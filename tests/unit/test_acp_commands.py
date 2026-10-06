@@ -1293,3 +1293,58 @@ def test_automation_new_in_run_session_returns_string():
     assert isinstance(out, str)
     assert "Automations are set up in a mini-ork thread" in out
     assert "start one from New Thread" in out
+
+
+# ── /kickoff (Zed S7b) ─────────────────────────────────────────────────────
+
+
+def test_kickoff_in_thread_returns_rewrite_sentinel_with_bridge():
+    """``/kickoff [task]`` in a thread session returns the
+    :class:`_RewriteToOrchestrate` sentinel with the kickoff-intent text
+    and the bridge line. Mirrors :func:`test_automation_new_in_thread_returns_rewrite_sentinel_with_bridge`."""
+    agent = _agent(Path.cwd())
+    agent._thread_sessions.add("run-1-abc")
+    agent._thread_config["run-1-abc"] = {"recipe": "changelog-entry"}
+    try:
+        out = asyncio.run(cmds.handle_kickoff(
+            agent, "run-1-abc", "fix the login redirect"))
+        # The orchestrator cannot see the pickers: the recipe is named.
+        assert "for the changelog-entry recipe" in out.intent_text
+        assert isinstance(out, cmds._RewriteToOrchestrate)
+        assert "fix the login redirect" in out.intent_text
+        assert "Follow your kickoff steps" in out.intent_text
+        # The intent nudges the orchestrator toward the thread's Recipe picker.
+        assert "Recipe picker" in out.intent_text
+        assert out.bridge is not None
+        assert "When the kickoff is ready" in out.bridge
+        assert "buttons to start the run" in out.bridge
+        # The bare ``/kickoff`` (no arg) still asks.
+        out_empty = asyncio.run(cmds.handle_kickoff(
+            agent, "run-1-abc", ""))
+        assert isinstance(out_empty, cmds._RewriteToOrchestrate)
+        assert "Ask what the run should do" in out_empty.intent_text
+    finally:
+        agent._thread_sessions.discard("run-1-abc")
+
+
+def test_kickoff_in_run_session_returns_string():
+    """``/kickoff`` in a run session (NOT a thread) returns a plain string
+    the dispatcher emits directly — the kickoff flow is thread-only."""
+    agent = _agent(Path.cwd())
+    out = asyncio.run(cmds.handle_kickoff(
+        agent, "run-1-abc", "fix the login redirect"))
+    assert isinstance(out, str)
+    assert "Kickoffs are written in a mini-ork thread" in out
+    assert "start one from New Thread" in out
+
+
+def test_kickoff_is_announced():
+    """The COMMANDS table includes ``kickoff`` and the HANDLERS table
+    dispatches it."""
+    names = {c.name for c in cmds.COMMANDS}
+    assert "kickoff" in names
+    assert "kickoff" in cmds.HANDLERS
+    # The hint is the "what the run should do" caption.
+    kickoff_cmd = next(c for c in cmds.COMMANDS if c.name == "kickoff")
+    assert kickoff_cmd.input is not None
+    assert kickoff_cmd.input.root.hint == "what the run should do"

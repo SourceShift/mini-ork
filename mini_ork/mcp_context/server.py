@@ -1112,6 +1112,22 @@ _CONTROL_TOOL_DEFS: list[dict[str, Any]] = [
             ],
         },
     },
+    {
+        "name": "draft_kickoff",
+        "description": (
+            "Show the user a kickoff before any run starts. It does NOT "
+            "start a run: the user starts it with a button. Fix every "
+            "finding of severity error and draft again."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "recipe": {"type": "string"},
+                "kickoff_markdown": {"type": "string"},
+            },
+            "required": ["recipe", "kickoff_markdown"],
+        },
+    },
 ]
 
 
@@ -1148,6 +1164,69 @@ def _draft_recipe(home: Path, args: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         _log(f"draft_recipe raised: {exc}")
         return {"error": f"draft_recipe: {exc}"}
+
+
+def _draft_kickoff(home: Path, args: dict[str, Any]) -> dict[str, Any]:
+    """Lint + write a single-file kickoff under ``<home>/kickoff-drafts/<slug>.md``.
+
+    Mirrors :func:`_draft_recipe`'s staging discipline but writes ONE file
+    (not a tree) — a kickoff is a markdown document. The slug is derived
+    from the title line (``mini_ork.kickoff_lint.slug``); re-drafting the
+    same kickoff atomically replaces the staged file (``os.replace``).
+    Never starts a run: the user starts it with the button.
+    """
+    import tempfile
+    from mini_ork import kickoff_lint
+    from mini_ork.recipes_catalog import find_recipe
+
+    if not isinstance(args, dict):
+        return {"error": "draft_kickoff: arguments must be an object"}
+
+    recipe = args.get("recipe")
+    markdown = args.get("kickoff_markdown")
+    if not isinstance(recipe, str) or not recipe.strip():
+        return {"error": "draft_kickoff: `recipe` is required"}
+    if not isinstance(markdown, str):
+        return {"error": "draft_kickoff: `kickoff_markdown` is required"}
+
+    if find_recipe(recipe.strip(), home) is None:
+        return {"ok": False, "error": f"unknown recipe: {recipe}"}
+
+    try:
+        findings = kickoff_lint.lint(
+            markdown, project=home.parent, recipe=recipe.strip(), home=home,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _log(f"kickoff_lint.lint raised: {exc}")
+        return {"error": f"draft_kickoff: lint failed: {exc}"}
+
+    draft_id = kickoff_lint.slug(markdown) or "kickoff"
+    drafts = home / "kickoff-drafts"
+    drafts.mkdir(parents=True, exist_ok=True)
+    draft_path = drafts / f"{draft_id}.md"
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(drafts),
+            prefix=f"{draft_id}.",
+            suffix=".md.tmp",
+            delete=False,
+        ) as tmp:
+            tmp.write(markdown)
+            tmp_path = Path(tmp.name)
+        os.replace(tmp_path, draft_path)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"draft_kickoff write raised: {exc}")
+        return {"error": f"draft_kickoff: write failed: {exc}"}
+
+    return {
+        "ok": True,
+        "draft_id": draft_id,
+        "recipe": recipe.strip(),
+        "path": str(draft_path),
+        "findings": findings,
+    }
 
 
 def _get_recipe_spec(home: Path, args: dict[str, Any]) -> dict[str, Any]:
@@ -1331,6 +1410,8 @@ def _call_tool(
                 return _get_recipe_spec(home, args)
             if name == "propose_automation":
                 return _propose_automation(home, args)
+            if name == "draft_kickoff":
+                return _draft_kickoff(home, args)
     except Exception as exc:  # defensive — kickoff says no exception ever
         _log(f"tool {name} raised: {exc}")
         return {"error": f"{name}: {exc}"}

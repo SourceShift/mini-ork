@@ -436,7 +436,7 @@ def test_subprocess_round_trip(server_home):
 
 
 def test_subprocess_round_trip_with_control(server_home):
-    """Spawn ``bin/mini-ork mcp-context --control`` and assert the 11-tool list."""
+    """Spawn ``bin/mini-ork mcp-context --control`` and assert the 19-tool list."""
     bin_path = REPO / "bin" / "mini-ork"
     if not bin_path.exists():
         pytest.skip("bin/mini-ork missing — subprocess test needs the launcher")
@@ -467,13 +467,15 @@ def test_subprocess_round_trip_with_control(server_home):
     lines = [json.loads(l) for l in proc.stdout.splitlines() if l.strip()]
     assert len(lines) == 3
     names = sorted(t["name"] for t in lines[1]["result"]["tools"])
-    # Seven read-only + eleven control = 18 tools (S3a: ``describe_recipe``;
-    # S4: ``workspaces``; S6b-1: ``list_automations`` + ``propose_automation``).
+    # Seven read-only + twelve control = 19 tools (S3a: ``describe_recipe``;
+    # S4: ``workspaces``; S6b-1: ``list_automations`` + ``propose_automation``;
+    # S7b: ``draft_kickoff``).
     expected = [
-        "certify", "cost", "describe_recipe", "draft_recipe", "get_recipe_spec",
-        "lanes", "learnings", "list_automations", "list_recipes", "list_runs",
-        "propose_automation", "recipe_guide", "run_detail", "run_status", "start_run",
-        "stop_run", "wait_for_run", "workspaces",
+        "certify", "cost", "describe_recipe", "draft_kickoff", "draft_recipe",
+        "get_recipe_spec", "lanes", "learnings", "list_automations",
+        "list_recipes", "list_runs", "propose_automation", "recipe_guide",
+        "run_detail", "run_status", "start_run", "stop_run", "wait_for_run",
+        "workspaces",
     ]
     assert names == expected
     # `start_run` with empty args → error object (recipe required).
@@ -536,16 +538,17 @@ def test_default_mode_rejects_control_tools(server_home):
 
 
 def test_control_mode_lists_eighteen_tools(server_home):
-    """With control=True, tools/list returns 7 + 11 = 18 names (S6b-1 adds
-    ``list_automations`` + ``propose_automation``)."""
+    """With control=True, tools/list returns 7 + 11 + 1 = 19 names (S6b-1 adds
+    ``list_automations`` + ``propose_automation``; S7b adds ``draft_kickoff``)."""
     resp = _call_control("tools/list")
     names = sorted(t["name"] for t in resp["result"]["tools"])
-    assert len(names) == 18
+    assert len(names) == 19
     assert names == sorted([
-        "certify", "cost", "describe_recipe", "draft_recipe", "get_recipe_spec",
-        "lanes", "learnings", "list_automations", "list_recipes", "list_runs",
-        "propose_automation", "recipe_guide", "run_detail", "run_status", "start_run",
-        "stop_run", "wait_for_run", "workspaces",
+        "certify", "cost", "describe_recipe", "draft_kickoff", "draft_recipe",
+        "get_recipe_spec", "lanes", "learnings", "list_automations",
+        "list_recipes", "list_runs", "propose_automation", "recipe_guide",
+        "run_detail", "run_status", "start_run", "stop_run", "wait_for_run",
+        "workspaces",
     ])
     # Kickoff is explicit: no commit-shaped tool must be exposed.
     for forbidden in ("commit", "commit_draft", "commit_recipe", "publish_recipe"):
@@ -1473,3 +1476,192 @@ def test_propose_automation_missing_required_returns_error(
     assert "error" in body
     for field in ("name", "recipe", "schedule", "kickoff_markdown"):
         assert field in body["error"]
+
+
+# ── draft_kickoff (Zed S7b) ────────────────────────────────────────────────
+
+
+def _kickoff_home(monkeypatch, tmp_path):
+    """A tmp ``.mini-ork`` home with one implementer recipe registered.
+
+    The kickoff MCP handler calls ``find_recipe`` first — a stub recipe
+    tree at ``<home>/recipes/<recipe>`` is enough to satisfy that probe.
+    The lint checks then run ``recipe_dir`` against ``MINI_ORK_HOME`` and
+    look for ``workflow.yaml`` with an implementer node, so the stub must
+    declare one.
+    """
+    h = tmp_path / "kickoff-home"
+    h.mkdir()
+    monkeypatch.setattr(
+        "mini_ork.mcp_context.server._resolve_home", lambda: h
+    )
+    recipe_dir = h / "recipes" / "code-fix"
+    recipe_dir.mkdir(parents=True, exist_ok=True)
+    (recipe_dir / "workflow.yaml").write_text(
+        "version: '0.1.0'\n"
+        "task_class: framework_edit\n"
+        "nodes:\n"
+        "  - {name: implementer, type: implementer}\n"
+        "edges: []\n",
+        encoding="utf-8",
+    )
+    (recipe_dir / "task_class.yaml").write_text(
+        "name: framework_edit\n", encoding="utf-8"
+    )
+    # The "project" the kickoff's scope paths are validated against is
+    # ``<home>.parent``. Place a real file there so the happy-path test
+    # can reference it in ``## Files in scope`` without a finding.
+    (h.parent / "present.py").write_text("x", encoding="utf-8")
+    monkeypatch.setenv("MINI_ORK_HOME", str(h))
+    return h
+
+
+def test_draft_kickoff_writes_under_kickoff_drafts(
+    server_home, monkeypatch, tmp_path
+):
+    """``draft_kickoff`` writes the staged file under
+    ``<home>/kickoff-drafts/<slug>.md`` and never touches recipes/.
+
+    Mirrors :func:`test_draft_recipe_writes_under_recipe_drafts` — same
+    pattern, single file rather than a tree.
+    """
+    h = _kickoff_home(monkeypatch, tmp_path)
+    resp = _call_args_control({
+        "name": "draft_kickoff",
+        "arguments": {
+            "recipe": "code-fix",
+            "kickoff_markdown": (
+                "# My Edit\n\n"
+                "## Files in scope\n"
+                "- `present.py`\n\n"
+                "## Success criteria\n"
+                "- runs\n"
+            ),
+        },
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is False
+    assert body["ok"] is True
+    assert body["draft_id"] == "my-edit"
+    assert body["recipe"] == "code-fix"
+    assert body["path"].endswith("/kickoff-drafts/my-edit.md")
+    assert (h / "kickoff-drafts" / "my-edit.md").is_file()
+    # Recipes/ untouched (kickoff never commits).
+    assert not (h / "recipes" / "my-edit").exists()
+    assert not (h / "kickoffs" / "my-edit.md").exists()
+    # Findings payload shape — empty list when the kickoff is complete.
+    assert isinstance(body["findings"], list)
+    assert body["findings"] == []
+
+
+def test_draft_kickoff_unknown_recipe_returns_error(
+    server_home, monkeypatch, tmp_path
+):
+    """Unknown recipe → ``{ok: False, error}`` per kickoff §MCP."""
+    h = _kickoff_home(monkeypatch, tmp_path)
+    resp = _call_args_control({
+        "name": "draft_kickoff",
+        "arguments": {
+            "recipe": "no-such-recipe",
+            "kickoff_markdown": "# x\n",
+        },
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is True
+    assert body["ok"] is False
+    assert "no-such-recipe" in body["error"]
+    # No file was written.
+    assert not (h / "kickoff-drafts").exists() or not any(
+        (h / "kickoff-drafts").iterdir()
+    )
+
+
+def test_draft_kickoff_rejects_missing_kickoff_markdown(
+    server_home, monkeypatch, tmp_path
+):
+    """Missing ``kickoff_markdown`` → ``error`` (required by schema)."""
+    _kickoff_home(monkeypatch, tmp_path)
+    resp = _call_args_control({
+        "name": "draft_kickoff",
+        "arguments": {"recipe": "code-fix"},
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is True
+    assert "kickoff_markdown" in body["error"]
+
+
+def test_draft_kickoff_only_in_control_mode(
+    server_home, monkeypatch, tmp_path
+):
+    """Default-mode MCP rejects ``draft_kickoff`` (kickoff §MCP)."""
+    _kickoff_home(monkeypatch, tmp_path)
+    resp = _call_args({
+        "name": "draft_kickoff",
+        "arguments": {
+            "recipe": "code-fix",
+            "kickoff_markdown": "# x\n",
+        },
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is True
+    assert "unknown tool" in body["error"]
+
+
+def test_draft_kickoff_returns_findings_for_incomplete_kickoff(
+    server_home, monkeypatch, tmp_path
+):
+    """Empty body / no title / no scope / no success → each surfaces as
+    a finding. None is fatal (errors-only stop the turn)."""
+    _kickoff_home(monkeypatch, tmp_path)
+    resp = _call_args_control({
+        "name": "draft_kickoff",
+        "arguments": {
+            "recipe": "code-fix",
+            "kickoff_markdown": "no title, no scope, no success\n",
+        },
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is False
+    assert body["ok"] is True
+    msgs = [f["msg"] for f in body["findings"]]
+    assert any("no '# ' title" in m for m in msgs)
+    assert any("'## Files in scope'" in m for m in msgs)
+    assert any("no success section" in m for m in msgs)
+
+
+def test_draft_kickoff_atomic_replacement(
+    server_home, monkeypatch, tmp_path
+):
+    """Re-drafting the same slug atomically replaces the staged file
+    (the kickoff's "atomic; replaces a draft of the same slug" promise)."""
+    h = _kickoff_home(monkeypatch, tmp_path)
+    first = _call_args_control({
+        "name": "draft_kickoff",
+        "arguments": {
+            "recipe": "code-fix",
+            "kickoff_markdown": (
+                "# My Edit\n\n## Files in scope\n- `present.py`\n\n"
+                "## Success criteria\n- first\n"
+            ),
+        },
+    })
+    body = json.loads(first["result"]["content"][0]["text"])
+    assert body["ok"] is True
+    staged = h / "kickoff-drafts" / "my-edit.md"
+    assert staged.read_text(encoding="utf-8").endswith("- first\n")
+    second = _call_args_control({
+        "name": "draft_kickoff",
+        "arguments": {
+            "recipe": "code-fix",
+            "kickoff_markdown": (
+                "# My Edit\n\n## Files in scope\n- `present.py`\n\n"
+                "## Success criteria\n- second\n"
+            ),
+        },
+    })
+    body2 = json.loads(second["result"]["content"][0]["text"])
+    assert body2["ok"] is True
+    assert staged.read_text(encoding="utf-8").endswith("- second\n")
+    # Exactly one staged file (no leftover temp).
+    drafts = list((h / "kickoff-drafts").iterdir())
+    assert [p.name for p in drafts] == ["my-edit.md"]

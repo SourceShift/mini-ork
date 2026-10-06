@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import json
+import re
 import os
 import secrets
 import sys
@@ -306,6 +307,50 @@ def _proposal_result(event: dict[str, Any], propose_calls: set[str]) -> dict[str
             "kickoff": str(proposal.get("kickoff") or ""),
             "next_fires": list(data.get("next_fires") or []),
             "workspace": str(proposal.get("workspace") or "worktree"),
+        }
+    return None
+
+
+def _kickoff_result(event: dict[str, Any], kickoff_calls: set[str]) -> dict[str, Any] | None:
+    """A successful ``draft_kickoff`` tool result in ``event`` (a stream-json
+    user message answering one of ``kickoff_calls``), as ``{draft_id,
+    tool_call_id, recipe, path, findings, ok}``; ``None`` otherwise.
+
+    Mirrors :func:`_draft_result` and :func:`_proposal_result`. The
+    payload shape is ``{"ok", "draft_id", "recipe", "path", "findings"}``
+    — the same JSON :func:`mini_ork.mcp_context.server._draft_kickoff`
+    returns. An ``ok: false`` envelope (unknown recipe) is still surfaced
+    so the orchestrator turn can iterate; the agent itself does not
+    offer buttons in that case (kickoff §Agent: "``ok: false`` asks
+    nothing").
+    """
+    if event.get("type") != "user" or not kickoff_calls:
+        return None
+    for block in (event.get("message") or {}).get("content") or []:
+        if not (isinstance(block, dict) and block.get("type") == "tool_result"):
+            continue
+        tool_call_id = str(block.get("tool_use_id") or "")
+        if tool_call_id not in kickoff_calls:
+            continue
+        raw = block.get("content")
+        if isinstance(raw, list):
+            raw = "".join(c.get("text", "") for c in raw if isinstance(c, dict))
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else None
+        except json.JSONDecodeError:
+            data = None
+        if not isinstance(data, dict):
+            return None
+        draft_id = str(data.get("draft_id") or "")
+        if data.get("ok") and not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,47}", draft_id):
+            return None  # it becomes a file name under the home
+        return {
+            "ok": bool(data.get("ok")),
+            "draft_id": draft_id,
+            "tool_call_id": tool_call_id,
+            "recipe": str(data.get("recipe") or ""),
+            "path": str(data.get("path") or ""),
+            "findings": list(data.get("findings") or []),
         }
     return None
 
@@ -2022,6 +2067,14 @@ class MiniOrkAcpAgent:
         # proposal exists (same shape as recipe drafts).
         propose_calls: set[str] = set()
         turn_proposal: dict[str, Any] = {}
+        # Zed S7b: this turn's draft_kickoff calls (tool_use id set) plus a
+        # side-table of the kickoff markdown + recipe the orchestrator
+        # submitted (captured from the tool_use input — the tool_result
+        # does not carry the markdown). The last successful kickoff drives
+        # the 4-button approval (Start run / Save / Change / Discard).
+        kickoff_calls: set[str] = set()
+        kickoff_inputs: dict[str, dict[str, str]] = {}
+        turn_kickoff: dict[str, Any] = {}
 
         async def on_event(event: dict[str, Any]) -> None:
             for update in _orchestration.map_event(event):
@@ -2038,6 +2091,16 @@ class MiniOrkAcpAgent:
                         draft_calls.add(str(block.get("id") or ""))
                     elif tool == "propose_automation":
                         propose_calls.add(str(block.get("id") or ""))
+                    elif tool == "draft_kickoff":
+                        kid = str(block.get("id") or "")
+                        if not kid:
+                            continue
+                        kickoff_calls.add(kid)
+                        inp = block.get("input") if isinstance(block.get("input"), dict) else {}
+                        kickoff_inputs[kid] = {
+                            "markdown": str(inp.get("kickoff_markdown") or ""),
+                            "recipe": str(inp.get("recipe") or ""),
+                        }
             child = self._extract_child_run_from_event(event, start_run_calls)
             if child:
                 await self._start_child_follow(session_id, child[0], recipe=child[1])
@@ -2051,6 +2114,16 @@ class MiniOrkAcpAgent:
                 turn_proposal.clear()
                 turn_proposal.update(proposal)
                 await self._emit_proposal_card(session_id, proposal)
+            kickoff = _kickoff_result(event, kickoff_calls)
+            if kickoff:
+                inputs = kickoff_inputs.get(kickoff["tool_call_id"], {})
+                kickoff["markdown"] = inputs.get("markdown", "")
+                if not kickoff.get("recipe"):
+                    kickoff["recipe"] = inputs.get("recipe", "")
+                if kickoff.get("ok"):
+                    turn_kickoff.clear()
+                    turn_kickoff.update(kickoff)
+                    await self._emit_kickoff_preview(session_id, kickoff)
 
         async def _run() -> Any:
             kwargs: dict[str, Any] = {}
@@ -2124,6 +2197,17 @@ class MiniOrkAcpAgent:
                 session_id, turn_proposal["proposal_id"],
                 tool_call_id=turn_proposal["tool_call_id"],
                 exists=turn_proposal["exists"],
+            )
+        # Zed S7b: kickoff approval fires LAST so a kickoff that triggers
+        # a child run (via the ``run`` option) gets its workspace / lane
+        # decisions made after the recipe/proposal drafts of the same turn
+        # have settled. An ``ok: false`` kickoff is silently ignored per
+        # the kickoff §Agent spec.
+        if turn_kickoff and turn_kickoff.get("ok"):
+            await self._offer_kickoff_draft_approval(
+                session_id, turn_kickoff["draft_id"],
+                tool_call_id=turn_kickoff["tool_call_id"],
+                recipe=str(turn_kickoff.get("recipe") or ""),
             )
         # Zed S5: surface review buttons for any run that became
         # ready-to-review during this turn, newest first. The orchestrator
@@ -2610,6 +2694,231 @@ class MiniOrkAcpAgent:
                     f"`discard` failed for `{recipe_id}`: {err}"
                 ),
             )
+
+    # ── kickoff-draft approval (Zed S7b) ──────────────────────────────────────
+
+    async def _emit_kickoff_preview(
+        self, session_id: str, kickoff: dict[str, Any]
+    ) -> None:
+        """Show a kickoff draft on its tool card: a new-file diff with the
+        markdown preview, then one line per finding (or "Looks complete.").
+
+        Card body (kickoff §Agent, verbatim):
+
+            FileEditToolCallContent(type="diff", path=<home>/kickoffs/<slug>.md,
+                                    old_text=None, new_text=<markdown>)
+            text:
+              - "Looks complete." when there are no findings
+              - one line per finding ("⚠ msg — fix" for warn,
+                "✗ msg — fix" for error) otherwise
+        """
+        home = self._home_for(session_id)
+        slug = str(kickoff.get("draft_id") or "kickoff")
+        path = str(home / "kickoffs" / f"{slug}.md")
+        findings = kickoff.get("findings") or []
+        if findings:
+            lines: list[str] = []
+            for f in findings:
+                if not isinstance(f, dict):
+                    continue
+                glyph = "✗" if f.get("sev") == "error" else "⚠"
+                msg = str(f.get("msg") or "")
+                fix = str(f.get("fix") or "")
+                lines.append(f"{glyph} {msg} — {fix}" if fix else f"{glyph} {msg}")
+            body_text = "\n".join(lines)
+        else:
+            body_text = "Looks complete."
+        content: list[Any] = [
+            FileEditToolCallContent(
+                type="diff", path=path, old_text=None,
+                new_text=str(kickoff.get("markdown") or ""),
+            ),
+            ContentToolCallContent(
+                type="content",
+                content=TextContentBlock(type="text", text=body_text),
+            ),
+        ]
+        await self._emit(session_id, ToolCallProgress(
+            session_update="tool_call_update",
+            tool_call_id=kickoff["tool_call_id"],
+            content=cast(Any, content),
+        ))
+
+    async def _offer_kickoff_draft_approval(
+        self, session_id: str, draft_id: str, *, tool_call_id: str, recipe: str
+    ) -> None:
+        """Ask the user, on the kickoff's own tool card, what to do with it:
+        Start run / Save only / Change something / Discard. Awaited inside the
+        turn. Dismissing keeps the draft.
+
+        The four options are the kickoff §Agent spec verbatim. The action
+        vocabulary differs from the recipe / proposal 3-button set (run vs.
+        save vs. change vs. discard) because the kickoff is one document
+        rather than a tree — there is no equivalent of "Update" since
+        re-drafting the same slug already overwrites the staged file.
+        """
+        if self._conn is None:
+            return
+        try:
+            response = await self._conn.request_permission(
+                session_id=session_id,
+                tool_call=ToolCallUpdate(
+                    tool_call_id=tool_call_id,
+                    kind="edit",
+                    title=f"Start {recipe} run?" if recipe else "Start run?",
+                    status="pending",
+                ),
+                options=[
+                    PermissionOption(option_id="run", name="Start run", kind="allow_once"),
+                    PermissionOption(option_id="save", name="Save only", kind="allow_always"),
+                    PermissionOption(option_id="change", name="Change something", kind="reject_once"),
+                    PermissionOption(option_id="discard", name="Discard", kind="reject_always"),
+                ],
+            )
+        except Exception:  # noqa: BLE001 — UI is best-effort, the draft survives
+            return
+        outcome = getattr(response, "outcome", None)
+        option_id = getattr(outcome, "option_id", None) if outcome is not None else None
+        if option_id in ("run", "save"):
+            await self._emit(session_id, ToolCallProgress(
+                session_update="tool_call_update",
+                tool_call_id=tool_call_id,
+                status="completed",
+            ))
+        if option_id == "run":
+            await self._handle_kickoff_run(session_id, draft_id, recipe=recipe)
+        elif option_id == "save":
+            await self._handle_kickoff_save(session_id, draft_id, recipe=recipe)
+        elif option_id == "change":
+            await self._handle_kickoff_change(session_id, draft_id)
+            await self._emit(session_id, ToolCallProgress(
+                session_update="tool_call_update",
+                tool_call_id=tool_call_id,
+                status="failed",
+            ))
+        elif option_id == "discard":
+            await self._handle_kickoff_discard(session_id, draft_id)
+            await self._emit(session_id, ToolCallProgress(
+                session_update="tool_call_update",
+                tool_call_id=tool_call_id,
+                status="failed",
+            ))
+        else:  # dismissed
+            await self._emit(session_id, self._build_refusal_message(
+                "Kickoff kept — ask me to start it when you're ready."))
+            await self._emit(session_id, ToolCallProgress(
+                session_update="tool_call_update",
+                tool_call_id=tool_call_id,
+                status="failed",
+            ))
+
+    async def _handle_kickoff_run(
+        self, session_id: str, draft_id: str, *, recipe: str
+    ) -> None:
+        """``run`` → start the run exactly as ``/run <recipe> <kickoff>`` does.
+
+        Delete the staged draft, then defer to ``_prompt_thread_direct`` —
+        it honours the thread's stored recipe + workspace + run-id minting
+        + launcher seam + in-thread follow. Per the prior-art lens this
+        is the single canonical launch path; reinventing launch logic
+        here would bypass worktree creation, env contract, and the
+        ``launcher`` / ``_reader`` / ``_stopper`` seams.
+        """
+        home = self._home_for(session_id)
+        staged = home / "kickoff-drafts" / f"{draft_id}.md"
+        try:
+            markdown = staged.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            markdown = ""
+        try:
+            staged.unlink()
+        except FileNotFoundError:
+            pass
+        if not recipe or not markdown:
+            await self._emit(session_id, self._build_refusal_message(
+                "Kickoff is missing its recipe or markdown — draft it again."
+            ))
+            return
+        await self._prompt_thread_direct(session_id, markdown, recipe=recipe)
+
+    async def _handle_kickoff_save(
+        self, session_id: str, draft_id: str, *, recipe: str = ""
+    ) -> None:
+        """``save`` → move the staged draft to ``<home>/kickoffs/<slug>.md``.
+
+        On collision, append ``-2``, ``-3`` … to the destination. The
+        canonical line is then surfaced to the user with a file link so
+        Zed renders it as a clickable mention. The user runs the saved
+        kickoff later via ``/run`` or
+        ``mini-ork run <recipe> .mini-ork/kickoffs/<name>.md``.
+        """
+        from mini_ork.kickoff_lint import slug as _slug
+
+        home = self._home_for(session_id)
+        staged = home / "kickoff-drafts" / f"{draft_id}.md"
+        target_dir = home / "kickoffs"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            markdown = staged.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            markdown = ""
+        # Use the slug from the markdown content for the saved path —
+        # the draft_id is already that slug, but the saved file should
+        # reflect the title at save-time, and re-using the same slug keeps
+        # a stable identity for the user.
+        target_name = draft_id if draft_id else _slug(markdown)
+        target = target_dir / f"{target_name}.md"
+        if target.exists():
+            n = 2
+            while True:
+                candidate = target_dir / f"{target_name}-{n}.md"
+                if not candidate.exists():
+                    target = candidate
+                    break
+                n += 1
+        try:
+            target.write_text(markdown, encoding="utf-8")
+            staged.unlink()
+        except OSError as exc:
+            await self._emit(session_id, self._build_refusal_message(
+                f"`save` failed for `{draft_id}`: {exc}"
+            ))
+            return
+        rel = target.relative_to(home.parent)
+        await self._emit(session_id, self._build_refusal_message(
+            f"Saved `.mini-ork/kickoffs/{target.name}`. "
+            "Run it later with `/run` or "
+            f"`mini-ork run {recipe or '<recipe>'} {rel}`."
+        ))
+        await self._emit_file_links(session_id, [target])
+
+    async def _handle_kickoff_change(
+        self, session_id: str, draft_id: str
+    ) -> None:
+        """``keep`` → keep the staged draft; ask the user what to change."""
+        del draft_id
+        await self._emit(session_id, self._build_refusal_message(
+            "Tell me what to change."
+        ))
+
+    async def _handle_kickoff_discard(
+        self, session_id: str, draft_id: str
+    ) -> None:
+        """``discard`` → delete the staged draft and report."""
+        home = self._home_for(session_id)
+        staged = home / "kickoff-drafts" / f"{draft_id}.md"
+        try:
+            staged.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            await self._emit(session_id, self._build_refusal_message(
+                f"`discard` failed for `{draft_id}`: {exc}"
+            ))
+            return
+        await self._emit(session_id, self._build_refusal_message(
+            "Kickoff discarded."
+        ))
 
     async def _offer_recipe_test_run(self, session_id: str, recipe_id: str) -> None:
         """After creating a recipe: offer to run it now on its example kickoff."""

@@ -210,6 +210,11 @@ COMMANDS: list[AvailableCommand] = [
         "Schedule a recipe: describe what should run and when.",
         "describe what should run and when",
     ),
+    _cmd(
+        "kickoff",
+        "Draft a kickoff with the orchestrator, check it, then start the run.",
+        "what the run should do",
+    ),
 ]
 
 
@@ -809,6 +814,44 @@ async def handle_automation_new(
     )
 
 
+async def handle_kickoff(
+    agent: Any, session_id: str, arg: str
+) -> _RewriteToOrchestrate | str:
+    """``/kickoff [task]`` — draft a kickoff the user checks before any run.
+
+    Mirrors :func:`handle_automation_new`: thread-only carve-out, rewrite
+    to orchestrator with the intent text + bridge. The orchestrator
+    reads the recipe (via ``describe_recipe``), interviews the user on
+    scope + success criteria + what is out of scope, then calls
+    ``draft_kickoff``. The agent shows the staged draft as a new-file
+    diff with the lint findings, then offers Start run / Save only /
+    Change something / Discard. The user starts the run with the
+    button.
+    """
+    if session_id not in getattr(agent, "_thread_sessions", set()):
+        return (
+            "Kickoffs are written in a mini-ork thread — start one "
+            "from New Thread."
+        )
+    what = arg.strip() or "Ask what the run should do."
+    # The orchestrator cannot see the thread's pickers, so name the recipe.
+    cfg = (getattr(agent, "_thread_config", {}) or {}).get(session_id) or {}
+    recipe = str(cfg.get("recipe") or getattr(agent, "_recipe", "") or "code-fix")
+    intent = (
+        f"The user wants a kickoff for the {recipe} recipe (the thread's Recipe "
+        f"picker; suggest another if it fits better): {what} "
+        "Follow your kickoff steps."
+    )
+    return _RewriteToOrchestrate(
+        intent_text=intent,
+        recipe_id=None,
+        bridge=(
+            "Handing this to the orchestrator. When the kickoff is ready "
+            "you'll see it here with the buttons to start the run."
+        ),
+    )
+
+
 async def handle_recipe_edit(agent: Any, session_id: str, arg: str) -> str | _RewriteToOrchestrate:
     """Thread-side: rewrite to orchestrator to edit an existing recipe.
 
@@ -1244,6 +1287,7 @@ HANDLERS: dict[str, Handler] = {
     "automations": handle_automations,
     "automation": handle_automation,
     "automation new": handle_automation_new,
+    "kickoff": handle_kickoff,
     "automation run": handle_automation_run,
     "automation pause": handle_automation_pause,
     "automation resume": handle_automation_resume,

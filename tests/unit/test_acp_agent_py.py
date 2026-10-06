@@ -5457,3 +5457,338 @@ def test_cancelling_a_race_stops_every_contestant(tmp_path, monkeypatch):
     resp = asyncio.run(scenario())
     assert resp.stop_reason == "cancelled"
     assert sorted(stopped) == sorted(state["order"])
+
+
+# ── /kickoff + draft_kickoff (Zed S7b) ──────────────────────────────────────
+
+
+def _kickoff_project(tmp_path, monkeypatch, *, project_files=("present.py",)):
+    """A tmp project with one real file under project/ + a stub docs recipe.
+
+    Mirrors :func:`_authoring_project` so the same `_thread_agent` factory
+    works. The kickoff lint checks scope paths against ``project`` =
+    ``home.parent``, so a real ``present.py`` under the project lets the
+    happy-path test reference it without a "not in the project" finding.
+    """
+    proj = tmp_path / "proj"
+    home = proj / ".mini-ork"
+    (home / "config").mkdir(parents=True)
+    (home / "config" / "agents.yaml").write_text(
+        "lanes:\n  worker: sonnet\n  reviewer: opus\n",
+        encoding="utf-8",
+    )
+    for name in project_files:
+        (proj / name).write_text("x", encoding="utf-8")
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+    engine = tmp_path / "engine"
+    docs = engine / "recipes" / "docs"
+    (docs / "prompts").mkdir(parents=True)
+    (docs / "workflow.yaml").write_text(
+        "version: '0.1.0'\ntask_class: docs\n"
+        "nodes:\n"
+        "  - {name: implementer, type: implementer}\n"
+        "edges: []\n",
+        encoding="utf-8",
+    )
+    (docs / "task_class.yaml").write_text(
+        "name: docs\ndescription: Docs edits.\n", encoding="utf-8"
+    )
+    (docs / "prompts" / "editor.md").write_text("edit docs\n")
+    (docs / "example-kickoff.md").write_text(
+        "# Docs Edit: Title\n"
+        "## Files in scope\n"
+        "## Success criteria\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("mini_ork.web.control._mini_ork_root", lambda: engine)
+    return proj, home
+
+
+def _kickoff_turn(home, prompts, kickoff_markdown, *, recipe="docs"):
+    """A fake orchestrator turn that calls the real ``draft_kickoff`` MCP
+    helper (mirrors :func:`_drafting_turn`)."""
+    from mini_ork.mcp_context.server import dispatch
+
+    def turn(lane, prompt, cwd, home_arg, resume, on_event):
+        async def _run():
+            prompts.append(prompt)
+            resp = dispatch({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "draft_kickoff", "arguments": {
+                    "recipe": recipe, "kickoff_markdown": kickoff_markdown,
+                }},
+            }, control=True)
+            # The MCP dispatcher wraps the handler result inside an envelope
+            # (``{"content": [{"type": "text", "text": <json>}]}``) — the
+            # agent's ``_kickoff_result`` parses the inner text, so surface
+            # the unwrapped handler JSON to the fake tool_result.
+            inner = resp["result"]["content"][0]["text"]
+            await on_event({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "toolu_k1",
+                 "name": "mcp__mini-ork__draft_kickoff",
+                 "input": {"recipe": recipe,
+                           "kickoff_markdown": kickoff_markdown}}]}})
+            await on_event({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_k1",
+                 "content": [{"type": "text", "text": inner}]}]}})
+            return _Turn()
+        return _run()
+    return lambda lane, prompt, cwd, home, resume, on_event: turn(
+        lane, prompt, cwd, home, resume, on_event)
+
+
+def test_kickoff_draft_shows_as_new_file_diff_with_findings(tmp_path, monkeypatch):
+    """``draft_kickoff`` in a thread turn surfaces as a new-file diff with
+    findings formatted ``⚠ msg — fix`` (warn) and ``✗ msg — fix`` (error).
+    A complete kickoff → "Looks complete." text."""
+    proj, home = _kickoff_project(tmp_path, monkeypatch)
+    prompts: list[str] = []
+    body = (
+        "# Title\n\n"
+        "## Files in scope\n"
+        "- `present.py`\n\n"
+        "## Success criteria\n- runs\n"
+    )
+    agent, thread = _thread_agent(proj, orchestrator_turn=_kickoff_turn(home, prompts, body))
+    conn = _PermConn([])
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("/kickoff fix the login redirect")]))
+    updates = [u for _, u in conn.sent]
+    # The preview arrives as a ToolCallProgress on toolu_k1.
+    preview = [u for u in updates if isinstance(u, ToolCallProgress)
+               and u.tool_call_id == "toolu_k1" and u.content]
+    diffs = [c for u in preview for c in u.content if isinstance(c, FileEditToolCallContent)]
+    assert len(diffs) == 1
+    assert diffs[0].old_text is None
+    assert diffs[0].new_text == body
+    assert diffs[0].path.endswith(".mini-ork/kickoffs/title.md")
+    text_blocks = [c.content for u in preview for c in u.content
+                   if isinstance(c, ContentToolCallContent)]
+    assert any("Looks complete." in b.text for b in text_blocks)
+    # The orchestrator turn was kicked off with the rewritten intent.
+    assert prompts and "fix the login redirect" in prompts[0]
+    # The bridge line surfaces in the AgentMessageChunk stream.
+    chunks = [u for _, u in conn.sent if isinstance(u, AgentMessageChunk)]
+    assert any("When the kickoff is ready" in getattr(c.content, "text", "")
+               for c in chunks)
+
+
+def test_kickoff_run_launches_and_follows(tmp_path, monkeypatch):
+    """``run`` → the kickoff's staged file is deleted, then the recipe runs
+    via ``_prompt_thread_direct`` and is followed in-thread."""
+    proj, home = _kickoff_project(tmp_path, monkeypatch)
+    body = (
+        "# Title\n\n## Files in scope\n- `present.py`\n\n"
+        "## Success criteria\n- runs\n"
+    )
+    prompts: list[str] = []
+
+    def turn(lane, prompt, cwd, home_arg, resume, on_event):
+        async def _run():
+            prompts.append(prompt)
+            from mini_ork.mcp_context.server import dispatch
+            resp = dispatch({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "draft_kickoff", "arguments": {
+                    "recipe": "docs", "kickoff_markdown": body,
+                }},
+            }, control=True)
+            # MCP wraps the handler result inside an envelope — surface the
+            # inner JSON string (matches ``_kickoff_result``'s parser).
+            content = resp["result"]["content"][0]["text"]
+            await on_event({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "toolu_k1",
+                 "name": "mcp__mini-ork__draft_kickoff",
+                 "input": {"recipe": "docs",
+                           "kickoff_markdown": body}}]}})
+            await on_event({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_k1",
+                 "content": [{"type": "text", "text": content}]}]}})
+            return _Turn()
+        return _run()
+    turn_fn = lambda lane, prompt, cwd, home, resume, on_event: turn(
+        lane, prompt, cwd, home, resume, on_event)
+
+    # Mark a child run that the run-launched-follow flow tracks.
+    def launcher(session_id, prompt_text):
+        # _prompt_thread_direct forwards the kickoff markdown into the
+        # launcher; the run id == session id here.
+        assert prompt_text == body
+        # The staged file is gone (the handler deletes it on ``run``).
+        assert not (home / "kickoff-drafts" / "title.md").exists()
+        return {"ok": True, "pid": 1, "log_path": "/tmp/x.log"}
+
+    def reader(rid):
+        return {
+            "status": "published",
+            "events": [],
+            "llm_calls": [],
+        }
+
+    agent, thread = _thread_agent(
+        proj, orchestrator_turn=turn_fn, launcher=launcher, reader=reader,
+    )
+    conn = _PermConn(["run"])
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("/kickoff fix the login redirect")]))
+    # _PermConn recorded one permission ask on the kickoff tool call.
+    assert any(tid == "toolu_k1" for tid, _ in conn.asked)
+
+
+def test_kickoff_save_moves_draft_to_kickoffs_dir(tmp_path, monkeypatch):
+    """``save`` → move the staged draft to ``<home>/kickoffs/<slug>.md``
+    with collision suffix, surface the canonical line + file link."""
+    proj, home = _kickoff_project(tmp_path, monkeypatch)
+    body = (
+        "# Title\n\n## Files in scope\n- `present.py`\n\n"
+        "## Success criteria\n- runs\n"
+    )
+    prompts: list[str] = []
+    agent, thread = _thread_agent(
+        proj, orchestrator_turn=_kickoff_turn(home, prompts, body),
+    )
+    conn = _PermConn(["save"])
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("/kickoff")]))
+    saved = home / "kickoffs" / "title.md"
+    assert saved.is_file()
+    assert saved.read_text(encoding="utf-8") == body
+    # The staged draft was deleted on save.
+    assert not (home / "kickoff-drafts" / "title.md").exists()
+    # The user-facing message + file link landed in the stream.
+    chunks_text = " ".join(
+        getattr(c.content, "text", "") for _, c in conn.sent
+        if isinstance(c, AgentMessageChunk)
+    )
+    assert "Saved `.mini-ork/kickoffs/title.md`" in chunks_text
+    assert "/run" in chunks_text
+
+
+def test_kickoff_save_uses_dash_two_on_collision(tmp_path, monkeypatch):
+    """When ``<home>/kickoffs/<slug>.md`` already exists, ``save`` picks
+    ``<slug>-2.md``. The user-facing message names the actual file."""
+    proj, home = _kickoff_project(tmp_path, monkeypatch)
+    # Pre-create a kickoff with the same slug.
+    (home / "kickoffs").mkdir(parents=True, exist_ok=True)
+    (home / "kickoffs" / "title.md").write_text("old", encoding="utf-8")
+    body = (
+        "# Title\n\n## Files in scope\n- `present.py`\n\n"
+        "## Success criteria\n- runs\n"
+    )
+    prompts: list[str] = []
+    agent, thread = _thread_agent(
+        proj, orchestrator_turn=_kickoff_turn(home, prompts, body),
+    )
+    conn = _PermConn(["save"])
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("/kickoff")]))
+    # The pre-existing file is untouched; the new save gets -2.
+    assert (home / "kickoffs" / "title.md").read_text(encoding="utf-8") == "old"
+    assert (home / "kickoffs" / "title-2.md").read_text(encoding="utf-8") == body
+
+
+def test_kickoff_change_keeps_draft(tmp_path, monkeypatch):
+    """``change`` → the staged draft survives; the user gets
+    "Tell me what to change." and the tool call is marked failed."""
+    proj, home = _kickoff_project(tmp_path, monkeypatch)
+    body = (
+        "# Title\n\n## Files in scope\n- `present.py`\n\n"
+        "## Success criteria\n- runs\n"
+    )
+    prompts: list[str] = []
+    agent, thread = _thread_agent(
+        proj, orchestrator_turn=_kickoff_turn(home, prompts, body),
+    )
+    conn = _PermConn(["change"])
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("/kickoff")]))
+    staged = home / "kickoff-drafts" / "title.md"
+    assert staged.is_file()
+    chunks_text = " ".join(
+        getattr(c.content, "text", "") for _, c in conn.sent
+        if isinstance(c, AgentMessageChunk)
+    )
+    assert "Tell me what to change" in chunks_text
+    failed = [u for _, u in conn.sent
+              if isinstance(u, ToolCallProgress)
+              and u.tool_call_id == "toolu_k1"
+              and u.status == "failed"]
+    assert failed, "change path must mark the tool call failed"
+
+
+def test_kickoff_discard_deletes_draft(tmp_path, monkeypatch):
+    """``discard`` → the staged draft is deleted; the user gets
+    "Kickoff discarded." and the tool call is marked failed."""
+    proj, home = _kickoff_project(tmp_path, monkeypatch)
+    body = (
+        "# Title\n\n## Files in scope\n- `present.py`\n\n"
+        "## Success criteria\n- runs\n"
+    )
+    prompts: list[str] = []
+    agent, thread = _thread_agent(
+        proj, orchestrator_turn=_kickoff_turn(home, prompts, body),
+    )
+    conn = _PermConn(["discard"])
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("/kickoff")]))
+    staged = home / "kickoff-drafts" / "title.md"
+    assert not staged.exists()
+    chunks_text = " ".join(
+        getattr(c.content, "text", "") for _, c in conn.sent
+        if isinstance(c, AgentMessageChunk)
+    )
+    assert "Kickoff discarded" in chunks_text
+
+
+def test_kickoff_dismissed_keeps_draft(tmp_path, monkeypatch):
+    """A dismissed permission dialog keeps the draft."""
+    proj, home = _kickoff_project(tmp_path, monkeypatch)
+    body = (
+        "# Title\n\n## Files in scope\n- `present.py`\n\n"
+        "## Success criteria\n- runs\n"
+    )
+    prompts: list[str] = []
+    agent, thread = _thread_agent(
+        proj, orchestrator_turn=_kickoff_turn(home, prompts, body),
+    )
+    conn = _PermConn([])  # empty → dismissed
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("/kickoff")]))
+    staged = home / "kickoff-drafts" / "title.md"
+    assert staged.is_file()
+    chunks_text = " ".join(
+        getattr(c.content, "text", "") for _, c in conn.sent
+        if isinstance(c, AgentMessageChunk)
+    )
+    assert "ask me to start it when you're ready" in chunks_text
+
+
+def test_kickoff_ok_false_offers_no_questions(tmp_path, monkeypatch):
+    """``ok: false`` (e.g. unknown recipe) → no permission ask; the orchestrator
+    gets the lint findings back from the MCP tool."""
+    proj, home = _kickoff_project(tmp_path, monkeypatch)
+    prompts: list[str] = []
+
+    def turn(lane, prompt, cwd, home_arg, resume, on_event):
+        async def _run():
+            prompts.append(prompt)
+            await on_event({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "toolu_k1",
+                 "name": "mcp__mini-ork__draft_kickoff",
+                 "input": {"recipe": "no-such-recipe",
+                           "kickoff_markdown": "# x\n"}}]}})
+            await on_event({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_k1",
+                 "content": [{"type": "text",
+                              "text": json.dumps({"ok": False,
+                                                   "error": "unknown recipe"})}]}]}})
+            return _Turn()
+        return _run()
+    turn_fn = lambda lane, prompt, cwd, home, resume, on_event: turn(
+        lane, prompt, cwd, home, resume, on_event)
+    agent, thread = _thread_agent(proj, orchestrator_turn=turn_fn)
+    conn = _PermConn([])
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("/kickoff")]))
+    # No permission ask landed on toolu_k1.
+    assert not any(tid == "toolu_k1" for tid, _ in conn.asked)

@@ -92,3 +92,23 @@ turn the request into an automation the user creates with a button:
 - `list_automations` shows the existing ones; to change one, propose
   again with the same id.
 - Keep automation ids short, lowercase, with hyphens.
+
+Writing a kickoff the user checks first:
+
+When the user asks for a kickoff to review ("write me a kickoff for …, I
+want to check it first"), or types `/kickoff …`:
+
+- Call `describe_recipe` for what the recipe expects and its example.
+- Read the code (Read / Grep / Glob) so `## Files in scope` names real
+  paths. Mark files the run creates with `(new)` after the path (e.g. `` - `mini_ork/foo.py` (new) ``).
+- Write a kickoff with: a one-line title; what to do and why; `## Files
+  in scope` (backtick-spans); `## Success criteria` with commands that
+  exit 0 (mirroring the recipe's example); a short out-of-scope note.
+- Then call `draft_kickoff` with the recipe and the markdown. The agent
+  shows the staged draft as a new-file diff with the lint findings, and
+  offers Start run / Save only / Change something / Discard.
+- If `draft_kickoff` returns error findings, fix the kickoff and call
+  `draft_kickoff` again. Warn-level findings are non-fatal but should be
+  addressed before saying the kickoff is ready.
+- Summarize in one or two lines. Never call `start_run` for a kickoff
+  the user wants to check — the user starts it with the button.
