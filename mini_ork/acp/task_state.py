@@ -216,8 +216,23 @@ def _write_diffstat(run_dir: Path, added: int, removed: int) -> None:
                 pass
 
 
-def _diff_counts(run_dir: Path) -> tuple[int, int] | None:
-    """``(added, removed)`` from the cached diff list; ``None`` on a hard failure.
+def _diff_counts(run_dir: Path) -> tuple[int, int, bool] | None:
+    """``(added, removed, cacheable)`` from the cached diff list; ``None`` on hard failure.
+
+    ``cacheable`` is True only when the counts can be safely persisted as
+    ``diffstat.json``:
+
+    - ``from_cache=True`` ⇒ the diff list came from the run's own
+      ``acp-diffs.json`` (always non-empty when persisted, see
+      ``diffs.run_diffs``'s ``if diffs and write_cache:`` gate). Cacheable.
+    - ``from_cache=False and diffs`` ⇒ counts came from a live
+      ``run_diffs`` call that returned a non-empty list. Cacheable.
+    - ``from_cache=False and not diffs`` ⇒ ``run_diffs`` short-circuited
+      to ``[]`` (no summary / worktree gone / empty ``files_changed``).
+      This is the r4 cache-poisoning trap in disguise — *not* cacheable.
+      An empty computed list must NOT persist ``(0, 0)``; the caller
+      shows the row at ``(0, 0)`` for this poll and recomputes next poll
+      (cheap: ``run_diffs`` returns before calling git).
 
     ``cached_or_computed`` swallows every failure (no DB, no cache,
     no git) and returns ``(diffs, from_cache)``; the count loop is
@@ -225,17 +240,20 @@ def _diff_counts(run_dir: Path) -> tuple[int, int] | None:
     the ``+++``/``---`` headers so they do not count as content lines.
 
     Returns ``None`` when the OUTER compute path (DB / git / cache
-    parse) fails so the caller can leave the row at ``(0, 0)`` for
+    parse) raises so the caller can leave the row at ``(0, 0)`` for
     this poll only and retry next poll — *never* persist a
     failure as ``(0, 0)`` (r5 fix 1, the r4 cache-poisoning trap).
-    A successful zero diff returns ``(0, 0)`` legitimately.
     """
     try:
         from mini_ork.acp.diffs import cached_or_computed
 
-        diffs, _ = cached_or_computed(Path(run_dir))
+        diffs, from_cache = cached_or_computed(Path(run_dir))
     except Exception:  # noqa: BLE001 — outer compute failure → no cache
         return None
+    # ``from_cache`` ⇒ run-authored, always non-empty ⇒ cacheable.
+    # ``from_cache=False`` ⇒ compute path: cacheable only if the live
+    # ``run_diffs`` returned real diffs. Empty computed list is the r6 trap.
+    cacheable = from_cache or bool(diffs)
     added = 0
     removed = 0
     for entry in diffs:
@@ -255,7 +273,7 @@ def _diff_counts(run_dir: Path) -> tuple[int, int] | None:
                     removed += 1
         except Exception:  # noqa: BLE001 — per-file failure is silent
             continue
-    return added, removed
+    return added, removed, cacheable
 
 
 def task_state(run_dir: Path, snapshot: dict[str, Any]) -> TaskState:
@@ -359,15 +377,19 @@ def task_state(run_dir: Path, snapshot: dict[str, Any]) -> TaskState:
             if cached_counts is not None:
                 added, removed = cached_counts
             else:
-                # Only cache a *successful* computation (r5 fix 1): a
-                # compute failure (None) leaves the row at (0, 0) for
-                # this poll only and is retried next poll — the r4
-                # cache-poisoning trap was that (0, 0) was persisted
-                # as a real result.
+                # Only cache a *successful* computation (r5 fix 1, r6
+                # extension): a compute failure (None) OR a non-cacheable
+                # result (empty computed list — the r4 cache-poisoning trap
+                # reborn) leaves the row at (0, 0) for this poll only and
+                # is retried next poll. ``cacheable`` is False when
+                # ``run_diffs`` returned ``[]`` (missing summary, worktree
+                # gone, empty ``files_changed``); the next poll pays one
+                # ``git show`` to recover — cheap, no half-committed cache.
                 computed = _diff_counts(path)
                 if computed is not None:
-                    added, removed = computed
-                    _write_diffstat(path, added, removed)
+                    added, removed, cacheable = computed
+                    if cacheable:
+                        _write_diffstat(path, added, removed)
         return TaskState(
             state="done",
             detail=PUBLISHED_DETAIL,

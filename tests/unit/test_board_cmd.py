@@ -691,21 +691,75 @@ def test_diffstat_written_on_first_runs_then_serves_second_call(
     assert matching[0]["removed"] == 2
 
 
-def test_diffstat_not_written_when_compute_fails(home: Path, monkeypatch) -> None:
-    """r5 fix 1: a compute failure in ``_diff_counts`` must NOT poison the cache.
+def test_diffstat_not_written_when_compute_returns_empty(home: Path, monkeypatch) -> None:
+    """r6 fix: ``run_diffs`` returning ``[]`` (no summary / worktree gone /
+    empty ``files_changed``) is the r4 cache-poisoning trap in disguise.
 
-    Poll 1: ``mini_ork.acp.diffs.run_diffs`` raised — ``diffstat.json`` must
-    NOT be written (the row shows (0, 0) for this poll only).
-    Poll 2: ``run_diffs`` unpatched, real diffs in the seed — ``diffstat.json``
-    is written with real counts.
+    ``_diff_counts`` returns ``(0, 0, cacheable=False)`` — counts are
+    *legitimately* zero but the bool must be False because the
+    underlying ``run_diffs`` short-circuited to ``[]`` before git.
+    Rule 4 MUST NOT persist ``(0, 0)`` here; an empty result is
+    recomputed next poll (cheap: ``run_diffs`` returns before calling
+    git).
+
+    Setup: no ``acp-diffs.json`` seeded so ``cached_or_computed``
+    falls through to the patched ``run_diffs``.
+    """
+    import mini_ork.acp.diffs as acp_diffs
+
+    run_id = "r-ds-empty-list"
+    _seed_run(home, run_id, "published")
+    # Deliberately do NOT seed acp-diffs.json — the empty list must come
+    # from the patched ``run_diffs`` so the cacheable signal is exercised.
+
+    cache_path = home / "runs" / run_id / "diffstat.json"
+    acp_cache = home / "runs" / run_id / "acp-diffs.json"
+    assert not acp_cache.is_file(), (
+        "test prerequisite — no pre-seeded acp-diffs.json so "
+        "cached_or_computed must reach run_diffs"
+    )
+
+    def empty(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(acp_diffs, "run_diffs", empty)
+    board_cmd._runs(home)
+    assert not cache_path.exists(), (
+        "empty run_diffs result must not poison diffstat.json with (0, 0) — "
+        "recompute on the next poll (cheap: run_diffs short-circuits before git)"
+    )
+
+
+def test_diffstat_not_written_when_compute_fails(home: Path, monkeypatch) -> None:
+    """r5 fix 1 + r6 fix: a compute failure in ``_diff_counts`` must NOT poison
+    the cache, AND the failure path must actually be exercised (r5 bug: poll 1
+    seeded ``acp-diffs.json`` so ``cached_or_computed`` short-circuited and
+    never reached the patched ``run_diffs``).
+
+    Poll 1: no ``acp-diffs.json`` seeded, ``run_diffs`` patched to raise.
+    ``cached_or_computed`` falls through to ``run_diffs`` which raises;
+    ``_diff_counts`` returns ``None``; rule 4 leaves the row at ``(0, 0)``
+    and does NOT write ``diffstat.json``.
+
+    Poll 2: ``run_diffs`` unpatched, ``acp-diffs.json`` seeded once.
+    ``cached_or_computed`` answers from cache (non-empty,
+    ``from_cache=True`` ⇒ ``cacheable=True``); counts computed and
+    ``diffstat.json`` written with the real counts.
     """
     import mini_ork.acp.diffs as acp_diffs
 
     run_id = "r-ds-fail-then-ok"
     _seed_run(home, run_id, "published")
-    _write_diff_cache(home, run_id, added=7, removed=3)
+    # Deliberately do NOT seed ``acp-diffs.json`` here — r5 did, which
+    # made the patched ``run_diffs`` never run on poll 1 and left the
+    # test asserting against a path it never exercised.
 
     cache_path = home / "runs" / run_id / "diffstat.json"
+    acp_cache = home / "runs" / run_id / "acp-diffs.json"
+    assert not acp_cache.is_file(), (
+        "test prerequisite — no pre-seeded acp-diffs.json so "
+        "cached_or_computed must reach run_diffs"
+    )
 
     # Poll 1: slow path blows up; cache must NOT be written.
     def boom(*_args, **_kwargs):
@@ -718,16 +772,11 @@ def test_diffstat_not_written_when_compute_fails(home: Path, monkeypatch) -> Non
         "and hides future real counts"
     )
 
-    # Poll 2: drop the patch AND the OTHER cache so ``cached_or_computed``
-    # must run ``run_diffs`` and succeed. ``diffstat.json`` appears with
-    # real counts.
+    # Poll 2: drop the patch so ``cached_or_computed`` would reach a real
+    # ``run_diffs`` if needed; seed ``acp-diffs.json`` so it can answer
+    # from cache (the run's own artifact) without needing a git repo.
+    # ``diffstat.json`` appears with real counts.
     monkeypatch.undo()
-    acp_cache = home / "runs" / run_id / "acp-diffs.json"
-    if acp_cache.is_file():
-        acp_cache.unlink()
-
-    # Seed a real diff cache so ``cached_or_computed`` can answer via
-    # ``run_diffs(write_cache=False)`` without needing a git repo.
     _write_diff_cache(home, run_id, added=7, removed=3)
 
     board_cmd._runs(home)
