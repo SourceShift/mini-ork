@@ -291,3 +291,31 @@ def test_no_args_returns_2_and_prints_usage(
     captured = capsys.readouterr()
     assert rc == 2
     assert "Usage: mini-ork zed" in captured.err
+
+def test_setup_layout_docks_the_task_board_panels(tmp_path, monkeypatch):
+    """``--layout`` moves only the dock keys and keeps every other panel setting."""
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(json.dumps({
+        "git_panel": {"dock": "left", "sort_by": "name"},
+        "agent": {"default_width": 700},
+        "theme": "One Dark",
+    }))
+    monkeypatch.setenv("ZED_SETTINGS", str(settings_file))
+    assert zed_cmd.main(["setup", "--layout"], root=str(tmp_path)) == 0
+    data = json.loads(settings_file.read_text())
+    assert data["git_panel"] == {"dock": "right", "sort_by": "name"}
+    assert data["project_panel"]["dock"] == "right"
+    assert data["agent"]["dock"] == "left"
+    assert data["agent"]["default_width"] == 700
+    assert data["agent"]["threads_sidebar"]["position"] == "left"
+    assert data["theme"] == "One Dark"
+
+
+def test_setup_without_layout_leaves_panels_alone(tmp_path, monkeypatch):
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(json.dumps({"git_panel": {"dock": "left"}}))
+    monkeypatch.setenv("ZED_SETTINGS", str(settings_file))
+    assert zed_cmd.main(["setup"], root=str(tmp_path)) == 0
+    data = json.loads(settings_file.read_text())
+    assert data["git_panel"] == {"dock": "left"}
+    assert "project_panel" not in data

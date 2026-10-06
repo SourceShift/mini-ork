@@ -177,6 +177,40 @@ def _build_context_entry(launcher: str, home: str | None) -> dict[str, Any]:
     return {"command": launcher, "args": ["mcp-context"], "env": _entry_env(home)}
 
 
+#: ``zed setup --layout``: the task-board arrangement — threads and the
+#: agent on the left, the Git panel (the task's files and changes) and the
+#: Project panel on the right. Zed's own "Panel Layout > Agentic" does the
+#: same for the current window; these keys make it the default.
+_LAYOUT_KEYS: tuple[tuple[str, str, str], ...] = (
+    ("agent", "dock", "left"),
+    ("git_panel", "dock", "right"),
+    ("project_panel", "dock", "right"),
+)
+
+
+def _apply_layout(data: dict[str, Any]) -> list[str]:
+    """Set the task-board dock positions in ``data``; return the keys changed.
+
+    Only the dock keys are touched — every other panel setting is kept.
+    A section that exists but is not an object is left alone.
+    """
+    changed: list[str] = []
+    for section, key, value in _LAYOUT_KEYS:
+        block = data.setdefault(section, {})
+        if not isinstance(block, dict):
+            continue
+        if block.get(key) != value:
+            block[key] = value
+            changed.append(f"{section}.{key} = {value}")
+    agent = data.get("agent")
+    if isinstance(agent, dict):
+        sidebar = agent.setdefault("threads_sidebar", {})
+        if isinstance(sidebar, dict) and sidebar.get("position") != "left":
+            sidebar["position"] = "left"
+            changed.append("agent.threads_sidebar.position = left")
+    return changed
+
+
 def _write_settings(path: str, data: dict[str, Any]) -> str | None:
     """Atomically write ``data`` to ``path`` after backing up the previous file.
 
@@ -228,6 +262,7 @@ def _cmd_setup(args: argparse.Namespace) -> int:
 
     data["agent_servers"]["mini-ork"] = _build_agent_entry(launcher, home)
     data["context_servers"]["mini-ork"] = _build_context_entry(launcher, home)
+    layout_changes = _apply_layout(data) if getattr(args, "layout", False) else []
 
     if args.dry_run:
         sys.stdout.write(
@@ -247,6 +282,15 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     )
     if home:
         sys.stdout.write(f"  env.MINI_ORK_HOME (both)         = {os.path.abspath(home)}\n")
+    for change in layout_changes:
+        sys.stdout.write(f"  {change}\n")
+    if getattr(args, "layout", False):
+        sys.stdout.write(
+            "  layout: threads + agent on the left, Git panel (the task's files and changes)\n"
+            "          on the right. In an open window: Panel Layout > Agentic, or the\n"
+            "          `workspace: use agentic layout` action. Start each task in its own\n"
+            "          worktree from the worktree picker in the title bar.\n"
+        )
     if os.environ.get("PATH"):
         sys.stdout.write("  env.PATH (both)                  = this shell's PATH (Zed from the Dock has a bare one;\n"
                          "                                     run setup again after installing a new CLI)\n")
@@ -368,6 +412,10 @@ def _build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--home", default=None, help="absolute MINI_ORK_HOME to embed")
     setup.add_argument(
         "--dry-run", action="store_true", help="print the resulting JSON, write nothing"
+    )
+    setup.add_argument(
+        "--layout", action="store_true",
+        help="also dock threads + agent left and the Git/Project panels right",
     )
 
     sub.add_parser("status", add_help=False)
