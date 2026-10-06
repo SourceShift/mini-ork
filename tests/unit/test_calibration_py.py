@@ -248,6 +248,10 @@ def test_recent_cutoff_compares_against_a_real_created_at(db, monkeypatch):
     """
     monkeypatch.setenv("MO_UCCI_WINDOW_DAYS", "1")
     cutoff = cal.recent_cutoff()
+    # One instant for the whole test: load_margin_rows reads the clock again,
+    # and if a second ticks in between the on-boundary row falls outside
+    # (seen on a loaded CI runner).
+    monkeypatch.setattr(cal, "recent_cutoff", lambda: cutoff)
     assert "T" in cutoff and " " not in cutoff
     # The same instant in the space-separated form is NOT an equivalent bound.
     # This is the trap the format exists to avoid, stated as an assertion.
