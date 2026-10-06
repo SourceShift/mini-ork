@@ -208,7 +208,10 @@ def _write_mcp_config(
     server's own defaults (``MINI_ORK_HOME``) win on key conflict so a
     caller cannot accidentally override the contract.
     """
-    env = {"MINI_ORK_HOME": str(home)}
+    # Both: bin/mini-ork prefers MINI_ORK_PROJECT_HOME, and an inherited one
+    # (from a thread opened in a linked worktree) would point at a home that
+    # does not exist.
+    env = {"MINI_ORK_HOME": str(home), "MINI_ORK_PROJECT_HOME": str(home)}
     if extra_env:
         for key, value in extra_env.items():
             env.setdefault(str(key), str(value))

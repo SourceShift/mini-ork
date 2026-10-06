@@ -601,6 +601,33 @@ class TestFire:
         assert branches.strip() == ""
         assert auto.load(home)[0]["last_error"] == "spawn failed"
 
+    def test_fire_names_directory_with_automation_id_and_suffix(self, tmp_path: Path) -> None:
+        """Z-W1: ``fire`` passes ``name=f"<id>-<rid[-6:]>"`` to
+        ``workspaces.create``; the worktree directory appears under
+        ``worktree_dir(project)`` with that name.
+        """
+        project = _git_repo(tmp_path)
+        home = project / ".mini-ork"
+        home.mkdir()
+        auto.add(home, id="nightly", name="n", recipe="code-fix",
+                 kickoff="# k", schedule="0 3 * * *", workspace="worktree")
+        captured: dict[str, Any] = {}
+
+        def fake_launch(*_a, **kw):
+            captured.update(kw)
+            return {"ok": True, "run_id": kw.get("run_id")}
+
+        result = auto.fire(home, "nightly", launcher=fake_launch)
+        assert result["ok"] is True
+        # MO_TARGET_CWD = worktree dir, which lives under worktree_dir(project).
+        from mini_ork import workspaces as _ws
+        expected_dir = _ws.worktree_dir(project)
+        target = Path(captured["extra_env"]["MO_TARGET_CWD"])
+        assert target.parent == expected_dir
+        # Name is ``<id>-<last 6 of run_id>``.
+        rid = captured["run_id"]
+        assert target.name == f"nightly-{rid[-6:]}"
+
     def test_success_clears_last_error_and_status_reads_it(self, tmp_path: Path) -> None:
         project = _git_repo(tmp_path)
         home = project / ".mini-ork"

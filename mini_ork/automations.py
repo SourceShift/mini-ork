@@ -835,7 +835,11 @@ def fire(
         from mini_ork import workspaces as _workspaces
 
         try:
-            ws = _workspaces.create(project, home, rid)
+            # Z-W1: name the worktree directory ``<automation id>-<last 6
+            # of run id>`` so it surfaces in Zed's worktree picker as the
+            # automation that owns it. The branch stays ``mini-ork/<rid>``.
+            ws_name = f"{automation_id}-{rid[-6:]}"
+            ws = _workspaces.create(project, home, rid, name=ws_name)
         except RuntimeError as exc:
             # Never fall back to the user's checkout: an unattended run
             # editing it in place is exactly what worktree mode prevents.

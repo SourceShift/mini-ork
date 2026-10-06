@@ -956,6 +956,137 @@ def test_start_run_non_git_project_falls_back_with_note(server_home, tmp_path, m
     assert captured["extra_env"] == {"MO_TARGET_CWD": str(not_a_repo)}
 
 
+def test_start_run_adopts_when_project_root_is_a_linked_worktree(server_home, tmp_path, monkeypatch):
+    """Z-W1: when ``MINI_ORK_HOME`` lives in a linked worktree (so
+    ``home.parent`` is the linked worktree itself), ``start_run`` adopts
+    that worktree instead of minting a new one. ``MO_TARGET_CWD`` points
+    at the linked worktree and the record's ``adopted`` flag is True.
+    """
+    repo = _git_repo(tmp_path)
+    # Create a linked worktree the MCP server will adopt.
+    wt_path = tmp_path / "linked-wt"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "wt-branch", str(wt_path)],
+        cwd=repo, check=True, capture_output=True,
+    )
+    # Place ``.mini-ork`` inside the linked worktree — that's how
+    # ``home.parent`` becomes a linked worktree.
+    home = wt_path / ".mini-ork"
+    home.mkdir()
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+
+    captured: dict = {}
+
+    def fake_launch(home, recipe, kickoff, run_id=None, extra_env=None):
+        captured["extra_env"] = extra_env
+        captured["run_id"] = run_id
+        return {
+            "ok": True,
+            "run_id": run_id or "rid",
+            "recipe": recipe,
+            "pid": 1,
+            "kickoff_path": "k",
+            "log_path": "l",
+        }
+
+    monkeypatch.setattr("mini_ork.web.control.launch_run", fake_launch)
+    resp = _call_args_control({
+        "name": "start_run",
+        "arguments": {
+            "recipe": "framework-edit",
+            "kickoff_markdown": "# hello\n",
+            "workspace": "worktree",
+        },
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is False
+    assert body["workspace"] == "worktree"
+    assert body["branch"] == "wt-branch"
+    assert body["adopted"] is True
+    # MO_TARGET_CWD points at the linked worktree, NOT a fresh one.
+    assert captured["extra_env"]["MO_TARGET_CWD"] == str(wt_path)
+    # Record reflects adopted state.
+    rid = body["run_id"]
+    record = json.loads((home / "worktrees" / f"{rid}.json").read_text())
+    assert record["adopted"] is True
+    assert record["path"] == str(wt_path)
+
+
+def test_start_run_from_a_thread_in_a_zed_worktree_adopts_it(server_home, tmp_path, monkeypatch):
+    """The real layout: the home is the MAIN checkout's .mini-ork (a linked
+    worktree has none — it is gitignored), the orchestrator thread runs in a
+    Zed linked worktree, and the agent passes its folder as MO_THREAD_CWD.
+    start_run adopts that worktree, so Zed's Git panel shows the change."""
+    repo = _git_repo(tmp_path)
+    home = repo / ".mini-ork"
+    home.mkdir()
+    wt_path = tmp_path / "worktrees" / "proj" / "fix-login"
+    subprocess.run(["git", "worktree", "add", "--detach", str(wt_path)],
+                   cwd=repo, check=True, capture_output=True)
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+    monkeypatch.setenv("MO_THREAD_CWD", str(wt_path))
+    captured: dict = {}
+
+    def fake_launch(home, recipe, kickoff, run_id=None, extra_env=None):
+        captured["extra_env"] = extra_env
+        return {"ok": True, "run_id": run_id, "recipe": recipe, "pid": 1,
+                "kickoff_path": "k", "log_path": "l"}
+
+    monkeypatch.setattr("mini_ork.web.control.launch_run", fake_launch)
+    resp = _call_args_control({"name": "start_run", "arguments": {
+        "recipe": "framework-edit", "kickoff_markdown": "# Fix login\n", "workspace": "worktree"}})
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert body["adopted"] is True
+    assert body["branch"] == f"mini-ork/{body['run_id']}"  # detached HEAD → a run branch
+    assert captured["extra_env"]["MO_TARGET_CWD"] == str(wt_path.resolve())
+    # No second worktree was created next to it.
+    listed = subprocess.run(["git", "worktree", "list"], cwd=repo, capture_output=True, text=True).stdout
+    assert len(listed.strip().splitlines()) == 2
+
+
+def test_start_run_creates_with_task_name_in_main_checkout(server_home, tmp_path, monkeypatch):
+    """Z-W1: when ``start_run`` runs from the main checkout, the new
+    worktree lives under ``worktree_dir(project)`` and its directory
+    name is ``task_name(<kickoff title>, <run id>)``.
+    """
+    repo = _git_repo(tmp_path)
+    home = repo / ".mini-ork"
+    home.mkdir()
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+    captured: dict = {}
+
+    def fake_launch(home, recipe, kickoff, run_id=None, extra_env=None):
+        captured["run_id"] = run_id
+        captured["extra_env"] = extra_env
+        return {
+            "ok": True,
+            "run_id": run_id or "rid",
+            "recipe": recipe,
+            "pid": 1,
+            "kickoff_path": "k",
+            "log_path": "l",
+        }
+
+    monkeypatch.setattr("mini_ork.web.control.launch_run", fake_launch)
+    resp = _call_args_control({
+        "name": "start_run",
+        "arguments": {
+            "recipe": "framework-edit",
+            "kickoff_markdown": "# Hello, World!\n",
+            "workspace": "worktree",
+        },
+    })
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert resp["result"]["isError"] is False
+    rid = body["run_id"]
+    target = Path(body["worktree"])
+    # Slug of "Hello, World!" → "hello-world".
+    assert target.name.startswith("hello-world-")
+    assert target.name.endswith(f"-{rid[-6:]}")
+    assert captured["extra_env"]["MO_TARGET_CWD"] == str(target)
+    assert body["adopted"] is False
+
+
 def test_start_run_rejects_unknown_workspace_value(server_home):
     resp = _call_args_control({
         "name": "start_run",

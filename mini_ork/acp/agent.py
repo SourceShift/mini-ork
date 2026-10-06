@@ -175,6 +175,25 @@ def mint_run_id() -> str:
     return f"run-{int(time.time())}-{secrets.token_hex(3)}"
 
 
+def task_name_for_kickoff(kickoff_text: str) -> str:
+    """First non-empty kickoff line with leading ``#`` stripped.
+
+    Direct-mode prompts and orchestrator kickoffs are markdown — the title
+    is the first heading line (or any non-empty line when no heading). The
+    title is then slugified in :func:`mini_ork.workspaces.task_name` to
+    become the worktree directory name (Z-W1). Returns ``""`` when the
+    text is empty or has no non-empty line.
+    """
+    for raw in (kickoff_text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            line = line.lstrip("#").strip()
+        return line
+    return ""
+
+
 def _mint_thread_id() -> str:
     """Mint an ``orch-…`` session id for a thread (orchestrator) session.
 
@@ -794,11 +813,41 @@ class MiniOrkAcpAgent:
         }
 
     def _home_for_for_cwd(self, cwd: str) -> Path:
-        """Resolve ``.mini-ork`` for a raw cwd (without a session id)."""
+        """Resolve ``.mini-ork`` for a raw cwd (without a session id).
+
+        When ``<cwd>/.mini-ork`` is missing and ``cwd`` is a git linked
+        worktree, fall through to ``<main_checkout>/.mini-ork`` so a
+        thread opened inside a Zed linked worktree (which is gitignored
+        and has no ``.mini-ork`` of its own) still finds the project's
+        home. See kickoff §Home resolution.
+        """
         candidate = Path(cwd) / ".mini-ork"
         if candidate.is_dir():
             return candidate
-        return self._resolve_home()
+        return self._home_in_linked_worktree(Path(cwd)) or self._resolve_home()
+
+    def _home_in_linked_worktree(self, cwd: Path) -> Path | None:
+        """``<main>/.mini-ork`` when ``cwd`` is a linked worktree, else ``None``.
+
+        Defensive: the import is inside the helper so a missing helper
+        (test harnesses that omit the workspace package) doesn't break
+        resolution — the no-home fallback in ``_home_for`` / ``_home_for_for_cwd``
+        still kicks in.
+        """
+        try:
+            from mini_ork import workspaces as _ws
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            if not _ws.is_linked_worktree(cwd):
+                return None
+            main = _ws.main_checkout(cwd)
+            if main is None:
+                return None
+            home = main / ".mini-ork"
+        except Exception:  # noqa: BLE001
+            return None
+        return home if home.is_dir() else None
 
     def _default_orchestrator_lane(self, home: Path) -> str:
         """Pick the default lane for a thread session at ``home``.
@@ -986,11 +1035,24 @@ class MiniOrkAcpAgent:
         (``agent.py:798-831``) so the picker renders as a free pick rather
         than a mode / model group. ``current_value`` falls back to the
         stored config, then ``_default_workspace``.
+
+        Z-W1: when the thread's cwd is a linked worktree, the ``worktree``
+        option is renamed ``This worktree (<dir>)`` — the picker surfaces
+        "this is the worktree you're already in" so the user knows the run
+        will ADOPT it (no new worktree).
         """
         cfg = self._thread_config.get(session_id) or {}
         current = str(cfg.get("workspace") or self._default_workspace)
         if current not in _WORKSPACE_VALUES:
             current = _WORKSPACE_WORKTREE
+        cwd = self._sessions.get(session_id) or ""
+        wt_label = self._worktree_picker_label(Path(cwd)) if cwd else _WORKSPACE_WORKTREE
+        wt_name = "This worktree" if wt_label is None else f"This worktree ({wt_label})"
+        wt_description = (
+            "Run commits onto the worktree's existing branch (no new worktree)."
+            if wt_label is not None
+            else "Each run edits and commits on its own branch."
+        )
         return SessionConfigOptionSelect(
             type="select",
             id="workspace",
@@ -1000,8 +1062,8 @@ class MiniOrkAcpAgent:
             options=[
                 SessionConfigSelectOption(
                     value=_WORKSPACE_WORKTREE,
-                    name="New worktree per task",
-                    description="Each run edits and commits on its own branch.",
+                    name=wt_name,
+                    description=wt_description,
                 ),
                 SessionConfigSelectOption(
                     value=_WORKSPACE_IN_PLACE,
@@ -1010,6 +1072,23 @@ class MiniOrkAcpAgent:
                 ),
             ],
         )
+
+    def _worktree_picker_label(self, cwd: Path) -> str | None:
+        """The directory name when ``cwd`` is a linked worktree, else ``None``.
+
+        Defensive against a missing workspaces helper — tests that omit the
+        workspaces package see a plain "worktree" picker label.
+        """
+        try:
+            from mini_ork import workspaces as _ws
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            if not _ws.is_linked_worktree(cwd):
+                return None
+            return cwd.name
+        except Exception:  # noqa: BLE001
+            return None
 
     def _recipe_entries(self, home: Path | None) -> list[Any]:
         """The project + engine recipe catalog; [] on any failure (the picker
@@ -1436,6 +1515,11 @@ class MiniOrkAcpAgent:
         back to in-place (the user's checkout is unchanged). The run
         marker title gains the `` · worktree mini-ork/<run_id>`` suffix
         so the thread UI surfaces isolation at a glance.
+
+        Z-W1: when the thread's cwd is a git linked worktree, the run
+        **adopts** it (no new worktree is minted; the run commits onto
+        the worktree's current branch). The marker suffix is
+        `` · this worktree <branch>`` so the user sees the difference.
         """
         if not text:
             return PromptResponse(stop_reason="refusal")
@@ -1449,13 +1533,26 @@ class MiniOrkAcpAgent:
         if workspace_mode not in _WORKSPACE_VALUES:
             workspace_mode = _WORKSPACE_WORKTREE
         ws_branch: str | None = None
+        ws_adopted: bool = False
         run_cwd = thread_cwd
         if workspace_mode == _WORKSPACE_WORKTREE:
             from mini_ork import workspaces as _workspaces
             try:
-                ws = _workspaces.create(
-                    Path(thread_cwd), self._home_for(session_id), new_run_id
-                )
+                if _workspaces.is_linked_worktree(Path(thread_cwd)):
+                    ws = _workspaces.adopt(
+                        Path(thread_cwd), self._home_for(session_id), new_run_id
+                    )
+                    ws_adopted = True
+                else:
+                    task_label = _workspaces.task_name(
+                        task_name_for_kickoff(text), new_run_id
+                    )
+                    ws = _workspaces.create(
+                        Path(thread_cwd),
+                        self._home_for(session_id),
+                        new_run_id,
+                        name=task_label,
+                    )
                 run_cwd = str(ws.path)
                 ws_branch = ws.branch
             except RuntimeError:
@@ -1483,7 +1580,11 @@ class MiniOrkAcpAgent:
         # would dedupe-by-id).
         self._thread_runs.setdefault(session_id, []).append(new_run_id)
         await self._open_run_marker(
-            session_id, new_run_id, recipe, worktree_branch=ws_branch
+            session_id,
+            new_run_id,
+            recipe,
+            worktree_branch=ws_branch,
+            adopted=ws_adopted,
         )
         self._direct_runs[session_id] = new_run_id
         try:
@@ -1574,7 +1675,10 @@ class MiniOrkAcpAgent:
             )
             ws: _workspaces.Workspace | None = None
             try:
-                ws = _workspaces.create(Path(thread_cwd), home, rid)
+                ws = _workspaces.create(
+                    Path(thread_cwd), home, rid,
+                    name=_workspaces.task_name(f"{task_name_for_kickoff(task)} {lane}", rid),
+                )
             except RuntimeError as exc:
                 await self._emit(
                     session_id,
@@ -3053,10 +3157,15 @@ class MiniOrkAcpAgent:
         recipe: str,
         *,
         worktree_branch: str | None = None,
+        adopted: bool = False,
     ) -> None:
         title = f"run {run_id} ({recipe})"
         if worktree_branch:
-            title = f"{title} · worktree {worktree_branch}"
+            # Adopted runs commit onto the existing branch in the user's
+            # linked worktree (``this worktree``) — vs. a freshly minted
+            # worktree (``worktree``). See kickoff §Where a run works.
+            prefix = "this worktree" if adopted else "worktree"
+            title = f"{title} · {prefix} {worktree_branch}"
         await self._emit(
             thread_id,
             ToolCallStart(
@@ -3364,9 +3473,13 @@ class MiniOrkAcpAgent:
         """
         from mini_ork.acp_orchestrator.harness import run_turn
 
-        extra_mcp_env: dict[str, str] | None = None
+        extra_mcp_env: dict[str, str] = {}
         if workspace_mode:
-            extra_mcp_env = {"MO_WORKSPACE_MODE": workspace_mode}
+            extra_mcp_env["MO_WORKSPACE_MODE"] = workspace_mode
+        if cwd:
+            # start_run adopts the thread's worktree when it is a linked one;
+            # the MCP server only knows the home, i.e. the main checkout.
+            extra_mcp_env["MO_THREAD_CWD"] = str(cwd)
         return await run_turn(
             lane=lane,
             prompt=prompt,
@@ -4614,14 +4727,21 @@ class MiniOrkAcpAgent:
 
         Step 1 — the session's bound cwd wins when ``<cwd>/.mini-ork`` is a
         directory (a CLI-started run in a different project resolves to the
-        right home). Steps 2–4 are the no-session fallback: constructor home →
-        ``MINI_ORK_HOME`` → ``<process cwd>/.mini-ork`` (``_resolve_home``).
+        right home). Step 2 — when ``<cwd>/.mini-ork`` is missing and the
+        cwd is a git linked worktree, the **main** checkout's ``.mini-ork``
+        is used (a Zed linked worktree is gitignored and has no
+        ``.mini-ork`` of its own). Steps 3–4 are the no-session fallback:
+        constructor home → ``MINI_ORK_HOME`` → ``<process cwd>/.mini-ork``
+        (``_resolve_home``).
         """
         cwd = self._sessions.get(session_id) if session_id is not None else None
         if cwd:
             candidate = Path(cwd) / ".mini-ork"
             if candidate.is_dir():
                 return candidate
+            linked_home = self._home_in_linked_worktree(Path(cwd))
+            if linked_home is not None:
+                return linked_home
         return self._resolve_home()
 
     def _launch(self, run_id: str, kickoff_text: str) -> dict[str, Any]:

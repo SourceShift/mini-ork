@@ -679,6 +679,10 @@ def launch_run(
     env = dict(os.environ)
     env["MINI_ORK_RUN_ID"] = rid
     env["MINI_ORK_HOME"] = str(home)
+    # bin/mini-ork prefers MINI_ORK_PROJECT_HOME over MINI_ORK_HOME, and the
+    # parent's value is whatever ITS cwd implied — e.g. <linked worktree>/.mini-ork,
+    # which does not exist. Pin both to the home this run belongs to.
+    env["MINI_ORK_PROJECT_HOME"] = str(home)
     env["MINI_ORK_ROOT"] = str(root)
     # Drop the parent's re-exec marker. If it leaked, bin/mini-ork's
     # _reexec_in_project_venv would skip the child's own venv re-exec and run on

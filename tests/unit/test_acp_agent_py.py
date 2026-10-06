@@ -787,6 +787,128 @@ def test_home_for_env_precedence(tmp_path, monkeypatch):
     assert agent._home_for(None) == Path(env_home)
 
 
+# ── Z-W1: linked-worktree home resolution + adopt + workspace picker label
+
+
+def _git_repo(tmp_path: Path) -> Path:
+    """Make a real git repo with one commit; mirrors ``_git_repo`` in other
+    test files but kept local to avoid cross-file fixtures."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=project,
+                   check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=project,
+                   check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@x"], cwd=project,
+                   check=True, capture_output=True)
+    (project / "README.md").write_text("hi\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=project, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=project,
+                   check=True, capture_output=True)
+    return project
+
+
+def test_home_for_falls_through_to_main_in_linked_worktree(tmp_path, monkeypatch):
+    """Z-W1: a session cwd that is a git linked worktree resolves the
+    main checkout's ``.mini-ork`` when the worktree has none of its own
+    (linked worktrees are gitignored)."""
+    project = _git_repo(tmp_path)
+    main_home = project / ".mini-ork"
+    main_home.mkdir()
+    # Add a linked worktree — no .mini-ork inside (it's gitignored).
+    wt = tmp_path / "proj-wt"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "wt-branch", str(wt)],
+        cwd=project, check=True, capture_output=True,
+    )
+    agent = MiniOrkAcpAgent()
+    agent._sessions["run-x"] = str(wt)
+    assert agent._home_for("run-x") == main_home
+
+
+def test_direct_mode_adopts_linked_worktree_and_marker_says_this_worktree(
+    tmp_path, monkeypatch
+):
+    """Z-W1: in a linked-worktree cwd, direct mode adopts (no new
+    worktree). MO_TARGET_CWD in the launcher equals the linked
+    worktree; the run marker says ``this worktree <branch>``."""
+    from unittest.mock import patch
+
+    project = _git_repo(tmp_path)
+    wt = tmp_path / "proj-wt"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "wt-branch", str(wt)],
+        cwd=project, check=True, capture_output=True,
+    )
+    main_home = project / ".mini-ork"
+    main_home.mkdir()
+
+    adopt_calls: dict = {}
+    create_calls: list = []
+
+    class _FakeWS:
+        def __init__(self, path, branch, adopted=False):
+            self.path = path
+            self.branch = branch
+            self.adopted = adopted
+
+    def fake_adopt(cwd, home, run_id):
+        adopt_calls["cwd"] = str(cwd)
+        adopt_calls["home"] = str(home)
+        adopt_calls["run_id"] = run_id
+        return _FakeWS(path=wt, branch="wt-branch", adopted=True)
+
+    def fake_create(*_a, **_k):
+        create_calls.append(_a)
+        raise AssertionError("create must not run in a linked worktree")
+
+    launched: dict = {}
+
+    def fake_launch(self, run_id, kickoff_text):
+        launched["run_id"] = run_id
+        launched["cwd"] = self._sessions.get(run_id)
+        return {"ok": True, "run_id": run_id}
+
+    with patch("mini_ork.acp_orchestrator.config.orchestrator_lanes",
+               return_value=[{"id": "opus", "name": "Opus"}]), \
+         patch("mini_ork.recipes_catalog.list_recipes",
+               return_value=[_recipe("code-fix")]), \
+         patch("mini_ork.workspaces.adopt", fake_adopt), \
+         patch("mini_ork.workspaces.create", fake_create), \
+         patch.object(MiniOrkAcpAgent, "_launch", fake_launch):
+        agent = MiniOrkAcpAgent(
+            reader=lambda _r: {"status": "published", "events": [], "llm_calls": []},
+            poll_interval=0,
+        )
+        resp = asyncio.run(agent.new_session(cwd=str(wt)))
+        sid = resp.session_id
+        asyncio.run(agent.set_config_option("mode", sid, "direct"))
+        asyncio.run(agent.prompt(sid, [_text_block("do it")]))
+
+    assert adopt_calls["cwd"] == str(wt)
+    assert adopt_calls["home"] == str(main_home)
+    assert create_calls == []
+    assert launched["cwd"] == str(wt)
+
+
+def test_workspace_picker_label_is_this_worktree_in_linked_worktree(tmp_path):
+    """Z-W1: when the thread's cwd is a linked worktree, the worktree
+    option in the picker is renamed ``This worktree (<dir>)``."""
+    project = _git_repo(tmp_path)
+    wt = tmp_path / "proj-wt"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "wt-branch", str(wt)],
+        cwd=project, check=True, capture_output=True,
+    )
+    (project / ".mini-ork").mkdir()
+    agent = MiniOrkAcpAgent(home=str(project / ".mini-ork"))
+    agent._sessions["run-x"] = str(wt)
+    opts = agent._build_workspace_config_option("run-x", project / ".mini-ork")
+    labels = [o.name for o in opts.options]
+    assert any("This worktree" in n for n in labels)
+    assert any("proj-wt" in n for n in labels)
+
+
 # ── Z3 live sidecar projection ─────────────────────────────────────────────
 
 
@@ -4177,10 +4299,11 @@ def test_direct_mode_worktree_creates_and_routes_to_worktree_path(tmp_path, monk
             self.path = path
             self.branch = branch
 
-    def fake_create(project, home, run_id):
+    def fake_create(project, home, run_id, *, name=None):
         captured["project"] = str(project)
         captured["home"] = str(home)
         captured["run_id"] = run_id
+        captured["name"] = name
         return _FakeWS(path=tmp_path / "ws", branch=f"mini-ork/{run_id}")
 
     launched: dict = {}
@@ -4226,7 +4349,7 @@ def test_direct_mode_in_place_skips_workspaces_create(tmp_path, monkeypatch):
 
     create_calls: list = []
 
-    def fake_create(project, home, run_id):
+    def fake_create(project, home, run_id, *, name=None):
         create_calls.append(run_id)
         raise AssertionError("workspaces.create must not run for in-place")
 
@@ -5030,7 +5153,7 @@ class _RaceWorkspaces:
         self.status_calls: list[str] = []
         self.loaded: dict[str, _RaceProbeWorkspace] = {}
 
-    def create(self, cwd, home, rid):  # noqa: ARG002 — race probe signature
+    def create(self, cwd, home, rid, *, name=None):  # noqa: ARG002 — race probe signature
         if not self.git_ok:
             raise RuntimeError("not a git repository")
         self.created.append(rid)
@@ -5792,3 +5915,37 @@ def test_kickoff_ok_false_offers_no_questions(tmp_path, monkeypatch):
     asyncio.run(agent.prompt(thread, [_text_block("/kickoff")]))
     # No permission ask landed on toolu_k1.
     assert not any(tid == "toolu_k1" for tid, _ in conn.asked)
+
+
+
+def test_new_task_worktree_is_named_after_the_task_not_the_raw_title(tmp_path, monkeypatch):
+    """Direct mode in the main checkout: the worktree folder is a slug of the
+    kickoff title + run suffix (it shows in Zed's worktree picker)."""
+    import subprocess
+    from mini_ork import workspaces as ws_mod
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    for cmd in (["git", "init", "-b", "main"], ["git", "config", "user.name", "T"],
+                ["git", "config", "user.email", "t@example.com"]):
+        subprocess.run(cmd, cwd=proj, check=True, capture_output=True)
+    (proj / "README.md").write_text("hi\n")
+    (proj / ".git" / "info" / "exclude").write_text(".mini-ork/\n")
+    subprocess.run(["git", "add", "README.md"], cwd=proj, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=proj, check=True, capture_output=True)
+    (proj / ".mini-ork").mkdir()
+    monkeypatch.setenv("MO_WORKTREE_DIR", str(tmp_path / "wts"))
+    launched: dict = {}
+
+    def launcher(rid, _kick):
+        launched["rid"] = rid
+        return {"ok": True, "run_id": rid}
+
+    agent, thread = _thread_agent(
+        proj, launcher=launcher,
+        reader=lambda _r: {"status": "failed", "events": [], "llm_calls": []})
+    asyncio.run(agent.prompt(thread, [_text_block("/run Fix: the login redirect!")]))
+    ws = ws_mod.load(proj / ".mini-ork", launched["rid"])
+    assert ws is not None
+    assert ws.path.name == f"fix-the-login-redirect-{launched['rid'][-6:]}"
+    assert ws.path.parent == (tmp_path / "wts" / "proj").resolve()  # Zed appends the project name

@@ -79,10 +79,36 @@ def _log(msg: str) -> None:
 
 
 def _resolve_home() -> Path:
-    """``MINI_ORK_HOME`` else ``<cwd>/.mini-ork`` (resolved)."""
+    """``MINI_ORK_HOME`` else ``<cwd>/.mini-ork`` (resolved).
+
+    Z-W1: when the cwd is a git linked worktree and the worktree itself
+    has no ``.mini-ork``, fall through to the **main** checkout's
+    ``.mini-ork`` (kickoff §Home resolution). A thread or worker launched
+    from inside a linked worktree reaches the same project state as one
+    launched from the main checkout.
+
+    Note: this fallback only fires when ``MINI_ORK_HOME`` is NOT set —
+    an explicit ``MINI_ORK_HOME`` always wins (test fixtures use it to
+    point at a hermetic tmp home).
+    """
     from mini_ork.web.db import resolve_home
 
-    return resolve_home(None)
+    if os.environ.get("MINI_ORK_HOME"):
+        return resolve_home(None)
+    home = resolve_home(None)
+    cwd = Path.cwd()
+    try:
+        from mini_ork import workspaces as _workspaces
+
+        if _workspaces.is_linked_worktree(cwd):
+            main = _workspaces.main_checkout(cwd)
+            if main is not None:
+                main_home = main / ".mini-ork"
+                if main_home.is_dir() and main_home != home:
+                    return main_home
+    except Exception:  # noqa: BLE001 — defensive against missing helper
+        pass
+    return home
 
 
 def _missing_home_error(home: Path) -> dict[str, str]:
@@ -517,7 +543,7 @@ def _start_run(home: Path, args: dict[str, Any]) -> dict[str, Any]:
 
     extra_env: dict[str, str] = {"MO_TARGET_CWD": str(project_root)}
     note: str | None = None
-    workspace_meta: dict[str, str] = {"workspace": workspace_mode}
+    workspace_meta: dict[str, Any] = {"workspace": workspace_mode}
     pre_minted_run_id: str | None = None
 
     if workspace_mode == "worktree":
@@ -528,13 +554,37 @@ def _start_run(home: Path, args: dict[str, Any]) -> dict[str, Any]:
         from mini_ork import workspaces as _workspaces
 
         pre_minted_run_id = mint_run_id()
+        # Derive the task title from the kickoff markdown for the worktree
+        # directory name (Z-W1). First non-empty line, leading ``#``
+        # stripped; falls back to "" when the text is empty.
+        title_line = ""
+        for raw in (kickoff_markdown or "").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith("#"):
+                line = line.lstrip("#").strip()
+            title_line = line
+            break
+        thread_cwd = Path(os.environ.get("MO_THREAD_CWD") or project_root)
         try:
-            ws = _workspaces.create(project_root, home, pre_minted_run_id)
+            if _workspaces.is_linked_worktree(thread_cwd):
+                # The thread runs in a (Zed) linked worktree: that worktree IS
+                # the task's workspace — the Git panel shows its changes.
+                ws = _workspaces.adopt(thread_cwd, home, pre_minted_run_id)
+            else:
+                ws = _workspaces.create(
+                    project_root,
+                    home,
+                    pre_minted_run_id,
+                    name=_workspaces.task_name(title_line, pre_minted_run_id),
+                )
             extra_env["MO_TARGET_CWD"] = str(ws.path)
             workspace_meta = {
                 "workspace": "worktree",
                 "worktree": str(ws.path),
                 "branch": ws.branch,
+                "adopted": ws.adopted,
             }
         except RuntimeError as exc:
             # Non-git repo (or a transient git failure) — fall back to
