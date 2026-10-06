@@ -152,20 +152,29 @@ def _backup_path(path: str) -> str:
     return f"{path}.bak-{timestamp}"
 
 
-def _build_agent_entry(launcher: str, home: str | None) -> dict[str, Any]:
-    """Build the ``agent_servers["mini-ork"]`` block."""
+def _entry_env(home: str | None) -> dict[str, str]:
+    """``MINI_ORK_HOME`` when given, plus the ``PATH`` of the shell running setup.
+
+    Zed started from the Dock gives its agents launchd's bare PATH
+    (``/usr/bin:/bin:…``), where the ``claude`` CLI the orchestrator runs on
+    — and the agent CLIs a run dispatches to — are not found.
+    """
     env: dict[str, str] = {}
     if home:
         env["MINI_ORK_HOME"] = os.path.abspath(home)
-    return {"type": "custom", "command": launcher, "args": ["acp"], "env": env}
+    if os.environ.get("PATH"):
+        env["PATH"] = os.environ["PATH"]
+    return env
+
+
+def _build_agent_entry(launcher: str, home: str | None) -> dict[str, Any]:
+    """Build the ``agent_servers["mini-ork"]`` block."""
+    return {"type": "custom", "command": launcher, "args": ["acp"], "env": _entry_env(home)}
 
 
 def _build_context_entry(launcher: str, home: str | None) -> dict[str, Any]:
     """Build the ``context_servers["mini-ork"]`` block."""
-    env: dict[str, str] = {}
-    if home:
-        env["MINI_ORK_HOME"] = os.path.abspath(home)
-    return {"command": launcher, "args": ["mcp-context"], "env": env}
+    return {"command": launcher, "args": ["mcp-context"], "env": _entry_env(home)}
 
 
 def _write_settings(path: str, data: dict[str, Any]) -> str | None:
@@ -238,6 +247,9 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     )
     if home:
         sys.stdout.write(f"  env.MINI_ORK_HOME (both)         = {os.path.abspath(home)}\n")
+    if os.environ.get("PATH"):
+        sys.stdout.write("  env.PATH (both)                  = this shell's PATH (Zed from the Dock has a bare one;\n"
+                         "                                     run setup again after installing a new CLI)\n")
     _warn_missing_acp()
     return 0
 

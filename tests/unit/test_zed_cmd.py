@@ -58,9 +58,10 @@ def test_setup_creates_both_entries_with_absolute_command(
     context = data["context_servers"]["mini-ork"]
     assert agent["type"] == "custom"
     assert agent["args"] == ["acp"]
-    assert agent["env"] == {}
+    # The shell's PATH travels with both entries: Zed from the Dock has a bare one.
+    assert agent["env"] == {"PATH": os.environ["PATH"]}
     assert context["args"] == ["mcp-context"]
-    assert context["env"] == {}
+    assert context["env"] == {"PATH": os.environ["PATH"]}
     # The launcher path must be absolute (macGUI apps do not inherit shell PATH).
     assert os.path.isabs(agent["command"])
     assert os.path.isabs(context["command"])
@@ -122,10 +123,10 @@ def test_setup_home_adds_mini_ork_home_to_both_envs(
 
     data = _read(settings_file)
     assert data["agent_servers"]["mini-ork"]["env"] == {
-        "MINI_ORK_HOME": str(project_home.resolve())
+        "MINI_ORK_HOME": str(project_home.resolve()), "PATH": os.environ["PATH"]
     }
     assert data["context_servers"]["mini-ork"]["env"] == {
-        "MINI_ORK_HOME": str(project_home.resolve())
+        "MINI_ORK_HOME": str(project_home.resolve()), "PATH": os.environ["PATH"]
     }
 
 
