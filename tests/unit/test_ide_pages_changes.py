@@ -61,7 +61,7 @@ def test_worktrees_lists_run_workspaces_with_merge_and_discard(project: Path, tm
     labels = [a["label"] for a in run_item["acts"]]
     assert labels == ["Merge into main", "Discard", "Open run"]
     assert run_item["acts"][0]["do"]["cli"] == ["board", "merge", "run-1791000000-aaaaaa"]
-    assert run_item["acts"][0]["do"]["confirm"] == "Merge"
+    assert run_item["acts"][0]["do"]["confirm"] == "Merge this run's branch into main?"
     assert run_item["acts"][1]["do"]["cli"] == ["board", "discard", "run-1791000000-aaaaaa"]
     assert run_item["acts"][1]["do"]["confirm"]
     other = items[1]
