@@ -307,8 +307,11 @@ def emit_unverified(post_rc, reason, replay=None, adequacy=None, flag="replay_un
     does not silently certify a non-verified patch, plus
     `<flag>: True` so a gate that knows about abstention can route it cleanly.
     The reason is prefixed with `unverified:` so an operator scanning the
-    verifier log sees the abstention immediately. ``adequacy`` (when present)
-    is the LAST key so the knob-off bytes are unchanged.
+    verifier log sees the abstention immediately. `status: "unverified"` is the
+    field to branch on; `pass` stays the conservative certify bit, and
+    `suite_green` records whether the post-patch suite itself was green
+    (`post_rc == 0`). `status` and `suite_green` are appended LAST so readers
+    that slice the JSON by byte position are unaffected.
     """
     payload = {
         "verifier": "test", "pass": False, "evidence_path": LOG_PATH,
@@ -321,6 +324,8 @@ def emit_unverified(post_rc, reason, replay=None, adequacy=None, flag="replay_un
         payload["replay"] = replay
     if adequacy is not None:
         payload["suite_adequacy"] = adequacy
+    payload["status"] = "unverified"
+    payload["suite_green"] = post_rc == 0
     print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
     return 0
 

@@ -45,7 +45,12 @@ Run `ls {{MO_CN_PREFETCH_DIR}}` — if any `*.md` files exist there, cat each on
 Issue APPROVE **only** when ALL of the following hold:
 
 1. `verifier_typecheck.json` → `pass: true`
-2. `verifier_test.json` → `pass: true`
+2. `verifier_test.json` → `pass: true`, **or** `status: "unverified"` with
+   `suite_green: true`. The second case means the suite itself passed and only
+   the extra delta-gate (replay) or suite-adequacy check abstained — it is
+   **not** a failure. Judge the diff on its merits and mention the abstention
+   in `evidence`. Never return `REQUEST_CHANGES` *because of* an abstention
+   alone.
 3. Every file in `implementer-summary.files_changed` is within the plan's
    expected edit surface (no scope surprise).
 4. The diff matches the plan's `decomposition` — no unexplained hunks.
@@ -58,7 +63,10 @@ If any single condition fails: do NOT APPROVE.
 ### REQUEST_CHANGES
 
 Issue REQUEST_CHANGES when the implementation is close but fixable in the next
-iteration. The `suggested_changes` array MUST be:
+iteration. An abstention in `verifier_test.json` (`status: "unverified"` with
+`suite_green: true`) is not a failure — never request changes *because of* an
+abstention alone; judge the diff on its merits and mention the abstention in
+`evidence`. The `suggested_changes` array MUST be:
 
 - Specific: name the file, the line range, and exactly what to change.
 - Actionable: the implementer must be able to act on each item without asking a
