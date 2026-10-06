@@ -18,11 +18,10 @@ deterministic evidence it names, REFUTED from a demonstrated failure, and
 UNVERIFIED (abstention — never a pass) otherwise. ``contract`` maps to
 ``"n/a"`` when no behavioral verifier produced a file.
 
-Opt-in knob ``MO_LEVEL_VECTOR`` (default OFF). OFF must be byte-identical to
-today: turning it on today would withhold all 61 audited published runs, so we
-measure first (smoke + live), exactly as ``MO_SUITE_ADEQUACY`` did. The knob is
+Opt-out knob ``MO_LEVEL_VECTOR`` (DEFAULT ON; ``"0"`` disables). The knob is
 read ONLY by :func:`enabled`; :func:`derive_levels` / :func:`level_report`
-never read it. Only ``"1"`` enables — ``"0"``, ``"true"`` and unset are OFF.
+never read it. Only ``"1"`` (or unset) enables — ``"0"``, ``"true"`` and any
+other value are OFF.
 
 Import-time contract: stdlib + ``mini_ork.context.context_env`` + the three
 status constants. No ``subprocess``, no ``mini_ork.cli`` / ``mini_ork.dispatch``,
@@ -52,13 +51,13 @@ def required_levels(task_class):
 
 
 def enabled(environ=None):
-    """True only when ``MO_LEVEL_VECTOR == "1"`` (default OFF).
+    """True only when ``MO_LEVEL_VECTOR == "1"`` (DEFAULT ON; ``"0"`` disables).
 
-    Reads ``environ`` when given, else ``context_env("MO_LEVEL_VECTOR", "0")``.
+    Reads ``environ`` when given, else ``context_env("MO_LEVEL_VECTOR", "1")``.
     """
     if environ is not None:
-        return environ.get("MO_LEVEL_VECTOR", "0") == "1"
-    return context_env("MO_LEVEL_VECTOR", "0") == "1"
+        return environ.get("MO_LEVEL_VECTOR", "1") == "1"
+    return context_env("MO_LEVEL_VECTOR", "1") == "1"
 
 
 def read_verifier_payload(path, verifier):

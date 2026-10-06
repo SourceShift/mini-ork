@@ -34,7 +34,7 @@
 #   MINI_ORK_RUN_ID      current run id (used in log path)
 #   MO_TEST_BASELINE     set to 0 to disable baseline (revert to absolute gating)
 #   MO_CODEFIX_REPLAY    set to 0 to disable the delta-gate replay (default ON)
-#   MO_SUITE_ADEQUACY               set to 1 to score the suite by mutant kill rate
+#   MO_SUITE_ADEQUACY               DEFAULT ON; set to 0 to skip the mutant-kill audit
 #   MO_SUITE_ADEQUACY_MAX_MUTANTS   cap on generated mutants (default 12, 1..50)
 #   MO_SUITE_ADEQUACY_MIN_SCORE     adequacy threshold (default 0.6, 0..1)
 #   MO_SUITE_ADEQUACY_TIMEOUT_S     per-run suite timeout (default 300, >=1)
@@ -326,14 +326,16 @@ def emit_unverified(post_rc, reason, replay=None, adequacy=None, flag="replay_un
 
 
 def _green_pass(reason, post_rc, replay=None):
-    """Route a green post-patch suite through the (optional) adequacy audit.
+    """Route a green post-patch suite through the adequacy audit (default ON).
 
-    Knob off: byte-identical to the pre-audit ``emit(True, …)``.
-    Knob on: run ``audit_suite`` against the changed source files and downgrade
-    a green that cannot kill its mutants to UNVERIFIED (pass:false, exit 0) —
-    the existing abstention contract, never a rollback.
+    Knob off (``MO_SUITE_ADEQUACY=0``): byte-identical to the pre-audit
+    ``emit(True, …)``. Knob on: run ``audit_suite`` against the changed source
+    files. ``ADEQUATE`` and ``NOT_APPLICABLE`` keep the pass (the latter means
+    the instrument does not apply to the change); anything else downgrades a
+    green that cannot kill its mutants to UNVERIFIED (pass:false, exit 0) — the
+    existing abstention contract, never a rollback.
     """
-    if os.environ.get("MO_SUITE_ADEQUACY", "0") != "1":
+    if os.environ.get("MO_SUITE_ADEQUACY", "1") != "1":
         return emit(True, reason, post_rc, replay=replay)
 
     if _suite_adequacy is None:
@@ -345,6 +347,9 @@ def _green_pass(reason, post_rc, replay=None):
         )
     if a["verdict"] == "ADEQUATE":
         return emit(True, f"{reason}; suite adequacy ADEQUATE (score {a['score']:.3f})",
+                    post_rc, replay=replay, adequacy=a)
+    if a["verdict"] == "NOT_APPLICABLE":
+        return emit(True, f"{reason}; suite adequacy n/a ({a['reason']})",
                     post_rc, replay=replay, adequacy=a)
     return emit_unverified(
         post_rc, f"suite-{a['verdict'].lower()}: {a['reason']}",

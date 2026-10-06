@@ -372,6 +372,7 @@ def test_knobs_off_byte_identical(monkeypatch):
         snapshots = {}
         for mode in modes:
             _clear_rel_env(monkeypatch)
+            monkeypatch.setenv("MO_ASSAY_RELATIONS", "0")  # DEFAULT ON now; pin OFF
             if mode == "rel0":
                 monkeypatch.setenv("MO_ASSAY_RELATIONS", "0")
             elif mode == "rescue1":
@@ -421,6 +422,7 @@ def test_knobs_on_invariants_refute_skips_relations(monkeypatch):
 def test_knobs_on_no_invariant_rescue_off_unchanged(monkeypatch):
     _clear_rel_env(monkeypatch)
     monkeypatch.setenv("MO_ASSAY_RELATIONS", "1")
+    monkeypatch.setenv("MO_ASSAY_RELATIONS_RESCUE", "0")  # "rescue off" is meant here
     seen: list[str] = []
     base = make_dispatch(mr_n=3, mr_block_n=0, relations_srcs=[REL_SRC])
 
@@ -509,3 +511,17 @@ def test_stderr_observability_line(capsys):
     for r in payload["records"]:
         assert "src" not in r
         assert "detail" not in r
+
+
+def test_enabled_default_on(monkeypatch):
+    monkeypatch.delenv("MO_ASSAY_RELATIONS", raising=False)
+    assert relations.enabled() is True
+    monkeypatch.setenv("MO_ASSAY_RELATIONS", "0")
+    assert relations.enabled() is False
+
+
+def test_rescue_enabled_default_on(monkeypatch):
+    monkeypatch.delenv("MO_ASSAY_RELATIONS_RESCUE", raising=False)
+    assert relations.rescue_enabled() is True
+    monkeypatch.setenv("MO_ASSAY_RELATIONS_RESCUE", "0")
+    assert relations.rescue_enabled() is False

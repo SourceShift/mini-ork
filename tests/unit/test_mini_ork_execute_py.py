@@ -1083,7 +1083,8 @@ def test_self_migrate_harvests_target_run_mirror_before_review(tmp_path):
     assert not (run_dir / "agent-migrator.stream.jsonl").exists()
 
 
-def test_run_verdict_preserves_recipe_detailed_verdict(tmp_path):
+def test_run_verdict_preserves_recipe_detailed_verdict(tmp_path, monkeypatch):
+    monkeypatch.setenv("MO_LEVEL_VECTOR", "0")  # DEFAULT ON now; pin the legacy 4-key shape
     run_dir = tmp_path / "run"; run_dir.mkdir()
     detailed = {"pass": True, "parity_pass": True}
     (run_dir / "verdict.json").write_text(json.dumps(detailed))

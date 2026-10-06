@@ -255,7 +255,7 @@ def test_generate_mutants_deterministic_and_capped(tmp_path):
 
 
 def test_enabled_knob():
-    assert suite_adequacy.enabled({}) is False
+    assert suite_adequacy.enabled({}) is True
     assert suite_adequacy.enabled({"MO_SUITE_ADEQUACY": "0"}) is False
     assert suite_adequacy.enabled({"MO_SUITE_ADEQUACY": "1"}) is True
     assert suite_adequacy.enabled({"MO_SUITE_ADEQUACY": "true"}) is False
@@ -343,6 +343,19 @@ def test_add():
     assert add(2, 3) == 5
 '''
 
+# Reads a plain-text config file so a fix that changes ONLY config.yaml is the
+# whole delta between a green candidate and a red base (replay overlap).
+CONFIG_TEST = '''\
+import os
+
+
+def test_threshold():
+    path = os.path.join(os.path.dirname(__file__), "config.yaml")
+    with open(path) as fh:
+        value = int(fh.read().strip().split("=")[1])
+    assert value == 2
+'''
+
 
 def _git(cwd: Path, *args: str) -> None:
     subprocess.check_call(
@@ -378,6 +391,7 @@ def _invoke(repo: Path, tmp_path: Path, *, replay: str, run_id: str,
     env["MINI_ORK_HOME"] = str(mini_home)
     env["MINI_ORK_RUN_ID"] = run_id
     env["MO_CODEFIX_REPLAY"] = replay
+    env.pop("MO_SUITE_ADEQUACY", None)  # DEFAULT ON now; only set when pinned
     if adequacy is not None:
         env["MO_SUITE_ADEQUACY"] = adequacy
     env["MINI_ORK_TEST_CMD"] = MINI_ORK_TEST_CMD
@@ -416,7 +430,7 @@ def test_knob_off_byte_identical(tmp_path):
     repo = _make_repo(tmp_path, mod_src=MOD_HEAD, test_src=TEST_STRONG)
     (repo / "mod.py").write_text(MOD_FIXED)
 
-    proc_unset = _invoke(repo, tmp_path, replay="1", run_id="knob-off")
+    proc_unset = _invoke(repo, tmp_path, replay="1", run_id="knob-off", adequacy="0")
     proc_zero = _invoke(repo, tmp_path, replay="1", run_id="knob-off", adequacy="0")
 
     last_unset = proc_unset.stdout.strip().splitlines()[-1]
@@ -469,3 +483,57 @@ def test_knob_on_weak_suite_inadequate(tmp_path):
     assert out["error_summary"].startswith("unverified: suite-inadequate"), out
     assert out["replay"]["overlap"] != [], out["replay"]
     assert out["suite_adequacy"]["survivors"] != [], out["suite_adequacy"]
+
+
+def test_no_sources_not_applicable(tmp_path):
+    # Only non-.py files in scope -> the instrument does not apply.
+    pkg = _make_package(tmp_path, CALC, STRONG_TEST)
+    res = suite_adequacy.audit_suite(str(pkg), CMD, ["readme.md", "config.yaml"])
+    assert res["verdict"] == "NOT_APPLICABLE", res
+    assert res["reason"].startswith("no-sources:"), res
+    assert res["mutants"] == [], res
+
+
+def test_too_few_sites_not_applicable(tmp_path):
+    # A one-line change (`X = 1`) has one mutation site, fewer than MIN_VALID.
+    pkg = _make_package(tmp_path, "X = 1\n", "def test_x():\n    assert True\n")
+    res = suite_adequacy.audit_suite(str(pkg), CMD, ["calc.py"])
+    assert res["verdict"] == "NOT_APPLICABLE", res
+    assert res["reason"] == "too-few-sites: 1", res
+
+
+def test_mutant_cap_below_min_valid_is_not_not_applicable(tmp_path, monkeypatch):
+    # A MAX_MUTANTS cap below MIN_VALID must not masquerade as "too few sites":
+    # the code has plenty of sites, so the audit cannot measure -> UNVERIFIED,
+    # never NOT_APPLICABLE (which would silently keep every green).
+    pkg = _make_package(tmp_path, CALC, STRONG_TEST)
+    monkeypatch.setenv("MO_SUITE_ADEQUACY_MAX_MUTANTS", "2")
+    res = suite_adequacy.audit_suite(str(pkg), CMD, ["calc.py"])
+    assert res["verdict"] == "UNVERIFIED", res
+
+
+def test_yaml_only_fix_not_applicable(tmp_path):
+    # Drive the REAL verifier with the knob UNSET: a fix that touches only a
+    # .yaml file has no .py in scope for the audit, so the green is kept via
+    # NOT_APPLICABLE and `adequacy_unverified` must stay absent.
+    repo = _make_repo(
+        tmp_path,
+        mod_src="def f():\n    return 1\n",
+        test_src=CONFIG_TEST,
+    )
+    (repo / "config.yaml").write_text("threshold=1\n")
+    _git(repo, "add", "config.yaml")
+    _git(repo, "commit", "-q", "-m", "add config")
+    (repo / "config.yaml").write_text("threshold=2\n")  # uncommitted non-.py fix
+
+    proc = _invoke(repo, tmp_path, replay="1", run_id="yaml-only", adequacy=None)
+    last = proc.stdout.strip().splitlines()
+    assert last, (
+        f"verifier produced no JSON: rc={proc.returncode} "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    out = json.loads(last[-1])
+
+    assert out["pass"] is True, out
+    assert out["suite_adequacy"]["verdict"] == "NOT_APPLICABLE", out
+    assert "adequacy_unverified" not in out, out

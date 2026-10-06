@@ -26,14 +26,13 @@ THE LAW
 The LLM proposes, execution decides, no LLM approves. PROVEN | REFUTED | UNVERIFIED, and an
 input not observed on BOTH sides is excluded and never counts as agreement.
 
-WHY THE KILL SWITCH IS OFF BY DEFAULT
-─────────────────────────────────────
+WHY THE KILL SWITCH IS ON BY DEFAULT
+────────────────────────────────────
 Every knob (`MO_ASSAY_DIFFERENTIAL`, `MO_ASSAY_DIFFERENTIAL_N`,
-`MO_ASSAY_DIFFERENTIAL_VETO_MIN`) is read at CALL time and defaults to OFF. A knob-less run
-dispatches no differential prompt and adds no `differential` key, so Verdicts are
-byte-identical to the pre-differential oracle until an operator opts in. This term can only
-turn a would-be PROVEN into REFUTED; it never creates PROVEN and never runs on a would-be
-REFUTED/UNVERIFIED.
+`MO_ASSAY_DIFFERENTIAL_VETO_MIN`) is read at CALL time and defaults to ON; `0` disables. A
+knob-less run dispatches the differential prompt and adds a `differential` key; set the knob
+to `0` for the byte-identical-to-pre-differential oracle. This term can only turn a would-be
+PROVEN into REFUTED; it never creates PROVEN and never runs on a would-be REFUTED/UNVERIFIED.
 """
 from __future__ import annotations
 
@@ -59,7 +58,7 @@ def _default_dispatch() -> DispatchFn:
     return default_dispatch
 
 
-# ── env knobs (read at CALL time; DEFAULT OFF) ───────────────────────────────
+# ── env knobs (read at CALL time; DEFAULT ON; `0` disables) ──────────────────
 _TRUE = {"1", "true", "yes", "on"}
 
 
@@ -68,9 +67,9 @@ def _truthy(value: str) -> bool:
 
 
 def enabled() -> bool:
-    """True iff `MO_ASSAY_DIFFERENTIAL` is set to a truthy value. Default OFF (kill switch
-    engaged): a knob-less run must be byte-identical to the pre-differential oracle."""
-    return _truthy(os.environ.get("MO_ASSAY_DIFFERENTIAL", ""))
+    """True iff `MO_ASSAY_DIFFERENTIAL` is truthy. DEFAULT ON; `0` disables (kill switch
+    released). A knob-less run dispatches the differential prompt."""
+    return _truthy(os.environ.get("MO_ASSAY_DIFFERENTIAL", "1"))
 
 
 def n_from_env() -> int:

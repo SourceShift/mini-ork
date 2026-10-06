@@ -71,6 +71,7 @@ def _run_verifier(repo: Path, tmp_path: Path, *, replay: str, run_id: str) -> di
     env["MINI_ORK_HOME"] = str(mini_home)
     env["MINI_ORK_RUN_ID"] = run_id
     env["MO_CODEFIX_REPLAY"] = replay
+    env["MO_SUITE_ADEQUACY"] = "0"  # these tests are about replay, not adequacy
     env["MINI_ORK_TEST_CMD"] = TEST_CMD
     # The verifier late-imports `mini_ork.certify`; that import needs the
     # worktree root on sys.path because the verifier is run as a script

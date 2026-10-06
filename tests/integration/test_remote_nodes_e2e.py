@@ -166,6 +166,11 @@ def _client(tmp_path: Path, node, *, lane: str = "e2e_fake") -> SimpleNamespace:
                 "MO_STATIC_RECIPE_PLAN": "1", "SSL_CERT_FILE": node.cert,
                 "MO_E2E_NODE_TOKEN": TOKEN, "MO_REMOTE_ALLOW_DIRTY_ENGINE": "1",
                 "PYTHONPATH": str(REPO)})
+    # The `MO_*` filter above drops the verification-stack knobs, which are now
+    # DEFAULT ON in the remote container. Pin them OFF: these tests exercise
+    # remote placement, not verification policy.
+    env["MO_LEVEL_VECTOR"] = "0"
+    env["MO_SUITE_ADEQUACY"] = "0"
     if lane == "e2e_fake":
         providers = tmp_path / "providers.yaml"
         providers.write_text(f"providers:\n  e2e_fake:\n    kind: executable\n    script: {FAKE_AGENT}\n")

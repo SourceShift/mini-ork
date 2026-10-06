@@ -18,13 +18,14 @@ Design constraints (all load-bearing):
 * copy, never touch — the live tree is never opened for writing. The audit runs
   inside a ``tempfile.mkdtemp`` + ``shutil.copytree`` copy that is always
   ``rmtree``-d in ``finally``.
-* opt-in — ``enabled`` is True only for ``MO_SUITE_ADEQUACY == "1"``, because
-  each audit costs up to 2+N extra full suite runs and changes code-fix
-  verdicts.
+* opt-out — ``enabled`` is True unless ``MO_SUITE_ADEQUACY == "0"`` (DEFAULT
+  ON; ``"0"`` disables). Each audit costs up to 2+N extra full suite runs and
+  changes code-fix verdicts, so a change too small to mutate is NOT_APPLICABLE
+  rather than downgraded.
 
 Knobs (module defaults; see :func:`settings`):
 
-  MO_SUITE_ADEQUACY                set to "1" to enable the audit
+  MO_SUITE_ADEQUACY                DEFAULT ON; set to "0" to disable the audit
   MO_SUITE_ADEQUACY_MAX_MUTANTS    cap on generated mutants (default 12, 1..50)
   MO_SUITE_ADEQUACY_MIN_SCORE      adequacy threshold (default 0.6, 0..1)
   MO_SUITE_ADEQUACY_TIMEOUT_S      per-run suite timeout (default 300, >=1)
@@ -128,9 +129,9 @@ class _Site:
 
 
 def enabled(environ=None) -> bool:
-    """True only when ``MO_SUITE_ADEQUACY == "1"`` (default OFF)."""
+    """True only when ``MO_SUITE_ADEQUACY == "1"`` (DEFAULT ON; ``"0"`` disables)."""
     src = os.environ if environ is None else environ
-    return src.get("MO_SUITE_ADEQUACY", "0") == "1"
+    return src.get("MO_SUITE_ADEQUACY", "1") == "1"
 
 
 def settings(environ=None) -> dict:
@@ -508,12 +509,18 @@ def _build_result(verdict, reason, *, files, max_mutants, min_score, score=None,
 def _audit(repo_dir, test_cmd, source_files, max_mutants, min_score, timeout_s):
     files = _eligible_files(repo_dir, source_files)
     if not files:
-        return _build_result("UNVERIFIED", "no-sources: no eligible .py files in scope",
+        return _build_result("NOT_APPLICABLE", "no-sources: no eligible .py files in scope",
                              files=[], max_mutants=max_mutants, min_score=min_score)
 
     mutants = generate_mutants(repo_dir, source_files, max_mutants=max_mutants, seed=0)
-    if not mutants:
-        return _build_result("UNVERIFIED", "no-sites: no mutation sites in eligible files",
+    if len(mutants) < MIN_VALID and len(mutants) < max_mutants:
+        # The change yields fewer than MIN_VALID mutation sites — the instrument
+        # does not apply to it, so keep the green rather than downgrade it. This
+        # is distinct from the post-run `too-few-valid` UNVERIFIED below, where
+        # sites existed but runs crashed/timed out. A generation capped by
+        # MO_SUITE_ADEQUACY_MAX_MUTANTS < MIN_VALID is NOT "too few sites": it
+        # falls through and ends UNVERIFIED, so the cap cannot switch the audit off.
+        return _build_result("NOT_APPLICABLE", f"too-few-sites: {len(mutants)}",
                              files=files, max_mutants=max_mutants, min_score=min_score)
 
     tmp = tempfile.mkdtemp(prefix="mo-suite-adequacy-")

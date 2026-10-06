@@ -22,12 +22,13 @@ THE LAW
 The LLM proposes, execution decides, no LLM approves. PROVEN | REFUTED | UNVERIFIED, and a
 relation that cannot execute ABSTAINS and never counts as holding.
 
-WHY THE KILL SWITCH IS OFF BY DEFAULT
-─────────────────────────────────────
+WHY THE KILL SWITCH IS ON BY DEFAULT
+────────────────────────────────────
 Every knob (`MO_ASSAY_RELATIONS`, `MO_ASSAY_RELATIONS_RESCUE`) is read at CALL time and
-defaults to OFF. A knob-less run dispatches no relation prompt and adds no `relations` key,
-so Verdicts are byte-identical to the pre-relations oracle — the measured recall/doctrine
-(arXiv 2602.10522, 2603.24774) is preserved until an operator opts in.
+defaults to ON; `0` disables. A knob-less run dispatches the relation prompt and adds a
+`relations` key; set the knob to `0` for a byte-identical-to-pre-relations oracle — the
+measured recall/doctrine (arXiv 2602.10522, 2603.24774) remains reachable by explicit
+opt-out.
 """
 from __future__ import annotations
 
@@ -53,7 +54,7 @@ def _default_dispatch() -> DispatchFn:
     return default_dispatch
 
 
-# ── env knobs (read at CALL time; DEFAULT OFF) ───────────────────────────────
+# ── env knobs (read at CALL time; DEFAULT ON; `0` disables) ──────────────────
 _TRUE = {"1", "true", "yes", "on"}
 
 
@@ -62,14 +63,15 @@ def _truthy(value: str) -> bool:
 
 
 def enabled() -> bool:
-    """True iff `MO_ASSAY_RELATIONS` is set to a truthy value. Default OFF (kill switch
-    engaged): a knob-less run must be byte-identical to the pre-relations oracle."""
-    return _truthy(os.environ.get("MO_ASSAY_RELATIONS", ""))
+    """True iff `MO_ASSAY_RELATIONS` is truthy. DEFAULT ON; `0` disables (kill switch
+    released). A knob-less run dispatches the relation prompt."""
+    return _truthy(os.environ.get("MO_ASSAY_RELATIONS", "1"))
 
 
 def rescue_enabled() -> bool:
-    """True iff `MO_ASSAY_RELATIONS_RESCUE` is set truthy. Ignored unless `enabled()`."""
-    return _truthy(os.environ.get("MO_ASSAY_RELATIONS_RESCUE", ""))
+    """True iff `MO_ASSAY_RELATIONS_RESCUE` is truthy (DEFAULT ON; `0` disables). Ignored
+    unless `enabled()`."""
+    return _truthy(os.environ.get("MO_ASSAY_RELATIONS_RESCUE", "1"))
 
 
 def k_from_env() -> int:

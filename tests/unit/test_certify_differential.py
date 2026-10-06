@@ -616,6 +616,7 @@ def test_knobs_off_byte_identical(monkeypatch):
         for mode in modes:
             _clear_diff_env(monkeypatch)
             _clear_rel_env(monkeypatch)
+            monkeypatch.setenv("MO_ASSAY_DIFFERENTIAL", "0")  # DEFAULT ON now; pin OFF
             if mode == "diff0":
                 monkeypatch.setenv("MO_ASSAY_DIFFERENTIAL", "0")
             elif mode == "n6":
@@ -792,6 +793,13 @@ def test_enabled_values(monkeypatch):
     for v in ("0", "false", "no", "off", "", "maybe"):
         monkeypatch.setenv("MO_ASSAY_DIFFERENTIAL", v)
         assert not differential.enabled(), v
+
+
+def test_enabled_default_on(monkeypatch):
+    monkeypatch.delenv("MO_ASSAY_DIFFERENTIAL", raising=False)
+    assert differential.enabled() is True
+    monkeypatch.setenv("MO_ASSAY_DIFFERENTIAL", "0")
+    assert differential.enabled() is False
 
 
 def test_split_values():

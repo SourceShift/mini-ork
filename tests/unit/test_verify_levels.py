@@ -239,7 +239,7 @@ def test_predicate():
 
 
 def test_enabled_knob():
-    assert L.enabled({}) is False
+    assert L.enabled({}) is True
     assert L.enabled({"MO_LEVEL_VECTOR": "0"}) is False
     assert L.enabled({"MO_LEVEL_VECTOR": "true"}) is False
     assert L.enabled({"MO_LEVEL_VECTOR": "1"}) is True
@@ -270,7 +270,7 @@ def test_read_verifier_payload(tmp_path):
 def test_emit_run_verdict_bytes(tmp_path, monkeypatch):
     old_bytes = b'{"verdict":"pass","failed_nodes":0,"dispatched":3,"source":"execute@run-level"}\n'
 
-    monkeypatch.delenv("MO_LEVEL_VECTOR", raising=False)
+    monkeypatch.setenv("MO_LEVEL_VECTOR", "0")  # DEFAULT ON now; pin OFF
     rd = tmp_path / "off"; rd.mkdir()
     ex._emit_run_verdict(str(rd), 0, 3)
     assert (rd / "verdict.json").read_bytes() == old_bytes
@@ -389,7 +389,8 @@ def test_real_strong_knob_on(tmp_path, monkeypatch):
     repo = _make_repo(tmp_path, mod_src=MOD_BUG, test_src=TEST_UNITTEST)
     (repo / "mod.py").write_text(MOD_FIX)  # uncommitted fix
     rc, db, rd = _drive_main(tmp_path, monkeypatch, repo=repo, run_id="r9",
-                             test_cmd=PYTEST_CMD, knob=True)
+                             test_cmd=PYTEST_CMD, knob=True,
+                             extra_env={"MO_SUITE_ADEQUACY": "0"})
     assert rc == 0
 
     verdict = json.loads((rd / "verdict.json").read_text())
@@ -436,7 +437,8 @@ def test_real_replay_abstain_knob_off(tmp_path, monkeypatch):
     repo = _make_repo(tmp_path, mod_src=MOD_BUG, test_src=TEST_UNITTEST)
     (repo / "mod.py").write_text(MOD_FIX)
     rc, db, rd = _drive_main(tmp_path, monkeypatch, repo=repo, run_id="r11",
-                             test_cmd=UNITTEST_CMD, knob=False)
+                             test_cmd=UNITTEST_CMD, knob=False,
+                             extra_env={"MO_LEVEL_VECTOR": "0"})
     assert rc == 0
 
     # verdict.json is the old literal bytes (today's gap: the abstention publishes)
