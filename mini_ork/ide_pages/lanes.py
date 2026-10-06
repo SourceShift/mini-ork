@@ -437,4 +437,4 @@ def _ledger(home: Path) -> dict[str, Any]:
                                if r.get("run_id") and (home / "runs" / str(r["run_id"])).is_dir()
                                else None)})
     return S.table("Ledger · latest calls", cols, head, out,
-                   actions=[S.btn("Usage report", S.cli("usage-report"), "ghost")])
+                   actions=[S.btn("Usage report", S.cli("usage-report", home=False), "ghost")])

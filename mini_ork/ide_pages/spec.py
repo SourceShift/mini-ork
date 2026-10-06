@@ -59,8 +59,17 @@ KINDS = ("primary", "default", "danger", "warn", "ghost")
 
 # ── actions ────────────────────────────────────────────────────────────────
 
-def cli(*args: str, confirm: str | None = None) -> dict[str, Any]:
-    return _with_confirm({"cli": [str(a) for a in args]}, confirm)
+def cli(*args: str, confirm: str | None = None, home: bool = True) -> dict[str, Any]:
+    """An action that runs a mini-ork subcommand.
+
+    ``home=False`` tells the IDE not to append ``--home``: the subcommand reads
+    ``MINI_ORK_HOME`` from the environment instead. Use it for subcommands whose
+    argparse rejects ``--home`` (``nodes ping|doctor``, ``sandbox-gc``,
+    ``bugs sweep|promote``, ``traceotter``, ``usage-report``)."""
+    out: dict[str, Any] = {"cli": [str(a) for a in args]}
+    if not home:
+        out["home"] = False
+    return _with_confirm(out, confirm)
 
 
 def page_link(key: str, tab: str | None = None, **args: Any) -> dict[str, Any]:
@@ -200,7 +209,7 @@ def bars(title: str, items: Iterable[tuple | list], **opt: Any) -> dict[str, Any
     out = []
     for i in items:
         i = list(i) + [None]
-        pct = max(1.0, min(100.0, float(i[1] or 0)))
+        pct = max(0.0, min(100.0, float(i[1] or 0)))
         out.append({"label": str(i[0]), "pct": round(pct, 1), "val": str(i[2]), "c": i[3] or "blue"})
     return _section("bars", title, {"items": out}, **opt)
 

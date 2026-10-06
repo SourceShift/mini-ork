@@ -108,7 +108,7 @@ def _nodes_table(home: Path, registry: dict[str, dict], markers: list[dict[str, 
         rows.append({"cells": [S.mono(name), S.muted("not probed"), S.muted("node-agent"),
                                S.mono(remote_by_node.get(name, 0)), S.mono("—"),
                                S.muted(entry.get("image") or entry.get("url") or "—")],
-                     "do": S.cli("nodes", "ping", name)})
+                     "do": S.cli("nodes", "ping", name, home=False)})
     note = ("Click a node to ping its /v1/health. Nothing is probed when this page opens."
             if registry else "No remote nodes registered — runs execute on this machine.")
     actions = []
@@ -126,7 +126,7 @@ def _doctor(registry: dict[str, dict]) -> dict[str, Any]:
     items = [S.dot(check, "not run") for check in CHECKS]
     return S.lst(f"Doctor · {target}", items,
                  note="An ordered preflight for an environment, with a fix hint per failure.",
-                 actions=[S.btn("Run doctor", S.cli("nodes", "doctor", "--no-llm"), "primary")])
+                 actions=[S.btn("Run doctor", S.cli("nodes", "doctor", "--no-llm", home=False), "primary")])
 
 
 def _remote_runs(home: Path, markers: list[dict[str, Any]]) -> dict[str, Any]:
@@ -242,7 +242,7 @@ def _sandboxes(home: Path, markers: list[dict[str, Any]], now: float) -> dict[st
                 else f"The reaper sweeps instances older than {hours} h; none waiting.")
     return S.table("Docker sandboxes", [S.col(fr=1), S.col(90), S.col(110)], ["sandbox", "run", "age"],
                    rows, full=True, note=note,
-                   actions=[S.btn("sandbox-gc", S.cli("sandbox-gc", confirm="Remove sandboxes older than the TTL?"),
+                   actions=[S.btn("sandbox-gc", S.cli("sandbox-gc", confirm="Remove sandboxes older than the TTL?", home=False),
                                   "primary")])
 
 

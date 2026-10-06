@@ -100,7 +100,9 @@ def _detail(row: dict[str, Any]) -> dict[str, Any]:
     aid = row["id"]
     enabled = bool(row.get("enabled"))
     actions = [
-        S.btn("Run now", S.cli("automations", "run", aid), "primary"),
+        S.btn("Run now", S.cli("automations", "run", aid,
+                               confirm=f"Start a run of {row.get('recipe') or 'this automation'} now?"),
+              "primary"),
         S.btn("Pause" if enabled else "Resume", S.cli("automations", "pause" if enabled else "resume", aid)),
         S.btn("Delete", S.cli("automations", "remove", aid,
                               confirm=f"Delete the automation {aid}? Its past runs stay."), "danger"),

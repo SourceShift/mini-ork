@@ -86,9 +86,11 @@ def test_active_tab_shows_the_open_node_lane_and_a_stop_button(home: Path) -> No
     assert cells[2]["c"] == "fam:sonnet"
     assert cells[4]["c"] == "green" and cells[4]["t"].endswith("s ago")
     controls = _section(p, "list", "Controls")
-    stop = controls["items"][0]["acts"][0]
-    assert stop["label"] == "Stop" and stop["do"]["cli"] == ["board", "stop", "run-1791000002-cccccc"]
-    assert stop["do"]["confirm"]
+    acts_by_label = {a["label"]: a for a in controls["items"][0]["acts"]}
+    assert acts_by_label["Stop"]["do"]["cli"] == ["board", "stop", "run-1791000002-cccccc"]
+    assert acts_by_label["Stop"]["do"]["confirm"]
+    assert acts_by_label["Kill"]["do"]["cli"] == ["board", "kill", "run-1791000002-cccccc"]
+    assert acts_by_label["Kill"]["do"]["confirm"]
     assert controls["items"][-1]["acts"][0]["do"] == {"page": "verify", "tab": "autonomy"}
 
 
@@ -102,6 +104,8 @@ def test_a_cost_paused_run_is_listed_as_paused(home: Path) -> None:
     assert cells[4]["t"] == "paused · cost"
     item = _section(p, "list", "Controls")["items"][0]
     assert "paused on cost" in item["t"] and "mini-ork resume" in item["sub"]
+    resume = next(a for a in item["acts"] if a["label"] == "Resume")
+    assert resume["do"] == {"cli": ["board", "resume", "run-1791000003-dddddd"]}
 
 
 def test_hooks_tab_reports_the_handler_and_the_event_tail(home: Path, monkeypatch) -> None:

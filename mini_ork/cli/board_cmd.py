@@ -10,6 +10,10 @@ truth.
   board run <run_id> [--home H]       one run's card (markdown) + its open workspace
   board merge|discard <run_id>        act on a run's workspace
   board stop <run_id>                 soft-stop a running run
+  board kill <run_id>                 SIGTERM then SIGKILL after 2 s
+  board resume <run_id>               resume a cost-paused run
+  board gate approve|reject <id> [--note TEXT]
+                                      resolve a mo_inbox_gates row
   board page <key> [--tab T] [--arg k=v ...]
                                       one IDE page as data (mini_ork.ide_pages)
 
@@ -367,6 +371,39 @@ def act(home: Path, verb: str, run_id: str) -> dict[str, Any]:
     return workspaces.discard(ws)
 
 
+def _act_kill(home: Path, run_id: str) -> dict[str, Any]:
+    """SIGTERM, then SIGKILL after 2 s — wired through the live control plane."""
+    from mini_ork.web.control import kill_run
+    from mini_ork.web.deps import db_for
+
+    return kill_run(home, db_for(home), run_id)
+
+
+def _act_resume(home: Path, run_id: str) -> dict[str, Any]:
+    """Lift the cost-pause sentinel on a run; ``approver="ide"`` records who."""
+    from mini_ork.web.control import resume_cost_run
+
+    return resume_cost_run(home, run_id, approver="ide")
+
+
+def _act_gate(home: Path, action: str, inbox_id: str, note: str | None) -> dict[str, Any]:
+    """Resolve a ``mo_inbox_gates`` row. ``False`` ⇒ already decided."""
+    from mini_ork.gates.oversight_inbox import resolve
+
+    db_path = home / "state.db"
+    if not db_path.is_file():
+        return {"ok": False, "error": "no state.db"}
+    try:
+        iid = int(inbox_id)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "invalid inbox id"}
+    status = "approved" if action == "approve" else "rejected"
+    ok = resolve(iid, status, review_note=note or "", db_path=db_path)
+    if not ok:
+        return {"ok": False, "error": "not pending"}
+    return {"ok": True, "inbox_id": iid, "status": status}
+
+
 def _default_home() -> Path:
     return Path(os.environ.get("MINI_ORK_HOME", "").strip() or (Path.cwd() / ".mini-ork"))
 
@@ -375,20 +412,31 @@ def main(rest: list[str], root: str) -> int:
     del root
     parser = argparse.ArgumentParser(prog="mini-ork board", add_help=False)
     parser.add_argument("verb", nargs="?", default="show",
-                        choices=["show", "run", "merge", "discard", "stop", "page"])
+                        choices=["show", "run", "merge", "discard", "stop", "kill", "resume", "gate", "page"])
     parser.add_argument("run_id", nargs="?")
+    # `gate approve|reject <inbox_id>` puts the action in run_id and the id here.
+    parser.add_argument("target", nargs="?")
     parser.add_argument("--home", default=None)
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--tab", default=None)
     parser.add_argument("--arg", action="append", default=[])
+    parser.add_argument("--note", default=None)
     try:
         args = parser.parse_args(rest)
     except SystemExit:
-        sys.stderr.write("usage: mini-ork board [run|merge|discard|stop <run_id>] "
+        sys.stderr.write("usage: mini-ork board [run|merge|discard|stop|kill|resume <run_id>] "
+                         "[gate approve|reject <inbox_id> [--note TEXT]] "
                          "[page <key> [--tab T] [--arg k=v]] [--home H] [--json]\n")
         return 2
     home = (Path(args.home) if args.home else _default_home()).expanduser().absolute()
-    if args.verb != "show" and not args.run_id:
+    if args.verb == "gate":
+        if not args.run_id or args.run_id not in ("approve", "reject"):
+            sys.stderr.write("mini-ork board gate: action must be 'approve' or 'reject'\n")
+            return 2
+        if not args.target:
+            sys.stderr.write("mini-ork board gate: an inbox id is required\n")
+            return 2
+    elif args.verb != "show" and not args.run_id:
         what = "a page key" if args.verb == "page" else "a run id"
         sys.stderr.write(f"mini-ork board {args.verb}: {what} is required\n")
         return 2
@@ -401,6 +449,12 @@ def main(rest: list[str], root: str) -> int:
         payload = board(home)
     elif args.verb == "run":
         payload = run_card(home, args.run_id)
+    elif args.verb == "kill":
+        payload = _act_kill(home, args.run_id)
+    elif args.verb == "resume":
+        payload = _act_resume(home, args.run_id)
+    elif args.verb == "gate":
+        payload = _act_gate(home, args.run_id, args.target, args.note)
     else:
         payload = act(home, args.verb, args.run_id)
     sys.stdout.write(json.dumps(payload, default=str) + "\n")

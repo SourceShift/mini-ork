@@ -129,8 +129,10 @@ def test_bugs_tab(seeded: Path) -> None:
     assert table["head"] == ["id", "report", "source", "score"]
     assert [c["t"] for c in table["rows"][0]["cells"]][1:] == ["verdict.json mismatch", "mini-ork-scheduler", "0.95"]
     actions = {a["label"]: a["do"] for a in table["actions"]}
-    assert actions["Sweep runs"] == {"cli": ["bugs", "sweep"]}
+    assert actions["Sweep runs"]["cli"] == ["bugs", "sweep"]
+    assert actions["Sweep runs"]["home"] is False
     assert actions["Promote top 3"]["cli"] == ["bugs", "promote", "--top", "3"]
+    assert actions["Promote top 3"]["home"] is False
 
 
 def test_traceotter_not_run_is_distinct_from_empty(home: Path) -> None:

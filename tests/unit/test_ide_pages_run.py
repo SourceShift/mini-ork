@@ -194,6 +194,10 @@ def test_actions_follow_the_run_state(home: Path) -> None:
     page = build_page(home, "run", None, {"run": RUN})
     labels = [a["label"] for a in page["actions"]]
     assert labels[0] == "Stop" and page["actions"][0]["do"]["cli"] == ["board", "stop", RUN]
+    assert page["actions"][0]["do"]["confirm"]
+    kill = next(a for a in page["actions"] if a["label"] == "Kill")
+    assert kill["do"]["cli"] == ["board", "kill", RUN]
+    assert kill["do"]["confirm"].startswith("Kill")
     assert page["chips"][0] == {"t": "running", "c": "blue"}
     assert "Certify this change" not in labels
 

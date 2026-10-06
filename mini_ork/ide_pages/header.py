@@ -70,6 +70,9 @@ def header(home: Path, counts: dict[str, int]) -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         scheduler_on = False
     db = home / "state.db"
+    today_usd: float | None = (
+        round(cost_ledger.spent_last_24h(db if db.is_file() else None), 2) if db.is_file() else None
+    )
     return {
         "project": project.name,
         "branch": _git(project, "rev-parse", "--abbrev-ref", "HEAD").strip(),
@@ -78,7 +81,7 @@ def header(home: Path, counts: dict[str, int]) -> dict[str, Any]:
         "working": int(counts.get("working", 0)),
         "failed": int(counts.get("failed", 0)),
         "done": int(counts.get("done", 0)),
-        "today_usd": round(cost_ledger.spent_last_24h(db if db.is_file() else None), 2),
+        "today_usd": today_usd,
         "cap_usd": round(cap, 2),
         "scheduler_on": scheduler_on,
         "contextnest": _contextnest(),

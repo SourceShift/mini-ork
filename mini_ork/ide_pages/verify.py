@@ -406,11 +406,11 @@ def _inbox_sections(home: Path, errors: dict[str, str]) -> list[dict[str, Any]]:
                                          f"waiting {S.age(g.get('enqueued_at'), int(time.time()))}") if x)
             item_id = g["inbox_id"]
             items.append(S.item(g.get("gate_id") or "gate", sub, m="⚑", mc="purple", acts=[
-                S.btn("Approve", S.thread(f"Approve oversight item {item_id} "
-                                          f"(mini-ork oversight --resolve {item_id} --status approved)"),
+                S.btn("Approve", S.cli("board", "gate", "approve", str(item_id),
+                                       confirm=f"Approve oversight item {item_id}?"),
                       "primary"),
-                S.btn("Reject", S.thread(f"Reject oversight item {item_id} "
-                                         f"(mini-ork oversight --resolve {item_id} --status rejected)"),
+                S.btn("Reject", S.cli("board", "gate", "reject", str(item_id),
+                                      confirm=f"Reject oversight item {item_id}?"),
                       "danger")]))
         for p in _rows(db, "promotion_records",
                        "SELECT promotion_id, candidate_id, utility_before, utility_after, decided_at "

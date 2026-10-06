@@ -368,10 +368,16 @@ def _actions(run: Run) -> list[dict[str, Any]]:
     if _running(run):
         acts.append(S.btn("Stop", S.cli("board", "stop", run.id,
                                          confirm="Stop this run after its current node?"), "warn"))
+        acts.append(S.btn("Kill", S.cli("board", "kill", run.id,
+                                       confirm=f"Kill {run.id}? SIGTERM, then SIGKILL after 2 s."),
+                          "danger"))
     else:
         if run.workspace is not None:
             base = getattr(run.workspace, "base_branch", "") or "base"
-            acts.append(S.btn(f"Merge into {base}", S.cli("board", "merge", run.id), "primary"))
+            acts.append(S.btn(f"Merge into {base}",
+                              S.cli("board", "merge", run.id,
+                                    confirm=f"Merge this run's branch into {base}?"),
+                              "primary"))
             acts.append(S.btn("Discard", S.cli("board", "discard", run.id,
                                                confirm="Discard this run's worktree and branch?"),
                               "danger"))

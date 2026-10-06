@@ -178,7 +178,8 @@ def _active(home: Path, now: int) -> list[dict[str, Any]]:
             controls.append(S.item(f"{r.run_id} · paused on cost",
                                    f"{title} · resume it with `mini-ork resume {r.run_id}`",
                                    m="⏸", mc="yellow",
-                                   acts=[S.btn("Open", S.open_run(r.run_id, title), "ghost")]))
+                                   acts=[S.btn("Resume", S.cli("board", "resume", r.run_id), "primary"),
+                                         S.btn("Open", S.open_run(r.run_id, title), "ghost")]))
             continue
         controls.append(S.item(
             f"{r.run_id} · {r.recipe}" if r.recipe else r.run_id,
@@ -186,6 +187,9 @@ def _active(home: Path, now: int) -> list[dict[str, Any]]:
             m="●", mc="blue",
             acts=[S.btn("Stop", S.cli("board", "stop", r.run_id,
                                       confirm=f"Stop {r.run_id}? The current node finishes."), "warn"),
+                  S.btn("Kill", S.cli("board", "kill", r.run_id,
+                                      confirm=f"Kill {r.run_id}? SIGTERM, then SIGKILL after 2 s."),
+                        "danger"),
                   S.btn("Open", S.open_run(r.run_id, title), "ghost")]))
     failed, _ = _fleet(home, "failed", 3)
     for r in failed:

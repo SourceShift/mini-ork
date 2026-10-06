@@ -72,6 +72,69 @@ def test_cli_usage_and_actions(home: Path, capsys) -> None:
     assert "runs" in json.loads(capsys.readouterr().out)
 
 
+def test_kill_unknown_run_reports_ok_false(home: Path, capsys) -> None:
+    assert board_cmd.main(["kill", "run-nope", "--home", str(home)], "") == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False and payload["error"] == "task_run not found"
+
+
+def test_resume_unknown_run_reports_ok_false(home: Path, capsys) -> None:
+    assert board_cmd.main(["resume", "run-nope", "--home", str(home)], "") == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False and payload["error"] == "run_dir not found"
+
+
+def test_gate_usage_error_without_an_id(home: Path) -> None:
+    assert board_cmd.main(["gate", "approve", "--home", str(home)], "") == 2
+
+
+def test_gate_approve_then_double_approve(home: Path, capsys) -> None:
+    con = sqlite3.connect(home / "state.db")
+    cur = con.execute("INSERT INTO mo_inbox_gates (gate_id, feature, phase, context_json, status, enqueued_at) "
+                      "VALUES (?,?,?,?,?,?)",
+                      ("human_sign_off", "release", "staging", "{}", "pending", int(time.time())))
+    con.commit()
+    con.close()
+    inbox_id = cur.lastrowid
+
+    assert board_cmd.main(["gate", "approve", str(inbox_id), "--home", str(home)], "") == 0
+    first = json.loads(capsys.readouterr().out)
+    assert first["ok"] is True and first["status"] == "approved"
+    # second call: row is no longer pending → ok: false, exit 1
+    assert board_cmd.main(["gate", "approve", str(inbox_id), "--home", str(home)], "") == 1
+    second = json.loads(capsys.readouterr().out)
+    assert second == {"ok": False, "error": "not pending"}
+
+
+def test_gate_reject_records_review_note(home: Path, capsys) -> None:
+    con = sqlite3.connect(home / "state.db")
+    cur = con.execute("INSERT INTO mo_inbox_gates (gate_id, feature, phase, context_json, status, enqueued_at) "
+                      "VALUES (?,?,?,?,?,?)",
+                      ("human_sign_off", "release", "staging", "{}", "pending", int(time.time())))
+    con.commit()
+    inbox_id = cur.lastrowid
+    con.close()
+
+    assert board_cmd.main(["gate", "reject", str(inbox_id), "--note", "no good",
+                           "--home", str(home)], "") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True and payload["status"] == "rejected"
+
+    con = sqlite3.connect(home / "state.db")
+    row = con.execute("SELECT status, review_note FROM mo_inbox_gates WHERE inbox_id = ?",
+                      (inbox_id,)).fetchone()
+    con.close()
+    assert row[0] == "rejected" and row[1] == "no good"
+
+
+def test_gate_missing_state_db_does_not_bootstrap_one(home: Path, capsys) -> None:
+    fresh = home.parent / "no-state"
+    fresh.mkdir()
+    assert board_cmd.main(["gate", "approve", "1", "--home", str(fresh)], "") == 1
+    assert json.loads(capsys.readouterr().out) == {"ok": False, "error": "no state.db"}
+    assert not (fresh / "state.db").exists()
+
+
 def test_card_files_map_onto_the_project_when_the_worktree_is_gone(tmp_path: Path) -> None:
     project = tmp_path / "proj"
     (project / "docs").mkdir(parents=True)

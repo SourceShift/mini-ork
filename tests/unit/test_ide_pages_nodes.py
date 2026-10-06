@@ -84,7 +84,8 @@ def test_registered_nodes_and_live_runs(home: Path, monkeypatch) -> None:
     local, remote = rows[0], rows[1]
     assert local["cells"][3]["t"] == "1"
     assert [c["t"] for c in remote["cells"][:4]] == ["hetzner-a", "not probed", "node-agent", "1"]
-    assert remote["do"] == {"cli": ["nodes", "ping", "hetzner-a"]}
+    assert remote["do"]["cli"] == ["nodes", "ping", "hetzner-a"]
+    assert remote["do"]["home"] is False
     assert page["sections"][1]["title"] == "Doctor · hetzner-a"
     remote_runs = page["sections"][2]
     assert remote_runs["title"] == "Remote run · run-remote"

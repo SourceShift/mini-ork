@@ -10,7 +10,6 @@ import contextlib
 import functools
 import json
 import os
-import sqlite3
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -37,14 +36,14 @@ def _rows(home: Path, sql: str, params: tuple = ()) -> list[dict[str, Any]]:
     db = home / "state.db"
     if not db.is_file():
         return []
-    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
-    con.row_factory = sqlite3.Row
+    # `db_for` opens the same WAL db the other pages do; a ro URI without the
+    # `-shm` sidecar fails and the page renders empty.
+    from mini_ork.web.deps import db_for
+    state = db_for(home)
     try:
-        return [dict(r) for r in con.execute(sql, params).fetchall()]
-    except sqlite3.OperationalError:
+        return state.rows(sql, params)
+    except Exception:
         return []
-    finally:
-        con.close()
 
 
 def _epoch(value: Any) -> int | None:

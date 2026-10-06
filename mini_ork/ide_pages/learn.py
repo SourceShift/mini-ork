@@ -316,9 +316,10 @@ def _bugs(home: Path) -> dict[str, Any]:
         out = [[S.muted("—"), S.muted("No bug reports yet"), "", ""]]
     return S.table("Bug reports", cols, ["id", "report", "source", "score"], out, full=True,
                    note="Sweep runs for bug reports, prioritise, and promote the top ones into kickoffs.",
-                   actions=[S.btn("Sweep runs", S.cli("bugs", "sweep")),
+                   actions=[S.btn("Sweep runs", S.cli("bugs", "sweep", home=False)),
                             S.btn("Promote top 3", S.cli("bugs", "promote", "--top", "3",
-                                                         confirm="Write kickoffs for the top 3 bug reports?"),
+                                                         confirm="Write kickoffs for the top 3 bug reports?",
+                                                         home=False),
                                   "primary")])
 
 
@@ -328,7 +329,7 @@ def _traceotter(home: Path) -> list[dict[str, Any]]:
     from mini_ork.web.routes.traceotter import summary
 
     data = summary(home=home)
-    ingest = S.btn("Ingest", S.cli("traceotter", confirm="Distill this project's runs with TraceOtter now?"))
+    ingest = S.btn("Ingest", S.cli("traceotter", confirm="Distill this project's runs with TraceOtter now?", home=False))
     if not data.get("available"):
         return [S.flow("Pipeline", [("ingest", "Codex · Claude · mini-ork"), ("normalize", "ADP episodes"),
                                     ("consolidate", "procedural skills"), ("export", "LLaMA-Factory SFT")],

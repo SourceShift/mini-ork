@@ -135,7 +135,11 @@ def test_human_gates_list_pending_items_or_say_nothing_waits(home: Path) -> None
     item = _section(page, "Pending human gates")["items"][0]
     assert item["t"] == "deployment_gate" and item["m"] == "⚑"
     assert [a["label"] for a in item["acts"]] == ["Approve", "Reject"]
-    assert "--status approved" in item["acts"][0]["do"]["thread"]
+    approve, reject = item["acts"]
+    assert approve["do"]["cli"] == ["board", "gate", "approve", "1"]
+    assert approve["do"]["confirm"].startswith("Approve")
+    assert reject["do"]["cli"] == ["board", "gate", "reject", "1"]
+    assert reject["do"]["confirm"].startswith("Reject")
     kv = {i["k"]: i["v"] for i in _section(page, "Oversight calibration · 30 days")["items"]}
     assert kv["Decisions"] == "0"
 

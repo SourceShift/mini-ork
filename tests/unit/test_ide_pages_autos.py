@@ -81,7 +81,8 @@ def test_automations_table_detail_firings_and_kickoff(home: Path) -> None:
     assert [i["k"] for i in detail["items"]] == ["Recipe", "When", "State"]
     assert detail["items"][2]["v"] == "active"
     labels = {a["label"]: a["do"] for a in detail["actions"]}
-    assert labels["Run now"] == {"cli": ["automations", "run", "deps-nightly"]}
+    assert labels["Run now"]["cli"] == ["automations", "run", "deps-nightly"]
+    assert labels["Run now"]["confirm"].startswith("Start a run of ")
     assert labels["Pause"] == {"cli": ["automations", "pause", "deps-nightly"]}
     assert labels["Delete"]["cli"] == ["automations", "remove", "deps-nightly"]
     assert labels["Delete"]["confirm"]
