@@ -28,6 +28,33 @@ variable is unset.*
 | `MINI_ORK_WORKFLOW_VERSION_ID` | *(flag)* | Pin the workflow version stamped in traces |
 | `MINI_ORK_NODE_DESC` | `"implementer"` | Node description used in publisher commit messages |
 
+## Verification stack
+
+ON by default; set a master switch to `"0"` to disable it. See
+[the verification stack](../architecture/verification-stack.md) for what each
+feature decides and the evidence it writes.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `MO_ASSAY_RELATIONS` | `"1"` | Metamorphic-relations term in the certify oracle (veto a would-be PROVEN on a broken relation) |
+| `MO_ASSAY_RELATIONS_RESCUE` | `"1"` | Relations may PROVE the no-informative-invariant case (≥2 held, ≥1 repaired, 0 violations) |
+| `MO_ASSAY_RELATIONS_K` | `3` | Relations per judgement (clamped 1–5) |
+| `MO_ASSAY_RELATIONS_VETO_MIN` | `1` | Attributed violations needed to veto |
+| `MO_ASSAY_DIFFERENTIAL` | `"1"` | Differential base-vs-patch term (veto on confirmed collateral divergence) |
+| `MO_ASSAY_DIFFERENTIAL_N` | `6` | Shared inputs per judgement (clamped 2–8) |
+| `MO_ASSAY_DIFFERENTIAL_VETO_MIN` | `2` | Confirmed `preserve` divergences needed to veto |
+| `MO_SUITE_ADEQUACY` | `"1"` | Mutation kill-rate audit of the code-fix suite; INADEQUATE/UNVERIFIED downgrade a green |
+| `MO_SUITE_ADEQUACY_MAX_MUTANTS` | `12` | Mutant cap (1–50) |
+| `MO_SUITE_ADEQUACY_MIN_SCORE` | `0.6` | Kill-rate threshold for ADEQUATE |
+| `MO_SUITE_ADEQUACY_TIMEOUT_S` | `300` | Per-run suite timeout during the audit |
+| `MO_LEVEL_VECTOR` | `"1"` | Five-level verdict vector + publisher gate (publish only when every required level is PROVEN) |
+| `MO_GATE_HACKABILITY_N` | `4` | Proposer documents per gate in `gate-fuzz --hackability` (0–16) |
+| `MO_GATE_HACKABILITY_BUDGET_USD` | `0.50` | Per-audit proposer budget |
+| `MO_GATE_HACKABILITY_MAX` | `0.25` | Promotion refuses a gate measured above this |
+| `MO_PROMOTION_GATE_HACKABILITY` | `"1"` | Promotion-gate consumer of the hackability records |
+| `MO_BEHAV_EQUIVALENCE` | *(unset → `exact`)* | Behavioral comparison operator: `exact`, `set`, `canonical`, `tolerant`, or a JSON spec |
+| `MO_BEHAV_EXPECT_BODY` | *(unset)* | Expected body (JSON) for the behavioral `expect_body` check |
+
 ## Planning / profile
 
 | Variable | Default | Effect |

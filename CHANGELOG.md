@@ -11,6 +11,15 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- feat(verify): the verification stack — six techniques from the 2000-paper verification review, ON by
+  default (see `docs/architecture/verification-stack.md`). Metamorphic relations in the certify oracle
+  (`certify/relations.py`, veto + rescue); differential base-vs-patch check (`certify/differential.py`, collateral-
+  damage veto); mutation-based suite adequacy in the code-fix verifier (`gates/suite_adequacy.py`); non-nested
+  five-level verdict vector + publisher gate (`verify/levels.py`); gate-hackability audit + promotion consumer
+  (`gates/hackability.py`, `gate-fuzz --hackability`); declared equivalence operator for the behavioral verifier
+  (`verify/equivalence.py`). Each was built by a mini-ork framework-edit run with RSI on and proven by a real
+  mini-ork run. Disable any feature with its master knob set to `0`.
+
 - feat(recipes): spec-driven-delivery — spec-dir → verified features with live smoke + UI-craft gates.
   Each spec in a `## Spec dir:` directory becomes a SpecCard whose acceptance gates are
   written before implementation and must fail on the untouched tree. Every deliverable
@@ -20,6 +29,15 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   LLM lane.
 
 ---
+
+### Fixed
+
+- fix(gates): certifying oracle gates (coalition, liveness, stability) defer on absent evidence instead of passing
+  (hackability 0.8 → 0.0, b53b6c0d).
+- fix(execute): framework-edit verifier nodes no longer require the verdict.json they are about to write (6/6 builds
+  skipped review, ad37d26f); recipe verifiers import the dispatching engine (fc9a210a).
+- fix(verify): unique `mini-ork verify` evidence logs and key-level diff paths (f5aa21ed); hackability proposer
+  dispatches from a scratch target dir (d69cbafd).
 
 ## [0.9.0] - 2026-10-01
 
