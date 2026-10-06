@@ -709,6 +709,9 @@ def test_diffstat_not_written_when_compute_returns_empty(home: Path, monkeypatch
 
     run_id = "r-ds-empty-list"
     _seed_run(home, run_id, "published")
+    # The run dir must exist, or a wrong write would fail silently and the
+    # negative assertion below could never fail.
+    (home / "runs" / run_id).mkdir(parents=True, exist_ok=True)
     # Deliberately do NOT seed acp-diffs.json — the empty list must come
     # from the patched ``run_diffs`` so the cacheable signal is exercised.
 
@@ -728,6 +731,13 @@ def test_diffstat_not_written_when_compute_returns_empty(home: Path, monkeypatch
         "empty run_diffs result must not poison diffstat.json with (0, 0) — "
         "recompute on the next poll (cheap: run_diffs short-circuits before git)"
     )
+
+    # Positive control: the same dir accepts a real result, so the negative
+    # assertion above was a real test of the guard.
+    monkeypatch.undo()
+    _write_diff_cache(home, run_id, added=2, removed=1)
+    board_cmd._runs(home)
+    assert json.loads(cache_path.read_text(encoding="utf-8")) == {"added": 2, "removed": 1, "v": 1}
 
 
 def test_diffstat_not_written_when_compute_fails(home: Path, monkeypatch) -> None:
@@ -750,6 +760,7 @@ def test_diffstat_not_written_when_compute_fails(home: Path, monkeypatch) -> Non
 
     run_id = "r-ds-fail-then-ok"
     _seed_run(home, run_id, "published")
+    (home / "runs" / run_id).mkdir(parents=True, exist_ok=True)
     # Deliberately do NOT seed ``acp-diffs.json`` here — r5 did, which
     # made the patched ``run_diffs`` never run on poll 1 and left the
     # test asserting against a path it never exercised.
