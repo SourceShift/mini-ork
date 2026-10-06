@@ -445,6 +445,39 @@ def _act_gate(home: Path, action: str, inbox_id: str, note: str | None) -> dict[
     return {"ok": True, "inbox_id": iid, "status": status}
 
 
+def _act_node(home: Path, run_id: str, node_id: str | None,
+              view: str | None, offset: int) -> dict[str, Any]:
+    """One DAG node's detail panel — ``board node <run_id> <node_id>``.
+
+    Delegates to ``mini_ork.ide_pages.node.build_node`` so the verb and the
+    page module never duplicate the reader/dispatch logic. The unknown-run /
+    unknown-node cases return ``ok: false`` and ``exit 1`` via the main()
+    rule at L519; path-traversal guards live in ``node.build_node``.
+    """
+    from mini_ork.ide_pages.node import build_node
+
+    return build_node(home, run_id, node_id or "", view=view, offset=offset or 0)
+
+
+def _act_steer(home: Path, run_id: str, text: str | None, role: str | None,
+               severity: str | None) -> dict[str, Any]:
+    """``board steer <run_id> --text ... --role ... --severity ...`` — inject an
+    operator_steering row through ``web.control.steer_run``.
+
+    Validation (role, severity, confidence) lives in ``steer_run``; we forward
+    ``source="ide"`` so a future audit can tell IDE-origin rows from CLI /
+    dashboard ones. ``steer_run`` returns ``ok: false`` and a typed error on
+    a bad role/severity — ``main()`` then exits 1.
+    """
+    from mini_ork.web.control import steer_run
+    from mini_ork.web.deps import db_for
+
+    return steer_run(db_for(home), run_id, text or "",
+                     role_target=role or "any",
+                     severity=severity or "info",
+                     source="ide")
+
+
 def _default_home() -> Path:
     return Path(os.environ.get("MINI_ORK_HOME", "").strip() or (Path.cwd() / ".mini-ork"))
 
@@ -457,11 +490,14 @@ def main(rest: list[str], root: str) -> int:
     except SystemExit:
         sys.stderr.write("usage: mini-ork board [run|merge|discard|stop|kill|resume <run_id>] "
                          "[gate approve|reject <inbox_id> [--note TEXT]] "
+                         "[node <run_id> <node_id> [--view V] [--offset N]] "
+                         "[steer <run_id> --role R --severity S --text TEXT] "
                          "[page <key> [--tab T] [--arg k=v]] [--home H] [--json]\n")
         return 2
-    # The third positional is only meaningful for `gate approve|reject <inbox_id>`.
-    # Any other verb that gets one is a usage error, not a silent extra.
-    if args.target and args.verb != "gate":
+    # The third positional is meaningful for `gate approve|reject <inbox_id>`
+    # (the inbox id) and `node <run_id> <node_id>` (the node id). Any other
+    # verb that gets one is a usage error, not a silent extra.
+    if args.target and args.verb not in ("gate", "node"):
         sys.stderr.write(f"mini-ork board {args.verb}: unexpected extra argument {args.target!r}\n")
         return 2
     home = (Path(args.home) if args.home else _default_home()).expanduser().absolute()
@@ -471,6 +507,20 @@ def main(rest: list[str], root: str) -> int:
             return 2
         if not args.target:
             sys.stderr.write("mini-ork board gate: an inbox id is required\n")
+            return 2
+    elif args.verb == "node":
+        if not args.run_id:
+            sys.stderr.write("mini-ork board node: a run id is required\n")
+            return 2
+        if not args.target:
+            sys.stderr.write("mini-ork board node: a node id is required\n")
+            return 2
+    elif args.verb == "steer":
+        if not args.run_id:
+            sys.stderr.write("mini-ork board steer: a run id is required\n")
+            return 2
+        if not args.text:
+            sys.stderr.write("mini-ork board steer: --text is required\n")
             return 2
     elif args.verb != "show" and not args.run_id:
         what = "a page key" if args.verb == "page" else "a run id"
@@ -498,6 +548,10 @@ def main(rest: list[str], root: str) -> int:
         payload = _act_resume(home, args.run_id)
     elif args.verb == "gate":
         payload = _act_gate(home, args.run_id, args.target, args.note)
+    elif args.verb == "node":
+        payload = _act_node(home, args.run_id, args.target, args.view, args.offset)
+    elif args.verb == "steer":
+        payload = _act_steer(home, args.run_id, args.text, args.role, args.severity)
     else:
         payload = act(home, args.verb, args.run_id)
     sys.stdout.write(json.dumps(payload, default=str) + "\n")
@@ -510,9 +564,12 @@ def build_parser() -> argparse.ArgumentParser:
     uses (no hand-copied parser drifting out of sync)."""
     parser = argparse.ArgumentParser(prog="mini-ork board", add_help=False)
     parser.add_argument("verb", nargs="?", default="show",
-                        choices=["show", "run", "merge", "discard", "stop", "kill", "resume", "gate", "page"])
+                        choices=["show", "run", "merge", "discard", "stop", "kill",
+                                 "resume", "gate", "page", "node", "steer"])
     parser.add_argument("run_id", nargs="?")
-    # `gate approve|reject <inbox_id>` puts the action in run_id and the id here.
+    # `gate approve|reject <inbox_id>` puts the action in run_id and the id here;
+    # `node <run_id> <node_id>` uses the same slot for the node id (the L464
+    # guard allows it through).
     parser.add_argument("target", nargs="?")
     parser.add_argument("--home", default=None)
     parser.add_argument("--json", action="store_true")
@@ -522,6 +579,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tab", default=None)
     parser.add_argument("--arg", action="append", default=[])
     parser.add_argument("--note", default=None)
+    parser.add_argument("--view", default=None,
+                        choices=["stream", "output", "prompt", "telemetry", "learning"],
+                        help="node detail view (default: stream)")
+    parser.add_argument("--offset", type=int, default=0,
+                        help="stream-view offset — return only entries from this line on")
+    parser.add_argument("--role", default="any",
+                        help="steer target role (default: any)")
+    parser.add_argument("--severity", default="info",
+                        help="steer severity: info|warn|critical (default: info)")
+    parser.add_argument("--text", default=None,
+                        help="steer message text")
     return parser
 
 

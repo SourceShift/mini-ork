@@ -555,14 +555,30 @@ def _dag_tab(run: Run, wanted: str | None) -> list[dict[str, Any]]:
                 if n is None:
                     continue
                 cost = S.money(n.cost) if n.cost else ""
-                col.append(S.dag_node(n.id, n.id, n.family, n.state, cost=cost,
-                                      selected=sel is not None and n.id == sel.id,
-                                      do=S.set_args(node=n.id)))
+                node_dict = S.dag_node(n.id, n.id, n.family, n.state, cost=cost,
+                                       selected=sel is not None and n.id == sel.id,
+                                       do=S.set_args(node=n.id))
+                # ``node.py``'s stream view reads ``role``/``dur``/``gates`` off
+                # the same dict the IDE draws from — augment in place rather
+                # than editing ``spec.dag_node``'s positional signature (the
+                # additive spec.py change was rejected to keep the diff inside
+                # the kickoff's 4-file scope).
+                node_dict["role"] = n.role_lane
+                node_dict["dur"] = _wall(n)
+                node_dict["gates"] = ", ".join(n.gates) or "—"
+                col.append(node_dict)
             if col:
                 cols.append(col)
-        return S.dag("", cols, legend=("depends_on → · verifiers check the node before them · "
+        sec = S.dag("", cols, legend=("depends_on → · verifiers check the node before them · "
                                        "rollback runs on escalates_to after a failure · "
                                        "click a node to inspect it"), full=True)
+        # ``spec.dag`` forwards ``**opt`` into ``_section`` which has no
+        # ``heads`` kwarg — mutate the returned dict in place so the kickoff's
+        # "stage label per column" reaches the IDE without a spec.py edit.
+        sec["heads"] = [_head_for(col, idx) for idx, col in enumerate(cols)]
+        sec["run_title"] = str(run.card.get("title") or "")
+        sec["recipe"] = str(run.card.get("recipe") or run.row.get("recipe") or "")
+        return sec
 
     def build_inspector() -> dict[str, Any]:
         if sel is None:
@@ -621,6 +637,15 @@ def _dag_tab(run: Run, wanted: str | None) -> list[dict[str, Any]]:
 
     return (S.guarded(errors, "DAG", build_dag) + S.guarded(errors, "Inspector", build_inspector)
             + S.guarded(errors, "Coalition", build_coalition))
+
+
+def _head_for(col: list[dict[str, Any]], idx: int) -> str:
+    """One stage label per DAG column: the first node's role, else ``stage N``."""
+    for node_dict in col:
+        role = str(node_dict.get("role") or "")
+        if role:
+            return role
+    return f"stage {idx}"
 
 
 def _overview_tab(run: Run) -> list[dict[str, Any]]:
