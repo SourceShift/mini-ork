@@ -1119,7 +1119,15 @@ def _handle_transform(ctx: NodeDispatch):
 
 
 def _handle_verifier(ctx: NodeDispatch):
+    post_impl = not _verifier_runs_before_implementer(ctx.workflow, ctx.node_id)
+
     def _publish_success():
+        # Verifier-produced artifacts (verdict.json) were exempt from the
+        # pre-run guard; once the scripts have run they must exist.
+        if post_impl and not _required_artifacts_ok(ctx.plan_path):
+            print("  [fail] verifier node: verifier did not produce its required artifact(s)",
+                  file=sys.stderr)
+            return 1, "error"
         if ctx.publish_declared_outputs():
             return 0, "done"
         return 1, "artifact_contract"
@@ -1129,8 +1137,8 @@ def _handle_verifier(ctx: NodeDispatch):
     # zero-byte. Covers the verifier_ref branch (which bypasses the canonical
     # verifier). A verifier ordered before the first implementer is a baseline
     # oracle and cannot require artifacts that do not exist until implementation.
-    if (not _verifier_runs_before_implementer(ctx.workflow, ctx.node_id)
-            and not _required_artifacts_ok(ctx.plan_path)):
+    # Artifacts the verifiers themselves write are checked after they run.
+    if post_impl and not _required_artifacts_ok(ctx.plan_path, skip_verifier_outputs=True):
         print("  [fail] verifier node: required artifact(s) missing or empty", file=sys.stderr)
         return 1, "error"
     artifact = ""

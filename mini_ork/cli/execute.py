@@ -1305,13 +1305,23 @@ def _extract_verdict(root, review_file) -> str:
     return (r.stdout.strip() or "unknown") if r.returncode == 0 else "unknown"
 
 
-def _required_artifacts_ok(plan_path) -> bool:
+VERIFIER_PRODUCED_ARTIFACTS = frozenset({"verdict.json"})
+
+
+def _required_artifacts_ok(plan_path, *, skip_verifier_outputs=False) -> bool:
     """Hollow-run guard for the verifier node (parity: bash _mo_required_artifacts_ok).
     A recipe that declares a concrete, run-local artifact (an ABSOLUTE, env-expanded
     artifact_contract path such as ``${MINI_ORK_RUN_DIR}/framework-edit.diff``) but
     produces nothing — missing OR zero-byte — fails. Relative canonical outputs are
     publish-targets (exempt), so a genuine artifact is never false-failed. Returns
-    True when all required artifacts exist + are non-empty (or none apply)."""
+    True when all required artifacts exist + are non-empty (or none apply).
+
+    ``skip_verifier_outputs`` exempts artifacts the verifiers THEMSELVES write
+    (``verdict.json``). Checked before the verifier runs, requiring them is
+    circular: every framework-edit build failed both verifier nodes on its own
+    not-yet-written verdict, skipped the reviewer and rolled back (6/6 builds,
+    2026-10-05). The verifier handler re-runs the full check after the scripts,
+    so a verifier that never writes its verdict still fails."""
     if not plan_path or not os.path.isfile(plan_path):
         return True
     try:
@@ -1326,6 +1336,8 @@ def _required_artifacts_ok(plan_path) -> bool:
         for raw in ac.get(key, []) or []:
             p = os.path.expandvars(str(raw))
             if not os.path.isabs(p) or p in seen:
+                continue
+            if skip_verifier_outputs and os.path.basename(p) in VERIFIER_PRODUCED_ARTIFACTS:
                 continue
             seen.add(p)
             if not (os.path.isfile(p) and os.path.getsize(p) > 0):
