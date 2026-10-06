@@ -148,14 +148,25 @@ def _seed(home: Path, *, status: str = "executing") -> Path:
     (run_dir / f"verifier_{SHELL_NODE}.log").write_text(
         "[verifier] running\n[ok] verifier pass\n")
 
-    # Operator-steering row for the run
+    # Operator-steering row for the run.
+    # Kickoff r2 fix #3: steer row's created_at must be (a) after node.start
+    # so it appears in any poll, (b) after the last transcript line so it
+    # sorts to the end, AND (c) before the offset boundary at line N+1 so
+    # the next poll does NOT re-emit it. The fixture's transcript has 11
+    # lines (indices 0..10), so we park the steer row at
+    # node.start + 10.5 s — strictly between line 10's proxy and line 11's
+    # boundary. expires_at uses wall-clock now + 1 h so the
+    # ``expires_at > now`` filter in ``_fetch_steer_rows`` always passes
+    # regardless of when the test runs.
     con = sqlite3.connect(home / "state.db")
-    now_ms = int(time.time() * 1000)
+    node_start_ms = (T0 + 10) * 1000
+    steer_ms = node_start_ms + 10_500
+    expires_ms = int(time.time() * 1000) + 3600_000
     con.execute(
         "INSERT INTO operator_steering (run_id, role_target, severity, message, source, "
         "confidence, created_at, expires_at) VALUES (?,?,?,?,?,?,?,?)",
-        (RUN, "implementer", "info", "be careful with the Edit tool", "ide",
-         0.8, now_ms, now_ms + 3600_000))
+        (RUN, AGENT_NODE, "info", "be careful with the Edit tool", "ide",
+         0.8, steer_ms, expires_ms))
     con.commit()
     con.close()
     return run_dir
@@ -188,7 +199,8 @@ def test_stream_view_kinds_and_order_match_the_transcript(home: Path) -> None:
     kinds = [e["k"] for e in out["entries"]]
     # user → think → tool(Read) → tool(Edit) → tool(Bash) → todo → text → note → steer
     assert kinds == ["user", "think", "tool", "tool", "tool", "todo", "text", "note", "steer"]
-    assert out["status"] == "finished"
+    # Kickoff r2 fix #7: status now carries the event count for finished nodes.
+    assert out["status"] == "finished · 9 events"
     assert out["status_c"] == "sub"
 
 
@@ -217,12 +229,131 @@ def test_stream_view_todo_render_marks_checkboxes(home: Path) -> None:
 
 
 def test_stream_view_offset_returns_only_later_entries(home: Path) -> None:
+    """Kickoff r2 fix #3 — offset is now transcript-line count, not list index.
+
+    First poll returns every entry (offset=N for N transcript lines).
+    A second poll with ``offset=N`` returns nothing — every transcript line
+    has been consumed, and the steer row's timestamp is at or after the
+    line-at-N boundary so it is filtered out.
+    """
     _seed(home)
     full = build_node(home, RUN, AGENT_NODE, view="stream")
-    n = len(full["entries"])
-    skipped = build_node(home, RUN, AGENT_NODE, view="stream", offset=4)
-    assert len(skipped["entries"]) == n - 4
-    assert skipped["offset"] == n
+    n_transcript_lines = full["offset"]
+    # First poll consumed all transcript lines. Second poll at that offset
+    # is empty; appending two assistant text lines afterwards yields exactly
+    # those two on the next poll (next test).
+    drained = build_node(home, RUN, AGENT_NODE, view="stream",
+                         offset=n_transcript_lines)
+    assert drained["entries"] == []
+    assert drained["offset"] == n_transcript_lines
+
+
+def test_stream_view_offset_after_append_returns_only_new_lines(home: Path) -> None:
+    """Append-only invariant from kickoff r2 fix #3.
+
+    Poll → offset N. Append two assistant text lines to the transcript.
+    Poll with ``offset=N`` → exactly those two, and no repeated steer row.
+    """
+    _seed(home)
+    initial = build_node(home, RUN, AGENT_NODE, view="stream")
+    n = initial["offset"]
+    assert initial["entries"], "fixture must yield at least one entry"
+
+    # Append two assistant text lines to the existing session jsonl.
+    session_path = (home / "runs" / RUN / "sessions" / f"{SESSION_UUID}.jsonl")
+    with session_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "appended line A"}
+        ]}}) + "\n")
+        f.write(json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "appended line B"}
+        ]}}) + "\n")
+
+    after = build_node(home, RUN, AGENT_NODE, view="stream", offset=n)
+    kinds = [e["k"] for e in after["entries"]]
+    args = [e["arg"] for e in after["entries"]]
+    assert kinds == ["text", "text"]
+    assert args == ["appended line A", "appended line B"]
+    # No repeated steer row: kickoff says "newer than the line at N".
+    assert all(e["k"] != "steer" for e in after["entries"])
+    assert after["offset"] == n + 2
+
+
+def test_stream_view_prompt_view_renders_str_content(home: Path) -> None:
+    """Kickoff r2 fix #1 — ``content`` may be a plain ``str`` (the prompt).
+
+    A transcript whose first user message is a string ``content`` must
+    surface that prompt in BOTH the stream view (first ``user`` entry)
+    and the prompt view (rendered prompt block).
+    """
+    _seed(home)
+    session_path = (home / "runs" / RUN / "sessions" / f"{SESSION_UUID}.jsonl")
+    # Replace the first user entry with a plain-string-content variant.
+    text = session_path.read_text(encoding="utf-8")
+    _, _, rest = text.partition("\n")
+    replacement = json.dumps({
+        "type": "user",
+        "message": {"content": "PROMPT AS STRING"},
+    })
+    session_path.write_text("\n".join([replacement, rest]))
+
+    # Stream view: first entry kind is ``user`` with that prompt as arg.
+    out = build_node(home, RUN, AGENT_NODE, view="stream")
+    user = next(e for e in out["entries"] if e["k"] == "user")
+    assert user["arg"] == "PROMPT AS STRING"
+    # A following Read tool entry is still present (the second assistant).
+    assert any(e["k"] == "tool" for e in out["entries"])
+
+    # Prompt view: the prompt block contains the prompt text.
+    prompt = build_node(home, RUN, AGENT_NODE, view="prompt")
+    rendered = "\n".join(line["t"] for line in prompt["block"])
+    assert "PROMPT AS STRING" in rendered
+
+
+def test_stream_view_shell_node_uses_log_not_transcript(home: Path) -> None:
+    """Kickoff r2 fix #2 — shell nodes resolve to their log, not a transcript."""
+    _seed(home)
+    out = build_node(home, RUN, SHELL_NODE, view="stream")
+    assert out["ok"] is True
+    # The shell-node log starts with "[verifier] running" → text kind,
+    # not the agent transcript's "implement the fix" prompt.
+    texts = [e["arg"] for e in out["entries"] if e["k"] == "text"]
+    assert texts == ["log output"]
+    # Resolver rule 3 only fires for running nodes; the shell node has no
+    # node_end event in the fixture (state stays "running"), but it has no
+    # session file at all — so the source must remain the verifier log,
+    # not a transcript. Add a stray session to prove rule 3 is gated.
+    stray = home / "runs" / RUN / "sessions" / "99999999-8888-7777-6666-555555555555.jsonl"
+    stray.parent.mkdir(parents=True, exist_ok=True)
+    stray.write_text(json.dumps({
+        "type": "user", "message": {"content": "STRANGER SESSION"},
+    }) + "\n")
+    out2 = build_node(home, RUN, SHELL_NODE, view="stream")
+    user_entries = [e for e in out2["entries"] if e["k"] == "user"]
+    assert user_entries == []
+    # Source pointer is the log filename, not the stray session file.
+    assert out2["source"].endswith("verifier_verifier_node.log")
+
+
+def test_stream_view_cost_state_builds_final_note(home: Path) -> None:
+    """Kickoff r2 fix #5 — when the transcript has no ``result`` entry,
+    the final note is built from the ``agent-<node>.live.jsonl`` cost-state.
+    """
+    _seed(home)
+    session_path = (home / "runs" / RUN / "sessions" / f"{SESSION_UUID}.jsonl")
+    # Strip the result entry from the fixture transcript.
+    text = session_path.read_text(encoding="utf-8")
+    lines = [ln for ln in text.splitlines() if ln.strip()
+             and json.loads(ln).get("type") != "result"]
+    session_path.write_text("\n".join(lines) + "\n")
+
+    out = build_node(home, RUN, AGENT_NODE, view="stream")
+    notes = [e for e in out["entries"] if e["k"] == "note"]
+    assert len(notes) == 1, f"expected one note, got {len(notes)}"
+    note = notes[0]
+    assert "Done" in note["arg"]
+    assert "$" in note["arg"]
+    assert "turns" in note["arg"]
 
 
 def test_stream_view_steer_entry_shows_severity_and_message(home: Path) -> None:
