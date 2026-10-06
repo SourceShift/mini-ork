@@ -574,23 +574,22 @@ def fleet_rows(
         added = 0
         removed = 0
         if precise_state == "done":
-            # ``task_state`` rule 4 (``mini_ork/acp/task_state.py:267-278``)
-            # already called ``_diff_counts(path)`` for ``published`` rows and
-            # stored the counts on ``TaskState.added/removed``. Recomputing
-            # here paid for one ``git show`` per file via
-            # ``cached_or_computed`` → ``run_diffs(write_cache=False)`` on
-            # cold-cache rows — that was the dominant cost of ``board
-            # --shell`` (204 subprocesses per poll on the researcher home).
-            # Reuse the values already in hand. Fall back to ``_diff_counts``
-            # only when the task_state run returned zeros AND no
-            # ``acp-diffs.json`` exists — the one shape where the helper's
-            # exception swallow could mask a non-zero result that the
-            # page-build path's ``run_diffs(write_cache=True)`` had not yet
-            # written. ``_diff_counts_cached`` and ``run_diffs`` both pass
-            # ``write_cache=False``, so they never populate the cache.
+            # ``task_state`` rule 4 (``mini_ork/acp/task_state.py``) already
+            # consulted the per-run ``diffstat.json`` cache before computing
+            # counts and wrote it on a miss. Reusing ``ts.added/removed`` is
+            # therefore a sub-millisecond read on the second poll — no
+            # ``git show``, no ``cached_or_computed`` fallback. The cache
+            # read happens in ``task_state`` so both projection call sites
+            # (``task_state`` rule 4 and ``fleet_rows``) spawn zero ``git``
+            # processes for a cached terminal row. The pre-r4 fallback that
+            # re-ran ``_diff_counts(run_dir)`` on a zero result was the
+            # dominant cost on the researcher home (~92 subprocesses per
+            # poll); it is gone. ``run_diffs(write_cache=False)`` (the
+            # ``cached_or_computed`` caller at ``diffs.py:272``) is
+            # distinct from ``run_diffs(write_cache=True)`` (the page-build
+            # path at ``diffs.py:190``); only the latter populates the
+            # run-produced ``acp-diffs.json``.
             added, removed = ts.added, ts.removed
-            if added == 0 and removed == 0 and not (run_dir / CACHE_NAME).is_file():
-                added, removed = _diff_counts(run_dir)
 
         mark = MARKS.get(precise_state, MARKS["working"])
 

@@ -17,9 +17,23 @@ can pin exact equality.
 from __future__ import annotations
 
 import difflib
+import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+# Persistent per-run diffstat cache. Distinct from ``diffs.CACHE_NAME``
+# (``"acp-diffs.json"``), which is run-produced only. ``diffstat.json``
+# holds the *aggregated* ``(added, removed)`` so the per-poll ``board
+# --shell`` projection never re-runs ``git show`` for a terminal row
+# whose counts were already computed. Schema is versioned (``"v": 1``)
+# so a future format change degrades to a slow-path re-compute rather
+# than a parse crash. Atomic via temp file + ``os.replace``; best-effort
+# (OSError-swallowed) so a read-only home yields ``None`` instead of a
+# board 500.
+DIFFSTAT_NAME = "diffstat.json"
+DIFFSTAT_VERSION = 1
 
 # Mark glyphs prefixed to a thread's title; the unicode minus in the
 # diff suffix (U+2212, "−") is NOT the ASCII "-" — copy the literal.
@@ -140,6 +154,53 @@ def _failing_node(events: list[dict[str, Any]]) -> tuple[str, str] | None:
         if reason != "done":
             failing = (node_id, reason)
     return failing
+
+
+def _diffstat_cached(run_dir: Path) -> tuple[int, int] | None:
+    """``(added, removed)`` from the persisted diffstat cache; ``None`` on miss.
+
+    Mirrors the ``_diff_counts_cached`` shape (``fleet.py:201-248``) but
+    reads the per-run ``diffstat.json`` we write below. Three swallow
+    cases — missing file, parse failure, wrong schema version — all
+    degrade to a slow-path recompute in the caller. The ``v: 1`` gate
+    lets a future writer bump the version and silently retire the old
+    shape without a migration.
+    """
+    cache = Path(run_dir) / DIFFSTAT_NAME if run_dir is not None else None
+    if cache is None or not cache.is_file():
+        return None
+    try:
+        raw = json.loads(cache.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("v") != DIFFSTAT_VERSION:
+        return None
+    try:
+        return int(raw.get("added", 0)), int(raw.get("removed", 0))
+    except (TypeError, ValueError):
+        return None
+
+
+def _write_diffstat(run_dir: Path, added: int, removed: int) -> None:
+    """Best-effort atomic write of ``diffstat.json`` for a terminal run.
+
+    Temp file + ``os.replace`` so a concurrent poll never reads a
+    half-written cache. ``OSError`` swallowed so a read-only home
+    degrades to "no cache" — the next poll falls through to the slow
+    path. Never raises. Never writes for working/needs_you rows; the
+    caller (``task_state`` rule 4) guards on the terminal-state
+    branch.
+    """
+    target = Path(run_dir) / DIFFSTAT_NAME
+    payload = {"added": int(added), "removed": int(removed), "v": DIFFSTAT_VERSION}
+    try:
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, target)
+    except OSError:
+        pass
 
 
 def _diff_counts(run_dir: Path) -> tuple[int, int]:
@@ -268,7 +329,19 @@ def task_state(run_dir: Path, snapshot: dict[str, Any]) -> TaskState:
     if status == "published":
         added, removed = (0, 0)
         if path is not None:
-            added, removed = _diff_counts(path)
+            # Read the persisted diffstat first — terminal rows never
+            # change, so a hit spares us ``_diff_counts`` (which
+            # funnels through ``cached_or_computed`` → ``run_diffs`` and
+            # pays one ``git show`` per file on a cache miss). On a miss
+            # we compute, then write the result so the next poll hits
+            # the cache. Both the read and the write are guarded to
+            # terminal rows — working/needs_you never write.
+            cached_counts = _diffstat_cached(path)
+            if cached_counts is not None:
+                added, removed = cached_counts
+            else:
+                added, removed = _diff_counts(path)
+                _write_diffstat(path, added, removed)
         return TaskState(
             state="done",
             detail=PUBLISHED_DETAIL,

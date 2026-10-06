@@ -103,6 +103,25 @@ def _write_diff_cache(home: Path, run_id: str, *, added: int, removed: int) -> N
     )
 
 
+def _seed_step_event(home: Path, run_id: str, *, node_id: str, created_at: int) -> None:
+    """Insert a single ``node_start`` ``run_events`` row for the given run.
+
+    No matching ``node_end`` — ``task_state._current_step`` returns the
+    node id (the running node's id) so the row's ``step`` field is
+    non-empty in the frozen ``_runs`` projection. Mirrors the lifecycle
+    shape ``test_events_by_run_filters_to_lifecycle_events`` uses.
+    """
+    con = sqlite3.connect(home / "state.db")
+    con.execute(
+        "INSERT INTO run_events (event_id, run_id, event_type, payload_json, created_at) "
+        "VALUES (?,?,?,?,?)",
+        (f"evt-{run_id}-start", run_id, "node_start",
+         json.dumps({"node_id": node_id}), created_at),
+    )
+    con.commit()
+    con.close()
+
+
 def test_board_has_every_section(home: Path) -> None:
     _seed_run(home, "run-1791000000-aaaaaa", "published")
     b = board_cmd.board(home)
@@ -442,12 +461,63 @@ def test_runs_output_is_stable_against_frozen_list(home: Path) -> None:
         if added or removed:
             _write_diff_cache(home, run_id, added=added, removed=removed)
 
+    # r4 extension: one ``needs_you`` row (rule 1 sentinel: ``.cost-pause``
+    # in the run dir) and one row carrying a non-empty ``step`` field
+    # (``node_start`` lifecycle event without a matching ``node_end`` so
+    # ``_current_step`` returns the node id). Seeded AFTER the 30 rows so
+    # DESC ordering places them at the TOP of the result.
+    needs_you_id = "run-1791000031-ggggg1"
+    step_id = "run-1791000032-ggggg2"
+    needs_you_ts = base + len(seeds) * 60
+    step_ts = needs_you_ts + 60
+    _seed_run_at(home, needs_you_id, "executing", created_at=needs_you_ts, updated_at=needs_you_ts)
+    (home / "runs" / needs_you_id).mkdir(parents=True, exist_ok=True)
+    (home / "runs" / needs_you_id / ".cost-pause").write_text("budget\n")
+    _seed_run_at(home, step_id, "executing", created_at=step_ts, updated_at=step_ts)
+    step_dir = home / "runs" / step_id
+    step_dir.mkdir(parents=True, exist_ok=True)
+    _seed_step_event(home, step_id, node_id="implementer", created_at=step_ts)
+
     runs, counts = board_cmd._runs(home)
 
-    # DESC by ``created_at`` + ``rowid`` → seeds reversed.
+    # DESC by ``created_at`` + ``rowid`` → seeds reversed. The two r4
+    # rows sit at the FRONT of the result (newest first).
     expected: list[dict] = []
+    # Newest → oldest loop: the two r4 rows first (literal), then the
+    # reversed 30-row seeds (re-derived via the existing loop).
+    expected.append({
+        "id": step_id,
+        "title": "code-fix run",
+        "recipe": "code-fix",
+        "state": "working",
+        "mark": "●",
+        "step": "implementer",
+        "started_at": step_ts,
+        "ended_at": None,
+        "cost_usd": 0.5,
+        "added": 0,
+        "removed": 0,
+        "has_workspace": False,
+    })
+    expected.append({
+        "id": needs_you_id,
+        "title": "code-fix run",
+        "recipe": "code-fix",
+        "state": "needs_you",
+        "mark": "✋",
+        "step": "",
+        "started_at": needs_you_ts,
+        "ended_at": None,
+        "cost_usd": 0.5,
+        "added": 0,
+        "removed": 0,
+        "has_workspace": False,
+    })
     for run_id, status, added, removed in reversed(seeds):
-        ts = base + (len(seeds) - 1 - len(expected)) * 60  # newest = seeds[-1]
+        seed_index = next(
+            idx for idx, (rid, _, _, _) in enumerate(seeds) if rid == run_id
+        )
+        ts = base + seed_index * 60
         if status == "published":
             state = "done"
             mark = "✓"
@@ -475,7 +545,7 @@ def test_runs_output_is_stable_against_frozen_list(home: Path) -> None:
             "has_workspace": False,
         })
 
-    assert counts == {"working": 15, "needs_you": 0, "done": 11, "failed": 4}
+    assert counts == {"working": 16, "needs_you": 1, "done": 11, "failed": 4}
     assert runs == expected
 
 
@@ -593,3 +663,53 @@ def test_events_by_run_filters_to_lifecycle_events(home: Path) -> None:
     events = events_by_run["r-evt"]
     types = sorted(e["event_type"] for e in events)
     assert types == ["node_end", "node_start"]
+
+
+# ── kickoff ide-board-perf-r4 — diffstat cache for finished runs ────────────
+
+
+def test_diffstat_written_on_first_runs_then_serves_second_call(
+    home: Path, monkeypatch
+) -> None:
+    """First ``_runs`` writes ``diffstat.json``; a second ``_runs`` with
+    ``mini_ork.acp.diffs.run_diffs`` monkeypatched to raise still returns
+    identical counts — proves the cache short-circuits before git.
+    """
+    import mini_ork.acp.diffs as acp_diffs
+
+    run_id = "r-ds-cache"
+    _seed_run(home, run_id, "published")
+    _write_diff_cache(home, run_id, added=4, removed=2)
+
+    board_cmd._runs(home)
+    cache_path = home / "runs" / run_id / "diffstat.json"
+    assert cache_path.is_file()
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert payload == {"added": 4, "removed": 2, "v": 1}
+
+    # Second call — break the slow path so the cache MUST answer.
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("git show forbidden")
+
+    monkeypatch.setattr(acp_diffs, "run_diffs", boom)
+
+    rows2, _ = board_cmd._runs(home)
+    matching = [r for r in rows2 if r["id"] == run_id]
+    assert len(matching) == 1
+    assert matching[0]["added"] == 4
+    assert matching[0]["removed"] == 2
+
+
+def test_diffstat_never_written_for_working_run(home: Path) -> None:
+    """A working (``classified``) run must never produce ``diffstat.json``.
+
+    Working runs return ``(0, 0)`` from ``task_state`` (rule 6) and
+    should never persist the cache — a cache hit on a still-running row
+    would mask a future diff arrival.
+    """
+    run_id = "r-ds-working"
+    _seed_run(home, run_id, "classified")
+
+    board_cmd._runs(home)
+    cache_path = home / "runs" / run_id / "diffstat.json"
+    assert not cache_path.exists()
