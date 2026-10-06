@@ -74,6 +74,7 @@ _NATIVE_MODULE_SUBS = {
     "collapse-check": "mini_ork.cli.collapse",
     "collapse-precursor": "mini_ork.cli.collapse_precursor",
     "automations": "mini_ork.cli.automations_cmd",
+    "board": "mini_ork.cli.board_cmd",
     "gate-fuzz": "mini_ork.cli.gate_fuzz",
     "memory-lifecycle": "mini_ork.cli.memory_lifecycle",
     "harness-contrast": "mini_ork.cli.harness_contrast",
@@ -130,6 +131,7 @@ Coordination:
   mcp-context                    Read-only stdio MCP server exposing runs, learnings,
                                    cost, and lanes (for agents in Zed etc.)
   zed setup|status|uninstall     Wire (or unwire) mini-ork inside Zed's settings.json
+  board [run|merge|discard|stop] The project's live state as JSON (IDE panels)
   automations <sub>              Manage per-project scheduled recipe runs
                                    (list|add|remove|pause|resume|run|tick|
                                    scheduler status|install|uninstall)
