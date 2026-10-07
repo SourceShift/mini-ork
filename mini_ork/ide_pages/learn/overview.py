@@ -7,7 +7,9 @@ freeze the clock without ``freezegun``.
 """
 from __future__ import annotations
 
+import calendar
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -18,10 +20,10 @@ DAY = 86400
 _PASS = {"published", "completed", "success"}
 _FAIL = {"failed", "rolled_back", "error"}
 
-# Cap retry-hint computations per render. The class-detail LIMIT is 10
-# (see below), so the cap equals the loop bound and a module-level counter
-# would be ceremony — but the code keeps one anyway so the test for
-# "cap at 10 per render" is a hard assert, not a hope (per kickoff change 1).
+# Cap retry-hint computations per render. Class detail already LIMITs to 10
+# rows, so at most 10 failed rows can trigger a hint lookup; the per-render
+# counter in _class_detail enforces the same bound explicitly so the page
+# can't blow its cost budget even if the row limit is ever raised.
 _HINT_CAP = 10
 
 
@@ -119,9 +121,9 @@ def _stalled_stage_count(conn, home: Path) -> int:
     """Return the number of stages whose ``stage_health`` row has ``alarm=True``.
 
     ``conn`` is used to gate on ``learning_pass_stats`` (cheap ``has_table``
-    probe — no rows fetched here). The read goes through
-    :func:`mini_ork.learning.ledger.stage_health` so the same kwargs-only API
-    the recipe ships.
+    probe — no rows fetched here). The actual read goes through
+    :func:`mini_ork.learning.ledger.stage_health`, so the page uses the same
+    kwargs-only API the recipe ships.
     """
     if not conn.has_table("learning_pass_stats"):
         return 0
@@ -556,16 +558,21 @@ def _iso_date(epoch: int) -> str:
 
 
 def _iso_to_epoch(iso_ts: str) -> int:
-    """Normalise a promotion_records.decided_at (ISO-8601 text) to epoch seconds.
+    """Normalise a promotion_records.decided_at (ISO-8601 text) to UTC epoch seconds.
 
-    The column is stored as ``YYYY-MM-DDTHH:MM:SSZ`` text, not as a SQLite
+    The column is stored as ``YYYY-MM-DDTHH:MM:SS[.ffffff]Z`` text (the writer
+    in ``mini_ork/gates/promotion_gate.py`` uses ``%f``), not as a SQLite
     integer — so it can't be compared or sorted against the other kinds'
-    epoch columns. Returning 0 on a bad/empty string keeps the sort stable
-    (those rows fall to the bottom of the merge).
+    epoch columns. Parsed as UTC via ``calendar.timegm`` (``time.mktime``
+    would shift by the local UTC offset and mis-order rows within a 2 h
+    window). Returning 0 on a bad/empty string keeps the sort stable (those
+    rows fall to the bottom of the merge).
     """
     if not iso_ts:
         return 0
+    ts = iso_ts[:-1] if iso_ts.endswith("Z") else iso_ts
     try:
-        return int(time.mktime(time.strptime(iso_ts, "%Y-%m-%dT%H:%M:%SZ")))
-    except (TypeError, ValueError):
+        dt = datetime.fromisoformat(ts)
+    except ValueError:
         return 0
+    return calendar.timegm(dt.timetuple())

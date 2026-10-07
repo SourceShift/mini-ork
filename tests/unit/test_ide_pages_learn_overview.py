@@ -144,6 +144,22 @@ def test_class_detail_hint_raising_does_not_break_page(
     assert detail["rows"][0]["cells"][4]["t"] == "REQUEST_CHANGES"
 
 
+def test_class_detail_failed_run_no_hint_no_memory_no_verdict(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed run with no hint, no failure_memory row and no verdict renders
+    'no reason recorded' — never '—' (the bug this phase exists to fix)."""
+    now = int(time.time())
+    _seed_failed_runs(home, count=1, now=now, verdict=None)
+    monkeypatch.setattr(
+        "mini_ork.ide_pages.learn.overview._hint_or_none",
+        lambda home, run_id: None)
+
+    page = learn.build(home, "overview", {"cls": "framework_edit"})
+    detail = _section(page, "framework_edit · last 10 finished runs")
+    assert detail["rows"][0]["cells"][4]["t"] == "no reason recorded"
+
+
 # ── reap button ───────────────────────────────────────────────────────────
 
 
@@ -271,17 +287,18 @@ def test_learning_loop_health_healthy_stage_only(home: Path) -> None:
 
 def test_recent_learning_events_one_of_each_kind(home: Path) -> None:
     """One of each kind in the last 14 days appears, older rows excluded,
-    AND events with distinct timestamps come out in global newest-first order
-    (kickoff change 4: at most 12, sorted across kinds)."""
+    AND events with interleaved timestamps come out in global newest-first
+    order with the exact title sequence asserted (kickoff change 1: at most
+    12, sorted across kinds)."""
     now = int(time.time())
     DAY = 86400
     con = sqlite3.connect(home / "state.db")
 
     # Distinct epoch offsets per kind so the merge ordering is observable.
-    pat_ts = now - 2 * DAY      # oldest of the four
-    mem_ts = now - 1 * DAY      # middle
-    pro_ts = now - 4 * DAY      # 2nd-newest
     bug_ts = now - 6 * 3600     # ~6 hours ago — newest of the four
+    mem_ts = now - 1 * DAY      # 2nd-newest
+    pat_ts = now - 2 * DAY      # 3rd-newest
+    pro_ts = now - 4 * DAY      # oldest of the four
 
     # emergent_patterns: one recent approved, one old (30d ago).
     con.execute(
@@ -353,19 +370,16 @@ def test_recent_learning_events_one_of_each_kind(home: Path) -> None:
     assert "other" not in titles
     assert "old issue" not in titles
 
-    # Global newest-first across kinds. Each item's `sub` starts with the
-    # ISO date we set on it — extract the YYYY-MM-DD and convert back to epoch.
-    from calendar import timegm
-    from datetime import datetime as _dt
-    parsed = []
-    for it in items:
-        sub = it.get("sub") or ""
-        date_str = sub.split(" · ")[0]
-        ts = int(timegm(_dt.strptime(date_str, "%Y-%m-%d").timetuple()))
-        parsed.append((ts, it["t"]))
-    assert parsed == sorted(parsed, key=lambda p: p[0], reverse=True), (
-        f"events not newest-first across kinds: {parsed}"
-    )
+    # Global newest-first across kinds: bug → memory → pattern → promotion,
+    # matching the seed offsets above. The exact title order is the assertion —
+    # a monotonic-only check would let two kinds swap silently.
+    expected = [
+        "mini-ork issue: mini-ork issue A",
+        "Memory retired: old memory",
+        "Pattern approved: lesson text a",
+        "Promotion promoted: cand-1",
+    ]
+    assert [i["t"] for i in items] == expected
 
     # At-most-12 — fewer is fine, more than 12 is the kickoff violation.
     assert len(items) <= 12
@@ -391,6 +405,23 @@ def test_recent_learning_events_tolerate_missing_tables(home: Path) -> None:
     events_sec = _section(page, "Recent learning events")
     assert events_sec["type"] == "list"
     assert events_sec["items"][0]["t"] == "No learning events in 14 days"
+
+
+def test_iso_to_epoch_accepts_fractional_seconds_and_is_utc(home: Path) -> None:
+    """promotion_gate writes decided_at with microseconds
+    (strftime '%Y-%m-%dT%H:%M:%fZ'); the converter must accept the fraction
+    and treat the 'Z' as UTC so promotions order correctly against the epoch
+    columns of the other three kinds."""
+    from mini_ork.ide_pages.learn.overview import _iso_to_epoch
+
+    # Fractional seconds must not fall through to 0.
+    assert _iso_to_epoch("2026-10-07T10:00:00.123Z") != 0
+    # Whole-second form parses to the exact UTC instant (calendar.timegm, not
+    # time.mktime — mktime shifts by the local UTC offset).
+    assert abs(_iso_to_epoch("2026-10-07T10:00:00Z") - 1791367200) < 2
+    # Bad / empty strings keep the stable-sort contract: 0.
+    assert _iso_to_epoch("") == 0
+    assert _iso_to_epoch("not-a-timestamp") == 0
 
 
 # ── page-shape sanity ─────────────────────────────────────────────────────
