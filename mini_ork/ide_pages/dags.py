@@ -150,8 +150,13 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
             entry = statuses.get(str(name), {})
             nodes.append({
                 "id": str(name),
+                "type": n.get("type"),
                 "lane": lane,
                 "state": entry.get("status", "never_seen"),
+                # Epoch seconds of node_start and the node_end duration, so the
+                # board can show each node's elapsed time (``None`` until seen).
+                "started_at": entry.get("started_at"),
+                "duration_ms": entry.get("duration_ms"),
             })
 
         edges: list[dict[str, Any]] = []

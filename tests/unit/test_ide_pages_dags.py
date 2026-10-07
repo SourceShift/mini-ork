@@ -217,3 +217,24 @@ def test_empty_state_db_returns_an_empty_payload(home: Path) -> None:
     """No runs at all → ``{ok, label, dags: {}, errors: {}}`` — never a 500."""
     page = build_page(home, "dags", None, {"ids": "run-does-not-exist"})
     assert page["ok"] is True and page["dags"] == {} and page["errors"] == {}
+
+
+def test_each_node_carries_its_type_and_timing(home: Path) -> None:
+    """The board shows each node's elapsed time: ``started_at`` is the
+    node_start epoch, ``duration_ms`` the node_end payload's (``None`` until
+    seen), and ``type`` the workflow node type."""
+    events = _events_for_demo()
+    _seed_run(home, RUN_A, "demo-recipe", events)
+    con = sqlite3.connect(home / "state.db")
+    con.execute(
+        "UPDATE run_events SET payload_json = json_set(payload_json, '$.duration_ms', 30000) "
+        "WHERE run_id = ? AND event_type = 'node_end' AND payload_json LIKE '%\"implementer\"%'",
+        (RUN_A,))
+    con.commit()
+    con.close()
+
+    nodes = {n["id"]: n for n in build_page(home, "dags", None, {"ids": RUN_A})["dags"][RUN_A]["nodes"]}
+    assert nodes["implementer"]["type"] == "implementer"
+    assert nodes["implementer"]["started_at"] == T0 + 10
+    assert nodes["implementer"]["duration_ms"] == 30000
+    assert nodes["planner"]["started_at"] is None and nodes["planner"]["duration_ms"] is None
