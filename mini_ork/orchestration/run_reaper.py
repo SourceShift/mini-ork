@@ -92,14 +92,42 @@ def release_pid_file(run_dir: Path) -> None:
         pass
 
 
-def close_run_record(db_path: str | Path, run_id: str, run_dir: Path, *,
-                     crashed: bool, now: int | None = None) -> str | None:
-    """Lifecycle teardown: a run that exits still non-terminal ends ``failed``.
+def finalize_passed(db_path: str | Path, run_id: str, note: str, *, now: int | None = None) -> bool:
+    """End a run that passed but has no publish step as ``published``.
 
-    Returns the status it replaced, or ``None`` when nothing changed. A
-    cost-paused run keeps its status — it waits on ``mini-ork resume``.
+    The ``task_runs`` CHECK allows three terminal statuses — published,
+    rolled_back, failed — and only ``published`` records a pass. So a run that
+    cleared every gate but delivers nothing beyond its run dir (no artifact
+    contract, or a workflow without a publisher node) is ``published`` with
+    ``note`` saying what was not delivered. Only a non-terminal row changes.
     """
-    if not run_id or (run_dir / ".cost-pause").exists() or _verdict_passed(run_dir):
+    now = int(time.time()) if now is None else now
+    con = sqlite3.connect(str(db_path), timeout=15.0)
+    try:
+        con.execute("PRAGMA busy_timeout = 15000")
+        cur = con.execute(
+            "UPDATE task_runs SET status = 'published', notes = COALESCE(notes || '; ', '') || ?, "
+            "updated_at = ?, ended_at = COALESCE(ended_at, ?), "
+            "duration_ms = CASE WHEN COALESCE(duration_ms, 0) = 0 "
+            "THEN MAX(COALESCE(ended_at, ?) - created_at, 0) * 1000 ELSE duration_ms END "
+            "WHERE id = ? AND status NOT IN ('published', 'failed', 'rolled_back')",
+            (note, now, now, now, run_id))
+        con.commit()
+        return cur.rowcount == 1
+    finally:
+        con.close()
+
+
+def close_run_record(db_path: str | Path, run_id: str, run_dir: Path, *,
+                     crashed: bool, rc: int | None = None, now: int | None = None) -> str | None:
+    """Lifecycle teardown: a run that exits non-terminal gets a terminal status.
+
+    Passed (``rc == 0``, no exception, ``verdict.json`` pass) → ``published``
+    via :func:`finalize_passed`; anything else → ``failed``. Returns the status
+    it replaced, or ``None`` when nothing changed. A cost-paused run keeps its
+    status — it waits on ``mini-ork resume``.
+    """
+    if not run_id or (run_dir / ".cost-pause").exists():
         return None
     now = int(time.time()) if now is None else now
     con = sqlite3.connect(str(db_path), timeout=15.0)
@@ -108,7 +136,17 @@ def close_run_record(db_path: str | Path, run_id: str, run_dir: Path, *,
         row = con.execute("SELECT status FROM task_runs WHERE id = ?", (run_id,)).fetchone()
         if row is None or row[0] in TERMINAL:
             return None
-        if crashed:
+        # A deadline exit returns 0 before verify runs: its verdict is unverified.
+        if not crashed and rc == 0 and _verdict_passed(run_dir) and not (run_dir / ".deadline-hit").exists():
+            con.close()
+            done = finalize_passed(db_path, run_id, "lifecycle: passed; the workflow wrote no terminal status "
+                                   "(no publish step ran)", now=now)
+            return row[0] if done else None
+        if _verdict_passed(run_dir) and not crashed and rc is None:
+            return None  # outcome unknown: never fail finished work (bf2805dd)
+        if _verdict_passed(run_dir) and rc not in (None, 0):
+            note = f"verify or a later step failed after a passing execute (rc={rc})"
+        elif crashed:
             note = "lifecycle exited on an exception before a verdict"
         elif (run_dir / ".deadline-hit").exists():
             note = "deadline hit before a verdict"

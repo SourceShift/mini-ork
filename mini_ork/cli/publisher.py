@@ -20,8 +20,25 @@ from mini_ork.verify import levels as _levels
 
 
 def set_status(db, run_id, new_status):  # late binding — avoids the execute<->publisher cycle
+    """Write ``new_status`` and prove it landed.
+
+    ``execute.set_status`` only warns when its retries run out; a terminal
+    status that silently fails to persist leaves the run in flight forever.
+    Read it back and raise instead (zero-fallback).
+    """
     from mini_ork.cli.execute import set_status as _impl  # noqa: PLC0415
-    return _impl(db, run_id, new_status)
+    _impl(db, run_id, new_status)
+    if not db or not run_id or not os.path.isfile(db):
+        return None
+    import sqlite3  # noqa: PLC0415
+    con = sqlite3.connect(db, timeout=15.0)
+    try:
+        row = con.execute("SELECT status FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+    finally:
+        con.close()
+    if row is not None and row[0] != new_status:
+        raise RuntimeError(f"set_status({new_status!r}) for {run_id} did not persist (row says {row[0]!r})")
+    return None
 
 def _recipe_root(root):
     """Base dir for recipe assets. ``main.py`` resolves a recipe against the
@@ -203,7 +220,16 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
     contract = (os.path.join(_recipe_root(root), "recipes", recipe, "artifact_contract.yaml")
                 if recipe else "")
     if not contract or not os.path.isfile(contract):
-        print(f"  [warn] publisher: no artifact_contract.yaml at {contract} — skipping", file=sys.stderr)
+        # Every gate above passed; there is just nothing to deliver. Leaving the
+        # status open made these runs read as in flight forever (K0: libwit's
+        # execute-only verified-artifact runs never see the overlay contract,
+        # because only `mini-ork run` threads MINI_ORK_RECIPE_ROOT).
+        msg = f"publisher: no artifact_contract.yaml at {contract or '(no recipe)'} — nothing delivered"
+        print(f"  [warn] {msg}", file=sys.stderr)
+        print(f"  [ok] {msg}; gates passed, run finalized as published")
+        if db and run_id and os.path.isfile(db):
+            from mini_ork.orchestration.run_reaper import finalize_passed  # noqa: PLC0415
+            finalize_passed(db, run_id, msg + "; artifact left in the run dir")
         return 0, "done"
     src_name, outputs = "synthesis.md", []
     try:

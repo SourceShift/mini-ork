@@ -476,6 +476,7 @@ def _run_lifecycle(argv, root) -> int:
             inner.append(a)
     sink: dict = {}
     crashed = False
+    rc: int | None = None
     # Run-level boundary: everything the lifecycle publishes (artifact path,
     # run dir, per-node MO_* vars) is wiped from the contextvar layer when
     # the run exits. The lifecycle owns the run context; in-process callers
@@ -497,7 +498,7 @@ def _run_lifecycle(argv, root) -> int:
             # A run that leaves here still non-terminal would read as in flight
             # forever. Teardown is best-effort: it MUST NOT change the rc.
             try:
-                _close_run_record(sink, crashed=crashed)
+                _close_run_record(sink, crashed=crashed, rc=rc)
             except Exception as exc:  # noqa: BLE001 — teardown is best-effort
                 sys.stderr.write(f"[warn] run record close failed: {exc}\n")
             # Raise task_runs.cost_usd to the ledger total so every reporter
@@ -534,7 +535,21 @@ def _release_remote_session() -> None:
         sys.stderr.write(f"[warn] remote session release failed: {exc}\n")
 
 
-def _close_run_record(sink: dict, *, crashed: bool) -> None:
+def _write_execute_log(run_dir: str, out: str, err: str) -> None:
+    """``execute.log`` = execute's stdout, then its stderr under a marker.
+
+    The publisher's ``[fail]`` / ``[warn]`` / ``[BLOCK]`` reasons go to stderr;
+    a rejection whose reason never reaches the run dir is unattributable
+    (K0: nine approved SDD runs rolled back with no recorded cause).
+    """
+    log = out
+    if err.strip():
+        log += "\n── execute stderr ──\n" + err
+    with open(os.path.join(run_dir, _execute_log_name()), "w", encoding="utf-8") as fh:
+        fh.write(log)
+
+
+def _close_run_record(sink: dict, *, crashed: bool, rc: int | None = None) -> None:
     """End the run's ``task_runs`` row, then drop its ``.pid``.
 
     Status first, ``.pid`` second: a kill between the two leaves a dead
@@ -550,7 +565,7 @@ def _close_run_record(sink: dict, *, crashed: bool) -> None:
     try:
         db = resolve_db_path(context_env("MINI_ORK_DB") or None)
         if os.path.isfile(db):
-            run_reaper.close_run_record(db, sink.get("run_id") or "", Path(run_dir), crashed=crashed)
+            run_reaper.close_run_record(db, sink.get("run_id") or "", Path(run_dir), crashed=crashed, rc=rc)
     finally:
         run_reaper.release_pid_file(Path(run_dir))
 
@@ -898,7 +913,7 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
         _run_dir = os.path.dirname(plan_path)
     if _run_dir and _run_dir != "." and os.path.isdir(_run_dir):
         try:
-            open(os.path.join(_run_dir, _execute_log_name()), "w").write(execute_out)
+            _write_execute_log(_run_dir, execute_out, execute_err)
         except OSError:
             pass
 
