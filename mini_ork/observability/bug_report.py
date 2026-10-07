@@ -53,6 +53,7 @@ import os
 import re
 import sqlite3
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 from mini_ork.context import context_env
@@ -504,10 +505,134 @@ def bug_report_show(bid: int) -> str:
 
 
 # Mirrors lib/bug_report.sh:258-369 (`bug_report_promote`).
+_FRAMEWORK_EDIT_RECIPE = "framework-edit"
+
+
+def _render_promoted_kickoff(
+    *,
+    title: str,
+    role: str,
+    sev: str,
+    conf: float,
+    freq: int,
+    obs_in: str,
+    task_class: str,
+    desc: str,
+    fix: str,
+    bid: int,
+    fp: str,
+    recipe: str | None,
+) -> str:
+    """Render the kickoff body for a promoted bug.
+
+    The default body is the generic "fix the noticed bug" blurb. When the epic
+    is bound to a recipe that reads the kickoff as a change request (currently
+    ``framework-edit``), emit the Goal / Scope / Success Criteria / Verification
+    shape that recipe's planner expects.
+    """
+    context = [
+        f"- Severity: **{sev}** (confidence {conf:.2f}, observed {freq}x)",
+        f"- First noticed by: `{role}` agent",
+        f"- Observed in: `{obs_in or 'general'}`",
+    ]
+    if task_class:
+        context.append(f"- Originating task_class: `{task_class}`")
+
+    body: list[str] = [f"# Bug-promoted epic: {title}", ""]
+
+    if recipe == _FRAMEWORK_EDIT_RECIPE:
+        body.extend([
+            "## Goal",
+            "",
+            "Fix a bug in mini-ork's own code, surfaced by a failed run and "
+            "attributed to the framework by failure triage:",
+            "",
+            f"> {title}",
+            "",
+            "## Scope",
+            "",
+            *context,
+            "- Target repo: this mini-ork checkout (the recipe edits it in an "
+            "isolated worktree).",
+            "- Improvable surface: the `mini_ork/` package and shipped "
+            "`recipes/*` verifiers. Keep the diff minimal and reviewable.",
+            "",
+            "## Evidence",
+            "",
+            (desc or "(none provided)").strip(),
+            "",
+        ])
+        if fix:
+            body.extend([
+                "## Failing log excerpt",
+                "",
+                "```",
+                fix.strip(),
+                "```",
+                "",
+            ])
+        body.extend([
+            "## Success Criteria",
+            "",
+            "- The failing node's log no longer reproduces the error.",
+            "- `static-check`, `test`, and `framework-edit-shape` verifiers pass.",
+            "- The change is proposed as `framework-edit.diff` + `verdict.json`.",
+            "",
+            "## Verification Command",
+            "",
+            "- `python3 -m pytest -q`",
+            "",
+        ])
+    else:
+        body.extend([
+            "## Goal",
+            "",
+            f"Fix the bug noticed by `{role}` agent during a prior run:",
+            "",
+            f"> {title}",
+            "",
+            "## Context",
+            "",
+            *context,
+            "",
+            "## Description",
+            "",
+            (desc or "(none provided)").strip(),
+            "",
+        ])
+        if fix:
+            body.extend([
+                "## Suggested fix (from the noticing agent)",
+                "",
+                fix.strip(),
+                "",
+            ])
+        body.extend([
+            "## Verification commands",
+            "",
+            "- `shellcheck $(git diff --name-only HEAD~1 HEAD | grep '\\.sh$')`",
+            "- `bash tests/integration/test_autonomous_epic_pipeline.sh`",
+            "",
+            "## Done When",
+            "",
+            "- `${MINI_ORK_RUN_DIR}/verdict.json` contains `{ \"pass\": true }`.",
+            "- The originating noticed_bug fingerprint stops recurring in new runs.",
+            "",
+        ])
+
+    body.extend([
+        f"_Auto-promoted from bug_reports id={bid} (fingerprint={fp[:12]})._",
+        "",
+    ])
+    return "\n".join(body)
+
+
 def bug_report_promote(
     *args: str,
     top: int = 3,
     repo_root: str | os.PathLike[str] | None = None,
+    recipe: str | None = None,
+    bug_ids: Sequence[int] | None = None,
 ) -> int:
     """Mirror bash `bug_report_promote --top N`.
 
@@ -520,7 +645,8 @@ def bug_report_promote(
       2. Skip if ``epics.id`` already exists (idempotence on re-promote).
       3. Write the kickoff body to
          ``{repo_root}/kickoffs/auto/{epic_id}.md``.
-      4. INSERT a ``epics`` row with ``status='not started'``.
+      4. INSERT a ``epics`` row with ``status='not started'`` (and ``recipe``
+         when one is given — see below).
       5. UPDATE ``bug_reports`` to ``status='queued_as_epic'``,
          ``promoted_to_epic_id={epic_id}``,
          ``updated_at=strftime('%s','now')``.
@@ -531,6 +657,19 @@ def bug_report_promote(
     Positional ``args`` are parsed for ``--top N`` to mirror bash; the
     explicit ``top=`` kwarg takes precedence. ``repo_root`` defaults to
     :func:`_resolve_repo_root`.
+
+    Extensions over the bash original (both keyword-only, both backwards
+    compatible):
+
+      * ``recipe`` — when set, the epic gets ``epics.recipe`` so the scheduler
+        dispatches that recipe instead of ``MO_SCHED_RECIPE`` (the column is
+        added on demand — the scheduler owns it via ``ensure_retry_schema``).
+        ``recipe="framework-edit"`` also switches the kickoff body to the
+        Goal / Scope / Success Criteria / Verification shape that recipe's
+        planner expects.
+      * ``bug_ids`` — restrict promotion to these ``bug_reports.id`` values
+        (used by failure triage to promote exactly the bug it just filed,
+        rather than whatever currently ranks top-N).
     """
     parsed_top = top
     i = 0
@@ -554,17 +693,33 @@ def bug_report_promote(
     try:
         con.execute("PRAGMA busy_timeout=5000")
 
+        # The scheduler owns epics.recipe (added on demand via
+        # ensure_retry_schema). Add it here too so a promote that asks for a
+        # recipe works on a DB where the scheduler has not run yet.
+        epic_cols = {r[1] for r in con.execute("PRAGMA table_info(epics)").fetchall()}
+        if recipe and epic_cols and "recipe" not in epic_cols:
+            con.execute("ALTER TABLE epics ADD COLUMN recipe TEXT")
+            epic_cols.add("recipe")
+
+        where = "WHERE status='open'"
+        params: list[object] = []
+        if bug_ids:
+            ids = [int(b) for b in bug_ids]
+            where += f" AND id IN ({','.join('?' for _ in ids)})"
+            params.extend(ids)
+        params.append(int(parsed_top))
+
         rows = con.execute(
-            """SELECT id, fingerprint, agent_role, task_class, observed_in,
+            f"""SELECT id, fingerprint, agent_role, task_class, observed_in,
                       title, description, suggested_fix, severity,
                       confidence, frequency
-                 FROM bug_reports WHERE status='open'
+                 FROM bug_reports {where}
                  ORDER BY CASE severity WHEN 'critical' THEN 8
                                        WHEN 'high'     THEN 4
                                        WHEN 'medium'   THEN 2
                                        ELSE 1 END * frequency * confidence DESC
                  LIMIT ?""",
-            (int(parsed_top),),
+            tuple(params),
         ).fetchall()
 
         promoted = 0
@@ -595,59 +750,26 @@ def bug_report_promote(
             kickoff_rel = f"kickoffs/auto/{epic_id}.md"
             kickoff_abs = root / kickoff_rel
 
-            body = [
-                f"# Bug-promoted epic: {title}",
-                "",
-                "## Goal",
-                "",
-                f"Fix the bug noticed by `{role}` agent during a prior run:",
-                "",
-                f"> {title}",
-                "",
-                "## Context",
-                "",
-                f"- Severity: **{sev}** (confidence {conf:.2f}, observed {freq}x)",
-                f"- First noticed by: `{role}` agent",
-                f"- Observed in: `{obs_in or 'general'}`",
-            ]
-            if tc:
-                body.append(f"- Originating task_class: `{tc}`")
-            body.append("")
-            body.extend([
-                "## Description",
-                "",
-                (desc or "(none provided)").strip(),
-                "",
-            ])
-            if fix:
-                body.extend([
-                    "## Suggested fix (from the noticing agent)",
-                    "",
-                    fix.strip(),
-                    "",
-                ])
-            body.extend([
-                "## Verification commands",
-                "",
-                "- `shellcheck $(git diff --name-only HEAD~1 HEAD | grep '\\.sh$')`",
-                "- `bash tests/integration/test_autonomous_epic_pipeline.sh`",
-                "",
-                "## Done When",
-                "",
-                "- `${MINI_ORK_RUN_DIR}/verdict.json` contains `{ \"pass\": true }`.",
-                "- The originating noticed_bug fingerprint stops recurring in new runs.",
-                "",
-                f"_Auto-promoted from bug_reports id={bid} (fingerprint={fp[:12]})._",
-                "",
-            ])
-            kickoff_abs.write_text("\n".join(body), encoding="utf-8")
+            kickoff = _render_promoted_kickoff(
+                title=title, role=role, sev=sev, conf=conf, freq=freq,
+                obs_in=obs_in, task_class=tc, desc=desc, fix=fix,
+                bid=bid, fp=fp, recipe=recipe,
+            )
+            kickoff_abs.write_text(kickoff, encoding="utf-8")
 
             epic_title = f"BUG-{bid}: {title[:140]}"
-            con.execute(
-                "INSERT INTO epics(id, title, status, kickoff_path) "
-                "VALUES(?,?,'not started',?)",
-                (epic_id, epic_title, kickoff_rel),
-            )
+            if recipe and "recipe" in epic_cols:
+                con.execute(
+                    "INSERT INTO epics(id, title, status, kickoff_path, recipe) "
+                    "VALUES(?,?,'not started',?,?)",
+                    (epic_id, epic_title, kickoff_rel, recipe),
+                )
+            else:
+                con.execute(
+                    "INSERT INTO epics(id, title, status, kickoff_path) "
+                    "VALUES(?,?,'not started',?)",
+                    (epic_id, epic_title, kickoff_rel),
+                )
             con.execute(
                 "UPDATE bug_reports SET status='queued_as_epic', "
                 "promoted_to_epic_id=?, updated_at=strftime('%s','now') "
