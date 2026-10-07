@@ -248,14 +248,14 @@ def _drive_gate_block(home: Path, run_id: str, monkeypatch: pytest.MonkeyPatch) 
     return plan.main([str(kickoff)], root=str(REPO), dispatch=None)
 
 
-def test_ac2_gate_block_writes_valid_asks_and_exits_6(home: Path, monkeypatch):
+def test_ac2_gate_block_writes_valid_asks(home: Path, monkeypatch):
     run_id = "run-blocked"
     _seed_row(home, run_id)
     _write_profile(home / "runs" / run_id, questions=("q1", "q2"))
 
     rc = _drive_gate_block(home, run_id, monkeypatch)
 
-    assert rc == 6
+    assert rc == 0  # `mini-ork plan` keeps its contract; execute's gate exits 6
     asks_dir = home / "runs" / run_id / "asks"
     ask_files = sorted(asks_dir.glob("ask-*.json"))
     assert [p.name for p in ask_files] == ["ask-1.json", "ask-2.json"]
@@ -274,13 +274,30 @@ def test_ac2_gate_block_writes_valid_asks_and_exits_6(home: Path, monkeypatch):
     assert events[0][0].startswith(f"evt-asks_blocked-{run_id}-")
 
 
+def test_ac2_execute_gate_blocks_resumably_on_open_asks(home: Path, monkeypatch):
+    # The exit 6 of a blocked run comes from execute's gate. With open ASKs it
+    # refuses to dispatch but writes no blocked.json and leaves the row planned.
+    from mini_ork.cli import execute
+
+    run_id = "run-gate"
+    _seed_row(home, run_id)
+    _write_profile(home / "runs" / run_id)
+    assert _drive_gate_block(home, run_id, monkeypatch) == 0
+    run_dir = home / "runs" / run_id
+    plan_path = next(run_dir.glob("plan*.json"))
+
+    assert execute._execute_gate_check(str(plan_path), str(run_dir), 0) is True  # → exit 6
+    assert not (run_dir / "blocked.json").exists()
+    assert _row(home, run_id) == {"status": "planned", "verdict": None}
+
+
 def test_ac2_blocked_run_stays_planned_and_is_not_reaped(home: Path, monkeypatch):
     run_id = "run-planned"
     _seed_row(home, run_id)
     _write_profile(home / "runs" / run_id)
 
     rc = _drive_gate_block(home, run_id, monkeypatch)
-    assert rc == 6
+    assert rc == 0
 
     run_dir = home / "runs" / run_id
     assert _row(home, run_id) == {"status": "planned", "verdict": None}

@@ -786,11 +786,11 @@ def main(argv=None, *, root=None, dispatch=None) -> int:
         if human_questions:
             # A headless run blocked on real questions is resumable, not failed:
             # write one ASK file per question, mark the row planned (non-terminal),
-            # and exit 6 — the same code execute used to signal this block.
+            # and return 0 like any blocked plan: execute's gate sees the open
+            # ASKs and exits 6 (resumable), so `mini-ork plan` keeps its contract.
             _write_ask_files(run_dir, run_id, human_questions, db)
             _db_write(db, run_id, task_class, out_file,
                       hashlib.sha256(plan_text.encode()).hexdigest()[:16])
-            return 6
         return 0
 
     # ── get raw plan: MO_GIVEN_PLAN | force-recipe-fallback | LLM dispatch ──
