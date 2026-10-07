@@ -35,12 +35,21 @@ FRAMEWORK_INTERNAL_PREFIXES = (
 
 
 def _db_path(db: str | None) -> str:
+    """Resolve the state DB: explicit arg → ``MINI_ORK_DB`` → ``$MINI_ORK_HOME/state.db``.
+
+    Never raises: an unset ``MINI_ORK_DB`` falls back to the home default
+    (home default ``.mini-ork``), matching ``RunContext.db_or_default`` and the
+    documented contract. Reading through ``context_env`` (not bare
+    ``os.environ``) keeps the per-run contextvar isolation layer authoritative.
+    Callers already fail soft on a missing file (``if not os.path.isfile(dbp):
+    return ""``), so an absent default resolves to no block rather than an error.
+    """
     if db:
         return db
     env = context_env("MINI_ORK_DB")
-    if not env:
-        raise RuntimeError("MINI_ORK_DB unset")
-    return env
+    if env:
+        return env
+    return os.path.join(context_env("MINI_ORK_HOME") or ".mini-ork", "state.db")
 
 
 def approx_tokens(s: str) -> int:
@@ -133,7 +142,14 @@ def context_assemble(task_brief_path: str, workflow_node: str,
     task_class = brief.get("task_class", "") if isinstance(brief, dict) else ""
     verifier_contract = verifier_contract or {}
 
-    con = sqlite3.connect(_db_path(db))
+    # An absent DB (uninitialized home) must not be created as a side effect:
+    # plain sqlite3.connect() would leave a 0-byte state.db behind now that
+    # _db_path() falls back instead of raising. Every query below already fails
+    # soft on a missing table, so fall back to a throwaway in-memory handle —
+    # the same missing-file tolerance the graph_context block below states
+    # explicitly with ``os.path.isfile(gc_db)``.
+    dbp = _db_path(db)
+    con = sqlite3.connect(dbp if os.path.isfile(dbp) else ":memory:")
     con.row_factory = sqlite3.Row
     cur_run = context_env("MINI_ORK_RUN_ID", "")
 

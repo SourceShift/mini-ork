@@ -728,6 +728,12 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     filter_node_type = args.filter_node_type
 
     home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
+    # Publish the documented DB default so _learned_block — which reads
+    # os.environ["MINI_ORK_DB"] — lights up when only MINI_ORK_HOME was set
+    # (e.g. execute invoked directly, bypassing the top-level dispatcher).
+    # Never override an explicit operator value.
+    if not context_env("MINI_ORK_DB"):
+        apply_env_overrides({"MINI_ORK_DB": os.path.join(home, "state.db")})
     plan_path, rc = _resolve_plan_path(args.plan_path, home, from_node=args.from_node,
                                        recovery_active=args.recovery_active)
     if rc != 0:

@@ -1109,6 +1109,15 @@ def main(argv=None, *, root=None) -> int:
         os.path.dirname(os.path.realpath(__file__)))
     os.environ["MINI_ORK_ROOT"] = root
     _load_secret_store_env()
+    # NOTE: main() deliberately does NOT publish a derived MINI_ORK_DB. A
+    # process-wide default here is indistinguishable from an operator-set one,
+    # so it would (a) shadow ``--home`` for subcommands that re-point the home
+    # for DB resolution (lessons forget/restore, serve) and (b) leak into
+    # web/control.py:launch_run children — those copy os.environ and re-pin
+    # MINI_ORK_HOME but not MINI_ORK_DB, so a run for project X would read and
+    # write another project's state.db. The default lives instead in the
+    # resolution ladder (``context_assembler._db_path``) and at the run boundary
+    # (``execute.main``), neither of which re-points the home it derived from.
     sub = argv[0] if argv else "help"
     rest = argv[1:]
 
