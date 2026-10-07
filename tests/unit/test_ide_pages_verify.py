@@ -52,7 +52,7 @@ def test_every_tab_builds_with_the_design_structure(home: Path) -> None:
         assert page["tab"] == key
         assert [(t["key"], t["label"]) for t in page["tabs"]] == [
             ("certify", "Certify"), ("gates", "Gates & verifiers"), ("panels", "Panel independence"),
-            ("inbox", "Human gates"), ("autonomy", "Autonomy & probes")]
+            ("inbox", "Human gates"), ("autonomy", "Autonomy & probes"), ("bugs", "Bug reports")]
         assert page["sections"]
         json.dumps(page)
 
@@ -169,3 +169,19 @@ def test_panel_independence_selects_a_recipe_and_reads_its_families(home: Path) 
     receipt = _section(page, "Receipt · who judged this")
     assert receipt["head"] == ["node", "family", "role", "lane"]
     assert receipt["rows"]
+
+
+def test_bugs_tab_lists_reports_with_both_actions(home: Path) -> None:
+    _sql(home, ("INSERT INTO bug_reports (fingerprint, agent_role, title, observed_in, confidence, status, "
+                "first_seen_at, last_seen_at, updated_at) VALUES ('fp', 'scheduler', 'verdict.json mismatch', "
+                "'bin/mini-ork-scheduler', 0.95, 'open', ?, ?, ?)",
+                (int(time.time()), int(time.time()), int(time.time()))))
+    table = _section(build_page(home, "verify", "bugs", {}), "Bug reports")
+    assert table["head"] == ["id", "report", "source", "score"]
+    assert [c["t"] for c in table["rows"][0]["cells"]][1:] == [
+        "verdict.json mismatch", "mini-ork-scheduler", "0.95"]
+    actions = {a["label"]: a["do"] for a in table["actions"]}
+    assert actions["Sweep runs"]["cli"] == ["bugs", "sweep"]
+    assert actions["Sweep runs"]["home"] is False
+    assert actions["Promote top 3"]["cli"] == ["bugs", "promote", "--top", "3"]
+    assert actions["Promote top 3"]["home"] is False

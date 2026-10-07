@@ -15,7 +15,7 @@ from typing import Any
 from mini_ork.ide_pages import spec as S
 
 TABS = [("certify", "Certify"), ("gates", "Gates & verifiers"), ("panels", "Panel independence"),
-        ("inbox", "Human gates"), ("autonomy", "Autonomy & probes")]
+        ("inbox", "Human gates"), ("autonomy", "Autonomy & probes"), ("bugs", "Bug reports")]
 
 DAY = 86400
 _CERT_LIMIT = 10
@@ -607,8 +607,38 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
         sections = _panel_sections(home, args, errors)
     elif tab == "inbox":
         sections = _inbox_sections(home, errors)
+    elif tab == "bugs":
+        sections = S.guarded(errors, "Bug reports", lambda: _bugs(home))
     else:
         sections = _autonomy_sections(home, errors)
     return S.page("verify", "Verification & safety",
                   "Executable checks first, independent panels second, and hard limits on what changes itself.",
                   tabs=TABS, tab=tab, args=args, sections=sections, errors=errors)
+
+
+# ── bug reports ────────────────────────────────────────────────────────────
+
+def _short_title(text: str, limit: int) -> str:
+    """Truncate a bug-report title; ``verify._short`` already owns run_id truncation."""
+    t = " ".join(str(text or "").split())
+    return t if len(t) <= limit else t[: limit - 1] + "…"
+
+
+def _bugs(home: Path) -> dict[str, Any]:
+    db = _db(home)
+    rows = db.rows("SELECT id, title, observed_in, confidence, status, severity FROM bug_reports "
+                   "ORDER BY CASE WHEN status = 'open' THEN 0 ELSE 1 END, confidence DESC LIMIT 20") \
+        if (db is not None and db.has_table("bug_reports")) else []
+    cols = [S.col(60), S.col(fr=1, min=0), S.col(70), S.col(56)]
+    out = [[S.mono(f"b-{r['id']}"), S.cell(_short_title(str(r.get("title") or ""), 110), "text"),
+            S.muted(Path(str(r.get("observed_in") or "—")).name), S.mono(f"{float(r.get('confidence') or 0):.2f}")]
+           for r in rows]
+    if not out:
+        out = [[S.muted("—"), S.muted("No bug reports yet"), "", ""]]
+    return S.table("Bug reports", cols, ["id", "report", "source", "score"], out, full=True,
+                   note="Sweep runs for bug reports, prioritise, and promote the top ones into kickoffs.",
+                   actions=[S.btn("Sweep runs", S.cli("bugs", "sweep", home=False)),
+                            S.btn("Promote top 3", S.cli("bugs", "promote", "--top", "3",
+                                                         confirm="Write kickoffs for the top 3 bug reports?",
+                                                         home=False),
+                                  "primary")])
