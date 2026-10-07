@@ -37,6 +37,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
@@ -45,6 +46,11 @@ from mini_ork.certify import invariants as mr
 from mini_ork.certify import probe as poc_plus
 from mini_ork.certify import relations
 from mini_ork.certify.context import CodeContext
+from mini_ork.certify.test_results import (
+    augment_for_results,
+    detect_runners,
+    parse_results_dir,
+)
 from mini_ork.certify.verdict import (
     PROVEN,
     REFUTED,
@@ -149,13 +155,15 @@ def replay_check(
                                 # pass/fail
           "applicable": bool | None,  # False when the replay instrument does
                                       # not apply to this command (no command,
-                                      # or a non-pytest runner)
+                                      # or a runner with no adapter and no
+                                      # results file)
           "replay":     dict | None,
         }
 
     Where ``replay`` carries ``{candidate_passed, base_failed, overlap}``
     as sorted lists — the audit trail a downstream consumer needs to
-    decide whether to override the verdict.
+    decide whether to override the verdict. For jest/vitest/results-file
+    runs it also carries ``runner``.
 
     Outcomes (mapped to the kickoff):
 
@@ -166,7 +174,8 @@ def replay_check(
             → ``passed=False, reason="tests-do-not-exercise-change"``
 
       base state cannot be evaluated (rc==-1, base uncollectable, no tests
-      collected anywhere, or `pytest` not in `cmd`)
+      collected anywhere, or no results file written for a runner with no
+      adapter)
             → ``unverified=True`` (the caller abstains, not passes/fails)
 
     CALLER OWNS THE BASE WORKTREE — this helper only consumes the path it
@@ -177,61 +186,152 @@ def replay_check(
     if not cmd or not cmd.strip():
         return {"passed": False, "reason": "no command", "unverified": True,
                 "replay": None, "applicable": False}
-    if "pytest" not in cmd:
-        # We can only parse per-test results from pytest -v output. Other
-        # runners (npm, cargo, go) have their own conventions; abstaining
-        # here is the honest answer until a sibling helper exists.
-        return {"passed": False, "reason": "replay supports pytest commands only",
-                "unverified": True, "replay": None, "applicable": False}
+    if "pytest" in cmd:
+        if not base_cwd or not os.path.isdir(base_cwd):
+            return {"passed": False, "reason": f"base cwd not a directory: {base_cwd!r}",
+                    "unverified": True, "replay": None}
+
+        augmented = _ensure_pytest_verbose(cmd)
+        cand_cwd = candidate_cwd or os.getcwd()
+        cand_log = candidate_log or os.path.join(base_cwd, ".replay_candidate.log")
+        b_log = base_log or os.path.join(base_cwd, ".replay_base.log")
+
+        def _run(cwd: str, log: str) -> tuple[int, set[str], set[str]]:
+            passed: set[str] = set()
+            failed: set[str] = set()
+            try:
+                with open(log, "wb") as fh:
+                    rc = subprocess.run(
+                        augmented, shell=True, cwd=cwd, env=scrubbed_test_env(),
+                        stdout=fh, stderr=subprocess.STDOUT,
+                    ).returncode
+            except OSError:
+                return -1, passed, failed
+            try:
+                text = Path(log).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return rc, passed, failed
+            for m in _TEST_RESULT_RE.finditer(text):
+                tid = m.group("id")
+                st = m.group("status")
+                if st == "PASSED":
+                    passed.add(tid)
+                elif st in ("FAILED", "ERROR"):
+                    failed.add(tid)
+            return rc, passed, failed
+
+        _, cand_pass, _ = _run(cand_cwd, cand_log)
+        base_rc, base_pass, base_fail = _run(base_cwd, b_log)
+
+        if base_rc == -1:
+            return {"passed": False, "reason": "base state could not be evaluated",
+                    "unverified": True, "replay": None}
+        if base_rc != 0 and not (base_pass or base_fail):
+            # rc!=0 AND no per-test lines parsed → pytest could not collect or
+            # run. We cannot claim the base "passes" or "fails" by test, so we
+            # abstain rather than silently fail or pass.
+            return {
+                "passed": False,
+                "reason": f"base could not run (rc={base_rc}); cannot establish delta",
+                "unverified": True,
+                "replay": None,
+            }
+        total = len(cand_pass) + len(base_pass) + len(base_fail)
+        if total == 0:
+            return {"passed": False, "reason": "no tests collected; cannot establish delta",
+                    "unverified": True, "replay": None}
+
+        overlap = cand_pass & base_fail
+        info = {
+            "candidate_passed": sorted(cand_pass),
+            "base_failed": sorted(base_fail),
+            "overlap": sorted(overlap),
+        }
+
+        if overlap:
+            return {
+                "passed": True,
+                "reason": "tests exercise the change (delta-gate overlap)",
+                "unverified": False,
+                "replay": info,
+            }
+        return {
+            "passed": False,
+            "reason": "tests-do-not-exercise-change",
+            "unverified": False,
+            "replay": info,
+        }
+
+    # ── jest / vitest / results-file adapters ─────────────────────────────
+    # pytest is handled above, byte-for-byte. Anything else runs through the
+    # structured path: augment jest/vitest so they write a results file, and
+    # export MINI_ORK_TEST_RESULTS_DIR so a gate script can write jest-JSON or
+    # JUnit XML to the same place.
     if not base_cwd or not os.path.isdir(base_cwd):
         return {"passed": False, "reason": f"base cwd not a directory: {base_cwd!r}",
                 "unverified": True, "replay": None}
 
-    augmented = _ensure_pytest_verbose(cmd)
     cand_cwd = candidate_cwd or os.getcwd()
     cand_log = candidate_log or os.path.join(base_cwd, ".replay_candidate.log")
     b_log = base_log or os.path.join(base_cwd, ".replay_base.log")
 
-    def _run(cwd: str, log: str) -> tuple[int, set[str], set[str]]:
-        passed: set[str] = set()
-        failed: set[str] = set()
-        try:
-            with open(log, "wb") as fh:
-                rc = subprocess.run(
-                    augmented, shell=True, cwd=cwd, env=scrubbed_test_env(),
-                    stdout=fh, stderr=subprocess.STDOUT,
-                ).returncode
-        except OSError:
-            return -1, passed, failed
-        try:
-            text = Path(log).read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return rc, passed, failed
-        for m in _TEST_RESULT_RE.finditer(text):
-            tid = m.group("id")
-            st = m.group("status")
-            if st == "PASSED":
-                passed.add(tid)
-            elif st in ("FAILED", "ERROR"):
-                failed.add(tid)
-        return rc, passed, failed
+    runners = detect_runners(cmd)
+    if "jest" in runners:
+        runner = "jest"
+    elif "vitest" in runners:
+        runner = "vitest"
+    else:
+        runner = "results-file"
 
-    _, cand_pass, _ = _run(cand_cwd, cand_log)
-    base_rc, base_pass, base_fail = _run(base_cwd, b_log)
+    with tempfile.TemporaryDirectory(prefix="replay-results-") as tmp:
+        cand_res_dir = os.path.join(tmp, "candidate")
+        base_res_dir = os.path.join(tmp, "base")
+        os.makedirs(cand_res_dir, exist_ok=True)
+        os.makedirs(base_res_dir, exist_ok=True)
+
+        def _run_structured(
+            cwd: str, log: str, res_dir: str
+        ) -> tuple[int, tuple[set[str], set[str]] | None]:
+            augmented, _ = augment_for_results(cmd, res_dir)
+            env = scrubbed_test_env()
+            env["MINI_ORK_TEST_RESULTS_DIR"] = res_dir
+            try:
+                with open(log, "wb") as fh:
+                    rc = subprocess.run(
+                        augmented, shell=True, cwd=cwd, env=env,
+                        stdout=fh, stderr=subprocess.STDOUT,
+                    ).returncode
+            except OSError:
+                return -1, None
+            return rc, parse_results_dir(res_dir, cwd)
+
+        _, cand_res = _run_structured(cand_cwd, cand_log, cand_res_dir)
+        base_rc, base_res = _run_structured(base_cwd, b_log, base_res_dir)
 
     if base_rc == -1:
         return {"passed": False, "reason": "base state could not be evaluated",
                 "unverified": True, "replay": None}
-    if base_rc != 0 and not (base_pass or base_fail):
-        # rc!=0 AND no per-test lines parsed → pytest could not collect or
-        # run. We cannot claim the base "passes" or "fails" by test, so we
-        # abstain rather than silently fail or pass.
+    if cand_res is None:
+        # No runner adapter and no results file written — the instrument does
+        # not apply to this command.
+        return {
+            "passed": False,
+            "reason": "replay supports pytest, jest, vitest, or a results file; "
+                      "none produced for this command",
+            "unverified": True,
+            "replay": None,
+            "applicable": False,
+        }
+    if base_res is None:
         return {
             "passed": False,
             "reason": f"base could not run (rc={base_rc}); cannot establish delta",
             "unverified": True,
             "replay": None,
         }
+
+    cand_pass, _ = cand_res
+    base_pass, base_fail = base_res
     total = len(cand_pass) + len(base_pass) + len(base_fail)
     if total == 0:
         return {"passed": False, "reason": "no tests collected; cannot establish delta",
@@ -242,6 +342,7 @@ def replay_check(
         "candidate_passed": sorted(cand_pass),
         "base_failed": sorted(base_fail),
         "overlap": sorted(overlap),
+        "runner": runner,
     }
 
     if overlap:
