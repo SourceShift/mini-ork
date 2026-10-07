@@ -31,6 +31,8 @@ def test_all_former_exec_subs_registered_natively():
         "coord", "concord", "lifetime", "self-improve", "topology", "usage-report", "watchdog",
         "acp", "calibrate", "collapse-check", "collapse-precursor", "gate-fuzz",
         "memory-lifecycle",
+        "prefs",
+        "reap",
         "harness-contrast", "harness-edit", "harness-audit", "hack-probe",
         "oversight", "metric-anchor", "active-eval", "certify", "node-agent",
         "nodes", "mcp-context", "zed", "specs", "automations", "board",

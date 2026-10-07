@@ -2421,6 +2421,27 @@ def _learned_block(root, task_class, node_type, lane="", node_id="",
     if node_type not in ("researcher", "implementer", "reviewer"):
         return ""
     del root
+    # Operator-set preferences (kickoff §"Injection (`_learned_block`)"). The
+    # prefs block is built first so it sits ahead of failure_modes + steering
+    # in the rendered prompt; explicit operator rules outrank learned ones.
+    # Any exception means no preference block; the rest of the learned block
+    # is unchanged — mirrors the existing fail-soft contract below.
+    pref_block = ""
+    pref_sources: list[dict] = []
+    try:
+        from mini_ork.memory import preferences
+        _prefs = preferences.prefs_for(task_class or "generic")
+        pref_block = preferences.render_block(_prefs)
+        if pref_block and sources is not None:
+            for _p in _prefs:
+                pref_sources.append({
+                    "kind": "preference",
+                    "id": f"pref:{_p['scope']}:{_p['target']}:{_p['key']}",
+                    "text": _p["value"],
+                })
+    except Exception:
+        pref_block = ""
+        pref_sources = []
     block = ""
     try:
         from mini_ork import context_assembler
@@ -2469,7 +2490,12 @@ def _learned_block(root, task_class, node_type, lane="", node_id="",
                 sources.extend(steering_sources)
     except Exception:
         pass
-    return block
+    if pref_sources and sources is not None:
+        # Pref sources are prepended so they appear in prompt order (prefs
+        # first), matching the IDE "Learning" tab contract that the user's
+        # operator rules show up ahead of learned failure modes.
+        sources[:0] = pref_sources
+    return pref_block + block
 
 
 def _intervention_gate_check(root, node_id, node_type, lane, node_desc):
