@@ -98,49 +98,49 @@ def _seed(home: Path, *, status: str = "executing") -> Path:
         json.dumps({"type": "user", "timestamp": _iso(T0 + 10), "message": {"content": [
             {"type": "text", "text": "implement the fix"}
         ]}}),
-        json.dumps({"type": "assistant", "timestamp": _iso(T0 + 11), "message": {"content": [
+        json.dumps({"type": "assistant", "timestamp": _iso(T0 + 70), "message": {"content": [
             {"type": "thinking", "thinking": "Let me read the file first."}
         ]}}),
-        json.dumps({"type": "assistant", "timestamp": _iso(T0 + 12), "message": {"content": [
+        json.dumps({"type": "assistant", "timestamp": _iso(T0 + 130), "message": {"content": [
             {"type": "tool_use", "id": "toolu_1", "name": "Read",
              "input": {"file_path": "/tmp/x.py"}}
         ]}}),
-        json.dumps({"type": "user", "timestamp": _iso(T0 + 13), "message": {"content": [
+        json.dumps({"type": "user", "timestamp": _iso(T0 + 190), "message": {"content": [
             {"type": "tool_result", "tool_use_id": "toolu_1", "content": [
                 {"type": "text", "text": "def foo(): pass"}
             ], "is_error": False}
         ]}}),
-        json.dumps({"type": "assistant", "timestamp": _iso(T0 + 14), "message": {"content": [
+        json.dumps({"type": "assistant", "timestamp": _iso(T0 + 250), "message": {"content": [
             {"type": "tool_use", "id": "toolu_2", "name": "Edit",
              "input": {"file_path": "/tmp/x.py",
                        "old_string": "def foo(): pass",
                        "new_string": "def foo(): return 42"}}
         ]}}),
-        json.dumps({"type": "user", "timestamp": _iso(T0 + 15), "message": {"content": [
+        json.dumps({"type": "user", "timestamp": _iso(T0 + 310), "message": {"content": [
             {"type": "tool_result", "tool_use_id": "toolu_2", "content": [
                 {"type": "text", "text": "applied"}
             ], "is_error": False}
         ]}}),
-        json.dumps({"type": "assistant", "timestamp": _iso(T0 + 16), "message": {"content": [
+        json.dumps({"type": "assistant", "timestamp": _iso(T0 + 370), "message": {"content": [
             {"type": "tool_use", "id": "toolu_3", "name": "Bash",
              "input": {"command": "pytest"}}
         ]}}),
-        json.dumps({"type": "user", "timestamp": _iso(T0 + 17), "message": {"content": [
+        json.dumps({"type": "user", "timestamp": _iso(T0 + 430), "message": {"content": [
             {"type": "tool_result", "tool_use_id": "toolu_3", "content": [
                 {"type": "text", "text": "ERROR: 1 failed"}
             ], "is_error": True}
         ]}}),
-        json.dumps({"type": "assistant", "timestamp": _iso(T0 + 18), "message": {"content": [
+        json.dumps({"type": "assistant", "timestamp": _iso(T0 + 490), "message": {"content": [
             {"type": "tool_use", "id": "toolu_4", "name": "TodoWrite",
              "input": {"todos": [
                 {"content": "read x.py", "status": "completed"},
                 {"content": "edit x.py", "status": "in_progress"},
              ]}}
         ]}}),
-        json.dumps({"type": "assistant", "timestamp": _iso(T0 + 19), "message": {"content": [
+        json.dumps({"type": "assistant", "timestamp": _iso(T0 + 550), "message": {"content": [
             {"type": "text", "text": "I edited the file and ran pytest."}
         ]}}),
-        json.dumps({"type": "result", "timestamp": _iso(T0 + 20), "result": "done",
+        json.dumps({"type": "result", "timestamp": _iso(T0 + 610), "result": "done",
                     "session_id": SESSION_UUID,
                     "total_cost_usd": 0.31, "num_turns": 12}),
     ]) + "\n")
@@ -160,8 +160,11 @@ def _seed(home: Path, *, status: str = "executing") -> Path:
     # expires_at uses wall-clock now + 1 h so the ``expires_at > now`` filter
     # in ``_fetch_steer_rows`` always passes regardless of when the test runs.
     con = sqlite3.connect(home / "state.db")
-    node_start_ms = (T0 + 10) * 1000
-    steer_ms = node_start_ms + 30_000
+    # r5: with 60-s spaced transcript lines, park the default steer at
+    # T0+700 (= last line at T0+610 + buffer) so it sorts AFTER the
+    # transcript's last line on a full read — preserves the r3 property
+    # "kinds list stops at the result note" the kinds-order test asserts.
+    steer_ms = (T0 + 700) * 1000
     expires_ms = int(time.time() * 1000) + 3600_000
     con.execute(
         "INSERT INTO operator_steering (run_id, role_target, severity, message, source, "
@@ -702,19 +705,19 @@ def test_learning_view_gradient_window_uses_seconds(home: Path) -> None:
 # ── r4 fixes — fail-before / pass-after evidence (kickoff ide-node-stream-r4) ──
 
 
-def _seed_60s(home: Path) -> None:
-    """Seed a session whose transcript lines are 60 s apart.
+def _write_five_line_transcript(home: Path) -> Path:
+    """Replace the shared fixture's session with 5 lines at 60-s spacing.
 
-    r4 fix #1 fails-before evidence: with 1-s spacing, the r3 proxy
-    ``node_start + prev_line_idx`` happens to equal the real ISO ``_ts``
-    of every line, so any "fix" passes vacuously. With 60-s spacing the
-    proxy drifts by tens of seconds — only a real ``max(_ts)`` bound
-    satisfies the kickoff test.
+    Returns the session path. Used by the r5 steer tests that exercise
+    the r4 real-``_ts`` lower-bound fix (with 60-s spacing the proxy
+    ``node_start + idx`` collapses to a wrong answer, exposing the fix).
+    The default ``_seed`` already writes 60-s spaced lines, but with
+    11 of them; these tests want a tight 5-line fixture.
     """
-    _seed(home)
-    session_path = home / "runs" / RUN / "sessions" / f"{SESSION_UUID}.jsonl"
-    # The default fixture has 11 lines at T0+10..20 (1-s apart). Replace
-    # with 5 lines at T0+10, 70, 130, 190, 250 — 60-s spacing.
+    run_dir = home / "runs" / RUN
+    run_dir.mkdir(parents=True, exist_ok=True)
+    session_path = run_dir / "sessions" / f"{SESSION_UUID}.jsonl"
+    session_path.parent.mkdir(parents=True, exist_ok=True)
     session_path.write_text("\n".join([
         json.dumps({"type": "user", "timestamp": _iso(T0 + 10), "message": {"content": [
             {"type": "text", "text": "implement the fix"}
@@ -732,6 +735,8 @@ def _seed_60s(home: Path) -> None:
             {"type": "text", "text": "step 4"}
         ]}}),
     ]) + "\n")
+    # Strip the result entry so the cost-state note path doesn't see one.
+    return session_path
 
 
 def test_steer_lower_bound_uses_real_iso_ts_not_proxy(home: Path) -> None:
@@ -753,7 +758,8 @@ def test_steer_lower_bound_uses_real_iso_ts_not_proxy(home: Path) -> None:
     The OLD code emits the steer; the NEW code does not. The test is
     fail-before/pass-after for r4 fix #1.
     """
-    _seed_60s(home)
+    _seed(home)
+    _write_five_line_transcript(home)
     # Steer at T0+60 — strictly between line 0's _ts (T0+10) and line 1's
     # _ts (T0+70). Passes the proxy lower bound (T0+11), fails the real
     # lower bound (T0+70).
@@ -779,7 +785,7 @@ def test_steer_lower_bound_uses_real_iso_ts_not_proxy(home: Path) -> None:
 
 
 def test_steer_emitted_once_and_skipped_on_subsequent_polls(home: Path) -> None:
-    """r4 fix #1 (positive case, kickoff scenario verbatim).
+    """r5 fix #1 (positive case, kickoff scenario verbatim).
 
     Transcript: 5 lines spaced 60 s apart (T0+10, 70, 130, 190, 250).
     Steer at ``start+100 s`` = T0+110 (between line 1 at T0+70 and line
@@ -787,11 +793,15 @@ def test_steer_emitted_once_and_skipped_on_subsequent_polls(home: Path) -> None:
 
     * Poll 1 (full read, offset=0): lower=None, upper=T0+250, steer
       110 ≤ 250 → emit. next_offset = 5.
-    * Poll 2 at the previous offset (5): consumed lines 0..4 → real
-      lower = T0+250; no new lines → has_upper=False → steer skipped.
-      Empty entries.
+    * Append "line 5" to the transcript at T0+260 (BEFORE the steer's
+      position is consumed). Poll 2 at the previous offset (5):
+      consumed lines 0..4 → real lower = T0+250; new line at T0+260
+      → has_upper=True; max_upper_ts = T0+260. The steer at T0+110 is
+      ≤ max_lower_ts (T0+250) → skipped. Only the appended line
+      surfaces.
     """
-    _seed_60s(home)
+    _seed(home)
+    session_path = _write_five_line_transcript(home)
     con = sqlite3.connect(home / "state.db")
     expires_ms = int(time.time() * 1000) + 3600_000
     con.execute(
@@ -811,10 +821,27 @@ def test_steer_emitted_once_and_skipped_on_subsequent_polls(home: Path) -> None:
     )
     full_offset = full["offset"]
 
-    # Poll 2 at the previous offset: drain, no entries.
-    drained = build_node(home, RUN, AGENT_NODE, view="stream", offset=full_offset)
-    assert drained["entries"] == []
-    assert drained["offset"] == full_offset
+    # Append a line BETWEEN polls.
+    with session_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"type": "assistant", "timestamp": _iso(T0 + 260),
+                            "message": {"content": [
+                                {"type": "text", "text": "appended line"}
+                            ]}}) + "\n")
+
+    # Poll 2 at the previous offset: only the appended line surfaces;
+    # the steer is dropped by the real-``_ts`` lower bound.
+    after = build_node(home, RUN, AGENT_NODE, view="stream", offset=full_offset)
+    args = [e["arg"] for e in after["entries"]]
+    kinds = [e["k"] for e in after["entries"]]
+    assert "appended line" in args, f"expected appended line, got: {args}"
+    assert all("mid-stream steer" not in (a or "") for a in args), (
+        f"steer must NOT re-emit after the consumed-``_ts`` lower bound "
+        f"advances to T0+250; entries: {after['entries']}"
+    )
+    assert "steer" not in kinds, (
+        f"no steer row expected on the post-append poll; got kinds: {kinds}"
+    )
+    assert after["offset"] == full_offset + 1
 
 
 def test_shell_log_uses_absolute_line_indices(home: Path) -> None:
@@ -897,55 +924,283 @@ def _make_node(node_id: str, node_type: str):
     return Node(id=node_id, type=node_type)
 
 
-def test_cost_note_emits_once_marker_blocks_re_synthesis(home: Path) -> None:
-    """r4 fix #4: a per-node marker file in ``run_dir`` guarantees the
-    cost-state note is emitted at most once across polls.
+def test_cost_note_stateless_full_read_always_emits(home: Path) -> None:
+    """r5 fix #2: a full read (offset=0) of a FINISHED node always emits
+    the cost-state note — two viewers that open it cold both see it.
 
-    The default seed leaves the run already finished (status='done' ⇒
-    not live), so the first poll emits the note once and writes the
-    marker. A subsequent poll at the same offset returns empty
-    (``no _KIND_NOTE in out`` AND marker exists → skip synthesis).
-
-    This is the r3 "no repeated note on repeated polls" property
-    rebuilt on a stateless builder: instead of relying on
-    ``int(offset) == 0`` (r3) which fails when the first poll is at
-    a non-zero offset during a live→finished transition, the marker
-    file blocks re-synthesis at any offset.
+    The r4 marker-file mechanism is gone; the once-ness is reconstructed
+    from data the builder already has (``offset==0`` path on a finished
+    node). A fresh full read after a previous full read must still emit
+    because there's no marker to consult — stateless derivation.
     """
     _seed(home)
     session_path = home / "runs" / RUN / "sessions" / f"{SESSION_UUID}.jsonl"
-    # Strip the result entry → 10 transcript lines, no result of its own.
+    # Strip the result entry so the cost-state fallback note is what feeds the note.
     text = session_path.read_text(encoding="utf-8")
     lines = [ln for ln in text.splitlines() if ln.strip()
              and json.loads(ln).get("type") != "result"]
     session_path.write_text("\n".join(lines) + "\n")
 
-    # First poll: run already done → emit the cost-state note + write marker.
+    # First full read emits the note.
     first = build_node(home, RUN, AGENT_NODE, view="stream")
     notes_first = [e for e in first["entries"] if e["k"] == "note"]
     assert len(notes_first) == 1, (
-        f"expected one cost-state note on first poll, got {len(notes_first)}"
+        f"expected one cost-state note on first full read, got {len(notes_first)}"
     )
-    note = notes_first[0]
-    assert "Done" in note["arg"] and "$" in note["arg"]
+    assert "Done" in notes_first[0]["arg"] and "$" in notes_first[0]["arg"]
 
-    # Marker file written.
+    # r5 invariant: NO marker file is written. The read path is read-only.
     marker = home / "runs" / RUN / f".cost-note-emitted.{AGENT_NODE}"
-    assert marker.exists(), (
-        f"r4 fix #4: expected marker file at {marker}"
+    assert not marker.exists(), (
+        f"r5: read path must never write a marker file; found {marker}"
     )
 
-    # Second poll at the SAME offset: marker blocks re-synthesis.
-    second = build_node(home, RUN, AGENT_NODE, view="stream",
-                        offset=first["offset"])
+    # A SECOND full read on the same view also emits the note — two
+    # viewers both get it (kickoff item 2: "Two full reads by two viewers
+    # both get the note").
+    second = build_node(home, RUN, AGENT_NODE, view="stream")
     notes_second = [e for e in second["entries"] if e["k"] == "note"]
-    assert notes_second == [], (
-        f"marker must block re-emission; second poll notes: {notes_second}"
+    assert len(notes_second) == 1, (
+        f"r5: a fresh full read still emits the note (stateless); got {len(notes_second)}"
     )
 
-    # Third poll at a DIFFERENT offset: still no note (marker is per-node,
-    # not per-offset).
-    third = build_node(home, RUN, AGENT_NODE, view="stream",
-                       offset=first["offset"] + 100)
-    notes_third = [e for e in third["entries"] if e["k"] == "note"]
-    assert notes_third == []
+
+def test_cost_note_stateless_live_follower_sees_once_on_edge(home: Path) -> None:
+    """r5 fix #2 + fix #4: start polling while LIVE with no cost-state,
+    then add cost-state and mark the node FINISHED. The next incremental
+    poll returns the note once; the following one returns nothing; a
+    fresh full read returns it again. The "once" guarantee on the
+    incremental path is derived from data, not a marker file.
+    """
+    _seed(home, status="executing")
+    session_path = home / "runs" / RUN / "sessions" / f"{SESSION_UUID}.jsonl"
+    # Replace the default 10-line transcript (60-s spacing — last line
+    # at T0+550) with a single live-phase line at T0+10. The kickoff's
+    # past-edge predicate requires ``newest_consumed_ts < end`` (T0+60),
+    # which the default transcript's later lines violate.
+    session_path.write_text(json.dumps({
+        "type": "user",
+        "timestamp": _iso(T0 + 10),
+        "message": {"content": [{"type": "text", "text": "fix"}]},
+    }) + "\n")
+
+    # Force AGENT_NODE into the "running" state so is_live=True on the
+    # first poll. Delete the default node_end so the loader sees only
+    # node_start.
+    con = sqlite3.connect(home / "state.db")
+    con.execute(
+        "DELETE FROM run_events WHERE run_id = ? AND event_type = 'node_end' "
+        "AND json_extract(payload_json, '$.node_id') = ?",
+        (RUN, AGENT_NODE))
+    # Default _seed's llm_calls row has session_id=NULL; rule 1 of the
+    # resolver reads live.jsonl which we delete. Give rule 2 a session_id.
+    con.execute(
+        "UPDATE llm_calls SET session_id = ? WHERE run_id = ? AND actor = 'worker'",
+        (SESSION_UUID, RUN))
+    con.commit(); con.close()
+
+    # Drop the cost-state envelope so the live follower sees no note.
+    live_path = home / "runs" / RUN / f"agent-{AGENT_NODE}.live.jsonl"
+    live_path.unlink(missing_ok=True)
+
+    # Poll 1 (live, no cost-state): no note.
+    poll1 = build_node(home, RUN, AGENT_NODE, view="stream")
+    notes1 = [e for e in poll1["entries"] if e["k"] == "note"]
+    assert notes1 == [], (
+        f"live poll should not emit a note without cost-state; got: {notes1}"
+    )
+    follow_offset = poll1["offset"]
+    assert follow_offset == 1, f"expected 1 consumed line, got {follow_offset}"
+
+    # Append a new transcript line PAST node.end (T0+60) — this is the
+    # realistic "node just finished, an event was logged at end_time"
+    # scenario the kickoff describes as the past-edge trigger.
+    with session_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"type": "assistant",
+                            "timestamp": _iso(T0 + 70),
+                            "message": {"content": [
+                                {"type": "text", "text": "edge-line"}
+                            ]}}) + "\n")
+
+    # Now add cost-state (live.jsonl envelope) and a node_end event so
+    # ``_live`` flips to False (finished). The cost-state ts = T0+60.
+    live_path.write_text(
+        json.dumps({"seq": 0, "stream": "stdout", "t": T0 + 60,
+                    "line": json.dumps({"session_id": SESSION_UUID,
+                                        "total_cost_usd": 0.31, "num_turns": 12})}) + "\n"
+    )
+    con = sqlite3.connect(home / "state.db")
+    con.execute(
+        "INSERT INTO run_events (event_id, run_id, event_type, payload_json, created_at) "
+        "VALUES (?,?,?,?,?)",
+        ("ev-finish-live", RUN, "node_end",
+         json.dumps({"node_id": AGENT_NODE, "node_type": "implementer",
+                     "model_lane": "worker", "finish_reason": "done"}),
+         T0 + 60))
+    con.commit(); con.close()
+
+    # Poll 2 (incremental): first poll past the live→finished edge.
+    # Predicate: newest_consumed_ts (T0+10) < cs_ts (T0+60) ✓ AND
+    # max_upper_ts (T0+70) >= cs_ts (T0+60) ✓ → emit note.
+    poll2 = build_node(home, RUN, AGENT_NODE, view="stream", offset=follow_offset)
+    notes2 = [e for e in poll2["entries"] if e["k"] == "note"]
+    assert len(notes2) == 1, (
+        f"first incremental poll past the edge should emit the note once; "
+        f"got {len(notes2)} notes"
+    )
+    edge_offset = poll2["offset"]
+
+    # Poll 3 (incremental at the new offset, no further new lines): nothing.
+    # Once-ness is reconstructed from the append-only offset contract — the
+    # caller advances offset based on ``next_offset`` from the prior poll,
+    # so the post-edge line is now "consumed" and the next ``_ste`` upper
+    # bound is empty. Without that advance the predicate would fire again,
+    # which is why the kickoff specifies the stateless design must rely on
+    # the caller respecting the offset cursor (kickoff: "the read path must
+    # never write").
+    poll3 = build_node(home, RUN, AGENT_NODE, view="stream",
+                       offset=edge_offset)
+    notes3 = [e for e in poll3["entries"] if e["k"] == "note"]
+    assert notes3 == [], (
+        f"subsequent incremental poll (advanced offset) should not re-emit; "
+        f"entries: {notes3}"
+    )
+
+    # Poll 4 (fresh full read): note returns (path (a) — every full read).
+    poll4 = build_node(home, RUN, AGENT_NODE, view="stream")
+    notes4 = [e for e in poll4["entries"] if e["k"] == "note"]
+    assert len(notes4) == 1, (
+        f"a fresh full read must re-emit the note; entries: {notes4}"
+    )
+
+
+def test_log_backed_steer_window_from_line_positions(home: Path) -> None:
+    """r5 fix #1: log-backed nodes use log line positions for the steer
+    window. A 10-line verifier log (each line carries no ISO timestamp,
+    falls back to ``node_start + line_index`` seconds); a steer at
+    T0+62 must emit on poll 1 and NOT emit on poll 2 after "line 10"
+    is appended at T0+70.
+
+    node.start = T0+60 (from events table). Line 0 → T0+60, …, line 9 →
+    T0+69. Steer at T0+62 is strictly between line 2 (T0+62) and line
+    3 (T0+63) — so it falls inside the consumed window after poll 1.
+
+    Poll 1 (offset=0): consumed=[], upper=[T0+60..T0+69] → max_upper =
+    T0+69. Steer 62 ≤ 69 → emit. After poll 1, append "line 10" → log
+    has 11 lines (0..10), line 10 → T0+70.
+
+    Poll 2 (offset=10): consumed=[T0+60..T0+69], upper=[T0+70]. Real
+    lower = T0+69; steer 62 ≤ 69 → dropped.
+    """
+    _seed(home)
+    log = home / "runs" / RUN / f"verifier_{SHELL_NODE}.log"
+    lines = [f"line {i}" for i in range(10)]
+    log.write_text("\n".join(lines) + "\n")
+
+    # Inject a steer at T0+62.
+    con = sqlite3.connect(home / "state.db")
+    expires_ms = int(time.time() * 1000) + 3600_000
+    con.execute(
+        "INSERT INTO operator_steering (run_id, role_target, severity, message, source, "
+        "confidence, created_at, expires_at) VALUES (?,?,?,?,?,?,?,?)",
+        (RUN, "verifier", "info", "log-backed steer", "ide", 0.8,
+         (T0 + 62) * 1000, expires_ms))
+    con.commit()
+    con.close()
+
+    # Poll 1: full read emits the steer.
+    full = build_node(home, RUN, SHELL_NODE, view="stream")
+    steers = [e["arg"] for e in full["entries"] if e["k"] == "steer"]
+    assert any("log-backed steer" in s for s in steers), (
+        f"expected log-backed steer on poll 1; entries: {full['entries']}"
+    )
+    full_offset = full["offset"]
+    assert full_offset == 10, f"expected offset 10, got {full_offset}"
+
+    # Append "line 10" at T0+70.
+    with log.open("a", encoding="utf-8") as f:
+        f.write("line 10\n")
+
+    # Poll 2 at the previous offset: consumed=[T0+60..T0+69], new upper
+    # = T0+70. The steer's position (T0+62) is inside the consumed
+    # window → dropped.
+    after = build_node(home, RUN, SHELL_NODE, view="stream",
+                       offset=full_offset)
+    args = [e["arg"] for e in after["entries"]]
+    kinds = [e["k"] for e in after["entries"]]
+    assert "line 10" in args, f"expected appended line, got: {args}"
+    assert "steer" not in kinds, (
+        f"log-backed steer must not re-emit after consumed window advances; "
+        f"kinds: {kinds}"
+    )
+    assert after["offset"] == full_offset + 1
+
+
+def test_reviewer_steer_surfaces_in_lens_researcher_stream(home: Path) -> None:
+    """r5 fix #3 (r4 reasserted): a ``role_target='reviewer'`` steer
+    surfaces in the stream of a researcher node whose id ends in
+    ``_lens`` (e.g. ``code_impact_lens``), because ``_role_for_node``
+    maps such researchers to ``reviewer``.
+
+    The default seed has a steer targeted at ``AGENT_NODE`` (the
+    implementer id, not the 'reviewer' role), so we inject a fresh
+    reviewer-targeted row and verify the lens node sees it. A non-lens
+    researcher does NOT see reviewer-targeted steers — its role falls
+    through to the default.
+    """
+    _seed(home)
+
+    # Insert the lens researcher node in the events table so the loader
+    # picks it up. The default workflow only knows about ``implementer``
+    # and ``verifier_node`` — we mirror the kickoff's recipe where
+    # ``code_impact_lens`` is dispatched as a researcher.
+    con = sqlite3.connect(home / "state.db")
+    for kind, ts in (("node_start", T0 + 55), ("node_end", T0 + 58)):
+        payload = {"node_id": "code_impact_lens", "node_type": "researcher",
+                   "model_lane": "minimax_lens"}
+        if kind == "node_end":
+            payload["finish_reason"] = "done"
+        con.execute("INSERT INTO run_events (event_id, run_id, event_type, "
+                    "payload_json, created_at) VALUES (?,?,?,?,?)",
+                    (f"ev-lens-{kind}", RUN, kind, json.dumps(payload), ts))
+    expires_ms = int(time.time() * 1000) + 3600_000
+    con.execute(
+        "INSERT INTO operator_steering (run_id, role_target, severity, message, source, "
+        "confidence, created_at, expires_at) VALUES (?,?,?,?,?,?,?,?)",
+        (RUN, "reviewer", "info", "for the lens reviewer", "ide", 0.8,
+         (T0 + 56) * 1000, expires_ms))
+    con.commit()
+    con.close()
+
+    # Reload AFTER the insert so ``code_impact_lens`` is in ``run_obj.nodes``.
+    run_obj = _load(home, RUN)
+    assert any(n.id == "code_impact_lens" for n in run_obj.nodes), (
+        f"loader did not surface lens researcher; nodes: "
+        f"{[n.id for n in run_obj.nodes]}"
+    )
+    out = build_node(home, RUN, "code_impact_lens", view="stream")
+    steers = [e["arg"] for e in out["entries"] if e["k"] == "steer"]
+    assert any("for the lens reviewer" in s for s in steers), (
+        f"lens researcher should see reviewer-targeted steers; got: "
+        f"{[e for e in out['entries'] if e['k'] == 'steer']}"
+    )
+
+    # A non-lens researcher (id does NOT end in "_lens") falls through
+    # to the default role → does NOT see reviewer-targeted steers.
+    for kind, ts in (("node_start", T0 + 55), ("node_end", T0 + 58)):
+        payload = {"node_id": "scout", "node_type": "researcher",
+                   "model_lane": "minimax_lens"}
+        if kind == "node_end":
+            payload["finish_reason"] = "done"
+        con = sqlite3.connect(home / "state.db")
+        con.execute("INSERT INTO run_events (event_id, run_id, event_type, "
+                    "payload_json, created_at) VALUES (?,?,?,?,?)",
+                    (f"ev-scout-{kind}", RUN, kind, json.dumps(payload), ts))
+        con.commit()
+        con.close()
+    scout_out = build_node(home, RUN, "scout", view="stream")
+    scout_steers = [e["arg"] for e in scout_out["entries"] if e["k"] == "steer"]
+    assert not any("for the lens reviewer" in s for s in scout_steers), (
+        f"non-lens researcher should NOT see reviewer-targeted steers; got: "
+        f"{scout_steers}"
+    )

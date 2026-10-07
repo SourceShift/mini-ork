@@ -25,12 +25,13 @@ byte-offset discipline from ``LiveTail`` is mirrored here for the
 partial line; the session file itself is read in one shot because it is
 written once at agent-finish time.
 
-r4 contract (kickoff ide-node-stream-r4): every visible entry carries an
-absolute ``_line`` (transcript line index, log file line index, or a
-synthetic cursor for the cost-state note). ``offset`` counts physical
-transcript/log lines plus the synthetic note when emitted, so a caller
-that follows ``next_offset`` skips previously-emitted entries without
-having to track per-call state.
+r5 contract (kickoff ide-node-stream-r5): every visible entry carries an
+absolute ``_line`` (transcript line index or log file line index). The
+cost-state note carries NO ``_line`` and does NOT advance the offset
+cursor — it is a stateless derivation that fires on every full read
+(``offset == 0``) and on the first incremental poll past the live→
+finished edge. ``offset`` therefore counts only physical transcript/log
+lines; the note never appears in the offset math.
 """
 from __future__ import annotations
 
@@ -229,12 +230,27 @@ def _resolve_via_llm_calls(run: "Run", node: Node) -> Path | None:
         return None
     start_s = int(node.start) - 2 if node.start is not None else None
     end_s = int(node.end) + 5 if node.end is not None else None
+    # ``llm_calls.ts`` is TEXT (ISO format, see ``db/migrations/0002...sql:241``).
+    # SQLite compares ISO strings chronologically when both bounds are also ISO.
+    # Passing integers here would coerce each row's ISO to a non-numeric 0 and
+    # either always match or never match — always-match in practice, since
+    # 0 lies between any default-bounds any two signed numbers.
+    from datetime import datetime, timezone
+    def _iso(epoch: int | None) -> str:
+        if epoch is None:
+            return ""
+        return datetime.fromtimestamp(int(epoch), tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%S.000Z"
+        )
+    bound_lo = _iso(start_s) or "0000-01-01T00:00:00.000Z"
+    bound_hi = _iso(end_s) or "9999-12-31T23:59:59.999Z"
     sql = ("SELECT session_id, ts FROM llm_calls "
            "WHERE run_id = ? AND actor = ? "
            "  AND session_id IS NOT NULL AND session_id != '' "
-           "ORDER BY ts DESC LIMIT 1000")
+           "  AND ts BETWEEN ? AND ? "
+           "ORDER BY ts DESC")
     try:
-        rows = db.rows(sql, (run.id, actor))
+        rows = db.rows(sql, (run.id, actor, bound_lo, bound_hi))
     except Exception:  # noqa: BLE001
         return None
     seen: set[str] = set()
@@ -606,8 +622,27 @@ def _stream_entries(session_path: Path | None, log_path: Path | None,
     # consumed lines carry real ISO timestamps and are *older* than
     # appended lines — taking ``max`` over all consumed ``_ts`` therefore
     # uses the real ISO value whenever it is available.
+    # r5 fix #1 (log-backed): for shell/verifier nodes, ``_log_path_entries``
+    # only returns lines at-or-after ``offset`` (no consumed-line entries).
+    # The "last consumed line" timestamp must be reconstructed from the
+    # line position: ``node_start + (offset - 1)`` seconds. Without this,
+    # the lower bound is empty on every incremental poll and any steer
+    # whose ``_ts`` precedes the first unconsumed line would re-emit.
+    #
+    # r5 fix #3 (no-source): for nodes without a transcript AND a log
+    # (e.g. ``researcher`` lenses whose work lives outside the stream),
+    # there are no line entries to bound against. Default the bounds to
+    # the node's lifetime ``[start, end]`` so role-targeted steers that
+    # fall inside the run window still surface.
     lower_bound_ts: list[int] = []  # transcript entries with _line < offset
     upper_bound_ts: list[int] = []  # transcript entries with _line >= offset
+    if session_path is None and log_path is None:
+        node_end_s = int(target.end) if target.end is not None else None
+        lower_bound_ts.append(node_start_s)
+        if node_end_s is not None:
+            upper_bound_ts.append(node_end_s)
+    if log_path is not None and int(offset) > 0:
+        lower_bound_ts.append(node_start_s + int(offset) - 1)
     for e in raw:
         if e.get("_src") == "steer":
             continue
@@ -671,45 +706,67 @@ def _stream_entries(session_path: Path | None, log_path: Path | None,
         if line_idx + 1 > next_offset:
             next_offset = line_idx + 1
 
-    # r4 fix #4: emit the cost-state note ONCE on the first poll where the
-    # node is no longer live and the cost-state/result is available.
+    # r5 fix #2: the cost-state note is STATELESS — the read path never
+    # writes. The "once-ness" property is reconstructed from data the
+    # builder already has. Two emission paths, both gated on the node
+    # being finished and the cost-state being available:
+    #
+    #   (a) every full read (``offset == 0``) of a finished node — the
+    #       note appears for every viewer that opens the panel cold;
+    #   (b) the first incremental poll past the live→finished edge —
+    #       a follower who was polling during live state should see the
+    #       note once when the node finishes, then never again until
+    #       they restart with offset=0.
     #
     # "Without changing offset" (kickoff wording): the note does NOT
-    # advance ``next_offset``. The "once" guarantee is delivered via a
-    # per-node marker file in ``run_dir`` — ``build_node`` is stateless
-    # across calls, so we record the emission on disk and any later poll
-    # (same offset or any subsequent offset) sees the marker and skips
-    # the synthesis step. This also matches the r3 intent that the note
-    # never appears more than once per stream.
+    # advance ``next_offset`` and carries no ``_line``. It does not count
+    # in the status pill's ``transcript_entry_count`` either.
     #
-    # The note does NOT count in the status pill's
-    # ``transcript_entry_count`` (which counts only physical transcript
-    # entries) — only the offset cursor reflects the physical lines.
-    note_marker: Path | None = None
-    note_already_emitted = False
-    if run_dir is not None:
-        note_marker = run_dir / f".cost-note-emitted.{target.id}"
-        if note_marker.exists():
-            note_already_emitted = True
-
+    # Edge predicate (b): the newest consumed transcript ``_ts`` BEFORE
+    # this poll is older than the node's end (or the cost-state
+    # timestamp) AND this poll's upper bound reaches it. Computed below
+    # from the consumed entries' ``_ts`` (transcript/log) vs the
+    # cost-state envelope (read on demand).
     if (run_dir is not None
             and not transcript_has_result
             and not is_live
-            and not note_already_emitted
             and not any(e.get("k") == _KIND_NOTE for e in out)):
-        note = _build_note_from_cost_state(run_dir, target)
-        if note:
-            out.append({
-                "k": _KIND_NOTE,
-                "head": "",
-                "arg": note,
-                "lines": [{"t": note, "c": "muted"}],
-            })
+        emit_note = False
+        if int(offset) == 0:
+            # Path (a): full read of a finished node.
+            emit_note = True
+        else:
+            # Path (b): first incremental poll past the live→finished edge.
+            # Compare the newest consumed entry's ``_ts`` (we already
+            # resolved it above) to the cost-state timestamp.
+            newest_consumed_ts = max_lower_ts
+            cs_env: dict[str, Any] | None = None
             try:
-                if note_marker is not None:
-                    note_marker.touch()
-            except OSError:
-                pass
+                cs_env = _fetch_cost_state(run_dir, target.id)
+            except Exception:  # noqa: BLE001
+                cs_env = None
+            cs_ts: int | None = None
+            if isinstance(cs_env, dict):
+                raw_ts = cs_env.get("ts")
+                if raw_ts is not None:
+                    cs_ts = _epoch(raw_ts)
+                if cs_ts is None and target.end is not None:
+                    cs_ts = int(target.end)
+            if (cs_ts is not None
+                    and newest_consumed_ts is not None
+                    and newest_consumed_ts < cs_ts
+                    and max_upper_ts is not None
+                    and max_upper_ts >= cs_ts):
+                emit_note = True
+        if emit_note:
+            note = _build_note_from_cost_state(run_dir, target)
+            if note:
+                out.append({
+                    "k": _KIND_NOTE,
+                    "head": "",
+                    "arg": note,
+                    "lines": [{"t": note, "c": "muted"}],
+                })
 
     # Strip the private keys the IDE doesn't need to render.
     for e in out:
