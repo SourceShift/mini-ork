@@ -19,11 +19,30 @@ How to use:
 
 Run order (revised after K0, `docs/audits/20261007-unpublished-spend-root-cause.md`
 @28a2d9a3, AC5 accepted 2026-10-07):
-K0.5a → K0.5b → K1 → I1 → I3 → I5 → I2 → I6 → I8 → I7 → I4 → I9.
+K0.5a → K0.5b → K1 → I1 → K0.5c → I3 → I5 → I2 → I6 → I8 → I7 → I4 → I9.
 - K0.5 is inserted first. Without it, about 37% of corrected unpublished spend
   cannot be attributed, so K1 before/after comparisons would measure noise.
 - I3 now runs before I5. I3 has a measured target (`needs_answers`); I5 has no
   K0 bucket.
+- K0.5c (added with the K0 erratum) runs after I1 and before I3: from I3 on,
+  epics are dispatched through framework-edit, and verifier nodes that error in
+  0 ms without running would make its publish-rate measurement meaningless.
+
+Build rules (user decisions, 2026-10-07):
+- **Build mode is hybrid.** K0.5a, K0.5b, K0.5c and I1 repair the dispatch
+  pipeline itself, so they are built directly in worktrees with
+  mutation-tested gates. From I3 onward each epic is DISPATCHED through
+  framework-edit (revise loop live), and `mini-ork metrics sdd` measures
+  whether framework-edit's publish rate (6/173 at K0) improves. If a dispatch
+  fails for harness reasons rather than the epic's content, record it in the
+  metrics (it is a K0 bucket), then fall back to a direct build and say so in
+  the commit.
+- **Behaviour-tightening ships behind a default-OFF `MO_*` flag.** Any epic
+  that makes verify, publish or the reviewer stricter (I1 first) lands with its
+  flag off. Turning it on is a separate change, made only after an A/B of
+  n ≥ 30 runs against the K1 frozen baseline
+  (`backups/k0-baseline-20261007-104547.db` +
+  `backups/k0-run-dirs-20261007-113952.json`).
 
 ## Finalize and record every run (id: sdd-k05a-finalize-every-run)
 - recipe: framework-edit
@@ -141,6 +160,34 @@ LLM test authoring (that is I2). Recipe workflow changes.
 ### Verification command
 `python3 -m pytest -q tests/unit/test_probe_validity.py tests/test_sdd_verifiers.py tests/test_sdd_e2e_dryrun.py`
 
+## framework-edit verifier nodes actually run (id: sdd-k05c-verifier-nodes-run)
+- recipe: framework-edit
+Depends on: sdd-i1-probe-validity
+
+### Goal
+Pipeline repair (build directly, per the hybrid rule). The K0 erratum found
+verifier nodes whose `node_end` is `finish_reason=error` after 0 ms — the
+verifier never ran — in 57 runs (framework-edit 27, code-fix 20), 30 of them
+classified as this harness bucket ($108.94 raw), plus 3 SDD-campaign runs
+($80.24). Detection rule (run_events, not execution_traces):
+`event_type='node_end' AND finish_reason='error' AND
+json_extract(payload_json,'$.node_type')='verifier' AND
+json_extract(payload_json,'$.duration_ms')=0`.
+### Acceptance
+- AC1: Root cause of the 0 ms verifier errors, with run ids (e.g.
+  `concord-mo1-20261002-184302`, `vt1-mr-relations-20261005-193626` …
+  `vt6-level-vector-20261005-203840`). Their reasons were not logged before
+  `e245d002`; reproduce on a fresh run where stderr now lands in execute.log.
+- AC2: A verifier node that did not execute fails loudly with reason
+  `verifier_not_executed` — never as a bare `error`.
+- AC3: 0 such cases on a fresh framework-edit smoke run.
+### Files in scope (candidates — confirm)
+- `mini_ork/cli/execute.py` (`_run_verifier_ref`)
+- `mini_ork/cli/execute_handlers.py` (verifier handler)
+- `tests/unit/test_verifier_nodes_run.py`
+### Verification command
+`python3 -m pytest -q tests/unit/test_verifier_nodes_run.py`
+
 ## I5 evidence ledger bound to code state (id: sdd-i5-evidence-ledger)
 - recipe: framework-edit
 Depends on: sdd-i1-probe-validity
@@ -168,7 +215,7 @@ Changes to the reviewer prompt (that is I7).
 
 ## I3 kickoff contract + clarification answer path (id: sdd-i3-kickoff-contract)
 - recipe: framework-edit
-Depends on: sdd-k1-baseline-metrics
+Depends on: sdd-k1-baseline-metrics, sdd-k05c-verifier-nodes-run
 
 ### Goal
 `kickoff_lint` requires five sections:

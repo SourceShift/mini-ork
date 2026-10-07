@@ -273,7 +273,7 @@ spec-kit becomes an optional **input format**. A `specs/NNN/spec.md` +
 stories). The adapter from the 10-06 plan (A1-A3) shrinks to "parse spec-kit
 into the I3 contract". It runs after I1-I5 land.
 
-## K0 result (2026-10-07, `docs/audits/20261007-unpublished-spend-root-cause.md` @28a2d9a3)
+## K0 result (2026-10-07, `docs/audits/20261007-unpublished-spend-root-cause.md`, corrected by its Erratum)
 
 The root-cause audit ran on the frozen snapshot
 `backups/k0-baseline-20261007-104547.db`.
@@ -289,22 +289,28 @@ correcting for the pre-2026-10-01 cost meter:
    - This is not SDD; it is fixed by K0.5a.
    - Most of it is already fixed by the run reaper.
    - `set_status` still drops its terminal write and only warns.
-   - 110 execute-only runs passed but were never finalized.
-2. **Reviewer/rubric rejection after implementation: $186.** This maps to
-   I7/I1, and also to K0.5b: in 12 runs the advisory rubric was the only
-   reason for failure.
-3. **Verify failure: $149.**
+   - 113 execute-only runs passed but were never finalized.
+2. **Reviewer/panel rejection after implementation: $169.** This maps to
+   I7/I1. Candidate false rejects (verify passed, run failed anyway) are 78
+   runs / $87 corrected. *(Corrected by the K0 erratum: the first pass said
+   "12 runs failed only on the advisory rubric" — 11 of those had failing
+   nodes hidden by a merged verdict.json; K0.5b still made the rubric file
+   unable to act as a verdict.)*
+3. **Verify failure: $126.**
    - It maps to I1, then I8.
-   - It is dominated by harness probes: apply-sentinel 28, web-smoke 26.
+   - It is dominated by harness probes: diff-apply-check-clean, apply-sentinel.
    - 3 runs pass every check but still have `pass:false`.
 
 **Smaller items:**
 - The SDD campaign lost 9 of 45 runs ($167) as rollbacks after the panel
   approved them. The publisher's stderr was never logged.
 - H3 is rejected: no-publish recipes account for only $2.
+- New harness bucket (erratum): verifier nodes that errored in 0 ms and never
+  ran — 30 runs ($108.94 raw / $20 corrected, framework-edit) plus $80 in the
+  SDD campaign. New epic K0.5c, before I3.
 
 **Change to the sequence below:** K0.5a and K0.5b are inserted before K1,
-and I3 now runs before I5. The authoritative order is in
+K0.5c (verifier nodes actually run) after I1, and I3 now runs before I5. The authoritative order is in
 `kickoffs/sdd-mechanisms/roadmap.md`.
 
 ## Sequence (one deliverable per kickoff)

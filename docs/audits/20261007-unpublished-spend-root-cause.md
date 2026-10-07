@@ -23,21 +23,70 @@ the same way: `.../backups/k0-sdd10x-20261007-110708.db` (45 runs, 0 published).
   more than unpublished ones, so the unpublished share goes **up from 67.0% to
   76.0%** (H1 rejected as an explanation).
 - **Top 3 root causes, ranked by corrected dollars:**
-  1. **Silent death: the run never reached a terminal status** — 315 runs,
-     $430.76 raw / **$209.94 corrected**. Not SDD; mostly fixed by this
+  1. **Silent death: the run never reached a terminal status** — 312 runs,
+     $430.53 raw / **$209.71 corrected**. Not SDD; mostly fixed by this
      morning's reaper and lifecycle teardown, two mechanisms still open.
-  2. **Post-implementation gate rejection (reviewer / rubric panel)** —
-     138 runs, $550.25 raw / **$186.01 corrected**. Mixed: some are correct
-     catches that a vacuous verify missed, some are false rejects (an
-     *advisory* rubric that still fails runs; verdicts that contradict their
-     own checks).
-  3. **Verify failure** — 162 runs, $522.99 raw / **$148.60 corrected**.
-     Dominated by harness probes, not product tests: two framework-edit probes
-     fail in most framework-edit verify failures.
+  2. **Post-implementation gate rejection (reviewer / panel)** — 132 runs,
+     $519.37 raw / **$169.03 corrected**. Mixed: some are correct catches that
+     a vacuous verify missed, some are candidate false rejects (verdicts that
+     contradict their own checks). *(The first version also blamed an advisory
+     rubric; that was a classifier error — see the Erratum.)*
+  3. **Verify failure** — 135 runs, $387.21 raw / **$125.86 corrected**.
+     Dominated by harness probes (diff-apply, sentinel), not product tests.
 - **Biggest single harness defect outside the top 3:** the reviewer's verdict
   is unparseable (`verdict=unknown`) in 16 runs, $140.21 raw / $89.06 corrected.
+- **Second harness defect: verifier nodes that never ran.** A verifier
+  `node_end` with `finish_reason=error` after **0 ms** — 30 runs here
+  ($108.94 raw / $20.36 corrected, framework-edit) and 3 runs / $80.24 (13%)
+  in the SDD campaign. New epic K0.5c.
 - **SDD campaign:** 9 of 45 runs ($167.44, 27%) were **approved by the panel and
   then rolled back** after a publisher error whose reason was never logged (H6).
+
+## Erratum (2026-10-07, second pass)
+
+Re-checking the "12 runs failed only on the advisory rubric" claim (it drove
+K0.5b's AC1) showed two classifier errors. Both are fixed in the classifier
+below and every table in this report is regenerated with it; the corrected
+unpublished share (76.0%) and the top-3 ranking are unchanged.
+
+1. **Merged `verdict.json`.** The file can hold the recipe verifier's
+   `{pass, tests_pass, static_pass, files_changed}` *and* the executor's
+   run-level `{verdict: "fail", failed_nodes, source: "execute@run-level"}`.
+   The first version read `pass: true` first and filed such runs as "verify
+   passed, rejected later". A run-level fail is now authoritative. 11 of the 12
+   "rubric-only" runs had failing nodes; the 12th (`run-1782939541-98592`,
+   2026-07-01) is from the bash era, and today's executor rolls back only when
+   a node fails — the rubric runs after execute and gates nothing.
+2. **Verifier nodes that never ran** are a harness failure, not a verify
+   failure. New bucket B19. Detection rule (run on the snapshot; 57 runs have
+   at least one such node, 30 land in B19 after precedence):
+
+   ```sql
+   SELECT r.run_id, t.recipe FROM run_events r JOIN task_runs t ON t.id = r.run_id
+   WHERE r.event_type = 'node_end' AND r.finish_reason = 'error'
+     AND json_extract(r.payload_json, '$.node_type') = 'verifier'
+     AND json_extract(r.payload_json, '$.duration_ms') = 0
+   GROUP BY r.run_id;
+   ```
+
+   By recipe: framework-edit 27, code-fix 20, code-fix probe arms 4,
+   goal-loop 3, rsi-technique-review 2, refactor-audit 1. Recent framework-edit
+   cases: `concord-mo1-20261002-184302`, `concord-mo2-20261002-212502`,
+   `concord-mo3-20261003-063622`, `vt1-mr-relations-20261005-193626`,
+   `vt2-hackability-audit-20261005-193952`, `vt3-equivalence-operator-20261005-193921`,
+   `vt4-differential-delta-20261005-201153`, `vt5-mutation-adequacy-20261005-194054`,
+   `vt6-level-vector-20261005-203840`. The *reason* was never recorded:
+   before `e245d002` the executor's stderr did not reach `execute.log`.
+   (Note: `execution_traces` does not carry this signal — the 0 ms duration is
+   only in the `run_events` `node_end` payload.)
+
+What moved: (c) candidate false rejects 93 → 78 runs ($104.15 → $86.85
+corrected); RC2 $186.01 → $169.03; RC3 $148.60 → $125.86; (e) gained B19.
+Run dirs are read live, so "passed, never published" reads 113 runs now
+(110 in the first pass) as runs that were in flight at snapshot time finish.
+Reading the live DB: the `sqlite3` CLI refuses `-readonly` / `mode=ro` on the
+WAL file with CANTOPEN (14); Python's `mode=ro` and the CLI's `immutable=1`
+both open it.
 
 ## AC1 — unpublished spend, mutually exclusive buckets (mini-ork home)
 
@@ -49,43 +98,44 @@ finalized, (c) false-reject candidate, (d:stage) real failure at that stage,
 | Bucket | AC3 label | Runs | Raw $ | Raw % | Corrected $ | Corr. % | Top recipes (raw $) |
 |---|---|---:|---:|---:|---:|---:|---|
 | B2 never finalized (non-terminal status) | (b) | 388 | 477.34 | 22.6 | 186.80 | 21.0 | verified-artifact 128, chapter-review 103, rsi-technique-review 55 |
+| B15 other / unclassified | (f) | 38 | 152.00 | 7.2 | 101.07 | 11.4 | framework-edit 89, recursive-self-improve 61, obs-smoke 1 |
 | B17 harness: reviewer verdict unparseable ('unknown') | (e) | 16 | 140.21 | 6.6 | 89.06 | 10.0 | research-synthesis 63, doc-to-features-loop 51, recursive-self-improve 17 |
-| B12b real failure: reviewer rejected (no verify result) | (d:reviewer) | 39 | 192.62 | 9.1 | 81.76 | 9.2 | framework-edit 90, code-fix 71, book-gen-flow-audit 21 |
-| B15 other / unclassified | (f) | 23 | 83.96 | 4.0 | 78.70 | 8.9 | recursive-self-improve 61, framework-edit 21, obs-smoke 1 |
+| B12b real failure: reviewer rejected (no verify result) | (d:reviewer) | 48 | 197.84 | 9.4 | 82.06 | 9.2 | framework-edit 96, code-fix 71, book-gen-flow-audit 21 |
 | B9b real failure: a verifier check failed | (d:verify) | 73 | 176.47 | 8.4 | 58.46 | 6.6 | code-fix 90, frontier-llm-research 41, recursive-self-improve 38 |
-| B9 real failure: verify tests failed | (d:verify-tests) | 34 | 183.27 | 8.7 | 57.39 | 6.5 | framework-edit 183 |
-| B7 verify PASSED, run rejected downstream (candidate false reject) | (c) | 34 | 86.12 | 4.1 | 56.97 | 6.4 | framework-edit 86 |
 | B6 dead before work: planner failure | (d:plan) | 6 | 66.81 | 3.2 | 52.17 | 5.9 | epic-runner 42, findings-validation-panel 20, bug-audit-cmgk 3 |
 | B1 crash-finalized / killed (reaped CRASH) | (b) | 37 | 64.67 | 3.1 | 49.87 | 5.6 | framework-edit 24, code-fix 11, researcher-qdrant-contract 8 |
+| B7 verify PASSED, run rejected downstream (candidate false reject) | (c) | 19 | 50.02 | 2.4 | 39.68 | 4.5 | framework-edit 50 |
 | B18 reviewer escalated to a human (no verdict) | (f) | 2 | 49.04 | 2.3 | 39.26 | 4.4 | recursive-validate-impl 49 |
-| B13 node error in verifier | (d:verifier) | 25 | 112.49 | 5.3 | 24.78 | 2.8 | code-fix 85, framework-edit 27, audit-findings-validator 1 |
+| B9 real failure: verify tests failed | (d:verify-tests) | 10 | 48.41 | 2.3 | 35.44 | 4.0 | framework-edit 48 |
 | B7e verify + review passed, run still failed (traces only) | (c) | 21 | 112.47 | 5.3 | 24.69 | 2.8 | chapter-review 112, code-fix 0 |
 | B5 dead before work: profile needs_answers | (d:profile) | 40 | 29.60 | 1.4 | 24.52 | 2.8 | recursive-self-improve 14, refactor-audit 10, audit-judge-panel 3 |
+| B13 node error in verifier | (d:verifier) | 21 | 111.57 | 5.3 | 23.98 | 2.7 | code-fix 85, framework-edit 26, audit-findings-validator 1 |
+| B19 harness: verifier node errored in 0 ms (never ran) | (e) | 30 | 108.94 | 5.2 | 20.36 | 2.3 | framework-edit 109, goal-loop 0 |
 | B7b verify passed, reviewer rejected (candidate false reject) | (c) | 32 | 117.03 | 5.5 | 16.17 | 1.8 | code-fix 117 |
 | B14 no run dir (unclassifiable) | (f) | 14 | 62.03 | 2.9 | 14.27 | 1.6 | chapter-review 62, frontier-llm-research 0 |
 | B10 real failure: verify static/shape check failed (tests ok) | (d:verify-static) | 3 | 22.79 | 1.1 | 5.93 | 0.7 | framework-edit 23 |
 | B4 infra: node cost_limit | (e) | 5 | 12.86 | 0.6 | 4.94 | 0.6 | bug-audit-fe-be 11, framework-edit 2, bug-audit-cmgk 0 |
-| B8 real failure: implementer produced no diff | (d:implementer) | 15 | 17.40 | 0.8 | 4.36 | 0.5 | framework-edit 17, self-migrate 0 |
 | B7c verify passed, panel/rubric rejected (candidate false reject) | (c) | 3 | 31.35 | 1.5 | 3.96 | 0.4 | rsi-technique-review 17, obs-smoke 9, frontier-llm-research 5 |
 | B13 node error in implementer | (d:implementer) | 3 | 9.24 | 0.4 | 3.84 | 0.4 | code-fix 6, framework-edit 3, goal-loop 0 |
 | B4 infra: node timeout | (e) | 2 | 9.58 | 0.5 | 3.03 | 0.3 | subsystem-integration-discovery 9, research-synthesis-mktcore 1 |
 | B7d verify passed, reviewer trace failed (traces only) | (c) | 3 | 8.64 | 0.4 | 2.35 | 0.3 | chapter-review 7, code-fix 1 |
 | B16 real failure: researcher/lens node failed | (d:researcher) | 18 | 12.14 | 0.6 | 2.08 | 0.2 | chapter-review 12, frontier-llm-research 0, verified-artifact 0 |
 | B11 verify vacuous (nothing checked), run failed | (d:verify-vacuous) | 24 | 27.97 | 1.3 | 2.04 | 0.2 | verified-artifact 28 |
+| B8 real failure: implementer produced no diff | (d:implementer) | 3 | 7.08 | 0.3 | 1.37 | 0.2 | framework-edit 7, self-migrate 0 |
 | B3 no publish expected (probe-scorer experiment arms) | (a) | 6 | 2.22 | 0.1 | 0.38 | 0.0 | code-fix__probe_11463_0 1, code-fix__probe_11463_1 1, code-fix__probe_19631_0 0 |
 | B12c real failure: reviewer trace failed (traces only) | (d:reviewer) | 6 | 2.02 | 0.1 | 0.11 | 0.0 | framework-edit 2 |
-| B9c real failure: verifier trace failed (traces only) | (d:verify) | 3 | 0.00 | 0.0 | 0.00 | 0.0 | verified-artifact 0 |
+| B9c real failure: verifier trace failed (traces only) | (d:verify) | 4 | 0.00 | 0.0 | 0.00 | 0.0 | verified-artifact 0, framework-edit 0 |
 | **Total unpublished** | | **875** | **2110.33** | 100.0 | **887.89** | 100.0 | |
 
 Rolled up by label:
 
 | Label | Runs | Raw $ | Raw % | Corrected $ | Corr. % |
 |---|---:|---:|---:|---:|---:|
-| (d) real failure | 289 | 852.82 | 40.4 | 317.44 | 35.8 |
+| (d) real failure | 259 | 711.94 | 33.7 | 292.01 | 32.9 |
 | (b) never finalized (B1 + B2) | 425 | 542.01 | 25.7 | 236.67 | 26.7 |
-| (f) other / unclassifiable / escalated | 39 | 195.03 | 9.2 | 132.23 | 14.9 |
-| (c) verify passed, rejected later | 93 | 355.61 | 16.9 | 104.15 | 11.7 |
-| (e) infra / harness | 23 | 162.64 | 7.7 | 97.02 | 10.9 |
+| (f) other / unclassifiable / escalated | 54 | 263.07 | 12.5 | 154.60 | 17.4 |
+| (e) infra / harness (incl. B19 verifier 0 ms) | 53 | 271.59 | 12.9 | 117.38 | 13.2 |
+| (c) verify passed, rejected later | 78 | 319.51 | 15.1 | 86.85 | 9.8 |
 | (a) no publish expected | 6 | 2.22 | 0.1 | 0.38 | 0.0 |
 | **Total** | **875** | **2110.33** | 100 | **887.89** | 100 |
 
@@ -98,7 +148,7 @@ All 45 runs are after the meter fix, so raw = corrected.
 | B13 node error in publisher | (d:publisher) | 9 | 167.44 | 27.1 | 167.44 | 27.1 | recursive-validate-impl 167 |
 | B9b real failure: a verifier check failed | (d:verify) | 10 | 132.27 | 21.4 | 132.27 | 21.4 | recursive-validate-impl 118, spec-driven-delivery 14 |
 | B18 reviewer escalated to a human (no verdict) | (f) | 4 | 82.35 | 13.3 | 82.35 | 13.3 | recursive-validate-impl 82 |
-| B13 node error in verifier | (d:verifier) | 3 | 80.24 | 13.0 | 80.24 | 13.0 | recursive-validate-impl 62, spec-driven-delivery 18 |
+| B19 harness: verifier node errored in 0 ms (never ran) | (e) | 3 | 80.24 | 13.0 | 80.24 | 13.0 | recursive-validate-impl 62, spec-driven-delivery 18 |
 | B5 dead before work: profile needs_answers | (d:profile) | 6 | 74.36 | 12.0 | 74.36 | 12.0 | spec-driven-delivery 74 |
 | B2 never finalized (non-terminal status) | (b) | 9 | 37.41 | 6.1 | 37.41 | 6.1 | spec-driven-delivery 22, recursive-validate-impl 16 |
 | B7b verify passed, reviewer rejected (candidate false reject) | (c) | 1 | 17.06 | 2.8 | 17.06 | 2.8 | recursive-validate-impl 17 |
@@ -139,14 +189,14 @@ Effect: MiniMax alone was recorded at $1,740.13 for ~1.42 B cached + 153 M input
 |---|---|---|
 | **H1** meter artifact | **Rejected** as an explanation of the share. The meter inflated dollars ~2.7×, but correcting it raises the unpublished share from 67.0% to 76.0%. | total $3,151.17 → $1,169.04; published $1,040.84 → $281.15; unpublished $2,110.33 → $887.89 |
 | **H2** never finalized | **Confirmed, and it is the #1 cause.** 425 runs, $542.01 raw / $236.67 corr (B1 + B2). Inside B2: 276 died mid-run ($309.49 / $147.80), 110 **passed** but were never published ($111.25 / $26.73), 2 had a fail verdict but the status write was lost ($56.60 / $12.27). | see RC1 |
-| **H3** no publish by design | **Rejected.** Only the probe-scorer arms are no-publish by design: 6 runs, $2.22. Every recipe except `harness-bridge` has an `artifact_contract.yaml`, so the publisher can publish it. framework-edit's 6/173 is gate rejection, not hand shipping: in its 34 "verify passed" failures the reviewer said `needs_revision` (19) or the rubric panel failed it (25 have `panel_pass=false`). | B3 |
-| **H4** false rejects | **Partly confirmed.** 93 runs, $355.61 raw / $104.15 corr reached a passing verify and were still failed. Hard false rejects: 12 failed only on the rubric pre-screen ($55.65 / $17.26) and 3 framework-edit runs passed every check in both checks tables yet `verdict.json` says `pass:false`. The rest (51 reviewer rejections after a passing verify, $155.49 / $53.92) cannot be called false without hidden-test truth, and the evidence cuts both ways (RC2). | B7, B7b–B7e |
+| **H3** no publish by design | **Rejected.** Only the probe-scorer arms are no-publish by design: 6 runs, $2.22. Every recipe except `harness-bridge` has an `artifact_contract.yaml`, so the publisher can publish it. framework-edit's 6/173 is gate rejection and harness failure, not hand shipping: in its 19 genuinely verify-passed failures the reviewer said `needs_revision` (18), and 27 framework-edit runs had verifier nodes that never ran (Erratum). | B3 |
+| **H4** false rejects | **Partly confirmed.** 78 runs, $319.51 raw / $86.85 corr reached a passing verify and were still failed. Hard false rejects: 3 framework-edit runs passed every check in both checks tables yet `verdict.json` says `pass:false`. The rest (50 reviewer rejections after a passing verify, $154.73 / $53.88) cannot be called false without hidden-test truth, and the evidence cuts both ways (RC2). *(The first version's "12 rubric-only rejections" was a classifier error — Erratum.)* | B7, B7b–B7e |
 | **H5** dead before work | **Confirmed but small.** profile `needs_answers` 40 runs $29.60 / $24.52; planner failure 6 runs $66.81 / $52.17; node `cost_limit`/`timeout` 7 runs $22.43 / $7.97. Lane failures are mostly invisible: 738 failed `llm_calls` rows have `error_category` NULL or `unknown`. In the SDD campaign `needs_answers` is larger: 6 runs, $74.36 (12%). | B4–B6 |
 | **H6** rollback destroyed good work | **Confirmed in the SDD campaign:** 9 recursive-validate-impl runs, panel `APPROVE`, then publisher error, then rollback — $167.44. Not visible as such in the mini-ork home (goal-loop unpublished total is $0.75). | SDD B13 publisher |
 
 ## AC4 — top 3 root causes, with opened run dirs
 
-### RC1 · Silent death (not SDD) — 315 runs, $430.76 raw / $209.94 corrected
+### RC1 · Silent death (not SDD) — 312 runs, $430.53 raw / $209.71 corrected
 
 The run's owning process ended without writing a terminal status, so the row
 stays `executing` / `classified` / `planned` / `reviewing` and every reporter
@@ -170,7 +220,7 @@ counted it as in flight. Mechanisms found:
    `e245d002`, which finalizes that branch)*.
    `run-1789811866-94475`: `oracle-gates: pre-publish pass`, `all nodes
    complete`, run-level verdict `pass`, status `executing`, kickoff in a temp
-   `libwit-verified-artifact-*` dir. 110 such runs ($111.25 raw) — this is
+   `libwit-verified-artifact-*` dir. 113 such runs ($111.48 raw; run dirs are read live) — this is
    finished work, counted as unpublished only because nothing marks it done.
 4. **Python-level abort** (exception, deadline exit): the old lifecycle deleted
    `.pid` and wrote no status. Fixed today in `7954fa6f`.
@@ -179,17 +229,17 @@ Status: (1) and (4) are fixed for new runs (`7954fa6f` lifecycle owns `.pid`
 and writes `failed` at teardown; the board reaper fails provably dead runs;
 `bf2805dd` keeps passing runs out of it). (2) and (3) are open.
 
-### RC2 · Post-implementation gate rejection — 138 runs, $550.25 raw / $186.01 corrected
+### RC2 · Post-implementation gate rejection — 132 runs, $519.37 raw / $169.03 corrected
 
-Labels (c) + (d:reviewer): the implementation existed and a reviewer or the
-rubric panel failed it. The evidence is mixed:
+Labels (c) + (d:reviewer): the implementation existed and a reviewer or a
+panel failed it. The evidence is mixed:
 
-- `run-1782939541-98592` (framework-edit) — **false reject.** `verdict.json`
-  `{files_changed:4, tests_pass:true, static_pass:true, pass:true}`,
-  `reviewer verdict=pass`, and the only negative is `panel-verdict.json`
-  `{panel_score:62.5, pass:false, source:"rubric-prescreen"}`. The lifecycle
-  labels the rubric "advisory pre-screen", yet it decided the run. 12 runs fail
-  this way ($55.65 raw / $17.26 corr).
+- `run-1782939541-98592` (framework-edit, 2026-07-01, bash era) — verify and
+  reviewer passed and only the rubric pre-screen said `pass:false`. It is the
+  single run of that shape: the other 11 the first version counted here had
+  failing nodes (Erratum), and the current executor gives the rubric no say.
+  K0.5b (`44a45ce0`) still made the rubric file unable to act as a verdict
+  anywhere (commit gate, panel approval gate, run verdict).
 - `child-1789898497-42951` (code-fix) — **correct reject, wrong reason
   upstream.** The "passing" test verifier ran
   `echo scoped-test-skipped-bounded-goal-loop-demo`; the reviewer found a real
@@ -198,7 +248,7 @@ rubric panel failed it. The evidence is mixed:
 - `run-1781706039-50968` (book-gen-flow-audit) — reviewer `fail`, panel 25:
   a real reject.
 
-### RC3 · Verify failure — 162 runs, $522.99 raw / $148.60 corrected
+### RC3 · Verify failure — 135 runs, $387.21 raw / $125.86 corrected
 
 - `run-1781191884-92049` (framework-edit): every check in
   `verifier-test.checks.tsv` is `true` (incl. `web-smoke-tests-pass`), yet
@@ -208,11 +258,11 @@ rubric panel failed it. The evidence is mixed:
 - `rsi-scan-2000-20260922-213524` (frontier-llm-research):
   `aggregation completeness failed: 2122 source sections and 2000 prompt
   sections` — an exact-count probe on a corpus that legitimately grew.
-- Across the 34 framework-edit "tests failed" runs (B9) the failing check ids
-  are mostly harness probes: `apply-sentinel-has-content` (28),
-  `web-smoke-tests-pass` (26 — one smoke test failing across unrelated
-  changes), `diff-applies-to-copy` (14), `patched-copy-created` (14). 3 of the
-  34 passed every check in both tables and still record `pass:false`.
+- Across the 10 framework-edit "tests failed" runs (B9) the failing check ids
+  are mostly harness probes: `diff-apply-check-clean` (6),
+  `apply-sentinel-has-content` (4), `diff-applies-to-copy` (2),
+  `web-smoke-tests-pass` (2), `patched-copy-created` (2). 3 of the 10 passed
+  every check in both tables and still record `pass:false`.
 
 ## Other findings worth acting on
 
@@ -233,14 +283,14 @@ rubric panel failed it. The evidence is mixed:
 
 | Root cause | Corrected $ | Maps to |
 |---|---:|---|
-| RC1 silent death — hard death / abort (B1 + B2 without a verdict) | 197.67 | **not SDD** (shipped today: `7954fa6f`, `ec54774d`, `bf2805dd`) |
+| RC1 silent death — hard death / abort (B1 + B2 without a verdict) | 197.44 | **not SDD** (shipped today: `7954fa6f`, `ec54774d`, `bf2805dd`) |
 | RC1 — lost status write (`set_status` swallows) | 12.27 | **not SDD** — zero-fallback: raise, do not warn |
-| RC1 — execute-only runs: publisher cannot see the overlay contract, returns with no status | 26.73 | **not SDD** — fixed in K0.5a (`e245d002`): the no-contract branch finalizes the run |
-| RC2 — advisory rubric acts as a gate | 17.26 | **not SDD** — gate wiring |
-| RC2 — reviewer rejects after a passing verify | 53.92 | **I7** (convergence audit replaces reviewer verdict authority), **I2** |
-| RC2 — other verify-passed failures (traces-only reads, no reviewer signal) | 32.97 | **I7** |
-| RC2 — reviewer rejects with no verify result | 81.87 | **I1** (verify must check what the reviewer is checking), **I7** |
-| RC3 — invalid / environment-dependent probes, verdict contradicts checks | 148.60 | **I1** (probe validity), then **I8** (repair instead of terminate) |
+| RC1 — execute-only runs: publisher cannot see the overlay contract, returns with no status | 26.96 | **not SDD** — fixed in K0.5a (`e245d002`): the no-contract branch finalizes the run |
+| Harness — verifier node errored in 0 ms, never ran (B19; + SDD $80.24) | 20.36 | **not SDD** — new epic **K0.5c** |
+| RC2 — reviewer rejects after a passing verify | 53.88 | **I7** (convergence audit replaces reviewer verdict authority), **I2** |
+| RC2 — other verify-passed failures (traces-only reads, no reviewer signal) | 32.98 | **I7** |
+| RC2 — reviewer rejects with no verify result | 82.17 | **I1** (verify must check what the reviewer is checking), **I7** |
+| RC3 — invalid / environment-dependent probes, verdict contradicts checks | 125.86 | **I1** (probe validity), then **I8** (repair instead of terminate) |
 | Reviewer verdict unparseable | 89.06 | **not SDD** — structured verdict |
 | Dead before work: `needs_answers` (+ SDD $74.36) | 24.52 | **I3** (kickoff contract + answer path) |
 | Dead before work: planner failure | 52.17 | **I4** for oversize tasks; parse errors are **not SDD** |
@@ -260,6 +310,11 @@ rubric panel failed it. The evidence is mixed:
    before K5 depends on it.
 3. Keep I1 as the first SDD epic. *Reason:* RC3 and the "vacuous verify, reviewer
    catches it" half of RC2 both reduce to probe validity.
+4. *(Added with the Erratum, accepted 2026-10-07.)* **Insert K0.5c "framework-edit
+   verifier nodes actually run" after I1 and before I3.** *Reason:* from I3 on,
+   epics are dispatched through framework-edit and its publish rate is the
+   measurement; verifier nodes that error in 0 ms without running make that
+   measurement meaningless.
 
 ## Limits
 
@@ -304,11 +359,12 @@ Rule order (first match wins): B1 CRASH / killed / crash-finalized notes → B2
 non-terminal status → B3 probe-scorer arm → B4 first failing node ended
 `timeout`/`cost_limit` → B5 no implementer + `needs_answers` → B6 no implementer
 + `plan-failure-*` or all planner traces failed → B7–B10 verify-schema
-`verdict.json` (`pass`, `files_changed`, `tests_pass`) → B17 reviewer
+`verdict.json` (`pass`, `files_changed`, `tests_pass`; skipped when the same
+file carries a run-level `verdict: fail` from `execute@run-level`) → B17 reviewer
 `unknown` → B18 reviewer `ESCALATE` → B9b/B7b/B7c verifier result files +
 reviewer / panel → B12b reviewer rejected → B11 all verifier traces vacuous →
-B12 first failing node `verdict_revise`/`verdict_fail` → B13 first failing node
-`error` → trace fallback (B9c, B7d, B12c, B7e, B16) → B14 no run dir → B15.
+B12 first failing node `verdict_revise`/`verdict_fail` → B19 first failing node is a verifier that
+errored in 0 ms (never ran) → B13 first failing node `error` → trace fallback (B9c, B7d, B12c, B7e, B16) → B14 no run dir → B15.
 
 The classifier, verbatim as run:
 
@@ -444,6 +500,10 @@ def features(c, run):
     for e in ev:
         if e["finish_reason"] not in (None, "done"):
             first_bad = (e["finish_reason"], node_type(e["payload_json"]))
+            try:
+                f["first_bad_ms"] = (json.loads(e["payload_json"] or "{}") or {}).get("duration_ms")
+            except (TypeError, ValueError):
+                f["first_bad_ms"] = None
             break
     f["first_bad"] = first_bad
     tr = c.execute("SELECT verifier_output, status, reviewer_verdict FROM execution_traces WHERE run_id=?",
@@ -474,6 +534,12 @@ def bucket(run, f):
     if not f["implementer"] and (f["plan_failure"] or (pl and all(x == "failure" for x in pl))):
         return "B6 dead before work: planner failure", "d:plan"
     v = f["verdict"]
+    # verdict.json can be MERGED: the recipe verifier's {pass, tests_pass, ...} and
+    # the executor's run-level {verdict: fail, failed_nodes, source} in one file.
+    # A run-level fail is authoritative — the recipe flag says nothing about the
+    # nodes that failed after it (K0 erratum, 2026-10-07).
+    if v and v.get("source") == "execute@run-level" and v.get("verdict") == "fail":
+        v = None
     if v and v.get("pass") is True:
         return "B7 verify PASSED, run rejected downstream (candidate false reject)", "c"
     if v and v.get("pass") is False:
@@ -502,6 +568,8 @@ def bucket(run, f):
         return "B11 verify vacuous (nothing checked), run failed", "d:verify-vacuous"
     if f["first_bad"] and f["first_bad"][0] in ("verdict_revise", "verdict_fail"):
         return f"B12 real failure: {f['first_bad'][1]} {f['first_bad'][0]}", f"d:{f['first_bad'][1]}"
+    if f["first_bad"] and f["first_bad"][0] == "error" and f["first_bad"][1] == "verifier" and f.get("first_bad_ms") == 0:
+        return "B19 harness: verifier node errored in 0 ms (never ran)", "e"
     if f["first_bad"] and f["first_bad"][0] == "error":
         return f"B13 node error in {f['first_bad'][1]}", "e" if f["first_bad"][1] in ("?",) else f"d:{f['first_bad'][1]}"
     # Trace fallback (runs whose dir was a temp home, e.g. libwit chapter-review).
