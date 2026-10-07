@@ -1,6 +1,7 @@
 # Learning & memory page — user-first refactor plan
 
-Status: PROPOSAL (2026-10-07)
+Status: IN PROGRESS (2026-10-07). Decisions taken: holdout ON at 10%; Bug reports → Verify &
+safety; TraceOtter → Self-improve. See "Progress" at the end.
 Scope: the IDE `learn` page (`mini_ork/ide_pages/learn.py`, rendered by `crates/mini_ork_ui` in
 `zed-mini-ork`), and the learning-pipeline data it needs to be worth reading.
 Builds on the fixes in flight today: `learn-inject`, `learn-node-tab`, `learn-run-tab`,
@@ -62,6 +63,29 @@ The reader is the operator running mini-ork on their repos. Jobs, most important
    so everything works headless and is testable.
 5. **Honest empty states.** Say why something is empty and what would fill it.
 6. **Mini-ork's notes about itself go to bugs, not into task prompts.**
+
+## Usefulness contract (binding for every UI phase)
+
+A section ships only if it fills every column. Each UI kickoff copies its rows into its spec. The
+reviewer rejects a section that misses one, and the final audit (P10) checks the rendered JSON
+from the live DB against this table.
+
+| Tab · section | Question it answers (job) | Denominator / baseline | Evidence link | Action | Empty state says |
+|---|---|---|---|---|---|
+| Overview · Needs you | Is anything waiting on me? (J4) | counts per item | each chip opens where to act | open / `mini-ork reap` for stuck runs | "Nothing needs you" |
+| Overview · Outcomes by task class | Is it getting better at my work? (J1) | terminal runs per 28-day window; Δ vs previous window; n<5 shows "—" | row → class detail | select class | "No finished runs in the last 56 days" |
+| Overview · Class detail | Why is this class failing? (J1) | last 10 terminal runs | each run opens | open run | n/a (only with a selection) |
+| Overview · Learning pipeline | Is the learning loop itself working? (J4) | per-stage inputs → outputs over the last 3 passes | last error per stage | rerun reflect | "Reflect has not run here" |
+| Overview · Recent learning events | What changed in what it knows? (J2) | last 14 days | lesson / promotion links | open lesson | "No learning events in 14 days" |
+| Lessons · Library | What has it learned, in words I can check? (J2, J3) | uses + lift with n per lesson; holdout comparison | → detail | filter chips | why empty + what fills it |
+| Lessons · Detail | Is this lesson true and does it help? (J3, J6) | lift = pass rate injected vs held out (n each) | member gradients, evidence runs, injecting nodes | approve / edit / pin / mute / retire / to-bug | n/a |
+| Memory · Preferences & constraints | What did I tell it, and does every run get it? (J5) | count; injected-in-last-7-days count | nodes that received it | set / remove (`mini-ork prefs`) | "No preferences. Add one: mini-ork prefs set …" |
+| Memory · Lane fit | Which lane works for which task class? (J1) | runs, pass rate, cost per pass per lane×class | → Lanes & cost | open lanes page | "No lane history yet" |
+| Memory · Store health | What should be forgotten? (J5) | lift with n, not raw win rate | → lesson | retire / reactivate | "Nothing to retire" |
+| Self-improve · Decisions | What change is waiting for my yes/no? (J4) | utility before → after | candidate evidence | approve / reject | "No candidate waiting" |
+| Self-improve · Loop / ledger / exports | Is self-improvement running, and at what cost? | per week; cost per iteration | run links | start / ingest | as today |
+| Run tab · Learnings | What did this run learn and what was it given? (J6) | this run only | node / trace | open node | why empty |
+| Node tab · Learning | What exactly did this node get, and what did we learn from it? (J6) | this node only | injected text + sources | open lesson | "Not recorded" / "not an LLM node" |
 
 ## Target page
 
@@ -225,3 +249,42 @@ flowchart TD
 - **Parallel edits.** Other sessions edit `ide_pages/run.py` and `node.py`. Each phase claims its
   files through `make worktree … OWNS=…`, and edits stay inside named functions.
 - **Out of scope:** ContextNest (cross-session memory) gets a link from the Memory tab only.
+
+Both decisions above were settled 2026-10-07: holdout ON at 10% (it ships with P4, with the
+`held_out` column already in the P1 ledger), and both tabs move (P8).
+
+## New findings while building (2026-10-07)
+
+- **Preferences reach no model.** `user_preferences.json` / `constraints.json` are read only into
+  the planner's `context-pack.json`, which no prompt includes, and `user_preference_memory` has
+  no writer. Fixed by P7a (`learn-prefs`): `mini-ork prefs` + injection first in every LLM node's
+  learned block.
+- **The daily cost circuit silently starves learning.** Outside a launch that raises
+  `MO_DAILY_BUDGET_USD`, every reflect LLM call (gradient extraction, induction) is refused once
+  the machine-wide 24 h spend passes $50. Today it was $82.73 by midday. The induction fix's new
+  error reporting surfaced it: `[cost_circuit_open] spent_today=$82.73 budget=$50`. P1b records it
+  as a named failure in `learning_pass_stats`, and the Overview health strip shows it.
+- **Induction is now serialized.** The fix put dispatch under a lock because `redirect_stdout` is
+  process-wide (the old parallel path could mix batch outputs). It's correct but slower. Follow-up:
+  have `llm_dispatch` return output without redirecting, then restore parallelism.
+
+## Progress
+
+| Phase | Worktree / run | State |
+|---|---|---|
+| P0 node tab | `learn-node-tab` | merged |
+| P0 run tab | `learn-run-tab` | merged |
+| P0 per-node record + lesson-only patterns | `learn-inject` | merged |
+| P0 induction lane | `induce-lane` | merged; lesson backfill running on glm |
+| P0 approval needs a lesson | `learn-gate` | revision 2 (Opus: restore cold-safe guard) |
+| P1a injection ledger + pass-stat API | `learn-ledger` | running |
+| P1b pass stats wired into reflect | — | after `learn-themes` + `learn-gate` merge |
+| P2 themes + kind split | `learn-themes` | running |
+| P3 lesson per theme + `mini-ork lessons` | — | after P1a + P2 |
+| P4 lift + holdout 10% | — | after P3 |
+| P5a Overview outcomes + needs-you, P8 restructure | `learn-restructure` | running |
+| P5b Overview pipeline strip + events | — | after P1b |
+| P6 Lessons tab | — | after P3 (lift column after P4) |
+| P7a preferences reach every node | `learn-prefs` | running |
+| P7b Memory tab | — | after P7a + restructure |
+| P10 usefulness audit | — | last: Opus lenses grade the live JSON of every tab against the contract above; findings become one fix round |
