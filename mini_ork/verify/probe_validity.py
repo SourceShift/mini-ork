@@ -256,16 +256,27 @@ def coverage_violations(acceptance_ids: list[str], probes: list[dict]) -> list[s
 
 @contextlib.contextmanager
 def base_tree(target_repo: str, base_ref: str) -> Iterator[str]:
-    """A detached throwaway checkout of ``base_ref`` (removed afterwards)."""
+    """A DETACHED throwaway checkout of ``base_ref``, always removed.
+
+    Detached (no branch) so branch-creation guards never fire; removed on every
+    path — success, a probe that raises, or a failed ``worktree add`` — and the
+    target's worktree registry pruned, so a shared target repo (another
+    session's campaign worktree) never keeps a stray entry.
+    """
+    import shutil
+
     tmp = tempfile.mkdtemp(prefix="probe-base-")
     os.rmdir(tmp)  # git worktree add wants to create it
-    subprocess.run(["git", "-C", target_repo, "worktree", "add", "--detach", "--quiet", tmp, base_ref],
-                   check=True, capture_output=True, text=True)
     try:
+        subprocess.run(["git", "-C", target_repo, "worktree", "add", "--detach", "--quiet", tmp, base_ref],
+                       check=True, capture_output=True, text=True)
         yield tmp
     finally:
         subprocess.run(["git", "-C", target_repo, "worktree", "remove", "--force", tmp],
                        capture_output=True, text=True)
+        if os.path.isdir(tmp):
+            shutil.rmtree(tmp, ignore_errors=True)
+        subprocess.run(["git", "-C", target_repo, "worktree", "prune"], capture_output=True, text=True)
 
 
 def remap(command: str, target_repo: str, base: str) -> str:

@@ -118,6 +118,22 @@ def test_a_probe_that_passes_on_base_is_vacuous(repo) -> None:
     assert _git(r, "worktree", "list").count("\n") == 0  # throwaway checkout removed
 
 
+def test_base_tree_is_detached_and_always_removed(repo) -> None:
+    r, base = repo
+    with pv.base_tree(str(r), base) as tmp:
+        assert _git(Path(tmp), "rev-parse", "--abbrev-ref", "HEAD") == "HEAD"  # detached, no branch
+    assert not Path(tmp).exists()
+    with pytest.raises(RuntimeError):
+        with pv.base_tree(str(r), base) as tmp2:
+            raise RuntimeError("probe blew up")
+    assert not Path(tmp2).exists()
+    with pytest.raises(subprocess.CalledProcessError):
+        with pv.base_tree(str(r), "0" * 40):  # a ref that does not exist
+            pass
+    assert _git(r, "worktree", "list").count("\n") == 0  # only the main worktree, nothing stale
+    assert len(_git(r, "branch", "--list").splitlines()) == 1  # no branch was ever created
+
+
 def test_absolute_target_paths_are_remapped_to_the_base_tree(repo) -> None:
     # Without the remap this probe would read the CHANGED tree and pass on "base".
     r, base = repo
