@@ -881,7 +881,7 @@ def test_mini_ork_run_refuses_a_kickoff_with_a_pending_fix(tmp_path: Path) -> No
     oversight_inbox.enqueue(
         retry_notify.GATE_ID, "run-earlier", "retry",
         {"hint": {"needs_change": {"kind": "environment", "summary": "set FOO_BAR"}}},
-        blocks_dispatch_for=os.path.realpath(kickoff), db_path=str(home / "state.db"))
+        blocks_dispatch_for=retry_notify.dispatch_key(str(kickoff)), db_path=str(home / "state.db"))
 
     blocked = _cli_run(tmp_path, home, kickoff, MINI_ORK_DRY_RUN="1")
     assert blocked.returncode == cli_main.RC_BLOCKED, blocked.stderr[-400:]

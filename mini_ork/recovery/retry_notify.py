@@ -16,7 +16,8 @@ Three responsibilities, in this order:
      ``<run_dir>/owner.json``, ``<run_dir>/NEEDS-CHANGE.md``, and
      ``<run_dir>/retry-gate.json``, plus enqueues ONE
      ``mo_inbox_gates`` row whose ``gate_id='retry_precondition'`` and
-     ``blocks_dispatch_for=<kickoff realpath>``. The dedupe query is
+     ``blocks_dispatch_for=<dispatch_key(kickoff)>`` (the kickoff's path AND
+     its task line, see :func:`dispatch_key`). The dedupe query is
      run by :func:`notify` (oversight_inbox has no UNIQUE); repeat
      ``notify`` calls on the same run return the existing inbox_id.
 
@@ -757,10 +758,10 @@ def notify(home: Path, run_id: str) -> dict[str, Any] | None:
     except OSError:
         pass
 
-    # Enqueue the gate with the kickoff realpath as blocks_dispatch_for.
+    # Enqueue the gate keyed on this run's task (kickoff path + task line).
     profile = _read_run_profile(run_dir)
     kickoff = str(profile.get("kickoff_path") or "")
-    blocks_for = _realpath(kickoff) if kickoff else ""
+    blocks_for = dispatch_key(kickoff) if kickoff else ""
     inbox_id, _ = _enqueue_retry_gate(home, run_id, hint, steps, owner_rec,
                                       blocks_for)
     if inbox_id is not None:
@@ -799,12 +800,36 @@ def notify(home: Path, run_id: str) -> dict[str, Any] | None:
 # ── 5. start guard helpers (used by ``mini_ork.cli.main``) ────────────────
 
 
-def pending_fix_for_kickoff(home: Path, kickoff_path: str) -> dict[str, Any] | None:
-    """A pending ``retry_precondition`` row whose ``blocks_dispatch_for``
-    realpath matches ``kickoff_path`` realpath.
+def dispatch_key(kickoff_path: str) -> str:
+    """What a pending fix blocks: this kickoff path AND its task.
 
-    ``None`` when there is no pending fix — the run may proceed.
-    ``MO_IGNORE_PENDING_FIX=1`` short-circuits the check at the caller.
+    Loops rewrite ONE kickoff file per cycle for different steps, so the path
+    alone blocked unrelated steps (W5-112's pending fix stopped W5-98). The
+    task is the kickoff's first non-empty line (its title, e.g.
+    ``acq-wave5-rsi — cycle for step W5-91``): the same step re-run is blocked
+    even when the rest of the kickoff (a ledger, notes) changed, a different
+    step is not. A kickoff without a title line falls back to its content hash.
+    """
+    path = _realpath(kickoff_path)
+    try:
+        text = Path(kickoff_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    title = next((ln.strip().lstrip("#").strip() for ln in text.splitlines() if ln.strip()), "")
+    if title:
+        return f"{path}#{' '.join(title.split())}"
+    import hashlib
+
+    return f"{path}#sha256:{hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]}"
+
+
+def pending_fix_for_kickoff(home: Path, kickoff_path: str) -> dict[str, Any] | None:
+    """A pending ``retry_precondition`` row for this kickoff's task
+    (:func:`dispatch_key`), or ``None`` when the run may proceed.
+
+    Rows written before the task was part of the key (a bare path, no ``#``)
+    never block: they cannot tell one step of a loop from another.
+    ``MO_IGNORE_PENDING_FIX=1`` short-circuits the check.
     """
     if os.environ.get(MO_IGNORE_PENDING_FIX) == "1":
         return None
@@ -819,13 +844,13 @@ def pending_fix_for_kickoff(home: Path, kickoff_path: str) -> dict[str, Any] | N
         rows = oversight_inbox.pending(db_path=db_path)
     except Exception:  # noqa: BLE001
         return None
-    want = _realpath(kickoff_path) if kickoff_path else ""
+    want = dispatch_key(kickoff_path) if kickoff_path else ""
     if not want:
         return None
     for row in rows:
         if row.get("gate_id") != GATE_ID:
             continue
-        if _realpath(str(row.get("blocks_dispatch_for") or "")) == want:
+        if str(row.get("blocks_dispatch_for") or "") == want:
             return row
     return None
 
