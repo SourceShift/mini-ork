@@ -1079,7 +1079,7 @@ def _verifier_stem(target: Node) -> str | None:
 
 
 def _is_command_backed(target: Node, session_path: Path | None,
-                       has_log: bool) -> bool:
+                       has_log: bool) -> bool:  # has_log kept in signature; build_node passes log_path-is-not-None
     """Branch gate: should the stream be built from commands?
 
     True when:
@@ -1107,12 +1107,14 @@ def _is_command_backed(target: Node, session_path: Path | None,
     # the workflow forgot to tag the type. ``_resolve_log_path`` would
     # also have surfaced a log; the command branch handles the case where
     # there is no log either (built-in steps that only print to
-    # execute.log).
-    return not has_log or True  # both shapes qualify; the helpers return [] otherwise
+    # execute.log). Both shapes qualify — the helpers return [] otherwise.
+    return True
 
 
 def _command_stream_entries(run_dir: Path, target: Node, log_path: Path | None,
-                            recipe_dir: Path | None) -> tuple[list[dict[str, Any]], int, str] | None:
+                            recipe_dir: Path | None, *,
+                            home: Path | None = None,
+                            offset: int = 0) -> tuple[list[dict[str, Any]], int, str] | None:  # log_path kept in signature; build_node's call shape
     """Build the stream entries (kickoff §2a–e) from command artefacts.
 
     Returns ``(entries, next_offset, source)`` when command artefacts are
@@ -1120,12 +1122,22 @@ def _command_stream_entries(run_dir: Path, target: Node, log_path: Path | None,
     nevertheless has no ``node-cmd`` record and no legacy
     ``verifier_<stem>.json`` AND no built-in log lines — caller should
     fall back to the existing log-line path.
+
+    r2 (kickoff fixes 1/4/5/6/7): every branch returns
+    ``(entries[offset:], len(entries), source)`` so polling at the returned
+    offset yields no duplicates. The reconstructed-command branch now
+    keeps §2b (sub-commands + ``_*cmd*.log``) and §2c (verifier logs)
+    after the ``reconstructed`` marker, and computes the command string as
+    ``python3 <recipe_dir>/<verifier_ref>`` (not the relative
+    ``target.prompt``). The §2c log block skips any path equal to the
+    record's ``output_path`` so the verifier's own log does not appear
+    twice.
     """
     entries: list[dict[str, Any]] = []
     line_idx = 0
-    next_offset = 0
     source_name = ""
     stem = _verifier_stem(target)
+    skip_paths: set[str] = set()  # paths already shown via §2a output
 
     record_path = (run_dir / "node-cmd" / f"verifier_{stem}.json") if stem else None
     legacy_evidence = (run_dir / f"verifier_{stem}.json") if stem else None
@@ -1152,6 +1164,8 @@ def _command_stream_entries(run_dir: Path, target: Node, log_path: Path | None,
         started = float(record.get("started_at") or 0.0)
         ended = float(record.get("ended_at") or 0.0)
         dur = max(0.0, ended - started)
+        if out_path:
+            skip_paths.add(out_path)
 
         arg_str = f"cd {cwd} && {cmd_str}" if cwd else cmd_str
 
@@ -1182,7 +1196,6 @@ def _command_stream_entries(run_dir: Path, target: Node, log_path: Path | None,
             "_line": line_idx,
         })
         line_idx += 1
-        next_offset = total_lines
         source_name = str(record_path.name) if record_path else ""
 
         # ── §2b — sub-commands the verifier ran ─────────────────────
@@ -1198,6 +1211,8 @@ def _command_stream_entries(run_dir: Path, target: Node, log_path: Path | None,
         except OSError:
             cmd_logs = []
         for cmd_log in cmd_logs:
+            if str(cmd_log) in skip_paths:
+                continue
             blocks = _parse_cmd_log_blocks(cmd_log)
             for blk in blocks:
                 blk["_line"] = line_idx
@@ -1207,7 +1222,7 @@ def _command_stream_entries(run_dir: Path, target: Node, log_path: Path | None,
         # ── §2c — the verifier's own logs ───────────────────────────
         for rel in (f"verifier-{stem}.log",):
             lp = run_dir / rel
-            if lp.is_file():
+            if lp.is_file() and str(lp) not in skip_paths:
                 e = _log_path_entry(lp, head="log", arg=str(lp),
                                     line_idx=line_idx, cap=NODE_CMD_LINE_CAP)
                 entries.append(e)
@@ -1224,13 +1239,15 @@ def _command_stream_entries(run_dir: Path, target: Node, log_path: Path | None,
                 )
             except OSError:
                 logs = []
-            if logs:
-                e = _log_path_entry(logs[0], head="log", arg=str(logs[0]),
+            for lp in logs:
+                if str(lp) in skip_paths:
+                    continue
+                e = _log_path_entry(lp, head="log", arg=str(lp),
                                     line_idx=line_idx, cap=NODE_CMD_LINE_CAP)
                 entries.append(e)
                 line_idx += 1
 
-        return entries, next_offset, source_name
+        return _slice_with_offset(entries, offset, source_name)
 
     # ── §2 reconstruction when only verifier_<stem>.json exists ─────
     if legacy_evidence and legacy_evidence.is_file():
@@ -1243,9 +1260,44 @@ def _command_stream_entries(run_dir: Path, target: Node, log_path: Path | None,
                 cwd = str(roots.target or "")
         except Exception:
             cwd = ""
-        cmd_str = f"python3 {target.prompt}" if target.prompt else ""
+
+        # r2 fix #7: build the command as ``python3 <recipe_dir>/<basename>``
+        # instead of the relative ``target.prompt`` (``<recipe>/<verifier_ref>``,
+        # which only resolves when cwd is the engine root). ``<recipe_id>`` is
+        # the segment before the first ``/`` in ``target.prompt``;
+        # ``<recipe_dir>`` is resolved via ``recipes_catalog.find_recipe`` with
+        # the engine ``recipes/<recipe>`` fallback.
+        recipe_id, basename = "", ""
+        if target.prompt:
+            prompt = target.prompt
+            if "/" in prompt:
+                recipe_id = prompt.split("/", 1)[0]
+            basename = Path(prompt).name
+        resolved_dir = recipe_dir
+        if resolved_dir is None and recipe_id:
+            try:
+                from mini_ork.recipes_catalog import find_recipe
+                info = find_recipe(recipe_id, home)
+                if info is not None:
+                    resolved_dir = info.path
+            except Exception:
+                resolved_dir = None
+            if resolved_dir is None:
+                engine_root = Path(__file__).resolve().parent.parent.parent
+                candidate = engine_root / "recipes" / recipe_id
+                if candidate.is_dir():
+                    resolved_dir = candidate
+        if resolved_dir and basename:
+            cmd_str = f"python3 {resolved_dir / basename}"
+        elif target.prompt:
+            cmd_str = f"python3 {target.prompt}"
+        else:
+            cmd_str = ""
+
         arg_str = f"cd {cwd} && {cmd_str}" if cwd else cmd_str
-        output_lines = _read_output_lines(str(legacy_evidence), NODE_CMD_LINE_CAP)
+        legacy_evidence_str = str(legacy_evidence)
+        skip_paths.add(legacy_evidence_str)
+        output_lines = _read_output_lines(legacy_evidence_str, NODE_CMD_LINE_CAP)
         entries.append({
             "k": _KIND_TOOL,
             "head": "$",
@@ -1265,7 +1317,52 @@ def _command_stream_entries(run_dir: Path, target: Node, log_path: Path | None,
             "_line": line_idx,
         })
         line_idx += 1
-        return entries, 0, legacy_evidence.name
+
+        # r2 fix #1: legacy runs keep §2b and §2c — every researcher run
+        # predates recording, so this branch is the main case.
+        ev_doc = _read_json_safely(legacy_evidence_str)
+        for e in _subcommand_entries(ev_doc):
+            e["_line"] = line_idx
+            entries.append(e)
+            line_idx += 1
+        try:
+            cmd_logs = sorted(run_dir.glob("_*cmd*.log"))
+        except OSError:
+            cmd_logs = []
+        for cmd_log in cmd_logs:
+            if str(cmd_log) in skip_paths:
+                continue
+            for blk in _parse_cmd_log_blocks(cmd_log):
+                blk["_line"] = line_idx
+                entries.append(blk)
+                line_idx += 1
+
+        for rel in (f"verifier-{stem}.log",):
+            lp = run_dir / rel
+            if lp.is_file() and str(lp) not in skip_paths:
+                e = _log_path_entry(lp, head="log", arg=str(lp),
+                                    line_idx=line_idx, cap=NODE_CMD_LINE_CAP)
+                entries.append(e)
+                line_idx += 1
+        ev_dir = run_dir / "evidence"
+        if ev_dir.is_dir():
+            try:
+                logs = sorted(
+                    [p for p in ev_dir.glob(f"{stem}*.log") if p.is_file()],
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+            except OSError:
+                logs = []
+            for lp in logs:
+                if str(lp) in skip_paths:
+                    continue
+                e = _log_path_entry(lp, head="log", arg=str(lp),
+                                    line_idx=line_idx, cap=NODE_CMD_LINE_CAP)
+                entries.append(e)
+                line_idx += 1
+
+        return _slice_with_offset(entries, offset, legacy_evidence.name)
 
     # ── §2d — built-in steps (rollback, publisher, skips) ────────────
     log_path_x = run_dir / "execute.log"
@@ -1277,11 +1374,35 @@ def _command_stream_entries(run_dir: Path, target: Node, log_path: Path | None,
         id_tag = f"[{target.id}]"
         type_tag = f"[{target.type}]" if target.type else ""
         node_id_tag = f"node_id={target.id}"
-        matched = [
-            ln for ln in all_lines
-            if id_tag in ln or (type_tag and type_tag in ln) or node_id_tag in ln
-            or ln.startswith(id_tag) or (type_tag and ln.startswith(type_tag))
-        ]
+        # r2 kickoff fix #3 — also keep built-in prefix lines that researchers
+        # write without an `[<id>]` tag (e.g. ``[ok] rollback complete``,
+        # ``[fail] rollback``, ``[info] rollback``). The `<id>` in the
+        # kickoff means either the full id or the short type — operators
+        # log ``[ok] rollback`` not ``[ok] rollback_node``. ``[skip]`` is
+        # always ``node_id=<id>`` (the existing shape with a prefix).
+        ok_prefixes: list[str] = [f"[ok] {target.id}"]
+        fail_prefixes: list[str] = [f"[fail] {target.id}"]
+        info_prefixes: list[str] = [f"[info] {target.id}"]
+        skip_prefixes: list[str] = [f"[skip] node_id={target.id}"]
+        if target.type:
+            ok_prefixes.append(f"[ok] {target.type}")
+            fail_prefixes.append(f"[fail] {target.type}")
+            info_prefixes.append(f"[info] {target.type}")
+
+        def _line_matches(ln: str) -> bool:
+            if id_tag in ln or (type_tag and type_tag in ln) or node_id_tag in ln:
+                return True
+            if ln.startswith(id_tag):
+                return True
+            if type_tag and ln.startswith(type_tag):
+                return True
+            for prefixes in (ok_prefixes, fail_prefixes, info_prefixes, skip_prefixes):
+                for p in prefixes:
+                    if p and ln.startswith(p):
+                        return True
+            return False
+
+        matched = [ln for ln in all_lines if _line_matches(ln)]
         if matched:
             entry_lines = [
                 {"t": ln[:LINE_CHARS], "c": "body"}
@@ -1316,11 +1437,24 @@ def _command_stream_entries(run_dir: Path, target: Node, log_path: Path | None,
                         "_line": line_idx,
                     })
                     line_idx += 1
-            return entries, 0, log_path_x.name
+            return _slice_with_offset(entries, offset, log_path_x.name)
 
     # No artefacts at all → caller falls back to existing log path or
     # emits the §2e "nothing was stored" note (build_node handles that).
     return None
+
+
+def _slice_with_offset(entries: list[dict[str, Any]], offset: int,
+                       source_name: str) -> tuple[list[dict[str, Any]], int, str]:
+    """Return ``(entries[offset:], len(entries), source_name)``.
+
+    r2 kickoff fix #4 — append-only offset contract that mirrors
+    ``_stream_entries`` and ``_log_path_entries``: the returned offset is
+    the **total** entry count, so the next poll at that offset returns no
+    duplicates (legacy and built-in too).
+    """
+    start = max(0, int(offset))
+    return entries[start:], len(entries), source_name
 
 
 def _read_output_lines(path: str, cap: int) -> list[dict[str, str]]:
@@ -1366,6 +1500,48 @@ def _read_json_safely(path: str) -> dict[str, Any]:
     return doc if isinstance(doc, dict) else {}
 
 
+def _verifier_pass_flag(run_dir: Path, *, stem: str | None) -> bool | None:
+    """Return the verifier evidence ``pass`` flag, when recoverable.
+
+    r2 kickoff fix #5: when the command branch has no recoverable rc
+    (legacy / built-in entries), derive the pill from the verifier
+    evidence's ``pass`` flag so ``pass: false`` still colours the pill
+    red. Looks at ``<run_dir>/verifier_<stem>.json`` first, then
+    ``<run_dir>/evidence/<stem>*.json|.log``. Returns ``None`` when no
+    evidence JSON can be parsed (caller falls through to node state).
+    """
+    candidates: list[Path] = []
+    if stem:
+        candidates.append(run_dir / f"verifier_{stem}.json")
+        ev_dir = run_dir / "evidence"
+        if ev_dir.is_dir():
+            try:
+                candidates.extend(
+                    sorted(
+                        [p for p in ev_dir.glob(f"{stem}*.json") if p.is_file()],
+                        key=lambda p: p.stat().st_mtime,
+                        reverse=True,
+                    )
+                )
+                candidates.extend(
+                    sorted(
+                        [p for p in ev_dir.glob(f"{stem}*.log") if p.is_file()],
+                        key=lambda p: p.stat().st_mtime,
+                        reverse=True,
+                    )
+                )
+            except OSError:
+                pass
+    for path in candidates:
+        doc = _read_json_safely(str(path))
+        if not doc:
+            continue
+        val = doc.get("pass")
+        if isinstance(val, bool):
+            return val
+    return None
+
+
 def _log_path_entry(log_path: Path, *, head: str, arg: str,
                     line_idx: int, cap: int) -> dict[str, Any]:
     try:
@@ -1391,7 +1567,15 @@ def _log_path_entry(log_path: Path, *, head: str, arg: str,
 
 
 def _subcommand_entries(ev_doc: dict[str, Any]) -> list[dict[str, Any]]:
-    """Mine sub-commands from a verifier evidence JSON (§2b)."""
+    """Mine sub-commands from a verifier evidence JSON (§2b).
+
+    r2 kickoff fix #2 — researcher ``gate_cmd`` + ``gate_cmd_output_tail`` +
+    ``gate_cmd_exit`` keys now collapse into a single entry: ``arg`` is the
+    command (``gate_cmd`` or a sentinel when the key is missing), ``lines``
+    is the output tail, with a muted ``exit <n>`` line appended. The
+    surfaces[] / target shape maps to ``arg=target`` + ``lines=status · reason``
+    on a single line.
+    """
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
 
@@ -1413,13 +1597,66 @@ def _subcommand_entries(ev_doc: dict[str, Any]) -> list[dict[str, Any]]:
             "_src": "subcmd",
         })
 
-    # gate_cmd / gate_cmd_output_tail / gate_cmd_exit — researcher verifier
-    for key in ("gate_cmd", "gate_cmd_output_tail", "gate_cmd_exit"):
-        v = ev_doc.get(key)
-        if isinstance(v, str) and v.strip():
-            _add("subcmd", v.strip(), [], None)
+    # gate_cmd / gate_cmd_output_tail / gate_cmd_exit — researcher verifier.
+    # r2: ONE entry, not three. ``gate_cmd_exit`` may be int (legacy fixture
+    # ``verifier_cycle-gate.json``) or str; coerce, do not string-compare.
+    gate_cmd_raw = ev_doc.get("gate_cmd")
+    if gate_cmd_raw is not None:
+        arg = str(gate_cmd_raw).strip() if isinstance(gate_cmd_raw, str) else (
+            str(gate_cmd_raw).strip() if str(gate_cmd_raw).strip() else ""
+        )
+        if not arg:
+            arg = "the step's gate command"
+    else:
+        arg = "the step's gate command"
 
-    # surfaces[] / surface:cmd — live_smoke verifier
+    tail_raw = ev_doc.get("gate_cmd_output_tail")
+    if isinstance(tail_raw, str):
+        tail_lines = tail_raw.splitlines()
+    elif isinstance(tail_raw, list):
+        tail_lines = [str(x) for x in tail_raw]
+    else:
+        tail_lines = []
+
+    exit_raw = ev_doc.get("gate_cmd_exit")
+    exit_int: int | None = None
+    if isinstance(exit_raw, bool):
+        exit_int = int(exit_raw)
+    elif isinstance(exit_raw, int):
+        exit_int = exit_raw
+    elif isinstance(exit_raw, str):
+        try:
+            exit_int = int(exit_raw.strip())
+        except ValueError:
+            exit_int = None
+
+    # Reuse ``_add`` so dedup / line-cap semantics stay aligned with the rest
+    # of the function; the muted ``exit <n>`` line is appended here.
+    if tail_lines or exit_int is not None:
+        key = f"subcmd|{arg}"
+        if key not in seen:
+            seen.add(key)
+            body = [
+                {"t": ln[:LINE_CHARS], "c": "body"}
+                for ln in tail_lines[:NODE_CMD_LINE_CAP]
+            ]
+            if exit_int is not None:
+                body.append({"t": f"exit {exit_int}", "c": "muted"})
+            out.append({
+                "k": _KIND_TOOL,
+                "head": "subcmd",
+                "arg": arg,
+                "lines": body or [{"t": "(no output)", "c": "muted"}],
+                "_src": "subcmd",
+            })
+    elif arg != "the step's gate command":
+        # ``gate_cmd`` present but no tail / no exit — emit one entry to
+        # preserve the command text in the stream.
+        _add("subcmd", arg, [], None)
+
+    # surfaces[] / surface:cmd — live_smoke verifier. r2: arg=target,
+    # lines=status · reason on a single line (not the surfaces[].lines
+    # output, which was the wrong field for the stream view).
     surfaces = ev_doc.get("surfaces")
     if isinstance(surfaces, list):
         for s in surfaces:
@@ -1427,15 +1664,17 @@ def _subcommand_entries(ev_doc: dict[str, Any]) -> list[dict[str, Any]]:
                 continue
             if s.get("surface") != "cmd":
                 continue
-            target = str(s.get("target") or "")
-            lines = s.get("lines") or []
-            if isinstance(lines, list):
-                lines = [str(ln) for ln in lines]
-            else:
-                lines = []
-            _add("subcmd", target, lines, s.get("rc"))
+            target = str(s.get("target") or "").strip()
+            if not target:
+                continue
+            status = str(s.get("status") or "").strip()
+            reason = str(s.get("reason") or "").strip()
+            line = f"{status} · {reason}".strip(" ·") or target
+            _add("subcmd", target, [line], None)
     if ev_doc.get("surface") == "cmd" and ev_doc.get("target"):
-        _add("subcmd", str(ev_doc.get("target") or ""), [], ev_doc.get("rc"))
+        target = str(ev_doc.get("target") or "").strip()
+        if target:
+            _add("subcmd", target, [str(ev_doc.get("reason") or ev_doc.get("status") or "")], None)
 
     # _*cmd*.log files in the run dir — handled separately by
     # ``_parse_cmd_log_blocks`` (the JSON is one source, the log is the
@@ -2232,6 +2471,7 @@ def build_node(home: Path, run_id: str, node_id: str, view: str | None = None,
     transcript_has_result = _transcript_has_result(session_path) if session_path else False
     transcript_entry_count = 0  # total transcript entries (full file, not poll slice)
     command_backed_used = False
+    command_backed_no_artefacts = False  # helper returned None (vs. []-at-end of stream)
     command_rc: int | None = None
     command_source_name = ""
     if view == "stream":
@@ -2260,6 +2500,8 @@ def build_node(home: Path, run_id: str, node_id: str, view: str | None = None,
             cmd = _command_stream_entries(
                 run_dir, target, log_path,
                 getattr(run_obj, "recipe_dir", None),
+                home=home,
+                offset=int(offset),
             )
             if cmd is not None:
                 stream_entries, next_offset, command_source_name = cmd
@@ -2277,6 +2519,8 @@ def build_node(home: Path, run_id: str, node_id: str, view: str | None = None,
                             except (ValueError, IndexError):
                                 command_rc = None
                             break
+            else:
+                command_backed_no_artefacts = True
                 # Merge steering rows so the operator_steering UX is
                 # identical across the two branches.
                 steer_only = _steer_entries(run_id, home, target)
@@ -2306,13 +2550,14 @@ def build_node(home: Path, run_id: str, node_id: str, view: str | None = None,
                 is_live=is_live,
             )
         # Kickoff §2e — non-agent node with NO session, NO log, NO
-        # command artefacts → one note entry. Fires when the command
-        # branch is gated by ``_is_command_backed`` AND there is no
-        # other source (no log_path either). When ``log_path`` is set
-        # the existing log line stream serves the consumer; we do not
-        # short-circuit it.
-        if (command_backed_branch and not stream_entries
-                and session_path is None and log_path is None):
+        # command artefacts → one note entry. Fires only on the first
+        # poll (``offset == 0``) when the helper returned ``None`` —
+        # polling past the end of a real stream must NOT re-emit this
+        # note, otherwise the consumer would see it duplicate with each
+        # poll (r2 kickoff fix #4 — append-only offset).
+        if (command_backed_no_artefacts and not stream_entries
+                and session_path is None and log_path is None
+                and int(offset) == 0):
             note_text = "No command or output was stored for this node."
             stream_entries = [{
                 "k": _KIND_NOTE,
@@ -2327,15 +2572,29 @@ def build_node(home: Path, run_id: str, node_id: str, view: str | None = None,
     status, status_c = _stream_status(target, session_path is not None,
                                       log_path is not None, is_live,
                                       transcript_entry_count)
-    # Kickoff ide-node-commands §2f — override the pill when the
-    # command branch owns the stream. ``command_rc`` comes from the
-    # recorded ``rc``; None means we couldn't recover it, in which case
-    # fall back to the existing pill.
-    if command_backed_used and command_rc is not None:
-        if command_rc == 0:
-            status, status_c = ("finished · command", "green")
-        else:
+    # Kickoff ide-node-commands §2f — override the pill when the command
+    # branch owns the stream. r2 (fix #5): widen to a non-zero rc, an
+    # evidence ``pass: false``, or a failed node state — and never let the
+    # underlying ``_stream_status`` emit ``"no transcript"`` when the
+    # command branch already produced entries.
+    if command_backed_used and stream_entries:
+        node_failed = (target.state == "failed")
+        # r2 kickoff fix #5 — never let ``command_rc == 0`` mask a refuted
+        # verifier verdict. The pill widens to red whenever rc != 0, the
+        # verifier wrote ``{"pass": false}`` in its evidence, or the node
+        # state is failed. When none of those trip, default to green so
+        # ``_stream_status`` cannot leak ``"no transcript"`` while entries
+        # exist.
+        ev_pass = _verifier_pass_flag(run_dir, stem=_verifier_stem(target))
+        red = (
+            (command_rc is not None and command_rc != 0)
+            or ev_pass is False
+            or node_failed
+        )
+        if red:
             status, status_c = ("failed · command", "red")
+        else:
+            status, status_c = ("finished · command", "green")
     elif command_backed_used and not stream_entries:
         # §2e — single empty-note pill state.
         status, status_c = ("no command recorded", "yellow")

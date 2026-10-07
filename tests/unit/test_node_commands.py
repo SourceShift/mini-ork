@@ -411,3 +411,232 @@ def test_command_stream_entries_returns_none_when_no_artefacts(home: Path) -> No
     # when execute.log has lines for this node — in _seed_run we did not
     # write such lines, so None is the expected outcome.
     assert out is None or (isinstance(out, tuple) and out[0] == [])
+
+
+# ── r2 — kickoff fix #9 (pinning tests) ──────────────────────────────────────
+
+
+def test_legacy_researcher_run_emits_subcmd_and_logs(home: Path) -> None:
+    """Legacy researcher run → `$` + reconstructed note + ONE gate entry with
+    an ``exit 1`` muted line, two smoke-log entries from `_smoke_cmd_W5-91.log`,
+    and the verifier-cycle-gate.log itself (kickoff fix #1 + #2).
+    """
+    run_dir = _seed_run(home)
+    legacy = run_dir / "verifier_static-check.json"
+    legacy.write_text(json.dumps({
+        "pass": False,
+        "errors": ["refuted"],
+        "gate_cmd": "python3 -m researcher.cli cycle_gate",
+        "gate_cmd_output_tail": "all checks passed\nrefuted by verifier",
+        "gate_cmd_exit": 1,
+    }))
+    # Two `$ <cmd>` blocks (researcher smoke shape).
+    (run_dir / "_smoke_cmd_W5-91.log").write_text(
+        "$ python3 -m smoke.cli step_one\n"
+        "step one output\n"
+        "[rc=0]\n"
+        "$ python3 -m smoke.cli step_two\n"
+        "step two output\n"
+        "[rc=0]\n"
+    )
+    # The verifier's own log (stem-keyed: ``verifier-<stem>.log``).
+    (run_dir / "verifier-static-check.log").write_text("refuted: 1 issue\n")
+    out = build_node(home, RUN, "static_check_verifier", view="stream")
+    assert out["ok"] is True
+    entries = out["entries"]
+    heads = [e.get("head") for e in entries]
+    # `$` command + reconstructed note + 1 gate subcmd (no longer 3).
+    assert heads[0] == "$"
+    assert "reconstructed" in heads
+    # 1 subcmd from the gate_cmd JSON + 2 from the smoke log = 3 total.
+    subcmd_entries = [e for e in entries if e.get("_src") == "subcmd"]
+    assert len(subcmd_entries) == 3, [e.get("arg") for e in subcmd_entries]
+    gate = next(e for e in subcmd_entries if "cycle_gate" in (e.get("arg") or ""))
+    assert gate is not None
+    exit_lines = [ln for ln in gate["lines"] if ln["t"].startswith("exit ")]
+    assert exit_lines, gate["lines"]
+    assert exit_lines[0]["t"] == "exit 1"
+    assert exit_lines[0]["c"] == "muted"
+    # Two smoke entries from the log.
+    smoke_args = [e.get("arg") or "" for e in subcmd_entries]
+    assert any("step_one" in a for a in smoke_args)
+    assert any("step_two" in a for a in smoke_args)
+    # The verifier-static-check.log was added as a log entry.
+    log_args = [e.get("arg") or "" for e in entries if e.get("_src") == "log"]
+    assert any("verifier-static-check.log" in a for a in log_args)
+
+
+def test_legacy_gate_cmd_exit_int_is_coerced() -> None:
+    """``gate_cmd_exit`` may be int in legacy fixtures; coerce, don't str() it."""
+    cycle_gate = {
+        "pass": False,
+        "gate_cmd": "python3 -m researcher.cli cycle_gate",
+        "gate_cmd_output_tail": "tail line",
+        "gate_cmd_exit": 1,  # int, not str
+    }
+    from mini_ork.ide_pages.node import _subcommand_entries
+    subs = _subcommand_entries(cycle_gate)
+    assert len(subs) == 1, subs
+    exit_lines = [ln for ln in subs[0]["lines"] if ln["t"].startswith("exit ")]
+    assert exit_lines[0]["t"] == "exit 1"
+
+
+def test_legacy_gate_cmd_missing_falls_back_to_sentinel() -> None:
+    """When ``gate_cmd`` is absent, emit a single subcmd with the sentinel."""
+    cycle_gate = {
+        "pass": False,
+        "gate_cmd_output_tail": "tail without gate_cmd",
+        "gate_cmd_exit": 0,
+    }
+    from mini_ork.ide_pages.node import _subcommand_entries
+    subs = _subcommand_entries(cycle_gate)
+    assert len(subs) == 1, subs
+    assert subs[0]["arg"] == "the step's gate command"
+    exit_lines = [ln for ln in subs[0]["lines"] if ln["t"].startswith("exit ")]
+    assert exit_lines[0]["t"] == "exit 0"
+
+
+def test_rollback_execute_log_keeps_built_in_prefix_lines(home: Path) -> None:
+    """execute.log with ``[ok] rollback complete`` / ``[fail] rollback`` keeps both."""
+    run_dir = _seed_run(home)
+    (run_dir / "execute.log").write_text(
+        f"[rollback] discard_worktree: {run_dir}\n"
+        f"[ok] rollback complete\n"
+        f"[rollback] node_id=rollback_node\n"
+        f"[fail] rollback — nothing to roll back\n"
+        f"[info] rollback\n"
+    )
+    (run_dir / "rolled-back.json").write_text(json.dumps({"ok": False}))
+    out = build_node(home, RUN, "rollback_node", view="stream")
+    entries = out["entries"]
+    built_in = [e for e in entries if e.get("head") == "built-in"]
+    assert built_in, [e["head"] for e in entries]
+    line_texts = " | ".join(ln["t"] for ln in built_in[0]["lines"])
+    assert "[ok] rollback complete" in line_texts
+    assert "[fail] rollback" in line_texts
+    assert "[info] rollback" in line_texts
+
+
+def test_offset_poll_returns_nothing_new(home: Path) -> None:
+    """Polling at the returned offset yields an empty list and the same offset."""
+    run_dir = _seed_run(home)
+    node_cmd = run_dir / "node-cmd"
+    node_cmd.mkdir()
+    record = {
+        "argv": ["python3", "verifiers/static-check.py"],
+        "cmd": "python3 verifiers/static-check.py",
+        "cwd": str(home),
+        "env": {},
+        "started_at": T0 + 0.0,
+        "ended_at": T0 + 1.0,
+        "rc": 0,
+        "output_path": str(run_dir / "evidence" / "static-check.log"),
+    }
+    (node_cmd / "verifier_static-check.json").write_text(json.dumps(record))
+    (run_dir / "evidence").mkdir(exist_ok=True)
+    (run_dir / "evidence" / "static-check.log").write_text("OK\n")
+    # First poll — full entries.
+    first = build_node(home, RUN, "static_check_verifier", view="stream", offset=0)
+    assert first["ok"] is True
+    first_entries = first["entries"]
+    assert first_entries, first
+    next_offset = int(first["offset"])
+    assert next_offset == len(first_entries), (next_offset, len(first_entries))
+    # Second poll — at the returned offset, no duplicates.
+    second = build_node(home, RUN, "static_check_verifier", view="stream",
+                        offset=next_offset)
+    assert second["ok"] is True
+    assert second["entries"] == [], second["entries"]
+    assert int(second["offset"]) == next_offset
+
+
+def test_pill_red_when_rc_zero_but_pass_false(home: Path) -> None:
+    """``rc=0`` BUT verifier evidence ``pass: false`` → red ``failed · command``.
+
+    r2 kickoff fix #5 widens the pill beyond just the recorded rc: when
+    the recorded rc is 0 but the verifier wrote ``{"pass": false}`` in its
+    evidence log, the pill must still colour red so the operator sees the
+    truth instead of a green "finished · command" sticker over a refuted
+    verdict.
+    """
+    run_dir = _seed_run(home)
+    node_cmd = run_dir / "node-cmd"
+    node_cmd.mkdir()
+    record = {
+        "argv": ["python3", "verifiers/static-check.py"],
+        "cmd": "python3 verifiers/static-check.py",
+        "cwd": str(home),
+        "env": {},
+        "started_at": T0 + 0.0,
+        "ended_at": T0 + 1.0,
+        "rc": 0,
+        "output_path": str(run_dir / "evidence" / "static-check.log"),
+    }
+    (node_cmd / "verifier_static-check.json").write_text(json.dumps(record))
+    (run_dir / "evidence").mkdir(exist_ok=True)
+    (run_dir / "evidence" / "static-check.log").write_text(
+        json.dumps({"pass": False, "errors": ["broken"]}),
+    )
+    out = build_node(home, RUN, "static_check_verifier", view="stream")
+    assert out["status"] == "failed · command", out["status"]
+    assert out["status_c"] == "red"
+
+
+def test_pill_red_for_legacy_pass_false(home: Path) -> None:
+    """Legacy run with ``pass: false`` evidence → red ``failed · command``."""
+    run_dir = _seed_run(home)
+    (run_dir / "verifier_static-check.json").write_text(
+        json.dumps({"pass": False, "errors": ["legacy failed"]}),
+    )
+    out = build_node(home, RUN, "static_check_verifier", view="stream")
+    assert out["ok"] is True
+    assert out["status"] == "failed · command", out["status"]
+    assert out["status_c"] == "red"
+
+
+def test_no_duplicate_log_when_record_output_path_matches(home: Path) -> None:
+    """A log whose absolute path equals ``output_path`` must not appear twice."""
+    run_dir = _seed_run(home)
+    node_cmd = run_dir / "node-cmd"
+    node_cmd.mkdir()
+    log_path = run_dir / "evidence" / "static-check.log"
+    log_path.parent.mkdir(exist_ok=True)
+    log_path.write_text("OUT\n")
+    record = {
+        "argv": ["python3", "verifiers/static-check.py"],
+        "cmd": "python3 verifiers/static-check.py",
+        "cwd": str(home),
+        "env": {},
+        "started_at": T0 + 0.0,
+        "ended_at": T0 + 1.0,
+        "rc": 0,
+        "output_path": str(log_path),  # == the log path
+    }
+    (node_cmd / "verifier_static-check.json").write_text(json.dumps(record))
+    out = build_node(home, RUN, "static_check_verifier", view="stream")
+    log_entries = [e for e in out["entries"] if e.get("_src") == "log"]
+    assert len(log_entries) == 0, [e.get("arg") for e in log_entries]
+
+
+def test_reconstructed_path_uses_recipe_dir(home: Path) -> None:
+    """Legacy reconstruction uses ``python3 <recipe_dir>/<basename>``, not the
+    relative ``target.prompt`` (kickoff fix #7). The recipe lives at the
+    engine's ``recipes/demo-recipe``, so ``python3 recipes/demo-recipe/verifiers/static-check.py``
+    is the rendered command.
+    """
+    run_dir = _seed_run(home)
+    from mini_ork.ide_pages.run import _load
+    run_obj = _load(home, RUN)
+    assert run_obj is not None
+    static_check = next(n for n in run_obj.nodes
+                        if n.id == "static_check_verifier")
+    # Patch the node's prompt so the reconstructor uses the demo recipe.
+    object.__setattr__(static_check, "prompt", "demo-recipe/verifiers/static-check.py")
+    (run_dir / "verifier_static-check.json").write_text(
+        json.dumps({"pass": True}),
+    )
+    out = build_node(home, RUN, "static_check_verifier", view="stream")
+    entries = out["entries"]
+    first = entries[0]
+    assert "static-check.py" in (first.get("arg") or "")
+    assert "demo-recipe" in (first.get("arg") or "")
