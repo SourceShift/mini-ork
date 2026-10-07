@@ -67,6 +67,7 @@ _NATIVE_MODULE_SUBS = {
     "topology": "mini_ork.cli.topology",
     "usage-report": "mini_ork.observability.usage_report",
     "watchdog": "mini_ork.orchestration.watchdog",
+    "reap": "mini_ork.orchestration.run_reaper",
     "acp": "mini_ork.cli.acp_cmd",
     "mcp-context": "mini_ork.cli.mcp_context_cmd",
     "zed": "mini_ork.cli.zed_cmd",
@@ -474,6 +475,7 @@ def _run_lifecycle(argv, root) -> int:
         else:
             inner.append(a)
     sink: dict = {}
+    crashed = False
     # Run-level boundary: everything the lifecycle publishes (artifact path,
     # run dir, per-node MO_* vars) is wiped from the contextvar layer when
     # the run exits. The lifecycle owns the run context; in-process callers
@@ -482,6 +484,9 @@ def _run_lifecycle(argv, root) -> int:
     with run_context_scope({}):
         try:
             rc = _run_lifecycle_impl(inner, root, sink)
+        except BaseException:
+            crashed = True
+            raise
         finally:
             try:
                 _release_remote_session()
@@ -489,6 +494,12 @@ def _run_lifecycle(argv, root) -> int:
                 # End the run principal on every return path and on exceptions,
                 # and pop the handle so --json never emits the object.
                 concord_run.stop(sink.pop("_concord", None))
+            # A run that leaves here still non-terminal would read as in flight
+            # forever. Teardown is best-effort: it MUST NOT change the rc.
+            try:
+                _close_run_record(sink, crashed=crashed)
+            except Exception as exc:  # noqa: BLE001 — teardown is best-effort
+                sys.stderr.write(f"[warn] run record close failed: {exc}\n")
             # Raise task_runs.cost_usd to the ledger total so every reporter
             # (web UI, MCP list_runs / run_status / wait_for_run, ACP history,
             # the ``mini_ork_result`` line) shows the same number. Best-effort:
@@ -521,6 +532,27 @@ def _release_remote_session() -> None:
                                env=context_env_snapshot())
     except Exception as exc:  # noqa: BLE001 — teardown is best-effort; the node TTLs it
         sys.stderr.write(f"[warn] remote session release failed: {exc}\n")
+
+
+def _close_run_record(sink: dict, *, crashed: bool) -> None:
+    """End the run's ``task_runs`` row, then drop its ``.pid``.
+
+    Status first, ``.pid`` second: a kill between the two leaves a dead
+    ``.pid`` on a terminal row, which the reaper ignores; the reverse order
+    would leave a non-terminal row with no owner record — unprovable.
+    """
+    run_dir = sink.pop("_pid_run_dir", None)
+    if not run_dir:
+        return  # dry run, or the run never started (budget preflight)
+    from mini_ork.learning.advantage_store import resolve_db_path
+    from mini_ork.orchestration import run_reaper
+
+    try:
+        db = resolve_db_path(context_env("MINI_ORK_DB") or None)
+        if os.path.isfile(db):
+            run_reaper.close_run_record(db, sink.get("run_id") or "", Path(run_dir), crashed=crashed)
+    finally:
+        run_reaper.release_pid_file(Path(run_dir))
 
 
 def _reconcile_run_cost(sink: dict) -> None:
@@ -726,6 +758,17 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
         sys.stderr.write(f"[concord] run principal not started: {exc}\n")
         sink["_concord"] = None
 
+    # Owner record: <run_dir>/.pid names this process from before classify
+    # until teardown, so a row whose .pid process is gone is provably orphaned
+    # (orchestration/run_reaper.py). Same home the run dir resolves to below.
+    if os.environ.get("MINI_ORK_DRY_RUN", "0") != "1":
+        from mini_ork.orchestration import run_reaper
+
+        pid_home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
+        pid_run_dir = Path(pid_home) / "runs" / run_id
+        run_reaper.claim_pid_file(pid_run_dir)
+        sink["_pid_run_dir"] = str(pid_run_dir)
+
     # derived task_class from recipe's task_class.yaml::name
     derived = ""
     tc_yaml = os.path.join(rbase, "recipes", recipe, "task_class.yaml")
@@ -833,6 +876,11 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
     execute_stderr = io.StringIO()
     with contextlib.redirect_stdout(execute_stdout), contextlib.redirect_stderr(execute_stderr):
         run_rc = mini_ork_execute.main([], root=root)
+    if sink.get("_pid_run_dir"):
+        # execute drops .pid in its own finally; this process still owns the run.
+        from mini_ork.orchestration import run_reaper
+
+        run_reaper.claim_pid_file(Path(sink["_pid_run_dir"]))
     execute_out = execute_stdout.getvalue()
     execute_err = execute_stderr.getvalue()
     sys.stdout.write(execute_out)

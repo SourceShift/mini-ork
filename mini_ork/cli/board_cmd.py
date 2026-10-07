@@ -526,6 +526,13 @@ def main(rest: list[str], root: str) -> int:
         what = "a page key" if args.verb == "page" else "a run id"
         sys.stderr.write(f"mini-ork board {args.verb}: {what} is required\n")
         return 2
+    # Reads first fail the runs whose dispatcher provably died, so no view
+    # below lists a dead run as in flight (orchestration/run_reaper.py).
+    reap_errors: dict[str, str] = {}
+    if args.verb in ("show", "page"):
+        from mini_ork.orchestration.run_reaper import reap
+
+        _section(reap_errors, "reaper", lambda: reap(home), [])
     if args.verb == "page":
         from mini_ork.ide_pages import build_page
 
@@ -554,6 +561,8 @@ def main(rest: list[str], root: str) -> int:
         payload = _act_steer(home, args.run_id, args.text, args.role, args.severity)
     else:
         payload = act(home, args.verb, args.run_id)
+    if reap_errors:
+        payload.setdefault("errors", {}).update(reap_errors)
     sys.stdout.write(json.dumps(payload, default=str) + "\n")
     return 0 if payload.get("ok", True) is not False else 1
 
