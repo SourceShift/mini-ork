@@ -151,3 +151,21 @@ def test_reproduces_the_k0_snapshot_baselines() -> None:
     assert (m["verify"]["vacuous"], m["verify"]["traces"]) == (343, 994)
     assert (m["reviewer"]["failures"], m["reviewer"]["traces"]) == (200, 550)
     assert m["crashed"] == {"runs": 37, "cost_usd": 64.67}
+
+
+def test_shadow_would_blocks_by_recipe_and_reason(home: Path, tmp_path: Path) -> None:
+    def rep(rid, obj):
+        (home / "runs" / rid / "probe-validity.json").write_text(json.dumps(obj), encoding="utf-8")
+    rep("r-pub", {"mode": "shadow", "would_block": False, "reasons": []})
+    rep("r-fail", {"mode": "shadow", "would_block": True, "reasons": ["verify_vacuous"]})
+    rep("r-open", {"mode": "enforce", "would_block": True, "reasons": ["aliased_probe"]})  # not shadow: ignored
+    m = json.loads(_run(["sdd", "--db", str(home / "state.db"), "--json"])[1])
+    assert m["shadow"] == {"n": 2, "would_block": 1,
+                           "by_recipe": {"code-fix": {"n": 2, "would_block": 1, "reasons": {"verify_vacuous": 1}}}}
+    jsonschema.validate(m, SCHEMA)
+    rc, md, _ = _run(["sdd", "--db", str(home / "state.db")])
+    assert "1/2 would block" in md and "| code-fix | 2 | 1 | verify_vacuous 1 |" in md
+    frozen = tmp_path / "rd.json"
+    _run(["sdd", "--db", str(home / "state.db"), "--write-run-dir-baseline", str(frozen), "--json"])
+    m2 = json.loads(_run(["sdd", "--db", str(home / "state.db"), "--run-dir-baseline", str(frozen), "--json"])[1])
+    assert m2["shadow"] is None  # a frozen baseline predates shadow runs

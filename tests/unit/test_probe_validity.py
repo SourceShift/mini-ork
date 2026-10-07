@@ -129,11 +129,9 @@ def test_absolute_target_paths_are_remapped_to_the_base_tree(repo) -> None:
 
 # ── AC3: did verify prove anything ──────────────────────────────────────────
 
-@pytest.fixture
-def db(tmp_path: Path) -> str:
-    h = tmp_path / ".mini-ork"
-    h.mkdir()
-    path = str(h / "state.db")
+def _make_db(home: Path) -> str:
+    home.mkdir(parents=True, exist_ok=True)
+    path = str(home / "state.db")
     rc, _o, err = mig.init_db(db=path, root=str(REPO))
     assert rc == 0, err
     con = sqlite3.connect(path)
@@ -143,6 +141,11 @@ def db(tmp_path: Path) -> str:
     con.commit()
     con.close()
     return path
+
+
+@pytest.fixture
+def db(tmp_path: Path) -> str:
+    return _make_db(tmp_path / ".mini-ork")
 
 
 def _verifier_end(db: str, node: str, ms: int, finish: str) -> None:
@@ -284,3 +287,68 @@ def test_sdd_test_validity_flags_aliasing_only_with_the_flag(tmp_path, monkeypat
     out, rows = tv.check_spec(tmp_path, card, timeout=10, env=None)
     assert [r["status"] for r in rows] == ["FAILS_TODAY", "FAILS_TODAY"]
     assert any(v.startswith("aliased_probe") for v in out) is aliased
+
+
+# ── shadow mode (sdd-i1-shadow) ─────────────────────────────────────────────
+
+def test_mode_parsing() -> None:
+    assert pv.mode({}) == "off" and pv.mode({"MO_PROBE_VALIDITY": "0"}) == "off"
+    assert pv.mode({"MO_PROBE_VALIDITY": "1"}) == "enforce" and pv.mode({"MO_PROBE_VALIDITY": "shadow"}) == "shadow"
+    assert pv.mode({"MO_PROBE_VALIDITY": "yes"}) == "off"
+    assert pv.enabled({"MO_PROBE_VALIDITY": "1"}) and not pv.enabled({"MO_PROBE_VALIDITY": "shadow"})
+
+
+def _arm(tmp_path: Path, name: str, monkeypatch, flag, capsys):
+    """One publisher run in its own dir/DB/repo; returns comparable outputs."""
+    root = tmp_path / name
+    root.mkdir()
+    r = root / "target"
+    r.mkdir()
+    for args in (("init", "-q"), ("config", "user.email", "t@t"), ("config", "user.name", "t")):
+        _git(r, *args)
+    (r / "a.py").write_text("x = 1\n")
+    _git(r, "add", "a.py")
+    _git(r, "commit", "-qm", "base")
+    base = _git(r, "rev-parse", "HEAD")
+    db = _make_db(root / ".mini-ork")
+    capsys.readouterr()
+    rc, status, notes, report = _publish(root, monkeypatch, db, r, base, flag=flag)
+    out = capsys.readouterr()
+    norm = lambda t: t.replace(str(root), "<ROOT>")  # noqa: E731
+    return rc, status, notes, report, norm(out.out), norm(out.err)
+
+
+def test_shadow_is_behaviour_identical_to_off_apart_from_its_writes(tmp_path, monkeypatch, capsys) -> None:
+    # The fixture enforce mode refuses (no verifier evidence at all).
+    off = _arm(tmp_path, "off", monkeypatch, None, capsys)
+    shadow = _arm(tmp_path, "shadow", monkeypatch, "shadow", capsys)
+    assert shadow[0] == off[0] == (0, "done")          # same return
+    assert shadow[1] == off[1] == "published"          # same final status
+    assert shadow[4] == off[4] and shadow[5] == off[5]  # same stdout / stderr
+    # ...and the only differences are the two writes:
+    assert off[3] is None and "[shadow]" not in off[2]
+    assert shadow[3]["mode"] == "shadow" and shadow[3]["would_block"] is True
+    assert shadow[3]["reasons"] == ["verify_vacuous"]
+    assert "[shadow] would block: verify_vacuous" in shadow[2]
+
+
+def test_shadow_pass_writes_its_report_but_no_note(tmp_path, monkeypatch, db, repo) -> None:
+    r, base = repo
+    _passing_verifier(db, tmp_path)
+    rc, status, notes, report = _publish(tmp_path, monkeypatch, db, r, base, flag="shadow",
+                                         checks=[{"id": "c1", "acceptance_ref": "AC1", "command": "test -f new.txt"}])
+    assert rc == (0, "done") and status == "published"
+    assert report["would_block"] is False and report["reasons"] == [] and "[shadow]" not in notes
+
+
+def test_shadow_never_turns_on_sdd_aliasing(tmp_path, monkeypatch) -> None:
+    tv = _load_test_validity(monkeypatch)
+    monkeypatch.setenv("MO_PROBE_VALIDITY", "shadow")
+    (tmp_path / "gates").mkdir()
+    card = {"spec_id": "S1", "source_hash": "h",
+            "acceptance": [{"id": "AC1", "gate": {"kind": "cmd"}}, {"id": "AC2", "gate": {"kind": "cmd"}}]}
+    probe = {"kind": "cmd", "probe": "false", "expect": "exit 0"}
+    (tmp_path / "gates" / "S1.json").write_text(json.dumps({"spec_id": "S1", "source_hash": "h", "probes": [
+        {**probe, "gate_id": "G1", "acceptance_ref": "AC1"}, {**probe, "gate_id": "G2", "acceptance_ref": "AC2"}]}))
+    out, _rows = tv.check_spec(tmp_path, card, timeout=10, env=None)
+    assert not any(v.startswith("aliased_probe") for v in out)

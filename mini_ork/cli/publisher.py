@@ -233,10 +233,12 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
             set_status(db, run_id, "failed")
             return 0, "levels_unverified"
         print(f"  [ok] publisher: level gate pass (required={rep['levels_required'] or None})")
-    # ── probe validity (I1, MO_PROBE_VALIDITY=1, default OFF): a verify that
-    # proved nothing, an aliased probe, or a probe that already passes on the
-    # untouched tree cannot publish.
-    if context_env("MO_PROBE_VALIDITY", "0") == "1":
+    # ── probe validity (I1, MO_PROBE_VALIDITY=1|shadow, default OFF): a verify
+    # that proved nothing, an aliased probe, or a probe that already passes on
+    # the untouched tree cannot publish. `shadow` evaluates and records what it
+    # would block, but never blocks and prints nothing.
+    _pv_mode = context_env("MO_PROBE_VALIDITY", "0")
+    if _pv_mode in ("1", "shadow"):
         from mini_ork.verify import probe_validity as _pv  # noqa: PLC0415
         roots = load_run_roots(run_dir) if run_dir else None
         target = (roots.target if roots else "") or context_env("MO_TARGET_CWD", "")
@@ -245,13 +247,19 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
             plan = json.load(open(plan_path, encoding="utf-8")) if plan_path else {}
         except (OSError, ValueError):
             plan = {}
+        shadow = _pv_mode == "shadow"
         ok, reason, _report = _pv.publish_gate(run_dir=run_dir, db=db, run_id=run_id, target_repo=target,
-                                               plan=plan if isinstance(plan, dict) else {})
-        if not ok:
+                                               plan=plan if isinstance(plan, dict) else {},
+                                               gate_mode="shadow" if shadow else "enforce")
+        if shadow:
+            if not ok:
+                _pv.record_note(db, run_id, f"[shadow] would block: {reason}")
+        elif not ok:
             print(f"  [BLOCK] probe-validity: {reason} — publish refused (probe-validity.json)")
             _pv.record_note(db, run_id, f"probe_validity: {reason}")
             return 1, "verdict_fail"
-        print("  [ok] probe-validity: pre-publish pass")
+        else:
+            print("  [ok] probe-validity: pre-publish pass")
     # ── artifact contract
     contract = (os.path.join(_recipe_root(root), "recipes", recipe, "artifact_contract.yaml")
                 if recipe else "")

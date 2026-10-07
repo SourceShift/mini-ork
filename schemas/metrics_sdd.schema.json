@@ -11,7 +11,8 @@
     "verify",
     "reviewer",
     "per_recipe",
-    "run_dirs"
+    "run_dirs",
+    "shadow"
   ],
   "additionalProperties": false,
   "properties": {
@@ -353,6 +354,61 @@
                 "number",
                 "null"
               ]
+            }
+          }
+        }
+      ]
+    },
+    "shadow": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "n",
+            "would_block",
+            "by_recipe"
+          ],
+          "properties": {
+            "n": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "would_block": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "by_recipe": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "n",
+                  "would_block",
+                  "reasons"
+                ],
+                "properties": {
+                  "n": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "would_block": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "reasons": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  }
+                }
+              }
             }
           }
         }

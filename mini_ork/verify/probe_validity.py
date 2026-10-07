@@ -50,12 +50,25 @@ PASSES_ON_BASE = "probe_passes_on_base"
 BASE_TREE_UNAVAILABLE = "base_tree_unavailable"
 
 
-def enabled(environ: dict | None = None) -> bool:
-    if environ is not None:
-        return environ.get(FLAG, "0") == "1"
-    from mini_ork.context import context_env
+def mode(environ: dict | None = None) -> str:
+    """``off`` (default), ``enforce`` (``MO_PROBE_VALIDITY=1``) or ``shadow``.
 
-    return context_env(FLAG, "0") == "1"
+    Shadow runs every check and records what it WOULD block
+    (``probe-validity.json`` + a task_runs note) but never blocks — the data
+    clock for the flip decision.
+    """
+    if environ is not None:
+        raw = environ.get(FLAG, "0")
+    else:
+        from mini_ork.context import context_env
+
+        raw = context_env(FLAG, "0")
+    return {"1": "enforce", "shadow": "shadow"}.get(raw, "off")
+
+
+def enabled(environ: dict | None = None) -> bool:
+    """Enforcing only — shadow never changes a verdict."""
+    return mode(environ) == "enforce"
 
 
 # ── probe execution + pass definition (moved verbatim from _sdd_common) ─────
@@ -405,9 +418,13 @@ def record_note(db: str, run_id: str, note: str) -> None:
 
 
 def publish_gate(*, run_dir: str, db: str, run_id: str, target_repo: str, plan: dict,
-                 timeout: float = DEFAULT_PROBE_TIMEOUT_S) -> tuple[bool, str, dict]:
-    """``(ok, reason, report)``; writes ``<run_dir>/probe-validity.json``."""
-    report: dict[str, Any] = {"flag": FLAG}
+                 timeout: float = DEFAULT_PROBE_TIMEOUT_S, gate_mode: str = "enforce") -> tuple[bool, str, dict]:
+    """``(ok, reason, report)``; writes ``<run_dir>/probe-validity.json``.
+
+    The report carries ``mode`` and ``would_block`` / ``reasons`` so shadow
+    evaluations can be counted later (``mini-ork metrics sdd``).
+    """
+    report: dict[str, Any] = {"flag": FLAG, "mode": gate_mode}
     ok, reason = True, ""
     proven, report["verify"] = verify_proven(db, run_id, run_dir)
     if not proven:
@@ -440,6 +457,8 @@ def publish_gate(*, run_dir: str, db: str, run_id: str, target_repo: str, plan: 
                 if any(r["violation"] for r in rows):
                     ok, reason = False, PASSES_ON_BASE
     report["ok"], report["reason"] = ok, reason
+    report["would_block"] = not ok
+    report["reasons"] = [reason] if reason else []
     with contextlib.suppress(OSError):
         (Path(run_dir) / "probe-validity.json").write_text(json.dumps(report, indent=1, default=str), encoding="utf-8")
     return ok, reason, report

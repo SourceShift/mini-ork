@@ -19,7 +19,7 @@ How to use:
 
 Run order (revised after K0, `docs/audits/20261007-unpublished-spend-root-cause.md`
 @28a2d9a3, AC5 accepted 2026-10-07):
-K0.5a → K0.5b → K1 → I1 → K0.5c → I3 → I5 → I2 → I6 → I8 → I7 → I4 → I9.
+K0.5a → K0.5b → K1 → I1 → I1-shadow → K0.5c → VA-verifier → I3 → I5 → I2 → I6 → I8 → I7 → I4 → I9.
 - K0.5 is inserted first. Without it, about 37% of corrected unpublished spend
   cannot be attributed, so K1 before/after comparisons would measure noise.
 - I3 now runs before I5. I3 has a measured target (`needs_answers`); I5 has no
@@ -38,6 +38,11 @@ Build rules (user decisions, 2026-10-07):
   fails for harness reasons rather than the epic's content, record it in the
   metrics (it is a K0 bucket), then fall back to a direct build and say so in
   the commit.
+- **Shadow before any flip (user decision, 2026-10-07).** A tightening flag
+  first runs in shadow (`MO_PROBE_VALIDITY=shadow`: evaluate, record
+  would-blocks, never block). Once >= 30 shadow runs per active recipe exist,
+  inspect the would-blocks by hand (`mini-ork metrics sdd` shadow section);
+  only if false refusals look small does the paid held-out A/B run.
 - **Behaviour-tightening ships behind a default-OFF `MO_*` flag.** Any epic
   that makes verify, publish or the reviewer stricter (I1 first) lands with its
   flag off. Turning it on is a separate change, made only after an A/B of
@@ -161,6 +166,28 @@ LLM test authoring (that is I2). Recipe workflow changes.
 ### Verification command
 `python3 -m pytest -q tests/unit/test_probe_validity.py tests/test_sdd_verifiers.py tests/test_sdd_e2e_dryrun.py`
 
+## I1 shadow mode (id: sdd-i1-shadow)
+- recipe: framework-edit
+Depends on: sdd-i1-probe-validity
+
+### Goal
+Start the data clock for the I1 flip without changing any verdict. Built
+directly (pipeline repair).
+### Acceptance
+- AC1: `MO_PROBE_VALIDITY=shadow` runs every I1 check and writes
+  `probe-validity.json` with `mode`, `would_block` and `reasons`.
+- AC2: a would-block adds `[shadow] would block: <reason>` to task_runs notes.
+- AC3: shadow NEVER blocks and is behaviour-identical to OFF apart from those
+  two writes (return, final status, stdout/stderr) — tested.
+- AC4: `mini-ork metrics sdd` reports shadow n and would-block counts by
+  recipe × reason.
+### Files in scope (candidates — confirm)
+- `mini_ork/verify/probe_validity.py`, `mini_ork/cli/publisher.py`
+- `mini_ork/cli/metrics_sdd.py`, `schemas/metrics_sdd.schema.json`
+- `tests/unit/test_probe_validity.py`, `tests/unit/test_metrics_sdd.py`
+### Verification command
+`python3 -m pytest -q tests/unit/test_probe_validity.py tests/unit/test_metrics_sdd.py`
+
 ## framework-edit verifier nodes actually run (id: sdd-k05c-verifier-nodes-run)
 - recipe: framework-edit
 Depends on: sdd-i1-probe-validity
@@ -195,6 +222,41 @@ json_extract(payload_json,'$.duration_ms')=0`.
 - `tests/unit/test_verifier_nodes_run.py`
 ### Verification command
 `python3 -m pytest -q tests/unit/test_verifier_nodes_run.py`
+
+## verified-artifact gets a real verifier (id: sdd-va-real-verifier)
+- recipe: framework-edit
+Depends on: sdd-i1-shadow
+
+### Goal
+Built directly; the recipe lives in the libwit/researcher repo at
+`server/resources/miniork-overlay-recipes/verified-artifact`. Today
+`verifiers/schema.sh` only checks "the output parses as JSON (after fence
+extraction) + the manifest exists" and emits no `pass: true` evidence, which
+is why I1 counts every verified-artifact run as `verify_vacuous` (219/219
+published runs in the shadow estimate; K1: 217 published with a vacuous
+verify).
+### Acceptance
+- AC1: port to `verifiers/schema.py` (bash verifiers are deprecated). It
+  emits ONE JSON verdict `{"pass": bool, "checks": [{id, pass, reason}]}` and
+  leaves the `verifier_*` evidence file I1 reads.
+- AC2: real checks — (a) `verified-artifact.json` validates against the
+  schema the manifest declares, not just "is JSON"; (b) required fields are
+  non-empty; (c) references/citations in the artifact resolve to items in the
+  inputs manifest (grounding), where the artifact type has them.
+- AC3: a deliberately broken fixture fails and a known-good one passes; the
+  checks are mutation-tested.
+- AC4: a fresh batch of verified-artifact runs under
+  `MO_PROBE_VALIDITY=shadow` shows 0 `verify_vacuous` would-blocks.
+- Constraint: the host side (`verifiedArtifactClient`, the caller-owned repair
+  callback) consumes this recipe — confirm its owner in libwit and do not break
+  the envelope it reads.
+### Files in scope (candidates — confirm, libwit/researcher repo)
+- `server/resources/miniork-overlay-recipes/verified-artifact/verifiers/schema.py` (new; replaces `schema.sh`)
+- `server/resources/miniork-overlay-recipes/verified-artifact/workflow.yaml`
+- tests next to the recipe
+### Verification command
+Recipe tests (to be named when the files are confirmed) + a shadow batch read
+with `mini-ork metrics sdd`.
 
 ## I5 evidence ledger bound to code state (id: sdd-i5-evidence-ledger)
 - recipe: framework-edit

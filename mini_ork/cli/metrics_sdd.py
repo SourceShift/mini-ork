@@ -136,6 +136,29 @@ def scan_run_dirs(runs_dir: Path) -> dict[str, Any]:
             "counts": {k: len(v) for k, v in ids.items()}, "ids": ids}
 
 
+def shadow_metrics(con: sqlite3.Connection, runs_dir: Path) -> dict[str, Any]:
+    """I1 shadow evaluations (``MO_PROBE_VALIDITY=shadow``): n and would-block
+    counts by recipe × reason, from each run dir's ``probe-validity.json``.
+    The flip rule needs >= 30 shadow runs per active recipe, inspected by hand."""
+    out: dict[str, Any] = {"n": 0, "would_block": 0, "by_recipe": {}}
+    for f in sorted(runs_dir.glob("*/probe-validity.json")) if runs_dir.is_dir() else []:
+        rep = _load(f)
+        if not isinstance(rep, dict) or rep.get("mode") != "shadow":
+            continue
+        row = con.execute("SELECT recipe FROM task_runs WHERE id = ?", (f.parent.name,)).fetchone()
+        recipe = (row["recipe"] if row else None) or "(none)"
+        r = out["by_recipe"].setdefault(recipe, {"n": 0, "would_block": 0, "reasons": {}})
+        out["n"] += 1
+        r["n"] += 1
+        if rep.get("would_block"):
+            out["would_block"] += 1
+            r["would_block"] += 1
+            for reason in rep.get("reasons") or ["(unspecified)"]:
+                r["reasons"][reason] = r["reasons"].get(reason, 0) + 1
+    out["by_recipe"] = dict(sorted(out["by_recipe"].items()))
+    return out
+
+
 def run_dir_metrics(snapshot: dict[str, Any], source: str) -> dict[str, Any]:
     c = snapshot["counts"]
     return {
@@ -161,6 +184,8 @@ def collect(db: str, *, runs_dir: Path | None, run_dir_baseline: Path | None) ->
     con = connect_readonly(db)
     try:
         out: dict[str, Any] = {"schema": SCHEMA_ID, "db": db, **db_metrics(con)}
+        # Shadow evaluations are new runs: read the live run dirs, never a frozen file.
+        out["shadow"] = shadow_metrics(con, runs_dir) if (runs_dir is not None and run_dir_baseline is None) else None
     finally:
         con.close()
     if run_dir_baseline is not None:
@@ -205,6 +230,13 @@ def render_markdown(m: dict[str, Any]) -> str:
             f"({_pct(rd['implemented_zero_files_rate'])}) |",
             "", f"Run dirs: {rd['source']}",
         ]
+    sh = m.get("shadow")
+    if sh:
+        lines += ["", f"I1 shadow (MO_PROBE_VALIDITY=shadow): {sh['would_block']}/{sh['n']} would block",
+                  "", "| Recipe | Shadow runs | Would block | Reasons |", "|---|---:|---:|---|"]
+        lines += [f"| {rec} | {v['n']} | {v['would_block']} | "
+                  f"{', '.join(f'{k} {n}' for k, n in sorted(v['reasons'].items())) or '—'} |"
+                  for rec, v in sh["by_recipe"].items()]
     lines += ["", "| Month | Verify traces | Vacuous |", "|---|---:|---:|"]
     lines += [f"| {x['month']} | {x['traces']} | {x['vacuous']} ({_pct(x['vacuous_rate'])}) |" for x in v["monthly"]]
     return "\n".join(lines) + "\n"
