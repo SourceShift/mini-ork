@@ -338,6 +338,36 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 break
 
+    # ── side-channel: lesson themes (MO_THEMES) ───────────────────────────
+    # Group gradient_records into themes so the prompt block stops carrying
+    # 10k near-duplicates of the same observation. Runs AFTER pattern_induct
+    # (which produces the gradient store this reads) and BEFORE the
+    # learning-loop write-back (which prints `[learning] persisted`).
+    # Default ON with the same `get(name, "1") != "0"` opt-out form as the
+    # other side-channels; a side-channel must never crash reflect, so the
+    # whole block is wrapped in a bare try/except that writes ONE stderr
+    # line on failure and continues. See mini_ork/learning/themes.py for the
+    # exact behaviour of assign_new and rollup_framework_bugs.
+    themes_report: dict | None = None
+    bugs_updated = 0
+    if os.environ.get("MO_THEMES", "1") != "0":
+        try:
+            from mini_ork.learning import themes
+
+            themes_report = themes.assign_new(db_path)
+            bugs_updated = themes.rollup_framework_bugs(db_path)
+        except Exception as exc:  # a side-channel must never crash reflect
+            sys.stderr.write(f"  [themes] skipped: {exc}\n")
+            themes_report = None
+            bugs_updated = 0
+    if themes_report is not None:
+        sys.stdout.write(
+            f"  [themes] assigned {themes_report.get('assigned', 0)} gradient(s) "
+            f"→ {themes_report.get('themes_total', 0)} theme(s) "
+            f"({themes_report.get('themes_new', 0)} new), "
+            f"{bugs_updated} framework bug(s) updated\n"
+        )
+
     # ── learning-loop write-back ───────────────────────────────────────────
     suggestions_written = 0
     try:
