@@ -403,9 +403,10 @@ def fleet_rows(
          candidate by its ``state`` (``working``/``needs_you``/``done``/
          ``failed``); the four buckets drive ``counts``.
       3. Apply ``state`` and ``recipe`` filters and slice to ``limit``.
-      4. For each SHOWN row only, call ``history.read_snapshot`` +
-         ``task_state`` + ``diffs.cached_or_computed`` (only for ``done``
-         rows) to compute the precise ``state``/``step``/``added``/``removed``.
+      4. For the SHOWN rows only: one batched lifecycle-event query
+         (``_events_by_run``), then ``task_state`` per row for the precise
+         ``state``/``step``/``added``/``removed`` (finished runs read their
+         cached ``diffstat.json``).
       5. Build ``FleetRow``s. ``started_at``/``ended_at`` are epoch ints;
          ``ended_at`` is set only for terminal states.
 

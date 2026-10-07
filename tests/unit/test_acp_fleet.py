@@ -233,22 +233,29 @@ def test_precise_state_only_computed_for_shown_rows(
     for i in range(10):
         seed_run(home, run_id=f"r-{i:03d}", status="published", created_at=NOW - i)
 
-    import mini_ork.acp.history as history
-
     calls: list[str] = []
-    orig = history.read_snapshot
+    batched: list[list[str]] = []
+    orig_state = fl.task_state
+    orig_events = fl._events_by_run
 
-    def spy(h: Path, run_id: str) -> dict:
-        calls.append(run_id)
-        return orig(h, run_id)
+    def spy_state(run_dir, snapshot):
+        calls.append(Path(run_dir).name)
+        return orig_state(run_dir, snapshot)
 
-    monkeypatch.setattr(history, "read_snapshot", spy)
+    def spy_events(h, run_ids):
+        batched.append(list(run_ids))
+        return orig_events(h, run_ids)
+
+    monkeypatch.setattr(fl, "task_state", spy_state)
+    monkeypatch.setattr(fl, "_events_by_run", spy_events)
 
     rows, _ = fl.fleet_rows(home, limit=3)
     assert len(rows) == 3
-    # The snapshot (and with it precise state + diff reads) is paid only for
-    # the rows that survive filtering and the limit — not all 10 candidates.
+    # Precise state (and with it the diff reads) is paid only for the rows that
+    # survive filtering and the limit — not all 10 candidates — and their events
+    # come from one batched query over exactly those rows.
     assert calls == ["r-000", "r-001", "r-002"]
+    assert batched == [["r-000", "r-001", "r-002"]]
 
 
 # ── time formatting ──────────────────────────────────────────────────────────
