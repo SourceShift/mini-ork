@@ -306,6 +306,29 @@ def _write_learned_record(run_dir: str, node_id: str, node_type: str,
                 pass
             raise
 
+        # Ledger — only when something was actually injected. Own try/except so
+        # a DB blip can never cascade back into the JSON/MD writes above
+        # (kickoff learn-ledger §"_write_learned_record change").
+        if injected:
+            try:
+                from mini_ork.learning import ledger as _ledger
+                _run_id = os.environ.get("MINI_ORK_RUN_ID") or os.path.basename(
+                    run_dir.rstrip(os.sep)
+                )
+                _ledger.record_injections(
+                    run_id=_run_id,
+                    node_id=node_id,
+                    node_type=node_type,
+                    lane=lane,
+                    task_class=task_class,
+                    attempt=int(attempt),
+                    sources=record["sources"],
+                )
+            except Exception:
+                # ledger writers are silent on the write path; the outer swallow
+                # already protects the dispatch.
+                pass
+
         # Markdown — only when the block was actually injected. A stale .md
         # from a prior attempt that did inject (and the current attempt did
         # not) is removed so the IDE never shows the previous attempt's text
