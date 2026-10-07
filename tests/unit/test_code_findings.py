@@ -896,3 +896,19 @@ def test_cli_prune_subcommand(tmp_path: Path, capsys) -> None:
         assert con.execute("SELECT COUNT(*) FROM code_findings").fetchone()[0] == 1
     finally:
         con.close()
+
+
+def test_finding_with_no_text_and_no_snippet_is_dropped() -> None:
+    # Live 2026-10-07: 18 '(no issue)' rows reached prompts via context_v2.
+    items = code_findings.parse_review(json.dumps({
+        "verdict": "needs_revision",
+        "findings": [
+            {"file": "mini_ork/ide_pages/node_changes.py", "line": 3, "severity": "high"},
+            {"file": "mini_ork/ide_pages/node_changes.py", "line": 9, "issue": "real problem"},
+            {"file": "mini_ork/x.py", "line": 1, "snippet": "x = 1"},
+        ],
+    }))
+    issues = [i["issue"] for i in items]
+    assert "(no issue)" not in issues
+    assert "real problem" in issues and "x = 1" in issues
+    assert len(items) == 2

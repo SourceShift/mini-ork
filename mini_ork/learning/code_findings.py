@@ -312,7 +312,12 @@ def _make_finding(file, line, issue, severity, verdict, snippet):
     issue_text = (_as_text(issue) or "").strip()
     snippet_text = _as_text(snippet)
     if not issue_text:
-        issue_text = (snippet_text or "").strip() or "(no issue)"
+        issue_text = (snippet_text or "").strip()
+    if not issue_text:
+        # Nothing to say (no issue text, no snippet): not a finding. These used
+        # to be stored as "(no issue)" and were injected into prompts by
+        # context_v2 as empty problems (live 2026-10-07: 18 rows, 2 runs).
+        return None
     verdict_text = _scalar_text(verdict)
     sev = _scalar_text(severity)
     if not sev:
@@ -430,7 +435,7 @@ def _dict_note_findings(item, verdict):
     ]
 
 
-def parse_review(text) -> list[dict]:
+def _parse_review_raw(text) -> list:
     """Parse one review payload into findings (pure: no DB, no git, no I/O).
 
     Handles the four live shapes: plain JSON, fenced JSON with prose around it,
@@ -558,7 +563,7 @@ def _verifier_reason(obj) -> str:
     return json.dumps(obj, default=str)
 
 
-def parse_verifier(name, payload) -> list[dict]:
+def _parse_verifier_raw(name, payload) -> list:
     """Parse one verifier payload. A failed verifier (``pass`` false, or
     ``verdict`` in ``fail|FAIL|REFUTED|error``) yields one high-severity finding
     whose issue is the reason / first failed check (≤ 300 chars) and whose file
@@ -1341,3 +1346,24 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def parse_review(text) -> list[dict]:
+    """Parse one review payload into findings (pure: no DB, no git, no I/O).
+
+    Handles the four live shapes: plain JSON, fenced JSON with prose around it,
+    pure prose/bullets, and JSON whose ``notes``/``reasons``/``findings`` carry
+    file-bearing strings. Structured ``findings`` dicts are taken as-is; string
+    items and bullet lines yield one finding each when they name a file. Items
+    with neither issue text nor a snippet are dropped.
+    """
+    return [f for f in _parse_review_raw(text) if f]
+
+
+def parse_verifier(name, payload) -> list[dict]:
+    """Parse one verifier payload. A failed verifier (``pass`` false, or
+    ``verdict`` in ``fail|FAIL|REFUTED|error``) yields one high-severity finding
+    whose issue is the reason / first failed check (≤ 300 chars) and whose file
+    is the first path in that text, if any. Passed verifiers yield [].
+    """
+    return [f for f in _parse_verifier_raw(name, payload) if f]
