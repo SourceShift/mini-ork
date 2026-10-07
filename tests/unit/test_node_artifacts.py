@@ -208,9 +208,9 @@ def test_verifier_outputs_have_kinds_and_previews(home: Path) -> None:
     assert f"verifier-{stem}.checks.tsv" in by_name
     assert by_name[f"verifier-{stem}.checks.tsv"]["kind"] == "text"
 
-    # newest evidence log
-    ev_names = [n for n in by_name if n.startswith(f"{stem}") and ".log" in n and "node-cmd" not in n]
-    assert any(n.startswith("static-check") for n in ev_names)
+    # newest evidence log, named relative to the run dir
+    ev_names = [n for n in by_name if n.startswith(f"evidence/{stem}") and n.endswith(".log")]
+    assert ev_names, sorted(by_name)
 
 
 def test_reviewer_inputs_include_parent_outputs_and_review_diff(home: Path) -> None:
