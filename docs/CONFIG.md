@@ -179,7 +179,8 @@ human_gate:
 | `MINI_ORK_TEST_CMD` | `npm test -- --passWithNoTests` | Test runner command |
 | `MINI_ORK_PLAYWRIGHT_CMD` | `npx playwright test` | E2E test command |
 | `MINI_ORK_GRADIENT_EXTRACTOR_FN` | unset | Optional named in-process test/extension override; production uses `mini_ork.learning.gradient_extractor` with native LLM dispatch |
-| `MINI_ORK_GRADIENT_MODEL` | `codex` | Provider lane used by native textual-gradient extraction |
+| `MINI_ORK_GRADIENT_MODEL` | the `reflector` role in `agents.yaml` | Provider lane used by native textual-gradient extraction |
+| `MINI_ORK_INDUCE_MODEL` | same lane as `MINI_ORK_GRADIENT_MODEL` | Provider lane for pattern induction (authors `lesson_text` for mined clusters) |
 
 ### Run behavior
 

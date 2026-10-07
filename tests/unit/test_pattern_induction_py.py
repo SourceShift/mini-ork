@@ -14,8 +14,10 @@ planner prompt), conflict, dedupe.
 from __future__ import annotations
 
 import io
+import itertools
 import json
 import sqlite3
+import sys
 
 import pytest
 
@@ -107,17 +109,22 @@ def _seed_emergent(db: str, pattern_id: str, *, lesson: str | None = None) -> No
     con.close()
 
 
-def _fake_native(payload, *, rc: int = 0, capture: list | None = None):
+def _fake_native(payload, *, rc: int = 0, stderr_text: str = "", capture: list | None = None):
     """Stand in for `llm_dispatch.llm_dispatch` at the process boundary.
 
     Writes the reply to stdout because that is the channel `_default_dispatch`
     captures — returning it any other way would test a contract the real
-    dispatcher does not have.
+    dispatcher does not have. On a non-zero rc the optional ``stderr_text`` is
+    written to stderr, mirroring the way a real dispatcher reports a 400/401,
+    so ``_default_dispatch`` actually populates ``_last_dispatch_error`` for
+    the "every call failed" branch in ``induce_cluster``.
     """
     def _fn(argv, *, root=None, dispatch_fn=None):
         if capture is not None:
             capture.append(list(argv))
         if rc != 0:
+            if stderr_text:
+                print(stderr_text, file=sys.stderr)
             return rc
         print(payload if isinstance(payload, str) else json.dumps(payload))
         return 0
@@ -431,6 +438,188 @@ def test_default_dispatch_fails_closed_when_the_transport_raises(monkeypatch):
 
     monkeypatch.setattr("mini_ork.dispatch.llm_dispatch.llm_dispatch", _boom)
     assert pi._default_dispatch("p") == (1, "")
+
+
+# ── lane chain + every-call-failed reporting ────────────────────────────────
+
+def test_default_dispatch_lane_chain_prefers_induce_then_gradient_then_codex(
+    monkeypatch,
+):
+    """One helper, three callers (argv, report, stderr line) — the chain has
+    to agree everywhere or the operator sees a lane name the dispatch never
+    used. ``codex`` is the legacy fallback so deployments predating the new
+    env vars still work.
+    """
+    captured: list = []
+    monkeypatch.setattr(
+        "mini_ork.dispatch.llm_dispatch.llm_dispatch",
+        _fake_native({"lessons": []}, capture=captured),
+    )
+    monkeypatch.delenv("MINI_ORK_INDUCE_MODEL", raising=False)
+    monkeypatch.delenv("MINI_ORK_GRADIENT_MODEL", raising=False)
+    pi._default_dispatch("p")
+    argv = captured[-1]
+    assert argv[argv.index("--model") + 1] == "codex"
+
+    captured.clear()
+    monkeypatch.setenv("MINI_ORK_GRADIENT_MODEL", "glm")
+    pi._default_dispatch("p")
+    argv = captured[-1]
+    assert argv[argv.index("--model") + 1] == "glm"
+
+    captured.clear()
+    monkeypatch.setenv("MINI_ORK_INDUCE_MODEL", "induce-only")
+    pi._default_dispatch("p")
+    argv = captured[-1]
+    assert argv[argv.index("--model") + 1] == "induce-only"
+
+
+def test_default_dispatch_records_stderr_on_a_failed_call(monkeypatch):
+    """A non-zero rc must populate ``_last_dispatch_error`` so
+    ``induce_cluster`` can surface the lane + error instead of a silent skip.
+    """
+    monkeypatch.setattr(
+        "mini_ork.dispatch.llm_dispatch.llm_dispatch",
+        _fake_native(None, rc=1, stderr_text="boom 400"),
+    )
+    monkeypatch.setattr(pi, "_last_dispatch_error", "")
+    rc, out = pi._default_dispatch("p")
+    assert rc == 1
+    assert out == ""
+    assert "boom 400" in pi._last_dispatch_error
+
+
+def test_induce_cluster_reports_dispatch_failed_when_every_call_fails(
+    tmp_path, monkeypatch,
+):
+    """Every batch failing is a distinct failure mode from "no proposal
+    survived the guardrails" — the operator needs to know the lane was the
+    problem, not the traces. The test patches the native dispatcher (not
+    ``_default_dispatch``) so ``_last_dispatch_error`` is actually written.
+    """
+    db = _db(tmp_path / "s.db")
+    _seed_traces(db, [{"trace_id": "t1", "status": "success"}])
+    monkeypatch.setattr(
+        "mini_ork.dispatch.llm_dispatch.llm_dispatch",
+        _fake_native(None, rc=1, stderr_text="boom 400"),
+    )
+    monkeypatch.setattr(pi, "_last_dispatch_error", "")
+    con = sqlite3.connect(db)
+    try:
+        text, report = pi.induce_cluster(
+            con, target="x", member_trace_ids=["t1"],
+        )
+    finally:
+        con.close()
+    assert text == ""
+    assert report["reason"] == "dispatch failed"
+    assert "boom 400" in report["error"]
+    assert report["model"]  # the resolved lane name is recorded, not a stack
+
+
+def test_induce_cluster_partial_failure_is_not_dispatch_failed(
+    tmp_path, monkeypatch,
+):
+    """A single failed batch leaves the surviving batch's proposals in play;
+    they still go through the normal guardrail path. The "dispatch failed"
+    branch is reserved for the case where every call failed — promoting a
+    partial outage would mask a real finding.
+    """
+    db = _db(tmp_path / "s.db")
+    # Seven rows gives propose_lessons two batches at the default size=6, so
+    # one failure and one success actually exercise both arms.
+    _seed_traces(db, [{"trace_id": f"t{i}", "status": "success"} for i in range(7)])
+    # itertools.count is atomic in CPython's GIL even from a pool worker, which
+    # is what we need: ``calls["n"] += 1`` from two threads racing on the
+    # same dict can lose an increment, leave both batches looking like the
+    # first one, and trip the "every call failed" branch.
+    calls = itertools.count(1)
+
+    def _patched(*a, **k):
+        n = next(calls)
+        if n == 1:
+            return (1, "")
+        return (0, json.dumps({"lessons": []}))
+
+    monkeypatch.setattr(pi, "_default_dispatch", _patched)
+    monkeypatch.setattr(pi, "_last_dispatch_error", "")
+    con = sqlite3.connect(db)
+    try:
+        _text, report = pi.induce_cluster(
+            con, target="x",
+            member_trace_ids=[f"t{i}" for i in range(7)],
+        )
+    finally:
+        con.close()
+    # ``next`` was consumed exactly twice — once per batch. Iterating the
+    # counter past its last value is fine; what matters is that both batches
+    # actually dispatched, so a partial-failure test is real.
+    assert next(calls) == 3, "both batches must actually dispatch"
+    assert report.get("reason") != "dispatch failed"
+
+
+def test_propose_lessons_threaded_restores_real_streams(tmp_path, monkeypatch):
+    """FINDING 2: two ThreadPoolExecutor workers stepping on each other's
+    ``contextlib.redirect_stdout``/``redirect_stderr`` would leave
+    ``sys.stdout``/``sys.stderr`` pointing at a dead StringIO after the call,
+    and (worse) one worker's writes would land in someone else's buffer.
+
+    The lock around the redirect+dispatch triple inside ``_default_dispatch``
+    is the fix; this test asserts the observable contract — after the threaded
+    pass, ``sys.stdout``/``sys.stderr`` are still whatever stream the caller
+    had installed (pytest's capture stream, in this run; a real terminal in
+    production). What we are NOT is a dead StringIO whose final ``getvalue``
+    came from a different batch's write.
+
+    Seven rows at the default batch_size=6 split into two batches — exactly
+    the shape that exercised the race in the reviewer's trials.
+    """
+    monkeypatch.setattr(
+        pi, "_default_dispatch",
+        lambda *a, **k: (0, json.dumps({"lessons": []})),
+    )
+    rows = [{"trace_id": f"t{i}", "status": "success"} for i in range(7)]
+    before_out, before_err = sys.stdout, sys.stderr
+    pi.propose_lessons(rows, target="x", max_workers=4)
+    assert sys.stdout is before_out, "stdout was left pointing at a dead StringIO"
+    assert sys.stderr is before_err, "stderr was left pointing at a dead StringIO"
+
+
+def test_default_dispatch_attributes_failure_to_the_lane_even_threaded(
+    monkeypatch,
+):
+    """FINDING 2 follow-on: with one batch failing on lane A and another on
+    lane B, the orchestrator's stderr line must attribute the error to the
+    lane the call actually used — reading the model/error off the entry, not
+    the env. The pre-fix code routed both writes into one process-global
+    StringIO, so a thread A 'err 400' could surface as a thread B 'err 401'
+    in ``_last_dispatch_error``.
+    """
+    next_thread_id = itertools.count(1)
+
+    def _fake(argv, *, root=None, dispatch_fn=None):
+        thread_id = next(next_thread_id)
+        # Lane A's worker errors first with "err 400", lane B's worker with
+        # "err 401". Pre-fix, ``sys.stderr`` is whichever redirect was last
+        # entered; post-fix, each worker keeps its own stderr bound to its own
+        # buffer because the lock serialises the redirect.
+        text = f"err 4{'00' if thread_id == 1 else '01'}"
+        print(text, file=sys.stderr)
+        return 1
+
+    monkeypatch.setattr(
+        "mini_ork.dispatch.llm_dispatch.llm_dispatch", _fake,
+    )
+    # Two sequential calls — different lanes — must each capture their own
+    # error text, not the other call's. (This is the un-threaded shadow of
+    # the same contract the threaded test above locks down.)
+    rc1, _ = pi._default_dispatch("p", model="lane-A")
+    err1 = pi._last_dispatch_error
+    rc2, _ = pi._default_dispatch("p", model="lane-B")
+    err2 = pi._last_dispatch_error
+    assert rc1 == 1 and rc2 == 1
+    assert "err 400" in err1 and "err 401" not in err1
+    assert "err 401" in err2 and "err 400" not in err2
 
 
 # ── orchestration ───────────────────────────────────────────────────────────

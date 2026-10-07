@@ -305,10 +305,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         from mini_ork.learning import pattern_induction
         if pattern_induction._induct_enabled():
+            # Propagate the live reflector lane so induction stops defaulting to
+            # ``codex`` (dead on chatgpt auth — see kickoff) and so a configured
+            # ``MINI_ORK_INDUCE_MODEL`` overrides the gradient lane per site.
             induce_report = pattern_induction.induce_pending(
                 db_path=db_path,
                 limit=int(os.environ.get("MO_PATTERN_INDUCE_LIMIT", "20")),
                 min_cluster=int(os.environ.get("MO_PATTERN_MINER_MIN_CLUSTER", "3")),
+                model=os.environ.get("MINI_ORK_INDUCE_MODEL") or gradient_model,
             )
     except Exception as exc:  # a side-channel must never crash reflect
         sys.stderr.write(f"  [pattern_induct] skipped: {exc}\n")
@@ -318,6 +322,21 @@ def main(argv: list[str] | None = None) -> int:
             f"  [pattern_induct] authored {induce_report.get('induced', 0)} lesson(s), "
             f"{len(induce_report.get('skipped') or [])} cluster(s) left without one\n"
         )
+        # Surface an every-call-failed cluster as one stderr line so the
+        # operator can see WHY the cluster was skipped (and which lane was
+        # actually dispatched). Reading the model/error off the entry — not the
+        # env — keeps the line consistent with what the dispatch attempted.
+        # The error tail is whatever the provider wrote to stderr (often a
+        # multi-line 400/401 dump); collapse whitespace so the line stays
+        # one line, matching the "ONE line" contract for an operator scan.
+        for skipped in induce_report.get("skipped") or []:
+            if skipped.get("reason") == "dispatch failed":
+                err = " ".join((skipped.get("error") or "").split())
+                sys.stderr.write(
+                    f"  [pattern_induct] every analyst call failed on lane "
+                    f"{skipped.get('model', '?')}: {err}\n"
+                )
+                break
 
     # ── learning-loop write-back ───────────────────────────────────────────
     suggestions_written = 0

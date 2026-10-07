@@ -56,6 +56,7 @@ import json
 import os
 import re
 import sqlite3
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -85,6 +86,60 @@ _MAX_DIRECTIVE = 280
 _MAX_CONDITION = 160
 
 _POLARITIES = ("do", "avoid")
+
+# Last failure captured by `_default_dispatch`, surfaced to the caller as
+# ``error`` on the new "dispatch failed" branch in ``induce_cluster``.
+# Process-global because ``propose_lessons`` dispatches via a thread pool;
+# the lock is what keeps the worst-case race a truncation rather than a
+# torn write. ``induce_cluster`` resets it per-cluster so a stale failure
+# from one cluster is never attributed to the next.
+_last_dispatch_error: str = ""
+_dispatch_error_lock = threading.Lock()
+
+# Serialises the redirect+dispatch triple inside ``_default_dispatch``.
+# ``contextlib.redirect_stdout``/``redirect_stderr`` mutate the process-global
+# ``sys.stdout``/``sys.stderr``; without this lock, two ThreadPoolExecutor
+# workers entering their redirects concurrently have their writes cross the
+# wires (one worker's writes leak into the other's StringIO, or escape to
+# the real terminal — surfacing a 400-style provider line in the reflect
+# operator's view). The lock covers the redirect, not the parse, and parsing
+# always happens after ``pool.map`` joins, so the per-batch parsing is not
+# inside the critical section.
+_dispatch_lock = threading.Lock()
+
+
+def _record_dispatch_error(msg: str) -> None:
+    """Store the last dispatch failure so ``induce_cluster`` can surface it.
+
+    Always wraps the last 300 chars so a multi-line provider dump does not
+    blow up the orchestrator's stderr line; the truncation lives in one place.
+    """
+    global _last_dispatch_error
+    with _dispatch_error_lock:
+        _last_dispatch_error = msg[-300:]
+
+
+def _reset_dispatch_error() -> None:
+    """Clear the global so a stale failure from a prior cluster cannot leak."""
+    global _last_dispatch_error
+    with _dispatch_error_lock:
+        _last_dispatch_error = ""
+
+
+def _resolve_model(model: str | None) -> str:
+    """The single source of truth for which lane induction is dispatched on.
+
+    One function, two callers — ``_default_dispatch`` builds the argv and
+    ``induce_cluster`` reports the lane on its "every call failed" branch.
+    Inlining both sides would let the two drift, and the stderr line would
+    end up naming a lane the call never used.
+    """
+    return (
+        model
+        or os.environ.get("MINI_ORK_INDUCE_MODEL")
+        or os.environ.get("MINI_ORK_GRADIENT_MODEL")
+        or "codex"
+    )
 
 # Normalising a condition is only safe if it does not merge distinct targets.
 # Digits and identifiers are preserved; casing, punctuation and whitespace are
@@ -373,26 +428,55 @@ def _default_dispatch(
     Mirrors ``gradient_extractor._default_dispatch`` so the two learning stages
     share one transport contract and one failure shape: a non-zero rc or empty
     stdout is a failed call, never an empty-but-successful answer.
+
+    On the failure arms (non-zero rc, empty stdout, or a raised exception) the
+    captured stderr text — or, when stderr is empty, a synthetic
+    ``"<lane> returned no output"`` — is recorded in ``_last_dispatch_error``
+    so the orchestrator can attribute the failure to the right cluster
+    instead of collapsing every outage into "no proposal".
+
+    The redirect+dispatch triple runs under ``_dispatch_lock`` because
+    ``contextlib.redirect_stdout``/``redirect_stderr`` mutate the
+    process-global ``sys.stdout``/``sys.stderr``; in threaded ``_one``, two
+    workers entering their redirects concurrently would have one worker's
+    writes land in the other's buffer (or, worse, in the real terminal —
+    where a 400-style provider message pollutes the reflect operator's view).
+    Serialising the redirect under the lock costs parallelism only across
+    batches, not inside a single dispatch, and removes the cross-talk.
     """
     from mini_ork.dispatch import llm_dispatch as native_dispatch
 
     stdout, stderr = io.StringIO(), io.StringIO()
+    resolved = _resolve_model(model)
     argv = [
-        "--model", model or os.environ.get("MINI_ORK_INDUCE_MODEL", "codex"),
+        "--model", resolved,
         "--node-type", "pattern-induct",
         "--prompt-text", prompt,
         "--timeout", "120",
         "--max-turns", "4",
     ]
     try:
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        # Lock before the redirect: ``contextlib.redirect_stdout`` swaps the
+        # process-global ``sys.stdout``, so two threads entering their own
+        # redirects concurrently would have one's writes escape into the other's
+        # StringIO (see FINDING 2 in the kickoff review). Holding the lock for
+        # the whole triple (redirect + native_dispatch + redirect-exit) keeps
+        # one worker's stdout bound to its own buffer for the duration of the
+        # call.
+        with _dispatch_lock, contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             rc = native_dispatch.llm_dispatch(
                 argv,
                 root=str(repo_root or os.environ.get("MINI_ORK_ROOT") or os.getcwd()),
                 dispatch_fn=dispatch_fn,
             )
-    except Exception:
+    except Exception as exc:
+        _record_dispatch_error(str(exc))
         return 1, ""
+    if rc != 0 or not stdout.getvalue():
+        captured = stderr.getvalue()
+        if not captured:
+            captured = f"{resolved} returned no output"
+        _record_dispatch_error(captured)
     return rc, stdout.getvalue()
 
 
@@ -428,12 +512,26 @@ def propose_lessons(
     batch_size: int = 6,
     max_batches: int = 4,
     max_workers: int = 4,
+    stats: dict | None = None,
 ) -> list[Any]:
     """Stage 2 — one analyst call per batch of traces, in parallel.
 
     ``max_batches`` bounds cost per cluster: a cluster with 400 members is
     sampled, not fully read, because the marginal trace beyond a few batches
     changes the guidance far less than it changes the bill.
+
+    ``stats`` is an out-parameter the orchestrator can pass in to observe how
+    many analyst calls were dispatched (``calls``) and how many of those came
+    back without a usable reply (``failed``). The counters are derived from
+    the per-batch ``(rc, out)`` tuples the dispatcher returns, NOT from an
+    in-worker increment — an unlocked ``stats["calls"] += 1`` inside ``_one``
+    is a read-modify-write race that can lose updates across the pool and
+    under-report ``calls`` (or make ``calls < failed`` on an all-failed run,
+    which silently falls through the ``induce_cluster`` "every call failed"
+    branch). Deriving from ``pool.map`` keeps the serial short-circuit
+    (max_workers == 1) reporting the same number of calls as the threaded one,
+    because both paths funnel their per-batch tuples through the same
+    accumulator below.
     """
     if not rows:
         return []
@@ -442,22 +540,36 @@ def propose_lessons(
     if not batches:
         return []
 
-    def _one(batch: list[Any]) -> list[Any]:
+    def _one(batch: list[Any]) -> tuple[int, str]:
         body = "\n".join(f"- {_trace_brief(r)}" for r in batch)
         prompt = (
             f"{ANALYST_SYSTEM}\n\nCluster: {target}\n"
             f"Traces in this batch:\n{body}\n\n{_lesson_contract()}"
         )
         rc, out = _default_dispatch(prompt, dispatch_fn=dispatch_fn, model=model)
-        if rc != 0:
-            return []
-        return _parse_lessons(out)
+        return rc, out
 
     workers = max(1, min(int(max_workers), len(batches)))
     if workers == 1:
-        return [p for b in batches for p in _one(b)]
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        return [p for chunk in pool.map(_one, batches) for p in chunk]
+        results: list[tuple[int, str]] = [_one(b) for b in batches]
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(_one, batches))
+
+    if stats is not None:
+        # Derived once, from per-batch tuples the caller already has. Same answer
+        # in the serial path as in the threaded path — both feed the same shape
+        # into the counter — and no race because the increment never runs in
+        # the worker.
+        stats["calls"] = len(results)
+        stats["failed"] = sum(1 for rc, out in results if rc != 0 or not out)
+
+    proposals: list[Any] = []
+    for rc, out in results:
+        if rc != 0:
+            continue
+        proposals.extend(_parse_lessons(out))
+    return proposals
 
 
 def merge_lessons(
@@ -564,8 +676,25 @@ def induce_cluster(
     if not rows:
         return "", {"target": target, "reason": "no readable member traces"}
 
-    proposals = propose_lessons(rows, target=target, dispatch_fn=dispatch_fn, model=model)
+    # Reset so a stale failure from a prior cluster cannot be attributed to
+    # this one: ``_last_dispatch_error`` is process-global, and
+    # ``propose_lessons`` may run ``_one`` in parallel via a thread pool, so
+    # the stored text after a batch is "the last failure of the last-finishing
+    # batch", not per-cluster.
+    _reset_dispatch_error()
+
+    stats: dict = {}
+    proposals = propose_lessons(
+        rows, target=target, dispatch_fn=dispatch_fn, model=model, stats=stats,
+    )
     result = consolidate(proposals, member_trace_ids=member_trace_ids)
+    if stats.get("calls", 0) > 0 and stats.get("failed", 0) == stats["calls"]:
+        return "", {
+            "target": target,
+            "reason": "dispatch failed",
+            "model": _resolve_model(model),
+            "error": _last_dispatch_error,
+        }
     if not result.kept:
         return "", {
             "target": target,
