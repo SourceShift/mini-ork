@@ -2,12 +2,11 @@
 
 The kickoff mandates:
   * classify_kind — 3 trace-field complaints → framework, 3 prompt/code
-    guidance → task. Real signals from the live DB (gradient_records) are
-    ideal; the cases here are synthetic and faithful to the live-DB
-    paraphrase families described in the kickoff. Swap them for verbatim
-    live-DB strings in a follow-up once a read-only sweep over the live
-    state.db is convenient.
-  * Paraphrases join one theme.
+    guidance → task, using VERBATIM live-DB signals (see the query below),
+    plus two regression probes (``reward_score missing`` → framework and
+    "the target file" → task).
+  * Paraphrases join one theme at the DEFAULT ``MO_THEME_SIM`` (no
+    hand-picked low threshold).
   * Determinism — two runs → identical theme ids.
   * assign_new is incremental — second call assigns 0.
   * n_runs counts distinct runs through evidence → execution_traces.run_id.
@@ -15,10 +14,33 @@ The kickoff mandates:
     a `wontfix` status a human set survives.
   * A DB without migration 0063 still works (ensure_schema).
 
+Live-DB signal selection (read-only probe of
+``/Volumes/docker-ssd/ps/mini-ork/.mini-ork/state.db``, URI ``?mode=ro``):
+
+    SELECT gradient_id, target, signal, suggested_change
+      FROM gradient_records
+     ORDER BY gradient_id;
+
+Classified in Python with the fixed ``FRAMEWORK_FIELDS`` regex over
+``target + signal + suggested_change``; the first 3 ``framework`` rows and the
+first 3 ``task`` rows were pasted verbatim into ``test_classify_kind_*``
+below. The read gives 7,480 / 10,338 (72.4%) framework — the kickoff's "58%"
+is not reproducible because the regex is substring-based and task lessons that
+merely mention a field name classify as framework. Which fields drive the
+difference (rows matching each field among the 7,480 framework rows; a row can
+match several): ``verifier_output`` 2,199, ``reviewer_verdict`` 1,866,
+``reward_\\w+`` 1,637, ``duration_ms`` 1,573, ``tool_calls`` 1,526,
+``files_read`` 1,449, ``cost_usd`` 1,354, ``node_type`` 1,324,
+``finish_reason`` 1,229, ``files_written`` 1,207, ``run context`` 1,125,
+``context_bundle_hash`` 1,013, ``recipe_fallback`` 940,
+``prompt_version_hash`` 790, ``process_reward`` 551, ``trace_id`` 65. See fix
+1's proof note.
+
 Pure stdlib + sqlite3. No network. Temp DB per test.
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -123,33 +145,62 @@ def _seed_gradient(
 
 
 @pytest.mark.parametrize(
-    "signal",
+    "target,signal,change",
     [
-        # Trace-field complaints — these are the bug-in-tracing class.
-        "verifier_output for this node is only {node_type: researcher}",
-        "this node's verifier_output records only {node_type: planner}",
-        "tool_calls empty for this run; duration_ms = 0; cost_usd missing",
-        # Live-DB vocabulary the FRAMEWORK_FIELDS regex covers.
-        "execution_traces.run_id is INTEGER not TEXT and the join fails",
-        "the gradient record's context_bundle_hash is recomputed each run",
-        "reward_g is None for every trace and reviewer_verdict is missing",
+        # Three verbatim live-DB framework signals (query in the module docstring).
+        (
+            "workflow.edge.verifier_to_status",
+            "Run status was set to 'success' directly from the verifier verdict even though workflow_version_id is null and reviewer_verdict is absent, meaning the success edge has no secondary check.",
+            "Gate the verifier→status edge on a completeness predicate (workflow_version_id present, duration_ms > 0) and route incomplete traces to a 'needs_review' status instead of 'success'.",
+        ),
+        (
+            "verifier.cost_and_duration_sanity",
+            "cost_usd=0.0 and duration_ms=0 on a planning trace that supposedly produced a plan.json — these zero values are sentinel-like and suggest metrics were never captured.",
+            "Add a sanity verifier that flags traces where both cost_usd==0 and duration_ms==0 as 'metrics_missing' rather than 'success', forcing instrumentation fixes upstream.",
+        ),
+        (
+            "workflow.edge.planner_to_verifier",
+            "final_artifact_ref is set but verifier_output={} — the edge handed off an artifact without running any verification gate.",
+            "Convert this edge from fire-and-forget to a gated handoff: verifier must emit a non-empty JSON with at least {schema_ok, files_referenced, acceptance_criteria_count} before status can flip to success.",
+        ),
+        # Regression probe (fix 1): `reward_\w+` must match a bare
+        # `reward_`-prefixed token — the old `reward(_|s)?` with a trailing
+        # ``\b`` failed before the word char in ``reward_score``.
+        ("", "reward_score missing", ""),
     ],
 )
-def test_classify_kind_framework(signal: str) -> None:
-    assert th.classify_kind("verifier.researcher", signal, "fix") == "framework"
+def test_classify_kind_framework(target: str, signal: str, change: str) -> None:
+    assert th.classify_kind(target, signal, change) == "framework"
 
 
 @pytest.mark.parametrize(
-    "signal",
+    "target,signal,change",
     [
-        # Prompt/code guidance — those are task lessons.
-        "set session.timeout to 1800s; the default 600s is too tight for embed",
-        "use the existing gradient_store.dedup_sim env, not a new constant",
-        "the implementer should respect scope_allow and not edit the gate",
+        # Three verbatim live-DB task signals (query in the module docstring;
+        # the first three task rows in gradient_id order are used, skipping the
+        # one seeded stub row ``e1-test-cross-class-seed``).
+        (
+            "workflow.node.planner",
+            "Planner emitted a blocker with identical human questions echoed across blocked.json, plan.json, and execute.log instead of attempting partial execution or degraded mode.",
+            "Make planner classify missing inputs as hard-block vs soft-block; soft-blocks should proceed with documented assumptions captured in plan.json rather than halting the whole run.",
+        ),
+        (
+            "agent.implementer.prompt",
+            "362s wall-clock and $2.13 spent producing only a log file (no source files written) indicates the implementer prompt let the agent monologue instead of acting on the dispatcher feature.",
+            "Tighten implementer prompt to require explicit 'edits made:' and 'files touched:' sections backed by tool calls, and cap cost/duration with an early-exit instruction when no edits are produced within N minutes.",
+        ),
+        (
+            "workflow.recipe.researcher_qdrant_contract",
+            "A single blocking question from the planner aborted the whole pipeline, leaving 4 promised artifacts unwritten and no fallback path to partial remediation analysis.",
+            "Add a clarifier/assumption-resolver node between planner and implementer that either auto-resolves with documented assumptions or downgrades to a scoped best-effort run, so blocked planners don't zero out the entire recipe.",
+        ),
+        # Regression probe (fix 1): `target` is dropped from FRAMEWORK_FIELDS,
+        # so ordinary English "the target file" is a task lesson, not framework.
+        ("verifier.researcher", "the target file was not written by the node", "write the target file"),
     ],
 )
-def test_classify_kind_task(signal: str) -> None:
-    assert th.classify_kind("verifier.researcher", signal, "fix it") == "task"
+def test_classify_kind_task(target: str, signal: str, change: str) -> None:
+    assert th.classify_kind(target, signal, change) == "task"
 
 
 # ── normalize + paraphrase ──────────────────────────────────────────────────
@@ -158,12 +209,13 @@ def test_classify_kind_task(signal: str) -> None:
 def test_normalize_collapses_identifiers() -> None:
     a = "verifier_output for this node is only {node_type: researcher}"
     b = "this node's verifier_output records only {node_type: planner}"
-    # Both paraphrase to the same string: trace ids collapse, hex collapses,
-    # paths collapse, numbers collapse, but the prose and the
-    # ``{node_type: …}`` token survive (we don't touch quoted JSON keys here
-    # because the colon + identifier isn't a JSON *value*). The HashEmbedder
-    # is content-only at the token level, so what matters is that ``node_type``
-    # and ``verifier_output`` both appear in BOTH normalized strings.
+    # Both paraphrase to DIFFERENT strings (they are the same idea, not the
+    # same sentence): trace ids collapse, hex collapses, paths collapse,
+    # numbers collapse, but the prose and the ``{node_type: …}`` token survive
+    # (we don't touch quoted JSON keys here because the colon + identifier
+    # isn't a JSON *value*). What matters for TF-IDF is that ``node_type`` and
+    # ``verifier_output`` both appear in BOTH normalized strings, so the two
+    # paraphrases share their discriminating tokens and join at a high cosine.
     na = th.normalize(a)
     nb = th.normalize(b)
     assert "verifier_output" in na and "node_type" in na
@@ -219,7 +271,7 @@ def test_representative_populated_after_assign(db: str) -> None:
             evidence=f"tr-r{i}",
             created_at=i,
         )
-    th.assign_new(db, sim=0.3)
+    th.assign_new(db)
     con = sqlite3.connect(db)
     row = con.execute(
         "SELECT representative FROM lesson_themes"
@@ -236,11 +288,14 @@ def test_paraphrases_join_one_theme(db: str) -> None:
     unrelated gradient lands in a DIFFERENT theme. The kickoff's exact
     paraphrases drive this test.
 
-    ``HashEmbedder`` cosine on normalized paraphrases sits around 0.45 — below
-    the default ``MO_THEME_SIM=0.6`` but well above unrelated gradients (which
-    cluster at < 0.1). The kickoff's ``MO_THEME_SIM=0.6`` is the production
-    default; this test runs the proof at ``sim=0.3`` so the paraphrase
-    contract is exercised without contradicting the documented default.
+    TF-IDF down-weights the shared telemetry tokens (``verifier_output``,
+    ``node_type`` — in a real DB these appear in thousands of signals) and that
+    LOWERS the pair's cosine. The pair still joins above the default
+    ``MO_THEME_SIM`` because the two paraphrases share their discriminating
+    tokens (``node``, ``only``, …) and differ only in incidental prose, while
+    the unrelated dedup note shares no tokens at all and clusters at ~0. The
+    test runs at the DEFAULT threshold — the kickoff forbids a hand-picked low
+    ``sim``.
     """
     _seed_gradient(
         db,
@@ -279,6 +334,63 @@ def test_paraphrases_join_one_theme(db: str) -> None:
     assert rows[2][1] != rows[0][1]  # unrelated gradient is a different theme
 
 
+def test_novel_vocabulary_paraphrases_share_theme(db: str) -> None:
+    """Two paraphrases using vocabulary ABSENT from the persisted IDF still
+    share one theme (review round 1 BLOCKER).
+
+    Before the fix a token missing from ``theme_idf`` got weight 0 in
+    ``_vector``/``_query_tokens``, so the pair's shared novel tokens
+    contributed nothing and the two paraphrases split into unrelated themes.
+    Unseen tokens now get the df=0 smoothed weight ``log(1 + n)``, so fresh
+    vocabulary is up-weighted and the pair joins.
+
+    The seed count matters: adding 2 to 40 stays under the 25% IDF-rebuild
+    threshold, so the novel tokens remain unseen by the persisted IDF — the
+    exact path that used to zero them.
+    """
+    # Seed enough gradients that the two additions do not trigger an IDF
+    # rebuild (40 -> 42 is < 1.25x), then assign so the IDF is persisted over
+    # the seed vocabulary only.
+    for i in range(40):
+        _seed_gradient(
+            db,
+            gid=f"gr-seed{i}",
+            signal=f"verifier_output for trace {i} only {{node_type: researcher}}",
+            evidence=f"tr-seed{i}",
+            created_at=i,
+        )
+    th.assign_new(db)
+
+    _seed_gradient(
+        db,
+        gid="gr-nov1",
+        signal="sandbox_snapshot_id is lost after microvm_resume restores the field",
+        evidence="tr-nov1",
+        created_at=100,
+    )
+    _seed_gradient(
+        db,
+        gid="gr-nov2",
+        signal="after microvm_resume the sandbox_snapshot_id field is null, not restored",
+        evidence="tr-nov2",
+        created_at=101,
+    )
+    report = th.assign_new(db)
+    assert report["assigned"] == 2
+
+    con = sqlite3.connect(db)
+    rows = list(
+        con.execute(
+            "SELECT gradient_id, theme_id FROM gradient_theme"
+            "  WHERE gradient_id IN ('gr-nov1', 'gr-nov2')"
+            "  ORDER BY gradient_id"
+        )
+    )
+    con.close()
+    assert rows[0][0] == "gr-nov1" and rows[1][0] == "gr-nov2"
+    assert rows[0][1] == rows[1][1]  # novel paraphrases share ONE theme
+
+
 def test_assign_new_is_incremental(db: str) -> None:
     """A second call assigns 0."""
     for i in range(5):
@@ -311,8 +423,8 @@ def test_determinism_two_runs(db: str, tmp_path: Path) -> None:
     for path in (db, db2):
         for gid, sig, ev, ts in rows:
             _seed_gradient(db=path, gid=gid, signal=sig, evidence=ev, created_at=ts)
-    th.assign_new(db, sim=0.3)
-    th.assign_new(db2, sim=0.3)
+    th.assign_new(db)
+    th.assign_new(db2)
 
     def _ids(p: str) -> list[str]:
         con = sqlite3.connect(p)
@@ -338,7 +450,7 @@ def test_n_runs_counts_distinct_runs(db: str) -> None:
         ("gr-n3", "tr-n3", 12, 3),  # different run
     ]:
         _seed_gradient(db, gid=gid, signal="verifier_output is only {node_type: x}", evidence=ev, run_id=rid, created_at=ts)
-    th.assign_new(db, sim=0.3)
+    th.assign_new(db)
     con = sqlite3.connect(db)
     row = con.execute("SELECT n_runs FROM lesson_themes").fetchone()
     con.close()
@@ -351,12 +463,14 @@ def test_n_runs_counts_distinct_runs(db: str) -> None:
 def test_rollup_creates_one_row_per_qualifying_theme(db: str) -> None:
     """Six framework themes with ≥ 5 members each → six bug_reports rows.
 
-    Each "node i" group uses a distinct, token-disjoint vocabulary so the
-    HashEmbedder keeps the six themes separate. The vocabulary below was
-    chosen so every pairwise cross-group cosine is below 0.45 (verified
-    manually); the test runs at ``sim=0.5`` so the cross-group members
-    reject the existing theme and start a new one. Within each group the
-    5 members share a vocabulary, so they cluster.
+    Each group uses a distinct vocabulary, so the six themes stay separate at
+    the DEFAULT threshold. The three tokens every group shares
+    (``framework_signal_N`` after normalize, ``node_type``, ``researcher``)
+    have a low IDF — they appear in all 30 gradients — so cross-group cosine
+    is ~0.08, while within-group cosine is 1.0 (the five members normalize to
+    identical strings). TF-IDF's down-weighting of the shared telemetry
+    vocabulary is exactly what keeps them apart without a hand-picked
+    ``sim``.
     """
     vocabularies = [
         "alpha bravo charlie delta echo",
@@ -375,7 +489,7 @@ def test_rollup_creates_one_row_per_qualifying_theme(db: str) -> None:
                 evidence=f"tr-r{i}-{j}",
                 created_at=i * 10 + j,
             )
-    th.assign_new(db, sim=0.5)
+    th.assign_new(db)
     n = th.rollup_framework_bugs(db, min_members=5)
     assert n == 6
 
@@ -395,7 +509,7 @@ def test_rollup_is_idempotent(db: str) -> None:
             evidence=f"tr-id{i}",
             created_at=i,
         )
-    th.assign_new(db, sim=0.3)
+    th.assign_new(db)
     n1 = th.rollup_framework_bugs(db, min_members=3)
     assert n1 == 1
     n2 = th.rollup_framework_bugs(db, min_members=3)
@@ -417,7 +531,7 @@ def test_rollup_preserves_wontfix(db: str) -> None:
             evidence=f"tr-w{i}",
             created_at=i,
         )
-    th.assign_new(db, sim=0.3)
+    th.assign_new(db)
     n1 = th.rollup_framework_bugs(db, min_members=3)
     assert n1 == 1
 
@@ -450,7 +564,7 @@ def test_rollup_skips_below_min_members(db: str) -> None:
             evidence=f"tr-s{i}",
             created_at=i,
         )
-    th.assign_new(db, sim=0.3)
+    th.assign_new(db)
     n = th.rollup_framework_bugs(db, min_members=5)
     assert n == 0
 
@@ -492,7 +606,8 @@ def test_assign_new_works_on_db_without_migration(tmp_path: Path) -> None:
 
 
 def test_backfill_dry_run_does_not_touch_source(db: str) -> None:
-    """``backfill --dry-run`` file-copies the source and runs against the copy."""
+    """``backfill --dry-run`` snapshots the source into ``:memory:`` and runs
+    against the snapshot, writing nothing to the source or to ``$TMPDIR``."""
     _seed_gradient(
         db,
         gid="gr-d0",
@@ -500,15 +615,23 @@ def test_backfill_dry_run_does_not_touch_source(db: str) -> None:
         evidence="tr-d0",
         created_at=1,
     )
-    # Hash source before, run dry-run, hash source after.
+    # Snapshot $TMPDIR and the source hash before, compare after — the run
+    # must neither write to the source nor drop a scratch file on disk.
+    import glob
+    import tempfile
+    pattern = os.path.join(tempfile.gettempdir(), "themes-dryrun-*")
+    tmp_before = set(glob.glob(pattern))
     h0 = _sha(db)
     out = th.backfill(db, dry_run=True)
     h1 = _sha(db)
     assert h0 == h1
     assert out["dry_run_source"] == db
-    assert out["dry_run_scratch"] != db
+    assert out["dry_run_scratch"] == ":memory:"
     assert out["wall_seconds"] >= 0
     assert out["assigned_in_run"]["assigned"] >= 1
+    # No new scratch file may appear in $TMPDIR (fix 5). Snapshot-before so
+    # pre-existing orphans from an older run can't make this flaky.
+    assert set(glob.glob(pattern)) == tmp_before
 
 
 def _sha(path: str) -> str:

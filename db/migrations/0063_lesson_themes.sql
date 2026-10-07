@@ -15,12 +15,19 @@
 -- still works because every entry point calls themes.ensure_schema() first;
 -- the migration exists for version-migration discipline, not correctness.
 --
--- Two tables:
+-- Three tables:
 --   lesson_themes — one row per theme (kind, representative, centroid, sizes).
 --   gradient_theme — many-to-one gradient → theme mapping, with similarity.
+--   theme_idf — per-token document frequency for the TF-IDF centroid.
 --
 -- `bug_report_id` is a soft FK to bug_reports(id) — no constraint, since the
 -- migration is additive and we do not want a circular dependency at apply.
+--
+-- theme_idf: ``df`` counts how many gradient_records.signal contain the token.
+-- One sentinel row — token = the NUL-prefixed string '\x00N' (which
+-- normalize() can never emit; its output is printable ASCII) — stores the
+-- total gradient count N in its ``df`` column. themes.assign_new re-reads this
+-- table on every call and rebuilds it when N has grown by >= 25%.
 
 PRAGMA foreign_keys = OFF;
 
@@ -33,6 +40,7 @@ CREATE TABLE IF NOT EXISTS lesson_themes (
   centroid      BLOB NOT NULL,
   n_gradients   INTEGER NOT NULL DEFAULT 0,
   n_runs        INTEGER NOT NULL DEFAULT 0,
+  n_at_refresh  INTEGER NOT NULL DEFAULT 0,
   first_seen    INTEGER,
   last_seen     INTEGER,
   lesson_text   TEXT,
@@ -49,6 +57,11 @@ CREATE TABLE IF NOT EXISTS gradient_theme (
 
 CREATE INDEX IF NOT EXISTS idx_gradient_theme_theme
   ON gradient_theme(theme_id);
+
+CREATE TABLE IF NOT EXISTS theme_idf (
+  token TEXT PRIMARY KEY,
+  df    INTEGER NOT NULL
+);
 
 PRAGMA foreign_keys = ON;
 
