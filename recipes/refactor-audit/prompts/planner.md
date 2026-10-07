@@ -71,7 +71,3 @@ those break the parser. Emit ONE `{ ... }` and STOP.
 
 --- KICKOFF ---
 {{KICKOFF_CONTENT}}
-
-<!-- applied:gradient_records:gr-388d3a5e7b10 -->
-- Observation: The planner appears to have produced a plan without reading repository context or invoking tools. In a refactor audit, a context-free plan is likely generic and weakly tied to the actual codebase.
-- Directive: Update the planner prompt to require repo-grounded discovery before drafting: inspect target files, summarize observed structure, identify constraints, then produce the plan. Include a mandatory 'evidence used' field in the planner output.

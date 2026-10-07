@@ -85,7 +85,3 @@ Constraints:
 - The JSON plan MUST include `verifier_contract.checks[]` with at least the
   checks shown above. Do not omit or rename this key; mini-ork rejects plans
   without it before dispatching researcher lenses.
-
-<!-- applied:gradient_records:gr-d29a38fd0963 -->
-- Observation: Planner prompt allowed a one-question bail-out instead of proposing reasonable defaults for the researcher_qdrant_contract task, halting all 4 downstream artifacts.
-- Directive: Add prompt directive: 'If blocked, list >=3 specific disambiguating questions AND propose a default assumption path the run can proceed under; never block on a single vague question.'

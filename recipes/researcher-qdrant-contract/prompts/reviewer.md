@@ -58,7 +58,3 @@ Rules:
 - If any split-brain writer is introduced, verdict MUST be `reject`.
 - If `--dry-run` is not actually gating writes, verdict MUST be `reject`.
 - Do NOT emit `<z-insight>` blocks.
-
-<!-- applied:gradient_records:gr-12809214f154 -->
-- Observation: Reviewer correctly tagged 'missing_verifier_contract' but no remediation path or owner is attached — verdict is terminal rather than routable.
-- Directive: Extend reviewer prompt to emit {verdict, missing_artifact, suggested_owner_node, retry_policy} so missing-contract verdicts auto-route back to the contract author instead of marking the run failed.

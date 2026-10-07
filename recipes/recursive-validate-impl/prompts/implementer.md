@@ -59,7 +59,3 @@ Rules:
   them.
 - Do not claim verifier success. Verifier nodes own pass/fail.
 - Keep commands and evidence paths reproducible from the repo root.
-
-<!-- applied:gradient_records:gr-354ca01c7d27 -->
-- Observation: Implementer produced a zero-diff output for a feature whose DoD explicitly required new files (lib/operation_tree.sh, bin/mini-ork-cancel, lifecycle wiring, tests, implementer-summary.json), indicating the prompt did not enforce a 'no-op is a failure mode' contract.
-- Directive: Update the implementer prompt to require an explicit declaration block listing every file it created/modified with paths and to fail loudly (emit status=blocked with reason) rather than emit an empty diff when it cannot produce the DoD artifacts.

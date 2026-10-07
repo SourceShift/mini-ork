@@ -89,7 +89,3 @@ Rules:
   `implementer_jest_invariants`, `verifier_tier2_unit`). The `id` is free-form;
   the `node_type` is the closed enum. Never push a descriptive label into
   `node_type`.
-
-<!-- applied:gradient_records:gr-11f4aba904d9 -->
-- Observation: Planner emitted a workflow whose node types didn't match the allowed set, indicating the prompt does not constrain or enumerate the valid node_type vocabulary for this task class.
-- Directive: Inject the current allowed node_type registry (with one-line descriptions) into the planner prompt as a hard constraint block, and require the planner to echo each chosen node_type back against that list before emitting the plan.

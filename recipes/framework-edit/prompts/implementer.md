@@ -16,7 +16,3 @@ Rules:
   the verifier writes it.
 
 The diff is the deliverable. Do not commit and do not apply the patch to main.
-
-<!-- applied:gradient_records:gr-1c9d2fad50a1 -->
-- Observation: The implementer wrote a very broad set of files for a `framework_edit`, including two complete skill directories, unrelated kickoffs, scripts, a tweet-replies file, and `skills-lock.json`, alongside the expected runtime and test files.
-- Directive: Constrain the implementer prompt to an explicit task-scoped file allowlist and require justification before modifying files outside the plan. Add a cleanup or rejection check for unrelated workspace writes.

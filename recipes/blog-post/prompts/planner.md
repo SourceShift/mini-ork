@@ -47,7 +47,3 @@ else (no prose preamble, no markdown fence):
 --- kickoff brief ---
 
 {{KICKOFF_CONTENT}}
-
-<!-- applied:gradient_records:gr-59a2f4c2cbf5 -->
-- Observation: Planner prompt apparently treats run_profile as mandatory and asks human questions verbatim rather than inferring from the kickoff's stated success criteria (1200 words, four techniques, first-person, CTA).
-- Directive: Update planner prompt to extract run_profile defaults from the kickoff's success_criteria block and only escalate to human when truly ambiguous (e.g. tone conflict, audience mismatch).

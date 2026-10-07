@@ -20,6 +20,36 @@ Reject if `verdict.json` does not use exactly these keys in this order in
 documentation and examples: `files_changed`, `tests_pass`, `static_pass`,
 `pass`.
 
-<!-- applied:gradient_records:gr-becc5b498213 -->
-- Observation: Reviewer spent 111s and $0.65 producing only a JSON stub with node_type and finish_reason — no findings, no rationale, no file references. The prompt is not forcing structured evidence-bound output.
-- Directive: Rewrite the reviewer prompt to require a findings[] array where each finding cites file:line and quotes the offending snippet, and make verdict_revise invalid unless findings[] is non-empty. Cap thinking budget so cost matches the depth of output.
+---
+
+## Output contract: findings
+
+Every review JSON MUST include a `findings` array. A review that reports no
+structured findings is not a review. Each entry:
+
+```json
+{
+  "file": "<repo-relative path of the changed file>",
+  "line": 42,
+  "severity": "high",
+  "snippet": "<the offending line or fragment, quoted verbatim>",
+  "issue": "<one sentence: the defect and why it matters>"
+}
+```
+
+| Field | Rules |
+|---|---|
+| `file` | Repo-relative path. Never absolute, never a bare basename. |
+| `line` | 1-based line number in the changed file. |
+| `severity` | Exactly one of: `high`, `medium`, `low`. |
+| `snippet` | The offending text, copied verbatim from the diff or file. |
+| `issue` | One sentence. Name the defect, not the category. |
+
+A `needs_revision` verdict (the runtime's name for the `revise` verdict above)
+MUST carry at least one finding — a revision request with an empty `findings`
+array is a contract violation. A `reject` verdict MUST also carry at least one
+finding. An `approve` verdict MAY carry an empty array.
+
+Findings are the machine-readable form of the review and are read by the IDE's
+"Your code" view, so they are part of the contract, not decoration: cite the
+file and line you actually inspected.

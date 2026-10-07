@@ -108,7 +108,3 @@ after the JSON.
 - Reformat the entire file — only touch the lines the plan targets.
 - Write your own tests (verifier nodes handle that).
 - Leave a TODO comment as a substitute for an implementation.
-
-<!-- applied:gradient_records:gr-d8d6a0740ee5 -->
-- Observation: The implementer treated backup/ as an acceptable working location and asserted passing tests from that environment despite the kickoff naming real source and test paths. The prompt did not sufficiently constrain path authority or verification claims.
-- Directive: Strengthen the implementer prompt to state that kickoff paths are authoritative, backup directories are never valid targets unless explicitly named, and verification claims must use the exact command and cwd specified by the recipe. Require explicit disclosure when a required path is missing instead of substituting nearby files.

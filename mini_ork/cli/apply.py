@@ -134,6 +134,17 @@ USAGE_TEXT = (
     "Flags:\n"
     "  --enable        Set MO_APPLY_ENABLED=1 for this call (master gate; default off)\n"
     "\n"
+    "Revert (only-verified-learnings rule):\n"
+    "  mini-ork apply --revert-unverified [--dry-run]\n"
+    "                  [--files-only | --db-only]\n"
+    "                  Remove every prompt directive that was not EARNED by a\n"
+    "                  measured (probe/code) promote, record the removal in\n"
+    "                  promotion_records, and quarantine the matching\n"
+    "                  version_registry rows. --files-only edits the prompt\n"
+    "                  files only (no DB write); --db-only records and\n"
+    "                  quarantines from DB state alone (post-merge, when the\n"
+    "                  on-disk markers are already gone).\n"
+    "\n"
 )
 
 
@@ -206,6 +217,18 @@ def _now() -> str:
     is NOT a strftime directive, so it stays a literal '%f' in the output.
     Kept verbatim for parity."""
     return time.strftime("%Y-%m-%dT%H:%M:%fZ", time.gmtime())
+
+
+def _opt_float(value):
+    """Best-effort float for audit payloads. None/""/non-numeric -> None, so a
+    malformed utility string can never turn a successful promote into a crash
+    while the sidecar entry is being assembled."""
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -685,7 +708,8 @@ def _directive_block(new_prompt: str, *, source_ref: str = "",
     return "\n".join(lines)
 def apply_mutation(candidate_id: str, target_file: str, new_prompt: str,
                    db: str | None = None, *, source_ref: str = "",
-                   context: str = "") -> str:
+                   context: str = "", source_id: str = "", scorer: str = "",
+                   n=None, before=None, after=None) -> str:
     """On PROMOTED decisions, mutate the target prompt file and write a
     version_registry row. NO-OP (returns "") unless MO_APPLY_ENABLED=1 and
     MO_APPLY_DRY_RUN is unset/0. Returns the version_id ("" when skipped or
@@ -744,6 +768,26 @@ def apply_mutation(candidate_id: str, target_file: str, new_prompt: str,
     except OSError:
         sys.stderr.write(f"apply_apply_mutation: FAILED to write {target_file}\n")
         raise
+
+    # Sidecar: the per-recipe record of which directive blocks were EARNED, and
+    # on what scorer. `scan`/`verification` (mini_ork/learning/prompt_directives)
+    # are the reversal path; this is the forward path that makes a future
+    # unverified promotion detectable without a DB query. It lands next to the
+    # target (dirname), so a tmp_path target keeps tests hermetic. Fail-open:
+    # the promote already happened; a sidecar fault must not unwind it.
+    try:
+        from mini_ork.learning import prompt_directives as _pd
+        _pd.append_sidecar_entry(
+            target_file,
+            source_id=source_id or (
+                source_ref.split(":", 1)[1] if ":" in source_ref else source_ref),
+            candidate_id=candidate_id,
+            scorer=scorer,
+            n=n, before=before, after=after,
+            source_ref=source_ref,
+        )
+    except Exception:
+        pass
 
     # Record the version. kind='agent' because prompt rewrites are agent-side
     # changes. The payload carries both file texts — ``content`` is what this
@@ -1265,7 +1309,12 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
             version_id = apply_mutation(
                 candidate_id, target_file, suggested_change, db=db,
                 source_ref=f"{source_kind}:{source_id}" if source_id else "",
-                context=parsed.get("signal", ""))
+                context=parsed.get("signal", ""),
+                source_id=source_id,
+                scorer=scorer,
+                n=int(probe_result.get("n", 0)) if probe_result else 0,
+                before=_opt_float(utility_before),
+                after=_opt_float(utility_after))
         except OSError:
             # bash: `version_id=$(apply_apply_mutation ... || true)` swallows
             # the write-failure rc; the flow continues with an empty id.
@@ -1494,12 +1543,67 @@ def _resolve_target_name(target: str, root: str) -> str:
     return target
 
 
+def _revert_unverified_main(argv: list[str], root: str) -> int:
+    """``mini-ork apply --revert-unverified [--dry-run] [--files-only|--db-only]``.
+
+    Parsed in its own branch, before the classic loop: this invocation carries
+    neither ``--task-class`` nor ``--target``, and ``--files-only`` / ``--db-only``
+    would otherwise hit the unknown-flag reject. ``--dry-run`` here means
+    revert-dry-run (compute, mutate nothing) — not the ``MO_APPLY_DRY_RUN`` env
+    export the classic path performs. Prints the result JSON on stdout, rc 0.
+    """
+    dry_run = False
+    files = True
+    record = True
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--revert-unverified":
+            i += 1
+            continue
+        if arg == "--dry-run":
+            dry_run = True
+            i += 1
+            continue
+        if arg == "--files-only":
+            files, record = True, False
+            i += 1
+            continue
+        if arg == "--db-only":
+            files, record = False, True
+            i += 1
+            continue
+        if arg in ("--help", "-h"):
+            sys.stdout.write(USAGE_TEXT)
+            return 0
+        sys.stderr.write(f"Unknown flag: {arg}\n")
+        sys.stderr.write(USAGE_TEXT)
+        return 2
+
+    home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
+    db = os.environ.get("MINI_ORK_DB") or os.path.join(home, "state.db")
+    os.environ.setdefault("MINI_ORK_HOME", home)
+    os.environ.setdefault("MINI_ORK_DB", db)
+
+    from mini_ork.learning import prompt_directives as _pd
+    result = _pd.revert_unverified(root, db, dry_run=dry_run, files=files,
+                                   record=record)
+    sys.stdout.write(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI dispatcher. Returns the exit code (mirrors bin/mini-ork-apply)."""
     if argv is None:
         argv = sys.argv[1:]
 
     root = _resolve_root()
+
+    # `--revert-unverified` is a self-contained invocation (no --task-class /
+    # --target) with its own flag set; it must intercept argv before the
+    # classic loop rejects those flags and before the required-flag checks.
+    if "--revert-unverified" in argv:
+        return _revert_unverified_main(argv, root)
 
     # ── arg parsing (bash `while/case` loop) ────────────────────────────────
     task_class = ""
