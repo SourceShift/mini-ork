@@ -44,7 +44,19 @@ CACHE_FILENAME = "retry-hint.json"
 _RETRY_VERDICTS = ("needs_revision", "reject", "fail")
 
 # Tokens that mean the provider rejected the call on credentials grounds.
-_AUTH_TOKENS = ("401", "403", "credential", "api key", "api_key", "unauthor")
+# The bare "401"/"403" digits live in a separate regex pass (see ``_looks_like_http_auth``)
+# because implementation logs routinely contain ``tokens_in=14012`` or ``cost=$0.21`` —
+# a substring ``in`` check would false-positive on every cost line. The word tokens
+# below are precise enough to be left as ``in`` matches.
+_AUTH_TOKENS = ("credential", "api key", "api_key", "unauthor")
+
+# HTTP status code digits are only auth when they sit near an HTTP/auth context word.
+_HTTP_AUTH_DIGITS = re.compile(r"\b(401|403)\b")
+_HTTP_AUTH_CONTEXT = re.compile(
+    r"(status|http|unauthori[sz]ed|forbidden)", re.IGNORECASE,
+)
+# How close a digit match must be to a context word to count as auth.
+_HTTP_AUTH_PROXIMITY = 30
 
 # Tokens in a verifier reason that mean "this isn't a code problem, the
 # environment can't reach what it needs".
@@ -58,6 +70,31 @@ _VERDICT_RE = re.compile(r'"verdict"\s*:\s*"([^"]+)"')
 
 def _hint_path(home: Path, run_id: str) -> Path:
     return home / "runs" / run_id / CACHE_FILENAME
+
+
+# Terminal-failed run statuses. A non-terminal status (executing, queued, …) means
+# the run is still in flight or has been relaunched — a cached hint from the prior
+# failed attempt would mislead the operator, so ``load_or_compute`` returns ``None``.
+_TERMINAL_FAILED = ("failed", "rolled_back")
+
+
+def _current_run_status(home: Path, run_id: str) -> str:
+    """The run's current ``task_runs.status`` — empty string when the DB is missing
+    or the row is absent. Fail-soft: a missing DB or schema drift is NOT an error.
+    """
+    try:
+        db = db_for(home)
+    except Exception:  # noqa: BLE001
+        return ""
+    try:
+        if not db.has_table("task_runs"):
+            return ""
+        rows = db.rows("SELECT status FROM task_runs WHERE id = ? LIMIT 1", (run_id,))
+    except Exception:  # noqa: BLE001
+        return ""
+    if not rows:
+        return ""
+    return str(rows[0].get("status") or "")
 
 
 def _now_iso() -> str:
@@ -98,19 +135,24 @@ def _recipe_workflow(home: Path, recipe: str) -> tuple[list[dict[str, Any]], lis
 def _topo_order(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> list[str]:
     """Node names in workflow topo order — longest ``depends_on`` chain first.
 
-    Verifier/reviewer/publisher/rollback nodes that follow an ``escalates_to``
-    edge are placed last so a failure at a verifier surfaces before its
-    rollback node (which is structurally a sibling).
+    Control-flow edges (``escalates_to`` and ``retries``) do not contribute to
+    the depth — they are sibling/loop signals, not real ordering constraints.
+    Skipping ``retries`` is what protects the walker from a cycle in recipes
+    that carry real ``edge_type: retries`` edges (e.g. ``prompt-graph-loop``).
+    A visited set on the depth walker is the belt-and-braces guard: any cycle
+    that survives the edge filter (e.g. a depends_on loop) cannot recurse.
     """
     names = [str(n.get("name")) for n in nodes if n.get("name")]
     known = set(names)
     preds: dict[str, set[str]] = {n: set() for n in names}
+    _CONTROL_FLOW_EDGE_TYPES = ("escalates_to", "retries")
     for e in edges:
         src, dst = str(e.get("from") or ""), str(e.get("to") or "")
         if src in known and dst in known and src != dst:
-            if str(e.get("edge_type") or "") == "escalates_to":
-                # escalation does NOT delay the target; if the target has any
-                # non-escalation deps they win.
+            if str(e.get("edge_type") or "") in _CONTROL_FLOW_EDGE_TYPES:
+                # Control-flow edges are not ordering constraints — they are
+                # either a sibling escalation or a retry loop. Either way,
+                # they do not delay the target.
                 continue
             preds.setdefault(dst, set()).add(src)
     for n in nodes:
@@ -120,16 +162,25 @@ def _topo_order(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> lis
                 str(d) for d in deps if d in known
             )
     depth: dict[str, int] = {}
+    visiting: set[str] = set()
 
-    def d(name: str, stack: tuple[str, ...]) -> int:
+    def d(name: str) -> int:
         if name in depth:
             return depth[name]
-        ps = preds.get(name) or set()
-        depth[name] = 0 if not ps else 1 + max(d(p, stack + (name,)) for p in ps)
-        return depth[name]
+        # Cycle guard — a leftover depends_on cycle (or any other loop) must
+        # never recurse, even after the edge filter dropped control-flow.
+        if name in visiting:
+            return 0
+        visiting.add(name)
+        try:
+            ps = preds.get(name) or set()
+            depth[name] = 0 if not ps else 1 + max(d(p) for p in ps)
+            return depth[name]
+        finally:
+            visiting.discard(name)
 
     for n in names:
-        d(n, ())
+        d(n)
     return sorted(names, key=lambda n: depth[n])
 
 
@@ -224,6 +275,19 @@ def _any_other_verifier_hard_failed(run_dir: Path, nodes: list[dict[str, Any]],
     of verifier failure in the run — a parallel REFUTED means a code problem
     is what actually failed the run, not the environment.
     """
+    return _find_other_verifier_hard_failed(run_dir, nodes, edges, target) is not None
+
+
+def _find_other_verifier_hard_failed(run_dir: Path, nodes: list[dict[str, Any]],
+                                     edges: list[dict[str, Any]],
+                                     target: str) -> dict[str, Any] | None:
+    """The first sibling verifier's payload when it has a REFUTED/FAIL verdict.
+
+    Returns ``None`` when every other verifier either passed, is UNVERIFIED,
+    or has no artefact. Used by :func:`_case_code` to surface the sibling's
+    reason as the case-3 detail when the target is UNVERIFIED (case 2 filtered
+    out) but a parallel REFUTED is the real reason the run failed.
+    """
     order = _topo_order(nodes, edges)
     name_to_node = {str(n.get("name")): n for n in nodes if n.get("name")}
     for name in order:
@@ -238,8 +302,8 @@ def _any_other_verifier_hard_failed(run_dir: Path, nodes: list[dict[str, Any]],
             continue
         status = str(verifier.get("status") or "").upper()
         if status in ("REFUTED", "FAIL") or verifier.get("pass") is False and status != "UNVERIFIED":
-            return True
-    return False
+            return verifier
+    return None
 
 
 def _extract_implementer_notes(run_dir: Path) -> list[str]:
@@ -272,11 +336,28 @@ def _verifier_reason(payload: dict[str, Any]) -> str:
 
 
 def _extract_review_detail(text: str) -> str:
-    """Pull the first ``"reasons": […]`` or ``"notes": […]`` block from a review file."""
+    """The first three reviewer reasons (or notes) as plain text, one per line.
+
+    Returns ``""`` when the file is not JSON or carries no ``reasons``/``notes``
+    block. The kickoff mandates plain text (not raw JSON) so the operator sees
+    the reviewer's exact language instead of a comma-and-quote array dump.
+    """
+    if not text:
+        return ""
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        # The review file may have a banner line or trailing log; the JSON
+        # object is the only thing we want to read from.
+        return ""
+    if not isinstance(data, dict):
+        return ""
     for key in ("reasons", "notes"):
-        m = re.search(rf'"{key}"\s*:\s*\[([^\]]*)\]', text)
-        if m:
-            return m.group(1)[:800]
+        items = data.get(key)
+        if isinstance(items, list) and items:
+            lines = [str(x) for x in items[:3] if x]
+            joined = "\n".join(lines)
+            return joined[:800]
     return ""
 
 
@@ -364,6 +445,24 @@ def _failure_class_for_any(home: Path, run_id: str
     return fc, node
 
 
+def _looks_like_http_auth(blob: str) -> bool:
+    """True when ``blob`` contains a bare 401/403 within 30 chars of an HTTP
+    context word. Substring ``in`` matching on digits is unreliable — it
+    matches ``tokens_in=14012`` or ``cost=$0.21``. The proximity check is the
+    smallest rule that keeps both negatives.
+    """
+    lower = blob.lower()
+    if not any(tok in lower for tok in _AUTH_TOKENS):
+        # No word-token auth hit — only count digit matches near an HTTP word.
+        for m in _HTTP_AUTH_DIGITS.finditer(blob):
+            start = max(0, m.start() - _HTTP_AUTH_PROXIMITY)
+            end = min(len(blob), m.end() + _HTTP_AUTH_PROXIMITY)
+            if _HTTP_AUTH_CONTEXT.search(blob[start:end]):
+                return True
+        return False
+    return True
+
+
 def _is_auth(run_dir: Path, node_name: str,
              verifier: dict[str, Any] | None) -> bool:
     """True when the verifier reason OR the node's log mentions an auth token.
@@ -388,19 +487,24 @@ def _is_auth(run_dir: Path, node_name: str,
         (verifier or {}).get("reason") or "",
         (verifier or {}).get("error_summary") or "",
         log_tail,
-    ]).lower()
-    return any(tok in blob for tok in _AUTH_TOKENS)
+    ])
+    return _looks_like_http_auth(blob)
 
 
-def _build_command(strategy: str, run_id: str, *, needs_ack: bool) -> str:
+def _build_command(strategy: str, run_id: str) -> str:
+    """The hint's command string — never embeds ``--ack-change`` or ``--force``.
+
+    The board verb appends those flags on its own when the operator typed them.
+    Baking them into the hint would couple the hint to a particular operator
+    action and make the hint's `command` field unreliable for read-only
+    consumers (the run page, the IDE shell, ``mini-ork recover --strategy
+    verify``).
+    """
     if strategy == "resume-cost":
         return f"mini-ork resume {run_id}"
     if strategy == "none":
         return ""
-    parts = ["mini-ork recover", run_id, "--strategy", strategy]
-    if needs_ack:
-        parts.append("--ack-change")
-    return " ".join(parts)
+    return " ".join(["mini-ork recover", run_id, "--strategy", strategy])
 
 
 def _case_environment(run_dir: Path, recipe: str, home: Path,
@@ -437,7 +541,7 @@ def _case_environment(run_dir: Path, recipe: str, home: Path,
             "evidence": str(verifier.get("evidence_path") or ""),
         },
         "notes": notes,
-        "command": _build_command("verify", run_id, needs_ack=True),
+        "command": _build_command("verify", run_id),
         "computed_at": _now_iso(),
     }
 
@@ -445,18 +549,32 @@ def _case_environment(run_dir: Path, recipe: str, home: Path,
 def _case_code(failed_name: str | None,
                verifier: dict[str, Any] | None,
                review: dict[str, Any] | None,
-               run_id: str) -> dict[str, Any] | None:
+               run_id: str,
+               sibling_hard_fail: dict[str, Any] | None = None) -> dict[str, Any] | None:
     """Case 3: verifier REFUTED/FAIL (not case 2) or reviewer reject/fail/needs_revision.
 
     ``UNVERIFIED`` is case 2's signature — when case 2 did not match (because
     earlier verifiers failed), the failure is treated as code, not environment.
     The command is the bare ``mini-ork recover <run>`` so an operator with
     ``--force`` can still kick the recovery (which is what the board verb does).
+
+    Order of preference for the detail (the operator-facing string):
+
+      1. Reviewer reasons (when ``review`` is needs_revision/reject/fail).
+         The reviewer is authoritative on rework — its language wins.
+      2. A REFUTED/FAIL sibling's reason. The target may be UNVERIFIED (case 2
+         filtered out), but a parallel REFUTED means the code itself is wrong
+         and the operator must see THAT verifier's reason — not an empty
+         string from the UNVERIFIED target.
+      3. The target verifier's own reason (only when it is REFUTED/FAIL —
+         UNVERIFIED is empty here on purpose).
     """
     summary = "The change was judged wrong — it needs a revision"
     detail = ""
     if isinstance(review, dict) and _review_failed(review):
         detail = _extract_review_detail(str(review.get("text") or ""))
+    if not detail and isinstance(sibling_hard_fail, dict):
+        detail = _verifier_reason(sibling_hard_fail)
     if not detail and isinstance(verifier, dict):
         status = str(verifier.get("status") or "").upper()
         if status != "UNVERIFIED":
@@ -529,7 +647,7 @@ def _case_provider_trouble(home: Path, run_id: str, run_dir: Path,
                 "evidence": "",
             },
             "notes": [],
-            "command": _build_command("resume", run_id, needs_ack=True),
+            "command": _build_command("resume", run_id),
             "computed_at": _now_iso(),
         }
 
@@ -551,7 +669,7 @@ def _case_provider_trouble(home: Path, run_id: str, run_dir: Path,
         "from_node": label,
         "needs_change": None,
         "notes": [],
-        "command": _build_command("resume", run_id, needs_ack=False),
+        "command": _build_command("resume", run_id),
         "computed_at": _now_iso(),
     }
 
@@ -611,7 +729,7 @@ def _case_cost_pause(run_id: str) -> dict[str, Any]:
             "evidence": "",
         },
         "notes": [],
-        "command": _build_command("resume-cost", run_id, needs_ack=False),
+        "command": _build_command("resume-cost", run_id),
         "computed_at": _now_iso(),
     }
 
@@ -651,8 +769,15 @@ def compute(home: Path, run_id: str) -> dict[str, Any] | None:
         if env is not None:
             return env
 
-    # Case 3 — code revision needed
-    code = _case_code(failed_name, verifier, review, run_id)
+    # Case 3 — code revision needed. Look up the sibling hard-fail payload
+    # up front so an UNVERIFIED target (case 2 filtered out) still surfaces
+    # the REFUTED sibling's reason as the operator-facing detail.
+    nodes, edges = _recipe_workflow(home, recipe)
+    sibling_hard_fail = _find_other_verifier_hard_failed(
+        run_dir, nodes, edges, failed_name or "",
+    ) if failed_name else None
+    code = _case_code(failed_name, verifier, review, run_id,
+                      sibling_hard_fail=sibling_hard_fail)
     if code is not None:
         return code
 
@@ -669,22 +794,57 @@ def compute(home: Path, run_id: str) -> dict[str, Any] | None:
     return _case_unknown(run_dir, failed_name, run_id, fallback_name=fallback_node)
 
 
-def _cache_dependencies(run_dir: Path) -> dict[str, int]:
-    """Mtimes of every file the hint reads — cache is valid only when fresher than all of them."""
+def _cache_dependencies(home: Path, run_dir: Path) -> dict[str, int]:
+    """Mtimes of every file/state the hint reads — cache is valid only when
+    fresher than all of them.
+
+    The on-disk mtimes alone are not enough: a fresh row in ``node_attempts``
+    or a new ``run_profile.json`` write can flip a case-4 hint or change a
+    case-2 ``from_node`` without touching any artefact file in the run dir.
+    Both feed the cache invalidation so the IDE shell never serves a hint
+    computed against stale state.
+    """
     deps: dict[str, int] = {}
-    if not run_dir.is_dir():
-        return deps
-    for pattern in ("verifier_*.json", "review-*.json", "impl-*.log"):
-        for path in run_dir.glob(pattern):
+    if run_dir.is_dir():
+        for pattern in ("verifier_*.json", "review-*.json", "impl-*.log"):
+            for path in run_dir.glob(pattern):
+                try:
+                    deps[f"{pattern}:{path.name}"] = path.stat().st_mtime_ns
+                except OSError:
+                    pass
+        sentinel = run_dir / ".cost-pause"
+        if sentinel.is_file():
             try:
-                deps[f"{pattern}:{path.name}"] = path.stat().st_mtime_ns
+                deps["sentinel:cost-pause"] = sentinel.stat().st_mtime_ns
             except OSError:
                 pass
-    sentinel = run_dir / ".cost-pause"
-    if sentinel.is_file():
+    # ``run_profile.json`` lives alongside the run dir (home/runs/<id>/..).
+    profile = run_dir / "run_profile.json" if run_dir.is_dir() else None
+    if profile is not None and profile.is_file():
         try:
-            deps["sentinel:cost-pause"] = sentinel.stat().st_mtime_ns
+            deps["run_profile.json"] = profile.stat().st_mtime_ns
         except OSError:
+            pass
+    # node_attempts can move without a corresponding file write — pull the
+    # latest ended_at for the run and use that as a synthetic mtime.
+    run_id = run_dir.name if run_dir.is_dir() else ""
+    if run_id and home is not None:
+        try:
+            db = db_for(home)
+            if db.has_table("node_attempts"):
+                rows = db.rows(
+                    "SELECT MAX(ended_at) AS last_ended FROM node_attempts "
+                    "WHERE run_id = ?",
+                    (run_id,),
+                )
+                if rows and rows[0].get("last_ended"):
+                    # mtime_ns is a virtual second-precision synthetic — the
+                    # cache file's own mtime_ns is real, and the comparison
+                    # only needs a monotonic ordering.
+                    deps["node_attempts:last_ended"] = int(
+                        rows[0]["last_ended"]
+                    ) * 1_000_000_000
+        except Exception:  # noqa: BLE001 — missing state.db: never raise
             pass
     return deps
 
@@ -696,22 +856,44 @@ def load_or_compute(home: Path, run_id: str, *, write: bool = True) -> dict[str,
     hint depends on; otherwise calls :func:`compute` and, when ``write=True``,
     saves the result. When ``write=False``, the hint is never written into
     a real run dir — the IDE page uses that mode.
+
+    A non-terminal run status (executing, queued, …) short-circuits BEFORE the
+    cache read so a relaunched run never returns the prior failed attempt's
+    hint. The cache file is left in place — a status flip back to failed
+    should still find the cached hint on the next call.
     """
     home = Path(home)
     run_dir = home / "runs" / run_id
     cached_path = _hint_path(home, run_id)
-    deps = _cache_dependencies(run_dir)
+    current_status = _current_run_status(home, run_id)
+    # Non-terminal ⇒ no hint, period. The run is in flight or was relaunched;
+    # the cached hint from the prior failed attempt is no longer authoritative.
+    # We intentionally do NOT unlink the cache: a status flip back to failed
+    # should still find it on the next call.
+    if current_status and current_status not in _TERMINAL_FAILED:
+        return None
+    deps = _cache_dependencies(home, run_dir)
     if cached_path.is_file() and deps:
         try:
             cache_mtime = cached_path.stat().st_mtime_ns
             if all(cache_mtime > m for m in deps.values() if m):
                 data = json.loads(cached_path.read_text(encoding="utf-8"))
                 if isinstance(data, dict) and data.get("run_id") == run_id:
-                    return data
+                    # A status change since the hint was cached also invalidates
+                    # the entry — the run may now be re-running on a different
+                    # attempt's artifacts.
+                    if current_status and data.get("status") != current_status:
+                        pass  # fall through to recompute
+                    else:
+                        return data
         except (OSError, ValueError, TypeError):
             pass
     hint = compute(home, run_id)
     if hint is not None and write:
+        # Stamp the current status onto the cache record so the next call can
+        # spot a status change even when the on-disk mtimes have not moved.
+        if current_status:
+            hint["status"] = current_status
         try:
             cached_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = cached_path.with_suffix(".json.tmp")

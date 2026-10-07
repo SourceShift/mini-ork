@@ -45,6 +45,37 @@ edges:
 """
 
 
+# A minimal slice of ``recipes/prompt-graph-loop/workflow.yaml`` — just the
+# two ``edge_type: retries`` edges (lines 150 & 152) and the depends-on
+# graph they feed. The cycle is real: ``recursive_plan_composer`` depends on
+# ``semantic_flow_extractor`` (via reflection_loop → recursive_plan_composer
+# retries), and ``human_feedback_gate`` retries ``semantic_flow_extractor``.
+PROMPT_GRAPH_LOOP_WORKFLOW = """\
+version: 1
+task_class: prompt_graph_loop
+nodes:
+  - {name: planner, type: planner, model_lane: planner, prompt_ref: prompts/planner.md}
+  - {name: implementer, type: implementer, model_lane: worker, prompt_ref: prompts/implementer.md}
+  - {name: live_smoke, type: verifier, verifier_ref: lib/live_smoke.py}
+  - {name: static_check, type: verifier, verifier_ref: verifiers/static-check.py}
+  - {name: reflection_loop, type: agent, model_lane: worker, prompt_ref: prompts/reflection.md}
+  - {name: recursive_plan_composer, type: agent, model_lane: worker, prompt_ref: prompts/recursion.md}
+  - {name: semantic_flow_extractor, type: agent, model_lane: worker, prompt_ref: prompts/semantic.md}
+  - {name: human_feedback_gate, type: verifier, verifier_ref: lib/human_feedback.py}
+  - {name: reviewer, type: reviewer, model_lane: reviewer, prompt_ref: prompts/reviewer.md}
+edges:
+  - {from: planner, to: implementer, edge_type: depends_on}
+  - {from: implementer, to: live_smoke, edge_type: depends_on}
+  - {from: live_smoke, to: static_check, edge_type: depends_on}
+  - {from: static_check, to: reviewer, edge_type: depends_on}
+  - {from: implementer, to: reflection_loop, edge_type: depends_on}
+  - {from: reflection_loop, to: recursive_plan_composer, edge_type: retries, recursive: true}
+  - {from: recursive_plan_composer, to: semantic_flow_extractor, edge_type: depends_on}
+  - {from: human_feedback_gate, to: semantic_flow_extractor, edge_type: retries, recursive: true}
+  - {from: semantic_flow_extractor, to: human_feedback_gate, edge_type: depends_on}
+"""
+
+
 # ── fixtures ───────────────────────────────────────────────────────────────
 
 
@@ -173,7 +204,9 @@ def test_case_2_verifier_unverified_returns_environment(home: Path) -> None:
     assert hint["needs_change"]["kind"] == "environment"
     assert "live_smoke" in hint["needs_change"]["summary"]
     assert any("ONBOARDING_DEMO_BOOK_PATH" in n for n in hint["notes"])
-    assert hint["command"].endswith("--ack-change")
+    # The hint's command string never embeds ``--ack-change`` — the board
+    # verb appends it when the operator typed it. See kickoff fix 6.
+    assert hint["command"] == "mini-ork recover " + RUN + " --strategy verify"
 
 
 def test_case_2_only_when_earlier_verifiers_passed(home: Path) -> None:
@@ -188,6 +221,46 @@ def test_case_2_only_when_earlier_verifiers_passed(home: Path) -> None:
     assert hint is not None
     # earlier static_check did NOT pass → not the verify/environment case
     assert hint["needs_change"]["kind"] != "environment"
+
+
+def test_case_3_when_refuted_sibling_sits_before_unverified(home: Path) -> None:
+    """Kickoff fix 4: a REFUTED sibling is a code change.
+
+    When ``live_smoke`` (REFUTED, earlier in topo order) fails BEFORE
+    ``static-check`` (UNVERIFIED, the would-be case-2 target), the result
+    is case 3 (code) with the REFUTED verifier's reason as the operator
+    detail. Case 2 was filtered out (REFUTED sibling disqualifies it) and
+    the UNVERIFIED target carries an empty reason — the REFUTED sibling
+    wins, so the operator sees a real reason instead of case 5 unknown.
+    """
+    run_dir = _seed_run(home, RUN, status="failed")
+    # Earlier in topo order (planner → implementer → live_smoke → static_check).
+    _write_verifier(run_dir, "live_smoke",
+                    {"verifier": "live_smoke", "pass": False, "status": "REFUTED",
+                     "reason": "compile error in module X"})
+    _write_verifier(run_dir, "static-check",
+                    {"verifier": "static-check", "pass": False, "status": "UNVERIFIED",
+                     "reason": ""})
+    hint = retry_hint.compute(home, RUN)
+    assert hint is not None
+    assert hint["needs_change"]["kind"] == "code"
+    assert "compile error" in hint["needs_change"]["detail"]
+
+
+def test_case_2_when_all_earlier_verifiers_passed(home: Path) -> None:
+    """Kickoff fix 4: when every earlier verifier passed, the UNVERIFIED
+    target IS the case-2 environment (no parallel REFUTED to disqualify it).
+    """
+    run_dir = _seed_run(home, RUN, status="failed")
+    _write_verifier(run_dir, "live_smoke",
+                    {"verifier": "live_smoke", "pass": True, "status": "PROVEN"})
+    _write_verifier(run_dir, "static-check",
+                    {"verifier": "static-check", "pass": False, "status": "UNVERIFIED",
+                     "reason": "backend unreachable — preconditions not met"})
+    hint = retry_hint.compute(home, RUN)
+    assert hint is not None
+    assert hint["needs_change"]["kind"] == "environment"
+    assert hint["strategy"] == "verify"
 
 
 def test_case_2_extracts_implementer_notes_only_relevant_lines(home: Path) -> None:
@@ -209,6 +282,33 @@ def test_case_2_extracts_implementer_notes_only_relevant_lines(home: Path) -> No
                    ("precondition", "must be restarted", "export", "not set", "env"))
 
 
+def test_topo_order_skips_retries_and_breaks_cycles(home: Path) -> None:
+    """Kickoff fix 3: a recipe with real ``edge_type: retries`` edges must not
+    recurse on the topo walker. Before the fix, the depth walker followed
+    ``reflection_loop → recursive_plan_composer`` (a retries edge) which
+    fed back into the depends_on chain and overflowed the recursion limit.
+
+    The test seeds a ``prompt-graph-loop`` recipe workflow with two
+    ``retries`` edges and an UNVERIFIED live_smoke; ``compute()`` must
+    return a case-2 hint without raising.
+    """
+    # Replace the test fixture's recipe with the prompt-graph-loop workflow.
+    recipe = home / "recipes" / "framework-edit"
+    (recipe / "workflow.yaml").write_text(PROMPT_GRAPH_LOOP_WORKFLOW)
+    run_dir = _seed_run(home, RUN, status="failed", recipe="framework-edit")
+    _write_verifier(run_dir, "live_smoke",
+                    {"verifier": "live_smoke", "pass": False, "status": "UNVERIFIED",
+                     "reason": "backend unreachable: preconditions not met"})
+    _write_verifier(run_dir, "static-check",
+                    {"verifier": "static-check", "pass": True, "status": "PROVEN"})
+    hint = retry_hint.compute(home, RUN)
+    assert hint is not None
+    # The retries cycle is dropped from the depth calculation, so the
+    # case-2 environment path still applies.
+    assert hint["needs_change"]["kind"] == "environment"
+    assert hint["strategy"] == "verify"
+
+
 def test_case_3_reviewer_needs_revision_returns_code(home: Path) -> None:
     run_dir = _seed_run(home, RUN, status="failed")
     _write_verifier(run_dir, "live_smoke",
@@ -222,8 +322,34 @@ def test_case_3_reviewer_needs_revision_returns_code(home: Path) -> None:
     assert hint["retryable"] is False and hint["strategy"] == "none"
     assert hint["needs_change"]["kind"] == "code"
     assert "judged wrong" in hint["needs_change"]["summary"]
-    assert "guard clause" in hint["needs_change"]["detail"] or "error handling" in hint["needs_change"]["detail"]
+    # Kickoff fix 5: reasons are joined as plain text, one per line. The
+    # raw JSON array body is never returned.
+    assert "guard clause" in hint["needs_change"]["detail"]
+    assert "error handling" in hint["needs_change"]["detail"]
+    assert "[" not in hint["needs_change"]["detail"]
     assert hint["command"] == ""
+
+
+def test_case_3_reviewer_joins_first_three_reasons(home: Path) -> None:
+    """Kickoff fix 5: the first three reasons are joined with ``\\n``;
+    the 4th and beyond are dropped. Plain text, not raw JSON.
+    """
+    run_dir = _seed_run(home, RUN, status="failed")
+    _write_verifier(run_dir, "live_smoke",
+                    {"verifier": "live_smoke", "pass": True, "status": "PROVEN"})
+    _write_verifier(run_dir, "static-check",
+                    {"verifier": "static-check", "pass": True, "status": "PROVEN"})
+    _write_review(run_dir, "reviewer", "needs_revision",
+                  ["first reason", "second reason", "third reason", "fourth (dropped)"])
+    hint = retry_hint.compute(home, RUN)
+    assert hint is not None
+    detail = hint["needs_change"]["detail"]
+    assert "first reason" in detail
+    assert "second reason" in detail
+    assert "third reason" in detail
+    assert "fourth (dropped)" not in detail
+    # Joined with newlines, not commas/quotes.
+    assert "\n" in detail
 
 
 def test_case_3_verifier_refuted_returns_code(home: Path) -> None:
@@ -269,7 +395,50 @@ def test_case_4_with_auth_token_returns_credentials(home: Path) -> None:
     assert hint is not None
     assert hint["strategy"] == "resume" and hint["retryable"] is True
     assert hint["needs_change"]["kind"] == "credentials"
-    assert hint["command"].endswith("--ack-change")
+    # The hint's command string never embeds ``--ack-change`` — the board
+    # verb appends it when the operator typed it. See kickoff fix 6.
+    assert hint["command"] == "mini-ork recover " + RUN + " --strategy resume"
+
+
+def test_auth_detection_ignores_cost_line_with_14012(home: Path) -> None:
+    """Kickoff fix 2 negative: ``tokens_in=14012`` and ``cost=$0.21`` must NOT
+    classify as auth. The bare-401 substring match was the r1 false-positive.
+    """
+    run_dir = _seed_run(home, RUN, status="failed")
+    _write_verifier(run_dir, "live_smoke",
+                    {"verifier": "live_smoke", "pass": True, "status": "PROVEN"})
+    _write_verifier(run_dir, "static-check",
+                    {"verifier": "static-check", "pass": True, "status": "PROVEN"})
+    _write_review(run_dir, "reviewer", "pass")
+    # The cost line carries ``14012`` and ``0.21`` but no auth context word.
+    _write_impl_log(run_dir, "implementer", [
+        "INFO tokens_in=14012 cost=$0.21 elapsed=2.4s",
+    ])
+    hint = retry_hint.compute(home, RUN)
+    assert hint is not None
+    # No auth hit, no failure_class row ⇒ case 5 unknown, NOT credentials.
+    assert hint["needs_change"]["kind"] != "credentials"
+
+
+def test_auth_detection_matches_http_401_unauthorized(home: Path) -> None:
+    """Kickoff fix 2 positive: ``HTTP 401 Unauthorized`` IS auth.
+
+    The digit match must sit within 30 chars of an HTTP/auth context word
+    (here: ``HTTP`` and ``Unauthorized``). A bare ``401`` without context
+    would not count.
+    """
+    run_dir = _seed_run(home, RUN, status="failed")
+    _write_verifier(run_dir, "live_smoke",
+                    {"verifier": "live_smoke", "pass": True, "status": "PROVEN"})
+    _write_verifier(run_dir, "static-check",
+                    {"verifier": "static-check", "pass": True, "status": "PROVEN"})
+    _write_review(run_dir, "reviewer", "pass")
+    _write_impl_log(run_dir, "implementer", [
+        "POST /v1/chat returned HTTP 401 Unauthorized — provider rejected the call",
+    ])
+    hint = retry_hint.compute(home, RUN)
+    assert hint is not None
+    assert hint["needs_change"]["kind"] == "credentials"
 
 
 def test_case_5_unknown_returns_unclassified(home: Path) -> None:
@@ -329,6 +498,48 @@ def test_cache_recomputes_when_a_dependency_changes(home: Path) -> None:
     second = retry_hint.load_or_compute(home, RUN, write=False)
     assert first is not None and second is not None
     assert second["needs_change"]["detail"] != first["needs_change"]["detail"]
+
+
+def test_load_or_compute_returns_none_for_re_running_run(home: Path,
+                                                          monkeypatch) -> None:
+    """Kickoff fix 1: a cached hint from the prior failed attempt must not be
+    returned while the run is re-running (status is non-terminal).
+
+    The run is seeded as ``failed`` so a hint is computed and cached. Then
+    the status flips to ``executing`` (the run was relaunched) and the next
+    ``load_or_compute`` call must return ``None`` — the cache file is NOT
+    deleted, so a status flip back to ``failed`` still finds it.
+    """
+    run_dir = _seed_run(home, RUN, status="failed")
+    _write_verifier(run_dir, "live_smoke",
+                    {"verifier": "live_smoke", "pass": False, "status": "REFUTED",
+                     "reason": "x"})
+    _write_verifier(run_dir, "static-check",
+                    {"verifier": "static-check", "pass": True, "status": "PROVEN"})
+    first = retry_hint.load_or_compute(home, RUN, write=True)
+    assert first is not None
+    # The cache file now exists; the next test re-uses it after a status flip.
+    cached_path = run_dir / "retry-hint.json"
+    assert cached_path.is_file()
+
+    # Flip the status to executing — the run is now in flight.
+    import sqlite3
+    con = sqlite3.connect(home / "state.db")
+    con.execute("UPDATE task_runs SET status = 'executing' WHERE id = ?", (RUN,))
+    con.commit()
+    con.close()
+    second = retry_hint.load_or_compute(home, RUN, write=True)
+    assert second is None
+    # Cache file is NOT deleted — a future flip back to failed still finds it.
+    assert cached_path.is_file()
+
+    # ``board retry`` on a re-running run → ``ok: false`` "nothing to retry",
+    # no subprocess spawned. The verb's spawn monkeypatch confirms.
+    captured = _patch_spawn(monkeypatch)
+    payload = _run_retry(["retry", RUN, "--home", str(home)], home)
+    assert payload["ok"] is False
+    assert "nothing to retry" in payload["error"]
+    assert "argv" not in captured
 
 
 def test_load_or_compute_with_write_false_does_not_write_cache(home: Path) -> None:
@@ -418,8 +629,17 @@ def test_board_retry_not_retryable_with_force_spawns(home: Path, monkeypatch) ->
     captured = _patch_spawn(monkeypatch)
     payload = _run_retry(["retry", RUN, "--home", str(home), "--force"], home)
     assert payload["ok"] is True
-    assert "argv" in captured and captured["argv"][:2] == ["mini-ork", "recover"]
+    # The canonical spawn: ``sys.executable + bin/mini-ork + recover + …``.
+    # Case 3 hints carry no command (the verb falls back to the bare
+    # ``mini-ork recover <run>``), and ``--force`` is appended last.
+    assert "argv" in captured
+    assert captured["argv"][0].endswith("/python3.11") or captured["argv"][0].endswith("/python")
+    assert captured["argv"][1].endswith("/bin/mini-ork")
+    assert captured["argv"][2:4] == ["recover", RUN]
+    # ``--force`` does NOT imply ``--ack-change`` — the two are independent
+    # operator intents. See kickoff fix 6.
     assert "--force" in captured["argv"]
+    assert "--ack-change" not in captured["argv"]
     assert captured["env_mini_ork_home"] == str(home)
 
 
@@ -459,7 +679,11 @@ def test_board_retry_resume_cost_spawns_resume(home: Path, monkeypatch) -> None:
     captured = _patch_spawn(monkeypatch)
     payload = _run_retry(["retry", RUN, "--home", str(home)], home)
     assert payload["ok"] is True
-    assert captured["argv"] == ["mini-ork", "resume", RUN]
+    # The canonical spawn shape: ``sys.executable + bin/mini-ork + resume + run``.
+    # No ``--ack-change``/``--force`` even when the operator did not pass them.
+    assert captured["argv"][0].endswith("/python3.11") or captured["argv"][0].endswith("/python")
+    assert captured["argv"][1].endswith("/bin/mini-ork")
+    assert captured["argv"][2:] == ["resume", RUN]
 
 
 def test_board_retry_parser_lists_retry_verb_and_flags() -> None:

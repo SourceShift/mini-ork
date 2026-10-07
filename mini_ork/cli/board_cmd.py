@@ -447,11 +447,15 @@ def _act_retry(
       * no hint              → ``ok: false``, "nothing to retry".
       * not retryable & !``--force`` → ``ok: false``, error = summary.
       * needs_change & !``--ack-change`` → ``ok: false``, error = ack prompt.
-      * otherwise            → detached spawn via ``acp.commands._spawn``,
-                               log at ``<run_dir>/recover-<ts>.log``, cwd =
-                               project root, env with ``MINI_ORK_HOME``.
+      * otherwise            → detached spawn via the canonical
+                               ``acp.commands._spawn`` shape
+                               (``sys.executable + bin/mini-ork + …``,
+                                ``MINI_ORK_ROOT`` set, ``MINI_ORK_VENV_ACTIVE``
+                                popped, ``cwd`` = engine root),
+                               log at ``<run_dir>/recover-<ts>.log``.
     """
     from mini_ork.recovery import retry_hint
+    from mini_ork.web.control import _mini_ork_root
 
     try:
         hint = retry_hint.load_or_compute(home, run_id, write=True)
@@ -487,7 +491,23 @@ def _act_retry(
             return {"ok": False, "run_id": run_id, "hint": hint,
                     "error": "hint has no command"}
 
-    argv = command.split()
+    # The hint's command is a string of ``mini-ork …`` tokens. The canonical
+    # spawn shape replaces the leading literal ``mini-ork`` with the absolute
+    # ``bin/mini-ork`` and prefixes ``sys.executable`` (mirrors
+    # ``acp.commands.handle_recover`` at L681-694). Operator-typed flags
+    # (``--ack-change``, ``--force``) are appended AFTER the split so a
+    # ``--force`` alone never implies ``--ack-change`` and the hint's
+    # command string never embeds them.
+    tokens = command.split()
+    root = _mini_ork_root()
+    if tokens and tokens[0] == "mini-ork":
+        tokens[0] = str(root / "bin" / "mini-ork")
+        argv: list[str] = [sys.executable, *tokens]
+    else:
+        argv = tokens
+    # ``--force`` does NOT add ``--ack-change`` — the two are independent
+    # operator intents. ``--ack-change`` is only added when the operator
+    # typed it, regardless of ``--force``.
     if ack_change and "--ack-change" not in argv:
         argv.append("--ack-change")
     if force and "--force" not in argv:
@@ -500,9 +520,10 @@ def _act_retry(
     log_path = run_dir / f"recover-{int(time.time())}.log"
     env = dict(os.environ)
     env["MINI_ORK_HOME"] = str(home)
+    env["MINI_ORK_ROOT"] = str(root)
+    env.pop("MINI_ORK_VENV_ACTIVE", None)
     try:
-        proc = _retry_spawn(argv, cwd=str(home.absolute().parent), env=env,
-                             stdout_path=log_path)
+        proc = _retry_spawn(argv, cwd=str(root), env=env, stdout_path=log_path)
     except Exception as exc:  # noqa: BLE001 — spawn failure: surface, do not crash
         return {"ok": False, "run_id": run_id, "hint": hint,
                 "error": f"spawn failed: {type(exc).__name__}: {exc}"}
