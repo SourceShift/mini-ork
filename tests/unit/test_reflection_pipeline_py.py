@@ -749,6 +749,10 @@ def test_persist_suggestions_does_not_drop_an_authored_lesson(temp_db):
     re-persists the same pattern_id from a source that may not have been
     re-induced yet — without the carry-forward, that would erase the lesson
     every pass and the prompt would silently fall back to the cluster key.
+
+    The stored lesson is also never overwritten by a *different* source lesson:
+    the upsert fills `lesson_text` only when it is empty, so a changed lesson
+    cannot ride a preserved approval into prompts unreviewed.
     """
     con = sqlite3.connect(temp_db)
     con.execute("PRAGMA busy_timeout=5000")
@@ -780,7 +784,11 @@ def test_persist_suggestions_does_not_drop_an_authored_lesson(temp_db):
     # The refresh still happened — only the unnamed column is preserved.
     assert math.isclose(row[1], 9.0, rel_tol=0, abs_tol=1e-6)
 
-    # A newly authored lesson does supersede the old one.
+    # A source lesson does NOT overwrite a stored one — the stored lesson is
+    # authoritative once authored, the same rule the induction guard encodes
+    # ("an authored one is never overwritten by a second opinion"). With the
+    # decision status now preserved, letting a changed lesson win would ride an
+    # old approval into prompts without re-verification.
     rp.reflection_persist_suggestions(json.dumps([{
         "pattern_id": "p-1", "description": "cluster: x", "frequency": 9,
         "suggested_promotion_type": "adr", "evidence_trace_ids": [],
@@ -792,7 +800,78 @@ def test_persist_suggestions_does_not_drop_an_authored_lesson(temp_db):
         "SELECT lesson_text FROM emergent_patterns WHERE pattern_id='p-1'"
     ).fetchone()[0]
     con.close()
-    assert after == "When the verifier emits no output: abort the run"
+    assert after == "When the verifier emits no output: treat the node as failed", (
+        f"a source lesson overwrote the stored one: {after!r}"
+    )
+
+
+def test_persist_suggestions_keeps_operator_decisions(temp_db):
+    """A persist pass must not reset an operator's approve/reject decision.
+
+    `INSERT OR REPLACE` deleted the conflicting row, so `status` and
+    `resolved_at` — columns the INSERT never named — were reset to
+    'proposed'/NULL on every reflect pass: an operator's `lessons forget`
+    (rejected) was silently undone and the approval history wiped each pass.
+    The upsert must keep the stored decision and refresh only the evidence.
+
+    The incoming suggestions below carry a *different* lesson than the stored
+    one on purpose: with the decision pinned to 'approved', a changed lesson
+    would otherwise ride the old approval into prompts without re-verification.
+    The stored lesson must win whenever it is non-blank; the source lesson only
+    fills a blank one.
+    """
+    con = sqlite3.connect(temp_db)
+    con.execute("PRAGMA busy_timeout=5000")
+    now = int(time.time())
+    con.executemany(
+        "INSERT INTO emergent_patterns(pattern_id, cluster_label, member_item_ids_json, "
+        "feature_set_json, strength_score, status, detected_at, resolved_at, lesson_text) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        [
+            ("p-approved", "cluster: a", "[]", "[\"adr\"]", 5.0, "approved", 1, now, "keep me"),
+            ("p-rejected", "cluster: r", "[]", "[\"adr\"]", 5.0, "rejected", 2, now, "forget me"),
+            ("p-blank", "cluster: b", "[]", "[\"adr\"]", 5.0, "proposed", 3, now, ""),
+        ],
+    )
+    con.commit()
+    con.close()
+
+    # The same pattern ids come back from a fresh mine, each with a *new*
+    # lesson, plus a brand-new row.
+    rp.reflection_persist_suggestions(json.dumps([
+        {"pattern_id": pid, "description": f"cluster: {pid[2]}", "frequency": 9,
+         "suggested_promotion_type": "adr", "evidence_trace_ids": [],
+         "lesson_text": f"REPLACED {pid}", "rationale": "r"}
+        for pid in ("p-approved", "p-rejected", "p-blank")
+    ] + [{"pattern_id": "p-new", "description": "cluster: n", "frequency": 3,
+          "suggested_promotion_type": "adr", "evidence_trace_ids": [],
+          "lesson_text": "fresh", "rationale": "r"}]))
+
+    con = sqlite3.connect(temp_db)
+    rows = {r[0]: (r[1], r[2]) for r in con.execute(
+        "SELECT pattern_id, status, resolved_at FROM emergent_patterns").fetchall()}
+    lessons = {r[0]: r[1] for r in con.execute(
+        "SELECT pattern_id, lesson_text FROM emergent_patterns").fetchall()}
+    strength = con.execute(
+        "SELECT strength_score FROM emergent_patterns WHERE pattern_id='p-approved'"
+    ).fetchone()[0]
+    con.close()
+
+    assert rows["p-approved"][0] == "approved", rows   # operator's decision survives
+    assert rows["p-approved"][1] is not None           # audit timestamp survives
+    assert rows["p-rejected"][0] == "rejected", rows   # forget is not undone
+    assert rows["p-rejected"][1] is not None
+    assert rows["p-new"] == ("proposed", None)         # new rows still enter proposed
+    # The stored lesson wins over the incoming one — an unverified change cannot
+    # ride an old approval into prompts.
+    assert lessons["p-approved"] == "keep me", lessons
+    assert lessons["p-rejected"] == "forget me", lessons
+    # …but a blank stored lesson is still filled from the source (the one case
+    # the kickoff says the incoming value is used).
+    assert lessons["p-blank"] == "REPLACED p-blank", lessons
+    assert lessons["p-new"] == "fresh", lessons
+    # The refresh still happened — only the decision columns are pinned.
+    assert math.isclose(strength, 9.0, rel_tol=0, abs_tol=1e-6)
 
 
 def test_learning_loop_writeback_from_trace_cluster(temp_db):

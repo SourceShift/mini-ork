@@ -32,6 +32,7 @@ def test_all_former_exec_subs_registered_natively():
         "acp", "calibrate", "collapse-check", "collapse-precursor", "gate-fuzz",
         "memory-lifecycle",
         "prefs",
+        "lessons",
         "reap",
         "harness-contrast", "harness-edit", "harness-audit", "hack-probe",
         "oversight", "metric-anchor", "active-eval", "certify", "node-agent",

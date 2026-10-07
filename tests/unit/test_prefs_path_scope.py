@@ -496,6 +496,10 @@ def _write_kickoff(path: Path, scope_line: str) -> Path:
 
 def test_prefs_preview_prints_path_rule_and_failure_header(db, monkeypatch, tmp_path):
     monkeypatch.setenv("MO_SEMANTIC_INJECT", "0")
+    # Raw gradients reach the block only under the operator opt-in (only
+    # verified learnings reach prompts by default, commit b13a285d). This test
+    # asserts the unverified-gradient path, so it must opt in explicitly.
+    monkeypatch.setenv("MO_INJECT_UNVERIFIED", "1")
     _seed_gradient(db)
     preferences.set_pref("ide-tests", "run the ide page tests", scope="path",
                          target="mini_ork/ide_pages/**")

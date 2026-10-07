@@ -21,6 +21,7 @@ from .semantic import (
     Embedder,
     HashEmbedder,
     add,
+    lookup_key,
     record_outcome,
     record_retrievals,
     rank_with_prior,
@@ -41,6 +42,7 @@ from .retirement import (
 __all__ = [
     "add",
     "upsert",
+    "lookup_key",
     "search",
     "rank_with_prior",
     "record_retrievals",

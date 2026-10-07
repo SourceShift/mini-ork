@@ -468,11 +468,12 @@ def _persist_suggestions_upsert(db_path: str, suggestions_json: str) -> int:
         # uses, over this connection: opening a second one here would block on
         # the write lock this transaction holds and silently do nothing.
         pattern_store.add_lesson_column(con, "emergent_patterns")
-        # INSERT OR REPLACE deletes the conflicting row and inserts a new one,
-        # so any column the new INSERT does not name is *lost*. A re-mined
-        # cluster that has not been re-induced would lose its authored lesson
-        # on every pass. Carrying the prior value forward is what makes the
-        # lesson durable rather than until-next-reflect.
+        # The preload keeps a re-mined cluster that has not been re-induced from
+        # losing its authored lesson: the upsert below already treats the stored
+        # lesson as authoritative, so this only matters for the INSERT-named
+        # value below (belt-and-braces for a caller that hands us a prior value
+        # directly). Cold-safe: a table without lesson_text yields an empty map,
+        # never a crash.
         try:
             prior_lessons = {
                 str(r[0]): r[1]
@@ -512,13 +513,44 @@ def _persist_suggestions_upsert(db_path: str, suggestions_json: str) -> int:
             features = [output_type] if output_type else []
             rationale = s.get("rationale") or None
             lesson = (s.get("lesson_text") or "").strip() or prior_lessons.get(str(pid))
+            # Upsert, not INSERT OR REPLACE. OR REPLACE deletes the conflicting
+            # row, so `status` and `resolved_at` — columns the INSERT did not
+            # name — were reset to 'proposed'/NULL on every reflect pass. An
+            # operator's `lessons forget` (rejected) was silently undone and the
+            # approval history wiped each pass. ON CONFLICT(pattern_id) keeps the
+            # stored status/resolved_at once an operator has decided
+            # (approved|rejected|superseded), refreshes the evidence columns from
+            # the new suggestion, and keeps the stored lesson once one is
+            # authored — the source lesson only *fills* a blank stored one, it
+            # never overwrites. Otherwise a changed lesson would ride the old
+            # approval straight into prompts without re-verification. New rows
+            # still enter as 'proposed'.
             con.execute(
                 """
-                INSERT OR REPLACE INTO emergent_patterns
+                INSERT INTO emergent_patterns
                     (pattern_id, cluster_label, member_item_ids_json,
                      feature_set_json, strength_score, suggested_meta_adr,
                      status, detected_at, resolved_at, lesson_text)
                 VALUES (?,?,?,?,?,?,?,?,NULL,?)
+                ON CONFLICT(pattern_id) DO UPDATE SET
+                    cluster_label        = excluded.cluster_label,
+                    member_item_ids_json = excluded.member_item_ids_json,
+                    feature_set_json     = excluded.feature_set_json,
+                    strength_score       = excluded.strength_score,
+                    suggested_meta_adr   = excluded.suggested_meta_adr,
+                    detected_at          = excluded.detected_at,
+                    lesson_text = COALESCE(NULLIF(TRIM(emergent_patterns.lesson_text), ''),
+                                           excluded.lesson_text),
+                    status = CASE
+                        WHEN emergent_patterns.status
+                             IN ('approved','rejected','superseded')
+                        THEN emergent_patterns.status
+                        ELSE 'proposed' END,
+                    resolved_at = CASE
+                        WHEN emergent_patterns.status
+                             IN ('approved','rejected','superseded')
+                        THEN emergent_patterns.resolved_at
+                        ELSE NULL END
                 """,
                 (
                     pid,

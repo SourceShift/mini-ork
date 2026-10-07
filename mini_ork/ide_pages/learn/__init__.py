@@ -10,13 +10,13 @@ from pathlib import Path
 from typing import Any
 
 from mini_ork.ide_pages import spec as S
-from mini_ork.ide_pages.learn import code, improve, lessons, memory, overview
+from mini_ork.ide_pages.learn import code, improve, lessons, memory, overview, rules
 
 TITLE = "Learning & memory"
 SUB = ("Is mini-ork getting better at your work, what has it learned, "
        "and what needs you.")
-TABS = [("code", "Your code"), ("overview", "Overview"), ("lessons", "Lessons"),
-        ("memory", "Memory"), ("improve", "Self-improve")]
+TABS = [("code", "Your code"), ("rules", "Rules"), ("overview", "Overview"),
+        ("lessons", "Lessons"), ("memory", "Memory"), ("improve", "Self-improve")]
 DEFAULT_TAB = TABS[0][0]
 
 # Old tab keys → new tab key. Keep these working for any deep-linked URLs the
@@ -31,6 +31,8 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
         key = DEFAULT_TAB
     if key == "code":
         sections_out = code.sections(home, args, errors)
+    elif key == "rules":
+        sections_out = rules.sections(home, args, errors)
     elif key == "overview":
         sections_out = overview.sections(home, args, errors)
     elif key == "lessons":

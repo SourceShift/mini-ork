@@ -41,6 +41,7 @@ from typing import Protocol, runtime_checkable
 # `mini_ork.memory.semantic.dispatch_model`; that attribute resolves to this
 # same object because Python imports are by-reference.
 from mini_ork.dispatch import DispatchRequest, dispatch_model
+from mini_ork.sqlite_read import connect_readonly
 
 
 # ── Reconcile thresholds (deterministic, unit-testable) ────────────────────
@@ -604,6 +605,48 @@ def upsert(
     finally:
         conn.close()
     return mid
+
+
+def lookup_key(
+    *,
+    scope: str,
+    key: str,
+    db_path: str | os.PathLike[str] | None = None,
+) -> int | None:
+    """The id of the memory ``scope`` + ``key`` names, or ``None`` if absent.
+
+    The read-only half of ``upsert``: same identity (``scope`` and the
+    ``meta.key`` it writes), no write. ``upsert`` creates the mirror on demand,
+    which is right for a prompt assembled inside a run — but a caller that must
+    observe the store without mutating it, like a preview render, may only rank
+    the mirrors that are already there. ``connect_readonly`` keeps that promise
+    even on an idle WAL database, where a bare ``mode=ro`` handle would fail.
+
+    A retired mirror returns ``None``: ``rank_with_prior`` skips retired rows,
+    so handing back their id would only create a candidate it then drops.
+    """
+    if not isinstance(scope, str) or not scope.strip():
+        raise ValueError("scope must be a non-empty string")
+    if not isinstance(key, str) or not key.strip():
+        raise ValueError("key must be a non-empty string")
+    db = _resolve_db_path(db_path)
+    meta = json.dumps({"key": key}, sort_keys=True)
+    try:
+        conn = connect_readonly(db)
+    except (OSError, sqlite3.Error):
+        return None
+    try:
+        try:
+            row = conn.execute(
+                "SELECT id FROM semantic_memory WHERE scope = ? AND meta = ? "
+                "AND retired_at = 0",
+                (scope, meta),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return None
+    finally:
+        conn.close()
+    return int(row[0]) if row else None
 
 
 def _utility(uses: int, wins: int) -> float:

@@ -176,24 +176,28 @@ def _kickoff_scope_paths(text: str) -> list[str]:
     return preferences.paths_in_text("\n".join(buf))
 
 
-def _preview(kickoff_path: str, task_class: str, node: str, as_json: bool,
-             out, err) -> int:
-    """Print the exact learned block a ``node`` of ``task_class`` would receive.
+def build_preview(kickoff_text: str, task_class: str, node: str
+                  ) -> tuple[str, list[dict], str, list[str]]:
+    """The exact learned block a ``node`` of ``task_class`` would receive.
 
-    Read-only with respect to the retrieval ledger: ``MINI_ORK_RUN_ID`` is masked
-    for the block (``run_context_scope({"MINI_ORK_RUN_ID": None})``) because
-    ``semantic_lessons_md`` records a retrieval only when it is set
-    (context_assembler.py:629) — a preview is not a run and must not log spend.
+    Pure with respect to its inputs — no file I/O, no stdout. Returns
+    ``(block, sources, task_class, paths)`` where ``task_class`` is the
+    resolved class (explicit → kickoff front matter → ``framework_edit``) and
+    ``paths`` the kickoff's declared scope paths.
+
+    Read-only with respect to the state DB, in two layers. ``MINI_ORK_RUN_ID``
+    is masked for the block (``run_context_scope({"MINI_ORK_RUN_ID": None})``)
+    because ``semantic_lessons_md`` records a retrieval only when it is set — a
+    preview is not a run and must not log spend. Masking the run id alone is not
+    enough, though: the semantic channel also sweeps finished runs and re-mirrors
+    every approved pattern, both writes. So the block is built with
+    ``read_only=True``, which ranks the mirrors that already exist and writes
+    nothing at all. Both live INSIDE this function so every caller (the CLI and
+    the Rules tab) inherits them; a preview that wrote would violate the
+    "Rules" tab's read-only contract.
     """
-    try:
-        with open(kickoff_path, encoding="utf-8", errors="replace") as f:
-            text = f.read()
-    except OSError as exc:
-        err.write(f"cannot read kickoff {kickoff_path}: {exc}\n")
-        return 2
-
-    tc = task_class or _kickoff_task_class(text) or "framework_edit"
-    paths = _kickoff_scope_paths(text)
+    tc = task_class or _kickoff_task_class(kickoff_text) or "framework_edit"
+    paths = _kickoff_scope_paths(kickoff_text)
 
     from mini_ork import context_assembler
 
@@ -210,10 +214,24 @@ def _preview(kickoff_path: str, task_class: str, node: str, as_json: bool,
                 })
         fm = context_assembler.failure_modes_md(
             tc, 5, db=os.environ.get("MINI_ORK_DB"),
-            node_type=node, sources=sources,
+            node_type=node, sources=sources, read_only=True,
         ).strip()
         if fm:
             block = block + "\n\n" + fm + "\n"
+    return block, sources, tc, paths
+
+
+def _preview(kickoff_path: str, task_class: str, node: str, as_json: bool,
+             out, err) -> int:
+    """Print the exact learned block a ``node`` of ``task_class`` would receive."""
+    try:
+        with open(kickoff_path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError as exc:
+        err.write(f"cannot read kickoff {kickoff_path}: {exc}\n")
+        return 2
+
+    block, sources, tc, paths = build_preview(text, task_class, node)
 
     if as_json:
         out.write(json.dumps({

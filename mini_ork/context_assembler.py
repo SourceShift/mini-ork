@@ -369,7 +369,8 @@ def _limbo_limit(node_type: str, base: int) -> int:
 def failure_modes_md(task_class: str, limit: int = 5, db: str | None = None,
                      *, node_type: str = "", lane: str = "",
                      node_id: str = "",
-                     sources: list[dict] | None = None) -> str:
+                     sources: list[dict] | None = None,
+                     read_only: bool = False) -> str:
     """The "Learned failure modes" block; '' when no learnings. Includes the
     project-scope filter: framework-internal targets are stripped when
     MO_TARGET_CWD is set and differs from MINI_ORK_ROOT.
@@ -381,6 +382,11 @@ def failure_modes_md(task_class: str, limit: int = 5, db: str | None = None,
     `sources` is an out-param: when supplied, one dict is appended per row that
     was actually injected, in prompt order. With ``sources=None`` the returned
     markdown is byte-identical to the same call with a list.
+
+    `read_only` renders the same block without touching the store — no
+    retrieval is logged and no mirror is written or swept (see
+    ``semantic_lessons_md``). A preview render passes it; a node assembling its
+    own prompt does not.
     """
     limit = _limbo_limit(node_type, limit)
     dbp = _db_path(db)
@@ -460,7 +466,7 @@ def failure_modes_md(task_class: str, limit: int = 5, db: str | None = None,
         # never to nothing, because the lessons are still evidence.
         block = semantic_lessons_md(task_class, emg_limit, db=dbp,
                                     lane=lane, node_id=node_id,
-                                    sources=sources)
+                                    sources=sources, read_only=read_only)
         if not block:
             block = _static_emergent_block(dbp, emg_limit, sources=sources)
         if block:
@@ -611,7 +617,8 @@ def _static_emergent_block(dbp: str, limit: int,
 
 def semantic_lessons_md(task_class: str, limit: int = 5, db: str | None = None,
                         *, lane: str = "", node_id: str = "",
-                        sources: list[dict] | None = None) -> str:
+                        sources: list[dict] | None = None,
+                        read_only: bool = False) -> str:
     """The emergent-pattern block, ranked by earned utility (SimUtil-UCB).
 
     Same rows, same shape as `_static_emergent_block` — different order. The
@@ -632,6 +639,14 @@ def semantic_lessons_md(task_class: str, limit: int = 5, db: str | None = None,
     `lane` and `node_id` are passed through to the retrieval ledger so the
     spend this call incurs is attributable to the decision that caused it
     (LIMBO, arXiv 2609.14138). They do not affect which memories are chosen.
+
+    `read_only=True` renders the block without touching the store at all: no
+    finished-run sweep, no mirror upsert, no retrieval row. Each approved
+    pattern is looked up by key and only the mirrors that already exist are
+    ranked, so on a database whose mirrors are current the order is exactly the
+    one a run would see — while a store with no mirrors yet yields '' and the
+    static block takes over upstream. A preview render is the caller this
+    exists for: reading must never write (kickoff "Rules" tab §3/§4).
 
     Returns '' when the channel is opted out, unavailable, or has nothing to
     say — the caller decides what to fall back to.
@@ -662,11 +677,14 @@ def semantic_lessons_md(task_class: str, limit: int = 5, db: str | None = None,
 
     scope = task_class or "generic"
     try:
-        # Close the loop before reading. A run that already finished has its
-        # verdict sitting in execution_traces, and a retrieval left pending
-        # counts toward `uses` forever with no chance of a win — so failing to
-        # sweep here would silently decay every memory the run used.
-        semantic.resolve_finished_runs(db_path=dbp)
+        if not read_only:
+            # Close the loop before reading. A run that already finished has its
+            # verdict sitting in execution_traces, and a retrieval left pending
+            # counts toward `uses` forever with no chance of a win — so failing to
+            # sweep here would silently decay every memory the run used. A
+            # read-only render must not sweep: the sweep resolves *other* runs'
+            # pending rows, which is a write regardless of who is asking.
+            semantic.resolve_finished_runs(db_path=dbp)
 
         candidates = []
         # memory_id → pattern_id: the only way each ranked memory can be traced
@@ -674,14 +692,26 @@ def semantic_lessons_md(task_class: str, limit: int = 5, db: str | None = None,
         # the upstream identity.
         memory_to_pattern = {}
         for pattern_id, label, feats, strength, lesson in rows:
-            memory_id = semantic.upsert(
-                _emergent_text(feats, label, lesson),
-                scope=scope,
-                key=str(pattern_id),
-                db_path=dbp,
-            )
+            if read_only:
+                # Rank the mirror that already exists; never create one. A
+                # pattern with no mirror yet is simply not a candidate here.
+                memory_id = semantic.lookup_key(
+                    scope=scope, key=str(pattern_id), db_path=dbp)
+                if memory_id is None:
+                    continue
+            else:
+                memory_id = semantic.upsert(
+                    _emergent_text(feats, label, lesson),
+                    scope=scope,
+                    key=str(pattern_id),
+                    db_path=dbp,
+                )
             memory_to_pattern[int(memory_id)] = pattern_id
             candidates.append((int(memory_id), float(strength or 0.0)))
+        if not candidates:
+            # No mirror to rank (a store that has never injected, read-only).
+            # Fall back rather than emit an empty-bodied block.
+            return ""
 
         ordered = semantic.rank_with_prior(
             candidates, scope=scope, top_k=limit, db_path=dbp,
@@ -690,7 +720,7 @@ def semantic_lessons_md(task_class: str, limit: int = 5, db: str | None = None,
         # Log the retrieval only when the caller is inside a run: an
         # unattributable retrieval can never be resolved to a win, so writing
         # one would depress this memory's utility for no information gained.
-        run_id = context_env("MINI_ORK_RUN_ID", "")
+        run_id = "" if read_only else context_env("MINI_ORK_RUN_ID", "")
         if run_id:
             semantic.record_retrievals(
                 [hit["memory_id"] for hit in ordered],

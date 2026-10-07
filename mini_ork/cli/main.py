@@ -79,6 +79,7 @@ _NATIVE_MODULE_SUBS = {
     "gate-fuzz": "mini_ork.cli.gate_fuzz",
     "memory-lifecycle": "mini_ork.cli.memory_lifecycle",
     "prefs": "mini_ork.cli.prefs_cmd",
+    "lessons": "mini_ork.cli.lessons_cmd",
     "harness-contrast": "mini_ork.cli.harness_contrast",
     "harness-edit": "mini_ork.cli.harness_edit",
     "harness-audit": "mini_ork.cli.harness_audit",

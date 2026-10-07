@@ -75,8 +75,8 @@ def test_page_shape_and_default_tab(home: Path) -> None:
         page = learn.build(home, tab, {})
         assert page["ok"] and page["key"] == "learn" and page["title"] == "Learning & memory"
         assert [(t["key"], t["label"]) for t in page["tabs"]] == [
-            ("code", "Your code"), ("overview", "Overview"), ("lessons", "Lessons"),
-            ("memory", "Memory"), ("improve", "Self-improve")]
+            ("code", "Your code"), ("rules", "Rules"), ("overview", "Overview"),
+            ("lessons", "Lessons"), ("memory", "Memory"), ("improve", "Self-improve")]
         assert page["tab"] == tab
         assert page["errors"] == {}, (tab, page["errors"])
         json.dumps(page)
