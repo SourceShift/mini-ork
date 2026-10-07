@@ -259,6 +259,29 @@ CREATE INDEX IF NOT EXISTS idx_user_pref_key     ON user_preference_memory(prefe
 CREATE INDEX IF NOT EXISTS idx_user_pref_scope   ON user_preference_memory(scope);
 """
 
+# The CHECK cannot be widened in place, so the table is rebuilt: create-new →
+# copy rows → drop-old → rename. Mirrors db/migrations/0065_preference_path_scope.sql;
+# unlike the SQL migration this path introspects ``sqlite_master`` for dependent
+# views/triggers (the migration drops/recreates the one known view by hand).
+_REBUILD_TABLE_SQL = """
+CREATE TABLE user_preference_memory_new (
+  user_id             TEXT    NOT NULL,
+  preference_key      TEXT    NOT NULL,
+  preference_value    TEXT    NOT NULL DEFAULT '{}',
+  scope               TEXT    NOT NULL DEFAULT 'global'
+                      CHECK (scope IN ('global','task_class','workflow','path')),
+  scope_target        TEXT    NOT NULL DEFAULT '',
+  set_at              TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (user_id, preference_key, scope, scope_target)
+);
+INSERT INTO user_preference_memory_new
+  (user_id, preference_key, preference_value, scope, scope_target, set_at)
+SELECT user_id, preference_key, preference_value, scope, scope_target, set_at
+FROM user_preference_memory;
+DROP TABLE user_preference_memory;
+ALTER TABLE user_preference_memory_new RENAME TO user_preference_memory;
+"""
+
 
 def ensure_schema(db: str | None = None) -> None:
     """Idempotent DDL so an unmigrated DB still accepts ``path`` rules.
@@ -266,8 +289,11 @@ def ensure_schema(db: str | None = None) -> None:
     Worktree DBs are routinely unmigrated (see migration
     ``0065_preference_path_scope.sql``, whose rebuild this mirrors). Fast path:
     the ``path`` scope is already in the CHECK. Otherwise the table is rebuilt
-    (create-new → copy rows → drop → rename) and the three indexes the drop
-    takes with it are recreated. Cold-safe: a missing table is created.
+    (create-new → copy rows → drop → rename), the three indexes the drop takes
+    with it are recreated, and any view/trigger that references the table is
+    dropped for the rebuild and recreated verbatim — otherwise the rename
+    aborts on SQLite >= 3.45 (see ``_dependent_schema_objects``). Cold-safe: a
+    missing table is created.
     """
     db_path = _resolve_db(db)
     con = sqlite3.connect(db_path)
@@ -276,6 +302,34 @@ def ensure_schema(db: str | None = None) -> None:
         con.commit()
     finally:
         con.close()
+
+
+def _quote_ident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _dependent_schema_objects(
+    con: sqlite3.Connection, table: str,
+) -> list[tuple[str, str, str]]:
+    """Every view/trigger whose SQL references ``table`` by name, views first.
+
+    The rebuild drops ``table`` and later renames ``<table>_new`` onto its name.
+    On SQLite >= 3.45 (``legacy_alter_table`` off — the runtime default under
+    Python 3.13) that ``ALTER TABLE … RENAME`` re-parses every view and trigger
+    in the schema, so a dependent left dangling across the drop aborts the
+    rebuild with ``error in view <name>: no such table: main.<table>``. The
+    caller drops these around the rebuild and recreates them from this SQL.
+    """
+    deps = [
+        (typ, name, sql)
+        for typ, name, sql in con.execute(
+            "SELECT type, name, sql FROM sqlite_master "
+            "WHERE type IN ('view','trigger') AND sql IS NOT NULL")
+        if table in sql
+    ]
+    # Views before triggers: a trigger body may select from a view, not vice versa.
+    deps.sort(key=lambda d: 0 if d[0] == "view" else 1)
+    return deps
 
 
 def _ensure_schema_con(con: sqlite3.Connection) -> None:
@@ -289,26 +343,25 @@ def _ensure_schema_con(con: sqlite3.Connection) -> None:
     ddl = row[0] or ""
     if "'path'" in ddl or '"path"' in ddl:
         return  # already extended
-    con.executescript(
-        "BEGIN;\n"
-        "CREATE TABLE user_preference_memory_new (\n"
-        "  user_id             TEXT    NOT NULL,\n"
-        "  preference_key      TEXT    NOT NULL,\n"
-        "  preference_value    TEXT    NOT NULL DEFAULT '{}',\n"
-        "  scope               TEXT    NOT NULL DEFAULT 'global'\n"
-        "                      CHECK (scope IN ('global','task_class','workflow','path')),\n"
-        "  scope_target        TEXT    NOT NULL DEFAULT '',\n"
-        "  set_at              TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),\n"
-        "  PRIMARY KEY (user_id, preference_key, scope, scope_target));\n"
-        "INSERT INTO user_preference_memory_new "
-        "(user_id, preference_key, preference_value, scope, scope_target, set_at) "
-        "SELECT user_id, preference_key, preference_value, scope, scope_target, set_at "
-        "FROM user_preference_memory;\n"
-        "DROP TABLE user_preference_memory;\n"
-        "ALTER TABLE user_preference_memory_new RENAME TO user_preference_memory;\n"
-        + _CREATE_INDEXES_SQL +
-        "\nCOMMIT;\n"
-    )
+    deps = _dependent_schema_objects(con, "user_preference_memory")
+    stmts = [
+        # Drop dependents first so the RENAME's schema re-parse stays clean.
+        *[f"DROP {typ.upper()} IF EXISTS {_quote_ident(name)};"
+          for typ, name, _ in deps],
+        _REBUILD_TABLE_SQL,
+        _CREATE_INDEXES_SQL,
+        # Recreate verbatim; the renamed table now answers to the old name.
+        *[sql.strip().rstrip(";") + ";" for _, _, sql in deps],
+    ]
+    try:
+        con.executescript("BEGIN;\n" + "\n".join(stmts) + "\nCOMMIT;\n")
+    except sqlite3.Error:
+        # Never leave the DB without its views: unwind the whole transaction.
+        try:
+            con.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
 
 
 # ─── set_pref / remove_pref ──────────────────────────────────────────────

@@ -47,6 +47,56 @@ CREATE INDEX idx_user_pref_user_id ON user_preference_memory(user_id);
 """
 
 
+# A DB whose pref table is referenced BY NAME by a view and a trigger — the
+# shape the live state.db has (``v_memory_health``) and the fixture DBs did not.
+# `ensure_schema`'s rebuild drops the table: on SQLite >= 3.45 the following
+# ALTER TABLE RENAME re-parses the schema and aborts on the dangling view, and
+# the drop takes the trigger with it. Both must be restored.
+_PATH_VIEW_DDL = """
+CREATE VIEW v_memory_health AS
+SELECT
+  'task_memory'            AS namespace,
+  COUNT(*)                 AS row_count,
+  MAX(created_at)          AS last_write
+FROM task_memory
+
+UNION ALL
+
+SELECT
+  'user_preference_memory',
+  COUNT(*),
+  MAX(set_at)
+FROM user_preference_memory;
+"""
+
+_PATH_DEPENDENTS_DDL = (
+    _OLD_CHECK_DDL
+    + """
+CREATE TABLE task_memory (row_id INTEGER PRIMARY KEY, created_at TEXT);
+CREATE TABLE pref_audit (preference_key TEXT);
+"""
+    + _PATH_VIEW_DDL
+    + """
+CREATE TRIGGER trg_pref_audit AFTER INSERT ON user_preference_memory
+BEGIN
+  INSERT INTO pref_audit(preference_key) VALUES (NEW.preference_key);
+END;
+"""
+)
+
+# The remaining memory-namespace tables the migration's v_memory_health selects
+# from (task_memory comes from _PATH_DEPENDENTS_DDL), so the recreated live view
+# is queryable rather than merely creatable.
+_NAMESPACE_TABLES_DDL = """
+CREATE TABLE IF NOT EXISTS workflow_memory (row_id INTEGER PRIMARY KEY, created_at TEXT);
+CREATE TABLE IF NOT EXISTS agent_performance_memory (row_id INTEGER PRIMARY KEY, last_updated TEXT);
+CREATE TABLE IF NOT EXISTS failure_memory (row_id INTEGER PRIMARY KEY, occurred_at TEXT);
+CREATE TABLE IF NOT EXISTS recovery_memory (row_id INTEGER PRIMARY KEY, recovered_at TEXT);
+CREATE TABLE IF NOT EXISTS artifact_memory (row_id INTEGER PRIMARY KEY, produced_at TEXT);
+CREATE TABLE IF NOT EXISTS benchmark_memory (row_id INTEGER PRIMARY KEY, ran_at TEXT);
+"""
+
+
 @pytest.fixture
 def db(tmp_path, monkeypatch):
     """A temp DB built via ``db/init.sh`` (so migration 0065 applies), with the
@@ -96,6 +146,45 @@ def _index_names(db: str) -> set[str]:
         return {r[0] for r in con.execute(
             "SELECT name FROM sqlite_master WHERE type='index' "
             "AND name LIKE 'idx_user_pref%'")}
+    finally:
+        con.close()
+
+
+def _table_ddl(db: str) -> str:
+    con = sqlite3.connect(db)
+    try:
+        return con.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='user_preference_memory'").fetchone()[0]
+    finally:
+        con.close()
+
+
+def _schema_object_count(db: str, typ: str, name: str) -> int:
+    con = sqlite3.connect(db)
+    try:
+        return con.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type=? AND name=?",
+            (typ, name)).fetchone()[0]
+    finally:
+        con.close()
+
+
+def _pref_row_count_via_view(db: str) -> int:
+    """The user_preference_memory row_count reported by v_memory_health."""
+    con = sqlite3.connect(db)
+    try:
+        return con.execute(
+            "SELECT row_count FROM v_memory_health "
+            "WHERE namespace='user_preference_memory'").fetchone()[0]
+    finally:
+        con.close()
+
+
+def _audit_count(db: str) -> int:
+    con = sqlite3.connect(db)
+    try:
+        return con.execute("SELECT COUNT(*) FROM pref_audit").fetchone()[0]
     finally:
         con.close()
 
@@ -152,6 +241,95 @@ def test_ensure_schema_rebuilds_old_check(tmp_path, monkeypatch):
         "idx_user_pref_user_id", "idx_user_pref_key", "idx_user_pref_scope"}
     # Idempotent: a second call is a no-op.
     preferences.ensure_schema()
+
+
+def test_ensure_schema_recreates_dependent_view_and_trigger(tmp_path, monkeypatch):
+    """The rebuild must restore a view AND a trigger that name the table.
+
+    On SQLite >= 3.45 (the Python 3.13 runtime) ALTER TABLE RENAME re-parses the
+    schema, so a view left dangling across the drop aborts the rebuild with
+    ``error in view v_memory_health: no such table: main.user_preference_memory``;
+    and DROP TABLE takes any trigger on the table with it. Both must survive.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    dbp = str(home / "state.db")
+    con = sqlite3.connect(dbp)
+    con.executescript(_PATH_DEPENDENTS_DDL)
+    con.execute(
+        "INSERT INTO user_preference_memory "
+        "(user_id, preference_key, preference_value, scope, scope_target, set_at) "
+        "VALUES ('default','tone','be terse','global','','2026-01-01T00:00:00.000Z')")
+    con.commit()
+    con.close()
+    monkeypatch.setenv("MINI_ORK_DB", dbp)
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+
+    preferences.ensure_schema()
+
+    assert "'path'" in _table_ddl(dbp)
+    # The view survived and still counts the pre-existing row.
+    assert _schema_object_count(dbp, "view", "v_memory_health") == 1
+    assert _pref_row_count_via_view(dbp) == 1
+    # A path rule inserts into the rebuilt table and the view sees it.
+    preferences.set_pref("ide-tests", "run tests", scope="path",
+                         target="mini_ork/ide_pages/**")
+    assert _pref_row_count_via_view(dbp) == 2
+    # The trigger survived and still fires.
+    assert _schema_object_count(dbp, "trigger", "trg_pref_audit") == 1
+    before = _audit_count(dbp)
+    con = sqlite3.connect(dbp)
+    con.execute(
+        "INSERT INTO user_preference_memory "
+        "(user_id, preference_key, preference_value, scope, scope_target, set_at) "
+        "VALUES ('default','k','v','global','','2026-01-02T00:00:00.000Z')")
+    con.commit()
+    con.close()
+    assert _audit_count(dbp) == before + 1, "the recreated trigger must still fire"
+
+
+def test_migration_0065_recreates_dependent_view(tmp_path, monkeypatch):
+    """0065 must drop and recreate v_memory_health around its table rebuild.
+
+    SQL cannot introspect, so the migration names the one live dependent view
+    explicitly; without that drop the RENAME re-parse fails on SQLite >= 3.45.
+    """
+    dbp = str(tmp_path / "state.db")
+    con = sqlite3.connect(dbp)
+    con.executescript(_PATH_DEPENDENTS_DDL + _NAMESPACE_TABLES_DDL)
+    con.executescript(
+        "CREATE TABLE IF NOT EXISTS schema_migrations "
+        "(filename TEXT PRIMARY KEY, applied_at TEXT, checksum TEXT);")
+    con.execute(
+        "INSERT INTO user_preference_memory "
+        "(user_id, preference_key, preference_value, scope, scope_target, set_at) "
+        "VALUES ('default','tone','be terse','global','','2026-01-01T00:00:00.000Z')")
+    con.commit()
+    con.close()
+
+    from mini_ork.stores import migrate  # the real runner's statement splitter
+
+    sql = (REPO / "db" / "migrations" / "0065_preference_path_scope.sql").read_text()
+    con = sqlite3.connect(dbp)
+    con.isolation_level = None  # manual transaction control, as _apply_one uses
+    migrate._exec_statements(con, sql, env={})
+    con.execute(
+        "INSERT OR IGNORE INTO schema_migrations(filename, applied_at, checksum) "
+        "VALUES ('0065_preference_path_scope.sql', "
+        "strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'preference-path-scope-v1')")
+    con.close()
+
+    assert "'path'" in _table_ddl(dbp)
+    # 0065 recreated the view from the live definition; it is queryable and
+    # counts the surviving row.
+    assert _schema_object_count(dbp, "view", "v_memory_health") == 1
+    assert _pref_row_count_via_view(dbp) == 1
+    # The widened CHECK accepts a path rule, and the view sees it.
+    monkeypatch.setenv("MINI_ORK_DB", dbp)
+    monkeypatch.setenv("MINI_ORK_HOME", str(tmp_path))
+    preferences.set_pref("ide-tests", "run tests", scope="path",
+                         target="mini_ork/ide_pages/**")
+    assert _pref_row_count_via_view(dbp) == 2
 
 
 # ─── glob matching ──────────────────────────────────────────────────────────

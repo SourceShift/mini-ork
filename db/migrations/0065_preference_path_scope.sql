@@ -14,12 +14,25 @@
 -- BEGIN — migrate.py:387-390).
 --
 -- DROP TABLE takes the table's three indexes with it (verified), so they are
--- recreated below; the ``v_memory_health`` view references the table *by name*,
--- survives the drop, and rebinds to the renamed table unchanged — no view
--- recreation is needed here.
+-- recreated below. It ALSO leaves ``v_memory_health`` dangling: the live view
+-- selects ``COUNT(*)`` from ``user_preference_memory`` by name. On SQLite
+-- >= 3.45 (``legacy_alter_table`` off — the default under the Python 3.13
+-- runtime) ``ALTER TABLE … RENAME`` re-parses every view in the schema and
+-- aborts with ``error in view v_memory_health: no such table:
+-- main.user_preference_memory`` (reproduced on a backup of the live state.db).
+-- SQL cannot introspect, so the one known dependent view is dropped first and
+-- recreated byte-for-byte — the exact ``SELECT sql FROM sqlite_master WHERE
+-- name='v_memory_health'`` captured from the live DB — after the rename.
+-- ``mini_ork.memory.preferences.ensure_schema`` mirrors this generically,
+-- introspecting ``sqlite_master`` for every dependent view and trigger.
 
 BEGIN TRANSACTION;
 
+-- 1. Drop the dependent view before the rebuild. Leaving it in place makes the
+--    ALTER TABLE RENAME below fail on SQLite >= 3.45 (see header).
+DROP VIEW IF EXISTS v_memory_health;
+
+-- 2. Rebuild the table with 'path' added to the CHECK.
 CREATE TABLE user_preference_memory_new (
   user_id             TEXT    NOT NULL,
   preference_key      TEXT    NOT NULL,
@@ -43,6 +56,71 @@ ALTER TABLE user_preference_memory_new RENAME TO user_preference_memory;
 CREATE INDEX IF NOT EXISTS idx_user_pref_user_id ON user_preference_memory(user_id);
 CREATE INDEX IF NOT EXISTS idx_user_pref_key     ON user_preference_memory(preference_key);
 CREATE INDEX IF NOT EXISTS idx_user_pref_scope   ON user_preference_memory(scope);
+
+-- 3. Recreate the dependent view from its exact live definition (the table now
+--    exists again, so the view rebinds to the rebuilt table).
+CREATE VIEW v_memory_health AS
+SELECT
+  'task_memory'            AS namespace,
+  COUNT(*)                 AS row_count,
+  MAX(created_at)          AS last_write
+FROM task_memory
+
+UNION ALL
+
+SELECT
+  'workflow_memory',
+  COUNT(*),
+  MAX(created_at)
+FROM workflow_memory
+
+UNION ALL
+
+SELECT
+  'agent_performance_memory',
+  COUNT(*),
+  MAX(last_updated)
+FROM agent_performance_memory
+
+UNION ALL
+
+SELECT
+  'failure_memory',
+  COUNT(*),
+  MAX(occurred_at)
+FROM failure_memory
+
+UNION ALL
+
+SELECT
+  'recovery_memory',
+  COUNT(*),
+  MAX(recovered_at)
+FROM recovery_memory
+
+UNION ALL
+
+SELECT
+  'user_preference_memory',
+  COUNT(*),
+  MAX(set_at)
+FROM user_preference_memory
+
+UNION ALL
+
+SELECT
+  'artifact_memory',
+  COUNT(*),
+  MAX(produced_at)
+FROM artifact_memory
+
+UNION ALL
+
+SELECT
+  'benchmark_memory',
+  COUNT(*),
+  MAX(ran_at)
+FROM benchmark_memory;
 
 COMMIT;
 
