@@ -176,7 +176,7 @@ def _seed(home: Path, *, status: str = "executing") -> Path:
 
 def test_every_view_builds_ok_true_for_the_agent_node(home: Path) -> None:
     _seed(home)
-    for view in ("stream", "output", "prompt", "telemetry", "learning"):
+    for view in ("stream", "output", "prompt", "telemetry", "learning", "changes"):
         out = build_node(home, RUN, AGENT_NODE, view=view)
         assert out["ok"] is True, view
         assert out["run"] == RUN
@@ -1285,3 +1285,75 @@ def test_reviewer_steer_surfaces_in_lens_researcher_stream(home: Path) -> None:
         f"non-lens researcher should NOT see reviewer-targeted steers; got: "
         f"{scout_steers}"
     )
+
+
+# ── kickoff §2 — full-length docs and the new ``changes`` view ─────────────
+
+
+def test_stream_user_entry_carries_md_true(home: Path) -> None:
+    """r6: the user entry's ``md`` flag is set; ``arg`` carries the full prompt."""
+    _seed(home)
+    out = build_node(home, RUN, AGENT_NODE, view="stream")
+    user = next(e for e in out["entries"] if e["k"] == "user")
+    assert user.get("md") is True
+    assert user["arg"] == "implement the fix"
+
+
+def test_stream_text_entry_carries_md_true(home: Path) -> None:
+    """r6: assistant ``text`` entries have ``md: true`` and full body."""
+    _seed(home)
+    out = build_node(home, RUN, AGENT_NODE, view="stream")
+    txt = next(e for e in out["entries"] if e["k"] == "text")
+    assert txt.get("md") is True
+    assert txt["arg"] == "I edited the file and ran pytest."
+
+
+def test_stream_full_length_prompt_returns_whole_with_md_true(home: Path) -> None:
+    """A 10,000-char prompt comes back whole (not the legacy 400-char snippet)."""
+    _seed(home)
+    run_dir = home / "runs" / RUN
+    session_path = run_dir / "sessions" / f"{SESSION_UUID}.jsonl"
+    big_prompt = "x" * 10_000
+    # Rewrite the transcript's first user entry with the big prompt.
+    text = session_path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    lines[0] = json.dumps({"type": "user", "timestamp": _iso(T0 + 10),
+                           "message": {"content": big_prompt}})
+    session_path.write_text("\n".join(lines) + "\n")
+    out = build_node(home, RUN, AGENT_NODE, view="stream")
+    user = next(e for e in out["entries"] if e["k"] == "user")
+    assert user["arg"] == big_prompt
+    assert user.get("md") is True
+
+
+def test_prompt_view_markdown_block_returns_full_text(home: Path) -> None:
+    """Kickoff §2: ``prompt`` view carries ``markdown.text`` = whole prompt."""
+    _seed(home)
+    out = build_node(home, RUN, AGENT_NODE, view="prompt")
+    md = out.get("markdown")
+    assert md is not None
+    assert md["title"] == "Rendered prompt · as dispatched"
+    # The fixture transcript carries the first user message as a list-of-blocks.
+    assert "implement the fix" in md["text"]
+    # ``block`` is preserved for back-compat.
+    assert "block" in out and out["block"]
+
+
+def test_output_view_markdown_block_for_lens_md(home: Path) -> None:
+    """Kickoff §2: a lens node's ``output`` view carries ``markdown.text``
+    equal to the WHOLE lens-*.md (not the SHELL_LOG_LINES tail)."""
+    _seed(home)
+    run_dir = home / "runs" / RUN
+    # Pretend the implementer is a lens-style node by writing a large
+    # ``lens-implementer.md`` (the first report in the priority chain).
+    md_text = "# Lens\n\n" + ("finding\n" * 200)
+    (run_dir / "lens-implementer.md").write_text(md_text)
+    out = build_node(home, RUN, AGENT_NODE, view="output")
+    md = out.get("markdown")
+    assert md is not None
+    assert md["title"] == "lens-implementer.md"
+    # The full file (not the last 40 lines) reaches the IDE.
+    assert md["text"] == md_text
+    assert Path(md["path"]).is_file()
+    # ``block`` is preserved.
+    assert "block" in out and out["block"]

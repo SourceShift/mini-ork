@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any
 
 from mini_ork.ide_pages import spec as S
+from mini_ork.ide_pages.node_changes import MD_FILE_CAP, USER_FULL_CAP, build_changes_view
 from mini_ork.ide_pages.run import Run, Node, _epoch, _load, _wall, _REVIEW_TYPES
 
 # Live-detection window per the kickoff §"live": running AND transcript grew
@@ -55,6 +56,11 @@ TOOL_RESULT_LINES = 12
 TOOL_INPUT_SUMMARY_CAP = 160
 SHELL_LOG_LINES = 40
 LINE_CHARS = 220
+# Kickoff §2 (full-length docs): user/text entries return the whole text up
+# to ``USER_FULL_CAP`` chars with ``md: true`` so the IDE panel renders
+# markdown instead of a 400/4_000 char snippet. The legacy ``USER_HEAD_CAP``
+# / ``TEXT_CAP`` stay in place — the kinds-order tests pin the kinds list,
+# not the snippet length, and other callers still want the trimmed cap.
 
 # Stream entry kinds in display order. The "kind" keys are the kickoff's
 # verbatim shape — the IDE panel maps them onto draw routines.
@@ -67,7 +73,7 @@ _KIND_STEER = "steer"
 _KIND_NOTE = "note"
 
 _DEFAULT_VIEW = "stream"
-_VIEWS = ("stream", "output", "prompt", "telemetry", "learning")
+_VIEWS = ("stream", "output", "prompt", "telemetry", "learning", "changes")
 
 # Map a node's ``type`` (workflow role) onto an ``operator_steering`` role.
 # ``_fetch_steer_rows`` keys on this map so the IDE stream shows only rows
@@ -838,8 +844,9 @@ def _session_entries(session_path: Path) -> list[dict[str, Any]]:
                     out.append(_with_ts({
                         "k": _KIND_USER,
                         "head": "",
-                        "arg": text[:USER_HEAD_CAP],
-                        "lines": [{"t": text[:USER_HEAD_CAP], "c": "body"}],
+                        "arg": text[:USER_FULL_CAP],
+                        "lines": [{"t": text[:USER_FULL_CAP], "c": "body"}],
+                        "md": True,
                         "_src": "tx",
                         "_line": line_idx,
                     }, entry, line_idx))
@@ -891,12 +898,13 @@ def _session_entries(session_path: Path) -> list[dict[str, Any]]:
                         "_line": line_idx,
                     }, entry, line_idx))
                 elif bt == "text":
-                    text = _text_block(b, "text")[:TEXT_CAP]
+                    text = _text_block(b, "text")[:USER_FULL_CAP]
                     out.append(_with_ts({
                         "k": _KIND_TEXT,
                         "head": "",
                         "arg": text,
                         "lines": [{"t": text, "c": "body"}],
+                        "md": True,
                         "_src": "tx",
                         "_line": line_idx,
                     }, entry, line_idx))
@@ -1234,9 +1242,16 @@ def _output_view(run_dir: Path, node: Node) -> dict[str, Any]:
     * ``<id>.md``
     * ``review-<id>.json``
     * ``verifier_<id>.json``
+
+    Kickoff §2: when the matched report is a markdown file, the response
+    ALSO carries a top-level ``markdown`` block built from the untruncated
+    file text (capped at ``MD_FILE_CAP`` chars), so the IDE panel renders
+    the report whole instead of the last ``SHELL_LOG_LINES`` lines. The
+    truncated ``block`` is kept for back-compat.
     """
     block: list[dict[str, str]] = []
     block_title = "Node output"
+    md_block: dict[str, Any] | None = None
     for path in _report_paths(run_dir, node.id):
         if not path.is_file():
             continue
@@ -1246,6 +1261,10 @@ def _output_view(run_dir: Path, node: Node) -> dict[str, Any]:
         block_title = f"Node output · {path.name}"
         for ln in text.splitlines()[-SHELL_LOG_LINES:]:
             block.append({"t": ln[:LINE_CHARS], "c": "body"})
+        if path.suffix == ".md":
+            md_block = {"title": path.name,
+                        "text": text[:MD_FILE_CAP],
+                        "path": str(path)}
         break
     if not block:
         block = [{"t": "No output file found for this node.", "c": "muted"}]
@@ -1260,8 +1279,11 @@ def _output_view(run_dir: Path, node: Node) -> dict[str, Any]:
             node.id not in rel):
             continue
         arts.append(S.item(rel, f"{_size(path)} bytes", acts=[S.btn("Open", S.open_path(str(path)), "ghost")]))
-    return {"block_title": block_title, "block": block,
-            "list_title": "Artifacts", "list": arts}
+    out: dict[str, Any] = {"block_title": block_title, "block": block,
+                           "list_title": "Artifacts", "list": arts}
+    if md_block is not None:
+        out["markdown"] = md_block
+    return out
 
 
 def _report_paths(run_dir: Path, node_id: str) -> list[Path]:
@@ -1298,9 +1320,16 @@ def _size(path: Path) -> int:
         return 0
 
 
-def _prompt_view(node: Node, session_path: Path | None) -> dict[str, Any]:
+def _prompt_view(node: Node, session_path: Path | None,
+                 recipe_dir: Path | None = None) -> dict[str, Any]:
+    """Kickoff §2: the response carries the FULL prompt (capped at
+    ``MD_FILE_CAP`` chars) as a top-level ``markdown`` block, plus the
+    truncated ``block`` for back-compat. The prompt file path comes from
+    ``node.prompt`` (``recipe_name/<prompt_ref>``) resolved against
+    ``recipe_dir`` when present."""
     block_title = "Rendered prompt · as dispatched"
     block: list[dict[str, str]] = []
+    full_text = ""
     if session_path is not None:
         for entry in _read_jsonl(session_path):
             if str(entry.get("type") or "") != "user":
@@ -1312,30 +1341,45 @@ def _prompt_view(node: Node, session_path: Path | None) -> dict[str, Any]:
             # as ``{"type":"user","message":{"content":"<prompt>"}}``).
             # A ``tool_result`` envelope is never a prompt.
             if isinstance(content, str):
-                text = content
-                for ln in text.splitlines():
-                    block.append({"t": ln[:LINE_CHARS], "c": "body"})
+                full_text = content
                 break
             if not isinstance(content, list):
                 continue
             for b in content:
                 if isinstance(b, dict) and b.get("type") == "text":
-                    text = str(b.get("text") or "")
-                    for ln in text.splitlines():
-                        block.append({"t": ln[:LINE_CHARS], "c": "body"})
+                    full_text = str(b.get("text") or "")
                     break
             break
-    if not block and node.prompt:
-        for ln in node.prompt.splitlines():
+    if not full_text and node.prompt:
+        full_text = node.prompt
+    if full_text:
+        for ln in full_text.splitlines():
             block.append({"t": ln[:LINE_CHARS], "c": "body"})
     if not block:
         block = [{"t": "No prompt recorded for this node.", "c": "muted"}]
-    list_items = []
+    list_items: list[dict[str, Any]] = []
     if node.prompt:
         list_items.append(S.item(node.prompt, "recipe prompt ref",
                                   acts=[S.btn("Open", S.open_path(node.prompt), "ghost")]))
-    return {"block_title": block_title, "block": block,
-            "list_title": "Prompt ref", "list": list_items}
+    out: dict[str, Any] = {"block_title": block_title, "block": block,
+                           "list_title": "Prompt ref", "list": list_items}
+    if full_text:
+        out["markdown"] = {"title": "Rendered prompt · as dispatched",
+                           "text": full_text[:MD_FILE_CAP],
+                           "path": _resolve_prompt_file(node, recipe_dir)}
+    return out
+
+
+def _resolve_prompt_file(node: Node, recipe_dir: Path | None) -> str | None:
+    """Resolve ``node.prompt`` (shape ``recipe_name/<prompt_ref>``) against
+    ``recipe_dir`` to an existing file path, or ``None`` when missing."""
+    if not node.prompt or recipe_dir is None:
+        return None
+    parts = node.prompt.split("/", 1)
+    if len(parts) != 2:
+        return None
+    path = recipe_dir / parts[1]
+    return str(path) if path.is_file() else None
 
 
 def _telemetry_view(run: Run, node: Node) -> dict[str, Any]:
@@ -1635,11 +1679,13 @@ def build_node(home: Path, run_id: str, node_id: str, view: str | None = None,
     elif view == "output":
         base.update(_output_view(run_dir, target))
     elif view == "prompt":
-        base.update(_prompt_view(target, session_path))
+        base.update(_prompt_view(target, session_path, run_obj.recipe_dir))
     elif view == "telemetry":
         base.update(_telemetry_view(run_obj, target))
     elif view == "learning":
         base.update(_learning_view(run_obj, target))
+    elif view == "changes":
+        base.update(build_changes_view(run_obj, target))
     return base
 
 

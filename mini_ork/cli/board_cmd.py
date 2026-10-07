@@ -589,7 +589,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--arg", action="append", default=[])
     parser.add_argument("--note", default=None)
     parser.add_argument("--view", default=None,
-                        choices=["stream", "output", "prompt", "telemetry", "learning"],
+                        choices=["stream", "output", "prompt", "telemetry", "learning",
+                                 "changes"],
                         help="node detail view (default: stream)")
     parser.add_argument("--offset", type=int, default=0,
                         help="stream-view offset — return only entries from this line on")
