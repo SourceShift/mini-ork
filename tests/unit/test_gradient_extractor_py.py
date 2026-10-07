@@ -401,3 +401,67 @@ def test_extract_failure_empty_stderr_still_names_lane(db, monkeypatch):
     assert err.rstrip().endswith(
         "gradient_extract: LLM dispatch failed on lane codex: rc=1 (no stderr captured)"
     ), f"unexpected stderr: {err!r}"
+
+
+def test_default_dispatch_resets_stale_error_on_success(db, monkeypatch):
+    """A successful `_default_dispatch` MUST clear any prior `_last_dispatch_error`.
+
+    The kickoff's stated test (failed → failed with empty stderr) is vacuous:
+    the rc!=0 path already overwrites the buffer with the lane marker, so
+    "first 400" cannot leak across two failed calls. The real hole is a
+    FAILED call followed by a SUCCESSFUL call: the rc==0 path leaves the
+    buffer alone, so a later failed call could echo the previous lane's
+    error. The fix resets `_last_dispatch_error = ""` at entry under the
+    lock, so a prior failure cannot survive a successful call.
+
+    Without the reset, the pre-fix reproduction is:
+        call 1 → rc=1, stderr "first 400"  → buffer = "lane codex: first 400"
+        call 2 → rc=0                       → buffer still = "lane codex: first 400"
+    """
+    # Pre-seed the buffer to a recognisable prior failure — simulating state
+    # left by an earlier call. The production reset must overwrite this.
+    monkeypatch.setattr(ge, "_last_dispatch_error", "lane codex: first 400")
+    from mini_ork.dispatch import llm_dispatch as native_dispatch
+
+    def fake(argv, *, root, dispatch_fn):
+        # Successful dispatch — does NOT write to _last_dispatch_error.
+        print('[{"target":"workflow.node.test","signal":"s",'
+              '"suggested_change":"c","confidence":0.5}]', end="")
+        return 0
+
+    monkeypatch.setattr(native_dispatch, "llm_dispatch", fake)
+    monkeypatch.setenv("MINI_ORK_GRADIENT_MODEL", "codex")
+
+    # Direct call — the reset is in `_default_dispatch`, not in `extract`.
+    rc, _ = ge._default_dispatch(
+        "stub prompt",
+        repo_root="/engine",
+        dispatch_fn=lambda *args: 0,
+    )
+    assert rc == 0
+    # The buffer MUST be cleared — a later failure must not echo "first 400".
+    assert ge._last_dispatch_error == "", (
+        f"stale error leaked across successful call: {ge._last_dispatch_error!r}"
+    )
+
+
+def test_default_dispatch_reset_runs_before_rc_zero_path(db, monkeypatch):
+    """The reset at entry runs BEFORE the success path leaves the buffer alone.
+
+    Companion to the previous test: the buffer is reset even if the call
+    itself never reaches a write site (rc==0 has no write site). This is the
+    direct regression guard for the fix.
+    """
+    monkeypatch.setattr(ge, "_last_dispatch_error", "stale lane codex: prior failure")
+    from mini_ork.dispatch import llm_dispatch as native_dispatch
+
+    monkeypatch.setattr(native_dispatch, "llm_dispatch", lambda *a, **kw: 0)
+    monkeypatch.setenv("MINI_ORK_GRADIENT_MODEL", "codex")
+
+    rc, _ = ge._default_dispatch(
+        "stub",
+        repo_root="/engine",
+        dispatch_fn=lambda *a: 0,
+    )
+    assert rc == 0
+    assert ge._last_dispatch_error == ""

@@ -1298,6 +1298,58 @@ def test_reflection_verify_patterns_legacy_db_no_lesson_column(
     assert st == "proposed"
 
 
+def test_reflection_verify_patterns_missing_table_returns_zero(tmp_path, monkeypatch):
+    """A DB with NO `emergent_patterns` table is cold-safe: returns 0, prints 0.
+
+    Revision 1 dropped the OperationalError guard on the probe path, so a DB
+    that has never run the migration that adds `emergent_patterns` raised
+    `sqlite3.OperationalError: no such table: emergent_patterns` instead of
+    printing `0` and returning `0`. The fix wraps EVERY `con.execute` in the
+    function so a missing table fails closed with no false approvals.
+    """
+    empty_db = str(tmp_path / "empty.db")
+    con = sqlite3.connect(empty_db)
+    con.execute("PRAGMA busy_timeout=5000")
+    # No CREATE TABLE — the table genuinely does not exist.
+    con.commit()
+    con.close()
+
+    monkeypatch.setenv("MINI_ORK_DB", empty_db)
+    import io
+    from contextlib import redirect_stdout
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        n = rp.reflection_verify_patterns()
+    assert n == 0
+    assert buf.getvalue().strip() == "0"
+
+
+def test_reflection_verify_patterns_missing_table_no_lesson_returns_zero(
+        tmp_path, monkeypatch):
+    """Missing table is cold-safe even with MO_EMERGENT_VERIFY_REQUIRE_LESSON=0.
+
+    The `else` branch (require_lesson=False) had no OperationalError guard in
+    r1 either, so a missing table raised from `con.execute(base_select)`. The
+    fix wraps that branch the same way: table absent → `print(0); return 0`.
+    """
+    empty_db = str(tmp_path / "empty-lesson-off.db")
+    con = sqlite3.connect(empty_db)
+    con.commit()
+    con.close()
+
+    monkeypatch.setenv("MINI_ORK_DB", empty_db)
+    monkeypatch.setenv("MO_EMERGENT_VERIFY_REQUIRE_LESSON", "0")
+    import io
+    from contextlib import redirect_stdout
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        n = rp.reflection_verify_patterns()
+    assert n == 0
+    assert buf.getvalue().strip() == "0"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # (8) reflection_extract_gradients — SQL trace_id selection + injected stub
 # ─────────────────────────────────────────────────────────────────────────────

@@ -22,9 +22,10 @@ from typing import Any, NoReturn, cast
 
 
 # Module-level capture of the last dispatch failure (lane + tail of provider
-# stderr). Future reflect fan-out could race the write site, so a Lock guards
-# every mutation. The read site in `extract` runs in the same thread as the
-# matching `_default_d` call, so no read-side lock is needed.
+# stderr). Both write sites in `_default_dispatch` and the read site in
+# `extract` take `_dispatch_lock` — a stale `_last_dispatch_error` could
+# otherwise survive across calls and confuse the next `extract`'s failure
+# message with the previous lane's error.
 _last_dispatch_error: str = ""
 _dispatch_lock = threading.Lock()
 
@@ -327,6 +328,12 @@ def _default_dispatch(
     """Call the native telemetry-aware dispatcher and isolate diagnostics."""
     global _last_dispatch_error
     from mini_ork.dispatch import llm_dispatch as native_dispatch
+
+    # Reset the module-level error buffer at entry under the lock: a previous
+    # failure must not leak into the current call's `extract` failure message
+    # when this call succeeds (rc==0 path leaves the buffer alone).
+    with _dispatch_lock:
+        _last_dispatch_error = ""
 
     stdout = io.StringIO()
     stderr = io.StringIO()

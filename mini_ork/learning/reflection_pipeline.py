@@ -936,11 +936,24 @@ def reflection_verify_patterns(*, db_path: str | None = None) -> int:
                 rows = con.execute(with_lesson_select).fetchall()
                 with_lesson = True
             except sqlite3.OperationalError:
+                # Column missing (legacy) OR table missing. Probe base_select
+                # — it lacks lesson_text, so a column-missing error does NOT
+                # re-fire here; only a table-missing error does.
+                try:
+                    rows = con.execute(base_select).fetchall()
+                    with_lesson = False
+                except sqlite3.OperationalError:
+                    # Table missing — fail closed: print(0); return 0.
+                    print(0)
+                    return 0
+        else:
+            try:
                 rows = con.execute(base_select).fetchall()
                 with_lesson = False
-        else:
-            rows = con.execute(base_select).fetchall()
-            with_lesson = False
+            except sqlite3.OperationalError:
+                # Table missing — fail closed: print(0); return 0.
+                print(0)
+                return 0
         now = int(time.time())
         approved = 0
         held = 0
@@ -960,11 +973,16 @@ def reflection_verify_patterns(*, db_path: str | None = None) -> int:
             if require_lesson and not (lesson_text and str(lesson_text).strip()):
                 held += 1
                 continue
-            con.execute(
-                "UPDATE emergent_patterns SET status='approved', resolved_at=? "
-                "WHERE pattern_id=? AND status='proposed'",
-                (now, pid),
-            )
+            try:
+                con.execute(
+                    "UPDATE emergent_patterns SET status='approved', resolved_at=? "
+                    "WHERE pattern_id=? AND status='proposed'",
+                    (now, pid),
+                )
+            except sqlite3.OperationalError:
+                # Table went away mid-iteration (race with another writer).
+                # Fail closed per row: do not promote, do not crash the gate.
+                continue
             approved += 1
         con.commit()
     finally:
