@@ -228,13 +228,12 @@ def _resolve_via_llm_calls(run: "Run", node: Node) -> Path | None:
     actor = str(node.role_lane or "")
     if not actor:
         return None
-    start_s = int(node.start) - 2 if node.start is not None else None
+    start_s = int(node.start) - 5 if node.start is not None else None
     end_s = int(node.end) + 5 if node.end is not None else None
     # ``llm_calls.ts`` is TEXT (ISO format, see ``db/migrations/0002...sql:241``).
     # SQLite compares ISO strings chronologically when both bounds are also ISO.
-    # Passing integers here would coerce each row's ISO to a non-numeric 0 and
-    # either always match or never match — always-match in practice, since
-    # 0 lies between any default-bounds any two signed numbers.
+    # Integer bounds would never match: SQLite sorts every INTEGER below every
+    # TEXT value, so ``ts BETWEEN <int> AND <int>`` is false for each row.
     from datetime import datetime, timezone
     def _iso(epoch: int | None) -> str:
         if epoch is None:
@@ -641,7 +640,14 @@ def _stream_entries(session_path: Path | None, log_path: Path | None,
         lower_bound_ts.append(node_start_s)
         if node_end_s is not None:
             upper_bound_ts.append(node_end_s)
-    if log_path is not None and int(offset) > 0:
+    # r6 fix #1 — the log-line proxy only fires when the stream is genuinely
+    # log-backed. When both a transcript AND an ``impl-<id>.log`` exist (the
+    # common implementer shape), ``log_path is not None`` is true but the
+    # transcript already supplies real ``_ts`` values; appending the proxy
+    # here would raise the lower bound and drop steers that belong to this
+    # poll. Same discriminator as the log-backed branch above
+    # (``session_path is None and log_path is not None``).
+    if session_path is None and log_path is not None and int(offset) > 0:
         lower_bound_ts.append(node_start_s + int(offset) - 1)
     for e in raw:
         if e.get("_src") == "steer":
@@ -746,12 +752,13 @@ def _stream_entries(session_path: Path | None, log_path: Path | None,
             except Exception:  # noqa: BLE001
                 cs_env = None
             cs_ts: int | None = None
-            if isinstance(cs_env, dict):
-                raw_ts = cs_env.get("ts")
-                if raw_ts is not None:
-                    cs_ts = _epoch(raw_ts)
-                if cs_ts is None and target.end is not None:
-                    cs_ts = int(target.end)
+            # r6 fix #3 — drop the dead ``cs_env.get("ts")`` read. The inner
+            # envelope returned by ``_fetch_cost_state`` carries the session
+            # aggregate only (session_id / total_cost_usd / num_turns); the
+            # outer ``live.jsonl`` record's ``t`` is discarded upstream. Fall
+            # straight through to the ``target.end`` fallback.
+            if isinstance(cs_env, dict) and target.end is not None:
+                cs_ts = int(target.end)
             if (cs_ts is not None
                     and newest_consumed_ts is not None
                     and newest_consumed_ts < cs_ts

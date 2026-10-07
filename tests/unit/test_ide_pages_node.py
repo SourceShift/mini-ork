@@ -155,8 +155,6 @@ def _seed(home: Path, *, status: str = "executing") -> Path:
         "[verifier] running\n[ok] verifier pass\n")
 
     # Operator-steering row for the run.
-    # r3 fix #3: park the steer at ``node.start + 30 s`` so it sorts AFTER
-    # the last transcript line (T0+20) — the kickoff's realistic timing.
     # expires_at uses wall-clock now + 1 h so the ``expires_at > now`` filter
     # in ``_fetch_steer_rows`` always passes regardless of when the test runs.
     con = sqlite3.connect(home / "state.db")
@@ -202,10 +200,8 @@ def test_stream_view_kinds_and_order_match_the_transcript(home: Path) -> None:
     out = build_node(home, RUN, AGENT_NODE, view="stream")
     kinds = [e["k"] for e in out["entries"]]
     # user → think → tool(Read) → tool(Edit) → tool(Bash) → todo → text → note.
-    # r3 fix #3: the default fixture steer parks at ``node.start + 30 s``
-    # (kickoff's realistic timing) which is past the transcript's last line
-    # — that steer surfaces only when new transcript lines catch up to it,
-    # so the kinds list stops at the result note.
+    # The fixture's steer is timed after the transcript's last line, so it
+    # surfaces only when new transcript lines catch up to it.
     assert kinds == ["user", "think", "tool", "tool", "tool", "todo", "text", "note"]
     # r3 fix #7: status carries the TOTAL transcript entry count, not the
     # poll slice. 8 parsed entries (user, think, tool×3, todo, text, note).
@@ -842,6 +838,91 @@ def test_steer_emitted_once_and_skipped_on_subsequent_polls(home: Path) -> None:
         f"no steer row expected on the post-append poll; got kinds: {kinds}"
     )
     assert after["offset"] == full_offset + 1
+
+
+def test_proxy_lower_bound_is_gated_on_log_backed_stream(home: Path) -> None:
+    """r6 fix #1: the log-line proxy (``node_start + offset - 1``) must only
+    enter ``lower_bound_ts`` when the stream is genuinely log-backed.
+
+    Recipe: an implementer node has BOTH a session transcript AND an
+    ``impl-<node>.log``. On HEAD (r5), ``_stream_entries`` appended the
+    proxy to ``lower_bound_ts`` whenever ``log_path is not None``, even
+    when ``session_path is not None`` — pushing ``max_lower_ts`` forward
+    to ``T0+109`` and causing a late-arriving steer at ``T0+25`` to be
+    dropped on the post-append poll.
+
+    Build: 100 transcript lines packed into whole seconds (T0+10 ..
+    T0+19.9), an ``impl-<node>.log``, a steer at T0+25. Append one
+    catch-up transcript line at T0+30 (idx 100). Poll at offset=100.
+
+    * OLD (HEAD, buggy): max_lower_ts = max(T0+19.9, T0+109) = T0+109.
+      Steer 25 ≤ 109 → dropped. Test FAILS.
+    * NEW (r6 fix): max_lower_ts = T0+19.9 (real ISO wins). Steer
+      25 > 19.9 AND 25 ≤ 30 → emitted exactly once. Test PASSES.
+    """
+    _seed(home)
+    run_dir = home / "runs" / RUN
+    session_path = _write_five_line_transcript(home)
+
+    # Implementer's own log — drives ``log_path is not None`` while a
+    # transcript is also present, exactly the r5 regression shape.
+    (run_dir / f"impl-{AGENT_NODE}.log").write_text(
+        "[impl] starting\n[impl] step 1\n[impl] step 2\n")
+
+    # Replace the fixture's 5-line transcript with a 100-line dense one
+    # packed across 10 s (10 lines per integer second, T0+10..T0+19).
+    # The kickoff asks for the bug to fail-before: with the proxy
+    # injected, ``max_lower_ts`` jumps to ``node_start + offset - 1
+    # = T0+109``, which is later than every real consumed line. The
+    # ISO timestamp format truncates to whole seconds, so the "density"
+    # of the test is achieved by ensuring the transcript's max real
+    # ``_ts`` stays well under T0+109.
+    dense_lines: list[str] = []
+    for i in range(100):
+        ts = T0 + 10 + (i // 10)  # 10 lines per integer second
+        dense_lines.append(json.dumps({
+            "type": "assistant",
+            "timestamp": _iso(ts),
+            "message": {"content": [
+                {"type": "text", "text": f"line {i}"}
+            ]},
+        }))
+    session_path.write_text("\n".join(dense_lines) + "\n")
+
+    # Steer at T0+25 — past the transcript's last line (T0+19.9) but
+    # BEFORE the appended catch-up line at T0+30. With the bug, the
+    # steer is dropped on every post-append poll.
+    con = sqlite3.connect(home / "state.db")
+    expires_ms = int(time.time() * 1000) + 3600_000
+    con.execute(
+        "INSERT INTO operator_steering (run_id, role_target, severity, message, source, "
+        "confidence, created_at, expires_at) VALUES (?,?,?,?,?,?,?,?)",
+        (RUN, AGENT_NODE, "info", "r6 fix #1 regression", "ide", 0.8,
+         (T0 + 25) * 1000, expires_ms))
+    con.commit()
+    con.close()
+
+    # Append the catch-up transcript line at T0+30 (line idx 100).
+    with session_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"type": "assistant", "timestamp": _iso(T0 + 30),
+                            "message": {"content": [
+                                {"type": "text", "text": "catch-up"}
+                            ]}}) + "\n")
+
+    # Poll at offset=100: lines 0..99 consumed; appended line in upper.
+    out = build_node(home, RUN, AGENT_NODE, view="stream", offset=100)
+    args = [e["arg"] for e in out["entries"]]
+    steer_rows = [e for e in out["entries"] if e["k"] == "steer"]
+    assert len(steer_rows) == 1, (
+        f"r6 fix #1 failed: expected exactly one steer emit on the "
+        f"post-append poll; got {len(steer_rows)} (entries: {args})"
+    )
+    assert "r6 fix #1 regression" in (steer_rows[0]["arg"] or ""), (
+        f"r6 fix #1 failed: steer payload missing; got: {steer_rows[0]}"
+    )
+    assert "catch-up" in args, (
+        f"r6 fix #1 failed: appended line must surface; got: {args}"
+    )
 
 
 def test_shell_log_uses_absolute_line_indices(home: Path) -> None:
