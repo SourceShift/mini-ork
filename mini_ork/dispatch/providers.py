@@ -161,13 +161,29 @@ def claude_result_text(stdout: str) -> str:
     return body
 
 
+def _claude_thinking_tokens(env: dict) -> int:
+    """Thinking tokens from a claude CLI result envelope: the top-level
+    ``usage.output_tokens_details.thinking_tokens``, else the sum of the
+    per-model ``modelUsage[*].thinkingTokens``. 0 when neither is reported."""
+    details = ((env.get("usage") or {}).get("output_tokens_details")) or {}
+    if isinstance(details, dict) and details.get("thinking_tokens") is not None:
+        return int(details.get("thinking_tokens") or 0)
+    per_model = env.get("modelUsage") or {}
+    if isinstance(per_model, dict):
+        return sum(int((m or {}).get("thinkingTokens") or 0)
+                   for m in per_model.values() if isinstance(m, dict))
+    return 0
+
+
 def parse_claude_usage(stdout: str) -> TokenUsage:
-    u = (_claude_envelope(stdout).get("usage")) or {}
+    env = _claude_envelope(stdout) or {}
+    u = env.get("usage") or {}
     return TokenUsage(
         input_tokens=int(u.get("input_tokens") or 0),
         output_tokens=int(u.get("output_tokens") or 0),
         cached_input_tokens=int(u.get("cache_read_input_tokens") or 0),
         cache_creation_tokens=int(u.get("cache_creation_input_tokens") or 0),
+        thinking_tokens=_claude_thinking_tokens(env),
     )
 
 

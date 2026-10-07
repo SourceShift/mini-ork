@@ -334,7 +334,7 @@ def check_lane_fuse(db, lane, category) -> bool:
 def write_llm_calls_row(db, provider, model_id, tier, feature_name, actor, status,
                         duration_ms, cost_usd, error_message, input_tokens=0, output_tokens=0,
                         metadata_json="{}", cached_input_tokens=0, cache_creation_input_tokens=0,
-                        error_category=None, retryable=None):
+                        error_category=None, retryable=None, thinking_tokens=0):
     if not (db and os.path.isfile(db)):
         return
     in_tok = _int_or(input_tokens, 0)
@@ -373,6 +373,7 @@ def write_llm_calls_row(db, provider, model_id, tier, feature_name, actor, statu
     for name, val in (("error_category", error_category), ("retryable", retryable),
                       ("cached_input_tokens", cached_in),
                       ("cache_creation_input_tokens", cache_create),
+                      ("thinking_tokens", _int_or(thinking_tokens, 0)),
                       ("cost_input_uncached_usd", cost_input_uncached),
                       ("cost_input_cached_usd", cost_input_cached),
                       ("cost_cache_write_usd", cost_cache_write)):
@@ -421,7 +422,8 @@ def mo_llm_dispatch(model, prompt, out_file, timeout_s=1500, max_turns=60, accep
     u = res.usage
     try:
         open(out_file + ".tokens", "w", encoding="utf-8").write(
-            f"{u.input_tokens}\t{u.output_tokens}\t{u.cached_input_tokens}\t{u.cache_creation_tokens}")
+            f"{u.input_tokens}\t{u.output_tokens}\t{u.cached_input_tokens}\t{u.cache_creation_tokens}"
+            f"\t{u.thinking_tokens}")
     except (OSError, AttributeError):
         pass
     if not res.ok and res.error:
@@ -577,12 +579,13 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
         cost_usd = "0"
         if os.path.isfile(out_file + ".cost"):
             cost_usd = open(out_file + ".cost").read().strip() or "0"
-        in_tok = out_tok = cached_in = cache_create = 0
+        in_tok = out_tok = cached_in = cache_create = thinking = 0
         if os.path.isfile(out_file + ".tokens"):
-            parts = (open(out_file + ".tokens").read().split("\t") + ["0"] * 4)[:4]
-            in_tok, out_tok, cached_in, cache_create = (_int_or(p, 0) for p in parts)
+            parts = (open(out_file + ".tokens").read().split("\t") + ["0"] * 5)[:5]
+            in_tok, out_tok, cached_in, cache_create, thinking = (_int_or(p, 0) for p in parts)
         write_llm_calls_row(db, provider, selected_model, tier, feature, actor, "success",
-                            duration_ms, cost_usd, "", in_tok, out_tok, "{}", cached_in, cache_create)
+                            duration_ms, cost_usd, "", in_tok, out_tok, "{}", cached_in, cache_create,
+                            thinking_tokens=thinking)
         run_dir = context_env("MINI_ORK_RUN_DIR")
         if os.path.isfile(out_file + ".cost") and run_dir:
             try:
@@ -624,13 +627,13 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
     cost_usd = "0"
     if os.path.isfile(out_file + ".cost"):
         cost_usd = open(out_file + ".cost").read().strip() or "0"
-    in_tok = out_tok = cached_in = cache_create = 0
+    in_tok = out_tok = cached_in = cache_create = thinking = 0
     if os.path.isfile(out_file + ".tokens"):
-        parts = (open(out_file + ".tokens").read().split("\t") + ["0"] * 4)[:4]
-        in_tok, out_tok, cached_in, cache_create = (_int_or(p, 0) for p in parts)
+        parts = (open(out_file + ".tokens").read().split("\t") + ["0"] * 5)[:5]
+        in_tok, out_tok, cached_in, cache_create, thinking = (_int_or(p, 0) for p in parts)
     write_llm_calls_row(db, provider, selected_model, tier, feature, actor, "failed",
                         duration_ms, cost_usd, err, in_tok, out_tok, "{}", cached_in, cache_create,
-                        error_category=category, retryable=retryable)
+                        error_category=category, retryable=retryable, thinking_tokens=thinking)
     sys.stderr.write(f"[llm_dispatch FAIL model={model} rc={rc}]\n")
     for side in (out_file + ".tokens", out_file + ".model"):
         try:

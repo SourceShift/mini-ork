@@ -154,6 +154,7 @@ def persist_call(
         "session_id": session_id,
         "cached_input_tokens": usage.cached_input_tokens,
         "cache_creation_input_tokens": usage.cache_creation_tokens,
+        "thinking_tokens": usage.thinking_tokens,
         "cost_input_uncached_usd": uncached_cost,
         "cost_input_cached_usd": cached_cost,
         "cost_cache_write_usd": cache_write_cost,

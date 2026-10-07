@@ -19,6 +19,10 @@ class TokenUsage:
     output_tokens: int = 0
     cached_input_tokens: int = 0
     cache_creation_tokens: int = 0
+    # Reasoning ("thinking") tokens, a breakdown of output_tokens — never
+    # additive to it. Anthropic-shaped envelopes report them under
+    # usage.output_tokens_details.thinking_tokens.
+    thinking_tokens: int = 0
 
 
 @dataclass(frozen=True)
