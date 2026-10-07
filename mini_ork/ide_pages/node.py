@@ -36,12 +36,21 @@ lines; the note never appears in the offset math.
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
 
 from mini_ork.ide_pages import spec as S
-from mini_ork.ide_pages.node_changes import MD_FILE_CAP, USER_FULL_CAP, build_changes_view
+from mini_ork.ide_pages.node_changes import (
+    MD_FILE_CAP,
+    USER_FULL_CAP,
+    _CODE_CHANGING_TYPES,
+    _is_review_node,
+    _read_json,
+    _result_items,
+    build_changes_view,
+)
 from mini_ork.ide_pages.run import Run, Node, _epoch, _load, _wall, _REVIEW_TYPES
 
 # Live-detection window per the kickoff §"live": running AND transcript grew
@@ -68,8 +77,8 @@ _KIND_TODO = "todo"
 _KIND_STEER = "steer"
 _KIND_NOTE = "note"
 
-_DEFAULT_VIEW = "stream"
-_VIEWS = ("stream", "output", "prompt", "telemetry", "learning", "changes")
+_DEFAULT_VIEW = "overview"
+_VIEWS = ("stream", "output", "prompt", "telemetry", "learning", "changes", "overview")
 
 # Map a node's ``type`` (workflow role) onto an ``operator_steering`` role.
 # ``_fetch_steer_rows`` keys on this map so the IDE stream shows only rows
@@ -121,7 +130,7 @@ def _reject_unsafe(name: str, value: str) -> str | None:
 
 
 def _resolve_session_path(run: "Run", node: Node) -> Path | None:
-    """Three-rule node→session resolver (kickoff r2 fixes #2).
+    """Five-rule node→session resolver (kickoff r2 fixes #2 + node-overview).
 
     1. ``session_id`` in the ``agent-<node>.live.jsonl`` cost-state/result
        envelope — most authoritative when the live file exists.
@@ -137,11 +146,26 @@ def _resolve_session_path(run: "Run", node: Node) -> Path | None:
        the node id/name or the prompt template text. A finished shell/
        verifier node with no mapped session falls through to
        ``_resolve_log_path`` — never borrow another node's transcript.
+    4. **node-overview §1.** Each session id observed by rule 1 (newest-first),
+       resolved against ``~/.claude/projects/*/<sid>.jsonl`` (newest-first,
+       first hit). Bound the candidate set; honor ``CLAUDE_CONFIG_DIR`` when
+       set; never raise on permission / missing-dir / empty glob.
+    5. **node-overview §1.** When no transcript file exists anywhere and the
+       live sidecar ``agent-<node>.live.jsonl`` does, return the sidecar
+       path. ``_session_entries`` recognises the sidecar filename and decodes
+       the ``{"line": "<stream-json>"}`` envelope into the same record
+       dispatcher — so the stream / overview view shows the agent's full
+       conversation instead of "no transcript". No schema migration; the
+       filename contract is unchanged (``web/routes/node_live.py:46``,
+       ``web/routes/stream.py:48``).
     """
     run_dir = run.run_dir
 
-    # Rule 1 — live.jsonl cost-state/result envelope (unchanged).
+    # Rule 1 — live.jsonl cost-state/result envelope. Also collect the sids
+    # we saw so rule 4 can probe the home projects tree when no local session
+    # file exists (the kickoff §1 lost-transcript case).
     live_path = run_dir / f"agent-{node.id}.live.jsonl"
+    envelope_sids: list[str] = []
     if live_path.is_file():
         try:
             tail = live_path.read_text(encoding="utf-8", errors="replace")
@@ -167,6 +191,10 @@ def _resolve_session_path(run: "Run", node: Node) -> Path | None:
             sid = env.get("session_id")
             if not isinstance(sid, str) or not sid:
                 continue
+            if sid not in envelope_sids:
+                # Rule 1 walks the tail newest-first; preserve that order so
+                # rule 4's glob checks the most recent sid first.
+                envelope_sids.append(sid)
             candidate = run_dir / "sessions" / f"{sid}.jsonl"
             if candidate.is_file():
                 return candidate
@@ -199,6 +227,67 @@ def _resolve_session_path(run: "Run", node: Node) -> Path | None:
                     first = _first_user_text(cand)
                     if first and any(n and n in first for n in needle):
                         return cand
+
+    # Rule 4 — node-overview §1: ``~/.claude/projects/*/<sid>.jsonl`` fallback.
+    # Claude Code stores sessions under per-project subdirectories of the
+    # ``projects`` tree. We don't know which project a run is in, so we glob all
+    # of them and take the newest (most recently modified) match — that's the
+    # most likely candidate for the operator's last active project. The glob
+    # is bounded by ``<sid>.jsonl`` so we never enumerate the whole tree.
+    # Honor ``CLAUDE_CONFIG_DIR`` first (Claude Code's own override);
+    # ``Path.home()`` already reflects the monkeypatched ``HOME`` so the test
+    # suite's ``monkeypatch.setenv("HOME", tmp_path)`` works.
+    for sid in envelope_sids:
+        home_hit = _resolve_home_projects_transcript(sid)
+        if home_hit is not None:
+            return home_hit
+
+    # Rule 5 — node-overview §1: fall back to the live sidecar itself. The
+    # session parser detects ``agent-<node>.live.jsonl`` and unwraps the
+    # ``{"line": "<stream-json>"}`` envelope into the same record dispatcher
+    # used for real transcripts — so the operator sees the agent's full
+    # conversation instead of "no transcript".
+    if live_path.is_file():
+        return live_path
+    return None
+
+
+def _resolve_home_projects_transcript(sid: str) -> Path | None:
+    """Rule 4 of the resolver: probe ``~/.claude/projects/*/<sid>.jsonl``.
+
+    Returns the newest existing hit, or ``None``. Bounds the candidate set to
+    ``*/<sid>.jsonl`` so a large ``projects`` tree is not enumerated; guards
+    every ``OSError`` (permissions, missing ``projects`` dir, race during
+    globbing). Honors ``CLAUDE_CONFIG_DIR`` first; falls back to
+    ``Path.home() / ".claude"``.
+    """
+    if not sid:
+        return None
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if config_dir:
+        claude_dir = Path(config_dir).expanduser()
+    else:
+        try:
+            claude_dir = Path.home() / ".claude"
+        except (OSError, RuntimeError):
+            return None
+    projects_dir = claude_dir / "projects"
+    if not projects_dir.is_dir():
+        return None
+    try:
+        candidates = sorted(
+            projects_dir.glob(f"*/{sid}.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return None
+    for p in candidates:
+        try:
+            if p.is_file():
+                return p
+        except OSError:
+            continue
     return None
 
 
@@ -691,22 +780,17 @@ def _stream_entries(session_path: Path | None, log_path: Path | None,
         out.append(e)
 
     next_offset = int(offset)
-    # r4 fix #5 minor: ``offset`` counts every non-blank transcript/log line,
-    # including ones that didn't emit (failed parse, blank line). For session
-    # transcripts this is the file's non-blank line count; for logs the
-    # matching helper.
-    if session_path is not None:
-        try:
-            text = session_path.read_text(encoding="utf-8", errors="replace")
-            physical_lines = sum(1 for ln in text.splitlines() if ln.strip())
-        except OSError:
-            physical_lines = 0
-    elif log_path is not None:
-        physical_lines = _log_line_count(log_path)
-    else:
-        physical_lines = 0
-    if physical_lines > next_offset:
-        next_offset = physical_lines
+    # r7 fix #1: ``offset`` is a CURSOR OVER DECODED RECORDS, not over
+    # physical file lines. ``_entries_from_records`` numbers ``_line`` by
+    # decoded-record index, so the cursor advances to ``max(emitted _line) + 1``
+    # — never past the highest record index we've consumed. The previous
+    # ``physical_lines`` (non-blank file-line count) advancement made the
+    # cursor jump over records when the file had non-blank but
+    # non-decodable lines (e.g. a stderr line in a live sidecar envelope
+    # stream): subsequent polls at ``offset >= physical_lines`` filtered
+    # out every later record as ``_line < offset``, dropping appended
+    # messages on incremental polls. The for-loop below is the single
+    # source of truth.
     for e in out:
         if e.get("_src") == "steer":
             continue
@@ -793,13 +877,93 @@ def _session_entries(session_path: Path) -> list[dict[str, Any]]:
     r3 fix #3: every entry also carries ``_ts`` (epoch seconds) parsed from
     the line's own ``timestamp`` field (ISO). ``_stream_entries`` sorts and
     thresholds on ``_ts`` instead of a fabricated ``node_start + idx*1000``.
+
+    node-overview §1: when ``session_path`` is the live sidecar
+    (``agent-<node>.live.jsonl``), the file is a sequence of
+    ``{"line": "<stream-json>"}`` envelopes. We unwrap each envelope,
+    decode the inner JSON, and feed the resulting record through the same
+    per-record dispatcher as a real transcript. Status pill, offset math,
+    and entry kinds all stay correct because the inner records carry the
+    same ``{"type", "message", "timestamp"}`` shape as a Claude Code
+    transcript line.
+    """
+    if _is_live_sidecar(session_path):
+        return _entries_from_records(_live_sidecar_records(session_path))
+    return _entries_from_records(_read_jsonl_records(session_path))
+
+
+def _is_live_sidecar(path: Path) -> bool:
+    """A live sidecar is named ``agent-<node>.live.jsonl``.
+
+    Mirrors the system-wide filename contract at
+    ``mini_ork/web/routes/node_live.py:46`` and
+    ``mini_ork/web/routes/stream.py:48`` — never widen this match without
+    also updating those readers.
+    """
+    name = path.name
+    return name.startswith("agent-") and name.endswith(".live.jsonl")
+
+
+def _live_sidecar_records(path: Path) -> list[dict[str, Any]]:
+    """Decode each ``{"line": "<stream-json>"}`` envelope into its inner dict.
+
+    Records that don't decode or aren't objects are skipped — same
+    resilience as :func:`_read_jsonl_records`. The returned list feeds
+    :func:`_entries_from_records` directly.
     """
     out: list[dict[str, Any]] = []
+    for rec in _read_jsonl_records(path):
+        if not isinstance(rec, dict):
+            continue
+        inner = rec.get("line")
+        if not isinstance(inner, str):
+            continue
+        try:
+            obj = json.loads(inner)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(obj, dict):
+            out.append(obj)
+    return out
+
+
+def _read_jsonl_records(path: Path) -> list[dict[str, Any]]:
+    """Read a JSONL file into a list of dict records, skipping non-decodable lines.
+
+    Used by :func:`_session_entries` (real transcripts) and indirectly by
+    :func:`_live_sidecar_records` (live sidecar envelopes). The original
+    :func:`_read_jsonl` is kept for callers that already tolerate
+    non-dict rows.
+    """
     try:
-        text = session_path.read_text(encoding="utf-8", errors="replace")
+        text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return out
-    lines = text.splitlines()
+        return []
+    out: list[dict[str, Any]] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(obj, dict):
+            out.append(obj)
+    return out
+
+
+def _entries_from_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Decoded session/live records → IDE entries.
+
+    Same dispatcher used by the real-transcript and live-sidecar paths so
+    the append-only offset cursor (L708-715), the status-pill entry count
+    (L2531), and the per-poll slice (L588) all agree on the same
+    ``_line`` indices for the same record stream. Determinism is the
+    reason this function takes a pre-decoded list rather than walking a
+    file — same records always produce the same ``_line`` ordering.
+    """
+    out: list[dict[str, Any]] = []
     first_user_done = False
     pending: dict[str, dict[str, Any]] = {}  # tool_use_id → tool info
 
@@ -814,16 +978,7 @@ def _session_entries(session_path: Path) -> list[dict[str, Any]]:
             base.setdefault("_ts_skip", line_idx)
         return base
 
-    for line_idx, raw in enumerate(lines):
-        line = raw.strip()
-        if not line:
-            continue
-        try:
-            entry = json.loads(line)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if not isinstance(entry, dict):
-            continue
+    for line_idx, entry in enumerate(records):
         typ = str(entry.get("type") or "")
         message = entry.get("message") if isinstance(entry.get("message"), dict) else {}
         content = message.get("content") if isinstance(message, dict) else None
@@ -1920,22 +2075,15 @@ def _transcript_has_result(session_path: Path | None) -> bool:
     (kickoff fix #5): when the transcript has its own ``result`` the
     session parser already produced a ``Done · $X · N turns`` note and
     the live.jsonl envelope would just duplicate it.
+
+    Routes through :func:`_records_decoded` so live-sidecar envelopes
+    (``agent-<node>.live.jsonl``) are unwrapped and their inner
+    ``result`` records are recognised on incremental polls.
     """
     if session_path is None or not session_path.is_file():
         return False
-    try:
-        text = session_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return False
-    for raw in text.splitlines():
-        raw = raw.strip()
-        if not raw:
-            continue
-        try:
-            obj = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if isinstance(obj, dict) and str(obj.get("type") or "") == "result":
+    for rec in _records_decoded(session_path):
+        if str(rec.get("type") or "") == "result":
             return True
     return False
 
@@ -2481,6 +2629,513 @@ def _learning_view(run: Run, node: Node) -> dict[str, Any]:
     return result
 
 
+# ── overview view (node-overview §2) ─────────────────────────────────────────
+
+def _overview_view(run: Run, node: Node, session_path: Path | None,
+                   run_dir: Path) -> dict[str, Any]:
+    """One DAG node's ``overview`` payload (kickoff §2). Best-effort:
+    every part is independent — a missing source drops that part, never
+    the view.
+
+    Parts:
+
+    * ``headline`` — ``{"t", "c"}``: one sentence on what happened,
+      dispatched on node kind.
+    * ``facts`` — kv rows for Status / Model / Started / Ended / Duration /
+      Cost (+ calls) / Turns / Tokens / Exit code (command nodes).
+    * ``result`` — reuses :func:`mini_ork.ide_pages.node_changes._result_items`.
+    * ``files`` + ``diff`` + ``diff_note`` — the run-cumulative changes view,
+      reused verbatim from :func:`build_changes_view`.
+    * ``final`` — ``{"text": markdown}``: the agent's final message (transcript
+      ``result`` text else last assistant text block), capped at
+      :data:`USER_FULL_CAP` (200,000 chars).
+    * ``links`` — ``[{"label", "path"}]`` for the node's own artefacts that
+      exist (review JSON, lens report, verifier log, impl log,
+      ``NEEDS-CHANGE.md``).
+    """
+    changes = build_changes_view(run, node)
+    headline = _overview_headline(run, node, run_dir, changes)
+    facts = _overview_facts(run, node, run_dir, session_path)
+    title, items = _result_items(run, node)
+    final = _overview_final(session_path)
+    links = _overview_links(run_dir, node.id)
+    return {
+        "headline": headline,
+        "facts": facts,
+        "result": {"title": title, "items": items},
+        "files": changes.get("files") or [],
+        "diff": changes.get("diff") or "",
+        "diff_note": changes.get("diff_note") or "",
+        "links": links,
+        "final": final,
+    }
+
+
+def _overview_headline(run: Run, node: Node, run_dir: Path,
+                        changes: dict[str, Any] | None = None) -> dict[str, str]:
+    """One-sentence headline. Per-kind dispatch from the kickoff §2:
+
+    * reviewer / judge → ``"<verdict> — <first reason>"`` (from review JSON).
+    * verifier → ``"<n> of <m> checks failed: <first failing check>"``,
+      ``"UNVERIFIED: <reason>"``, or ``"all <m> checks passed"``.
+    * implementer / code-changing → ``"changed <n> files (+a −r)"``.
+    * lens / researcher → first ``#`` heading of the report.
+    * planner → ``plan.json``'s ``objective``.
+    * built-in (verifier / publisher / rollback / shell / gate / transform)
+      → last execute.log line.
+    * any failed node → failure reason first (``finish_reason``, llm_call
+      ``error_message``, last log line).
+
+    ``changes`` is passed through (computed once in :func:`_overview_view`)
+    so the implementer branch does not re-invoke
+    :func:`build_changes_view` on the same node.
+    """
+    # Failed-node headline first — surface the failure before any per-kind text.
+    failure = _overview_failure_reason(run, node, run_dir)
+    if failure:
+        return {"t": failure, "c": "red"}
+
+    ntype = str(node.type or "")
+
+    if _is_review_node(node):
+        return _overview_reviewer_headline(run_dir, node)
+
+    if ntype in ("verifier", "test", "typecheck", "static_check"):
+        return _overview_verifier_headline(run_dir, node)
+
+    if ntype in _CODE_CHANGING_TYPES:
+        return _overview_implementer_headline(changes or build_changes_view(run, node))
+
+    if ntype in ("researcher", "lens"):
+        return _overview_lens_headline(run_dir, node)
+
+    if ntype in ("planner", "decomposer"):
+        return _overview_planner_headline(run_dir)
+
+    if ntype in ("publisher", "rollback", "shell", "gate", "transform"):
+        return _overview_command_headline(run_dir, node)
+
+    # Catch-all: fall through to other-node items.
+    return {"t": f"{node.type or 'Node'} · {node.id}", "c": "sub"}
+
+
+def _overview_failure_reason(run: Run, node: Node, run_dir: Path) -> str | None:
+    """Failure reason from ``node_end`` ``finish_reason``, a failed
+    ``llm_calls`` ``error_message``, or the last log line — **only** when
+    the node is in ``state == "failed"``. Successful nodes return
+    ``None`` so the per-kind dispatch below surfaces their real headline.
+    """
+    if node.state != "failed":
+        return None
+    fin = str(node.finish or "").strip()
+    if fin:
+        return f"failed · {fin}"
+    # node.finish empty — try llm_calls error_message.
+    for c in run.calls or []:
+        if not isinstance(c, dict):
+            continue
+        if not _call_for_node(c, node):
+            continue
+        err = str(c.get("error_message") or c.get("error") or "").strip()
+        if err:
+            return f"failed · {err}"
+    # Last log line — only real command/verifier logs. Live sidecars
+    # (``agent-<id>.live.jsonl``) are envelope-only and would otherwise
+    # surface a raw JSON line as the headline.
+    for rel in (f"verifier_{node.id}.log",
+                f"evidence/{node.id}.log",
+                f"impl-{node.id}.log"):
+        path = run_dir / rel
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for raw in reversed(lines):
+            txt = raw.strip()
+            if txt:
+                return txt[:200]
+    return None
+
+
+def _overview_reviewer_headline(run_dir: Path, node: Node) -> dict[str, str]:
+    """``"<verdict> — <first reason>"`` from ``review-<node>.json``.
+
+    Reads reasons in order: ``reasons`` → ``notes`` → ``findings``. Accepts
+    both string items (the shape the framework-edit reviewer contract emits)
+    and dict items with ``title`` / ``text`` / ``note`` keys. Falls back to
+    ``lens-<id>.md`` first heading when the JSON is absent or carries no
+    reason text.
+    """
+    review_path = run_dir / f"review-{node.id}.json"
+    review = _read_json_safely(str(review_path))
+    if isinstance(review, dict):
+        verdict = str(review.get("verdict") or "").strip()
+        notes = (review.get("reasons")
+                 or review.get("notes")
+                 or review.get("findings")
+                 or [])
+        first_reason = ""
+        if isinstance(notes, list):
+            for n in notes:
+                if isinstance(n, str):
+                    txt = n.strip()
+                elif isinstance(n, dict):
+                    txt = str(n.get("title") or n.get("text")
+                              or n.get("note") or "").strip()
+                else:
+                    continue
+                if txt:
+                    first_reason = txt
+                    break
+        if verdict:
+            color = _VERDICT_COLOUR_FOR_OVERVIEW.get(verdict, "sub")
+            if first_reason:
+                return {"t": f"{verdict} — {first_reason}", "c": color}
+            return {"t": f"{verdict}", "c": color}
+    # Fall back to the markdown report's first heading.
+    return _overview_lens_headline(run_dir, node)
+
+
+_VERDICT_COLOUR_FOR_OVERVIEW = {
+    "approve": "green",
+    "warn": "yellow",
+    "block": "red",
+    "aborted": "red",
+    "pending": "sub",
+    "needs_revision": "yellow",
+    "needs_change": "yellow",
+    "revise": "yellow",
+    "reject": "red",
+    "pass": "green",
+    "fail": "red",
+    "ok": "green",
+}
+
+
+def _overview_verifier_headline(run_dir: Path, node: Node) -> dict[str, str]:
+    """Per-check counts from ``verifier_<stem>.json``.
+
+    Three shapes:
+
+    * ``checks[]`` array → ``"<n> of <m> checks failed: <first failing name>"``,
+      or ``"all <m> checks passed"``.
+    * executor shape (``pass: false`` / ``error_summary`` / ``post_rc``) →
+      ``"UNVERIFIED: <reason>"`` when ``pass`` is false.
+    * else — silent.
+
+    r7 fix #2: recipe verifier JSON is prefixed with a ``DeprecationWarning``
+    line (the recipe runner prints the warning before emitting the JSON
+    object), so a raw ``json.loads`` fails. The strict ``_read_json_safely``
+    silently dropped the headline to ``"verifier · <node-id>"`` on real
+    runs. Reuse :func:`_read_json` (tolerant of leading non-JSON noise) so the
+    ``"<n> of <m> checks failed: <first failing name>"`` headline survives
+    on framework-edit verifier outputs.
+    """
+    stem = _verifier_stem(node)
+    candidates = [stem, node.id] if stem else [node.id]
+    for cand in candidates:
+        vjson = _read_json(run_dir / f"verifier_{cand}.json")
+        if not isinstance(vjson, dict):
+            continue
+        checks = vjson.get("checks")
+        if isinstance(checks, list) and checks:
+            total = len(checks)
+            failed: list[dict[str, Any]] = []
+            for c in checks:
+                if isinstance(c, dict) and not bool(c.get("pass")):
+                    failed.append(c)
+            if failed:
+                first_name = str(failed[0].get("name")
+                                 or failed[0].get("cid")
+                                 or failed[0].get("id")
+                                 or "check")
+                return {"t": f"{len(failed)} of {total} checks failed: {first_name}",
+                        "c": "red"}
+            return {"t": f"all {total} checks passed", "c": "green"}
+        # Executor shape.
+        if "pass" in vjson:
+            if vjson.get("pass") is False:
+                reason = str(vjson.get("error_summary")
+                             or vjson.get("verifier") or "no reason recorded")
+                return {"t": f"UNVERIFIED: {reason}", "c": "red"}
+            return {"t": "verifier passed", "c": "green"}
+    return {"t": f"verifier · {node.id}", "c": "sub"}
+
+
+def _overview_implementer_headline(changes: dict[str, Any]) -> dict[str, str]:
+    """``"changed <n> files (+a −r)"`` from a pre-computed changes view.
+
+    Returns ``"no files changed"`` (muted) when the diff is empty. The
+    caller (``_overview_view``) is responsible for invoking
+    :func:`build_changes_view` once and threading the result through.
+    """
+    files = changes.get("files") or []
+    if not files:
+        return {"t": "no files changed", "c": "muted"}
+    n = len(files)
+    added = sum(int(f.get("added") or 0) for f in files)
+    removed = sum(int(f.get("removed") or 0) for f in files)
+    return {"t": f"changed {n} files (+{added} −{removed})", "c": "green"}
+
+
+def _overview_lens_headline(run_dir: Path, node: Node) -> dict[str, str]:
+    """First ``#`` heading from the report (use ``_report_paths``)."""
+    try:
+        paths = _report_paths(run_dir, node.id)
+    except Exception:  # noqa: BLE001
+        paths = []
+    for path in paths:
+        if path.suffix != ".md":
+            continue
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            stripped = line.lstrip("#").strip()
+            if stripped and line.startswith("#"):
+                return {"t": stripped[:200], "c": "sub"}
+    return {"t": f"{node.type or 'Node'} · {node.id}", "c": "sub"}
+
+
+def _overview_planner_headline(run_dir: Path) -> dict[str, str]:
+    """``plan.json`` ``objective`` field."""
+    plan = _read_json_safely(str(run_dir / "plan.json"))
+    if isinstance(plan, dict):
+        obj = str(plan.get("objective") or "").strip()
+        if obj:
+            return {"t": obj[:200], "c": "sub"}
+    return {"t": "Planner plan", "c": "sub"}
+
+
+def _overview_command_headline(run_dir: Path, node: Node) -> dict[str, str]:
+    """Last line of the node's log."""
+    for rel in (f"verifier_{node.id}.log",
+                f"evidence/{node.id}.log",
+                f"impl-{node.id}.log"):
+        path = run_dir / rel
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for raw in reversed(lines):
+            txt = raw.strip()
+            if txt:
+                return {"t": txt[:200], "c": "sub"}
+    return {"t": f"{node.type or 'Node'} · {node.id}", "c": "sub"}
+
+
+def _overview_facts(run: Run, node: Node, run_dir: Path,
+                   session_path: Path | None = None) -> list[dict[str, Any]]:
+    """kv rows the Status / Model / Started / Ended / Duration / Cost /
+    Turns / Tokens / Exit code (command nodes).
+
+    Best-effort: every row is added only when its source has the data.
+    """
+    items: list[dict[str, Any]] = []
+
+    # Status — state (+ verdict colour from any review JSON).
+    state_text = str(node.state or "—")
+    state_color = _overview_state_color(run_dir, node, state_text)
+    items.append({"k": "Status", "v": state_text, "c": state_color})
+
+    # Model — family · lane.
+    model = " · ".join(p for p in (node.family, node.role_lane) if p) or "—"
+    items.append({"k": "Model", "v": model, "c": "text"})
+
+    # Started / Ended (local HH:MM:SS; date when not today).
+    started = _fmt_local_ts(node.start)
+    ended = _fmt_local_ts(node.end)
+    items.append({"k": "Started", "v": started, "c": "text"})
+    items.append({"k": "Ended", "v": ended, "c": "text"})
+
+    # Duration — reuse _wall (the kickoff's "Duration" entry).
+    duration = _wall(node)
+    items.append({"k": "Duration", "v": duration, "c": "text"})
+
+    # Cost (+ calls).
+    cost_v = f"${(node.cost or 0.0):.2f}"
+    if node.calls:
+        cost_v += f" · {node.calls} call{'s' if node.calls != 1 else ''}"
+    items.append({"k": "Cost", "v": cost_v, "c": "text"})
+
+    # Turns — from transcript ``result.num_turns`` or live cost-state envelope.
+    # Threaded session_path avoids re-resolving through the full resolver.
+    turns = _overview_turns(run, node, session_path)
+    if turns is not None:
+        items.append({"k": "Turns", "v": str(turns), "c": "text"})
+
+    # Tokens.
+    tokens = _node_tokens(node, run)
+    if tokens is not None:
+        items.append({"k": "Tokens", "v": f"{tokens:,}", "c": "text"})
+
+    # Exit code (command nodes — recorded in node-cmd/<stem>.json).
+    rc = _command_rc(run_dir, node)
+    if rc is not None:
+        items.append({"k": "Exit code",
+                      "v": str(rc),
+                      "c": "red" if rc != 0 else "text"})
+
+    return items
+
+
+def _overview_state_color(run_dir: Path, node: Node, state_text: str) -> str:
+    if state_text == "failed":
+        return "red"
+    if state_text == "running":
+        return "yellow"
+    if state_text == "done":
+        return "green"
+    # Borrow the review JSON's verdict colour when present (covers
+    # reviewer/judge whose state is "done" but the kickoff wants a verdict
+    # colour on the Status pill).
+    review = _read_json_safely(str(run_dir / f"review-{node.id}.json"))
+    if isinstance(review, dict):
+        v = str(review.get("verdict") or "")
+        if v in _VERDICT_COLOUR_FOR_OVERVIEW:
+            return _VERDICT_COLOUR_FOR_OVERVIEW[v]
+    return "sub"
+
+
+def _fmt_local_ts(epoch: int | None) -> str:
+    """Local ``HH:MM:SS`` for today; ``YYYY-MM-DD HH:MM:SS`` for other days.
+    ``"—"`` when ``epoch`` is ``None``."""
+    if epoch is None:
+        return "—"
+    try:
+        from datetime import datetime
+        dt = datetime.fromtimestamp(int(epoch))
+    except (OSError, ValueError, OverflowError):
+        return "—"
+    now = datetime.now()
+    if (dt.year, dt.month, dt.day) == (now.year, now.month, now.day):
+        return dt.strftime("%H:%M:%S")
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _overview_turns(run: Run, node: Node,
+                   session_path: Path | None = None) -> int | None:
+    """Number of agent turns — transcript ``result.num_turns`` or live
+    cost-state envelope.
+
+    ``session_path`` is threaded from :func:`_overview_view` (the public
+    caller already resolves it); when omitted, the full resolver runs.
+    """
+    state = _fetch_cost_state(run.run_dir, node.id)
+    if isinstance(state, dict):
+        nt = state.get("num_turns")
+        if nt is not None:
+            try:
+                return int(nt)
+            except (TypeError, ValueError):
+                pass
+    if session_path is None:
+        session_path = _resolve_session_path(run, node)
+    if session_path is not None:
+        for rec in _records_decoded(session_path):
+            if str(rec.get("type") or "") != "result":
+                continue
+            nt = rec.get("num_turns")
+            if nt is None:
+                continue
+            try:
+                return int(nt)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _records_decoded(session_path: Path | None) -> list[dict[str, Any]]:
+    """Session file (real transcript or live sidecar) → decoded inner records.
+
+    Shared by :func:`_overview_turns` and :func:`_overview_final` so the
+    same source-of-truth walk is used regardless of view.
+    """
+    if session_path is None:
+        return []
+    if _is_live_sidecar(session_path):
+        return _live_sidecar_records(session_path)
+    return _read_jsonl_records(session_path)
+
+
+def _overview_final(session_path: Path | None) -> dict[str, Any]:
+    """The agent's final message — ``result`` text else last assistant text block.
+
+    Capped at :data:`USER_FULL_CAP` (200,000 chars).
+    """
+    text = ""
+    last_assistant = ""
+    for rec in _records_decoded(session_path):
+        typ = str(rec.get("type") or "")
+        if typ == "result":
+            res = str(rec.get("result") or "")
+            if res:
+                return {"text": res[:USER_FULL_CAP]}
+        if typ == "assistant":
+            msg = rec.get("message") if isinstance(rec.get("message"), dict) else {}
+            content = msg.get("content") if isinstance(msg, dict) else None
+            if not isinstance(content, list):
+                continue
+            for b in content:
+                if isinstance(b, dict) and str(b.get("type") or "") == "text":
+                    t = str(b.get("text") or "")
+                    if t:
+                        last_assistant = t
+    if not text:
+        text = last_assistant
+    return {"text": text[:USER_FULL_CAP]}
+
+
+def _overview_links(run_dir: Path, node_id: str) -> list[dict[str, str]]:
+    """``[{"label", "path"}]`` for the node's own artefacts that exist.
+
+    Mirrors the kickoff §2 named artefacts: review JSON, lens report,
+    verifier log, impl log, ``NEEDS-CHANGE.md``. Falls back to the
+    ``_report_paths`` chain for lens / synthesiser nodes.
+    """
+    candidates: list[tuple[str, Path]] = [
+        ("Review", run_dir / f"review-{node_id}.json"),
+        ("Impl log", run_dir / f"impl-{node_id}.log"),
+        ("Verifier log", run_dir / f"verifier_{node_id}.log"),
+        ("Needs change", run_dir / "NEEDS-CHANGE.md"),
+        ("Lens report", run_dir / f"lens-{node_id}.md"),
+        ("Verdict", run_dir / "verdict.json"),
+    ]
+    try:
+        for report in _report_paths(run_dir, node_id):
+            label = "Report" if not _candidates_with_path(report, candidates) else None
+            if label is None:
+                continue
+            candidates.append((label, report))
+    except Exception:  # noqa: BLE001
+        pass
+    out: list[dict[str, str]] = []
+    for label, path in candidates:
+        if not path.is_file():
+            continue
+        out.append({"label": label, "path": str(path)})
+    # De-duplicate by path.
+    seen: set[str] = set()
+    uniq: list[dict[str, str]] = []
+    for link in out:
+        if link["path"] in seen:
+            continue
+        seen.add(link["path"])
+        uniq.append(link)
+    return uniq
+
+
+def _candidates_with_path(path: Path, candidates: list[tuple[str, Path]]) -> bool:
+    return any(str(c[1]) == str(path) for c in candidates)
+
+
 # ── public builder ──────────────────────────────────────────────────────────
 
 def build_node(home: Path, run_id: str, node_id: str, view: str | None = None,
@@ -2662,6 +3317,8 @@ def build_node(home: Path, run_id: str, node_id: str, view: str | None = None,
         base.update(_learning_view(run_obj, target))
     elif view == "changes":
         base.update(build_changes_view(run_obj, target))
+    elif view == "overview":
+        base.update(_overview_view(run_obj, target, session_path, run_dir))
     return base
 
 
