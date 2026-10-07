@@ -75,14 +75,14 @@ def test_page_shape_and_default_tab(home: Path) -> None:
         page = learn.build(home, tab, {})
         assert page["ok"] and page["key"] == "learn" and page["title"] == "Learning & memory"
         assert [(t["key"], t["label"]) for t in page["tabs"]] == [
-            ("overview", "Overview"), ("lessons", "Lessons"),
+            ("code", "Your code"), ("overview", "Overview"), ("lessons", "Lessons"),
             ("memory", "Memory"), ("improve", "Self-improve")]
         assert page["tab"] == tab
         assert page["errors"] == {}, (tab, page["errors"])
         json.dumps(page)
-    # None and unknown both fall back to overview.
-    assert learn.build(home, None, {})["tab"] == "overview"
-    assert learn.build(home, "nope", {})["tab"] == "overview"
+    # None and unknown both fall back to the first tab (Your code).
+    assert learn.build(home, None, {})["tab"] == "code"
+    assert learn.build(home, "nope", {})["tab"] == "code"
 
 
 def test_old_tab_keys_are_remapped(home: Path) -> None:

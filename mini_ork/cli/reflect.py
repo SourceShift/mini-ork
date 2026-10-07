@@ -463,6 +463,27 @@ def main(argv: list[str] | None = None) -> int:
             f"(lane, task_class) pair(s)\n"
         )
 
+    # ── side-channel: code findings (MO_CODE_FINDINGS) ──────────────────────
+    # Harvest reviewer/verifier findings out of the run dirs into the
+    # code_findings tables, so the "Your code" tab can group what reviews keep
+    # finding in the same file. Runs AFTER the other side-channels (it only
+    # reads their outputs' run dirs). Default ON with the same
+    # `get(name, "1") != "0"` opt-out form as its neighbours. harvest() calls
+    # ensure_schema itself, so there is no schema step here, and the whole block
+    # is fail-soft — a side-channel must never crash reflect.
+    if os.environ.get("MO_CODE_FINDINGS", "1") != "0":
+        from mini_ork.learning import code_findings
+        try:
+            cf_stats = code_findings.harvest(mini_ork_home, db=db_path)
+        except Exception as exc:  # a side-channel must never crash reflect
+            sys.stderr.write(f"  [code_findings] skipped: {exc}\n")
+            cf_stats = None
+        if cf_stats is not None:
+            sys.stdout.write(
+                f"  [code_findings] harvested {cf_stats.get('runs', 0)} run(s), "
+                f"{cf_stats.get('findings', 0)} finding(s)\n"
+            )
+
     # ── GEPA optimizer block intentionally NOT ported (default path skipped) ──
 
     # ── trace end ──────────────────────────────────────────────────────────

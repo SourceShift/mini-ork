@@ -10,12 +10,12 @@ from pathlib import Path
 from typing import Any
 
 from mini_ork.ide_pages import spec as S
-from mini_ork.ide_pages.learn import improve, lessons, memory, overview
+from mini_ork.ide_pages.learn import code, improve, lessons, memory, overview
 
 TITLE = "Learning & memory"
 SUB = ("Is mini-ork getting better at your work, what has it learned, "
        "and what needs you.")
-TABS = [("overview", "Overview"), ("lessons", "Lessons"),
+TABS = [("code", "Your code"), ("overview", "Overview"), ("lessons", "Lessons"),
         ("memory", "Memory"), ("improve", "Self-improve")]
 DEFAULT_TAB = TABS[0][0]
 
@@ -29,7 +29,9 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     key = _OLD_KEY_MAP.get(tab or "", tab or "")
     if key not in {k for k, _ in TABS}:
         key = DEFAULT_TAB
-    if key == "overview":
+    if key == "code":
+        sections_out = code.sections(home, args, errors)
+    elif key == "overview":
         sections_out = overview.sections(home, args, errors)
     elif key == "lessons":
         sections_out = lessons.sections(home, args, errors)
