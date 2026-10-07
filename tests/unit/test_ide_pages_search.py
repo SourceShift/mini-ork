@@ -95,6 +95,8 @@ def _no_real_builder(monkeypatch: pytest.MonkeyPatch) -> None:  # pyright: ignor
     ``_spawn_indexer``.
     """
     monkeypatch.setattr(search_mod, "_spawn_indexer", _recorder_spawn)
+    # Tests that do not pass time_budget= must not depend on machine speed.
+    monkeypatch.setattr(search_mod, "_REINDEX_TIME_BUDGET_S", 600.0)
 
 
 # ── reindex ──────────────────────────────────────────────────────────────────

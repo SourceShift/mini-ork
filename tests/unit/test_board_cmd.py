@@ -19,6 +19,9 @@ def _no_real_search_builder(monkeypatch: pytest.MonkeyPatch) -> None:
     """`board runs --query` never starts a real background index builder here."""
     monkeypatch.setattr(search_mod, "_spawn_indexer",
                         lambda _args, *, log_handle=None: type("Fake", (), {"pid": None})())
+    # With no builder, a query must index every seeded run itself, however
+    # slow the machine is: the in-query time budget would make paging flaky.
+    monkeypatch.setattr(search_mod, "_REINDEX_TIME_BUDGET_S", 600.0)
 
 REPO = Path(__file__).resolve().parents[2]
 
