@@ -22,9 +22,15 @@
 #   post green + overlap with base failures  -> pass  (real fix)
 #   post green + nothing fails on base       -> fail  (tests-do-not-exercise-change)
 #   post green + base unevaluable            -> unverified (abstain; gate softens)
-#   post red,  base ALSO red                 -> pass  (pre-existing/env breakage)
+#   post red,  base ALSO red                 -> per-test decision (see below)
 #   post red,  base green                    -> fail  (the patch introduced a regression)
 #   post red,  base indeterminate            -> fail  (fall back to absolute)
+#
+# Red base, per test (post red AND base red):
+#   a test passed on base but not on post        -> fail  (regression on a red base)
+#   no regression, strict improvement + knob     -> pass  (MO_TEST_CERTIFY_ON_IMPROVEMENT=1)
+#   no regression, improvement or equal          -> unverified (red_base_unverified)
+#   no per-test outcomes on either side          -> unverified (never a blanket pass)
 #
 # Exit codes:  0 pass   1 fail   (unverified also exits 0 — abstention, not failure)
 #
@@ -38,6 +44,9 @@
 #   MO_SUITE_ADEQUACY_MAX_MUTANTS   cap on generated mutants (default 12, 1..50)
 #   MO_SUITE_ADEQUACY_MIN_SCORE     adequacy threshold (default 0.6, 0..1)
 #   MO_SUITE_ADEQUACY_TIMEOUT_S     per-run suite timeout (default 300, >=1)
+#   MO_ALLOW_TEST_CHANGES           set to 1 to disable the test-weakening guard
+#   MO_TEST_LEGACY_RED_BASE         set to 1 to restore the old red-base blanket pass
+#   MO_TEST_CERTIFY_ON_IMPROVEMENT  set to 1 to certify a strict red-base improvement
 
 from __future__ import annotations
 import json
@@ -65,6 +74,51 @@ try:
 except Exception:                       # pragma: no cover — defensive only
     _suite_adequacy = None              # type: ignore[assignment]
 
+try:
+    # Late import — same seam as the two above. `scrubbed_test_env` lives
+    # outside `mini_ork.verify.__all__`, so it is imported by full subpath.
+    from mini_ork.verify.test_env import scrubbed_test_env
+except Exception:                       # pragma: no cover — defensive only
+    def scrubbed_test_env(environ=None):
+        import os as _os
+        env = dict(_os.environ if environ is None else environ)
+        for k in list(env):
+            if (k in {"MINI_ORK_SECRETS", "MINI_ORK_DB", "MINI_ORK_HOME",
+                      "MINI_ORK_PROJECT_HOME", "MINI_ORK_RUN_ID", "MINI_ORK_RUN_DIR",
+                      "MINI_ORK_PLAN_PATH", "MINI_ORK_AGENTS"}
+                    or k.endswith(("_API_KEY", "_AUTH_TOKEN", "_ACCESS_TOKEN",
+                                   "_SECRET", "_SECRET_KEY"))
+                    or k.startswith("ANTHROPIC_")
+                    or k in {"OPENAI_API_BASE", "OPENAI_BASE_URL"}):
+                env.pop(k)
+        return env
+
+try:
+    # Late import — the jest/vitest/results-file leg of the red-base per-test
+    # parse; only used when the test command is not pytest.
+    from mini_ork.certify.test_results import augment_for_results, parse_results_dir
+    _TEST_RESULTS_AVAILABLE = True
+except Exception:                       # pragma: no cover — defensive only
+    augment_for_results = None          # type: ignore[assignment]
+    parse_results_dir = None            # type: ignore[assignment]
+    _TEST_RESULTS_AVAILABLE = False
+
+
+def _child_env(environ=None):
+    """Environment for the target repo's test command.
+
+    `scrubbed_test_env()` strips provider credentials and live mini-ork state
+    pointers, but PRESERVES every ``MO_*`` knob by contract. The kickoff's
+    leak list includes the ``MO_*`` lane keys, so drop those too — a
+    target-repo test must not see the operator's lane configuration.
+    """
+    env = scrubbed_test_env(environ)
+    for k in list(env):
+        if k.startswith("MO_"):
+            env.pop(k)
+    return env
+
+
 MINI_ORK_HOME = os.environ.get("MINI_ORK_HOME", ".mini-ork")
 MINI_ORK_RUN_ID = os.environ.get("MINI_ORK_RUN_ID", "unknown-run")
 LOG_DIR = os.path.join(MINI_ORK_HOME, "runs", MINI_ORK_RUN_ID)
@@ -73,6 +127,8 @@ LOG_PATH = os.path.join(LOG_DIR, "verifier_test.log")
 BASE_LOG = os.path.join(LOG_DIR, "verifier_test_baseline.log")
 REPLAY_CANDIDATE_LOG = os.path.join(LOG_DIR, "verifier_replay_candidate.log")
 REPLAY_BASE_LOG = os.path.join(LOG_DIR, "verifier_replay_base.log")
+RED_CANDIDATE_LOG = os.path.join(LOG_DIR, "verifier_red_base_candidate.log")
+RED_BASE_LOG = os.path.join(LOG_DIR, "verifier_red_base_base.log")
 
 
 def _is_test_path(rel_path: str) -> bool:
@@ -210,6 +266,227 @@ def _changed_source_files(candidate_cwd: str) -> list[str]:
     return sorted(set(changed))
 
 
+# ── Tamper guard (kickoff antigaming-a §3) ──────────────────────────────────
+# A patch that deletes a test file, renames it to a non-test path, or adds a
+# skip marker to an EXISTING test file weakens the suite. The guard reads
+# `git diff` against HEAD only, never mutates the candidate, and fires before
+# the suite runs.
+
+_SKIP_MARKER_RE = re.compile("|".join((
+    r"@pytest\.mark\.skip",
+    r"@pytest\.mark\.xfail",
+    r"pytest\.skip\(",
+    r"@unittest\.skip",
+    r"\bxit\(",
+    r"\bxdescribe\(",
+    r"\b(it|test|describe)\.skip\(",
+    r"\b(it|test|describe)\.todo\(",
+)))
+
+
+def _is_guard_test_path(rel_path: str) -> bool:
+    """Test-file matcher for the tamper guard (broader than ``_is_test_path``).
+
+    A test file is any path under a ``tests/`` / ``__tests__/`` dir segment,
+    or a basename matching ``test_*.py`` / ``*_test.py`` /
+    ``*.test.[cm]?[jt]sx?`` / ``*.spec.[cm]?[jt]sx?``. Deliberately distinct
+    from the replay overlay's narrower ``_is_test_path`` per the kickoff.
+    """
+    norm = rel_path.replace("\\", "/")
+    parts = norm.split("/")
+    for seg in parts[:-1]:
+        if seg in ("tests", "__tests__"):
+            return True
+    base = parts[-1]
+    if base.startswith("test_") and base.endswith(".py"):
+        return True
+    if base.endswith("_test.py"):
+        return True
+    if re.search(r"\.(?:test|spec)\.[cm]?[jt]sx?$", base):
+        return True
+    return False
+
+
+def _check_tests_tamper(cwd: str) -> tuple[bool, str]:
+    """Return ``(violated, reason)`` for test-weakening changes vs HEAD.
+
+    Deletions (``D``) and renames to a non-test path (``R``) are violations,
+    as are newly added skip markers in files that exist in HEAD (``git diff
+    -U0`` naturally excludes untracked files, and a new file's ``---`` side is
+    ``/dev/null`` so its markers are ignored). Returns ``(False, "")`` on any
+    git error or when not inside a work tree.
+    """
+    in_git = subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode == 0
+    if not in_git:
+        return False, ""
+
+    violations: list[str] = []
+
+    name_status = subprocess.run(
+        ["git", "diff", "-M", "--name-status", "HEAD"],
+        cwd=cwd, capture_output=True, text=True,
+    )
+    if name_status.returncode == 0:
+        for line in name_status.stdout.splitlines():
+            if not line.strip():
+                continue
+            fields = line.split("\t")
+            status = fields[0]
+            if status.startswith("R"):
+                if len(fields) >= 3:
+                    old, new = fields[1], fields[2]
+                    if _is_guard_test_path(old) and not _is_guard_test_path(new):
+                        violations.append(f"{old}: renamed to non-test path {new}")
+            elif status == "D":
+                path = fields[1] if len(fields) > 1 else ""
+                if path and _is_guard_test_path(path):
+                    violations.append(f"{path}: deleted")
+
+    diff = subprocess.run(
+        ["git", "diff", "-U0", "HEAD"],
+        cwd=cwd, capture_output=True, text=True,
+    )
+    if diff.returncode == 0:
+        current: str | None = None
+        is_new = False
+        for line in diff.stdout.splitlines():
+            if line.startswith("--- "):
+                rest = line[4:]
+                if rest.startswith("a/"):
+                    rest = rest[2:]
+                is_new = rest == "/dev/null"
+                continue
+            if line.startswith("+++ "):
+                rest = line[4:]
+                if rest.startswith("b/"):
+                    rest = rest[2:]
+                current = rest
+                continue
+            if line.startswith("+") and not line.startswith("+++"):
+                if (current and not is_new and _is_guard_test_path(current)
+                        and _SKIP_MARKER_RE.search(line[1:])):
+                    marker = line[1:].strip()[:40]
+                    violations.append(f"{current}: added skip marker {marker}")
+
+    if not violations:
+        return False, ""
+    return True, ", ".join(violations)
+
+
+# ── Red-base per-test parsing (kickoff antigaming-a §1) ─────────────────────
+# Local twin of oracle._TEST_RESULT_RE / _ensure_pytest_verbose: the verifier
+# must keep working in a target repo with no mini_ork on path, and [c:0]
+# forbids editing oracle.py.
+
+_RED_TEST_RESULT_RE = re.compile(
+    r"(?P<id>(?:\S+::\S+|\S+\.py))\s+(?P<status>PASSED|FAILED|ERROR|SKIPPED)\b"
+)
+
+
+def _ensure_pytest_verbose(cmd: str) -> str:
+    """Insert ``-v --tb=no`` into a pytest command lacking a verbose flag."""
+    if "pytest" not in cmd:
+        return cmd
+    if re.search(r"(?:^|\s)(?:-v\b|--verbose\b)", cmd):
+        return cmd
+    return re.sub(r"\bpytest\b", "pytest -v --tb=no", cmd, count=1)
+
+
+def _per_test_outcomes(cmd: str, cwd: str, log: str) -> tuple[int, set[str], set[str]]:
+    """Run ``cmd`` in ``cwd`` and return ``(rc, passed_ids, failed_ids)``.
+
+    pytest → augment with ``-v`` and parse the console text. Anything else →
+    augment jest/vitest to write a results file and parse
+    ``MINI_ORK_TEST_RESULTS_DIR`` via the structured adapters. Returns empty
+    sets when no per-test outcomes are produced.
+    """
+    if "pytest" in cmd:
+        augmented = _ensure_pytest_verbose(cmd)
+        env = _child_env()
+        try:
+            with open(log, "wb") as fh:
+                rc = subprocess.run(
+                    augmented, shell=True, cwd=cwd, env=env,
+                    stdout=fh, stderr=subprocess.STDOUT,
+                ).returncode
+        except OSError:
+            return -1, set(), set()
+        passed: set[str] = set()
+        failed: set[str] = set()
+        try:
+            with open(log, encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            return rc, passed, failed
+        for m in _RED_TEST_RESULT_RE.finditer(text):
+            tid = m.group("id")
+            st = m.group("status")
+            if st == "PASSED":
+                passed.add(tid)
+            elif st in ("FAILED", "ERROR"):
+                failed.add(tid)
+        return rc, passed, failed
+
+    if not _TEST_RESULTS_AVAILABLE:
+        return -1, set(), set()
+    with tempfile.TemporaryDirectory(prefix="redbase-results-") as tmp:
+        augmented, _ = augment_for_results(cmd, tmp)
+        env = _child_env()
+        env["MINI_ORK_TEST_RESULTS_DIR"] = tmp
+        try:
+            with open(log, "wb") as fh:
+                rc = subprocess.run(
+                    augmented, shell=True, cwd=cwd, env=env,
+                    stdout=fh, stderr=subprocess.STDOUT,
+                ).returncode
+        except OSError:
+            return -1, set(), set()
+        res = parse_results_dir(tmp, cwd)
+    if res is None:
+        return rc, set(), set()
+    return rc, res[0], res[1]
+
+
+def _judge_red_base(post_rc, base_wt):
+    """Per-test decision for a red post-patch suite on a red baseline.
+
+    Replaces the old ``BASE_RC != 0`` blanket pass. Runs both sides with
+    per-test outcomes and compares the passing ids:
+
+      - a test that passed on the base but not on the candidate is a
+        regression → fail;
+      - no regression plus a strict improvement → pass only under
+        ``MO_TEST_CERTIFY_ON_IMPROVEMENT=1``, else abstain;
+      - equal outcomes, or no per-test outcomes on either side → abstain.
+    """
+    if not base_wt:
+        return emit_unverified(post_rc, "no per-test results on a red base",
+                               flag="red_base_unverified")
+
+    _, cand_pass, cand_fail = _per_test_outcomes(CMD, os.getcwd(), RED_CANDIDATE_LOG)
+    _, base_pass, base_fail = _per_test_outcomes(CMD, base_wt, RED_BASE_LOG)
+
+    if not (cand_pass or cand_fail or base_pass or base_fail):
+        return emit_unverified(post_rc, "no per-test results on a red base",
+                               flag="red_base_unverified")
+
+    regressions = sorted(base_pass - cand_pass)
+    if regressions:
+        return emit(False, f"regression on a red base: {', '.join(regressions[:5])}",
+                    post_rc)
+
+    improvements = sorted(cand_pass & base_fail)
+    if improvements and os.environ.get("MO_TEST_CERTIFY_ON_IMPROVEMENT", "0") == "1":
+        return emit(True, "red base: strict improvement with no regression", post_rc)
+
+    detail = " (strict improvement)" if improvements else ""
+    return emit_unverified(post_rc, f"red base: no regression{detail}",
+                           flag="red_base_unverified")
+
+
 def _package_scripts():
     try:
         with open("package.json", encoding="utf-8") as f:
@@ -268,9 +545,10 @@ CMD = detect_test_cmd()
 BASE_RC = ""
 
 
-def run_suite(log):  # returns the exit code, never raises
+def run_suite(log, env=None):  # returns the exit code, never raises
     with open(log, "wb") as fh:
-        return subprocess.run(CMD, shell=True, stdout=fh, stderr=subprocess.STDOUT).returncode
+        return subprocess.run(CMD, shell=True, stdout=fh, stderr=subprocess.STDOUT,
+                              env=env).returncode
 
 
 def first_fail_line(log):
@@ -471,9 +749,18 @@ def main():
         }, separators=(",", ":"), ensure_ascii=False))
         return 0
 
+    # ── Tamper guard (BEFORE the suite) ─────────────────────────────────
+    # A patch that deletes/renames a test file or adds a skip marker to an
+    # existing one weakens the suite. Refuse before running anything so the
+    # revise loop sees the refusal as immediate feedback.
+    if os.environ.get("MO_ALLOW_TEST_CHANGES", "0") != "1":
+        violated, reason = _check_tests_tamper(os.getcwd())
+        if violated:
+            return emit(False, f"tests weakened: {reason}", "")
+
     # ── Post-patch run (current working tree = patched) ──────────────────
     sys.stderr.write(f"[test] running: {CMD}\n")
-    post_rc = run_suite(LOG_PATH)
+    post_rc = run_suite(LOG_PATH, env=_child_env())
 
     if post_rc == 0:
         # ── Delta-gate replay: a green suite that doesn't exercise the bug is theatre ──
@@ -500,25 +787,33 @@ def main():
     # tests that were already failing on the candidate.
     in_git = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    base_wt = None
     if os.environ.get("MO_TEST_BASELINE", "1") != "0" and in_git:
-        wt, _ = _attach_overlaid_worktree(os.getcwd())
-        if wt:
-            try:
-                with open(BASE_LOG, "wb") as fh:
-                    BASE_RC = subprocess.run(CMD, shell=True, cwd=wt, stdout=fh,
-                                             stderr=subprocess.STDOUT).returncode
-            finally:
-                _detach_git_worktree(wt)
+        base_wt, _ = _attach_overlaid_worktree(os.getcwd())
 
-    if BASE_RC == "":
-        # Could not establish a baseline → fall back to absolute gating (do not hide a regression).
-        return emit(False, "post-patch failing; no baseline established (absolute gate)", post_rc)
-    if BASE_RC != 0:
-        # Baseline ALSO fails → pre-existing failure / broken test env in untouched code.
-        sys.stderr.write(f"[test] baseline (HEAD) also fails rc={BASE_RC} — pre-existing/env, not a regression\n")
-        return emit(True, "pre-existing failure: baseline (HEAD) also fails — uninformative test env, not caused by this patch", post_rc)
-    # Baseline green, post red → the patch broke something.
-    return emit(False, "regression: baseline (HEAD) passed but post-patch fails", post_rc)
+    try:
+        if base_wt:
+            with open(BASE_LOG, "wb") as fh:
+                BASE_RC = subprocess.run(CMD, shell=True, cwd=base_wt, stdout=fh,
+                                         stderr=subprocess.STDOUT,
+                                         env=_child_env()).returncode
+
+        if BASE_RC == "":
+            # Could not establish a baseline → fall back to absolute gating (do not hide a regression).
+            return emit(False, "post-patch failing; no baseline established (absolute gate)", post_rc)
+        if BASE_RC != 0:
+            # Baseline ALSO fails. Decide per test instead of blanket-passing
+            # (a patch that breaks MORE tests in an already-red suite must not
+            # be certified). `MO_TEST_LEGACY_RED_BASE=1` restores the old pass
+            # as an explicit escape hatch.
+            if os.environ.get("MO_TEST_LEGACY_RED_BASE", "0") == "1":
+                sys.stderr.write(f"[test] baseline (HEAD) also fails rc={BASE_RC} — legacy red-base escape hatch\n")
+                return emit(True, "pre-existing failure: baseline (HEAD) also fails — uninformative test env, not caused by this patch", post_rc)
+            return _judge_red_base(post_rc, base_wt)
+        # Baseline green, post red → the patch broke something.
+        return emit(False, "regression: baseline (HEAD) passed but post-patch fails", post_rc)
+    finally:
+        _detach_git_worktree(base_wt)
 
 
 if __name__ == "__main__":

@@ -20,6 +20,40 @@ import shutil
 import subprocess
 import sys
 
+try:
+    # Late import — the verifier may be copied into a fixture without the rest
+    # of mini_ork on PYTHONPATH (same seam as code-fix/verifiers/test.py).
+    from mini_ork.verify.test_env import scrubbed_test_env
+except Exception:                       # pragma: no cover — defensive only
+    def scrubbed_test_env(environ=None):
+        import os as _os
+        env = dict(_os.environ if environ is None else environ)
+        for k in list(env):
+            if (k in {"MINI_ORK_SECRETS", "MINI_ORK_DB", "MINI_ORK_HOME",
+                      "MINI_ORK_PROJECT_HOME", "MINI_ORK_RUN_ID", "MINI_ORK_RUN_DIR",
+                      "MINI_ORK_PLAN_PATH", "MINI_ORK_AGENTS"}
+                    or k.endswith(("_API_KEY", "_AUTH_TOKEN", "_ACCESS_TOKEN",
+                                   "_SECRET", "_SECRET_KEY"))
+                    or k.startswith("ANTHROPIC_")
+                    or k in {"OPENAI_API_BASE", "OPENAI_BASE_URL"}):
+                env.pop(k)
+        return env
+
+
+def _child_env(environ=None):
+    """Environment for the target repo's type-check command.
+
+    ``scrubbed_test_env()`` strips provider credentials and live mini-ork
+    state pointers but preserves ``MO_*`` lane keys by contract; drop those
+    too so the child never sees the operator's lane configuration.
+    """
+    env = scrubbed_test_env(environ)
+    for k in list(env):
+        if k.startswith("MO_"):
+            env.pop(k)
+    return env
+
+
 MINI_ORK_HOME = os.environ.get("MINI_ORK_HOME", ".mini-ork")
 MINI_ORK_RUN_ID = os.environ.get("MINI_ORK_RUN_ID", "unknown-run")
 LOG_DIR = os.path.join(MINI_ORK_HOME, "runs", MINI_ORK_RUN_ID)
@@ -142,7 +176,8 @@ def main():
     sys.stderr.write(f"[typecheck] running: {cmd}\n")
     with open(LOG_PATH, "wb") as log:
         exit_code = subprocess.run(cmd, shell=True, stdout=log,
-                                   stderr=subprocess.STDOUT).returncode
+                                   stderr=subprocess.STDOUT,
+                                   env=_child_env()).returncode
 
     if exit_code == 0:
         passed = True
