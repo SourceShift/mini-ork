@@ -25,8 +25,9 @@ K0.5a → K0.5b → K1 → I1 → K0.5c → I3 → I5 → I2 → I6 → I8 → I
 - I3 now runs before I5. I3 has a measured target (`needs_answers`); I5 has no
   K0 bucket.
 - K0.5c (added with the K0 erratum) runs after I1 and before I3: from I3 on,
-  epics are dispatched through framework-edit, and verifier nodes that error in
-  0 ms without running would make its publish-rate measurement meaningless.
+  epics are dispatched through framework-edit, and verifier errors with no
+  recorded cause (plus verifier durations that are always 0) would make its
+  publish-rate measurement untrustworthy.
 
 Build rules (user decisions, 2026-10-07):
 - **Build mode is hybrid.** K0.5a, K0.5b, K0.5c and I1 repair the dispatch
@@ -165,16 +166,23 @@ LLM test authoring (that is I2). Recipe workflow changes.
 Depends on: sdd-i1-probe-validity
 
 ### Goal
-Pipeline repair (build directly, per the hybrid rule). The K0 erratum found
-verifier nodes whose `node_end` is `finish_reason=error` after 0 ms — the
-verifier never ran — in 57 runs (framework-edit 27, code-fix 20), 30 of them
-classified as this harness bucket ($108.94 raw), plus 3 SDD-campaign runs
-($80.24). Detection rule (run_events, not execution_traces):
+Pipeline repair (build directly, per the hybrid rule). Two findings from the
+K0 erratum:
+- `duration_ms` is 0 on every Python-era verifier `node_end`, run or not: the
+  executor's fallback node_end (`execute_handlers.dispatch_node`, for handlers
+  that never call `trace()`) hard-codes it. "0 ms" is therefore NOT evidence
+  that a verifier did not run.
+- Verifier nodes errored with no recorded cause in 57 runs (framework-edit 27,
+  code-fix 20), 30 of them in K0 bucket B19 ($108.94 raw), plus 3 SDD-campaign
+  runs ($80.24). vt1–vt6 failed in the same second they started.
+Detection rule for those errors (run_events, not execution_traces):
 `event_type='node_end' AND finish_reason='error' AND
 json_extract(payload_json,'$.node_type')='verifier' AND
 json_extract(payload_json,'$.duration_ms')=0`.
 ### Acceptance
-- AC1: Root cause of the 0 ms verifier errors, with run ids (e.g.
+- AC0: The fallback `node_end` records the real duration (from the
+  recorded node start), not 0.
+- AC1: Root cause of those verifier errors, with run ids (e.g.
   `concord-mo1-20261002-184302`, `vt1-mr-relations-20261005-193626` …
   `vt6-level-vector-20261005-203840`). Their reasons were not logged before
   `e245d002`; reproduce on a fresh run where stderr now lands in execute.log.

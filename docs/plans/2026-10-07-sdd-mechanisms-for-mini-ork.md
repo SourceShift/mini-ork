@@ -305,9 +305,10 @@ correcting for the pre-2026-10-01 cost meter:
 - The SDD campaign lost 9 of 45 runs ($167) as rollbacks after the panel
   approved them. The publisher's stderr was never logged.
 - H3 is rejected: no-publish recipes account for only $2.
-- New harness bucket (erratum): verifier nodes that errored in 0 ms and never
-  ran — 30 runs ($108.94 raw / $20 corrected, framework-edit) plus $80 in the
-  SDD campaign. New epic K0.5c, before I3.
+- New bucket (erratum): verifier node errors with no recorded cause — 30 runs
+  ($108.94 raw / $20 corrected, framework-edit) plus $80 in the SDD campaign.
+  Their 0 ms durations are an emitter artifact (every Python-era verifier
+  node_end records 0), not proof they never ran. Epic K0.5c, before I3.
 
 **Change to the sequence below:** K0.5a and K0.5b are inserted before K1,
 K0.5c (verifier nodes actually run) after I1, and I3 now runs before I5. The authoritative order is in

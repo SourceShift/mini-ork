@@ -35,10 +35,10 @@ the same way: `.../backups/k0-sdd10x-20261007-110708.db` (45 runs, 0 published).
      Dominated by harness probes (diff-apply, sentinel), not product tests.
 - **Biggest single harness defect outside the top 3:** the reviewer's verdict
   is unparseable (`verdict=unknown`) in 16 runs, $140.21 raw / $89.06 corrected.
-- **Second harness defect: verifier nodes that never ran.** A verifier
-  `node_end` with `finish_reason=error` after **0 ms** — 30 runs here
-  ($108.94 raw / $20.36 corrected, framework-edit) and 3 runs / $80.24 (13%)
-  in the SDD campaign. New epic K0.5c.
+- **Unexplained verifier errors.** Python-era verifier nodes that errored with
+  no recorded cause — 30 runs here ($108.94 raw / $20.36 corrected,
+  framework-edit) and 3 runs / $80.24 (13%) in the SDD campaign. Epic K0.5c
+  root-causes them now that stderr is captured (see Erratum, correction 2).
 - **SDD campaign:** 9 of 45 runs ($167.44, 27%) were **approved by the panel and
   then rolled back** after a publisher error whose reason was never logged (H6).
 
@@ -57,9 +57,17 @@ unpublished share (76.0%) and the top-3 ranking are unchanged.
    "rubric-only" runs had failing nodes; the 12th (`run-1782939541-98592`,
    2026-07-01) is from the bash era, and today's executor rolls back only when
    a node fails — the rubric runs after execute and gates nothing.
-2. **Verifier nodes that never ran** are a harness failure, not a verify
-   failure. New bucket B19. Detection rule (run on the snapshot; 57 runs have
-   at least one such node, 30 land in B19 after precedence):
+2. **Verifier node errors with no recorded cause** get their own bucket, B19,
+   labelled (f) unknown. *(Correction 2, same day: the first version of this
+   erratum called these "verifier nodes that never ran" because their
+   `duration_ms` is 0. That is not evidence: since the Python port the
+   executor's fallback `node_end` — used for handlers that never call
+   `trace()`, the verifier handler among them — hard-codes `duration_ms=0` for
+   EVERY verifier node: all 274 `done` and all 86 errored verifier node_ends
+   from September on. vt1–vt6 did fail in the same second they started, which
+   points at a harness fault, but the cause was never logged.)* Detection rule
+   (run on the snapshot; 57 runs have at least one such node, 30 land in B19
+   after precedence):
 
    ```sql
    SELECT r.run_id, t.recipe FROM run_events r JOIN task_runs t ON t.id = r.run_id
@@ -81,7 +89,7 @@ unpublished share (76.0%) and the top-3 ranking are unchanged.
    only in the `run_events` `node_end` payload.)
 
 What moved: (c) candidate false rejects 93 → 78 runs ($104.15 → $86.85
-corrected); RC2 $186.01 → $169.03; RC3 $148.60 → $125.86; (e) gained B19.
+corrected); RC2 $186.01 → $169.03; RC3 $148.60 → $125.86; (f) gained B19.
 Run dirs are read live, so "passed, never published" reads 113 runs now
 (110 in the first pass) as runs that were in flight at snapshot time finish.
 Reading the live DB: the `sqlite3` CLI refuses `-readonly` / `mode=ro` on the
@@ -110,7 +118,7 @@ finalized, (c) false-reject candidate, (d:stage) real failure at that stage,
 | B7e verify + review passed, run still failed (traces only) | (c) | 21 | 112.47 | 5.3 | 24.69 | 2.8 | chapter-review 112, code-fix 0 |
 | B5 dead before work: profile needs_answers | (d:profile) | 40 | 29.60 | 1.4 | 24.52 | 2.8 | recursive-self-improve 14, refactor-audit 10, audit-judge-panel 3 |
 | B13 node error in verifier | (d:verifier) | 21 | 111.57 | 5.3 | 23.98 | 2.7 | code-fix 85, framework-edit 26, audit-findings-validator 1 |
-| B19 harness: verifier node errored in 0 ms (never ran) | (e) | 30 | 108.94 | 5.2 | 20.36 | 2.3 | framework-edit 109, goal-loop 0 |
+| B19 verifier node errored, cause unrecorded (Python era) | (f) | 30 | 108.94 | 5.2 | 20.36 | 2.3 | framework-edit 109, goal-loop 0 |
 | B7b verify passed, reviewer rejected (candidate false reject) | (c) | 32 | 117.03 | 5.5 | 16.17 | 1.8 | code-fix 117 |
 | B14 no run dir (unclassifiable) | (f) | 14 | 62.03 | 2.9 | 14.27 | 1.6 | chapter-review 62, frontier-llm-research 0 |
 | B10 real failure: verify static/shape check failed (tests ok) | (d:verify-static) | 3 | 22.79 | 1.1 | 5.93 | 0.7 | framework-edit 23 |
@@ -133,8 +141,8 @@ Rolled up by label:
 |---|---:|---:|---:|---:|---:|
 | (d) real failure | 259 | 711.94 | 33.7 | 292.01 | 32.9 |
 | (b) never finalized (B1 + B2) | 425 | 542.01 | 25.7 | 236.67 | 26.7 |
-| (f) other / unclassifiable / escalated | 54 | 263.07 | 12.5 | 154.60 | 17.4 |
-| (e) infra / harness (incl. B19 verifier 0 ms) | 53 | 271.59 | 12.9 | 117.38 | 13.2 |
+| (f) other / unclassifiable / escalated (incl. B19) | 84 | 372.01 | 17.6 | 174.96 | 19.7 |
+| (e) infra / harness | 23 | 162.64 | 7.7 | 97.02 | 10.9 |
 | (c) verify passed, rejected later | 78 | 319.51 | 15.1 | 86.85 | 9.8 |
 | (a) no publish expected | 6 | 2.22 | 0.1 | 0.38 | 0.0 |
 | **Total** | **875** | **2110.33** | 100 | **887.89** | 100 |
@@ -148,7 +156,7 @@ All 45 runs are after the meter fix, so raw = corrected.
 | B13 node error in publisher | (d:publisher) | 9 | 167.44 | 27.1 | 167.44 | 27.1 | recursive-validate-impl 167 |
 | B9b real failure: a verifier check failed | (d:verify) | 10 | 132.27 | 21.4 | 132.27 | 21.4 | recursive-validate-impl 118, spec-driven-delivery 14 |
 | B18 reviewer escalated to a human (no verdict) | (f) | 4 | 82.35 | 13.3 | 82.35 | 13.3 | recursive-validate-impl 82 |
-| B19 harness: verifier node errored in 0 ms (never ran) | (e) | 3 | 80.24 | 13.0 | 80.24 | 13.0 | recursive-validate-impl 62, spec-driven-delivery 18 |
+| B19 verifier node errored, cause unrecorded (Python era) | (f) | 3 | 80.24 | 13.0 | 80.24 | 13.0 | recursive-validate-impl 62, spec-driven-delivery 18 |
 | B5 dead before work: profile needs_answers | (d:profile) | 6 | 74.36 | 12.0 | 74.36 | 12.0 | spec-driven-delivery 74 |
 | B2 never finalized (non-terminal status) | (b) | 9 | 37.41 | 6.1 | 37.41 | 6.1 | spec-driven-delivery 22, recursive-validate-impl 16 |
 | B7b verify passed, reviewer rejected (candidate false reject) | (c) | 1 | 17.06 | 2.8 | 17.06 | 2.8 | recursive-validate-impl 17 |
@@ -189,7 +197,7 @@ Effect: MiniMax alone was recorded at $1,740.13 for ~1.42 B cached + 153 M input
 |---|---|---|
 | **H1** meter artifact | **Rejected** as an explanation of the share. The meter inflated dollars ~2.7×, but correcting it raises the unpublished share from 67.0% to 76.0%. | total $3,151.17 → $1,169.04; published $1,040.84 → $281.15; unpublished $2,110.33 → $887.89 |
 | **H2** never finalized | **Confirmed, and it is the #1 cause.** 425 runs, $542.01 raw / $236.67 corr (B1 + B2). Inside B2: 276 died mid-run ($309.49 / $147.80), 110 **passed** but were never published ($111.25 / $26.73), 2 had a fail verdict but the status write was lost ($56.60 / $12.27). | see RC1 |
-| **H3** no publish by design | **Rejected.** Only the probe-scorer arms are no-publish by design: 6 runs, $2.22. Every recipe except `harness-bridge` has an `artifact_contract.yaml`, so the publisher can publish it. framework-edit's 6/173 is gate rejection and harness failure, not hand shipping: in its 19 genuinely verify-passed failures the reviewer said `needs_revision` (18), and 27 framework-edit runs had verifier nodes that never ran (Erratum). | B3 |
+| **H3** no publish by design | **Rejected.** Only the probe-scorer arms are no-publish by design: 6 runs, $2.22. Every recipe except `harness-bridge` has an `artifact_contract.yaml`, so the publisher can publish it. framework-edit's 6/173 is gate rejection and harness failure, not hand shipping: in its 19 genuinely verify-passed failures the reviewer said `needs_revision` (18), and 27 framework-edit runs had verifier node errors with no recorded cause (Erratum). | B3 |
 | **H4** false rejects | **Partly confirmed.** 78 runs, $319.51 raw / $86.85 corr reached a passing verify and were still failed. Hard false rejects: 3 framework-edit runs passed every check in both checks tables yet `verdict.json` says `pass:false`. The rest (50 reviewer rejections after a passing verify, $154.73 / $53.88) cannot be called false without hidden-test truth, and the evidence cuts both ways (RC2). *(The first version's "12 rubric-only rejections" was a classifier error — Erratum.)* | B7, B7b–B7e |
 | **H5** dead before work | **Confirmed but small.** profile `needs_answers` 40 runs $29.60 / $24.52; planner failure 6 runs $66.81 / $52.17; node `cost_limit`/`timeout` 7 runs $22.43 / $7.97. Lane failures are mostly invisible: 738 failed `llm_calls` rows have `error_category` NULL or `unknown`. In the SDD campaign `needs_answers` is larger: 6 runs, $74.36 (12%). | B4–B6 |
 | **H6** rollback destroyed good work | **Confirmed in the SDD campaign:** 9 recursive-validate-impl runs, panel `APPROVE`, then publisher error, then rollback — $167.44. Not visible as such in the mini-ork home (goal-loop unpublished total is $0.75). | SDD B13 publisher |
@@ -286,7 +294,7 @@ panel failed it. The evidence is mixed:
 | RC1 silent death — hard death / abort (B1 + B2 without a verdict) | 197.44 | **not SDD** (shipped today: `7954fa6f`, `ec54774d`, `bf2805dd`) |
 | RC1 — lost status write (`set_status` swallows) | 12.27 | **not SDD** — zero-fallback: raise, do not warn |
 | RC1 — execute-only runs: publisher cannot see the overlay contract, returns with no status | 26.96 | **not SDD** — fixed in K0.5a (`e245d002`): the no-contract branch finalizes the run |
-| Harness — verifier node errored in 0 ms, never ran (B19; + SDD $80.24) | 20.36 | **not SDD** — new epic **K0.5c** |
+| Verifier node errored, cause unrecorded (B19; + SDD $80.24) | 20.36 | **not SDD** — epic **K0.5c** (record real durations, then root-cause) |
 | RC2 — reviewer rejects after a passing verify | 53.88 | **I7** (convergence audit replaces reviewer verdict authority), **I2** |
 | RC2 — other verify-passed failures (traces-only reads, no reviewer signal) | 32.98 | **I7** |
 | RC2 — reviewer rejects with no verify result | 82.17 | **I1** (verify must check what the reviewer is checking), **I7** |
@@ -313,8 +321,8 @@ panel failed it. The evidence is mixed:
 4. *(Added with the Erratum, accepted 2026-10-07.)* **Insert K0.5c "framework-edit
    verifier nodes actually run" after I1 and before I3.** *Reason:* from I3 on,
    epics are dispatched through framework-edit and its publish rate is the
-   measurement; verifier nodes that error in 0 ms without running make that
-   measurement meaningless.
+   measurement; verifier errors with no recorded cause (and node durations
+   that are always 0) make that measurement untrustworthy.
 
 ## Limits
 
@@ -364,7 +372,7 @@ file carries a run-level `verdict: fail` from `execute@run-level`) → B17 revie
 `unknown` → B18 reviewer `ESCALATE` → B9b/B7b/B7c verifier result files +
 reviewer / panel → B12b reviewer rejected → B11 all verifier traces vacuous →
 B12 first failing node `verdict_revise`/`verdict_fail` → B19 first failing node is a verifier that
-errored in 0 ms (never ran) → B13 first failing node `error` → trace fallback (B9c, B7d, B12c, B7e, B16) → B14 no run dir → B15.
+errored (Python era, cause unrecorded) → B13 first failing node `error` → trace fallback (B9c, B7d, B12c, B7e, B16) → B14 no run dir → B15.
 
 The classifier, verbatim as run:
 
@@ -568,8 +576,12 @@ def bucket(run, f):
         return "B11 verify vacuous (nothing checked), run failed", "d:verify-vacuous"
     if f["first_bad"] and f["first_bad"][0] in ("verdict_revise", "verdict_fail"):
         return f"B12 real failure: {f['first_bad'][1]} {f['first_bad'][0]}", f"d:{f['first_bad'][1]}"
+    # duration_ms is 0 on EVERY Python-era verifier node_end (the executor's
+    # fallback emitter hard-codes it), so it says nothing about whether the
+    # verifier ran. These are verifier errors whose cause was not recorded
+    # (stderr did not reach execute.log before e245d002) — unknown, not harness.
     if f["first_bad"] and f["first_bad"][0] == "error" and f["first_bad"][1] == "verifier" and f.get("first_bad_ms") == 0:
-        return "B19 harness: verifier node errored in 0 ms (never ran)", "e"
+        return "B19 verifier node errored, cause unrecorded (Python era)", "f"
     if f["first_bad"] and f["first_bad"][0] == "error":
         return f"B13 node error in {f['first_bad'][1]}", "e" if f["first_bad"][1] in ("?",) else f"d:{f['first_bad'][1]}"
     # Trace fallback (runs whose dir was a temp home, e.g. libwit chapter-review).
