@@ -1940,9 +1940,14 @@ def _salvage_before_revert(root: str, run_dir: str, run_id: str) -> dict | None:
         paths.extend(sorted(_untracked_now(real_root) - pre))
 
     # 2. Keep only paths strictly inside the target repo; drop run-dir and git
-    #    internals so unrelated dirt is never captured.
+    #    internals so unrelated dirt is never captured. De-dupe on the
+    #    normalized rel path (not the raw string) so the same file recorded
+    #    once as an absolute path and once repo-relative collapses to one entry.
     rels: list[str] = []
-    for raw in sorted({p for p in paths if p}):
+    seen: set[str] = set()
+    for raw in paths:
+        if not raw:
+            continue
         ap = raw if os.path.isabs(raw) else os.path.join(real_root, raw)
         real = os.path.realpath(ap)
         if real == real_root or not real.startswith(real_root + os.sep):
@@ -1953,7 +1958,11 @@ def _salvage_before_revert(root: str, run_dir: str, run_id: str) -> dict | None:
             continue
         if rel.startswith(".git" + os.sep) or rel == ".git":
             continue
+        if rel in seen:
+            continue
+        seen.add(rel)
         rels.append(rel)
+    rels.sort()
     if not rels:
         return None
 

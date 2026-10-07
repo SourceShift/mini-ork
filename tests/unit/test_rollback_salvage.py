@@ -268,6 +268,37 @@ def test_no_paths_means_no_ref_and_normal_revert(tmp_path, monkeypatch):
     assert (repo / "a.txt").read_text() == "a-broken\n"
 
 
+# ── DoD 8: absolute + repo-relative duplicates collapse to one path ──────────
+
+
+def test_absolute_path_and_review_diff_dedupe_to_one(tmp_path, monkeypatch):
+    """The same file recorded once by absolute path (``files_changed``) and once
+    repo-relative (``review-diff.patch`` header) must appear exactly once in
+    ``salvage.json["files"]`` and the printed restore command."""
+    repo = _mk_repo(tmp_path)
+    (repo / "a.txt").write_text("a-modified\n")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "implementer-summary.json").write_text(
+        json.dumps({"files_changed": [str(repo / "a.txt")]}))
+    (run_dir / "review-diff.patch").write_text(
+        "diff --git a/a.txt b/a.txt\n"
+        "--- a/a.txt\n"
+        "+++ b/a.txt\n")
+    monkeypatch.setenv("MO_TARGET_CWD", str(repo))
+
+    res = exh._salvage_before_revert(str(repo), str(run_dir), "r")
+
+    assert res is not None
+    assert res["saved"] is True
+    assert res["files"] == ["a.txt"]
+    doc = json.loads((run_dir / "salvage.json").read_text())
+    assert doc["files"] == ["a.txt"]
+    checkout = [c for c in doc["restore"] if c.startswith("git checkout ")][0]
+    assert checkout == f"git checkout {doc['sha']} -- a.txt"
+    assert checkout.count("a.txt") == 1
+
+
 # ── keep_worktree: nothing is destroyed, so nothing is salvaged ──────────────
 
 
