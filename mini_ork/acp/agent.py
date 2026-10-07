@@ -245,18 +245,27 @@ _SLASH_RACE_PREFIX = "/race "
 # times. See ``_offer_lane_repair``.
 _LANE_REPAIR_RETRIES = 3
 _LANE_REPAIR_RETRY_DELAY = 2.0
+# A lane that keeps dying must not loop the follower forever: at most this many
+# resumes are started per run in one follower lifetime. The next failure is
+# closed ``failed`` without a further prompt.
+_LANE_REPAIR_MAX_RESUMES = 3
 # After a resume is started ``handle_recover`` spawns a detached ``mini-ork
 # recover``; the run's DB row stays ``failed`` until that subprocess reaches the
 # executor, so the follower waits for the status to leave the terminal set
-# before it re-polls. That wait reuses ``MiniOrkAcpAgent._start_timeout_s`` —
-# the same "the run has not produced a live row yet" bound ``_await_terminal``
-# applies — and closes the marker ``failed`` if it expires (see
-# ``_await_resume_started``).
+# before it re-polls. Dedicated constants (not ``_start_timeout_s`` /
+# ``_poll_interval``) so a test can shrink the wait without dragging the
+# unrelated launch clock; if it expires the marker is closed ``failed`` and the
+# thread is told the resume did not start (see ``_await_resume_started``).
+_LANE_REPAIR_RESUME_WAIT_S = 120.0
+_LANE_REPAIR_RESUME_POLL_S = 2.0
 # ``_offer_lane_repair`` outcomes, telling ``_follow_in_thread`` what to do:
-# close the marker ``failed`` (``_NONE``), leave it open for the user's answer
-# (``_PROMPTED``), or keep following the same run (``_RESUMED``).
+# keep following the same run (``_RESUMED``); leave the marker open for the
+# user's answer (``_OFFERED``); close the marker ``failed`` because the user
+# left the run as is (``_DECLINED``); not a lane failure, so today's behaviour
+# (``_NONE``).
 _LANE_REPAIR_NONE = "none"
-_LANE_REPAIR_PROMPTED = "prompted"
+_LANE_REPAIR_OFFERED = "offered"
+_LANE_REPAIR_DECLINED = "declined"
 _LANE_REPAIR_RESUMED = "resumed"
 
 
@@ -707,6 +716,10 @@ class MiniOrkAcpAgent:
         # lifecycles (a review offer is discarded on merge / discard; a repair
         # offer is not). Mirrors the review set's "never re-fire" contract.
         self._lane_repair_emitted: set[str] = set()
+        # run id → the ``/recover`` log path once a resume was started, so
+        # ``_follow_in_thread`` can cite it if the resume never reaches the
+        # executor (the reply the decision handler reads carries the path).
+        self._lane_repair_recover: dict[str, str] = {}
         # Per-run env overlay merged into ``_launch``'s ``extra_env``.
         # Zed S7a: the race turn seeds each run's entry so
         # ``MO_ROUTING_POLICY=workflow_default`` survives the spawn.
@@ -3339,12 +3352,16 @@ class MiniOrkAcpAgent:
 
         Recovery: a run that died on an unavailable lane is offered a resume
         on a working lane. The resume keeps the SAME run id, so this loop
-        stays in the same task: it waits for the run's status to leave the
-        terminal set, then re-enters ``_await_terminal`` and projects the
-        resumed run — the marker stays owned for the run's whole life. No
-        second follower is spawned (a spawn from inside this task would see
-        itself in ``_followers`` and no-op).
+        stays in the same task — at most ``_LANE_REPAIR_MAX_RESUMES`` times per
+        run: it drops the cached terminal status, re-marks the card
+        ``in_progress``, waits (bounded) for the run's status to leave the
+        terminal set, then loops back into ``_await_terminal`` and projects the
+        resumed run — the marker stays owned for the run's whole life. A resume
+        that never reaches the executor is announced and the card closed
+        ``failed``. No second follower is spawned (a spawn from inside this
+        task would see itself in ``_followers`` and no-op).
         """
+        resumes = 0
         while True:
             stop = await self._await_terminal(run_id)
             if stop == "cancelled":
@@ -3361,18 +3378,41 @@ class MiniOrkAcpAgent:
             if await self._offer_run_review(thread_id, run_id):
                 return stop  # S5 buttons/message — the marker stays open
             if not ok:
-                repair = await self._offer_lane_repair(thread_id, run_id)
-                if repair == _LANE_REPAIR_RESUMED:
-                    # Wait for the detached recover to flip the row out of the
-                    # terminal set, then reuse this task to poll it again.
-                    if await self._await_resume_started(run_id):
-                        continue
-                    # recover never took: fall through to today's ``failed``
-                    # close so the marker is not left hanging.
-                elif repair == _LANE_REPAIR_PROMPTED:
-                    # The user was told (buttons, or the one-time message);
-                    # the marker stays ``in_progress`` until they answer.
-                    return stop
+                if resumes < _LANE_REPAIR_MAX_RESUMES:
+                    repair = await self._offer_lane_repair(thread_id, run_id)
+                    if repair == _LANE_REPAIR_RESUMED:
+                        resumes += 1
+                        # A later failure is a NEW one: forget this offer's
+                        # dedupe marker so it is announced rather than
+                        # swallowed, and drop the cached terminal status so
+                        # the next ``_await_terminal`` does not return at once.
+                        self._lane_repair_emitted.discard(run_id)
+                        log_path = self._lane_repair_recover.pop(run_id, "")
+                        self._run_status.pop(run_id, None)
+                        # Re-open the card for the resumed incarnation.
+                        await self._emit(thread_id, ToolCallProgress(
+                            session_update="tool_call_update",
+                            tool_call_id=f"{run_id}:parent",
+                            status="in_progress",
+                        ))
+                        if await self._await_resume_started(run_id):
+                            continue  # follow the resumed run to its next end
+                        # The detached recover never flipped the row: say so
+                        # and close the marker rather than leave it hanging.
+                        await self._emit(
+                            thread_id,
+                            self._build_refusal_message(
+                                self._lane_repair_no_start_message(run_id, log_path)
+                            ),
+                        )
+                    elif repair == _LANE_REPAIR_OFFERED:
+                        # The user was told (buttons, or the one-time message);
+                        # the marker stays ``in_progress`` until they answer.
+                        return stop
+                # ``declined`` / ``none`` — and the resume cap, or a resume
+                # that never started: the follower moves on from this failure,
+                # so a later one offers a fresh prompt.
+                self._lane_repair_emitted.discard(run_id)
             await self._emit(
                 thread_id,
                 ToolCallProgress(
@@ -3391,20 +3431,22 @@ class MiniOrkAcpAgent:
         re-entry into ``_await_terminal`` would return ``end_turn`` at once
         and re-offer the repair forever. Returns ``True`` once the status is
         non-terminal (the recover reached the executor), ``False`` on timeout
-        or cancel (the caller closes the marker ``failed``).
+        or cancel (the caller announces the failed resume and closes the
+        marker ``failed``).
 
-        The bound is ``_start_timeout_s`` — the same "the run has not produced
-        a live row yet" clock ``_await_terminal`` uses for a fresh launch.
+        Bounded by ``_LANE_REPAIR_RESUME_WAIT_S`` (polled every
+        ``_LANE_REPAIR_RESUME_POLL_S``) — a dedicated clock, so shrinking it in
+        a test does not drag the unrelated ``_start_timeout_s`` launch bound.
         """
         reader = self._reader or self._read_snapshot
-        deadline = time.monotonic() + self._start_timeout_s
+        deadline = time.monotonic() + _LANE_REPAIR_RESUME_WAIT_S
         while time.monotonic() < deadline:
             if run_id in self._cancelled:
                 return False
             status = (reader(run_id) or {}).get("status")
             if status is not None and status not in TERMINAL_STATUSES:
                 return True
-            await asyncio.sleep(self._poll_interval)
+            await asyncio.sleep(_LANE_REPAIR_RESUME_POLL_S)
         return False
 
     async def _deliver_to_zed(self, thread_id: str, run_id: str) -> bool:
@@ -3635,13 +3677,15 @@ class MiniOrkAcpAgent:
         """Tell the thread a run died on a lane, and offer a resume.
 
         Called by ``_follow_in_thread`` when a run ended ``failed`` (before the
-        marker is closed). Returns:
+        marker is closed). Returns one of:
 
-          * ``_LANE_REPAIR_PROMPTED`` — buttons on an active turn, or a
+          * ``_LANE_REPAIR_OFFERED`` — buttons on an active turn, or a
             one-time message otherwise; the caller leaves the marker
             ``in_progress`` until the user answers.
           * ``_LANE_REPAIR_RESUMED`` — the user picked resume / retry and the
             same run is being recovered; the caller keeps following it.
+          * ``_LANE_REPAIR_DECLINED`` — the user chose to leave the run as is;
+            the caller closes the marker ``failed``.
           * ``_LANE_REPAIR_NONE`` — no lane hint, a race run, or any error;
             the caller closes the marker ``failed`` as before.
 
@@ -3655,7 +3699,7 @@ class MiniOrkAcpAgent:
         if run_id in self._lane_repair_emitted:
             # Already offered for this incarnation of the run: do not re-post,
             # and do not close the marker (the user still owes an answer).
-            return _LANE_REPAIR_PROMPTED
+            return _LANE_REPAIR_OFFERED
         # Zed S7a: a race run surfaces its decision on the parent permission
         # card; a per-run repair prompt would be a second, conflicting one.
         if run_id in self._skip_review:
@@ -3700,7 +3744,7 @@ class MiniOrkAcpAgent:
                 await self._emit(thread_id, self._build_refusal_message(text))
             except Exception:  # noqa: BLE001
                 pass
-            return _LANE_REPAIR_PROMPTED
+            return _LANE_REPAIR_OFFERED
 
         options = [
             PermissionOption(
@@ -3731,20 +3775,19 @@ class MiniOrkAcpAgent:
                 options=options,
             )
         except Exception:  # noqa: BLE001 — UI is best-effort, marker stays open
-            return _LANE_REPAIR_PROMPTED
+            return _LANE_REPAIR_OFFERED
         outcome = getattr(response, "outcome", None)
         option_id = getattr(outcome, "option_id", None) if outcome is not None else None
         try:
-            resumed = await self._handle_lane_repair_decision(
+            return await self._handle_lane_repair_decision(
                 thread_id, run_id, option_id, hint
             )
         except Exception:  # noqa: BLE001 — never raise into the follower
-            return _LANE_REPAIR_PROMPTED
-        return _LANE_REPAIR_RESUMED if resumed else _LANE_REPAIR_PROMPTED
+            return _LANE_REPAIR_OFFERED
 
     async def _handle_lane_repair_decision(
         self, thread_id: str, run_id: str, option_id: str | None, hint: dict[str, Any]
-    ) -> bool:
+    ) -> str:
         """Apply the user's pick on a lane-repair prompt.
 
         ``lane:<x>`` resumes on the picked lane (``/recover <run> --lane
@@ -3752,10 +3795,12 @@ class MiniOrkAcpAgent:
         (``abandon`` or a dismissed card) leaves the run as it is and prints how
         to resume later.
 
-        Returns ``True`` when a resume / retry was started — the caller
-        (``_follow_in_thread``, in the SAME task) keeps following the run — and
-        ``False`` for abandon. The dedupe marker is dropped on a resume so a
-        second lane failure offers a fresh prompt instead of going silent.
+        Returns ``_LANE_REPAIR_RESUMED`` when a resume / retry was started —
+        the caller (``_follow_in_thread``, in the SAME task) keeps following
+        the run — and ``_LANE_REPAIR_DECLINED`` for abandon. The marker close
+        is owned by the caller, so exactly one ``failed`` emit lands per run.
+        The recover log path is stashed so the caller can cite it if the resume
+        never reaches the executor.
         """
         from mini_ork.acp import commands as _commands
 
@@ -3771,27 +3816,31 @@ class MiniOrkAcpAgent:
             command = str(hint.get("command") or "")
             tail = f" You can resume later with:\n`{command}`" if command else ""
             await self._emit(
-                thread_id,
-                ToolCallProgress(
-                    session_update="tool_call_update",
-                    tool_call_id=f"{run_id}:parent",
-                    status="failed",
-                ),
-            )
-            await self._emit(
                 thread_id, self._build_refusal_message(f"Left as is.{tail}")
             )
-            return False
+            return _LANE_REPAIR_DECLINED
         reply = await _commands.handle(self, thread_id, "recover", arg)
         if isinstance(reply, _commands.CommandReply):
-            await self._emit(thread_id, self._build_refusal_message(reply.text))
+            text = reply.text
+            await self._emit(thread_id, self._build_refusal_message(text))
             await self._emit_file_links(thread_id, reply.links)
         else:
-            await self._emit(thread_id, self._build_refusal_message(str(reply)))
-        # The resume reuses this run id; forget the "already offered" marker so
-        # a second failure is announced again rather than swallowed.
-        self._lane_repair_emitted.discard(run_id)
-        return True
+            text = str(reply)
+            await self._emit(thread_id, self._build_refusal_message(text))
+        # The reply cites the detached recover's log; keep it so a resume that
+        # never reaches the executor can point the user at it.
+        match = re.search(r"log: `([^`]+)`", text)
+        if not match:
+            # /recover refused or failed to spawn (its reply is already in the
+            # thread): nothing resumed, so don't wait for a row that won't move.
+            return _LANE_REPAIR_DECLINED
+        self._lane_repair_recover[run_id] = match.group(1)
+        return _LANE_REPAIR_RESUMED
+
+    def _lane_repair_no_start_message(self, run_id: str, log_path: str) -> str:
+        """Announce a started resume whose row never left the terminal set."""
+        see = f" — see `{log_path}`" if log_path else ""
+        return f"The resume did not start{see}. Run `/recover {run_id}` to try again."
 
     async def _offer_thread_review(self, thread_id: str) -> None:
         """Orchestrator turn-end pass: walk the runs this thread followed

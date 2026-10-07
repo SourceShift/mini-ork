@@ -9,8 +9,12 @@ stubbed, and the ``/recover`` handler is replaced so nothing spawns. Covers:
   * ``_offer_lane_repair`` on an active turn (buttons) and an inactive turn
     (one message, deduped), and that a non-lane hint keeps today's behaviour;
   * the resume / retry / abandon choices, and that a resume is followed through
-    by the SAME follower task (no second ``_start_child_follow``), prompting
-    again on a second failure and closing the run card ``failed``;
+    by the SAME follower task (no second ``_start_child_follow``) to its next
+    end — ``published`` (card ``completed``) or a second failure (prompted
+    again, then closed ``failed`` on "Leave it");
+  * a resume that never reaches the executor (the detached ``recover`` never
+    flips the row) announces it and closes the card ``failed``, and the number
+    of resumes per run is bounded;
   * the offline thread append in ``retry_notify.notify`` (replay shape + dedupe);
   * never raising into the follower.
 """
@@ -59,9 +63,16 @@ def _recipe(name: str) -> RecipeInfo:
 
 @pytest.fixture(autouse=True)
 def _fast_lane_repair(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The 2 s poll between hint reads is for a real run's lagging DB write;
-    tests return a classified hint immediately or want the retry instant."""
+    """Collapse the clock the follower keeps for a REAL run.
+
+    The 2 s poll between hint reads is for a lagging DB write; tests return a
+    classified hint immediately. The 120 s / 2 s post-resume wait for the
+    resumed row to leave the terminal set is for a detached ``recover`` that
+    has to reach the executor; a test whose reader never leaves the terminal
+    set must fail fast instead of spinning for two minutes."""
     monkeypatch.setattr("mini_ork.acp.agent._LANE_REPAIR_RETRY_DELAY", 0)
+    monkeypatch.setattr("mini_ork.acp.agent._LANE_REPAIR_RESUME_WAIT_S", 0.05)
+    monkeypatch.setattr("mini_ork.acp.agent._LANE_REPAIR_RESUME_POLL_S", 0.001)
 
 
 @pytest.fixture(autouse=True)
@@ -193,8 +204,9 @@ def _new_thread_agent(
     proj.mkdir()
     # ``_home_for(run_id)`` resolves to ``<proj>/.mini-ork`` when it exists.
     (proj / ".mini-ork").mkdir(parents=True, exist_ok=True)
-    # A tiny start timeout: it also bounds the post-resume wait, so a reader
-    # that never leaves the terminal set fails fast instead of spinning.
+    # A tiny start timeout, so a reader with no task row fails fast. The
+    # post-resume wait has its own (monkeypatched) clock — see
+    # ``_fast_lane_repair``.
     ctor_kwargs.setdefault("start_timeout", 0.05)
     agent = MiniOrkAcpAgent(**ctor_kwargs)
     resp = asyncio.run(agent.new_session(cwd=str(proj)))
@@ -288,12 +300,21 @@ def test_start_run_has_no_owner_without_mo_thread_id(
 
 
 def _stub_recover(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
-    """Replace the ``/recover`` handler so nothing spawns; record its args."""
+    """Replace the ``/recover`` handler so nothing spawns; record its args.
+
+    The reply mirrors ``handle_recover``'s shape, including the ``log:`` line,
+    so a resume that never starts has a log path to cite.
+    """
     calls: list[tuple[str, str]] = []
 
     async def fake_recover(agent, session_id, arg):  # noqa: ANN001
         calls.append((session_id, arg))
-        return f"`/recover` `{arg}` started."
+        run_id = arg.split()[0] if arg.split() else arg
+        return (
+            f"`/recover` `{run_id}` started.\n"
+            "- pid: `4242`\n"
+            f"- log: `/tmp/{run_id}.recover.log`"
+        )
 
     monkeypatch.setitem(acp_commands.HANDLERS, "recover", fake_recover)
     return calls
@@ -355,8 +376,72 @@ def test_resume_is_followed_in_the_same_task_and_a_second_failure_prompts_again(
     # A second lane failure prompted again (no silent short-circuit).
     assert len(conn.calls) == 2
     assert conn.calls[1]["option_ids"] == ["lane:deepseek", "same", "abandon"]
-    # The final "Leave it" closed the card exactly once, and no follower lingers.
-    assert [p.status for p in conn.progress("run-lane-1:parent")] == ["failed"]
+    # The card was re-opened for the resumed incarnation, then the final
+    # "Leave it" closed it ``failed`` exactly once. No follower lingers.
+    assert [p.status for p in conn.progress("run-lane-1:parent")] == [
+        "in_progress",
+        "failed",
+    ]
+    assert "run-lane-1" not in agent._followers
+
+
+def test_a_resumed_run_is_followed_to_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reader ``failed -> executing -> published``: the SAME follower keeps
+    polling the resumed run and the card ends ``completed`` — not stuck
+    ``in_progress`` forever."""
+    hint = _lane_hint(suggestions=[{"lane": "deepseek", "reason": "ok"}])
+    _patch_hint(monkeypatch, hint)
+    agent, _proj, sid = _new_thread_agent(
+        tmp_path,
+        monkeypatch,
+        reader=_seq_reader(["failed", "executing", "published"]),
+        poll_interval=0,
+    )
+    conn = _Conn(outcome_id="lane:deepseek")
+    agent.on_connect(conn)
+    recover_calls = _stub_recover(monkeypatch)
+
+    asyncio.run(agent.prompt(sid, [_text_block("/run do it")]))
+
+    # Exactly one resume, followed to the run's new terminal end.
+    assert recover_calls == [(sid, "run-lane-1 --lane codex_lens=deepseek")]
+    assert len(conn.calls) == 1
+    assert [p.status for p in conn.progress("run-lane-1:parent")] == [
+        "in_progress",
+        "completed",
+    ]
+    assert "run-lane-1" not in agent._followers
+
+
+def test_at_most_three_resumes_then_no_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lane that keeps dying is followed at most three times; the fourth
+    failure closes the card ``failed`` with no further prompt."""
+    hint = _lane_hint(suggestions=[{"lane": "deepseek", "reason": "ok"}])
+    _patch_hint(monkeypatch, hint)
+    agent, _proj, sid = _new_thread_agent(
+        tmp_path,
+        monkeypatch,
+        reader=_seq_reader([
+            "failed", "executing",
+            "failed", "executing",
+            "failed", "executing",
+            "failed",
+        ]),
+        poll_interval=0,
+    )
+    conn = _Conn(outcome_id=["lane:deepseek"] * 3)
+    agent.on_connect(conn)
+    recover_calls = _stub_recover(monkeypatch)
+
+    asyncio.run(agent.prompt(sid, [_text_block("/run do it")]))
+
+    assert len(conn.calls) == 3  # the fourth failure is not offered
+    assert len(recover_calls) == 3
+    assert conn.progress("run-lane-1:parent")[-1].status == "failed"
     assert "run-lane-1" not in agent._followers
 
 
@@ -418,15 +503,19 @@ def test_child_follow_survives_a_resume(
 
     assert recover_calls == [(sid, "run-lane-1 --lane codex_lens=deepseek")]
     assert len(conn.calls) == 2
-    assert [p.status for p in conn.progress("run-lane-1:parent")] == ["failed"]
+    assert [p.status for p in conn.progress("run-lane-1:parent")] == [
+        "in_progress",
+        "failed",
+    ]
     assert "run-lane-1" not in agent._followers
 
 
 def test_a_resume_that_never_takes_closes_the_card_failed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The detached ``recover`` never flips the row: the bounded wait expires
-    and the marker is closed ``failed`` rather than left hanging ``in_progress``."""
+    """The detached ``recover`` never flips the row: the bounded wait expires,
+    the thread is told the resume did not start (citing the recover log), and
+    the marker is closed ``failed`` rather than left hanging ``in_progress``."""
     hint = _lane_hint(suggestions=[{"lane": "deepseek", "reason": "ok"}])
     _patch_hint(monkeypatch, hint)
     agent, _proj, sid = _new_thread_agent(
@@ -440,7 +529,15 @@ def test_a_resume_that_never_takes_closes_the_card_failed(
 
     assert recover_calls == [(sid, "run-lane-1 --lane codex_lens=deepseek")]
     assert len(conn.calls) == 1  # no second prompt
-    assert [p.status for p in conn.progress("run-lane-1:parent")] == ["failed"]
+    assert any(
+        "The resume did not start" in m.content.text
+        and "/tmp/run-lane-1.recover.log" in m.content.text
+        for m in conn.messages()
+    )
+    assert [p.status for p in conn.progress("run-lane-1:parent")] == [
+        "in_progress",
+        "failed",
+    ]
     assert "run-lane-1" not in agent._followers
 
 
@@ -464,6 +561,37 @@ def test_abandon_closes_the_marker_and_prints_the_command(
     assert any("mini-ork recover run-lane-1" in m.content.text for m in conn.messages())
 
 
+def test_a_refused_recover_closes_the_card_without_waiting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``/recover`` refuses (no ``log:`` line, nothing spawned): the card closes
+    ``failed`` once, the refusal is in the thread, and no resume slot is spent
+    waiting for a row that will never move."""
+    hint = _lane_hint(suggestions=[{"lane": "deepseek", "reason": "ok"}])
+    _patch_hint(monkeypatch, hint)
+    agent, _proj, sid = _new_thread_agent(
+        tmp_path, monkeypatch, reader=_failed_reader, poll_interval=0
+    )
+    conn = _Conn(outcome_id="lane:deepseek")
+    agent.on_connect(conn)
+    calls: list[str] = []
+
+    async def refusing_recover(agent, session_id, arg):  # noqa: ANN001
+        calls.append(arg)
+        return "`/recover` `run-lane-1`: not spawning — the run is still active."
+
+    monkeypatch.setitem(acp_commands.HANDLERS, "recover", refusing_recover)
+
+    asyncio.run(agent.prompt(sid, [_text_block("/run do it")]))
+
+    assert calls == ["run-lane-1 --lane codex_lens=deepseek"]
+    assert len(conn.calls) == 1
+    assert [p.status for p in conn.progress("run-lane-1:parent")] == ["failed"]
+    assert any("not spawning" in m.content.text for m in conn.messages())
+    assert not any("The resume did not start" in m.content.text for m in conn.messages())
+    assert "run-lane-1" not in agent._followers
+
+
 # ── 3. the inactive turn (one message, deduped) ─────────────────────────────
 
 
@@ -479,7 +607,7 @@ def test_inactive_turn_posts_one_message_and_dedupes(
     agent.on_connect(conn)
 
     # No active turn → the one-time message path.
-    assert asyncio.run(agent._offer_lane_repair(sid, "run-lane-1")) == "prompted"
+    assert asyncio.run(agent._offer_lane_repair(sid, "run-lane-1")) == "offered"
     msgs = conn.messages()
     assert len(msgs) == 1
     text = msgs[0].content.text
@@ -490,7 +618,7 @@ def test_inactive_turn_posts_one_message_and_dedupes(
     assert "/recover run-lane-1 --lane codex_lens=opus" in text
 
     # Second call → deduped, no second message.
-    assert asyncio.run(agent._offer_lane_repair(sid, "run-lane-1")) == "prompted"
+    assert asyncio.run(agent._offer_lane_repair(sid, "run-lane-1")) == "offered"
     assert len(conn.messages()) == 1
 
 
