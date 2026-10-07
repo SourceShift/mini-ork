@@ -288,6 +288,38 @@ def task_state(run_dir: Path, snapshot: dict[str, Any]) -> TaskState:
     status = snapshot.get("status")
     events = list(snapshot.get("events") or [])
 
+    # Rule 0: a pending ``retry_precondition`` gate means a prior cycle
+    # failed in a way the operator must fix before this run can continue.
+    # Cheap: only paid when ``<run_dir>/retry-gate.json`` exists, and the
+    # selector query is indexed on ``status='pending'``. Wins over the
+    # cost-pause rule so the fix-step text stays visible alongside the
+    # cost-pause detail.
+    if path is not None and status in ("failed", "rolled_back", "executing"):
+        try:
+            from mini_ork.recovery import retry_notify
+            home = path.parent.parent
+            pending = retry_notify.pending_fix_for_run(home, path)
+            if isinstance(pending, dict):
+                ctxt_raw = pending.get("context")
+                ctxt = ctxt_raw if isinstance(ctxt_raw, dict) else {}
+                hint_raw = ctxt.get("hint")
+                hint = hint_raw if isinstance(hint_raw, dict) else {}
+                nc_raw = hint.get("needs_change")
+                nc = nc_raw if isinstance(nc_raw, dict) else {}
+                summary = str(nc.get("summary") or "")
+                return TaskState(
+                    state="needs_you",
+                    detail=(
+                        f"needs a fix: {summary[:60]}"
+                        if summary else "needs a fix"
+                    ),
+                    step=_current_step(events),
+                    added=0,
+                    removed=0,
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
     # Rule 1: cost-pause sentinel wins over everything else (a paused
     # run may also be in a terminal state from a prior cycle).
     if path is not None and (path / ".cost-pause").exists():

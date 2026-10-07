@@ -566,13 +566,45 @@ def _act_retry(
     except Exception as exc:  # noqa: BLE001 — spawn failure: surface, do not crash
         return {"ok": False, "run_id": run_id, "hint": hint,
                 "error": f"spawn failed: {type(exc).__name__}: {exc}"}
+
+    # ``board retry <run> --ack-change`` resolves the run's pending
+    # ``retry_precondition`` gate with the audit note "retried via board
+    # retry" so the resolve→spawn path is visible in ``mo_inbox_gates``
+    # alongside the gate→retry handoff path. Fail-soft — a missing row
+    # or DB never blanks the spawn.
+    if ack_change:
+        try:
+            from mini_ork.gates import oversight_inbox
+            from mini_ork.recovery import retry_notify
+            _db = str(home / "state.db")
+            for row in oversight_inbox.pending(db_path=_db):
+                if (str(row.get("gate_id") or "") == retry_notify.GATE_ID
+                        and str(row.get("feature") or "") == run_id):
+                    oversight_inbox.resolve(
+                        int(row["inbox_id"]), "approved",
+                        review_note="retried via board retry",
+                        db_path=_db,
+                    )
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+
     return {"ok": True, "run_id": run_id, "hint": hint, "pid": proc.pid,
             "log": str(log_path), "command": command}
 
 
 def _act_gate(home: Path, action: str, inbox_id: str, note: str | None) -> dict[str, Any]:
-    """Resolve a ``mo_inbox_gates`` row. ``False`` ⇒ already decided."""
-    from mini_ork.gates.oversight_inbox import resolve
+    """Resolve a ``mo_inbox_gates`` row. ``False`` ⇒ already decided.
+
+    When the resolved row is a ``retry_precondition`` gate, the approve
+    branch hands off to :func:`_act_retry` (with ``--ack-change``) so the
+    run is retried under the same detached spawn shape ``recover`` uses.
+    The reject branch writes ``{"abandoned": true}`` into the run dir's
+    ``retry-gate.json`` so the IDE / polling layers can read the abandon
+    status without a DB query.
+    """
+    from mini_ork.gates import oversight_inbox
+    from mini_ork.recovery import retry_notify
 
     db_path = home / "state.db"
     if not db_path.is_file():
@@ -582,9 +614,52 @@ def _act_gate(home: Path, action: str, inbox_id: str, note: str | None) -> dict[
     except (TypeError, ValueError):
         return {"ok": False, "error": "invalid inbox id"}
     status = "approved" if action == "approve" else "rejected"
-    ok = resolve(iid, status, review_note=note or "", db_path=db_path)
+    ok = oversight_inbox.resolve(iid, status, review_note=note or "", db_path=db_path)
     if not ok:
         return {"ok": False, "error": "not pending"}
+
+    # Resolve the gate's feature to a run_id so we can route the handoff.
+    # Fetch on BOTH branches (approve + reject) — the reject branch needs
+    # gate_id + feature to write the abandoned marker, and a missing row
+    # is itself a meaningful signal we should report.
+    row = oversight_inbox.get(iid, db_path=db_path)
+    if not isinstance(row, dict):
+        return {"ok": True, "inbox_id": iid, "status": status}
+    gate_id = str(row.get("gate_id") or "")
+    feature = str(row.get("feature") or "")
+    # The retry gate writes ``feature=<run_id>`` (retry_notify._enqueue_retry_gate).
+    # Run dirs are at ``<home>/runs/<run_id>``; check that the dir exists
+    # so a custom MINI_ORK_RUN_ID (e.g. "retry-notify-20261007123316") still
+    # resolves to a run instead of being silently dropped.
+    run_id = feature if feature and (home / "runs" / feature).is_dir() else ""
+
+    if gate_id == retry_notify.GATE_ID and status == "approved" and run_id:
+        # Approve: dispatch ``board retry <run> --ack-change`` (detached),
+        # returning the same pid/log payload so callers can tail the log.
+        return _act_retry(home, run_id, ack_change=True)
+    if gate_id == retry_notify.GATE_ID and status == "rejected" and run_id:
+        # Reject: mark the gate pointer ``{"abandoned": true}`` so polling
+        # readers see the abandon without needing the row.
+        gate_pointer = home / "runs" / run_id / retry_notify.GATE_POINTER_FILENAME
+        try:
+            gate_pointer.parent.mkdir(parents=True, exist_ok=True)
+            existing = {}
+            if gate_pointer.is_file():
+                try:
+                    existing = json.loads(gate_pointer.read_text(encoding="utf-8"))
+                except (OSError, ValueError, TypeError):
+                    existing = {}
+            if isinstance(existing, dict):
+                existing["abandoned"] = True
+            else:
+                existing = {"abandoned": True}
+            gate_pointer.write_text(
+                json.dumps(existing, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        return {"ok": True, "inbox_id": iid, "status": status, "abandoned": True}
     return {"ok": True, "inbox_id": iid, "status": status}
 
 

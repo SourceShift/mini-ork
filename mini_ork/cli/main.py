@@ -765,6 +765,35 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
     if (blocked := _budget_preflight(sink)) is not None:
         return blocked
 
+    # Start guard: refuse dispatch while a previous run with the same kickoff
+    # has a pending ``retry_precondition`` gate. ``MO_IGNORE_PENDING_FIX=1``
+    # bypasses for opt-in situations (a user rerunning the same kickoff after
+    # they believe the fix is in). Reuses ``RC_BLOCKED = 75`` so the caller
+    # maps exit-code failure cleanly. The home resolution below is the same
+    # one the rest of the lifecycle uses (canonicalised by the canonical
+    # setter at L846+); keeping a single source of truth means the guard
+    # sees the same env contract the run will dispatch under.
+    try:
+        from mini_ork.recovery import retry_notify
+        _pid_home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
+        _pending = retry_notify.pending_fix_for_kickoff(
+            Path(_pid_home), os.path.realpath(kickoff),
+        )
+        if _pending is not None:
+            _pid_run_id = str(_pending.get("feature") or "?")
+            _ctxt = _pending.get("context") if isinstance(_pending.get("context"), dict) else {}
+            _nc = _ctxt.get("hint", {}).get("needs_change") if isinstance(_ctxt.get("hint"), dict) else None
+            _summary = (_nc or {}).get("summary") or "an upstream change is required"
+            sys.stderr.write(
+                f"needs a change before this run can continue: "
+                f"pending run {_pid_run_id} ({_summary}). "
+                f"Confirm with: mini-ork board retry {_pid_run_id} --ack-change "
+                f"(or set MO_IGNORE_PENDING_FIX=1).\n"
+            )
+            return RC_BLOCKED
+    except Exception:  # noqa: BLE001 — guard is best-effort, never break the run
+        pass
+
     # Every run is a Concord principal: register it (fail-open) so the node
     # workers this run spawns inherit CONCORD_PRINCIPAL. Concord must never
     # fail or delay a run, so any error here only logs and drops the handle.
@@ -774,13 +803,39 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
         sys.stderr.write(f"[concord] run principal not started: {exc}\n")
         sink["_concord"] = None
 
+    # Resolve the home ONCE for the rest of the lifecycle. The start guard
+    # above and the pid claim below both used to repeat the
+    # ``env.get(MINI_ORK_HOME) or cwd/.mini-ork`` dance; canonicalising it
+    # here removes two divergent sources of truth and keeps the home the
+    # notify / task_state readers see the same one the writer used.
+    pid_home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
+
+    # Owner record: write ``<run_dir>/owner.json`` at run start (kickoff
+    # section 3). This makes a later poll that races the run-start write
+    # still resolve to the same owner the run actually had, even when
+    # ``MO_RUN_OWNER`` is no longer set in the environment. ``owner()``
+    # honours MO_RUN_OWNER first when owner.json is absent, so the
+    # persisted record matches what the run was actually scoped to.
+    if os.environ.get("MINI_ORK_DRY_RUN", "0") != "1":
+        try:
+            from mini_ork.recovery import retry_notify
+            os.makedirs(os.path.join(pid_home, "runs", run_id), exist_ok=True)
+            owner_rec = retry_notify.owner(Path(pid_home), run_id)
+            if isinstance(owner_rec, dict):
+                import json as _json
+                (Path(pid_home) / "runs" / run_id / retry_notify.OWNER_FILENAME).write_text(
+                    _json.dumps(owner_rec, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+        except Exception:  # noqa: BLE001 — owner write is best-effort, never break the run
+            pass
+
     # Owner record: <run_dir>/.pid names this process from before classify
     # until teardown, so a row whose .pid process is gone is provably orphaned
     # (orchestration/run_reaper.py). Same home the run dir resolves to below.
     if os.environ.get("MINI_ORK_DRY_RUN", "0") != "1":
         from mini_ork.orchestration import run_reaper
 
-        pid_home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
         pid_run_dir = Path(pid_home) / "runs" / run_id
         run_reaper.claim_pid_file(pid_run_dir)
         sink["_pid_run_dir"] = str(pid_run_dir)
@@ -955,6 +1010,40 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
         sink["verdict"] = _verdicts[-1]
     if run_rc == 0:
         run_rc = vr.returncode
+
+    # ── retry-notify: best-effort side-channel that records the owner,
+    # writes NEEDS-CHANGE.md, and enqueues a ``retry_precondition`` gate
+    # when the run failed and the hint classifies the cause. Never changes
+    # the run's exit code — failures inside ``retry_notify.notify`` are
+    # caught inside the helper. Only fires when ``run_rc != 0`` so a
+    # green run stays quiet.
+    #
+    # Risk note: a run whose verify step crashed without first flipping
+    # ``task_runs.status='failed'`` would otherwise be invisible to
+    # ``retry_hint.load_or_compute`` (its status gate short-circuits on
+    # anything other than failed/rolled_back), so notify would no-op
+    # silently. We stamp the status before calling notify so the
+    # explicit post-verify path is always honoured.
+    if run_rc != 0 and _run_dir and _run_dir != "." and os.path.isdir(_run_dir):
+        try:
+            import sqlite3 as _sqlite_status
+            _status_db = str(Path(home) / "state.db")
+            if Path(_status_db).is_file():
+                with _sqlite_status.connect(_status_db) as _con:
+                    _con.execute(
+                        "UPDATE task_runs SET status='failed', updated_at=? "
+                        "WHERE id=? AND status NOT IN ('published','failed','rolled_back','succeeded')",
+                        (int(time.time()), run_id),
+                    )
+                    _con.commit()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from mini_ork.recovery import retry_notify
+            retry_notify.notify(Path(home), run_id)
+        except Exception:  # noqa: BLE001
+            pass
+
     if not _gate("verify", artifact):
         return run_rc
 
