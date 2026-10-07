@@ -294,7 +294,7 @@ def task_state(run_dir: Path, snapshot: dict[str, Any]) -> TaskState:
     # selector query is indexed on ``status='pending'``. Wins over the
     # cost-pause rule so the fix-step text stays visible alongside the
     # cost-pause detail.
-    if path is not None and status in ("failed", "rolled_back", "executing"):
+    if path is not None and status in ("failed", "rolled_back"):
         try:
             from mini_ork.recovery import retry_notify
             home = path.parent.parent

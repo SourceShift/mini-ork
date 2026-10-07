@@ -816,3 +816,76 @@ def test_read_only_proof_names_env_var_and_restart(home: Path) -> None:
     flat = "\n".join(steps)
     assert "ONBOARDING_DEMO_BOOK_PATH" in flat
     assert "Restart the backend" in flat
+
+# ── review fixes (Opus r2): env names, owner timing, the start guard ───────
+
+
+def test_env_var_names_are_never_cut_at_the_context_window_edge() -> None:
+    text = ("The variable ONBOARDING_DEMO_BOOK_PATH_FOR_BACKEND, read by the onboarding "
+            "smoke, is missing")
+    assert retry_notify._env_var_names(text) == ["ONBOARDING_DEMO_BOOK_PATH_FOR_BACKEND"]
+
+
+def test_the_real_w5_91_error_names_the_variable() -> None:
+    err = "ONBOARDING_DEMO_BOOK_PATH is not set — refusing to email a guessed demo-book link"
+    assert retry_notify._env_var_names(err) == ["ONBOARDING_DEMO_BOOK_PATH"]
+
+
+def test_owner_is_written_at_start_only_when_the_launcher_names_one(
+        home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert retry_notify.record_owner_at_start(home, "run-start-a") is None
+    assert not (home / "runs" / "run-start-a" / retry_notify.OWNER_FILENAME).exists()
+    monkeypatch.setenv(retry_notify.MO_RUN_OWNER, "thread:sess-42")
+    rec = retry_notify.record_owner_at_start(home, "run-start-b")
+    assert rec is not None and (rec["kind"], rec["id"]) == ("thread", "sess-42")
+    saved = json.loads((home / "runs" / "run-start-b" / retry_notify.OWNER_FILENAME).read_text())
+    assert (saved["kind"], saved["id"]) == ("thread", "sess-42")
+
+
+def test_a_loop_kickoff_is_inferred_as_the_owner_when_none_was_named(home: Path) -> None:
+    _seed_run(home, "run-loop-1", kickoff_subdir="rsi/acq-wave5-rsi", kickoff_name="kickoff.md")
+    rec = retry_notify.owner(home, "run-loop-1")
+    assert rec is not None and (rec["kind"], rec["id"]) == ("loop", "acq-wave5-rsi")
+
+
+def _cli_home(tmp_path: Path) -> Path:
+    import subprocess
+
+    home = tmp_path / "cli-home"
+    home.mkdir()
+    subprocess.run(["bash", str(REPO / "db" / "init.sh")],
+                   env={**os.environ, "MINI_ORK_HOME": str(home), "MINI_ORK_DB": str(home / "state.db")},
+                   capture_output=True, text=True, check=True)
+    return home
+
+
+def _cli_run(tmp_path: Path, home: Path, kickoff: Path, **extra: str):
+    import subprocess
+
+    env = {**os.environ, "MINI_ORK_HOME": str(home), "MINI_ORK_DB": str(home / "state.db"),
+           "MINI_ORK_ROOT": str(REPO), "MINI_ORK_RUN_ID": "guard-probe",
+           "MINI_ORK_PROFILE_GATE": "0", "MINI_ORK_NONINTERACTIVE": "1", **extra}
+    env.pop(retry_notify.MO_IGNORE_PENDING_FIX, None)
+    env.update(extra)
+    return subprocess.run([str(REPO / "bin" / "mini-ork"), "run", "--json", "code-fix", str(kickoff)],
+                          capture_output=True, text=True, env=env, timeout=180)
+
+
+def test_mini_ork_run_refuses_a_kickoff_with_a_pending_fix(tmp_path: Path) -> None:
+    from mini_ork.cli import main as cli_main
+    from mini_ork.gates import oversight_inbox
+
+    home = _cli_home(tmp_path)
+    kickoff = tmp_path / "k.md"
+    kickoff.write_text("# fix\n\n## Files in scope\n\n- a.py\n")
+    oversight_inbox.enqueue(
+        retry_notify.GATE_ID, "run-earlier", "retry",
+        {"hint": {"needs_change": {"kind": "environment", "summary": "set FOO_BAR"}}},
+        blocks_dispatch_for=os.path.realpath(kickoff), db_path=str(home / "state.db"))
+
+    blocked = _cli_run(tmp_path, home, kickoff, MINI_ORK_DRY_RUN="1")
+    assert blocked.returncode == cli_main.RC_BLOCKED, blocked.stderr[-400:]
+    assert "run-earlier" in blocked.stderr and "set FOO_BAR" in blocked.stderr
+
+    bypass = _cli_run(tmp_path, home, kickoff, MINI_ORK_DRY_RUN="1", MO_IGNORE_PENDING_FIX="1")
+    assert "needs a change before this run can continue" not in bypass.stderr

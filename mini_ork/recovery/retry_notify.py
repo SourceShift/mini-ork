@@ -245,8 +245,8 @@ def owner(home: Path, run_id: str) -> dict[str, Any] | None:
     """The run's owner record — ``{"kind", "id", "label"}`` — or ``None``.
 
     Resolution order (first non-empty wins) per kickoff section 1:
-    ``owner.json`` is the persisted source of truth (written by ``main.py``
-    at run start from ``MO_RUN_OWNER`` if set, else the inference below),
+    ``owner.json`` is the persisted source of truth (written at run start
+    only from ``MO_RUN_OWNER``, else by :func:`notify` from the inference),
     so it outranks the live env var. ``MO_RUN_OWNER`` is a runtime override
     that flows into the next ``owner.json`` write but does NOT supersede a
     previously-persisted record on read.
@@ -319,30 +319,21 @@ def _truncate(s: str, n: int) -> str:
 
 
 def _env_var_names(text: str) -> list[str]:
-    """Env var names within 40 chars of a context word. Order preserved."""
+    """Env var names within 40 chars of a context word ("not set", "export",
+    …), in order. Whole-token matches over the full text, so a name next to
+    the window edge is never cut short."""
     if not text:
         return []
-    hits: list[tuple[int, str]] = []
-    for m in _ENV_CONTEXT_RE.finditer(text):
-        ctx_start = max(0, m.start() - 40)
-        ctx_end = min(len(text), m.end() + 40)
-        window = text[ctx_start:ctx_end]
-        for vmatch in _ENV_VAR_RE.finditer(window):
-            name = vmatch.group(1)
-            # Skip when the next char is lowercase = NOT an env var (it's
-            # a CamelCase / mixed-case identifier, e.g. ``OnboardingCheck``).
-            end = vmatch.end()
-            if end < len(window) and window[end].islower():
-                continue
-            hits.append((m.start(), name))
-    # Dedup keeping the first occurrence of each name; sort by context.
-    seen: set[str] = set()
+    contexts = [(m.start(), m.end()) for m in _ENV_CONTEXT_RE.finditer(text)]
+    if not contexts:
+        return []
     out: list[str] = []
-    for _, name in sorted(hits, key=lambda t: t[0]):
-        if name in seen:
-            continue
-        seen.add(name)
-        out.append(name)
+    for vmatch in _ENV_VAR_RE.finditer(text):
+        start, end = vmatch.span()
+        near = any(start <= c_end + 40 and end >= c_start - 40 for c_start, c_end in contexts)
+        name = vmatch.group(1)
+        if near and name not in out:
+            out.append(name)
     return out
 
 
@@ -579,6 +570,24 @@ def _write_needs_change_md(run_dir: Path, owner_rec: dict[str, Any],
     path = run_dir / NOTIFY_FILENAME
     path.write_text("\n".join(out), encoding="utf-8")
     return path
+
+
+def record_owner_at_start(home: Path, run_id: str) -> dict[str, Any] | None:
+    """Persist ``owner.json`` at run start, only when ``MO_RUN_OWNER`` names one.
+
+    Without it the owner is inferred later, by :func:`notify`, once the run
+    profile, kickoff path and run events exist; writing an inference at start
+    would freeze the ``user:`` fallback before those signals are there.
+    """
+    env_owner = os.environ.get(MO_RUN_OWNER) or ""
+    if ":" not in env_owner:
+        return None
+    rec = owner(home, run_id)
+    if isinstance(rec, dict):
+        run_dir = _run_dir(Path(home), run_id)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        _write_owner_json(run_dir, rec)
+    return rec
 
 
 def _write_owner_json(run_dir: Path, owner_rec: dict[str, Any]) -> None:

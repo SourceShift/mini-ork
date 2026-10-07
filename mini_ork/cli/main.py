@@ -810,24 +810,13 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
     # notify / task_state readers see the same one the writer used.
     pid_home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
 
-    # Owner record: write ``<run_dir>/owner.json`` at run start (kickoff
-    # section 3). This makes a later poll that races the run-start write
-    # still resolve to the same owner the run actually had, even when
-    # ``MO_RUN_OWNER`` is no longer set in the environment. ``owner()``
-    # honours MO_RUN_OWNER first when owner.json is absent, so the
-    # persisted record matches what the run was actually scoped to.
+    # The run's owner, when the launcher named one (``MO_RUN_OWNER``); else it
+    # is inferred when the run fails (retry_notify.notify).
     if os.environ.get("MINI_ORK_DRY_RUN", "0") != "1":
         try:
             from mini_ork.recovery import retry_notify
-            os.makedirs(os.path.join(pid_home, "runs", run_id), exist_ok=True)
-            owner_rec = retry_notify.owner(Path(pid_home), run_id)
-            if isinstance(owner_rec, dict):
-                import json as _json
-                (Path(pid_home) / "runs" / run_id / retry_notify.OWNER_FILENAME).write_text(
-                    _json.dumps(owner_rec, indent=2, sort_keys=True) + "\n",
-                    encoding="utf-8",
-                )
-        except Exception:  # noqa: BLE001 — owner write is best-effort, never break the run
+            retry_notify.record_owner_at_start(Path(pid_home), run_id)
+        except Exception:  # noqa: BLE001 — never break the run
             pass
 
     # Owner record: <run_dir>/.pid names this process from before classify
@@ -1017,27 +1006,7 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
     # the run's exit code — failures inside ``retry_notify.notify`` are
     # caught inside the helper. Only fires when ``run_rc != 0`` so a
     # green run stays quiet.
-    #
-    # Risk note: a run whose verify step crashed without first flipping
-    # ``task_runs.status='failed'`` would otherwise be invisible to
-    # ``retry_hint.load_or_compute`` (its status gate short-circuits on
-    # anything other than failed/rolled_back), so notify would no-op
-    # silently. We stamp the status before calling notify so the
-    # explicit post-verify path is always honoured.
     if run_rc != 0 and _run_dir and _run_dir != "." and os.path.isdir(_run_dir):
-        try:
-            import sqlite3 as _sqlite_status
-            _status_db = str(Path(home) / "state.db")
-            if Path(_status_db).is_file():
-                with _sqlite_status.connect(_status_db) as _con:
-                    _con.execute(
-                        "UPDATE task_runs SET status='failed', updated_at=? "
-                        "WHERE id=? AND status NOT IN ('published','failed','rolled_back','succeeded')",
-                        (int(time.time()), run_id),
-                    )
-                    _con.commit()
-        except Exception:  # noqa: BLE001
-            pass
         try:
             from mini_ork.recovery import retry_notify
             retry_notify.notify(Path(home), run_id)
