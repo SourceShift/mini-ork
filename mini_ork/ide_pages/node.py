@@ -1512,82 +1512,222 @@ def _call_for_node(call: dict[str, Any], node: Node) -> bool:
     return True
 
 
+# ── per-node learning view (kickoff `learn-node-tab`) ───────────────────────
+#
+# Three independent sources, in order:
+#
+#   1. The ``learned/<node.id>.{md,json}`` pair the parallel ``learn-inject``
+#      worktree writes — the verbatim injected text (markdown block) and the
+#      sources it was assembled from (list items).
+#   2. Role-targeted ``operator_steering`` rows — the existing
+#      ``_fetch_steer_rows`` discipline, retitled to "Pending steering · [sev]"
+#      so they can't be confused with already-injected steering.
+#   3. Run-scoped gradients whose evidence trace is THIS run AND starts with
+#      ``f"tr-{node.type}-{node.id}-"`` — replaces the old time-window query
+#      that leaked gradients across concurrent same-class runs.
+#
+# The view returns ``{"list_title", "list", "markdown"?: ...}`` — ``markdown``
+# is OPTIONAL (omitted when no ``.md`` file exists, so the Zed panel can tell
+# "no injected text" from "injected empty text"). All other fields stay
+# additive over the kickoff's pre-fix view, no consumer has to change.
+
+_LEARNED_NODE_TYPES = frozenset({"researcher", "implementer", "reviewer"})
+_LEARNED_GRADIENT_LIMIT = 10
+_PENDING_STEER_LIMIT = 5
+
+
+def _learned_record(run_dir: Path, node_id: str) -> dict[str, Any] | None:
+    """Read ``learned/<node_id>.json`` — the per-node injection record.
+
+    Returns ``None`` if the file is missing or unparseable. Tolerates a
+    missing ``learned/`` directory (the producer's contract; runs from
+    before that producer existed have no per-node file).
+    """
+    path = run_dir / "learned" / f"{node_id}.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _learning_md_block(run_dir: Path, node_id: str) -> dict[str, Any] | None:
+    """Build the optional top-level ``markdown`` block from ``learned/<id>.md``.
+
+    Returns ``None`` when the file is missing — ``build_node`` then omits the
+    top-level ``markdown`` key entirely (kickoff §1: the key's *absence* is
+    the "nothing was injected" signal).
+    """
+    path = run_dir / "learned" / f"{node_id}.md"
+    if not path.is_file():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    return {"title": "Injected into this node's prompt",
+            "text": text[:MD_FILE_CAP],
+            "path": str(path)}
+
+
+def _learning_sources_items(record: dict[str, Any]) -> list[dict[str, Any]]:
+    """Render per-source ``S.item`` rows from a learned-record.
+
+    Three source kinds (gradient / pattern / steering) plus the
+    ``injected: false`` short-circuits. Empty sources + ``injected: true``
+    yields no items — the record was injected but matched nothing.
+    """
+    out: list[dict[str, Any]] = []
+    if not bool(record.get("injected", True)):
+        reason = str(record.get("reason") or "")
+        if reason == "opt-out":
+            sub = "MO_INJECT_LEARNINGS=0 for this run"
+        elif reason == "nothing matched":
+            sub = ("no learned failure modes or lessons matched "
+                   "this task class")
+        else:
+            sub = reason or "injection was disabled for this run"
+        out.append(S.item("Nothing injected", sub))
+        return out
+    sources = record.get("sources")
+    if not isinstance(sources, list):
+        return out
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        kind = str(src.get("kind") or "")
+        if kind == "gradient":
+            signal = str(src.get("signal") or "")[:200]
+            fix = str(src.get("suggested_change") or "")[:200]
+            target = str(src.get("target") or "")
+            sub = f"fix: {fix}"
+            if target:
+                sub = f"{sub} · {target}"
+            out.append(S.item(signal, sub, m="✦", mc="purple"))
+        elif kind == "pattern":
+            text = str(src.get("text") or "")[:200]
+            sub = f"pattern {str(src.get('id') or '')}".strip()
+            out.append(S.item(text, sub, m="◆", mc="purple"))
+        elif kind == "steering":
+            message = str(src.get("message") or "")
+            severity = str(src.get("severity") or "info")
+            source = str(src.get("source") or "")
+            sub = f"steering · {severity} · from {source}"
+            out.append(S.item(message, sub, m="→", mc="blue"))
+    return out
+
+
+def _learning_learned_from(run: Run, node: Node) -> list[dict[str, Any]]:
+    """Run-scoped gradients for this node — JOIN through ``execution_traces``.
+
+    Kickoff §5 — gradients whose evidence trace is in *this* run AND starts
+    with ``f"tr-{node.type}-{node.id}-"``. The prefix filter happens in
+    Python because node ids contain ``_`` (a SQL ``LIKE`` wildcard) and a
+    naive ``LIKE 'tr-implementer-implementer-%'`` would over-match
+    ``implementerX``. Tolerates a missing ``execution_traces`` OR
+    ``gradient_records`` table — returns an empty list rather than
+    blanking the panel.
+    """
+    out: list[dict[str, Any]] = []
+    if not run.row.get("id"):
+        return out
+    try:
+        from mini_ork.web.deps import db_for
+
+        db = db_for(run.home)
+        if not db.has_table("gradient_records"):
+            return out
+        if not db.has_table("execution_traces"):
+            return out
+        prefix = f"tr-{node.type}-{node.id}-"
+        rows = db.rows(
+            "SELECT g.gradient_id, g.target, g.signal, g.suggested_change, "
+            "       g.confidence, g.created_at, t.trace_id "
+            "FROM gradient_records g "
+            "JOIN execution_traces t ON t.trace_id = g.evidence "
+            "WHERE t.run_id = ? "
+            "ORDER BY g.created_at DESC",
+            (run.id,),
+        )
+        for g in rows or []:
+            trace_id = str(g.get("trace_id") or "")
+            if not trace_id.startswith(prefix):
+                continue
+            try:
+                c = float(g.get("confidence") or 0.0)
+            except (TypeError, ValueError):
+                c = 0.0
+            sig = str(g.get("signal") or "")[:200]
+            sc = str(g.get("suggested_change") or "")[:160]
+            out.append(S.item(
+                sig,
+                f"fix: {sc} · confidence {c:.2f}",
+                m="✦", mc="green",
+                acts=[S.btn("Open", S.open_path(str(run.home / "runs" / run.id)), "ghost")],
+            ))
+            if len(out) >= _LEARNED_GRADIENT_LIMIT:
+                break
+    except Exception:  # noqa: BLE001 — silent table-missing tolerance
+        return out
+    return out
+
+
 def _learning_view(run: Run, node: Node) -> dict[str, Any]:
-    """Kickoff fix #7: context-pack gradients + role-targeted steering rows
-    + run-window gradients. The same three sources the operator's recipe
-    workflow reads for the planner (cf. ``mini_ork.context.assemble``).
+    """Per-node Learning tab — what was injected, what was learned.
+
+    Returns ``{"list_title": "Learning", "list": [...], "markdown"?: {...}}``.
+    The ``markdown`` key is included ONLY when ``learned/<id>.md`` exists
+    (Zed ``render_facts`` reads it as a top-level kv block).
     """
     out: list[dict[str, Any]] = []
 
-    # 1. Injected gradients from the run's context-pack.
-    pack_path = run.run_dir / "context-pack.json"
-    if pack_path.is_file():
-        try:
-            pack = json.loads(pack_path.read_text(encoding="utf-8", errors="replace"))
-        except (json.JSONDecodeError, OSError):
-            pack = {}
-        for key, label in (("prior_similar_runs", "Prior similar runs"),
-                           ("known_failure_modes", "Known failure modes"),
-                           ("verified_emergent_patterns", "Verified patterns"),
-                           ("similar_lessons", "Similar lessons"),
-                           ("constraints", "Constraints")):
-            value = pack.get(key)
-            if not isinstance(value, list) or not value:
-                continue
-            first = next((v for v in value if isinstance(v, dict)), None)
-            cite = str((first or {}).get("cite") or "")
-            out.append(S.item(f"{label} · {len(value)}",
-                              cite or "from the context pack", m="✦", mc="purple"))
+    # Sources list — one row per source in the .json record, or a single
+    # "Nothing injected" / "Not recorded" / "No learning is injected" row
+    # when there is no record.
+    md_block = _learning_md_block(run.run_dir, node.id)
+    record = _learned_record(run.run_dir, node.id)
+    if record is not None:
+        out.extend(_learning_sources_items(record))
+    elif node.type in _LEARNED_NODE_TYPES:
+        out.append(S.item("Not recorded",
+                         "this run predates per-node learning records"))
+    else:
+        out.append(S.item("No learning is injected into this node type",
+                         str(node.type or "shell")))
 
-    # 2. Steering rows for this node's role (read directly so we don't
-    # consume rows the dispatcher still needs — same discipline as
-    # ``_fetch_steer_rows``). r3 fix #5: filter on the mapped role.
-    role = _role_for_node(node)
-    steer_rows = _fetch_steer_rows(run.id, run.home, role=role)
-    for r in steer_rows[:5]:
+    # Pending steering — same role-scoped read as before, retitled so it
+    # can't be confused with steering that the .json record injected above.
+    try:
+        steer_rows = _fetch_steer_rows(run.id, run.home,
+                                       role=_role_for_node(node)) or []
+    except Exception:  # noqa: BLE001
+        steer_rows = []
+    for r in steer_rows[:_PENDING_STEER_LIMIT]:
         sev = str(r.get("severity") or "info")
         msg = str(r.get("message") or "")
         if not msg:
             continue
-        out.append(S.item(f"Steering · [{sev}]", msg, m="→", mc="blue"))
+        out.append(S.item(f"Pending steering · [{sev}]", msg, m="→", mc="blue"))
 
-    # 3. Gradients produced in the run's window (same rule as
-    # ``run._learnings_tab``). r3 fix #6: ``gradient_records.created_at``
-    # is epoch SECONDS — the previous ``* 1000`` + ``+ 60_000`` ms window
-    # silently excluded every row. Match the run.py predicate one-for-one.
-    if run.row.get("id"):
-        try:
-            from mini_ork.web.deps import db_for
+    # Learned from this node — run-scoped gradients joined on the trace id.
+    learned = _learning_learned_from(run, node)
+    if learned:
+        out.extend(learned)
+    elif node.state in ("done", "failed"):
+        out.append(S.item(
+            "Nothing learned from this node yet",
+            "reflection writes gradients after the run's last node",
+        ))
 
-            home = run.home
-            db = db_for(home)
-            if db.has_table("gradient_records"):
-                start_s = int(node.start or 0)
-                end_s = (int(node.end) if node.end is not None
-                         else int(time.time()))
-                task_class = str(run.row.get("task_class") or "")
-                where = ["created_at BETWEEN ? AND ?",
-                         "(task_class = ? OR ? = '')"]
-                params: list[Any] = [start_s, end_s + 60, task_class, task_class]
-                for g in db.rows(
-                    "SELECT gradient_id, target, signal, suggested_change, confidence "
-                    "FROM gradient_records WHERE " + " AND ".join(where) +
-                    " ORDER BY created_at DESC LIMIT 5",
-                    tuple(params),
-                ):
-                    out.append(S.item(
-                        f"{g.get('gradient_id')} → {g.get('target') or ''}",
-                        str(g.get('signal') or ''),
-                        acts=[S.btn("Open", S.open_path(str(run.home / "runs" / run.id)), "ghost")],
-                    ))
-        except Exception:  # noqa: BLE001
-            pass
-
-    if node.gates:
-        out.append(S.item("Gates", ", ".join(node.gates)))
     if not out:
         out.append(S.item("No learning signals yet.", ""))
-    return {"list_title": "Learning", "list": out}
+
+    result: dict[str, Any] = {"list_title": "Learning", "list": out}
+    if md_block is not None:
+        result["markdown"] = md_block
+    return result
 
 
 # ── public builder ──────────────────────────────────────────────────────────

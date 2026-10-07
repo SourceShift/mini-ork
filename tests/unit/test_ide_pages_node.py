@@ -58,18 +58,23 @@ def home(tmp_path: Path) -> Path:
     return h
 
 
-def _seed(home: Path, *, status: str = "executing") -> Path:
-    """One run with one agent-node session transcript + one shell-node log."""
-    run_dir = home / "runs" / RUN
-    run_dir.mkdir(parents=True)
+def _seed(home: Path, *, status: str = "executing", run_id: str = RUN) -> Path:
+    """One run with one agent-node session transcript + one shell-node log.
+
+    ``run_id`` defaults to :data:`RUN`; tests that need overlapping runs in
+    the same ``state.db`` pass their own ids. ``event_id`` includes the run
+    id so two seeded runs don't collide on the ``run_events`` primary key.
+    """
+    run_dir = home / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
     kickoff = home / "kickoffs" / "demo.md"
-    kickoff.parent.mkdir(parents=True)
+    kickoff.parent.mkdir(parents=True, exist_ok=True)
     kickoff.write_text("# Make the demo pass\n\nDetails.\n")
     con = sqlite3.connect(home / "state.db")
     con.execute(
         "INSERT INTO task_runs (id, recipe, status, cost_usd, created_at, updated_at, ended_at, "
         "task_class, kickoff_path, workflow_version, trace_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (RUN, "demo-recipe", status, 0.31, T0, T0 + 120, T0 + 100, "demo", str(kickoff), "latest", "tr-demo-1"))
+        (run_id, "demo-recipe", status, 0.31, T0, T0 + 120, T0 + 100, "demo", str(kickoff), "latest", "tr-demo-1"))
 
     events = [("node_start", "implementer", "implementer", "worker", T0 + 10, None),
               ("node_end", "implementer", "implementer", "worker", T0 + 60, "done"),
@@ -79,10 +84,10 @@ def _seed(home: Path, *, status: str = "executing") -> Path:
         if fin:
             payload["finish_reason"] = fin
         con.execute("INSERT INTO run_events (event_id, run_id, event_type, payload_json, created_at) "
-                    "VALUES (?,?,?,?,?)", (f"ev-{i}", RUN, kind, json.dumps(payload), ts))
+                    "VALUES (?,?,?,?,?)", (f"ev-{run_id}-{i}", run_id, kind, json.dumps(payload), ts))
     con.execute("INSERT INTO llm_calls (provider, model_id, tier, feature_name, actor, run_id, "
                 "cost_usd, status, ts) VALUES (?,?,?,?,?,?,?,?,?)",
-                ("gateway", "minimax", "default", "mini-ork:worker", "worker", RUN, 0.07, "success",
+                ("gateway", "minimax", "default", "mini-ork:worker", "worker", run_id, 0.07, "success",
                  _iso(T0 + 50)))
     con.commit()
     con.close()
@@ -167,7 +172,7 @@ def _seed(home: Path, *, status: str = "executing") -> Path:
     con.execute(
         "INSERT INTO operator_steering (run_id, role_target, severity, message, source, "
         "confidence, created_at, expires_at) VALUES (?,?,?,?,?,?,?,?)",
-        (RUN, AGENT_NODE, "info", "be careful with the Edit tool", "ide",
+        (run_id, AGENT_NODE, "info", "be careful with the Edit tool", "ide",
          0.8, steer_ms, expires_ms))
     con.commit()
     con.close()
@@ -672,30 +677,253 @@ def test_fetch_steer_rows_uses_mapped_role(home: Path) -> None:
     assert "for reviewer" not in msgs
 
 
-def test_learning_view_gradient_window_uses_seconds(home: Path) -> None:
-    """r3 fix #6: gradient_records.created_at is epoch SECONDS.
+# ── kickoff `learn-node-tab` — run-scoped Learning view ──────────────────────
 
-    node.start=T0+10, node.end=T0+60 → window [T0+10, T0+120]. A row at
-    T0+30 (in window) is returned; rows outside are not.
+RUN_A = "run-1791000000-aaaa"
+RUN_B = "run-1791000000-bbbb"
+HASH_A = "aa" * 8
+HASH_B = "bb" * 8
+TRACE_IMPL_A = f"tr-implementer-implementer-{HASH_A}"
+TRACE_IMPL_B = f"tr-implementer-implementer-{HASH_B}"
+TRACE_LENS_A = f"tr-researcher-prior_art_lens-{HASH_A}"
+
+
+def _seed_run_traces(home: Path, run_id: str, trace_id: str, gradient_id: str,
+                      signal: str, fix: str = "use the right scope") -> None:
+    """Append the JOIN pair the new run-scoped view reads.
+
+    Both rows use the run's string id for ``execution_traces.run_id`` — the
+    column is INTEGER-typed in the DDL, but SQLite's manifest typing stores
+    the string verbatim and the equality compare in the new SQL binds the
+    same string, so the JOIN returns the row.
     """
-    _seed(home)
     con = sqlite3.connect(home / "state.db")
-    for gid, sig, at in (("gr-inside", "in-window", T0 + 30),
-                          ("gr-before", "before-window", T0 - 100),
-                          ("gr-after", "after-window", T0 + 500)):
-        con.execute(
-            "INSERT INTO gradient_records (gradient_id, target, signal, "
-            "task_class, confidence, created_at, suggested_change, evidence) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (gid, "demo", sig, "demo", 0.9, at, "", "test-fixture"))
+    con.execute(
+        "INSERT INTO execution_traces (trace_id, run_id, task_class, status) "
+        "VALUES (?,?,?,?)",
+        (trace_id, run_id, "demo", "success"),
+    )
+    con.execute(
+        "INSERT INTO gradient_records (gradient_id, target, signal, task_class, "
+        "confidence, created_at, suggested_change, evidence) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (gradient_id, "demo", signal, "demo", 0.9, T0 + 30, fix, trace_id),
+    )
     con.commit()
     con.close()
 
+
+def test_learning_view_gradient_filter_uses_run_scope(home: Path) -> None:
+    """Run-scoped JOIN — gradients from run B must NOT leak into run A.
+
+    Replaces the r3 ``test_learning_view_gradient_window_uses_seconds``
+    whose time-window predicate leaked gradients across concurrent runs
+    of the same task class (kickoff ``learn-node-tab`` §3 fix).
+    """
+    _seed(home, run_id=RUN_A)
+    _seed(home, run_id=RUN_B)
+    _seed_run_traces(home, RUN_A, TRACE_IMPL_A, "gr-A", "signal-from-run-A")
+    _seed_run_traces(home, RUN_B, TRACE_IMPL_B, "gr-B", "signal-from-run-B")
+
+    out_a = build_node(home, RUN_A, AGENT_NODE, view="learning")
+    titles_a = [str(i.get("t", "")) for i in out_a["list"]]
+    assert "signal-from-run-A" in titles_a
+    assert "signal-from-run-B" not in titles_a
+
+    out_b = build_node(home, RUN_B, AGENT_NODE, view="learning")
+    titles_b = [str(i.get("t", "")) for i in out_b["list"]]
+    assert "signal-from-run-B" in titles_b
+    assert "signal-from-run-A" not in titles_b
+
+
+def test_learning_view_gradient_filter_respects_node_prefix(home: Path) -> None:
+    """Node-id prefix filter — a researcher-trace gradient must NOT appear
+    on the implementer node.
+
+    The prefix ``f"tr-{node.type}-{node.id}-"`` is matched in Python because
+    node ids contain ``_`` (a SQL ``LIKE`` wildcard). The test overrides the
+    fixture's workflow to add the ``prior_art_lens`` researcher node.
+    """
+    workflow_path = home / "recipes" / "demo-recipe" / "workflow.yaml"
+    workflow_path.write_text(
+        "version: 1\ntask_class: demo\nnodes:\n"
+        "  - {name: planner, type: planner, model_lane: planner, prompt_ref: prompts/planner.md}\n"
+        "  - {name: implementer, type: implementer, model_lane: worker, prompt_ref: prompts/implementer.md}\n"
+        "  - {name: prior_art_lens, type: researcher, model_lane: codex_lens, prompt_ref: prompts/prior-art-lens.md}\n"
+    )
+    _seed(home)  # implementer + verifier_node events
+    # Add a prior_art_lens node_end so the run is not "executing".
+    con = sqlite3.connect(home / "state.db")
+    con.execute(
+        "INSERT INTO run_events (event_id, run_id, event_type, payload_json, created_at) "
+        "VALUES (?,?,?,?,?)",
+        (f"ev-{RUN}-lens-end", RUN, "node_end",
+         json.dumps({"node_id": "prior_art_lens", "node_type": "researcher",
+                     "model_lane": "codex_lens", "finish_reason": "done"}),
+         T0 + 50),
+    )
+    con.commit()
+    con.close()
+    _seed_run_traces(home, RUN, TRACE_IMPL_A, "gr-impl-A", "impl-signal-A")
+    # A gradient whose trace belongs to the prior_art_lens researcher — it
+    # must NOT appear on the implementer node and MUST appear on the lens.
+    _seed_run_traces(home, RUN, TRACE_LENS_A, "gr-lens-A", "lens-signal-A")
+
+    out_impl = build_node(home, RUN, AGENT_NODE, view="learning")
+    titles_impl = [str(i.get("t", "")) for i in out_impl["list"]]
+    assert "impl-signal-A" in titles_impl
+    assert "lens-signal-A" not in titles_impl
+
+    out_lens = build_node(home, RUN, "prior_art_lens", view="learning")
+    titles_lens = [str(i.get("t", "")) for i in out_lens["list"]]
+    assert "lens-signal-A" in titles_lens
+    assert "impl-signal-A" not in titles_lens
+
+
+def test_learning_view_markdown_block_from_run(home: Path) -> None:
+    """``learned/<id>.md`` populates the optional top-level ``markdown`` key."""
+    _seed(home)
+    learned = home / "runs" / RUN / "learned"
+    learned.mkdir(parents=True, exist_ok=True)
+    (learned / f"{AGENT_NODE}.md").write_text("injected text body")
+
     out = build_node(home, RUN, AGENT_NODE, view="learning")
-    items_str = " ".join(str(item) for item in out["list"])
-    assert "gr-inside" in items_str
-    assert "gr-before" not in items_str
-    assert "gr-after" not in items_str
+    assert "markdown" in out
+    assert out["markdown"]["text"] == "injected text body"
+    assert out["markdown"]["title"] == "Injected into this node's prompt"
+    assert out["markdown"]["path"].endswith(f"learned/{AGENT_NODE}.md")
+
+
+def test_learning_view_markdown_key_absent_without_injection(home: Path) -> None:
+    """No ``learned/<id>.md`` → ``markdown`` key absent (Zed renders nothing)."""
+    _seed(home)
+    out = build_node(home, RUN, AGENT_NODE, view="learning")
+    assert "markdown" not in out
+
+
+def test_learning_view_sources_render_in_order(home: Path) -> None:
+    """Three-source ``.json`` → list rows in gradient / pattern / steering order."""
+    _seed(home)
+    learned = home / "runs" / RUN / "learned"
+    learned.mkdir(parents=True, exist_ok=True)
+    record = {
+        "node_id": AGENT_NODE, "node_type": "implementer", "lane": "codex_lens",
+        "task_class": "demo", "attempt": 1,
+        "written_at": "2026-10-07T12:00:00.000Z",
+        "injected": True, "reason": "",
+        "sources": [
+            {"kind": "gradient", "id": "gr1", "target": "demo",
+             "signal": "grad-signal-text", "suggested_change": "grad-fix-text"},
+            {"kind": "pattern", "id": "ptn1", "text": "pattern-text"},
+            {"kind": "steering", "id": "st1", "severity": "info",
+             "source": "ide", "message": "steer-msg-text"},
+        ],
+    }
+    (learned / f"{AGENT_NODE}.json").write_text(json.dumps(record))
+
+    out = build_node(home, RUN, AGENT_NODE, view="learning")
+    head = out["list"][:3]
+    assert "grad-signal-text" in head[0]["t"]
+    assert head[0]["mc"] == "purple"
+    assert "pattern-text" in head[1]["t"]
+    assert head[1]["mc"] == "purple"
+    assert head[2]["t"] == "steer-msg-text"
+    assert head[2]["mc"] == "blue"
+
+
+def test_learning_view_nothing_injected_reason(home: Path) -> None:
+    """``injected: false`` → single 'Nothing injected' item with the kickoff's
+    verbatim sub for ``nothing matched`` (and for ``opt-out``).
+    """
+    _seed(home)
+    learned = home / "runs" / RUN / "learned"
+    learned.mkdir(parents=True, exist_ok=True)
+
+    def _nothing(reason: str, sub_expected: str) -> None:
+        (learned / f"{AGENT_NODE}.json").write_text(json.dumps({
+            "node_id": AGENT_NODE, "node_type": "implementer", "lane": "codex_lens",
+            "task_class": "demo", "attempt": 1,
+            "written_at": "2026-10-07T12:00:00.000Z",
+            "injected": False, "reason": reason, "sources": [],
+        }))
+        out = build_node(home, RUN, AGENT_NODE, view="learning")
+        rows = [i for i in out["list"] if i.get("t") == "Nothing injected"]
+        assert len(rows) == 1, rows
+        assert rows[0]["sub"] == sub_expected
+
+    _nothing("nothing matched",
+             "no learned failure modes or lessons matched this task class")
+    _nothing("opt-out", "MO_INJECT_LEARNINGS=0 for this run")
+
+
+def test_learning_view_no_record_implementer(home: Path) -> None:
+    """No ``learned/`` dir, implementer node → 'Not recorded' fallback."""
+    _seed(home)
+    # No learned/ directory created.
+    out = build_node(home, RUN, AGENT_NODE, view="learning")
+    rows = [i for i in out["list"] if i.get("t") == "Not recorded"]
+    assert len(rows) == 1
+    assert rows[0]["sub"] == "this run predates per-node learning records"
+
+
+def test_learning_view_no_record_shell_node(home: Path) -> None:
+    """No ``learned/`` dir, non-injected node type → 'No learning is injected'
+    fallback with ``node.type or 'shell'`` as the sub.
+    """
+    _seed(home)
+    out = build_node(home, RUN, SHELL_NODE, view="learning")
+    rows = [i for i in out["list"]
+            if i.get("t") == "No learning is injected into this node type"]
+    assert len(rows) == 1
+    assert rows[0]["sub"] == "verifier"
+
+
+def test_learning_view_no_gates_row_and_no_context_pack(home: Path) -> None:
+    """The Gates row + every context-pack-derived row are GONE.
+
+    Seeds ``context-pack.json`` with one prior_similar_runs row (whose
+    ``cite`` carries the storage-key shape the old view emitted) and gives
+    the implementer node real gates — neither should appear in the list.
+    """
+    _seed(home)
+    run_dir = home / "runs" / RUN
+    (run_dir / "context-pack.json").write_text(json.dumps({
+        "prior_similar_runs": [{"cite":
+                               "gradient_records/cross_class:workflow.node.implementer"}],
+    }))
+
+    out = build_node(home, RUN, AGENT_NODE, view="learning")
+    items = out["list"]
+    titles = [str(i.get("t", "")) for i in items]
+    subs = [str(i.get("sub", "")) for i in items]
+    full = "\n".join(titles + subs)
+    assert "Gates" not in full, full
+    assert "Prior similar runs" not in full, full
+    assert "gradient_records/cross_class:" not in full, full
+
+
+def test_learning_view_pending_steering_title(home: Path) -> None:
+    """Steering rows are retitled 'Pending steering · [sev]' — never the
+    old 'Steering · [sev]' prefix.
+    """
+    _seed(home)
+    out = build_node(home, RUN, AGENT_NODE, view="learning")
+    titles = [str(i.get("t", "")) for i in out["list"]]
+    assert any("Pending steering · [info]" in t for t in titles), titles
+    assert not any(t.startswith("Steering · [") for t in titles), titles
+
+
+def test_learning_view_learned_fallback_when_node_finished(home: Path) -> None:
+    """A finished implementer node with no gradients shows the
+    'Nothing learned from this node yet' row (kickoff §5 last bullet).
+    """
+    _seed(home)  # implementer finishes at T0+60 → state='done'
+    out = build_node(home, RUN, AGENT_NODE, view="learning")
+    titles = [str(i.get("t", "")) for i in out["list"]]
+    subs = [str(i.get("sub", "")) for i in out["list"]]
+    assert any("Nothing learned from this node yet" in t for t in titles)
+    assert any("reflection writes gradients after the run's last node" in s
+               for s in subs)
 
 
 # ── r4 fixes — fail-before / pass-after evidence (kickoff ide-node-stream-r4) ──
