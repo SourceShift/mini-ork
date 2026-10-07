@@ -57,6 +57,28 @@ _BULLET_RE = re.compile(r"^\s*(?:[-*]|\d+\.)\s+")
 
 _PASS_VERDICTS = {"approve", "approved", "pass", "passed", "ok", "okay"}
 
+# A reviewer note that *reports a check* rather than naming a problem: "PASS: …",
+# "ruff clean", "66 passed", "already applied", "verifier artifact", … Reviews
+# write these often enough that the file-name-matching rule below harvested them
+# as findings (kickoff #5, live 2026-10-07). Module-level because
+# ``prune_receipts`` reuses the exact same rule on rows already in the table.
+RECEIPT_RE = re.compile(
+    r"^\W*(?:pass|ok|verified|checked|fixed|accepted|not a defect|scope ok|resolved|confirmed)\b"
+    r"|\b\d+ passed\b"
+    r"|ruff (?:clean|check)"
+    r"|false (?:negative|positive)"
+    r"|verifier artifact"
+    r"|reverse[- ]?apply"
+    r"|already (?:applied|exists)",
+    re.IGNORECASE,
+)
+
+
+def _is_receipt(text) -> bool:
+    """True when a note/reason reads as a *report of a check* — "PASS:", "ruff
+    clean", "66 passed", "already applied" — not a problem to fix."""
+    return bool(RECEIPT_RE.search(str(text or "")))
+
 
 # ── categorization ────────────────────────────────────────────────────────────
 # Deterministic keyword map, first match wins. Labels are the kickoff's
@@ -335,23 +357,50 @@ def _prose_to_findings(text, verdict):
     findings: one per bullet that names a file, or one for the whole text when
     there are no bullets. Items naming no file are kept with ``file=None`` only
     when the verdict is not a pass (they explain a rejection).
+
+    Receipts are not findings (kickoff #5): under a PASS verdict *every* string
+    note is a check report — a passing review's prose says what it verified, not
+    what is wrong — so nothing is harvested; otherwise a note matching
+    ``RECEIPT_RE`` ("PASS: …", "ruff clean", "66 passed", "already applied") is
+    skipped before it can become a finding. Structured ``findings[]`` dicts do
+    not pass through here and are always kept.
     """
     findings = []
     items = _split_bullets(text)
     if not items:
         items = [text.strip()] if (text or "").strip() else []
+    passed = _is_pass(verdict)
     for item in items:
         item = (item or "").strip()
         if not item:
+            continue
+        if passed or _is_receipt(item):
             continue
         m = _PATH_RE.search(item)
         if m:
             findings.append(
                 _make_finding(m.group("path"), m.group("line"), item, None, verdict, None)
             )
-        elif not _is_pass(verdict):
+        else:
             findings.append(_make_finding(None, None, item, None, verdict, None))
     return findings
+
+
+# The keys a machine-written finding / dict-note may carry its problem text
+# under. ``issue`` is canonical, but a structured ``findings[]`` entry that
+# carried only ``problem``/``description``/``message``/``text`` used to parse to
+# an empty issue and land as the ``(no issue)`` placeholder (reviewer, round 2);
+# the same fallback ``_dict_note_findings`` already used closes that hole.
+_ISSUE_KEYS = ("issue", "problem", "description", "message", "text", "note", "detail")
+
+
+def _issue_of(item):
+    """The first non-empty problem text of a dict finding, or ``None``."""
+    for key in _ISSUE_KEYS:
+        value = item.get(key)
+        if _as_text(value):
+            return value
+    return None
 
 
 def _dict_note_findings(item, verdict):
@@ -363,8 +412,7 @@ def _dict_note_findings(item, verdict):
     an approved review never mints a ``(no issue)`` row.
     """
     file = _scalar_text(item.get("file"))
-    issue = (item.get("issue") or item.get("text") or item.get("note")
-             or item.get("message") or item.get("detail"))
+    issue = _issue_of(item)
     if file is None and not _as_text(issue) and item.get("snippet") is None:
         return []
     if file is None and _is_pass(verdict):
@@ -405,7 +453,7 @@ def parse_review(text) -> list[dict]:
                         _make_finding(
                             item.get("file"),
                             item.get("line"),
-                            item.get("issue"),
+                            _issue_of(item),
                             item.get("severity"),
                             item.get("verdict") if item.get("verdict") is not None else verdict,
                             item.get("snippet"),
@@ -974,6 +1022,47 @@ def harvest(home, *, run_ids=None, db=None) -> dict:
     return stats
 
 
+# ── prune ─────────────────────────────────────────────────────────────────────
+
+
+def prune_receipts(db=None) -> int:
+    """Delete ``code_findings`` rows whose ``issue`` reads as a receipt (§5).
+
+    The receipt rule stops *new* receipts at the parser, but rows already in the
+    table (harvested before the rule, INSERT OR IGNORE by fingerprint since)
+    linger — pruning is the only way to drop them, which is why the live proof
+    runs prune before rendering. Idempotent: a second call returns 0. Cold-safe
+    like the rest of the write path — a missing DB is a silent no-op, no error.
+    Returns the number of rows deleted.
+    """
+    con = _open(db)
+    if con is None:
+        return 0
+    try:
+        try:
+            rows = con.execute("SELECT id, issue FROM code_findings").fetchall()
+        except sqlite3.Error as e:
+            print(f"  [warn] code_findings: prune failed: {e}", file=sys.stderr)
+            return 0
+        ids = [r[0] for r in rows if _is_receipt(r[1])]
+        if ids:
+            con.executemany("DELETE FROM code_findings WHERE id = ?", [(i,) for i in ids])
+            con.commit()
+        return len(ids)
+    except sqlite3.Error as e:
+        print(f"  [warn] code_findings: prune failed: {e}", file=sys.stderr)
+        try:
+            con.rollback()
+        except sqlite3.Error:
+            pass
+        return 0
+    finally:
+        try:
+            con.close()
+        except sqlite3.Error:
+            pass
+
+
 # ── read-only queries ─────────────────────────────────────────────────────────
 
 
@@ -1028,6 +1117,12 @@ def _aggregate_areas(rows, depth, limit) -> list[dict]:
         out.append(
             {
                 "area": area,
+                # The group's identity, before the dominant-file relabel below:
+                # a disjoint partition of the findings by ``_dir_prefix`` key.
+                # The page carries it so a row and the detail it opens are the
+                # same set of findings (reviewer, round 2) instead of re-deriving
+                # a recursive file-or-subtree set from the display label.
+                "key": key,
                 "n_findings": total,
                 "n_runs": len(g["runs"]),
                 "worst_severity": worst,
@@ -1189,6 +1284,8 @@ def _print_human(cmd, result) -> None:
             cats = ", ".join(f"{c}x{n}" for c, n in r["top_categories"])
             print(f"{r['area']}  n={r['n_findings']} runs={r['n_runs']} "
                   f"worst={r['worst_severity']} [{cats}]")
+    elif cmd == "prune":
+        print(f"pruned {result} receipt row(s)")
     else:  # show
         for r in result:
             loc = r["file"] or ""
@@ -1220,6 +1317,8 @@ def main(argv=None) -> int:
     p_show = sub.add_parser("show", parents=[common],
                             help="list findings for a path prefix")
     p_show.add_argument("path", help="file path prefix")
+    sub.add_parser("prune", parents=[common],
+                   help="delete harvested receipt notes (check reports, not problems)")
 
     args = ap.parse_args(argv)
     home = args.home or os.environ.get("MINI_ORK_HOME") or _DEFAULT_HOME
@@ -1228,6 +1327,8 @@ def main(argv=None) -> int:
         result = harvest(home, db=args.db)
     elif args.cmd == "areas":
         result = areas(db=args.db, since_days=args.days)
+    elif args.cmd == "prune":
+        result = prune_receipts(db=args.db)
     else:  # show
         result = findings_for(args.path, db=args.db)
 

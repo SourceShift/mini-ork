@@ -77,6 +77,9 @@ def test_parse_review_plain_json_findings() -> None:
 
 
 def test_parse_review_fenced_json_with_prose() -> None:
+    # The ```json fence is found even with prose around it. Under APPROVE every
+    # string note is a receipt (§5): a passing review's prose reports what it
+    # checked, not problems — so nothing is harvested from it.
     text = (
         "Here is the review.\n```json\n"
         + json.dumps({
@@ -85,15 +88,22 @@ def test_parse_review_fenced_json_with_prose() -> None:
         })
         + "\n```\nthanks"
     )
-    findings = code_findings.parse_review(text)
-    paths = [f["file"] for f in findings]
-    assert "mini_ork/acp/agent.py" in paths
+    assert code_findings.parse_review(text) == []
+
+    # A non-pass review keeps the file-bearing note, with its line (the fence
+    # is still what makes the JSON parse at all).
+    nonpass = (
+        "Here is the review.\n```json\n"
+        + json.dumps({
+            "verdict": "needs_revision",
+            "notes": ["mini_ork/acp/agent.py:1529 stale docstring"],
+        })
+        + "\n```\nthanks"
+    )
+    findings = code_findings.parse_review(nonpass)
     f = next(f for f in findings if f["file"] == "mini_ork/acp/agent.py")
     assert f["line"] == 1529
-    # APPROVE is a pass → the file-bearing note defaults to low severity.
-    assert f["severity"] == "low"
-    # The "all good" note names no file and the verdict is a pass → dropped.
-    assert all(f["file"] is not None for f in findings)
+    assert f["severity"] == "medium"
 
 
 def test_parse_review_prose_bullets() -> None:
@@ -173,6 +183,28 @@ def test_parse_review_dict_notes_under_pass_dropped() -> None:
     assert any(f["file"] is None and "scope creep" in f["issue"] for f in f2)
 
 
+def test_parse_review_structured_findings_issue_fallback() -> None:
+    # Reviewer notes[2]: a structured findings[] dict that carries its problem
+    # under ``problem``/``description``/``message``/``text`` instead of ``issue``
+    # used to parse to an empty issue and land as the "(no issue)" placeholder.
+    text = json.dumps({
+        "verdict": "needs_revision",
+        "findings": [
+            {"file": "mini_ork/a.py", "problem": "drops the guard", "severity": "high"},
+            {"file": "mini_ork/b.py", "description": "stale docstring"},
+            {"file": "mini_ork/c.py", "message": "off by one"},
+            {"file": "mini_ork/d.py", "text": "quadratic loop"},
+        ],
+    })
+    findings = code_findings.parse_review(text)
+    issues = {f["file"]: f["issue"] for f in findings}
+    assert issues["mini_ork/a.py"] == "drops the guard"
+    assert issues["mini_ork/b.py"] == "stale docstring"
+    assert issues["mini_ork/c.py"] == "off by one"
+    assert issues["mini_ork/d.py"] == "quadratic loop"
+    assert all(f["issue"] != "(no issue)" for f in findings)
+
+
 def test_parse_review_coerces_malformed_field_types() -> None:
     # A machine-written review can carry the wrong types (issue as a list,
     # verdict as a dict). Parsing must not raise and every field must land as a
@@ -191,6 +223,68 @@ def test_parse_review_coerces_malformed_field_types() -> None:
         assert f["file"] is None or isinstance(f["file"], str)
         assert f["verdict"] is None or isinstance(f["verdict"], str)
         assert f["line"] is None or isinstance(f["line"], int)
+
+
+def test_parse_review_skips_receipt_notes() -> None:
+    # §5: a note that *reports a check* rather than naming a problem is skipped
+    # even when it names a file. The receipt strings are the live ones from real
+    # reviews; the last two are real problems from those same reviews (kept).
+    text = json.dumps({
+        "verdict": "needs_revision",
+        "notes": [
+            "Checked fine: kickoff gate 66 passed; ruff clean",
+            "static-check diff-apply-check-clean FAIL is a verifier artifact",
+            "OK: --reason is required by memory_lifecycle.py:39",
+            "PASS: mini_ork/acp/agent.py:12 checks out",
+            "VERIFIED: tests/unit/test_x.py:3",
+            "FIXED BLOCKER: mini_ork/ide_pages/node.py:2440",
+            "NOT A DEFECT: mini_ork/learning/code_findings.py:100",
+            "Scope OK: mini_ork/cli/reflect.py:475",
+            "diff already applied to tests/unit/test_y.py:2",
+            "BLOCKER mini_ork/ide_pages/node.py:2440: summary reads the 50-capped list",
+            "mini_ork/learning/code_findings.py:333 receipts harvested as findings",
+        ],
+    })
+    findings = code_findings.parse_review(text)
+    issues = [f["issue"] for f in findings]
+    assert len(findings) == 2, issues
+    assert any("summary reads the 50-capped list" in i for i in issues)
+    assert any("receipts harvested as findings" in i for i in issues)
+
+
+def test_receipt_re_matches_the_live_strings() -> None:
+    for receipt in (
+        "Checked fine: kickoff gate 66 passed; ruff clean",
+        "static-check diff-apply-check-clean FAIL is a verifier artifact",
+        "OK: --reason is required by memory_lifecycle.py:39",
+        "PASS: everything ok",
+        "VERIFIED: mini_ork/x.py:3",
+        "FIXED BLOCKER: node.py:1",
+        "NOT A DEFECT: tests/unit/y.py:2",
+        "Scope OK: src/z.py:9",
+        "resolved: mini_ork/x.py",
+        "already exists in working directory",
+        "reverse-apply check clean",
+    ):
+        assert code_findings._is_receipt(receipt), receipt
+    # A real problem is not a receipt, even when it names a file.
+    assert not code_findings._is_receipt(
+        "BLOCKER mini_ork/ide_pages/node.py:2440: pill uses the offset slice"
+    )
+
+
+def test_parse_review_pass_verdict_drops_all_string_notes() -> None:
+    # §5: under a pass verdict EVERY string note is a receipt — a passing
+    # review's prose only says what it checked. Structured findings[] dicts are
+    # always kept, pass or not.
+    text = json.dumps({
+        "verdict": "APPROVE",
+        "notes": ["mini_ork/acp/agent.py:1529 fixed", "ruff clean", "all good"],
+        "findings": [{"file": "mini_ork/z.py", "line": 4,
+                      "issue": "drops the guard", "severity": "high"}],
+    })
+    findings = code_findings.parse_review(text)
+    assert [f["file"] for f in findings] == ["mini_ork/z.py"]
 
 
 # ── parse_verifier ─────────────────────────────────────────────────────────────
@@ -751,3 +845,54 @@ def test_areas_leave_out_run_artifacts(tmp_path: Path, monkeypatch) -> None:
     assert names and all("verifier_test.json" not in n for n in names)
     every = {a["area"] for a in code_findings.areas(db=str(db), repo_root=str(repo), repo_only=False)}
     assert any("verifier_test.json" in n for n in every)
+
+
+# ── prune_receipts (§5) ─────────────────────────────────────────────────────
+
+
+def test_prune_receipts_deletes_only_receipts(tmp_path: Path) -> None:
+    db = _bare_db(tmp_path / "cf.db")
+    code_findings.ensure_schema(str(db))
+    now = int(time.time())
+    _insert_finding(db, file="mini_ork/a.py", severity="high", category="other",
+                    run_id="r1", ts=now, issue="query drops pending rows")
+    _insert_finding(db, file="mini_ork/b.py", severity="low", category="other",
+                    run_id="r1", ts=now, issue="PASS: mini_ork/b.py:3 verified")
+    _insert_finding(db, file="mini_ork/c.py", severity="low", category="other",
+                    run_id="r1", ts=now, issue="ruff clean, 66 passed")
+
+    assert code_findings.prune_receipts(db=str(db)) == 2
+    # Idempotent: the receipts are gone, so a second pass removes nothing.
+    assert code_findings.prune_receipts(db=str(db)) == 0
+
+    con = sqlite3.connect(db)
+    try:
+        left = [r[0] for r in con.execute("SELECT issue FROM code_findings")]
+    finally:
+        con.close()
+    assert left == ["query drops pending rows"]
+
+
+def test_prune_receipts_is_cold_safe(tmp_path: Path) -> None:
+    # A missing DB is a silent no-op (never conjured), like the write path.
+    assert code_findings.prune_receipts(db=str(tmp_path / "absent.db")) == 0
+
+
+def test_cli_prune_subcommand(tmp_path: Path, capsys) -> None:
+    db = _bare_db(tmp_path / "cf.db")
+    code_findings.ensure_schema(str(db))
+    now = int(time.time())
+    _insert_finding(db, file="mini_ork/a.py", severity="high", category="other",
+                    run_id="r1", ts=now, issue="PASS: mini_ork/a.py:1 verified")
+    _insert_finding(db, file="mini_ork/b.py", severity="high", category="other",
+                    run_id="r1", ts=now, issue="the guard is missing")
+
+    rc = code_findings.main(["prune", "--db", str(db)])
+    assert rc == 0
+    assert "pruned 1 receipt row(s)" in capsys.readouterr().out
+
+    con = sqlite3.connect(db)
+    try:
+        assert con.execute("SELECT COUNT(*) FROM code_findings").fetchone()[0] == 1
+    finally:
+        con.close()

@@ -471,9 +471,15 @@ def main(argv: list[str] | None = None) -> int:
     # `get(name, "1") != "0"` opt-out form as its neighbours. harvest() calls
     # ensure_schema itself, so there is no schema step here, and the whole block
     # is fail-soft — a side-channel must never crash reflect.
+    #
+    # The import sits INSIDE the try, unlike the neighbouring side-channels that
+    # import above theirs (they fail-soft on the *call* only). This block pulls a
+    # heavier dependency chain (sqlite/glob/subprocess + the learning package),
+    # so an ImportError here must degrade to the `[code_findings] skipped:` line
+    # rather than crash reflect — do not "restore" it to match the neighbours.
     if os.environ.get("MO_CODE_FINDINGS", "1") != "0":
-        from mini_ork.learning import code_findings
         try:
+            from mini_ork.learning import code_findings
             cf_stats = code_findings.harvest(mini_ork_home, db=db_path)
         except Exception as exc:  # a side-channel must never crash reflect
             sys.stderr.write(f"  [code_findings] skipped: {exc}\n")

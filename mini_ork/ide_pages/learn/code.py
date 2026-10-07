@@ -38,7 +38,13 @@ from mini_ork.ide_pages.learn._common import short
 # is outside this change's file scope). Clustering here must agree with how
 # themes group gradients, so the helpers are reused, never re-implemented — the
 # blocking lint tier (F + E9) does not flag private-name imports.
-from mini_ork.learning.code_findings import areas, findings_for
+from mini_ork.learning.code_findings import (
+    _DEFAULT_DEPTH,
+    _dir_prefix,
+    _in_repo,
+    _run_title,
+    areas,
+)
 from mini_ork.learning.themes import (
     _df_to_idf,
     _dot,
@@ -64,7 +70,17 @@ _RECURRING_PER_AREA = 2   # representatives shown in an area row
 _REPR_MAX = 70        # area-row "recurring problems" cell cap
 _REPR_DETAIL = 160    # recurring-table problem cap
 _ISSUE_MAX = 120      # findings-table problem cap
-_AREA_FINDINGS = 50   # findings pulled per area
+_AREA_FINDINGS = 50   # rows in the area's Findings *table* (the summary and the
+                      # recurrence clusters read the full set — kickoff #1)
+# The grouping depth ``areas()`` uses. The page re-derives every group key with
+# the exact same ``_dir_prefix(file, depth)`` rule, so a table row and the detail
+# it opens are ONE set of findings, not two that happen to agree (reviewer,
+# round 2).
+_DEPTH = _DEFAULT_DEPTH
+# ``_make_finding`` stamps this on a finding that carried no issue text at all.
+# It is the absence of a problem, not a problem, so ``recurring()`` never
+# clusters it (reviewer, round 2: it was the top "recurring problem" live).
+_PLACEHOLDER_ISSUE = "(no issue)"
 
 # Severity ranking: lower is worse. Unknown severities sort last.
 _SEV_ORDER = {"blocker": 0, "critical": 0, "high": 1, "major": 1,
@@ -159,32 +175,72 @@ def _days_chips(args: dict[str, str]) -> dict[str, Any]:
 
 # ── section: areas table ───────────────────────────────────────────────────
 
+def _area_stats(fs: list[dict[str, Any]]) -> tuple[int, str]:
+    """``(distinct run count, worst severity)`` over one finding set.
+
+    The single derivation the areas-table row and the area detail both call, so
+    a row and the page it opens are computed from the same set and can never
+    disagree (reviewer, round 1). ``_SEV_ORDER`` is the same ranking the rest of
+    the page uses; an empty set has no runs and no worst severity above ``low``.
+    """
+    n_runs = len({f.get("run_id") for f in fs if f.get("run_id")})
+    sevs = [str(f.get("severity") or "low").lower() for f in fs]
+    worst = min(sevs, key=lambda s: _SEV_ORDER.get(s, 3)) if sevs else "low"
+    return n_runs, worst
+
+
 def _areas_table(home: Path, args: dict[str, str]) -> dict[str, Any]:
     db = _db_path(home)
-    rows = areas(db=db, since_days=_days(args))
+    days = _days(args)
+    rows = areas(db=db, since_days=days)
     if not rows:
         return S.lst(AREAS_TITLE,
                      [S.dot("No review findings yet. They appear after your runs are reviewed.")],
                      full=True)
     now = int(time.time())
     selected = str(args.get("area") or "")
-    out_rows = []
+    # ONE membership rule for both views (reviewer, round 2). ``areas()`` groups
+    # the window's findings by ``_dir_prefix(file, depth)`` — a *disjoint*
+    # partition — and each row now carries that group key. The row's numbers and
+    # its click target both come from the key, so a row and the page it opens are
+    # the same findings by construction, and no finding is counted twice. r1
+    # derived the row from the display label instead, so the ``mini_ork`` row
+    # (label, a shallow group) swept in the whole recursive subtree — a superset
+    # of ``mini_ork/cli``, ``mini_ork/learning`` … and the sibling findings that
+    # *belong* to a dominant-file group (``mini_ork/ide_pages``) fell out of every
+    # row. Records carry their own group key now.
+    all_fs = _window_findings(db, since_days=days)
+    prepared = []
     for a in rows:
+        key = str(a.get("key") or a["area"])
+        fs = _membership(all_fs, key)
+        n_runs, worst = _area_stats(fs)
+        prepared.append((key, str(a["area"]), fs, n_runs, worst))
+    # Same ordering rule as ``_aggregate_areas`` — worst first, then most findings
+    # — now over the derived numbers, so the visible order matches the visible
+    # counts rather than a group's hidden totals.
+    prepared.sort(key=lambda p: (_SEV_ORDER.get(p[4], 3), -len(p[2])))
+    out_rows = []
+    for key, label, fs, n_runs, worst in prepared:
         problems = " · ".join(
             short(c["representative"], _REPR_MAX)
-            for c in _recurring_for_area(home, a)[:_RECURRING_PER_AREA]
+            for c in recurring(fs)[:_RECURRING_PER_AREA]
         ) or "—"
         out_rows.append({
             "cells": [
-                S.mono(a["area"]),
-                S.cell(a["n_findings"]),
-                S.cell(a["n_runs"]),
-                S.cell(a["worst_severity"], _sev_colour(a["worst_severity"])),
+                # ``label`` is ``areas()``'s display name — the dominant file when
+                # one owns the group — shown as a CELL; the click target is the
+                # group key, so the row always opens its whole group and the
+                # siblings a dominant file would otherwise hide (reviewer, r2).
+                S.mono(label),
+                S.cell(len(fs)),
+                S.cell(n_runs),
+                S.cell(worst, _sev_colour(worst)),
                 S.cell(problems, "sub"),
-                S.cell(S.age(a["last_ts"], now), "sub"),
+                S.cell(S.age(max((int(f.get("ts") or 0) for f in fs), default=0), now), "sub"),
             ],
-            "do": S.set_args(area=a["area"]),
-            "sel": selected == a["area"],
+            "do": S.set_args(area=key),
+            "sel": selected == key,
         })
     return S.table(
         AREAS_TITLE,
@@ -196,73 +252,142 @@ def _areas_table(home: Path, args: dict[str, str]) -> dict[str, Any]:
               "each finding and turn a recurring problem into a rule."))
 
 
-def _findings_for_area(db: str, area: str) -> list[dict[str, Any]]:
-    """Findings belonging to *exactly* ``area`` — never a sibling that shares
-    its name prefix.
+def _select_findings(conn, where: str, params: list, cutoff: int,
+                     join: bool) -> list[dict[str, Any]]:
+    """One SELECT over ``code_findings`` with the ``file`` predicate and the
+    ``ts`` cutoff pushed into SQL, ahead of any limit.
 
-    ``findings_for`` matches a path *prefix* (``file LIKE area || '%'``), which
-    is both too wide and ambiguous:
+    Mirrors ``findings_for``'s row shape (LEFT JOIN ``task_runs`` so run
+    titles/status resolve, title falling back to the run id) but without that
+    helper's ``LIMIT`` — the limit belongs on the Findings *table*, not on the
+    query the summary and the clusters read. r1 applied the file filter in
+    Python *after* a SQL ``LIMIT 50``, so a crowd of newer prefix siblings
+    (``bin/mini-ork-apply``, ``-bugs``, …) evicted ``bin/mini-ork``'s own rows
+    before the filter saw them (kickoff #2).
+    """
+    tr_cols = ", tr.kickoff_path, tr.status" if join else ""
+    join_sql = " LEFT JOIN task_runs tr ON tr.id = f.run_id" if join else ""
+    sql = (
+        "SELECT f.run_id, f.source, f.file, f.line, f.severity, f.category, "
+        "f.issue, f.snippet, f.verdict, f.ts" + tr_cols + " "
+        "FROM code_findings f" + join_sql + " "
+        f"WHERE {where} AND f.ts >= ? ORDER BY f.ts DESC"
+    )
+    out: list[dict[str, Any]] = []
+    for r in conn.rows(sql, list(params) + [cutoff]):
+        kick = r.get("kickoff_path") if join else None
+        out.append({
+            "run_id": r["run_id"],
+            "run_title": _run_title(kick, r["run_id"]),
+            "run_status": r["status"] if join else None,
+            "source": r["source"],
+            "file": r["file"],
+            "line": r["line"],
+            "severity": r["severity"],
+            "category": r["category"],
+            "issue": r["issue"],
+            "snippet": r["snippet"],
+            "verdict": r["verdict"],
+            "ts": r["ts"],
+        })
+    return out
 
-    * a bare directory area ``mini_ork/acp`` would also sweep in the sibling
-      directory ``mini_ork/acp_orchestrator/*`` (both exist in this tree; so do
-      ``ui/src/context`` vs ``ui/src/contexts`` and ``kickoffs/sdd`` vs
-      ``kickoffs/sdd-mechanisms``);
-    * whether the area is a file or a directory cannot be read off its suffix —
-      ``bin/mini-ork`` and ``Makefile`` are files, ``svc/pay`` is a directory,
-      yet none carries an extension. Round 2 regression: ``Path(area).suffix``
-      sent every extensionless *file* down the directory branch, so
-      ``findings_for("bin/mini-ork/")`` matched nothing and its findings
-      vanished.
 
-    So the *data* decides, not the name. Query both shapes and merge:
+def _group_key(file: Any, depth: int = _DEPTH) -> str:
+    """The ``areas()`` group key of a finding's ``file`` — the page re-derives it
+    with the very same ``_dir_prefix`` rule ``_aggregate_areas`` uses, so the two
+    agree by construction (reviewer, round 2).
 
-    * **file** → rows whose ``file`` equals the area exactly;
-    * **directory** → rows under ``area + "/"``, the trailing separator forcing
-      LIKE to match a real path boundary and therefore only true descendants.
+    A bare filename (no directory) keys on itself, exactly as ``_aggregate_areas``
+    does, so ``Makefile`` is its own group rather than an empty-prefix bucket.
+    """
+    f = str(file or "")
+    if not f:
+        return ""
+    return _dir_prefix(f, depth) or f
 
-    A given area matches at most one shape, so the merge never double-counts.
-    Newest first, capped, to match ``findings_for``'s own ordering.
+
+def _window_findings(db: str, *, since_days: int, repo_only: bool = True,
+                     repo_root: str | None = None) -> list[dict[str, Any]]:
+    """Every finding in the ``since_days`` window, newest first — the one set the
+    areas table partitions and the detail filters.
+
+    The window (``int(time.time()) - days*86400``) and the ``_in_repo`` filter are
+    the exact ones ``areas()`` applies (kickoff #4; reviewer, round 1), so the
+    groups that table renders partition *this* set and their counts sum to it
+    (reviewer, round 2).
+
+    Read-only throughout: ``StateDB`` opens with ``query_only=ON``, the page's own
+    convention (see ``_harvest_summary``).
+    """
+    from mini_ork.web.db import StateDB
+
+    cutoff = int(time.time()) - int(since_days) * 86400
+    try:
+        conn = StateDB(Path(db))
+    except (FileNotFoundError, OSError):
+        return []
+    if not conn.has_table("code_findings"):
+        return []
+    join = conn.has_table("task_runs")
+    fs = _select_findings(conn, "f.file IS NOT NULL", [], cutoff, join)
+    if repo_only and fs:
+        keep = _in_repo({str(f["file"]) for f in fs if f.get("file")}, repo_root)
+        fs = [f for f in fs if f.get("file") in keep]
+    fs.sort(key=lambda f: int(f.get("ts") or 0), reverse=True)
+    return fs
+
+
+def _membership(all_fs: list[dict[str, Any]], area: str) -> list[dict[str, Any]]:
+    """The findings of *exactly* ``area`` — the ONE rule both views share.
+
+    ``area`` is a group key from ``areas()`` (``_group_key(file) == area``), or a
+    path a user deep-linked. A finding belongs when its group key equals the area
+    (the disjoint partition the areas table renders) or when its file *is* the
+    area (a file deep-link, ``area=bin/mini-ork``). The two cases never overlap
+    for the same finding, so nothing is counted twice and no row over-counts a
+    neighbour (reviewer, round 2 — r1's recursive ``area/**`` query made the
+    ``mini_ork`` row a superset of ``mini_ork/cli``, ``mini_ork/learning``, …).
     """
     base = area.rstrip("/")
-    exact = [f for f in findings_for(base, db=db, limit=_AREA_FINDINGS)
-             if str(f.get("file") or "") == base]
-    under = findings_for(base + "/", db=db, limit=_AREA_FINDINGS)
-    merged = exact + under
-    merged.sort(key=lambda f: int(f.get("ts") or 0), reverse=True)
-    return merged[:_AREA_FINDINGS]
+    return [
+        f for f in all_fs
+        if _group_key(f.get("file")) == base or str(f.get("file") or "") == base
+    ]
 
 
-def _recurring_for_area(home: Path, area_row: dict[str, Any]) -> list[dict[str, Any]]:
-    """Clusters for one area. ``findings_for`` matches a prefix (see
-    ``_findings_for_area``); a bare-filename area (a single file that dominates)
-    falls back to its top file's full path."""
-    db = _db_path(home)
-    fs = _findings_for_area(db, str(area_row["area"]))
-    if not fs and area_row.get("files"):
-        fs = _findings_for_area(db, str(area_row["files"][0][0]))
-    return recurring(fs)
+def _findings_for_area(db: str, area: str, *, since_days: int,
+                       repo_root: str | None = None) -> list[dict[str, Any]]:
+    """The detail's view of ``area`` — ``_membership`` over the same window the
+    areas table partitions, so a row and the page it opens are one set."""
+    return _membership(
+        _window_findings(db, since_days=since_days, repo_root=repo_root), area)
 
 
 # ── section: area detail (+ one finding) ───────────────────────────────────
 
 def _area_detail(home: Path, args: dict[str, str], area: str) -> list[dict[str, Any]]:
     db = _db_path(home)
-    fs = _findings_for_area(db, area)
+    # The FULL set (not the capped page) drives the summary line and the
+    # recurrence clusters; only the Findings *table* below is sliced to
+    # ``_AREA_FINDINGS``. r1 fed all three from one 50-capped list, so a
+    # 147-finding area claimed "50 findings in 8 runs" and clustered a 50-row
+    # sample (kickoff #1). The window is the same ``days`` the areas table used
+    # (kickoff #4) and the membership is the same ``_in_repo``-filtered set —
+    # the areas-table row now derives its numbers through this very call, so the
+    # two views are equal by construction (reviewer, round 1).
+    fs = _findings_for_area(db, area, since_days=_days(args))
     clusters = recurring(fs)
 
-    # The summary line must describe the rows listed below, so it is derived
-    # from ``fs`` itself — never from an ``areas()`` group row. A group row
-    # counts every file in the directory, but the label and this view are the
-    # area's own findings, so a directory group labelled with its dominant file
-    # would overstate the count and worst severity (reviewer, round 2).
-    n_runs = len({f.get("run_id") for f in fs if f.get("run_id")})
-    sevs = [str(f.get("severity") or "low").lower() for f in fs]
-    worst = min(sevs, key=lambda s: _SEV_ORDER.get(s, 3)) if sevs else "low"
+    # The summary line describes the rows listed below, and ``_area_stats`` is
+    # the exact derivation the areas table uses for its row — so the row count
+    # and this count are the same number, not two numbers that happen to agree.
+    n_runs, worst = _area_stats(fs)
     last = max((int(f.get("ts") or 0) for f in fs), default=0)
     date = time.strftime("%Y-%m-%d", time.localtime(last)) if last else "—"
-    # A file area targets its own path; a directory area targets ``area/**``.
-    # Decided from the data (see ``_findings_for_area``) — the suffix cannot
-    # tell ``bin/mini-ork`` (file) from ``svc/pay`` (directory).
+    # A file area targets its own path; a directory area targets the glob that
+    # matches *its* group (see ``_rule_glob``). Decided from the data — the
+    # suffix cannot tell ``bin/mini-ork`` (file) from ``svc/pay`` (directory).
     is_file = any(str(f.get("file") or "") == area.rstrip("/") for f in fs)
     lines = [f"{len(fs)} findings in {n_runs} run{'' if n_runs == 1 else 's'}, "
              f"worst {worst}, last {date}", "", "**Recurring problems**"]
@@ -305,7 +430,7 @@ def _area_detail(home: Path, args: dict[str, str], area: str) -> list[dict[str, 
             S.cell(short(f.get("issue") or "", _ISSUE_MAX)),
             S.cell(short(f.get("run_title") or f.get("run_id") or "", 60), "sub"),
         ], "do": S.set_args(area=area, finding=finding_key(f)),
-            "sel": selected == finding_key(f)} for f in fs],
+            "sel": selected == finding_key(f)} for f in fs[:_AREA_FINDINGS]],
         full=True))
 
     if selected:
@@ -339,19 +464,40 @@ def _finding_detail(f: dict[str, Any] | None) -> dict[str, Any]:
 
 # ── the "Make it a rule" action ────────────────────────────────────────────
 
+def _rule_glob(area: str, *, is_file: bool) -> str:
+    """The ``--target`` glob that matches *exactly* the findings one row sums
+    (reviewer, round 2).
+
+    The rule must reach the same files the row and the detail agree on — no more,
+    or it is injected into runs touching a *different* row's files. The grouping
+    truncates a directory path to ``_DEPTH`` segments, so:
+
+    * a **file** area targets the file itself;
+    * a directory key **at max depth** (``_DEPTH`` segments) collapses every
+      deeper descendant into one group → ``key/**`` matches the whole group;
+    * a **shallower** directory key holds only its direct children (any deeper
+      file keys on its own longer prefix, a different row) → ``key/*``, so the
+      rule never leaks into a sibling row's subtree.
+    """
+    base = area.rstrip("/")
+    if is_file:
+        return base
+    segments = len([s for s in base.split("/") if s])
+    return base + ("/**" if segments >= _DEPTH else "/*")
+
+
 def _rule_action(area: str, cluster: dict[str, Any], *, is_file: bool) -> dict[str, Any]:
     """The "Make it a rule" CLI action for one recurring problem in ``area``.
 
-    ``is_file`` is decided by the data (see ``_findings_for_area``): a file area
-    targets its own path, a directory area targets ``area/**``. It is a required
-    keyword so no caller can silently re-introduce the suffix guess that treated
-    ``bin/mini-ork`` (a file) as a directory and emitted a glob that never
+    ``is_file`` is decided by the data (see ``_membership``): a file area targets
+    its own path, a directory area the glob ``_rule_glob`` derives. It is a
+    required keyword so no caller can silently re-introduce the suffix guess that
+    treated ``bin/mini-ork`` (a file) as a directory and emitted a glob that never
     matches (reviewer, round 2).
     """
     rep = cluster["representative"]
     slug = hashlib.sha1(rep.encode("utf-8")).hexdigest()[:8]
-    base = area.rstrip("/")
-    glob = base if is_file else base + "/**"
+    glob = _rule_glob(area, is_file=is_file)
     text = f"In {area}: avoid this recurring review finding — {rep}"
     return S.cli("prefs", "set", f"review-{slug}", text, "--scope", "path", "--target", glob,
                  confirm=f"Add a rule for {glob}? Every run that touches it will be told this.")
@@ -435,9 +581,12 @@ def recurring(findings: list[dict[str, Any]], *, sim: float = _SIM,
          "files": [top 3], "worst_severity", "finding_ids"}
 
     Ordered by ``n`` then severity. Findings whose text has no tokens are kept
-    as singletons so nothing is silently dropped.
+    as singletons so nothing is silently dropped — but a finding whose issue is
+    the ``(no issue)`` placeholder is *not* a problem at all, so it is dropped
+    before clustering (reviewer, round 2: it topped the live recurring table).
     """
-    items = list(findings)
+    items = [f for f in findings
+             if str(f.get("issue") or "").strip().lower() != _PLACEHOLDER_ISSUE]
     if not items:
         return []
 
