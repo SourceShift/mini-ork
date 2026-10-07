@@ -317,3 +317,87 @@ def test_reflection_defaults_use_native_gradient_owner(monkeypatch):
     assert calls[0] == ("extract", "tr-1", False)
     assert calls[1][0] == "store"
     assert calls[2] == ("schema",)
+
+
+def test_extract_failure_surfaces_lane_and_provider_stderr(db, monkeypatch):
+    """A failed native dispatch raises SystemExit; stderr names the lane AND the provider message.
+
+    Pre-fix, `_default_dispatch` dropped stderr and `extract` died with the bare
+    string "gradient_extract: LLM dispatch failed", masking the actual provider
+    error (e.g. sibling induction was silently dead for weeks on a 'model is
+    not supported' 400 from `codex`). The fix captures lane + last 300 chars of
+    stderr into `_last_dispatch_error` under a lock; `extract`'s `_fail` now
+    surfaces them. This test is the regression guard for that fix.
+    """
+    # Reset the module-level error buffer — earlier tests may have left state.
+    monkeypatch.setattr(ge, "_last_dispatch_error", "")
+
+    # Real work signal so the degenerate-node skip does not fire (BUG4a).
+    trace_id = trace_store.trace_write(
+        {
+            "trace_id": "tr-fail-dispatch",
+            "task_class": "grad-fail",
+            "duration_ms": 1200,
+            "verifier_output": {"verdict": "fail"},
+        },
+        db=db,
+    )
+    from mini_ork.dispatch import llm_dispatch as native_dispatch
+
+    def fake(argv, *, root, dispatch_fn):
+        # The provider writes its real failure to stderr.
+        print("boom 400: 'gpt-6-astra' model is not supported", file=sys.stderr)
+        return 1
+
+    monkeypatch.setattr(native_dispatch, "llm_dispatch", fake)
+    monkeypatch.setenv("MINI_ORK_GRADIENT_MODEL", "codex")
+
+    rc, _, err = _py_extract(trace_id, db)
+    assert rc != 0, "extract must raise SystemExit on rc != 0"
+    # Both the provider message AND the lane reach stderr.
+    assert "boom 400" in err, f"stderr missing provider message: {err!r}"
+    assert "codex" in err, f"stderr missing lane name: {err!r}"
+    # And it does NOT regress to the bare pre-fix text alone.
+    assert "LLM dispatch failed" in err
+    assert err.rstrip().endswith(
+        "gradient_extract: LLM dispatch failed on lane codex: boom 400: 'gpt-6-astra' model is not supported"
+    ), f"unexpected stderr: {err!r}"
+
+
+def test_extract_failure_empty_stderr_still_names_lane(db, monkeypatch):
+    """A failed native dispatch with NO stderr still names the lane (F2).
+
+    Pre-fix, `_last_dispatch_error` was set to `""` when stderr was empty, so
+    `extract` fell back to the bare `LLM dispatch failed` text with no lane.
+    That re-blinds the blind-failure class this kickoff exists to close
+    (e.g. provider dies before logging anything). The fix records a synthetic
+    `lane <x>: rc=N (no stderr captured)` instead.
+    """
+    monkeypatch.setattr(ge, "_last_dispatch_error", "")
+
+    trace_id = trace_store.trace_write(
+        {
+            "trace_id": "tr-fail-empty-stderr",
+            "task_class": "grad-fail-empty",
+            "duration_ms": 1200,
+            "verifier_output": {"verdict": "fail"},
+        },
+        db=db,
+    )
+    from mini_ork.dispatch import llm_dispatch as native_dispatch
+
+    def fake(argv, *, root, dispatch_fn):
+        # Provider dies without writing anything to stderr.
+        return 1
+
+    monkeypatch.setattr(native_dispatch, "llm_dispatch", fake)
+    monkeypatch.setenv("MINI_ORK_GRADIENT_MODEL", "codex")
+
+    rc, _, err = _py_extract(trace_id, db)
+    assert rc != 0
+    assert "codex" in err, f"stderr missing lane name: {err!r}"
+    assert "no stderr captured" in err, f"stderr missing fallback marker: {err!r}"
+    assert "LLM dispatch failed" in err
+    assert err.rstrip().endswith(
+        "gradient_extract: LLM dispatch failed on lane codex: rc=1 (no stderr captured)"
+    ), f"unexpected stderr: {err!r}"

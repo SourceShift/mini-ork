@@ -14,10 +14,19 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterable
 from typing import Any, NoReturn, cast
+
+
+# Module-level capture of the last dispatch failure (lane + tail of provider
+# stderr). Future reflect fan-out could race the write site, so a Lock guards
+# every mutation. The read site in `extract` runs in the same thread as the
+# matching `_default_d` call, so no read-side lock is needed.
+_last_dispatch_error: str = ""
+_dispatch_lock = threading.Lock()
 
 
 _GRADIENT_EXTRACTOR_PROMPT_TEMPLATE = """You are a recipe-design improvement analyst.
@@ -316,12 +325,14 @@ def _default_dispatch(
     model: str | None = None,
 ) -> tuple[int, str]:
     """Call the native telemetry-aware dispatcher and isolate diagnostics."""
+    global _last_dispatch_error
     from mini_ork.dispatch import llm_dispatch as native_dispatch
 
     stdout = io.StringIO()
     stderr = io.StringIO()
+    lane = model or os.environ.get("MINI_ORK_GRADIENT_MODEL", "codex")
     argv = [
-        "--model", model or os.environ.get("MINI_ORK_GRADIENT_MODEL", "codex"),
+        "--model", lane,
         "--node-type", "gradient-extract",
         "--prompt-text", prompt,
         "--timeout", "120",
@@ -334,8 +345,31 @@ def _default_dispatch(
                 root=str(repo_root or os.environ.get("MINI_ORK_ROOT") or os.getcwd()),
                 dispatch_fn=dispatch_fn,
             )
-    except Exception:
+    except Exception as exc:
+        # Capture lane + exception text for `extract`'s structured failure.
+        # Truncate the variable part first, then prepend the lane prefix —
+        # a single slice on the whole string would otherwise eat the prefix
+        # on a long exception text and re-blind the blind-failure class this
+        # fix closes.
+        lane_prefix = f"lane {lane}: "
+        exc_text = f"{type(exc).__name__}: {exc}"
+        if len(lane_prefix) + len(exc_text) > 320:
+            exc_text = exc_text[: 320 - len(lane_prefix)] + "…"
+        with _dispatch_lock:
+            _last_dispatch_error = lane_prefix + exc_text
         return 1, ""
+    if rc != 0:
+        tail = stderr.getvalue().strip()
+        with _dispatch_lock:
+            if tail:
+                # Keep the lane prefix whole — truncate only the variable tail.
+                lane_prefix = f"lane {lane}: "
+                snippet = tail[-300:]
+                _last_dispatch_error = lane_prefix + snippet
+            else:
+                # No stderr captured (e.g. provider died before logging) — still
+                # name the lane so the failure is not blind.
+                _last_dispatch_error = f"lane {lane}: rc={rc} (no stderr captured)"
     return rc, stdout.getvalue()
 
 
@@ -499,7 +533,12 @@ def extract(
             dispatch_fn=dispatch_fn,
         )
         if rc != 0:
-            _fail("gradient_extract: LLM dispatch failed")
+            with _dispatch_lock:
+                captured = _last_dispatch_error
+            if captured:
+                _fail(f"gradient_extract: LLM dispatch failed on {captured}")
+            else:
+                _fail("gradient_extract: LLM dispatch failed")
         items = _parse_llm_output(raw, trace_id)
     else:
         items = list(override_fn(trace_id, trace_json))

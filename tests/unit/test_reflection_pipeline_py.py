@@ -858,18 +858,26 @@ def test_learning_loop_writeback_from_trace_cluster(temp_db):
 # (9) reflection_verify_patterns — judge-gate: proposed → approved on floor
 # ─────────────────────────────────────────────────────────────────────────────
 def _seed_emergent(temp_db, rows):
-    """rows: list of (pattern_id, members_list, strength_score, status)."""
+    """rows: list of (pattern_id, members_list, strength_score, status[, lesson_text]).
+
+    The optional 5th element is the authored lesson_text. Default None keeps
+    callers pre-existing in scope; new tests append a non-empty string to
+    exercise the lesson-gate knob.
+    """
     now = int(time.time())
     con = sqlite3.connect(temp_db)
     con.execute("PRAGMA busy_timeout=5000")
     con.execute("DELETE FROM emergent_patterns")
-    for pid, members, strength, status in rows:
+    for row in rows:
+        pid, members, strength, status = row[:4]
+        lesson_text = row[4] if len(row) >= 5 else None
         con.execute(
             "INSERT INTO emergent_patterns (pattern_id, cluster_label, "
-            "member_item_ids_json, feature_set_json, strength_score, status, detected_at) "
-            "VALUES (?,?,?,?,?,?,?)",
+            "member_item_ids_json, feature_set_json, strength_score, status, "
+            "detected_at, lesson_text) "
+            "VALUES (?,?,?,?,?,?,?,?)",
             (pid, f"label-{pid}", json.dumps(members), json.dumps(["verifier_addition"]),
-             strength, status, now),
+             strength, status, now, lesson_text),
         )
     con.commit()
     con.close()
@@ -905,14 +913,14 @@ def test_reflection_verify_patterns_gate(temp_db):
             {"item_table": "execution_traces", "item_id": "tr-strong-1"},
             {"item_table": "execution_traces", "item_id": "tr-strong-2"},
             {"item_table": "execution_traces", "item_id": "tr-strong-3"},
-        ], 5.0, "proposed"),  # pass: 3 distinct runs
+        ], 5.0, "proposed", "lesson: 3 distinct runs back this pattern"),  # pass: 3 distinct runs + lesson
         ("p-weak-str", [
             {"item_table": "execution_traces", "item_id": "tr-weak-str"},
-        ], 2.0, "proposed"),  # fail: strength
-        ("p-no-ev",    [],                                                     9.0, "proposed"),  # fail: evidence
+        ], 2.0, "proposed", "lesson: weak evidence lesson"),  # fail: strength
+        ("p-no-ev",    [],                                                     9.0, "proposed", "lesson: no-ev lesson"),  # fail: evidence
         ("p-already",  [
             {"item_table": "execution_traces", "item_id": "tr-strong-1"},
-        ], 8.0, "approved"),  # not proposed
+        ], 8.0, "approved", "lesson: already-approved lesson"),  # not proposed
     ]
 
     _seed_emergent(temp_db, seed)
@@ -967,7 +975,8 @@ def test_reflection_verify_patterns_repeated_trace_id_is_one_observation(
     proposed→approved — and only approved rows reach the agent's context."""
     _seed_traces(temp_db, [("tr-dup", "run-a")])
     _seed_emergent(temp_db, [
-        ("p-dup", _members("tr-dup", "tr-dup", "tr-dup"), 9.0, "proposed"),
+        ("p-dup", _members("tr-dup", "tr-dup", "tr-dup"), 9.0, "proposed",
+         "lesson: dup-trace lesson"),
     ])
 
     assert _verify_and_status(temp_db, monkeypatch, "p-dup") == "proposed"
@@ -981,7 +990,8 @@ def test_reflection_verify_patterns_one_run_is_one_observation(temp_db, monkeypa
     _seed_traces(temp_db, [("tr-s1", "run-solo"), ("tr-s2", "run-solo"),
                            ("tr-s3", "run-solo")])
     _seed_emergent(temp_db, [
-        ("p-one-run", _members("tr-s1", "tr-s2", "tr-s3"), 9.0, "proposed"),
+        ("p-one-run", _members("tr-s1", "tr-s2", "tr-s3"), 9.0, "proposed",
+         "lesson: one-run lesson"),
     ])
 
     assert _verify_and_status(temp_db, monkeypatch, "p-one-run") == "proposed"
@@ -1000,7 +1010,8 @@ def test_reflection_verify_patterns_null_run_id_is_unproven(temp_db, monkeypatch
     con.commit()
     con.close()
     _seed_emergent(temp_db, [
-        ("p-null", _members("tr-n1", "tr-n2", "tr-n3"), 9.0, "proposed"),
+        ("p-null", _members("tr-n1", "tr-n2", "tr-n3"), 9.0, "proposed",
+         "lesson: null-run-id lesson"),
     ])
 
     assert _verify_and_status(temp_db, monkeypatch, "p-null") == "proposed"
@@ -1013,7 +1024,7 @@ def test_reflection_verify_patterns_floor_cannot_be_lowered(temp_db, monkeypatch
     bar, the hole would be open again by configuration."""
     _seed_traces(temp_db, [("tr-one", "run-only")])
     _seed_emergent(temp_db, [
-        ("p-env1", _members("tr-one"), 9.0, "proposed"),
+        ("p-env1", _members("tr-one"), 9.0, "proposed", "lesson: env1 lesson"),
     ])
 
     assert _verify_and_status(
@@ -1026,7 +1037,8 @@ def test_reflection_verify_patterns_floor_can_be_raised(temp_db, monkeypatch):
     """The env var raises the bar: 3 independent runs do not clear 5."""
     _seed_traces(temp_db, [("tr-r1", "run-1"), ("tr-r2", "run-2"), ("tr-r3", "run-3")])
     _seed_emergent(temp_db, [
-        ("p-env5", _members("tr-r1", "tr-r2", "tr-r3"), 9.0, "proposed"),
+        ("p-env5", _members("tr-r1", "tr-r2", "tr-r3"), 9.0, "proposed",
+         "lesson: env5 lesson"),
     ])
 
     assert _verify_and_status(
@@ -1037,7 +1049,8 @@ def test_reflection_verify_patterns_floor_can_be_raised(temp_db, monkeypatch):
 
 def test_reflection_verify_patterns_optout(temp_db, monkeypatch):
     """MO_EMERGENT_VERIFY=0 is a hard opt-out: nothing is promoted, count 0."""
-    seed = [("p-strong", [{"item_table": "execution_traces", "item_id": "t1"}], 5.0, "proposed")]
+    seed = [("p-strong", [{"item_table": "execution_traces", "item_id": "t1"}], 5.0, "proposed",
+             "lesson: optout-row lesson")]
     _seed_emergent(temp_db, seed)
     monkeypatch.setenv("MO_EMERGENT_VERIFY", "0")
     import io
@@ -1065,6 +1078,224 @@ def test_reflection_verify_patterns_cold(temp_db):
     with redirect_stdout(buf):
         assert rp.reflection_verify_patterns() == 0
     assert buf.getvalue().strip() == "0"
+
+
+def test_reflection_verify_patterns_with_lesson_is_approved(temp_db):
+    """A row that clears both floors AND has a non-blank lesson_text is approved.
+
+    The lesson gate is the new third requirement (kickoff fix #1). Without it,
+    approval is content-free; with it, the gate only promotes rows that say
+    something. This test is the positive path: lesson present + floors met →
+    approved, no held line.
+    """
+    _seed_traces(temp_db, [
+        ("tr-L1", "run-l1"), ("tr-L2", "run-l2"), ("tr-L3", "run-l3"),
+    ])
+    _seed_emergent(temp_db, [
+        ("p-with-lesson", _members("tr-L1", "tr-L2", "tr-L3"), 5.0, "proposed",
+         "lesson: 3 distinct runs back this pattern"),
+    ])
+    import io
+    from contextlib import redirect_stderr, redirect_stdout
+
+    out_buf = io.StringIO()
+    err_buf = io.StringIO()
+    with redirect_stdout(out_buf), redirect_stderr(err_buf):
+        n = rp.reflection_verify_patterns()
+    assert n == 1
+    assert out_buf.getvalue().strip() == "1"
+    # No held line when all rows cleared the lesson gate.
+    assert "pattern(s) held" not in err_buf.getvalue()
+
+    con = sqlite3.connect(temp_db)
+    st = con.execute(
+        "SELECT status FROM emergent_patterns WHERE pattern_id='p-with-lesson'"
+    ).fetchone()[0]
+    con.close()
+    assert st == "approved"
+
+
+def test_reflection_verify_patterns_without_lesson_is_held(temp_db):
+    """A row that clears both floors but has no lesson_text stays proposed.
+
+    The held row is reported once on stderr so the operator can see why nothing
+    promoted. The stdout `print(approved)` contract is unchanged.
+    """
+    _seed_traces(temp_db, [
+        ("tr-H1", "run-h1"), ("tr-H2", "run-h2"), ("tr-H3", "run-h3"),
+    ])
+    _seed_emergent(temp_db, [
+        ("p-no-lesson", _members("tr-H1", "tr-H2", "tr-H3"), 5.0, "proposed", None),
+    ])
+    import io
+    from contextlib import redirect_stderr, redirect_stdout
+
+    out_buf = io.StringIO()
+    err_buf = io.StringIO()
+    with redirect_stdout(out_buf), redirect_stderr(err_buf):
+        n = rp.reflection_verify_patterns()
+    assert n == 0
+    assert out_buf.getvalue().strip() == "0"
+    err = err_buf.getvalue()
+    assert "  [verify] 1 pattern(s) held: floors met, no authored lesson yet" in err
+
+    con = sqlite3.connect(temp_db)
+    st = con.execute(
+        "SELECT status FROM emergent_patterns WHERE pattern_id='p-no-lesson'"
+    ).fetchone()[0]
+    con.close()
+    assert st == "proposed"
+
+
+def test_reflection_verify_patterns_optout_require_lesson_approves_empty(
+        temp_db, monkeypatch):
+    """MO_EMERGENT_VERIFY_REQUIRE_LESSON=0 restores today's lesson-less approval.
+
+    The new lesson gate is opt-out (default-on). With the knob off, a row that
+    clears the two existing floors is approved even without a lesson — matching
+    the pre-fix behaviour. Opt-out does NOT touch the strength/evidence floors.
+    """
+    _seed_traces(temp_db, [
+        ("tr-O1", "run-o1"), ("tr-O2", "run-o2"), ("tr-O3", "run-o3"),
+    ])
+    _seed_emergent(temp_db, [
+        ("p-optout-no-lesson", _members("tr-O1", "tr-O2", "tr-O3"), 5.0,
+         "proposed", None),
+    ])
+    import io
+    from contextlib import redirect_stderr, redirect_stdout
+
+    monkeypatch.setenv("MO_EMERGENT_VERIFY_REQUIRE_LESSON", "0")
+    out_buf = io.StringIO()
+    err_buf = io.StringIO()
+    with redirect_stdout(out_buf), redirect_stderr(err_buf):
+        n = rp.reflection_verify_patterns()
+    assert n == 1
+    assert "pattern(s) held" not in err_buf.getvalue()
+
+    con = sqlite3.connect(temp_db)
+    st = con.execute(
+        "SELECT status FROM emergent_patterns WHERE pattern_id='p-optout-no-lesson'"
+    ).fetchone()[0]
+    con.close()
+    assert st == "approved"
+
+
+def test_reflection_verify_patterns_already_approved_stays_approved(temp_db):
+    """An already-approved row without a lesson is not demoted.
+
+    The gate is a forward-only promotion: it transitions 'proposed' → 'approved'
+    on floor + lesson. It does NOT touch rows that already carry status='approved',
+    so historical approvals without an authored lesson keep their status. The
+    function's stdout/return contract is also unchanged: 0 newly-approved rows.
+    """
+    _seed_traces(temp_db, [("tr-historical", "run-hist")])
+    _seed_emergent(temp_db, [
+        ("p-historical", _members("tr-historical"), 9.0, "approved", None),
+    ])
+    import io
+    from contextlib import redirect_stderr, redirect_stdout
+
+    out_buf = io.StringIO()
+    err_buf = io.StringIO()
+    with redirect_stdout(out_buf), redirect_stderr(err_buf):
+        n = rp.reflection_verify_patterns()
+    assert n == 0
+    assert "pattern(s) held" not in err_buf.getvalue()
+
+    con = sqlite3.connect(temp_db)
+    st = con.execute(
+        "SELECT status FROM emergent_patterns WHERE pattern_id='p-historical'"
+    ).fetchone()[0]
+    con.close()
+    assert st == "approved"
+
+
+def test_reflection_verify_patterns_legacy_db_no_lesson_column(
+        tmp_path, monkeypatch):
+    """Legacy DB (predates migration 0056) lacks lesson_text entirely.
+
+    The kickoff mandates the same probe pattern as _suggest_promotions_query:
+    on OperationalError, fall back to the no-column select and treat every row
+    as "no authored lesson". The gate must still run, every proposed row must
+    be held (no column = no lessons by definition, fail-closed), and the
+    held-count diagnostic must reach stderr — the previous round dropped it on
+    that path, silently disabling verification AND swallowing the warning.
+    """
+    legacy_db = str(tmp_path / "legacy.db")
+    con = sqlite3.connect(legacy_db)
+    con.execute(
+        "CREATE TABLE emergent_patterns ("
+        "pattern_id TEXT PRIMARY KEY,"
+        "cluster_label TEXT NOT NULL,"
+        "member_item_ids_json TEXT NOT NULL,"
+        "feature_set_json TEXT NOT NULL,"
+        "strength_score REAL NOT NULL,"
+        "suggested_meta_adr TEXT,"
+        "status TEXT NOT NULL DEFAULT 'proposed'"
+        "    CHECK(status IN ('proposed','approved','rejected','superseded')),"
+        "detected_at INTEGER NOT NULL,"
+        "resolved_at INTEGER"
+        ")"
+    )
+    con.execute(
+        "CREATE TABLE execution_traces ("
+        "trace_id TEXT PRIMARY KEY,"
+        "run_id TEXT,"
+        "task_class TEXT,"
+        "status TEXT,"
+        "created_at INTEGER"
+        ")"
+    )
+    now = int(time.time())
+    con.executemany(
+        "INSERT INTO execution_traces(trace_id, run_id, task_class, status, "
+        "created_at) VALUES (?, ?, 'code_fix', 'success', ?)",
+        [("tr-leg-1", "run-leg-1", now),
+         ("tr-leg-2", "run-leg-2", now),
+         ("tr-leg-3", "run-leg-3", now)],
+    )
+    con.executemany(
+        "INSERT INTO emergent_patterns (pattern_id, cluster_label, "
+        "member_item_ids_json, feature_set_json, strength_score, status, "
+        "detected_at) VALUES (?,?,?,?,?,?,?)",
+        [
+            ("p-legacy", "label-p-legacy",
+             json.dumps([
+                 {"item_table": "execution_traces", "item_id": "tr-leg-1"},
+                 {"item_table": "execution_traces", "item_id": "tr-leg-2"},
+                 {"item_table": "execution_traces", "item_id": "tr-leg-3"},
+             ]),
+             json.dumps(["verifier_addition"]),
+             5.0, "proposed", now),
+        ],
+    )
+    con.commit()
+    con.close()
+
+    monkeypatch.setenv("MINI_ORK_DB", legacy_db)
+    import io
+    from contextlib import redirect_stderr, redirect_stdout
+
+    out_buf = io.StringIO()
+    err_buf = io.StringIO()
+    with redirect_stdout(out_buf), redirect_stderr(err_buf):
+        n = rp.reflection_verify_patterns()
+    # No rows approved: legacy DB has no lesson_text, so all proposed rows
+    # are "no lesson" by definition.
+    assert n == 0
+    assert out_buf.getvalue().strip() == "0"
+    # Held-count diagnostic MUST reach stderr — this is the line the previous
+    # round silently dropped on the OperationalError path.
+    assert "  [verify] 1 pattern(s) held: floors met, no authored lesson yet" in err_buf.getvalue()
+
+    # Status untouched.
+    con = sqlite3.connect(legacy_db)
+    st = con.execute(
+        "SELECT status FROM emergent_patterns WHERE pattern_id='p-legacy'"
+    ).fetchone()[0]
+    con.close()
+    assert st == "proposed"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

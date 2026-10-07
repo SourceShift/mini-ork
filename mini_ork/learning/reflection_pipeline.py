@@ -889,16 +889,19 @@ def reflection_verify_patterns(*, db_path: str | None = None) -> int:
     Judge-gate (extract→distill→verify): transition emergent_patterns rows from
     status='proposed' → 'approved' when they clear both
     ``strength_score >= MO_EMERGENT_VERIFY_MIN_STRENGTH`` AND the evidence
-    resolves to at least ``MO_EMERGENT_VERIFY_MIN_EVIDENCE`` DISTINCT runs. Only
-    approved rows are eligible to be read into routing/context — the guard
-    against memory confabulation (Dixit 2026).
+    resolves to at least ``MO_EMERGENT_VERIFY_MIN_EVIDENCE`` DISTINCT runs AND
+    (when ``MO_EMERGENT_VERIFY_REQUIRE_LESSON=1``, the default) the row carries
+    a non-blank ``lesson_text``. Only approved rows are eligible to be read into
+    routing/context — the guard against memory confabulation (Dixit 2026).
 
     The independence floor is clamped UP, never down: ``max(floor, env)``, so an
     environment variable can raise the bar but never restore the forgeable one.
     A safety floor is not a setting.
 
     Opt-out MO_EMERGENT_VERIFY=0. Cold-safe: no-op on missing/empty table. Prints
-    and returns the count of newly-approved rows.
+    and returns the count of newly-approved rows. Rows that clear the two
+    strength/evidence floors but lack an authored lesson stay 'proposed'; a single
+    stderr line reports the held count.
     """
     if os.environ.get("MO_EMERGENT_VERIFY", "1") != "1":
         print(0)
@@ -911,35 +914,66 @@ def reflection_verify_patterns(*, db_path: str | None = None) -> int:
                                _INDEPENDENT_EVIDENCE_FLOOR)))
     except (TypeError, ValueError):
         min_evidence = _INDEPENDENT_EVIDENCE_FLOOR
+    require_lesson = os.environ.get("MO_EMERGENT_VERIFY_REQUIRE_LESSON", "1") == "1"
     db_path = _resolve_db(db_path)
     con = _connect(db_path)
     try:
-        try:
-            rows = con.execute(
-                "SELECT pattern_id, member_item_ids_json, strength_score "
-                "FROM emergent_patterns WHERE status='proposed'"
-            ).fetchall()
-        except sqlite3.OperationalError:
-            print(0)
-            return 0
+        # Probe the lesson_text column the same way _suggest_promotions_query
+        # does (line 388–409): the schema migration to live DBs adds the
+        # column, and a legacy DB that predates it must keep running — every
+        # proposed row there is "no authored lesson" by definition (fail-closed
+        # by intent), and the held-count diagnostic still has to reach stderr.
+        base_select = (
+            "SELECT pattern_id, member_item_ids_json, strength_score "
+            "FROM emergent_patterns WHERE status='proposed'"
+        )
+        with_lesson_select = (
+            "SELECT pattern_id, member_item_ids_json, strength_score, lesson_text "
+            "FROM emergent_patterns WHERE status='proposed'"
+        )
+        if require_lesson:
+            try:
+                rows = con.execute(with_lesson_select).fetchall()
+                with_lesson = True
+            except sqlite3.OperationalError:
+                rows = con.execute(base_select).fetchall()
+                with_lesson = False
+        else:
+            rows = con.execute(base_select).fetchall()
+            with_lesson = False
         now = int(time.time())
         approved = 0
-        for pid, members_json, strength in rows:
+        held = 0
+        for row in rows:
+            pid = row[0]
+            members_json = row[1]
+            strength = row[2]
+            lesson_text = row[3] if with_lesson else None
             n_runs = _independent_evidence_count(con, _member_trace_ids(members_json))
             try:
                 s = float(strength)
             except (TypeError, ValueError):
                 s = 0.0
-            if s >= min_strength and n_runs >= min_evidence:
-                con.execute(
-                    "UPDATE emergent_patterns SET status='approved', resolved_at=? "
-                    "WHERE pattern_id=? AND status='proposed'",
-                    (now, pid),
-                )
-                approved += 1
+            clears_floors = s >= min_strength and n_runs >= min_evidence
+            if not clears_floors:
+                continue
+            if require_lesson and not (lesson_text and str(lesson_text).strip()):
+                held += 1
+                continue
+            con.execute(
+                "UPDATE emergent_patterns SET status='approved', resolved_at=? "
+                "WHERE pattern_id=? AND status='proposed'",
+                (now, pid),
+            )
+            approved += 1
         con.commit()
     finally:
         con.close()
+    if held:
+        print(
+            f"  [verify] {held} pattern(s) held: floors met, no authored lesson yet",
+            file=sys.stderr,
+        )
     print(approved)
     return approved
 
@@ -1041,7 +1075,10 @@ def reflection_run(since_ts: int | None = None, *,
     # [judge-gate] extract→distill→verify: promote only evidence-backed
     # emergent_patterns from 'proposed' → 'approved' so confabulated
     # self-diagnoses never reach routing/context (Dixit 2026).
-    print("  [verify] judge-gate emergent_patterns", file=sys.stderr)
+    print(
+        "  [verify] emergent_patterns gate (strength + independent runs + authored lesson)",
+        file=sys.stderr,
+    )
     approved = 0
     try:
         _approved_buf = io.StringIO()
@@ -1050,7 +1087,7 @@ def reflection_run(since_ts: int | None = None, *,
     except Exception:
         approved = 0
     print(
-        f"reflection_run: {approved} emergent_patterns approved by judge-gate",
+        f"reflection_run: {approved} emergent_patterns approved",
         file=sys.stderr,
     )
 
