@@ -271,8 +271,7 @@ def _write_attached_image(
 
     The directory is created lazily; ``n`` is the next free integer already
     present in the directory — turn 2's image does not overwrite turn 1's
-    ``0.png``. Re-sending the same image within a turn reuses its slot
-    (the helper is called once per block). Decode failures raise — the
+    ``0.png``. Decode failures raise — the
     prompt caller surfaces them. The returned path is what the orchestrator
     is told to ``Read``.
     """
@@ -346,23 +345,14 @@ def _attachment_lines(
     return lines
 
 
-def _build_prompt_payload(
-    text: str, prompt: list[Any], session_id: str, home: Path
-) -> str:
-    """Compose the prompt payload from text + non-text attachment lines.
+def _compose_payload(text: str, attachment_lines: list[str]) -> str:
+    """Join the prompt text and its attachment lines with a blank line.
 
-    ``text`` is whatever the caller has produced (a slash-command rewrite
-    when one was stashed, otherwise the joined text blocks). Attachment
-    lines follow a ``"\\n\\n"`` separator only when at least one is
-    non-empty. Text-only prompts are unchanged.
-
-    Slash-command detection still calls ``_extract_prompt_text`` so this
-    helper is for the orchestrate / direct paths only.
+    Pure: the lines come from ``_attachment_lines`` (which writes the image
+    files), so composing never writes anything. Text-only prompts are
+    unchanged; an attachment-only prompt has no leading blank line.
     """
-    attachment_lines = _attachment_lines(prompt, session_id, home)
-    if not attachment_lines:
-        return text
-    return text + "\n\n" + "\n".join(attachment_lines)
+    return "\n\n".join(part for part in (text, "\n".join(attachment_lines)) if part)
 
 
 def _tail_log(path: str | None, n: int = 20) -> str:
@@ -1523,21 +1513,18 @@ class MiniOrkAcpAgent:
     async def _prompt_thread(
         self, session_id: str, prompt: list[Any]
     ) -> PromptResponse:
-        """Route a thread-session prompt to orchestrate or direct mode.
+        """Route a thread-session prompt.
 
-        The ``/run <task>`` slash command short-circuits to direct mode for
-        that one prompt regardless of the stored mode. Otherwise the stored
-        ``mode`` config selects the path. The orchestrator turn is awaited
-        inline so cancel can interrupt it; the direct-mode path reuses the
-        existing ``_await_terminal`` loop against the fresh run id.
-
-        Slash-command detection still keys on the text-only prompt so an
-        image block cannot masquerade as ``/run``. The orchestrate and
-        direct paths receive an *augmented* payload — text plus any
-        attached images (decoded to ``<home>/attachments/<session>/<n>.<ext>``
-        with an ``Attached image: <path>`` line), embedded text resources
-        inlined, and resource links advertised. ``_extract_prompt_text``
-        still feeds the slash router.
+        Every plain prompt goes to the orchestrator, which decides whether to
+        answer, start a mini-ork run or edit directly; a stored ``mode`` no
+        longer changes routing. ``/run <task>`` starts a direct run and
+        ``/race <task>`` a race; both are matched on the text-only prompt so an
+        image block cannot masquerade as a command. The run and orchestrator
+        paths receive the text plus the attachment lines: images decoded to
+        ``<home>/attachments/<session>/<n>.<ext>`` with an
+        ``Attached image: <path>`` line, embedded text resources inlined and
+        resource links listed. The orchestrator turn is awaited inline so a
+        cancel can interrupt it.
         """
         # A cancel ends one turn, not the thread.
         self._cancelled.discard(session_id)
@@ -1572,16 +1559,15 @@ class MiniOrkAcpAgent:
                     title=title,
                 ),
             )
-        # Direct / orchestrate paths receive the augmented payload — the
-        # user may have attached images or resources the text-only string
-        # would have dropped.
+        # The text-only string feeds the slash router; the run / orchestrator
+        # paths get the text plus the attachment lines (images, resources).
         home = self._home_for(session_id)
-        attachment_lines = _attachment_lines(prompt, session_id, home)
         slash_text = self._strip_slash_run(text)
         if slash_text is not None:
-            if attachment_lines:
-                slash_text = slash_text + "\n\n" + "\n".join(attachment_lines)
-            return await self._prompt_thread_direct(session_id, slash_text)
+            lines = _attachment_lines(prompt, session_id, home)
+            return await self._prompt_thread_direct(
+                session_id, _compose_payload(slash_text, lines)
+            )
         race_text = self._strip_slash_race(text)
         if race_text is not None:
             return await self._prompt_thread_race(session_id, race_text)
@@ -1589,10 +1575,7 @@ class MiniOrkAcpAgent:
         # legacy ``mode=direct`` keeps being accepted by ``set_config_option``
         # so old clients do not error, but it no longer changes routing —
         # direct runs are reachable only via ``/run`` and ``/race``.
-        if attachment_lines:
-            payload = text + "\n\n" + "\n".join(attachment_lines)
-        else:
-            payload = text
+        payload = _compose_payload(text, _attachment_lines(prompt, session_id, home))
         return await self._prompt_thread_orchestrate(session_id, payload)
 
     @staticmethod

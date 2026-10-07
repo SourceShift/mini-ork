@@ -49,7 +49,7 @@ from acp.schema import (  # noqa: E402
 from acp import RequestError  # noqa: E402
 
 from mini_ork.acp.agent import MiniOrkAcpAgent, mint_run_id  # noqa: E402
-from mini_ork.acp.agent import _build_prompt_payload  # noqa: E402,F401
+from mini_ork.acp.agent import _attachment_lines, _compose_payload  # noqa: E402,F401
 from mini_ork.recipes_catalog import RecipeInfo  # noqa: E402
 
 
@@ -652,9 +652,8 @@ def test_prompt_payload_writes_image_attachment_and_inlines_embedded_text(tmp_pa
         uri="file:///notes/other.md",
         name="Other",
     )
-    payload = _build_prompt_payload(
-        "", [image, embedded, link], sid, home,
-    )
+    payload = _compose_payload("", _attachment_lines([image, embedded, link], sid, home))
+    assert not payload.startswith("\n")
 
     # The image decoded under the session's attachment dir.
     att_dir = home / "attachments" / sid
@@ -6209,10 +6208,9 @@ def test_image_attachment_reaches_the_orchestrator_with_file_and_line(tmp_path):
 
     assert len(prompts) == 1
     prompt = prompts[0]
-    assert "describe this" in prompt
     home = agent._home_for(sid)
     expected = home / "attachments" / sid / "0.png"
-    assert f"Attached image: {expected}" in prompt
+    assert prompt == f"describe this\n\nAttached image: {expected}"
     assert expected.is_file()
     assert expected.read_bytes() == _PNG_BYTES
 
