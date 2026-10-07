@@ -19,6 +19,7 @@ helpers from the prior design are gone; ``_NAMESPACES`` itself stays in
 from __future__ import annotations
 
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +34,7 @@ _PREF_NOTE = ("Every researcher, implementer and reviewer gets these first in it
 _PREF_ADD_THREAD = ("I want to add a mini-ork preference. Ask me what it is and its scope, "
                     "then run `mini-ork prefs set` for it.")
 
-_LANE_NOTE = ("From agent_performance_memory (refreshed by reflect). "
+_LANE_NOTE = ("From execution traces of the last 28 days (valid runs only: infra exits excluded). "
               "★ = best pass rate with at least 5 runs.")
 
 _MEMORY_KV_TITLE = "Memories to review · counts"
@@ -141,7 +142,7 @@ def _pref_acts(p: dict) -> list[dict[str, Any]]:
 
 def _lane_fit(home: Path) -> dict[str, Any]:
     conn = db(home)
-    if not conn.has_table("agent_performance_memory"):
+    if not conn.has_table("execution_traces"):
         return S.table(
             "Lane fit by task class",
             [S.col(140), S.col(110), S.col(180), S.col(60), S.col(80), S.col(80)],
@@ -151,17 +152,44 @@ def _lane_fit(home: Path) -> dict[str, Any]:
             full=True, note=_LANE_NOTE,
         )
 
+    # 28-day window, lexicographically comparable to the created_at shape
+    # ``%Y-%m-%dT%H:%M:%fZ`` (see dispatch/calibration.recent_cutoff).
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=28)).strftime("%Y-%m-%dT%H:%M:%S")
     rows = conn.rows(
-        "SELECT agent_version_id, role, model, task_class, runs_count, "
-        "success_count, avg_cost_usd FROM agent_performance_memory "
-        "WHERE runs_count >= 3"
+        "WITH lanes AS ("
+        "  SELECT task_class,"
+        "    CASE"
+        "      WHEN json_valid(verifier_output)"
+        "           AND COALESCE(json_extract(verifier_output, '$.node_type'), '') <> ''"
+        "        THEN json_extract(verifier_output, '$.node_type')"
+        "      WHEN trace_id LIKE 'tr-%-%'"
+        "        THEN substr(trace_id, 4, instr(substr(trace_id, 4), '-') - 1)"
+        "      ELSE '?'"
+        "    END AS role,"
+        "    agent_version_id AS lane,"
+        "    status, cost_usd"
+        "  FROM execution_traces"
+        "  WHERE agent_version_id <> ''"
+        "    AND task_class <> ''"
+        "    AND COALESCE(validity, 'valid') = 'valid'"
+        "    AND status IN ('success', 'failure')"
+        "    AND created_at >= ?"
+        ") "
+        "SELECT task_class, role, lane,"
+        "  COUNT(*) AS runs,"
+        "  SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success,"
+        "  AVG(cost_usd) AS avg_cost_usd"
+        " FROM lanes"
+        " GROUP BY task_class, role, lane"
+        " HAVING COUNT(*) >= 3",
+        (cutoff,),
     )
     by_class: dict[str, list[dict]] = {}
     for r in rows:
         by_class.setdefault(str(r.get("task_class") or "unknown"), []).append(r)
 
     ranked = sorted(by_class.items(),
-                    key=lambda kv: -sum(int(x.get("runs_count") or 0) for x in kv[1]))[:8]
+                    key=lambda kv: -sum(int(x.get("runs") or 0) for x in kv[1]))[:8]
     if not ranked:
         return S.table(
             "Lane fit by task class",
@@ -179,30 +207,31 @@ def _lane_fit(home: Path) -> dict[str, Any]:
         # Top-4 lanes per class by pass rate desc; ties broken by runs desc.
         lanes_sorted = sorted(
             lanes,
-            key=lambda r: (-(int(r.get("success_count") or 0)
-                            / max(1, int(r.get("runs_count") or 0))),
-                           -int(r.get("runs_count") or 0)),
+            key=lambda r: (-(int(r.get("success") or 0)
+                            / max(1, int(r.get("runs") or 0))),
+                           -int(r.get("runs") or 0)),
         )[:4]
         # Best lane for the class — highest pass rate with runs >= 5.
-        eligible = [r for r in lanes_sorted if int(r.get("runs_count") or 0) >= 5]
+        eligible = [r for r in lanes_sorted if int(r.get("runs") or 0) >= 5]
         if eligible:
-            best_id = max(
+            best = max(
                 eligible,
-                key=lambda r: int(r.get("success_count") or 0)
-                              / max(1, int(r.get("runs_count") or 0)),
-            ).get("agent_version_id")
+                key=lambda r: int(r.get("success") or 0)
+                              / max(1, int(r.get("runs") or 0)),
+            )
+            best_key = (best.get("role"), best.get("lane"))
         else:
-            best_id = None
+            best_key = None
         first = True
         for r in lanes_sorted:
-            runs = int(r.get("runs_count") or 0)
-            succ = int(r.get("success_count") or 0)
+            runs = int(r.get("runs") or 0)
+            succ = int(r.get("success") or 0)
             rate = (100.0 * succ / runs) if runs else 0.0
             rate_text = f"{rate:.0f}%"
             rate_color = _pass_rate_colour(rate)
             cost = float(r.get("avg_cost_usd") or 0.0)
-            lane = str(r.get("agent_version_id") or "?")
-            if r.get("agent_version_id") == best_id:
+            lane = str(r.get("lane") or "?")
+            if (r.get("role"), r.get("lane")) == best_key:
                 lane = f"{lane} ★"
             out.append({
                 "cells": [

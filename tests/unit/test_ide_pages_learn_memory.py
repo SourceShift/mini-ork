@@ -3,7 +3,7 @@
 The tab is driven by three real data sources:
 
 - ``user_preference_memory`` + ``lesson_injections`` for Preferences & constraints.
-- ``agent_performance_memory`` for Lane fit by task class.
+- ``execution_traces`` for Lane fit by task class.
 - ``semantic_memory`` + ``semantic_memory_uses`` for Memories to review.
 
 Those tables are created lazily by the runtime (migrations + ``ledger.ensure_schema``);
@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -171,22 +172,38 @@ def test_preferences_empty_state(home: Path) -> None:
     assert any(a["label"] == "Add preference" for a in prefs["actions"])
 
 
+def _seed_traces(con: sqlite3.Connection, lane: str, role: str, cls: str,
+                 n_success: int, n_failure: int, *,
+                 cost_usd: float = 0.05, validity: str = "valid",
+                 days_ago: float = 0.0) -> None:
+    """Insert ``n_success`` success + ``n_failure`` failure execution_traces rows
+    for one (lane, role, class) group, stamped ``days_ago`` days before now.
+
+    ``created_at`` is written in the same ``%Y-%m-%dT%H:%M:%S.%fZ`` shape the
+    runtime uses (``db/migrations/0014``), so the 28-day window compare in
+    ``_lane_fit`` sees it the same way the live DB does.
+    """
+    created = (datetime.now(timezone.utc) - timedelta(days=days_ago)).strftime(
+        "%Y-%m-%dT%H:%M:%S.%fZ")
+    vo = json.dumps({"node_type": role})
+    seq = 0
+    for status, n in (("success", n_success), ("failure", n_failure)):
+        for _ in range(n):
+            con.execute(
+                "INSERT INTO execution_traces "
+                "(trace_id, agent_version_id, task_class, verifier_output, cost_usd, "
+                "status, created_at, validity) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (f"tr-{role}-{lane}-{seq}", lane, cls, vo, cost_usd, status, created, validity),
+            )
+            seq += 1
+
+
 def test_lane_fit_hides_rows_below_three_runs(home: Path) -> None:
-    """Lanes with runs_count < 3 are filtered out — kickoff floor."""
-    iso = "2026-10-01T00:00:00.000Z"
+    """Lanes with fewer than 3 runs are filtered out — kickoff floor."""
     con = sqlite3.connect(home / "state.db")
-    lane_rows: list[tuple[str, str, str, str, int, int, float, str]] = [
-        ("v1", "implementer", "sonnet", "code_fix", 10, 9, 0.05, iso),  # 90% — visible
-        ("v2", "implementer", "haiku", "code_fix", 2, 2, 0.02, iso),    # <3 runs → hidden
-        ("v3", "implementer", "opus", "code_fix", 4, 1, 0.10, iso),    # 25% — visible
-    ]
-    for av, role, model, cls, rc, sc, cost, ts in lane_rows:
-        con.execute(
-            "INSERT INTO agent_performance_memory "
-            "(agent_version_id, role, model, task_class, runs_count, success_count, "
-            "avg_cost_usd, last_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (av, role, model, cls, rc, sc, cost, ts),
-        )
+    _seed_traces(con, "v1", "implementer", "code_fix", 9, 1)  # 10 runs, 90% — visible
+    _seed_traces(con, "v2", "implementer", "code_fix", 2, 0)  # 2 runs → hidden
+    _seed_traces(con, "v3", "implementer", "code_fix", 1, 3)  # 4 runs, 25% — visible
     con.commit()
     con.close()
 
@@ -200,24 +217,14 @@ def test_lane_fit_hides_rows_below_three_runs(home: Path) -> None:
 
 
 def test_lane_fit_star_only_on_best_lane_with_at_least_five_runs(home: Path) -> None:
-    """★ marks the lane with the highest pass rate AND runs_count >= 5."""
-    iso = "2026-10-01T00:00:00.000Z"
+    """★ marks the lane with the highest pass rate AND runs >= 5."""
     con = sqlite3.connect(home / "state.db")
-    lane_rows: list[tuple[str, str, str, str, int, int, float, str]] = [
-        # code_fix: v1 9/10 = 90% (★ candidate), v2 4/5 = 80% (eligible but lower), v3 3/3 = 100% (no ★ — runs<5).
-        ("v1", "implementer", "sonnet", "code_fix", 10, 9, 0.10, iso),
-        ("v2", "implementer", "haiku",  "code_fix", 5,  4, 0.05, iso),
-        ("v3", "implementer", "opus",   "code_fix", 3,  3, 0.20, iso),
-        # review: v4 8/9 = 89% → eligible and best → ★
-        ("v4", "implementer", "sonnet", "review", 9, 8, 0.10, iso),
-    ]
-    for av, role, model, cls, rc, sc, cost, ts in lane_rows:
-        con.execute(
-            "INSERT INTO agent_performance_memory "
-            "(agent_version_id, role, model, task_class, runs_count, success_count, "
-            "avg_cost_usd, last_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (av, role, model, cls, rc, sc, cost, ts),
-        )
+    # code_fix: v1 9/10 = 90% (★), v2 4/5 = 80% (eligible but lower), v3 3/3 = 100% (no ★ — runs<5).
+    _seed_traces(con, "v1", "implementer", "code_fix", 9, 1)
+    _seed_traces(con, "v2", "implementer", "code_fix", 4, 1)
+    _seed_traces(con, "v3", "implementer", "code_fix", 3, 0)
+    # review: v4 8/9 = 89% → eligible and best → ★
+    _seed_traces(con, "v4", "implementer", "review", 8, 1)
     con.commit()
     con.close()
 
@@ -246,20 +253,10 @@ def test_lane_fit_star_only_on_best_lane_with_at_least_five_runs(home: Path) -> 
 
 def test_lane_fit_pass_rate_colours(home: Path) -> None:
     """green ≥ 70%, red < 40%, yellow in between — checked on the rate cell."""
-    iso = "2026-10-01T00:00:00.000Z"
     con = sqlite3.connect(home / "state.db")
-    lane_rows: list[tuple[str, str, str, str, int, int, float, str]] = [
-        ("va", "implementer", "sonnet", "g_class", 10, 9, 0.10, iso),  # 90% → green
-        ("vb", "implementer", "haiku",  "g_class", 10, 5, 0.10, iso),  # 50% → yellow
-        ("vc", "implementer", "opus",   "g_class", 10, 3, 0.10, iso),  # 30% → red
-    ]
-    for av, role, model, cls, rc, sc, cost, ts in lane_rows:
-        con.execute(
-            "INSERT INTO agent_performance_memory "
-            "(agent_version_id, role, model, task_class, runs_count, success_count, "
-            "avg_cost_usd, last_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (av, role, model, cls, rc, sc, cost, ts),
-        )
+    _seed_traces(con, "va", "implementer", "g_class", 9, 1)  # 90% → green
+    _seed_traces(con, "vb", "implementer", "g_class", 2, 3)  # 40% → yellow (boundary)
+    _seed_traces(con, "vc", "implementer", "g_class", 1, 4)  # 20% → red
     con.commit()
     con.close()
 
@@ -279,6 +276,110 @@ def test_lane_fit_pass_rate_colours(home: Path) -> None:
     assert colours["va"] == "green"
     assert colours["vb"] == "yellow"
     assert colours["vc"] == "red"
+
+
+def test_lane_fit_excludes_infra_vacuous_and_stale(home: Path) -> None:
+    """Exact cells for the kickoff recipe, and infra/vacuous/stale rows excluded.
+
+    The infra_failed and vacuous rows are seeded ON the 'good'/'mid' lanes (same
+    role and class), not parked on their own <3-run lanes — so letting either
+    through its filter would change the asserted 90%/40% and fail the test.
+    """
+    con = sqlite3.connect(home / "state.db")
+    _seed_traces(con, "good", "researcher", "verified_artifact", 9, 1, cost_usd=0.09)  # 90% → ★
+    _seed_traces(con, "mid", "researcher", "verified_artifact", 2, 3, cost_usd=0.20)   # 40%
+    # infra_failed ON the good lane — if the validity filter dropped it, good
+    # becomes 9/11 ≈ 82%, not 90%. (Manual INSERT: _seed_traces would reuse
+    # 'tr-researcher-good-0' and trip the trace_id UNIQUE constraint.)
+    created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    con.execute(
+        "INSERT INTO execution_traces "
+        "(trace_id, agent_version_id, task_class, verifier_output, cost_usd, "
+        "status, created_at, validity) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("tr-researcher-good-infra-0", "good", "verified_artifact",
+         json.dumps({"node_type": "researcher"}), 0.09, "failure", created, "infra_failed"),
+    )
+    # vacuous ON the mid lane — if the status filter dropped it, mid becomes
+    # 2/6 ≈ 33%, not 40%.
+    con.execute(
+        "INSERT INTO execution_traces "
+        "(trace_id, agent_version_id, task_class, verifier_output, cost_usd, "
+        "status, created_at, validity) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("tr-researcher-mid-vac-0", "mid", "verified_artifact",
+         json.dumps({"node_type": "researcher"}), 0.20, "vacuous", created, "valid"),
+    )
+    _seed_traces(con, "old", "researcher", "verified_artifact", 5, 0,
+                 days_ago=30.0)                                                 # stale → excluded
+    con.commit()
+    con.close()
+
+    page = learn.build(home, "memory", {})
+    table = _section(page, "Lane fit by task class")
+    assert len(table["rows"]) == 2
+    good, mid = table["rows"]
+    # Assert the exact cells: class | role | lane | runs | pass rate | cost / run.
+    assert [c["t"] for c in good["cells"]] == \
+        ["verified_artifact", "researcher", "good ★", "10", "90%", "$0.09"]
+    assert [c["t"] for c in mid["cells"]] == \
+        ["", "researcher", "mid", "5", "40%", "$0.20"]
+    assert good["cells"][4]["c"] == "green"
+    assert mid["cells"][4]["c"] == "yellow"
+    # The excluded rows must not surface as their own lanes.
+    lane_texts = [r["cells"][2]["t"] for r in table["rows"]]
+    assert not any("infra" in t or "vac" in t or "old" in t for t in lane_texts)
+
+
+def test_lane_fit_star_one_role_per_lane(home: Path) -> None:
+    """One lane with two roles in the same class: only the best (role, lane) row
+    gets the ★ — the star is keyed on the row, not the lane name alone."""
+    con = sqlite3.connect(home / "state.db")
+    # Same lane 'shared', two roles in one class. researcher 9/10 = 90% (★);
+    # implementer 4/5 = 80% (eligible but lower). Both ≥ 5 runs, same lane.
+    _seed_traces(con, "shared", "researcher", "code_fix", 9, 1)
+    _seed_traces(con, "shared", "implementer", "code_fix", 4, 1)
+    con.commit()
+    con.close()
+
+    page = learn.build(home, "memory", {})
+    table = _section(page, "Lane fit by task class")
+    by_role = {r["cells"][1]["t"]: r for r in table["rows"]}
+    assert set(by_role) == {"researcher", "implementer"}
+    stars = [r for r in table["rows"] if "★" in r["cells"][2]["t"]]
+    assert len(stars) == 1
+    assert stars[0]["cells"][1]["t"] == "researcher"
+    # Same lane, other role: no star.
+    assert "★" not in by_role["implementer"]["cells"][2]["t"]
+
+
+def test_lane_fit_role_from_trace_id_prefix(home: Path) -> None:
+    """Role falls back to the ``tr-<type>-`` prefix; a trace_id with no second
+    dash renders '?', never the stray '-' the old substr produced."""
+    con = sqlite3.connect(home / "state.db")
+    created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    # verifier_output has no node_type → role must come from the trace_id prefix.
+    rows = [
+        ("tr-verifier-x-0", "v1", "cls", "{}", "success"),
+        ("tr-verifier-x-1", "v1", "cls", "{}", "success"),
+        ("tr-verifier-x-2", "v1", "cls", "{}", "success"),
+        # No second dash → '?' role (not '-'). Same class so both lanes surface.
+        ("tr-3efc7149cd804818", "v2", "cls", "{}", "success"),
+        ("tr-3efc7149cd804819", "v2", "cls", "{}", "success"),
+        ("tr-3efc7149cd804820", "v2", "cls", "{}", "success"),
+    ]
+    for tid, lane, cls, vo, status in rows:
+        con.execute(
+            "INSERT INTO execution_traces "
+            "(trace_id, agent_version_id, task_class, verifier_output, cost_usd, "
+            "status, created_at, validity) VALUES (?, ?, ?, ?, 0.05, ?, ?, 'valid')",
+            (tid, lane, cls, vo, status, created),
+        )
+    con.commit()
+    con.close()
+
+    page = learn.build(home, "memory", {})
+    table = _section(page, "Lane fit by task class")
+    roles = {r["cells"][1]["t"] for r in table["rows"]}
+    assert roles == {"verifier", "?"}
 
 
 def test_memories_to_review_lists_below_baseline_with_retire(home: Path) -> None:
