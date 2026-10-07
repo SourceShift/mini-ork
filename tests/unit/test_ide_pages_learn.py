@@ -341,15 +341,24 @@ def test_overview_empty_state(home: Path) -> None:
 
 
 def test_lessons_tab(seeded: Path) -> None:
+    """Default (no ``item``) build: three sections, every row openable.
+
+    Re-pinned for the learn-lessons-detail change: the gradient "gradient" column
+    split into ``target`` + ``signal``, the "injected" column now carries a real
+    count, and Patterns/Failure modes became tables (so rows carry ``do``/``sel``
+    instead of list ``items``/marks).
+    """
     page = learn.build(seeded, "lessons", {})
     assert [s["title"] for s in page["sections"]] == ["Gradients", "Patterns", "Failure modes"]
     grads = _section(page, "Gradients")
-    assert grads["head"] == ["gradient", "task class", "conf", "injected"]
+    assert grads["head"] == ["target", "signal", "task class", "conf", "injected"]
     assert [c["t"] for c in grads["rows"][0]["cells"]] == [
-        "verifier.code_fix · checks unclear", "code_fix", "0.84", "—"]
-    fm = _section(page, "Failure modes")["items"][0]
-    assert fm["t"] == "dispatch_error · execute" and fm["m"] == "✗"
-    assert fm["sub"].startswith("3 times in 3 runs")
+        "verifier.code_fix", "checks unclear", "code_fix", "0.84", "—"]
+    assert grads["rows"][0]["do"] == {"set": {"item": "g:g1"}}
+    fm = _section(page, "Failure modes")
+    assert [c["t"] for c in fm["rows"][0]["cells"]] == [
+        "dispatch_error · execute", "3", "3", "2026-10-03", "—"]
+    assert fm["rows"][0]["do"] == {"set": {"item": "f:dispatch_error|execute"}}
 
 
 def test_memory_tab(seeded: Path) -> None:
