@@ -268,6 +268,45 @@ Both decisions above were settled 2026-10-07: holdout ON at 10% (it ships with P
   process-wide (the old parallel path could mix batch outputs). It's correct but slower. Follow-up:
   have `llm_dispatch` return output without redirecting, then restore parallelism.
 
+## Engineer-first redesign (2026-10-07; supersedes the tab layout above)
+
+**What prompted it.** The first rebuild (Overview / Lessons / Memory / Self-improve) answers
+"how is mini-ork itself doing": task-class pass rates, stuck runs, decaying memories, quarantined
+promotions. That serves whoever maintains mini-ork. A software engineer using mini-ork on their
+codebase got nothing from it. Their questions are about their code and about steering the agents.
+
+| Engineer's question | Tab | Data |
+|---|---|---|
+| What has it learned about my code, file by file? | **Your code** | review findings + verifier failures per file/line (E1) |
+| What rules will agents follow when they touch this code, and can I change them? | **Rules** | your rules (`mini-ork prefs`, plus a new path scope) + learned lessons in plain words, with uses and lift |
+| What will the agents be told for my next task? | **Rules → Preview** | the learned-block renderer for a chosen kickoff |
+| What went wrong recently, and will it happen again? | **Recent mistakes** | failed / needs-revision runs, by cause, in plain words, with run titles |
+| Is it getting better at my kind of work? | **Trends** | today's outcomes table, with readable task names and run titles |
+
+**Moves off this page:** stuck runs, learning-loop health, the budget circuit, decaying memories,
+promotions and self-improve go to **Setup & health**. They matter to the person running
+mini-ork, not to the engineer doing a task.
+
+**Evidence the engineer data exists:**
+- 314 review files hold 390 reviewer findings, 254 naming a file and line (e.g.
+  `mini_ork/acp/agent.py:1529 docstring contradicts fix #2`); `mini_ork/ide_pages/node.py`
+  alone has 52.
+- 126 verifier files.
+- 52 of 57 mined patterns now carry an authored lesson (backfill on glm, 2026-10-07).
+
+| Step | Deliverable | Depends on |
+|---|---|---|
+| E1 | `code_findings` harvester + `areas()` / `findings_for()` rollups (migration 0064) | — (running) |
+| E2 | Path-scoped rules: `mini-ork prefs set --scope path --target 'mini_ork/ide_pages/**'`, injected only when the run's scope (`run_profile.scope_allow` / kickoff "Files in scope") matches; `mini-ork prefs preview <kickoff>` prints the exact learned block | prefs (merged) |
+| E3 | UI: Your code tab (areas → findings → "Make this a rule for this file") | E1, E2 |
+| E4 | UI: Rules tab (yours + learned, uses/lift, Keep/Edit/Forget, Preview) | E2, P3 |
+| E5 | UI: Recent mistakes + Trends; move system health to Setup & health | E1 |
+| E6 | Reflect hook: harvest findings every pass | E1, themes merged |
+| P10 | Usefulness audit, now against the engineer's questions above | all |
+
+P3 (one lesson per theme) and P4 (lift + holdout) stay: they decide which learned lessons appear
+in Rules and whether they help.
+
 ## Progress
 
 | Phase | Worktree / run | State |
