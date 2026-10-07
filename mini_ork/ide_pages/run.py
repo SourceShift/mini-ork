@@ -873,6 +873,154 @@ def _agents_tab(run: Run) -> list[dict[str, Any]]:
     return S.guarded(errors, "Agent roster", roster) + S.guarded(errors, "Cost by stage", run_level)
 
 
+# `tr-<type>-<node>-<hash>` is the trace-id format the gradient extractor writes
+# as evidence (see ``mini_ork/learning/gradient_extractor.py``); strip the type
+# prefix and the trailing hash to surface the node id in the UI. If a trace id
+# doesn't match the shape, return it whole — the caller's fallback is "show the
+# raw id" rather than "show nothing".
+_NODE_FROM_TRACE = re.compile(r"^tr-[a-z_]+-([a-z0-9_]+)-([A-Za-z0-9]+)$")
+
+_PACK_DETAIL_CAP = 8
+
+
+def _parse_trace_node(trace_id: str) -> str:
+    """Pull the node id out of ``tr-<type>-<node>-<hash>``; fall back to ``trace_id``."""
+    m = _NODE_FROM_TRACE.match(trace_id or "")
+    return m.group(1) if m else (trace_id or "")
+
+
+def _pack_failure_modes_items(value: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for fm in (value if isinstance(value, list) else []):
+        if not isinstance(fm, dict):
+            continue
+        title = str(fm.get("signal") or "")[:200]
+        fix = ("fix: " + str(fm.get("suggested_change") or ""))[:160]
+        parts = [fix]
+        target = str(fm.get("target") or "")
+        if target:
+            parts.append("· " + target)
+        conf = fm.get("confidence")
+        if conf is not None:
+            try:
+                parts.append(f"· confidence {float(conf):.2f}")
+            except (TypeError, ValueError):
+                pass
+        out.append(S.item(title, " ".join(parts)))
+    return out
+
+
+def _pack_similar_lessons_items(value: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for sl in (value if isinstance(value, list) else []):
+        if not isinstance(sl, dict):
+            continue
+        title = str(sl.get("title") or "")[:200]
+        fix = ("fix: " + str(sl.get("suggested_fix") or ""))[:160]
+        sub = fix
+        score = sl.get("score")
+        if score is not None:
+            try:
+                sub += f" · similarity {float(score):.2f}"
+            except (TypeError, ValueError):
+                pass
+        out.append(S.item(title, sub))
+    return out
+
+
+def _pack_patterns_items(value: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for vp in (value if isinstance(value, list) else []):
+        if not isinstance(vp, dict):
+            continue
+        lesson = str(vp.get("lesson_text") or "")
+        cluster = str(vp.get("cluster_label") or "")
+        title = lesson if lesson else cluster
+        cite = str(vp.get("cite") or "")
+        # Pattern id lives after the last '/' in cite ("execution_traces/pat-xyz" → "pat-xyz").
+        pattern_id = cite.rsplit("/", 1)[-1] if "/" in cite else cite
+        parts = [f"pattern {pattern_id}"] if pattern_id else []
+        strength = vp.get("strength_score")
+        if strength is not None:
+            try:
+                parts.append(f"· strength {float(strength):.0f}")
+            except (TypeError, ValueError):
+                pass
+        if not lesson:
+            parts.append("· no authored lesson (frequency only)")
+        out.append(S.item(title, " ".join(parts) if parts else ""))
+    return out
+
+
+def _pack_prior_runs_items(value: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for pr in (value if isinstance(value, list) else []):
+        if not isinstance(pr, dict):
+            continue
+        status = str(pr.get("status") or "")
+        trace_id = str(pr.get("trace_id") or "")
+        title = f"{status} · {trace_id}" if trace_id else status
+        try:
+            cost = float(pr.get("cost_usd") or 0.0)
+        except (TypeError, ValueError):
+            cost = 0.0
+        try:
+            duration_ms = int(pr.get("duration_ms") or 0)
+        except (TypeError, ValueError):
+            duration_ms = 0
+        duration_s = duration_ms // 1000
+        created_at = str(pr.get("created_at") or "")
+        sub = f"${cost:.2f} · {duration_s}s · {created_at[:16]}"
+        mc = "green" if status == "success" else ("red" if status == "failure" else "sub")
+        out.append(S.item(title, sub, mc=mc))
+    return out
+
+
+def _pack_kv_items(value: Any) -> list[dict[str, Any]]:
+    """Constraints / user_preferences — list of scalars/dicts or a flat dict.
+
+    A dict becomes one item per ``f"{k}: {v}"`` entry; a list of scalars or
+    one-key dicts becomes one item per entry."""
+    out: list[dict[str, Any]] = []
+    if isinstance(value, list):
+        for v in value:
+            if isinstance(v, dict):
+                for k2, v2 in v.items():
+                    out.append(S.item(f"{k2}: {v2}"[:200]))
+            else:
+                out.append(S.item(str(v)[:200]))
+    elif isinstance(value, dict):
+        for k2, v2 in value.items():
+            out.append(S.item(f"{k2}: {v2}"[:200]))
+    return out
+
+
+_PACK_ITEM_BUILDERS = {
+    "known_failure_modes": _pack_failure_modes_items,
+    "similar_lessons": _pack_similar_lessons_items,
+    "verified_emergent_patterns": _pack_patterns_items,
+    "prior_similar_runs": _pack_prior_runs_items,
+    "constraints": _pack_kv_items,
+    "user_preferences": _pack_kv_items,
+}
+
+
+def _pack_section_items(key: str, value: Any, pack_path: Path) -> list[dict[str, Any]]:
+    """Build the detail list for one non-empty pack section.
+
+    Caps visible items at ``_PACK_DETAIL_CAP``; the overflow becomes a
+    ``+N more`` row with an Open action that jumps to the pack file."""
+    builder = _PACK_ITEM_BUILDERS.get(key)
+    raw_items = builder(value) if builder else []
+    if len(raw_items) > _PACK_DETAIL_CAP:
+        overflow = len(raw_items) - _PACK_DETAIL_CAP
+        visible = raw_items[:_PACK_DETAIL_CAP]
+        visible.append(S.item(f"+{overflow} more",
+                              acts=[S.btn("Open", S.open_path(str(pack_path)), "ghost")]))
+        return visible
+    return raw_items
+
+
 def _learnings_tab(run: Run) -> list[dict[str, Any]]:
     errors: dict[str, str] = {}
 
@@ -880,21 +1028,39 @@ def _learnings_tab(run: Run) -> list[dict[str, Any]]:
         from mini_ork.web.db import db_for
 
         db = db_for(run.home)
-        items = []
-        start = _epoch(run.row.get("created_at"))
-        # Reflection runs after the last node, so the window closes at the
-        # row's last update, not at ``ended_at``.
-        end = max(_epoch(run.row.get("ended_at")) or 0, _epoch(run.row.get("updated_at")) or 0) \
-            or int(time.time())
-        task_class = run.row.get("task_class") or ""
-        if start and db.has_table("gradient_records"):
-            for g in db.rows(
-                "SELECT gradient_id, target, signal, confidence FROM gradient_records "
-                "WHERE created_at BETWEEN ? AND ? AND (task_class = ? OR ? = '') "
-                "ORDER BY created_at DESC LIMIT 20", (start, end + 60, task_class, task_class)):
-                items.append(S.item(f"{g.get('gradient_id')} · {str(g.get('signal') or '')[:160]}",
-                                    f"confidence {float(g.get('confidence') or 0):.2f} · {g.get('target')}",
-                                    m="✦", mc="purple"))
+        items: list[dict[str, Any]] = []
+        if db.has_table("gradient_records"):
+            # Join on execution_traces by trace_id (= gradient.evidence) and
+            # filter by run_id so gradients from other same-class runs in the
+            # same window don't bleed in. Tolerate a missing execution_traces
+            # table: skip the run-scoped join (no rows, no crash).
+            if db.has_table("execution_traces"):
+                join_sql = (
+                    "SELECT g.gradient_id, g.signal, g.suggested_change, g.evidence, "
+                    "g.confidence, g.target, g.task_class, g.created_at "
+                    "FROM gradient_records g "
+                    "JOIN execution_traces t ON t.trace_id = g.evidence "
+                    "WHERE t.run_id = ? "
+                    "ORDER BY g.created_at DESC LIMIT 20"
+                )
+                # Bind `run.id` directly: live `execution_traces.run_id` holds the
+                # text run id from `task_runs.id` (e.g. ``run-<ts>-<pid>``),
+                # not an integer — a `CAST(? AS INTEGER)` would coerce text to 0
+                # and silently drop every real row.
+                rows = db.rows(join_sql, (run.id,))
+            else:
+                rows = []
+            for g in rows:
+                trace_id = str(g.get("evidence") or "")
+                node = _parse_trace_node(trace_id) or "—"
+                title = str(g.get("signal") or "")[:200]
+                fix = ("fix: " + str(g.get("suggested_change") or ""))[:160]
+                try:
+                    conf = float(g.get("confidence") or 0.0)
+                except (TypeError, ValueError):
+                    conf = 0.0
+                sub = f"{fix} · {node} · confidence {conf:.2f}"
+                items.append(S.item(title, sub, m="✦", mc="purple"))
         if db.has_table("learning_record"):
             for r in db.rows("SELECT title, category, outcome, confidence FROM learning_record "
                              "WHERE run_id = ? ORDER BY rank LIMIT 20", (run.id,)):
@@ -904,11 +1070,13 @@ def _learnings_tab(run: Run) -> list[dict[str, Any]]:
         if not items:
             items = [S.dot("Nothing recorded", "Reflection writes gradients after the run's last node.")]
         return S.lst("Produced by the run", items, full=True,
-                     note="Gradients recorded while this run reflected (same task class, during the run).")
+                     note="Gradients reflection wrote about this run's own nodes.")
 
-    def available() -> dict[str, Any]:
+    def available() -> list[dict[str, Any]]:
+        sections: list[dict[str, Any]] = []
         pack_path = run.run_dir / "context-pack.json"
-        items = []
+        items: list[dict[str, Any]] = []
+        pack: dict[str, Any] = {}
         if pack_path.is_file():
             try:
                 pack = json.loads(pack_path.read_text(encoding="utf-8"))
@@ -924,9 +1092,10 @@ def _learnings_tab(run: Run) -> list[dict[str, Any]]:
                 value = pack.get(key)
                 n = len(value) if isinstance(value, (list, dict)) else 0
                 if n:
-                    first = value[0] if isinstance(value, list) else next(iter(value.values()))
-                    cite = first.get("cite") if isinstance(first, dict) else ""
-                    items.append(S.ok(label, f"{n} item{'s' if n != 1 else ''}" + (f" · e.g. {cite}" if cite else "")))
+                    items.append(S.ok(label, f"{n} item{'s' if n != 1 else ''}"))
+                    detail = _pack_section_items(key, value, pack_path)
+                    if detail:
+                        sections.append(S.lst(f"{label} · {n}", detail, full=True))
                 else:
                     items.append(S.dot(label, "none given"))
             graph = pack.get("graph_context") if isinstance(pack.get("graph_context"), dict) else {}
@@ -945,7 +1114,10 @@ def _learnings_tab(run: Run) -> list[dict[str, Any]]:
             n = (db.row("SELECT COUNT(*) AS n FROM operator_steering WHERE run_id = ?", (run.id,)) or {}).get("n", 0)
             items.append(S.ok("Operator steering", f"{n} message(s) this run") if n
                          else S.dot("Operator steering", "none this run"))
-        return S.lst("Available to the run", items, full=True)
+        summary = S.lst("Available to the run", items, full=True,
+                        note="Context pack assembled for the planner at plan time. Each "
+                             "node's own injected learning is on its Learning tab.")
+        return [summary, *sections]
 
     return (S.guarded(errors, "Produced by the run", produced)
             + S.guarded(errors, "Available to the run", available))

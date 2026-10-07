@@ -89,6 +89,12 @@ def _seed(home: Path, *, status: str = "published", recipe: str = "demo-recipe")
                 "confidence, created_at, task_class) VALUES (?,?,?,?,?,?,?,?)",
                 ("gr-demo1", "workflow.node.implementer", "the implementer skipped the test",
                  "run the test first", "tr-x", 0.7, T0 + 115, "demo"))
+    # Bridge for `_learnings_tab`'s run-scoped gradient join: `task_runs.id` is
+    # TEXT (e.g. ``run-<ts>-<pid>``) and live `execution_traces.run_id` stores
+    # the same text — mirror that shape here so the join exercised by
+    # `test_agents_learnings_and_artifacts` reflects production.
+    con.execute("INSERT INTO execution_traces (trace_id, run_id, status, task_class) "
+                "VALUES (?, ?, ?, ?)", ("tr-x", RUN, "success", "demo"))
     con.commit()
     con.close()
     (run_dir / "plan.json").write_text('{"objective": "x"}')
@@ -177,9 +183,17 @@ def test_agents_learnings_and_artifacts(home: Path) -> None:
 
     learn = build_page(home, "run", "learnings", {"run": RUN})
     produced = _section(learn, "list", "Produced by the run")
-    assert produced["items"][0]["t"].startswith("gr-demo1")
+    # Title is the gradient's signal (not its gradient_id); the trace id
+    # `tr-x` doesn't parse to a node name, so the sub falls back to the raw id.
+    assert produced["items"][0]["t"] == "the implementer skipped the test"
+    assert produced["items"][0]["m"] == "✦"
+    assert "fix: run the test first" in produced["items"][0]["sub"]
+    assert "tr-x" in produced["items"][0]["sub"]
+    assert "confidence 0.70" in produced["items"][0]["sub"]
     available = {i["t"]: i for i in _section(learn, "list", "Available to the run")["items"]}
     assert available["Prior same-class runs"]["m"] == "✓"
+    # New summary drops the cite — only the count remains.
+    assert available["Prior same-class runs"]["sub"] == "1 item"
     assert available["Learned failure modes"]["sub"] == "none given"
 
     arts = build_page(home, "run", "artifacts", {"run": RUN})
