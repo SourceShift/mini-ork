@@ -621,3 +621,96 @@ def load_pack(run_dir: str) -> dict:
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+# ── run-level wiring helpers (used by plan._inject_context / execute._learned_block) ──
+
+def arm(run_id: str) -> str:
+    """Which arm this run is in: ``off`` | ``shadow`` | ``v2`` | ``holdout``."""
+    m = mode()
+    if m != "on":
+        return m
+    return "holdout" if in_holdout(run_id) else "v2"
+
+
+def _profile_kickoff(run_dir: str) -> str:
+    try:
+        with open(os.path.join(run_dir, "run_profile.json"), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return str(data.get("kickoff_path") or "") if isinstance(data, dict) else ""
+    except (OSError, ValueError):
+        return ""
+
+
+def pack_for_run(run_dir: str, *, kickoff_path: str | None = None, task_class: str = "",
+                 run_id: str = "", db: str | None = None) -> dict:
+    """The run's v2 pack: loaded when the planner already wrote it, else built
+    (from ``run_profile.json``'s kickoff when none is given) and written once.
+    Never raises; ``{}`` when there is no kickoff to read."""
+    try:
+        pack = load_pack(run_dir)
+        if pack:
+            return pack
+        kickoff_path = kickoff_path or _profile_kickoff(run_dir)
+        if not kickoff_path:
+            return {}
+        pack = build(kickoff_path, task_class=task_class, db=db, run_id=run_id)
+        pack["arm"] = arm(run_id)
+        write_json(os.path.join(run_dir, PACK_FILENAME), pack)
+        return pack
+    except Exception:  # noqa: BLE001 — prompt path must fail soft
+        return {}
+
+
+def rendered_ids(text: str, pack: dict) -> list[str]:
+    """Pack item ids that actually appear in ``text`` (after budget trimming)."""
+    return [i for i in (pack.get("item_ids") or []) if f"[{i}]" in text]
+
+
+def node_block(run_dir: str, node_type: str, run_id: str, *, task_class: str = "",
+               sources: list[dict] | None = None) -> str:
+    """The v2 block for one LLM node, or ``""`` unless this run's arm is ``v2``.
+    Appends one ``kind: "context_v2"`` source per injected item id."""
+    if not run_dir or arm(run_id) != "v2":
+        return ""
+    pack = pack_for_run(run_dir, task_class=task_class, run_id=run_id)
+    text = render(pack, node_type) if pack else ""
+    if text and sources is not None:
+        sources.extend({"kind": "context_v2", "id": i} for i in rendered_ids(text, pack))
+    return text
+
+
+def write_injection_record(run_dir: str, node_id: str, *, text: str,
+                           sources: list[dict], extra: dict | None = None) -> None:
+    """``learned/<node_id>.md`` (the exact injected text) + ``.json`` — the same
+    ledger shape the execute handlers write for LLM nodes, here for the planner,
+    whose injection was previously unrecorded. Never raises."""
+    try:
+        learned = os.path.join(run_dir, "learned")
+        record = {
+            "node_id": node_id,
+            "injected": bool(text and text.strip()),
+            "reason": "" if text and text.strip() else "nothing matched",
+            "sources": list(sources),
+            "written_at": int(time.time()),
+        }
+        record.update(extra or {})
+        write_json(os.path.join(learned, f"{node_id}.json"), record)
+        md_path = os.path.join(learned, f"{node_id}.md")
+        if record["injected"]:
+            with open(md_path, "w", encoding="utf-8") as fh:
+                fh.write(text.strip() + "\n")
+        elif os.path.exists(md_path):
+            os.remove(md_path)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def acknowledgements(plan: dict, pack: dict) -> dict:
+    """The planner's optional ``context_used`` list, split into ids that exist
+    in the pack and ids it made up."""
+    used = plan.get("context_used") if isinstance(plan, dict) else None
+    used = [str(u) for u in used] if isinstance(used, list) else []
+    known = item_ids(pack)
+    return {"used": used, "valid": [u for u in used if u in known],
+            "invalid": [u for u in used if u not in known]}

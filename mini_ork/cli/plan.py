@@ -446,26 +446,52 @@ def _contextnest_recent_sessions_md(brief_path, max_files=4) -> str:
         return ""
 
 
+def _context_v2_planner(kickoff, task_class, db, out_file, dry_run) -> tuple[str, dict, dict]:
+    """``(block, pack, ledger_extra)`` for the planner. ``block`` is non-empty only
+    in the ``v2`` arm (``MO_CONTEXT_V2=on``, not held out); ``shadow`` builds and
+    records the pack without injecting it. Fail-soft."""
+    try:
+        from mini_ork import context_v2
+        ctx_mode = context_v2.mode()
+        if dry_run or ctx_mode == "off":
+            return "", {}, {"context_v2": {"mode": ctx_mode, "arm": "off", "injected": False}}
+        run_dir = os.path.dirname(out_file)
+        run_id = os.environ.get("MINI_ORK_RUN_ID", "") or os.path.basename(run_dir)
+        pack = context_v2.pack_for_run(run_dir, kickoff_path=kickoff, task_class=task_class,
+                                       run_id=run_id, db=db)
+        arm = context_v2.arm(run_id)
+        block = context_v2.render(pack, "planner") if (pack and arm == "v2") else ""
+        return block, pack, {"context_v2": {
+            "mode": ctx_mode, "arm": arm, "injected": bool(block),
+            "item_ids": context_v2.rendered_ids(block, pack) if block else []}}
+    except Exception:
+        return "", {}, {}
+
+
 def _inject_context(prompt, kickoff, task_class, db, out_file, dry_run) -> str:
     if os.environ.get("MO_INJECT_LEARNINGS", "1") != "1":
         return prompt
-    blocks = []
+    # (kind, text) in prompt order. The three task_class-keyed v1 blocks are the
+    # ones context v2 replaces in its v2 arm; everything else is kept as is.
+    v1_task_blocks: list[tuple[str, str]] = []
+    other_blocks: list[tuple[str, str]] = []
     try:
         from mini_ork import context_assembler
-        for producer in (context_assembler.failure_modes_md, context_assembler.prior_runs_md):
+        for kind, producer in (("failure_modes", context_assembler.failure_modes_md),
+                               ("prior_runs", context_assembler.prior_runs_md)):
             try:
                 block = producer(task_class, 5, db=db)
             except Exception:
                 block = ""
             if block:
-                blocks.append(block)
+                v1_task_blocks.append((kind, block))
 
         try:
             graph_block = context_assembler.graph_context_md(task_class, 5, db=db)
         except Exception:
             graph_block = ""
         if graph_block:
-            blocks.append(graph_block)
+            v1_task_blocks.append(("graph_context", graph_block))
 
         role_pack = ""
         if os.environ.get("MO_USE_ROLE_PACKS", "1") == "1":
@@ -476,17 +502,39 @@ def _inject_context(prompt, kickoff, task_class, db, out_file, dry_run) -> str:
                 role_pack = ""
         generic = "" if role_pack else _contextnest_atoms_md(kickoff, 6)
         if role_pack or generic:
-            blocks.append(role_pack or generic)
+            other_blocks.append(("role_pack" if role_pack else "contextnest_atoms",
+                                 role_pack or generic))
         recent = _contextnest_recent_sessions_md(kickoff, 4)
         if recent:
-            blocks.append(recent)
+            other_blocks.append(("contextnest_recent", recent))
         try:
             from mini_ork.orchestration.active_state_index import render_active_state_block
             active = render_active_state_block(task_class, 30, db_path=db)
         except Exception:
             active = ""
         if active:
-            blocks.append(active)
+            other_blocks.append(("active_state", active))
+
+        v2_block, _v2_pack, ledger_extra = _context_v2_planner(
+            kickoff, task_class, db, out_file, dry_run)
+        tagged = ([("context_v2", v2_block)] if v2_block else v1_task_blocks) + other_blocks
+        blocks = [text for _, text in tagged]
+
+        if not dry_run:
+            # The planner's exact injected text, in the same ledger shape the
+            # execute handlers write for LLM nodes (learned/<node>.md + .json).
+            try:
+                from mini_ork import context_v2
+                sources = [{"kind": kind} for kind, _ in tagged]
+                if v2_block:
+                    sources += [{"kind": "context_v2", "id": i}
+                                for i in ledger_extra.get("context_v2", {}).get("item_ids", [])]
+                context_v2.write_injection_record(
+                    os.path.dirname(out_file), "planner",
+                    text="\n\n".join(b.rstrip("\n") for b in blocks),
+                    sources=sources, extra=ledger_extra)
+            except Exception:
+                pass
 
         if not dry_run:
             brief_path = ""

@@ -2535,6 +2535,22 @@ def _learned_block(root, task_class, node_type, lane="", node_id="",
     except Exception:
         pref_block = ""
         pref_sources = []
+    # Context v2 (MO_CONTEXT_V2=on, not held out): the kickoff's constraints and
+    # the problems reviewers already found in this run's files, from the pack the
+    # planner wrote. It sits after the operator's preferences and before the
+    # learned failure modes. Any other arm, or any failure, adds nothing.
+    v2_block = ""
+    v2_sources: list[dict] = []
+    try:
+        from mini_ork import context_v2
+        v2_block = context_v2.node_block(
+            context_env("MINI_ORK_RUN_DIR", ""), node_type,
+            context_env("MINI_ORK_RUN_ID", ""), task_class=task_class or "",
+            sources=v2_sources)
+        if v2_block:
+            v2_block = "\n\n" + v2_block
+    except Exception:
+        v2_block, v2_sources = "", []
     block = ""
     try:
         from mini_ork import context_assembler
@@ -2583,12 +2599,12 @@ def _learned_block(root, task_class, node_type, lane="", node_id="",
                 sources.extend(steering_sources)
     except Exception:
         pass
-    if pref_sources and sources is not None:
+    if (pref_sources or v2_sources) and sources is not None:
         # Pref sources are prepended so they appear in prompt order (prefs
-        # first), matching the IDE "Learning" tab contract that the user's
-        # operator rules show up ahead of learned failure modes.
-        sources[:0] = pref_sources
-    return pref_block + block
+        # first, then context v2), matching the IDE "Learning" tab contract
+        # that the user's operator rules show up ahead of learned failure modes.
+        sources[:0] = pref_sources + v2_sources
+    return pref_block + v2_block + block
 
 
 def _intervention_gate_check(root, node_id, node_type, lane, node_desc):

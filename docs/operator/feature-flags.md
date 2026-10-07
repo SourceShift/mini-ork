@@ -146,6 +146,9 @@ five keys or none.
 | Variable | Default | Effect |
 |---|---|---|
 | `MINI_ORK_CTX_BUDGET_TOKENS` | `"64000"` | Context-pack token budget |
+| `MO_CONTEXT_V2` | `"shadow"` | Context selected by the run's files in scope and the kickoff contract (`mini_ork/context_v2.py`) instead of by task class. `off` · `shadow` build + record `context-pack.v2.json`, inject nothing new · `on` the planner gets the v2 block in place of the three task_class blocks (failure modes, prior runs, graph context) and researcher/implementer/reviewer nodes get it after the operator preferences. The planner's exact injected text is always recorded in `learned/planner.md` + `.json`. Measured by `mini-ork metrics context` |
+| `MO_CONTEXT_V2_HOLDOUT` | `"0.2"` | Under `on`, the deterministic share of runs (by run id) that keep the v1 context, so `metrics context` can compare recurrence of injected problems (`lift` = holdout − v2) |
+| `MO_CONTEXT_V2_MIN_SEVERITY` | `"medium"` | Lowest finding severity a recurring-problem group needs to be injected (`low` lets harness remarks through) |
 | `MINI_ORK_SLICE_PROVIDER` | `"default"` | Context slice provider selection |
 | `MO_SEMANTIC_MODEL` | `"haiku"` | Semantic-memory helper model |
 | `MO_EMBED_PROVIDER` | `""` | Embedder provider (see `register_embedder_provider`) |

@@ -665,7 +665,11 @@ def _overview_tab(run: Run) -> list[dict[str, Any]]:
                                [S.btn("Open", S.open_path(kick), "ghost")]))
         for name, what in (("plan.json", "The planner's objective and steps"),
                            ("run_profile.json", "Task class and risk the classifier assigned"),
-                           ("context-pack.json", "Cite-tagged memory the planner was given")):
+                           # Audit only: no model reads this file. What the planner
+                           # actually received is learned/planner.md.
+                           ("context-pack.json", "Memory available at plan time (audit only, not sent to the planner)"),
+                           ("context-pack.v2.json", "Context selected for this run's files (context v2)"),
+                           ("learned/planner.md", "Exactly what the planner was given")):
             p = d / name
             if p.is_file():
                 items.append(S.dot(name, f"{what} · {_size(p)}", [S.btn("Open", S.open_path(str(p)), "ghost")]))

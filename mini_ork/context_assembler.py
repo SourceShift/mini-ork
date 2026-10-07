@@ -208,10 +208,14 @@ def context_assemble(task_brief_path: str, workflow_node: str,
 
     similar_lessons = []
     try:
+        # The planner's brief is {"task_class", "kickoff"}: without the kickoff text
+        # the query was the bare task class, so every "similar" lesson was a
+        # framework-meta match on the word "framework_edit".
         query_text = " ".join(filter(None, [
             brief.get("goal", "") if isinstance(brief, dict) else "",
             brief.get("title", "") if isinstance(brief, dict) else "",
             brief.get("description", "") if isinstance(brief, dict) else "",
+            (brief.get("kickoff", "") or "")[:2000] if isinstance(brief, dict) else "",
             task_class]))
 
         for tbl, col, kind in (("bug_reports", "title", "bug"),
@@ -421,7 +425,7 @@ def failure_modes_md(task_class: str, limit: int = 5, db: str | None = None,
         out.append("Avoid repeating these known issues:")
         for gradient_id, target, signal, change in rows:
             out.append(f"- [{target}] {signal.strip()}")
-            out.append(f"  Fix applied going forward: {change.strip()}")
+            out.append(f"  Suggested fix (not verified as applied): {change.strip()}")
             if sources is not None:
                 sources.append({
                     "kind": "gradient",
@@ -880,7 +884,7 @@ def graph_context_md(task_class: str, limit: int = 5, db: str | None = None) -> 
                      if target_class and target_class != task_class else "")
             out.append(f"- [{target}]{scope} {link_count} failure link(s): "
                        f"{(signal or '').strip()}")
-            out.append(f"  Fix applied going forward: {(change or '').strip()}")
+            out.append(f"  Suggested fix (not verified as applied): {(change or '').strip()}")
     if hotspots:
         out.append("Recurring failure hotspots:")
         for stage, category, n, last_at, last_error in hotspots:

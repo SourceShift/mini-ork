@@ -215,6 +215,9 @@ def main(argv=None, *, stdout=None, stderr=None) -> int:
     if args[:1] == ["sdd"]:  # `mini-ork metrics sdd` — the SDD plan's baselines
         from mini_ork.cli import metrics_sdd  # noqa: PLC0415
         return metrics_sdd.main(args[1:], stdout=out, stderr=err)
+    if args[:1] == ["context"]:  # `mini-ork metrics context` — context v2 delivery + outcome
+        from mini_ork.cli import metrics_context  # noqa: PLC0415
+        return metrics_context.main(args[1:], stdout=out, stderr=err)
 
     recipe, since, fmt, help_flag, unknown, parse_err = _parse(argv)
     if help_flag:
