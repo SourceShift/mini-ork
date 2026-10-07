@@ -127,8 +127,9 @@ def suggest(home, *, failed_lane, alias, node_types, db=None,
     * candidates = ``known_lanes`` minus ``failed_lane``, restricted to
       ``code_lanes()`` when any of ``node_types`` is a code node;
     * drop lanes with any quota/auth failure in the window;
-    * rank by ``ok`` desc, then fewer ``other_fail``, then name; unseen lanes
-      (no recent calls) rank last;
+    * rank tested lanes first; for code, in ``MO_CODE_LANES`` order (the house
+      preference: opus, the reviewer family, last); then ``ok`` desc, fewer
+      ``other_fail``, name; unseen lanes (no recent calls) rank last;
     * return ``[{"lane", "reason"}]`` (≤ ``limit``), e.g.
       ``"14 successful calls in the last 6h"`` / ``"no recent calls (untested)"``.
     """
@@ -151,10 +152,15 @@ def suggest(home, *, failed_lane, alias, node_types, db=None,
             continue  # unhealthy — drop
         scored.append((ln, h))
 
+    # For code, the MO_CODE_LANES order is the house preference (implementer on
+    # a different family than the Opus reviewer, opus last): it outranks raw
+    # success counts among healthy lanes. Untested lanes still rank last.
+    policy = {ln: i for i, ln in enumerate(code_lanes())} if is_code else {}
+
     def _key(item: tuple[str, dict[str, Any]]):
         ln, h = item
         unseen = h["ok"] == 0 and h["other_fail"] == 0
-        return (unseen, -int(h["ok"]), int(h["other_fail"]), ln)
+        return (unseen, policy.get(ln, len(policy)), -int(h["ok"]), int(h["other_fail"]), ln)
 
     scored.sort(key=_key)
     out: list[dict[str, str]] = []

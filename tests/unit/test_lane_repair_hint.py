@@ -183,6 +183,84 @@ def _seed_run(home: Path, run_id: str = RUN, *, status: str = "failed",
     return run_dir
 
 
+def _seed_live_shape(home: Path, run_id: str = RUN, *,
+                     with_node_failure: bool = True) -> Path:
+    """The r2 live shape (run ``learn-memory-tab-r2-…``): a workflow node
+    (``prior_art_lens`` on ``codex_lens``) dies on a 429 whose wording lives
+    **only** in ``agent-prior_art_lens.live.jsonl``; a *later* reflect-time
+    ``gradient-extract`` call times out on ``minimax``. The hint must pick the
+    run's own node, not the newest row (the r1 bug)."""
+    ts = int(time.time())
+    run_dir = home / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    kickoff = home / "kickoffs" / "demo.md"
+    kickoff.parent.mkdir(parents=True, exist_ok=True)
+    kickoff.write_text("# lane-repair test\n", encoding="utf-8")
+    con = sqlite3.connect(home / "state.db")
+    con.execute(
+        "INSERT INTO task_runs (id, recipe, status, cost_usd, created_at, updated_at, "
+        "ended_at, task_class, kickoff_path, workflow_version) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (run_id, "framework-edit", "failed", 0.5, ts, ts + 100, ts + 80,
+         "framework_edit", str(kickoff), "latest"))
+    # ``code_impact_lens`` started on ``minimax_lens`` but did not fail.
+    con.execute(
+        "INSERT INTO run_events (event_id, run_id, event_type, payload_json, created_at) "
+        "VALUES (?,?,?,?,?)",
+        (f"ev-{run_id}-start-cil", run_id, "node_start",
+         json.dumps({"node_id": "code_impact_lens", "node_type": "researcher",
+                     "model_lane": "minimax_lens"}), ts + 5))
+    if with_node_failure:
+        con.execute(
+            "INSERT INTO run_events (event_id, run_id, event_type, payload_json, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (f"ev-{run_id}-start-pal", run_id, "node_start",
+             json.dumps({"node_id": "prior_art_lens", "node_type": "researcher",
+                         "model_lane": "codex_lens"}), ts + 10))
+        con.execute(
+            "INSERT INTO run_events (event_id, run_id, event_type, payload_json, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (f"ev-{run_id}-end-pal", run_id, "node_end",
+             json.dumps({"node_id": "prior_art_lens",
+                         "finish_reason": "error"}), ts + 30))
+    con.commit()
+    con.close()
+    if with_node_failure:
+        # NULL category; the row's error_message is unrelated stderr chatter, and
+        # the 429 wording lives only in the agent live stream.
+        _insert_llm_call(
+            home, model_id="minimax", status="failed", run_id=run_id,
+            feature_name="mini-ork:codex_lens", actor="codex_lens",
+            error_message="stderr: npm warn deprecated left-pad@1.0.0",
+            error_category=None, retryable=0,
+        )
+        (run_dir / "agent-prior_art_lens.live.jsonl").write_text(
+            # The real capture shape: a ``{"seq","stream","t","line"}`` wrapper
+            # whose ``line`` string holds the provider record with the result.
+            json.dumps({"seq": 0, "stream": "stdout", "t": 203.956,
+                        "line": json.dumps({
+                            "type": "result", "is_error": True,
+                            "api_error_status": 429, "result": MINIMAX_TEXT})}) + "\n",
+            encoding="utf-8",
+        )
+    # Healthy lanes for the suggest ranking (not run-scoped).
+    for _ in range(5):
+        _insert_llm_call(home, model_id="deepseek", status="success")
+    for _ in range(9):
+        _insert_llm_call(home, model_id="glm", status="success")
+    # The LATER reflect-time call — newest row (``id DESC``), NULL category.
+    _insert_llm_call(
+        home, model_id="minimax", status="failed", run_id=run_id,
+        feature_name="mini-ork:gradient-extract", actor="gradient-extract",
+        error_message="timeout after 120.0s", error_category=None, retryable=0,
+    )
+    (run_dir / "run_profile.json").write_text(
+        json.dumps({"kickoff_path": str(kickoff), "recipe": "framework-edit"}),
+        encoding="utf-8",
+    )
+    return run_dir
+
+
 # ── 1. classify_error quota wording ─────────────────────────────────────────
 
 
@@ -309,6 +387,148 @@ def test_compute_legacy_null_category_uses_log_429(home: Path) -> None:
     assert hint["needs_change"]["alias"] == "codex_lens"
 
 
+def test_lane_hint_follows_run_node_not_latest_reflect_call(home: Path) -> None:
+    """The r1 live bug: the newest failed row is a reflect-time call, so the
+    hint pointed at ``gradient-extract`` (a non-node alias recover rejects).
+    The hint must instead name the run's own failed node and its 429."""
+    _seed_live_shape(home)
+    hint = retry_hint.compute(home, RUN)
+    assert hint is not None
+    assert hint["failed_node"] == "prior_art_lens"
+    assert hint["from_node"] == "prior_art_lens"
+    assert hint["strategy"] == "resume"
+    nc = hint["needs_change"]
+    assert nc["kind"] == "lane"
+    assert nc["lane"] == "minimax"
+    assert nc["alias"] == "codex_lens"
+    # The detail is the stream's 429, never the newer row's timeout chatter or
+    # the raw capture envelope.
+    assert "Token Plan usage limit" in nc["detail"]
+    assert nc["detail"].startswith("API Error")
+    assert "timeout after 120.0s" not in nc["detail"]
+    assert {"prior_art_lens", "implementer"} <= set(nc["nodes"])
+    assert nc["code"] is True
+    assert all(s["lane"] != "glm" for s in nc["suggestions"])
+    assert nc["suggestions"][0]["lane"] == "deepseek"
+    assert hint["command"] == (
+        f"mini-ork recover {RUN} --lane codex_lens={nc['suggestions'][0]['lane']}")
+
+
+def _seed_healthy_node_quoting_429(home: Path, run_dir: Path, *,
+                                   finish_reason: str | None) -> None:
+    """A healthy ``code_impact_lens`` whose transcript merely *quotes* the 429
+    (a ``tool_result`` reading a kickoff/log that contains it) and then reports
+    success. Its file name sorts before ``prior_art_lens``, so a first-sorted
+    file / raw-text heuristic picks it — the second live bug. ``finish_reason``
+    stamps its ``node_end`` (``"done"`` = explicit success, ``None`` = the end
+    event is absent, which counts as failed)."""
+    if finish_reason is not None:
+        con = sqlite3.connect(home / "state.db")
+        con.execute(
+            "INSERT INTO run_events (event_id, run_id, event_type, payload_json, "
+            "created_at) VALUES (?,?,?,?,?)",
+            (f"ev-{RUN}-end-cil", RUN, "node_end",
+             json.dumps({"node_id": "code_impact_lens",
+                         "finish_reason": finish_reason}), int(time.time()) + 20))
+        con.commit()
+        con.close()
+    quoted = json.dumps({"type": "user", "message": {"content": [
+        {"type": "tool_result", "content": "kickoff says: " + MINIMAX_TEXT}]}})
+    (run_dir / "agent-code_impact_lens.live.jsonl").write_text(
+        json.dumps({"seq": 0, "stream": "stdout", "t": 1.0, "line": quoted}) + "\n"
+        + json.dumps({"seq": 1, "stream": "stdout", "t": 2.0, "line": json.dumps(
+            {"type": "result", "is_error": False,
+             "result": "lens report written"})}) + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_lane_hint_ignores_healthy_node_quoting_the_429(home: Path) -> None:
+    """``code_impact_lens`` finished fine (``finish_reason: done``) but its live
+    stream quotes the 429 in a ``tool_result``. The hint must still name the
+    run's real failed node ``prior_art_lens`` / ``codex_lens``, and the detail
+    must be the marker-carrying record's result — never the quoting node's
+    benign result text nor the raw capture envelope."""
+    run_dir = _seed_live_shape(home)
+    _seed_healthy_node_quoting_429(home, run_dir, finish_reason="done")
+    hint = retry_hint.compute(home, RUN)
+    assert hint is not None
+    assert hint["failed_node"] == "prior_art_lens"
+    assert hint["from_node"] == "prior_art_lens"
+    nc = hint["needs_change"]
+    assert nc["kind"] == "lane"
+    assert nc["alias"] == "codex_lens"
+    assert nc["lane"] == "minimax"
+    assert nc["detail"].startswith("API Error")
+    assert "Token Plan usage limit" in nc["detail"]
+    assert "lens report written" not in nc["detail"]
+
+
+def test_lane_hint_uses_record_mark_not_raw_429_text(home: Path) -> None:
+    """Same quote, but ``code_impact_lens`` has *no* ``node_end`` (which counts
+    as failed). Only the record-level mark can exonerate it: its stream carries
+    no provider record with ``is_error``/``api_error_status == 429``, so the 429
+    is a quote, not its own failure. The hint must name ``prior_art_lens``."""
+    run_dir = _seed_live_shape(home)
+    _seed_healthy_node_quoting_429(home, run_dir, finish_reason=None)
+    failures = retry_hint._legacy_lane_failures(run_dir)
+    assert len(failures) == 1
+    assert failures[0][0] == "prior_art_lens"
+    # The detail is the marker-carrying record's ``result``, not the quoting
+    # node's benign text nor the raw capture envelope.
+    assert failures[0][1].startswith("API Error")
+    hint = retry_hint.compute(home, RUN)
+    assert hint is not None
+    assert hint["failed_node"] == "prior_art_lens"
+    assert hint["needs_change"]["alias"] == "codex_lens"
+
+
+def test_lane_case_ignores_reflect_only_failure(home: Path) -> None:
+    """With ONLY the reflect-time ``gradient-extract`` failure (no workflow node
+    failed), the lane case declines and the existing cases decide."""
+    run_dir = _seed_live_shape(home, with_node_failure=False)
+    assert retry_hint._case_lane_unavailable(
+        home, RUN, run_dir, "framework-edit") is None
+    hint = retry_hint.compute(home, RUN)
+    if hint is not None:
+        assert hint["needs_change"]["kind"] != "lane"
+
+
+@pytest.mark.parametrize("category,record", [
+    ("capacity", {"type": "result", "is_error": True, "api_error_status": 529,
+                  "result": "API Error: 529 Overloaded. Please retry."}),
+    ("network", {"type": "result", "is_error": True,
+                 "result": "API Error: Connection error."}),
+])
+def test_lane_case_declines_transient_not_dead_lane(
+        home: Path, category: str, record: dict) -> None:
+    """The r2 regression: a transient provider failure — a 529 overload or a
+    connection error — must NOT be reported as a dead lane. Both carry
+    ``is_error`` (the 529 a non-429 ``api_error_status``), so only the quota/auth
+    *wording* can tell them from a wall. The row is also categorised
+    (``capacity``/``network``), which keeps it out of the legacy NULL-category
+    branch — a categorised row is never a dead-lane row."""
+    run_dir = _seed_live_shape(home)
+    con = sqlite3.connect(home / "state.db")
+    con.execute(
+        "UPDATE llm_calls SET error_category = ? "
+        "WHERE run_id = ? AND actor = ?",
+        (category, RUN, "codex_lens"),
+    )
+    con.commit()
+    con.close()
+    (run_dir / "agent-prior_art_lens.live.jsonl").write_text(
+        json.dumps({"seq": 0, "stream": "stdout", "t": 1.0,
+                    "line": json.dumps(record)}) + "\n",
+        encoding="utf-8",
+    )
+    assert retry_hint._case_lane_unavailable(
+        home, RUN, run_dir, "framework-edit") is None
+    hint = retry_hint.compute(home, RUN)
+    assert hint is not None
+    assert hint["needs_change"]["kind"] != "lane"
+
+
 # ── 5. fix_steps + notify ───────────────────────────────────────────────────
 
 
@@ -377,3 +597,54 @@ def test_lane_from_attempt_row_empty_without_failed_call(home: Path) -> None:
     empty = home / "runs" / "run-no-calls"
     empty.mkdir(parents=True)
     assert retry_notify._lane_from_attempt_row(empty) == ""
+
+
+def _set_end(home: Path, node_id: str, finish_reason: str) -> None:
+    con = sqlite3.connect(home / "state.db")
+    con.execute(
+        "INSERT INTO run_events (event_id, run_id, event_type, payload_json, created_at) "
+        "VALUES (?,?,?,?,?)",
+        (f"ev-{RUN}-end-{node_id}-{finish_reason}", RUN, "node_end",
+         json.dumps({"node_id": node_id, "finish_reason": finish_reason}),
+         int(time.time()) + 60))
+    con.commit()
+    con.close()
+
+
+def test_quota_row_never_names_a_node_that_finished(home: Path) -> None:
+    """Opus r2 review: a quota row on an alias whose nodes all ended ``done``
+    (the lane recovered — retry or fallback) must not produce a lane hint
+    naming a finished node."""
+    run_dir = _seed_run(home)              # quota row on codex_lens
+    _set_end(home, "prior_art_lens", "done")   # later end wins: recovered
+    _set_end(home, "implementer", "done")
+    assert retry_hint._case_lane_unavailable(
+        home, RUN, run_dir, "framework-edit") is None
+
+
+def test_quota_row_names_the_node_that_did_not_finish(home: Path) -> None:
+    """The lens recovered but the implementer (same alias) never ended: the
+    run died mid-node there, so that is the failed node."""
+    run_dir = _seed_run(home)
+    _set_end(home, "prior_art_lens", "done")
+    hint = retry_hint._case_lane_unavailable(home, RUN, run_dir, "framework-edit")
+    assert hint is not None
+    assert hint["failed_node"] == "implementer"
+
+
+def test_suggest_code_lanes_follow_policy_order_over_success_count(home: Path) -> None:
+    """For code, MO_CODE_LANES order (opus, the reviewer family, last) outranks
+    raw success counts among healthy lanes — live 2026-10-07 opus had the most
+    successes and was suggested for the implementer first."""
+    for _ in range(3):
+        _insert_llm_call(home, model_id="deepseek", status="success")
+    for _ in range(30):
+        _insert_llm_call(home, model_id="opus", status="success")
+    out = lane_suggest.suggest(
+        home, failed_lane="minimax", alias="codex_lens",
+        node_types=["implementer"], db=db_for(home),
+    )
+    lanes = [s["lane"] for s in out]
+    assert "deepseek" in lanes and "opus" in lanes
+    assert lanes.index("deepseek") < lanes.index("opus")
+    assert "glm" not in lanes

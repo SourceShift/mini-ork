@@ -784,20 +784,142 @@ def _failed_lane_rows(home: Path, run_id: str) -> list[dict[str, Any]]:
         return []
 
 
-def _run_dir_has_legacy_lane_failure(run_dir: Path) -> bool:
-    """True when an ``agent-*.live.jsonl`` / ``impl-*.log`` carries the 429 mark
-    together with the quota wording (legacy rows with NULL ``error_category``)."""
+def _row_alias(row: dict[str, Any]) -> str:
+    """The lane alias a failed ``llm_calls`` row was dispatched under.
+
+    ``actor`` is the alias when the executor recorded one; otherwise the
+    ``feature_name`` after ``mini-ork:`` (``mini-ork:codex_lens`` →
+    ``codex_lens``). A reflect-time call carries its own feature name
+    (``gradient-extract``) — the caller filters those out by requiring the
+    alias to be one this run actually dispatched.
+    """
+    actor = str(row.get("actor") or "").strip()
+    if actor:
+        return actor
+    feat = str(row.get("feature_name") or "")
+    if ":" in feat:
+        return feat.split(":", 1)[1].strip()
+    return feat.strip()
+
+
+def _record_mark_and_result(data: Any) -> tuple[bool, str]:
+    """``(carries_429_mark, result_text)`` from one decoded stream record.
+
+    A record is either an ``agent-*.live.jsonl`` wrapper ``{"seq", "stream",
+    "t", "line"}`` whose ``line`` string holds the provider's raw JSON, or a
+    bare provider record. The dead-lane mark is read off the *provider* record:
+    the quota/auth wording in ``result`` is required, and ``is_error`` /
+    ``api_error_status == 429`` / a ``(429)`` in that wording is only an extra
+    gate — never a mark alone, or a transient 529/connection error would read as
+    a dead lane. It is never read off the surrounding raw stream text — a healthy
+    node's transcript can quote a different node's 429 inside a ``tool_result``
+    (which carries no top-level ``result`` and is therefore never a match).
+    ``(False, "")`` when ``data`` is not a record or carries a mark-less/absent
+    ``result``.
+    """
+    if not isinstance(data, dict):
+        return False, ""
+    record: Any = data
+    line = data.get("line")
+    if isinstance(line, str) and line:
+        try:
+            decoded = json.loads(line)
+        except (ValueError, TypeError):
+            decoded = None
+        if isinstance(decoded, dict):
+            record = decoded
+    if not isinstance(record, dict):
+        return False, ""
+    raw = record.get("result")
+    res = raw if isinstance(raw, str) else ""
+    # The dead-lane wording (quota/auth) is REQUIRED. A bare ``is_error`` record
+    # is a transient provider failure — a 529 "Overloaded. Please retry.", a
+    # connection error — not a wall the operator must switch lanes for, and
+    # ``api_error_status == 429`` alone is likewise a rate limit, not a quota.
+    # The 429 signals survive only as an extra gate on top of the wording; they
+    # never mark on their own, or a retryable overload would read as a dead lane.
+    wording = bool(res and _LEGACY_QUOTA_RE.search(res))
+    gate = bool(
+        record.get("is_error")
+        or record.get("api_error_status") == 429
+        or (res and _LEGACY_429_RE.search(res))
+    )
+    return (wording and gate), res
+
+
+def _stream_lane_mark(text: str, *, record_only: bool,
+                      limit: int = 400) -> tuple[bool, str]:
+    """``(carries_429_mark, detail)`` for one legacy lane stream.
+
+    ``record_only`` streams (``agent-*.live.jsonl``) are scanned for decodable
+    JSON records; the detail is the ``result`` text of the first whose provider
+    record carries the 429/quota mark. Plain-text streams (``impl-*.log``) are
+    scanned for the first line carrying the wording. ``detail`` (≤ ``limit``
+    chars) is only ever returned alongside a mark; ``(False, "")`` when the
+    stream carries none.
+    """
+    if record_only:
+        decoder = json.JSONDecoder()
+        idx = 0
+        while True:
+            start = text.find("{", idx)
+            if start < 0:
+                break
+            try:
+                data, end = decoder.raw_decode(text, start)
+            except ValueError:
+                idx = start + 1
+                continue
+            idx = end
+            marked, res = _record_mark_and_result(data)
+            if marked:
+                return True, res[:limit]
+        return False, ""
+    for line in text.splitlines():
+        # Both patterns are required (as in r1): a lone ``(429)`` is a rate
+        # limit and a lone ``billing``/``credits`` mention is chatter — only a
+        # line that carries the 429 *and* the quota/auth wording is a dead lane.
+        if _LEGACY_429_RE.search(line) and _LEGACY_QUOTA_RE.search(line):
+            stripped = line.strip()
+            if stripped:
+                return True, stripped[:limit]
+    return False, ""
+
+
+def _legacy_lane_failures(run_dir: Path) -> list[tuple[str, str]]:
+    """Every ``(node_id, detail)`` legacy lane failure in ``run_dir``, in
+    sorted-file order.
+
+    A pre-0021 (or pre-fix) run wrote NULL ``error_category``, so the 429 lives
+    only in an ``agent-<node>.live.jsonl`` / ``impl-<node>.log``. The node id
+    comes from the file name, the detail from the marker-carrying record's
+    ``result`` text (≤ 400 chars). Returning *all* matches (not just the first)
+    lets the caller drop healthy nodes: a node whose transcript merely quotes
+    another node's 429 is not a failure, and only its own ``node_end`` can say
+    whether it died. ``[]`` when no file carries the mark.
+    """
+    out: list[tuple[str, str]] = []
     if not run_dir.is_dir():
-        return False
-    for pattern in ("agent-*.live.jsonl", "impl-*.log"):
+        return out
+    for pattern, prefix, suffix, record_only in (
+        ("agent-*.live.jsonl", "agent-", ".live.jsonl", True),
+        ("impl-*.log", "impl-", ".log", False),
+    ):
         for path in sorted(run_dir.glob(pattern)):
+            name = path.name
+            if not (name.startswith(prefix) and name.endswith(suffix)):
+                continue
+            node = name[len(prefix):-len(suffix)]
+            if not node:
+                continue
             try:
                 text = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            if _LEGACY_429_RE.search(text) and _LEGACY_QUOTA_RE.search(text):
-                return True
-    return False
+            marked, detail = _stream_lane_mark(text, record_only=record_only)
+            if marked:
+                out.append((node, detail))
+    return out
 
 
 def _node_start_lanes(home: Path, run_id: str
@@ -841,85 +963,131 @@ def _node_start_lanes(home: Path, run_id: str
 def _failed_node_for_alias(starts: list[dict[str, Any]], ends: dict[str, str],
                            alias: str) -> str | None:
     """The first node (start order) whose ``node_start.model_lane`` == ``alias``
-    and whose last ``node_end.finish_reason != "done"``; else the first node
-    with that alias; else ``None``."""
+    and whose last ``node_end.finish_reason != "done"`` — a node with no
+    ``node_end`` counts as failed (the run died mid-node), matching the legacy
+    path. ``None`` when every such node finished: a node that ended ``done`` is
+    never named as the failure (Opus r2 review)."""
     for s in starts:
         if s.get("model_lane") != alias:
             continue
         nid = str(s.get("node_id") or "")
-        if nid and ends.get(nid, "done") != "done":
+        if nid and ends.get(nid) != "done":
             return nid
-    for s in starts:
-        if s.get("model_lane") == alias and s.get("node_id"):
-            return str(s["node_id"])
     return None
 
 
-def _run_lanes(run_dir: Path) -> dict[str, str]:
-    """The run-frozen ``lanes:`` map from ``<run_dir>/config/agents.yaml``."""
-    p = run_dir / "config" / "agents.yaml"
-    if not p.is_file():
-        return {}
-    try:
-        import yaml
-        doc = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-    except (OSError, ImportError, ValueError):
-        return {}
-    lanes = doc.get("lanes") if isinstance(doc, dict) else None
-    if not isinstance(lanes, dict):
-        return {}
-    return {str(k): str(v) for k, v in lanes.items()}
+def _workflow_alias_map(starts: list[dict[str, Any]]
+                        ) -> tuple[dict[str, list[str]], dict[str, str]]:
+    """``(alias -> [node_id …], node_id -> alias)`` from this run's ``node_start``
+    payloads, in start order.
+
+    Only nodes that actually started contribute — a reflect-time call
+    (``gradient-extract``, ``pattern-induct``, ``rubric``) has no ``node_start``,
+    so its alias can never enter the map and be mistaken for the node that
+    killed the run. Payloads without a ``model_lane`` contribute nothing.
+    """
+    by_alias: dict[str, list[str]] = {}
+    node_alias: dict[str, str] = {}
+    for s in starts:
+        nid = str(s.get("node_id") or "")
+        lane = str(s.get("model_lane") or "")
+        if not nid or not lane:
+            continue
+        node_alias[nid] = lane
+        by_alias.setdefault(lane, [])
+        if nid not in by_alias[lane]:
+            by_alias[lane].append(nid)
+    return by_alias, node_alias
 
 
 def _case_lane_unavailable(home: Path, run_id: str, run_dir: Path,
                            recipe: str) -> dict[str, Any] | None:
-    """A failed ``llm_calls`` row classified quota/auth (or a legacy NULL-category
-    row whose log carries the 429) → suggest a healthy lane and tell the operator
-    to switch. Evaluated BEFORE cases 4 and 5."""
+    """A dead lane (quota/auth) on one of the run's *own* workflow nodes →
+    suggest a healthy lane and tell the operator to switch.
+
+    Only aliases this run actually dispatched are eligible: the map is built
+    from ``run_events`` ``node_start.model_lane`` payloads, so a reflect-time
+    call (``gradient-extract``, ``pattern-induct``, ``rubric``) can never be
+    mistaken for the node that killed the run — the r1 live bug, where the
+    newest row was always a post-workflow call. When no workflow-alias failure
+    exists the case declines (returns ``None``) and cases 4/5 decide.
+    Evaluated BEFORE cases 4 and 5.
+    """
     rows = _failed_lane_rows(home, run_id)
     if not rows:
         return None
-    row = next((r for r in rows if r.get("error_category") in ("quota", "auth")), None)
-    if row is None:
-        if not _run_dir_has_legacy_lane_failure(run_dir):
+    starts, ends = _node_start_lanes(home, run_id)
+    by_alias, node_alias = _workflow_alias_map(starts)
+    if not by_alias:
+        return None
+
+    candidates = [r for r in rows if _row_alias(r) in by_alias]
+    if not candidates:
+        return None
+
+    # A quota/auth row only names a dead lane if a node using that alias did
+    # not finish: an alias whose every node ended ``done`` recovered (retry,
+    # fallback lane) and must not become the hint's failed node.
+    quota_rows = [r for r in candidates
+                  if r.get("error_category") in ("quota", "auth")
+                  and any(ends.get(nid) != "done"
+                          for nid in by_alias.get(_row_alias(r), []))]
+    # Legacy rows only: a row that already carries *any* ``error_category``
+    # (``capacity``, ``network``, …) was classified by the executor and is not a
+    # dead-lane row, so the stream-wording heuristic must not run over it.
+    legacy_candidates = [r for r in candidates
+                         if not str(r.get("error_category") or "").strip()]
+    if quota_rows:
+        row = quota_rows[0]
+        alias = _row_alias(row)
+        error_kind = str(row.get("error_category") or "quota")
+        failed_node = _failed_node_for_alias(starts, ends, alias)
+        detail = str(row.get("error_message") or "")[:400]
+    else:
+        # Legacy: NULL error_category. The 429 lives in the provider stream, not
+        # the row. Each candidate must be a node this run actually dispatched
+        # (``node_alias``) whose own ``node_end`` did not say ``done`` — a
+        # missing end counts as failed (the run aborted mid-node) — and whose
+        # alias has a *legacy* row (NULL category; a categorised row is never a
+        # dead-lane row). That drops a healthy node whose transcript merely
+        # *quotes* another node's 429, never borrows the lane from an unrelated
+        # alias, and never resurrects a categorised transient failure. Prefer a
+        # node whose end explicitly failed over one whose end is missing.
+        matches: list[tuple[str, str, str]] = []
+        for cand_node, cand_detail in _legacy_lane_failures(run_dir):
+            cand_alias = node_alias.get(cand_node, "")
+            if not cand_alias or ends.get(cand_node) == "done":
+                continue
+            if not any(_row_alias(r) == cand_alias for r in legacy_candidates):
+                continue
+            matches.append((cand_node, cand_alias, cand_detail))
+        if not matches:
             return None
-        row = rows[0]
+        node, alias, detail = next(
+            (m for m in matches if ends.get(m[0]) not in (None, "done")),
+            matches[0],
+        )
+        row = next(r for r in legacy_candidates if _row_alias(r) == alias)
+        failed_node = node
+        error_kind = "quota"
 
     lane = str(row.get("model_id") or "")
     provider = str(row.get("provider") or "")
-    actor = str(row.get("actor") or "").strip()
-    feat = str(row.get("feature_name") or "")
-    alias = actor or (feat.split(":", 1)[1].strip() if ":" in feat else feat.strip())
-    error_kind = str(row.get("error_category") or "quota")
-    if error_kind not in ("quota", "auth"):
-        error_kind = "quota"
     if not lane or not alias:
         return None
+    if error_kind not in ("quota", "auth"):
+        error_kind = "quota"
 
     nodes, _edges = _recipe_workflow(home, recipe)
     using = [n for n in nodes if str(n.get("model_lane") or "") == alias]
-
-    if not using:
-        # Live-data tolerance: the row's actor/feature_name may carry the node
-        # TYPE (e.g. "researcher") rather than the lane alias. Resolve the alias
-        # from the failed lane via the run-frozen agents.yaml snapshot
-        # (codex_lens → minimax), else from a model_lane equal to the lane.
-        lanes = _run_lanes(run_dir)
-        aliases = sorted(
-            a for a, v in lanes.items() if v.split(",", 1)[0].strip() == lane
-        )
-        if len(aliases) == 1:
-            alias = aliases[0]
-            using = [n for n in nodes if str(n.get("model_lane") or "") == alias]
-        if not using:
-            using = [n for n in nodes if str(n.get("model_lane") or "") == lane]
-            if using:
-                alias = lane
-
-    starts, ends = _node_start_lanes(home, run_id)
-    failed_node = _failed_node_for_alias(starts, ends, alias)
-
-    using_names = [str(n.get("name")) for n in using if n.get("name")]
+    # ``nodes`` = workflow declaration order first (the operator-facing order the
+    # ``fix_steps`` test pins), then any node this run dispatched under the alias
+    # that the recipe does not list.
+    using_names: list[str] = []
+    for name in ([str(n.get("name")) for n in using if n.get("name")]
+                 + list(by_alias.get(alias, []))):
+        if name and name not in using_names:
+            using_names.append(name)
     node_types = [str(n.get("type") or "") for n in using if n.get("type")]
 
     suggestions: list[dict[str, str]] = []
@@ -949,7 +1117,7 @@ def _case_lane_unavailable(home: Path, run_id: str, run_dir: Path,
         "needs_change": {
             "kind": "lane",
             "summary": summary,
-            "detail": str(row.get("error_message") or "")[:400],
+            "detail": detail,
             "lane": lane,
             "alias": alias,
             "provider": provider,
