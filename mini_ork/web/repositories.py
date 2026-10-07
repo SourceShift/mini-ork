@@ -11,6 +11,7 @@ structures, never a 500, exactly as the inline probes did.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from typing import Any, Sequence
 
@@ -290,6 +291,73 @@ class RunDetailRepository:
             (task_run_id,),
         )
 
+    def fetch_run_recipes(
+        self, task_run_ids: Sequence[str] | None = None,
+        *, limit: int = 50,
+    ) -> dict[str, str]:
+        """Bulk sibling of :meth:`fetch_run_recipe` — one ``SELECT id, recipe``
+        round-trip across many runs.
+
+        ``task_run_ids=None`` falls back to the ``limit`` most recent runs so
+        the IDE's ``dags`` page is usable from the CLI without an explicit
+        ``--arg ids=...``; the default 50 mirrors the page's
+        ``DEFAULT_PAGE_SIZE`` so the board's two batched calls agree on the
+        window. An empty list yields an empty dict (no rows match).
+
+        NULL ``recipe`` values (per-run column nullable; see
+        ``tests/unit/test_run_detail_repo_py.py:177``) are dropped — the
+        caller treats their run as "recipe not found" via the empty mapping.
+        """
+        if task_run_ids is None:
+            rows = self._db.rows(
+                "SELECT id, recipe FROM task_runs "
+                f"ORDER BY created_at DESC LIMIT {int(limit)}"
+            )
+        elif not task_run_ids:
+            return {}
+        else:
+            placeholders = ",".join("?" * len(task_run_ids))
+            rows = self._db.rows(
+                f"SELECT id, recipe FROM task_runs WHERE id IN ({placeholders})",
+                tuple(task_run_ids),
+            )
+        out: dict[str, str] = {}
+        for r in rows:
+            recipe = r.get("recipe")
+            if recipe:
+                out[str(r["id"])] = str(recipe)
+        return out
+
+    def fetch_node_lifecycle_events_bulk(
+        self, task_run_ids: Sequence[str]
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Bulk sibling of :meth:`fetch_node_lifecycle_events` — one round-trip.
+
+        Returns ``{run_id: [rows…]}`` with rows in ``created_at ASC`` order,
+        matching the per-run method's ordering so the dags page can merge
+        them straight into :func:`derive_node_statuses`. The same
+        ``event_type IN ('node_start', 'node_end')`` filter is preserved
+        verbatim — ``mini_ork/web/routes/run_detail.py::_node_status_map``
+        depends on it.
+        """
+        if not task_run_ids or not self._db.has_table("run_events"):
+            return {rid: [] for rid in task_run_ids}
+        placeholders = ",".join("?" * len(task_run_ids))
+        rows = self._db.rows(
+            f"""
+            SELECT run_id, event_type, created_at, payload_json
+            FROM run_events
+            WHERE run_id IN ({placeholders})
+              AND event_type IN ('node_start', 'node_end')
+            ORDER BY created_at ASC
+            """,
+            tuple(task_run_ids),
+        )
+        out: dict[str, list[dict[str, Any]]] = {rid: [] for rid in task_run_ids}
+        for r in rows:
+            out.setdefault(str(r["run_id"]), []).append(r)
+        return out
+
     # ── mo_events ────────────────────────────────────────────────────────────
 
     def fetch_mo_events_by_trace_id(
@@ -399,6 +467,63 @@ class RunDetailRepository:
             """,
             (start, upper),
         )
+
+
+# Statuses the DAG view can show. Mirrors the vocabulary at
+# ``mini_ork/web/routes/run_detail.py:658-664`` exactly — do not add a fifth.
+_NEVER_SEEN = "never_seen"
+_RUNNING = "running"
+_DONE = "done"
+_FAILED = "failed"
+# Verdict values that flip a ``node_end`` to ``failed``. From
+# ``run_detail.py:705``. Mirrored here so this helper can stand alone.
+_FAILED_VERDICTS = frozenset({"REQUEST_CHANGES", "ESCALATE", "CRASH"})
+
+
+def derive_node_statuses(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Aggregate ``node_start`` / ``node_end`` events into per-node statuses.
+
+    Pure module-level helper. Takes the rows already fetched by
+    :meth:`RunDetailRepository.fetch_node_lifecycle_events_bulk` (or its
+    single-run counterpart) and returns ``{node_id: {status, …}}`` with one
+    entry per node that emitted at least one lifecycle event. Run-level
+    "no events at all" → ``{}``; the merge default of ``never_seen`` is the
+    caller's responsibility (mirroring ``run_detail.py:673-674``).
+
+    Rules, verbatim from ``mini_ork/web/routes/run_detail.py:658-664``:
+
+    - ``never_seen`` : no ``node_start`` event for this node  (caller applies)
+    - ``running``    : ``node_start`` present, no ``node_end`` yet
+    - ``done``       : ``node_end`` present, no verdict failure
+    - ``failed``     : ``node_end`` present with verdict in
+                       {``REQUEST_CHANGES``, ``ESCALATE``, ``CRASH``}
+
+    ``rows[i]`` is a dict with at least ``event_type`` and ``payload_json``
+    keys; ``payload_json`` may be ``None`` or unparseable — both yield an
+    empty payload and the row is skipped (no ``node_id`` to key on).
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        payload_raw = r.get("payload_json")
+        try:
+            payload = json.loads(payload_raw) if payload_raw else {}
+        except json.JSONDecodeError:
+            payload = {}
+        node_id = payload.get("node_id")
+        if not node_id:
+            continue
+        entry = out.setdefault(str(node_id), {"status": _NEVER_SEEN})
+        if r.get("event_type") == "node_start":
+            entry["status"] = _RUNNING
+            entry["started_at"] = r.get("created_at")
+        elif r.get("event_type") == "node_end":
+            verdict = payload.get("verdict")
+            entry["status"] = _FAILED if verdict in _FAILED_VERDICTS else _DONE
+            entry["duration_ms"] = payload.get("duration_ms")
+            entry["verdict"] = verdict
+            entry["artifact_path"] = payload.get("artifact_path")
+            entry["ended_at"] = r.get("created_at")
+    return out
 
 
 class ArtifactsRepository:
