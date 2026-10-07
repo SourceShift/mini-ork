@@ -24,6 +24,13 @@ byte-offset discipline from ``LiveTail`` is mirrored here for the
 ``agent-<node>.live.jsonl`` sidecar so the session-id lookup doesn't read a
 partial line; the session file itself is read in one shot because it is
 written once at agent-finish time.
+
+r4 contract (kickoff ide-node-stream-r4): every visible entry carries an
+absolute ``_line`` (transcript line index, log file line index, or a
+synthetic cursor for the cost-state note). ``offset`` counts physical
+transcript/log lines plus the synthetic note when emitted, so a caller
+that follows ``next_offset`` skips previously-emitted entries without
+having to track per-call state.
 """
 from __future__ import annotations
 
@@ -33,7 +40,7 @@ from pathlib import Path
 from typing import Any
 
 from mini_ork.ide_pages import spec as S
-from mini_ork.ide_pages.run import Run, Node, _epoch, _load, _wall
+from mini_ork.ide_pages.run import Run, Node, _epoch, _load, _wall, _REVIEW_TYPES
 
 # Live-detection window per the kickoff §"live": running AND transcript grew
 # in the last 120 s. Named so a future tweak is one edit.
@@ -66,21 +73,37 @@ _VIEWS = ("stream", "output", "prompt", "telemetry", "learning")
 # targeted at the node's role or ``any``. ``_VALID_ROLES`` lives in
 # ``mini_ork.steering.operator_steering:40`` — every value here must be in
 # that set.
+#
+# r4 fix #3: ``_REVIEW_TYPES`` (``mini_ork.ide_pages.run:28``) lists every
+# node type that should read reviewer-targeted steers; we reuse it verbatim
+# instead of duplicating the set. The ``researcher`` type maps to ``reviewer``
+# only when its id ends in ``_lens`` (the convention the recipe uses to mark
+# review lenses — non-lens researchers, e.g. scouts, stay on the default role).
 _NODE_ROLE_MAP: dict[str, str] = {
     "planner": "planner",
     "decomposer": "planner",
     "implementer": "implementer",
     "worker": "implementer",
-    "reviewer": "reviewer",
-    "synthesizer": "reviewer",
     "verifier": "verifier",
     "static_check": "verifier",
     "test": "verifier",
 }
+for _rt in _REVIEW_TYPES:
+    _NODE_ROLE_MAP[_rt] = "reviewer"
 
 
 def _role_for_node(node: Node) -> str:
-    return _NODE_ROLE_MAP.get(str(node.type or ""), "any")
+    """Role key used by ``_fetch_steer_rows``.
+
+    r4 fix #3: ``researcher`` nodes whose id ends in ``_lens`` map to
+    ``reviewer`` so code_impact_lens / prior_art_lens (and any other
+    recipe-defined ``*_lens`` researcher) sees reviewer-targeted steers.
+    Non-lens researchers fall through to the default ``any`` role.
+    """
+    ntype = str(node.type or "")
+    if ntype == "researcher" and str(node.id or "").endswith("_lens"):
+        return "reviewer"
+    return _NODE_ROLE_MAP.get(ntype, "any")
 
 # Edit-family tools whose input carries an old/new body the IDE renders as a
 # coloured diff. Listed verbatim per the kickoff.
@@ -209,7 +232,7 @@ def _resolve_via_llm_calls(run: "Run", node: Node) -> Path | None:
     sql = ("SELECT session_id, ts FROM llm_calls "
            "WHERE run_id = ? AND actor = ? "
            "  AND session_id IS NOT NULL AND session_id != '' "
-           "ORDER BY ts DESC LIMIT 50")
+           "ORDER BY ts DESC LIMIT 1000")
     try:
         rows = db.rows(sql, (run.id, actor))
     except Exception:  # noqa: BLE001
@@ -525,7 +548,10 @@ def _text_block(b: Any, kind: str) -> str:
 
 def _stream_entries(session_path: Path | None, log_path: Path | None,
                     run_id: str, home: Path, *,
-                    target: Node, offset: int) -> tuple[list[dict[str, Any]], int]:
+                    target: Node, offset: int,
+                    run_dir: Path | None = None,
+                    transcript_has_result: bool = False,
+                    is_live: bool = False) -> tuple[list[dict[str, Any]], int]:
     """Build the stream view's ``entries`` list (kickoff fix #3).
 
     Returns ``(entries, next_offset)`` where ``next_offset`` is the number
@@ -544,7 +570,7 @@ def _stream_entries(session_path: Path | None, log_path: Path | None,
     if session_path is not None:
         raw.extend(_session_entries(session_path))
     elif log_path is not None:
-        raw.extend(_log_path_entries(log_path))
+        raw.extend(_log_path_entries(log_path, offset=int(offset)))
     raw.extend(_steer_entries(run_id, home, target))
 
     node_start_s = int(target.start or 0)
@@ -558,30 +584,42 @@ def _stream_entries(session_path: Path | None, log_path: Path | None,
             e["_ts"] = node_start_s + line_idx
     raw.sort(key=lambda e: (int(e.get("_ts") or 0), 0 if e.get("_src") == "steer" else 1))
 
-    # r3 fix #3: compute the timestamp of the LAST transcript line this
-    # poll would consume. Steers live in the same timeline and are emitted
-    # only when (a) the poll consumed at least one transcript line, AND
-    # (b) the steer's timestamp is strictly newer than line N-1, AND
-    # (c) the steer's timestamp is NOT later than the last line consumed.
-    # "Before node.start" steers are emitted on a full read because
-    # line N-1 has no timestamp (lower bound collapses to -inf).
-    consumed_line_ts: list[int] = []
+    # r4 fix #1: bound steers against REAL transcript timestamps.
+    # ``lower_bound`` = max ``_ts`` over transcript entries already consumed
+    # (line at offset-1, in real seconds — never ``node_start + idx``). The
+    # upper bound is the max ``_ts`` over transcript entries this poll would
+    # consume (the "last consumed line's _ts" after the poll). A steer is
+    # returned iff its ``_ts`` is strictly newer than the lower bound AND
+    # not later than the upper bound.
+    #
+    # r3 fix #3 had the wrong complement: ``consumed_line_ts`` skipped lines
+    # with ``_line < offset`` (so it held the *to-be-consumed* lines, not the
+    # already-consumed ones), and the lower bound fell back to
+    # ``node_start + prev_line_idx`` — a proxy that equals the real bound
+    # only when every transcript line is exactly 1 s apart. With 60 s spacing
+    # (kickoff fixture) the proxy is off by tens of seconds and the steer
+    # boundary collapses.
+    #
+    # H1 (lens §5): timestamp-less appended lines fall back to
+    # ``node_start + line_idx`` (set in :func:`_with_ts`). The fallback
+    # cannot pull ``lower_bound`` backwards in the common case because
+    # consumed lines carry real ISO timestamps and are *older* than
+    # appended lines — taking ``max`` over all consumed ``_ts`` therefore
+    # uses the real ISO value whenever it is available.
+    lower_bound_ts: list[int] = []  # transcript entries with _line < offset
+    upper_bound_ts: list[int] = []  # transcript entries with _line >= offset
     for e in raw:
         if e.get("_src") == "steer":
             continue
         line_idx = int(e.get("_line") or 0)
+        ts_val = int(e.get("_ts") or 0)
         if line_idx < int(offset):
-            continue
-        consumed_line_ts.append(int(e.get("_ts") or 0))
-    has_lines = bool(consumed_line_ts)
-    max_line_ts = max(consumed_line_ts) if has_lines else None
-    if int(offset) > 0:
-        prev_line_idx = int(offset) - 1
-        prev_line_ts = node_start_s + prev_line_idx
-    else:
-        # Full read — no "line N-1". Lower bound collapses so steers before
-        # ``node.start`` appear at the top of the stream (kickoff rule).
-        prev_line_ts = None
+            lower_bound_ts.append(ts_val)
+        else:
+            upper_bound_ts.append(ts_val)
+    has_upper = bool(upper_bound_ts)
+    max_upper_ts = max(upper_bound_ts) if has_upper else None
+    max_lower_ts = max(lower_bound_ts) if lower_bound_ts else None
 
     out: list[dict[str, Any]] = []
     for e in raw:
@@ -589,14 +627,17 @@ def _stream_entries(session_path: Path | None, log_path: Path | None,
         if is_steer:
             steer_ts = int(e.get("_ts") or 0)
             # No new lines consumed → nothing to bound the steer against.
-            if not has_lines:
+            # The kickoff's "the one after returns nothing" guard: a drain
+            # poll (offset >= total lines) returns no steers so a caller
+            # polling at the same offset can't double-include them.
+            if not has_upper:
                 continue
             # "Newer than the line at N-1" — strict so we never repeat.
-            if prev_line_ts is not None and steer_ts <= prev_line_ts:
+            if max_lower_ts is not None and steer_ts <= max_lower_ts:
                 continue
             # "Not later than the last line consumed" — drops steers that
             # were added by the operator after the transcript froze.
-            if max_line_ts is not None and steer_ts > max_line_ts:
+            if max_upper_ts is not None and steer_ts > max_upper_ts:
                 continue
         else:
             # ``offset`` = number of transcript lines already consumed.
@@ -607,12 +648,68 @@ def _stream_entries(session_path: Path | None, log_path: Path | None,
         out.append(e)
 
     next_offset = int(offset)
+    # r4 fix #5 minor: ``offset`` counts every non-blank transcript/log line,
+    # including ones that didn't emit (failed parse, blank line). For session
+    # transcripts this is the file's non-blank line count; for logs the
+    # matching helper.
+    if session_path is not None:
+        try:
+            text = session_path.read_text(encoding="utf-8", errors="replace")
+            physical_lines = sum(1 for ln in text.splitlines() if ln.strip())
+        except OSError:
+            physical_lines = 0
+    elif log_path is not None:
+        physical_lines = _log_line_count(log_path)
+    else:
+        physical_lines = 0
+    if physical_lines > next_offset:
+        next_offset = physical_lines
     for e in out:
         if e.get("_src") == "steer":
             continue
         line_idx = int(e.get("_line") or 0)
         if line_idx + 1 > next_offset:
             next_offset = line_idx + 1
+
+    # r4 fix #4: emit the cost-state note ONCE on the first poll where the
+    # node is no longer live and the cost-state/result is available.
+    #
+    # "Without changing offset" (kickoff wording): the note does NOT
+    # advance ``next_offset``. The "once" guarantee is delivered via a
+    # per-node marker file in ``run_dir`` — ``build_node`` is stateless
+    # across calls, so we record the emission on disk and any later poll
+    # (same offset or any subsequent offset) sees the marker and skips
+    # the synthesis step. This also matches the r3 intent that the note
+    # never appears more than once per stream.
+    #
+    # The note does NOT count in the status pill's
+    # ``transcript_entry_count`` (which counts only physical transcript
+    # entries) — only the offset cursor reflects the physical lines.
+    note_marker: Path | None = None
+    note_already_emitted = False
+    if run_dir is not None:
+        note_marker = run_dir / f".cost-note-emitted.{target.id}"
+        if note_marker.exists():
+            note_already_emitted = True
+
+    if (run_dir is not None
+            and not transcript_has_result
+            and not is_live
+            and not note_already_emitted
+            and not any(e.get("k") == _KIND_NOTE for e in out)):
+        note = _build_note_from_cost_state(run_dir, target)
+        if note:
+            out.append({
+                "k": _KIND_NOTE,
+                "head": "",
+                "arg": note,
+                "lines": [{"t": note, "c": "muted"}],
+            })
+            try:
+                if note_marker is not None:
+                    note_marker.touch()
+            except OSError:
+                pass
 
     # Strip the private keys the IDE doesn't need to render.
     for e in out:
@@ -821,21 +918,36 @@ def _result_text(block: dict[str, Any]) -> tuple[str, bool]:
     return text, is_error
 
 
-def _log_path_entries(log_path: Path) -> list[dict[str, Any]]:
+def _log_path_entries(log_path: Path, offset: int = 0) -> list[dict[str, Any]]:
     """Log-file entries for shell/verifier nodes.
 
     r3 fix #4: one entry per log line so ``offset`` counts log lines and
     each new line surfaces as its own ``text`` entry. ``_src="log"`` and
     ``_line=<index>`` keep the offset contract identical to transcript
     entries.
+
+    r4 fix #2: index by ABSOLUTE file line number so incremental polls at
+    ``offset=N`` return exactly the new lines, not a re-slice of the tail.
+    The ``SHELL_LOG_LINES`` cap is applied only on a full read (``offset==0``):
+    a 45-line log returns the last 40 lines (with absolute ``_line`` 5..44)
+    on the first poll, and the next 5 lines on a subsequent poll at ``offset=40``.
     """
     try:
         text = log_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         text = ""
-    raw_lines = text.splitlines()[-SHELL_LOG_LINES:]
+    raw_lines = text.splitlines()
+    total = len(raw_lines)
+    if int(offset) <= 0:
+        # Full read: cap to the last SHELL_LOG_LINES lines but keep
+        # absolute line indices so the caller can pick up at offset N.
+        start_idx = max(0, total - SHELL_LOG_LINES)
+    else:
+        # Incremental poll: every line at-or-after ``offset``, no cap.
+        start_idx = min(int(offset), total)
     out: list[dict[str, Any]] = []
-    for idx, raw in enumerate(raw_lines):
+    for abs_idx in range(start_idx, total):
+        raw = raw_lines[abs_idx]
         c = "red" if "Traceback" in raw or "ERROR" in raw else (
             "green" if "PASS" in raw or "ok" in raw.lower() else "body")
         out.append({
@@ -844,9 +956,26 @@ def _log_path_entries(log_path: Path) -> list[dict[str, Any]]:
             "arg": raw[:LINE_CHARS],
             "lines": [{"t": raw[:LINE_CHARS], "c": c}],
             "_src": "log",
-            "_line": idx,
+            "_line": abs_idx,
         })
     return out
+
+
+def _log_line_count(log_path: Path) -> int:
+    """Total non-blank log lines — what ``offset`` advances against.
+
+    r4 fix #5 minor: ``offset`` counts every non-blank transcript line,
+    including ones that don't emit a visible entry (failed parse, blank
+    line). Same rule for shell logs: a 45-line log with 40 emit-cap on a
+    full read still has ``offset == 45`` after the first poll, so the
+    second poll at ``offset=45`` returns empty (and "NEW LINE" appended
+    at line 45 is correctly reported by the poll at offset=45).
+    """
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return 0
+    return sum(1 for ln in text.splitlines() if ln.strip())
 
 
 def _steer_entries(run_id: str, home: Path, target: Node) -> list[dict[str, Any]]:
@@ -1393,27 +1522,18 @@ def build_node(home: Path, run_id: str, node_id: str, view: str | None = None,
         if session_path is not None:
             transcript_entry_count = len(_session_entries(session_path))
         elif log_path is not None:
-            transcript_entry_count = len(_log_path_entries(log_path))
+            # r4 fix #2: status pill counts emit-cap-violating entries too —
+            # a 45-line log reports "finished · 45 events", not "… 40 events"
+            # from the SHELL_LOG_LINES cap.
+            transcript_entry_count = _log_line_count(log_path)
 
         stream_entries, next_offset = _stream_entries(
             session_path, log_path, run_id, home,
             target=target, offset=int(offset),
+            run_dir=run_dir,
+            transcript_has_result=transcript_has_result,
+            is_live=is_live,
         )
-        # r3 fix #2: emit the cost-state note ONCE on a full read
-        # (``offset == 0``). The note does NOT advance ``offset``, so
-        # subsequent polls at the same offset return nothing and never
-        # re-synthesise the note.
-        if (not transcript_has_result
-                and int(offset) == 0
-                and not any(e.get("k") == _KIND_NOTE for e in stream_entries)):
-            note = _build_note_from_cost_state(run_dir, target)
-            if note:
-                stream_entries.append({
-                    "k": _KIND_NOTE,
-                    "head": "",
-                    "arg": note,
-                    "lines": [{"t": note, "c": "muted"}],
-                })
 
     status, status_c = _stream_status(target, session_path is not None,
                                       log_path is not None, is_live,

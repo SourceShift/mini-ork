@@ -541,12 +541,15 @@ def test_status_finished_event_count_is_total_transcript(home: Path) -> None:
 
 
 def test_offset_no_repeated_note_on_repeated_polls(home: Path) -> None:
-    """r3 fix #2: 10-line transcript (no ``result``) → offsets 10/10/10 on
-    three polls; polls 2/3 return nothing. Append 2 lines → returns those 2.
+    """r4 fix #4: 10-line transcript (no ``result``) → full read returns 10
+    transcript entries plus the cost-state note; ``next_offset`` stays at
+    10 because the note does NOT advance the cursor (kickoff "without
+    changing offset"). A per-node marker file guarantees the note is
+    emitted at most once — subsequent polls at the same offset return
+    empty.
 
-    The cost-state note is emitted ONCE on the full read and does NOT advance
-    ``offset``; subsequent polls at the same offset return nothing and never
-    re-synthesise the note.
+    Appending 2 lines and polling at the same offset returns those 2
+    because the filter still matches ``_line >= offset`` for them.
     """
     _seed(home)
     session_path = (home / "runs" / RUN / "sessions" / f"{SESSION_UUID}.jsonl")
@@ -559,7 +562,9 @@ def test_offset_no_repeated_note_on_repeated_polls(home: Path) -> None:
     full = build_node(home, RUN, AGENT_NODE, view="stream")
     n = full["offset"]
     assert n == 10, f"expected offset 10, got {n}"
-    # Exactly one cost-state note, and it does NOT count in n.
+    # Exactly one cost-state note. r4: the note does NOT count in the
+    # status pill's ``transcript_entry_count`` (which counts emitted
+    # entries only) and does NOT advance ``next_offset``.
     notes = [e for e in full["entries"] if e["k"] == "note"]
     assert len(notes) == 1, f"expected one note, got {len(notes)}"
 
@@ -692,3 +697,255 @@ def test_learning_view_gradient_window_uses_seconds(home: Path) -> None:
     assert "gr-inside" in items_str
     assert "gr-before" not in items_str
     assert "gr-after" not in items_str
+
+
+# ── r4 fixes — fail-before / pass-after evidence (kickoff ide-node-stream-r4) ──
+
+
+def _seed_60s(home: Path) -> None:
+    """Seed a session whose transcript lines are 60 s apart.
+
+    r4 fix #1 fails-before evidence: with 1-s spacing, the r3 proxy
+    ``node_start + prev_line_idx`` happens to equal the real ISO ``_ts``
+    of every line, so any "fix" passes vacuously. With 60-s spacing the
+    proxy drifts by tens of seconds — only a real ``max(_ts)`` bound
+    satisfies the kickoff test.
+    """
+    _seed(home)
+    session_path = home / "runs" / RUN / "sessions" / f"{SESSION_UUID}.jsonl"
+    # The default fixture has 11 lines at T0+10..20 (1-s apart). Replace
+    # with 5 lines at T0+10, 70, 130, 190, 250 — 60-s spacing.
+    session_path.write_text("\n".join([
+        json.dumps({"type": "user", "timestamp": _iso(T0 + 10), "message": {"content": [
+            {"type": "text", "text": "implement the fix"}
+        ]}}),
+        json.dumps({"type": "assistant", "timestamp": _iso(T0 + 70), "message": {"content": [
+            {"type": "thinking", "thinking": "step 1"}
+        ]}}),
+        json.dumps({"type": "assistant", "timestamp": _iso(T0 + 130), "message": {"content": [
+            {"type": "text", "text": "step 2"}
+        ]}}),
+        json.dumps({"type": "assistant", "timestamp": _iso(T0 + 190), "message": {"content": [
+            {"type": "text", "text": "step 3"}
+        ]}}),
+        json.dumps({"type": "assistant", "timestamp": _iso(T0 + 250), "message": {"content": [
+            {"type": "text", "text": "step 4"}
+        ]}}),
+    ]) + "\n")
+
+
+def test_steer_lower_bound_uses_real_iso_ts_not_proxy(home: Path) -> None:
+    """r4 fix #1: steer emitted iff ``steer_ts > max(_ts of consumed lines)``.
+
+    The kickoff distinguishes the OLD proxy ``node_start + prev_line_idx``
+    from the NEW real bound by their behaviour on a 60-s-spaced
+    transcript. With the OLD proxy:
+
+    * offset=2, consumed lines are 0 (T0+10) and 1 (T0+70).
+    * Proxy lower bound = ``node_start + (offset-1) = T0+10 + 1 = T0+11``.
+    * A steer at T0+60 (> T0+11, < T0+70) passes the OLD lower bound.
+
+    With the NEW real bound:
+
+    * Real lower bound = ``max(_ts of lines 0,1) = T0+70``.
+    * A steer at T0+60 fails the strict ``> T0+70`` check → dropped.
+
+    The OLD code emits the steer; the NEW code does not. The test is
+    fail-before/pass-after for r4 fix #1.
+    """
+    _seed_60s(home)
+    # Steer at T0+60 — strictly between line 0's _ts (T0+10) and line 1's
+    # _ts (T0+70). Passes the proxy lower bound (T0+11), fails the real
+    # lower bound (T0+70).
+    con = sqlite3.connect(home / "state.db")
+    expires_ms = int(time.time() * 1000) + 3600_000
+    con.execute(
+        "INSERT INTO operator_steering (run_id, role_target, severity, message, source, "
+        "confidence, created_at, expires_at) VALUES (?,?,?,?,?,?,?,?)",
+        (RUN, "implementer", "info", "between-line-0-and-1", "ide",
+         0.8, (T0 + 60) * 1000, expires_ms))
+    con.commit()
+    con.close()
+
+    # Poll at offset=2: lines 0..1 consumed; lines 2..4 to-consume.
+    # OLD: steer 60 > proxy 11 → pass; 60 ≤ upper 250 → emit.
+    # NEW: steer 60 > real 70 → FAIL → skip.
+    out = build_node(home, RUN, AGENT_NODE, view="stream", offset=2)
+    steers = [e["arg"] for e in out["entries"] if e["k"] == "steer"]
+    assert "between-line-0-and-1" not in " ".join(steers), (
+        f"r4 fix #1 failed: steer at T0+60 between consumed lines should "
+        f"be filtered by the real bound; emitted entries: {steers}"
+    )
+
+
+def test_steer_emitted_once_and_skipped_on_subsequent_polls(home: Path) -> None:
+    """r4 fix #1 (positive case, kickoff scenario verbatim).
+
+    Transcript: 5 lines spaced 60 s apart (T0+10, 70, 130, 190, 250).
+    Steer at ``start+100 s`` = T0+110 (between line 1 at T0+70 and line
+    2 at T0+130).
+
+    * Poll 1 (full read, offset=0): lower=None, upper=T0+250, steer
+      110 ≤ 250 → emit. next_offset = 5.
+    * Poll 2 at the previous offset (5): consumed lines 0..4 → real
+      lower = T0+250; no new lines → has_upper=False → steer skipped.
+      Empty entries.
+    """
+    _seed_60s(home)
+    con = sqlite3.connect(home / "state.db")
+    expires_ms = int(time.time() * 1000) + 3600_000
+    con.execute(
+        "INSERT INTO operator_steering (run_id, role_target, severity, message, source, "
+        "confidence, created_at, expires_at) VALUES (?,?,?,?,?,?,?,?)",
+        (RUN, "implementer", "info", "mid-stream steer", "ide", 0.8,
+         (T0 + 110) * 1000, expires_ms))
+    con.commit()
+    con.close()
+
+    # Poll 1: full read emits the steer (lower=None on offset=0; 110 ≤ 250).
+    full = build_node(home, RUN, AGENT_NODE, view="stream")
+    full_steers = [e["arg"] for e in full["entries"] if e["k"] == "steer"]
+    assert any("mid-stream steer" in s for s in full_steers), (
+        f"expected the mid-stream steer to emit on full read; got: "
+        f"{[e for e in full['entries'] if e['k'] == 'steer']}"
+    )
+    full_offset = full["offset"]
+
+    # Poll 2 at the previous offset: drain, no entries.
+    drained = build_node(home, RUN, AGENT_NODE, view="stream", offset=full_offset)
+    assert drained["entries"] == []
+    assert drained["offset"] == full_offset
+
+
+def test_shell_log_uses_absolute_line_indices(home: Path) -> None:
+    """r4 fix #2: 45-line log → offset 45; append "NEW LINE" → poll at 45
+    returns exactly that line.
+
+    The full read caps to the last 40 lines (with absolute ``_line``
+    5..44). next_offset = 45 (total physical line count). A subsequent
+    poll at offset=45 returns empty; appending "NEW LINE" at line 45
+    and polling at offset=45 returns exactly that one line.
+    """
+    _seed(home)
+    log = home / "runs" / RUN / f"verifier_{SHELL_NODE}.log"
+    # Write 45 lines: lines 0..39 plus 5 more (lines 40..44).
+    lines = [f"line {i}" for i in range(45)]
+    log.write_text("\n".join(lines) + "\n")
+
+    # Full read: capped to last 40 lines (absolute indices 5..44).
+    full = build_node(home, RUN, SHELL_NODE, view="stream")
+    full_texts = [e["arg"] for e in full["entries"] if e["k"] == "text"]
+    assert len(full_texts) == 40, f"expected 40 lines on full read, got {len(full_texts)}"
+    # First emitted absolute line index is 5 ("line 5"); last is 44 ("line 44").
+    assert full_texts[0] == "line 5"
+    assert full_texts[-1] == "line 44"
+    # next_offset = 45 (total physical line count, NOT the cap).
+    assert full["offset"] == 45, f"expected offset 45, got {full['offset']}"
+
+    # Drain at offset=45: empty.
+    drained = build_node(home, RUN, SHELL_NODE, view="stream", offset=45)
+    assert drained["entries"] == []
+
+    # Append "NEW LINE" at absolute index 45.
+    with log.open("a", encoding="utf-8") as f:
+        f.write("NEW LINE\n")
+    after = build_node(home, RUN, SHELL_NODE, view="stream", offset=45)
+    after_texts = [e["arg"] for e in after["entries"] if e["k"] == "text"]
+    assert after_texts == ["NEW LINE"], f"expected ['NEW LINE'], got {after_texts}"
+    assert after["offset"] == 46, f"expected offset 46, got {after['offset']}"
+
+
+def test_role_for_node_treats_lens_as_reviewer(home: Path) -> None:
+    """r4 fix #3: ``researcher`` whose id ends in ``_lens`` → reviewer.
+
+    Before the fix the map lacked explicit ``researcher`` handling, so a
+    lens researcher only saw ``any``-targeted steers. After the fix a
+    reviewer-targeted steer at the ``code_impact_lens`` node is
+    surfaced by ``_role_for_node``.
+    """
+    from mini_ork.ide_pages.node import _role_for_node
+    from mini_ork.ide_pages.run import _REVIEW_TYPES as _RT
+
+    # Synthetic Node instances to exercise _role_for_node.
+    code_impact = _make_node("code_impact_lens", "researcher")
+    prior_art = _make_node("prior_art_lens", "researcher")
+    plain_scout = _make_node("scout", "researcher")
+    judge = _make_node("judge_node", "judge")
+    synth = _make_node("synth_node", "synthesizer")
+    lens = _make_node("lens_node", "lens")
+
+    assert _role_for_node(code_impact) == "reviewer"
+    assert _role_for_node(prior_art) == "reviewer"
+    assert _role_for_node(plain_scout) == "any", (
+        "non-lens researchers should fall through to the default role"
+    )
+    for node in (judge, synth, lens):
+        assert _role_for_node(node) == "reviewer", (
+            f"{node.id} (type={node.type}) should map to reviewer"
+        )
+    # Sanity: every reviewer-role node type is in _REVIEW_TYPES (per kickoff).
+    for rt in _RT:
+        n = _make_node(f"x_{rt}", rt)
+        assert _role_for_node(n) == "reviewer", (
+            f"_REVIEW_TYPES entry {rt!r} should map to reviewer"
+        )
+
+
+def _make_node(node_id: str, node_type: str):
+    """Lightweight Node for ``_role_for_node`` tests (no DB needed)."""
+    from mini_ork.ide_pages.run import Node
+    return Node(id=node_id, type=node_type)
+
+
+def test_cost_note_emits_once_marker_blocks_re_synthesis(home: Path) -> None:
+    """r4 fix #4: a per-node marker file in ``run_dir`` guarantees the
+    cost-state note is emitted at most once across polls.
+
+    The default seed leaves the run already finished (status='done' ⇒
+    not live), so the first poll emits the note once and writes the
+    marker. A subsequent poll at the same offset returns empty
+    (``no _KIND_NOTE in out`` AND marker exists → skip synthesis).
+
+    This is the r3 "no repeated note on repeated polls" property
+    rebuilt on a stateless builder: instead of relying on
+    ``int(offset) == 0`` (r3) which fails when the first poll is at
+    a non-zero offset during a live→finished transition, the marker
+    file blocks re-synthesis at any offset.
+    """
+    _seed(home)
+    session_path = home / "runs" / RUN / "sessions" / f"{SESSION_UUID}.jsonl"
+    # Strip the result entry → 10 transcript lines, no result of its own.
+    text = session_path.read_text(encoding="utf-8")
+    lines = [ln for ln in text.splitlines() if ln.strip()
+             and json.loads(ln).get("type") != "result"]
+    session_path.write_text("\n".join(lines) + "\n")
+
+    # First poll: run already done → emit the cost-state note + write marker.
+    first = build_node(home, RUN, AGENT_NODE, view="stream")
+    notes_first = [e for e in first["entries"] if e["k"] == "note"]
+    assert len(notes_first) == 1, (
+        f"expected one cost-state note on first poll, got {len(notes_first)}"
+    )
+    note = notes_first[0]
+    assert "Done" in note["arg"] and "$" in note["arg"]
+
+    # Marker file written.
+    marker = home / "runs" / RUN / f".cost-note-emitted.{AGENT_NODE}"
+    assert marker.exists(), (
+        f"r4 fix #4: expected marker file at {marker}"
+    )
+
+    # Second poll at the SAME offset: marker blocks re-synthesis.
+    second = build_node(home, RUN, AGENT_NODE, view="stream",
+                        offset=first["offset"])
+    notes_second = [e for e in second["entries"] if e["k"] == "note"]
+    assert notes_second == [], (
+        f"marker must block re-emission; second poll notes: {notes_second}"
+    )
+
+    # Third poll at a DIFFERENT offset: still no note (marker is per-node,
+    # not per-offset).
+    third = build_node(home, RUN, AGENT_NODE, view="stream",
+                       offset=first["offset"] + 100)
+    notes_third = [e for e in third["entries"] if e["k"] == "note"]
+    assert notes_third == []
