@@ -2517,7 +2517,13 @@ def _learned_block(root, task_class, node_type, lane="", node_id="",
     pref_sources: list[dict] = []
     try:
         from mini_ork.memory import preferences
-        _prefs = preferences.prefs_for(task_class or "generic")
+        # The run's declared file scope (run_profile.json → scope_allow), so a
+        # path-scoped rule reaches only the runs that touch a matching file.
+        # ``MINI_ORK_RUN_DIR`` is published before this call (dispatch_node,
+        # publish_env({ENV_RUN_DIR: run_dir_eff})); missing/empty → no path rules.
+        _run_dir = context_env("MINI_ORK_RUN_DIR", "")
+        _paths = preferences.scope_paths(_run_dir) if _run_dir else []
+        _prefs = preferences.prefs_for(task_class or "generic", paths=_paths)
         pref_block = preferences.render_block(_prefs)
         if pref_block and sources is not None:
             for _p in _prefs:
