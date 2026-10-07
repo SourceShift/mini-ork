@@ -78,12 +78,15 @@ def _yaml_load(path: str) -> dict:
     return data
 
 
+_CONTROL_EDGE_TYPES = frozenset({"escalates_to", "retries"})
+
+
 def load_dag(workflow_yaml_path: str) -> DAG:
     """Parse ``workflow.yaml`` into a ``DAG``.
 
-    Edges with ``edge_type == "escalates_to"`` are EXCLUDED from the
-    dependency relation: they are operator-path edges, not data flow
-    edges. A failed verifier escalating to rollback must not pull the
+    Edges with ``edge_type`` in ``{"escalates_to", "retries"}`` are EXCLUDED
+    from the dependency relation: they are control-flow edges (operator path,
+    revise loop), not data flow edges. A failed verifier escalating to rollback must not pull the
     whole DAG into the closure (that would defeat the point of E2).
     All other edge_types (``depends_on``, ``supplies_context_to``,
     ``verifies``) are treated as data-flow deps — see module docstring
@@ -123,7 +126,12 @@ def load_dag(workflow_yaml_path: str) -> DAG:
             # Edge references an unknown node — ignore (workflow.yaml
             # validation belongs to plan, not the recovery planner).
             continue
-        if str(e.get("edge_type") or "").strip() == "escalates_to":
+        # ``escalates_to`` (operator path) and ``retries`` (the revise loop:
+        # a failed gate sends findings back to the implementer) are control
+        # flow, not data flow. ``retries`` points BACKWARDS, so counting it
+        # makes every revise-loop recipe (framework-edit since 2be82523) a
+        # cycle and recover refuses the whole run.
+        if str(e.get("edge_type") or "").strip() in _CONTROL_EDGE_TYPES:
             continue
         # Dedup per-node adjacency.
         if dst not in children[src]:
