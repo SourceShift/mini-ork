@@ -548,6 +548,75 @@ def _other_node_items(run_dir: Path, node: Node) -> tuple[str, list[dict[str, An
 # ── review helpers ──────────────────────────────────────────────────────────
 
 
+# ── run target dirs (kickoff fix #2 — shared by files + findings) ───────────
+
+_TARGET_DIRS_CACHE: dict[tuple[str, str], list[Path]] = {}
+
+
+def _run_target_dirs(run: Run | None) -> list[Path]:
+    """Ordered existing dirs a run's changed files may live in.
+
+    ``run.workspace.path`` first (the live worktree record), then the run's own
+    ``run_profile.json``: ``target_repo``, ``roots.target``, ``roots.exec_cwd``.
+    A missing file, a missing key, or a value that is not an existing directory
+    is skipped. Cached per ``run.run_dir`` — the workspace path is part of the
+    key too, so a workspace that appears after the first view (the IDE polls a
+    live run) is not masked by a stale entry — so the files list and the
+    finding resolver do not re-read (and re-parse) the profile.
+    """
+    if run is None:
+        return []
+    ws = getattr(run, "workspace", None)
+    ws_path = getattr(ws, "path", None) if ws is not None else None
+    key = (str(run.run_dir), str(ws_path or ""))
+    cached = _TARGET_DIRS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    out: list[Path] = []
+    if ws_path:
+        out.append(Path(ws_path))
+    profile = _read_json(run.run_dir / "run_profile.json") or {}
+    roots = profile.get("roots")
+    if not isinstance(roots, dict):
+        roots = {}
+    for value in (profile.get("target_repo"), roots.get("target"), roots.get("exec_cwd")):
+        if value:
+            out.append(Path(str(value)))
+    seen: set[str] = set()
+    dirs: list[Path] = []
+    for d in out:
+        s = str(d)
+        if s not in seen and d.is_dir():
+            seen.add(s)
+            dirs.append(d)
+    _TARGET_DIRS_CACHE[key] = dirs
+    return dirs
+
+
+def _resolve_in_dirs(path: str, dirs: list[Path]) -> tuple[str, str] | None:
+    """Resolve ``path`` inside ``dirs`` → ``(display, absolute)`` or ``None``.
+
+    A relative path is tried as given (``dir / path``); an absolute path is
+    tried by its tails, so a path recorded against a since-removed worktree
+    still maps onto a live target dir. ``display`` is the path relative to the
+    dir the file was found in; the first hit wins (``dirs`` is ordered).
+    """
+    p = Path(path)
+    for base in dirs:
+        if p.is_absolute():
+            parts = p.parts
+            for start in range(1, len(parts)):
+                rel = Path(*parts[start:])
+                candidate = base / rel
+                if candidate.is_file():
+                    return str(rel), str(candidate)
+        else:
+            candidate = base / p
+            if candidate.is_file():
+                return str(p), str(candidate)
+    return None
+
+
 def _finding_item(note: Any, run: Run | None = None) -> dict[str, Any]:
     """One review finding → spec item with severity mark + ``file:line`` + open.
 
@@ -597,7 +666,8 @@ def _resolve_finding_path(file_path: str, run: Run | None) -> str:
 
     1. ``Path(file_path)`` absolute and existing → return as-is.
     2. Try ``run.home.absolute().parent / file_path`` (project root).
-    3. Try ``run.workspace.path / file_path`` (workspace record).
+    3. Try each ``_run_target_dirs(run)``: the workspace record, then the
+       run's recorded ``target_repo`` / ``roots`` (see ``_run_target_dirs``).
     4. Otherwise ``""`` (no open action; finding stays in the list).
     """
     if not file_path:
@@ -611,13 +681,9 @@ def _resolve_finding_path(file_path: str, run: Run | None) -> str:
     candidate = project / file_path
     if candidate.is_file():
         return str(candidate)
-    ws = run.workspace
-    if ws is not None:
-        ws_path = getattr(ws, "path", None)
-        if ws_path:
-            candidate = Path(ws_path) / file_path
-            if candidate.is_file():
-                return str(candidate)
+    hit = _resolve_in_dirs(file_path, _run_target_dirs(run))
+    if hit is not None:
+        return hit[1]
     return ""
 
 
@@ -692,7 +758,7 @@ def _files_and_note(run: Run, show_diff: bool,
         new_text = str(d.get("new_text") or "")
         if diff_source == "acp" and (old_text or new_text) and not (added or removed):
             added, removed = _line_diff_counts(old_text, new_text)
-        display, absolute = _project_file_lazy(path, project)
+        display, absolute = _project_file_lazy(path, project, run)
         files.append(
             {
                 "path": display,
@@ -919,24 +985,57 @@ def _diff_text(files: list[dict[str, Any]],
     return text, ""
 
 
-def _project_file_lazy(path: str, project: Path) -> tuple[str, str | None]:
-    """Fix #7: lazy import of ``board_cmd._project_file``.
+def _project_file_lazy(path: str, project: Path,
+                       run: Run | None = None) -> tuple[str, str | None]:
+    """Fix #7 + kickoff fix #3: lazy import, then a run-target fallback.
 
     The import is inside the function so this module does not need a
     top-level ``from mini_ork.cli.board_cmd import ...`` (mirrors the
     pattern at ``run.py:732``).
+
+    A RELATIVE path is accepted from the project only on an EXACT hit
+    (``project / path`` is a file). On a miss — or for any absolute path the
+    project lacks a tail for — each ``_run_target_dirs(run)`` (the run's live
+    worktree, then its recorded ``target_repo`` / roots) is tried BEFORE the
+    project tail match. That ordering matters: a new file the run created
+    (e.g. ``docs/new/README.md``) must resolve to its own worktree copy, not
+    collapse onto the project's ``README.md`` just because that basename
+    happens to exist at the project root. ``_project_file``'s tail match
+    stays as the LAST resort, so a since-gone worktree path still maps onto
+    the main checkout. This mirrors ``_resolve_finding_path``'s order
+    (exact project → target dirs) so the files list and the findings agree.
+    An absolute path that exists only where it is (a live worktree) falls
+    back to its git root.
     """
     from mini_ork.cli.board_cmd import _project_file
 
+    p = Path(path)
+    if not p.is_absolute():
+        exact = project / p
+        if exact.is_file():
+            return str(p), str(exact)
+        hit = _resolve_in_dirs(path, _run_target_dirs(run))
+        if hit is not None:
+            return hit
+        # Nothing in the run's own dirs → keep the project tail match (a
+        # delivered run whose worktree is gone but whose path still maps
+        # onto main by a shorter tail).
+        return _project_file(path, project)
     display, absolute = _project_file(path, project)
-    if absolute is None and Path(path).is_absolute() and Path(path).is_file():
+    if absolute is not None:
+        return display, absolute
+    hit = _resolve_in_dirs(path, _run_target_dirs(run))
+    if hit is not None:
+        return hit
+    if p.is_file():
         # A live worktree's file that the project does not have yet (a new
         # file): open it where it is, shown relative to its repo root.
-        absolute = path
-        for parent in Path(path).parents:
+        display = path
+        for parent in p.parents:
             if (parent / ".git").exists():
-                display = str(Path(path).relative_to(parent))
+                display = str(p.relative_to(parent))
                 break
+        return display, path
     return display, absolute
 
 

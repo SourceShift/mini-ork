@@ -382,19 +382,35 @@ def _project_file(path: str, project: Path) -> tuple[str, str | None]:
 
     A delivered run's worktree is gone, so its recorded path is mapped onto the
     project: the longest tail of the path that exists in the project wins.
+
+    A RELATIVE path is tried as ``project / path`` first (start 0) so a
+    run-recorded path such as ``mini_ork/ide_pages/x.py`` resolves against the
+    project root even when the process cwd is somewhere else. When a relative
+    path resolves nowhere it is returned unchanged for display — never just its
+    basename (``p.name`` would drop the directory). An ABSOLUTE path keeps
+    today's tail mapping, and an absolute path that resolves nowhere keeps the
+    basename display.
     """
     p = Path(path)
-    if p.is_file():
-        try:
-            return str(p.relative_to(project)), str(p)
-        except ValueError:
-            pass
+    if p.is_absolute():
+        if p.is_file():
+            try:
+                return str(p.relative_to(project)), str(p)
+            except ValueError:
+                pass
+        parts = p.parts
+        for start in range(1, len(parts)):
+            candidate = project.joinpath(*parts[start:])
+            if candidate.is_file():
+                return str(Path(*parts[start:])), str(candidate)
+        return p.name, None
     parts = p.parts
-    for start in range(1, len(parts)):
-        candidate = project.joinpath(*parts[start:])
+    for start in range(0, len(parts)):
+        rel = Path(*parts[start:])
+        candidate = project / rel
         if candidate.is_file():
-            return str(Path(*parts[start:])), str(candidate)
-    return p.name, None
+            return str(rel), str(candidate)
+    return path, None
 
 
 def _card_fields(card: dict[str, Any], project: Path) -> dict[str, Any]:
