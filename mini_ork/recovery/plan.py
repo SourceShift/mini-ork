@@ -55,10 +55,33 @@ from mini_ork.stores import checkpoints as mc
 __all__ = [
     "RecoveryPlan",
     "RECOVERY_STRATEGIES",
+    "RecoveryRefused",
     "compute_recovery",
     "plan_recovery",
     "format_status",
 ]
+
+
+class RecoveryRefused(ValueError):
+    """A recovery that the planner can compute but refuses to dispatch.
+
+    Distinct from ``ValueError`` (which is reserved for programmer errors
+    — bad strategy, unknown ``--from-node``) so the CLI boundary in
+    ``mini_ork.recovery.planner.main`` can catch refusal messages
+    separately and surface the operator hint without a traceback.
+
+    The kickoff's two refusals live here:
+
+      * ``verify`` with an upstream LLM node lacking a reusable checkpoint.
+      * The change-needed gate (``needs_change`` set in the retry hint
+        without ``--ack-change``) — though that one is normally raised
+        higher in the CLI layer.
+    """
+
+    def __init__(self, message: str, *, kind: str = "refused"):
+        super().__init__(message)
+        self.kind = kind
+
 
 # Strategy enum — strings, not Enum, so JSON serialization stays trivial.
 # ``reattach`` (remote-nodes-10): re-attach to a still-running remote proc
@@ -70,7 +93,77 @@ __all__ = [
 # ``--strategy reattach`` plan currently produces the same closure as
 # ``resume`` until the executor learns to short-circuit dispatch when the
 # proc is already running on the VM.
-RECOVERY_STRATEGIES = ("resume", "retry", "repair", "pause", "reattach")
+#
+# ``verify`` (kickoff §3): re-run only the verifier chain while reusing
+# every upstream LLM node. Entry = first ``verifier`` in topo order (or
+# ``--from-node``); every upstream node must be reusable, with the planner
+# treated as implicitly reusable when ``<run_dir>/plan.json`` parses.
+RECOVERY_STRATEGIES = ("resume", "retry", "repair", "pause", "reattach", "verify")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# workflow.yaml node-type helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _node_types(workflow_yaml_path: str) -> dict[str, str]:
+    """Parse ``workflow.yaml`` a second time to surface each node's ``type``.
+
+    The DAG loader (``mini_ork.recovery.dag.load_dag``) deliberately
+    discards ``type`` (see ``dag.py:105-113``) — the closure is
+    type-agnostic. ``compute_recovery`` needs node types for two
+    decisions: the ``verify`` strategy's entry resolution ("first
+    verifier in topo order") and the planner-as-reusable shortcut
+    (kickoff §2: ``<run_dir>/plan.json`` makes the skipped-planner
+    reusable). The lens recommended the second-yaml-parse option (a) so
+    the diff stays inside the declared file surface; this is that parse.
+
+    Soft-imports PyYAML the same way ``dag._yaml_load`` does
+    (``dag.py:67-78``); on ImportError or any YAML error, returns ``{}``
+    so the planner falls back to a type-blind plan (the closure still
+    computes correctly; only the type-keyed shortcuts are skipped).
+    """
+    if not workflow_yaml_path or not os.path.isfile(workflow_yaml_path):
+        return {}
+    try:
+        import yaml  # type: ignore[import-untyped]
+
+        with open(workflow_yaml_path, encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+    except (OSError, ImportError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, str] = {}
+    for n in data.get("nodes") or []:
+        if not isinstance(n, dict):
+            continue
+        nid = str(n.get("name") or "").strip()
+        typ = str(n.get("type") or "").strip()
+        if nid and typ:
+            out[nid] = typ
+    return out
+
+
+def _ancestors(dag: DAG, node: str) -> set[str]:
+    """Every node transitively upstream of ``node`` (incl. ``node``).
+
+    Mirrors :meth:`DAG.descendants` (``dag.py:52``) but walks the parent
+    map. Used by the ``verify`` strategy's upstream-reusability check
+    (kickoff §3). ``node`` is included so callers can ask "is ``node``
+    itself reusable" without a second membership test.
+    """
+    if node not in dag.parents:
+        return {node}
+    seen: set[str] = set()
+    stack = [node]
+    while stack:
+        cur = stack.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        stack.extend(dag.parents.get(cur, ()))
+    return seen
 
 
 @dataclasses.dataclass
@@ -100,7 +193,10 @@ class RecoveryPlan:
                        to detect "the closure was computed against the
                        same inputs we now want to dispatch". Exec compares
                        to its own sku before honoring the plan; mismatch
-                       → recompute."""
+                       → recompute.
+      node_types     — name → type map parsed from workflow.yaml (used by
+                       the ``verify`` strategy's entry resolution; carries
+                       through ``to_dict`` for downstream consumers)."""
 
     run_id: str
     recipe: str
@@ -114,6 +210,7 @@ class RecoveryPlan:
     cost_boundary: dict
     reason: dict[str, str]
     sku: str
+    node_types: dict[str, str] = dataclasses.field(default_factory=dict)
 
     def to_dict(self) -> dict:
         out = dataclasses.asdict(self)
@@ -159,6 +256,7 @@ def _reusable_set(
     *,
     recipe: str,
     task_class: str,
+    node_types: dict[str, str] | None = None,
 ) -> tuple[set[str], dict[str, str]]:
     """For every node in the DAG, ask E1 ``is_node_reusable`` and return
     (reuse_set, reason_map). reason_map[node] = "" if reusable, else a
@@ -172,11 +270,22 @@ def _reusable_set(
     rather than ``"hash_mismatch"`` because the operator expectation
     is different (a hash mismatch implies a config-change invalidation;
     a no_row means "this node never ran").
+
+    Planner shortcut (kickoff §2 / lens §1.2): the planner node is special —
+    ``mini_ork/cli/execute_handlers.py:453`` short-circuits when
+    ``MINI_ORK_RECOVERY_CLOSURE`` is set, so the planner never writes a
+    checkpoint row. Today its ``no_row`` makes it the closure root and
+    swallows every reusable upstream node. To fix this without scope_cheek,
+    a planner-typed node with no checkpoint row is counted as reusable
+    (reason ``"plan_json"``) when ``<run_dir>/plan.json`` exists and
+    parses as JSON. Any other ``no_row`` node keeps today's behaviour.
     """
     recipe_eff = recipe or "unknown"
     tc_eff = task_class or "generic"
+    types = node_types or {}
     reuse: set[str] = set()
     reason: dict[str, str] = {}
+    plan_json_present = _plan_json_present_and_parses(run_dir)
     for nid in dag.node_ids:
         # Direct DB read first to classify the failure mode. Cheap,
         # and the planner needs the distinction for the --status print
@@ -184,6 +293,10 @@ def _reusable_set(
         # downstream; a "hash_mismatch" node IS a regression signal).
         row_status = _peek_row_status(db_path, run_id, nid)
         if row_status is None:
+            if plan_json_present and types.get(nid) == "planner":
+                reuse.add(nid)
+                reason[nid] = "plan_json"
+                continue
             reason[nid] = "no_row"
             continue
         if row_status != "success":
@@ -203,6 +316,29 @@ def _reusable_set(
         else:
             reason[nid] = "hash_mismatch_or_artifact_corrupt"
     return reuse, reason
+
+
+def _plan_json_present_and_parses(run_dir: str) -> bool:
+    """True iff ``<run_dir>/plan.json`` exists and parses as JSON.
+
+    Cheap, side-effect-free read; used by ``_reusable_set`` to gate the
+    planner-as-reusable shortcut. A missing or unparseable plan.json is
+    treated as "not present" so a run whose plan was lost falls back to
+    the legacy ``no_row`` behaviour rather than claiming the planner
+    is reusable on speculation.
+    """
+    if not run_dir:
+        return False
+    import json
+    path = os.path.join(run_dir, "plan.json")
+    if not os.path.isfile(path):
+        return False
+    try:
+        with open(path, encoding="utf-8") as fh:
+            json.load(fh)
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def _peek_row_status(db_path: str, run_id: str, node_id: str) -> str | None:
@@ -319,9 +455,11 @@ def compute_recovery(
     dag = load_dag(workflow_yaml_path)
     recipe_eff = recipe or "unknown"
     tc_eff = task_class or "generic"
+    node_types = _node_types(workflow_yaml_path)
     reuse, reason = _reusable_set(
         dag, db_path, run_id, run_dir,
         recipe=recipe_eff, task_class=tc_eff,
+        node_types=node_types,
     )
     all_set = set(dag.node_ids)
 
@@ -384,6 +522,7 @@ def compute_recovery(
         cost_boundary={"paused": False, "node": None},
         reason=reason_view,
         sku=_sku(run_id, recipe_eff, tc_eff),
+        node_types=node_types,
     )
 
 
@@ -432,6 +571,41 @@ def plan_recovery(
         workflow_yaml_path, run_id, db_path, run_dir,
         recipe=recipe, task_class=task_class, from_node=from_node,
     )
+
+    # ``verify`` strategy override (kickoff §3). Entry = first verifier in
+    # topo order (or ``--from-node``); closure = entry + descendants;
+    # every upstream node must be reusable — otherwise refuse with a
+    # clear message rather than letting a non-reusable LLM node silently
+    # validate an outdated run. Done AFTER the strategy-agnostic compute
+    # so the planner-reuse shortcut (kickoff §2) is already applied.
+    if strategy == "verify":
+        dag = load_dag(workflow_yaml_path)
+        verify_entry = from_node
+        if not verify_entry:
+            for nid in dag.topo:
+                if plan.node_types.get(nid) == "verifier":
+                    verify_entry = nid
+                    break
+        if not verify_entry:
+            raise RecoveryRefused(
+                "no verifier-typed node found in workflow.yaml; "
+                "--strategy verify requires at least one verifier",
+                kind="verify_no_entry",
+            )
+        for nid in _ancestors(dag, verify_entry):
+            if nid in plan.reuse:
+                continue
+            raise RecoveryRefused(
+                f"{nid} has no reusable checkpoint — use --strategy resume",
+                kind="verify_no_reusable_upstream",
+            )
+        plan.closure = dag.descendants(verify_entry)
+        plan.failed_node = verify_entry
+        plan.first_node = next(
+            (nid for nid in dag.topo if nid in plan.closure),
+            None,
+        )
+
     # Retry semantics: same entry, but the plan carries the operator's
     # explicit "I know what's broken" intent for downstream trace
     # metadata. No behavioral change in this E2 increment; the field
