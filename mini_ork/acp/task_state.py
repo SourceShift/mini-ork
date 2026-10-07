@@ -526,6 +526,18 @@ def run_mark(status: str | None, run_dir: Path | None) -> str:
         home = path.parent.parent
         if (home / "worktrees" / f"{path.name}.json").is_file():
             return MARKS["needs_you"]
+    if status in ("failed", "rolled_back") and path is not None:
+        # A pending ``retry_precondition`` gate means the operator must act
+        # before this run can continue — needs-you, not failed. Mirrors rule 0
+        # of ``task_state`` so the cheap tile count agrees with the precise
+        # list. Zero DB reads unless ``retry-gate.json`` exists.
+        try:
+            from mini_ork.recovery import retry_notify
+            home = path.parent.parent
+            if isinstance(retry_notify.pending_fix_for_run(home, path), dict):
+                return MARKS["needs_you"]
+        except Exception:  # noqa: BLE001
+            pass
     if status == "published":
         return MARKS["done"]
     if status in ("failed", "rolled_back"):

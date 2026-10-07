@@ -101,6 +101,28 @@ def assert_root() -> None:
             die(f"ROOT is not a git checkout: {ROOT}")
 
 
+def _supersede_gates(target_dir: str, note: str) -> list[str]:
+    """Close pending retry gates bound to a just-merged/removed worktree.
+
+    Stays standalone by intent (no top-level ``mini_ork`` import): bootstrap
+    ROOT onto ``sys.path`` at the call site and fail soft — a gate problem
+    must never fail an operation that already succeeded. Returns the closed
+    run ids (``[]`` when the package is unavailable or nothing matched).
+    """
+    home = os.environ.get("MINI_ORK_HOME") or os.path.join(ROOT, ".mini-ork")
+    try:
+        if ROOT and ROOT not in sys.path:
+            sys.path.insert(0, ROOT)
+        from mini_ork.recovery import retry_notify
+        return retry_notify.supersede_gates_for_target(home, target_dir, note)
+    except Exception as exc:
+        # Fail soft, but visibly: a stale ROOT checkout (local main lags
+        # origin after a push) may lack the helper, leaving gates open.
+        print(f"[mo-worktree] warn: retry gates for {target_dir} not closed: "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return []
+
+
 # ── CAID file-ownership registry ───────────────────────────────────────────
 
 def normalize_path(p: str) -> str:
@@ -290,6 +312,12 @@ def merge_worktree(args: list[str]) -> None:
         die(f"green gate failed ({test_cmd}) in {wt}; "
             f"{_differential_verdict(wt, test_cmd, pre_rebase, base_before)}")
     git("-C", wt, "push", "origin", "HEAD:main")
+    short_sha = git("-C", wt, "rev-parse", "--short", "HEAD",
+                    check=False, capture=True).stdout.strip()
+    closed = _supersede_gates(
+        wt, f"superseded: merged to main as {short_sha}")
+    if closed:
+        print(f"[mo-worktree] closed retry gate(s): {', '.join(closed)}")
     print(f"[mo-worktree] merged {branch} -> origin/main. "
           f"Tear down with: scripts/mini_ork_worktree.py clean {slug}")
 
@@ -337,6 +365,10 @@ def clean_worktree(slug_arg: str) -> None:
     if os.path.isdir(wt):
         branch = git("-C", wt, "rev-parse", "--abbrev-ref", "HEAD",
                      check=False, capture=True).stdout.strip()
+        closed = _supersede_gates(
+            wt, f"superseded: worktree {slug} removed")
+        if closed:
+            print(f"[mo-worktree] closed retry gate(s): {', '.join(closed)}")
         rc = git("-C", ROOT, "worktree", "remove", wt, check=False).returncode
         if rc != 0:
             git("-C", ROOT, "worktree", "remove", "--force", wt)

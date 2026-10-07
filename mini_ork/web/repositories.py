@@ -318,7 +318,7 @@ class RunDetailRepository:
             SELECT event_type, created_at, payload_json
             FROM run_events
             WHERE run_id = ? AND event_type IN ('node_start', 'node_end')
-            ORDER BY created_at ASC
+            ORDER BY created_at ASC, rowid ASC
             """,
             (task_run_id,),
         )
@@ -381,7 +381,7 @@ class RunDetailRepository:
             FROM run_events
             WHERE run_id IN ({placeholders})
               AND event_type IN ('node_start', 'node_end')
-            ORDER BY created_at ASC
+            ORDER BY created_at ASC, rowid ASC
             """,
             tuple(task_run_ids),
         )
@@ -546,8 +546,21 @@ def derive_node_statuses(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]
             continue
         entry = out.setdefault(str(node_id), {"status": _NEVER_SEEN})
         if r.get("event_type") == "node_start":
+            start_at = r.get("created_at")
+            ended = entry.get("ended_at")
+            # ``created_at`` is 1-second resolution, so a node whose start and
+            # end share a second can arrive in either row order. A recorded end
+            # at-or-after this start means the node already finished — never
+            # resurrect it to ``running``. A start STRICTLY later than the end
+            # is a real re-run and does flip. Both types may be None → skip.
+            if ended is not None and start_at is not None:
+                try:
+                    if ended >= start_at:
+                        continue
+                except TypeError:
+                    pass
             entry["status"] = _RUNNING
-            entry["started_at"] = r.get("created_at")
+            entry["started_at"] = start_at
         elif r.get("event_type") == "node_end":
             verdict = payload.get("verdict")
             entry["status"] = _FAILED if verdict in _FAILED_VERDICTS else _DONE

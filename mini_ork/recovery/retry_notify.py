@@ -1002,3 +1002,69 @@ def pending_fix_for_run(home: Path, run_dir: Path) -> dict[str, Any] | None:
     if str(row.get("status") or "") != "pending":
         return None
     return row
+
+
+def supersede_gates_for_target(
+    home: str | Path, target_dir: str | Path, note: str,
+) -> list[str]:
+    """Close pending retry gates whose run targeted ``target_dir``.
+
+    Called when a task worktree is merged to main or removed: work on every
+    failed run that targeted it is now settled (its fix landed or was
+    dropped), so its gate must stop asking the operator forever. A gate is
+    matched when the run's ``run_profile.json`` names a ``target_repo`` or
+    ``roots.target`` equal (realpath) to ``target_dir``.
+
+    For each still-pending gate: resolve the row ``rejected`` with ``note``,
+    then write ``{"abandoned": true, "superseded": note}`` into the pointer
+    file — the exact marker ``board gate reject`` writes. Idempotent: a
+    second call finds no pending row (``resolve`` returns ``False``) and
+    returns ``[]``. Never raises: a bad file is skipped, and the run ids that
+    WERE closed are returned.
+    """
+    home = Path(home)
+    want = _realpath(target_dir)
+    closed: list[str] = []
+    try:
+        pointers = sorted(home.glob(f"runs/*/{GATE_POINTER_FILENAME}"))
+    except OSError:
+        return closed
+    for pointer in pointers:
+        try:
+            run_dir = pointer.parent
+            profile = _read_run_profile(run_dir)
+            roots = profile.get("roots")
+            target = roots.get("target") if isinstance(roots, dict) else None
+            if not any(
+                t and _realpath(t) == want
+                for t in (profile.get("target_repo"), target)
+            ):
+                continue
+            body = json.loads(pointer.read_text(encoding="utf-8"))
+            if not isinstance(body, dict):
+                continue
+            raw_iid = body.get("inbox_id")
+            if raw_iid is None:
+                continue
+            try:
+                iid = int(raw_iid)
+            except (TypeError, ValueError):
+                continue
+            from mini_ork.gates import oversight_inbox
+            db_path = str(home / "state.db")
+            if not Path(db_path).is_file():
+                continue
+            if oversight_inbox.resolve(
+                iid, "rejected", review_note=note, db_path=db_path,
+            ) is not True:
+                continue
+            body["abandoned"] = True
+            body["superseded"] = note
+            pointer.write_text(
+                json.dumps(body, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            closed.append(run_dir.name)
+        except Exception:  # noqa: BLE001
+            continue
+    return closed
