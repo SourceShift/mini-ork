@@ -1043,13 +1043,34 @@ def _aggregate_areas(rows, depth, limit) -> list[dict]:
     return out[:limit]
 
 
+def _in_repo(files: set, repo_root: str | None) -> set:
+    """The subset of ``files`` that are real paths of the code repo.
+
+    Findings also name run artifacts (``verifier_test.json``,
+    ``framework-edit.diff``, ``plan.json``) — live 2026-10-07 the top "area" was
+    ``verifier_test.json`` with 49 findings. Those are not code an engineer
+    owns. A path counts when ``git ls-files`` lists it or it exists under the
+    repo root; with no repo to check against, nothing is filtered.
+    """
+    root = repo_root or os.environ.get("MINI_ORK_ROOT") or os.getcwd()
+    listed = _git_ls_files(root)
+    if listed is None and not os.path.isdir(root):
+        return set(files)
+    keep = set()
+    for f in files:
+        if (listed is not None and f in listed) or os.path.exists(os.path.join(root, f)):
+            keep.add(f)
+    return keep
+
+
 def areas(*, db=None, depth=_DEFAULT_DEPTH, since_days=_DEFAULT_SINCE_DAYS,
-          limit=_DEFAULT_AREAS_LIMIT) -> list[dict]:
+          limit=_DEFAULT_AREAS_LIMIT, repo_only=True, repo_root=None) -> list[dict]:
     """Group findings by file area (kickoff §7). Read-only.
 
     Groups by the file's directory prefix up to ``depth`` segments, keeping the
     file itself when a single file dominates (≥ 60% of the area). Ordered by
-    high-severity count, then n_findings.
+    high-severity count, then n_findings. With ``repo_only`` (default) only
+    findings on files of the code repo count; run artifacts are left out.
     """
     con = _open(db)
     if con is None:
@@ -1069,6 +1090,9 @@ def areas(*, db=None, depth=_DEFAULT_DEPTH, since_days=_DEFAULT_SINCE_DAYS,
             con.close()
         except sqlite3.Error:
             pass
+    if repo_only and rows:
+        keep = _in_repo({r[0] for r in rows}, repo_root)
+        rows = [r for r in rows if r[0] in keep]
     return _aggregate_areas(rows, depth=depth, limit=limit)
 
 

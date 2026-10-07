@@ -626,7 +626,7 @@ def test_areas_groups_orders_and_honours_since_days(tmp_path: Path) -> None:
     _insert_finding(db, file="mini_ork/learning/bar.py", severity="low",
                     category="other", run_id="r9", ts=now - 40 * 86400)
 
-    result = code_findings.areas(db=str(db), since_days=30)
+    result = code_findings.areas(db=str(db), since_days=30, repo_only=False)
 
     # node.py dominates its area (3 of 4) → the area IS the file; high first.
     assert result[0]["area"] == "mini_ork/ide_pages/node.py"
@@ -645,7 +645,7 @@ def test_areas_never_blank_label(tmp_path: Path) -> None:
     # must still be non-empty.
     _insert_finding(db, file="node.py", severity="high", category="other",
                     run_id="r", ts=now)
-    result = code_findings.areas(db=str(db), since_days=30)
+    result = code_findings.areas(db=str(db), since_days=30, repo_only=False)
     assert result and result[0]["area"] == "node.py"
 
 
@@ -663,7 +663,7 @@ def test_areas_bare_filenames_stay_separate(tmp_path: Path) -> None:
     _insert_finding(db, file="CLAUDE.md", severity="low", category="other",
                     run_id="r9", ts=now)
 
-    result = code_findings.areas(db=str(db), since_days=30)
+    result = code_findings.areas(db=str(db), since_days=30, repo_only=False)
     by_area = {r["area"]: r for r in result}
     assert set(by_area) == {"verdict.json", "pyproject.toml", "CLAUDE.md"}
     assert by_area["verdict.json"]["n_findings"] == 3
@@ -729,3 +729,25 @@ def test_prose_finding_takes_severity_from_its_leading_word() -> None:
     assert sev["mini_ork/ide_pages/node.py"] == "high"
     assert sev["tests/unit/test_x.py"] == "low"
     assert sev["mini_ork/acp/agent.py"] == "high"
+
+
+def test_areas_leave_out_run_artifacts(tmp_path: Path, monkeypatch) -> None:
+    # Live 2026-10-07: 'verifier_test.json' (a run artifact) ranked as the top
+    # code area. Only files of the code repo count as areas.
+    repo = tmp_path / "repo"
+    (repo / "pkg").mkdir(parents=True)
+    (repo / "pkg" / "mod.py").write_text("x = 1\n", encoding="utf-8")
+    monkeypatch.setattr(code_findings, "_git_ls_files", lambda *_: None)
+    db = _bare_db(tmp_path / "cf.db")
+    code_findings.ensure_schema(str(db))
+    con = sqlite3.connect(db)
+    now = int(__import__("time").time())
+    for i, f in enumerate(["pkg/mod.py", "pkg/mod.py", "verifier_test.json"]):
+        con.execute("INSERT INTO code_findings (fingerprint, run_id, source, file, line, severity, "
+                    "category, issue, ts) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (f"fp{i}", "run-1", "review:reviewer", f, 1, "high", "other", "x", now))
+    con.commit(); con.close()
+    names = {a["area"] for a in code_findings.areas(db=str(db), repo_root=str(repo))}
+    assert names and all("verifier_test.json" not in n for n in names)
+    every = {a["area"] for a in code_findings.areas(db=str(db), repo_root=str(repo), repo_only=False)}
+    assert any("verifier_test.json" in n for n in every)
