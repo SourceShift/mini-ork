@@ -226,16 +226,22 @@ def test_build_command_for_subscription_lane(tmp_path):
     assert "--mcp-config" in argv
     assert argv[argv.index("--mcp-config") + 1] == str(mcp)
     assert "--strict-mcp-config" in argv
-    # Tool gating.
+    # Tool gating. The thread is a control plane (kickoff §ide-control-plane):
+    # the orchestrator may read AND edit directly, so Edit / Write /
+    # MultiEdit / Bash move into ``_ALLOWED_TOOLS``. ``NotebookEdit``
+    # stays in ``_DISALLOWED_TOOLS`` (notebook cells drift silently out
+    # of the change contract).
     at = argv.index("--allowedTools")
     allowed = argv[at + 1 : argv.index("--disallowedTools")]
     assert "Read" in allowed
     assert "mcp__mini-ork__*" in allowed
+    assert "Edit" in allowed
+    assert "Write" in allowed
+    assert "MultiEdit" in allowed
+    assert "Bash" in allowed
     dt = argv.index("--disallowedTools")
     disallowed = argv[dt + 1 : argv.index("--append-system-prompt-file")]
-    assert "Edit" in disallowed
-    assert "Write" in disallowed
-    assert "Bash" in disallowed
+    assert "NotebookEdit" in disallowed
     # System prompt file.
     assert argv[argv.index("--append-system-prompt-file") + 1] == str(prompt)
     # No resume when not given.

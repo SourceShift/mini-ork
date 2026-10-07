@@ -34,16 +34,27 @@ from mini_ork.dispatch.providers import (
 __all__ = ["TurnResult", "build_command", "run_turn"]
 
 
-# Tools the orchestrator is allowed to invoke. The kickoff grants read-only
-# repo access (the orchestrator must never edit — all edits go through a
-# mini-ork run) plus the full mini-ork MCP tool namespace, prefixed
-# ``mcp__mini-ork__`` (the MCP server's tools re-export under that prefix).
-_ALLOWED_TOOLS = ("mcp__mini-ork__*", "Read", "Grep", "Glob", "LS")
+# Tools the orchestrator is allowed to invoke. The thread is a control plane
+# (kickoff §ide-control-plane): the orchestrator may edit directly when the
+# user asks for hands-on work or the change is small and explicit, and uses
+# the full mini-ork MCP tool namespace prefixed ``mcp__mini-ork__`` (the MCP
+# server's tools re-export under that prefix) for everything else.
+_ALLOWED_TOOLS = (
+    "mcp__mini-ork__*",
+    "Read",
+    "Grep",
+    "Glob",
+    "LS",
+    "Edit",
+    "Write",
+    "MultiEdit",
+    "Bash",
+)
 
-# Tools the orchestrator must NOT invoke. ``Edit`` / ``Write`` / ``MultiEdit``
-# / ``NotebookEdit`` would let it bypass the mini-ork change contract; ``Bash``
-# would let it bypass the MCP sandbox and exec anything in the host shell.
-_DISALLOWED_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit", "Bash")
+# Tools the orchestrator must NOT invoke. ``NotebookEdit`` is still off so
+# notebook cells don't drift silently out of the change contract. Everything
+# else moves to ``_ALLOWED_TOOLS`` so the orchestrator can do hands-on work.
+_DISALLOWED_TOOLS = ("NotebookEdit",)
 
 # Cancellation grace period for SIGTERM → SIGKILL escalation.
 _SIGTERM_GRACE_S = 3.0

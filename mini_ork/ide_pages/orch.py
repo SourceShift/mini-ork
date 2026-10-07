@@ -21,7 +21,6 @@ from mini_ork.ide_pages import spec as S
 TABS = [("session", "Session"), ("kickoffs", "Kickoffs"), ("races", "Races"),
         ("planner", "Classify & plan"), ("coord", "Coordination")]
 
-_MODE_LABELS = {"orchestrate": "Orchestrate", "direct": "Direct run"}
 _WORKSPACE_LABELS = {"worktree": "New worktree per task", "in-place": "In place (this checkout)"}
 _HISTORY_THREADS = 8
 _HISTORY_RUNS = 8
@@ -82,7 +81,6 @@ def _read_json(path: Path) -> Any:
 # ── session ────────────────────────────────────────────────────────────────
 
 def _thread_defaults(home: Path) -> dict[str, Any]:
-    mode = os.environ.get("MO_ACP_DEFAULT_MODE") or "orchestrate"
     if os.environ.get("MO_ACP_DEFAULT_MODEL"):
         lane, lane_env = os.environ["MO_ACP_DEFAULT_MODEL"], "MO_ACP_DEFAULT_MODEL"
     else:
@@ -92,13 +90,13 @@ def _thread_defaults(home: Path) -> dict[str, Any]:
     recipe = os.environ.get("MO_ACP_RECIPE") or "code-fix"
     ws = os.environ.get("MO_WORKSPACE_MODE") or "worktree"
     return S.kv("Thread defaults", [
-        ("Mode", _MODE_LABELS.get(mode, mode), "text", "MO_ACP_DEFAULT_MODE"),
         ("Orchestrator lane", lane, "purple", lane_env),
         ("Recipe", recipe, "text", "MO_ACP_RECIPE"),
         ("Workspace", _WORKSPACE_LABELS.get(ws, ws), "text", "MO_WORKSPACE_MODE"),
-    ], full=True, note="The orchestrator only reads (Read, Grep, Glob). Every change goes through "
-                       "a run, so it is verified and rolled back on failure. Change these from "
-                       "the thread’s pickers.")
+    ], full=True, note="The thread is a control plane — the orchestrator decides per "
+                       "request whether to answer, start a run, or edit directly. "
+                       "Model is the only picker in the thread; Recipe and Workspace "
+                       "are the defaults the orchestrator proposes.")
 
 
 def _mcp_tools() -> dict[str, Any]:

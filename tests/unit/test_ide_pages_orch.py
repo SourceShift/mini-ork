@@ -83,13 +83,15 @@ def test_every_tab_builds(home: Path, monkeypatch) -> None:
 
 
 def test_thread_defaults_follow_the_env(home: Path, monkeypatch) -> None:
-    monkeypatch.setenv("MO_ACP_DEFAULT_MODE", "direct")
+    # Thread defaults surface Model + Recipe + Workspace as the defaults the
+    # orchestrator proposes (the thread is a control plane; Mode is no
+    # longer offered as a picker).
     monkeypatch.setenv("MO_ACP_DEFAULT_MODEL", "sonnet")
     monkeypatch.setenv("MO_WORKSPACE_MODE", "in-place")
     monkeypatch.delenv("MO_ACP_RECIPE", raising=False)
     page = orch.build(home, "session", {})
     kv = {i["k"]: i for i in page["sections"][0]["items"]}
-    assert kv["Mode"]["v"] == "Direct run"
+    assert "Mode" not in kv
     assert kv["Orchestrator lane"]["v"] == "sonnet" and kv["Orchestrator lane"]["sub"] == "MO_ACP_DEFAULT_MODEL"
     assert kv["Recipe"]["v"] == "code-fix"
     assert kv["Workspace"]["v"] == "In place (this checkout)"

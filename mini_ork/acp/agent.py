@@ -30,6 +30,8 @@ the launcher / reader / stopper / killer seams still apply.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import datetime as _dt
 import json
 import re
@@ -52,6 +54,7 @@ from acp.schema import (
     ContentToolCallContent,
     Cost,
     FileEditToolCallContent,
+    ImageContentBlock,
     Implementation,
     InitializeResponse,
     ListSessionsResponse,
@@ -59,6 +62,7 @@ from acp.schema import (
     NewSessionResponse,
     PermissionOption,
     PlanEntry,
+    PromptCapabilities,
     PromptResponse,
     ResourceContentBlock,
     ToolCallUpdate,
@@ -241,6 +245,101 @@ def _extract_prompt_text(prompt: list[Any]) -> str:
         text = getattr(block, "text", None)
         if isinstance(text, str) and text.strip():
             chunks.append(text)
+    return "\n".join(chunks)
+
+
+# Extension for ``image/png`` → ``.png``. The ACP client sends ``mimeType``
+# (camelCase JSON) which Pydantic deserialises to ``mime_type`` on the model.
+_ATTACHMENT_EXT_BY_MIME = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+}
+
+
+def _attachment_extension(mime_type: str) -> str:
+    """Map an ACP image mime type to a filesystem extension; ``.bin`` fallback."""
+    return _ATTACHMENT_EXT_BY_MIME.get(str(mime_type or "").lower(), ".bin")
+
+
+def _write_attached_image(
+    home: Path, session_id: str, n: int, block: ImageContentBlock
+) -> Path:
+    """Decode an image block to ``<home>/attachments/<session>/<n>.<ext>``.
+
+    The directory is created lazily; an existing ``<n>.<ext>`` is replaced
+    (re-sending the same image is idempotent). Decode failures raise — the
+    prompt caller surfaces them. The returned path is what the orchestrator
+    is told to ``Read``.
+    """
+    target_dir = home / "attachments" / session_id
+    target_dir.mkdir(parents=True, exist_ok=True)
+    ext = _attachment_extension(getattr(block, "mime_type", "") or "")
+    target = target_dir / f"{n}{ext}"
+    raw = base64.b64decode(str(getattr(block, "data", "") or ""), validate=True)
+    target.write_bytes(raw)
+    return target
+
+
+def _build_prompt_payload(
+    prompt: list[Any], session_id: str, home: Path
+) -> str:
+    """Render an ACP prompt into the string the orchestrator / launcher sees.
+
+    Text blocks join with newlines (same shape as ``_extract_prompt_text``).
+    Image blocks (base64 ``data`` + ``mime_type``) decode to
+    ``<home>/attachments/<session>/<n>.<ext>`` and the prompt gains an
+    ``Attached image: <abs path>`` line so the orchestrator can ``Read`` it.
+    Embedded text resources inline as ``--- <uri> ---\\n<text>`` (blob
+    resources append a placeholder line — Claude can read images directly).
+    Resource links append ``Attached: <uri>``. Text-only prompts are
+    unchanged.
+
+    Slash-command detection still calls ``_extract_prompt_text`` so this
+    helper is for the orchestrate / direct paths only.
+    """
+    chunks: list[str] = []
+    image_counter = 0
+    for block in prompt or []:
+        text = getattr(block, "text", None)
+        if isinstance(text, str) and text.strip():
+            chunks.append(text)
+            continue
+        # ImageContentBlock carries base64 ``data`` + ``mime_type``.
+        if isinstance(block, ImageContentBlock):
+            try:
+                path = _write_attached_image(
+                    home, session_id, image_counter, block
+                )
+            except (binascii.Error, ValueError, OSError) as exc:
+                # Surface a clear hint in the prompt so the orchestrator
+                # can tell the user; the run is still launched.
+                chunks.append(f"[attached image decode failed: {exc}]")
+                image_counter += 1
+                continue
+            chunks.append(f"Attached image: {path}")
+            image_counter += 1
+            continue
+        # ResourceContentBlock (the wire-level resource link) advertises a
+        # uri the user wants to reference.
+        if isinstance(block, ResourceContentBlock):
+            uri = getattr(block, "uri", "") or ""
+            if uri:
+                chunks.append(f"Attached: {uri}")
+            continue
+        # EmbeddedResource carries an inline payload (text or blob).
+        resource = getattr(block, "resource", None)
+        if resource is not None:
+            uri = getattr(resource, "uri", "") or ""
+            mime = getattr(resource, "mime_type", "") or ""
+            text_body = getattr(resource, "text", None)
+            if isinstance(text_body, str) and text_body:
+                header = f"--- {uri} ---" if uri else f"--- {mime or 'attachment'} ---"
+                chunks.append(f"{header}\n{text_body}")
+            elif uri:
+                chunks.append(f"Attached: {uri} ({mime or 'binary'})")
     return "\n".join(chunks)
 
 
@@ -624,6 +723,10 @@ class MiniOrkAcpAgent:
             agent_info=Implementation(name="mini-ork-acp", version="0.9.0"),
             agent_capabilities=AgentCapabilities(
                 load_session=True,
+                prompt_capabilities=PromptCapabilities(
+                    image=True,
+                    embedded_context=True,
+                ),
                 session_capabilities=SessionCapabilities(list=SessionListCapabilities()),
             ),
             auth_methods=[
@@ -766,7 +869,6 @@ class MiniOrkAcpAgent:
         self._thread_config[thread_id] = self._initial_thread_config(cwd)
         home = self._home_for(thread_id)
         config_options = self._build_config_options(thread_id, home)
-        modes = self._build_session_modes(thread_id)
         # Z9c-2: persist the thread meta + initial config. The store
         # swallows I/O errors (a read-only home logs to stderr) so the
         # new_session response is unaffected.
@@ -787,7 +889,6 @@ class MiniOrkAcpAgent:
         await self._emit_available_commands(thread_id)
         return NewSessionResponse(
             session_id=thread_id,
-            modes=modes,
             config_options=cast(Any, config_options),
             field_meta={"kind": "thread"},
         )
@@ -899,41 +1000,16 @@ class MiniOrkAcpAgent:
     def _build_config_options(
         self, session_id: str, home: Path
     ) -> list[SessionConfigOptionSelect]:
-        """Materialise the four Zed-rendered pickers in kickoff order.
+        """Materialise the single Zed-rendered picker.
 
-        Order: mode (category="mode"), model (category="model"), recipe (no
-        category), workspace (no category — Zed S4). Each option carries
-        the current stored value as ``current_value``. Picker sources:
-        ``acp_orchestrator.config`` for model lanes; ``web.recipes.list_recipes``
-        for recipes; the literal ``{"orchestrate", "direct"}`` for mode;
-        the literal ``{"worktree", "in-place"}`` for workspace.
+        The thread is a control plane (kickoff §ide-control-plane): only the
+        orchestrator lane picker is offered. ``mode``, ``recipe``, and
+        ``workspace`` remain stored in ``_thread_config`` so legacy clients
+        that call ``set_config_option("recipe", …)`` still succeed and so
+        the orchestrator can use the stored recipe / workspace as its
+        default when proposing a new run. They are simply not surfaced.
         """
-        cfg = self._thread_config.get(session_id) or {}
-        return [
-            SessionConfigOptionSelect(
-                type="select",
-                id="mode",
-                name="Mode",
-                description="How each prompt in this thread is interpreted.",
-                category="mode",
-                current_value=str(cfg.get("mode") or _MODE_ORCHESTRATE),
-                options=[
-                    SessionConfigSelectOption(
-                        value=_MODE_ORCHESTRATE,
-                        name="Orchestrate",
-                        description="Talk to the mini-ork orchestrator",
-                    ),
-                    SessionConfigSelectOption(
-                        value=_MODE_DIRECT,
-                        name="Direct run",
-                        description="Each prompt is a run kickoff",
-                    ),
-                ],
-            ),
-            self._build_model_config_option(session_id, home),
-            self._build_recipe_config_option(session_id, home),
-            self._build_workspace_config_option(session_id, home),
-        ]
+        return [self._build_model_config_option(session_id, home)]
 
     def _build_model_config_option(
         self, session_id: str, home: Path
@@ -1432,6 +1508,14 @@ class MiniOrkAcpAgent:
         ``mode`` config selects the path. The orchestrator turn is awaited
         inline so cancel can interrupt it; the direct-mode path reuses the
         existing ``_await_terminal`` loop against the fresh run id.
+
+        Slash-command detection still keys on the text-only prompt so an
+        image block cannot masquerade as ``/run``. The orchestrate and
+        direct paths receive an *augmented* payload — text plus any
+        attached images (decoded to ``<home>/attachments/<session>/<n>.<ext>``
+        with an ``Attached image: <path>`` line), embedded text resources
+        inlined, and resource links advertised. ``_extract_prompt_text``
+        still feeds the slash router.
         """
         # A cancel ends one turn, not the thread.
         self._cancelled.discard(session_id)
@@ -1474,9 +1558,19 @@ class MiniOrkAcpAgent:
             return await self._prompt_thread_race(session_id, race_text)
         cfg = self._thread_config.get(session_id) or {}
         mode = str(cfg.get("mode") or _MODE_ORCHESTRATE)
+        # Direct / orchestrate paths receive the augmented payload — the
+        # user may have attached images or resources the text-only string
+        # would have dropped.
+        home = self._home_for(session_id)
+        payload = _build_prompt_payload(prompt, session_id, home)
+        if not payload and text:
+            # No non-text blocks surfaced anything useful — fall back to the
+            # text-only string so a prompt of only failed-decode messages
+            # still flows.
+            payload = text
         if mode == _MODE_DIRECT:
-            return await self._prompt_thread_direct(session_id, text)
-        return await self._prompt_thread_orchestrate(session_id, text)
+            return await self._prompt_thread_direct(session_id, payload or text)
+        return await self._prompt_thread_orchestrate(session_id, payload or text)
 
     @staticmethod
     def _strip_slash_run(text: str) -> str | None:
@@ -4769,7 +4863,6 @@ class MiniOrkAcpAgent:
         await self._emit_available_commands(session_id)
         return LoadSessionResponse(
             config_options=cast(Any, self._current_config_options(session_id)),
-            modes=self._build_session_modes(session_id),
         )
 
     async def _replay_run_in_thread(self, thread_id: str, run_id: str, cwd: str) -> bool:

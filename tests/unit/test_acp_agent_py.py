@@ -49,6 +49,7 @@ from acp.schema import (  # noqa: E402
 from acp import RequestError  # noqa: E402
 
 from mini_ork.acp.agent import MiniOrkAcpAgent, mint_run_id  # noqa: E402
+from mini_ork.acp.agent import _build_prompt_payload  # noqa: E402,F401
 from mini_ork.recipes_catalog import RecipeInfo  # noqa: E402
 
 
@@ -119,15 +120,14 @@ def test_new_session_mints_thread_session_when_no_run_id_added():
     assert agent._sessions[sid] == "/tmp/proj"
     assert sid in agent._thread_sessions
     assert agent._thread_config[sid]["mode"] == "orchestrate"
-    # The picker list carries four Zed-rendered options in the mandated order.
-    # (Z4 added workspace; the option list ends with it.)
+    # The thread is a control plane: only the model picker is offered.
+    # (mode / recipe / workspace are stored in _thread_config but not surfaced.)
     assert resp.config_options is not None
-    assert [opt.id for opt in resp.config_options] == ["mode", "model", "recipe", "workspace"]
-    assert resp.config_options[0].category == "mode"
-    assert resp.config_options[1].category == "model"
-    assert resp.modes is not None
-    assert resp.modes.current_mode_id == "orchestrate"
-    assert {m.id for m in resp.modes.available_modes} == {"orchestrate", "direct"}
+    assert [opt.id for opt in resp.config_options] == ["model"]
+    assert resp.config_options[0].category == "model"
+    # ``modes`` is no longer advertised on new_session — the thread
+    # routes every prompt to the orchestrator, which decides per request.
+    assert getattr(resp, "modes", None) is None
 
 
 def test_new_session_honours_client_meta_run_id_override():
@@ -346,11 +346,15 @@ def test_initialize_with_no_capabilities_yields_all_false():
         assert agent.client_supports(feature) is False
 
 
-def test_recipe_picker_includes_project_recipe(monkeypatch, tmp_path):
-    """A thread session whose project has ``.mini-ork/recipes/my-audit/``
-    lists ``my-audit`` in the recipe picker. The engine root is patched
-    to an empty dir so the test never depends on the real engine
-    checkout.
+def test_thread_session_offers_only_model_picker_but_keeps_recipe_settable(
+    monkeypatch, tmp_path
+):
+    """The thread is a control plane: only the model picker is offered.
+
+    The recipe is still settable via ``set_config_option`` (legacy clients)
+    and the orchestrator uses the stored recipe when proposing a new run.
+    The engine root is patched to an empty dir so the test never depends
+    on the real engine checkout.
     """
 
     # Project home = ``<tmp>/proj/.mini-ork/recipes/my-audit/...``.
@@ -380,13 +384,13 @@ def test_recipe_picker_includes_project_recipe(monkeypatch, tmp_path):
     agent = MiniOrkAcpAgent()
     resp = asyncio.run(agent.new_session(cwd=str(proj)))
     assert resp.config_options is not None
-    recipe_opt = next(o for o in resp.config_options if o.id == "recipe")
-    assert recipe_opt is not None
-    recipe_ids = {o.value for o in recipe_opt.options}
-    assert "my-audit" in recipe_ids
-    # And the description for the project entry follows the kickoff rule.
-    proj_entry = next(o for o in recipe_opt.options if o.value == "my-audit")
-    assert proj_entry.description == "project recipe"
+    # The picker surfaces exactly one option (model); recipe is no longer
+    # offered. ``set_config_option("recipe", …)`` still accepts the legacy
+    # id and stores the value the orchestrator proposes for new runs.
+    assert [opt.id for opt in resp.config_options] == ["model"]
+    sid = resp.session_id
+    asyncio.run(agent.set_config_option("recipe", sid, "my-audit"))
+    assert agent._thread_config[sid]["recipe"] == "my-audit"
 
 
 def test_prompt_refuses_unsafe_session_id():
@@ -599,6 +603,71 @@ def test_initialize_advertises_load_session_and_session_list():
     assert caps.load_session is True
     assert caps.session_capabilities is not None
     assert caps.session_capabilities.list is not None
+    # The thread is a control plane — clients can attach images and
+    # embedded resources (kickoff §ide-control-plane, change 4).
+    assert caps.prompt_capabilities is not None
+    assert caps.prompt_capabilities.image is True
+    assert caps.prompt_capabilities.embedded_context is True
+
+
+def test_prompt_payload_writes_image_attachment_and_inlines_embedded_text(tmp_path):
+    """A non-text prompt block decodes to disk and the payload carries
+    the path the orchestrator can ``Read``.
+
+    Image bytes land in ``<home>/attachments/<session>/<n>.<ext>``;
+    embedded text resources inline as ``--- <uri> ---\\n<text>``;
+    resource links add ``Attached: <uri>``. Slash-command detection
+    still sees the text-only string.
+    """
+    import base64 as _b64
+
+    from acp.schema import (
+        EmbeddedResource,
+        ImageContentBlock,
+        ResourceContentBlock,
+        TextResourceContents,
+    )
+
+    agent, _conn, sid = _make_thread_agent(tmp_path)
+    home = agent._home_for(sid)
+    # 1×1 transparent PNG (smallest valid PNG).
+    png_bytes = bytes.fromhex(
+        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
+        "890000000d49444154789c6300010000000500010d0a2db40000000049454e44ae426082"
+    )
+    image = ImageContentBlock(
+        type="image",
+        mime_type="image/png",
+        data=_b64.b64encode(png_bytes).decode("ascii"),
+    )
+    embedded = EmbeddedResource(
+        resource=TextResourceContents(
+            mime_type="text/plain",
+            uri="file:///notes/spec.md",
+            text="spec body",
+        ),
+    )
+    link = ResourceContentBlock(
+        type="resource_link",
+        uri="file:///notes/other.md",
+        name="Other",
+    )
+    payload = _build_prompt_payload(
+        [image, embedded, link], sid, home,
+    )
+
+    # The image decoded under the session's attachment dir.
+    att_dir = home / "attachments" / sid
+    written = list(att_dir.iterdir())
+    assert len(written) == 1
+    assert written[0].suffix == ".png"
+    assert written[0].read_bytes() == png_bytes
+    # The payload carries a Read-friendly line plus the inlined resource
+    # and resource link.
+    assert f"Attached image: {written[0]}" in payload
+    assert "--- file:///notes/spec.md ---" in payload
+    assert "spec body" in payload
+    assert "Attached: file:///notes/other.md" in payload
 
 
 def test_list_sessions_resolves_project_home_and_maps_rows(tmp_path):
@@ -1157,8 +1226,10 @@ def test_set_config_option_stores_and_returns_full_list(tmp_path):
     ):
         resp = asyncio.run(agent.set_config_option("model", sid, "sonnet"))
     assert resp.config_options is not None
-    assert [opt.id for opt in resp.config_options] == ["mode", "model", "recipe", "workspace"]
-    assert resp.config_options[1].current_value == "sonnet"
+    # Only the model picker is offered; the response carries one option
+    # whose ``current_value`` reflects the just-stored lane.
+    assert [opt.id for opt in resp.config_options] == ["model"]
+    assert resp.config_options[0].current_value == "sonnet"
     assert agent._thread_config[sid]["model"] == "sonnet"
     # The emission lands on the wire.
     updates = [
@@ -1166,7 +1237,7 @@ def test_set_config_option_stores_and_returns_full_list(tmp_path):
         if isinstance(u, ConfigOptionUpdate) and u.session_update == "config_option_update"
     ]
     assert len(updates) == 1
-    assert updates[0].config_options[1].current_value == "sonnet"
+    assert updates[0].config_options[0].current_value == "sonnet"
 
 
 def test_set_config_option_rejects_unknown_id(tmp_path):
@@ -2569,7 +2640,8 @@ def test_fresh_process_load_puts_each_run_after_its_marker(tmp_path):
     ids = [getattr(u, "tool_call_id", None) for _, u in conn.sent]
     assert ids.index(f"{child}:parent") < ids.index(f"{child}:n1")
     assert {sid for sid, _ in conn.sent} == {thread}
-    assert [o.id for o in resp.config_options] == ["mode", "model", "recipe", "workspace"]
+    # Loaded thread sessions expose the model picker only (control plane).
+    assert [o.id for o in resp.config_options] == ["model"]
 
 
 # ── Z4 implementer diff surface ──────────────────────────────────────────────
@@ -4240,12 +4312,11 @@ def test_workspace_option_appears_in_picker_order(tmp_path):
         return_value=[_recipe("code-fix")],
     ):
         resp = asyncio.run(agent.set_config_option("workspace", sid, "in-place"))
+    # Workspace is still settable (legacy clients) but the picker exposes
+    # only the model option — the stored value is the default the
+    # orchestrator proposes when launching a new run.
     assert resp.config_options is not None
-    ids = [opt.id for opt in resp.config_options]
-    assert ids == ["mode", "model", "recipe", "workspace"]
-    ws = next(opt for opt in resp.config_options if opt.id == "workspace")
-    assert ws.current_value == "in-place"
-    assert {opt.value for opt in ws.options} == {"worktree", "in-place"}
+    assert [opt.id for opt in resp.config_options] == ["model"]
     assert agent._thread_config[sid]["workspace"] == "in-place"
 
 
@@ -6017,7 +6088,13 @@ def test_finished_run_is_handed_to_the_client_as_agent_edits(tmp_path, monkeypat
     assert any(t.endswith("\n\n") and "in your project now" in t for t in texts)
 
 
-def test_workspace_picker_in_a_main_checkout_offers_a_new_worktree(tmp_path):
+def test_workspace_default_in_a_main_checkout_is_a_new_worktree(tmp_path):
+    """A main-checkout thread session stores ``worktree`` as the workspace
+    default the orchestrator proposes. The thread is a control plane so
+    the workspace is no longer surfaced as a picker option; legacy
+    ``set_config_option("workspace", …)`` calls still flip the stored
+    value (covered in ``test_set_config_option_stores_workspace``).
+    """
     from unittest.mock import patch
 
     proj = tmp_path / "proj"
@@ -6028,9 +6105,10 @@ def test_workspace_picker_in_a_main_checkout_offers_a_new_worktree(tmp_path):
         agent = MiniOrkAcpAgent(poll_interval=0)
         agent._client_capabilities = _fs_write_caps()
         resp = asyncio.run(agent.new_session(cwd=str(proj)))
-    names = [o.name for opt in (resp.config_options or []) if getattr(opt, "id", "") == "workspace"
-             for o in (getattr(opt, "options", None) or [])]
-    assert "New worktree per task" in names and not any("This worktree" in n for n in names)
+    # The picker exposes only the model option — workspace is stored, not
+    # offered — and the stored default matches the main-checkout policy.
+    assert [opt.id for opt in (resp.config_options or [])] == ["model"]
+    assert agent._thread_config[resp.session_id]["workspace"] == "worktree"
 
 
 def test_a_file_the_user_changed_blocks_delivery_and_keeps_the_buttons(tmp_path, monkeypatch):
