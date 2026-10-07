@@ -150,8 +150,20 @@ _check("artifact-diff-shape", "framework-edit.diff has unified-diff anchors",
 _check("evidence-log-written", "evidence log is writable", lambda: os.access(EVIDENCE, os.W_OK))
 
 # Task-specific tier.
-_check("diff-apply-check-clean", "diff applies cleanly to repo root",
-       lambda: _run(["git", "-C", REPO_ROOT, "apply", "--check", DIFF]))
+def _diff_consistent_with_repo_root():
+    """The diff matches the repo root: it applies forward (not yet applied), or it
+    applies in REVERSE (the implementer already edited the tree in place, the
+    framework-edit default, so a forward --check always fails with 'already
+    exists'). Fails only when neither holds: a stale or corrupt diff."""
+    if _run(["git", "-C", REPO_ROOT, "apply", "--check", DIFF]):
+        return True
+    _ev.write("  forward --check failed; trying --reverse (edit applied in place)\n")
+    _ev.flush()
+    return _run(["git", "-C", REPO_ROOT, "apply", "--check", "--reverse", DIFF])
+
+
+_check("diff-apply-check-clean", "diff applies cleanly to repo root, or is already applied there",
+       _diff_consistent_with_repo_root)
 
 
 def _changed_files_check():
