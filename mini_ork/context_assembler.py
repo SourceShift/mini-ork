@@ -359,7 +359,8 @@ def _limbo_limit(node_type: str, base: int) -> int:
 
 def failure_modes_md(task_class: str, limit: int = 5, db: str | None = None,
                      *, node_type: str = "", lane: str = "",
-                     node_id: str = "") -> str:
+                     node_id: str = "",
+                     sources: list[dict] | None = None) -> str:
     """The "Learned failure modes" block; '' when no learnings. Includes the
     project-scope filter: framework-internal targets are stripped when
     MO_TARGET_CWD is set and differs from MINI_ORK_ROOT.
@@ -367,6 +368,10 @@ def failure_modes_md(task_class: str, limit: int = 5, db: str | None = None,
     `node_type` sets the LIMBO retrieval count (see ``_limbo_limit``); `lane`
     and `node_id` are recorded on the retrieval ledger so the memory spend this
     block costs is attributable. All three default to today's flat behaviour.
+
+    `sources` is an out-param: when supplied, one dict is appended per row that
+    was actually injected, in prompt order. With ``sources=None`` the returned
+    markdown is byte-identical to the same call with a list.
     """
     limit = _limbo_limit(node_type, limit)
     dbp = _db_path(db)
@@ -383,7 +388,7 @@ def failure_modes_md(task_class: str, limit: int = 5, db: str | None = None,
     con.execute("PRAGMA busy_timeout=5000")
     try:
         rows = con.execute("""
-            SELECT target, signal, suggested_change
+            SELECT gradient_id, target, signal, suggested_change
             FROM gradient_records
             WHERE (task_class = ? OR target LIKE ?) AND confidence >= 0.6
             ORDER BY confidence DESC, created_at DESC LIMIT ?
@@ -395,16 +400,24 @@ def failure_modes_md(task_class: str, limit: int = 5, db: str | None = None,
         con.close()
     if strip_framework:
         rows = [r for r in rows
-                if not r[0].startswith(FRAMEWORK_INTERNAL_PREFIXES)][:limit]
+                if not r[1].startswith(FRAMEWORK_INTERNAL_PREFIXES)][:limit]
     else:
         rows = rows[:limit]
     out = []
     if rows:
         out.append("--- Learned failure modes (from prior runs of this task class) ---")
         out.append("Avoid repeating these known issues:")
-        for target, signal, change in rows:
+        for gradient_id, target, signal, change in rows:
             out.append(f"- [{target}] {signal.strip()}")
             out.append(f"  Fix applied going forward: {change.strip()}")
+            if sources is not None:
+                sources.append({
+                    "kind": "gradient",
+                    "id": gradient_id,
+                    "target": target,
+                    "signal": signal,
+                    "suggested_change": change,
+                })
         out.append("--- /learned failure modes ---")
 
     # Verified emergent patterns (judge-gate approved) — read-back into the
@@ -424,9 +437,10 @@ def failure_modes_md(task_class: str, limit: int = 5, db: str | None = None,
         # unavailable or opted-out channel degrades to the static ordering —
         # never to nothing, because the lessons are still evidence.
         block = semantic_lessons_md(task_class, emg_limit, db=dbp,
-                                    lane=lane, node_id=node_id)
+                                    lane=lane, node_id=node_id,
+                                    sources=sources)
         if not block:
-            block = _static_emergent_block(dbp, emg_limit)
+            block = _static_emergent_block(dbp, emg_limit, sources=sources)
         if block:
             out.append(block)
 
@@ -497,24 +511,43 @@ def _emergent_text(
     return f"[{feat}] {(cluster_label or '').strip()}"
 
 
-def _static_emergent_block(dbp: str, limit: int) -> str:
+def _static_emergent_block(dbp: str, limit: int,
+                           *, sources: list[dict] | None = None) -> str:
     """Strength-ordered read-back — the pre-semantic behaviour, kept as the
     degradation path. Ordering is unchanged; only the LIMIT moved to Python.
+
+    Approved patterns whose ``lesson_text`` is NULL/blank are skipped by
+    default: the prompt as published must only carry authored guidance, never
+    a frequency count (Trace2Skill 2603.25158 — judgement-gated lesson is the
+    one a model read and signed). Opt-out
+    ``MO_EMERGENT_INJECT_UNLESSONED=1`` restores the prior "inject every
+    approved row" behaviour. The block is omitted — not emitted with an
+    empty header — when nothing remains.
     """
-    rows = _approved_emergent_rows(dbp)[:limit]
+    unlessoned = os.environ.get("MO_EMERGENT_INJECT_UNLESSONED", "0") == "1"
+    rows = _approved_emergent_rows(dbp)
+    if not unlessoned:
+        rows = [r for r in rows if (r[4] or "").strip()]
+    rows = rows[:limit]
     if not rows:
         return ""
-    lines = ["--- Verified emergent patterns (cross-run, judge-gate approved) ---"]
-    lines.extend(
-        f"- {_emergent_text(feats, label, lesson)}"
-        for _pid, label, feats, _strength, lesson in rows
-    )
-    lines.append("--- /verified emergent patterns ---")
+    lines = ["--- Lessons from recurring patterns (prior runs) ---"]
+    for pattern_id, label, feats, _strength, lesson in rows:
+        text = _emergent_text(feats, label, lesson)
+        lines.append(f"- {text}")
+        if sources is not None:
+            sources.append({
+                "kind": "pattern",
+                "id": pattern_id,
+                "text": text,
+            })
+    lines.append("--- /lessons from recurring patterns ---")
     return "\n".join(lines)
 
 
 def semantic_lessons_md(task_class: str, limit: int = 5, db: str | None = None,
-                        *, lane: str = "", node_id: str = "") -> str:
+                        *, lane: str = "", node_id: str = "",
+                        sources: list[dict] | None = None) -> str:
     """The emergent-pattern block, ranked by earned utility (SimUtil-UCB).
 
     Same rows, same shape as `_static_emergent_block` — different order. The
@@ -550,6 +583,19 @@ def semantic_lessons_md(task_class: str, limit: int = 5, db: str | None = None,
     if not rows:
         return ""
 
+    # Skip approved patterns whose `lesson_text` is NULL/blank — only an
+    # authored lesson is guidance; a cluster statistic masquerading as a
+    # lesson is the defect (Trace2Skill 2603.25158). Opt-out
+    # MO_EMERGENT_INJECT_UNLESSONED=1 keeps the prior behaviour. Done here in
+    # the injection path so `_approved_emergent_rows` keeps its unconditional
+    # contract — other readers (reflections, JSON pack entries) want every
+    # approved row regardless of authoring.
+    unlessoned = os.environ.get("MO_EMERGENT_INJECT_UNLESSONED", "0") == "1"
+    if not unlessoned:
+        rows = [r for r in rows if (r[4] or "").strip()]
+    if not rows:
+        return ""
+
     scope = task_class or "generic"
     try:
         # Close the loop before reading. A run that already finished has its
@@ -559,6 +605,10 @@ def semantic_lessons_md(task_class: str, limit: int = 5, db: str | None = None,
         semantic.resolve_finished_runs(db_path=dbp)
 
         candidates = []
+        # memory_id → pattern_id: the only way each ranked memory can be traced
+        # back to the originating pattern once the retrieval ledger has stripped
+        # the upstream identity.
+        memory_to_pattern = {}
         for pattern_id, label, feats, strength, lesson in rows:
             memory_id = semantic.upsert(
                 _emergent_text(feats, label, lesson),
@@ -566,6 +616,7 @@ def semantic_lessons_md(task_class: str, limit: int = 5, db: str | None = None,
                 key=str(pattern_id),
                 db_path=dbp,
             )
+            memory_to_pattern[int(memory_id)] = pattern_id
             candidates.append((int(memory_id), float(strength or 0.0)))
 
         ordered = semantic.rank_with_prior(
@@ -587,7 +638,7 @@ def semantic_lessons_md(task_class: str, limit: int = 5, db: str | None = None,
                 db_path=dbp,
             )
 
-        lines = ["--- Verified emergent patterns (cross-run, judge-gate approved) ---"]
+        lines = ["--- Lessons from recurring patterns (prior runs) ---"]
         for hit in ordered:
             # Credit is only ever claimed, never speculated: a retrieval whose
             # run has not reported yet says nothing about this memory, so it
@@ -596,7 +647,13 @@ def semantic_lessons_md(task_class: str, limit: int = 5, db: str | None = None,
             if hit["wins"] > 0:
                 suffix = f"  (helped {hit['wins']}/{hit['uses']} retrievals)"
             lines.append(f"- {hit['text']}{suffix}")
-        lines.append("--- /verified emergent patterns ---")
+            if sources is not None:
+                sources.append({
+                    "kind": "pattern",
+                    "id": memory_to_pattern.get(hit["memory_id"], ""),
+                    "text": hit["text"],
+                })
+        lines.append("--- /lessons from recurring patterns ---")
         return "\n".join(lines)
     except Exception:
         # Any failure here degrades to the static block upstream. The prompt

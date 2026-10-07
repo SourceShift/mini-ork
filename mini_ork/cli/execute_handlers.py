@@ -17,6 +17,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -216,6 +217,133 @@ def _node_attempt_no(db, run_id: str, node_id: str) -> int:
         return int(row[0] or 0) + 1
     except sqlite3.Error:
         return 1
+
+
+def _write_learned_record(run_dir: str, node_id: str, node_type: str,
+                          lane: str, task_class: str, *,
+                          attempt: int, block: str,
+                          sources: list[dict] | None) -> None:
+    """Persist the learned block an LLM node actually received.
+
+    Writes two artifacts under ``<run_dir>/learned/``:
+
+    - ``<node_id>.md`` — ``block.strip()`` followed by a newline, only when
+      the block is non-empty. A stale ``.md`` from a prior attempt with an
+      empty block is removed.
+    - ``<node_id>.json`` — always. ``injected`` is True iff the block was
+      non-empty; ``reason`` is "opt-out" when ``MO_INJECT_LEARNINGS != "1"``,
+      "nothing matched" when the block was empty, else "". ``sources`` is the
+      list collected by ``_learned_block`` (gradient / pattern / steering
+      rows, in prompt order).
+
+    The IDE "Learning" tab reads both files; this is the only inspectable
+    surface for what the learner actually saw (F5-B, learn-inject kickoff).
+
+    Never raises: an exception here would interrupt the node dispatch and
+    waste the LLM spend that already happened. The caller has already
+    fall-through semantics (``try/except`` in ``_learned_block``); matching
+    that on the write side keeps the read-side cost-of-truth out of the
+    dispatch path. Atomic (tmp + ``os.replace``) so an interrupted write
+    never leaves a torn file the IDE would happily render as "what the
+    learner was told".
+    """
+    try:
+        if not run_dir:
+            return
+        learned_dir = os.path.join(run_dir, "learned")
+        os.makedirs(learned_dir, exist_ok=True)
+        # Opt-out / empty-block semantics are reflected in the JSON record;
+        # the markdown side mirrors the actual injected text (none).
+        opted_out = os.environ.get("MO_INJECT_LEARNINGS", "1") != "1"
+        # ``injected`` is True only when something actually reached the prompt.
+        # Opt-out short-circuits the upstream gate before the block is built, so
+        # any block that does land here (a caller bypassing the gate) is recorded
+        # as not-injected — its presence in the record is the audit, not the
+        # data.
+        injected = bool(block and block.strip()) and not opted_out
+        if opted_out:
+            reason = "opt-out"
+        elif not injected:
+            reason = "nothing matched"
+        else:
+            reason = ""
+        record = {
+            "node_id": node_id,
+            "node_type": node_type,
+            "lane": lane,
+            "task_class": task_class,
+            "attempt": int(attempt),
+            "written_at": int(time.time()),
+            "injected": injected,
+            "reason": reason,
+            "sources": list(sources) if sources else [],
+        }
+        md_path = os.path.join(learned_dir, f"{node_id}.md")
+        json_path = os.path.join(learned_dir, f"{node_id}.json")
+
+        # JSON always — atomic via tmp + os.replace so a crash mid-write never
+        # leaves the IDE rendering a partial record.
+        tmp_json = tempfile.NamedTemporaryFile(
+            mode="w", delete=False, prefix=f".{node_id}.", suffix=".json.tmp",
+            dir=learned_dir, encoding="utf-8",
+        )
+        try:
+            try:
+                json.dump(record, tmp_json, ensure_ascii=False, sort_keys=True)
+                tmp_json.flush()
+                os.fsync(tmp_json.fileno())
+            finally:
+                tmp_json.close()
+            os.replace(tmp_json.name, json_path)
+        except Exception:
+            # json.dump / os.replace failed — drop the orphan tmp file
+            # (``delete=False`` above means it stays on disk otherwise).
+            # Debris in learned/ would surface as "the record is corrupt"
+            # in the next read; the outer except still swallows the raise.
+            try:
+                os.unlink(tmp_json.name)
+            except OSError:
+                pass
+            raise
+
+        # Markdown — only when the block was actually injected. A stale .md
+        # from a prior attempt that did inject (and the current attempt did
+        # not) is removed so the IDE never shows the previous attempt's text
+        # as if it were from the current one.
+        if injected:
+            tmp_md = tempfile.NamedTemporaryFile(
+                mode="w", delete=False, prefix=f".{node_id}.", suffix=".md.tmp",
+                dir=learned_dir, encoding="utf-8",
+            )
+            try:
+                try:
+                    tmp_md.write(block.strip() + "\n")
+                    tmp_md.flush()
+                    os.fsync(tmp_md.fileno())
+                finally:
+                    tmp_md.close()
+                os.replace(tmp_md.name, md_path)
+            except Exception:
+                # Same reasoning as the JSON branch — drop the orphan
+                # ``.<node_id>.<...>.md.tmp`` file on any failure.
+                try:
+                    os.unlink(tmp_md.name)
+                except OSError:
+                    pass
+                raise
+        else:
+            try:
+                os.remove(md_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+    except Exception:
+        # Swallow — node dispatch must continue regardless of record-write
+        # failure. The cost-of-truth that already happened in
+        # ``failure_modes_md`` / ``operator_steering.fetch_for`` cannot be
+        # unmade; surfacing an exception here would discard the LLM work.
+        pass
 
 
 @_node_publish_boundary
@@ -435,7 +563,17 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     # retrieval ledger can attribute the memory spend to the decision that
     # caused it (LIMBO); note ``node_id`` is a local here — the env publish that
     # would make it ambient happens on the next line, too late for this call.
-    learned = _learned_block(root, task_class, node_type, lane, node_id)
+    # ``learned_block_sources`` collects exactly what was injected so the IDE
+    # "Learning" tab can show the learner what it actually received.
+    learned_sources: list[dict] = []
+    learned = _learned_block(root, task_class, node_type, lane, node_id,
+                             sources=learned_sources)
+    if node_type in ("researcher", "implementer", "reviewer"):
+        _write_learned_record(
+            run_dir_eff, node_id, node_type, lane, task_class,
+            attempt=_node_attempt_no(db, run_id, node_id),
+            block=learned, sources=learned_sources,
+        )
     # Publish the per-node identity + clear any stale resume session in one
     # canonical step (None removes the variable).
     publish_env(node_env_overrides(

@@ -205,16 +205,26 @@ def test_similar_lessons_skip_missing_source_table(db, tmp_path, monkeypatch):
 
 
 def _seed_emergent(db, rows):
-    """rows: (pattern_id, cluster_label, features_list, strength, status)."""
+    """rows: (pattern_id, cluster_label, features_list, strength, status,
+    lesson_text_or_None). Approved patterns with a non-empty ``lesson_text``
+    exercise the lesson-injection path; ``None`` or blank skips injection
+    unless ``MO_EMERGENT_INJECT_UNLESSONED=1``.
+    """
     con = sqlite3.connect(db)
     now = int(time.time())
-    for pid, label, feats, strength, status in rows:
+    for row in rows:
+        if len(row) == 5:
+            pid, label, feats, strength, status = row
+            lesson = None
+        else:
+            pid, label, feats, strength, status, lesson = row
         con.execute(
             "INSERT INTO emergent_patterns (pattern_id, cluster_label, "
             "member_item_ids_json, feature_set_json, strength_score, "
-            "suggested_meta_adr, status, detected_at) VALUES (?,?,?,?,?,?,?,?)",
+            "suggested_meta_adr, status, lesson_text, detected_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             (pid, label, "[]", json.dumps(feats), strength,
-             "meta-adr text", status, now))
+             "meta-adr text", status, lesson, now))
     con.commit()
     con.close()
 
@@ -226,12 +236,13 @@ def test_verified_emergent_md_readback(db, monkeypatch):
     monkeypatch.delenv("MO_TARGET_CWD", raising=False)
     _seed_emergent(db, [
         ("emg-ok",  "empty verifier output means silent failure",
-         ["verifier_addition"], 7.0, "approved"),
+         ["verifier_addition"], 7.0, "approved",
+         "empty verifier output means silent failure — treat it as a real failure signal"),
         ("emg-raw", "unverified confabulated self-diagnosis",
-         ["adr"], 9.0, "proposed"),
+         ["adr"], 9.0, "proposed", None),
     ])
     py = ca.failure_modes_md("code-fix", 5, db=db)
-    assert "Verified emergent patterns" in py
+    assert "Lessons from recurring patterns" in py
     assert "empty verifier output means silent failure" in py
     # The 'proposed' (unverified) pattern must NOT reach the prompt.
     assert "confabulated" not in py
@@ -242,12 +253,13 @@ def test_verified_emergent_optout_and_json(db, monkeypatch):
     under verified_emergent_patterns."""
     monkeypatch.setenv("MINI_ORK_DB", db)
     _seed_emergent(db, [
-        ("emg-ok", "cross-run lesson", ["verifier_addition"], 6.0, "approved"),
+        ("emg-ok", "cross-run lesson", ["verifier_addition"], 6.0, "approved",
+         "reuse cross-run lesson only when a model authored it"),
     ])
     # opt-out hides the markdown block.
     monkeypatch.setenv("MO_EMERGENT_INJECT", "0")
     py_off = ca.failure_modes_md("code-fix", 5, db=db)
-    assert "Verified emergent patterns" not in py_off
+    assert "Lessons from recurring patterns" not in py_off
     monkeypatch.delenv("MO_EMERGENT_INJECT", raising=False)
 
     # JSON path: verified_emergent_patterns populated.
@@ -425,9 +437,12 @@ def test_semantic_lessons_cold_store_matches_the_static_block(db, monkeypatch):
     monkeypatch.setenv("MINI_ORK_DB", db)
     monkeypatch.delenv("MINI_ORK_RUN_ID", raising=False)
     _seed_emergent(db, [
-        ("a", "strongest pattern", ["adr"], 9.0, "approved"),
-        ("b", "middling pattern", ["adr"], 5.0, "approved"),
-        ("c", "weakest pattern", ["adr"], 1.0, "approved"),
+        ("a", "strongest pattern", ["adr"], 9.0, "approved",
+         "strongest pattern: always lead with it"),
+        ("b", "middling pattern", ["adr"], 5.0, "approved",
+         "middling pattern: use only after the strongest"),
+        ("c", "weakest pattern", ["adr"], 1.0, "approved",
+         "weakest pattern: treat as admission candidate"),
     ])
 
     warm = ca.semantic_lessons_md("code-fix", 3, db=db)
@@ -445,7 +460,8 @@ def _seed_strength_ladder(db, count=20, top=9.0, step=0.05):
     """
     _seed_emergent(db, [
         (f"p{index:02d}", f"pattern-{index:02d} says something", ["adr"],
-         top - index * step, "approved")
+         top - index * step, "approved",
+         f"pattern-{index:02d} says something — authored lesson")
         for index in range(count)
     ])
 
@@ -457,9 +473,12 @@ def test_semantic_lessons_rank_by_earned_utility(db, monkeypatch):
     monkeypatch.setenv("MINI_ORK_DB", db)
     monkeypatch.delenv("MINI_ORK_RUN_ID", raising=False)
     _seed_emergent(db, [
-        ("emg-a", "first pattern", ["adr"], 7.0, "approved"),
-        ("emg-b", "second pattern that works", ["adr"], 7.0, "approved"),
-        ("emg-c", "third pattern", ["adr"], 7.0, "approved"),
+        ("emg-a", "first pattern", ["adr"], 7.0, "approved",
+         "first pattern has an authored lesson to anchor the ordering"),
+        ("emg-b", "second pattern that works", ["adr"], 7.0, "approved",
+         "second pattern that works earned utility through retrievals"),
+        ("emg-c", "third pattern", ["adr"], 7.0, "approved",
+         "third pattern contributes a complementary lesson"),
     ])
 
     from mini_ork import memory as semantic
@@ -470,7 +489,7 @@ def test_semantic_lessons_rank_by_earned_utility(db, monkeypatch):
 
     py = ca.semantic_lessons_md("code-fix", 3, db=db)
     bullets = [ln for ln in py.splitlines() if ln.startswith("- ")]
-    assert bullets[0].startswith("- [adr] second pattern that works"), (
+    assert bullets[0].startswith("- second pattern that works earned utility"), (
         f"the pattern with a record did not lead its equals: {py!r}"
     )
     assert "(helped 3/3 retrievals)" in py
@@ -498,7 +517,8 @@ def test_semantic_lessons_demote_a_pattern_that_never_helps(db, monkeypatch):
     assert "pattern-00 says something" not in py, (
         f"a pattern that never once helped held its place: {py!r}"
     )
-    assert py.count("- [") == 3
+    bullets = sum(1 for ln in py.splitlines() if ln.startswith("- "))
+    assert bullets == 3
     # The ones that displaced it are its near-prior peers, not distant ones —
     # the gate still bounds how far the record can reach.
     assert all(f"pattern-{i:02d}" in py for i in (1, 2, 3)), py
@@ -532,8 +552,10 @@ def test_semantic_lessons_optout_restores_the_static_order(db, monkeypatch):
     monkeypatch.setenv("MINI_ORK_DB", db)
     monkeypatch.delenv("MINI_ORK_RUN_ID", raising=False)
     _seed_emergent(db, [
-        ("emg-strong", "broad vague advice", ["adr"], 9.0, "approved"),
-        ("emg-weak", "specific narrow fix", ["verifier_addition"], 1.0, "approved"),
+        ("emg-strong", "broad vague advice", ["adr"], 9.0, "approved",
+         "broad vague advice: weaker but always ships first"),
+        ("emg-weak", "specific narrow fix", ["verifier_addition"], 1.0, "approved",
+         "specific narrow fix: earns utility through retrievals"),
     ])
     from mini_ork import memory as semantic
     ca.semantic_lessons_md("code-fix", 3, db=db)  # mirror-on-read creates the row
@@ -546,7 +568,7 @@ def test_semantic_lessons_optout_restores_the_static_order(db, monkeypatch):
     py = ca.failure_modes_md("code-fix", 3, db=db)
     assert "broad vague" in py and "specific narrow" in py
     assert py.index("broad vague") < py.index("specific narrow"), "static order back"
-    assert "Verified emergent patterns" in py, "the block must not disappear"
+    assert "Lessons from recurring patterns" in py, "the block must not disappear"
 
 
 def test_semantic_lessons_log_retrieval_only_inside_a_run(db, monkeypatch):
@@ -554,7 +576,7 @@ def test_semantic_lessons_log_retrieval_only_inside_a_run(db, monkeypatch):
     so writing one would depress the memory's utility for nothing. Outside a
     run the block is emitted and nothing is logged."""
     monkeypatch.setenv("MINI_ORK_DB", db)
-    _seed_emergent(db, [("emg-1", "a lesson", ["adr"], 5.0, "approved")])
+    _seed_emergent(db, [("emg-1", "a lesson", ["adr"], 5.0, "approved", "a lesson: authored to anchor injection")])
 
     monkeypatch.delenv("MINI_ORK_RUN_ID", raising=False)
     assert ca.semantic_lessons_md("code-fix", 3, db=db) != ""
@@ -572,7 +594,7 @@ def test_semantic_lessons_close_the_loop_across_injections(db, monkeypatch):
     earned."""
     monkeypatch.setenv("MINI_ORK_DB", db)
     monkeypatch.setenv("MINI_ORK_RUN_ID", "run-loop")
-    _seed_emergent(db, [("emg-1", "lesson that helped", ["adr"], 1.0, "approved")])
+    _seed_emergent(db, [("emg-1", "lesson that helped", ["adr"], 1.0, "approved", "lesson that helped: earned utility through retrievals")])
 
     first = ca.semantic_lessons_md("code-fix", 3, db=db)
     assert "lesson that helped" in first and "(helped" not in first
@@ -584,8 +606,9 @@ def test_semantic_lessons_close_the_loop_across_injections(db, monkeypatch):
          "agent_version_id": "codex"}, db=db)
 
     second = ca.semantic_lessons_md("code-fix", 3, db=db)
-    assert second == first.replace("- [adr] lesson that helped",
-                                  "- [adr] lesson that helped  (helped 1/1 retrievals)"), (
+    assert second == first.replace(
+        "- lesson that helped: earned utility through retrievals",
+        "- lesson that helped: earned utility through retrievals  (helped 1/1 retrievals)"), (
         f"the completed run's win was not reflected: {second!r}"
     )
 
@@ -594,7 +617,7 @@ def test_semantic_lessons_hold_a_still_running_run_pending(db, monkeypatch):
     """The sweep must not credit a run whose traces are still live."""
     monkeypatch.setenv("MINI_ORK_DB", db)
     monkeypatch.setenv("MINI_ORK_RUN_ID", "run-live")
-    _seed_emergent(db, [("emg-1", "a lesson", ["adr"], 5.0, "approved")])
+    _seed_emergent(db, [("emg-1", "a lesson", ["adr"], 5.0, "approved", "a lesson: authored to anchor injection")])
     ca.semantic_lessons_md("code-fix", 3, db=db)
 
     trace_store.trace_write(
@@ -616,7 +639,7 @@ def test_semantic_lessons_cold_safe_without_the_patterns_table(db, monkeypatch):
 
     assert ca.semantic_lessons_md("code-fix", 5, db=db) == ""
     assert ca._static_emergent_block(db, 5) == ""
-    assert "Verified emergent patterns" not in ca.failure_modes_md("code-fix", 5, db=db)
+    assert "Lessons from recurring patterns" not in ca.failure_modes_md("code-fix", 5, db=db)
 
 
 def test_semantic_lessons_do_not_leak_proposed_patterns(db, monkeypatch):
@@ -708,7 +731,7 @@ def test_failure_modes_records_which_decision_caused_the_retrieval(db, monkeypat
     monkeypatch.setenv("MINI_ORK_DB", db)
     monkeypatch.setenv("MINI_ORK_RUN_ID", "run-42")
     monkeypatch.delenv("MO_LIMBO_BUDGET", raising=False)
-    _seed_emergent(db, [("emg-attr", "a lesson worth citing", ["adr"], 5.0, "approved")])
+    _seed_emergent(db, [("emg-attr", "a lesson worth citing", ["adr"], 5.0, "approved", "a lesson worth citing verbatim when the matching signal appears")])
 
     ca.failure_modes_md(
         "code-fix", 5, db=db,
@@ -735,7 +758,7 @@ def test_failure_modes_attribution_defaults_to_unknown(db, monkeypatch):
     monkeypatch.setenv("MINI_ORK_DB", db)
     monkeypatch.setenv("MINI_ORK_RUN_ID", "run-43")
     monkeypatch.delenv("MO_LIMBO_BUDGET", raising=False)
-    _seed_emergent(db, [("emg-attr2", "another lesson", ["adr"], 5.0, "approved")])
+    _seed_emergent(db, [("emg-attr2", "another lesson", ["adr"], 5.0, "approved", "another lesson worth carrying verbatim through the prompt")])
 
     ca.failure_modes_md("code-fix", 5, db=db)
 

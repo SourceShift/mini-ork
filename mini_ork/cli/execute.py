@@ -2396,7 +2396,8 @@ def _assemble_reviewer_inputs(run_dir):
     return block
 
 
-def _learned_block(root, task_class, node_type, lane="", node_id=""):
+def _learned_block(root, task_class, node_type, lane="", node_id="",
+                    *, sources: list[dict] | None = None):
     """F5-B (bash _dispatch_node:2357-2382): inject reflect-learned failure modes +
     unconsumed operator-steering messages into LLM node prompts — the READ side of
     the learning loop. Empty when opt-out or for a non-LLM node.
@@ -2408,6 +2409,12 @@ def _learned_block(root, task_class, node_type, lane="", node_id=""):
     they do not change which memories come back. ``node_type`` also sets the
     retrieval count — a judgment node sees more of the loop's record than a
     mechanical one (see context_assembler._limbo_limit).
+
+    ``sources`` is an out-param: when supplied, one dict is appended per row
+    actually injected — ``kind: "gradient"`` / ``kind: "pattern"`` for the
+    ``failure_modes_md`` rows (passed through) and ``kind: "steering"`` for
+    each operator-steering message appended below. With ``sources=None`` the
+    returned markdown is byte-identical to the same call with a list.
     """
     if os.environ.get("MO_INJECT_LEARNINGS", "1") != "1":
         return ""
@@ -2420,6 +2427,7 @@ def _learned_block(root, task_class, node_type, lane="", node_id=""):
         fm = context_assembler.failure_modes_md(
             task_class or "generic", 5, db=os.environ.get("MINI_ORK_DB"),
             node_type=node_type, lane=lane, node_id=node_id,
+            sources=sources,
         ).strip()
         if fm:
             block = "\n\n" + fm + "\n"
@@ -2432,12 +2440,33 @@ def _learned_block(root, task_class, node_type, lane="", node_id=""):
                 "--- Operator steering (injected supervisor guidance) ---",
                 f"{len(rows)} message(s) targeted at this node. Treat as load-bearing:",
             ]
+            # Collect steering sources into a local list and only commit
+            # them to ``sources`` after the prompt block has been built —
+            # a mid-loop exception would otherwise leak entries that never
+            # reached the prompt, and ``sources`` would claim more was
+            # injected than actually was.
+            steering_sources: list[dict] = []
             for row in rows:
                 severity = str(row.get("severity", "info")).upper()
                 source = row.get("source") or "unknown"
-                lines.append(f"- [{severity}] (from {source}) {row.get('message', '')}")
+                message = row.get("message", "")
+                lines.append(f"- [{severity}] (from {source}) {message}")
+                if sources is not None:
+                    steering_sources.append({
+                        "kind": "steering",
+                        "id": row.get("id"),
+                        "severity": severity,
+                        "source": source,
+                        "message": message,
+                    })
             lines.append("--- /operator steering ---")
             block += "\n" + "\n".join(lines) + "\n"
+            if sources is not None:
+                # Only commit sources after the prompt block has been built —
+                # a mid-loop exception would otherwise leak entries that never
+                # reached the block, and ``sources`` would claim more was
+                # injected than actually was.
+                sources.extend(steering_sources)
     except Exception:
         pass
     return block
