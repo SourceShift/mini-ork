@@ -67,6 +67,18 @@ _NOTE_TOKENS = ("precondition", "must be restarted", "export", "not set", "env")
 
 _VERDICT_RE = re.compile(r'"verdict"\s*:\s*"([^"]+)"')
 
+# Legacy lane-failure detection: a pre-0021 (or pre-fix) run wrote NULL
+# ``error_category``, but the provider's 429 still lives in an
+# ``agent-*.live.jsonl`` / ``impl-*.log``. The 429 mark is either the
+# claude-code result field ``"api_error_status":429`` or the parenthesised
+# ``(429)`` the provider's own error text prints.
+_LEGACY_429_RE = re.compile(r'"api_error_status"\s*:\s*429|\(429\)')
+_LEGACY_QUOTA_RE = re.compile(
+    r"usage limit|token plan|purchase credits|out of credits|credit balance"
+    r"|insufficient balance|exceeded your current quota|billing",
+    re.IGNORECASE,
+)
+
 
 def _hint_path(home: Path, run_id: str) -> Path:
     return home / "runs" / run_id / CACHE_FILENAME
@@ -751,6 +763,207 @@ def _case_cost_pause(run_id: str) -> dict[str, Any]:
     }
 
 
+# ── lane-unavailable case ──────────────────────────────────────────────────
+
+def _failed_lane_rows(home: Path, run_id: str) -> list[dict[str, Any]]:
+    """Failed ``llm_calls`` rows for ``run_id``, latest first."""
+    try:
+        db = db_for(home)
+    except Exception:  # noqa: BLE001 — missing state.db: never raise
+        return []
+    if not db.has_table("llm_calls"):
+        return []
+    try:
+        return db.rows(
+            "SELECT model_id, provider, feature_name, actor, error_category, "
+            "error_message, ts FROM llm_calls WHERE run_id = ? AND status = 'failed' "
+            "ORDER BY id DESC",
+            (run_id,),
+        )
+    except Exception:  # noqa: BLE001 — schema drift: never raise
+        return []
+
+
+def _run_dir_has_legacy_lane_failure(run_dir: Path) -> bool:
+    """True when an ``agent-*.live.jsonl`` / ``impl-*.log`` carries the 429 mark
+    together with the quota wording (legacy rows with NULL ``error_category``)."""
+    if not run_dir.is_dir():
+        return False
+    for pattern in ("agent-*.live.jsonl", "impl-*.log"):
+        for path in sorted(run_dir.glob(pattern)):
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if _LEGACY_429_RE.search(text) and _LEGACY_QUOTA_RE.search(text):
+                return True
+    return False
+
+
+def _node_start_lanes(home: Path, run_id: str
+                      ) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """``(starts, ends)`` from ``run_events`` — ``starts`` in created order,
+    each ``{"node_id", "model_lane"}``; ``ends`` maps node_id → last
+    finish_reason."""
+    starts: list[dict[str, Any]] = []
+    ends: dict[str, str] = {}
+    try:
+        db = db_for(home)
+    except Exception:  # noqa: BLE001 — missing state.db: never raise
+        return starts, ends
+    if not db.has_table("run_events"):
+        return starts, ends
+    try:
+        rows = db.rows(
+            "SELECT event_type, payload_json FROM run_events WHERE run_id = ? "
+            "ORDER BY created_at ASC, event_id ASC",
+            (run_id,),
+        )
+    except Exception:  # noqa: BLE001 — schema drift: never raise
+        return starts, ends
+    for r in rows:
+        try:
+            payload = json.loads(r.get("payload_json") or "{}")
+        except (ValueError, TypeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            continue
+        nid = str(payload.get("node_id") or "")
+        et = r.get("event_type")
+        if et == "node_start":
+            starts.append({"node_id": nid,
+                           "model_lane": str(payload.get("model_lane") or "")})
+        elif et == "node_end" and nid:
+            ends[nid] = str(payload.get("finish_reason") or "done")
+    return starts, ends
+
+
+def _failed_node_for_alias(starts: list[dict[str, Any]], ends: dict[str, str],
+                           alias: str) -> str | None:
+    """The first node (start order) whose ``node_start.model_lane`` == ``alias``
+    and whose last ``node_end.finish_reason != "done"``; else the first node
+    with that alias; else ``None``."""
+    for s in starts:
+        if s.get("model_lane") != alias:
+            continue
+        nid = str(s.get("node_id") or "")
+        if nid and ends.get(nid, "done") != "done":
+            return nid
+    for s in starts:
+        if s.get("model_lane") == alias and s.get("node_id"):
+            return str(s["node_id"])
+    return None
+
+
+def _run_lanes(run_dir: Path) -> dict[str, str]:
+    """The run-frozen ``lanes:`` map from ``<run_dir>/config/agents.yaml``."""
+    p = run_dir / "config" / "agents.yaml"
+    if not p.is_file():
+        return {}
+    try:
+        import yaml
+        doc = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    except (OSError, ImportError, ValueError):
+        return {}
+    lanes = doc.get("lanes") if isinstance(doc, dict) else None
+    if not isinstance(lanes, dict):
+        return {}
+    return {str(k): str(v) for k, v in lanes.items()}
+
+
+def _case_lane_unavailable(home: Path, run_id: str, run_dir: Path,
+                           recipe: str) -> dict[str, Any] | None:
+    """A failed ``llm_calls`` row classified quota/auth (or a legacy NULL-category
+    row whose log carries the 429) → suggest a healthy lane and tell the operator
+    to switch. Evaluated BEFORE cases 4 and 5."""
+    rows = _failed_lane_rows(home, run_id)
+    if not rows:
+        return None
+    row = next((r for r in rows if r.get("error_category") in ("quota", "auth")), None)
+    if row is None:
+        if not _run_dir_has_legacy_lane_failure(run_dir):
+            return None
+        row = rows[0]
+
+    lane = str(row.get("model_id") or "")
+    provider = str(row.get("provider") or "")
+    actor = str(row.get("actor") or "").strip()
+    feat = str(row.get("feature_name") or "")
+    alias = actor or (feat.split(":", 1)[1].strip() if ":" in feat else feat.strip())
+    error_kind = str(row.get("error_category") or "quota")
+    if error_kind not in ("quota", "auth"):
+        error_kind = "quota"
+    if not lane or not alias:
+        return None
+
+    nodes, _edges = _recipe_workflow(home, recipe)
+    using = [n for n in nodes if str(n.get("model_lane") or "") == alias]
+
+    if not using:
+        # Live-data tolerance: the row's actor/feature_name may carry the node
+        # TYPE (e.g. "researcher") rather than the lane alias. Resolve the alias
+        # from the failed lane via the run-frozen agents.yaml snapshot
+        # (codex_lens → minimax), else from a model_lane equal to the lane.
+        lanes = _run_lanes(run_dir)
+        aliases = sorted(
+            a for a, v in lanes.items() if v.split(",", 1)[0].strip() == lane
+        )
+        if len(aliases) == 1:
+            alias = aliases[0]
+            using = [n for n in nodes if str(n.get("model_lane") or "") == alias]
+        if not using:
+            using = [n for n in nodes if str(n.get("model_lane") or "") == lane]
+            if using:
+                alias = lane
+
+    starts, ends = _node_start_lanes(home, run_id)
+    failed_node = _failed_node_for_alias(starts, ends, alias)
+
+    using_names = [str(n.get("name")) for n in using if n.get("name")]
+    node_types = [str(n.get("type") or "") for n in using if n.get("type")]
+
+    suggestions: list[dict[str, str]] = []
+    code = False
+    try:
+        from mini_ork.recovery import lane_suggest
+        code = any(t in lane_suggest.CODE_ROLES for t in node_types)
+        suggestions = lane_suggest.suggest(
+            home, failed_lane=lane, alias=alias, node_types=node_types,
+            db=db_for(home), limit=3,
+        )
+    except Exception:  # noqa: BLE001 — suggestions are advisory, never fatal
+        suggestions = []
+
+    command = ""
+    if suggestions:
+        command = f"mini-ork recover {run_id} --lane {alias}={suggestions[0]['lane']}"
+    summary = (f"{lane} is out of quota" if error_kind == "quota"
+               else f"{lane} rejected the credentials")
+    return {
+        "version": HINT_VERSION,
+        "run_id": run_id,
+        "failed_node": failed_node,
+        "retryable": True,
+        "strategy": "resume",
+        "from_node": failed_node,
+        "needs_change": {
+            "kind": "lane",
+            "summary": summary,
+            "detail": str(row.get("error_message") or "")[:400],
+            "lane": lane,
+            "alias": alias,
+            "provider": provider,
+            "error_kind": error_kind,
+            "nodes": using_names,
+            "suggestions": suggestions,
+            "code": code,
+        },
+        "notes": [],
+        "command": command,
+        "computed_at": _now_iso(),
+    }
+
+
 def compute(home: Path, run_id: str) -> dict[str, Any] | None:
     """Pure read — return the retry hint for ``run_id`` or ``None``.
 
@@ -805,6 +1018,12 @@ def compute(home: Path, run_id: str) -> dict[str, Any] | None:
                       sibling_hard_fail=sibling_hard_fail)
     if code is not None:
         return code
+
+    # Case 3.5 — a dead lane (quota/auth) on an LLM node. Runs BEFORE cases 4
+    # and 5 so a quota failure surfaces as a lane switch, not a silent resume.
+    lane_hint = _case_lane_unavailable(home, run_id, run_dir, recipe)
+    if lane_hint is not None:
+        return lane_hint
 
     # Case 4 — provider trouble on an LLM node
     trouble = _case_provider_trouble(home, run_id, run_dir, failed_name, verifier)

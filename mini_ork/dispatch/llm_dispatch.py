@@ -16,6 +16,7 @@ bash gateway provider taxonomy (distinct from mini_ork.dispatch's finer one).
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import sqlite3
@@ -40,7 +41,9 @@ def classify_error(message: str, rc: str | int = "") -> str:
                  r"|not logged in|unauthorized|forbidden", text):
         return "auth"
     if re.search(r"429", text) and re.search(
-            r"monthly|tokens-per-day|billing|quota|insufficient credits|credit limit", text):
+            r"monthly|tokens-per-day|billing|quota|insufficient credits|credit limit"
+            r"|usage limit|token plan|purchase credits|out of credits|credit balance"
+            r"|insufficient balance|exceeded your current quota", text):
         return "quota"
     if re.search(r"(^|[^0-9])(429|503)([^0-9]|$)", text) and re.search(
             r"capacity|concurrent|rate|overload|temporarily unavailable", text):
@@ -104,6 +107,53 @@ def strip_protocol_blocks(out_file: str) -> None:
             open(out_file, "w", encoding="utf-8").write(cleaned.rstrip() + "\n")
         except OSError:
             pass
+
+
+def _provider_error_from_result(out_file: str) -> str:
+    """The real provider error from a claude-code ``result`` object on stdout.
+
+    The claude-code wrapper prints a provider rejection as a JSON ``result``
+    object (or a JSONL stream line) on stdout — ``{"type":"result",
+    "is_error":true, "api_error_status":429, "result":"API Error: …"}`` — while
+    its stderr only carries CLI chatter. The failed-call tail reads ``.err.log``
+    only, so the 429 sat invisible in stdout JSON and ``classify_error`` never
+    saw the quota wording. Parse stdout for that object and return
+    ``f"HTTP {status}: {result}"[:1000]`` (no ``HTTP`` part when there is no
+    status); return ``""`` when stdout has no such object.
+    """
+    try:
+        raw = open(out_file, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return ""
+    candidates: list[dict] = []
+    # One whole-object document (a single result), plus each JSONL stream line.
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            candidates.append(obj)
+    except (ValueError, TypeError):
+        pass
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(obj, dict):
+            candidates.append(obj)
+    best = ""
+    for obj in candidates:
+        if obj.get("is_error") is not True:
+            continue
+        result = obj.get("result")
+        if not isinstance(result, str) or not result:
+            continue
+        status = obj.get("api_error_status")
+        prefix = f"HTTP {status}: " if status is not None and str(status) else ""
+        best = (prefix + result)[:1000]
+    return best
 
 
 def _int_or(v, d):
@@ -559,7 +609,16 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
         err = (open(out_file + ".err.log", errors="ignore").read()[-200:])
     except OSError:
         pass
+    # The claude-code wrapper hides the real provider rejection in a stdout
+    # ``result`` object (``is_error: true``, ``api_error_status``, ``result``).
+    # Surface it so ``error_message``/``error_category`` carry the provider's
+    # own words (the MiniMax 429 quota text) instead of the CLI's stderr chatter.
+    provider_err = _provider_error_from_result(out_file)
+    if provider_err:
+        err = provider_err
     err = redact_secrets(err)
+    category = classify_error(err, rc)
+    retryable = int(error_retryable(category))
     # A failed call still burned wall-clock, and partial provider usage often
     # survives in the sidecars — record both instead of hard zeros.
     cost_usd = "0"
@@ -570,7 +629,8 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
         parts = (open(out_file + ".tokens").read().split("\t") + ["0"] * 4)[:4]
         in_tok, out_tok, cached_in, cache_create = (_int_or(p, 0) for p in parts)
     write_llm_calls_row(db, provider, selected_model, tier, feature, actor, "failed",
-                        duration_ms, cost_usd, err, in_tok, out_tok, "{}", cached_in, cache_create)
+                        duration_ms, cost_usd, err, in_tok, out_tok, "{}", cached_in, cache_create,
+                        error_category=category, retryable=retryable)
     sys.stderr.write(f"[llm_dispatch FAIL model={model} rc={rc}]\n")
     for side in (out_file + ".tokens", out_file + ".model"):
         try:

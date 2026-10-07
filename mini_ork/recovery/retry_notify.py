@@ -200,15 +200,16 @@ def _automation_record_for_run(home: Path, run_id: str) -> str | None:
 
 
 def _lane_from_attempt_row(run_dir: Path) -> str:
-    """Best-effort ``lane`` from the most recent ``node_attempts`` row for
-    ``run_id``. Returns ``""`` when the schema is unavailable, no row
-    exists, or the column is unset. Lets :func:`_step_credentials`
-    name the lane so the operator knows which provider key to rotate.
+    """Best-effort ``lane`` = the latest failed ``llm_calls.model_id`` for the
+    run. Returns ``""`` when the schema is unavailable or no failed row exists.
+    Lets :func:`_step_credentials` name the lane so the operator knows which
+    provider key to rotate.
 
-    Forward-compatible: the current ``node_attempts`` schema (migration
-    0050) does not carry a ``lane`` column, so this lookup returns
-    ``""`` today. A future migration adding the column lights the
-    branch up without code changes.
+    ``node_attempts`` has no ``lane`` column (migration 0050 lists only
+    ``node_type, started_at, ended_at, result, failure_class, …``), so the old
+    ``SELECT lane FROM node_attempts`` always returned ``""``. ``llm_calls`` is
+    the writer that records the resolved lane — ``model_id`` — so that is the
+    real source.
     """
     if not run_dir.is_dir():
         return ""
@@ -223,19 +224,18 @@ def _lane_from_attempt_row(run_dir: Path) -> str:
     except Exception:  # noqa: BLE001
         return ""
     try:
-        if not db.has_table("node_attempts"):
+        if not db.has_table("llm_calls"):
             return ""
         rows = db.rows(
-            "SELECT lane FROM node_attempts WHERE run_id = ? "
-            "AND lane IS NOT NULL AND lane != '' "
-            "ORDER BY started_at DESC LIMIT 1",
+            "SELECT model_id FROM llm_calls WHERE run_id = ? AND status = 'failed' "
+            "ORDER BY id DESC LIMIT 1",
             (run_id,),
         )
     except Exception:  # noqa: BLE001
         return ""
     if not rows:
         return ""
-    return str(rows[0].get("lane") or "")
+    return str(rows[0].get("model_id") or "")
 
 
 # ── 1. owner ────────────────────────────────────────────────────────────────
@@ -492,6 +492,59 @@ def _step_unknown(run_dir: Path) -> list[str]:
     ]
 
 
+def _run_dir_has_impl_artifact(run_dir: Path) -> bool:
+    """True when the run dir carries ``framework-edit.diff`` or an implementer
+    artifact (an ``impl-*.log`` / ``agent-implementer.*``) — i.e. the
+    implementer ran and the tree was touched."""
+    if not run_dir.is_dir():
+        return False
+    if (run_dir / "framework-edit.diff").is_file():
+        return True
+    if list(run_dir.glob("impl-*.log")):
+        return True
+    return bool(list(run_dir.glob("agent-implementer.*")))
+
+
+def _step_lane(nc: dict[str, Any], hint: dict[str, Any], run_dir: Path) -> list[str]:
+    """Kind ``lane`` — deterministic strings: the failed lane, the switch
+    command (or the "no healthy lane" fallback), and the "nothing changed"
+    line when the run stopped before the implementer."""
+    lane = str(nc.get("lane") or "?")
+    alias = str(nc.get("alias") or "?")
+    provider = str(nc.get("provider") or "the provider")
+    detail = str(nc.get("detail") or "")
+    raw_nodes = nc.get("nodes")
+    nodes = [str(n) for n in raw_nodes] if isinstance(raw_nodes, list) else []
+    raw_sug = nc.get("suggestions")
+    suggestions = [dict(s) for s in raw_sug] if isinstance(raw_sug, list) else []
+    from_node = str(hint.get("from_node") or "")
+    command = str(hint.get("command") or "")
+    run_id = str(hint.get("run_id") or "<run>")
+    code = bool(nc.get("code"))
+
+    steps = [
+        f"{provider} lane '{lane}' (used by {alias}: {', '.join(nodes)}) "
+        f"failed: {detail}",
+    ]
+    if suggestions:
+        s0 = suggestions[0]
+        steps.append(
+            f"Switch {alias} to '{s0.get('lane')}' ({s0.get('reason')}) and "
+            f"resume from {from_node}: {command}",
+        )
+        for s in suggestions[1:]:
+            steps.append(f"Or '{s.get('lane')}' ({s.get('reason')})")
+    else:
+        code_word = "code " if code else ""
+        steps.append(
+            f"No other {code_word}lane looks healthy — top up {provider} credits "
+            f"or add a lane to providers.yaml, then: mini-ork recover {run_id}",
+        )
+    if not _run_dir_has_impl_artifact(run_dir):
+        steps.append("Nothing was changed in your code; the run stopped before the implementer.")
+    return steps
+
+
 def fix_steps(hint: dict[str, Any] | None, *, home: Path | None = None) -> list[str]:
     """The hint's ``needs_change`` rendered as numbered fix steps.
 
@@ -532,6 +585,8 @@ def fix_steps(hint: dict[str, Any] | None, *, home: Path | None = None) -> list[
         steps = _step_budget(run_id)
     elif kind == "code":
         steps = _step_code(detail, [str(n) for n in notes])
+    elif kind == "lane":
+        steps = _step_lane(nc, hint, run_dir)
     else:  # unknown and any future kind
         steps = _step_unknown(run_dir)
 
