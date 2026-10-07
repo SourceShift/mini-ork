@@ -31,14 +31,36 @@ def _yaml(path: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-@lru_cache(maxsize=64)
 def _cached_yaml(path_str: str) -> dict[str, Any]:
-    """Memoise YAML reads keyed on absolute path string.
+    """Memoise YAML reads keyed on the file's absolute path **and mtime**.
 
     The same ``<home>/config/agents.yaml`` and ``<engine>/config/agents.yaml``
     are read on every ``lane_map`` call; caching keeps a 50-run board poll
     to one disk read per path instead of up to 3 × 50.
+
+    The mtime is part of the key rather than the path alone, because the cache
+    outlives a single call in any long-lived host (the web server, the Python
+    SDK, a REPL). Re-pointing ``<home>/config/agents.yaml`` mid-session — what
+    a lane re-point does — must not keep serving the old labels until 64
+    other paths happen to evict the entry. A ``stat`` is far cheaper than the
+    read it saves, and the IDE's own path (one ``mini-ork board page`` process
+    per poll) never sees a stale entry either way.
     """
+    try:
+        mtime_ns = Path(path_str).stat().st_mtime_ns
+    except OSError:  # a missing file already reads as {} below
+        mtime_ns = 0
+    return _cached_yaml_at(path_str, mtime_ns)
+
+
+@lru_cache(maxsize=64)
+def _cached_yaml_at(path_str: str, mtime_ns: int) -> dict[str, Any]:
+    """The parse, cached on ``(path, mtime_ns)``.
+
+    ``mtime_ns`` takes no part in the parse — it is in the signature so that an
+    edited file is a different key and re-reads.
+    """
+    del mtime_ns  # part of the key only; see ``_cached_yaml``
     return _yaml(Path(path_str))
 
 

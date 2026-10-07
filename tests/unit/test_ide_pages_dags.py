@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -238,3 +239,36 @@ def test_each_node_carries_its_type_and_timing(home: Path) -> None:
     assert nodes["implementer"]["started_at"] == T0 + 10
     assert nodes["implementer"]["duration_ms"] == 30000
     assert nodes["planner"]["started_at"] is None and nodes["planner"]["duration_ms"] is None
+
+
+def test_lane_labels_follow_an_agents_yaml_repoint(home: Path) -> None:
+    """Re-pointing the project's ``agents.yaml`` changes the labels the page
+    reports — the cached read is keyed on the file's mtime, not just its path.
+
+    This is the long-lived-host case (the web server, the Python SDK, a REPL)
+    where the module-level cache outlives one call: the board's own path spawns
+    a fresh ``board page`` process per poll and would never have noticed.
+    """
+    from mini_ork.ide_pages import _lanes
+
+    run_dir = home.parent / "runs" / "a-run-with-no-snapshot"
+    assert _lanes.lane_map(home, run_dir) == {
+        "planner": "glm",
+        "worker": "minimax",
+        "reviewer": "opus",
+    }
+
+    agents = home / "config" / "agents.yaml"
+    agents.write_text(
+        "lanes:\n  planner: deepseek\n  worker: deepseek_flash\n  reviewer: kimi\n"
+    )
+    # Bump the mtime deterministically: two writes in the same nanosecond are
+    # possible in principle, and the whole point is that the key changed.
+    stamp = 1_600_000_000 * 1_000_000_000
+    os.utime(agents, ns=(stamp, stamp))
+
+    assert _lanes.lane_map(home, run_dir) == {
+        "planner": "deepseek",
+        "worker": "deepseek_flash",
+        "reviewer": "kimi",
+    }
