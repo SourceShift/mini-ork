@@ -472,11 +472,53 @@ def _act_resume(home: Path, run_id: str) -> dict[str, Any]:
 _retry_spawn = None  # populated lazily on first use, see ``_act_retry``
 
 
+def _merge_lanes(argv: list[str], lanes: list[str] | None) -> list[str]:
+    """Apply operator ``--lane <alias>=<lane>`` flags to a spawned argv.
+
+    Each operator lane REPLACES any ``--lane`` flag already carrying the same
+    alias (the hint's suggested lane for a ``kind == "lane"`` hint), and is
+    appended otherwise. Matches both the ``--lane <alias>=<lane>`` two-token
+    form and the ``--lane=<alias>=<lane>`` single-token form; the alias is the
+    substring before the first ``=``.
+    """
+    if not lanes:
+        return argv
+    for lane in lanes:
+        alias = lane.split("=", 1)[0].strip()
+        replaced = False
+        out: list[str] = []
+        i = 0
+        while i < len(argv):
+            tok = argv[i]
+            if tok == "--lane" and i + 1 < len(argv):
+                existing = argv[i + 1].split("=", 1)[0].strip()
+                if existing == alias:
+                    out.extend(["--lane", lane])
+                    i += 2
+                    replaced = True
+                    continue
+            elif tok.startswith("--lane="):
+                existing = tok[len("--lane="):].split("=", 1)[0].strip()
+                if existing == alias:
+                    out.append(f"--lane={lane}")
+                    i += 1
+                    replaced = True
+                    continue
+            out.append(tok)
+            i += 1
+        if not replaced:
+            out.extend(["--lane", lane])
+        argv = out
+    return argv
+
+
 def _act_retry(
     home: Path, run_id: str, *,
     ack_change: bool = False, force: bool = False, dry_run: bool = False,
+    lanes: list[str] | None = None,
 ) -> dict[str, Any]:
-    """``board retry <run_id> [--ack-change] [--force] [--dry-run]``.
+    """``board retry <run_id> [--ack-change] [--force] [--dry-run]
+    [--lane <alias>=<lane>]…``.
 
     Always returns ``{"ok": …, "hint": <hint or null>, …}`` — never raises.
     The hint itself is computed by ``mini_ork.recovery.retry_hint``; this
@@ -492,6 +534,14 @@ def _act_retry(
                                 ``MINI_ORK_ROOT`` set, ``MINI_ORK_VENV_ACTIVE``
                                 popped, ``cwd`` = engine root),
                                log at ``<run_dir>/recover-<ts>.log``.
+
+    Operator ``--lane`` flags (a list of ``alias=lane``) are threaded onto the
+    spawned command: each replaces any ``--lane`` flag already carrying the
+    same alias (the hint's suggested lane) and is appended otherwise. ``--lane``
+    alone never implies ``--ack-change``/``--force``. A ``--lane`` on a hint
+    whose command verb is not ``recover`` (the resume-cost hint runs
+    ``mini-ork resume``, which ignores ``--lane``) is REFUSED — never silently
+    dropped.
     """
     from mini_ork.recovery import retry_hint
     from mini_ork.web.control import _mini_ork_root
@@ -514,7 +564,9 @@ def _act_retry(
         summary = (needs_change or {}).get("summary") or "run is not retryable"
         return {"ok": False, "run_id": run_id, "hint": hint, "error": summary}
 
-    if needs_change is not None and not ack_change and not force and str(hint.get("strategy") or "") != "resume-cost":
+    if needs_change is not None and not ack_change and not force \
+            and str(hint.get("strategy") or "") != "resume-cost" \
+            and needs_change.get("kind") != "lane":
         return {"ok": False, "run_id": run_id, "hint": hint,
                 "error": f"needs a change first: {needs_change.get('summary') or '?'}"}
 
@@ -538,12 +590,26 @@ def _act_retry(
     # ``--force`` alone never implies ``--ack-change`` and the hint's
     # command string never embeds them.
     tokens = command.split()
+    # ``--lane`` is a ``recover`` flag: the resume-cost hint's command is
+    # ``mini-ork resume <run>``, and ``mini_ork/cli/resume.py`` ignores extra
+    # args — so appending ``--lane`` there would silently drop the switch and
+    # re-run the dead lane. Refuse instead of reporting a switch that never
+    # happened (the verb is the token right after the ``mini-ork`` prefix).
+    if lanes:
+        verb = tokens[1] if len(tokens) > 1 else ""
+        if verb != "recover":
+            return {"ok": False, "run_id": run_id, "hint": hint,
+                    "error": f"--lane requires a recover hint (this hint runs "
+                             f"'mini-ork {verb}', which takes no --lane)"}
     root = _mini_ork_root()
     if tokens and tokens[0] == "mini-ork":
         tokens[0] = str(root / "bin" / "mini-ork")
         argv: list[str] = [sys.executable, *tokens]
     else:
         argv = tokens
+    # Operator ``--lane`` flags replace the hint's same-alias ``--lane`` and
+    # append otherwise; ``--lane`` alone never implies ``--ack-change``/``--force``.
+    argv = _merge_lanes(argv, lanes)
     # ``--force`` does NOT add ``--ack-change`` — the two are independent
     # operator intents. ``--ack-change`` is only added when the operator
     # typed it, regardless of ``--force``.
@@ -867,7 +933,7 @@ def main(rest: list[str], root: str) -> int:
     elif args.verb == "retry":
         payload = _act_retry(home, args.run_id,
                              ack_change=args.ack_change, force=args.force,
-                             dry_run=args.dry_run)
+                             dry_run=args.dry_run, lanes=args.lane)
     elif args.verb == "runs":
         try:
             payload = _runs_verb(home, args.query, args.offset, args.limit)
@@ -923,6 +989,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "case-3 'code' revisions).")
     parser.add_argument("--dry-run", action="store_true",
                         help="retry: return the hint only, never spawn.")
+    parser.add_argument("--lane", action="append", default=[],
+                        help="retry: pin a lane for the spawned recover "
+                             "(repeatable, <alias>=<lane>). Does not imply "
+                             "--ack-change/--force.")
     parser.add_argument("--query", default=None,
                         help="full-text query for board runs (whitespace ANDed)")
     parser.add_argument("--limit", type=int, default=_RUNS_VERB_DEFAULT_LIMIT,

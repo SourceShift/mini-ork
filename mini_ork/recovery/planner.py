@@ -129,6 +129,7 @@ __all__ = [
 _USAGE = """\
 Usage: mini-ork recover <run_id> [--from-node <id>] [--strategy NAME] [--status]
                                 [--carry-patch NAME] [--ack-change] [--force]
+                                [--lane <alias>=<lane>]…
 
 Recover a failed run by walking the workflow DAG, marking each node
 reusable via E1's `is_node_reusable`, and dispatching ONLY the
@@ -176,6 +177,13 @@ Options:
                                  an implementer-typed node. ``--status``
                                  prints the resolved target/patch/would-apply
                                  state without touching the tree.
+  --lane <alias>=<lane>        Pin a workflow lane alias to a provider lane
+                                 for the resumed run (repeatable). Writes
+                                 ``runs/<id>/config/agents.recover.yaml``
+                                 and appends the switch to
+                                 ``runs/<id>/recover-lanes.log``; the
+                                 resumed execute reads the pin via
+                                 ``MINI_ORK_AGENTS``.
   --ack-change                 Acknowledge a ``needs_change`` retry hint
                                  and proceed past the change-needed gate.
                                  Required when ``<run_dir>/retry-hint.json``
@@ -475,6 +483,200 @@ def _format_restore_plan(
     return "\n".join(lines)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Lane repair (kickoff lane-repair-resume §1) — ``--lane <alias>=<lane>``
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _parse_lane_overrides(raw: list[str]) -> dict[str, str]:
+    """Turn repeatable ``--lane <alias>=<lane>`` tokens into an ordered
+    ``{alias: lane}`` map. Raises ``ValueError`` on a malformed token so the
+    caller exits 2 (a bad ``--lane`` must never dispatch)."""
+    out: dict[str, str] = {}
+    for tok in raw:
+        if "=" not in tok:
+            raise ValueError(f"expected --lane <alias>=<lane>, got {tok!r}")
+        alias, lane = tok.split("=", 1)
+        alias = alias.strip()
+        lane = lane.strip()
+        if not alias or not lane:
+            raise ValueError(f"expected --lane <alias>=<lane>, got {tok!r}")
+        out[alias] = lane
+    return out
+
+
+def _node_lane_aliases(workflow: str) -> list[str]:
+    """The ``model_lane`` values the workflow's nodes declare, in declaration
+    order. This is the alias set ``--lane <alias>`` must belong to. A missing
+    or malformed workflow yields ``[]`` (the caller reports "no aliases")."""
+    import yaml  # noqa: PLC0415 — lazy; the planner must stay dep-light
+
+    try:
+        with open(workflow, encoding="utf-8") as fh:
+            doc = yaml.safe_load(fh) or {}
+    except (OSError, ValueError, yaml.YAMLError):
+        return []
+    aliases: list[str] = []
+    for node in doc.get("nodes") or []:
+        if not isinstance(node, dict):
+            continue
+        ml = node.get("model_lane")
+        if isinstance(ml, str) and ml and ml not in aliases:
+            aliases.append(ml)
+    return aliases
+
+
+def _registry_lanes() -> list[str]:
+    """Lane names the effective providers registry exposes (sorted)."""
+    from mini_ork.dispatch import providers  # noqa: PLC0415
+
+    try:
+        reg = providers._load_providers_registry()
+    except Exception:  # noqa: BLE001 — an unreadable registry is empty, not fatal
+        return []
+    return sorted(str(k) for k in reg.keys())
+
+
+def _validate_lane_overrides(overrides: dict[str, str], workflow: str) -> list[str]:
+    """Exit-2 error lines for any ``--lane`` alias/lane that is not known.
+
+    The alias must be a ``model_lane`` the workflow's nodes use; the lane must
+    be a key of the effective providers registry (an unknown lane must NOT
+    silently resolve to ``sonnet`` via ``resolve_lane_model``'s fallback).
+    Returns ``[]`` when every override is valid.
+    """
+    aliases = _node_lane_aliases(workflow)
+    lanes = _registry_lanes()
+    errs: list[str] = []
+    for alias in overrides:
+        if alias not in aliases:
+            errs.append(
+                f"unknown alias {alias!r}; valid aliases: "
+                f"{', '.join(aliases) or '<none>'}"
+            )
+    for alias, lane in overrides.items():
+        if lane not in lanes:
+            errs.append(
+                f"unknown lane {lane!r} (for {alias!r}); valid lanes: "
+                f"{', '.join(lanes) or '<none>'}"
+            )
+    return errs
+
+
+def _base_overlay_path(home: str | None = None) -> str | None:
+    """The overlay the resumed execute will actually merge over the template.
+
+    Mirrors ``agents_config.personal_path`` — ``$MINI_ORK_AGENTS`` when it
+    points at an existing file, else ``<home>/config/agents.local.yaml``, else
+    ``None`` — so the lane-repair base is the SAME overlay the execute
+    resolves. Reading only ``$MINI_ORK_AGENTS`` (the pre-fix behaviour) missed
+    ``agents.local.yaml`` whenever the env var was unset: pinning one alias then
+    wrote a one-key overlay and silently routed every OTHER alias back to the
+    team template's lane. ``personal_path`` raises ``ValueError`` when
+    ``$MINI_ORK_AGENTS`` is set but names a missing file; fall back to that raw
+    env value there so the (broken) path is still what the preview/log shows.
+    """
+    from mini_ork.dispatch import agents_config  # noqa: PLC0415
+
+    try:
+        return agents_config.personal_path(home=home)
+    except ValueError:
+        return os.environ.get("MINI_ORK_AGENTS")
+
+
+def _old_lane(alias: str, run_dir: str, overlay: str | None) -> str:
+    """The lane ``alias`` currently resolves to — the base overlay (the
+    ``$MINI_ORK_AGENTS`` / ``<home>/config/agents.local.yaml`` file from
+    ``_base_overlay_path``, merged on top) wins, then the run snapshot. Falls
+    back to the alias itself when neither names it (mirrors
+    ``resolve_lane_family``'s fail-open pass-through for the log line only)."""
+    import yaml  # noqa: PLC0415
+
+    sources = [overlay] if overlay else []
+    sources.append(os.path.join(run_dir, "config", "agents.yaml"))
+    for src in sources:
+        if not src or not os.path.isfile(src):
+            continue
+        try:
+            with open(src, encoding="utf-8") as fh:
+                doc = yaml.safe_load(fh) or {}
+            lanes = doc.get("lanes") if isinstance(doc, dict) else None
+            if isinstance(lanes, dict) and alias in lanes:
+                return str(lanes[alias])
+        except (OSError, ValueError, yaml.YAMLError):
+            continue
+    return alias
+
+
+def _write_lane_overlay(
+    run_dir: str, overrides: dict[str, str], overlay: str | None
+) -> Path:
+    """Write ``<run_dir>/config/agents.recover.yaml`` = the base overlay deep-
+    merged with any prior ``agents.recover.yaml`` and then ``{"lanes":
+    overrides}``. Returns the overlay path to hand to the execute via
+    ``MINI_ORK_AGENTS``.
+
+    The deep merge (``agents_config.merge``) keeps the operator's other lane
+    aliases: only the requested aliases are overwritten, everything else in a
+    pre-existing overlay survives. A broken pre-existing overlay is treated as
+    empty so a stale ``MINI_ORK_AGENTS`` never crashes ``recover`` — the
+    requested ``--lane`` still lands. A prior ``agents.recover.yaml`` is folded
+    in as well: a second ``recover --lane`` from a fresh shell does not carry
+    the first call's flags, and the env override does not outlive its process,
+    so without this the earlier pin would vanish and its node would fall back
+    to the dead lane. The new ``--lane`` pins win over both.
+    """
+    from mini_ork.dispatch import agents_config  # noqa: PLC0415
+    import yaml  # noqa: PLC0415
+
+    base: dict = {}
+    if overlay:
+        try:
+            base = agents_config._load_yaml(overlay, "agents overlay")
+        except (ValueError, OSError):
+            base = {}
+    prior = Path(run_dir) / "config" / "agents.recover.yaml"
+    if prior.is_file():
+        try:
+            base = agents_config.merge(
+                base,
+                agents_config._load_yaml(str(prior), "agents recover overlay"),
+            )
+        except (ValueError, OSError):
+            pass
+    merged = agents_config.merge(base, {"lanes": overrides})
+    config_dir = Path(run_dir) / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    dest = config_dir / "agents.recover.yaml"
+    dest.write_text(yaml.safe_dump(merged, sort_keys=True), encoding="utf-8")
+    return dest
+
+
+def _append_lane_log(run_dir: str, overrides: dict[str, str], overlay: str | None) -> None:
+    """Append one ``<iso ts> <alias>: <old lane> -> <new lane>`` line per
+    override to ``<run_dir>/recover-lanes.log``."""
+    from datetime import datetime, timezone  # noqa: PLC0415
+
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    lines = [
+        f"{ts} {alias}: {_old_lane(alias, run_dir, overlay)} -> {lane}\n"
+        for alias, lane in overrides.items()
+    ]
+    with open(os.path.join(run_dir, "recover-lanes.log"), "a", encoding="utf-8") as fh:
+        fh.writelines(lines)
+
+
+def _format_lane_block(
+    overrides: dict[str, str], run_dir: str, overlay: str | None
+) -> str:
+    """Operator-facing ``--status`` preview of the requested lane switches
+    (read-only — the write happens on the dispatch path only)."""
+    lines = ["    lane overrides:"]
+    for alias, lane in overrides.items():
+        lines.append(f"      {alias}: {_old_lane(alias, run_dir, overlay)} -> {lane}")
+    return "\n".join(lines)
+
+
 def _abandon_lease(db_path: str, run_id: str, req: Any, token: str | None) -> None:
     """A refused restore dispatched nothing: close the request as failed and
     release the lease, so the ledger never records a dispatch that did not run."""
@@ -521,6 +723,7 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
     carry_patch = ""
     ack_change = False
     force = False
+    lane_overrides: list[str] = []
     positional: list[str] = []
     i = 0
     while i < len(argv):
@@ -569,6 +772,15 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
             i += 1
         elif a == "--force":
             force = True
+            i += 1
+        elif a == "--lane":
+            if i + 1 >= len(argv):
+                sys.stderr.write("--lane requires <alias>=<lane>\n")
+                return 2
+            lane_overrides.append(argv[i + 1])
+            i += 2
+        elif a.startswith("--lane="):
+            lane_overrides.append(a.split("=", 1)[1].strip())
             i += 1
         elif a == "--workflow":
             if i + 1 >= len(argv):
@@ -633,6 +845,13 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
     run_dir, db_default, workflow_default, recipe = _resolve_default_paths(run_id)
     workflow = workflow_override or workflow_default
     db_path = db_override or db_default
+    # The lane-repair base overlay: what the execute would merge over the
+    # template (``$MINI_ORK_AGENTS`` or ``<home>/config/agents.local.yaml``).
+    # Captured BEFORE any env rewrite so ``--status`` and the dispatch path
+    # read the SAME pre-existing overlay (kickoff §1: "other aliases kept").
+    lane_base = _base_overlay_path(
+        context_env("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
+    )
     task_class = (os.environ.get("MINI_ORK_TASK_CLASS")
                   or _task_class_for_recipe(recipe) or "generic")
 
@@ -646,6 +865,25 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
             f"[mini-ork-recover] workflow.yaml not found: {workflow or '<unset>'}\n"
         )
         return 1
+
+    # ── Lane repair (kickoff lane-repair-resume §1): parse + validate
+    # ``--lane <alias>=<lane>``. Validation runs BEFORE the hint gate, status
+    # print, and lease block, so a bad alias/lane exits 2 with the choices
+    # listed and never writes or dispatches. The overlay write happens only on
+    # the dispatch path (``--status`` stays read-only on disk).
+    lane_pins: dict[str, str] = {}
+    if lane_overrides:
+        try:
+            lane_pins = _parse_lane_overrides(lane_overrides)
+        except ValueError as exc:
+            sys.stderr.write(f"recover: {exc}\n")
+            return 2
+        lane_errors = _validate_lane_overrides(lane_pins, workflow)
+        if lane_errors:
+            sys.stderr.write("recover: invalid --lane value\n")
+            for line in lane_errors:
+                sys.stderr.write(f"  {line}\n")
+            return 2
 
     # ── Hint gate (kickoff §5). Reads the retry hint for this run,
     # preferring ``mini_ork.recovery.retry_hint.load_or_compute`` (the
@@ -661,6 +899,10 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
         run_id=run_id,
     )
     if status_only:
+        if lane_pins:
+            sys.stdout.write(
+                _format_lane_block(lane_pins, run_dir, lane_base) + "\n"
+            )
         if hint is not None:
             sys.stdout.write(_format_hint_block(hint) + "\n")
         sys.stdout.write(_format_restore_plan(
@@ -686,12 +928,24 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
         return 1
     if hint is not None and hint.get("needs_change") and not ack_change and not status_only:
         nc = hint["needs_change"]
-        sys.stderr.write(
-            f"Needs a change before retrying ({nc.get('kind')!r}): "
-            f"{nc.get('summary')}\n{nc.get('detail')}\n"
-            f"Fix it, then rerun with --ack-change.\n"
+        # A ``kind == 'lane'`` needs_change is satisfied by the operator's
+        # ``--lane <alias>=<lane>`` flag — the flag IS the change (kickoff
+        # lane-repair-resume §1: the hint suggests ``recover <run> --lane
+        # <alias>=<lane>``, not ``--ack-change``). Let it through when the
+        # pin is present and (if the hint names an alias) matches the pin;
+        # a lane hint with no ``--lane`` still refuses like any other change.
+        lane_ack = (
+            nc.get("kind") == "lane"
+            and bool(lane_pins)
+            and (not nc.get("alias") or nc.get("alias") in lane_pins)
         )
-        return 1
+        if not lane_ack:
+            sys.stderr.write(
+                f"Needs a change before retrying ({nc.get('kind')!r}): "
+                f"{nc.get('summary')}\n{nc.get('detail')}\n"
+                f"Fix it, then rerun with --ack-change.\n"
+            )
+            return 1
 
     try:
         plan = plan_recovery(
@@ -790,6 +1044,14 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
             _abandon_lease(db_path, run_id, _req, _token)
             return 1
 
+    # ── Lane repair: write the overlay + log, then hand the overlay path to
+    # the execute via MINI_ORK_AGENTS. The "old lane" is captured BEFORE the
+    # env is rewritten (both writers read the same pre-existing overlay).
+    if lane_pins:
+        overlay_path = _write_lane_overlay(run_dir, lane_pins, lane_base)
+        _append_lane_log(run_dir, lane_pins, lane_base)
+        apply_env_overrides({"MINI_ORK_AGENTS": str(overlay_path)})
+
     # Active strategies: emit the env, print the plan, hand off to
     # the native executor which honors MINI_ORK_RECOVERY_FROM + CLOSURE.
     _emit_recovery_env(plan)
@@ -840,7 +1102,6 @@ def cli_main(argv: list[str] | None = None, *, execute_fn=None) -> int:
     exec_rc = 1
     try:
         exec_rc = execute_fn(exec_argv)
-        return exec_rc
     finally:
         if _lease is not None:
             if handoff["request_id"]:
@@ -848,6 +1109,20 @@ def cli_main(argv: list[str] | None = None, *, execute_fn=None) -> int:
                                       status="completed" if exec_rc == 0 else "failed")
             if handoff["lease_token"]:
                 _lease.release_lease(handoff["db_path"], handoff["run_id"], handoff["lease_token"])
+    # ── retry-notify (kickoff lane-repair-resume §2): mirror ``mini_ork.cli.main``
+    # so a re-failed recover reports the owner + fix steps like a fresh ``run``
+    # does. Fail-soft — never changes the run's exit code. Only fires when the
+    # resumed execute actually ran and failed (a dispatch that never reached the
+    # executor leaves ``handoff`` empty and returns before this point).
+    if exec_rc != 0 and handoff.get("run_dir") and os.path.isdir(handoff["run_dir"]):
+        try:
+            from mini_ork.recovery import retry_notify  # noqa: PLC0415
+
+            home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
+            retry_notify.notify(Path(home), handoff["run_id"])
+        except Exception:  # noqa: BLE001
+            pass
+    return exec_rc
 
 
 if __name__ == "__main__":

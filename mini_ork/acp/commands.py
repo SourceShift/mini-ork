@@ -652,29 +652,73 @@ async def handle_resume(agent: Any, session_id: str, arg: str) -> str:
     )
 
 
+def _apply_lane(lanes: dict[str, str], token: str) -> bool:
+    """Parse ``<alias>=<lane>`` into ``lanes``. Returns ``True`` on a valid
+    token; ``False`` (and leaves ``lanes`` untouched) on a malformed one so the
+    caller can reply with a usage error instead of spawning a recover that
+    would silently run the dead lane."""
+    if "=" not in token:
+        return False
+    alias, lane = token.split("=", 1)
+    alias = alias.strip()
+    lane = lane.strip()
+    if not alias or not lane:
+        return False
+    lanes[alias] = lane
+    return True
+
+
 async def handle_recover(agent: Any, session_id: str, arg: str) -> str:
     """Spawn a detached ``mini-ork recover`` for the current run."""
     run_id = _current_run_id(agent, session_id, arg)
     if not run_id:
         return "No run in this thread yet — `/runs` lists the project's runs."
-    # Parse ``--from-node <id>`` out of the arg; the run id (if any) was
-    # already consumed by ``_current_run_id``.
+    # Parse ``--from-node <id>``, ``--lane <alias>=<lane>`` (repeatable), and
+    # ``--force`` out of the arg; the run id (if any) was already consumed by
+    # ``_current_run_id``.
     tokens = [t for t in arg.split() if t]
     from_node = ""
-    cleaned: list[str] = []
-    skip = False
-    for tok in tokens:
-        if skip:
-            from_node = tok
-            skip = False
-            continue
+    lanes: dict[str, str] = {}
+    force = False
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
         if tok == "--from-node":
-            skip = True
+            if i + 1 < len(tokens):
+                from_node = tokens[i + 1]
+                i += 2
+                continue
+            i += 1
             continue
         if tok.startswith("--from-node="):
-            from_node = tok[len("--from-node=") :]
+            from_node = tok[len("--from-node="):]
+            i += 1
             continue
-        cleaned.append(tok)
+        if tok == "--lane":
+            if i + 1 < len(tokens):
+                if not _apply_lane(lanes, tokens[i + 1]):
+                    return (
+                        "`/recover` needs `--lane <alias>=<lane>` "
+                        "(e.g. `--lane codex_lens=deepseek`); "
+                        "no lane pin set — not spawning."
+                    )
+                i += 2
+                continue
+            return "`/recover` needs a value after `--lane` (`<alias>=<lane>`); not spawning."
+        if tok.startswith("--lane="):
+            if not _apply_lane(lanes, tok[len("--lane="):]):
+                return (
+                    "`/recover` needs `--lane <alias>=<lane>` "
+                    "(e.g. `--lane codex_lens=deepseek`); "
+                    "no lane pin set — not spawning."
+                )
+            i += 1
+            continue
+        if tok == "--force":
+            force = True
+            i += 1
+            continue
+        i += 1
     home = agent._home_for(run_id)
     # The recipe and engine root — ``control.launch_run`` resolves them
     # identically; we mirror the shape so ``/recover`` and ``launch_run``
@@ -688,6 +732,10 @@ async def handle_recover(agent: Any, session_id: str, arg: str) -> str:
     argv: list[str] = [sys.executable, str(root / "bin" / "mini-ork"), "recover", run_id]
     if from_node:
         argv.extend(["--from-node", from_node])
+    for alias, lane in lanes.items():
+        argv.extend(["--lane", f"{alias}={lane}"])
+    if force:
+        argv.append("--force")
     env = dict(os.environ)
     env["MINI_ORK_HOME"] = str(home)
     env["MINI_ORK_ROOT"] = str(root)
@@ -696,7 +744,15 @@ async def handle_recover(agent: Any, session_id: str, arg: str) -> str:
         proc = _spawn(argv, cwd=str(root), env=env, stdout_path=log_path)
     except OSError as exc:
         return f"`/recover` spawn failed: {exc}"
+    head = ""
+    if lanes:
+        switch = ", ".join(f"{a} → {l}" for a, l in lanes.items())
+        head = (
+            f"Resuming `{run_id}` from {from_node or 'closure root'} "
+            f"with {switch}. Log: `{log_path}`\n"
+        )
     return (
+        head +
         f"`/recover` `{run_id}` started.\n"
         f"- pid: `{proc.pid}`\n"
         f"- log: `{log_path}`\n"
