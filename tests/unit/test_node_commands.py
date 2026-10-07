@@ -310,7 +310,8 @@ def test_stream_subcommand_entries_from_smoke_logs(home: Path) -> None:
     run_dir = _seed_run(home)
     node_cmd = run_dir / "node-cmd"
     node_cmd.mkdir()
-    smoke_log = run_dir / "_smoke_cmd_W5-91.log"
+    # ``_<kind>_cmd*.log`` belongs to the verifier whose stem names <kind>.
+    smoke_log = run_dir / "_static_cmd_W5-91.log"
     smoke_log.write_text(
         "$ python3 -m smoke.cli step_one\n"
         "all checks pass\n"
@@ -418,7 +419,7 @@ def test_command_stream_entries_returns_none_when_no_artefacts(home: Path) -> No
 
 def test_legacy_researcher_run_emits_subcmd_and_logs(home: Path) -> None:
     """Legacy researcher run → `$` + reconstructed note + ONE gate entry with
-    an ``exit 1`` muted line, two smoke-log entries from `_smoke_cmd_W5-91.log`,
+    an ``exit 1`` muted line, two command-log entries from `_static_cmd_W5-91.log`,
     and the verifier-cycle-gate.log itself (kickoff fix #1 + #2).
     """
     run_dir = _seed_run(home)
@@ -430,8 +431,8 @@ def test_legacy_researcher_run_emits_subcmd_and_logs(home: Path) -> None:
         "gate_cmd_output_tail": "all checks passed\nrefuted by verifier",
         "gate_cmd_exit": 1,
     }))
-    # Two `$ <cmd>` blocks (researcher smoke shape).
-    (run_dir / "_smoke_cmd_W5-91.log").write_text(
+    # Two `$ <cmd>` blocks (researcher smoke shape), named for this verifier.
+    (run_dir / "_static_cmd_W5-91.log").write_text(
         "$ python3 -m smoke.cli step_one\n"
         "step one output\n"
         "[rc=0]\n"
@@ -499,12 +500,14 @@ def test_legacy_gate_cmd_missing_falls_back_to_sentinel() -> None:
 def test_rollback_execute_log_keeps_built_in_prefix_lines(home: Path) -> None:
     """execute.log with ``[ok] rollback complete`` / ``[fail] rollback`` keeps both."""
     run_dir = _seed_run(home)
+    # execute.log indents its lines with two spaces (the real shape).
     (run_dir / "execute.log").write_text(
-        f"[rollback] discard_worktree: {run_dir}\n"
-        f"[ok] rollback complete\n"
-        f"[rollback] node_id=rollback_node\n"
-        f"[fail] rollback — nothing to roll back\n"
-        f"[info] rollback\n"
+        f"  [rollback] discard_worktree: {run_dir}\n"
+        f"  [ok] rollback complete\n"
+        f"  [rollback] node_id=rollback_node\n"
+        f"  [fail] rollback — nothing to roll back\n"
+        f"  [info] rollback\n"
+        f"  [route] policy=workflow_default node=reviewer lane=opus\n"
     )
     (run_dir / "rolled-back.json").write_text(json.dumps({"ok": False}))
     out = build_node(home, RUN, "rollback_node", view="stream")
@@ -515,6 +518,7 @@ def test_rollback_execute_log_keeps_built_in_prefix_lines(home: Path) -> None:
     assert "[ok] rollback complete" in line_texts
     assert "[fail] rollback" in line_texts
     assert "[info] rollback" in line_texts
+    assert "node=reviewer" not in line_texts
 
 
 def test_offset_poll_returns_nothing_new(home: Path) -> None:
@@ -548,6 +552,9 @@ def test_offset_poll_returns_nothing_new(home: Path) -> None:
     assert second["ok"] is True
     assert second["entries"] == [], second["entries"]
     assert int(second["offset"]) == next_offset
+    # The pill describes the whole stream, not the (empty) slice.
+    assert (second["status"], second["status_c"]) == (first["status"], first["status_c"])
+    assert first["status"] == "finished · command"
 
 
 def test_pill_red_when_rc_zero_but_pass_false(home: Path) -> None:
@@ -618,25 +625,43 @@ def test_no_duplicate_log_when_record_output_path_matches(home: Path) -> None:
     assert len(log_entries) == 0, [e.get("arg") for e in log_entries]
 
 
-def test_reconstructed_path_uses_recipe_dir(home: Path) -> None:
-    """Legacy reconstruction uses ``python3 <recipe_dir>/<basename>``, not the
-    relative ``target.prompt`` (kickoff fix #7). The recipe lives at the
-    engine's ``recipes/demo-recipe``, so ``python3 recipes/demo-recipe/verifiers/static-check.py``
-    is the rendered command.
-    """
+def test_reconstructed_path_keeps_the_verifier_ref_subdirectory(home: Path) -> None:
+    """``node.prompt`` is ``<recipe dir>/<verifier_ref>``: the reconstructed
+    command runs ``<recipe dir path>/verifiers/static-check.py``."""
     run_dir = _seed_run(home)
-    from mini_ork.ide_pages.run import _load
-    run_obj = _load(home, RUN)
-    assert run_obj is not None
-    static_check = next(n for n in run_obj.nodes
-                        if n.id == "static_check_verifier")
-    # Patch the node's prompt so the reconstructor uses the demo recipe.
-    object.__setattr__(static_check, "prompt", "demo-recipe/verifiers/static-check.py")
-    (run_dir / "verifier_static-check.json").write_text(
-        json.dumps({"pass": True}),
-    )
-    out = build_node(home, RUN, "static_check_verifier", view="stream")
-    entries = out["entries"]
-    first = entries[0]
-    assert "static-check.py" in (first.get("arg") or "")
-    assert "demo-recipe" in (first.get("arg") or "")
+    (run_dir / "verifier_static-check.json").write_text(json.dumps({"pass": True}))
+    node = Node(id="static_check_verifier", type="verifier",
+                prompt="demo-recipe/verifiers/static-check.py")
+    entries, _offset, _src = _command_stream_entries(run_dir, node, None, None, home=home)
+    expected = home / "recipes" / "demo-recipe" / "verifiers" / "static-check.py"
+    assert entries[0]["arg"].endswith(f"python3 {expected}"), entries[0]["arg"]
+
+
+def test_a_verifier_with_only_its_own_logs_still_shows_them(home: Path) -> None:
+    """No JSON, no record, only ``verifier-<stem>.log`` + ``evidence/<stem>-*.log``
+    (the researcher scope_guard shape): command + note + both logs."""
+    run_dir = _seed_run(home)
+    (run_dir / "verifier-static-check.log").write_text("step W5-91: 7 changed path(s)\nscope_clean\n")
+    (run_dir / "evidence").mkdir(exist_ok=True)
+    (run_dir / "evidence" / "static-check-1791-1-ab.log").write_text("scope_clean\n")
+    node = Node(id="static_check_verifier", type="verifier",
+                prompt="demo-recipe/verifiers/static-check.py")
+    entries, total, _src = _command_stream_entries(run_dir, node, None, None, home=home)
+    heads = [e["head"] for e in entries]
+    assert heads == ["$", "reconstructed", "log", "log"], heads
+    assert total == 4
+    assert any("scope_clean" in ln["t"] for ln in entries[2]["lines"])
+
+
+def test_smoke_command_logs_belong_to_the_smoke_verifier_only(home: Path) -> None:
+    run_dir = _seed_run(home)
+    (run_dir / "_smoke_cmd_W5-91.log").write_text("$ python3 smoke.py w5_91\nok\n[rc=0]\n")
+    (run_dir / "verifier_static-check.json").write_text(json.dumps({"pass": True}))
+    gate = Node(id="static_check_verifier", type="verifier",
+                prompt="demo-recipe/verifiers/static-check.py")
+    entries, _o, _s = _command_stream_entries(run_dir, gate, None, None, home=home)
+    assert not any("smoke.py" in (e.get("arg") or "") for e in entries)
+    (run_dir / "verifier_live-smoke.json").write_text(json.dumps({"pass": False, "status": "UNVERIFIED"}))
+    smoke = Node(id="live_smoke", type="verifier", prompt="demo-recipe/verifiers/live-smoke.py")
+    entries, _o, _s = _command_stream_entries(run_dir, smoke, None, None, home=home)
+    assert any("smoke.py w5_91" in (e.get("arg") or "") for e in entries)
