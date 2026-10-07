@@ -307,6 +307,11 @@ def test_learned_block_collects_sources_for_steering(db, monkeypatch):
     # entry for the duration of the test.
     monkeypatch.setitem(sys.modules, "mini_ork.steering.operator_steering",
                         _FakeSteering)
+    # ``from pkg import sub`` reads the package ATTRIBUTE before sys.modules:
+    # once any earlier test imported the real submodule (test_context_assembler
+    # does), the attribute wins and the fake above is bypassed. Patch both.
+    import mini_ork.steering as _steering_pkg
+    monkeypatch.setattr(_steering_pkg, "operator_steering", _FakeSteering, raising=False)
 
     sources: list[dict] = []
     block = execute._learned_block(
