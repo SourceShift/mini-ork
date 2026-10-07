@@ -1,0 +1,362 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "mini-ork.metrics.sdd/v1",
+  "title": "mini-ork metrics sdd --json",
+  "type": "object",
+  "required": [
+    "schema",
+    "db",
+    "runs",
+    "crashed",
+    "verify",
+    "reviewer",
+    "per_recipe",
+    "run_dirs"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "const": "mini-ork.metrics.sdd/v1"
+    },
+    "db": {
+      "type": "string"
+    },
+    "runs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "total",
+        "published",
+        "publish_rate",
+        "non_terminal",
+        "cost_usd",
+        "unpublished_cost_usd",
+        "unpublished_cost_share",
+        "cost_per_published"
+      ],
+      "properties": {
+        "total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "published": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "publish_rate": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "non_terminal": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cost_usd": {
+          "type": "number"
+        },
+        "unpublished_cost_usd": {
+          "type": "number"
+        },
+        "unpublished_cost_share": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "cost_per_published": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      }
+    },
+    "crashed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runs",
+        "cost_usd"
+      ],
+      "properties": {
+        "runs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cost_usd": {
+          "type": "number"
+        }
+      }
+    },
+    "verify": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "traces",
+        "vacuous",
+        "vacuous_rate",
+        "monthly",
+        "passed_run_failed",
+        "published_with_vacuous"
+      ],
+      "properties": {
+        "traces": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "vacuous": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "vacuous_rate": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "monthly": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "month",
+              "traces",
+              "vacuous",
+              "vacuous_rate"
+            ],
+            "properties": {
+              "month": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "traces": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "vacuous": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "vacuous_rate": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              }
+            }
+          }
+        },
+        "passed_run_failed": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "runs",
+            "by_recipe"
+          ],
+          "properties": {
+            "runs": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "by_recipe": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        },
+        "published_with_vacuous": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "runs",
+            "by_recipe"
+          ],
+          "properties": {
+            "runs": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "by_recipe": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    "reviewer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "traces",
+        "failures",
+        "failure_rate"
+      ],
+      "properties": {
+        "traces": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failures": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failure_rate": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      }
+    },
+    "per_recipe": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "recipe",
+          "runs",
+          "published",
+          "publish_rate",
+          "cost_usd",
+          "unpublished_cost_share",
+          "cost_per_published"
+        ],
+        "properties": {
+          "recipe": {
+            "type": "string"
+          },
+          "runs": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "published": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "publish_rate": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "cost_usd": {
+            "type": "number"
+          },
+          "unpublished_cost_share": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "cost_per_published": {
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        }
+      }
+    },
+    "run_dirs": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "source",
+            "dirs",
+            "plan_failure",
+            "plan_failure_rate",
+            "run_profiles",
+            "needs_answers",
+            "needs_answers_rate",
+            "review_diffs",
+            "empty_diffs",
+            "empty_diff_rate",
+            "implementer_summaries",
+            "implemented_zero_files",
+            "implemented_zero_files_rate"
+          ],
+          "properties": {
+            "source": {
+              "type": "string",
+              "pattern": "^(live|frozen):"
+            },
+            "dirs": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "plan_failure": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "plan_failure_rate": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "run_profiles": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "needs_answers": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "needs_answers_rate": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "review_diffs": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "empty_diffs": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "empty_diff_rate": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "implementer_summaries": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "implemented_zero_files": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "implemented_zero_files_rate": {
+              "type": [
+                "number",
+                "null"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}
