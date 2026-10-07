@@ -20,7 +20,7 @@ from mini_ork.ide_pages import build_page
 from mini_ork.ide_pages.node import (
     _call_for_node, _fetch_steer_rows, _node_tokens, build_node,
 )
-from mini_ork.ide_pages.run import _epoch, _load
+from mini_ork.ide_pages.run import _load
 from mini_ork.stores import migrate as mig
 
 REPO = Path(__file__).resolve().parents[2]
