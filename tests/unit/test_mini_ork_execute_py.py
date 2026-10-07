@@ -1383,6 +1383,11 @@ edges:
     run_dir.mkdir()
     plan = run_dir / "plan.json"
     plan.write_text(json.dumps({"objective": "o", "task_class": "artifact_test"}))
+    # A real schema: execute.set_status now raises when the status write cannot
+    # be made (K0.5a), and an empty auto-created state.db has no task_runs.
+    from mini_ork.stores import migrate as mig
+    rc, _out, err = mig.init_db(db=str(tmp_path / "state.db"), root=str(REPO))
+    assert rc == 0, err
     calls: list[str] = []
 
     def failing_producer(_task_class, lane, _prompt):

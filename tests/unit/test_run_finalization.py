@@ -72,6 +72,47 @@ def test_publisher_status_write_that_lands_does_not_raise(home: Path) -> None:
     assert _row(home, "run-ok")["status"] == "published"
 
 
+def test_execute_set_status_raises_when_the_db_stays_locked(home: Path, monkeypatch) -> None:
+    from mini_ork.cli import execute as ex
+
+    _seed(home, "run-locked")
+    real_connect = ex.sqlite3.connect
+
+    class Locked:
+        def __init__(self, *a, **kw): self._c = real_connect(*a, **kw)
+        def execute(self, sql, *args):
+            if sql.lstrip().upper().startswith("UPDATE"):
+                raise ex.sqlite3.OperationalError("database is locked")
+            return self._c.execute(sql, *args)
+        def commit(self): self._c.commit()
+        def close(self): self._c.close()
+
+    monkeypatch.setattr(ex.sqlite3, "connect", Locked)
+    monkeypatch.setattr(ex.time, "sleep", lambda s: None)
+    with pytest.raises(RuntimeError, match="could not be written: database is locked"):
+        ex.set_status(str(home / "state.db"), "run-locked", "failed")
+
+
+def test_execute_set_status_fails_fast_on_a_non_transient_error(tmp_path: Path, monkeypatch) -> None:
+    from mini_ork.cli import execute as ex
+
+    db = tmp_path / "empty.db"
+    sqlite3.connect(db).close()  # no task_runs table
+    slept: list[float] = []
+    monkeypatch.setattr(ex.time, "sleep", slept.append)
+    with pytest.raises(RuntimeError, match="no such table"):
+        ex.set_status(str(db), "run-x", "executing")
+    assert slept == []  # a missing table does not heal by waiting
+
+
+def test_execute_set_status_still_writes_normally(home: Path) -> None:
+    from mini_ork.cli import execute as ex
+
+    _seed(home, "run-fine")
+    ex.set_status(str(home / "state.db"), "run-fine", "failed")
+    assert _row(home, "run-fine")["status"] == "failed"
+
+
 # ── AC2 ─────────────────────────────────────────────────────────────────────
 
 def test_lifecycle_teardown_publishes_a_passed_run_with_no_publish_step(home: Path) -> None:

@@ -1195,8 +1195,13 @@ def _post_run_learning(db, run_dir, run_id, task_class="", fail_count=None):
 # ── per-node live-path support helpers (deterministic; increment 4) ──
 
 def set_status(db, run_id, new_status, *, dry_run=False):
-    """Verbatim port of _d021_set_status: retrying task_runs status write;
-    terminal states stamp ended_at + duration_ms."""
+    """Retrying task_runs status write; terminal states stamp ended_at + duration_ms.
+
+    Raises ``RuntimeError`` when the write cannot be made: after the retries for
+    a locked/busy DB, at once for anything else (a missing table does not heal
+    by waiting). It used to print ``[warn]`` and return, and a terminal status
+    that never landed left the run reading as in flight forever (K0 root cause
+    #1, zero-fallback)."""
     if dry_run or not db or not run_id or not os.path.isfile(db):
         return
     terminal = {"published", "rolled_back", "failed"}
@@ -1225,9 +1230,12 @@ def set_status(db, run_id, new_status, *, dry_run=False):
                 con.close()
         except sqlite3.OperationalError as e:
             last_err = e
+            msg = str(e).lower()
+            if "locked" not in msg and "busy" not in msg:
+                break  # not transient — retrying cannot help
             time.sleep(0.5 * (attempt + 1))
     if last_err is not None:
-        sys.stderr.write(f"[warn] set_status({new_status}) failed after retries: {last_err}\n")
+        raise RuntimeError(f"set_status({new_status!r}) for {run_id} could not be written: {last_err}") from last_err
 
 
 def charge_node_cost(db, run_id, cost_file="", *, dry_run=False, root=None):
