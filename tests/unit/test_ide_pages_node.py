@@ -1357,3 +1357,70 @@ def test_output_view_markdown_block_for_lens_md(home: Path) -> None:
     assert Path(md["path"]).is_file()
     # ``block`` is preserved.
     assert "block" in out and out["block"]
+
+
+# ── ide-node-changes-r2 (kickoff §8 + §9) — fail-before / pass-after evidence ──
+
+
+def test_prompt_view_with_no_transcript_reads_prompt_file(home: Path) -> None:
+    """Fix #8: a node with no transcript gets ``markdown.text`` equal to the
+    prompt file's contents (the recipe's ``prompts/<ref>``).
+
+    Without the fix the prompt view returned the recipe ref (``node.prompt``)
+    as a placeholder string, not the file contents.
+    """
+    _seed(home)
+    run_dir = home / "runs" / RUN
+    # Drop the only session transcript so ``_prompt_view`` sees no user message.
+    (run_dir / "sessions").mkdir(exist_ok=True)
+    for s in (run_dir / "sessions").glob("*.jsonl"):
+        s.unlink()
+    # Drop the live.jsonl cost-state envelope so rule 1 of the resolver
+    # also returns nothing.
+    live_path = run_dir / f"agent-{AGENT_NODE}.live.jsonl"
+    if live_path.exists():
+        live_path.unlink()
+
+    # Seed a recipe prompt the fixture can resolve.
+    recipe_prompt = home / "recipes" / "demo-recipe" / "prompts" / "implementer.md"
+    recipe_prompt.parent.mkdir(parents=True, exist_ok=True)
+    recipe_prompt.write_text("Implement the prompt-file test.\n\nWith details.\n")
+
+    out = build_node(home, RUN, AGENT_NODE, view="prompt")
+    md = out.get("markdown")
+    assert md is not None, out
+    # The markdown text is the file contents (not the recipe ref).
+    assert md["text"].startswith("Implement the prompt-file test.")
+    assert "With details." in md["text"]
+
+
+def test_stream_user_entry_lines_trimmed_to_legacy_cap(home: Path) -> None:
+    """Fix #9: ``lines`` keeps the legacy cap (USER_HEAD_CAP = 400 / TEXT_CAP
+    = 4_000); only ``arg`` (+ ``md: true``) carries the full text.
+
+    Without the fix the user entry's ``lines[0]["t"]`` was the full
+    USER_FULL_CAP (200 KB) text, not the legacy 400-char snippet.
+    """
+    _seed(home)
+    run_dir = home / "runs" / RUN
+    session_path = run_dir / "sessions" / f"{SESSION_UUID}.jsonl"
+    big_prompt = "x" * 10_000
+    text = session_path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    lines[0] = json.dumps({"type": "user", "timestamp": _iso(T0 + 10),
+                           "message": {"content": big_prompt}})
+    session_path.write_text("\n".join(lines) + "\n")
+
+    out = build_node(home, RUN, AGENT_NODE, view="stream")
+    user = next(e for e in out["entries"] if e["k"] == "user")
+    # ``arg`` carries the full text (kickoff §2 full-length docs).
+    assert user["arg"] == big_prompt
+    assert user.get("md") is True
+    # ``lines`` is trimmed to the LEGACY cap (USER_HEAD_CAP = 400), not the
+    # full USER_FULL_CAP (200_000).
+    from mini_ork.ide_pages.node import USER_HEAD_CAP, USER_FULL_CAP
+    line_text = user["lines"][0]["t"]
+    assert len(line_text) <= USER_HEAD_CAP, (
+        f"lines[0]['t'] should be capped to USER_HEAD_CAP={USER_HEAD_CAP}, "
+        f"got length {len(line_text)} (USER_FULL_CAP={USER_FULL_CAP})")
+    assert len(line_text) < USER_FULL_CAP

@@ -56,11 +56,6 @@ TOOL_RESULT_LINES = 12
 TOOL_INPUT_SUMMARY_CAP = 160
 SHELL_LOG_LINES = 40
 LINE_CHARS = 220
-# Kickoff §2 (full-length docs): user/text entries return the whole text up
-# to ``USER_FULL_CAP`` chars with ``md: true`` so the IDE panel renders
-# markdown instead of a 400/4_000 char snippet. The legacy ``USER_HEAD_CAP``
-# / ``TEXT_CAP`` stay in place — the kinds-order tests pin the kinds list,
-# not the snippet length, and other callers still want the trimmed cap.
 
 # Stream entry kinds in display order. The "kind" keys are the kickoff's
 # verbatim shape — the IDE panel maps them onto draw routines.
@@ -845,7 +840,7 @@ def _session_entries(session_path: Path) -> list[dict[str, Any]]:
                         "k": _KIND_USER,
                         "head": "",
                         "arg": text[:USER_FULL_CAP],
-                        "lines": [{"t": text[:USER_FULL_CAP], "c": "body"}],
+                        "lines": [{"t": text[:USER_HEAD_CAP], "c": "body"}],
                         "md": True,
                         "_src": "tx",
                         "_line": line_idx,
@@ -903,7 +898,7 @@ def _session_entries(session_path: Path) -> list[dict[str, Any]]:
                         "k": _KIND_TEXT,
                         "head": "",
                         "arg": text,
-                        "lines": [{"t": text, "c": "body"}],
+                        "lines": [{"t": text[:TEXT_CAP], "c": "body"}],
                         "md": True,
                         "_src": "tx",
                         "_line": line_idx,
@@ -1350,8 +1345,18 @@ def _prompt_view(node: Node, session_path: Path | None,
                     full_text = str(b.get("text") or "")
                     break
             break
-    if not full_text and node.prompt:
-        full_text = node.prompt
+    if not full_text:
+        # Fix #8: when no transcript prompt was captured, read the prompt
+        # file ``_resolve_prompt_file`` finds and use its contents.
+        # Fall back to the recipe ref only when no file resolves.
+        prompt_path = _resolve_prompt_file(node, recipe_dir)
+        if prompt_path:
+            try:
+                full_text = Path(prompt_path).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                full_text = ""
+        if not full_text and node.prompt:
+            full_text = node.prompt
     if full_text:
         for ln in full_text.splitlines():
             block.append({"t": ln[:LINE_CHARS], "c": "body"})

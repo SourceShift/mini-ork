@@ -186,6 +186,25 @@ def _seed(home: Path, *, repo: Path, base_sha: str) -> Path:
         )
     )
     log_path.write_text("[verifier] running\n[ok] verifier pass\n")
+    # Fix #2 — recipe verifier stem-based artefacts. ``node.prompt`` ends
+    # in ``verifiers/test.py`` → stem ``test``. The reader tries the stem
+    # first, then the node id.
+    (run_dir / "verifier_test.json").write_text(
+        json.dumps(
+            {
+                "verifier": "test",
+                "pass": True,
+                "checks": [
+                    {"name": "lint", "rc": 0, "log": "verifier_verifier_node.log"},
+                    {"name": "compile", "rc": 0, "log": "verifier_verifier_node.log"},
+                ],
+            }
+        )
+    )
+    (run_dir / "evidence").mkdir(exist_ok=True)
+    (run_dir / "evidence" / "test.log").write_text(
+        "[lint] running\n[lint] ok\n[compile] running\n[compile] ok\n"
+    )
 
     # Review JSON: needs_revision + 2 findings with file:line.
     (run_dir / "review-reviewer.json").write_text(
@@ -258,14 +277,24 @@ def test_changes_view_verifier_has_checks_with_log_paths(home: Path) -> None:
     _seed(home, repo=repo, base_sha=base_sha)
     out = build_node(home, RUN, "verifier_node", view="changes")
     items = out["result"]["items"]
-    # First item is the pass verdict row (with the log path in `sub` or acts).
-    first = items[0]
-    assert str(first.get("t") or "").startswith("pass")
-    blob = json.dumps(items)
-    assert "verifier_verifier_node.log" in blob
-    # The verifier's OK button points at the log file.
-    acts_blob = json.dumps([a for it in items for a in (it.get("acts") or [])])
-    assert "verifier_verifier_node.log" in acts_blob
+    # Fix #2 contract: per-check rows (no leading verdict row). Each check
+    # has ``t`` = check name, ``sub`` = "rc <n> · <log name>" and
+    # ``path`` = the absolute log path.
+    cids = [str(it.get("t") or "") for it in items]
+    assert "lint" in cids
+    assert "compile" in cids
+    # Each item's ``path`` points at an existing log file (either the
+    # run-dir log or ``evidence/<stem>*.log``).
+    paths_blob = json.dumps([it.get("path") for it in items])
+    assert "verifier_verifier_node.log" in paths_blob or "evidence/test.log" in paths_blob
+    for it in items:
+        if it.get("path"):
+            assert Path(it["path"]).is_file(), it["path"]
+        # ``sub`` carries "rc <n>" + the log name.
+        sub = it.get("sub") or ""
+        assert "rc 0" in sub, sub
+    # No leading verdict row.
+    assert not str(items[0].get("t") or "").startswith("pass")
 
 
 def test_changes_view_reviewer_verdict_first_then_findings_with_paths(home: Path) -> None:
@@ -354,3 +383,210 @@ def test_changes_view_no_workspace_records_commits_note(home: Path) -> None:
     out = build_node(home, RUN, "publisher", view="changes")
     assert out["commits"] == []
     assert "No commits" in out["commits_note"]
+
+
+# ── kickoff r2 (ide-node-changes-r2) — fail-before / pass-after evidence ──
+
+
+def test_changes_view_planner_with_start_none_gets_no_diff(home: Path) -> None:
+    """Fix #1: a planner with ``start=None`` returns no diff even when a
+    later code-changing node has one.
+
+    The kickoff's `_show_diff_for` switches to a workflow-order index
+    check; the planner (always index 0) is ``False`` and the implementer
+    (later index) is ``True``. This fails on ``4ff6a5fe`` (the old
+    start-time heuristic returned ``True`` defensively when either side
+    was missing) and passes once the index check lands.
+
+    Fixture: planner has no ``node_start`` event in the events table; the
+    loader leaves ``node.start = None``. With the OLD code the missing
+    start trips the defensive ``else`` branch (``return True``) and the
+    planner gets the implementer's diff.
+    """
+    repo, base_sha = _seed_git_repo(home.absolute().parent)
+    _seed(home, repo=repo, base_sha=base_sha)
+    # Delete the planner's node_start event so its loader-resolved
+    # ``start`` is ``None``.
+    con = sqlite3.connect(home / "state.db")
+    con.execute(
+        "DELETE FROM run_events WHERE run_id = ? AND event_type = 'node_start' "
+        "AND json_extract(payload_json, '$.node_id') = 'planner'",
+        (RUN,))
+    con.commit(); con.close()
+
+    # Wipe the in-process fleet cache so ``fleet.run_card`` rebuilds from
+    # the cleared events table.
+    from mini_ork.acp import fleet as _fleet
+    cache = getattr(_fleet, "_RUN_CARD_CACHE", None)
+    if isinstance(cache, dict):
+        cache.clear()
+
+    # Sanity: the loaded planner has no start time.
+    from mini_ork.ide_pages.run import _load as _load_run
+    run_obj = _load_run(home, RUN)
+    assert run_obj is not None, "loader returned None"
+    planner = next(n for n in run_obj.nodes if n.id == "planner")
+    assert planner.start is None, (
+        f"loader did not honour missing node_start; got {planner.start}")
+
+    planner_out = build_node(home, RUN, "planner", view="changes")
+    assert planner_out["files"] == [], planner_out["files"]
+    assert "No code changed" in planner_out["diff_note"], planner_out["diff_note"]
+
+    impl_out = build_node(home, RUN, "implementer", view="changes")
+    assert len(impl_out["files"]) == 2, impl_out["files"]
+
+
+def test_changes_view_lens_node_reads_report(home: Path) -> None:
+    """Fix #3: a ``researcher`` node whose id ends in ``_lens`` is treated
+    as a review node, and its ``lens-code_impact.md`` is read via
+    ``Node._report_paths`` (lazy-imported, strips ``_lens``).
+
+    Before the fix, the lens researcher fell through to ``_other_node_items``
+    (filename match only) and missed the ``lens-<id>.md`` content.
+    """
+    repo, base_sha = _seed_git_repo(home.absolute().parent)
+    _seed(home, repo=repo, base_sha=base_sha)
+    run_dir = home / "runs" / RUN
+    # Lens researcher node: id ``code_impact_lens``, type ``researcher``.
+    con = sqlite3.connect(home / "state.db")
+    for kind, ts in (("node_start", T0 + 5), ("node_end", T0 + 12)):
+        payload = {"node_id": "code_impact_lens", "node_type": "researcher",
+                   "model_lane": "minimax_lens"}
+        if kind == "node_end":
+            payload["finish_reason"] = "done"
+        con.execute(
+            "INSERT INTO run_events (event_id, run_id, event_type, payload_json, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (f"ev-cil-{kind}", RUN, kind, json.dumps(payload), ts))
+    con.commit(); con.close()
+    # Lens report — must be ``lens-code_impact.md`` (not ``lens-code_impact_lens.md``).
+    (run_dir / "lens-code_impact.md").write_text(
+        "# Code impact\n\n## Findings\n\n- finding A\n- finding B\n"
+    )
+
+    out = build_node(home, RUN, "code_impact_lens", view="changes")
+    items = out["result"]["items"]
+    # Heading rows surface from ``_items_from_markdown``.
+    titles = [str(it.get("t") or "") for it in items]
+    assert any("Code impact" in t for t in titles), items
+    # The lens researcher has NO ``review-<id>.json``, so the kickoff's
+    # logic must read the markdown — not fall through to "No review
+    # artefacts found".
+    assert not any("No review artefacts" in (it.get("t") or "") for it in items), items
+
+
+def test_changes_view_patch_only_returns_patch_text_and_counts(home: Path) -> None:
+    """Fix #4: when only ``framework-edit.diff`` (or ``review-diff.patch``)
+    is present (no acp diffs, no workspace git), the view shows the
+    patch text and per-file ``+``/``-`` counts from the hunks.
+
+    The existing ``_parse_unified_diff_into_entries`` returned only the
+    file paths and skipped line counts; the new parser stores them so
+    ``files[*].added``/``.removed`` reflect the hunks.
+    """
+    repo, base_sha = _seed_git_repo(home.absolute().parent)
+    _seed(home, repo=repo, base_sha=base_sha)
+    run_dir = home / "runs" / RUN
+    # Remove acp-diffs.json and the workspace record so only the patch
+    # file remains.
+    (run_dir / "acp-diffs.json").unlink()
+    # Write a small patch with known ``+``/``-`` line counts.
+    patch_text = (
+        "diff --git a/foo.py b/foo.py\n"
+        "index 0000..1111 100644\n"
+        "--- a/foo.py\n"
+        "+++ b/foo.py\n"
+        "@@ -0,0 +1,3 @@\n"
+        "+line one\n"
+        "+line two\n"
+        "+line three\n"
+        "@@ -1,1 +1,0 @@\n"
+        "-old line\n"
+    )
+    (run_dir / "framework-edit.diff").write_text(patch_text)
+
+    out = build_node(home, RUN, "implementer", view="changes")
+    files = out["files"]
+    assert len(files) == 1, files
+    f = files[0]
+    assert f["path"].endswith("foo.py"), f
+    assert f["added"] == 3, f
+    assert f["removed"] == 1, f
+    # The diff text is the patch itself (capped), not a re-derived
+    # ``unified_diff`` from empty old/new text.
+    assert "+line one" in out["diff"]
+    assert "-old line" in out["diff"]
+    assert out["diff_note"] == "" or "capped" in out["diff_note"]
+
+
+def test_changes_view_cached_or_computed_called_once(home: Path) -> None:
+    """Fix #5: ``cached_or_computed`` is invoked once per
+    ``build_changes_view`` (the changes view threads the entries through).
+
+    Before the fix, both ``_files_and_note`` and ``_diff_text`` called it
+    independently, so a single build dropped two cache reads.
+    """
+    repo, base_sha = _seed_git_repo(home.absolute().parent)
+    _seed(home, repo=repo, base_sha=base_sha)
+    from mini_ork.acp import diffs as _diffs
+
+    original = _diffs.cached_or_computed
+    calls = {"n": 0}
+
+    def spy(run_dir):
+        calls["n"] += 1
+        return original(run_dir)
+
+    _diffs.cached_or_computed = spy
+    try:
+        out = build_node(home, RUN, "implementer", view="changes")
+        assert out["ok"] is True
+        assert calls["n"] == 1, (
+            f"expected 1 cached_or_computed call per build, got {calls['n']}")
+    finally:
+        _diffs.cached_or_computed = original
+
+
+def test_changes_view_finding_path_resolves_against_project_root(home: Path,
+                                                                 monkeypatch: pytest.MonkeyPatch,
+                                                                 tmp_path: Path) -> None:
+    """Fix #6: reviewer finding with a repo-relative ``file`` resolves to
+    an absolute path against the project root, not the process cwd.
+
+    The kickoff's note: ``Path(file_path).is_file()`` against process
+    cwd was the bug; ``_resolve_finding_path`` now joins with the
+    project root and (when present) the workspace path.
+    """
+    repo, base_sha = _seed_git_repo(home.absolute().parent)
+    _seed(home, repo=repo, base_sha=base_sha)
+    run_dir = home / "runs" / RUN
+    # Inject a finding with a REPO-RELATIVE path (``wt/a.py`` — exists
+    # in the seeded worktree, NOT in the test runner's cwd).
+    (run_dir / "review-reviewer.json").write_text(json.dumps({
+        "verdict": "needs_revision",
+        "notes": [
+            {"title": "issue one",
+             "file": "wt/a.py",
+             "line": 1,
+             "severity": "high"},
+        ],
+    }))
+
+    # Run from a different cwd so a stale ``Path(...).is_file()`` against
+    # cwd would have been False.
+    other = tmp_path / "elsewhere"
+    other.mkdir(parents=True, exist_ok=True)
+    monkeypatch.chdir(other)
+
+    out = build_node(home, RUN, "reviewer", view="changes")
+    items = out["result"]["items"]
+    # The finding row carries ``path`` and an Open act pointing at the
+    # absolute file (the project-root-joined ``wt/a.py``).
+    finding = next((it for it in items if "issue one" in (it.get("t") or "")), None)
+    assert finding is not None, items
+    assert finding.get("path"), finding
+    assert Path(finding["path"]).is_file(), finding["path"]
+    # The Open act is the absolute path.
+    acts_blob = json.dumps(finding.get("acts") or [])
+    assert finding["path"] in acts_blob

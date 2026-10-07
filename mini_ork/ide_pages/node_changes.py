@@ -24,9 +24,9 @@ Reuses (not re-derives):
   record (``base_sha`` / ``branch`` / ``path``).
 
 Layering note: this page module imports its sibling
-:mod:`mini_ork.ide_pages.run` (``Run``, ``Node``) only. ``_project_file``
-is duplicated from :mod:`mini_ork.cli.board_cmd` to avoid inverting the
-CLI → pages import direction that the kickoff's "files in scope" forbids.
+:mod:`mini_ork.ide_pages.run` (``Run``, ``Node``) only. File-changed-file
+resolution is delegated to ``board_cmd._project_file`` via a lazy import
+inside the helper to keep the CLI → pages import direction intact.
 """
 
 from __future__ import annotations
@@ -80,17 +80,19 @@ def build_changes_view(run: Run, node: Node) -> dict[str, Any]:
     Shape::
 
         {"result": {"title": str, "items": [spec item]},
-         "files": [{path, added, removed, abs}],
+         "files": [{path, added, removed, abs, path}],
          "diff": <unified diff text, capped>,
          "diff_note": str,
          "commits": [{sha, subject, when, author, files}],
          "commits_note": str}
     """
     run_dir = run.run_dir
-    title, items = _result_items(run_dir, node)
+    # Fix #5: load diffs once per build, thread the entries through.
+    diff_entries, diff_source = _load_diffs(run_dir)
+    title, items = _result_items(run, node)
     show_diff = _show_diff_for(run, node)
-    files, files_note = _files_and_note(run_dir, run, show_diff)
-    diff, cap_note = _diff_text(run_dir, files) if show_diff else ("", "")
+    files, files_note = _files_and_note(run, show_diff, diff_entries, diff_source)
+    diff, cap_note = _diff_text(run_dir, files, diff_entries) if show_diff else ("", "")
     diff_note = " ".join(n for n in (files_note, cap_note) if n)
     commits, commits_note = _commits(run)
     return {
@@ -106,18 +108,31 @@ def build_changes_view(run: Run, node: Node) -> dict[str, Any]:
 # ── per-node-type result items ─────────────────────────────────────────────
 
 
-def _result_items(run_dir: Path, node: Node) -> tuple[str, list[dict[str, Any]]]:
+def _is_review_node(node: Node) -> bool:
+    """Fix #3: lens / review coalition rule mirrored from ``run.py:614``.
+
+    Treat a node as a review node when its type is in the review set OR
+    its id contains ``lens`` or ``review`` (the recipe's lens convention).
+    """
+    ntype = str(node.type or "")
+    if ntype in ("reviewer", "eval", "judge", "lens", "synthesizer"):
+        return True
+    nid = str(node.id or "")
+    return "lens" in nid or "review" in nid
+
+
+def _result_items(run: Run, node: Node) -> tuple[str, list[dict[str, Any]]]:
     """Project the node's result artefacts onto ``(title, items)``."""
     ntype = str(node.type or "")
     if ntype in ("planner", "decomposer"):
-        return _planner_items(run_dir)
-    if ntype in ("reviewer", "eval", "judge", "lens", "synthesizer"):
-        return _review_items(run_dir, node)
+        return _planner_items(run.run_dir)
+    if _is_review_node(node):
+        return _review_items(run, node)
     if ntype in ("verifier", "test", "typecheck", "static_check"):
-        return _verifier_items(run_dir, node)
+        return _verifier_items(run.run_dir, node)
     if ntype == "rollback":
-        return _rollback_items(run_dir)
-    return _other_node_items(run_dir, node)
+        return _rollback_items(run.run_dir)
+    return _other_node_items(run.run_dir, node)
 
 
 def _planner_items(run_dir: Path) -> tuple[str, list[dict[str, Any]]]:
@@ -149,10 +164,16 @@ def _planner_items(run_dir: Path) -> tuple[str, list[dict[str, Any]]]:
     return ("Planner plan", items)
 
 
-def _review_items(run_dir: Path, node: Node) -> tuple[str, list[dict[str, Any]]]:
-    """Reviewer / lens / synthesizer / eval / judge: verdict first, then findings."""
+def _review_items(run: Run, node: Node) -> tuple[str, list[dict[str, Any]]]:
+    """Reviewer / lens / synthesizer / eval / judge: verdict first, then findings.
+
+    Fix #3: lens / review resolution reuses ``Node._report_paths`` (lazy import,
+    strips ``_lens`` → ``lens-code_impact.md``). The ``review-<id>.json``
+    fallback remains for legacy runs.
+    """
     items: list[dict[str, Any]] = []
     verdict_text, verdict_color = "", "sub"
+    run_dir = run.run_dir
 
     # 1. Whole-run verdict (verdict.json), then per-node review JSON.
     verdict = _read_json(run_dir / "verdict.json")
@@ -169,15 +190,34 @@ def _review_items(run_dir: Path, node: Node) -> tuple[str, list[dict[str, Any]]]
             verdict_text, verdict_color = rv, _VERDICT_COLOUR.get(rv, "sub")
         notes = review.get("notes") or review.get("findings") or []
         if isinstance(notes, list):
-            items.extend(_finding_item(n) for n in notes if n)
+            items.extend(_finding_item(n, run) for n in notes if n)
 
-    # 2. Markdown fallback (only when the review JSON had no notes). The
-    # first existing markdown in the kickoff-named priority order wins.
+    # 2. Markdown fallback (only when the review JSON had no notes). Fix
+    # #3: prefer ``Node._report_paths(run_dir, node.id)`` (lazy import),
+    # which strips ``_lens`` and walks ``lens-<stripped>.md`` →
+    # ``lens-<id>.md`` → ``<stripped>.md`` → ``<id>.md``.
     if not items:
-        for md_path in (run_dir / f"lens-{node.id}.md", run_dir / "synthesis.md", run_dir / f"{node.id}.md"):
+        try:
+            from mini_ork.ide_pages.node import _report_paths
+
+            report_candidates = _report_paths(run_dir, node.id)
+        except Exception:  # noqa: BLE001 — a missing helper must not break the view
+            report_candidates = []
+        # Drop ``review-<id>.json`` / ``verifier_<id>.json`` (those are JSON
+        # paths the helper lists but the markdown fallback consumes only
+        # ``*.md`` files).
+        for md_path in report_candidates:
+            if md_path.suffix != ".md":
+                continue
             if md_path.is_file():
                 items = _items_from_markdown(md_path)
                 break
+        if not items:
+            for md_path in (run_dir / f"lens-{node.id}.md", run_dir / "synthesis.md",
+                            run_dir / f"{node.id}.md"):
+                if md_path.is_file():
+                    items = _items_from_markdown(md_path)
+                    break
 
     if not verdict_text and not items:
         items.append(S.dot("No review artefacts found"))
@@ -189,49 +229,134 @@ def _review_items(run_dir: Path, node: Node) -> tuple[str, list[dict[str, Any]]]
 
 
 def _verifier_items(run_dir: Path, node: Node) -> tuple[str, list[dict[str, Any]]]:
+    """Fix #2: read verifier artefacts by stem (from ``node.prompt``), then node id.
+
+    Stem = ``Path(node.prompt).stem`` when ``node.prompt`` ends in ``.py``;
+    otherwise fall back to ``node.id``. Read, in order:
+
+    * ``verifier_<stem>.json`` — its ``checks`` array (recipe verifier shape).
+    * ``verifier-<stem>.checks.tsv`` — recipe verifier tab-separated rows.
+    * ``evidence/<stem>*.log`` — first matching evidence log for ``path``.
+
+    Each check item: ``t`` = check name, ``sub`` = ``rc <n> · <log name>``,
+    ``path`` = absolute log path when it exists, colour by pass/fail.
+    """
     items: list[dict[str, Any]] = []
     title = f"Verifier · {node.id}"
 
-    # Recipe verifier: TSV (verifier-<x>.checks.tsv). Executor verifier:
-    # JSON with pass/post_rc/error_summary/evidence_path. The dash/underscore
-    # naming differs by hand, so both readers exist side-by-side.
-    tsv_path = run_dir / f"verifier-{node.id}.checks.tsv"
-    if tsv_path.is_file():
-        items = _items_from_checks_tsv(tsv_path)
+    stem = _verifier_stem(node)
+    candidates = [stem, node.id]
 
-    vjson = _read_json(run_dir / f"verifier_{node.id}.json")
-    if isinstance(vjson, dict):
-        passed = bool(vjson.get("pass"))
-        post_rc = vjson.get("post_rc")
-        ev_path = str(vjson.get("evidence_path") or "")
-        err_summary = str(vjson.get("error_summary") or "")
-        sub_bits: list[str] = []
-        if post_rc not in (None, ""):
-            sub_bits.append(f"rc={post_rc}")
-        if err_summary:
-            sub_bits.append(err_summary[:160])
-        if ev_path:
-            sub_bits.append(ev_path)
-        sub = " · ".join(sub_bits)
-        log_path = _first_existing_log(run_dir, node.id)
-        acts = [S.btn("Open log", S.open_path(str(log_path)), "ghost")] if log_path else []
-        verdict_row = S.ok("pass", sub, acts) if passed else S.bad("fail", sub, acts)
-        # Verdict row first so the reader sees pass/fail at a glance.
-        items = [verdict_row] + items
+    # 1. JSON with ``checks`` array (recipe verifier shape).
+    for candidate in candidates:
+        vjson = _read_json(run_dir / f"verifier_{candidate}.json")
+        if isinstance(vjson, dict):
+            checks = vjson.get("checks") or []
+            if isinstance(checks, list) and checks:
+                for chk in checks:
+                    if not isinstance(chk, dict):
+                        continue
+                    items.append(_check_item(chk, run_dir))
+                if items:
+                    break
 
-    # Tail of the verifier log for context (always, when a log exists).
-    for log_name in (f"verifier_{node.id}.log", f"evidence/{node.id}.log", f"verifier-{node.id}.log"):
-        log_path = run_dir / log_name
-        if not log_path.is_file():
-            continue
-        tail = _read_tail(log_path, 12)
-        for ln in tail:
-            items.append(S.item(ln[:200], log_name, m="›", mc="muted"))
-        break
+    # 2. TSV fallback (recipe verifier when JSON was not written).
+    if not items:
+        for candidate in candidates:
+            tsv_path = run_dir / f"verifier-{candidate}.checks.tsv"
+            if tsv_path.is_file():
+                items = _items_from_checks_tsv_with_log(tsv_path, run_dir)
+                if items:
+                    break
 
     if not items:
         items.append(S.dot("No verifier artefacts found"))
     return (title, items)
+
+
+def _verifier_stem(node: Node) -> str:
+    """Stem from ``node.prompt`` (``verifiers/<x>.py`` → ``<x>``), else node id.
+
+    The recipe writes ``node.prompt = "<recipe_dir.name>/<prompt_ref|verifier_ref>"``;
+    for verifier nodes the relevant tail is the verifier_ref basename without
+    ``.py``. When ``node.prompt`` doesn't end in ``.py`` (e.g. a legacy
+    prompt_ref), fall back to ``node.id`` so the legacy fixture still
+    resolves.
+    """
+    prompt = str(node.prompt or "")
+    if prompt.endswith(".py"):
+        tail = prompt.rsplit("/", 1)[-1]
+        return Path(tail).stem
+    return node.id
+
+
+def _check_item(chk: dict[str, Any], run_dir: Path) -> dict[str, Any]:
+    """One recipe-verifier check → spec item with ``t`` / ``sub`` / ``path``."""
+    name = str(chk.get("name") or chk.get("cid") or chk.get("id") or "")
+    rc = chk.get("rc", "")
+    log_name = str(chk.get("log") or chk.get("log_name") or "")
+    passed = bool(chk.get("pass"))
+    sub_bits: list[str] = []
+    if rc != "" and rc is not None:
+        sub_bits.append(f"rc {rc}")
+    if log_name:
+        sub_bits.append(log_name)
+    sub = " · ".join(sub_bits)
+    abs_log_path = ""
+    if log_name:
+        candidate = run_dir / log_name
+        if candidate.is_file():
+            abs_log_path = str(candidate)
+        else:
+            # Try evidence/<stem>*.log pattern when the check records a
+            # generic log name (e.g. "verifier-static-check.log").
+            stem = Path(log_name).stem
+            matches = sorted((run_dir / "evidence").glob(f"{stem}*.log")) if (run_dir / "evidence").is_dir() else []
+            if matches:
+                abs_log_path = str(matches[0])
+    acts: list[dict[str, Any]] = []
+    if abs_log_path:
+        acts.append(S.btn("Open log", S.open_path(abs_log_path), "ghost"))
+    mark = "✓" if not passed else "✓"  # placeholder; replaced below
+    mark, mc = ("✓", "green") if passed else ("✗", "red")
+    out = S.item(name, sub, m=mark, mc=mc, acts=acts)
+    out["path"] = abs_log_path
+    out["passed"] = passed
+    return out
+
+
+def _items_from_checks_tsv_with_log(tsv_path: Path, run_dir: Path) -> list[dict[str, Any]]:
+    """Recipe verifier TSV → items with log-path resolution.
+
+    Each row is ``cid\\tdesc\\tpassed``; no per-row log path is recorded,
+    so ``path`` falls back to the first ``evidence/<stem>*.log`` for the
+    TSV's stem (``verifier-<stem>.checks.tsv`` → ``<stem>``).
+    """
+    items: list[dict[str, Any]] = []
+    try:
+        text = tsv_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return [S.bad("could not read checks.tsv")]
+    stem = tsv_path.name.removeprefix("verifier-").removesuffix(".checks.tsv")
+    abs_log = ""
+    if (run_dir / "evidence").is_dir():
+        matches = sorted((run_dir / "evidence").glob(f"{stem}*.log"))
+        if matches:
+            abs_log = str(matches[0])
+    acts: list[dict[str, Any]] = []
+    if abs_log:
+        acts.append(S.btn("Open log", S.open_path(abs_log), "ghost"))
+    for raw in text.splitlines():
+        parts = raw.split("\t")
+        if len(parts) < 3:
+            continue
+        cid, desc, passed = parts[0], parts[1], parts[2].strip().lower() == "true"
+        mark, mc = ("✓", "green") if passed else ("✗", "red")
+        item = S.item(f"{cid} · {desc}", "", m=mark, mc=mc, acts=list(acts))
+        item["path"] = abs_log
+        item["passed"] = passed
+        items.append(item)
+    return items
 
 
 def _rollback_items(run_dir: Path) -> tuple[str, list[dict[str, Any]]]:
@@ -284,8 +409,14 @@ def _other_node_items(run_dir: Path, node: Node) -> tuple[str, list[dict[str, An
 # ── review helpers ──────────────────────────────────────────────────────────
 
 
-def _finding_item(note: Any) -> dict[str, Any]:
-    """One review finding → spec item with severity mark + ``file:line`` + open."""
+def _finding_item(note: Any, run: Run | None = None) -> dict[str, Any]:
+    """One review finding → spec item with severity mark + ``file:line`` + open.
+
+    Fix #6: resolve relative ``file_path`` against the project root, then
+    the run's workspace path when it has one. Set ``item["path"]`` to the
+    absolute path when the file exists, and keep the Open act pointing at
+    it. Never resolve against the process cwd.
+    """
     if not isinstance(note, dict):
         return S.item(str(note), "")
     text = str(note.get("title") or note.get("text") or note.get("note") or "")
@@ -307,31 +438,53 @@ def _finding_item(note: Any) -> dict[str, Any]:
         m, mc = "•", "sub"
     else:
         m, mc = "•", "sub"
+    abs_path = _resolve_finding_path(file_path, run)
     acts: list[dict[str, Any]] = []
-    if file_path and Path(file_path).is_file():
-        acts.append(S.btn("Open", S.open_path(file_path), "ghost"))
-    return S.item(text, sub, m=m, mc=mc, acts=acts)
+    if abs_path:
+        acts.append(S.btn("Open", S.open_path(abs_path), "ghost"))
+    out = S.item(text, sub, m=m, mc=mc, acts=acts)
+    if abs_path:
+        out["path"] = abs_path
+    return out
+
+
+def _resolve_finding_path(file_path: str, run: Run | None) -> str:
+    """Project-rooted resolution (Fix #6).
+
+    A reviewer captures paths against the worktree at run time; the IDE
+    view runs in a different cwd (process cwd, often the operator's
+    shell) and must not consult ``Path(file_path).is_file()`` against
+    cwd. Resolution order:
+
+    1. ``Path(file_path)`` absolute and existing → return as-is.
+    2. Try ``run.home.absolute().parent / file_path`` (project root).
+    3. Try ``run.workspace.path / file_path`` (workspace record).
+    4. Otherwise ``""`` (no open action; finding stays in the list).
+    """
+    if not file_path:
+        return ""
+    p = Path(file_path)
+    if p.is_absolute() and p.is_file():
+        return str(p)
+    if run is None:
+        return ""
+    project = run.home.absolute().parent
+    candidate = project / file_path
+    if candidate.is_file():
+        return str(candidate)
+    ws = run.workspace
+    if ws is not None:
+        ws_path = getattr(ws, "path", None)
+        if ws_path:
+            candidate = Path(ws_path) / file_path
+            if candidate.is_file():
+                return str(candidate)
+    return ""
 
 
 def _verdict_item(verdict: str, color: str) -> dict[str, Any]:
     mark = {"green": "✓", "yellow": "!", "red": "✗", "sub": "•"}.get(color, "•")
     return S.item(verdict, m=mark, mc=color)
-
-
-def _items_from_checks_tsv(tsv_path: Path) -> list[dict[str, Any]]:
-    """Recipe verifier TSV → items. Each row is ``cid\\tdesc\\tpassed``."""
-    items: list[dict[str, Any]] = []
-    try:
-        text = tsv_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return [S.bad("could not read checks.tsv")]
-    for raw in text.splitlines():
-        parts = raw.split("\t")
-        if len(parts) < 3:
-            continue
-        cid, desc, passed = parts[0], parts[1], parts[2].strip().lower() == "true"
-        items.append(S.ok(f"{cid} · {desc}", "") if passed else S.bad(f"{cid} · {desc}", ""))
-    return items
 
 
 def _items_from_markdown(md_path: Path) -> list[dict[str, Any]]:
@@ -356,47 +509,51 @@ def _items_from_markdown(md_path: Path) -> list[dict[str, Any]]:
 
 
 def _show_diff_for(run: Run, node: Node) -> bool:
-    """``True`` when the node itself is a code-changing node, or when an
-    earlier-starting code-changing node already ran.
+    """Fix #1: workflow-order index check.
 
-    The DAG-column layout collapses every node into one column when the
-    workflow declares no ``depends_on`` edges (the test fixture does this),
-    so a DAG-position check would treat every node as "stage 0". A
-    start-time check distinguishes "the planner ran before the
-    implementer" correctly in that layout.
+    A node shows the diff only if a code-changing node sits at or before it
+    in ``run.nodes``. The previous start-time heuristic returned ``True``
+    defensively when either side was missing, hiding the bug where a
+    planner with ``start=None`` was treated as running before every other
+    node. With the index check the planner (always index 0 in the DAG) is
+    ``False`` and the implementer (later index) is ``True`` even when
+    start times are missing.
     """
-    self_start = node.start
-    for n in run.nodes:
-        if n.type not in _CODE_CHANGING_TYPES:
-            continue
-        if n.id == node.id:
-            return True  # this node is itself a code-changing node
-        if self_start is not None and n.start is not None:
-            if n.start <= self_start:
-                return True
-        else:
-            # No start info on one side → assume the code-changing node ran
-            # first (defensive default: prefer showing the diff over missing
-            # it on a row with partial lifecycle data).
+    nodes_list = list(run.nodes)
+    try:
+        node_idx = next(i for i, n in enumerate(nodes_list) if n.id == node.id)
+    except StopIteration:
+        return False
+    for n in nodes_list[: node_idx + 1]:
+        if str(n.type or "") in _CODE_CHANGING_TYPES:
             return True
     return False
 
 
-def _files_and_note(run_dir: Path, run: Run, show_diff: bool) -> tuple[list[dict[str, Any]], str]:
-    """Run-cumulative files list with abs paths + ``diff_note`` for empty state."""
+def _files_and_note(run: Run, show_diff: bool,
+                    diff_entries: list[dict[str, Any]],
+                    diff_source: str) -> tuple[list[dict[str, Any]], str]:
+    """Run-cumulative files list with abs paths + ``diff_note`` for empty state.
+
+    Fix #5: ``diff_entries`` and ``diff_source`` come from
+    ``build_changes_view``'s single ``_load_diffs`` call, not a fresh one
+    here.
+    """
     if not show_diff:
         return [], "No code changed by this point."
-    diffs = _load_diffs(run_dir)
-    if not diffs:
+    if not diff_entries:
         return [], "No code changes recorded for this run."
     project = run.home.absolute().parent
     files: list[dict[str, Any]] = []
-    for d in diffs:
+    for d in diff_entries:
         path = str(d.get("path") or "")
+        added = int(d.get("added") or 0)
+        removed = int(d.get("removed") or 0)
         old_text = str(d.get("old_text") or "")
         new_text = str(d.get("new_text") or "")
-        added, removed = _line_diff_counts(old_text, new_text)
-        display, absolute = _resolve_project_file(path, project)
+        if diff_source != "patch" and (old_text or new_text) and not (added or removed):
+            added, removed = _line_diff_counts(old_text, new_text)
+        display, absolute = _project_file_lazy(path, project)
         files.append(
             {
                 "path": display,
@@ -423,9 +580,25 @@ def _line_diff_counts(old_text: str, new_text: str) -> tuple[int, int]:
     return added, removed
 
 
-def _load_diffs(run_dir: Path) -> list[dict[str, Any]]:
-    """Prefer ``acp-diffs.json``; fall back to ``framework-edit.diff`` /
-    ``review-diff.patch`` (unified diffs parsed for path only), else empty."""
+# Fix #4 — patch-file fallback returns the patch text and per-file +/-
+# counts from the patch's hunks (excluding ``+++``/``---`` headers). Prefer
+# ``review-diff.patch``, then ``framework-edit.diff``. When neither a patch
+# nor acp diffs exist but the run has a workspace branch, fall back to
+# ``git -C <project> diff <base>..<branch>`` (timeout 5 s).
+def _load_diffs(run_dir: Path) -> tuple[list[dict[str, Any]], str]:
+    """Single source-of-truth loader for the changes view.
+
+    * ``"acp"`` — entries from ``cached_or_computed(acp-diffs.json)``.
+    * ``"patch"`` — entries parsed from ``review-diff.patch`` (preferred)
+      or ``framework-edit.diff`` (fallback). ``old_text`` / ``new_text``
+      are empty (patch format is not invertible), but ``added`` /
+      ``removed`` are the ``+`` / ``-`` line counts from each file's
+      hunks (excluding ``+++`` / ``---`` headers), so ``files[]`` shows
+      the right counts and ``diff`` is the patch text itself.
+    * ``"git"`` — entries computed via ``git diff`` on the workspace
+      branch (5 s timeout).
+    * ``""`` — empty list with no source.
+    """
     try:
         from mini_ork.acp import diffs as _diffs
 
@@ -433,59 +606,119 @@ def _load_diffs(run_dir: Path) -> list[dict[str, Any]]:
     except Exception:  # noqa: BLE001 — a broken diff cache must not blank the view
         entries = []
     if entries:
-        return entries
-    for rel in ("framework-edit.diff", "review-diff.patch"):
+        return entries, "acp"
+    for rel in ("review-diff.patch", "framework-edit.diff"):
         path = run_dir / rel
         if path.is_file():
             try:
                 text = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            return _parse_unified_diff_into_entries(text)
-    return []
+            return _parse_patch_into_entries(text), "patch"
+    git_entries = _git_diff_fallback(run_dir)
+    if git_entries:
+        return git_entries, "git"
+    return [], ""
 
 
-def _parse_unified_diff_into_entries(text: str) -> list[dict[str, Any]]:
-    """Rough unified-diff → ``[{path, old_text, new_text}]`` for the fallback path.
+def _git_diff_fallback(run_dir: Path) -> list[dict[str, Any]]:
+    """``git -C <ws_path> diff <base>..<branch>`` with a 5 s timeout.
 
-    Only the file path is recovered; old/new text is empty because the patch
-    format is not invertible without git. Good enough for the ``files[]`` list
-    when the executor left only the patch file.
+    Used when neither an ``acp-diffs.json`` cache nor a patch file is
+    present but the run's workspace record names a base and branch. The
+    diff is parsed via the same patch parser so per-file ``+``/``-``
+    counts survive. Empty list when the workspace record is missing, the
+    subprocess fails, or it times out.
+    """
+    worktrees_dir = run_dir.parent / "worktrees"
+    if not worktrees_dir.is_dir():
+        return []
+    candidates = sorted(worktrees_dir.glob("*.json"))
+    if not candidates:
+        return []
+    try:
+        data = json.loads(candidates[0].read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    ws_path = data.get("path")
+    branch = str(data.get("branch") or "")
+    base = str(data.get("base_sha") or "")
+    if not ws_path or not branch or not base:
+        return []
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(ws_path), "diff", f"{base}..{branch}"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if proc.returncode != 0 or not proc.stdout:
+        return []
+    return _parse_patch_into_entries(proc.stdout)
+
+
+def _parse_patch_into_entries(text: str) -> list[dict[str, Any]]:
+    """Unified-diff → ``[{path, added, removed, old_text, new_text}]``.
+
+    ``old_text`` / ``new_text`` are empty because the patch format is
+    not invertible without git. ``added`` / ``removed`` are the ``+`` /
+    ``-`` line counts in each file's hunks (excluding the ``+++`` /
+    ``---`` headers that the unified-diff format uses to label files).
     """
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
+    current: dict[str, Any] | None = None
     for line in text.splitlines():
-        if line.startswith("+++ ") or line.startswith("--- "):
+        if line.startswith("diff --git "):
+            parts = line.split(" b/", 1)
+            if len(parts) != 2:
+                current = None
+                continue
+            path = parts[1].strip()
+            if path in seen:
+                current = None
+                continue
+            seen.add(path)
+            current = {"path": path, "old_text": "", "new_text": "",
+                       "added": 0, "removed": 0}
+            out.append(current)
             continue
-        if not line.startswith("diff --git "):
+        if current is None:
             continue
-        parts = line.split(" b/", 1)
-        if len(parts) != 2:
+        if line.startswith("+++ ") or line.startswith("--- ") or line.startswith("@@"):
             continue
-        path = parts[1].strip()
-        if path in seen:
-            continue
-        seen.add(path)
-        out.append({"path": path, "old_text": "", "new_text": ""})
+        if line.startswith("+"):
+            current["added"] += 1
+        elif line.startswith("-"):
+            current["removed"] += 1
     return out
 
 
-def _diff_text(run_dir: Path, files: list[dict[str, Any]]) -> tuple[str, str]:
-    """Unified-diff text for the run + a cap note (kickoff §1).
+def _diff_text(run_dir: Path, files: list[dict[str, Any]],
+               diff_entries: list[dict[str, Any]]) -> tuple[str, str]:
+    """Unified-diff text for the run + a cap note.
 
-        Returns ``(text, note)``. ``note`` is non-empty only when the cap fires,
-        e.g. ``"Diff capped at 300 KB."`` — the IDE prints it next to a "show
-    diff" toggle so a cap is enough to spot without re-loading the whole file.
+    Fix #5: ``diff_entries`` is the single loader's result. Fix #4: when
+    the source is a patch file, return the patch text itself (capped) —
+    not a re-derived ``unified_diff`` from empty ``old_text`` /
+    ``new_text``.
     """
     if not files:
         return "", ""
-    diffs, _ = _safe_cached(run_dir)
     chunks: list[str] = []
-    for d in diffs or []:
-        path = str(d.get("path") or "")
+    for d in diff_entries:
         old = str(d.get("old_text") or "").splitlines(keepends=True)
         new = str(d.get("new_text") or "").splitlines(keepends=True)
-        chunks.extend(difflib.unified_diff(old, new, fromfile=f"a/{path}", tofile=f"b/{path}"))
+        if old or new:
+            path = str(d.get("path") or "")
+            chunks.extend(difflib.unified_diff(
+                old, new, fromfile=f"a/{path}", tofile=f"b/{path}"))
+    if not chunks:
+        # Patch-only entries — fall back to reading the run's patch file
+        # directly so the IDE shows the real diff text (capped).
+        chunks.append(_read_patch_text(run_dir))
     text = "".join(chunks)
     if len(text) > DIFF_TEXT_CAP:
         text = text[:DIFF_TEXT_CAP]
@@ -493,13 +726,29 @@ def _diff_text(run_dir: Path, files: list[dict[str, Any]]) -> tuple[str, str]:
     return text, ""
 
 
-def _safe_cached(run_dir: Path) -> tuple[list[dict[str, Any]], bool]:
-    try:
-        from mini_ork.acp import diffs as _diffs
+def _read_patch_text(run_dir: Path) -> str:
+    """Concatenate ``review-diff.patch`` then ``framework-edit.diff`` (whichever exists)."""
+    chunks: list[str] = []
+    for rel in ("review-diff.patch", "framework-edit.diff"):
+        path = run_dir / rel
+        if path.is_file():
+            try:
+                chunks.append(path.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                continue
+    return "".join(chunks)
 
-        return _diffs.cached_or_computed(run_dir)
-    except Exception:  # noqa: BLE001
-        return [], False
+
+def _project_file_lazy(path: str, project: Path) -> tuple[str, str | None]:
+    """Fix #7: lazy import of ``board_cmd._project_file``.
+
+    The import is inside the function so this module does not need a
+    top-level ``from mini_ork.cli.board_cmd import ...`` (mirrors the
+    pattern at ``run.py:732``).
+    """
+    from mini_ork.cli.board_cmd import _project_file
+
+    return _project_file(path, project)
 
 
 # ── commits (kickoff §1) ─────────────────────────────────────────────────────
@@ -605,49 +854,12 @@ def _parse_commits(output: str) -> list[dict[str, Any]]:
 # ── shared helpers ──────────────────────────────────────────────────────────
 
 
-def _resolve_project_file(path: str, project: Path) -> tuple[str, str | None]:
-    """``(display path, existing absolute path or None)`` for a changed file.
-
-    Mirrors :func:`mini_ork.cli.board_cmd._project_file`. A delivered run's
-    worktree is gone, so its recorded path is mapped onto the project: the
-    longest tail of the path that exists in the project wins.
-    """
-    p = Path(path)
-    if p.is_file():
-        try:
-            return str(p.relative_to(project)), str(p)
-        except ValueError:
-            pass
-    parts = p.parts
-    for start in range(1, len(parts)):
-        candidate = project.joinpath(*parts[start:])
-        if candidate.is_file():
-            return str(Path(*parts[start:])), str(candidate)
-    return p.name, None
-
-
 def _read_json(path: Path) -> dict[str, Any] | None:
     try:
         data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
     except (OSError, json.JSONDecodeError):
         return None
     return data if isinstance(data, dict) else None
-
-
-def _read_tail(path: Path, n: int) -> list[str]:
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return []
-    return text.splitlines()[-n:]
-
-
-def _first_existing_log(run_dir: Path, node_id: str) -> Path | None:
-    for tpl in ("verifier_{node}.log", "evidence/{node}.log", "verifier-{node}.log"):
-        path = run_dir / tpl.format(node=node_id)
-        if path.is_file():
-            return path
-    return None
 
 
 def _human(n: int) -> str:
