@@ -319,9 +319,9 @@ def test_build_artifacts_view_via_build_node(home: Path) -> None:
     out = build_node(home, RUN, "implementer", view="artifacts")
     assert out["ok"] is True
     assert out["view"] == "artifacts"
-    assert "artifacts" in out and "inputs" in out["artifacts"] and "outputs" in out["artifacts"]
-    in_names = {a["name"] for a in out["artifacts"]["inputs"]}
-    out_names = {a["name"] for a in out["artifacts"]["outputs"]}
+    assert "inputs" in out and "outputs" in out
+    in_names = {a["name"] for a in out["inputs"]}
+    out_names = {a["name"] for a in out["outputs"]}
     assert "plan.json" in in_names
     assert "implementer-summary.json" in out_names
 
@@ -508,3 +508,29 @@ def test_write_tool_paths_filtered_to_run_dir(home: Path, tmp_path: Path) -> Non
     out_paths = {a["path"] for a in out_view["outputs"]}
     assert str(inside.resolve()) in out_paths
     assert str(repo_path.resolve()) not in out_paths
+
+# ── Opus review fixes (finished directly) ──────────────────────────────────
+
+
+def test_a_planner_is_not_given_the_plan_it_writes(home: Path) -> None:
+    _seed_run(home)
+    out = build_node(home, RUN, "planner", view="artifacts")
+    assert "plan.json" not in {a["name"] for a in out["inputs"]}, out["inputs"]
+
+
+def test_files_a_prompt_names_but_the_node_writes_are_outputs_not_inputs(
+        home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import mini_ork.ide_pages.node_artifacts as na
+
+    run_dir = _seed_run(home)
+    (run_dir / "implementer-summary.json").write_text("{}")
+    (run_dir / "lens-notes.md").write_text("# notes\n")
+    monkeypatch.setattr(
+        na, "_rendered_prompt",
+        lambda run, node: "Read lens-notes.md, then write implementer-summary.json.",
+    )
+    out = build_node(home, RUN, "implementer", view="artifacts")
+    inputs = {a["name"] for a in out["inputs"]}
+    outputs = {a["name"] for a in out["outputs"]}
+    assert "lens-notes.md" in inputs
+    assert "implementer-summary.json" not in inputs and "implementer-summary.json" in outputs

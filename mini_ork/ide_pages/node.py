@@ -3347,7 +3347,7 @@ def build_node(home: Path, run_id: str, node_id: str, view: str | None = None,
         base.update(_overview_view(run_obj, target, session_path, run_dir))
     elif view == "artifacts":
         from mini_ork.ide_pages.node_artifacts import build_artifacts_view  # lazy: breaks import cycle
-        base["artifacts"] = build_artifacts_view(run_obj, target)
+        base.update(build_artifacts_view(run_obj, target))  # {"inputs": [...], "outputs": [...]}
     return base
 
 

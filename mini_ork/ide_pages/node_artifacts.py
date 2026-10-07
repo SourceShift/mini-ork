@@ -121,7 +121,7 @@ def _outputs_for(run: Run, node: Node) -> list[dict[str, Any]]:
     for path in _write_paths_for(run, node):
         candidates.append((path, nid))
 
-    return _dedup_artifacts(candidates)
+    return _dedup_artifacts(candidates, run.run_dir)
 
 
 # ── inputs ─────────────────────────────────────────────────────────────────
@@ -159,6 +159,8 @@ def _inputs_for(run: Run, node: Node) -> list[dict[str, Any]]:
         if kickoff:
             candidates.append((Path(kickoff), "run"))
         for name in _RUN_LEVEL_FALLBACKS:
+            if name == "plan.json" and str(node.type or "") in ("planner", "decomposer"):
+                continue  # the planner WRITES the plan; it is not given it
             candidates.append((run_dir / name, "run"))
 
     # Prompt-named files always included (reviewer special-case + generic scan).
@@ -167,32 +169,52 @@ def _inputs_for(run: Run, node: Node) -> list[dict[str, Any]]:
         candidates.append((run_dir / "review-diff.patch", "run"))
     prompt_text = _rendered_prompt(run, node)
     if prompt_text:
+        # A prompt also names what the node must WRITE; those are outputs.
+        own = {str(p.resolve()) for p, _ in _resolved_outputs_paths(run, node)}
+        own |= {str(p.resolve()) for p in _write_paths_for(run, node)}
+        # …and a file first written after the node finished cannot have been
+        # given to it (e.g. the run's verdict.json named in an implementer prompt).
+        ended = float(node.end) if node.end is not None else None
         for path in _paths_named_in_text(prompt_text, run_dir):
+            if str(path.resolve()) in own:
+                continue
+            try:
+                if ended is not None and path.stat().st_mtime > ended + 5:
+                    continue
+            except OSError:
+                continue
             candidates.append((path, "run"))
 
-    return _dedup_artifacts(candidates)
+    return _dedup_artifacts(candidates, run.run_dir)
 
 
 # ── shared artifact helpers ────────────────────────────────────────────────
 
 
-def _dedup_artifacts(candidates: list[tuple[Path, str]]) -> list[dict[str, Any]]:
+def _dedup_artifacts(candidates: list[tuple[Path, str]], run_dir: Path | None = None) -> list[dict[str, Any]]:
     """Resolve candidates to existing files, dedupe by absolute path, build dicts."""
     seen: set[str] = set()
     out: list[dict[str, Any]] = []
     for path, from_ in candidates:
         if not path.is_file():
             continue
-        key = str(path.resolve()) if path.exists() else str(path)
+        key = str(path.resolve())
         if key in seen:
             continue
         seen.add(key)
-        out.append(_artifact_dict(path, from_=from_))
+        out.append(_artifact_dict(path, from_=from_, run_dir=run_dir))
     return out
 
 
-def _artifact_dict(path: Path, *, from_: str) -> dict[str, Any]:
+def _artifact_dict(path: Path, *, from_: str, run_dir: Path | None = None) -> dict[str, Any]:
+    # Relative to the run dir, so evidence/… and node-cmd/… twins of a file
+    # name stay distinguishable.
     name = path.name
+    if run_dir is not None:
+        try:
+            name = str(path.resolve().relative_to(Path(run_dir).resolve()))
+        except ValueError:
+            name = path.name
     try:
         size = path.stat().st_size
     except OSError:
