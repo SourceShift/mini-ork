@@ -40,24 +40,14 @@ import json
 import os
 import re
 import shlex
-import signal
-import subprocess
 import sys
 import tempfile
-import time
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 
 DEFAULT_PROBE_TIMEOUT_S = 120.0
 OUTPUT_TAIL_CHARS = 2000
-_REAP_TIMEOUT_S = 5.0
-_VACUOUS_PROBES = frozenset({"", "true", ":", "exit", "exit 0", "/bin/true", "/usr/bin/true"})
-_EXIT_ONLY_RE = re.compile(
-    r"^(?:exit(?:[ _-]?(?:code|status))?|rc|return[ _-]?code)\s*(?:=|==|:|is)?\s*0\.?$", re.I)
-# A string no honest probe prints: an expect that matches both it and the
-# empty string is satisfied by any output.
-_VACUITY_SENTINEL = "\x00sdd-vacuity-sentinel\x00"
 
 
 class Malformed(Exception):
@@ -291,111 +281,40 @@ def deliverables_for(card: dict, acceptance_id: str) -> list[str]:
 # ── probes ────────────────────────────────────────────────────────────────
 
 
-def _kill_group(pgid: int) -> None:
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.killpg(pgid, signal.SIGKILL)
+def probe_validity():
+    """The core probe rules (``mini_ork.verify.probe_validity``), imported from
+    the engine root like :func:`specdir_module`. The pass definition, vacuity
+    checks and probe runner live there now so every recipe shares them (I1)."""
+    root = str(engine_root())
+    if sys.path[:1] != [root]:
+        sys.path.insert(0, root)
+    return importlib.import_module("mini_ork.verify.probe_validity")
 
 
 def run_cmd(argv: list[str], *, timeout: float, env: dict | None = None,
             cwd: str | os.PathLike[str] | None = None) -> dict:
-    """Run ``argv`` in its own process group with captured output.
-
-    Returns ``{exit_code, timed_out, duration_s, output, error}``; on timeout
-    the group is SIGKILLed and ``exit_code`` is None.
-    """
-    start = time.monotonic()
-    try:
-        proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                start_new_session=True)
-    except OSError as exc:
-        return {"exit_code": None, "timed_out": False, "duration_s": 0.0, "output": "",
-                "error": f"spawn failed: {exc}"}
-    timed_out = False
-    try:
-        out, _ = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        _kill_group(proc.pid)
-        try:
-            out, _ = proc.communicate(timeout=_REAP_TIMEOUT_S)
-        except subprocess.TimeoutExpired:
-            # A descendant escaped the group and still holds the pipe.
-            proc.kill()
-            if proc.stdout:
-                proc.stdout.close()
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.wait(timeout=_REAP_TIMEOUT_S)
-            out = b""
-    return {
-        "exit_code": None if timed_out else proc.returncode,
-        "timed_out": timed_out,
-        "duration_s": round(time.monotonic() - start, 3),
-        "output": (out or b"").decode("utf-8", errors="replace"),
-        "error": None,
-    }
+    return probe_validity().run_cmd(argv, timeout=timeout, env=env, cwd=cwd)
 
 
 def run_probe(probe: str, expect: str, *, timeout: float, env: dict | None = None,
               cwd: str | os.PathLike[str] | None = None) -> dict:
-    """Run one probe and judge it with :func:`expect_matches`.
-
-    Returns ``{status: PASSED|FAILED, reason, exit_code, timed_out,
-    duration_s, output_tail}``.
-    """
-    res = run_cmd(["bash", "-c", probe], timeout=timeout, env=env, cwd=cwd)
-    output = res["output"]
-    if res["error"]:
-        status, reason = "FAILED", res["error"]
-    elif res["timed_out"]:
-        status, reason = "FAILED", "timeout"
-    elif expect_matches(expect, res["exit_code"], output):
-        status, reason = "PASSED", "exit 0 and expect satisfied"
-    elif res["exit_code"] != 0:
-        status, reason = "FAILED", f"exit {res['exit_code']}"
-    else:
-        status, reason = "FAILED", "exit 0 but output does not satisfy expect"
-    return {"status": status, "reason": reason, "exit_code": res["exit_code"],
-            "timed_out": res["timed_out"], "duration_s": res["duration_s"],
-            "output_tail": output[-OUTPUT_TAIL_CHARS:]}
+    return probe_validity().run_probe(probe, expect, timeout=timeout, env=env, cwd=cwd)
 
 
 def is_exit_only(expect: str) -> bool:
-    return bool(_EXIT_ONLY_RE.match((expect or "").strip()))
+    return probe_validity().is_exit_only(expect)
 
 
 def expect_matches(expect: str, exit_code, output: str) -> bool:
-    """The single probe pass definition: exit 0 AND ``expect`` satisfied
-    (see module docstring)."""
-    text = (expect or "").strip()
-    if exit_code != 0 or not text:
-        return False
-    if is_exit_only(text):
-        return True
-    try:
-        return re.search(text, output, re.M) is not None
-    except re.error:
-        return text in output
+    return probe_validity().expect_matches(expect, exit_code, output)
 
 
 def is_vacuous_probe(probe) -> bool:
-    if not isinstance(probe, str):
-        return True
-    norm = " ".join(probe.split())
-    while norm.endswith(";"):
-        norm = norm[:-1].rstrip()
-    return norm in _VACUOUS_PROBES
+    return probe_validity().is_vacuous_probe(probe)
 
 
 def vacuous_expect(expect) -> str | None:
-    """Why ``expect`` cannot discriminate, or None when it can."""
-    if not isinstance(expect, str) or not expect.strip():
-        return "expect is empty"
-    if is_exit_only(expect):
-        return None
-    if expect_matches(expect, 0, "") and expect_matches(expect, 0, _VACUITY_SENTINEL):
-        return "expect is satisfied by any output"
-    return None
+    return probe_validity().vacuous_expect(expect)
 
 
 def shell_template(template: str, values: dict) -> str:

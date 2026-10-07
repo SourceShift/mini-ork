@@ -233,6 +233,25 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
             set_status(db, run_id, "failed")
             return 0, "levels_unverified"
         print(f"  [ok] publisher: level gate pass (required={rep['levels_required'] or None})")
+    # ── probe validity (I1, MO_PROBE_VALIDITY=1, default OFF): a verify that
+    # proved nothing, an aliased probe, or a probe that already passes on the
+    # untouched tree cannot publish.
+    if context_env("MO_PROBE_VALIDITY", "0") == "1":
+        from mini_ork.verify import probe_validity as _pv  # noqa: PLC0415
+        roots = load_run_roots(run_dir) if run_dir else None
+        target = (roots.target if roots else "") or context_env("MO_TARGET_CWD", "")
+        plan_path = context_env("MINI_ORK_PLAN_PATH", "") or (os.path.join(run_dir, "plan.json") if run_dir else "")
+        try:
+            plan = json.load(open(plan_path, encoding="utf-8")) if plan_path else {}
+        except (OSError, ValueError):
+            plan = {}
+        ok, reason, _report = _pv.publish_gate(run_dir=run_dir, db=db, run_id=run_id, target_repo=target,
+                                               plan=plan if isinstance(plan, dict) else {})
+        if not ok:
+            print(f"  [BLOCK] probe-validity: {reason} — publish refused (probe-validity.json)")
+            _pv.record_note(db, run_id, f"probe_validity: {reason}")
+            return 1, "verdict_fail"
+        print("  [ok] probe-validity: pre-publish pass")
     # ── artifact contract
     contract = (os.path.join(_recipe_root(root), "recipes", recipe, "artifact_contract.yaml")
                 if recipe else "")

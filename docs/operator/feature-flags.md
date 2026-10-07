@@ -48,6 +48,7 @@ feature decides and the evidence it writes.
 | `MO_SUITE_ADEQUACY_MIN_SCORE` | `0.6` | Kill-rate threshold for ADEQUATE |
 | `MO_SUITE_ADEQUACY_TIMEOUT_S` | `300` | Per-run suite timeout during the audit |
 | `MO_LEVEL_VECTOR` | `"1"` | Five-level verdict vector + publisher gate (publish only when every required level is PROVEN) |
+| `MO_PROBE_VALIDITY` | `"0"` | I1 pre-publish probe-validity gate (`mini_ork/verify/probe_validity.py`): refuses a run whose verify proved nothing (no verifier node executed and passed; a 0 ms verifier never ran), whose probes are aliased across acceptance criteria, or whose probes already pass on the untouched base tree (`pre-implementer-ref`). Reason in `probe-validity.json` + task_runs notes. Default OFF until an n≥30 A/B against the K1 frozen baseline (`kickoffs/sdd-mechanisms/roadmap.md`) |
 | `MO_GATE_HACKABILITY_N` | `4` | Proposer documents per gate in `gate-fuzz --hackability` (0–16) |
 | `MO_GATE_HACKABILITY_BUDGET_USD` | `0.50` | Per-audit proposer budget |
 | `MO_GATE_HACKABILITY_MAX` | `0.25` | Promotion refuses a gate measured above this |

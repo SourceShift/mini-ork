@@ -39,6 +39,7 @@ from _sdd_common import (  # noqa: E402
     is_vacuous_probe,
     load_cards,
     probe_env,
+    probe_validity,
     probe_timeout,
     run_dir,
     run_probe,
@@ -102,6 +103,9 @@ def check_spec(rd: Path, card: dict, *, timeout: float, env: dict) -> tuple[list
     for aid in kinds:
         if seen.get(aid, 0) != 1:
             out.append(f"acceptance '{aid}' has {seen.get(aid, 0)} probes, need exactly 1")
+    pv = probe_validity()
+    if pv.enabled():  # I1 AC1, default OFF: one probe aliased across criteria proves only one
+        out.extend(pv.aliasing_violations([p for p in gates["probes"] if isinstance(p, dict)]))
     return out, rows
 
 
@@ -109,19 +113,12 @@ def _execute(row: dict, probe: dict, *, timeout: float, env: dict) -> list[str]:
     res = run_probe(probe["probe"], probe["expect"], timeout=timeout, env=env, cwd=os.getcwd())
     row.update(executed=True, exit_code=res["exit_code"], duration_s=res["duration_s"],
                output_tail=res["output_tail"])
-    precondition = "precondition" in (probe.get("tags") or [])
-    passed = res["status"] == "PASSED"
-    if precondition:
-        row["status"] = "PRECONDITION_OK" if passed else "PRECONDITION_FAILED"
-        row["reason"] = res["reason"]
-        return [] if passed else [f"precondition probe does not pass now ({res['reason']})"]
     delivered = {s.strip() for s in os.environ.get("MO_SDD_DELIVERED_SPECS", "").split(",") if s.strip()}
-    if passed and row["spec_id"] in delivered:
-        row["status"], row["reason"] = "DELIVERED_OK", "spec already delivered (MO_SDD_DELIVERED_SPECS); passing now is the expected state"
-        return []
-    row["status"] = "VACUOUS" if passed else "FAILS_TODAY"
-    row["reason"] = res["reason"] if not passed else "passes on the untouched tree"
-    return ["probe already passes on the untouched tree (vacuous)"] if passed else []
+    status, reason, violation = probe_validity().classify_base_run(
+        res["status"] == "PASSED", precondition="precondition" in (probe.get("tags") or []),
+        delivered=row["spec_id"] in delivered, run_reason=res["reason"])
+    row["status"], row["reason"] = status, reason
+    return [violation] if violation else []
 
 
 def body():
