@@ -88,6 +88,7 @@ _NATIVE_MODULE_SUBS = {
     "certify": "mini_ork.cli.certify",
     "node-agent": "mini_ork.cli.node_agent",
     "nodes": "mini_ork.cli.nodes",
+    "triage": "mini_ork.cli.triage",
 }
 
 _HELP = """mini-ork — task operating system for agents (v0.1)

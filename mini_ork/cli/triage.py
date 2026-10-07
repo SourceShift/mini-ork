@@ -75,3 +75,7 @@ def main(rest=None, root=None) -> int:
             print("  (dry-run: re-run with --promote to file and queue a fix)")
 
     return _BLAME_EXIT.get(res.blame, 3)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

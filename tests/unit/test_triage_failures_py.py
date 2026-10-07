@@ -239,3 +239,24 @@ def test_verifier_node_finds_framework_traceback_in_evidence_log(tmp_path, monke
 
     res = triage_run(RUN_ID, home=str(home), db=str(db), root=str(root), dry_run=True)
     assert res.blame == "mini_ork"
+
+
+def test_kill_switch_blocks_writes(tmp_path, monkeypatch):
+    """The ``.triage-kill`` sentinel stops filing without touching env vars.
+
+    Diagnosis still works (blame is unchanged); only the write is suppressed —
+    so an operator can silence the loop and still run ``--dry-run``.
+    """
+    home, db, root = _make_env(tmp_path, monkeypatch)
+    (home / "state").mkdir()
+    (home / "state" / ".triage-kill").write_text("", encoding="utf-8")
+
+    res = triage_run(RUN_ID, home=str(home), db=str(db), root=str(root))
+    assert res.blame == "mini_ork"
+    assert res.bug_id is None
+    assert "kill switch" in res.reason
+
+    con = sqlite3.connect(db)
+    count = con.execute("SELECT COUNT(*) FROM bug_reports").fetchone()[0]
+    con.close()
+    assert count == 0

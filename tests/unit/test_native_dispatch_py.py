@@ -36,6 +36,7 @@ def test_all_former_exec_subs_registered_natively():
         "harness-contrast", "harness-edit", "harness-audit", "hack-probe",
         "oversight", "metric-anchor", "active-eval", "certify", "node-agent",
         "nodes", "mcp-context", "zed", "specs", "automations", "board",
+        "triage",
     }
     assert expected == set(_NATIVE_MODULE_SUBS)
     for sub in expected:
@@ -49,6 +50,27 @@ def test_native_module_mapping_matches_runtime_select():
     assert _NATIVE_MODULE_SUBS["recover"] == "mini_ork.recovery.planner"
     for sub, module in _NATIVE_MODULE_SUBS.items():
         assert module.startswith("mini_ork.")
+
+
+def test_native_module_subs_are_runnable_via_python_m():
+    """Every native module sub must guard ``main()`` behind ``__main__``.
+
+    ``_native_module_handler`` dispatches as ``python -m <module>``, so a module
+    without an ``if __name__ == "__main__":`` block imports and exits 0 having
+    printed nothing — a silent no-op that looks like success. ``triage`` shipped
+    exactly that way; this guards the whole class.
+    """
+    import importlib.util
+    from pathlib import Path
+
+    for sub, module in _NATIVE_MODULE_SUBS.items():
+        spec = importlib.util.find_spec(module)
+        assert spec and spec.origin, f"{sub}: cannot locate {module}"
+        src = Path(spec.origin).read_text(encoding="utf-8")
+        assert '__name__ == "__main__"' in src or "__name__ == '__main__'" in src, (
+            f"{sub} ({module}) has no `if __name__ == \"__main__\":` entrypoint — "
+            f"`python -m {module}` would import and exit silently"
+        )
 
 
 def test_native_dispatch_uses_python_m(monkeypatch):

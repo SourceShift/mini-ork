@@ -689,6 +689,33 @@ def _apply_recovery_filter(node_ids: list[str], *, from_node: str,
     return node_ids, 0
 
 
+def _maybe_triage_failed_run(db, run_id, home, root) -> None:
+    """Attribute a failed run and queue a fix — off unless ``MO_FAILURE_TRIAGE=1``.
+
+    Best-effort by contract: triage reads ``run_events`` and may write a bug row,
+    but it must never raise into the run that just failed, so every failure here
+    is logged and swallowed. Promotion of the bug to a schedulable
+    ``framework-edit`` epic is a second, independent opt-in
+    (``MO_FAILURE_TRIAGE_PROMOTE=1``): emitting is safe, spending budget is not.
+    """
+    if not run_id or context_env("MO_FAILURE_TRIAGE", "") != "1":
+        return
+    try:
+        from mini_ork.triage.failures import triage_run
+
+        triage_run(
+            run_id,
+            home=home,
+            db=db,
+            root=root,
+            promote=context_env("MO_FAILURE_TRIAGE_PROMOTE", "") == "1",
+        )
+    except Exception:  # noqa: BLE001 — triage must never fail a run
+        sys.stderr.write(
+            f"execute: failure triage raised for {run_id}:\n{traceback.format_exc()}"
+        )
+
+
 def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     root = root or os.environ.get("MINI_ORK_ROOT") or os.getcwd()
@@ -1033,6 +1060,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         if not dry_run and run_id and context_env("MO_PLACEMENT", "").strip().lower() == "remote" \
                 and not _provision_remote_session(run_id, live_run_dir, db):
             set_status(db, run_id, "failed")
+            _maybe_triage_failed_run(db, run_id, home, root)
             return 1
         if speculative_requested:
             # The schema's historical wording promised first-winner replicas, but
@@ -1081,6 +1109,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         _post_run_learning(db, live_run_dir, run_id, task_class, fail_count=fail_count)
         if fail_count > 0:
             set_status(db, run_id, "failed")
+            _maybe_triage_failed_run(db, run_id, home, root)
             sys.stderr.write(f"execute: {fail_count} node(s) failed\n")
             return 1
         print("\nexecute: all nodes complete")

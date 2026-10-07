@@ -95,6 +95,16 @@ def resolve_root(root: str | os.PathLike[str] | None = None) -> str:
     return str(Path(__file__).resolve().parent.parent.parent)
 
 
+def _triage_kill_switch(home: str) -> bool:
+    """True when the operator has dropped ``{home}/state/.triage-kill``.
+
+    Mirrors ``.self-improve-kill``: a way to stop the loop without editing env
+    vars on every launcher. Blocks *writes* (the bug row + the fix epic), never
+    diagnosis — ``--dry-run`` still reports blame while the switch is set.
+    """
+    return os.path.exists(os.path.join(home, "state", ".triage-kill"))
+
+
 def _tail(path: Path) -> str:
     try:
         with open(path, "rb") as fh:
@@ -290,6 +300,10 @@ def triage_run(
     res.reason = f"primary failed node {primary.node_id} ({primary.finish_reason}) → {res.blame}"
 
     if dry_run or res.blame != "mini_ork":
+        return res
+
+    if _triage_kill_switch(home_s):
+        res.reason += "; kill switch set (.triage-kill) — not filing a bug"
         return res
 
     # Record the bug. Only on first sighting: ``bug_report_sweep`` re-counts
