@@ -86,14 +86,18 @@ def _default_spawn(root, prompt_file, out_dir, model, budget, scope_card) -> int
                   "Bash(git reset --hard*),Bash(git checkout main*),Bash(rm -rf*),"
                   "Bash(curl* -o*),Bash(wget*),Bash(ssh*),Bash(scp*),Agent,TaskCreate,TaskUpdate")
     prompt = open(prompt_file).read()
+    worker_cmd = ["claude", "-p", "--model", model, "--max-budget-usd", str(budget), *scope,
+                  "--add-dir", root, "--disallowedTools", disallowed,
+                  "--dangerously-skip-permissions", "--output-format", "stream-json",
+                  "--include-partial-messages", "--verbose", prompt]
+    # Agent-session isolation: run the cleaner worker with mini-ork's settings,
+    # not the operator's ~/.claude. Spliced after "-p"; the existing --model
+    # stays (so the subscription-lane alias is not duplicated).
+    from mini_ork.dispatch.providers import claude_isolation_args  # noqa: PLC0415
+    worker_cmd[2:2] = claude_isolation_args(os.environ, model, worker_cmd)
     with open(os.path.join(out_dir, "worker.log"), "wb") as lg, \
          open(os.path.join(out_dir, "worker.err"), "wb") as er:
-        rc = subprocess.run(
-            ["claude", "-p", "--model", model, "--max-budget-usd", str(budget), *scope,
-             "--add-dir", root, "--disallowedTools", disallowed,
-             "--dangerously-skip-permissions", "--output-format", "stream-json",
-             "--include-partial-messages", "--verbose", prompt],
-            stdout=lg, stderr=er).returncode
+        rc = subprocess.run(worker_cmd, stdout=lg, stderr=er).returncode
     open(os.path.join(out_dir, "worker.exit"), "w").write(f"{rc}\n")
     return rc
 

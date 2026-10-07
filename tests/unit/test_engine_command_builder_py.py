@@ -64,10 +64,17 @@ def test_claude_engine_has_a_command_builder():
 
 
 def test_builder_injects_resume_when_session_id_present():
+    # MO_NODE_SETTING_SOURCES="" pins THIS test's intent (grants/resume argv
+    # shape) by switching the orthogonal agent-session isolation step off; it
+    # has its own coverage in test_agent_session_isolation.py.
     out = _claude_command_builder(
         ("claude", "-p", "hi"),
         request=_req("opus"),
-        env={"MO_RESUME_SESSION_ID": "sess-9", "MO_TOOL_GRANTS_DISABLED": "1"},
+        env={
+            "MO_RESUME_SESSION_ID": "sess-9",
+            "MO_TOOL_GRANTS_DISABLED": "1",
+            "MO_NODE_SETTING_SOURCES": "",
+        },
     )
     assert out == ("claude", "--resume", "sess-9", "-p", "hi")
 
@@ -75,7 +82,9 @@ def test_builder_injects_resume_when_session_id_present():
 def test_builder_is_noop_when_grants_disabled_and_no_resume():
     cmd = ("claude", "-p", "hi")
     out = _claude_command_builder(
-        cmd, request=_req("glm"), env={"MO_TOOL_GRANTS_DISABLED": "1"}
+        cmd,
+        request=_req("glm"),
+        env={"MO_TOOL_GRANTS_DISABLED": "1", "MO_NODE_SETTING_SOURCES": ""},
     )
     assert out == cmd
 

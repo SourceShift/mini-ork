@@ -379,7 +379,10 @@ def mo_run_rubric_prescreen(
     # Resolve the lane from the canonical provider registry. The rubric prompt
     # uses Claude's JSON-schema CLI contract, while the registry supplies the
     # lane's credentials, endpoint, model, and inherited-environment removals.
-    from mini_ork.dispatch.providers import resolve_provider  # noqa: PLC0415
+    from mini_ork.dispatch.providers import (  # noqa: PLC0415
+        claude_isolation_args,
+        resolve_provider,
+    )
     _lane_root = os.path.dirname(os.path.dirname(scripts_dir.rstrip("/")))
     try:
         provider = resolve_provider(lane, root=_lane_root, environment=os.environ)
@@ -433,6 +436,13 @@ def mo_run_rubric_prescreen(
         *budget_flag,
         prompt_text,
     ]
+    # Agent-session isolation: run the rubric with mini-ork's settings, not the
+    # operator's ~/.claude (the user hooks/output-style rules are for the
+    # operator's own sessions and cost ~14K tokens per turn). Spliced after
+    # "-p"; effort and budget flags stay untouched. The model comes from the
+    # lane's ANTHROPIC_MODEL in sub_env; opus/sonnet (no model pin) get
+    # ``--model`` from the helper.
+    cmd[2:2] = claude_isolation_args(sub_env, lane, cmd)
 
     # Best-effort subprocess: bash uses `( set -uo pipefail; ... ) || true`
     # so a claude failure is advisory-only. Mirror with check=False +

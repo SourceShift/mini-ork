@@ -76,7 +76,13 @@ def test_build_command_keeps_resume_id_even_when_tool_grants_disabled():
     command = ENGINES["claude"].build_command(
         ("claude", "-p", "x"),
         request=request,
-        env={"MO_TOOL_GRANTS_DISABLED": "1", "MO_RESUME_SESSION_ID": "sess-1"},
+        # MO_NODE_SETTING_SOURCES="" switches the orthogonal isolation step off
+        # so this test asserts the grants/resume argv shape it is about.
+        env={
+            "MO_TOOL_GRANTS_DISABLED": "1",
+            "MO_RESUME_SESSION_ID": "sess-1",
+            "MO_NODE_SETTING_SOURCES": "",
+        },
     )
 
     assert command == ("claude", "--resume", "sess-1", "-p", "x")

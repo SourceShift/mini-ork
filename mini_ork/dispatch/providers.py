@@ -1264,18 +1264,26 @@ def dispatch_model(
     # argv both key off ``request.path_map``.
     lane_kind = _lane_kind(request.model, root)
     request = _attach_isolation(request, {**effective_env, **request.env}, lane_kind=lane_kind)
-    command = engine.build_command(spec.command, request=request, env=effective_env)
-    command = _portable_transport_command(command, request=request, env=effective_env)
-    if command != spec.command:
-        spec = replace(spec, command=command)
     # Merge lane env after removing stale gateway variables. Explicit request
     # overrides are applied last so a caller can deliberately opt into a custom
     # endpoint without mutating the process environment.
+    #
+    # This is computed BEFORE the command is built because the command builder's
+    # subscription-model pin (``claude_isolation_args``) must decide on the
+    # CHILD's spawn env, not the ambient one. Building against ``effective_env``
+    # read the operator's ambient ``ANTHROPIC_MODEL`` and skipped ``--model
+    # opus``, while ``spec.unset_env`` (ANTHROPIC_GATEWAY_ENV) stripped that very
+    # variable from the child — so the opus/sonnet lanes fell through to the CLI
+    # default model. Passing the post-merge env mirrors the rubric call site.
     merged_env = dict(effective_env)
     for key in spec.unset_env:
         merged_env.pop(key, None)
     merged_env.update(spec.env)
     merged_env.update(request.env)
+    command = engine.build_command(spec.command, request=request, env=merged_env)
+    command = _portable_transport_command(command, request=request, env=effective_env)
+    if command != spec.command:
+        spec = replace(spec, command=command)
     # Isolation selector (SE-3 SC3): decide WHICH workspace the harness CLI is
     # spawned into (host in-process Popen vs a Workspace.spawn backend). See
     # _select_workspace for the precedence rule.
@@ -1717,18 +1725,117 @@ class Capabilities:
     agent_doc: bool = False
 
 
+# ── Agent-session isolation (kickoff/agent-session-isolation.md) ─────────────
+# Every claude-CLI node mini-ork spawns otherwise loads the OPERATOR's personal
+# Claude Code config (~/.claude/settings.json, ~/.claude/CLAUDE.md, user plugins):
+# 14 SessionStart hooks, "learning"/"CAVEMAN" output-style rules, a per-response
+# <z-insight> block for a personal dashboard, 190 skills. That config is written
+# for the operator's own interactive sessions, and it costs ~14K tokens on EVERY
+# turn of EVERY node. The ACP orchestrator already fixed its own thread
+# (acp_orchestrator/harness.py: MO_ORCHESTRATOR_SETTING_SOURCES); this is the
+# node twin under a DISTINCT env var. `--setting-sources project,local` keeps
+# the project CLAUDE.md but drops the user layer; the repo `--settings` file
+# re-pins the two user values runs silently depend on (model + effort).
+
+# claude CLI model aliases for the subscription lanes (mirror of
+# acp_orchestrator/harness.py:_SUBSCRIPTION_MODEL_ALIASES — kept local rather
+# than imported across modules, per the prior-art lens).
+_SUBSCRIPTION_MODEL_ALIASES = {"opus": "opus", "sonnet": "sonnet"}
+
+# Resolved from the PACKAGE location, never cwd and never MINI_ORK_HOME: the
+# worktree cwd varies per node and `.mini-ork/config/` is the HOME-overlay
+# surface. `.parents[2]` is the repo root (same pattern as _transport_pythonpath).
+_NODE_SETTINGS_PATH = Path(__file__).resolve().parents[2] / "config" / "agent-claude-settings.json"
+
+
+def claude_isolation_args(
+    env: Mapping[str, str],
+    lane: str | None = None,
+    argv: Sequence[str] = (),
+) -> list[str]:
+    """The isolation flags to splice into a claude argv (pure; returns a list).
+
+    - ``MO_NODE_SETTING_SOURCES`` (default ``"project,local"``). Set it empty
+      (``""``) for legacy behaviour: return ``[]`` and load everything.
+    - Otherwise returns ``["--setting-sources", v, "--settings", <abs path of
+      config/agent-claude-settings.json>]``. ``MO_NODE_SETTINGS`` overrides the
+      path (empty string omits ``--settings`` entirely).
+    - Plus ``["--model", lane]`` when ``lane`` is ``"opus"``/``"sonnet"``,
+      ``--model`` is not already in ``argv`` and ``ANTHROPIC_MODEL`` is not in
+      ``env`` — those lanes carry no ``model:`` pin in providers.yaml, so their
+      model otherwise comes ONLY from the (now-suppressed) user setting.
+
+    ``argv`` is used only to avoid duplicating a flag already present, and to
+    guard on the engine: a non-claude argv (e.g. ``codex exec``) returns ``[]``
+    so it passes through byte-identical (defence in depth, mirroring
+    ``apply_tool_grants``/``apply_resume``).
+
+    ``--settings`` is emitted only for a path that is a regular file: ``claude
+    -p --settings <missing>`` hard-fails the node ("Settings file not found"),
+    and ``pyproject.toml`` ships only ``mini_ork*`` — a non-checkout install has
+    no repo-root ``config/``, so an unguarded ``--settings`` would break every
+    claude node. A missing file degrades to "no custom settings", never a crash.
+    """
+    if not argv or argv[0] != "claude":
+        return []
+    sources = (env.get("MO_NODE_SETTING_SOURCES", "project,local") or "").strip()
+    if not sources:
+        return []
+    out: list[str] = []
+    if "--setting-sources" not in argv:
+        out += ["--setting-sources", sources]
+    settings = env.get("MO_NODE_SETTINGS")
+    if settings is None:
+        settings = str(_NODE_SETTINGS_PATH)
+    settings = settings.strip()
+    if settings and "--settings" not in argv and os.path.isfile(settings):
+        out += ["--settings", settings]
+    if (
+        lane in _SUBSCRIPTION_MODEL_ALIASES
+        and "--model" not in argv
+        and not env.get("ANTHROPIC_MODEL")
+    ):
+        out += ["--model", _SUBSCRIPTION_MODEL_ALIASES[lane]]
+    return out
+
+
+def _insert_before_output_format(
+    command: tuple[str, ...], flags: Sequence[str]
+) -> tuple[str, ...]:
+    """Insert ``flags`` right before ``--output-format`` (else append).
+
+    The same positional contract ``apply_tool_grants`` implements: the claude
+    spec always emits ``… --permission-mode <mode> --output-format …``, so the
+    splice is deterministic and the resulting argv stays byte-for-byte
+    equivalent to the bash layout."""
+    new = list(command)
+    insert_idx = len(new)
+    for i, arg in enumerate(new):
+        if arg == "--output-format":
+            insert_idx = i
+            break
+    new[insert_idx:insert_idx] = list(flags)
+    return tuple(new)
+
+
 def _claude_command_builder(
     command: tuple[str, ...],
     *,
     request: DispatchRequest,
     env: Mapping[str, str],
 ) -> tuple[str, ...]:
-    """Rewrite a claude argv for a dispatch: inject node-scoped tool grants
-    (--allowedTools/--strict-mcp-config/--mcp-config; kickoff/tool-grant-hermetic
-    -dispatch.md) unless MO_TOOL_GRANTS_DISABLED=1, then E4 turn-resume
-    (--resume <id>) when MO_RESUME_SESSION_ID is set. Both leaf helpers also
-    guard on ``command[0] == "claude"``, so this is defence in depth; the load-
+    """Rewrite a claude argv for a dispatch: inject agent-session isolation
+    (--setting-sources / --settings / subscription --model; always, regardless
+    of MO_TOOL_GRANTS_DISABLED), then node-scoped tool grants (--allowedTools/
+    --strict-mcp-config/--mcp-config; kickoff/tool-grant-hermetic-dispatch.md)
+    unless MO_TOOL_GRANTS_DISABLED=1, then E4 turn-resume (--resume <id>) when
+    MO_RESUME_SESSION_ID is set. The isolation step runs FIRST and is not gated
+    by the grants flag — it is orthogonal to tool access. Every leaf helper also
+    guards on ``command[0] == "claude"``, so this is defence in depth; the load-
     bearing guarantee is that no builder is registered for executable engines."""
+    isolation = claude_isolation_args(env, request.model, command)
+    if isolation:
+        command = _insert_before_output_format(command, isolation)
     if env.get('MO_TOOL_GRANTS_DISABLED', '0') != '1':
         run_dir = env.get('MINI_ORK_RUN_DIR', '') or None
         command = apply_tool_grants(command, env=env, run_dir=run_dir, request=request)

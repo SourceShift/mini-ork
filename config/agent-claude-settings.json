@@ -1,0 +1,14 @@
+{
+  "effortLevel": "xhigh",
+  "alwaysThinkingEnabled": true,
+  "env": {
+    "API_TIMEOUT_MS": "3000000",
+    "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {"matcher": "Bash", "hooks": [{"type": "command",
+        "command": "if command -v rtk >/dev/null 2>&1; then exec rtk hook claude; fi; cat >/dev/null"}]}
+    ]
+  }
+}
