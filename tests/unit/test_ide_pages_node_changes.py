@@ -34,6 +34,7 @@ nodes:
   - {name: planner, type: planner, model_lane: planner, prompt_ref: prompts/planner.md}
   - {name: implementer, type: implementer, model_lane: worker, prompt_ref: prompts/implementer.md}
   - {name: verifier_node, type: verifier, verifier_ref: verifiers/test.py}
+  - {name: static_check_verifier, type: verifier, verifier_ref: verifiers/static-check.py}
   - {name: reviewer, type: reviewer, model_lane: reviewer, prompt_ref: prompts/reviewer.md}
   - {name: publisher, type: publisher}
 """
@@ -128,14 +129,15 @@ def _seed(home: Path, *, repo: Path, base_sha: str) -> Path:
         ),
     )
 
-    # Five completed nodes (planner, implementer, verifier_node, reviewer,
-    # publisher). Each emits node_start then node_end so the run's DAG is
-    # fully attributed.
+    # Six completed nodes (planner, implementer, verifier_node,
+    # static_check_verifier, reviewer, publisher). Each emits node_start
+    # then node_end so the run's DAG is fully attributed.
     events = [
         ("planner", "planner", "planner", T0 + 10, T0 + 20),
         ("implementer", "implementer", "worker", T0 + 20, T0 + 50),
         ("verifier_node", "verifier", "verifier", T0 + 50, T0 + 60),
-        ("reviewer", "reviewer", "reviewer", T0 + 60, T0 + 70),
+        ("static_check_verifier", "verifier", "verifier", T0 + 60, T0 + 65),
+        ("reviewer", "reviewer", "reviewer", T0 + 65, T0 + 70),
         ("publisher", "publisher", "publisher", T0 + 70, T0 + 80),
     ]
     for i, (node, ntype, lane, ts, end) in enumerate(events):
@@ -590,3 +592,315 @@ def test_changes_view_finding_path_resolves_against_project_root(home: Path,
     # The Open act is the absolute path.
     acts_blob = json.dumps(finding.get("acts") or [])
     assert finding["path"] in acts_blob
+
+
+# ── kickoff r3 (ide-node-changes-r3) — six fixes ──────────────────────
+
+
+def _seed_static_check(run_dir: Path) -> Path:
+    """Seed the ``static_check_verifier`` artefacts (kickoff r3 §3).
+
+    Writes ``verifier_static-check.json`` with a leading
+    ``DeprecationWarning`` line, ``verifier-static-check.checks.tsv``
+    (mirroring the real recipe columns ``cid\\tdesc\\tpassed``) and
+    ``evidence/static-check.log``. Returns the log path.
+    """
+    log_path = run_dir / "evidence" / "static-check.log"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "evidence").mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        "[static-check] running\n[static-check] [lint] running\n"
+        "[static-check] [lint] ok\n[static-check] [artifact] running\n"
+        "[static-check] [artifact] ok\n"
+    )
+    json_text = json.dumps(
+        {
+            "verifier": "static-check",
+            "pass": False,
+            "checks": [
+                {"name": "lint", "expected": "ok", "actual": "ok", "pass": True},
+                {"name": "artifact-diff-exists", "expected": "exists", "actual": "missing", "pass": False},
+            ],
+        }
+    )
+    # Add a leading DeprecationWarning line so fix #2 is exercised.
+    (run_dir / "verifier_static-check.json").write_text(
+        "DeprecationWarning: pkg_resources is deprecated\n" + json_text
+    )
+    # TSV columns match the real recipe: cid \t desc \t passed (no rc).
+    (run_dir / "verifier-static-check.checks.tsv").write_text(
+        "lint\tstatic-check: lint ok\ttrue\n"
+        "artifact-diff-exists\tframework-edit.diff exists\tfalse\n"
+    )
+    return log_path
+
+
+def test_changes_view_executor_shape_verdict_row_and_log_tail(home: Path) -> None:
+    """Fix #1: executor-shape verifier JSON (``pass`` / ``post_rc`` /
+    ``error_summary``) renders a red row + log tail, never "No verifier
+    artefacts found".
+
+    Before the fix, ``_verifier_items`` only knew the recipe ``checks[]``
+    shape and the TSV. A flat executor verdict was silently dropped. The
+    new executor-shape branch emits one row whose ``t`` is
+    ``error_summary``, ``sub`` carries the rc + log basename, and
+    ``log_tail`` carries the last lines of the evidence log.
+    """
+    repo, base_sha = _seed_git_repo(home.absolute().parent)
+    _seed(home, repo=repo, base_sha=base_sha)
+    run_dir = home / "runs" / RUN
+    # Wipe any seed-time static-check artefacts so this fixture owns the row.
+    for rel in ("verifier_static-check.json", "verifier-static-check.checks.tsv"):
+        p = run_dir / rel
+        if p.exists():
+            p.unlink()
+    log = run_dir / "verifier_static-check.log"
+    log.write_text("[verifier] [pytest] running\n[pytest] FAILED\n")
+    (run_dir / "verifier_static-check.json").write_text(
+        json.dumps({"pass": False, "post_rc": 2, "error_summary": "pytest failed",
+                    "evidence_path": str(log)})
+    )
+
+    out = build_node(home, RUN, "static_check_verifier", view="changes")
+    items = out["result"]["items"]
+    # Exactly one verdict row (no leading "No verifier artefacts found").
+    assert len(items) == 1, items
+    row = items[0]
+    assert row["t"] == "pytest failed", row
+    assert "rc 2" in row["sub"], row["sub"]
+    assert "verifier_static-check.log" in row["sub"], row["sub"]
+    assert row["mc"] == "red", row
+    assert row["passed"] is False
+    # log_tail carries the file tail.
+    assert "FAILED" in (row.get("log_tail") or ""), row.get("log_tail")
+    # The absolute log path is wired up.
+    assert row.get("path"), row
+    assert Path(row["path"]).is_file(), row["path"]
+
+
+def test_changes_view_tolerant_json_parses_with_deprecation_warning(home: Path) -> None:
+    """Fix #2: ``verifier_<stem>.json`` with a leading
+    ``DeprecationWarning`` line still parses.
+
+    Before the fix, raw ``json.loads`` raised and the reader returned
+    ``None`` — falling through to "No verifier artefacts found". The new
+    reader finds the first ``{`` and parses from there to EOF.
+    """
+    repo, base_sha = _seed_git_repo(home.absolute().parent)
+    _seed(home, repo=repo, base_sha=base_sha)
+    _seed_static_check(home / "runs" / RUN)
+
+    out = build_node(home, RUN, "static_check_verifier", view="changes")
+    items = out["result"]["items"]
+    # Two checks (lint, artifact-diff-exists) — JSON parsed despite the
+    # leading DeprecationWarning.
+    titles = [str(it.get("t") or "") for it in items]
+    assert "lint" in titles, titles
+    assert "artifact-diff-exists" in titles, titles
+    # No silent "No verifier artefacts found".
+    assert not any("No verifier artefacts" in t for t in titles), titles
+
+
+def test_changes_view_static_check_fixture_rows_have_sub_and_path(home: Path) -> None:
+    """Fix #3: TSV/JSON check rows carry ``sub = rc <n> · <log name>``
+    and ``path`` = absolute log path.
+
+    Fixture mirrors the kickoff's recipe shape: JSON with a leading
+    ``DeprecationWarning`` line (parsed), TSV with recipe columns
+    ``cid/desc/passed`` (no rc), and ``evidence/<stem>.log``. Asserts
+    names, sub carries rc + log name, and ``path`` points at the
+    evidence log.
+    """
+    repo, base_sha = _seed_git_repo(home.absolute().parent)
+    _seed(home, repo=repo, base_sha=base_sha)
+    run_dir = home / "runs" / RUN
+    log_path = _seed_static_check(run_dir)
+
+    out = build_node(home, RUN, "static_check_verifier", view="changes")
+    items = out["result"]["items"]
+    by_name = {it["t"]: it for it in items}
+    assert "lint" in by_name, items
+    assert "artifact-diff-exists" in by_name, items
+    # Real checks[] name no log: every row points at the verifier's own
+    # evidence/<stem>.log for both sub and path.
+    for name, passed in (("lint", True), ("artifact-diff-exists", False)):
+        row = by_name[name]
+        assert row.get("sub") == "static-check.log", row
+        assert Path(row["path"]).resolve() == log_path.resolve(), row["path"]
+        assert row["passed"] is passed, row
+
+
+def test_check_rows_fall_back_to_the_newest_timestamped_evidence_log(home: Path) -> None:
+    """No ``evidence/<stem>.log`` → the newest ``evidence/<stem>-*.log``."""
+    import os
+
+    repo, base_sha = _seed_git_repo(home.absolute().parent)
+    _seed(home, repo=repo, base_sha=base_sha)
+    run_dir = home / "runs" / RUN
+    _seed_static_check(run_dir).unlink()
+    old = run_dir / "evidence" / "static-check-100-1-aaa.log"
+    new = run_dir / "evidence" / "static-check-200-1-bbb.log"
+    old.write_text("old\n")
+    new.write_text("new\n")
+    os.utime(old, (1_000, 1_000))
+    os.utime(new, (2_000, 2_000))
+
+    out = build_node(home, RUN, "static_check_verifier", view="changes")
+    rows = [it for it in out["result"]["items"] if it.get("t") == "lint"]
+    assert rows and rows[0]["sub"] == new.name, rows
+    assert Path(rows[0]["path"]).resolve() == new.resolve()
+
+
+def test_read_json_skips_a_warning_line_that_contains_a_brace(tmp_path: Path) -> None:
+    from mini_ork.ide_pages.node_changes import _read_json
+
+    p = tmp_path / "v.json"
+    p.write_text('Warning: dict {x} is deprecated\n{"pass": true, "checks": []}\n')
+    assert _read_json(p) == {"pass": True, "checks": []}
+
+
+def test_a_large_complete_review_patch_is_kept(tmp_path: Path) -> None:
+    """Size alone is not truncation: a complete 60 KB review-diff.patch wins."""
+    from mini_ork.ide_pages.node_changes import _select_patch_text
+
+    body = "diff --git a/f.py b/f.py\n--- a/f.py\n+++ b/f.py\n@@ -1 +1 @@\n" + ("+x\n" * 20_000)
+    (tmp_path / "review-diff.patch").write_text(body)
+    (tmp_path / "framework-edit.diff").write_text(body + "+y\n")
+    text, name = _select_patch_text(tmp_path)
+    assert name == "review-diff.patch" and text == body
+
+
+def test_a_mid_hunk_review_patch_yields_to_the_longer_framework_diff(tmp_path: Path) -> None:
+    from mini_ork.ide_pages.node_changes import _select_patch_text
+
+    full = "diff --git a/f.py b/f.py\n--- a/f.py\n+++ b/f.py\n@@ -1,2 +1,2 @@\n+a\n+b\n"
+    (tmp_path / "review-diff.patch").write_text(full[:-2])  # cut inside the "+b" line, no trailing newline
+    (tmp_path / "framework-edit.diff").write_text(full)
+    text, name = _select_patch_text(tmp_path)
+    assert name == "framework-edit.diff" and text == full
+
+
+def test_changes_view_git_fallback_uses_correct_record(home: Path,
+                                                       tmp_path: Path) -> None:
+    """Fix #4: the git fallback reads ``run.workspace`` (loaded from
+    ``<home>/worktrees/<run_id>.json``) and ignores every other record
+    in ``<home>/worktrees/``.
+
+    Before the fix, the fallback sorted ``<run_dir>.parent / "worktrees"``
+    and took the first match — wrong directory, wrong record, silent
+    empty result. The new code passes ``run`` and reads ``run.workspace``
+    directly, so a second (bogus) record for a different run_id is
+    ignored.
+    """
+    repo, base_sha = _seed_git_repo(home.absolute().parent)
+    _seed(home, repo=repo, base_sha=base_sha)
+    run_dir = home / "runs" / RUN
+
+    # Drop acp-diffs.json and both patch files so the git fallback is
+    # the only source left.
+    for rel in ("acp-diffs.json", "review-diff.patch", "framework-edit.diff"):
+        p = run_dir / rel
+        if p.exists():
+            p.unlink()
+
+    # Plant a bogus second record under a name that would sort first if
+    # the OLD code enumerated ``home / "worktrees"``. Its fields point
+    # at a non-existent path so the OLD code would return [] (or fail).
+    bogus = home / "worktrees" / "AAAAA-other-run.json"
+    bogus.write_text(json.dumps({
+        "run_id": "other-run",
+        "path": str(tmp_path / "does-not-exist"),
+        "branch": "wt/test",
+        "base_branch": "main",
+        "base_sha": "deadbeef" * 5,
+        "project": str(tmp_path),
+        "adopted": False,
+        "clean_at_start": True,
+        "home": str(home),
+    }))
+    # The current run's record is the real one — left in place by _seed.
+
+    out = build_node(home, RUN, "implementer", view="changes")
+    files = out["files"]
+    # The fallback produced the actual repo's commits (a.py, b.py), NOT
+    # the bogus second record (which would have returned []). Paths
+    # come through ``_project_file`` (the longest tail that exists in the
+    # main checkout); the diff text is the raw ``git -C <ws> diff``
+    # output — paths relative to the worktree (``<project>/wt``).
+    paths = {f["path"] for f in files}
+    assert len(files) == 2, paths
+    assert any(p.endswith("a.py") for p in paths), paths
+    assert any(p.endswith("b.py") for p in paths), paths
+    # The diff text contains the git diff hunks for a.py / b.py.
+    assert out["diff"]
+    assert "a/a.py b/a.py" in out["diff"], out["diff"]
+    assert "a/b.py b/b.py" in out["diff"], out["diff"]
+
+
+def test_changes_view_one_diff_text_with_both_patch_files(home: Path) -> None:
+    """Fix #5: when both ``review-diff.patch`` and ``framework-edit.diff``
+    are present, the diff text holds exactly ONE ``diff --git`` per
+    file — never concatenated.
+
+    Before the fix, ``_read_patch_text`` concatenated both files so the
+    view duplicated every ``diff --git`` (2 per file when both exist).
+    The new code chooses one file (preferring ``review-diff.patch`` when
+    it isn't truncated) and returns its text intact.
+    """
+    repo, base_sha = _seed_git_repo(home.absolute().parent)
+    _seed(home, repo=repo, base_sha=base_sha)
+    run_dir = home / "runs" / RUN
+    # Drop acp-diffs.json so the patch source wins.
+    (run_dir / "acp-diffs.json").unlink()
+
+    review_text = (
+        "diff --git a/foo.py b/foo.py\n"
+        "index 0000..1111 100644\n"
+        "--- a/foo.py\n"
+        "+++ b/foo.py\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+line one\n"
+        "+line two\n"
+    )  # ends with newline → NOT truncated → review-diff.patch wins.
+    framework_text = (
+        "diff --git a/bar.py b/bar.py\n"
+        "index 0000..2222 100644\n"
+        "--- a/bar.py\n"
+        "+++ b/bar.py\n"
+        "@@ -0,0 +1,1 @@\n"
+        "+other line\n"
+    )
+    (run_dir / "review-diff.patch").write_text(review_text)
+    (run_dir / "framework-edit.diff").write_text(framework_text)
+
+    out = build_node(home, RUN, "implementer", view="changes")
+    # Exactly one ``diff --git`` per file (foo.py only — review won,
+    # framework's bar.py is NOT concatenated).
+    n_foo = out["diff"].count("foo.py b/")
+    n_bar = out["diff"].count("bar.py b/")
+    assert n_foo == 1, out["diff"]
+    assert n_bar == 0, out["diff"]
+    # The text matches the chosen source byte-for-byte.
+    assert "+line one" in out["diff"]
+    assert "+line two" in out["diff"]
+    # The files[] counts reflect the chosen source (added=2, removed=0).
+    foo_row = next(f for f in out["files"] if f["path"].endswith("foo.py"))
+    assert foo_row["added"] == 2
+    assert foo_row["removed"] == 0
+
+
+def test_a_new_file_in_another_worktree_opens_where_it_is(tmp_path: Path) -> None:
+    """A file the project lacks (new in a live worktree) keeps its real path."""
+    from mini_ork.ide_pages.node_changes import _project_file_lazy
+
+    project = tmp_path / "project"
+    project.mkdir()
+    worktree = tmp_path / "wt"
+    (worktree / ".git").mkdir(parents=True)
+    new_file = worktree / "pkg" / "new_mod.py"
+    new_file.parent.mkdir()
+    new_file.write_text("x = 1\n")
+
+    display, absolute = _project_file_lazy(str(new_file), project)
+    assert display == "pkg/new_mod.py"
+    assert absolute == str(new_file)

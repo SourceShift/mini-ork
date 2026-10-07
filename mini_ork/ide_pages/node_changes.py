@@ -80,19 +80,19 @@ def build_changes_view(run: Run, node: Node) -> dict[str, Any]:
     Shape::
 
         {"result": {"title": str, "items": [spec item]},
-         "files": [{path, added, removed, abs, path}],
+         "files": [{path, added, removed, abs}],
          "diff": <unified diff text, capped>,
          "diff_note": str,
          "commits": [{sha, subject, when, author, files}],
          "commits_note": str}
     """
-    run_dir = run.run_dir
-    # Fix #5: load diffs once per build, thread the entries through.
-    diff_entries, diff_source = _load_diffs(run_dir)
+    # Fix #4 + #5: load diffs once per build; pass ``run`` so the git
+    # fallback can resolve ``run.workspace`` (base_sha / branch / path).
+    diff_entries, diff_text, diff_source = _load_diffs(run)
     title, items = _result_items(run, node)
     show_diff = _show_diff_for(run, node)
     files, files_note = _files_and_note(run, show_diff, diff_entries, diff_source)
-    diff, cap_note = _diff_text(run_dir, files, diff_entries) if show_diff else ("", "")
+    diff, cap_note = _diff_text(files, diff_entries, diff_text) if show_diff else ("", "")
     diff_note = " ".join(n for n in (files_note, cap_note) if n)
     commits, commits_note = _commits(run)
     return {
@@ -229,13 +229,16 @@ def _review_items(run: Run, node: Node) -> tuple[str, list[dict[str, Any]]]:
 
 
 def _verifier_items(run_dir: Path, node: Node) -> tuple[str, list[dict[str, Any]]]:
-    """Fix #2: read verifier artefacts by stem (from ``node.prompt``), then node id.
+    """Fix #1 + #2: read verifier artefacts by stem (from ``node.prompt``), then node id.
 
     Stem = ``Path(node.prompt).stem`` when ``node.prompt`` ends in ``.py``;
     otherwise fall back to ``node.id``. Read, in order:
 
     * ``verifier_<stem>.json`` — its ``checks`` array (recipe verifier shape).
     * ``verifier-<stem>.checks.tsv`` — recipe verifier tab-separated rows.
+    * ``verifier_<stem>.json`` again, treated as the executor shape
+      (``pass`` / ``post_rc`` / ``error_summary`` / ``evidence_path``)
+      when no ``checks[]`` was found and no TSV resolved (Fix #1).
     * ``evidence/<stem>*.log`` — first matching evidence log for ``path``.
 
     Each check item: ``t`` = check name, ``sub`` = ``rc <n> · <log name>``,
@@ -256,7 +259,7 @@ def _verifier_items(run_dir: Path, node: Node) -> tuple[str, list[dict[str, Any]
                 for chk in checks:
                     if not isinstance(chk, dict):
                         continue
-                    items.append(_check_item(chk, run_dir))
+                    items.append(_check_item(chk, run_dir, _fallback_log(run_dir, candidate, vjson)))
                 if items:
                     break
 
@@ -269,9 +272,87 @@ def _verifier_items(run_dir: Path, node: Node) -> tuple[str, list[dict[str, Any]
                 if items:
                     break
 
+    # 3. Executor-shape JSON fallback (Fix #1): the executor may have
+    #    written a flat verdict JSON (``pass`` / ``post_rc`` /
+    #    ``error_summary`` / ``evidence_path``) without a ``checks[]``
+    #    array and without a TSV. Render one red/green verdict row with
+    #    the log tail. Never fall back to the silent "No verifier
+    #    artefacts found" dot when the keys are recognisable.
+    if not items:
+        for candidate in candidates:
+            vjson = _read_json(run_dir / f"verifier_{candidate}.json")
+            if not isinstance(vjson, dict):
+                continue
+            row = _verdict_row_from_executor_shape(vjson, run_dir)
+            if row is not None:
+                items.append(row)
+                break
+
     if not items:
         items.append(S.dot("No verifier artefacts found"))
     return (title, items)
+
+
+# Fix #1: executor-shape JSON → one verdict row. Recognise when the
+# JSON has the flat verdict keys (no ``checks[]`` array).
+_RECOGNISED_EXECUTOR_KEYS = ("pass", "post_rc", "error_summary", "evidence_path")
+
+
+def _verdict_row_from_executor_shape(vjson: dict[str, Any], run_dir: Path) -> dict[str, Any] | None:
+    """One executor-shape verifier JSON → one spec row + log tail.
+
+    ``verifier_vnode.json = {"pass": false, "post_rc": 2,
+    "error_summary": "pytest failed"}`` renders ``t="pytest failed"``,
+    ``sub="rc 2"`` (with the log filename), ``mc="red"``, ``path`` =
+    absolute log path, ``log_tail`` = the file's tail text. Returns
+    ``None`` when the JSON has no recognised executor-shape keys.
+    """
+    if not any(k in vjson for k in _RECOGNISED_EXECUTOR_KEYS):
+        return None
+    text = str(vjson.get("error_summary") or vjson.get("verifier") or "verifier")
+    passed = bool(vjson.get("pass"))
+    rc = vjson.get("post_rc", "")
+    evidence_path = str(vjson.get("evidence_path") or "")
+    sub_bits: list[str] = []
+    if rc != "" and rc is not None:
+        sub_bits.append(f"rc {rc}")
+    log_path = Path(evidence_path) if evidence_path else None
+    log_basename = ""
+    abs_log_path = ""
+    if log_path is not None and log_path.is_file():
+        abs_log_path = str(log_path)
+        log_basename = log_path.name
+    elif evidence_path:
+        # Try to resolve via evidence/<stem>*.log when evidence_path's
+        # basename is generic (e.g. ``verifier-static-check.log``).
+        generic = Path(evidence_path).name
+        stem = generic.removesuffix(".log") or generic
+        if (run_dir / "evidence").is_dir():
+            matches = sorted((run_dir / "evidence").glob(f"{stem}*.log"))
+            if matches:
+                abs_log_path = str(matches[0])
+                log_basename = Path(abs_log_path).name
+    if log_basename:
+        sub_bits.append(log_basename)
+    sub = " · ".join(sub_bits)
+    mark, mc = ("✓", "green") if passed else ("✗", "red")
+    acts: list[dict[str, Any]] = []
+    if abs_log_path:
+        acts.append(S.btn("Open log", S.open_path(abs_log_path), "ghost"))
+    out = S.item(text, sub, m=mark, mc=mc, acts=acts)
+    out["path"] = abs_log_path
+    out["passed"] = passed
+    out["log_tail"] = _log_tail(abs_log_path) if abs_log_path else ""
+    return out
+
+
+def _log_tail(path: str, n: int = 50) -> str:
+    """Last ``n`` lines of a verifier log file (empty on missing)."""
+    try:
+        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    return "\n".join(lines[-n:])
 
 
 def _verifier_stem(node: Node) -> str:
@@ -290,21 +371,46 @@ def _verifier_stem(node: Node) -> str:
     return node.id
 
 
-def _check_item(chk: dict[str, Any], run_dir: Path) -> dict[str, Any]:
-    """One recipe-verifier check → spec item with ``t`` / ``sub`` / ``path``."""
+def _fallback_log(run_dir: Path, stem: str, vjson: dict[str, Any]) -> str:
+    """The verifier's own log when its checks name none.
+
+    Real ``checks[]`` entries carry only ``name/expected/actual/pass``. Use
+    ``evidence/<stem>.log``, then the newest ``evidence/<stem>*.log``, then
+    the JSON's top-level ``evidence_path``; ``""`` when none exists.
+    """
+    evidence = run_dir / "evidence"
+    exact = evidence / f"{stem}.log"
+    if exact.is_file():
+        return str(exact)
+    if evidence.is_dir():
+        matches = sorted(evidence.glob(f"{stem}*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if matches:
+            return str(matches[0])
+    top = str(vjson.get("evidence_path") or "")
+    return top if top and Path(top).is_file() else ""
+
+
+def _check_item(chk: dict[str, Any], run_dir: Path, fallback_log: str = "") -> dict[str, Any]:
+    """One recipe-verifier check → spec item with ``t`` / ``sub`` / ``path``.
+
+    A check that names no log of its own points at ``fallback_log`` (the
+    verifier's log), so real rows still carry a log name and path.
+    """
     name = str(chk.get("name") or chk.get("cid") or chk.get("id") or "")
     rc = chk.get("rc", "")
     log_name = str(chk.get("log") or chk.get("log_name") or "")
+    if not log_name and fallback_log:
+        log_name = fallback_log
     passed = bool(chk.get("pass"))
     sub_bits: list[str] = []
     if rc != "" and rc is not None:
         sub_bits.append(f"rc {rc}")
     if log_name:
-        sub_bits.append(log_name)
+        sub_bits.append(Path(log_name).name)
     sub = " · ".join(sub_bits)
     abs_log_path = ""
     if log_name:
-        candidate = run_dir / log_name
+        candidate = Path(log_name) if Path(log_name).is_absolute() else run_dir / log_name
         if candidate.is_file():
             abs_log_path = str(candidate)
         else:
@@ -317,7 +423,6 @@ def _check_item(chk: dict[str, Any], run_dir: Path) -> dict[str, Any]:
     acts: list[dict[str, Any]] = []
     if abs_log_path:
         acts.append(S.btn("Open log", S.open_path(abs_log_path), "ghost"))
-    mark = "✓" if not passed else "✓"  # placeholder; replaced below
     mark, mc = ("✓", "green") if passed else ("✗", "red")
     out = S.item(name, sub, m=mark, mc=mc, acts=acts)
     out["path"] = abs_log_path
@@ -328,9 +433,11 @@ def _check_item(chk: dict[str, Any], run_dir: Path) -> dict[str, Any]:
 def _items_from_checks_tsv_with_log(tsv_path: Path, run_dir: Path) -> list[dict[str, Any]]:
     """Recipe verifier TSV → items with log-path resolution.
 
-    Each row is ``cid\\tdesc\\tpassed``; no per-row log path is recorded,
-    so ``path`` falls back to the first ``evidence/<stem>*.log`` for the
-    TSV's stem (``verifier-<stem>.checks.tsv`` → ``<stem>``).
+    Fix #3: each row's ``sub`` is ``rc <n> · <log name>`` when either is
+    known; ``path`` is the absolute log path. The TSV has no ``rc`` /
+    ``log`` columns, so ``rc`` is looked up by ``cid`` from
+    ``verifier_<stem>.json``'s ``checks[]`` (when present). When no
+    ``rc`` is found, ``sub`` is log-name-only.
     """
     items: list[dict[str, Any]] = []
     try:
@@ -338,11 +445,30 @@ def _items_from_checks_tsv_with_log(tsv_path: Path, run_dir: Path) -> list[dict[
     except OSError:
         return [S.bad("could not read checks.tsv")]
     stem = tsv_path.name.removeprefix("verifier-").removesuffix(".checks.tsv")
+    # Look up rc / log_name from the JSON's matching ``checks[]`` by cid.
+    rc_by_cid: dict[str, Any] = {}
+    log_by_cid: dict[str, str] = {}
+    vjson = _read_json(run_dir / f"verifier_{stem}.json")
+    if isinstance(vjson, dict):
+        chk_list = vjson.get("checks") or []
+        if isinstance(chk_list, list):
+            for chk in chk_list:
+                if not isinstance(chk, dict):
+                    continue
+                cid = str(chk.get("name") or chk.get("cid") or chk.get("id") or "")
+                if not cid:
+                    continue
+                rc_by_cid[cid] = chk.get("rc", "")
+                ln = str(chk.get("log") or chk.get("log_name") or "")
+                if ln:
+                    log_by_cid[cid] = ln
     abs_log = ""
+    log_basename = ""
     if (run_dir / "evidence").is_dir():
         matches = sorted((run_dir / "evidence").glob(f"{stem}*.log"))
         if matches:
             abs_log = str(matches[0])
+            log_basename = Path(abs_log).name
     acts: list[dict[str, Any]] = []
     if abs_log:
         acts.append(S.btn("Open log", S.open_path(abs_log), "ghost"))
@@ -351,11 +477,19 @@ def _items_from_checks_tsv_with_log(tsv_path: Path, run_dir: Path) -> list[dict[
         if len(parts) < 3:
             continue
         cid, desc, passed = parts[0], parts[1], parts[2].strip().lower() == "true"
+        sub_bits: list[str] = []
+        rc = rc_by_cid.get(cid, "")
+        if rc != "" and rc is not None:
+            sub_bits.append(f"rc {rc}")
+        log_name = log_by_cid.get(cid, "") or log_basename
+        if log_name:
+            sub_bits.append(log_name)
+        sub = " · ".join(sub_bits)
         mark, mc = ("✓", "green") if passed else ("✗", "red")
-        item = S.item(f"{cid} · {desc}", "", m=mark, mc=mc, acts=list(acts))
-        item["path"] = abs_log
-        item["passed"] = passed
-        items.append(item)
+        out = S.item(f"{cid} · {desc}", sub, m=mark, mc=mc, acts=list(acts))
+        out["path"] = abs_log
+        out["passed"] = passed
+        items.append(out)
     return items
 
 
@@ -551,7 +685,7 @@ def _files_and_note(run: Run, show_diff: bool,
         removed = int(d.get("removed") or 0)
         old_text = str(d.get("old_text") or "")
         new_text = str(d.get("new_text") or "")
-        if diff_source != "patch" and (old_text or new_text) and not (added or removed):
+        if diff_source == "acp" and (old_text or new_text) and not (added or removed):
             added, removed = _line_diff_counts(old_text, new_text)
         display, absolute = _project_file_lazy(path, project)
         files.append(
@@ -580,83 +714,135 @@ def _line_diff_counts(old_text: str, new_text: str) -> tuple[int, int]:
     return added, removed
 
 
-# Fix #4 — patch-file fallback returns the patch text and per-file +/-
-# counts from the patch's hunks (excluding ``+++``/``---`` headers). Prefer
-# ``review-diff.patch``, then ``framework-edit.diff``. When neither a patch
-# nor acp diffs exist but the run has a workspace branch, fall back to
-# ``git -C <project> diff <base>..<branch>`` (timeout 5 s).
-def _load_diffs(run_dir: Path) -> tuple[list[dict[str, Any]], str]:
-    """Single source-of-truth loader for the changes view.
+# Fix #4 + #5 — patch-file fallback returns the patch text and per-file
+# +/- counts from the patch's hunks (excluding ``+++``/``---`` headers).
+# Prefer ``review-diff.patch``, falling back to ``framework-edit.diff``
+# when the reviewer patch was capped at 50 KB or ends mid-hunk. When
+# neither a patch nor acp diffs exist but the run has a workspace
+# branch, fall back to ``git -C <ws_path> diff <base>..<branch>``
+# (timeout 5 s). The chosen patch text is returned in the 3-tuple so
+# ``_diff_text`` can render it directly without re-derivation.
+def _load_diffs(run: Run) -> tuple[list[dict[str, Any]], str, str]:
+    """Single source-of-truth loader for the changes view (3-tuple).
 
-    * ``"acp"`` — entries from ``cached_or_computed(acp-diffs.json)``.
-    * ``"patch"`` — entries parsed from ``review-diff.patch`` (preferred)
-      or ``framework-edit.diff`` (fallback). ``old_text`` / ``new_text``
-      are empty (patch format is not invertible), but ``added`` /
-      ``removed`` are the ``+`` / ``-`` line counts from each file's
-      hunks (excluding ``+++`` / ``---`` headers), so ``files[]`` shows
-      the right counts and ``diff`` is the patch text itself.
-    * ``"git"`` — entries computed via ``git diff`` on the workspace
-      branch (5 s timeout).
-    * ``""`` — empty list with no source.
+    * ``("acp", entries, "")`` — entries from
+      ``cached_or_computed(acp-diffs.json)`` (single-arg); empty patch
+      text because the source IS the per-file text.
+    * ``("review-diff.patch" | "framework-edit.diff", entries, text)``
+      — entries parsed from the chosen patch; ``text`` is the patch
+      text itself (Fix #5: never concatenated, never re-derived).
+    * ``("git", entries, "")`` — entries via ``git diff`` on the
+      workspace branch (5 s timeout).
+    * ``("", [], "")`` — empty; downstream renders the empty-state.
+
+    The single-arg ``cached_or_computed(run.run_dir)`` call preserves
+    the test spy in
+    ``tests/unit/test_ide_pages_node_changes.py::test_changes_view_cached_or_computed_called_once``
+    — it expects one arg.
     """
     try:
         from mini_ork.acp import diffs as _diffs
 
-        entries, _ = _diffs.cached_or_computed(run_dir)
+        entries, _ = _diffs.cached_or_computed(run.run_dir)
     except Exception:  # noqa: BLE001 — a broken diff cache must not blank the view
         entries = []
     if entries:
-        return entries, "acp"
-    for rel in ("review-diff.patch", "framework-edit.diff"):
-        path = run_dir / rel
-        if path.is_file():
-            try:
-                text = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            return _parse_patch_into_entries(text), "patch"
-    git_entries = _git_diff_fallback(run_dir)
+        return entries, "", "acp"
+    text, name = _select_patch_text(run.run_dir)
+    if text:
+        return _parse_patch_into_entries(text), text, name
+    git_entries, git_text = _git_diff_fallback(run)
     if git_entries:
-        return git_entries, "git"
-    return [], ""
+        return git_entries, git_text, "git"
+    return [], "", ""
 
 
-def _git_diff_fallback(run_dir: Path) -> list[dict[str, Any]]:
+def _patch_is_truncated(text: str) -> bool:
+    """``True`` when ``review-diff.patch`` ends mid-hunk.
+
+    The file on disk is the full git diff (only the reviewer's prompt copy is
+    capped), so size alone never means truncated.
+    """
+    if text.endswith("\n"):
+        return False
+    stripped = text.rstrip()
+    if not stripped:
+        return False
+    return stripped.splitlines()[-1][:1] in ("+", "-", " ")
+
+
+def _select_patch_text(run_dir: Path) -> tuple[str, str]:
+    """Pick ONE patch file as the diff source (never concatenate).
+
+    Fix #5: prefer ``review-diff.patch``. Fall back to
+    ``framework-edit.diff`` when ``review-diff.patch`` ends mid-hunk and
+    ``framework-edit.diff`` is longer. Returns
+    ``("", "")`` when neither file exists or both fail to read.
+    """
+    review_text = _read_text(run_dir / "review-diff.patch")
+    framework_text = _read_text(run_dir / "framework-edit.diff")
+    if not review_text and not framework_text:
+        return "", ""
+    if (review_text and framework_text and _patch_is_truncated(review_text)
+            and len(framework_text) > len(review_text)):
+        return framework_text, "framework-edit.diff"
+    if review_text:
+        return review_text, "review-diff.patch"
+    return framework_text, "framework-edit.diff"
+
+
+def _read_text(path: Path) -> str:
+    if not path.is_file():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _git_diff_fallback(run: Run) -> tuple[list[dict[str, Any]], str]:
     """``git -C <ws_path> diff <base>..<branch>`` with a 5 s timeout.
 
-    Used when neither an ``acp-diffs.json`` cache nor a patch file is
-    present but the run's workspace record names a base and branch. The
-    diff is parsed via the same patch parser so per-file ``+``/``-``
-    counts survive. Empty list when the workspace record is missing, the
-    subprocess fails, or it times out.
+    Fix #4: ``base_sha`` / ``branch`` / ``path`` come from ``run.workspace``,
+    which itself was loaded from ``<home>/worktrees/<run_id>.json`` by
+    ``mini_ork.workspaces.load``. We NEVER enumerate sibling run records
+    here. When ``base_sha`` is missing, derive
+    ``merge-base origin/main <branch>`` instead (5 s timeout). Returns
+    ``([], "")`` on missing branch, subprocess failure, or timeout;
+    otherwise ``(entries, raw_text)`` so ``_diff_text`` can render the
+    patch verbatim.
     """
-    worktrees_dir = run_dir.parent / "worktrees"
-    if not worktrees_dir.is_dir():
-        return []
-    candidates = sorted(worktrees_dir.glob("*.json"))
-    if not candidates:
-        return []
-    try:
-        data = json.loads(candidates[0].read_text(encoding="utf-8", errors="replace"))
-    except (OSError, ValueError, json.JSONDecodeError):
-        return []
-    if not isinstance(data, dict):
-        return []
-    ws_path = data.get("path")
-    branch = str(data.get("branch") or "")
-    base = str(data.get("base_sha") or "")
-    if not ws_path or not branch or not base:
-        return []
+    ws = run.workspace
+    if ws is None:
+        return [], ""
+    ws_path = getattr(ws, "path", None)
+    branch = str(getattr(ws, "branch", "") or "")
+    if ws_path is None or not branch:
+        return [], ""
+    ws_path_str = str(ws_path)
+    base = str(getattr(ws, "base_sha", "") or "")
+    if not base:
+        # No recorded base → ``merge-base origin/main <branch>``.
+        try:
+            proc = subprocess.run(
+                ["git", "-C", ws_path_str, "merge-base", "origin/main", branch],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return [], ""
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return [], ""
+        base = proc.stdout.strip().splitlines()[0]
     try:
         proc = subprocess.run(
-            ["git", "-C", str(ws_path), "diff", f"{base}..{branch}"],
+            ["git", "-C", ws_path_str, "diff", f"{base}..{branch}"],
             capture_output=True, text=True, timeout=5,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return []
+        return [], ""
     if proc.returncode != 0 or not proc.stdout:
-        return []
-    return _parse_patch_into_entries(proc.stdout)
+        return [], ""
+    return _parse_patch_into_entries(proc.stdout), proc.stdout
 
 
 def _parse_patch_into_entries(text: str) -> list[dict[str, Any]]:
@@ -696,47 +882,36 @@ def _parse_patch_into_entries(text: str) -> list[dict[str, Any]]:
     return out
 
 
-def _diff_text(run_dir: Path, files: list[dict[str, Any]],
-               diff_entries: list[dict[str, Any]]) -> tuple[str, str]:
+def _diff_text(files: list[dict[str, Any]],
+               diff_entries: list[dict[str, Any]],
+               source_text: str) -> tuple[str, str]:
     """Unified-diff text for the run + a cap note.
 
-    Fix #5: ``diff_entries`` is the single loader's result. Fix #4: when
-    the source is a patch file, return the patch text itself (capped) —
-    not a re-derived ``unified_diff`` from empty ``old_text`` /
-    ``new_text``.
+    Fix #5: ``source_text`` is the single loader's chosen patch text —
+    render it directly (capped), never re-derive from ``old_text`` /
+    ``new_text`` and never concatenate ``review-diff.patch`` +
+    ``framework-edit.diff``. For ``"acp"`` / ``"git"`` sources
+    ``source_text`` is empty and we fall back to a ``unified_diff`` from
+    per-file old/new text (when available).
     """
     if not files:
         return "", ""
-    chunks: list[str] = []
-    for d in diff_entries:
-        old = str(d.get("old_text") or "").splitlines(keepends=True)
-        new = str(d.get("new_text") or "").splitlines(keepends=True)
-        if old or new:
-            path = str(d.get("path") or "")
-            chunks.extend(difflib.unified_diff(
-                old, new, fromfile=f"a/{path}", tofile=f"b/{path}"))
-    if not chunks:
-        # Patch-only entries — fall back to reading the run's patch file
-        # directly so the IDE shows the real diff text (capped).
-        chunks.append(_read_patch_text(run_dir))
-    text = "".join(chunks)
+    if source_text:
+        text = source_text
+    else:
+        chunks: list[str] = []
+        for d in diff_entries:
+            old = str(d.get("old_text") or "").splitlines(keepends=True)
+            new = str(d.get("new_text") or "").splitlines(keepends=True)
+            if old or new:
+                path = str(d.get("path") or "")
+                chunks.extend(difflib.unified_diff(
+                    old, new, fromfile=f"a/{path}", tofile=f"b/{path}"))
+        text = "".join(chunks)
     if len(text) > DIFF_TEXT_CAP:
         text = text[:DIFF_TEXT_CAP]
         return text, f"Diff capped at {DIFF_TEXT_CAP // 1000} KB."
     return text, ""
-
-
-def _read_patch_text(run_dir: Path) -> str:
-    """Concatenate ``review-diff.patch`` then ``framework-edit.diff`` (whichever exists)."""
-    chunks: list[str] = []
-    for rel in ("review-diff.patch", "framework-edit.diff"):
-        path = run_dir / rel
-        if path.is_file():
-            try:
-                chunks.append(path.read_text(encoding="utf-8", errors="replace"))
-            except OSError:
-                continue
-    return "".join(chunks)
 
 
 def _project_file_lazy(path: str, project: Path) -> tuple[str, str | None]:
@@ -748,7 +923,16 @@ def _project_file_lazy(path: str, project: Path) -> tuple[str, str | None]:
     """
     from mini_ork.cli.board_cmd import _project_file
 
-    return _project_file(path, project)
+    display, absolute = _project_file(path, project)
+    if absolute is None and Path(path).is_absolute() and Path(path).is_file():
+        # A live worktree's file that the project does not have yet (a new
+        # file): open it where it is, shown relative to its repo root.
+        absolute = path
+        for parent in Path(path).parents:
+            if (parent / ".git").exists():
+                display = str(Path(path).relative_to(parent))
+                break
+    return display, absolute
 
 
 # ── commits (kickoff §1) ─────────────────────────────────────────────────────
@@ -855,9 +1039,25 @@ def _parse_commits(output: str) -> list[dict[str, Any]]:
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
+    """A JSON object from ``path`` — verifier files may carry log lines before it.
+
+    Fix #2: tolerant read. ``verifier_static-check.json`` starts with a
+    ``DeprecationWarning`` line, so a raw ``json.loads`` fails. Find the
+    first line that starts with ``{`` and parse from there to end-of-file; return ``None``
+    when the slice is not valid JSON or the parsed value is not a dict.
+    Mirrors :func:`mini_ork.ide_pages.run._json_obj`.
+    """
     try:
-        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
-    except (OSError, json.JSONDecodeError):
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    match = re.search(r"^\{", text, re.MULTILINE)
+    if match is None:
+        return None
+    start = match.start()
+    try:
+        data = json.loads(text[start:])
+    except ValueError:
         return None
     return data if isinstance(data, dict) else None
 
