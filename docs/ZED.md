@@ -279,6 +279,14 @@ default server stays read-only.
   writes `.mini-ork/runs/<run id>/agent-<node>.live.jsonl` per workflow node;
   orchestrator threads are kept in `.mini-ork/acp-threads/`. This is where to
   look when a run stalls.
+- **The Claude CLI's startup lines are not the agent's output.** On a gateway
+  lane (`deepseek`, `glm`, `kimi`, `minimax`) the harness prints an
+  auth-precedence notice and a model-registry warning to stderr before it does
+  any work. They are advisory and harmless, and mini-ork withholds them from
+  the live view (`_HARNESS_STARTUP_NOISE` in `mini_ork/dispatch/core.py`) so a
+  node still starting up does not show warnings where its output belongs. A
+  node whose panel is *empty* is idle, not erroring; the failure text for a
+  lane that did fail still leads with the API error from its stdout envelope.
 - **The project must contain `.mini-ork/`.** `mini-ork zed setup` writes
   settings, but each run needs its own home — run `mini-ork init` in the
   project root if you have not.

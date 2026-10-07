@@ -47,6 +47,25 @@ TextParser = Callable[[str], str]
 # Cap on the recorded error text (llm_calls.error_message / DispatchResult.error).
 _ERROR_CAP = 2000
 
+# Advisory chatter the Claude CLI prints to stderr at startup, before it does any
+# work: the connectors notice on any lane that sets an ANTHROPIC_* auth source
+# (which takes precedence over a claude.ai login), and the model-registry warning
+# on any lane pinned to a gateway model id the CLI does not ship — the whole
+# anthropic-compat family (deepseek, glm, kimi, minimax) trips the second one.
+#
+# Both are benign and both are the FIRST thing a live view of a lane sees, so
+# without this the node inspector shows two warnings where the agent's output
+# belongs until the stdout envelope arrives. Matched by substring because the
+# connectors notice is prefixed with a "⚠ " glyph on some versions.
+_HARNESS_STARTUP_NOISE = (
+    "claude.ai connectors are disabled",
+    "[claude-code:unrecognized_model]",
+)
+
+
+def _is_harness_startup_noise(line: str) -> bool:
+    return any(marker in line for marker in _HARNESS_STARTUP_NOISE)
+
 
 def _failure_detail(stdout: str, stderr: str) -> str:
     """The error to record for a non-zero lane exit.
@@ -208,12 +227,18 @@ def _drain_stream(
     record never carries half a JSON line unless the harness genuinely died
     mid-write — and that trailing fragment is flagged rather than dropped,
     because it is usually the last thing a killed run said.
+
+    The harness's startup chatter is kept in ``sink`` but withheld from the
+    live view — see ``_HARNESS_STARTUP_NOISE``. ``sink`` is what a failed lane
+    reports through ``_failure_detail``, so diagnostics are unaffected.
     """
     if stream is None:
         return
     try:
         for line in stream:
             sink.append(line)
+            if name == "stderr" and _is_harness_startup_noise(line):
+                continue
             live.write_line(line, name, partial=not line.endswith("\n"))
     except (OSError, ValueError):
         # The group was killed under us. What was already drained is still a
