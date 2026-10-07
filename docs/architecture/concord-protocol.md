@@ -235,6 +235,25 @@ commit, in a throwaway worktree. The verdict is one of:
 
 `MO_MERGE_DIFFERENTIAL=0` skips the rerun.
 
+## Live tuning and arbitration (shipped 2026-10-05 → 2026-10-08)
+
+Concord has run on production ContextNest since 2026-10-04. Each change below came
+from measuring the notices that reached live sessions (read back from transcripts),
+not from guessing.
+
+| Change | Measured problem | Rule now |
+|---|---|---|
+| **P1c noise cut** (ContextNest #216) | 30 of 52 disk-truth notices were "deleted on disk" on a **Write** re-creating a file after a loop rollback. 58 of 71 digest lines were Claude auto-memory files | A Write never gets a deletion notice. The digest skips `CONTEXTNEST_CONCORD_DIGEST_IGNORE_GLOBS` (default `**/.claude/projects/*/memory/**`). Measured after: digest lines −68%/h, disk notices −41%/h |
+| **P2e implicit scope** (#218) | 43 of 122 owns violations were the worktree's **own kickoff** or `.mini-ork/**` run logs | Both count as in scope (`CONTEXTNEST_CONCORD_OWNS_IMPLICIT_GLOBS`, `CONTEXTNEST_CONCORD_OWNS_OWN_KICKOFF=0` to disable). Real drift, such as two worktrees editing the same unclaimed file, still reports |
+| **P3b intent blend** (#219) | One status question replaced a loop's topic (similarity 0.996 → 0.62) | An intent is a running blend, `normalize((1−α)·old + α·new)` with α = `CONTEXTNEST_CONCORD_INTENT_ALPHA` (0.3). An off-topic turn (cos < 0.5) keeps the old text. `samples` is exposed by `/coord/intents` |
+| **P1d shell attribution** (#220) | P1b could not say **who** changed a file (21 of 52 notices) | Bash calls record `exec` footprints, and the hook matcher includes `Bash`. A disk-truth notice names the likely writer: "Probably `<principal>` ran `…`" or "your own shell command". Exec rows never count as writes |
+| **P4 arbitration** (#221) | Notices repeated every turn with no record of whether anyone acted | Every notice belongs to an **overlap item** `(overlap O-<id>)`. `POST /coord/overlaps/{id}/ack` (proceed/yield) messages the other side. An item unacknowledged after 3 notices or 30 min **escalates once** to `human:operator`'s mailbox. `POST /coord/freezes` lets the operator freeze a glob. Freeze is the only blocking path; it denies everyone outside the freezer's lineage, including requests with no resolved principal |
+
+All of it was verified live on prod on 2026-10-08: own kickoff in scope; shell write
+attributed; overlap id and ack; freeze denies an outsider and an unbound request;
+intents expose `samples`. The prod boot now takes about 34 min (424 k fragments), so
+`make cn-prod` waits up to 3600 s.
+
 ## Live smoke
 
 `scripts/concord_live_smoke.py --cn-bin <contextnest>` drives an isolated
@@ -277,10 +296,10 @@ The smoke surfaced three Claude Code behaviours a harness must design around:
 | Phase | Adds |
 |---|---|
 | P0.5 | ✅ Offline replay + labelled precision (see above) |
-| P1 | ✅ Footprints + pre-action stale-premise check; ✅ P1b disk truth for writers Concord never sees |
-| P2 | ✅ Hot-set claims, `--owns` enforcement, per-turn digest, epic admission (see above). Still open: publish-gate validation of the `main` ref |
-| P3 | ✅ Topic overlap through live intents (opt-in, calibrate first). Still open: ack, escalate and freeze arbitration; attributing Bash writes to a principal |
-| P4 | ✅ Alone-versus-combined test validation at merge |
+| P1 | ✅ Footprints + pre-action stale-premise check; ✅ P1b disk truth; ✅ P1c measured noise cut; ✅ P1d shell-write attribution |
+| P2 | ✅ Hot-set claims, `--owns` enforcement, per-turn digest, epic admission; ✅ P2e implicit scope. Still open: publish-gate validation of the `main` ref |
+| P3 | ✅ Topic overlap through live intents (opt-in, calibrate first); ✅ P3b intent blend. Still open: turn notices on after calibrating `/coord/topic-pairs` on real traffic |
+| P4 | ✅ Alone-versus-combined test validation at merge; ✅ overlap arbitration (ack, escalate, operator freeze). Still open: a `mini-ork concord overlaps / ack-overlap / freeze` CLI |
 
 Design rationale and literature: see the Concord design note (2026-10-02 coordination
 technique review, 1000 papers, three independent reviewers).
