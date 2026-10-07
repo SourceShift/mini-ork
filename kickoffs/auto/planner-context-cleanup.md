@@ -1,4 +1,4 @@
-# Planner context: no unverified gradients, no other sessions' or projects' material
+# Planner context: no unverified gradients, no other sessions' or projects' material; full verify command
 
 ## Why (audit of live runs, 2026-10-07)
 
@@ -30,6 +30,7 @@ BOTH the v1 and v2 arms (`other_blocks`).
 ## Files in scope (touch ONLY these)
 
 - `mini_ork/cli/plan.py`: ONLY `_inject_context` (and a small helper it uses)
+- `mini_ork/context_v2.py`: ONLY `_constraint_items` (change 4)
 - `docs/CONFIG.md`: ONLY two new env-var rows
 - `tests/unit/test_planner_context_cleanup.py` (new)
 
@@ -44,9 +45,12 @@ Do NOT modify any other file.
 3. **The planner injection record** (`context_v2.write_injection_record(... extra=...)`) gets
    `extra["skipped_blocks"] = {"graph_context": "unverified", "role_pack": "shared_context_off",
    …}` for every block left out, so the ledger shows what was withheld and why.
-4. **Ledger kinds for v2 items:** where `_inject_context` builds `sources` for context_v2 item ids
-   (`{"kind": "context_v2", "id": i}`), set the kind from the id prefix: `c:` → `constraint`,
-   `f:` → `finding`, `p:` → `prior_attempt`, else `context_v2`. Ids unchanged.
+4. **The full verification command reaches agents** (`context_v2._constraint_items`, :468-470):
+   `one = " ".join(cmd.split())[:240]` cuts long commands. In 3 of the last 30 kickoffs the
+   command was longer (e.g. `eng-your-code-tab-r2.md`, 428 chars), so every node was told
+   "Success is proven by: `<broken half-command>`". Keep the whole command up to 2000 chars.
+   Beyond that, cut and append ` …(truncated)` so the cut is visible. Leave the
+   `"kind": "context_v2"` source kind as it is: `mini_ork/cli/metrics_context.py:78` depends on it.
 5. **`docs/CONFIG.md` rows:**
    - `MO_PLANNER_SHARED_CONTEXT` | unset | "1 adds ContextNest memory, the attention inbox and
      the active-state index to the planner prompt (off: they carry other sessions' and projects'
@@ -63,8 +67,8 @@ Do NOT modify any other file.
 - `MO_INJECT_UNVERIFIED=1` → the graph-context block is present.
 - `MO_PLANNER_SHARED_CONTEXT=1` → the role pack / active-state blocks are present (from stub
   producers).
-- `sources` kinds for v2 ids `c:0`, `f:abc`, `p:run-1` → `constraint` / `finding` /
-  `prior_attempt`.
+- `context_v2._constraint_items({"verification": [<a 430-char command>]})`: the item text holds
+  the whole command. A 2500-char command is cut and ends with `…(truncated)`.
 - The verified failure-modes block (patterns) is still injected in the v1 arm.
 
 ## Verification command
@@ -73,11 +77,11 @@ The command that proves this run succeeded (per file; the host kills one CPU-bou
 that runs longer than 30 s):
 
 ```bash
-for f in tests/unit/test_planner_context_cleanup.py tests/unit/test_mini_ork_plan_py.py; do env -u MINI_ORK_RUN_ID -u MINI_ORK_DB -u MINI_ORK_HOME python3.11 -m pytest -q -p no:asyncio "$f" || exit 1; sleep 3; done   # must exit 0
+for f in tests/unit/test_planner_context_cleanup.py tests/unit/test_mini_ork_plan_py.py tests/unit/test_context_v2.py tests/unit/test_context_v2_wiring.py; do env -u MINI_ORK_RUN_ID -u MINI_ORK_DB -u MINI_ORK_HOME python3.11 -m pytest -q -p no:asyncio "$f" || exit 1; sleep 3; done   # must exit 0
 ```
 
 ## Done when
 
 - The verification command → 0 failed. Paste the summary lines.
-- `uvx ruff check mini_ork/cli/plan.py tests/unit/test_planner_context_cleanup.py` → clean.
+- `uvx ruff check mini_ork/cli/plan.py mini_ork/context_v2.py tests/unit/test_planner_context_cleanup.py` → clean.
 - `git diff --stat` touches only the files in scope.
