@@ -53,3 +53,15 @@ finding. An `approve` verdict MAY carry an empty array.
 Findings are the machine-readable form of the review and are read by the IDE's
 "Your code" view, so they are part of the contract, not decoration: cite the
 file and line you actually inspected.
+
+---
+
+## One complete pass
+
+Report every blocking problem you can find in this one review. The implementer
+fixes only what you list, so a blocker that is visible now but reported in a
+later round costs a whole extra round and can discard the delivery. Before you
+answer, read the whole diff, every changed file, and list each file you read in
+`checked_criteria`. If a round fixes your earlier findings, judge those fixes
+first; a new blocker in a later round must be one the earlier diff did not
+already show.

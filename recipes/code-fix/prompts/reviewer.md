@@ -127,3 +127,16 @@ Emit a single JSON object on stdout. No prose before or after.
   maps to REQUEST_CHANGES with a specific probe question in `suggested_changes`.
 - Skip the `evidence` array — every verdict must be grounded.
 - Approve if any verifier failed, even if you believe the failure is minor.
+
+---
+
+## One complete pass
+
+Put every blocking problem you can find into this one review's
+`suggested_changes`; when there are more than five, merge related ones so the
+list stays within its 1–5 limit. The implementer fixes only what you list, so a blocker that
+is visible now but reported in a later round costs a whole extra round and can
+discard the fix. Before you answer, read the whole diff, every changed file, and
+name the files you read in `evidence`. If this round fixes your earlier
+requests, judge those fixes first; a new blocker in a later round must be one
+the earlier diff did not already show.

@@ -1062,6 +1062,85 @@ def _read_revise_feedback(run_dir: str) -> dict | None:
     return {"round": round_no, "max_rounds": max_rounds, "feedback_text": feedback_text}
 
 
+def _review_round_arm(run_id: str) -> str:
+    """``MO_REVIEW_ROUND_AWARE``: ``off`` (default) | ``on``. Under ``on``, a
+    deterministic ``MO_REVIEW_ROUND_AWARE_HOLDOUT`` share of runs (default 0.2,
+    by run id) keeps the plain reviewer, so the effect can be measured."""
+    if context_env("MO_REVIEW_ROUND_AWARE", "off").strip().lower() not in ("on", "1", "true"):
+        return "off"
+    try:
+        rate = min(max(float(context_env("MO_REVIEW_ROUND_AWARE_HOLDOUT", "0.2")), 0.0), 1.0)
+    except ValueError:
+        rate = 0.2
+    if run_id and rate > 0.0:
+        digest = hashlib.sha1(f"review-rounds:{run_id}".encode("utf-8")).hexdigest()[:8]
+        if int(digest, 16) / 0xFFFFFFFF < rate:
+            return "holdout"
+    return "on"
+
+
+def _reviewer_round_block(run_dir: str, run_id: str) -> str:
+    """Round awareness + a severity bar for the plain reviewer, or ``""``.
+
+    Measured 2026-10-07: framework-edit runs that rolled back after their revise
+    rounds mostly hit NEW blockers each round (regressions of the last fix, or
+    issues visible since round 1 but reported late), and the reviewer did not
+    know that a final-round needs_revision discards the whole delivery. This
+    block tells it which attempt it is judging and to block only on high
+    severity. It changes what gets approved, so it ships behind a default-off
+    flag with a holdout arm; the arm and attempt are recorded in
+    ``review-round-aware.json`` for the comparison.
+    """
+    arm = _review_round_arm(run_id)
+    if arm == "off":
+        return ""
+    revise = _read_revise_feedback(run_dir)
+    try:
+        cap = max(0, int(context_env("MO_REVISE_ROUNDS", "2")))
+    except ValueError:
+        cap = 2
+    if revise:
+        attempt = int(revise.get("round") or 1) + 1
+        total = int(revise.get("max_rounds") or cap) + 1
+    else:
+        attempt, total = 1, cap + 1
+    final = attempt >= total
+    try:
+        record_path = os.path.join(run_dir, "review-round-aware.json")
+        records = []
+        if os.path.isfile(record_path):
+            with open(record_path, encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            records = loaded if isinstance(loaded, list) else []
+        records.append({"arm": arm, "attempt": attempt, "total": total, "final": final,
+                        "at": int(time.time())})
+        with open(record_path, "w", encoding="utf-8") as fh:
+            json.dump(records, fh)
+    except (OSError, ValueError):
+        pass
+    if arm != "on":
+        return ""
+    consequence = ("on this FINAL attempt it discards the whole delivery and the run rolls back."
+                   if final else "the implementer gets one more attempt to fix them.")
+    lines = [
+        f"## Review attempt {attempt} of {total}",
+        f"A fail or needs_revision verdict sends your findings back to the implementer; {consequence}",
+        "- Return fail or needs_revision only for HIGH-severity findings: the change is wrong, "
+        "unsafe, breaks a test, or misses a requirement of the kickoff. For medium and low "
+        "findings, pass and list them in your notes/findings.",
+    ]
+    if attempt > 1 and revise:
+        from mini_ork.context_assembler import cap_block
+        lines.append("- First check that every finding from the previous attempt (below) is "
+                     "fixed. Raise a NEW blocking finding only if it is high severity.")
+        lines.append(cap_block(revise.get("feedback_text") or "",
+                               label=f"revise/round-{attempt - 1}.md"))
+    if final:
+        lines.append("- This is the last attempt: block only if shipping this change would be "
+                     "worse than discarding all of it.")
+    return "\n".join(lines) + "\n\n"
+
+
 def _handle_implementer(ctx: NodeDispatch):
     impl_log = ctx.declared_output_path(
         os.path.join(ctx.run_dir, f"impl-{ctx.node_id}.log")
@@ -1289,6 +1368,7 @@ def _handle_reviewer(ctx: NodeDispatch):
         # agent-written output (routing the captured text to `.stdout.md`).
         prompt = (f"{ctx.prepend()}Review the implementation for: {ctx.node_desc}{ctx.learned}\n\n"
                   f"Plan:\n{ctx.plan_content}{ctx.artifact_context}{ctx.scope_guard()}\n\n{reviewer_inputs}\n"
+                  f"{_reviewer_round_block(ctx.run_dir_eff or ctx.run_dir, ctx.run_id)}"
                   'Respond with JSON: {"verdict": "pass|fail|needs_revision", "notes": []}\n'
                   f'AND write that exact JSON object to {review_file} — a Bash heredoc is fine. '
                   'That file is the artifact the runtime reads; an answer that is prose only is discarded.')
