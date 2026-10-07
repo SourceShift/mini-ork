@@ -32,6 +32,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 _RUN_LIMIT = 50
+_RUNS_VERB_DEFAULT_LIMIT = 50
+_RUNS_VERB_MAX_LIMIT = 200
 _GRADIENT_LIMIT = 30
 _RECORD_LIMIT = 20
 _PATTERN_LIMIT = 10
@@ -46,28 +48,65 @@ def _section(errors: dict[str, str], name: str, fn: Callable[[], Any], empty: An
 
 
 def _runs(home: Path) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    from mini_ork import workspaces
     from mini_ork.acp.fleet import fleet_rows
 
-    rows, counts = fleet_rows(home, state="all", limit=_RUN_LIMIT)
-    open_ws = {w.run_id for w in workspaces.list_open(home)}
-    return [
-        {
-            "id": r.run_id,
-            "title": r.title,
-            "recipe": r.recipe,
-            "state": r.state,
-            "mark": r.mark,
-            "step": r.step,
-            "started_at": r.started_at,
-            "ended_at": r.ended_at,
-            "cost_usd": round(float(r.cost_usd or 0.0), 4),
-            "added": r.added,
-            "removed": r.removed,
-            "has_workspace": r.run_id in open_ws,
-        }
-        for r in rows
-    ], dict(counts)
+    fleet, counts = fleet_rows(home, state="all", limit=_RUN_LIMIT)
+    open_ws = _open_workspace_ids(home)
+    return [_fleet_row_to_dict(r, open_ws) for r in fleet], dict(counts)
+
+
+def _fleet_row_to_dict(row: Any, open_ws: set[str]) -> dict[str, Any]:
+    """Map a ``FleetRow`` to the IDE row dict — shared by ``_runs`` and
+    :func:`_rows_for` so both stay byte-compatible (the recspec requires
+    ``board runs`` rows to match ``board --json``)."""
+    return {
+        "id": row.run_id,
+        "title": row.title,
+        "recipe": row.recipe,
+        "state": row.state,
+        "mark": row.mark,
+        "step": row.step,
+        "started_at": row.started_at,
+        "ended_at": row.ended_at,
+        "cost_usd": round(float(row.cost_usd or 0.0), 4),
+        "added": row.added,
+        "removed": row.removed,
+        "has_workspace": row.run_id in open_ws,
+    }
+
+
+def _open_workspace_ids(home: Path) -> set[str]:
+    from mini_ork import workspaces
+
+    return {w.run_id for w in workspaces.list_open(home)}
+
+
+def _rows_for(home: Path, run_ids: list[str]) -> list[dict[str, Any]]:
+    """Build the IDE row dicts for ``run_ids`` in input order.
+
+    Real rows for every id — no stub fallback. ``runs_by_ids`` is one
+    ``SELECT ... WHERE id IN (...)`` for the candidate rows; ``rows_from_candidates``
+    computes the precise ``state``/``step``/``added``/``removed`` from the run
+    dir + a batched events lookup. Shape mirrors :func:`_runs` so ``board runs``
+    rows are byte-compatible with ``board --json`` rows.
+    """
+    if not run_ids:
+        return []
+    from mini_ork.acp.fleet import rows_from_candidates
+    from mini_ork.acp.history import runs_by_ids
+
+    candidates = runs_by_ids(home, run_ids)
+    fleet = rows_from_candidates(home, candidates)
+    by_id = {r.run_id: r for r in fleet}
+    open_ws = _open_workspace_ids(home)
+
+    out: list[dict[str, Any]] = []
+    for rid in run_ids:
+        r = by_id.get(rid)
+        if r is None:
+            continue
+        out.append(_fleet_row_to_dict(r, open_ws))
+    return out
 
 
 def _learnings(home: Path) -> list[dict[str, Any]]:
@@ -582,6 +621,92 @@ def _act_steer(home: Path, run_id: str, text: str | None, role: str | None,
                      source="ide")
 
 
+def _clamp_runs_verb_args(offset: int, limit: int) -> tuple[int, int]:
+    """Sanitise the verb's offset/limit — ``argparse`` only checks types."""
+    if offset < 0:
+        raise ValueError(f"offset must be >= 0 (got {offset})")
+    if limit < 1:
+        raise ValueError(f"limit must be >= 1 (got {limit})")
+    return int(offset), min(int(limit), _RUNS_VERB_MAX_LIMIT)
+
+
+def _runs_verb(home: Path, query: str | None, offset: int, limit: int) -> dict[str, Any]:
+    """``mini-ork board runs [--query Q] [--offset N] [--limit M]``.
+
+    No query: pages across every run (newest first); ``total`` is the full
+    ``task_runs`` count, so paging past the 200-candidate ``CANDIDATE_LIMIT``
+    window still surfaces real records — the ``list_runs`` rows are passed
+    straight to :func:`mini_ork.acp.fleet.rows_from_candidates` (no
+    ``runs_by_ids`` re-read). With a query: FTS5 over kickoff + main
+    artifacts, with a LIKE fallback when sqlite was built without FTS5.
+    Errors are surfaced in the payload's ``errors`` field rather than
+    failing the whole verb. When reindex runs with a partial budget the
+    payload also carries ``"indexing": True``.
+    """
+    errors: dict[str, str] = {}
+    offset, limit = _clamp_runs_verb_args(offset, limit)
+    query = (query or "").strip()
+
+    if query:
+        from mini_ork.ide_pages import search as _search
+
+        # Reindex first so cold calls find matches; then search once.
+        # Both calls thread ``errors`` so the FTS5-degraded note + the
+        # partial-index note (``errors["index"]``) reach the verb payload.
+        _section(errors, "reindex", lambda: _search.reindex(home, errors=errors), 0)
+        run_ids, total = _section(
+            errors, "search",
+            lambda: _search.search(home, query, limit, offset, errors=errors),
+            ([], 0),
+        )
+        run_ids = list(run_ids)
+        rows = _rows_for(home, run_ids)
+    else:
+        from mini_ork.acp.fleet import rows_from_candidates
+        from mini_ork.acp.history import list_runs
+
+        try:
+            candidates, _ = list_runs(home, limit=limit, offset=offset)
+            total = _count_runs(home)
+        except Exception as exc:  # noqa: BLE001
+            candidates = []
+            total = 0
+            errors["list_runs"] = f"{type(exc).__name__}: {exc}"
+        # No-query path: pass ``list_runs`` rows straight to
+        # ``rows_from_candidates`` instead of collapsing to ids and
+        # re-reading via ``runs_by_ids`` (kickoff r3 fix #5).
+        fleet = rows_from_candidates(home, candidates)
+        open_ws = _open_workspace_ids(home)
+        rows = [_fleet_row_to_dict(r, open_ws) for r in fleet]
+
+    has_more = (offset + len(rows)) < int(total or 0)
+    return {
+        "ok": True,
+        "runs": rows,
+        "total": int(total or 0),
+        "offset": offset,
+        "has_more": has_more,
+        "errors": errors,
+        "indexing": "index" in errors,
+    }
+
+
+def _count_runs(home: Path) -> int:
+    """Total ``task_runs`` rows — ``0`` on a missing DB / missing table."""
+    if not (Path(home) / "state.db").is_file():
+        return 0
+    try:
+        from mini_ork.web.db import db_for
+
+        db = db_for(home)
+        if not db.has_table("task_runs"):
+            return 0
+        row = db.row("SELECT COUNT(*) AS n FROM task_runs") or {}
+        return int(row.get("n") or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def _default_home() -> Path:
     return Path(os.environ.get("MINI_ORK_HOME", "").strip() or (Path.cwd() / ".mini-ork"))
 
@@ -627,7 +752,7 @@ def main(rest: list[str], root: str) -> int:
         if not args.text:
             sys.stderr.write("mini-ork board steer: --text is required\n")
             return 2
-    elif args.verb != "show" and not args.run_id:
+    elif args.verb != "show" and args.verb != "runs" and not args.run_id:
         what = "a page key" if args.verb == "page" else "a run id"
         sys.stderr.write(f"mini-ork board {args.verb}: {what} is required\n")
         return 2
@@ -668,6 +793,12 @@ def main(rest: list[str], root: str) -> int:
         payload = _act_retry(home, args.run_id,
                              ack_change=args.ack_change, force=args.force,
                              dry_run=args.dry_run)
+    elif args.verb == "runs":
+        try:
+            payload = _runs_verb(home, args.query, args.offset, args.limit)
+        except ValueError as exc:
+            sys.stderr.write(f"mini-ork board runs: {exc}\n")
+            return 2
     else:
         payload = act(home, args.verb, args.run_id)
     if reap_errors:
@@ -683,7 +814,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mini-ork board", add_help=False)
     parser.add_argument("verb", nargs="?", default="show",
                         choices=["show", "run", "merge", "discard", "stop", "kill",
-                                 "resume", "retry", "gate", "page", "node", "steer"])
+                                 "resume", "retry", "gate", "page", "node", "steer", "runs"])
     parser.add_argument("run_id", nargs="?")
     # `gate approve|reject <inbox_id>` puts the action in run_id and the id here;
     # `node <run_id> <node_id>` uses the same slot for the node id (the L464
@@ -717,6 +848,11 @@ def build_parser() -> argparse.ArgumentParser:
                              "case-3 'code' revisions).")
     parser.add_argument("--dry-run", action="store_true",
                         help="retry: return the hint only, never spawn.")
+    parser.add_argument("--query", default=None,
+                        help="full-text query for board runs (whitespace ANDed)")
+    parser.add_argument("--limit", type=int, default=_RUNS_VERB_DEFAULT_LIMIT,
+                        help=f"page size for runs board (default {_RUNS_VERB_DEFAULT_LIMIT}, "
+                             f"max {_RUNS_VERB_MAX_LIMIT})")
     return parser
 
 

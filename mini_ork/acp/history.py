@@ -215,6 +215,73 @@ def list_runs(
     return out, (offset + limit if has_more else None)
 
 
+def runs_by_ids(home: Path, run_ids: list[str]) -> list[dict[str, Any]]:
+    """``list_runs``-shaped rows for the given ids, in input order.
+
+    Used by the ``board runs`` verb to build real rows for ids past
+    ``MAX_LIMIT = 50`` (the cap the ACP ``/runs`` table applies) without
+    paying the full ``list_runs`` scan. One ``SELECT ... WHERE id IN (...)``
+    with the same key set, title rule, and ``_is_safe_token`` filter as
+    :func:`list_runs`. Ids not present in ``task_runs`` are silently
+    skipped; the returned list is at most ``len(run_ids)`` long and
+    preserves input order so callers can zip it back to a request.
+
+    A missing DB or missing table returns ``[]``; an empty ``run_ids``
+    short-circuits before touching the DB.
+    """
+    from mini_ork.web.db import db_for
+
+    if not run_ids:
+        return []
+    home = Path(home)
+    if not (home / "state.db").exists():
+        return []
+    safe_ids = [rid for rid in run_ids if isinstance(rid, str) and _is_safe_token(rid)]
+    if not safe_ids:
+        return []
+    try:
+        db = db_for(home)
+    except (FileNotFoundError, sqlite3.OperationalError):
+        return []
+    if not db.has_table("task_runs"):
+        return []
+    placeholders = ",".join("?" for _ in safe_ids)
+    try:
+        rows = db.rows(
+            f"""
+            SELECT id, recipe, status, cost_usd, created_at, updated_at, kickoff_path
+            FROM task_runs
+            WHERE id IN ({placeholders})
+            """,
+            tuple(safe_ids),
+        )
+    except sqlite3.OperationalError:
+        return []
+    by_id: dict[str, dict[str, Any]] = {
+        rid: row for row in rows for rid in [row.get("id")] if isinstance(rid, str) and rid
+    }
+    out: list[dict[str, Any]] = []
+    for rid in run_ids:
+        row = by_id.get(rid)
+        if row is None:
+            continue
+        recipe = row.get("recipe")
+        kickoff = _read_kickoff(home, rid, row.get("kickoff_path"))
+        title = _title_from_kickoff(kickoff) or f"{recipe or 'mini-ork'} run"
+        out.append(
+            {
+                "run_id": rid,
+                "status": row.get("status"),
+                "recipe": recipe,
+                "cost_usd": row.get("cost_usd"),
+                "created_at": _normalize_ts(row.get("created_at")),
+                "updated_at": _normalize_ts(row.get("updated_at")),
+                "title": title,
+            }
+        )
+    return out
+
+
 def kickoff_text(home: Path, run_id: str, max_chars: int = 4000) -> str:
     """The kickoff markdown for ``run_id``, truncated to ``max_chars``; "" when absent."""
     home = Path(home)

@@ -30,6 +30,7 @@ a row.
 - ``chips``  ``items`` of ``{"t", "on", "do"}`` — filter chips
 - ``dag``    ``cols`` of node lists (see :func:`dag`) + ``legend``
 - ``inspector`` one node's output lines and key/values (see :func:`inspector`)
+- ``markdown`` ``text`` (raw markdown body) + ``path`` (absolute file path)
 
 Colours are names, never hex: ``text body muted sub dim blue green red yellow
 purple cyan orange`` or a lane family ``fam:<lane>`` (``fam:sonnet``). The IDE
@@ -244,6 +245,15 @@ def code(title: str, lines: Iterable[tuple | list | str], **opt: Any) -> dict[st
         else:
             out.append({"t": str(line[0]), "c": line[1] if len(line) > 1 else "body"})
     return _section("code", title, {"lines": out}, **opt)
+
+
+def markdown(title: str, text: str, path: str | None = None, **opt: Any) -> dict[str, Any]:
+    """A full markdown body — the run's kickoff, rendered raw by the IDE.
+
+    ``path`` is the absolute file the text was loaded from (``None`` when the
+    text came from memory or the run had no kickoff).
+    """
+    return _section("markdown", title, {"text": text or "", "path": path or ""}, **opt)
 
 
 def pills(title: str, items: Iterable[tuple | list | str], **opt: Any) -> dict[str, Any]:

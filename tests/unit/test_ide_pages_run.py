@@ -123,7 +123,7 @@ def test_dag_layers_the_workflow_and_attributes_cost(home: Path) -> None:
     _seed(home)
     page = build_page(home, "run", None, {"run": RUN})
     assert page["ok"] is True and page["tab"] == "dag" and page["title"] == RUN
-    assert [t["key"] for t in page["tabs"]] == ["dag", "overview", "agents", "learnings", "artifacts"]
+    assert [t["key"] for t in page["tabs"]] == ["dag", "kickoff", "overview", "agents", "learnings", "artifacts"]
     assert [c["t"] for c in page["chips"]][:2] == ["published · verified", "5/6 nodes"]
     dag = _section(page, "dag")
     cols = [[n["id"] for n in c] for c in dag["cols"]]
@@ -240,3 +240,86 @@ def test_missing_or_unknown_run(home: Path) -> None:
     assert build_page(home, "run", None, {})["ok"] is False
     out = build_page(home, "run", None, {"run": "run-nope"})
     assert out["ok"] is False and "no run run-nope" in out["error"]
+
+
+def test_kickoff_tab_renders_the_full_kickoff(home: Path) -> None:
+    """The Kickoff tab returns one full-width ``markdown`` section whose text
+    is the whole kickoff (cap 200 000) and whose ``path`` is the kickoff
+    file's absolute path. Regression: the old header showed a one-line
+    description; the tab must show the full brief.
+    """
+    _seed(home)
+    page = build_page(home, "run", "kickoff", {"run": RUN})
+    md = _section(page, "markdown")
+    assert md["text"].startswith("# Make the demo pass")
+    assert "Details." in md["text"]
+    assert md["full"] is True
+    assert md["path"].endswith("demo.md") and Path(md["path"]).is_absolute()
+
+
+def test_kickoff_tab_caps_at_200000_with_a_trailing_marker(home: Path) -> None:
+    """Beyond 200 000 chars the text is truncated and ``(truncated)`` appended.
+    The cap is the recspec — past it, the IDE would lag.
+    """
+    _seed(home)
+    long_text = "x" * 250_000
+    kick = home / "kickoffs" / "demo.md"
+    kick.write_text(long_text)
+    page = build_page(home, "run", "kickoff", {"run": RUN})
+    md = _section(page, "markdown")
+    assert md["text"].endswith("(truncated)\n")
+    assert md["text"].startswith("x" * 100)
+
+
+def test_kickoff_tab_falls_back_to_runs_inbox(home: Path) -> None:
+    """With no ``task_runs.kickoff_path`` row, the runs-inbox fallback wins."""
+    _seed(home)
+    inbox = home / "runs-inbox" / f"{RUN}.md"
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+    inbox.write_text("# From inbox\n\ninbox body\n")
+    # The fixture seeds ``kickoff_path`` to the home/kickoffs/demo.md path;
+    # clear the column so the resolver falls through to inbox.
+    import sqlite3 as _sqlite3
+    con = _sqlite3.connect(home / "state.db")
+    con.execute("UPDATE task_runs SET kickoff_path = '' WHERE id = ?", (RUN,))
+    con.commit()
+    con.close()
+    page = build_page(home, "run", "kickoff", {"run": RUN})
+    md = _section(page, "markdown")
+    assert md["text"].startswith("# From inbox")
+    assert md["path"].endswith(f"runs-inbox/{RUN}.md")
+
+
+def test_kickoff_tab_falls_back_to_run_dir_glob(home: Path) -> None:
+    """No ``kickoff_path`` row and no runs-inbox: a ``kickoff*.md`` glob in
+    the run dir is the third fallback (operator dropped the file alongside
+    the run dir).
+    """
+    _seed(home)
+    run_dir = home / "runs" / RUN
+    (run_dir / "kickoff-extra.md").write_text("# Run-dir kickoff\n\nyes.\n")
+    import sqlite3 as _sqlite3
+    con = _sqlite3.connect(home / "state.db")
+    con.execute("UPDATE task_runs SET kickoff_path = '' WHERE id = ?", (RUN,))
+    con.commit()
+    con.close()
+    page = build_page(home, "run", "kickoff", {"run": RUN})
+    md = _section(page, "markdown")
+    assert md["text"].startswith("# Run-dir kickoff")
+    assert md["path"].endswith("kickoff-extra.md")
+
+
+def test_kickoff_tab_reports_when_no_kickoff_is_found(home: Path) -> None:
+    """No kickoff at any tier — the tab shows the single-dot list section."""
+    _seed(home)
+    import sqlite3 as _sqlite3
+    con = _sqlite3.connect(home / "state.db")
+    con.execute("UPDATE task_runs SET kickoff_path = '' WHERE id = ?", (RUN,))
+    con.commit()
+    con.close()
+    # Drop the runs-inbox file and the run-dir kickoff*.md too.
+    (home / "kickoffs" / "demo.md").unlink()
+    page = build_page(home, "run", "kickoff", {"run": RUN})
+    lst = _section(page, "list", "Kickoff")
+    assert len(lst["items"]) == 1
+    assert "No kickoff file recorded" in lst["items"][0]["t"]

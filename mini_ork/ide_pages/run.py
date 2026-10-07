@@ -20,8 +20,13 @@ from typing import Any
 
 from mini_ork.ide_pages import spec as S
 
-TABS = [("dag", "DAG"), ("overview", "Overview"), ("agents", "Agents"),
+TABS = [("dag", "DAG"), ("kickoff", "Kickoff"), ("overview", "Overview"), ("agents", "Agents"),
         ("learnings", "Learnings"), ("artifacts", "Artifacts")]
+
+# The kickoff text is capped well above the 20 KB the run card shows — the kickoff
+# tab is the place to read the whole task brief. Beyond the cap we append a
+# trailing marker instead of silently chopping.
+_KICKOFF_TAB_CAP = 200_000
 
 # Node types that run a script, not a model, unless llm_calls say otherwise.
 _DETERMINISTIC = {"verifier", "publisher", "rollback", "shell", "gate", "transform"}
@@ -835,6 +840,62 @@ def _overview_tab(run: Run) -> list[dict[str, Any]]:
             + S.guarded(errors, "Files changed", files))
 
 
+def _resolve_kickoff(run: Run) -> tuple[str, str]:
+    """The run's kickoff markdown and its absolute source path.
+
+    Three-tier resolution: ``task_runs.kickoff_path`` → ``runs-inbox/<id>.md``
+    → the first ``kickoff*.md`` globbed in the run dir. ``history._read_kickoff``
+    does the same two-tier read but returns only text — we re-read it here so
+    we can also report which path actually served the bytes.
+    """
+    from mini_ork.acp.history import _is_safe_token
+
+    def _try(path: Path) -> str:
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    row_path = run.row.get("kickoff_path") or ""
+    if row_path:
+        text = _try(Path(row_path))
+        if text:
+            return text, str(Path(row_path).resolve())
+
+    if _is_safe_token(run.id):
+        inbox = run.home / "runs-inbox" / f"{run.id}.md"
+        if inbox.is_file():
+            text = _try(inbox)
+            if text:
+                return text, str(inbox.resolve())
+
+    for candidate in sorted(run.run_dir.glob("kickoff*.md")):
+        if candidate.is_file():
+            text = _try(candidate)
+            if text:
+                return text, str(candidate.resolve())
+
+    return "", ""
+
+
+def _kickoff_tab(run: Run) -> list[dict[str, Any]]:
+    errors: dict[str, str] = {}
+
+    def build() -> dict[str, Any]:
+        text, path = _resolve_kickoff(run)
+        if not text:
+            return S.lst("Kickoff", [S.dot("No kickoff file recorded for this run",
+                                            "Checked task_runs.kickoff_path, runs-inbox, and the run dir.")],
+                          full=True)
+        truncated = len(text) > _KICKOFF_TAB_CAP
+        if truncated:
+            text = text[:_KICKOFF_TAB_CAP] + "\n\n(truncated)\n"
+        title = Path(path).name if path else "Kickoff"
+        return S.markdown(title, text, path=path, full=True)
+
+    return S.guarded(errors, "Kickoff", build)
+
+
 def _agents_tab(run: Run) -> list[dict[str, Any]]:
     errors: dict[str, str] = {}
 
@@ -1192,6 +1253,7 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
              S.chip(S.money(_cost(run))), S.chip(_elapsed(run))]
     sections = {
         "dag": lambda: _dag_tab(run, args.get("node")),
+        "kickoff": lambda: _kickoff_tab(run),
         "overview": lambda: _overview_tab(run),
         "agents": lambda: _agents_tab(run),
         "learnings": lambda: _learnings_tab(run),

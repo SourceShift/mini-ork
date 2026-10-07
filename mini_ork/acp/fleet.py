@@ -462,11 +462,29 @@ def fleet_rows(
         filtered = [row for row in filtered if (row.get("recipe") or "") == recipe]
 
     shown = filtered[:bounded_limit]
-    shown_run_ids = [str(r.get("run_id") or "") for r in shown if r.get("run_id")]
-    events_by_run = _events_by_run(Path(home), shown_run_ids)
+    rows = rows_from_candidates(Path(home), shown)
+    return rows, counts
+
+
+def rows_from_candidates(home: Path, candidates: list[dict[str, Any]]) -> list[FleetRow]:
+    """Build ``FleetRow``s from ``list_runs``-shaped candidate dicts.
+
+    Extracted from :func:`fleet_rows` (the old step 4-5 block, lines
+    465-523) so the board ``runs`` verb can build rows for ids past the
+    ``MAX_LIMIT = 50`` clamp without going through the cheap-state
+    filter. The candidate dicts must carry the ``list_runs`` keys
+    (``run_id``, ``status``, ``recipe``, ``cost_usd``, ``created_at``,
+    ``updated_at``, ``title``); ``title`` is taken verbatim from the
+    dict so callers that pre-computed it (e.g. :func:`runs_by_ids`) keep
+    control of the title rule.
+    """
+    if not candidates:
+        return []
+    run_ids = [str(r.get("run_id") or "") for r in candidates if r.get("run_id")]
+    events_by_run = _events_by_run(home, run_ids)
 
     rows: list[FleetRow] = []
-    for row in shown:
+    for row in candidates:
         run_id = row.get("run_id") or ""
         recipe_name = str(row.get("recipe") or "")
         title = str(row.get("title") or "")
@@ -522,7 +540,7 @@ def fleet_rows(
             )
         )
 
-    return rows, counts
+    return rows
 
 
 def render_fleet(rows: list[FleetRow], counts: dict[str, int], *, state: str, now: int) -> str:
@@ -836,6 +854,7 @@ __all__ = [
     "FleetRow",
     "fleet_rows",
     "render_fleet",
+    "rows_from_candidates",
     "run_card",
     "render_card",
 ]

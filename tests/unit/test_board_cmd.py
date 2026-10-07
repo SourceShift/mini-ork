@@ -10,7 +10,15 @@ from pathlib import Path
 import pytest
 
 from mini_ork.cli import board_cmd
+from mini_ork.ide_pages import search as search_mod
 from mini_ork.stores import migrate as mig
+
+
+@pytest.fixture(autouse=True)
+def _no_real_search_builder(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`board runs --query` never starts a real background index builder here."""
+    monkeypatch.setattr(search_mod, "_spawn_indexer",
+                        lambda _args, *, log_handle=None: type("Fake", (), {"pid": None})())
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -879,3 +887,418 @@ def test_board_shell_path_does_not_pull_in_fastapi(home: Path) -> None:
     )
     assert neg_proc.returncode == 0, neg_proc.stderr
     assert "NEG OK" in neg_proc.stdout
+
+
+# ── kickoff ide-kickoff-search — ``board runs`` verb ───────────────────────
+
+
+def _seed_run_with_kickoff(home: Path, run_id: str, *, created_at: int,
+                           kickoff_text: str = "default kickoff body") -> int:
+    """Like ``_seed_run_at`` but with a kickoff file referenced from
+    ``kickoff_path`` so the search indexer reads a real file.
+    """
+    kickoff = home / "kickoffs" / f"{run_id}.md"
+    kickoff.parent.mkdir(parents=True, exist_ok=True)
+    kickoff.write_text(kickoff_text)
+    con = sqlite3.connect(home / "state.db")
+    con.execute(
+        "INSERT INTO task_runs (id, recipe, status, cost_usd, created_at, updated_at, "
+        "task_class, kickoff_path, workflow_version) VALUES (?,?,?,?,?,?,?,?,?)",
+        (run_id, "code-fix", "published", 0.0, created_at, created_at,
+         "code_fix", str(kickoff), "latest"),
+    )
+    con.commit()
+    con.close()
+    run_dir = home / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir.stat().st_mtime_ns
+
+
+def test_runs_verb_no_query_pages_across_all_runs(home: Path) -> None:
+    """``board runs`` (no query) pages the full ``task_runs`` set; ``total``
+    is the row count, not a sliced window."""
+    import io
+    from contextlib import redirect_stdout
+
+    base = 1_791_000_000
+    for i in range(7):
+        _seed_run_at(home, f"run-{base + i}-rk{i}", "published",
+                     created_at=base + i * 60, updated_at=base + i * 60)
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = board_cmd.main(["runs", "--limit", "3", "--home", str(home)], "")
+    assert rc == 0
+    payload = json.loads(buf.getvalue())
+    assert payload["ok"] is True
+    assert payload["total"] == 7
+    assert len(payload["runs"]) == 3
+    assert payload["offset"] == 0
+    assert payload["has_more"] is True
+    assert payload["errors"] == {}
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = board_cmd.main(["runs", "--offset", "6", "--limit", "3", "--home", str(home)], "")
+    page2 = json.loads(buf.getvalue())
+    assert page2["offset"] == 6 and page2["total"] == 7 and page2["has_more"] is False
+    assert len(page2["runs"]) == 1
+
+
+def test_runs_verb_with_query_uses_the_search_index(home: Path) -> None:
+    """``board runs --query X`` returns only the matching runs."""
+    base = 1_791_000_000
+    rid_a = f"run-{base}-maaa01"
+    rid_b = f"run-{base + 60}-maaa02"
+    _seed_run_with_kickoff(home, rid_a, created_at=base,
+                           kickoff_text="# alpha\n\napple banana feature\n")
+    _seed_run_with_kickoff(home, rid_b, created_at=base + 60,
+                           kickoff_text="# beta\n\ncherry durian feature\n")
+
+    import io
+    from contextlib import redirect_stdout
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = board_cmd.main(["runs", "--query", "apple", "--home", str(home)], "")
+    assert rc == 0
+    payload = json.loads(buf.getvalue())
+    assert payload["ok"] is True
+    assert payload["total"] >= 1
+    assert any(r["id"] == rid_a for r in payload["runs"])
+    assert all(r["id"] != rid_b for r in payload["runs"])
+
+
+def test_runs_verb_limit_is_clamped_to_200(home: Path) -> None:
+    """``--limit`` above 200 is clamped, not a usage error."""
+    import io
+    from contextlib import redirect_stdout
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = board_cmd.main(["runs", "--limit", "999", "--home", str(home)], "")
+    assert rc == 0
+    payload = json.loads(buf.getvalue())
+    assert payload["ok"] is True
+    # No runs seeded — the clamp is the contract; payload still has the shape.
+    assert payload["runs"] == [] and payload["total"] == 0
+
+
+def test_runs_verb_bad_offset_returns_usage_error(home: Path) -> None:
+    import io
+    from contextlib import redirect_stdout, redirect_stderr
+    buf_out, buf_err = io.StringIO(), io.StringIO()
+    with redirect_stdout(buf_out), redirect_stderr(buf_err):
+        rc = board_cmd.main(["runs", "--offset", "-1", "--home", str(home)], "")
+    assert rc == 2
+    assert "offset" in buf_err.getvalue()
+
+
+def test_runs_verb_does_not_require_a_run_id(home: Path) -> None:
+    """``board runs`` (no positional) is exempt from the run-id requirement
+    that other action verbs trigger."""
+    import io
+    from contextlib import redirect_stdout
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = board_cmd.main(["runs", "--home", str(home)], "")
+    assert rc == 0
+    payload = json.loads(buf.getvalue())
+    assert payload["ok"] is True
+
+
+def test_runs_verb_parser_accepts_runs_as_choice(home: Path) -> None:
+    """The parser's ``verb`` choice includes ``runs`` so a typo of ``run``
+    (singular) still routes through the ``run`` verb without crashing here."""
+    parser = board_cmd.build_parser()
+    args = parser.parse_args(["runs", "--home", str(home)])
+    assert args.verb == "runs"
+
+
+def test_runs_verb_payload_shape_matches_spec(home: Path) -> None:
+    """The payload keys are exact: ``ok, runs, total, offset, has_more,
+    errors, indexing`` — no extras (the shell ``_SHELL_KEYS`` guard
+    forbids leak). The new ``indexing`` flag (kickoff r3 fix #2) is
+    always present so the IDE can show partial-index state without a
+    second round-trip."""
+    import io
+    from contextlib import redirect_stdout
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        board_cmd.main(["runs", "--home", str(home)], "")
+    payload = json.loads(buf.getvalue())
+    assert set(payload) == {"ok", "runs", "total", "offset", "has_more", "errors", "indexing"}
+
+
+def test_runs_verb_no_state_db_is_an_empty_envelope(home: Path) -> None:
+    """Without ``state.db`` the verb returns the empty envelope — not exit 1."""
+    fresh = home.parent / "no-state"
+    fresh.mkdir()
+    import io
+    from contextlib import redirect_stdout
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = board_cmd.main(["runs", "--home", str(fresh)], "")
+    assert rc == 0
+    payload = json.loads(buf.getvalue())
+    assert payload["ok"] is True and payload["total"] == 0 and payload["runs"] == []
+
+
+# ── kickoff ide-kickoff-search-r2 — paging past the 50-row fleet window ─────
+
+
+def _seed_sixty_published_runs(home: Path) -> list[str]:
+    """Seed 60 published runs with distinct titles/recipes, evenly spaced.
+
+    Returns the rids in insertion (oldest-first) order; ``rids[0]`` is the
+    oldest seed and ``rids[59]`` is the newest. ``list_runs`` orders
+    newest-first, so ``rids[59]`` is the first row of the page.
+    """
+    base = 1_791_500_000
+    rids: list[str] = []
+    con = sqlite3.connect(home / "state.db")
+    for i in range(60):
+        rid = f"run-{base + i * 60:09d}-p{i:02d}"
+        ts = base + i * 60
+        title = f"publish-{i:02d}-kickoff"
+        kickoff = home / "kickoffs" / f"{rid}.md"
+        kickoff.parent.mkdir(parents=True, exist_ok=True)
+        kickoff.write_text(f"# {title}\n\nbody\n")
+        con.execute(
+            "INSERT INTO task_runs (id, recipe, status, cost_usd, created_at, updated_at, "
+            "task_class, kickoff_path, workflow_version) VALUES (?,?,?,?,?,?,?,?,?)",
+            (rid, f"recipe-{i:02d}", "published", 0.0, ts, ts,
+             "code_fix", str(kickoff), "latest"),
+        )
+        rids.append(rid)
+    con.commit()
+    con.close()
+    return rids
+
+
+def test_runs_verb_pages_past_fleet_window_with_real_rows(home: Path) -> None:
+    """The 50-row ``MAX_LIMIT`` clamp must NOT make rows past index 50
+    stubs. ``board runs --offset 48 --limit 4`` returns the 49th-52nd
+    runs with real title/recipe/state, not the old ``_minimal`` stub.
+    """
+    import io
+    from contextlib import redirect_stdout
+
+    rids = _seed_sixty_published_runs(home)
+    # list_runs is newest-first: rids[0] is the oldest, rids[59] is the
+    # newest. Offset 48 limit 4 → rids[11], rids[10], rids[9], rids[8]
+    # (the 49th-52nd runs in newest-first order).
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = board_cmd.main(
+            ["runs", "--offset", "48", "--limit", "4", "--home", str(home)], "")
+    assert rc == 0
+    payload = json.loads(buf.getvalue())
+    assert payload["ok"] is True
+    assert payload["total"] == 60
+    assert len(payload["runs"]) == 4
+    assert payload["has_more"] is True
+    assert payload["offset"] == 48
+    expected_ids = [rids[11], rids[10], rids[9], rids[8]]
+    expected_titles = ["publish-11-kickoff", "publish-10-kickoff",
+                       "publish-09-kickoff", "publish-08-kickoff"]
+    expected_recipes = ["recipe-11", "recipe-10", "recipe-09", "recipe-08"]
+    for row, eid, etitle, erecipe in zip(
+        payload["runs"], expected_ids, expected_titles, expected_recipes
+    ):
+        assert row["id"] == eid, f"expected id {eid!r}, got {row['id']!r}"
+        assert row["title"] == etitle, f"expected title {etitle!r}, got {row['title']!r}"
+        assert row["recipe"] == erecipe, f"expected recipe {erecipe!r}, got {row['recipe']!r}"
+        assert row["state"] == "done", (
+            f"row state must be done (published → done), got {row['state']!r}"
+        )
+
+    # Offset 56, limit 4 → rids[3], rids[2], rids[1], rids[0] (the 4 oldest).
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = board_cmd.main(
+            ["runs", "--offset", "56", "--limit", "4", "--home", str(home)], "")
+    assert rc == 0
+    payload2 = json.loads(buf.getvalue())
+    assert payload2["total"] == 60
+    assert len(payload2["runs"]) == 4
+    assert payload2["has_more"] is False
+    oldest_ids = [rids[3], rids[2], rids[1], rids[0]]
+    oldest_titles = ["publish-03-kickoff", "publish-02-kickoff",
+                     "publish-01-kickoff", "publish-00-kickoff"]
+    for row, eid, etitle in zip(payload2["runs"], oldest_ids, oldest_titles):
+        assert row["id"] == eid
+        assert row["state"] == "done"
+        assert row["title"] == etitle
+        assert row["recipe"] == f"recipe-{eid[-2:]}"
+
+
+def test_runs_verb_query_finds_oldest_run_by_unique_word(home: Path) -> None:
+    """A word unique to the oldest run's kickoff is found via search and
+    the row carries the real title/recipe/state — not a stub.
+    """
+    import io
+    from contextlib import redirect_stdout
+
+    rids = _seed_sixty_published_runs(home)
+    oldest = rids[0]  # insertion order, oldest is index 0
+    # Replace the oldest run's kickoff with a unique word.
+    unique = "oldestuniquephrase-xyz"
+    (home / "kickoffs" / f"{oldest}.md").write_text(f"# publish-00-kickoff\n\n{unique}\n")
+    (home / "runs" / oldest).mkdir(parents=True, exist_ok=True)
+    (home / "runs" / oldest).touch()
+    con = sqlite3.connect(home / "state.db")
+    con.execute("UPDATE task_runs SET kickoff_path = ? WHERE id = ?",
+                (str(home / "kickoffs" / f"{oldest}.md"), oldest))
+    con.commit()
+    con.close()
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = board_cmd.main(["runs", "--query", unique, "--home", str(home)], "")
+    assert rc == 0
+    payload = json.loads(buf.getvalue())
+    assert payload["ok"] is True
+    assert any(r["id"] == oldest for r in payload["runs"]), \
+        f"oldest run {oldest!r} not in {payload['runs']!r}"
+    match = next(r for r in payload["runs"] if r["id"] == oldest)
+    assert match["state"] == "done"
+    assert match["recipe"] == "recipe-00"
+    assert match["title"] == "publish-00-kickoff"
+
+
+def test_runs_verb_finds_a_run_by_its_id(home: Path) -> None:
+    """The FTS body now suffixes the run id, so a query for the run id
+    finds the run even when its kickoff does not contain the id.
+    """
+    import io
+    from contextlib import redirect_stdout
+
+    rids = _seed_sixty_published_runs(home)
+    target = rids[5]
+    # Confirm the kickoff does NOT contain the run id (the seed body is generic).
+    kickoff = home / "kickoffs" / f"{target}.md"
+    assert target not in kickoff.read_text(encoding="utf-8")
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = board_cmd.main(["runs", "--query", target, "--home", str(home)], "")
+    assert rc == 0
+    payload = json.loads(buf.getvalue())
+    assert any(r["id"] == target for r in payload["runs"]), \
+        f"run id {target!r} not found in {payload['runs']!r}"
+
+
+def test_runs_verb_falls_back_to_like_when_fts5_is_unavailable(
+    home: Path, monkeypatch
+) -> None:
+    """With FTS5 forced off, the payload ``errors`` carries the fallback
+    note and ``--offset`` still pages the LIKE matches. Seeds ≥ 2 LIKE
+    matches so we can verify disjoint pages + ``total`` (kickoff r3 fix #7c).
+    """
+    import io
+    from contextlib import redirect_stdout
+
+    from mini_ork.ide_pages import search as search_mod
+
+    monkeypatch.setattr(search_mod, "_fts5_available", lambda *_a, **_k: False)
+
+    rids = _seed_sixty_published_runs(home)
+    # Inject the same unique word into two distinct runs so LIKE has ≥ 2
+    # matches to page through.
+    like_word = "liketargetword-12345"
+    targets = [rids[7], rids[22]]
+    for target in targets:
+        (home / "kickoffs" / f"{target}.md").write_text(
+            f"# publish-{target[-2:]}-kickoff\n\n{like_word}\n"
+        )
+        (home / "runs" / target).mkdir(parents=True, exist_ok=True)
+        (home / "runs" / target).touch()
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = board_cmd.main(
+            ["runs", "--query", like_word, "--offset", "0",
+             "--limit", "1", "--home", str(home)], "")
+    assert rc == 0
+    page1 = json.loads(buf.getvalue())
+    assert page1["errors"].get("search") and "FTS5 unavailable" in page1["errors"]["search"]
+    assert page1["total"] == 2, f"LIKE should report total=2, got {page1['total']}"
+    assert len(page1["runs"]) == 1
+    assert page1["runs"][0]["id"] in targets
+
+    # Paging still works in the LIKE path. Page 2 returns the OTHER
+    # match — pages must be disjoint.
+    buf2 = io.StringIO()
+    with redirect_stdout(buf2):
+        board_cmd.main(
+            ["runs", "--query", like_word, "--offset", "1",
+             "--limit", "1", "--home", str(home)], "")
+    page2 = json.loads(buf2.getvalue())
+    assert page2["ok"] is True
+    assert page2["offset"] == 1
+    assert page2["total"] == 2, f"LIKE total must stay stable across pages, got {page2['total']}"
+    assert len(page2["runs"]) == 1
+    ids1 = {r["id"] for r in page1["runs"]}
+    ids2 = {r["id"] for r in page2["runs"]}
+    assert ids1.isdisjoint(ids2), f"LIKE pages must be disjoint, got {ids1} ∩ {ids2}"
+    assert ids1 | ids2 == set(targets), "LIKE paging should cover exactly the two seeded matches"
+
+
+def test_runs_calls_fleet_rows_exactly_once(home: Path, monkeypatch) -> None:
+    """``_runs`` must call ``fleet_rows`` once per poll — the old code
+    called it twice (once in ``_runs``, once via ``_rows_for``).
+    """
+    from mini_ork.acp import fleet as acp_fleet
+
+    _seed_sixty_published_runs(home)
+    calls: list[tuple] = []
+    original = acp_fleet.fleet_rows
+
+    def spy(home_arg, **kwargs):
+        calls.append((home_arg, kwargs))
+        return original(home_arg, **kwargs)
+
+    monkeypatch.setattr(acp_fleet, "fleet_rows", spy)
+    # ``_runs`` does ``from mini_ork.acp.fleet import fleet_rows`` inside
+    # the function; the import runs at call time so the patch above is
+    # visible on the next ``_runs(home)`` call.
+
+    board_cmd._runs(home)
+    assert len(calls) == 1, f"fleet_rows called {len(calls)} times, expected 1"
+
+
+def test_runs_verb_search_path_paginates_with_correct_has_more(home: Path) -> None:
+    """Search-path paging: 60 runs share the word 'publish' in their title.
+    ``--limit 5 --offset 0/5/10`` returns disjoint pages of 5 with the
+    correct ``has_more`` and a stable ``total``.
+    """
+    import io
+    from contextlib import redirect_stdout
+
+    _seed_sixty_published_runs(home)
+
+    def _page(offset: int) -> dict:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = board_cmd.main(
+                ["runs", "--query", "publish", "--offset", str(offset),
+                 "--limit", "5", "--home", str(home)], "")
+        assert rc == 0
+        return json.loads(buf.getvalue())
+
+    p0 = _page(0)
+    p5 = _page(5)
+    p10 = _page(10)
+    assert p0["total"] == 60
+    assert len(p0["runs"]) == 5
+    assert len(p5["runs"]) == 5
+    assert len(p10["runs"]) == 5
+    assert p0["has_more"] is True
+    assert p5["has_more"] is True
+    assert p10["has_more"] is True
+    ids0 = {r["id"] for r in p0["runs"]}
+    ids5 = {r["id"] for r in p5["runs"]}
+    ids10 = {r["id"] for r in p10["runs"]}
+    assert ids0.isdisjoint(ids5)
+    assert ids5.isdisjoint(ids10)
+    assert ids0.isdisjoint(ids10)
