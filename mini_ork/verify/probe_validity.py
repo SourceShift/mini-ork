@@ -286,13 +286,40 @@ def run_on_base(probes: list[dict], *, target_repo: str, base_ref: str,
 
 # ── AC3 + the pre-publish gate ─────────────────────────────────────────────
 
-def verify_proven(db: str, run_id: str) -> tuple[bool, dict]:
-    """Did any verifier node of this run execute and pass?
+def _evidence_pass(path: Path) -> bool | None:
+    """``pass`` from a verifier evidence file (JSON, possibly after log lines)."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(obj, dict) and "pass" in obj:
+                return obj["pass"] is True
+    try:
+        obj = json.loads(text)
+    except ValueError:
+        return None
+    return obj["pass"] is True if isinstance(obj, dict) and "pass" in obj else None
 
-    A verifier ``node_end`` that is ``done`` after > 0 ms proved something; one
-    that errored in 0 ms never ran (K0.5c) and proves nothing.
+
+def verify_proven(db: str, run_id: str, run_dir: str = "") -> tuple[bool, dict]:
+    """Did a verifier of this run execute and pass?
+
+    Proven = a verifier ``node_end`` ended ``done`` AND a verifier evidence file
+    in the run dir (``verifier_<stem>.json|.log`` / ``verifier-result-*.json``, what
+    the verifier node persists after running its script) reports ``pass: true``.
+    ``duration_ms`` is NOT used: the executor's fallback node_end records 0 for
+    every verifier node since the Python port, run or not. A verifier node that
+    returns ``done`` without running anything (``[warn] verifier node: no
+    outputs in artifact_contract``) leaves no evidence file, so it proves nothing.
     """
-    detail = {"verifier_nodes": 0, "passed": 0, "never_ran": 0}
+    detail = {"verifier_nodes": 0, "done": 0, "errored": 0, "evidence_files": 0, "evidence_pass": 0}
     if not db or not run_id or not os.path.isfile(db):
         return False, detail
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
@@ -310,13 +337,20 @@ def verify_proven(db: str, run_id: str) -> tuple[bool, dict]:
         if not isinstance(p, dict) or p.get("node_type") != "verifier":
             continue
         detail["verifier_nodes"] += 1
-        ms = p.get("duration_ms")
         reason = finish_reason or p.get("finish_reason")
-        if reason == "done" and isinstance(ms, (int, float)) and ms > 0:
-            detail["passed"] += 1
-        elif ms == 0:
-            detail["never_ran"] += 1
-    return detail["passed"] > 0, detail
+        if reason == "done":
+            detail["done"] += 1
+        elif reason:
+            detail["errored"] += 1
+    if run_dir:
+        rd = Path(run_dir)
+        # .log = the same evidence under the pre-September name.
+        for f in sorted(set(rd.glob("verifier_*.json")) | set(rd.glob("verifier_*.log"))
+                        | set(rd.glob("verifier-result-*.json"))):
+            detail["evidence_files"] += 1
+            if _evidence_pass(f):
+                detail["evidence_pass"] += 1
+    return detail["done"] > 0 and detail["evidence_pass"] > 0, detail
 
 
 def load_probes(run_dir: str, plan: dict) -> tuple[list[str], list[dict]]:
@@ -375,7 +409,7 @@ def publish_gate(*, run_dir: str, db: str, run_id: str, target_repo: str, plan: 
     """``(ok, reason, report)``; writes ``<run_dir>/probe-validity.json``."""
     report: dict[str, Any] = {"flag": FLAG}
     ok, reason = True, ""
-    proven, report["verify"] = verify_proven(db, run_id)
+    proven, report["verify"] = verify_proven(db, run_id, run_dir)
     if not proven:
         ok, reason = False, VERIFY_VACUOUS
     acceptance, probes = load_probes(run_dir, plan)

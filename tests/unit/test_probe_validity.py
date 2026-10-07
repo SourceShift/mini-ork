@@ -155,13 +155,22 @@ def _verifier_end(db: str, node: str, ms: int, finish: str) -> None:
     con.close()
 
 
-def test_verify_proven_needs_an_executed_passing_verifier(db: str) -> None:
-    assert pv.verify_proven(db, "r") == (False, {"verifier_nodes": 0, "passed": 0, "never_ran": 0})
-    _verifier_end(db, "static", 0, "error")  # never ran (K0.5c signature)
-    proven, detail = pv.verify_proven(db, "r")
-    assert not proven and detail["never_ran"] == 1
-    _verifier_end(db, "test", 150, "done")
-    assert pv.verify_proven(db, "r")[0]
+def test_verify_proven_needs_a_done_verifier_with_passing_evidence(db: str, tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    assert pv.verify_proven(db, "r", str(run_dir))[0] is False           # nothing at all
+    _verifier_end(db, "static", 0, "error")
+    assert pv.verify_proven(db, "r", str(run_dir))[1]["errored"] == 1    # errored: not proof
+    _verifier_end(db, "test", 0, "done")                                 # 0 ms is NORMAL (fallback emitter)
+    assert pv.verify_proven(db, "r", str(run_dir))[0] is False           # done but no evidence file
+    (run_dir / "verifier_test.json").write_text('[test] running\n{"verifier":"test","pass":false}\n')
+    assert pv.verify_proven(db, "r", str(run_dir))[0] is False           # evidence says fail
+    (run_dir / "verifier_typecheck.json").write_text('{"verifier":"typecheck","pass":true}')
+    proven, detail = pv.verify_proven(db, "r", str(run_dir))
+    assert proven and detail["evidence_pass"] == 1 and detail["done"] == 1
+    (run_dir / "verifier_typecheck.json").unlink()
+    (run_dir / "verifier_lint.log").write_text('[lint] ok\n{"verifier":"lint","pass":true}\n')  # pre-Sept name
+    assert pv.verify_proven(db, "r", str(run_dir))[0]
 
 
 # ── the gate through the publisher ──────────────────────────────────────────
@@ -188,6 +197,13 @@ def _publish(tmp_path, monkeypatch, db, repo, base, *, checks=None, flag="1"):
     return rc, status, notes, (json.loads(report.read_text()) if report.exists() else None)
 
 
+def _passing_verifier(db: str, tmp_path: Path) -> None:
+    """A verifier node that ran and passed: node_end done + its evidence file."""
+    _verifier_end(db, "test", 0, "done")
+    (tmp_path / "run").mkdir(exist_ok=True)
+    (tmp_path / "run" / "verifier_test.json").write_text('{"verifier":"test","pass":true}')
+
+
 def test_flag_on_refuses_a_verify_that_proved_nothing(tmp_path, monkeypatch, db, repo, capsys) -> None:
     r, base = repo
     rc, status, notes, report = _publish(tmp_path, monkeypatch, db, r, base)
@@ -196,15 +212,16 @@ def test_flag_on_refuses_a_verify_that_proved_nothing(tmp_path, monkeypatch, db,
     assert "[BLOCK] probe-validity: verify_vacuous" in capsys.readouterr().out
 
 
-def test_flag_on_a_verifier_that_never_ran_proves_nothing(tmp_path, monkeypatch, db, repo) -> None:
+def test_flag_on_a_done_verifier_without_evidence_proves_nothing(tmp_path, monkeypatch, db, repo) -> None:
+    # e.g. the "[warn] verifier node: no outputs in artifact_contract" path: done, nothing ran
     r, base = repo
-    _verifier_end(db, "static", 0, "error")
+    _verifier_end(db, "static", 0, "done")
     assert _publish(tmp_path, monkeypatch, db, r, base)[3]["reason"] == "verify_vacuous"
 
 
 def test_flag_on_refuses_aliased_probes(tmp_path, monkeypatch, db, repo) -> None:
     r, base = repo
-    _verifier_end(db, "test", 150, "done")
+    _passing_verifier(db, tmp_path)
     checks = [{"id": "c1", "acceptance_ref": "AC1", "command": "test -f new.txt"},
               {"id": "c2", "acceptance_ref": "AC2", "command": "test -f new.txt"}]
     rc, _status, notes, report = _publish(tmp_path, monkeypatch, db, r, base, checks=checks)
@@ -213,7 +230,7 @@ def test_flag_on_refuses_aliased_probes(tmp_path, monkeypatch, db, repo) -> None
 
 def test_flag_on_refuses_a_probe_that_passes_on_the_base_tree(tmp_path, monkeypatch, db, repo) -> None:
     r, base = repo
-    _verifier_end(db, "test", 150, "done")
+    _passing_verifier(db, tmp_path)
     checks = [{"id": "c1", "acceptance_ref": "AC1", "command": "test -f a.py"}]
     rc, _status, _notes, report = _publish(tmp_path, monkeypatch, db, r, base, checks=checks)
     assert rc == (1, "verdict_fail") and report["reason"] == "probe_passes_on_base"
@@ -221,7 +238,7 @@ def test_flag_on_refuses_a_probe_that_passes_on_the_base_tree(tmp_path, monkeypa
 
 def test_flag_on_valid_probes_pass_the_gate(tmp_path, monkeypatch, db, repo, capsys) -> None:
     r, base = repo
-    _verifier_end(db, "test", 150, "done")
+    _passing_verifier(db, tmp_path)
     checks = [{"id": "c1", "acceptance_ref": "AC1", "command": "test -f new.txt"}]
     rc, status, _notes, report = _publish(tmp_path, monkeypatch, db, r, base, checks=checks)
     assert report["ok"] is True and rc == (0, "done") and status == "published"
