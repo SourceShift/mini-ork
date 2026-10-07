@@ -162,7 +162,12 @@ counted it as in flight. Mechanisms found:
    ends `rollback complete` / `run-level verdict.json: fail (failed_nodes=20)`,
    status still `executing`.
 3. **Execute-only callers** — libwit dispatches verified-artifact through
-   `execute` without the publisher, so a passing run is never finalized.
+   `execute`, not `mini-ork run`. The publisher node does run, but only the
+   `run` lifecycle threads `MINI_ORK_RECIPE_ROOT`, so it cannot see the
+   overlay recipe's `artifact_contract.yaml`; its no-contract branch printed a
+   stderr warning and returned without writing any status *(corrected
+   2026-10-07 — the first version said the publisher never ran; fixed in
+   `e245d002`, which finalizes that branch)*.
    `run-1789811866-94475`: `oracle-gates: pre-publish pass`, `all nodes
    complete`, run-level verdict `pass`, status `executing`, kickoff in a temp
    `libwit-verified-artifact-*` dir. 110 such runs ($111.25 raw) — this is
@@ -230,7 +235,7 @@ rubric panel failed it. The evidence is mixed:
 |---|---:|---|
 | RC1 silent death — hard death / abort (B1 + B2 without a verdict) | 197.67 | **not SDD** (shipped today: `7954fa6f`, `ec54774d`, `bf2805dd`) |
 | RC1 — lost status write (`set_status` swallows) | 12.27 | **not SDD** — zero-fallback: raise, do not warn |
-| RC1 — execute-only callers never finalize passing runs | 26.73 | **not SDD** — caller finalizes, or a terminal "finished, unpublished" state |
+| RC1 — execute-only runs: publisher cannot see the overlay contract, returns with no status | 26.73 | **not SDD** — fixed in K0.5a (`e245d002`): the no-contract branch finalizes the run |
 | RC2 — advisory rubric acts as a gate | 17.26 | **not SDD** — gate wiring |
 | RC2 — reviewer rejects after a passing verify | 53.92 | **I7** (convergence audit replaces reviewer verdict authority), **I2** |
 | RC2 — other verify-passed failures (traces-only reads, no reviewer signal) | 32.97 | **I7** |
