@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from mini_ork.ide_pages import spec as S
-from mini_ork.ide_pages.run import Run, Node, _load, _wall
+from mini_ork.ide_pages.run import Run, Node, _epoch, _load, _wall
 
 # Live-detection window per the kickoff §"live": running AND transcript grew
 # in the last 120 s. Named so a future tweak is one edit.
@@ -60,6 +60,27 @@ _KIND_NOTE = "note"
 
 _DEFAULT_VIEW = "stream"
 _VIEWS = ("stream", "output", "prompt", "telemetry", "learning")
+
+# Map a node's ``type`` (workflow role) onto an ``operator_steering`` role.
+# ``_fetch_steer_rows`` keys on this map so the IDE stream shows only rows
+# targeted at the node's role or ``any``. ``_VALID_ROLES`` lives in
+# ``mini_ork.steering.operator_steering:40`` — every value here must be in
+# that set.
+_NODE_ROLE_MAP: dict[str, str] = {
+    "planner": "planner",
+    "decomposer": "planner",
+    "implementer": "implementer",
+    "worker": "implementer",
+    "reviewer": "reviewer",
+    "synthesizer": "reviewer",
+    "verifier": "verifier",
+    "static_check": "verifier",
+    "test": "verifier",
+}
+
+
+def _role_for_node(node: Node) -> str:
+    return _NODE_ROLE_MAP.get(str(node.type or ""), "any")
 
 # Edit-family tools whose input carries an old/new body the IDE renders as a
 # coloured diff. Listed verbatim per the kickoff.
@@ -160,6 +181,10 @@ def _resolve_via_llm_calls(run: "Run", node: Node) -> Path | None:
     actor matches ``node.role_lane`` and whose timestamp is inside the
     node's ``[start - 2, end + 5]`` window (matches ``run._attribute_calls``).
 
+    r3 fix #1: ``llm_calls.ts`` is the ISO column (not ``ts_ms`` — that column
+    does not exist). The window is in epoch SECONDS, so we project ``ts`` and
+    filter in Python via ``_epoch`` (mirrors ``run._attribute_calls``).
+
     Done as a direct ``db_for(home).rows(...)`` because the shared
     ``repositories._llm_calls_select`` does not project ``session_id`` and
     widening it would touch every LLM reader in the repo (lens §4.1).
@@ -179,24 +204,25 @@ def _resolve_via_llm_calls(run: "Run", node: Node) -> Path | None:
     actor = str(node.role_lane or "")
     if not actor:
         return None
-    start_ms = (int(node.start) - 2) * 1000 if node.start is not None else None
-    end_ms = (int(node.end) + 5) * 1000 if node.end is not None else None
-    where = ["run_id = ?", "actor = ?", "session_id IS NOT NULL", "session_id != ''"]
-    params: list[Any] = [run.id, actor]
-    if start_ms is not None:
-        where.append("ts_ms >= ?")
-        params.append(start_ms)
-    if end_ms is not None:
-        where.append("ts_ms <= ?")
-        params.append(end_ms)
-    sql = ("SELECT session_id, ts_ms FROM llm_calls WHERE " + " AND ".join(where)
-           + " ORDER BY ts_ms DESC LIMIT 5")
+    start_s = int(node.start) - 2 if node.start is not None else None
+    end_s = int(node.end) + 5 if node.end is not None else None
+    sql = ("SELECT session_id, ts FROM llm_calls "
+           "WHERE run_id = ? AND actor = ? "
+           "  AND session_id IS NOT NULL AND session_id != '' "
+           "ORDER BY ts DESC LIMIT 50")
     try:
-        rows = db.rows(sql, tuple(params))
-    except Exception:  # noqa: BLE001 — older schema may lack ts_ms
+        rows = db.rows(sql, (run.id, actor))
+    except Exception:  # noqa: BLE001
         return None
     seen: set[str] = set()
     for r in rows:
+        ts_s = _epoch(r.get("ts"))
+        if ts_s is None:
+            continue
+        if start_s is not None and ts_s < start_s:
+            continue
+        if end_s is not None and ts_s > end_s:
+            continue
         sid = str(r.get("session_id") or "")
         if not sid or sid in seen:
             continue
@@ -366,7 +392,11 @@ def _kv_items(node: Node, duration: str, run: "Run") -> list[dict[str, str]]:
 
 
 def _node_tokens(node: Node, run: "Run") -> int | None:
-    """Sum input+output+cached tokens for the node's attributed llm_calls.
+    """Sum input + output tokens for the node's attributed llm_calls.
+
+    r3 fix #7 minor: ``cached_input_tokens`` is NOT summed — the kickoff
+    renamed the operator-facing number to "input + output" so the cost
+    badge doesn't double-count cache hits.
 
     Reads ``run.calls`` (the rows already attributed by ``_attribute_calls``
     to this exact node). When attribution yielded zero rows — common for
@@ -380,7 +410,7 @@ def _node_tokens(node: Node, run: "Run") -> int | None:
             continue
         if not _call_for_node(c, node):
             continue
-        for key in ("input_tokens", "output_tokens", "cached_input_tokens"):
+        for key in ("input_tokens", "output_tokens"):
             v = c.get(key)
             try:
                 if v is not None:
@@ -504,6 +534,11 @@ def _stream_entries(session_path: Path | None, log_path: Path | None,
     (or ``any``) and this run (no ``run_id IS NULL`` rows), and are
     skipped when their timestamp is not strictly newer than the line
     at offset N — that is the "no repeated steer row" property.
+
+    r3 fix #3: ordering is by ``_ts`` (epoch SECONDS) from each entry's
+    own ``timestamp`` (transcript) or ``created_at // 1000`` (steer).
+    Lines without a timestamp fall back to ``node.start + line_idx`` —
+    the line index still drives the append-only contract.
     """
     raw: list[dict[str, Any]] = []
     if session_path is not None:
@@ -512,31 +547,60 @@ def _stream_entries(session_path: Path | None, log_path: Path | None,
         raw.extend(_log_path_entries(log_path))
     raw.extend(_steer_entries(run_id, home, target))
 
-    node_start_ms = int(target.start or 0) * 1000
-    # Attach timestamps so we can sort by time, not by source kind.
+    node_start_s = int(target.start or 0)
+    # Resolve ``_ts`` for every entry: prefer the per-line ISO timestamp,
+    # else fall back to ``node.start + line_idx`` (seconds). Steer rows
+    # already carry ``_ts`` in seconds (set in ``_steer_entries``).
     for e in raw:
-        if e.get("_src") == "steer":
-            e["_ts"] = int(e.get("_ts") or node_start_ms)
-        else:
+        ts_val = e.get("_ts")
+        if ts_val is None:
             line_idx = int(e.get("_line") or 0)
-            e["_ts"] = node_start_ms + line_idx * 1000
+            e["_ts"] = node_start_s + line_idx
     raw.sort(key=lambda e: (int(e.get("_ts") or 0), 0 if e.get("_src") == "steer" else 1))
 
+    # r3 fix #3: compute the timestamp of the LAST transcript line this
+    # poll would consume. Steers live in the same timeline and are emitted
+    # only when (a) the poll consumed at least one transcript line, AND
+    # (b) the steer's timestamp is strictly newer than line N-1, AND
+    # (c) the steer's timestamp is NOT later than the last line consumed.
+    # "Before node.start" steers are emitted on a full read because
+    # line N-1 has no timestamp (lower bound collapses to -inf).
+    consumed_line_ts: list[int] = []
+    for e in raw:
+        if e.get("_src") == "steer":
+            continue
+        line_idx = int(e.get("_line") or 0)
+        if line_idx < int(offset):
+            continue
+        consumed_line_ts.append(int(e.get("_ts") or 0))
+    has_lines = bool(consumed_line_ts)
+    max_line_ts = max(consumed_line_ts) if has_lines else None
+    if int(offset) > 0:
+        prev_line_idx = int(offset) - 1
+        prev_line_ts = node_start_s + prev_line_idx
+    else:
+        # Full read — no "line N-1". Lower bound collapses so steers before
+        # ``node.start`` appear at the top of the stream (kickoff rule).
+        prev_line_ts = None
+
     out: list[dict[str, Any]] = []
-    line_threshold = node_start_ms + int(offset) * 1000
     for e in raw:
         is_steer = e.get("_src") == "steer"
         if is_steer:
-            # "Steer rows newer than the line at N" — strictly greater
-            # than line_threshold (which is the timestamp at the offset
-            # boundary). Equality drops the row so we never repeat one
-            # the previous poll already showed.
-            if int(e.get("_ts") or 0) <= line_threshold:
+            steer_ts = int(e.get("_ts") or 0)
+            # No new lines consumed → nothing to bound the steer against.
+            if not has_lines:
+                continue
+            # "Newer than the line at N-1" — strict so we never repeat.
+            if prev_line_ts is not None and steer_ts <= prev_line_ts:
+                continue
+            # "Not later than the last line consumed" — drops steers that
+            # were added by the operator after the transcript froze.
+            if max_line_ts is not None and steer_ts > max_line_ts:
                 continue
         else:
             # ``offset`` = number of transcript lines already consumed.
-            # Return entries whose source line is at-or-after that point
-            # (skip lines [0..offset-1]).
+            # Return entries whose source line is at-or-after that point.
             line_idx = int(e.get("_line") or 0)
             if line_idx < int(offset):
                 continue
@@ -552,7 +616,7 @@ def _stream_entries(session_path: Path | None, log_path: Path | None,
 
     # Strip the private keys the IDE doesn't need to render.
     for e in out:
-        for k in ("_src", "_line", "_ts"):
+        for k in ("_src", "_line", "_ts", "_ts_skip"):
             e.pop(k, None)
     return out, next_offset
 
@@ -562,6 +626,10 @@ def _session_entries(session_path: Path) -> list[dict[str, Any]]:
 
     Each yielded entry carries ``_src="tx"`` and ``_line=<index>`` so
     ``_stream_entries`` can compute the append-only offset.
+
+    r3 fix #3: every entry also carries ``_ts`` (epoch seconds) parsed from
+    the line's own ``timestamp`` field (ISO). ``_stream_entries`` sorts and
+    thresholds on ``_ts`` instead of a fabricated ``node_start + idx*1000``.
     """
     out: list[dict[str, Any]] = []
     try:
@@ -571,6 +639,17 @@ def _session_entries(session_path: Path) -> list[dict[str, Any]]:
     lines = text.splitlines()
     first_user_done = False
     pending: dict[str, dict[str, Any]] = {}  # tool_use_id → tool info
+
+    def _with_ts(base: dict[str, Any], raw: dict[str, Any], line_idx: int) -> dict[str, Any]:
+        ts_s = _epoch(raw.get("timestamp"))
+        if ts_s is not None:
+            base["_ts"] = ts_s
+        else:
+            # Fallback when the line lacks ``timestamp``: use ``line_idx``
+            # as a stable secondary key. ``_stream_entries`` resolves the
+            # final value when it knows the node's start.
+            base.setdefault("_ts_skip", line_idx)
+        return base
 
     for line_idx, raw in enumerate(lines):
         line = raw.strip()
@@ -595,14 +674,14 @@ def _session_entries(session_path: Path) -> list[dict[str, Any]]:
                 first_user_done = True
                 text = _extract_user_text(content)
                 if text:
-                    out.append({
+                    out.append(_with_ts({
                         "k": _KIND_USER,
                         "head": "",
                         "arg": text[:USER_HEAD_CAP],
                         "lines": [{"t": text[:USER_HEAD_CAP], "c": "body"}],
                         "_src": "tx",
                         "_line": line_idx,
-                    })
+                    }, entry, line_idx))
                 continue
             # Subsequent user envelopes carry tool_results (never strings).
             if not isinstance(content, list):
@@ -625,14 +704,14 @@ def _session_entries(session_path: Path) -> list[dict[str, Any]]:
                 if len(res_lines) > TOOL_RESULT_LINES:
                     lines_list.append({"t": f"… {len(res_lines) - TOOL_RESULT_LINES} more lines",
                                        "c": "muted"})
-                out.append({
+                out.append(_with_ts({
                     "k": _KIND_TOOL,
                     "head": tool_info["name"],
                     "arg": tool_info["summary"],
                     "lines": lines_list or [{"t": "(no output)", "c": "muted"}],
                     "_src": "tx",
                     "_line": line_idx,
-                })
+                }, entry, line_idx))
         elif typ == "assistant":
             if not isinstance(content, list):
                 continue
@@ -642,24 +721,24 @@ def _session_entries(session_path: Path) -> list[dict[str, Any]]:
                 bt = str(b.get("type") or "")
                 if bt == "thinking":
                     text = _text_block(b, "thinking")[:THINK_HEAD_CAP]
-                    out.append({
+                    out.append(_with_ts({
                         "k": _KIND_THINK,
                         "head": "Thinking… ",
                         "arg": text,
                         "lines": [{"t": text, "c": "muted"}],
                         "_src": "tx",
                         "_line": line_idx,
-                    })
+                    }, entry, line_idx))
                 elif bt == "text":
                     text = _text_block(b, "text")[:TEXT_CAP]
-                    out.append({
+                    out.append(_with_ts({
                         "k": _KIND_TEXT,
                         "head": "",
                         "arg": text,
                         "lines": [{"t": text, "c": "body"}],
                         "_src": "tx",
                         "_line": line_idx,
-                    })
+                    }, entry, line_idx))
                 elif bt == "tool_use":
                     name = str(b.get("name") or "tool")
                     tin = b.get("input") or {}
@@ -676,16 +755,16 @@ def _session_entries(session_path: Path) -> list[dict[str, Any]]:
                             mark = "☒" if str(t.get("status") or "") == "completed" else "☐"
                             todo_lines.append({"t": f"{mark} {t.get('content') or ''}",
                                                "c": "body"})
-                        out.append({
+                        out.append(_with_ts({
                             "k": _KIND_TODO,
                             "head": "",
                             "arg": "",
                             "lines": todo_lines,
                             "_src": "tx",
                             "_line": line_idx,
-                        })
+                        }, entry, line_idx))
         elif typ == "result":
-            out.append({
+            out.append(_with_ts({
                 "k": _KIND_NOTE,
                 "head": "",
                 "arg": _format_result_note(entry),
@@ -693,7 +772,7 @@ def _session_entries(session_path: Path) -> list[dict[str, Any]]:
                            "c": "muted"}],
                 "_src": "tx",
                 "_line": line_idx,
-            })
+            }, entry, line_idx))
     return out
 
 
@@ -745,44 +824,50 @@ def _result_text(block: dict[str, Any]) -> tuple[str, bool]:
 def _log_path_entries(log_path: Path) -> list[dict[str, Any]]:
     """Log-file entries for shell/verifier nodes.
 
-    Each entry carries ``_src="log"`` and ``_line=<index>`` so the
-    append-only offset is consistent with transcript entries — the IDE
-    doesn't care which file the line came from, only that offsets are stable.
+    r3 fix #4: one entry per log line so ``offset`` counts log lines and
+    each new line surfaces as its own ``text`` entry. ``_src="log"`` and
+    ``_line=<index>`` keep the offset contract identical to transcript
+    entries.
     """
     try:
         text = log_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         text = ""
-    lines: list[dict[str, str]] = []
     raw_lines = text.splitlines()[-SHELL_LOG_LINES:]
-    for raw in raw_lines:
+    out: list[dict[str, Any]] = []
+    for idx, raw in enumerate(raw_lines):
         c = "red" if "Traceback" in raw or "ERROR" in raw else (
             "green" if "PASS" in raw or "ok" in raw.lower() else "body")
-        lines.append({"t": raw[:LINE_CHARS], "c": c})
-    return [{
-        "k": _KIND_TEXT,
-        "head": "",
-        "arg": "log output",
-        "lines": lines,
-        "_src": "log",
-        "_line": 0,
-    }] if lines else []
+        out.append({
+            "k": _KIND_TEXT,
+            "head": "",
+            "arg": raw[:LINE_CHARS],
+            "lines": [{"t": raw[:LINE_CHARS], "c": c}],
+            "_src": "log",
+            "_line": idx,
+        })
+    return out
 
 
 def _steer_entries(run_id: str, home: Path, target: Node) -> list[dict[str, Any]]:
     """Read operator_steering rows for this run + node role DIRECTLY.
 
-    Kickoff fix #3 filter: ``run_id IS NULL`` is excluded; rows with
-    ``run_id = ''`` are kept for legacy reasons. Role is the node's id
-    (operator_steering's CHECK constraint keys on node ids: planner /
-    implementer / reviewer / verifier) or ``any``.
+    r3 fix #5: filter on the node's MAPPED ROLE (``_role_for_node``),
+    not on the node's id. ``operator_steering.role_target`` keys on the
+    five roles defined in ``operator_steering._VALID_ROLES`` (planner /
+    implementer / reviewer / verifier / any) — the legacy comment claiming
+    the CHECK keys on node ids was wrong.
 
     ``operator_steering.fetch_for`` marks rows consumed in an UPDATE; using
     it here would consume rows the dispatcher's context_assembler still needs
     (the consume-on-read is shared state with ``cli/execute.py``). The IDE
     stream view is read-only display, so a direct SELECT is correct.
+
+    r3 fix #3: ``created_at`` is epoch milliseconds, so we divide by 1000
+    to share the SECONDS timeline with transcript ``timestamp`` rows.
     """
-    rows = _fetch_steer_rows(run_id, home, target.id)
+    role = _role_for_node(target)
+    rows = _fetch_steer_rows(run_id, home, role=role)
     out: list[dict[str, Any]] = []
     for r in rows:
         sev = str(r.get("severity") or "info")
@@ -796,12 +881,20 @@ def _steer_entries(run_id: str, home: Path, target: Node) -> list[dict[str, Any]
             "lines": [{"t": f"[{sev}] {msg}", "c": c}],
             "_src": "steer",
             "_line": 0,
-            "_ts": ts_ms,
+            "_ts": ts_ms // 1000,  # ms → seconds to share the timeline
         })
     return out
 
 
-def _fetch_steer_rows(run_id: str, home: Path, node_id: str = "") -> list[dict[str, Any]]:
+def _fetch_steer_rows(run_id: str, home: Path, role: str = "") -> list[dict[str, Any]]:
+    """Read operator_steering rows for this run + role.
+
+    r3 fix #5: ``role`` is one of the five strings in
+    ``operator_steering._VALID_ROLES`` (``planner`` / ``implementer`` /
+    ``reviewer`` / ``verifier`` / ``any``) — derived from the node's
+    ``type`` via ``_role_for_node``. Rows whose ``role_target`` matches
+    ``role`` (or ``any`` / blank for legacy) are returned.
+    """
     try:
         from mini_ork.web.deps import db_for
     except Exception:  # noqa: BLE001 — steering is optional display content
@@ -816,9 +909,9 @@ def _fetch_steer_rows(run_id: str, home: Path, node_id: str = "") -> list[dict[s
         return []
     role_filter = ""
     params: tuple[Any, ...] = (run_id, int(time.time() * 1000))
-    if node_id:
+    if role:
         role_filter = "  AND (role_target = ? OR role_target = 'any' OR role_target = '') "
-        params = (run_id, node_id, int(time.time() * 1000))
+        params = (run_id, role, int(time.time() * 1000))
     try:
         return db.rows(
             "SELECT run_id, role_target, severity, message, source, "
@@ -1108,8 +1201,9 @@ def _telemetry_view(run: Run, node: Node) -> dict[str, Any]:
 
 def _llm_calls_for_node(run: Run, node: Node) -> list[dict[str, Any]]:
     """Direct llm_calls SELECT with the ``session_id`` column the shared
-    repository reader omits (kickoff fix #7). Same time window as
-    ``run._attribute_calls``: ``start-2 <= ts_ms <= end+5``.
+    repository reader omits. Same time window as ``run._attribute_calls``:
+    ``start-2 <= ts <= end+5`` — but ``ts`` is the ISO column, so we filter
+    in Python via ``_epoch`` (mirrors ``_call_for_node``).
 
     Returns an empty list on any DB error so the telemetry view can fall back
     to ``run.calls`` (which still has the cost/badge data even without
@@ -1130,45 +1224,48 @@ def _llm_calls_for_node(run: Run, node: Node) -> list[dict[str, Any]]:
     actor = str(node.role_lane or "")
     if not actor:
         return []
-    where = ["run_id = ?", "actor = ?"]
-    params: list[Any] = [run.id, actor]
-    if node.start is not None:
-        where.append("ts_ms >= ?")
-        params.append((int(node.start) - 2) * 1000)
-    if node.end is not None:
-        where.append("ts_ms <= ?")
-        params.append((int(node.end) + 5) * 1000)
+    start_s = int(node.start) - 2 if node.start is not None else None
+    end_s = int(node.end) + 5 if node.end is not None else None
     sql = ("SELECT actor, model_id, input_tokens, output_tokens, cached_input_tokens, "
-           "       cost_usd, duration_ms, session_id, ts_ms "
-           "FROM llm_calls WHERE " + " AND ".join(where) +
-           " ORDER BY ts_ms ASC")
+           "       cost_usd, duration_ms, session_id, ts "
+           "FROM llm_calls WHERE run_id = ? AND actor = ? ORDER BY ts ASC")
     try:
-        return db.rows(sql, tuple(params))
+        rows = db.rows(sql, (run.id, actor))
     except Exception:  # noqa: BLE001
         return []
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        ts_s = _epoch(r.get("ts"))
+        if ts_s is None:
+            continue
+        if start_s is not None and ts_s < start_s:
+            continue
+        if end_s is not None and ts_s > end_s:
+            continue
+        out.append(r)
+    return out
 
 
 def _call_for_node(call: dict[str, Any], node: Node) -> bool:
     """Match an llm_calls row to a node by actor AND time window.
 
-    Mirrors ``run._attribute_calls`` (start - 2 ≤ ts ≤ end + 5) so the
-    telemetry list and the cost badge never disagree about which calls
-    belong to the node (kickoff fix #7).
+    r3 fix #1: ``ts`` is the ISO column; ``_epoch`` converts it to epoch
+    seconds and the window is ``start-2 ≤ ts ≤ end+5`` in seconds
+    (mirrors ``run._attribute_calls``).
     """
     actor = str(call.get("actor") or "")
     if actor != node.role_lane:
         return False
     if node.start is None and node.end is None:
         return True
-    try:
-        ts_ms = int(call.get("ts_ms") or 0)
-    except (TypeError, ValueError):
+    ts_s = _epoch(call.get("ts"))
+    if ts_s is None:
         return False
-    start_ms = (int(node.start) - 2) * 1000 if node.start is not None else None
-    end_ms = (int(node.end) + 5) * 1000 if node.end is not None else None
-    if start_ms is not None and ts_ms < start_ms:
+    start_s = int(node.start) - 2 if node.start is not None else None
+    end_s = int(node.end) + 5 if node.end is not None else None
+    if start_s is not None and ts_s < start_s:
         return False
-    if end_ms is not None and ts_ms > end_ms:
+    if end_s is not None and ts_s > end_s:
         return False
     return True
 
@@ -1202,8 +1299,9 @@ def _learning_view(run: Run, node: Node) -> dict[str, Any]:
 
     # 2. Steering rows for this node's role (read directly so we don't
     # consume rows the dispatcher still needs — same discipline as
-    # ``_fetch_steer_rows``).
-    steer_rows = _fetch_steer_rows(run.id, run.home, node.id)
+    # ``_fetch_steer_rows``). r3 fix #5: filter on the mapped role.
+    role = _role_for_node(node)
+    steer_rows = _fetch_steer_rows(run.id, run.home, role=role)
     for r in steer_rows[:5]:
         sev = str(r.get("severity") or "info")
         msg = str(r.get("message") or "")
@@ -1212,7 +1310,9 @@ def _learning_view(run: Run, node: Node) -> dict[str, Any]:
         out.append(S.item(f"Steering · [{sev}]", msg, m="→", mc="blue"))
 
     # 3. Gradients produced in the run's window (same rule as
-    # ``run._learnings_tab``).
+    # ``run._learnings_tab``). r3 fix #6: ``gradient_records.created_at``
+    # is epoch SECONDS — the previous ``* 1000`` + ``+ 60_000`` ms window
+    # silently excluded every row. Match the run.py predicate one-for-one.
     if run.row.get("id"):
         try:
             from mini_ork.web.deps import db_for
@@ -1220,15 +1320,13 @@ def _learning_view(run: Run, node: Node) -> dict[str, Any]:
             home = run.home
             db = db_for(home)
             if db.has_table("gradient_records"):
-                start_ms = int(node.start or 0) * 1000
-                end_ms = (int(node.end) * 1000 if node.end is not None
-                          else int(time.time()) * 1000)
+                start_s = int(node.start or 0)
+                end_s = (int(node.end) if node.end is not None
+                         else int(time.time()))
                 task_class = str(run.row.get("task_class") or "")
-                where = ["created_at BETWEEN ? AND ?"]
-                params: list[Any] = [start_ms, end_ms + 60_000]
-                if task_class:
-                    where.append("(task_class = ? OR task_class = '')")
-                    params.append(task_class)
+                where = ["created_at BETWEEN ? AND ?",
+                         "(task_class = ? OR ? = '')"]
+                params: list[Any] = [start_s, end_s + 60, task_class, task_class]
                 for g in db.rows(
                     "SELECT gradient_id, target, signal, suggested_change, confidence "
                     "FROM gradient_records WHERE " + " AND ".join(where) +
@@ -1286,40 +1384,40 @@ def build_node(home: Path, run_id: str, node_id: str, view: str | None = None,
     stream_entries: list[dict[str, Any]] = []
     next_offset = int(offset)
     transcript_has_result = _transcript_has_result(session_path) if session_path else False
+    transcript_entry_count = 0  # total transcript entries (full file, not poll slice)
     if view == "stream":
+        # r3 fix #7 minor: ``finished · N events`` reports the TOTAL
+        # transcript entry count, not this poll's slice. Parse the source
+        # once for the count, then again inside ``_stream_entries`` for
+        # the per-poll slice — both reads are O(file size).
+        if session_path is not None:
+            transcript_entry_count = len(_session_entries(session_path))
+        elif log_path is not None:
+            transcript_entry_count = len(_log_path_entries(log_path))
+
         stream_entries, next_offset = _stream_entries(
             session_path, log_path, run_id, home,
             target=target, offset=int(offset),
         )
-        # Cost-state fallback: emit a note entry ONLY when the transcript
-        # itself has no ``result`` entry (kickoff fix #5). Reading the
-        # transcript up-front means an already-shown note never gets
-        # duplicated by the live.jsonl parse.
-        if not transcript_has_result and not any(
-                e.get("k") == _KIND_NOTE for e in stream_entries):
+        # r3 fix #2: emit the cost-state note ONCE on a full read
+        # (``offset == 0``). The note does NOT advance ``offset``, so
+        # subsequent polls at the same offset return nothing and never
+        # re-synthesise the note.
+        if (not transcript_has_result
+                and int(offset) == 0
+                and not any(e.get("k") == _KIND_NOTE for e in stream_entries)):
             note = _build_note_from_cost_state(run_dir, target)
             if note:
-                # Use a synthetic line index past the transcript so the
-                # next poll's offset grows naturally.
-                synth_line = next_offset + len(stream_entries)
                 stream_entries.append({
                     "k": _KIND_NOTE,
                     "head": "",
                     "arg": note,
                     "lines": [{"t": note, "c": "muted"}],
-                    "_src": "log",
-                    "_line": synth_line,
                 })
-                # _src/_line are stripped before the response; for the
-                # post-stripped list we still want the next_offset to
-                # advance by one so a follow-up poll doesn't re-emit it.
-                stream_entries[-1].pop("_src", None)
-                stream_entries[-1].pop("_line", None)
-                next_offset = synth_line + 1
 
     status, status_c = _stream_status(target, session_path is not None,
                                       log_path is not None, is_live,
-                                      len(stream_entries))
+                                      transcript_entry_count)
 
     base: dict[str, Any] = {
         "ok": True,
