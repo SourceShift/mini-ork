@@ -222,13 +222,13 @@ def _projects(home: Path) -> dict[str, Any]:
                   else S.muted("ready") if (h / "state.db").is_file() else S.cell("missing", "red"))
         rows.append({"cells": [S.cell(h.parent.name, "text", b=is_current),
                                S.muted(str(h.parent).replace(os.path.expanduser("~"), "~", 1)), status],
-                     "sel": is_current, "do": None if is_current else S.reveal(str(h.parent))})
-    actions = [S.btn("Add project", None, "primary"),
+                     "sel": is_current, "do": None if is_current else S.project(str(h.parent))})
+    actions = [S.btn("Add project", S.project_pick(), "primary"),
                S.btn("Open registry", S.open_path(str(file)) if file.is_file() else None)]
     return S.table("Projects", [S.col(fr=1), S.col(fr=1.4), S.col(80)], ["project", "path", ""], rows,
                    full=True, actions=actions,
-                   note=f"Known homes come from {str(file).replace(os.path.expanduser('~'), '~', 1)} "
-                        "(shared with mini-ork serve).")
+                   note=f"Click a project to switch this window to it. Known homes come from "
+                        f"{str(file).replace(os.path.expanduser('~'), '~', 1)} (shared with mini-ork serve).")
 
 
 # ── health & exports ───────────────────────────────────────────────────────

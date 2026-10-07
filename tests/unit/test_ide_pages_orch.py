@@ -13,7 +13,7 @@ from mini_ork.ide_pages import orch, spec
 from mini_ork.stores import migrate as mig
 
 REPO = Path(__file__).resolve().parents[2]
-_ACTION_KEYS = {"cli", "page", "set", "run", "path", "reveal", "url", "thread"}
+_ACTION_KEYS = {"cli", "page", "set", "run", "path", "reveal", "url", "thread", "project", "project_pick"}
 
 
 def check_page(page: dict[str, Any], key: str) -> None:

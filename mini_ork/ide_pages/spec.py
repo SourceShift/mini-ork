@@ -43,6 +43,8 @@ Actions (``do``) — what a button, row or chip does in the IDE:
 - ``{"run": run_id, "title": t, "tab": t}``    open a run's tab
 - ``{"path": abs}`` / ``{"reveal": abs}`` / ``{"url": u}``
 - ``{"thread": text}``             new mini-ork thread, ``text`` as its first prompt
+- ``{"project": abs}``             switch the IDE window to the project at ``abs``
+- ``{"project_pick": true}``       pick a project folder, then switch to it
 Any action may carry ``"confirm": "<question>"``.
 """
 from __future__ import annotations
@@ -98,6 +100,16 @@ def open_path(path: str) -> dict[str, Any]:
 
 def reveal(path: str) -> dict[str, Any]:
     return {"reveal": str(path)}
+
+
+def project(path: str) -> dict[str, Any]:
+    """Switch the IDE window to the mini-ork project rooted at ``path``."""
+    return {"project": path}
+
+
+def project_pick() -> dict[str, Any]:
+    """Ask for a project folder, then switch the IDE window to it."""
+    return {"project_pick": True}
 
 
 def url(u: str) -> dict[str, Any]:
