@@ -80,6 +80,12 @@ edges:
   - { from: reviewer,              to: rollback,              edge_type: escalates_to }
   - { from: static_check_verifier, to: rollback,              edge_type: escalates_to }
   - { from: test_verifier,         to: rollback,              edge_type: escalates_to }
+  # Revise loop: a failed gate sends its findings back to the implementer for a
+  # bounded number of rounds BEFORE the escalates_to rollback edges fire (they
+  # run only after the rounds are exhausted).
+  - { from: static_check_verifier, to: implementer,           edge_type: retries, max_rounds: 2 }
+  - { from: test_verifier,         to: implementer,           edge_type: retries, max_rounds: 2 }
+  - { from: reviewer,              to: implementer,           edge_type: retries, max_rounds: 2 }
 
 rollback_strategy: keep_run_artifacts_discard_worktree
 max_self_correction_iterations: 0

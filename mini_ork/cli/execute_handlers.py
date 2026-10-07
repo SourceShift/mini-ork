@@ -862,6 +862,39 @@ _IMPLEMENTER_COMPLETION_ARTIFACTS: dict[str, tuple[str, ...]] = {
 }
 
 
+def _read_revise_feedback(run_dir: str) -> dict | None:
+    """Read the revise-round state the runtime wrote, if any.
+
+    ``<run_dir>/revise/current.json`` is the process-crossing channel: the
+    dispatch loop writes it (execute.py's pool children can't see publish_env),
+    and the implementer appends the referenced feedback file to its prompt.
+    Returns ``None`` when the file is absent — the no-revise fast path.
+    """
+    if not run_dir:
+        return None
+    current_path = os.path.join(run_dir, "revise", "current.json")
+    if not os.path.isfile(current_path):
+        return None
+    try:
+        with open(current_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    round_no = data.get("round")
+    max_rounds = data.get("max_rounds", 2)
+    feedback_path = data.get("feedback") or ""
+    feedback_text = ""
+    if feedback_path and os.path.isfile(feedback_path):
+        try:
+            with open(feedback_path, encoding="utf-8", errors="replace") as fh:
+                feedback_text = fh.read()
+        except OSError:
+            feedback_text = ""
+    return {"round": round_no, "max_rounds": max_rounds, "feedback_text": feedback_text}
+
+
 def _handle_implementer(ctx: NodeDispatch):
     impl_log = ctx.declared_output_path(
         os.path.join(ctx.run_dir, f"impl-{ctx.node_id}.log")
@@ -895,6 +928,19 @@ def _handle_implementer(ctx: NodeDispatch):
     prompt = (f"{ctx.prepend()}Implement: {ctx.node_desc}{ctx.learned}\n\nPlan:\n"
               f"{ctx.plan_content}{ctx.artifact_context}{ctx.scope_guard()}\n\n"
               f"Write your execution summary to: {impl_log}")
+    # Revise loop: when the runtime wrote <run_dir>/revise/current.json, the
+    # failed gates' findings are appended so the implementer fixes ONLY those
+    # problems on top of the work already in the tree — never starts over.
+    revise = _read_revise_feedback(ctx.run_dir_eff or ctx.run_dir)
+    if revise:
+        from mini_ork.context_assembler import cap_block
+
+        feedback = cap_block(
+            revise["feedback_text"],
+            label=f"revise/round-{revise['round']}.md",
+        )
+        prompt += (f"\n\n## Revision round {revise['round']} of {revise['max_rounds']}\n"
+                   f"{feedback}")
     os.makedirs(os.path.dirname(impl_log) or ".", exist_ok=True)
     # F4: pin the codex/gemini edit surface to the TARGET repo (kickoff's git
     # toplevel), not os.getcwd(). Without this the implementer diff/writes land

@@ -733,10 +733,13 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     dispatch_mode = _resolve_dispatch_mode(args.dispatch_mode_override, workflow)
     fields_list = [tuple((e.split(_SEP) + [""] * 8)[:8]) for e in node_ids]
     control_parents: dict[str, tuple[str, ...]] = {}
+    retry_edges: dict[str, tuple[str, int]] = {}
     if workflow and os.path.isfile(workflow):
         from mini_ork.workflow import compile_workflow
 
-        control_parents = compile_workflow(workflow).control_parents
+        compiled = compile_workflow(workflow)
+        control_parents = compiled.control_parents
+        retry_edges = compiled.retry_edges
 
         # A recipe that declares a `recursion:` block owns its own loop caps.
         # Publish them so the driver honors the declaration instead of its own
@@ -865,6 +868,10 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     def _count_failures(outcomes):
         return sum(1 for _field, rc, _finish_reason in outcomes if rc != 0)
 
+    # Revise-loop cap read once per run: 0 (or negative) restores the legacy
+    # block-descendants-and-rollback behaviour exactly.
+    revise_rounds_cap = _revise_rounds_limit()
+
     def _dispatch_dependency_graph():
         """Dispatch control/data dependencies in readiness waves.
 
@@ -878,6 +885,23 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         statuses: dict[str, str] = {}
         order = {field[0]: index for index, field in enumerate(work_fields)}
         selected_ids = set(pending)
+        fields_by_id = {field[0]: field for field in work_fields}
+        # revise round bookkeeping: target node_id -> rounds already consumed.
+        round_used: dict[str, int] = {}
+
+        def _control_descendants(target: str) -> set[str]:
+            """``target`` plus every node reachable from it through control parents."""
+            descendants = {target}
+            frontier = [target]
+            while frontier:
+                current = frontier.pop()
+                for node_id, field in fields_by_id.items():
+                    if node_id in descendants:
+                        continue
+                    if current in control_parents.get(node_id, ()):
+                        descendants.add(node_id)
+                        frontier.append(node_id)
+            return descendants
 
         while pending:
             blocked = []
@@ -937,12 +961,52 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
 
             for field in batch:
                 pending.pop(field[0])
-            for field, rc, _finish_reason in _parallel(batch):
+            outcomes = _parallel(batch)
+            for field, rc, _finish_reason in outcomes:
                 if rc == 0:
                     statuses[field[0]] = "success"
                 else:
                     statuses[field[0]] = "failed"
                     fail_count += 1
+
+            # ── revise loop (retries edges) ────────────────────────────────
+            # A failed node that carries a `retries` edge sends its findings
+            # back to the edge's target (normally the implementer) instead of
+            # blocking its descendants. Group the failures by target so several
+            # gates failing in one wave produce ONE combined revise round.
+            revise_groups: dict[str, list[tuple[tuple, int, str]]] = {}
+            for field, rc, finish_reason in outcomes:
+                if rc == 0 or field[0] not in retry_edges:
+                    continue
+                target, max_rounds = retry_edges[field[0]]
+                cap = min(max_rounds, revise_rounds_cap)
+                if round_used.get(target, 0) >= cap:
+                    continue
+                revise_groups.setdefault(target, []).append((field, rc, finish_reason))
+            if revise_groups:
+                for target, failed_sources in revise_groups.items():
+                    _target_max = retry_edges[failed_sources[0][0][0]][1]
+                    round_no = round_used.get(target, 0) + 1
+                    round_used[target] = round_no
+                    reset_ids = _control_descendants(target)
+                    feedback_path = _write_revise_feedback(
+                        live_run_dir, round_no, _target_max, failed_sources)
+                    _archive_revise_round(
+                        live_run_dir, round_no,
+                        [fields_by_id[node_id] for node_id in reset_ids])
+                    _write_revise_current(
+                        live_run_dir, round_no, _target_max, feedback_path)
+                    for node_id in reset_ids:
+                        prior = statuses.pop(node_id, None)
+                        if prior in {"failed", "blocked"}:
+                            fail_count -= 1
+                        pending[node_id] = fields_by_id[node_id]
+                    source_names = ", ".join(field[0] for field, _rc, _fr in failed_sources)
+                    print(
+                        f"[revise] round {round_no}/{_target_max}: {source_names} found "
+                        f"problems → re-running {target} with feedback ({feedback_path})",
+                        file=sys.stderr,
+                    )
 
     dependency_aware = any(
         control_parents.get(field[0]) for field in work_fields
@@ -2659,6 +2723,184 @@ def _make_checkpoint_fn(db, run_id, run_dir, recipe, task_class):
 _REVIEW_PASS = {"pass", "approve", "approved"}
 _REVIEW_REVISE = {"revise", "needs_revision", "request_changes"}
 # unknown/other verdicts fall through to verdict_fail (matches bash catch-all)
+
+
+# ── revise loop (retries edges) ──────────────────────────────────────────────
+# A failed node with a `retries` edge sends its findings back to the edge's
+# target for a bounded number of rounds, instead of blocking descendants. All
+# revise state crosses the process split through the run dir (``revise/``):
+# publish_env writes die in pool workers, so the feedback file + current.json
+# are the only reliable channel back into the implementer's next dispatch.
+
+def _revise_rounds_limit() -> int:
+    """``MO_REVISE_ROUNDS``, default 2. ``<=0`` disables the revise loop."""
+    try:
+        return int(context_env("MO_REVISE_ROUNDS", "2"))
+    except ValueError:
+        return 2
+
+
+def _verifier_stem(field) -> str:
+    """The verifier evidence stem for a node field (mirrors ``_handle_verifier``).
+
+    ``verifier_<stem>.json`` is the run-local evidence the reviewer input
+    assembly reads; the stem derives from the node's verifier_ref (field[5]),
+    falling back to the node id when no verifier script is declared.
+    """
+    verifier_ref = (field[5] if len(field) > 5 else "") or ""
+    if verifier_ref.startswith("verifiers/"):
+        stem = verifier_ref[len("verifiers/"):]
+    else:
+        stem = verifier_ref or field[0]
+    if stem.endswith((".sh", ".py")):
+        stem = stem[:-3]
+    return stem
+
+
+def _tail_lines(path: str, count: int) -> list[str]:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.readlines()[-count:]
+    except OSError:
+        return []
+
+
+def _revise_failure_section(run_dir: str, field, finish_reason: str) -> str:
+    """One per-source section of a revise feedback file."""
+    node_id, node_type = field[0], field[1]
+    lines = [f"## {node_id} ({node_type})"]
+    if node_type == "verifier":
+        stem = _verifier_stem(field)
+        evidence = os.path.join(run_dir, f"verifier_{stem}.json")
+        lines.append(f"verifier evidence: verifier_{stem}.json")
+        body = ""
+        if os.path.isfile(evidence):
+            try:
+                with open(evidence, encoding="utf-8", errors="replace") as fh:
+                    body = fh.read()
+            except OSError:
+                body = ""
+        summary = ""
+        if body:
+            try:
+                data = json.loads(body)
+            except Exception:
+                data = None
+            if isinstance(data, dict):
+                for key in ("error_summary", "reasons", "failed_checks", "verdict"):
+                    value = data.get(key)
+                    if value:
+                        summary = json.dumps(value)[:4000]
+                        break
+                evidence_path = data.get("evidence_path")
+                if evidence_path:
+                    lines.append(f"evidence_path: {evidence_path}")
+            else:
+                summary = body[:4000]
+        if summary:
+            lines.append(f"error summary: {summary}")
+        else:
+            lines.append("(no verifier evidence produced)")
+        # Best-effort tail of the human-readable log, if one exists.
+        for candidate in (f"verifier-{stem}.log", f"evidence/{stem}.log"):
+            tail = _tail_lines(os.path.join(run_dir, candidate), 80)
+            if tail:
+                lines.append(f"evidence tail ({candidate}):")
+                lines.extend(line.rstrip("\n") for line in tail)
+                break
+    elif node_type == "reviewer":
+        review_file = os.path.join(run_dir, f"review-{node_id}.json")
+        body = ""
+        if os.path.isfile(review_file):
+            try:
+                with open(review_file, encoding="utf-8", errors="replace") as fh:
+                    body = fh.read()
+            except OSError:
+                body = ""
+        data = None
+        if body:
+            try:
+                data = json.loads(body)
+            except Exception:
+                data = None
+        if isinstance(data, dict):
+            lines.append(f"verdict: {data.get('verdict', 'unknown')}")
+            notes = data.get("notes")
+            if notes:
+                if isinstance(notes, list):
+                    lines.append("notes:")
+                    lines.extend(f"- {note}" for note in notes)
+                else:
+                    lines.append(f"notes: {notes}")
+            elif data.get("reasons"):
+                lines.append(f"reasons: {json.dumps(data['reasons'])[:4000]}")
+        else:
+            lines.append(f"(review file unparseable): {body[:4000]}")
+    else:
+        lines.append(f"finish reason: {finish_reason or 'failed'}")
+    return "\n".join(lines)
+
+
+def _write_revise_feedback(run_dir: str, round_no: int, max_rounds: int,
+                           sources) -> str:
+    """Write ``<run_dir>/revise/round-<n>.md`` and return its path."""
+    revise_dir = os.path.join(run_dir, "revise")
+    os.makedirs(revise_dir, exist_ok=True)
+    header = (
+        f"Round {round_no} of {max_rounds}: the previous attempt was checked and these "
+        "problems were found. Fix ONLY these problems, on top of the changes already "
+        "in the working tree. Do not start over, and do not revert your earlier work.\n"
+    )
+    sections = [_revise_failure_section(run_dir, field, finish_reason)
+                for field, _rc, finish_reason in sources]
+    path = os.path.join(revise_dir, f"round-{round_no}.md")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(header + "\n\n".join(sections) + "\n")
+    return path
+
+
+def _write_revise_current(run_dir: str, round_no: int, max_rounds: int,
+                          feedback_path: str) -> None:
+    revise_dir = os.path.join(run_dir, "revise")
+    os.makedirs(revise_dir, exist_ok=True)
+    with open(os.path.join(revise_dir, "current.json"), "w", encoding="utf-8") as fh:
+        json.dump({"round": round_no, "max_rounds": max_rounds,
+                   "feedback": feedback_path}, fh)
+
+
+def _node_revise_artifacts(run_dir: str, field) -> list[str]:
+    """Per-node output files that must leave the run root on a revise round."""
+    node_id, node_type = field[0], field[1]
+    if node_type == "verifier":
+        return [os.path.join(run_dir, f"verifier_{_verifier_stem(field)}.json")]
+    if node_type == "reviewer":
+        return [os.path.join(run_dir, f"review-{node_id}.json")]
+    if node_type == "implementer":
+        return [os.path.join(run_dir, f"impl-{node_id}.log")]
+    return []
+
+
+def _archive_revise_round(run_dir: str, round_no: int, reset_fields) -> None:
+    """Move the prior round's outputs out of the run root into ``revise/round-<n>/``.
+
+    History is kept so the next round's reviewer never reads stale files; the
+    reset nodes re-run and write fresh evidence.
+    """
+    dest = os.path.join(run_dir, "revise", f"round-{round_no}")
+    os.makedirs(dest, exist_ok=True)
+    for field in reset_fields:
+        for source in _node_revise_artifacts(run_dir, field):
+            if os.path.isfile(source):
+                try:
+                    shutil.move(source, os.path.join(dest, os.path.basename(source)))
+                except OSError:
+                    pass
+    review_diff = os.path.join(run_dir, "review-diff.patch")
+    if os.path.isfile(review_diff):
+        try:
+            shutil.move(review_diff, os.path.join(dest, "review-diff.patch"))
+        except OSError:
+            pass
 
 
 

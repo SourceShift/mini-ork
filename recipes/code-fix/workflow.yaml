@@ -89,5 +89,11 @@ edges:
   - { from: typecheck,   to: rollback,    edge_type: escalates_to  }
   - { from: test,        to: rollback,    edge_type: escalates_to  }
   - { from: reviewer,    to: rollback,    edge_type: escalates_to  }
+  # Revise loop: a failed gate sends its findings back to the implementer for a
+  # bounded number of rounds BEFORE the escalates_to rollback edges fire (they
+  # run only after the rounds are exhausted).
+  - { from: typecheck,   to: implementer, edge_type: retries, max_rounds: 2 }
+  - { from: test,        to: implementer, edge_type: retries, max_rounds: 2 }
+  - { from: reviewer,    to: implementer, edge_type: retries, max_rounds: 2 }
 
 rollback_strategy: revert_branch

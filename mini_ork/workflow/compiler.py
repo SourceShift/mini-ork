@@ -87,6 +87,11 @@ class CompiledWorkflow:
     topological_order: tuple[str, ...]
     bindings: tuple[ArtifactBinding, ...]
     control_parents: dict[str, tuple[str, ...]]
+    # source -> (target, max_rounds) for `retries` edges. A revise edge loops a
+    # failed source's findings back to an ancestor (normally the implementer) for
+    # a bounded number of rounds. Excluded from control_parents (the graph stays
+    # acyclic); the runtime reads this map to drive the revise loop.
+    retry_edges: dict[str, tuple[str, int]] = field(default_factory=dict)
 
     def node_fields(self, separator: str) -> list[str]:
         return [self.nodes[node_id].dispatch_fields(separator) for node_id in self.topological_order]
@@ -213,6 +218,24 @@ def _node_from_yaml(raw: Any) -> WorkflowNode:
         transform=transform,
         strict_handshake=strict_handshake,
     )
+
+
+def _ancestors_of(node_id: str, parents: dict[str, set[str]]) -> set[str]:
+    """The control ancestors of ``node_id`` (transitive, exclusive of itself).
+
+    A ``retries`` edge must loop its source back to one of these — otherwise the
+    revise round would re-enter a node that never ran before the source, and the
+    "run again on top of the work already in the tree" contract is meaningless.
+    """
+    seen: set[str] = set()
+    stack: list[str] = list(parents.get(node_id, ()))
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        stack.extend(parents.get(current, ()))
+    return seen
 
 
 def _stable_topological_order(
@@ -343,11 +366,45 @@ def compile_workflow(path: str | Path) -> CompiledWorkflow:
                 raise WorkflowCompileError(f"required input {node.name}.{input_spec.name} has no artifact binding")
 
     declared_tuple = tuple(declared)
+    control_parents = {
+        node_id: tuple(sorted(parent_ids, key=declared.index))
+        for node_id, parent_ids in parents.items()
+    }
+
+    # `retries` edges are collected and validated AFTER control parents are
+    # built, because the target-must-be-ancestor check needs the reachability
+    # implied by the control graph. A source may declare at most one revise edge.
+    retry_edges: dict[str, tuple[str, int]] = {}
+    for raw_edge in raw_edges:
+        edge = _mapping(raw_edge, context="workflow edge")
+        if str(edge.get("edge_type") or "depends_on") != "retries":
+            continue
+        source = str(edge.get("from") or "").strip()
+        target = str(edge.get("to") or "").strip()
+        # Node existence was already validated for every edge above; this pass
+        # only repeats the shape checks specific to a revise edge.
+        if source in retry_edges:
+            raise WorkflowCompileError(f"node {source} declares more than one retries edge")
+        raw_max = edge.get("max_rounds", 2)
+        if raw_max is None:
+            raw_max = 2
+        if isinstance(raw_max, bool) or not isinstance(raw_max, int) or raw_max < 0:
+            raise WorkflowCompileError(
+                f"retries edge {source} -> {target} max_rounds must be a non-negative integer"
+            )
+        if target not in _ancestors_of(source, parents):
+            raise WorkflowCompileError(
+                f"retries edge {source} -> {target} must loop back to an ancestor of "
+                f"{source} through control parents"
+            )
+        retry_edges[source] = (target, int(raw_max))
+
     return CompiledWorkflow(
         path=workflow_path,
         nodes=nodes,
         declared_order=declared_tuple,
         topological_order=_stable_topological_order(declared_tuple, parents),
         bindings=tuple(bindings),
-        control_parents={node_id: tuple(sorted(parent_ids, key=declared.index)) for node_id, parent_ids in parents.items()},
+        control_parents=control_parents,
+        retry_edges=retry_edges,
     )

@@ -46,6 +46,11 @@ Two common extension selectors are:
 | `MO_ROUTING_POLICY` | Chooses a registered native routing policy. |
 | `MO_EMBED_PROVIDER` | Chooses a registered semantic-memory embedder. |
 
+`MO_REVISE_ROUNDS` (default `2`) caps the revise-loop rounds a failed
+`retries`-edge node may spend re-dispatching its target before the
+`escalates_to` rollback edges fire. Set it to `0` to restore the pre-revise
+behaviour (a failed node blocks its descendants and rollback runs).
+
 The verification stack — metamorphic relations, the differential check,
 mutation suite adequacy, the level vector, the gate-hackability audit, and the
 declared equivalence operator — is ON by default. Its knobs are listed under
