@@ -354,12 +354,13 @@ def test_lessons_tab(seeded: Path) -> None:
 
 def test_memory_tab(seeded: Path) -> None:
     page = learn.build(seeded, "memory", {})
-    bars = {b["label"]: b["val"] for b in _section(page, "Namespaces · state.db")["items"]}
-    assert set(bars) == {"task", "workflow", "agent_performance", "failure", "recovery", "user_preference",
-                         "artifact", "benchmark"}
-    assert bars["failure"] == "3"
-    life = {i["k"]: i["v"] for i in _section(page, "Semantic memory lifecycle")["items"]}
-    assert life == {"Active": "1", "Decaying": "1", "Retired": "1"}
+    titles = [s["title"] for s in page["sections"]]
+    # P7b: legacy Namespaces + lifecycle kv are gone; three new sections ship instead.
+    assert "Namespaces · state.db" not in titles
+    assert "Semantic memory lifecycle" not in titles
+    assert "Preferences & constraints" in titles
+    assert "Lane fit by task class" in titles
+    assert "Memories to review" in titles
     # The Idea tree moved out of memory; it lives in improve now.
     assert not any(s["title"].startswith("Idea tree") for s in page["sections"])
 
