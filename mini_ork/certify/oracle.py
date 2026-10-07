@@ -89,6 +89,11 @@ _TEST_RESULT_RE = re.compile(
     r"(?P<id>(?:\S+::\S+|\S+\.py))\s+(?P<status>PASSED|FAILED|ERROR|SKIPPED)\b"
 )
 
+#: jest/vitest suite-load failure id suffix (see test_results.py). A test id
+#: that ends with this failed because its suite could not load — collection/load
+#: error, i.e. weak fail-to-pass evidence, not a real failing assertion.
+_SUITE_LOAD_FAILURE_SUFFIX = "::<suite load failure>"
+
 
 def _ensure_pytest_verbose(cmd: str) -> str:
     """Insert `-v --tb=no` into a pytest command that lacks verbose flags.
@@ -153,6 +158,9 @@ def replay_check(
           "unverified": bool,   # True if base state could not be evaluated;
                                 # the caller should abstain rather than
                                 # pass/fail
+          "weak":       bool,   # True when the overlap is weak-only: every
+                                # overlapping test failed on base with a
+                                # collection/load error, not a real assertion
           "applicable": bool | None,  # False when the replay instrument does
                                       # not apply to this command (no command,
                                       # or a runner with no adapter and no
@@ -160,15 +168,30 @@ def replay_check(
           "replay":     dict | None,
         }
 
-    Where ``replay`` carries ``{candidate_passed, base_failed, overlap}``
-    as sorted lists — the audit trail a downstream consumer needs to
-    decide whether to override the verdict. For jest/vitest/results-file
-    runs it also carries ``runner``.
+    Where ``replay`` carries ``{candidate_passed, base_failed, overlap,
+    weak_overlap, strong_overlap, flaky}`` as sorted lists — the audit trail a
+    downstream consumer needs to decide whether to override the verdict. For
+    jest/vitest/results-file runs it also carries ``runner``.
+
+    ``weak_overlap`` is the subset of ``overlap`` whose base failure was a
+    collection/load error (pytest ``ERROR`` status, or a jest/vitest
+    ``<file>::<suite load failure>`` id); ``strong_overlap`` is the rest
+    (a real failing assertion). ``flaky`` is the subset of the first-run
+    overlap that dropped out of the flake re-run (see below).
+
+    Flake re-run: when the overlap is non-empty and ``MO_REPLAY_FLAKE_RERUN``
+    is not ``"0"`` (default on), both sides are run once more with the same
+    command. The final overlap is ``(cand_pass₁ ∩ cand_pass₂) ∩
+    (base_fail₁ ∩ base_fail₂)``; ids that dropped out land in ``flaky``. If
+    the final overlap is empty the result is ``tests-do-not-exercise-change``
+    naming the flaky ids. There is no re-run when the overlap is empty, so the
+    failure path costs nothing extra.
 
     Outcomes (mapped to the kickoff):
 
       base-fails / candidate-passes (overlap non-empty)
             → ``passed=True, reason="tests exercise the change (delta-gate overlap)"``
+              (``weak=True`` when the overlap is weak-only)
 
       candidate-passes / nothing-fails-on-base
             → ``passed=False, reason="tests-do-not-exercise-change"``
@@ -196,9 +219,10 @@ def replay_check(
         cand_log = candidate_log or os.path.join(base_cwd, ".replay_candidate.log")
         b_log = base_log or os.path.join(base_cwd, ".replay_base.log")
 
-        def _run(cwd: str, log: str) -> tuple[int, set[str], set[str]]:
+        def _run(cwd: str, log: str) -> tuple[int, set[str], set[str], set[str]]:
             passed: set[str] = set()
-            failed: set[str] = set()
+            weak: set[str] = set()
+            strong: set[str] = set()
             try:
                 with open(log, "wb") as fh:
                     rc = subprocess.run(
@@ -206,27 +230,32 @@ def replay_check(
                         stdout=fh, stderr=subprocess.STDOUT,
                     ).returncode
             except OSError:
-                return -1, passed, failed
+                return -1, passed, weak, strong
             try:
                 text = Path(log).read_text(encoding="utf-8", errors="replace")
             except OSError:
-                return rc, passed, failed
+                return rc, passed, weak, strong
             for m in _TEST_RESULT_RE.finditer(text):
                 tid = m.group("id")
                 st = m.group("status")
                 if st == "PASSED":
                     passed.add(tid)
-                elif st in ("FAILED", "ERROR"):
-                    failed.add(tid)
-            return rc, passed, failed
+                elif st == "ERROR":
+                    # Collection/load error → weak fail-to-pass evidence.
+                    weak.add(tid)
+                elif st == "FAILED":
+                    # A real failing assertion → strong evidence.
+                    strong.add(tid)
+            return rc, passed, weak, strong
 
-        _, cand_pass, _ = _run(cand_cwd, cand_log)
-        base_rc, base_pass, base_fail = _run(base_cwd, b_log)
+        _, cand_pass_1, _, _ = _run(cand_cwd, cand_log)
+        base_rc, base_pass_1, base_weak_1, base_strong_1 = _run(base_cwd, b_log)
+        base_fail_1 = base_weak_1 | base_strong_1
 
         if base_rc == -1:
             return {"passed": False, "reason": "base state could not be evaluated",
                     "unverified": True, "replay": None}
-        if base_rc != 0 and not (base_pass or base_fail):
+        if base_rc != 0 and not (base_pass_1 or base_fail_1):
             # rc!=0 AND no per-test lines parsed → pytest could not collect or
             # run. We cannot claim the base "passes" or "fails" by test, so we
             # abstain rather than silently fail or pass.
@@ -236,16 +265,44 @@ def replay_check(
                 "unverified": True,
                 "replay": None,
             }
-        total = len(cand_pass) + len(base_pass) + len(base_fail)
+        total = len(cand_pass_1) + len(base_pass_1) + len(base_fail_1)
         if total == 0:
             return {"passed": False, "reason": "no tests collected; cannot establish delta",
                     "unverified": True, "replay": None}
 
+        overlap_1 = cand_pass_1 & base_fail_1
+        cand_pass = cand_pass_1
+        base_fail = base_fail_1
+        flaky: list[str] = []
+        if overlap_1 and os.environ.get("MO_REPLAY_FLAKE_RERUN", "1") != "0":
+            # Flake re-run: both sides once more with the same command, and keep
+            # only the tests that were stable on both runs. Deterministic runners
+            # produce identical sets, so this is a no-op for them.
+            cand_rc_2, cand_pass_2, cand_weak_2, cand_strong_2 = _run(cand_cwd, cand_log + ".2")
+            base_rc_2, base_pass_2, base_weak_2, base_strong_2 = _run(base_cwd, b_log + ".2")
+            if (cand_rc_2 == -1 or not (cand_pass_2 or cand_weak_2 or cand_strong_2)
+                    or base_rc_2 == -1 or not (base_pass_2 or base_weak_2 or base_strong_2)):
+                # The re-run itself could not produce outcomes (an infra hiccup,
+                # not a test result). Abstain, exactly as an unrunnable first run
+                # does, rather than calling the overlap flaky and failing the patch.
+                return {"passed": False,
+                        "reason": "flake re-run could not run; cannot confirm the overlap",
+                        "unverified": True, "replay": None}
+            cand_pass = cand_pass_1 & cand_pass_2
+            base_fail = base_fail_1 & (base_weak_2 | base_strong_2)
+            flaky = sorted(overlap_1 - (cand_pass & base_fail))
+
         overlap = cand_pass & base_fail
+        weak_overlap = sorted(overlap & base_weak_1)
+        strong_overlap = sorted(overlap & base_strong_1)
+
         info = {
             "candidate_passed": sorted(cand_pass),
             "base_failed": sorted(base_fail),
             "overlap": sorted(overlap),
+            "weak_overlap": weak_overlap,
+            "strong_overlap": strong_overlap,
+            "flaky": flaky,
         }
 
         if overlap:
@@ -253,20 +310,24 @@ def replay_check(
                 "passed": True,
                 "reason": "tests exercise the change (delta-gate overlap)",
                 "unverified": False,
+                "weak": not strong_overlap,
                 "replay": info,
             }
+        reason = "tests-do-not-exercise-change"
+        if flaky:
+            reason = f"tests-do-not-exercise-change (flaky: {', '.join(flaky)})"
         return {
             "passed": False,
-            "reason": "tests-do-not-exercise-change",
+            "reason": reason,
             "unverified": False,
             "replay": info,
         }
 
     # ── jest / vitest / results-file adapters ─────────────────────────────
-    # pytest is handled above, byte-for-byte. Anything else runs through the
-    # structured path: augment jest/vitest so they write a results file, and
-    # export MINI_ORK_TEST_RESULTS_DIR so a gate script can write jest-JSON or
-    # JUnit XML to the same place.
+    # pytest is handled above. Anything else runs through the structured path:
+    # augment jest/vitest so they write a results file, and export
+    # MINI_ORK_TEST_RESULTS_DIR so a gate script can write jest-JSON or JUnit
+    # XML to the same place.
     if not base_cwd or not os.path.isdir(base_cwd):
         return {"passed": False, "reason": f"base cwd not a directory: {base_cwd!r}",
                 "unverified": True, "replay": None}
@@ -283,30 +344,35 @@ def replay_check(
     else:
         runner = "results-file"
 
-    with tempfile.TemporaryDirectory(prefix="replay-results-") as tmp:
-        cand_res_dir = os.path.join(tmp, "candidate")
-        base_res_dir = os.path.join(tmp, "base")
-        os.makedirs(cand_res_dir, exist_ok=True)
-        os.makedirs(base_res_dir, exist_ok=True)
+    def _run_once(cand_cwd: str, cand_log: str, base_cwd: str, b_log: str):
+        """Run both sides once; returns ``(base_rc, cand_res, base_res)``."""
+        with tempfile.TemporaryDirectory(prefix="replay-results-") as tmp:
+            cand_res_dir = os.path.join(tmp, "candidate")
+            base_res_dir = os.path.join(tmp, "base")
+            os.makedirs(cand_res_dir, exist_ok=True)
+            os.makedirs(base_res_dir, exist_ok=True)
 
-        def _run_structured(
-            cwd: str, log: str, res_dir: str
-        ) -> tuple[int, tuple[set[str], set[str]] | None]:
-            augmented, _ = augment_for_results(cmd, res_dir)
-            env = scrubbed_test_env()
-            env["MINI_ORK_TEST_RESULTS_DIR"] = res_dir
-            try:
-                with open(log, "wb") as fh:
-                    rc = subprocess.run(
-                        augmented, shell=True, cwd=cwd, env=env,
-                        stdout=fh, stderr=subprocess.STDOUT,
-                    ).returncode
-            except OSError:
-                return -1, None
-            return rc, parse_results_dir(res_dir, cwd)
+            def _run_structured(
+                cwd: str, log: str, res_dir: str
+            ) -> tuple[int, tuple[set[str], set[str]] | None]:
+                augmented, _ = augment_for_results(cmd, res_dir)
+                env = scrubbed_test_env()
+                env["MINI_ORK_TEST_RESULTS_DIR"] = res_dir
+                try:
+                    with open(log, "wb") as fh:
+                        rc = subprocess.run(
+                            augmented, shell=True, cwd=cwd, env=env,
+                            stdout=fh, stderr=subprocess.STDOUT,
+                        ).returncode
+                except OSError:
+                    return -1, None
+                return rc, parse_results_dir(res_dir, cwd)
 
-        _, cand_res = _run_structured(cand_cwd, cand_log, cand_res_dir)
-        base_rc, base_res = _run_structured(base_cwd, b_log, base_res_dir)
+            _, cand_res = _run_structured(cand_cwd, cand_log, cand_res_dir)
+            base_rc, base_res = _run_structured(base_cwd, b_log, base_res_dir)
+            return base_rc, cand_res, base_res
+
+    base_rc, cand_res, base_res = _run_once(cand_cwd, cand_log, base_cwd, b_log)
 
     if base_rc == -1:
         return {"passed": False, "reason": "base state could not be evaluated",
@@ -330,18 +396,46 @@ def replay_check(
             "replay": None,
         }
 
-    cand_pass, _ = cand_res
-    base_pass, base_fail = base_res
-    total = len(cand_pass) + len(base_pass) + len(base_fail)
+    cand_pass_1, _ = cand_res
+    base_pass_1, base_fail_1 = base_res
+    base_weak_1 = {i for i in base_fail_1 if i.endswith(_SUITE_LOAD_FAILURE_SUFFIX)}
+    base_strong_1 = base_fail_1 - base_weak_1
+    total = len(cand_pass_1) + len(base_pass_1) + len(base_fail_1)
     if total == 0:
         return {"passed": False, "reason": "no tests collected; cannot establish delta",
                 "unverified": True, "replay": None}
 
+    overlap_1 = cand_pass_1 & base_fail_1
+    cand_pass = cand_pass_1
+    base_fail = base_fail_1
+    flaky: list[str] = []
+    if overlap_1 and os.environ.get("MO_REPLAY_FLAKE_RERUN", "1") != "0":
+        # Flake re-run: both sides once more with the same command; keep only
+        # the tests stable on both runs. Deterministic runners are a no-op.
+        _, cand_res_2, base_res_2 = _run_once(cand_cwd, cand_log + ".2", base_cwd, b_log + ".2")
+        if cand_res_2 is None or base_res_2 is None:
+            # The re-run produced no parsable results (infra hiccup): abstain
+            # like an unrunnable first run, never label the overlap flaky.
+            return {"passed": False,
+                    "reason": "flake re-run could not run; cannot confirm the overlap",
+                    "unverified": True, "replay": None}
+        cand_pass_2 = cand_res_2[0]
+        base_fail_2 = base_res_2[1]
+        cand_pass = cand_pass_1 & cand_pass_2
+        base_fail = base_fail_1 & base_fail_2
+        flaky = sorted(overlap_1 - (cand_pass & base_fail))
+
     overlap = cand_pass & base_fail
+    weak_overlap = sorted(overlap & base_weak_1)
+    strong_overlap = sorted(overlap & base_strong_1)
+
     info = {
         "candidate_passed": sorted(cand_pass),
         "base_failed": sorted(base_fail),
         "overlap": sorted(overlap),
+        "weak_overlap": weak_overlap,
+        "strong_overlap": strong_overlap,
+        "flaky": flaky,
         "runner": runner,
     }
 
@@ -350,11 +444,15 @@ def replay_check(
             "passed": True,
             "reason": "tests exercise the change (delta-gate overlap)",
             "unverified": False,
+            "weak": not strong_overlap,
             "replay": info,
         }
+    reason = "tests-do-not-exercise-change"
+    if flaky:
+        reason = f"tests-do-not-exercise-change (flaky: {', '.join(flaky)})"
     return {
         "passed": False,
-        "reason": "tests-do-not-exercise-change",
+        "reason": reason,
         "unverified": False,
         "replay": info,
     }

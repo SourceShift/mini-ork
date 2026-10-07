@@ -613,17 +613,65 @@ def emit_unverified(post_rc, reason, replay=None, adequacy=None, flag="replay_un
     return 0
 
 
-def _green_pass(reason, post_rc, replay=None):
+def _revise_rounds_remain():
+    """True when the revise loop has at least one round left.
+
+    Mirrors the runtime's revise-round bookkeeping: rounds remain when there is
+    no ``<LOG_DIR>/revise/current.json`` and ``MO_REVISE_ROUNDS`` is enabled, or
+    when the recorded ``round`` is below ``max_rounds``. A missing, unreadable,
+    or malformed ``current.json`` is treated as "no revise state yet".
+    """
+    try:
+        cap = int(os.environ.get("MO_REVISE_ROUNDS", "2"))
+    except ValueError:
+        cap = 2
+    if cap <= 0:
+        return False
+    current_path = os.path.join(LOG_DIR, "revise", "current.json")
+    try:
+        with open(current_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return True
+    if not isinstance(data, dict):
+        return True
+    try:
+        n = int(data.get("round"))
+        m = int(data.get("max_rounds", cap))
+    except (TypeError, ValueError):
+        return True
+    # The runtime grants min(edge max_rounds, MO_REVISE_ROUNDS) rounds; trusting
+    # the edge max alone would hard-fail on the last granted round.
+    return n < min(m, cap)
+
+
+def _green_pass(reason, post_rc, replay=None, require_adequate=False):
     """Route a green post-patch suite through the adequacy audit (default ON).
 
     Knob off (``MO_SUITE_ADEQUACY=0``): byte-identical to the pre-audit
-    ``emit(True, …)``. Knob on: run ``audit_suite`` against the changed source
-    files. ``ADEQUATE`` and ``NOT_APPLICABLE`` keep the pass (the latter means
-    the instrument does not apply to the change); anything else downgrades a
-    green that cannot kill its mutants to UNVERIFIED (pass:false, exit 0) — the
-    existing abstention contract, never a rollback.
+    ``emit(True, …)`` — unless ``require_adequate`` (weak fail-to-pass), which
+    can never pass without an ``ADEQUATE`` verdict. Knob on: run ``audit_suite``
+    against the changed source files.
+
+    Normal (strong) path: ``ADEQUATE`` and ``NOT_APPLICABLE`` keep the pass
+    (the latter means the instrument does not apply to the change); anything
+    else downgrades a green that cannot kill its mutants to UNVERIFIED
+    (pass:false, exit 0) — the existing abstention contract, never a rollback.
+
+    Weak path (``require_adequate=True``): only ``ADEQUATE`` keeps the pass.
+    ``NOT_APPLICABLE`` and every other non-ADEQUATE verdict become
+    ``weak_f2p_unverified`` — except ``INADEQUATE`` with surviving mutants,
+    which feeds the revise loop: with rounds remaining it fails (exit 1) naming
+    the survivors so the implementer can strengthen the assertions; with rounds
+    exhausted it falls back to today's ``adequacy_unverified`` abstention.
     """
     if os.environ.get("MO_SUITE_ADEQUACY", "1") != "1":
+        if require_adequate:
+            return emit_unverified(
+                post_rc,
+                "weak fail-to-pass requires an ADEQUATE suite; adequacy audit disabled",
+                replay=replay, flag="weak_f2p_unverified",
+            )
         return emit(True, reason, post_rc, replay=replay)
 
     if _suite_adequacy is None:
@@ -637,8 +685,33 @@ def _green_pass(reason, post_rc, replay=None):
         return emit(True, f"{reason}; suite adequacy ADEQUATE (score {a['score']:.3f})",
                     post_rc, replay=replay, adequacy=a)
     if a["verdict"] == "NOT_APPLICABLE":
+        if require_adequate:
+            return emit_unverified(post_rc, f"weak fail-to-pass: {a['reason']}",
+                                   replay=replay, adequacy=a, flag="weak_f2p_unverified")
         return emit(True, f"{reason}; suite adequacy n/a ({a['reason']})",
                     post_rc, replay=replay, adequacy=a)
+    if require_adequate and a["verdict"] == "INADEQUATE" and a.get("survivors"):
+        survivors = a["survivors"][:5]
+        mutant_text = "; ".join(
+            f"{s['file']}:{s['line']} {s['operator']}: {s['original']} -> {s['mutated']}"
+            for s in survivors
+        )
+        if _revise_rounds_remain():
+            return emit(
+                False,
+                f"weak fail-to-pass: {mutant_text}; "
+                "strengthen the assertions so these mutants fail",
+                post_rc, replay=replay, adequacy=a,
+            )
+        return emit_unverified(
+            post_rc, f"suite-{a['verdict'].lower()}: {a['reason']}",
+            replay=replay, adequacy=a, flag="adequacy_unverified",
+        )
+    if require_adequate:
+        return emit_unverified(
+            post_rc, f"weak fail-to-pass: suite-{a['verdict'].lower()}: {a['reason']}",
+            replay=replay, adequacy=a, flag="weak_f2p_unverified",
+        )
     return emit_unverified(
         post_rc, f"suite-{a['verdict'].lower()}: {a['reason']}",
         replay=replay, adequacy=a, flag="adequacy_unverified",
@@ -774,6 +847,9 @@ def main():
                                    replay=replay_result.get("replay"),
                                    replay_applicable=replay_result.get("applicable"))
         if replay_result["passed"]:
+            if replay_result.get("weak"):
+                return _green_pass("post-patch suite green; replay: tests exercise the change",
+                                   post_rc, replay=replay_result["replay"], require_adequate=True)
             return _green_pass("post-patch suite green; replay: tests exercise the change",
                                post_rc, replay=replay_result["replay"])
         return emit(False, replay_result["reason"], post_rc, replay=replay_result["replay"])
