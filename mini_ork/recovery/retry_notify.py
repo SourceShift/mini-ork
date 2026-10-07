@@ -36,7 +36,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-__all__ = ["owner", "fix_steps", "notify"]
+__all__ = ["owner", "fix_steps", "lane_repair_message", "notify"]
 
 GATE_ID = "retry_precondition"  # written into mo_inbox_gates.gate_id
 PHASE = "retry"  # written into mo_inbox_gates.phase
@@ -710,6 +710,102 @@ def _write_gate_pointer(run_dir: Path, inbox_id: int, blocks_for: str) -> None:
     )
 
 
+# ── lane-repair delivery (offline thread append) ──────────────────────────
+#
+# A run whose lane is unavailable is not thrown away: the Zed thread that
+# started it is told, and offered a resume on a working lane. The live path is
+# ``MiniOrkAcpAgent._offer_lane_repair`` (an ACP message / permission card);
+# the offline path lives in ``notify`` below — it appends ONE record to the
+# thread's JSONL so the user reads it on the next ``session/load`` even when
+# the thread was not open when the run failed. ``lane_repair_message`` is the
+# one builder both paths share, so the text a user reads live is byte-identical
+# to the text replayed from disk.
+
+# The env kind a Zed thread writes into ``MO_RUN_OWNER`` (``thread:<id>``).
+_THREAD_OWNER_KIND = "thread"
+
+
+def lane_repair_message(hint: dict[str, Any]) -> str:
+    """The "this run needs a lane repair" message the user sees.
+
+    Reads the lane ``needs_change`` payload (``provider``, ``lane``, ``alias``,
+    ``nodes``, ``detail``, ``suggestions``) plus the hint's top-level
+    ``run_id`` / ``failed_node``. Pure string work — no I/O, never raises.
+    """
+    hint = hint if isinstance(hint, dict) else {}
+    nc_raw = hint.get("needs_change")
+    nc: dict[str, Any] = nc_raw if isinstance(nc_raw, dict) else {}
+    run_id = str(hint.get("run_id") or "")
+    failed_node = str(hint.get("failed_node") or "")
+    provider = str(nc.get("provider") or "the")
+    lane = str(nc.get("lane") or "")
+    alias = str(nc.get("alias") or "")
+    nodes = nc.get("nodes") if isinstance(nc.get("nodes"), list) else []
+    nodes_txt = ", ".join(str(n) for n in nodes)
+    detail = _truncate(str(nc.get("detail") or ""), 200)
+    head = f"**{run_id} needs repair.** {provider} lane `{lane}`"
+    if nodes_txt:
+        head += f" (used by {alias}: {nodes_txt})"
+    head += " failed:"
+    lines = [head]
+    if detail:
+        lines.append(detail)
+    lines.append(f"Resume from `{failed_node}` on a working lane:")
+    suggestions = [s for s in (nc.get("suggestions") or []) if isinstance(s, dict)][:2]
+    for s in suggestions:
+        line = f"/recover {run_id} --lane {alias}={str(s.get('lane') or '')}"
+        reason = str(s.get("reason") or "")
+        if reason:
+            line += f"   ({reason})"
+        lines.append(line)
+    if not suggestions:
+        lines.append(f"/recover {run_id}")
+    return "\n".join(lines)
+
+
+def _append_lane_repair(
+    home: Path, thread_id: str, run_id: str, hint: dict[str, Any]
+) -> bool:
+    """Append ONE lane-repair message to ``thread_id``'s JSONL (best-effort).
+
+    The record matches the shape ``agent.py`` replays as an
+    ``AgentMessageChunk`` (camelCase ``sessionUpdate``, ``by_alias`` JSON), and
+    carries a ``lane-repair:<run_id>`` marker so a repeat call — or the
+    identical message the live agent already emitted — never double-posts.
+    Returns ``True`` when a record was appended. Never raises: a bad thread id
+    (``ThreadStore`` raises ``ValueError`` on an unsafe id) or an unwritable
+    home returns ``False``.
+    """
+    h = dict(hint) if isinstance(hint, dict) else {}
+    h["run_id"] = h.get("run_id") or run_id
+    text = lane_repair_message(h)
+    marker = f"lane-repair:{run_id}"
+    try:
+        from mini_ork.acp.threads import ThreadStore
+
+        store = ThreadStore(home)
+        for rec in store.read(thread_id):
+            if rec.get("marker") == marker:
+                return False
+            update = rec.get("update")
+            if (rec.get("type") == "update" and isinstance(update, dict)
+                    and update.get("sessionUpdate") == "agent_message_chunk"):
+                content = update.get("content")
+                if isinstance(content, dict) and content.get("text") == text:
+                    return False  # the live agent already posted this
+        store.append(thread_id, {
+            "type": "update",
+            "update": {
+                "content": {"type": "text", "text": text},
+                "sessionUpdate": "agent_message_chunk",
+            },
+            "marker": marker,
+        })
+        return True
+    except Exception:  # noqa: BLE001 — delivery is best-effort, never raise
+        return False
+
+
 def notify(home: Path, run_id: str) -> dict[str, Any] | None:
     """Best-effort side-channel: write NEEDS-CHANGE.md, enqueue a gate,
     print a banner. Returns ``None`` when there is no ``needs_change``
@@ -743,6 +839,12 @@ def notify(home: Path, run_id: str) -> dict[str, Any] | None:
     retryable = bool(hint.get("retryable"))
     if not (needs_kind == "code" or retryable):
         return None
+
+    # Offline delivery: when a Zed thread owns the run and it died on a lane,
+    # append ONE message to that thread so the user sees it on the next
+    # ``session/load`` even if the thread was not open when the run failed.
+    if str(owner_rec.get("kind") or "") == _THREAD_OWNER_KIND and needs_kind == "lane":
+        _append_lane_repair(home, str(owner_rec.get("id") or ""), run_id, hint)
 
     # Persist owner.json (so a later poll that reads owner.json before
     # MO_RUN_OWNER fires still gets the right answer).

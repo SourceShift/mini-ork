@@ -237,6 +237,28 @@ _SLASH_RUN_PREFIX = "/run "
 # keep via a follow-up permission prompt.
 _SLASH_RACE_PREFIX = "/race "
 
+# Lane-repair prompt (recovery). A run that died because its lane is
+# unavailable is not thrown away: the thread that started it is told why, and
+# offered a resume on a working lane. ``retry_hint.load_or_compute`` stays
+# silent until the run's terminal status lands in the DB, and that write can
+# lag the moment ``_await_terminal`` returns, so the hint is polled a few
+# times. See ``_offer_lane_repair``.
+_LANE_REPAIR_RETRIES = 3
+_LANE_REPAIR_RETRY_DELAY = 2.0
+# After a resume is started ``handle_recover`` spawns a detached ``mini-ork
+# recover``; the run's DB row stays ``failed`` until that subprocess reaches the
+# executor, so the follower waits for the status to leave the terminal set
+# before it re-polls. That wait reuses ``MiniOrkAcpAgent._start_timeout_s`` —
+# the same "the run has not produced a live row yet" bound ``_await_terminal``
+# applies — and closes the marker ``failed`` if it expires (see
+# ``_await_resume_started``).
+# ``_offer_lane_repair`` outcomes, telling ``_follow_in_thread`` what to do:
+# close the marker ``failed`` (``_NONE``), leave it open for the user's answer
+# (``_PROMPTED``), or keep following the same run (``_RESUMED``).
+_LANE_REPAIR_NONE = "none"
+_LANE_REPAIR_PROMPTED = "prompted"
+_LANE_REPAIR_RESUMED = "resumed"
+
 
 def _extract_prompt_text(prompt: list[Any]) -> str:
     """Flatten the text content blocks of an ACP prompt into one string."""
@@ -679,6 +701,12 @@ class MiniOrkAcpAgent:
         # flag prevents the message from re-firing on every poll. A
         # successful merge / discard clears the entry (no second offer).
         self._ready_to_review_emitted: set[str] = set()
+        # run id → True once the lane-repair prompt (buttons, or the one-time
+        # message) was offered for a run that died on a lane. Its own set, not
+        # ``_ready_to_review_emitted``: the two prompts have different
+        # lifecycles (a review offer is discarded on merge / discard; a repair
+        # offer is not). Mirrors the review set's "never re-fire" contract.
+        self._lane_repair_emitted: set[str] = set()
         # Per-run env overlay merged into ``_launch``'s ``extra_env``.
         # Zed S7a: the race turn seeds each run's entry so
         # ``MO_ROUTING_POLICY=workflow_default`` survives the spawn.
@@ -1664,10 +1692,17 @@ class MiniOrkAcpAgent:
         self._sessions[new_run_id] = run_cwd
         self._recipes[new_run_id] = recipe
         self._launch_count += 1
+        # Name the thread as this run's owner BEFORE the launch. ``_launch``
+        # merges ``_run_env[run_id]`` into the child's env; the run-failure
+        # path (``retry_notify.notify``) then knows which thread to tell, and
+        # the offline fallback can append the repair message to it. Cleared
+        # once the run's follow ends (or the launch fails).
+        self._run_env.setdefault(new_run_id, {})["MO_RUN_OWNER"] = f"thread:{session_id}"
         launcher = self._launcher or self._launch
         result = launcher(new_run_id, text)
         self._launches[new_run_id] = result if isinstance(result, dict) else {}
         if isinstance(result, dict) and result.get("ok") is False:
+            self._run_env.pop(new_run_id, None)
             await self._emit(
                 session_id,
                 self._build_refusal_message(
@@ -1694,6 +1729,9 @@ class MiniOrkAcpAgent:
             stop = await self._follow_in_thread(session_id, new_run_id)
         finally:
             self._direct_runs.pop(session_id, None)
+            # The per-run env overlay is only read at launch time — drop it so
+            # one entry per ``/run`` does not leak.
+            self._run_env.pop(new_run_id, None)
         return PromptResponse(stop_reason="end_turn" if stop == "refusal" else stop)
 
     async def _prompt_thread_race(
@@ -2340,6 +2378,10 @@ class MiniOrkAcpAgent:
             # signature, so only forward when we're calling our own default.
             if turn is self._default_orchestrator_turn:
                 kwargs["workspace_mode"] = str(cfg.get("workspace") or _WORKSPACE_WORKTREE)
+                # ``thread_id`` reaches the MCP server as ``MO_THREAD_ID`` so a
+                # ``start_run`` inside the turn can name this thread as the
+                # launched run's owner.
+                kwargs["thread_id"] = session_id
             return await turn(
                 lane=lane,
                 prompt=text,
@@ -3294,21 +3336,43 @@ class MiniOrkAcpAgent:
         marker stays ``in_progress`` until the user picks; ``merge`` /
         ``discard`` flips it to ``completed`` and re-emits the title from
         the new state.
+
+        Recovery: a run that died on an unavailable lane is offered a resume
+        on a working lane. The resume keeps the SAME run id, so this loop
+        stays in the same task: it waits for the run's status to leave the
+        terminal set, then re-enters ``_await_terminal`` and projects the
+        resumed run — the marker stays owned for the run's whole life. No
+        second follower is spawned (a spawn from inside this task would see
+        itself in ``_followers`` and no-op).
         """
-        stop = await self._await_terminal(run_id)
-        if stop == "cancelled":
-            return stop  # the run may still be going; leave its marker open
-        ok = stop == "end_turn" and self._run_status.get(run_id) == "published"
-        if ok and await self._deliver_to_zed(thread_id, run_id):
-            await self._emit(thread_id, ToolCallProgress(
-                session_update="tool_call_update",
-                tool_call_id=f"{run_id}:parent",
-                status="completed",
-            ))
-            await self._reemit_title_after_review(run_id)
-            return stop
-        ws_ready = await self._offer_run_review(thread_id, run_id)
-        if not ws_ready:
+        while True:
+            stop = await self._await_terminal(run_id)
+            if stop == "cancelled":
+                return stop  # the run may still be going; leave its marker open
+            ok = stop == "end_turn" and self._run_status.get(run_id) == "published"
+            if ok and await self._deliver_to_zed(thread_id, run_id):
+                await self._emit(thread_id, ToolCallProgress(
+                    session_update="tool_call_update",
+                    tool_call_id=f"{run_id}:parent",
+                    status="completed",
+                ))
+                await self._reemit_title_after_review(run_id)
+                return stop
+            if await self._offer_run_review(thread_id, run_id):
+                return stop  # S5 buttons/message — the marker stays open
+            if not ok:
+                repair = await self._offer_lane_repair(thread_id, run_id)
+                if repair == _LANE_REPAIR_RESUMED:
+                    # Wait for the detached recover to flip the row out of the
+                    # terminal set, then reuse this task to poll it again.
+                    if await self._await_resume_started(run_id):
+                        continue
+                    # recover never took: fall through to today's ``failed``
+                    # close so the marker is not left hanging.
+                elif repair == _LANE_REPAIR_PROMPTED:
+                    # The user was told (buttons, or the one-time message);
+                    # the marker stays ``in_progress`` until they answer.
+                    return stop
             await self._emit(
                 thread_id,
                 ToolCallProgress(
@@ -3317,7 +3381,31 @@ class MiniOrkAcpAgent:
                     status="completed" if ok else "failed",
                 ),
             )
-        return stop
+            return stop
+
+    async def _await_resume_started(self, run_id: str) -> bool:
+        """Wait (bounded) for a just-resumed run to leave the terminal set.
+
+        ``handle_recover`` spawns a DETACHED ``mini-ork recover``, so the DB
+        row is still ``failed`` when the follower first re-polls: a naive
+        re-entry into ``_await_terminal`` would return ``end_turn`` at once
+        and re-offer the repair forever. Returns ``True`` once the status is
+        non-terminal (the recover reached the executor), ``False`` on timeout
+        or cancel (the caller closes the marker ``failed``).
+
+        The bound is ``_start_timeout_s`` — the same "the run has not produced
+        a live row yet" clock ``_await_terminal`` uses for a fresh launch.
+        """
+        reader = self._reader or self._read_snapshot
+        deadline = time.monotonic() + self._start_timeout_s
+        while time.monotonic() < deadline:
+            if run_id in self._cancelled:
+                return False
+            status = (reader(run_id) or {}).get("status")
+            if status is not None and status not in TERMINAL_STATUSES:
+                return True
+            await asyncio.sleep(self._poll_interval)
+        return False
 
     async def _deliver_to_zed(self, thread_id: str, run_id: str) -> bool:
         """Hand a finished run's change to Zed as agent edits.
@@ -3543,6 +3631,168 @@ class MiniOrkAcpAgent:
             ),
         )
 
+    async def _offer_lane_repair(self, thread_id: str, run_id: str) -> str:
+        """Tell the thread a run died on a lane, and offer a resume.
+
+        Called by ``_follow_in_thread`` when a run ended ``failed`` (before the
+        marker is closed). Returns:
+
+          * ``_LANE_REPAIR_PROMPTED`` — buttons on an active turn, or a
+            one-time message otherwise; the caller leaves the marker
+            ``in_progress`` until the user answers.
+          * ``_LANE_REPAIR_RESUMED`` — the user picked resume / retry and the
+            same run is being recovered; the caller keeps following it.
+          * ``_LANE_REPAIR_NONE`` — no lane hint, a race run, or any error;
+            the caller closes the marker ``failed`` as before.
+
+        ``retry_hint.load_or_compute`` returns ``None`` until the run's status
+        has flipped to a terminal failure, and that DB write can lag the moment
+        ``_await_terminal`` returns, so the hint is polled a few times.
+
+        Never raises into the follower: every path is wrapped, and a failure
+        falls back to today's ``failed`` close.
+        """
+        if run_id in self._lane_repair_emitted:
+            # Already offered for this incarnation of the run: do not re-post,
+            # and do not close the marker (the user still owes an answer).
+            return _LANE_REPAIR_PROMPTED
+        # Zed S7a: a race run surfaces its decision on the parent permission
+        # card; a per-run repair prompt would be a second, conflicting one.
+        if run_id in self._skip_review:
+            return _LANE_REPAIR_NONE
+        try:
+            from mini_ork.recovery import retry_hint, retry_notify
+
+            home = self._home_for(run_id)
+            hint: dict[str, Any] | None = None
+            for attempt in range(_LANE_REPAIR_RETRIES):
+                hint = retry_hint.load_or_compute(home, run_id, write=False)
+                nc = hint.get("needs_change") if isinstance(hint, dict) else None
+                if isinstance(nc, dict) and str(nc.get("kind") or ""):
+                    break  # classified (lane or not) — no point waiting
+                if attempt < _LANE_REPAIR_RETRIES - 1:
+                    await asyncio.sleep(_LANE_REPAIR_RETRY_DELAY)
+            if not isinstance(hint, dict):
+                return _LANE_REPAIR_NONE
+            nc = hint.get("needs_change")
+            if not isinstance(nc, dict) or str(nc.get("kind") or "") != "lane":
+                return _LANE_REPAIR_NONE
+            text = retry_notify.lane_repair_message(hint)
+            failed_node = str(hint.get("failed_node") or "")
+            lane = str(nc.get("lane") or "")
+            summary = str(nc.get("summary") or "").strip()
+            summary_tail = summary if len(summary) <= 60 else summary[:59].rstrip() + "…"
+            suggestions = [
+                s for s in (nc.get("suggestions") or []) if isinstance(s, dict)
+            ][:2]
+        except Exception:  # noqa: BLE001 — never raise into the follower
+            return _LANE_REPAIR_NONE
+
+        self._lane_repair_emitted.add(run_id)
+        active_turn = (
+            self._direct_runs.get(thread_id) == run_id
+            or self._orchestrator_tasks.get(thread_id) is not None
+        )
+        if not active_turn or self._conn is None:
+            # No live UI to host the buttons: one message, and the marker
+            # stays open until the user runs ``/recover``.
+            try:
+                await self._emit(thread_id, self._build_refusal_message(text))
+            except Exception:  # noqa: BLE001
+                pass
+            return _LANE_REPAIR_PROMPTED
+
+        options = [
+            PermissionOption(
+                option_id=f"lane:{str(s.get('lane') or '')}",
+                name=f"Resume on {str(s.get('lane') or '')} ({str(s.get('reason') or '')})",
+                kind="allow_once",
+            )
+            for s in suggestions
+        ]
+        options.append(
+            PermissionOption(option_id="same", name=f"Retry on {lane}", kind="allow_once")
+        )
+        options.append(
+            PermissionOption(option_id="abandon", name="Leave it", kind="reject_once")
+        )
+        try:
+            response = await self._conn.request_permission(
+                session_id=thread_id,
+                tool_call=ToolCallUpdate(
+                    tool_call_id=f"{run_id}:parent",
+                    kind="other",
+                    title=(
+                        f"{run_id} stopped: {lane} {summary_tail}. "
+                        f"Resume from {failed_node}?"
+                    ),
+                    status="pending",
+                ),
+                options=options,
+            )
+        except Exception:  # noqa: BLE001 — UI is best-effort, marker stays open
+            return _LANE_REPAIR_PROMPTED
+        outcome = getattr(response, "outcome", None)
+        option_id = getattr(outcome, "option_id", None) if outcome is not None else None
+        try:
+            resumed = await self._handle_lane_repair_decision(
+                thread_id, run_id, option_id, hint
+            )
+        except Exception:  # noqa: BLE001 — never raise into the follower
+            return _LANE_REPAIR_PROMPTED
+        return _LANE_REPAIR_RESUMED if resumed else _LANE_REPAIR_PROMPTED
+
+    async def _handle_lane_repair_decision(
+        self, thread_id: str, run_id: str, option_id: str | None, hint: dict[str, Any]
+    ) -> bool:
+        """Apply the user's pick on a lane-repair prompt.
+
+        ``lane:<x>`` resumes on the picked lane (``/recover <run> --lane
+        <alias>=<x>``); ``same`` retries on the lane that failed; anything else
+        (``abandon`` or a dismissed card) leaves the run as it is and prints how
+        to resume later.
+
+        Returns ``True`` when a resume / retry was started — the caller
+        (``_follow_in_thread``, in the SAME task) keeps following the run — and
+        ``False`` for abandon. The dedupe marker is dropped on a resume so a
+        second lane failure offers a fresh prompt instead of going silent.
+        """
+        from mini_ork.acp import commands as _commands
+
+        nc = hint.get("needs_change")
+        nc = nc if isinstance(nc, dict) else {}
+        alias = str(nc.get("alias") or "")
+        if isinstance(option_id, str) and option_id.startswith("lane:"):
+            picked = option_id[len("lane:"):]
+            arg = f"{run_id} --lane {alias}={picked}" if alias and picked else run_id
+        elif option_id == "same":
+            arg = run_id
+        else:
+            command = str(hint.get("command") or "")
+            tail = f" You can resume later with:\n`{command}`" if command else ""
+            await self._emit(
+                thread_id,
+                ToolCallProgress(
+                    session_update="tool_call_update",
+                    tool_call_id=f"{run_id}:parent",
+                    status="failed",
+                ),
+            )
+            await self._emit(
+                thread_id, self._build_refusal_message(f"Left as is.{tail}")
+            )
+            return False
+        reply = await _commands.handle(self, thread_id, "recover", arg)
+        if isinstance(reply, _commands.CommandReply):
+            await self._emit(thread_id, self._build_refusal_message(reply.text))
+            await self._emit_file_links(thread_id, reply.links)
+        else:
+            await self._emit(thread_id, self._build_refusal_message(str(reply)))
+        # The resume reuses this run id; forget the "already offered" marker so
+        # a second failure is announced again rather than swallowed.
+        self._lane_repair_emitted.discard(run_id)
+        return True
+
     async def _offer_thread_review(self, thread_id: str) -> None:
         """Orchestrator turn-end pass: walk the runs this thread followed
         during the turn, newest-first, and offer buttons for any that are
@@ -3642,6 +3892,7 @@ class MiniOrkAcpAgent:
         resume: str | None,
         on_event: Callable[[dict[str, Any]], Awaitable[None]],
         workspace_mode: str | None = None,
+        thread_id: str | None = None,
     ) -> Any:
         """Default ``orchestrator_turn`` — delegates to the orchestrator harness.
 
@@ -3654,12 +3905,19 @@ class MiniOrkAcpAgent:
         subprocess via ``MO_WORKSPACE_MODE`` so ``start_run`` inside the
         orchestrator's own tool calls lands on the same workspace choice as
         the parent thread. ``None`` falls through to the harness default.
+
+        ``thread_id`` is forwarded as ``MO_THREAD_ID`` so the MCP server's
+        ``start_run`` can name the thread as the launched run's owner
+        (``MO_RUN_OWNER=thread:<id>``) — the run-failure path then knows which
+        thread to tell when a run dies on an unavailable lane.
         """
         from mini_ork.acp_orchestrator.harness import run_turn
 
         extra_mcp_env: dict[str, str] = {}
         if workspace_mode:
             extra_mcp_env["MO_WORKSPACE_MODE"] = workspace_mode
+        if thread_id:
+            extra_mcp_env["MO_THREAD_ID"] = thread_id
         if cwd:
             # start_run works from the thread's own checkout; the MCP server
             # only knows the home, i.e. the main checkout.

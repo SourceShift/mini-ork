@@ -542,6 +542,13 @@ def _start_run(home: Path, args: dict[str, Any]) -> dict[str, Any]:
     from mini_ork.web.control import launch_run
 
     extra_env: dict[str, str] = {"MO_TARGET_CWD": str(project_root)}
+    # The orchestrator's spawned MCP server inherits MO_THREAD_ID from the
+    # thread that started the turn; naming it as the run's owner lets the
+    # run-failure path (retry_notify) tell that thread when the run dies on an
+    # unavailable lane. Read the same way MO_THREAD_CWD is below.
+    thread_id = os.environ.get("MO_THREAD_ID") or ""
+    if thread_id:
+        extra_env["MO_RUN_OWNER"] = f"thread:{thread_id}"
     note: str | None = None
     workspace_meta: dict[str, Any] = {"workspace": workspace_mode}
     pre_minted_run_id: str | None = None
