@@ -658,9 +658,12 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     # permanently "running" in the DAG. trace() pops the start-map entry, so
     # this fires only for the handlers that bypassed the trace seam.
     if node_id in node_start_ms:
-        node_start_ms.pop(node_id, None)
-        mo_node_end(run_id, node_id, node_type, 0,
-                    finish_reason=finish_reason, db=db)
+        # The real duration (it was a hard-coded 0, so every Python-era verifier
+        # node_end read "0 ms" whether it ran or not — K0.5c AC0).
+        started = node_start_ms.pop(node_id, None)
+        mo_node_end(run_id, node_id, node_type,
+                    max(0, _now_ms() - started) if started is not None else 0,
+                    verdict=ctx.node_verdict, finish_reason=finish_reason, db=db)
     return rc, finish_reason
 
 
@@ -722,6 +725,9 @@ class NodeDispatch:
     artifact_context: str = ""
     artifact_ledger: object | None = None
     compiled_workflow: object | None = None
+    # A handler that never calls trace() can leave a reason here; the fallback
+    # node_end carries it as the payload verdict (e.g. verifier_not_executed).
+    node_verdict: str = ""
 
     @property
     def recipe_eff(self) -> str:
@@ -1375,6 +1381,22 @@ def _handle_transform(ctx: NodeDispatch):
     return 0, "done"
 
 
+VERIFIER_NOT_EXECUTED = "verifier_not_executed"
+
+
+def _verifier_not_executed(ctx: NodeDispatch, why: str):
+    """Fail a verifier node that never ran its script — loudly, with a reason
+    (K0.5c AC2). finish_reason stays the CHECK-enum `error`; the reason rides
+    in the node_end payload verdict, a [fail] line and task_runs notes. No
+    verifier_* evidence is written, so I1 counts it as not proven."""
+    line = f"  [fail] verifier node {ctx.node_id}: {VERIFIER_NOT_EXECUTED} ({why})"
+    print(line, file=sys.stderr)
+    print(line)
+    ctx.node_verdict = VERIFIER_NOT_EXECUTED
+    _append_run_note(ctx.db, ctx.run_id, f"{VERIFIER_NOT_EXECUTED}: node {ctx.node_id} ({why})")
+    return 1, "error"
+
+
 def _handle_verifier(ctx: NodeDispatch):
     post_impl = not _verifier_runs_before_implementer(ctx.workflow, ctx.node_id)
 
@@ -1397,7 +1419,7 @@ def _handle_verifier(ctx: NodeDispatch):
     # Artifacts the verifiers themselves write are checked after they run.
     if post_impl and not _required_artifacts_ok(ctx.plan_path, skip_verifier_outputs=True):
         print("  [fail] verifier node: required artifact(s) missing or empty", file=sys.stderr)
-        return 1, "error"
+        return _verifier_not_executed(ctx, "required artifact(s) missing or empty before the verifier ran")
     artifact = ""
     try:
         ac = (json.load(open(ctx.plan_path)).get("artifact_contract") or {}) if ctx.plan_path else {}
@@ -1428,7 +1450,7 @@ def _handle_verifier(ctx: NodeDispatch):
         script = os.path.join(ctx.recipe_dir, ctx.verifier_ref)
         if not os.path.isfile(script):
             print(f"  [fail] verifier_ref not found: {ctx.verifier_ref}", file=sys.stderr)
-            return 1, "error"
+            return _verifier_not_executed(ctx, f"verifier_ref not found: {ctx.verifier_ref}")
         ev_dir = os.path.join(context_env("MINI_ORK_RUN_DIR", ctx.run_dir), "evidence")
         os.makedirs(ev_dir, exist_ok=True)
         ev = os.path.join(ev_dir, os.path.basename(ctx.verifier_ref).replace(".sh", "").replace(".py", "") + ".log")

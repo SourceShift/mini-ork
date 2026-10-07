@@ -50,7 +50,7 @@ def _ctx(tmp_path, run, script_body):
         workflow=_workflow(tmp_path), node_id="test_verifier", plan_path=_plan(tmp_path, run),
         verifier_ref="verifiers/test.py", recipe_dir=str(recipe), run_dir=str(run),
         run_dir_eff=str(run), task_class="framework_edit", root=str(tmp_path),
-        publish_declared_outputs=lambda: True,
+        publish_declared_outputs=lambda: True, db="", run_id="",
     )
 
 
