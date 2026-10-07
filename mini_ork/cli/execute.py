@@ -2636,6 +2636,16 @@ def _execute_gate_check(plan_path, run_dir, dry_run):
     # A needs_answers plan with ZERO questions is a contradiction — do not block.
     if status != "needs_answers" or not questions:
         return False
+    # The planner already persisted one ASK file per question (asks/ask-N.json)
+    # and exited 6. When this gate is reached anyway (a standalone execute
+    # against a needs_answers plan), the run is resumable — refuse to dispatch
+    # and signal exit 6 WITHOUT writing blocked.json or marking the run failed.
+    asks_dir = os.path.join(run_dir, "asks")
+    if os.path.isdir(asks_dir) and any(
+            n.startswith("ask-") and n.endswith(".json") for n in os.listdir(asks_dir)):
+        print("[blocked] plan_status=needs_answers — answer the ASK files, then "
+              "resume (mini-ork resume <run_id> --answer ask-1=<text>)")
+        return True
     gate_info = {"plan_status": status, "blocked_by": p.get("blocked_by") or "unknown",
                  "human_questions": questions}
     print("[blocked] plan_status=needs_answers — refusing to dispatch "

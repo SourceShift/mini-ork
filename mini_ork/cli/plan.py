@@ -371,6 +371,77 @@ def _prompt_profile_questions(questions, profile_path) -> str:
     return answers_path if _apply_profile_answers(profile_path, payload) else ""
 
 
+def _question_text(q) -> str:
+    """Normalise a profile question to its promptable text.
+
+    ``gen_profile`` writes plain strings, but the profile reader passes through
+    whatever the profile file holds; dicts and non-strings degrade to their text
+    the same way ``_prompt_profile_questions`` does, so the ASK file's
+    ``question`` key and the answers map resume builds stay keyed identically.
+    """
+    if isinstance(q, str):
+        return q
+    if isinstance(q, dict):
+        return q.get("text") or q.get("question") or str(q)
+    return str(q)
+
+
+def _emit_asks_blocked_event(db, run_id, ask_ids, created_at):
+    """Best-effort ``run_events`` row for a run blocked on profile questions.
+
+    ``event_id`` embeds the run id (``evt-asks_blocked-<run_id>-<ts>``) because
+    ``run_events.event_id`` is UNIQUE — two runs blocking in the same second
+    would otherwise collide. ``event_type`` is unconstrained TEXT; ``finish_reason``
+    is left NULL so no CHECK enum is widened.
+    """
+    if not (db and os.path.isfile(db) and run_id):
+        return
+    import sqlite3
+    try:
+        con = sqlite3.connect(db, timeout=5.0)
+        con.execute("PRAGMA busy_timeout = 5000")
+        con.execute(
+            "INSERT INTO run_events(event_id, run_id, event_type, payload_json, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (f"evt-asks_blocked-{run_id}-{created_at}", run_id, "asks_blocked",
+             json.dumps({"ask_ids": ask_ids, "blocked_by": "run_profile"}), created_at))
+        con.commit()
+        con.close()
+    except sqlite3.Error:
+        pass
+
+
+def _write_ask_files(run_dir: str, run_id: str, questions, db) -> list[str]:
+    """Persist one ``asks/ask-N.json`` per human question and print the resume
+    hint. Returns the ask ids written, in 1-based question order."""
+    asks_dir = os.path.join(run_dir, "asks")
+    os.makedirs(asks_dir, exist_ok=True)
+    created_at = int(time.time())
+    ask_ids: list[str] = []
+    for index, q in enumerate(questions, 1):
+        ask_id = f"ask-{index}"
+        ask_ids.append(ask_id)
+        ask = {
+            "schema_version": "ask@1",
+            "ask_id": ask_id,
+            "run_id": run_id,
+            "question": _question_text(q),
+            "blocking_refs": ["run_profile"],
+            "options": [],
+            "default": None,
+            "created_at": created_at,
+            "answer": None,
+            "answered_at": None,
+        }
+        with open(os.path.join(asks_dir, f"{ask_id}.json"), "w", encoding="utf-8") as fh:
+            json.dump(ask, fh, indent=2)
+            fh.write("\n")
+    print(f"[asks] {len(questions)} question(s) written to {asks_dir} — "
+          f"answer with: mini-ork resume {run_id} --answer ask-1=<text>")
+    _emit_asks_blocked_event(db, run_id, ask_ids, created_at)
+    return ask_ids
+
+
 def _brief_query(path) -> str:
     try:
         raw = Path(path).read_text(encoding="utf-8")
@@ -704,13 +775,22 @@ def main(argv=None, *, root=None, dispatch=None) -> int:
                 "artifact_contract": {"outputs": [], "success_verifiers": []},
                 "verifier_contract": {"checks": [{"id": "profile-needs-answers",
                     "description": "Planner dispatch is blocked until run_profile is ready."}]}}
+        plan_text = json.dumps(plan, indent=2) + "\n"
         with open(out_file, "w", encoding="utf-8") as f:
-            json.dump(plan, f, indent=2); f.write("\n")
+            f.write(plan_text)
         print(f"plan_path={out_file}")
         print(f"task_class={task_class}")
         print('{"plan_status":"needs_answers","blocked_by":"run_profile"}')
         _trace_plan(trace_id, task_class, "blocked", db,
                     reviewer_verdict="run_profile_needs_answers")
+        if human_questions:
+            # A headless run blocked on real questions is resumable, not failed:
+            # write one ASK file per question, mark the row planned (non-terminal),
+            # and exit 6 — the same code execute used to signal this block.
+            _write_ask_files(run_dir, run_id, human_questions, db)
+            _db_write(db, run_id, task_class, out_file,
+                      hashlib.sha256(plan_text.encode()).hexdigest()[:16])
+            return 6
         return 0
 
     # ── get raw plan: MO_GIVEN_PLAN | force-recipe-fallback | LLM dispatch ──

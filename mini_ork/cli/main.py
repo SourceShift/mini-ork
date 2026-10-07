@@ -435,6 +435,27 @@ def gen_profile(kickoff_path, root, recipe, task_class, profile_path, agents_pat
     return data
 
 
+def _gen_profile_or_reuse(kickoff, root, recipe, task_class, profile_path, agents_path,
+                          rbase) -> dict:
+    """Reuse an already-answered profile instead of re-deriving its questions.
+
+    ``mini-ork resume --answer`` applies answers to ``run_profile.json``
+    (``profile_status`` → ``ready``, ``human_questions`` → ``[]``) before
+    re-entering the lifecycle. Without this guard ``gen_profile`` would re-derive
+    the very questions the run was blocked on from the unchanged kickoff and
+    re-block it, so the profile gate would never pass. A fresh run has no
+    ``run_profile.json`` yet and always generates.
+    """
+    try:
+        existing = json.load(open(profile_path, encoding="utf-8"))
+    except Exception:
+        existing = {}
+    if existing.get("profile_status") == "ready" and existing.get("answers"):
+        return existing
+    return gen_profile(kickoff, root, recipe, task_class, profile_path, agents_path,
+                       recipe_base=rbase)
+
+
 def _grep_kv(text: str, key: str) -> str:
     for line in text.splitlines():
         if line.startswith(key + "="):
@@ -902,8 +923,8 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
     # resolved path is byte-equivalent to the prior "home/config/agents.yaml".
     agents_path = agents_config.overlay_or(
         os.path.join(home, "config", "agents.yaml"), home=home)
-    data = gen_profile(kickoff, root, recipe, task_class, profile_path, agents_path,
-                       recipe_base=rbase)
+    data = _gen_profile_or_reuse(kickoff, root, recipe, task_class, profile_path,
+                                 agents_path, rbase)
     sys.stdout.write(f"profile_path={profile_path}\n")
     sys.stdout.write(f"profile_status={data['profile_status']}\n")
     sys.stdout.write(f"profile_confidence={data['confidence']:.2f}\n")

@@ -52,8 +52,12 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """)
     _write(h / "recipes" / "framework-edit" / "example-kickoff.md", """
         # Framework Edit: Title
+        ## Goal
+        ## Acceptance
+        - AC1
         ## Files in scope
-        ## Success criteria
+        ## Out of scope
+        ## Verification command
     """)
     _write(h / "recipes" / "framework-edit" / "task_class.yaml", """
         name: framework_edit
@@ -220,17 +224,18 @@ def test_lint_success_variants_accepted(project: Path, home: Path):
 
 
 def test_lint_missing_example_heading_warns(project: Path, home: Path):
-    """framework-edit's example has '## Files in scope' and '## Success criteria'.
-    Drop '## Success criteria' from the user's kickoff and lint must flag it."""
+    """framework-edit's example lists five contract sections. Drop '## Verification
+    command' from the user's kickoff and lint must flag it as a missing example
+    heading."""
     (project / "present.py").write_text("x", encoding="utf-8")
     body = (
-        "# Title\n\n## Files in scope\n"
-        "- `present.py`\n\n## Done when\n- runs\n"
+        "# Title\n\n## Goal\n- ship\n\n## Acceptance\n- AC1\n\n"
+        "## Files in scope\n- `present.py`\n\n## Out of scope\n- none\n"
     )
     out = kickoff_lint.lint(body, project=project, recipe="framework-edit", home=home)
-    # "Success criteria" is the heading used in the example.
+    # "Verification command" is the heading used in the example.
     assert any(
-        "have a '## Success criteria' section" in f["msg"] for f in out
+        "have a '## Verification command' section" in f["msg"] for f in out
     )
 
 
@@ -251,16 +256,22 @@ def test_lint_unknown_recipe_warns(project: Path, home: Path):
 
 
 def test_lint_complete_kickoff_returns_no_findings(project: Path, home: Path):
-    """A complete kickoff — title, scope (paths exist), success criteria,
-    example headings all present, length under cap — must return []."""
+    """A complete kickoff — title, all five contract sections (with an AC id),
+    scope paths that exist, length under cap — must return []."""
     (project / "present.py").write_text("x", encoding="utf-8")
     # Title matches the example kickoff so the "examples have a section"
     # warning does not fire.
     body = (
         "# Framework Edit: Title\n\n"
+        "## Goal\n"
+        "- ship the change\n\n"
+        "## Acceptance\n"
+        "- AC1: the lint stays silent\n\n"
         "## Files in scope\n"
         "- `present.py`\n\n"
-        "## Success criteria\n"
+        "## Out of scope\n"
+        "- nothing\n\n"
+        "## Verification command\n"
         "- runs\n"
     )
     out = kickoff_lint.lint(body, project=project, recipe="framework-edit", home=home)
@@ -309,8 +320,12 @@ def test_lint_uses_examples_dir_layout(project: Path, tmp_path: Path):
     """)
     _write(h / "recipes" / "newer-recipe" / "examples" / "newer-recipe" / "kickoff.md", """
         # Newer Recipe Title
+        ## Goal
+        ## Acceptance
+        - AC1
         ## Files in scope
-        ## Verification
+        ## Out of scope
+        ## Verification command
     """)
     _write(h / "recipes" / "newer-recipe" / "task_class.yaml", """
         name: newer-recipe
@@ -322,8 +337,9 @@ def test_lint_uses_examples_dir_layout(project: Path, tmp_path: Path):
     try:
         (project / "present.py").write_text("x", encoding="utf-8")
         body = (
-            "# Newer Recipe Title\n\n## Files in scope\n"
-            "- `present.py`\n\n## Verification\n- runs\n"
+            "# Newer Recipe Title\n\n## Goal\n- x\n\n## Acceptance\n- AC1\n\n"
+            "## Files in scope\n- `present.py`\n\n## Out of scope\n- none\n\n"
+            "## Verification command\n- runs\n"
         )
         out = kickoff_lint.lint(body, project=project, recipe="newer-recipe", home=h)
     finally:
@@ -347,6 +363,10 @@ def test_lint_new_marker_after_the_path_is_honoured(project: Path, home: Path):
 def test_lint_does_not_demand_the_examples_own_title(project: Path, home: Path):
     """Only an example's ``## `` sections are expected — not its ``# Title``."""
     (project / "present.py").write_text("x", encoding="utf-8")
-    body = "# Another task\n\n## Files in scope\n- `present.py`\n\n## Success criteria\n- runs\n"
+    body = (
+        "# Another task\n\n## Goal\n- x\n\n## Acceptance\n- AC1\n\n"
+        "## Files in scope\n- `present.py`\n\n## Out of scope\n- none\n\n"
+        "## Verification command\n- runs\n"
+    )
     out = kickoff_lint.lint(body, project=project, recipe="framework-edit", home=home)
     assert [f for f in out if "examples have" in f["msg"]] == []

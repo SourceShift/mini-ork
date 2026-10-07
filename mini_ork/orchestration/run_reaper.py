@@ -72,6 +72,32 @@ def _read_pids(path: Path) -> tuple[int, ...]:
     return tuple(int(p) for p in path.read_text(encoding="utf-8").split() if p.isdigit())
 
 
+def _has_unanswered_ask(run_dir: Path) -> bool:
+    """True when the run dir holds an ``asks/ask-*.json`` with ``answer`` unset.
+
+    A headless run blocked on profile questions writes one ASK file per question
+    (``mini_ork.cli.plan``) and exits 6 resumably. Until every ASK is answered
+    the run is paused, not dead or failed — the reaper must leave it alone.
+    """
+    asks_dir = run_dir / "asks"
+    if not asks_dir.is_dir():
+        return False
+    try:
+        names = os.listdir(asks_dir)
+    except OSError:
+        return False
+    for name in names:
+        if not (name.startswith("ask-") and name.endswith(".json")):
+            continue
+        try:
+            data = json.loads((asks_dir / name).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if data.get("answer") in (None, ""):
+            return True
+    return False
+
+
 # ── owner record (written by the run's own process) ─────────────────────────
 
 def claim_pid_file(run_dir: Path) -> Path:
@@ -128,6 +154,8 @@ def close_run_record(db_path: str | Path, run_id: str, run_dir: Path, *,
     status — it waits on ``mini-ork resume``.
     """
     if not run_id or (run_dir / ".cost-pause").exists():
+        return None
+    if _has_unanswered_ask(run_dir):
         return None
     now = int(time.time()) if now is None else now
     con = sqlite3.connect(str(db_path), timeout=15.0)
@@ -199,6 +227,8 @@ def probe(run_dir: Path) -> Probe:
         return Probe("remote", detail="mirrored from a remote node; its pid is not local")
     if (run_dir / ".cost-pause").exists():
         return Probe("paused", detail="cost-paused; waits on `mini-ork resume`")
+    if _has_unanswered_ask(run_dir):
+        return Probe("paused", detail="blocked on profile answers; waits on `mini-ork resume --answer`")
     if _verdict_passed(run_dir):
         return Probe("finished", detail="verdict.json passed; finished without a publish step")
     pid_path = run_dir / PID_FILE

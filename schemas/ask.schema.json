@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mini-ork/schemas/ask.schema.json",
+  "title": "Ask",
+  "description": "One persisted profile question a headless run was blocked on. Written by mini_ork.cli.plan as <run_dir>/asks/ask-N.json; answered and consumed by mini-ork resume --answer. The ASK file format is the contract other surfaces (board, web UI, ACP) will read later.",
+  "type": "object",
+  "required": ["schema_version", "ask_id", "run_id", "question", "blocking_refs",
+               "options", "default", "created_at", "answer", "answered_at"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "ask@1"
+    },
+    "ask_id": {
+      "type": "string",
+      "description": "1-based question id in question order: ask-1, ask-2, …",
+      "pattern": "^ask-[1-9][0-9]*$"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The task_runs.id this question blocks."
+    },
+    "question": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The human question text."
+    },
+    "blocking_refs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Paths or ids this question blocks (e.g. run_profile)."
+    },
+    "options": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Allowed answers, if any; empty when free-form."
+    },
+    "default": {
+      "type": ["string", "null"],
+      "description": "Pre-fill answer, or null."
+    },
+    "created_at": {
+      "type": "integer",
+      "description": "Epoch seconds when the ASK file was written."
+    },
+    "answer": {
+      "type": ["string", "null"],
+      "description": "The recorded answer, or null while unanswered."
+    },
+    "answered_at": {
+      "type": ["integer", "null"],
+      "description": "Epoch seconds when the answer was recorded, or null."
+    }
+  }
+}
