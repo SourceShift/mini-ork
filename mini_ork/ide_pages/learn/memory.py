@@ -44,18 +44,18 @@ _RETIRE_REASON = "operator request from Memory tab"
 
 
 def sections(home: Path, args: dict[str, str], errors: dict[str, str],  # noqa: ARG001
-             *, now: int | None = None) -> list[dict[str, Any]]:  # noqa: ARG001
+             *, now: int | None = None) -> list[dict[str, Any]]:
     """Compose the three Memory tab sections in the kickoff's order.
 
     ``args`` is unused today (no per-page filter yet on the Memory tab); it stays
     in the signature so the dispatcher in ``learn/__init__.py`` calls every
-    tab with the same shape. ``now`` is exposed so tests can freeze time
-    without freezegun; helpers that need it read it directly from
-    ``time.time()`` and stay free of plumbing.
+    tab with the same shape. ``now`` is threaded through to the preferences
+    section so tests can freeze the 7-day window without freezegun, the way
+    ``overview.sections`` does.
     """
     del args
-    del now
-    return (S.guarded(errors, _PREF_SECTION_TITLE, lambda: _preferences(home))
+    moment = int(now) if now is not None else int(time.time())
+    return (S.guarded(errors, _PREF_SECTION_TITLE, lambda: _preferences(home, moment))
             + S.guarded(errors, "Lane fit by task class", lambda: _lane_fit(home))
             + S.guarded(errors, "Memories to review", lambda: _memories_to_review(home)))
 
@@ -63,7 +63,7 @@ def sections(home: Path, args: dict[str, str], errors: dict[str, str],  # noqa: 
 # ── 1. Preferences & constraints ─────────────────────────────────────────
 
 
-def _preferences(home: Path) -> dict[str, Any]:
+def _preferences(home: Path, now: int) -> dict[str, Any]:
     db_path = str(home / "state.db")
     prefs = _safe_list_prefs(db_path)
     items = []
@@ -76,7 +76,7 @@ def _preferences(home: Path) -> dict[str, Any]:
         else:
             scope_label = f"{scope}: {target}"
         sub_parts = [scope_label]
-        sub_parts.append(_injection_sub(scope, target, str(p.get("key") or ""), p, db_path))
+        sub_parts.append(_injection_sub(scope, target, str(p.get("key") or ""), p, db_path, now))
         src = str(p.get("source") or "")
         if src.startswith("file:"):
             fname = src[len("file:"):]
@@ -101,13 +101,12 @@ def _safe_list_prefs(db_path: str) -> list[dict]:
         return []
 
 
-def _injection_sub(scope: str, target: str, key: str, pref: dict, db_path: str) -> str:
+def _injection_sub(scope: str, target: str, key: str, pref: dict, db_path: str, now: int) -> str:
     """The "given to N node(s) in 7 days" / "not given ..." sub-fragment."""
     src = str(pref.get("source") or "")
     if not src.startswith("db"):
         # File-sourced prefs never reach the injection ledger.
         return "not given to any node in 7 days"
-    now = int(time.time())
     since = now - 7 * 86400
     source_id = f"pref:{scope}:{target}:{key}"
     try:
@@ -234,6 +233,17 @@ def _pass_rate_colour(rate_pct: float) -> str:
     return "yellow"
 
 
+def _delta_colour(delta: float | None) -> str:
+    """Δ cell colour: red ≤ −5 pt, green ≥ +5 pt, muted otherwise (or no data)."""
+    if delta is None:
+        return "muted"
+    if delta <= -5.0:
+        return "red"
+    if delta >= 5.0:
+        return "green"
+    return "muted"
+
+
 # ── 3. Memories to review ───────────────────────────────────────────────
 
 
@@ -284,6 +294,26 @@ def _overall_baseline(conn) -> str:
     return f"{100.0 * wins / (wins + losses):.0f}%"
 
 
+def _resolved(conn, memory_id: int, scope: str) -> tuple[int, int]:
+    """Resolved ``(wins, losses)`` for one (memory, scope) from the use ledger.
+
+    ``pending`` rows are unresolved and must not feed the win rate, ``n``, or
+    any baseline comparison — only ``win`` and ``loss`` count.
+    """
+    if not conn.has_table("semantic_memory_uses"):
+        return 0, 0
+    rows = conn.rows(
+        "SELECT "
+        "SUM(CASE WHEN outcome='win' THEN 1 ELSE 0 END) AS wins, "
+        "SUM(CASE WHEN outcome='loss' THEN 1 ELSE 0 END) AS losses "
+        "FROM semantic_memory_uses WHERE memory_id = ? AND scope = ?",
+        (memory_id, scope),
+    )
+    if not rows:
+        return 0, 0
+    return int(rows[0].get("wins") or 0), int(rows[0].get("losses") or 0)
+
+
 def _memory_review_table(home: Path) -> dict[str, Any]:
     from mini_ork.memory import candidates, RETIRE_MIN_USES
 
@@ -315,17 +345,18 @@ def _memory_review_table(home: Path) -> dict[str, Any]:
             continue
         baselines[str(r.get("scope") or "")] = 100.0 * wins / (wins + losses)
 
-    # Per-memory resolved uses; only memories with n >= RETIRE_MIN_USES are ranked
-    # against the baseline (others have too little evidence to retire).
+    # Per-memory resolved uses; only memories with wins + losses >= RETIRE_MIN_USES
+    # are ranked against the baseline (others have too little evidence to retire).
+    # ``n`` is resolved uses only — pending must not count, so a single pending
+    # row no longer drops an otherwise-qualifying group.
     mem_rows = conn.rows(
         "SELECT memory_id, scope, "
         "SUM(CASE WHEN outcome='win' THEN 1 ELSE 0 END) AS wins, "
         "SUM(CASE WHEN outcome='loss' THEN 1 ELSE 0 END) AS losses, "
-        "COUNT(*) AS n "
+        "SUM(CASE WHEN outcome IN ('win', 'loss') THEN 1 ELSE 0 END) AS n "
         "FROM semantic_memory_uses "
         "GROUP BY memory_id, scope "
-        f"HAVING n >= {int(RETIRE_MIN_USES)} "
-        "AND SUM(CASE WHEN outcome='pending' THEN 1 ELSE 0 END) = 0"
+        f"HAVING SUM(CASE WHEN outcome IN ('win', 'loss') THEN 1 ELSE 0 END) >= {int(RETIRE_MIN_USES)}"
     )
     flagged: dict[int, dict[str, Any]] = {}
     for r in mem_rows:
@@ -340,13 +371,16 @@ def _memory_review_table(home: Path) -> dict[str, Any]:
         if baseline is None:
             continue
         delta = rate - baseline
-        if delta <= -5.0:
+        # Round once so the flag threshold, the displayed Δ text and its colour
+        # all read the same value (round() also normalises −0.x to 0 → "+0pt").
+        delta_pt = round(delta)
+        if delta_pt <= -5:
             flagged[int(r["memory_id"])] = {
                 "memory_id": int(r["memory_id"]),
                 "scope": scope,
                 "rate": rate,
                 "baseline": baseline,
-                "delta": delta,
+                "delta": delta_pt,
                 "n": n,
                 "source": "delta",
             }
@@ -363,17 +397,30 @@ def _memory_review_table(home: Path) -> dict[str, Any]:
                 cid = int(c.get("memory_id") or 0)
                 if cid in flagged:
                     continue
-                # candidates() reports the raw utility; mirror against baseline.
+                # candidates() reports smoothed utility from the denormalized
+                # semantic_memory counters — NOT the resolved win rate the
+                # baseline uses. Re-derive the rate from the use ledger so the
+                # two columns stay commensurable.
                 base = baselines.get(scope)
                 if base is None:
                     continue
+                wins, losses = _resolved(conn, cid, scope)
+                n = wins + losses
+                if n > 0:
+                    rate = 100.0 * wins / n
+                    # Same rounding as the delta path so text, colour and the
+                    # listing agree (round() normalises −0.x to 0 → "+0pt").
+                    delta_pt = round(rate - base)
+                else:
+                    rate = None
+                    delta_pt = None
                 flagged[cid] = {
                     "memory_id": cid,
                     "scope": scope,
-                    "rate": 100.0 * float(c.get("utility") or 0.0),
+                    "rate": rate,
                     "baseline": base,
-                    "delta": 100.0 * float(c.get("utility") or 0.0) - base,
-                    "n": int(c.get("uses") or 0),
+                    "delta": delta_pt,
+                    "n": n,
                     "source": "candidate",
                 }
         except Exception:  # noqa: BLE001 — candidate fetch failure: still show what we have
@@ -398,7 +445,10 @@ def _memory_review_table(home: Path) -> dict[str, Any]:
             mem_text[int(r["id"])] = r
 
     rows_out: list[Any] = []
-    for cid, info in sorted(flagged.items(), key=lambda kv: kv[1]["delta"]):
+    for cid, info in sorted(
+        flagged.items(),
+        key=lambda kv: kv[1]["delta"] if kv[1]["delta"] is not None else 1e9,
+    ):
         meta = mem_text.get(cid) or {}
         text_str = short(str(meta.get("text") or ""), 140)
         retired = bool(meta.get("retired_at"))
@@ -412,13 +462,16 @@ def _memory_review_table(home: Path) -> dict[str, Any]:
                 confirm=("Retire this memory? It stops being injected; "
                          "reactivate any time."),
             )
+        rate_cell = (S.cell(f"{info['rate']:.0f}%", _pass_rate_colour(info["rate"]))
+                     if info["rate"] is not None else S.muted("—"))
+        delta_text = f"{info['delta']:+.0f}pt" if info["delta"] is not None else "—"
         rows_out.append({
             "cells": [
                 S.cell(text_str, "text"),
                 S.muted(info["scope"]),
-                S.cell(f"{info['rate']:.0f}%", _pass_rate_colour(info["rate"])),
+                rate_cell,
                 S.muted(f"{info['baseline']:.0f}%"),
-                S.cell(f"{info['delta']:+.0f}pt", "red"),
+                S.cell(delta_text, _delta_colour(info["delta"])),
                 S.mono(str(info["n"])),
                 S.cell(state_label, state_color),
             ],

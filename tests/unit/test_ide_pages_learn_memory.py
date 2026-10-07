@@ -58,6 +58,48 @@ def _ledger_table(conn: sqlite3.Connection) -> None:
     )
 
 
+def _memory_uses_table(conn: sqlite3.Connection) -> None:
+    """semantic_memory_uses is bootstrapped lazily — make it exist before INSERT."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS semantic_memory_uses (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id    INTEGER NOT NULL,
+            scope        TEXT    NOT NULL,
+            run_id       TEXT    NOT NULL DEFAULT '',
+            task_class   TEXT    NOT NULL DEFAULT '',
+            lane         TEXT    NOT NULL DEFAULT '',
+            node_id      TEXT    NOT NULL DEFAULT '',
+            retrieved_at REAL    NOT NULL,
+            outcome      TEXT    NOT NULL DEFAULT 'pending'
+        );
+        """
+    )
+
+
+def _ensure_semantic_memory_cols(conn: sqlite3.Connection) -> None:
+    """Add the lazily-added semantic_memory columns the review table reads."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(semantic_memory)")}
+    for col, decl in (("uses", "INTEGER NOT NULL DEFAULT 0"),
+                      ("wins", "INTEGER NOT NULL DEFAULT 0"),
+                      ("retired_at", "REAL NOT NULL DEFAULT 0"),
+                      ("retire_reason", "TEXT NOT NULL DEFAULT ''"),
+                      ("retire_evidence", "TEXT NOT NULL DEFAULT ''")):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE semantic_memory ADD COLUMN {col} {decl}")
+
+
+def _add_uses(con: sqlite3.Connection, memory_id: int, scope: str,
+              outcome: str, count: int) -> None:
+    """Insert ``count`` resolved/pending ledger rows for one (memory, scope)."""
+    for _ in range(count):
+        con.execute(
+            "INSERT INTO semantic_memory_uses (memory_id, scope, run_id, retrieved_at, outcome) "
+            "VALUES (?, ?, 'r', ?, ?)",
+            (memory_id, scope, int(time.time()), outcome),
+        )
+
+
 def test_preferences_db_pref_shows_injection_count(home: Path) -> None:
     """A DB pref with 2 injections in the last 7 days reads 'given to 2 node(s)';
     a 3rd injection outside the window is ignored."""
@@ -240,7 +282,8 @@ def test_lane_fit_pass_rate_colours(home: Path) -> None:
 
 
 def test_memories_to_review_lists_below_baseline_with_retire(home: Path) -> None:
-    """A 60% memory with n=10 in a 75%-baseline scope appears with Δ -15pt and a Retire action."""
+    """A 60% memory (10 resolved + 3 pending) in a 75%-baseline scope appears with
+    n=10 and Δ -15pt; pending uses are ignored."""
     db_path = str(home / "state.db")
     con = sqlite3.connect(db_path)
     try:
@@ -294,6 +337,13 @@ def test_memories_to_review_lists_below_baseline_with_retire(home: Path) -> None
                 "VALUES (1, 'code_fix', 'r', ?, 'loss')",
                 (int(time.time()),),
             )
+        # 3 pending uses for m1 — pending must NOT count toward n (resolved only).
+        for _ in range(3):
+            con.execute(
+                "INSERT INTO semantic_memory_uses (memory_id, scope, run_id, retrieved_at, outcome) "
+                "VALUES (1, 'code_fix', 'r', ?, 'pending')",
+                (int(time.time()),),
+            )
         for _ in range(8):
             con.execute(
                 "INSERT INTO semantic_memory_uses (memory_id, scope, run_id, retrieved_at, outcome) "
@@ -335,6 +385,9 @@ def test_memories_to_review_lists_below_baseline_with_retire(home: Path) -> None
     assert m1_row["cells"][2]["t"] == "60%"
     assert m1_row["cells"][3]["t"] == "75%"
     assert m1_row["cells"][4]["t"] == "-15pt"
+    assert m1_row["cells"][4]["c"] == "red"
+    # n counts resolved uses only: 6 wins + 4 losses = 10, the 3 pending are ignored.
+    assert m1_row["cells"][5]["t"] == "10"
     # m2 must NOT be listed (Δ = +5pt > -5).
     assert not any(r["cells"][0]["t"].startswith("m2") for r in flagged_rows)
     # Retire action: cli = memory-lifecycle --retire 1 --reason <text>.
@@ -416,6 +469,156 @@ def test_memories_to_review_empty_state(home: Path) -> None:
     table = _section(page, "Memories to review")
     assert "Nothing to review" in table["rows"][0]["cells"][0]["t"]
     assert page["errors"] == {}
+
+
+def test_preferences_injection_window_frozen_now(home: Path) -> None:
+    """Frozen ``now`` pins the 7-day window: one injection inside, one outside."""
+    frozen = 2_000_000_000
+    db_path = str(home / "state.db")
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(
+            "INSERT INTO user_preference_memory "
+            "(user_id, preference_key, preference_value, scope, scope_target, set_at) "
+            "VALUES ('default', 'tone', 'Keep summaries short', 'global', '', '2026-10-01T00:00:00.000Z')"
+        )
+        _ledger_table(con)
+        # 1 day ago (inside the 7-day window) vs 8 days ago (outside).
+        for node, offset_days in (("in", 1), ("out", 8)):
+            con.execute(
+                "INSERT INTO lesson_injections "
+                "(run_id, node_id, node_type, lane, task_class, attempt, source_kind, source_id, held_out, ts) "
+                "VALUES ('r', ?, 'implementer', 'glm', 'code_fix', 1, 'preference', "
+                "'pref:global::tone', 0, ?)",
+                (node, frozen - offset_days * 86400),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+    sections = learn.memory.sections(home, {}, {}, now=frozen)
+    prefs = next(s for s in sections if s["title"] == "Preferences & constraints")
+    item = prefs["items"][0]
+    assert "given to 1 node(s) in 7 days" in item["sub"]
+
+
+def test_memories_to_review_zero_delta_muted(home: Path) -> None:
+    """A candidate whose resolved rate equals its baseline renders a muted +0pt Δ."""
+    db_path = str(home / "state.db")
+    con = sqlite3.connect(db_path)
+    try:
+        _ensure_semantic_memory_cols(con)
+        # Active candidate: uses=4, wins=0 → utility (0+1)/(4+2) < enter → retire.
+        con.execute(
+            "INSERT INTO semantic_memory (scope, text, embedding, created_at, uses, wins, retired_at) "
+            "VALUES ('code_fix', 'c0: neutral memory', x'00', ?, 4, 0, 0)",
+            (int(time.time()),),
+        )
+        _memory_uses_table(con)
+        # mem 1 resolved 60% (3w/2l); baseline 60% (mem 999 3w/2l) → Δ = 0.
+        _add_uses(con, 1, "code_fix", "win", 3)
+        _add_uses(con, 1, "code_fix", "loss", 2)
+        _add_uses(con, 999, "code_fix", "win", 3)
+        _add_uses(con, 999, "code_fix", "loss", 2)
+        con.commit()
+    finally:
+        con.close()
+
+    page = learn.build(home, "memory", {})
+    table = _section(page, "Memories to review")
+    row = next(r for r in table["rows"] if r["cells"][0]["t"].startswith("c0"))
+    assert row["cells"][2]["t"] == "60%"
+    assert row["cells"][4]["t"] == "+0pt"
+    assert row["cells"][4]["c"] == "muted"
+
+
+def test_memories_to_review_candidate_shows_resolved_rate(home: Path) -> None:
+    """A candidate shows its resolved ledger win rate, not smoothed utility."""
+    db_path = str(home / "state.db")
+    con = sqlite3.connect(db_path)
+    try:
+        _ensure_semantic_memory_cols(con)
+        # Active candidate: uses=4, wins=0 → utility = 1/6 ≈ 17% if shown.
+        con.execute(
+            "INSERT INTO semantic_memory (scope, text, embedding, created_at, uses, wins, retired_at) "
+            "VALUES ('code_fix', 'c1: resolved 80', x'00', ?, 4, 0, 0)",
+            (int(time.time()),),
+        )
+        _memory_uses_table(con)
+        # Resolved ledger: mem 1 = 8w/2l (80%); baseline mem 999 1w/1l → 9/12 = 75%.
+        _add_uses(con, 1, "code_fix", "win", 8)
+        _add_uses(con, 1, "code_fix", "loss", 2)
+        _add_uses(con, 999, "code_fix", "win", 1)
+        _add_uses(con, 999, "code_fix", "loss", 1)
+        con.commit()
+    finally:
+        con.close()
+
+    page = learn.build(home, "memory", {})
+    table = _section(page, "Memories to review")
+    row = next(r for r in table["rows"] if r["cells"][0]["t"].startswith("c1"))
+    assert row["cells"][2]["t"] == "80%"   # resolved, not the 17% utility
+    assert row["cells"][5]["t"] == "10"    # 8+2 resolved, not semantic_memory.uses=4
+
+
+def test_memories_to_review_positive_delta_rounds_to_green(home: Path) -> None:
+    """Raw Δ ≈ +4.8pt renders '+5pt' green — the text and colour read the same
+    rounded value instead of colouring the raw float below the +5 threshold."""
+    db_path = str(home / "state.db")
+    con = sqlite3.connect(db_path)
+    try:
+        _ensure_semantic_memory_cols(con)
+        # Active candidate: uses=4, wins=0 → utility 1/6 < enter → retire candidate.
+        con.execute(
+            "INSERT INTO semantic_memory (scope, text, embedding, created_at, uses, wins, retired_at) "
+            "VALUES ('code_fix', 'g: rounds up to green', x'00', ?, 4, 0, 0)",
+            (int(time.time()),),
+        )
+        _memory_uses_table(con)
+        # Resolved ledger: mem 1 = 1w/2l (33.3%); baseline mem 999 = 1w/3l
+        # → scope baseline = 2/7 ≈ 28.6% → raw Δ ≈ +4.76 → rounds to +5.
+        _add_uses(con, 1, "code_fix", "win", 1)
+        _add_uses(con, 1, "code_fix", "loss", 2)
+        _add_uses(con, 999, "code_fix", "win", 1)
+        _add_uses(con, 999, "code_fix", "loss", 3)
+        con.commit()
+    finally:
+        con.close()
+
+    page = learn.build(home, "memory", {})
+    table = _section(page, "Memories to review")
+    row = next(r for r in table["rows"] if r["cells"][0]["t"].startswith("g:"))
+    assert row["cells"][4]["t"] == "+5pt"
+    assert row["cells"][4]["c"] == "green"
+
+
+def test_memories_to_review_negative_fraction_renders_plus_zero(home: Path) -> None:
+    """Raw Δ ≈ −0.48pt renders '+0pt' muted — round() normalises −0.x to 0,
+    so the cell never shows the '−0pt' that f'{-0.3:+.0f}' would produce."""
+    db_path = str(home / "state.db")
+    con = sqlite3.connect(db_path)
+    try:
+        _ensure_semantic_memory_cols(con)
+        con.execute(
+            "INSERT INTO semantic_memory (scope, text, embedding, created_at, uses, wins, retired_at) "
+            "VALUES ('code_fix', 'z: negates to plus zero', x'00', ?, 4, 0, 0)",
+            (int(time.time()),),
+        )
+        _memory_uses_table(con)
+        # Resolved ledger: mem 1 = 13w/1l (92.9%); baseline mem 999 = 1w/0l
+        # → scope baseline = 14/15 ≈ 93.3% → raw Δ ≈ −0.48 → rounds to 0.
+        _add_uses(con, 1, "code_fix", "win", 13)
+        _add_uses(con, 1, "code_fix", "loss", 1)
+        _add_uses(con, 999, "code_fix", "win", 1)
+        con.commit()
+    finally:
+        con.close()
+
+    page = learn.build(home, "memory", {})
+    table = _section(page, "Memories to review")
+    row = next(r for r in table["rows"] if r["cells"][0]["t"].startswith("z:"))
+    assert row["cells"][4]["t"] == "+0pt"
+    assert row["cells"][4]["c"] == "muted"
 
 
 def test_entrypoint_no_errors(home: Path) -> None:
