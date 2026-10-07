@@ -2308,9 +2308,14 @@ def _assemble_reviewer_inputs(run_dir):
     no_op = False
     if files and not (os.path.isfile(diff_path) and os.path.getsize(diff_path) > 0):
         no_op = _tree_has_no_change(worktree, baseline, specs)
+    noop_marker = os.path.join(run_dir, "review-diff-noop.json")
     try:
+        if not no_op and os.path.isfile(noop_marker):
+            # A marker left by an earlier attempt of this run (e.g. a recover
+            # that ran before the work was restored) must not block this one.
+            os.unlink(noop_marker)
         if no_op:
-            with open(os.path.join(run_dir, "review-diff-noop.json"), "w",
+            with open(noop_marker, "w",
                       encoding="utf-8") as handle:
                 json.dump({
                     "status": "no_op",

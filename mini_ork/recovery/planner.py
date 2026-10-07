@@ -227,7 +227,7 @@ def _resolve_default_paths(
     if not recipe:
         # A CLI recover has no MINI_ORK_RECIPE; without the run's recipe every
         # checkpoint hashes as recipe="unknown" and reads as hash_mismatch.
-        recipe = _recipe_from_run_profile(run_dir)
+        recipe = _recipe_from_task_runs(db, run_id) or _recipe_from_run_profile(run_dir)
     if not workflow and recipe:
         # Catalog-first: a project recipe in <home>/recipes/ shadows the
         # engine's bundled recipe of the same name. The catalog walks the
@@ -245,6 +245,26 @@ def _resolve_default_paths(
             )
             workflow = os.path.join(root, "recipes", recipe, "workflow.yaml")
     return run_dir, db, workflow, recipe
+
+
+def _recipe_from_task_runs(db: str, run_id: str) -> str:
+    """The recipe the run actually executed, from its ``task_runs`` row.
+
+    ``run_profile.json``'s ``recipe`` is the profiler's suggestion and can
+    differ from what ran (a framework-edit run profiled as ``docs``), so the
+    ledger row wins; ``""`` when the row or table is missing.
+    """
+    import sqlite3
+
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            row = con.execute("SELECT recipe FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return ""
+    return str(row[0] or "").strip() if row else ""
 
 
 def _recipe_from_run_profile(run_dir: str) -> str:
