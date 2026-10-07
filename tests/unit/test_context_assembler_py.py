@@ -48,6 +48,8 @@ def db(tmp_path_factory):
 def test_failure_modes_md(db, monkeypatch):
     monkeypatch.setenv("MINI_ORK_DB", db)
     monkeypatch.delenv("MO_TARGET_CWD", raising=False)
+    # Raw gradients are opt-in since the 2026-10-07 verified-only rule.
+    monkeypatch.setenv("MO_INJECT_UNVERIFIED", "1")
     py = ca.failure_modes_md("code-fix", 5, db=db)
     assert "auth.middleware" in py and "lowconf.target" not in py
 
@@ -57,8 +59,22 @@ def test_failure_modes_project_scope_filter(db, monkeypatch, tmp_path):
     monkeypatch.setenv("MINI_ORK_DB", db)
     monkeypatch.setenv("MINI_ORK_ROOT", str(REPO))
     monkeypatch.setenv("MO_TARGET_CWD", str(tmp_path))
+    monkeypatch.setenv("MO_INJECT_UNVERIFIED", "1")
     py = ca.failure_modes_md("code-fix", 5, db=db)
     assert "workflow.gate" not in py and "auth.middleware" in py
+
+
+def test_failure_modes_default_excludes_raw_gradients(db, monkeypatch):
+    """Verified-only default: seeded gradients are NOT injected unless the
+    operator opts back in. Nothing else is seeded, so the block is empty."""
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    monkeypatch.delenv("MO_TARGET_CWD", raising=False)
+    monkeypatch.delenv("MO_INJECT_UNVERIFIED", raising=False)
+    monkeypatch.delenv("MO_EMERGENT_INJECT", raising=False)
+    src: list[dict] = []
+    py = ca.failure_modes_md("code-fix", 5, db=db, sources=src)
+    assert py == ""
+    assert src == []
 
 
 def test_prior_runs_md(db, monkeypatch):

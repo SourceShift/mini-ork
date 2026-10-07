@@ -87,6 +87,8 @@ def test_failure_modes_sources_match_injected_order(db, monkeypatch):
     monkeypatch.setenv("MINI_ORK_DB", db)
     monkeypatch.delenv("MO_TARGET_CWD", raising=False)
     monkeypatch.delenv("MO_EMERGENT_INJECT", raising=False)
+    # Raw gradients are opt-in since the 2026-10-07 verified-only rule.
+    monkeypatch.setenv("MO_INJECT_UNVERIFIED", "1")
     src: list[dict] = []
     md_with = ca.failure_modes_md("code-fix", 5, db=db, sources=src)
     md_without = ca.failure_modes_md("code-fix", 5, db=db)

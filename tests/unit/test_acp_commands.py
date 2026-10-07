@@ -361,7 +361,9 @@ def test_learnings_sections_present(home: Path):
     assert "Emergent patterns" in out
 
 
-def test_learnings_filter_caps_results(home: Path):
+def test_learnings_filter_caps_results(home: Path, monkeypatch: pytest.MonkeyPatch):
+    # Raw gradients are opt-in since the 2026-10-07 verified-only rule.
+    monkeypatch.setenv("MO_INJECT_UNVERIFIED", "1")
     seed_run(home, run_id="run-lr-002", task_class="framework_edit")
     seed_gradient(home, task_class="framework_edit", target="dispatch",
                   signal="a really specific signal the filter should pick up")

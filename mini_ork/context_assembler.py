@@ -9,6 +9,11 @@ operator-steering and active-state blocks delegate to their native owners.
 This module is the context-engine seam: what it emits is exactly what gets
 injected into planner/worker prompts, so an evolvable-playbook loop (GEPA-style
 weight-free improvement) plugs in here by scoring which emitted lessons help.
+
+Only verified learnings reach prompts (user rule 2026-10-07): approved+lessoned
+patterns, verified theme lessons, and operator preferences. Raw gradients are
+evidence for verification, not guidance — they are injected only when
+``MO_INJECT_UNVERIFIED=1``, which is off by default.
 """
 from __future__ import annotations
 
@@ -387,15 +392,22 @@ def failure_modes_md(task_class: str, limit: int = 5, db: str | None = None,
     con = sqlite3.connect(dbp)
     con.execute("PRAGMA busy_timeout=5000")
     try:
-        rows = con.execute("""
-            SELECT gradient_id, target, signal, suggested_change
-            FROM gradient_records
-            WHERE (task_class = ? OR target LIKE ?) AND confidence >= 0.6
-            ORDER BY confidence DESC, created_at DESC LIMIT ?
-        """, (task_class, f"%{task_class}%",
-              limit * 4 if strip_framework else limit)).fetchall()
-    except sqlite3.OperationalError:
+        # Raw gradients are EVIDENCE for verification, not verified guidance:
+        # the extractor's own confidence self-rating (>= 0.6) is not a
+        # verification (user rule 2026-10-07). They are injected only when the
+        # operator explicitly opts back in — default unset == off.
         rows = []
+        if os.environ.get("MO_INJECT_UNVERIFIED", "") == "1":
+            try:
+                rows = con.execute("""
+                    SELECT gradient_id, target, signal, suggested_change
+                    FROM gradient_records
+                    WHERE (task_class = ? OR target LIKE ?) AND confidence >= 0.6
+                    ORDER BY confidence DESC, created_at DESC LIMIT ?
+                """, (task_class, f"%{task_class}%",
+                      limit * 4 if strip_framework else limit)).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
     finally:
         con.close()
     if strip_framework:
@@ -419,6 +431,12 @@ def failure_modes_md(task_class: str, limit: int = 5, db: str | None = None,
                     "suggested_change": change,
                 })
         out.append("--- /learned failure modes ---")
+
+    # Verified theme lessons — the loop-verified complement to the raw gradient
+    # block above (user rule 2026-10-07). Uses the same post-LIMBO ``limit``.
+    verified = _verified_theme_lessons(dbp, task_class, limit, sources=sources)
+    if verified:
+        out.append(verified)
 
     # Verified emergent patterns (judge-gate approved) — read-back into the
     # prompt. ONLY status='approved' rows (cleared the evidence/strength floor
@@ -444,6 +462,48 @@ def failure_modes_md(task_class: str, limit: int = 5, db: str | None = None,
         if block:
             out.append(block)
 
+    return "\n".join(out)
+
+
+def _verified_theme_lessons(dbp: str, task_class: str, limit: int,
+                            sources: list[dict] | None = None) -> str:
+    """Verified theme lessons for ``task_class``; '' when there are none.
+
+    A row counts as verified when it carries ``status='verified'``, is a
+    ``kind='task'`` theme, has a non-blank authored ``lesson_text`` (written
+    by grounded pattern induction, never invented here), and matches the task
+    class or the wildcard ``'*'``. Strongest first: ``n_runs`` then recency.
+
+    Cold-safe by construction: missing table or columns is no section and no
+    error — this runs on the prompt-injection path, where a raise would abort
+    a dispatch whose spend already happened. A ``limit <= 0`` emits nothing.
+    """
+    if limit <= 0:
+        return ""
+    con = sqlite3.connect(dbp)
+    con.execute("PRAGMA busy_timeout=5000")
+    try:
+        rows = con.execute("""
+            SELECT theme_id, lesson_text, n_runs
+            FROM lesson_themes
+            WHERE status = 'verified' AND kind = 'task'
+              AND lesson_text IS NOT NULL AND TRIM(lesson_text) <> ''
+              AND (task_class = ? OR task_class = '*')
+            ORDER BY n_runs DESC, last_seen DESC LIMIT ?
+        """, (task_class, limit)).fetchall()
+    except sqlite3.OperationalError:
+        return ""
+    finally:
+        con.close()
+    if not rows:
+        return ""
+    out = [f"--- Verified lessons from prior runs ({task_class}) ---"]
+    for theme_id, lesson_text, n_runs in rows:
+        out.append(f"- {lesson_text.strip()}  (seen in {n_runs} runs)")
+        if sources is not None:
+            sources.append({"kind": "theme", "id": theme_id,
+                            "text": lesson_text})
+    out.append("--- /verified lessons ---")
     return "\n".join(out)
 
 

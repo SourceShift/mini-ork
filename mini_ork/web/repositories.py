@@ -12,6 +12,7 @@ structures, never a 500, exactly as the inline probes did.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from typing import Any, Sequence
 
@@ -130,25 +131,56 @@ class LearningRepository:
     def fetch_failure_mode_gradients(self, task_class: str) -> list[dict[str, Any]]:
         """What context_assemble would inject as known failure modes.
 
-        Filter MUST mirror mini_ork.context_assembler.failure_modes_md.
-        (task_class = ? OR target LIKE ?) — this panel claims to show what
-        gets injected, so the queries have to agree. target-LIKE alone
-        missed rows whose task_class matches but whose target doesn't
-        embed the class name (e.g. target=workflow.node.verify).
+        Filter MUST mirror mini_ork.context_assembler.failure_modes_md. By
+        default that is the VERIFIED theme lessons (``status='verified'``,
+        ``kind='task'``, non-blank ``lesson_text``, class match or ``'*'``);
+        the raw gradient query — ``(task_class = ? OR target LIKE ?) AND
+        confidence >= 0.6`` — returns only under ``MO_INJECT_UNVERIFIED=1``
+        (user rule 2026-10-07: raw gradients are evidence, not guidance).
+        target-LIKE alone missed rows whose task_class matches but whose
+        target doesn't embed the class name (e.g. target=workflow.node.verify).
+
+        Theme rows reuse the gradient row keys (``lesson_text`` → ``signal``,
+        ``theme_id`` → ``gradient_id``) so the route/ACP/MCP consumers — all
+        ``.get()``-tolerant — render unchanged instead of blanking out.
         """
-        if not self._db.has_table("gradient_records"):
+        if os.environ.get("MO_INJECT_UNVERIFIED", "") == "1":
+            if not self._db.has_table("gradient_records"):
+                return []
+            return self._db.rows(
+                """
+                SELECT gradient_id, target, signal, suggested_change,
+                       evidence, confidence, created_at
+                FROM gradient_records
+                WHERE (task_class = ? OR target LIKE ?) AND confidence >= 0.6
+                ORDER BY confidence DESC, created_at DESC
+                LIMIT 10
+                """,
+                (task_class, f"%{task_class}%"),
+            )
+        if not self._db.has_table("lesson_themes"):
             return []
-        return self._db.rows(
-            """
-            SELECT gradient_id, target, signal, suggested_change,
-                   evidence, confidence, created_at
-            FROM gradient_records
-            WHERE (task_class = ? OR target LIKE ?) AND confidence >= 0.6
-            ORDER BY confidence DESC, created_at DESC
-            LIMIT 10
-            """,
-            (task_class, f"%{task_class}%"),
-        )
+        try:
+            return self._db.rows(
+                """
+                SELECT theme_id     AS gradient_id,
+                       'theme:' || theme_id AS target,
+                       lesson_text  AS signal,
+                       ''           AS suggested_change,
+                       NULL         AS evidence,
+                       NULL         AS confidence,
+                       last_seen    AS created_at
+                FROM lesson_themes
+                WHERE status = 'verified' AND kind = 'task'
+                  AND lesson_text IS NOT NULL AND TRIM(lesson_text) <> ''
+                  AND (task_class = ? OR task_class = '*')
+                ORDER BY n_runs DESC, last_seen DESC
+                LIMIT 10
+                """,
+                (task_class,),
+            )
+        except sqlite3.OperationalError:
+            return []
 
     def gradient_count(self) -> int:
         if not self._db.has_table("gradient_records"):

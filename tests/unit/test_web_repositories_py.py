@@ -162,7 +162,11 @@ def test_fetch_gradient_records_by_evidence(seeded: LearningRepository) -> None:
     assert seeded.fetch_gradient_records([]) == []
 
 
-def test_fetch_failure_mode_gradients_mirror_context_assembler(seeded: LearningRepository) -> None:
+def test_fetch_failure_mode_gradients_mirror_context_assembler(
+        seeded: LearningRepository, monkeypatch) -> None:
+    # Raw gradients are opt-in since the 2026-10-07 verified-only rule; the
+    # default returns verified lesson_themes rows (none seeded here).
+    monkeypatch.setenv("MO_INJECT_UNVERIFIED", "1")
     rows = seeded.fetch_failure_mode_gradients("code-fix")
     ids = {r["gradient_id"] for r in rows}
     # task_class match OR target LIKE, confidence >= 0.6
@@ -213,10 +217,13 @@ def test_empty_db_returns_empty_not_error(empty: LearningRepository) -> None:
     assert empty.gradient_count() == 0
 
 
-def test_get_learning_handler_shape_preserved(tmp_path: Path) -> None:
+def test_get_learning_handler_shape_preserved(tmp_path: Path, monkeypatch) -> None:
     """Handler-level guard: classification + response shaping unchanged."""
     from mini_ork.web.routes.run_detail import get_learning
 
+    # Raw gradients are opt-in since the 2026-10-07 verified-only rule; this
+    # guard pins the response shape for the opt-in path.
+    monkeypatch.setenv("MO_INJECT_UNVERIFIED", "1")
     db_path = tmp_path / "state.db"
     _seed(db_path)
     out = get_learning(task_run_id="run-1", db=StateDB(db_path))
