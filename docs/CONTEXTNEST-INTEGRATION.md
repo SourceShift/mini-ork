@@ -81,7 +81,7 @@ Inside the existing `MO_INJECT_LEARNINGS` block, runs in order:
 2. Native `contextnest_atoms_md` fallback (PR-1 capsule swap, then retrieve)
 3. Native `contextnest_recent_sessions_md` for file-touch history
 
-Step 1 is gated by `MO_USE_ROLE_PACKS=1` (default on); set to `0` to skip role packs and use only the generic path.
+All three steps are **off by default since 2026-10-07**: they carry other sessions' and other projects' items (the attention inbox handed planners another project's to-dos), so the planner gets them only with `MO_PLANNER_SHARED_CONTEXT=1`. When off, they are not called, and the planner injection record lists them under `skipped_blocks`. With the opt-in on, step 1 is still gated by `MO_USE_ROLE_PACKS=1` (default on); set it to `0` to use only the generic path.
 
 ### Worker pre-fetch (`hooks/subagent-prefetch.sh` + `mini_ork/cli/execute.py`)
 
@@ -107,7 +107,8 @@ When mini-ork dispatches a Claude Code subagent or sees one stop, it also POSTs 
 | `CN_HOOK_TIMEOUT_SEC` | **3** (was 1 pre-PR-1) | Hook POST timeout (the reachability ping uses `CN_TIMEOUT_SEC` instead — PR-1 fix) |
 | `CN_PING_TTL` | `30` | Seconds to cache reachability state |
 | `MO_DISABLE_CN` | unset | `1` → every CN call short-circuits, no network |
-| `MO_USE_ROLE_PACKS` | `1` | **PR-3.** `0` to skip role packs and use only the generic capsule-or-retrieve path |
+| `MO_PLANNER_SHARED_CONTEXT` | unset | `1` puts the ContextNest planner blocks (role pack / capsule, recent sessions) and the active-state index back into the planner prompt. Off by default since 2026-10-07 |
+| `MO_USE_ROLE_PACKS` | `1` | **PR-3.** `0` to skip role packs and use only the generic capsule-or-retrieve path (only matters with `MO_PLANNER_SHARED_CONTEXT=1`) |
 | `CN_PREFETCH_REFRESH_SEC` | `1800` | Worker prefetch refresh cadence (30 min) |
 
 ## Failure modes

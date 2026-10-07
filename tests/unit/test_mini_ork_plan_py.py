@@ -302,6 +302,9 @@ def test_context_blocks_order_and_context_pack_persist(tmp_path, monkeypatch):
     rc = _run_py_dispatch(home, db, kickoff, out, dispatch, extra={
         "MO_INJECT_LEARNINGS": "1",
         "MO_USE_ROLE_PACKS": "1",
+        # The shared-session blocks are opt-in since the 2026-10-07
+        # planner-context cleanup; this test asserts their rendered order.
+        "MO_PLANNER_SHARED_CONTEXT": "1",
     })
 
     prompt = captured["prompt"]

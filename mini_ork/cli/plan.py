@@ -546,6 +546,10 @@ def _inject_context(prompt, kickoff, task_class, db, out_file, dry_run) -> str:
     # ones context v2 replaces in its v2 arm; everything else is kept as is.
     v1_task_blocks: list[tuple[str, str]] = []
     other_blocks: list[tuple[str, str]] = []
+    # Blocks withheld from the prompt, with the reason. Written to the planner
+    # injection ledger (change 3) so an operator can see what was left out and
+    # why, instead of it silently vanishing.
+    skipped: dict[str, str] = {}
     try:
         from mini_ork import context_assembler
         for kind, producer in (("failure_modes", context_assembler.failure_modes_md),
@@ -557,37 +561,56 @@ def _inject_context(prompt, kickoff, task_class, db, out_file, dry_run) -> str:
             if block:
                 v1_task_blocks.append((kind, block))
 
-        try:
-            graph_block = context_assembler.graph_context_md(task_class, 5, db=db)
-        except Exception:
-            graph_block = ""
+        # Raw gradients are EVIDENCE, not verified guidance (user rule
+        # 2026-10-07): the graph-context block rides the same
+        # MO_INJECT_UNVERIFIED opt-in as the node learned blocks. Default off.
+        graph_block = ""
+        if os.environ.get("MO_INJECT_UNVERIFIED", "") == "1":
+            try:
+                graph_block = context_assembler.graph_context_md(task_class, 5, db=db)
+            except Exception:
+                graph_block = ""
+        else:
+            skipped["graph_context"] = "unverified"
         if graph_block:
             v1_task_blocks.append(("graph_context", graph_block))
 
-        role_pack = ""
-        if os.environ.get("MO_USE_ROLE_PACKS", "1") == "1":
+        # Other sessions' and other projects' material (the role pack, the
+        # ContextNest attention inbox / recent sessions, the global
+        # active-state index) is not this run's context: a planner can act on
+        # it. Off by default — and when off the producers are not called at
+        # all (no ContextNest HTTP, no DB scan). Opt back in per run.
+        if os.environ.get("MO_PLANNER_SHARED_CONTEXT", "") == "1":
+            role_pack = ""
+            if os.environ.get("MO_USE_ROLE_PACKS", "1") == "1":
+                try:
+                    from mini_ork.steering.context_role_packs import role_pack_md
+                    role_pack = role_pack_md("planner", kickoff, "")
+                except Exception:
+                    role_pack = ""
+            generic = "" if role_pack else _contextnest_atoms_md(kickoff, 6)
+            if role_pack or generic:
+                other_blocks.append(("role_pack" if role_pack else "contextnest_atoms",
+                                     role_pack or generic))
+            recent = _contextnest_recent_sessions_md(kickoff, 4)
+            if recent:
+                other_blocks.append(("contextnest_recent", recent))
             try:
-                from mini_ork.steering.context_role_packs import role_pack_md
-                role_pack = role_pack_md("planner", kickoff, "")
+                from mini_ork.orchestration.active_state_index import render_active_state_block
+                active = render_active_state_block(task_class, 30, db_path=db)
             except Exception:
-                role_pack = ""
-        generic = "" if role_pack else _contextnest_atoms_md(kickoff, 6)
-        if role_pack or generic:
-            other_blocks.append(("role_pack" if role_pack else "contextnest_atoms",
-                                 role_pack or generic))
-        recent = _contextnest_recent_sessions_md(kickoff, 4)
-        if recent:
-            other_blocks.append(("contextnest_recent", recent))
-        try:
-            from mini_ork.orchestration.active_state_index import render_active_state_block
-            active = render_active_state_block(task_class, 30, db_path=db)
-        except Exception:
-            active = ""
-        if active:
-            other_blocks.append(("active_state", active))
+                active = ""
+            if active:
+                other_blocks.append(("active_state", active))
+        else:
+            skipped["role_pack"] = "shared_context_off"
+            skipped["contextnest_recent"] = "shared_context_off"
+            skipped["active_state"] = "shared_context_off"
 
         v2_block, _v2_pack, ledger_extra = _context_v2_planner(
             kickoff, task_class, db, out_file, dry_run)
+        # Record what was withheld and why, alongside the v2 arm metadata.
+        ledger_extra = {**ledger_extra, "skipped_blocks": dict(skipped)}
         tagged = ([("context_v2", v2_block)] if v2_block else v1_task_blocks) + other_blocks
         blocks = [text for _, text in tagged]
 

@@ -193,6 +193,13 @@ human_gate:
 | `MINI_ORK_DRY_RUN` | `0` | `1` = classify + plan only, no execution |
 | `MINI_ORK_VERBOSE` | `0` | `1` = debug-level log output |
 
+### Planner context injection
+
+| Variable | Default | Description |
+|---|---|---|
+| `MO_PLANNER_SHARED_CONTEXT` | unset | `1` adds ContextNest memory, the attention inbox and the active-state index to the planner prompt (off: they carry other sessions' and projects' items) |
+| `MO_INJECT_UNVERIFIED` | unset | `1` re-enables raw gradients (node learned block, planner graph context); default: verified learnings only |
+
 ### Provider API keys
 
 Store in `$MINI_ORK_HOME/config/secrets.local.sh` (default:

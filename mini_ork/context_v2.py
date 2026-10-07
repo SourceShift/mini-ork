@@ -49,6 +49,9 @@ DEFAULT_MODE = "shadow"
 DEFAULT_HOLDOUT = 0.2
 DEFAULT_SIM = 0.35
 PACK_FILENAME = "context-pack.v2.json"
+# The full success command reaches every node; only an absurd one is cut, and
+# the cut is made visible (change 4).
+_VERIFY_CMD_MAX = 2000
 
 _SEVERITY_RANK = {"critical": 5, "blocker": 5, "high": 4, "medium": 3, "low": 2, "info": 1}
 _SEVERITY_WORDS_RE = re.compile(
@@ -466,7 +469,11 @@ def _constraint_items(contract: dict) -> list[dict]:
         listed = ", ".join(f"`{p}`" for p in contract["files_in_scope"][:12])
         items.append({"kind": "scope", "text": f"Touch only these files: {listed}"})
     for cmd in contract.get("verification", [])[:2]:
-        one = " ".join(cmd.split())[:240]
+        # Keep the WHOLE command: a 240-char cut told nodes "success is proven
+        # by" a broken half-command (3 of the last 30 kickoffs had longer ones).
+        one = " ".join(cmd.split())
+        if len(one) > _VERIFY_CMD_MAX:
+            one = one[:_VERIFY_CMD_MAX] + " …(truncated)"
         items.append({"kind": "verify", "text": f"Success is proven by: `{one}`"})
     for i, item in enumerate(items):
         item["id"] = f"c:{i}"

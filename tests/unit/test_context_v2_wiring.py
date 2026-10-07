@@ -66,6 +66,12 @@ def setup(tmp_path, monkeypatch):
     monkeypatch.setenv("MINI_ORK_RUN_ID", "run-x")
     monkeypatch.setenv("MO_USE_ROLE_PACKS", "0")
     monkeypatch.setenv("MO_INJECT_LEARNINGS", "1")
+    # These arm tests assert the v1 prompt, which historically carried the
+    # shared-session blocks and the raw-gradient graph block. The 2026-10-07
+    # planner-context cleanup made both opt-in, so opt in here; the new default
+    # is covered by tests/unit/test_planner_context_cleanup.py.
+    monkeypatch.setenv("MO_PLANNER_SHARED_CONTEXT", "1")
+    monkeypatch.setenv("MO_INJECT_UNVERIFIED", "1")
     monkeypatch.setattr(context_assembler, "failure_modes_md", lambda *a, **k: "V1-FM")
     monkeypatch.setattr(context_assembler, "prior_runs_md", lambda *a, **k: "V1-PRIOR")
     monkeypatch.setattr(context_assembler, "graph_context_md", lambda *a, **k: "V1-GRAPH")
