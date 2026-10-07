@@ -183,7 +183,7 @@ def _events_by_run(home: Path, run_ids: list[str]) -> dict[str, list[dict[str, A
            f"ORDER BY created_at ASC")
     out_map: dict[str, list[dict[str, Any]]] = {rid: [] for rid in run_ids}
     try:
-        from mini_ork.web.deps import db_for
+        from mini_ork.web.db import db_for
         rows = db_for(Path(home)).rows(sql, tuple(run_ids))
     except Exception:  # noqa: BLE001 — best-effort batch read
         return out_map
@@ -239,7 +239,7 @@ def _cost_by_stage(home: Path, run_id: str) -> tuple[dict[str, float], float]:
     ``_stage_label``. Rows with no ``cost_usd`` default to ``0.0`` so a
     schema drift in the cost column never crashes the projection.
     """
-    from mini_ork.web.deps import db_for
+    from mini_ork.web.db import db_for
     from mini_ork.web.repositories import RunDetailRepository
 
     try:
@@ -269,7 +269,7 @@ def _steps(home: Path, run_id: str) -> list[dict[str, Any]]:
     ``failed`` — the same rule ``MiniOrkAcpAgent``'s ``_read_snapshot``
     consumers apply.
     """
-    from mini_ork.web.deps import db_for
+    from mini_ork.web.db import db_for
     from mini_ork.web.repositories import RunDetailRepository
 
     try:
@@ -368,7 +368,7 @@ def _learnings(home: Path, run_id: str, *, limit: int = 5) -> list[str]:
     dozens of titles. ``LearningRepository.fetch_learning_records`` orders
     by ``rank ASC, updated_at DESC`` — keep the cap on the consumer side.
     """
-    from mini_ork.web.deps import db_for
+    from mini_ork.web.db import db_for
     from mini_ork.web.repositories import LearningRepository
 
     try:
@@ -642,7 +642,7 @@ def run_card(home: Path, run_id: str) -> dict[str, Any] | None:
       * ``verdict`` — ``{verdict, reason}`` or ``None``.
       * ``learnings`` — titles (≤ 5).
     """
-    from mini_ork.web.deps import db_for
+    from mini_ork.web.db import db_for
     from mini_ork.web.repositories import RunDetailRepository
 
     home = Path(home)

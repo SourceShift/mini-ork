@@ -10,16 +10,13 @@ viewing different projects don't pay connection setup per request.
 
 from __future__ import annotations
 
-import threading
 from pathlib import Path
 
 from fastapi import Depends, Header, HTTPException, Query
 
-from .db import StateDB, resolve_home
+from .db import StateDB, db_for, resolve_home
 
 _default_home: Path | None = None
-_dbs: dict[Path, StateDB] = {}
-_dbs_lock = threading.Lock()
 
 
 def set_home_override(home: Path) -> None:
@@ -83,15 +80,6 @@ def get_home_lenient(
         return get_home(x_mini_ork_home, home)
     except HTTPException:
         return get_default_home()
-
-
-def db_for(home: Path) -> StateDB:
-    with _dbs_lock:
-        db = _dbs.get(home)
-        if db is None:
-            db = StateDB(home / "state.db")
-            _dbs[home] = db
-        return db
 
 
 def get_db(home: Path = Depends(get_home)) -> StateDB:

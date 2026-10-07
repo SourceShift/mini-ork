@@ -35,7 +35,7 @@ def _rows(home: Path, sql: str, params: tuple = ()) -> list[dict[str, Any]]:
         return []
     # `db_for` opens the same WAL db the other pages do; a ro URI without the
     # `-shm` sidecar fails and the page renders empty.
-    from mini_ork.web.deps import db_for
+    from mini_ork.web.db import db_for
     state = db_for(home)
     try:
         return state.rows(sql, params)

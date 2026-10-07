@@ -145,7 +145,7 @@ def _worktrees(home: Path, ctx: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _review(home: Path, now: int) -> list[dict[str, Any]]:
-    from mini_ork.web.deps import db_for
+    from mini_ork.web.db import db_for
 
     db = db_for(home)
     if not db.has_table("pre_push_reviews"):

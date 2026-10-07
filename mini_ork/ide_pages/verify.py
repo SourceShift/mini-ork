@@ -26,7 +26,7 @@ _CHIP_LIMIT = 14
 # ── shared readers ─────────────────────────────────────────────────────────
 
 def _db(home: Path):
-    from mini_ork.web.deps import db_for
+    from mini_ork.web.db import db_for
 
     if not (home / "state.db").is_file():
         return None

@@ -312,7 +312,7 @@ def recipe_rows(
     task_class.yaml ``matches.keywords`` entry.
     """
     from mini_ork import recipes_catalog
-    from mini_ork.web.deps import db_for
+    from mini_ork.web.db import db_for
 
     src = source if source in SOURCE_LABELS else "all"
     needle = text.strip().lower()
@@ -458,7 +458,7 @@ def recipe_card(home: Path | None, recipe_id: str) -> dict[str, Any] | None:
     degrades to empty dicts, never raises.
     """
     from mini_ork import recipes_catalog
-    from mini_ork.web.deps import db_for
+    from mini_ork.web.db import db_for
 
     entry = recipes_catalog.find_recipe(recipe_id, home)
     if entry is None:

@@ -103,7 +103,7 @@ def _chains(home: Path) -> dict[str, list[str]]:
 
 
 def _db(home: Path):
-    from mini_ork.web.deps import db_for
+    from mini_ork.web.db import db_for
 
     return db_for(home)
 

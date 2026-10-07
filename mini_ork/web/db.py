@@ -125,3 +125,17 @@ def resolve_home(home: str | os.PathLike | None) -> Path:
     if env:
         return Path(env).resolve()
     return (Path.cwd() / ".mini-ork").resolve()
+
+
+_dbs: dict[Path, StateDB] = {}
+_dbs_lock = threading.Lock()
+
+
+def db_for(home: Path) -> StateDB:
+    """Return the StateDB for ``home``, cached process-wide (one per home)."""
+    with _dbs_lock:
+        db = _dbs.get(home)
+        if db is None:
+            db = StateDB(home / "state.db")
+            _dbs[home] = db
+        return db

@@ -71,7 +71,7 @@ def _runs(home: Path) -> tuple[list[dict[str, Any]], dict[str, int]]:
 
 
 def _learnings(home: Path) -> list[dict[str, Any]]:
-    from mini_ork.web.deps import db_for
+    from mini_ork.web.db import db_for
 
     db = db_for(home)
     out: list[dict[str, Any]] = []
@@ -262,7 +262,7 @@ _ARTIFACT_LIMIT = 400
 
 def _kickoff(home: Path, run_id: str) -> dict[str, Any]:
     from mini_ork.acp.history import _read_kickoff
-    from mini_ork.web.deps import db_for
+    from mini_ork.web.db import db_for
 
     path = None
     try:
@@ -399,7 +399,7 @@ def act(home: Path, verb: str, run_id: str) -> dict[str, Any]:
 
     if verb == "stop":
         from mini_ork.web.control import stop_run
-        from mini_ork.web.deps import db_for
+        from mini_ork.web.db import db_for
 
         return stop_run(home, db_for(home), run_id)
     ws = workspaces.load(home, run_id)
@@ -415,7 +415,7 @@ def act(home: Path, verb: str, run_id: str) -> dict[str, Any]:
 def _act_kill(home: Path, run_id: str) -> dict[str, Any]:
     """SIGTERM, then SIGKILL after 2 s — wired through the live control plane."""
     from mini_ork.web.control import kill_run
-    from mini_ork.web.deps import db_for
+    from mini_ork.web.db import db_for
 
     return kill_run(home, db_for(home), run_id)
 

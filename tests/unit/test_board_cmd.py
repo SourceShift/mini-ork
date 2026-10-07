@@ -809,3 +809,73 @@ def test_diffstat_never_written_for_working_run(home: Path) -> None:
     board_cmd._runs(home)
     cache_path = home / "runs" / run_id / "diffstat.json"
     assert not cache_path.exists()
+
+
+# ── kickoff ide-board-perf-r7 — FastAPI must NOT enter sys.modules on the
+#    ``board --shell`` boot path. ``_events_by_run`` early-returns when no
+#    ``state.db`` exists, so the temp home MUST be seeded — otherwise the
+#    assertion passes on the unfixed tree (false-positive guard).
+
+
+def test_board_shell_path_does_not_pull_in_fastapi(home: Path) -> None:
+    """``mini_ork.cli.board_cmd._runs(<seeded home>)`` and
+    ``mini_ork.ide_pages.header.header`` must NOT import ``fastapi`` or
+    ``pydantic`` — they used to because every ACP/IDE module reached
+    ``mini_ork.web.deps`` (whose module top loads FastAPI) just to get
+    ``db_for``. The fix moved ``db_for`` into ``mini_ork.web.db`` (FastAPI-
+    free) and re-exports it from ``deps`` for the web server.
+
+    The temp home is the ``home`` fixture: ``mig.init_db`` already seeded
+    ``state.db`` so ``_events_by_run`` is reached and FastAPI-free re-export
+    caching isn't a vacuous pass.
+
+    A negative control at the end asserts the test WOULD catch a
+    regression: importing ``mini_ork.web.deps`` directly DOES pull in
+    FastAPI, so a future regression that re-introduces the
+    ``web.deps.db_for`` import on the board path would fail.
+    """
+    import sys
+
+    _seed_run(home, "run-r7-shellpath", "published")
+    code = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"import mini_ork.cli.board_cmd as b\n"
+        f"b._runs(Path({str(home)!r}))\n"
+        "from mini_ork.ide_pages.header import header\n"
+        "header_func = header\n"
+        "assert 'fastapi' not in sys.modules, sorted(m for m in sys.modules if m.startswith('fastapi'))\n"
+        "assert 'pydantic' not in sys.modules, sorted(m for m in sys.modules if m.startswith('pydantic'))\n"
+        "print('OK', 'fastapi' in sys.modules, 'pydantic' in sys.modules)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=30
+    )
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    # Subprocess prints ``OK <fastapi-in-modules> <pydantic-in-modules>``.
+    # Both must be False — the r7 fix moved ``db_for`` into
+    # ``mini_ork.web.db`` so the board path stays FastAPI-free.
+    stdout = proc.stdout.strip()
+    assert stdout.startswith("OK "), f"unexpected subprocess output: {stdout!r}"
+    parts = stdout.split()
+    assert len(parts) == 3, f"unexpected subprocess output shape: {stdout!r}"
+    assert parts[1] == "False", f"fastapi leaked into sys.modules: {stdout!r}"
+    assert parts[2] == "False", f"pydantic leaked into sys.modules: {stdout!r}"
+
+    # Negative control: ``mini_ork.web.deps`` top-loads FastAPI, so this
+    # WOULD fail if the new guard ever regresses to re-importing it on
+    # the board path. Kept in-process so the subprocess above remains a
+    # pure shape check.
+    import subprocess as _subprocess
+
+    neg_code = (
+        "import mini_ork.web.deps as d\n"
+        "import sys\n"
+        "assert 'fastapi' in sys.modules, 'web.deps must import fastapi'\n"
+        "print('NEG OK')\n"
+    )
+    neg_proc = _subprocess.run(
+        [sys.executable, "-c", neg_code], capture_output=True, text=True, timeout=20
+    )
+    assert neg_proc.returncode == 0, neg_proc.stderr
+    assert "NEG OK" in neg_proc.stdout

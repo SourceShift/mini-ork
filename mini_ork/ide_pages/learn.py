@@ -46,7 +46,7 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
 
 
 def _db(home: Path):
-    from mini_ork.web.deps import db_for
+    from mini_ork.web.db import db_for
 
     return db_for(home)
 

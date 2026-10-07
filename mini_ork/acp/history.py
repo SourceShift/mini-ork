@@ -117,7 +117,7 @@ def read_snapshot(home: Path, run_id: str) -> dict[str, Any]:
     shape ``{"status", "events", "llm_calls"}``; a missing DB or missing row
     yields ``{"status": None, "events": [], "llm_calls": []}``.
     """
-    from mini_ork.web.deps import db_for
+    from mini_ork.web.db import db_for
     from mini_ork.web.repositories import RunDetailRepository
 
     home = Path(home)
@@ -165,7 +165,7 @@ def list_runs(
     the offset for the next page, or ``None`` when exhausted. A missing DB or
     missing ``task_runs`` table returns ``([], None)``.
     """
-    from mini_ork.web.deps import db_for
+    from mini_ork.web.db import db_for
 
     home = Path(home)
     if not (home / "state.db").exists():
@@ -220,7 +220,7 @@ def kickoff_text(home: Path, run_id: str, max_chars: int = 4000) -> str:
     home = Path(home)
     kickoff_path: str | None = None
     if (home / "state.db").exists():
-        from mini_ork.web.deps import db_for
+        from mini_ork.web.db import db_for
         from mini_ork.web.repositories import RunDetailRepository
 
         try:

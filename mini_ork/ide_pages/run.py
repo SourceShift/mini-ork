@@ -232,7 +232,7 @@ def _attribute_calls(nodes: dict[str, Node], calls: list[dict[str, Any]], now: i
 
 def _load(home: Path, run_id: str) -> Run | None:
     from mini_ork.acp import fleet
-    from mini_ork.web.deps import db_for
+    from mini_ork.web.db import db_for
 
     card = fleet.run_card(home, run_id)
     if card is None:
@@ -664,7 +664,7 @@ def _overview_tab(run: Run) -> list[dict[str, Any]]:
         return S.lst("Why? — evidence", items)
 
     def correlation() -> dict[str, Any]:
-        from mini_ork.web.deps import db_for
+        from mini_ork.web.db import db_for
 
         db = db_for(run.home)
         events = db.row("SELECT COUNT(*) AS n FROM run_events WHERE run_id = ?", (run.id,)) \
@@ -678,7 +678,7 @@ def _overview_tab(run: Run) -> list[dict[str, Any]]:
         ])
 
     def recent() -> dict[str, Any]:
-        from mini_ork.web.deps import db_for
+        from mini_ork.web.db import db_for
 
         db = db_for(run.home)
         rows = db.rows("SELECT event_type, payload_json, created_at FROM run_events WHERE run_id = ? "
@@ -764,7 +764,7 @@ def _learnings_tab(run: Run) -> list[dict[str, Any]]:
     errors: dict[str, str] = {}
 
     def produced() -> dict[str, Any]:
-        from mini_ork.web.deps import db_for
+        from mini_ork.web.db import db_for
 
         db = db_for(run.home)
         items = []
@@ -825,7 +825,7 @@ def _learnings_tab(run: Run) -> list[dict[str, Any]]:
                                                 f"{pack.get('budget_tokens') or '—'} budget"))
         else:
             items.append(S.dot("No context pack", "This run was not given a context pack."))
-        from mini_ork.web.deps import db_for
+        from mini_ork.web.db import db_for
 
         db = db_for(run.home)
         if db.has_table("operator_steering"):

@@ -312,7 +312,7 @@ def _current_run_id(agent: Any, session_id: str, arg: str) -> str | None:
 def _resolve_run_row(agent: Any, run_id: str) -> dict[str, Any] | None:
     """The ``task_runs`` row for ``run_id`` (or ``None`` when absent)."""
     try:
-        from mini_ork.web.deps import db_for
+        from mini_ork.web.db import db_for
         from mini_ork.web.repositories import RunDetailRepository
 
         home = agent._home_for(run_id)
@@ -424,7 +424,7 @@ async def handle_status(agent: Any, session_id: str, arg: str) -> str:
 
 async def handle_learnings(agent: Any, session_id: str, arg: str) -> str:
     """Failure-mode gradients + learning records + emergent patterns."""
-    from mini_ork.web.deps import db_for
+    from mini_ork.web.db import db_for
     from mini_ork.web.repositories import LearningRepository, RunDetailRepository
 
     filter_text = arg.strip().lower()
@@ -486,7 +486,7 @@ async def handle_learnings(agent: Any, session_id: str, arg: str) -> str:
 async def handle_cost(agent: Any, session_id: str, arg: str) -> str:
     """Spend per recipe per day + this run + rolling-24h budget gauge."""
     from mini_ork.cost_ledger import spent_last_24h
-    from mini_ork.web.deps import db_for
+    from mini_ork.web.db import db_for
     from mini_ork.web.routes.trajectory import cost_by_day
 
     tokens = arg.strip().split()
@@ -604,7 +604,7 @@ async def _act_on_run(
     if not run_id:
         return "No run in this thread yet — `/runs` lists the project's runs."
     try:
-        from mini_ork.web.deps import db_for
+        from mini_ork.web.db import db_for
 
         home = agent._home_for(run_id)
         db = db_for(home)
