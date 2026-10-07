@@ -477,12 +477,16 @@ def build(kickoff_path: str, *, task_class: str = "", db: str | None = None,
           run_id: str | None = None, max_clusters: int = 5,
           kickoff_text: str | None = None) -> dict:
     """The v2 pack for one run. Never raises; unreadable inputs give empty sections."""
+    kickoff_bytes: bytes | None = None
     if kickoff_text is None:
         try:
-            with open(kickoff_path, encoding="utf-8") as fh:
-                kickoff_text = fh.read()
+            with open(kickoff_path, "rb") as fh:
+                kickoff_bytes = fh.read()
+            kickoff_text = kickoff_bytes.decode("utf-8", errors="replace")
         except OSError:
             kickoff_text = ""
+    else:
+        kickoff_bytes = kickoff_text.encode("utf-8")
     contract = parse_contract(kickoff_text)
     findings = scope_findings(contract["files_in_scope"], db=db, exclude_run=run_id)
     floor = min_severity()
@@ -497,6 +501,12 @@ def build(kickoff_path: str, *, task_class: str = "", db: str | None = None,
         "run_id": run_id or "",
         "task_class": task_class,
         "kickoff_path": kickoff_path,
+        # The contract as the run received it, before any node ran: the kickoff
+        # guard (mini_ork.verify.kickoff_guard) compares the file against this at
+        # publish time, so a run cannot widen its own scope by editing it.
+        "kickoff_sha256": (hashlib.sha256(kickoff_bytes).hexdigest()
+                           if kickoff_bytes is not None else ""),
+        "kickoff_snapshot": kickoff_text if kickoff_bytes is not None else "",
         "contract": contract,
         "constraints": constraints,
         "file_findings": clusters,

@@ -170,6 +170,29 @@ def _publisher_try_commit_files(root, target_repo, run_dir, review_file, verdict
         return False
 
 
+def _kickoff_guard(run_dir, db, run_id):
+    """Kickoff guard (MO_KICKOFF_GUARD=off|shadow|on, default shadow): a run that
+    edited or deleted its own kickoff cannot publish. ``shadow`` records what it
+    would block (kickoff-guard.json + a task_runs note) and never blocks; ``on``
+    refuses and restores the kickoff from the pre-run snapshot. Returns the
+    publisher's ``(rc, finish_reason)`` when blocking, else ``None``."""
+    from mini_ork.verify import kickoff_guard as _kg  # noqa: PLC0415
+    gate_mode = _kg.mode()
+    if gate_mode == "off" or not run_dir:
+        return None
+    ok, reason, _report = _kg.publish_gate(run_dir, gate_mode=gate_mode)
+    if ok:
+        return None
+    from mini_ork.verify import probe_validity as _pv  # noqa: PLC0415
+    if gate_mode == "shadow":
+        _pv.record_note(db, run_id, f"[shadow] kickoff guard would block: {reason}")
+        return None
+    print(f"  [BLOCK] kickoff-guard: {reason} — the run changed its own contract; "
+          "kickoff restored, publish refused (kickoff-guard.json)")
+    _pv.record_note(db, run_id, f"kickoff_guard: {reason}")
+    return 1, "verdict_fail"
+
+
 def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file="", verdict_env=""):
     """Port of bash publisher branch (:2909-3200). The panel found the port stubbed
     this to `set_status('published')` — this restores the two BLOCKING gates + delivery:
@@ -260,6 +283,9 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
             return 1, "verdict_fail"
         else:
             print("  [ok] probe-validity: pre-publish pass")
+    blocked = _kickoff_guard(run_dir, db, run_id)
+    if blocked:
+        return blocked
     # ── artifact contract
     contract = (os.path.join(_recipe_root(root), "recipes", recipe, "artifact_contract.yaml")
                 if recipe else "")
