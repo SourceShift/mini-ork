@@ -170,6 +170,26 @@ def test_paused_and_remote_runs_are_never_judged_by_a_local_pid(home: Path, mark
     assert _row(home, "run-held")["status"] == "executing"
 
 
+def test_a_run_whose_verdict_passed_is_never_labelled_failed(home: Path) -> None:
+    # Regression: execute-only callers end a passing run with no publish step;
+    # the stale pass of the 2026-10-07 researcher backfill marked 25 of them
+    # failed. Neither a dead .pid nor --stale-after may fail finished work.
+    old = int(time.time()) - 30 * HOUR
+    dead_dir = _seed(home, "run-pass-dead")
+    _write_pid(dead_dir, _dead_pid())
+    stale_dir = _seed(home, "run-pass-stale", updated_at=old)
+    for d in (dead_dir, stale_dir):
+        (d / "verdict.json").write_text(json.dumps({"verdict": "pass", "failed_nodes": 0}), encoding="utf-8")
+    fail_dir = _seed(home, "run-fail-stale", updated_at=old)
+    (fail_dir / "verdict.json").write_text(json.dumps({"verdict": "fail", "failed_nodes": 2}), encoding="utf-8")
+
+    assert run_reaper.probe(dead_dir).verdict == "finished"
+    assert [r["run_id"] for r in run_reaper.reap(home, stale_after=6 * HOUR)] == ["run-fail-stale"]
+    assert _row(home, "run-pass-dead")["status"] == "executing"
+    assert _row(home, "run-pass-stale")["status"] == "executing"
+    assert run_reaper.close_run_record(home / "state.db", "run-pass-dead", dead_dir, crashed=False) is None
+
+
 def test_terminal_rows_are_not_candidates(home: Path) -> None:
     run_dir = _seed(home, "run-done", "published")
     _write_pid(run_dir, _dead_pid())

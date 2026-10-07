@@ -43,7 +43,7 @@ _START_SLACK_S = 2
 
 @dataclass(frozen=True)
 class Probe:
-    """``verdict`` is one of alive | dead | unknown | remote | paused."""
+    """``verdict`` is one of alive | dead | unknown | remote | paused | finished."""
 
     verdict: str
     pids: tuple[int, ...] = ()
@@ -52,6 +52,20 @@ class Probe:
 
 def _iso(ts: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts))
+
+
+def _verdict_passed(run_dir: Path) -> bool:
+    """The run finished and passed: ``verdict.json`` says pass.
+
+    An execute-only caller (e.g. libwit's verified-artifact) ends a passing run
+    with no publish step, so its status stays ``executing``. That is finished
+    work, not a death — never label it ``failed``.
+    """
+    try:
+        data = json.loads((run_dir / "verdict.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and (data.get("verdict") == "pass" or data.get("pass") is True)
 
 
 def _read_pids(path: Path) -> tuple[int, ...]:
@@ -85,7 +99,7 @@ def close_run_record(db_path: str | Path, run_id: str, run_dir: Path, *,
     Returns the status it replaced, or ``None`` when nothing changed. A
     cost-paused run keeps its status — it waits on ``mini-ork resume``.
     """
-    if not run_id or (run_dir / ".cost-pause").exists():
+    if not run_id or (run_dir / ".cost-pause").exists() or _verdict_passed(run_dir):
         return None
     now = int(time.time()) if now is None else now
     con = sqlite3.connect(str(db_path), timeout=15.0)
@@ -147,6 +161,8 @@ def probe(run_dir: Path) -> Probe:
         return Probe("remote", detail="mirrored from a remote node; its pid is not local")
     if (run_dir / ".cost-pause").exists():
         return Probe("paused", detail="cost-paused; waits on `mini-ork resume`")
+    if _verdict_passed(run_dir):
+        return Probe("finished", detail="verdict.json passed; finished without a publish step")
     pid_path = run_dir / PID_FILE
     try:
         pids = _read_pids(pid_path)
