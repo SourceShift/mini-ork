@@ -76,6 +76,7 @@ from mini_ork.dispatch.routing import (  # noqa: F401
 from mini_ork.cli.publisher import (  # noqa: F401
     _envsubst,
     _publisher_try_commit_files,
+    is_rubric_prescreen,
     publisher_node,
 )
 from mini_ork.runtime.run_roots import (  # noqa: F401
@@ -322,7 +323,10 @@ def _emit_run_verdict(run_dir, fail_count, dispatched, *, dry_run=False, task_cl
     # rehearsal of a different workflow as its outcome.
     if not (run_dir and os.path.isdir(run_dir)):
         return
-    if not dry_run and os.path.isfile(os.path.join(run_dir, "panel-verdict.json")):
+    panel = os.path.join(run_dir, "panel-verdict.json")
+    # A real panel gate owns the run verdict; the advisory rubric's score file
+    # (same name) does not.
+    if not dry_run and os.path.isfile(panel) and not is_rubric_prescreen(panel):
         return
     verdict = "fail" if fail_count > 0 else "pass"
     verdict_path = os.path.join(
@@ -977,6 +981,12 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
             revise_groups: dict[str, list[tuple[tuple, int, str]]] = {}
             for field, rc, finish_reason in outcomes:
                 if rc == 0 or field[0] not in retry_edges:
+                    continue
+                if finish_reason == REVIEWER_VERDICT_UNPARSEABLE:
+                    # Nothing to send back: the reviewer judged nothing. Re-running
+                    # the implementer would spend a full round on a format failure.
+                    print(f"[revise] skipped for {field[0]}: reviewer verdict unparseable "
+                          "— no findings to send back", file=sys.stderr)
                     continue
                 target, max_rounds = retry_edges[field[0]]
                 cap = min(max_rounds, revise_rounds_cap)
@@ -2944,6 +2954,7 @@ from mini_ork.cli.execute_handlers import (  # noqa: E402,F401
     dispatch_node,
     register_implementer_submode,
     register_node_handler,
+    REVIEWER_VERDICT_UNPARSEABLE,
 )
 
 

@@ -1059,6 +1059,27 @@ def _classify_review_node(recipe_eff: str, node_id: str, root: str, run_dir: str
     return os.path.join(run_dir, f"review-{node_id}.json"), False, False
 
 
+REVIEWER_VERDICT_UNPARSEABLE = "reviewer_verdict_unparseable"
+
+
+def _append_run_note(db: str, run_id: str, note: str) -> None:
+    """Append ``note`` to ``task_runs.notes``. Warns (does not raise): the trace
+    already carries the reason, and the node's own failure must not be masked."""
+    if not db or not run_id or not os.path.isfile(db):
+        return
+    try:
+        con = sqlite3.connect(db, timeout=15.0)
+        try:
+            con.execute("PRAGMA busy_timeout = 15000")
+            con.execute("UPDATE task_runs SET notes = COALESCE(notes || '; ', '') || ? WHERE id = ?",
+                        (note, run_id))
+            con.commit()
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        print(f"  [warn] could not record '{note}' in task_runs.notes: {exc}", file=sys.stderr)
+
+
 def _handle_reviewer(ctx: NodeDispatch):
     review_file, is_panel_gate, is_synth = _classify_review_node(
         ctx.recipe_eff, ctx.node_id, ctx.root, ctx.run_dir)
@@ -1149,6 +1170,19 @@ def _handle_reviewer(ctx: NodeDispatch):
         ctx.trace(ctx.node_id, "success", "reviewer", review_file, verdict, "done")
         ctx.charge()
         return 0, "done"
+    if vn == "unknown":
+        # No pass|fail|needs_revision verdict could be parsed. Fail the node
+        # explicitly and say why — it used to fall through to an ordinary
+        # verdict_fail with no reason. run_events.finish_reason is a CHECK enum,
+        # so the trace keeps `verdict_fail` and carries the reason as its
+        # verdict; the returned reason tells the revise loop to skip the round.
+        print(f"  [fail] reviewer {ctx.node_id}: no parseable verdict in {review_file} "
+              f"({REVIEWER_VERDICT_UNPARSEABLE})", file=sys.stderr)
+        print(f"  [fail] reviewer {ctx.node_id}: {REVIEWER_VERDICT_UNPARSEABLE}")
+        ctx.trace(ctx.node_id, "failure", "reviewer", review_file, REVIEWER_VERDICT_UNPARSEABLE, "verdict_fail")
+        _append_run_note(ctx.db, ctx.run_id, f"{REVIEWER_VERDICT_UNPARSEABLE}: node {ctx.node_id}")
+        ctx.charge()
+        return 1, REVIEWER_VERDICT_UNPARSEABLE
     fr = "verdict_revise" if vn in _REVIEW_REVISE else "verdict_fail"
     ctx.trace(ctx.node_id, "failure", "reviewer", review_file, verdict, fr)
     ctx.charge()

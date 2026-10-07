@@ -40,6 +40,22 @@ def set_status(db, run_id, new_status):  # late binding — avoids the execute<-
         raise RuntimeError(f"set_status({new_status!r}) for {run_id} did not persist (row says {row[0]!r})")
     return None
 
+def is_rubric_prescreen(path) -> bool:
+    """True when ``path`` is the advisory rubric pre-screen's score file.
+
+    The rubric writes ``panel-verdict.json`` with ``source: rubric-prescreen``
+    — the same name a real panel gate uses. It records a score; it never
+    approves a commit, satisfies the panel approval gate, or replaces the run
+    verdict (K0.5b AC1).
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and data.get("source") == "rubric-prescreen"
+
+
 def _recipe_root(root):
     """Base dir for recipe assets. ``main.py`` resolves a recipe against the
     consumer's ``MINI_ORK_HOME`` overlay and threads the winning base via
@@ -75,7 +91,7 @@ def _publisher_try_commit_files(root, target_repo, run_dir, review_file, verdict
     if run_dir:
         for name in ("panel-verdict.json", "review-verdict.json"):
             p = os.path.join(run_dir, name)
-            if os.path.isfile(p):
+            if os.path.isfile(p) and not is_rubric_prescreen(p):
                 candidates.append(p)
     if review_file and os.path.isfile(review_file):
         candidates.append(review_file)
@@ -188,7 +204,8 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
     # ── recursive-validate-impl requires an approved panel verdict
     if recipe == "recursive-validate-impl":
         pvf = os.path.join(run_dir, "panel-verdict.json")
-        if not (os.path.isfile(pvf) and os.path.getsize(pvf) > 0):
+        # A rubric pre-screen score is not the panel's verdict.
+        if not (os.path.isfile(pvf) and os.path.getsize(pvf) > 0) or is_rubric_prescreen(pvf):
             print(f"  [BLOCK] publisher: missing panel verdict at {pvf}", file=sys.stderr)
             return 1, "verdict_fail"
         try:

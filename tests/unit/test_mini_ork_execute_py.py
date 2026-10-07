@@ -696,10 +696,11 @@ def test_live_reviewer_verdict_gate(tmp_path):
     rc_rev, fr_rev = ex.dispatch_node(_fields("rev3", "reviewer", "opus"),
                                       dispatch_fn=_fake('{"verdict": "needs_revision"}'), **common)
     assert rc_rev == 1 and fr_rev == "verdict_revise"
-    # unknown/unparseable verdict on a gating (non-synth) node → FAIL, not neutral.
+    # unknown/unparseable verdict on a gating (non-synth) node → FAIL, not neutral,
+    # and with its reason named (K0.5b): the revise loop must not spend a round on it.
     rc_unk, fr_unk = ex.dispatch_node(_fields("rev4", "reviewer", "opus"),
                                       dispatch_fn=_fake("I think this looks fine overall."), **common)
-    assert rc_unk == 1 and fr_unk == "verdict_fail"
+    assert rc_unk == 1 and fr_unk == "reviewer_verdict_unparseable"
     # a synth reviewer never gates → always success
     rc_synth, _ = ex.dispatch_node(_fields("synth_node", "reviewer", "opus"),
                                    dispatch_fn=_fake("# Synthesis\ntop findings..."), **common)
