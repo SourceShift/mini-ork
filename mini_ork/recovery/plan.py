@@ -484,6 +484,14 @@ def compute_recovery(
     else:
         closure = dag.descendants(failed_node)
 
+    # No node may appear in BOTH reuse and rerun (kickoff §3 fix 2):
+    # the status printer and downstream consumers assume the sets are
+    # disjoint. Subtraction runs after closure is final (covers both
+    # the from_node override and the auto-detected failure root) and
+    # before ``reason_view`` is built so a closure node is never
+    # labelled "reusable" on the --status printout.
+    reuse -= closure
+
     # Re-express the reason map with the operator-friendly labels the
     # status printer expects. ``reason`` already covers every node;
     # closure nodes that ARE reusable (impossible by construction, but
@@ -592,7 +600,12 @@ def plan_recovery(
                 "--strategy verify requires at least one verifier",
                 kind="verify_no_entry",
             )
-        for nid in _ancestors(dag, verify_entry):
+        # ``_ancestors`` is documented to include the node itself
+        # (``plan.py:148-166``); exclude the entry here — the entry is
+        # precisely the verifier with no success checkpoint, so testing
+        # it for reusability would refuse every ``--strategy verify``
+        # invocation (kickoff §3 fix 1).
+        for nid in _ancestors(dag, verify_entry) - {verify_entry}:
             if nid in plan.reuse:
                 continue
             raise RecoveryRefused(
@@ -605,6 +618,10 @@ def plan_recovery(
             (nid for nid in dag.topo if nid in plan.closure),
             None,
         )
+        # Closure subtract from reuse (kickoff §3 fix 2). Done here too
+        # because the verify branch overrides ``plan.closure`` AFTER
+        # ``compute_recovery`` returned.
+        plan.reuse -= plan.closure
 
     # Retry semantics: same entry, but the plan carries the operator's
     # explicit "I know what's broken" intent for downstream trace

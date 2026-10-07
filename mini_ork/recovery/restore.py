@@ -131,18 +131,20 @@ def _resolve_patch_path(
     return candidate if os.path.isfile(candidate) else None
 
 
-def _rolled_back_marker(run_dir: str) -> bool:
-    """A ``rolled-back.json`` or ``salvage.patch`` is the signal that the
-    implementer's tree was reverted and needs restoration.
+def _rolled_back_marker(run_dir: str, patch: str | None = None) -> bool:
+    """True when the implementer's work was carried out of the tree.
 
-    Either artifact is sufficient on its own — ``rolled-back.json`` is written
-    by ``_record_rolled_back`` at ``execute_handlers.py:1290`` and
-    ``salvage.patch`` by ``_salvage_before_revert`` at ``execute_handlers.py:1658``.
+    ``rolled-back.json`` (``_record_rolled_back``), ``salvage.patch``
+    (``_salvage_before_revert``) or a resolved carry patch: a recipe whose own
+    rollback saves the work under another name (``--carry-patch`` or the
+    workflow's ``recovery.carry_patch``, e.g. ``cycle-delta.patch``) writes
+    neither of the first two, and its patch is the only record of the edit.
     """
     if not run_dir:
         return False
     return (os.path.isfile(os.path.join(run_dir, "rolled-back.json"))
-            or os.path.isfile(os.path.join(run_dir, "salvage.patch")))
+            or os.path.isfile(os.path.join(run_dir, "salvage.patch"))
+            or bool(patch and os.path.isfile(patch)))
 
 
 def _git(cwd: str, args: list[str]) -> subprocess.CompletedProcess:
@@ -189,7 +191,7 @@ def plan_restore(
     out = {
         "target": target,
         "patch": patch,
-        "rolled_back": _rolled_back_marker(run_dir),
+        "rolled_back": _rolled_back_marker(run_dir, patch),
         "would_apply": None,
         "stderr": "",
     }
@@ -199,7 +201,7 @@ def plan_restore(
     if not patch or not os.path.isfile(patch):
         out["would_apply"] = "no_patch"
         return out
-    if not _rolled_back_marker(run_dir):
+    if not _rolled_back_marker(run_dir, patch):
         out["would_apply"] = "not_rolled_back"
         return out
     rev = _git(target, ["apply", "--check", "-R", str(patch)])
@@ -245,7 +247,7 @@ def restore_carry_patch(
         return ("no_target", "no implementer-summary.json worktree_path and no run_profile roots")
     if not patch or not os.path.isfile(patch):
         return ("no_patch", f"no carry patch at {patch or '<unresolved>'}")
-    if not _rolled_back_marker(run_dir):
+    if not _rolled_back_marker(run_dir, patch):
         return ("not_rolled_back", "no rolled-back.json / salvage.patch present — nothing to restore")
     rev = _git(target_resolved, ["apply", "--check", "-R", str(patch)])
     if rev.returncode == 0:

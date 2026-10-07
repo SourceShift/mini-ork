@@ -82,6 +82,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from typing import Any
 from pathlib import Path
 
 # E1 seam — read by is_node_reusable for the per-node reuse decision.
@@ -322,13 +323,21 @@ def _task_class_for_recipe(recipe: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _load_retry_hint(run_dir: str) -> dict | None:
-    """Read ``<run_dir>/retry-hint.json`` if present, else ``None``.
+def _load_retry_hint(
+    run_dir: str,
+    *,
+    home: str | None = None,
+    run_id: str | None = None,
+) -> dict | None:
+    """Read the retry hint for this run, preferring the module seam.
 
-    The retry-hint module is owned by a parallel run; this shim is the
-    durable seam that lets a verifying consumer refuse a structurally-
-    plausible-but-actually-broken retry. Contract (per the parallel-run
-    owner):
+    Tries ``mini_ork.recovery.retry_hint.load_or_compute(home, run_id)``
+    first (kickoff §3 fix 4). Falls back to ``<run_dir>/retry-hint.json``
+    when the module is absent (``ImportError``) or returns ``None``. The
+    module is the durable seam owned by a parallel run; the file is the
+    legacy fallback for runs whose owner hasn't migrated.
+
+    The retry-hint contract (per the parallel-run owner):
         {retryable: bool, strategy: str, from_node: str|null,
          needs_change: null|{kind, summary, detail, evidence},
          command: str}
@@ -336,21 +345,29 @@ def _load_retry_hint(run_dir: str) -> dict | None:
     Malformed JSON, missing keys, or a missing file all degrade to
     ``None`` ("today's behaviour") so a partial / corrupt hint never
     blocks recovery — the parallel run's contract is verified
-    independently.
+    independently. The import is performed lazily so a test can inject a
+    stub via ``monkeypatch.setitem(sys.modules, ...)`` BEFORE the planner
+    hits this code path (kickoff test 4).
     """
-    if not run_dir:
-        return None
-    path = os.path.join(run_dir, "retry-hint.json")
-    if not os.path.isfile(path):
-        return None
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    return data
+    hint: dict | None = None
+    if home and run_id:
+        try:
+            from mini_ork.recovery.retry_hint import load_or_compute  # pyright: ignore[reportMissingImports] — soft import, may be absent
+            hint = load_or_compute(Path(home), run_id)
+        except ImportError:
+            pass
+    if hint is None and run_dir:
+        path = os.path.join(run_dir, "retry-hint.json")
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return None
+        if isinstance(data, dict):
+            hint = data
+    return hint
 
 
 def _format_hint_block(hint: dict) -> str:
@@ -374,18 +391,21 @@ def _format_hint_block(hint: dict) -> str:
     return "\n".join(lines)
 
 
-def _needs_restore(plan: RecoveryPlan, run_dir: str) -> bool:
+def _needs_restore(plan: RecoveryPlan, run_dir: str, carry_patch: str | None = None,
+                   workflow: str | None = None) -> bool:
     """True iff the recovery must apply a carry patch before dispatch.
 
-    Two conditions (kickoff §4):
+    Two conditions (kickoff §3 fix 6):
 
-      1. The reuse set contains an implementer-typed node (or any other
-         code-changing type — ``node_types`` carries the type map so
-         ``implementer``, ``rollback``, etc. all qualify). Without an
+      1. The reuse set contains an implementer-typed node. Without a
          reused implementer there's nothing for the verifier to verify
-         against — the tree is already clean.
-      2. The run was rolled back (``rolled-back.json`` OR
-         ``salvage.patch`` present). Otherwise nothing to restore.
+         against — the tree is already clean. (The code only checks
+         ``"implementer"``; do not list other types here without also
+         extending the membership test below. No recipe declares another
+         code-changing node type as of 2026-10-07.)
+      2. The run was rolled back: ``rolled-back.json``, ``salvage.patch`` or
+         the resolved carry patch (``--carry-patch`` / workflow
+         ``recovery.carry_patch``) is present. Otherwise nothing to restore.
 
     Both must hold; the function short-circuits on the cheaper
     ``plan.reuse`` check first.
@@ -401,7 +421,9 @@ def _needs_restore(plan: RecoveryPlan, run_dir: str) -> bool:
         return True
     if os.path.isfile(os.path.join(run_dir, "salvage.patch")):
         return True
-    return False
+    from mini_ork.recovery.restore import _resolve_patch_path
+
+    return _resolve_patch_path(run_dir, carry_patch, workflow) is not None
 
 
 def _format_restore_plan(
@@ -431,6 +453,17 @@ def _format_restore_plan(
     if plan.get("stderr"):
         lines.append(f"      stderr:      {plan['stderr']}")
     return "\n".join(lines)
+
+
+def _abandon_lease(db_path: str, run_id: str, req: Any, token: str | None) -> None:
+    """A refused restore dispatched nothing: close the request as failed and
+    release the lease, so the ledger never records a dispatch that did not run."""
+    if _lease is None:
+        return
+    if req:
+        _lease.close_recovery(db_path, req[0], status="failed")
+    if token:
+        _lease.release_lease(db_path, run_id, token)
 
 
 def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
@@ -594,22 +627,30 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
         )
         return 1
 
-    # ── Hint gate (kickoff §5). Reads ``<run_dir>/retry-hint.json`` if
-    # present. The retry_hint module is owned by a parallel run; this
-    # fallback is the durable seam that lets a verifying consumer refuse
-    # a structurally-plausible-but-actually-broken retry. The hint's
-    # contract (per the parallel-run owner):
+    # ── Hint gate (kickoff §5). Reads the retry hint for this run,
+    # preferring ``mini_ork.recovery.retry_hint.load_or_compute`` (the
+    # durable module seam owned by a parallel run) and falling back to
+    # ``<run_dir>/retry-hint.json``. The hint's contract (per the
+    # parallel-run owner):
     #   {retryable: bool, strategy, from_node, needs_change: null|
     #    {kind, summary, detail, evidence}, command}
-    # No file → today's behaviour. Malformed JSON → today's behaviour.
-    hint = _load_retry_hint(run_dir)
+    # No hint → today's behaviour. Malformed JSON → today's behaviour.
+    hint = _load_retry_hint(
+        run_dir,
+        home=os.environ.get("MINI_ORK_HOME"),
+        run_id=run_id,
+    )
     if status_only:
         if hint is not None:
             sys.stdout.write(_format_hint_block(hint) + "\n")
         sys.stdout.write(_format_restore_plan(
             run_dir, carry_patch or None, workflow,
         ) + "\n")
-    if hint is not None and not hint.get("retryable", True) and not force:
+    # ``--status`` must always print the hint + restore + reuse/rerun
+    # plan (kickoff §3 fix 3). Refusal is a DISPATCH-time concern; the
+    # status printout gives the operator the picture they need to
+    # decide whether to use ``--force`` / ``--ack-change``.
+    if hint is not None and not hint.get("retryable", True) and not force and not status_only:
         sys.stderr.write(
             f"[mini-ork-recover] retry-hint refuses this run "
             f"(strategy={hint.get('strategy')!r});"
@@ -623,7 +664,7 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
             sys.stderr.write(f"detail:  {nc['detail']}\n")
         sys.stderr.write("Pass --force to override.\n")
         return 1
-    if hint is not None and hint.get("needs_change") and not ack_change:
+    if hint is not None and hint.get("needs_change") and not ack_change and not status_only:
         nc = hint["needs_change"]
         sys.stderr.write(
             f"Needs a change before retrying ({nc.get('kind')!r}): "
@@ -648,33 +689,6 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
     if status_only:
         sys.stdout.write(format_status(plan))
         return 0
-
-    # ── Carry-patch restore (kickoff §4). For verify / resume / retry,
-    # when the reuse set contains an implementer-typed node AND the run
-    # was rolled back, restore the salvage (or operator-supplied) patch
-    # BEFORE the lease is acquired. The reuse set + node_types come
-    # straight from the just-computed plan — no extra reads.
-    if strategy in ("verify", "resume", "retry") and _needs_restore(plan, run_dir):
-        status, message = restore_carry_patch(
-            run_dir,
-            cli_carry_patch=carry_patch or None,
-            workflow_path=workflow,
-        )
-        sys.stdout.write(
-            f"[mini-ork-recover] restore: {status} — {message}\n"
-        )
-        if status == "conflict":
-            sys.stderr.write(
-                "[mini-ork-recover] refusing to dispatch: carry-patch "
-                "conflict. Resolve the conflict, then rerun.\n"
-            )
-            return 1
-        if status in ("no_target", "no_patch"):
-            sys.stderr.write(
-                "[mini-ork-recover] refusing to dispatch: cannot resolve "
-                f"restore target/patch ({status}: {message}).\n"
-            )
-            return 1
 
     if strategy == "pause":
         # Pure observation — never dispatch. Operator can read the
@@ -724,6 +738,37 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
             apply_env_overrides({"MINI_ORK_RECOVERY_REQUEST": _req[0]})
             _lease.mark_dispatched(db_path, _req[0], owner_token=_token, cost_usd=0.0)
         apply_env_overrides({"MINI_ORK_LEASE_TOKEN": _token})
+
+    # ── Carry-patch restore (kickoff §3 fix 5). Runs AFTER the lease
+    # block above so a refused second worker (another recovery is
+    # already in flight) returns rc=0 BEFORE we touch the tree. Legacy
+    # pre-E3 DBs (lease_tables_present == False) fall through without
+    # a lease block — restore runs anyway because no one else can hold
+    # the run.
+    if strategy in ("verify", "resume", "retry") and _needs_restore(
+            plan, run_dir, carry_patch or None, workflow):
+        status, message = restore_carry_patch(
+            run_dir,
+            cli_carry_patch=carry_patch or None,
+            workflow_path=workflow,
+        )
+        sys.stdout.write(
+            f"[mini-ork-recover] restore: {status} — {message}\n"
+        )
+        if status == "conflict":
+            sys.stderr.write(
+                "[mini-ork-recover] refusing to dispatch: carry-patch "
+                "conflict. Resolve the conflict, then rerun.\n"
+            )
+            _abandon_lease(db_path, run_id, _req, _token)
+            return 1
+        if status in ("no_target", "no_patch"):
+            sys.stderr.write(
+                "[mini-ork-recover] refusing to dispatch: cannot resolve "
+                f"restore target/patch ({status}: {message}).\n"
+            )
+            _abandon_lease(db_path, run_id, _req, _token)
+            return 1
 
     # Active strategies: emit the env, print the plan, hand off to
     # the native executor which honors MINI_ORK_RECOVERY_FROM + CLOSURE.
