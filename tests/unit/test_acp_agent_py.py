@@ -653,7 +653,7 @@ def test_prompt_payload_writes_image_attachment_and_inlines_embedded_text(tmp_pa
         name="Other",
     )
     payload = _build_prompt_payload(
-        [image, embedded, link], sid, home,
+        "", [image, embedded, link], sid, home,
     )
 
     # The image decoded under the session's attachment dir.
@@ -951,8 +951,9 @@ def test_direct_mode_adopts_linked_worktree_and_marker_says_this_worktree(
         )
         resp = asyncio.run(agent.new_session(cwd=str(wt)))
         sid = resp.session_id
-        asyncio.run(agent.set_config_option("mode", sid, "direct"))
-        asyncio.run(agent.prompt(sid, [_text_block("do it")]))
+        # Direct runs are reachable only via ``/run`` (or ``/race``) — the
+        # legacy ``mode=direct`` config no longer routes prompts.
+        asyncio.run(agent.prompt(sid, [_text_block("/run do it")]))
 
     assert adopt_calls["cwd"] == str(wt)
     assert adopt_calls["home"] == str(main_home)
@@ -1596,7 +1597,12 @@ def test_only_start_run_results_start_a_child_run(tmp_path):
     assert "docs" in markers[0].title
 
 
-def test_direct_mode_launches_with_selected_recipe(tmp_path):
+def test_direct_mode_routes_plain_prompts_to_the_orchestrator(tmp_path):
+    """A stored ``mode=direct`` is kept for legacy clients but no longer
+    routes a plain prompt to ``_prompt_thread_direct`` — the orchestrator
+    sees the rewritten /typed text instead. Direct runs stay reachable via
+    ``/run`` and ``/race``.
+    """
     from unittest.mock import patch
 
     proj = tmp_path / "proj"
@@ -1604,54 +1610,54 @@ def test_direct_mode_launches_with_selected_recipe(tmp_path):
     fake_lanes = [{"id": "opus", "name": "Opus"}]
     fake_recipes = ["code-fix", "framework-edit"]
 
-    launched: list[tuple[str, str, str]] = []  # (run_id, kickoff, recipe)
+    launched: list[tuple[str, str]] = []  # _launch must stay empty
+    prompts: list[str] = []
 
     def fake_reader(rid: str) -> dict:
-        # Only the fresh run sees a row; the thread session id is not in the db.
-        if not rid.startswith("run-"):
-            return {"status": None, "events": [], "llm_calls": []}
         return {"status": "published", "events": [], "llm_calls": []}
 
     def fake_turn(lane, prompt, cwd, home, resume, on_event):
-        raise AssertionError("orchestrator_turn must not run in direct mode")
+        async def _run():
+            prompts.append(prompt)
+            return _Turn()
 
-    agent = MiniOrkAcpAgent(
-        orchestrator_turn=fake_turn,
-        reader=fake_reader,
-        poll_interval=0,
-    )
+        return _run()
 
-    with patch(
-        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
-        return_value=fake_lanes,
-    ), patch(
-        "mini_ork.recipes_catalog.list_recipes",
-        return_value=[_recipe(n) for n in fake_recipes],
-    ):
-        resp = asyncio.run(agent.new_session(cwd=str(proj)))
-        sid = resp.session_id
-        # Switch to direct mode with the framework-edit recipe.
-        asyncio.run(agent.set_config_option("mode", sid, "direct"))
-        asyncio.run(agent.set_config_option("recipe", sid, "framework-edit"))
-
-    # Patch the bound _launch to capture (run_id, kickoff, recipe) — _launch
-    # reads from ``_sessions`` / ``_recipes`` so we can detect the right one.
     original_launch = MiniOrkAcpAgent._launch
 
     def captured_launch(self, run_id, kickoff_text):
-        launched.append((run_id, kickoff_text, self._recipes.get(run_id) or ""))
+        launched.append((run_id, kickoff_text))
         return {"ok": True, "run_id": run_id}
 
     MiniOrkAcpAgent._launch = captured_launch  # type: ignore[method-assign]
     try:
-        turn_resp = asyncio.run(agent.prompt(sid, [_text_block("do it")]))
+        agent = MiniOrkAcpAgent(
+            orchestrator_turn=fake_turn,
+            reader=fake_reader,
+            poll_interval=0,
+        )
+        with patch(
+            "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+            return_value=fake_lanes,
+        ), patch(
+            "mini_ork.recipes_catalog.list_recipes",
+            return_value=[_recipe(n) for n in fake_recipes],
+        ):
+            resp = asyncio.run(agent.new_session(cwd=str(proj)))
+            sid = resp.session_id
+            # Stored ``mode=direct`` keeps being honoured by ``set_config_option``
+            # so old clients do not error.
+            asyncio.run(agent.set_config_option("mode", sid, "direct"))
+            asyncio.run(agent.set_config_option("recipe", sid, "framework-edit"))
+            turn_resp = asyncio.run(agent.prompt(sid, [_text_block("do it")]))
     finally:
         MiniOrkAcpAgent._launch = original_launch  # type: ignore[method-assign]
 
     assert turn_resp.stop_reason == "end_turn"
-    assert len(launched) == 1
-    assert launched[0][2] == "framework-edit"
-    assert launched[0][0].startswith("run-")
+    # No direct-mode run was launched.
+    assert launched == []
+    # The orchestrator received the prompt.
+    assert prompts == ["do it"]
 
 
 def test_slash_run_in_orchestrate_mode_launches_directly(tmp_path):
@@ -4397,8 +4403,9 @@ def test_direct_mode_worktree_creates_and_routes_to_worktree_path(tmp_path, monk
         agent = MiniOrkAcpAgent(reader=lambda _r: {"status": "published", "events": [], "llm_calls": []}, poll_interval=0)
         resp = asyncio.run(agent.new_session(cwd=str(proj)))
         sid = resp.session_id
-        asyncio.run(agent.set_config_option("mode", sid, "direct"))
-        turn_resp = asyncio.run(agent.prompt(sid, [_text_block("do it")]))
+        # Direct runs are reachable only via ``/run`` — the legacy
+        # ``mode=direct`` config no longer routes prompts.
+        turn_resp = asyncio.run(agent.prompt(sid, [_text_block("/run do it")]))
 
     assert turn_resp.stop_reason == "end_turn"
     # workspaces.create was called with the project root and the thread's home.
@@ -4442,9 +4449,10 @@ def test_direct_mode_in_place_skips_workspaces_create(tmp_path, monkeypatch):
         agent = MiniOrkAcpAgent(reader=lambda _r: {"status": "published", "events": [], "llm_calls": []}, poll_interval=0)
         resp = asyncio.run(agent.new_session(cwd=str(proj)))
         sid = resp.session_id
-        asyncio.run(agent.set_config_option("mode", sid, "direct"))
+        # Direct runs are reachable only via ``/run`` — the legacy
+        # ``mode=direct`` config no longer routes prompts.
         asyncio.run(agent.set_config_option("workspace", sid, "in-place"))
-        turn_resp = asyncio.run(agent.prompt(sid, [_text_block("do it")]))
+        turn_resp = asyncio.run(agent.prompt(sid, [_text_block("/run do it")]))
 
     assert turn_resp.stop_reason == "end_turn"
     assert create_calls == []
@@ -6141,3 +6149,198 @@ def test_a_client_without_file_writing_gets_the_merge_buttons(tmp_path, monkeypa
     asyncio.run(agent.prompt(thread, [_text_block("/run do it")]))
     assert conn.writes == []
     assert len(conn.calls) == 1
+
+
+# ── thread control plane — image attachments (ide-control-plane r2) ──────────
+
+
+_PNG_BYTES = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
+    "890000000d49444154789c6300010000000500010d0a2db40000000049454e44ae426082"
+)
+
+
+def _image_block(png_bytes: bytes = _PNG_BYTES):
+    import base64 as _b64
+
+    from acp.schema import ImageContentBlock
+
+    return ImageContentBlock(
+        type="image",
+        mime_type="image/png",
+        data=_b64.b64encode(png_bytes).decode("ascii"),
+    )
+
+
+def test_image_attachment_reaches_the_orchestrator_with_file_and_line(tmp_path):
+    """A text + image prompt flows to the orchestrator with the rewritten
+    text and an ``Attached image: <path>`` marker; the file holds the bytes.
+    """
+    from unittest.mock import patch
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    fake_lanes = [{"id": "opus", "name": "Opus"}]
+    fake_recipes = ["code-fix"]
+    prompts: list[str] = []
+
+    def fake_turn(lane, prompt, cwd, home, resume, on_event):
+        async def _run():
+            prompts.append(prompt)
+            return _Turn()
+
+        return _run()
+
+    with patch(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        return_value=fake_lanes,
+    ), patch(
+        "mini_ork.recipes_catalog.list_recipes",
+        return_value=[_recipe(n) for n in fake_recipes],
+    ):
+        agent = MiniOrkAcpAgent(
+            orchestrator_turn=fake_turn,
+            reader=lambda _: {"status": "published", "events": [], "llm_calls": []},
+            poll_interval=0,
+        )
+        resp = asyncio.run(agent.new_session(cwd=str(proj)))
+        sid = resp.session_id
+        asyncio.run(agent.prompt(sid, [_text_block("describe this"), _image_block()]))
+
+    assert len(prompts) == 1
+    prompt = prompts[0]
+    assert "describe this" in prompt
+    home = agent._home_for(sid)
+    expected = home / "attachments" / sid / "0.png"
+    assert f"Attached image: {expected}" in prompt
+    assert expected.is_file()
+    assert expected.read_bytes() == _PNG_BYTES
+
+
+def test_recipe_new_rewrite_survives_with_an_image_block(tmp_path, monkeypatch):
+    """``/recipe new audit migrations`` + an image reaches the orchestrator
+    with the rewrite (not the literal slash command) AND the attachment line.
+    """
+    proj, home = _authoring_project(tmp_path, monkeypatch)
+    prompts: list[str] = []
+    agent, thread = _thread_agent(
+        proj,
+        orchestrator_turn=_drafting_turn(home, prompts, draft=False),
+    )
+    conn = _PermConn([])
+    agent.on_connect(conn)
+    asyncio.run(
+        agent.prompt(
+            thread,
+            [_text_block("/recipe new audit migrations"), _image_block()],
+        )
+    )
+    assert conn.asked == []
+    assert prompts, "orchestrator was not invoked"
+    prompt = prompts[0]
+    # The slash rewrite (containing "create a new recipe") is what the
+    # orchestrator sees — NOT the literal ``/recipe new …``.
+    assert "create a new recipe" in prompt and "audit migrations" in prompt
+    assert "/recipe new" not in prompt
+    expected = home / "attachments" / thread / "0.png"
+    assert f"Attached image: {expected}" in prompt
+
+
+def test_two_image_prompts_in_one_session_keep_their_own_files(tmp_path):
+    """Turn 2's image lands in ``1.png`` instead of overwriting turn 1's ``0.png``."""
+    from unittest.mock import patch
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    fake_lanes = [{"id": "opus", "name": "Opus"}]
+    fake_recipes = ["code-fix"]
+    # Distinct bytes so we can prove each file holds its own payload.
+    png_b = _PNG_BYTES[:-1] + bytes([(_PNG_BYTES[-1] + 1) % 256])
+
+    def fake_turn(lane, prompt, cwd, home, resume, on_event):
+        async def _run():
+            return _Turn()
+
+        return _run()
+
+    with patch(
+        "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+        return_value=fake_lanes,
+    ), patch(
+        "mini_ork.recipes_catalog.list_recipes",
+        return_value=[_recipe(n) for n in fake_recipes],
+    ):
+        agent = MiniOrkAcpAgent(
+            orchestrator_turn=fake_turn,
+            reader=lambda _: {"status": "published", "events": [], "llm_calls": []},
+            poll_interval=0,
+        )
+        resp = asyncio.run(agent.new_session(cwd=str(proj)))
+        sid = resp.session_id
+        asyncio.run(agent.prompt(sid, [_text_block("first"), _image_block(_PNG_BYTES)]))
+        # Mutate the bytes to assert each file holds its own.
+        asyncio.run(agent.prompt(sid, [_text_block("second"), _image_block(png_b)]))
+
+    home = agent._home_for(sid)
+    att_dir = home / "attachments" / sid
+    assert (att_dir / "0.png").is_file()
+    assert (att_dir / "1.png").is_file()
+    assert (att_dir / "0.png").read_bytes() == _PNG_BYTES
+    assert (att_dir / "1.png").read_bytes() == png_b
+
+
+def test_run_slash_command_keeps_the_attachment_lines(tmp_path):
+    """``/run <task>`` + an image: the launched run receives the kickoff
+    text plus the ``Attached image: <path>`` marker.
+    """
+    from unittest.mock import patch
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    fake_lanes = [{"id": "opus", "name": "Opus"}]
+    fake_recipes = ["code-fix"]
+    launched: list[tuple[str, str]] = []
+
+    def fake_turn(lane, prompt, cwd, home, resume, on_event):
+        async def _run():
+            return _Turn()
+
+        return _run()
+
+    original_launch = MiniOrkAcpAgent._launch
+
+    def captured_launch(self, run_id, kickoff_text):
+        launched.append((run_id, kickoff_text))
+        return {"ok": True, "run_id": run_id}
+
+    MiniOrkAcpAgent._launch = captured_launch  # type: ignore[method-assign]
+    try:
+        with patch(
+            "mini_ork.acp_orchestrator.config.orchestrator_lanes",
+            return_value=fake_lanes,
+        ), patch(
+            "mini_ork.recipes_catalog.list_recipes",
+            return_value=[_recipe(n) for n in fake_recipes],
+        ):
+            agent = MiniOrkAcpAgent(
+                orchestrator_turn=fake_turn,
+                reader=lambda _: {"status": "published", "events": [], "llm_calls": []},
+                poll_interval=0,
+            )
+            resp = asyncio.run(agent.new_session(cwd=str(proj)))
+            sid = resp.session_id
+            asyncio.run(
+                agent.prompt(
+                    sid,
+                    [_text_block("/run fix the thing"), _image_block()],
+                )
+            )
+    finally:
+        MiniOrkAcpAgent._launch = original_launch  # type: ignore[method-assign]
+
+    assert len(launched) == 1
+    run_id, kickoff = launched[0]
+    assert run_id.startswith("run-")
+    assert "fix the thing" in kickoff
+    home = agent._home_for(sid)
+    assert f"Attached image: {home / 'attachments' / sid / '0.png'}" in kickoff
