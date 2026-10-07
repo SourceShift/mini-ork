@@ -668,6 +668,93 @@ def _overview_tab(run: Run) -> list[dict[str, Any]]:
             items = [S.dot("No inputs recorded", "The run directory has no kickoff, plan or context pack.")]
         return S.lst("Run inputs", items, note="What it knew going in.")
 
+    def retry_section() -> dict[str, Any] | list[dict[str, Any]]:
+        # Deferred import keeps a cold-path ``run_page`` import from pulling
+        # in ``retry_hint`` (which imports ``db_for`` + ``recipes_catalog``).
+        try:
+            from mini_ork.recovery import retry_hint
+        except Exception:  # noqa: BLE001 — a missing import must not blank the page
+            return []
+        if str(run.card.get("status") or "") not in ("failed", "rolled_back"):
+            return []
+        try:
+            hint = retry_hint.load_or_compute(run.home, run.id, write=False)
+        except Exception:  # noqa: BLE001 — hint crash drops the section, never the page
+            return []
+        if not isinstance(hint, dict):
+            return []
+        needs_change = hint.get("needs_change") if isinstance(hint.get("needs_change"), dict) else None
+        from_node = str(hint.get("from_node") or hint.get("failed_node") or "")
+        strategy = str(hint.get("strategy") or "")
+        # Cost-pause first — the hint carries a ``needs_change: budget`` block,
+        # but the operator action is to lift the cost cap (resume), not to ack
+        # a code change. Treat it as the dedicated branch it is.
+        if hint.get("retryable") and strategy == "resume-cost":
+            return S.lst("Retry", [S.ok(f"Resume this cost-paused run with `mini-ork resume {run.id}`.")],
+                         full=True,
+                         actions=[S.btn("Resume",
+                                        S.cli("board", "retry", run.id,
+                                              confirm=f"Resume cost-paused {run.id}?"),
+                                        "primary")])
+        if needs_change is not None:
+            kind = str(needs_change.get("kind") or "?")
+            summary = str(needs_change.get("summary") or "")
+            detail = str(needs_change.get("detail") or "")
+            evidence = str(needs_change.get("evidence") or "")
+            notes = [str(n) for n in (hint.get("notes") or []) if isinstance(n, str)]
+            if not hint.get("retryable"):
+                # Case 3 (or any case where the change itself must be
+                # revised) — surface the judgement but offer no button so
+                # the operator reads the detail before re-running.
+                items = [S.bad(f"Can't be resumed: {summary}" if summary
+                               else "Can't be resumed")]
+                for note in notes:
+                    items.append(S.dot(note, mc="muted"))
+                head = S.lst("Retry", items, full=True,
+                             note="No retry button — the hint says the change itself must be revised.")
+                if detail:
+                    return [head, S.code("Detail",
+                                         [(ln, "body") for ln in detail.splitlines() or [detail]],
+                                         full=True)]
+                return head
+            items: list[dict[str, Any]] = [S.warn(
+                f"Needs a change before retrying ({kind}): {summary}")]
+            for note in notes:
+                items.append(S.dot(note, mc="muted"))
+            actions: list[dict[str, Any]] = []
+            if evidence and Path(evidence).exists():
+                actions.append(S.btn("Open evidence", S.open_path(evidence), "ghost"))
+            actions.append(S.btn("I fixed it — retry",
+                                 S.cli("board", "retry", run.id, "--ack-change",
+                                       confirm=f"Retry {run.id} after the change?"), "primary"))
+            head = S.lst("Retry", items, full=True, actions=actions,
+                         note="The hint blocked spawning until a change is acknowledged.")
+            if detail:
+                return [head, S.code("Detail",
+                                     [(ln, "body") for ln in detail.splitlines() or [detail]],
+                                     full=True)]
+            return head
+        if hint.get("retryable"):
+            msg = f"Can resume from {from_node}, reusing finished nodes" if from_node \
+                else "Can resume this run, reusing finished nodes"
+            return S.lst("Retry", [S.ok(msg)], full=True,
+                         actions=[S.btn("↻ Retry",
+                                        S.cli("board", "retry", run.id,
+                                              confirm=f"Retry from {from_node}?"
+                                              if from_node else f"Retry {run.id}?"),
+                                        "primary")])
+        # not retryable
+        summary = (needs_change or {}).get("summary") if needs_change else "Not retryable"
+        detail = (needs_change or {}).get("detail") if needs_change else ""
+        items = [S.bad(str(summary) if summary else "Can't be resumed")]
+        head = S.lst("Retry", items, full=True,
+                     note="No retry button — the hint says the change itself must be revised.")
+        if detail:
+            return [head, S.code("Detail",
+                                 [(ln, "body") for ln in detail.splitlines() or [detail]],
+                                 full=True)]
+        return head
+
     def evidence() -> dict[str, Any]:
         items = []
         for p in sorted(d.glob("verifier_*.json")):
@@ -742,7 +829,8 @@ def _overview_tab(run: Run) -> list[dict[str, Any]]:
         note = "From the run's cached diff; the worktree is gone." if run.card.get("files_from_cache") else ""
         return S.lst("Files changed", items, full=True, note=note)
 
-    return (S.guarded(errors, "Run inputs", inputs) + S.guarded(errors, "Why? — evidence", evidence)
+    return (S.guarded(errors, "Retry", retry_section) + S.guarded(errors, "Run inputs", inputs)
+            + S.guarded(errors, "Why? — evidence", evidence)
             + S.guarded(errors, "Correlation", correlation) + S.guarded(errors, "Recent events", recent)
             + S.guarded(errors, "Files changed", files))
 

@@ -427,6 +427,89 @@ def _act_resume(home: Path, run_id: str) -> dict[str, Any]:
     return resume_cost_run(home, run_id, approver="ide")
 
 
+# The board retry verb spawns a ``mini-ork recover`` subprocess under the same
+# detached shape as ``acp.commands._spawn``. We re-bind the import here so the
+# board tests can monkeypatch ``_retry_spawn`` and never actually launch.
+_retry_spawn = None  # populated lazily on first use, see ``_act_retry``
+
+
+def _act_retry(
+    home: Path, run_id: str, *,
+    ack_change: bool = False, force: bool = False, dry_run: bool = False,
+) -> dict[str, Any]:
+    """``board retry <run_id> [--ack-change] [--force] [--dry-run]``.
+
+    Always returns ``{"ok": …, "hint": <hint or null>, …}`` — never raises.
+    The hint itself is computed by ``mini_ork.recovery.retry_hint``; this
+    verb wires the gating rules from the kickoff (``retry-hint.md`` §2):
+
+      * ``--dry-run``         → hint only, never spawns.
+      * no hint              → ``ok: false``, "nothing to retry".
+      * not retryable & !``--force`` → ``ok: false``, error = summary.
+      * needs_change & !``--ack-change`` → ``ok: false``, error = ack prompt.
+      * otherwise            → detached spawn via ``acp.commands._spawn``,
+                               log at ``<run_dir>/recover-<ts>.log``, cwd =
+                               project root, env with ``MINI_ORK_HOME``.
+    """
+    from mini_ork.recovery import retry_hint
+
+    try:
+        hint = retry_hint.load_or_compute(home, run_id, write=True)
+    except Exception as exc:  # noqa: BLE001 — a hint crash must not blank the verb
+        return {"ok": False, "run_id": run_id, "error": f"{type(exc).__name__}: {exc}"}
+
+    if hint is None:
+        return {"ok": False, "run_id": run_id, "error": "nothing to retry"}
+
+    if dry_run:
+        return {"ok": True, "run_id": run_id, "hint": hint, "dry_run": True}
+
+    needs_change = hint.get("needs_change") if isinstance(hint.get("needs_change"), dict) else None
+    retryable = bool(hint.get("retryable"))
+
+    if not retryable and not force:
+        summary = (needs_change or {}).get("summary") or "run is not retryable"
+        return {"ok": False, "run_id": run_id, "hint": hint, "error": summary}
+
+    if needs_change is not None and not ack_change and not force and str(hint.get("strategy") or "") != "resume-cost":
+        return {"ok": False, "run_id": run_id, "hint": hint,
+                "error": f"needs a change first: {needs_change.get('summary') or '?'}"}
+
+    command = str(hint.get("command") or "")
+    if not command:
+        # ``--force`` on a not-retryable hint (e.g. reviewer reject) still
+        # needs a command so the operator gets a recovery to inspect. We
+        # do NOT do this without ``--force`` — a bare retry verb should
+        # refuse to spawn anything when the hint has no command.
+        if force:
+            command = f"mini-ork recover {run_id}"
+        else:
+            return {"ok": False, "run_id": run_id, "hint": hint,
+                    "error": "hint has no command"}
+
+    argv = command.split()
+    if ack_change and "--ack-change" not in argv:
+        argv.append("--ack-change")
+    if force and "--force" not in argv:
+        argv.append("--force")
+
+    global _retry_spawn
+    if _retry_spawn is None:
+        from mini_ork.acp.commands import _spawn as _retry_spawn  # type: ignore[assignment]
+    run_dir = home / "runs" / run_id
+    log_path = run_dir / f"recover-{int(time.time())}.log"
+    env = dict(os.environ)
+    env["MINI_ORK_HOME"] = str(home)
+    try:
+        proc = _retry_spawn(argv, cwd=str(home.absolute().parent), env=env,
+                             stdout_path=log_path)
+    except Exception as exc:  # noqa: BLE001 — spawn failure: surface, do not crash
+        return {"ok": False, "run_id": run_id, "hint": hint,
+                "error": f"spawn failed: {type(exc).__name__}: {exc}"}
+    return {"ok": True, "run_id": run_id, "hint": hint, "pid": proc.pid,
+            "log": str(log_path), "command": command}
+
+
 def _act_gate(home: Path, action: str, inbox_id: str, note: str | None) -> dict[str, Any]:
     """Resolve a ``mo_inbox_gates`` row. ``False`` ⇒ already decided."""
     from mini_ork.gates.oversight_inbox import resolve
@@ -492,6 +575,7 @@ def main(rest: list[str], root: str) -> int:
                          "[gate approve|reject <inbox_id> [--note TEXT]] "
                          "[node <run_id> <node_id> [--view V] [--offset N]] "
                          "[steer <run_id> --role R --severity S --text TEXT] "
+                         "[retry <run_id> [--ack-change] [--force] [--dry-run]] "
                          "[page <key> [--tab T] [--arg k=v]] [--home H] [--json]\n")
         return 2
     # The third positional is meaningful for `gate approve|reject <inbox_id>`
@@ -559,6 +643,10 @@ def main(rest: list[str], root: str) -> int:
         payload = _act_node(home, args.run_id, args.target, args.view, args.offset)
     elif args.verb == "steer":
         payload = _act_steer(home, args.run_id, args.text, args.role, args.severity)
+    elif args.verb == "retry":
+        payload = _act_retry(home, args.run_id,
+                             ack_change=args.ack_change, force=args.force,
+                             dry_run=args.dry_run)
     else:
         payload = act(home, args.verb, args.run_id)
     if reap_errors:
@@ -574,7 +662,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mini-ork board", add_help=False)
     parser.add_argument("verb", nargs="?", default="show",
                         choices=["show", "run", "merge", "discard", "stop", "kill",
-                                 "resume", "gate", "page", "node", "steer"])
+                                 "resume", "retry", "gate", "page", "node", "steer"])
     parser.add_argument("run_id", nargs="?")
     # `gate approve|reject <inbox_id>` puts the action in run_id and the id here;
     # `node <run_id> <node_id>` uses the same slot for the node id (the L464
@@ -600,6 +688,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="steer severity: info|warn|critical (default: info)")
     parser.add_argument("--text", default=None,
                         help="steer message text")
+    parser.add_argument("--ack-change", action="store_true",
+                        help="retry: acknowledge the hint's needs_change block "
+                             "(otherwise the verb refuses to spawn).")
+    parser.add_argument("--force", action="store_true",
+                        help="retry: bypass the retryable=false gate (e.g. for "
+                             "case-3 'code' revisions).")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="retry: return the hint only, never spawn.")
     return parser
 
 
