@@ -249,6 +249,18 @@ def _first_failed_node(run_dir: Path, recipe: str, home: Path
     return None, {}
 
 
+def _failed_review(run_dir: Path, recipe: str, home: Path
+                   ) -> tuple[str | None, dict[str, Any] | None]:
+    """The first reviewer/judge (topo order) whose verdict asks for a revision."""
+    nodes, edges = _recipe_workflow(home, recipe)
+    name_to_node = {str(n.get("name")): n for n in nodes if n.get("name")}
+    for name in _topo_order(nodes, edges):
+        review = _node_artifacts(run_dir, name, name_to_node.get(name, {})).get("review")
+        if isinstance(review, dict) and _review_failed(review):
+            return name, review
+    return None, None
+
+
 def _earlier_verifiers_passed(run_dir: Path, nodes: list[dict[str, Any]],
                               edges: list[dict[str, Any]], target: str) -> bool:
     """True when every verifier node earlier in topo order has a passing artefact."""
@@ -344,12 +356,19 @@ def _extract_review_detail(text: str) -> str:
     """
     if not text:
         return ""
+    data: Any = None
     try:
         data = json.loads(text)
     except (ValueError, TypeError):
-        # The review file may have a banner line or trailing log; the JSON
-        # object is the only thing we want to read from.
-        return ""
+        # A banner line or trailing log around the object: decode the first
+        # JSON object that parses.
+        decoder = json.JSONDecoder()
+        for start in (i for i, ch in enumerate(text) if ch == "{"):
+            try:
+                data, _end = decoder.raw_decode(text, start)
+                break
+            except ValueError:
+                continue
     if not isinstance(data, dict):
         return ""
     for key in ("reasons", "notes"):
@@ -562,23 +581,21 @@ def _case_code(failed_name: str | None,
 
       1. Reviewer reasons (when ``review`` is needs_revision/reject/fail).
          The reviewer is authoritative on rework — its language wins.
-      2. A REFUTED/FAIL sibling's reason. The target may be UNVERIFIED (case 2
-         filtered out), but a parallel REFUTED means the code itself is wrong
-         and the operator must see THAT verifier's reason — not an empty
-         string from the UNVERIFIED target.
-      3. The target verifier's own reason (only when it is REFUTED/FAIL —
-         UNVERIFIED is empty here on purpose).
+      2. The target verifier's own reason, when it is REFUTED/FAIL.
+      3. A REFUTED/FAIL sibling's reason: the target may be UNVERIFIED (case 2
+         filtered out), but a REFUTED sibling means the code itself is wrong,
+         so the operator sees THAT verifier's reason, not an empty string.
     """
     summary = "The change was judged wrong — it needs a revision"
     detail = ""
     if isinstance(review, dict) and _review_failed(review):
         detail = _extract_review_detail(str(review.get("text") or ""))
-    if not detail and isinstance(sibling_hard_fail, dict):
-        detail = _verifier_reason(sibling_hard_fail)
     if not detail and isinstance(verifier, dict):
         status = str(verifier.get("status") or "").upper()
         if status != "UNVERIFIED":
             detail = _verifier_reason(verifier)
+    if not detail and isinstance(sibling_hard_fail, dict):
+        detail = _verifier_reason(sibling_hard_fail)
     if not detail:
         return None  # case 2 already filtered; nothing left to report
     return {
@@ -758,6 +775,14 @@ def compute(home: Path, run_id: str) -> dict[str, Any] | None:
     # Case 1 — cost-pause sentinel
     if (run_dir / ".cost-pause").is_file():
         return _case_cost_pause(run_id)
+
+    # A reviewer that asked for a revision outranks any verifier outcome: the
+    # change was judged wrong, so retrying it unchanged cannot help.
+    review_name, failed_review = _failed_review(run_dir, recipe, home)
+    if failed_review is not None:
+        code = _case_code(review_name, None, failed_review, run_id, sibling_hard_fail=None)
+        if code is not None:
+            return code
 
     failed_name, artifacts = _first_failed_node(run_dir, recipe, home)
     verifier = artifacts.get("verifier") if isinstance(artifacts.get("verifier"), dict) else None

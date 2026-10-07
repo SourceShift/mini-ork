@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import shutil
 import sqlite3
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -219,8 +220,33 @@ def test_case_2_only_when_earlier_verifiers_passed(home: Path) -> None:
                      "reason": "compile error"})
     hint = retry_hint.compute(home, RUN)
     assert hint is not None
-    # earlier static_check did NOT pass → not the verify/environment case
-    assert hint["needs_change"]["kind"] != "environment"
+    # A REFUTED verifier anywhere means the code is wrong: a code change, with
+    # that verifier's reason.
+    assert hint["needs_change"]["kind"] == "code"
+    assert "compile error" in hint["needs_change"]["detail"]
+
+
+def test_reviewer_needs_revision_beats_an_unverified_check(home: Path) -> None:
+    """A reviewer asking for a revision outranks a verifier that could not reach
+    a surface: retrying unchanged cannot help, so it is a code change."""
+    run_dir = _seed_run(home, RUN, status="failed")
+    _write_verifier(run_dir, "live_smoke",
+                    {"verifier": "live_smoke", "pass": False, "status": "UNVERIFIED",
+                     "reason": "unreachable surface"})
+    (run_dir / "review-reviewer.json").write_text(json.dumps({
+        "verdict": "needs_revision",
+        "reasons": ["the migration drops a column", "no test for the empty case"],
+    }))
+    hint = retry_hint.compute(home, RUN)
+    assert hint is not None
+    assert hint["retryable"] is False
+    assert hint["needs_change"]["kind"] == "code"
+    assert hint["needs_change"]["detail"].splitlines()[0] == "the migration drops a column"
+
+
+def test_review_reasons_survive_a_banner_line() -> None:
+    text = 'warning: noise {not json}\n{"verdict": "needs_revision", "reasons": ["a", "b"]}\ntrailing log'
+    assert retry_hint._extract_review_detail(text) == "a\nb"
 
 
 def test_case_3_when_refuted_sibling_sits_before_unverified(home: Path) -> None:
@@ -633,7 +659,7 @@ def test_board_retry_not_retryable_with_force_spawns(home: Path, monkeypatch) ->
     # Case 3 hints carry no command (the verb falls back to the bare
     # ``mini-ork recover <run>``), and ``--force`` is appended last.
     assert "argv" in captured
-    assert captured["argv"][0].endswith("/python3.11") or captured["argv"][0].endswith("/python")
+    assert captured["argv"][0] == sys.executable
     assert captured["argv"][1].endswith("/bin/mini-ork")
     assert captured["argv"][2:4] == ["recover", RUN]
     # ``--force`` does NOT imply ``--ack-change`` — the two are independent
@@ -681,7 +707,7 @@ def test_board_retry_resume_cost_spawns_resume(home: Path, monkeypatch) -> None:
     assert payload["ok"] is True
     # The canonical spawn shape: ``sys.executable + bin/mini-ork + resume + run``.
     # No ``--ack-change``/``--force`` even when the operator did not pass them.
-    assert captured["argv"][0].endswith("/python3.11") or captured["argv"][0].endswith("/python")
+    assert captured["argv"][0] == sys.executable
     assert captured["argv"][1].endswith("/bin/mini-ork")
     assert captured["argv"][2:] == ["resume", RUN]
 
@@ -789,3 +815,17 @@ def test_run_page_drops_retry_section_on_hint_crash(home: Path, monkeypatch) -> 
     # Retry section is silently dropped, but the rest of the page survives.
     assert "Retry" not in titles
     assert any(s["title"] == "Run inputs" for s in page["sections"])
+
+def test_a_refuted_target_reports_its_own_reason(home: Path) -> None:
+    """Two REFUTED checks: the first failed one reports its own reason."""
+    run_dir = _seed_run(home, RUN, status="failed")
+    _write_verifier(run_dir, "live_smoke",
+                    {"verifier": "live_smoke", "pass": False, "status": "REFUTED",
+                     "reason": "the capture returned 500"})
+    _write_verifier(run_dir, "static-check",
+                    {"verifier": "static-check", "pass": False, "status": "REFUTED",
+                     "reason": "lint E501"})
+    hint = retry_hint.compute(home, RUN)
+    assert hint is not None and hint["needs_change"]["kind"] == "code"
+    assert hint["failed_node"] == "live_smoke"
+    assert "the capture returned 500" in hint["needs_change"]["detail"]
