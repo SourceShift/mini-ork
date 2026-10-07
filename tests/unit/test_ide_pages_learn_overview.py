@@ -364,7 +364,10 @@ def test_recent_learning_events_one_of_each_kind(home: Path) -> None:
     titles = " | ".join(i["t"] for i in items)
     assert "Pattern approved" in titles
     assert "Memory retired" in titles
-    assert "Promotion" in titles
+    # Promotion rows now carry the plain-word label (/target) instead of
+    # "Promotion {decision}". The seed has no apply_attempts row, so the target
+    # falls back to the candidate id and a promoted decision reads "Applied".
+    assert "Applied" in titles
     assert "mini-ork issue: mini-ork issue A" in titles
     # The non-learning bug and the old bug are filtered out.
     assert "other" not in titles
@@ -377,7 +380,7 @@ def test_recent_learning_events_one_of_each_kind(home: Path) -> None:
         "mini-ork issue: mini-ork issue A",
         "Memory retired: old memory",
         "Pattern approved: lesson text a",
-        "Promotion promoted: cand-1",
+        "Applied: cand-1",
     ]
     assert [i["t"] for i in items] == expected
 

@@ -13,10 +13,12 @@ from typing import Any
 
 from mini_ork.ide_pages import spec as S
 from mini_ork.ide_pages.learn._common import count, db, outcome_colour, short
+from mini_ork.learning.promotion_explain import decisions
 
 
 def sections(home: Path, args: dict[str, str], errors: dict[str, str]) -> list[dict[str, Any]]:
-    return (S.guarded(errors, "Loop", lambda: _loop(home))
+    return (S.guarded(errors, "Changes proposed to your prompts", lambda: _changes(home, args))
+            + S.guarded(errors, "Loop", lambda: _loop(home))
             + S.guarded(errors, "Candidate", lambda: _candidate(home))
             + S.guarded(errors, "Self-improve ledger", lambda: _ledger(home))
             + S.guarded(errors, "Health probes", lambda: _health(home))
@@ -32,6 +34,95 @@ def _latest_promotion(conn) -> dict[str, Any] | None:
                      "decision, decided_at, decided_by, rationale FROM promotion_records "
                      "ORDER BY decided_at DESC LIMIT 1")
     return rows[0] if rows else None
+
+
+def _repo_root(home: Path) -> Path:
+    """The project root that owns ``recipes/``.
+
+    ``home`` is the state.db dir; in the live layout that is ``<root>/.mini-ork``,
+    so prefer the parent when it carries ``recipes/``. Page tests use a bare
+    home with no recipes tree, so fall back to ``home`` itself.
+    """
+    if (home / "recipes").is_dir():
+        return home
+    if (home.parent / "recipes").is_dir():
+        return home.parent
+    return home
+
+
+def _changes(home: Path, args: dict[str, str]) -> list[dict[str, Any]]:
+    """Every change proposed to a recipe prompt, in plain words.
+
+    Rows come from :func:`mini_ork.learning.promotion_explain.decisions`; test
+    runs (the ``gr-smoke*`` sources) are hidden unless ``args['tests'] == '1'``.
+    When ``args['decision']`` is set, its full detail renders before the table.
+    """
+    root = _repo_root(home)
+    rows = decisions(db(home), root)
+    show_tests = str(args.get("tests") or "") == "1"
+    selected = str(args.get("decision") or "")
+    out: list[dict[str, Any]] = []
+    if selected:
+        row = next((r for r in rows if r["candidate"] == selected), None)
+        if row is not None:
+            out.extend(_change_detail(row, root))
+    visible = [r for r in rows if show_tests or not r["test_run"]]
+    out.append(_changes_table(visible, show_tests, selected))
+    return out
+
+
+def _change_detail(row: dict[str, Any], root: Path) -> list[dict[str, Any]]:
+    """The full-proposal + full-rationale detail rendered before the table."""
+    title = f"{row['label']} · {row['target']}"
+    body = [f"**Proposed change**\n\n{row['proposal'] or '—'}",
+            f"**Why**\n\n{row['reason']}"]
+    if row["rationale"]:
+        body.append("\n".join(f"> {line}" for line in row["rationale"].splitlines()))
+    if row["signal"]:
+        body.append(f"**Observation**\n\n{row['signal']}")
+    if row["suggested_change"]:
+        body.append(f"**Suggested change**\n\n{row['suggested_change']}")
+
+    live = str(row.get("live_path") or "")
+    before, after = row.get("utility_before"), row.get("utility_after")
+    utility = (f"{float(before):.2f} → {float(after):.2f}"
+               if isinstance(before, (int, float)) and isinstance(after, (int, float)) else "—")
+    acts = [S.btn("Open prompt", S.open_path(str(root / live)), "ghost")] if live else []
+    acts.append(S.btn("Close", S.set_args()))
+    note = ("This change is in your prompt but was never measured."
+            if row["label"] == "Applied without evaluation" and live else "")
+    return [
+        S.markdown(title, "\n\n".join(body), full=True),
+        S.kv(f"{title} · decision", [
+            ("Decided at", str(row.get("decided_at_iso") or "")[:16] or "—"),
+            ("Utility", utility),
+            ("In use", live or "—"),
+        ], full=True, actions=acts, note=note),
+    ]
+
+
+def _changes_table(rows: list[dict[str, Any]], show_tests: bool, selected: str) -> dict[str, Any]:
+    cols = [S.col(84), S.col(fr=1, min=0), S.col(140), S.col(240)]
+    head = ["date", "change", "outcome", "in use"]
+    out_rows: list[dict[str, Any]] = []
+    for r in rows:
+        label = f"{r['target']} ({r['task_class']}): {r['proposal'][:110]}" if r["task_class"] \
+            else f"{r['target']}: {r['proposal'][:110]}"
+        out_rows.append({
+            "cells": [S.mono(str(r.get("decided_at_iso") or "")[:10]), S.cell(label),
+                      S.cell(r["label"], r["colour"]), S.mono(r["live_path"] or "—")],
+            "do": S.set_args(decision=r["candidate"]),
+            "sel": r["candidate"] == selected,
+        })
+    if not out_rows:
+        out_rows = [{"cells": [S.muted("—"), S.muted("No changes proposed yet"), "", ""]}]
+    toggle = S.btn("Hide test runs" if show_tests else "Show test runs",
+                   S.set_args(tests="" if show_tests else "1"))
+    return S.table("Changes proposed to your prompts", cols, head, out_rows, full=True,
+                   actions=[toggle],
+                   note="Every change mini-ork proposed to a recipe prompt, newest first. "
+                        "Green = applied and measured; muted = never measured; red = it broke "
+                        "a task the old prompt solved.")
 
 
 def _loop(home: Path) -> dict[str, Any]:

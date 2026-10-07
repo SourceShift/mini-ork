@@ -14,7 +14,8 @@ from pathlib import Path
 from typing import Any
 
 from mini_ork.ide_pages import spec as S
-from mini_ork.ide_pages.learn._common import db, outcome_colour, short
+from mini_ork.ide_pages.learn._common import db, short
+from mini_ork.learning.promotion_explain import decisions
 
 DAY = 86400
 _PASS = {"published", "completed", "success"}
@@ -488,28 +489,26 @@ def _recent_learning_events(home: Path, now: int) -> dict[str, Any]:
                 date = _iso_date(ts)
                 pairs.append((ts, S.warn(f"Memory retired: {text[:140]}", f"{date} · {reason}")))
 
-    # 3. promotion_records (any decision within 14 days).
+    # 3. promotion_records (any decision within 14 days). Each row is explained
+    # in plain words — *why* it was quarantined or applied — and flagged when
+    # the applied change is still live in a recipe prompt.
     if conn.has_table("promotion_records"):
-        cols = {r["name"] for r in conn.rows("PRAGMA table_info(promotion_records)")}
-        if {"decided_at", "decision", "candidate_id"} <= cols:
-            iso_cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(cutoff))
-            rows = conn.rows(
-                "SELECT promotion_id, candidate_id, decision, decided_at, "
-                "utility_before, utility_after FROM promotion_records "
-                "WHERE decided_at >= ? ORDER BY decided_at DESC LIMIT 12", (iso_cutoff,))
-            for r in rows:
-                decision = str(r.get("decision") or "?")
-                cand = str(r.get("candidate_id") or "")
-                iso_ts = str(r.get("decided_at") or "")
-                ts = _iso_to_epoch(iso_ts)
-                before = r.get("utility_before")
-                after = r.get("utility_after")
-                utility = (f"utility {before:.2f} → {after:.2f}"
-                           if isinstance(before, (int, float)) and isinstance(after, (int, float))
-                           else "")
-                date = iso_ts[:10] if iso_ts else ""
-                pairs.append((ts, S.item(f"Promotion {decision}: {cand}", f"{date} · {utility}".strip(" ·"),
-                              mc=outcome_colour(decision))))
+        for d in decisions(conn, _repo_root(home), limit=12):
+            ts = int(d.get("decided_at") or 0)
+            if ts < cutoff:
+                continue
+            date = _iso_date(ts)
+            sub = f"{date} · {d['reason']}".strip(" ·")
+            if d.get("live_path"):
+                sub += f" · in use in {d['live_path']}"
+            if d.get("test_run"):
+                sub += " · test run"
+            target = str(d.get("target") or d.get("candidate") or "")
+            task_class = str(d.get("task_class") or "")
+            title = f"{d['label']}: {target}" + (f" ({task_class})" if task_class else "")
+            pairs.append((ts, S.item(
+                title, sub, mc=d["colour"],
+                acts=[S.page_link("learn", "improve", decision=d["candidate"])])))
 
     # 4. bug_reports with agent_role='learning' (first_seen_at within 14 days).
     if conn.has_table("bug_reports"):
@@ -555,6 +554,20 @@ def _iso_date(epoch: int) -> str:
     if not epoch:
         return ""
     return time.strftime("%Y-%m-%d", time.gmtime(int(epoch)))
+
+
+def _repo_root(home: Path) -> Path:
+    """The project root that owns ``recipes/``.
+
+    ``home`` is the state.db dir; in the live layout that is ``<root>/.mini-ork``,
+    so prefer the parent when it carries ``recipes/``. Page tests use a bare
+    home with no recipes tree, so fall back to ``home`` itself.
+    """
+    if (home / "recipes").is_dir():
+        return home
+    if (home.parent / "recipes").is_dir():
+        return home.parent
+    return home
 
 
 def _iso_to_epoch(iso_ts: str) -> int:
