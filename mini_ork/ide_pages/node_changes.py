@@ -84,7 +84,9 @@ def build_changes_view(run: Run, node: Node) -> dict[str, Any]:
          "diff": <unified diff text, capped>,
          "diff_note": str,
          "commits": [{sha, subject, when, author, files}],
-         "commits_note": str}
+         "commits_note": str,
+         "agent_edits": [{path, tool, added, removed, diff}],
+         "agent_edits_note": str}
     """
     # Fix #4 + #5: load diffs once per build; pass ``run`` so the git
     # fallback can resolve ``run.workspace`` (base_sha / branch / path).
@@ -95,6 +97,7 @@ def build_changes_view(run: Run, node: Node) -> dict[str, Any]:
     diff, cap_note = _diff_text(files, diff_entries, diff_text) if show_diff else ("", "")
     diff_note = " ".join(n for n in (files_note, cap_note) if n)
     commits, commits_note = _commits(run)
+    agent_edits, agent_edits_note = _agent_edits(run, node)
     return {
         "result": {"title": title, "items": items},
         "files": files,
@@ -102,6 +105,8 @@ def build_changes_view(run: Run, node: Node) -> dict[str, Any]:
         "diff_note": diff_note,
         "commits": commits,
         "commits_note": commits_note,
+        "agent_edits": agent_edits,
+        "agent_edits_note": agent_edits_note,
     }
 
 
@@ -1036,6 +1041,66 @@ def _parse_commits(output: str) -> list[dict[str, Any]]:
 
 
 # ── shared helpers ──────────────────────────────────────────────────────────
+
+
+def _agent_edits(run: Run, node: Node) -> tuple[list[dict[str, Any]], str]:
+    """Per-edit diff body extracted from the node's session transcript.
+
+    Each entry: ``{"path", "tool", "added", "removed", "diff"}`` —
+    ``- old`` / ``+ new`` lines, full length per edit, capped at
+    :data:`DIFF_LINES_CAP` (from ``node_artifacts``) lines TOTAL across the
+    whole list.
+
+    Returns ``(items, note)`` where ``note`` is:
+      * ``""``  when there is no session,
+      * ``"This node edited no files."`` when there is a transcript with no
+        edit-family tool calls.
+
+    Lazy-imports :mod:`mini_ork.ide_pages.node_artifacts` to reuse its
+    edit-family tool scan + diff rendering (the writer of this view),
+    avoiding a duplicate transcript parser.
+    """
+    from mini_ork.ide_pages.node import _resolve_session_path  # lazy
+    from mini_ork.ide_pages.node_artifacts import (  # lazy: sibling module
+        DIFF_LINES_CAP, edit_tool_calls, render_edit_diff,
+    )
+    try:
+        session_path = _resolve_session_path(run, node)
+    except Exception:  # noqa: BLE001
+        return [], ""
+    if session_path is None:
+        return [], ""
+    calls = edit_tool_calls(session_path)
+    if not calls:
+        return [], "This node edited no files."
+    items: list[dict[str, Any]] = []
+    lines_used = 0
+    for tool_name, file_path, inp in calls:
+        body = render_edit_diff(tool_name, file_path, inp)
+        body_lines = body.splitlines()
+        added = sum(1 for ln in body_lines if ln.startswith("+ "))
+        removed = sum(1 for ln in body_lines if ln.startswith("- "))
+        remaining = DIFF_LINES_CAP - lines_used
+        truncated = remaining <= 0
+        if truncated:
+            break
+        if len(body_lines) > remaining:
+            body_lines = body_lines[:remaining]
+            truncated = True
+        diff_text = "\n".join(body_lines)
+        added = sum(1 for l in body_lines if l.startswith("+ "))
+        removed = sum(1 for l in body_lines if l.startswith("- "))
+        items.append({
+            "path": file_path,
+            "tool": tool_name,
+            "added": added,
+            "removed": removed,
+            "diff": diff_text,
+        })
+        lines_used += len(body_lines)
+        if truncated:
+            break
+    return items, ""
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:

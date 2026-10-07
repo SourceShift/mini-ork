@@ -78,7 +78,7 @@ _KIND_STEER = "steer"
 _KIND_NOTE = "note"
 
 _DEFAULT_VIEW = "overview"
-_VIEWS = ("stream", "output", "prompt", "telemetry", "learning", "changes", "overview")
+_VIEWS = ("stream", "output", "prompt", "telemetry", "learning", "changes", "overview", "artifacts")
 
 # Map a node's ``type`` (workflow role) onto an ``operator_steering`` role.
 # ``_fetch_steer_rows`` keys on this map so the IDE stream shows only rows
@@ -3345,6 +3345,9 @@ def build_node(home: Path, run_id: str, node_id: str, view: str | None = None,
         base.update(build_changes_view(run_obj, target))
     elif view == "overview":
         base.update(_overview_view(run_obj, target, session_path, run_dir))
+    elif view == "artifacts":
+        from mini_ork.ide_pages.node_artifacts import build_artifacts_view  # lazy: breaks import cycle
+        base["artifacts"] = build_artifacts_view(run_obj, target)
     return base
 
 
