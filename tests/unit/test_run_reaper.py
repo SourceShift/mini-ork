@@ -64,7 +64,7 @@ def _event(home: Path, run_id: str, event_type: str, node_id: str, at: int) -> N
     con = sqlite3.connect(home / "state.db")
     con.execute(
         "INSERT INTO run_events(event_id, run_id, event_type, payload_json, created_at) VALUES (?,?,?,?,?)",
-        (f"evt-{event_type}-{node_id}-{at}", run_id, event_type, json.dumps({"node_id": node_id}), at))
+        (f"evt-{run_id}-{event_type}-{node_id}-{at}", run_id, event_type, json.dumps({"node_id": node_id}), at))
     con.commit()
     con.close()
 
@@ -101,6 +101,23 @@ def test_a_pid_file_whose_process_is_gone_is_reaped_as_a_crash(home: Path) -> No
                        "AND event_type = 'node_end'").fetchone()[0]
     con.close()
     assert ends == 1
+
+
+def test_runs_sharing_a_node_id_are_closed_in_one_pass(home: Path) -> None:
+    # Regression: the synthetic node_end key had no run id, so the second run
+    # with a dangling "implementer" in the same second hit UNIQUE(event_id)
+    # and aborted the pass (researcher backfill, 2026-10-07).
+    started = int(time.time()) - 30
+    for run_id in ("run-a", "run-b", "run-c"):
+        _write_pid(_seed(home, run_id), _dead_pid())
+        _event(home, run_id, "node_start", "implementer", started)
+
+    assert sorted(r["run_id"] for r in run_reaper.reap(home)) == ["run-a", "run-b", "run-c"]
+    con = sqlite3.connect(home / "state.db")
+    closed = dict(con.execute("SELECT run_id, COUNT(*) FROM run_events WHERE event_type = 'node_end' "
+                              "GROUP BY run_id").fetchall())
+    con.close()
+    assert closed == {"run-a": 1, "run-b": 1, "run-c": 1}
 
 
 def test_a_live_owner_is_left_alone(home: Path) -> None:

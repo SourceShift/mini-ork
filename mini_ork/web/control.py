@@ -517,7 +517,10 @@ def _close_dangling_node_events(db: StateDB, task_run_id: str) -> None:
                 INSERT INTO run_events(event_id, run_id, event_type, payload_json, created_at)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (f"evt-node_end-{nid}-killclose-{now}", task_run_id, "node_end", json.dumps(payload), now),
+                # The run id keeps the key unique when several runs that share
+                # a node id are closed in the same second (the run reaper).
+                (f"evt-node_end-{task_run_id}-{nid}-killclose-{now}", task_run_id, "node_end",
+                 json.dumps(payload), now),
             )
         con.commit()
     except sqlite3.OperationalError:
