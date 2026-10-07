@@ -988,7 +988,12 @@ def _entries_from_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]
             # message's ``content`` as a plain ``str``. The first user
             # entry IS the prompt; a ``tool_result`` envelope must never
             # be taken as the prompt.
-            if not first_user_done:
+            # A live sidecar (stream-json) has no prompt record: its first
+            # user record is a tool_result and must reach the tool path below.
+            has_tool_result = isinstance(content, list) and any(
+                isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+            )
+            if not first_user_done and not has_tool_result:
                 first_user_done = True
                 text = _extract_user_text(content)
                 if text:
@@ -2658,7 +2663,7 @@ def _overview_view(run: Run, node: Node, session_path: Path | None,
     facts = _overview_facts(run, node, run_dir, session_path)
     title, items = _result_items(run, node)
     final = _overview_final(session_path)
-    links = _overview_links(run_dir, node.id)
+    links = _overview_links(run_dir, node.id, _verifier_stem(node) if str(node.type or "") == "verifier" else "")
     return {
         "headline": headline,
         "facts": facts,
@@ -2683,25 +2688,34 @@ def _overview_headline(run: Run, node: Node, run_dir: Path,
     * planner → ``plan.json``'s ``objective``.
     * built-in (verifier / publisher / rollback / shell / gate / transform)
       → last execute.log line.
-    * any failed node → failure reason first (``finish_reason``, llm_call
-      ``error_message``, last log line).
+    * any other failed node → failure reason first (``finish_reason``,
+      llm_call ``error_message``, last log line); reviewers and verifiers keep
+      their verdict / checks headline (in red), which explains the failure.
 
     ``changes`` is passed through (computed once in :func:`_overview_view`)
     so the implementer branch does not re-invoke
     :func:`build_changes_view` on the same node.
     """
-    # Failed-node headline first — surface the failure before any per-kind text.
     failure = _overview_failure_reason(run, node, run_dir)
-    if failure:
-        return {"t": failure, "c": "red"}
-
     ntype = str(node.type or "")
 
-    if _is_review_node(node):
-        return _overview_reviewer_headline(run_dir, node)
+    # A reviewer's verdict and a verifier's checks ARE the explanation of a
+    # failure ("needs_revision — …", "UNVERIFIED: …"), so they win over the
+    # bare finish reason; red when the node failed.
+    if _is_review_node(node) or ntype in ("verifier", "test", "typecheck", "static_check"):
+        kind = (_overview_reviewer_headline(run_dir, node) if _is_review_node(node)
+                else _overview_verifier_headline(run_dir, node))
+        if kind.get("t") and kind.get("c") != "sub":
+            if failure:
+                kind = {**kind, "c": "red"}
+            return kind
+        if failure:
+            return {"t": failure, "c": "red"}
+        return kind
 
-    if ntype in ("verifier", "test", "typecheck", "static_check"):
-        return _overview_verifier_headline(run_dir, node)
+    # Elsewhere the failure reason comes first.
+    if failure:
+        return {"t": failure, "c": "red"}
 
     if ntype in _CODE_CHANGING_TYPES:
         return _overview_implementer_headline(changes or build_changes_view(run, node))
@@ -2792,7 +2806,7 @@ def _overview_reviewer_headline(run_dir: Path, node: Node) -> dict[str, str]:
         if verdict:
             color = _VERDICT_COLOUR_FOR_OVERVIEW.get(verdict, "sub")
             if first_reason:
-                return {"t": f"{verdict} — {first_reason}", "c": color}
+                return {"t": _clip(" ".join(f"{verdict} — {first_reason}".split())), "c": color}
             return {"t": f"{verdict}", "c": color}
     # Fall back to the markdown report's first heading.
     return _overview_lens_headline(run_dir, node)
@@ -2854,14 +2868,20 @@ def _overview_verifier_headline(run_dir: Path, node: Node) -> dict[str, str]:
                 return {"t": f"{len(failed)} of {total} checks failed: {first_name}",
                         "c": "red"}
             return {"t": f"all {total} checks passed", "c": "green"}
-        # Executor shape.
+        # Executor / live-smoke shape: a status word and a reason.
         if "pass" in vjson:
             if vjson.get("pass") is False:
-                reason = str(vjson.get("error_summary")
-                             or vjson.get("verifier") or "no reason recorded")
-                return {"t": f"UNVERIFIED: {reason}", "c": "red"}
+                status = str(vjson.get("status") or "UNVERIFIED").upper()
+                reason = " ".join(str(vjson.get("reason") or vjson.get("error_summary")
+                                      or vjson.get("verifier") or "no reason recorded").split())
+                return {"t": _clip(f"{status}: {reason}"), "c": "red"}
             return {"t": "verifier passed", "c": "green"}
     return {"t": f"verifier · {node.id}", "c": "sub"}
+
+
+def _clip(text: str, limit: int = 240) -> str:
+    """A headline is one glance long; the full text is in the result below."""
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
 def _overview_implementer_headline(changes: dict[str, Any]) -> dict[str, str]:
@@ -3039,16 +3059,15 @@ def _overview_turns(run: Run, node: Node,
     if session_path is None:
         session_path = _resolve_session_path(run, node)
     if session_path is not None:
+        turns: int | None = None
         for rec in _records_decoded(session_path):
             if str(rec.get("type") or "") != "result":
                 continue
-            nt = rec.get("num_turns")
-            if nt is None:
-                continue
             try:
-                return int(nt)
+                turns = int(rec.get("num_turns"))  # the last round's count wins
             except (TypeError, ValueError):
-                return None
+                continue
+        return turns
     return None
 
 
@@ -3066,7 +3085,8 @@ def _records_decoded(session_path: Path | None) -> list[dict[str, Any]]:
 
 
 def _overview_final(session_path: Path | None) -> dict[str, Any]:
-    """The agent's final message — ``result`` text else last assistant text block.
+    """The agent's final message — the last ``result`` text, else the last
+    assistant text block.
 
     Capped at :data:`USER_FULL_CAP` (200,000 chars).
     """
@@ -3075,9 +3095,12 @@ def _overview_final(session_path: Path | None) -> dict[str, Any]:
     for rec in _records_decoded(session_path):
         typ = str(rec.get("type") or "")
         if typ == "result":
+            # A revise loop runs the agent again in the same sidecar: the LAST
+            # result is the node's answer now.
             res = str(rec.get("result") or "")
             if res:
-                return {"text": res[:USER_FULL_CAP]}
+                text = res
+            continue
         if typ == "assistant":
             msg = rec.get("message") if isinstance(rec.get("message"), dict) else {}
             content = msg.get("content") if isinstance(msg, dict) else None
@@ -3093,7 +3116,7 @@ def _overview_final(session_path: Path | None) -> dict[str, Any]:
     return {"text": text[:USER_FULL_CAP]}
 
 
-def _overview_links(run_dir: Path, node_id: str) -> list[dict[str, str]]:
+def _overview_links(run_dir: Path, node_id: str, stem: str = "") -> list[dict[str, str]]:
     """``[{"label", "path"}]`` for the node's own artefacts that exist.
 
     Mirrors the kickoff §2 named artefacts: review JSON, lens report,
@@ -3103,11 +3126,14 @@ def _overview_links(run_dir: Path, node_id: str) -> list[dict[str, str]]:
     candidates: list[tuple[str, Path]] = [
         ("Review", run_dir / f"review-{node_id}.json"),
         ("Impl log", run_dir / f"impl-{node_id}.log"),
-        ("Verifier log", run_dir / f"verifier_{node_id}.log"),
         ("Needs change", run_dir / "NEEDS-CHANGE.md"),
         ("Lens report", run_dir / f"lens-{node_id}.md"),
-        ("Verdict", run_dir / "verdict.json"),
     ]
+    if stem:
+        candidates[2:2] = [
+            ("Verifier log", run_dir / f"verifier-{stem}.log"),
+            ("Verifier result", run_dir / f"verifier_{stem}.json"),
+        ]
     try:
         for report in _report_paths(run_dir, node_id):
             label = "Report" if not _candidates_with_path(report, candidates) else None

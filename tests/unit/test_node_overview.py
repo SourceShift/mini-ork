@@ -792,3 +792,50 @@ def test_overview_verifier_headline_survives_deprecation_warning_prefix_node_id(
     headline = _overview_verifier_headline(run_dir, target)
     assert headline["t"] == "all 1 checks passed"
     assert headline["c"] == "green"
+
+# ── real stream-json sidecar shape (Opus review, finished directly) ─────────
+
+
+def _stream_json_sidecar(results: list[str]) -> list[dict]:
+    """A realistic Claude stream-json sidecar: init, a tool call and its
+    result (no prompt record), then one ``result`` per round."""
+    records: list[dict] = [
+        {"type": "system", "subtype": "init", "session_id": "sid-rv"},
+        {"type": "assistant", "session_id": "sid-rv", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "tu-1", "name": "Bash", "input": {"command": "ls $RD"}}]}},
+        {"type": "user", "session_id": "sid-rv", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "tu-1", "content": "review-diff.patch\nplan.json"}]}},
+    ]
+    for i, text in enumerate(results, 1):
+        records.append({"type": "assistant", "session_id": "sid-rv", "message": {"role": "assistant",
+                        "content": [{"type": "text", "text": f"round {i} thinking"}]}})
+        records.append({"type": "result", "session_id": "sid-rv", "result": text, "num_turns": 10 * i})
+    return records
+
+
+def test_a_stream_json_sidecar_keeps_its_first_tool_call(home: Path) -> None:
+    run_id = "run-sidecar-tool"
+    _insert_run(home, run_id=run_id)
+    _insert_node_events(home, run_id, node_id="reviewer", ntype="reviewer", lane="reviewer", finish="done")
+    run_dir = home / "runs" / run_id
+    (run_dir / ".sessions").mkdir(parents=True, exist_ok=True)
+    (run_dir / ".sessions" / "reviewer.session").write_text("sid-missing\n")
+    _write_live_only(run_dir, "reviewer", session_id="sid-rv", records=_stream_json_sidecar(["the verdict"]))
+
+    out = build_node(home, run_id, "reviewer", view="stream")
+    tools = [e for e in out["entries"] if e.get("head") == "Bash"]
+    assert tools, [e.get("head") for e in out["entries"]]
+    assert "ls $RD" in tools[0]["arg"]
+    assert any("review-diff.patch" in ln["t"] for ln in tools[0]["lines"])
+
+
+def test_overview_final_comes_from_the_last_round(home: Path) -> None:
+    run_id = "run-sidecar-rounds"
+    _insert_run(home, run_id=run_id)
+    _insert_node_events(home, run_id, node_id="reviewer", ntype="reviewer", lane="reviewer", finish="done")
+    run_dir = home / "runs" / run_id
+    _write_live_only(run_dir, "reviewer", session_id="sid-rv",
+                     records=_stream_json_sidecar(["round one: I wrote the verdict", '{"verdict": "needs_revision"}']))
+
+    out = build_node(home, run_id, "reviewer", view="overview")
+    assert out["final"]["text"] == '{"verdict": "needs_revision"}'
