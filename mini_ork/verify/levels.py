@@ -16,7 +16,9 @@ UNVERIFIED), mirroring :class:`mini_ork.verify.behavioral.BehavioralVerdict`
 and :class:`mini_ork.runtime.engine.ExecOutcome`: PROVEN only from the
 deterministic evidence it names, REFUTED from a demonstrated failure, and
 UNVERIFIED (abstention — never a pass) otherwise. ``contract`` maps to
-``"n/a"`` when no behavioral verifier produced a file.
+``"n/a"`` when no behavioral verifier produced a file, and ``target`` maps
+to ``"n/a"`` when the replay instrument does not apply to the test runner
+(a non-pytest command) — an ``n/a`` level does not block publish.
 
 Opt-out knob ``MO_LEVEL_VECTOR`` (DEFAULT ON; ``"0"`` disables). The knob is
 read ONLY by :func:`enabled`; :func:`derive_levels` / :func:`level_report`
@@ -160,7 +162,13 @@ def derive_levels(run_dir):
         reasons["executes"] = "verifier_test.json: no post_rc"
 
     # target — a green suite PROVED it exercises the change (replay overlap).
-    if not (ru or au) and rc == 0 and T.get("pass") is True and ov:
+    # When the replay instrument does not apply to the test runner (a
+    # non-pytest command), a green suite cannot be proven by replay; record
+    # n/a (publish does not block) rather than UNVERIFIED.
+    if T.get("replay_applicable") is False and rc == 0:
+        vector["target"] = NA
+        reasons["target"] = "verifier_test.json: replay instrument n/a for this test runner"
+    elif not (ru or au) and rc == 0 and T.get("pass") is True and ov:
         vector["target"] = PROVEN
         reasons["target"] = "verifier_test.json: pass with replay overlap"
     elif not (ru or au) and rc == 0 and T.get("pass") is False and ov == []:
@@ -205,8 +213,9 @@ def derive_levels(run_dir):
 
 def publish_decision(vector, *, required):
     """``"refute"`` if any required level is REFUTED; else ``"abstain"`` if any
-    required level is not PROVEN (UNVERIFIED, ``n/a`` or missing); else
-    ``"publish"``. Empty ``required`` → ``"publish"``."""
+    required level is UNVERIFIED or missing; else ``"publish"``. A level that
+    is ``"n/a"`` (the instrument does not apply to this run) does not block —
+    it is skipped. Empty ``required`` → ``"publish"``."""
     required = tuple(required)
     if not required:
         return "publish"
@@ -214,7 +223,7 @@ def publish_decision(vector, *, required):
         if vector.get(level, UNVERIFIED) == REFUTED:
             return "refute"
     for level in required:
-        if vector.get(level, UNVERIFIED) != PROVEN:
+        if vector.get(level, UNVERIFIED) not in (PROVEN, NA):
             return "abstain"
     return "publish"
 

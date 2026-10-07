@@ -89,7 +89,9 @@ def _run_verifier(
 # ── 1. green non-pytest → abstention, not failure ──────────────────────────
 def test_green_non_pytest_emits_abstention(tmp_path):
     """A green non-pytest command must emit `status: unverified` + `suite_green:
-    true`, keep `pass: false`, and exit 0 (abstention, not failure)."""
+    true`, keep `pass: false`, and exit 0 (abstention, not failure). Because
+    the replay instrument does not apply to a non-pytest runner, the payload
+    also carries `replay_applicable: false`."""
     repo = _make_repo(tmp_path)
 
     rc, out = _run_verifier(repo, tmp_path, cmd=GREEN_CMD, run_id="abstain-green")
@@ -99,6 +101,7 @@ def test_green_non_pytest_emits_abstention(tmp_path):
     assert out["status"] == "unverified", out
     assert out["suite_green"] is True, out
     assert out["replay_unverified"] is True, out
+    assert out["replay_applicable"] is False, out
 
 
 # ── 2. red non-pytest → fail ───────────────────────────────────────────────

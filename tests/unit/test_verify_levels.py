@@ -176,6 +176,55 @@ def test_target(tmp_path):
     assert vector["preserve"] == UNVERIFIED
 
 
+def test_target_na(tmp_path):
+    # replay instrument n/a (non-pytest runner) + green suite -> target = n/a,
+    # and the required code_fix vector publishes.
+    rd = _run_dir(
+        tmp_path,
+        summary={"status": "implemented", "files_changed": ["mod.py"]},
+        test_payload=_test_evidence({
+            "verifier": "test", "pass": False, "post_rc": 0, "base_rc": "",
+            "replay_unverified": True, "replay_applicable": False,
+        }),
+        name="na",
+    )
+    vector, reasons = L.derive_levels(str(rd))
+    assert vector["target"] == NA
+    assert reasons["target"] == "verifier_test.json: replay instrument n/a for this test runner"
+    assert vector["applies"] == PROVEN
+    assert vector["executes"] == PROVEN
+    assert vector["preserve"] == PROVEN
+    assert L.publish_decision(vector, required=L.required_levels("code_fix")) == "publish"
+
+    # replay_applicable absent (a pytest replay that abstained for another
+    # reason) -> still UNVERIFIED, still abstain, even with the other three
+    # required levels PROVEN.
+    rd2 = _run_dir(
+        tmp_path,
+        summary={"status": "implemented", "files_changed": ["mod.py"]},
+        test_payload=_test_evidence({
+            "verifier": "test", "pass": False, "post_rc": 0, "base_rc": "",
+            "replay_unverified": True,
+        }),
+        name="na2",
+    )
+    vector2, _ = L.derive_levels(str(rd2))
+    assert vector2["target"] == UNVERIFIED
+    assert L.publish_decision(vector2, required=L.required_levels("code_fix")) == "abstain"
+
+    # post_rc != 0 + replay_applicable false -> no n/a, no publish.
+    rd3 = _run_dir(
+        tmp_path,
+        test_payload=_test_evidence({
+            "verifier": "test", "pass": False, "post_rc": 1, "base_rc": "0",
+            "replay_unverified": True, "replay_applicable": False,
+        }),
+        name="na3",
+    )
+    vector3, _ = L.derive_levels(str(rd3))
+    assert vector3["target"] == UNVERIFIED
+
+
 def test_contract(tmp_path):
     # absent -> n/a
     rd = _run_dir(tmp_path, name="absent")
@@ -230,12 +279,24 @@ def test_predicate():
     assert L.publish_decision(base, required=req) == "publish"
     assert L.all_levels_ok(base, required=req) is True
 
-    # required=("contract",) with n/a -> abstain
-    assert L.publish_decision(base, required=("contract",)) == "abstain"
+    # required=("contract",) with n/a -> publish (n/a does not block)
+    assert L.publish_decision(base, required=("contract",)) == "publish"
 
     # required_levels("docs") == () -> publish
     assert L.required_levels("docs") == ()
     assert L.publish_decision(base, required=()) == "publish"
+
+
+def test_publish_decision_na():
+    # n/a does not block publish
+    assert L.publish_decision({"target": NA, "executes": PROVEN},
+                              required=("target", "executes")) == "publish"
+    # refute still wins over n/a
+    assert L.publish_decision({"target": NA, "executes": REFUTED},
+                              required=("target", "executes")) == "refute"
+    # n/a + UNVERIFIED still abstains
+    assert L.publish_decision({"target": NA, "executes": UNVERIFIED},
+                              required=("target", "executes")) == "abstain"
 
 
 def test_enabled_knob():
@@ -409,10 +470,9 @@ def test_real_strong_knob_on(tmp_path, monkeypatch):
     assert _status(db, "r9") == "published"
 
 
-def test_real_replay_abstain_knob_on(tmp_path, monkeypatch):
+def test_real_replay_na_knob_on(tmp_path, monkeypatch):
     repo = _make_repo(tmp_path, mod_src=MOD_BUG, test_src=TEST_UNITTEST)
     (repo / "mod.py").write_text(MOD_FIX)
-    head_before = _git_text(repo, "rev-parse", "HEAD")
     rc, db, rd = _drive_main(tmp_path, monkeypatch, repo=repo, run_id="r10",
                              test_cmd=UNITTEST_CMD, knob=True)
     assert rc == 0
@@ -420,17 +480,21 @@ def test_real_replay_abstain_knob_on(tmp_path, monkeypatch):
     payload = L.read_verifier_payload(str(rd / "verifier_test.json"), "test")
     assert payload["replay_unverified"] is True
     assert payload["pass"] is False
+    assert payload["replay_applicable"] is False
 
     verdict = json.loads((rd / "verdict.json").read_text())
     assert verdict["failed_nodes"] == 0
-    assert verdict["levels"]["target"] == UNVERIFIED
-    assert verdict["levels_ok"] is False
-    assert verdict["levels_decision"] == "abstain"
+    assert verdict["levels"]["target"] == NA
+    assert verdict["levels_ok"] is True
+    assert verdict["levels_decision"] == "publish"
 
-    # no rollback, no commit
-    assert _git_text(repo, "rev-parse", "HEAD") == head_before
-    assert (repo / "mod.py").read_text() == MOD_FIX
-    assert _status(db, "r10") == "failed"
+    # a green non-pytest suite publishes: target = n/a is not a block
+    assert _git_text(repo, "log", "-1", "--pretty=%s").startswith("mini-ork(code-fix): ")
+    committed = [ln for ln in
+                 _git_text(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD")
+                 .splitlines() if ln]
+    assert committed == ["mod.py"]
+    assert _status(db, "r10") == "published"
 
 
 def test_real_replay_abstain_knob_off(tmp_path, monkeypatch):

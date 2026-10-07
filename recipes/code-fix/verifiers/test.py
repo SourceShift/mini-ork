@@ -300,7 +300,8 @@ def emit(passed, reason, post_rc, replay=None, adequacy=None):
     return 0 if passed else 1
 
 
-def emit_unverified(post_rc, reason, replay=None, adequacy=None, flag="replay_unverified"):
+def emit_unverified(post_rc, reason, replay=None, adequacy=None, flag="replay_unverified",
+                    replay_applicable=None):
     """Emit an abstention (gate treats as 'no roll-back, no certify'). Exits 0.
 
     The payload carries `pass: False` so any caller that only reads `pass`
@@ -311,7 +312,9 @@ def emit_unverified(post_rc, reason, replay=None, adequacy=None, flag="replay_un
     field to branch on; `pass` stays the conservative certify bit, and
     `suite_green` records whether the post-patch suite itself was green
     (`post_rc == 0`). `status` and `suite_green` are appended LAST so readers
-    that slice the JSON by byte position are unaffected.
+    that slice the JSON by byte position are unaffected. `replay_applicable`
+    is emitted only when False (the replay instrument does not apply to this
+    test runner), and it is appended after `suite_green`.
     """
     payload = {
         "verifier": "test", "pass": False, "evidence_path": LOG_PATH,
@@ -326,6 +329,8 @@ def emit_unverified(post_rc, reason, replay=None, adequacy=None, flag="replay_un
         payload["suite_adequacy"] = adequacy
     payload["status"] = "unverified"
     payload["suite_green"] = post_rc == 0
+    if replay_applicable is False:
+        payload["replay_applicable"] = False
     print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
     return 0
 
@@ -479,7 +484,8 @@ def main():
             return _green_pass("post-patch suite green (replay skipped: certify unavailable or not a git repo)", post_rc)
         if replay_result.get("unverified"):
             return emit_unverified(post_rc, replay_result["reason"],
-                                   replay=replay_result.get("replay"))
+                                   replay=replay_result.get("replay"),
+                                   replay_applicable=replay_result.get("applicable"))
         if replay_result["passed"]:
             return _green_pass("post-patch suite green; replay: tests exercise the change",
                                post_rc, replay=replay_result["replay"])

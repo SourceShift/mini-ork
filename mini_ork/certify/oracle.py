@@ -147,6 +147,9 @@ def replay_check(
           "unverified": bool,   # True if base state could not be evaluated;
                                 # the caller should abstain rather than
                                 # pass/fail
+          "applicable": bool | None,  # False when the replay instrument does
+                                      # not apply to this command (no command,
+                                      # or a non-pytest runner)
           "replay":     dict | None,
         }
 
@@ -172,13 +175,14 @@ def replay_check(
     state, branch, and stash hygiene are not ours to manage.
     """
     if not cmd or not cmd.strip():
-        return {"passed": False, "reason": "no command", "unverified": True, "replay": None}
+        return {"passed": False, "reason": "no command", "unverified": True,
+                "replay": None, "applicable": False}
     if "pytest" not in cmd:
         # We can only parse per-test results from pytest -v output. Other
         # runners (npm, cargo, go) have their own conventions; abstaining
         # here is the honest answer until a sibling helper exists.
         return {"passed": False, "reason": "replay supports pytest commands only",
-                "unverified": True, "replay": None}
+                "unverified": True, "replay": None, "applicable": False}
     if not base_cwd or not os.path.isdir(base_cwd):
         return {"passed": False, "reason": f"base cwd not a directory: {base_cwd!r}",
                 "unverified": True, "replay": None}
