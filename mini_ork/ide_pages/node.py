@@ -56,6 +56,7 @@ TOOL_RESULT_LINES = 12
 TOOL_INPUT_SUMMARY_CAP = 160
 SHELL_LOG_LINES = 40
 LINE_CHARS = 220
+NODE_CMD_LINE_CAP = 5000
 
 # Stream entry kinds in display order. The "kind" keys are the kickoff's
 # verbatim shape — the IDE panel maps them onto draw routines.
@@ -1045,6 +1046,469 @@ def _log_line_count(log_path: Path) -> int:
     return sum(1 for ln in text.splitlines() if ln.strip())
 
 
+# ── non-agent command path (kickoff ide-node-commands §2) ──────────────────────
+# When a node has no session transcript and either its type is not an LLM
+# type (verifier / publisher / rollback / shell / gate / transform) or it
+# has no ``llm_calls``, the stream view is rebuilt from commands instead of
+# from a Claude Code session. The kickoff names 5 entry kinds (a–e); this
+# helper returns the entries + the consumed offset, or ``None`` to signal
+# "no command artefacts for this node — fall back to the existing log
+# line stream". That additive shape (lens §3.1 option A) preserves the
+# mandate-green test_ide_pages_node.py:318 fixture, which only ships a
+# verifier_<id>.log.
+
+
+def _verifier_stem(target: Node) -> str | None:
+    """Stem of the verifier script for this node (basename minus extension).
+
+    ``Node.prompt`` is ``<recipe>/<verifier_ref>`` per ``run.py:258``; for
+    a framework-edit node with ``verifier_ref: verifiers/static-check.py``
+    it reads ``framework-edit/static-check.py`` and ``Path.stem`` yields
+    ``static-check`` — the correct stem the kickoff's evidence files
+    (``verifier_static-check.json``) are keyed on. The fall-back
+    node-id-with-``_``→``-`` rule from the kickoff is intentionally
+    avoided: it would yield ``static-check-verifier`` for the framework
+    edit verifier, which does not exist on disk (lens §3.2).
+    """
+    if not target.prompt:
+        return None
+    p = Path(target.prompt)
+    if p.suffix in (".py", ".sh"):
+        return p.stem
+    return None
+
+
+def _is_command_backed(target: Node, session_path: Path | None,
+                       has_log: bool) -> bool:
+    """Branch gate: should the stream be built from commands?
+
+    True when:
+
+    * the node has no session transcript (an LLM-bearing node would have one),
+    * AND the node has no recorded LLM calls (no Claude Code transcript),
+    * OR its ``type`` is one of the deterministic (non-LLM) types in
+      ``run._DETERMINISTIC`` (verifier, publisher, rollback, shell, gate,
+      transform).
+
+    A node with ``calls > 0`` and a non-deterministic type falls back to
+    the existing path (it should have a session somewhere — missing
+    session is a real bug, not something the command branch should paper
+    over).
+    """
+    if session_path is not None:
+        return False
+    from mini_ork.ide_pages.run import _DETERMINISTIC
+
+    if (target.type or "") in _DETERMINISTIC:
+        return True
+    if target.calls and target.calls > 0:
+        return False
+    # No session, no calls, non-LLM — treat as command-backed even when
+    # the workflow forgot to tag the type. ``_resolve_log_path`` would
+    # also have surfaced a log; the command branch handles the case where
+    # there is no log either (built-in steps that only print to
+    # execute.log).
+    return not has_log or True  # both shapes qualify; the helpers return [] otherwise
+
+
+def _command_stream_entries(run_dir: Path, target: Node, log_path: Path | None,
+                            recipe_dir: Path | None) -> tuple[list[dict[str, Any]], int, str] | None:
+    """Build the stream entries (kickoff §2a–e) from command artefacts.
+
+    Returns ``(entries, next_offset, source)`` when command artefacts are
+    available. Returns ``None`` when this is a non-agent node that
+    nevertheless has no ``node-cmd`` record and no legacy
+    ``verifier_<stem>.json`` AND no built-in log lines — caller should
+    fall back to the existing log-line path.
+    """
+    entries: list[dict[str, Any]] = []
+    line_idx = 0
+    next_offset = 0
+    source_name = ""
+    stem = _verifier_stem(target)
+
+    record_path = (run_dir / "node-cmd" / f"verifier_{stem}.json") if stem else None
+    legacy_evidence = (run_dir / f"verifier_{stem}.json") if stem else None
+
+    record: dict[str, Any] | None = None
+    if record_path and record_path.is_file():
+        try:
+            parsed = json.loads(record_path.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(parsed, dict):
+                record = parsed
+        except (OSError, ValueError):
+            record = None
+
+    if isinstance(record, dict):
+        argv = [str(a) for a in (record.get("argv") or [])]
+        cmd_str = str(record.get("cmd") or "") or shlex_join_safe(argv)
+        cwd = str(record.get("cwd") or "")
+        rc_raw = record.get("rc")
+        try:
+            rc = int(rc_raw) if rc_raw is not None else 0
+        except (TypeError, ValueError):
+            rc = 0
+        out_path = str(record.get("output_path") or "")
+        started = float(record.get("started_at") or 0.0)
+        ended = float(record.get("ended_at") or 0.0)
+        dur = max(0.0, ended - started)
+
+        arg_str = f"cd {cwd} && {cmd_str}" if cwd else cmd_str
+
+        # ── §2a — the command itself ─────────────────────────────────
+        output_lines = _read_output_lines(out_path, NODE_CMD_LINE_CAP)
+        is_error = (rc != 0)
+        for ln in output_lines:
+            ln["c"] = "red" if is_error else ln.get("c", "body")
+        if output_lines and output_lines[-1].get("t", "").startswith("exit "):
+            pass  # already an exit line below
+        # Tail cap notice
+        total_lines = _count_lines(out_path)
+        if total_lines > NODE_CMD_LINE_CAP:
+            output_lines.append({
+                "t": f"… {total_lines - NODE_CMD_LINE_CAP} more lines — {out_path}",
+                "c": "muted",
+            })
+        output_lines.append({
+            "t": f"exit {rc} · {dur:.2f}s",
+            "c": "red" if is_error else "muted",
+        })
+        entries.append({
+            "k": _KIND_TOOL,
+            "head": "$",
+            "arg": arg_str,
+            "lines": output_lines or [{"t": "(no output)", "c": "muted"}],
+            "_src": "cmd",
+            "_line": line_idx,
+        })
+        line_idx += 1
+        next_offset = total_lines
+        source_name = str(record_path.name) if record_path else ""
+
+        # ── §2b — sub-commands the verifier ran ─────────────────────
+        ev_doc = _read_json_safely(out_path)
+        sub = _subcommand_entries(ev_doc)
+        for e in sub:
+            e["_line"] = line_idx
+            entries.append(e)
+            line_idx += 1
+        # ── §2b — _*cmd*.log files (researcher verifier smoke runs) ──
+        try:
+            cmd_logs = sorted(run_dir.glob("_*cmd*.log"))
+        except OSError:
+            cmd_logs = []
+        for cmd_log in cmd_logs:
+            blocks = _parse_cmd_log_blocks(cmd_log)
+            for blk in blocks:
+                blk["_line"] = line_idx
+                entries.append(blk)
+                line_idx += 1
+
+        # ── §2c — the verifier's own logs ───────────────────────────
+        for rel in (f"verifier-{stem}.log",):
+            lp = run_dir / rel
+            if lp.is_file():
+                e = _log_path_entry(lp, head="log", arg=str(lp),
+                                    line_idx=line_idx, cap=NODE_CMD_LINE_CAP)
+                entries.append(e)
+                line_idx += 1
+                if not source_name:
+                    source_name = lp.name
+        ev_dir = run_dir / "evidence"
+        if ev_dir.is_dir():
+            try:
+                logs = sorted(
+                    [p for p in ev_dir.glob(f"{stem}*.log") if p.is_file()],
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+            except OSError:
+                logs = []
+            if logs:
+                e = _log_path_entry(logs[0], head="log", arg=str(logs[0]),
+                                    line_idx=line_idx, cap=NODE_CMD_LINE_CAP)
+                entries.append(e)
+                line_idx += 1
+
+        return entries, next_offset, source_name
+
+    # ── §2 reconstruction when only verifier_<stem>.json exists ─────
+    if legacy_evidence and legacy_evidence.is_file():
+        # Best-effort cwd from the run profile's pinned target.
+        cwd = ""
+        try:
+            from mini_ork.runtime.run_roots import load_run_roots
+            roots = load_run_roots(str(run_dir))
+            if roots:
+                cwd = str(roots.target or "")
+        except Exception:
+            cwd = ""
+        cmd_str = f"python3 {target.prompt}" if target.prompt else ""
+        arg_str = f"cd {cwd} && {cmd_str}" if cwd else cmd_str
+        output_lines = _read_output_lines(str(legacy_evidence), NODE_CMD_LINE_CAP)
+        entries.append({
+            "k": _KIND_TOOL,
+            "head": "$",
+            "arg": arg_str or "(reconstructed command)",
+            "lines": output_lines or [{"t": "(no output)", "c": "muted"}],
+            "_src": "cmd",
+            "_line": line_idx,
+        })
+        line_idx += 1
+        note_text = "Command reconstructed from the recipe — this run predates command recording."
+        entries.append({
+            "k": _KIND_NOTE,
+            "head": "reconstructed",
+            "arg": note_text,
+            "lines": [{"t": note_text, "c": "muted"}],
+            "_src": "note",
+            "_line": line_idx,
+        })
+        line_idx += 1
+        return entries, 0, legacy_evidence.name
+
+    # ── §2d — built-in steps (rollback, publisher, skips) ────────────
+    log_path_x = run_dir / "execute.log"
+    if log_path_x.is_file() and target.id:
+        try:
+            all_lines = log_path_x.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            all_lines = []
+        id_tag = f"[{target.id}]"
+        type_tag = f"[{target.type}]" if target.type else ""
+        node_id_tag = f"node_id={target.id}"
+        matched = [
+            ln for ln in all_lines
+            if id_tag in ln or (type_tag and type_tag in ln) or node_id_tag in ln
+            or ln.startswith(id_tag) or (type_tag and ln.startswith(type_tag))
+        ]
+        if matched:
+            entry_lines = [
+                {"t": ln[:LINE_CHARS], "c": "body"}
+                for ln in matched[:NODE_CMD_LINE_CAP]
+            ]
+            entries.append({
+                "k": _KIND_TOOL,
+                "head": "built-in",
+                "arg": f"{target.type or ''} · {target.id}",
+                "lines": entry_lines or [{"t": "(no output)", "c": "muted"}],
+                "_src": "builtin",
+                "_line": line_idx,
+            })
+            line_idx += 1
+            for name, head in (("rolled-back.json", "rollback"),
+                               ("salvage.json", "salvage")):
+                rp = run_dir / name
+                if rp.is_file():
+                    try:
+                        txt = rp.read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        txt = ""
+                    entries.append({
+                        "k": _KIND_NOTE,
+                        "head": head,
+                        "arg": rp.name,
+                        "lines": [
+                            {"t": ln[:LINE_CHARS], "c": "muted"}
+                            for ln in txt.splitlines()
+                        ],
+                        "_src": "builtin",
+                        "_line": line_idx,
+                    })
+                    line_idx += 1
+            return entries, 0, log_path_x.name
+
+    # No artefacts at all → caller falls back to existing log path or
+    # emits the §2e "nothing was stored" note (build_node handles that).
+    return None
+
+
+def _read_output_lines(path: str, cap: int) -> list[dict[str, str]]:
+    """Read up to ``cap`` lines from ``path`` as colour-tagged dicts."""
+    if not path:
+        return []
+    p = Path(path)
+    if not p.is_file():
+        return []
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    out: list[dict[str, str]] = []
+    for ln in text.splitlines()[:cap]:
+        out.append({"t": ln[:LINE_CHARS], "c": "body"})
+    return out
+
+
+def _count_lines(path: str) -> int:
+    if not path:
+        return 0
+    p = Path(path)
+    if not p.is_file():
+        return 0
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return 0
+    return len(text.splitlines())
+
+
+def _read_json_safely(path: str) -> dict[str, Any]:
+    if not path:
+        return {}
+    p = Path(path)
+    if not p.is_file():
+        return {}
+    try:
+        doc = json.loads(p.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def _log_path_entry(log_path: Path, *, head: str, arg: str,
+                    line_idx: int, cap: int) -> dict[str, Any]:
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    raw = text.splitlines()
+    lines: list[dict[str, str]] = []
+    for ln in raw[:cap]:
+        c = "red" if "Traceback" in ln or "ERROR" in ln else (
+            "green" if "PASS" in ln or "ok" in ln.lower() else "body")
+        lines.append({"t": ln[:LINE_CHARS], "c": c})
+    if len(raw) > cap:
+        lines.append({"t": f"… {len(raw) - cap} more lines", "c": "muted"})
+    return {
+        "k": _KIND_TOOL,
+        "head": head,
+        "arg": arg,
+        "lines": lines or [{"t": "(no output)", "c": "muted"}],
+        "_src": "log",
+        "_line": line_idx,
+    }
+
+
+def _subcommand_entries(ev_doc: dict[str, Any]) -> list[dict[str, Any]]:
+    """Mine sub-commands from a verifier evidence JSON (§2b)."""
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def _add(head: str, arg: str, lines: list[str], rc: int | None) -> None:
+        if not arg and not lines:
+            return
+        key = f"{head}|{arg}"
+        if key in seen:
+            return
+        seen.add(key)
+        body = [{"t": ln[:LINE_CHARS], "c": "body"} for ln in lines[:NODE_CMD_LINE_CAP]]
+        if rc is not None:
+            body.append({"t": f"[rc={rc}]", "c": "red" if rc else "muted"})
+        out.append({
+            "k": _KIND_TOOL,
+            "head": head,
+            "arg": arg,
+            "lines": body or [{"t": "(no output)", "c": "muted"}],
+            "_src": "subcmd",
+        })
+
+    # gate_cmd / gate_cmd_output_tail / gate_cmd_exit — researcher verifier
+    for key in ("gate_cmd", "gate_cmd_output_tail", "gate_cmd_exit"):
+        v = ev_doc.get(key)
+        if isinstance(v, str) and v.strip():
+            _add("subcmd", v.strip(), [], None)
+
+    # surfaces[] / surface:cmd — live_smoke verifier
+    surfaces = ev_doc.get("surfaces")
+    if isinstance(surfaces, list):
+        for s in surfaces:
+            if not isinstance(s, dict):
+                continue
+            if s.get("surface") != "cmd":
+                continue
+            target = str(s.get("target") or "")
+            lines = s.get("lines") or []
+            if isinstance(lines, list):
+                lines = [str(ln) for ln in lines]
+            else:
+                lines = []
+            _add("subcmd", target, lines, s.get("rc"))
+    if ev_doc.get("surface") == "cmd" and ev_doc.get("target"):
+        _add("subcmd", str(ev_doc.get("target") or ""), [], ev_doc.get("rc"))
+
+    # _*cmd*.log files in the run dir — handled separately by
+    # ``_parse_cmd_log_blocks`` (the JSON is one source, the log is the
+    # other; the caller merges them).
+    return out
+
+
+def _parse_cmd_log_blocks(path: Path) -> list[dict[str, Any]]:
+    """Split a ``_<run_dir>_cmd_<step>.log`` into ``$ cmd / output / [rc=N]`` blocks.
+
+    Each block becomes one ``subcmd`` entry. Lines starting with ``$`` open
+    a new block; a line matching ``[rc=N]`` closes one (carrying its rc).
+    Output lines belong to the most recently opened command.
+    """
+    if not path or not path.is_file():
+        return []
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    out: list[dict[str, Any]] = []
+    cur_cmd: str | None = None
+    cur_lines: list[str] = []
+    cur_rc: int | None = None
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if line.startswith("$ "):
+            if cur_cmd is not None:
+                out.append(_build_cmd_block(cur_cmd, cur_lines, cur_rc))
+            cur_cmd = line[2:].strip()
+            cur_lines = []
+            cur_rc = None
+        elif line.startswith("[rc="):
+            try:
+                cur_rc = int(line[4:].rstrip("]").strip())
+            except ValueError:
+                cur_rc = None
+            if cur_cmd is not None:
+                out.append(_build_cmd_block(cur_cmd, cur_lines, cur_rc))
+                cur_cmd = None
+                cur_lines = []
+                cur_rc = None
+        else:
+            if cur_cmd is not None:
+                cur_lines.append(line)
+    if cur_cmd is not None:
+        out.append(_build_cmd_block(cur_cmd, cur_lines, cur_rc))
+    return out
+
+
+def _build_cmd_block(cmd: str, lines: list[str], rc: int | None) -> dict[str, Any]:
+    body: list[dict[str, str]] = []
+    for ln in lines[:NODE_CMD_LINE_CAP]:
+        body.append({"t": ln[:LINE_CHARS], "c": "body"})
+    if rc is not None:
+        body.append({"t": f"[rc={rc}]", "c": "red" if rc else "muted"})
+    return {
+        "k": _KIND_TOOL,
+        "head": "subcmd",
+        "arg": cmd,
+        "lines": body or [{"t": "(no output)", "c": "muted"}],
+        "_src": "subcmd",
+    }
+
+
+def shlex_join_safe(argv: list[str]) -> str:
+    try:
+        import shlex as _shlex
+        return _shlex.join(argv)
+    except ImportError:
+        return " ".join(argv)
+
+
 def _steer_entries(run_id: str, home: Path, target: Node) -> list[dict[str, Any]]:
     """Read operator_steering rows for this run + node role DIRECTLY.
 
@@ -1767,6 +2231,9 @@ def build_node(home: Path, run_id: str, node_id: str, view: str | None = None,
     next_offset = int(offset)
     transcript_has_result = _transcript_has_result(session_path) if session_path else False
     transcript_entry_count = 0  # total transcript entries (full file, not poll slice)
+    command_backed_used = False
+    command_rc: int | None = None
+    command_source_name = ""
     if view == "stream":
         # r3 fix #7 minor: ``finished · N events`` reports the TOTAL
         # transcript entry count, not this poll's slice. Parse the source
@@ -1780,17 +2247,98 @@ def build_node(home: Path, run_id: str, node_id: str, view: str | None = None,
             # from the SHELL_LOG_LINES cap.
             transcript_entry_count = _log_line_count(log_path)
 
-        stream_entries, next_offset = _stream_entries(
-            session_path, log_path, run_id, home,
-            target=target, offset=int(offset),
-            run_dir=run_dir,
-            transcript_has_result=transcript_has_result,
-            is_live=is_live,
+        # Kickoff ide-node-commands §2 — non-agent branch. When there is
+        # no session transcript AND the node has no llm_calls OR its
+        # ``type`` is one of the deterministic shapes (verifier, publisher,
+        # rollback, shell, gate, transform), build the stream from
+        # commands. Additive with the existing log-line path: when no
+        # command artefacts exist, fall back transparently.
+        command_backed_branch = _is_command_backed(
+            target, session_path, log_path is not None,
         )
+        if command_backed_branch:
+            cmd = _command_stream_entries(
+                run_dir, target, log_path,
+                getattr(run_obj, "recipe_dir", None),
+            )
+            if cmd is not None:
+                stream_entries, next_offset, command_source_name = cmd
+                command_backed_used = True
+                # Recover rc for the status pill: walk the first `$` entry's
+                # trailing ``exit <rc> · ...`` line; the helper emits it last.
+                first = stream_entries[0] if stream_entries else None
+                if first and first.get("head") == "$":
+                    lines = first.get("lines") or []
+                    for ln in reversed(lines):
+                        t = ln.get("t") or ""
+                        if t.startswith("exit "):
+                            try:
+                                command_rc = int(t.split()[1])
+                            except (ValueError, IndexError):
+                                command_rc = None
+                            break
+                # Merge steering rows so the operator_steering UX is
+                # identical across the two branches.
+                steer_only = _steer_entries(run_id, home, target)
+                # Re-tag lines so the offset math still works (steer rows
+                # carry their own ``_ts`` and are not affected by offset).
+                if steer_only:
+                    # Drop steering entries that would otherwise appear twice
+                    # (once from the command branch, once from steering).
+                    seen_keys = {(e.get("_src"), e.get("_line")) for e in stream_entries}
+                    for s in steer_only:
+                        key = (s.get("_src"), s.get("_line"))
+                        if key not in seen_keys:
+                            stream_entries.append(s)
+                    stream_entries.sort(
+                        key=lambda e: (
+                            int(e.get("_ts") or 0),
+                            0 if e.get("_src") == "steer" else 1,
+                        )
+                    )
+
+        if not command_backed_used:
+            stream_entries, next_offset = _stream_entries(
+                session_path, log_path, run_id, home,
+                target=target, offset=int(offset),
+                run_dir=run_dir,
+                transcript_has_result=transcript_has_result,
+                is_live=is_live,
+            )
+        # Kickoff §2e — non-agent node with NO session, NO log, NO
+        # command artefacts → one note entry. Fires when the command
+        # branch is gated by ``_is_command_backed`` AND there is no
+        # other source (no log_path either). When ``log_path`` is set
+        # the existing log line stream serves the consumer; we do not
+        # short-circuit it.
+        if (command_backed_branch and not stream_entries
+                and session_path is None and log_path is None):
+            note_text = "No command or output was stored for this node."
+            stream_entries = [{
+                "k": _KIND_NOTE,
+                "head": "empty",
+                "arg": note_text,
+                "lines": [{"t": note_text, "c": "muted"}],
+                "_src": "note",
+                "_line": 0,
+            }]
+            next_offset = 0
 
     status, status_c = _stream_status(target, session_path is not None,
                                       log_path is not None, is_live,
                                       transcript_entry_count)
+    # Kickoff ide-node-commands §2f — override the pill when the
+    # command branch owns the stream. ``command_rc`` comes from the
+    # recorded ``rc``; None means we couldn't recover it, in which case
+    # fall back to the existing pill.
+    if command_backed_used and command_rc is not None:
+        if command_rc == 0:
+            status, status_c = ("finished · command", "green")
+        else:
+            status, status_c = ("failed · command", "red")
+    elif command_backed_used and not stream_entries:
+        # §2e — single empty-note pill state.
+        status, status_c = ("no command recorded", "yellow")
 
     base: dict[str, Any] = {
         "ok": True,
@@ -1817,8 +2365,9 @@ def build_node(home: Path, run_id: str, node_id: str, view: str | None = None,
             "status": status,
             "status_c": status_c,
             "meta": _meta(target, run_obj),
-            "source": str(session_path.name if session_path else (
-                log_path.name if log_path else "")),
+            "source": str(command_source_name or (
+                session_path.name if session_path else (
+                    log_path.name if log_path else ""))),
             "done_note": _done_note(target),
         })
     elif view == "output":

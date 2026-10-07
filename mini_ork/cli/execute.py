@@ -35,6 +35,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -1508,8 +1509,25 @@ def _run_verifier_ref(script, evidence_path, *, plan_path="", artifact_path="", 
     # on the local branch. Under remote placement, the helper writes the
     # merged output to ``evidence_path`` from the run-dir pull's content
     # (falling back to the exec'd ``output`` string when the pull missed).
-    rc, _ = run_check(_verifier_argv(script), cwd=cwd, env=verifier_env,
+    argv = _verifier_argv(script)
+    started_at = time.time()
+    rc, _ = run_check(argv, cwd=cwd, env=verifier_env,
                       evidence_path=evidence_path)
+    ended_at = time.time()
+    # Best-effort command recording (kickoff ide-node-commands §1). The
+    # recorder writes <run_dir>/node-cmd/<stem>.json with argv/cmd/cwd/env/rc/
+    # timing so the IDE's stream view can render the full command and its
+    # output for non-agent nodes. Must never raise (caller's rc and evidence
+    # bytes are byte-identical to the legacy path), must never include
+    # secret env keys (whitelist below).
+    try:
+        _record_verifier_command(
+            script=script, argv=argv, evidence_path=evidence_path,
+            run_dir=run_dir, cwd=cwd, env=verifier_env,
+            started_at=started_at, ended_at=ended_at, rc=rc,
+        )
+    except Exception:
+        pass
     if not os.path.getsize(evidence_path):
         open(evidence_path, "w").write(f"vacuous pass: verifier exited {rc} but wrote no evidence")
         return 1
@@ -1520,6 +1538,77 @@ def _run_verifier_ref(script, evidence_path, *, plan_path="", artifact_path="", 
     if not isinstance(payload, dict) or "pass" not in payload:
         return rc
     return 0 if payload.get("pass") is True else 1
+
+
+# ── command recorder (kickoff ide-node-commands §1) ──────────────────────────
+# Best-effort sidecar the IDE reads to render the stream view for non-agent
+# nodes. Six env keys are projected — never any secret. The write target is
+# <run_dir>/node-cmd/<stem>.json; the stem comes from ``evidence_path`` so it
+# matches the verifier_<stem>.json convention the IDE already keys on.
+
+_RECORD_ENV_WHITELIST = (
+    "MINI_ORK_PLAN_PATH",
+    "ARTIFACT_PATH",
+    "MINI_ORK_RUN_DIR",
+    "MINI_ORK_RUN_ID",
+    "MO_TARGET_CWD",
+    "PYTHONPATH",
+)
+
+
+def _record_verifier_command(*, script, argv, evidence_path, run_dir, cwd,
+                             env, started_at, ended_at, rc):
+    """Write ``<run_dir>/node-cmd/<stem>.json`` for the IDE stream view.
+
+    Pure information — never alters ``rc``, ``evidence_path`` bytes, or
+    stderr. Callers wrap this in ``try/except``; this function itself
+    never raises (worst case: writes nothing).
+    """
+    target_run_dir = run_dir or os.path.dirname(evidence_path) or ""
+    if not target_run_dir:
+        return
+
+    # Stem: derive from evidence_path so verifier_static-check.json (the
+    # copied copy in <run_dir>/) and the runner verify we write node-cmd/
+    # verifier_<stem>.json with the same stem.
+    ev_stem = os.path.basename(evidence_path or "")
+    for sfx in (".log", ".json"):
+        if ev_stem.endswith(sfx):
+            ev_stem = ev_stem[: -len(sfx)]
+            break
+    if ev_stem.startswith("verifier_"):
+        ev_stem = ev_stem[len("verifier_") :]
+    if not ev_stem:
+        return
+
+    record_dir = os.path.join(target_run_dir, "node-cmd")
+    record_path = os.path.join(record_dir, f"verifier_{ev_stem}.json")
+
+    # Project the env into the caller's whitelist — secrets in the parent's
+    # ``os.environ`` never make it to disk.
+    safe_env = {k: env[k] for k in _RECORD_ENV_WHITELIST if k in env}
+
+    payload = {
+        "script": script,
+        "argv": [str(a) for a in argv],
+        "cmd": shlex.join([str(a) for a in argv]),
+        "cwd": cwd or "",
+        "env": safe_env,
+        "started_at": float(started_at),
+        "ended_at": float(ended_at),
+        "rc": int(rc) if rc is not None else None,
+        "output_path": evidence_path or "",
+    }
+    try:
+        os.makedirs(record_dir, exist_ok=True)
+    except OSError:
+        return
+    try:
+        write_json_atomic(record_path, payload)
+    except OSError:
+        # Read-only filesystem, permission denied, etc. — silently no-op,
+        # never raise: this is a sidecar, not a control flow input.
+        return
 
 
 def _default_llm_dispatch(root):
