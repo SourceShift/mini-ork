@@ -190,8 +190,10 @@ def test_resolve_is_read_only(home: Path) -> None:
     assert _snapshot(run_dir) == before
 
 
-def test_bare_failed_detail_falls_back_to_the_hint_node(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """task_state's bare "Failed" fallback is no detail: the hint's node names it."""
+def test_bare_failed_detail_never_guesses_a_node(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """task_state's bare "Failed" fallback names no node, and the hint's own node
+    is a best-effort guess — the card must not render "Failed at <guess>": the
+    text stays "Failed" and the hint's summary carries the detail."""
     _seed(home, status="failed")
     import mini_ork.recovery.retry_hint as retry_hint
 
@@ -201,7 +203,7 @@ def test_bare_failed_detail_falls_back_to_the_hint_node(home: Path, monkeypatch:
     run = _run(home)
     run.card["detail"] = "Failed"
     out = outcome.resolve(run)
-    assert out["text"] == "Failed at reviewer"
+    assert out["text"] == "Failed"
     assert "rejected. The change itself must be revised." in out["detail"]
 
 

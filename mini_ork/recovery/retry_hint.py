@@ -37,7 +37,17 @@ from mini_ork.recipes_catalog import find_recipe
 from mini_ork.verify.levels import read_verifier_payload
 from mini_ork.web.db import db_for
 
-HINT_VERSION = 1
+# Bump whenever the classifier's *rule set* changes: a cached hint at an older
+# version was produced by different rules and may say "strategy: none" for a run
+# the current rules classify as retryable. The cache read rejects a version
+# mismatch outright, so a poisoned ``retry-hint.json`` self-heals on upgrade —
+# the on-disk mtimes cannot catch a hint written AFTER the artefact that would
+# have changed it (the live case: ``recover`` wrote a strategy-none hint after
+# the run's abstain ``verdict.json``).
+#
+# v2 (2026-10-08): the withheld-publish branch (case 1.5) — a run whose publisher
+# abstained with no failing node is retryable ``verify``, not unclassified.
+HINT_VERSION = 2
 CACHE_FILENAME = "retry-hint.json"
 
 # Reviewer/eval/judge verdicts that mean "the change was wrong".
@@ -1132,6 +1142,106 @@ def _case_lane_unavailable(home: Path, run_id: str, run_dir: Path,
     }
 
 
+def _run_node_events(home: Path, run_id: str) -> list[dict[str, Any]] | None:
+    """This run's ``run_events`` rows shaped for ``task_state._failing_node``.
+
+    ``None`` when the DB / table / query is unavailable — the caller then
+    declines to classify rather than asserting a "no node failed" it cannot
+    actually see.
+    """
+    try:
+        db = db_for(home)
+    except Exception:  # noqa: BLE001 — missing state.db: never raise
+        return None
+    try:
+        if not db.has_table("run_events"):
+            return None
+        rows = db.rows(
+            "SELECT event_type, payload_json FROM run_events WHERE run_id = ? "
+            "ORDER BY created_at ASC, event_id ASC",
+            (run_id,),
+        )
+    except Exception:  # noqa: BLE001 — schema drift: never raise
+        return None
+    return [
+        {"event_type": r.get("event_type"), "payload_json": r.get("payload_json")}
+        for r in rows
+    ]
+
+
+def _first_verifier_node(nodes: list[dict[str, Any]],
+                         edges: list[dict[str, Any]]) -> str:
+    """The verifier node a withheld re-verify should re-enter at.
+
+    The ``test`` verifier when the recipe declares one — it is what PROVES the
+    ``target`` level, the level the publisher withholds on
+    (``verifier_test.json`` → ``target``) — else the first ``type: verifier``
+    node in topo order. ``""`` when the recipe declares no verifier.
+    """
+    by_name = {str(n.get("name")): n for n in nodes if n.get("name")}
+    order = [
+        name for name in _topo_order(nodes, edges)
+        if str((by_name.get(name) or {}).get("type") or "") == "verifier"
+    ]
+    if not order:
+        return ""
+    for name in order:
+        ref = str((by_name.get(name) or {}).get("verifier_ref") or "")
+        if Path(ref).stem == "test":
+            return name
+    return order[0]
+
+
+def _case_withheld(home: Path, run_dir: Path, run_id: str,
+                   recipe: str) -> dict[str, Any] | None:
+    """Case 1.5 — a withheld publish is retryable; re-verifying is the whole fix.
+
+    The run did all its work and the publisher abstained (a level was not
+    PROVEN) with no node failing, so the hint is ``strategy: verify`` from the
+    recipe's ``test`` verifier. ``needs_change`` stays ``None``: nothing must
+    change before a re-verify, and a ``kind``-bearing hint would be refused by
+    the ``needs_change`` gate in ``recover`` (``planner``) and ``board retry``
+    unless the operator passed ``--ack-change`` — the dead end this case
+    removes. Declines on: no ``abstain`` level report, a REFUTED level (the
+    failed rule owns that), a failing node, or an unreadable ``run_events``.
+    """
+    try:
+        from mini_ork.acp.task_state import withheld_publish
+    except Exception:  # noqa: BLE001 — task_state is optional; never block the hint
+        return None
+    events = _run_node_events(home, run_id)
+    if events is None:
+        # The lifecycle is unreadable: we cannot assert "no node failed", and a
+        # withheld hint that hides a genuine failure is exactly the dead end
+        # this case removes. Decline instead.
+        return None
+    levels = withheld_publish(run_dir, events)
+    if levels is None:
+        return None
+    nodes, edges = _recipe_workflow(home, recipe)
+    from_node = _first_verifier_node(nodes, edges)
+    # The command must re-enter at the verifier that PROVES `target` (from_node);
+    # a bare --strategy verify re-enters at the first verifier in topo order.
+    command = _build_command("verify", run_id)
+    if command and from_node:
+        command += f" --from-node {from_node}"
+    return {
+        "version": HINT_VERSION,
+        "run_id": run_id,
+        "failed_node": None,
+        "retryable": True,
+        "strategy": "verify",
+        "from_node": from_node,
+        "needs_change": None,
+        "notes": [
+            f"Not published: {', '.join(levels)} unverified",
+            "re-verify; publishes when every level is PROVEN or n/a",
+        ],
+        "command": command,
+        "computed_at": _now_iso(),
+    }
+
+
 def compute(home: Path, run_id: str) -> dict[str, Any] | None:
     """Pure read — return the retry hint for ``run_id`` or ``None``.
 
@@ -1156,6 +1266,14 @@ def compute(home: Path, run_id: str) -> dict[str, Any] | None:
     # Case 1 — cost-pause sentinel
     if (run_dir / ".cost-pause").is_file():
         return _case_cost_pause(run_id)
+
+    # Case 1.5 — a withheld publish. Evaluated BEFORE the reviewer/verifier
+    # cases: every node passed and only the publisher abstained, so a stale
+    # reviewer needs_revision artefact from an earlier revise round (or a
+    # verifier artefact that merely reads UNVERIFIED) must not shadow it.
+    withheld_hint = _case_withheld(home, run_dir, run_id, recipe)
+    if withheld_hint is not None:
+        return withheld_hint
 
     # A reviewer that asked for a revision outranks any verifier outcome: the
     # change was judged wrong, so retrying it unchanged cannot help.
@@ -1218,7 +1336,17 @@ def _cache_dependencies(home: Path, run_dir: Path) -> dict[str, int]:
     """
     deps: dict[str, int] = {}
     if run_dir.is_dir():
-        for pattern in ("verifier_*.json", "review-*.json", "impl-*.log"):
+        for pattern in (
+            "verifier_*.json",
+            "review-*.json",
+            "impl-*.log",
+            # The level report and the landed marker both flip the withheld /
+            # landed classification; without them a stale retry-hint.json would
+            # survive a freshly written abstain verdict or landed.json.
+            "verdict.json",
+            "run-verdict.json",
+            "landed.json",
+        ):
             for path in run_dir.glob(pattern):
                 try:
                     deps[f"{pattern}:{path.name}"] = path.stat().st_mtime_ns
@@ -1264,10 +1392,12 @@ def _cache_dependencies(home: Path, run_dir: Path) -> dict[str, int]:
 def load_or_compute(home: Path, run_id: str, *, write: bool = True) -> dict[str, Any] | None:
     """Cache-aware compute.
 
-    Reads ``<run_dir>/retry-hint.json`` when it is newer than every file the
-    hint depends on; otherwise calls :func:`compute` and, when ``write=True``,
-    saves the result. When ``write=False``, the hint is never written into
-    a real run dir — the IDE page uses that mode.
+    Reads ``<run_dir>/retry-hint.json`` when it carries the current
+    :data:`HINT_VERSION` and is newer than every file the hint depends on;
+    otherwise calls :func:`compute` and, when ``write=True``, saves the result.
+    When ``write=False``, the hint is never written into a real run dir — the
+    IDE page uses that mode. The version check is what retires a hint written by
+    an older rule set that the mtimes alone cannot date (see :data:`HINT_VERSION`).
 
     A non-terminal run status (executing, queued, …) short-circuits BEFORE the
     cache read so a relaunched run never returns the prior failed attempt's
@@ -1290,7 +1420,8 @@ def load_or_compute(home: Path, run_id: str, *, write: bool = True) -> dict[str,
             cache_mtime = cached_path.stat().st_mtime_ns
             if all(cache_mtime > m for m in deps.values() if m):
                 data = json.loads(cached_path.read_text(encoding="utf-8"))
-                if isinstance(data, dict) and data.get("run_id") == run_id:
+                if (isinstance(data, dict) and data.get("run_id") == run_id
+                        and data.get("version") == HINT_VERSION):
                     # A status change since the hint was cached also invalidates
                     # the entry — the run may now be re-running on a different
                     # attempt's artifacts.
@@ -1298,6 +1429,10 @@ def load_or_compute(home: Path, run_id: str, *, write: bool = True) -> dict[str,
                         pass  # fall through to recompute
                     else:
                         return data
+                # A cached hint at an older ``version`` was written by different
+                # rules — recompute rather than serve a stale classification.
+                # This is what retires the mis-classified "strategy: none" hint
+                # ``recover`` left on the live run after its abstain verdict.json.
         except (OSError, ValueError, TypeError):
             pass
     hint = compute(home, run_id)

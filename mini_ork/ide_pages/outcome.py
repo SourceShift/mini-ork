@@ -21,14 +21,29 @@ Rules, first match wins (``state_word`` names the branch):
 3. **Failed / rolled back** — tone red; the retry actions come from
    ``retry_hint`` (lane switch, ack-change retry, resume-cost).
 4. **Published** — tone green, " · verified" only when a verdict file passes.
+
+Two terminal branches are intercepted ahead of that dispatch, because the
+card's live ``task_state`` would otherwise route them to the wrong word:
+
+0. **Landed elsewhere** — a failed row carrying ``landed.json`` is done.
+0. **Withheld publish** — every node passed but the publisher abstained
+   (``levels_decision == "abstain"``): tone orange, "Not published —
+   <level> unverified", with Certify / Publish again. A level that is
+   explicitly REFUTED, or a node that actually failed, instead renders the
+   failed rule (the level's change is wrong, or the run died mid-node — a
+   stale ``abstain`` report does not make it a "needs you" decision).
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from mini_ork.ide_pages import spec as S
 
 # The five verification levels, in report order (``mini_ork.verify.levels``).
+# Which levels count as "withheld" is NOT decided here — ``task_state``
+# ``withheld_levels``/``withheld_publish`` own that rule; these names only drive
+# the badge row.
 LEVELS = ("applies", "executes", "target", "preserve", "contract")
 _PROVEN = "PROVEN"
 _REFUTED = "REFUTED"
@@ -44,6 +59,74 @@ def _run_mod():
     from mini_ork.ide_pages import run as run_mod
 
     return run_mod
+
+
+def _ts_mod():
+    """``mini_ork.acp.task_state`` — the one owner of the landed / withheld rules.
+
+    Reached lazily (like ``_run_mod``) so importing this page never drags the
+    fleet projection in at module load. Every caller fails soft: a missing
+    ``task_state`` degrades the card rather than raising into the board.
+    """
+    from mini_ork.acp import task_state as ts_mod
+
+    return ts_mod
+
+
+def _node_events(run) -> list[dict[str, Any]]:
+    """This run's nodes shaped as ``task_state`` ``node_end`` events.
+
+    The *degraded* lifecycle: ``run.nodes`` already folds the job to one row per
+    node, but the card carries only ``finish_reason`` — no payload ``verdict`` /
+    ``error`` — so this loses the failure signals ``_node_end_failure`` also
+    reads. ``_lifecycle_events`` is the faithful source; this stands in only
+    when the DB read fails, and then a ``finish_reason`` failure (``timeout``,
+    ``error``) is still caught.
+    """
+    return [
+        {"event_type": "node_end",
+         "payload_json": {"node_id": n.id, "finish_reason": n.finish}}
+        for n in run.nodes
+    ]
+
+
+def _lifecycle_events(run) -> list[dict[str, Any]] | None:
+    """The run's real ``node_start`` / ``node_end`` rows, or ``None`` if unreadable.
+
+    The same query ``fleet._steps`` and ``task_state``'s snapshot use, so this
+    card applies "did a node fail?" to exactly the bytes the fleet row does. It
+    matters for the common real crash shape: ``kill_run`` / the run reaper close
+    a dangling start with ``{verdict: "CRASH", interrupted: true}`` and NO
+    ``finish_reason`` (``web/control.py:_close_dangling_node_events``) — a
+    ``run.nodes`` reconstruction keeps only ``finish_reason`` and would miss it.
+    """
+    try:
+        from mini_ork.web.db import db_for
+        from mini_ork.web.repositories import RunDetailRepository
+
+        rows = RunDetailRepository(db_for(run.home)).fetch_node_lifecycle_events(run.id)
+    except Exception:  # noqa: BLE001 — a missing DB degrades to the card's nodes
+        return None
+    return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else None
+
+
+def _events_for_gate(run) -> list[dict[str, Any]]:
+    """The events to judge a node failure by: the real lifecycle, else run.nodes."""
+    events = _lifecycle_events(run)
+    return events if events is not None else _node_events(run)
+
+
+def _failing_node_id(run) -> str | None:
+    """The id of a node that failed, per ``task_state._failing_node``; else ``None``.
+
+    ``None`` also when ``task_state`` cannot be imported — the caller then reads
+    "no failing node" and renders a bare "Failed" rather than guessing one.
+    """
+    try:
+        failing = _ts_mod()._failing_node(_events_for_gate(run))
+    except Exception:  # noqa: BLE001 — task_state optional: never blank the card
+        return None
+    return failing[0] if failing else None
 
 
 # ── cheap predicates (also used by ``run._graph`` for its state word) ───────
@@ -341,13 +424,22 @@ def _gate_needs_you(run, gate: dict[str, Any]) -> dict[str, Any]:
 # ── rule 3: failed / rolled back ───────────────────────────────────────────
 
 def _failed(run, hint: dict[str, Any] | None) -> dict[str, Any]:
-    node = ""
-    if isinstance(hint, dict):
-        node = str(hint.get("from_node") or hint.get("failed_node") or "")
     card = _card_detail(run)
     if card == "Failed":  # task_state's FAILED_FALLBACK: no failing node recorded
         card = ""
-    text = card or (f"Failed at {node}" if node else "Failed")
+    node = ""
+    if isinstance(hint, dict):
+        node = str(hint.get("from_node") or hint.get("failed_node") or "")
+    if card:
+        text = card
+    elif _failing_node_id(run) is None:
+        # No node in this run failed (per the fixed ``_failing_node``); the hint
+        # may still name a best-effort node pulled from an impl log — a guess.
+        # The kickoff forbids rendering it: the text stays "Failed" and the
+        # hint's own summary carries the detail.
+        text = "Failed"
+    else:
+        text = f"Failed at {node}" if node else "Failed"
     detail = _failure_detail(run, hint)
     actions, revised = _failed_actions(run, hint)
     if revised and revised not in detail:
@@ -443,6 +535,133 @@ def _lane_actions(run, nc: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+# ── landed elsewhere / withheld publish (§4, §3) ───────────────────────────
+
+def _landed(run) -> dict[str, Any] | None:
+    """``landed.json`` for a terminal-failed run whose change landed elsewhere.
+
+    ``{"commit", "repo", "note"}`` (the sha kept whole; the card truncates to
+    9) or ``None`` when the file is missing / unparsable / carries no commit.
+    Written by the operator or a later tool. Delegates to
+    ``task_state.landed_report`` — the single reader ``task_state`` and
+    ``run_mark`` already share, so the card can never disagree with the tile.
+    """
+    if _status(run) not in _FAILED:
+        return None
+    try:
+        return _ts_mod().landed_report(run.run_dir)
+    except Exception:  # noqa: BLE001 — task_state optional: no landed card
+        return None
+
+
+def _landed_out(run, landed: dict[str, Any]) -> dict[str, Any]:
+    """The done card for a change delivered elsewhere (§4).
+
+    "Open commit" reveals the repo directory — the closest surface the IDE has
+    to a commit (there is no commit-opening verb; ``S.reveal`` is the kickoff's
+    §4 action). The label is the kickoff's wording.
+    """
+    actions: list[dict[str, Any]] = []
+    repo = landed["repo"]
+    if repo and (Path(repo) / ".git").exists():
+        actions.append(S.btn("Open commit", S.reveal(str(repo)), "primary"))
+    return {
+        "state": "done",
+        "tone": "green",
+        "icon": "✓",
+        "text": f"Landed via {landed['commit'][:9]}",
+        "detail": landed["note"],
+        "actions": actions,
+        "callouts": [],
+    }
+
+
+def _withheld(run) -> dict[str, Any] | None:
+    """The withheld-publish card — every step passed, only the publisher abstained.
+
+    ``None`` unless the run is terminal-failed and its level report says
+    ``levels_decision == "abstain"`` (a retry gate or a cost pause outranks it,
+    mirroring ``task_state``'s rule order). A level that is explicitly
+    ``REFUTED``, or a node that actually failed, means the change itself is
+    wrong, so that renders through the failed rule. Evaluated before the
+    ``state_word`` dispatch: the card's live ``task_state`` routes a withheld
+    run to ``needs_you``, which would otherwise reach ``_needs_you`` (the
+    review/gate UX) instead of this card.
+
+    Both the levels and the failing-node gate come from ``task_state``
+    (``withheld_levels`` / ``withheld_publish``) so the card, the tile and the
+    retry hint classify "withheld" by one rule. The gate is fed the run's real
+    lifecycle rows (:func:`_lifecycle_events`) — the same bytes ``task_state``
+    rule 2.5 and ``retry_hint`` judge — so a withheld verdict over a run that
+    was killed or reaped mid-node renders through the failed rule here exactly
+    as it does in the fleet row, and "Publish again" is never offered for a run
+    whose re-run actually died.
+    """
+    if _status(run) not in _FAILED:
+        return None
+    if _pending_gate(run) is not None or (run.run_dir / ".cost-pause").is_file():
+        return None
+    try:
+        ts = _ts_mod()
+        raw = ts.withheld_levels(run.run_dir)
+        if raw is None:
+            return None
+        # A node failed (a stale abstain verdict.json from an earlier attempt,
+        # plus a recover re-run that died mid-node) → the failed rule owns it.
+        # Gate on the SAME rule ``task_state`` rule 2.5 applies, over the run's
+        # REAL lifecycle rows — the card's ``run.nodes`` keep only
+        # ``finish_reason`` and would miss the reaper's verdict-only CRASH end.
+        # Read-only, so the two probes share one try.
+        gate = ts.withheld_publish(run.run_dir, _events_for_gate(run))
+    except Exception:  # noqa: BLE001 — task_state optional: no withheld card
+        return None
+    unproven, refuted = raw
+    if refuted:
+        out = _failed(run, _hint(run))
+        out["text"] = f"Not published — {', '.join(refuted)} refuted"
+        return out
+    if gate is None:
+        return None
+    rv = _run_verdict(run)
+    rev = _review(run)
+    verdict = str((rev or {}).get("verdict") or "").strip() or "pass"
+    passed, total = _verifier_checks(run)
+    detail = (
+        f"Every step passed ({verdict}, checks {passed}/{total}). "
+        "mini-ork publishes only when every level is PROVEN."
+    )
+    reasons = rv.get("levels_reasons") if isinstance(rv.get("levels_reasons"), dict) else {}
+    lines = [
+        f"{name}: {str(reasons.get(name) or '').strip()[:160]}"
+        for name in unproven if str(reasons.get(name) or "").strip()
+    ]
+    if lines:
+        detail += "\n" + "\n".join(lines)
+    actions: list[dict[str, Any]] = [
+        S.btn("Certify this change",
+              S.page_link("verify", "certify", run=run.id), "primary"),
+        S.btn("Publish again",
+              S.cli("board", "retry", run.id,
+                    confirm="Re-run the publisher? It publishes only if the "
+                            "levels are now proven.")),
+    ]
+    for btn in _run_mod()._review_actions(run) or []:
+        # "Certify this change" is THE primary action here — the reviewed card
+        # must not carry two primaries (Certify + the Merge button that
+        # ``_review_actions`` marks primary). Demote the copied Merge to ghost;
+        # Discard already arrives as "danger".
+        actions.append({**btn, "kind": "ghost"} if btn.get("kind") == "primary" else btn)
+    return {
+        "state": "needs_you",
+        "tone": "orange",
+        "icon": "?",
+        "text": f"Not published — {', '.join(unproven)} unverified",
+        "detail": detail,
+        "actions": actions,
+        "callouts": [],
+    }
+
+
 # ── rule 4: published ──────────────────────────────────────────────────────
 
 def _verified(run) -> bool:
@@ -475,15 +694,22 @@ def resolve(run) -> dict[str, Any]:
     Read-only — ``run`` is a :class:`mini_ork.ide_pages.run.Run`; every file the
     outcome reads is read with ``write=False`` (the retry hint) or not at all.
     """
-    state = state_word(run)
-    if state == "needs_you":
-        out = _needs_you(run)
-    elif state == "running":
-        out = _running(run)
-    elif state == "failed":
-        out = _failed(run, _hint(run))
+    landed = _landed(run)
+    withheld = None if landed is not None else _withheld(run)
+    if landed is not None:
+        out = _landed_out(run, landed)
+    elif withheld is not None:
+        out = withheld
     else:
-        out = _published(run)
+        state = state_word(run)
+        if state == "needs_you":
+            out = _needs_you(run)
+        elif state == "running":
+            out = _running(run)
+        elif state == "failed":
+            out = _failed(run, _hint(run))
+        else:
+            out = _published(run)
     out.setdefault("callouts", [])
     out["counts"] = _counts(run)
     out["menu"] = _menu(run, out["actions"])

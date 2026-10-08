@@ -122,7 +122,7 @@ def test_rule3_published_is_done_with_diff_count(tmp_path):
 
 
 def test_rule4_failed_names_the_failing_node_and_reason(tmp_path):
-    """Failed → ``Failed at <node> (<reason>)``; missing reason → ``unknown``."""
+    """Failed → ``Failed at <node> (<reason>)``; a bare end is not a failure."""
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     snap = _snapshot(
@@ -139,8 +139,14 @@ def test_rule4_failed_names_the_failing_node_and_reason(tmp_path):
     assert ts.detail == "Failed at implementer (error)"
 
 
-def test_rule4_failed_without_finish_reason_falls_back_to_unknown(tmp_path):
-    """A node_end with no ``finish_reason`` payload still surfaces as the failing node."""
+def test_rule4_failed_without_finish_reason_is_not_the_failing_node(tmp_path):
+    """A bare ``node_end`` (no finish_reason / verdict / error) is NOT a failure.
+
+    kickoff ``withheld-publish-outcome`` change 1: code-fix implementer
+    ``node_end`` events carry no ``finish_reason``, so the old "missing ⇒
+    unknown ⇒ failed" rule blamed the implementer for a run that never failed
+    there. With no node naming itself failed, the detail is the bare fallback.
+    """
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     snap = _snapshot(
@@ -151,7 +157,7 @@ def test_rule4_failed_without_finish_reason_falls_back_to_unknown(tmp_path):
     )
     ts = task_state(run_dir, snap)
     assert ts.state == "failed"
-    assert ts.detail == "Failed at rollback (unknown)"
+    assert ts.detail == FAILED_FALLBACK
 
 
 def test_rule4_failed_with_all_clean_ends_falls_back_to_just_failed(tmp_path):

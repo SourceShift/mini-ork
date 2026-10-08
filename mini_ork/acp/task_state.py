@@ -1,12 +1,15 @@
 """Per-run task state for the ACP thread surface (Zed S1).
 
 A single ``task_state(run_dir, snapshot)`` call answers the kickoff's
-five-rule question — *what is this run doing right now, and is the
-user needed?* — without any I/O beyond the ``.cost-pause`` sentinel
-and the cached diff list. ``run_mark`` is the cheap sibling used by
-``list_sessions`` for the run rows in the thread list (no event /
-diff reads); ``title_with_state`` formats the title that lands in
-Zed's thread list.
+rule question — *what is this run doing right now, and is the user
+needed?* — with no I/O beyond three cheap sentinels (``.cost-pause``,
+``retry-gate.json``, ``landed.json``), the cached diff list and the
+run's small level report (``verdict.json`` / ``run-verdict.json``);
+every file read is skipped unless the run is terminal, and every read
+fails soft. ``run_mark`` is the cheap sibling used by ``list_sessions``
+for the run rows in the thread list — file reads only, never events or
+diffs; ``title_with_state`` formats the title that lands in Zed's
+thread list.
 
 Pure functions, no async, no ACP types, no module-level state — same
 shape as ``mini_ork.acp.diffs`` (``diffs.py:15-16``: "Pure functions:
@@ -59,6 +62,21 @@ FAILED_FALLBACK = "Failed"
 FAILED_AT_PREFIX = "Failed at "
 FAILED_AT_SUFFIX_OPEN = " ("
 FAILED_AT_SUFFIX_CLOSE = ")"
+WITHHELD_PREFIX = "Not published: "
+WITHHELD_SUFFIX = " unverified — review and decide"
+LANDED_PREFIX = "Landed via "
+
+# The level vocabulary and the run-dir files that carry it. Mirrors
+# ``mini_ork.verify.levels`` (``LEVELS``/``PROVEN``/``REFUTED``/``NA``) and
+# ``ide_pages.outcome``'s read order — kept local so this module stays a leaf
+# (no import of the verify package).
+LEVELS = ("applies", "executes", "target", "preserve", "contract")
+PROVEN = "PROVEN"
+REFUTED = "REFUTED"
+NA = "n/a"
+RUN_VERDICT_NAME = "run-verdict.json"
+VERDICT_NAME = "verdict.json"
+LANDED_NAME = "landed.json"
 
 
 @dataclass(frozen=True)
@@ -135,26 +153,74 @@ def _current_step(events: list[dict[str, Any]]) -> str:
     return last_seen
 
 
-def _failing_node(events: list[dict[str, Any]]) -> tuple[str, str] | None:
-    """The last ``node_end`` whose ``finish_reason`` is not ``"done"``; ``None`` when all clean.
+# ``finish_reason`` values a completed node carries. Anything else explicit
+# ("error", "timeout", "interrupted", …) is a failure. ``levels_unverified`` is
+# the publisher's own abstain signal (``publisher.py`` returns
+# ``(0, "levels_unverified")``); it is a withheld publish, not a crashed node —
+# treating it as a failure would blame the publisher and make every withheld
+# surface decline.
+_TERMINAL_OK_FINISH = ("done", "skipped", "abstain", "levels_unverified")
 
-    The detail format is ``"Failed at <id> (<finish_reason>)"`` when
-    found, else plain ``"Failed"`` — kickoff rule 4. ``finish_reason``
-    is a string key in the ``node_end`` payload; missing / empty is
-    treated as ``"unknown"`` so the user still gets a useful line.
+# Payload ``verdict`` values that say the node's own judgement was negative.
+_FAIL_VERDICTS = (
+    "request_changes", "escalate", "crash", "needs_revision", "fail", "failed",
+)
+
+
+def _node_end_failure(payload: dict[str, Any]) -> str | None:
+    """The reason string when a ``node_end`` payload *says* it failed, else ``None``.
+
+    Only an explicit failure signal counts (kickoff change 1):
+
+    * a ``finish_reason`` other than ``done`` / ``skipped`` / ``abstain`` /
+      ``levels_unverified``;
+    * a ``verdict`` in ``{REQUEST_CHANGES, ESCALATE, CRASH, needs_revision,
+      fail, failed}`` (case-insensitive);
+    * a non-empty ``error``.
+
+    A missing ``finish_reason`` with no other failure signal is NOT a failure.
+    The live bug this rule closes: code-fix implementer ``node_end`` events
+    carry no ``finish_reason``, so the old "missing ⇒ unknown ⇒ failed" rule
+    blamed the implementer for a run that never failed at all.
     """
-    failing: tuple[str, str] | None = None
-    for ev in events:
+    reason = payload.get("finish_reason")
+    if reason is not None and str(reason) != "":
+        reason = str(reason)
+        return None if reason in _TERMINAL_OK_FINISH else reason
+    verdict = str(payload.get("verdict") or "")
+    if verdict.lower() in _FAIL_VERDICTS:
+        return verdict
+    if str(payload.get("error") or ""):
+        return "error"
+    return None
+
+
+def _failing_node(events: list[dict[str, Any]]) -> tuple[str, str] | None:
+    """The last node still failing, as ``(node_id, reason)``; ``None`` when all clean.
+
+    Per-node state: a node's *later* ``node_end`` (a revise round that passed)
+    clears an earlier failure of the same id, so only the node whose LAST
+    ``node_end`` carries a failure signal is reported. ``_node_end_failure``
+    decides what "carries a failure signal" means — a bare ``node_end`` is not
+    a failure. The detail format is ``"Failed at <id> (<reason>)"`` when found,
+    else plain ``"Failed"`` (kickoff rule 4).
+    """
+    state: dict[str, str | None] = {}
+    last_index: dict[str, int] = {}
+    for index, ev in enumerate(events):
         if ev.get("event_type") != "node_end":
             continue
         node_id, _ = _node_id_and_step(ev)
         if not node_id:
             continue
         payload = _parse_payload(ev.get("payload_json"))
-        reason = str(payload.get("finish_reason") or "unknown")
-        if reason != "done":
-            failing = (node_id, reason)
-    return failing
+        state[node_id] = _node_end_failure(payload)
+        last_index[node_id] = index
+    failing = [nid for nid, reason in state.items() if reason is not None]
+    if not failing:
+        return None
+    node_id = max(failing, key=lambda nid: last_index[nid])
+    return node_id, str(state[node_id])
 
 
 def _diffstat_cached(run_dir: Path) -> tuple[int, int] | None:
@@ -276,6 +342,137 @@ def _diff_counts(run_dir: Path) -> tuple[int, int, bool] | None:
     return added, removed, cacheable
 
 
+def _read_json_obj(path: Path) -> dict[str, Any] | None:
+    """A JSON object from ``path``; ``None`` when missing, unparsable or not an object.
+
+    The module's standing fail-soft contract: a half-written run dir, a
+    read-only home or a banner line in front of the JSON degrades to ``None``
+    rather than raising into a board 500.
+    """
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def run_level_report(run_dir: Path | None) -> dict[str, Any] | None:
+    """The run's level report: ``run-verdict.json``, else ``verdict.json`` when it
+    carries ``levels`` / ``levels_decision``.
+
+    Mirrors ``ide_pages.outcome._run_verdict`` (and ``retry_hint``'s read) so a
+    run is judged withheld by exactly one rule everywhere. ``None`` when neither
+    file exists or parses — a recipe that does not own ``verdict.json`` and a
+    missing level vector both land here.
+    """
+    if run_dir is None:
+        return None
+    base = Path(run_dir)
+    report = _read_json_obj(base / RUN_VERDICT_NAME)
+    if report is not None:
+        return report
+    fallback = _read_json_obj(base / VERDICT_NAME)
+    if fallback is not None and ("levels" in fallback or "levels_decision" in fallback):
+        return fallback
+    return None
+
+
+def withheld_levels(run_dir: Path | None) -> tuple[list[str], list[str]] | None:
+    """``(unproven, refuted)`` level names for a run whose publish was withheld.
+
+    ``None`` when the run has no level report, or its ``levels_decision`` is not
+    ``"abstain"`` — i.e. the publisher never withheld this run. ``unproven`` is
+    every level that is neither ``PROVEN`` nor ``n/a`` (an ``n/a`` level has not
+    failed), in report order; ``refuted`` is the subset that is explicitly
+    ``REFUTED`` — a refute means the change itself was wrong, so callers route
+    to the failed rule instead of "needs you".
+
+    Read once, fail soft. Shared by ``task_state``, ``run_mark``,
+    ``ide_pages.outcome`` and ``recovery.retry_hint`` so the cheap tile count
+    and the precise list can never disagree about what "withheld" means.
+    """
+    report = run_level_report(run_dir)
+    if not isinstance(report, dict):
+        return None
+    if str(report.get("levels_decision") or "") != "abstain":
+        return None
+    levels = report.get("levels")
+    if not isinstance(levels, dict):
+        return None
+    unproven: list[str] = []
+    refuted: list[str] = []
+    for name in LEVELS:
+        if name not in levels:
+            continue
+        value = str(levels.get(name) or "")
+        if value in ("", PROVEN, NA):
+            continue
+        unproven.append(name)
+        if value == REFUTED:
+            refuted.append(name)
+    if not unproven:
+        return None
+    return unproven, refuted
+
+
+def withheld_publish(run_dir: Path | None,
+                     events: list[dict[str, Any]] | None = None) -> list[str] | None:
+    """The non-PROVEN level names when the publisher withheld and nothing failed.
+
+    The single "needs you, not failed" gate — the withheld rule of ``task_state``
+    (rule 2.5), ``run_mark``, ``ide_pages.outcome`` and ``recovery.retry_hint``
+    all reach for this one function so the tile, the card and the retry hint can
+    never disagree about whether a run is merely withheld.
+
+    ``None`` (the run is NOT merely withheld) when:
+
+    * the level report is missing or does not say ``abstain`` — the publisher
+      never withheld it;
+    * a level is explicitly ``REFUTED`` — the change itself is wrong, so the
+      failed rule owns it (not a "needs you" decision);
+    * ``events`` is given and a node failed per :func:`_failing_node` — a real
+      failure, even when an earlier attempt's ``abstain`` verdict.json is still
+      in the run dir (a recover re-run that died mid-node).
+
+    ``events`` may be ``None`` for a caller that has not (or cannot) read the
+    lifecycle: the level report alone then decides. That is the *provisional*
+    answer ``run_mark`` takes before confirming against
+    :func:`_lifecycle_events_for` — the cheap first pass keeps the file-only
+    cost, so a caller that cannot see events must not present it as final. A
+    caller that *can* see events but whose read failed (``retry_hint``) passes
+    ``None`` only after deciding to decline — never as a silent "no node failed".
+    """
+    withheld = withheld_levels(run_dir)
+    if withheld is None or withheld[1]:
+        return None
+    if events is not None and _failing_node(events) is not None:
+        return None
+    return withheld[0]
+
+
+def landed_report(run_dir: Path | None) -> dict[str, Any] | None:
+    """``landed.json`` for a terminal run whose change landed elsewhere.
+
+    ``{"commit", "repo", "note"}`` (the sha kept whole; callers truncate to 9
+    for display) or ``None`` when the file is missing / unparsable / carries no
+    ``commit``. Written by the operator or a later tool — a delivered change
+    must never keep looking failed.
+    """
+    if run_dir is None:
+        return None
+    data = _read_json_obj(Path(run_dir) / LANDED_NAME)
+    if data is None:
+        return None
+    commit = str(data.get("commit") or "").strip()
+    if not commit:
+        return None
+    return {
+        "commit": commit,
+        "repo": str(data.get("repo") or ""),
+        "note": str(data.get("note") or ""),
+    }
+
+
 def task_state(run_dir: Path, snapshot: dict[str, Any]) -> TaskState:
     """Map a run snapshot to its ``TaskState`` per the five-rule kickoff spec.
 
@@ -287,6 +484,25 @@ def task_state(run_dir: Path, snapshot: dict[str, Any]) -> TaskState:
     path = Path(run_dir) if run_dir is not None else None
     status = snapshot.get("status")
     events = list(snapshot.get("events") or [])
+
+    # Rule -1 (landed): the change WAS delivered — by a later revision or a
+    # direct commit — so a terminal run carrying ``landed.json`` is done, never
+    # failed. First among the terminal rules: it beats the retry gate, the
+    # withheld rule and the kept-worktree rule (kickoff §4). Cheap: only paid
+    # when the row is terminal, and the read is a miss unless the file exists.
+    if path is not None and status in ("failed", "rolled_back"):
+        landed = landed_report(path)
+        if landed is not None:
+            detail = LANDED_PREFIX + landed["commit"][:9]
+            if landed["note"]:
+                detail += f" — {landed['note']}"
+            return TaskState(
+                state="done",
+                detail=detail,
+                step=_current_step(events),
+                added=0,
+                removed=0,
+            )
 
     # Rule 0: a pending ``retry_precondition`` gate means a prior cycle
     # failed in a way the operator must fix before this run can continue.
@@ -349,6 +565,25 @@ def task_state(run_dir: Path, snapshot: dict[str, Any]) -> TaskState:
                     added=0,
                     removed=0,
                 )
+
+    # Rule 2.5 (withheld publish): every node passed but the publisher
+    # abstained — a level was not PROVEN — so nothing failed and the user must
+    # decide, not revise. Sits BEFORE the worktree rule so a kept worktree
+    # cannot flip it back to "failed", and after the pending-gate / cost-pause
+    # rules so a real blocker still wins. A level that is explicitly REFUTED, or
+    # a node that actually failed (a stale abstain verdict.json from an earlier
+    # attempt plus a recover re-run that died mid-node), falls through to the
+    # failed rule — the change itself is wrong there.
+    if path is not None and status in ("failed", "rolled_back"):
+        withheld = withheld_publish(path, events)
+        if withheld is not None:
+            return TaskState(
+                state="needs_you",
+                detail=WITHHELD_PREFIX + ", ".join(withheld) + WITHHELD_SUFFIX,
+                step=_current_step(events),
+                added=0,
+                removed=0,
+            )
 
     # Rule 3: terminal run with an open workspace record that still has
     # commits ahead or uncommitted changes → "ready to review". The
@@ -506,14 +741,46 @@ def _workspace_status_for_terminal_run(run_dir: Path | None) -> dict[str, Any] |
     }
 
 
-def run_mark(status: str | None, run_dir: Path | None) -> str:
-    """Cheap mark glyph for ``list_sessions`` rows — no event or diff reads.
+def _lifecycle_events_for(run_dir: Path) -> list[dict[str, Any]] | None:
+    """A run's ``node_start`` / ``node_end`` rows, or ``None`` when unreadable.
 
-    A ``.cost-pause`` sentinel flips any non-terminal status to the
-    "needs you" mark; a terminal run with an open workspace record
-    whose branch still has changes also flips to ✋ (S5); published →
-    done; failed / rolled_back → failed; anything else → working. The
-    mark is the prefix Zed's thread list shows next to the run's title.
+    ``<home>/state.db`` is reached exactly as :func:`run_mark`'s other probes
+    reach it (``run_dir.parent.parent``, the run id being the dir name). The
+    imports are lazy and the guard broad so this stays a leaf: a missing, locked
+    or schema-less DB degrades to ``None`` — the caller then keeps the
+    level-report-only answer — instead of raising into a list render.
+    """
+    try:
+        from mini_ork.web.db import db_for
+        from mini_ork.web.repositories import RunDetailRepository
+
+        rows = RunDetailRepository(db_for(run_dir.parent.parent)).fetch_node_lifecycle_events(
+            run_dir.name)
+    except Exception:  # noqa: BLE001 — no DB: no lifecycle
+        return None
+    return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else None
+
+
+def run_mark(status: str | None, run_dir: Path | None) -> str:
+    """Cheap mark glyph for ``list_sessions`` rows — file reads, no diff reads.
+
+    A ``.cost-pause`` sentinel flips any non-terminal status to the "needs you"
+    mark; a terminal run that landed elsewhere (``landed.json``) is done; one
+    whose publisher withheld (``verdict.json`` says ``abstain``, no level
+    refuted, no failing node) is "needs you"; a terminal run with an open
+    workspace record whose branch still changes also flips to ✋ (S5);
+    published → done; failed / rolled_back → failed; anything else → working.
+    The mark is the prefix Zed's thread list shows next to the run's title, so
+    it must agree with ``task_state`` — both re-read the same helpers.
+
+    The withheld branch is the one case the level report alone cannot settle: a
+    stale ``abstain`` verdict.json over a run that actually died mid-node — a
+    killed / reaped re-run whose crash end carries only ``verdict: CRASH`` —
+    would read "needs you" here while the precise row says failed, and the
+    kickoff requires the tile count and the list to agree. So this branch, and
+    only this branch, confirms against the run's lifecycle with one bounded
+    query (``_lifecycle_events_for``); every other mark stays a pure file read,
+    and an unreadable DB keeps the level-report-only answer.
     """
     path = Path(run_dir) if run_dir is not None else None
     if path is not None and (path / ".cost-pause").exists() and status not in (
@@ -522,6 +789,19 @@ def run_mark(status: str | None, run_dir: Path | None) -> str:
         "failed",
     ):
         return MARKS["needs_you"]
+    if status in ("failed", "rolled_back") and path is not None:
+        # Landed elsewhere → done (beats the worktree, gate and withheld rules),
+        # then a withheld publish → needs_you. Both mirror ``task_state`` so the
+        # tile count matches the list ("one count").
+        if landed_report(path) is not None:
+            return MARKS["done"]
+        if withheld_publish(path) is not None:
+            # Provisional (level report only) — confirm against the lifecycle so
+            # a stale ``abstain`` over a crashed re-run marks failed, not
+            # needs-you. An unreadable DB keeps the provisional answer.
+            events = _lifecycle_events_for(path)
+            if events is None or withheld_publish(path, events) is not None:
+                return MARKS["needs_you"]
     if status in ("published", "failed", "rolled_back") and path is not None:
         home = path.parent.parent
         if (home / "worktrees" / f"{path.name}.json").is_file():
@@ -573,7 +853,11 @@ def title_with_state(base: str, ts: TaskState | None) -> str:
 __all__ = [
     "MARKS",
     "TaskState",
-    "task_state",
+    "landed_report",
+    "run_level_report",
     "run_mark",
+    "task_state",
     "title_with_state",
+    "withheld_levels",
+    "withheld_publish",
 ]
