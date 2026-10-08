@@ -242,26 +242,60 @@ def _working_tree_clean(cwd: str) -> bool:
     return proc.returncode == 0 and not proc.stdout.strip()
 
 
-def _run_dir_base_ref() -> str:
-    """The base to replay/baseline against when the run COMMITTED, else "".
+def _strict_ancestor(ref: str, cwd: str) -> bool:
+    """True when ``ref`` is a STRICT ancestor of HEAD in ``cwd``.
 
-    The code-fix implementer may COMMIT its change. Then the working tree is
-    clean and HEAD already carries the patch, so a base built from HEAD is the
-    candidate itself and the delta gate refutes a correct patch with
-    ``tests-do-not-exercise-change``. In that case the replay base must be the
-    run's `pre-implementer-ref` (the snapshot `execute.py` records before the
-    implementer edits).
-
-    When the working tree is DIRTY the patch is the uncommitted diff and HEAD
-    is already the pre-patch tree, so we return "" (use HEAD) — the unchanged
-    path. `pre-implementer-ref` is written via `git stash create`, so it is
-    NOT unconditionally the pre-patch tree (a caller that stages changes before
-    the run makes the snapshot carry them); the cleanliness gate keeps us off
-    that ref exactly when it would be wrong.
+    A strict ancestor means HEAD has advanced past the snapshot — the run's
+    work is committed into HEAD, so ``ref`` is the true pre-patch base even if
+    the working tree is dirty from a leftover in-scope edit. A `git stash
+    create` snapshot is a CHILD of the HEAD it was taken on, never an
+    ancestor, so this is False for the "caller staged before the run" hazard.
     """
-    if not _working_tree_clean(os.getcwd()):
+    if not ref:
+        return False
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=cwd, capture_output=True, text=True,
+    ).stdout.strip()
+    if not head or head == ref:
+        return False
+    proc = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", ref, head],
+        cwd=cwd, capture_output=True, text=True,
+    )
+    return proc.returncode == 0
+
+
+def _run_dir_base_ref() -> str:
+    """The base to replay/baseline against, or "" to use HEAD.
+
+    The base must be a commit that does NOT contain the patch. Two recorded
+    situations where HEAD is NOT that commit:
+
+    1. The implementer COMMITTED its change and left the tree CLEAN, so HEAD
+       already carries the fix (+ tests) and a base built from HEAD is the
+       candidate itself.
+    2. The run's work reached HEAD by a commit (e.g. a recovery commit) but an
+       extra in-scope file is still uncommitted, so the tree is DIRTY while
+       HEAD is post-patch. A dirty tree alone is NOT proof that HEAD is
+       pre-patch.
+
+    Both are detected by the same fact: the run's `pre-implementer-ref` is a
+    STRICT ANCESTOR of HEAD, i.e. HEAD advanced past the snapshot — so the
+    snapshot is the pre-patch base. When HEAD has not advanced (``ref ==
+    HEAD``, the ordinary uncommitted-diff case) we return "" and use HEAD.
+
+    `pre-implementer-ref` is written via `git stash create`, so it is NOT
+    unconditionally the pre-patch tree (a caller that stages changes before
+    the run makes the snapshot carry them). That hazard is excluded here
+    without relying on cleanliness: a stash snapshot is a CHILD of HEAD, never
+    a strict ancestor, so ``_strict_ancestor`` is False for it.
+    """
+    ref = _run_dir_ref()
+    if not ref:
         return ""
-    return _run_dir_ref()
+    if _working_tree_clean(os.getcwd()) or _strict_ancestor(ref, os.getcwd()):
+        return ref
+    return ""
 
 
 def _candidate_delta_entries(candidate_cwd: str, base_ref: str = "") -> list[tuple[str, str]]:

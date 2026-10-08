@@ -487,6 +487,53 @@ def test_replay_base_is_pre_implementer_ref_for_committed_patch(tmp_path):
     assert any("test_fixed" in tid for tid in out["replay"]["overlap"]), out["replay"]
 
 
+def test_replay_base_ref_when_committed_but_tree_dirty(tmp_path):
+    """Committed fix + a LEFTOVER uncommitted in-scope file → base is still the
+    pre-implementer-ref, not the (post-patch) HEAD.
+
+    Regression (ask-k2, 2026-10-08): the run's work reached HEAD via a recovery
+    commit while one in-scope file stayed modified, so the tree was DIRTY. The
+    old cleanliness gate read "dirty ⇒ HEAD is pre-patch" and built the base
+    from HEAD — which already held the committed fix + tests — refuting a
+    correct patch with ``tests-do-not-exercise-change``. Dirty does not imply
+    HEAD is pre-patch when the ref is a strict ancestor of HEAD."""
+    repo = _make_repo(
+        tmp_path,
+        mod_src="def add(a, b):\n    return a - b\n",
+        test_src="from mod import add\n\ndef test_add_trivial():\n    assert add(0, 0) == 0\n",
+    )
+    # A tracked, in-scope, NON-test file whose later edit dirties the tree.
+    (repo / "notes.txt").write_text("v1\n")
+    _git(repo, "add", "notes.txt")
+    _git(repo, "commit", "-q", "-m", "notes")
+    pre = _git_text(repo, "rev-parse", "HEAD").strip()
+
+    # Candidate COMMITS the fix + a regression test that fails on buggy code...
+    (repo / "mod.py").write_text("def add(a, b):\n    return a + b\n")
+    tests_dir = repo / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_fix.py").write_text(
+        "from mod import add\n\ndef test_fixed():\n    assert add(2, 3) == 5\n"
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "fix + regression test")
+    # ...then leaves an in-scope file COMMITTED-adjacent dirty (the mixed state).
+    (repo / "notes.txt").write_text("v2\n")
+    assert _git_text(repo, "status", "--porcelain").strip() != "", (
+        "worktree must be dirty for this regression"
+    )
+
+    _write_ref(tmp_path, "replay-mixed", pre)
+
+    out = _run_verifier(repo, tmp_path, replay="1", run_id="replay-mixed")
+
+    assert out["verifier"] == "test"
+    assert out["pass"] is True, out
+    assert "exercise" in out["error_summary"], out
+    assert out["replay"]["overlaid_tests"] == ["tests/test_fix.py"], out["replay"]
+    assert any("test_fixed" in tid for tid in out["replay"]["overlap"]), out["replay"]
+
+
 def test_replay_committed_test_passing_on_base_not_proven(tmp_path):
     """Committed no-op + committed redundant test that ALSO passes on the base:
     the overlay must still refuse to call it proof (anti-gaming guard holds
