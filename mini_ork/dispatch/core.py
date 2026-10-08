@@ -17,9 +17,11 @@ breaking. Two structural guarantees the bash version could not make:
   3. **Process contract.** The harness is spawned into its own session
      (`start_new_session=True`) so neither it nor anything it spawns has a
      controlling terminal — no `/dev/tty` prompt can block a headless run. A
-     timeout SIGKILLs the whole detached process *group*, so a hung harness
-     can't orphan grandchildren that keep burning the lane (and can't deadlock
-     the output drain by holding the inherited stdout pipe).
+     timeout SIGKILLs the whole detached process *group* — and then the ppid
+     tree, since the harness starts each of its own commands in a separate
+     group — so a hung harness can't orphan grandchildren that keep burning the
+     lane (and can't deadlock the output drain by holding the inherited stdout
+     pipe).
 """
 
 from __future__ import annotations
@@ -101,21 +103,104 @@ def _failure_detail(stdout: str, stderr: str) -> str:
     return envelope + sep + tail[-room:]
 
 
-def _terminate_process_group(proc: "subprocess.Popen[str]") -> None:
-    """SIGKILL the whole session the child leads. The child was spawned with
-    ``start_new_session=True``, so it is its own process-group leader; killing
-    the *group* — not just the direct child — reaps any grandchildren the
-    harness spawned (claude's helpers, codex's sidecar). That matters twice: a
-    hung lane can't leave orphans that keep burning cost after we've abandoned
-    it, and it frees the inherited stdout pipe those grandchildren hold, which
-    is what would otherwise deadlock the drain ``communicate()``. Best-effort —
-    if the group is already gone, fall back to the direct child."""
+def _descendant_pids(root_pid: int) -> list[int]:
+    """Every live descendant of ``root_pid``, read from one ``ps`` snapshot.
+
+    The process-group kill below is not sufficient on its own: the Claude CLI
+    runs each Bash tool command in its *own* process group, so those commands —
+    and everything under them — survive a kill of the leader's group and
+    reparent to pid 1. A cargo build the agent started held its build-directory
+    lock for 57 minutes after its node timed out for exactly this reason. The
+    ppid tree is the only link that still spans those escaped groups, and it is
+    only observable while the leader is alive, so this snapshot is taken
+    *before* any signal is sent.
+
+    Fail-soft: any error (no ``ps``, a wedged ``ps``, an unparsable line) yields
+    ``[]``. A diagnostic probe that could hang or raise would be worse than the
+    orphan it is meant to catch. ``root_pid`` itself is never in the result.
+    """
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        out = subprocess.run(
+            ["ps", "-A", "-o", "pid=,ppid="],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    children: dict[int, list[int]] = {}
+    try:
+        for line in out.stdout.splitlines():
+            fields = line.split()
+            if len(fields) != 2:
+                continue
+            pid, ppid = int(fields[0]), int(fields[1])
+            children.setdefault(ppid, []).append(pid)
+    except ValueError:
+        return []
+    # Breadth-first over the ppid map, guarding against a cycle in a pid map
+    # that changed under us (a reparent to 1, a recycled pid).
+    descendants: list[int] = []
+    seen = {root_pid}
+    frontier = [root_pid]
+    while frontier:
+        following: list[int] = []
+        for parent in frontier:
+            for child in children.get(parent, []):
+                if child in seen:
+                    continue
+                seen.add(child)
+                descendants.append(child)
+                following.append(child)
+        frontier = following
+    return descendants
+
+
+def _terminate_process_group(proc: "subprocess.Popen[str]") -> None:
+    """SIGKILL the child and everything it started, in or out of its group.
+
+    The child was spawned with ``start_new_session=True``, so it leads its own
+    process group; killing that *group* — not just the direct child — reaps the
+    grandchildren that share it (claude's helpers, codex's sidecar). But a group
+    kill alone does not reach everything: the Claude CLI runs each Bash tool
+    command in a *separate* process group, so those commands and their
+    descendants survive the group kill and reparent to pid 1 — the orphan that
+    kept a cargo build-directory lock, and burned CPU and memory, long after its
+    node had been abandoned. So the ppid tree is collected first (once the
+    leader dies the link to what it started is gone), then the leader's group is
+    killed, then each collected descendant's group is swept. That also matters
+    for the drain: the escaped groups hold the inherited stdout pipe, and the
+    sweep is what finally closes it.
+
+    Best-effort throughout: the group kill falls back to the direct child, and
+    every descendant signal swallows a lookup/permission failure. Never signals
+    this process's own group (``os.getpgrp()``), the leader's own already-killed
+    group, or pid 1.
+    """
+    # Snapshot before any signal: after the leader dies its children reparent to
+    # pid 1 and the ppid tree that identifies them is lost.
+    descendants = _descendant_pids(proc.pid)
+    leader_pgid: int | None = None
+    try:
+        leader_pgid = os.getpgid(proc.pid)
+        os.killpg(leader_pgid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
         try:
             proc.kill()
         except OSError:
+            pass
+    own_pgid = os.getpgrp()
+    for pid in descendants:
+        if pid <= 1 or pid == os.getpid():
+            continue
+        try:
+            pgid = os.getpgid(pid)
+            # The leader's group was already signalled; our own group must never
+            # be signalled (a mis-mapped pid must not take the harness down with
+            # it), so those fall back to a single-pid kill.
+            if pgid not in (leader_pgid, own_pgid, 1):
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
             pass
 
 
