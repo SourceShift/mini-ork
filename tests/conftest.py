@@ -15,9 +15,28 @@ directory around every test, isolating that leakage suite-wide.
 """
 from __future__ import annotations
 
+import getpass
 import os
+import tempfile
+from pathlib import Path
 
 import pytest
+
+from scratch_prune import prune_stale_basetemps
+
+# Basetemps untouched this long belong to no live session (see scratch_prune).
+_STALE_BASETEMP_AGE_S = 3 * 60 * 60
+
+
+def pytest_sessionstart(session):
+    # Controller only: xdist workers share the controller's basetemp root.
+    if hasattr(session.config, "workerinput"):
+        return
+    try:
+        root = Path(tempfile.gettempdir()) / f"pytest-of-{getpass.getuser()}"
+        prune_stale_basetemps(root, max_age_s=_STALE_BASETEMP_AGE_S)
+    except Exception:  # noqa: BLE001 — scratch hygiene must never fail a test session
+        pass
 
 
 @pytest.fixture(autouse=True)

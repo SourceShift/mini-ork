@@ -73,6 +73,9 @@ include = ["mini_ork*"]
 #     under docs/research/experiments/fixtures/** (sample tasks, not real tests).
 pythonpath = ["."]
 testpaths = ["tests"]
+#   - keep tmp_path dirs only for failed tests: a passing session's scratch is
+#     deleted at session end (the suite writes ~20 GB/day across concurrent runs).
+tmp_path_retention_policy = "failed"
 
 [tool.ruff]
 target-version = "py311"
