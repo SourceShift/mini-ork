@@ -117,15 +117,23 @@ def test_red_non_pytest_emits_fail(tmp_path):
     assert "suite_green" not in out, out
 
 
-# ── 3. replay opt-out, green → pass ────────────────────────────────────────
-def test_green_opt_out_emits_pass(tmp_path):
-    """With the delta-gate replay off, a green command certifies: `pass: true`."""
+# ── 3. replay opt-out, green non-runner → the same abstention ───────────────
+def test_green_opt_out_non_runner_is_the_same_abstention(tmp_path):
+    """The opt-out no longer hides applicability: a green command with no
+    pytest/jest/vitest runner and no results file abstains exactly as without
+    the opt-out (`replay_applicable: false` → target n/a), instead of a bare
+    `pass: true` that left target UNVERIFIED and withheld green runs. A pytest
+    command with the opt-out keeps its plain green pass
+    (test_replay_early_applicability.py)."""
     repo = _make_repo(tmp_path)
 
     rc, out = _run_verifier(repo, tmp_path, cmd=GREEN_CMD, replay="0", run_id="optout-pass")
 
     assert rc == 0, out
-    assert out["pass"] is True, out
+    assert out["pass"] is False, out
+    assert out["status"] == "unverified", out
+    assert out["suite_green"] is True, out
+    assert out["replay_applicable"] is False, out
 
 
 # ── 4. prompt guard: reviewer.md teaches the abstention rule ────────────────

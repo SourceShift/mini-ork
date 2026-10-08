@@ -95,11 +95,17 @@ except Exception:                       # pragma: no cover — defensive only
 
 try:
     # Late import — the jest/vitest/results-file leg of the red-base per-test
-    # parse; only used when the test command is not pytest.
-    from mini_ork.certify.test_results import augment_for_results, parse_results_dir
+    # parse and the early replay-applicability decision; only used when the
+    # test command is not pytest.
+    from mini_ork.certify.test_results import (
+        augment_for_results,
+        detect_runners,
+        parse_results_dir,
+    )
     _TEST_RESULTS_AVAILABLE = True
 except Exception:                       # pragma: no cover — defensive only
     augment_for_results = None          # type: ignore[assignment]
+    detect_runners = None               # type: ignore[assignment]
     parse_results_dir = None            # type: ignore[assignment]
     _TEST_RESULTS_AVAILABLE = False
 
@@ -809,6 +815,46 @@ def _detach_git_worktree(wt):
     shutil.rmtree(wt, ignore_errors=True)
 
 
+def _runner_detection_available():
+    """True when the structured-runner classifier is importable.
+
+    False in a target repo with no ``mini_ork`` on path (the seam at the top
+    of this file). Callers must treat "unavailable" as *applicable* rather
+    than as *not applicable*.
+    """
+    return _TEST_RESULTS_AVAILABLE and detect_runners is not None
+
+
+def _replay_applies(cmd, results_dir):
+    """Whether the delta-gate replay instrument applies to this command.
+
+    Applicability is a property of the command and of what its post-patch run
+    produced — it never needs a base run, so it can be decided BEFORE any
+    base worktree is attached (the cold-build disk incident).
+
+      - a pytest/jest/vitest runner → applies;
+      - otherwise, applies only when the post-patch run wrote a results file
+        the oracle can PARSE into ``results_dir`` (the results-file contract);
+      - when the runner classifier is unavailable (no ``mini_ork`` on path),
+        report *applicable*: an unprovable non-applicability must not silently
+        downgrade ``target`` from UNVERIFIED to ``n/a`` (publish without proof).
+    """
+    if not _runner_detection_available():
+        return True
+    if detect_runners(cmd):
+        return True
+    if results_dir and os.path.isdir(results_dir):
+        # The oracle treats the command as applicable only when it finds a
+        # PARSABLE results file (jest/vitest JSON, JUnit XML); a stray log or
+        # empty subdir would otherwise trigger the cold base build and still end
+        # n/a. Same parser here, so the early decision matches the late one.
+        try:
+            return parse_results_dir(results_dir, os.getcwd()) is not None
+        except Exception:  # noqa: BLE001 — an unreadable dir is "no results file"
+            return False
+    return False
+
+
 def _run_replay_check():
     """Run the delta-gate replay. Returns the replay_check() dict, or None if skipped.
 
@@ -870,69 +916,99 @@ def main():
 
     # ── Post-patch run (current working tree = patched) ──────────────────
     sys.stderr.write(f"[test] running: {CMD}\n")
-    post_rc = run_suite(LOG_PATH, env=_child_env())
-
-    if post_rc == 0:
-        # ── Delta-gate replay: a green suite that doesn't exercise the bug is theatre ──
-        if os.environ.get("MO_CODEFIX_REPLAY", "1") == "0":
-            return _green_pass("post-patch suite green (replay opt-out: MO_CODEFIX_REPLAY=0)", post_rc)
-        replay_result = _run_replay_check()
-        if replay_result is None:
-            return _green_pass("post-patch suite green (replay skipped: certify unavailable or not a git repo)", post_rc)
-        if replay_result.get("unverified"):
-            return emit_unverified(post_rc, replay_result["reason"],
-                                   replay=replay_result.get("replay"),
-                                   replay_applicable=replay_result.get("applicable"))
-        if replay_result["passed"]:
-            if replay_result.get("weak"):
-                return _green_pass("post-patch suite green; replay: tests exercise the change",
-                                   post_rc, replay=replay_result["replay"], require_adequate=True)
-            return _green_pass("post-patch suite green; replay: tests exercise the change",
-                               post_rc, replay=replay_result["replay"])
-        return emit(False, replay_result["reason"], post_rc, replay=replay_result["replay"])
-
-    # ── Post-patch failed → establish a baseline to attribute blame ───────
-    # Baseline = HEAD (the pre-patch tree) run in a throwaway worktree so the
-    # real working directory is never mutated. Only reached when post-patch is red.
-    # The baseline worktree must also carry the candidate's test files: a
-    # candidate that ADDS a new regression test will not "pre-exist" on HEAD,
-    # so without the overlay the baseline would be misleadingly green for
-    # tests that were already failing on the candidate.
-    in_git = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-    base_wt = None
-    if os.environ.get("MO_TEST_BASELINE", "1") != "0" and in_git:
-        base_wt, _ = _attach_overlaid_worktree(os.getcwd())
+    post_env = _child_env()
+    # A command with no pytest/jest/vitest runner may still prove applicability
+    # by writing a results file, so give it a dir to write into. The dir is
+    # removed after the replay decision (below) so a cold run cannot leak TMPDIR
+    # space the way the disk incident did. pytest/jest/vitest commands are
+    # unchanged — their adapters already own the results-file contract.
+    results_dir = None
+    if _runner_detection_available() and not detect_runners(CMD):
+        results_dir = tempfile.mkdtemp(prefix="mo-verifier-results-")
+        post_env["MINI_ORK_TEST_RESULTS_DIR"] = results_dir
 
     try:
-        if base_wt:
-            with open(BASE_LOG, "wb") as fh:
-                BASE_RC = subprocess.run(CMD, shell=True, cwd=base_wt, stdout=fh,
-                                         stderr=subprocess.STDOUT,
-                                         env=_child_env()).returncode
+        post_rc = run_suite(LOG_PATH, env=post_env)
 
-        if BASE_RC == "":
-            # Could not establish a baseline → fall back to absolute gating (do not hide a regression).
-            return emit(False, "post-patch failing; no baseline established (absolute gate)", post_rc)
-        unrunnable = _baseline_unrunnable(BASE_RC, BASE_LOG)
-        if unrunnable:
-            # NOT a red baseline. Checked BEFORE the legacy hatch so that hatch
-            # can never blanket-pass a baseline that never ran.
-            sys.stderr.write(f"[test] {unrunnable} — cannot attribute; needs rerun\n")
-            return emit(False, f"{unrunnable} — cannot attribute the failure; rerun needed", post_rc)
-        if BASE_RC != 0:
-            # Baseline ALSO fails. Decide per test instead of blanket-passing
-            # (a patch that breaks MORE tests in an already-red suite must not
-            # be certified). `MO_TEST_LEGACY_RED_BASE=1` restores the old pass
-            # as an explicit escape hatch.
-            if os.environ.get("MO_TEST_LEGACY_RED_BASE", "0") == "1":
-                sys.stderr.write(f"[test] baseline (HEAD) also fails rc={BASE_RC} — legacy red-base escape hatch\n")
-                return emit(True, "pre-existing failure: baseline (HEAD) also fails — uninformative test env, not caused by this patch", post_rc)
-            return _judge_red_base(post_rc, base_wt)
-        # Baseline green, post red → the patch broke something.
-        return emit(False, "regression: baseline (HEAD) passed but post-patch fails", post_rc)
+        if post_rc == 0:
+            # ── Replay applicability (decided BEFORE any base worktree) ─────
+            # Whether the delta-gate replay applies is a property of the command
+            # and of what this post-patch run produced; it never needs a base
+            # run. Deciding it here avoids a cold base build (the disk incident)
+            # and records `replay_applicable: false` even under the
+            # `MO_CODEFIX_REPLAY=0` opt-out (the false-withhold incident). The
+            # emission below is byte-identical to the late twin in oracle.py, so
+            # levels.py maps it to `target: n/a` exactly as before.
+            if not _replay_applies(CMD, results_dir):
+                return emit_unverified(
+                    post_rc,
+                    "replay supports pytest, jest, vitest, or a results file; "
+                    "none produced for this command",
+                    replay=None, replay_applicable=False,
+                )
+            # ── Delta-gate replay: a green suite that doesn't exercise the bug is theatre ──
+            if os.environ.get("MO_CODEFIX_REPLAY", "1") == "0":
+                return _green_pass("post-patch suite green (replay opt-out: MO_CODEFIX_REPLAY=0)", post_rc)
+            replay_result = _run_replay_check()
+            if replay_result is None:
+                return _green_pass("post-patch suite green (replay skipped: certify unavailable or not a git repo)", post_rc)
+            if replay_result.get("unverified"):
+                return emit_unverified(post_rc, replay_result["reason"],
+                                       replay=replay_result.get("replay"),
+                                       replay_applicable=replay_result.get("applicable"))
+            if replay_result["passed"]:
+                if replay_result.get("weak"):
+                    return _green_pass("post-patch suite green; replay: tests exercise the change",
+                                       post_rc, replay=replay_result["replay"], require_adequate=True)
+                return _green_pass("post-patch suite green; replay: tests exercise the change",
+                                   post_rc, replay=replay_result["replay"])
+            return emit(False, replay_result["reason"], post_rc, replay=replay_result["replay"])
+
+        # ── Post-patch failed → establish a baseline to attribute blame ───────
+        # Baseline = HEAD (the pre-patch tree) run in a throwaway worktree so the
+        # real working directory is never mutated. Only reached when post-patch is red.
+        # The baseline worktree must also carry the candidate's test files: a
+        # candidate that ADDS a new regression test will not "pre-exist" on HEAD,
+        # so without the overlay the baseline would be misleadingly green for
+        # tests that were already failing on the candidate.
+        in_git = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        base_wt = None
+        if os.environ.get("MO_TEST_BASELINE", "1") != "0" and in_git:
+            base_wt, _ = _attach_overlaid_worktree(os.getcwd())
+
+        try:
+            if base_wt:
+                with open(BASE_LOG, "wb") as fh:
+                    BASE_RC = subprocess.run(CMD, shell=True, cwd=base_wt, stdout=fh,
+                                             stderr=subprocess.STDOUT,
+                                             env=_child_env()).returncode
+
+            if BASE_RC == "":
+                # Could not establish a baseline → fall back to absolute gating (do not hide a regression).
+                return emit(False, "post-patch failing; no baseline established (absolute gate)", post_rc)
+            unrunnable = _baseline_unrunnable(BASE_RC, BASE_LOG)
+            if unrunnable:
+                # NOT a red baseline. Checked BEFORE the legacy hatch so that hatch
+                # can never blanket-pass a baseline that never ran.
+                sys.stderr.write(f"[test] {unrunnable} — cannot attribute; needs rerun\n")
+                return emit(False, f"{unrunnable} — cannot attribute the failure; rerun needed", post_rc)
+            if BASE_RC != 0:
+                # Baseline ALSO fails. Decide per test instead of blanket-passing
+                # (a patch that breaks MORE tests in an already-red suite must not
+                # be certified). `MO_TEST_LEGACY_RED_BASE=1` restores the old pass
+                # as an explicit escape hatch.
+                if os.environ.get("MO_TEST_LEGACY_RED_BASE", "0") == "1":
+                    sys.stderr.write(f"[test] baseline (HEAD) also fails rc={BASE_RC} — legacy red-base escape hatch\n")
+                    return emit(True, "pre-existing failure: baseline (HEAD) also fails — uninformative test env, not caused by this patch", post_rc)
+                return _judge_red_base(post_rc, base_wt)
+            # Baseline green, post red → the patch broke something.
+            return emit(False, "regression: baseline (HEAD) passed but post-patch fails", post_rc)
+        finally:
+            _detach_git_worktree(base_wt)
     finally:
-        _detach_git_worktree(base_wt)
+        if results_dir:
+            shutil.rmtree(results_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
