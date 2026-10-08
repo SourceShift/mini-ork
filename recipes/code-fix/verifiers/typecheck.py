@@ -9,16 +9,34 @@
 #   1  typecheck failed
 #
 # Env vars:
-#   MINI_ORK_TYPECHECK_CMD   explicit command to run (skips auto-detect)
+#   MINI_ORK_TYPECHECK_CMD   explicit command to run (skips auto-detect AND
+#                            scoping — the operator owns that command's scope)
+#   MINI_ORK_TYPECHECK_FULL  "1" forces the unscoped whole-project run
 #   MINI_ORK_HOME            path to .mini-ork/ dir (default: .mini-ork)
 #   MINI_ORK_RUN_ID          current run id (used in log path)
+#
+# SCOPING (issue #4): an AUTO-DETECTED bare compiler (tsc / mypy) is narrowed
+# to the run's touched files, because a whole-project run reddens every lane on
+# a repo with pre-existing diagnostics — a phantom red the child did not cause.
+# An operator-supplied MINI_ORK_TYPECHECK_CMD is run VERBATIM: only the operator
+# knows that command's file-argument syntax. Such a command can scope itself by
+# reading $MINI_ORK_TOUCHED_FILES (below). Outside a git work tree, nothing can
+# be attributed, so the command runs unscoped — never silently skipped.
+#
+# Child env:
+#   MINI_ORK_TOUCHED_FILES   newline-separated repo-relative paths this run
+#                            changed (working tree ∪ untracked ∪ base...HEAD)
 
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
+from typing import NamedTuple
 
 try:
     # Late import — the verifier may be copied into a fixture without the rest
@@ -124,10 +142,23 @@ def _has_mypy_marker():
     return False
 
 
-def detect_typecheck_cmd():
-    # Explicit override wins.
-    if os.environ.get("MINI_ORK_TYPECHECK_CMD"):
-        return os.environ["MINI_ORK_TYPECHECK_CMD"]
+class _Detected(NamedTuple):
+    """A detected command plus what the caller may do with its scope.
+
+    ``tool`` is ``"tsc"``/``"mypy"`` only for the bare compilers this module
+    discovered itself — the ones it can safely narrow to the touched files.
+    Every other command is ``"full"``: its scope belongs to whoever wrote it.
+    """
+    cmd: str
+    tool: str
+    bin: str = ""
+
+
+def detect_typecheck():
+    # Explicit override wins — and is never rescoped (see module docstring).
+    explicit = os.environ.get("MINI_ORK_TYPECHECK_CMD")
+    if explicit:
+        return _Detected(explicit, "full")
 
     # npm / pnpm / yarn — check package.json scripts first.
     if os.path.isfile("package.json"):
@@ -135,49 +166,236 @@ def detect_typecheck_cmd():
         for candidate in _SCRIPT_CANDIDATES:
             if candidate in scripts:
                 if shutil.which("pnpm"):
-                    return f"pnpm run {candidate}"
+                    return _Detected(f"pnpm run {candidate}", "full")
                 if shutil.which("npm"):
-                    return f"npm run {candidate}"
+                    return _Detected(f"npm run {candidate}", "full")
 
     # TypeScript project marker required before we trust a tsc binary.
     if _has_ts_marker():
         if shutil.which("tsc"):
-            return "tsc --noEmit"
+            return _Detected("tsc --noEmit", "tsc", "tsc")
         if os.path.isfile("./node_modules/.bin/tsc") and os.access("./node_modules/.bin/tsc", os.X_OK):
-            return "./node_modules/.bin/tsc --noEmit"
+            return _Detected("./node_modules/.bin/tsc --noEmit", "tsc", "./node_modules/.bin/tsc")
 
     # Python mypy — require a configured mypy, not just any pyproject.toml.
     if shutil.which("mypy") and _has_mypy_marker():
-        return "mypy ."
+        return _Detected("mypy .", "mypy", "mypy")
 
     # Rust
     if shutil.which("cargo") and os.path.isfile("Cargo.toml"):
-        return "cargo check"
+        return _Detected("cargo check", "full")
 
     # Go
     if shutil.which("go") and os.path.isfile("go.mod"):
-        return "go build ./..."
+        return _Detected("go build ./...", "full")
 
     # Nothing found — skip and pass
+    return _Detected("", "full")
+
+
+def detect_typecheck_cmd() -> str:
+    """The detected command only (compat wrapper around :func:`detect_typecheck`)."""
+    return detect_typecheck().cmd
+
+
+# ── touched-file scoping ─────────────────────────────────────────────────────
+#
+# A whole-project compiler run on a repo with pre-existing diagnostics reddens
+# every lane for reasons the child did not cause, and the loop quarantines
+# healthy fixes (observed live: a red main rolled back every lane). The gate is
+# therefore narrowed to this run's own change surface.
+
+_HEX_REF = re.compile(r"[0-9a-fA-F]{7,40}")
+# Extensions each scoped tool can actually accept on its command line. A file of
+# any other type would make the tool error on the *argument* rather than the
+# code (``tsc --noEmit README.md`` is TS6054), i.e. a false red.
+_SCOPE_EXT = {"tsc": (".ts", ".tsx", ".mts", ".cts"), "mypy": (".py", ".pyi")}
+# Never part of a child's change surface.
+_NOISE_PREFIX = (".mini-ork/",)
+
+
+def _git(root: str, *args: str, timeout_s: int = 120) -> tuple[int, str]:
+    """Run git without ever raising. Returns ``(rc, stdout)``."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", root, *args], capture_output=True, text=True, timeout=timeout_s,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return 127, ""
+    return proc.returncode, proc.stdout or ""
+
+
+def _is_git_worktree(root: str) -> bool:
+    rc, out = _git(root, "rev-parse", "--is-inside-work-tree")
+    return rc == 0 and out.strip() == "true"
+
+
+def _run_dir_ref() -> str:
+    """This run's pre-implementer ref, when the run dir carries one."""
+    home = os.environ.get("MINI_ORK_HOME", "").strip()
+    run_id = os.environ.get("MINI_ORK_RUN_ID", "").strip()
+    if not (home and run_id):
+        return ""
+    try:
+        ref = Path(home, "runs", run_id, "pre-implementer-ref").read_text(
+            encoding="utf-8"
+        ).strip()
+    except OSError:
+        return ""
+    # A garbage ref must never reach git as a revision argument.
+    return ref if _HEX_REF.fullmatch(ref) else ""
+
+
+def _scoped_base(root: str) -> str:
+    """The base the diff is taken against — the run's own start point first.
+
+    ``merge-base HEAD origin/main`` is the LAST resort, not the default: once
+    origin/main moves, ``origin/main...HEAD`` is the whole branch's divergence
+    and drags in other sessions' files. The run dir's pre-implementer ref makes
+    the diff this child's own; ``MO_GOAL_SCOPED_BASE`` covers callers with no
+    run dir (the goal-loop binding's contract).
+    """
+    ref = _run_dir_ref() or os.environ.get("MO_GOAL_SCOPED_BASE", "").strip()
+    if ref:
+        return ref
+    for candidate in ("origin/main", "main"):
+        rc, out = _git(root, "merge-base", "HEAD", candidate)
+        if rc == 0 and out.strip():
+            return out.strip()
     return ""
 
 
+def touched_files(root: str) -> list[str]:
+    """Repo-relative paths this run changed: working tree, untracked, and
+    (when a base resolves) everything committed on top of it."""
+    paths: set[str] = set()
+    rc, out = _git(root, "status", "--porcelain", "-uall")
+    if rc == 0:
+        for line in out.splitlines():
+            if len(line) < 4:
+                continue
+            rest = line[3:]
+            if " -> " in rest:  # rename: keep the destination
+                rest = rest.split(" -> ", 1)[1]
+            path = rest.strip().strip('"')
+            if path:
+                paths.add(path)
+    base = _scoped_base(root)
+    if base:
+        rc, out = _git(root, "diff", "--name-only", f"{base}...HEAD")
+        if rc == 0:
+            paths.update(p.strip() for p in out.splitlines() if p.strip())
+    return sorted(
+        p for p in paths if p and not p.startswith(_NOISE_PREFIX)
+    )
+
+
+def _tsc_overlay(root: str, files: list[str]) -> str | None:
+    """A generated tsconfig EXTENDING the project config, narrowed to ``files``.
+
+    Passing files straight to ``tsc`` would bypass ``tsconfig.json`` entirely —
+    no path aliases, no ``strict``, no ``lib`` — so every scoped run would
+    report bogus errors and the scope would be worse than no scope. ``files``
+    (not ``include``) carries the scope so the project's own ``exclude`` globs
+    cannot silently drop a changed file into a vacuous "no inputs" run.
+
+    Returns ``None`` when the project has no root ``tsconfig.json`` to extend,
+    which makes the caller fall back to the unscoped run.
+    """
+    if not os.path.isfile(os.path.join(root, "tsconfig.json")):
+        return None
+    overlay = {
+        "extends": "./tsconfig.json",
+        "compilerOptions": {"noEmit": True, "incremental": False},
+        "files": files,
+        "include": [],
+    }
+    handle = tempfile.NamedTemporaryFile(
+        "w", suffix=".json", prefix="mo-scoped-tsconfig-", dir=root, delete=False,
+    )
+    with handle:
+        json.dump(overlay, handle)
+    return handle.name
+
+
+def _emit_pass(reason: str) -> int:
+    print(json.dumps({
+        "verifier": "typecheck", "pass": True, "evidence_path": None,
+        "error_summary": reason,
+    }, separators=(",", ":"), ensure_ascii=False))
+    return 0
+
+
+def _scoped_command(
+    root: str, det: _Detected, touched: list[str]
+) -> tuple[str | None, str, str | None]:
+    """``(command, note, overlay_path)`` narrowed to this run's own change surface.
+
+    ``command`` is ``None`` only when the scope is empty *and* git proved the
+    run changed nothing this tool can see — a real "nothing to check", which
+    the caller reports as a pass. It never returns ``None`` merely because
+    scoping failed: an unscopeable tool runs unscoped instead (note ``""``).
+    """
+    keep = _SCOPE_EXT[det.tool]
+    scoped = [f for f in touched if f.endswith(keep)]
+    if not scoped:
+        return None, f"no {det.tool} files among {len(touched)} touched", None
+    if det.tool == "mypy":
+        return (
+            f"{det.bin} " + " ".join(shlex.quote(f) for f in scoped),
+            f"scoped to {len(scoped)} touched file(s)",
+            None,
+        )
+    overlay = _tsc_overlay(root, scoped)
+    if overlay:
+        return (
+            f"{det.bin} --noEmit -p {shlex.quote(overlay)}",
+            f"scoped to {len(scoped)} touched file(s)",
+            overlay,
+        )
+    return None, "", None  # no tsconfig.json — unscoped run, never a skip
+
+
 def main():
-    cmd = detect_typecheck_cmd()
+    det = detect_typecheck()
 
-    if not cmd:
+    if not det.cmd:
         sys.stderr.write("[typecheck] no typecheck command detected — skipping (pass)\n")
-        print(json.dumps({
-            "verifier": "typecheck", "pass": True, "evidence_path": None,
-            "error_summary": "no typecheck tool detected — skipped",
-        }, separators=(",", ":"), ensure_ascii=False))
-        return 0
+        return _emit_pass("no typecheck tool detected — skipped")
 
-    sys.stderr.write(f"[typecheck] running: {cmd}\n")
-    with open(LOG_PATH, "wb") as log:
-        exit_code = subprocess.run(cmd, shell=True, stdout=log,
-                                   stderr=subprocess.STDOUT,
-                                   env=_child_env()).returncode
+    root = os.path.realpath(os.getcwd())
+    full = os.environ.get("MINI_ORK_TYPECHECK_FULL", "") == "1"
+    touched = touched_files(root) if _is_git_worktree(root) else []
+
+    cmd = det.cmd
+    note = ""
+    overlay_path = None
+    if not full and det.tool in _SCOPE_EXT:
+        scoped_cmd, note, overlay_path = _scoped_command(root, det, touched)
+        if scoped_cmd is None:
+            if note:  # genuinely nothing this tool can check
+                sys.stderr.write(f"[typecheck] {note} — skipping (pass)\n")
+                return _emit_pass(f"{note} — skipped")
+            note = "no project tsconfig.json — running unscoped"
+        else:
+            cmd = scoped_cmd
+
+    suffix = f" [{note}]" if note else ""
+    sys.stderr.write(f"[typecheck] running: {cmd}{suffix}\n")
+    child_env = _child_env()
+    if touched:
+        child_env["MINI_ORK_TOUCHED_FILES"] = "\n".join(touched)
+    try:
+        with open(LOG_PATH, "wb") as log:
+            exit_code = subprocess.run(cmd, shell=True, stdout=log,
+                                       stderr=subprocess.STDOUT,
+                                       env=child_env).returncode
+    finally:
+        if overlay_path:
+            try:
+                os.unlink(overlay_path)
+            except OSError:
+                pass
 
     if exit_code == 0:
         passed = True

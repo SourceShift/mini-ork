@@ -59,6 +59,21 @@ feature decides and the evidence it writes.
 | `MO_BEHAV_EQUIVALENCE` | *(unset → `exact`)* | Behavioral comparison operator: `exact`, `set`, `canonical`, `tolerant`, or a JSON spec |
 | `MO_BEHAV_EXPECT_BODY` | *(unset)* | Expected body (JSON) for the behavioral `expect_body` check |
 
+### Verifier scoping (code-fix)
+
+`recipes/code-fix/verifiers/typecheck.py` narrows a **detected** bare compiler
+(`tsc`, `mypy`) to the run's own change surface, so a repo with pre-existing
+diagnostics cannot redden a lane for a reason the patch did not cause. The
+touched set is the child's working tree ∪ untracked ∪ `pre-implementer-ref…HEAD`
+(falling back to `git merge-base HEAD origin/main`, then `main`) — never
+`origin/main` alone, which drags in other sessions' commits once it moves.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `MINI_ORK_TYPECHECK_CMD` | *(unset → auto-detect)* | Explicit command. Run **verbatim** — the operator owns its scope |
+| `MINI_ORK_TYPECHECK_FULL` | *(unset)* | `"1"` forces the unscoped whole-project run for a detected compiler |
+| `MINI_ORK_TOUCHED_FILES` | *(exported to the child)* | Newline-separated repo-relative paths this run changed; a `MINI_ORK_TYPECHECK_CMD`/`MINI_ORK_TEST_CMD` script can scope itself by reading it |
+
 ## Planning / profile
 
 | Variable | Default | Effect |
