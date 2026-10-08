@@ -197,3 +197,78 @@ def test_ids_relative_to_cwd(tmp_path):
     passed_b, _ = parse_results_dir(str(d_b), "/rootB")
 
     assert passed_a == passed_b == {"tests/add.test.js::add works"}
+
+
+# ── symlinked roots (#17) ─────────────────────────────────────────────────────
+
+def test_ids_are_stable_across_a_symlinked_worktree_root(tmp_path):
+    """A suite loaded through a symlinked root is reported by the runner under
+    its REAL path, while the caller passes the symlink it created (the macOS
+    ``/var`` ↔ ``/private/var`` case for every ``mkdtemp``). The id must be
+    cwd-relative so it still matches the same suite on the other tree — a
+    ``../../`` chain never can.
+    """
+    real = tmp_path / "real"
+    (real / "src" / "__tests__").mkdir(parents=True)
+    link = tmp_path / "link"
+    link.symlink_to(real)
+
+    suite = real / "src" / "__tests__" / "x.test.ts"
+    suite.write_text("it('works', () => {})\n")
+    results = tmp_path / "results"
+    results.mkdir()
+    _write_json(results, "jest-1.json", {
+        "testResults": [
+            {
+                "name": str(suite),  # the resolved path, as node reports it
+                "status": "passed",
+                "assertionResults": [{"fullName": "works", "status": "passed"}],
+            }
+        ]
+    })
+
+    passed, failed = parse_results_dir(str(results), str(link))
+    assert passed == {"src/__tests__/x.test.ts::works"}
+    assert failed == set()
+
+
+def test_load_failure_id_is_stable_across_a_symlinked_root(tmp_path):
+    """Same hazard on the load-failure id: a ``::<suite load failure>`` under a
+    symlinked root must land on the same relative id, not a ``../../`` chain."""
+    real = tmp_path / "real"
+    (real / "src" / "__tests__").mkdir(parents=True)
+    link = tmp_path / "link"
+    link.symlink_to(real)
+
+    suite = real / "src" / "__tests__" / "x.test.ts"
+    suite.write_text("import './missing'\n")
+    results = tmp_path / "results"
+    results.mkdir()
+    _write_json(results, "jest-1.json", {
+        "testResults": [{"name": str(suite), "status": "failed", "assertionResults": []}]
+    })
+
+    passed, failed = parse_results_dir(str(results), str(link))
+    assert passed == set()
+    assert failed == {"src/__tests__/x.test.ts::<suite load failure>"}
+
+
+def test_suite_genuinely_outside_cwd_keeps_the_literal_escape(tmp_path):
+    """A suite outside the cwd is still reported as before: the realpath retry
+    escapes too, so the literal relative answer is kept (no regression)."""
+    inside = tmp_path / "inside"
+    inside.mkdir()
+    results = tmp_path / "results"
+    results.mkdir()
+    _write_json(results, "jest-1.json", {
+        "testResults": [
+            {
+                "name": str(tmp_path / "other" / "a.test.js"),
+                "status": "passed",
+                "assertionResults": [{"fullName": "t", "status": "passed"}],
+            }
+        ]
+    })
+
+    passed, _ = parse_results_dir(str(results), str(inside))
+    assert passed == {"../other/a.test.js::t"}

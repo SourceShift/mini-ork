@@ -115,18 +115,39 @@ def augment_for_results(cmd: str, results_dir: str) -> tuple[str, set[str]]:
     return "".join(out), augmented
 
 
+def _escapes_cwd(rel: str) -> bool:
+    return rel == ".." or rel.startswith(".." + os.sep)
+
+
 def _rel_to_cwd(path: str, cwd: str) -> str:
     """Return `path` relative to `cwd` when absolute; unchanged otherwise.
 
     The same test file lives at a different absolute root on the base and
     candidate trees, so only the cwd-relative suffix is a stable id.
+
+    The two roots are not always spelled the same way even when they are the
+    same directory: ``jest``/``vitest`` report the *resolved* path of a suite
+    (node realpaths modules as it loads them), while the caller passes the
+    path it created. On macOS every ``mkdtemp`` under ``/var`` has a
+    ``/private/var`` twin, so relativizing the two spellings as-written yields
+    a junk ``../../../../..`` chain that can never match the candidate's id.
+    When the literal relativization escapes the cwd, retry on the real paths;
+    if that also escapes (a suite genuinely outside the tree), keep the
+    literal answer so an outside-cwd suite is still reported as before.
     """
-    if os.path.isabs(path):
-        try:
-            return os.path.relpath(path, cwd)
-        except ValueError:
-            return path
-    return path
+    if not os.path.isabs(path):
+        return path
+    try:
+        rel = os.path.relpath(path, cwd)
+    except ValueError:
+        return path
+    if not _escapes_cwd(rel):
+        return rel
+    try:
+        rel_resolved = os.path.relpath(os.path.realpath(path), os.path.realpath(cwd))
+    except ValueError:
+        return rel
+    return rel if _escapes_cwd(rel_resolved) else rel_resolved
 
 
 def _parse_json_results(path: str, cwd: str) -> tuple[set[str], set[str]] | None:
