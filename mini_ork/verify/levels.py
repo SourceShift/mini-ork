@@ -150,6 +150,13 @@ def derive_levels(run_dir):
     )
     ru = T.get("replay_unverified") is True
     au = T.get("adequacy_unverified") is True
+    # An adapter-less runner (a wrapper script, `make test`, `go test ./...`)
+    # cannot name overlapping tests, so it proves the delta at suite grain:
+    # the whole command flipped red→green with tests running on both sides.
+    opaque_proof = (
+        isinstance(replay, dict)
+        and replay.get("proven_by") == "exit-code-delta"
+    )
 
     # executes — the runner reached a test outcome.
     if rc in (0, 1):
@@ -161,16 +168,21 @@ def derive_levels(run_dir):
     else:
         reasons["executes"] = "verifier_test.json: no post_rc"
 
-    # target — a green suite PROVED it exercises the change (replay overlap).
-    # When the replay instrument does not apply to the test runner (a
-    # non-pytest command), a green suite cannot be proven by replay; record
-    # n/a (publish does not block) rather than UNVERIFIED.
+    # target — a green suite PROVED it exercises the change (replay overlap),
+    # or — for an adapter-less runner — the whole suite flipped red→green with
+    # tests running on both sides (opaque exit-code delta). When the replay
+    # instrument truly does not apply (no adapter, and the output carries no
+    # test-run marker), record n/a (publish does not block) rather than
+    # UNVERIFIED.
     if T.get("replay_applicable") is False and rc == 0:
         vector["target"] = NA
         reasons["target"] = "verifier_test.json: replay instrument n/a for this test runner"
-    elif not (ru or au) and rc == 0 and T.get("pass") is True and ov:
+    elif not (ru or au) and rc == 0 and T.get("pass") is True and (ov or opaque_proof):
         vector["target"] = PROVEN
-        reasons["target"] = "verifier_test.json: pass with replay overlap"
+        reasons["target"] = (
+            "verifier_test.json: pass with replay overlap" if ov
+            else "verifier_test.json: pass with opaque exit-code delta"
+        )
     elif not (ru or au) and rc == 0 and T.get("pass") is False and ov == []:
         vector["target"] = REFUTED
         reasons["target"] = "verifier_test.json: pass=false, no overlap"

@@ -470,7 +470,15 @@ def test_real_strong_knob_on(tmp_path, monkeypatch):
     assert _status(db, "r9") == "published"
 
 
-def test_real_replay_na_knob_on(tmp_path, monkeypatch):
+def test_real_opaque_delta_knob_on(tmp_path, monkeypatch):
+    """A non-pytest runner is proven by the opaque exit-code delta.
+
+    The suite here is `python -m unittest` — no per-test adapter exists, and
+    the old instrument called the replay "n/a" (target n/a, publish unblocked).
+    The opaque fallback runs the command unchanged on both sides and proves the
+    delta at suite grain: base (buggy HEAD) red, candidate green. target is now
+    PROVEN rather than n/a.
+    """
     repo = _make_repo(tmp_path, mod_src=MOD_BUG, test_src=TEST_UNITTEST)
     (repo / "mod.py").write_text(MOD_FIX)
     rc, db, rd = _drive_main(tmp_path, monkeypatch, repo=repo, run_id="r10",
@@ -478,17 +486,22 @@ def test_real_replay_na_knob_on(tmp_path, monkeypatch):
     assert rc == 0
 
     payload = L.read_verifier_payload(str(rd / "verifier_test.json"), "test")
-    assert payload["replay_unverified"] is True
-    assert payload["pass"] is False
-    assert payload["replay_applicable"] is False
+    assert payload["pass"] is True
+    # `replay_applicable` is only written when False; absent == the instrument
+    # applied to this command (the opaque fallback), so it is not n/a.
+    assert payload.get("replay_applicable") is not False
+    assert payload["replay"]["runner"] == "opaque"
+    assert payload["replay"]["proven_by"] == "exit-code-delta"
+    assert payload["replay"]["candidate_rc"] == 0
+    assert payload["replay"]["base_rc"] != 0
 
     verdict = json.loads((rd / "verdict.json").read_text())
     assert verdict["failed_nodes"] == 0
-    assert verdict["levels"]["target"] == NA
+    assert verdict["levels"]["target"] == PROVEN
     assert verdict["levels_ok"] is True
     assert verdict["levels_decision"] == "publish"
 
-    # a green non-pytest suite publishes: target = n/a is not a block
+    # a green non-pytest suite whose delta is proven publishes
     assert _git_text(repo, "log", "-1", "--pretty=%s").startswith("mini-ork(code-fix): ")
     committed = [ln for ln in
                  _git_text(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD")

@@ -264,9 +264,15 @@ def test_replay_helper_fails_with_passing_on_base(tmp_path):
 
 
 def test_replay_helper_unverified_for_non_pytest():
+    # The literal abstention reason is host-dependent: with no cargo project in
+    # /tmp the command yields no test-run marker (adapter-list reason) and, where
+    # cargo is absent, an unrunnable-rc reason. Both are abstentions, which is
+    # the contract this pins; the exact adapter wording is pinned by
+    # test_replay_structured_runners.py::test_no_adapter_no_results_is_not_applicable.
     result = replay_check("cargo test", base_cwd="/tmp", candidate_cwd="/tmp")
     assert result["unverified"] is True
-    assert "pytest" in result["reason"]
+    assert result["passed"] is False
+    assert result["reason"]
 
 
 def test_replay_helper_unverified_for_missing_base(tmp_path):

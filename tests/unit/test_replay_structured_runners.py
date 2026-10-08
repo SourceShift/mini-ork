@@ -145,3 +145,71 @@ def test_no_adapter_no_results_is_not_applicable(tmp_path):
     assert result["applicable"] is False
     assert result["replay"] is None
     assert "pytest" in result["reason"]
+
+
+# ── 8. opaque fallback (no adapter, no results file) ─────────────────────────
+#
+# A wrapper script / `make test` / `go test ./...` has no per-test adapter and
+# writes no results file. Refusing every such command made the instrument
+# unusable outside pytest and jest (the reported defect: a jest wrapper exited 0
+# on the candidate and the replay still said "unverified"). The fallback judges
+# by exit code, and only when BOTH sides prove tests actually ran.
+
+OPAQUE_SH = """#!/bin/bash
+if grep -q 'a - b' add.js; then
+  echo "1 failed, 1 passed"
+  exit 1
+fi
+echo "1 passed"
+exit 0
+"""
+
+
+def _install_opaque_runner(tree: Path, name: str, body: str) -> None:
+    script = tree / name
+    script.write_text(body)
+    script.chmod(0o755)
+
+
+def test_opaque_command_rc_delta_is_proven(tmp_path):
+    base, cand = _make_trees(tmp_path, base_buggy=True)
+    for tree in (base, cand):
+        _install_opaque_runner(tree, "run-tests.sh", OPAQUE_SH)
+
+    result = replay_check("bash run-tests.sh", base_cwd=str(base), candidate_cwd=str(cand))
+
+    assert result["passed"] is True, result
+    assert result["unverified"] is False
+    assert result["replay"]["runner"] == "opaque"
+    assert result["replay"]["candidate_rc"] == 0
+    assert result["replay"]["base_rc"] != 0
+
+
+def test_opaque_command_without_a_test_marker_is_never_a_pass(tmp_path):
+    """A silent exit-0 stub must not beat a silent exit-0 base into a PASS."""
+    base, cand = _make_trees(tmp_path, base_buggy=True)
+    for tree in (base, cand):
+        _install_opaque_runner(tree, "noop.sh", "#!/bin/bash\nexit 0\n")
+
+    result = replay_check("bash noop.sh", base_cwd=str(base), candidate_cwd=str(cand))
+
+    assert result["passed"] is False, result
+    assert result["unverified"] is True
+    assert result["applicable"] is False
+
+
+def test_opaque_unrunnable_baseline_is_not_a_delta(tmp_path):
+    """The base worktree has no node_modules: rc 127 is "never ran", not "red".
+
+    Candidate passes (marker printed, rc 0), base cannot run (rc 127). Without
+    the runnability guard that pair looks exactly like a legitimate delta.
+    """
+    base, cand = _make_trees(tmp_path, base_buggy=True)
+    body = "#!/bin/bash\necho '1 passed'\nexit 0\n"
+    _install_opaque_runner(cand, "run-tests.sh", body)
+
+    result = replay_check("bash run-tests.sh", base_cwd=str(base), candidate_cwd=str(cand))
+
+    assert result["passed"] is False, result
+    assert result["unverified"] is True
+    assert "could not run" in result["reason"]

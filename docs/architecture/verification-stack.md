@@ -151,7 +151,7 @@ reviewer or LLM output:
 |---|---|---|
 | `applies` | `implementer-summary.json` | Implemented, with a non-empty file list. |
 | `executes` | `verifier_test.json` | The runner reached test outcomes. |
-| `target` | `verifier_test.json` | The suite is green **and** the replay proves it exercises the change. |
+| `target` | `verifier_test.json` | The suite is green **and** the replay proves it exercises the change — a non-empty per-test overlap, or (adapter-less runners) an opaque exit-code delta. |
 | `preserve` | `verifier_test.json` | No regression, and the suite is not adequacy-unverified. |
 | `contract` | `verifier_behavioral.json` | The behavioral verifier is PROVEN (`n/a` when absent). |
 
@@ -261,8 +261,10 @@ With a knob at `0`, verdicts are byte-identical to the pre-feature behaviour.
   - `code-fix` publishes only when the target is proven: a green replay overlap plus an adequate suite, or one the
     audit doesn't apply to. Runs that used to publish on a green suite alone now end `failed`, with the fix kept in
     the tree.
-  - For a repo whose test command the replay can't parse (non-pytest), `target` cannot be PROVEN, so `code-fix` will
-    not publish there. That's the honest answer until a replay adapter exists for that runner.
+  - For a repo whose test command has no per-test adapter (not pytest/jest/vitest, no results file), the replay falls
+    back to an **opaque exit-code delta**: the command runs unchanged on both sides, and the suite is proven when the
+    candidate exits 0, the base exits non-zero, and both logs show tests actually ran. A command that cannot run
+    (rc 126/127/77) or prints no test-run marker stays `n/a`/`unverified` — never a false PROVEN.
 - **Cost.**
   - Certify makes about 2 extra LLM calls per judgement and up to about 2k + 2N extra sandbox runs.
   - Code-fix adds up to 2 + `MAX_MUTANTS` suite runs per green verifier.

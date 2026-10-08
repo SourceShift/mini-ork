@@ -139,6 +139,98 @@ def _failure_signature(output: str) -> str | None:
     return None
 
 
+# ── opaque replay fallback ───────────────────────────────────────────────────
+#
+# Not every project runs pytest or jest. A wrapper script (`./test-v2.sh`),
+# `make test`, `go test ./...`, `cargo test` — none have a per-test adapter, and
+# refusing all of them made the replay instrument unusable outside the two
+# adapter runners (the reported defect: a jest wrapper exited 0 on the candidate
+# and the replay still said "unverified"). The fallback judges by exit code,
+# guarded by two proofs described in :func:`_opaque_delta`.
+
+# Exit codes that mean the process never reached the test runner at all:
+# 126 = found but not executable, 127 = command not found, 77 = the jest-guard
+# convention for "refused to start under load". A baseline that could not run is
+# NOT a red baseline, so no delta may be minted against it.
+_UNRUNNABLE_RC = frozenset({"126", "127", "77"})
+
+# Runner-agnostic evidence that tests were actually EXECUTED. Without one of
+# these the exit code is unattributable: a stub that exits 0 beats a real red
+# base and mints a false PASS.
+_RAN_MARKERS = (
+    re.compile(r"\bTests:\s"),                            # jest summary
+    re.compile(r"\b\d+ (?:passing|pending|failing)\b"),   # mocha/jest
+    re.compile(r"\b\d+ passed\b"),                        # pytest/vitest
+    re.compile(r"^test result:", re.M),                   # cargo test
+    re.compile(r"^(?:ok|FAIL|ok  )\s+\S", re.M),          # go test
+    re.compile(r"\bTest Suites:\s"),                      # jest
+    re.compile(r"\bRan \d+ test"),                        # django/unittest
+)
+
+
+def _ran_tests(log_path: str) -> bool:
+    """True when the log carries a runner-agnostic "tests executed" marker."""
+    try:
+        text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return any(rx.search(text) for rx in _RAN_MARKERS)
+
+
+def _opaque_delta(
+    *,
+    candidate_rc: int,
+    base_rc: int,
+    candidate_log: str,
+    base_log: str,
+) -> dict:
+    """Judge an adapter-less command by exit code, fail-closed on ambiguity.
+
+    Pass requires ALL of: the candidate exits 0, the base exits non-zero, and
+    BOTH logs prove tests actually ran. The both-sides marker requirement is
+    load-bearing — the base worktree is a fresh ``git worktree add --detach
+    HEAD`` with no ``node_modules``, so a candidate that runs (rc 0) against a
+    base that cannot (rc 127) looks exactly like a legitimate delta and would
+    mint the very false PASS this instrument exists to prevent.
+
+    A pass carries ``replay["proven_by"] == "exit-code-delta"``: the suite as a
+    whole flipped red→green, which is the strongest statement an adapter-less
+    runner allows. The level vector reads that key to mark ``target`` PROVEN
+    (there is no per-test ``overlap`` list to key on).
+    """
+    for side, rc in (("candidate", candidate_rc), ("baseline", base_rc)):
+        if str(rc) in _UNRUNNABLE_RC:
+            return {
+                "passed": False,
+                "reason": f"{side} could not run (rc={rc}); cannot establish delta",
+                "unverified": True, "replay": None, "applicable": True,
+            }
+    if not (_ran_tests(candidate_log) and _ran_tests(base_log)):
+        return {
+            "passed": False,
+            "reason": "replay supports pytest, jest, vitest, or a results file; "
+                      "none produced for this command, and its output carries no "
+                      "test-run marker — cannot confirm tests executed",
+            "unverified": True, "replay": None, "applicable": False,
+        }
+
+    info = {"runner": "opaque", "candidate_rc": candidate_rc, "base_rc": base_rc}
+    if candidate_rc == 0 and base_rc != 0:
+        return {
+            "passed": True,
+            "reason": "opaque command: candidate exit 0, base exit non-zero, "
+                      "tests ran on both sides",
+            "unverified": False, "applicable": True,
+            "replay": {**info, "proven_by": "exit-code-delta"},
+        }
+    return {
+        "passed": False,
+        "reason": (f"opaque command: no candidate-pass/base-fail delta "
+                   f"(candidate rc={candidate_rc}, base rc={base_rc})"),
+        "unverified": False, "replay": info, "applicable": True,
+    }
+
+
 def replay_check(
     cmd: str,
     *,
@@ -368,26 +460,29 @@ def replay_check(
                     return -1, None
                 return rc, parse_results_dir(res_dir, cwd)
 
-            _, cand_res = _run_structured(cand_cwd, cand_log, cand_res_dir)
+            cand_rc, cand_res = _run_structured(cand_cwd, cand_log, cand_res_dir)
             base_rc, base_res = _run_structured(base_cwd, b_log, base_res_dir)
-            return base_rc, cand_res, base_res
+            return cand_rc, base_rc, cand_res, base_res
 
-    base_rc, cand_res, base_res = _run_once(cand_cwd, cand_log, base_cwd, b_log)
+    cand_rc, base_rc, cand_res, base_res = _run_once(
+        cand_cwd, cand_log, base_cwd, b_log
+    )
 
     if base_rc == -1:
         return {"passed": False, "reason": "base state could not be evaluated",
                 "unverified": True, "replay": None}
     if cand_res is None:
-        # No runner adapter and no results file written — the instrument does
-        # not apply to this command.
-        return {
-            "passed": False,
-            "reason": "replay supports pytest, jest, vitest, or a results file; "
-                      "none produced for this command",
-            "unverified": True,
-            "replay": None,
-            "applicable": False,
-        }
+        # No adapter matched and no results file was written — but the command
+        # may still be replayable as an opaque exit-code instrument (a wrapper
+        # script, `make test`, `go test ./...`). Refusing every such command is
+        # the reported defect; `_opaque_delta` judges it fail-closed. The runs
+        # already happened above (augment_for_results is a no-op for a command
+        # with no jest/vitest word), so reuse their exit codes and logs rather
+        # than re-running the suite twice more.
+        return _opaque_delta(
+            candidate_rc=cand_rc, base_rc=base_rc,
+            candidate_log=cand_log, base_log=b_log,
+        )
     if base_res is None:
         return {
             "passed": False,
@@ -412,7 +507,9 @@ def replay_check(
     if overlap_1 and os.environ.get("MO_REPLAY_FLAKE_RERUN", "1") != "0":
         # Flake re-run: both sides once more with the same command; keep only
         # the tests stable on both runs. Deterministic runners are a no-op.
-        _, cand_res_2, base_res_2 = _run_once(cand_cwd, cand_log + ".2", base_cwd, b_log + ".2")
+        _, _, cand_res_2, base_res_2 = _run_once(
+            cand_cwd, cand_log + ".2", base_cwd, b_log + ".2"
+        )
         if cand_res_2 is None or base_res_2 is None:
             # The re-run produced no parsable results (infra hiccup): abstain
             # like an unrunnable first run, never label the overlap flaky.
