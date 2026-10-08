@@ -51,6 +51,10 @@ def test_scrubbed_test_env_drops_mini_ork_state_pointers():
         "MINI_ORK_RUN_DIR": "/tmp/run",
         "MINI_ORK_PLAN_PATH": "/tmp/plan.json",
         "MINI_ORK_AGENTS": "/tmp/agents.yaml",
+        # The operator's target-repo pointer: a test wrapper that re-cds to it
+        # would escape the cwd the oracle set and re-run the candidate on the
+        # base side (the ask-k2 delta-gate false negative).
+        "MO_TARGET_CWD": "/tmp/target-repo",
     }
     out = scrubbed_test_env(src)
     for k in src:

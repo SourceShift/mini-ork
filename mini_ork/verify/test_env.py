@@ -40,6 +40,15 @@ from collections.abc import Mapping
 # would re-bind the child to the operator's live run / database / secrets
 # store, or to a shadow agent registry that doesn't exist inside the
 # sandboxed worktree.
+#
+# ``MO_TARGET_CWD`` belongs here for the same reason: it names the operator's
+# target repo, so a test wrapper that does ``cd "${MO_TARGET_CWD:-$PWD}"``
+# escapes the cwd the caller set. The oracle's delta-gate replay runs the SAME
+# command twice with an explicit ``cwd`` (base worktree, then candidate); if the
+# wrapper re-cds to the leaked candidate path the base side silently re-runs the
+# candidate, ``base == candidate``, the touched-test overlap is empty, and every
+# patch is refuted as ``tests-do-not-exercise-change``. Scrubbing it lets the
+# wrapper's ``:-$PWD`` fall back to the caller's ``cwd`` — the side under test.
 _DENY_NAMES: frozenset[str] = frozenset({
     "MINI_ORK_SECRETS",
     "MINI_ORK_DB",
@@ -49,6 +58,7 @@ _DENY_NAMES: frozenset[str] = frozenset({
     "MINI_ORK_RUN_DIR",
     "MINI_ORK_PLAN_PATH",
     "MINI_ORK_AGENTS",
+    "MO_TARGET_CWD",
 })
 
 # Credential suffixes. Names fully custom (MINIMAX_API_KEY, GLM_API_KEY,
