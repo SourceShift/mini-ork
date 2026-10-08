@@ -1088,6 +1088,38 @@ def cli_main(argv: list[str] | None = None, *, execute_fn=None) -> int:
         "MINI_ORK_WORKFLOW": handoff["workflow"],
         "MINI_ORK_RECIPE": handoff["recipe"] or None,
     })
+    # ── Recover revival fix 1 (kickoff recover-revival-fixes §1): close the
+    # dead attempt before dispatching. The original process died mid-node and
+    # left a ``node_start`` with no ``node_end``; the stale-heartbeat watchdog
+    # would otherwise read that dead node's heartbeat as a current hang and
+    # abort THIS recovery. ``web.control._close_dangling_node_events`` is the
+    # same closer ``board kill`` / the run reaper use. Fail-soft: any error
+    # (missing table, missing state.db) is printed, never stops the recovery.
+    try:
+        import sqlite3 as _sqlite3  # noqa: PLC0415 — scoped to cli_main
+
+        from mini_ork.web.control import _close_dangling_node_events  # noqa: PLC0415
+        from mini_ork.web.db import StateDB  # noqa: PLC0415
+
+        def _count_node_ends() -> int:
+            _con = _sqlite3.connect(handoff["db_path"], timeout=5.0)
+            try:
+                return _con.execute(
+                    "SELECT COUNT(*) FROM run_events WHERE run_id = ? "
+                    "AND event_type = 'node_end'",
+                    (handoff["run_id"],)).fetchone()[0]
+            finally:
+                _con.close()
+
+        # Count how many node_end rows the closer *adds* rather than re-deriving
+        # the started/ended node-id sets it already computes internally.
+        _before = _count_node_ends()
+        _close_dangling_node_events(StateDB(Path(handoff["db_path"])), handoff["run_id"])
+        print(f"[mini-ork-recover] closed {_count_node_ends() - _before} dangling "
+              "node(s) from the previous attempt")
+    except Exception as _exc:  # noqa: BLE001 — fail-soft, never stop the recovery
+        print(f"[mini-ork-recover] could not close dangling nodes: {_exc}",
+              file=sys.stderr)
     exec_argv = ["--recovery"]
     plan_json = os.path.join(handoff["run_dir"], "plan.json")
     if os.path.isfile(plan_json):
@@ -1104,11 +1136,55 @@ def cli_main(argv: list[str] | None = None, *, execute_fn=None) -> int:
         exec_rc = execute_fn(exec_argv)
     finally:
         if _lease is not None:
-            if handoff["request_id"]:
-                _lease.close_recovery(handoff["db_path"], handoff["request_id"],
-                                      status="completed" if exec_rc == 0 else "failed")
-            if handoff["lease_token"]:
-                _lease.release_lease(handoff["db_path"], handoff["run_id"], handoff["lease_token"])
+            # Lease bookkeeping must never stop the zombie guard below: a raise
+            # here would leave the row ``executing`` with no live process.
+            try:
+                if handoff["request_id"]:
+                    _lease.close_recovery(handoff["db_path"], handoff["request_id"],
+                                          status="completed" if exec_rc == 0 else "failed")
+                if handoff["lease_token"]:
+                    _lease.release_lease(handoff["db_path"], handoff["run_id"], handoff["lease_token"])
+            except Exception as exc:  # noqa: BLE001
+                sys.stderr.write(f"[mini-ork-recover] lease cleanup failed: {exc}\n")
+        # ── Recover revival fix 2 (kickoff recover-revival-fixes §2): never
+        # leave a zombie. If execute exited (or raised) with the row still
+        # ``executing``, the board would show a dead run as working forever.
+        # Reuse the reaper's compare-and-set writer; gated on the status read
+        # here, so a row the executor already published is left untouched.
+        # Fail-soft; the exception (if any) still propagates.
+        try:
+            import sqlite3 as _sqlite3  # noqa: PLC0415 — scoped to cli_main
+            import time as _time  # noqa: PLC0415
+
+            from mini_ork.orchestration.run_reaper import (  # noqa: PLC0415
+                _has_unanswered_ask,
+                _mark_failed,
+            )
+
+            _run_dir = Path(handoff["run_dir"])
+            # A cost-paused run, or one blocked on profile answers, is waiting
+            # on ``mini-ork resume`` — not dead. Leave its row alone (mirrors
+            # ``run_reaper.close_run_record``). Only a *failing* exit
+            # (``exec_rc != 0``, or execute raised so it stayed at its 1
+            # default) is a zombie; a clean rc=0 that wrote no terminal status
+            # is finished work, never failed here.
+            _waiting = (_run_dir / ".cost-pause").exists() or _has_unanswered_ask(_run_dir)
+            if exec_rc != 0 and not _waiting:
+                _con = _sqlite3.connect(handoff["db_path"], timeout=5.0)
+                try:
+                    _row = _con.execute(
+                        "SELECT status, updated_at FROM task_runs WHERE id = ?",
+                        (handoff["run_id"],)).fetchone()
+                    if _row and _row[0] in ("executing", "running"):
+                        _now = int(_time.time())
+                        _mark_failed(
+                            _con, handoff["run_id"], _row[0], _row[1], None,
+                            f"recover: execute exited rc={exec_rc} without a terminal status",
+                            ended_at=_now, now=_now)
+                finally:
+                    _con.close()
+        except Exception as _exc:  # noqa: BLE001 — fail-soft, never mask the exec result
+            print(f"[mini-ork-recover] could not reap zombie row: {_exc}", file=sys.stderr)
     # ── retry-notify (kickoff lane-repair-resume §2): mirror ``mini_ork.cli.main``
     # so a re-failed recover reports the owner + fix steps like a fresh ``run``
     # does. Fail-soft — never changes the run's exit code. Only fires when the

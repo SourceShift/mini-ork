@@ -1662,6 +1662,14 @@ def _default_llm_dispatch(root):
     return d
 
 
+# Process-start floor for the stale-heartbeat watchdog: heartbeats older than
+# this belong to a *previous* process (their node_start was never closed), not
+# to a hang in the current attempt. Recorded once at module import. A caller
+# may pin it explicitly via `MO_EXEC_STARTED_MS` (unset by default) so a
+# spawned worker can judge against its parent's start.
+_EXEC_STARTED_MS = int(time.time() * 1000)
+
+
 def _watchdog_stale_heartbeat(root, db, run_id):
     """Port of bash `_mo_watchdog_check_stale_heartbeats` (embedded python). Returns
     '<node>\\t<ts>' for the first node whose last heartbeat is older than the timeout
@@ -1673,6 +1681,10 @@ def _watchdog_stale_heartbeat(root, db, run_id):
         timeout_ms = int(float(os.environ.get("MO_HEARTBEAT_TIMEOUT_S", "300")) * 1000)
     except ValueError:
         timeout_ms = 300000
+    try:
+        exec_started_ms = int(os.environ.get("MO_EXEC_STARTED_MS") or _EXEC_STARTED_MS)
+    except (TypeError, ValueError):
+        exec_started_ms = _EXEC_STARTED_MS
     now_ms = int(time.time() * 1000)
     cutoff = now_ms - timeout_ms
     try:
@@ -1705,7 +1717,7 @@ def _watchdog_stale_heartbeat(root, db, run_id):
             ended_ms = (int(created_at or 0) * 1000) + 999
             ended_at[node] = max(ended_ms, ended_at.get(node, 0))
     for node, last_hb in latest.items():
-        if last_hb < cutoff and ended_at.get(node, 0) < last_hb:
+        if last_hb < cutoff and last_hb >= exec_started_ms and ended_at.get(node, 0) < last_hb:
             return f"{node}\t{last_hb}"
     return ""
 
