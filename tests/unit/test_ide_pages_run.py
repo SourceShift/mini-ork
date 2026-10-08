@@ -242,6 +242,77 @@ def test_missing_or_unknown_run(home: Path) -> None:
     assert out["ok"] is False and "no run run-nope" in out["error"]
 
 
+# The keys today's (level-1) page carries; the v2 ``graph`` key is additive on
+# top of them at EVERY level.
+_LEVEL_ONE_KEYS = {"ok", "key", "title", "sub", "chips", "actions", "tabs", "tab",
+                   "args", "sections", "errors", "label"}
+
+
+def test_level_one_page_is_unchanged_plus_an_additive_graph(
+        home: Path, monkeypatch) -> None:
+    """MINI_ORK_IDE_SPEC unset → today's page, byte-for-byte, plus ``graph``."""
+    _seed(home)
+    monkeypatch.delenv("MINI_ORK_IDE_SPEC", raising=False)
+    page = build_page(home, "run", None, {"run": RUN})
+    assert set(page) - {"graph"} == _LEVEL_ONE_KEYS
+    assert page["title"] == RUN  # the run id is still the title
+    assert [t["key"] for t in page["tabs"]] == [
+        "dag", "kickoff", "overview", "agents", "learnings", "artifacts"]
+    assert page["tab"] == "dag"
+    assert page["sections"][0]["type"] == "dag"
+    assert page["chips"][0] == {"t": "published · verified", "c": "green"}
+    assert page["actions"][0]["label"] == "Certify this change"
+    # The additive graph matches the DAG tab's own columns.
+    assert page["graph"]["cols"] == _section(page, "dag")["cols"]
+    assert page["graph"]["state"] == "done"
+
+
+def test_level_two_starts_with_story_and_carries_the_graph_key(
+        home: Path, monkeypatch) -> None:
+    _seed(home)
+    monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
+    page = build_page(home, "run", None, {"run": RUN})
+    assert [t["key"] for t in page["tabs"]][:2] == ["story", "graph"]
+    assert page["tab"] == "story"
+    assert page["title"] == "Make the demo pass"  # the kickoff title, not the run id
+    assert page["sections"][0]["type"] == "triage"  # one true outcome up front
+    assert page["actions"] == []  # header actions move into the triage
+
+    graph_tab = build_page(home, "run", "graph", {"run": RUN})
+    assert graph_tab["tab"] == "graph"
+    assert graph_tab["graph"]["cols"] == _section(graph_tab, "dag")["cols"]
+    assert page["graph"]["cols"] == graph_tab["graph"]["cols"]
+
+    # A stale ``dag`` link still lands on the graph tab.
+    assert build_page(home, "run", "dag", {"run": RUN})["tab"] == "graph"
+    # …and ``overview`` lands on the story.
+    assert build_page(home, "run", "overview", {"run": RUN})["tab"] == "story"
+
+
+def test_level_two_title_prefers_the_goal_over_the_recipe_placeholder(
+        home: Path, monkeypatch) -> None:
+    """No kickoff file → ``run_card`` titles the run ``"<recipe> run"``; the
+    v2 title skips that placeholder for the operator's goal, and the goal and
+    criteria ride the hero section."""
+    run_dir = _seed(home)
+    monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
+    import sqlite3 as _sqlite3
+    con = _sqlite3.connect(home / "state.db")
+    con.execute("UPDATE task_runs SET kickoff_path = '' WHERE id = ?", (RUN,))
+    con.commit()
+    con.close()
+    (home / "kickoffs" / "demo.md").unlink()
+    (run_dir / "run_profile.json").write_text(json.dumps({
+        "user_goal": "Ship the thing\nsecond line",
+        "success_criteria": ["it works", "it is fast"],
+    }))
+    page = build_page(home, "run", None, {"run": RUN})
+    assert page["title"] == "Ship the thing"
+    hero = _section(page, "hero", "What this run is for")
+    assert hero["goal"] == "Ship the thing\nsecond line"
+    assert hero["criteria"] == ["it works", "it is fast"]
+
+
 def test_kickoff_tab_renders_the_full_kickoff(home: Path) -> None:
     """The Kickoff tab returns one full-width ``markdown`` section whose text
     is the whole kickoff (cap 200 000) and whose ``path`` is the kickoff

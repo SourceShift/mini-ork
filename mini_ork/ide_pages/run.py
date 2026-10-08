@@ -18,10 +18,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from mini_ork.ide_pages import outcome as O
 from mini_ork.ide_pages import spec as S
 
 TABS = [("dag", "DAG"), ("kickoff", "Kickoff"), ("overview", "Overview"), ("agents", "Agents"),
         ("learnings", "Learnings"), ("artifacts", "Artifacts")]
+
+# The v2 tab bar (``MINI_ORK_IDE_SPEC=2``): the story replaces the overview and
+# the graph replaces the DAG. The old keys still resolve (``dag`` → ``graph``,
+# ``overview`` → ``story``) so a stale IDE link lands somewhere sensible.
+V2_TABS = [("story", "Story"), ("graph", "Graph"), ("kickoff", "Kickoff"),
+           ("agents", "Agents"), ("learnings", "Learnings"), ("artifacts", "Artifacts")]
+V2_ALIASES = {"dag": "graph", "overview": "story"}
 
 # The kickoff text is capped well above the 20 KB the run card shows — the kickoff
 # tab is the place to read the whole task brief. Beyond the cap we append a
@@ -383,25 +391,49 @@ def _sub(run: Run) -> str:
     return " · ".join(p for p in parts if p)
 
 
+def _stop_kill_actions(run: Run) -> list[dict[str, Any]]:
+    """Stop / Kill — the two controls a running run offers."""
+    return [
+        S.btn("Stop", S.cli("board", "stop", run.id,
+                            confirm="Stop this run after its current node?"), "warn"),
+        S.btn("Kill", S.cli("board", "kill", run.id,
+                            confirm=f"Kill {run.id}? SIGTERM, then SIGKILL after 2 s."),
+              "danger"),
+    ]
+
+
+def _discard_action(run: Run) -> dict[str, Any] | None:
+    """Discard the run's worktree and branch — ``None`` when it has no workspace."""
+    if run.workspace is None:
+        return None
+    return S.btn("Discard", S.cli("board", "discard", run.id,
+                                  confirm="Discard this run's worktree and branch?"),
+                 "danger")
+
+
+def _review_actions(run: Run) -> list[dict[str, Any]]:
+    """Merge / Discard — the decision a finished run with a worktree needs."""
+    if run.workspace is None:
+        return []
+    base = getattr(run.workspace, "base_branch", "") or "base"
+    return [
+        S.btn(f"Merge into {base}",
+              S.cli("board", "merge", run.id,
+                    confirm=f"Merge this run's branch into {base}?"),
+              "primary"),
+        S.btn("Discard", S.cli("board", "discard", run.id,
+                               confirm="Discard this run's worktree and branch?"),
+              "danger"),
+    ]
+
+
 def _actions(run: Run) -> list[dict[str, Any]]:
     web = _serve_url(run.id)
     acts: list[dict[str, Any]] = []
     if _running(run):
-        acts.append(S.btn("Stop", S.cli("board", "stop", run.id,
-                                         confirm="Stop this run after its current node?"), "warn"))
-        acts.append(S.btn("Kill", S.cli("board", "kill", run.id,
-                                       confirm=f"Kill {run.id}? SIGTERM, then SIGKILL after 2 s."),
-                          "danger"))
+        acts.extend(_stop_kill_actions(run))
     else:
-        if run.workspace is not None:
-            base = getattr(run.workspace, "base_branch", "") or "base"
-            acts.append(S.btn(f"Merge into {base}",
-                              S.cli("board", "merge", run.id,
-                                    confirm=f"Merge this run's branch into {base}?"),
-                              "primary"))
-            acts.append(S.btn("Discard", S.cli("board", "discard", run.id,
-                                               confirm="Discard this run's worktree and branch?"),
-                              "danger"))
+        acts.extend(_review_actions(run))
         acts.append(S.btn("Certify this change", S.page_link("verify", "certify", run=run.id)))
         acts.append(S.btn("Open run folder", S.reveal(str(run.run_dir)), "ghost"))
     acts.append(S.btn("Open in web UI", S.url(web) if web else None, "ghost"))
@@ -542,47 +574,68 @@ def _selected(run: Run, wanted: str | None) -> Node | None:
     return run.nodes[0] if run.nodes else None
 
 
+def _graph(run: Run, wanted: str | None = None) -> dict[str, Any]:
+    """The run's node graph — the DAG columns plus the header the IDE draws.
+
+    ``_dag_tab``'s ``dag`` section and the page's top-level ``graph`` key both
+    build from here, so they cannot drift::
+
+        {"cols": [[node_dict]], "heads": [str], "run_title": str,
+         "recipe": str, "state": <outcome state word>}
+    """
+    sel = _selected(run, wanted)
+    by_id = {n.id: n for n in run.nodes}
+    cols: list[list[dict[str, Any]]] = []
+    for c in run.cols:
+        col = []
+        for nid in c:
+            n = by_id.get(nid)
+            if n is None:
+                continue
+            cost = S.money(n.cost) if n.cost else ""
+            node_dict = S.dag_node(n.id, n.id, n.family, n.state, cost=cost,
+                                   selected=sel is not None and n.id == sel.id,
+                                   do=S.set_args(node=n.id))
+            # ``node.py``'s stream view reads ``role``/``dur``/``gates`` off
+            # the same dict the IDE draws from — augment in place rather
+            # than editing ``spec.dag_node``'s positional signature (the
+            # additive spec.py change was rejected to keep the diff inside
+            # the kickoff's 4-file scope).
+            node_dict["role"] = n.role_lane
+            node_dict["dur"] = _wall(n)
+            node_dict["gates"] = ", ".join(n.gates) or "—"
+            col.append(node_dict)
+        if col:
+            cols.append(col)
+    return {
+        "cols": cols,
+        "heads": [_head_for(col, idx) for idx, col in enumerate(cols)],
+        "run_title": str(run.card.get("title") or ""),
+        "recipe": str(run.card.get("recipe") or run.row.get("recipe") or ""),
+        "state": O.state_word(run),
+    }
+
+
 def _dag_tab(run: Run, wanted: str | None) -> list[dict[str, Any]]:
     errors: dict[str, str] = {}
     sel = _selected(run, wanted)
-    by_id = {n.id: n for n in run.nodes}
 
     def build_dag() -> dict[str, Any]:
         if not run.nodes:
             return S.lst("DAG", [S.dot("No nodes recorded yet",
                                        "The run has not started a node and its recipe has no workflow.yaml.")],
                          full=True)
-        cols = []
-        for c in run.cols:
-            col = []
-            for nid in c:
-                n = by_id.get(nid)
-                if n is None:
-                    continue
-                cost = S.money(n.cost) if n.cost else ""
-                node_dict = S.dag_node(n.id, n.id, n.family, n.state, cost=cost,
-                                       selected=sel is not None and n.id == sel.id,
-                                       do=S.set_args(node=n.id))
-                # ``node.py``'s stream view reads ``role``/``dur``/``gates`` off
-                # the same dict the IDE draws from — augment in place rather
-                # than editing ``spec.dag_node``'s positional signature (the
-                # additive spec.py change was rejected to keep the diff inside
-                # the kickoff's 4-file scope).
-                node_dict["role"] = n.role_lane
-                node_dict["dur"] = _wall(n)
-                node_dict["gates"] = ", ".join(n.gates) or "—"
-                col.append(node_dict)
-            if col:
-                cols.append(col)
-        sec = S.dag("", cols, legend=("depends_on → · verifiers check the node before them · "
-                                       "rollback runs on escalates_to after a failure · "
-                                       "click a node to inspect it"), full=True)
+        graph = _graph(run, wanted)
+        sec = S.dag("", graph["cols"],
+                    legend=("depends_on → · verifiers check the node before them · "
+                            "rollback runs on escalates_to after a failure · "
+                            "click a node to inspect it"), full=True)
         # ``spec.dag`` forwards ``**opt`` into ``_section`` which has no
         # ``heads`` kwarg — mutate the returned dict in place so the kickoff's
         # "stage label per column" reaches the IDE without a spec.py edit.
-        sec["heads"] = [_head_for(col, idx) for idx, col in enumerate(cols)]
-        sec["run_title"] = str(run.card.get("title") or "")
-        sec["recipe"] = str(run.card.get("recipe") or run.row.get("recipe") or "")
+        sec["heads"] = graph["heads"]
+        sec["run_title"] = graph["run_title"]
+        sec["recipe"] = graph["recipe"]
         return sec
 
     def build_inspector() -> dict[str, Any]:
@@ -653,7 +706,7 @@ def _head_for(col: list[dict[str, Any]], idx: int) -> str:
     return f"stage {idx}"
 
 
-def _overview_tab(run: Run) -> list[dict[str, Any]]:
+def _overview_tab(run: Run, *, include_retry: bool = True) -> list[dict[str, Any]]:
     errors: dict[str, str] = {}
     d = run.run_dir
 
@@ -838,7 +891,8 @@ def _overview_tab(run: Run) -> list[dict[str, Any]]:
         note = "From the run's cached diff; the worktree is gone." if run.card.get("files_from_cache") else ""
         return S.lst("Files changed", items, full=True, note=note)
 
-    return (S.guarded(errors, "Retry", retry_section) + S.guarded(errors, "Run inputs", inputs)
+    return ((S.guarded(errors, "Retry", retry_section) if include_retry else [])
+            + S.guarded(errors, "Run inputs", inputs)
             + S.guarded(errors, "Why? — evidence", evidence)
             + S.guarded(errors, "Correlation", correlation) + S.guarded(errors, "Recent events", recent)
             + S.guarded(errors, "Files changed", files))
@@ -1243,6 +1297,103 @@ def _rel(path: str, home: Path) -> str:
 
 # ── entry point ─────────────────────────────────────────────────────────────
 
+def _run_profile(run: Run) -> dict[str, Any]:
+    """The run's ``run_profile.json`` — the classifier's task class and the
+    operator's goal / success criteria. ``{}`` when the run has none."""
+    try:
+        data = json.loads((run.run_dir / "run_profile.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _branch(run: Run) -> str:
+    return str(getattr(run.workspace, "branch", "") or "")
+
+
+def _title_v2(run: Run) -> str:
+    """The kickoff title, else the goal's first line, else the run id.
+
+    ``fleet.run_card`` derives the card title from the kickoff's first line and
+    falls back to ``"<recipe> run"`` when the kickoff cannot be read. That
+    placeholder carries no information about what the run is *for*, so it is
+    skipped in favour of the operator's goal — otherwise a run whose kickoff
+    lives only in ``run_profile.json`` would be titled "framework-edit run".
+    """
+    recipe = str(run.card.get("recipe") or run.row.get("recipe") or "")
+    title = str(run.card.get("title") or "").strip()
+    if title and title != f"{recipe or 'mini-ork'} run":
+        return title
+    goal = str(_run_profile(run).get("user_goal") or "").strip()
+    if goal:
+        first = goal.splitlines()[0].strip()
+        if first:
+            return first[:120]
+    return run.id
+
+
+def _sub_v2(run: Run) -> str:
+    parts = [str(run.card.get("recipe") or run.row.get("recipe") or "")]
+    branch = _branch(run)
+    if branch:
+        parts.append(f"branch {branch}")
+    parts.append(run.id)
+    return " · ".join(p for p in parts if p)
+
+
+def _story_tab(run: Run, outcome: dict[str, Any]) -> list[dict[str, Any]]:
+    """The v2 story: triage, the outcome's callouts, the goal/criteria hero,
+    then today's Overview sections minus the Retry block the triage replaced."""
+    sections = [S.triage(outcome["text"], tone=outcome["tone"], icon=outcome["icon"],
+                         detail=outcome["detail"], counts=outcome["counts"],
+                         actions=outcome["actions"], menu=outcome["menu"])]
+    sections.extend(outcome.get("callouts") or [])
+    profile = _run_profile(run)
+    goal = str(profile.get("user_goal") or "").strip()
+    raw_criteria = profile.get("success_criteria")
+    criteria = [str(c) for c in raw_criteria] if isinstance(raw_criteria, list) else []
+    if goal or criteria:
+        recipe = str(run.card.get("recipe") or run.row.get("recipe") or "")
+        meta = []
+        if recipe:
+            meta.append(S.meta_item(recipe))
+        branch = _branch(run)
+        if branch:
+            meta.append(S.meta_item(f"branch {branch}", mono=True))
+        meta.append(S.meta_item(run.id, mono=True))
+        sections.append(S.hero("What this run is for", goal=goal,
+                               criteria=criteria[:8], meta=meta))
+    sections.extend(_overview_tab(run, include_retry=False))
+    return sections
+
+
+def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
+    """The ``MINI_ORK_IDE_SPEC=2`` page: one true outcome, next action next to it."""
+    outcome = O.resolve(run)
+    keys = {k for k, _ in V2_TABS}
+    wanted = (tab or "").strip()
+    resolved = V2_ALIASES.get(wanted, wanted)
+    if resolved not in keys:
+        resolved = "story"
+    node = args.get("node")
+    sections = {
+        "story": lambda: _story_tab(run, outcome),
+        "graph": lambda: _dag_tab(run, node),
+        "kickoff": lambda: _kickoff_tab(run),
+        "agents": lambda: _agents_tab(run),
+        "learnings": lambda: _learnings_tab(run),
+        "artifacts": lambda: _artifacts_tab(run),
+    }[resolved]()
+    chips = [S.chip(outcome["state"], outcome["tone"]),
+             S.chip(S.money(_cost(run))), S.chip(_elapsed(run))]
+    page = S.page("run", _title_v2(run), _sub_v2(run), chips_=chips, actions=[],
+                  tabs=V2_TABS, tab=resolved,
+                  args={"run": run.id, **({"node": node} if node else {})},
+                  sections=sections)
+    page["graph"] = _graph(run, node)
+    return page
+
+
 def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     run_id = (args.get("run") or "").strip()
     if not run_id:
@@ -1251,6 +1402,8 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     run = _load(home, run_id)
     if run is None:
         return {"ok": False, "key": "run", "error": f"no run {run_id}"}
+    if S.ide_level() >= 2:
+        return _build_v2(run, tab, args)
     tab = tab if tab in {k for k, _ in TABS} else "dag"
     done = sum(1 for n in run.nodes if n.state == "done")
     chips = [_state_chip(run), S.chip(f"{done}/{len(run.nodes)} nodes"),
@@ -1263,6 +1416,9 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
         "learnings": lambda: _learnings_tab(run),
         "artifacts": lambda: _artifacts_tab(run),
     }[tab]()
-    return S.page("run", run.id, _sub(run), chips_=chips, actions=_actions(run), tabs=TABS,
+    page = S.page("run", run.id, _sub(run), chips_=chips, actions=_actions(run), tabs=TABS,
                   tab=tab, args={"run": run.id, **({"node": args["node"]} if args.get("node") else {})},
                   sections=sections)
+    # Additive at every level: the graph is available to an old IDE too.
+    page["graph"] = _graph(run, args.get("node"))
+    return page
