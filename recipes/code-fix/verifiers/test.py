@@ -361,6 +361,194 @@ def _overlay_candidate_tests(base_wt: str, candidate_cwd: str, base_ref: str = "
     return sorted(overlaid)
 
 
+# ── #16: a base load failure caused by a candidate-ADDED module is proof ─────
+# The overlay carries a candidate's new test onto the base, but a test that
+# imports a module the candidate ADDED cannot load there: jest/ts-jest report
+# "Cannot find module '../x'" with ZERO per-test ids, so the base records only
+# `<file>::<suite load failure>` — an id that never intersects the candidate's
+# `<file>::<test name>` ids. The overlap stays empty and a correct
+# "add module + test" patch is REFUTED with `tests-do-not-exercise-change`.
+#
+# When the unresolved module resolves to a path the candidate ADDED (absent at
+# the base ref), the load failure IS the exercise proof: the test runs code
+# that did not exist before. That file's candidate-passing ids then count as
+# base-failed, which is exactly the delta the gate wants. Two guards keep the
+# rule honest: the spec must be a relative import that RESOLVES to a
+# candidate-ADDED path (a bare-package load failure — the base worktree has no
+# `node_modules` — names no repo path and proves nothing), and the file must
+# actually appear as a base load failure (`<file>::<suite load failure>`).
+
+_SUITE_LOAD_FAILURE_SUFFIX = "::<suite load failure>"
+
+# The two runner wordings that name an unresolvable module: jest/ts-jest's
+# "Cannot find module 'X' from 'Y'" (the `from` clause is optional — the
+# TS2307 form "Cannot find module 'X' or its corresponding type declarations."
+# omits it) and vitest/rollup's `Failed to resolve import "X" from "Y"`.
+_MISSING_MODULE_RE = re.compile(
+    r"(?:Cannot find module|Failed to resolve import)\s*['\"](?P<spec>[^'\"]+)['\"]"
+    r"(?:\s*(?:,|\bor\b)?\s*from\s*['\"](?P<importer>[^'\"]+)['\"])?"
+)
+# jest prints `FAIL <file>` above each failed suite; it supplies the importer
+# for a wording that omits the `from` clause.
+_FAIL_LINE_RE = re.compile(r"FAIL\s+(?P<file>\S+)")
+
+# Resolution probes for a relative import spec (extension + index forms).
+_MODULE_PROBE_EXTS = ("", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".d.ts")
+_MODULE_INDEX_NAMES = ("index.ts", "index.tsx", "index.js", "index.jsx")
+
+
+def _norm_rel(path: str) -> str:
+    """Repo-relative form of a git/jest path (forward slashes, no `./`)."""
+    p = (path or "").replace("\\", "/").strip()
+    while p.startswith("./"):
+        p = p[2:]
+    return p
+
+
+def _resolve_module_paths(spec: str, importer: str) -> list[str]:
+    """Repo-relative candidates a relative import ``spec`` could resolve to.
+
+    Returns ``[]`` for a non-relative spec (a bare package name, an absolute
+    path, or a path alias): those name no repo file, so a base load failure
+    against them is the bare-worktree `node_modules` gap, not this patch.
+    """
+    if not spec.startswith("."):
+        return []
+    base = os.path.normpath(os.path.join(os.path.dirname(importer), spec))
+    out = [base + ext for ext in _MODULE_PROBE_EXTS]
+    out += [os.path.join(base, name) for name in _MODULE_INDEX_NAMES]
+    return out
+
+
+def _candidate_added_paths(candidate_cwd: str, base_ref: str = "") -> set[str]:
+    """Repo-relative paths the candidate ADDED (absent at the base ref)."""
+    added: set[str] = set()
+    for status, rel_path in _candidate_delta_entries(candidate_cwd, base_ref):
+        # Working-tree `??` (untracked) / `A ` (staged) and the committed
+        # `A` from `git diff --name-status base..HEAD`.
+        if status == "??" or status[:1] == "A":
+            added.add(rel_path)
+    return added
+
+
+def _base_load_failure_promotions(base_log: str, overlaid, candidate_cwd: str,
+                                  base_ref: str = "") -> dict[str, dict]:
+    """Overlaid test files whose base load failure names a candidate-ADDED module.
+
+    Maps ``test_file -> {"missing_module", "added_path"}``. Empty when the base
+    log is unreadable, when the candidate added nothing, or when no unresolved
+    spec resolves into the added set.
+    """
+    try:
+        text = Path(base_log).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    added = _candidate_added_paths(candidate_cwd, base_ref)
+    if not added:
+        return {}
+    overlaid_set = set(overlaid)
+    promotions: dict[str, dict] = {}
+    current_fail = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        m_fail = _FAIL_LINE_RE.match(line)
+        if m_fail:
+            current_fail = _norm_rel(m_fail.group("file"))
+            continue
+        m = _MISSING_MODULE_RE.search(line)
+        if not m:
+            continue
+        importer = _norm_rel(m.group("importer") or current_fail)
+        if importer not in overlaid_set or importer in promotions:
+            continue
+        spec = m.group("spec")
+        for resolved in _resolve_module_paths(spec, importer):
+            if resolved in added:
+                promotions[importer] = {"missing_module": spec, "added_path": resolved}
+                break
+    return promotions
+
+
+def _load_failure_file_id(base_fail, test_file: str) -> str | None:
+    """The base `<file>::<suite load failure>` id for ``test_file``, or None.
+
+    Matched by TAIL, not exactly: the base worktree is a `git worktree add`
+    under a fresh mkdtemp root, so on macOS its absolute path can differ from
+    the candidate's by a `/var` ↔ `/private/var` prefix — and `_rel_to_cwd`
+    then relativizes the base id to a `../../private/var/...` chain that no
+    longer equals the cwd-relative overlay path. The trailing
+    ``<test_file>::<suite load failure>`` is stable across both.
+    """
+    suffix = f"{test_file}{_SUITE_LOAD_FAILURE_SUFFIX}"
+    if suffix in base_fail:
+        return suffix
+    tail = "/" + test_file + _SUITE_LOAD_FAILURE_SUFFIX
+    for tid in base_fail:
+        if tid.endswith(tail):
+            return tid
+    return None
+
+
+def _promote_base_load_failure(replay_result: dict, *, candidate_cwd: str,
+                               base_ref: str = "", base_log: str | None = None):
+    """Recast a base load failure of a candidate-ADDED module as overlap proof.
+
+    Called only when the replay returned ``passed=False`` for a green suite.
+    Returns a promoted ``replay_check``-shaped dict (``passed=True`` with the
+    added ids in ``overlap``/``strong_overlap`` and a ``load_failure_proof``
+    audit block), or ``None`` when nothing promotes — in which case the caller
+    keeps the honest ``tests-do-not-exercise-change`` refutation.
+
+    The promoted ids are marked STRONG, not weak: the module genuinely did not
+    exist on the base, so the load failure is positive evidence the test
+    exercises the change, not a collection hiccup. (Weak would also route
+    through ``require_adequate=True``, which a TS repo — no changed ``.py`` for
+    the adequacy audit — can never satisfy, so the patch would stay unverified.)
+    """
+    replay = replay_result.get("replay")
+    if not isinstance(replay, dict):
+        return None
+    cand_pass = set(replay.get("candidate_passed") or [])
+    if not cand_pass:
+        return None                       # 0 tests run never passes
+    overlaid = list(replay.get("overlaid_tests") or [])
+    if not overlaid:
+        return None
+    base_fail = set(replay.get("base_failed") or [])
+    promotions = _base_load_failure_promotions(
+        base_log or REPLAY_BASE_LOG, overlaid, candidate_cwd, base_ref
+    )
+
+    proof: dict[str, dict] = {}
+    promoted: set[str] = set()
+    for test_file, info in promotions.items():
+        if _load_failure_file_id(base_fail, test_file) is None:
+            continue                      # suite did not fail to load → not this case
+        ids = {tid for tid in cand_pass if tid.startswith(test_file + "::")}
+        if not ids:
+            continue
+        promoted |= ids
+        proof[test_file] = {**info, "promoted_ids": sorted(ids)}
+    if not promoted:
+        return None
+
+    promoted_replay = dict(replay)
+    promoted_replay["base_failed"] = sorted(base_fail | promoted)
+    promoted_replay["overlap"] = sorted(set(replay.get("overlap") or []) | promoted)
+    promoted_replay["strong_overlap"] = sorted(
+        set(replay.get("strong_overlap") or []) | promoted
+    )
+    promoted_replay["load_failure_proof"] = proof
+    return {
+        "passed": True,
+        "reason": "tests exercise the change (delta-gate overlap; base load "
+                  "failure of a candidate-added module)",
+        "unverified": False,
+        "weak": False,
+        "replay": promoted_replay,
+    }
+
+
 def _changed_source_files(candidate_cwd: str) -> list[str]:
     """Changed non-test ``.py`` files from ``git status --porcelain``.
 
@@ -1091,6 +1279,15 @@ def main():
                                        post_rc, replay=replay_result["replay"], require_adequate=True)
                 return _green_pass("post-patch suite green; replay: tests exercise the change",
                                    post_rc, replay=replay_result["replay"])
+            # Before refuting: a base load failure of a module the candidate
+            # ADDED (the overlay carried the test, but the new module is not on
+            # the base) means the test DOES exercise the change — the base could
+            # not even import it. Recast those ids as base-failed (#16).
+            promoted = _promote_base_load_failure(
+                replay_result, candidate_cwd=os.getcwd(), base_ref=_run_dir_base_ref(),
+            )
+            if promoted is not None:
+                return _green_pass(promoted["reason"], post_rc, replay=promoted["replay"])
             return emit(False, replay_result["reason"], post_rc, replay=replay_result["replay"])
 
         # ── Post-patch failed → establish a baseline to attribute blame ───────

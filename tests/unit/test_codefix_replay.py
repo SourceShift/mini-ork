@@ -14,6 +14,7 @@ cleaner diff is easier to read when a regression breaks it.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -63,7 +64,8 @@ def _make_repo(
     return repo
 
 
-def _run_verifier(repo: Path, tmp_path: Path, *, replay: str, run_id: str) -> dict:
+def _run_verifier(repo: Path, tmp_path: Path, *, replay: str, run_id: str,
+                  test_cmd: str = TEST_CMD) -> dict:
     """Invoke the verifier on `repo`. Returns the parsed JSON envelope (last stdout line)."""
     mini_home = tmp_path / "mo-home"
     mini_home.mkdir(exist_ok=True)
@@ -72,7 +74,7 @@ def _run_verifier(repo: Path, tmp_path: Path, *, replay: str, run_id: str) -> di
     env["MINI_ORK_RUN_ID"] = run_id
     env["MO_CODEFIX_REPLAY"] = replay
     env["MO_SUITE_ADEQUACY"] = "0"  # these tests are about replay, not adequacy
-    env["MINI_ORK_TEST_CMD"] = TEST_CMD
+    env["MINI_ORK_TEST_CMD"] = test_cmd
     # The verifier late-imports `mini_ork.certify`; that import needs the
     # worktree root on sys.path because the verifier is run as a script
     # (`python3 verifier/test.py`) not as `python3 -m`.
@@ -535,3 +537,175 @@ def test_overlay_carries_js_ts_test_paths(tmp_path):
     assert out["verifier"] == "test"
     assert "replay" in out, out
     assert "server/routes/__tests__/authorQuestions.test.ts" in out["replay"]["overlaid_tests"], out["replay"]
+
+
+# ── 8. base load failure of a candidate-ADDED module (defect #16) ───────────
+# The overlay carries a candidate's new test onto the base, but a test that
+# imports a module the candidate ADDED cannot load there: jest reports
+# "Cannot find module '../x'" with ZERO per-test ids, so the base records only
+# `<file>::<suite load failure>` — an id that never intersects the candidate's
+# `<file>::<test name>` ids. Overlap stays empty and a correct "add module +
+# test" patch is refuted. When the unresolved module resolves to a path the
+# candidate ADDED (absent at the base ref), the load failure IS the exercise
+# proof: those ids become base-failed and the patch is proven.
+
+# A jest stand-in: it walks `**/*.test.ts`, resolves each test's first RELATIVE
+# import against the tree, writes a jest-JSON results file (an assertion result,
+# or — on a load failure — a `status: "failed"` suite with none), prints a
+# jest-like FAIL transcript, and exits non-zero when any suite failed to load.
+# Driven through `MINI_ORK_TEST_CMD="python3 runner.py"` so the verifier takes
+# its results-file leg with no jest/node toolchain required.
+TS_RUNNER = r'''import json, os, re, sys
+from pathlib import Path
+
+cwd = Path(os.getcwd())
+files = sorted(p for p in cwd.rglob("*.test.ts") if "node_modules" not in p.parts)
+test_results = []
+any_failed = False
+for p in files:
+    rel = p.relative_to(cwd).as_posix()
+    m = re.search(r"(?:from|import)\s*['\"](?P<s>\.[^'\"]+)['\"]", p.read_text())
+    missing = None
+    if m:
+        spec = m.group("s")
+        target = p.parent / spec
+        if not any(Path(str(target) + e).exists() for e in ("", ".ts", ".tsx", "/index.ts")):
+            missing = spec
+    if missing is not None:
+        print("FAIL " + rel)
+        print("  ● Test suite failed to run")
+        print()
+        print("    Cannot find module '" + missing + "' from '" + rel + "'")
+        test_results.append({"name": str(p), "status": "failed"})
+        any_failed = True
+    else:
+        test_results.append({
+            "name": str(p), "status": "passed",
+            "assertionResults": [{"status": "passed", "fullName": "works the change"}],
+        })
+print("Test Suites: %d total" % len(test_results))
+print("Tests:       %d total" % len(test_results))
+res = os.environ.get("MINI_ORK_TEST_RESULTS_DIR")
+if res:
+    os.makedirs(res, exist_ok=True)
+    Path(res, "jest-1.json").write_text(json.dumps({"testResults": test_results}))
+sys.exit(1 if any_failed else 0)
+'''
+
+TS_CMD = "python3 runner.py"
+
+
+def _make_ts_repo(tmp_path: Path, *, head_files: dict[str, str] | None = None) -> Path:
+    """A throwaway TS-ish git repo whose `runner.py` jest stand-in is committed
+    at HEAD (so it is present in the base worktree, not only the candidate)."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "config", "core.autocrlf", "false")
+    (repo / "runner.py").write_text(TS_RUNNER)
+    for rel, src in (head_files or {}).items():
+        p = repo / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(src)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "init")
+    return repo
+
+
+def _verifier_module(tmp_path: Path, monkeypatch):
+    """Load the verifier script as a module so its helpers can be unit-tested.
+
+    `MINI_ORK_HOME`/`MINI_ORK_RUN_ID` are redirected to `tmp_path` first: the
+    module creates its log dir at import time."""
+    monkeypatch.setenv("MINI_ORK_HOME", str(tmp_path / "verifier-import-home"))
+    monkeypatch.setenv("MINI_ORK_RUN_ID", "unit-import")
+    spec = importlib.util.spec_from_file_location("mo_codefix_verifier_ut", VERIFIER)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_base_load_failure_of_candidate_added_module_is_proof(tmp_path):
+    """(a) Candidate adds src/x.ts + src/__tests__/x.test.ts importing it. The
+    overlay carries the test onto the base, where the new module does not exist
+    → the suite fails to LOAD ("Cannot find module '../x'") with no per-test
+    ids. That load failure is the exercise proof → target PROVEN."""
+    repo = _make_ts_repo(tmp_path)
+    (repo / "src" / "__tests__").mkdir(parents=True)
+    (repo / "src" / "x.ts").write_text("export const x = 1\n")
+    (repo / "src" / "__tests__" / "x.test.ts").write_text("import { x } from '../x'\n")
+
+    out = _run_verifier(repo, tmp_path, replay="1", run_id="loadfail-proof",
+                        test_cmd=TS_CMD)
+
+    assert out["verifier"] == "test"
+    assert out["pass"] is True, out
+    assert "exercise" in out["error_summary"], out
+    # The new test crossed onto the base (overlay) and failed to load there.
+    assert out["replay"]["overlaid_tests"] == ["src/__tests__/x.test.ts"], out["replay"]
+    # Its candidate-passing id now counts as base-failed → non-empty overlap.
+    assert out["replay"]["overlap"] == ["src/__tests__/x.test.ts::works the change"], out["replay"]
+    # The audit block names the unresolved module and the added path it resolves to.
+    proof = out["replay"]["load_failure_proof"]["src/__tests__/x.test.ts"]
+    assert proof["missing_module"] == "../x", proof
+    assert proof["added_path"] == "src/x.ts", proof
+
+
+def test_base_load_failure_module_not_added_by_candidate_not_proven(tmp_path, monkeypatch):
+    """(b) A base load failure naming a module the candidate did NOT add proves
+    nothing — neither a relative module absent from the candidate diff nor a
+    bare package (the bare base worktree has no node_modules)."""
+    mod = _verifier_module(tmp_path, monkeypatch)
+    repo = _make_ts_repo(tmp_path)
+    (repo / "src" / "__tests__").mkdir(parents=True)
+    (repo / "src" / "__tests__" / "x.test.ts").write_text("import '../y'\n")
+
+    replay = {
+        "candidate_passed": ["src/__tests__/x.test.ts::works the change"],
+        "base_failed": ["src/__tests__/x.test.ts::<suite load failure>"],
+        "overlap": [],
+        "overlaid_tests": ["src/__tests__/x.test.ts"],
+    }
+    result = {"passed": False, "reason": "tests-do-not-exercise-change", "replay": replay}
+
+    # The named relative module ('../y' → src/__tests__/y) is not in the diff.
+    log_rel = tmp_path / "base-rel.log"
+    log_rel.write_text(
+        "FAIL src/__tests__/x.test.ts\n"
+        "  ● Test suite failed to run\n\n"
+        "    Cannot find module '../y' from 'src/__tests__/x.test.ts'\n"
+    )
+    assert mod._promote_base_load_failure(
+        result, candidate_cwd=str(repo), base_ref="", base_log=str(log_rel),
+    ) is None
+
+    # A bare package resolves to no repo path → still not proof.
+    log_pkg = tmp_path / "base-pkg.log"
+    log_pkg.write_text(
+        "FAIL src/__tests__/x.test.ts\n"
+        "  ● Test suite failed to run\n\n"
+        "    Cannot find module 'react' from 'src/__tests__/x.test.ts'\n"
+    )
+    assert mod._promote_base_load_failure(
+        result, candidate_cwd=str(repo), base_ref="", base_log=str(log_pkg),
+    ) is None
+
+
+def test_base_suite_loads_and_passes_not_proven(tmp_path):
+    """(c) When the base CAN load and pass the overlaid test — it imports a
+    module that already exists at the base ref — there is no load failure and
+    the patch stays not-proven."""
+    repo = _make_ts_repo(tmp_path, head_files={"src/mod.ts": "export const m = 1\n"})
+    (repo / "src" / "__tests__").mkdir(parents=True)
+    (repo / "src" / "__tests__" / "x.test.ts").write_text("import { m } from '../mod'\n")
+
+    out = _run_verifier(repo, tmp_path, replay="1", run_id="loadfail-notproven",
+                        test_cmd=TS_CMD)
+
+    assert out["verifier"] == "test"
+    assert out["pass"] is False, out
+    assert "tests-do-not-exercise-change" in out["error_summary"], out
+    assert out["replay"]["overlap"] == [], out["replay"]
