@@ -266,3 +266,20 @@ def test_pytest_opt_out_keeps_the_green_pass(tmp_path):
 
     vector = _write_evidence_and_levels(tmp_path, "pytest-optout", out)
     assert vector["target"] == UNVERIFIED
+
+
+def test_opaque_runner_with_test_markers_stays_applicable(tmp_path):
+    """An adapter-less command whose output proves tests ran (`Ran 1 test`)
+    is the oracle's opaque exit-code instrument (ad507150): applicable, so the
+    early check must NOT short-circuit it to n/a."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("cf_test_verifier", VERIFIER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    log = tmp_path / "post.log"
+    log.write_text("....\n----------------------------------------------------------------------\nRan 4 tests in 0.01s\n\nOK\n")
+    assert mod._replay_applies("python -m unittest", None, str(log)) is True
+    build = tmp_path / "build.log"
+    build.write_text("   Compiling mini_ork_ui v0.1.0\n    Finished `release-fast` profile in 6m 19s\n")
+    assert mod._replay_applies("script/mini-ork-build", None, str(build)) is False

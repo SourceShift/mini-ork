@@ -825,7 +825,20 @@ def _runner_detection_available():
     return _TEST_RESULTS_AVAILABLE and detect_runners is not None
 
 
-def _replay_applies(cmd, results_dir):
+def _post_log_ran_tests(log_path):
+    """The oracle's own "tests executed" check on the post-patch log; False
+    when the oracle is unavailable or the log is unreadable."""
+    try:
+        from mini_ork.certify.oracle import _ran_tests
+    except Exception:  # noqa: BLE001 — no oracle → no opaque instrument
+        return False
+    try:
+        return bool(_ran_tests(log_path))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _replay_applies(cmd, results_dir, post_log=None):
     """Whether the delta-gate replay instrument applies to this command.
 
     Applicability is a property of the command and of what its post-patch run
@@ -842,6 +855,13 @@ def _replay_applies(cmd, results_dir):
     if not _runner_detection_available():
         return True
     if detect_runners(cmd):
+        return True
+    # The oracle's opaque fallback (ad507150) replays an adapter-less command
+    # by exit-code delta — but only when its output proves tests RAN. Mirror
+    # that: a post-patch log carrying a runner-agnostic test-run marker
+    # (`Ran N tests`, `test result:`, `N passed`, …) makes the command
+    # applicable; a build-only command (no marker) stays n/a with no base run.
+    if post_log and _post_log_ran_tests(post_log):
         return True
     if results_dir and os.path.isdir(results_dir):
         # The oracle treats the command as applicable only when it finds a
@@ -939,7 +959,7 @@ def main():
             # `MO_CODEFIX_REPLAY=0` opt-out (the false-withhold incident). The
             # emission below is byte-identical to the late twin in oracle.py, so
             # levels.py maps it to `target: n/a` exactly as before.
-            if not _replay_applies(CMD, results_dir):
+            if not _replay_applies(CMD, results_dir, LOG_PATH):
                 return emit_unverified(
                     post_rc,
                     "replay supports pytest, jest, vitest, or a results file; "
