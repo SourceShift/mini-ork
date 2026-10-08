@@ -73,6 +73,66 @@ def _verifier_stem(raw):
     return stem[:-3] if stem.endswith((".sh", ".py")) else stem
 
 
+def _dag_result(run_dir, name):
+    """The workflow verifier node's persisted result for ``name``, or ``None``.
+
+    The verifier node writes ``<run_dir>/verifier_<stem>.json`` (see
+    ``execute_handlers._handle_verifier``), where ``<stem>`` is computed by the
+    exact same ``_verifier_stem`` rule used here. The file is a byte copy of the
+    verifier's evidence log, so a real one usually carries log lines ahead of the
+    JSON payload; parse it the way the other in-tree readers do
+    (``scheduler._load_verifier``): whole-file ``json.loads`` first, then the last
+    line that parses as a JSON object. Only a dict carrying a ``pass`` key is a
+    reusable result — a missing file, a parse error or a non-dict returns
+    ``None`` so the caller runs the script unchanged.
+
+    A reusable result must satisfy the same minimum-evidence assertion as a
+    fresh verifier: its ``evidence_path`` file exists and is non-empty, or the
+    JSON carries an ``error_summary``. Otherwise it is treated as missing and
+    the caller falls back to running the script.
+    """
+    if not run_dir:
+        return None
+    path = os.path.join(run_dir, f"verifier_{_verifier_stem(name)}.json")
+    try:
+        text = open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return None
+    payload = None
+    try:
+        loaded = json.loads(text)
+    except ValueError:
+        loaded = None
+    if isinstance(loaded, dict) and "pass" in loaded:
+        payload = loaded
+    else:
+        # Log-line-prefixed (or multi-object) file: the result is the last line
+        # that parses as a JSON object with a ``pass`` key — the same bottom-up
+        # scan ``_declared_unmeasured`` uses below.
+        for line in reversed(text.splitlines()):
+            line = line.strip()
+            if not (line.startswith("{") and line.endswith("}")):
+                continue
+            try:
+                cand = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(cand, dict) and "pass" in cand:
+                payload = cand
+                break
+    if not isinstance(payload, dict) or "pass" not in payload:
+        return None
+    # Minimum evidence: a reused result certifies only when its evidence file
+    # exists and is non-empty, or it carries an error_summary. ``evidence_path``
+    # may be null (the "no test runner detected — skipped" shape), so coerce
+    # before touching the filesystem.
+    ev_path = str(payload.get("evidence_path") or "")
+    evidence_ok = bool(ev_path) and os.path.isfile(ev_path) and os.path.getsize(ev_path) > 0
+    if not (evidence_ok or payload.get("error_summary")):
+        return None
+    return payload
+
+
 def _find_verifier_script(raw, root, home):
     stem = _verifier_stem(raw)
     # Prefer the extension the contract named; fall back to the sibling so a
@@ -339,6 +399,47 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
             sys.stdout.write(f"[dry-run] verifier: {name} → {script or 'NOT_FOUND'}\n")
             results.append(f'{{"verifier":"{name}","pass":null,"evidence_path":"dry-run"}}')
             continue
+        # Post-run reuse: the workflow's verifier node already ran this verifier
+        # and persisted its result to <run_dir>/verifier_<stem>.json. Re-running
+        # it here duplicates the suite on an unchanged tree and — after a
+        # rollback — re-runs it against the reverted tree, truncating the run's
+        # only copy of the failure evidence. Reuse the DAG result unless a
+        # re-run is explicitly forced. The reused row flows through the gates
+        # and the verdict computation exactly like a fresh one.
+        if os.environ.get("MO_VERIFY_RERUN") != "1":
+            dag = _dag_result(run_dir, name)
+            if dag is not None:
+                sys.stderr.write(
+                    f"[verify] {name}: reused DAG result (MO_VERIFY_RERUN=1 to re-run)\n")
+                if dag.get("pass") is True:
+                    pass_count += 1
+                elif dag.get("pass") is not None:
+                    # Kickoff: "True -> pass; anything else -> fail". Only an
+                    # explicit ``pass: null`` abstains; any other value (a
+                    # non-boolean, e.g. the string "false") counts one fail.
+                    # Testing ``is False`` here would fail open: a payload whose
+                    # ``pass`` is neither True nor None would be counted as
+                    # neither, and with a declared non-empty output artifact that
+                    # abstention resolves the whole run to 'pass'.
+                    fail_count += 1
+                # pass: null (an abstain / unmeasured envelope) counts neither,
+                # mirroring a fresh verifier that declared it measured nothing.
+                #
+                # Fixed-shape row: never splice the payload's own keys into the
+                # results. A real verifier payload carries a ``verdict`` key
+                # (``{"verdict": "pass", ...}``, see the framework-edit
+                # verifiers), and ``mini_ork.cli.main`` reads the LAST
+                # ``"verdict":"…"`` match in verify's stdout as the run's verdict
+                # — so a reused pass-shaped payload would report a failing run as
+                # ``pass``. Only the fields the verdict computation and the run
+                # log need are copied; the payload's ``error_summary`` rides along
+                # as ``detail``, the key fresh failure rows use.
+                row = {"verifier": name, "pass": dag.get("pass"),
+                       "evidence_path": dag.get("evidence_path"), "reused": "dag"}
+                if dag.get("error_summary"):
+                    row["detail"] = dag["error_summary"]
+                results.append(json.dumps(row, separators=(",", ":")))
+                continue
         if not script:
             command = _find_verifier_command(name, plan_path)
             if not command:
