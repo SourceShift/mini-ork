@@ -1014,6 +1014,24 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                     statuses[field[0]] = "failed"
                     fail_count += 1
 
+            # ── per-run orchestrator (MO_RUN_ORCHESTRATOR=1; default off) ──
+            # Observe each node outcome at the wave boundary and pick one of
+            # advance/help/repair/mutate/promote (see
+            # mini_ork/orchestration/runner_orchestrator.py). With the flag unset
+            # this block is inert: nothing is imported and nothing is called, so
+            # the default path is byte-identical to before.
+            #
+            # Wired only on this dependency-graph path. The other ``_parallel``
+            # call sites below (parallel / partitioned / serial dispatch) stay
+            # unwired — matching the kickoff's scope, not an oversight.
+            try:
+                from mini_ork.orchestration.runner_orchestrator import enabled as _orch_enabled
+            except Exception:
+                _orch_enabled = lambda: False  # noqa: E731
+            if _orch_enabled():
+                _orchestrator_act(live_run_dir, db, run_id, outcomes, retry_edges,
+                                  revision_state=locals())
+
             # ── revise loop (retries edges) ────────────────────────────────
             # A failed node that carries a `retries` edge sends its findings
             # back to the edge's target (normally the implementer) instead of
@@ -3249,6 +3267,150 @@ def _archive_revise_round(run_dir: str, round_no: int, reset_fields) -> None:
             pass
 
 
+# Roles ``steer_run`` accepts (web/control._STEER_ROLES). A node type outside
+# this set steers the run-wide queue via ``any`` instead of being rejected.
+_ORCH_STEER_ROLES = {"planner", "implementer", "reviewer", "verifier"}
+
+
+def _open_state_db(db_path):
+    """Open a StateDB over the run's state.db path, or None if unusable.
+
+    The per-run orchestrator's HELP branch calls ``web.control.steer_run``, which
+    wants a ``StateDB`` instance (not the path string the loop carries). Reuse
+    the exact reader the web routes construct — do not open a second connection
+    style.
+    """
+    if not db_path or not os.path.isfile(db_path):
+        return None
+    try:
+        from mini_ork.web.db import StateDB
+
+        return StateDB(db_path)
+    except Exception:
+        return None
+
+
+def _orchestrator_act(run_dir, db, run_id, outcomes, retry_edges, *, revision_state):
+    """Realize one per-run-orchestrator action per failed node in this wave.
+
+    Called (only when ``MO_RUN_ORCHESTRATOR`` is on) once per dependency-graph
+    wave with that wave's ``outcomes`` — ``(field, rc, finish_reason)`` tuples.
+    For each failed node it asks the pure decision core (``on_node_boundary``)
+    for one Action and performs the side effect, reusing existing machinery:
+
+      * HELP  — ``steer_run`` with the guard-checked message; a message that
+                would mutate the node's contract is rejected and an
+                ``orchestrator.help.rejected`` row is emitted instead.
+      * REPAIR— the bounded brief via the existing ``_write_revise_feedback``.
+      * MUTATE— ``orchestrator.mutate.proposed``; the declared retries edge owns
+                the re-run (we reuse ``_control_descendants`` to scope it rather
+                than re-queue here, which would double-count ``fail_count``).
+      * PROMOTE— ``orchestrator.promote.filed``; never ``apply_mutation`` (that
+                stays the post-run, held-out-gated path).
+
+    Never invents retries edges. The one global budget gate
+    (``MO_ORCH_BUDGET_USD``) is fed the run's real spend from the cost ledger,
+    so exceeding the cap silences the orchestrator for the rest of the wave.
+    Whole body is fail-safe: any exception prints one line to stderr and returns
+    — the orchestrator can never take a run down.
+    """
+    try:
+        from mini_ork.orchestration.runner_orchestrator import (
+            HELP,
+            MUTATE,
+            PROMOTE,
+            REPAIR,
+            guard_steer,
+            on_node_boundary,
+            steer_message,
+        )
+        from mini_ork.observability.node_events import mo_node_emit
+
+        round_used = revision_state.get("round_used") or {}
+        control_descendants = revision_state.get("_control_descendants")
+
+        # The global budget gate reads the run's REAL spend. Passing nothing
+        # would leave ``spent_usd`` at its 0.0 default and the documented
+        # ``MO_ORCH_BUDGET_USD`` cap could never close. ``run_cost`` returns
+        # None when the ledger is unreadable; that degrades to 0.0 (gate open),
+        # never to a spurious block.
+        try:
+            from mini_ork.cost_ledger import run_cost as _run_cost
+
+            _spent = _run_cost(db, run_id)
+        except Exception:
+            _spent = None
+        spent_usd = float(_spent) if _spent is not None else 0.0
+
+        for field, rc, finish_reason in outcomes:
+            if rc == 0:
+                continue
+            node_id, node_type = field[0], field[1]
+            action = on_node_boundary({
+                "run_id": run_id,
+                "node_id": node_id,
+                "node_type": node_type,
+                "rc": rc,
+                "finish_reason": finish_reason,
+                "has_retries_edge": node_id in retry_edges,
+                "db": db,
+            }, spent_usd=spent_usd)
+            if action is None:
+                continue
+
+            if action.kind == HELP:
+                message = steer_message(action)
+                if not guard_steer(message):
+                    mo_node_emit(run_id, node_id, node_type,
+                                 "orchestrator.help.rejected",
+                                 json.dumps({"reason": action.reason}), db=db)
+                    continue
+                steer_db = _open_state_db(db)
+                if steer_db is not None:
+                    steer_run = _import_steer_run()
+                    if steer_run is not None:
+                        steer_run(
+                            steer_db, run_id, message,
+                            role_target=(node_type if node_type in _ORCH_STEER_ROLES
+                                         else "any"),
+                            severity="info",
+                        )
+            elif action.kind == REPAIR:
+                edge = retry_edges.get(node_id)
+                if edge:
+                    target_id, max_rounds = edge
+                    round_no = int(round_used.get(target_id, 0)) + 1
+                    _write_revise_feedback(
+                        run_dir, round_no, max_rounds, [(field, rc, finish_reason)])
+            elif action.kind == MUTATE:
+                proposal = dict(action.payload)
+                if node_id in retry_edges and callable(control_descendants):
+                    # The declared edge re-runs this node and its descendants
+                    # through the revise loop below — the single owner of the
+                    # fail-count bookkeeping a re-queue requires. Surface the
+                    # exact node set rather than re-queueing from here.
+                    proposal["reset_descendants"] = sorted(control_descendants(node_id))
+                mo_node_emit(run_id, node_id, node_type,
+                             "orchestrator.mutate.proposed",
+                             json.dumps(proposal), db=db)
+            elif action.kind == PROMOTE:
+                mo_node_emit(run_id, node_id, node_type,
+                             "orchestrator.promote.filed",
+                             json.dumps(action.payload), db=db)
+    except Exception as exc:  # noqa: BLE001 — never take a run down
+        print(f"[orchestrator] skipping wave: {exc}", file=sys.stderr)
+        return
+
+
+def _import_steer_run():
+    """Lazily resolve ``web.control.steer_run`` (kept out of module import so a
+    web-layer import cycle can never reach the default execute path)."""
+    try:
+        from mini_ork.web.control import steer_run
+
+        return steer_run
+    except Exception:
+        return None
 
 
 from mini_ork.cli.execute_handlers import (  # noqa: E402,F401
