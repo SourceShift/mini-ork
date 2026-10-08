@@ -14,12 +14,24 @@ Two constraints shape this writer:
 
 **A tailer holds a byte offset.** A reader opens this file, records where it got
 to, and comes back later for the delta. That makes the file append-only in the
-strict sense: the byte cap STOPS appends when the budget is spent rather than
-truncating, because rewriting a prefix would leave every open offset pointing at
-the wrong byte — a silent corruption that looks like duplicated or garbled
-output, not like a cap. ``MO_MAX_LIVE_BYTES`` (default 16 MiB) is deliberately
-separate from ``MO_MAX_TRANSCRIPT_BYTES``, which gates ``transcript.json`` and
-caps a file nobody tail-reads.
+strict sense: the byte budget ROTATES the file when it is spent rather than
+truncating a prefix in place, because rewriting a prefix would leave every open
+offset pointing at the wrong byte — a silent corruption that looks like
+duplicated or garbled output, not like a cap. Rotation replaces the whole file
+with a shorter, fresh segment; a reader that finds ``offset > size`` treats it
+as a truncation and resets to 0 (``web/routes/node_live.py``), so the live view
+resumes on the new segment instead of stalling. The failure this avoids is the
+one an earlier version had: the mirror stopped dead at the cap, its mtime froze,
+and an operator watching a large node could not tell it apart from a hang.
+
+``MO_MAX_LIVE_BYTES`` (default 16 MiB) bounds ONE SEGMENT — the writer keeps the
+current segment plus the one it just rotated aside (``<path>.1``), so disk stays
+bounded at two segments per node while the live path always advances. It is
+deliberately separate from ``MO_MAX_TRANSCRIPT_BYTES``, which gates
+``transcript.json`` and caps a file nobody tail-reads. Setting it to ``0``
+disables rotation: the live file then grows unbounded, for a node whose output
+is legitimately large and whose operator would rather have one long file than a
+rotated pair.
 
 **Records are raw transport lines, not parsed events.** The provider-specific
 JSON envelope is the parser callables' business (``dispatch`` injects
@@ -52,9 +64,10 @@ def live_file_path() -> str:
 
 
 def max_live_bytes() -> int:
-    """Byte budget for one live file. An unparseable value falls back to the
-    default: this is a budget knob on a diagnostic path, and raising here would
-    turn a typo in an env var into a failed dispatch."""
+    """Byte budget for one live SEGMENT before the writer rotates, or ``0`` for
+    unbounded. An unparseable value falls back to the default: this is a budget
+    knob on a diagnostic path, and raising here would turn a typo in an env var
+    into a failed dispatch."""
     raw = os.environ.get(MAX_BYTES_ENV, "").strip()
     if not raw:
         return DEFAULT_MAX_BYTES
@@ -78,9 +91,10 @@ class LiveWriter:
         self._lock = threading.Lock()
         self._seq = 0
         self._written = 0
-        self._truncated = False
+        self._rotations = 0
         self._started = time.monotonic()
         self._max_bytes = max_live_bytes() if max_bytes is None else max_bytes
+        self._path = path
         self._fh = None
         if path:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -94,7 +108,15 @@ class LiveWriter:
 
     @property
     def truncated(self) -> bool:
-        return self._truncated
+        """Retained for callers that predate rotation. The writer no longer cuts
+        the stream when the budget is spent — it rotates — so this is always
+        False; see :attr:`rotated`."""
+        return False
+
+    @property
+    def rotated(self) -> bool:
+        """True once the writer has rolled a full segment aside at least once."""
+        return self._rotations > 0
 
     def write_line(self, line: str, stream: str = "stdout", *, partial: bool = False) -> None:
         """Record one complete transport line.
@@ -115,42 +137,68 @@ class LiveWriter:
         if partial:
             record["partial"] = True
         with self._lock:
-            if self._fh is None or self._truncated:
+            if self._fh is None:
                 return
             record["seq"] = self._seq
             record["t"] = round(time.monotonic() - self._started, 3)
             payload = json.dumps(record, ensure_ascii=False) + "\n"
             encoded = len(payload.encode("utf-8", "replace"))
-            if self._written + encoded > self._max_bytes:
-                self._truncate_locked()
-                return
+            # ``self._written`` guards the degenerate case: a single record
+            # larger than the whole budget must still be written (it cannot be
+            # split) rather than triggering a rotation on every write.
+            if (self._max_bytes and self._written
+                    and self._written + encoded > self._max_bytes):
+                self._rotate_locked()
+                if self._fh is None:
+                    return
             self._seq += 1
             self._written += encoded
             self._fh.write(payload)
             self._fh.flush()
 
-    def _truncate_locked(self) -> None:
-        """Stop appending and record that we did. Called with the lock held.
+    def _rotate_locked(self) -> None:
+        """Roll the full segment aside and continue in a fresh file.
 
-        The marker is written even when the budget is already spent, so the file
-        can overshoot ``max_bytes`` by its size (~140 bytes) once. That is
-        deliberate: the budget bounds PAYLOAD, and a capped file with no marker
-        is indistinguishable from a short run — a tailer would show the operator
-        two lines and let them believe that was all the node said. A bounded
-        overshoot is the cheaper wrong answer.
+        Called with the lock held, once the current segment's budget is spent.
+        The live path ALWAYS keeps advancing: the failure this replaces was a
+        mirror that stopped dead at the cap, its mtime frozen, which an operator
+        watching a large node cannot tell apart from a hang. A tailer holds a
+        byte offset into ``self._path``; after rotation that path is a shorter,
+        fresh file, and the reader (``web/routes/node_live.py``) treats
+        ``offset > size`` as a truncation and resets to 0 — so the live view
+        resumes on the new segment instead of stalling.
+
+        Exactly one previous segment is retained (``<path>.1``): disk stays
+        bounded at two segments per node, the mirror keeps the most recent
+        window of output, and the authoritative full record remains in the
+        node's transcript.
         """
-        self._truncated = True
+        self._rotations += 1
         marker = json.dumps(
             {
                 "seq": self._seq,
                 "stream": "meta",
                 "t": round(time.monotonic() - self._started, 3),
-                "line": f"live stream truncated at {self._max_bytes} bytes",
-                "truncated": True,
+                "line": f"live segment rotated at {self._max_bytes} bytes",
+                "rotated": True,
             }
         ) + "\n"
-        self._fh.write(marker)  # type: ignore[union-attr]
-        self._fh.flush()  # type: ignore[union-attr]
+        if self._fh is not None:
+            try:
+                self._fh.write(marker)
+                self._fh.flush()
+            finally:
+                self._fh.close()
+        self._fh = None
+        try:
+            os.replace(self._path, self._path + ".1")
+        except OSError:
+            pass
+        try:
+            self._fh = open(self._path, "a", encoding="utf-8", errors="replace")
+        except OSError:
+            self._fh = None
+        self._written = 0
 
     def close(self) -> None:
         with self._lock:
