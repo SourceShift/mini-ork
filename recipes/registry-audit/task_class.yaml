@@ -1,0 +1,31 @@
+name: registry_audit
+description: >
+  Audit a markdown feature registry row by row and rewrite each Status cell.
+  A deterministic parser (no LLM) turns the document into a stable item list;
+  a bounded, checkpointed fan-out then runs one read-only audit child per item,
+  so a re-run resumes from the items already done instead of re-spending on
+  all of them.
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+matches:
+  keywords:
+    - registry-audit
+    - feature registry
+    - registry status
+    - status audit
+    - ebook companion registry
+  path_globs:
+    - "**/*feature-registry*.md"
+    - "**/*registry*.md"
+  regex:
+    - "registry.*(status|audit)"
+    - "(status|audit).*registry"
+
+default_gates:
+  - budget_gate
+
+# Read-only analysis: the children read code and report; they never edit the
+# registry (the publisher rewrites it), so no source mutation is at risk.
+risk_class: low

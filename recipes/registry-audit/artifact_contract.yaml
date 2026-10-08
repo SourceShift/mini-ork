@@ -1,0 +1,20 @@
+task_class: registry_audit
+expected_artifact: audit-verdict.json
+
+# The wave's proof artifact. audit_coverage.py (the verifier_ref) re-reads the
+# parsed items, the plan, and the fan-out manifest, then writes
+# audit-verdict.json into $MINI_ORK_RUN_DIR. A non-empty `outputs` is what makes
+# the verifier node take its verifier_ref branch instead of the "no outputs in
+# artifact_contract" early return, so audit_coverage actually runs.
+source_artifact: audit-verdict.json
+outputs:
+  - audit-verdict.json
+
+success_verifiers:
+  - verifiers/audit_coverage.py
+
+# A wave that leaves items unaudited is a real failure and must not be recorded
+# as a pass — the registry's whole purpose is a complete status column, so a
+# partial pass is the vacuous-verdict hazard. request_changes sends the findings
+# back to the implementer for a bounded revise round (e.g. a timed-out item).
+failure_policy: request_changes

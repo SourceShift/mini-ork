@@ -1,0 +1,72 @@
+version: "0.1.0"
+task_class: registry_audit
+description: >
+  One audit wave over a markdown feature registry. A deterministic parse
+  materializes the item list (MO_REGISTRY_PATH), a plan node selects the items
+  still lacking a result, the audit_items implementer fans out one read-only
+  child per item through the shared item_fanout pool, and audit_check proves
+  every planned item was accounted for. The publisher rewrites the Status cells.
+
+nodes:
+  - name: planner
+    type: planner
+    model_lane: planner
+    prompt_ref: prompts/planner.md
+    dispatch_mode: serial
+    tools:
+      native: [Read]
+
+  # Deterministic: parses the registry document into items. No LLM, so the id
+  # set is stable across runs — the per-item checkpoints in item_fanout key on
+  # those ids, and a model re-deriving them would give a different set each time.
+  - name: registry_parse
+    type: transform
+    transform: registry_parse
+    dispatch_mode: serial
+    outputs:
+      - { name: registry_items, path: registry-items.json, kind: file, visibility: consumer }
+
+  # Selects the items still without a checkpointed result (resume), capped by
+  # MO_REGISTRY_MAX_ITEMS, minus anything in MO_REGISTRY_QUARANTINED.
+  - name: audit_plan
+    type: transform
+    transform: audit_plan
+    dispatch_mode: serial
+    inputs:
+      registry_items: { required: true }
+    outputs:
+      - { name: audit_plan, path: audit-plan.json, kind: file, visibility: consumer }
+
+  # The fan-out lives INSIDE this node: one implementer whose registered
+  # submode driver (lib/fanout_driver.py) runs the bounded pool. `serial` is
+  # correct here — the concurrency is the pool's, not the DAG's.
+  - name: audit_items
+    type: implementer
+    prompt_ref: null
+    dispatch_mode: serial
+
+  - name: audit_check
+    type: verifier
+    prompt_ref: null
+    verifier_ref: verifiers/audit_coverage.py
+    dispatch_mode: serial
+    outputs:
+      - { name: audit_verdict, path: audit-verdict.json, kind: file, visibility: consumer }
+
+  - name: publisher
+    type: publisher
+    prompt_ref: prompts/publisher.md
+    dispatch_mode: serial
+
+edges:
+  - { from: planner,        to: registry_parse, edge_type: depends_on }
+  - { from: registry_parse, to: audit_plan,     edge_type: depends_on, from_output: registry_items, to_input: registry_items }
+  - { from: audit_plan,     to: audit_items,    edge_type: depends_on }
+  - { from: audit_items,    to: audit_check,    edge_type: depends_on }
+  - { from: audit_check,    to: publisher,      edge_type: depends_on }
+  # A revise round re-runs ONLY the items without a checkpoint, because
+  # audit_plan filters on the results directory — this is why the per-item
+  # checkpoint exists.
+  - { from: audit_check,    to: audit_items,    edge_type: retries, max_rounds: 2 }
+
+source_artifact: audit-verdict.json
