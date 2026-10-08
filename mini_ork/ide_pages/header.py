@@ -7,6 +7,7 @@ cached ping, with a short timeout.
 from __future__ import annotations
 
 import os
+import sqlite3
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -124,6 +125,80 @@ def _nodes() -> dict[str, Any]:
     return {"configured": len(names), "names": names}
 
 
+# One statement per poll: the ``ts`` cutoff rides ``idx_llm_calls_ts``, and the
+# per-lane roll-up plus the newest failing message both come out of the window
+# function below — no per-lane round-trip, which matters because ``header()`` is
+# polled every few seconds. ``ts`` is the same ISO shape cost_ledger's cutoff
+# compares against (``strftime('%Y-%m-%dT%H:%M:%S', …)`` sorts below the stored
+# ``…%H:%M:%S.%fZ`` rows of the same second, so nothing newer is dropped).
+_LANES_SQL = """
+WITH win AS (
+  SELECT
+    COALESCE(NULLIF(actor, ''), provider) AS lane,
+    status,
+    cost_usd,
+    error_message,
+    ROW_NUMBER() OVER (
+      PARTITION BY COALESCE(NULLIF(actor, ''), provider), (status <> 'success')
+      ORDER BY ts DESC
+    ) AS rn
+  FROM llm_calls
+  WHERE ts >= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-24 hours')
+)
+SELECT
+  lane,
+  COUNT(*)                                            AS calls,
+  SUM(CASE WHEN status <> 'success' THEN 1 ELSE 0 END) AS failed,
+  ROUND(COALESCE(SUM(cost_usd), 0), 2)                 AS usd,
+  MAX(CASE WHEN status <> 'success' AND rn = 1 THEN error_message END) AS last_error
+FROM win
+GROUP BY lane
+ORDER BY calls DESC, lane ASC
+LIMIT 8
+"""
+
+
+def _lanes(db: Path) -> list[dict[str, Any]]:
+    """Per-lane call health over the last 24 h, for the status-bar mini-bars.
+
+    One indexed query over ``llm_calls`` (see :data:`_LANES_SQL`; the ``ts``
+    cutoff uses ``idx_llm_calls_ts`` when the DB carries one) groups by the lane
+    label — ``actor`` when present, else ``provider`` — and yields, per lane,
+    today's ``calls``, ``failed`` (any ``status`` other than ``'success'``), the
+    ``usd`` spent (rounded to cents), and the newest failing row's
+    ``error_message`` cut to 120 chars. Lanes sort by calls desc, capped at 8.
+
+    Fail-soft: a missing DB file, a DB without ``llm_calls`` (or without one of
+    the columns read here), or any other ``sqlite3.Error`` returns ``[]`` — the
+    status bar drops the mini-bars rather than blanking the header. The
+    connection is a plain one (never ``mode=ro``) for the idle-WAL reason
+    documented in ``mini_ork.cost_ledger``; SELECTs never write the DB.
+    """
+    if not db.is_file():
+        return []
+    try:
+        con = sqlite3.connect(os.fspath(db), timeout=5)
+    except sqlite3.Error:
+        return []
+    try:
+        rows = con.execute(_LANES_SQL).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        con.close()
+    out: list[dict[str, Any]] = []
+    for lane, calls, failed, usd, last_error in rows:
+        out.append({
+            "lane": str(lane or ""),
+            "calls": int(calls or 0),
+            "failed": int(failed or 0),
+            "usd": round(float(usd or 0.0), 2),
+            # One line for a status-bar tooltip: collapse newlines/indent first.
+            "last_error": " ".join(str(last_error).split())[:120] if last_error else "",
+        })
+    return out
+
+
 def header(home: Path, counts: dict[str, int]) -> dict[str, Any]:
     from mini_ork import cost_ledger
 
@@ -159,4 +234,5 @@ def header(home: Path, counts: dict[str, int]) -> dict[str, Any]:
         "contextnest": _contextnest(),
         "nodes": _nodes(),
         "version": _version(),
+        "lanes": _lanes(db) if db.is_file() else [],
     }

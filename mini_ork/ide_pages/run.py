@@ -1388,6 +1388,16 @@ def _story_tab(run: Run, outcome: dict[str, Any]) -> list[dict[str, Any]]:
     from mini_ork.ide_pages import run_story
 
     sections.extend(S.guarded({}, "What happened", lambda: run_story.story_section(run)))
+    # A live run can still be steered: the box runs ``mini-ork board steer
+    # <run> --text <typed>``. Finished runs get no composer — there is nothing
+    # left to steer. ``_running`` is the page's own running test (the one the
+    # live chip and ``_actions`` use), so the composer cannot appear on a run
+    # the header already calls done.
+    if _running(run):
+        sections.append(S.composer(
+            "Tell the running agent what to change… (Enter to send)",
+            ["board", "steer", run.id, "--text"],
+            title="Steer this run"))
     return sections
 
 
