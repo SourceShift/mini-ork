@@ -33,6 +33,10 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
         sections = (S.guarded(errors, "Lanes", lambda: _lanes_table(home))
                     + S.guarded(errors, "Credentials", lambda: _credentials(home))
                     + S.guarded(errors, "Bring your own provider", lambda: _byo(home)))
+        if S.ide_level() >= 2:
+            # Add, don't remove: the agents board goes first, the old table stays below it.
+            sections[0]["title"] = "All · Lanes"
+            sections = S.guarded(errors, "Lanes · last 24 h", lambda: _lanes_agents(home)) + sections
     elif tab == "routing":
         sections = (S.guarded(errors, "Role → lane ladder", lambda: _ladder(home))
                     + S.guarded(errors, "GRPO bandit · implementer arms", lambda: _bandit(home))
@@ -151,25 +155,60 @@ def _probe_cache(home: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _calls_by_lane(home: Path, providers: dict[str, dict[str, Any]]) -> dict[str, dict[str, float]]:
+def _lane_of(row: dict[str, Any], providers: dict[str, dict[str, Any]]) -> str | None:
+    """The configured lane a ledger row belongs to, or ``None`` if none match.
+
+    Dispatch writes the *lane alias* into ``model_id`` and the *vendor* into
+    ``provider`` (production: ``model_id='codex'``, ``provider='openai'``), so a
+    row matches a lane whose alias is the ``model_id`` or whose configured model
+    is, and — for a row that carried no alias — whose alias *is* the provider.
+    This is the single match rule the "All · Lanes" table and the agents board
+    both read through, so the two can never disagree.
+    """
+    model = str(row.get("model_id") or "").lower()
+    provider = str(row.get("provider") or "").lower()
+    for lane, entry in providers.items():
+        names = {lane.lower(), str(entry.get("model") or "").lower()} - {""}
+        if model in names or provider == lane.lower():
+            return lane
+    return None
+
+
+def _calls_by_lane(home: Path, providers: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Per-lane ``calls`` / ``errors`` / ``usd`` over the last 24 h, plus ``last_error``.
+
+    Both reads filter and match the ledger the same way — by the lane alias in
+    ``model_id`` (see :func:`_lane_of`) — so the counts and the newest failing
+    message always describe the same rows.
+    """
     db = _db(home)
     if not db.has_table("llm_calls"):
         return {}
     rows = db.rows(
         "SELECT provider, model_id, status, COUNT(*) AS n, COALESCE(SUM(cost_usd),0) AS usd "
         "FROM llm_calls WHERE ts >= ? GROUP BY provider, model_id, status", (_since(24),))
-    out: dict[str, dict[str, float]] = defaultdict(lambda: {"calls": 0, "usd": 0.0, "errors": 0})
-    for lane, entry in providers.items():
-        names = {lane.lower(), str(entry.get("model") or "").lower()} - {""}
-        for r in rows:
-            model = str(r.get("model_id") or "").lower()
-            provider = str(r.get("provider") or "").lower()
-            if model in names or provider == lane.lower():
-                bucket = out[lane]
-                bucket["calls"] += int(r.get("n") or 0)
-                bucket["usd"] += float(r.get("usd") or 0.0)
-                if str(r.get("status") or "success") != "success":
-                    bucket["errors"] += int(r.get("n") or 0)
+    out: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"calls": 0, "usd": 0.0, "errors": 0, "last_error": ""})
+    for r in rows:
+        lane = _lane_of(r, providers)
+        if lane is None:
+            continue
+        bucket = out[lane]
+        bucket["calls"] += int(r.get("n") or 0)
+        bucket["usd"] += float(r.get("usd") or 0.0)
+        if str(r.get("status") or "success") != "success":
+            bucket["errors"] += int(r.get("n") or 0)
+    # Newest failing message per lane: newest-first, so the first row that
+    # names a lane sets its "last" line and later (older) rows never overwrite it.
+    for r in db.rows(
+            "SELECT provider, model_id, error_message FROM llm_calls "
+            "WHERE ts >= ? AND status != 'success' AND COALESCE(error_message,'') != '' "
+            "ORDER BY ts DESC", (_since(24),)):
+        lane = _lane_of(r, providers)
+        if lane is None or out[lane]["last_error"]:
+            continue
+        # One line for the agent row: collapse newlines/indent before cutting.
+        out[lane]["last_error"] = " ".join(str(r.get("error_message")).split())[:120]
     return out
 
 
@@ -220,6 +259,51 @@ def _state(entry: dict[str, Any], names: set[str], probe: Any, errors: int) -> d
     if errors:
         return S.cell(f"{errors} error{'s' if errors != 1 else ''}", "yellow")
     return S.cell("ok", "green")
+
+
+_LANE_AGENTS_TITLE = "Lanes · last 24 h"
+
+
+def _lane_call_state(calls: int, failed: int) -> str:
+    """The agent-row state for a lane's 24-h calls (kickoff §1)."""
+    if calls >= 3 and failed / calls >= 0.5:
+        return "failed"
+    return "running" if calls > 0 else "pending"
+
+
+def _lanes_agents(home: Path) -> dict[str, Any]:
+    """One ``agents`` row per configured lane, from the ledger's 24-h roll-up.
+
+    Calls, failures, spend and the "last" error line all come from
+    :func:`_calls_by_lane` — the same read the "All · Lanes" table below this
+    board uses, matched the way dispatch writes the ledger (``model_id`` holds
+    the lane alias, ``provider`` the vendor) — so the board and that table can
+    never disagree.
+
+    The kickoff's "read the 24-h numbers from ``header._lanes``" cannot feed
+    them: the header buckets by ``actor``, which is a node/role name
+    (``gradient-extract``, ``reviewer``), never a lane alias, so a lane there
+    reads another bucket's counts *and* another bucket's error (live: every lane
+    read 0 calls while the table below showed its real count). Reading the
+    ledger by the alias is what makes the "last" line real, too.
+    """
+    providers = _providers(home)
+    calls = _calls_by_lane(home, providers)
+    out = []
+    for lane in sorted(providers):
+        entry = providers[lane]
+        stats = calls.get(lane) or {}
+        calls_n = int(stats.get("calls") or 0)
+        failed = int(stats.get("errors") or 0)
+        out.append(S.agent_row(lane, _lane_call_state(calls_n, failed),
+                               lane=str(entry.get("kind") or ""),
+                               model=str(entry.get("model") or ""),
+                               step=f"{calls_n} calls · {failed} failed",
+                               last=str(stats.get("last_error") or ""),
+                               cost=S.money(stats.get("usd")) if calls_n else "—"))
+    if not out:
+        out = [S.agent_row("no lanes", "pending", step="no providers.yaml found")]
+    return S.agents(_LANE_AGENTS_TITLE, out, full=True)
 
 
 def _credentials(home: Path) -> dict[str, Any]:

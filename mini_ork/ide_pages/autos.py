@@ -71,14 +71,14 @@ def _automations_tab(home: Path, args: dict[str, str], errors: dict[str, str]) -
         return [S.lst("Automations", [S.bad("Could not read automations", f"{type(exc).__name__}: {exc}")],
                       full=True)]
     if not rows:
-        return [S.table(
+        return _with_automations_board(rows, [S.table(
             "Automations",
             [S.col(fr=1, min=120), S.col(fr=1, min=120), S.col(80), S.col(110)],
             ["automation", "when", "next", "last"],
             [[S.muted("No automations yet"), "", "", ""]],
             full=True,
             note="Ask a mini-ork thread to run a recipe on a schedule, "
-                 "or use mini-ork automations add.")]
+                 "or use mini-ork automations add.")], errors)
     selected = next((r for r in rows if r["id"] == args.get("auto")), rows[0])
     table = S.table(
         "Automations",
@@ -93,7 +93,64 @@ def _automations_tab(home: Path, args: dict[str, str], errors: dict[str, str]) -
     out += S.guarded(errors, selected["id"], lambda: _detail(selected))
     out += S.guarded(errors, "Next three firings", lambda: _firings(selected))
     out += S.guarded(errors, "Kickoff each run receives", lambda: _kickoff(home, selected["id"]))
-    return out
+    return _with_automations_board(rows, out, errors)
+
+
+# (column title, colour, the automation state it gathers).
+# The store carries only ``enabled``; there is no "disabled" state to read, so
+# that column stays empty rather than relabelling an enabled automation.
+_AUTO_COLUMNS = (("Enabled", "green", "enabled"), ("Paused", "sub", "paused"),
+                 ("Disabled", "red", "disabled"))
+# The card mark and the IDE state word per automation state.
+_AUTO_CARD = {"enabled": ("●", "running"), "paused": ("⏸", "pending")}
+
+
+def _auto_state(row: dict[str, Any]) -> str:
+    """An automation's state, from the fields its store carries.
+
+    Only ``enabled`` is stored. An enabled automation whose last firing could
+    not start is still enabled — it fires again on its schedule — so it stays in
+    the Enabled column, with a ✗ mark and a ``failed`` state saying what
+    happened last. Nothing is ever "Disabled": the store has no such field, so
+    that column is empty by construction.
+    """
+    return "enabled" if row.get("enabled") else "paused"
+
+
+def _auto_card(row: dict[str, Any]) -> dict[str, Any]:
+    aid = str(row["id"])
+    state = _auto_state(row)
+    mark, card_state = _AUTO_CARD[state]
+    if state == "enabled" and row.get("last_error"):
+        mark, card_state = "✗", "failed"
+    # The same parse the old table's "last" column uses, so the chip never
+    # carries the raw ``last_run`` text (backticks, or a whole error message).
+    last = _last_cell(row)
+    meta = [S.meta_item(last["t"], last["c"])] if last["t"] else []
+    return {"id": aid, "title": str(row.get("name") or aid),
+            "sub": str(row.get("when") or row.get("schedule") or ""),
+            "state": card_state, "mark": mark,
+            "meta": meta, "do": S.set_args(auto=aid)}
+
+
+def _automations_board(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """One card per automation, grouped into its state's column."""
+    cols = []
+    for title, colour, state in _AUTO_COLUMNS:
+        cards = [_auto_card(r) for r in rows if _auto_state(r) == state]
+        cols.append(S.column(title, cards, c=colour))
+    return S.columns("Automations", cols, full=True)
+
+
+def _with_automations_board(rows: list[dict[str, Any]], sections: list[dict[str, Any]],
+                            errors: dict[str, str]) -> list[dict[str, Any]]:
+    """Level 2 adds the state board above the old table (add, don't remove)."""
+    if S.ide_level() < 2:
+        return sections
+    for section in sections:
+        if section.get("title") == "Automations":
+            section["title"] = "All · Automations"
+    return S.guarded(errors, "Automations", lambda: _automations_board(rows)) + sections
 
 
 def _detail(row: dict[str, Any]) -> dict[str, Any]:

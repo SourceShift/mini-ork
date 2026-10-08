@@ -7,6 +7,7 @@ from its YAML; specs from ``spec-index.json`` files; epics from ``state.db``.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -142,9 +143,72 @@ def _recipe_sections(home: Path, args: dict[str, str], errors: dict[str, str],
                 items.append(S.dot("Test it now", "no example kickoff yet"))
         return S.lst("Checks", items or [S.dot("Select a recipe")], col=2)
 
-    return (S.guarded(errors, "Catalog", catalog) + S.guarded(errors, "Detail", detail)
-            + S.guarded(errors, "Flow", flow) + S.guarded(errors, "Contract", contract_list)
-            + S.guarded(errors, "Checks", checks))
+    sections = (S.guarded(errors, "Catalog", catalog) + S.guarded(errors, "Detail", detail)
+                + S.guarded(errors, "Flow", flow) + S.guarded(errors, "Contract", contract_list)
+                + S.guarded(errors, "Checks", checks))
+    if S.ide_level() >= 2:
+        # Add, don't remove: the family board first, the old catalog below it.
+        for section in sections:
+            if section.get("title") == "Catalog":
+                section["title"] = "All · Catalog"
+        sections = S.guarded(errors, "Recipes", lambda: _recipes_board(rows)) + sections
+    return sections
+
+
+# The task_class family a recipe belongs to, chosen from its task_class
+# keywords (the ``matches.keywords`` list ``recipe_rows`` already carries) and
+# the tokens of its id. A family owns the recipe when any of its marker words is
+# one of those tokens (exact match, so "editorial" is not "edit"); the first
+# family to match wins (dict insertion order), and anything unmatched is
+# Ops / other. Map: column title → (column colour, marker words).
+_RECIPE_FAMILIES: dict[str, tuple[str, frozenset[str]]] = {
+    "Code": ("blue", frozenset({"code", "fix", "bug", "patch", "refactor", "edit",
+                                "migration", "schema", "audit", "parity", "smoke",
+                                "compile", "diff", "doc", "docs"})),
+    "Research": ("purple", frozenset({"research", "researcher", "literature", "lens",
+                                      "synthesis", "inventory", "survey", "review", "judge",
+                                      "spec", "critique", "panel"})),
+}
+_RECIPE_FAMILY_OTHER = ("Ops / other", "sub")
+
+
+def _recipe_tokens(row: dict[str, Any]) -> set[str]:
+    """The lowercase words of a recipe's id and task_class keywords."""
+    text = " ".join([str(row.get("id") or "")]
+                    + [str(k) for k in (row.get("keywords") or [])]).lower()
+    return {t for t in re.split(r"[^a-z0-9]+", text) if t}
+
+
+def _recipe_family(row: dict[str, Any]) -> tuple[str, str]:
+    """The ``(column title, colour)`` for one catalog row."""
+    tokens = _recipe_tokens(row)
+    for title, (colour, markers) in _RECIPE_FAMILIES.items():
+        if tokens & markers:
+            return title, colour
+    return _RECIPE_FAMILY_OTHER
+
+
+def _recipe_card(row: dict[str, Any]) -> dict[str, Any]:
+    """One recipe card: its name, a one-line description, and the open action."""
+    rid = str(row.get("id") or "")
+    runs = int(row.get("runs") or 0)
+    return {"id": rid, "title": rid,
+            "sub": " ".join(str(row.get("description") or "").split())[:140],
+            "state": "done" if runs else "pending", "mark": "✓" if runs else "○",
+            "meta": [], "do": S.set_args(recipe=rid)}
+
+
+def _recipes_board(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """One card per recipe, grouped into its task_class family's column."""
+    buckets: dict[str, list[dict[str, Any]]] = {title: [] for title in _RECIPE_FAMILIES}
+    buckets[_RECIPE_FAMILY_OTHER[0]] = []
+    for row in rows:
+        buckets.setdefault(_recipe_family(row)[0], []).append(_recipe_card(row))
+    cols = [S.column(title, buckets[title], c=colour)
+            for title, (colour, _markers) in _RECIPE_FAMILIES.items()]
+    cols.append(S.column(_RECIPE_FAMILY_OTHER[0], buckets[_RECIPE_FAMILY_OTHER[0]],
+                         c=_RECIPE_FAMILY_OTHER[1]))
+    return S.columns("Recipes", cols, full=True)
 
 
 # ── specs ──────────────────────────────────────────────────────────────────

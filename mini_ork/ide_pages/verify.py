@@ -81,6 +81,32 @@ def _certificates(home: Path) -> list[dict[str, Any]]:
 _VERDICT_COLOUR = {"PROVEN": "green", "REFUTED": "red", "UNVERIFIED": "yellow"}
 _VERDICT_EXIT = {"PROVEN": "exit 0", "REFUTED": "exit 1", "UNVERIFIED": "exit 2"}
 
+# Certificate verdict → the check-row state a ``checks`` list draws. Anything
+# that is not PROVEN or REFUTED (UNVERIFIED, a missing verdict) is ``na``.
+_CERT_CHECK_STATE = {"PROVEN": "pass", "REFUTED": "fail"}
+
+
+def _certificate_checks(certs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Recent certificates as ``checks`` rows (kickoff §2).
+
+    ``certs`` is the list ``latest`` already loaded — the certificates folder is
+    read once per page, not once per section. ``name`` is the run or target a
+    certificate names, falling back to its claim; ``detail`` is the
+    certificate's own one-line reason. The open action is the same one the old
+    table row carries.
+    """
+    rows = []
+    for cert in certs:
+        claim = cert.get("claim") if isinstance(cert.get("claim"), dict) else {}
+        name = _short_title(cert.get("target") or cert.get("run_id") or claim.get("summary") or "", 120)
+        verdict = str(cert.get("verdict") or "")
+        rows.append(S.check_row(name or "certificate", _CERT_CHECK_STATE.get(verdict, "na"),
+                                detail=_short_title(cert.get("reason") or verdict, 160),
+                                do=S.open_path(str(cert["_path"]))))
+    if not rows:
+        rows = [S.check_row("No certificates yet", "na", detail="they land in .mini-ork/certificates/")]
+    return S.checks("Certificates", rows, full=True)
+
 
 def _certify_sections(home: Path, args: dict[str, str], errors: dict[str, str]) -> list[dict[str, Any]]:
     claim = (args.get("claim") or "").strip()
@@ -143,8 +169,15 @@ def _certify_sections(home: Path, args: dict[str, str], errors: dict[str, str]) 
                        [{"cells": r, "do": S.open_path(c["_path"]) if certs else None}
                         for r, c in zip(rows, certs or [{}])], full=True)
 
-    return (S.guarded(errors, "Certify", form) + S.guarded(errors, "Certificate", latest)
-            + S.guarded(errors, "Recent certificates", recent))
+    sections = (S.guarded(errors, "Certify", form) + S.guarded(errors, "Certificate", latest)
+                + S.guarded(errors, "Recent certificates", recent))
+    if S.ide_level() >= 2:
+        # Add, don't remove: the checks list first, the old table stays below it.
+        for section in sections:
+            if section.get("title") == "Recent certificates":
+                section["title"] = "All · Recent certificates"
+        sections = S.guarded(errors, "Certificates", lambda: _certificate_checks(certs)) + sections
+    return sections
 
 
 # ── gates & verifiers ──────────────────────────────────────────────────────
