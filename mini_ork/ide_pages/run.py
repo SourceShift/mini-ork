@@ -1328,6 +1328,12 @@ def _title_v2(run: Run) -> str:
     recipe = str(run.card.get("recipe") or run.row.get("recipe") or "")
     title = str(run.card.get("title") or "").strip()
     if title and title != f"{recipe or 'mini-ork'} run":
+        # The card title is the heading cut to 80 chars; show the whole heading
+        # when the card title is just its prefix.
+        heading = str(_run_profile(run).get("user_goal") or "").strip()
+        heading = heading.splitlines()[0].strip() if heading else ""
+        if len(title) >= 80 and len(heading) > len(title) and heading.startswith(title):
+            return heading[:200]
         return title
     goal = str(_run_profile(run).get("user_goal") or "").strip()
     if goal:
@@ -1357,6 +1363,13 @@ def _story_tab(run: Run, outcome: dict[str, Any]) -> list[dict[str, Any]]:
     goal = str(profile.get("user_goal") or "").strip()
     raw_criteria = profile.get("success_criteria")
     criteria = [str(c) for c in raw_criteria] if isinstance(raw_criteria, list) else []
+    # The hero's goal is the kickoff's first heading, which is also the run
+    # page title — so an unedited goal would repeat the title word for word.
+    # Blank the hero goal when it matches the title, leaving just the criteria.
+    title = _title_v2(run).strip().casefold()
+    if goal and title and goal.casefold().startswith(title) \
+            and (goal.casefold() == title or len(title) >= 80):
+        goal = ""
     if goal or criteria:
         recipe = str(run.card.get("recipe") or run.row.get("recipe") or "")
         meta = []

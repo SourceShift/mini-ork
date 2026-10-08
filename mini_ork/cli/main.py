@@ -287,10 +287,25 @@ def gen_profile(kickoff_path, root, recipe, task_class, profile_path, agents_pat
         return [line for line in lines if line.strip()]
 
     def bullets(lines):
+        # A wrapped kickoff bullet — a markdown list item whose text spills
+        # onto an indented continuation line — must stay ONE item, so the
+        # success criteria and scope lists don't split mid-sentence. A line
+        # starts a new item when it is a list item (`- `/`* `/`1.`/`1)`) or is
+        # not indented; an indented non-list line continues the previous item.
+        # Nested bullets (indented `- …`) stay separate items, as before.
         items = []
         for line in lines:
             stripped = re.sub(r"^\s*[-*]\s*", "", line).strip()
-            if stripped:
+            if not stripped:
+                continue
+            is_list_item = bool(re.match(r"^\s*(?:[-*]\s+|\d+[.)]\s+)", line))
+            if is_list_item or not line[:1].isspace():
+                items.append(stripped)
+            elif items:
+                # Join the raw continuation text: the marker strip above would
+                # eat a leading '-'/'*' that is content ('--flag', '*emph*').
+                items[-1] = items[-1] + " " + line.strip()
+            else:
                 items.append(stripped)
         return items
 
