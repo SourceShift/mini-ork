@@ -171,7 +171,10 @@ def _resolve_session_path(run: "Run", node: Node) -> Path | None:
             tail = live_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             tail = ""
-        for raw in tail.splitlines()[-50:]:
+        # Newest-first: a node that ran several attempts (revise rounds)
+        # appends every attempt's session to the same sidecar, and the
+        # latest attempt's session is the one to show.
+        for raw in reversed(tail.splitlines()[-50:]):
             line = raw.strip()
             if not line:
                 continue

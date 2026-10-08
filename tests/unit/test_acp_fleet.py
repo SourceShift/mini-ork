@@ -343,6 +343,36 @@ def test_card_steps_with_durations_and_failed_step(home: Path):
     assert "| `implementer` | implementer | `codex` | 2m30s | failed (error) |" in out
 
 
+def test_a_new_attempt_after_a_revise_verdict_is_running(home: Path):
+    # Round 1's reviewer asked for a revision; round 2's reviewer is running.
+    # The step must describe the latest attempt (running), not round 1's end.
+    seed_run(home, run_id="r-revise", status="executing",
+             created_at=NOW - 400, updated_at=NOW)
+    seed_event(home, run_id="r-revise", event_id="e1", event_type="node_start",
+               node_id="reviewer", node_type="reviewer", model_lane="opus",
+               created_at=NOW - 300)
+    seed_event(home, run_id="r-revise", event_id="e2", event_type="node_end",
+               node_id="reviewer", node_type="reviewer", model_lane="opus",
+               finish_reason="verdict_revise", created_at=NOW - 200)
+    seed_event(home, run_id="r-revise", event_id="e3", event_type="node_start",
+               node_id="reviewer", node_type="reviewer", model_lane="opus",
+               created_at=NOW - 50)
+
+    step = fl.run_card(home, "r-revise")["steps"][0]
+    assert step["state"] == "running"
+    assert step["start"] == NOW - 50
+    assert step["end"] is None
+    assert step["finish_reason"] == ""
+
+    # Once round 2 ends, its own end is reported.
+    seed_event(home, run_id="r-revise", event_id="e4", event_type="node_end",
+               node_id="reviewer", node_type="reviewer", model_lane="opus",
+               finish_reason="done", created_at=NOW - 10)
+    step = fl.run_card(home, "r-revise")["steps"][0]
+    assert step["state"] == "done"
+    assert step["duration"] == 40
+
+
 def test_cost_by_stage_grouping_and_labels(home: Path):
     seed_run(home, run_id="r-cost", status="published")
     seed_llm_call(home, run_id="r-cost", feature_name="mini-ork:gradient-extract",

@@ -195,6 +195,32 @@ def test_resolve_session_path_falls_back_to_live_sidecar_when_no_transcript(home
     assert sid.name == "agent-implementer.live.jsonl"
 
 
+def test_resolve_session_path_prefers_the_latest_attempt_in_the_sidecar(home: Path) -> None:
+    """A revise round appends its session to the same sidecar: show the latest one."""
+    run_id = "run-two-rounds"
+    _insert_run(home, run_id=run_id)
+    _insert_node_events(home, run_id, node_id="reviewer", ntype="reviewer",
+                        lane="worker", finish="done")
+    run_dir = home / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "sessions").mkdir()
+    for sid in ("sid-round1", "sid-round2"):
+        (run_dir / "sessions" / f"{sid}.jsonl").write_text("{}\n")
+    lines = [_envelope({"type": "system", "subtype": "init", "session_id": "sid-round1"}),
+             _envelope({"type": "result", "result": "needs_revision", "session_id": "sid-round1"}),
+             _envelope({"type": "system", "subtype": "init", "session_id": "sid-round2"}),
+             _envelope({"type": "assistant", "session_id": "sid-round2"})]
+    (run_dir / "agent-reviewer.live.jsonl").write_text(
+        "\n".join(json.dumps(line) for line in lines) + "\n")
+
+    run_obj = _load(home, run_id)
+    assert run_obj is not None
+    target = next(n for n in run_obj.nodes if n.id == "reviewer")
+    found = _resolve_session_path(run_obj, target)
+    assert found is not None
+    assert found.name == "sid-round2.jsonl"
+
+
 # ── B) ~/.claude/projects fallback ─────────────────────────────────────────
 
 

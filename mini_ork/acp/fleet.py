@@ -267,7 +267,9 @@ def _steps(home: Path, run_id: str) -> list[dict[str, Any]]:
     ``finish_reason``, ``state`` (``done``/``running``/``failed``).
     A ``node_end`` with ``finish_reason`` not in ``("done", "")`` is
     ``failed`` — the same rule ``MiniOrkAcpAgent``'s ``_read_snapshot``
-    consumers apply.
+    consumers apply. Each row describes the node's LATEST attempt: a
+    ``node_start`` after a ``node_end`` (the next revise round) makes the
+    node running again.
     """
     from mini_ork.web.db import db_for
     from mini_ork.web.repositories import RunDetailRepository
@@ -302,6 +304,10 @@ def _steps(home: Path, run_id: str) -> list[dict[str, Any]]:
         ts = ev.get("created_at")
         if kind == "node_start":
             starts[node_id] = {"ts": ts, "payload": payload}
+            # A new attempt (a revise round, a retry, a recover) supersedes the
+            # previous attempt's end: until this attempt ends, the node is
+            # running — not "failed" on the last round's verdict_revise.
+            ends.pop(node_id, None)
         elif kind == "node_end":
             ends[node_id] = {"ts": ts, "payload": payload}
         if node_id not in order:
