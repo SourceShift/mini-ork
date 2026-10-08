@@ -31,10 +31,25 @@ a row.
 - ``dag``    ``cols`` of node lists (see :func:`dag`) + ``legend``
 - ``inspector`` one node's output lines and key/values (see :func:`inspector`)
 - ``markdown`` ``text`` (raw markdown body) + ``path`` (absolute file path)
+- ``hero``   ``goal``, ``criteria``, ``pill``, ``meta`` (see :func:`hero`)
+- ``triage`` ``text``, ``tone``, ``icon``, ``detail``, ``counts``, ``menu``
+- ``callout`` ``text_md``, ``tone``; actions via the section's ``actions``
+- ``story``  ``steps`` of step dicts (see :func:`story_step`)
+- ``files``  ``files``, ``diff``, ``diff_note``, ``commits`` (see :func:`files`)
+- ``findings`` ``verdict``, ``reasons``, ``items`` (see :func:`findings`)
+- ``checks`` ``rows`` + ``summary`` (``passing``/``failing``/``pending``/``na``)
+- ``agents`` ``rows`` of agent dicts (see :func:`agent_row`)
+- ``composer`` ``placeholder`` + ``cli`` — the IDE appends the typed text
+- ``columns`` ``cols`` of column dicts (see :func:`column`)
 
 Colours are names, never hex: ``text body muted sub dim blue green red yellow
 purple cyan orange`` or a lane family ``fam:<lane>`` (``fam:sonnet``). The IDE
-maps them onto its theme.
+maps them onto its theme. State words are ``done running failed skipped pending
+needs_you``.
+
+:func:`ide_level` reads ``MINI_ORK_IDE_SPEC`` on every call (default ``1``): an
+IDE that sets ``MINI_ORK_IDE_SPEC=2`` gets the section types above; an older IDE
+(env unset) keeps getting today's pages.
 
 Actions (``do``) — what a button, row or chip does in the IDE:
 
@@ -50,6 +65,7 @@ Any action may carry ``"confirm": "<question>"``.
 """
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Iterable
 from typing import Any
 
@@ -58,6 +74,24 @@ COLOURS = ("text", "body", "muted", "sub", "dim", "blue", "green", "red", "yello
 
 # Button kinds, as drawn in the design.
 KINDS = ("primary", "default", "danger", "warn", "ghost")
+
+
+# ── spec level ─────────────────────────────────────────────────────────────
+
+def ide_level() -> int:
+    """The IDE spec level the caller asked for, from ``MINI_ORK_IDE_SPEC``.
+
+    The new IDE sets ``MINI_ORK_IDE_SPEC=2`` on every page build; builders use
+    this to decide whether to emit the v2 section types. Read on each call —
+    never cached — so a long-lived process sees a new value. Anything missing,
+    non-numeric or below ``1`` is level ``1`` (today's pages).
+    """
+    raw = os.environ.get("MINI_ORK_IDE_SPEC")
+    try:
+        level = int(raw) if raw is not None else 1
+    except (TypeError, ValueError):
+        return 1
+    return level if level >= 1 else 1
 
 
 # ── actions ────────────────────────────────────────────────────────────────
@@ -294,6 +328,213 @@ def inspector(label: str, role: str, state: str, lines: Iterable[tuple | list | 
     return _section("inspector", "", {"label": label, "role": role, "state": state,
                                       "lines": sec["lines"], "items": kvs["items"],
                                       "steer": steer, "steer_note": note}, **opt)
+
+
+# ── v2 sections (MINI_ORK_IDE_SPEC=2) ──────────────────────────────────────
+#
+# Every helper below funnels through :func:`_section`, so ``note`` / ``actions``
+# / ``full`` / ``col`` / ``row_span`` keep working and colours stay the COLOURS
+# names. States are the words ``done running failed skipped pending needs_you``.
+
+def _tc(v: Any, c: str = "sub") -> dict[str, Any] | None:
+    """``None`` | ``str`` | ``(t, c)`` → ``{"t", "c"}`` (``None`` stays ``None``)."""
+    if v is None:
+        return None
+    if isinstance(v, (tuple, list)):
+        return {"t": str(v[0]) if v else "", "c": str(v[1]) if len(v) > 1 else c}
+    return {"t": str(v), "c": c}
+
+
+def _lines(lines: Iterable[Any]) -> list[dict[str, Any]]:
+    """``str`` | ``(t, c)`` rows → ``{"t", "c"}`` items (default colour ``body``)."""
+    out: list[dict[str, Any]] = []
+    for line in lines:
+        if isinstance(line, str):
+            out.append({"t": line, "c": "body"})
+        else:
+            row = list(line)
+            out.append({"t": str(row[0]), "c": row[1] if len(row) > 1 else "body"})
+    return out
+
+
+def meta_item(t: Any, c: str = "sub", *, mono: bool = False) -> dict[str, Any]:
+    """One ``hero`` meta chip: ``{"t", "c", "mono"}``."""
+    return {"t": str(t), "c": c, "mono": mono}
+
+
+def hero(title: str, *, goal: str = "", criteria: Iterable[Any] = (), pill: Any = None,
+         meta: Iterable[Any] = (), **opt: Any) -> dict[str, Any]:
+    """A run's headline block. ``pill`` is ``(t, c)`` | ``str`` | ``None``."""
+    opt.setdefault("full", True)
+    return _section("hero", title, {
+        "goal": str(goal),
+        "criteria": [str(c) for c in criteria],
+        "pill": _tc(pill),
+        "meta": list(meta),
+    }, **opt)
+
+
+def triage(text: str, *, tone: str = "muted", icon: str = "", detail: str = "",
+           counts: Iterable[Any] = (), actions: Iterable[dict[str, Any]] = (),
+           menu: Iterable[dict[str, Any]] = (), **opt: Any) -> dict[str, Any]:
+    """The "what needs you" strip. ``counts``: ``(t, c)`` or ``{"t", "c"}``."""
+    opt.setdefault("full", True)
+    out_counts = [c if isinstance(c, dict) else _tc(c) for c in counts]
+    return _section("triage", "", {
+        "text": str(text),
+        "tone": tone,
+        "icon": icon,
+        "detail": str(detail),
+        "counts": out_counts,
+        "menu": list(menu),
+    }, actions=actions, **opt)
+
+
+def callout(title: str, text_md: str = "", *, tone: str = "orange",
+            actions: Iterable[dict[str, Any]] = (), **opt: Any) -> dict[str, Any]:
+    """A short markdown note; buttons ride the section's ``actions`` field."""
+    return _section("callout", title, {"text_md": str(text_md), "tone": tone},
+                    actions=actions, **opt)
+
+
+def story_step(step_id: str, title: str, *, kind: str = "", state: str = "pending",
+               lane: str = "", model: str = "", headline: Any = None,
+               meta: Iterable[Any] = (), dur: str = "", cost: str = "", open: bool = False,
+               do: dict[str, Any] | None = None, body: Iterable[Any] = ()) -> dict[str, Any]:
+    """One step of a :func:`story`. ``headline`` is ``(t, c)`` or ``str``."""
+    return {"id": str(step_id), "title": str(title), "kind": str(kind), "state": state,
+            "lane": str(lane), "model": str(model), "headline": _tc(headline),
+            "meta": list(meta), "dur": str(dur), "cost": str(cost), "open": bool(open),
+            "do": do, "body": list(body)}
+
+
+def block_md(text: str) -> dict[str, Any]:
+    return {"kind": "md", "text": str(text)}
+
+
+def block_lines(lines: Iterable[Any]) -> dict[str, Any]:
+    """``str`` | ``(t, c)`` lines, like :func:`code`."""
+    return {"kind": "lines", "lines": _lines(lines)}
+
+
+def block_files(files: Iterable[Any], *, diff: str = "", diff_note: str = "",
+                commits: Iterable[Any] = ()) -> dict[str, Any]:
+    return {"kind": "files", "files": list(files), "diff": str(diff),
+            "diff_note": str(diff_note), "commits": list(commits)}
+
+
+def block_findings(items: Iterable[Any], *, verdict: Any = None,
+                   reasons: Iterable[Any] = ()) -> dict[str, Any]:
+    return {"kind": "findings", "items": list(items), "verdict": _tc(verdict),
+            "reasons": [str(r) for r in reasons]}
+
+
+def block_checks(rows: Iterable[Any], *, summary: dict[str, Any] | None = None) -> dict[str, Any]:
+    rows = list(rows)
+    return {"kind": "checks", "rows": rows,
+            "summary": summary if summary is not None else _checks_summary(rows)}
+
+
+def story(title: str, steps: Iterable[Any], **opt: Any) -> dict[str, Any]:
+    """A vertical run story; ``steps`` come from :func:`story_step`."""
+    return _section("story", title, {"steps": list(steps)}, **opt)
+
+
+def file_entry(path: str, *, abs: str = "", status: str = "M", added: int = 0,
+               removed: int = 0) -> dict[str, Any]:
+    """One changed file for :func:`files` / :func:`block_files`."""
+    return {"path": str(path), "abs": str(abs), "status": status,
+            "added": int(added or 0), "removed": int(removed or 0)}
+
+
+def files(title: str, files: Iterable[Any], *, diff: str = "", diff_note: str = "",
+          commits: Iterable[Any] = (), **opt: Any) -> dict[str, Any]:
+    """Changed files + the cumulative diff; entries come from :func:`file_entry`."""
+    return _section("files", title, {"files": list(files), "diff": str(diff),
+                                     "diff_note": str(diff_note), "commits": list(commits)}, **opt)
+
+
+def finding(issue: str, *, severity: str = "", file: str = "", line: Any = None,
+            abs: str = "", snippet: str = "", source: str = "") -> dict[str, Any]:
+    """One review finding row for :func:`findings` / :func:`block_findings`."""
+    return {"issue": str(issue), "severity": str(severity), "file": str(file),
+            "line": line, "abs": str(abs), "snippet": str(snippet), "source": str(source)}
+
+
+def findings(title: str, items: Iterable[Any], *, verdict: Any = None,
+             reasons: Iterable[Any] = (), **opt: Any) -> dict[str, Any]:
+    """A findings list. ``verdict`` is ``(t, c)`` | ``str`` | ``None``."""
+    return _section("findings", title, {"verdict": _tc(verdict),
+                                        "reasons": [str(r) for r in reasons],
+                                        "items": list(items)}, **opt)
+
+
+def check_row(name: str, state: str, *, detail: str = "", log: Iterable[Any] = (),
+              do: dict[str, Any] | None = None) -> dict[str, Any]:
+    """One check for :func:`checks` / :func:`block_checks`; ``log`` lines like :func:`code`."""
+    return {"name": str(name), "state": state, "detail": str(detail),
+            "log": _lines(log), "do": do}
+
+
+_PASS_STATES = frozenset({"pass", "done", "ok"})
+_FAIL_STATES = frozenset({"fail", "failed", "error"})
+_PENDING_STATES = frozenset({"pending", "running"})
+
+
+def _checks_summary(rows: Iterable[Any]) -> dict[str, int]:
+    """Count check-row states into ``passing`` / ``failing`` / ``pending`` / ``na``."""
+    out = {"passing": 0, "failing": 0, "pending": 0, "na": 0}
+    for row in rows:
+        state = str((row.get("state") if isinstance(row, dict) else "") or "").lower()
+        if state in _PASS_STATES:
+            out["passing"] += 1
+        elif state in _FAIL_STATES:
+            out["failing"] += 1
+        elif state in _PENDING_STATES:
+            out["pending"] += 1
+        else:
+            out["na"] += 1
+    return out
+
+
+def checks(title: str, rows: Iterable[Any], *, summary: dict[str, Any] | None = None,
+           **opt: Any) -> dict[str, Any]:
+    """A check list; ``summary`` is computed from the row states when ``None``."""
+    rows = list(rows)
+    return _section("checks", title, {
+        "rows": rows,
+        "summary": summary if summary is not None else _checks_summary(rows),
+    }, **opt)
+
+
+def agent_row(node_id: str, state: str, *, lane: str = "", model: str = "", step: str = "",
+              last: str = "", cost: str = "", dur: str = "",
+              do: dict[str, Any] | None = None) -> dict[str, Any]:
+    """One agent for :func:`agents`."""
+    return {"id": str(node_id), "state": state, "lane": str(lane), "model": str(model),
+            "step": str(step), "last": str(last), "cost": str(cost), "dur": str(dur), "do": do}
+
+
+def agents(title: str, rows: Iterable[Any], **opt: Any) -> dict[str, Any]:
+    """The run's agents; rows come from :func:`agent_row`."""
+    return _section("agents", title, {"rows": list(rows)}, **opt)
+
+
+def composer(placeholder: str, cli_args: Iterable[str], **opt: Any) -> dict[str, Any]:
+    """An input box that runs ``mini-ork <cli> …`` — the IDE appends typed text."""
+    return _section("composer", "", {"placeholder": str(placeholder),
+                                     "cli": [str(a) for a in cli_args]}, **opt)
+
+
+def column(title: str, cards: Iterable[Any], *, c: str = "sub") -> dict[str, Any]:
+    """One column of a :func:`columns` section; ``count`` tracks the card list."""
+    cards = list(cards)
+    return {"title": str(title), "c": c, "count": len(cards), "cards": cards}
+
+
+def columns(title: str, cols: Iterable[Any], **opt: Any) -> dict[str, Any]:
+    """Side-by-side columns; entries come from :func:`column`."""
+    return _section("columns", title, {"cols": list(cols)}, **opt)
 
 
 # ── page ───────────────────────────────────────────────────────────────────

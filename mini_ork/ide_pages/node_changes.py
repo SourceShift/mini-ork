@@ -172,9 +172,11 @@ def _planner_items(run_dir: Path) -> tuple[str, list[dict[str, Any]]]:
 def _review_items(run: Run, node: Node) -> tuple[str, list[dict[str, Any]]]:
     """Reviewer / lens / synthesizer / eval / judge: verdict first, then findings.
 
-    Fix #3: lens / review resolution reuses ``Node._report_paths`` (lazy import,
-    strips ``_lens`` → ``lens-code_impact.md``). The ``review-<id>.json``
-    fallback remains for legacy runs.
+    The review JSON's structured ``findings`` come first (each via
+    :func:`_finding_item`), then string ``notes``, then string ``reasons`` — so
+    a non-empty ``notes`` string can no longer hide the structured findings. The
+    markdown fallback (``Node._report_paths``, lazy import, strips ``_lens`` →
+    ``lens-code_impact.md``) still runs only when the JSON yielded no items.
     """
     items: list[dict[str, Any]] = []
     verdict_text, verdict_color = "", "sub"
@@ -193,14 +195,20 @@ def _review_items(run: Run, node: Node) -> tuple[str, list[dict[str, Any]]]:
         rv = str(review.get("verdict") or "")
         if rv:
             verdict_text, verdict_color = rv, _VERDICT_COLOUR.get(rv, "sub")
-        notes = review.get("notes") or review.get("findings") or []
-        if isinstance(notes, list):
-            items.extend(_finding_item(n, run) for n in notes if n)
+        findings = review.get("findings")
+        notes = review.get("notes")
+        if isinstance(findings, list) or isinstance(notes, list):
+            # Structured findings first, then string notes, then reasons.
+            items.extend(_review_text_items(findings, run))
+            items.extend(_review_text_items(notes, run))
+            items.extend(_review_text_items(review.get("reasons"), run))
+        else:
+            # Neither is a list: today's behaviour, unchanged.
+            legacy = notes or findings or []
+            if isinstance(legacy, list):
+                items.extend(_finding_item(n, run) for n in legacy if n)
 
-    # 2. Markdown fallback (only when the review JSON had no notes). Fix
-    # #3: prefer ``Node._report_paths(run_dir, node.id)`` (lazy import),
-    # which strips ``_lens`` and walks ``lens-<stripped>.md`` →
-    # ``lens-<id>.md`` → ``<stripped>.md`` → ``<id>.md``.
+    # 2. Markdown fallback (only when the review JSON had no items).
     if not items:
         try:
             from mini_ork.ide_pages.node import _report_paths
@@ -231,6 +239,21 @@ def _review_items(run: Run, node: Node) -> tuple[str, list[dict[str, Any]]]:
         title = f"Reviewer · {verdict_text}"
         items = [_verdict_item(verdict_text, verdict_color)] + items
     return (title, items)
+
+
+def _review_text_items(raw: Any, run: Run | None) -> list[dict[str, Any]]:
+    """Review JSON ``findings`` / ``notes`` / ``reasons`` → spec items.
+
+    A dict entry is a structured finding (:func:`_finding_item`); a string is a
+    plain item. Accepts a single value or a list; skips ``None`` and empties.
+    """
+    entries = raw if isinstance(raw, list) else [raw]
+    items: list[dict[str, Any]] = []
+    for entry in entries:
+        if not entry:
+            continue
+        items.append(_finding_item(entry, run) if isinstance(entry, dict) else S.item(str(entry), ""))
+    return items
 
 
 def _verifier_items(run_dir: Path, node: Node) -> tuple[str, list[dict[str, Any]]]:
@@ -620,14 +643,21 @@ def _resolve_in_dirs(path: str, dirs: list[Path]) -> tuple[str, str] | None:
 def _finding_item(note: Any, run: Run | None = None) -> dict[str, Any]:
     """One review finding → spec item with severity mark + ``file:line`` + open.
 
-    Fix #6: resolve relative ``file_path`` against the project root, then
-    the run's workspace path when it has one. Set ``item["path"]`` to the
-    absolute path when the file exists, and keep the Open act pointing at
-    it. Never resolve against the process cwd.
+    The text falls back through ``title`` / ``text`` / ``note`` / ``issue`` /
+    ``summary``, so a findings-only review (``{"issue": ...}``) never renders a
+    blank title. A ``snippet`` is appended to ``sub`` as ``" · <snippet>"``,
+    collapsed to one line and cut at 100 chars with an ellipsis. ``blocker``
+    maps like ``critical``.
+
+    Path resolution and the Open act are unchanged: resolve the relative
+    ``file_path`` against the project root, then the run's workspace path, and
+    point ``item["path"]`` + Open at the absolute path when the file exists —
+    never against the process cwd.
     """
     if not isinstance(note, dict):
         return S.item(str(note), "")
-    text = str(note.get("title") or note.get("text") or note.get("note") or "")
+    text = str(note.get("title") or note.get("text") or note.get("note")
+               or note.get("issue") or note.get("summary") or "")
     file_path = str(note.get("file") or note.get("path") or "")
     line = note.get("line")
     sub = ""
@@ -637,8 +667,11 @@ def _finding_item(note: Any, run: Run | None = None) -> dict[str, Any]:
         sub = file_path
     elif line not in (None, ""):
         sub = f"line {line}"
+    snippet = _snippet_line(note.get("snippet"))
+    if snippet:
+        sub = f"{sub} · {snippet}" if sub else snippet
     severity = str(note.get("severity") or note.get("level") or "").lower()
-    if severity in ("critical", "high"):
+    if severity in ("critical", "blocker", "high"):
         m, mc = "!", "red"
     elif severity in ("medium", "warn", "warning"):
         m, mc = "!", "yellow"
@@ -654,6 +687,14 @@ def _finding_item(note: Any, run: Run | None = None) -> dict[str, Any]:
     if abs_path:
         out["path"] = abs_path
     return out
+
+
+def _snippet_line(raw: Any) -> str:
+    """A finding's ``snippet`` as one line: whitespace collapsed, cut at 100 chars."""
+    if raw is None or raw == "":
+        return ""
+    text = " ".join(str(raw).split())
+    return text[:99] + "…" if len(text) > 100 else text
 
 
 def _resolve_finding_path(file_path: str, run: Run | None) -> str:

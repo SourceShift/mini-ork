@@ -904,3 +904,72 @@ def test_a_new_file_in_another_worktree_opens_where_it_is(tmp_path: Path) -> Non
     display, absolute = _project_file_lazy(str(new_file), project)
     assert display == "pkg/new_mod.py"
     assert absolute == str(new_file)
+
+
+# ── kickoff ide-spec-v2 §B — reviewer findings that actually show ─────────
+
+
+def test_review_items_findings_first_then_string_notes(home: Path) -> None:
+    """Structured ``findings`` lead; string ``notes`` follow — a non-empty
+    ``notes`` string can no longer hide the findings (kickoff §B).
+
+    The finding's ``issue`` is the text, ``file:line · snippet`` is the sub
+    (single line), and ``high`` severity draws the red mark.
+    """
+    repo, base_sha = _seed_git_repo(home.absolute().parent)
+    _seed(home, repo=repo, base_sha=base_sha)
+    run_dir = home / "runs" / RUN
+    (run_dir / "review-reviewer.json").write_text(json.dumps({
+        "verdict": "needs_revision",
+        "findings": [{
+            "issue": "handler leaks the file handle",
+            "file": str(repo / "a.py"),
+            "line": 1,
+            "severity": "high",
+            "snippet": "with open(p) as f:\n    pass\nand then something",
+        }],
+        "notes": ["ran the suite twice; two flakes", "gate output truncated"],
+    }))
+
+    out = build_node(home, RUN, "reviewer", view="changes")
+    items = out["result"]["items"]
+    # Verdict row first, then the finding, then the notes.
+    assert "needs_revision" in str(items[0].get("t") or ""), items
+    finding = items[1]
+    assert finding["t"] == "handler leaks the file handle", finding
+    assert "a.py:1" in finding["sub"], finding["sub"]
+    assert "with open(p) as f:" in finding["sub"], finding["sub"]
+    assert "\n" not in finding["sub"], finding["sub"]      # snippet is one line
+    assert finding["mc"] == "red", finding                  # high → red mark
+    assert items[2]["t"] == "ran the suite twice; two flakes", items
+    assert items[3]["t"] == "gate output truncated", items
+
+
+def test_review_items_findings_only_have_no_blank_titles(home: Path) -> None:
+    """A findings-only review renders each ``issue`` / ``summary`` as the text."""
+    repo, base_sha = _seed_git_repo(home.absolute().parent)
+    _seed(home, repo=repo, base_sha=base_sha)
+    run_dir = home / "runs" / RUN
+    (run_dir / "review-reviewer.json").write_text(json.dumps({
+        "findings": [
+            {"issue": "scope creep in the gate", "file": str(repo / "b.py"),
+             "line": 1, "severity": "critical"},
+            {"summary": "no reproducer attached", "file": str(repo / "a.py"),
+             "line": 1, "severity": "low"},
+        ],
+    }))
+
+    out = build_node(home, RUN, "reviewer", view="changes")
+    titles = [str(it.get("t") or "") for it in out["result"]["items"]]
+    assert titles == ["scope creep in the gate", "no reproducer attached"], titles
+    assert all(t.strip() for t in titles)  # no blank titles
+    assert out["result"]["items"][0]["mc"] == "red"  # critical → red
+
+
+def test_finding_item_snippet_is_capped_at_100_chars() -> None:
+    from mini_ork.ide_pages.node_changes import _finding_item
+
+    item = _finding_item({"issue": "x", "file": "a.py", "line": 2, "snippet": "y" * 400})
+    snippet = item["sub"].split(" · ", 1)[1]
+    assert len(snippet) == 100, len(snippet)
+    assert snippet.endswith("…"), snippet
