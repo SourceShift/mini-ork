@@ -1103,6 +1103,16 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 cap = min(max_rounds, revise_rounds_cap)
                 if round_used.get(target, 0) >= cap:
                     continue
+                if target not in fields_by_id:
+                    # The revise target is not part of THIS run's dispatch
+                    # closure — e.g. `recover --from-node test` re-verifies a
+                    # tree without re-running the implementer. There is nothing
+                    # to send the findings back to, so the revise is impossible:
+                    # let the failure stand instead of crashing on the missing
+                    # field (KeyError at the reset below) (run-1791469896-2926).
+                    print(f"[revise] skipped for {field[0]}: revise target '{target}' "
+                          "is outside this run's node closure", file=sys.stderr)
+                    continue
                 revise_groups.setdefault(target, []).append((field, rc, finish_reason))
             if revise_groups:
                 for target, failed_sources in revise_groups.items():
@@ -1114,10 +1124,13 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                         live_run_dir, round_no, _target_max, failed_sources)
                     _archive_revise_round(
                         live_run_dir, round_no,
-                        [fields_by_id[node_id] for node_id in reset_ids])
+                        [fields_by_id[node_id] for node_id in reset_ids
+                         if node_id in fields_by_id])
                     _write_revise_current(
                         live_run_dir, round_no, _target_max, feedback_path)
                     for node_id in reset_ids:
+                        if node_id not in fields_by_id:
+                            continue
                         prior = statuses.pop(node_id, None)
                         if prior in {"failed", "blocked"}:
                             fail_count -= 1

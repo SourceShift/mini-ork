@@ -151,7 +151,7 @@ def _write_overlay(tmp_path: Path, workflow: dict) -> Path:
 
 
 def _run(tmp_path, monkeypatch, *, workflow, reviewer_verdicts,
-         typecheck="pass", test="pass", revise_rounds=None):
+         typecheck="pass", test="pass", revise_rounds=None, recovery_from=None):
     """Drive ``ex.main`` once and return (rc, state, run_dir)."""
     wf_path = _write_overlay(tmp_path, workflow)
     repo = _repo(tmp_path)
@@ -182,6 +182,10 @@ def _run(tmp_path, monkeypatch, *, workflow, reviewer_verdicts,
     monkeypatch.setenv("MO_GRADE_RUN_REWARD", "0")
     monkeypatch.setenv("MO_LEARNING_WRITEBACK", "0")
     monkeypatch.setenv("MO_LANE_ROUTER", "0")
+    # A partial-closure recovery: restrict dispatch to the DAG downstream of
+    # `recovery_from` (e.g. a `recover --from-node test` skips the implementer).
+    if recovery_from:
+        monkeypatch.setenv("MINI_ORK_RECOVERY_FROM", recovery_from)
 
     state = {"implementer": 0, "reviewer": 0, "rollback": 0, "impl_prompts": []}
 
@@ -360,3 +364,26 @@ def test_real_recipes_compile_and_expose_retry_edges():
         for source, (target, max_rounds) in cw.retry_edges.items():
             assert target == "implementer"
             assert max_rounds == 2
+
+
+# ── DoD 9: a revise target OUTSIDE the closure is skipped, not fatal ──────────
+
+def test_revise_target_outside_closure_is_skipped(tmp_path, monkeypatch):
+    """A partial-closure recovery whose revise target is NOT dispatched must not
+    crash the revise loop.
+
+    ``recover --from-node test`` restricts dispatch to the DAG downstream of
+    ``test`` — the implementer is not part of the closure. When the reviewer then
+    fails, its ``retries`` edge points back to the implementer, which has no
+    entry in ``fields_by_id``; the old code indexed it anyway and died with
+    ``KeyError: 'implementer'`` at ``[fields_by_id[n] for n in reset_ids]``.
+    A revise is impossible here, so it must be SKIPPED and the failure left to
+    stand. Regression for run-1791469896-2926 (a from-test recovery crashed)."""
+    rc, state, _run_dir = _run(
+        tmp_path, monkeypatch, workflow=_base_workflow(),
+        reviewer_verdicts=["needs_revision"],
+        recovery_from="test",
+    )
+
+    assert state["implementer"] == 0   # outside the closure → never dispatched
+    assert rc != 0                      # the failure stands; no crash
