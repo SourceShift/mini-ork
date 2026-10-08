@@ -429,3 +429,109 @@ def test_overlay_preserves_candidate_tree_byte_identical(tmp_path):
     assert before_status == after_status, (
         f"git status changed\nbefore={before_status!r}\nafter={after_status!r}"
     )
+
+
+# ── 7. committed patch: base must be the run's pre-implementer-ref ─────────
+# The implementer may COMMIT its change. Then HEAD already contains both the
+# fix AND the new test and `git status` is clean — so a base built from HEAD is
+# the candidate itself, and the overlay copies nothing. Every such patch was
+# refuted with `tests-do-not-exercise-change`. The base must instead be the
+# run's `pre-implementer-ref` (the commit `execute.py` records *before* the
+# implementer edits), with the candidate's test delta carried onto it.
+
+def _write_ref(tmp_path: Path, run_id: str, sha: str) -> None:
+    """Drop a run's `pre-implementer-ref` where the verifier looks for it."""
+    rd = tmp_path / "mo-home" / "runs" / run_id
+    rd.mkdir(parents=True, exist_ok=True)
+    (rd / "pre-implementer-ref").write_text(sha + "\n")
+
+
+def test_replay_base_is_pre_implementer_ref_for_committed_patch(tmp_path):
+    """Committed fix + committed regression test → base = pre-implementer-ref;
+    the overlay carries the committed test onto it → target PROVEN.
+
+    Regression: the base was built from HEAD, which already held the committed
+    fix and test, so base == candidate → empty overlap → spurious refute."""
+    repo = _make_repo(
+        tmp_path,
+        mod_src="def add(a, b):\n    return a - b\n",
+        test_src="from mod import add\n\ndef test_add_trivial():\n    assert add(0, 0) == 0\n",
+    )
+    pre = _git_text(repo, "rev-parse", "HEAD").strip()
+
+    # Candidate COMMITS the fix and a new regression test that fails on buggy code.
+    (repo / "mod.py").write_text("def add(a, b):\n    return a + b\n")
+    tests_dir = repo / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_fix.py").write_text(
+        "from mod import add\n\ndef test_fixed():\n    assert add(2, 3) == 5\n"
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "fix + regression test")
+    assert _git_text(repo, "status", "--porcelain").strip() == "", (
+        "worktree must be clean (the implementer committed)"
+    )
+
+    _write_ref(tmp_path, "replay-committed", pre)
+
+    out = _run_verifier(repo, tmp_path, replay="1", run_id="replay-committed")
+
+    assert out["verifier"] == "test"
+    assert out["pass"] is True, out
+    assert "exercise" in out["error_summary"], out
+    # The committed test crossed onto the pre-implementer base...
+    assert out["replay"]["overlaid_tests"] == ["tests/test_fix.py"], out["replay"]
+    # ...and it failed there (buggy source) while passing on the candidate.
+    assert any("test_fixed" in tid for tid in out["replay"]["overlap"]), out["replay"]
+
+
+def test_replay_committed_test_passing_on_base_not_proven(tmp_path):
+    """Committed no-op + committed redundant test that ALSO passes on the base:
+    the overlay must still refuse to call it proof (anti-gaming guard holds
+    under the pre-implementer base too)."""
+    repo = _make_repo(
+        tmp_path,
+        # Code is already correct at HEAD; the "patch" only adds a redundant test.
+        mod_src="def add(a, b):\n    return a + b\n",
+        test_src="from mod import add\n\ndef test_add():\n    assert add(2, 3) == 5\n",
+    )
+    pre = _git_text(repo, "rev-parse", "HEAD").strip()
+    tests_dir = repo / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_extra.py").write_text(
+        "from mod import add\n\ndef test_extra():\n    assert add(0, 0) == 0\n"
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "no-op + redundant test")
+
+    _write_ref(tmp_path, "replay-committed-noop", pre)
+
+    out = _run_verifier(repo, tmp_path, replay="1", run_id="replay-committed-noop")
+
+    assert out["verifier"] == "test"
+    assert out["pass"] is False, out
+    assert "tests-do-not-exercise-change" in out["error_summary"], out
+    assert out["replay"]["overlap"] == [], out["replay"]
+
+
+def test_overlay_carries_js_ts_test_paths(tmp_path):
+    """A `__tests__/*.test.ts` path IS a test file: the overlay must carry it.
+
+    The code-fix recipe runs on JS/TS repos (jest/vitest results-file runner),
+    whose tests live under `__tests__/` as `*.test.ts`. The old `_is_test_path`
+    was Python-only, so a TS repo's new tests never reached the base."""
+    repo = _make_repo(
+        tmp_path,
+        mod_src="def add(a, b):\n    return a - b\n",
+        test_src="from mod import add\n\ndef test_add():\n    assert add(2, 3) == 5\n",
+    )
+    (repo / "mod.py").write_text("def add(a, b):\n    return a + b\n")
+    d = repo / "server" / "routes" / "__tests__"
+    d.mkdir(parents=True)
+    (d / "authorQuestions.test.ts").write_text("// ts regression test\n")
+
+    out = _run_verifier(repo, tmp_path, replay="1", run_id="overlay-ts")
+
+    assert out["verifier"] == "test"
+    assert "replay" in out, out
+    assert "server/routes/__tests__/authorQuestions.test.ts" in out["replay"]["overlaid_tests"], out["replay"]

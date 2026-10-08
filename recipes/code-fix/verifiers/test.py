@@ -56,6 +56,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 try:
     # Late import — the verifier must keep working in environments that do
@@ -175,17 +176,20 @@ def _baseline_unrunnable(base_rc: str, base_log: str) -> str | None:
 
 
 def _is_test_path(rel_path: str) -> bool:
-    """Test-file pattern per kickoff: segment 'tests'/'test' OR basename match.
+    """Whether ``rel_path`` is a test file the replay overlay should carry.
 
-    Matches paths like:
-      - `tests/unit/foo.py`, `test/unit/foo.py`, `foo/tests/bar.py`
-        (any path segment equals `tests` or `test`)
-      - `test_foo.py`, `foo/test_foo.py`, `foo_test.py`, `conftest.py`
-        (basename matches `test_*.py` / `*_test.py` / `conftest.py`)
+    A test file is any path under a ``tests`` / ``test`` / ``__tests__`` dir
+    segment, or a basename matching ``test_*.py`` / ``*_test.py`` /
+    ``conftest.py`` / ``*.test.[cm]?[jt]sx?`` / ``*.spec.[cm]?[jt]sx?``.
+
+    The JS/TS patterns matter: the code-fix recipe runs on jest/vitest repos
+    whose tests live under ``__tests__/`` as ``*.test.ts`` — a Python-only
+    matcher leaves those off the base and the delta gate then refutes every
+    "fix + new test" patch on such a repo.
     """
     parts = rel_path.replace("\\", "/").split("/")
     for seg in parts[:-1]:
-        if seg in ("tests", "test"):
+        if seg in ("tests", "test", "__tests__"):
             return True
     base = parts[-1]
     if base == "conftest.py":
@@ -194,51 +198,143 @@ def _is_test_path(rel_path: str) -> bool:
         return True
     if base.endswith("_test.py"):
         return True
+    if re.search(r"\.(?:test|spec)\.[cm]?[jt]sx?$", base):
+        return True
     return False
 
 
-def _overlay_candidate_tests(base_wt: str, candidate_cwd: str) -> list[str]:
+_HEX_REF_RE = re.compile(r"[0-9a-fA-F]{7,40}")
+
+
+def _run_dir_ref() -> str:
+    """This run's ``pre-implementer-ref`` — the true pre-patch commit — or "".
+
+    Mirrors ``recipes/code-fix/verifiers/typecheck.py:_run_dir_ref``. The
+    code-fix implementer may COMMIT its change; by verify time ``HEAD`` then
+    already contains the change under test, so a base built from ``HEAD`` is
+    the candidate itself and the delta gate refutes every patch with
+    ``tests-do-not-exercise-change``. The run dir's pre-implementer snapshot
+    (written by ``execute.py`` before the implementer edits) is the baseline
+    the replay and the red-base judge must both use.
+
+    A garbage ref must never reach git as a revision argument, so the value is
+    validated as a hex object name.
+    """
+    home = os.environ.get("MINI_ORK_HOME", "").strip()
+    run_id = os.environ.get("MINI_ORK_RUN_ID", "").strip()
+    if not (home and run_id):
+        return ""
+    try:
+        ref = Path(home, "runs", run_id, "pre-implementer-ref").read_text(
+            encoding="utf-8"
+        ).strip()
+    except OSError:
+        return ""
+    return ref if _HEX_REF_RE.fullmatch(ref) else ""
+
+
+def _working_tree_clean(cwd: str) -> bool:
+    """True when `git status --porcelain` reports nothing (tracked or not)."""
+    proc = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=cwd, capture_output=True, text=True,
+    )
+    return proc.returncode == 0 and not proc.stdout.strip()
+
+
+def _run_dir_base_ref() -> str:
+    """The base to replay/baseline against when the run COMMITTED, else "".
+
+    The code-fix implementer may COMMIT its change. Then the working tree is
+    clean and HEAD already carries the patch, so a base built from HEAD is the
+    candidate itself and the delta gate refutes a correct patch with
+    ``tests-do-not-exercise-change``. In that case the replay base must be the
+    run's `pre-implementer-ref` (the snapshot `execute.py` records before the
+    implementer edits).
+
+    When the working tree is DIRTY the patch is the uncommitted diff and HEAD
+    is already the pre-patch tree, so we return "" (use HEAD) — the unchanged
+    path. `pre-implementer-ref` is written via `git stash create`, so it is
+    NOT unconditionally the pre-patch tree (a caller that stages changes before
+    the run makes the snapshot carry them); the cleanliness gate keeps us off
+    that ref exactly when it would be wrong.
+    """
+    if not _working_tree_clean(os.getcwd()):
+        return ""
+    return _run_dir_ref()
+
+
+def _candidate_delta_entries(candidate_cwd: str, base_ref: str = "") -> list[tuple[str, str]]:
+    """``(status, rel_path)`` for the candidate's changes vs the base.
+
+    Working-tree changes come from `git status --porcelain` (modified / added /
+    deleted / untracked). When ``base_ref`` is given, the COMMITTED delta
+    ``base_ref..HEAD`` is added too: an implementer that commits its change
+    leaves a clean `git status`, so a porcelain scan alone would miss every
+    test file it committed. Paths are deduped (the working-tree entry wins).
+    """
+    entries: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    proc = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=candidate_cwd, capture_output=True, text=True,
+    )
+    if proc.returncode == 0:
+        for line in proc.stdout.splitlines():
+            if not line or len(line) < 3:
+                continue
+            # Renames print as `XY old -> new`; keep the new path.
+            if " -> " in line:
+                prefix, _, new_part = line.partition(" -> ")
+                status, rel_path = prefix[:2], new_part.strip()
+            else:
+                status, rel_path = line[:2], line[3:].strip()
+            # Skip ignored files (status `!!`) and empties.
+            if not rel_path or status == "!!" or rel_path in seen:
+                continue
+            seen.add(rel_path)
+            entries.append((status, rel_path))
+
+    if base_ref:
+        # `--no-renames` so a rename is an explicit A + D pair, not an
+        # unparsed `R100 old\tnew`. `base_ref..HEAD` is the committed part
+        # only; the porcelain scan above already owns the working tree.
+        dproc = subprocess.run(
+            ["git", "diff", "--name-status", "--no-renames", f"{base_ref}..HEAD"],
+            cwd=candidate_cwd, capture_output=True, text=True,
+        )
+        if dproc.returncode == 0:
+            for line in dproc.stdout.splitlines():
+                parts = line.split("\t")
+                if len(parts) < 2:
+                    continue
+                status, rel_path = parts[0][:1], parts[-1].strip()
+                if not rel_path or rel_path in seen:
+                    continue
+                seen.add(rel_path)
+                entries.append((status, rel_path))
+    return entries
+
+
+def _overlay_candidate_tests(base_wt: str, candidate_cwd: str, base_ref: str = "") -> list[str]:
     """Copy the candidate's test files onto the base worktree.
 
-    Reads `git status --porcelain --untracked-files=all` in the candidate,
-    keeps every path whose status indicates modified/added/untracked/deleted
-    AND that matches `_is_test_path`. Modified/added/untracked files are
-    copied from candidate → base (with directory creation as needed).
-    Deleted files are removed from the base too.
+    The change set is `_candidate_delta_entries(candidate_cwd, base_ref)` —
+    the working-tree changes plus, when ``base_ref`` is given, the committed
+    ``base_ref..HEAD`` delta. Every path matching `_is_test_path` is copied
+    candidate → base (with directory creation as needed); deleted ones are
+    removed from the base too.
 
-    Returns a sorted list of overlaid (or deleted) relative paths. The list
-    is the `overlaid_tests` audit trail the kickoff requires.
+    Returns a sorted list of overlaid (or deleted) relative paths — the
+    `overlaid_tests` audit trail the kickoff requires.
 
     This helper is silent on failure: a missing path or a copy/delete error
     must NOT fail the verifier. The overlay augments the base; the replay
     oracle (replay_check) is the one that decides pass/fail.
     """
-    proc = subprocess.run(
-        ["git", "status", "--porcelain", "--untracked-files=all"],
-        cwd=candidate_cwd,
-        capture_output=True, text=True,
-    )
-    if proc.returncode != 0:
-        return []
-
     overlaid: list[str] = []
-    for line in proc.stdout.splitlines():
-        if not line or len(line) < 3:
-            continue
-        # Renames print as `XY old -> new`; treat the new path as the candidate
-        # path and ignore the old (the base still has it from HEAD).
-        if " -> " in line:
-            prefix, _, new_part = line.partition(" -> ")
-            status = prefix[:2]
-            rel_path = new_part.strip()
-        else:
-            status = line[:2]
-            rel_path = line[3:].strip()
-        if not rel_path:
-            continue
-        # Skip ignored files; we never want to copy an `.gitignore`-d test.
-        if status == "!!":
-            continue
+    for status, rel_path in _candidate_delta_entries(candidate_cwd, base_ref):
         if not _is_test_path(rel_path):
             continue
 
@@ -761,19 +857,25 @@ def _green_pass(reason, post_rc, replay=None, require_adequate=False):
     )
 
 
-def _attach_git_worktree_base():
-    """Create a detached worktree at HEAD. Returns path or None on failure.
+def _attach_git_worktree_base(ref: str = ""):
+    """Create a detached worktree at ``ref`` (default ``HEAD``) or None.
 
     The caller is responsible for `git worktree remove --force <path>`
     afterwards. We use `--detach` because we never want this worktree to
     advance HEAD — that would mutate the user's branch state in a way
     that has nothing to do with the verifier.
 
-    Note: this helper returns the raw HEAD worktree. Use
+    ``ref`` is the run's ``pre-implementer-ref`` when known: it is the true
+    pre-patch tree, whereas ``HEAD`` may already carry a committed patch
+    (making the base == candidate). An unknown/unreachable ref — e.g. one
+    recorded by a different repo — must not lose the baseline, so we fall
+    back to ``HEAD``.
+
+    Note: this helper returns the raw base worktree. Use
     `_attach_overlaid_worktree()` for the replay/baseline paths that must
     carry the candidate's test files onto the base (otherwise the replay
-    always sees `tests-do-not-exercise-change` for fixes that add an
-    untracked regression test).
+    always sees `tests-do-not-exercise-change` for fixes that add a new
+    regression test).
     """
     in_git = subprocess.run(
         ["git", "rev-parse", "--is-inside-work-tree"],
@@ -782,27 +884,34 @@ def _attach_git_worktree_base():
     if not in_git:
         return None
     wt = tempfile.mkdtemp()
+    target = ref or "HEAD"
     added = subprocess.run(
-        ["git", "worktree", "add", "-q", "--detach", wt, "HEAD"],
+        ["git", "worktree", "add", "-q", "--detach", wt, target],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     ).returncode == 0
+    if not added and target != "HEAD":
+        added = subprocess.run(
+            ["git", "worktree", "add", "-q", "--detach", wt, "HEAD"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode == 0
     if not added:
         shutil.rmtree(wt, ignore_errors=True)
         return None
     return wt
 
 
-def _attach_overlaid_worktree(candidate_cwd: str) -> tuple[str | None, list[str]]:
-    """HEAD worktree + candidate test-file overlay. Both branches (green
+def _attach_overlaid_worktree(candidate_cwd: str, base_ref: str = "") -> tuple[str | None, list[str]]:
+    """Base worktree + candidate test-file overlay. Both branches (green
     replay, red baseline) need the same overlay, so they share this helper.
 
-    Returns (worktree_path_or_None, overlaid_paths). The caller is responsible
-    for `_detach_git_worktree(wt)` afterwards.
+    ``base_ref`` is the run's pre-implementer ref (default HEAD). Returns
+    (worktree_path_or_None, overlaid_paths). The caller is responsible for
+    `_detach_git_worktree(wt)` afterwards.
     """
-    wt = _attach_git_worktree_base()
+    wt = _attach_git_worktree_base(base_ref)
     if wt is None:
         return None, []
-    return wt, _overlay_candidate_tests(wt, candidate_cwd)
+    return wt, _overlay_candidate_tests(wt, candidate_cwd, base_ref)
 
 
 def _detach_git_worktree(wt):
@@ -893,7 +1002,7 @@ def _run_replay_check():
     if os.environ.get("MO_CODEFIX_REPLAY", "1") == "0":
         return None
     candidate_cwd = os.getcwd()
-    wt, overlaid = _attach_overlaid_worktree(candidate_cwd)
+    wt, overlaid = _attach_overlaid_worktree(candidate_cwd, _run_dir_base_ref())
     if wt is None:
         return None
     try:
@@ -985,8 +1094,9 @@ def main():
             return emit(False, replay_result["reason"], post_rc, replay=replay_result["replay"])
 
         # ── Post-patch failed → establish a baseline to attribute blame ───────
-        # Baseline = HEAD (the pre-patch tree) run in a throwaway worktree so the
-        # real working directory is never mutated. Only reached when post-patch is red.
+        # Baseline = the run's pre-implementer ref (HEAD when the run carries
+        # none) run in a throwaway worktree so the real working directory is
+        # never mutated. Only reached when post-patch is red.
         # The baseline worktree must also carry the candidate's test files: a
         # candidate that ADDS a new regression test will not "pre-exist" on HEAD,
         # so without the overlay the baseline would be misleadingly green for
@@ -995,7 +1105,7 @@ def main():
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
         base_wt = None
         if os.environ.get("MO_TEST_BASELINE", "1") != "0" and in_git:
-            base_wt, _ = _attach_overlaid_worktree(os.getcwd())
+            base_wt, _ = _attach_overlaid_worktree(os.getcwd(), _run_dir_base_ref())
 
         try:
             if base_wt:
