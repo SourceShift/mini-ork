@@ -1405,6 +1405,23 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
     return page
 
 
+def _attach_flow(page: dict[str, Any], run_obj: Run) -> None:
+    """Level-≥2 only: add ``page["flow"]`` next to ``graph``, fail-soft.
+
+    Built with a lazy import (``run_flow`` imports this module, so a top-level
+    import would be circular — the same dance as ``run_dock``). On error the key
+    is ``None`` and ``errors["flow"]`` says why: a broken flow costs the flow,
+    never the page. Level 1 stays byte-identical.
+    """
+    try:
+        from mini_ork.ide_pages import run_flow
+
+        page["flow"] = run_flow.build_flow(run_obj)
+    except Exception as exc:  # noqa: BLE001 — a broken flow must not blank the page
+        page["flow"] = None
+        page.setdefault("errors", {})["flow"] = f"{type(exc).__name__}: {exc}"
+
+
 def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     run_id = (args.get("run") or "").strip()
     if not run_id:
@@ -1427,9 +1444,12 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
                       args={"run": run.id, "view": "dock"},
                       sections=run_dock.build(run, t, errors), errors=errors)
         page["graph"] = _graph(run, args.get("node"))
+        _attach_flow(page, run)
         return page
     if S.ide_level() >= 2:
-        return _build_v2(run, tab, args)
+        page = _build_v2(run, tab, args)
+        _attach_flow(page, run)
+        return page
     tab = tab if tab in {k for k, _ in TABS} else "dag"
     done = sum(1 for n in run.nodes if n.state == "done")
     chips = [_state_chip(run), S.chip(f"{done}/{len(run.nodes)} nodes"),
