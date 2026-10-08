@@ -80,6 +80,26 @@ Evaluated before the failed rule, with the same condition:
 The failed rule's "Failed at <node>" now uses the fixed `_failing_node`. When none is found,
 the text is "Failed" plus the hint summary, never a guessed node.
 
+
+### 4. Landed elsewhere (`landed.json`)
+
+49 failed runs in the last 4 days did deliver their change through a later revision or a direct
+commit. The user's rule is to never leave delivered work looking failed. A run dir may carry
+`landed.json` `{"commit": "<sha>", "repo": "<path>", "note": "<str>"}`, written by the operator
+or a later tool.
+
+- **`task_state`:** when `status in ("failed", "rolled_back")` and `landed.json` exists with a
+  non-empty `commit`, return `TaskState(state="done", detail=f"Landed via {commit[:9]}" + (f" —
+  {note}" if note else ""), …)`. Evaluate this rule FIRST among the terminal rules: it beats the
+  retry gate and the withheld rule.
+- **`run_mark`:** same rule → the done mark.
+- **`outcome.resolve`:** same rule → state `done`, tone `green`, icon `✓`, text `Landed via
+  <sha>`, detail = note.
+  - Actions: **Open commit** when `repo` is a git dir. Use
+    `S.cli("board","…")` only if such a verb exists; otherwise omit it. Keep the menu.
+- **Test:** a failed run with `landed.json` → done everywhere (task_state, run_mark, outcome),
+  with the sha in the text.
+
 ## Tests (`tests/unit/test_withheld_publish_outcome.py`; reuse fixtures from `tests/unit/test_ide_pages_outcome.py` / `tests/unit/test_needs_you_truth.py`)
 
 - **Events like the live run** (implementer node_end with no finish_reason; reviewer
