@@ -598,7 +598,19 @@ def clean_worktree(slug_arg: str) -> None:
             print(f"[mo-worktree] closed retry gate(s): {', '.join(closed)}")
         rc = git("-C", ROOT, "worktree", "remove", wt, check=False).returncode
         if rc != 0:
-            git("-C", ROOT, "worktree", "remove", "--force", wt)
+            rc = git("-C", ROOT, "worktree", "remove", "--force", wt,
+                     check=False).returncode
+        if rc != 0:
+            # Not a registered worktree any more (its admin dir under
+            # .git/worktrees was pruned by another process). Still release the
+            # claims and the branch below — a stale claim would refuse every
+            # later worktree on the same files — and leave the directory for a
+            # human to inspect rather than deleting unknown content.
+            print(f"[mo-worktree] warn: {wt} is not a registered worktree; "
+                  "releasing its claims and leaving the directory in place",
+                  file=sys.stderr)
+            if not branch or branch == "HEAD":
+                branch = f"wt/{slug}"
         if branch and branch != "main":
             git("-C", ROOT, "branch", "-d", branch, check=False,
                 capture=True)
