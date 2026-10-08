@@ -465,6 +465,33 @@ def _lane_env_from_registry(
     return {}
 
 
+def _lane_no_push_env(env: dict[str, str]) -> dict[str, str]:
+    """Neutralise ``git push`` for an agentic lane (issue B5).
+
+    A lane that pushes corrupts the operator's branch and bypasses review:
+    observed live, a lane self-pushed to ``main`` before the reviewer ran. The
+    framework owns commit / merge / push; lanes only leave edits in the working
+    tree. Injecting ``remote.origin.pushurl`` through the ``GIT_CONFIG_*`` env
+    channel makes any ``git push`` inside the lane fail with a
+    "remote helper not found" error, without touching the repo's own config or
+    the operator's git state.
+
+    Opt a lane back in with ``MO_LANE_ALLOW_PUSH=1`` in the operator's process
+    environment (read here, not from the lane env, so a lane cannot self-grant).
+    """
+    if os.environ.get("MO_LANE_ALLOW_PUSH", "0") == "1":
+        return env
+    out = dict(env)
+    try:
+        n = int(out.get("GIT_CONFIG_COUNT", "0"))
+    except (TypeError, ValueError):
+        n = 0
+    out["GIT_CONFIG_COUNT"] = str(n + 1)
+    out[f"GIT_CONFIG_KEY_{n}"] = "remote.origin.pushurl"
+    out[f"GIT_CONFIG_VALUE_{n}"] = "no-push://disabled-by-mini-ork"
+    return out
+
+
 def claude_env_for(
     model: str,
     root: str | os.PathLike[str] | None = None,
@@ -1296,6 +1323,10 @@ def dispatch_model(
         merged_env.pop(key, None)
     merged_env.update(spec.env)
     merged_env.update(request.env)
+    # Lane safety (B5): a lane must never push. Applied to every lane here —
+    # the last point where the child env is fully assembled — so no lane kind
+    # (anthropic-compat / -native / openai / executable) escapes it.
+    merged_env = _lane_no_push_env(merged_env)
     command = engine.build_command(spec.command, request=request, env=merged_env)
     command = _portable_transport_command(command, request=request, env=effective_env)
     if command != spec.command:

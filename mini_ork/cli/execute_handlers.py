@@ -789,7 +789,11 @@ def scope_guard_block(run_dir: str) -> str:
     inside MO_TARGET_CWD, and lens agents enumerated them — every tool
     round-trip re-billed that context (worst measured call: 14.77M input
     tokens, $2.89; 27 sibling lens calls returned zero output). No lens,
-    researcher, or reviewer legitimately needs another run's directory."""
+    researcher, or reviewer legitimately needs another run's directory.
+
+    The same block also carries the repository write guard (B5): a lane that
+    commits/merges/pushes corrupts the operator's branch and bypasses review.
+    The framework owns all three; the lane only edits the working tree."""
     return (
         "\n--- Scope guard (hard constraint) ---\n"
         f"The ONLY run directory you may read is: {run_dir}\n"
@@ -797,7 +801,15 @@ def scope_guard_block(run_dir: str) -> str:
         "directory (sibling runs under .mini-ork/runs/), .git internals, or "
         "node_modules. Past-run artifacts are not evidence for this task and "
         "scanning them wastes the context budget.\n"
-        "--- /scope guard ---\n")
+        "--- /scope guard ---\n"
+        "\n--- Repository write guard (hard constraint) ---\n"
+        "Never run `git commit`, `git merge`, `git rebase`, or `git push`. The "
+        "framework owns commit, merge and push; a lane that pushes to a shared "
+        "branch corrupts the operator's worktree and bypasses review. Leave "
+        "your edits in the working tree — the framework will pick them up. "
+        "Push is disabled at the process level for this lane, so a forced "
+        "attempt can only fail and waste your budget.\n"
+        "--- /repository write guard ---\n")
 
 
 def _handle_planner_early(root):
