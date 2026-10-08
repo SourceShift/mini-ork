@@ -21,8 +21,11 @@ class TokenUsage:
     cache_creation_tokens: int = 0
     # Reasoning ("thinking") tokens, a breakdown of output_tokens — never
     # additive to it. Anthropic-shaped envelopes report them under
-    # usage.output_tokens_details.thinking_tokens.
-    thinking_tokens: int = 0
+    # usage.output_tokens_details.thinking_tokens. ``None`` means the provider
+    # did not report a figure at all — distinct from a reported ``0``. Storing
+    # the absence as 0 would be indistinguishable from "the model did no
+    # thinking", so the value stays None end-to-end and lands as SQL NULL.
+    thinking_tokens: int | None = None
 
 
 @dataclass(frozen=True)

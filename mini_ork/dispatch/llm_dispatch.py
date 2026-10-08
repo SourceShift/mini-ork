@@ -163,6 +163,19 @@ def _int_or(v, d):
         return d
 
 
+def _read_token_sidecar(path):
+    """(input, output, cached_in, cache_create, thinking) from a ``.tokens``
+    sidecar written next to a dispatch's out_file. A missing file yields all
+    zeros; ``thinking`` is None when the provider did not report a figure (the
+    field is blank), so it is stored as SQL NULL rather than a misleading 0."""
+    try:
+        parts = (open(path).read().split("\t") + ["", "", "", "", ""])[:5]
+    except OSError:
+        return 0, 0, 0, 0, None
+    return (_int_or(parts[0], 0), _int_or(parts[1], 0), _int_or(parts[2], 0),
+            _int_or(parts[3], 0), _int_or(parts[4], None))
+
+
 def backoff_seconds_raw(attempt, max_sleep: int | str = 45, base_s: int | str = 5,
                         *, _jitter=None) -> int:
     max_sleep = _int_or(max_sleep, 45)
@@ -334,7 +347,7 @@ def check_lane_fuse(db, lane, category) -> bool:
 def write_llm_calls_row(db, provider, model_id, tier, feature_name, actor, status,
                         duration_ms, cost_usd, error_message, input_tokens=0, output_tokens=0,
                         metadata_json="{}", cached_input_tokens=0, cache_creation_input_tokens=0,
-                        error_category=None, retryable=None, thinking_tokens=0):
+                        error_category=None, retryable=None, thinking_tokens=None):
     if not (db and os.path.isfile(db)):
         return
     in_tok = _int_or(input_tokens, 0)
@@ -373,7 +386,7 @@ def write_llm_calls_row(db, provider, model_id, tier, feature_name, actor, statu
     for name, val in (("error_category", error_category), ("retryable", retryable),
                       ("cached_input_tokens", cached_in),
                       ("cache_creation_input_tokens", cache_create),
-                      ("thinking_tokens", _int_or(thinking_tokens, 0)),
+                      ("thinking_tokens", _int_or(thinking_tokens, None)),
                       ("cost_input_uncached_usd", cost_input_uncached),
                       ("cost_input_cached_usd", cost_input_cached),
                       ("cost_cache_write_usd", cost_cache_write)):
@@ -420,10 +433,13 @@ def mo_llm_dispatch(model, prompt, out_file, timeout_s=1500, max_turns=60, accep
     except OSError:
         pass
     u = res.usage
+    # The thinking field is blank when the provider did not report it, so the
+    # reader below can tell "unreported" (→ None → NULL) from a reported 0.
+    thinking_field = "" if u.thinking_tokens is None else str(u.thinking_tokens)
     try:
         open(out_file + ".tokens", "w", encoding="utf-8").write(
             f"{u.input_tokens}\t{u.output_tokens}\t{u.cached_input_tokens}\t{u.cache_creation_tokens}"
-            f"\t{u.thinking_tokens}")
+            f"\t{thinking_field}")
     except (OSError, AttributeError):
         pass
     if not res.ok and res.error:
@@ -579,10 +595,8 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
         cost_usd = "0"
         if os.path.isfile(out_file + ".cost"):
             cost_usd = open(out_file + ".cost").read().strip() or "0"
-        in_tok = out_tok = cached_in = cache_create = thinking = 0
-        if os.path.isfile(out_file + ".tokens"):
-            parts = (open(out_file + ".tokens").read().split("\t") + ["0"] * 5)[:5]
-            in_tok, out_tok, cached_in, cache_create, thinking = (_int_or(p, 0) for p in parts)
+        in_tok, out_tok, cached_in, cache_create, thinking = _read_token_sidecar(
+            out_file + ".tokens")
         write_llm_calls_row(db, provider, selected_model, tier, feature, actor, "success",
                             duration_ms, cost_usd, "", in_tok, out_tok, "{}", cached_in, cache_create,
                             thinking_tokens=thinking)
@@ -627,10 +641,8 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
     cost_usd = "0"
     if os.path.isfile(out_file + ".cost"):
         cost_usd = open(out_file + ".cost").read().strip() or "0"
-    in_tok = out_tok = cached_in = cache_create = thinking = 0
-    if os.path.isfile(out_file + ".tokens"):
-        parts = (open(out_file + ".tokens").read().split("\t") + ["0"] * 5)[:5]
-        in_tok, out_tok, cached_in, cache_create, thinking = (_int_or(p, 0) for p in parts)
+    in_tok, out_tok, cached_in, cache_create, thinking = _read_token_sidecar(
+        out_file + ".tokens")
     write_llm_calls_row(db, provider, selected_model, tier, feature, actor, "failed",
                         duration_ms, cost_usd, err, in_tok, out_tok, "{}", cached_in, cache_create,
                         error_category=category, retryable=retryable, thinking_tokens=thinking)

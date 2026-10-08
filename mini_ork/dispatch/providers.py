@@ -161,18 +161,22 @@ def claude_result_text(stdout: str) -> str:
     return body
 
 
-def _claude_thinking_tokens(env: dict) -> int:
+def _claude_thinking_tokens(env: dict) -> int | None:
     """Thinking tokens from a claude CLI result envelope: the top-level
     ``usage.output_tokens_details.thinking_tokens``, else the sum of the
-    per-model ``modelUsage[*].thinkingTokens``. 0 when neither is reported."""
+    per-model ``modelUsage[*].thinkingTokens``. ``None`` when neither reports a
+    figure at all — a reported ``0`` is returned as ``0``, so a consumer can
+    tell "did no thinking" from "we do not know"."""
     details = ((env.get("usage") or {}).get("output_tokens_details")) or {}
     if isinstance(details, dict) and details.get("thinking_tokens") is not None:
         return int(details.get("thinking_tokens") or 0)
     per_model = env.get("modelUsage") or {}
     if isinstance(per_model, dict):
-        return sum(int((m or {}).get("thinkingTokens") or 0)
-                   for m in per_model.values() if isinstance(m, dict))
-    return 0
+        reported = [m.get("thinkingTokens") for m in per_model.values()
+                    if isinstance(m, dict) and m.get("thinkingTokens") is not None]
+        if reported:
+            return sum(int(v or 0) for v in reported)
+    return None
 
 
 def parse_claude_usage(stdout: str) -> TokenUsage:
