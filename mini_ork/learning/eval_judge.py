@@ -215,10 +215,18 @@ def aggregate_axes(axes: dict, overall=None) -> float:
 # ── Layer 0: execution-grounded reward ───────────────────────────────────────
 def _verifier_passed(v: dict):
     """True/False from one parsed verifier JSON, or None when it carries no real
-    signal (vacuous / dry-run / running). Supports the ``pass`` bool
+    signal (vacuous / dry-run / running / unverified). Supports the ``pass`` bool
     (recipe verifiers like test.py) and the ``verdict``/``status`` string
-    (cli/verify.py)."""
+    (cli/verify.py).
+
+    An ``unverified`` status is an ABSTENTION, not a refutation: the instrument
+    could not read the delta (a Rust or jest build it has no adapter for), so the
+    payload carries no real execution signal even when ``pass`` is present. Checked
+    BEFORE the ``pass`` short-circuit so ``{"pass": false, "status": "unverified"}``
+    → None (never counted as a failure) while ``{"pass": false}`` stays False."""
     if not isinstance(v, dict):
+        return None
+    if str(v.get("status") or "").strip().lower() == "unverified":
         return None
     if "pass" in v:
         return bool(v["pass"])

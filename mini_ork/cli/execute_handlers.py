@@ -2244,6 +2244,70 @@ def _handle_rollback(ctx: NodeDispatch):
     return 0, "done"
 
 
+def _parse_verifier_json(body: str):
+    """The LAST top-level JSON object in a ``verifier_*.json`` evidence file, or None.
+
+    The verifier runner merges stdout+stderr into the same file, so a real payload
+    is preceded by a ``[x] running: <cmd>`` banner line (see
+    ``verify.levels.read_verifier_payload``); a naive ``json.loads(body)`` chokes on
+    it — every verifier then abstained and the eval reward was poisoned. Mirrors
+    ``scheduler._load_verifier``: try the whole body, then the last top-level object
+    via ``raw_decode`` with consumed-span tracking, so a NESTED object (e.g. the
+    ``{"pass": true}`` inside a ``checks`` list) is never mistaken for the payload."""
+    try:
+        obj = json.loads(body)
+    except (ValueError, TypeError):
+        obj = None
+    if isinstance(obj, dict):
+        return obj
+    decoder = json.JSONDecoder()
+    found, pos, consumed = None, 0, 0
+    for line in body.splitlines(keepends=True):
+        start, pos = pos, pos + len(line)
+        stripped = line.lstrip()
+        if start < consumed or not stripped.startswith("{"):
+            continue
+        try:
+            obj, end = decoder.raw_decode(body, start + len(line) - len(stripped))
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            found, consumed = obj, end
+    return found
+
+
+def _banner_command(body: str) -> str:
+    """The command named by the verifier's last ``[<name>] running: <cmd>`` line."""
+    for line in reversed(body.splitlines()):
+        marker = line.find("] running:")
+        if marker != -1 and line.lstrip().startswith("["):
+            return line[marker + len("] running:"):].strip()
+    return ""
+
+
+def _vacuous_verdict(parsed: dict) -> dict:
+    """``parsed`` → the no-signal verdict for a command that ran nothing.
+
+    A literal ``true`` / ``:`` command (``probe_validity._VACUOUS_PROBES``) proves
+    nothing, so its ``pass`` must not count in the execution reward and its
+    ``suite_green``/``post_rc`` must not claim a green suite. Keep the identity
+    fields for the judge's trajectory view; reuse the existing no-signal
+    vocabulary (``status: "vacuous"``, read by ``eval_judge._verifier_passed``)
+    rather than invent a field."""
+    drop = ("pass", "verdict", "status", "suite_green", "post_rc")
+    kept = {k: v for k, v in parsed.items() if k not in drop}
+    return {**kept, "status": "vacuous"}
+
+
+def _is_vacuous_command(body: str) -> bool:
+    """Whether the banner command the verifier ran is a static no-op (``true``)."""
+    cmd = _banner_command(body)
+    if not cmd:
+        return False
+    from mini_ork.verify.probe_validity import is_vacuous_probe  # noqa: PLC0415
+    return is_vacuous_probe(cmd)
+
+
 def _read_run_trajectory(db: str, run_id: str, run_dir: str):
     """Best-effort: this run's execution_traces rows + any verifier_*.json
     verdicts in the run dir, for the judge's trajectory view. Fail-open — any
@@ -2275,10 +2339,15 @@ def _read_run_trajectory(db: str, run_id: str, run_dir: str):
                             body = fh.read().strip()
                     except OSError:
                         continue
-                    try:
-                        verifier_verdicts[name] = json.loads(body)  # parsed → pass/verdict
-                    except (ValueError, TypeError):
+                    parsed = _parse_verifier_json(body)
+                    if parsed is None:
                         verifier_verdicts[name] = {"raw": body[:200]}
+                    elif _is_vacuous_command(body):
+                        # A literal-`true` command is test theater: its pass/suite
+                        # must not count as verification (probe_validity's rule).
+                        verifier_verdicts[name] = _vacuous_verdict(parsed)
+                    else:
+                        verifier_verdicts[name] = parsed
         except OSError:
             pass
     return traces, verifier_verdicts
@@ -2292,7 +2361,11 @@ def _stage_checks(plan_present: bool, artifact_ref: str, traces: list,
 
       plan     — the plan stage produced a non-empty contract.
       execute  — the run actually did work: a success trace or a declared artifact.
-      verify   — at least one verifier is non-vacuous (produced a real pass/fail).
+      verify   — at least one verifier is non-vacuous: a real pass/fail, or a suite
+                 that ran green after the patch (suite_green + post_rc==0) even if
+                 the delta instrument abstained. A payload whose banner command was
+                 a no-op (``true``) is marked ``status: "vacuous"`` upstream, so it
+                 can never be the non-vacuous one.
       coverage — the pass FRACTION over the concrete verifiers (== Layer-0 r_exec),
                  crediting *how much* verified, not just that verification ran.
 
@@ -2306,7 +2379,17 @@ def _stage_checks(plan_present: bool, artifact_ref: str, traces: list,
     concrete = [ej._verifier_passed(v) for v in verifier_verdicts.values()
                 if isinstance(v, dict)]
     concrete = [c for c in concrete if c is not None]
-    checks["verify"] = True if concrete else (False if verifier_verdicts else None)
+    # A suite that ran GREEN after the patch is real, non-vacuous verification even
+    # when the delta instrument ABSTAINED (status="unverified") — the exit code is
+    # the signal the instrument could not turn into a replay delta (a Rust/jest
+    # build with no adapter). Mirrors verify.levels' `preserve` level (post_rc == 0)
+    # and ad507150 ("never a false PROVEN", but also never a false refutation).
+    green_suite = any(
+        isinstance(v, dict) and v.get("suite_green") is True
+        and v.get("post_rc") == 0
+        for v in verifier_verdicts.values())
+    checks["verify"] = True if (concrete or green_suite) else (
+        False if verifier_verdicts else None)
     checks["coverage"] = r_exec  # already the [0,1] pass fraction, or None
     return checks
 
