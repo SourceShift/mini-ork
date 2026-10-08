@@ -48,6 +48,10 @@ def _isolate_process_state():
     # caller's real file whenever the suite runs under a mini-ork run that
     # exported MINI_ORK_SECRETS (held-out tasks, framework-edit verifiers).
     os.environ.pop("MINI_ORK_SECRETS", None)
+    # Never let a test spawn a real, detached auto-repair `recover`: the run and
+    # recover flows call auto_repair.maybe_repair on every failed run, and it is
+    # on unless MO_AUTO_REPAIR is "0". Tests of the loop opt back in explicitly.
+    os.environ["MO_AUTO_REPAIR"] = "0"
     try:
         cwd_snapshot = os.getcwd()
     except OSError:

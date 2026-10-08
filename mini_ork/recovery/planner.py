@@ -88,7 +88,7 @@ from pathlib import Path
 # E1 seam — read by is_node_reusable for the per-node reuse decision.
 # Importing at module top means a runtime absence of E1 surfaces
 # immediately as ImportError on first call (fail loud).
-from mini_ork.context import apply_env_overrides, context_env
+from mini_ork.context import apply_env_overrides, context_env, scoped_environ
 
 # DAG + plan-computation seams (SRP split; re-exported for parity).
 from mini_ork.recovery.dag import DAG, load_dag
@@ -1078,9 +1078,44 @@ def cli_main(argv: list[str] | None = None, *, execute_fn=None) -> int:
     for key in ("MINI_ORK_RECOVERY_RUN_ID", "MINI_ORK_RECOVERY_SKU", "MINI_ORK_RECOVERY_CLOSURE",
                 "MINI_ORK_RECOVERY_STRATEGY", "MINI_ORK_RECOVERY_FROM"):
         os.environ.pop(key, None)  # only this call's plan may drive the executor
+    # ── auto-repair hand-off ──: when auto-repair spawned this recover, wait for
+    # the spawning lifecycle to exit before dispatching. It still OWNS the run
+    # record (``main._close_run_record`` runs in the caller's ``finally``, after
+    # reflect); starting now would let that teardown see our ``executing``
+    # status and flip the live repair to ``failed``. Fail-soft.
+    try:
+        from mini_ork.recovery import auto_repair  # noqa: PLC0415
+        auto_repair.wait_for_spawner()
+    except Exception:  # noqa: BLE001 — the hand-off must never fail a recover
+        pass
+    # The spawn markers belong to THIS recover only. Drop them from the process
+    # env before dispatch, so nothing in the execute subtree (a verifier running
+    # the recover tests, a nested recover) can act as this repair attempt; the
+    # early-return hand-off below restores them just for its own call.
+    _repair_markers = {
+        key: os.environ[key]
+        for key in ("MO_AUTO_REPAIR_ATTEMPT", "MO_AUTO_REPAIR_RUN_ID",
+                    "MO_AUTO_REPAIR_WAIT_PID")
+        if key in os.environ
+    }
+    apply_env_overrides({key: None for key in _repair_markers})
     handoff: dict = {}
     rc = main(argv, handoff=handoff)
     if rc != 0 or not handoff:
+        # A recover that never dispatched — the hint gate refused it,
+        # ``plan_recovery`` raised ``RecoveryRefused``, another process holds the
+        # lease, a lane pin was invalid, or every node is reusable — leaves the
+        # auto-repair attempt that spawned it with nothing running. Hand the run
+        # to the human instead of stranding ``repair.json`` at
+        # ``state='repairing'`` with no owner. No-op for any other caller
+        # (``note_stuck`` only acts on a spawned attempt).
+        try:
+            from mini_ork.recovery import auto_repair  # noqa: PLC0415
+            with scoped_environ(_repair_markers):
+                auto_repair.note_stuck(
+                    reason=f"recover exited rc={rc} without dispatching")
+        except Exception:  # noqa: BLE001 — the hand-off must never fail a recover
+            pass
         return rc
     # ── Recover-task-class fix (kickoff recover-task-class §1): publish the
     # run's task class so a recovered execute does not silently fall back to
@@ -1234,6 +1269,22 @@ def cli_main(argv: list[str] | None = None, *, execute_fn=None) -> int:
             retry_notify.notify(Path(home), handoff["run_id"])
         except Exception:  # noqa: BLE001
             pass
+    # ── auto-repair: a revived run that fails again re-enters the loop. Mirror
+    # ``mini_ork.cli.main``'s hook (kickoff auto-repair-loop). UNCONDITIONAL —
+    # a withdrawn publish sets status='failed' while exec_rc == 0 — and quiet:
+    # ``maybe_repair`` reads the DB status itself and never raises, so the
+    # recover flow's exit code and stdout are unchanged. ``wait_for_exit``: this
+    # process released the lease and reaped its row above, so it hands the run
+    # to the child and must be gone before the child dispatches.
+    try:
+        from mini_ork.recovery import auto_repair  # noqa: PLC0415
+        _repair_home = os.environ.get("MINI_ORK_HOME") or (
+            os.path.dirname(handoff.get("db_path") or "") or None)
+        if _repair_home and handoff.get("run_id"):
+            auto_repair.maybe_repair(Path(_repair_home), handoff["run_id"],
+                                     wait_for_exit=True)
+    except Exception:  # noqa: BLE001
+        pass
     return exec_rc
 
 

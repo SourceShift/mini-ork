@@ -38,6 +38,7 @@ def test_all_former_exec_subs_registered_natively():
         "oversight", "metric-anchor", "active-eval", "certify", "node-agent",
         "nodes", "mcp-context", "zed", "specs", "automations", "board",
         "triage",
+        "repair",
     }
     assert expected == set(_NATIVE_MODULE_SUBS)
     for sub in expected:

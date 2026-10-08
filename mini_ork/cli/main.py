@@ -24,6 +24,7 @@ from pathlib import Path
 
 from mini_ork import trace_store
 from mini_ork.context import (
+    apply_env_overrides,
     context_env,
     context_env_snapshot,
     publish_env,
@@ -57,6 +58,7 @@ _NATIVE_MODULE_SUBS = {
     "rollback": "mini_ork.cli.rollback",
     "resume": "mini_ork.cli.resume",
     "recover": "mini_ork.recovery.planner",
+    "repair": "mini_ork.cli.repair_cmd",
     "serve": "mini_ork.cli.serve",
     "bug-collector": "mini_ork.observability.bug_collector",
     "conductor": "mini_ork.orchestration.conductor",
@@ -953,6 +955,13 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
     if not _gate("plan", plan_path):
         return 0
 
+    # ── auto-repair: default ON ── (user rule: always revive and fix).
+    # Published BEFORE execute so the whole run flow (and the triage gate in
+    # execute.py, which stands down when MO_AUTO_REPAIR=1) sees one owner for a
+    # terminal failure. An explicit operator "0" is never overridden.
+    if context_env("MO_AUTO_REPAIR", "") == "":
+        apply_env_overrides({"MO_AUTO_REPAIR": "1"})
+
     # ── execute ── (failures do not exit; verify+reflect still fire)
     from mini_ork.cli import execute as mini_ork_execute
     execute_stdout = io.StringIO()
@@ -1035,6 +1044,19 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
             retry_notify.notify(Path(home), run_id)
         except Exception:  # noqa: BLE001
             pass
+
+    # ── auto-repair: revive the same run when it failed ──. UNCONDITIONAL — a
+    # withheld publish sets status='failed' while run_rc == 0, so gating on rc
+    # would silently miss every abstain case. ``maybe_repair`` reads the run's DB
+    # status itself and never raises, so a green run stays quiet.
+    # ``wait_for_exit``: this lifecycle still owns the run record — it is closed
+    # in ``_run_lifecycle``'s ``finally``, after reflect — so the spawned
+    # recover must wait for this process to exit before it dispatches.
+    try:
+        from mini_ork.recovery import auto_repair
+        auto_repair.maybe_repair(Path(home), run_id, wait_for_exit=True)
+    except Exception:  # noqa: BLE001
+        pass
 
     if not _gate("verify", artifact):
         return run_rc
