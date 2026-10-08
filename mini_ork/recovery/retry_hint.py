@@ -47,8 +47,15 @@ from mini_ork.web.db import db_for
 #
 # v2 (2026-10-08): the withheld-publish branch (case 1.5) — a run whose publisher
 # abstained with no failing node is retryable ``verify``, not unclassified.
-HINT_VERSION = 2
+# v3 (2026-10-08): the interrupted branch (case 1.6) — a node that started and
+# never ended is retryable ``resume`` from that node, not unclassified.
+HINT_VERSION = 3
 CACHE_FILENAME = "retry-hint.json"
+
+# Finish reasons that end a node without failing it — the same set
+# ``acp/task_state._TERMINAL_OK_FINISH`` uses (kept local: this module imports
+# ``task_state`` lazily).
+_TERMINAL_OK_FINISH = ("done", "skipped", "abstain", "levels_unverified")
 
 # Reviewer/eval/judge verdicts that mean "the change was wrong".
 _RETRY_VERDICTS = ("needs_revision", "reject", "fail")
@@ -1145,6 +1152,13 @@ def _case_lane_unavailable(home: Path, run_id: str, run_dir: Path,
 def _run_node_events(home: Path, run_id: str) -> list[dict[str, Any]] | None:
     """This run's ``run_events`` rows shaped for ``task_state._failing_node``.
 
+    The rows carry ``event_type`` and ``payload_json`` for the shared
+    ``_failing_node`` walk, plus ``created_at`` and ``rowid`` so a caller that
+    must not trust the event-id order (``_case_interrupted``) can re-sort into
+    true *insertion* order. ``rowid`` is the table's hidden monotonic key — the
+    ``event_id`` PRIMARY KEY is TEXT, so ``run_events`` is a plain rowid table
+    (``db/migrations/0016``) and rows are committed in emission order.
+
     ``None`` when the DB / table / query is unavailable — the caller then
     declines to classify rather than asserting a "no node failed" it cannot
     actually see.
@@ -1157,14 +1171,20 @@ def _run_node_events(home: Path, run_id: str) -> list[dict[str, Any]] | None:
         if not db.has_table("run_events"):
             return None
         rows = db.rows(
-            "SELECT event_type, payload_json FROM run_events WHERE run_id = ? "
+            "SELECT event_type, payload_json, created_at, rowid AS rid "
+            "FROM run_events WHERE run_id = ? "
             "ORDER BY created_at ASC, event_id ASC",
             (run_id,),
         )
     except Exception:  # noqa: BLE001 — schema drift: never raise
         return None
     return [
-        {"event_type": r.get("event_type"), "payload_json": r.get("payload_json")}
+        {
+            "event_type": r.get("event_type"),
+            "payload_json": r.get("payload_json"),
+            "created_at": r.get("created_at"),
+            "rowid": r.get("rid"),
+        }
         for r in rows
     ]
 
@@ -1242,6 +1262,129 @@ def _case_withheld(home: Path, run_dir: Path, run_id: str,
     }
 
 
+def _case_interrupted(home: Path, run_id: str) -> dict[str, Any] | None:
+    """Case 1.6 — a node that STARTED and never ended is an interruption.
+
+    A dispatcher that dies mid-node leaves a ``node_start`` with no matching
+    ``node_end`` and a ``failed`` task row. That is not an unclassified failure:
+    the cheap, correct retry is to re-run that node (``mini-ork recover <run>
+    --strategy resume``).
+
+    The walk must NOT trust the ``event_id`` order. ``created_at`` has
+    one-second resolution (:mod:`mini_ork.observability.node_events` writes
+    ``int(time.time())``) and the id is ``evt-<event_type>-<node>-<ns>-<pid>``,
+    so within one second every ``evt-node_end-…`` sorts before every
+    ``evt-node_start-…``. Read in that order a same-second start/end pair comes
+    back end-first, and the node then looks open forever — a genuine failure
+    gets reported as "interrupted during <node>". Two order-free rules replace
+    the raw walk:
+
+      * a node is OPEN iff it has more ``node_start`` rows than ``node_end``
+        rows — counts, not sequence, so a same-second start/end pair is closed
+        whichever way the rows are read;
+      * the failing-end veto, and the pick of "the node that started last",
+        both use *insertion* order (``created_at`` then ``rowid`` — the same
+        ordering the workflow viewer uses, ``web/repositories.py``).
+
+    Declines — returns ``None`` — when ``run_events`` is unreadable, when every
+    started node also ended (a genuine failure owns the run, and its own case
+    must fire), or when a failing ``node_end`` was emitted after the chosen
+    node's latest ``node_start``: a parallel batch that dies on one node (a 429
+    dead lane, a REFUTED sibling) leaves its in-flight siblings with a dangling
+    ``node_start``, and resuming the sibling would re-hit the same dead lane —
+    the failed node's own case (lane / code) must classify it, not this one.
+    """
+    events = _run_node_events(home, run_id)
+    if events is None:
+        return None
+
+    def _insertion_key(ev: dict[str, Any]) -> tuple[int, int]:
+        try:
+            created = int(ev.get("created_at") or 0)
+        except (TypeError, ValueError):
+            created = 0
+        try:
+            rid = int(ev.get("rowid") or 0)
+        except (TypeError, ValueError):
+            rid = 0
+        return created, rid
+
+    # Re-sort into insertion order. The shared read orders by ``event_id``, which
+    # is exactly the ordering that breaks under one-second ``created_at``.
+    ordered = sorted(events, key=_insertion_key)
+
+    starts: dict[str, int] = {}
+    ends: dict[str, int] = {}
+    latest_start_seq: dict[str, int] = {}
+    failing_end_seq: list[int] = []
+    for seq, ev in enumerate(ordered):
+        et = ev.get("event_type")
+        if et not in ("node_start", "node_end"):
+            continue
+        try:
+            payload = json.loads(ev.get("payload_json") or "{}")
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        nid = str(payload.get("node_id") or "")
+        if not nid:
+            continue
+        if et == "node_start":
+            starts[nid] = starts.get(nid, 0) + 1
+            latest_start_seq[nid] = seq
+        elif payload.get("interrupted") is True:
+            # The synthetic ``node_end`` that ``board kill``, the run reaper
+            # and ``recover`` write for a dead attempt
+            # (``web.control._close_dangling_node_events``: verdict CRASH,
+            # interrupted true). It records that the step never finished, so
+            # it does not close the node.
+            continue
+        else:
+            ends[nid] = ends.get(nid, 0) + 1
+            finish = str(payload.get("finish_reason") or "done")
+            if finish not in _TERMINAL_OK_FINISH:
+                failing_end_seq.append(seq)
+
+    # Order-free openness: a node with more starts than ends is still in flight.
+    # A ``node_end`` for a node that never started contributes only to ``ends``,
+    # so a bare ``node_end`` can never invent an open node.
+    open_nodes = [nid for nid, n in starts.items() if n > ends.get(nid, 0)]
+    if not open_nodes:
+        return None
+    # The node that started LAST among those still open.
+    node = max(open_nodes, key=lambda nid: latest_start_seq[nid])
+    # A failure emitted AFTER this node's start means a sibling in the same
+    # parallel batch died and left this node's ``node_start`` dangling. The run
+    # did not stop mid-node — a genuine failure owns it, so defer to the
+    # lane/code case. A failure BEFORE the start (an earlier round's
+    # ``verdict_revise``) does not: the node was re-entered after it and the run
+    # died in the re-run.
+    if any(seq > latest_start_seq[node] for seq in failing_end_seq):
+        return None
+    run_dir = home / "runs" / run_id
+    return {
+        "version": HINT_VERSION,
+        "run_id": run_id,
+        "failed_node": node,
+        "retryable": True,
+        "strategy": "resume",
+        "from_node": node,
+        "needs_change": {
+            "kind": "interrupted",
+            "summary": (
+                f"Interrupted during {node}: the run stopped before the step "
+                "finished. Resume from it."
+            ),
+            "detail": _tail_log(run_dir, node),
+            "evidence": "node_start without node_end",
+        },
+        "notes": [],
+        "command": _build_command("resume", run_id),
+        "computed_at": _now_iso(),
+    }
+
+
 def compute(home: Path, run_id: str) -> dict[str, Any] | None:
     """Pure read — return the retry hint for ``run_id`` or ``None``.
 
@@ -1274,6 +1417,15 @@ def compute(home: Path, run_id: str) -> dict[str, Any] | None:
     withheld_hint = _case_withheld(home, run_dir, run_id, recipe)
     if withheld_hint is not None:
         return withheld_hint
+
+    # Case 1.6 — a node that started and never ended is an interruption. This is
+    # the run's most recent fact, so it is evaluated BEFORE the reviewer case: a
+    # stale reviewer verdict from an earlier revise round must not shadow it
+    # (the live bug — a run that died mid-implementer was reported as unclassified
+    # while an older ``review-*.json`` still sat in the run dir).
+    interrupted_hint = _case_interrupted(home, run_id)
+    if interrupted_hint is not None:
+        return interrupted_hint
 
     # A reviewer that asked for a revision outranks any verifier outcome: the
     # change was judged wrong, so retrying it unchanged cannot help.
