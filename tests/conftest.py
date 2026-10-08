@@ -11,12 +11,15 @@ diverge and the parity assertion fails. Each such test passes in isolation but
 fails in the full suite (the CI-only, single-process failure mode).
 
 This autouse fixture snapshots and restores ``os.environ`` and the working
-directory around every test, isolating that leakage suite-wide.
+directory around every test, isolating that leakage suite-wide. It also closes
+and drops ``mini_ork.web.db``'s cached ``StateDB`` connections, which outlive a
+test's ``tmp_path`` and would otherwise read a reused path's old database.
 """
 from __future__ import annotations
 
 import getpass
 import os
+import sys
 import tempfile
 from pathlib import Path
 
@@ -52,6 +55,28 @@ def _isolate_process_state():
     # recover flows call auto_repair.maybe_repair on every failed run, and it is
     # on unless MO_AUTO_REPAIR is "0". Tests of the loop opt back in explicitly.
     os.environ["MO_AUTO_REPAIR"] = "0"
+    # Every in-process reader of state.db goes through mini_ork.web.db.db_for,
+    # which caches a StateDB (holding a read-only sqlite connection) in the
+    # process-wide ``_dbs`` dict, keyed by the home path. pytest reuses a
+    # tmp_path string across tests whose names share their first 30 chars
+    # (``tmp_path_retention_policy = "failed"`` deletes a passing test's dir, so
+    # the numbered slot is handed to the next same-prefix test). The reused
+    # test then builds a fresh state.db at the same path, but db_for returns the
+    # cached StateDB whose connection still points at the deleted inode (and
+    # whose has_table cache is stale), so it reads the PREVIOUS test's rows and
+    # fleet/run-page/retry-hint/board reads go wrong silently. Close and drop
+    # the cache per test so a fresh connection observes the new file. Guarded
+    # by sys.modules: never import the module just to reset it.
+    db_mod = sys.modules.get("mini_ork.web.db")
+    if db_mod is not None:
+        for cached in list(db_mod._dbs.values()):
+            close = getattr(cached, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # noqa: BLE001 — a reset must never fail a test
+                    pass
+        db_mod._dbs.clear()
     try:
         cwd_snapshot = os.getcwd()
     except OSError:
