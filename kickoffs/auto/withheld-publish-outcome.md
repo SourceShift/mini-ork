@@ -30,6 +30,7 @@ failed, offer retry from the failed node.
 - `mini_ork/acp/task_state.py`: ONLY `_failing_node`, `task_state` (one new rule) and
   `run_mark` (the same rule, cheap)
 - `mini_ork/ide_pages/outcome.py`: `resolve` + one new helper
+- `mini_ork/recovery/retry_hint.py`: ONLY the classification entry: a withheld-publish branch
 - `tests/unit/test_withheld_publish_outcome.py` (new)
 
 ## Changes (exact)
@@ -99,6 +100,23 @@ or a later tool.
     `S.cli("board","…")` only if such a verb exists; otherwise omit it. Keep the menu.
 - **Test:** a failed run with `landed.json` → done everywhere (task_state, run_mark, outcome),
   with the sha in the text.
+
+
+### 5. `retry_hint`: a withheld publish is retryable (verify)
+
+`mini-ork recover ide-orca-b2a-triage-20261008104922 --from-node test` was REFUSED: "retry-hint
+refuses this run (strategy='none'); summary: Failed at implementer; the cause was not classified".
+The run had every node green and only the publisher abstained.
+
+Add the same withheld condition early in `load_or_compute`'s classification:
+- `levels_decision == "abstain"` and no failing node (same helper as `task_state`);
+- return `retryable: True`, `strategy: "verify"`, `from_node: <first verifier node of the
+  workflow>`;
+- `needs_change: {"kind": "levels", "summary": "Not published: <levels> unverified", "detail":
+  <levels_reasons lines>}`;
+- notes: `["re-verify; publishes when every level is PROVEN or n/a"]`.
+
+Test: the live-shaped fixture → strategy verify, retryable, from_node = the test verifier.
 
 ## Tests (`tests/unit/test_withheld_publish_outcome.py`; reuse fixtures from `tests/unit/test_ide_pages_outcome.py` / `tests/unit/test_needs_you_truth.py`)
 
