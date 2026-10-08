@@ -170,8 +170,21 @@ per trigger, so the same failure is never fixed twice:
   `mini_ork.triage.failures.triage_run(run_id, home=home, db=<db>, root=<root>,
   promote=context_env("MO_FAILURE_TRIAGE_PROMOTE") == "1")` exactly once. Record
   `"triaged": true` in `repair.json`. Fail-soft.
-- The triage loop's owner will gate its execute.py hook to skip runs while auto-repair is on, and
-  defer to this give-up call. Do NOT touch execute.py.
+- **Default ON, explicit in the run flow.** User rule: always revive and fix. In `main.py`'s run
+  flow, BEFORE execute is called, when `MO_AUTO_REPAIR` is unset, publish it as `"1"` via
+  `mini_ork.context.apply_env_overrides({"MO_AUTO_REPAIR": "1"})`, the sanctioned mutator. An
+  explicit `"0"` is never overridden.
+  - The triage owner gates its execute.py hook opt-in: it skips when
+    `context_env("MO_AUTO_REPAIR", "0") == "1"`.
+  - So a normal `mini-ork run` has auto-repair owning the trigger. A direct `mini-ork execute`
+    or `MO_AUTO_REPAIR=0` keeps triage firing as today.
+  - Do NOT touch execute.py.
+- `decide()` treats `MO_AUTO_REPAIR == "0"` as off. Anything else (incl. unset, e.g. the manual
+  `repair` CLI) is on.
+- **Record the triage outcome on every give-up**, even when `MO_FAILURE_TRIAGE != "1"`:
+  `"triaged": false`, so absence is explicit.
+- The hook in execute.py is named `_maybe_triage_failed_run(db, run_id, home, root)`; triage's
+  signature is `triage_run(run_id, *, home=None, db=None, root=None, promote=False, dry_run=False)`.
 - **Re-dispatch path:** revise/prove rounds go through `mini-ork recover` → the normal executor.
   Do not build your own agent dispatch. The executor's session-reuse fix (researcher-defects
   a45032c1, C9b) then applies automatically once merged.
