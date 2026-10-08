@@ -520,10 +520,17 @@ def agents(title: str, rows: Iterable[Any], **opt: Any) -> dict[str, Any]:
     return _section("agents", title, {"rows": list(rows)}, **opt)
 
 
-def composer(placeholder: str, cli_args: Iterable[str], **opt: Any) -> dict[str, Any]:
-    """An input box that runs ``mini-ork <cli> …`` — the IDE appends typed text."""
-    return _section("composer", "", {"placeholder": str(placeholder),
-                                     "cli": [str(a) for a in cli_args]}, **opt)
+def composer(placeholder: str, cli_args: Iterable[str], *, title: str = "",
+             **opt: Any) -> dict[str, Any]:
+    """An input box that runs ``mini-ork <cli> …`` — the IDE appends typed text.
+
+    ``title`` labels the box (e.g. "Steer the run"); it is the section title, so
+    the layout keys (``full`` / ``col`` / ``note``) still ride ``**opt``.
+    ``cli_args`` is the argv prefix as a list; the typed text becomes its last
+    argument — e.g. ``["board", "steer", run_id, "--text"]``.
+    """
+    return _section("composer", title, {"placeholder": str(placeholder),
+                                        "cli": [str(a) for a in cli_args]}, **opt)
 
 
 def column(title: str, cards: Iterable[Any], *, c: str = "sub") -> dict[str, Any]:

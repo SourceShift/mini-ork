@@ -16,6 +16,8 @@ from typing import Any
 PAGES: dict[str, str] = {
     "run": "Run",
     "orch": "Orchestrator",
+    "inbox": "Inbox",
+    "kanban": "Board",
     "runs": "Runs",
     "changes": "Changes",
     "verify": "Verify & safety",
