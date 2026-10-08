@@ -2318,6 +2318,74 @@ def _review_pathspecs(worktree, files):
     return specs
 
 
+def _pre_impl_untracked_set(run_dir):
+    """The files that were already untracked when the run started.
+
+    Captured at run start by ``_capture_pre_impl_baseline``. Anything in this
+    set is pre-existing dirt from a concurrent session sharing an in-place
+    target — never this run's work — so the reviewer diff must skip it.
+    """
+    path = os.path.join(run_dir or "", "pre-implementer-untracked")
+    try:
+        with open(path) as fh:
+            return {line for line in fh.read().splitlines() if line}
+    except OSError:
+        return set()
+
+
+def _spec_matches(rel, specs):
+    """True when repo-relative *rel* is named by any pathspec in *specs*."""
+    for spec in specs:
+        s = str(spec).rstrip("/")
+        if s and (rel == s or rel.startswith(s + "/")):
+            return True
+    return False
+
+
+def _append_untracked_hunks(diff_path, worktree, run_dir, specs):
+    """Append each untracked file's ``/dev/null`` diff to *diff_path*.
+
+    ``git diff <baseline>`` reports tracked paths only, so a run that creates a
+    file produces an empty ``review-diff.patch`` and the reviewer passes work it
+    never saw (observed live: a code-fix child created new files and the reviewer
+    was handed ``(no diff)``). Mirrors the untracked loop in ``_delta()`` — the
+    framework-edit harvester already includes untracked files; this brings the
+    reviewer path to parity. Files already untracked before the run (a concurrent
+    session's scratch) and run-mirror evidence under ``.mini-ork/`` are skipped.
+    """
+    skip = _pre_impl_untracked_set(run_dir)
+    try:
+        ls = subprocess.run(
+            ["git", "-C", worktree, "ls-files", "-z", "--others", "--exclude-standard"],
+            capture_output=True, text=True, errors="surrogateescape", timeout=60)
+    except Exception:
+        return
+    if ls.returncode != 0:
+        return
+    try:
+        with open(diff_path, "a") as fh:
+            for rel in (ls.stdout or "").split("\0"):
+                if not rel or rel in skip or rel.startswith(".mini-ork/"):
+                    continue
+                if specs and not _spec_matches(rel, specs):
+                    continue
+                if not os.path.isfile(os.path.join(worktree, rel)):
+                    continue
+                try:
+                    new = subprocess.run(
+                        ["git", "-C", worktree, "diff", "--no-color", "--binary",
+                         "--no-index", "--", "/dev/null", rel],
+                        capture_output=True, text=True, errors="surrogateescape",
+                        timeout=60)
+                except Exception:
+                    continue
+                # --no-index exits 1 when files differ — that IS the new-file diff.
+                if new.returncode in (0, 1) and new.stdout.strip():
+                    fh.write(new.stdout)
+    except OSError:
+        return
+
+
 def _tree_has_no_change(worktree, baseline, specs):
     """True when git sees neither a tracked delta nor an untracked file.
 
@@ -2397,6 +2465,10 @@ def _assemble_reviewer_inputs(run_dir):
                 args += ["--", *specs]
             with open(diff_path, "w") as fh:
                 subprocess.run(args, stdout=fh, stderr=subprocess.DEVNULL)
+            # `git diff <baseline>` lists TRACKED paths only, so a run that
+            # CREATES a module/test/migration yields an empty patch and the
+            # reviewer passes work it never saw. Append the untracked hunks.
+            _append_untracked_hunks(diff_path, worktree, run_dir, specs)
         if not (os.path.isfile(diff_path) and os.path.getsize(diff_path) > 0):
             open(diff_path, "w").close()
     except Exception:

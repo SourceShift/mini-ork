@@ -179,6 +179,29 @@ def test_untracked_new_file_is_not_a_no_op(tmp_path, monkeypatch):
 
     ex._assemble_reviewer_inputs(str(run_dir))
     assert (run_dir / "review-diff-noop.json").exists() is False
+    # `git diff <baseline>` reports tracked paths only — without the untracked
+    # hunk the reviewer is handed an empty patch and approves blind.
+    assert "new work" in (run_dir / "review-diff.patch").read_text()
+
+
+def test_pre_impl_untracked_scratch_is_not_attributed_to_the_run(tmp_path, monkeypatch):
+    """A file already untracked at run start belongs to another session, not this
+    run, so it must never enter the reviewer diff."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("MO_TARGET_CWD", str(repo))
+
+    (repo / "other-session-scratch.txt").write_text("not mine\n")
+    ex._capture_pre_impl_baseline(str(run_dir))  # records the scratch as pre-existing
+    (repo / "brand-new.txt").write_text("new work\n")
+    _summary(run_dir, repo, [str(repo / "brand-new.txt")])
+
+    ex._assemble_reviewer_inputs(str(run_dir))
+    patch = (run_dir / "review-diff.patch").read_text()
+    assert "new work" in patch
+    assert "not mine" not in patch
 
 
 def test_no_summary_leaves_the_empty_diff_branch_untouched(tmp_path):
