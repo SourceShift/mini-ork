@@ -408,6 +408,23 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
         # and the verdict computation exactly like a fresh one.
         if os.environ.get("MO_VERIFY_RERUN") != "1":
             dag = _dag_result(run_dir, name)
+            if dag is None and run_dir and os.path.isfile(
+                    os.path.join(run_dir, "rolled-back.json")):
+                # Kickoff: the workflow skipped this verifier and rollback then
+                # reverted the tree, so there is nothing left to verify. Running
+                # the script here would run the suite against the reverted tree
+                # and truncate the run's only copy of the failure evidence. The
+                # row abstains (``pass: null``), exactly like the unmeasured row
+                # below — it counts as neither pass nor fail.
+                sys.stderr.write(
+                    f"[verify] {name}: not re-run on a rolled-back tree "
+                    "(MO_VERIFY_RERUN=1 to force)\n")
+                results.append(json.dumps({
+                    "verifier": name, "pass": None, "evidence_path": "",
+                    "reused": "skipped",
+                    "detail": "not run: the workflow skipped this verifier and the run was rolled back",
+                }, separators=(",", ":")))
+                continue
             if dag is not None:
                 sys.stderr.write(
                     f"[verify] {name}: reused DAG result (MO_VERIFY_RERUN=1 to re-run)\n")

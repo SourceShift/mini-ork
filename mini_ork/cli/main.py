@@ -1009,6 +1009,21 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
         except OSError:
             pass
 
+    # ── auto-repair: hand the failure off as soon as execute has decided it ──.
+    # UNCONDITIONAL — a withheld publish sets status='failed' during execute
+    # while run_rc == 0, so the status is already terminal when the hook runs and
+    # gating on rc would silently miss every abstain case. ``maybe_repair`` reads
+    # the run's DB status itself and never raises, so a green run stays quiet.
+    # Handing off here — before the rubric/verify/reflect tail — is safe: the
+    # spawned recover already waits for this lifecycle to exit
+    # (``MO_AUTO_REPAIR_WAIT_PID``), so if this process later dies in verify or
+    # reflect, the repair still happens.
+    try:
+        from mini_ork.recovery import auto_repair
+        auto_repair.maybe_repair(Path(home), run_id, wait_for_exit=True)
+    except Exception:  # noqa: BLE001
+        pass
+
     # ── rubric pre-screen (advisory, native side-channel) ──
     if _should_run_rubric(_run_dir):
         sys.stdout.write("── rubric (advisory pre-screen) ──\n")
@@ -1059,19 +1074,6 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
             retry_notify.notify(Path(home), run_id)
         except Exception:  # noqa: BLE001
             pass
-
-    # ── auto-repair: revive the same run when it failed ──. UNCONDITIONAL — a
-    # withheld publish sets status='failed' while run_rc == 0, so gating on rc
-    # would silently miss every abstain case. ``maybe_repair`` reads the run's DB
-    # status itself and never raises, so a green run stays quiet.
-    # ``wait_for_exit``: this lifecycle still owns the run record — it is closed
-    # in ``_run_lifecycle``'s ``finally``, after reflect — so the spawned
-    # recover must wait for this process to exit before it dispatches.
-    try:
-        from mini_ork.recovery import auto_repair
-        auto_repair.maybe_repair(Path(home), run_id, wait_for_exit=True)
-    except Exception:  # noqa: BLE001
-        pass
 
     if not _gate("verify", artifact):
         return run_rc
