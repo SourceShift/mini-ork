@@ -195,9 +195,10 @@ def test_no_live_file_means_no_file_is_created(tmp_path, monkeypatch):
     assert list(tmp_path.iterdir()) == []
 
 
-def test_byte_cap_stops_appends_rather_than_rewriting(tmp_path):
-    """A tailer holds a byte offset into this file, so the cap must never
-    truncate a prefix — it stops, leaving every already-published byte valid."""
+def test_byte_cap_rotates_rather_than_freezing(tmp_path):
+    """At the byte cap the writer rotates (c2ea4139, issue #12): the live path
+    keeps advancing to the newest record instead of freezing behind a terminal
+    marker. The full rotation contract lives in test_live_stream_rotation.py."""
     live = tmp_path / "run.live.jsonl"
     writer = LiveWriter(str(live), max_bytes=200)
     for i in range(100):
@@ -205,25 +206,24 @@ def test_byte_cap_stops_appends_rather_than_rewriting(tmp_path):
     writer.close()
 
     recs = _read_records(live)
-    assert writer.truncated is True
-    assert len(recs) < 100
-    # Every record but the marker is a real line, and the marker is last.
-    marker = [r for r in recs if r.get("truncated")]
-    assert len(marker) == 1
-    assert recs[-1].get("truncated") is True
-    assert marker[0]["seq"] == len(recs) - 1
+    assert writer.rotated is True
+    assert writer.truncated is False
+    assert any(r.get("line") == "line-99" for r in recs)
+    assert not any(r.get("truncated") for r in recs)
 
 
 def test_byte_cap_bounds_the_file(tmp_path):
-    """Payload respects the budget; the truncation marker is allowed a bounded
-    overshoot so a capped file is never mistaken for a short one."""
+    """Each segment respects the budget (plus a bounded rotation marker), and
+    only one previous segment is kept."""
     live = tmp_path / "run.live.jsonl"
     writer = LiveWriter(str(live), max_bytes=500)
     for _ in range(50):
         writer.write_line("y" * 100 + "\n")
     writer.close()
-    assert writer.truncated is True
+    assert writer.rotated is True
     assert live.stat().st_size <= 500 + 256
+    assert (tmp_path / "run.live.jsonl.1").stat().st_size <= 500 + 256
+    assert not (tmp_path / "run.live.jsonl.2").exists()
 
 
 def test_max_live_bytes_env_is_read_and_bad_values_fall_back(tmp_path, monkeypatch):
