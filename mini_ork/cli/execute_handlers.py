@@ -1192,22 +1192,44 @@ def _handle_implementer(ctx: NodeDispatch):
         print("dispatcher failed", file=sys.stderr)
         ctx.trace(ctx.node_id, "failure", "implementer", sub_log, "", "error")
         return 1, "error"
-    prompt = (f"{ctx.prepend()}Implement: {ctx.node_desc}{ctx.learned}\n\nPlan:\n"
-              f"{ctx.plan_content}{ctx.artifact_context}{ctx.scope_guard()}\n\n"
-              f"Write your execution summary to: {impl_log}")
     # Revise loop: when the runtime wrote <run_dir>/revise/current.json, the
-    # failed gates' findings are appended so the implementer fixes ONLY those
-    # problems on top of the work already in the tree — never starts over.
+    # failed gates' findings are the ONLY thing the next attempt must act on.
+    # Re-sending the whole first-attempt context (recipe prompt + plan + artifact
+    # context) to fix one finding is a fresh full session for a delta-sized job —
+    # every extra round re-pays for the same background the agent already had.
+    # So a revise round keeps the implementer header + the revision-round heading
+    # (the markers every harness and reader keys on) but drops the first-attempt
+    # background: the agent gets the findings and the working tree it must fix on
+    # top of. MO_REVISE_FULL_CONTEXT=1 restores the old full-context prompt.
+    from mini_ork.context_assembler import cap_block
     revise = _read_revise_feedback(ctx.run_dir_eff or ctx.run_dir)
-    if revise:
-        from mini_ork.context_assembler import cap_block
-
+    if revise and context_env("MO_REVISE_FULL_CONTEXT", "0") != "1":
         feedback = cap_block(
             revise["feedback_text"],
             label=f"revise/round-{revise['round']}.md",
         )
-        prompt += (f"\n\n## Revision round {revise['round']} of {revise['max_rounds']}\n"
-                   f"{feedback}")
+        prompt = (f"{ctx.scope_guard()}\n"
+                  f"Implement: {ctx.node_desc}\n\n"
+                  f"## Revision round {revise['round']} of {revise['max_rounds']}\n"
+                  "A checker reviewed your previous attempt on this task and found the "
+                  "problems below. Fix ONLY these problems, on top of the changes already "
+                  "in the working tree. Do not start over, and do not revert your earlier "
+                  "work.\n\n"
+                  f"{feedback}\n\n"
+                  "Your previous changes are already in the working tree — run `git diff` "
+                  "to see them, and do not re-explore the repository from scratch.\n\n"
+                  f"Write your execution summary to: {impl_log}")
+    else:
+        prompt = (f"{ctx.prepend()}Implement: {ctx.node_desc}{ctx.learned}\n\nPlan:\n"
+                  f"{ctx.plan_content}{ctx.artifact_context}{ctx.scope_guard()}\n\n"
+                  f"Write your execution summary to: {impl_log}")
+        if revise:
+            feedback = cap_block(
+                revise["feedback_text"],
+                label=f"revise/round-{revise['round']}.md",
+            )
+            prompt += (f"\n\n## Revision round {revise['round']} of {revise['max_rounds']}\n"
+                       f"{feedback}")
     os.makedirs(os.path.dirname(impl_log) or ".", exist_ok=True)
     # F4: pin the codex/gemini edit surface to the TARGET repo (kickoff's git
     # toplevel), not os.getcwd(). Without this the implementer diff/writes land
