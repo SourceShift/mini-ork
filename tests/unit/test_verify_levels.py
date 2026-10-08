@@ -535,7 +535,14 @@ def test_real_prered_knob_on(tmp_path, monkeypatch):
     assert rc == 0
 
     payload = L.read_verifier_payload(str(rd / "verifier_test.json"), "test")
-    assert payload["pass"] is True
+    # A red base no longer blanket-passes (the old BASE_RC != 0 rule). Here the
+    # candidate strictly improves (mod.py's tests now pass) with no regression,
+    # but the suite as a whole is still red, so the verifier ABSTAINS: pass=False.
+    # Only MO_TEST_CERTIFY_ON_IMPROVEMENT=1 certifies a strict red-base
+    # improvement — that is the "current contract" this test pins.
+    assert payload["pass"] is False
+    assert payload["red_base_unverified"] is True
+    assert payload["status"] == "unverified"
     assert payload["post_rc"] == 1
     assert payload["base_rc"] == "1"
 
@@ -543,6 +550,7 @@ def test_real_prered_knob_on(tmp_path, monkeypatch):
     assert verdict["levels"]["executes"] == PROVEN
     assert verdict["levels"]["target"] == UNVERIFIED
     assert verdict["levels"]["preserve"] == UNVERIFIED
+    assert verdict["levels_decision"] == "abstain"
 
     assert _git_text(repo, "rev-parse", "HEAD") == head_before
     assert _status(db, "r12") == "failed"
