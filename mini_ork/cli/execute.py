@@ -701,6 +701,13 @@ def _maybe_triage_failed_run(db, run_id, home, root) -> None:
     """
     if not run_id or context_env("MO_FAILURE_TRIAGE", "") != "1":
         return
+    # Single-owner rule for the terminal-failure trigger: when the in-run
+    # auto-repair loop owns the failure (MO_AUTO_REPAIR=1), it calls triage
+    # itself on give-up, so this hook stands down — two owners would promote a
+    # duplicate fix epic for one failure. Opt-in: unset/0 keeps today's
+    # behavior (my triage fires), so nothing changes until auto-repair ships.
+    if context_env("MO_AUTO_REPAIR", "0") == "1":
+        return
     try:
         from mini_ork.triage.failures import triage_run
 
