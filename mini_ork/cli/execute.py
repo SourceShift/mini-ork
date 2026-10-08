@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import contextlib
 import concurrent.futures
+import glob
 import hashlib
 import io
 import json
@@ -3040,6 +3041,56 @@ def _tail_lines(path: str, count: int) -> list[str]:
         return []
 
 
+# A line that reads like a real failure: a compiler diagnostic (rustc/tsc
+# ``error[E0xxx]``, ``--> file:line``), a test-runner verdict (``FAILED``), or a
+# Python traceback / assertion. Used to pull the SUBSTANCE out of a verifier log
+# for a revise round — the JSON verdict line alone ("post-patch failing; see
+# log") leaves the implementer fixing blind (issue #13).
+_ERROR_LINE_RE = re.compile(
+    r"^\s*(?:error|assert|traceback)\b|-->|\bFAILED\b|\w*Error\b", re.IGNORECASE)
+
+
+def _error_lines(path: str, max_lines: int = 40, max_bytes: int = 6000) -> list[str]:
+    """Error-bearing lines from a verifier log, capped so the round keeps issue
+    #9b's budget — findings, not the whole attempt."""
+    out: list[str] = []
+    used = 0
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if not _ERROR_LINE_RE.search(line):
+                    continue
+                stripped = line.rstrip("\n")
+                used += len(stripped) + 1
+                if used > max_bytes:
+                    break
+                out.append(stripped)
+                if len(out) >= max_lines:
+                    break
+    except OSError:
+        return []
+    return out
+
+
+def _verifier_log_candidates(run_dir: str, stem: str) -> list[str]:
+    """Existing verifier-log paths for *stem*, in preference order.
+
+    Three naming conventions coexist in run dirs: ``verifier_<stem>.log`` (the
+    code-fix verifiers, ``recipes/code-fix/verifiers/test.py``), the older
+    ``verifier-<stem>.log`` (hyphen, some workflow runs), and
+    ``evidence/<stem>.log`` written by verifier-ref nodes. A newest-first
+    ``evidence/<stem>-*.log`` glob follows for per-run evidence copies. Only
+    paths that exist are returned."""
+    out = [os.path.join(run_dir, f"verifier_{stem}.log"),
+           os.path.join(run_dir, f"verifier-{stem}.log"),
+           os.path.join(run_dir, f"evidence/{stem}.log")]
+    ev_dir = os.path.join(run_dir, "evidence")
+    if os.path.isdir(ev_dir):
+        out.extend(sorted(glob.glob(os.path.join(ev_dir, f"{stem}-*.log")),
+                          key=os.path.getmtime, reverse=True))
+    return [p for p in out if os.path.isfile(p)]
+
+
 def _revise_failure_section(run_dir: str, field, finish_reason: str) -> str:
     """One per-source section of a revise feedback file."""
     node_id, node_type = field[0], field[1]
@@ -3076,13 +3127,26 @@ def _revise_failure_section(run_dir: str, field, finish_reason: str) -> str:
             lines.append(f"error summary: {summary}")
         else:
             lines.append("(no verifier evidence produced)")
-        # Best-effort tail of the human-readable log, if one exists.
-        for candidate in (f"verifier-{stem}.log", f"evidence/{stem}.log"):
-            tail = _tail_lines(os.path.join(run_dir, candidate), 80)
-            if tail:
-                lines.append(f"evidence tail ({candidate}):")
-                lines.extend(line.rstrip("\n") for line in tail)
+        # The verifier's OWN error lines — the substance a reviewer/implementer
+        # needs. A round file carrying only the JSON verdict ("post-patch
+        # failing; see log") makes the next attempt fix blind (issue #13), so
+        # pull the real diagnostics from whichever log convention this run used.
+        candidates = _verifier_log_candidates(run_dir, stem)
+        for candidate in candidates:
+            errors = _error_lines(candidate)
+            if errors:
+                lines.append(f"verifier errors ({os.path.basename(candidate)}):")
+                lines.extend(errors)
                 break
+        else:
+            # No error-looking line: fall back to a bounded tail so a
+            # non-error diagnostic (e.g. a summary block) is still visible.
+            for candidate in candidates:
+                tail = _tail_lines(candidate, 40)
+                if tail:
+                    lines.append(f"evidence tail ({os.path.basename(candidate)}):")
+                    lines.extend(line.rstrip("\n") for line in tail)
+                    break
     elif node_type == "reviewer":
         review_file = os.path.join(run_dir, f"review-{node_id}.json")
         body = ""
