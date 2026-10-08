@@ -393,3 +393,24 @@ def test_writer_a_flag_off_writes_nothing(tmp_path, monkeypatch, db) -> None:
     assert (rc, fr) == (0, "done")
     assert not (rd / "evidence-ledger.jsonl").exists()
 
+
+def test_tree_hash_seeds_from_the_real_index_and_keeps_force_added_files(tmp_path):
+    # From an EMPTY temp index `add -A` re-hashes every file (>30 s on the
+    # researcher repo, a timeout) and drops tracked-but-ignored files. Seeded
+    # from a copy of the real index, a clean tree hashes to exactly HEAD^{tree}.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for args in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+    (repo / ".gitignore").write_text("*.log\n")
+    (repo / "kept.log").write_text("force-added\n")
+    (repo / "a.py").write_text("x = 1\n")
+    subprocess.run(["git", "-C", str(repo), "add", ".gitignore", "a.py"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "add", "-f", "kept.log"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True, capture_output=True)
+    index_before = (repo / ".git" / "index").read_bytes()
+
+    head_tree = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"],
+                               check=True, capture_output=True, text=True).stdout.strip()
+    assert el.tree_hash(str(repo)) == head_tree
+    assert (repo / ".git" / "index").read_bytes() == index_before

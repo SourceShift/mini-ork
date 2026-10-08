@@ -90,6 +90,17 @@ def tree_hash(target_repo: str, *, timeout: float = DEFAULT_GIT_TIMEOUT_S) -> st
         env = dict(os.environ)
         env["GIT_INDEX_FILE"] = tmp_index
         try:
+            # Seed it with a COPY of the real index: its stat cache lets `add -A`
+            # re-hash only changed files. From an empty index every file is
+            # re-hashed, which took >30 s on the researcher repo and timed out.
+            # It also keeps force-added tracked files a fresh index would drop.
+            real = subprocess.run(["git", "-C", target_repo, "rev-parse", "--git-path", "index"],
+                                  timeout=timeout, capture_output=True, text=True)
+            real_index = real.stdout.strip() if real.returncode == 0 else ""
+            if real_index and not os.path.isabs(real_index):
+                real_index = os.path.join(target_repo, real_index)
+            if real_index and os.path.isfile(real_index):
+                shutil.copyfile(real_index, tmp_index)
             subprocess.run(["git", "-C", target_repo, "add", "-A"], env=env,
                            timeout=timeout, check=True,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
