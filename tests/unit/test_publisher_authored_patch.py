@@ -587,3 +587,59 @@ def test_shared_index_only_refreshes_the_published_paths(tmp_path, repo):
     subprocess.run(["git", "-C", str(repo), "-c", "user.name=p", "-c", "user.email=p@x",
                     "commit", "-q", "-m", "peer"], check=True, capture_output=True)
     assert "line2-run" in git_out("show", "HEAD:a.py")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# scope entries as kickoffs write them; an abstain is not "published"
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_scope_matches_paths_directories_and_bare_file_names():
+    from mini_ork.cli.publisher_authored_patch import _in_scope
+
+    rel = "crates/mini_ork_ui/src/page.rs"
+    assert _in_scope(rel, [])
+    assert _in_scope(rel, [rel])
+    assert _in_scope(rel, ["crates/mini_ork_ui/src/"])
+    assert _in_scope(rel, ["crates/mini_ork_ui"])
+    assert _in_scope(rel, ["page.rs"])
+    assert _in_scope(rel, ["src/page.rs"])
+    assert not _in_scope(rel, ["flow.rs"])
+    assert not _in_scope(rel, ["age.rs"])  # a segment match, not a substring
+    assert not _in_scope("README.md", ["page.rs", "crates/mini_ork_ui/src/"])
+
+
+def test_bare_file_name_scope_admits_the_nested_file(tmp_path, repo):
+    # Live: a kickoff listed `page.rs` under "Files in scope (under
+    # `crates/mini_ork_ui/src/`)"; scope_allow held the bare name, so every
+    # in-repo edit was filtered out and the publish abstained.
+    nested = repo / "pkg" / "src"
+    nested.mkdir(parents=True)
+    (nested / "page.rs").write_text(BASE_A)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "nested")
+    base = _head(repo)
+    run_dir = _make_run_dir(
+        tmp_path, repo, base, scope=["page.rs"],
+        edits=[("Edit", {"file_path": str(nested / "page.rs"),
+                         "old_string": "line2\n", "new_string": "line2-run\n"})],
+    )
+    (nested / "page.rs").write_text(BASE_A.replace("line2", "line2-run"))
+
+    authored = resolve_authored_patch(str(run_dir))
+    assert isinstance(authored, AuthoredPatch), authored
+    assert "pkg/src/page.rs" in authored.patch_text
+
+
+def test_an_abstained_in_place_commit_is_recorded(tmp_path, repo):
+    from mini_ork.cli import publisher
+
+    base = _head(repo)
+    run_dir = _make_run_dir(tmp_path, repo, base, scope=["a.py"])
+    (repo / "a.py").write_text(BASE_A.replace("line2", "line2-peer"))
+    committed = publisher._publisher_try_commit_files(
+        "", str(repo), str(run_dir), "", "approve", "code-fix", "implementer", "r-1")
+    assert committed is False
+    record = json.loads((run_dir / "publish-abstain.json").read_text())
+    assert record["reason"].startswith("publish-")
+    assert _head(repo) == base

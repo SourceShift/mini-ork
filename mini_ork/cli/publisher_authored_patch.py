@@ -177,6 +177,34 @@ def _scope(run_dir: str) -> list[str]:
         return []
 
 
+def _in_scope(rel: str, scope: list[str]) -> bool:
+    """Whether repo-relative ``rel`` is inside the declared ``scope``.
+
+    ``scope == []`` (nothing declared) admits everything. Kickoffs name files
+    three ways, and all three count:
+
+    * the repo-relative path (``crates/mini_ork_ui/src/page.rs``);
+    * a directory (``crates/mini_ork_ui/src/``): every path under it;
+    * a bare file name listed under a directory heading (``page.rs`` in
+      "Files in scope (under `crates/mini_ork_ui/src/`)"): matched by its
+      trailing path segments, so ``page.rs`` admits ``…/src/page.rs`` and
+      ``src/page.rs`` admits ``…/ui/src/page.rs``.
+    """
+    if not scope:
+        return True
+    for entry in scope:
+        entry = entry.strip().lstrip("./")
+        if not entry:
+            continue
+        if rel == entry:
+            return True
+        if rel.startswith(entry.rstrip("/") + "/"):
+            return True
+        if rel.endswith("/" + entry):
+            return True
+    return False
+
+
 def _under(path: str, real_dir: str) -> bool:
     """True when ``path`` resolves to ``real_dir`` itself or a child of it."""
     if not real_dir:
@@ -261,7 +289,7 @@ def _filter_patch_scope(patch_text: str, scope: list[str]) -> str:
     kept = []
     for section in _patch_sections(patch_text):
         paths = [p for p in (_section_path(section),) if p]
-        if paths and all(p in scope for p in paths):
+        if paths and all(_in_scope(p, scope) for p in paths):
             kept.append(section.rstrip("\n"))
     return "\n".join(kept) + "\n" if kept else ""
 
@@ -526,7 +554,7 @@ def _collect_edits(path: str, real_repo: str, scope: list[str], run_real: str = 
                 continue
             if run_real and _under(os.path.join(real_repo, rel), run_real):
                 continue
-            if scope and rel not in scope:
+            if not _in_scope(rel, scope):
                 continue
             edits.append((rel, name, inp))
     return edits
@@ -861,7 +889,7 @@ def _resolve_from_declared_files(run_dir: str, repo: str, scope: list[str], base
         rel = _repo_rel(raw, real_repo)
         if rel is None:
             continue  # outside the target repo — never committed
-        if scope and rel not in scope:
+        if not _in_scope(rel, scope):
             continue
         try:
             files[rel] = _read_text(os.path.join(real_repo, rel))

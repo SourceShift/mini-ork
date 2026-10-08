@@ -77,6 +77,25 @@ def _envsubst(s):
 
 
 
+_PUBLISH_ABSTAIN_FILE = "publish-abstain.json"
+
+
+def _record_publish_abstain(run_dir, reason, detail):
+    """``publish-abstain.json``: the approved change was NOT committed, and why.
+
+    The caller reads it to keep the run's status honest (``failed``, not
+    ``published``) — a run whose authored patch could not be attributed or no
+    longer applies has delivered nothing.
+    """
+    if not run_dir:
+        return
+    try:
+        with open(os.path.join(run_dir, _PUBLISH_ABSTAIN_FILE), "w", encoding="utf-8") as fh:
+            json.dump({"reason": reason, "detail": detail}, fh, indent=1)
+    except OSError:
+        pass
+
+
 def _publisher_try_commit_files(root, target_repo, run_dir, review_file, verdict_env,
                                 recipe, node_desc, run_id):
     """Commit the run's ACCEPTED, AUTHORED patch in place on reviewer APPROVE.
@@ -140,6 +159,7 @@ def _publisher_try_commit_files(root, target_repo, run_dir, review_file, verdict
     authored = _pap.resolve_authored_patch(run_dir, repo=target_repo)
     if isinstance(authored, _pap.Abstain):
         log(f"  [skip-publish] abstain {authored.reason}: {authored.detail}")
+        _record_publish_abstain(run_dir, authored.reason, authored.detail)
         return False
     if authored.source.startswith("declared-files"):
         # No authorship evidence at all (the M1 empty-outputs in-place path): the
@@ -159,6 +179,7 @@ def _publisher_try_commit_files(root, target_repo, run_dir, review_file, verdict
     landed = _pap.land_patch(target_repo, authored.patch_text, "", message=msg)
     if isinstance(landed, _pap.Abstain):
         log(f"  [skip-publish] abstain {landed.reason}: {landed.detail}")
+        _record_publish_abstain(run_dir, landed.reason, landed.detail)
         return False
     # Keep the `[publish] committed N file(s): <sha>` shape: run pages and the
     # flow map parse it (ide_pages/run_flow.py `_PUBLISH_RE`).
@@ -348,9 +369,20 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
             except Exception:
                 target_repo = root or "."
         print("  [warn] publisher: artifact_contract.yaml has no outputs[] — skipping publish", file=sys.stderr)
+        abstain_path = os.path.join(run_dir, _PUBLISH_ABSTAIN_FILE) if run_dir else ""
+        if abstain_path and os.path.isfile(abstain_path):
+            os.remove(abstain_path)  # a stale record from an earlier attempt
         _publisher_try_commit_files(root, target_repo, run_dir, review_file, verdict_env,
                                     recipe or "code-fix", os.environ.get("MINI_ORK_NODE_DESC", "implementer"),
                                     run_id or "local")
+        if abstain_path and os.path.isfile(abstain_path):
+            # The approved change could not be committed as the run's own patch:
+            # nothing was delivered, so the run is not "published". Exit 0 so no
+            # rollback discards the work left in the tree.
+            print("  [ABSTAIN] publisher: the authored patch was not committed "
+                  f"(see {_PUBLISH_ABSTAIN_FILE}) — publish withheld")
+            set_status(db, run_id, "failed")
+            return 0, "publish_abstain"
         set_status(db, run_id, "published")
         return 0, "done"
     # ── copy source_artifact → outputs[] + git-commit each.
