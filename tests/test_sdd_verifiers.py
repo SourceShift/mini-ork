@@ -570,6 +570,37 @@ def test_ledger_corrupt_input_is_malformed(project):
     assert code == 2 and out["reason"].startswith("malformed input"), out
 
 
+# ── writer (b): one evidence row per smoke gate × clause (I5) ──────────────
+
+def _ledger_evidence_fixture(tmp_path) -> Project:
+    project = Project(tmp_path)
+    ratified(project)
+    dump(project.run / "smoke-live.json", {"gates": [
+        {"spec_id": "feature-export", "gate_id": "AC1", "acceptance_ref": "AC1", "status": "PASSED"},
+        {"spec_id": "feature-export", "gate_id": "AC2", "acceptance_ref": "AC2", "status": "PASSED"},
+    ]})
+    dump(project.run / "aggregate-verdict.json", {"deliverables": [
+        {"spec_id": "feature-export", "deliverable_id": "D1", "child_run_id": "run-a", "commit": "abc1234"}]})
+    return project
+
+
+def test_ledger_writer_evidence_rows(tmp_path):
+    project = _ledger_evidence_fixture(tmp_path)
+    code, out, _ = project.verify("ledger-writer", MO_EVIDENCE_LEDGER="1")
+    assert code == 0, out
+    evidence = [json.loads(line) for line in (project.run / "evidence-ledger.jsonl").read_text().splitlines()]
+    assert {(r["ac_id"], r["verdict"]) for r in evidence} == {("F1", "pass"), ("C1", "pass")}
+    assert {r["probe"] for r in evidence} == {"AC1", "AC2"}
+    assert all(set(r) == {"ts", "row_id", "ac_id", "probe", "verdict", "tree", "log"} for r in evidence)
+
+
+def test_ledger_writer_no_evidence_rows_when_flag_off(tmp_path):
+    project = _ledger_evidence_fixture(tmp_path)
+    code, out, _ = project.verify("ledger-writer")
+    assert code == 0, out
+    assert not (project.run / "evidence-ledger.jsonl").exists()
+
+
 # ── fail closed: missing inputs and empty sets ───────────────────────────
 
 

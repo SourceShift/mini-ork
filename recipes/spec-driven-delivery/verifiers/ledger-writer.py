@@ -30,6 +30,7 @@ exists. slide-back.json is written atomically. Non-zero gauges still pass.
 """
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import sys
@@ -40,6 +41,7 @@ from _sdd_common import (  # noqa: E402
     Malformed,
     atomic_write_json,
     deliverables_for,
+    engine_root,
     load_cards,
     load_json,
     run_dir,
@@ -71,6 +73,51 @@ def _asks_open(rd: Path) -> tuple[int, list[str]]:
         if not resolved:
             open_asks.append(path.name)
     return len(open_asks), open_asks
+
+
+def _evidence_ledger():
+    """``mini_ork.verify.evidence_ledger``, from the engine root (like
+    :func:`_sdd_common.probe_validity`)."""
+    root = str(engine_root())
+    if sys.path[:1] != [root]:
+        sys.path.insert(0, root)
+    return importlib.import_module("mini_ork.verify.evidence_ledger")
+
+
+def _evidence_rows(rd: Path, smoke: list[dict], cards: dict) -> list[dict]:
+    """Writer (b): one evidence-ledger row per smoke gate × clause (ac_id = clause_id).
+
+    Enrichment only — gated on ``MO_EVIDENCE_LEDGER`` not ``0``, and an
+    exception warns once (captured as ``stderr_tail``) and never fails the node.
+    """
+    try:
+        el = _evidence_ledger()
+    except Exception as exc:  # noqa: BLE001 — a broken engine must not fail this verifier
+        print(f"  [warn] evidence ledger unavailable: {exc}", file=sys.stderr)
+        return []
+    if el.mode() == "off":
+        return []
+    tree = el.tree_hash(os.getcwd())
+    log = str(rd / "smoke-live.json")
+    out, seen = [], set()
+    for gate in smoke:
+        ref = gate.get("acceptance_ref")
+        card = cards.get(gate.get("spec_id"))
+        acc = next((a for a in (card.get("acceptance") or []) if a["id"] == ref), None) if card else None
+        clause_ids = list(acc["clause_refs"]) if acc and acc.get("clause_refs") else [None]
+        for clause_id in clause_ids:
+            key = (gate.get("gate_id") or ref, clause_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            ac_id = clause_id or (gate.get("gate_id") or ref)
+            row = el.append_row(str(rd), ac_id=str(ac_id),
+                                probe=str(gate.get("gate_id") or ref),
+                                verdict="pass" if gate.get("status") == "PASSED" else "fail",
+                                log=log, tree=tree)
+            if row:
+                out.append(row)
+    return out
 
 
 def body():
@@ -125,6 +172,8 @@ def body():
         fh.write("".join(json.dumps(r, sort_keys=True) + "\n" for r in rows))
         fh.flush()
         os.fsync(fh.fileno())
+
+    _evidence_rows(rd, smoke, cards)
 
     def distinct(verdict):
         return len({(r["spec_id"], r["gate_id"]) for r in rows if r["verdict"] == verdict})

@@ -1558,6 +1558,29 @@ def _verifier_not_executed(ctx: NodeDispatch, why: str):
     return 1, "error"
 
 
+def _write_evidence_ledger_row(ctx: NodeDispatch, script: str, ev: str, rc: int, vstem: str) -> None:
+    """Writer (a): one evidence-ledger row per verifier run (enrichment only).
+
+    Only when ``MO_EVIDENCE_LEDGER`` is not ``0``. ``ac_id`` is the verifier
+    JSON's ``ac_id`` when present, else ``verifier:<stem>``; ``verdict`` is
+    ``pass`` iff the verifier exited 0. A write failure warns once and never
+    fails the node — the ledger is a record, not a gate at write time.
+    """
+    from mini_ork.verify import evidence_ledger as _el  # noqa: PLC0415
+
+    if _el.mode() == "off":
+        return
+    try:
+        roots = load_run_roots(ctx.run_dir_eff or ctx.run_dir)
+        target = (roots.target if roots else "") or context_env("MO_TARGET_CWD", "")
+        tree = _el.tree_hash(target) if target else None
+        ac_id = _el.verifier_ac_id(ev) or f"verifier:{vstem}"
+        _el.append_row(ctx.run_dir_eff or ctx.run_dir, ac_id=ac_id, probe=script,
+                       verdict="pass" if rc == 0 else "fail", log=ev, tree=tree)
+    except Exception as exc:  # noqa: BLE001 — enrichment must never fail the node
+        print(f"  [warn] evidence-ledger write skipped: {exc}", file=sys.stderr)
+
+
 def _handle_verifier(ctx: NodeDispatch):
     post_impl = not _verifier_runs_before_implementer(ctx.workflow, ctx.node_id)
 
@@ -1619,11 +1642,12 @@ def _handle_verifier(ctx: NodeDispatch):
             script, ev, plan_path=ctx.plan_path, artifact_path=artifact,
             run_dir=ctx.run_dir_eff or ctx.run_dir,
         )
+        vstem = ctx.verifier_ref[len("verifiers/"):] if ctx.verifier_ref.startswith("verifiers/") else ctx.verifier_ref
+        vstem = vstem[:-3] if vstem.endswith((".sh", ".py")) else vstem
+        _write_evidence_ledger_row(ctx, script, ev, rc, vstem)
         # F2-B: persist evidence to verifier_<stem>.json (bash :2886-2888) so the
         # reviewer input assembly can read the typecheck/test verdicts. Before the
         # rc return so failures are visible too (a missing verifier is real signal).
-        vstem = ctx.verifier_ref[len("verifiers/"):] if ctx.verifier_ref.startswith("verifiers/") else ctx.verifier_ref
-        vstem = vstem[:-3] if vstem.endswith((".sh", ".py")) else vstem
         persist_dir = context_env("MINI_ORK_RUN_DIR", ctx.run_dir)
         if persist_dir and os.path.isfile(ev) and os.path.getsize(ev) > 0:
             try:

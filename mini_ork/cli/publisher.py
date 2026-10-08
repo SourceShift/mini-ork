@@ -283,6 +283,28 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
             return 1, "verdict_fail"
         else:
             print("  [ok] probe-validity: pre-publish pass")
+    # ── evidence ledger (I5, MO_EVIDENCE_LEDGER=1|shadow, default OFF): an
+    # approval is backed only by ledger rows whose tree equals the tree being
+    # published. `shadow` evaluates and records what it would block, but never
+    # blocks and prints nothing. `0` leaves the publisher byte-identical.
+    _el_mode = context_env("MO_EVIDENCE_LEDGER", "0")
+    if _el_mode in ("1", "shadow"):
+        from mini_ork.verify import evidence_ledger as _el  # noqa: PLC0415
+        from mini_ork.verify import probe_validity as _pv  # noqa: PLC0415
+        roots = load_run_roots(run_dir) if run_dir else None
+        target = (roots.target if roots else "") or context_env("MO_TARGET_CWD", "")
+        shadow = _el_mode == "shadow"
+        ok, reason, _report = _el.publish_gate(run_dir=run_dir, target_repo=target,
+                                               gate_mode="shadow" if shadow else "enforce")
+        if shadow:
+            if not ok:
+                _pv.record_note(db, run_id, f"[shadow] evidence ledger would block: {reason}")
+        elif not ok:
+            print(f"  [BLOCK] evidence-ledger: {reason} — publish refused (evidence-ledger-gate.json)")
+            _pv.record_note(db, run_id, f"evidence_ledger: {reason}")
+            return 1, "verdict_fail"
+        else:
+            print("  [ok] evidence-ledger: pre-publish pass")
     blocked = _kickoff_guard(run_dir, db, run_id)
     if blocked:
         return blocked
