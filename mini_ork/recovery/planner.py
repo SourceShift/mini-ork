@@ -1082,12 +1082,48 @@ def cli_main(argv: list[str] | None = None, *, execute_fn=None) -> int:
     rc = main(argv, handoff=handoff)
     if rc != 0 or not handoff:
         return rc
-    apply_env_overrides({
+    # ── Recover-task-class fix (kickoff recover-task-class §1): publish the
+    # run's task class so a recovered execute does not silently fall back to
+    # "generic" and fail the wrong publish gates (the run's plan.json has no
+    # task_class; the normal run flow sets the env, this one did not). Order:
+    # the ledger row (what actually ran) → run_profile.json → plan.json →
+    # leave unset. An explicitly set non-empty MINI_ORK_TASK_CLASS is never
+    # overridden. Read-only and fail-soft; a read error just skips a source.
+    _overrides = {
         "MINI_ORK_RUN_ID": handoff["run_id"],
         "MINI_ORK_RUN_DIR": handoff["run_dir"],
         "MINI_ORK_WORKFLOW": handoff["workflow"],
         "MINI_ORK_RECIPE": handoff["recipe"] or None,
-    })
+    }
+    if not context_env("MINI_ORK_TASK_CLASS").strip():
+        _task_class = ""
+        try:
+            import sqlite3 as _sqlite3  # noqa: PLC0415 — scoped to cli_main
+
+            _con = _sqlite3.connect(f"file:{handoff['db_path']}?mode=ro", uri=True)
+            try:
+                _row = _con.execute(
+                    "SELECT task_class FROM task_runs WHERE id = ?",
+                    (handoff["run_id"],)).fetchone()
+            finally:
+                _con.close()
+            _task_class = str(_row[0] or "").strip() if _row else ""
+        except _sqlite3.Error:
+            _task_class = ""
+        if not _task_class:
+            for _name in ("run_profile.json", "plan.json"):
+                try:
+                    with open(os.path.join(handoff["run_dir"], _name),
+                              encoding="utf-8") as _fh:
+                        _task_class = str(
+                            (json.load(_fh) or {}).get("task_class") or "").strip()
+                except (OSError, ValueError, TypeError):
+                    _task_class = ""
+                if _task_class:
+                    break
+        if _task_class:
+            _overrides["MINI_ORK_TASK_CLASS"] = _task_class
+    apply_env_overrides(_overrides)
     # ── Recover revival fix 1 (kickoff recover-revival-fixes §1): close the
     # dead attempt before dispatching. The original process died mid-node and
     # left a ``node_start`` with no ``node_end``; the stale-heartbeat watchdog

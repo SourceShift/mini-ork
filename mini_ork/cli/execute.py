@@ -724,6 +724,61 @@ def _maybe_triage_failed_run(db, run_id, home, root) -> None:
         )
 
 
+def _resolve_task_class(plan_path: str, run_id: str, db: str) -> str:
+    """The run's task class, resolved defensively for every entry point.
+
+    Order (kickoff recover-task-class §2): ``plan.json`` → the
+    ``MINI_ORK_TASK_CLASS`` env → ``<run_dir>/run_profile.json`` → the
+    ``task_runs`` row → ``"generic"``. The run dir is the plan's directory.
+
+    Read-only and fail-soft: an unreadable or empty source is skipped, never
+    raised. Extracted from ``main`` so the chain is unit-testable.
+    """
+    # 1. plan.json — the plan's own class wins outright when it names one.
+    if plan_path:
+        try:
+            with open(plan_path, encoding="utf-8") as handle:
+                plan_class = str((json.load(handle) or {}).get("task_class") or "").strip()
+        except (OSError, ValueError, TypeError):
+            plan_class = ""
+        if plan_class:
+            return plan_class
+
+    # 2. the run-identity env (an explicit launcher/operator value).
+    env_class = context_env("MINI_ORK_TASK_CLASS").strip()
+    if env_class:
+        return env_class
+
+    # 3. run_profile.json — the profiler's verdict, sitting next to the plan.
+    if plan_path:
+        try:
+            with open(os.path.join(os.path.dirname(plan_path), "run_profile.json"),
+                      encoding="utf-8") as handle:
+                profile_class = str((json.load(handle) or {}).get("task_class") or "").strip()
+        except (OSError, ValueError, TypeError):
+            profile_class = ""
+        if profile_class:
+            return profile_class
+
+    # 4. the ledger row — what actually ran — when the DB and run id are known.
+    if db and run_id:
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            try:
+                row = con.execute(
+                    "SELECT task_class FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+            finally:
+                con.close()
+            row_class = str(row[0] or "").strip() if row else ""
+        except sqlite3.Error:
+            row_class = ""
+        if row_class:
+            return row_class
+
+    # 5. the documented default (matches RunContext.task_class_or_default).
+    return "generic"
+
+
 def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     root = root or os.environ.get("MINI_ORK_ROOT") or os.getcwd()
@@ -824,18 +879,15 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     # dispatch_fn is the LLM seam (task_class, node_type, prompt) -> (rc, text);
     # defaults to the ported llm_dispatch. dispatch_node wires the ported helpers
     # (apply_impl_output, charge_node_cost, set_status, verdict gate) around it.
-    task_class = ""
-    if plan_path:
-        try:
-            with open(plan_path, encoding="utf-8") as handle:
-                task_class = str((json.load(handle) or {}).get("task_class") or "")
-        except (OSError, ValueError, TypeError):
-            task_class = ""
+    # Task-class resolution (kickoff recover-task-class §2): plan.json → env →
+    # run_profile.json → task_runs row → "generic". A recovered execute used to
+    # run as "generic" (no plan class, no env), so the publisher evaluated the
+    # wrong gate set; the run dir's profile / ledger row now supply the class.
     ctx = RunContext.from_env()
-    task_class = task_class or ctx.task_class_or_default()
     db = ctx.db_or_default()
     run_id = ctx.run_id
     recipe = ctx.recipe
+    task_class = _resolve_task_class(plan_path, run_id, db)
     # Recipe-local register.py bootstrap in the PARENT (serial/in-process
     # dispatch + compile_workflow above). The process-isolated path also
     # bootstraps inside each pool child (_isolated_dispatch_worker) — a spawned
