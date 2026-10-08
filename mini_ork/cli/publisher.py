@@ -79,13 +79,20 @@ def _envsubst(s):
 
 def _publisher_try_commit_files(root, target_repo, run_dir, review_file, verdict_env,
                                 recipe, node_desc, run_id):
-    """Port of bash `_publisher_try_commit_files` (embedded python, :824-949). Commit
-    the implementer's in-place edits on reviewer APPROVE. Strict-child path validation
-    (the OSS-leak guard — only `git add --` files proven inside the target repo, never
-    `-A`). Returns True on commit, False on skip."""
+    """Commit the run's ACCEPTED, AUTHORED patch in place on reviewer APPROVE.
+
+    The commit carries only the change the run itself authored — a recovery carry
+    patch, a fresh run's implementer Write/Edit calls replayed from its session
+    transcript, or (text/codex lanes) the implementer's own emitted diff
+    (:mod:`mini_ork.cli.publisher_authored_patch`). It is landed through a
+    PRIVATE index parented on the CURRENT HEAD, so the shared `.git/index` is never
+    staged into and a peer's in-window edit in the same file is never swept in (the
+    old whole-file `git add` did exactly that: run `ide-orca-b2b-story-20261008113340`
+    committed a peer's `ThrottledSpinExt` work). Hunks the authored patch does not
+    carry are listed in `publish-foreign-hunks.txt` and left untouched. Returns True
+    on commit, False on skip/abstain."""
     def log(msg):
         print(msg, file=sys.stderr, flush=True)
-    summary_path = os.path.join(run_dir, "implementer-summary.json") if run_dir else ""
     verdict = ""
     candidates = []
     if run_dir:
@@ -126,48 +133,39 @@ def _publisher_try_commit_files(root, target_repo, run_dir, review_file, verdict
         disp = verdict or (verdict_env or "").strip() or "<none>"
         log(f"  [skip-publish] reviewer verdict (resolved: '{disp}') is not APPROVE — no commit")
         return False
-    files = []
-    if summary_path and os.path.isfile(summary_path):
-        try:
-            data = json.load(open(summary_path, encoding="utf-8"))
-            if isinstance(data, dict) and isinstance(data.get("files_changed"), list):
-                files = [e for e in data["files_changed"] if isinstance(e, str) and e]
-        except Exception:
-            pass
-    if not files:
-        log(f"  [skip-publish] no files_changed in {summary_path or '<unset>'} — no commit")
-        return False
     if not target_repo:
         log("  [skip-publish] no target_repo resolved (MO_TARGET_CWD empty and git toplevel failed)")
         return False
-    real_root = os.path.realpath(target_repo)
-    valid = []
-    for raw in files:
-        ap = raw if os.path.isabs(raw) else os.path.abspath(raw)
-        if not os.path.exists(ap):
-            log(f"  [reject-publish] file does not exist: {raw}")
-            continue
-        real = os.path.realpath(ap)
-        if real != real_root and not real.startswith(real_root + os.sep):
-            log(f"  [reject-publish] file escapes target repo toplevel: {raw} -> {real} not under {real_root}")
-            continue
-        valid.append(real)
-    if not valid:
-        log(f"  [skip-publish] no valid files inside target_repo={real_root} — no commit")
+    from mini_ork.cli import publisher_authored_patch as _pap  # noqa: PLC0415
+    authored = _pap.resolve_authored_patch(run_dir, repo=target_repo)
+    if isinstance(authored, _pap.Abstain):
+        log(f"  [skip-publish] abstain {authored.reason}: {authored.detail}")
         return False
-    try:
-        subprocess.run(["git", "add", "--", *valid], cwd=target_repo, check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        msg = f"mini-ork({recipe}): {node_desc} [run {run_id}]"
-        subprocess.run(["git", "-c", "user.email=mini-ork@local", "-c", "user.name=mini-ork",
-                        "commit", "-q", "-m", msg], cwd=target_repo, check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        sha = subprocess.check_output(["git", "-C", target_repo, "rev-parse", "HEAD"]).decode("utf-8", "replace").strip()
-        log(f"  [publish] committed {len(valid)} file(s): {sha}")
-        return True
-    except subprocess.CalledProcessError as e:
-        log(f"  [skip-publish] git add/commit failed in {target_repo}: rc={e.returncode}")
+    if authored.source.startswith("declared-files"):
+        # No authorship evidence at all (the M1 empty-outputs in-place path): the
+        # patch is the run's declared files taken whole, so a peer's in-window hunk
+        # inside one of them cannot be separated. Say so — do not let it look like
+        # an authored patch.
+        log("  [warn] publisher: no authored source (carry patch, transcript replay or "
+            "implementer diff) — committing the run's declared files_changed")
+    # Cross-check (kickoff §3): changed lines in `git diff pre-implementer-ref`
+    # that the authored patch does not carry are a peer's in-window edit. List
+    # them; never commit them, never revert them.
+    foreign = _pap.report_foreign_hunks(target_repo, run_dir, authored.patch_text)
+    if foreign:
+        log(f"  [warn] publisher: {len(foreign)} foreign hunk(s) left uncommitted "
+            f"(publish-foreign-hunks.txt)")
+    msg = f"mini-ork({recipe}): {node_desc} [run {run_id}]"
+    landed = _pap.land_patch(target_repo, authored.patch_text, "", message=msg)
+    if isinstance(landed, _pap.Abstain):
+        log(f"  [skip-publish] abstain {landed.reason}: {landed.detail}")
         return False
+    # Keep the `[publish] committed N file(s): <sha>` shape: run pages and the
+    # flow map parse it (ide_pages/run_flow.py `_PUBLISH_RE`).
+    n_files = len(_pap._paths_in_patch(authored.patch_text))
+    log(f"  [publish] committed {n_files} file(s): {landed} "
+        f"(authored patch: {authored.source})")
+    return True
 
 
 def _kickoff_guard(run_dir, db, run_id):
