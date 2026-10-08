@@ -33,6 +33,7 @@ import os
 import re
 import subprocess
 import sys
+from collections.abc import Iterable, Iterator
 
 DEFAULT_WORKTREES_DIR = "/Volumes/docker-ssd/ps/mini-ork-worktrees"
 DEFAULT_TEST_CMD = "python3 -m pytest -q"
@@ -204,6 +205,229 @@ def list_owners(json_mode: bool) -> None:
         print("(no active claims)")
 
 
+# ── OSS guard: refuse to publish unclaimed paths or confidential material ───
+# `main` is public. Before `merge` rebases this branch's own commits onto
+# origin/main and pushes them, two cheap, deterministic checks run at that one
+# choke point: the branch must stay inside its --owns claims, and its added
+# lines must carry no confidential terms or credential shapes. Both run after
+# the rebase (so `origin/main..HEAD` is exactly the branch's own commits) and
+# before the green gate and `git push` — a refusal pushes nothing.
+#
+# The content check scans EVERY commit's patch plus every commit message, not
+# just the net diff: a secret added in one commit and removed in the next still
+# lands in public history once pushed.
+
+# One private-terms file (one regex per line), untracked and never committed:
+# the names it holds are themselves sensitive, so a refusal names a private
+# match only by its line number in the file. Absent file ⇒ ignored.
+_TERMS_FILE = "oss-guard-terms.txt"
+
+# Generic, OSS-safe terms only. Product/company/person names belong in the
+# private terms file — never in this code, the tests, the docs or the kickoff.
+_CONFIDENTIAL_RE = (
+    r"fundrais|investor|pitch[ -]?deck|venture capital|\bvaluation\b"
+    r"|seed round|term sheet|@gmail\.com"
+)
+
+# Credential shapes. Each alternative is a named group so a refusal can name
+# WHICH shape matched without ever echoing the secret itself.
+_CREDENTIAL_RE = re.compile(
+    r"(?P<openai_key>sk-[A-Za-z0-9_-]{24,})"
+    r"|(?P<github_pat>ghp_[A-Za-z0-9]{30,})"
+    r"|(?P<github_fine_grained_pat>github_pat_[A-Za-z0-9_]{30,})"
+    r"|(?P<aws_access_key>AKIA[0-9A-Z]{16})"
+    r"|(?P<slack_token>xox[bpa]-[A-Za-z0-9-]{10,})"
+    r"|(?P<private_key>-----BEGIN [A-Z ]*PRIVATE KEY)"
+)
+
+# A credential-shaped value that names itself a fixture is not a leak
+# (`sk-test-value-never-shown-…`). Scoped to the matched value, not the line,
+# so `key = "sk-live-…"  # not a test` is still refused.
+_FIXTURE_WORDS = ("test", "fake", "dummy", "example")
+
+# The guard's own definition and tests necessarily spell out the terms and
+# key shapes they refuse; their added lines are not scanned.
+_OSS_SELF = ("scripts/mini_ork_worktree.py", "tests/unit/test_merge_oss_guard.py")
+
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+_FILE_HEADER_RE = re.compile(r"^\+\+\+ b/(.+)$")
+
+
+# Pin the diff format against user/repo config: colour (color.ui=always would
+# prefix every line with an ANSI escape and make the scan fail open), external
+# diff drivers, textconv, noprefix/mnemonic prefixes and rename detection.
+_PLAIN_DIFF = ("--no-color", "--no-ext-diff", "--no-textconv", "--no-renames",
+               "--src-prefix=a/", "--dst-prefix=b/")
+
+
+def _branch_paths(wt: str) -> list[str]:
+    """Paths this branch changes vs origin/main, i.e. its own commits.
+
+    ``--no-renames``: a rename out of an unclaimed path lists that path too.
+    """
+    out = git("-C", wt, "-c", "core.quotepath=off", "diff", "--name-only",
+              "--no-renames", "origin/main...HEAD", capture=True).stdout
+    return [p for p in out.splitlines() if p.strip()]
+
+
+def _added_lines(diff_text: str) -> Iterator[tuple[str, int, str]]:
+    """Yield ``(path, lineno, text)`` for every added line of a patch.
+
+    Same walk as ``mini_ork/review/lenses.py::check_secret_patterns`` (path from
+    the ``+++ b/`` header, new-file line numbers from each ``@@`` hunk), but
+    hunk-aware: inside a hunk every ``+`` line is content, so an added line
+    that itself starts with ``++`` is scanned rather than mistaken for a file
+    header. Anything that is not ``+``/``-``/`` ``/``\\`` ends the hunk. Kept
+    local on purpose — this script is standalone and does not import
+    ``mini_ork``.
+    """
+    path = "?"
+    lineno = 0
+    in_hunk = False
+    for raw in diff_text.split("\n"):
+        if in_hunk:
+            if raw.startswith("+"):
+                yield path, lineno, raw[1:]
+                lineno += 1
+                continue
+            if raw.startswith(" "):
+                lineno += 1
+                continue
+            if raw.startswith(("-", "\\")):
+                continue  # removed lines and "\ No newline" keep the counter
+            in_hunk = False  # fall through: a header, a new hunk, a commit line
+        hunk = _HUNK_RE.match(raw)
+        if hunk:
+            lineno = int(hunk.group(1))
+            in_hunk = True
+            continue
+        header = _FILE_HEADER_RE.match(raw)
+        if header:
+            path = header.group(1)
+
+
+def _message_lines(wt: str) -> Iterator[tuple[str, int, str]]:
+    """Yield ``("commit <sha> message", lineno, text)`` for each branch commit."""
+    out = git("-C", wt, "log", "--format=%h%x01%B%x00", "origin/main..HEAD",
+              capture=True).stdout
+    for record in out.split("\x00"):
+        sha, sep, body = record.strip("\n").partition("\x01")
+        if not sep:
+            continue
+        for i, line in enumerate(body.splitlines(), 1):
+            yield f"commit {sha} message", i, line
+
+
+def _oss_terms_path() -> str:
+    home = os.environ.get("MINI_ORK_HOME") or os.path.join(ROOT, ".mini-ork")
+    return os.path.join(home, _TERMS_FILE)
+
+
+def _confidential_patterns() -> list[tuple[str, str]]:
+    """``(regex, label)`` pairs: the committed generic regex plus private terms.
+
+    A generic match is labelled by its matched text; a private term only as
+    ``private term #<line>``, so the sensitive name never reaches a log.
+    """
+    patterns = [(_CONFIDENTIAL_RE, "")]
+    terms = _oss_terms_path()
+    if os.path.isfile(terms):
+        with open(terms, encoding="utf-8") as f:
+            for n, line in enumerate(f, 1):
+                if line.strip():
+                    patterns.append((line.strip(), f"private term #{n}"))
+    return patterns
+
+
+def _is_fixture_value(value: str) -> bool:
+    low = value.lower()
+    return any(word in low for word in _FIXTURE_WORDS)
+
+
+def _scan(lines: Iterable[tuple[str, int, str]]) -> list[str]:
+    """``path:line matches <term>`` notes for lines that must not ship.
+
+    The offending line is never included — only the location and the matched
+    generic term, a private term's number, or the credential shape's name — so
+    neither a secret nor a private name is echoed.
+    """
+    patterns = _confidential_patterns()
+    found: list[str] = []
+    for path, lineno, line in lines:
+        if path in _OSS_SELF:
+            continue
+        for pat, label in patterns:
+            m = re.search(pat, line, re.IGNORECASE)
+            if m:
+                found.append(f"{path}:{lineno} matches {label or m.group(0)}")
+        for m in _CREDENTIAL_RE.finditer(line):
+            if not _is_fixture_value(m.group(0)):
+                found.append(f"{path}:{lineno} matches {m.lastgroup}")
+    return list(dict.fromkeys(found))
+
+
+def _oss_findings(diff_text: str) -> list[str]:
+    """Findings for the added lines of one patch text."""
+    return _scan(_added_lines(diff_text))
+
+
+def _summarize(findings: list[str], limit: int = 10) -> str:
+    shown = "; ".join(findings[:limit])
+    if len(findings) > limit:
+        shown += f" (+{len(findings) - limit} more)"
+    return shown
+
+
+def _check_claims(slug: str, wt: str) -> None:
+    """A claimed worktree may only merge paths it claimed (or its kickoff)."""
+    claims = [path for rslug, path in _read_ownership() if rslug == slug]
+    if not claims:
+        return  # old worktree, created without --owns: nothing to enforce
+    allowed_kickoff = f"kickoffs/auto/{slug}.md"
+    outside = [
+        p for p in _branch_paths(wt)
+        if normalize_path(p) != allowed_kickoff
+        and not any(paths_overlap(p, claim) for claim in claims)
+    ]
+    if not outside:
+        return
+    if os.environ.get("MO_MERGE_ALLOW_UNCLAIMED") == "1":
+        print(f"[mo-worktree] warn: MO_MERGE_ALLOW_UNCLAIMED=1 — merging "
+              f"{len(outside)} unclaimed path(s): {', '.join(outside)}",
+              file=sys.stderr)
+        return
+    die(f"merge refused: {len(outside)} path(s) outside this worktree's "
+        f"claims: {', '.join(outside)} — add --owns or drop them")
+
+
+def _check_oss_content(wt: str) -> None:
+    """No confidential term or credential shape may reach the public main.
+
+    Every branch commit's own patch is scanned (history, not the net diff),
+    then every commit message.
+    """
+    history = git("-C", wt, "-c", "core.quotepath=off", "log", "-p",
+                  *_PLAIN_DIFF, "--format=commit %H", "origin/main..HEAD",
+                  capture=True).stdout
+    found = _oss_findings(history) + _scan(_message_lines(wt))
+    if not found:
+        return
+    if os.environ.get("MO_MERGE_ALLOW_OSS") == "1":
+        print(f"[mo-worktree] warn: MO_MERGE_ALLOW_OSS=1 — allowing "
+              f"{len(found)} confidential/secret finding(s) into the public "
+              f"main: {_summarize(found)}", file=sys.stderr)
+        return
+    die(f"merge refused: {len(found)} confidential/secret finding(s): "
+        f"{_summarize(found)} — remove it, or set MO_MERGE_ALLOW_OSS=1 only "
+        f"for a reviewed public mention")
+
+
+def _oss_guard(wt: str, slug: str) -> None:
+    """The single choke point: claims first, then content. Fails closed."""
+    _check_claims(slug, wt)
+    _check_oss_content(wt)
+
+
 # ── Concord registration (best-effort, fail-open) ─────────────────────────
 # A worktree is registered with ContextNest as principal agent:wt-<slug>, with
 # its --owns claims as labels, so the per-turn precheck can flag edits inside
@@ -304,6 +528,9 @@ def merge_worktree(args: list[str]) -> None:
     pre_rebase = git("-C", wt, "rev-parse", "HEAD", capture=True).stdout.strip()
     base_before = git("-C", wt, "merge-base", "HEAD", "origin/main", capture=True).stdout.strip()
     git("-C", wt, "rebase", "origin/main")
+    # Fail fast before the (slower) green gate and before anything is pushed:
+    # the branch must stay inside its claims and carry nothing confidential.
+    _oss_guard(wt, slug)
     # Green gate: never push a red branch to main. Override the command per-task
     # with MINI_ORK_TEST_CMD (e.g. a scoped pytest path for a fast, focused gate).
     test_cmd = os.environ.get("MINI_ORK_TEST_CMD", DEFAULT_TEST_CMD)
