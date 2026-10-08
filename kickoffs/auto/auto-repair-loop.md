@@ -153,6 +153,31 @@ changing the exit code. `decide` reads the run's DB status itself. A withheld pu
   `try` before the lease `finally`, or right after it. Use the run id from `handoff["run_id"]`
   and the home from env `MINI_ORK_HOME` (or `<root>/.mini-ork`).
 
+
+### Sequencing with failure triage (agreed with the triage loop's owner)
+
+`mini_ork/triage` (MO_FAILURE_TRIAGE / _PROMOTE, hooked in execute.py's fail branch) escalates a
+failure to a separate framework-edit epic. Auto-repair fixes the SAME run first. To keep one owner
+per trigger, so the same failure is never fixed twice:
+
+- **Marker:** `repair.json` carries `"state"`, one of:
+  - `"repairing"`: an attempt was spawned;
+  - `"gave_up"`: the decision was `human` after at least one attempt, OR the stop rules fired;
+  - `"repaired"`: a later decide() finds the run published/done.
+
+  Write it on every apply.
+- **On give-up:** when `context_env("MO_FAILURE_TRIAGE") == "1"`, call
+  `mini_ork.triage.failures.triage_run(run_id, home=home, db=<db>, root=<root>,
+  promote=context_env("MO_FAILURE_TRIAGE_PROMOTE") == "1")` exactly once. Record
+  `"triaged": true` in `repair.json`. Fail-soft.
+- The triage loop's owner will gate its execute.py hook to skip runs while auto-repair is on, and
+  defer to this give-up call. Do NOT touch execute.py.
+- **Re-dispatch path:** revise/prove rounds go through `mini-ork recover` → the normal executor.
+  Do not build your own agent dispatch. The executor's session-reuse fix (researcher-defects
+  a45032c1, C9b) then applies automatically once merged.
+- **Test:** a give-up with `MO_FAILURE_TRIAGE=1` calls `triage_run` once (stub it). A second
+  give-up decision does not call it again.
+
 ### CLI `mini-ork repair`
 
 - `mini-ork repair <run_id> [--dry-run] [--json]`: decide, print the decision; apply unless
