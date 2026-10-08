@@ -939,7 +939,20 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
             and bool(lane_pins)
             and (not nc.get("alias") or nc.get("alias") in lane_pins)
         )
-        if not lane_ack:
+        # A ``needs_change`` kind in ``retry_hint.NO_CHANGE_KINDS`` (an
+        # ``interrupted`` run, case 1.6) needs no operator change either:
+        # resuming the step IS the fix, so the hint's own command passes
+        # without ``--ack-change`` (kickoff interrupted-resume §2). The module
+        # is a soft import — ``_load_retry_hint`` may have read a bare
+        # ``retry-hint.json`` with the module absent — so read the constant
+        # defensively; a missing module degrades to the old refusal.
+        try:
+            from mini_ork.recovery import retry_hint as _rh
+            no_change_kinds = _rh.NO_CHANGE_KINDS
+        except Exception:  # noqa: BLE001 — absent recovery module: no exemption
+            no_change_kinds = frozenset()
+        no_change_ack = nc.get("kind") in no_change_kinds
+        if not lane_ack and not no_change_ack:
             sys.stderr.write(
                 f"Needs a change before retrying ({nc.get('kind')!r}): "
                 f"{nc.get('summary')}\n{nc.get('detail')}\n"

@@ -543,7 +543,10 @@ def _act_retry(
       * ``--dry-run``         → hint only, never spawns.
       * no hint              → ``ok: false``, "nothing to retry".
       * not retryable & !``--force`` → ``ok: false``, error = summary.
-      * needs_change & !``--ack-change`` → ``ok: false``, error = ack prompt.
+      * needs_change & !``--ack-change`` → ``ok: false``, error = ack prompt —
+        except a ``kind`` in ``retry_hint.NO_CHANGE_KINDS`` (an ``interrupted``
+        run: resuming IS the fix) or a ``lane`` hint, both of which need no
+        ``--ack-change``.
       * otherwise            → detached spawn via the canonical
                                ``acp.commands._spawn`` shape
                                (``sys.executable + bin/mini-ork + …``,
@@ -582,7 +585,8 @@ def _act_retry(
 
     if needs_change is not None and not ack_change and not force \
             and str(hint.get("strategy") or "") != "resume-cost" \
-            and needs_change.get("kind") != "lane":
+            and needs_change.get("kind") != "lane" \
+            and needs_change.get("kind") not in retry_hint.NO_CHANGE_KINDS:
         return {"ok": False, "run_id": run_id, "hint": hint,
                 "error": f"needs a change first: {needs_change.get('summary') or '?'}"}
 

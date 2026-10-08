@@ -423,6 +423,39 @@ def decide(home: Path, run_id: str) -> dict[str, Any]:
                 signature=signature,
             )
 
+    # 3.5 Interrupted mid-node (``needs_change.kind == "interrupted"``, retry
+    # hint case 1.6) → resume the dangling node. Nothing needs changing:
+    # re-running the step IS the fix, so it is a plain ``infra`` resume from the
+    # hint's node. A run a *person* stopped is not auto-resumed: ``board kill``
+    # appends ``"killed-by-user"`` to ``task_runs.notes`` (``web/control.py``
+    # ``_writeback_terminal``). Notes are APPEND-ONLY (``notes = COALESCE(notes
+    # || '; ', '') || ?``) and never reset, so a note written BEFORE the kill
+    # pushes the marker off the start of the column — the test is per note, not
+    # a prefix on the whole string (cf. ``metrics_sdd``).
+    if hint_kind == "interrupted":
+        killed_by_user = False
+        try:
+            from mini_ork.web.db import db_for
+            db = db_for(home)
+            if db.has_table("task_runs"):
+                row = db.row("SELECT notes FROM task_runs WHERE id = ? LIMIT 1", (run_id,))
+                notes = str((row or {}).get("notes") or "")
+                killed_by_user = any(
+                    seg.startswith("killed-by-user") for seg in notes.split("; ")
+                )
+        except Exception:  # noqa: BLE001 — an unreadable notes column: treat as live
+            killed_by_user = False
+        if killed_by_user:
+            return _decision("none", reason="killed by the user — not auto-resumed",
+                             signature=signature)
+        node = str((hint or {}).get("from_node") or failed_node or "") or None
+        return _decision(
+            "infra",
+            from_node=node,
+            reason=f"interrupted during {node or '?'} — resume it",
+            signature=signature,
+        )
+
     # 4. Infra / provider trouble → same node, same lane.
     if _is_infra(home, run_id, hint, nc, failed_node, fail_reason):
         return _decision(

@@ -198,6 +198,19 @@ def _hint(run) -> dict[str, Any] | None:
     return hint if isinstance(hint, dict) else None
 
 
+def _no_change_kinds() -> frozenset[str]:
+    """``retry_hint.NO_CHANGE_KINDS`` — needs_change kinds whose retry needs no
+    operator change (an ``interrupted`` run: re-running the step IS the fix).
+
+    Empty when the recovery module is absent, so the branch simply never fires.
+    """
+    try:
+        from mini_ork.recovery import retry_hint
+    except Exception:  # noqa: BLE001 — a missing recovery module: no exemption
+        return frozenset()
+    return frozenset(getattr(retry_hint, "NO_CHANGE_KINDS", frozenset()))
+
+
 def _review(run) -> dict[str, Any] | None:
     """``review-reviewer.json`` else the first ``review-*.json``."""
     rm = _run_mod()
@@ -476,7 +489,14 @@ def _failure_detail(run, hint: dict[str, Any] | None) -> str:
 
 def _failed_actions(run, hint: dict[str, Any] | None) -> tuple[list[dict[str, Any]], str]:
     """``(actions, revised_note)`` — ``revised_note`` is non-empty when the hint
-    says the change itself must be revised (no retry button is offered)."""
+    says the change itself must be revised (no retry button is offered).
+
+    A retryable hint whose ``needs_change.kind`` is in
+    ``retry_hint.NO_CHANGE_KINDS`` (an ``interrupted`` run) gets a single
+    ``Resume from <node>`` button with no ``--ack-change`` — resuming IS the
+    fix. A ``lane`` kind is satisfied by its ``--lane`` switch; any other
+    ``needs_change`` is a real operator fix (``--ack-change``).
+    """
     rm = _run_mod()
     actions: list[dict[str, Any]] = []
     revised = ""
@@ -491,6 +511,15 @@ def _failed_actions(run, hint: dict[str, Any] | None) -> tuple[list[dict[str, An
                                      "primary"))
             elif isinstance(nc, dict) and str(nc.get("kind") or "") == "lane":
                 actions.extend(_lane_actions(run, nc))
+            elif isinstance(nc, dict) and str(nc.get("kind") or "") in _no_change_kinds():
+                node = str(hint.get("from_node") or hint.get("failed_node") or "")
+                label = f"Resume from {node}" if node else "Resume"
+                actions.append(S.btn(
+                    label,
+                    S.cli("board", "retry", run.id,
+                          confirm=f"Resume {run.id} from {node}?" if node
+                                  else f"Resume {run.id}?"),
+                    "primary"))
             elif isinstance(nc, dict):
                 actions.append(S.btn("I fixed it — retry",
                                      S.cli("board", "retry", run.id, "--ack-change",

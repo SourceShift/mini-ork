@@ -52,6 +52,12 @@ from mini_ork.web.db import db_for
 HINT_VERSION = 3
 CACHE_FILENAME = "retry-hint.json"
 
+# needs_change kinds whose retry needs no change: re-running the step IS the fix.
+# An ``interrupted`` run (case 1.6) stopped mid-node; the hint's own command
+# (``mini-ork recover <run> --strategy resume``) resumes it, so the gates must
+# not demand ``--ack-change``/``--force`` for it.
+NO_CHANGE_KINDS = frozenset({"interrupted"})
+
 # Finish reasons that end a node without failing it — the same set
 # ``acp/task_state._TERMINAL_OK_FINISH`` uses (kept local: this module imports
 # ``task_state`` lazily).
