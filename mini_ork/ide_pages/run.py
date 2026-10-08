@@ -1413,6 +1413,21 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     run = _load(home, run_id)
     if run is None:
         return {"ok": False, "key": "run", "error": f"no run {run_id}"}
+    if S.ide_level() >= 2 and (args.get("view") or "") == "dock":
+        # The right dock panel: one column, its own tab bar. Imported here
+        # (not at module top) — ``run_dock`` imports this module, so a
+        # top-level import would be circular (same dance as ``_story_tab``).
+        from mini_ork.ide_pages import run_dock
+
+        t = tab if tab in {k for k, _ in run_dock.DOCK_TABS} else "changes"
+        errors: dict[str, str] = {}
+        sub = f"{O.state_word(run)} · {S.money(_cost(run))} · {_elapsed(run)}"
+        page = S.page("run", _title_v2(run), sub, chips_=[], actions=[],
+                      tabs=run_dock.DOCK_TABS, tab=t,
+                      args={"run": run.id, "view": "dock"},
+                      sections=run_dock.build(run, t, errors), errors=errors)
+        page["graph"] = _graph(run, args.get("node"))
+        return page
     if S.ide_level() >= 2:
         return _build_v2(run, tab, args)
     tab = tab if tab in {k for k, _ in TABS} else "dag"
