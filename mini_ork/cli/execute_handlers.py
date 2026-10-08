@@ -1304,6 +1304,12 @@ def _handle_implementer(ctx: NodeDispatch):
         # artifact-completed path keeps only the edits the agent already made.
         apply_impl_output(impl_log, target)   # ported "capture coin-flip" applier
     if ctx.recipe_eff == "framework-edit":
+        moved = _implementer_moved_base(ctx.run_dir_eff, target)
+        if moved:
+            print(f"  [ground-truth] FAIL: {moved}", file=sys.stderr)
+            _append_run_note(ctx.db, ctx.run_id, f"impl_moved_base: {moved}")
+            ctx.trace(ctx.node_id, "failure", "implementer", impl_log, "", "impl_moved_base")
+            return 1, "impl_moved_base"
         ok, fr = _harvest_framework_edit_ground_truth(ctx.run_dir_eff, target)
         if not ok:
             ctx.trace(ctx.node_id, "failure", "implementer", impl_log, "", fr)
@@ -1349,6 +1355,38 @@ def _classify_review_node(recipe_eff: str, node_id: str, root: str, run_dir: str
 
 
 REVIEWER_VERDICT_UNPARSEABLE = "reviewer_verdict_unparseable"
+
+
+def _implementer_moved_base(run_dir: str, target: str) -> str:
+    """Why the implementer's tree delta cannot be trusted, or ``""``.
+
+    The ground-truth harvest diffs the target against ``pre-implementer-ref``,
+    the commit HEAD was on before the implementer ran. If the implementer
+    commits, rebases, resets or checks out another ref, HEAD moves and the
+    delta carries every commit between the two: 2026-10-08,
+    sdd-i5-evidence-ledger-20261008122008 rebased onto origin/main mid-run and
+    shipped a 54-file diff for a 6-file change, then spent two revise rounds
+    chasing it. Fail the node here, with the cause, instead. ``""`` when the
+    check cannot run (no baseline, not a git repo).
+    """
+    if not run_dir or not target:
+        return ""
+    try:
+        baseline = open(os.path.join(run_dir, "pre-implementer-ref")).read().strip()
+    except OSError:
+        return ""
+    if not baseline:
+        return ""
+    head = subprocess.run(["git", "-C", target, "rev-parse", "HEAD"],
+                          capture_output=True, text=True)
+    if head.returncode != 0:
+        return ""
+    head_sha = head.stdout.strip()
+    if head_sha == baseline:
+        return ""
+    return (f"HEAD {head_sha[:12]} is not the run's starting commit {baseline[:12]}: the implementer "
+            "committed, rebased, reset or checked out in the target, so the tree delta would carry "
+            f"unrelated commits. Restore HEAD to {baseline[:12]} and leave the change uncommitted.")
 
 
 def _append_run_note(db: str, run_id: str, note: str) -> None:

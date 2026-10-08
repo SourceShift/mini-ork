@@ -16,3 +16,8 @@ Rules:
   the verifier writes it.
 
 The diff is the deliverable. Do not commit and do not apply the patch to main.
+Never commit, rebase, reset, pull, stash, or check out another ref in the target:
+HEAD must stay on the run's starting commit (`${MINI_ORK_RUN_DIR}/pre-implementer-ref`).
+The engine re-derives the diff from the working tree against that commit, and a
+moved HEAD fails the implementer node (`impl_moved_base`). An out-of-date base is
+not yours to fix: the merge step rebases.
