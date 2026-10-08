@@ -253,6 +253,34 @@ def _normalize_profile(profile_path):
         return ""
 
 
+def _kickoff_declares_verification_command(kickoff_path) -> bool:
+    """True when the kickoff file states how success is proven (C8).
+
+    Unreadable / missing kickoff → False, i.e. keep today's behaviour: the
+    profile gate interrogates rather than silently passing an unknown kickoff.
+    """
+    try:
+        with open(kickoff_path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return False
+    try:
+        from mini_ork.gates.profile_gate import declares_verification_command
+        return declares_verification_command(text)
+    except Exception:
+        return False
+
+
+def _normalize_kickoff_complete(profile_path) -> str:
+    if not profile_path:
+        return ""
+    try:
+        from mini_ork.gates.profile_gate import normalize_kickoff_complete
+        return normalize_kickoff_complete(profile_path)
+    except Exception:
+        return ""
+
+
 def _apply_profile_answers(profile_path, answer_payload) -> bool:
     if not profile_path:
         return False
@@ -723,6 +751,20 @@ def main(argv=None, *, root=None, dispatch=None) -> int:
                 profile_status, confidence, human_questions = _read_profile_meta(profile_path)
                 sys.stderr.write("  [ok] profile flagged needs_answers with 0 questions — "
                                  "nothing to answer; treating as ready\n")
+        # A kickoff that declares its own verification command is self-sufficient:
+        # the standard run_profile questions (success criteria / scope / how you
+        # prove it) are all answerable from the kickoff itself. Interrogating it
+        # spends one LLM call per node — every goal-loop child re-plans — and when
+        # that call fails the gate BLOCKS a kickoff that never needed an answer.
+        # Ready the profile instead; the questions are deferred, not dropped.
+        # MO_PROFILE_REQUIRE_ANSWERS=1 restores the LLM interrogation.
+        if (profile_status == "needs_answers"
+                and os.environ.get("MO_PROFILE_REQUIRE_ANSWERS", "0") != "1"
+                and _kickoff_declares_verification_command(kickoff)):
+            if _normalize_kickoff_complete(profile_path) == "ready":
+                profile_status, confidence, human_questions = _read_profile_meta(profile_path)
+                sys.stderr.write("  [ok] kickoff declares a verification command — profile "
+                                 "questions deferred, no LLM interrogation\n")
 
     prompt = _build_prompt(root, kickoff, workflow, profile_path)
     prompt = _inject_context(prompt, kickoff, task_class, db, out_file, dry_run)
