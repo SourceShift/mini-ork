@@ -142,7 +142,8 @@ def _providers(home: Path) -> dict[str, dict[str, Any]]:
 
 
 def _layers(wf_nodes: list[dict[str, Any]], edges: list[Any]) -> list[list[str]]:
-    """Columns by longest ``depends_on``/``verifies`` path; escalation-only nodes last."""
+    """Columns by longest ``depends_on``/``verifies`` path; escalation-only nodes
+    last; ``retries`` (revise-loop) edges are ignored."""
     names = [str(n.get("name")) for n in wf_nodes if n.get("name")]
     known = set(names)
     preds: dict[str, set[str]] = {n: set() for n in names}
@@ -152,6 +153,10 @@ def _layers(wf_nodes: list[dict[str, Any]], edges: list[Any]) -> list[list[str]]
             continue
         src, dst, kind = str(e.get("from") or ""), str(e.get("to") or ""), str(e.get("edge_type") or "")
         if src not in known or dst not in known or src == dst:
+            continue
+        if kind == "retries":
+            # A revise loop (verifier/reviewer → implementer) is feedback, not
+            # order: counting it put the implementer after its own reviewer.
             continue
         if kind == "escalates_to":
             escalated.add(dst)
@@ -1343,7 +1348,7 @@ def _sub_v2(run: Run) -> str:
 
 def _story_tab(run: Run, outcome: dict[str, Any]) -> list[dict[str, Any]]:
     """The v2 story: triage, the outcome's callouts, the goal/criteria hero,
-    then today's Overview sections minus the Retry block the triage replaced."""
+    then the step-by-step story — one row per pipeline node with its evidence."""
     sections = [S.triage(outcome["text"], tone=outcome["tone"], icon=outcome["icon"],
                          detail=outcome["detail"], counts=outcome["counts"],
                          actions=outcome["actions"], menu=outcome["menu"])]
@@ -1363,7 +1368,13 @@ def _story_tab(run: Run, outcome: dict[str, Any]) -> list[dict[str, Any]]:
         meta.append(S.meta_item(run.id, mono=True))
         sections.append(S.hero("What this run is for", goal=goal,
                                criteria=criteria[:8], meta=meta))
-    sections.extend(_overview_tab(run, include_retry=False))
+    # Imported inside the function: ``node.py`` imports ``run.py``, so a
+    # top-level ``run_story`` import (which pulls in ``node.py``) would be
+    # circular. Guarded like the Overview sections it replaces: a broken story
+    # costs the story, never the triage / callouts / hero above it.
+    from mini_ork.ide_pages import run_story
+
+    sections.extend(S.guarded({}, "What happened", lambda: run_story.story_section(run)))
     return sections
 
 
