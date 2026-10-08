@@ -178,7 +178,71 @@ def test_red_base_legacy_escape_hatch_passes(tmp_path):
     assert out["pass"] is True, out
 
 
-# ── 5. env scrub: MO_CANARY does not leak into the child suite ──────────────
+# ── 5. an UNRUNNABLE baseline is never a red baseline ───────────────────────
+#
+# `BASE_RC != 0` cannot tell "the suite ran and was already red" from "the
+# suite never started". The reported live failures were exactly that: post rc=1
+# with base rc=127 (no node_modules in the base worktree) and rc=77 on both
+# sides (jest-guard refused). Zero tests executed, and the run was certified.
+
+RED_MOD = "def a():\n    return 1\n"
+RED_TEST = "from mod import a\n\n\ndef test_a():\n    assert a() == 999\n"
+
+
+def test_unrunnable_baseline_is_not_a_red_baseline(tmp_path):
+    """The candidate's runner is missing in the base worktree → rc 127.
+
+    The runner is untracked and NOT a test file, so the overlay does not carry
+    it to the base — the same shape as a base worktree without node_modules.
+    """
+    repo = _make_repo(tmp_path, {"mod.py": RED_MOD, "test_a.py": RED_TEST})
+    (repo / "runner.py").write_text(
+        "import subprocess, sys\n"
+        "sys.exit(subprocess.call([sys.executable, '-m', 'pytest',\n"
+        "                          '-p', 'no:cacheprovider', *sys.argv[1:]]))\n"
+    )
+
+    rc, out = _run_verifier(
+        repo, tmp_path, run_id="redbase-unrunnable",
+        extra_env={"MINI_ORK_TEST_CMD": "python3 ./runner.py"},
+    )
+
+    assert rc == 1, out
+    assert out["pass"] is False, out
+    assert "did not execute tests" in out["error_summary"], out
+
+
+def test_missing_test_binary_fails_rather_than_abstains(tmp_path):
+    """Both sides rc 127 — the live jest-without-node_modules shape."""
+    repo = _make_repo(tmp_path, {"mod.py": RED_MOD, "test_a.py": RED_TEST})
+
+    rc, out = _run_verifier(
+        repo, tmp_path, run_id="redbase-missing-bin",
+        extra_env={"MINI_ORK_TEST_CMD": "./node_modules/.bin/jest --ci"},
+    )
+
+    assert rc == 1, out
+    assert out["pass"] is False, out
+    assert "did not execute tests" in out["error_summary"], out
+
+
+def test_legacy_hatch_cannot_pass_an_unrunnable_baseline(tmp_path):
+    """MO_TEST_LEGACY_RED_BASE is checked AFTER the runnability classification."""
+    repo = _make_repo(tmp_path, {"mod.py": RED_MOD, "test_a.py": RED_TEST})
+
+    rc, out = _run_verifier(
+        repo, tmp_path, run_id="redbase-legacy-unrunnable",
+        extra_env={
+            "MINI_ORK_TEST_CMD": "./node_modules/.bin/jest --ci",
+            "MO_TEST_LEGACY_RED_BASE": "1",
+        },
+    )
+
+    assert rc == 1, out
+    assert out["pass"] is False, out
+
+
+# ── 6. env scrub: MO_CANARY does not leak into the child suite ──────────────
 def test_child_env_scrubs_mo_canary(tmp_path):
     repo = _make_repo(tmp_path, {
         "mod.py": "def add(a, b):\n    return a + b\n",

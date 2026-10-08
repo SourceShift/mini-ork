@@ -130,6 +130,43 @@ REPLAY_BASE_LOG = os.path.join(LOG_DIR, "verifier_replay_base.log")
 RED_CANDIDATE_LOG = os.path.join(LOG_DIR, "verifier_red_base_candidate.log")
 RED_BASE_LOG = os.path.join(LOG_DIR, "verifier_red_base_base.log")
 
+# Exit codes that mean the process never reached the test runner: 126 (found
+# but not executable), 127 (command not found), 77 (the jest-guard convention
+# for "refused to start under load"). A baseline with one of these did NOT
+# fail — it never ran, so no pass and no regression may be attributed to it.
+_UNRUNNABLE_RC = frozenset({"126", "127", "77"})
+# The same states, as the output reports them (the rc is often masked by a
+# wrapper script that swallows the inner exit code).
+_UNRUNNABLE_LOG_RE = re.compile(
+    r"command not found|No such file or directory|not executable"
+    r"|\brefus(?:e|ed)\b|REFUSE:",
+    re.IGNORECASE,
+)
+
+
+def _baseline_unrunnable(base_rc: str, base_log: str) -> str | None:
+    """A reason string when the baseline never executed its tests.
+
+    ``BASE_RC != 0`` cannot distinguish "the suite ran and was already red"
+    from "the suite never started". Both land in the same bucket, and treating
+    the second as a red baseline is how a run with ZERO tests executed got
+    certified green (a candidate whose ``node_modules`` exists but whose base
+    worktree has none: candidate rc=0, base rc=127).
+    """
+    if str(base_rc) in _UNRUNNABLE_RC:
+        return f"baseline did not execute tests (rc={base_rc})"
+    try:
+        with open(base_log, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    if _UNRUNNABLE_LOG_RE.search(text):
+        return (
+            f"baseline did not execute tests (rc={base_rc}; "
+            "its output reports a launch failure)"
+        )
+    return None
+
 
 def _is_test_path(rel_path: str) -> bool:
     """Test-file pattern per kickoff: segment 'tests'/'test' OR basename match.
@@ -877,6 +914,12 @@ def main():
         if BASE_RC == "":
             # Could not establish a baseline → fall back to absolute gating (do not hide a regression).
             return emit(False, "post-patch failing; no baseline established (absolute gate)", post_rc)
+        unrunnable = _baseline_unrunnable(BASE_RC, BASE_LOG)
+        if unrunnable:
+            # NOT a red baseline. Checked BEFORE the legacy hatch so that hatch
+            # can never blanket-pass a baseline that never ran.
+            sys.stderr.write(f"[test] {unrunnable} — cannot attribute; needs rerun\n")
+            return emit(False, f"{unrunnable} — cannot attribute the failure; rerun needed", post_rc)
         if BASE_RC != 0:
             # Baseline ALSO fails. Decide per test instead of blanket-passing
             # (a patch that breaks MORE tests in an already-red suite must not
