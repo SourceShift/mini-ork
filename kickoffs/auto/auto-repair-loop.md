@@ -104,6 +104,15 @@ Inputs:
 Reuse the round-file format `execute._write_revise_feedback` uses, but write it in
 `auto_repair.apply`, not `decide`.
 
+**Include the real error text.** Live case: ide-orca-b2b-story failed both revise rounds on a
+Rust compile error (`post_rc=101`). Its round files only said "post-patch failing; see log",
+because the cargo output lives in `verifier_test.log` and never reached the implementer. For a
+failing test/typecheck verifier, append up to 40 lines from `<run_dir>/verifier_<id>.log`,
+falling back to the newest `evidence/<id>-*.log`. Keep the lines matching
+`^error|^warning: unused|^\s+-->|^\s+\||FAILED|Error:|Traceback|assert`, each with its next 2
+lines of context. If both logs are empty, say so explicitly in the round file: "the build/test
+output was not captured; re-run the verification command first and read its errors".
+
 ### `auto_repair.apply(home, run_id, decision, *, spawn=True) -> dict`
 
 - **For revise/prove:**
