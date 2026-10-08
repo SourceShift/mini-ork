@@ -423,34 +423,42 @@ def _needs_restore(plan: RecoveryPlan, run_dir: str, carry_patch: str | None = N
                    workflow: str | None = None) -> bool:
     """True iff the recovery must apply a carry patch before dispatch.
 
-    Two conditions (kickoff §3 fix 6):
+    Three conditions:
 
-      1. The reuse set contains an implementer-typed node. Without a
+      1. The operator passed ``--carry-patch`` explicitly and it resolves to a
+         file: the tree must hold it before dispatch, even when the implementer
+         re-runs. A resumed implementer continues on top of its own earlier
+         work, so the carried change has to be there for it to build on.
+      2. The reuse set contains an implementer-typed node. Without a
          reused implementer there's nothing for the verifier to verify
          against — the tree is already clean. (The code only checks
          ``"implementer"``; do not list other types here without also
          extending the membership test below. No recipe declares another
          code-changing node type as of 2026-10-07.)
-      2. The run was rolled back: ``rolled-back.json``, ``salvage.patch`` or
+      3. The run was rolled back: ``rolled-back.json``, ``salvage.patch`` or
          the resolved carry patch (``--carry-patch`` / workflow
          ``recovery.carry_patch``) is present. Otherwise nothing to restore.
 
-    Both must hold; the function short-circuits on the cheaper
-    ``plan.reuse`` check first.
+    Condition 1 is standalone; conditions 2 and 3 must both hold. The function
+    short-circuits on the cheaper ``plan.reuse`` check for the implicit rule.
     """
+    if not run_dir:
+        return False
+    from mini_ork.recovery.restore import _resolve_patch_path
+
+    # An explicit --carry-patch is an operator instruction, not an inference
+    # from the reuse set: carry it whether or not the implementer re-runs.
+    if carry_patch and _resolve_patch_path(run_dir, carry_patch, None) is not None:
+        return True
     has_code_reuse = any(
         plan.node_types.get(nid) in ("implementer",) for nid in plan.reuse
     )
     if not has_code_reuse:
         return False
-    if not run_dir:
-        return False
     if os.path.isfile(os.path.join(run_dir, "rolled-back.json")):
         return True
     if os.path.isfile(os.path.join(run_dir, "salvage.patch")):
         return True
-    from mini_ork.recovery.restore import _resolve_patch_path
-
     return _resolve_patch_path(run_dir, carry_patch, workflow) is not None
 
 

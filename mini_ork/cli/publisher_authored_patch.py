@@ -9,7 +9,10 @@ there).  This module supplies the three halves of that contract:
   sources that can claim authorship:
 
   - a recovery **carry patch** (``salvage.patch`` / a ``--carry-patch`` named in
-    ``run_profile.json``);
+    ``run_profile.json``) that ``restore_carry_patch`` actually APPLIED — proven
+    by ``carry-applied.json`` naming it with a matching sha256. A ``salvage.patch``
+    that merely sits in the run dir is not a source: the operator never carried
+    it, so committing it would publish the unreviewed round-2 work (ide-orca-f2b);
   - a fresh run's implementer ``Write``/``Edit``/``MultiEdit`` calls replayed IN
     ORDER from its session transcript (failed ``is_error`` tool calls are skipped:
     a rejected Edit followed by a successful retry is ordinary, not a peer edit);
@@ -46,12 +49,14 @@ HEAD).  Neither ever falls back to a whole-file ``git add`` or a silent
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+from pathlib import Path
 from typing import NamedTuple
 
 __all__ = [
@@ -530,8 +535,25 @@ def _failed_tool_use_ids(path: str) -> set[str]:
     return failed
 
 
-def _collect_edits(path: str, real_repo: str, scope: list[str], run_real: str = ""):
+def _record_ts(record: object) -> float | None:
+    """Epoch seconds of an SDK transcript record's ISO ``timestamp``, or None."""
+    raw = record.get("timestamp") if isinstance(record, dict) else None
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        from datetime import datetime  # noqa: PLC0415
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _collect_edits(path: str, real_repo: str, scope: list[str], run_real: str = "",
+                   since: float | None = None):
     """Ordered in-repo, in-scope, non-failed (rel, tool, input) edits from a transcript.
+
+    ``since`` (epoch seconds) keeps only the calls recorded after it: a resumed
+    session appends a recover's edits to the transcript that already holds the
+    earlier attempt's.
 
     Edits inside ``run_real`` are dropped: a run dir that lives inside the target
     repo (``<repo>/.mini-ork/runs/<id>``, gitignored) holds the implementer's own
@@ -543,6 +565,12 @@ def _collect_edits(path: str, real_repo: str, scope: list[str], run_real: str = 
     failed = _failed_tool_use_ids(path)
     edits = []
     for record in _records_in(path):
+        if since is not None:
+            # Only calls made after ``since`` (a recover's own attempt). A record
+            # without a timestamp cannot be placed, so it is not counted.
+            ts = _record_ts(record)
+            if ts is None or ts <= since:
+                continue
         for tid, name, inp in _tool_uses_in(record):
             if tid is not None and tid in failed:
                 continue
@@ -913,6 +941,162 @@ def _resolve_from_declared_files(run_dir: str, repo: str, scope: list[str], base
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _edits_since(run_dir: str, real_repo: str, scope: list[str], since: float):
+    """The implementer's in-scope edits recorded after ``since``, oldest session first."""
+    sessions = os.path.join(run_dir, "sessions")
+    try:
+        names = sorted(os.listdir(sessions))
+    except OSError:
+        return []
+    run_real = os.path.realpath(run_dir)
+    found = []
+    for name in names:
+        path = os.path.join(sessions, name)
+        if not name.endswith(".jsonl"):
+            continue
+        try:
+            if os.path.getmtime(path) <= since:
+                continue
+        except OSError:
+            continue
+        edits = _collect_edits(path, real_repo, scope, run_real, since=since)
+        if edits:
+            found.append((os.path.getmtime(path), edits))
+    found.sort(key=lambda item: item[0])
+    return [edit for _, edits in found for edit in edits]
+
+
+def _attempt_started(run_dir: str, fallback: float) -> float:
+    """When the run's LATEST implementer attempt started (epoch seconds).
+
+    A recover can be stopped and relaunched: an abandoned attempt's edits sit in
+    the same resumed transcript but were discarded from the tree, so only the
+    calls after the latest ``node_start`` of the implementer belong to the
+    change being published. Falls back to ``fallback`` when the run's
+    ``run_events`` cannot be read.
+    """
+    home = os.path.dirname(os.path.dirname(os.path.abspath(run_dir)))
+    run_id = os.path.basename(os.path.abspath(run_dir))
+    try:
+        from mini_ork.web.db import db_for  # noqa: PLC0415
+        rows = db_for(Path(home)).rows(
+            "SELECT payload_json, created_at FROM run_events WHERE run_id = ? "
+            "AND event_type = 'node_start' ORDER BY created_at DESC, rowid DESC",
+            (run_id,))
+    except Exception:  # noqa: BLE001 — no DB: the carry file's time is the floor
+        return fallback
+    for row in rows or []:
+        try:
+            payload = json.loads(row.get("payload_json") or "{}")
+        except (ValueError, TypeError):
+            continue
+        if isinstance(payload, dict) and (payload.get("node_type") == "implementer"
+                                          or payload.get("node_id") == "implementer"):
+            try:
+                return max(float(row.get("created_at") or 0), fallback)
+            except (TypeError, ValueError):
+                return fallback
+    return fallback
+
+
+def _carry_applied(run_dir: str, name: str, text: str) -> bool:
+    """Whether the run dir's carry patch was actually APPLIED to the tree.
+
+    ``mini_ork.recovery.restore.restore_carry_patch`` writes
+    ``carry-applied.json`` (the patch's basename + the sha256 of its bytes) when
+    it lands a carry. A ``salvage.patch`` that merely sits in the run dir — the
+    work the operator never carried — must not be published, so it is a source
+    ONLY when this marker names it and the sha matches (the ide-orca-f2b
+    incident: the publisher committed the unreviewed round-2 salvage).
+    """
+    record = _read_json(os.path.join(run_dir, "carry-applied.json"))
+    if not record:
+        return False
+    if str(record.get("patch") or "") != name:
+        return False
+    expected = str(record.get("sha256") or "")
+    if not expected:
+        return False
+    try:
+        digest = hashlib.sha256(_b(text)).hexdigest()
+    except Exception:  # noqa: BLE001 — an unencodable patch is not a proven carry
+        return False
+    return digest == expected
+
+
+def _carry_applied_at(run_dir: str) -> float:
+    """``carry-applied.json``'s ``applied_at`` (epoch seconds), else 0.0."""
+    record = _read_json(os.path.join(run_dir, "carry-applied.json"))
+    try:
+        return float(record.get("applied_at") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _rolled_back(run_dir: str) -> bool:
+    """True when the run's rollback reset the tree to the base."""
+    return os.path.isfile(os.path.join(run_dir, "rolled-back.json"))
+
+
+def _rolled_back_at(run_dir: str) -> float:
+    """``rolled-back.json``'s mtime (epoch seconds), else 0.0 — the epoch.
+
+    Used as the floor when the run's ``node_start`` events cannot be read: an
+    edit recorded before the rollback belongs to a discarded attempt.
+    """
+    try:
+        return os.path.getmtime(os.path.join(run_dir, "rolled-back.json"))
+    except OSError:
+        return 0.0
+
+
+def _carry_tree(repo: str, base_ref: str, carry_text: str) -> str | Abstain:
+    """The tree of ``base_ref`` with the carry patch applied (private index)."""
+    tmp = tempfile.mkdtemp(prefix="mo-carry-")
+    index = os.path.join(tmp, "index")
+    try:
+        if _git(repo, "read-tree", base_ref, index=index).returncode != 0:
+            return Abstain("publish-unattributable", f"read-tree {base_ref[:12]} failed")
+        applied = _git(repo, "apply", "--cached", "-", index=index,
+                       input_bytes=_b(carry_text))
+        if applied.returncode != 0:
+            return Abstain("publish-unattributable",
+                           f"the carry patch does not apply to {base_ref[:12]}: "
+                           f"{applied.stderr.strip()}")
+        tree = _git(repo, "write-tree", index=index)
+        if tree.returncode != 0:
+            return Abstain("publish-unattributable", "write-tree of the carry tree failed")
+        return tree.stdout.strip()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _compose_carry_and_edits(repo: str, base_ref: str, carry_text: str,
+                             carry_name: str, edits) -> AuthoredPatch | Abstain:
+    """A recover's authored patch: the carry patch, then the revived implementer's
+    own edits replayed on top of it — proven against the working tree, and
+    expressed against ``base_ref`` like every other authored patch."""
+    tree = _carry_tree(repo, base_ref, carry_text)
+    if isinstance(tree, Abstain):
+        return tree
+    replayed = _replay(repo, tree, edits)
+    if isinstance(replayed, Abstain):
+        return replayed
+    files = dict(replayed)
+    for rel in _paths_in_patch(carry_text):
+        if rel not in files:
+            files[rel] = _base_content(repo, tree, rel)
+    mismatch = _verify_against_tree(repo, files)
+    if mismatch is not None:
+        return mismatch
+    patch = _build_patch(repo, base_ref, files)
+    if isinstance(patch, Abstain):
+        return patch
+    if not patch.strip():
+        return Abstain("publish-no-authored-patch", "the carry patch and edits cancel out")
+    return AuthoredPatch(patch, f"carry-patch:{carry_name}+transcript-replay")
+
+
 def resolve_authored_patch(run_dir: str, repo: str | None = None) -> AuthoredPatch | Abstain:
     """The run's AUTHORED patch, or an :class:`Abstain` when it cannot be proven.
 
@@ -931,21 +1115,56 @@ def resolve_authored_patch(run_dir: str, repo: str | None = None) -> AuthoredPat
     carried = _carry_patch(run_dir)
     if carried is not None:
         text, name = carried
-        if scope:
-            text = _filter_patch_scope(text, scope)
-        if not text.strip():
-            return Abstain("publish-no-authored-patch",
-                           f"carry patch {name} has nothing inside the run's declared scope")
-        unsafe = _unsafe_path(text)
-        if unsafe:
-            return Abstain("publish-unattributable",
-                           f"carry patch {name} touches a path outside the repo: {unsafe}")
-        return AuthoredPatch(text, f"carry-patch:{name}")
+        # A carry patch counts as authored ONLY when the restore actually
+        # APPLIED it (``carry-applied.json`` names it and its sha matches). A
+        # ``salvage.patch`` that merely sits in the run dir is not a source —
+        # committing it would publish the unreviewed salvage (ide-orca-f2b).
+        if _carry_applied(run_dir, name, text):
+            if scope:
+                text = _filter_patch_scope(text, scope)
+            if not text.strip():
+                return Abstain("publish-no-authored-patch",
+                               f"carry patch {name} has nothing inside the run's declared scope")
+            unsafe = _unsafe_path(text)
+            if unsafe:
+                return Abstain("publish-unattributable",
+                               f"carry patch {name} touches a path outside the repo: {unsafe}")
+            # A revived implementer keeps working on top of the carry patch. Its
+            # own later edits are part of the run's authored change: committing
+            # the carry patch alone would publish less than the reviewer approved
+            # and leave the rest as "foreign" hunks.
+            carry_repo = repo or _target_repo(run_dir)
+            base_ref = _pre_impl_ref(run_dir)
+            carry_path = os.path.join(run_dir, name)
+            if carry_repo and os.path.isdir(carry_repo) and base_ref and os.path.isfile(carry_path):
+                since = _attempt_started(run_dir, _carry_applied_at(run_dir))
+                later = _edits_since(run_dir, os.path.realpath(carry_repo), scope, since)
+                if later:
+                    return _compose_carry_and_edits(carry_repo, base_ref, text, name, later)
+            return AuthoredPatch(text, f"carry-patch:{name}")
+        # The carry was NOT applied: fall through. The rolled-back rule below
+        # (or the normal replay chain) decides authorship from the tree.
 
     repo = repo or _target_repo(run_dir)
     if not repo or not os.path.isdir(repo):
         return Abstain("publish-unattributable", "no target repo in run_profile.json")
     base_ref = _pre_impl_ref(run_dir)
+
+    # A rolled-back run with no applied carry: the rollback reset the tree to
+    # the base before the LATEST implementer attempt, so only the edits recorded
+    # after that attempt started belong to the change being published. Replaying
+    # the whole transcript would resurrect an earlier, discarded attempt's edits
+    # — never fall back to those sessions.
+    if base_ref and _rolled_back(run_dir):
+        since = _attempt_started(run_dir, _rolled_back_at(run_dir))
+        later = _edits_since(run_dir, os.path.realpath(repo), scope, since)
+        if later:
+            return _replay_edits(repo, base_ref, later)
+        return Abstain(
+            "publish-no-authored-patch",
+            "the run rolled back and no implementer edits after its latest attempt "
+            "reconcile against the base",
+        )
 
     # 1) the implementer's own Write/Edit calls, replayed in order.
     if base_ref:

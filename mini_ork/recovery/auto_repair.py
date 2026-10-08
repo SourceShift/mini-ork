@@ -222,6 +222,35 @@ def _events(home: Path, run_id: str) -> list[dict[str, Any]] | None:
     return retry_hint._run_node_events(Path(home), run_id)
 
 
+def _publisher_finished_done(events: list[dict[str, Any]] | None) -> bool:
+    """True when the publisher's LATEST ``node_end`` carries ``finish_reason == "done"``.
+
+    A publisher that finished ``done`` DELIVERED the run: it is published
+    whatever ``verdict.json``'s level report still says, so the loop must not
+    treat it as a merely-withheld run and spawn a re-verify (the recover
+    incident: auto-repair re-verified an already-published run). Only a
+    publisher that ended ``levels_unverified`` / ``publish_abstain`` really did
+    withhold — that override stays.
+
+    Reads the events ``decide`` already loaded; ``None`` (no lifecycle
+    available) is never a "published" claim.
+    """
+    if not events:
+        return False
+    from mini_ork.acp.task_state import _parse_payload
+    latest = None
+    for ev in events:
+        if ev.get("event_type") != "node_end":
+            continue
+        payload = _parse_payload(ev.get("payload_json"))
+        node_id = str(payload.get("node_id") or ev.get("node_id") or "")
+        node_type = str(payload.get("node_type") or ev.get("node_type") or "")
+        if "publisher" not in (node_id, node_type):
+            continue
+        latest = str(payload.get("finish_reason") or "")
+    return latest == "done"
+
+
 def _workflow(home: Path, recipe: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     from mini_ork.recovery import retry_hint
     return retry_hint._recipe_workflow(Path(home), recipe)
@@ -361,15 +390,23 @@ def decide(home: Path, run_id: str) -> dict[str, Any]:
 
     run_dir = _run_dir(home, run_id)
     status = _run_status(home, run_id)
+    events = _events(home, run_id)
     # Rule 1 is "the run is not failed/rolled_back". A withheld publish counts
     # as failed even when the status flag disagrees (see ``_is_withheld``): the
     # loop must not go blind to a withheld run that a status rewrite republished.
     if status not in _TERMINAL_FAILED and not _is_withheld(run_dir):
         return _decision("none", reason=f"run is not failed/rolled_back (status={status or 'unknown'})")
+    # ...but a publisher whose LATEST node_end finished ``done`` PUBLISHED the
+    # run — whatever ``verdict.json``'s level report still says. Without this a
+    # published run whose level report lingered at ``abstain`` was re-verified
+    # by the loop. Only a publisher that ended ``levels_unverified`` /
+    # ``publish_abstain`` (``_publisher_finished_done`` is False) stays withheld.
+    if _publisher_finished_done(events):
+        return _decision("none",
+                         reason="the publisher finished done — the run is published")
 
     recipe = _recipe_of(home, run_id)
     hint = _load_hint(home, run_id)
-    events = _events(home, run_id)
     failing = None
     if events is not None:
         from mini_ork.acp.task_state import _failing_node

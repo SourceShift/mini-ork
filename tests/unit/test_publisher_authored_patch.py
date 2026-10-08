@@ -7,10 +7,13 @@ throwaway git repo plus a synthetic run dir.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import sqlite3
 import subprocess
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -61,6 +64,66 @@ def _patch_a_line2() -> str:
     )
 
 
+def _patch_line1() -> str:
+    """A carry patch changing a.py line1 -> line1-salvage.
+
+    Deliberately a DIFFERENT line from :func:`_patch_a_line2`, so a test can
+    tell whether a composed patch came from the carry, the transcript replay, or
+    both.
+    """
+    return (
+        "diff --git a/a.py b/a.py\n"
+        "--- a/a.py\n"
+        "+++ b/a.py\n"
+        "@@ -1,3 +1,3 @@\n"
+        "-line1\n"
+        "+line1-salvage\n"
+        " line2\n"
+        " line3\n"
+    )
+
+
+def _iso(epoch: float) -> str:
+    """An SDK-transcript ``timestamp`` (ISO-8601, Z) for ``epoch``."""
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _stamp_sessions(run_dir: Path, epoch: float) -> None:
+    """Force the session transcripts' mtime so ``_edits_since`` admits them.
+
+    ``_edits_since`` skips a session file whose mtime is not after the attempt
+    start, so a transcript written "now" for an attempt timestamped later needs
+    its mtime moved forward too.
+    """
+    for path in (run_dir / "sessions").glob("*.jsonl"):
+        os.utime(path, (epoch, epoch))
+
+
+def _seed_node_start(run_dir: Path, started_at: float) -> None:
+    """One implementer ``node_start`` in the run's ``state.db`` at ``started_at``.
+
+    ``_attempt_started`` reads the LATEST implementer ``node_start`` from the
+    run's ``run_events``; the run dir is ``<home>/runs/<id>``.
+    """
+    home = run_dir.parent.parent
+    run_id = run_dir.name
+    con = sqlite3.connect(home / "state.db")
+    try:
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS run_events (event_id TEXT PRIMARY KEY, "
+            "run_id TEXT, event_type TEXT, payload_json TEXT, created_at INTEGER)")
+        con.execute(
+            "INSERT INTO run_events(event_id, run_id, event_type, payload_json, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (f"evt-{run_id}-{int(started_at)}", run_id, "node_start",
+             json.dumps({"node_id": "implementer", "node_type": "implementer"}),
+             int(started_at)),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
 @pytest.fixture()
 def repo(tmp_path: Path) -> Path:
     path = tmp_path / "repo"
@@ -78,10 +141,11 @@ def _head(repo: Path) -> str:
 
 
 def _make_run_dir(tmp_path: Path, repo: Path, base_ref: str | None, *,
-                  scope=None, carry=None, edits=None, records=None,
-                  impl_log=None, summary=None) -> Path:
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
+                  scope=None, carry=None, carry_applied=True, rolled_back=False,
+                  edits=None, records=None, impl_log=None, summary=None,
+                  node_start=None) -> Path:
+    run_dir = tmp_path / "home" / "runs" / "run"
+    run_dir.mkdir(parents=True)
     if base_ref is not None:
         (run_dir / "pre-implementer-ref").write_text(base_ref + "\n")
     profile = {"roots": {"target": str(repo)}}
@@ -90,6 +154,19 @@ def _make_run_dir(tmp_path: Path, repo: Path, base_ref: str | None, *,
     (run_dir / "run_profile.json").write_text(json.dumps(profile))
     if carry is not None:
         (run_dir / "salvage.patch").write_text(carry)
+        if carry_applied:
+            # A carry patch is a source only once the restore PROVED it landed
+            # (``carry-applied.json``); a bare ``salvage.patch`` is not.
+            (run_dir / "carry-applied.json").write_text(json.dumps({
+                "patch": "salvage.patch",
+                "sha256": hashlib.sha256(carry.encode("utf-8")).hexdigest(),
+                "applied_at": 0.0,
+                "target": str(repo),
+            }))
+    if rolled_back:
+        (run_dir / "rolled-back.json").write_text(json.dumps({"at": 0}))
+    if node_start is not None:
+        _seed_node_start(run_dir, node_start)
     if edits is not None or records is not None:
         (run_dir / "sessions").mkdir()
         lines = []
@@ -550,6 +627,121 @@ def test_carry_patch_commit_equals_the_carry_patch_exactly(tmp_path, repo):
     committed = _git(repo, "show", "--format=", "--no-color", sha).stdout
     assert _changed_lines(committed) == _changed_lines(carry) == ["-line2", "+line2-run"]
     assert _git(repo, "show", "--name-only", "--format=", sha).stdout.split() == ["a.py"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# a recover: an unapplied carry is not a source; an applied one composes
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _attempt_records(*, abandoned: dict | None, live: dict,
+                     base: float) -> list[dict]:
+    """Timestamped transcript records for a recovered implementer attempt.
+
+    ``abandoned`` (if given) is stamped BEFORE ``base`` (the latest implementer
+    ``node_start``); ``live`` is stamped after it.
+    """
+    out: list[dict] = []
+    if abandoned is not None:
+        out.append({"type": "assistant", "timestamp": _iso(base - 50),
+                    "message": {"content": [abandoned]}})
+    out.append({"type": "assistant", "timestamp": _iso(base + 60),
+                "message": {"content": [live]}})
+    return out
+
+
+def test_unapplied_carry_publishes_the_transcript_replay_not_the_salvage(tmp_path, repo):
+    """A ``salvage.patch`` that merely sits in the run dir is NOT a source.
+
+    The rollback reset the tree to the base and the carry was never applied, so
+    the authored patch is the revived implementer's own replay — committing the
+    salvage would publish the unreviewed round-2 work (the ide-orca-f2b
+    incident).
+    """
+    base = _head(repo)
+    now = time.time()
+    write = {"type": "tool_use", "id": "tu-1", "name": "Write", "input": {
+        "file_path": str(repo / "a.py"), "content": BASE_A.replace("line2\n", "line2-run\n")}}
+    run_dir = _make_run_dir(
+        tmp_path, repo, base, scope=["a.py"],
+        carry=_patch_line1(), carry_applied=False, rolled_back=True,
+        records=_attempt_records(abandoned=None, live=write, base=now),
+        node_start=now)
+    _stamp_sessions(run_dir, now + 60)
+    (repo / "a.py").write_text(BASE_A.replace("line2\n", "line2-run\n"))
+
+    authored = resolve_authored_patch(str(run_dir))
+    assert isinstance(authored, AuthoredPatch), authored
+    assert authored.source == "transcript-replay"
+    assert "line2-run" in authored.patch_text
+    assert "line1-salvage" not in authored.patch_text  # the salvage never landed
+
+    sha = land_patch(str(repo), authored.patch_text, "")
+    assert isinstance(sha, str), sha
+    committed = _git(repo, "show", f"{sha}:a.py").stdout
+    assert "line2-run" in committed and "line1-salvage" not in committed
+
+
+def test_applied_carry_composes_with_the_revived_implementers_edits(tmp_path, repo):
+    """Carry applied + a later implementer edit → the publish is BOTH.
+
+    Committing the carry alone would publish less than the reviewer approved and
+    leave the implementer's own change as "foreign" hunks; landing the composed
+    patch on the base must reproduce the tree.
+    """
+    base = _head(repo)
+    now = time.time()
+    carry = _patch_line1()
+    edit = {"type": "tool_use", "id": "tu-2", "name": "Edit", "input": {
+        "file_path": str(repo / "a.py"),
+        "old_string": "line2\n", "new_string": "line2-run\n"}}
+    run_dir = _make_run_dir(
+        tmp_path, repo, base, scope=["a.py"], carry=carry,
+        records=_attempt_records(abandoned=None, live=edit, base=now),
+        node_start=now)
+    _stamp_sessions(run_dir, now + 60)
+    # The tree holds the carry AND the implementer's own edit on top of it.
+    (repo / "a.py").write_text(
+        BASE_A.replace("line1\n", "line1-salvage\n").replace("line2\n", "line2-run\n"))
+
+    authored = resolve_authored_patch(str(run_dir))
+    assert isinstance(authored, AuthoredPatch), authored
+    assert authored.source == "carry-patch:salvage.patch+transcript-replay"
+
+    sha = land_patch(str(repo), authored.patch_text, "")
+    assert isinstance(sha, str), sha
+    committed = _git(repo, "show", f"{sha}:a.py").stdout
+    assert "line1-salvage" in committed and "line2-run" in committed
+
+
+def test_edits_before_the_latest_attempt_are_ignored(tmp_path, repo):
+    """An abandoned attempt's edits sit in the same resumed transcript.
+
+    They were discarded from the tree, so only the calls after the LATEST
+    implementer ``node_start`` belong to the change being published. Replaying
+    the abandoned Write would desynchronise the replay from the tree.
+    """
+    base = _head(repo)
+    now = time.time()
+    abandoned = {"type": "tool_use", "id": "tu-0", "name": "Write", "input": {
+        "file_path": str(repo / "a.py"),
+        "content": BASE_A.replace("line3", "line3-abandoned")}}
+    live = {"type": "tool_use", "id": "tu-1", "name": "Edit", "input": {
+        "file_path": str(repo / "a.py"),
+        "old_string": "line2\n", "new_string": "line2-run\n"}}
+    run_dir = _make_run_dir(
+        tmp_path, repo, base, scope=["a.py"], carry=_patch_line1(),
+        records=_attempt_records(abandoned=abandoned, live=live, base=now),
+        node_start=now)
+    _stamp_sessions(run_dir, now + 60)
+    (repo / "a.py").write_text(
+        BASE_A.replace("line1\n", "line1-salvage\n").replace("line2\n", "line2-run\n"))
+
+    authored = resolve_authored_patch(str(run_dir))
+    assert isinstance(authored, AuthoredPatch), authored
+    assert authored.source == "carry-patch:salvage.patch+transcript-replay"
+    assert "line2-run" in authored.patch_text
+    assert "line3-abandoned" not in authored.patch_text
 
 
 # ─────────────────────────────────────────────────────────────────────────────

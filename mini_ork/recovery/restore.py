@@ -32,13 +32,18 @@ Public API:
         ``{"applied","already_applied","conflict","no_target","no_patch",
            "not_rolled_back"}``. Refuses on missing target/patch with a
         human-readable message — operators want a refusal reason on stderr,
-        not a traceback.
+        not a traceback. On ``applied`` / ``already_applied`` (never a dry run)
+        it records ``<run_dir>/carry-applied.json`` — the proof the publisher's
+        ``resolve_authored_patch`` requires before it counts a carry patch as
+        authored.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
+import time
 from typing import Optional
 
 __all__ = ["restore_carry_patch", "plan_restore"]
@@ -157,6 +162,43 @@ def _git(cwd: str, args: list[str]) -> subprocess.CompletedProcess:
     )
 
 
+def _record_carry_applied(run_dir: str, patch: str, target: str) -> None:
+    """Write ``<run_dir>/carry-applied.json`` — proof a carry patch landed.
+
+    The publisher only counts a carry patch as authored when this marker names
+    it AND its ``sha256`` matches the file (``resolve_authored_patch``), so a
+    ``salvage.patch`` that merely sits in the run dir — the work the operator
+    never carried — is never published (the ide-orca-f2b incident).
+
+    Best-effort: the tree was already mutated by ``git apply``, so an OSError
+    (or an unreadable patch) must never fail the restore.
+    """
+    if not run_dir or not patch:
+        return
+    try:
+        with open(patch, "rb") as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return
+    record = {
+        "patch": os.path.basename(patch),
+        "sha256": digest,
+        "applied_at": time.time(),
+        "target": target,
+    }
+    path = os.path.join(run_dir, "carry-applied.json")
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(record, fh)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
@@ -251,6 +293,7 @@ def restore_carry_patch(
         return ("not_rolled_back", "no rolled-back.json / salvage.patch present — nothing to restore")
     rev = _git(target_resolved, ["apply", "--check", "-R", str(patch)])
     if rev.returncode == 0:
+        _record_carry_applied(run_dir, patch, target_resolved)
         return ("already_applied", f"carry patch already applied at {target_resolved}")
     fwd = _git(target_resolved, ["apply", "--3way", "--check", str(patch)])
     if fwd.returncode != 0:
@@ -260,4 +303,5 @@ def restore_carry_patch(
     res = _git(target_resolved, ["apply", "--3way", str(patch)])
     if res.returncode != 0:
         return ("conflict", f"git apply --3way failed: {res.stderr.strip()}")
+    _record_carry_applied(run_dir, patch, target_resolved)
     return ("applied", f"applied {patch} to {target_resolved}")
