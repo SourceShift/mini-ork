@@ -34,9 +34,9 @@ This run adds the loop:
 - `mini_ork/cli/main.py`: ONLY
   - one `"repair": "mini_ork.cli.repair_cmd"` entry in `_NATIVE_MODULE_SUBS`;
   - one hook right after the existing `retry_notify.notify(...)` side channel in the run flow
-    (~:1026-1037).
+    (~:1029-1037).
 - `mini_ork/recovery/planner.py`: ONLY one hook in `cli_main` after `execute_fn(exec_argv)`
-  returns (~:1100), so a revived run that fails again re-enters the loop.
+  returns (~:1172), so a revived run that fails again re-enters the loop.
 - `tests/unit/test_native_dispatch_py.py`: ONLY add `"repair"` to the exact-set `expected` in
   `test_all_former_exec_subs_registered_natively`. This guard asserts exact set equality.
 - `tests/unit/test_auto_repair.py` (new)
