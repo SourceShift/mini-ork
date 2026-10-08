@@ -66,6 +66,18 @@ implementation is acceptable or if `REQUEST_CHANGES` is warranted.
 7. **Minimal diff.** Edit the minimum number of lines needed to satisfy the plan.
    Do not touch unrelated code even if you think it could be improved.
 
+8. **If you run the suite, scope it to files.** You rarely need to run the suite —
+   the verifier nodes run it once, scoped. When you do, pass the **changed test
+   file path**, never a name filter alone:
+   - `jest path/to/x.test.ts --maxWorkers=2` (not `jest -t "some name"`)
+   - `pytest path/to/test_x.py` (not `pytest -k "some name"`)
+   - `npx vitest run path/to/x.test.ts`
+
+   A bare `-t` / `--testNamePattern` / `-k` makes the runner **collect the whole
+   repo first** and spawn one worker per file: measured live as 11 workers ×
+   ~900 MB on an 11-core box, load average 124–138 for 8+ minutes. If you cannot
+   name the file, do not run the suite at all.
+
 ---
 
 ## Output

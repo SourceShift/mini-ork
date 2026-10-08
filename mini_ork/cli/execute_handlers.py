@@ -793,7 +793,9 @@ def scope_guard_block(run_dir: str) -> str:
 
     The same block also carries the repository write guard (B5): a lane that
     commits/merges/pushes corrupts the operator's branch and bypasses review.
-    The framework owns all three; the lane only edits the working tree."""
+    The framework owns all three; the lane only edits the working tree. And the
+    resource guard (B7): a suite run must be scoped to a file path, never a bare
+    name filter, which collects the whole repo and fans out one worker per file."""
     return (
         "\n--- Scope guard (hard constraint) ---\n"
         f"The ONLY run directory you may read is: {run_dir}\n"
@@ -809,7 +811,14 @@ def scope_guard_block(run_dir: str) -> str:
         "your edits in the working tree — the framework will pick them up. "
         "Push is disabled at the process level for this lane, so a forced "
         "attempt can only fail and waste your budget.\n"
-        "--- /repository write guard ---\n")
+        "--- /repository write guard ---\n"
+        "\n--- Resource guard (hard constraint) ---\n"
+        "If you run tests, pass the changed test FILE path — never a bare name "
+        "filter (`-t` / `--testNamePattern` / `-k` alone). A name filter "
+        "collects the whole repo and spawns one worker per file, which has "
+        "saturated this machine before. Add `--maxWorkers=2` when the runner "
+        "supports it.\n"
+        "--- /resource guard ---\n")
 
 
 def _handle_planner_early(root):
