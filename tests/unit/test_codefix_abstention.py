@@ -147,3 +147,30 @@ def test_reviewer_prompt_teaches_abstention_rule():
     approve = text.split("### REQUEST_CHANGES")[0]
     assert 'status: "unverified"' in approve
     assert "suite_green: true" in approve
+
+
+# ── 5. un-attributable baseline → abstain, not a revise-driving failure ─────
+def test_unrunnable_baseline_abstains(tmp_path):
+    """A test runner that never STARTED (its exit is the jest-guard's load-
+    refusal `rc=77`, or a missing-deps `rc=127`) is un-attributable, so the
+    verifier must ABSTAIN — `status: unverified` + exit 0 — not fail.
+
+    `emit()` exits 1, which the executor's revise loop reads as a fixable gate
+    failure and answers with a full implementer round spent on an environment
+    collision the patch cannot fix. Seen live (run-1791469896-2926) when host
+    load pinned the jest-guard above LOAD_MAX, refusing BOTH candidate and
+    baseline; the run burned a revise round re-running the implementer on
+    'cannot attribute the failure; rerun needed'.
+    """
+    repo = _make_repo(tmp_path)
+
+    # 77 is the jest-guard's "refused to start under load" convention — it is
+    # in the verifier's _UNRUNNABLE_RC set and stands in for a real refusal.
+    rc, out = _run_verifier(repo, tmp_path, cmd="bash -c 'exit 77'", run_id="base-unrunnable")
+
+    assert rc == 0, out
+    assert out["pass"] is False, out
+    assert out["status"] == "unverified", out
+    assert out["base_unrunnable"] is True, out
+    assert out["base_rc"] == "77", out
+    assert "suite_green" not in out or out["suite_green"] is False, out

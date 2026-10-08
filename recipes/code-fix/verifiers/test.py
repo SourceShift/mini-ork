@@ -1350,10 +1350,24 @@ def main():
                 return emit(False, "post-patch failing; no baseline established (absolute gate)", post_rc)
             unrunnable = _baseline_unrunnable(BASE_RC, BASE_LOG)
             if unrunnable:
-                # NOT a red baseline. Checked BEFORE the legacy hatch so that hatch
-                # can never blanket-pass a baseline that never ran.
-                sys.stderr.write(f"[test] {unrunnable} — cannot attribute; needs rerun\n")
-                return emit(False, f"{unrunnable} — cannot attribute the failure; rerun needed", post_rc)
+                # NOT a red baseline — the test runner never started (load
+                # refusal via the jest-guard rc=77, missing deps rc=127, …).
+                # Checked BEFORE the legacy hatch so that hatch can never
+                # blanket-pass a baseline that never ran.
+                #
+                # An un-attributable result must ABSTAIN, not fail: `emit()`
+                # exits 1, which the executor's revise loop reads as a fixable
+                # gate failure and answers with a full implementer round — spent
+                # on an environment collision the patch cannot fix. Route it
+                # through the abstention contract (exit 0, `status: unverified`)
+                # exactly like the replay/adequacy abstentions, so the gate
+                # neither rolls back nor certifies and no revise round is burned.
+                sys.stderr.write(f"[test] {unrunnable} — cannot attribute; abstaining\n")
+                return emit_unverified(
+                    post_rc,
+                    f"{unrunnable} — cannot attribute the failure; rerun needed",
+                    flag="base_unrunnable",
+                )
             if BASE_RC != 0:
                 # Baseline ALSO fails. Decide per test instead of blanket-passing
                 # (a patch that breaks MORE tests in an already-red suite must not
