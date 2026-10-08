@@ -9,6 +9,11 @@ Inputs:
 - Test verifier output.
 - Planner and lens reports.
 
+> These inputs are assembled for you: the runtime inlines their contents in a
+> "Reviewer inputs" block appended to this prompt. Read THAT block — do not
+> issue Read calls to re-open the paths above. If an input is missing it is
+> shown as `(not available)`.
+
 Return one JSON object with:
 - `verdict`: `approve`, `revise`, or `reject`
 - `reasons`: array of concrete reasons
@@ -61,7 +66,8 @@ file and line you actually inspected.
 Report every blocking problem you can find in this one review. The implementer
 fixes only what you list, so a blocker that is visible now but reported in a
 later round costs a whole extra round and can discard the delivery. Before you
-answer, read the whole diff, every changed file, and list each file you read in
-`checked_criteria`. If a round fixes your earlier findings, judge those fixes
-first; a new blocker in a later round must be one the earlier diff did not
-already show.
+answer, work through the whole diff in the reviewer-inputs block:
+every changed file is already there — do not issue Read calls to re-open them.
+List each changed file you judged in `checked_criteria`. If a round fixes your
+earlier findings, judge those fixes first; a new blocker in a later round must
+be one the earlier diff did not already show.

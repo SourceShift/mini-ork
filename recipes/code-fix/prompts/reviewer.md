@@ -136,7 +136,9 @@ Put every blocking problem you can find into this one review's
 `suggested_changes`; when there are more than five, merge related ones so the
 list stays within its 1–5 limit. The implementer fixes only what you list, so a blocker that
 is visible now but reported in a later round costs a whole extra round and can
-discard the fix. Before you answer, read the whole diff, every changed file, and
-name the files you read in `evidence`. If this round fixes your earlier
+discard the fix. Before you answer, work through the whole diff in the
+Reviewer inputs block — every changed file is already there, so do not issue
+Read calls to re-open them — and name the changed files you judged in
+`evidence`. If this round fixes your earlier
 requests, judge those fixes first; a new blocker in a later round must be one
 the earlier diff did not already show.
