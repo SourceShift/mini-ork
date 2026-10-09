@@ -25,7 +25,7 @@ import time
 from collections.abc import Callable
 
 from mini_ork.context import context_env
-from mini_ork.dispatch.predicates import looks_like_json
+from mini_ork.dispatch.predicates import SHAPE_REJECT_RC, looks_like_json
 
 
 # ── pure helpers (verbatim regex transcriptions) ──
@@ -549,6 +549,28 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
     # A.2 boundary shape check — None unless this node's artifact is known JSON.
     accept_fn = _shape_predicate_for(node_type)
 
+    # A JSON-contract node (today: the planner) is dispatched with the role's
+    # fallback TAIL behind its lead lane, not a lone lane. A lead that returns the
+    # WRONG SHAPE then counts as a lane failure inside ``dispatch_with_fallback``
+    # and the next lane serves, instead of the run dying on rc=SHAPE_REJECT_RC.
+    #
+    # Why the planner needed this specifically: it is dispatched by the Python
+    # plan runtime (``cli/plan.py`` -> ``llm_dispatch``), NOT through the executor
+    # that publishes ``MO_DISPATCH_CHAIN`` (the planner early-handler no-ops), so
+    # ``model`` here was a single lane. An intermittently shape-rejecting glm
+    # planner (2 of 3 calls observed 2026-10-09) then hard-failed the whole run at
+    # plan.py's ``rc != 0`` branch — BEFORE its repair loop, which only ever sees
+    # an rc==0 plan with wrong *content*, never a wrong *shape*. Prose nodes keep
+    # single-lane dispatch: the chain is applied only when a shape predicate is
+    # armed, and an explicit ``model_override``/already-multi-lane model is left
+    # untouched.
+    if accept_fn is not None and not model_override and "," not in str(model):
+        try:
+            from mini_ork.dispatch.routing import dispatch_chain
+            model = dispatch_chain(node_type, resolve_lane_family(model, root, home))
+        except Exception:
+            pass
+
     start_ms = int(time.time() * 1000)
     attempt = 1
     rc = 1
@@ -572,11 +594,23 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
             except OSError:
                 pass
         probe = probe[-2000:]
-        if (glm_fair_usage_retryable(model, probe, attempt, max_attempts)
-                or throttle_retryable(model, probe, rc, attempt, max_attempts)):
+        fair_usage = glm_fair_usage_retryable(model, probe, attempt, max_attempts)
+        throttled = throttle_retryable(model, probe, rc, attempt, max_attempts)
+        # A wrong-SHAPE reply is a stochastic model-formatting miss, not a terminal
+        # failure: the lane produced output, it was merely unusable. Retry it in
+        # the same backoff loop (bounded by max_attempts) so a transient
+        # non-JSON planner turn does not end the run. Scoped to nodes whose
+        # artifact is known JSON (``accept_fn``), so prose nodes are unaffected.
+        shape_reject = (accept_fn is not None and rc == SHAPE_REJECT_RC
+                        and attempt < max_attempts)
+        if fair_usage or throttled or shape_reject:
             sleep_s = backoff_seconds(attempt)
-            reason = "fair_usage" if glm_fair_usage_retryable(model, probe, attempt, max_attempts) \
-                else classify_error(probe, rc)
+            if fair_usage:
+                reason = "fair_usage"
+            elif shape_reject and not throttled:
+                reason = "shape_reject"
+            else:
+                reason = classify_error(probe, rc)
             sys.stderr.write(f"[llm_dispatch RETRY model={model} reason={reason} "
                              f"attempt={attempt}/{max_attempts} sleep={sleep_s}s]\n")
             time.sleep(sleep_s)
