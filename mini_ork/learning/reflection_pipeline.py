@@ -186,40 +186,115 @@ def _dedupe_pass1_exact(db_path: str, tbl: str, batch: int) -> tuple[list[str], 
     return to_delete, survivors
 
 
+# Pass-2 CPU budget: difflib's ratio is O(len^2), and a full fuzzy pass on the
+# live gradient table burned one core past ram-sentinel's 30s CPU-runaway bar —
+# the SIGTERM landed mid-pass, so step 2 never returned and the whole
+# ``mini-ork reflect`` pipeline died there (the learning loop read as "no
+# gradients to dedupe" while it was actually being killed). The pass is now
+# bounded two ways: a lossless length window prunes pairs that cannot reach the
+# threshold, and a wall-clock budget caps the total so a bigger table degrades
+# to "deduped some, the rest next run" instead of a killed process.
+_DEDUPE_BUDGET_S = 20.0  # strictly under ram-sentinel's 30s CPU-runaway bar
+
+
+def _dedupe_budget_s() -> float:
+    """Resolved pass-2 wall-clock budget in seconds (env-overridable)."""
+    try:
+        return float(os.environ.get("MO_DEDUP_BUDGET_S", _DEDUPE_BUDGET_S))
+    except (TypeError, ValueError):
+        return _DEDUPE_BUDGET_S
+
+
 def _dedupe_pass2_fuzzy(survivors: list, fuzzy: float) -> tuple[list[str], int]:
     """Pass-2: fuzzy merge within (task_class, target) groups on signal text.
 
     Mirrors bash's SequenceMatcher three-stage ratio gate (real_quick_ratio,
-    quick_ratio, ratio) — all three must clear the threshold for a hit.
+    quick_ratio, ratio) — all three must clear the threshold for a hit — but
+    bounds the cost so the pass cannot be CPU-killed:
+
+    * **Lossless length window.** ``ratio(a, b) <= 2*min(|a|,|b|)/(|a|+|b|)``,
+      so when ``|a| = lt`` any match must sit at a length ``lk`` in
+      ``[f*lt/(2-f), lt*(2-f)/f]``. Kept texts are bucketed by length and only
+      the reachable buckets are scanned — a pair that cannot reach ``fuzzy``
+      is rejected without ever entering difflib. Behaviour is identical to the
+      unbucketed scan; only unreachable comparisons are skipped.
+    * **Wall-clock budget.** ``os.nice(10)`` plus a ``_DEDUPE_BUDGET_S``
+      deadline stop the loop before ram-sentinel's 30s runaway bar; a truncated
+      pass reports how many groups it processed and the remainder dedupes on
+      the next run (the step is idempotent).
+
     Returns (to_delete_gids, fuzzy_deleted_count).
     """
     groups: dict[tuple, list] = {}
     for row in survivors:
         groups.setdefault((row[5], row[1]), []).append(row)
 
+    try:
+        os.nice(10)
+    except OSError:
+        pass
+
+    # A candidate of length lt can only match a kept text of length lk when
+    # lk/lt lies in [lo_mult, hi_mult]. Widened by a char each side so the
+    # window is a strict superset — it never drops a real hit.
+    lo_mult = fuzzy / (2.0 - fuzzy) if 0.0 < fuzzy < 2.0 else 0.0
+    hi_mult = (2.0 - fuzzy) / fuzzy if fuzzy > 0.0 else float("inf")
+    budget_s = _dedupe_budget_s()
+    deadline = time.monotonic() + budget_s
+
     to_delete: list[str] = []
     fuzzy_deleted = 0
-    for grp in groups.values():
-        kept_texts: list[str] = []
+    n_groups = len(groups)
+    processed = 0
+    truncated = False
+    # Smallest groups first: an oversized group (its O(n^2) scan can spend the
+    # whole budget alone) would otherwise starve every group behind it, since
+    # each run restarts from the top of the dict. Cheap groups finish now; the
+    # big one is chipped at across runs.
+    for grp in sorted(groups.values(), key=len):
+        kept_by_len: dict[int, list[str]] = {}
         for row in grp:
+            if time.monotonic() >= deadline:
+                truncated = True
+                break
             gid = row[0]
             text = row[2]  # row[2] is the `signal` column
-            sm = SequenceMatcher(b=text, autojunk=False)
+            lt = len(text)
+            lo = max(0, int(lt * lo_mult) - 1)
+            hi = lt if hi_mult == float("inf") else int(lt * hi_mult) + 1
+            sm: SequenceMatcher | None = None
             dup = False
-            for kt in kept_texts:
-                sm.set_seq1(kt)
-                if (
-                    sm.real_quick_ratio() >= fuzzy
-                    and sm.quick_ratio() >= fuzzy
-                    and sm.ratio() >= fuzzy
-                ):
-                    dup = True
+            for lk in range(lo, hi + 1):
+                bucket = kept_by_len.get(lk)
+                if not bucket:
+                    continue
+                if sm is None:
+                    sm = SequenceMatcher(b=text, autojunk=False)
+                for kt in bucket:
+                    sm.set_seq1(kt)
+                    if (
+                        sm.real_quick_ratio() >= fuzzy
+                        and sm.quick_ratio() >= fuzzy
+                        and sm.ratio() >= fuzzy
+                    ):
+                        dup = True
+                        break
+                if dup:
                     break
             if dup:
                 to_delete.append(gid)
                 fuzzy_deleted += 1
             else:
-                kept_texts.append(text)
+                kept_by_len.setdefault(lt, []).append(text)
+        if truncated:
+            break
+        processed += 1
+    if truncated:
+        print(
+            f"reflection_deduplicate: fuzzy pass hit its {budget_s:.0f}s budget "
+            f"after {processed}/{n_groups} group(s) — the rest dedupes on the next run",
+            file=sys.stderr,
+        )
     return to_delete, fuzzy_deleted
 
 
