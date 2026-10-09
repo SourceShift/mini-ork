@@ -283,3 +283,20 @@ def test_opaque_runner_with_test_markers_stays_applicable(tmp_path):
     build = tmp_path / "build.log"
     build.write_text("   Compiling mini_ork_ui v0.1.0\n    Finished `release-fast` profile in 6m 19s\n")
     assert mod._replay_applies("script/mini-ork-build", None, str(build)) is False
+
+
+def test_go_and_cargo_test_are_applicable_without_a_base_build():
+    """`go test` / `cargo test` now have structured adapters, so applicability
+    is decidable from the command alone (before any base run) — while a
+    build-only invocation stays n/a and never triggers a cold base build."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("cf_test_verifier", VERIFIER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    assert mod._replay_applies("go test ./...", None, None) is True
+    assert mod._replay_applies("cargo test --all", None, None) is True
+    # Build tools first: these are NOT test runs.
+    assert mod._replay_applies("go build ./...", None, None) is False
+    assert mod._replay_applies("cargo build --release", None, None) is False

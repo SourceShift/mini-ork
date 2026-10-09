@@ -1176,12 +1176,17 @@ def _replay_applies(cmd, results_dir, post_log=None):
     produced — it never needs a base run, so it can be decided BEFORE any
     base worktree is attached (the cold-build disk incident).
 
-      - a pytest/jest/vitest runner → applies;
+      - a pytest/jest/vitest/go/cargo runner → applies (``detect_runners``
+        recognises ``go test``/``cargo test``, not bare ``go``/``cargo``);
       - otherwise, applies only when the post-patch run wrote a results file
         the oracle can PARSE into ``results_dir`` (the results-file contract);
       - when the runner classifier is unavailable (no ``mini_ork`` on path),
         report *applicable*: an unprovable non-applicability must not silently
         downgrade ``target`` from UNVERIFIED to ``n/a`` (publish without proof).
+
+    This early decision mirrors the oracle's late one because both consult
+    ``detect_runners`` — broadening the adapter's runner set widens both at
+    once, so they cannot drift.
     """
     if not _runner_detection_available():
         return True

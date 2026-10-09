@@ -12,6 +12,7 @@ import json
 from mini_ork.certify.test_results import (
     augment_for_results,
     detect_runners,
+    parse_log_results,
     parse_results_dir,
 )
 
@@ -42,6 +43,32 @@ def test_detect_runners_not_a_jest_word():
 
 def test_detect_runners_none():
     assert detect_runners("bash gate.sh") == set()
+
+
+def test_detect_runners_go_and_cargo_test():
+    assert detect_runners("go test ./...") == {"go"}
+    assert detect_runners("go test -v ./pkg") == {"go"}
+    assert detect_runners("/usr/local/go/bin/go test ./...") == {"go"}
+    assert detect_runners("cargo test --all") == {"cargo"}
+    # Toolchain/flags between the tool and the subcommand are tolerated.
+    assert detect_runners("cargo +nightly test") == {"cargo"}
+
+
+def test_detect_runners_build_tools_are_not_test_runs():
+    # `go`/`cargo` are build tools first: a build/vet/run invocation is NOT a
+    # test run and must not widen replay applicability.
+    assert detect_runners("go build ./...") == set()
+    assert detect_runners("go vet ./...") == set()
+    assert detect_runners("cargo build --release") == set()
+    assert detect_runners("cargo run") == set()
+
+
+def test_detect_runners_toolchain_near_misses():
+    # Word-boundary discipline: a filename that merely contains `go`/`cargo`
+    # (or a `go test`-shaped argument) is not the runner.
+    assert detect_runners("bash go-test.sh") == set()
+    assert detect_runners("bash cargo.testing") == set()
+    assert detect_runners("echo gotest") == set()
 
 
 # ── augment_for_results ───────────────────────────────────────────────────────
@@ -86,6 +113,36 @@ def test_augment_pytest_byte_identical():
 
 def test_augment_no_runner_unchanged():
     cmd = "bash gate.sh"
+    new, runners = augment_for_results(cmd, "/tmp/results")
+    assert new == cmd
+    assert runners == set()
+
+
+def test_augment_go_test_adds_json_on_stdout():
+    # `go test` has no output-file flag: `-json` is inserted so the event
+    # stream lands on stdout (the oracle parses it back from the run log).
+    new, runners = augment_for_results("go test ./...", "/tmp/results")
+    assert new == "go test -json ./..."
+    assert runners == {"go"}
+
+
+def test_augment_go_test_keeps_existing_flags():
+    new, runners = augment_for_results("go test -v -count=1 ./pkg", "/tmp/results")
+    assert new == "go test -json -v -count=1 ./pkg"
+    assert runners == {"go"}
+
+
+def test_augment_go_test_already_json_is_unchanged():
+    cmd = "go test -json ./..."
+    new, runners = augment_for_results(cmd, "/tmp/results")
+    assert new == cmd
+    assert runners == {"go"}
+
+
+def test_augment_cargo_test_is_never_augmented():
+    # cargo's JSON reporter is nightly-only; the command must already ask for
+    # it, so the adapter leaves it alone (it degrades to the exit-code path).
+    cmd = "cargo test --all"
     new, runners = augment_for_results(cmd, "/tmp/results")
     assert new == cmd
     assert runners == set()
@@ -272,3 +329,96 @@ def test_suite_genuinely_outside_cwd_keeps_the_literal_escape(tmp_path):
 
     passed, _ = parse_results_dir(str(results), str(inside))
     assert passed == {"../other/a.test.js::t"}
+
+
+# ── parse_log_results: go test -json ──────────────────────────────────────────
+
+GO_JSON_LOG = "\n".join([
+    '{"Action":"start","Package":"example.com/m"}',
+    '{"Action":"run","Package":"example.com/m","Test":"TestAdd"}',
+    '{"Action":"output","Package":"example.com/m","Test":"TestAdd","Output":"=== RUN   TestAdd\\n"}',
+    '{"Action":"pass","Package":"example.com/m","Test":"TestAdd","Elapsed":0}',
+    '{"Action":"run","Package":"example.com/m","Test":"TestSub"}',
+    '{"Action":"fail","Package":"example.com/m","Test":"TestSub","Elapsed":0}',
+    # Package-level summary fail — NOT a load failure, because the package
+    # produced per-test outcomes.
+    '{"Action":"fail","Package":"example.com/m","Elapsed":0.01}',
+])
+
+# A package whose test binary could not build: newer go names it `build-fail`.
+GO_BUILD_FAIL_LOG = "\n".join([
+    '{"Action":"build-output","ImportPath":"example.com/m","Output":"# example.com/m\\n"}',
+    '{"Action":"build-fail","ImportPath":"example.com/m"}',
+])
+
+# Older go reports only the package-level fail, with no per-test outcome.
+GO_OLD_BUILD_FAIL_LOG = "\n".join([
+    '{"Action":"start","Package":"example.com/m"}',
+    '{"Action":"fail","Package":"example.com/m","Elapsed":0.02}',
+])
+
+
+def test_parse_go_json_log_per_test_outcomes():
+    assert parse_log_results(GO_JSON_LOG, "/work", "go") == (
+        {"example.com/m::TestAdd"},
+        {"example.com/m::TestSub"},
+    )
+
+
+def test_parse_go_package_summary_fail_is_not_a_load_failure():
+    # The trailing package-level `fail` must not be double-counted as weak
+    # evidence when the package already produced a real failing assertion.
+    assert parse_log_results(GO_JSON_LOG, "/work", "go")[1] == {"example.com/m::TestSub"}
+
+
+def test_parse_go_build_fail_is_a_load_failure():
+    assert parse_log_results(GO_BUILD_FAIL_LOG, "/work", "go") == (
+        set(),
+        {"example.com/m::<suite load failure>"},
+    )
+
+
+def test_parse_go_old_style_build_fail_is_a_load_failure():
+    # A package-level fail with no per-test outcome is the older go's only
+    # build-failure signal.
+    assert parse_log_results(GO_OLD_BUILD_FAIL_LOG, "/work", "go") == (
+        set(),
+        {"example.com/m::<suite load failure>"},
+    )
+
+
+def test_parse_go_no_outcomes_is_none():
+    assert parse_log_results('{"Action":"output","Package":"p","Output":"x\\n"}',
+                             "/work", "go") is None
+
+
+# ── parse_log_results: cargo's libtest JSON stream ───────────────────────────
+
+CARGO_JSON_LOG = "\n".join([
+    '{"type":"suite","event":"started","test_count":2}',
+    '{"type":"test","event":"started","name":"tests::test_add"}',
+    '{"type":"test","event":"ok","name":"tests::test_add"}',
+    '{"type":"test","event":"failed","name":"tests::test_sub"}',
+    '{"type":"test","event":"ignored","name":"tests::test_skip"}',
+    '{"type":"suite","event":"failed","passed":1,"failed":1,"ignored":1}',
+    '   Compiling m v0.1.0',
+])
+
+
+def test_parse_cargo_json_log_outcomes():
+    assert parse_log_results(CARGO_JSON_LOG, "/work", "cargo") == (
+        {"tests::test_add"},
+        {"tests::test_sub"},
+    )
+
+
+def test_parse_cargo_build_failure_is_none():
+    # No test events (the build never reached libtest): fall through to the
+    # exit-code instrument rather than inventing an outcome.
+    build = "   Compiling m v0.1.0\nerror[E0425]: cannot find value `x`\n"
+    assert parse_log_results(build, "/work", "cargo") is None
+
+
+def test_parse_log_results_unknown_runner_is_none():
+    assert parse_log_results(GO_JSON_LOG, "/work", "jest") is None
+    assert parse_log_results("", "/work", "go") is None

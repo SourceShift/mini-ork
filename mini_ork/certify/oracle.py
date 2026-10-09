@@ -47,8 +47,10 @@ from mini_ork.certify import probe as poc_plus
 from mini_ork.certify import relations
 from mini_ork.certify.context import CodeContext
 from mini_ork.certify.test_results import (
+    _SUITE_LOAD_FAILURE_SUFFIX,
     augment_for_results,
     detect_runners,
+    parse_log_results,
     parse_results_dir,
 )
 from mini_ork.certify.verdict import (
@@ -89,10 +91,10 @@ _TEST_RESULT_RE = re.compile(
     r"(?P<id>(?:\S+::\S+|\S+\.py))\s+(?P<status>PASSED|FAILED|ERROR|SKIPPED)\b"
 )
 
-#: jest/vitest suite-load failure id suffix (see test_results.py). A test id
-#: that ends with this failed because its suite could not load — collection/load
-#: error, i.e. weak fail-to-pass evidence, not a real failing assertion.
-_SUITE_LOAD_FAILURE_SUFFIX = "::<suite load failure>"
+#: Suite-load failure id suffix (imported from test_results.py — the single
+#: source of truth). A test id that ends with this failed because its suite
+#: could not load — collection/load error, i.e. weak fail-to-pass evidence,
+#: not a real failing assertion.
 
 
 def _ensure_pytest_verbose(cmd: str) -> str:
@@ -415,11 +417,13 @@ def replay_check(
             "replay": info,
         }
 
-    # ── jest / vitest / results-file adapters ─────────────────────────────
+    # ── jest / vitest / go / cargo / results-file adapters ────────────────
     # pytest is handled above. Anything else runs through the structured path:
-    # augment jest/vitest so they write a results file, and export
+    # augment jest/vitest so they write a results file (and `go test` with
+    # `-json` so it emits its event stream), and export
     # MINI_ORK_TEST_RESULTS_DIR so a gate script can write jest-JSON or JUnit
-    # XML to the same place.
+    # XML to the same place. Commands with no adapter and no results file fall
+    # through to the opaque exit-code instrument.
     if not base_cwd or not os.path.isdir(base_cwd):
         return {"passed": False, "reason": f"base cwd not a directory: {base_cwd!r}",
                 "unverified": True, "replay": None}
@@ -433,6 +437,10 @@ def replay_check(
         runner = "jest"
     elif "vitest" in runners:
         runner = "vitest"
+    elif "go" in runners:
+        runner = "go"
+    elif "cargo" in runners:
+        runner = "cargo"
     else:
         runner = "results-file"
 
@@ -458,7 +466,18 @@ def replay_check(
                         ).returncode
                 except OSError:
                     return -1, None
-                return rc, parse_results_dir(res_dir, cwd)
+                res = parse_results_dir(res_dir, cwd)
+                if res is None and runner in ("go", "cargo"):
+                    # These runners have no output-file flag: their structured
+                    # event stream IS stdout, which the run above captured to
+                    # the log. Parse it back so the delta gate gets per-test
+                    # ids instead of degrading to the exit-code instrument.
+                    try:
+                        text = Path(log).read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        return rc, None
+                    res = parse_log_results(text, cwd, runner)
+                return rc, res
 
             cand_rc, cand_res = _run_structured(cand_cwd, cand_log, cand_res_dir)
             base_rc, base_res = _run_structured(base_cwd, b_log, base_res_dir)
@@ -477,8 +496,8 @@ def replay_check(
         # script, `make test`, `go test ./...`). Refusing every such command is
         # the reported defect; `_opaque_delta` judges it fail-closed. The runs
         # already happened above (augment_for_results is a no-op for a command
-        # with no jest/vitest word), so reuse their exit codes and logs rather
-        # than re-running the suite twice more.
+        # with no adapter), so reuse their exit codes and logs rather than
+        # re-running the suite twice more.
         return _opaque_delta(
             candidate_rc=cand_rc, base_rc=base_rc,
             candidate_log=cand_log, base_log=b_log,

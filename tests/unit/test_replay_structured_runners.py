@@ -213,3 +213,129 @@ def test_opaque_unrunnable_baseline_is_not_a_delta(tmp_path):
     assert result["passed"] is False, result
     assert result["unverified"] is True
     assert "could not run" in result["reason"]
+
+
+# ── 9. go test -json adapter (no go toolchain required) ──────────────────────
+#
+# A repo with no pytest entrypoint may still run `go test`. The adapter
+# augments the command with `-json` and parses the event stream back from the
+# run log (go has no output-file flag). The fake `go` shim prints the same
+# NDJSON a real `go test -json` emits.
+
+FAKE_GO = """#!/usr/bin/env python3
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+if "test" not in args:
+    sys.exit(0)  # only `go test` is exercised here
+
+src = open(os.path.join(os.getcwd(), "add.js")).read()
+buggy = "a - b" in src
+pkg = "example.com/m"
+
+
+def emit(action, test=None):
+    ev = {"Action": action, "Package": pkg, "Elapsed": 0}
+    if test:
+        ev["Test"] = test
+    print(json.dumps(ev))
+
+
+emit("run", "TestAdd")
+if buggy:
+    emit("fail", "TestAdd")
+    emit("fail")
+    sys.exit(1)
+emit("pass", "TestAdd")
+emit("pass")
+sys.exit(0)
+"""
+
+# Base fails to BUILD (no per-test outcome) while the candidate passes: the
+# only base signal is a build-fail, which is a load failure, not an assertion.
+FAKE_GO_BUILD_FAIL = """#!/usr/bin/env python3
+import json
+import os
+import sys
+
+src = open(os.path.join(os.getcwd(), "add.js")).read()
+buggy = "a - b" in src
+pkg = "example.com/m"
+if buggy:
+    print(json.dumps({"Action": "build-fail", "ImportPath": pkg}))
+    sys.exit(1)
+print(json.dumps({"Action": "pass", "Package": pkg, "Test": "TestAdd"}))
+print(json.dumps({"Action": "pass", "Package": pkg}))
+sys.exit(0)
+"""
+
+FAKE_CARGO = """#!/usr/bin/env python3
+import json
+import os
+import sys
+
+src = open(os.path.join(os.getcwd(), "add.js")).read()
+buggy = "a - b" in src
+print(json.dumps({"type": "suite", "event": "started", "test_count": 1}))
+print(json.dumps({
+    "type": "test",
+    "event": "failed" if buggy else "ok",
+    "name": "tests::test_add",
+}))
+sys.exit(1 if buggy else 0)
+"""
+
+
+def _install_shim(bindir: Path, name: str, body: str) -> None:
+    shim = bindir / name
+    shim.write_text(body)
+    shim.chmod(0o755)
+
+
+def test_go_test_json_fail_to_pass_is_proven(tmp_path, monkeypatch):
+    base, cand = _make_trees(tmp_path, base_buggy=True)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    _install_shim(bindir, "go", FAKE_GO)
+    _patch_path(monkeypatch, bindir)
+
+    result = replay_check("go test ./...", base_cwd=str(base), candidate_cwd=str(cand))
+
+    assert result["passed"] is True, result
+    assert result["unverified"] is False
+    assert result["weak"] is False, result  # a real failing assertion
+    assert result["replay"]["runner"] == "go"
+    assert result["replay"]["overlap"] == ["example.com/m::TestAdd"]
+
+
+def test_go_build_failure_on_base_is_not_a_pass(tmp_path, monkeypatch):
+    """A base that cannot build yields only a load-failure id, which never
+    overlaps a per-test pass — the replay must NOT mint a pass from it."""
+    base, cand = _make_trees(tmp_path, base_buggy=True)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    _install_shim(bindir, "go", FAKE_GO_BUILD_FAIL)
+    _patch_path(monkeypatch, bindir)
+
+    result = replay_check("go test ./...", base_cwd=str(base), candidate_cwd=str(cand))
+
+    assert result["passed"] is False, result
+    assert result["replay"]["overlap"] == [], result["replay"]
+    assert result["replay"]["base_failed"] == ["example.com/m::<suite load failure>"], result
+
+
+def test_cargo_test_json_fail_to_pass_is_proven(tmp_path, monkeypatch):
+    base, cand = _make_trees(tmp_path, base_buggy=True)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    _install_shim(bindir, "cargo", FAKE_CARGO)
+    _patch_path(monkeypatch, bindir)
+
+    result = replay_check("cargo test", base_cwd=str(base), candidate_cwd=str(cand))
+
+    assert result["passed"] is True, result
+    assert result["unverified"] is False
+    assert result["replay"]["runner"] == "cargo"
+    assert result["replay"]["overlap"] == ["tests::test_add"]
