@@ -172,8 +172,17 @@ def context_assemble(task_brief_path: str, workflow_node: str,
         # Run-level, not trace-level. The old query picked the newest 10 TRACE
         # rows, so one 8-node run filled the whole block with contentless
         # per-node rows ("success · 12s · $0.01"), and a run's real shape (did
-        # it land? what did it cost? its reward?) was never visible. Collapse to
-        # <=5 runs and carry the outcome payload the reader actually needs.
+        # it land? what did it cost?) was never visible. Collapse to <=5 runs
+        # and carry the outcome payload the reader actually needs.
+        #
+        # The old payload also carried `reward_g = MAX(reward_g)`. That reward
+        # is SATURATED — 5k+ traces pin it at 1.0 regardless of whether the
+        # work landed, including the verifier@v1 "reward" that just echoes the
+        # node_type. A constant 1.0 is not a success signal; it is circular
+        # evidence that made every prior run read as a proven success (the very
+        # defect similar_lessons flags). Ship a discriminating `outcome` derived
+        # from what actually happened — an artifact landing and the pass/fail
+        # mix — and drop the reward entirely.
         for r in con.execute("""
             SELECT COALESCE(run_id, trace_id) AS run_key,
                    COUNT(*) AS nodes,
@@ -182,22 +191,32 @@ def context_assemble(task_brief_path: str, workflow_node: str,
                    SUM(COALESCE(cost_usd, 0)) AS cost_usd,
                    SUM(COALESCE(duration_ms, 0)) AS duration_ms,
                    MAX(created_at) AS last_at,
-                   MAX(COALESCE(reward_g, 0)) AS reward_g,
                    MAX(COALESCE(final_artifact_ref, '')) AS artifact_ref
             FROM execution_traces
             WHERE task_class = ? AND (? = '' OR run_id IS NULL OR run_id != ?)
             GROUP BY run_key
             ORDER BY last_at DESC LIMIT 5
         """, (task_class, cur_run, cur_run)).fetchall():
+            nodes = int(r["nodes"] or 0)
+            non_success = int(r["non_success"] or 0)
+            artifact_ref = r["artifact_ref"] or ""
+            if artifact_ref and non_success == 0:
+                outcome = "landed"
+            elif artifact_ref:
+                outcome = f"landed with {non_success} non-success node(s)"
+            elif non_success >= nodes and nodes:
+                outcome = "failed (no artifact)"
+            else:
+                outcome = "no artifact"
             prior_runs.append({
                 "cite": f"execution_traces/{r['run_key']}",
                 "run_id": r["run_key"],
-                "nodes": int(r["nodes"] or 0),
-                "non_success_nodes": int(r["non_success"] or 0),
+                "nodes": nodes,
+                "non_success_nodes": non_success,
                 "cost_usd": round(float(r["cost_usd"] or 0.0), 3),
                 "duration_ms": int(r["duration_ms"] or 0),
-                "reward_g": float(r["reward_g"] or 0.0),
-                "artifact_ref": r["artifact_ref"] or "",
+                "outcome": outcome,
+                "artifact_ref": artifact_ref,
                 "created_at": r["last_at"]})
     except Exception:
         pass

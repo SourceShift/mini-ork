@@ -1103,12 +1103,20 @@ def _pack_prior_runs_items(value: Any) -> list[dict[str, Any]]:
         if nodes:
             bits.append(f"{nodes} nodes")
         bits += [f"${cost:.2f}", f"{duration_ms // 1000}s"]
-        reward = pr.get("reward_g")
-        try:
-            if reward not in (None,) and float(reward):
-                bits.append(f"reward {float(reward):.2f}")
-        except (TypeError, ValueError):
-            pass
+        # Prefer the discriminating `outcome` (landed / failed / no artifact).
+        # The old `reward_g` was a saturated 1.0 and is no longer emitted; keep
+        # the read for one release so packs written before this change still
+        # render, but never lead with a constant.
+        outcome = str(pr.get("outcome") or "").strip()
+        if outcome:
+            bits.append(outcome)
+        else:
+            reward = pr.get("reward_g")
+            try:
+                if reward is not None and float(reward) not in (0.0, 1.0):
+                    bits.append(f"reward {float(reward):.2f}")
+            except (TypeError, ValueError):
+                pass
         if bad:
             bits.append(f"{bad} non-success")
         if created_at:
@@ -1277,6 +1285,12 @@ def _learnings_tab(run: Run) -> list[dict[str, Any]]:
                 sections.append(S.lst(f"Constraints (injected) · {len(cons)}", detail, full=True))
             else:
                 items.append(S.dot("Constraints", "none injected"))
+            themes = v2.get("themes") if isinstance(v2.get("themes"), list) else []
+            if themes:
+                detail = [S.item(str(t.get("text") or "")[:180], str(t.get("id") or ""))
+                          for t in themes if isinstance(t, dict)]
+                items.append(S.ok("Verified lessons", f"{len(themes)} injected"))
+                sections.append(S.lst(f"Verified lessons (injected) · {len(themes)}", detail, full=True))
             contract = v2.get("contract") if isinstance(v2.get("contract"), dict) else {}
             ff = v2.get("file_findings") if isinstance(v2.get("file_findings"), list) else []
             if ff:

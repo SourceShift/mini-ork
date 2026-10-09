@@ -362,6 +362,42 @@ def prior_attempts(kickoff_path: str, *, db: str | None = None,
     return out
 
 
+def verified_themes(task_class: str, *, db: str | None = None,
+                    limit: int = 5) -> list[dict]:
+    """Authored, verified theme lessons for ``task_class`` (or the ``'*'``
+    wildcard), strongest first. The v1 arm has carried these since the
+    ``lesson_themes`` table landed, but the v2 pack — the LIVE arm — never did,
+    so an approved lesson could reach a holdout run and not a normal one.
+
+    A row counts only when it is ``status='verified'``, ``kind='task'``, and
+    carries a non-blank authored ``lesson_text`` (written by grounded pattern
+    induction — never invented here). Cold-safe: a missing table or column is
+    an empty list, because this runs on the injection path where a raise would
+    abort a dispatch whose spend already happened.
+    """
+    con = _connect_ro(db)
+    if con is None or limit <= 0:
+        return []
+    try:
+        rows = con.execute(
+            """
+            SELECT theme_id, lesson_text, n_runs
+            FROM lesson_themes
+            WHERE status = 'verified' AND kind = 'task'
+              AND lesson_text IS NOT NULL AND TRIM(lesson_text) <> ''
+              AND (task_class = ? OR task_class = '*')
+            ORDER BY n_runs DESC, last_seen DESC LIMIT ?
+            """,
+            (task_class, int(limit)),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        con.close()
+    return [{"id": f"t:{r['theme_id']}", "text": str(r["lesson_text"]).strip(),
+             "n_runs": int(r["n_runs"] or 0)} for r in rows]
+
+
 # ── recurring problems (TF-IDF, themes helpers) ──────────────────────────────
 
 def clean_issue(text: str) -> str:
@@ -501,6 +537,7 @@ def build(kickoff_path: str, *, task_class: str = "", db: str | None = None,
                 if _SEVERITY_RANK.get(str(c["worst_severity"]).lower(), 0) >= floor]
     clusters = clusters[:max_clusters]
     prior = prior_attempts(kickoff_path, db=db, current_run=run_id)
+    themes = verified_themes(task_class, db=db)
     constraints = _constraint_items(contract)
     return {
         "version": 2,
@@ -518,9 +555,10 @@ def build(kickoff_path: str, *, task_class: str = "", db: str | None = None,
         "constraints": constraints,
         "file_findings": clusters,
         "prior_attempts": prior,
+        "themes": themes,
         "n_findings_scanned": len(findings),
         "item_ids": ([c["id"] for c in constraints] + [c["id"] for c in clusters]
-                     + [p["id"] for p in prior]),
+                     + [p["id"] for p in prior] + [t["id"] for t in themes]),
         "built_at": int(time.time()),
     }
 
@@ -545,14 +583,18 @@ def render(pack: dict, role: str = "planner", *, budget_chars: int = 6000) -> st
     constraints = pack.get("constraints") or []
     clusters = list(pack.get("file_findings") or [])
     prior = list(pack.get("prior_attempts") or [])
-    if not (constraints or clusters or prior):
+    themes = list(pack.get("themes") or [])
+    if not (constraints or clusters or prior or themes):
         return ""
 
-    def compose(clusters, prior) -> str:
+    def compose(clusters, prior, themes) -> str:
         lines = ["--- Context for this task (selected by the files in scope and the kickoff) ---"]
         if constraints:
             lines.append("Hard constraints from the kickoff:")
             lines += [f"- [{c['id']}] {c['text']}" for c in constraints]
+        if themes:
+            lines.append("Lessons verified on earlier runs of this task class:")
+            lines += [f"- [{t['id']}] {t['text']}" for t in themes]
         if clusters:
             lines.append("Problems reviewers already found in these files. Do not repeat them:")
             for c in clusters:
@@ -571,13 +613,18 @@ def render(pack: dict, role: str = "planner", *, budget_chars: int = 6000) -> st
         lines.append("--- /context ---")
         return "\n".join(lines) + "\n"
 
-    text = compose(clusters, prior)
+    text = compose(clusters, prior, themes)
     while len(text) > budget_chars and prior:
         prior.pop()
-        text = compose(clusters, prior)
+        text = compose(clusters, prior, themes)
     while len(text) > budget_chars and clusters:
         clusters.pop()
-        text = compose(clusters, prior)
+        text = compose(clusters, prior, themes)
+    # Dropped last: a verified, authored lesson is the highest-signal line we
+    # carry, so it outlives the machine-clustered findings under budget pressure.
+    while len(text) > budget_chars and themes:
+        themes.pop()
+        text = compose(clusters, prior, themes)
     return text
 
 
