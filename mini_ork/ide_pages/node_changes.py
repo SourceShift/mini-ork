@@ -7,10 +7,12 @@ a real run:
 * ``result`` — per-node-type items drawn from the node's result artifacts
   (``review-<id>.json`` / ``verifier_<id>.json`` / ``plan.json`` /
   ``lens-<id>.md`` / ``rolled-back.json`` / per-node files-by-name).
-* ``files`` + ``diff`` — the run's cumulative code changes as of this
-  node. Empty for nodes that ran before any code-changing node, with
-  ``diff_note`` saying so. Capped at 300 KB with ``diff_note`` saying
-  when the cap fires.
+* ``files`` + ``diff`` — node-scoped. A code-changing node (implementer /
+  worker / writer / drafter) shows the run's cumulative changes as of this
+  node, capped at 300 KB with ``diff_note`` saying when the cap fires; every
+  other node shows only the files *it* edited (usually none), with
+  ``diff_note`` saying so. Never the run's diff borrowed onto a verifier or
+  reviewer.
 * ``commits`` — ``git log --numstat <base_sha>..<branch>`` on the
   workspace when it still exists; the publisher-recorded commit from
   ``publish.json`` / ``verdict.json`` / ``run-verdict.json`` otherwise;
@@ -87,15 +89,28 @@ def build_changes_view(run: Run, node: Node) -> dict[str, Any]:
          "commits_note": str,
          "agent_edits": [{path, tool, added, removed, diff}],
          "agent_edits_note": str}
+
+    ``files`` / ``diff`` are **node-scoped**. A code-changing node
+    (``implementer`` / ``worker`` / ``writer`` / ``drafter``) owns the run's
+    change set, so it keeps the cumulative view from the diff source. Every
+    other node (verifier, reviewer, publisher, …) changed nothing of its own,
+    so it must not borrow the implementer's diff: its files come from its own
+    transcript edits (:func:`_own_edits`), which is usually empty. Without
+    this a ``test`` node's Overview listed the implementer's ``calc.py`` and
+    the run's ``.pyc`` noise as if the verifier had written them.
     """
     # Fix #4 + #5: load diffs once per build; pass ``run`` so the git
     # fallback can resolve ``run.workspace`` (base_sha / branch / path).
     diff_entries, diff_text, diff_source = _load_diffs(run)
     title, items = _result_items(run, node)
-    show_diff = _show_diff_for(run, node)
-    files, files_note = _files_and_note(run, show_diff, diff_entries, diff_source)
-    diff, cap_note = _diff_text(files, diff_entries, diff_text) if show_diff else ("", "")
-    diff_note = " ".join(n for n in (files_note, cap_note) if n)
+    owns_run_diff = str(node.type or "") in _CODE_CHANGING_TYPES
+    show_diff = _show_diff_for(run, node) and owns_run_diff
+    if show_diff:
+        files, files_note = _files_and_note(run, show_diff, diff_entries, diff_source)
+        diff, cap_note = _diff_text(files, diff_entries, diff_text)
+        diff_note = " ".join(n for n in (files_note, cap_note) if n)
+    else:
+        files, diff, diff_note = _own_edits(run, node)
     commits, commits_note = _commits(run)
     agent_edits, agent_edits_note = _agent_edits(run, node)
     return {
@@ -108,6 +123,33 @@ def build_changes_view(run: Run, node: Node) -> dict[str, Any]:
         "agent_edits": agent_edits,
         "agent_edits_note": agent_edits_note,
     }
+
+
+def _own_edits(run: Run, node: Node) -> tuple[list[dict[str, Any]], str, str]:
+    """The files THIS node changed, from its own transcript edits.
+
+    The node-scoped counterpart of :func:`_files_and_note`: same
+    ``{path, added, removed, abs}`` file shape and a plain diff body, but
+    sourced from the node's own edit-family tool calls rather than the run's
+    cumulative diff. Returns ``(files, diff, note)``; an empty list carries a
+    note so the IDE says *why* the section is empty instead of drawing a bare
+    heading (mirrors ``_files_and_note``'s "No code changed by this point.").
+    """
+    edits = _agent_edits(run, node)[0]
+    if not edits:
+        return [], "", "No code changed by this node."
+    project = run.home.absolute().parent
+    files: list[dict[str, Any]] = []
+    for edit in edits:
+        display, absolute = _project_file_lazy(str(edit.get("path") or ""), project, run)
+        files.append({
+            "path": display,
+            "added": int(edit.get("added") or 0),
+            "removed": int(edit.get("removed") or 0),
+            "abs": absolute,
+        })
+    diff = "\n".join(str(e.get("diff") or "") for e in edits if e.get("diff"))
+    return files, diff, ""
 
 
 # ── per-node-type result items ─────────────────────────────────────────────

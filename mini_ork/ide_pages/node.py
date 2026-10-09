@@ -2652,8 +2652,9 @@ def _overview_view(run: Run, node: Node, session_path: Path | None,
     * ``facts`` — kv rows for Status / Model / Started / Ended / Duration /
       Cost (+ calls) / Turns / Tokens / Exit code (command nodes).
     * ``result`` — reuses :func:`mini_ork.ide_pages.node_changes._result_items`.
-    * ``files`` + ``diff`` + ``diff_note`` — the run-cumulative changes view,
-      reused verbatim from :func:`build_changes_view`.
+    * ``files`` + ``diff`` + ``diff_note`` — node-scoped changes, reused
+      verbatim from :func:`build_changes_view`: the run's cumulative diff for
+      a code-changing node, only the node's own edits for every other node.
     * ``final`` — ``{"text": markdown}``: the agent's final message (transcript
       ``result`` text else last assistant text block), capped at
       :data:`USER_FULL_CAP` (200,000 chars).
