@@ -1612,6 +1612,79 @@ def _write_evidence_ledger_row(ctx: NodeDispatch, script: str, ev: str, rc: int,
         print(f"  [warn] evidence-ledger write skipped: {exc}", file=sys.stderr)
 
 
+def _verifier_result_name(ctx: NodeDispatch) -> str:
+    """The ``verifier_name`` key the abstain gate groups calibration slices by.
+
+    A declared ``verifier_ref`` (e.g. ``verifiers/typecheck.py``) yields its
+    stem (``typecheck``); the canonical verifier yields ``verifier@v1`` — the
+    same identity the trace layer stamps as ``reward_source``, so a
+    ``verifier_results`` slice lines up with the traces it explains.
+    """
+    ref = (ctx.verifier_ref or "").strip()
+    if ref:
+        stem = os.path.basename(ref)
+        for suf in (".sh", ".py"):
+            if stem.endswith(suf):
+                stem = stem[:-3]
+        if stem:
+            return stem
+    return "verifier@v1"
+
+
+def _rubric_axes_json(run_dir: str) -> str | None:
+    """The scored rubric axes for this run (``rubric.json`` items), else None.
+
+    The items carry the per-criterion label/verdict/note the verifier actually
+    reasoned over; persisting them is what turns a bare pass/fail into an
+    auditable verdict. ``None`` (no rubric, or no items) stores NULL."""
+    path = os.path.join(run_dir, "rubric.json") if run_dir else ""
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        doc = json.load(open(path, encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    items = doc.get("items") if isinstance(doc, dict) else None
+    if not items:
+        return None
+    try:
+        return json.dumps(items)
+    except (TypeError, ValueError):
+        return None
+
+
+def _record_verifier_result(ctx: NodeDispatch, verdict: str) -> None:
+    """Persist one ``verifier_results`` row for this verifier node (enrichment only).
+
+    ``verifier_results`` (migration 0025) is the labelled history
+    ``gates.abstain_gate`` reads to calibrate its LTT confidence threshold and
+    the table an operator annotates with ground-truth FP/FN flags — yet before
+    this wire it stayed empty while 8k+ traces claimed
+    ``reward_source='verifier@v1'``. ``verdict`` is one of the DDL enum
+    ``pass|fail|indeterminate|vacuous``; anything else would trip the CHECK and
+    be swallowed below.
+
+    ``confidence`` is left NULL by design: the verifier emits a pass/fail
+    rubric, not a calibrated posterior, and inventing one would poison the
+    conformal calibration the gate computes over this column. The row still
+    carries the verdict and the scored axes for audit.
+
+    Best-effort: a recording failure must never fail a verifier node, so every
+    exception is swallowed (mirrors ``_write_evidence_ledger_row``).
+    """
+    if not ctx.db or not ctx.run_id:
+        return
+    try:
+        from mini_ork.gates.verifier_rubric import verifier_result_record  # noqa: PLC0415
+
+        verifier_result_record(
+            ctx.db, ctx.run_id, _verifier_result_name(ctx), verdict,
+            scored_axes_json=_rubric_axes_json(ctx.run_dir_eff or ctx.run_dir),
+        )
+    except Exception as exc:  # noqa: BLE001 — enrichment must never fail the node
+        print(f"  [warn] verifier_results write skipped: {exc}", file=sys.stderr)
+
+
 def _handle_verifier(ctx: NodeDispatch):
     post_impl = not _verifier_runs_before_implementer(ctx.workflow, ctx.node_id)
 
@@ -1621,10 +1694,22 @@ def _handle_verifier(ctx: NodeDispatch):
         if post_impl and not _required_artifacts_ok(ctx.plan_path):
             print("  [fail] verifier node: verifier did not produce its required artifact(s)",
                   file=sys.stderr)
+            _record_verifier_result(ctx, "fail")
             return 1, "error"
         if ctx.publish_declared_outputs():
+            _record_verifier_result(ctx, "pass")
             return 0, "done"
+        _record_verifier_result(ctx, "fail")
         return 1, "artifact_contract"
+
+    def _finish(rc: int):
+        # The rc-0 exit is the verifier's own pass; a non-zero rc is a fail.
+        # Recording here (not in _publish_success) is what captures the FAIL
+        # rows the abstain gate's calibration window also reads.
+        if rc == 0:
+            return _publish_success()
+        _record_verifier_result(ctx, "fail")
+        return 1, "error"
 
     # Hollow-run guard: fail before any verifier runs if the recipe declares a
     # concrete run-local artifact (absolute contract path) that is missing or
@@ -1634,6 +1719,9 @@ def _handle_verifier(ctx: NodeDispatch):
     # Artifacts the verifiers themselves write are checked after they run.
     if post_impl and not _required_artifacts_ok(ctx.plan_path, skip_verifier_outputs=True):
         print("  [fail] verifier node: required artifact(s) missing or empty", file=sys.stderr)
+        # The verifier never ran — 'vacuous' is the DDL's "produced nothing
+        # meaningful" verdict; recording it keeps the audit trail honest.
+        _record_verifier_result(ctx, "vacuous")
         return _verifier_not_executed(ctx, "required artifact(s) missing or empty before the verifier ran")
     artifact = ""
     try:
@@ -1685,13 +1773,13 @@ def _handle_verifier(ctx: NodeDispatch):
                 shutil.copy(ev, os.path.join(persist_dir, f"verifier_{vstem}.json"))
             except OSError:
                 pass
-        return _publish_success() if rc == 0 else (1, "error")
+        return _finish(rc)
     module_env = _module_env(ctx.root)
     rc = subprocess.run([
         sys.executable, "-m", "mini_ork.cli.verify", "--plan", ctx.plan_path,
         "--task-class", ctx.task_class, artifact,
     ], env=module_env).returncode
-    return _publish_success() if rc == 0 else (1, "error")
+    return _finish(rc)
 
 
 def _handle_publisher(ctx: NodeDispatch):
