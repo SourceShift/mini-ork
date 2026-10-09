@@ -6,6 +6,11 @@
 # imported at module-load time, so a malformed card fails the catalog load
 # rather than regressing `mini_ork.verify.behavioral`'s pure-stdlib contract.
 #
+# `recipe` names the consuming recipe: recipes/post-mvp-delivery lists
+# `verifiers/api_contract.py` in its artifact_contract success_verifiers and
+# ships the recipe-local observable that drives the live probe. Empty would
+# mean the verifier is orphaned — the "producer built, never consumed" shape.
+#
 # Stats below are seeded manually for the P3 kickoff — no fitted IRT model
 # yet. card_score = discrimination * consistency * (1/(1+cost)) - fuzz_penalty.
 
@@ -13,7 +18,7 @@ name: api_contract
 kind: behavioral
 surface: api
 cost: 0.10
-recipe: ""
+recipe: recipes/post-mvp-delivery
 
 stats:
   discrimination: 0.78

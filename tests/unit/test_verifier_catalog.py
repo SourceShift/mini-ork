@@ -1,9 +1,14 @@
 """P3: behavioral verifier catalog (load, rank, score, malformed-card)."""
 from __future__ import annotations
 
+import importlib.util
+import json
+import os
 import textwrap
+from pathlib import Path
 
 import pytest
+import yaml
 
 from mini_ork.verify.catalog import (
     VerifierCard,
@@ -12,6 +17,8 @@ from mini_ork.verify.catalog import (
     load_cards,
     rank_verifiers,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _stats(discrimination=0.8, consistency=0.9, fuzz_penalty=0.05, n=10):
@@ -183,3 +190,85 @@ def test_load_cards_raises_on_missing_required_name(tmp_path):
 
 def test_load_cards_returns_empty_for_empty_dir(tmp_path):
     assert load_cards(tmp_path) == []
+
+
+# ─── wiring: the api_contract card is consumed by a recipe ───────────────── #
+def _load_recipe_dispatcher():
+    """Import the recipe-local api_contract dispatcher by path (its directory
+    is hyphenated, so it is not importable by name)."""
+    path = REPO_ROOT / "recipes" / "post-mvp-delivery" / "verifiers" / "api_contract.py"
+    spec = importlib.util.spec_from_file_location("mo_pmd_api_contract", path)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_repo_api_contract_card_is_wired_to_its_consuming_recipe():
+    """Guards the "producer built, never consumed" shape: the shipped card must
+    name the recipe that actually lists the verifier in its success_verifiers."""
+    cards = {c.name: c for c in load_cards(REPO_ROOT / "verifiers", "*.card.yaml")}
+    assert "api_contract" in cards
+    card = cards["api_contract"]
+    # A non-empty recipe pointer is what makes the card consumed rather than orphaned.
+    assert card.recipe == "recipes/post-mvp-delivery"
+
+    recipe_dir = REPO_ROOT / card.recipe
+    assert recipe_dir.is_dir(), f"card recipe {card.recipe!r} is not a recipe dir"
+    contract = yaml.safe_load((recipe_dir / "artifact_contract.yaml").read_text(encoding="utf-8"))
+    assert "verifiers/api_contract.py" in (contract.get("success_verifiers") or [])
+    # The recipe-local dispatcher and the observable it defaults to must exist,
+    # or the wiring resolves to the (observable-less) top-level seed and abstains.
+    assert (recipe_dir / "verifiers" / "api_contract.py").is_file()
+    assert (recipe_dir / "verifiers" / "api_contract.observable.yaml").is_file()
+
+
+def test_api_contract_dispatcher_bridges_unverified_to_vacuous_envelope():
+    """The bridge turns the behavioral engine's UNVERIFIED (exit 1, multi-line
+    verdict) into the dispatcher's single-line vacuous envelope at exit 0, so
+    `mini_ork/cli/verify.py` records it as unmeasured — never a pass, never a
+    hard fail. PROVEN/REFUTED pass through unchanged."""
+    mod = _load_recipe_dispatcher()
+
+    unverified = json.dumps({"status": "UNVERIFIED", "evidence": "no staging_url"})
+    out, code = mod._bridge(unverified + "\n", 1)
+    assert code == 0
+    # The engine's own verdict is preserved, then the vacuous envelope is last
+    # (verify.py scans backwards for the last single-line JSON object).
+    assert out.startswith(unverified)
+    envelope = json.loads(out.splitlines()[-1])
+    assert envelope["verdict"] == "vacuous"
+    assert envelope["pass"] is None
+
+    # A verdict with no trailing newline still gets the envelope on its own line.
+    out2, code2 = mod._bridge(unverified, 1)
+    assert code2 == 0
+    assert json.loads(out2.splitlines()[-1])["pass"] is None
+
+    proven = json.dumps({"status": "PROVEN", "pass": True})
+    assert mod._bridge(proven, 0) == (proven, 0)
+
+    refuted = json.dumps({"status": "REFUTED", "pass": False})
+    assert mod._bridge(refuted, 1) == (refuted, 1)
+
+
+def test_api_contract_dispatcher_defaults_observable_env(monkeypatch, capsys):
+    """`main()` exports MO_OBSERVABLE_SPEC pointing at the recipe-local descriptor
+    when the operator has not supplied one, then abstains (vacuous, exit 0) on
+    the unprobeable default surface."""
+    mod = _load_recipe_dispatcher()
+    monkeypatch.delenv("MO_OBSERVABLE_SPEC", raising=False)
+    monkeypatch.delenv("MO_BEHAV_SURFACE", raising=False)
+    monkeypatch.setenv("MO_STAGING_URL", "")  # empty base → no protocol → unreachable
+    try:
+        rc = mod.main()
+        assert rc == 0
+        spec_env = os.environ.get("MO_OBSERVABLE_SPEC", "")
+        assert os.path.basename(spec_env) == "api_contract.observable.yaml"
+        assert os.path.isfile(spec_env)
+        out = capsys.readouterr().out
+    finally:
+        # main() setdefaults the var; remove it so the addition cannot leak.
+        os.environ.pop("MO_OBSERVABLE_SPEC", None)
+    envelope = [ln for ln in out.splitlines() if ln.startswith("{")]
+    assert envelope and json.loads(envelope[-1])["pass"] is None

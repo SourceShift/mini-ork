@@ -4,6 +4,12 @@ expected_artifact: options_then_delivery_plan
 success_verifiers:
   - verifiers/options-completeness.py
   - verifiers/selected-option-gate.py
+  # Behavioral layer: probes the delivered staging surface live. Resolves to the
+  # recipe-local dispatcher (recipes/post-mvp-delivery/verifiers/api_contract.py),
+  # which defaults MO_OBSERVABLE_SPEC to the recipe-local descriptor and records
+  # an UNVERIFIED surface as unmeasured rather than a fail. PROVEN/REFUTED count
+  # as a normal pass/fail.
+  - verifiers/api_contract.py
 
 failure_policy: request_user_choice
 rollback_policy: >
