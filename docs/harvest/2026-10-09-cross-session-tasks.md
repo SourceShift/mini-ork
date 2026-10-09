@@ -81,8 +81,25 @@ handed to mini-ork — researcher is outside this harvest's scope (mini-ork +
 ContextNest).
 
 - in_progress — Prod book job `job_1791227051195_4751f7cc` ("Turning Clients Into
-  Referrals"): ch1 committed; ch2 recorded failed because the job was paused by
-  the user mid-attempt and the awaiting-author seam aborts on a stopped job.
+  Referrals"): ch1 committed; ch2's `failed` is a **pause artefact, not a defect**
+  (peer-corrected 2026-10-10, evidence below). By design:
+  - Job FSM `generating -> paused`, action `pause`, actor `user:8788fa63-…`, at
+    2026-10-09 08:42:17 — the user paused it.
+  - The in-flight ch2 attempt ran to the W9 seam, raised one blocking question at
+    08:43:44, then `awaitAuthorAnswers` (`…/authorQuestions/awaitAuthorAnswers.ts:24`)
+    saw a STOPPED_JOB_STATES FSM and returned `{stopped:true}` — deliberately
+    without marking anything.
+  - `chapterInternalDagDispatch.ts:1716` turned that into a `NonRetryableError` so
+    Hatchet would not silently re-run a paused job; that throw wrote `failed`.
+  - `failed` is a retryable bucket owned by the advance sweep, not terminal —
+    `localBookAdvanceBackstop.ts:327-339` keeps `'failed'` in the
+    orphan-candidate set ("nothing is executing and advanceBook owns the retry").
+    The book is not stuck on it.
+  - ch1 completed while carrying two still-open **non-blocking** questions — the
+    intended asymmetry: only `blocking = true` gates a chapter.
+  - Only real critique is **labelling**: `failed` conflates "chapter defect" with
+    "operator paused mid-attempt" (a naming/UX question, not plumbing). Still
+    user-gated; no work started.
 - pending — Ledger failed mini-ork runs (status=failed, $0, carrying the run id)
   so the compose debug view can open their agent logs
   (`server/services/bookGeneration/miniOrkRunLogService.ts`).
