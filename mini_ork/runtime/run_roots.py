@@ -8,8 +8,9 @@ not equal the resolved target).
 
 The target-resolution ladder is byte-identical to ``_resolve_target_cwd``
 in :mod:`mini_ork.cli.execute`: explicit ``MO_TARGET_CWD`` git toplevel,
-then the kickoff's git toplevel, then the kickoff dir, then cwd. The two
-helpers exist side-by-side so a parity test can cross-check them — and
+then the kickoff's git toplevel, then an explicit ``MINI_ORK_TARGET_REPO``
+that resolves to a non-engine git repo, then the kickoff dir, then cwd. The
+two helpers exist side-by-side so a parity test can cross-check them — and
 ``_resolve_target_cwd`` is reduced to a thin wrapper that delegates here.
 
 With no ``roots`` record (legacy run dirs created before this landed),
@@ -80,6 +81,33 @@ def _git_toplevel_from_dir(kdir: str) -> str:
     return ""
 
 
+def _repo_under_engine_guard(src: Mapping[str, str]) -> str:
+    """git-toplevel of an explicit ``MINI_ORK_TARGET_REPO``, unless it is the engine.
+
+    Returns ``""`` when the var is unset, is not a directory, is not a git
+    repo, or resolves to the same tree as ``MINI_ORK_ROOT`` /
+    ``MINI_ORK_ENGINE_ROOT``. The engine exclusion is load-bearing:
+    ``bin/mini-ork`` defaults ``MINI_ORK_TARGET_REPO`` to the process cwd, so
+    when a run is launched from the engine that default would otherwise
+    re-introduce the CWT-A corruption the kickoff-dir fallback exists to
+    prevent. This rung therefore only ever fires for an operand that is
+    *both* a real repo and not the engine.
+    """
+    raw = (src.get("MINI_ORK_TARGET_REPO", "") or "").strip()
+    if not raw or not os.path.isdir(raw):
+        return ""
+    top = _git_toplevel(raw)
+    if not top:
+        return ""
+    engine = (src.get("MINI_ORK_ROOT", "")
+              or src.get("MINI_ORK_ENGINE_ROOT", "") or "").strip()
+    if engine:
+        eng_top = _git_toplevel(engine) or engine
+        if os.path.realpath(top) == os.path.realpath(eng_top):
+            return ""
+    return top
+
+
 def resolve_run_roots(run_dir: str, *, env: Mapping[str, str] | None = None) -> RunRoots:
     """Resolve the run's four roots from ``run_dir`` + current env.
 
@@ -105,6 +133,14 @@ def resolve_run_roots(run_dir: str, *, env: Mapping[str, str] | None = None) -> 
         if kickoff and os.path.isfile(kickoff):
             kdir = os.path.dirname(kickoff)
             target = _git_toplevel_from_dir(kdir)
+            if not target:
+                # An explicit MINI_ORK_TARGET_REPO is a stronger signal of intent
+                # than the bare kickoff dir, so honor it — but ONLY once the
+                # kickoff's own repo has been ruled out (the "kickoff repo wins
+                # over cwd" guarantee above stays intact), and never when it
+                # resolves to the engine (the CWT-A hazard). When nothing
+                # qualifies, fall back to the kickoff dir for bash parity.
+                target = _repo_under_engine_guard(src)
             if not target:
                 # Bash parity: dirname(kickoff) on git failure — preserves the
                 # CWT-A corruption fix. Never fall through to os.getcwd().

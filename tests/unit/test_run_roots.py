@@ -107,6 +107,8 @@ def test_parity_kickoff_not_in_a_repo_falls_back_to_kickoff_dir(tmp_path, monkey
     monkeypatch.delenv("MO_TARGET_CWD", raising=False)
     monkeypatch.delenv("MINI_ORK_HOME", raising=False)
     monkeypatch.delenv("MINI_ORK_ROOT", raising=False)
+    monkeypatch.delenv("MINI_ORK_ENGINE_ROOT", raising=False)
+    monkeypatch.delenv("MINI_ORK_TARGET_REPO", raising=False)
     monkeypatch.delenv("MO_SHARED_DRIVE_BACKEND", raising=False)
     monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
 
@@ -279,3 +281,70 @@ def test_exec_cwd_recorded_when_shared_drive_opted_in(tmp_path, monkeypatch):
     assert roots.exec_cwd == os.path.abspath(str(drive_root))
     # The target stays the resolved git toplevel — not the drive redirect.
     assert roots.target == str(repo)
+
+
+# ─── MINI_ORK_TARGET_REPO rung: explicit repo beats the bare kickoff dir ─────
+
+
+def test_mini_ork_target_repo_honored_when_kickoff_not_in_a_repo(tmp_path, monkeypatch):
+    """Kickoff sits outside any repo; an explicit MINI_ORK_TARGET_REPO that IS a
+    repo wins over the bare kickoff-dir fallback (the observed footgun: a
+    kickoff staged in /tmp with MINI_ORK_TARGET_REPO set targeted /tmp)."""
+    bare = tmp_path / "norepo"
+    bare.mkdir()
+    kickoff = bare / "K.md"
+    kickoff.write_text("k")
+    repo = tmp_path / "target"
+    _init_repo(repo)
+    run_dir = tmp_path / "run"
+    _write_profile(run_dir, kickoff_path=str(kickoff))
+    monkeypatch.delenv("MO_TARGET_CWD", raising=False)
+    monkeypatch.delenv("MINI_ORK_ROOT", raising=False)
+    monkeypatch.delenv("MINI_ORK_ENGINE_ROOT", raising=False)
+    monkeypatch.delenv("MO_SHARED_DRIVE_BACKEND", raising=False)
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
+    monkeypatch.setenv("MINI_ORK_TARGET_REPO", str(repo))
+
+    assert run_roots.resolve_run_roots(str(run_dir)).target == str(repo)
+
+
+def test_kickoff_repo_still_wins_over_mini_ork_target_repo(tmp_path, monkeypatch):
+    """The new rung must NOT outrank the kickoff's own repo (CWT-A guarantee)."""
+    kickoff_repo = tmp_path / "kickoff-repo"
+    _init_repo(kickoff_repo)
+    other = tmp_path / "other"
+    _init_repo(other)
+    kickoff = kickoff_repo / "K.md"
+    kickoff.write_text("k")
+    run_dir = tmp_path / "run"
+    _write_profile(run_dir, kickoff_path=str(kickoff))
+    monkeypatch.delenv("MO_TARGET_CWD", raising=False)
+    monkeypatch.delenv("MINI_ORK_ROOT", raising=False)
+    monkeypatch.delenv("MINI_ORK_ENGINE_ROOT", raising=False)
+    monkeypatch.delenv("MO_SHARED_DRIVE_BACKEND", raising=False)
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
+    monkeypatch.setenv("MINI_ORK_TARGET_REPO", str(other))
+
+    assert run_roots.resolve_run_roots(str(run_dir)).target == str(kickoff_repo)
+
+
+def test_mini_ork_target_repo_pointing_at_engine_is_ignored(tmp_path, monkeypatch):
+    """A launcher-defaulted MINI_ORK_TARGET_REPO (= cwd) resolving to the engine
+    must not become the target — the CWT-A guard rejects it and the kickoff-dir
+    fallback stands."""
+    engine = tmp_path / "engine"
+    _init_repo(engine)
+    bare = tmp_path / "norepo"
+    bare.mkdir()
+    kickoff = bare / "K.md"
+    kickoff.write_text("k")
+    run_dir = tmp_path / "run"
+    _write_profile(run_dir, kickoff_path=str(kickoff))
+    monkeypatch.delenv("MO_TARGET_CWD", raising=False)
+    monkeypatch.delenv("MINI_ORK_ENGINE_ROOT", raising=False)
+    monkeypatch.delenv("MO_SHARED_DRIVE_BACKEND", raising=False)
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
+    monkeypatch.setenv("MINI_ORK_TARGET_REPO", str(engine))
+    monkeypatch.setenv("MINI_ORK_ROOT", str(engine))
+
+    assert run_roots.resolve_run_roots(str(run_dir)).target == str(bare)
