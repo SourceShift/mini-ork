@@ -566,3 +566,86 @@ def test_a_committed_fix_is_still_captured(tmp_path):
 
     patch = (tmp_path / "results.patches" / f"{first_task['id']}.patch").read_text()
     assert "+# committed fix" in patch
+
+
+# ── jest/vitest tasks ─────────────────────────────────────────────────────────
+
+
+def _mk_js_history(tmp_path: Path) -> dict[str, str]:
+    repo = tmp_path / "js_repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    shas: dict[str, str] = {}
+    shas["base"] = _commit(repo, "chore: base", {
+        "src/calc.js": "export function add(a, b) {\n  return a - b;\n}\n",
+        "src/calc.test.js": "// placeholder\n",
+    })
+    shas["fix"] = _commit(repo, "fix: add subtracted instead of adding", {
+        "src/calc.js": "export function add(a, b) {\n  return a + b;\n}\n",
+        "src/calc.test.js": "import { add } from './calc.js';\ntest('add works', () => {});\n",
+    })
+    return {"repo": str(repo), **shas}
+
+
+def _js_task(shas: dict[str, str]) -> dict:
+    return {
+        "id": f"mo-{shas['fix'][:10]}",
+        "fix_sha": shas["fix"],
+        "base_sha": shas["base"],
+        "problem_statement": "fix: add subtracted instead of adding",
+        "src_files": ["src/calc.js"],
+        "test_files": ["src/calc.test.js"],
+        "fail_to_pass": ["src/calc.test.js::add works"],
+        "pass_to_pass": ["src/calc.test.js::neg works"],
+        "split": "dev",
+        "difficulty": "easy",
+        "weak_signal": False,
+    }
+
+
+def _fake_js_runner(tmp_path: Path):
+    """A stand-in jest that writes a results file whose verdict tracks whether
+    the checked-out src carries the fix — no node/jest needed in CI."""
+    script = tmp_path / "fake_jest.py"
+    script.write_text(
+        "import json, os, sys\n"
+        "out = next(a.split('=', 1)[1] for a in sys.argv if a.startswith('--outputFile='))\n"
+        "cwd = os.getcwd()\n"
+        "suite = os.path.join(cwd, 'src', 'calc.test.js')\n"
+        "try:\n"
+        "    src = open(os.path.join(cwd, 'src', 'calc.js')).read()\n"
+        "except OSError:\n"
+        "    src = ''\n"
+        "fixed = 'a + b' in src\n"
+        "res = {'testResults': [{'name': suite, 'status': 'passed', 'assertionResults': [\n"
+        "    {'fullName': 'add works', 'status': 'passed' if fixed else 'failed'},\n"
+        "    {'fullName': 'neg works', 'status': 'passed'}]}]}\n"
+        "open(out, 'w').write(json.dumps(res))\n"
+    )
+    return lambda workdir: ("jest", [sys.executable, str(script)])
+
+
+def test_grade_dispatches_js_tests_to_the_repo_runner(tmp_path, monkeypatch):
+    h = _mk_js_history(tmp_path)
+    scratch = tmp_path / "scratch"
+    _git(Path(h["repo"]), "worktree", "add", "-q", "--detach", str(scratch), h["fix"])
+    monkeypatch.setattr(r.mht, "_locate_js_runner", _fake_js_runner(tmp_path))
+
+    row = r.grade(scratch, _js_task(h), sys.executable, 120)
+
+    assert row["passed"] is True
+    assert row["failed_ids"] == []
+
+
+def test_grade_js_task_fails_when_the_source_is_unfixed(tmp_path, monkeypatch):
+    h = _mk_js_history(tmp_path)
+    scratch = tmp_path / "scratch"
+    _git(Path(h["repo"]), "worktree", "add", "-q", "--detach", str(scratch), h["base"])
+    monkeypatch.setattr(r.mht, "_locate_js_runner", _fake_js_runner(tmp_path))
+
+    row = r.grade(scratch, _js_task(h), sys.executable, 120)
+
+    assert row["passed"] is False
+    assert row["failed_ids"] == ["src/calc.test.js::add works"]

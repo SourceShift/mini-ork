@@ -204,7 +204,13 @@ def _run_solver_cmd(
 
 
 def grade(scratch: Path, task: dict, python: str, timeout: int) -> dict[str, Any]:
-    """Restore hidden ``test_files`` from ``fix_sha`` and run pytest on them.
+    """Restore hidden ``test_files`` from ``fix_sha`` and grade them.
+
+    The solve-time grader mirrors the miner's per-family dispatch: it delegates
+    to ``mine_heldout_tasks.run_tests``, which runs pytest files under pytest
+    (JUnit XML) and jest/vitest files under the repo's own JS runner (jest
+    JSON), unioning the ids — so a task mined from either family is gradeable
+    end-to-end with the same code the miner validated it with.
 
     The solver's source changes stay intact: we only overlay the test files
     so a solver that tampered with the grader sees fresh tests. Returns a
