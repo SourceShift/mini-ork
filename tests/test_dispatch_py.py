@@ -210,9 +210,11 @@ def _repo_lane(lane: str, tmp_path, monkeypatch):
 
 
 # The lanes the B0 probe measured relaying `content_block_delta` at token
-# granularity (2026-09-18). Streaming is opt-in per lane precisely so a gateway
-# that buffers can stay on the json envelope rather than emitting the same
-# events in one lump at exit — so this set is a measurement, not a default.
+# granularity (2026-09-18). Streaming is now the DEFAULT for every anthropic
+# lane — a node's output must reach the live sidecar while it runs, not in one
+# lump at exit — and a lane that cannot stream opts back out with
+# `gateway: true`. This set records the measured lanes; the default covers the
+# rest.
 _STREAMS = ("deepseek", "glm", "minimax")
 
 
@@ -242,11 +244,16 @@ def test_every_anthropic_compat_lane_parses_identically_whatever_the_format(tmp_
         assert spec.parse_usage is parse_claude_usage, lane
 
 
-def test_lanes_outside_the_measured_set_keep_the_json_envelope_byte_for_byte(tmp_path, monkeypatch):
-    """A lane added to providers.yaml without deciding its format must fail
-    here rather than silently streaming an unmeasured gateway."""
+def test_lanes_outside_the_measured_set_stream_by_default(tmp_path, monkeypatch):
+    """A lane added to providers.yaml without a `gateway` key streams like every
+    other. This was the opposite assertion under the old opt-in polarity, and
+    the cost of that polarity is on record: every lane whose entry predated the
+    knob — the whole researcher home's `*_lens` set — emitted one object at
+    exit, so a six-minute node showed a zero-byte live file and read as a hang.
+    A gateway that genuinely cannot stream declares `gateway: true`."""
     for lane in ("kimi",):
-        assert _repo_lane(lane, tmp_path, monkeypatch).command[-1] == "json", lane
+        cmd = _repo_lane(lane, tmp_path, monkeypatch).command
+        assert cmd[5:] == ("stream-json", "--verbose", "--include-partial-messages"), lane
 
 
 def test_native_claude_lanes_stream_with_the_claude_parsers(tmp_path, monkeypatch):
@@ -254,8 +261,8 @@ def test_native_claude_lanes_stream_with_the_claude_parsers(tmp_path, monkeypatc
     # REPO config: a live home (CWD-relative .mini-ork or MINI_ORK_HOME) that
     # predates the `sonnet` lane shadows the repo registry and this resolves
     # as "unknown lane" instead of the anthropic transport under test.
-    # opus/sonnet opt into stream-json (gateway: false): Anthropic's own
-    # endpoint relays deltas natively, and the live sidecar shows them.
+    # opus/sonnet stream: Anthropic's own endpoint relays deltas natively, and
+    # the live sidecar shows them.
     monkeypatch.delenv("MINI_ORK_PROVIDERS", raising=False)
     monkeypatch.setenv("MINI_ORK_HOME", str(tmp_path / ".mini-ork"))
     for lane in ("sonnet", "opus"):

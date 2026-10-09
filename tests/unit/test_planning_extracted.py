@@ -176,6 +176,11 @@ def test_overlay_plan_applies_recipe_contract(tmp_path):
                                               str(profile), str(tmp_path)))
     ac = out["artifact_contract"]
     assert ac["success_verifiers"] == ["verifiers/check.py"]
-    assert ac["outputs"] == ["x"]  # setdefault keeps the planner's outputs
+    # The recipe OWNS its artifact contract, so its outputs REPLACE the
+    # planner's. Under the old ``setdefault`` the planner kept ``["x"]`` — and
+    # that is how run-1791584660-89421 came to plan ``judge-lane-a-audit.md``
+    # for a run whose producer wrote ``judge-opus-audit.md``. The planner's
+    # free-form prose is the only thing preserved.
+    assert ac["outputs"] == ["out.md"]
     # planner prose verifiers are preserved as acceptance_criteria
     assert ac["acceptance_criteria"] == ["v"]

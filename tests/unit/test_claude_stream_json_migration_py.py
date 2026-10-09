@@ -134,11 +134,15 @@ def test_malformed_and_empty_stdout_degrade_to_zero():
         assert claude_session_id(bad) == ""
 
 
-def test_gateway_false_is_the_only_way_to_opt_in():
+def test_streaming_is_the_default_and_gateway_true_opts_out():
+    """Every lane streams unless it declares it cannot. An unset, missing or
+    misspelled value must NOT silently disable streaming — only the literal
+    boolean ``true`` does."""
+    assert _wants_stream_json({}) is True
     assert _wants_stream_json({"gateway": False}) is True
-    for value in (True, "false", "False", 0, None, "no", ""):
-        assert _wants_stream_json({"gateway": value}) is False, value
-    assert _wants_stream_json({}) is False
+    for value in ("false", "False", 0, None, "no", "", "true", 1):
+        assert _wants_stream_json({"gateway": value}) is True, value
+    assert _wants_stream_json({"gateway": True}) is False
 
 
 def _spec_for(entry: dict) -> object:
@@ -164,9 +168,10 @@ def test_streaming_lane_argv_carries_the_three_required_flags():
     assert "json" not in cmd
 
 
-def test_default_lane_argv_is_byte_for_byte_what_it_was():
-    """Every existing lane and test expects the json form; the opt-in must not
-    move the default."""
+def test_default_lane_argv_streams():
+    """A lane with no `gateway` key — the shape of every entry written before
+    the knob existed — now streams, so its output lands on the live sidecar
+    while the node runs instead of as one object at exit."""
     spec = _spec_for(
         {"base_url": "https://example.invalid/anthropic", "api_key_env": "NOPE_KEY"}
     )
@@ -176,16 +181,29 @@ def test_default_lane_argv_is_byte_for_byte_what_it_was():
         "--permission-mode",
         "bypassPermissions",
         "--output-format",
-        "json",
+        "stream-json",
+        "--verbose",
+        "--include-partial-messages",
     )
 
 
-def test_anthropic_native_honors_the_same_lever():
+def test_gateway_true_lane_falls_back_to_json():
+    """The opt-out is the only way to get the single-object form back."""
+    spec = _spec_for(
+        {
+            "base_url": "https://example.invalid/anthropic",
+            "api_key_env": "NOPE_KEY",
+            "gateway": True,
+        }
+    )
+    assert spec.command[-1] == "json"  # type: ignore[attr-defined]
+    assert "stream-json" not in spec.command  # type: ignore[attr-defined]
+
+
+def test_anthropic_native_streams_by_default():
     """opus/sonnet run the same CLI against real Anthropic, which streams; the
-    lever is per-lane there too, and unset still means json."""
-    on = _build_anthropic_native(
-        "opus", {"gateway": False}, None, {}, None
-    )
-    off = _build_anthropic_native("opus", {}, None, {}, None)
+    default follows the compat lanes, and `gateway: true` is the escape hatch."""
+    on = _build_anthropic_native("opus", {}, None, {}, None)
+    off = _build_anthropic_native("opus", {"gateway": True}, None, {}, None)
     assert "stream-json" in on.command  # type: ignore[attr-defined]
     assert off.command[-1] == "json"  # type: ignore[attr-defined]

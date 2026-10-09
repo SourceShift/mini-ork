@@ -37,9 +37,13 @@
 #   base_url:    endpoint for anthropic-compat / openai-compat
 #   api_key_env: NAME of the env var holding the API key
 #   script:      path for kind=executable (absolute or repo-relative)
-#   gateway:     anthropic-compat defaults to true (json output, no
-#                stream-json); set false only for endpoints that stream
-#                native Anthropic stream-json correctly
+#   gateway:     anthropic-compat STREAMS by default (--output-format
+#                stream-json + --include-partial-messages), so a node's
+#                output reaches the live sidecar while it runs. Set true
+#                only for an endpoint that cannot stream at all and must
+#                fall back to one json object at exit. An explicit false
+#                is the default and is kept on the lanes below to record
+#                the B0 probe that measured them relaying deltas.
 #   extra_env:   optional map of extra env vars to export at dispatch
 #
 # Wire-up: point a lane at your entry in config/agents.yaml, e.g.

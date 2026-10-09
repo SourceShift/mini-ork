@@ -8,4 +8,52 @@ rollback_policy: >
   Discard synthesis if verification fails.
 
 source_artifact: synthesis.md
-outputs: []
+# BARE run-local names, deliberately: the publisher resolves a relative name
+# with no directory component against MINI_ORK_RUN_DIR and PRESERVES it — it
+# does not copy it into the target repo. This panel is read-only with respect
+# to the target; the reports are run-dir evidence, not deliverables that belong
+# in a commit. An empty list here is what let the planner invent its own
+# artifact names (``judge-lane-a-audit.md``) for a run whose files are actually
+# ``judge-opus-audit.md`` / ``judge-minimax-audit.md`` / ``synthesis.md``, so
+# the plan and the publisher disagreed with the prompts about what the run
+# produces.
+outputs:
+  - judge-opus-audit.md
+  - judge-minimax-audit.md
+  - synthesis.md
+
+acceptance_criteria:
+  # Human artifacts — the two judge reports and the synthesis.
+  - Both judge reports and the synthesis report exist under ${MINI_ORK_RUN_DIR}.
+  - >
+    Each judge report carries the FIVE shared sections in this order:
+    Discovery Evidence, Finding Verdicts, Fix Verdicts, Recommended Fix Order,
+    Open Questions. Lane-specific material (cost recomputation, cross-finding
+    observations) is a subsection INSIDE a section, never a sixth heading.
+  - >
+    Each report has one Finding Verdicts block per finding F1..F6 and one Fix
+    Verdicts block per fix S1..S6, in order, each carrying
+    finding_id/fix_id, verdict, severity, evidence_checked, reasoning and
+    corrections.
+  - >
+    Every verdict is one of confirmed|partially_confirmed|refuted|unverifiable
+    and every severity is one of critical|high|medium|low — no other words.
+
+  # Machine artifacts — the structured sidecars, one shared schema.
+  - >
+    Each lane also writes ONE JSON object to its declared node output path
+    (context-opus_judge.json / context-minimax_judge.json) with the SAME key
+    set: schema_version, panel_id, lane, model, findings[], fixes[],
+    fix_order[], counts{}, open_questions[], read_only_attestation{}.
+  - >
+    findings[] is exactly F1..F6 in order; fixes[] is exactly S1..S6 in order
+    with fix_id AND finding_id (the F#/S# link) so a consumer can join the two
+    lanes on finding_id without position.
+  - >
+    counts.severity_histogram carries all four severity keys and sums to six.
+  - >
+    The two lanes' key sets are identical at the top level, in findings[] and
+    in fixes[] — the verifier fails the run if any of the three diverges.
+
+  # Read-only guarantee.
+  - Each report states that no file under $MO_TARGET_CWD was modified.

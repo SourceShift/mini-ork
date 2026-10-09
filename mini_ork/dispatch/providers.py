@@ -674,14 +674,13 @@ def _claude_spec(
     newline-delimited events as they are produced. That is the whole difference
     between a node whose output appears at completion and one whose output the
     live sidecar (``dispatch/live_stream.py``) can tail while it runs, and it is
-    per-lane because it depends on the gateway: the config documents
-    ``gateway: false`` as opt-in for "endpoints that stream native Anthropic
-    stream-json correctly", and a gateway that buffers would deliver the same
-    events in one lump at exit (B0 measured all three lanes we ship as
-    relaying). ``--include-partial-messages`` is required for token-level
-    deltas — without it the events are whole messages, which is a stream in
-    name only for a long generation. ``--verbose`` is required by the CLI
-    whenever ``--print`` and ``stream-json`` are combined.
+    per-lane only so a lane that genuinely cannot stream can opt back out with
+    ``gateway: true``; the default is streaming (``_wants_stream_json``), and a
+    gateway that buffers would deliver the same events in one lump at exit (B0
+    measured all three lanes we ship as relaying). ``--include-partial-messages``
+    is required for token-level deltas — without it the events are whole
+    messages, which is a stream in name only for a long generation. ``--verbose``
+    is required by the CLI whenever ``--print`` and ``stream-json`` are combined.
     """
     command: list[str] = [
         "claude",
@@ -707,15 +706,25 @@ def _claude_spec(
 
 
 def _wants_stream_json(entry: Mapping[str, object]) -> bool:
-    """``gateway: false`` opts a lane into stream-json.
+    """Stream-json is the DEFAULT; ``gateway: true`` is the opt-OUT.
 
-    Identity comparison against ``False``, not falsiness: the documented default
-    is json output, so only an entry that says ``false`` explicitly moves. An
-    unset, missing or misspelled value keeps the format every existing lane and
-    test expects — the safe direction, since the failure mode of guessing wrong
-    is a dispatch whose output nothing can parse.
+    Every lane streams unless it says ``gateway: true``. Streaming is the
+    property the operator actually wants — a node's output visible on the live
+    sidecar WHILE it runs, not in one lump at exit — and it costs nothing to
+    ask for: the parsers read the ``type=="result"`` event, which stream-json
+    and json-mode share byte-for-byte, so the format switch is invisible to
+    every consumer (``_claude_envelope``). A gateway that buffers its SSE
+    simply delivers the same events late; a lane that cannot stream at all
+    declares it with ``gateway: true`` and keeps the old single-object output.
+
+    Identity comparison against ``True``, not truthiness: a misspelled or
+    unset value must not silently disable streaming for a lane that wants it.
+    The previous polarity (opt-in on ``gateway: false``) left every lane whose
+    entry predated the knob — including the whole researcher home's
+    ``*_lens`` set — emitting one object at exit, which is why a six-minute
+    synthesizer showed a zero-byte live file and read as a hang.
     """
-    return entry.get("gateway") is False
+    return entry.get("gateway") is not True
 
 
 def _build_anthropic_native(name, entry, root, extra_env, model_id) -> ProviderSpec:

@@ -100,8 +100,17 @@ def overlay_plan(plan_json, task_class, profile_path, root) -> str:
                 if prose and prose != recipe_verifiers:
                     ac.setdefault("acceptance_criteria", prose)
                 ac["success_verifiers"] = recipe_verifiers
+                # The recipe OWNS its artifact contract; the planner may not
+                # redefine what the run produces. This was ``setdefault``, so a
+                # planner that emitted its own ``outputs`` kept them — and it
+                # did: run-1791584660-89421 planned ``judge-lane-a-audit.md`` /
+                # ``judge-lane-b-audit.md`` while the prompts, the verifier and
+                # the run dir all used ``judge-opus-audit.md`` /
+                # ``judge-minimax-audit.md``. ``success_verifiers`` two lines up
+                # is already overridden unconditionally; ``outputs`` is the same
+                # kind of declaration and now gets the same treatment.
                 if recipe_contract.get("outputs"):
-                    ac.setdefault("outputs", recipe_contract["outputs"])
+                    ac["outputs"] = recipe_contract["outputs"]
                 p["artifact_contract"] = ac
         except Exception:
             pass
