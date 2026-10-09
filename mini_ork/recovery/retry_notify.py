@@ -601,6 +601,22 @@ def fix_steps(hint: dict[str, Any] | None, *, home: Path | None = None) -> list[
 # ── 3. notify ──────────────────────────────────────────────────────────────
 
 
+def _step_line(step: str) -> tuple[str, str]:
+    """Split ``step`` into ``(kind, text)`` — ``"item"`` for a numbered step,
+    ``"detail"`` for an indented continuation of the step before it.
+
+    Producers spell a continuation as a string that starts with whitespace:
+    ``_step_code`` emits ``"  - <reason>"`` under "Start a revision run …",
+    ``_step_unknown`` emits ``"  | <log line>"`` under "Read the evidence …".
+    Numbering those would turn one instruction into N instructions, so the
+    renderer must see them as detail, not as steps.
+    """
+    text = step.rstrip()
+    if text[:1].isspace():
+        return "detail", text.lstrip()
+    return "item", text
+
+
 def _write_needs_change_md(run_dir: Path, owner_rec: dict[str, Any],
                            hint: dict[str, Any], steps: list[str]) -> Path:
     raw_nc = hint.get("needs_change")
@@ -608,6 +624,17 @@ def _write_needs_change_md(run_dir: Path, owner_rec: dict[str, Any],
     summary = str(nc.get("summary") or "")
     detail = str(nc.get("detail") or "")
     evidence = str(nc.get("evidence") or "")
+    numbered: list[str] = []
+    n = 0
+    for step in steps:
+        kind, text = _step_line(step)
+        if kind == "detail" and numbered:
+            # Three spaces: an indented block under the previous list item,
+            # so the reason/log line reads as part of its step, not a new one.
+            numbered.append(f"   {text}")
+            continue
+        n += 1
+        numbered.append(f"{n}. {text}")
     out = [
         f"# {summary or 'A change is needed before this run can continue'}",
         "",
@@ -616,7 +643,7 @@ def _write_needs_change_md(run_dir: Path, owner_rec: dict[str, Any],
         "",
         "## What to do",
         "",
-        *[f"{i}. {s}" for i, s in enumerate(steps, 1)],
+        *numbered,
         "",
     ]
     if detail:
@@ -880,8 +907,14 @@ def notify(home: Path, run_id: str) -> dict[str, Any] | None:
         print(f"  needs_change: {needs_kind}")
         if summary:
             print(f"  summary: {summary}")
-        for i, step in enumerate(steps, 1):
-            print(f"  step {i}: {step}")
+        step_n = 0
+        for step in steps:
+            kind, text = _step_line(step)
+            if kind == "detail" and step_n:
+                print(f"         {text}")
+                continue
+            step_n += 1
+            print(f"  step {step_n}: {text}")
         print(f"needs_change={needs_kind}")
         print(f"retry_hint={run_dir / NOTIFY_FILENAME}")
         if inbox_id is not None:

@@ -447,6 +447,35 @@ def test_fix_steps_code_surfaces_reviewer_reasons(home: Path) -> None:
     assert "missing newline" in flat
 
 
+def test_needs_change_md_indents_reasons_under_one_step(home: Path) -> None:
+    """A code fix is ONE numbered step; its reasons hang under it.
+
+    Before the fix the numbering loop rendered every ``"  - <reason>"``
+    continuation as its own step, so NEEDS-CHANGE.md read
+    ``1. Start a revision run … / 2. - didn't strip … / 3. - missing …``
+    — three instructions for one action.
+    """
+    run_dir = home / "runs" / "run-rn-md"
+    run_dir.mkdir(parents=True)
+    hint = {"needs_change": {"kind": "code", "summary": "Revision needed",
+                             "detail": "", "evidence": ""}}
+    steps = [
+        "Start a revision run with these reasons:",
+        "  - didn't strip the unused arg",
+        "  - missing newline at end of file",
+        "Confirm: mini-ork board retry run-rn-md --ack-change",
+    ]
+    md = retry_notify._write_needs_change_md(run_dir, {}, hint, steps).read_text(
+        encoding="utf-8")
+    assert "1. Start a revision run with these reasons:" in md
+    assert "\n   - didn't strip the unused arg\n" in md
+    assert "\n   - missing newline at end of file\n" in md
+    assert "2. Confirm: mini-ork board retry run-rn-md --ack-change" in md
+    # The reasons are detail, never numbered steps of their own.
+    assert "2. - " not in md
+    assert "3. " not in md
+
+
 def test_fix_steps_unknown(home: Path) -> None:
     """``unknown`` with no impl log yields the no-log captured message."""
     hint = {
