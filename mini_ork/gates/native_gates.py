@@ -279,6 +279,23 @@ def _eval_synthesis_promote(
     task_class = ctx.get("task_class") or ""
     if not verdict_file or not os.path.isfile(verdict_file) or not task_class:
         return "defer"
+    # K0.5b AC1 (same doctrine as cli.publisher.is_rubric_prescreen): the
+    # advisory rubric pre-screen writes ``panel-verdict.json`` with
+    # ``source: rubric-prescreen`` — the same path a real panel gate uses.
+    # A prescreen score never approves a commit and must never BLOCK one
+    # either. Live case run-1791543223-76795 (framework-edit): the prescreen's
+    # 12.5/100 advisory score reached mo_promote_synthesis_gate through this
+    # evaluator and became a blocking safety_violation, refusing every publish
+    # of a run whose real gates (reviewer + level vector) had passed. A file
+    # that is only a prescreen means "no panel verdict present" → defer, the
+    # same no-evidence answer every other oracle gate gives.
+    try:
+        with open(verdict_file, encoding="utf-8") as fh:
+            verdict_data = json.load(fh)
+    except (OSError, ValueError):
+        return "defer"
+    if isinstance(verdict_data, dict) and verdict_data.get("source") == "rubric-prescreen":
+        return "defer"
     try:
         from mini_ork.gates import promotion_gate
 

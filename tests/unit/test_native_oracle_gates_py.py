@@ -382,6 +382,36 @@ def test_synthesis_promote_authority_capture_rejects(db, tmp_path):
 
 def test_synthesis_promote_missing_inputs_defer(db, tmp_path):
     assert_native("synthesis-promote", "{}", db, "defer")
+
+
+def test_synthesis_promote_rubric_prescreen_defers(db, tmp_path):
+    # K0.5b AC1: the advisory rubric pre-screen writes panel-verdict.json with
+    # source: rubric-prescreen. Its score must not BLOCK a publish any more
+    # than it may approve one — a prescreen file is "no panel verdict present".
+    # Live case: run-1791543223-76795 (framework-edit) had its publish refused
+    # as a safety_violation on the prescreen's 12.5/100 advisory score while
+    # the run's real gates (reviewer + level vector) had passed.
+    vf = _write_verdict(tmp_path, "prescreen.json", {
+        "panel_score": 12.5,
+        "pass": False,
+        "source": "rubric-prescreen",
+        "task_class": "framework_edit",
+        "scale": "rubric 0-8 mapped to 0-100",
+    })
+    ctx = json.dumps({"verdict_file": vf, "task_class": "framework_edit"})
+    assert_native("synthesis-promote", ctx, db, "defer")
+
+
+def test_synthesis_promote_real_low_score_still_fails(db, tmp_path):
+    # Guard the guard: a REAL panel verdict with a low score must still fail —
+    # the prescreen deferral must not become a blanket low-score pardon.
+    vf = _write_verdict(tmp_path, "low-real.json", {
+        "panel_score": 12.5,
+        "voters": [],
+        "structural": {},
+    })
+    ctx = json.dumps({"verdict_file": vf, "task_class": "research_synthesis"})
+    assert_native("synthesis-promote", ctx, db, "fail")
     vf = _write_verdict(tmp_path, "ok2.json", {"panel_score": 90.0})
     # missing task_class
     assert_native("synthesis-promote", json.dumps({"verdict_file": vf}), db, "defer")
