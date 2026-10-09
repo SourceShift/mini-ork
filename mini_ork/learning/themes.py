@@ -75,6 +75,7 @@ __all__ = [
     "classify_kind",
     "ensure_schema",
     "normalize",
+    "promote",
     "role_of",
     "rollup_framework_bugs",
     "stats",
@@ -915,6 +916,110 @@ def _refresh_theme(
     t["n_at_refresh"] = at_refresh
 
 
+# ── Promotion (candidate → verified lesson) ─────────────────────────────────
+
+
+def promote(
+    db_path: str | None = None,
+    *,
+    min_runs: int | None = None,
+    limit: int = 20,
+    dispatch_fn=None,
+    model: str | None = None,
+) -> dict:
+    """Author + verify ``lesson_text`` for candidate themes.
+
+    A ``lesson_themes`` row is a cluster statistic until an authored lesson is
+    written. The v1/v2 lesson blocks (``context_assembler``'s
+    ``_verified_theme_lessons`` and ``context_v2.verified_themes``) read only
+    ``status='verified'`` rows with a non-blank ``lesson_text`` — so a table of
+    candidates with no author is a consumer with no producer, and both blocks
+    render nothing. This is that producer.
+
+    A theme's member traces come from ``gradient_theme`` ⋈ ``gradient_records``
+    (``evidence`` is the trace a gradient was extracted from). The lesson is
+    authored by the SAME grounded induction path ``pattern_records`` uses
+    (``induce_cluster`` → propose → guardrails → merge), so ``'verified'`` here
+    means exactly what it means for a pattern lesson: authored from the evidence
+    and surviving the guardrails, never invented. Gated by ``MO_PATTERN_INDUCE``
+    (the same switch as pattern induction). Only rows whose ``lesson_text`` is
+    blank are touched, so a re-run is cheap and an authored lesson is never
+    overwritten.
+
+    ``min_runs`` (default ``$MO_THEME_PROMOTE_MIN_RUNS`` or 3) is the support
+    bar: a theme seen on fewer runs carries too little evidence to generalise.
+    """
+    from mini_ork.learning import pattern_induction as pi
+
+    report: dict = {"promoted": 0, "skipped": [], "enabled": pi._induct_enabled()}
+    if not report["enabled"]:
+        return report
+
+    db_path = _resolve_db_path(db_path)
+    if not os.path.isfile(db_path):
+        return report
+    con = _connect(db_path)
+    try:
+        _ensure_schema_con(con)
+        con.commit()
+        if min_runs is None:
+            try:
+                min_runs = int(os.environ.get("MO_THEME_PROMOTE_MIN_RUNS", "3"))
+            except ValueError:
+                min_runs = 3
+        try:
+            min_members = int(os.environ.get("MO_THEME_PROMOTE_MIN_MEMBERS", "3"))
+        except ValueError:
+            min_members = 3
+        rows = con.execute(
+            """
+            SELECT theme_id, representative, task_class, n_runs
+              FROM lesson_themes
+             WHERE kind = 'task' AND status = 'candidate'
+               AND COALESCE(lesson_text, '') = ''
+               AND n_runs >= ?
+             ORDER BY n_runs DESC, last_seen DESC
+             LIMIT ?
+            """,
+            (max(1, int(min_runs)), max(1, int(limit))),
+        ).fetchall()
+        now = int(time.time())
+        for r in rows:
+            tid = r["theme_id"]
+            members = [
+                str(x[0]) for x in con.execute(
+                    "SELECT DISTINCT g.evidence FROM gradient_theme gt "
+                    "JOIN gradient_records g ON g.gradient_id = gt.gradient_id "
+                    "WHERE gt.theme_id = ? AND COALESCE(g.evidence, '') <> ''",
+                    (tid,),
+                ).fetchall()
+            ]
+            members = [m for m in (members or []) if m.strip()]
+            if len(set(members)) < max(1, min_members):
+                report["skipped"].append(
+                    {"theme_id": tid, "reason": "too few member traces"})
+                continue
+            text, detail = pi.induce_cluster(
+                con, target=r["representative"] or tid,
+                member_trace_ids=members, dispatch_fn=dispatch_fn, model=model,
+            )
+            if not text:
+                reason = detail.get("reason") if isinstance(detail, dict) else None
+                report["skipped"].append(
+                    {"theme_id": tid, "reason": reason or "no lesson"})
+                continue
+            con.execute(
+                "UPDATE lesson_themes SET lesson_text = ?, status = 'verified',"
+                " updated_at = ? WHERE theme_id = ?",
+                (text, now, tid),
+            )
+            con.commit()
+            report["promoted"] += 1
+        return report
+    finally:
+        con.close()
+
+
 # ── Backfill + stats ────────────────────────────────────────────────────────
 
 
@@ -1245,6 +1350,14 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="minimum theme size to roll up (default $MO_THEME_BUG_MIN or 20)")
     rl.add_argument("--db", default=None, help="override DB path")
 
+    pr = sub.add_parser("promote", help="author + verify lessons for candidate themes")
+    pr.add_argument("--min-runs", type=int, default=None,
+                   help="support bar: minimum runs a theme must span "
+                        "(default $MO_THEME_PROMOTE_MIN_RUNS or 3)")
+    pr.add_argument("--limit", type=int, default=20,
+                   help="max themes to promote per call (default 20)")
+    pr.add_argument("--db", default=None, help="override DB path")
+
     return p
 
 
@@ -1257,6 +1370,8 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "rollup":
         n = rollup_framework_bugs(db_path=args.db, min_members=args.min_members)
         out = {"bugs_updated": n}
+    elif args.cmd == "promote":
+        out = promote(db_path=args.db, min_runs=args.min_runs, limit=args.limit)
     else:  # pragma: no cover — argparse required=True
         return 2
     sys.stdout.write(json.dumps(out, indent=2, sort_keys=True) + "\n")

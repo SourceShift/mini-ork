@@ -375,22 +375,28 @@ def main(argv: list[str] | None = None) -> int:
     # exact behaviour of assign_new and rollup_framework_bugs.
     themes_report: dict | None = None
     bugs_updated = 0
+    promoted = 0
     if os.environ.get("MO_THEMES", "1") != "0":
         try:
             from mini_ork.learning import themes
 
             themes_report = themes.assign_new(db_path)
             bugs_updated = themes.rollup_framework_bugs(db_path)
+            # Author + verify lessons for supported themes, so the v1/v2 lesson
+            # blocks get a producer (a candidate-only table renders nothing).
+            promoted = themes.promote(db_path).get("promoted", 0)
         except Exception as exc:  # a side-channel must never crash reflect
             sys.stderr.write(f"  [themes] skipped: {exc}\n")
             themes_report = None
             bugs_updated = 0
+            promoted = 0
     if themes_report is not None:
         sys.stdout.write(
             f"  [themes] assigned {themes_report.get('assigned', 0)} gradient(s) "
             f"→ {themes_report.get('themes_total', 0)} theme(s) "
             f"({themes_report.get('themes_new', 0)} new), "
-            f"{bugs_updated} framework bug(s) updated\n"
+            f"{bugs_updated} framework bug(s) updated, "
+            f"{promoted} lesson(s) promoted\n"
         )
 
     # ── learning-loop write-back ───────────────────────────────────────────
