@@ -294,8 +294,32 @@ def _review_text_items(raw: Any, run: Run | None) -> list[dict[str, Any]]:
     for entry in entries:
         if not entry:
             continue
-        items.append(_finding_item(entry, run) if isinstance(entry, dict) else S.item(str(entry), ""))
+        items.append(_finding_item(entry, run) if isinstance(entry, dict)
+                     else S.item(plain_reason(entry), ""))
     return items
+
+
+def plain_reason(text: str) -> str:
+    """Review reasons are plain sentences, not markdown.
+
+    Reviewer agents emit the occasional ``**bold**``, `` `code` `` or a stray
+    ```` ``` ```` fence marker inside ``reasons`` / ``notes`` strings. The
+    contract says plain text, and single-line renderers (the IDE's result
+    rows, headlines) show the markers literally — strip them so the words
+    survive. Fence *marker* lines drop; fenced *content* stays. Whitespace
+    collapses to one line (a reason is one sentence). Falls back to the
+    original stripped text when stripping would empty it.
+    """
+    original = str(text).strip()
+    lines = [ln for ln in original.splitlines() if not ln.strip().startswith("```")]
+    stripped = "".join(lines)
+    # A reason sentence has no legitimate use for markdown marks — remove
+    # them outright rather than pattern-matching how they hug content
+    # (agents quote things like `` `  - ` `` where the marks wrap spaces).
+    for mark in ("**", "__", "`", "*"):
+        stripped = stripped.replace(mark, "")
+    stripped = " ".join(stripped.split())
+    return stripped or original
 
 
 def _verifier_items(run_dir: Path, node: Node) -> tuple[str, list[dict[str, Any]]]:

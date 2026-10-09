@@ -50,6 +50,7 @@ from mini_ork.ide_pages.node_changes import (
     _read_json,
     _result_items,
     build_changes_view,
+    plain_reason,
 )
 from mini_ork.ide_pages.run import Run, Node, _epoch, _load, _wall, _REVIEW_TYPES
 
@@ -2639,6 +2640,33 @@ def _learning_view(run: Run, node: Node) -> dict[str, Any]:
 
 # ── overview view (node-overview §2) ─────────────────────────────────────────
 
+def _final_is_review_contract(final_text: str, run_dir: Path, node: Node) -> bool:
+    """True when the agent's "final message" is the raw review contract.
+
+    Reviewer prompts have the agent end with a ```` ```json ```` block; that
+    block is also written to ``review-<id>.json`` and parsed into the result
+    items. Showing it as the final message duplicates the items as a wall of
+    JSON, so the view drops it (only when it parses as the review shape and
+    the parsed artifact actually exists).
+    """
+    if not (_is_review_node(node) and final_text.lstrip().startswith("```")):
+        return False
+    if not (run_dir / f"review-{node.id}.json").is_file():
+        return False
+    stripped = final_text.strip()
+    body = stripped.strip("`").strip()
+    # Drop a leading language tag (```json) and any trailing fence.
+    first_nl = body.find("\n")
+    if first_nl != -1 and not body.startswith("{"):
+        body = body[first_nl + 1:]
+    body = body.rsplit("```", 1)[0] if "```" in body else body
+    try:
+        parsed = json.loads(body)
+    except (ValueError, TypeError):
+        return False
+    return isinstance(parsed, dict) and "verdict" in parsed
+
+
 def _overview_view(run: Run, node: Node, session_path: Path | None,
                    run_dir: Path) -> dict[str, Any]:
     """One DAG node's ``overview`` payload (kickoff §2). Best-effort:
@@ -2667,6 +2695,11 @@ def _overview_view(run: Run, node: Node, session_path: Path | None,
     facts = _overview_facts(run, node, run_dir, session_path)
     title, items = _result_items(run, node)
     final = _overview_final(session_path)
+    if _final_is_review_contract(final.get("text") or "", run_dir, node):
+        # The reviewer's "final message" is the raw ``json contract block it
+        # was told to emit — the parsed form is already the result items
+        # above, and the raw dump renders as a wall of clipped JSON.
+        final = {}
     links = _overview_links(run_dir, node.id, _verifier_stem(node) if str(node.type or "") == "verifier" else "")
     return {
         "headline": headline,
@@ -2810,7 +2843,8 @@ def _overview_reviewer_headline(run_dir: Path, node: Node) -> dict[str, str]:
         if verdict:
             color = _VERDICT_COLOUR_FOR_OVERVIEW.get(verdict, "sub")
             if first_reason:
-                return {"t": _clip(" ".join(f"{verdict} — {first_reason}".split())), "c": color}
+                reason = plain_reason(first_reason)
+                return {"t": _clip(" ".join(f"{verdict} — {reason}".split())), "c": color}
             return {"t": f"{verdict}", "c": color}
     # Fall back to the markdown report's first heading.
     return _overview_lens_headline(run_dir, node)
