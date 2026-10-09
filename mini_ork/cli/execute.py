@@ -1209,6 +1209,26 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
             _maybe_triage_failed_run(db, run_id, home, root)
             sys.stderr.write(f"execute: {fail_count} node(s) failed\n")
             return 1
+        # F4: a recipe with NO publisher node never writes a terminal status, so
+        # an all-green run left the row at "executing" — the board read it as
+        # phantom "working" forever and the reaper's liveness probe had to guess.
+        # Finalize here, reusing ``run_reaper.finalize_passed`` (the same function
+        # the lifecycle teardown calls): a run that cleared every gate but
+        # delivers nothing beyond its run dir is ``published`` with a note saying
+        # so. Recipes WITH a publisher already wrote their status, so this
+        # no-ops on any terminal row.
+        if not any(f[1] == "publisher" for f in fields_list):
+            try:
+                from mini_ork.orchestration.run_reaper import finalize_passed
+
+                if finalize_passed(
+                    db,
+                    run_id,
+                    "execute: all nodes passed; no publisher node — artifact kept in the run dir",
+                ):
+                    print("  [status] no publisher node — finalized as published")
+            except Exception as exc:  # noqa: BLE001 — teardown is best-effort
+                sys.stderr.write(f"[warn] finalize_passed failed: {exc}\n")
         print("\nexecute: all nodes complete")
         return 0
     finally:
