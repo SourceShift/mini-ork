@@ -1,0 +1,25 @@
+-- 0068_drop_textual_gradients.sql — retire the orphaned ``textual_gradients``
+-- table.
+--
+-- ``textual_gradients`` was the gen-1 evolution-engine learning table, created
+-- by ``0011_evolution.sql``. Its only producer was the bash pipeline
+-- ``lib/gradient_extractor.sh``, which was removed in the 2026-07 bash-removal.
+-- The Python successor (``mini_ork/learning/gradient_extractor.py`` — "Native
+-- textual-gradient extraction") writes the replacement table
+-- ``gradient_records`` instead, which carries 10k+ rows.
+--
+-- Result: ``textual_gradients`` has no writer and no reader anywhere in the
+-- tree — ``grep -rn "INSERT INTO textual_gradients"`` returns nothing outside
+-- docs, and no code, test, view, or FK references the table. It sits empty and
+-- inert. An empty learning table is actively misleading: readers of the board /
+-- audits interpret 0 rows as "learning broken" rather than "table retired".
+--
+-- The three sibling tables from 0011 (``workflow_candidates``,
+-- ``promotion_records``, ``version_registry``) are still live; only this one
+-- lost its producer. Its data, if any exists in a foreign home, was written by
+-- a pipeline that no longer runs and is read by nothing — dropping it is
+-- lossless with respect to live behavior.
+--
+-- Safe: ``textual_gradients`` is the referencing side of its FKs
+-- (-> execution_traces, -> workflow_candidates); nothing references it.
+DROP TABLE IF EXISTS textual_gradients;
