@@ -262,7 +262,15 @@ def _effective_lanes(root: str, home: str) -> dict | None:
         candidate = os.path.join(root, "config", "agents.yaml")
         if os.path.isfile(candidate):
             tmpl = candidate
-    over_p = agents_config.personal_path(home=home) if home else None
+    # ``home`` defaults to "" for the lane resolvers (``resolve_lane_family``
+    # and the routing policies call it with no home), and a falsy home used to
+    # SKIP the overlay outright — so the run's snapshot lanes (e.g. a stale
+    # ``codex_lens: codex`` or ``implementer: minimax``) silently won and an
+    # operator's ``agents.local.yaml`` / ``$MINI_ORK_AGENTS`` never reached the
+    # dispatch chain. ``home or None`` routes an empty home through
+    # ``personal_path``'s ``$MINI_ORK_HOME`` / env fallback instead of dropping
+    # the user's overlay.
+    over_p = agents_config.personal_path(home=home or None)
     if not tmpl and over_p is None:
         return None
     try:
