@@ -35,7 +35,7 @@ from mini_ork.vcs import repo_integrity_guard
 from mini_ork.gates import rubric_prescreen
 from mini_ork.orchestration import concord_run
 
-_NATIVE_SUBS = {"apply", "classify", "plan", "verify", "reflect", "garden", "validate"}
+_NATIVE_SUBS = {"apply", "classify", "plan", "verify", "verifier", "reflect", "garden", "validate"}
 
 # Native module subcommands. Compatibility launchers under bin/ re-exec this
 # dispatcher, so there is one public command implementation.
@@ -129,6 +129,8 @@ Lifecycle:
   providers                      Configure or inspect credentials for workflow lanes
   validate                       Pre-run static checks with Fix: hints
   garden                         Drift detection (collisions, orphans, stale runs)
+  verifier list|annotate         Inspect verifier results and label false
+                                   positives/negatives (abstain-gate calibration)
   recipe-eval                    Static evaluation of recipe definitions
   version
 
