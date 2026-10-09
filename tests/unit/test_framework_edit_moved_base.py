@@ -64,6 +64,35 @@ def test_a_reset_onto_another_commit_is_a_moved_base(tmp_path) -> None:
     assert "is not the run's starting commit" in exh._implementer_moved_base(str(run_dir), str(repo))
 
 
+def test_a_stash_snapshot_baseline_with_head_unchanged_passes(tmp_path) -> None:
+    # The dirty-tree shape _snapshot_pre_impl_ref creates: `git stash create`
+    # records a WIP commit (2 parents: HEAD + index) as pre-implementer-ref.
+    # HEAD stays on the starting commit, so the base never moved (2026-10-09,
+    # run-1791543223-76795 failed impl_moved_base on exactly this).
+    repo, run_dir, _ = _repo_with_baseline(tmp_path)
+    (repo / "a.txt").write_text("pre-existing uncommitted dirt\n")  # tracked mod
+    stash = _git(repo, "stash", "create")
+    assert stash  # a dirty tree yields a WIP commit
+    (run_dir / "pre-implementer-ref").write_text(stash + "\n")
+    assert exh._implementer_moved_base(str(run_dir), str(repo)) == ""
+
+
+def test_a_backward_reset_off_a_normal_baseline_is_a_moved_base(tmp_path) -> None:
+    # Control for the stash rule: a NORMAL (1-parent) baseline whose first
+    # parent is HEAD is a backward reset, not a dirt snapshot — still a moved
+    # base. Only the 2-parent stash shape resolves to its first parent.
+    repo, run_dir, _ = _repo_with_baseline(tmp_path)
+    (repo / "b.txt").write_text("second commit\n")
+    _git(repo, "add", "b.txt")
+    _git(repo, "commit", "-qm", "the baseline")
+    baseline = _git(repo, "rev-parse", "HEAD")
+    (run_dir / "pre-implementer-ref").write_text(baseline + "\n")
+    first = _git(repo, "rev-parse", "HEAD~1")
+    _git(repo, "reset", "-q", "--hard", first)  # HEAD == baseline's first parent
+    why = exh._implementer_moved_base(str(run_dir), str(repo))
+    assert "is not the run's starting commit" in why and baseline[:12] in why
+
+
 def test_no_baseline_or_no_repo_defers(tmp_path) -> None:
     repo, run_dir, _ = _repo_with_baseline(tmp_path)
     (run_dir / "pre-implementer-ref").unlink()

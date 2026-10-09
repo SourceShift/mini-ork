@@ -1381,6 +1381,14 @@ def _implementer_moved_base(run_dir: str, target: str) -> str:
     shipped a 54-file diff for a 6-file change, then spent two revise rounds
     chasing it. Fail the node here, with the cause, instead. ``""`` when the
     check cannot run (no baseline, not a git repo).
+
+    A dirty tree at snapshot time makes ``_snapshot_pre_impl_ref`` record a
+    ``git stash create`` WIP commit as the baseline (so the harvest diff
+    excludes the pre-existing dirt). That stash commit's FIRST parent is the
+    HEAD the run started from, so HEAD == that parent also means the base never
+    moved — the implementer only left its change uncommitted, as required
+    (2026-10-09, run-1791543223-76795 failed ``impl_moved_base`` on exactly
+    this shape: HEAD da191c35 vs the "WIP on main: da191c35" stash 92dd9611).
     """
     if not run_dir or not target:
         return ""
@@ -1397,6 +1405,16 @@ def _implementer_moved_base(run_dir: str, target: str) -> str:
     head_sha = head.stdout.strip()
     if head_sha == baseline:
         return ""
+    # Stash-shaped baseline (>= 2 parents) whose first parent is HEAD: the run's
+    # own dirt snapshot, not a moved base. A normal commit has exactly 1 parent,
+    # and HEAD matching ITS parent would be a backward reset — still a failure.
+    parents = subprocess.run(
+        ["git", "-C", target, "rev-list", "--parents", "-1", baseline],
+        capture_output=True, text=True)
+    if parents.returncode == 0:
+        parts = parents.stdout.split()
+        if len(parts) >= 3 and parts[1] == head_sha:
+            return ""
     return (f"HEAD {head_sha[:12]} is not the run's starting commit {baseline[:12]}: the implementer "
             "committed, rebased, reset or checked out in the target, so the tree delta would carry "
             f"unrelated commits. Restore HEAD to {baseline[:12]} and leave the change uncommitted.")
