@@ -74,6 +74,30 @@ Genuinely deliverable in researcher (pending, no user gate):
 - delete merged worktrees (several sessions)
 - confirm main deploys green + remove their worktrees (researcher-c2)
 
+### researcher-64 (session 6206c133) — peer inventory, 2026-10-10
+
+Reported read-only by the peer session; **inventory only, no work started**. Not
+handed to mini-ork — researcher is outside this harvest's scope (mini-ork +
+ContextNest).
+
+- in_progress — Prod book job `job_1791227051195_4751f7cc` ("Turning Clients Into
+  Referrals"): ch1 committed; ch2 recorded failed because the job was paused by
+  the user mid-attempt and the awaiting-author seam aborts on a stopped job.
+- pending — Ledger failed mini-ork runs (status=failed, $0, carrying the run id)
+  so the compose debug view can open their agent logs
+  (`server/services/bookGeneration/miniOrkRunLogService.ts`).
+- pending — Delete the now-unrendered `ChapterWorkbench` / `ChapterStepTimeline`
+  components and update their tests (`src/pages/compose/components/write/`).
+- pending — launchd supervision for the laptop prod book worker (currently a
+  tmux watchdog loop; `infra/` + `scripts/dev-worker-watchdog.sh`).
+
+Blocked on the **user** (a peer cannot approve these):
+- approve updating 8 outdated FE tests (ChapterVoiceSelect 5, theater 2,
+  library r2-covercard 1) left behind by the compose-write change.
+- answer the one blocking author question on ch2 of `job_1791227051195_4751f7cc`,
+  then unpause the job so ch2 re-runs.
+- approve hiding the compose header job cost from non-admin authors.
+
 ## C. ContextNest repo
 
 - raise `MO_DAILY_BUDGET_USD` 150 → 225, then resume kickoff 06 attempt 2
