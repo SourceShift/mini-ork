@@ -33,6 +33,20 @@ FRAMEWORK_INTERNAL_PREFIXES = (
     "provenance.", "provider.", "cache.", "dispatcher.",
 )
 
+# similar_lessons relevance floor. The old 0.15 admitted weak 0.16–0.35 cosine
+# matches (off-topic telemetry noise) into every pack; a block that is mostly
+# noise trains the reader to skip it. 0.35 keeps only on-topic lessons;
+# ``MO_SIMILAR_LESSONS_FLOOR`` overrides for experiments.
+_SIMILAR_LESSONS_FLOOR_DEFAULT = 0.35
+
+
+def _similar_lessons_floor() -> float:
+    """Resolved similar_lessons score floor (env-overridable, fail-safe)."""
+    try:
+        return float(os.environ.get("MO_SIMILAR_LESSONS_FLOOR", _SIMILAR_LESSONS_FLOOR_DEFAULT))
+    except (TypeError, ValueError):
+        return _SIMILAR_LESSONS_FLOOR_DEFAULT
+
 
 def _db_path(db: str | None) -> str:
     """Resolve the state DB: explicit arg → ``MINI_ORK_DB`` → ``$MINI_ORK_HOME/state.db``.
@@ -155,17 +169,36 @@ def context_assemble(task_brief_path: str, workflow_node: str,
 
     prior_runs = []
     try:
+        # Run-level, not trace-level. The old query picked the newest 10 TRACE
+        # rows, so one 8-node run filled the whole block with contentless
+        # per-node rows ("success · 12s · $0.01"), and a run's real shape (did
+        # it land? what did it cost? its reward?) was never visible. Collapse to
+        # <=5 runs and carry the outcome payload the reader actually needs.
         for r in con.execute("""
-            SELECT trace_id, task_class, status, cost_usd, duration_ms, created_at
+            SELECT COALESCE(run_id, trace_id) AS run_key,
+                   COUNT(*) AS nodes,
+                   SUM(CASE WHEN status NOT IN ('success', 'passed', 'ok') THEN 1 ELSE 0 END)
+                       AS non_success,
+                   SUM(COALESCE(cost_usd, 0)) AS cost_usd,
+                   SUM(COALESCE(duration_ms, 0)) AS duration_ms,
+                   MAX(created_at) AS last_at,
+                   MAX(COALESCE(reward_g, 0)) AS reward_g,
+                   MAX(COALESCE(final_artifact_ref, '')) AS artifact_ref
             FROM execution_traces
             WHERE task_class = ? AND (? = '' OR run_id IS NULL OR run_id != ?)
-            ORDER BY created_at DESC LIMIT 10
+            GROUP BY run_key
+            ORDER BY last_at DESC LIMIT 5
         """, (task_class, cur_run, cur_run)).fetchall():
             prior_runs.append({
-                "cite": f"execution_traces/{r['trace_id']}",
-                "trace_id": r["trace_id"], "status": r["status"],
-                "cost_usd": r["cost_usd"], "duration_ms": r["duration_ms"],
-                "created_at": r["created_at"]})
+                "cite": f"execution_traces/{r['run_key']}",
+                "run_id": r["run_key"],
+                "nodes": int(r["nodes"] or 0),
+                "non_success_nodes": int(r["non_success"] or 0),
+                "cost_usd": round(float(r["cost_usd"] or 0.0), 3),
+                "duration_ms": int(r["duration_ms"] or 0),
+                "reward_g": float(r["reward_g"] or 0.0),
+                "artifact_ref": r["artifact_ref"] or "",
+                "created_at": r["last_at"]})
     except Exception:
         pass
 
@@ -177,7 +210,7 @@ def context_assemble(task_brief_path: str, workflow_node: str,
             FROM gradient_records
             WHERE ((task_class = ? OR target LIKE ?) OR task_class = '__cross_class__')
               AND confidence >= 0.6
-            ORDER BY is_cross_class DESC, confidence DESC LIMIT 10
+            ORDER BY is_cross_class ASC, confidence DESC LIMIT 10
         """, (task_class, f"%{task_class}%")).fetchall():
             failure_modes.append({
                 "cite": f"gradient_records/{r['target']}",
@@ -203,7 +236,7 @@ def context_assemble(task_brief_path: str, workflow_node: str,
         try:
             for r in con.execute("""
                 SELECT pattern_id, cluster_label, feature_set_json,
-                       strength_score, suggested_meta_adr
+                       strength_score, lesson_text, suggested_meta_adr
                 FROM emergent_patterns
                 WHERE status='approved'
                 ORDER BY strength_score DESC, detected_at DESC LIMIT ?
@@ -216,7 +249,7 @@ def context_assemble(task_brief_path: str, workflow_node: str,
                     "cite": f"emergent_patterns/{r['pattern_id']}",
                     "feature": feats[0] if feats else "emergent",
                     "cluster_label": r["cluster_label"],
-                    "suggested_change": r["suggested_meta_adr"] or "",
+                    "suggested_change": (r["lesson_text"] or r["suggested_meta_adr"] or ""),
                     "strength_score": r["strength_score"],
                     "scope": "emergent"})
         except Exception:
@@ -246,7 +279,7 @@ def context_assemble(task_brief_path: str, workflow_node: str,
             scored = [
                 (score, rows[index])
                 for score, index in rank_raw(query_text, docs)
-                if score >= 0.15
+                if score >= _similar_lessons_floor()
             ]
             for s, r in scored[:3]:
                 similar_lessons.append({
@@ -841,6 +874,19 @@ def _graph_context_rows(task_class: str, limit: int, dbp: str,
         except sqlite3.OperationalError:
             linked = []
         try:
+            # Recency window: an un-windowed GROUP BY ranks a hotspot from any
+            # era by lifetime count, so a burst of `execute/dispatch_error`s from
+            # 2026-07 never ages out and is injected as if it were current. Only
+            # failures inside the window are a live hotspot; MO_HOTSPOT_WINDOW_DAYS
+            # overrides the default 30-day window.
+            try:
+                _hotspot_days = int(os.environ.get("MO_HOTSPOT_WINDOW_DAYS", "30"))
+            except (TypeError, ValueError):
+                _hotspot_days = 30
+            hotspot_cutoff = (
+                datetime.datetime.now(datetime.timezone.utc)
+                - datetime.timedelta(days=max(_hotspot_days, 0))
+            ).strftime("%Y-%m-%dT%H:%M:%S")
             hotspots = con.execute("""
                 SELECT fm.workflow_stage, fm.failure_category, COUNT(*) AS n,
                        MAX(fm.occurred_at) AS last_at,
@@ -849,10 +895,11 @@ def _graph_context_rows(task_class: str, limit: int, dbp: str,
                            AND fm2.failure_category = fm.failure_category
                          ORDER BY fm2.occurred_at DESC LIMIT 1) AS last_error
                   FROM failure_memory fm
+                 WHERE fm.occurred_at >= ?
                  GROUP BY fm.workflow_stage, fm.failure_category
                  ORDER BY n DESC, last_at DESC
                  LIMIT ?
-            """, (limit,)).fetchall()
+            """, (hotspot_cutoff, limit)).fetchall()
         except sqlite3.OperationalError:
             hotspots = []
         try:
