@@ -442,16 +442,29 @@ def _step_budget(run_id: str = "") -> list[str]:
 
 
 def _step_code(detail: str, notes: list[str]) -> list[str]:
-    text = (detail or "").strip()
-    if not text:
+    """One ``  - <reason>`` sub-bullet per reviewer reason.
+
+    ``detail`` arrives from :func:`retry_hint._extract_review_detail` as up
+    to three reasons joined one-per-line (and the code-kind hint sets
+    ``notes`` to ``[]``), so the reasons live INSIDE a single multiline
+    string. Packing that into one bullet left every reason after the first
+    flush-left in NEEDS-CHANGE.md — the flattening this widget exists to
+    avoid. Split on newlines so each reason is its own continuation line
+    under the single "Start a revision run" step; fall back to ``notes``
+    (also per-reason) only when ``detail`` carries no reasons.
+    """
+    def _reasons(raw: str) -> list[str]:
+        return [ln.strip() for ln in (raw or "").splitlines() if ln.strip()]
+
+    bullets = _reasons(detail)
+    if not bullets:
         for n in notes or []:
-            text = (n or "").strip()
-            if text:
-                break
-    bullets = [text] if text else ["the reviewer asked for a revision"]
+            bullets.extend(_reasons(str(n or "")))
+    if not bullets:
+        bullets = ["the reviewer asked for a revision"]
     return [
         "Start a revision run with these reasons:",
-        *[f"  - {b}" for b in bullets if b.strip()],
+        *[f"  - {b}" for b in bullets],
     ]
 
 

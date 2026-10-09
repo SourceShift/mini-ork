@@ -446,6 +446,20 @@ def test_fix_steps_code_surfaces_reviewer_reasons(home: Path) -> None:
     assert "didn't strip the unused arg" in flat
     assert "missing newline" in flat
 
+    # Each reviewer reason is its OWN continuation entry — the bug was one
+    # multiline ``  - `` bullet, so the second reason rendered flush-left.
+    assert steps[0] == "Start a revision run with these reasons:"
+    assert "  - didn't strip the unused arg" in steps
+    assert "  - missing newline at end of file" in steps
+    assert not any("\n" in s for s in steps)
+
+    md = retry_notify._write_needs_change_md(
+        run_dir, {}, hint, steps).read_text(encoding="utf-8")
+    assert "1. Start a revision run with these reasons:" in md
+    assert "\n   - didn't strip the unused arg\n" in md
+    assert "\n   - missing newline at end of file\n" in md
+    assert "2. - " not in md
+
 
 def test_needs_change_md_indents_reasons_under_one_step(home: Path) -> None:
     """A code fix is ONE numbered step; its reasons hang under it.
