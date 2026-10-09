@@ -618,15 +618,46 @@ def reflection_extract_gradients(since_ts: int = 0) -> None:
     )
     extracted = 0
     skipped_watermark = 0
+    dispatch_failed = 0
+    circuit_open = 0
+    from mini_ork.learning import gradient_extractor as _ge
+
     for tid in trace_ids:
         if not tid:
             continue
-        from mini_ork.learning import gradient_extractor
 
-        if gradient_extractor.has_watermark(tid):
+        if _ge.has_watermark(tid):
             skipped_watermark += 1
             continue
-        for gradient in _gradient_extract(tid):
+        # A per-trace dispatch refusal (cost circuit open, lane down, quota) must
+        # NOT abort the whole batch. The native extractor SIGNS OFF with a
+        # SystemExit on a refused dispatch; un-guarded, the FIRST refusal killed
+        # reflection for the entire run — silently — so the learning loop read as
+        # "nothing to learn" instead of "budget exhausted", and the gradient hole
+        # was invisible for hours. Count it, surface it, and continue.
+        try:
+            grads = list(_gradient_extract(tid))
+        except (SystemExit, Exception) as exc:  # noqa: BLE001
+            dispatch_failed += 1
+            last_err = str(getattr(_ge, "_last_dispatch_error", "") or "")
+            if "cost_circuit_open" in last_err:
+                circuit_open += 1
+                print(
+                    "reflection_extract_gradients: dispatch halted "
+                    f"({last_err.strip()[:160]}) — aborting batch after "
+                    f"{dispatch_failed} refusal(s)",
+                    file=sys.stderr,
+                )
+                break
+            if not last_err:
+                last_err = f"{type(exc).__name__}: {exc}"
+            print(
+                f"reflection_extract_gradients: dispatch failed for {tid} "
+                f"({last_err.strip()[:160]}) — skipping",
+                file=sys.stderr,
+            )
+            continue
+        for gradient in grads:
             if not gradient:
                 continue
             try:
@@ -640,6 +671,13 @@ def reflection_extract_gradients(since_ts: int = 0) -> None:
         print(
             "reflection_extract_gradients: skipped "
             f"{skipped_watermark} already-extracted trace(s) (watermark)",
+            file=sys.stderr,
+        )
+    if dispatch_failed:
+        print(
+            "reflection_extract_gradients: "
+            f"{dispatch_failed} trace(s) skipped on dispatch failure"
+            + (f" ({circuit_open} cost_circuit_open)" if circuit_open else ""),
             file=sys.stderr,
         )
     print(

@@ -831,14 +831,27 @@ def _handle_reflector_early(root):
     # never fail the workflow node. Capturing output also prevents the
     # reflect report from leaking into execute's stdout contract.
     try:
-        subprocess.run(
+        proc = subprocess.run(
             [sys.executable, "-m", "mini_ork.cli.reflect"],
             capture_output=True,
             timeout=_reflect_timeout_seconds(),
             env={**_module_env(root), "MINI_ORK_ROOT": root},
         )
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+    except subprocess.TimeoutExpired:
+        # Surface it: a silently-skipped reflection is how a gradient outage
+        # stayed invisible for hours (the learning loop read as "nothing to
+        # learn" while dispatch was actually refused).
+        print("  [reflect] timed out — reflection skipped this node "
+              "(learning loop lags; run `mini-ork reflect` to catch up)",
+              file=sys.stderr)
+        return 0, "done"
+    except OSError as exc:
+        print(f"  [reflect] could not launch reflection ({exc})", file=sys.stderr)
+        return 0, "done"
+    if proc.returncode != 0:
+        tail = (proc.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        note = tail[-1] if tail else f"rc={proc.returncode}"
+        print(f"  [reflect] reflection reported a problem: {note[:200]}", file=sys.stderr)
     return 0, "done"
 
 
