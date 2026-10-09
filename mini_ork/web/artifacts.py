@@ -40,9 +40,18 @@ def list_artifacts(home: Path, run_id: str) -> list[dict[str, Any]]:
     root = runs_root(home) / run_id
     if not root.exists() or not root.is_dir():
         return []
+    # Same scratch-subtree rule as the board run tab: a verifier sandbox is a
+    # full repo copy (thousands of files), not a run artifact. Imported here
+    # (not at module top) to keep this FastAPI-free module out of cli import
+    # cycles on the board poll path.
+    from mini_ork.cli.board_cmd import _artifact_excluded
+
     items: list[dict[str, Any]] = []
     for fp in sorted(root.rglob("*")):
         if not fp.is_file():
+            continue
+        relpath = str(fp.relative_to(root))
+        if _artifact_excluded(relpath):
             continue
         try:
             st = fp.stat()
@@ -51,7 +60,7 @@ def list_artifacts(home: Path, run_id: str) -> list[dict[str, Any]]:
         items.append(
             {
                 "name": fp.name,
-                "relpath": str(fp.relative_to(root)),
+                "relpath": relpath,
                 "size": st.st_size,
                 "mtime": int(st.st_mtime),
                 "kind": _classify(fp.name),

@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -336,26 +337,53 @@ def _artifact_group(rel: str) -> str:
 
 _GROUP_ORDER = ["Kickoff & plan", "Results", "Diffs", "Agent output", "Logs", "Evidence", "Other"]
 
+# Subtrees a run uses as workspace, not output: verifier/implementer sandboxes
+# (a full repo copy each — thousands of files), the pre-implementer fixture
+# file copy, and transform scratch. Without pruning these swamp the listing
+# and, worse, crowd real artifacts out under _ARTIFACT_LIMIT because a lexical
+# walk hits ``verifier-*-work`` before ``workspace``.
+_ARTIFACT_EXCLUDE_RE = re.compile(r"^(?:[^/]+-work|pre-impl-fixture/files|workspace/scratch)(?:/|$)")
+
+
+def _artifact_excluded(rel: str) -> bool:
+    """True for scratch paths no artifact listing should show."""
+    if _ARTIFACT_EXCLUDE_RE.match(rel):
+        return True
+    # A ``.git`` anywhere (sandbox repo copies carry one) is never run output.
+    return ".git" in rel.split("/")
+
 
 def _artifacts(run_dir: Path) -> list[dict[str, Any]]:
-    """Every file the run wrote, grouped and ordered for the run tab."""
+    """What the run produced, grouped and ordered for the run tab.
+
+    Scratch subtrees are pruned during the walk (not filtered after), and
+    ``_ARTIFACT_LIMIT`` applies after grouping so an over-limit run keeps
+    its Kickoff & plan / Results rows instead of whichever files a lexical
+    walk happened to reach first.
+    """
     if not run_dir.is_dir():
         return []
     out: list[dict[str, Any]] = []
-    for path in sorted(run_dir.rglob("*")):
-        if len(out) >= _ARTIFACT_LIMIT:
-            break
-        if not path.is_file():
-            continue
-        rel = path.relative_to(run_dir).as_posix()
-        try:
-            stat = path.stat()
-        except OSError:
-            continue
-        out.append({"path": rel, "abs": str(path), "size": stat.st_size,
-                    "modified": int(stat.st_mtime), "group": _artifact_group(rel)})
+    for dirpath, dirnames, filenames in os.walk(run_dir):
+        base = Path(dirpath)
+        rel_dir = base.relative_to(run_dir).as_posix()
+        dirnames[:] = [
+            d for d in dirnames
+            if not _artifact_excluded(d if rel_dir == "." else f"{rel_dir}/{d}")
+        ]
+        for name in filenames:
+            rel = name if rel_dir == "." else f"{rel_dir}/{name}"
+            if _artifact_excluded(rel):
+                continue
+            path = base / name
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            out.append({"path": rel, "abs": str(path), "size": stat.st_size,
+                        "modified": int(stat.st_mtime), "group": _artifact_group(rel)})
     out.sort(key=lambda a: (_GROUP_ORDER.index(a["group"]), a["path"]))
-    return out
+    return out[:_ARTIFACT_LIMIT]
 
 
 def _unified_diff(run_dir: Path) -> str:

@@ -268,6 +268,88 @@ def test_artifacts_are_grouped_for_the_run_tab(tmp_path: Path) -> None:
     assert board_cmd._artifacts(tmp_path / "missing") == []
 
 
+# ── scratch-subtree pruning for the artifacts listing ───────────────────────
+
+
+def _seed_run_dir_with_scratch(run_dir: Path) -> None:
+    """A run dir whose real output is outnumbered by scratch: verifier and
+    implementer sandboxes (each a full repo copy with a ``.git``), the
+    pre-implementer fixture file copy, and transform scratch — plus the real
+    files each of those must not crowd out."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    for rel in ("plan.json", "verdict.json", "agent-editor.live.jsonl"):
+        (run_dir / rel).write_text("x")
+    (run_dir / "pre-impl-fixture" / "MANIFEST.json").parent.mkdir(parents=True, exist_ok=True)
+    (run_dir / "pre-impl-fixture" / "MANIFEST.json").write_text("{}")
+    for rel in (
+        "verifier-test-work/repo/.git/hooks/pre-commit.sample",
+        "verifier-test-work/repo/mini_ork/cli/main.py",
+        "verifier-static-check-work/repo/ui/src/app.tsx",
+        "implementer-work/repo/target/calc.py",
+        "pre-impl-fixture/files/repo/calc.py",
+        "workspace/scratch/anonymize-12/response-bundle.md",
+    ):
+        p = run_dir / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("scratch")
+
+
+def test_artifacts_listing_prunes_scratch_subtrees(tmp_path: Path) -> None:
+    """Sandbox repo copies, the fixture file copy and transform scratch are
+    workspaces, not run output — none may appear in the listing, while the
+    fixture MANIFEST and the ledger's declared-output manifests stay."""
+    run_dir = tmp_path / "run-scratch"
+    _seed_run_dir_with_scratch(run_dir)
+    (run_dir / "workspace" / "manifests" / "synthesizer.outputs.json").parent.mkdir(parents=True)
+    (run_dir / "workspace" / "manifests" / "synthesizer.outputs.json").write_text("{}")
+
+    listed = [a["path"] for a in board_cmd._artifacts(run_dir)]
+    assert listed == [
+        "plan.json",                      # Kickoff & plan
+        "verdict.json",                   # Results
+        "agent-editor.live.jsonl",        # Agent output
+        "pre-impl-fixture/MANIFEST.json",  # Other (kept — evidence, not a copy)
+        "workspace/manifests/synthesizer.outputs.json",  # Other (ledger output)
+    ]
+
+
+def test_artifacts_limit_keeps_priority_groups_not_lexical_walk_order(
+        tmp_path: Path, monkeypatch) -> None:
+    """``_ARTIFACT_LIMIT`` must apply AFTER grouping. The old code capped a
+    lexical walk, so ``verifier-*-work/**`` files (which sort before
+    ``workspace`` but after top-level files) crowded real artifacts out —
+    a run with 7,403 sandbox files showed 334 of them as "what the run
+    produced". With limit 2 the listing must keep Kickoff & plan and
+    Results, not the lexically-first survivors."""
+    run_dir = tmp_path / "run-capped"
+    _seed_run_dir_with_scratch(run_dir)
+    monkeypatch.setattr(board_cmd, "_ARTIFACT_LIMIT", 2)
+
+    listed = [a["path"] for a in board_cmd._artifacts(run_dir)]
+    assert listed == ["plan.json", "verdict.json"]
+
+
+def test_web_list_artifacts_skips_scratch_subtrees(tmp_path: Path) -> None:
+    """The web ``/artifacts`` endpoint shares the pruning rule, so the web UI
+    cannot list a sandbox repo copy either. The web walk sorts lexically
+    (no group order), so the expected list is the sorted real paths."""
+    from mini_ork.web import artifacts as web_artifacts
+
+    home = tmp_path / "proj" / ".mini-ork"
+    _seed_run_dir_with_scratch(home / "runs" / "run-web")
+
+    relpaths = [a["relpath"] for a in web_artifacts.list_artifacts(home, "run-web")]
+    assert relpaths == [
+        "agent-editor.live.jsonl",
+        "plan.json",
+        "pre-impl-fixture/MANIFEST.json",
+        "verdict.json",
+    ]
+    # The .git deep inside a sandbox copy must never be served by the walk.
+    assert not any(".git" in r or "-work/" in r or r.startswith("pre-impl-fixture/files")
+                   for r in relpaths)
+
+
 # ── kickoff ide-board-perf-r2 — Part B tests ──────────────────────────────
 
 
