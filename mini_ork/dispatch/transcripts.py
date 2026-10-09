@@ -4,8 +4,24 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
+
+
+def _strip_protocol_blocks(text: str) -> str:
+    """Drop ``<z-insight>…</z-insight>`` blocks at write-time.
+
+    Dispatched CLIs inherit the operator's global agent config, which appends a
+    ``<z-insight>`` JSON envelope to deliverable output. Stripping here means
+    every transcript consumer (``web/agents.py``, ``ide_pages/node.py``, …)
+    reads a clean transcript instead of re-stripping at render time.
+    """
+    if not text or "<z-insight>" not in text:
+        return text
+    text = re.sub(r"<z-insight>.*?</z-insight>", "", text, flags=re.S)
+    text = re.sub(r"<z-insight>.*\Z", "", text, flags=re.S)
+    return text.rstrip()
 
 
 def _bounded_text(path: Path, max_bytes: int) -> tuple[str, bool]:
@@ -42,12 +58,13 @@ def write_exec_transcript(out_file: str | os.PathLike[str], model: str = "unknow
             turns.append({
                 "turn_index": len(turns), "model": raw.get("model") or model,
                 "input_tokens": t_in, "output_tokens": t_out,
-                "text": raw.get("text") or "", "tool_uses": raw.get("tool_uses") or [],
+                "text": _strip_protocol_blocks(raw.get("text") or ""), "tool_uses": raw.get("tool_uses") or [],
                 "cache_read_input_tokens": int(raw.get("cache_read_input_tokens") or 0),
                 "cache_creation_input_tokens": int(raw.get("cache_creation_input_tokens") or 0),
                 "stop_reason": raw.get("stop_reason"), "session_id": raw.get("session_id"),
             })
     text, truncated = _bounded_text(output, max_bytes)
+    text = _strip_protocol_blocks(text)
     if turns:
         if text and not turns[-1]["text"]:
             turns[-1]["text"] = text
