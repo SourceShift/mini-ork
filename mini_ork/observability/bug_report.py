@@ -610,8 +610,13 @@ def _render_promoted_kickoff(
         body.extend([
             "## Verification commands",
             "",
-            "- `shellcheck $(git diff --name-only HEAD~1 HEAD | grep '\\.sh$')`",
-            "- `bash tests/integration/test_autonomous_epic_pipeline.sh`",
+            # Must reference paths that EXIST and terminate on their own. The
+            # previous pair cited tests/integration/test_autonomous_epic_pipeline.sh
+            # (deleted by the 2026-07 bash-removal, Phase 4) and a `shellcheck
+            # $(...)` whose substitution is EMPTY when no .sh changed — shellcheck
+            # then reads stdin and hangs the verifier.
+            "- `python3 -m compileall -q mini_ork`",
+            "- `python3 -m pytest -q tests/unit/test_mini_ork_epics_py.py tests/unit/test_scheduler_py.py`",
             "",
             "## Done When",
             "",
