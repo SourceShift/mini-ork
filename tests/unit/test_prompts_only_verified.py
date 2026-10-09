@@ -442,5 +442,67 @@ def test_guard_flags_marker_without_verified_sidecar(tmp_path):
 def test_real_repo_has_no_unverified_markers():
     """The rule, enforced against the actual repo tree: every applied block
     that survives must be explained by a sidecar entry naming a real scorer.
-    After the revert this is vacuously true (no markers remain)."""
+    After the revert this is vacuously true (no markers remain).
+
+    Runs also read the project overlay (``<MINI_ORK_HOME>/recipes``) FIRST, so
+    when a home is set the guard must walk it too — otherwise an overlay prompt
+    edit is injected yet invisible.
+    """
     assert pd.unverified_markers(REPO) == []
+    assert pd.unverified_markers(REPO, pd.home_recipe_dirs()) == []
+
+
+def test_home_recipe_dirs(monkeypatch):
+    monkeypatch.delenv("MINI_ORK_HOME", raising=False)
+    assert pd.home_recipe_dirs() == []
+    monkeypatch.setenv("MINI_ORK_HOME", str(Path("/tmp/x-home")))
+    assert pd.home_recipe_dirs() == [str(Path("/tmp/x-home") / "recipes")]
+    assert pd.home_recipe_dirs("/other") == [str(Path("/other") / "recipes")]
+
+
+def test_guard_flags_overlay_marker_only_when_roots_passed(tmp_path):
+    """A marker in the project overlay is invisible to a repo-only scan and
+    visible once the overlay roots are supplied — the read-root/scan-root gap."""
+    repo = _make_repo(tmp_path, prompt="# P\n")  # repo recipes are clean
+    overlay_target = (tmp_path / "home" / "recipes" / "ovl" / "prompts" / "agent.md")
+    overlay_target.parent.mkdir(parents=True)
+    overlay_target.write_text(
+        "# P\n\n<!-- applied:gradient_records:gr-ovl -->\n- Directive: d\n")
+
+    assert pd.unverified_markers(str(repo)) == []  # repo-only: blind to overlay
+    overlay = pd.home_recipe_dirs(str(tmp_path / "home"))
+    assert pd.unverified_markers(str(repo), overlay) == [str(overlay_target)]
+
+
+def test_revert_unverified_cleans_overlay(tmp_path, db):
+    """The repair path reaches the same overlay roots the guard checks."""
+    repo = _make_repo(tmp_path, prompt="# P\n")
+    target = tmp_path / "home" / "recipes" / "ovl" / "prompts" / "agent.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("# P\n\n<!-- applied:gradient_records:gr-ovl -->\n"
+                      "- Observation: o\n- Directive: d\n")
+    overlay = pd.home_recipe_dirs(str(tmp_path / "home"))
+
+    res = pd.revert_unverified(str(repo), db, files=True, record=False,
+                               extra_recipe_dirs=overlay)
+    assert "gr-ovl" in res["removed"]
+    assert res["files_changed"] == [str(target)]
+    assert "applied:gradient_records" not in target.read_text()
+    assert pd.unverified_markers(str(repo), overlay) == []
+
+
+def test_cli_revert_include_home(tmp_path, db, envscrub, capsys):
+    """``--revert-unverified --include-home`` cleans the overlay too."""
+    repo = _make_repo(tmp_path, prompt="# P\n")
+    target = tmp_path / "home" / "recipes" / "ovl" / "prompts" / "agent.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("# P\n\n<!-- applied:gradient_records:gr-ovl -->\n"
+                      "- Directive: d\n")
+    envscrub.setenv("MINI_ORK_HOME", str(tmp_path / "home"))
+
+    rc = ap._revert_unverified_main(
+        ["--revert-unverified", "--files-only", "--include-home"], str(repo))
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert "gr-ovl" in out["removed"]
+    assert "applied:gradient_records" not in target.read_text()

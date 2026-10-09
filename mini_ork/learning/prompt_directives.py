@@ -112,7 +112,20 @@ def _now() -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # scan — every applied block on disk
 # ─────────────────────────────────────────────────────────────────────────────
-def scan(repo_root) -> list[dict]:
+def home_recipe_dirs(home: str | None = None) -> list[str]:
+    """Recipe base dirs a run reads from the project overlay: ``[<home>/recipes]``.
+
+    Runs resolve recipes overlay-first (``<MINI_ORK_HOME>/recipes/<id>/``), but
+    ``scan`` walks ``<repo>/recipes`` only. Passing these through
+    ``extra_recipe_dirs`` closes that gap so a hand-edited overlay prompt cannot
+    carry an ``applied:`` block the guard never sees. Empty when ``MINI_ORK_HOME``
+    is unset (a coherent "no overlay here" state).
+    """
+    h = home or os.environ.get("MINI_ORK_HOME")
+    return [os.path.join(h, "recipes")] if h else []
+
+
+def scan(repo_root, extra_recipe_dirs=None) -> list[dict]:
     """Return every ``applied:`` directive block under ``recipes/*/prompts/*.md``.
 
     A block is: the marker line, the ``- Observation:`` / ``- Directive:``
@@ -121,21 +134,39 @@ def scan(repo_root) -> list[dict]:
     ``end_line`` are 1-based and inclusive of the blank line, so removing the
     slice ``[start_line-1:end_line]`` reverses the append byte-for-byte.
 
+    ``extra_recipe_dirs`` are additional ``<...>/recipes`` base dirs to scan
+    alongside ``<repo>/recipes`` — the project overlay a run resolves first
+    (:func:`home_recipe_dirs`). The guard must walk every root the run READS or
+    an overlay edit escapes it. A block found outside ``repo_root`` keeps its
+    absolute path as ``file`` (its ``..``-relative form would not round-trip
+    through ``_sidecar_entry_for``).
+
     Each dict carries the kickoff's keys — ``source_id`` (the bare
-    ``gr-<hex>`` id), ``file`` (repo-relative), ``start_line``, ``end_line``,
-    ``text`` — plus ``marker_ref`` (``gradient_records:gr-<hex>``, the exact
-    string the marker carries) for callers that need to match the marker.
+    ``gr-<hex>`` id), ``file`` (repo-relative, or absolute when outside the
+    repo tree), ``start_line``, ``end_line``, ``text`` — plus ``marker_ref``
+    (``gradient_records:gr-<hex>``, the exact string the marker carries) for
+    callers that need to match the marker.
     """
     root = os.path.abspath(str(repo_root)) if repo_root else os.getcwd()
     blocks: list[dict] = []
-    pattern = os.path.join(root, "recipes", "*", "prompts", "*.md")
-    for path in sorted(glob.glob(pattern)):
+    bases = [os.path.join(root, "recipes")]
+    for d in (extra_recipe_dirs or []):
+        if d:
+            bases.append(os.path.abspath(str(d)))
+    seen: set[str] = set()
+    for path in (p for base in bases
+                 for p in sorted(glob.glob(os.path.join(base, "*", "prompts", "*.md")))):
+        if path in seen:
+            continue
+        seen.add(path)
         try:
             with open(path, encoding="utf-8", errors="replace") as fh:
                 content = fh.read()
         except OSError:
             continue
         rel = os.path.relpath(path, root)
+        if rel.startswith(".."):
+            rel = path  # outside the repo tree: keep absolute so it round-trips
         lines = content.split("\n")
         i = 0
         while i < len(lines):
@@ -316,16 +347,18 @@ def _sidecar_entry_for(repo_root: str, block: dict) -> dict | None:
     return None
 
 
-def unverified_markers(repo_root) -> list[str]:
+def unverified_markers(repo_root, extra_recipe_dirs=None) -> list[str]:
     """Applied markers that lack a sidecar entry with a real scorer.
 
     The static guard: any ``applied:`` block on disk must be explained by a
     sidecar entry whose ``scorer`` is in ``VERIFIED_SCORERS``. Returns the
-    offending repo-relative file paths (sorted, deduped).
+    offending file paths (sorted, deduped) — repo-relative, or absolute for a
+    block found under ``extra_recipe_dirs`` (the project overlay a run reads
+    first; pass ``home_recipe_dirs()``).
     """
     root = os.path.abspath(str(repo_root)) if repo_root else os.getcwd()
     offenders = []
-    for block in scan(root):
+    for block in scan(root, extra_recipe_dirs):
         entry = _sidecar_entry_for(root, block)
         if entry is None or entry.get("scorer") not in VERIFIED_SCORERS:
             offenders.append(block["file"])
@@ -529,7 +562,8 @@ def _record_reverts(db: str | None, source_ids, suffixes: set[str],
 
 
 def revert_unverified(repo_root, db: str | None = None, *, dry_run: bool = False,
-                      files: bool = True, record: bool = True) -> dict:
+                      files: bool = True, record: bool = True,
+                      extra_recipe_dirs=None) -> dict:
     """Revert every unverified applied directive under ``repo_root``.
 
     ``files`` scans+edits the prompt files; ``record`` writes the audit rows and
@@ -537,8 +571,13 @@ def revert_unverified(repo_root, db: str | None = None, *, dry_run: bool = False
     record=False) — the worktree run; the operator's post-merge ``--db-only`` is
     (files=False, record=True), whose source_ids come from the DB because the
     markers are gone by then. Idempotent: a second run removes nothing and
-    records nothing. Returns ``{removed, kept_verified, files_changed,
-    quarantined, recorded, dry_run}``.
+    records nothing.
+
+    ``extra_recipe_dirs`` extends the file scan to the project overlay a run
+    reads first (:func:`home_recipe_dirs`); pass it to clean the same roots the
+    guard checks. Ignored when ``files`` is False (``--db-only`` derives its
+    source_ids from the DB, so file location is irrelevant). Returns
+    ``{removed, kept_verified, files_changed, quarantined, recorded, dry_run}``.
     """
     root = os.path.abspath(str(repo_root)) if repo_root else os.getcwd()
 
@@ -546,7 +585,7 @@ def revert_unverified(repo_root, db: str | None = None, *, dry_run: bool = False
     kept_verified: list[str] = []
     blocks_by_file: dict[str, list[dict]] = {}
     if files:
-        for block in scan(root):
+        for block in scan(root, extra_recipe_dirs):
             if verification(db, block["source_id"])["verified"]:
                 kept_verified.append(block["source_id"])
                 continue

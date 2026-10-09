@@ -136,14 +136,16 @@ USAGE_TEXT = (
     "\n"
     "Revert (only-verified-learnings rule):\n"
     "  mini-ork apply --revert-unverified [--dry-run]\n"
-    "                  [--files-only | --db-only]\n"
+    "                  [--files-only | --db-only] [--include-home]\n"
     "                  Remove every prompt directive that was not EARNED by a\n"
     "                  measured (probe/code) promote, record the removal in\n"
     "                  promotion_records, and quarantine the matching\n"
     "                  version_registry rows. --files-only edits the prompt\n"
     "                  files only (no DB write); --db-only records and\n"
     "                  quarantines from DB state alone (post-merge, when the\n"
-    "                  on-disk markers are already gone).\n"
+    "                  on-disk markers are already gone). --include-home also\n"
+    "                  scans the project overlay (<home>/recipes), the recipe\n"
+    "                  roots a run reads before <root>/recipes.\n"
     "\n"
 )
 
@@ -1555,6 +1557,7 @@ def _revert_unverified_main(argv: list[str], root: str) -> int:
     dry_run = False
     files = True
     record = True
+    include_home = False
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -1573,6 +1576,12 @@ def _revert_unverified_main(argv: list[str], root: str) -> int:
             files, record = False, True
             i += 1
             continue
+        if arg == "--include-home":
+            # Also scan the project overlay (<home>/recipes) — the roots a run
+            # reads first, which the default repo-only scan misses.
+            include_home = True
+            i += 1
+            continue
         if arg in ("--help", "-h"):
             sys.stdout.write(USAGE_TEXT)
             return 0
@@ -1586,8 +1595,9 @@ def _revert_unverified_main(argv: list[str], root: str) -> int:
     os.environ.setdefault("MINI_ORK_DB", db)
 
     from mini_ork.learning import prompt_directives as _pd
-    result = _pd.revert_unverified(root, db, dry_run=dry_run, files=files,
-                                   record=record)
+    result = _pd.revert_unverified(
+        root, db, dry_run=dry_run, files=files, record=record,
+        extra_recipe_dirs=_pd.home_recipe_dirs(home) if include_home else None)
     sys.stdout.write(json.dumps(result, indent=2, sort_keys=True) + "\n")
     return 0
 
