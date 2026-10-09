@@ -248,11 +248,11 @@ def _attribute_calls(nodes: dict[str, Node], calls: list[dict[str, Any]], now: i
             best.family = model
 
 
-def _load(home: Path, run_id: str) -> Run | None:
+def _load(home: Path, run_id: str, *, with_files: bool = True) -> Run | None:
     from mini_ork.acp import fleet
     from mini_ork.web.db import db_for
 
-    card = fleet.run_card(home, run_id)
+    card = fleet.run_card(home, run_id, with_files=with_files)
     if card is None:
         return None
     db = db_for(home)

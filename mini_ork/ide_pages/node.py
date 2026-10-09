@@ -3181,7 +3181,12 @@ def build_node(home: Path, run_id: str, node_id: str, view: str | None = None,
         return {"ok": False, "error": f"unknown view {view!r} "
                                        f"(expected one of {', '.join(_VIEWS)})"}
 
-    run_obj = _load(home, run_id)
+    # ``with_files=False``: the node page reads no ``card["files"]``. The
+    # changes view does its own single ``_load_diffs``; letting the run
+    # load compute the card's files too would make one node view read the
+    # diff cache twice (see
+    # ``test_changes_view_cached_or_computed_called_once``).
+    run_obj = _load(home, run_id, with_files=False)
     if run_obj is None:
         return {"ok": False, "error": f"no run {run_id}"}
 

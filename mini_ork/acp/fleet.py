@@ -645,13 +645,20 @@ def render_fleet(rows: list[FleetRow], counts: dict[str, int], *, state: str, no
     return "\n".join(parts)
 
 
-def run_card(home: Path, run_id: str) -> dict[str, Any] | None:
+def run_card(home: Path, run_id: str, *, with_files: bool = True) -> dict[str, Any] | None:
     """Project a run's read-model state into a dict the renderer can shape.
 
     Returns ``None`` for an unknown ``run_id`` (no ``task_runs`` row).
     All exceptions are swallowed at the I/O boundaries so a missing DB or
     table degrades to ``{...with empty fields...}`` instead of a 500 — the
     same shape every other projection in the codebase uses.
+
+    ``with_files=False`` skips the ``_file_changes`` read entirely and
+    leaves ``files`` / ``files_from_cache`` at their empty defaults. That
+    call funnels through ``diffs.cached_or_computed``, which on a cache
+    miss pays one ``git show`` per changed file; a caller that never reads
+    ``files`` (the DAG node page) must not pay it. The run page and the
+    ``/status`` card keep the default and still get the real list.
 
     Fields:
       * ``title``, ``recipe``, ``status`` — raw from the run row + snapshot.
@@ -692,7 +699,10 @@ def run_card(home: Path, run_id: str) -> dict[str, Any] | None:
     run_dir = _run_dir(home, run_id)
     ts = task_state(run_dir, snapshot)
 
-    files, files_from_cache = _file_changes(run_dir)
+    if with_files:
+        files, files_from_cache = _file_changes(run_dir)
+    else:
+        files, files_from_cache = [], True
     cost_by_stage, cost_total = _cost_by_stage(home, run_id)
     verdict = _verdict(run_dir)
     learnings = _learnings(home, run_id)
