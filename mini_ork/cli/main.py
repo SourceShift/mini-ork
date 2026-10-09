@@ -802,6 +802,12 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
         sys.stderr.write(f"kickoff not found: {kickoff}\n"); return 2
     run_id = os.environ.setdefault("MINI_ORK_RUN_ID", f"run-{int(time.time())}-{os.getpid()}")
     sink["run_id"] = run_id
+    # Heal reflect rows a hard-killed parent (SIGKILL, uncatchable) left stuck
+    # 'running' — the live path finalizes its own row in the reflect `finally`,
+    # but a parent killed mid-reflect leaves one for the next run to mop up.
+    # Age-guarded, so a reflect still in flight is never touched.
+    with contextlib.suppress(Exception):
+        trace_store.finalize_reflect_traces()
     if (blocked := _budget_preflight(sink)) is not None:
         return blocked
 
@@ -1093,6 +1099,16 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
             )
         except subprocess.TimeoutExpired:
             sys.stdout.write("── reflect (timed out; skipped) ──\n")
+        finally:
+            # A timed-out reflect is SIGKILLed by subprocess.run, so its own
+            # terminal trace write never runs and the row it opened as
+            # 'running' leaks forever — inflating the running count AND hiding
+            # the run from `resolve_finished_runs` (which reads "run over = no
+            # trace running"). The parent owns the kill, so the parent owns the
+            # terminal write. Keyed on run_id, so it only touches this run's
+            # reflect row.
+            with contextlib.suppress(Exception):
+                trace_store.finalize_reflect_traces(run_id)
 
     # ── trajectory retention (roadmap Step 2 / A2): best-effort TTL prune of
     # turn_jsonl artifacts. MO_TRAJECTORY_TTL_DAYS=0 disables; never gates.

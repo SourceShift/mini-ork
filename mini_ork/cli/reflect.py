@@ -20,6 +20,7 @@ matches the kickoff's "byte-identical to the pre-R4b reflect" invariant.
 from __future__ import annotations
 
 import argparse
+import atexit
 import contextlib
 import io
 import json
@@ -128,6 +129,26 @@ def _trace_write(payload_json: str, env: dict) -> None:
         pass
 
 
+def _trace_finalizer(trace_id: str, trace_env: dict, state: dict) -> None:
+    """atexit guard: land a terminal 'failure' row if the pipeline exits
+    without writing its own terminal trace.
+
+    Covers the exception/crash path only. It CANNOT cover the parent's
+    subprocess-timeout path: that SIGKILLs this process and atexit never runs
+    on SIGKILL. That path is covered parent-side by
+    ``trace_store.finalize_reflect_traces(run_id)``."""
+    if state.get("terminal"):
+        return
+    from mini_ork import trace_store
+    try:
+        payload = json.dumps(trace_store.enrich_stage_trace(
+            {"trace_id": trace_id, "task_class": "__reflect__", "status": "failure"},
+            node_type="reflector"))
+        _trace_write(payload, trace_env)
+    except Exception:
+        pass
+
+
 # ── Dry-run branch ───────────────────────────────────────────────────────────
 def _dry_run(since: int, task_class_filter: str, reflect_lane: str,
              gradient_model: str, db_path: str) -> None:
@@ -213,6 +234,7 @@ def main(argv: list[str] | None = None) -> int:
         "MINI_ORK_DB": db_path,
     }
 
+    _trace_state: dict = {"terminal": False}
     if not dry_run:
         _trace_write(
             json.dumps({
@@ -222,6 +244,9 @@ def main(argv: list[str] | None = None) -> int:
             }),
             trace_env,
         )
+        # Defensive terminal write if the pipeline exits without finalizing
+        # (exception/crash). The SIGKILL path is the parent's to finalize.
+        atexit.register(_trace_finalizer, trace_id, trace_env, _trace_state)
 
     # ── dry-run branch ─────────────────────────────────────────────────────
     if dry_run:
@@ -525,6 +550,7 @@ def main(argv: list[str] | None = None) -> int:
         },
     }, node_type="reflector"))
     _trace_write(payload, trace_env)
+    _trace_state["terminal"] = True
 
     sys.stdout.write(
         f"reflect: analyzed {traces_analyzed or 0} traces, "

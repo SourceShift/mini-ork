@@ -438,3 +438,57 @@ def trace_query(task_class: str = "", status: str = "", since: int = 0,
     rows = con.execute(sql, params).fetchall()
     con.close()
     return [dict(r) for r in rows]
+
+
+def finalize_reflect_traces(
+    run_id: str = "",
+    *,
+    db: str | None = None,
+    grace_s: int = 720,
+) -> int:
+    """Mark leaked ``'__reflect__'`` ``'running'`` traces terminal.
+
+    Reflect is spawned by the parent with ``subprocess.run(timeout=...)``. On
+    timeout Python SIGKILLs the child, so reflect's own terminal trace write
+    (``mini_ork.cli.reflect``) can never run — the row it opened as
+    ``status='running'`` leaks forever. That leak is not cosmetic: it inflates
+    the ``status='running'`` count, and it poisons every reader that treats "a
+    run is over when none of its traces is running" as the finished-run
+    predicate (``memory.semantic.resolve_finished_runs``), silently starving
+    the semantic feedback loop for the whole run. The process that does the
+    killing owns the terminal write; this is that write.
+
+    ``run_id`` given  → exact sweep for that one run. The caller knows its
+                        reflect child just exited, so no age guard is applied.
+    ``run_id`` empty  → age-guarded sweep of every stuck reflect row older than
+                        ``grace_s`` — heals rows a hard-killed parent left
+                        behind, without racing a reflect still in flight.
+
+    Returns the number of rows finalized. Cold-safe: a missing table or db
+    yields 0 rather than raising.
+    """
+    try:
+        dbp = _db_path(db)
+    except RuntimeError:
+        return 0
+    if not os.path.isfile(dbp):
+        return 0
+    sql = ("UPDATE execution_traces SET status='failure' "
+           "WHERE task_class='__reflect__' AND status='running'")
+    params: list[object] = []
+    if run_id:
+        sql += " AND run_id=?"
+        params.append(run_id)
+    else:
+        sql += " AND CAST(strftime('%s', created_at) AS INTEGER) <= ?"
+        params.append(int(time.time()) - int(grace_s))
+    con = sqlite3.connect(dbp)
+    try:
+        con.execute("PRAGMA busy_timeout=5000")
+        cur = con.execute(sql, params)
+        con.commit()
+        return int(cur.rowcount or 0)
+    except sqlite3.OperationalError:
+        return 0
+    finally:
+        con.close()
