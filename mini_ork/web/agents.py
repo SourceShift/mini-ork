@@ -24,6 +24,7 @@ from typing import Any
 
 from . import artifacts, recipes
 from .db import StateDB
+from .repositories import derive_node_statuses
 
 # task_runs.status values after which no node can possibly still be running.
 _TERMINAL_RUN_STATUSES = {"published", "rolled_back", "failed"}
@@ -470,30 +471,14 @@ def _collect_node_events(db: StateDB, task_run_id: str) -> dict[str, dict[str, A
         SELECT event_type, created_at, payload_json
         FROM run_events
         WHERE run_id = ? AND event_type IN ('node_start', 'node_end')
-        ORDER BY created_at ASC
+        ORDER BY created_at ASC, rowid ASC
         """,
         (task_run_id,),
     )
-    out: dict[str, dict[str, Any]] = {}
-    for r in rows:
-        try:
-            p = json.loads(r["payload_json"]) if r["payload_json"] else {}
-        except json.JSONDecodeError:
-            p = {}
-        nid = p.get("node_id")
-        if not nid:
-            continue
-        e = out.setdefault(nid, {"status": "never_seen"})
-        if r["event_type"] == "node_start":
-            e["status"] = "running"
-            e["started_at"] = r["created_at"]
-        elif r["event_type"] == "node_end":
-            verdict = p.get("verdict")
-            e["status"] = "failed" if verdict in ("REQUEST_CHANGES", "ESCALATE", "CRASH") else "done"
-            e["verdict"] = verdict
-            e["duration_ms"] = p.get("duration_ms")
-            e["ended_at"] = r["created_at"]
-    return out
+    # One lifecycle rule for the whole read model: a revise round's new
+    # ``node_start`` retires the prior round's end, so the agent detail page
+    # never pairs round 2's start with round 1's end (a 0s/stale node).
+    return derive_node_statuses(rows)
 
 
 def _lane_to_nodes(recipe_name: str | None) -> dict[str, list[str]]:

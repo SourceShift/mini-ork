@@ -325,3 +325,36 @@ def test_node_status_map_classification_preserved(tmp_path: Path) -> None:
     assert out["verifier"]["status"] == "failed"  # REQUEST_CHANGES
     assert out["verifier"]["verdict"] == "REQUEST_CHANGES"
     assert "other" not in out  # different run
+
+
+def test_node_status_map_revise_rerun_retires_the_prior_end(tmp_path: Path) -> None:
+    """A revise round's new node_start (sharing a second with the prior end,
+    arriving first) makes the node running again: the entry must not keep
+    round 1's ended_at/duration, which rendered a 0s/stale finished node."""
+    from mini_ork.web.routes.run_detail import _node_status_map
+
+    db_path = tmp_path / "state.db"
+    _seed(db_path)
+    con = sqlite3.connect(db_path)
+    con.executemany(
+        "INSERT INTO run_events (event_id, run_id, event_type, created_at, payload_json)"
+        " VALUES (?,?,?,?,?)",
+        [
+            ("rv-1", "run-1", "node_start", 1200,
+             json.dumps({"node_id": "reviewer"})),
+            # round 2's start lands before round 1's end, same second.
+            ("rv-2", "run-1", "node_start", 1300,
+             json.dumps({"node_id": "reviewer"})),
+            ("rv-3", "run-1", "node_end", 1300,
+             json.dumps({"node_id": "reviewer", "verdict": "REQUEST_CHANGES",
+                         "duration_ms": 77})),
+        ],
+    )
+    con.commit()
+    con.close()
+
+    out = _node_status_map(StateDB(db_path), "run-1")
+    assert out["reviewer"]["status"] == "running"
+    assert out["reviewer"]["started_at"] == 1300
+    assert "ended_at" not in out["reviewer"]
+    assert "duration_ms" not in out["reviewer"]

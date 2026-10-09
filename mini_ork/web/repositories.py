@@ -512,17 +512,114 @@ _FAILED = "failed"
 _FAILED_VERDICTS = frozenset({"REQUEST_CHANGES", "ESCALATE", "CRASH"})
 
 
+def fold_node_attempts(
+    rows: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Fold ``node_start`` / ``node_end`` events into one entry per node,
+    describing the node's LATEST attempt as a start/end pair.
+
+    Returns ``{node_id: {"start": int | None, "end": int | None,
+    "end_payload": dict | None}}``. ``end_payload`` is the matched
+    ``node_end``'s parsed payload (``verdict`` / ``duration_ms`` /
+    ``artifact_path`` / ``finish_reason``), or ``None`` while the latest
+    attempt is still running.
+
+    Why not "the last start seen / the last end seen": ``run_events.
+    created_at`` is 1-second resolution, and a revise round's new
+    ``node_start`` can share a second with the PRIOR round's ``node_end``
+    (or arrive after a reaper-synthesized dangling ``node_end``). Bookkeeping
+    that keys on "the last end seen" then pairs round 2's start with round
+    1's end, and the node renders as a 0-second finished step instead of a
+    running one.
+
+    Pairing rule — an ATTEMPT SEQUENCE, order-independent within a second:
+    walk the node's ``node_start`` events in order and close each with the
+    earliest not-yet-consumed ``node_end`` whose timestamp is at-or-after
+    that start. The latest attempt (the last start) therefore has an ``end``
+    only when a later end matched it; a prior round's end never leaks into
+    it. Timestamps of ``None`` pair by position. A node with only ends (no
+    start) is closed by its last end.
+
+    ``rows[i]`` is a dict with at least ``event_type`` and ``payload_json``;
+    ``payload_json`` may be ``None`` or unparseable — both yield an empty
+    payload and the row is skipped (no ``node_id`` to key on).
+    """
+    starts: dict[str, list[Any]] = {}
+    ends: dict[str, list[tuple[Any, dict[str, Any]]]] = {}
+    order: list[str] = []
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        kind = r.get("event_type")
+        if kind not in ("node_start", "node_end"):
+            continue
+        payload_raw = r.get("payload_json")
+        try:
+            payload = json.loads(payload_raw) if payload_raw else {}
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        node_id = str(payload.get("node_id") or "")
+        if not node_id:
+            continue
+        if node_id not in order:
+            order.append(node_id)
+        if kind == "node_start":
+            starts.setdefault(node_id, []).append(r.get("created_at"))
+        else:
+            ends.setdefault(node_id, []).append((r.get("created_at"), payload))
+
+    out: dict[str, dict[str, Any]] = {}
+    for node_id in order:
+        node_starts = starts.get(node_id, [])
+        node_ends = ends.get(node_id, [])
+        latest: tuple[Any, dict[str, Any]] | None = None
+        if not node_starts:
+            # Orphan end(s): a reaper synthesized an end for a node whose
+            # start row never landed. The last end closes it.
+            if node_ends:
+                latest = node_ends[-1]
+        else:
+            consumed = [False] * len(node_ends)
+            for si, s_ts in enumerate(node_starts):
+                match_i = None
+                for ei, (e_ts, _p) in enumerate(node_ends):
+                    if consumed[ei]:
+                        continue
+                    # ``None`` timestamps can't be ordered; a present end
+                    # closes a present start only when it is not earlier.
+                    if e_ts is None or s_ts is None or e_ts >= s_ts:
+                        match_i = ei
+                        break
+                if match_i is None:
+                    if si == len(node_starts) - 1:
+                        latest = None  # latest attempt still running
+                    continue
+                consumed[match_i] = True
+                if si == len(node_starts) - 1:
+                    latest = node_ends[match_i]
+        out[node_id] = {
+            "start": node_starts[-1] if node_starts else None,
+            "end": latest[0] if latest else None,
+            "end_payload": latest[1] if latest else None,
+        }
+    return out
+
+
 def derive_node_statuses(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """Aggregate ``node_start`` / ``node_end`` events into per-node statuses.
 
-    Pure module-level helper. Takes the rows already fetched by
+    Pure module-level helper, and the single source of truth for the
+    lifecycle rule (``run_detail.py`` and ``agents.py`` delegate here).
+    Takes the rows fetched by
     :meth:`RunDetailRepository.fetch_node_lifecycle_events_bulk` (or its
     single-run counterpart) and returns ``{node_id: {status, …}}`` with one
     entry per node that emitted at least one lifecycle event. Run-level
     "no events at all" → ``{}``; the merge default of ``never_seen`` is the
-    caller's responsibility (mirroring ``run_detail.py:673-674``).
+    caller's responsibility.
 
-    Rules, verbatim from ``mini_ork/web/routes/run_detail.py:658-664``:
+    Rules:
 
     - ``never_seen`` : no ``node_start`` event for this node  (caller applies)
     - ``running``    : ``node_start`` present, no ``node_end`` yet
@@ -530,44 +627,27 @@ def derive_node_statuses(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]
     - ``failed``     : ``node_end`` present with verdict in
                        {``REQUEST_CHANGES``, ``ESCALATE``, ``CRASH``}
 
-    ``rows[i]`` is a dict with at least ``event_type`` and ``payload_json``
-    keys; ``payload_json`` may be ``None`` or unparseable — both yield an
-    empty payload and the row is skipped (no ``node_id`` to key on).
+    Timing comes from :func:`fold_node_attempts`, so a node's entry always
+    describes its LATEST attempt: a revise round's new ``node_start`` retires
+    the prior round's ``ended_at`` / ``duration_ms`` / ``verdict`` — the entry
+    never mixes round 2's start with round 1's end (the 0s-node bug).
     """
     out: dict[str, dict[str, Any]] = {}
-    for r in rows:
-        payload_raw = r.get("payload_json")
-        try:
-            payload = json.loads(payload_raw) if payload_raw else {}
-        except json.JSONDecodeError:
-            payload = {}
-        node_id = payload.get("node_id")
-        if not node_id:
-            continue
-        entry = out.setdefault(str(node_id), {"status": _NEVER_SEEN})
-        if r.get("event_type") == "node_start":
-            start_at = r.get("created_at")
-            ended = entry.get("ended_at")
-            # ``created_at`` is 1-second resolution, so a node whose start and
-            # end share a second can arrive in either row order. A recorded end
-            # at-or-after this start means the node already finished — never
-            # resurrect it to ``running``. A start STRICTLY later than the end
-            # is a real re-run and does flip. Both types may be None → skip.
-            if ended is not None and start_at is not None:
-                try:
-                    if ended >= start_at:
-                        continue
-                except TypeError:
-                    pass
+    for node_id, attempt in fold_node_attempts(rows).items():
+        entry: dict[str, Any] = {"status": _NEVER_SEEN}
+        start_at = attempt["start"]
+        if start_at is not None:
             entry["status"] = _RUNNING
             entry["started_at"] = start_at
-        elif r.get("event_type") == "node_end":
+        payload = attempt["end_payload"]
+        if payload is not None:
             verdict = payload.get("verdict")
             entry["status"] = _FAILED if verdict in _FAILED_VERDICTS else _DONE
             entry["duration_ms"] = payload.get("duration_ms")
             entry["verdict"] = verdict
             entry["artifact_path"] = payload.get("artifact_path")
-            entry["ended_at"] = r.get("created_at")
+            entry["ended_at"] = attempt["end"]
+        out[node_id] = entry
     return out
 
 

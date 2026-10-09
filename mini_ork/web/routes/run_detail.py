@@ -15,7 +15,11 @@ from .. import agents as agent_mod, artifacts, recipes, why
 from ..db import StateDB
 from ..deps import get_db, get_home
 from ..recipes import mini_ork_root
-from ..repositories import LearningRepository, RunDetailRepository
+from ..repositories import (
+    LearningRepository,
+    RunDetailRepository,
+    derive_node_statuses,
+)
 
 router = APIRouter(prefix="/api/v1/task-runs", tags=["run-detail"])
 
@@ -682,31 +686,13 @@ def get_dag(
 
 
 def _node_status_map(db: StateDB, task_run_id: str) -> dict[str, dict[str, Any]]:
-    """Aggregate node_start / node_end events per node_id."""
-    rows = RunDetailRepository(db).fetch_node_lifecycle_events(task_run_id)
+    """Aggregate node_start / node_end events per node_id.
 
-    out: dict[str, dict[str, Any]] = {}
-    for r in rows:
-        try:
-            payload = json.loads(r["payload_json"]) if r["payload_json"] else {}
-        except json.JSONDecodeError:
-            payload = {}
-        node_id = payload.get("node_id")
-        if not node_id:
-            continue
-        entry = out.setdefault(node_id, {"status": "never_seen"})
-        if r["event_type"] == "node_start":
-            entry["status"] = "running"
-            entry["started_at"] = r["created_at"]
-        elif r["event_type"] == "node_end":
-            verdict = payload.get("verdict")
-            entry["status"] = (
-                "failed"
-                if verdict in ("REQUEST_CHANGES", "ESCALATE", "CRASH")
-                else "done"
-            )
-            entry["duration_ms"] = payload.get("duration_ms")
-            entry["verdict"] = verdict
-            entry["artifact_path"] = payload.get("artifact_path")
-            entry["ended_at"] = r["created_at"]
-    return out
+    Delegates to :func:`mini_ork.web.repositories.derive_node_statuses` — the
+    one lifecycle reducer, so the DAG API and the board cannot drift. A revise
+    round's new ``node_start`` therefore retires the prior round's
+    ``ended_at`` / ``duration_ms`` / ``verdict`` instead of leaving the node
+    with a stale end paired to its new start.
+    """
+    rows = RunDetailRepository(db).fetch_node_lifecycle_events(task_run_id)
+    return derive_node_statuses(rows)

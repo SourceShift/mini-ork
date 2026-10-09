@@ -272,7 +272,7 @@ def _steps(home: Path, run_id: str) -> list[dict[str, Any]]:
     node running again.
     """
     from mini_ork.web.db import db_for
-    from mini_ork.web.repositories import RunDetailRepository
+    from mini_ork.web.repositories import RunDetailRepository, fold_node_attempts
 
     try:
         repo = RunDetailRepository(db_for(Path(home)))
@@ -280,8 +280,13 @@ def _steps(home: Path, run_id: str) -> list[dict[str, Any]]:
     except Exception:  # noqa: BLE001
         return []
 
-    starts: dict[str, dict[str, Any]] = {}
-    ends: dict[str, dict[str, Any]] = {}
+    # Attempt-sequence pairing (shared with the web reducers): a revise
+    # round's new ``node_start`` must not be paired with the prior round's
+    # ``node_end`` — even when the two rows share a second, or the prior end
+    # arrives late (a reaper-synthesized dangling end). Otherwise the node
+    # renders as a 0-second finished step instead of running.
+    attempts = fold_node_attempts(events)
+
     node_types: dict[str, str] = {}
     lanes: dict[str, str] = {}
     order: list[str] = []
@@ -301,32 +306,22 @@ def _steps(home: Path, run_id: str) -> list[dict[str, Any]]:
         lane = str(payload.get("model_lane") or payload.get("lane") or "")
         if node_id not in lanes and lane:
             lanes[node_id] = lane
-        ts = ev.get("created_at")
-        if kind == "node_start":
-            starts[node_id] = {"ts": ts, "payload": payload}
-            # A new attempt (a revise round, a retry, a recover) supersedes the
-            # previous attempt's end: until this attempt ends, the node is
-            # running — not "failed" on the last round's verdict_revise.
-            ends.pop(node_id, None)
-        elif kind == "node_end":
-            ends[node_id] = {"ts": ts, "payload": payload}
         if node_id not in order:
             order.append(node_id)
 
     out: list[dict[str, Any]] = []
     for node_id in order:
-        s = starts.get(node_id, {})
-        e = ends.get(node_id)
-        start_ts = s.get("ts") if isinstance(s, dict) else None
-        end_ts = e.get("ts") if isinstance(e, dict) else None
+        attempt = attempts.get(node_id, {})
+        start_ts = attempt.get("start")
+        end_ts = attempt.get("end")
+        end_payload = attempt.get("end_payload") or {}
         duration: int | None = None
         if isinstance(start_ts, (int, float)) and isinstance(end_ts, (int, float)):
             duration = int(end_ts) - int(start_ts)
         finish_reason = ""
         state = "running"
-        if e is not None:
-            payload = e.get("payload") if isinstance(e, dict) else {}
-            finish_reason = str((payload or {}).get("finish_reason") or "")
+        if end_ts is not None:
+            finish_reason = str((end_payload or {}).get("finish_reason") or "")
             state = "failed" if finish_reason not in ("done", "") else "done"
         out.append(
             {

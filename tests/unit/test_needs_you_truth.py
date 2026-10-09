@@ -302,3 +302,26 @@ def test_strictly_later_start_flips_a_finished_node_to_running() -> None:
     rows = [_ev("n", "node_start", 100), _ev("n", "node_end", 100),
             _ev("n", "node_start", 200)]
     assert derive_node_statuses(rows)["n"]["status"] == "running"
+
+
+def test_revise_rerun_same_second_start_does_not_adopt_the_prior_end() -> None:
+    # Round 1's reviewer ends at 100; round 2's start shares the second and
+    # arrives first (the 1s-clock / reaper ordering). The node is running —
+    # it must not keep round 1's ended_at, which inverted the window and
+    # rendered the node as a 0s finished step.
+    rows = [_ev("reviewer", "node_start", 50),
+            _ev("reviewer", "node_start", 100),
+            _ev("reviewer", "node_end", 100)]
+    entry = derive_node_statuses(rows)["reviewer"]
+    assert entry["status"] == "running"
+    assert entry["started_at"] == 100
+    assert "ended_at" not in entry
+    assert "duration_ms" not in entry
+    assert "verdict" not in entry
+
+    # Round 2's own end (a later second) then closes round 2.
+    rows.append(_ev("reviewer", "node_end", 150))
+    entry = derive_node_statuses(rows)["reviewer"]
+    assert entry["status"] == "done"
+    assert entry["started_at"] == 100
+    assert entry["ended_at"] == 150

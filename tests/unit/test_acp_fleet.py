@@ -373,6 +373,42 @@ def test_a_new_attempt_after_a_revise_verdict_is_running(home: Path):
     assert step["duration"] == 40
 
 
+def test_same_second_prior_end_never_pairs_with_the_new_round(home: Path):
+    # A revise round restarts the reviewer, and the new node_start shares a
+    # second with round 1's node_end — the row order the 1-second clock (or a
+    # reaper-synthesized dangling end) can produce. The new start must NOT
+    # adopt round 1's end: that pairing rendered the node as a 0s finished
+    # step (start == end, verdict of the *prior* round). It is running until
+    # its OWN end lands.
+    seed_run(home, run_id="r-tie", status="executing",
+             created_at=NOW - 400, updated_at=NOW)
+    seed_event(home, run_id="r-tie", event_id="e1", event_type="node_start",
+               node_id="reviewer", node_type="reviewer", model_lane="opus",
+               created_at=NOW - 300)
+    # Round 2's start is inserted BEFORE round 1's end, and both share a
+    # second — the out-of-order arrival the pairing must survive.
+    seed_event(home, run_id="r-tie", event_id="e3", event_type="node_start",
+               node_id="reviewer", node_type="reviewer", model_lane="opus",
+               created_at=NOW - 200)
+    seed_event(home, run_id="r-tie", event_id="e2", event_type="node_end",
+               node_id="reviewer", node_type="reviewer", model_lane="opus",
+               finish_reason="verdict_revise", created_at=NOW - 200)
+
+    step = fl.run_card(home, "r-tie")["steps"][0]
+    assert step["state"] == "running"
+    assert step["start"] == NOW - 200
+    assert step["end"] is None
+    assert step["duration"] is None
+
+    # Round 2's own end (a later second) then pairs with round 2's start.
+    seed_event(home, run_id="r-tie", event_id="e4", event_type="node_end",
+               node_id="reviewer", node_type="reviewer", model_lane="opus",
+               finish_reason="done", created_at=NOW - 100)
+    step = fl.run_card(home, "r-tie")["steps"][0]
+    assert step["state"] == "done"
+    assert step["duration"] == 100
+
+
 def test_cost_by_stage_grouping_and_labels(home: Path):
     seed_run(home, run_id="r-cost", status="published")
     seed_llm_call(home, run_id="r-cost", feature_name="mini-ork:gradient-extract",
