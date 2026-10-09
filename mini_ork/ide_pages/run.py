@@ -1081,9 +1081,15 @@ def _pack_prior_runs_items(value: Any) -> list[dict[str, Any]]:
     for pr in (value if isinstance(value, list) else []):
         if not isinstance(pr, dict):
             continue
-        status = str(pr.get("status") or "")
-        trace_id = str(pr.get("trace_id") or "")
-        title = f"{status} · {trace_id}" if trace_id else status
+        rid = str(pr.get("run_id") or pr.get("trace_id") or "")
+        try:
+            nodes = int(pr.get("nodes") or 0)
+        except (TypeError, ValueError):
+            nodes = 0
+        try:
+            bad = int(pr.get("non_success_nodes") or 0)
+        except (TypeError, ValueError):
+            bad = 0
         try:
             cost = float(pr.get("cost_usd") or 0.0)
         except (TypeError, ValueError):
@@ -1092,11 +1098,24 @@ def _pack_prior_runs_items(value: Any) -> list[dict[str, Any]]:
             duration_ms = int(pr.get("duration_ms") or 0)
         except (TypeError, ValueError):
             duration_ms = 0
-        duration_s = duration_ms // 1000
         created_at = str(pr.get("created_at") or "")
-        sub = f"${cost:.2f} · {duration_s}s · {created_at[:16]}"
-        mc = "green" if status == "success" else ("red" if status == "failure" else "sub")
-        out.append(S.item(title, sub, mc=mc))
+        bits = []
+        if nodes:
+            bits.append(f"{nodes} nodes")
+        bits += [f"${cost:.2f}", f"{duration_ms // 1000}s"]
+        reward = pr.get("reward_g")
+        try:
+            if reward not in (None,) and float(reward):
+                bits.append(f"reward {float(reward):.2f}")
+        except (TypeError, ValueError):
+            pass
+        if bad:
+            bits.append(f"{bad} non-success")
+        if created_at:
+            bits.append(created_at[:16])
+        legacy_status = str(pr.get("status") or "")
+        mc = "green" if (bad == 0 and legacy_status != "failure") else "sub"
+        out.append(S.item(rid or "(run)", " · ".join(bits), mc=mc))
     return out
 
 
@@ -1143,6 +1162,48 @@ def _pack_section_items(key: str, value: Any, pack_path: Path) -> list[dict[str,
                               acts=[S.btn("Open", S.open_path(str(pack_path)), "ghost")]))
         return visible
     return raw_items
+
+
+def _read_json_obj(path: Path) -> dict[str, Any]:
+    """Parsed JSON object at ``path``, or ``{}`` on any read/parse error."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _injection_ledger(run: Run) -> list[dict[str, Any]]:
+    """Per-node rows from ``learned/<node>.json`` — what each node was given.
+
+    ``learned/`` is the INJECTION ledger (what actually reached the model),
+    not produced learnings. Rendering it closes the "display != injection"
+    gap: the planner injects the v2 pack, so the tab must show the v2 blocks
+    (and each node's source ids / skipped blocks), not the v1 builder output.
+    """
+    learned_dir = run.run_dir / "learned"
+    if not learned_dir.is_dir():
+        return []
+    out: list[dict[str, Any]] = []
+    for p in sorted(learned_dir.glob("*.json")):
+        d = _read_json_obj(p)
+        node = str(d.get("node_id") or p.stem)
+        injected = bool(d.get("injected"))
+        srcs = d.get("sources") if isinstance(d.get("sources"), list) else []
+        kinds = sorted({str(s.get("kind") or "") for s in srcs if isinstance(s, dict)})
+        skipped = d.get("skipped_blocks") if isinstance(d.get("skipped_blocks"), dict) else {}
+        mark = "●" if injected else "○"
+        sub_bits = [f"{len(srcs)} source(s)"]
+        if kinds:
+            sub_bits.append("/".join(k for k in kinds if k))
+        if skipped:
+            sub_bits.append("skipped: " + ", ".join(sorted(skipped)))
+        if d.get("reason"):
+            sub_bits.append(str(d.get("reason"))[:60])
+        out.append(S.item(f"{mark} {node}", " · ".join(sub_bits),
+                          m="✦" if injected else "○",
+                          mc="purple" if injected else "sub"))
+    return out
 
 
 def _learnings_tab(run: Run) -> list[dict[str, Any]]:
@@ -1198,14 +1259,43 @@ def _learnings_tab(run: Run) -> list[dict[str, Any]]:
 
     def available() -> list[dict[str, Any]]:
         sections: list[dict[str, Any]] = []
-        pack_path = run.run_dir / "context-pack.json"
         items: list[dict[str, Any]] = []
-        pack: dict[str, Any] = {}
-        if pack_path.is_file():
-            try:
-                pack = json.loads(pack_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                pack = {}
+        # Prefer the INJECTED artifact. The planner writes context-pack.v2.json
+        # and SUPPRESSES the v1 builder output, so rendering v1 showed a pack the
+        # model never saw. v2 first; v1 only as a fallback for older runs.
+        v2_path = run.run_dir / "context-pack.v2.json"
+        v1_path = run.run_dir / "context-pack.json"
+        if v2_path.is_file():
+            v2 = _read_json_obj(v2_path)
+            items.append(S.ok("Injected context", "v2 pack — what the planner received"))
+            cons = v2.get("constraints") if isinstance(v2.get("constraints"), list) else []
+            if cons:
+                detail = [S.item(f"{c.get('kind', '?')}: {str(c.get('text', ''))[:180]}",
+                                 str(c.get("id", "")))
+                          for c in cons if isinstance(c, dict)]
+                items.append(S.ok("Constraints", f"{len(cons)} injected"))
+                sections.append(S.lst(f"Constraints (injected) · {len(cons)}", detail, full=True))
+            else:
+                items.append(S.dot("Constraints", "none injected"))
+            contract = v2.get("contract") if isinstance(v2.get("contract"), dict) else {}
+            ff = v2.get("file_findings") if isinstance(v2.get("file_findings"), list) else []
+            if ff:
+                detail = [S.item(str(f.get("file") or f.get("path") or "file"),
+                                 str(f.get("finding") or f.get("summary") or "")[:160])
+                          for f in ff if isinstance(f, dict)]
+                items.append(S.ok("File findings", f"{len(ff)} file(s)"))
+                sections.append(S.lst(f"File findings · {len(ff)}", detail, full=True))
+            elif contract:
+                detail = _pack_kv_items(contract)
+                if detail:
+                    items.append(S.ok("Contract", f"{len(detail)} clause(s)"))
+                    sections.append(S.lst("Contract (injected)", detail, full=True))
+            pa = v2.get("prior_attempts") if isinstance(v2.get("prior_attempts"), list) else []
+            if pa:
+                items.append(S.ok("Prior attempts", f"{len(pa)} attempt(s)"))
+        elif v1_path.is_file():
+            items.append(S.ok("Context pack", "v1 builder output"))
+            pack = _read_json_obj(v1_path)
             labels = (("prior_similar_runs", "Prior same-class runs"),
                       ("known_failure_modes", "Learned failure modes"),
                       ("verified_emergent_patterns", "Verified patterns"),
@@ -1217,7 +1307,7 @@ def _learnings_tab(run: Run) -> list[dict[str, Any]]:
                 n = len(value) if isinstance(value, (list, dict)) else 0
                 if n:
                     items.append(S.ok(label, f"{n} item{'s' if n != 1 else ''}"))
-                    detail = _pack_section_items(key, value, pack_path)
+                    detail = _pack_section_items(key, value, v1_path)
                     if detail:
                         sections.append(S.lst(f"{label} · {n}", detail, full=True))
                 else:
@@ -1231,6 +1321,12 @@ def _learnings_tab(run: Run) -> list[dict[str, Any]]:
                                                 f"{pack.get('budget_tokens') or '—'} budget"))
         else:
             items.append(S.dot("No context pack", "This run was not given a context pack."))
+
+        ledger = _injection_ledger(run)
+        if ledger:
+            items.append(S.ok("Per-node injection", f"{len(ledger)} node(s) recorded"))
+            sections.append(S.lst(f"Injected per node · {len(ledger)}", ledger, full=True))
+
         from mini_ork.web.db import db_for
 
         db = db_for(run.home)
@@ -1239,8 +1335,8 @@ def _learnings_tab(run: Run) -> list[dict[str, Any]]:
             items.append(S.ok("Operator steering", f"{n} message(s) this run") if n
                          else S.dot("Operator steering", "none this run"))
         summary = S.lst("Available to the run", items, full=True,
-                        note="Context pack assembled for the planner at plan time. Each "
-                             "node's own injected learning is on its Learning tab.")
+                        note="The context the planner actually received (v2 pack), "
+                             "plus each node's own injection ledger.")
         return [summary, *sections]
 
     return (S.guarded(errors, "Produced by the run", produced)
