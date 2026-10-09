@@ -209,9 +209,29 @@ def _require_supported_python(root: Path) -> None:
     sys.exit(2)
 
 
+def _should_reexec(env: "os._Environ[str] | dict[str, str]",
+                   version_info: tuple[int, ...]) -> bool:
+    """Decide whether to re-exec into the project venv.
+
+    ``MINI_ORK_VENV_ACTIVE`` is set by a parent that already re-exec'd, meaning
+    "a venv is in effect, do not loop". But that marker is inherited across a
+    relaunch through the ``#!/usr/bin/env python3`` shebang — the scheduler
+    spawns ``bin/mini-ork`` and ``env`` re-resolves ``python3`` from ``PATH``,
+    which can land back on an unsupported interpreter (e.g. a micromamba 3.9).
+    The marker then lies. Trust it only when we genuinely ARE on a supported
+    interpreter; otherwise re-exec anyway, because the alternative is a silent
+    half-working engine (PEP 604 annotations crash recipe verifiers at import).
+    """
+    if env.get("MINI_ORK_USE_VENV", "1") == "0":
+        return False
+    if env.get("MINI_ORK_VENV_ACTIVE") == "1" and version_info >= MIN_PYTHON:
+        return False
+    return True
+
+
 def _reexec_in_project_venv(root: Path) -> None:
     """Keep the public command on the dependencies created by ``make install``."""
-    if os.environ.get("MINI_ORK_USE_VENV", "1") == "0" or os.environ.get("MINI_ORK_VENV_ACTIVE") == "1":
+    if not _should_reexec(os.environ, sys.version_info):
         return
     python = _venv_python(root)
     if not python.is_file():
