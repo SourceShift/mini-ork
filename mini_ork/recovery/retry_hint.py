@@ -867,7 +867,28 @@ def _record_mark_and_result(data: Any) -> tuple[bool, str]:
         or record.get("api_error_status") == 429
         or (res and _LEGACY_429_RE.search(res))
     )
-    return (wording and gate), res
+    if wording and gate:
+        return True, res
+    # Codex app-server terminal events carry the provider's words in ``message``
+    # (``type:"error"``) or ``error.message`` (``type:"turn.failed"``) — never
+    # in a ``result`` field, and often without any 429 (the account-plan limit
+    # prints "You've hit your usage limit … try again at <date>"). Those types
+    # are provider failure events already, so the wording alone marks; the
+    # is_error/429 gate above applies only to ``result`` records, where a
+    # transient overload must not read as a dead lane.
+    err_msg = ""
+    rtype = record.get("type")
+    if rtype == "error":
+        m = record.get("message")
+        err_msg = m if isinstance(m, str) else ""
+    elif rtype == "turn.failed":
+        err = record.get("error")
+        if isinstance(err, dict):
+            m = err.get("message")
+            err_msg = m if isinstance(m, str) else ""
+    if err_msg and _LEGACY_QUOTA_RE.search(err_msg):
+        return True, err_msg
+    return False, ""
 
 
 def _stream_lane_mark(text: str, *, record_only: bool,
@@ -1058,8 +1079,12 @@ def _case_lane_unavailable(home: Path, run_id: str, run_dir: Path,
     # Legacy rows only: a row that already carries *any* ``error_category``
     # (``capacity``, ``network``, …) was classified by the executor and is not a
     # dead-lane row, so the stream-wording heuristic must not run over it.
+    # ``unknown`` is the exception: it means the executor FAILED to classify
+    # (e.g. a pre-fix run whose codex ``turn.failed`` usage-limit text carried
+    # no 429 for ``classify_error`` to key on), so it is treated like NULL and
+    # the heuristic still runs over the row.
     legacy_candidates = [r for r in candidates
-                         if not str(r.get("error_category") or "").strip()]
+                         if str(r.get("error_category") or "").strip() in ("", "unknown")]
     if quota_rows:
         row = quota_rows[0]
         alias = _row_alias(row)

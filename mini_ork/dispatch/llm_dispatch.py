@@ -40,10 +40,17 @@ def classify_error(message: str, rc: str | int = "") -> str:
     if re.search(r"(^|[^0-9])(401|403)([^0-9]|$)|invalid api key|authentication failed"
                  r"|not logged in|unauthorized|forbidden", text):
         return "auth"
+    # Account-plan limit wording that is unambiguous on its own: provider
+    # relays emit it without any HTTP 429 (the Codex CLI prints "You've hit
+    # your usage limit … try again at <date>" on ``turn.failed``), so gating
+    # these on 429 would mute a real dead lane into "unknown". The weaker
+    # words (monthly|billing|quota|…) stay gated behind a 429 below.
+    if re.search(r"usage limit|exceeded your current quota|insufficient credits"
+                 r"|insufficient balance|out of credits|purchase credits"
+                 r"|credit limit|credit balance", text):
+        return "quota"
     if re.search(r"429", text) and re.search(
-            r"monthly|tokens-per-day|billing|quota|insufficient credits|credit limit"
-            r"|usage limit|token plan|purchase credits|out of credits|credit balance"
-            r"|insufficient balance|exceeded your current quota", text):
+            r"monthly|tokens-per-day|billing|quota|token plan", text):
         return "quota"
     if re.search(r"(^|[^0-9])(429|503)([^0-9]|$)", text) and re.search(
             r"capacity|concurrent|rate|overload|temporarily unavailable", text):
