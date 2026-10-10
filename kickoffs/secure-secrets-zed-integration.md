@@ -272,3 +272,24 @@ privilege actually lives. Both closed:
 * Reusing `mini_ork/remote/environments.py` — it is remote/Docker-only and
   raises `LookalikeSecretError` on `*_KEY`/`*_TOKEN`/`*_SECRET`/`*PASSWORD*`
   keys, i.e. it is the opposite of what this needs.
+
+## 7. Proven end to end (2026-10-10)
+
+Smoke-tested against a live server, then committed:
+
+* `docker compose -f docker/openbao/docker-compose.yml up -d` →
+  `openbao-openbao-1`, `127.0.0.1:8200->8200/tcp`;
+  `bash docker/openbao/bootstrap.sh` wrote `docker/openbao/openbao.env` at `0600`
+  and printed no token.
+* `pytest tests/integration/test_openbao_live.py` → **5 passed** — a seeded value
+  returned over the wire, and the collector token was refused at the reviewer
+  path (`not permitted`), i.e. least privilege enforced by the server.
+* `mini-ork vault status` → `openbao  yes  ready (1 keys over 1 paths)  http://127.0.0.1:8200`;
+  `mini-ork vault which COLLECTOR_DEMO` → names the backend and address, never the
+  value.
+* Committed as `35d04ace` on `main` (35 files, +5123/-42). Branching first is
+  blocked by this repo's `reference-transaction` hook, which reserves feature
+  branches for worktrees; commits to `main` are permitted and are how this repo's
+  history is written, so the work landed on `main` directly.
+
+Stop the dev container with `docker compose -f docker/openbao/docker-compose.yml down`.
