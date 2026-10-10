@@ -1972,6 +1972,118 @@ def _capture_pre_impl_baseline(run_dir):
         pass
 
 
+def _impl_moved_base_recorded(db, run_id):
+    """True when this run's ledger records an ``impl_moved_base`` node failure.
+
+    The laundering guard's only durable witness. The implementer handler records
+    the reason twice — ``ctx.trace(..., "impl_moved_base")`` and
+    ``_append_run_note(ctx.db, ctx.run_id, "impl_moved_base: ...")``
+    (execute_handlers.py:1372-1374) — but only the note survives: migration 0021
+    CHECKs ``run_events.finish_reason`` against a fixed enum that has no
+    ``impl_moved_base`` member, so the ``node_end`` insert is rejected and the
+    row dropped (``mo_node_emit`` swallows sqlite errors by contract). Read
+    ``task_runs.notes`` instead; notes are appended ``"; "``-joined in order.
+
+    Fail-closed: a missing db, an unreadable table, or a missing run row returns
+    True — "the prior implementer moved the base" — so a signal we cannot read
+    can never license a refresh that would launder a committed change into an
+    empty harvest.
+    """
+    if not db or not run_id or not os.path.isfile(db):
+        return True
+    try:
+        con = sqlite3.connect(db, timeout=15.0)
+        try:
+            con.execute("PRAGMA busy_timeout = 15000")
+            row = con.execute(
+                "SELECT notes FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return True
+    if not row:
+        return True
+    notes = row[0] or ""
+    return any(seg.strip().startswith("impl_moved_base")
+               for seg in notes.split("; "))
+
+
+def _refresh_stale_pre_impl_baseline(run_dir, target, *, db=None, run_id=None):
+    """Re-snapshot a stale ``pre-implementer-ref`` against the CURRENT target
+    HEAD, on a resume that re-runs the implementer. Returns True iff refreshed.
+
+    Why this exists: the pre-implementer baseline is captured ONCE per run
+    (``_capture_pre_impl_baseline`` is idempotent). If an external actor advances
+    the target's HEAD after the run started — a merge onto the shared tree, a
+    sibling run's base — the recorded baseline becomes a stale proper ancestor of
+    HEAD and ``_implementer_moved_base`` fails the resumed implementer node with
+    ``impl_moved_base`` even though THIS implementer never moved anything. The
+    fix is to drop the stale snapshot so the pre-dispatch capture
+    (execute_handlers.py:524) re-snapshots the CURRENT tree before the implementer
+    edits it.
+
+    Guarded three ways, each an invariant the kickoff names:
+
+      * Invariant 1 (within-attempt idempotence) — refresh only when
+        ``_implementer_moved_base`` actually reports a reason. A plain retry
+        (HEAD == the recorded baseline, or the stash-WIP first-parent shape) is
+        still valid and is left byte-identical, so the run keeps its ORIGINAL
+        snapshot and never absorbs its own uncommitted delta.
+      * Invariant 2 (no laundering) — topology alone cannot tell an external
+        advance from a change the prior attempt committed: both leave the
+        baseline a proper ancestor of HEAD. So the run's own ledger decides.
+        When ``_impl_moved_base_recorded`` says the implementer node already
+        failed ``impl_moved_base``, the movement is attributable to the run
+        itself — refuse, keep the stale baseline, and let the guard keep failing
+        loudly. A committed change can never be laundered into an empty harvest.
+      * Invariant 4 (orphaned baselines) — a baseline object that no longer
+        exists (rewritten main) already returns a reason from
+        ``_implementer_moved_base``, so it flows through this same refresh path.
+
+    When it does refresh, it removes ``pre-implementer-ref`` AND
+    ``pre-implementer-untracked`` together: the capture's idempotence gate is the
+    ref file's existence and it rewrites both, so invalidating only one would
+    pair a fresh baseline with a stale untracked inventory (harvest-time
+    mis-exclusion).
+
+    ``_implementer_moved_base`` stays the single definition of "this baseline is
+    a valid pre-tree of HEAD"; its code and message are byte-identical. The guard
+    re-reads the baseline at harvest time, so any HEAD move AFTER the fresh
+    snapshot still fails with the existing message (invariant 3, unmodified).
+    """
+    if not run_dir or not target:
+        return False
+    ref_path = os.path.join(run_dir, "pre-implementer-ref")
+    if not os.path.isfile(ref_path):
+        return False
+    try:
+        from mini_ork.cli.execute_handlers import _implementer_moved_base
+    except Exception:  # noqa: BLE001 — an import failure must never refresh blindly
+        return False
+    moved = _implementer_moved_base(run_dir, target)
+    if not moved:
+        return False  # invariant 1: the recorded baseline is still valid
+    if _impl_moved_base_recorded(db, run_id):
+        print("  [recover] refusing to refresh pre-implementer-ref: this run's "
+              "ledger already records an impl_moved_base failure, so the HEAD "
+              "movement is attributable to the prior implementer attempt, not an "
+              "external advance — refreshing would launder a committed change "
+              "into an empty harvest.", file=sys.stderr)
+        return False
+    try:
+        os.remove(ref_path)
+    except OSError:
+        return False
+    try:
+        os.remove(os.path.join(run_dir, "pre-implementer-untracked"))
+    except OSError:
+        pass
+    print("  [recover] refreshed stale pre-implementer-ref to the current target "
+          "HEAD; the pre-dispatch capture will re-snapshot. Stale reason: "
+          f"{moved}", file=sys.stderr)
+    return True
+
+
 def _harvest_framework_edit_ground_truth(run_dir, target):
     """framework-edit's implementer self-writes framework-edit.diff, and nothing
     validated that artifact against reality. A hallucinating agent

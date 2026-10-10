@@ -83,6 +83,7 @@ _harvest_framework_edit_ground_truth = _execute_delegate(
 _harvest_self_migrate_artifacts = _execute_delegate("_harvest_self_migrate_artifacts")
 _intervention_gate_check = _execute_delegate("_intervention_gate_check")
 _learned_block = _execute_delegate("_learned_block")
+_refresh_stale_pre_impl_baseline = _execute_delegate("_refresh_stale_pre_impl_baseline")
 _required_artifacts_ok = _execute_delegate("_required_artifacts_ok")
 _researcher_output_file = _execute_delegate("_researcher_output_file")
 _resolve_target_cwd = _execute_delegate("_resolve_target_cwd")

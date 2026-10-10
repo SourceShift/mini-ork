@@ -462,6 +462,50 @@ def _needs_restore(plan: RecoveryPlan, run_dir: str, carry_patch: str | None = N
     return _resolve_patch_path(run_dir, carry_patch, workflow) is not None
 
 
+def _implementer_in_closure(plan: RecoveryPlan) -> bool:
+    """True iff the closure that will rerun contains an implementer-typed node.
+
+    Only a rerun implementer edits the target in place, so only it needs the
+    stale-baseline refresh. Types come from ``plan.node_types`` (workflow.yaml);
+    the same membership rule ``_needs_restore`` uses for the reuse set. A recipe
+    that declares no implementer-typed code-changer (no recipe does as of
+    2026-10-10) never reaches the refresh.
+    """
+    return any(plan.node_types.get(nid) == "implementer" for nid in plan.closure)
+
+
+def _refresh_stale_baseline_for_resume(plan: RecoveryPlan, run_dir: str,
+                                       db_path: str) -> bool:
+    """Refresh a stale ``pre-implementer-ref`` before a resumed implementer runs.
+
+    Wires ``execute._refresh_stale_pre_impl_baseline`` into the recover dispatch
+    path: a resume that re-runs the implementer reuses the run's recorded
+    baseline, and a baseline an external actor has since outrun would false-fail
+    the implementer with ``impl_moved_base`` even though it never moved HEAD. The
+    target is resolved exactly as the original capture resolved it — the
+    persisted ``run_profile.json`` roots first, then the live ladder. Fail-soft:
+    any error returns False and the run keeps today's behaviour; the helper's own
+    laundering refusal and fail-closed ledger read are preserved.
+    """
+    if not run_dir or not _implementer_in_closure(plan):
+        return False
+    try:
+        from mini_ork.runtime.run_roots import load_run_roots, resolve_run_roots
+
+        roots = load_run_roots(run_dir)
+        target = (roots.target if roots and roots.target
+                  else resolve_run_roots(run_dir).target)
+        if not target:
+            return False
+        from mini_ork.cli import execute as _execute  # noqa: PLC0415
+
+        return bool(_execute._refresh_stale_pre_impl_baseline(
+            run_dir, target, db=db_path, run_id=plan.run_id))
+    except Exception as exc:  # noqa: BLE001 — never block a recovery
+        sys.stderr.write(f"[mini-ork-recover] baseline refresh skipped: {exc}\n")
+        return False
+
+
 def _format_restore_plan(
     run_dir: str,
     cli_carry_patch: str | None,
@@ -1072,6 +1116,17 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
         overlay_path = _write_lane_overlay(run_dir, lane_pins, lane_base)
         _append_lane_log(run_dir, lane_pins, lane_base)
         apply_env_overrides({"MINI_ORK_AGENTS": str(overlay_path)})
+
+    # ── Stale-baseline refresh (resume re-runs the implementer) ──
+    # A resumed implementer reuses the run's recorded pre-implementer-ref; if an
+    # external actor advanced the target HEAD since that one-time snapshot, the
+    # stale baseline false-fails the implementer node with `impl_moved_base`.
+    # Drop the stale snapshot here so the pre-dispatch capture re-snapshots the
+    # CURRENT tree. Gated on an implementer node being in the closure and
+    # internal to the helper: a within-attempt retry keeps its snapshot, and a
+    # movement the run's own ledger attributes to the prior implementer is
+    # refused (never launder a committed change into an empty harvest).
+    _refresh_stale_baseline_for_resume(plan, run_dir, db_path)
 
     # Active strategies: emit the env, print the plan, hand off to
     # the native executor which honors MINI_ORK_RECOVERY_FROM + CLOSURE.
