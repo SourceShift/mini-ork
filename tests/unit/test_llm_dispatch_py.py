@@ -35,6 +35,14 @@ _CLASSIFY_CASES = [
     ("503 overload", "", "capacity"),
     ("bearer token", "", "unknown"),
     ("no providers.yaml entry", "", "config"),
+    # Account-plan limit wording with no 429 at all (the codex CLI prints this
+    # verbatim on turn.failed; run-1791619207-22518) is still a dead lane.
+    ("You've hit your usage limit. Upgrade to Plus to continue using Codex, "
+     "or try again at Nov 8th, 2026 10:19 AM.", "", "quota"),
+    ("insufficient credits — purchase credits to continue", "", "quota"),
+    # Weak quota words stay gated behind a 429.
+    ("monthly billing summary attached", "", "unknown"),
+    ("429 token plan", "", "quota"),
 ]
 
 

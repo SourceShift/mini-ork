@@ -387,6 +387,108 @@ def test_compute_legacy_null_category_uses_log_429(home: Path) -> None:
     assert hint["needs_change"]["alias"] == "codex_lens"
 
 
+# ── 5. run-1791619207-22518: codex turn.failed quota, no 429, category unknown ──
+
+CODEX_QUOTA_TEXT = (
+    "You've hit your usage limit. Upgrade to Plus to continue using Codex "
+    "(https://chatgpt.com/explore/plus), or try again at Nov 8th, 2026 10:19 AM."
+)
+
+
+def test_record_mark_codex_terminal_event_shapes() -> None:
+    """The codex app-server carries the provider's words in ``message`` /
+    ``error.message`` on terminal events — never in ``result``, and with no
+    429. Those shapes must mark; a non-terminal record quoting the wording
+    (a tool_result) must not."""
+    wrapper = json.loads(json.dumps({"seq": 10, "stream": "stderr", "t": 6.076,
+                                     "line": json.dumps(
+                                         {"type": "turn.failed",
+                                          "error": {"message": CODEX_QUOTA_TEXT}})}))
+    marked, detail = retry_hint._record_mark_and_result(wrapper)
+    assert marked
+    assert "usage limit" in detail
+    marked, detail = retry_hint._record_mark_and_result(
+        {"type": "error", "message": CODEX_QUOTA_TEXT})
+    assert marked
+    assert "usage limit" in detail
+    # The silent-death result record (empty result, not an error) never marks…
+    marked, _ = retry_hint._record_mark_and_result(
+        {"type": "result", "is_error": False, "api_error_status": None,
+         "result": "", "subtype": "success"})
+    assert not marked
+    # …and neither does a transcript that merely quotes the wording.
+    marked, _ = retry_hint._record_mark_and_result(
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "content": "kickoff says: " + CODEX_QUOTA_TEXT}]}})
+    assert not marked
+
+
+def test_compute_unknown_category_plus_codex_stream_lanes(home: Path) -> None:
+    """The 2026-10-10 session-task-judge failure: the judge's minimax attempt
+    died silently (success record, empty result), the codex fallback died on
+    the account-plan limit (turn.failed, no 429), and the terminal row is the
+    sonnet preflight with error_category 'unknown'. The hint must still name
+    the node, the alias, and the quota cause — not case-5 'not classified'."""
+    ts = int(time.time())
+    run_id = "run-1791619207-22518"
+    run_dir = home / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    kickoff = home / "kickoffs" / "judge.md"
+    kickoff.parent.mkdir(parents=True, exist_ok=True)
+    kickoff.write_text("# judge\n", encoding="utf-8")
+    con = sqlite3.connect(home / "state.db")
+    con.execute(
+        "INSERT INTO task_runs (id, recipe, status, cost_usd, created_at, updated_at, "
+        "ended_at, task_class, kickoff_path, workflow_version) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (run_id, "framework-edit", "failed", 0.57, ts, ts + 200, ts + 192,
+         "framework_edit", str(kickoff), "latest"))
+    con.execute(
+        "INSERT INTO run_events (event_id, run_id, event_type, payload_json, created_at) "
+        "VALUES (?,?,?,?,?)",
+        (f"ev-{run_id}-start", run_id, "node_start",
+         json.dumps({"node_id": "minimax_judge", "node_type": "researcher",
+                     "model_lane": "minimax_lens"}), ts + 5))
+    con.execute(
+        "INSERT INTO run_events (event_id, run_id, event_type, payload_json, created_at) "
+        "VALUES (?,?,?,?,?)",
+        (f"ev-{run_id}-end", run_id, "node_end",
+         json.dumps({"node_id": "minimax_judge", "finish_reason": "error"}), ts + 192))
+    con.commit()
+    con.close()
+    _insert_llm_call(
+        home, model_id="sonnet", provider="anthropic", status="failed",
+        run_id=run_id, feature_name="mini-ork:minimax_lens", actor="minimax_lens",
+        error_message="lane preflight failed: unknown lane: 'sonnet'",
+        error_category="unknown", retryable=0,
+    )
+    (run_dir / "agent-minimax_judge.live.jsonl").write_text(
+        # 1) the minimax attempt's silent death: success record, empty result;
+        # 2) the codex fallback's account-plan limit on turn.failed, no 429.
+        json.dumps({"seq": 0, "stream": "stdout", "t": 184.8, "line": json.dumps(
+            {"type": "result", "is_error": False, "api_error_status": None,
+             "result": "", "num_turns": 35, "subtype": "success"})}) + "\n"
+        + json.dumps({"seq": 10, "stream": "stderr", "t": 6.076, "line": json.dumps(
+            {"type": "turn.failed", "error": {"message": CODEX_QUOTA_TEXT}})}) + "\n",
+        encoding="utf-8",
+    )
+    for _ in range(5):
+        _insert_llm_call(home, model_id="deepseek", status="success")
+    (run_dir / "run_profile.json").write_text(
+        json.dumps({"kickoff_path": str(kickoff), "recipe": "framework-edit"}),
+        encoding="utf-8",
+    )
+    hint = retry_hint.compute(home, run_id)
+    assert hint is not None
+    nc = hint["needs_change"]
+    assert nc["kind"] == "lane"
+    assert hint["failed_node"] == "minimax_judge"
+    assert nc["alias"] == "minimax_lens"
+    assert nc["error_kind"] == "quota"
+    assert "usage limit" in nc["detail"]
+    assert hint["command"] == f"mini-ork recover {run_id} --lane minimax_lens=deepseek"
+
+
 def test_lane_hint_follows_run_node_not_latest_reflect_call(home: Path) -> None:
     """The r1 live bug: the newest failed row is a reflect-time call, so the
     hint pointed at ``gradient-extract`` (a non-node alias recover rejects).
