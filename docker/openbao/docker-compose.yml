@@ -1,0 +1,30 @@
+# The secure tier in one command: an OpenBao that mini-ork reads through the
+# `openbao` vault backend, plus the policies that make per-role least privilege
+# real. The server enforces those policies; mini-ork never holds a broader
+# token, so it cannot widen them by accident.
+#
+#   docker compose -f docker/openbao/docker-compose.yml up -d
+#   bash docker/openbao/bootstrap.sh
+#   set -a; source docker/openbao/openbao.env; set +a
+#   mini-ork vault status
+#
+# Dev mode is the copy-paste way to *exercise* the secure tier: in-memory
+# storage, unsealed, a known root token, plain HTTP on loopback. It is not a
+# production deployment. For real use, replace the `command` with a config that
+# sets storage, seal, and TLS — the policies below and the entire mini-ork side
+# stay exactly the same, which is the point of the two-tier split.
+services:
+  openbao:
+    image: docker.io/openbao/openbao:latest
+    command: server -dev -dev-listen-address=0.0.0.0:8200
+    environment:
+      BAO_DEV_ROOT_TOKEN_ID: root
+      # Dev mode serves plain HTTP, so the container's own `bao` CLI must be told
+      # to speak http rather than assume https.
+      BAO_ADDR: http://127.0.0.1:8200
+    ports:
+      # Loopback only. A dev server with a known root token must not be reachable
+      # from the network.
+      - "127.0.0.1:8200:8200"
+    cap_add:
+      - IPC_LOCK

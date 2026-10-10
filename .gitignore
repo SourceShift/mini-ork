@@ -150,3 +150,6 @@ scripts/comparative-opinions.sh
 
 # docker bind-visibility probes left by an interrupted test run
 .mo-bindprobe-*/
+
+# Scoped OpenBao tokens minted by docker/openbao/bootstrap.sh — never commit them.
+docker/openbao/openbao.env

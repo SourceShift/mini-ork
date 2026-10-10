@@ -165,6 +165,33 @@
           "type": ["array", "object"],
           "description": "Recipe-declared harness tools, optionally grouped by native and MCP capability."
         },
+        "description": {
+          "type": "string",
+          "description": "Human-readable summary of what this node does; used in the DAG and in the node prompt when no prompt_ref is given.",
+          "default": ""
+        },
+        "mcp_servers": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Names of MCP servers this node may use, resolved against the MCP registry (see docs/CONFIG.md). The union of these and any tools.mcp grants is what the node is allowed to reach; nothing else is visible to it.",
+          "default": []
+        },
+        "skills": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Names of skills this node may use, resolved against the skill registry. A skill not named here is not available to the node.",
+          "default": []
+        },
+        "agent_doc": {
+          "type": "string",
+          "description": "Path to an agent-instruction document injected into this node's dispatch.",
+          "default": ""
+        },
+        "env": {
+          "type": "object",
+          "description": "Environment variables this node needs, declared by the recipe. A value may be a ${NAME} reference resolved at the node boundary from the secret store, or null to declare the variable absent for this node. The operator's run-scoped config/env.yaml overrides these.",
+          "additionalProperties": { "type": ["string", "number", "boolean", "null"] }
+        },
         "transform": {
           "type": "string",
           "description": "Registered deterministic transform identifier; required for transform nodes."

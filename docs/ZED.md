@@ -27,7 +27,11 @@ What it does:
   - `agent_servers.mini-ork` for ACP (the **Agent Panel**)
   - `context_servers.mini-ork` for MCP (so the built-in Zed agent, Claude,
     Codex etc. all see runs, learnings, cost and lanes)
+- Wires every server in your MCP registry as a third kind of entry,
+  `context_servers["mcp:<name>"]` — see *MCP servers inside Zed* below.
 - Creates `settings.json.bak-<timestamp>` before mutating anything.
+
+`setup --no-mcp` writes only the two `mini-ork` entries.
 
 If your project lives at a non-default `MINI_ORK_HOME`, pass `--home <dir>`
 so the entries embed it in both `env` maps.
@@ -55,6 +59,53 @@ Both `setup` and `uninstall` accept `--dry-run` to print the resulting JSON
 without writing it. If your existing `settings.json` is unparseable (Zed
 allows `//` comments and trailing commas), setup refuses to overwrite and
 prints the two blocks to merge by hand — return code 2, file unchanged.
+
+### MCP servers inside Zed (and their tokens)
+
+A server like the arXiv one needs a token. Zed's `context_servers` entries can
+hold a command, a URL and literal headers — but **not a secret**: it does not
+interpolate `${NAME}`, and anything you paste is a plaintext value sitting in
+`settings.json` and in every backup of it, readable by every extension.
+
+So `zed setup` never copies the token. For each server in your registry it
+writes one entry that names the *shim* instead of the server:
+
+```json
+"context_servers": {
+  "mcp:arxiv": { "command": "/abs/path/mini-ork", "args": ["mcp", "launch", "arxiv"] }
+}
+```
+
+`mini-ork mcp launch arxiv` resolves the registry entry — including
+`${LIBWIT_ARXIV_TOKEN}` from the vault — and then:
+
+- for a **stdio** server, `execvp`s it, so the real server *is* the process:
+  no wrapper in the middle, no byte of stdin, no signal, no exit code touched;
+- for a **URL** server, bridges stdio to it (`mini-ork mcp proxy <name>`),
+  putting the resolved `Authorization` header on each request.
+
+Either way, the token exists only in the spawned process's memory. The file Zed
+reads, and its backups, name a server and hold no credential — and rotating the
+token means editing `secrets.local.sh`, not `settings.json`. The same
+`${NAME}` serves the editor and every node, so there is one rotation point.
+
+Servers with a URL are reached through the bridge rather than pasted
+directly, for the same reason: pasting the URL and its `Authorization` header
+is exactly the plaintext-in-settings.json case above.
+
+```bash
+mini-ork mcp list                    # what the registry defines, and what resolves
+mini-ork mcp check --workflow ...    # what a workflow will need at dispatch time
+mini-ork vault which ARXIV_API_TOKEN # which backend holds it (never its value)
+```
+
+What is deliberately **not** wired: a server Zed provides as an *extension*
+(mini-ork nodes run outside the editor, so there is nothing to grant them), and
+one that authenticates by **OAuth** — a subprocess started by Zed has no
+browser flow to complete, so such a server needs a pre-obtained token in the
+registry's headers instead. `zed setup` skips disabled entries, and `zed
+uninstall` removes every `mcp:` entry it wrote while leaving anyone else's
+entries alone.
 
 ---
 

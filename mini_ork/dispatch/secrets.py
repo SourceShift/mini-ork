@@ -25,6 +25,44 @@ _NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ASSIGNMENT = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
 _INERT_SHELL_LINES = {"set -a", "set +a"}
 
+# ``${NAME}`` or ``${NAME:-fallback}``. Deliberately not the bare ``$NAME`` form:
+# a credential value may legitimately contain ``$``, and there is no way to tell
+# an intended reference from a literal once the two share a syntax.
+_PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+
+def expand_secret_references(
+    text: str, environ: Mapping[str, str], *, context: str = ""
+) -> str:
+    """Substitute ``${NAME}`` / ``${NAME:-fallback}`` references from ``environ``.
+
+    Config files name secrets instead of holding them (``${ARXIV_API_TOKEN}``);
+    this is the one place that turns a name back into a value. An unresolvable
+    reference raises instead of expanding to an empty string — a header that
+    becomes ``Bearer `` and a token that becomes ``""`` both fail much later,
+    somewhere that cannot name the variable that was missing.
+    """
+    where = f" in {context}" if context else ""
+    # A vault chain knows where it looked (file, sops, OpenBao, a command);
+    # a plain mapping only knows the one file this module owns.
+    location = (
+        environ.describe()  # type: ignore[attr-defined]
+        if callable(getattr(environ, "describe", None))
+        else f"the secret store ({secret_store_path(environ)})"
+    )
+
+    def replace(match: re.Match[str]) -> str:
+        name, fallback = match.group(1), match.group(2)
+        if name in environ:
+            return environ[name]
+        if fallback is not None:
+            return fallback
+        raise SecretStoreError(
+            f"${{{name}}}{where} is not set; export it or add it to {location}"
+        )
+
+    return _PLACEHOLDER.sub(replace, text)
+
 
 def secret_store_path(environment: Mapping[str, str] | None = None) -> Path:
     """Resolve the one per-project credential file without reading it."""

@@ -319,3 +319,125 @@ def test_setup_without_layout_leaves_panels_alone(tmp_path, monkeypatch):
     data = json.loads(settings_file.read_text())
     assert data["git_panel"] == {"dock": "left"}
     assert "project_panel" not in data
+
+
+# ── MCP servers wired through `mcp launch` ──────────────────────────────────
+
+
+def _write_registry(home: Path, servers: dict) -> None:
+    config = home / "config"
+    config.mkdir(parents=True, exist_ok=True)
+    (config / "mcp_servers.json").write_text(
+        json.dumps({"mcpServers": servers}), encoding="utf-8"
+    )
+
+
+def _setup_with_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, servers: dict):
+    settings_file = tmp_path / "settings.json"
+    _write_registry(tmp_path, servers)
+    monkeypatch.setenv("ZED_SETTINGS", str(settings_file))
+    monkeypatch.setenv("MINI_ORK_HOME", str(tmp_path))
+    monkeypatch.delenv("MINI_ORK_ROOT", raising=False)
+    return settings_file
+
+
+def test_setup_wires_stdio_servers_through_the_shim(tmp_path, monkeypatch):
+    settings_file = _setup_with_registry(tmp_path, monkeypatch, {
+        "arxiv": {
+            "command": "npx",
+            "args": ["-y", "arxiv-mcp-server"],
+            "env": {"ARXIV_API_TOKEN": "${LIBWIT_ARXIV_TOKEN}"},
+        },
+    })
+    monkeypatch.setenv("LIBWIT_ARXIV_TOKEN", "tok-123")
+
+    assert zed_cmd.main(["setup"], root=str(tmp_path)) == 0
+
+    text = settings_file.read_text()
+    entry = json.loads(text)["context_servers"]["mcp:arxiv"]
+    assert entry["args"] == ["mcp", "launch", "arxiv"]
+    assert os.path.isabs(entry["command"])
+    # The point of the shim: the token is not in the file, nor in the backup.
+    assert "tok-123" not in text
+    assert "LIBWIT_ARXIV_TOKEN" not in text
+
+
+def test_setup_wires_url_servers_through_the_bridge(tmp_path, monkeypatch):
+    settings_file = _setup_with_registry(tmp_path, monkeypatch, {
+        "remote": {"type": "http", "url": "https://example.test/mcp",
+                   "headers": {"Authorization": "Bearer ${TOKEN}"}},
+    })
+    monkeypatch.setenv("TOKEN", "tok-123")
+
+    assert zed_cmd.main(["setup"], root=str(tmp_path)) == 0
+
+    text = settings_file.read_text()
+    entry = json.loads(text)["context_servers"]["mcp:remote"]
+    assert entry["args"] == ["mcp", "launch", "remote"]
+    # The URL server is reached through the bridge, so its Authorization header
+    # is resolved at spawn time and never reaches disk.
+    assert "tok-123" not in text
+    assert "Bearer" not in text
+    assert "example.test" not in text
+
+
+def test_setup_skips_disabled_and_extension_servers(tmp_path, monkeypatch):
+    settings_file = _setup_with_registry(tmp_path, monkeypatch, {
+        "off": {"command": "npx", "enabled": False},
+        "from-ext": {"command": "npx", "source": "extension"},
+        "on": {"command": "npx"},
+    })
+    assert zed_cmd.main(["setup"], root=str(tmp_path)) == 0
+    contexts = json.loads(settings_file.read_text())["context_servers"]
+    assert sorted(contexts) == ["mcp:on", "mini-ork"]
+
+
+def test_setup_no_mcp_wires_only_the_agent(tmp_path, monkeypatch):
+    settings_file = _setup_with_registry(tmp_path, monkeypatch, {
+        "arxiv": {"command": "npx"},
+    })
+    assert zed_cmd.main(["setup", "--no-mcp"], root=str(tmp_path)) == 0
+    contexts = json.loads(settings_file.read_text())["context_servers"]
+    assert list(contexts) == ["mini-ork"]
+
+
+def test_setup_without_a_registry_still_writes_the_agent(tmp_path, monkeypatch):
+    settings_file = tmp_path / "settings.json"
+    monkeypatch.setenv("ZED_SETTINGS", str(settings_file))
+    monkeypatch.setenv("MINI_ORK_HOME", str(tmp_path))
+    monkeypatch.delenv("MINI_ORK_ROOT", raising=False)
+    assert zed_cmd.main(["setup"], root=str(tmp_path)) == 0
+    contexts = json.loads(settings_file.read_text())["context_servers"]
+    assert list(contexts) == ["mini-ork"]
+
+
+def test_uninstall_removes_the_shim_entries_and_keeps_foreign_ones(tmp_path, monkeypatch):
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(json.dumps({
+        "context_servers": {
+            "mini-ork": {"command": "/x/mini-ork", "args": ["mcp-context"]},
+            "mcp:arxiv": {"command": "/x/mini-ork", "args": ["mcp", "launch", "arxiv"]},
+            "someone-else": {"command": "/x/other"},
+        },
+    }))
+    monkeypatch.setenv("ZED_SETTINGS", str(settings_file))
+
+    assert zed_cmd.main(["uninstall"], root=str(tmp_path)) == 0
+    contexts = json.loads(settings_file.read_text()).get("context_servers", {})
+    assert contexts == {"someone-else": {"command": "/x/other"}}
+
+
+def test_status_reports_the_shim_entries(tmp_path, monkeypatch, capsys):
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(json.dumps({
+        "context_servers": {
+            "mini-ork": {"command": "/x/mini-ork", "args": ["mcp-context"]},
+            "mcp:arxiv": {"command": "/x/mini-ork", "args": ["mcp", "launch", "arxiv"]},
+        },
+    }))
+    monkeypatch.setenv("ZED_SETTINGS", str(settings_file))
+
+    assert zed_cmd.main(["status"], root=str(tmp_path)) == 0
+    out = capsys.readouterr().out
+    assert "MCP servers wired via `mcp launch`: 1" in out
+    assert "mcp:arxiv" in out

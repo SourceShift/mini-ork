@@ -1,0 +1,59 @@
+# Secret vault backends, in precedence order (first source that has a key wins).
+#
+# Copy to $MINI_ORK_HOME/config/vault.yaml. If this file is absent the chain is
+# simply: environment, then $MINI_ORK_HOME/config/secrets.local.sh — which needs
+# no setup at all and is the whole story for trying mini-ork locally.
+#
+# Every backend serves the same `${NAME}` placeholder that `env.yaml`, the MCP
+# registry and every config file already use, so switching backends never
+# changes a config file. Inspect the result with:
+#
+#   mini-ork vault status          # which backends are wired, and are they ready
+#   mini-ork vault which ARXIV_API_TOKEN   # which backend holds that name
+#
+# No value ever leaves through a command's stdout: both commands print names and
+# locations only.
+
+backends:
+
+  # 1. The ambient environment. Keep it first: a shell `export` must be able to
+  #    rotate one credential for one invocation, which is what debugging wants.
+  - type: env
+
+  # 2. The owner-only 0600 file. Zero setup, single machine.
+  - type: file
+    # file: config/secrets.local.sh     # default: $MINI_ORK_HOME/config/secrets.local.sh
+
+  # 3. A SOPS-encrypted document (age or PGP). Git-committable, still no server.
+  #    Uncomment after: sops --encrypt --age <recipient> secrets.yaml > secrets.enc.yaml
+  # - type: sops
+  #   file: config/secrets.enc.yaml
+
+  # 4. Any executable that prints one value for a key — pass, op, bws,
+  #    infisical, or anything else you already run. `{key}` is substituted into
+  #    one argv element (never through a shell).
+  # - type: command
+  #   argv: ["pass", "show", "mini-ork/{key}"]
+  # - type: command
+  #   argv: ["infisical", "secrets", "get", "{key}", "--plain", "--silent"]
+  # - type: command
+  #   argv: ["op", "read", "op://Private/mini-ork/{key}"]
+
+  # 5. Self-hosted OpenBao (MPL-2.0 — the Linux Foundation fork of Vault), read
+  #    over its HTTP API. This is the one to use when runs are shared, audited or
+  #    cloud-scale: it is the only backend whose SERVER enforces which paths an
+  #    identity may read, so a token that can read the collector's path cannot
+  #    read the reviewer's, and mini-ork cannot widen that by accident because it
+  #    never holds a broader credential.
+  #
+  #    Prefer a short-lived, path-scoped token over the root token. Put it in
+  #    OPENBAO_TOKEN (the vault can hold it too — but then something has to).
+  # - type: openbao
+  #   address: http://127.0.0.1:8200
+  #   mount: secret
+  #   token_env: OPENBAO_TOKEN
+  #   # One KV-v2 path per node role is the shape that makes least privilege
+  #   # real: the collector's token is issued a policy for its path only.
+  #   paths:
+  #     - mini-ork/collector
+  #     - mini-ork/reviewer

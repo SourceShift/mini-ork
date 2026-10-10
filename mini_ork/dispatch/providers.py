@@ -1550,12 +1550,14 @@ def _write_node_mcp_config(
     path_map: "object | None" = None,
 ) -> str | None:
     """Write a node-scoped .mcp-config.json containing only the granted MCP
-    servers. Sources the operator's MCP server definitions from
-    ${MINI_ORK_HOME}/config/mcp_servers.json (operator home) or
-    ${MINI_ORK_ROOT}/.claude/mcp_servers.json (repo fallback), filters to the
-    granted subset, writes to ${run_dir}/.mcp-config.json. Granted servers not
-    in the operator config get a no-op stub so --strict-mcp-config keeps the
-    dispatch hermetic.
+    servers. Definitions come from the registry (see
+    ``mini_ork.dispatch.mcp_registry``): the run's own
+    ``<run_dir>/config/mcp_servers.json``, then the operator home, then the repo
+    fallbacks — filtered to the granted subset and written to
+    ``${run_dir}/.mcp-config.json``. Placeholders in an entry are resolved from
+    the secret store here, so a token never has to live in the registry file.
+    Granted servers not in the registry get a no-op stub so
+    --strict-mcp-config keeps the dispatch hermetic.
 
     Under a ``path_map`` (sandbox isolation), an additional translated copy is
     written as ``.mcp-config.sandbox.json`` and the returned path is the
@@ -1570,36 +1572,13 @@ def _write_node_mcp_config(
     if not granted:
         return None
     e = env if env is not None else os.environ
-    home = e.get("MINI_ORK_HOME", "") or ""
-    root = e.get("MINI_ORK_ROOT", "") or ""
-    sources: list[str] = []
-    if home:
-        sources.append(os.path.join(home, "config", "mcp_servers.json"))
-    if root:
-        sources.append(os.path.join(root, ".claude", "mcp_servers.json"))
-        sources.append(os.path.join(root, "mcp", "steering.json"))
-    operator: dict[str, object] = {}
-    for src in sources:
-        if not src or not os.path.isfile(src):
-            continue
-        try:
-            with open(src, encoding="utf-8") as fh:
-                d = json.load(fh)
-        except (OSError, ValueError, TypeError):
-            continue
-        if isinstance(d, dict) and isinstance(d.get("mcpServers"), dict):
-            operator = d["mcpServers"]  # type: ignore[assignment]
-            break
-        if isinstance(d, dict):
-            operator = d
-            break
-    scoped: dict[str, object] = {}
-    for g in granted:
-        candidate = operator.get(g) if isinstance(operator, dict) else None
-        if isinstance(candidate, dict):
-            scoped[g] = candidate
-        else:
-            scoped[g] = {"command": "echo", "args": [f"no-op: {g} not configured"]}
+    from .mcp_registry import load_registry, scoped_config
+    from .vault import vault_environment
+
+    # Resolve placeholders against the store overlaid with this dispatch's
+    # environment — the same precedence the lanes use, so a shell export can
+    # rotate a credential for one run without editing the store.
+    scoped = scoped_config(granted, load_registry(e), vault_environment(e))
     out_dir = Path(run_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / ".mcp-config.json"

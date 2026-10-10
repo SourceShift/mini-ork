@@ -48,6 +48,12 @@ class WorkflowNode:
     mcp_servers: tuple[str, ...] = ()
     skills: tuple[str, ...] = ()
     agent_doc: str = ""
+    # Variables this node needs at dispatch, declared by the recipe rather than
+    # by the operator's run file: the recipe knows *which* agent a variable
+    # belongs to (a committable structural fact), the run file supplies the
+    # value. Values may be ``${NAME}`` references (resolved at the node boundary
+    # from the secret store) or ``None`` to declare the variable absent.
+    env: dict[str, str | None] = field(default_factory=dict)
     inputs: dict[str, ArtifactInput] = field(default_factory=dict)
     outputs: dict[str, ArtifactOutput] = field(default_factory=dict)
     transform: str = ""
@@ -164,6 +170,47 @@ def _parse_outputs(raw: Any, *, node_id: str) -> dict[str, ArtifactOutput]:
     return parsed
 
 
+def _parse_node_env(raw: Any, *, node_id: str) -> dict[str, str | None]:
+    """The node's ``env:`` block: NAME → value reference, or null for absent.
+
+    Values stay mostly uninterpreted here — ``${NAME}`` is resolved at the node
+    boundary against the secret store, not at compile time, because a workflow is
+    compiled (and tested) without the operator's credentials present. Only the
+    shape is validated: a nested mapping in an env value is a mistake that would
+    otherwise reach a child process as ``"{'a': 'b'}"``.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise WorkflowCompileError(
+            f"node {node_id} env must be a mapping of NAME: value"
+        )
+    parsed: dict[str, str | None] = {}
+    for key, value in raw.items():
+        if isinstance(key, bool):
+            # YAML 1.1 reads an unquoted `on:`/`off:`/`yes:`/`no:` key as a
+            # boolean, so `ON: 1` would silently become the variable "True".
+            raise WorkflowCompileError(
+                f"node {node_id} env {key!r} is a YAML boolean, not a variable name; "
+                'quote it ("ON") if that is the name you want'
+            )
+        name = str(key)
+        if value is None:
+            parsed[name] = None
+        elif isinstance(value, bool):
+            # YAML true/false would stringify as "True"/"False", which no child
+            # process reads as a flag.
+            parsed[name] = "1" if value else "0"
+        elif isinstance(value, (str, int, float)):
+            parsed[name] = str(value)
+        else:
+            raise WorkflowCompileError(
+                f"node {node_id} env {name} must be a string, number, boolean or null, "
+                f"not {type(value).__name__}"
+            )
+    return parsed
+
+
 def _node_from_yaml(raw: Any) -> WorkflowNode:
     details = _mapping(raw, context="workflow node")
     name = str(details.get("name") or "").strip()
@@ -187,6 +234,7 @@ def _node_from_yaml(raw: Any) -> WorkflowNode:
     mcp_servers = _str_tuple(details.get("mcp_servers"))
     skills = _str_tuple(details.get("skills"))
     agent_doc = str(details.get("agent_doc") or "").strip()
+    env = _parse_node_env(details.get("env"), node_id=name)
     transform = str(details.get("transform") or "").strip()
     if node_type == "transform" and not transform:
         raise WorkflowCompileError(f"transform node {name} requires a transform identifier")
@@ -213,6 +261,7 @@ def _node_from_yaml(raw: Any) -> WorkflowNode:
         mcp_servers=mcp_servers,
         skills=skills,
         agent_doc=agent_doc,
+        env=env,
         inputs=inputs,
         outputs=outputs,
         transform=transform,

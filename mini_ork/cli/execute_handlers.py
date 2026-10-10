@@ -30,6 +30,10 @@ from mini_ork.context import (
     publish_env,
     run_context_scope,
 )
+from mini_ork.dispatch.run_env import RunEnvError, effective_node_overrides, load_run_env
+from mini_ork.dispatch.secrets import SecretStoreError
+from mini_ork.dispatch.skill_registry import granted_skills, materialize_skills
+from mini_ork.dispatch.vault import vault_environment
 from mini_ork.runtime.run_roots import load_run_roots
 from mini_ork.cli.main import _module_env, _reflect_timeout_seconds
 from mini_ork.observability.node_events import _now_ms, mo_node_emit, mo_node_end, mo_node_start
@@ -605,6 +609,39 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         input_hash=hashlib.sha256(f"{run_id}|{node_id}|{recipe}".encode()).hexdigest(),
         node_type=node_type))
 
+    # Per-run and per-node environment (config/env.yaml). Published AFTER the
+    # identity block so a run file can override a lane's model or budget but not
+    # the node's own identity — the reserved keys are rejected when the file is
+    # parsed. A malformed file fails the node as a config error rather than
+    # running with the overrides silently dropped, which is the failure this
+    # file exists to prevent. Keys another node declared are cleared here, so a
+    # per-node declaration is a guarantee, not a suggestion.
+    try:
+        _run_env = load_run_env(run_dir_eff)
+    except (RunEnvError, SecretStoreError) as exc:
+        print(f"  [env] node_id={node_id}: {exc}", file=sys.stderr)
+        return 1, "config"
+    if not _run_env.is_empty or compiled_workflow is not None:
+        _workflow_env_keys: set[str] = set()
+        _node_env: dict[str, str | None] = {}
+        if compiled_workflow is not None:
+            for _decl in compiled_workflow.nodes.values():
+                _workflow_env_keys.update(_decl.env)
+            if node_id in compiled_workflow.nodes:
+                _node_env = dict(compiled_workflow.nodes[node_id].env)
+        try:
+            _node_overrides = effective_node_overrides(
+                _run_env, node_id, node_env=_node_env,
+                workflow_declared=_workflow_env_keys,
+                # The vault resolves the recipe's `${NAME}` references here, at
+                # the boundary, so the value reaches the child and nowhere else.
+                environ=vault_environment(),
+            )
+        except (RunEnvError, SecretStoreError) as exc:
+            print(f"  [env] node_id={node_id}: {exc}", file=sys.stderr)
+            return 1, "config"
+        publish_env(_node_overrides)
+
     # (E4 turn-resume) During an active recovery, restore this node's persisted
     # transcript and export MO_RESUME_SESSION_ID so a claude lane continues the
     # interrupted conversation (`--resume <id>`, via providers.dispatch_model)
@@ -652,7 +689,19 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     mo_node_start(run_id, node_id, node_type, model_lane=lane, db=db,
                   placement=placement, node_host=node_host, session_id=session_id)
     node_start_ms[node_id] = _now_ms()
-    rc, finish_reason = handler(ctx)
+    # Skills granted to this node are materialized into the checkout it runs in
+    # and released when it ends, wrapping exactly the handler call: a grant is
+    # scoped to one node, so a skill the reviewer was not granted is simply not
+    # there while the reviewer runs. The finally covers every return path and a
+    # handler that raises.
+    _materialized_skills = materialize_skills(
+        granted_skills(compiled_workflow, node_id),
+        context_env("MO_TARGET_CWD", "") or os.getcwd(),
+    )
+    try:
+        rc, finish_reason = handler(ctx)
+    finally:
+        _materialized_skills.release()
     # Handlers that never call trace() (verifier/publisher/rollback/eval) must
     # still close their node — an orphaned node_start renders the node
     # permanently "running" in the DAG. trace() pops the start-map entry, so

@@ -36,7 +36,7 @@ def test_all_former_exec_subs_registered_natively():
         "reap",
         "harness-contrast", "harness-edit", "harness-audit", "hack-probe",
         "oversight", "metric-anchor", "active-eval", "certify", "node-agent",
-        "nodes", "mcp-context", "zed", "specs", "automations", "board",
+        "nodes", "mcp", "vault", "mcp-context", "zed", "specs", "automations", "board",
         "triage",
         "repair",
     }

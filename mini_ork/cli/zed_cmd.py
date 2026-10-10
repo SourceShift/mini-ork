@@ -44,7 +44,12 @@ _USAGE = (
     "Usage: mini-ork zed <setup|status|uninstall> [--home <dir>] [--dry-run]\n\n"
     "Wire (or unwire) mini-ork inside Zed's settings.json. Reads and writes\n"
     "$ZED_SETTINGS if set, else ~/.config/zed/settings.json. Always backs up\n"
-    "the existing file before mutating it.\n"
+    "the existing file before mutating it.\n\n"
+    "setup also wires every server in the MCP registry as a context server\n"
+    "named `mcp:<name>`, pointing at `mini-ork mcp launch <name>` — so a token\n"
+    "resolved from the vault is never written into settings.json (a stdio\n"
+    "server is exec'd there; a URL server is bridged).\n"
+    "Pass --no-mcp to wire only the agent.\n"
 )
 
 
@@ -177,6 +182,53 @@ def _build_context_entry(launcher: str, home: str | None) -> dict[str, Any]:
     return {"command": launcher, "args": ["mcp-context"], "env": _entry_env(home)}
 
 
+def _build_mcp_context_entry(launcher: str, home: str | None, name: str) -> dict[str, Any]:
+    """Build a ``context_servers["mcp:<name>"]`` block.
+
+    The block names the shim, never the server. Zed cannot interpolate
+    ``${NAME}`` and must not hold a token, so this entry starts
+    ``mini-ork mcp launch <name>``, which resolves the registry entry against the
+    vault and execs the real server. The token therefore never appears in
+    ``settings.json`` or in any backup of it.
+    """
+    return {"command": launcher, "args": ["mcp", "launch", name], "env": _entry_env(home)}
+
+
+#: Context-server keys ``zed setup`` owns and ``zed uninstall`` removes.
+_OWNED_CONTEXT_PREFIX = "mcp:"
+
+
+def _stdio_mcp_names(home: str | None) -> list[str]:
+    """Registry names ``mcp launch`` can serve — a stdio command or a URL.
+
+    Both are wired through the same shim: a stdio entry is exec'd, a URL entry
+    is bridged, and a token for either is resolved at spawn time. Nothing is
+    resolved *here*, so reading the registry to build the entry list cannot
+    fail on a missing secret — which is what keeps ``zed setup`` usable before
+    every credential is in place.
+
+    The registry is optional: when it is absent this is simply an empty list,
+    never a reason for ``zed setup`` to fail.
+    """
+    try:
+        from mini_ork.dispatch.mcp_registry import load_registry
+    except ImportError as exc:
+        sys.stderr.write(f"mini-ork zed: MCP registry unavailable: {exc}\n")
+        return []
+    env = dict(os.environ)
+    if home:
+        env["MINI_ORK_HOME"] = os.path.abspath(home)
+    registry = load_registry(env)
+    return sorted(
+        str(name)
+        for name, entry in registry.items()
+        if isinstance(entry, dict)
+        and (entry.get("command") or entry.get("url"))
+        and entry.get("enabled") is not False
+        and str(entry.get("source") or "").lower() != "extension"
+    )
+
+
 #: ``zed setup --layout``: the task-board arrangement — threads and the
 #: agent on the left, the Git panel (the task's files and changes) and the
 #: Project panel on the right. Zed's own "Panel Layout > Agentic" does the
@@ -262,6 +314,15 @@ def _cmd_setup(args: argparse.Namespace) -> int:
 
     data["agent_servers"]["mini-ork"] = _build_agent_entry(launcher, home)
     data["context_servers"]["mini-ork"] = _build_context_entry(launcher, home)
+
+    mcp_names: list[str] = []
+    if not getattr(args, "no_mcp", False):
+        mcp_names = _stdio_mcp_names(home)
+        for mcp_name in mcp_names:
+            data["context_servers"][f"{_OWNED_CONTEXT_PREFIX}{mcp_name}"] = (
+                _build_mcp_context_entry(launcher, home, mcp_name)
+            )
+
     layout_changes = _apply_layout(data) if getattr(args, "layout", False) else []
 
     if args.dry_run:
@@ -282,6 +343,18 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     )
     if home:
         sys.stdout.write(f"  env.MINI_ORK_HOME (both)         = {os.path.abspath(home)}\n")
+    if mcp_names:
+        sys.stdout.write(
+            f"  context_servers: {len(mcp_names)} MCP server(s) wired through "
+            f"`mcp launch` (no token in this file)\n"
+        )
+        for mcp_name in mcp_names:
+            sys.stdout.write(f"    {_OWNED_CONTEXT_PREFIX}{mcp_name}\n")
+    elif not getattr(args, "no_mcp", False):
+        sys.stdout.write(
+            "  context_servers: no stdio MCP servers in the registry "
+            "(add one with `mini-ork mcp add`)\n"
+        )
     for change in layout_changes:
         sys.stdout.write(f"  {change}\n")
     if getattr(args, "layout", False):
@@ -337,6 +410,14 @@ def _cmd_status(args: argparse.Namespace) -> int:
     _report("agent_servers.mini-ork", agent_entry)
     _report("context_servers.mini-ork", context_entry)
 
+    owned = sorted(str(key) for key in contexts if str(key).startswith(_OWNED_CONTEXT_PREFIX)) if isinstance(contexts, dict) else []
+    if owned:
+        sys.stdout.write(f"  MCP servers wired via `mcp launch`: {len(owned)}\n")
+        for key in owned:
+            sys.stdout.write(f"    {key}\n")
+    else:
+        sys.stdout.write("  MCP servers wired via `mcp launch`: none\n")
+
     acp_ok = importlib.util.find_spec("acp") is not None
     sys.stdout.write(f"  'acp' extra importable: {'yes' if acp_ok else 'no'}\n")
     if not acp_ok:
@@ -370,9 +451,13 @@ def _cmd_uninstall(args: argparse.Namespace) -> int:
     if isinstance(agents, dict) and "mini-ork" in agents:
         del agents["mini-ork"]
         removed = True
-    if isinstance(contexts, dict) and "mini-ork" in contexts:
-        del contexts["mini-ork"]
-        removed = True
+    if isinstance(contexts, dict):
+        # Everything under our prefix was written by `zed setup`, so it goes too;
+        # leaving the entries behind would keep spawning a shim for a server the
+        # user just unwired.
+        for key in [k for k in contexts if k == "mini-ork" or str(k).startswith(_OWNED_CONTEXT_PREFIX)]:
+            del contexts[key]
+            removed = True
 
     # Drop now-empty maps so the resulting settings file stays tidy.
     if isinstance(agents, dict) and not agents:
@@ -416,6 +501,10 @@ def _build_parser() -> argparse.ArgumentParser:
     setup.add_argument(
         "--layout", action="store_true",
         help="also dock threads + agent left and the Git/Project panels right",
+    )
+    setup.add_argument(
+        "--no-mcp", action="store_true",
+        help="do not wire the registry's stdio MCP servers as context servers",
     )
 
     sub.add_parser("status", add_help=False)

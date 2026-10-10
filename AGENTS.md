@@ -60,6 +60,15 @@ tiers), pytest on 3.11/3.12 (sharded), UI typecheck, and web smoke;
 `.github/workflows/release.yml` re-runs the blocking lint + a unit-layer
 pytest smoke before building release artifacts.
 
+## Feature delivery: two tiers, always
+
+Every new feature ships in two tiers, and both are part of the definition of done:
+
+1. **Secure, cloud-scalable tier** — the recommended one for real and shared use. It must survive a hostile or merely careless deployment: secrets come from a real secret store, access is scoped per node/agent rather than globally, nothing lands in a log or a shell history, and the design still holds when the work moves off one machine onto many.
+2. **Simple tier** — for someone trying mini-ork on their own laptop. No server, no daemon, no cloud account, no network round-trip; it must work after at most copying an example config. If the feature only works once infrastructure is stood up, it is not finished.
+
+Do not pick one and call it done. Do not make the simple tier a toy that silently drops the security property the feature exists for: it may fall back to a local file or the environment, but it must fail closed (a missing value is a clear error, never a silent empty string). Document both, and let one config file choose between them, so the user can start simple and switch to the secure tier without rewriting call sites. The vault is the reference implementation of this shape (`config/vault.example.yaml`, `mini-ork vault status`).
+
 ## Extension points
 
 - Recipes: add a directory under `recipes/` with `task_class.yaml`, `workflow.yaml`, `artifact_contract.yaml`.

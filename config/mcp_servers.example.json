@@ -1,0 +1,46 @@
+{
+  "_comment": [
+    "Example MCP server registry. Copy to $MINI_ORK_HOME/config/mcp_servers.json",
+    "and edit, or use `mini-ork mcp add`.",
+    "",
+    "A node reaches a server by NAME (tools.mcp or mcp_servers: in workflow.yaml);",
+    "this file is the other half of that reference. Only servers a node is granted",
+    "are ever written into that node's .mcp-config.json, and the dispatch runs with",
+    "--strict-mcp-config, so nothing outside this file is visible to it.",
+    "",
+    "NEVER put a credential here. Write ${NAME} and export NAME in",
+    "$MINI_ORK_HOME/config/secrets.local.sh (0600). An unset ${NAME} is a hard error",
+    "at dispatch time, not an empty header the node discovers mid-call.",
+    "",
+    "Both shapes are accepted: Zed's editor shape (source/headers/oauth) and the",
+    "claude CLI shape (command/type/url). Editor-only keys are dropped, and OAuth",
+    "is not supported — provide a pre-obtained token in headers instead."
+  ],
+  "mcpServers": {
+    "arxiv": {
+      "command": "npx",
+      "args": ["-y", "arxiv-mcp-server", "--storage-path", "/tmp/arxiv-papers"],
+      "env": {
+        "ARXIV_API_TOKEN": "${LIBWIT_ARXIV_TOKEN}"
+      }
+    },
+    "codegraph": {
+      "command": "codegraph",
+      "args": ["mcp"]
+    },
+    "libwit": {
+      "type": "http",
+      "url": "https://libwit.internal/mcp",
+      "headers": {
+        "Authorization": "Bearer ${LIBWIT_API_TOKEN}"
+      }
+    },
+    "websearch": {
+      "source": "http",
+      "url": "https://api.example.com/mcp",
+      "headers": {
+        "X-API-Key": "${EXAMPLE_SEARCH_KEY:-anonymous}"
+      }
+    }
+  }
+}

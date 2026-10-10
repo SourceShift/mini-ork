@@ -244,3 +244,276 @@ lanes:
 
 See `config/providers.yaml` for the full schema and commented examples
 (OpenRouter, custom gateways, executable scripts).
+
+## MCP Server Registry
+
+A node reaches an MCP server **by name** — `tools.mcp: [arxiv, codegraph]` or
+the capability envelope `mcp_servers: [arxiv]` in `workflow.yaml`. The name is
+a reference; the registry holds the other half — the connection definition and
+its auth. Only the granted servers are written into that node's
+`.mcp-config.json`, and the dispatch adds `--strict-mcp-config`, so the node
+cannot reach a server the recipe did not grant it.
+
+### Where the registry is read from
+
+First definition of a name wins, in this order:
+
+1. `<run_dir>/config/mcp_servers.json` — the run's own frozen copy
+2. `$MINI_ORK_HOME/config/mcp_servers.json` — the operator's registry
+3. `$MINI_ORK_ROOT/.claude/mcp_servers.json`, then `$MINI_ORK_ROOT/mcp/steering.json`
+
+`mini-ork mcp add|rm` writes only file (2): the repo file is a committed
+template and the run file is a snapshot.
+
+### Entry shape
+
+Both shapes are accepted, so a Zed entry can be pasted unchanged:
+
+```json
+{ "command": "npx", "args": ["-y", "pkg"], "env": {"TOKEN": "${T}"} }
+{ "type": "http", "url": "https://host/mcp", "headers": {"Authorization": "Bearer ${T}"} }
+{ "source": "http", "url": "https://host/mcp", "headers": {"X-Key": "${T}"} }
+```
+
+`source`/`enabled`/`remote` are editor-only and dropped. `oauth` and extension
+`settings` blobs are **not supported** — a node runs outside the editor, so
+provide a pre-obtained token in `headers` and mini-ork warns that it did.
+`enabled: false` on a granted server is a hard error, not a silent skip.
+
+See `config/mcp_servers.example.json`.
+
+### Auth: `${NAME}` placeholders
+
+A value of the form `${NAME}` or `${NAME:-fallback}` is expanded at dispatch
+time from the secret store overlaid with the run's runtime environment. **The
+registry file therefore holds no secret and is safe to commit.**
+
+An unset `${NAME}` with no fallback is an error at dispatch — a server granted
+with a silently-empty `Authorization` header would otherwise fail deep inside a
+node where the cause is invisible. Check before you run:
+
+```bash
+mini-ork mcp list              # every server and whether it resolves
+mini-ork mcp check --workflow recipes/code-fix/workflow.yaml
+```
+
+`mcp check` resolves every grant a workflow declares (both `tools.mcp` and
+`mcp_servers:`) and exits non-zero on the first `FAIL`.
+
+## Per-Run and Per-Node Environment
+
+`secrets.local.sh` is one global file. Two things it cannot express: a value
+that differs **per run** (this run's vendor token, not the last one's), and a
+value that differs **per node** (only the collector needs the source API token;
+the reviewer must not have it).
+
+`<run_dir>/config/env.yaml` expresses both:
+
+```yaml
+env:                       # every node in this run
+  MO_RESEARCH_MIN_SOURCES: 40
+  ARXIV_API_TOKEN: ${LIBWIT_ARXIV_TOKEN}
+nodes:                     # one node, overrides the run level
+  collector:
+    ARXIV_API_TOKEN: ${LIBWIT_ARXIV_TOKEN}
+  reviewer:
+    ARXIV_API_TOKEN: null  # explicitly absent for this node
+```
+
+A recipe can also declare *which* variable a node needs, in the node itself:
+
+```yaml
+- name: collector
+  type: researcher
+  env:
+    ARXIV_API_TOKEN: null      # this node needs it; the run file supplies it
+```
+
+Precedence, lowest first: the recipe's node `env:`, then the run file's `env:`,
+then the run file's `nodes.<id>`. The recipe decides *which agent* needs a
+variable (a committable structural fact); the run file supplies the value and
+therefore wins.
+
+**Masking.** Every key any declaration mentions is part of the node's published
+environment; keys this node is not supplied are set to `None`, which *removes*
+the variable rather than leaving it inherited. That is what makes a per-node
+declaration a guarantee: a token published for the collector cannot survive
+into the reviewer, even though both run in one process on the serial path.
+`null` in the run file is how a node explicitly opts out of a run-level or
+ambient value.
+
+**Reserved keys.** `MINI_ORK_RUN_ID`, `MINI_ORK_RUN_DIR`, `MO_NODE_ID`,
+`MO_NODE_TYPE`, `MO_NODE_ATTEMPT`, `MO_DISPATCH_CHAIN`, `MO_TARGET_CWD`,
+`MO_RESUME_SESSION_ID` and `MO_INPUT_HASH` are owned by the executor and are
+rejected in `env.yaml` rather than silently overridden — a run that needs to
+set `MO_NODE_ID` is broken, not configured.
+
+An unknown top-level section is an error, so a `node:` typo cannot silently
+drop every per-node override and run every node with the run-level environment.
+
+## Secret Vault
+
+`${NAME}` — in `env.yaml`, in the MCP registry, in `providers.yaml` — is
+resolved against a **chain of backends**. A backend is one source of values;
+the chain is the declared order, and the first source that has the key wins.
+The point is that the same `${NAME}` works whether you are trying mini-ork on
+one laptop or running it for a team, and moving between the two means editing
+one file, never a config that mentions a secret.
+
+```bash
+mini-ork vault status              # which backends are wired, and are they ready
+mini-ork vault which ARXIV_API_TOKEN   # which backend holds that name
+```
+
+Neither command prints a value — only names and locations. A command that
+prints secrets ends up in a shell history file and on a screen share.
+
+### The simple tier (no setup)
+
+With no `$MINI_ORK_HOME/config/vault.yaml` present, the chain is:
+
+1. **`env`** — the ambient environment. First, always: a shell `export` rotates
+   one credential for one invocation, which is what a debug session wants.
+2. **`file`** — `$MINI_ORK_HOME/config/secrets.local.sh`, owner-only `0600`.
+   Nothing to install; `mini-ork init` scaffolds it.
+
+That is the whole story for a tester: no server, no daemon, no network. A
+missing key is a clear error at the node boundary, never a silent empty string.
+
+### Backends
+
+Declare the chain in `$MINI_ORK_HOME/config/vault.yaml` (see
+`config/vault.example.yaml`):
+
+```yaml
+backends:
+  - type: env
+  - type: file
+  - type: sops
+    file: config/secrets.enc.yaml
+  - type: command
+    argv: ["pass", "show", "mini-ork/{key}"]
+  - type: openbao
+    address: http://127.0.0.1:8200
+    mount: secret
+    token_env: OPENBAO_TOKEN
+    paths: [mini-ork/collector, mini-ork/reviewer]
+```
+
+| Backend | What it is | When to use it |
+| --- | --- | --- |
+| `env` | the process environment | always first; lets a shell export win |
+| `file` | the owner-only `secrets.local.sh` | one machine, zero setup |
+| `sops` | a SOPS-encrypted YAML (age/PGP), decrypted once per process | the encrypted file is committable; still no server |
+| `command` | any executable that prints one value for a key; `{key}` is substituted into one argv element, never through a shell | `pass`, `op read`, `bws`, `infisical`, or anything you already run |
+| `openbao` | self-hosted [OpenBao](https://openbao.org) (MPL-2.0, the Linux Foundation fork of Vault), KV-v2 over HTTP | shared, audited, or cloud-scale runs |
+
+**Why OpenBao is the recommendation for the secure tier.** It is the only
+backend whose *server* enforces what an identity may read. A deny-by-default
+policy per path means a token issued to the collector's path cannot read the
+reviewer's, and mini-ork cannot widen that by accident because it never holds a
+broader credential. Issue a short-lived, path-scoped token (not the root token)
+and put it in `OPENBAO_TOKEN` — or in the `file` backend, since the token
+itself is just another secret.
+
+`docker/openbao/` runs that whole tier in one command: a dev OpenBao, a
+KV-v2 path and a read-only policy per node role, an audit device, and a
+short-lived token per role, minted into a `0600` file rather than printed. See
+`docker/openbao/README.md`. `tests/integration/test_openbao_live.py` proves the
+path against a live server — including that a role's token is *refused* at
+another role's path — and skips cleanly when `OPENBAO_ADDR` is unset.
+
+`command` deliberately generalizes `pass`/`op`/`bws`/`infisical` so mini-ork
+never has to know those tools exist, and so a team already using one of them
+gains per-node masking without adopting anything new.
+
+### Precedence and failures
+
+The chain is consulted in order; `env` wins over `file` wins over `sops` wins
+over `command` wins over `openbao`. Shell `export` therefore always beats a
+stored value.
+
+A backend that *cannot serve* — an unreadable `vault.yaml`, a `command` that
+exits non-zero, an OpenBao path the token is not permitted to read — raises
+`VaultError`, a `SecretStoreError` subclass, so it travels the same path as any
+other unresolvable `${NAME}` and is reported the same way. A lookup tool that
+fails is deliberately *not* treated as "the key is absent": `pass show missing`
+and a network timeout both exit non-zero, and treating that as unset would
+silently drop a credential.
+
+A 404 on an OpenBao path is not an error — an operator adds paths as they need
+them — but a 401/403 is, and names the token environment variable so the fix is
+obvious. Unknown top-level sections and unknown backend types are rejected at
+load time rather than silently falling back to the default chain.
+
+**YAML gotcha.** `ON:`, `OFF:`, `YES:` and `NO:` are YAML 1.1 booleans, so an
+unquoted key by that name becomes the variable `"True"`. mini-ork rejects a
+boolean variable name in both `env.yaml` and node `env:` rather than resolving
+it. Quote it (`"ON"`) if that is the name you want.
+
+### Knowing which tier you are on
+
+The simple tier is a real choice, not a mistake — but a run that resolves secrets
+in the clear should say so rather than let an operator assume otherwise. When
+the chain is **only** the plaintext backends (`env` and `file`), mini-ork writes
+one line to stderr at the start of a run explaining how to move up, and
+`mini-ork doctor` prints the same thing under `Secret vault:` alongside the
+per-backend status.
+
+It is advice, never a gate: it cannot fail a run, and switching to `sops`,
+`command`, or `openbao` — or back — makes it appear once and then stay quiet. The
+note is remembered as a signature of the chain (backend names and where they read
+from, never a value) in `$MINI_ORK_HOME/state/vault-protection.sig`, so it is not
+repeated on every run while nothing has changed.
+
+## Skills
+
+A skill is a directory of procedure an agent can read — a `SKILL.md` plus
+whatever it references. A recipe grants one to a node by name, the same way it
+grants an MCP server:
+
+```yaml
+- name: researcher
+  type: researcher
+  skills: [arxiv-search, source-rating]
+```
+
+A harness reads skills from a fixed directory (Claude Code reads
+`<cwd>/.claude/skills/`) and has no "here is my skill list" flag, so a grant
+becomes a **symlink in the checkout the node runs in**:
+
+```
+<node cwd>/.claude/skills/arxiv-search -> <registry>/arxiv-search
+```
+
+The link is created just before the node's handler runs and removed when it
+ends — including when it fails. That is what makes the grant a guarantee
+rather than a suggestion: the reviewer that was *not* granted the research
+skill cannot find it, because it was never there while the reviewer ran. It is
+the same discipline as the per-node environment: least privilege enforced by
+absence, not by prompt.
+
+Where `name` resolves, first definition winning:
+
+| Source | Path | Use |
+| --- | --- | --- |
+| run | `<run_dir>/config/skills/<name>/` | pin exactly what this run saw; makes a boundary run reproducible |
+| operator | `$MINI_ORK_HOME/config/skills/<name>/` | your machine, every project |
+| project | `$MINI_ORK_ROOT/.agents/skills/<name>/` | committed with the repo; the same directory Zed reads |
+
+Two rules keep this safe inside a working tree a human also uses:
+
+* **Never overwrite.** If `<node cwd>/.claude/skills/<name>` already exists — a
+  skill you wrote — it is left alone and a warning is printed. Your file wins.
+* **Release only what it created.** A link that has since become a real
+  directory is the node's own output, and stays.
+
+A name no registry defines is a warning, not a failure — the same posture the
+MCP registry takes with an unconfigured server, so a typo costs a line of
+stderr rather than a run.
+
+This is the two-tier shape again: the simple tier is a directory in
+`.agents/skills/`, committed or dropped in by hand, with no server involved;
+the secure, multi-tenant tier is the same directory content served from the
+run's own `config/skills/`, so a shared deployment controls which nodes see
+which skills without anyone editing a checkout.

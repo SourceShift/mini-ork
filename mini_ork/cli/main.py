@@ -31,6 +31,9 @@ from mini_ork.context import (
     run_context_scope,
 )
 from mini_ork.dispatch import agents_config, config_resolve, deadline_budget
+from mini_ork.dispatch.run_env import RunEnvError, load_run_env
+from mini_ork.dispatch.secrets import SecretStoreError
+from mini_ork.dispatch.vault import VaultError
 from mini_ork.vcs import repo_integrity_guard
 from mini_ork.gates import rubric_prescreen
 from mini_ork.orchestration import concord_run
@@ -72,6 +75,8 @@ _NATIVE_MODULE_SUBS = {
     "reap": "mini_ork.orchestration.run_reaper",
     "acp": "mini_ork.cli.acp_cmd",
     "mcp-context": "mini_ork.cli.mcp_context_cmd",
+    "mcp": "mini_ork.cli.mcp_cmd",
+    "vault": "mini_ork.cli.vault_cmd",
     "zed": "mini_ork.cli.zed_cmd",
     "calibrate": "mini_ork.cli.calibrate",
     "collapse-check": "mini_ork.cli.collapse",
@@ -127,6 +132,8 @@ Lifecycle:
   update                         Apply migrations + report config drift
   doctor                         Check deps, environment, and provider preflight
   providers                      Configure or inspect credentials for workflow lanes
+  mcp                            Manage the MCP server registry nodes grant by name
+  vault                          Report which secret sources are wired, and where a key lives
   validate                       Pre-run static checks with Fix: hints
   garden                         Drift detection (collisions, orphans, stale runs)
   verifier list|annotate         Inspect verifier results and label false
@@ -149,6 +156,20 @@ Provider credentials:
   providers configure <lane>                 Prompt securely to configure one provider lane
   providers configure --workflow <path>      Configure every provider lane used by a workflow
   providers --help                           See automation options; keys never use CLI flags
+
+MCP servers (granted per node by name):
+  mcp list                                   Show the registry and what resolves
+  mcp add <name> --url <url> | --command <c>  Define a server; --secret NAME stores its token
+  mcp rm <name>                              Remove an operator-defined server
+  mcp check --workflow <path>                Resolve every grant a recipe declares
+
+Secret vault (where ${NAME} in configs and env.yaml is resolved):
+  vault status                               Show the backend chain and its readiness
+  vault which <NAME>                         Name the backend that holds NAME (never its value)
+  # No vault.yaml needed: the default chain is the environment, then the
+  # owner-only $MINI_ORK_HOME/config/secrets.local.sh. See config/vault.example.yaml
+  # for sops (committable encrypted file), command (pass/op/bws/infisical) and
+  # openbao (self-hosted, per-path policies) backends.
 
 Environment:
   MINI_ORK_HOME   project home dir  (default: .mini-ork/)
@@ -804,6 +825,21 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
         sys.stderr.write(f"kickoff not found: {kickoff}\n"); return 2
     run_id = os.environ.setdefault("MINI_ORK_RUN_ID", f"run-{int(time.time())}-{os.getpid()}")
     sink["run_id"] = run_id
+    # Name the protection gap once, and only when the vault chain changes:
+    # values resolving in the clear is the legitimate zero-setup tier, but the
+    # operator of a shared or audited run should hear it without having to
+    # remember to ask. A bad config is left to the boundary that already reports
+    # it, so this never changes which error a run dies on.
+    try:
+        from mini_ork.dispatch.vault import (
+            VaultError,
+            report_protection_gap,
+            vault_environment,
+        )
+
+        report_protection_gap(vault_environment())
+    except VaultError:
+        pass
     # Heal reflect rows a hard-killed parent (SIGKILL, uncatchable) left stuck
     # 'running' — the live path finalizes its own row in the reflect `finally`,
     # but a parent killed mid-reflect leaves one for the next run to mop up.
@@ -922,6 +958,18 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
         config_resolve.snapshot_run_config(run_dir)
     except Exception:
         pass
+    # Run-scoped environment (config/env.yaml). Published here, ahead of
+    # classify/plan, so the planner and every child process see it — the node
+    # boundary later re-publishes it plus that node's own overrides. A malformed
+    # file stops the run now, before any spend, rather than at the first node
+    # whose overrides would have silently gone missing.
+    try:
+        _run_env = load_run_env(run_dir)
+    except (RunEnvError, SecretStoreError, VaultError) as exc:
+        sys.stderr.write(f"run environment is invalid: {exc}\n")
+        return 2
+    if _run_env.run_level:
+        publish_env(_run_env.run_level)
     profile_path = os.path.join(run_dir, "run_profile.json")
     os.environ["MINI_ORK_PROFILE_PATH"] = profile_path
 
@@ -1247,6 +1295,22 @@ def _doctor_handler(rest, root):
             print(f"  [OK]      {family} (${env_var} set)")
         else:
             print(f"  [WARN]    {family} (${env_var} unset; run: mini-ork providers configure {family})")
+
+    print("")
+    print("Secret vault:")
+    from mini_ork.dispatch.vault import vault_environment
+
+    try:
+        environment = vault_environment()
+    except VaultError as exc:
+        print(f"  [WARN]    vault config: {exc}")
+    else:
+        for backend_status in environment.status():
+            tag = "[OK]      " if backend_status.ready else "[WARN]    "
+            print(f"  {tag}{backend_status.backend}: {backend_status.detail}")
+        gap = environment.protection_gap()
+        if gap:
+            print(f"  [WARN]    {gap}")
     return 0
 
 
@@ -1267,9 +1331,24 @@ def _providers_handler(rest, root):
     return providers.main(rest, root=root)
 
 
+def _mcp_handler(rest, root):
+    from mini_ork.cli import mcp_cmd
+    return mcp_cmd.main(rest, root=root)
+
+
+def _vault_handler(rest, root):
+    from mini_ork.cli import vault_cmd
+    return vault_cmd.main(rest, root=root)
+
+
 def _install_handler(rest, root):
     from mini_ork.cli import install_command
     return install_command.main(rest, root=root)
+
+
+def _board_handler(rest, root):
+    from mini_ork.cli import board_cmd
+    return board_cmd.main(rest, root=root)
 
 
 def _build_default_registry() -> dict:
@@ -1282,10 +1361,22 @@ def _build_default_registry() -> dict:
     registry["execute"] = _execute_inprocess
     for sub, module in _NATIVE_MODULE_SUBS.items():
         registry[sub] = _native_module_handler(module)
+    # `board` is the IDE's hot path: the shell polls it every 1.5 s and every
+    # panel, tab and action re-reads it, so a second interpreter per call is the
+    # dominant cost of the whole IDE (measured: 0.04 s of work, ~0.25 s through
+    # `python -m`). Registered in-process on top of the native table entry,
+    # which stays so `_NATIVE_MODULE_SUBS` keeps mirroring runtime-select.sh
+    # (tests/unit/test_native_dispatch_py.py asserts the mapping). `board retry`
+    # is the one verb that spawns a child (`mini-ork recover`); it sets
+    # MINI_ORK_ROOT and cwd=root itself, so it does not need the child-env
+    # protection `_module_env` adds.
+    registry["board"] = _board_handler
     registry["run"] = _run_handler
     registry["doctor"] = _doctor_handler
     registry["install"] = _install_handler
     registry["providers"] = _providers_handler
+    registry["mcp"] = _mcp_handler
+    registry["vault"] = _vault_handler
     registry["version"] = _version_handler
     for alias in ("help", "--help", "-h"):
         registry[alias] = _help_handler
