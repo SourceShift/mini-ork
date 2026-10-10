@@ -23,6 +23,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from mini_ork.features import gate_env
+
 from .db import StateDB
 
 # Statuses that may be controlled. Terminal statuses are excluded — killing
@@ -692,8 +694,14 @@ def launch_run(
     # whatever interpreter started it. The child sets the flag again itself when
     # it re-execs.
     env.pop("MINI_ORK_VENV_ACTIVE", None)
+    blocked_premium: list[str] = []
     if extra_env:
-        env.update({str(k): str(v) for k, v in extra_env.items()})
+        overrides = {str(k): str(v) for k, v in extra_env.items()}
+        accept = (
+            overrides.get("MO_ACCEPT_PREMIUM", env.get("MO_ACCEPT_PREMIUM", "")) not in ("", "0")
+        )
+        overrides, blocked_premium = gate_env(overrides, accept_premium=bool(accept))
+        env.update(overrides)
 
     try:
         log_fh = open(log_path, "ab")  # noqa: SIM115 — handed to the child; closed in parent below
@@ -719,6 +727,7 @@ def launch_run(
         "run_id": rid,
         "recipe": rcp,
         "pid": proc.pid,
+        "blocked_premium": blocked_premium,
         "kickoff_path": str(kickoff_path),
         "log_path": str(log_path),
     }

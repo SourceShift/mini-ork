@@ -26,11 +26,22 @@ def launch(
     recipe: str = Body(..., embed=True, description="Recipe name, e.g. 'code-fix'"),
     kickoff_markdown: str = Body(..., embed=True, description="Kickoff markdown body"),
     run_id: str | None = Body(None, embed=True, description="Optional caller-supplied run id"),
+    extra_env: dict[str, str] | None = Body(
+        None,
+        embed=True,
+        description=(
+            "Per-run env overrides — the wizard's feature selection. Premium-feature "
+            "knobs are stripped unless MO_ACCEPT_PREMIUM=1 is included "
+            "(see `mini-ork features`)."
+        ),
+    ),
     home=Depends(get_home),
     operator: str = Depends(auth.require_token),
 ) -> dict[str, Any]:
     """Launch a recipe detached and return its run_id without blocking."""
-    result = control.launch_run(home, recipe, kickoff_markdown, run_id=run_id)
+    result = control.launch_run(
+        home, recipe, kickoff_markdown, run_id=run_id, extra_env=extra_env
+    )
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error", "launch failed"))
     result["operator"] = operator
