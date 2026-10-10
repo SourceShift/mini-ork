@@ -1,0 +1,19 @@
+name: session_task_judge
+description: >
+  Three-lane read-only judge panel. Judges MiniMax-M3 (minimax_lens),
+  GLM-5.3 (glm_lens), and DeepSeek-V4-Flash (deepseek_lens) independently
+  assess a session's pending tasks for positive impact vs staleness against
+  live repo + run state, each also grading the proposed solution for the
+  task, then a synthesizer reconciles the three reports into one verdict
+  matrix and execution order.
+matches:
+  keywords: ["session task judge", "judge pending tasks", "stale task panel", "task impact panel"]
+  patterns: []
+risk_class: low
+cost_model:
+  currency: USD
+  estimated_cost_min: 3
+  estimated_cost_max: 25
+  per_lens_estimate: 6
+default_gates:
+  - budget_gate

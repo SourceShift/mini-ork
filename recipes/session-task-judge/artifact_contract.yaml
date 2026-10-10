@@ -1,0 +1,29 @@
+# Bare names on purpose: the publisher resolves bare output names against
+# MINI_ORK_RUN_DIR, preserving them run-local — this panel is read-only with
+# respect to the repo, so nothing it produces belongs in the tree.
+version: 1
+task_class: session_task_judge
+
+expected_artifact:
+  kind: composite
+  description: >
+    Three judge reports (one per model family) + three structured sidecars
+    sharing one schema + one synthesis reconciling them.
+
+outputs:
+  - judge-minimax-tasks.md
+  - judge-glm-tasks.md
+  - judge-deepseek-tasks.md
+  - synthesis.md
+
+success_verifiers:
+  - verifiers/panel-completeness.py
+
+failure_policy: request_changes
+
+acceptance_criteria:
+  - every judge report carries the five sections in order with 12 verdict blocks (6 tasks + 6 solutions)
+  - every verdict/severity value comes from the fixed enum sets
+  - every sidecar shares one schema so the synthesizer can join mechanically
+  - the synthesis names all three lanes and every T/P id
+  - the panel made no edit to any repo source file
