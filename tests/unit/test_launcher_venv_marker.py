@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -23,13 +24,31 @@ _LAUNCHER = _ROOT / "bin" / "mini-ork"
 def _load_launcher():
     # The launcher calls ``os.execve`` at module scope. Disable the venv
     # re-exec before import or loading it would replace the pytest process.
+    #
+    # Loading it ALSO mutates process-global state at module scope: its
+    # ``_configure_paths`` writes MINI_ORK_HOME / MINI_ORK_PROJECT_HOME /
+    # MINI_ORK_ROOT / MINI_ORK_TARGET_REPO / MINI_ORK_ENGINE_ROOT into
+    # ``os.environ`` and ``sys.path.insert(0, ENGINE_ROOT)``. This load runs at
+    # MODULE scope, so anything left behind leaks into every later test in the
+    # shard — a later test's ``bin/mini-ork`` subprocess inherits the leaked
+    # MINI_ORK_PROJECT_HOME, which the launcher prefers over the test's own
+    # MINI_ORK_HOME, so that child resolves the wrong ``.mini-ork`` (wrong
+    # state.db, spurious mo-home upload). Snapshot and restore so the load is
+    # hermetic.
+    env_snapshot = dict(os.environ)
+    path_snapshot = list(sys.path)
     os.environ["MINI_ORK_USE_VENV"] = "0"
-    loader = SourceFileLoader("mini_ork_launcher_under_test", str(_LAUNCHER))
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    assert spec is not None
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    return module
+    try:
+        loader = SourceFileLoader("mini_ork_launcher_under_test", str(_LAUNCHER))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        assert spec is not None
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        return module
+    finally:
+        os.environ.clear()
+        os.environ.update(env_snapshot)
+        sys.path[:] = path_snapshot
 
 
 launcher = _load_launcher()

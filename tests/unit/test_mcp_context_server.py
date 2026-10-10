@@ -1663,10 +1663,24 @@ def test_draft_kickoff_writes_under_kickoff_drafts(
             "recipe": "code-fix",
             "kickoff_markdown": (
                 "# My Edit\n\n"
+                "## Goal\n"
+                "- make the thing work\n\n"
+                "## Problem\n"
+                "- it is broken\n\n"
+                "## Definition of Done\n"
+                "- it works\n\n"
                 "## Files in scope\n"
                 "- `present.py`\n\n"
+                "## Out of scope\n"
+                "- everything else\n\n"
                 "## Success criteria\n"
-                "- runs\n"
+                "- AC1: it runs\n\n"
+                "## Verification command\n"
+                "- `pytest -q`\n\n"
+                "## Model Preference\n"
+                "- any\n\n"
+                "## Notes\n"
+                "- none\n"
             ),
         },
     })

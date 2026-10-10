@@ -34,6 +34,12 @@ def test_dead_primary_falls_back_to_working_lane(tmp_path, monkeypatch):
     )
     (stub_bin / "codex").chmod(0o755)
     monkeypatch.setenv("PATH", f"{stub_bin}{os.pathsep}{os.environ['PATH']}")
+    # Pin the dispatch cwd in the ENVIRONMENT too, not just request.cwd. The
+    # codex transport re-derives its own guard cwd from MO_TARGET_CWD (falling
+    # back to os.getcwd()), so a checkout whose path contains `/mini-ork`
+    # (e.g. CI's /home/runner/work/mini-ork/mini-ork) would otherwise trip the
+    # framework-tree guard for a reason unrelated to fallback.
+    monkeypatch.setenv("MO_TARGET_CWD", str(tmp_path))
     # Force glm 'dead' (unset key → preflight fails instantly, standing in for a
     # hang). The chain must fall back to codex (stubbed) and succeed.
     monkeypatch.setenv("GLM_API_KEY", "")
@@ -49,6 +55,7 @@ def test_all_lanes_dead_returns_faithful_failure_not_hang(monkeypatch):
     monkeypatch.setenv("GLM_API_KEY", "")
     monkeypatch.setenv("KIMI_API_KEY", "")
     monkeypatch.setenv("MINIMAX_API_KEY", "")
+    monkeypatch.setenv("MO_TARGET_CWD", "/tmp")  # keep the transport cwd guard off the ambient cwd
     req = DispatchRequest(model="glm", prompt="x", timeout_s=10, cwd="/tmp")
     r = dispatch_with_fallback(req, ["glm", "kimi", "minimax"])
     assert not r.ok

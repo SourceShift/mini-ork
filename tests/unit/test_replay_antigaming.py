@@ -275,6 +275,12 @@ def _run_main(mod, monkeypatch, audit_verdict, capsys, *, replay=None):
     from mini_ork.gates import suite_adequacy as sa
 
     monkeypatch.setattr(mod, "run_suite", lambda log, env=None: 0)
+    # Isolate the weak-f2p/adequacy logic from the replay-applicability gate
+    # (decided off the test command BEFORE any replay runs). These unit tests pin
+    # the post-replay decision, so the gate is stubbed "applicable" — exactly as
+    # ``_run_replay_check`` is already stubbed. The gate itself is covered by
+    # tests/unit/test_verify_levels.py.
+    monkeypatch.setattr(mod, "_replay_applies", lambda *a, **k: True)
     monkeypatch.setattr(
         mod, "_run_replay_check",
         lambda: dict(replay if replay is not None else _WEAK_REPLAY),

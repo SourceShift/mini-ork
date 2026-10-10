@@ -207,13 +207,23 @@ def test_unrunnable_baseline_is_not_a_red_baseline(tmp_path):
         extra_env={"MINI_ORK_TEST_CMD": "python3 ./runner.py"},
     )
 
-    assert rc == 1, out
+    # An un-attributable baseline ABSTAINS (exit 0, status unverified) — it must
+    # not `emit()` (exit 1), which the executor's revise loop reads as a fixable
+    # gate failure and answers with a full implementer round spent on an
+    # environment collision the patch cannot fix.
+    assert rc == 0, out
     assert out["pass"] is False, out
+    assert out["status"] == "unverified", out
+    assert out["base_unrunnable"] is True, out
     assert "did not execute tests" in out["error_summary"], out
 
 
-def test_missing_test_binary_fails_rather_than_abstains(tmp_path):
-    """Both sides rc 127 — the live jest-without-node_modules shape."""
+def test_missing_test_binary_abstains_rather_than_fails(tmp_path):
+    """Both sides rc 127 — the live jest-without-node_modules shape.
+
+    A missing runner is NOT a red baseline: it abstains (exit 0) so the gate
+    neither certifies nor burns a revise round on an environment collision.
+    """
     repo = _make_repo(tmp_path, {"mod.py": RED_MOD, "test_a.py": RED_TEST})
 
     rc, out = _run_verifier(
@@ -221,13 +231,18 @@ def test_missing_test_binary_fails_rather_than_abstains(tmp_path):
         extra_env={"MINI_ORK_TEST_CMD": "./node_modules/.bin/jest --ci"},
     )
 
-    assert rc == 1, out
+    assert rc == 0, out
     assert out["pass"] is False, out
+    assert out["base_unrunnable"] is True, out
     assert "did not execute tests" in out["error_summary"], out
 
 
 def test_legacy_hatch_cannot_pass_an_unrunnable_baseline(tmp_path):
-    """MO_TEST_LEGACY_RED_BASE is checked AFTER the runnability classification."""
+    """MO_TEST_LEGACY_RED_BASE is checked AFTER the runnability classification.
+
+    The hatch cannot blanket-PASS a baseline that never ran; the runnability
+    classification abstains first (exit 0, `base_unrunnable`), never `pass:true`.
+    """
     repo = _make_repo(tmp_path, {"mod.py": RED_MOD, "test_a.py": RED_TEST})
 
     rc, out = _run_verifier(
@@ -238,8 +253,9 @@ def test_legacy_hatch_cannot_pass_an_unrunnable_baseline(tmp_path):
         },
     )
 
-    assert rc == 1, out
+    assert rc == 0, out
     assert out["pass"] is False, out
+    assert out["base_unrunnable"] is True, out
 
 
 # ── 6. env scrub: MO_CANARY does not leak into the child suite ──────────────

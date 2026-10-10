@@ -385,8 +385,20 @@ WORKFLOW = (
 )
 
 
+# The implementer's emitted unified diff (MOD_BUG → MOD_FIX). Written as
+# impl-<node>.log so the publisher's authored-patch resolver has a source.
+_AUTHORED_DIFF = (
+    "--- a/mod.py\n"
+    "+++ b/mod.py\n"
+    "@@ -1,2 +1,2 @@\n"
+    " def add(a, b):\n"
+    "-    return a - b\n"
+    "+    return a + b\n"
+)
+
+
 def _drive_main(tmp_path, monkeypatch, *, repo, run_id, test_cmd, knob,
-                extra_env=None):
+                extra_env=None, authored=False):
     """Stand up a real home/db/run-dir/workflow, run the REAL verifier + publisher
     through ``ex.main``, and return ``(rc, db, rd)``."""
     home = tmp_path / "mo-home"
@@ -409,6 +421,14 @@ def _drive_main(tmp_path, monkeypatch, *, repo, run_id, test_cmd, knob,
     # The real git-derived implementer summary the publisher commit gate reads,
     # and a reviewer stand-in (the vector never reads it).
     ex._write_implementer_summary(str(rd), str(repo), "impl.log")
+    if authored:
+        # The publisher commits ONLY the run's authored patch
+        # (mini_ork/cli/publisher_authored_patch.py): with a pre-implementer-ref
+        # baseline present, the declared files_changed is a whole-file TREE delta
+        # and is not a source. Stand in the implementer's own emitted unified diff
+        # (the text apply_impl_output applies with `git apply`) so a run whose
+        # levels are PROVEN actually publishes.
+        (rd / "impl-test.log").write_text(_AUTHORED_DIFF)
     (rd / "review-verdict.json").write_text(json.dumps({"verdict": "pass"}))
 
     env = {
@@ -451,7 +471,7 @@ def test_real_strong_knob_on(tmp_path, monkeypatch):
     (repo / "mod.py").write_text(MOD_FIX)  # uncommitted fix
     rc, db, rd = _drive_main(tmp_path, monkeypatch, repo=repo, run_id="r9",
                              test_cmd=PYTEST_CMD, knob=True,
-                             extra_env={"MO_SUITE_ADEQUACY": "0"})
+                             extra_env={"MO_SUITE_ADEQUACY": "0"}, authored=True)
     assert rc == 0
 
     verdict = json.loads((rd / "verdict.json").read_text())
@@ -482,7 +502,7 @@ def test_real_opaque_delta_knob_on(tmp_path, monkeypatch):
     repo = _make_repo(tmp_path, mod_src=MOD_BUG, test_src=TEST_UNITTEST)
     (repo / "mod.py").write_text(MOD_FIX)
     rc, db, rd = _drive_main(tmp_path, monkeypatch, repo=repo, run_id="r10",
-                             test_cmd=UNITTEST_CMD, knob=True)
+                             test_cmd=UNITTEST_CMD, knob=True, authored=True)
     assert rc == 0
 
     payload = L.read_verifier_payload(str(rd / "verifier_test.json"), "test")
@@ -515,7 +535,7 @@ def test_real_replay_abstain_knob_off(tmp_path, monkeypatch):
     (repo / "mod.py").write_text(MOD_FIX)
     rc, db, rd = _drive_main(tmp_path, monkeypatch, repo=repo, run_id="r11",
                              test_cmd=UNITTEST_CMD, knob=False,
-                             extra_env={"MO_LEVEL_VECTOR": "0"})
+                             extra_env={"MO_LEVEL_VECTOR": "0"}, authored=True)
     assert rc == 0
 
     # verdict.json is the old literal bytes (today's gap: the abstention publishes)

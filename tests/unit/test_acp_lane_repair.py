@@ -76,6 +76,19 @@ def _fast_lane_repair(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _stub_setup_readiness(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Neutralise the orchestrator readiness gate on thread setup.
+
+    ``_enforce_thread_setup`` shells out to the ambient orchestrator check
+    (``claude auth status``) and raises ``RequestError.auth_required`` when it
+    fails — true on a bare CI runner with no login. This file is explicitly
+    hermetic (no lane, no network, no subprocess), so the gate must not consult
+    the ambient install; the same seam is stubbed in
+    ``tests/unit/test_acp_agent_py.py``. The gate itself is covered there."""
+    monkeypatch.setattr("mini_ork.acp.agent._setup_readiness_for_thread", lambda cwd: [])
+
+
+@pytest.fixture(autouse=True)
 def _catalog(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "mini_ork.acp_orchestrator.config.orchestrator_lanes",
