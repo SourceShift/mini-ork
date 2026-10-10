@@ -38,8 +38,39 @@ def last_route_provenance() -> dict:
     return dict(_ROUTE_PROVENANCE.get())
 
 
-def dispatch_chain(node_type: str, lead: str) -> str:
-    """Lead lane + role-category fallback tail, comma-joined, order-preserving dedup."""
+def _registry_known_lanes(root: str | None) -> set[str] | None:
+    """Lane names present in the providers registry, or None when unavailable.
+
+    Registry membership is what ``resolve_provider`` / preflight enforce — a
+    tail entry without a ``providers.yaml`` entry cannot dispatch at all — so
+    the SAME source decides whether it belongs in a fallback chain. None means
+    "could not read" and the caller fails open (the dead entry then surfaces
+    loudly at preflight, exactly as before).
+    """
+    try:
+        from mini_ork.dispatch.providers import _load_providers_registry
+        # An EMPTY registry (no file, or one with no providers) fails open:
+        # nothing can dispatch then — the lead included — so filtering the tail
+        # changes nothing but couples the chain to ambient config. Only a
+        # registry that actually declares lanes decides what the tail may hold.
+        return set(_load_providers_registry(root)) or None
+    except Exception:
+        return None
+
+
+def dispatch_chain(node_type: str, lead: str, root: str | None = None) -> str:
+    """Lead lane + role-category fallback tail, comma-joined, order-preserving dedup.
+
+    Tail entries that have no providers.yaml entry are DROPPED (with a stderr
+    note), because they can never serve — they only convert a lead-lane failure
+    into the misleading terminal error ``lane preflight failed: unknown lane:
+    'sonnet'`` instead of the lead's real error (observed 2026-10-10: a
+    quota-dead minimax lead walked the review tail to the unmapped builtin
+    ``sonnet`` and the run failed naming the wrong lane). The LEAD is never
+    filtered: it is explicit intent (workflow pin or operator override), and a
+    typo there should fail loud. ``MO_FALLBACK_*`` overrides are still honoured,
+    filtered by the same rule.
+    """
     tail = ""
     if node_type in _CODING_ROLES:
         tail = os.environ.get("MO_FALLBACK_CODING", "minimax,codex,sonnet")
@@ -53,6 +84,15 @@ def dispatch_chain(node_type: str, lead: str) -> str:
         if x and x not in seen:
             seen.add(x)
             out.append(x)
+    known = _registry_known_lanes(root)
+    if known is not None and out[1:]:
+        kept = [out[0]] + [x for x in out[1:] if x in known]
+        for dead in [x for x in out[1:] if x not in known]:
+            sys.stderr.write(
+                f"[dispatch] fallback tail lane {dead!r} has no providers.yaml "
+                f"entry — dropping from chain\n"
+            )
+        out = kept
     return ",".join(out)
 
 

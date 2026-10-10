@@ -119,10 +119,20 @@ def test_bash_python_parity():
             assert ex.reward_from_status(s, v) == expected
 
 
-def test_dispatch_chain_parity():
+def test_dispatch_chain_parity(tmp_path):
     old = dict(os.environ)
+    # Pin the providers registry to a fixture that declares every lane the
+    # golden chains name: without this, chain filtering reads whichever
+    # providers.yaml the ambient CWD/home resolves to (home registry in a
+    # primary checkout vs repo registry in CI differ in their lane sets) and
+    # the parity golden would pass or fail on the operator's local config.
+    registry = tmp_path / "providers.yaml"
+    registry.write_text("providers:\n" + "".join(
+        f"  {lane}:\n    kind: openai-chat\n    model: m-{lane}\n    api_key_env: K_{lane.upper()}\n"
+        for lane in ("minimax", "codex", "sonnet", "opus", "kimi", "glm")))
     os.environ.update({"MO_FALLBACK_CODING": "minimax,codex,sonnet",
-                       "MO_FALLBACK_REVIEW": "opus,kimi,sonnet"})
+                       "MO_FALLBACK_REVIEW": "opus,kimi,sonnet",
+                       "MINI_ORK_PROVIDERS": str(registry)})
     cases = {
         ("implementer", "minimax"): "minimax,codex,sonnet",
         ("implementer", "glm"): "glm,minimax,codex,sonnet",

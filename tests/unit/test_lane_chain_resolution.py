@@ -79,3 +79,74 @@ def test_chain_lead_is_family_not_alias(tmp_path, monkeypatch):
     parts = chain.split(",")
     assert parts[0] == "codex", f"chain lead must be codex, got {parts[0]!r} in {chain!r}"
     assert parts.index("codex") < parts.index("minimax")
+
+
+# ── fallback-tail lane filtering (2026-10-10) ────────────────────────────────
+# RATCHET set: a dead tail lane (no providers.yaml entry) must be DROPPED from
+# the chain, not walked into a terminal "unknown lane" preflight error that
+# masks the lead's real failure. Observed live: quota-dead minimax lead →
+# review tail walked to unmapped `sonnet` → run failed naming the wrong lane.
+
+def _write_providers(tmp_path, *lanes):
+    home = tmp_path / ".mini-ork"
+    (home / "config").mkdir(parents=True, exist_ok=True)
+    (home / "config" / "providers.yaml").write_text("providers:\n" + "".join(
+        f"  {lane}:\n    kind: openai-chat\n    model: m-{lane}\n"
+        f"    api_key_env: K_{lane.upper()}\n" for lane in lanes))
+    return str(home)
+
+
+def test_dead_tail_lane_dropped(tmp_path, monkeypatch, capsys):
+    home = _write_providers(tmp_path, "minimax", "codex")  # no sonnet
+    monkeypatch.setenv("MINI_ORK_HOME", home)
+    monkeypatch.setenv("MINI_ORK_ROOT", home)
+    monkeypatch.delenv("MO_FALLBACK_CODING", raising=False)
+    chain = dispatch_chain("implementer", "codex", root=home)
+    assert chain == "codex,minimax", chain
+    assert "sonnet" in capsys.readouterr().err  # the drop is logged, not silent
+
+
+def test_registered_tail_lane_kept(tmp_path, monkeypatch):
+    home = _write_providers(tmp_path, "minimax", "codex", "sonnet")
+    monkeypatch.setenv("MINI_ORK_HOME", home)
+    monkeypatch.setenv("MINI_ORK_ROOT", home)
+    chain = dispatch_chain("implementer", "codex", root=home)
+    assert chain == "codex,minimax,sonnet", chain
+
+
+def test_lead_never_filtered(tmp_path, monkeypatch):
+    # The lead is explicit intent — an unregistered lead must stay so preflight
+    # fails loud with ITS name, not be silently swallowed by the filter.
+    home = _write_providers(tmp_path, "minimax", "codex")
+    monkeypatch.setenv("MINI_ORK_HOME", home)
+    monkeypatch.setenv("MINI_ORK_ROOT", home)
+    chain = dispatch_chain("implementer", "ghost_lead", root=home)
+    assert chain.split(",")[0] == "ghost_lead", chain
+
+
+def test_env_override_tail_also_filtered(tmp_path, monkeypatch):
+    home = _write_providers(tmp_path, "minimax")
+    monkeypatch.setenv("MINI_ORK_HOME", home)
+    monkeypatch.setenv("MINI_ORK_ROOT", home)
+    monkeypatch.setenv("MO_FALLBACK_CODING", "ghost,minimax")
+    chain = dispatch_chain("implementer", "minimax", root=home)
+    assert chain == "minimax", chain  # ghost dropped, minimax deduped into lead
+
+
+def test_broken_registry_fails_open(tmp_path, monkeypatch):
+    bad = tmp_path / "providers.yaml"
+    bad.write_text("providers: [not, a, mapping]\n")
+    monkeypatch.setenv("MINI_ORK_PROVIDERS", str(bad))
+    monkeypatch.delenv("MO_FALLBACK_REVIEW", raising=False)
+    chain = dispatch_chain("reviewer", "opus", root=str(tmp_path))
+    # Unreadable registry → no filtering → the dead entry surfaces at preflight.
+    assert chain == "opus,kimi,sonnet", chain
+
+
+def test_empty_registry_fails_open(tmp_path, monkeypatch):
+    empty = tmp_path / "providers.yaml"
+    empty.write_text("providers: {}\n")
+    monkeypatch.setenv("MINI_ORK_PROVIDERS", str(empty))
+    monkeypatch.delenv("MO_FALLBACK_CODING", raising=False)
+    chain = dispatch_chain("implementer", "codex", root=str(tmp_path))
+    assert chain == "codex,minimax,sonnet", chain

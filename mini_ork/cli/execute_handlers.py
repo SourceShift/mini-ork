@@ -527,7 +527,7 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     # dispatch backend routes around a hung/flaky lead lane (bash:2224-2225, NEW-5).
     from mini_ork.dispatch.llm_dispatch import resolve_lane_family
     _chain_lead = resolve_lane_family(lane)
-    publish_env({ENV_DISPATCH_CHAIN: dispatch_chain(node_type, _chain_lead)})
+    publish_env({ENV_DISPATCH_CHAIN: dispatch_chain(node_type, _chain_lead, root)})
 
     # ── Pre-dispatch gates, in bash _dispatch_node order (:2231-2318). These run
     # for every real dispatch; the dry-run preview path is _dry_dispatch_node. ──

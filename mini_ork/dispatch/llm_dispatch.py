@@ -567,7 +567,7 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
     if accept_fn is not None and not model_override and "," not in str(model):
         try:
             from mini_ork.dispatch.routing import dispatch_chain
-            model = dispatch_chain(node_type, resolve_lane_family(model, root, home))
+            model = dispatch_chain(node_type, resolve_lane_family(model, root, home), root)
         except Exception:
             pass
 
