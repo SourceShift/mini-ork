@@ -1,0 +1,4 @@
+[submodule "ui"]
+	path = ui
+	url = https://github.com/SourceShift/mini-ork-ui.git
+	branch = main
