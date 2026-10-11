@@ -38,9 +38,11 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from mini_ork.ide_pages import _lanes
 from mini_ork.ide_pages import spec as S
 from mini_ork.ide_pages.node_changes import (
     MD_FILE_CAP,
@@ -79,7 +81,8 @@ _KIND_STEER = "steer"
 _KIND_NOTE = "note"
 
 _DEFAULT_VIEW = "overview"
-_VIEWS = ("stream", "output", "prompt", "telemetry", "learning", "changes", "overview", "artifacts")
+_VIEWS = ("stream", "output", "prompt", "telemetry", "learning", "changes", "overview",
+          "artifacts", "harness")
 
 # Map a node's ``type`` (workflow role) onto an ``operator_steering`` role.
 # ``_fetch_steer_rows`` keys on this map so the IDE stream shows only rows
@@ -3200,6 +3203,228 @@ def _candidates_with_path(path: Path, candidates: list[tuple[str, Path]]) -> boo
     return any(str(c[1]) == str(path) for c in candidates)
 
 
+# ── harness view ────────────────────────────────────────────────────────────
+
+def _harness_view(home: Path, run: Run, node: Node, run_dir: Path) -> dict[str, Any]:
+    """The node's declared harness: native tools, MCP servers, skills, agent doc.
+
+    Every value is a *resolution* of the node's own declaration against the
+    registries — never a claim about what the node did. The two on-disk records
+    that look like they would answer this cannot:
+    ``providers._write_node_mcp_config`` writes ``<run_dir>/.mcp-config.json``
+    once per run and each node's dispatch overwrites it (last-writer-wins), and
+    it holds fully expanded secrets; ``skill_registry.materialize_skills``
+    symlinks the granted skills into the working tree and ``release()`` removes
+    them when the node ends. So the view says "configured" / "not found", never
+    "linked" or "used".
+    """
+    recipe = str((run.card or {}).get("recipe") or (run.row or {}).get("recipe") or "")
+    document = _lanes.workflow_yaml(home, recipe) if recipe else {}
+    declared = _declared_node(document, node.id)
+    env = _harness_env(home, run_dir)
+
+    # Lazy imports: no module under ``ide_pages/`` imports ``dispatch/`` at
+    # module load, and ``providers`` alone costs ~90 ms.
+    from mini_ork.dispatch.mcp_registry import load_registry, node_mcp_grants
+    from mini_ork.dispatch.skill_registry import load_skills, node_skill_names
+
+    grants = node_mcp_grants(declared) if declared else ()
+    skills = node_skill_names(declared) if declared else ()
+    try:
+        registry = load_registry(env)
+    except Exception:  # noqa: BLE001 — a broken registry must not blank the tab
+        registry = {}
+    try:
+        available = load_skills(env)
+    except Exception:  # noqa: BLE001
+        available = {}
+
+    items: list[dict[str, Any]] = []
+    for name in grants:
+        items.append(_mcp_item(name, registry))
+    for name in skills:
+        source = available.get(name)
+        if source is None:
+            items.append(S.warn(f"skill · {name}",
+                                "not found in any skill directory — the node would "
+                                "run without it"))
+        else:
+            items.append(S.ok(f"skill · {name}", f"available · {source}"))
+    if not items:
+        items.append(S.item("No MCP servers or skills",
+                            "this node runs with its declared tools only"))
+
+    tools_blk = declared.get("tools") if isinstance(declared.get("tools"), dict) else {}
+    native = _as_names(tools_blk.get("native")) if tools_blk else []
+    if native:
+        native_v, native_c = ", ".join(native), "text"
+        native_note = "tools: declared in the recipe"
+    else:
+        from mini_ork.dispatch.providers import _mo_default_tools_for_type  # lazy: heavy import
+        default = _pretty_tools(_mo_default_tools_for_type(node.type).split("|", 1)[0])
+        native_v, native_c = default, "muted"
+        native_note = (f"tools: not declared — dispatch would apply the "
+                       f"{node.type or 'node'} default ({default})")
+
+    kv = [
+        {"k": "Role (agents.yaml)", "v": node.role_lane or "—", "c": "text"},
+        {"k": "Lane served", "v": node.family or "—", "c": "text"},
+        {"k": "Lane declared", "v": _declared_lane(home, run_dir, node.role_lane), "c": "text"},
+        {"k": "Stage", "v": str(_stage_for(run, node)), "c": "text"},
+        {"k": "Native tools", "v": native_v, "c": native_c},
+        {"k": "MCP servers", "v": str(len(grants)) if grants else "none",
+         "c": "text" if grants else "muted"},
+        {"k": "Skills", "v": str(len(skills)) if skills else "none",
+         "c": "text" if skills else "muted"},
+    ]
+
+    block: list[dict[str, str]] = [
+        {"t": f"node type: {node.type or '—'}", "c": "text"},
+        {"t": native_note, "c": "muted"},
+    ]
+    if recipe and declared:
+        block.append({"t": f"read from recipes/{recipe}/workflow.yaml", "c": "muted"})
+    elif recipe:
+        block.append({"t": f"no node named {node.id!r} in recipes/{recipe}/workflow.yaml",
+                      "c": "muted"})
+    else:
+        block.append({"t": "no recipe recorded on this run — harness unknown", "c": "muted"})
+    block.append({
+        "t": "Effective tools are MO_RESOLVED_NODE_TOOLS → the node's tools: block → "
+             "the type default. Only the latter two are visible here: a dispatch-time "
+             "override is not recorded per node.",
+        "c": "muted",
+    })
+
+    out: dict[str, Any] = {
+        "kv": kv,
+        "block_title": f"Harness · {recipe or 'unknown recipe'}",
+        "block": block,
+        "list_title": "MCP servers & skills · declared grants",
+        "list": items,
+    }
+    agent_doc = str(declared.get("agent_doc") or "") if declared else ""
+    if agent_doc:
+        doc = _agent_doc_markdown(agent_doc, run.recipe_dir)
+        if doc is not None:
+            out["markdown"] = doc
+    return out
+
+
+def _declared_node(document: dict[str, Any], node_id: str) -> dict[str, Any]:
+    """The recipe's node block for ``node_id``.
+
+    Matches ``-``/``_`` spelling variants the way
+    ``providers._resolve_node_tools_from_yaml`` does, because a recipe node name
+    and the run's node id do not always agree on the separator.
+    """
+    if not document:
+        return {}
+    target = node_id.replace("-", "_")
+    for raw in document.get("nodes") or []:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        if name == node_id or name.replace("-", "_") == target:
+            return raw
+    return {}
+
+
+def _as_names(value: Any) -> list[str]:
+    """A ``tools:``/``skills:`` value as a list, accepting both YAML shapes."""
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if isinstance(value, (list, tuple)):
+        return [str(part).strip() for part in value if str(part).strip()]
+    return []
+
+
+def _pretty_tools(csv: str) -> str:
+    return ", ".join(part for part in (p.strip() for p in csv.split(",")) if part)
+
+
+def _mcp_item(name: str, registry: Mapping[str, Mapping[str, object]]) -> dict[str, Any]:
+    """One ``mcp · <name>`` list item: its transport and whether a dispatch would
+    accept it.
+
+    The transport is read from the **unexpanded** registry entry —
+    ``normalize_entry`` does not substitute ``${NAME}`` — so a ``${TOKEN}``
+    header stays a placeholder and no secret reaches the panel. Never call
+    ``resolve_grant``/``scoped_config`` here: both expand.
+    """
+    from mini_ork.dispatch.mcp_registry import McpRegistryError, normalize_entry
+
+    raw = registry.get(name)
+    if raw is None:
+        return S.warn(f"mcp · {name}",
+                      "not in the registry — dispatch substitutes a no-op stub")
+    if raw.get("enabled") is False:
+        return S.bad(f"mcp · {name}",
+                     "disabled in the registry — dispatch would refuse this node")
+    try:
+        entry = normalize_entry(name, raw)
+    except McpRegistryError as exc:
+        return S.bad(f"mcp · {name}", str(exc))
+    return S.ok(f"mcp · {name}", _transport_of(entry))
+
+
+def _transport_of(entry: Mapping[str, object]) -> str:
+    command = entry.get("command")
+    if command:
+        args = " ".join(str(arg) for arg in (entry.get("args") or []))
+        return f"stdio · {command} {args}".strip()
+    url = str(entry.get("url") or "")
+    return f"{entry.get('type') or 'http'} · {url}".strip()
+
+
+def _declared_lane(home: Path, run_dir: Path, role: str) -> str:
+    """The provider lane ``agents.yaml`` declares for ``role`` (may differ from
+    the lane that served the node after a re-point — that difference is signal)."""
+    if not role:
+        return "—"
+    try:
+        return _lanes.lane_map(home, run_dir).get(role) or "—"
+    except Exception:  # noqa: BLE001 — a missing agents.yaml is not a page error
+        return "—"
+
+
+def _agent_doc_markdown(agent_doc: str, recipe_dir: Path | None) -> dict[str, Any] | None:
+    """The declared agent doc as a markdown block, or ``None`` when it is empty.
+
+    The file is resolved against ``recipe_dir`` the way ``_resolve_prompt_file``
+    resolves a prompt ref; when no file matches, the literal ref is shown. The
+    rendered ``path`` gives the IDE's Open button something to open.
+    """
+    path: str | None = None
+    if recipe_dir is not None:
+        candidate = Path(recipe_dir) / agent_doc
+        if candidate.is_file():
+            path = str(candidate)
+    text = agent_doc
+    if path is not None:
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = agent_doc
+    if not text.strip():
+        return None
+    return {"title": "agent_doc · declared", "text": text[:MD_FILE_CAP], "path": path or ""}
+
+
+def _harness_env(home: Path, run_dir: Path) -> dict[str, str]:
+    """The three vars ``mcp_registry.registry_paths`` and
+    ``skill_registry.skill_source_dirs`` read, so the tab resolves exactly the
+    registry a dispatch would.
+
+    The IDE process sets none of them (``board_cmd.main`` deletes its own), so
+    without this mapping every node would read as unconfigured — the worst
+    failure mode for this feature.
+    """
+    root = os.environ.get("MINI_ORK_ROOT") or str(Path(__file__).resolve().parents[2])
+    return {"MINI_ORK_HOME": str(home), "MINI_ORK_RUN_DIR": str(run_dir),
+            "MINI_ORK_ROOT": root}
+
+
 # ── public builder ──────────────────────────────────────────────────────────
 
 def build_node(home: Path, run_id: str, node_id: str, view: str | None = None,
@@ -3391,6 +3616,8 @@ def build_node(home: Path, run_id: str, node_id: str, view: str | None = None,
     elif view == "artifacts":
         from mini_ork.ide_pages.node_artifacts import build_artifacts_view  # lazy: breaks import cycle
         base.update(build_artifacts_view(run_obj, target))  # {"inputs": [...], "outputs": [...]}
+    elif view == "harness":
+        base.update(_harness_view(home, run_obj, target, run_dir))
     return base
 
 

@@ -147,6 +147,21 @@ def materialize_skills(
     return handle
 
 
+def node_skill_names(node: Mapping[str, object]) -> tuple[str, ...]:
+    """The skill names one workflow node declares (empty when it declares none).
+
+    ``skills:`` accepts either a CSV string or a YAML list; both shapes appear in
+    recipes. Shared with the IDE's node inspector so it and ``granted_skills``
+    read a node's grants the same way.
+    """
+    declared = node.get("skills") or ()
+    if isinstance(declared, str):
+        return tuple(part.strip() for part in declared.split(",") if part.strip())
+    if isinstance(declared, (list, tuple)):
+        return tuple(str(part).strip() for part in declared if str(part).strip())
+    return ()
+
+
 def granted_skills(
     compiled_workflow: object, node_id: str
 ) -> tuple[str, ...]:
@@ -154,7 +169,4 @@ def granted_skills(
     nodes = getattr(compiled_workflow, "nodes", None)
     if not isinstance(nodes, Mapping) or node_id not in nodes:
         return ()
-    declared = getattr(nodes[node_id], "skills", ())
-    if isinstance(declared, str):
-        return tuple(part.strip() for part in declared.split(",") if part.strip())
-    return tuple(declared or ())
+    return node_skill_names({"skills": getattr(nodes[node_id], "skills", ())})

@@ -24,6 +24,7 @@ import yaml
 from mini_ork.dispatch.mcp_registry import (
     McpRegistryError,
     load_registry,
+    node_mcp_grants,
     operator_registry_path,
     registry_paths,
     resolve_grant,
@@ -232,19 +233,9 @@ def workflow_mcp_grants(workflow: str | Path) -> list[tuple[str, tuple[str, ...]
         node_id = str(node.get("name") or "").strip()
         if not node_id:
             continue
-        servers: list[str] = []
-        tools = node.get("tools")
-        if isinstance(tools, Mapping):
-            for token in str(tools.get("mcp") or "").strip("[]").split(","):
-                if token.strip().strip("'\""):
-                    servers.append(token.strip().strip("'\""))
-        declared = node.get("mcp_servers") or []
-        if isinstance(declared, str):
-            declared = declared.split(",")
-        if isinstance(declared, list):
-            servers.extend(str(item).strip() for item in declared if str(item).strip())
+        servers = node_mcp_grants(node)
         if servers:
-            grants.append((node_id, tuple(dict.fromkeys(servers))))
+            grants.append((node_id, servers))
     return grants
 
 

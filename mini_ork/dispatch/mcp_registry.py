@@ -112,6 +112,29 @@ def load_registry(env: Mapping[str, str] | None = None) -> dict[str, dict]:
     return merged
 
 
+def node_mcp_grants(node: Mapping[str, object]) -> tuple[str, ...]:
+    """The MCP server names one workflow node grants, deduplicated in grant order.
+
+    Reads both grant surfaces — the ``tools.mcp`` block and the ``mcp_servers``
+    envelope — because a server reachable through either one still has to
+    resolve, and a check that read only one would pass a workflow that fails.
+    Lives here rather than in the CLI so ``mini-ork mcp check`` and the IDE's
+    node inspector resolve a node's grants through one implementation.
+    """
+    servers: list[str] = []
+    tools = node.get("tools")
+    if isinstance(tools, Mapping):
+        for token in str(tools.get("mcp") or "").strip("[]").split(","):
+            if token.strip().strip("'\""):
+                servers.append(token.strip().strip("'\""))
+    declared = node.get("mcp_servers") or []
+    if isinstance(declared, str):
+        declared = declared.split(",")
+    if isinstance(declared, list):
+        servers.extend(str(item).strip() for item in declared if str(item).strip())
+    return tuple(dict.fromkeys(servers))
+
+
 # ── placeholder resolution ───────────────────────────────────────────────────
 
 
