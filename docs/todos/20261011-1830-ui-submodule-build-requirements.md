@@ -1,7 +1,8 @@
 # UI submodule: can a user build the Rust IDE from the mini-ork repo?
 
 **Asked:** 2026-10-11 18:30
-**Status:** open — 1 requirement impossible as stated, 4 unsatisfied.
+**Status:** open — R1 and R2 done (`6ba54378`); R3, R4, R5 open. The "build the
+IDE from mini-ork" part cannot be met as stated, for the reason above.
 
 ## The question
 
@@ -22,21 +23,17 @@ and both `ui/README.md` and the fork's `MINI-ORK.md` say so.
 ## Requirements, and where each stands
 
 ### R1 — A clone of mini-ork should give a usable tree
-**Status:** PARTIAL.
-`README.md:218` says `git clone https://github.com/SourceShift/mini-ork.git`
-with no `--recurse-submodules`, so `ui/` lands **empty** — verified against a
-fresh clone. Nothing warns the user; the directory just looks like an empty folder
-that was never populated.
-**Remaining:** add `--recurse-submodules` (or a `git submodule update --init`
-line) to the quick-start, and one sentence saying the Python side works without it.
+**Status:** SATISFIED (`6ba54378`).
+`README.md:218` clones with `--recurse-submodules`, and `:226` says the Python
+runtime works without `ui/` filled. `install.sh:81` runs `git submodule update
+--init --recursive --depth 1` best-effort and prints the retry command when it
+fails, so an install never leaves the crate empty and silent about it.
 
 ### R2 — A user should be able to build the Rust IDE, documented from mini-ork
-**Status:** NOT SATISFIED.
-`docs/UI.md` names where the crate lives but never says how to build the IDE. A
-reader is left holding a submodule with no path forward.
-**Remaining:** a short "Building the IDE" section in `docs/UI.md` — clone
-`SourceShift/zed-mini-ork --recurse-submodules`, run `script/mini-ork-build`,
-`open -a "mini-ork IDE"`. Two commands and a pointer to `MINI-ORK.md`.
+**Status:** SATISFIED (`6ba54378`).
+`docs/UI.md:17` is a "Building the IDE" section: clone
+`SourceShift/zed-mini-ork --recurse-submodules`, `script/mini-ork-build`, then
+`open -a "mini-ork IDE"`, pointing at the fork's `MINI-ORK.md` for the rest.
 
 ### R3 — Worktrees should carry the crate
 **Status:** NOT SATISFIED.
@@ -80,5 +77,6 @@ limitation where a user will find it.
 
 ## Suggested order
 
-R1 and R2 are documentation and take minutes. R4 is the live one — a shipped test
-is silently blind to it. R3 and R5 are tooling changes and want a decision first.
+R1 and R2 are done. **R4 is the live one** — a shipped test is silently blind to
+it, so the suite reports green over a broken path. R3 and R5 are tooling changes
+and want a decision first (materialise, or document).
