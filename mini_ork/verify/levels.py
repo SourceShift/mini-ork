@@ -41,9 +41,25 @@ LEVELS = ("applies", "executes", "target", "preserve", "contract")
 NA = "n/a"
 VALUES = (PROVEN, REFUTED, UNVERIFIED, NA)
 
-# The ONLY declaration point for required levels. `contract` stays unrequired
-# until a contract producer is wired into the code-fix workflow.
-REQUIRED_LEVELS = {"code_fix": ("applies", "executes", "target", "preserve")}
+# The ONLY declaration point for required levels. `code_fix` proves the
+# tree-change quartet through its own instruments. `verified_artifact` proves
+# `contract` through its recipe verifier's published evidence (see
+# `_contract_from_recipe_verifiers`) — the artifact recipe changes no source
+# tree, so its only provable level is the contract its deterministic verifier
+# checks (run-1791736854: verdict.json said publish with every level UNVERIFIED
+# while evidence/schema.log held a full pass).
+REQUIRED_LEVELS = {
+    "code_fix": ("applies", "executes", "target", "preserve"),
+    "verified_artifact": ("contract",),
+}
+
+# Classes whose recipes change a source tree and therefore OWN the
+# applies/executes/target/preserve instruments (implementer-summary.json and
+# verifier_test.json are both written by code-fix-shaped nodes). For any other
+# class an ABSENT instrument is n/a (the level cannot apply to the recipe), not
+# UNVERIFIED — abstention is reserved for "the instrument ran and could not
+# prove", never for "this recipe never had the instrument".
+_CODE_EDIT_CLASSES = {"code_fix"}
 
 
 def required_levels(task_class):
@@ -99,13 +115,98 @@ def _read_json_dict(path):
     return data if isinstance(data, dict) else None
 
 
-def derive_levels(run_dir):
+# Evidence files that are NOT contract instruments: the code-fix test replay
+# and the behavioral verifier own their levels; every other verifier_<stem>.json
+# at the run root is a recipe verifier's declared output.
+_CONTRACT_EVIDENCE_EXCLUDE = {"verifier_test.json", "verifier_behavioral.json"}
+
+
+def _read_verifier_evidence(path):
+    """The last JSON object in ``path`` shaped like a recipe verifier's envelope.
+
+    Recipe verifier evidence (e.g. verified-artifact's schema.py) is published
+    as merged stdout+stderr followed by a pretty-printed
+    ``{"pass": bool, "checks": [{"id", "pass", "gating", ...}, ...]}`` envelope.
+    Scan bottom-up like :func:`read_verifier_payload`; the envelope's shape
+    (bool ``pass`` + list ``checks``) distinguishes it from the inner check
+    objects, which fail the guard.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return None
+    for i in range(len(lines) - 1, -1, -1):
+        if not lines[i].lstrip().startswith("{"):
+            continue
+        for text in ("\n".join(lines[i:]), lines[i]):
+            try:
+                obj = json.loads(text)
+            except (ValueError, TypeError):
+                continue
+            if (
+                isinstance(obj, dict)
+                and isinstance(obj.get("pass"), bool)
+                and isinstance(obj.get("checks"), list)
+            ):
+                return obj
+    return None
+
+
+def _contract_from_recipe_verifiers(run_dir):
+    """``(PROVEN|REFUTED|UNVERIFIED|None, reason)`` from verifier_<stem>.json
+    evidence at the run root. ``None`` = no such file (the caller decides n/a
+    vs UNVERIFIED from the task class). Any demonstrated failure (envelope
+    ``pass:false`` or a failed gating check) REFUTES; an unparsable evidence
+    file with no refutation is UNVERIFIED (abstain — never a pass)."""
+    if not run_dir:
+        return None, ""
+    try:
+        names = sorted(
+            name for name in os.listdir(run_dir)
+            if name.startswith("verifier_") and name.endswith(".json")
+            and name not in _CONTRACT_EVIDENCE_EXCLUDE
+        )
+    except OSError:
+        return None, ""
+    verdicts = {}
+    for name in names:
+        obj = _read_verifier_evidence(os.path.join(run_dir, name))
+        if obj is None:
+            verdicts[name] = "unparsable"
+            continue
+        gating_failed = any(
+            isinstance(check, dict)
+            and check.get("gating") is True
+            and check.get("pass") is not True
+            for check in obj["checks"]
+        )
+        verdicts[name] = "refuted" if (obj["pass"] is False or gating_failed) else "proven"
+    if not verdicts:
+        return None, ""
+    if "refuted" in verdicts.values():
+        bad = ", ".join(n for n, v in verdicts.items() if v == "refuted")
+        return REFUTED, f"recipe verifier evidence REFUTED ({bad})"
+    if "unparsable" in verdicts.values():
+        bad = ", ".join(n for n, v in verdicts.items() if v == "unparsable")
+        return UNVERIFIED, f"recipe verifier evidence unparsable ({bad})"
+    return PROVEN, "recipe verifier evidence PROVEN (" + ", ".join(verdicts) + ")"
+
+
+def derive_levels(run_dir, task_class=None):
     """Derive the five-level vector ``(vector, reasons)`` from run evidence.
 
     Inputs (all named deterministic producers):
       S = <run_dir>/implementer-summary.json   (git-derived, _write_implementer_summary)
       T = read_verifier_payload(<run_dir>/verifier_test.json, "test")
       B = read_verifier_payload(<run_dir>/verifier_behavioral.json, "behavioral")
+      R = verifier_<stem>.json envelopes at the run root (recipe verifiers)
+
+    ``task_class`` (optional; the verdict path always passes it) selects the
+    instruments a recipe OWNS: for a class outside ``_CODE_EDIT_CLASSES`` an
+    ABSENT S or T is n/a ("this recipe never had the instrument"), while a
+    present-but-unproven instrument still abstains. Without ``task_class``
+    (legacy callers, tests) every absent instrument stays UNVERIFIED.
 
     First match wins per level; anything not listed is UNVERIFIED. Never raises
     and never reads a reviewer/panel/eval/rubric file. Each reason is prefixed
@@ -118,6 +219,14 @@ def derive_levels(run_dir):
 
     vector = dict.fromkeys(LEVELS, UNVERIFIED)
     reasons = dict.fromkeys(LEVELS, "")
+
+    # Instrument ownership. `has_test` gates the n/a short-circuit: a present
+    # verifier_test.json is scored normally whatever the class.
+    has_summary = S is not None
+    has_test = os.path.isfile(os.path.join(run_dir, "verifier_test.json"))
+    owns_tree_instruments = (
+        task_class is not None and task_class in _CODE_EDIT_CLASSES
+    )
 
     # applies ← implementer-summary.json (status + files_changed). `implemented`
     # with an empty/absent files_changed is NOT proven: the git derivation can
@@ -135,8 +244,21 @@ def derive_levels(run_dir):
     elif status == "no_changes":
         vector["applies"] = REFUTED
         reasons["applies"] = "implementer-summary.json: no_changes"
+    elif not has_summary and not owns_tree_instruments and task_class is not None:
+        vector["applies"] = NA
+        reasons["applies"] = f"implementer-summary.json: instrument n/a for task_class={task_class}"
     else:
         reasons["applies"] = "implementer-summary.json: missing or empty files_changed"
+
+    # The applies n/a verdict above means the whole tree-change quartet is
+    # outside this recipe; without test evidence the remaining three levels
+    # are n/a together rather than three copies of the same abstention.
+    tree_levels_na = (
+        task_class is not None
+        and not owns_tree_instruments
+        and not has_summary
+        and not has_test
+    )
 
     # Derived values shared by executes / target / preserve.
     post_rc = T.get("post_rc")
@@ -159,7 +281,10 @@ def derive_levels(run_dir):
     )
 
     # executes — the runner reached a test outcome.
-    if rc in (0, 1):
+    if tree_levels_na:
+        vector["executes"] = NA
+        reasons["executes"] = f"verifier_test.json: instrument n/a for task_class={task_class}"
+    elif rc in (0, 1):
         vector["executes"] = PROVEN
         reasons["executes"] = f"verifier_test.json: post_rc={rc}"
     elif isinstance(rc, int) and base_green:
@@ -174,7 +299,10 @@ def derive_levels(run_dir):
     # instrument truly does not apply (no adapter, and the output carries no
     # test-run marker), record n/a (publish does not block) rather than
     # UNVERIFIED.
-    if T.get("replay_applicable") is False and rc == 0:
+    if tree_levels_na:
+        vector["target"] = NA
+        reasons["target"] = f"verifier_test.json: instrument n/a for task_class={task_class}"
+    elif T.get("replay_applicable") is False and rc == 0:
         vector["target"] = NA
         reasons["target"] = "verifier_test.json: replay instrument n/a for this test runner"
     elif not (ru or au) and rc == 0 and T.get("pass") is True and (ov or opaque_proof):
@@ -193,7 +321,10 @@ def derive_levels(run_dir):
     # suite is the only witness for "no regression" and was measured unable to
     # detect faults in the changed files. `ru` does not affect preserve (rc==0
     # already shows every test passes).
-    if not au and rc == 0:
+    if tree_levels_na:
+        vector["preserve"] = NA
+        reasons["preserve"] = f"verifier_test.json: instrument n/a for task_class={task_class}"
+    elif not au and rc == 0:
         vector["preserve"] = PROVEN
         reasons["preserve"] = "verifier_test.json: post_rc=0"
     elif rc not in (None, 0) and base_green:
@@ -202,23 +333,40 @@ def derive_levels(run_dir):
     else:
         reasons["preserve"] = "verifier_test.json: preserve not proven"
 
-    # contract ← verifier_behavioral.json. Absent file → n/a; present but
-    # unparsable or any other status → UNVERIFIED.
+    # contract ← verifier_behavioral.json, else the recipe's own contract
+    # verifier evidence (verifier_<stem>.json envelopes at the run root). With
+    # neither instrument present, a task class that REQUIRES contract records
+    # UNVERIFIED (a required level may never ride an absent instrument into
+    # publish); every other class records n/a.
     b_path = os.path.join(run_dir, "verifier_behavioral.json")
-    if B is None:
-        if os.path.isfile(b_path):
-            reasons["contract"] = "verifier_behavioral.json: unparsable"
+    if B is not None and B.get("status") == PROVEN:
+        vector["contract"] = PROVEN
+        reasons["contract"] = "verifier_behavioral.json: PROVEN"
+    elif B is not None and B.get("status") == REFUTED:
+        vector["contract"] = REFUTED
+        reasons["contract"] = "verifier_behavioral.json: REFUTED"
+    elif B is not None:
+        reasons["contract"] = f"verifier_behavioral.json: status={B.get('status')!r}"
+    elif os.path.isfile(b_path):
+        reasons["contract"] = "verifier_behavioral.json: unparsable"
+    else:
+        status, reason = _contract_from_recipe_verifiers(run_dir)
+        if status is PROVEN:
+            vector["contract"] = PROVEN
+            reasons["contract"] = reason
+        elif status is REFUTED:
+            vector["contract"] = REFUTED
+            reasons["contract"] = reason
+        elif status is UNVERIFIED:
+            reasons["contract"] = reason
+        elif "contract" in required_levels(task_class or ""):
+            reasons["contract"] = (
+                "no contract-verifier evidence (required for task_class="
+                f"{task_class})"
+            )
         else:
             vector["contract"] = NA
             reasons["contract"] = "verifier_behavioral.json: absent"
-    elif B.get("status") == PROVEN:
-        vector["contract"] = PROVEN
-        reasons["contract"] = "verifier_behavioral.json: PROVEN"
-    elif B.get("status") == REFUTED:
-        vector["contract"] = REFUTED
-        reasons["contract"] = "verifier_behavioral.json: REFUTED"
-    else:
-        reasons["contract"] = f"verifier_behavioral.json: status={B.get('status')!r}"
 
     return vector, reasons
 
@@ -251,7 +399,7 @@ def level_report(run_dir, task_class):
     Returns exactly these keys, in order: ``levels``, ``levels_reasons``,
     ``levels_required``, ``levels_ok``, ``levels_decision``.
     """
-    vector, reasons = derive_levels(run_dir)
+    vector, reasons = derive_levels(run_dir, task_class)
     required = list(required_levels(task_class))
     return {
         "levels": vector,

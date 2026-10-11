@@ -127,6 +127,46 @@ class TestWrappedBullets:
         assert "`tests/unit/test_run_profile_bullets.py`" in data["scope_allow"][0]
 
 
+class TestFlushLeftWrappedProse:
+    """A kickoff sentence hard-wrapped at ~78 columns can spill onto a
+    flush-left line (column 0). When the previous item does not END a sentence,
+    that line is a continuation, not a new criterion (run-1791736854 split
+    "…every heading" / "below, verbatim, …" into two success criteria)."""
+
+    def test_flush_left_wrap_joins_mid_sentence(self, tmp_path):
+        data = _profile(tmp_path, """# Flush-left wrap fixture
+
+## Done when
+
+- every heading listed below appears verbatim in the artifact markdown
+
+Required H2 headings — the caller content guard requires every heading
+below, verbatim, as an `## ` heading in the artifact `markdown`:
+
+- Coherence findings
+""")
+        assert data["success_criteria"] == [
+            "every heading listed below appears verbatim in the artifact markdown",
+            "Required H2 headings — the caller content guard requires every "
+            "heading below, verbatim, as an `## ` heading in the artifact "
+            "`markdown`:",
+            "Coherence findings",
+        ]
+
+    def test_flush_left_line_after_terminal_punctuation_stays_its_own_item(self, tmp_path):
+        data = _profile(tmp_path, """# Terminal punctuation fixture
+
+## Done when
+
+- run the suite:
+report every failure
+""")
+        assert data["success_criteria"] == [
+            "run the suite:",
+            "report every failure",
+        ]
+
+
 class TestOneLineBulletsUnchanged:
     def test_flat_bullets_are_untouched(self, tmp_path):
         data = _profile(tmp_path, """# Flat fixture

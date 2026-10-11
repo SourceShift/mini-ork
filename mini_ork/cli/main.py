@@ -514,7 +514,10 @@ def gen_profile(kickoff_path, root, recipe, task_class, profile_path, agents_pat
                 continue
             if current:
                 lines.append(raw.rstrip())
-        return [line for line in lines if line.strip()]
+        # Blank lines are KEPT: bullets() needs them to tell a hard-wrapped
+        # continuation (flush-left line directly after the item it continues)
+        # from the first line of a new paragraph (separated by a blank).
+        return lines
 
     def bullets(lines):
         # A wrapped kickoff bullet — a markdown list item whose text spills
@@ -523,20 +526,38 @@ def gen_profile(kickoff_path, root, recipe, task_class, profile_path, agents_pat
         # starts a new item when it is a list item (`- `/`* `/`1.`/`1)`) or is
         # not indented; an indented non-list line continues the previous item.
         # Nested bullets (indented `- …`) stay separate items, as before.
+        # A flush-left NON-list line ADJACENT to an item that does not END a
+        # sentence (no terminal `.`/`:`/`;`/`!`/`?`) also continues that item:
+        # the kickoff writer hard-wrapped prose at ~78 columns and the wrap
+        # landed at column 0 (run-1791736854 split "…every heading" / "below,
+        # verbatim, …" into two success criteria). A blank line, or terminal
+        # punctuation on the previous item, closes the thought — the next
+        # flush-left line is then genuinely a new item.
         items = []
+        after_blank = True
         for line in lines:
             stripped = re.sub(r"^\s*[-*]\s*", "", line).strip()
             if not stripped:
+                after_blank = True
                 continue
             is_list_item = bool(re.match(r"^\s*(?:[-*]\s+|\d+[.)]\s+)", line))
-            if is_list_item or not line[:1].isspace():
+            if is_list_item:
                 items.append(stripped)
-            elif items:
+            elif line[:1].isspace() and items:
                 # Join the raw continuation text: the marker strip above would
                 # eat a leading '-'/'*' that is content ('--flag', '*emph*').
                 items[-1] = items[-1] + " " + line.strip()
-            else:
+            elif (
+                after_blank
+                or not items
+                or items[-1].rstrip()[-1:] in (".", ":", ";", "!", "?")
+            ):
                 items.append(stripped)
+            else:
+                # Reaching here: flush-left, adjacent, previous item does not
+                # end a sentence — a hard-wrapped continuation. Join it.
+                items[-1] = items[-1] + " " + line.strip()
+            after_blank = False
         return items
 
     def first_heading():

@@ -249,6 +249,121 @@ def test_contract(tmp_path):
     assert vector4["contract"] == UNVERIFIED
 
 
+SCHEMA_EVIDENCE_PASS = (
+    "VERIFY OK: stable verified-artifact envelope passed\n"
+    '{\n  "pass": true,\n  "checks": [\n'
+    '    {"id": "envelope", "pass": true, "gating": true, "reason": ""},\n'
+    '    {"id": "title_matches_manifest", "pass": true, "gating": false, "reason": ""}\n'
+    "  ]\n}\n"
+)
+
+
+def test_contract_from_recipe_verifier_evidence(tmp_path):
+    """The artifact recipe's own deterministic verifier publishes its envelope
+    to <run_dir>/verifier_schema.json; that evidence PROVES contract for
+    verified_artifact (run-1791736854 published with every level UNVERIFIED
+    while this evidence held a full pass)."""
+    rd = _run_dir(tmp_path, name="recipe_proven")
+    (rd / "verifier_schema.json").write_text(SCHEMA_EVIDENCE_PASS, encoding="utf-8")
+    vector, reasons = L.derive_levels(str(rd), "verified_artifact")
+    assert vector["contract"] == PROVEN
+    assert "verifier_schema.json" in reasons["contract"]
+    # The tree-change quartet is n/a for a class whose recipe owns none of
+    # those instruments — not three abstentions on a publish.
+    assert vector["applies"] == NA
+    assert vector["executes"] == NA
+    assert vector["target"] == NA
+    assert vector["preserve"] == NA
+    assert L.publish_decision(vector, required=L.required_levels("verified_artifact")) == "publish"
+
+    # The evidence scores the same WITHOUT a task class (an instrument that
+    # ran is scored whatever the caller knew about the recipe).
+    vector_legacy, _ = L.derive_levels(str(rd))
+    assert vector_legacy["contract"] == PROVEN
+
+
+def test_contract_refuted_by_recipe_verifier_evidence(tmp_path):
+    # envelope pass:false -> REFUTED (publisher rc 1 -> rollback/reject)
+    rd = _run_dir(tmp_path, name="recipe_refuted")
+    (rd / "verifier_schema.json").write_text(
+        'VERIFY FAIL\n{"pass": false, "checks": [{"id": "envelope", "pass": false, "gating": true}]}\n',
+        encoding="utf-8",
+    )
+    vector, _ = L.derive_levels(str(rd), "verified_artifact")
+    assert vector["contract"] == REFUTED
+    assert L.publish_decision(vector, required=L.required_levels("verified_artifact")) == "refute"
+
+    # envelope pass:true but a GATING check failed -> still REFUTED; a
+    # non-gating failure alone does not refute.
+    rd2 = _run_dir(tmp_path, name="recipe_gating")
+    (rd2 / "verifier_schema.json").write_text(
+        '{"pass": true, "checks": ['
+        '{"id": "required_h2", "pass": false, "gating": true}, '
+        '{"id": "title_matches_manifest", "pass": false, "gating": false}]}\n',
+        encoding="utf-8",
+    )
+    vector2, _ = L.derive_levels(str(rd2), "verified_artifact")
+    assert vector2["contract"] == REFUTED
+
+    rd3 = _run_dir(tmp_path, name="recipe_nongating")
+    (rd3 / "verifier_schema.json").write_text(
+        '{"pass": true, "checks": ['
+        '{"id": "title_matches_manifest", "pass": false, "gating": false}]}\n',
+        encoding="utf-8",
+    )
+    vector3, _ = L.derive_levels(str(rd3), "verified_artifact")
+    assert vector3["contract"] == PROVEN
+
+
+def test_contract_required_but_no_evidence_abstains(tmp_path):
+    # verified_artifact with NO evidence at all: contract is UNVERIFIED (a
+    # required level may never ride an absent instrument to publish), and the
+    # decision abstains.
+    rd = _run_dir(tmp_path, name="recipe_bare")
+    vector, reasons = L.derive_levels(str(rd), "verified_artifact")
+    assert vector["contract"] == UNVERIFIED
+    assert "required" in reasons["contract"]
+    assert L.publish_decision(vector, required=L.required_levels("verified_artifact")) == "abstain"
+
+    # unparsable evidence -> UNVERIFIED, not a pass
+    rd2 = _run_dir(tmp_path, name="recipe_unparsable")
+    (rd2 / "verifier_schema.json").write_text("not json at all\n", encoding="utf-8")
+    vector2, _ = L.derive_levels(str(rd2), "verified_artifact")
+    assert vector2["contract"] == UNVERIFIED
+    assert L.publish_decision(vector2, required=L.required_levels("verified_artifact")) == "abstain"
+
+    # a class that does not require contract keeps the absent -> n/a reading
+    rd3 = _run_dir(tmp_path, name="other_bare")
+    vector3, _ = L.derive_levels(str(rd3), "ui_audit")
+    assert vector3["contract"] == NA
+    assert L.publish_decision(vector3, required=L.required_levels("ui_audit")) == "publish"
+
+
+def test_tree_levels_na_only_for_non_code_edit_classes(tmp_path):
+    # code_fix WITHOUT evidence still abstains on every tree level (legacy
+    # semantics — the instruments exist for the class, they just proved nothing)
+    rd = _run_dir(tmp_path, name="codefix_bare")
+    vector, _ = L.derive_levels(str(rd), "code_fix")
+    assert vector["applies"] == UNVERIFIED
+    assert vector["executes"] == UNVERIFIED
+    assert vector["target"] == UNVERIFIED
+    assert vector["preserve"] == UNVERIFIED
+    assert L.publish_decision(vector, required=L.required_levels("code_fix")) == "abstain"
+
+    # and a non-code-edit class that DOES have verifier_test.json is scored,
+    # never n/a'd away (a present instrument is read whatever the class)
+    rd2 = _run_dir(
+        tmp_path, name="generic_with_test",
+        summary={"status": "implemented", "files_changed": ["a.py"]},
+        test_payload=_test_evidence({"verifier": "test", "post_rc": 0, "pass": True,
+                                      "replay": {"overlap": ["test_x"]}}),
+    )
+    vector2, _ = L.derive_levels(str(rd2), "ui_audit")
+    assert vector2["applies"] == PROVEN
+    assert vector2["executes"] == PROVEN
+    assert vector2["preserve"] == PROVEN
+
+
 def test_empty_run_dir(tmp_path):
     rd = _run_dir(tmp_path, name="empty")
     vector, _ = L.derive_levels(str(rd))
