@@ -358,3 +358,22 @@ def test_node_status_map_revise_rerun_retires_the_prior_end(tmp_path: Path) -> N
     assert out["reviewer"]["started_at"] == 1300
     assert "ended_at" not in out["reviewer"]
     assert "duration_ms" not in out["reviewer"]
+
+
+def test_fetch_run_classifications_returns_only_the_recipe_less_rows(seeded):
+    """A ``task_runs`` row with no recipe is the classification the dags page
+    draws a single node for.
+
+    ``fetch_run_recipes`` drops those rows by construction (it selects on
+    ``recipe``), so the page needs this read to know the row exists at all —
+    and it must not return the rows that *do* have a recipe, or the two reads
+    would disagree about the same id.
+    """
+    out = seeded.fetch_run_classifications(["run-1", "run-done", "run-missing"])
+
+    assert set(out) == {"run-done"}
+    assert out["run-done"]["task_class"] == "code-fix"
+    assert out["run-done"]["status"] == "published"
+    assert out["run-done"]["created_at"] == 900
+    # An empty id list is an empty answer, not a query over every row.
+    assert seeded.fetch_run_classifications([]) == {}

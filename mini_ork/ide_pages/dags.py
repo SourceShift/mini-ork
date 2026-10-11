@@ -9,6 +9,14 @@ never one query per run.
 
 Per-run isolation is the contract: one unreadable run lands in
 ``errors[run_id]`` and must not remove or abort the other thumbnails.
+
+A ``task_runs`` row with no recipe is the one run that is neither: while its
+status is ``classified`` it is the *classification* that precedes a run
+(``cli/classify.py`` writes the row before any workflow is chosen), so it has a
+row on the board and no workflow to read. It gets a one-node DAG naming what
+was classified — see :func:`_classification_dag` for why silence is the wrong
+answer there. A recipe-less row that is *not* classified is reported in
+``errors`` instead: there is no honest node to draw for it.
 """
 from __future__ import annotations
 
@@ -75,6 +83,52 @@ def _workflow_safe(name: str, home: Path) -> dict[str, Any]:
     return {"nodes": nodes, "edges": wf.get("edges") or []}
 
 
+#: The status ``cli/classify.py`` writes, and the only one this page will draw
+#: a node for on a row that has no recipe. ``task_runs.status`` holds it until
+#: the run is planned into a workflow and the recipe column is filled in.
+CLASSIFY_STATUS = "classified"
+
+#: The node id a recipe-less run is drawn with when its row names no task
+#: class — the fallback, not the usual case: ``classify.py`` always writes the
+#: class it chose.
+CLASSIFY_NODE_ID = "classify"
+
+
+def _classification_dag(entry: dict[str, Any]) -> dict[str, Any]:
+    """The one-node DAG of a run that was classified but never started.
+
+    ``cli/classify.py`` records the classification as a ``task_runs`` row of
+    its own — ``recipe`` NULL, ``status='classified'`` — so there is no
+    workflow to read and no edges to draw between. Emitting nothing for such a
+    run (the old silent ``continue``) leaves the board drawing a card with no
+    nodes in it, which a reader cannot tell apart from a broken read; the node
+    names the class the kickoff was sorted into, which is the one thing that
+    actually happened.
+
+    The single node is ``done``: the row exists because the classification
+    finished. It is deliberately not the run's own state — the run may still be
+    "working" on the board, waiting to be planned into a workflow.
+    """
+    task_class = str(entry.get("task_class") or "").strip() or CLASSIFY_NODE_ID
+    duration = entry.get("duration_ms")
+    return {
+        "recipe": task_class,
+        "nodes": [
+            {
+                "id": task_class,
+                "type": "classifier",
+                "lane": None,
+                "state": "done",
+                "started_at": entry.get("created_at"),
+                # A classification reports 0 rather than a measured span, and
+                # `0` would draw as a real zero-second step.
+                "duration_ms": duration or None,
+            }
+        ],
+        "edges": [],
+    }
+
+
 def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     """Return ``{ok, label, dags, errors}`` for the Threads board."""
     del tab  # the dags page has no sub-tabs.
@@ -98,6 +152,10 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     # One round-trip for all node lifecycle events across the batch.
     lifecycle = repo.fetch_node_lifecycle_events_bulk(ids_to_show)
 
+    # And one for the runs ``fetch_run_recipes`` could not return: a row with no
+    # recipe is a classification, which still belongs on the board.
+    classifications = repo.fetch_run_classifications(ids_to_show)
+
     # Distinct recipe names → one workflow read each. ``_lanes.workflow_yaml``
     # routes through ``_cached_yaml`` (lru_cache), so repeats across runs
     # cost zero — the read-once contract matches what ``load_recipe`` used
@@ -113,10 +171,23 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     for run_id in ids_to_show:
         recipe_name = recipes.get(run_id)
         if not recipe_name:
-            # The CLI passed an id that is not in ``task_runs`` — an
-            # unknown run, not a missing recipe. Skip silently: an empty
-            # payload for an unknown id must not surface as a per-run error
-            # (see ``test_empty_state_db_returns_an_empty_payload``).
+            classified = classifications.get(run_id)
+            if classified is None:
+                # The CLI passed an id that is not in ``task_runs`` — an
+                # unknown run, not a missing recipe. Skip silently: an empty
+                # payload for an unknown id must not surface as a per-run error
+                # (see ``test_empty_state_db_returns_an_empty_payload``).
+                continue
+            status = str(classified.get("status") or "")
+            if status != CLASSIFY_STATUS:
+                # No recipe was ever recorded and this row is not (or no longer)
+                # a classification. Drawing it as one would put a step on the
+                # board that never ran, so it is reported instead.
+                errors[run_id] = f"no recipe recorded (status={status or 'unknown'})"
+                continue
+            # Not a run yet — the classification that precedes one. It has a
+            # board row, so it needs a card.
+            dags[run_id] = _classification_dag(classified)
             continue
         wf = workflows.get(recipe_name) or {}
         nodes_raw = wf.get("nodes") or []

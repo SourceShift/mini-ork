@@ -17,6 +17,8 @@ RUN_B = "run-dag-bbbb"
 RUN_C = "run-dag-cccc"
 RUN_NO_RECIPE = "run-dag-no-recipe"
 RUN_NO_EVENTS = "run-dag-no-events"
+RUN_CLASSIFIED = "run-dag-classified"
+RUN_CLASSIFIED_ANON = "run-dag-classified-anon"
 T0 = 1_791_000_000
 
 WORKFLOW = """\
@@ -90,6 +92,29 @@ def _seed_run(home: Path, run_id: str, recipe: str,
             "INSERT INTO run_events (event_id, run_id, event_type, payload_json, created_at) "
             "VALUES (?,?,?,?,?)",
             (f"ev-{run_id}-{i}", run_id, kind, json.dumps(payload), ts))
+    con.commit()
+    con.close()
+
+
+def _seed_classification(
+    home: Path, run_id: str, task_class: str, status: str = "classified"
+) -> None:
+    """The row ``cli/classify.py`` writes before any workflow is chosen.
+
+    ``recipe`` is NULL — that is the whole point: the run has been sorted into a
+    task class, but nothing has been planned or executed, so there is no
+    workflow on disk to draw.
+
+    ``task_class`` is NOT NULL in the migrated schema, so the page's fallback
+    node id is reached by an *empty* class, not a missing one.
+    """
+    con = sqlite3.connect(home / "state.db")
+    con.execute(
+        "INSERT INTO task_runs (id, recipe, status, cost_usd, created_at, updated_at, "
+        "ended_at, task_class, kickoff_path, workflow_version, trace_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (run_id, None, status, 0.0, T0, T0, None,
+         task_class, "kickoffs/auto/demo.md", "latest", f"tr-classify-{run_id}"))
     con.commit()
     con.close()
 
@@ -182,6 +207,72 @@ def test_a_run_with_an_unknown_recipe_records_in_errors_not_in_dags(home: Path) 
     assert {n["id"] for n in page["dags"][RUN_C]["nodes"]} == {
         "planner", "implementer", "test", "reviewer", "publisher", "rollback"
     }
+
+
+def test_a_classified_run_draws_the_one_node_it_has(home: Path) -> None:
+    """A ``task_runs`` row with ``recipe`` NULL is a classification, not a run.
+
+    The board lists that row, so the page must give it a card. Dropping it (the
+    old silent ``continue``) left the row rendering with no nodes at all, which
+    a reader cannot tell apart from a broken read.
+    """
+    _seed_classification(home, RUN_CLASSIFIED, "audit_judge_panel")
+    _seed_run(home, RUN_A, "demo-recipe", _events_for_demo())
+
+    page = build_page(home, "dags", None, {"ids": f"{RUN_CLASSIFIED},{RUN_A}"})
+
+    assert page["ok"] is True
+    # Not an error: nothing failed, there is simply no workflow yet.
+    assert page["errors"] == {}
+    assert page["dags"][RUN_CLASSIFIED] == {
+        "recipe": "audit_judge_panel",
+        "nodes": [
+            {
+                "id": "audit_judge_panel",
+                "type": "classifier",
+                "lane": None,
+                "state": "done",
+                "started_at": T0,
+                # The row reports 0 rather than a measured span; a literal 0
+                # would draw as a real zero-second step.
+                "duration_ms": None,
+            }
+        ],
+        "edges": [],
+    }
+    # The real run beside it is untouched — one row's shape must not cost
+    # another its DAG.
+    assert page["dags"][RUN_A]["recipe"] == "demo-recipe"
+    assert len(page["dags"][RUN_A]["nodes"]) == 6
+    json.dumps(page)
+
+
+def test_a_classification_with_a_blank_task_class_still_draws_a_node(home: Path) -> None:
+    """``classify.py`` always writes the class it chose, and the column is NOT
+    NULL — but a blank one is allowed by the schema, and a card with no node in
+    it is the very thing this page must not render."""
+    _seed_classification(home, RUN_CLASSIFIED_ANON, "")
+
+    dag = build_page(home, "dags", None, {"ids": RUN_CLASSIFIED_ANON})["dags"][RUN_CLASSIFIED_ANON]
+
+    assert dag["nodes"][0]["id"] == "classify"
+    assert dag["nodes"][0]["type"] == "classifier"
+
+
+def test_a_recipe_less_row_that_is_not_a_classification_is_reported(home: Path) -> None:
+    """The synthesized node is only for a row that says ``classified``.
+
+    Anything else with no recipe is data the page cannot draw, and drawing it
+    as a classification would put a step on the board that never ran — so it is
+    named in ``errors`` and left out of ``dags``, like any other unreadable run.
+    """
+    _seed_classification(home, RUN_CLASSIFIED, "code-fix", status="published")
+
+    page = build_page(home, "dags", None, {"ids": RUN_CLASSIFIED})
+
+    assert page["ok"] is True
+    assert RUN_CLASSIFIED not in page["dags"]
+    assert "published" in page["errors"][RUN_CLASSIFIED]
 
 
 def test_a_run_with_no_run_events_yields_all_never_seen(home: Path) -> None:

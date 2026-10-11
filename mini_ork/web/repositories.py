@@ -360,6 +360,40 @@ class RunDetailRepository:
                 out[str(r["id"])] = str(recipe)
         return out
 
+    def fetch_run_classifications(
+        self, task_run_ids: Sequence[str]
+    ) -> dict[str, dict[str, Any]]:
+        """``task_runs`` rows that carry no recipe — a classification, not a run.
+
+        ``cli/classify.py`` records the classification itself as a task run:
+        ``status='classified'`` with ``recipe`` NULL, because no workflow has
+        been chosen yet. :meth:`fetch_run_recipes` selects on ``recipe`` and so
+        drops exactly those rows, which leaves the board with a row that has no
+        DAG to draw. The dags page reads them separately and gives each one the
+        single node that did happen.
+
+        One round-trip for the whole batch, and only rows with no recipe — the
+        caller has already established which ids those are by their absence
+        from :meth:`fetch_run_recipes`.
+        """
+        if not task_run_ids:
+            return {}
+        placeholders = ",".join("?" * len(task_run_ids))
+        rows = self._db.rows(
+            "SELECT id, task_class, status, created_at, duration_ms FROM task_runs "
+            f"WHERE id IN ({placeholders}) AND (recipe IS NULL OR recipe = '')",
+            tuple(task_run_ids),
+        )
+        return {
+            str(r["id"]): {
+                "task_class": r.get("task_class"),
+                "status": r.get("status"),
+                "created_at": r.get("created_at"),
+                "duration_ms": r.get("duration_ms"),
+            }
+            for r in rows
+        }
+
     def fetch_node_lifecycle_events_bulk(
         self, task_run_ids: Sequence[str]
     ) -> dict[str, list[dict[str, Any]]]:
