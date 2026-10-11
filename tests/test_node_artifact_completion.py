@@ -343,6 +343,148 @@ def test_declared_artifacts_ok_reports_each_violation(tmp_path):
     assert not ok and "not a regular file" in why
 
 
+# ── T14: per-kind completion contracts — the fabrication gate ───────────────
+#
+# The generic checks (regular / non-empty / fresh / JSON-parseable) pass for a
+# well-formed fabrication. These pin the per-kind contract layer that closes
+# that gap, and just as much that an unknown basename keeps exactly today's
+# checks (no regression on the default path).
+
+def _run_dir(tmp_path: Path) -> Path:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    return run_dir
+
+
+def _summary_path(run_dir: Path, payload) -> str:
+    path = run_dir / "implementer-summary.json"
+    path.write_text(payload if isinstance(payload, str) else json.dumps(payload), encoding="utf-8")
+    return str(path)
+
+
+def test_t14_empty_files_changed_is_rejected(tmp_path):
+    path = _summary_path(_run_dir(tmp_path), {"status": "implemented", "files_changed": []})
+
+    ok, why = ec.declared_artifacts_ok([path], since_mtime=time.time() - 1)
+
+    assert not ok
+    assert "implementer-summary.json contract" in why and "empty" in why
+
+
+def test_t14_missing_claimed_relative_file_is_rejected(tmp_path):
+    run_dir = _run_dir(tmp_path)
+    repo = tmp_path / "target"
+    repo.mkdir()
+    path = _summary_path(run_dir, {"files_changed": ["a.py"]})  # a.py absent under repo
+
+    ok, why = ec.declared_artifacts_ok([path], since_mtime=time.time() - 1, repo_root=str(repo))
+
+    assert not ok
+    assert "implementer-summary.json contract" in why and "missing" in why
+
+
+def test_t14_stale_claimed_file_is_rejected(tmp_path):
+    run_dir = _run_dir(tmp_path)
+    repo = tmp_path / "target"
+    repo.mkdir()
+    (repo / "a.py").write_text("x = 1\n", encoding="utf-8")
+    past = time.time() - 600
+    os.utime(repo / "a.py", (past, past))  # older than the dispatch-start marker
+    path = _summary_path(run_dir, {"files_changed": ["a.py"]})  # summary itself is fresh
+
+    ok, why = ec.declared_artifacts_ok([path], since_mtime=time.time() - 1, repo_root=str(repo))
+
+    assert not ok
+    assert "implementer-summary.json contract" in why and "stale" in why
+
+
+def test_t14_fresh_claimed_file_passes(tmp_path):
+    run_dir = _run_dir(tmp_path)
+    repo = tmp_path / "target"
+    repo.mkdir()
+    (repo / "a.py").write_text("x = 1\n", encoding="utf-8")
+    path = _summary_path(run_dir, {"files_changed": ["a.py"]})
+
+    assert ec.declared_artifacts_ok(
+        [path], since_mtime=time.time() - 1, repo_root=str(repo)) == (True, "ok")
+
+
+def test_t14_honest_abstention_passes(tmp_path):
+    """A "no repro" report with an explicit not-ready + reason is a deliverable."""
+    path = _summary_path(_run_dir(tmp_path), {"ready_for_tier1": False, "block_reason": "no repro"})
+
+    assert ec.declared_artifacts_ok([path], since_mtime=time.time() - 1) == (True, "ok")
+
+
+def test_t14_abstention_without_a_block_reason_is_rejected(tmp_path):
+    path = _summary_path(_run_dir(tmp_path), {"ready_for_tier1": False, "files_changed": []})
+
+    ok, why = ec.declared_artifacts_ok([path], since_mtime=time.time() - 1)
+    assert not ok and "implementer-summary.json contract" in why
+
+
+def test_t14_plan_json_step_shape(tmp_path):
+    run_dir = _run_dir(tmp_path)
+    plan = run_dir / "plan.json"
+    plan.write_text(json.dumps({"steps": []}), encoding="utf-8")
+
+    ok, why = ec.declared_artifacts_ok([str(plan)], since_mtime=time.time() - 1)
+    assert not ok and "plan.json contract" in why and "empty" in why
+
+    plan.write_text(json.dumps({"steps": [{"id": "s1"}]}), encoding="utf-8")
+    assert ec.declared_artifacts_ok([str(plan)], since_mtime=time.time() - 1) == (True, "ok")
+
+
+def test_t14_patch_requires_a_header_pair(tmp_path):
+    patch = _run_dir(tmp_path) / "framework-edit.patch"
+    patch.write_text("--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n", encoding="utf-8")
+    assert ec.declared_artifacts_ok([str(patch)], since_mtime=time.time() - 1) == (True, "ok")
+
+    patch.write_text("prose with no diff headers at all\n", encoding="utf-8")
+    ok, why = ec.declared_artifacts_ok([str(patch)], since_mtime=time.time() - 1)
+    assert not ok and "patch contract" in why and "header pair" in why
+
+
+def test_t14_diff_extension_matches_the_patch_contract(tmp_path):
+    diff = _run_dir(tmp_path) / "changes.diff"
+    diff.write_text("just prose\n", encoding="utf-8")
+
+    ok, why = ec.declared_artifacts_ok([str(diff)], since_mtime=time.time() - 1)
+    assert not ok and "patch contract" in why
+
+
+def test_t14_unknown_basename_keeps_todays_checks(tmp_path):
+    notes = _run_dir(tmp_path) / "notes.md"
+    notes.write_text("free-form notes\n", encoding="utf-8")
+
+    assert ec.declared_artifacts_ok([str(notes)], since_mtime=time.time() - 1) == (True, "ok")
+
+
+def test_t14_custom_contract_is_honored_for_its_basename_only(tmp_path):
+    run_dir = _run_dir(tmp_path)
+    seen: list[tuple] = []
+
+    def contract(path, since_mtime):
+        seen.append((path, since_mtime))
+        return "custom-notes contract: nope"
+
+    ec.register_completion_contract("custom-notes.txt", contract)
+    custom = run_dir / "custom-notes.txt"
+    custom.write_text("anything\n", encoding="utf-8")
+    try:
+        ok, why = ec.declared_artifacts_ok([str(custom)], since_mtime=time.time() - 1)
+        assert not ok and why.endswith("custom-notes contract: nope") and len(seen) == 1
+
+        other = run_dir / "other-notes.txt"
+        other.write_text("fine\n", encoding="utf-8")
+        assert ec.declared_artifacts_ok([str(other)], since_mtime=time.time() - 1) == (True, "ok")
+    finally:
+        # Drop the test registration so later tests see the built-in registry.
+        ec._COMPLETION_CONTRACTS[:] = [
+            entry for entry in ec._COMPLETION_CONTRACTS if entry[0] != "custom-notes.txt"
+        ]
+
+
 # ── implementer artifact completion (recursive-validate-impl) ───────────────
 
 def _dispatch_implementer(tmp_path, monkeypatch, *, recipe, rc, summary):
@@ -403,6 +545,23 @@ def test_implementer_clean_handshake_still_applies_and_normalizes(tmp_path, monk
     assert (rc, fr) == (0, "done")
     assert len(applied) == 1
     assert _tier1_ready(json.loads((run_dir / "implementer-summary.json").read_text(encoding="utf-8")))
+
+
+def test_implementer_artifact_completion_emits_additive_contracts_field(tmp_path, monkeypatch):
+    """The completion event gains a per-contract pass/fail field; the pre-existing
+    payload keys (rc, suppressed_finish_reason, artifacts) are unchanged."""
+    events: list[tuple] = []
+    monkeypatch.setattr(eh, "mo_node_emit", lambda *a, **k: events.append(a))
+
+    (rc, fr), _run_dir, _applied = _dispatch_implementer(
+        tmp_path, monkeypatch, recipe="recursive-validate-impl", rc=124, summary=K3_SUMMARY)
+    assert (rc, fr) == (0, "done")
+
+    payloads = [json.loads(a[4]) for a in events if a[3] == "node.artifact_completion"]
+    assert payloads, "expected a node.artifact_completion run_event"
+    payload = payloads[-1]
+    assert payload["contracts"] == {"implementer-summary.json": "pass"}
+    assert payload["rc"] == 124 and "suppressed_finish_reason" in payload and payload["artifacts"]
 
 
 # ── T12: strict_handshake in the compiler and the schema ────────────────────

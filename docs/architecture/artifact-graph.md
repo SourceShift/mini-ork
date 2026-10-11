@@ -42,6 +42,35 @@ Any other implementer with no `outputs` gets no artifact completion. Set
 to turn this off. Verifier, publisher, rollback, reviewer, eval, and transform
 nodes are unaffected.
 
+The generic checks (regular, non-empty, fresh, JSON-parseable) cannot tell a
+well-formed fabrication from a real deliverable, so a registry of **per-kind
+completion contracts** adds the shape each known artifact must have.
+`declared_artifacts_ok` takes an optional `repo_root` (defaulting to
+`MO_TARGET_CWD`, else the process cwd) and, when a declared output's basename
+matches a registered contract, also requires it to satisfy that contract:
+
+* `implementer-summary.json` — the claimed files (``touched_files`` /
+  ``files_changed``) must be non-empty and, for each relative claim, exist as a
+  regular file under `repo_root` modified at or after the dispatch-start marker
+  (absolute claims are shape-checked only, since run directories move). An empty
+  claim list is accepted **only** for an honest abstention: `ready_for_tier1`
+  exactly `false` **and** a non-empty `block_reason` (e.g. `"no repro"`).
+* `plan.json` — a JSON object with a non-empty list of object `steps`.
+* `*.diff` / `*.patch` — at least one `--- ` / `+++ ` header pair (prose-only
+  output no longer qualifies just for being non-empty and fresh).
+
+Unknown basenames keep exactly the generic checks. A failure reason keeps the
+`<path>: ...` shape and names the contract (for example
+`…/implementer-summary.json: implementer-summary.json contract: files_changed/touched_files is empty`),
+and the whole check still fails on the first violating path. The
+`node.artifact_completion` payload carries an additive `contracts` field
+(`{"implementer-summary.json": "pass"}`) — the pre-existing `rc`,
+`suppressed_finish_reason`, and `artifacts` keys are unchanged. Register a new
+kind without editing the dispatcher:
+`mini_ork.execute_compat.register_completion_contract(pattern, fn)` where `fn`
+is `(path, since_mtime) -> str | None` (a reason string, or `None` to pass),
+mirroring `register_gate_evaluator`.
+
 The engine's `implementer-summary.json` writer merges into the summary the
 agent wrote instead of overwriting it. It also normalizes the result to the
 tier-verifier shape: `touched_files` falls back to `files_changed`, and
