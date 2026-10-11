@@ -40,6 +40,7 @@ from mini_ork.observability.node_events import _now_ms, mo_node_emit, mo_node_en
 from mini_ork.execute_compat import (
     ARTIFACT_COMPLETION_LOG,
     declared_artifacts_ok,
+    declared_artifacts_report,
     node_strict_handshake,
 )
 from mini_ork.workflow.store import make_artifact_store
@@ -1054,7 +1055,9 @@ def _completed_via_artifacts(ctx: NodeDispatch, paths: list[str],
     try:
         mo_node_emit(ctx.run_id, ctx.node_id, ctx.node_type, "node.artifact_completion",
                      json.dumps({"rc": rc, "suppressed_finish_reason": finish_reason,
-                                 "artifacts": paths}), db=ctx.db)
+                                 "artifacts": paths,
+                                 "contracts": declared_artifacts_report(
+                                     paths, since_mtime=since_mtime)}), db=ctx.db)
     except Exception:
         pass
     return True
