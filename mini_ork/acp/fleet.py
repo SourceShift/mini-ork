@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -73,6 +74,44 @@ class FleetRow:
     cost_usd: float
     added: int
     removed: int
+    # The kickoff a run was launched from (verbatim path), or "" when the
+    # row predates the column / the launch recorded none. Kept on the row
+    # so callers can group retries of one task — see :func:`lineage_key`.
+    kickoff: str = ""
+
+
+# ``<epic_id>-attempt-<n>.md`` — the name ``scheduler.build_carry_over_kickoff``
+# gives a retry's kickoff. Attempt 1 runs the epic's own ``kickoffs/<id>.md``,
+# so stripping this suffix folds every attempt of one task back onto one key.
+_ATTEMPT_SUFFIX = re.compile(r"-attempt-\d+$")
+
+
+def lineage_key(recipe: str, kickoff: str) -> str:
+    """The *task* a run is executing, independent of which attempt it is.
+
+    A retry does not launch the original kickoff: ``scheduler`` writes the
+    previous attempts' verdicts into ``kickoffs/<epic_id>-attempt-<n>.md``
+    and the run's ``kickoff_path`` points there. Two runs of the same task
+    therefore carry different paths, and a view that lists runs by path
+    shows every attempt as its own row — the inbox's duplicate failures,
+    where the task's later attempt already published.
+
+    The key is ``"<recipe>:<stem>"`` with the trailing ``-attempt-<n>``
+    stripped: the recipe keeps two tasks launched from a same-named file
+    apart (legal, if unusual). Returns ``""`` when there is no kickoff
+    path — a run with no lineage can only group with itself, so callers
+    fall back to ``run_id``.
+    """
+    text = (kickoff or "").strip()
+    if not text:
+        return ""
+    stem = Path(text).name
+    if stem.endswith(".md"):
+        stem = stem[: -len(".md")]
+    stem = _ATTEMPT_SUFFIX.sub("", stem)
+    if not stem:
+        return ""
+    return f"{recipe or '?'}:{stem}"
 
 
 def _run_dir(home: Path, run_id: str) -> Path:
@@ -477,7 +516,8 @@ def rows_from_candidates(home: Path, candidates: list[dict[str, Any]]) -> list[F
     (``run_id``, ``status``, ``recipe``, ``cost_usd``, ``created_at``,
     ``updated_at``, ``title``); ``title`` is taken verbatim from the
     dict so callers that pre-computed it (e.g. :func:`runs_by_ids`) keep
-    control of the title rule.
+    control of the title rule. ``kickoff_path`` is optional — a candidate
+    without it yields ``FleetRow.kickoff == ""`` (no lineage).
     """
     if not candidates:
         return []
@@ -538,6 +578,7 @@ def rows_from_candidates(home: Path, candidates: list[dict[str, Any]]) -> list[F
                 cost_usd=cost,
                 added=added,
                 removed=removed,
+                kickoff=str(row.get("kickoff_path") or ""),
             )
         )
 

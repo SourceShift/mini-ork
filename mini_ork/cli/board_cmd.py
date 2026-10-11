@@ -510,6 +510,36 @@ def _act_resume(home: Path, run_id: str) -> dict[str, Any]:
     return resume_cost_run(home, run_id, approver="ide")
 
 
+def _act_dismiss(home: Path, run_id: str, *, undo: bool = False) -> dict[str, Any]:
+    """Hide a run from the IDE inbox, or put it back (``--undo``).
+
+    The marker is a per-run file, alongside ``landed.json`` and ``repair.json``
+    that ``ide_pages.inbox`` already reads, so a dismissal travels with the run
+    directory instead of living in one index a concurrent writer could lose.
+    Nothing is deleted: the run keeps its events, artifacts and worktree, and
+    still appears on the runs page. An unwritable home is reported, never
+    silently ignored — a button that leaves the row on screen with no
+    explanation is worse than a refusal.
+    """
+    if not run_id:
+        return {"ok": False, "error": "dismiss needs a run id"}
+    run_dir = Path(home) / "runs" / run_id
+    if not run_dir.is_dir():
+        return {"ok": False, "run_id": run_id, "error": f"no run {run_id}"}
+    marker = run_dir / "dismissed.json"
+    try:
+        if undo:
+            marker.unlink(missing_ok=True)
+        else:
+            marker.write_text(
+                json.dumps({"at": int(time.time()), "by": "ide"}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+    except OSError as exc:
+        return {"ok": False, "run_id": run_id, "error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": True, "run_id": run_id, "mode": "restored" if undo else "dismissed"}
+
+
 # The board retry verb spawns a ``mini-ork recover`` subprocess under the same
 # detached shape as ``acp.commands._spawn``. We re-bind the import here so the
 # board tests can monkeypatch ``_retry_spawn`` and never actually launch.
@@ -1008,6 +1038,8 @@ def build_payload(home: Path, args) -> dict[str, Any]:
                              dry_run=args.dry_run, lanes=args.lane)
     elif args.verb == "runs":
         payload = _runs_verb(home, args.query, args.offset, args.limit)
+    elif args.verb == "dismiss":
+        payload = _act_dismiss(home, args.run_id, undo=args.undo)
     else:
         payload = act(home, args.verb, args.run_id)
     if reap_errors:
@@ -1032,7 +1064,7 @@ def build_parser() -> argparse.ArgumentParser:
     uses (no hand-copied parser drifting out of sync)."""
     parser = argparse.ArgumentParser(prog="mini-ork board", add_help=False)
     parser.add_argument("verb", nargs="?", default="show",
-                        choices=["show", "run", "merge", "discard", "stop", "kill",
+                        choices=["show", "run", "merge", "discard", "dismiss", "stop", "kill",
                                  "resume", "retry", "gate", "page", "node", "steer", "runs"])
     parser.add_argument("run_id", nargs="?")
     # `gate approve|reject <inbox_id>` puts the action in run_id and the id here;
@@ -1067,6 +1099,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "case-3 'code' revisions).")
     parser.add_argument("--dry-run", action="store_true",
                         help="retry: return the hint only, never spawn.")
+    parser.add_argument("--undo", action="store_true",
+                        help="dismiss: clear the run's dismissal marker, so the "
+                             "inbox shows it again. A dismissal hides a row, it "
+                             "never deletes a run.")
     parser.add_argument("--lane", action="append", default=[],
                         help="retry: pin a lane for the spawned recover "
                              "(repeatable, <alias>=<lane>). Does not imply "

@@ -410,9 +410,20 @@ def triage(text: str, *, tone: str = "muted", icon: str = "", detail: str = "",
 
 
 def callout(title: str, text_md: str = "", *, tone: str = "orange",
+            icon: str = "", meta: Iterable[Any] = (),
             actions: Iterable[dict[str, Any]] = (), **opt: Any) -> dict[str, Any]:
-    """A short markdown note; buttons ride the section's ``actions`` field."""
-    return _section("callout", title, {"text_md": str(text_md), "tone": tone},
+    """A short markdown note; buttons ride the section's ``actions`` field.
+
+    ``icon`` is the leading glyph, drawn instead of the tone's default mark —
+    ``outcome.resolve`` already computes one (``✋`` needs you, ``✗`` failed,
+    ``✓`` published, ``●`` working) and a caller that has it should pass it
+    through rather than have the renderer guess a mark from the colour.
+    ``meta`` is a row of :func:`cell` facts under the text (run id, recipe,
+    attempt) for the caller that has them.
+    """
+    return _section("callout", title,
+                    {"text_md": str(text_md), "tone": tone, "icon": str(icon),
+                     "meta": [c if isinstance(c, dict) else cell(c) for c in meta]},
                     actions=actions, **opt)
 
 

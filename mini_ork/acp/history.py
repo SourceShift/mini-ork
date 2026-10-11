@@ -159,11 +159,13 @@ def list_runs(
     """Run rows newest-first, paged; ``(rows, next_offset)`` or ``([], None)``.
 
     Each row maps to ``{"run_id", "status", "recipe", "cost_usd", "created_at",
-    "updated_at", "title"}``. ``title`` is the first non-empty kickoff line
-    (``#`` stripped, 80-char cap) with a ``"{recipe or 'mini-ork'} run"``
-    fallback. Rows whose id is not a safe token are skipped. ``next_offset`` is
-    the offset for the next page, or ``None`` when exhausted. A missing DB or
-    missing ``task_runs`` table returns ``([], None)``.
+    "updated_at", "title", "kickoff_path"}``. ``title`` is the first non-empty
+    kickoff line (``#`` stripped, 80-char cap) with a ``"{recipe or 'mini-ork'}
+    run"`` fallback. ``kickoff_path`` is the raw column, kept so callers can
+    group retries of one task (``fleet.lineage_key``). Rows whose id is not a
+    safe token are skipped. ``next_offset`` is the offset for the next page, or
+    ``None`` when exhausted. A missing DB or missing ``task_runs`` table returns
+    ``([], None)``.
     """
     from mini_ork.web.db import db_for
 
@@ -210,6 +212,12 @@ def list_runs(
                 "created_at": _normalize_ts(row.get("created_at")),
                 "updated_at": _normalize_ts(row.get("updated_at")),
                 "title": title,
+                # The kickoff a run was launched from, verbatim: the retry
+                # lineage key (``fleet.lineage_key``). Reads that show a list of
+                # runs need it to tell "three attempts at one task" from "three
+                # tasks" — the inbox's duplicate rows. Empty when the column is
+                # null, which ``lineage_key`` treats as "no lineage".
+                "kickoff_path": str(row.get("kickoff_path") or ""),
             }
         )
     return out, (offset + limit if has_more else None)
@@ -277,6 +285,8 @@ def runs_by_ids(home: Path, run_ids: list[str]) -> list[dict[str, Any]]:
                 "created_at": _normalize_ts(row.get("created_at")),
                 "updated_at": _normalize_ts(row.get("updated_at")),
                 "title": title,
+                # Same contract as ``list_runs``: the retry lineage key.
+                "kickoff_path": str(row.get("kickoff_path") or ""),
             }
         )
     return out

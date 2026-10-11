@@ -488,14 +488,21 @@ def _failure_detail(run, hint: dict[str, Any] | None) -> str:
 
 
 def _failed_actions(run, hint: dict[str, Any] | None) -> tuple[list[dict[str, Any]], str]:
-    """``(actions, revised_note)`` — ``revised_note`` is non-empty when the hint
-    says the change itself must be revised (no retry button is offered).
+    """``(actions, revised_note)`` — ``revised_note`` is a plain-language
+    reason the run is not simply retryable.
 
     A retryable hint whose ``needs_change.kind`` is in
     ``retry_hint.NO_CHANGE_KINDS`` (an ``interrupted`` run) gets a single
     ``Resume from <node>`` button with no ``--ack-change`` — resuming IS the
     fix. A ``lane`` kind is satisfied by its ``--lane`` switch; any other
     ``needs_change`` is a real operator fix (``--ack-change``).
+
+    A not-retryable hint splits in two. ``code`` means the change itself is
+    wrong, so the note says so and no retry is offered — retrying would fail
+    the same way. Anything else (``unknown``, or no hint at all) means the
+    cause was never established: the note says *that*, and a forced retry is
+    still offered, because "we could not tell" is not a reason to leave the
+    operator with no button.
     """
     rm = _run_mod()
     actions: list[dict[str, Any]] = []
@@ -534,7 +541,27 @@ def _failed_actions(run, hint: dict[str, Any] | None) -> tuple[list[dict[str, An
                           confirm=f"Retry from {node}?" if node else f"Retry {run.id}?"),
                     "primary"))
         else:
-            revised = "The change itself must be revised."
+            # Not retryable. Only a ``code`` kind actually knows the change is
+            # at fault; the rest of them mean retry_hint could not classify the
+            # failure at all (``unknown`` is case 5's "not classified"). The old
+            # blanket "the change itself must be revised" asserted a cause we do
+            # not have and left the row with no way forward, so say what is
+            # true and offer the forced retry — ``--force`` re-runs the failed
+            # step, which is a real (if uninformed) option.
+            kind = str(nc.get("kind") or "") if isinstance(nc, dict) else ""
+            if kind == "code":
+                revised = "The change itself must be revised."
+            else:
+                # Deliberately short: the hint's own summary ("the cause was
+                # not classified") is already in ``detail``, and the caller
+                # appends this after it — a second sentence saying the same
+                # thing read as a stutter.
+                revised = "Retrying re-runs the failed step."
+                actions.append(S.btn(
+                    "Retry anyway",
+                    S.cli("board", "retry", run.id, "--force",
+                          confirm=f"Retry {run.id} with no diagnosis?"),
+                    "primary"))
     discard = rm._discard_action(run)
     if discard is not None:
         actions.append(discard)
