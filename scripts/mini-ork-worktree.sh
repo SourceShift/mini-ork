@@ -160,6 +160,16 @@ create_worktree() {
   # ALLOW_WORKTREE_BRANCH_CREATE=1 satisfies the reference-transaction guard.
   ALLOW_WORKTREE_BRANCH_CREATE=1 git -C "$ROOT" worktree add -b "$branch" "$wt" "$base"
 
+  # A fresh worktree carries submodule gitlinks but none of their content, so a
+  # repo that vendors code that way starts with an empty directory where the
+  # vendored tree should be (the IDE crate, in this repo). A linked worktree
+  # gets its own module dir — git 2.39 does not share the main checkout's
+  # .git/modules — so this clones from the recorded URL and needs the network.
+  # Warn rather than die: the crate is a build input for the IDE, not for the
+  # runtime, and dying would break worktree creation for every offline run.
+  git -C "$wt" submodule update --init --recursive \
+    || echo "[mo-worktree] warning: submodules not materialised in $wt" >&2
+
   if [ "${#owns[@]}" -gt 0 ]; then
     register_ownership "$safe_slug" "${owns[@]}"
     echo "[mo-worktree] claimed: ${owns[*]}" >&2

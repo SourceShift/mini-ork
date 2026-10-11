@@ -28,6 +28,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -343,6 +344,17 @@ def create(
     )
     if rc != 0:
         raise RuntimeError(f"worktree add failed: {err.strip()}")
+    # A fresh worktree carries submodule gitlinks but none of their content, so a
+    # repo that vendors code that way starts the run with an empty directory
+    # where the vendored tree should be, and nothing says so. A linked worktree
+    # gets its own module dir (git 2.39 does not share the main checkout's
+    # .git/modules), so this clones from the recorded URL and needs the network.
+    # Warn instead of failing: the crate is an IDE build input, not a runtime
+    # one, and raising here would break worktree creation for every offline run.
+    rc, _, err = _git(["submodule", "update", "--init", "--recursive"], worktree, timeout=300)
+    if rc != 0:
+        print(f"mini-ork: submodules not materialised in {worktree}: {err.strip()}",
+              file=sys.stderr)
     ws = Workspace(
         run_id=run_id,
         path=worktree,
