@@ -740,6 +740,51 @@ def _abandon_lease(db_path: str, run_id: str, req: Any, token: str | None) -> No
         _lease.release_lease(db_path, run_id, token)
 
 
+def _rerun_rubric_prescreen(handoff: dict) -> None:
+    """Re-run the advisory rubric prescreen over the recovered run's artifacts.
+
+    A recover re-enters the execute loop directly and never passes through
+    ``mini_ork.cli.main``'s lifecycle tail, so ``panel-verdict.json`` kept the
+    FAILED attempt's advisory score after a successful revival
+    (run-1791619207-22518 showed ``panel_score 37.5 / pass false`` over
+    published artifacts). Mirrors ``main._should_run_rubric``'s guards and
+    ``main``'s fail-soft call; the prescreen itself rewrites
+    ``rubric.json`` + ``panel-verdict.json`` in place.
+    """
+    import contextlib
+    import io
+    import sqlite3 as _sq3  # noqa: PLC0415 — scoped, mirrors cli_main's local use
+
+    if os.environ.get("MO_RUBRIC", "1") != "1":
+        return
+    if os.environ.get("MINI_ORK_DRY_RUN", "0") == "1":
+        return
+    run_dir = str(handoff.get("run_dir") or "")
+    db_path = str(handoff.get("db_path") or "")
+    run_id = str(handoff.get("run_id") or "")
+    if not run_dir or not os.path.isdir(run_dir) or not db_path or not run_id:
+        return
+    con = _sq3.connect(db_path, timeout=5.0)
+    try:
+        row = con.execute(
+            "SELECT kickoff_path, task_class FROM task_runs WHERE id = ?",
+            (run_id,)).fetchone()
+    finally:
+        con.close()
+    if not row or not str(row[0] or ""):
+        return
+    from mini_ork.gates import rubric_prescreen  # noqa: PLC0415
+    root = os.environ.get("MINI_ORK_ROOT") or os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+    with contextlib.redirect_stdout(io.StringIO()):
+        rubric_prescreen.mo_rubric_run_score(
+            str(row[0]), run_dir, str(row[1] or "generic"),
+            mini_ork_root=root,
+            mini_ork_home=os.path.dirname(db_path),
+            mini_ork_db=db_path,
+        )
+
+
 def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
     """CLI entrypoint mirroring ``mini_ork_resume.main``.
 
@@ -1332,6 +1377,15 @@ def cli_main(argv: list[str] | None = None, *, execute_fn=None) -> int:
                     _con.close()
         except Exception as _exc:  # noqa: BLE001 — fail-soft, never mask the exec result
             print(f"[mini-ork-recover] could not reap zombie row: {_exc}", file=sys.stderr)
+    # ── rubric pre-screen refresh: recover bypasses ``cli.main``'s lifecycle
+    # tail, so re-run the advisory prescreen over the recovered artifacts or
+    # ``panel-verdict.json`` keeps the dead attempt's score (2026-10-11,
+    # run-1791619207-22518). Fail-soft, before retry-notify/auto-repair.
+    if handoff.get("run_dir"):
+        try:
+            _rerun_rubric_prescreen(handoff)
+        except Exception as _exc:  # noqa: BLE001
+            print(f"[mini-ork-recover] rubric prescreen failed: {_exc}", file=sys.stderr)
     # ── retry-notify (kickoff lane-repair-resume §2): mirror ``mini_ork.cli.main``
     # so a re-failed recover reports the owner + fix steps like a fresh ``run``
     # does. Fail-soft — never changes the run's exit code. Only fires when the

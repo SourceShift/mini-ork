@@ -273,3 +273,53 @@ def test_cli_marks_failed_and_propagates_when_execute_raises(tmp_path, monkeypat
 
     # The finally-block reaper still ran before the exception propagated.
     assert _row(db)[0] == "failed"
+
+
+# ── rubric prescreen refresh on recover (2026-10-11) ────────────────────────
+
+def test_cli_reruns_rubric_prescreen_after_recover(tmp_path, monkeypatch):
+    """Recover bypasses cli.main's lifecycle tail — the advisory rubric
+    prescreen must be re-run over the recovered artifacts, or
+    ``panel-verdict.json`` keeps the dead attempt's score
+    (run-1791619207-22518: 37.5/pass=false over published artifacts)."""
+    db, wf = _setup_run(tmp_path, monkeypatch)
+    kickoff = tmp_path / "k.md"
+    kickoff.write_text("# kick\n", encoding="utf-8")
+    con = sqlite3.connect(db)
+    con.execute("UPDATE task_runs SET kickoff_path=? WHERE id=?", (str(kickoff), RUN))
+    con.commit()
+    con.close()
+
+    from mini_ork.gates import rubric_prescreen
+    called: dict = {}
+
+    def fake_score(kick, run_dir, task_class, **kw):
+        called.update(kick=str(kick), run_dir=str(run_dir), task_class=task_class)
+
+    monkeypatch.setattr(rubric_prescreen, "mo_rubric_run_score", fake_score)
+
+    rc = rp.cli_main([RUN, "--workflow", wf, "--db", db], execute_fn=lambda argv: 0)
+
+    assert rc == 0
+    assert called["kick"] == str(kickoff)
+    assert called["task_class"] == TC
+    assert Path(called["run_dir"]) == tmp_path / "run"
+
+
+def test_cli_prescreen_honors_mo_rubric_optout(tmp_path, monkeypatch):
+    db, wf = _setup_run(tmp_path, monkeypatch)
+    kickoff = tmp_path / "k.md"
+    kickoff.write_text("# kick\n", encoding="utf-8")
+    con = sqlite3.connect(db)
+    con.execute("UPDATE task_runs SET kickoff_path=? WHERE id=?", (str(kickoff), RUN))
+    con.commit()
+    con.close()
+
+    from mini_ork.gates import rubric_prescreen
+    monkeypatch.setattr(
+        rubric_prescreen, "mo_rubric_run_score",
+        lambda *a, **k: pytest.fail("prescreen must not run under MO_RUBRIC=0"))
+    monkeypatch.setenv("MO_RUBRIC", "0")
+
+    rc = rp.cli_main([RUN, "--workflow", wf, "--db", db], execute_fn=lambda argv: 0)
+    assert rc == 0
