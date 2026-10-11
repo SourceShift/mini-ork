@@ -1,0 +1,201 @@
+diff --git a/mini_ork/cli/execute_handlers.py b/mini_ork/cli/execute_handlers.py
+index 5e0b7214..9b96d36d 100644
+--- a/mini_ork/cli/execute_handlers.py
++++ b/mini_ork/cli/execute_handlers.py
+@@ -552,7 +552,12 @@ def _handle_implementer(ctx: NodeDispatch):
+             return 1, "error"
+         os.makedirs(os.path.dirname(fallback_sub_log) or ".", exist_ok=True)
+         os.makedirs(os.path.dirname(sub_log), exist_ok=True)
+-        rc = subprocess.run(["python3", script]).returncode
++        # Use sys.executable (the venv's python) instead of ambient ``python3`` —
++        # an ambient ``python3`` lacks the venv site-packages, so a dispatcher
++        # that does ``import mini_ork`` would resolve against the system python
++        # and fail with ModuleNotFoundError. sys.executable is the python that
++        # is actually running this executor, which already imports mini_ork OK.
++        rc = subprocess.run([sys.executable, script]).returncode
+         if rc == 0:
+             if sub_log != fallback_sub_log and os.path.isfile(fallback_sub_log):
+                 shutil.copy2(fallback_sub_log, sub_log)
+diff --git a/recipes/goal-loop/lib/drive.py b/recipes/goal-loop/lib/drive.py
+index 16d9e742..f4e0d2ba 100644
+--- a/recipes/goal-loop/lib/drive.py
++++ b/recipes/goal-loop/lib/drive.py
+@@ -26,6 +26,7 @@ import argparse
+ import importlib.util
+ import json
+ import os
++import re
+ import subprocess
+ import sys
+ from pathlib import Path
+@@ -51,6 +52,45 @@ divergence = _loop_state_module.divergence
+ FINAL_VERDICT_FILENAME = "final-verdict.json"
+ 
+ 
++# ─────────────────────────────────────────────────────────────────────────
++# Per-unit kickoff templating
++# ─────────────────────────────────────────────────────────────────────────
++
++
++_UNIT_ID_SLUG_RE = re.compile(r"[^A-Za-z0-9_.-]")
++
++
++def _slugify_unit_id(unit_id: str) -> str:
++    """Filesystem-safe slug of ``unit_id`` — replace any char that would break a
++    filename (notably ``/``, which unit ids routinely contain because they're
++    usually relative repo paths) with ``_``. Empty input falls back to ``"x"``
++    so the resulting filename is never blank.
++    """
++    return _UNIT_ID_SLUG_RE.sub("_", unit_id or "x")
++
++
++def _render_kickoff_template(text: str, unit_id: str, reason: str) -> str | None:
++    """Materialize ``{{unit_id}}`` / ``{{reason}}`` into the kickoff body.
++
++    A kickoff template without placeholders passes through unchanged (returns
++    ``None`` so the caller knows a per-unit copy is unnecessary and the original
++    template file may be reused as-is). With at least one placeholder present,
++    substitution is plain text replacement — no slugging of ``{{unit_id}}``
++    because the substitution value is a CONTENT field, not a filename; the
++    slug is applied separately when the per-unit temp filename is derived.
++    """
++    has_unit = "{{unit_id}}" in text
++    has_reason = "{{reason}}" in text
++    if not has_unit and not has_reason:
++        return None
++    rendered = text
++    if has_unit:
++        rendered = rendered.replace("{{unit_id}}", str(unit_id or ""))
++    if has_reason:
++        rendered = rendered.replace("{{reason}}", str(reason or ""))
++    return rendered
++
++
+ # ─────────────────────────────────────────────────────────────────────────
+ # Per-wave sweep submode body
+ # ─────────────────────────────────────────────────────────────────────────
+@@ -61,6 +101,14 @@ def _default_spawn_fn(plan_entry: dict[str, Any]) -> dict[str, Any]:
+ 
+     Honors ``MO_GOAL_SPAWN_DRY=1`` (dry-run) and the per-unit caps by letting
+     the spawn API raise ``ValueError`` (caller marks ``deferred``).
++
++    Per-unit kickoff templating: a single template (file path or inline body)
++    can declare ``{{unit_id}}`` / ``{{reason}}`` placeholders; this function
++    materializes them per unit and writes a slug-suffixed copy under
++    ``<run_dir>/_inline_kickoff_<slug>.md``. Templates without placeholders
++    pass through unchanged — file templates are referenced in place (no copy)
++    and inline bodies still go through the temp-file path with a slug-safe
++    name (unit ids routinely contain ``/``).
+     """
+     if os.environ.get("MO_GOAL_SPAWN_DRY", "").strip() == "1":
+         return {
+@@ -83,14 +131,28 @@ def _default_spawn_fn(plan_entry: dict[str, Any]) -> dict[str, Any]:
+             "or include kickoff_hint.kickoff in sweep-plan entry)"
+         )
+ 
++    unit_id = str(plan_entry.get("unit_id", "") or "")
++    reason = str(kickoff_hint.get("reason", "") or "")
++    run_dir = os.environ.get("MINI_ORK_RUN_DIR", ".")
++    slug = _slugify_unit_id(unit_id)
++
+     if os.path.isfile(kickoff_text):
+-        kickoff_path = kickoff_text
++        raw = Path(kickoff_text).read_text(encoding="utf-8")
++        rendered = _render_kickoff_template(raw, unit_id, reason)
++        if rendered is None:
++            # Static template — no placeholders; reference the original in
++            # place so spawn copies it verbatim.
++            kickoff_path = kickoff_text
++        else:
++            kickoff_path = os.path.join(run_dir, f"_inline_kickoff_{slug}.md")
++            Path(kickoff_path).write_text(rendered, encoding="utf-8")
+     else:
+-        # Treat the hint as inline kickoff body — write to a temp file next
+-        # to the run dir and pass that path to spawn.
+-        run_dir = os.environ.get("MINI_ORK_RUN_DIR", ".")
+-        kickoff_path = os.path.join(run_dir, f"_inline_kickoff_{plan_entry.get('unit_id','x')}.md")
+-        Path(kickoff_path).write_text(kickoff_text, encoding="utf-8")
++        # Inline kickoff body — render template (or pass through) then write
++        # to a slug-suffixed temp file so spawn can address it.
++        rendered = _render_kickoff_template(kickoff_text, unit_id, reason)
++        body = rendered if rendered is not None else kickoff_text
++        kickoff_path = os.path.join(run_dir, f"_inline_kickoff_{slug}.md")
++        Path(kickoff_path).write_text(body, encoding="utf-8")
+ 
+     result = spawn(
+         parent_run=run_id,
+diff --git a/recipes/goal-loop/register.py b/recipes/goal-loop/register.py
+index 20f025a5..052f6abd 100644
+--- a/recipes/goal-loop/register.py
++++ b/recipes/goal-loop/register.py
+@@ -19,14 +19,20 @@ What this module does:
+    forbids touching files outside ``recipes/goal-loop/`` + the one test
+    file).
+ 
+-2. Registers the ``(goal-loop, sweep_dispatcher)`` implementer submode with
+-   the U4b driver script (``lib/drive.py``). When invoked by the dispatch
+-   layer (no args), ``drive.py`` falls through to ``sweep_run()``, which
+-   reads ``<run_dir>/sweep-plan.json``, fans out
++2. Registers the ``(goal-loop, sweep)`` implementer submode with the U4b
++   driver script (``lib/drive.py``). When invoked by the dispatch layer
++   (no args), ``drive.py`` falls through to ``sweep_run()``, which reads
++   ``<run_dir>/sweep-plan.json``, fans out
+    ``mini_ork.cli.spawn.spawn(...)`` per planned unit honoring
+    ``MINI_ORK_RECURSIVE_MAX_PARALLEL``, and writes
+    ``<run_dir>/sweep-result.json``. ``MO_GOAL_SPAWN_DRY=1`` records the
+-   planned spawns without invoking ``spawn`` (unit-test seam).
++   planned spawns without invoking ``spawn`` (unit-test seam). The
++   submode is keyed on the dedicated ``sweep`` implementer node in
++   ``workflow.yaml`` — previously the sweep body was registered under
++   ``sweep_dispatcher`` (a transform), so the implementer submode
++   registry in ``mini_ork.cli.execute_handlers._IMPLEMENTER_SUBMODES``
++   (only consulted in ``_handle_implementer``) never matched and the
++   driver silently no-op'd through every wave.
+ """
+ from __future__ import annotations
+ 
+@@ -61,7 +67,7 @@ _TRANSFORMS_SPEC.loader.exec_module(_TRANSFORMS_MODULE)
+ 
+ register_implementer_submode(
+     recipe="goal-loop",
+-    node_id="sweep_dispatcher",
++    node_id="sweep",
+     results_artifact="sweep-result.json",
+     script=_DRIVER_SCRIPT,
+ )
+\ No newline at end of file
+diff --git a/recipes/goal-loop/workflow.yaml b/recipes/goal-loop/workflow.yaml
+index ddc679a9..985745f5 100644
+--- a/recipes/goal-loop/workflow.yaml
++++ b/recipes/goal-loop/workflow.yaml
+@@ -28,6 +28,20 @@ nodes:
+     outputs:
+       - { name: sweep_plan, path: sweep-plan.json, kind: file, visibility: consumer }
+ 
++  # U4b driver node: actually spawn the fix children written by
++  # sweep_dispatcher. Type ``implementer`` so the dispatch layer consults
++  # ``mini_ork.cli.execute_handlers._IMPLEMENTER_SUBMODES`` and runs the
++  # ``(goal-loop, sweep)`` entry registered by ``recipes/goal-loop/register.py``.
++  # A previous incarnation registered the same driver under the
++  # ``sweep_dispatcher`` transform — transform handlers ignore submodes, so
++  # ``sweep_run()`` never fired and waves planned children without spawning
++  # them (driver killed the loop as ``diverged:no_progress``).
++  - name: sweep
++    type: implementer
++    dispatch_mode: serial
++    outputs:
++      - { name: sweep_result, path: sweep-result.json, kind: file, visibility: consumer }
++
+   - name: goal_check
+     type: verifier
+     prompt_ref: null
+@@ -44,7 +58,8 @@ nodes:
+ edges:
+   - { from: planner,          to: goal_state,        edge_type: depends_on }
+   - { from: goal_state,       to: sweep_dispatcher,  edge_type: depends_on }
+-  - { from: sweep_dispatcher, to: goal_check,        edge_type: depends_on }
++  - { from: sweep_dispatcher, to: sweep,             edge_type: depends_on }
++  - { from: sweep,            to: goal_check,        edge_type: depends_on }
+   - { from: goal_check,       to: publisher,         edge_type: depends_on }
+ 
+ recursion:

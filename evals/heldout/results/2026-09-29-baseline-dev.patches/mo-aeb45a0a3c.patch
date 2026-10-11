@@ -1,0 +1,780 @@
+diff --git a/kickoffs/book-goal-loop/launch-armed.sh b/kickoffs/book-goal-loop/launch-armed.sh
+index 4800b533..9b232705 100755
+--- a/kickoffs/book-goal-loop/launch-armed.sh
++++ b/kickoffs/book-goal-loop/launch-armed.sh
+@@ -70,6 +70,13 @@ export MO_STATIC_RECIPE_PLAN=1
+ export MINI_ORK_PROFILE_GATE=0
+ export MINI_ORK_RECURSIVE_MAX_PARALLEL=1
+ export MINI_ORK_ALLOW_CHILD_SPAWN=1
++# Patience windows: the book loop runs MAX_CHILDREN_PER_WAVE=1 over 10 chapters,
++# so the failing set cannot shrink until a whole chapter lands. Without the
++# patience window the UCCI signature repeats at wave 2 and the loop declares
++# no_progress before a real researcher fix can land. 6 waves = generous upper
++# bound for a code-fix child to ship a researcher fix that moves the failure.
++export MO_GOAL_DIVERGENCE_PATIENCE="${MO_GOAL_DIVERGENCE_PATIENCE:-6}"
++export MO_GOAL_QUARANTINE_PATIENCE="${MO_GOAL_QUARANTINE_PATIENCE:-6}"
+ # 0 = spawn a REAL fix child (LLM spend); 1 = scaffold-only (~$0 wiring proof).
+ export MO_GOAL_NO_EXECUTE="${MO_GOAL_NO_EXECUTE:-0}"
+ # CLOSED-LOOP verification ownership: the code-fix child's in-sandbox reviewer is
+diff --git a/recipes/goal-loop/lib/drive.py b/recipes/goal-loop/lib/drive.py
+index 7dede246..903479f3 100644
+--- a/recipes/goal-loop/lib/drive.py
++++ b/recipes/goal-loop/lib/drive.py
+@@ -219,6 +219,89 @@ def _default_state_dir(goal_id: str) -> str:
+     return os.path.join(home, "goal-loop", goal_id)
+ 
+ 
++def _parse_unit_reasons_from_goal_state(path: Path) -> dict[str, dict[str, Any]]:
++    """Parse ``<run_dir>/goal-state.json`` into the unit-fingerprint shape.
++
++    The wave's ``goal_state`` transform writes ``{unit_id: {"pass": bool, "reason":
++    str}}``. We map that into ``{unit_id: {"status": "pass"|"fail", "failing_node":
++    str, "reasons": [str]}}`` so :func:`wave_signature` and :func:`record_wave`
++    can fold per-unit progress (status + failing node + volatile-stripped reasons).
++
++    A ``failing_node`` is extracted from the reason text when present (either
++    via a literal ``node=<id>`` / ``failing_node=<id>`` token, or by taking the
++    first whitespace-delimited token — most production reasons look like
++    ``"W9 failed because ..."``). When the reason carries no node hint, the
++    fingerprint's ``failing_node`` is the empty string and the signature falls
++    back to status + reasons. Unparseable / missing files yield an empty dict,
++    which preserves the historical signature (unit-set only) for callers.
++    """
++    if not path.is_file():
++        return {}
++    try:
++        raw = json.loads(path.read_text(encoding="utf-8"))
++    except json.JSONDecodeError:
++        return {}
++    if not isinstance(raw, dict):
++        return {}
++
++    # Local copy of the regexes (loop_state has them too; we don't import to
++    # keep drive.py hermetic under ``python3 drive.py`` no-args invocation).
++    _node_pat = re.compile(r"\b(?:node|failing_node)=([\w.\-]+)")
++    _volatile_pat = re.compile(r"\b(?:attempts?|mdlen)=\d+\b")
++    _ws_pat = re.compile(r"\s+")
++
++    def _clean(reason: str) -> str:
++        return _ws_pat.sub(" ", _volatile_pat.sub("", reason or "")).strip()
++
++    def _node(reason: str) -> str:
++        m = _node_pat.search(reason or "")
++        if m:
++            return m.group(1)
++        # First whitespace-delimited token — empty if reason is empty.
++        tokens = (reason or "").split()
++        return tokens[0] if tokens else ""
++
++    out: dict[str, dict[str, Any]] = {}
++    for unit_id, state in raw.items():
++        if not isinstance(state, dict):
++            continue
++        is_pass = bool(state.get("pass"))
++        reason_text = str(state.get("reason", "") or "")
++        out[str(unit_id)] = {
++            "status": "pass" if is_pass else "fail",
++            "failing_node": "" if is_pass else _node(reason_text),
++            "reasons": [_clean(reason_text)] if reason_text else [],
++        }
++    return out
++
++
++def _parse_attempted_from_sweep_result(path: Path) -> list[str]:
++    """Parse ``<run_dir>/sweep-result.json`` into the list of attempted unit ids.
++
++    The wave's ``sweep`` node writes ``{"units": [{"unit_id": ..., "status":
++    ...}, ...]}``. ``attempted`` is the subset that were ACTUALLY dispatched
++    (``status in {"spawned", "failed"}``); ``deferred`` / ``dry_run`` units
++    were capped out by the parallel budget and must not accrue quarantine
++    hashes for failures the loop never tried to fix.
++    """
++    if not path.is_file():
++        return []
++    try:
++        raw = json.loads(path.read_text(encoding="utf-8"))
++    except json.JSONDecodeError:
++        return []
++    if not isinstance(raw, dict):
++        return []
++    units = raw.get("units") or []
++    if not isinstance(units, list):
++        return []
++    return [
++        str(u.get("unit_id"))
++        for u in units
++        if isinstance(u, dict) and u.get("status") in {"spawned", "failed"}
++    ]
++
++
+ def _default_run_wave_fn(wave_no: int, quarantined: set[str]) -> dict[str, Any]:
+     """Production wave runner — shells ``bin/mini-ork run goal-loop <kickoff>``."""
+     kickoff = os.environ.get("MO_GOAL_WAVE_KICKOFF") or os.environ.get("MO_GOAL_CHILD_KICKOFF")
+@@ -250,6 +333,15 @@ def _default_run_wave_fn(wave_no: int, quarantined: set[str]) -> dict[str, Any]:
+             payload.update(json.loads(Path(panel_path).read_text(encoding="utf-8")))
+         except json.JSONDecodeError:
+             pass
++    # Thread the per-unit fingerprint + attempted set so record_wave can
++    # fold real progress (status + failing node + volatile-stripped reasons)
++    # and scope quarantine hashing to the units this wave actually tried.
++    payload["unit_reasons"] = _parse_unit_reasons_from_goal_state(
++        Path(run_dir) / "goal-state.json",
++    )
++    payload["attempted"] = _parse_attempted_from_sweep_result(
++        Path(run_dir) / "sweep-result.json",
++    )
+     payload["exit_code"] = proc.returncode
+     payload["quarantined"] = sorted(quarantined)
+     return payload
+@@ -344,16 +436,36 @@ def drive(
+     resolved_run_wave = run_wave_fn or _default_run_wave_fn
+     resolved_cost = cost_fn or _default_cost_fn
+ 
++    # Patience windows for the two stop conditions. Default 2 preserves the
++    # all-units-per-wave contract (every unit in failing_after hashed every
++    # wave → two identical in a row means no progress). The book launcher
++    # raises these to 6 (MO_GOAL_DIVERGENCE_PATIENCE / MO_GOAL_QUARANTINE_PATIENCE)
++    # so a code-fix child gets several waves to land a real researcher fix
++    # before the loop declares a unit hopeless. With per-unit fingerprints
++    # and attempted-scoped hashing, identical-fingerprint repeats are already
++    # rare; the patience window is the belt-and-braces upper bound.
++    divergence_patience = _env_int("MO_GOAL_DIVERGENCE_PATIENCE", 2)
++    quarantine_patience = _env_int("MO_GOAL_QUARANTINE_PATIENCE", 2)
++    if divergence_patience < 1:
++        raise ValueError("MO_GOAL_DIVERGENCE_PATIENCE must be >= 1")
++    if quarantine_patience < 1:
++        raise ValueError("MO_GOAL_QUARANTINE_PATIENCE must be >= 1")
++
+     state = load_state(resolved_state_dir, goal_id)
+ 
+     while len(state.get("waves", [])) < max_waves:
+         wave_no = len(state.get("waves", [])) + 1
+ 
+-        # GRAO quarantine: skip units whose last 2 fix-hashes are identical.
++        # GRAO quarantine: skip units whose last ``quarantine_patience``
++        # fix-hashes are identical. With attempted-scoped hashing this is
++        # almost always empty for a healthy loop; the patience window is
++        # the upper bound against a truly stuck child.
+         quarantined: set[str] = set()
+         for unit_id, history in state.get("failed_fixes", {}).items():
+-            if len(history) >= 2 and history[-1] == history[-2]:
+-                quarantined.add(unit_id)
++            if len(history) >= quarantine_patience:
++                recent = history[-quarantine_patience:]
++                if all(h == recent[0] for h in recent):
++                    quarantined.add(unit_id)
+ 
+         # Cheap projection-based budget stop BEFORE we spend on a new wave.
+         projected = _projected_wave_cost(state)
+@@ -390,6 +502,10 @@ def drive(
+             failing_before = sorted(prev_after)
+         cost_usd = float(verdict_dict.get("cost_usd", 0.0) or 0.0)
+         run_id = str(verdict_dict.get("run_id", "") or "")
++        attempted = verdict_dict.get("attempted")
++        if attempted is not None:
++            attempted = sorted(attempted)
++        unit_reasons = verdict_dict.get("unit_reasons")
+ 
+         record_wave(
+             state,
+@@ -398,6 +514,8 @@ def drive(
+             failing_before=failing_before,
+             failing_after=failing_after,
+             cost_usd=cost_usd,
++            attempted=attempted,
++            unit_reasons=unit_reasons,
+         )
+ 
+         # 1. goal_met — wave verdict == "pass".
+@@ -440,7 +558,7 @@ def drive(
+             return payload
+ 
+         # 3. diverged — UCCI divergence-kill (signature repeat or regressing).
+-        div = divergence(state)
++        div = divergence(state, patience=divergence_patience)
+         if div is not None:
+             payload = {
+                 "stop": "diverged",
+@@ -476,7 +594,8 @@ def drive(
+         "failing_units": final_failing,
+         "quarantined_units": sorted(
+             u for u, h in state.get("failed_fixes", {}).items()
+-            if len(h) >= 2 and h[-1] == h[-2]
++            if len(h) >= quarantine_patience
++            and all(x == h[-quarantine_patience] for x in h[-quarantine_patience:])
+         ),
+     }
+     save_state(state, resolved_state_dir)
+diff --git a/recipes/goal-loop/lib/loop_state.py b/recipes/goal-loop/lib/loop_state.py
+index dc09be85..029f80fd 100644
+--- a/recipes/goal-loop/lib/loop_state.py
++++ b/recipes/goal-loop/lib/loop_state.py
+@@ -7,11 +7,23 @@ GRAO outcome-tagged memory (per-unit `failed_fixes` map) + UCCI divergence-kill
+ Pure functions, no globals, no I/O outside the state path the caller passes in.
+ The ``divergence()`` decision is the operator-visible stop signal — its returned
+ signature string lands verbatim in ``final-verdict.json`` for debugging.
++
++Divergence + quarantine take a patience window (``MO_GOAL_DIVERGENCE_PATIENCE``
++and ``MO_GOAL_QUARANTINE_PATIENCE``; default ``2`` to preserve the all-units-
++per-wave contract, the book launcher sets ``6`` so a code-fix child gets
++several waves to land a real researcher fix before the loop declares a unit
++hopeless). The signatures fold per-unit failure FINGERPRINTS — status +
++failing node + reasons with volatile counters stripped — so a fix that MOVES
++a chapter's failure ``W9 -> W15`` or clears it counts as progress even before
++the failing-set shrinks. ``reasons=None`` reproduces the historical set-only
++signature byte-for-byte (the pre-fingerprint behavior the prior 30 driver
++tests pin).
+ """
+ from __future__ import annotations
+ 
+ import hashlib
+ import json
++import re
+ from pathlib import Path
+ from typing import Any
+ 
+@@ -19,6 +31,18 @@ State = dict[str, Any]
+ 
+ STATE_FILENAME = "goal-loop-state.json"
+ 
++# Volatile counters embedded in reason strings by the goal-state predicate
++# (node attempt counts, markdown-length probes). Stripped from the fingerprint
++# so two retries against the same root cause produce the same signature.
++_VOLATILE_COUNTER_RE = re.compile(r"\b(?:attempts?|mdlen)=\d+\b")
++_WHITESPACE_RE = re.compile(r"\s+")
++
++
++def _strip_volatile(reason: str) -> str:
++    """Return ``reason`` with volatile counters collapsed out."""
++    out = _VOLATILE_COUNTER_RE.sub("", reason or "")
++    return _WHITESPACE_RE.sub(" ", out).strip()
++
+ 
+ def state_path(state_dir: str | Path) -> Path:
+     """Return the absolute path to the state JSON file for ``state_dir``."""
+@@ -87,16 +111,48 @@ def fix_hash(unit_id: str, failing_reasons: list[str] | None = None) -> str:
+     return h.hexdigest()
+ 
+ 
+-def wave_signature(failing_units: list[str]) -> str:
+-    """sha256 of the sorted failing-unit list for the wave.
++def wave_signature(
++    failing_units: list[str],
++    unit_reasons: dict[str, dict[str, Any]] | None = None,
++) -> str:
++    """sha256 of the wave's failure signature.
++
++    With ``unit_reasons=None`` (the historical call shape), folds ONLY the
++    sorted failing-unit list — byte-for-byte identical to the prior
++    ``wave_signature(failing_units)``. Existing callers that don't yet thread
++    the per-unit fingerprint continue to work unchanged.
+ 
+-    Identical signatures across consecutive waves means the outer driver
+-    fixed nothing; that is the UCCI divergence-kill trigger.
++    With ``unit_reasons`` provided as ``{unit_id: fingerprint_dict}``, folds
++    each unit's FINGERPRINT (status + failing node + sorted, volatile-stripped
++    reasons) so a fix that MOVES a chapter's failure ``W9 -> W15`` or clears
++    it counts as progress even before the failing set shrinks. The fingerprint
++    dict shape is ``{"status": "pass"|"fail", "failing_node": str, "reasons":
++    list[str]}``; unknown fields are ignored.
+     """
+     h = hashlib.sha256()
++    if unit_reasons is None:
++        # Historical path — set-only signature. Reproduces the pre-fingerprint
++        # hash byte-for-byte (the kickoff's "reasons=None reproduces the
++        # historical set-only signature" contract).
++        for unit in sorted(failing_units):
++            h.update(unit.encode("utf-8"))
++            h.update(b"\x00")
++        return h.hexdigest()
++
+     for unit in sorted(failing_units):
++        fingerprint = unit_reasons.get(unit) or {}
+         h.update(unit.encode("utf-8"))
+         h.update(b"\x00")
++        h.update(str(fingerprint.get("status", "")).encode("utf-8"))
++        h.update(b"\x00")
++        h.update(str(fingerprint.get("failing_node", "")).encode("utf-8"))
++        h.update(b"\x00")
++        for reason in sorted(
++            _strip_volatile(str(r)) for r in (fingerprint.get("reasons") or [])
++        ):
++            if reason:
++                h.update(reason.encode("utf-8"))
++                h.update(b"\x00")
+     return h.hexdigest()
+ 
+ 
+@@ -108,18 +164,31 @@ def record_wave(
+     failing_before: list[str],
+     failing_after: list[str],
+     cost_usd: float,
++    attempted: list[str] | None = None,
++    unit_reasons: dict[str, dict[str, Any]] | None = None,
+ ) -> State:
+     """Append a wave record + update ``failed_fixes`` for each still-failing unit.
+ 
+     ``failing_before`` is the unit set the wave STARTED trying to fix (i.e. the
+     units the wave's hunt selected — quarantined units are excluded).
+     ``failing_after`` is what is STILL failing at the end of the wave (the
+-    goal_state_eval output). ``failed_fixes[unit_id]`` records the hash for
+-    every unit that survived a wave; the same hash appearing on two waves
+-    means the same fix attempt was tried twice, which is the GRAO quarantine
+-    signal.
++    goal_state_eval output).
++
++    Quarantine hashing is SCOPED to the units the wave ACTUALLY attempted
++    (``sweep-result.json``'s ``attempted`` list). A pending chapter the
++    single-child loop never reached does NOT accrue identical hashes — without
++    this, a MAX_CHILDREN_PER_WAVE=1 loop over 10 chapters accrues the same
++    hash for every surviving unit by wave 2 and trips all_quarantined next.
++    ``attempted=None`` falls back to the historical "hash every failing_after"
++    behavior so prior callers (which never built the attempted set) continue
++    to produce the same quarantine timeline.
++
++    ``unit_reasons`` threads each attempted unit's fingerprint into the
++    quarantine hash via :func:`fix_hash`. With it, two retries against the
++    SAME failing node hash the same (quarantine); a retry against a MOVED
++    failing node hashes differently (no false-quarantine).
+     """
+-    sig = wave_signature(failing_after)
++    sig = wave_signature(failing_after, unit_reasons=unit_reasons)
+     wave_record = {
+         "wave": wave,
+         "run_id": run_id,
+@@ -131,38 +200,57 @@ def record_wave(
+     state.setdefault("waves", []).append(wave_record)
+ 
+     failed_fixes: dict[str, list[str]] = state.setdefault("failed_fixes", {})
+-    for unit_id in sorted(failing_after):
+-        # Hash is keyed on the unit id only — two consecutive waves where
+-        # the SAME unit remains in failing_after yields the SAME hash, which
+-        # is the GRAO quarantine trigger ("hash already appears twice"). The
+-        # kickoff §Goal ¶1 mentions ``sorted failing reasons`` as the second
+-        # hash input, but panel-verdict.json (the wave's contract output)
+-        # only carries unit ids, not per-unit reasons — the reasons live in
+-        # ``goal-state.json`` which the wave does not surface. Unit-id-keyed
+-        # hashing is the deterministic stand-in that keeps the quarantine
+-        # logic testable without a side channel for reasons.
+-        h = fix_hash(unit_id)
++    # Hashing scope: with attempted=None, hash every failing_after unit
++    # (historical behavior). With attempted provided, hash only the
++    # intersection so a pending chapter the wave never reached doesn't
++    # accrue hashes and trip all_quarantined spuriously.
++    if attempted is None:
++        units_to_hash = sorted(failing_after)
++    else:
++        attempted_set = set(attempted)
++        units_to_hash = sorted(u for u in failing_after if u in attempted_set)
++
++    for unit_id in units_to_hash:
++        fingerprint = (unit_reasons or {}).get(unit_id) or {}
++        reasons = fingerprint.get("reasons") or []
++        # Strip volatile counters here too so two retries against the same
++        # root cause hash identically even if the live counter changed.
++        cleaned = [_strip_volatile(str(r)) for r in reasons]
++        h = fix_hash(unit_id, failing_reasons=[c for c in cleaned if c])
+         failed_fixes.setdefault(unit_id, []).append(h)
+ 
+     return state
+ 
+ 
+-def should_quarantine(unit_id: str, current_hash: str, state: State) -> bool:
+-    """GRAO quarantine check.
+-
+-    Per kickoff §Goal ¶1 "A unit whose CURRENT failure hash already appears
+-    twice is QUARANTINED". This function checks if ``current_hash`` appears
+-    2+ times in ``state["failed_fixes"][unit_id]`` BEFORE we append the
+-    current sighting — caller decides whether to skip this wave entirely
+-    (quarantined units are skipped by the hunt, reported in
+-    ``final-verdict.json``).
++def should_quarantine(
++    unit_id: str,
++    current_hash: str,
++    state: State,
++    *,
++    patience: int | None = None,
++) -> bool:
++    """GRAO quarantine check (per-wave history tail).
++
++    Returns True when ``current_hash`` matches the last ``patience`` hashes
++    recorded for ``unit_id``. ``patience=None`` defaults to ``2`` (the
++    historical two-consecutive rule). The book launcher raises this to ``6``
++    via ``MO_GOAL_QUARANTINE_PATIENCE`` so a code-fix child gets several
++    waves to land a real fix before the loop declares the unit hopeless.
++
++    Note: this is the LOW-LEVEL check used by tests. The driver itself reads
++    ``MO_GOAL_QUARANTINE_PATIENCE`` and applies the same rule inline against
++    the in-memory history.
+     """
++    if patience is None:
++        patience = 2
+     history = state.get("failed_fixes", {}).get(unit_id, [])
+-    same_count = sum(1 for h in history if h == current_hash)
+-    return same_count >= 2
++    if len(history) < patience:
++        return False
++    recent = history[-patience:]
++    return all(h == recent[0] for h in recent)
+ 
+ 
+-def divergence(state: State) -> str | None:
++def divergence(state: State, *, patience: int | None = None) -> str | None:
+     """UCCI divergence-kill trigger.
+ 
+     Returns ``None`` when no divergence has been detected, or a short string
+@@ -170,31 +258,36 @@ def divergence(state: State) -> str | None:
+     written into ``final-verdict.json`` verbatim for operator debuggability.
+ 
+     Two trigger conditions (per kickoff §Goal ¶1):
+-      1. Same failure signature on two consecutive waves → "no_progress".
+-      2. ``failing_after > failing_before`` on two consecutive waves →
+-         "regressing".
++      1. Same failure signature on ``patience`` consecutive waves → "no_progress".
++      2. ``failing_after`` grew in each of the last ``patience`` waves → "regressing".
++
++    ``patience=None`` defaults to ``2`` (the historical two-consecutive rule);
++    the book launcher raises this to ``6`` via ``MO_GOAL_DIVERGENCE_PATIENCE``.
+     """
++    if patience is None:
++        patience = 2
+     waves: list[dict[str, Any]] = state.get("waves", [])
+-    if len(waves) < 2:
++    if len(waves) < patience:
+         return None
+ 
+-    last_two = waves[-2:]
++    last_n = waves[-patience:]
+ 
+-    sigs = [w.get("signature") for w in last_two]
+-    if len(sigs) == 2 and sigs[0] == sigs[1] and sigs[0] is not None:
++    sigs = [w.get("signature") for w in last_n]
++    if (
++        len(sigs) == patience
++        and all(s is not None for s in sigs)
++        and all(s == sigs[0] for s in sigs)
++    ):
+         return f"no_progress:{sigs[0]}"
+ 
+     def _failing_count(w: dict[str, Any]) -> int:
+         return len(w.get("failing_after", []))
+ 
+-    counts = [_failing_count(w) for w in last_two]
+-    if len(counts) == 2 and counts[1] > counts[0]:
+-        # Two waves in a row of growing failure counts. The kickoff says
+-        # "regressing two waves running" — both waves must show growth vs the
+-        # previous one. We only have two waves here, so we check whether the
+-        # second is larger than the first; if a third wave also grows the
+-        # next call (with three waves) will fire again. The kickoff's two-wave
+-        # rule applies once we have >= 2 waves to compare.
+-        return f"regressing:{counts[0]}->{counts[1]}"
++    counts = [_failing_count(w) for w in last_n]
++    if (
++        len(counts) == patience
++        and all(counts[i] > counts[i - 1] for i in range(1, patience))
++    ):
++        return "regressing:" + "->".join(str(c) for c in counts)
+ 
+     return None
+\ No newline at end of file
+diff --git a/tests/unit/test_goal_loop_driver.py b/tests/unit/test_goal_loop_driver.py
+index 602f1402..e4804dab 100644
+--- a/tests/unit/test_goal_loop_driver.py
++++ b/tests/unit/test_goal_loop_driver.py
+@@ -671,4 +671,293 @@ def test_cli_max_waves_flag_reaches_the_driver():
+         "--units-cmd", "echo u", "--predicate-cmd", "echo ok",
+         "--child-recipe", "code-fix", "--max-waves", "0",
+     ])
+-    assert rc == 2
+\ No newline at end of file
++    assert rc == 2
++
++
++# ── 11. wave_signature folds the per-unit FINGERPRINT, not the set only ──
++#   (U4b divergence fix: with MAX_CHILDREN_PER_WAVE=1 the failing set cannot
++#   shrink, so the old set-only signature repeats at wave 2 and trips
++#   no_progress before any researcher fix can land. The fingerprint folds
++#   status + failing node + volatile-stripped reasons so a fix that MOVES
++#   W9 → W15 or clears it counts as progress.)
++
++
++def test_wave_signature_strips_volatile_counters_keeps_failing_node():
++    """``attempts=N`` and ``mdlen=N`` do NOT change the signature; the failing
++    node DOES. Same fingerprint (status + node + non-volatile reason) → same
++    signature, regardless of how the live counter ticked between waves.
++    """
++    sig_t0 = _LOOP_STATE.wave_signature(
++        ["u1"],
++        unit_reasons={
++            "u1": {
++                "status": "fail",
++                "failing_node": "W9",
++                "reasons": ["W9 failed; mdlen=1234 vs 800 attempts=2"],
++            },
++        },
++    )
++    sig_t1 = _LOOP_STATE.wave_signature(
++        ["u1"],
++        unit_reasons={
++            "u1": {
++                "status": "fail",
++                "failing_node": "W9",
++                "reasons": ["W9 failed; mdlen=1300 vs 800 attempts=5"],
++            },
++        },
++    )
++    assert sig_t0 == sig_t1
++
++
++def test_wave_signature_changes_when_failure_moves_node():
++    """Moving the failure ``W9 -> W15`` MUST change the signature, so the
++    outer loop sees progress even when the failing set is identical."""
++    sig_w9 = _LOOP_STATE.wave_signature(
++        ["u1", "u2"],
++        unit_reasons={
++            "u1": {"status": "fail", "failing_node": "W9",
++                   "reasons": ["W9 failed"]},
++            "u2": {"status": "fail", "failing_node": "W12",
++                   "reasons": ["W12 failed"]},
++        },
++    )
++    sig_w15 = _LOOP_STATE.wave_signature(
++        ["u1", "u2"],
++        unit_reasons={
++            "u1": {"status": "fail", "failing_node": "W15",
++                   "reasons": ["W15 failed"]},
++            "u2": {"status": "fail", "failing_node": "W12",
++                   "reasons": ["W12 failed"]},
++        },
++    )
++    assert sig_w9 != sig_w15
++
++
++def test_wave_signature_backward_compat_reasons_none():
++    """``wave_signature(failing_units)`` (no unit_reasons) is byte-for-byte
++    identical to the pre-fingerprint implementation — the kickoff's
++    ``reasons=None reproduces the historical set-only signature`` contract."""
++    import hashlib
++    expected = hashlib.sha256()
++    for unit in sorted(["u1", "u2"]):
++        expected.update(unit.encode("utf-8"))
++        expected.update(b"\x00")
++    assert _LOOP_STATE.wave_signature(["u1", "u2"]) == expected.hexdigest()
++
++
++# ── 12. divergence() honors the patience window ─────────────────────────
++#   The book launcher raises MO_GOAL_DIVERGENCE_PATIENCE to 6 so a code-fix
++#   child gets several waves to land a real researcher fix before the loop
++#   declares no_progress. Patience=2 is the historical default that preserves
++#   the all-units-per-wave contract.
++
++
++def test_divergence_patience_window_three_waves(tmp_path, monkeypatch):
++    """patience=3: two identical signatures do NOT trip; the third does."""
++    monkeypatch.setenv("MO_GOAL_DIVERGENCE_PATIENCE", "3")
++    state_dir = tmp_path / "state"
++
++    def run_wave(wave_no, quarantined):
++        return {
++            "verdict": "fail",
++            "failing_after": ["u1"],
++            "attempted": ["u1"],
++            "unit_reasons": {"u1": {"status": "fail", "failing_node": "W9",
++                                    "reasons": ["W9 failed"]}},
++            "cost_usd": 1.0,
++            "run_id": f"r{wave_no}",
++        }
++
++    verdict = drive(
++        goal_id="g-pat-3", target_cwd="/tmp",
++        units_cmd="echo u", predicate_cmd="echo ok", child_recipe="code-fix",
++        max_waves=10, budget_total_usd=100.0,
++        run_wave_fn=run_wave, cost_fn=lambda: 0.0, state_dir=state_dir,
++    )
++
++    assert verdict["stop"] == "diverged"
++    assert verdict["waves"] == 3, "patience=3 must let 2 identical sigs through"
++
++
++# ── 13. record_wave scopes quarantine hashing to ATTEMPTED units ─────────
++#   Without this, MAX_CHILDREN_PER_WAVE=1 over 10 chapters accrues the same
++#   hash for every surviving unit by wave 2 and trips all_quarantined next
++#   (the kickoff's "GRAO quarantine was degenerate" finding).
++
++
++def test_record_wave_attempted_scoped_hashing():
++    """``attempted=[]`` means nothing was dispatched this wave; even if a unit
++    remains in failing_after, it must NOT accrue a quarantine hash."""
++    state = _LOOP_STATE.load_state(_tmp_empty_dir(), "g-attempt")
++
++    _LOOP_STATE.record_wave(
++        state,
++        wave=1, run_id="r1",
++        failing_before=["u_pending"],
++        failing_after=["u_pending"],  # never attempted
++        cost_usd=0.0,
++        attempted=[],
++        unit_reasons={},
++    )
++    assert "u_pending" not in state["failed_fixes"], (
++        "pending unit must not accrue hashes when attempted=[]"
++    )
++
++
++def _tmp_empty_dir():
++    """Lazily mint a fresh tmp dir per call — used only by hash-scope tests
++    that don't exercise persistence."""
++    import tempfile
++    return Path(tempfile.mkdtemp(prefix="loop-state-test-"))
++
++
++# ── 14. drive() integration: book loop survives to wave 4 and lands ──────
++#   Simulates MAX_CHILDREN_PER_WAVE=1 over 10 chapters. The single child
++#   moves the failure W9 → W15 (real progress) before clearing it on the
++#   third attempt. With fingerprints the outer loop sees that movement as
++#   a signature change; with set-only signatures it would have tripped
++#   no_progress at wave 2.
++
++
++def test_book_loop_survives_to_wave_4_and_lands(tmp_path):
++    state_dir = tmp_path / "state"
++    pending = [f"ch{i:02d}" for i in range(1, 10)]  # 9 chapters still pending
++    waves_run: list[int] = []
++
++    # Per-wave fingerprint for the hunted chapter. Moved failure between
++    # waves 1 → 2; cleared on wave 3 → goal_met on wave 4.
++    fingerprints = {
++        1: {"ch00": {"status": "fail", "failing_node": "W9",
++                     "reasons": ["W9 failed mdlen=1200"]}},
++        2: {"ch00": {"status": "fail", "failing_node": "W15",
++                     "reasons": ["W15 failed mdlen=850"]}},
++        3: {"ch00": {"status": "fail", "failing_node": "W9",
++                     "reasons": ["W9 failed mdlen=1100"]}},
++    }
++
++    def run_wave(wave_no, quarantined):
++        waves_run.append(wave_no)
++        if wave_no <= 3:
++            return {
++                "verdict": "fail",
++                "failing_after": ["ch00"] + pending,
++                "attempted": ["ch00"],
++                "unit_reasons": fingerprints[wave_no],
++                "cost_usd": 1.0,
++                "run_id": f"r{wave_no}",
++            }
++        return {"verdict": "pass", "failing_after": [], "cost_usd": 1.0,
++                "run_id": "r4"}
++
++    verdict = drive(
++        goal_id="g-book-loop", target_cwd="/tmp",
++        units_cmd="echo u", predicate_cmd="echo ok", child_recipe="code-fix",
++        max_waves=10, budget_total_usd=100.0,
++        run_wave_fn=run_wave, cost_fn=lambda: 0.0, state_dir=state_dir,
++    )
++
++    assert verdict["stop"] == "goal_met"
++    assert waves_run == [1, 2, 3, 4], (
++        "the loop must NOT trip no_progress at wave 2 when the failure "
++        "moves W9 → W15; pending chapters must not spuriously trip "
++        "all_quarantined."
++    )
++
++
++# ── 15. drive() integration: book loop still diverges at the window ──────
++#   Sanity check: patience=3 must NOT mask genuine stuckness. Three waves
++#   of IDENTICAL fingerprint still trips no_progress — at wave 3, not 2.
++
++
++def test_book_loop_diverges_at_window_not_before(tmp_path, monkeypatch):
++    monkeypatch.setenv("MO_GOAL_DIVERGENCE_PATIENCE", "3")
++    state_dir = tmp_path / "state"
++    waves_run: list[int] = []
++
++    def run_wave(wave_no, quarantined):
++        waves_run.append(wave_no)
++        return {
++            "verdict": "fail",
++            "failing_after": ["u1"],
++            "attempted": ["u1"],
++            "unit_reasons": {"u1": {"status": "fail", "failing_node": "W9",
++                                    "reasons": ["W9 failed"]}},
++            "cost_usd": 1.0,
++            "run_id": f"r{wave_no}",
++        }
++
++    verdict = drive(
++        goal_id="g-div-window", target_cwd="/tmp",
++        units_cmd="echo u", predicate_cmd="echo ok", child_recipe="code-fix",
++        max_waves=10, budget_total_usd=100.0,
++        run_wave_fn=run_wave, cost_fn=lambda: 0.0, state_dir=state_dir,
++    )
++
++    assert verdict["stop"] == "diverged"
++    assert verdict["waves"] == 3, (
++        "patience=3 must let the 1st and 2nd identical sigs through "
++        "and fire no_progress on the 3rd"
++    )
++
++
++# ── 16. drive() integration: pending units never trip all_quarantined ─────
++#   u_pending lives in failing_after every wave (the single-child loop
++#   never reaches it). Without attempted-scoped hashing, after 2 waves the
++#   identical unit_id hash would mark it quarantined and the next wave's
++#   all_quarantined check would fire spuriously.
++
++
++def test_pending_unit_never_trips_all_quarantined(tmp_path):
++    state_dir = tmp_path / "state"
++    waves_run: list[int] = []
++
++    def run_wave(wave_no, quarantined):
++        waves_run.append(wave_no)
++        # Wave 1+2: u1 hunted (fingerprint changes — loop should keep going).
++        # u_pending never attempted; sits in failing_after every wave.
++        # Wave 3+: u1 cleared → only u_pending remains, never quarantined.
++        if wave_no <= 2:
++            return {
++                "verdict": "fail",
++                "failing_after": ["u1", "u_pending"],
++                "attempted": ["u1"],
++                "unit_reasons": {
++                    "u1": {"status": "fail", "failing_node": "W9"
++                           if wave_no == 1 else "W15",
++                           "reasons": ["moved"]},
++                },
++                "cost_usd": 1.0,
++                "run_id": f"r{wave_no}",
++            }
++        # Wave 3+: u1 cleared, only u_pending remains, nothing to attempt.
++        return {
++            "verdict": "fail",
++            "failing_after": ["u_pending"],
++            "attempted": [],
++            "unit_reasons": {},
++            "cost_usd": 1.0,
++            "run_id": f"r{wave_no}",
++        }
++
++    verdict = drive(
++        goal_id="g-pending", target_cwd="/tmp",
++        units_cmd="echo u", predicate_cmd="echo ok", child_recipe="code-fix",
++        max_waves=10, budget_total_usd=100.0,
++        run_wave_fn=run_wave, cost_fn=lambda: 0.0, state_dir=state_dir,
++    )
++
++    assert "u_pending" not in verdict["quarantined_units"], (
++        "u_pending must never be quarantined — it was never attempted, so "
++        "no quarantine hash was ever recorded for it"
++    )
++    # The KEY invariant: all_quarantined must NOT fire spuriously on a
++    # pending unit (the historical failure mode this fix exists to prevent).
++    assert verdict["stop"] != "all_quarantined", (
++        "all_quarantined must not fire when the pending unit was never "
++        "attempted — it has no quarantine history by construction"
++    )
++    # u1 (the hunted chapter) did produce a stable fingerprint across waves
++    # 3+ where only u_pending remains, so the loop correctly trips
++    # 'diverged' or 'max_waves_reached' — both are acceptable signals that
++    # the loop noticed the stuckness without falsely quarantining u_pending.
+\ No newline at end of file

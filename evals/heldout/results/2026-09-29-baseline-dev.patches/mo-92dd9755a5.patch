@@ -1,0 +1,33 @@
+diff --git a/mini_ork/cli/main.py b/mini_ork/cli/main.py
+index 701d4722..f83c32e4 100644
+--- a/mini_ork/cli/main.py
++++ b/mini_ork/cli/main.py
+@@ -134,6 +134,11 @@ Environment:
+ def _module_env(root):
+     env = context_env_snapshot()
+     env["PYTHONPATH"] = root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
++    # PYTHONSAFEPATH (Python 3.11+) drops the implicit cwd entry from sys.path,
++    # so the PYTHONPATH we just pinned at `root` resolves even when a child is
++    # spawned with cwd at a target repo that contains its own mini_ork/ tree.
++    # Without it the target's stale mini_ork/ wins and the engine is shadowed.
++    env["PYTHONSAFEPATH"] = "1"
+     return env
+ 
+ 
+@@ -586,9 +591,13 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
+         return 0
+ 
+     # ── plan ──
+-    plan_env = dict(os.environ)
+-    plan_env["PYTHONPATH"] = root + (os.pathsep + plan_env["PYTHONPATH"]
+-                                      if plan_env.get("PYTHONPATH") else "")
++    # Use the shared _module_env helper so the plan child cannot drift from
++    # every other module child. _module_env pins PYTHONPATH at `root` and sets
++    # PYTHONSAFEPATH=1, which drops the implicit cwd entry from sys.path so a
++    # child whose cwd holds a target repo with its own mini_ork/ tree cannot
++    # shadow the engine (the plan child would otherwise write a stale rehearsal
++    # placeholder over the live run's plan.json).
++    plan_env = _module_env(root)
+     pl = subprocess.run(
+         [sys.executable, "-m", "mini_ork.cli.plan", kickoff],
+         capture_output=True, text=True, env=plan_env,

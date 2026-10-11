@@ -1,0 +1,128 @@
+diff --git a/mini_ork/recovery/planner.py b/mini_ork/recovery/planner.py
+index 8ef11ecc..ef83a745 100644
+--- a/mini_ork/recovery/planner.py
++++ b/mini_ork/recovery/planner.py
+@@ -79,6 +79,7 @@ Module layout (SOLID SRP split — behavior byte-identical parity port):
+ """
+ from __future__ import annotations
+ 
++import json
+ import os
+ import sys
+ 
+@@ -166,6 +167,19 @@ def _resolve_default_paths(
+       3. ``$CWD/.mini-ork/runs/<run_id>`` (the install-default).
+     The same precedence mirrors mini_ork_resume (see :44-49) so the
+     two subcommands agree on where the artifacts live.
++
++    Recipe resolution order:
++      1. ``MINI_ORK_RECIPE`` env (authoritative — set by the live execute
++         loop on a healthy run).
++      2. ``<run_dir>/run_profile.json["recipe"]`` — the recipe the
++         original run was kicked off with. Without this fallback an
++         unset ``MINI_ORK_RECIPE`` collapses every checkpoint's
++         recipe hash to ``"unknown"`` and the planner reports the
++         whole DAG as hash_mismatch (plan.py defaults ``recipe_eff``
++         to ``"unknown"``). The bash wrapper used to set
++         ``MINI_ORK_RECIPE`` for us; the in-process recover path
++         reads it from the profile so the planner's config_hash
++         matches what E1 wrote at run time.
+     """
+     run_dir_env = context_env("MINI_ORK_RUN_DIR", "").strip()
+     home = context_env("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
+@@ -179,6 +193,20 @@ def _resolve_default_paths(
+     if not workflow and recipe:
+         root = os.environ.get("MINI_ORK_ROOT") or os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+         workflow = os.path.join(root, "recipes", recipe, "workflow.yaml")
++    if not recipe:
++        # Fall back to run_profile.json so the planner doesn't hash every
++        # checkpoint against "unknown". Silent on a malformed/missing
++        # profile (legacy pre-0052 layouts may not have one).
++        rp = os.path.join(run_dir, "run_profile.json")
++        try:
++            with open(rp, encoding="utf-8") as _f:
++                _profile = json.load(_f)
++        except (OSError, ValueError):
++            _profile = None
++        if isinstance(_profile, dict):
++            _val = _profile.get("recipe")
++            if isinstance(_val, str) and _val:
++                recipe = _val
+     return run_dir, db, workflow, recipe
+ 
+ 
+@@ -403,6 +431,8 @@ def main(argv: list[str] | None = None) -> int:
+     # MINI_ORK_LEASE_TOKEN so execute's checkpoint publish is fenced against a
+     # stale worker. Gated on lease_tables_present so a pre-0052 (legacy) DB
+     # recovers fence-free exactly as E2 did.
++    _req_id: str | None = None
++    _token: str | None = None
+     if _lease is not None and _lease.lease_tables_present(db_path):
+         _from = plan.first_node or (from_node or "")
+         _req = _lease.request_recovery(db_path, run_id, _from, strategy)
+@@ -416,19 +446,60 @@ def main(argv: list[str] | None = None) -> int:
+             )
+             return 0
+         if _req is not None:
+-            apply_env_overrides({"MINI_ORK_RECOVERY_REQUEST": _req[0]})
+-            _lease.mark_dispatched(db_path, _req[0], owner_token=_token, cost_usd=0.0)
++            _req_id = _req[0]
++            apply_env_overrides({"MINI_ORK_RECOVERY_REQUEST": _req_id})
++            _lease.mark_dispatched(db_path, _req_id, owner_token=_token, cost_usd=0.0)
+         apply_env_overrides({"MINI_ORK_LEASE_TOKEN": _token})
+ 
+-    # Active strategies: emit the env, print the plan, hand off to
+-    # the native executor which honors MINI_ORK_RECOVERY_FROM + CLOSURE.
++    # Active strategies: emit the env, then hand off to the native
++    # executor IN-PROCESS — the env hand-off is process-local
++    # (see _emit_recovery_env:191 contract), and the bash wrapper that
++    # used to chain `recover` → `execute` was retired in the 2026-07
++    # bash removal. Dispatching in-process keeps MINI_ORK_RECOVERY_FROM /
++    # CLOSURE / LEASE_TOKEN alive AND guarantees the lease is released
++    # before this process exits, so the lease can't be held for its TTL
++    # while no node actually runs. On a pre-0052 DB ``_req_id`` /
++    # ``_token`` stay ``None`` and the cleanup below is a no-op.
+     _emit_recovery_env(plan)
+     sys.stdout.write(format_status(plan))
+     sys.stdout.write(
+         f"[mini-ork-recover] dispatching closure from node={plan.first_node} "
+         f"({len(plan.closure)} node{'s' if len(plan.closure) != 1 else ''} to rerun)\n"
+     )
+-    return 0
++    # ``execute`` derives node_ids from MINI_ORK_WORKFLOW when there's no
++    # plan.json (``_recovery_no_plan`` in execute._resolve_plan_path), so
++    # publish it here. Tests and operators may already have set it.
++    if workflow:
++        apply_env_overrides({"MINI_ORK_WORKFLOW": workflow})
++    # Lazy import — execute imports from this module
++    # (``from mini_ork.recovery.planner import load_dag``); a top-level
++    # import would loop. Same pattern as ``cancel_recovery`` above.
++    try:
++        from mini_ork.cli import execute as _mini_ork_execute  # noqa: PLC0415
++        rc = _mini_ork_execute.main(["--recovery"])
++    except SystemExit as exc:
++        rc = exc.code if isinstance(exc.code, int) else 1
++    except Exception as exc:  # noqa: BLE001 — never silently swallow dispatch
++        sys.stderr.write(f"[mini-ork-recover] execute dispatch failed: {exc!r}\n")
++        rc = 1
++    # Close the recovery request (completed|failed) + release the lease
++    # so the run is no longer "TTL-held by a worker that did no work".
++    # Failure here is logged but does not mask the dispatch rc — the
++    # caller still sees whether the executor actually ran.
++    if _req_id is not None and _lease is not None:
++        try:
++            _lease.close_recovery(
++                db_path, _req_id,
++                status="completed" if rc == 0 else "failed",
++            )
++        except Exception as exc:  # noqa: BLE001
++            sys.stderr.write(f"[mini-ork-recover] close_recovery failed: {exc!r}\n")
++    if _token is not None and _lease is not None:
++        try:
++            _lease.release_lease(db_path, run_id, _token)
++        except Exception as exc:  # noqa: BLE001
++            sys.stderr.write(f"[mini-ork-recover] release_lease failed: {exc!r}\n")
++    return rc
+ 
+ 
+ if __name__ == "__main__":

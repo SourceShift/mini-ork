@@ -1,0 +1,52 @@
+diff --git a/mini_ork/certify/llm.py b/mini_ork/certify/llm.py
+index cbba371f..4de52c8c 100644
+--- a/mini_ork/certify/llm.py
++++ b/mini_ork/certify/llm.py
+@@ -9,12 +9,19 @@ verifier process. Anything more elaborate (lane routing, telemetry) lives in
+ `llm_calls` row is written by the CLI wrapper, which this in-process path does
+ not go through), so the sidecar is read here and summed. A certificate reports
+ what the verdict cost from `spent()`, never from a table this path never wrote.
++
++Each call runs inside a `scoped_environ` that pins `MO_TARGET_CWD` to a freshly
++allocated scratch directory and removes it afterwards, so agentic lanes with
++file tools operate in a throwaway directory rather than the caller's repo
++(certify runs inside the user's own tree).
+ """
+ from __future__ import annotations
+ 
+ import os
++import shutil
+ import tempfile
+ 
++from mini_ork.context import ENV_TARGET_CWD, scoped_environ
+ from mini_ork.dispatch.llm_dispatch import mo_llm_dispatch
+ 
+ # The code-writing lane: probes and invariants are pytest code, so the default is a
+@@ -39,12 +46,18 @@ def default_dispatch(prompt: str) -> str:
+     The oracle already treats empty output as "could not build a probe" →
+     UNVERIFIED (see `oracle.judge`). Swallowing exceptions here is the contract:
+     a dispatch crash must not propagate and break a long-running verify loop.
++
++    Each call gets a scratch `MO_TARGET_CWD` so agentic lanes with file tools
++    operate in a throwaway directory rather than the caller's repo (which is
++    the user's project during live certify).
+     """
+     model = os.environ.get("MO_CERTIFY_MODEL", DEFAULT_MODEL)
+     fd, out_file = tempfile.mkstemp(prefix="certify-oracle-", suffix=".out")
++    scratch_dir = tempfile.mkdtemp(prefix="certify-oracle-scratch-")
+     try:
+         os.close(fd)
+-        rc = mo_llm_dispatch(model, prompt, out_file)
++        with scoped_environ({ENV_TARGET_CWD: scratch_dir}):
++            rc = mo_llm_dispatch(model, prompt, out_file)
+         _spend["calls"] += 1
+         try:
+             with open(out_file + ".cost", encoding="utf-8") as f:
+@@ -66,6 +79,7 @@ def default_dispatch(prompt: str) -> str:
+                 os.remove(out_file + suffix)
+             except OSError:
+                 pass
++        shutil.rmtree(scratch_dir, ignore_errors=True)
+ 
+ 
+ __all__ = ["DEFAULT_MODEL", "default_dispatch", "reset_spend", "spent"]

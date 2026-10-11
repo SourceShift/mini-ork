@@ -1,0 +1,375 @@
+diff --git a/kickoffs/book-goal-loop/binding/chapter_terminal_fail.py b/kickoffs/book-goal-loop/binding/chapter_terminal_fail.py
+new file mode 100755
+index 00000000..b1ee0070
+--- /dev/null
++++ b/kickoffs/book-goal-loop/binding/chapter_terminal_fail.py
+@@ -0,0 +1,214 @@
++#!/usr/bin/env python3
++"""fail-cmd for the goal-loop: has chapter <n> of BOOK_UUID terminally failed?
++
++Contract (recipes/goal-loop/lib/transforms.py::_await_terminal via
++_poll_until_settled): invoked as
++``python3 chapter_terminal_fail.py <chapter_number>`` (argv, not shell).
++Exit code is INVERTED vs the goal predicate:
++
++  exit 0 == the chapter is terminally failed (success for the fail-probe)
++  exit 1 == the chapter has NOT terminally failed (keep waiting)
++  exit 2 == bad input / missing config (conservative; the loop will keep waiting)
++  exit 3 == DB error (conservative; the loop will keep waiting and surface)
++
++The first stdout/stderr line is captured as the reason text. The consumer
++(_poll_until_settled) checks the success probe FIRST each cycle — a unit that
++both passes the goal predicate AND trips this fail probe in the same window is
++reported as passed, so a worker that finally completes right as we declare
++terminal failure still wins.
++
++Three terminal-failure signals, all checked against ``book_chapter_lifecycle``:
++
++  1. permanently_failed = 't' — always fires (the worker has decided the
++     chapter is hopeless; nothing the loop can do).
++
++  2. status in the failed set (default: failed | degraded | cancelled) — opt-
++     in via MO_GOAL_FAIL_ON_STATUS_FAILED=1 because a chapter can sit in
++     'failed' transiently before a retry (so the loop must not pounce on the
++     first sight of the string).
++
++  3. STALL — opt-in via MO_GOAL_STALL_SECONDS > 0 (set to 0 to disable). All
++     three must hold: status='generating', last_error is non-empty (the
++     worker is actively failing), and the newest ``run-*`` directory under
++     MO_GOAL_RUNS_DIR is at least MO_GOAL_STALL_SECONDS stale. Run-dir
++     freshness is the stall signal — NOT lifecycle.updated_at, which stays
++     frozen at the last chapter milestone during a HEALTHY long generation;
++     keying a stall on updated_at would kill healthy long gens.
++
++Conservative non-terminal cases (the loop keeps waiting):
++  * DB error / query failure
++  * missing lifecycle row for the chapter
++  * committed_complete = 't' — the chapter is actually done, NOT failed
++"""
++from __future__ import annotations
++
++import os
++import re
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++
++# Statuses that count as terminally failed when MO_GOAL_FAIL_ON_STATUS_FAILED=1.
++# 'failed' / 'degraded' / 'cancelled' are the book-goal-loop's settled-bad
++# outcomes; a transient 'failed' before retry is filtered by the opt-in gate.
++_FAILED_STATUSES = frozenset({"failed", "degraded", "cancelled"})
++
++
++def _q(sql: str) -> subprocess.CompletedProcess[str]:
++    return subprocess.run(
++        [
++            "psql",
++            "-h", os.environ.get("PGHOST", "REDACTED-INTERNAL-IP"),
++            "-p", os.environ.get("PGPORT", "5932"),
++            "-U", os.environ.get("PGUSER", "researcher_user"),
++            "-d", os.environ.get("PGDATABASE", "researcher_db"),
++            "-tA", "-F", "|", "-c", sql,
++        ],
++        capture_output=True,
++        text=True,
++    )
++
++
++def _int_env(name: str, default: int) -> int:
++    raw = os.environ.get(name)
++    if raw is None or raw.strip() == "":
++        return default
++    try:
++        return int(raw.strip())
++    except ValueError:
++        return default
++
++
++def _bool_env(name: str) -> bool:
++    raw = os.environ.get(name, "").strip()
++    return raw == "1"
++
++
++def _stall_seconds() -> int:
++    return _int_env("MO_GOAL_STALL_SECONDS", 0)
++
++
++def _runs_dir() -> str:
++    return os.environ.get("MO_GOAL_RUNS_DIR", "").strip()
++
++
++def _newest_run_mtime(runs_dir: str) -> float | None:
++    """Return the most-recent mtime (seconds) of any ``run-*`` child, or None.
++
++    A missing directory or one with no ``run-*`` children yields None — the
++    caller treats that as "no stall signal" rather than an error, because a
++    worker that hasn't produced a run dir yet is not necessarily stalled.
++    """
++    try:
++        root = Path(runs_dir)
++    except (OSError, ValueError):
++        return None
++    if not root.is_dir():
++        return None
++    newest: float | None = None
++    try:
++        for child in root.iterdir():
++            if not child.is_dir():
++                continue
++            if not child.name.startswith("run-"):
++                continue
++            try:
++                mtime = child.stat().st_mtime
++            except OSError:
++                continue
++            if newest is None or mtime > newest:
++                newest = mtime
++    except OSError:
++        return None
++    return newest
++
++
++def main(argv: list[str]) -> int:
++    if not argv:
++        print("usage: chapter_terminal_fail.py <chapter_number>", file=sys.stderr)
++        return 2
++    chapter = argv[0].strip()
++    if not re.fullmatch(r"\d+", chapter):
++        print(f"bad chapter id: {chapter!r}", file=sys.stderr)
++        return 2
++    book = os.environ.get("BOOK_UUID", "").strip()
++    if not re.fullmatch(r"[0-9a-fA-F-]{36}", book):
++        print(f"BOOK_UUID unset/invalid: {book!r}", file=sys.stderr)
++        return 2
++
++    sql = (
++        "SELECT status, "
++        "committed_complete, "
++        "permanently_failed, "
++        "generation_attempts, "
++        "coalesce(last_error,''), "
++        "coalesce(degraded,'f') "
++        "FROM book_chapter_lifecycle "
++        f"WHERE book_uuid='{book}' AND chapter_number={chapter};"
++    )
++    proc = _q(sql)
++    if proc.returncode != 0:
++        print(f"ch{chapter} db-error: {proc.stderr.strip()[:80]}")
++        return 3
++
++    rows = proc.stdout.strip().splitlines()
++    if not rows:
++        print(f"ch{chapter} missing: no lifecycle row for this chapter")
++        return 1
++
++    cols = (rows[0].split("|") + [""] * 6)[:6]
++    status, committed, permfail, _attempts, lasterr, degraded = cols
++
++    # Conservative: a chapter marked complete is NOT a terminal failure — it
++    # succeeded. The success probe (chapter_predicate.py) will already have
++    # agreed, but if the race makes us run first, do not false-trip.
++    if committed == "t":
++        print(f"ch{chapter} committed_complete=t — not a terminal failure")
++        return 1
++
++    # 1) permanently_failed=t ALWAYS fires — the worker has given up.
++    if permfail == "t":
++        print(
++            f"ch{chapter} TERMINAL_FAIL permanently_failed=t "
++            f"status={status} degraded={degraded}"
++        )
++        return 0
++
++    # 2) status in the failed set — opt-in because 'failed' can be transient
++    #    before a retry; the loop must not pounce on the first sighting.
++    if _bool_env("MO_GOAL_FAIL_ON_STATUS_FAILED") and status in _FAILED_STATUSES:
++        print(
++            f"ch{chapter} TERMINAL_FAIL status={status} (opt-in) "
++            f"degraded={degraded} err={lasterr[:60]}"
++        )
++        return 0
++
++    # 3) STALL — opt-in via MO_GOAL_STALL_SECONDS > 0. All three conditions
++    #    must hold: the worker is generating, it has a fresh error, and the
++    #    newest run-* dir is stale. Keying on run-dir freshness (NOT
++    #    lifecycle.updated_at) avoids killing healthy long generations whose
++    #    updated_at stays frozen at the last chapter milestone.
++    stall_s = _stall_seconds()
++    runs_dir = _runs_dir()
++    if stall_s > 0 and runs_dir and status == "generating" and lasterr.strip():
++        newest = _newest_run_mtime(runs_dir)
++        if newest is not None:
++            idle = time.time() - newest
++            if idle >= stall_s:
++                print(
++                    f"ch{chapter} TERMINAL_FAIL stall status=generating "
++                    f"err={lasterr[:40]} idle_s={int(idle)} >= {stall_s}"
++                )
++                return 0
++
++    print(
++        f"ch{chapter} not-terminal status={status} committed={committed} "
++        f"permfail={permfail} degraded={degraded}"
++    )
++    return 1
++
++
++if __name__ == "__main__":
++    sys.exit(main(sys.argv[1:]))
+\ No newline at end of file
+diff --git a/kickoffs/book-goal-loop/launch-armed.sh b/kickoffs/book-goal-loop/launch-armed.sh
+index 476cb519..1b3761cd 100755
+--- a/kickoffs/book-goal-loop/launch-armed.sh
++++ b/kickoffs/book-goal-loop/launch-armed.sh
+@@ -55,6 +55,19 @@ export MO_GOAL_WAVE_KICKOFF="$BIND/wave-kickoff.md"
+ export MO_GOAL_CHILD_KICKOFF="$BIND/child-kickoff.md"
+ export MO_GOAL_UNITS_CMD="bash $BIND/list_chapters.sh"
+ export MO_GOAL_PREDICATE_CMD="python3 $BIND/chapter_predicate.py"
++# Optional terminal-fail probe (opt-in): exit 0 == the chapter has terminally
++# failed (permanently_failed=t / opt-in status=failed / opt-in STALL) so the
++# outer loop quarantines + re-plans instead of burning the full
++# MO_GOAL_APPLY_AWAIT_SECONDS window on a hopeless regen. Default unset →
++# _poll_until_settled collapses to the historical wait-for-pass-only loop.
++export MO_GOAL_TERMINAL_FAIL_CMD="${MO_GOAL_TERMINAL_FAIL_CMD:-python3 $BIND/chapter_terminal_fail.py}"
++# Run-dir the stall detector scans (researcher's chapter run-* directories).
++# Override per-deployment if the researcher's run root lives elsewhere.
++export MO_GOAL_RUNS_DIR="${MO_GOAL_RUNS_DIR:-$PRIMARY/runs}"
++# Stall threshold (seconds idle on the newest run-* dir, opt-in). 0 disables.
++# 1200s = 20min ≈ ~10x the goal-loop node cadence, so a healthy long gen
++# (~30s/run-dir churn) never trips; a worker that crashed mid-chapter does.
++export MO_GOAL_STALL_SECONDS="${MO_GOAL_STALL_SECONDS:-1200}"
+ # DEEP evidence (optional but on by default here): run ONCE per wave for only the
+ # selected fix units, capturing the real failure picture (untruncated last_error,
+ # the artifact the lane produced, produced-vs-required heading delta) so the fix
+diff --git a/recipes/goal-loop/lib/transforms.py b/recipes/goal-loop/lib/transforms.py
+index 86d9fee3..2910d3fe 100644
+--- a/recipes/goal-loop/lib/transforms.py
++++ b/recipes/goal-loop/lib/transforms.py
+@@ -261,6 +261,70 @@ def _poll_until_zero(
+         waited += step
+ 
+ 
++def _poll_until_settled(
++    success_fn: Callable[[], int],
++    fail_fn: Callable[[], int] | None,
++    *,
++    timeout_s: int,
++    poll_s: int,
++) -> dict[str, Any]:
++    """Poll success FIRST each cycle, then the (optional) fail probe.
++
++    Both probes use the same inverted convention as :func:`_poll_until_zero`
++    (rc=0 == signal raised). The success probe wins ties: a unit that BOTH
++    passes the goal predicate AND trips the terminal-fail probe in the same
++    window is reported as ``terminal=False, settled=True`` so a worker that
++    finally completes the chapter does not lose to a parallel failure just
++    declared by a stall detector. Returning ``settled/terminal/reason``
++    lets the caller tell goal_met from terminal_failure from timeout without
++    re-deriving the rc logic.
++
++    ``fail_fn=None`` collapses to the historical wait-for-success-only loop
++    (one probe per cycle, same shape as :func:`_poll_until_zero`), so unarmed
++    loops — MO_GOAL_TERMINAL_FAIL_CMD unset — are byte-for-byte unchanged.
++    """
++    step = poll_s if poll_s > 0 else (timeout_s + 1)
++    waited = 0
++    last_pass: int | None = None
++    last_fail: int | None = None
++    while True:
++        last_pass = success_fn()
++        if last_pass == 0:
++            return {
++                "settled": True,
++                "terminal": False,
++                "reason": "goal_met",
++                "waited_s": waited,
++                "last_pass_rc": last_pass,
++                "last_fail_rc": last_fail,
++            }
++        if fail_fn is not None:
++            last_fail = fail_fn()
++            if last_fail == 0:
++                return {
++                    "settled": True,
++                    "terminal": True,
++                    "reason": "terminal_failure",
++                    "waited_s": waited,
++                    "last_pass_rc": last_pass,
++                    "last_fail_rc": last_fail,
++                }
++        else:
++            last_fail = None
++        if waited >= timeout_s:
++            return {
++                "settled": False,
++                "terminal": False,
++                "reason": "timeout",
++                "waited_s": waited,
++                "last_pass_rc": last_pass,
++                "last_fail_rc": last_fail,
++            }
++        if poll_s > 0:
++            time.sleep(poll_s)
++        waited += step
++
++
+ def _units_to_apply(run_dir: str) -> list[str]:
+     """Read ``sweep-result.json`` and return the swept unit ids worth deploying."""
+     sweep_path = Path(run_dir) / "sweep-result.json"
+@@ -307,23 +371,43 @@ def _await_deploy() -> dict[str, Any]:
+ def _await_terminal(unit_id: str, cwd: str) -> dict[str, Any]:
+     """Block until ``unit_id`` reaches a terminal state after re-dispatch.
+ 
+-    Polls ``MO_GOAL_TERMINAL_CMD`` (argv prefix + unit_id) when set, else falls
+-    back to ``MO_GOAL_PREDICATE_CMD`` (terminal == the goal predicate passes).
+-    The unit id is always the final argv slot — never shell-interpolated.
++    Pass argv is built from ``MO_GOAL_TERMINAL_CMD`` (else
++    ``MO_GOAL_PREDICATE_CMD``); a fail argv is OPTIONALLY built from
++    ``MO_GOAL_TERMINAL_FAIL_CMD`` when the operator arms it. Both prepend
++    the same argv parser; the unit id is always the final discrete argv slot
++    for each — never shell-interpolated.
++
++    Poll order is success-first, so a chapter that simultaneously satisfies
++    the goal predicate AND trips the fail probe (e.g. a worker that finally
++    completes while a stall detector is firing) is reported as a pass. When
++    ``MO_GOAL_TERMINAL_FAIL_CMD`` is unset, ``fail_fn=None`` collapses the
++    poll to the historical wait-for-success-only loop — backward-compatible
++    for every unarmed driver.
+     """
+-    terminal_cmd = os.environ.get("MO_GOAL_TERMINAL_CMD") or os.environ.get(
++    pass_cmd = os.environ.get("MO_GOAL_TERMINAL_CMD") or os.environ.get(
+         "MO_GOAL_PREDICATE_CMD",
+     )
+-    if not terminal_cmd:
+-        return {"settled": False, "reason": "no MO_GOAL_TERMINAL_CMD/PREDICATE_CMD"}
+-    argv = shlex.split(terminal_cmd) + [unit_id]
++    if not pass_cmd:
++        return {
++            "settled": False,
++            "terminal": False,
++            "reason": "no MO_GOAL_TERMINAL_CMD/PREDICATE_CMD",
++        }
++    pass_argv = shlex.split(pass_cmd) + [unit_id]
++    fail_cmd = (os.environ.get("MO_GOAL_TERMINAL_FAIL_CMD") or "").strip()
++    fail_argv: list[str] | None = shlex.split(fail_cmd) + [unit_id] if fail_cmd else None
+     timeout_s = _int_env("MO_GOAL_APPLY_AWAIT_SECONDS", 5400)
+     poll_s = _int_env("MO_GOAL_APPLY_POLL_SECONDS", 60)
+-    result = _poll_until_zero(
+-        lambda: _run(argv, cwd=cwd, shell=False)["rc"],
+-        timeout_s=timeout_s, poll_s=poll_s,
++    result = _poll_until_settled(
++        lambda: _run(pass_argv, cwd=cwd, shell=False)["rc"],
++        (lambda: _run(fail_argv, cwd=cwd, shell=False)["rc"]) if fail_argv is not None else None,
++        timeout_s=timeout_s,
++        poll_s=poll_s,
+     )
+-    return {"settled": result["ok"], "unit_id": unit_id, **result}
++    # Carry `ok` for any consumer still keying off the old _poll_until_zero
++    # shape (set by tests + the apply-result.json schema); `settled` is the
++    # canonical name from here on.
++    return {"ok": result["settled"], "unit_id": unit_id, **result}
+ 
+ 
+ def _run_apply(run_dir: str) -> dict[str, Any]:

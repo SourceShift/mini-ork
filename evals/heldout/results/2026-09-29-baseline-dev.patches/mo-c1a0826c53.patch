@@ -1,0 +1,40 @@
+diff --git a/recipes/goal-loop/lib/drive.py b/recipes/goal-loop/lib/drive.py
+index c55e887b..701e495b 100644
+--- a/recipes/goal-loop/lib/drive.py
++++ b/recipes/goal-loop/lib/drive.py
+@@ -240,6 +240,17 @@ def _default_run_wave_fn(wave_no: int, quarantined: set[str]) -> dict[str, Any]:
+     # delimited; empty (no quarantine yet) leaves selection at historical.
+     wave_env = dict(os.environ)
+     wave_env["MO_GOAL_QUARANTINED_UNITS"] = "\n".join(sorted(quarantined))
++    # Snapshot pre-wave spend so the wave subprocess's REAL cost can be read
++    # off the today_cost_usd() delta. Previously cost_usd was sourced from
++    # panel-verdict.json (the panel node's own ~$0 call), which masked every
++    # wave as starved and trapped the autoraise predictor on
++    # ``len(funded) < patience`` forever.
++    db = os.environ.get("MINI_ORK_DB")
++    try:
++        from mini_ork.scheduler import today_cost_usd
++        cost_before = today_cost_usd(db)
++    except Exception:
++        cost_before = 0.0
+     proc = subprocess.run(
+         [cli, "run", "goal-loop", kickoff],
+         check=False, capture_output=True, text=True, env=wave_env,
+@@ -258,6 +269,17 @@ def _default_run_wave_fn(wave_no: int, quarantined: set[str]) -> dict[str, Any]:
+         except json.JSONDecodeError:
+             pass
+ 
++    # Override the panel's $0 cost_usd with the measured wave subprocess delta.
++    # Clamped >= 0 so a starved wave or a 24h-window slide reads as 'not
++    # funded' ($0) rather than going negative — negative traffic would defeat
++    # the funded-wave check that gates the autoraise predictor.
++    try:
++        from mini_ork.scheduler import today_cost_usd
++        cost_after = today_cost_usd(db)
++    except Exception:
++        cost_after = cost_before
++    payload["cost_usd"] = max(0.0, float(cost_after) - float(cost_before))
++
+     # Per-unit failure fingerprints (progress signal) from goal-state.json:
+     # a ``unit_id -> reason`` map the driver folds into the wave signature so
+     # a fix that moves a unit's failure counts as progress even before the

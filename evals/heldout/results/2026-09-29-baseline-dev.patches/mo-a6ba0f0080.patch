@@ -1,0 +1,82 @@
+diff --git a/mini_ork/cli/execute.py b/mini_ork/cli/execute.py
+index 9ea548ae..598aa430 100644
+--- a/mini_ork/cli/execute.py
++++ b/mini_ork/cli/execute.py
+@@ -1085,8 +1085,10 @@ def _verifier_runs_before_implementer(workflow, node_id) -> bool:
+     Baseline/parity capture nodes intentionally run before an implementer can
+     produce the plan's final artifacts. Applying the hollow-run artifact guard
+     to that phase creates a false failed-node count even when the baseline
+-    verifier itself passes. Unknown or malformed workflows fail closed by
+-    returning ``False``.
++    verifier itself passes. A workflow with no implementer is entirely
++    pre-implementation: its verifier scripts may be deterministic artifact
++    producers, so they must run their own contracts. Unknown or malformed
++    workflows fail closed by returning ``False``.
+     """
+     if not workflow or not node_id or not os.path.isfile(workflow):
+         return False
+@@ -1094,10 +1096,14 @@ def _verifier_runs_before_implementer(workflow, node_id) -> bool:
+         import yaml  # noqa: PLC0415
+         nodes = (yaml.safe_load(open(workflow, encoding="utf-8")) or {}).get("nodes") or []
+         current = next(i for i, node in enumerate(nodes) if node.get("name") == node_id)
+-        first_implementer = next(i for i, node in enumerate(nodes)
+-                                 if node.get("type") == "implementer")
++        first_implementer = next(
++            (i for i, node in enumerate(nodes) if node.get("type") == "implementer"),
++            None,
++        )
+     except (OSError, StopIteration, TypeError, AttributeError):
+         return False
++    if first_implementer is None:
++        return True
+     return current < first_implementer
+ 
+ 
+diff --git a/mini_ork/dispatch/providers.py b/mini_ork/dispatch/providers.py
+index b05dd369..dc04f243 100644
+--- a/mini_ork/dispatch/providers.py
++++ b/mini_ork/dispatch/providers.py
+@@ -27,9 +27,11 @@ from .models import DispatchRequest, DispatchResult, TokenUsage
+ from .secrets import SecretStoreError, read_secret_exports, secret_store_path
+ 
+ # Lanes mini-ork knows about. codex/gemini are EXECUTABLE wrappers (run the
+-# cl_*.sh as a command); the rest are the CLAUDE family (source the cl_*.sh to
+-# pin ANTHROPIC_* env, then run `claude --print --output-format json`).
++# cl_*.sh as a command). Anthropic-compatible gateways source a wrapper to pin
++# ANTHROPIC_* env, but must use plain-text output because their Claude CLI path
++# does not guarantee the native Claude JSON envelope.
+ EXECUTABLE_MODELS = frozenset({"codex", "gemini"})
++ANTHROPIC_COMPAT_MODELS = frozenset({"deepseek", "glm", "kimi", "minimax"})
+ KNOWN_MODELS = frozenset(
+     {"opus", "sonnet", "kimi", "glm", "minimax", "codex", "gemini", "deepseek"}
+ )
+@@ -455,7 +457,19 @@ def resolve_provider(
+         command: tuple[str, ...] = (str(wrapper), "--print", "--output-format", "text")
+         return ProviderSpec(model, command)
+ 
+-    # Claude family: env-pin from the wrapper, then run claude with JSON output.
++    # Anthropic-compatible gateways return a plain assistant response through
++    # the Claude CLI. Requesting a native Claude JSON envelope causes gateway
++    # notices or unparseable output to masquerade as a successful empty result.
++    env = claude_env_for(model, root, environment=environment)
++    if model in ANTHROPIC_COMPAT_MODELS:
++        return ProviderSpec(
++            model=model,
++            command=("claude", "--print", "--permission-mode", "bypassPermissions",
++                     "--output-format", "text"),
++            env=env,
++        )
++
++    # Native Claude family: env-pin from the wrapper, then run claude with JSON output.
+     # `--permission-mode bypassPermissions` is LOAD-BEARING: without it, `claude
+     # --print` runs in the default permission mode and auto-denies every Write/
+     # Edit/Bash-redirect in non-interactive mode, so an implementer/worker lane
+@@ -470,7 +484,7 @@ def resolve_provider(
+         parse_cost=claude_cost,
+         parse_text=claude_result_text,
+         parse_session=claude_session_id,
+-        env=claude_env_for(model, root, environment=environment),
++        env=env,
+     )
+ 
+ 

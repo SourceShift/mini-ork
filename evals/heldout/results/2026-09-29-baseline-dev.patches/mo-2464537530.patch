@@ -1,0 +1,480 @@
+diff --git a/bin/mini-ork-plan b/bin/mini-ork-plan
+index a6d0625b..b63436f5 100755
+--- a/bin/mini-ork-plan
++++ b/bin/mini-ork-plan
+@@ -91,6 +91,10 @@ export MINI_ORK_HOME MINI_ORK_DB
+ TASK_CLASS="${TASK_CLASS:-generic}"
+ WORKFLOW="${MINI_ORK_WORKFLOW:-}"
+ 
++# D-145: bounded LLM repair-retry + Zero-Fallback policy
++MAX_REPAIRS="${MO_PLAN_MAX_REPAIRS:-2}"
++DET_FALLBACK="${MO_PLAN_DETERMINISTIC_FALLBACK:-0}"
++
+ # ── resolve output path ───────────────────────────────────────────────────────
+ # Reuse MINI_ORK_RUN_ID from the dispatcher if present; else allocate one and export
+ RUN_ID="${MINI_ORK_RUN_ID:-run-$(date +%s)-$$}"
+@@ -942,58 +946,239 @@ print(json.dumps(plan, indent=2))
+ PY
+ }
+ 
+-if [ "$HAS_VERIFIER" = "missing_verifier_contract" ]; then
+-  _d015_preserve_raw "missing_verifier_contract"
+-  if PLAN_JSON=$(_d015_recipe_fallback_plan); then
+-    echo "PLAN WARNING: planner output did not expose verifier_contract.checks; using deterministic recipe fallback plan." >&2
+-    HAS_VERIFIER="ok"
+-  else
+-    echo "PLAN REJECTED: verifier_contract.checks is missing or empty." >&2
+-    echo "A plan is not complete until success-check is defined." >&2
+-    _d015_mark_plan_failed "missing_verifier_contract"
+-    trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"missing_verifier_contract\"}" >/dev/null 2>&1 || true
++# ── D-145: bounded LLM repair-retry loop with zero-fallback policy ───────────
++# Spec (D-145): parse_error / missing_verifier_contract / bad_artifact_contract /
++# bad_node_types trigger up to MO_PLAN_MAX_REPAIRS (default 2) LLM repair
++# attempts. Each retry re-invokes the planner with its raw invalid output +
++# the EXACT validation error + an instruction to return ONLY valid JSON
++# restating the required schema keys. Iterative self-repair (arXiv:2604.10508)
++# + error-reflection prompting (arXiv:2508.16729); truncation guard
++# (arXiv:2605.13076 / JSONSchemaBench 2501.10868) flags unbalanced braces.
++# If repairs are exhausted, planning HARD-FAILS (exit 1, D-015 forensics
++# preserved) — Zero-Fallback, never a silent hardcoded plan. The old
++# deterministic fallback survives only behind an explicit opt-in
++# MO_PLAN_DETERMINISTIC_FALLBACK=1 (default OFF).
++_repairable_verdicts='parse_error|missing_verifier_contract|bad_artifact_contract|bad_node_types'
++# shellcheck disable=SC2254  # intentional unquoted expansion for case-pattern alternation
++case "$HAS_VERIFIER" in
++  ok) ;;
++  placeholder_plan)
++    # Not recoverable per spec (template plans are not safe to auto-repair).
++    echo "PLAN REJECTED: planner emitted a template plan with placeholder values." >&2
++    echo "The selected plan must name real files, sections, actions, and verifier checks." >&2
++    _d015_preserve_raw "placeholder_plan"
++    _d015_mark_plan_failed "placeholder_plan"
++    trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"placeholder_plan\"}" >/dev/null 2>&1 || true
+     exit 1
+-  fi
+-fi
++    ;;
++  $_repairable_verdicts)
++    _last_verdict="$HAS_VERIFIER"
++    _repair_ok=0
++    for _attempt in $(seq 1 "$MAX_REPAIRS"); do
++      # Truncation guard (JSONSchemaBench 2501.10868): unbalanced braces
++      # are the top cause of planner parse_error; flag it in the repair
++      # prompt so the model returns the COMPLETE object, not a fragment.
++      _trunc_note=""
++      _open=$(printf '%s' "${PLAN_JSON_RAW:-}" | tr -cd '{' | wc -c | tr -d ' ')
++      _close=$(printf '%s' "${PLAN_JSON_RAW:-}" | tr -cd '}' | wc -c | tr -d ' ')
++      if [ "${_open:-0}" != "${_close:-0}" ]; then
++        _trunc_note="NOTE: previous output appears truncated (${_open} open vs ${_close} close braces). Return the COMPLETE JSON object, not a fragment."
++      fi
++      # Build repair prompt: original planner prompt + raw invalid output + exact error
++      REPAIR_PROMPT_TEXT=$(PROMPT_TEXT="$PROMPT_TEXT" \
++        PLAN_JSON_RAW="$PLAN_JSON_RAW" \
++        _REPAIR_VERDICT="$_last_verdict" \
++        _TRUNC_NOTE="$_trunc_note" \
++        python3 <<'PY'
++import os, sys
++sys.stdout.write(os.environ["PROMPT_TEXT"])
++sys.stdout.write("\n\n--- REPAIR REQUEST (D-145) ---\n")
++sys.stdout.write("Your previous output was rejected with verdict: ")
++sys.stdout.write(repr(os.environ["_REPAIR_VERDICT"]) + "\n")
++trunc = os.environ.get("_TRUNC_NOTE", "")
++if trunc:
++    sys.stdout.write(trunc + "\n")
++sys.stdout.write("\nRAW previous output (verbatim):\n<<<BEGIN_RAW>>>\n")
++sys.stdout.write(os.environ["PLAN_JSON_RAW"])
++sys.stdout.write("\n<<<END_RAW>>>\n\n")
++sys.stdout.write("INSTRUCTIONS:\n")
++sys.stdout.write("- Return ONLY valid JSON fixing the validation error above.\n")
++sys.stdout.write("- Restate the required top-level keys verbatim:\n")
++sys.stdout.write("  objective, assumptions, decomposition, dependencies, risk_notes,\n")
++sys.stdout.write("  artifact_contract, verifier_contract.checks (REQUIRED, at least one item).\n")
++sys.stdout.write("- Each decomposition step must have a non-empty node_type from:\n")
++sys.stdout.write("  planner|researcher|implementer|reviewer|verifier|reflector|publisher|rollback\n")
++sys.stdout.write("- No markdown fences, no prose, no commentary. JSON only.\n")
++PY
++      )
++      # Re-dispatch planner LLM with repair prompt
++      _plan_repair_failed=0
++      if [ -n "$_plan_dispatch_err" ]; then
++        PLAN_JSON_RAW=$(llm_dispatch \
++          --task-class "$TASK_CLASS" \
++          --node-type "planner" \
++          --prompt-text "$REPAIR_PROMPT_TEXT" \
++          2>"$_plan_dispatch_err") || _plan_repair_failed=1
++      else
++        PLAN_JSON_RAW=$(llm_dispatch \
++          --task-class "$TASK_CLASS" \
++          --node-type "planner" \
++          --prompt-text "$REPAIR_PROMPT_TEXT") || _plan_repair_failed=1
++      fi
++      if [ "$_plan_repair_failed" = "1" ]; then
++        echo "PLAN REPAIR: LLM dispatch failed on attempt $_attempt (continuing)" >&2
++        continue
++      fi
++      # Re-extract plan JSON (same D-011/016/052 extraction logic)
++      PLAN_JSON=$(PLAN_JSON_RAW="$PLAN_JSON_RAW" python3 <<'PY'
++import json, os, sys
++txt = os.environ.get("PLAN_JSON_RAW", "")
+ 
+-if [ "$HAS_VERIFIER" = "placeholder_plan" ]; then
+-  echo "PLAN REJECTED: planner emitted a template plan with placeholder values." >&2
+-  echo "The selected plan must name real files, sections, actions, and verifier checks." >&2
+-  _d015_preserve_raw "placeholder_plan"
+-  _d015_mark_plan_failed "placeholder_plan"
+-  trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"placeholder_plan\"}" >/dev/null 2>&1 || true
+-  exit 1
+-fi
++def objects(s):
++    i = 0
++    while True:
++        start = s.find('{', i)
++        if start < 0: return
++        depth = 0; in_str = False; esc = False
++        for j in range(start, len(s)):
++            c = s[j]
++            if in_str:
++                if esc: esc = False
++                elif c == '\\': esc = True
++                elif c == '"': in_str = False
++                continue
++            if c == '"': in_str = True
++            elif c == '{': depth += 1
++            elif c == '}':
++                depth -= 1
++                if depth == 0:
++                    yield s[start:j+1]; i = j + 1; break
++        else:
++            return
+ 
+-if [ "$HAS_VERIFIER" = "bad_artifact_contract" ]; then
+-  echo "PLAN REJECTED: artifact_contract must be an object." >&2
+-  _d015_preserve_raw "bad_artifact_contract"
+-  _d015_mark_plan_failed "bad_artifact_contract"
+-  trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"bad_artifact_contract\"}" >/dev/null 2>&1 || true
+-  exit 1
+-fi
++def contains_placeholder(v):
++    if isinstance(v, str):
++        stripped = v.strip()
++        return stripped.startswith('<') and stripped.endswith('>')
++    if isinstance(v, list): return any(contains_placeholder(x) for x in v)
++    if isinstance(v, dict): return any(contains_placeholder(x) for x in v.values())
++    return False
+ 
+-if [ "$HAS_VERIFIER" = "bad_node_types" ]; then
+-  echo "PLAN REJECTED: one or more decomposition[].node_type values are empty or invalid (D-008b)." >&2
+-  echo "Each step must declare node_type as one of: planner|researcher|implementer|reviewer|verifier|reflector|publisher|rollback" >&2
+-  _d015_preserve_raw "bad_node_types"
+-  _d015_mark_plan_failed "bad_node_types"
+-  trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"bad_node_types\"}" >/dev/null 2>&1 || true
+-  exit 1
+-fi
++def is_plan(obj):
++    if not isinstance(obj, dict): return False
++    if not isinstance(obj.get('verifier_contract'), dict): return False
++    if not obj.get('verifier_contract', {}).get('checks'): return False
++    if contains_placeholder(obj): return False
++    return any(k in obj for k in ('objective', 'decomposition', 'artifact_contract'))
+ 
+-if [ "$HAS_VERIFIER" = "parse_error" ]; then
+-  _d015_preserve_raw "parse_error"
+-  if PLAN_JSON=$(_d015_recipe_fallback_plan); then
+-    echo "PLAN WARNING: planner emitted invalid JSON; using deterministic recipe fallback plan." >&2
+-    HAS_VERIFIER="ok"
+-  else
+-    echo "PLAN REJECTED: planner emitted non-JSON output." >&2
+-    _d015_mark_plan_failed "parse_error"
+-    trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"parse_error\"}" >/dev/null 2>&1 || true
++first = None
++for chunk in objects(txt):
++    if first is None: first = chunk
++    try: parsed = json.loads(chunk)
++    except Exception: continue
++    if is_plan(parsed):
++        sys.stdout.write(json.dumps(parsed, indent=2)); sys.exit(0)
++sys.stdout.write(first if first is not None else txt)
++PY
++      )
++      # D-012: charge cost for this repair attempt (LLM was called, money spent)
++      if [ -f "$MINI_ORK_DB" ] && [ -n "${RUN_ID:-}" ]; then
++        python3 -c "
++import sqlite3, sys, time
++con = sqlite3.connect(sys.argv[1])
++con.execute('PRAGMA journal_mode=WAL')
++con.execute(\"UPDATE task_runs SET cost_usd=COALESCE(cost_usd,0)+0.05, updated_at=? WHERE id=?\", (int(time.time()), sys.argv[2]))
++con.commit(); con.close()
++" "$MINI_ORK_DB" "$RUN_ID" 2>/dev/null || true
++      fi
++      # Re-validate (same D-008b logic) — pass via env var so the heredoc
++      # stdin isn't shadowed by a pipe (shellcheck SC2259).
++      HAS_VERIFIER=$(PLAN_JSON="$PLAN_JSON" python3 <<'PY'
++import os, sys, json
++NODE_TYPES = {'planner','researcher','implementer','reviewer','verifier','reflector','publisher','rollback'}
++try:
++    p = json.loads(os.environ["PLAN_JSON"])
++    vc = p.get('verifier_contract', {})
++    checks = vc.get('checks', [])
++    if not checks:
++        print('missing_verifier_contract'); sys.exit(0)
++    def contains_placeholder(v):
++        if isinstance(v, str):
++            s = v.strip()
++            return s.startswith('<') and s.endswith('>')
++        if isinstance(v, list): return any(contains_placeholder(x) for x in v)
++        if isinstance(v, dict): return any(contains_placeholder(x) for x in v.values())
++        return False
++    if contains_placeholder(p):
++        print('placeholder_plan'); sys.exit(0)
++    ac = p.get('artifact_contract', {})
++    if not isinstance(ac, dict):
++        print('bad_artifact_contract'); sys.exit(0)
++    bad_steps = []
++    for i, step in enumerate(p.get('decomposition', []) or []):
++        nt = (step.get('node_type') or '').strip()
++        if not nt:
++            bad_steps.append(f'step[{i}] {step.get("id","?")}: empty node_type')
++        elif nt not in NODE_TYPES:
++            bad_steps.append(f'step[{i}] {step.get("id","?")}: node_type={nt!r} not in {sorted(NODE_TYPES)}')
++    if bad_steps:
++        print('bad_node_types:' + '|'.join(bad_steps), file=sys.stderr)
++        print('bad_node_types'); sys.exit(0)
++    print('ok')
++except Exception as e:
++    print(f'parse_error:{e}', file=sys.stderr)
++    print('parse_error')
++PY
++      )
++      case "$HAS_VERIFIER" in
++        ok) _repair_ok=1; break ;;
++        placeholder_plan)
++          # Not recoverable on retry either
++          echo "PLAN REPAIR: attempt $_attempt produced placeholder plan — hard-fail." >&2
++          _d015_preserve_raw "placeholder_plan"
++          _d015_mark_plan_failed "placeholder_plan"
++          trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"placeholder_plan\"}" >/dev/null 2>&1 || true
++          exit 1
++          ;;
++        *) _last_verdict="$HAS_VERIFIER"
++           echo "PLAN REPAIR: attempt $_attempt returned verdict '$HAS_VERIFIER' (continuing)" >&2 ;;
++      esac
++    done
++
++    if [ "$_repair_ok" != "1" ]; then
++      # Repairs exhausted
++      if [ "$DET_FALLBACK" = "1" ]; then
++        # Explicit opt-in: use the OLD deterministic recipe_fallback_plan
++        if PLAN_JSON=$(_d015_recipe_fallback_plan); then
++          echo "PLAN WARNING: planner repairs exhausted; using deterministic recipe fallback plan (MO_PLAN_DETERMINISTIC_FALLBACK=1)." >&2
++          HAS_VERIFIER="ok"
++        else
++          echo "PLAN REJECTED: planner repairs exhausted and recipe fallback unavailable (verdict=$_last_verdict)." >&2
++          _d015_preserve_raw "$_last_verdict"
++          _d015_mark_plan_failed "$_last_verdict"
++          trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"${_last_verdict}\"}" >/dev/null 2>&1 || true
++          exit 1
++        fi
++      else
++        # Zero-fallback: hard-fail
++        echo "PLAN REJECTED: planner repairs exhausted (MO_PLAN_MAX_REPAIRS=$MAX_REPAIRS); zero-fallback — exit 1." >&2
++        echo "  Last verdict: $_last_verdict" >&2
++        echo "  Override with MO_PLAN_DETERMINISTIC_FALLBACK=1 to use the old deterministic plan." >&2
++        _d015_preserve_raw "$_last_verdict"
++        _d015_mark_plan_failed "$_last_verdict"
++        trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"${_last_verdict}\"}" >/dev/null 2>&1 || true
++        exit 1
++      fi
++    fi
++    ;;
++  *)
++    echo "PLAN REJECTED: unknown verdict '$HAS_VERIFIER'" >&2
++    _d015_preserve_raw "unknown_verdict"
++    _d015_mark_plan_failed "unknown_verdict"
++    trace_write "{\"trace_id\":\"$TRACE_ID\",\"task_class\":\"${TASK_CLASS}\",\"status\":\"failure\",\"reviewer_verdict\":\"unknown_verdict\"}" >/dev/null 2>&1 || true
+     exit 1
+-  fi
+-fi
++    ;;
++esac
+ 
+ # ── write plan ────────────────────────────────────────────────────────────────
+ # Stamp task_class so plan.json is self-describing: execute and any
+diff --git a/mini_ork/ported/mini_ork_plan.py b/mini_ork/ported/mini_ork_plan.py
+index 09215dd1..f9ed99f7 100644
+--- a/mini_ork/ported/mini_ork_plan.py
++++ b/mini_ork/ported/mini_ork_plan.py
+@@ -7,6 +7,11 @@ chain of quality gates (D-011/016/052 extraction, D-008b node-type check,
+ placeholder/parse rejection with recipe-fallback), overlays the recipe
+ artifact_contract, and writes plan.json + the task_runs row.
+ 
++D-145: recoverable validation failures (parse_error / missing_verifier_contract /
++bad_artifact_contract / bad_node_types) now trigger up to MO_PLAN_MAX_REPAIRS
++(default 2) LLM repair attempts before any deterministic fallback. If repairs
++are exhausted, planning HARD-FAILS (Zero-Fallback) unless MO_PLAN_DETERMINISTIC_FALLBACK=1.
++
+ The one non-deterministic seam is the LLM dispatch (``dispatch=``); MO_GIVEN_PLAN
+ and --dry-run skip it. Every embedded-python block (extraction, validation,
+ fallback, dry-run/gate placeholders, overlay, DB write) is transcribed verbatim.
+@@ -210,6 +215,45 @@ def recipe_fallback_plan(recipe, workflow_path, root, kickoff) -> str | None:
+     return json.dumps(plan, indent=2)
+ 
+ 
++# D-145: verdicts that qualify for bounded LLM repair-retry (vs hard-fail).
++_REPAIRABLE_VERDICTS = {"parse_error", "missing_verifier_contract",
++                        "bad_artifact_contract", "bad_node_types"}
++
++
++def _truncation_note(raw: str) -> str:
++    """JSONSchemaBench 2501.10868: detect unbalanced braces — a top cause of
++    parse_error — and surface it in the repair prompt so the model returns
++    the COMPLETE object, not a fragment."""
++    opens = raw.count("{")
++    closes = raw.count("}")
++    if opens != closes:
++        return (f"NOTE: previous output appears truncated "
++                f"({opens} open vs {closes} close braces). "
++                f"Return the COMPLETE JSON object, not a fragment.")
++    return ""
++
++
++def _build_repair_prompt(system_prompt: str, raw: str, verdict: str) -> str:
++    """Build the LLM repair prompt (D-145): original prompt + raw invalid
++    output + exact validation error + instruction to return ONLY valid JSON."""
++    trunc = _truncation_note(raw)
++    return (
++        f"{system_prompt}\n\n"
++        f"--- REPAIR REQUEST (D-145) ---\n"
++        f"Your previous output was rejected with verdict: {verdict!r}.\n"
++        + (trunc + "\n" if trunc else "")
++        + f"\nRAW previous output (verbatim):\n<<<BEGIN_RAW>>>\n{raw}\n<<<END_RAW>>>\n\n"
++        f"INSTRUCTIONS:\n"
++        f"- Return ONLY valid JSON fixing the validation error above.\n"
++        f"- Restate the required top-level keys verbatim:\n"
++        f"  objective, assumptions, decomposition, dependencies, risk_notes,\n"
++        f"  artifact_contract, verifier_contract.checks (REQUIRED, at least one item).\n"
++        f"- Each decomposition step must have a non-empty node_type from:\n"
++        f"  planner|researcher|implementer|reviewer|verifier|reflector|publisher|rollback\n"
++        f"- No markdown fences, no prose, no commentary. JSON only.\n"
++    )
++
++
+ def overlay_plan(plan_json, task_class, profile_path, root) -> str:
+     try:
+         p = json.loads(plan_json)
+@@ -429,13 +473,15 @@ def main(argv=None, *, root=None, dispatch=None) -> int:
+         print(f"plan_path={out_file}")
+         print(f"task_class={task_class}")
+         return 0
++    # Build the planner prompt unconditionally so the D-145 repair loop has
++    # it as context even when MO_GIVEN_PLAN bypasses the initial dispatch.
++    prompt = _build_prompt(root, kickoff, workflow, profile_path)
+     if given:
+         if not os.access(given, os.R_OK):
+             sys.stderr.write(f"MO_GIVEN_PLAN is set but not readable: {given}\n"); return 1
+         raw = open(given).read()
+         sys.stderr.write(f"plan: using given plan from MO_GIVEN_PLAN={given} (planner LLM skipped)\n")
+     else:
+-        prompt = _build_prompt(root, kickoff, workflow, profile_path)
+         if dispatch is None:
+             sys.stderr.write("LLM dispatch unavailable (no seam provided)\n"); return 1
+         rc, raw = dispatch(task_class, "planner", prompt)
+@@ -448,33 +494,74 @@ def main(argv=None, *, root=None, dispatch=None) -> int:
+     _charge_cost(db, run_id)
+     verdict = validate_plan(plan_json)
+ 
+-    if verdict == "missing_verifier_contract":
+-        _preserve_raw(home, run_id, verdict, raw, plan_json)
+-        fb = recipe_fallback_plan(recipe, workflow, root, kickoff)
+-        if fb:
+-            plan_json, verdict = fb, "ok"
+-            sys.stderr.write("PLAN WARNING: planner output did not expose verifier_contract.checks; using deterministic recipe fallback plan.\n")
+-        else:
+-            sys.stderr.write("PLAN REJECTED: verifier_contract.checks is missing or empty.\n")
+-            _mark_failed(db, run_id, verdict); return 1
+-    if verdict == "placeholder_plan":
++    # D-145: bounded LLM repair-retry loop with zero-fallback policy.
++    # Iterative self-repair (arXiv:2604.10508) + error-reflection prompting
++    # (arXiv:2508.16729); truncation guard (arXiv:2605.13076 / JSONSchemaBench
++    # 2501.10868) flags unbalanced braces. Recoverable verdicts trigger up to
++    # MO_PLAN_MAX_REPAIRS LLM repair attempts. If repairs are exhausted,
++    # HARD-FAIL (Zero-Fallback, default) unless MO_PLAN_DETERMINISTIC_FALLBACK=1.
++    max_repairs = int(os.environ.get("MO_PLAN_MAX_REPAIRS", "2"))
++    det_fallback = os.environ.get("MO_PLAN_DETERMINISTIC_FALLBACK", "0") == "1"
++
++    if verdict in _REPAIRABLE_VERDICTS:
++        last_verdict = verdict
++        repair_ok = False
++        for attempt in range(1, max_repairs + 1):
++            repair_prompt = _build_repair_prompt(prompt, raw, last_verdict)
++            if dispatch is None:
++                sys.stderr.write(f"PLAN REPAIR: no dispatch seam — attempt {attempt} unavailable (continuing)\n")
++                continue
++            rc, raw = dispatch(task_class, "planner", repair_prompt)
++            if rc != 0:
++                sys.stderr.write(f"PLAN REPAIR: LLM dispatch failed on attempt {attempt} (continuing)\n")
++                continue
++            _charge_cost(db, run_id)
++            plan_json = extract_plan_json(raw)
++            verdict = validate_plan(plan_json)
++            if verdict == "ok":
++                repair_ok = True
++                break
++            if verdict == "placeholder_plan":
++                sys.stderr.write(f"PLAN REPAIR: attempt {attempt} produced placeholder plan — hard-fail.\n")
++                _preserve_raw(home, run_id, verdict, raw, plan_json)
++                _mark_failed(db, run_id, verdict); return 1
++            last_verdict = verdict
++            sys.stderr.write(f"PLAN REPAIR: attempt {attempt} returned verdict '{verdict}' (continuing)\n")
++
++        if not repair_ok:
++            # Repairs exhausted
++            if det_fallback:
++                fb = recipe_fallback_plan(recipe, workflow, root, kickoff)
++                if fb:
++                    plan_json, verdict = fb, "ok"
++                    sys.stderr.write(
++                        "PLAN WARNING: planner repairs exhausted; using deterministic recipe fallback plan "
++                        "(MO_PLAN_DETERMINISTIC_FALLBACK=1).\n")
++                else:
++                    sys.stderr.write(
++                        f"PLAN REJECTED: planner repairs exhausted and recipe fallback unavailable "
++                        f"(verdict={last_verdict}).\n")
++                    _preserve_raw(home, run_id, last_verdict, raw, plan_json)
++                    _mark_failed(db, run_id, last_verdict); return 1
++            else:
++                sys.stderr.write(
++                    f"PLAN REJECTED: planner repairs exhausted (MO_PLAN_MAX_REPAIRS={max_repairs}); "
++                    f"zero-fallback — exit 1.\n")
++                sys.stderr.write(f"  Last verdict: {last_verdict}\n")
++                sys.stderr.write("  Override with MO_PLAN_DETERMINISTIC_FALLBACK=1 to use the old deterministic plan.\n")
++                _preserve_raw(home, run_id, last_verdict, raw, plan_json)
++                _mark_failed(db, run_id, last_verdict); return 1
++    elif verdict == "placeholder_plan":
+         sys.stderr.write("PLAN REJECTED: planner emitted a template plan with placeholder values.\n")
+-        _preserve_raw(home, run_id, verdict, raw, plan_json); _mark_failed(db, run_id, verdict); return 1
+-    if verdict == "bad_artifact_contract":
+-        sys.stderr.write("PLAN REJECTED: artifact_contract must be an object.\n")
+-        _preserve_raw(home, run_id, verdict, raw, plan_json); _mark_failed(db, run_id, verdict); return 1
+-    if verdict == "bad_node_types":
+-        sys.stderr.write("PLAN REJECTED: one or more decomposition[].node_type values are empty or invalid (D-008b).\n")
+-        _preserve_raw(home, run_id, verdict, raw, plan_json); _mark_failed(db, run_id, verdict); return 1
+-    if verdict == "parse_error":
++        sys.stderr.write("The selected plan must name real files, sections, actions, and verifier checks.\n")
+         _preserve_raw(home, run_id, verdict, raw, plan_json)
+-        fb = recipe_fallback_plan(recipe, workflow, root, kickoff)
+-        if fb:
+-            plan_json, verdict = fb, "ok"
+-            sys.stderr.write("PLAN WARNING: planner emitted invalid JSON; using deterministic recipe fallback plan.\n")
+-        else:
+-            sys.stderr.write("PLAN REJECTED: planner emitted non-JSON output.\n")
+-            _mark_failed(db, run_id, verdict); return 1
++        _mark_failed(db, run_id, verdict); return 1
++    elif verdict == "ok":
++        pass
++    else:
++        sys.stderr.write(f"PLAN REJECTED: unknown verdict {verdict!r}\n")
++        _preserve_raw(home, run_id, verdict, raw, plan_json)
++        _mark_failed(db, run_id, verdict); return 1
+ 
+     plan_json = overlay_plan(plan_json, task_class, profile_path, root)
+     os.makedirs(os.path.dirname(out_file), exist_ok=True)

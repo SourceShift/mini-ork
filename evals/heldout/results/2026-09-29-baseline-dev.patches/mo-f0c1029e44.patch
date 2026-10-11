@@ -1,0 +1,393 @@
+diff --git a/mini_ork/learning/reflection_pipeline.py b/mini_ork/learning/reflection_pipeline.py
+index 3fc0f98b..3c9b7d49 100644
+--- a/mini_ork/learning/reflection_pipeline.py
++++ b/mini_ork/learning/reflection_pipeline.py
+@@ -786,22 +786,91 @@ def reflection_persist_suggestions(suggestions_json: str, *,
+     return _persist_suggestions_upsert(db_path, suggestions_json)
+ 
+ 
++def _count_distinct_runs(con: sqlite3.Connection, members_json: str) -> int:
++    """Independence-aware evidence count behind a member list.
++
++    Counts DISTINCT non-null run_ids behind the named trace ids. Rules:
++      * a repeated trace id is one observation (collapsed before the lookup);
++      * N traces sharing one run_id are one observation (SQL DISTINCT run_id);
++      * a NULL/empty run_id is unproven independence and counts zero
++        (filtered out of the distinct set);
++      * an unresolvable trace id counts zero (no row → no run_id);
++      * a missing execution_traces table falls back to the distinct-id count
++        rather than crashing reflection (cold-schema safety).
++
++    Members are the dicts persisted by `_persist_suggestions_upsert`
++    (``{"item_table": "execution_traces", "item_id": tid}``); non-dict or
++    empty item_id entries contribute zero.
++    """
++    try:
++        members = json.loads(members_json) if members_json else []
++    except (json.JSONDecodeError, TypeError):
++        return 0
++    if not isinstance(members, list):
++        return 0
++    trace_ids: list[str] = []
++    seen: set[str] = set()
++    for m in members:
++        if not isinstance(m, dict):
++            continue
++        tid = m.get("item_id")
++        if not isinstance(tid, str) or not tid:
++            continue
++        if tid in seen:
++            # Repeated trace id collapses to one observation before lookup.
++            continue
++        seen.add(tid)
++        trace_ids.append(tid)
++    if not trace_ids:
++        return 0
++    try:
++        placeholders = ",".join("?" * len(trace_ids))
++        rows = con.execute(
++            f"SELECT DISTINCT run_id FROM execution_traces "
++            f"WHERE trace_id IN ({placeholders})",
++            trace_ids,
++        ).fetchall()
++    except sqlite3.OperationalError:
++        # Missing execution_traces table (cold schema): distinct-id fallback
++        # rather than crashing reflection.
++        return len(seen)
++    run_ids = {
++        r[0] for r in rows
++        if r[0] is not None and r[0] != ""
++    }
++    return len(run_ids)
++
++
+ def reflection_verify_patterns(*, db_path: str | None = None) -> int:
+     """Approve emergent patterns that meet evidence and strength floors.
+ 
+     Judge-gate (extract→distill→verify): transition emergent_patterns rows from
+     status='proposed' → 'approved' when they clear the evidence/strength floor
+-    (strength_score >= MO_EMERGENT_VERIFY_MIN_STRENGTH AND member-evidence count
+-    >= MO_EMERGENT_VERIFY_MIN_EVIDENCE). Only approved rows are eligible to be
+-    read into routing/context — the guard against memory confabulation (Dixit
+-    2026). Opt-out MO_EMERGENT_VERIFY=0. Cold-safe: no-op on missing/empty
+-    table. Prints and returns the count of newly-approved rows.
++    (strength_score >= MO_EMERGENT_VERIFY_MIN_STRENGTH AND the count of distinct
++    non-null run_ids behind the member trace ids >= MO_EMERGENT_VERIFY_MIN_EVIDENCE).
++    Only approved rows are eligible to be read into routing/context — the guard
++    against memory confabulation (Dixit 2026). Opt-out MO_EMERGENT_VERIFY=0.
++    Cold-safe: no-op on missing/empty table.
++
++    `n_evidence` is independence-aware (see `_count_distinct_runs`):
++      * a repeated trace id is one observation;
++      * N traces sharing one run_id are one observation;
++      * a NULL/empty run_id is unproven independence and counts zero;
++      * an unresolvable trace id counts zero;
++      * a missing traces table falls back to the distinct-id count.
++
++    MO_EMERGENT_VERIFY_MIN_EVIDENCE clamps UP only (max(3, env)): a safety
++    floor is not a setting, and no env var may restore the forgeable bar.
++
++    Prints and returns the count of newly-approved rows.
+     """
+     if os.environ.get("MO_EMERGENT_VERIFY", "1") != "1":
+         print(0)
+         return 0
+     min_strength = float(os.environ.get("MO_EMERGENT_VERIFY_MIN_STRENGTH", "3"))
+-    min_evidence = int(os.environ.get("MO_EMERGENT_VERIFY_MIN_EVIDENCE", "1"))
++    # Safety floor clamps UP: a forgeable bar is not a setting.
++    raw_min_evidence = int(os.environ.get("MO_EMERGENT_VERIFY_MIN_EVIDENCE", "1"))
++    min_evidence = max(3, raw_min_evidence)
+     db_path = _resolve_db(db_path)
+     con = _connect(db_path)
+     try:
+@@ -816,10 +885,7 @@ def reflection_verify_patterns(*, db_path: str | None = None) -> int:
+         now = int(time.time())
+         approved = 0
+         for pid, members_json, strength in rows:
+-            try:
+-                n_evidence = len(json.loads(members_json)) if members_json else 0
+-            except (json.JSONDecodeError, TypeError):
+-                n_evidence = 0
++            n_evidence = _count_distinct_runs(con, members_json)
+             try:
+                 s = float(strength)
+             except (TypeError, ValueError):
+diff --git a/tests/unit/test_reflection_pipeline_py.py b/tests/unit/test_reflection_pipeline_py.py
+index c7e74a53..291bdebf 100644
+--- a/tests/unit/test_reflection_pipeline_py.py
++++ b/tests/unit/test_reflection_pipeline_py.py
+@@ -811,50 +811,232 @@ def _seed_emergent(temp_db, rows):
+     con.close()
+ 
+ 
+-def test_reflection_verify_patterns_gate(temp_db):
+-    """Judge-gate promotes only evidence-backed 'proposed' rows to 'approved'.
++def _seed_execution_traces(temp_db, trace_to_run):
++    """Seed execution_traces rows backing the named trace ids.
+ 
+-    Floor (defaults): strength_score >= 3 AND member-evidence count >= 1.
+-    Rows below either bound stay 'proposed'."""
+-    seed = [
+-        ("p-strong",   [{"item_table": "execution_traces", "item_id": "t1"}], 5.0, "proposed"),  # pass
+-        ("p-weak-str", [{"item_table": "execution_traces", "item_id": "t2"}], 2.0, "proposed"),  # fail: strength
+-        ("p-no-ev",    [],                                                     9.0, "proposed"),  # fail: evidence
+-        ("p-already",  [{"item_table": "execution_traces", "item_id": "t3"}], 8.0, "approved"),  # not proposed
+-    ]
++    `trace_to_run` is a dict mapping trace_id → run_id (int) or None for
++    an unresolvable / NULL run_id. Multiple trace_ids can share the same
++    run_id; a NULL run_id is recorded as SQL NULL (unproven independence).
++    """
++    con = sqlite3.connect(temp_db)
++    con.execute("PRAGMA busy_timeout=5000")
++    now = "2026-07-04T12:00:00.000Z"
++    for tid, rid in trace_to_run.items():
++        con.execute(
++            "INSERT OR IGNORE INTO execution_traces(trace_id, run_id, task_class, "
++            "status, created_at) VALUES (?, ?, 'code_fix', 'success', ?)",
++            (tid, rid, now),
++        )
++    con.commit()
++    con.close()
+ 
+-    _seed_emergent(temp_db, seed)
++
++def _statuses(temp_db):
++    con = sqlite3.connect(temp_db)
++    rows = dict(con.execute(
++        "SELECT pattern_id, status FROM emergent_patterns"
++    ).fetchall())
++    con.close()
++    return rows
++
++
++def _seed_runs(temp_db, n):
++    """Seed `n` distinct epic+run rows; return the list of new run_ids."""
++    con = sqlite3.connect(temp_db)
++    con.execute("PRAGMA busy_timeout=5000")
++    run_ids = []
++    for i in range(n):
++        epic = f"epic-rv-{i}"
++        con.execute(
++            "INSERT OR IGNORE INTO epics(id, title, status) "
++            "VALUES (?, 't', 'in progress')",
++            (epic,),
++        )
++        con.execute(
++            "INSERT INTO runs(epic_id, run_dir, branch, baseline_sha, agent) "
++            "VALUES (?, ?, 'main', 'sha', 'glm')",
++            (epic, f"run-rv-{i}"),
++        )
++        run_ids.append(con.execute("SELECT last_insert_rowid()").fetchone()[0])
++    con.commit()
++    con.close()
++    return run_ids
++
++
++def _run_verify():
+     import io
+     from contextlib import redirect_stdout
+     buf = io.StringIO()
+     with redirect_stdout(buf):
+         n = rp.reflection_verify_patterns()
++    return n, buf.getvalue().strip()
++
++
++def test_reflection_verify_patterns_gate(temp_db):
++    """Judge-gate promotes only evidence-backed 'proposed' rows to 'approved'.
++
++    Seeds REAL execution_traces rows with distinct run_ids so the independence-
++    aware evidence counter has something to resolve. Floor (defaults):
++    strength_score >= 3 AND distinct-run count >= 3 (safety floor clamps UP).
++    Rows below either bound stay 'proposed'.
++    """
++    r0, r1, r2, r3 = _seed_runs(temp_db, 4)
++    _seed_execution_traces(temp_db, {
++        "t-strong": r0,
++        "t-weak": r1,
++        "t-no-ev": r2,   # seeded but the pattern has no members referencing it
++        "t-already": r3,
++    })
++    seed = [
++        # 1 distinct run behind 3 member ids (t-strong repeated 3x in JSON).
++        ("p-strong",   [{"item_table": "execution_traces", "item_id": "t-strong"}] * 3,
++         5.0, "proposed"),  # fail: only 1 distinct run (clamped floor=3)
++        ("p-weak-str", [{"item_table": "execution_traces", "item_id": "t-weak"}], 2.0, "proposed"),  # fail: strength
++        ("p-no-ev",    [],                                                     9.0, "proposed"),  # fail: no evidence
++        ("p-already",  [{"item_table": "execution_traces", "item_id": "t-already"}], 8.0, "approved"),  # not proposed
++    ]
++
++    _seed_emergent(temp_db, seed)
++    n, emitted = _run_verify()
++    assert n == 0
++    assert emitted == "0"
++
++    statuses = _statuses(temp_db)
++    assert statuses["p-strong"] == "proposed"    # 1 distinct run < floor 3
++    assert statuses["p-weak-str"] == "proposed"  # strength below floor
++    assert statuses["p-no-ev"] == "proposed"     # no members
++    assert statuses["p-already"] == "approved"   # not in scope
++
++
++def test_reflection_verify_patterns_independence_three_runs(temp_db):
++    """3 distinct runs behind 3 trace ids clears the safety floor and is approved."""
++    r0, r1, r2 = _seed_runs(temp_db, 3)
++    _seed_execution_traces(temp_db, {"t0": r0, "t1": r1, "t2": r2})
++    seed = [
++        ("p-3-runs", [{"item_table": "execution_traces", "item_id": t}
++                      for t in ("t0", "t1", "t2")], 5.0, "proposed"),
++    ]
++    _seed_emergent(temp_db, seed)
++    n, _ = _run_verify()
+     assert n == 1
+-    assert buf.getvalue().strip() == "1"
++    assert _statuses(temp_db)["p-3-runs"] == "approved"
+ 
+-    # Row-diff after Python ran: only p-strong flipped to approved; p-already
+-    # stays approved; the two failing rows stay proposed.
++
++def test_reflection_verify_patterns_repeated_trace_id_is_one(temp_db):
++    """One trace id repeated N times is one observation (1 distinct run, not N)."""
++    r0, r1 = _seed_runs(temp_db, 2)
++    _seed_execution_traces(temp_db, {"t-x": r0, "t-y": r1})
++    seed = [
++        # t-x appears 3 times in the member list — only 1 distinct run.
++        ("p-repeat", [{"item_table": "execution_traces", "item_id": "t-x"}] * 3,
++         5.0, "proposed"),
++    ]
++    _seed_emergent(temp_db, seed)
++    n, _ = _run_verify()
++    assert n == 0
++    assert _statuses(temp_db)["p-repeat"] == "proposed"
++
++
++def test_reflection_verify_patterns_traces_sharing_one_run(temp_db):
++    """N traces behind one run_id are one observation (one distinct run)."""
++    r0 = _seed_runs(temp_db, 1)[0]
++    _seed_execution_traces(temp_db, {
++        "t-shared-a": r0,
++        "t-shared-b": r0,
++        "t-shared-c": r0,
++    })
++    seed = [
++        ("p-one-run", [{"item_table": "execution_traces", "item_id": t}
++                       for t in ("t-shared-a", "t-shared-b", "t-shared-c")],
++         5.0, "proposed"),
++    ]
++    _seed_emergent(temp_db, seed)
++    n, _ = _run_verify()
++    assert n == 0
++    assert _statuses(temp_db)["p-one-run"] == "proposed"
++
++
++def test_reflection_verify_patterns_null_run_id_counts_zero(temp_db):
++    """A NULL run_id is unproven independence — counted as zero even if distinct trace ids exist."""
++    r0, r1 = _seed_runs(temp_db, 2)
++    _seed_execution_traces(temp_db, {
++        "t-good-a": r0,
++        "t-good-b": r1,
++        "t-orphan-a": None,
++        "t-orphan-b": None,
++    })
++    seed = [
++        # 2 trace ids exist (good-a, good-b) but pattern only references the
++        # orphan ones — independent run_ids: 0.
++        ("p-null-rid", [{"item_table": "execution_traces", "item_id": t}
++                        for t in ("t-orphan-a", "t-orphan-b")],
++         5.0, "proposed"),
++    ]
++    _seed_emergent(temp_db, seed)
++    n, _ = _run_verify()
++    assert n == 0
++    assert _statuses(temp_db)["p-null-rid"] == "proposed"
++
++
++def test_reflection_verify_patterns_floor_cannot_be_lowered(temp_db, monkeypatch):
++    """MO_EMERGENT_VERIFY_MIN_EVIDENCE clamps UP — env=1 cannot drop the floor below 3."""
++    r0, r1, r2 = _seed_runs(temp_db, 3)
++    _seed_execution_traces(temp_db, {"t-a": r0, "t-b": r1, "t-c": r2})
++    monkeypatch.setenv("MO_EMERGENT_VERIFY_MIN_EVIDENCE", "1")
++    seed = [
++        ("p-floor-1", [{"item_table": "execution_traces", "item_id": "t-a"}],
++         5.0, "proposed"),  # 1 distinct run, but floor is clamped to 3
++    ]
++    _seed_emergent(temp_db, seed)
++    n, _ = _run_verify()
++    assert n == 0
++    assert _statuses(temp_db)["p-floor-1"] == "proposed"
++
++
++def test_reflection_verify_patterns_floor_can_be_raised(temp_db, monkeypatch):
++    """MO_EMERGENT_VERIFY_MIN_EVIDENCE clamps UP — env=5 raises the floor to 5."""
++    r0, r1, r2, r3 = _seed_runs(temp_db, 4)
++    _seed_execution_traces(temp_db, {"t-a": r0, "t-b": r1, "t-c": r2, "t-d": r3})
++    monkeypatch.setenv("MO_EMERGENT_VERIFY_MIN_EVIDENCE", "5")
++    seed = [
++        # 4 distinct runs — clear the default floor (3) but not the raised 5.
++        ("p-4-of-5", [{"item_table": "execution_traces", "item_id": t}
++                      for t in ("t-a", "t-b", "t-c", "t-d")],
++         5.0, "proposed"),
++    ]
++    _seed_emergent(temp_db, seed)
++    n, _ = _run_verify()
++    assert n == 0
++    assert _statuses(temp_db)["p-4-of-5"] == "proposed"
++
++
++def test_reflection_verify_patterns_missing_traces_table(temp_db, monkeypatch):
++    """Missing execution_traces table → distinct-id fallback (no crash)."""
+     con = sqlite3.connect(temp_db)
+-    statuses = dict(con.execute(
+-        "SELECT pattern_id, status FROM emergent_patterns"
+-    ).fetchall())
++    con.execute("PRAGMA busy_timeout=5000")
++    con.execute("DROP TABLE IF EXISTS execution_traces")
++    con.commit()
+     con.close()
+-    assert statuses["p-strong"] == "approved"
+-    assert statuses["p-weak-str"] == "proposed"
+-    assert statuses["p-no-ev"] == "proposed"
+-    assert statuses["p-already"] == "approved"
++    seed = [
++        ("p-distinct-ids", [{"item_table": "execution_traces", "item_id": t}
++                            for t in ("t-a", "t-b", "t-c")],
++         5.0, "proposed"),
++    ]
++    _seed_emergent(temp_db, seed)
++    n, _ = _run_verify()
++    # Distinct-id fallback counts 3 distinct trace ids → clears floor (3).
++    assert n == 1
++    assert _statuses(temp_db)["p-distinct-ids"] == "approved"
+ 
+ 
+ def test_reflection_verify_patterns_optout(temp_db, monkeypatch):
+     """MO_EMERGENT_VERIFY=0 is a hard opt-out: nothing is promoted, count 0."""
++    r0 = _seed_runs(temp_db, 1)[0]
++    _seed_execution_traces(temp_db, {"t1": r0})
+     seed = [("p-strong", [{"item_table": "execution_traces", "item_id": "t1"}], 5.0, "proposed")]
+     _seed_emergent(temp_db, seed)
+     monkeypatch.setenv("MO_EMERGENT_VERIFY", "0")
+-    import io
+-    from contextlib import redirect_stdout
+-    buf = io.StringIO()
+-    with redirect_stdout(buf):
+-        n = rp.reflection_verify_patterns()
++    n, _ = _run_verify()
+     assert n == 0
+     con = sqlite3.connect(temp_db)
+     st = con.execute("SELECT status FROM emergent_patterns WHERE pattern_id='p-strong'").fetchone()[0]
+@@ -869,12 +1051,9 @@ def test_reflection_verify_patterns_cold(temp_db):
+     con.execute("DELETE FROM emergent_patterns")
+     con.commit()
+     con.close()
+-    import io
+-    from contextlib import redirect_stdout
+-    buf = io.StringIO()
+-    with redirect_stdout(buf):
+-        assert rp.reflection_verify_patterns() == 0
+-    assert buf.getvalue().strip() == "0"
++    n, emitted = _run_verify()
++    assert n == 0
++    assert emitted == "0"
+ 
+ 
+ # ─────────────────────────────────────────────────────────────────────────────

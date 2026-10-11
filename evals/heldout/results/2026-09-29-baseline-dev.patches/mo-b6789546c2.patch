@@ -1,0 +1,104 @@
+diff --git a/recipes/goal-loop/lib/drive.py b/recipes/goal-loop/lib/drive.py
+index 204626b8..d8a8c69c 100644
+--- a/recipes/goal-loop/lib/drive.py
++++ b/recipes/goal-loop/lib/drive.py
+@@ -233,9 +233,16 @@ def _default_run_wave_fn(wave_no: int, quarantined: set[str]) -> dict[str, Any]:
+     cli = os.path.join(
+         os.environ.get("MINI_ORK_ROOT", "."), "bin", "mini-ork",
+     )
++    # Feed the GRAO quarantine set back into the wave subprocess so the
++    # sweep planner can exclude stuck units instead of hammering them.
++    # Newline-sorted (driver side, deterministic), blank when nothing is
++    # quarantined (backward-compat: an unset env var reproduces the historical
++    # selection byte-for-byte).
++    wave_env = os.environ.copy()
++    wave_env["MO_GOAL_QUARANTINED_UNITS"] = "\n".join(sorted(quarantined))
+     proc = subprocess.run(
+         [cli, "run", "goal-loop", kickoff],
+-        check=False, capture_output=True, text=True,
++        check=False, capture_output=True, text=True, env=wave_env,
+     )
+     panel_path = os.path.join(run_dir, "panel-verdict.json")
+     payload: dict[str, Any] = {
+diff --git a/recipes/goal-loop/lib/transforms.py b/recipes/goal-loop/lib/transforms.py
+index 15c8a318..9dd2c4c4 100644
+--- a/recipes/goal-loop/lib/transforms.py
++++ b/recipes/goal-loop/lib/transforms.py
+@@ -65,6 +65,67 @@ def _slug(unit_id: str) -> str:
+     return re.sub(r"[^A-Za-z0-9._-]", "_", unit_id)[:80] or "x"
+ 
+ 
++# Numeric-aware unit ordering: chapter ids "1","2",…,"10" must sort as
++# 1,3,4,…,10,2 (natural) — the historical plain ``sorted()`` on strings put
++# "1" ahead of "10" and starved every other chapter forever. We parse the
++# leading run of digits (when present) as an int and keep the trailing tail as
++# a stable secondary key, so unit ids that don't start with a number still
++# fall back to a deterministic string order.
++_UNIT_SORT_RE = re.compile(r"^(\d+)(.*)$", re.DOTALL)
++
++
++def _unit_sort_key(unit_id: str) -> tuple[int, str, str]:
++    """Sort key for unit ids so ``ch1`` precedes ``ch2`` precedes ``ch10``."""
++    match = _UNIT_SORT_RE.match(unit_id)
++    if match is None:
++        # Pure non-numeric id: keep a stable ordering so it sorts AFTER every
++        # numeric-prefixed id (numeric tuple wins because int < str in Py3).
++        return (1, unit_id, "")
++    digits = match.group(1)
++    tail = match.group(2)
++    try:
++        head_int = int(digits)
++    except ValueError:
++        return (1, unit_id, "")
++    return (0, f"{head_int:020d}", tail)
++
++
++def _parse_quarantine_env() -> set[str]:
++    """Read ``MO_GOAL_QUARANTINED_UNITS`` (newline-separated) into a set.
++
++    Blank / unset ⇒ empty set (backward compat with drivers that pre-date
++    the quarantine feedback channel).
++    """
++    raw = os.environ.get("MO_GOAL_QUARANTINED_UNITS", "")
++    return {line.strip() for line in raw.splitlines() if line.strip()}
++
++
++def _select_units(
++    failing: list[str],
++    max_children: int,
++    quarantined: set[str],
++) -> list[str]:
++    """Pure core of ``goal_sweep_plan`` — pick the wave's fix children.
++
++    Starvation guard: if EVERY failing unit is quarantined, drop the exclusion
++    so the wave still emits a plan (the driver's ``all_quarantined`` stop then
++    ends the loop cleanly). Otherwise exclude quarantined units, then sort by
++    numeric-aware key, then cap at ``max_children``.
++    """
++    if max_children <= 0 or not failing:
++        return []
++    failing_set = set(failing)
++    if failing_set and failing_set == (failing_set & quarantined):
++        # Every failing unit is quarantined — keep dispatching so the driver
++        # can fire its ``all_quarantined`` stop on the next iteration. The
++        # exclusion is dropped, not the units themselves.
++        effective = failing
++    else:
++        effective = [u for u in failing if u not in quarantined]
++    effective_sorted = sorted(effective, key=_unit_sort_key)
++    return effective_sorted[:max_children]
++
++
+ @register_transform("goal_state_eval")
+ def goal_state_eval(workflow: CompiledWorkflow, ledger: ArtifactLedger, node_id: str) -> Path:
+     """Materialize ``goal-state.json`` from MO_GOAL_* env config.
+@@ -125,7 +186,8 @@ def goal_sweep_plan(workflow: CompiledWorkflow, ledger: ArtifactLedger, node_id:
+     failing = sorted(
+         unit_id for unit_id, state in goal_state.items() if not state.get("pass", False)
+     )
+-    selected = failing[:max_children]
++    quarantined = _parse_quarantine_env()
++    selected = _select_units(failing, max_children, quarantined)
+ 
+     # Deep-evidence harvest (optional): for ONLY the units we're about to
+     # dispatch, run MO_GOAL_EVIDENCE_CMD to gather the rich failure signal the

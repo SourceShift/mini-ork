@@ -1,0 +1,65 @@
+diff --git a/kickoffs/book-goal-loop/binding/restart_worker.py b/kickoffs/book-goal-loop/binding/restart_worker.py
+index 9bb2272c..ad5f1a4b 100644
+--- a/kickoffs/book-goal-loop/binding/restart_worker.py
++++ b/kickoffs/book-goal-loop/binding/restart_worker.py
+@@ -180,13 +180,49 @@ _FAIL_MARKERS = (
+ _SYNC_REFS = ("origin/main", "main")
+ 
+ 
+-def _git(worktree: str, *args: str, timeout: int = 120) -> subprocess.CompletedProcess[str]:
++def _git(worktree: str, *args: str, timeout: int = 120, env=None) -> subprocess.CompletedProcess[str]:
+     return subprocess.run(
+         ["git", "-C", worktree, *args],
+-        capture_output=True, text=True, timeout=timeout,
++        capture_output=True, text=True, timeout=timeout, env=env,
+     )
+ 
+ 
++def _identity_env(worktree: str) -> dict[str, str]:
++    """Fallback git identity for the mutating `git merge --no-edit` that lands
++    the product branch on the deploy target. Without one, CI / fresh-container
++    runners die with `empty ident name ... not allowed`, and the resync is
++    mis-reported as a merge conflict — which is exactly the regression this
++    binding exists to prevent.
++
++    Configured identity wins; an explicitly empty `GIT_*` env is filled too —
++    that empty-variable case is what CI actually presents (CI exports the
++    keys with empty strings rather than unset). Identity matches
++    `mini_ork/vcs/rebase_guard.py` and `mini_ork/vcs/auto_merge.py`
++    (`mini-ork` / `mini-ork@localhost`). Only applied to the merge call —
++    other git invocations inherit the ambient env."""
++    e = dict(os.environ)
++    # A configured (non-empty) env pair wins — leave the env alone.
++    if e.get("GIT_AUTHOR_EMAIL") and e.get("GIT_COMMITTER_EMAIL"):
++        return e
++    # Otherwise check git config; if empty (or blocked to /dev/null by the
++    # test that reproduces CI's failure), fill the fallback identity —
++    # including empty env values, since `setdefault` would leave "" in place.
++    cfg = subprocess.run(
++        ["git", "-C", worktree, "config", "user.email"],
++        capture_output=True, text=True,
++    ).stdout.strip()
++    if not cfg:
++        for key, val in (
++            ("GIT_AUTHOR_NAME", "mini-ork"),
++            ("GIT_AUTHOR_EMAIL", "mini-ork@localhost"),
++            ("GIT_COMMITTER_NAME", "mini-ork"),
++            ("GIT_COMMITTER_EMAIL", "mini-ork@localhost"),
++        ):
++            if not e.get(key):
++                e[key] = val
++    return e
++
++
+ def _sync_upstream(worktree: str) -> str:
+     """Merge the product branch into the deploy target. Returns a one-line why.
+ 
+@@ -214,7 +250,7 @@ def _sync_upstream(worktree: str) -> str:
+     if _git(worktree, "merge-base", "--is-ancestor", ref, "HEAD").returncode == 0:
+         return f"already contains {ref}"
+ 
+-    merged = _git(worktree, "merge", "--no-edit", ref)
++    merged = _git(worktree, "merge", "--no-edit", ref, env=_identity_env(worktree))
+     if merged.returncode == 0:
+         head = _git(worktree, "rev-parse", "--short", "HEAD").stdout.strip()
+         return f"merged {ref} into the deploy target (HEAD {head})"

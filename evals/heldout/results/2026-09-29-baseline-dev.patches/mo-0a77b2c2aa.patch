@@ -1,0 +1,316 @@
+diff --git a/mini_ork/cli/execute.py b/mini_ork/cli/execute.py
+index 01a9740b..c57ab502 100644
+--- a/mini_ork/cli/execute.py
++++ b/mini_ork/cli/execute.py
+@@ -1642,11 +1642,72 @@ def _write_implementer_summary(run_dir, target, impl_log):
+         handle.write("\n")
+ 
+ 
++def _review_pathspecs(worktree, declared):
++    """Clean the implementer-declared ``files_changed`` into repo-relative pathspecs.
++
++    ``implementer-summary.files_changed`` is recorded ABSOLUTE because the
++    publisher's commit gate and ``_revert_branch`` need that shape, but ``git
++    diff`` accepts a pathspec only relative to the repo root. An absolute path
++    matched NOTHING and exited 0, so the reviewer diff was a silent empty file.
++    An untracked symlink (e.g. ``baml_client -> /neighbouring/checkout``)
++    resolved outside the repo via ``realpath`` and recorded a path that could never
++    be a pathspec at all. ``_review_pathspecs`` relativizes each declared entry
++    against ``worktree``, drops any that resolve outside the repo, drops pathspec
++    magic (``:(...``, leading ``-``/``--``/``..``, etc.), and returns the cleaned
++    repo-relative list. Order preserved; duplicates dropped.
++    """
++    if not worktree or not os.path.isdir(worktree) or not declared:
++        return []
++    try:
++        repo_real = os.path.realpath(worktree)
++    except OSError:
++        return []
++    out: list[str] = []
++    for raw in declared:
++        if not isinstance(raw, str) or not raw:
++            continue
++        # Drop pathspec magic. Git interprets a leading ``-`` as another option
++        # (e.g. ``--cached``), a leading ``:`` introduces ``:(exclude)`` etc.,
++        # and ``:(`` anywhere is pathspec magic. ``--`` (bare) is harmless but
++        # redundant; drop it.
++        if raw in ("--",) or raw.startswith(("-", ":", "..")):
++            continue
++        if ":(" in raw:
++            continue
++        # Relativize against the declared worktree.
++        try:
++            rel = os.path.relpath(raw, worktree)
++        except ValueError:  # different drives on Windows; bail rather than crash
++            continue
++        if not rel or rel.startswith("..") or os.path.isabs(rel):
++            continue
++        # Drop anything that resolves outside the repo (symlink escape).
++        full = os.path.join(worktree, rel)
++        try:
++            real = os.path.realpath(full)
++        except OSError:
++            continue
++        if real != repo_real and not real.startswith(repo_real + os.sep):
++            continue
++        if rel not in out:
++            out.append(rel)
++    return out
++
++
+ def _assemble_reviewer_inputs(run_dir):
+     """F2-B (bash _mo_assemble_reviewer_inputs:182-275). Build the reviewer input block:
+     implementer-summary.json + verifier_{typecheck,test}.json + a generated
+     review-diff.patch, with the REVIEWER NOTE. Without this the classic reviewer reviews
+-    blind and hard-abstains ('inputs missing') — the gate becomes theater."""
++    blind and hard-abstains ('inputs missing') — the gate becomes theater.
++
++    Pathspec handling: the declared ``files_changed`` may be absolute, may
++    contain symlinks resolving outside the repo, or may be entirely empty after
++    cleaning. We WIDEN on empty (capture the whole delta — a wider diff can
++    never hide a real edit) and write ``review-diff-noop.json`` when the
++    declared files are demonstrably unchanged in both the tracked diff and the
++    untracked list (the implementer changed nothing). An untracked NEW file is
++    real work and is explicitly NOT a no-op — the no-op marker is only emitted
++    when every declared file is absent from BOTH lists."""
+     if not run_dir:
+         return ""
+     try:
+@@ -1678,6 +1739,7 @@ def _assemble_reviewer_inputs(run_dir):
+             baseline = open(ref_path).read().strip()
+         except OSError:
+             baseline = ""
++    pathspecs = _review_pathspecs(worktree, files)
+     try:
+         if os.path.isdir(worktree) and subprocess.run(
+                 ["git", "-C", worktree, "rev-parse", "--git-dir"],
+@@ -1685,8 +1747,12 @@ def _assemble_reviewer_inputs(run_dir):
+             args = ["git", "-C", worktree, "diff", "--no-color"]
+             if baseline:
+                 args.append(baseline)
+-            if files:
+-                args += ["--", *files]
++            # WIDEN on empty pathspecs: if every declared entry dropped out
++            # (absolute / pathspec magic / out-of-tree symlink), capture the
++            # whole delta. A wider diff can never hide a real edit; a narrow
++            # empty pathspec always did.
++            if pathspecs:
++                args += ["--", *pathspecs]
+             with open(diff_path, "w") as fh:
+                 subprocess.run(args, stdout=fh, stderr=subprocess.DEVNULL)
+         if not (os.path.isfile(diff_path) and os.path.getsize(diff_path) > 0):
+@@ -1694,6 +1760,41 @@ def _assemble_reviewer_inputs(run_dir):
+     except Exception:
+         open(diff_path, "w").close()
+ 
++    # No-op detection: declared files are unchanged in BOTH the tracked diff
++    # AND the untracked list. An untracked new file is real work and is
++    # explicitly not a no-op — we only flag no-op when the declared files are
++    # absent from both lists (i.e. the implementer claimed to touch them but
++    # did not). The marker is read by _handle_reviewer before any model spend.
++    if pathspecs and os.path.isdir(worktree):
++        try:
++            tracked = subprocess.run(
++                ["git", "-C", worktree, "diff", "--name-only"] + ([baseline] if baseline else []),
++                capture_output=True, text=True, timeout=15,
++            )
++            untracked = subprocess.run(
++                ["git", "-C", worktree, "ls-files", "--others", "--exclude-standard"],
++                capture_output=True, text=True, timeout=15,
++            )
++        except Exception:
++            tracked = untracked = None
++        if tracked is not None and untracked is not None:
++            tracked_set = {line.strip() for line in (tracked.stdout or "").splitlines() if line.strip()}
++            untracked_set = {line.strip() for line in (untracked.stdout or "").splitlines() if line.strip()}
++            if all(rel not in tracked_set and rel not in untracked_set for rel in pathspecs):
++                noop_path = os.path.join(run_dir, "review-diff-noop.json")
++                try:
++                    with open(noop_path, "w", encoding="utf-8") as fh:
++                        json.dump({
++                            "status": "noop",
++                            "reason": "declared files unchanged in tracked diff and untracked list",
++                            "declared_files": pathspecs,
++                            "tracked_diff_files": sorted(tracked_set),
++                            "untracked_files": sorted(untracked_set),
++                        }, fh, indent=2)
++                        fh.write("\n")
++                except OSError:
++                    pass
++
+     def _sec(title, path):
+         if os.path.isfile(path) and os.path.getsize(path) > 0:
+             from mini_ork.context_assembler import cap_block
+diff --git a/mini_ork/cli/execute_handlers.py b/mini_ork/cli/execute_handlers.py
+index 6204c3a9..48152fc5 100644
+--- a/mini_ork/cli/execute_handlers.py
++++ b/mini_ork/cli/execute_handlers.py
+@@ -706,6 +706,17 @@ def _handle_reviewer(ctx: NodeDispatch):
+                   f"Write your synthesis to: {review_file}")
+     else:
+         reviewer_inputs = _assemble_reviewer_inputs(ctx.run_dir_eff)
++        # No-op gate: _assemble_reviewer_inputs wrote review-diff-noop.json when
++        # the declared files were demonstrably unchanged in both the tracked
++        # diff and the untracked list. The implementer changed nothing — block
++        # rc 1 BEFORE any model spend so a real review is never skipped on an
++        # empty diff, and the run never bills tokens for an absent change.
++        noop_marker = os.path.join(ctx.run_dir_eff, "review-diff-noop.json")
++        if os.path.isfile(noop_marker):
++            print(f"  [fail] reviewer no-op: declared files unchanged "
++                  f"(marker={noop_marker})", file=sys.stderr)
++            ctx.trace(ctx.node_id, "failure", "reviewer", review_file, "", "noop")
++            return 1, "noop"
+         prompt = (f"{ctx.prepend()}Review the implementation for: {ctx.node_desc}{ctx.learned}\n\n"
+                   f"Plan:\n{ctx.plan_content}{ctx.artifact_context}{ctx.scope_guard()}\n\n{reviewer_inputs}\n"
+                   'Respond with JSON: {"verdict": "pass|fail|needs_revision", "notes": []}')
+@@ -818,6 +829,29 @@ def _handle_verifier(ctx: NodeDispatch):
+         # as "failed / needs another attempt" even though it succeeded and the
+         # standalone verify phase passed. Success must report success; the warn
+         # line above keeps the diagnostic without poisoning machine consumers.
++        # Carry-forward: a DECLARED verifier_ref MUST run even when outputs is
++        # empty — code-fix recipes declare outputs:[] and ship verifier_ref
++        # scripts that read the worktree directly. Without this carve-out, a
++        # declared verifier_ref on a recipe with outputs:[] is silently
++        # skipped (vacuous-pass) and the verifier node does not gate the run.
++        if ctx.verifier_ref and ctx.recipe_dir:
++            script = os.path.join(ctx.recipe_dir, ctx.verifier_ref)
++            if not os.path.isfile(script):
++                print(f"  [fail] verifier_ref not found: {ctx.verifier_ref}", file=sys.stderr)
++                return 1, "error"
++            ev_dir = os.path.join(context_env("MINI_ORK_RUN_DIR", ctx.run_dir), "evidence")
++            os.makedirs(ev_dir, exist_ok=True)
++            ev = os.path.join(ev_dir, os.path.basename(ctx.verifier_ref).replace(".sh", "").replace(".py", "") + ".log")
++            rc = _run_verifier_ref(script, ev, plan_path=ctx.plan_path, artifact_path="")
++            vstem = ctx.verifier_ref[len("verifiers/"):] if ctx.verifier_ref.startswith("verifiers/") else ctx.verifier_ref
++            vstem = vstem[:-3] if vstem.endswith((".sh", ".py")) else vstem
++            persist_dir = context_env("MINI_ORK_RUN_DIR", ctx.run_dir)
++            if persist_dir and os.path.isfile(ev) and os.path.getsize(ev) > 0:
++                try:
++                    shutil.copy(ev, os.path.join(persist_dir, f"verifier_{vstem}.json"))
++                except OSError:
++                    pass
++            return _publish_success() if rc == 0 else (1, "error")
+         print("  [warn] verifier node: no outputs in artifact_contract")
+         return _publish_success()
+     if ctx.verifier_ref and ctx.recipe_dir:
+diff --git a/mini_ork/cli/spawn.py b/mini_ork/cli/spawn.py
+index a78872aa..9904e78f 100644
+--- a/mini_ork/cli/spawn.py
++++ b/mini_ork/cli/spawn.py
+@@ -423,14 +423,25 @@ class SpawnResult:
+         exit_code: 0 on success, 2 on validation failure, child exit code otherwise.
+         spawn_id: Generated spawn id from mo_recursive_approve_spawn.
+         child_exit_code: Set when the execute step ran; None for --no-execute.
++        child_run_id: The compute_child_run_id value (set in both no-execute and
++            execute branches). Lets the outer driver attribute a wave's outcome
++            to the child that produced it.
++        child_run_dir: Host-side path to the child's run dir
++            (``<home>/runs/<child_run_id>``) so the caller can read
++            review-verdict.json / review-diff.patch / review-diff-noop.json
++            directly. Same shape across no-execute and execute.
+     """
+ 
+     def __init__(self, lines: list[str], exit_code: int, spawn_id: str = "",
+-                 child_exit_code: int | None = None) -> None:
++                 child_exit_code: int | None = None,
++                 child_run_id: str | None = None,
++                 child_run_dir: str | None = None) -> None:
+         self.lines = lines
+         self.exit_code = exit_code
+         self.spawn_id = spawn_id
+         self.child_exit_code = child_exit_code
++        self.child_run_id = child_run_id
++        self.child_run_dir = child_run_dir
+ 
+ 
+ def _persist_child_log(home: str, child_run_id: str,
+@@ -554,7 +565,9 @@ def spawn(
+ 
+     if int(no_execute):
+         lines.append("spawn_status=approved")
+-        return SpawnResult(lines=lines, exit_code=0, spawn_id=spawn_id)
++        return SpawnResult(lines=lines, exit_code=0, spawn_id=spawn_id,
++                           child_run_id=child_run_id,
++                           child_run_dir=os.path.join(resolved_home, "runs", child_run_id))
+ 
+     ro.mo_recursive_mark_spawn(child_run_id, "running")
+     ro.mo_recursive_emit_event(
+@@ -620,7 +633,9 @@ def spawn(
+         lines.append("spawn_status=failed")
+ 
+     return SpawnResult(lines=lines, exit_code=child_exit, spawn_id=spawn_id,
+-                       child_exit_code=child_exit)
++                       child_exit_code=child_exit,
++                       child_run_id=child_run_id,
++                       child_run_dir=os.path.join(resolved_home, "runs", child_run_id))
+ 
+ 
+ def main(argv: list[str] | None = None) -> int:
+diff --git a/recipes/goal-loop/lib/drive.py b/recipes/goal-loop/lib/drive.py
+index 95c9e3fa..cf90da9e 100644
+--- a/recipes/goal-loop/lib/drive.py
++++ b/recipes/goal-loop/lib/drive.py
+@@ -134,12 +134,62 @@ def _default_spawn_fn(plan_entry: dict[str, Any]) -> dict[str, Any]:
+         allow_child_spawn=int(os.environ.get("MINI_ORK_ALLOW_CHILD_SPAWN", "0")),
+         no_execute=int(os.environ.get("MO_GOAL_NO_EXECUTE", "0")),
+     )
++    # Per-child attribution: SpawnResult now carries child_run_id and the
++    # host-side child_run_dir so the outer loop can attribute a wave's outcome
++    # to the child that produced it. Without this the sweep entry was a black
++    # box — the GRAO quarantine set / divergence scoring could not correlate a
++    # failing unit with the actual child run. getattr() defends against test
++    # mocks that pre-date the new attributes (older SimpleNamespace fakes omit
++    # child_run_dir; production SpawnResult always sets both).
++    child_run_id = getattr(result, "child_run_id", None)
++    child_run_dir = getattr(result, "child_run_dir", None)
++    child_verdict = ""
++    child_failed_nodes = 0
++    review_diff_bytes = 0
++    child_no_op = False
++    if child_run_dir:
++        rv = os.path.join(child_run_dir, "review-verdict.json")
++        if os.path.isfile(rv):
++            try:
++                child_verdict = (json.loads(Path(rv).read_text(encoding="utf-8")) or {}).get("verdict", "") or ""
++            except (OSError, json.JSONDecodeError):
++                pass
++        rd = os.path.join(child_run_dir, "review-diff.patch")
++        if os.path.isfile(rd):
++            try:
++                review_diff_bytes = os.path.getsize(rd)
++            except OSError:
++                review_diff_bytes = 0
++        if os.path.isfile(os.path.join(child_run_dir, "review-diff-noop.json")):
++            child_no_op = True
++        if child_run_id:
++            db = os.environ.get("MINI_ORK_DB")
++            if db and os.path.isfile(db):
++                try:
++                    import sqlite3  # noqa: PLC0415 — local import keeps module light
++                    con = sqlite3.connect(db, timeout=5.0)
++                    con.execute("PRAGMA busy_timeout=5000")
++                    row = con.execute(
++                        "SELECT COUNT(*) FROM execution_traces WHERE run_id=? "
++                        "AND status NOT IN ('success','running')",
++                        (child_run_id,),
++                    ).fetchone()
++                    if row:
++                        child_failed_nodes = int(row[0] or 0)
++                    con.close()
++                except Exception:  # noqa: BLE001 — best-effort, never crash the spawn
++                    pass
+     return {
+         "status": "spawned" if result.exit_code == 0 else "failed",
+         "unit_id": plan_entry.get("unit_id"),
+         "child_recipe": child_recipe,
+         "spawn_id": result.spawn_id,
+-        "child_run_id": None,
++        "child_run_id": child_run_id,
++        "child_run_dir": child_run_dir,
++        "child_verdict": child_verdict,
++        "child_failed_nodes": child_failed_nodes,
++        "review_diff_bytes": review_diff_bytes,
++        "child_no_op": child_no_op,
+         "exit_code": result.exit_code,
+     }
+ 

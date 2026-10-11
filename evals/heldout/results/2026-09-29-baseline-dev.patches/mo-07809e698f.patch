@@ -1,0 +1,1351 @@
+diff --git a/mini_ork/dispatch/__init__.py b/mini_ork/dispatch/__init__.py
+index dde1e673..3eb14905 100644
+--- a/mini_ork/dispatch/__init__.py
++++ b/mini_ork/dispatch/__init__.py
+@@ -32,7 +32,7 @@ from .providers import (
+     resolve_provider,
+     resolve_target_cwd,
+ )
+-from .telemetry import cache_aware_cost, persist_call
++from .telemetry import FAMILY_RATES, INPUT_INCLUDES_CACHE, cache_aware_cost, persist_call
+ 
+ __all__ = [
+     "dispatch",
+@@ -53,6 +53,8 @@ __all__ = [
+     "EXECUTABLE_MODELS",
+     "persist_call",
+     "cache_aware_cost",
++    "FAMILY_RATES",
++    "INPUT_INCLUDES_CACHE",
+     "lane_health",
+     "preflight",
+     "LaneHealth",
+diff --git a/mini_ork/dispatch/codex_transport.py b/mini_ork/dispatch/codex_transport.py
+index f2d31b68..92cb2011 100644
+--- a/mini_ork/dispatch/codex_transport.py
++++ b/mini_ork/dispatch/codex_transport.py
+@@ -221,6 +221,7 @@ def harvest(
+     at the discounted rate), so they are subtracted before the full input
+     rate — same as cl_codex.sh. Missing/empty paths skip that sidecar."""
+     in_tok = out_tok = cached_tok = 0
++    cache_create_tok = 0
+     turns: list[dict] = []
+     thread_id = None
+     for ev in _iter_events(stream_text):
+@@ -231,22 +232,27 @@ def harvest(
+             t_in = int(u.get("input_tokens") or 0)
+             t_out = int(u.get("output_tokens") or 0)
+             t_cached = int(u.get("cached_input_tokens") or 0)
++            t_cache_create = int(u.get("cache_creation_input_tokens") or 0)
+             in_tok += t_in
+             out_tok += t_out
+             cached_tok += t_cached
++            cache_create_tok += t_cache_create
+             turns.append(
+                 {
+                     "turn_index": len(turns),
+                     "input_tokens": t_in,
+                     "output_tokens": t_out,
+                     "cache_read_input_tokens": t_cached,
++                    "cache_creation_input_tokens": t_cache_create,
+                     "model": "codex",
+                     "session_id": thread_id,
+                 }
+             )
+     if usage_path and (in_tok or out_tok):
++        # 4-field TSV: in / out / cached / cache_creation. The 2-field legacy
++        # form is still parseable by providers._read_codex_sidecars.
+         with open(usage_path, "w", encoding="utf-8") as f:
+-            f.write(f"{in_tok}\t{out_tok}\n")
++            f.write(f"{in_tok}\t{out_tok}\t{cached_tok}\t{cache_create_tok}\n")
+     if turns_path and turns:
+         with open(turns_path, "w", encoding="utf-8") as f:
+             for t in turns:
+diff --git a/mini_ork/dispatch/llm_dispatch.py b/mini_ork/dispatch/llm_dispatch.py
+index 4fe40b8e..b9b9a209 100644
+--- a/mini_ork/dispatch/llm_dispatch.py
++++ b/mini_ork/dispatch/llm_dispatch.py
+@@ -24,7 +24,9 @@ import time
+ from collections.abc import Callable
+ 
+ from mini_ork.context import context_env
++from mini_ork.dispatch.models import TokenUsage
+ from mini_ork.dispatch.predicates import looks_like_json
++from mini_ork.dispatch.telemetry import cache_aware_cost
+ 
+ 
+ # ── pure helpers (verbatim regex transcriptions) ──
+@@ -255,10 +257,22 @@ def write_llm_calls_row(db, provider, model_id, tier, feature_name, actor, statu
+     out_tok = _int_or(output_tokens, 0)
+     cached_in = _int_or(cached_input_tokens, 0)
+     cache_create = _int_or(cache_creation_input_tokens, 0)
+-    uncached_in = max(in_tok - cached_in - cache_create, 0)
+-    cost_input_uncached = uncached_in * 15.0 / 1_000_000
+-    cost_input_cached = cached_in * 1.5 / 1_000_000
+-    cost_cache_write = cache_create * 18.75 / 1_000_000
++    # Single source of truth for the cache-aware cost split — delegate to
++    # telemetry.cache_aware_cost so the family-keyed INPUT_INCLUDES_CACHE +
++    # FAMILY_RATES tables in telemetry.py are the ONLY place the math lives.
++    # Previously this function hardcoded anthropic rates (15 / 1.5 / 18.75)
++    # and unconditionally subtracted cache from input — wrong for every
++    # non-anthropic family (openai gpt-5 → negative-clamped zero breakdown;
++    # gateway rows → fabricated costs).
++    cost_input_uncached, cost_input_cached, cost_cache_write = cache_aware_cost(
++        TokenUsage(
++            input_tokens=in_tok,
++            output_tokens=out_tok,
++            cached_input_tokens=cached_in,
++            cache_creation_tokens=cache_create,
++        ),
++        family=provider,
++    )
+     import json as _json
+     try:
+         _md = _json.loads(metadata_json or "{}")
+diff --git a/mini_ork/dispatch/opencode_transport.py b/mini_ork/dispatch/opencode_transport.py
+index a3a0ae2d..14194e69 100644
+--- a/mini_ork/dispatch/opencode_transport.py
++++ b/mini_ork/dispatch/opencode_transport.py
+@@ -174,6 +174,7 @@ def harvest(
+     dispatch. ``usage_path``/``turns_path``/``cost_path`` left empty skip that
+     sidecar (matches the codex transport's contract)."""
+     in_tok = out_tok = cached_tok = 0
++    cache_create_tok = 0
+     cost_total = 0.0
+     turns: list[dict] = []
+     session_id = ""
+@@ -187,16 +188,20 @@ def harvest(
+             t_in = _coerce_int(tokens.get("input"))
+             t_out = _coerce_int(tokens.get("output"))
+             # opencode emits `tokens.cache` as a nested {"write","read"} object;
+-            # cache-read is the billable-relevant half. Fall back to a scalar
+-            # `cache`/`cached` for forward-compat with a flatter shape.
++            # map write→cache_creation (5-min prompt-cache writes), read→cached
++            # (cache hits, billed at the discounted rate). Fall back to a
++            # scalar `cache`/`cached` for forward-compat with a flatter shape.
+             cache = tokens.get("cache")
+             if isinstance(cache, Mapping):
++                t_cache_create = _coerce_int(cache.get("write"))
+                 t_cached = _coerce_int(cache.get("read"))
+             else:
++                t_cache_create = 0
+                 t_cached = _coerce_int(cache if cache is not None else tokens.get("cached"))
+             in_tok += t_in
+             out_tok += t_out
+             cached_tok += t_cached
++            cache_create_tok += t_cache_create
+             cost_total += _coerce_float(part.get("cost"))
+             turns.append(
+                 {
+@@ -204,13 +209,16 @@ def harvest(
+                     "input_tokens": t_in,
+                     "output_tokens": t_out,
+                     "cache_read_input_tokens": t_cached,
++                    "cache_creation_input_tokens": t_cache_create,
+                     "model": "opencode",
+                     "session_id": session_id,
+                 }
+             )
+     if usage_path and (in_tok or out_tok):
++        # 4-field TSV: in / out / cached / cache_creation. Same shape as the
++        # codex transport so providers._read_codex_sidecars handles both.
+         with open(usage_path, "w", encoding="utf-8") as f:
+-            f.write(f"{in_tok}\t{out_tok}\n")
++            f.write(f"{in_tok}\t{out_tok}\t{cached_tok}\t{cache_create_tok}\n")
+     if turns_path and turns:
+         with open(turns_path, "w", encoding="utf-8") as f:
+             for t in turns:
+diff --git a/mini_ork/dispatch/providers.py b/mini_ork/dispatch/providers.py
+index ad2f07b2..ddd01c9e 100644
+--- a/mini_ork/dispatch/providers.py
++++ b/mini_ork/dispatch/providers.py
+@@ -1133,15 +1133,24 @@ def apply_tool_grants(
+ 
+ 
+ def _read_codex_sidecars(usage_path: str, cost_path: str) -> tuple[TokenUsage, float]:
+-    """Read cl_codex.sh's sidecars: MO_USAGE_FILE is a TSV ``in<TAB>out`` line;
+-    MO_COST_FILE is a single float. Missing/garbled → zeros."""
+-    in_tok = out_tok = 0
++    """Read cl_codex.sh's sidecars: MO_USAGE_FILE is a TSV line whose shape has
++    evolved from 2 fields (``in<TAB>out``) to 4 fields
++    (``in<TAB>out<TAB>cached<TAB>cache_creation``). Missing fields fall back to
++    0 — old sidecars still parse cleanly. MO_COST_FILE is a single float.
++    Missing/garbled → zeros."""
++    in_tok = out_tok = cached_tok = cache_create_tok = 0
+     cost = 0.0
+     try:
+         with open(usage_path, encoding="utf-8") as fh:
+             parts = fh.read().strip().split("\t")
++            if len(parts) >= 1:
++                in_tok = int(parts[0] or 0)
+             if len(parts) >= 2:
+-                in_tok, out_tok = int(parts[0] or 0), int(parts[1] or 0)
++                out_tok = int(parts[1] or 0)
++            if len(parts) >= 3:
++                cached_tok = int(parts[2] or 0)
++            if len(parts) >= 4:
++                cache_create_tok = int(parts[3] or 0)
+     except (OSError, ValueError):
+         pass
+     try:
+@@ -1149,7 +1158,12 @@ def _read_codex_sidecars(usage_path: str, cost_path: str) -> tuple[TokenUsage, f
+             cost = float(fh.read().strip() or 0.0)
+     except (OSError, ValueError):
+         pass
+-    return TokenUsage(input_tokens=in_tok, output_tokens=out_tok), cost
++    return TokenUsage(
++        input_tokens=in_tok,
++        output_tokens=out_tok,
++        cached_input_tokens=cached_tok,
++        cache_creation_tokens=cache_create_tok,
++    ), cost
+ 
+ 
+ # ── Per-engine command builders (SOLID M6, OCP; SE-3 Phase A.3) ─────────────
+diff --git a/mini_ork/dispatch/telemetry.py b/mini_ork/dispatch/telemetry.py
+index 26747e62..8d25c6b9 100644
+--- a/mini_ork/dispatch/telemetry.py
++++ b/mini_ork/dispatch/telemetry.py
+@@ -34,19 +34,121 @@ DEFAULT_RATE_UNCACHED_IN = 15.0
+ DEFAULT_RATE_CACHED_IN = 1.5
+ DEFAULT_RATE_CACHE_WRITE = 18.75
+ 
++# Provider-family → "does ``input_tokens`` already include the cached +
++# cache_creation tokens?" semantics.
++#
++#   True  → the provider's input_tokens COUNTS the cached + cache-creation
++#            tokens; subtract them to get fresh input for the uncached rate.
++#            (OpenAI gpt-5 / codex turn.completed behaves this way.)
++#   False → the provider reports input_tokens as FRESH-ONLY; cached +
++#            cache_creation are separate fields that bill independently.
++#            (Anthropic claude envelope, opencode's tokens.input, anthropic-
++#            compat gateway lanes that route through the claude CLI.)
++#
++# A family missing from this dict is treated as INPUT_INCLUDES_CACHE=False
++# (anthropic-shape) — i.e. NO subtraction — because subtracting unknown
++# semantics is the bug we are fixing (anthropic rows went to $0.0017 because
++# the old subtraction clamped to 0 when cached > input).
++INPUT_INCLUDES_CACHE: dict[str, bool] = {
++    "anthropic": False,
++    "openai": True,
++    "opencode": False,
++    "gateway": False,   # anthropic-compat lanes use the claude binary
++    "google": False,
++}
++
++# Per-family USD per MTok rates (uncached_in, cached_in, cache_write).
++#
++# Per-family contract:
++#   - "anthropic"   : list prices (lib/llm-dispatch.sh defaults).
++#   - "openai"      : gpt-5 list (1.25 / 0.125 / 0.0); codex's usage sidecar
++#                     has no separate cache_creation signal, so cache_write=0.
++#   - "opencode"    : opencode surfaces its own per-call cost in the stream
++#                     (envelope total), so its breakdown uses the anthropic
++#                     rates as a documented upper-bound (no better signal).
++#   - "gateway"     : anthropic-compat = anthropic list.
++#   - "google" / unknown : (0, 0, 0) — NEVER fabricate breakdown columns for
++#                     a family without a registered rate sheet. A zero
++#                     breakdown is the load-bearing contract: silent phantom
++#                     costs (codex ~$1,160 vs $115.73 real) are the regression
++#                     this table was built to prevent.
++FAMILY_RATES: dict[str, tuple[float, float, float]] = {
++    "anthropic": (15.0, 1.5, 18.75),
++    "openai": (1.25, 0.125, 0.0),
++    "opencode": (15.0, 1.5, 18.75),
++    "gateway": (15.0, 1.5, 18.75),
++    "google": (0.0, 0.0, 0.0),
++}
++
++
++def _resolve_rates(
++    family: str,
++    rate_uncached_in: float | None,
++    rate_cached_in: float | None,
++    rate_cache_write: float | None,
++) -> tuple[float, float, float] | None:
++    """Return (uncached, cached, cache_write) USD/Mtok or None when the family
++    has no rate sheet (i.e. never fabricate). Explicit rate kwargs override the
++    family table when all three are provided."""
++    if (
++        rate_uncached_in is not None
++        and rate_cached_in is not None
++        and rate_cache_write is not None
++    ):
++        return (rate_uncached_in, rate_cached_in, rate_cache_write)
++    if family not in FAMILY_RATES:
++        return None
++    base = FAMILY_RATES[family]
++    return (
++        rate_uncached_in if rate_uncached_in is not None else base[0],
++        rate_cached_in if rate_cached_in is not None else base[1],
++        rate_cache_write if rate_cache_write is not None else base[2],
++    )
++
+ 
+ def cache_aware_cost(
+     usage: TokenUsage,
+     *,
+-    rate_uncached_in: float = DEFAULT_RATE_UNCACHED_IN,
+-    rate_cached_in: float = DEFAULT_RATE_CACHED_IN,
+-    rate_cache_write: float = DEFAULT_RATE_CACHE_WRITE,
++    family: str = "anthropic",
++    rate_uncached_in: float | None = None,
++    rate_cached_in: float | None = None,
++    rate_cache_write: float | None = None,
+ ) -> tuple[float, float, float]:
+-    """(uncached_input, cached_input, cache_write) USD. input_tokens INCLUDES the
+-    cached + cache-creation tokens, so subtract them before the uncached rate."""
+-    uncached_in = max(
+-        usage.input_tokens - usage.cached_input_tokens - usage.cache_creation_tokens, 0
+-    )
++    """(uncached_input, cached_input, cache_write) USD for a per-call usage.
++
++    ``family`` keys INPUT_INCLUDES_CACHE + FAMILY_RATES so each provider gets
++    correct math:
++
++      - anthropic / opencode / gateway : input_tokens is FRESH-only; the
++        cached + cache_creation fields are SEPARATE billable inputs. No
++        subtraction; charge each pool at its own rate.
++      - openai gpt-5 (codex)            : input_tokens INCLUDES the cached +
++        cache_creation tokens, so uncached_in = max(input - cached -
++        cache_creation, 0). Cache_creation stays at 0 because the codex
++        usage sidecar does not surface a separate cache-write signal.
++      - google / unknown                : (0, 0, 0) — never fabricate.
++
++    Explicit rate_uncached_in / rate_cached_in / rate_cache_write kwargs win
++    over the family table when all three are provided (backwards-compatible
++    per-call override; legacy call sites pass them explicitly).
++    """
++    rates = _resolve_rates(family, rate_uncached_in, rate_cached_in, rate_cache_write)
++    if rates is None:
++        return (0.0, 0.0, 0.0)
++    rate_uncached_in, rate_cached_in, rate_cache_write = rates
++    # Family with all-zero rates → don't compute breakdown either.
++    if rate_uncached_in == 0.0 and rate_cached_in == 0.0 and rate_cache_write == 0.0:
++        return (0.0, 0.0, 0.0)
++    if INPUT_INCLUDES_CACHE.get(family, False):
++        uncached_in = max(
++            usage.input_tokens - usage.cached_input_tokens - usage.cache_creation_tokens,
++            0,
++        )
++    else:
++        # Anthropic-shape: input_tokens is fresh-only; cached + cache_creation
++        # are SEPARATE billable fields. Subtracting here is the bug that
++        # zeroed anthropic receipt rows (cached > input → max(…, 0) = 0).
++        uncached_in = max(usage.input_tokens, 0)
+     return (
+         uncached_in * rate_uncached_in / 1_000_000,
+         usage.cached_input_tokens * rate_cached_in / 1_000_000,
+@@ -76,7 +178,12 @@ def persist_call(
+         return None
+ 
+     usage = result.usage
+-    uncached_cost, cached_cost, cache_write_cost = cache_aware_cost(usage)
++    # Family-aware breakdown: ``provider`` is the family name (anthropic /
++    # openai / opencode / gateway / google / …); FAMILY_RATES + INPUT_INCLUDES_CACHE
++    # key off it so anthropic rows are no longer zeroed by an over-eager cache
++    # subtraction and google / unknown families yield (0, 0, 0) instead of
++    # fabricated phantom costs.
++    uncached_cost, cached_cost, cache_write_cost = cache_aware_cost(usage, family=provider)
+     md: dict[str, object] = dict(metadata or {})
+     if session_id and "session_id" not in md:
+         md["session_id"] = session_id
+diff --git a/scripts/llm_calls_cost_backfill.py b/scripts/llm_calls_cost_backfill.py
+new file mode 100644
+index 00000000..7fc608a3
+--- /dev/null
++++ b/scripts/llm_calls_cost_backfill.py
+@@ -0,0 +1,267 @@
++#!/usr/bin/env python3
++"""Recompute the cache-aware cost breakdown columns in ``llm_calls``.
++
++The ``cost_input_uncached_usd`` / ``cost_input_cached_usd`` /
++``cost_cache_write_usd`` columns were historically priced every provider at
++Anthropic list rates (15 / 1.5 / 18.75 USD per MTok) and unconditionally
++subtracted cached+cache_creation from input_tokens. Live data proved both
++assumptions wrong:
++
++  - anthropic rows went to $0.0017 uncached cost (the subtraction zeroed
++    fresh input the envelope already excludes cache from; receipt rows
++    had input=44k / cached=261k);
++  - codex (OpenAI gpt-5) rows reported ~$1,160 vs the real $115.73
++    (rates + cache-subtraction mismatch compounded);
++  - gateway rows reported ~$815 fabricated cost vs $607.64 real envelope
++    total — the breakdown invented phantom dollars.
++
++The fix lives in ``mini_ork.dispatch.telemetry.cache_aware_cost``: per-family
++``INPUT_INCLUDES_CACHE`` semantics + ``FAMILY_RATES`` table. This script is
++the retroactive sweep that re-prices historical rows under the new rules.
++
++Hard contract:
++  - DRY-RUN BY DEFAULT. Pass ``--apply`` to actually write rows. Without
++    ``--apply`` the script prints what it WOULD change and exits 0.
++  - Never touches ``input_tokens`` / ``output_tokens`` /
++    ``cached_input_tokens`` / ``cache_creation_input_tokens`` /
++    ``cost_usd``. Only the three breakdown columns are recomputed. The
++    original token totals + the provider-reported ``cost_usd`` are the
++    ground truth we are correcting AGAINST, not variables we are allowed
++    to overwrite.
++
++Usage:
++  # default DB (MINI_ORK_DB or $MINI_ORK_HOME/state.db); show proposed changes
++  python3 scripts/llm_calls_cost_backfill.py
++
++  # explicit DB
++  python3 scripts/llm_calls_cost_backfill.py --db /path/to/state.db
++
++  # write to the DB
++  python3 scripts/llm_calls_cost_backfill.py --apply
++
++  # filter to a single provider family (e.g. only "anthropic" rows)
++  python3 scripts/llm_calls_cost_backfill.py --provider anthropic
++"""
++from __future__ import annotations
++
++import argparse
++import os
++import sqlite3
++import sys
++from pathlib import Path
++
++# Allow `python3 scripts/llm_calls_cost_backfill.py` from the repo root —
++# the dispatch layer lives one level up + inside the package.
++_REPO_ROOT = Path(__file__).resolve().parent.parent
++if str(_REPO_ROOT) not in sys.path:
++    sys.path.insert(0, str(_REPO_ROOT))
++
++from mini_ork.context import context_env  # noqa: E402
++from mini_ork.dispatch.telemetry import (  # noqa: E402
++    FAMILY_RATES,
++    INPUT_INCLUDES_CACHE,
++    cache_aware_cost,
++)
++from mini_ork.dispatch.models import TokenUsage  # noqa: E402
++
++
++def _default_db_path() -> Path:
++    """Resolve the llm_calls DB: $MINI_ORK_DB → $MINI_ORK_HOME/state.db → ./state.db."""
++    explicit = context_env("MINI_ORK_DB")
++    if explicit:
++        return Path(explicit)
++    home = context_env("MINI_ORK_HOME")
++    if home:
++        return Path(home) / "state.db"
++    return Path.cwd() / "state.db"
++
++
++def _existing_breakdown_columns(con: sqlite3.Connection) -> set[str]:
++    """The set of cost_*_usd breakdown columns actually present in this DB
++    schema. Old DBs without the 0024 cache-aware migration have none, so the
++    backfill is a no-op there (nothing to recompute)."""
++    try:
++        cols = {row[1] for row in con.execute("PRAGMA table_info(llm_calls)")}
++    except sqlite3.OperationalError:
++        return set()
++    return {c for c in ("cost_input_uncached_usd", "cost_input_cached_usd", "cost_cache_write_usd") if c in cols}
++
++
++def _iter_rows(con: sqlite3.Connection, provider: str | None):
++    """Yield (id, family, input, output, cached, cache_creation) tuples."""
++    sql = (
++        "SELECT id, provider, COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), "
++        "COALESCE(cached_input_tokens, 0), COALESCE(cache_creation_input_tokens, 0) "
++        "FROM llm_calls"
++    )
++    params: tuple = ()
++    if provider:
++        sql += " WHERE provider = ?"
++        params = (provider,)
++    yield from con.execute(sql, params)
++
++
++def _format_change(
++    row_id: int,
++    family: str,
++    old: tuple[float, float, float],
++    new: tuple[float, float, float],
++    usage: TokenUsage,
++) -> str:
++    return (
++        f"id={row_id} family={family} "
++        f"in={usage.input_tokens} out={usage.output_tokens} "
++        f"cached={usage.cached_input_tokens} cache_create={usage.cache_creation_tokens} "
++        f"uncached {old[0]:.6f}→{new[0]:.6f} "
++        f"cached {old[1]:.6f}→{new[1]:.6f} "
++        f"cache_write {old[2]:.6f}→{new[2]:.6f}"
++    )
++
++
++def _summarize(
++    con: sqlite3.Connection,
++    *,
++    apply: bool,
++    provider: str | None,
++    limit: int | None,
++) -> int:
++    """Walk every llm_calls row, recompute the breakdown, print/write.
++
++    Returns the number of rows whose breakdown ACTUALLY CHANGED (zero means
++    nothing to backfill — the historical rows were already correctly priced,
++    or the schema predates the breakdown columns)."""
++    breakdown_cols = _existing_breakdown_columns(con)
++    if len(breakdown_cols) < 3:
++        sys.stderr.write(
++            f"[llm_calls_cost_backfill] llm_calls schema lacks breakdown columns "
++            f"(have {sorted(breakdown_cols)}); nothing to recompute\n"
++        )
++        return 0
++
++    updated = 0
++    scanned = 0
++    plan: list[tuple[int, str, TokenUsage, tuple[float, float, float], tuple[float, float, float]]] = []
++
++    for row_id, family, in_tok, out_tok, cached_tok, cache_create_tok in _iter_rows(con, provider):
++        if limit is not None and updated >= limit:
++            break
++        scanned += 1
++        old = (
++            float(con.execute(
++                "SELECT cost_input_uncached_usd FROM llm_calls WHERE id=?", (row_id,)
++            ).fetchone()[0] or 0.0),
++            float(con.execute(
++                "SELECT cost_input_cached_usd FROM llm_calls WHERE id=?", (row_id,)
++            ).fetchone()[0] or 0.0),
++            float(con.execute(
++                "SELECT cost_cache_write_usd FROM llm_calls WHERE id=?", (row_id,)
++            ).fetchone()[0] or 0.0),
++        )
++        usage = TokenUsage(
++            input_tokens=int(in_tok),
++            output_tokens=int(out_tok),
++            cached_input_tokens=int(cached_tok),
++            cache_creation_tokens=int(cache_create_tok),
++        )
++        new = cache_aware_cost(usage, family=family or "anthropic")
++        if (
++            abs(old[0] - new[0]) > 1e-9
++            or abs(old[1] - new[1]) > 1e-9
++            or abs(old[2] - new[2]) > 1e-9
++        ):
++            updated += 1
++            plan.append((row_id, family or "anthropic", usage, old, new))
++
++    if not apply:
++        sys.stdout.write(
++            f"[llm_calls_cost_backfill] DRY-RUN scanned={scanned} would_update={updated} "
++            f"db={con.execute('PRAGMA database_list').fetchone()[2] if False else ''}\n"
++        )
++        for row_id, family, usage, old, new in plan[:50]:
++            sys.stdout.write(_format_change(row_id, family, old, new, usage) + "\n")
++        if len(plan) > 50:
++            sys.stdout.write(f"[llm_calls_cost_backfill] …and {len(plan) - 50} more\n")
++        sys.stdout.write(
++            "[llm_calls_cost_backfill] Pass --apply to write these changes.\n"
++        )
++        return updated
++
++    if not plan:
++        sys.stdout.write(f"[llm_calls_cost_backfill] scanned={scanned} updated=0 (no changes)\n")
++        return 0
++
++    con.execute("BEGIN")
++    try:
++        for row_id, _family, usage, old, new in plan:
++            con.execute(
++                "UPDATE llm_calls SET "
++                "cost_input_uncached_usd=?, cost_input_cached_usd=?, cost_cache_write_usd=? "
++                "WHERE id=?",
++                (new[0], new[1], new[2], row_id),
++            )
++        con.commit()
++    except Exception:
++        con.rollback()
++        raise
++    sys.stdout.write(
++        f"[llm_calls_cost_backfill] APPLIED scanned={scanned} updated={updated}\n"
++    )
++    for row_id, family, usage, old, new in plan[:50]:
++        sys.stdout.write(_format_change(row_id, family, old, new, usage) + "\n")
++    if len(plan) > 50:
++        sys.stdout.write(f"[llm_calls_cost_backfill] …and {len(plan) - 50} more\n")
++    return updated
++
++
++def main(argv: list[str] | None = None) -> int:
++    argv = list(sys.argv[1:] if argv is None else argv)
++    parser = argparse.ArgumentParser(
++        description="Recompute llm_calls cache-aware cost breakdown under the "
++        "new family-keyed INPUT_INCLUDES_CACHE + FAMILY_RATES rules.",
++    )
++    parser.add_argument(
++        "--db", default=None,
++        help="Path to the SQLite DB. Default: $MINI_ORK_DB → $MINI_ORK_HOME/state.db → ./state.db.",
++    )
++    parser.add_argument(
++        "--apply", action="store_true",
++        help="Write the recomputed breakdown. Default: dry-run (print proposed changes).",
++    )
++    parser.add_argument(
++        "--provider", default=None,
++        help="Restrict the sweep to one provider family (e.g. 'anthropic').",
++    )
++    parser.add_argument(
++        "--limit", type=int, default=None,
++        help="Stop after recomputing this many rows (useful for sampling).",
++    )
++    args = parser.parse_args(argv)
++
++    db_path = Path(args.db) if args.db else _default_db_path()
++    if not db_path.is_file():
++        sys.stderr.write(f"[llm_calls_cost_backfill] DB not found: {db_path}\n")
++        return 2
++
++    # Surface the family tables so an operator can sanity-check before --apply.
++    sys.stdout.write(
++        f"[llm_calls_cost_backfill] db={db_path} mode={'APPLY' if args.apply else 'DRY-RUN'}\n"
++        f"[llm_calls_cost_backfill] INPUT_INCLUDES_CACHE={INPUT_INCLUDES_CACHE}\n"
++        f"[llm_calls_cost_backfill] FAMILY_RATES={FAMILY_RATES}\n"
++    )
++
++    con = sqlite3.connect(str(db_path), timeout=10)
++    try:
++        con.execute("PRAGMA busy_timeout=5000")
++        _summarize(
++            con,
++            apply=args.apply,
++            provider=args.provider,
++            limit=args.limit,
++        )
++    finally:
++        con.close()
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+\ No newline at end of file
+diff --git a/tests/test_dispatch_telemetry_py.py b/tests/test_dispatch_telemetry_py.py
+index 94658061..3b16cd68 100644
+--- a/tests/test_dispatch_telemetry_py.py
++++ b/tests/test_dispatch_telemetry_py.py
+@@ -1,6 +1,7 @@
+ """Tests for mini_ork.dispatch.telemetry — persisting a DispatchResult to
+ llm_calls. Faithful-port checks: column introspection (works on old schemas),
+-cache-aware cost split, success/failed status, and no-op on a missing DB.
++family-aware cache-aware cost split, success/failed status, and no-op on a
++missing DB.
+ """
+ 
+ from __future__ import annotations
+@@ -11,6 +12,8 @@ import pytest
+ 
+ from mini_ork.dispatch import (
+     DispatchResult,
++    FAMILY_RATES,
++    INPUT_INCLUDES_CACHE,
+     TokenUsage,
+     cache_aware_cost,
+     persist_call,
+@@ -108,11 +111,38 @@ def test_persist_failed_row_records_error(tmp_path):
+ 
+ 
+ def test_cost_breakdown_persisted(tmp_path):
++    # provider="openai" (gpt-5 / codex family): input_tokens INCLUDES the
++    # cached + cache_creation tokens, so cache_aware_cost subtracts them to
++    # get fresh input. uncached_in = 1000-200-100 = 700.
+     db = _db(tmp_path, FULL_SCHEMA)
+     res = DispatchResult(
+         ok=True, rc=0, model="glm",
+         usage=TokenUsage(input_tokens=1000, cached_input_tokens=200, cache_creation_tokens=100),
+     )
++    rowid = persist_call(db, res, provider="openai", feature_name="f")
++    con = sqlite3.connect(db)
++    uncached, cached, cw = con.execute(
++        "SELECT cost_input_uncached_usd, cost_input_cached_usd, cost_cache_write_usd "
++        "FROM llm_calls WHERE id=?",
++        (rowid,),
++    ).fetchone()
++    con.close()
++    # openai rates: 1.25 / 0.125 / 0.0 (no cache_creation signal from codex)
++    assert uncached == pytest.approx(700 * 1.25 / 1_000_000)
++    assert cached == pytest.approx(200 * 0.125 / 1_000_000)
++    assert cw == pytest.approx(0.0)
++
++
++def test_cost_breakdown_anthropic_does_not_subtract_cache(tmp_path):
++    # provider="anthropic": claude envelope reports input_tokens as fresh-only;
++    # the cached + cache_creation fields are SEPARATE billable inputs. The
++    # pre-fix code subtracted cached from input and zeroed anthropic receipt
++    # rows (cached > input → max(…, 0) = 0 → phantom $0.0017 uncached cost).
++    db = _db(tmp_path, FULL_SCHEMA)
++    res = DispatchResult(
++        ok=True, rc=0, model="sonnet",
++        usage=TokenUsage(input_tokens=44, cached_input_tokens=261, cache_creation_tokens=0),
++    )
+     rowid = persist_call(db, res, provider="anthropic", feature_name="f")
+     con = sqlite3.connect(db)
+     uncached, cached, cw = con.execute(
+@@ -121,10 +151,32 @@ def test_cost_breakdown_persisted(tmp_path):
+         (rowid,),
+     ).fetchone()
+     con.close()
+-    # uncached_in = 1000-200-100 = 700
+-    assert uncached == pytest.approx(700 * 15.0 / 1_000_000)
+-    assert cached == pytest.approx(200 * 1.5 / 1_000_000)
+-    assert cw == pytest.approx(100 * 18.75 / 1_000_000)
++    # anthropic INPUT_INCLUDES_CACHE=False → no subtraction; uncached_in=44
++    assert uncached == pytest.approx(44 * 15.0 / 1_000_000)
++    assert cached == pytest.approx(261 * 1.5 / 1_000_000)
++    assert cw == pytest.approx(0.0)
++
++
++def test_cost_breakdown_unknown_family_is_zero_not_fabricated(tmp_path):
++    # An unknown / google family MUST yield (0, 0, 0) — never fabricate.
++    # Live-data damage: gateway rows previously reported ~$815 fabricated
++    # breakdown vs $607.64 real envelope cost.
++    db = _db(tmp_path, FULL_SCHEMA)
++    res = DispatchResult(
++        ok=True, rc=0, model="?",
++        usage=TokenUsage(input_tokens=10_000, cached_input_tokens=2_000),
++    )
++    rowid = persist_call(db, res, provider="google", feature_name="f")
++    con = sqlite3.connect(db)
++    uncached, cached, cw = con.execute(
++        "SELECT cost_input_uncached_usd, cost_input_cached_usd, cost_cache_write_usd "
++        "FROM llm_calls WHERE id=?",
++        (rowid,),
++    ).fetchone()
++    con.close()
++    assert uncached == 0.0
++    assert cached == 0.0
++    assert cw == 0.0
+ 
+ 
+ def test_introspection_writes_only_existing_columns(tmp_path):
+@@ -145,8 +197,66 @@ def test_missing_db_is_noop_not_crash(tmp_path):
+ 
+ 
+ def test_cache_aware_cost_subtracts_cached_and_creation():
++    # OpenAI gpt-5 / codex: input_tokens INCLUDES the cached + cache_creation
++    # tokens, so cache_aware_cost subtracts them. The default ``family`` was
++    # historically anthropic (and subtracted unconditionally) — that was the
++    # bug that zeroed anthropic receipt rows. family="openai" pins the
++    # subtraction case.
+     u = TokenUsage(input_tokens=1000, cached_input_tokens=200, cache_creation_tokens=100)
+-    uncached, cached, cw = cache_aware_cost(u)
+-    assert uncached == pytest.approx(700 * 15.0 / 1_000_000)
+-    assert cached == pytest.approx(200 * 1.5 / 1_000_000)
+-    assert cw == pytest.approx(100 * 18.75 / 1_000_000)
++    uncached, cached, cw = cache_aware_cost(u, family="openai")
++    assert uncached == pytest.approx(700 * 1.25 / 1_000_000)
++    assert cached == pytest.approx(200 * 0.125 / 1_000_000)
++    # openai / codex usage sidecar has no cache_creation signal → 0
++    assert cw == pytest.approx(0.0)
++
++
++def test_cache_aware_cost_anthropic_does_not_subtract():
++    # Anthropic envelope reports input_tokens fresh-only; cached +
++    # cache_creation are SEPARATE billable fields. Subtracting here is the
++    # bug that clamped receipt rows to 0 when cached > input.
++    u = TokenUsage(input_tokens=44, cached_input_tokens=261, cache_creation_tokens=10)
++    uncached, cached, cw = cache_aware_cost(u, family="anthropic")
++    assert uncached == pytest.approx(44 * 15.0 / 1_000_000)
++    assert cached == pytest.approx(261 * 1.5 / 1_000_000)
++    assert cw == pytest.approx(10 * 18.75 / 1_000_000)
++
++
++def test_cache_aware_cost_unknown_family_returns_zeros():
++    # google / unknown family → never fabricate breakdown.
++    u = TokenUsage(input_tokens=10_000, cached_input_tokens=2_000, cache_creation_tokens=500)
++    assert cache_aware_cost(u, family="google") == (0.0, 0.0, 0.0)
++    assert cache_aware_cost(u, family="some-future-vendor") == (0.0, 0.0, 0.0)
++
++
++def test_cache_aware_cost_explicit_rates_override_family_table():
++    # Backwards-compat: an explicit per-call rate triple wins over FAMILY_RATES.
++    u = TokenUsage(input_tokens=1000, cached_input_tokens=200, cache_creation_tokens=100)
++    uncached, cached, cw = cache_aware_cost(
++        u,
++        family="anthropic",
++        rate_uncached_in=10.0,
++        rate_cached_in=1.0,
++        rate_cache_write=12.0,
++    )
++    assert uncached == pytest.approx(1000 * 10.0 / 1_000_000)
++    assert cached == pytest.approx(200 * 1.0 / 1_000_000)
++    assert cw == pytest.approx(100 * 12.0 / 1_000_000)
++
++
++def test_family_tables_expose_semantics_and_rates():
++    # The family table is the single source of truth for both the subtraction
++    # semantics (INPUT_INCLUDES_CACHE) and the rate sheet (FAMILY_RATES).
++    # Downstream consumers (cache_aware_cost, persist_call,
++    # llm_dispatch.write_llm_calls_row, scripts/llm_calls_cost_backfill.py)
++    # all read these two dicts — guard the table shape so a future provider
++    # can't ship without a rate row.
++    assert INPUT_INCLUDES_CACHE["anthropic"] is False
++    assert INPUT_INCLUDES_CACHE["openai"] is True
++    assert INPUT_INCLUDES_CACHE["opencode"] is False
++    assert INPUT_INCLUDES_CACHE["gateway"] is False
++    for family in ("anthropic", "openai", "opencode", "gateway"):
++        uncached, cached, cache_write = FAMILY_RATES[family]
++        # Every registered family has 3 rates; zero-rate families (google)
++        # are the only ones permitted to use (0, 0, 0).
++        assert len(FAMILY_RATES[family]) == 3
++        assert uncached >= 0 and cached >= 0 and cache_write >= 0, family
+diff --git a/tests/test_web_smoke.py b/tests/test_web_smoke.py
+index 7a01b36d..efcd7a1d 100644
+--- a/tests/test_web_smoke.py
++++ b/tests/test_web_smoke.py
+@@ -865,7 +865,14 @@ def test_cache_cost_components_sum_to_cost_usd(tmp_path: Path) -> None:
+ 
+     assert row[4] == 200
+     assert row[5] == 300
+-    expected_input_cost = (500 * 15.0 + 200 * 1.5 + 300 * 18.75) / 1_000_000
++    # Anthropic envelope reports input_tokens as FRESH-only (input does NOT
++    # include cached/cache_creation). The old test subtracted cached+creation
++    # from input — that assumption was disproven by live data: receipt rows
++    # with cached > input were clamped to 0 and phantom $0.0017 costs
++    # persisted. The new family-aware cache_aware_cost leaves uncached_in
++    # = input_tokens for anthropic; cached + cache_creation are separate
++    # billable inputs.
++    expected_input_cost = (1000 * 15.0 + 200 * 1.5 + 300 * 18.75) / 1_000_000
+     component_sum = row[0] + row[1] + row[2]
+     assert component_sum == pytest.approx(expected_input_cost)
+     assert row[3] == pytest.approx(0.009)
+diff --git a/tests/unit/test_codex_transport_py.py b/tests/unit/test_codex_transport_py.py
+index 2e7b9b88..6216fbe8 100644
+--- a/tests/unit/test_codex_transport_py.py
++++ b/tests/unit/test_codex_transport_py.py
+@@ -47,7 +47,7 @@ while i < len(argv):
+         break
+     i += 1
+ print('{"type":"thread.started","thread_id":"thr-unit"}')
+-print('{"type":"turn.completed","usage":{"input_tokens":1500,"output_tokens":250,"cached_input_tokens":500}}')
++print('{"type":"turn.completed","usage":{"input_tokens":1500,"output_tokens":250,"cached_input_tokens":500,"cache_creation_input_tokens":75}}')
+ print('{"type":"item.completed","item":{"type":"agent_message","text":"alpha body"}}')
+ mode = os.environ.get("FAKE_CODEX_MODE", "ok")
+ if mode == "transcript":
+@@ -327,9 +327,9 @@ STREAM = "\n".join(
+         "[cl_codex] prompt_bytes=5",
+         '{"type":"thread.started","thread_id":"t-1"}',
+         "not-json-noise",
+-        '{"type":"turn.completed","usage":{"input_tokens":1000,"output_tokens":500,"cached_input_tokens":200}}',
++        '{"type":"turn.completed","usage":{"input_tokens":1000,"output_tokens":500,"cached_input_tokens":200,"cache_creation_input_tokens":50}}',
+         "{malformed",
+-        '{"type":"turn.completed","usage":{"input_tokens":2000,"output_tokens":700,"cached_input_tokens":100}}',
++        '{"type":"turn.completed","usage":{"input_tokens":2000,"output_tokens":700,"cached_input_tokens":100,"cache_creation_input_tokens":30}}',
+     ]
+ )
+ 
+@@ -347,13 +347,17 @@ def _harvest(tmp_path, monkeypatch, **env):
+ def test_harvest_usage_and_turns_exact(tmp_path, monkeypatch):
+     monkeypatch.setenv("MO_PRICING_YAML", str(tmp_path / "none.yaml"))
+     usage, turns, _cost = _harvest(tmp_path, monkeypatch)
+-    assert usage.read_text() == "3000\t1200\n"
++    # 4-field TSV: in / out / cached / cache_creation. Sums are 3000 / 1200
++    # / 300 / 80. The 2-field legacy form (in<TAB>out) is still parseable by
++    # providers._read_codex_sidecars.
++    assert usage.read_text() == "3000\t1200\t300\t80\n"
+     lines = turns.read_text().splitlines()
+     assert json.loads(lines[0]) == {
+         "turn_index": 0,
+         "input_tokens": 1000,
+         "output_tokens": 500,
+         "cache_read_input_tokens": 200,
++        "cache_creation_input_tokens": 50,
+         "model": "codex",
+         "session_id": "t-1",
+     }
+@@ -362,6 +366,7 @@ def test_harvest_usage_and_turns_exact(tmp_path, monkeypatch):
+         "input_tokens": 2000,
+         "output_tokens": 700,
+         "cache_read_input_tokens": 100,
++        "cache_creation_input_tokens": 30,
+         "model": "codex",
+         "session_id": "t-1",
+     }
+@@ -380,6 +385,27 @@ def test_harvest_cost_env_override_wins(tmp_path, monkeypatch):
+     assert cost.read_text() == "0.015150\n"
+ 
+ 
++def test_harvest_legacy_two_field_sidecar_still_parses(tmp_path, monkeypatch):
++    """Old codex runs wrote ``in<TAB>out`` only. The new 4-field shape must
++    not break consumers that still emit the legacy form."""
++    monkeypatch.setenv("MO_PRICING_YAML", str(tmp_path / "none.yaml"))
++    usage = tmp_path / "u.tokens"
++    turns = tmp_path / "turns.jsonl"
++    cost = tmp_path / "cost.txt"
++    # Plain 2-field sidecar — caches absent → 0.
++    usage.write_text("3000\t1200\n")
++    # Empty stream so harvest writes the (legacy) usage sidecar already on
++    # disk but does NOT overwrite it; verify providers._read_codex_sidecars
++    # handles both shapes.
++    from mini_ork.dispatch.providers import _read_codex_sidecars
++    usage_, cost_ = _read_codex_sidecars(str(usage), str(cost))
++    assert usage_.input_tokens == 3000
++    assert usage_.output_tokens == 1200
++    assert usage_.cached_input_tokens == 0
++    assert usage_.cache_creation_tokens == 0
++    assert cost_ == 0.0
++
++
+ def test_harvest_cost_pricing_yaml_lookup(tmp_path, monkeypatch):
+     pricing = tmp_path / "pricing.yaml"
+     pricing.write_text(
+@@ -562,16 +588,19 @@ def test_native_subprocess_writes_expected_output_and_sidecars(
+     proc, usage, turns, cost = _run_transport(fmt, tmp_path, target, monkeypatch)
+ 
+     assert proc.returncode == 0
+-    assert _read_or_none(usage) == "1500\t250\n"
++    # 4-field TSV: in / out / cached / cache_creation (the fake CLI emits
++    # cached_input_tokens=500, cache_creation_input_tokens=75).
++    assert _read_or_none(usage) == "1500\t250\t500\t75\n"
+     assert json.loads(turns.read_text()) == {
+         "turn_index": 0,
+         "input_tokens": 1500,
+         "output_tokens": 250,
+         "cache_read_input_tokens": 500,
++        "cache_creation_input_tokens": 75,
+         "model": "codex",
+         "session_id": "thr-unit",
+     }
+-    # (1000*1.0 + 500*0.1 + 250*5.0)/1e6 = 0.0023
++    # (1000*1.0 + 500*0.1 + 250*5.0)/1e6 = 0.0023 (rates still ignore cache_creation)
+     assert _read_or_none(cost) == "0.002300\n"
+ 
+ 
+diff --git a/tests/unit/test_llm_calls_cost_backfill_py.py b/tests/unit/test_llm_calls_cost_backfill_py.py
+new file mode 100644
+index 00000000..602f5c71
+--- /dev/null
++++ b/tests/unit/test_llm_calls_cost_backfill_py.py
+@@ -0,0 +1,349 @@
++"""Tests for scripts/llm_calls_cost_backfill.py — the retroactive sweep that
++re-prices the cache-aware cost breakdown columns under the new family-keyed
++INPUT_INCLUDES_CACHE + FAMILY_RATES rules.
++
++Hard contract under test:
++  - DRY-RUN BY DEFAULT (no --apply). Without --apply, no DB writes occur.
++  - Never touches input_tokens / output_tokens / cached_input_tokens /
++    cache_creation_input_tokens / cost_usd.
++  - Re-prices historical anthropic / openai / gateway rows under the new
++    semantics — the receipt rows that previously went to $0.0017 (cached >
++    input → clamped to 0) now land at full fresh-only cost.
++"""
++
++from __future__ import annotations
++
++import sqlite3
++import sys
++from pathlib import Path
++
++import pytest
++
++# Repo root on path so the backfill script (under scripts/) can be invoked
++# as a Python module — mirrors how an operator runs it from the CLI.
++REPO_ROOT = Path(__file__).resolve().parents[2]
++SCRIPT_PATH = REPO_ROOT / "scripts" / "llm_calls_cost_backfill.py"
++
++
++SCHEMA_SQL = """
++CREATE TABLE llm_calls (
++    id INTEGER PRIMARY KEY AUTOINCREMENT,
++    provider TEXT NOT NULL,
++    model_id TEXT NOT NULL,
++    tier TEXT NOT NULL,
++    feature_name TEXT NOT NULL,
++    actor TEXT,
++    status TEXT NOT NULL,
++    duration_ms INTEGER NOT NULL DEFAULT 0,
++    cost_usd REAL NOT NULL DEFAULT 0,
++    error_message TEXT,
++    iter INTEGER,
++    run_id TEXT,
++    traceparent TEXT,
++    input_tokens INTEGER NOT NULL DEFAULT 0,
++    output_tokens INTEGER NOT NULL DEFAULT 0,
++    total_tokens INTEGER NOT NULL DEFAULT 0,
++    metadata_json TEXT NOT NULL DEFAULT '{}',
++    session_id TEXT,
++    cached_input_tokens INTEGER DEFAULT 0,
++    cache_creation_input_tokens INTEGER DEFAULT 0,
++    cost_input_uncached_usd REAL DEFAULT 0,
++    cost_input_cached_usd REAL DEFAULT 0,
++    cost_cache_write_usd REAL DEFAULT 0
++);
++"""
++
++
++def _seed_db(db_path: Path, rows: list[dict]) -> None:
++    """Seed ``db_path`` with the full schema + a handful of fixture rows."""
++    con = sqlite3.connect(str(db_path))
++    con.executescript(SCHEMA_SQL)
++    for row in rows:
++        con.execute(
++            """
++            INSERT INTO llm_calls (
++                provider, model_id, tier, feature_name, actor, status,
++                duration_ms, cost_usd, input_tokens, output_tokens,
++                cached_input_tokens, cache_creation_input_tokens,
++                cost_input_uncached_usd, cost_input_cached_usd,
++                cost_cache_write_usd
++            ) VALUES (
++                :provider, :model_id, :tier, :feature_name, :actor, :status,
++                :duration_ms, :cost_usd, :input_tokens, :output_tokens,
++                :cached_input_tokens, :cache_creation_input_tokens,
++                :cost_input_uncached_usd, :cost_input_cached_usd,
++                :cost_cache_write_usd
++            )
++            """,
++            row,
++        )
++    con.commit()
++    con.close()
++
++
++def _invoke(argv: list[str], monkeypatch: pytest.MonkeyPatch, env: dict | None = None) -> int:
++    """Run the backfill script as a module (load + main()) so the same code
++    path an operator hits from the CLI is exercised here. env overrides
++    MINI_ORK_HOME / MINI_ORK_DB so we never touch a real DB."""
++    import importlib.util
++
++    spec = importlib.util.spec_from_file_location("llm_calls_cost_backfill", SCRIPT_PATH)
++    assert spec and spec.loader
++    module = importlib.util.module_from_spec(spec)
++    sys.modules["llm_calls_cost_backfill"] = module
++    spec.loader.exec_module(module)
++    return module.main(argv)
++
++
++@pytest.fixture
++def isolate_db(monkeypatch):
++    """Default MINI_ORK_HOME points at .mini-ork; redirect to /tmp so the
++    backfill's default DB resolver doesn't touch a real DB."""
++    monkeypatch.delenv("MINI_ORK_DB", raising=False)
++    monkeypatch.setenv("MINI_ORK_HOME", "/tmp/mini-ork-backfill-test-home")
++
++
++def test_dry_run_does_not_modify_db(tmp_path: Path, isolate_db, monkeypatch) -> None:
++    """Default mode (no --apply) MUST leave every row's breakdown columns
++    unchanged."""
++    db = tmp_path / "state.db"
++    _seed_db(
++        db,
++        [
++            {
++                "provider": "anthropic",
++                "model_id": "sonnet",
++                "tier": "default",
++                "feature_name": "mini-ork:test",
++                "actor": "tester",
++                "status": "success",
++                "duration_ms": 100,
++                "cost_usd": 0.009,
++                "input_tokens": 1000,
++                "output_tokens": 25,
++                "cached_input_tokens": 200,
++                "cache_creation_input_tokens": 300,
++                # Pre-fix incorrect breakdown (subtraction):
++                "cost_input_uncached_usd": (500 * 15.0) / 1_000_000,
++                "cost_input_cached_usd": (200 * 1.5) / 1_000_000,
++                "cost_cache_write_usd": (300 * 18.75) / 1_000_000,
++            }
++        ],
++    )
++
++    rc = _invoke(["--db", str(db)], monkeypatch)
++    assert rc == 0
++
++    con = sqlite3.connect(str(db))
++    uncached, cached, cw = con.execute(
++        "SELECT cost_input_uncached_usd, cost_input_cached_usd, "
++        "cost_cache_write_usd FROM llm_calls"
++    ).fetchone()
++    in_tok, cost_usd = con.execute(
++        "SELECT input_tokens, cost_usd FROM llm_calls"
++    ).fetchone()
++    con.close()
++    # Tokens + cost_usd untouched (dry-run never writes).
++    assert in_tok == 1000
++    assert cost_usd == pytest.approx(0.009)
++    # Breakdown NOT updated — the old (wrong) row is still on disk.
++    assert uncached == pytest.approx((500 * 15.0) / 1_000_000)
++
++
++def test_apply_reprices_anthropic_rows(tmp_path: Path, monkeypatch) -> None:
++    """--apply rewrites the breakdown columns. Anthropic (no subtraction):
++    fresh-only input=1000 → uncached_in=1000. Pre-fix had subtracted cached
++    + creation from input and landed at 0.0017 (the live-data damage)."""
++    monkeypatch.delenv("MINI_ORK_DB", raising=False)
++    monkeypatch.setenv("MINI_ORK_HOME", "/tmp/no-home")
++    db = tmp_path / "state.db"
++    _seed_db(
++        db,
++        [
++            {
++                "provider": "anthropic",
++                "model_id": "sonnet",
++                "tier": "default",
++                "feature_name": "mini-ork:test",
++                "actor": "tester",
++                "status": "success",
++                "duration_ms": 100,
++                "cost_usd": 0.009,
++                "input_tokens": 1000,
++                "output_tokens": 25,
++                "cached_input_tokens": 200,
++                "cache_creation_input_tokens": 300,
++                "cost_input_uncached_usd": 0.0017,   # the buggy value
++                "cost_input_cached_usd": 0.0,
++                "cost_cache_write_usd": 0.0,
++            }
++        ],
++    )
++
++    rc = _invoke(["--db", str(db), "--apply"], monkeypatch)
++    assert rc == 0
++
++    con = sqlite3.connect(str(db))
++    (uncached, cached, cw, in_tok, out_tok, c_in, cc_in, cost_usd) = con.execute(
++        "SELECT cost_input_uncached_usd, cost_input_cached_usd, "
++        "cost_cache_write_usd, input_tokens, output_tokens, "
++        "cached_input_tokens, cache_creation_input_tokens, cost_usd "
++        "FROM llm_calls"
++    ).fetchone()
++    con.close()
++    # Tokens + cost_usd NEVER touched.
++    assert in_tok == 1000 and out_tok == 25 and c_in == 200 and cc_in == 300
++    assert cost_usd == pytest.approx(0.009)
++    # Anthropic INPUT_INCLUDES_CACHE=False → uncached_in = input_tokens = 1000.
++    assert uncached == pytest.approx(1000 * 15.0 / 1_000_000)
++    assert cached == pytest.approx(200 * 1.5 / 1_000_000)
++    assert cw == pytest.approx(300 * 18.75 / 1_000_000)
++
++
++def test_apply_reprices_openai_rows_with_subtraction(tmp_path: Path, monkeypatch) -> None:
++    """OpenAI gpt-5 / codex: input_tokens INCLUDES cache, so the new math
++    subtracts cached + cache_creation to get fresh input. Codex rates
++    (1.25 / 0.125 / 0.0)."""
++    monkeypatch.delenv("MINI_ORK_DB", raising=False)
++    monkeypatch.setenv("MINI_ORK_HOME", "/tmp/no-home")
++    db = tmp_path / "state.db"
++    _seed_db(
++        db,
++        [
++            {
++                "provider": "openai",
++                "model_id": "gpt-5",
++                "tier": "default",
++                "feature_name": "mini-ork:test",
++                "actor": "tester",
++                "status": "success",
++                "duration_ms": 100,
++                "cost_usd": 0.123,
++                "input_tokens": 10_000,
++                "output_tokens": 500,
++                "cached_input_tokens": 2_000,
++                "cache_creation_input_tokens": 0,
++                "cost_input_uncached_usd": 10.0,   # wildly wrong (anthropic rates)
++                "cost_input_cached_usd": 1.0,
++                "cost_cache_write_usd": 0.0,
++            }
++        ],
++    )
++
++    rc = _invoke(["--db", str(db), "--apply"], monkeypatch)
++    assert rc == 0
++
++    con = sqlite3.connect(str(db))
++    (uncached, cached, cw) = con.execute(
++        "SELECT cost_input_uncached_usd, cost_input_cached_usd, "
++        "cost_cache_write_usd FROM llm_calls"
++    ).fetchone()
++    in_tok = con.execute("SELECT input_tokens FROM llm_calls").fetchone()[0]
++    con.close()
++    assert in_tok == 10_000  # untouched
++    # fresh_in = 10_000 - 2_000 - 0 = 8_000 → 8_000 * 1.25 / 1M
++    assert uncached == pytest.approx(8_000 * 1.25 / 1_000_000)
++    assert cached == pytest.approx(2_000 * 0.125 / 1_000_000)
++    # openai (codex) has no cache_creation signal → 0
++    assert cw == 0.0
++
++
++def test_unknown_family_yields_zero_breakdown(tmp_path: Path, monkeypatch) -> None:
++    """An unknown / google provider family MUST yield (0, 0, 0) — never
++    fabricate. This was the gateway / google regression: live rows had
++    fabricated ~$815 cost vs $607.64 real envelope total."""
++    monkeypatch.delenv("MINI_ORK_DB", raising=False)
++    monkeypatch.setenv("MINI_ORK_HOME", "/tmp/no-home")
++    db = tmp_path / "state.db"
++    _seed_db(
++        db,
++        [
++            {
++                "provider": "google",
++                "model_id": "?",
++                "tier": "default",
++                "feature_name": "mini-ork:test",
++                "actor": "tester",
++                "status": "success",
++                "duration_ms": 100,
++                "cost_usd": 0.05,
++                "input_tokens": 1000,
++                "output_tokens": 25,
++                "cached_input_tokens": 0,
++                "cache_creation_input_tokens": 0,
++                # Pre-fix had fabricated ~$0.015 uncached.
++                "cost_input_uncached_usd": 0.015,
++                "cost_input_cached_usd": 0.0,
++                "cost_cache_write_usd": 0.0,
++            }
++        ],
++    )
++
++    rc = _invoke(["--db", str(db), "--apply"], monkeypatch)
++    assert rc == 0
++
++    con = sqlite3.connect(str(db))
++    (uncached, cached, cw) = con.execute(
++        "SELECT cost_input_uncached_usd, cost_input_cached_usd, "
++        "cost_cache_write_usd FROM llm_calls"
++    ).fetchone()
++    con.close()
++    assert uncached == 0.0
++    assert cached == 0.0
++    assert cw == 0.0
++
++
++def test_missing_db_returns_2(tmp_path: Path, monkeypatch) -> None:
++    monkeypatch.delenv("MINI_ORK_DB", raising=False)
++    monkeypatch.setenv("MINI_ORK_HOME", "/tmp/no-home")
++    rc = _invoke(["--db", str(tmp_path / "no-such.db"), "--apply"], monkeypatch)
++    assert rc == 2
++
++
++def test_apply_only_updates_changed_rows(tmp_path: Path, monkeypatch) -> None:
++    """Already-correct rows are left at their current value (no churn)."""
++    monkeypatch.delenv("MINI_ORK_DB", raising=False)
++    monkeypatch.setenv("MINI_ORK_HOME", "/tmp/no-home")
++    db = tmp_path / "state.db"
++    # Pre-compute the correct breakdown for an anthropic row.
++    in_tok, c_in, cc_in = 1000, 200, 50
++    correct = (
++        in_tok * 15.0 / 1_000_000,
++        c_in * 1.5 / 1_000_000,
++        cc_in * 18.75 / 1_000_000,
++    )
++    _seed_db(
++        db,
++        [
++            {
++                "provider": "anthropic",
++                "model_id": "sonnet",
++                "tier": "default",
++                "feature_name": "mini-ork:test",
++                "actor": "tester",
++                "status": "success",
++                "duration_ms": 100,
++                "cost_usd": 0.009,
++                "input_tokens": in_tok,
++                "output_tokens": 25,
++                "cached_input_tokens": c_in,
++                "cache_creation_input_tokens": cc_in,
++                "cost_input_uncached_usd": correct[0],
++                "cost_input_cached_usd": correct[1],
++                "cost_cache_write_usd": correct[2],
++            }
++        ],
++    )
++
++    rc = _invoke(["--db", str(db), "--apply"], monkeypatch)
++    assert rc == 0
++
++    con = sqlite3.connect(str(db))
++    row = con.execute(
++        "SELECT cost_input_uncached_usd, cost_input_cached_usd, "
++        "cost_cache_write_usd FROM llm_calls"
++    ).fetchone()
++    con.close()
++    assert row[0] == pytest.approx(correct[0])
++    assert row[1] == pytest.approx(correct[1])
++    assert row[2] == pytest.approx(correct[2])
+\ No newline at end of file
+diff --git a/tests/unit/test_opencode_engine.py b/tests/unit/test_opencode_engine.py
+index fe6d0899..d7142d06 100644
+--- a/tests/unit/test_opencode_engine.py
++++ b/tests/unit/test_opencode_engine.py
+@@ -372,13 +372,16 @@ def _harvest(tmp_path, **paths):
+ 
+ def test_harvest_usage_and_turns_exact(tmp_path):
+     usage, turns, _cost = _harvest(tmp_path)
+-    assert usage.read_text() == "3000\t1200\n"
++    # 4-field TSV: in / out / cached / cache_creation. The stream carries
++    # cache.read={200,100} (sum=300) and cache.write={99,42} (sum=141).
++    assert usage.read_text() == "3000\t1200\t300\t141\n"
+     lines = turns.read_text().splitlines()
+     assert json.loads(lines[0]) == {
+         "turn_index": 0,
+         "input_tokens": 1000,
+         "output_tokens": 500,
+         "cache_read_input_tokens": 200,
++        "cache_creation_input_tokens": 99,
+         "model": "opencode",
+         "session_id": "s-1",
+     }
+@@ -387,6 +390,7 @@ def test_harvest_usage_and_turns_exact(tmp_path):
+         "input_tokens": 2000,
+         "output_tokens": 700,
+         "cache_read_input_tokens": 100,
++        "cache_creation_input_tokens": 42,
+         "model": "opencode",
+         "session_id": "s-1",
+     }
+@@ -420,20 +424,26 @@ def test_harvest_skips_sidecars_without_usage(tmp_path):
+ def test_harvest_cache_read_from_nested_object(tmp_path):
+     """Real opencode `--format json` emits tokens.cache as a nested
+     {"read","write"} object (verified against v1.18.4); cache-read must come
+-    from `.read`, never the `.write` half and never the whole dict coerced."""
++    from `.read`, never the `.write` half and never the whole dict coerced.
++    cache_creation_input_tokens maps from `.write` (5-min prompt-cache writes)."""
+     stream = '{"type":"step_finish","sessionID":"s","part":{"tokens":{"input":10,"output":5,"cache":{"read":77,"write":999}},"cost":0}}'
+     turns = tmp_path / "turns.jsonl"
+     ot.harvest(stream, str(tmp_path / "u.tokens"), str(turns), "")
+-    assert json.loads(turns.read_text().splitlines()[0])["cache_read_input_tokens"] == 77
++    first = json.loads(turns.read_text().splitlines()[0])
++    assert first["cache_read_input_tokens"] == 77
++    assert first["cache_creation_input_tokens"] == 999
+ 
+ 
+ def test_harvest_cache_scalar_forward_compat(tmp_path):
+     """A flatter, scalar `tokens.cache` still coerces (forward-compat fallback
+-    for a hypothetical schema change)."""
++    for a hypothetical schema change). The scalar maps to cache_read; there
++    is no scalar signal for cache_write."""
+     stream = '{"type":"step_finish","sessionID":"s","part":{"tokens":{"input":10,"output":5,"cache":33},"cost":0}}'
+     turns = tmp_path / "turns.jsonl"
+     ot.harvest(stream, str(tmp_path / "u.tokens"), str(turns), "")
+-    assert json.loads(turns.read_text().splitlines()[0])["cache_read_input_tokens"] == 33
++    first = json.loads(turns.read_text().splitlines()[0])
++    assert first["cache_read_input_tokens"] == 33
++    assert first["cache_creation_input_tokens"] == 0
+ 
+ 
+ # ─── body: reconstructed from text events ────────────────────────────────────
+@@ -512,12 +522,15 @@ def test_native_subprocess_writes_expected_output_and_sidecars(
+     proc, usage, turns, cost = _run_transport(fmt, tmp_path, target, monkeypatch)
+ 
+     assert proc.returncode == 0
+-    assert _read_or_none(usage) == "1500\t250\n"
++    # 4-field TSV: in / out / cached / cache_creation. The fake CLI emits
++    # cache.read=500, cache.write=0, so cache_creation=0 here.
++    assert _read_or_none(usage) == "1500\t250\t500\t0\n"
+     assert json.loads(turns.read_text()) == {
+         "turn_index": 0,
+         "input_tokens": 1500,
+         "output_tokens": 250,
+         "cache_read_input_tokens": 500,
++        "cache_creation_input_tokens": 0,
+         "model": "opencode",
+         "session_id": "ses-unit",
+     }

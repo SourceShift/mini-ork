@@ -1,0 +1,163 @@
+diff --git a/kickoffs/book-goal-loop/binding/chapter_terminal_fail.py b/kickoffs/book-goal-loop/binding/chapter_terminal_fail.py
+index caa00bce..8cc80bcf 100644
+--- a/kickoffs/book-goal-loop/binding/chapter_terminal_fail.py
++++ b/kickoffs/book-goal-loop/binding/chapter_terminal_fail.py
+@@ -20,17 +20,24 @@ Terminal signals (any ⇒ exit 0):
+     because researcher can move a chapter to ``failed`` transiently before a
+     retry, so treating ``failed`` as terminal by default would abandon a
+     recoverable chapter.
+-  * STALL: ``status='generating'`` AND ``last_error`` present AND no
+-    verified-artifact run dir under ``MO_GOAL_RUNS_DIR`` has been touched within
+-    ``MO_GOAL_STALL_SECONDS`` — the chapter is orphaned mid-generation (worker
+-    crash / lost book-gen singleton lock) and will never advance. Opt-in
++  * STALL: ``status`` in ``{generating, failed, error}`` AND ``last_error`` present
++    AND no verified-artifact run dir under ``MO_GOAL_RUNS_DIR`` has been
++    touched within ``MO_GOAL_STALL_SECONDS`` — the chapter is orphaned and will
++    never advance. The status set is BROADENED beyond ``generating`` because
++    the worker can burn its per-dispatch retry budget, land on ``status=failed``
++    (NOT ``permanently_failed``), and go idle — a chapter only a redispatch
++    could advance. ``aborted`` is excluded (the researcher itself quits). Opt-in
+     (requires both env vars set), because the chapter-lifecycle ``updated_at``
+     does NOT track per-node progress: a HEALTHY long generation keeps
+     ``updated_at`` frozen at its last milestone while the internal DAG marches
+     W9 -> W10 -> W11 -> ..., so run-dir freshness is the ONLY reliable "is a
+-    node actually running right now" signal. book-gen is a serial singleton
+-    (one chapter at a time), so book-global run-dir freshness == the active
+-    chapter's freshness.
++    node actually running right now" signal. A racily failed BETWEEN retries
++    still has a churning worker (fresh ``run-*``), so age < stall ⇒ NOT
++    terminal; only a genuinely stopped worker (age >= stall) trips it. This
++    is strictly safer than ``MO_GOAL_FAIL_ON_STATUS_FAILED``, which fires on
++    ``failed`` immediately and would abandon a chapter mid-retry.
++    book-gen is a serial singleton (one chapter at a time), so book-global
++    run-dir freshness == the active chapter's freshness.
+ 
+ Connection comes from libpq env vars; no secret lives here.
+ """
+@@ -45,6 +52,15 @@ from pathlib import Path
+ 
+ _FAILED_STATUSES = {"failed", "error", "permanently_failed", "aborted"}
+ 
++# Statuses that, combined with a populated ``last_error`` AND an idle run-dir
++# for at least ``MO_GOAL_STALL_SECONDS``, indicate a worker that has STOPPED
++# making progress (rather than transiently failed mid-retry). Distinct from
++# ``_FAILED_STATUSES``: that set drives an opt-in fail-fast that ignores worker
++# vitality and is unsafe for the worker-exhausted-but-recoverable case. This
++# set keeps the idle-run-dir gate as the safe discriminator. ``aborted`` is
++# excluded — that is the researcher itself quitting, not a stalled worker.
++_STALL_STATUSES = {"generating", "failed", "error"}
++
+ 
+ def _q(sql: str) -> subprocess.CompletedProcess[str]:
+     return subprocess.run(
+@@ -147,14 +163,14 @@ def main(argv: list[str]) -> int:
+ 
+     runs_dir = os.environ.get("MO_GOAL_RUNS_DIR", "").strip()
+     stall_s = _int_env("MO_GOAL_STALL_SECONDS", 0)
+-    if runs_dir and stall_s > 0 and status_l == "generating" and lasterr:
++    if runs_dir and stall_s > 0 and status_l in _STALL_STATUSES and lasterr:
+         age = _newest_run_age_seconds(runs_dir)
+         if age is not None and age >= stall_s:
+-            print(f"ch{chapter} TERMINAL: stalled — status=generating, last_error set, "
++            print(f"ch{chapter} TERMINAL: stalled — status={status_l}, last_error set, "
+                   f"newest run dir idle {int(age)}s >= {stall_s}s err={lasterr}")
+             return 0
+         age_str = "none" if age is None else f"{int(age)}s"
+-        print(f"ch{chapter} not terminal: generating, run-dir age={age_str} "
++        print(f"ch{chapter} not terminal: status={status_l} (stall-eligible), run-dir age={age_str} "
+               f"(< {stall_s}s ⇒ still churning)")
+         return 1
+ 
+diff --git a/tests/unit/test_goal_loop_recipe.py b/tests/unit/test_goal_loop_recipe.py
+index 02ece961..ec5db218 100644
+--- a/tests/unit/test_goal_loop_recipe.py
++++ b/tests/unit/test_goal_loop_recipe.py
+@@ -619,6 +619,88 @@ def test_terminal_fail_newest_run_age(tmp_path):
+     assert _tfmod._newest_run_age_seconds(str(runs)) < 60.0
+ 
+ 
++def _stub_q(monkeypatch, stdout: str, returncode: int = 0):
++    """Replace ``_tfmod._q`` with a stub returning a fixed CompletedProcess.
++
++    The real ``_q`` shells out to psql; tests want hermetic control of the
++    chapter row without any DB. The stdout mimics the SQL projection
++    ``status|committed_complete|permanently_failed|last_error``.
++    """
++    monkeypatch.setattr(
++        _tfmod,
++        "_q",
++        lambda sql: subprocess.CompletedProcess(
++            args=["psql"], returncode=returncode, stdout=stdout, stderr="",
++        ),
++    )
++
++
++def test_terminal_fail_worker_exhausted_idle_is_terminal(tmp_path, monkeypatch):
++    """status=failed + last_error + stale run-dir ⇒ TERMINAL (worker exhausted retries).
++
++    This is the dominant stall mode observed on live book d0df3cdb: the worker
++    burns its per-dispatch retry budget, lands on status=failed (NOT
++    permanently_failed), and goes idle. Without this branch the await sat out
++    the full 90-min MO_GOAL_APPLY_AWAIT_SECONDS window on a chapter only a
++    redispatch could advance.
++    """
++    import time as _t
++
++    runs = tmp_path / "runs"
++    runs.mkdir()
++    # Stamp an OLD run-* dir so age >= MO_GOAL_STALL_SECONDS (worker is idle).
++    (runs / "run-000").mkdir()
++    stale = _t.time() - 4000
++    os.utime(runs / "run-000", (stale, stale))
++
++    monkeypatch.setenv("BOOK_UUID", "d0df3cdb-8164-450e-b841-2c9354ea0423")
++    monkeypatch.setenv("MO_GOAL_RUNS_DIR", str(runs))
++    monkeypatch.setenv("MO_GOAL_STALL_SECONDS", "60")
++    # permfail=f so the "always terminal" gate does not preempt the stall gate.
++    _stub_q(monkeypatch, "failed|f|f|retry budget exhausted\n")
++
++    assert _tfmod.main(["1"]) == 0
++
++
++def test_terminal_fail_failed_but_churning_not_terminal(tmp_path, monkeypatch):
++    """status=failed + last_error + FRESH run-dir ⇒ NOT terminal (still churning).
++
++    A chapter can racily fail BETWEEN retries while the worker is alive and
++    mid-cycle; the run-dir mtime stays fresh because the worker just emitted
++    a verified artifact. Treating that as terminal would abandon a recoverable
++    chapter — strictly more aggressive than MO_GOAL_FAIL_ON_STATUS_FAILED and
++    unsafe. The idle-run-dir gate is what keeps the broadened status set from
++    regressing into a fail-fast on transient failures.
++    """
++    runs = tmp_path / "runs"
++    runs.mkdir()
++    # A fresh run-* dir ⇒ age is small (< MO_GOAL_STALL_SECONDS) ⇒ churning.
++    (runs / "run-001").mkdir()
++
++    monkeypatch.setenv("BOOK_UUID", "d0df3cdb-8164-450e-b841-2c9354ea0423")
++    monkeypatch.setenv("MO_GOAL_RUNS_DIR", str(runs))
++    monkeypatch.setenv("MO_GOAL_STALL_SECONDS", "60")
++    _stub_q(monkeypatch, "failed|f|f|transient retry failure\n")
++
++    assert _tfmod.main(["1"]) == 1
++
++
++def test_terminal_fail_permfail_always_terminal(monkeypatch):
++    """permanently_failed=t wins regardless of status / run-dir / stall env.
++
++    The researcher's own give-up flag is the unambiguous terminal signal; the
++    broadened stall branch must never preempt it.
++    monkeypatch.delenv is used because MO_GOAL_RUNS_DIR unset is the default
++    — making sure permfail fires WITHOUT the stall env armed.
++    """
++    monkeypatch.setenv("BOOK_UUID", "d0df3cdb-8164-450e-b841-2c9354ea0423")
++    monkeypatch.delenv("MO_GOAL_RUNS_DIR", raising=False)
++    monkeypatch.delenv("MO_GOAL_STALL_SECONDS", raising=False)
++    _stub_q(monkeypatch, "error|f|t|researcher gave up\n")
++
++    assert _tfmod.main(["1"]) == 0
++
++
+ # ── 6. _harvest_selected_evidence: sweep-plan enrichment + on-disk file ───
+ # The seam goal_sweep_plan calls to fill kickoff_hint.evidence / evidence_path.
+ # It must be OFF by default (no MO_GOAL_EVIDENCE_CMD → empty, so unarmed loops

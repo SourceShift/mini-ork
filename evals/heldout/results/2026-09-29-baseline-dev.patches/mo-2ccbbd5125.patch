@@ -1,0 +1,164 @@
+diff --git a/mini_ork/web/deps.py b/mini_ork/web/deps.py
+index 2a288b74..edfe05fa 100644
+--- a/mini_ork/web/deps.py
++++ b/mini_ork/web/deps.py
+@@ -22,10 +22,33 @@ _dbs: dict[Path, StateDB] = {}
+ _dbs_lock = threading.Lock()
+ 
+ 
++def resolve_home_path(raw: str | Path) -> Path:
++    """Resolve a user-supplied path to its canonical .mini-ork home form.
++
++    Accepts either the project folder (~/ps/researcher) or the home itself
++    (~/ps/researcher/.mini-ork). Prefers <folder>/.mini-ork over a stray
++    state.db at the folder root.
++
++    Idempotent: resolve_home_path(resolve_home_path(p)) == resolve_home_path(p).
++    Does NOT validate that a state.db exists; callers that need to reject
++    invalid paths must follow up with their own check.
++    """
++    home = Path(raw).expanduser().resolve()
++    if (home / ".mini-ork" / "state.db").exists():
++        home = home / ".mini-ork"
++    return home
++
++
+ def set_home_override(home: Path) -> None:
+-    """Set the server-wide default home (boot flag / project switch)."""
++    """Set the server-wide default home (boot flag / project switch).
++
++    Normalises to the .mini-ork form so get_default_home always returns a
++    canonical path and downstream callers (list_projects, _register,
++    remove_project) compare paths consistently regardless of which surface
++    form the boot flag used.
++    """
+     global _default_home
+-    _default_home = Path(home).resolve()
++    _default_home = resolve_home_path(home)
+ 
+ 
+ def get_default_home() -> Path:
+@@ -33,11 +56,7 @@ def get_default_home() -> Path:
+ 
+ 
+ def _resolve_request_home(raw: str) -> Path:
+-    home = Path(raw).expanduser().resolve()
+-    # Accept the project folder or the home itself; prefer the real
+-    # <folder>/.mini-ork over stray state.db debris at the folder root.
+-    if (home / ".mini-ork" / "state.db").exists():
+-        home = home / ".mini-ork"
++    home = resolve_home_path(raw)
+     if not (home / "state.db").exists():
+         raise HTTPException(
+             status_code=404, detail=f"workspace not found: no state.db under {home}"
+diff --git a/mini_ork/web/routes/projects.py b/mini_ork/web/routes/projects.py
+index 6bee7f1c..dc58eec4 100644
+--- a/mini_ork/web/routes/projects.py
++++ b/mini_ork/web/routes/projects.py
+@@ -20,7 +20,7 @@ from typing import Any
+ 
+ from fastapi import APIRouter, Body, Depends, HTTPException
+ 
+-from ..deps import get_home_lenient, set_home_override
++from ..deps import get_home_lenient, resolve_home_path, set_home_override
+ 
+ router = APIRouter(prefix="/api/v1/projects", tags=["projects"])
+ 
+@@ -32,14 +32,30 @@ def _registry_path() -> Path:
+     return Path.home() / ".config" / "mini-ork" / "projects.json"
+ 
+ 
+-def _load_registry() -> list[str]:
++def _load_registry() -> list[Path]:
++    """Read the registered homes, normalising each to its canonical
++    .mini-ork form and deduplicating. Returning normalised Path objects
++    keeps list_projects / _register / remove_project consistent regardless
++    of which surface form (project folder vs. home itself) was originally
++    written to disk — without this, repeated adds could leave stale
++    duplicates that list as separate projects with exists=False."""
+     path = _registry_path()
+     try:
+         data = json.loads(path.read_text())
+-        homes = data.get("projects", [])
+-        return [h for h in homes if isinstance(h, str)]
++        raw_homes = data.get("projects", [])
+     except (OSError, json.JSONDecodeError):
+         return []
++    out: list[Path] = []
++    seen: set[Path] = set()
++    for h in raw_homes:
++        if not isinstance(h, str):
++            continue
++        normalized = resolve_home_path(h)
++        if normalized in seen:
++            continue
++        seen.add(normalized)
++        out.append(normalized)
++    return out
+ 
+ 
+ def _save_registry(homes: list[str]) -> None:
+@@ -52,7 +68,13 @@ def _save_registry(homes: list[str]) -> None:
+ 
+ 
+ def _resolve(home: str) -> Path:
+-    return Path(home).expanduser().resolve()
++    """Normalise a user-supplied path to its canonical .mini-ork home form.
++
++    Used for every registry comparison (add / remove / list / switch) so
++    the same project path matches itself regardless of which surface form
++    the caller passed (project folder vs. home itself).
++    """
++    return resolve_home_path(home)
+ 
+ 
+ def _entry(home: Path, active: Path) -> dict[str, Any]:
+@@ -67,7 +89,7 @@ def _entry(home: Path, active: Path) -> dict[str, Any]:
+ 
+ @router.get("")
+ def list_projects(active: Path = Depends(get_home_lenient)) -> dict[str, Any]:
+-    homes = [_resolve(h) for h in _load_registry()]
++    homes = _load_registry()
+     if active not in homes:
+         # Persist, not just display: otherwise the boot home silently
+         # vanishes from the list the moment the user switches away.
+@@ -115,12 +137,7 @@ def _normalize(raw: str) -> Path:
+     raw = (raw or "").strip()
+     if not raw:
+         raise HTTPException(status_code=422, detail="path required")
+-    home = _resolve(raw)
+-    # Prefer <folder>/.mini-ork over a state.db directly in the folder —
+-    # stray state.db files at project roots (test debris) must not win
+-    # over the real home.
+-    if (home / ".mini-ork" / "state.db").exists():
+-        home = home / ".mini-ork"
++    home = resolve_home_path(raw)
+     if not (home / "state.db").exists():
+         hint = (
+             "folder not found"
+@@ -132,7 +149,7 @@ def _normalize(raw: str) -> Path:
+ 
+ 
+ def _register(home: Path) -> None:
+-    homes = [_resolve(h) for h in _load_registry()]
++    homes = _load_registry()
+     if home not in homes:
+         homes.append(home)
+         _save_registry([str(h) for h in homes])
+@@ -146,7 +163,7 @@ def validate_project(path: str = "", active: Path = Depends(get_home_lenient)) -
+         home = _normalize(path)
+     except HTTPException as e:
+         return {"ok": False, "error": str(e.detail)}
+-    registered = home in [_resolve(h) for h in _load_registry()] or home == active
++    registered = home in _load_registry() or home == active
+     return {"ok": True, **_entry(home, active), "registered": registered}
+ 
+ 
+@@ -173,6 +190,6 @@ def remove_project(body: dict = Body(...), active: Path = Depends(get_home_lenie
+     home = _resolve(raw)
+     if home == active:
+         raise HTTPException(status_code=409, detail="cannot remove the active project")
+-    homes = [h for h in (_resolve(x) for x in _load_registry()) if h != home]
++    homes = [h for h in _load_registry() if h != home]
+     _save_registry([str(h) for h in homes])
+     return {"ok": True, "removed": str(home)}

@@ -1,0 +1,501 @@
+diff --git a/kickoffs/book-goal-loop/binding/restart_worker.py b/kickoffs/book-goal-loop/binding/restart_worker.py
+index 615a7ec1..a05afa76 100644
+--- a/kickoffs/book-goal-loop/binding/restart_worker.py
++++ b/kickoffs/book-goal-loop/binding/restart_worker.py
+@@ -112,6 +112,9 @@ Env
+     MO_WORKER_STOP_TIMEOUT_SECONDS  wait for the supervised unit to exit (default 120)
+     MINI_ORK_RUN_DIR               where the replacement's log is written
+     MO_GOAL_WORKER_RESTART_DRY     =1 -> resolve + print the plan, touch nothing
++    MO_GOAL_SYNC_UPSTREAM          =1 (default) merge `origin/main` into the worktree
++                                    before spawn (best-effort, warns on conflict/dirty);
++                                    =0 restores pre-fix behaviour (no upstream sync)
+ 
+ Exit 0 == the fixed worker is up (or DRY plan printed); non-zero == restart failed.
+ """
+@@ -382,6 +385,131 @@ def _ensure_colocated_home(worktree: str, primary_home: str) -> tuple[str | None
+     return wt_home, f"built co-located .mini-ork at {wt_home} (engine->primary, {len(os.listdir(wt_recipes))} recipes co-located)"
+ 
+ 
++def _sync_upstream(worktree: str) -> tuple[bool, str]:
++    """Merge `origin/main` (or `main`) into the worktree, best-effort.
++
++    Why this exists
++    ---------------
++    The deploy target is a long-lived branch the loop's children commit onto (the
++    `codex/goalloop-fixes`-style branch in the kickoff). It drifts behind main,
++    and a fix merged to main is invisible to the worker here until the branch
++    it actually runs contains it — measured 2026-09-20: the jina figure-preservation
++    fix (ba57a71e4) was on main, but the deploy target was 14 commits behind, so
++    every chapter kept losing its figures while the fix was reported as shipped.
++    The restart is the "make the code live" edge, so we close the gap here,
++    BEFORE the replacement worker spawns — the new worker reads from the same
++    branch the merge just refreshed.
++
++    Best-effort by construction
++    -------------------------
++    A conflict, dirty tree, missing upstream ref, or any tool failure aborts the
++    sync and warns, leaving the worktree byte-identical and never blocking the
++    restart. The restart proceeds regardless: a missing merge-forward is strictly
++    less bad than a held singleton lock, and the operator can `git -C <worktree>
++    merge origin/main` themselves once they see the warning. We refuse to guess
++    at a conflict resolution (-X ours/theirs) — that would be a fabricated fix;
++    a conflict is named (the merge --abort undoes any index/worktree churn) and
++    left for an operator.
++
++    The loop's own commit survives by construction: `git merge` is a 3-way merge
++    that preserves both parents in the resulting merge commit, so the worktree's
++    pre-merge HEAD (the loop's fix) is always an ancestor of the post-merge HEAD.
++    The branch pointer advances; no loop commit is lost.
++
++    MO_GOAL_SYNC_UPSTREAM=0 restores today's behaviour exactly: the function
++    returns immediately without touching git.
++
++    Returns (True, why) on success/skip/conflict — never False. A non-actionable
++    warn is still success at this layer; the restart must not block on it."""
++    if os.environ.get("MO_GOAL_SYNC_UPSTREAM", "1").strip() == "0":
++        return True, "MO_GOAL_SYNC_UPSTREAM=0; upstream sync skipped (legacy behaviour)"
++
++    # 1. Worktree must be a git checkout. A non-sanctioned dir or a missing .git
++    #    means there is nothing to merge into — skip, never raise.
++    probe = subprocess.run(
++        ["git", "-C", worktree, "rev-parse", "--is-inside-work-tree"],
++        capture_output=True, text=True, timeout=10,
++    )
++    if probe.returncode != 0:
++        why = (probe.stderr or probe.stdout or "").strip().splitlines()
++        return True, f"worktree is not a git checkout ({why[-1] if why else 'rev-parse failed'}); upstream sync skipped"
++
++    # 2. Refuse to merge through uncommitted changes. A dirty worktree would
++    #    either lose the changes on `git stash` (we do NOT stash) or block on a
++    #    conflict we can't safely auto-resolve. The operator sees the warning
++    #    and either commits or stashes themselves before the next restart.
++    dirty = subprocess.run(
++        ["git", "-C", worktree, "diff-index", "--quiet", "HEAD", "--"],
++        capture_output=True, text=True, timeout=10,
++    )
++    if dirty.returncode != 0:
++        status = subprocess.run(
++            ["git", "-C", worktree, "status", "--porcelain"],
++            capture_output=True, text=True, timeout=10,
++        )
++        snippet = " | ".join(status.stdout.splitlines()[:3]).strip() or "uncommitted changes"
++        return True, f"worktree tree is dirty ({snippet!r}); upstream sync skipped (refusing to merge through uncommitted changes)"
++
++    # 3. Pick the upstream ref. Prefer `origin/main` (what the prod-push path
++    #    merges — `MO_GOAL_APPLY_CMD` in launch-armed.sh); fall back to a local
++    #    `main` when origin is unreachable so the sync still helps in offline
++    #    reproductions. NEVER refuse to fall back — a stale local `main` is
++    #    better than no forward-merge at all.
++    rev = subprocess.run(
++        ["git", "-C", worktree, "rev-parse", "--verify", "--quiet", "origin/main"],
++        capture_output=True, text=True, timeout=10,
++    )
++    if rev.returncode == 0:
++        upstream = "origin/main"
++    else:
++        rev = subprocess.run(
++            ["git", "-C", worktree, "rev-parse", "--verify", "--quiet", "main"],
++            capture_output=True, text=True, timeout=10,
++        )
++        if rev.returncode == 0:
++            upstream = "main"
++        else:
++            return True, "neither origin/main nor main is resolvable; upstream sync skipped"
++
++    # 4. Merge. Use --no-ff so the loop's commit and main's commit are both
++    #    preserved as parents of the merge commit when there IS something to
++    #    bring in (the "loop's commit survives" invariant in the kickoff is a
++    #    property of the DAG --no-ff produces). When there is nothing to bring
++    #    in (upstream already an ancestor), git prints "Already up to date"
++    #    and exits 0 WITHOUT making a commit — distinct from a real merge, so
++    #    we report it as such. NEVER -X ours/theirs — that would fabricate a
++    #    resolution. On conflict git leaves the worktree in MERGING with
++    #    conflict markers, which we --abort below.
++    merge = subprocess.run(
++        ["git", "-C", worktree, "merge", "--no-ff", "--no-edit", upstream],
++        capture_output=True, text=True, timeout=120,
++    )
++    if merge.returncode == 0:
++        out = (merge.stdout or "") + (merge.stderr or "")
++        if "Already up to date" in out or "Already up-to-date" in out:
++            return True, f"worktree Already up to date with {upstream}; nothing to merge"
++        return True, f"merged {upstream} into worktree (loop's commit preserved as a merge parent)"
++
++    # 5. Conflict. git left the worktree in MERGING with conflict markers and a
++    #    dirty index. --abort restores HEAD byte-identically (per git-merge docs:
++    #    "resets the index and updates the files in the working tree"). Report
++    #    the first stderr line as the operator's handle — the file + line in
++    #    the conflict output is enough to locate the resolution site.
++    abort = subprocess.run(
++        ["git", "-C", worktree, "merge", "--abort"],
++        capture_output=True, text=True, timeout=10,
++    )
++    err = (merge.stderr or merge.stdout or "").strip().splitlines()
++    hint = err[0] if err else "conflict"
++    if abort.returncode != 0:
++        # --abort failing means the worktree was NOT in MERGING (rare: a hook
++        # already cleared it). Surface that explicitly — the operator must
++        # inspect before any next restart, since we cannot prove the tree is
++        # byte-identical to HEAD.
++        return True, f"merge conflict while merging {upstream} ({hint!r}); --abort FAILED ({abort.stderr.strip()!r}) — worktree may NOT be at HEAD, operator must inspect"
++    return True, f"merge conflict while merging {upstream} ({hint!r}); left worktree at HEAD, named for operator"
++
++
+ def _mini_ork_home(worktree: str) -> tuple[str | None, str]:
+     """Best-effort: ensure the worktree worker can resolve the vendored mini-ork
+     binary the chapter DAG shells out to (see 'Why we pin MINI_ORK_HOME_DIR').
+@@ -591,6 +719,16 @@ def main(argv: list[str]) -> int:
+     print(f"worker-restart stop: {why_stop}")
+     if not stopped:
+         return 1
++    # Forward-merge origin/main (or main) into the worktree BEFORE the replacement
++    # spawns. Best-effort by construction: _sync_upstream always returns True and
++    # never raises; a conflict/dirty/unreachable-upstream only WARNS, the restart
++    # proceeds. The kickoff names this as the live-load edge — without it the
++    # worker keeps running code that diverged from main N commits ago, and fixes
++    # merged to main are invisible until the branch the worker actually uses
++    # contains them (observed 2026-09-20: 14 commits of drift, every chapter
++    # losing its figures while the fix was reported shipped).
++    synced, why_sync = _sync_upstream(worktree)
++    print(f"worker-restart sync: {why_sync}")
+     started, why_start = _start_replacement(worktree, role, log_path)
+     print(f"worker-restart start: {why_start}")
+     if not started:
+diff --git a/tests/unit/test_restart_worker_binding.py b/tests/unit/test_restart_worker_binding.py
+index 867ad8ab..2d514f97 100644
+--- a/tests/unit/test_restart_worker_binding.py
++++ b/tests/unit/test_restart_worker_binding.py
+@@ -804,3 +804,333 @@ def test_start_pins_colocated_home_into_worker_env(mod, monkeypatch, tmp_path):
+     assert ok is True
+     assert seen["env"]["MINI_ORK_HOME_DIR"] == str(tmp_path / ".mini-ork")  # co-located, == worktree
+     assert "built co-located" in why
++
++
++# ── upstream-sync (merge forward on every worker restart) ────────────────────
++#
++# Why the deploy target drifts
++# -----------------------------
++# The worker's deploy branch (`codex/goalloop-fixes`-style long-lived branch) is
++# where the loop's children commit; main lands fixes out-of-band. A merge to main
++# is invisible to the worker here until the branch it actually runs contains it
++# (measured 2026-09-20: 14 commits of drift, every chapter losing its figures
++# while the fix was reported shipped). The restart is the only edge where the
++# fix can land on the running worker, so the merge-forward fires here.
++#
++# These tests are hermetic — they use real git in tmp_path to prove the merge
++# actually creates a merge commit (loop commit survives) and that `git merge
++# --abort` restores HEAD byte-identically on conflict. The merge logic lives in
++# `_sync_upstream` and is best-effort by construction: every branch returns
++# True, never aborts the restart.
++
++_GIT_ENV = ("GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@x GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@x ")
++
++
++def _init_git(root, branch="main"):
++    """Init a git repo at `root` on `branch` with one empty commit (so the worktree
++    is a valid git checkout the function can rev-parse, status, and merge into)."""
++    import subprocess
++
++    root.mkdir(parents=True, exist_ok=True)
++    subprocess.run(["git", "init", "-q", "--initial-branch", branch], cwd=str(root), check=True)
++    subprocess.run(["git", "config", "user.email", "t@x"], cwd=str(root), check=True)
++    subprocess.run(["git", "config", "user.name", "T"], cwd=str(root), check=True)
++    subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "init"], cwd=str(root), check=True)
++
++
++def _git(cwd, *args):
++    import subprocess
++
++    return subprocess.run(
++        ["git", "-C", str(cwd)] + list(args), capture_output=True, text=True
++    )
++
++
++def _head(cwd):
++    import subprocess
++
++    return subprocess.check_output(
++        ["git", "-C", str(cwd), "rev-parse", "HEAD"], text=True
++    ).strip()
++
++
++def _status_clean(cwd):
++    import subprocess
++
++    return subprocess.run(
++        ["git", "-C", str(cwd), "status", "--porcelain"], capture_output=True, text=True
++    ).stdout.strip() == ""
++
++
++def test_sync_upstream_opt_out_is_noop(mod, monkeypatch, tmp_path):
++    """MO_GOAL_SYNC_UPSTREAM=0 restores pre-fix behaviour: subprocess.run is never
++    invoked, so the worktree is byte-identical AND we never even read git state."""
++    _init_git(tmp_path)
++    monkeypatch.setenv("MO_GOAL_SYNC_UPSTREAM", "0")
++
++    def boom(*a, **k):
++        raise AssertionError("subprocess.run must not be called when opted out")
++
++    monkeypatch.setattr(mod.subprocess, "run", boom)
++    ok, why = mod._sync_upstream(str(tmp_path))
++    assert ok is True and "MO_GOAL_SYNC_UPSTREAM=0" in why and "legacy" in why
++
++
++def test_sync_upstream_opt_out_defaults_to_running_when_unset(mod, monkeypatch, tmp_path):
++    """Unset MO_GOAL_SYNC_UPSTREAM defaults to enabled — the kickoff fix IS the
++    default behaviour, not an opt-in."""
++    monkeypatch.delenv("MO_GOAL_SYNC_UPSTREAM", raising=False)
++    _init_git(tmp_path)
++    # main has a commit ahead of feature (no conflict), feature is HEAD
++    (tmp_path / "from-main.txt").write_text("m")
++    _git(tmp_path, "add", "from-main.txt").check_returncode()
++    _git(tmp_path, "commit", "-q", "-m", "m").check_returncode()
++    # Branch feature from BEFORE main's commit so main is AHEAD (no Already-up-to-date no-op)
++    _git(tmp_path, "checkout", "-q", "HEAD~1").check_returncode()
++    _git(tmp_path, "checkout", "-q", "-b", "feature").check_returncode()
++    (tmp_path / "from-feature.txt").write_text("f")
++    _git(tmp_path, "add", "from-feature.txt").check_returncode()
++    _git(tmp_path, "commit", "-q", "-m", "f").check_returncode()
++
++    ok, why = mod._sync_upstream(str(tmp_path))
++    assert ok is True and "merged" in why  # ran by default
++
++
++def test_sync_upstream_not_a_git_worktree_skips(mod, monkeypatch, tmp_path):
++    """A non-git worktree is not a failure — there is simply nothing to sync into.
++    The restart must not block on a missing .git."""
++    # tmp_path is fresh, not a git repo
++    import subprocess
++
++    real_run = subprocess.run
++
++    def spy(*args, **kwargs):
++        argv = args[0] if args else kwargs.get("args", [])
++        if "merge" in argv:
++            raise AssertionError(f"must not run `merge` on a non-git worktree; saw {argv!r}")
++        return real_run(*args, **kwargs)
++
++    monkeypatch.setattr(mod.subprocess, "run", spy)
++    ok, why = mod._sync_upstream(str(tmp_path))
++    assert ok is True and "not a git checkout" in why
++
++
++def test_sync_upstream_dirty_tree_skips(mod, tmp_path):
++    """Uncommitted changes block the merge — the operator must clean the tree
++    (commit or stash) before the next restart. The warning names the first few
++    dirty files so the operator doesn't have to run `git status` themselves."""
++    _init_git(tmp_path)
++    (tmp_path / "wip.txt").write_text("wip")
++    _git(tmp_path, "add", "wip.txt").check_returncode()
++    ok, why = mod._sync_upstream(str(tmp_path))
++    assert ok is True and "dirty" in why and "refusing to merge" in why
++    assert "wip.txt" in why  # the dirty file is named
++
++
++def test_sync_upstream_no_upstream_skips(mod, tmp_path):
++    """Neither origin/main nor main exists -> skip. There is no upstream to
++    forward-merge; the warning tells the operator nothing is wrong with the
++    worktree itself."""
++    _init_git(tmp_path, branch="develop")  # initial branch is NOT main
++    # Confirm setup invariants
++    assert _git(tmp_path, "rev-parse", "--verify", "--quiet", "origin/main").returncode != 0
++    assert _git(tmp_path, "rev-parse", "--verify", "--quiet", "main").returncode != 0
++
++    ok, why = mod._sync_upstream(str(tmp_path))
++    assert ok is True and "neither origin/main nor main" in why
++
++
++def test_sync_upstream_falls_back_to_local_main_when_no_origin(mod, tmp_path):
++    """No origin/main -> fall back to a local `main` (offline reproductions and
++    pre-push worktrees still get a forward-merge, just from the local main HEAD
++    instead of origin's)."""
++    _init_git(tmp_path, branch="main")
++    (tmp_path / "from-main.txt").write_text("m")
++    _git(tmp_path, "add", "from-main.txt").check_returncode()
++    _git(tmp_path, "commit", "-q", "-m", "main commit").check_returncode()
++    # Branch feature from BEFORE main's commit (HEAD~1 = init) so main is AHEAD
++    # of feature — the merge must be a real forward-merge, not an "Already up to
++    # date" no-op (which is what feature-on-top-of-main produces).
++    _git(tmp_path, "checkout", "-q", "HEAD~1").check_returncode()
++    _git(tmp_path, "checkout", "-q", "-b", "feature").check_returncode()
++    (tmp_path / "from-feature.txt").write_text("f")
++    _git(tmp_path, "add", "from-feature.txt").check_returncode()
++    _git(tmp_path, "commit", "-q", "-m", "feature commit").check_returncode()
++    # No origin remote -> origin/main is unresolvable
++    assert _git(tmp_path, "rev-parse", "--verify", "--quiet", "origin/main").returncode != 0
++    # main still exists as a ref (we branched feature FROM init; main's commit is
++    # still resolvable via the local `main` ref)
++    assert _git(tmp_path, "rev-parse", "--verify", "--quiet", "main").returncode == 0
++
++    ok, why = mod._sync_upstream(str(tmp_path))
++    assert ok is True and "merged main" in why  # local `main`, NOT origin/main
++    assert "Already up to date" not in why  # a real merge happened
++    # Both branches' files exist
++    assert (tmp_path / "from-main.txt").read_text() == "m"
++    assert (tmp_path / "from-feature.txt").read_text() == "f"
++    # Tree is clean (merge committed, no unmerged paths)
++    assert _status_clean(tmp_path)
++
++
++def test_sync_upstream_merges_origin_main_and_preserves_loop_commit(mod, tmp_path):
++    """The kickoff's two invariants in one test: (1) the merge-forward actually
++    lands — main's commits appear in the worktree branch; (2) the loop's own
++    commit SURVIVES — the pre-merge HEAD is still an ancestor of the new HEAD
++    (verified via `git merge-base --is-ancestor`). This is the property that
++    makes `--no-ff` the right choice: both branches' DAG positions are kept."""
++    _init_git(tmp_path, branch="main")
++    # main has a commit ahead of feature
++    (tmp_path / "from-main.txt").write_text("main-content")
++    _git(tmp_path, "add", "from-main.txt").check_returncode()
++    _git(tmp_path, "commit", "-q", "-m", "main lands a fix").check_returncode()
++    # Spin up a `feature` branch (the deploy target the loop commits onto) with a
++    # non-conflicting change, on top of main's initial state.
++    _git(tmp_path, "checkout", "-q", "-b", "feature").check_returncode()
++    # First rewind feature to before main's commit, so the merge is non-trivial
++    # (origin/main is AHEAD of feature) but non-conflicting (different files).
++    _git(tmp_path, "reset", "--hard", "HEAD~1").check_returncode()
++    (tmp_path / "from-feature.txt").write_text("loop-content")
++    _git(tmp_path, "add", "from-feature.txt").check_returncode()
++    _git(tmp_path, "commit", "-q", "-m", "loop commits a fix").check_returncode()
++
++    # Spin up a local origin/main so the merge targets origin/main (matches the
++    # production merge command in launch-armed.sh).
++    _git(tmp_path, "branch", "-f", "main", "main").check_returncode()  # ensure main still exists
++    _git(tmp_path, "update-ref", "refs/remotes/origin/main", "main").check_returncode()
++
++    loop_head = _head(tmp_path)  # capture pre-merge: the loop's commit
++    assert _status_clean(tmp_path)
++
++    ok, why = mod._sync_upstream(str(tmp_path))
++    assert ok is True and "merged origin/main" in why
++    assert "preserved as a merge parent" in why  # the exact wording from the impl
++
++    # Both files exist and the merge was real (no fast-forward shadowing the work)
++    assert (tmp_path / "from-main.txt").read_text() == "main-content"
++    assert (tmp_path / "from-feature.txt").read_text() == "loop-content"
++    assert _status_clean(tmp_path)  # committed, no conflict markers
++
++    # The loop's commit survives: loop_head is an ancestor of the post-merge HEAD
++    is_ancestor = _git(tmp_path, "merge-base", "--is-ancestor", loop_head, "HEAD")
++    assert is_ancestor.returncode == 0, (
++        f"loop commit {loop_head} must remain an ancestor of HEAD after the merge"
++    )
++
++    # The HEAD advanced (a merge commit landed) — not a silent no-op
++    new_head = _head(tmp_path)
++    assert new_head != loop_head, "HEAD must advance after a successful forward-merge"
++
++
++def test_sync_upstream_conflict_aborts_and_leaves_head_and_tree_untouched(mod, tmp_path):
++    """The kickoff's hardest invariant: a genuine conflict leaves HEAD and the
++    working tree BYTE-IDENTICAL. We compare pre- and post-sync git state (HEAD
++    sha + `git status --porcelain`), and prove the function returned True with
++    a conflict warning (the restart still proceeds). The merge command MUST NOT
++    use -X ours/theirs (that would fabricate a resolution)."""
++    _init_git(tmp_path, branch="main")
++    (tmp_path / "common.txt").write_text("from main\n")
++    _git(tmp_path, "add", "common.txt").check_returncode()
++    _git(tmp_path, "commit", "-q", "-m", "main edits common.txt").check_returncode()
++    # Branch feature from BEFORE main's commit (HEAD~1 = init) so main is AHEAD of
++    # feature with a CONFLICTING edit on common.txt. (feature-on-top-of-main
++    # would make the merge a no-op — main is an ancestor of feature, nothing to
++    # merge in, no conflict.)
++    _git(tmp_path, "checkout", "-q", "HEAD~1").check_returncode()
++    _git(tmp_path, "checkout", "-q", "-b", "feature").check_returncode()
++    (tmp_path / "common.txt").write_text("from feature\n")
++    _git(tmp_path, "add", "common.txt").check_returncode()
++    _git(tmp_path, "commit", "-q", "-m", "feature edits common.txt differently").check_returncode()
++
++    pre_head = _head(tmp_path)
++    assert _status_clean(tmp_path)
++    pre_content = (tmp_path / "common.txt").read_text()
++
++    ok, why = mod._sync_upstream(str(tmp_path))
++
++    # Invariant 1: function returns True — the restart MUST proceed regardless of
++    # the conflict. A blocking sync would wedge the singleton lock.
++    assert ok is True, f"sync must not abort the restart; got {why!r}"
++    # Invariant 2: a conflict warning names what went wrong
++    assert "conflict" in why, f"warning must name the conflict; got {why!r}"
++    # Invariant 3: HEAD is byte-identical — no merge commit landed
++    assert _head(tmp_path) == pre_head, "HEAD must not advance on conflict"
++    # Invariant 4: working tree is byte-identical — no conflict markers, no staged
++    # changes, no untracked files left behind. `git merge --abort` cleans all of
++    # these per git-merge docs.
++    assert _status_clean(tmp_path), "tree must be clean after conflict + abort"
++    # Invariant 5: the file content is the pre-merge feature-branch content
++    # (the abort restored HEAD's version — no `theirs`/`ours` resolution)
++    assert (tmp_path / "common.txt").read_text() == pre_content, (
++        "conflict must not silently resolve; content must be the pre-merge HEAD version"
++    )
++    # Invariant 6: we did NOT use -X ours/theirs — there are no such flags in the
++    # conflict-warning path (impl uses bare `git merge --no-ff --no-edit`)
++    assert "ours" not in why and "theirs" not in why, "the warning must not advertise a fabricated resolution"
++
++
++def test_sync_upstream_is_a_noop_when_main_is_already_merged(mod, tmp_path):
++    """main is already an ancestor of HEAD -> the merge is "Already up to date",
++    HEAD doesn't move, no commit is made. The function still returns True
++    (best-effort); the warning distinguishes this from a real merge so the
++    operator sees the sync had nothing to do (e.g. another worker already
++    forward-merged this exact SHA)."""
++    _init_git(tmp_path, branch="main")
++    (tmp_path / "common.txt").write_text("shared")
++    _git(tmp_path, "add", "common.txt").check_returncode()
++    _git(tmp_path, "commit", "-q", "-m", "main").check_returncode()
++    _git(tmp_path, "checkout", "-q", "-b", "feature").check_returncode()
++    # feature has a commit ON TOP of main (so main is already feature's ancestor)
++    (tmp_path / "feature-only.txt").write_text("feature")
++    _git(tmp_path, "add", "feature-only.txt").check_returncode()
++    _git(tmp_path, "commit", "-q", "-m", "feature on top").check_returncode()
++
++    pre_head = _head(tmp_path)
++    assert _status_clean(tmp_path)
++
++    ok, why = mod._sync_upstream(str(tmp_path))
++    assert ok is True
++    assert "Already up to date" in why  # explicit no-op signal
++    assert _status_clean(tmp_path)
++    # HEAD did NOT move — the merge had nothing to bring in
++    assert _head(tmp_path) == pre_head, "HEAD must not advance on Already-up-to-date"
++
++
++def test_main_invokes_sync_after_stop_before_start(mod, monkeypatch, tmp_path, capsys):
++    """The sync fires in the ONLY window where the worktree is settled (worker
++    drained) and the replacement has not yet pinned its own commits: AFTER
++    _stop_incumbent, BEFORE _start_replacement. This ordering is the kickoff's
++    contract — the merge happens on the worktree's CURRENT branch (the deploy
++    target) BEFORE the new worker starts running on it."""
++    monkeypatch.setenv("MO_GOAL_TARGET_CWD", str(tmp_path))
++    monkeypatch.delenv("MO_GOAL_WORKER_RESTART_DRY", raising=False)
++    order: list[str] = []
++    monkeypatch.setattr(mod, "_worker_pids", lambda role: [7])
++    monkeypatch.setattr(mod, "_stop_incumbent", lambda *a, **k: order.append("stop") or (True, "drained"))
++    monkeypatch.setattr(mod, "_sync_upstream", lambda w: order.append("sync") or (True, "merged origin/main"))
++    monkeypatch.setattr(mod, "_start_replacement", lambda *a, **k: order.append("start") or (True, "spawned"))
++    monkeypatch.setattr(mod, "_await_ready", lambda *a, **k: (True, "registered"))
++    rc = mod.main([])
++    out = capsys.readouterr().out
++    assert rc == 0
++    assert order == ["stop", "sync", "start"], f"sync must run between stop and start; got {order}"
++    # The sync line is printed for the operator so a conflict warn is visible
++    assert "worker-restart sync" in out
++    assert "merged origin/main" in out
++
++
++def test_main_dry_run_does_not_invoke_sync(mod, monkeypatch, tmp_path, capsys):
++    """DRY resolves the plan + prints it; it must NOT touch git, NOT stop the
++    incumbent, NOT spawn, and (with this change) NOT sync upstream. The plan
++    describes what WOULD happen, including the sync — but no side effect."""
++    monkeypatch.setenv("MO_GOAL_TARGET_CWD", str(tmp_path))
++    monkeypatch.setenv("MO_GOAL_WORKER_RESTART_DRY", "1")
++    monkeypatch.setattr(mod, "_worker_pids", lambda role: [4242])
++    touched = {"stop": False, "sync": False, "start": False}
++    monkeypatch.setattr(mod, "_stop_incumbent", lambda *a, **k: touched.__setitem__("stop", True) or (True, "x"))
++    monkeypatch.setattr(mod, "_sync_upstream", lambda *a, **k: touched.__setitem__("sync", True) or (True, "x"))
++    monkeypatch.setattr(mod, "_start_replacement", lambda *a, **k: touched.__setitem__("start", True) or (True, "x"))
++    rc = mod.main([])
++    out = capsys.readouterr().out
++    assert rc == 0
++    assert touched == {"stop": False, "sync": False, "start": False}
++    assert "DRY" in out and "4242" in out

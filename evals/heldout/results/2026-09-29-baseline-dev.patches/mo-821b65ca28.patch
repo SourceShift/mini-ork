@@ -1,0 +1,89 @@
+diff --git a/mini_ork/dispatch/llm_dispatch.py b/mini_ork/dispatch/llm_dispatch.py
+index 1777bc73..a0d7dcca 100644
+--- a/mini_ork/dispatch/llm_dispatch.py
++++ b/mini_ork/dispatch/llm_dispatch.py
+@@ -164,9 +164,9 @@ def glm_fair_usage_retryable(model, message, attempt=1, max_attempts=1) -> bool:
+ 
+ def resolve_lane_model(node_type, root, home) -> str:
+     """agents.yaml lanes.<node_type> → lanes.worker → worker_default → sonnet."""
+-    agents = os.path.join(home, "config", "agents.yaml")
++    agents = os.path.join(home, "config", "agents.yaml") if home else ""
+     if not os.path.isfile(agents):
+-        agents = os.path.join(root, "config", "agents.yaml")
++        agents = os.path.join(root, "config", "agents.yaml") if root else ""
+     if not os.path.isfile(agents):
+         return "sonnet"
+     try:
+@@ -192,9 +192,9 @@ def resolve_lane_family(lane: str, root: str = "", home: str = "") -> str:
+         return lane
+     root = root or context_env("MINI_ORK_ROOT")
+     home = home or context_env("MINI_ORK_HOME")
+-    agents = os.path.join(home, "config", "agents.yaml")
++    agents = os.path.join(home, "config", "agents.yaml") if home else ""
+     if not os.path.isfile(agents):
+-        agents = os.path.join(root, "config", "agents.yaml")
++        agents = os.path.join(root, "config", "agents.yaml") if root else ""
+     if not os.path.isfile(agents):
+         return lane
+     try:
+diff --git a/tests/unit/test_lane_chain_resolution.py b/tests/unit/test_lane_chain_resolution.py
+index 8f37b3c4..785e3275 100644
+--- a/tests/unit/test_lane_chain_resolution.py
++++ b/tests/unit/test_lane_chain_resolution.py
+@@ -50,3 +50,28 @@ def test_chain_lead_is_family_not_alias(tmp_path, monkeypatch):
+     parts = chain.split(",")
+     assert parts[0] == "codex", f"chain lead must be codex, got {parts[0]!r} in {chain!r}"
+     assert parts.index("codex") < parts.index("minimax")
++
++
++def test_empty_home_and_root_does_not_resolve_against_cwd(tmp_path, monkeypatch):
++    """RATCHET: an empty MINI_ORK_HOME/ROOT must NOT silently resolve
++    config/agents.yaml against the process CWD. Old behaviour: os.path.join
++    with home='' produced 'config/agents.yaml', which os.path.isfile then
++    checked against CWD — masking a miss as a hit when the repo (with its
++    default config/agents.yaml) was checked out there. New behaviour: a
++    clean miss returns the lane unchanged."""
++    # Plant a CWD-relative config/agents.yaml that the OLD code would pick up.
++    cwd_agents = tmp_path / "config"
++    cwd_agents.mkdir()
++    (cwd_agents / "agents.yaml").write_text(textwrap.dedent("""
++        lanes:
++          codex_lens: codex
++          implementer: sonnet
++    """))
++    monkeypatch.chdir(tmp_path)
++    monkeypatch.delenv("MINI_ORK_HOME", raising=False)
++    monkeypatch.delenv("MINI_ORK_ROOT", raising=False)
++    # Env unset: clean miss — lane unchanged because no policy was pinned.
++    assert resolve_lane_family("codex_lens") == "codex_lens"
++    assert resolve_lane_family("implementer") == "implementer"
++    # Explicit empty kwargs are likewise a clean miss.
++    assert resolve_lane_family("codex_lens", root="", home="") == "codex_lens"
+diff --git a/tests/unit/test_llm_dispatch_py.py b/tests/unit/test_llm_dispatch_py.py
+index 6bedd96b..7cb0a998 100644
+--- a/tests/unit/test_llm_dispatch_py.py
++++ b/tests/unit/test_llm_dispatch_py.py
+@@ -169,6 +169,23 @@ def test_lane_resolution(tmp_path):
+         assert ld.resolve_lane_model(nt, root, hm) == expect, nt
+ 
+ 
++def test_resolve_lane_model_empty_home_root_does_not_hit_cwd(tmp_path, monkeypatch):
++    """RATCHET: empty home/root must NOT silently resolve config/agents.yaml
++    against the process CWD. Old behaviour joined '' into 'config/agents.yaml'
++    and isfile'd it against CWD, so an implementer alias would silently map to
++    'sonnet' from the repo-default agents.yaml — indistinguishable from a
++    hit. New behaviour: a clean miss falls through to the 'sonnet' default
++    without consulting the CWD's agents.yaml at all."""
++    cwd_agents = tmp_path / "config"
++    cwd_agents.mkdir()
++    (cwd_agents / "agents.yaml").write_text("lanes:\n  implementer: kimi\n  planner: opus\n")
++    monkeypatch.chdir(tmp_path)
++    # Old buggy code: 'config/agents.yaml' resolves against tmp_path → returns 'kimi'.
++    # New code: empty home/root → joins to '' → isfile('') is False → 'sonnet' fallback.
++    assert ld.resolve_lane_model("implementer", root="", home="") == "sonnet"
++    assert ld.resolve_lane_model("planner", root="", home="") == "sonnet"
++
++
+ # ── retry loop with injected stub ──
+ 
+ def test_retry_loop_stub(tmp_path, monkeypatch):

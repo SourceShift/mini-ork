@@ -1,0 +1,178 @@
+diff --git a/mini_ork/gates/promotion_gate.py b/mini_ork/gates/promotion_gate.py
+index d92e485e..c1f7c2b6 100644
+--- a/mini_ork/gates/promotion_gate.py
++++ b/mini_ork/gates/promotion_gate.py
+@@ -68,6 +68,13 @@ caching):
+     MO_MIN_FINDING_CARDINALITY       → min finding cardinality (default 5)
+     MO_DETERMINISTIC_TASK_CLASSES    → space-separated bypass list
+                                         (default "code_fix db_migration")
++    MO_PROMOTION_MIN_RUNS            → independent-run floor for
++                                        ``promotion_evaluate`` (default
++                                        implicit 3). The env var may RAISE
++                                        the floor but never lower it — a
++                                        floor an environment can lower is
++                                        not a floor. Effective floor is
++                                        ``max(3, MO_PROMOTION_MIN_RUNS)``.
+     MINI_ORK_ROOT                    → legacy: where to find ``lib/cw_por.sh``
+                                         (WS4: CW-POR is computed natively via
+                                         ``mini_ork.gates.cw_por``; the env var
+@@ -152,24 +159,43 @@ def promotion_evaluate(
+ ) -> dict[str, Any]:
+     """Evaluate a candidate for promotion.
+ 
+-    Mirrors ``lib/promotion_gate.sh::promotion_evaluate`` exactly:
++    Mirrors ``lib/promotion_gate.sh::promotion_evaluate`` with the
++    independence-rule addition (post-bash-removal; the port is now the
++    sole implementation):
+ 
+       * SUM(pass) / AVG(utility_score) / MIN(pass) / COUNT(*) over
+-        ``benchmark_results`` for the candidate_id
++        ``benchmark_results`` for the candidate_id (sample stats — counts
++        every observation, including duplicates from the same run)
+       * baseline ``utility_score`` from ``version_registry`` (default 0.0
+         when missing) — guarded by a sqlite_master existence check
++      * INDEPENDENCE: distinct non-NULL/non-blank ``benchmark_results.run_id``
++        values back the decision. Floor is ``max(3, MO_PROMOTION_MIN_RUNS)``;
++        the env var may raise but never lower the floor — a floor an
++        environment can lower is not a floor. A NULL/blank ``run_id`` is
++        unproven independence and counts zero; nothing backfills a
++        synthetic id (that would fabricate the exact independence being
++        demanded).
+       * decision tree: no ``benchmark_results`` rows at all → rejected (no
+-        measurement, no promote); not all_pass → rejected; utility_delta≤0 →
+-        quarantined; else promoted. There is no human branch: a gate decision
+-        is a measurement verdict, never a request for approval.
++        measurement, no promote); not all_pass → rejected; independent
++        run count below the floor → rejected; utility_delta≤0 →
++        quarantined; else promoted. There is no human branch: a gate
++        decision is a measurement verdict, never a request for approval.
+       * INSERTs into ``promotion_records`` (migration 0011 schema:
+         ``promotion_id`` PK, ``from_version_id`` + ``to_version_id`` NOT
+-        NULL FKs to workflow_memory, ``decided_by``='gate')
++        NULL FKs to workflow_memory, ``decided_by``='gate') with
++        ``benchmark_run_id`` carrying the comma-joined distinct run list
++        (no single ``benchmark_memory.summary_id`` names a multi-run
++        decision; FK enforcement is off in app connections, so the text
++        write is safe).
+       * exits rc=1 (raises ``SystemExit``) when ``workflow_candidates`` has
+         no row for ``candidate_id`` (matching bash's silent exit-1 contract)
+ 
+     Returns the decision JSON as a dict with floats rounded to 6
+-    decimals (``round(_, 6)``).
++    decimals (``round(_, 6)``) and ``benchmark_run_id`` echoing the
++    comma-joined distinct run list (string of ints, e.g. ``"1,2,3"``).
++    The ``n_runs`` key carries the distinct-run count for downstream
++    audit; an empty independence set (``n_runs=0``) appears for the
++    rejected-by-independence branch.
+ 
+     ``mini_ork_root`` is accepted for parity with the bash surface but is
+     unused — bash sources its sub-libraries lazily, the port does not
+@@ -180,6 +206,15 @@ def promotion_evaluate(
+ 
+     ensure_table(db_path)
+ 
++    # ── Env-driven independence floor (read at function entry — NO
++    # import-time caching). Floor is at least 3; the env var may RAISE it
++    # but never lower it. A floor an environment can lower is not a floor.
++    try:
++        _env_floor = int(os.environ.get("MO_PROMOTION_MIN_RUNS", "0") or "0")
++    except (TypeError, ValueError):
++        _env_floor = 0
++    min_runs_floor = max(3, _env_floor)
++
+     # Connect — match bash: PRAGMA busy_timeout=5000 not strictly needed
+     # for in-process reads, but keeps parity with the embedded heredocs
+     # that do set it.
+@@ -200,6 +235,32 @@ def promotion_evaluate(
+             )
+         """, (candidate_id,)).fetchone()
+ 
++        # ── Distinct non-NULL/non-blank run_ids behind this candidate.
++        # NULL/blank run_id is unproven independence and counts zero —
++        # nothing backfills a synthetic id (that would fabricate the
++        # exact independence being demanded). The migrated schema
++        # declares run_id INTEGER NOT NULL so this cannot arise there,
++        # but the guard holds for loose and legacy tables (TEXT columns,
++        # ad-hoc seeds, missing FKs). CAST(... AS TEXT) <> '' catches
++        # both NULL and the blank-string case across both INTEGER and
++        # TEXT storage. Sorted ascending so the comma-joined audit
++        # string is deterministic.
++        run_id_rows = con.execute("""
++            SELECT DISTINCT run_id FROM benchmark_results
++            WHERE candidate_id=?
++              AND run_id IS NOT NULL
++              AND CAST(run_id AS TEXT) <> ''
++        """, (candidate_id,)).fetchall()
++        try:
++            distinct_runs = sorted(int(r[0]) for r in run_id_rows)
++        except (TypeError, ValueError):
++            # Non-integer run_id in a loose/legacy table: drop anything
++            # that won't coerce cleanly. Independence must be counted on
++            # a sortable integer basis to write a meaningful audit list.
++            distinct_runs = []
++        n_runs = len(distinct_runs)
++        run_list_str = ",".join(str(r) for r in distinct_runs)
++
+         # ── Baseline from version_registry (mirrors bash lines 97-105) ──
+         vr_exists = con.execute(
+             "SELECT name FROM sqlite_master WHERE type='table' AND name='version_registry'"
+@@ -223,7 +284,10 @@ def promotion_evaluate(
+ 
+         utility_delta = utility_after - utility_before
+ 
+-        # ── Decision logic (mirrors bash lines 123-140) ──
++        # ── Decision logic (mirrors bash lines 123-140 + independence
++        # branch). Independence is measured separately from sample count:
++        # one run emitting N passing rows is N samples but ONE observation.
++        # The candidate left in shadow with no version bump on failure. ──
+         if brun is None:
+             # Zero benchmark_results rows: nothing was measured. The old
+             # fall-through promoted here, and the rationale asserted "all
+@@ -243,6 +307,17 @@ def promotion_evaluate(
+                 f"Not all benchmark tasks passed "
+                 f"({brun['passed']}/{brun['total_tasks']})"
+             )
++        elif n_runs < min_runs_floor:
++            # Sample count is fine (all_pass above), but independence is
++            # not: a single run (or fewer than the floor) cannot promote.
++            # The candidate remains in shadow — re-evaluatable once more
++            # distinct runs land behind it.
++            decision = "rejected"
++            rationale = (
++                f"insufficient independent evidence: {n_runs} distinct run(s), "
++                f"{min_runs_floor} required; {brun['total_tasks']} sample(s) "
++                f"recorded"
++            )
+         elif utility_delta <= 0:
+             decision = "quarantined"
+             rationale = (
+@@ -254,7 +329,8 @@ def promotion_evaluate(
+             rationale = (
+                 f"Utility improved by {utility_delta:.4f} "
+                 f"({utility_before:.4f} → {utility_after:.4f}); "
+-                f"all benchmark tasks passed."
++                f"all benchmark tasks passed; "
++                f"{n_runs} independent run(s)."
+             )
+ 
+         result = {
+@@ -263,7 +339,9 @@ def promotion_evaluate(
+             "utility_before": round(utility_before, 6),
+             "utility_after": round(utility_after, 6),
+             "utility_delta": round(utility_delta, 6),
+-            "benchmark_run_id": candidate_id,
++            "benchmark_run_id": run_list_str,
++            "n_runs": n_runs,
++            "min_runs_floor": min_runs_floor,
+             "all_pass": all_pass,
+             "safety_violations": safety_violations,
+         }
+@@ -290,7 +368,7 @@ def promotion_evaluate(
+             VALUES (?,?,?,?,?,?,?,?,?,?)
+         """, (
+             record_id, candidate_id, base_ver, base_ver,
+-            utility_before, utility_after, None,
++            utility_before, utility_after, run_list_str,
+             rationale, decision, "gate",
+         ))
+         con.commit()

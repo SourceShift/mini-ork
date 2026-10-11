@@ -1,0 +1,248 @@
+diff --git a/mini_ork/cli/execute_handlers.py b/mini_ork/cli/execute_handlers.py
+index c84c6f6a..00edb92d 100644
+--- a/mini_ork/cli/execute_handlers.py
++++ b/mini_ork/cli/execute_handlers.py
+@@ -1038,6 +1038,33 @@ def _run_changed_files(run_dir: str) -> list[str]:
+     return []
+ 
+ 
++def _write_rolled_back_manifest(run_dir: str, *, strategy: str,
++                                reverted: list[str], removed: list[str],
++                                rejected: list[str]) -> None:
++    """Record the paths rollback touched so the post-run verify can label them.
++
++    Without this record, the post-rollback verifier blames the implementer
++    for files rollback itself deleted — a "required artifact missing or
++    empty" surfaces on rollback's own action, not an implementer miss.
++    Verdict is unchanged (a reverted run still fails); only the attribution
++    is. Best-effort: any write failure is silent — observability must not
++    sink the run.
++    """
++    if not run_dir:
++        return
++    payload = {
++        "strategy": strategy,
++        "reverted_paths": list(reverted),
++        "removed_paths": list(removed),
++        "rejected_paths": list(rejected),
++    }
++    try:
++        with open(os.path.join(run_dir, "rolled-back.json"), "w", encoding="utf-8") as fh:
++            json.dump(payload, fh, indent=2)
++    except OSError:
++        pass
++
++
+ def _revert_working_tree(root: str, run_dir: str) -> bool:
+     """``revert_branch`` compensation (roadmap Step 1 / fix-tracker M3).
+ 
+@@ -1055,6 +1082,8 @@ def _revert_working_tree(root: str, run_dir: str) -> bool:
+     files: list[str] = _run_changed_files(run_dir)
+     if not files:
+         log("  [rollback] revert_branch: no files_changed recorded — working tree untouched")
++        _write_rolled_back_manifest(run_dir, strategy="revert_branch",
++                                    reverted=[], removed=[], rejected=[])
+         return True
+     target_repo = context_env("MO_TARGET_CWD", "")
+     if not target_repo:
+@@ -1095,6 +1124,11 @@ def _revert_working_tree(root: str, run_dir: str) -> bool:
+                 rejected.append(raw)
+     log(f"  [rollback] revert_branch: restored {len(restored)} tracked file(s), "
+         f"removed {len(removed)} created file(s), rejected {len(rejected)}")
++    # Record what we touched so post-run verify can label these paths
++    # rolled_back (vs. a genuine implementer miss). Verdict unchanged.
++    _write_rolled_back_manifest(run_dir, strategy="revert_branch",
++                                reverted=restored, removed=removed,
++                                rejected=rejected)
+     # Leftover report: any of the recorded paths still dirty?
+     leftover = subprocess.run(
+         ["git", "-C", real_root, "status", "--porcelain", "--", *files],
+@@ -1206,6 +1240,10 @@ def _revert_inplace_diff(run_dir: str, root: str) -> bool:
+                 log(f"  [rollback] could not remove created file: {rel}")
+     log(f"  [rollback] discard_worktree: per-path restore over {len(paths)} path(s)"
+         + (f", {len(pre_dirty)} restored to pre-run dirty state" if pre_dirty else ""))
++    # Record what we touched so post-run verify can label these paths
++    # rolled_back (vs. a genuine implementer miss). Verdict unchanged.
++    _write_rolled_back_manifest(run_dir, strategy="keep_run_artifacts_discard_worktree",
++                                reverted=paths, removed=[], rejected=[])
+     clean = [p for p in paths if p not in pre_dirty]
+     leftover = subprocess.run(
+         ["git", "-C", real_root, "status", "--porcelain", "--", *clean],
+diff --git a/mini_ork/cli/verify.py b/mini_ork/cli/verify.py
+index bbe53d5b..2a920ca1 100644
+--- a/mini_ork/cli/verify.py
++++ b/mini_ork/cli/verify.py
+@@ -167,6 +167,35 @@ def _default_mutation_report(artifact_path):
+                         "mutation-validation.json")
+ 
+ 
++def _load_rolled_back_paths(run_dir):
++    """The set of paths this run's rollback reverted (so verify can label them).
++
++    Reads ``<run_dir>/rolled-back.json`` if it exists. The manifest is written
++    by ``_revert_working_tree`` / ``_revert_inplace_diff`` (kickoff
++    §rollback/verify); without it, the post-rollback verifier blames the
++    implementer for files rollback itself deleted. Empty set on missing file
++    or unreadable payload — verify falls back to its existing label.
++    """
++    if not run_dir or not os.path.isdir(run_dir):
++        return set()
++    path = os.path.join(run_dir, "rolled-back.json")
++    if not os.path.isfile(path):
++        return set()
++    try:
++        with open(path, encoding="utf-8") as fh:
++            data = json.load(fh)
++    except (OSError, ValueError):
++        return set()
++    if not isinstance(data, dict):
++        return set()
++    out: set[str] = set()
++    for key in ("reverted_paths", "removed_paths"):
++        for p in data.get(key, []) or []:
++            if isinstance(p, str) and p:
++                out.add(p)
++    return out
++
++
+ def _run_mutation_campaign(artifact_path, plan_path):
+     """Run the adversarial-mutation campaign so the mutation gate has evidence.
+ 
+@@ -240,6 +269,7 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
+     evidence_dir = (os.path.join(run_dir, "evidence") if run_dir and os.path.isdir(run_dir)
+                     else os.path.join(home, "runs", "evidence"))
+     os.makedirs(evidence_dir, exist_ok=True)
++    rolled_back_paths = _load_rolled_back_paths(run_dir)
+ 
+     verifier_names: list[str] = []
+     if plan_path and os.path.isfile(plan_path):
+@@ -334,7 +364,13 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
+                         pass_count += 1
+                     else:
+                         sys.stderr.write(f"  [fail] required artifact missing or empty: {p}\n")
+-                        results.append(f'{{"verifier":"__artifact__","pass":false,"evidence_path":"{p}"}}')
++                        # Rollback touched this path before verify ran — the
++                        # missing artifact is the rollback's own action, not
++                        # an implementer miss. Label it so the cause is
++                        # attributable. Verdict stays fail (reverted run
++                        # failed); only the attribution moves.
++                        detail = "rolled_back" if p in rolled_back_paths else "missing_or_empty"
++                        results.append(f'{{"verifier":"__artifact__","pass":false,"detail":"{detail}","evidence_path":"{p}"}}')
+                         fail_count += 1
+                         artifact_fail = True
+ 
+diff --git a/mini_ork/dispatch/core.py b/mini_ork/dispatch/core.py
+index c65c3638..caa9a23b 100644
+--- a/mini_ork/dispatch/core.py
++++ b/mini_ork/dispatch/core.py
+@@ -284,6 +284,16 @@ def dispatch(
+     duration_ms = int((time.monotonic() - start) * 1000)
+     stdout = stdout or ""
+     if rc != 0:
++        # Lead with the stdout envelope (Claude --output-format json puts the
++        # API error there: is_error, api_error_status, result), then keep the
++        # stderr tail (often only an advisory banner — e.g. "Key limit
++        # exceeded" was logged as the banner instead of the 403 envelope).
++        # 1500/500 budget keeps the envelope head inside the 2000-char cap
++        # so the real cause is the FIRST thing an operator sees.
++        envelope = (stdout or "").strip()
++        stderr_tail = (stderr or "").rstrip()
++        envelope_head = envelope[:1500]
++        combined = envelope_head + (("\n" + stderr_tail[-500:]) if stderr_tail else "")
+         # A FAILED node is exactly what E4 resumes — capture its session_id
+         # from whatever envelope made it to stdout so the recovery can
+         # `--resume` the same conversation.
+@@ -291,7 +301,7 @@ def dispatch(
+             ok=False,
+             rc=rc,
+             text=stdout,
+-            error=(stderr or "")[-2000:],
++            error=combined[-2000:],
+             model=request.model,
+             duration_ms=duration_ms,
+             session_id=parse_session(stdout) if parse_session else "",
+diff --git a/mini_ork/dispatch/routing.py b/mini_ork/dispatch/routing.py
+index 57c204e9..93b94099 100644
+--- a/mini_ork/dispatch/routing.py
++++ b/mini_ork/dispatch/routing.py
+@@ -56,13 +56,76 @@ def dispatch_chain(node_type: str, lead: str) -> str:
+     return ",".join(out)
+ 
+ 
++def _effective_agents_yaml_path() -> str:
++    """Resolve the canonical agents.yaml (run-dir first, then HOME, then ROOT).
++
++    Mirrors ``config_resolve.resolve_agents_yaml`` precedence in-place so this
++    module stays self-contained for the lane-lookup branch. Returns "" when
++    no config exists in any of the three locations; callers fall back.
++    """
++    run_dir = os.environ.get("MINI_ORK_RUN_DIR", "")
++    if run_dir:
++        cand = os.path.join(run_dir, "config", "agents.yaml")
++        if os.path.isfile(cand):
++            return cand
++    home = os.environ.get("MINI_ORK_HOME", "")
++    if home:
++        cand = os.path.join(home, "config", "agents.yaml")
++        if os.path.isfile(cand):
++            return cand
++    root = os.environ.get("MINI_ORK_ROOT", "")
++    if root:
++        cand = os.path.join(root, "config", "agents.yaml")
++        if os.path.isfile(cand):
++            return cand
++    return ""
++
++
++def _agents_yaml_role_lane(role: str) -> str:
++    """The lane mapped to ``role`` in the operator's agents.yaml, or "".
++
++    Operator sets ``lanes.<role>`` in agents.yaml precisely to override the
++    frontier/cheap defaults (kickoff §routing). Returning "" for a missing
++    file, malformed yaml, or unmapped role lets the caller fall through to
++    the defaults without raising — config errors are NEVER a run sink.
++    """
++    path = _effective_agents_yaml_path()
++    if not path:
++        return ""
++    try:
++        import yaml
++
++        with open(path, encoding="utf-8") as fh:
++            data = yaml.safe_load(fh)
++        lanes = (data or {}).get("lanes") or {}
++        if not isinstance(lanes, dict):
++            return ""
++        val = lanes.get(role)
++        return str(val).strip() if val else ""
++    except Exception:
++        return ""
++
++
+ def learning_static_lane(node_type: str, current_lane: str) -> str:
+-    frontier = os.environ.get("MO_FRONTIER_LANE", "opus_lens")
+-    cheap = os.environ.get("MO_CHEAP_LANE", "kimi_lens")
+-    # A recipe-pinned lane (current_lane != node_type) is explicit author intent
+-    # + the learning loop's exploration arm — keep it.
++    """Pick a lane for an unpinned node, honoring agents.yaml operator mapping.
++
++    Order of precedence (each step only applies when the previous returned nothing):
++      1. recipe pin: ``current_lane != node_type`` is explicit author intent +
++         the learning loop's exploration arm — keep it.
++      2. agents.yaml ``lanes.<role>``: the operator-set role→lane override,
++         frequently set precisely to avoid the frontier/cheap defaults.
++      3. defaults: frontier for reviewer, cheap for researcher/implementer.
++    """
++    # 1. Recipe pin (author intent / learning exploration arm).
+     if current_lane != node_type:
+         return current_lane
++    # 2. Operator's agents.yaml lanes.<role> override (the bug-fix).
++    mapped = _agents_yaml_role_lane(node_type)
++    if mapped:
++        return mapped
++    # 3. Defaults (frontier / cheap) for unmapped roles only.
++    frontier = os.environ.get("MO_FRONTIER_LANE", "opus_lens")
++    cheap = os.environ.get("MO_CHEAP_LANE", "kimi_lens")
+     if node_type == "reviewer":
+         return frontier
+     if node_type in ("researcher", "implementer"):

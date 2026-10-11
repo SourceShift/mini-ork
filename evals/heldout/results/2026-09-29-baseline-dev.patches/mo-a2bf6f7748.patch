@@ -1,0 +1,51 @@
+diff --git a/kickoffs/book-goal-loop/binding/scoped_gate.py b/kickoffs/book-goal-loop/binding/scoped_gate.py
+index 19d16ed9..004f26bc 100644
+--- a/kickoffs/book-goal-loop/binding/scoped_gate.py
++++ b/kickoffs/book-goal-loop/binding/scoped_gate.py
+@@ -55,6 +55,10 @@ from pathlib import Path
+ 
+ TS_EXT = (".ts", ".tsx", ".mts", ".cts")
+ TEST_RE = re.compile(r"(\.test\.|\.spec\.|/__tests__/)")
++# A git ref read from disk is operator-controlled but the file may be empty,
++# partial, or corrupted; a non-hex value must NEVER reach git (invalid ref or
++# flag-injection vector), so the resolver gates every read on this shape.
++_HEX_RE = re.compile(r"^[0-9a-f]{7,40}$")
+ # Trees served by tsconfig.server.json (node/commonjs + @server/@shared path
+ # maps) rather than the root client config (bundler + @/ -> src/).
+ SERVER_ROOTS = ("server/", "shared/", "scripts/")
+@@ -83,6 +87,26 @@ def _run(argv: list[str], cwd: str, timeout_s: int) -> tuple[int, str]:
+     return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+ 
+ 
++def _resolve_base(root: str, fallback: str) -> str:
++    """The diff base for THIS child: prefer the child's own pre-implementer
++    ref (the worktree state captured by execute.py before the first implementer
++    edit) so we measure ONLY the child's change, never the goal-loop worker's
++    pre-existing divergence from origin/main (the phantom-red that broke the
++    typecheck on unrelated .ts files). MO_GOAL_SCOPED_BASE remains the
++    fallback when no run dir or ref is on disk, and a non-hex value is
++    rejected so it can never reach git.
++    """
++    run_dir = os.environ.get("MINI_ORK_RUN_DIR", "").strip()
++    if run_dir:
++        try:
++            ref = open(os.path.join(run_dir, "pre-implementer-ref"), encoding="utf-8").read().strip()
++        except OSError:
++            ref = ""
++        if _HEX_RE.match(ref):
++            return ref
++    return fallback
++
++
+ def _changed(root: str, base: str) -> list[str]:
+     """Repo-relative paths the child has touched: working tree, untracked, and
+     (when ``base`` resolves) everything committed on top of it."""
+@@ -195,7 +219,7 @@ def main(argv: list[str]) -> int:
+     # resolves the config through its own realpath, so a symlinked target (a
+     # macOS mktemp dir, say) would render every error path as "../../..".
+     root = os.path.realpath(os.environ.get("MO_GOAL_TARGET_CWD") or os.getcwd())
+-    files = _changed(root, os.environ.get("MO_GOAL_SCOPED_BASE", "").strip())
++    files = _changed(root, _resolve_base(root, os.environ.get("MO_GOAL_SCOPED_BASE", "").strip()))
+     if mode == "typecheck":
+         files = [f for f in files if not TEST_RE.search(f)]
+     if not files:

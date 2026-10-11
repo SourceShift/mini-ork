@@ -1,0 +1,25 @@
+{
+  "mo-9a0cf68ccf": {
+    "cost_usd": 0.697069,
+    "difficulty": "easy",
+    "failed_ids": [
+      "tests.unit.test_cli_main_dry_run::test_rubric_prescreen_is_disabled_for_dry_runs",
+      "tests.unit.test_cli_main_dry_run::test_rubric_prescreen_remains_enabled_for_real_runs"
+    ],
+    "passed": false,
+    "seconds": 394.50023412518203,
+    "solver_rc": 1,
+    "weak_signal": true
+  },
+  "mo-ccda47b494": {
+    "cost_usd": 1.454328,
+    "difficulty": "easy",
+    "failed_ids": [
+      "tests.test_web_smoke::test_load_transcript_strips_z_insight_blocks"
+    ],
+    "passed": false,
+    "seconds": 459.07992020761594,
+    "solver_rc": 1,
+    "weak_signal": false
+  }
+}

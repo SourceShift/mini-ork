@@ -1,0 +1,195 @@
+diff --git a/mini_ork/dispatch/__main__.py b/mini_ork/dispatch/__main__.py
+index a4d1ec6a..e7fe2426 100644
+--- a/mini_ork/dispatch/__main__.py
++++ b/mini_ork/dispatch/__main__.py
+@@ -85,11 +85,34 @@ def main(argv: list[str] | None = None) -> int:
+         except Exception as exc:  # transcript generation must never break dispatch
+             sys.stderr.write(f"[mini_ork.dispatch] transcript write failed: {exc}\n")
+     if run_dir and os.path.isdir(run_dir):
++        # Stamp the dispatcher's MO_NODE_ID and clear the cost/duration/lane
++        # sidecars BEFORE writing the new values, so a node that dispatched
++        # nothing sees no stale data from the previous dispatch. _read_fresh_sidecar
++        # returns None on a stamp mismatch, so without the clear a no-dispatch
++        # node could still read the prior node's cost back as its own.
++        for side in (".last-llm-cost", ".last-llm-duration-ms", ".last-llm-lane"):
++            try:
++                os.remove(os.path.join(run_dir, side))
++            except OSError:
++                pass
++        node_id = os.environ.get("MO_NODE_ID", "")
++        try:
++            with open(os.path.join(run_dir, ".last-llm-node"), "w", encoding="utf-8") as fh:
++                fh.write(node_id)
++        except OSError:
++            pass
+         try:
+             with open(os.path.join(run_dir, ".last-llm-cost"), "w", encoding="utf-8") as fh:
+                 fh.write(f"{result.cost_usd:.6f}")
+             with open(os.path.join(run_dir, ".last-llm-duration-ms"), "w", encoding="utf-8") as fh:
+                 fh.write(str(result.duration_ms))
++            # Only the member the dispatcher actually served earns the credit.
++            # dispatch_with_fallback sets result.model to the lane that served
++            # (single model), not the fallback chain, so this is the right
++            # granularity for the lane sidecar.
++            served_lane = getattr(result, "model", "") or lanes[0]
++            with open(os.path.join(run_dir, ".last-llm-lane"), "w", encoding="utf-8") as fh:
++                fh.write(str(served_lane))
+         except OSError:
+             pass
+ 
+diff --git a/mini_ork/dispatch/llm_dispatch.py b/mini_ork/dispatch/llm_dispatch.py
+index ed132399..15f41687 100644
+--- a/mini_ork/dispatch/llm_dispatch.py
++++ b/mini_ork/dispatch/llm_dispatch.py
+@@ -513,6 +513,7 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
+         run_dir = context_env("MINI_ORK_RUN_DIR")
+         if os.path.isfile(out_file + ".cost") and run_dir:
+             try:
++                _stamp_and_clear_sidecars(run_dir)
+                 open(os.path.join(run_dir, ".last-llm-cost"), "w").write(open(out_file + ".cost").read())
+                 os.remove(out_file + ".cost")
+             except OSError:
+@@ -566,6 +567,7 @@ def _write_duration_ms(ms):
+     rd = context_env("MINI_ORK_RUN_DIR")
+     if not rd:
+         return
++    _stamp_and_clear_sidecars(rd)
+     try:
+         open(os.path.join(rd, ".last-llm-duration-ms"), "w").write(str(ms))
+     except OSError:
+@@ -580,11 +582,38 @@ def _write_lane_sidecar(lane):
+     rd = context_env("MINI_ORK_RUN_DIR")
+     if not rd or not lane:
+         return
++    _stamp_and_clear_sidecars(rd)
+     try:
+         open(os.path.join(rd, ".last-llm-lane"), "w").write(str(lane))
+     except OSError:
+         pass
+ 
+ 
++def _stamp_and_clear_sidecars(run_dir: str) -> None:
++    """Clear the cost/duration/lane sidecars and stamp .last-llm-node with
++    MO_NODE_ID so a node that dispatched nothing never reads the previous
++    node's cost back as its own. _read_fresh_sidecar returns None on a stamp
++    mismatch; the clear guarantees the value sidecars carry the stamped
++    node's data only. Idempotent — safe to call before every write."""
++    for side in (".last-llm-cost", ".last-llm-duration-ms", ".last-llm-lane"):
++        try:
++            os.remove(os.path.join(run_dir, side))
++        except OSError:
++            pass
++    try:
++        open(os.path.join(run_dir, ".last-llm-node"), "w").write(
++            os.environ.get("MO_NODE_ID", "")
++        )
++    except OSError:
++        pass
++
++
++# `_stamp_and_clear_sidecars` is defined AFTER its first call site above, but
++# Python resolves it at call time — `_write_duration_ms` and `_write_lane_sidecar`
++# are not invoked during module import. The helper keeps the three call sites
++# (this module + dispatch/__main__) byte-identical so a future reader gate can
++# be tightened in one place.
++
++
+ if __name__ == "__main__":
+     raise SystemExit(llm_dispatch())
+diff --git a/mini_ork/scheduler.py b/mini_ork/scheduler.py
+index 504fccfb..3a0519bf 100644
+--- a/mini_ork/scheduler.py
++++ b/mini_ork/scheduler.py
+@@ -143,12 +143,27 @@ def pick_ready(db: str | None = None) -> list[str]:
+ 
+ 
+ def today_cost_usd(db: str | None = None) -> float:
++    """Sum real dispatch spend over the rolling 24h window.
++
++    Prefers llm_calls — the per-dispatch ledger every provider call writes,
++    node or stage — so stage writers (reflect / gradient-extract / jury /
++    lens-panel) that never reach a charge call still surface in the daily
++    budget guard. Falls back to task_runs.cost_usd when llm_calls is absent
++    (DB behind the migrator): graceful degradation, never a blind zero.
++    """
+     con = _conn(db)
+     try:
+-        row = con.execute(
+-            "SELECT COALESCE(SUM(cost_usd), 0) FROM task_runs "
+-            "WHERE created_at >= strftime('%s','now','-24 hours')").fetchone()
+-        return float(row[0] or 0)
++        try:
++            con.execute("SELECT 1 FROM llm_calls LIMIT 0")
++            row = con.execute(
++                "SELECT COALESCE(SUM(cost_usd), 0) FROM llm_calls "
++                "WHERE ts >= strftime('%Y-%m-%dT%H:%M:%fZ','now','-24 hours')").fetchone()
++            return float(row[0] or 0)
++        except sqlite3.OperationalError:
++            row = con.execute(
++                "SELECT COALESCE(SUM(cost_usd), 0) FROM task_runs "
++                "WHERE created_at >= strftime('%s','now','-24 hours')").fetchone()
++            return float(row[0] or 0)
+     except sqlite3.OperationalError:
+         return 0.0
+     finally:
+diff --git a/mini_ork/trace_store.py b/mini_ork/trace_store.py
+index 173cf78a..4387f50f 100644
+--- a/mini_ork/trace_store.py
++++ b/mini_ork/trace_store.py
+@@ -191,6 +191,16 @@ def trace_write(payload: dict | str, db: str | None = None) -> str:
+     except that columns the live table lacks are dropped instead of raising — see
+     ``_trace_upsert``."""
+     p = json.loads(payload) if isinstance(payload, str) else dict(payload)
++    # agent_version_id may arrive as the lane the router was asked for — a
++    # comma-separated fallback family (e.g. "glm,minimax") is legitimate there,
++    # and it held an advantage row competing with its own members for the same
++    # slice. Only the member the dispatcher actually served earns the credit,
++    # so a chain is narrowed to its first non-empty member before write.
++    raw_lane = (p.get("agent_version_id", "") or "").strip()
++    if "," in raw_lane:
++        first = next((m.strip() for m in raw_lane.split(",") if m.strip()), "")
++        if first:
++            p["agent_version_id"] = first
+     trace_id = p.get("trace_id") or f"tr-{uuid.uuid4().hex[:16]}"
+     run_id = (p.get("run_id") or os.environ.get("MINI_ORK_TASK_RUN_ID")
+               or context_env("MINI_ORK_RUN_ID") or None)
+@@ -229,9 +239,15 @@ def trace_write(payload: dict | str, db: str | None = None) -> str:
+ 
+ 
+ def _read_fresh_sidecar(name: str) -> str | None:
+-    """Freshness-gated sidecar read from $MINI_ORK_RUN_DIR. A sidecar older than
+-    5x MO_DISPATCH_TIMEOUT is treated as absent so a stale lane/cost from an
+-    earlier dispatch can never be attributed to the current trace."""
++    """Freshness-gated sidecar read from $MINI_ORK_RUN_DIR. Dispatchers stamp
++    ``.last-llm-node`` with ``MO_NODE_ID`` and clear the cost/duration/lane
++    sidecars before writing; a stamp mismatch returns None so a node that
++    dispatched nothing never reads the previous node's cost back as its own.
++    A missing stamp falls back to the legacy freshness-only path — a writer
++    that doesn't stamp (yet) stays trusted, so the gate only narrows
++    attribution, never blanks it out. A sidecar older than 5x MO_DISPATCH_TIMEOUT
++    is treated as absent so a stale lane/cost from an earlier dispatch can
++    never be attributed to the current trace."""
+     run_dir = context_env("MINI_ORK_RUN_DIR", "")
+     if not run_dir:
+         return None
+@@ -247,6 +263,20 @@ def _read_fresh_sidecar(name: str) -> str | None:
+         return None
+     if time.time() - st.st_mtime > freshness_s:
+         return None
++    # Node stamp gates cross-node contamination. A missing stamp leaves the
++    # legacy freshness-only path in place so older writers (no stamp) remain
++    # trusted and a downstream stage never loses its own attribution when a
++    # node decides not to stamp.
++    stamp_path = os.path.join(run_dir, ".last-llm-node")
++    try:
++        with open(stamp_path) as fh:
++            stamp = fh.read().strip()
++    except OSError:
++        stamp = ""
++    if stamp:
++        current = os.environ.get("MO_NODE_ID", "")
++        if stamp != current:
++            return None
+     try:
+         with open(path) as fh:
+             return fh.read().strip()

@@ -1,0 +1,11 @@
+{
+  "mo-ccda47b494": {
+    "cost_usd": 1.503247,
+    "difficulty": "easy",
+    "failed_ids": [],
+    "passed": true,
+    "seconds": 614.6248920420185,
+    "solver_rc": 0,
+    "weak_signal": false
+  }
+}

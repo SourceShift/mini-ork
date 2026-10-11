@@ -1,0 +1,213 @@
+diff --git a/mini_ork/cli/self_improve.py b/mini_ork/cli/self_improve.py
+index 9ec9e595..85242eb4 100644
+--- a/mini_ork/cli/self_improve.py
++++ b/mini_ork/cli/self_improve.py
+@@ -272,6 +272,118 @@ def _parse_args(argv):
+     return o, None
+ 
+ 
++# ── surface-scoped leak guard ──────────────────────────────────────────
++# The self-improve iter dispatches into a linked worktree under
++# home/worktrees/iter-N-ts. When path resolution mis-targets the parent
++# checkout, the implementer's edits leak into root instead of staying in
++# the worktree, so a rejected iteration has been observed leaving modified
++# tracked files and stray untracked files in main (iter-1 leaked verify.py
++# + test_verify.py and had to be hand-reverted). The guard below snapshots
++# the surface as it stood BEFORE dispatch, then after the iter is decided
++# (and ONLY on non-success outcomes — a successful auto_merge intentionally
++# modifies root, so reverting there would erase the very change we wanted
++# to land) reverts only paths that went clean→dirty during the run. Paths
++# the operator already had dirty are never touched, so a concurrent
++# hand-edit on a self-improve iter is the operator's choice, not a leak.
++
++_ROOT_SURFACE_DIRS = ("mini_ork", "recipes", "schemas", "tests")
++
++
++def _root_surface_dirty(root: str) -> set:
++    """NUL-delimited `git status --porcelain` over the improvable surface.
++
++    Returns the set of repo-relative paths currently dirty inside
++    mini_ork/, recipes/, schemas/, tests/. Mirrors the recursive-self-
++    improve kickoff's "Improvable surface" wording exactly, so the snapshot
++    is exactly the paths a leak guard can revert safely. Out-of-surface
++    edits (operator WIP under docs/, scratch under .mini-ork/) are
++    intentionally invisible — they can't be leaked by an iter, so they
++    don't belong in the snapshot.
++    """
++    rel = subprocess.run(
++        ["git", "-C", root, "status", "--porcelain", "-z",
++         "--", *_ROOT_SURFACE_DIRS],
++        capture_output=True,
++    )
++    if rel.returncode != 0 or not rel.stdout:
++        return set()
++    parts = rel.stdout.decode("utf-8", errors="replace").split("\x00")
++    dirty: set = set()
++    i = 0
++    while i < len(parts):
++        entry = parts[i]
++        i += 1
++        if not entry or len(entry) < 4 or entry[2] != " ":
++            continue
++        path = entry[3:]
++        # In -z mode, rename/copy entries report "<XY> <orig>\0<new>"; the
++        # next non-empty part is the destination. For everything else, the
++        # path is everything after "XY ".
++        if entry[1] in ("R", "C") and i < len(parts) and parts[i]:
++            path = parts[i]
++            i += 1
++        path = path.strip()
++        if path.startswith('"') and path.endswith('"'):
++            path = path[1:-1].replace('\\"', '"').replace('\\\\', '\\')
++        if path:
++            dirty.add(path)
++    return dirty
++
++
++def _restore_root_surface_leak(root: str, pre_dirty: set) -> list:
++    """Revert in-surface leaks: paths that were clean at snapshot time but
++    became dirty during the run.
++
++    Tracked paths → `git checkout HEAD -- <path>` (in-surface only).
++    Untracked files → `os.remove` (only the file itself, never a dir).
++
++    Paths the operator already had dirty pre-run (`pre_dirty`) are NEVER
++    touched — a concurrent hand-edit on a self-improve iter is the
++    operator's choice, not a leak. Out-of-surface paths are invisible to
++    this function (the snapshot never included them).
++
++    Returns the sorted list of paths that were reverted, for logging.
++    """
++    post = _root_surface_dirty(root)
++    leaked = post - pre_dirty
++    if not leaked:
++        return []
++    reverted: list = []
++    for path in sorted(leaked):
++        # Defense in depth — the snapshot is bounded by _ROOT_SURFACE_DIRS,
++        # so a path here is by construction inside the surface, but reject
++        # anything that slipped through (e.g. an absolute path or a `..`).
++        if not any(path == d or path.startswith(d + "/") for d in _ROOT_SURFACE_DIRS):
++            continue
++        abs_path = os.path.join(root, path)
++        if not os.path.exists(abs_path):
++            continue
++        is_tracked = subprocess.run(
++            ["git", "-C", root, "ls-files", "--error-unmatch", "--", path],
++            capture_output=True,
++        ).returncode == 0
++        ok = False
++        if is_tracked:
++            ok = subprocess.run(
++                ["git", "-C", root, "checkout", "HEAD", "--", path],
++                capture_output=True,
++            ).returncode == 0
++        else:
++            # Untracked single files only — never rm -r. An untracked dir
++            # left by the iter is rare and the conservative choice is to
++            # leave it for the operator to clean up; the leak guard's job
++            # is to revert the obvious case, not to delete directories.
++            if os.path.isfile(abs_path):
++                try:
++                    os.remove(abs_path)
++                    ok = True
++                except OSError:
++                    ok = False
++        if ok:
++            reverted.append(path)
++    return reverted
++
++
+ def main(argv=None, *, root=None, dispatch=None) -> int:
+     argv = list(sys.argv[1:] if argv is None else argv)
+     root = root or os.environ.get("MINI_ORK_ROOT") or os.path.dirname(
+@@ -445,6 +557,14 @@ logs, code paths, benchmark deltas, and arXiv references).
+         subprocess.run(["git", "-C", root, "branch", "-D", branch], capture_output=True)
+         return 0, it
+ 
++    # Surface-scoped leak snapshot. The iter's worktree lives under
++    # home/worktrees/... but the iter's edits have been observed leaking
++    # into the parent checkout (root) on rejected runs; this captures the
++    # exact set of paths that were dirty on the improvable surface BEFORE
++    # dispatch, so the post-iter restore can tell which clean→dirty diffs
++    # belong to the iter vs. the operator's prior hand-edits.
++    pre_dirty = _root_surface_dirty(root)
++
+     # dispatch (seam)
+     exec_log = os.path.join(run_dir, "execute.log")
+     time_left = hard_deadline - int(time.time())
+@@ -515,6 +635,18 @@ logs, code paths, benchmark deltas, and arXiv references).
+         with open(os.path.join(run_dir, "patches", f"iter-{it}.diff"), "wb") as fh:
+             subprocess.run(["git", "-C", wt_path, "diff"], stdout=fh, stderr=subprocess.DEVNULL)
+ 
++    # Surface-scoped leak restore. A successful iter with auto_merge
++    # intentionally modifies root (the merge IS the delivery), so the
++    # restore runs only on non-success outcomes — that's the exact case
++    # the kickoff names ("a rejected iteration could leave modified
++    # tracked files and stray untracked files in main"). Logging the
++    # restored paths gives an audit trail for any future leak triage.
++    if outcome != "success":
++        leaked = _restore_root_surface_leak(root, pre_dirty)
++        if leaked:
++            print(f"  [iter] restored {len(leaked)} leaked surface path(s): "
++                  f"{', '.join(leaked)}")
++
+     subprocess.run(["git", "-C", root, "worktree", "remove", "--force", wt_path], capture_output=True)
+     record_run(db, run_id, it, outcome, notes, wt_path, branch, soft_deadline, hard_deadline)
+     return 0, it
+diff --git a/tests/unit/test_mini_ork_self_improve_py.py b/tests/unit/test_mini_ork_self_improve_py.py
+index 8ae2096d..41ffdb71 100644
+--- a/tests/unit/test_mini_ork_self_improve_py.py
++++ b/tests/unit/test_mini_ork_self_improve_py.py
+@@ -115,3 +115,51 @@ def test_record_success(tmp_path):
+     assert "old|1|meta|old row|superseded" in got
+     # the new resolved row references the iteration's branch
+     assert "run-7|3|" in got and "resolved" in got
++
++
++# ── surface-scoped leak guard ──
++
++def test_restore_root_surface_leak(tmp_path):
++    """Surface-scoped leak guard: only paths clean pre-run AND inside the
++    improvable surface get reverted. Operator pre-dirty WIP and out-of-
++    surface changes are untouched.
++    """
++    # Build a tiny mini-ork-shaped repo: git init, surface dirs, an outside
++    # file, an operator WIP. Commit baseline so `git status` is meaningful.
++    repo = tmp_path / "repo"; repo.mkdir()
++    subprocess.run(["git", "init", "-q", str(repo)], check=True)
++    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True)
++    subprocess.run(["git", "-C", str(repo), "config", "user.name", "t"], check=True)
++    for d in ("mini_ork", "recipes", "schemas", "tests", "docs"):
++        (repo / d).mkdir()
++    (repo / "mini_ork" / "a.py").write_text("# baseline a\n")
++    (repo / "recipes" / "r.yaml").write_text("# baseline r\n")
++    (repo / "tests" / "t.py").write_text("# baseline t\n")
++    (repo / "docs" / "notes.md").write_text("# baseline docs\n")
++    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
++    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "baseline"], check=True)
++
++    # Operator WIP — already dirty pre-run; MUST NOT be reverted.
++    (repo / "mini_ork" / "wip.py").write_text("# operator WIP\n")
++
++    # Snapshot pre-dispatch state (must include the WIP).
++    pre = si._root_surface_dirty(str(repo))
++    assert "mini_ork/wip.py" in pre
++
++    # Simulate three leaks during the iter:
++    # 1. tracked mutation inside surface (a.py modified)
++    (repo / "mini_ork" / "a.py").write_text("# LEAK: iter mutated a\n")
++    # 2. untracked file inside surface (new b.py)
++    (repo / "mini_ork" / "b.py").write_text("# LEAK: iter dropped b\n")
++    # 3. out-of-surface operator edit (docs/notes.md) — must NOT be reverted.
++    (repo / "docs" / "notes.md").write_text("# out-of-surface operator edit\n")
++
++    # Run the leak guard.
++    reverted = si._restore_root_surface_leak(str(repo), pre)
++
++    # The two in-surface leaks are reverted; WIP + out-of-surface untouched.
++    assert reverted == ["mini_ork/a.py", "mini_ork/b.py"]
++    assert (repo / "mini_ork" / "a.py").read_text() == "# baseline a\n"
++    assert not (repo / "mini_ork" / "b.py").exists()
++    assert (repo / "mini_ork" / "wip.py").read_text() == "# operator WIP\n"
++    assert (repo / "docs" / "notes.md").read_text() == "# out-of-surface operator edit\n"

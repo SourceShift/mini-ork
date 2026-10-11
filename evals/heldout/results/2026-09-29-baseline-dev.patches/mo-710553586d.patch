@@ -1,0 +1,36 @@
+diff --git a/recipes/frontier-llm-research/verifiers/assemble-aggregation.sh b/recipes/frontier-llm-research/verifiers/assemble-aggregation.sh
+index a54ab1c0..2e739d2e 100755
+--- a/recipes/frontier-llm-research/verifiers/assemble-aggregation.sh
++++ b/recipes/frontier-llm-research/verifiers/assemble-aggregation.sh
+@@ -19,3 +19,4 @@ fi
+ python3 "$RECIPE_DIR/lib/research_pipeline.py" assemble "${summaries[@]}" \
+   --techniques "$INPUT_DIR/unified_techniques/unified-techniques.md" \
+   --output "$RUN_DIR/aggregation.md"
++printf '%s\n' '{"verifier":"frontier-research-aggregation","pass":true}'
+diff --git a/recipes/frontier-llm-research/verifiers/collect-latest-libwit.sh b/recipes/frontier-llm-research/verifiers/collect-latest-libwit.sh
+index b6f73931..e344c7f0 100755
+--- a/recipes/frontier-llm-research/verifiers/collect-latest-libwit.sh
++++ b/recipes/frontier-llm-research/verifiers/collect-latest-libwit.sh
+@@ -8,3 +8,4 @@ RUN_DIR="${MINI_ORK_RUN_DIR:?MINI_ORK_RUN_DIR required}"
+ python3 "$RECIPE_DIR/lib/research_pipeline.py" collect \
+   --plan "$RECIPE_DIR/collection-plan.json" \
+   --output "$RUN_DIR/source-corpus.json"
++printf '%s\n' '{"verifier":"frontier-research-collection","pass":true}'
+diff --git a/recipes/frontier-llm-research/verifiers/prepare-technique-rollup.sh b/recipes/frontier-llm-research/verifiers/prepare-technique-rollup.sh
+index 1b02fae1..07283dda 100755
+--- a/recipes/frontier-llm-research/verifiers/prepare-technique-rollup.sh
++++ b/recipes/frontier-llm-research/verifiers/prepare-technique-rollup.sh
+@@ -18,3 +18,4 @@ fi
+ 
+ python3 "$RECIPE_DIR/lib/research_pipeline.py" rollup "${inputs[@]}" \
+   --output "$RUN_DIR/technique-rollup.json"
++printf '%s\n' '{"verifier":"frontier-research-rollup","pass":true}'
+diff --git a/recipes/frontier-llm-research/verifiers/shard-corpus.sh b/recipes/frontier-llm-research/verifiers/shard-corpus.sh
+index 52371899..de418cb6 100755
+--- a/recipes/frontier-llm-research/verifiers/shard-corpus.sh
++++ b/recipes/frontier-llm-research/verifiers/shard-corpus.sh
+@@ -18,3 +18,4 @@ python3 "$RECIPE_DIR/lib/research_pipeline.py" shard \
+   --output "$RUN_DIR/shards/source-shard-08.json" \
+   --output "$RUN_DIR/shards/source-shard-09.json" \
+   --output "$RUN_DIR/shards/source-shard-10.json"
++printf '%s\n' '{"verifier":"frontier-research-sharding","pass":true}'

@@ -1,0 +1,378 @@
+diff --git a/mini_ork/cli/execute_handlers.py b/mini_ork/cli/execute_handlers.py
+index 4e5e57a1..c6d4d63a 100644
+--- a/mini_ork/cli/execute_handlers.py
++++ b/mini_ork/cli/execute_handlers.py
+@@ -1099,6 +1099,106 @@ def _revert_working_tree(root: str, run_dir: str) -> bool:
+     return True
+ 
+ 
++def _revert_inplace_diff(root: str, run_dir: str) -> bool:
++    """``keep_run_artifacts_discard_worktree`` compensation (in-place recipes).
++
++    Reverses the run's own ``framework-edit.diff`` so the next serial epic
++    starts from a clean base. The in-place agent may leave any mix of states
++    (tracked edits, untracked creates, staged-but-not-committed, partial
++    reverts), so the restore is per-path and state-agnostic:
++
++      * paths present in HEAD → ``git checkout HEAD -- <path>`` resets BOTH
++        the index entry AND the worktree content (a bare ``git apply -R``
++        only reverts worktree content and leaves the agent's staged entries
++        behind — observed live).
++      * created paths (absent from HEAD) → unstaged and unlinked.
++      * paths outside the recorded delta → never touched.
++
++    Containment check keeps a traversing diff path (``..``/absolute/
++    symlink-escape) from reaching outside ``MO_TARGET_CWD`` (the publisher's
++    OSS-leak guard, identical to revert_branch). Run artifacts under
++    ``run_dir`` (diff, verdicts, logs) survive — the strategy's name states
++    the contract; discarding them would defeat the point of the recipe's own
++    artifact_contract.
++    """
++    def log(msg):
++        print(msg, file=sys.stderr, flush=True)
++
++    files: list[str] = _run_changed_files(run_dir)
++    if not files:
++        log("  [rollback] keep_run_artifacts_discard_worktree: no files_changed recorded — working tree untouched")
++        return True
++    target_repo = context_env("MO_TARGET_CWD", "")
++    if not target_repo:
++        try:
++            target_repo = subprocess.check_output(
++                ["git", "-C", root or ".", "rev-parse", "--show-toplevel"],
++                stderr=subprocess.DEVNULL).decode().strip()
++        except Exception:
++            target_repo = root or "."
++    real_root = os.path.realpath(target_repo)
++    restored, removed, rejected = [], [], []
++    for raw in files:
++        ap = raw if os.path.isabs(raw) else os.path.join(real_root, raw)
++        real = os.path.realpath(ap)
++        # Containment check: a traversing diff path (``../foo``, an absolute
++        # path outside the target, a symlink whose target escapes) must be
++        # refused before any destructive operation, mirroring the publisher's
++        # OSS-leak guard so the two readers of the same files agree.
++        if real != real_root and not real.startswith(real_root + os.sep):
++            rejected.append(raw)
++            log(f"  [rollback] keep_run_artifacts_discard_worktree: reject-revert: "
++                f"path escapes target repo: {raw}")
++            continue
++        rel = os.path.relpath(real, real_root)
++        tracked = subprocess.run(
++            ["git", "-C", real_root, "ls-files", "--error-unmatch", "--", rel],
++            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
++        if tracked:
++            # ``git checkout HEAD -- <path>`` resets BOTH the index entry AND
++            # the worktree content — a bare ``git apply -R`` would only
++            # revert worktree content and leave the agent's staged entries
++            # behind (which would then re-apply on the next checkout).
++            rc = subprocess.run(
++                ["git", "-C", real_root, "checkout", "HEAD", "--", rel],
++                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
++            if rc == 0:
++                restored.append(rel)
++            else:
++                rejected.append(raw)
++        else:
++            # Implementer-created file (absent from HEAD): unstage any
++            # leftover index entry, then unlink.
++            try:
++                subprocess.run(
++                    ["git", "-C", real_root, "rm", "--cached", "--ignore-unmatch", "--", rel],
++                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++            except Exception:
++                pass
++            try:
++                if os.path.isfile(real):
++                    os.remove(real)
++                    removed.append(rel)
++                elif os.path.isdir(real):
++                    # Never recursively delete: a created directory whose
++                    # contents were never staged could be live work the
++                    # operator placed there. Report and skip.
++                    log(f"  [rollback] keep_run_artifacts_discard_worktree: skipping non-empty "
++                        f"created dir (likely operator work): {raw}")
++                    rejected.append(raw)
++            except OSError:
++                rejected.append(raw)
++    log(f"  [rollback] keep_run_artifacts_discard_worktree: restored {len(restored)} tracked file(s), "
++        f"removed {len(removed)} created file(s), rejected {len(rejected)}; run artifacts preserved")
++    leftover = subprocess.run(
++        ["git", "-C", real_root, "status", "--porcelain", "--", *files],
++        capture_output=True, text=True).stdout.strip()
++    if leftover:
++        log(f"  [warn] rollback: leftover changes after keep_run_artifacts_discard_worktree:\n{leftover}")
++        return False
++    return True
++
++
+ def _handle_rollback(ctx: NodeDispatch):
+     # F4: bash (:3205-3223) does a best-effort version_rollback (workflow then
+     # agent), succeeds regardless of whether a prior version exists, sets
+@@ -1141,19 +1241,35 @@ def _handle_rollback(ctx: NodeDispatch):
+     # nowhere — fix-tracker M3). Version-registry rollback handles DB state;
+     # revert_branch handles FILE state. rc contract unchanged: the rollback
+     # node always succeeds and reports, it never re-fails the run.
+-    if _rollback_strategy(ctx.workflow) == "revert_branch":
+-        # Outer-loop verification override: when an OUTER driver owns the
+-        # authoritative gate (goal-loop: deploy -> regen -> DB flip), the
+-        # in-sandbox reviewer is both redundant and evidence-starved, so a
+-        # revert_branch here would DESTROY the implementer's verified edit
+-        # before the real gate ever tests it. The driver sets this flag to
+-        # keep FILE state (the version-registry/DB rollback above still runs).
+-        if context_env("MINI_ORK_ROLLBACK_KEEP_WORKTREE", "").strip().lower() in ("1", "true", "yes"):
+-            print("  [ok] rollback: MINI_ORK_ROLLBACK_KEEP_WORKTREE set — preserving working-tree "
+-                  "edit (an outer loop owns verification; an in-sandbox revert would destroy the fix)",
+-                  file=sys.stderr, flush=True)
+-        else:
++    # MINI_ORK_ROLLBACK_KEEP_WORKTREE is hoisted ABOVE strategy dispatch:
++    # in a closed RSI loop the authoritative gate is downstream (deploy -> regen
++    # -> DB flip) and tests the FILE state the implementer produced, so an
++    # in-sandbox revert would destroy a verified-correct edit before the real
++    # gate ever sees it. The flag covers BOTH strategies, not just revert_branch,
++    # so the in-place branch honours it too.
++    keep_worktree = context_env("MINI_ORK_ROLLBACK_KEEP_WORKTREE", "").strip().lower() in ("1", "true", "yes")
++    if keep_worktree:
++        print("  [ok] rollback: MINI_ORK_ROLLBACK_KEEP_WORKTREE set — preserving working-tree "
++              "edit (an outer loop owns verification; an in-sandbox revert would destroy the fix)",
++              file=sys.stderr, flush=True)
++    else:
++        strategy = _rollback_strategy(ctx.workflow)
++        if strategy == "revert_branch":
+             _revert_working_tree(ctx.root, ctx.run_dir_eff or ctx.run_dir)
++        elif strategy == "keep_run_artifacts_discard_worktree":
++            # In-place recipes (framework-edit, self-migrate) edit MO_TARGET_CWD
++            # directly: the rolled-back run leaves the harvested diff sitting in
++            # the target tree, so the next serial epic starts from a dirty base
++            # and its reviewer diff sweeps in the dead run's work. Revert just
++            # this run's delta — run artifacts (diff, verdicts, logs) survive.
++            _revert_inplace_diff(ctx.root, ctx.run_dir_eff or ctx.run_dir)
++        elif strategy:
++            # Unknown strategy declared in workflow.yaml — surface it, don't
++            # silently fall back to revert_branch (which would override an
++            # operator's explicit in-place choice with a worktree strategy).
++            print(f"  [warn] rollback: unknown strategy '{strategy}' — leaving working tree "
++                  "untouched (declared in workflow but no implementation)",
++                  file=sys.stderr, flush=True)
+     print("  [ok] rollback complete")
+     # NOTE: bash traces NO rollback node (:3205-3223 has no _trace_write_node_rich).
+     # Tracing it with status=success would write a spurious +1-reward execution_traces
+diff --git a/mini_ork/cli/main.py b/mini_ork/cli/main.py
+index a89d574d..7914f8bf 100644
+--- a/mini_ork/cli/main.py
++++ b/mini_ork/cli/main.py
+@@ -126,6 +126,15 @@ Environment:
+   MINI_ORK_HOME   project home dir  (default: .mini-ork/)
+   MINI_ORK_DB     sqlite3 state db  (default: $MINI_ORK_HOME/state.db)
+   MINI_ORK_DRY_RUN  set to 1 for dry-run mode on all subcommands
++
++Config seams (path overrides — survive `git reset --hard` on the engine):
++  MINI_ORK_PROVIDERS  Override path for providers.yaml (default: $MINI_ORK_HOME/config/providers.yaml)
++                      Honoured by dispatch/providers.py AND mini-ork validate.
++  MINI_ORK_AGENTS     Override path for agents.yaml (default: $MINI_ORK_HOME/config/agents.yaml)
++                      Honoured by mini-ork validate (check 3) and the coalition gate.
++                      web/recipes.py:load_lanes takes an explicit `home` parameter
++                      and does NOT consult MINI_ORK_AGENTS — callers pass home
++                      directly to point it at the consumer's config.
+ """
+ 
+ 
+diff --git a/mini_ork/cli/validate.py b/mini_ork/cli/validate.py
+index 147a16e6..0c3b51a1 100644
+--- a/mini_ork/cli/validate.py
++++ b/mini_ork/cli/validate.py
+@@ -234,12 +234,19 @@ def _check_recipe(root: str, recipe: str, findings: Findings) -> None:
+ # $MINI_ORK_ROOT/config/agents.yaml (config_resolve precedence).
+ # ─────────────────────────────────────────────────────────────────────────────
+ def _check_agents_yaml(root: str, home: str, findings: Findings) -> None:
+-    agents_yaml = ""
+-    for candidate in (os.path.join(home, "config", "agents.yaml"),
++    # MINI_ORK_AGENTS is the seam that lets a consumer point the engine at a
++    # vendored copy of agents.yaml so lane policy survives `git reset --hard`
++    # inside the upstream checkout. Honour it BEFORE the home/root fallback so
++    # the env override always wins (same precedence as MINI_ORK_PROVIDERS).
++    agents_yaml = (os.environ.get("MINI_ORK_AGENTS") or "").strip()
++    for candidate in (agents_yaml,
++                      os.path.join(home, "config", "agents.yaml"),
+                       os.path.join(root, "config", "agents.yaml")):
+-        if os.path.isfile(candidate):
++        if candidate and os.path.isfile(candidate):
+             agents_yaml = candidate
+             break
++    else:
++        agents_yaml = ""
+     if agents_yaml:
+         if not _valid_yaml(agents_yaml):
+             findings.error(
+@@ -248,8 +255,9 @@ def _check_agents_yaml(root: str, home: str, findings: Findings) -> None:
+             )
+     else:
+         findings.warn(
+-            "no agents.yaml found in MINI_ORK_HOME/config or ENGINE_ROOT/config",
+-            "run 'mini-ork init' to seed default config",
++            "no agents.yaml found in $MINI_ORK_AGENTS, MINI_ORK_HOME/config, "
++            "or ENGINE_ROOT/config",
++            "run 'mini-ork init' to seed default config, or set MINI_ORK_AGENTS",
+         )
+ 
+ 
+@@ -257,11 +265,21 @@ def _check_agents_yaml(root: str, home: str, findings: Findings) -> None:
+ # Check 4 — secrets presence for executable lanes ($MINI_ORK_HOME/config/
+ # providers.yaml). A broken providers.yaml yields no warnings (bash heredoc
+ # stderr is discarded).
++#
++# MINI_ORK_PROVIDERS is honoured here so the validate step agrees with
++# dispatch/providers.py on which providers.yaml the engine will actually
++# read — without the seam the validate pass could resolve lanes against one
++# file while dispatch validated against another.
+ # ─────────────────────────────────────────────────────────────────────────────
+ def _check_provider_secrets(home: str, findings: Findings) -> None:
+     import yaml
+-    providers_yaml = os.path.join(home, "config", "providers.yaml")
+-    if not os.path.isfile(providers_yaml):
++    override = (os.environ.get("MINI_ORK_PROVIDERS") or "").strip()
++    providers_yaml = ""
++    for candidate in (override, os.path.join(home, "config", "providers.yaml")):
++        if candidate and os.path.isfile(candidate):
++            providers_yaml = candidate
++            break
++    if not providers_yaml:
+         return
+     try:
+         with open(providers_yaml) as f:
+diff --git a/mini_ork/gates/native_gates.py b/mini_ork/gates/native_gates.py
+index 16af0986..2e67eeda 100644
+--- a/mini_ork/gates/native_gates.py
++++ b/mini_ork/gates/native_gates.py
+@@ -114,8 +114,14 @@ def _eval_coalition(
+         # native port lives in observability/topology_metrics.py.
+         rho = topology_metrics.measure_rho(db_path, panel_run_id)
+         root = mini_ork_root or os.environ.get("MINI_ORK_ROOT", "")
++        # MINI_ORK_AGENTS is the seam that lets a consumer point the engine
++        # at a vendored agents.yaml so lane policy survives a `reset --hard`
++        # of the upstream checkout. Honour it BEFORE the root/config fallback
++        # so the consumer's config always wins (parity with dispatch/providers'
++        # MINI_ORK_PROVIDERS handling).
+         agents_yaml = (
+-            os.path.join(root, "config", "agents.yaml") if root else None
++            os.environ.get("MINI_ORK_AGENTS")
++            or (os.path.join(root, "config", "agents.yaml") if root else None)
+         )
+         payload, _rc = coalition_gate.check_panel_coalition(
+             panel_run_id, recipe, rho=rho, db=db_path, agents_yaml=agents_yaml
+diff --git a/tests/test_recovery_closure.py b/tests/test_recovery_closure.py
+index 8224b0bf..2af67fbc 100644
+--- a/tests/test_recovery_closure.py
++++ b/tests/test_recovery_closure.py
+@@ -461,6 +461,13 @@ def test_execute_loop_dispatches_only_closure(
+     MINI_ORK_RECOVERY_CLOSURE set must call dispatch_fn ONLY for the
+     closure nodes. The mocked LLM records every node it sees; the test
+     asserts no ancestor of the closure root fires.
++
++    The fixture points the in-place implementer at a fresh scratch git
++    repo via ``MO_TARGET_CWD`` and has the mock LLM write a real file
++    there. Without the real edit surface, a framework-edit implementer
++    that "changes no file" would pass this test — the exact behaviour
++    the ground-truth harvest exists to forbid. Node identity still comes
++    from ``MO_NODE_ID``, so ``seen == ["D"]`` is preserved.
+     """
+     run_id = "run-exec-001"
+     recipe = "framework-edit"
+@@ -478,41 +485,70 @@ def test_execute_loop_dispatches_only_closure(
+         str(workflow), run_id, db_path, run_dir,
+         recipe=recipe, task_class=tc, strategy="resume",
+     )
+-    os.environ["MINI_ORK_RUN_ID"] = run_id
+-    os.environ["MINI_ORK_RECIPE"] = recipe
+-    os.environ["MINI_ORK_TASK_CLASS"] = tc
+-    os.environ["MINI_ORK_HOME"] = str(tmp_path)
+-    os.environ["MINI_ORK_DB"] = db_path
+-    os.environ["MINI_ORK_RUN_DIR"] = run_dir
+-    os.environ["MINI_ORK_WORKFLOW"] = str(workflow)
+-    os.environ["MINI_ORK_RECOVERY_FROM"] = plan.first_node or ""
+-    os.environ["MINI_ORK_RECOVERY_CLOSURE"] = " ".join(sorted(plan.closure))
+-    os.environ["MINI_ORK_RECOVERY_RUN_ID"] = run_id
+-    os.environ["MINI_ORK_RECOVERY_SKU"] = plan.sku
+-
+-    # Dispatch seam records the node_id passed to the LLM. The
+-    # researcher / implementer / reviewer paths all funnel through
+-    # this; assert that ONLY D is observed.
++    # Create a scratch git repo so the in-place implementer has a real
++    # edit surface. The harvest reads MO_TARGET_CWD; without a real
++    # writable tree the framework-edit diff derivation can fall back to
++    # the engine checkout (the [cwd] codex target: line in
++    # implementer.log), so the test was previously reading the wrong tree
++    # entirely — a falsified success.
++    target_repo = tmp_path / "target"
++    target_repo.mkdir()
++    subprocess.run(["git", "init", "-q", str(target_repo)], check=True)
++    subprocess.run(["git", "-C", str(target_repo), "config", "user.email", "t@t"], check=True)
++    subprocess.run(["git", "-C", str(target_repo), "config", "user.name", "t"], check=True)
++    (target_repo / "seed.txt").write_text("baseline\n")
++    subprocess.run(["git", "-C", str(target_repo), "add", "seed.txt"], check=True)
++    subprocess.run(["git", "-C", str(target_repo), "commit", "-q", "-m", "seed"], check=True)
++
++    # MO_TARGET_CWD is set via monkeypatch rather than the raw
++    # os.environ the surrounding lines use: a leaked MO_TARGET_CWD
++    # would silently retarget a later test's harvest — the kickoff's
++    # exact concern. monkeypatch unwinds it on teardown.
++    monkeypatch.setenv("MO_TARGET_CWD", str(target_repo))
++    monkeypatch.setenv("MINI_ORK_RUN_ID", run_id)
++    monkeypatch.setenv("MINI_ORK_RECIPE", recipe)
++    monkeypatch.setenv("MINI_ORK_TASK_CLASS", tc)
++    monkeypatch.setenv("MINI_ORK_HOME", str(tmp_path))
++    monkeypatch.setenv("MINI_ORK_DB", db_path)
++    monkeypatch.setenv("MINI_ORK_RUN_DIR", run_dir)
++    monkeypatch.setenv("MINI_ORK_WORKFLOW", str(workflow))
++    monkeypatch.setenv("MINI_ORK_RECOVERY_FROM", plan.first_node or "")
++    monkeypatch.setenv("MINI_ORK_RECOVERY_CLOSURE", " ".join(sorted(plan.closure)))
++    monkeypatch.setenv("MINI_ORK_RECOVERY_RUN_ID", run_id)
++    monkeypatch.setenv("MINI_ORK_RECOVERY_SKU", plan.sku)
++
++    # Dispatch seam records the node_id passed to the LLM AND writes
++    # the implementer's actual edit (D's only path in the closure).
++    # An implementer that writes nothing now fails the ground-truth
++    # harvest in execute.py with `impl_no_changes` — the test's
++    # assertion of `rc == 0` then fails too. Without the file write
++    # the test would silently green-light the exact theatre mode the
++    # ground-truth harvest exists to prevent.
+     seen: list[str] = []
+ 
+     def fake_dispatch(task_class, node_type, prompt):
+-        # The LLM seam receives the prompt; we recover node_id from
+-        # the env (set by dispatch_node as MO_NODE_ID). Args unused —
+-        # the closure filter is the property under test, not the
+-        # prompt shape.
+         del task_class, node_type, prompt
+-        seen.append(os.environ.get("MO_NODE_ID", "?"))
+-        return 0, f"fake-output-for-{os.environ.get('MO_NODE_ID', '?')}"
+-
+-    # The planner + verifier (researcher / reviewer / etc) write to
+-    # disk; fake_dispatch returns text only. The execute loop's
+-    # dispatch_node writes a small marker artifact so is_node_reusable
+-    # could rerun. We don't need checkpoint behavior here — just the
+-    # closure filter.
++        node_id = os.environ.get("MO_NODE_ID", "?")
++        seen.append(node_id)
++        # An in-place implementer edits MO_TARGET_CWD directly. Write
++        # the closure node's (D) edit so the harvest has something
++        # truthful to diff against.
++        if node_id == "D":
++            (Path(os.environ["MO_TARGET_CWD"]) / "D-edit.txt").write_text(
++                f"implementer-output-for-{node_id}\n"
++            )
++        return 0, f"fake-output-for-{node_id}"
++
+     rc = mex.main([], dispatch_fn=fake_dispatch)
+     # Closure is {D}; only D should appear in `seen`.
+     assert seen == ["D"], f"seen={seen}"
+     assert rc == 0, f"rc={rc}"
++    # The implementer's edit landed in the scratch target — a falsifier:
++    # drop this assertion's setup (the file write) and a future ground-
++    # truth harvest change will fail the run with `impl_no_changes`
++    # rather than silently passing a no-op as a green test.
++    assert (target_repo / "D-edit.txt").is_file(), \
++        "implementer edit missing from MO_TARGET_CWD"
+ 
+ 
+ def test_execute_loop_no_dispatch_with_status_only(

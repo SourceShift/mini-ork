@@ -1,0 +1,250 @@
+diff --git a/bin/mini-ork-epics b/bin/mini-ork-epics
+index 89f63bfc..06902a10 100755
+--- a/bin/mini-ork-epics
++++ b/bin/mini-ork-epics
+@@ -83,11 +83,18 @@ DEP_PATTERNS = (
+     r"^\s*(?:-\s+)?(?:depends on|blocked by|after|requires|should follow|prefer after|related to|see also|context)\s*:.*$"
+ )
+ DEP_RE = re.compile(DEP_PATTERNS, re.I)
++# Heading markers that opt the heading (and its body) OUT of epic parsing.
++# Backward-compatible: existing roadmaps without these markers behave as before.
++NO_EPIC_MARKERS = ("(no-epic)", "(context)", "(ignore)")
+ 
+ def slugify(title: str) -> str:
+     s = re.sub(r"[^a-z0-9-]+", "-", title.lower().strip()).strip("-")
+     return s or "epic"
+ 
++def is_skippable_heading(title: str) -> bool:
++    t = title.rstrip()
++    return any(t.endswith(m) for m in NO_EPIC_MARKERS)
++
+ def extract_path_hints(body):
+     """Find backtick'd file paths in the body; treat as scope hints."""
+     paths = re.findall(r"`([a-z_][\w./-]*\.(?:sh|py|sql|md|yaml|yml|json|ts|tsx|js|jsx))`", body, re.I)
+@@ -122,6 +129,10 @@ for raw in text.splitlines():
+     m = EPIC_RE.match(raw)
+     if m:
+         title, explicit_id = m.group(1).strip(), (m.group(2) or "").strip()
++        if is_skippable_heading(title):
++            # Marked heading + body must be skipped entirely.
++            cur = None
++            continue
+         eid = explicit_id or slugify(title)
+         cur = {"id": eid, "title": title, "body": []}
+         epics.append(cur)
+@@ -225,17 +236,53 @@ DEP_RES = {
+     "soft": re.compile(r"^\s*(?:-\s+)?(?:should follow|prefer after)\s*:\s*(.+)$", re.I),
+     "informational": re.compile(r"^\s*(?:-\s+)?(?:related to|see also|context)\s*:\s*(.+)$", re.I),
+ }
++# Heading markers that opt the heading (and its body) OUT of epic parsing.
++# Backward-compatible: existing roadmaps without these markers behave as before.
++NO_EPIC_MARKERS = ("(no-epic)", "(context)", "(ignore)")
+ 
+ def slugify(title: str) -> str:
+     s = re.sub(r"[^a-z0-9-]+", "-", title.lower().strip()).strip("-")
+     return s or "epic"
+ 
++def is_skippable_heading(title: str) -> bool:
++    t = title.rstrip()
++    return any(t.endswith(m) for m in NO_EPIC_MARKERS)
++
++def resolve_dep_token(token: str, known_ids):
++    """Resolve a dep token to a real epic id.
++
++    Strategies, in order: exact -> slug-exact -> unique slug-prefix ->
++    unique slug-substring. Returns the resolved id, or None if the token
++    is unresolved or ambiguous (multiple matches at any strategy).
++    """
++    if token in known_ids:
++        return token
++    tok_slug = slugify(token)
++    slug_matches = [eid for eid in known_ids if slugify(eid) == tok_slug]
++    if len(slug_matches) == 1:
++        return slug_matches[0]
++    if len(slug_matches) > 1:
++        return None
++    prefix_matches = [eid for eid in known_ids if slugify(eid).startswith(tok_slug)]
++    if len(prefix_matches) == 1:
++        return prefix_matches[0]
++    if len(prefix_matches) > 1:
++        return None
++    substr_matches = [eid for eid in known_ids if tok_slug in slugify(eid)]
++    if len(substr_matches) == 1:
++        return substr_matches[0]
++    return None
++
+ epics = []  # (id, title, body_lines)
+ cur = None
+ for raw in text.splitlines():
+     m = EPIC_RE.match(raw)
+     if m:
+         title, explicit_id = m.group(1).strip(), (m.group(2) or "").strip()
++        if is_skippable_heading(title):
++            # Marked heading + body must be skipped entirely.
++            cur = None
++            continue
+         eid = explicit_id or slugify(title)
+         cur = {"id": eid, "title": title, "body": []}
+         epics.append(cur)
+@@ -258,7 +305,12 @@ epics = deduped
+ con = sqlite3.connect(db)
+ con.execute("PRAGMA busy_timeout=5000")
+ 
+-inserted, dep_count = 0, 0
++# known_ids spans parsed + existing epics so dep tokens can resolve across
++# both (e.g. "Epic 0" pointing at an existing slug "epic-0-restated").
++existing_ids = {r[0] for r in con.execute("SELECT id FROM epics").fetchall()}
++known_ids = {e["id"] for e in epics} | existing_ids
++
++inserted, dep_count, skipped = 0, 0, 0
+ for e in epics:
+     # 1. Upsert the epic row. New epics default to 'not started'; existing
+     #    rows are left alone (so re-ingest doesn't clobber in-flight state).
+@@ -275,20 +327,31 @@ for e in epics:
+             m = rgx.match(line)
+             if not m:
+                 continue
+-            for raw_dep in re.split(r"[,\s]+", m.group(1)):
++            # Split dep lists on commas ONLY — whitespace was splitting
++            # multi-word tokens like "Epic 0" into bogus pieces.
++            for raw_dep in m.group(1).split(","):
+                 dep = raw_dep.strip().strip("`")
+                 if not dep or dep == e["id"]:
+                     continue
++                resolved = resolve_dep_token(dep, known_ids)
++                if resolved is None:
++                    print(
++                        f"WARNING: unresolved dep '{dep}' in epic "
++                        f"'{e['id']}' ({kind}); skipped",
++                        file=sys.stderr,
++                    )
++                    skipped += 1
++                    continue
+                 try:
+                     con.execute(
+                         """INSERT OR IGNORE INTO epic_dependencies
+                             (from_epic_id, to_epic_id, kind)
+                             VALUES(?,?,?)""",
+-                        (dep, e["id"], kind),
++                        (resolved, e["id"], kind),
+                     )
+                     dep_count += 1
+                 except sqlite3.Error as err:
+-                    print(f"ingest: dep insert failed ({dep}->{e['id']}): {err}", file=sys.stderr)
++                    print(f"ingest: dep insert failed ({resolved}->{e['id']}): {err}", file=sys.stderr)
+ 
+ # 3. Auto-block any epic that has at least one unresolved hard dep AND is
+ #    currently 'not started' — the scheduler skips 'blocked' epics until
+@@ -303,7 +366,7 @@ con.execute("""
+        )
+ """)
+ con.commit()
+-print(f"ingest: {inserted} new epic(s), {dep_count} dep edge(s) processed")
++print(f"ingest: {inserted} new epic(s), {dep_count} dep edge(s) processed, {skipped} unresolved dep(s)")
+ PY
+ }
+ 
+diff --git a/mini_ork/ported/mini_ork_epics.py b/mini_ork/ported/mini_ork_epics.py
+index 9950424b..4db8331a 100644
+--- a/mini_ork/ported/mini_ork_epics.py
++++ b/mini_ork/ported/mini_ork_epics.py
+@@ -41,6 +41,40 @@ _DEP_RES = {
+ _DEP_ANY = re.compile(
+     r"^\s*(?:-\s+)?(?:depends on|blocked by|after|requires|should follow|prefer after|"
+     r"related to|see also|context)\s*:.*$", re.I)
++# Heading markers that opt the heading (and its body) OUT of epic parsing.
++# Backward-compatible: existing roadmaps without these markers behave as before.
++_NO_EPIC_MARKERS = ("(no-epic)", "(context)", "(ignore)")
++
++
++def _is_skippable_heading(title: str) -> bool:
++    t = title.rstrip()
++    return any(t.endswith(m) for m in _NO_EPIC_MARKERS)
++
++
++def _resolve_dep_token(token: str, known_ids) -> str | None:
++    """Resolve a dep token to a real epic id.
++
++    Strategies, in order: exact -> slug-exact -> unique slug-prefix ->
++    unique slug-substring. Returns the resolved id, or None if the token
++    is unresolved or ambiguous (multiple matches at any strategy).
++    """
++    if token in known_ids:
++        return token
++    tok_slug = _slugify(token)
++    slug_matches = [eid for eid in known_ids if _slugify(eid) == tok_slug]
++    if len(slug_matches) == 1:
++        return slug_matches[0]
++    if len(slug_matches) > 1:
++        return None
++    prefix_matches = [eid for eid in known_ids if _slugify(eid).startswith(tok_slug)]
++    if len(prefix_matches) == 1:
++        return prefix_matches[0]
++    if len(prefix_matches) > 1:
++        return None
++    substr_matches = [eid for eid in known_ids if tok_slug in _slugify(eid)]
++    if len(substr_matches) == 1:
++        return substr_matches[0]
++    return None
+ 
+ 
+ def _resolve_db(db):
+@@ -59,6 +93,10 @@ def _parse_epics(text: str):
+         m = _EPIC_RE.match(raw)
+         if m:
+             title = m.group(1).strip()
++            if _is_skippable_heading(title):
++                # Marked heading + body must be skipped entirely.
++                cur = None
++                continue
+             eid = (m.group(2) or "").strip() or _slugify(title)
+             cur = {"id": eid, "title": title, "body": []}
+             epics.append(cur)
+@@ -80,7 +118,9 @@ def ingest(roadmap: str, db: str) -> int:
+     if not epics:
+         sys.stderr.write("ingest: no '## <title>' headings found\n"); return 1
+     con = sqlite3.connect(db); con.execute("PRAGMA busy_timeout=5000")
+-    inserted = dep_count = 0
++    inserted = dep_count = skipped = 0
++    existing_ids = {r[0] for r in con.execute("SELECT id FROM epics").fetchall()}
++    known_ids = {e["id"] for e in epics} | existing_ids
+     for e in epics:
+         if not con.execute("SELECT id FROM epics WHERE id=?", (e["id"],)).fetchone():
+             con.execute("INSERT INTO epics(id, title, status) VALUES(?,?,'not started')",
+@@ -91,14 +131,23 @@ def ingest(roadmap: str, db: str) -> int:
+                 m = rgx.match(line)
+                 if not m:
+                     continue
+-                for raw_dep in re.split(r"[,\s]+", m.group(1)):
++                # Split dep lists on commas ONLY — whitespace was splitting
++                # multi-word tokens like "Epic 0" into bogus pieces.
++                for raw_dep in m.group(1).split(","):
+                     dep = raw_dep.strip().strip("`")
+                     if not dep or dep == e["id"]:
+                         continue
++                    resolved = _resolve_dep_token(dep, known_ids)
++                    if resolved is None:
++                        sys.stderr.write(
++                            f"WARNING: unresolved dep '{dep}' in epic "
++                            f"'{e['id']}' ({kind}); skipped\n")
++                        skipped += 1
++                        continue
+                     try:
+                         con.execute("INSERT OR IGNORE INTO epic_dependencies "
+                                     "(from_epic_id, to_epic_id, kind) VALUES(?,?,?)",
+-                                    (dep, e["id"], kind))
++                                    (resolved, e["id"], kind))
+                         dep_count += 1
+                     except sqlite3.Error:
+                         pass
+@@ -107,7 +156,9 @@ def ingest(roadmap: str, db: str) -> int:
+             SELECT DISTINCT to_epic_id FROM epic_dependencies
+              WHERE kind='hard' AND resolved_at IS NULL)""")
+     con.commit(); con.close()
+-    sys.stdout.write(f"ingest: {inserted} new epic(s), {dep_count} dep edge(s) processed\n")
++    sys.stdout.write(
++        f"ingest: {inserted} new epic(s), {dep_count} dep edge(s) processed, "
++        f"{skipped} unresolved dep(s)\n")
+     return 0
+ 
+ 

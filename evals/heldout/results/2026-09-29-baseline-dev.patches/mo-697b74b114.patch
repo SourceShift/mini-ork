@@ -1,0 +1,246 @@
+diff --git a/config/agents.yaml b/config/agents.yaml
+index 48eff32d..ddb6f206 100644
+--- a/config/agents.yaml
++++ b/config/agents.yaml
+@@ -51,6 +51,14 @@ lanes:
+   # node.model_lane: minimax_lens (NOT auto-added to existing 4-lens
+   # workflows — that's a per-recipe cost-budget decision).
+   minimax_lens: minimax  # MiniMax (Anthropic-compatible gateway, M3)
++  # Dedicated judge lane for advisory eval nodes (recipes/code-fix workflow.yaml
++  # node `eval`). Split out of `reviewer` because the eval node's lane string is
++  # ALSO what reaches the judge: the node's resolved lane is published into
++  # MO_DISPATCH_CHAIN, which _default_llm_dispatch reads BEFORE the jury's
++  # per-juror lane argument — so a shared `reviewer` lane pinned the judge to
++  # Opus and made MO_EVAL_JURY_LANES inert. A distinct lane lets the judge run
++  # on a non-reviewer family and makes cross-family juries actually fire.
++  judge: minimax         # MiniMax-M3 — independent judge, never gates
+ budget:
+   per_epic_usd: 5.00
+   per_run_usd: 0.50
+diff --git a/mini_ork/cli/execute.py b/mini_ork/cli/execute.py
+index 3ef768cc..4770f8cd 100644
+--- a/mini_ork/cli/execute.py
++++ b/mini_ork/cli/execute.py
+@@ -1520,6 +1520,60 @@ def _write_self_migrate_implementer_summary(run_dir, target, impl_log, harvested
+         handle.write("\n")
+ 
+ 
++def _write_implementer_summary(run_dir, target, impl_log):
++    """Materialize the implementer-summary.json the publisher's commit gate reads.
++
++    Only self-migrate had a writer, so every other recipe (code-fix included) left
++    the file absent — publisher._publisher_try_commit_files then found no
++    files_changed and skipped the commit, meaning a passing run could never
++    publish. Derive the list from the working tree instead of trusting the model's
++    self-report, scoped by <run_dir>/pre-implementer-ref so a concurrent session's
++    pre-existing dirt is never swept into the commit (the same baseline
++    _assemble_reviewer_inputs uses for the reviewer diff). Untracked files are
++    included because a newly created file is exactly the kind of change the commit
++    must carry; anything under run_dir is excluded so run sidecars (which may live
++    inside an in-place target tree) can never be committed.
++    """
++    if not run_dir or not target:
++        return
++    baseline = ""
++    ref_path = os.path.join(run_dir, "pre-implementer-ref")
++    if os.path.isfile(ref_path):
++        try:
++            baseline = open(ref_path, encoding="utf-8").read().strip()
++        except OSError:
++            baseline = ""
++    under_run_dir = os.path.realpath(run_dir)
++    files: list[str] = []
++    try:
++        args = ["git", "-C", target, "diff", "--name-only"]
++        if baseline:
++            args.append(baseline)
++        rels: list[str] = []
++        for argv in (args, ["git", "-C", target, "ls-files", "--others", "--exclude-standard"]):
++            proc = subprocess.run(argv, capture_output=True, text=True, timeout=15)
++            if proc.returncode == 0:
++                rels.extend(line.strip() for line in proc.stdout.splitlines() if line.strip())
++        for rel in rels:
++            full = os.path.join(target, rel)
++            real = os.path.realpath(full)
++            if real == under_run_dir or real.startswith(under_run_dir + os.sep):
++                continue
++            if real not in files:
++                files.append(real)
++    except Exception:
++        files = []
++    payload = {
++        "status": "implemented",
++        "worktree_path": target,
++        "files_changed": files,
++        "implementation_log": impl_log,
++    }
++    with open(os.path.join(run_dir, "implementer-summary.json"), "w", encoding="utf-8") as handle:
++        json.dump(payload, handle, indent=2)
++        handle.write("\n")
++
++
+ def _assemble_reviewer_inputs(run_dir):
+     """F2-B (bash _mo_assemble_reviewer_inputs:182-275). Build the reviewer input block:
+     implementer-summary.json + verifier_{typecheck,test}.json + a generated
+diff --git a/mini_ork/cli/execute_handlers.py b/mini_ork/cli/execute_handlers.py
+index 424bc3b7..83280e8e 100644
+--- a/mini_ork/cli/execute_handlers.py
++++ b/mini_ork/cli/execute_handlers.py
+@@ -70,6 +70,7 @@ _run_verifier_ref = _execute_delegate("_run_verifier_ref")
+ _synth_artifact_name = _execute_delegate("_synth_artifact_name")
+ _verifier_runs_before_implementer = _execute_delegate("_verifier_runs_before_implementer")
+ _watchdog_stale_heartbeat = _execute_delegate("_watchdog_stale_heartbeat")
++_write_implementer_summary = _execute_delegate("_write_implementer_summary")
+ _write_self_migrate_implementer_summary = _execute_delegate(
+     "_write_self_migrate_implementer_summary"
+ )
+@@ -604,6 +605,8 @@ def _handle_implementer(ctx: NodeDispatch):
+         _write_self_migrate_implementer_summary(
+             ctx.run_dir_eff, target, impl_log, harvested
+         )
++    else:
++        _write_implementer_summary(ctx.run_dir_eff, target, impl_log)
+     if not ctx.publish_declared_outputs():
+         ctx.trace(ctx.node_id, "failure", "implementer", impl_log, "", "artifact_contract")
+         return 1, "artifact_contract"
+@@ -665,6 +668,19 @@ def _handle_reviewer(ctx: NodeDispatch):
+         return 1, "artifact_contract"
+     verdict = _extract_verdict(ctx.root, review_file)
+     print(f"  [info] reviewer verdict={verdict} → {review_file}")
++    # Hand the verdict to the publisher through run_dir, NOT the environment: nodes
++    # execute in a ProcessPoolExecutor (cli/execute.py), so a publish_env write in
++    # this worker dies with the worker and the publisher's own process observes
++    # nothing — REVIEW_FILE/VERDICT read as "" there, which silently skipped every
++    # commit. publisher._publisher_try_commit_files already scans run_dir for
++    # panel-verdict.json / review-verdict.json; this is that missing writer, and
++    # run_dir is the one surface that actually crosses the process split.
++    try:
++        with open(os.path.join(ctx.run_dir, "review-verdict.json"), "w",
++                  encoding="utf-8") as handle:
++            json.dump({"verdict": verdict}, handle)
++    except OSError:
++        pass
+     vn = verdict.lower()
+     if is_synth:  # true synth only — panel gate falls through to the verdict gate
+         # BUG6: a synthesizer produces a document, not a pass/fail verdict, so
+diff --git a/mini_ork/cli/publisher.py b/mini_ork/cli/publisher.py
+index d657bb3d..01781422 100644
+--- a/mini_ork/cli/publisher.py
++++ b/mini_ork/cli/publisher.py
+@@ -55,9 +55,15 @@ def _publisher_try_commit_files(root, target_repo, run_dir, review_file, verdict
+             continue
+         if not isinstance(data, dict):
+             continue
+-        if data.get("pass") is True or str(data.get("verdict", "")).strip().lower() in {"approve", "approved", "pass"}:
++        seen = str(data.get("verdict", "")).strip().lower()
++        if data.get("pass") is True or seen in {"approve", "approved", "pass"}:
+             verdict = "approve"
+             break
++        # Keep a non-approving verdict for the skip message below. Reporting
++        # '<none>' when a reviewer DID return verdict='fail' reads as "no verdict
++        # found at all" and sends the reader hunting a missing file that is present.
++        if seen and not verdict:
++            verdict = seen
+     if verdict != "approve" and review_file and root:
+         try:
+             out = subprocess.check_output(
+diff --git a/recipes/code-fix/workflow.yaml b/recipes/code-fix/workflow.yaml
+index 75f06270..d06a8142 100644
+--- a/recipes/code-fix/workflow.yaml
++++ b/recipes/code-fix/workflow.yaml
+@@ -53,11 +53,14 @@ nodes:
+   # Advisory per-run graded eval (roadmap Step-3). Trajectory-aware LLM judge
+   # → reward_source='eval@v1' on execution_traces. NEVER gates: it always
+   # succeeds (falls open to the rubric/PRM heuristic when the judge is
+-  # unavailable), so it does not escalate to rollback. Reuses the reviewer lane
+-  # for now; a dedicated independent judge lane is the Phase-1 improvement.
++  # unavailable), so it does not escalate to rollback. Runs on the dedicated
++  # `judge` lane (agents.yaml) rather than `reviewer`: the node's resolved lane
++  # is what gets published into MO_DISPATCH_CHAIN, which the dispatcher reads
++  # ahead of any per-juror lane argument — sharing `reviewer` silently pinned
++  # the judge to Opus and made MO_EVAL_JURY_LANES inert.
+   - name: eval
+     type: eval
+-    model_lane: reviewer
++    model_lane: judge
+     prompt_ref: prompts/eval.md
+     dispatch_mode: serial
+     tools:
+diff --git a/tests/unit/test_mini_ork_execute_py.py b/tests/unit/test_mini_ork_execute_py.py
+index 51bf2ecc..a0a9f1cc 100644
+--- a/tests/unit/test_mini_ork_execute_py.py
++++ b/tests/unit/test_mini_ork_execute_py.py
+@@ -503,6 +503,10 @@ def test_live_implementer_applies_diff(tmp_path, monkeypatch):
+     assert rc == 0 and fr == "done"
+     assert (rd / "impl-impl1.log").read_text() == _DIFF_LOG
+     assert (repo / "app.py").read_text() == "x = 1\ny = 2\n"   # diff applied to clean tree
++    # The publisher's commit gate reads files_changed from this file; before this
++    # only self-migrate wrote one, so code-fix runs could never commit.
++    summary = json.loads((rd / "implementer-summary.json").read_text())
++    assert summary["files_changed"] == [os.path.realpath(repo / "app.py")]
+ 
+ 
+ def test_live_reviewer_verdict_gate(tmp_path):
+@@ -513,9 +517,13 @@ def test_live_reviewer_verdict_gate(tmp_path):
+     rc_pass, _ = ex.dispatch_node(_fields("rev1", "reviewer", "opus"),
+                                   dispatch_fn=_fake('{"verdict": "pass"}'), **common)
+     assert rc_pass == 0
++    # Nodes run in a ProcessPoolExecutor, so env-based handoff dies with the worker;
++    # the verdict must land in run_dir for the publisher's process to observe it.
++    assert json.loads((rd / "review-verdict.json").read_text()) == {"verdict": "pass"}
+     rc_fail, fr_fail = ex.dispatch_node(_fields("rev2", "reviewer", "opus"),
+                                         dispatch_fn=_fake('{"verdict": "fail"}'), **common)
+     assert rc_fail == 1 and fr_fail == "verdict_fail"
++    assert json.loads((rd / "review-verdict.json").read_text()) == {"verdict": "fail"}
+     rc_rev, fr_rev = ex.dispatch_node(_fields("rev3", "reviewer", "opus"),
+                                       dispatch_fn=_fake('{"verdict": "needs_revision"}'), **common)
+     assert rc_rev == 1 and fr_rev == "verdict_revise"
+@@ -731,6 +739,48 @@ def test_publisher_commit_rejects_unapproved_or_outside_paths(tmp_path):
+     ).strip() == base_head
+ 
+ 
++def test_code_fix_publish_seam_survives_the_process_split(tmp_path, monkeypatch):
++    # End-to-end through the real seam: implementer → reviewer → publisher with
++    # review_file="" and verdict_env="" — exactly what the publisher sees in
++    # production, because nodes run in a ProcessPoolExecutor and any env-based
++    # handoff dies with the reviewer's worker process. Before the run_dir handoff
++    # the publisher resolved '<none>' here and skipped every code-fix commit.
++    db = _seed_db(tmp_path, "seam"); _seed_task_run(db)
++    rd = tmp_path / "run"; rd.mkdir()
++    repo = _git_repo(tmp_path / "seam-repo")
++    monkeypatch.setenv("MO_TARGET_CWD", str(repo))
++    common = dict(root=str(REPO), run_dir=str(rd), plan_path=_plan(tmp_path),
++                  task_class="code_fix", db=db, run_id="r1")
++
++    rc_impl, _ = ex.dispatch_node(_fields("impl1", "implementer", "codex"),
++                                  dispatch_fn=_fake(_DIFF_LOG), **common)
++    assert rc_impl == 0
++    rc_rev, _ = ex.dispatch_node(_fields("rev1", "reviewer", "opus"),
++                                 dispatch_fn=_fake('{"verdict": "pass"}'), **common)
++    assert rc_rev == 0
++
++    assert ex._publisher_try_commit_files(
++        str(REPO), str(repo), str(rd), "", "", "code-fix", "implementer", "run-seam",
++    ) is True
++    committed = subprocess.check_output(
++        ["git", "-C", str(repo), "show", "--name-only", "--format=", "HEAD"], text=True,
++    ).splitlines()
++    assert committed == ["app.py"]
++
++
++def test_publisher_skip_message_names_the_actual_verdict(tmp_path, capsys):
++    # A reviewer that DID return verdict='fail' must not be reported as '<none>' —
++    # that reads as "no verdict found at all" and sends the reader hunting a file
++    # that is present.
++    repo = _git_repo(tmp_path / "fail-repo")
++    run_dir = tmp_path / "fail-run"; run_dir.mkdir()
++    (run_dir / "review-verdict.json").write_text('{"verdict": "fail"}\n')
++    assert ex._publisher_try_commit_files(
++        str(REPO), str(repo), str(run_dir), "", "", "code-fix", "implementer", "run-fail",
++    ) is False
++    assert "resolved: 'fail'" in capsys.readouterr().err
++
++
+ def test_reviewer_input_assembly_preserves_summary_verifiers_and_diff(tmp_path):
+     repo = _git_repo(tmp_path / "review-repo")
+     (repo / "app.py").write_text("x = 2\n")

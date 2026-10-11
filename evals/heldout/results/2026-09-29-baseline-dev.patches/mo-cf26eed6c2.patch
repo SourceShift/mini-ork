@@ -1,0 +1,36 @@
+diff --git a/recipes/rsi-technique-review/lib/rsi_review.py b/recipes/rsi-technique-review/lib/rsi_review.py
+index bf05f97e..97c181b8 100755
+--- a/recipes/rsi-technique-review/lib/rsi_review.py
++++ b/recipes/rsi-technique-review/lib/rsi_review.py
+@@ -26,7 +26,18 @@ GROUP_COUNT = 10
+ VERDICTS = ("implement-now", "next", "watch", "skip")
+ NOVELTY = ("new", "extends", "already-shipped")
+ EFFORT_WEIGHT = {"S": 1.0, "M": 1.5, "L": 2.5}
+-ARXIV_ID = re.compile(r"arxiv:\d{4}\.\d{4,5}")
++ARXIV_ID = re.compile(r"arxiv:\d{4}\.\d{4,5}(?:v\d+)?")
++ARXIV_VERSION_SUFFIX = re.compile(r"v\d+$")
++
++
++def _arxiv_canonical(arxiv_id: str) -> str:
++    """Strip an optional trailing version (v1, v2, …) for forgiving comparison.
++
++    LibWit corpus source_ids sometimes keep the version suffix (`arxiv:2604.05112v1`)
++    while report prose refers to the same paper without it (`arxiv:2604.05112`).
++    Normalising both sides avoids flagging a real citation as absent.
++    """
++    return ARXIV_VERSION_SUFFIX.sub("", arxiv_id)
+ 
+ 
+ class ReviewError(RuntimeError):
+@@ -430,7 +441,10 @@ def verify(final_path: Path, merged_path: Path, corpus_path: Path) -> None:
+     if len(groups) != GROUP_COUNT:
+         raise ReviewError(f"final review lists {len(groups)} groups, expected {GROUP_COUNT}")
+     cited = set(ARXIV_ID.findall(text))
+-    unknown = sorted(cited - set(corpus))
++    # Normalise on both sides so a citation in the report (with or without v1/v2/…)
++    # matches the corpus source_id even when only one of the two carries the suffix.
++    corpus_canonical = {_arxiv_canonical(cid) for cid in corpus}
++    unknown = sorted(cid for cid in cited if _arxiv_canonical(cid) not in corpus_canonical)
+     if unknown:
+         raise ReviewError(f"final review cites {len(unknown)} ids absent from the corpus: {', '.join(unknown[:10])}")
+     known_ids = {r["id"] for r in merged["ranked"]}

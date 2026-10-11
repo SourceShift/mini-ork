@@ -1,0 +1,19 @@
+diff --git a/mini_ork/learning/probe_scorer.py b/mini_ork/learning/probe_scorer.py
+index 744f3440..2e3a3181 100644
+--- a/mini_ork/learning/probe_scorer.py
++++ b/mini_ork/learning/probe_scorer.py
+@@ -83,7 +83,13 @@ def _launch_run(recipe_name: str, kickoff: str) -> tuple[str, str, float]:
+         timeout_s = float(os.environ.get("MO_APPLY_PROBE_TIMEOUT_S", "600"))
+     except ValueError:
+         timeout_s = 600.0
+-    env = {**os.environ, "MINI_ORK_ROOT": root, "MINI_ORK_NONINTERACTIVE": "1"}
++    # Probe runs MUST freeze the plan: a stochastic planner failure inside the
++    # nested launch (rc=65 looks_like_json) kills a random arm and fabricates
++    # regression signal. recipe_fallback_plan renders the temp recipe's
++    # workflow.yaml deterministically with zero LLM. Inherit MO_STATIC_RECIPE_PLAN
++    # from the parent so an operator can explicitly opt out (MO_STATIC_RECIPE_PLAN=0).
++    env = {**os.environ, "MINI_ORK_ROOT": root, "MINI_ORK_NONINTERACTIVE": "1",
++           "MO_STATIC_RECIPE_PLAN": os.environ.get("MO_STATIC_RECIPE_PLAN", "1")}
+     # Run-scoped env must NOT leak into the probe launch: an inherited
+     # MINI_ORK_RUN_ID makes the nested run REUSE this run's task_runs row
+     # (outcome attribution then reads the wrong status), inherited

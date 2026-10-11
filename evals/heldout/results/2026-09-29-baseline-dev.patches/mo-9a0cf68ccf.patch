@@ -1,0 +1,18 @@
+diff --git a/mini_ork/cli/main.py b/mini_ork/cli/main.py
+index 28a6cb71..a00ff1d4 100644
+--- a/mini_ork/cli/main.py
++++ b/mini_ork/cli/main.py
+@@ -452,7 +452,12 @@ def _run_lifecycle(argv, root) -> int:
+             pass
+ 
+     # ── rubric pre-screen (advisory, native side-channel) ──
+-    if os.environ.get("MO_RUBRIC", "1") == "1" and _run_dir and os.path.isdir(_run_dir):
++    # Skipped in dry runs (MINI_ORK_DRY_RUN=1) since rubric scoring writes
++    # durable trace/db side-effects and would corrupt CI integration runs
++    # where MINI_ORK_DRY_RUN is forced to 1 globally.
++    if (os.environ.get("MO_RUBRIC", "1") == "1"
++            and os.environ.get("MINI_ORK_DRY_RUN", "0") != "1"
++            and _run_dir and os.path.isdir(_run_dir)):
+         sys.stdout.write("── rubric (advisory pre-screen) ──\n")
+         try:
+             # The parity port contains real print() calls; keep the launcher's

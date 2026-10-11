@@ -1,0 +1,20 @@
+{
+  "mo-9a0cf68ccf": {
+    "cost_usd": 0.0,
+    "difficulty": "easy",
+    "failed_ids": [],
+    "passed": true,
+    "seconds": 0.045809542294591665,
+    "solver_rc": 0,
+    "weak_signal": true
+  },
+  "mo-ccda47b494": {
+    "cost_usd": 0.0,
+    "difficulty": "easy",
+    "failed_ids": [],
+    "passed": true,
+    "seconds": 0.27600758289918303,
+    "solver_rc": 0,
+    "weak_signal": false
+  }
+}

@@ -1,0 +1,100 @@
+diff --git a/mini_ork/web/agents.py b/mini_ork/web/agents.py
+index 871cc871..c7dda9bd 100644
+--- a/mini_ork/web/agents.py
++++ b/mini_ork/web/agents.py
+@@ -18,6 +18,7 @@ from __future__ import annotations
+ 
+ import json
+ import os
++import re
+ from pathlib import Path
+ from typing import Any
+ 
+@@ -27,6 +28,27 @@ from .db import StateDB
+ # task_runs.status values after which no node can possibly still be running.
+ _TERMINAL_RUN_STATUSES = {"published", "rolled_back", "failed"}
+ 
++# Strip operator-session <z-insight> protocol blocks at the render layer.
++# lib/llm-dispatch.sh strips the same shape at write time for new runs;
++# transcripts persisted before that fix still carry the blocks and the
++# UI must never render them.
++_Z_INSIGHT_PAIR_RE = re.compile(r"<z-insight>.*?</z-insight>", re.DOTALL)
++_Z_INSIGHT_TAIL_RE = re.compile(r"<z-insight>.*\Z", re.DOTALL)
++
++
++def _strip_z_insight(text: str | None) -> str | None:
++    """Remove <z-insight>...</z-insight> protocol blocks from rendered text.
++
++    Defensive: returns the input untouched when it is empty or already free
++    of the marker, so the common path stays cheap. Mirrors the sanitizer in
++    lib/llm-dispatch.sh so persisted transcripts and current writes agree.
++    """
++    if not text or "<z-insight>" not in text:
++        return text
++    text = _Z_INSIGHT_PAIR_RE.sub("", text)
++    text = _Z_INSIGHT_TAIL_RE.sub("", text)
++    return text.rstrip()
++
+ 
+ def _dispatcher_alive(home: Path, task_run_id: str) -> bool:
+     """Probe the dispatcher .pid written by bin/mini-ork-execute. Missing
+@@ -231,6 +253,9 @@ def load_transcript(home: Path, task_run_id: str, node_id: str) -> dict[str, Any
+                 payload["transcript_path"] = str(path.relative_to(home))
+                 payload["available"] = True
+                 payload.setdefault("turns", [])
++                for turn in payload["turns"]:
++                    if isinstance(turn, dict) and "text" in turn:
++                        turn["text"] = _strip_z_insight(turn["text"])
+                 return payload
+             except (OSError, json.JSONDecodeError) as e:
+                 return {"turns": [], "available": False, "reason": f"parse error: {e}"}
+@@ -257,7 +282,7 @@ def load_transcript(home: Path, task_run_id: str, node_id: str) -> dict[str, Any
+                     "model": None,
+                     "input_tokens": 0,
+                     "output_tokens": 0,
+-                    "text": text,
++                    "text": _strip_z_insight(text),
+                     "tool_uses": [],
+                     "cache_read_input_tokens": 0,
+                     "cache_creation_input_tokens": 0,
+@@ -346,6 +371,31 @@ def agent_detail(
+             (task_run_id, f"%{node_id}%", node_id),
+         )
+ 
++    transcript = load_transcript(home, task_run_id, node_id)
++
++    # Backfill zero-token transcripts from the llm_calls ledger. Executable
++    # lanes (codex, etc.) harvest real per-turn usage into llm_calls, but
++    # the pre-fix fallback transcript writer recorded zeros — so the UI
++    # showed '— in / — out' for runs that did have cost+usage. When the
++    # transcript has turns but every turn is zero-tokened and the ledger
++    # has rows for this node, assign the aggregated totals to the first
++    # turn and tag the source so the UI can render the provenance.
++    if transcript.get("available") and transcript.get("turns") and llm_rows:
++        turns = transcript["turns"]
++        if all(
++            isinstance(t, dict)
++            and int(t.get("input_tokens") or 0) == 0
++            and int(t.get("output_tokens") or 0) == 0
++            for t in turns
++        ):
++            total_in = sum(int(r.get("input_tokens") or 0) for r in llm_rows)
++            total_out = sum(int(r.get("output_tokens") or 0) for r in llm_rows)
++            if total_in or total_out:
++                first = turns[0]
++                first["input_tokens"] = total_in
++                first["output_tokens"] = total_out
++                transcript["tokens_source"] = "llm_calls"
++
+     return {
+         "task_run_id": task_run_id,
+         "node": node,
+@@ -357,7 +407,7 @@ def agent_detail(
+         "prompt": {"path": prompt_path, "content": prompt_text},
+         "artifacts": artifact_payloads,
+         "llm_calls": llm_rows,
+-        "transcript": load_transcript(home, task_run_id, node_id),
++        "transcript": transcript,
+         "children": children,
+     }
+ 

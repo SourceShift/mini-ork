@@ -1,0 +1,118 @@
+diff --git a/mini_ork/cli/publisher.py b/mini_ork/cli/publisher.py
+index 72c66511..f0e6aab2 100644
+--- a/mini_ork/cli/publisher.py
++++ b/mini_ork/cli/publisher.py
+@@ -21,6 +21,21 @@ def set_status(db, run_id, new_status):  # late binding — avoids the execute<-
+     from mini_ork.cli.execute import set_status as _impl  # noqa: PLC0415
+     return _impl(db, run_id, new_status)
+ 
++def _recipe_root(root: str) -> str:
++    """Base dir for recipe assets (artifact_contract). main.py resolves a
++    recipe against the MINI_ORK_HOME overlay when a consumer symlinks a
++    private recipe there (MINI_ORK_ROOT still points at the primary checkout)
++    and threads the winning base via MINI_ORK_RECIPE_ROOT. Honor it so every
++    recipe-asset read in this module matches where the recipe was found;
++    absent (dev checkouts), fall back to root unchanged.
++
++    Mirrors ``mini_ork.cli.execute._recipe_root`` and
++    ``mini_ork.cli.execute_handlers._recipe_root`` — duplicated here because
++    ``cli.execute`` imports from this module (cycle), so a shared helper can't
++    live in either place without late-binding indirection.
++    """
++    return os.environ.get("MINI_ORK_RECIPE_ROOT") or root
++
+ def _envsubst(s):
+     """B2-C: envsubst-equivalent — expand $VAR / ${VAR} from the environment, BLANKING
+     unset vars (os.path.expandvars leaves them literal, which commits garbage
+@@ -168,8 +183,11 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
+         if not ok:
+             print("  [BLOCK] publisher: panel verdict is not approved — publish refused", file=sys.stderr)
+             return 1, "verdict_fail"
+-    # ── artifact contract
+-    contract = os.path.join(root, "recipes", recipe, "artifact_contract.yaml") if recipe else ""
++    # ── artifact contract — resolve via MINI_ORK_RECIPE_ROOT so a consumer's
++    # MINI_ORK_HOME overlay wins over the engine's stale recipe copy. main.py
++    # threads the env var when it finds the recipe in the overlay; absent,
++    # fall back to the engine root (dev checkouts).
++    contract = os.path.join(_recipe_root(root), "recipes", recipe, "artifact_contract.yaml") if recipe else ""
+     if not contract or not os.path.isfile(contract):
+         print(f"  [warn] publisher: no artifact_contract.yaml at {contract} — skipping", file=sys.stderr)
+         return 0, "done"
+diff --git a/recipes/chapter-review/artifact_contract.yaml b/recipes/chapter-review/artifact_contract.yaml
+index 82dfa74a..b09c7b5c 100644
+--- a/recipes/chapter-review/artifact_contract.yaml
++++ b/recipes/chapter-review/artifact_contract.yaml
+@@ -10,12 +10,15 @@ rollback_policy: >
+   individually consumable and can be re-synthesized without re-running
+   lenses.
+ 
+-# v0.2-pt9 (D-037): source_artifact names the input files staged into
+-# $MINI_ORK_RUN_DIR by the dispatcher. outputs[] lists the canonical
+-# artifact the publisher writes + git-commits.
+-source_artifact:
+-  - chapter.md
+-  - context.json
+-  - style_blueprint.md   # optional; dispatcher omits if absent
+-outputs:
+-  - chapter-review.json
++# chapter-review is an aggregation recipe: lens score JSONs and the panel
++# synthesis are produced in-place under $MINI_ORK_RUN_DIR by their producers,
++# not synthesized from a single source file. outputs[] is therefore empty
++# so the publisher takes the M1 in-place implementer-commit branch
++# (_publisher_try_commit_files) instead of the source_artifact -> outputs[]
++# copy. source_artifact MUST be a single string here — a list would crash
++# _envsubst()'s re.sub() with "expected string or bytes-like object, got
++# 'list'" inside a ProcessPool child whose traceback never surfaces to the
++# parent (D-037 v0.2-pt9 landmine; regression for the researcher's overlay
++# carrying a list-valued source_artifact).
++source_artifact: chapter-review.json
++outputs: []
+\ No newline at end of file
+diff --git a/tests/unit/test_mini_ork_execute_py.py b/tests/unit/test_mini_ork_execute_py.py
+index 1b298f9f..ee9b61da 100644
+--- a/tests/unit/test_mini_ork_execute_py.py
++++ b/tests/unit/test_mini_ork_execute_py.py
+@@ -491,6 +491,43 @@ def test_synth_artifact_name_list_raises_clear_error_not_typeerror(tmp_path):
+         ex._synth_artifact_name(str(tmp_path), "bad")
+ 
+ 
++def test_engine_chapter_review_contract_is_single_string_source_artifact():
++    # The engine checkout's copy was the stale D-037 list form while the
++    # consumer overlay carried the fix. Keep them aligned: a list-valued
++    # source_artifact is unrecoverable in the publisher's ProcessPool child, so
++    # a standalone run (no MINI_ORK_RECIPE_ROOT overlay) must not be a landmine.
++    d = yaml.safe_load(
++        (REPO / "recipes" / "chapter-review" / "artifact_contract.yaml").read_text()
++    )
++    assert isinstance(d["source_artifact"], str)
++    assert d["outputs"] == []
++
++
++def test_publisher_contract_honors_recipe_root_overlay(tmp_path, monkeypatch):
++    # Live regression (2026-09-20): publisher_node joined `root` (the engine
++    # checkout) directly, so it read the STALE contract even though main.py had
++    # resolved the recipe against the consumer overlay and threaded that base
++    # via MINI_ORK_RECIPE_ROOT. The stale list-valued source_artifact then died
++    # in _envsubst (TypeError inside the ProcessPool child) and the whole run
++    # failed its exit_code!==0 gate — while the synthesis and both verifiers
++    # passed, so the passing rubric was discarded and rubric_status never flipped.
++    engine = tmp_path / "engine"
++    _write_contract(engine, "chapter-review",
++                    "source_artifact:\n  - chapter.md\n  - context.json\n"
++                    "outputs:\n  - chapter-review.json\n")
++    overlay = tmp_path / "overlay"
++    _write_contract(overlay, "chapter-review",
++                    "source_artifact: chapter-review.json\noutputs: []\n")
++    rd = tmp_path / "run"; rd.mkdir()
++    monkeypatch.setenv("MINI_ORK_RECIPE_ROOT", str(overlay))
++    monkeypatch.setenv("MO_ORACLE_GATES_AUTO", "0")
++    db = _seed_db(tmp_path, "pub"); _seed_task_run(db)
++    rc, fr = ex.publisher_node(
++        str(engine), str(rd), db, "r1", "chapter-review", "chapter_review",
++        review_file="", verdict_env="")
++    assert (rc, fr) == (0, "done")
++
++
+ def test_live_implementer_applies_diff(tmp_path, monkeypatch):
+     db = _seed_db(tmp_path, "i"); _seed_task_run(db)
+     rd = tmp_path / "run"; rd.mkdir()
