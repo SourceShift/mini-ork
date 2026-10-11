@@ -52,6 +52,7 @@ pub fn glyph(key: &str) -> &'static str {
         "context" => "◫",
         "nodes" => "⬡",
         "setup" => "⚙",
+        "features" => "◈",
         _ => "◇",
     }
 }
@@ -70,6 +71,7 @@ pub fn default_label(key: &str) -> &'static str {
         "context" => "Context",
         "nodes" => "Nodes",
         "setup" => "Setup & health",
+        "features" => "Features",
         _ => "mini-ork",
     }
 }
