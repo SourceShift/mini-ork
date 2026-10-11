@@ -3217,6 +3217,18 @@ def _make_checkpoint_fn(db, run_id, run_dir, recipe, task_class):
                 provider_session_id = open(_sc).read().strip()
             except OSError:
                 provider_session_id = ""
+        # (E3 liveness) A recover-owned closure can outlive the 15-min lease
+        # TTL (the 2026-10-10 session-task-judge recover fenced out its
+        # synthesizer checkpoint for exactly that reason). Refresh the lease
+        # just before the fenced publish: refresh is token-identity keyed, so
+        # a live holder extends cleanly, while a lease stolen by a newer
+        # worker no-ops and the fence below rejects — the §7 invariant holds.
+        if owner_token:
+            try:
+                from mini_ork.stores.lease import refresh_lease
+                refresh_lease(db, run_id, owner_token)
+            except Exception:  # noqa: BLE001 — refresh is best-effort; fence decides
+                pass
         mc.write_checkpoint(
             db, run_id, node_id,
             status="success", input_hash=input_hash,

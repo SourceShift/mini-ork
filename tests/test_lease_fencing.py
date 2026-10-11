@@ -139,11 +139,24 @@ def test_expired_lease_can_be_stolen(db_path):
     assert lease.current_lease(db_path, "run1")["owner_token"] == "B"
 
 
-def test_refresh_live_true_expired_false(db_path):
+def test_refresh_live_and_lapsed_both_extend(db_path):
     lease.acquire_lease(db_path, "run1", owner_token="A", ttl_s=100, now=1000)
     assert lease.refresh_lease(db_path, "run1", "A", ttl_s=100, now=1050) is True
-    # after expiry the holder has lost it → refresh fails
-    assert lease.refresh_lease(db_path, "run1", "A", ttl_s=100, now=5000) is False
+    # a lapsed-but-never-stolen lease is still OURS: a recovery closure can
+    # outlive the TTL (2026-10-10 session-task-judge recover lost its
+    # synthesizer checkpoint to exactly that lapse), so refresh is keyed on
+    # token identity, not wall-clock liveness. A steal rewrites owner_token —
+    # pinned separately below.
+    assert lease.refresh_lease(db_path, "run1", "A", ttl_s=100, now=5000) is True
+    assert lease.is_lease_holder(db_path, "run1", "A", now=5050) is True
+
+
+def test_refresh_after_steal_returns_false(db_path):
+    lease.acquire_lease(db_path, "run1", owner_token="A", ttl_s=10, now=1000)  # expires 1010
+    assert lease.acquire_lease(db_path, "run1", owner_token="B", ttl_s=100, now=2000) == "B"
+    # the stale worker cannot resurrect itself over the live recovery
+    assert lease.refresh_lease(db_path, "run1", "A", ttl_s=100, now=2010) is False
+    assert lease.current_lease(db_path, "run1")["owner_token"] == "B"
 
 
 def test_release_only_by_holder(db_path):

@@ -193,8 +193,16 @@ def acquire_lease(
 def refresh_lease(
     db: str, run_id: str, owner_token: str, *, ttl_s: int = DEFAULT_LEASE_TTL_S, now: Optional[int] = None
 ) -> bool:
-    """Extend the lease while still alive. False if the token is not the live
-    holder (expired or superseded) — the caller has lost ownership."""
+    """Extend the lease while the row still names this token.
+
+    Refresh is keyed on token IDENTITY, not wall-clock liveness: an
+    expired-but-never-stolen lease is still ours to extend (a recovery
+    closure can outlive the 15-min TTL — the 2026-10-10 session-task-judge
+    recover lost its synthesizer checkpoint to exactly that lapse). False
+    when the caller has genuinely lost ownership — the row is gone,
+    released, or was re-acquired by a newer worker (its token differs).
+    A stale worker therefore cannot resurrect itself over live work: a
+    steal rewrites ``owner_token``, and this refresh no-ops."""
     if not db or not run_id or not owner_token:
         return False
     ts = _now(now)
@@ -204,8 +212,8 @@ def refresh_lease(
         try:
             cur = con.execute(
                 "UPDATE run_leases SET expires_at=?, renewed_at=? "
-                "WHERE run_id=? AND owner_token=? AND expires_at>?",
-                (exp, ts, run_id, owner_token, ts),
+                "WHERE run_id=? AND owner_token=?",
+                (exp, ts, run_id, owner_token),
             )
             con.commit()
             return cur.rowcount == 1
