@@ -376,12 +376,10 @@ def promotion_evaluate(
             # cross-detector trustworthiness audit (hack_probe, metric_anchor,
             # gate_fuzzer) flags the grader. A rejected decision is never
             # flipped upward; the audit only acts on the promote branch.
-            # Opt-out via MO_PROMOTION_VERIFIER_AUDIT=0.
-            try:
-                audit_enabled = os.environ.get(
-                    "MO_PROMOTION_VERIFIER_AUDIT", "1") != "0"
-            except Exception:
-                audit_enabled = True
+            # Opt-out via MO_PROMOTION_VERIFIER_AUDIT=0. ``os.environ.get``
+            # cannot raise, so the default-ON contract is read directly.
+            audit_enabled = os.environ.get(
+                "MO_PROMOTION_VERIFIER_AUDIT", "1") != "0"
             if audit_enabled:
                 try:
                     from mini_ork.learning import verifier_audit

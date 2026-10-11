@@ -472,15 +472,14 @@ def test_audit_clean_collapse_history_no_flags(db):
     assert result["ok"] is True
     assert result["flags"] == []
     assert result["evidence"]["hack_probe"]["hacking"] is False
-    # metric_anchor: the projection populates ``scored`` / ``held_out`` /
-    # ``agreements`` per row from the row's own anchor (kickoff
-    # ``auto/rsi-i2b-audit-sensitivity.md`` rule #1), so ``n_with_anchor``
-    # counts every row. The balanced ``[True, False]`` agreement keeps
-    # ``discrimination = 0.5`` → above the vacuity floor → ``intact is
-    # True`` on a clean trajectory. The collapse signal lives in the
-    # ``collapse`` arm, not here.
-    assert result["evidence"]["metric_anchor"]["n_with_anchor"] == 8
-    assert result["evidence"]["metric_anchor"]["intact"] is True
+    # metric_anchor: ``collapse_history`` rows carry no per-probe
+    # ``scored`` / ``held_out`` / ``agreements`` lists (the table stores
+    # per-decision fractions only), so the projection leaves those fields
+    # absent and the detector's anti-fabrication contract reports
+    # ``intact is None`` — an unaudited metric must never read as an
+    # intact one. ``n_with_anchor == 0`` is the honest measurement.
+    assert result["evidence"]["metric_anchor"]["n_with_anchor"] == 0
+    assert result["evidence"]["metric_anchor"]["intact"] is None
     # The new ``collapse`` arm reads the same rows; healthy rows produce
     # ``recommendation="none"`` and contribute no flag.
     assert result["evidence"]["collapse"]["recommendation"] == "none"
@@ -535,15 +534,17 @@ def test_audit_flags_textbook_collapse_via_collapse_history(db):
     """The live-smoke fixture: 10 rows of ``score = 0.40 + 0.06*i``,
     ``anchor = 0.95 - 0.08*i`` (score rising, anchor falling).
 
-    The kickoff's prior state returned ``ok=True, flags=[]`` because:
-      (a) ``_project_metric_row`` emitted ``scored=None, held_out=None``
-          → ``metric_anchor`` saw zero anchor measurements;
-      (b) the audit never wired ``collapse_detector.detect``, so the
-          breaker's ``recommendation="halt"`` had no echo in the audit.
+    The kickoff's prior state returned ``ok=True, flags=[]`` because the
+    audit never wired ``collapse_detector.detect``, so the breaker's
+    ``recommendation="halt"`` had no echo in the audit. ``metric_anchor``
+    also reported zero anchor measurements, but that is the detector's
+    anti-fabrication contract — ``collapse_history`` carries no per-probe
+    anchor lists, so it is preserved, not "fixed".
 
     After the I2b fix the audit:
-      * populates ``scored`` / ``held_out`` / ``agreements`` so
-        ``metric_anchor.audit`` reports ``n_with_anchor == 10``;
+      * keeps ``metric_anchor`` fail-open (``collapse_history`` carries no
+        per-probe anchor lists, so the anti-fabrication contract reports
+        ``intact is None`` / ``n_with_anchor == 0`` — no flag);
       * runs ``collapse_detector.detect`` on the same rows and trips
         ``recommendation == "halt"`` (half-split means: first-half
         score mean = 0.52, second-half = 0.82 → score_rise = +0.30;
@@ -568,9 +569,13 @@ def test_audit_flags_textbook_collapse_via_collapse_history(db):
     # produces on the projected rows); the test deliberately does not
     # require either way.
     assert "collapse" in result["flags"]
-    # The metric_anchor row projection populates every row's anchor
-    # fields so ``n_with_anchor == 10`` (kickoff rule #1).
-    assert result["evidence"]["metric_anchor"]["n_with_anchor"] == 10
+    # The metric_anchor row projection stays fail-open: ``collapse_history``
+    # stores per-decision fractions, not per-probe anchor lists, so the
+    # anti-fabrication contract reports ``intact is None`` and counts zero
+    # anchored rows. The collapse signal lives entirely in the ``collapse``
+    # arm below — never in a fabricated anchor.
+    assert result["evidence"]["metric_anchor"]["n_with_anchor"] == 0
+    assert result["evidence"]["metric_anchor"]["intact"] is None
     # The new collapse detector arm ran and reported the textbook halt.
     assert result["evidence"]["collapse"]["recommendation"] == "halt"
     assert result["evidence"]["collapse"]["divergence"] is True
@@ -588,12 +593,12 @@ def test_audit_clean_10row_collapse_history_no_flags(db):
     second_mean(anchor)`` is negative). ``divergence`` requires BOTH,
     so ``recommendation="none"`` and no flag.
 
-    ``metric_anchor`` reads the constant ``[True, False]`` agreements
-    → ``discrimination = 0.5`` for every row → above the vacuity
-    floor → ``intact is True`` → no flag. ``hack_probe`` sees the
-    visible score and the visible rise (anchor → core_pass) both
-    increasing, so ``level_gap`` and ``stagnation`` see no divergence
-    → ``hacking is False`` → no flag.
+    ``metric_anchor`` stays fail-open: ``collapse_history`` rows carry no
+    per-probe anchor lists, so the anti-fabrication contract reports
+    ``intact is None`` → no flag. ``hack_probe`` sees the visible score
+    and the visible rise (anchor → core_pass) both increasing, so
+    ``level_gap`` and ``stagnation`` see no divergence → ``hacking is
+    False`` → no flag.
     """
     _seed_workflow(db)
     _seed_collapse_history(
@@ -607,10 +612,11 @@ def test_audit_clean_10row_collapse_history_no_flags(db):
     assert result["ok"] is True
     assert result["flags"] == []
     assert result["evidence"]["hack_probe"]["hacking"] is False
-    # metric_anchor: full measurement set, clean anchor, non-vacuous
-    # discrimination → intact is True (not None as before the fix).
-    assert result["evidence"]["metric_anchor"]["n_with_anchor"] == 10
-    assert result["evidence"]["metric_anchor"]["intact"] is True
+    # metric_anchor: ``collapse_history`` carries no per-probe anchor
+    # lists, so the anti-fabrication contract keeps the arm fail-open —
+    # ``intact is None``, ``n_with_anchor == 0``, no flag.
+    assert result["evidence"]["metric_anchor"]["n_with_anchor"] == 0
+    assert result["evidence"]["metric_anchor"]["intact"] is None
     # collapse: anchor rising → anchor_drop < 0 → divergence False
     # → recommendation="none" (kickoff test #2).
     assert result["evidence"]["collapse"]["recommendation"] == "none"

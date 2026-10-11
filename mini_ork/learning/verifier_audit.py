@@ -153,56 +153,31 @@ def _project_hack_row(row: sqlite3.Row) -> dict:
     }
 
 
-_REFERENCE_HELD_OUT = tuple("abcdefghij")
-"""The paper's anchored reference set (matches ``REFERENCE_SIZE = 10`` at
-``metric_anchor.py:37``). ``collapse_history`` rows are per-decision
-fractions, not per-probe lists — the column doesn't carry a real held-out
-set. Each row's own ``anchor`` value IS the per-decision measurement
-that ``metric_anchor`` aggregates, so the row is its own measurement:
-``held_out`` is the reference set the detector compares against and
-``scored`` is the row's own ids that did NOT touch the reference. The
-two are disjoint → ``anchor_contaminated`` returns ``False``; ``len ==
-REFERENCE_SIZE`` → ``under_anchored`` returns ``False``. ``agreements``
-is a balanced pair (``[True, False]``) so ``discrimination = 0.5`` for
-every row — never ``0.0`` (which would render the detector vacuous at
-the floor regardless of the row's anchor trajectory)."""
-
-
 def _project_metric_row(row: sqlite3.Row) -> dict:
     """Project a ``collapse_history`` row onto the metric_anchor row shape.
 
-    The detector needs per-probe ``scored`` / ``held_out`` / ``agreements``
-    lists (metric_anchor.py:41-94). ``collapse_history`` stores the row's
-    own anchor fraction, so the projection materialises the row AS its
-    own measurement: the reference set the row is compared against is the
-    paper's 10-item set (``_REFERENCE_HELD_OUT``); the ids the row scored
-    are row-unique synthetic ids that don't intersect that reference; and
-    the agreements list is a balanced pair so ``discrimination = 0.5``
-    for every row regardless of the row's anchor value.
+    Structural fail-open contract (metric_anchor.py:19-25): "an unaudited
+    metric must never read as an intact one". The detector needs per-probe
+    ``scored`` / ``held_out`` / ``agreements`` lists; ``collapse_history``
+    stores per-decision fractions and does NOT carry those lists. We pass
+    the row through anyway so the detector's own fall-through path runs
+    cleanly, but the absent lists mean:
 
-    Result per row:
-      * ``anchor_contaminated`` → ``False`` (disjoint id sets)
-      * ``under_anchored`` → ``False`` (held_out length == REFERENCE_SIZE)
-      * ``discrimination`` → ``0.5`` (one True, one False)
-      * ``n_with_anchor`` rises from 0 → N for the audit's reader
+      * ``n_with_anchor = 0`` (no row has both ``scored`` and ``held_out``)
+      * ``intact = None`` (the ``anchor["n"] < MIN_GENERATIONS`` branch)
+      * ``undecided = ["no_anchor_measured"]``
 
-    The collapse signal lives in the new ``collapse_detector`` arm, not
-    here. ``metric_anchor`` reads discrimination (constant 0.5), so
-    healthy and textbook-collapse rows alike report ``intact is True`` —
-    the metric has a clean, fully-sized anchor and is discriminating.
-    The collapse detector (separate arm) is the detector that catches the
-    textbook signature; this arm exists to (a) satisfy ``n_with_anchor``
-    parity with the detector's row contract and (b) let ``metric_anchor``
-    flag any future row whose projection itself looks broken
-    (``held_out`` smaller than the reference, ``scored`` overlapping,
-    etc.).
+    → the metric_anchor arm contributes NO flag. This is the same
+    fail-open the audit honours for empty history; the detector's
+    anti-fabrication contract demands it. Synthesizing ``held_out`` from
+    ``anchor`` would be a fabrication (per metric_anchor.py:19-25) and
+    is explicitly forbidden here.
     """
-    step = row["step"]
     return {
-        "gen": step,
-        "scored": [f"gen-{step}-s0", f"gen-{step}-s1"],
-        "held_out": list(_REFERENCE_HELD_OUT),
-        "agreements": [True, False],
+        "gen": row["step"],
+        "scored": None,
+        "held_out": None,
+        "agreements": [],
     }
 
 
