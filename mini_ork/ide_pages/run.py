@@ -46,6 +46,11 @@ _STATE_TEXT = {"done": "done", "running": "working", "failed": "failed", "pendin
                "skipped": "not run"}
 _OUTPUT_LINES = 40
 _LINE_CHARS = 220
+# The run description in the header: one paragraph, at most this many lines,
+# wrapped at this width. The IDE draws one row per line, so the cap is a
+# layout contract, not a suggestion.
+_DESC_LINES = 5
+_DESC_LINE_CHARS = 104
 _GREEN = re.compile(r"\bPASS\b|✓|\bapprove|\bpass(ed)?\b|\bok\b", re.I)
 _RED = re.compile(r"\bFAIL|\bERROR\b|Traceback|\berror:|✗|\brc=[1-9]", re.I)
 _ENGINE_ROOT = Path(__file__).resolve().parents[2]
@@ -1462,6 +1467,164 @@ def _sub_v2(run: Run) -> str:
     return " · ".join(p for p in parts if p)
 
 
+def _read_run_json(run: Run, name: str) -> dict[str, Any]:
+    """A JSON object from the run dir, ``{}`` when missing or unreadable."""
+    try:
+        data = json.loads((run.run_dir / name).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _clip(text: str, limit: int) -> str:
+    """``text`` cut at the last word boundary before ``limit``, ellipsis included."""
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    cut = text.rfind(" ", 0, limit)
+    return f"{text[: cut if cut > 0 else limit].rstrip()}…"
+
+
+def _prefix_of(left: str, right: str) -> bool:
+    """True when either string is the other's prefix, ignoring case.
+
+    The header draws the title directly above the description, so an intent
+    that is the title (or a cut of it) would be the same words twice. Prefix
+    rather than equality because the title is already truncated to 200 chars
+    while the goal it came from is not.
+    """
+    a, b = left.strip().casefold(), right.strip().casefold()
+    if not a or not b:
+        return False
+    return a.startswith(b) or b.startswith(a)
+
+
+def _desc_intent(run: Run) -> str:
+    """What the run is *for*, in words already on disk.
+
+    The planner is the first model node and already writes the run's own
+    one-sentence ``objective`` into ``plan.json`` — asking for a success
+    criteria in plain language. It wins over the operator's goal because it
+    describes *this* plan, not the brief. The goal's first line is next, then
+    the run card's title. No prompt change is needed for this: the field the
+    planner is already required to emit is exactly the sentence wanted here.
+    """
+    objective = str(_read_run_json(run, "plan.json").get("objective") or "").strip()
+    if objective:
+        return objective
+    goal = str(_run_profile(run).get("user_goal") or "").strip()
+    if goal:
+        first = goal.splitlines()[0].strip()
+        if first:
+            return first
+    return str(run.card.get("title") or "").strip()
+
+
+def _desc_node_label(node: Node) -> str:
+    """``tier4_synth (opus55)`` — the node and the lane that served it."""
+    family = str(node.family or "")
+    return f"{node.id} ({family})" if family and family != "shell" else node.id
+
+
+def _desc_headline(run: Run, node: Node) -> str:
+    """The node's own headline — the same sentence its story row draws, so the
+    header and the story can never describe the same node differently."""
+    try:
+        from mini_ork.ide_pages.node import _overview_headline
+
+        return str(_overview_headline(run, node, run.run_dir).get("t") or "").strip()
+    except Exception:  # noqa: BLE001 — a headline is never worth failing a page
+        return ""
+
+
+def _desc_outcome(run: Run, outcome: dict[str, Any] | None = None) -> str:
+    """What *happened*: the run's own outcome sentence, then the counts.
+
+    The lead is ``outcome.resolve(run)["text"]`` — the exact sentence the
+    Story tab's triage box shows — so the header and the page cannot disagree
+    about what became of the run. Only when that sentence is generic (it does
+    not name the deciding node) is the node's own headline added; otherwise it
+    would be the same news twice.
+    """
+    nodes = run.nodes
+    total = len(nodes)
+    if not total:
+        return ""
+    done = sum(1 for n in nodes if n.state == "done")
+    skipped = sum(1 for n in nodes if n.state == "skipped")
+    failed = [n for n in nodes if n.state == "failed"]
+    working = [n for n in nodes if n.state == "running"]
+
+    lead = str((outcome or {}).get("text") or "").strip().rstrip(".")
+    if not lead:
+        lead = (f"Failed at {_desc_node_label(failed[0])}" if failed
+                else f"Working: {working[0].id}" if working else "")
+    if failed and failed[0].id.casefold() not in lead.casefold():
+        detail = _desc_headline(run, failed[0])
+        if detail:
+            lead = f"{lead}: {detail}" if lead else detail
+
+    parts = [f"{done}/{total} nodes done"]
+    if skipped:
+        # "not run" is the word the rest of the page uses for this state.
+        parts.append(f"{skipped} not run")
+    if failed:
+        parts.append(f"{len(failed)} failed")
+    parts += [S.money(_cost(run)), _elapsed(run)]
+    counts = " · ".join(parts) + "."
+    return f"{lead}. {counts}" if lead else counts
+
+
+def _desc_wrap(text: str, width: int = _DESC_LINE_CHARS, lines: int = _DESC_LINES) -> str:
+    """Wrap ``text`` into at most ``lines`` lines of ``width`` characters.
+
+    The IDE draws one row per line, so the wrap is a layout contract: overflow
+    is cut with an ellipsis rather than left to the renderer to clip.
+    """
+    rest = " ".join(text.split())
+    out: list[str] = []
+    while rest and len(out) < lines:
+        if len(rest) <= width:
+            out.append(rest)
+            return "\n".join(out)
+        cut = rest.rfind(" ", 0, width + 1)
+        if cut <= 0:
+            cut = width
+        out.append(rest[:cut].rstrip())
+        rest = rest[cut:].lstrip()
+    if rest and out:
+        out[-1] = f"{out[-1][: width - 1].rstrip()}…"
+    return "\n".join(out)
+
+
+def _desc_fold(run: Run, outcome: dict[str, Any] | None = None, title: str = "") -> str:
+    """The run's description: one paragraph, at most ``_DESC_LINES`` lines —
+    what the run is for, then what happened.
+
+    Both halves are already written down somewhere (the planner's objective,
+    the run's own outcome sentence, the nodes' headlines), so this only folds
+    them: no model call, no new artefact on disk, and nothing that can go stale
+    against the run. ``outcome`` is passed in when the caller has already
+    resolved it, so the description never pays for a second read; ``title`` is
+    what the header draws above it, so an intent that only repeats the title is
+    dropped.
+
+    The intent is clipped to two lines so the outcome always survives, and
+    anything unreadable costs an empty string — the header then renders exactly
+    as it did before the description existed.
+    """
+    try:
+        intent = _clip(_desc_intent(run), _DESC_LINE_CHARS * 2)
+        if _prefix_of(intent, title):
+            intent = ""
+        if outcome is None:
+            outcome = O.resolve(run)
+        rest = _desc_outcome(run, outcome)
+    except Exception:  # noqa: BLE001 — a description is never worth failing a page
+        return ""
+    return _desc_wrap(" ".join(p for p in (intent, rest) if p))
+
+
 def _story_tab(run: Run, outcome: dict[str, Any]) -> list[dict[str, Any]]:
     """The v2 story: triage, the outcome's callouts, the goal/criteria hero,
     then the step-by-step story — one row per pipeline node with its evidence."""
@@ -1530,10 +1693,11 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
     }[resolved]()
     chips = [S.chip(outcome["state"], outcome["tone"]),
              S.chip(S.money(_cost(run))), S.chip(_elapsed(run))]
-    page = S.page("run", _title_v2(run), _sub_v2(run), chips_=chips, actions=[],
+    title = _title_v2(run)
+    page = S.page("run", title, _sub_v2(run), chips_=chips, actions=[],
                   tabs=V2_TABS, tab=resolved,
                   args={"run": run.id, **({"node": node} if node else {})},
-                  sections=sections)
+                  sections=sections, desc=_desc_fold(run, outcome, title))
     page["graph"] = _graph(run, node)
     return page
 
@@ -1597,7 +1761,7 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     }[tab]()
     page = S.page("run", run.id, _sub(run), chips_=chips, actions=_actions(run), tabs=TABS,
                   tab=tab, args={"run": run.id, **({"node": args["node"]} if args.get("node") else {})},
-                  sections=sections)
+                  sections=sections, desc=_desc_fold(run, None, run.id))
     # Additive at every level: the graph is available to an old IDE too.
     page["graph"] = _graph(run, args.get("node"))
     return page

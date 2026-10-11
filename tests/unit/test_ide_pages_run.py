@@ -250,11 +250,12 @@ _LEVEL_ONE_KEYS = {"ok", "key", "title", "sub", "chips", "actions", "tabs", "tab
 
 def test_level_one_page_is_unchanged_plus_an_additive_graph(
         home: Path, monkeypatch) -> None:
-    """MINI_ORK_IDE_SPEC unset → today's page, byte-for-byte, plus ``graph``."""
+    """MINI_ORK_IDE_SPEC unset → today's page, byte-for-byte, plus the additive
+    ``graph`` and ``desc`` — keys an older IDE simply does not read."""
     _seed(home)
     monkeypatch.delenv("MINI_ORK_IDE_SPEC", raising=False)
     page = build_page(home, "run", None, {"run": RUN})
-    assert set(page) - {"graph"} == _LEVEL_ONE_KEYS
+    assert set(page) - {"graph", "desc"} == _LEVEL_ONE_KEYS
     assert page["title"] == RUN  # the run id is still the title
     assert [t["key"] for t in page["tabs"]] == [
         "dag", "kickoff", "overview", "agents", "learnings", "artifacts"]

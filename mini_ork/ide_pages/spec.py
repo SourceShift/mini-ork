@@ -568,9 +568,15 @@ def columns(title: str, cols: Iterable[Any], **opt: Any) -> dict[str, Any]:
 def page(key: str, title: str, sub: str = "", *, chips_: Iterable[dict[str, Any]] = (),
          actions: Iterable[dict[str, Any]] = (), tabs: Iterable[tuple[str, str]] = (),
          tab: str | None = None, args: dict[str, Any] | None = None,
-         sections: Iterable[dict[str, Any]] = (), errors: dict[str, str] | None = None) -> dict[str, Any]:
+         sections: Iterable[dict[str, Any]] = (), errors: dict[str, str] | None = None,
+         desc: str = "") -> dict[str, Any]:
+    """``desc`` is the page's own description, drawn under the title: at most
+    one paragraph of :data:`mini_ork.ide_pages.run._DESC_LINES` lines, already
+    wrapped, ``\\n``-separated. Empty (the default) leaves the header exactly
+    as it was before the field existed."""
     tab_list = [{"key": k, "label": label} for k, label in tabs]
-    return {"ok": True, "key": key, "title": title, "sub": sub, "chips": list(chips_),
+    return {"ok": True, "key": key, "title": title, "sub": sub, "desc": desc,
+            "chips": list(chips_),
             "actions": list(actions), "tabs": tab_list,
             "tab": tab or (tab_list[0]["key"] if tab_list else ""), "args": dict(args or {}),
             "sections": list(sections), "errors": dict(errors or {})}
