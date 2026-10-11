@@ -197,7 +197,9 @@ def test_framework_edit_shape(tmp_path: Path) -> None:
 
     # Merge: present, carrying the commit sha.
     assert flow["merge"] is not None
+    assert flow["merge"]["kind"] == "commit"
     assert flow["merge"]["commit"] == SHA
+    assert flow["merge"]["artifacts"] == []
     assert {"label": f"Committed {SHA[:7]}", "ok": True} in flow["merge"]["checks"]
     # The run committed its own change in place: no human merge step.
     assert flow["merge"]["human"] is None
@@ -205,6 +207,8 @@ def test_framework_edit_shape(tmp_path: Path) -> None:
     # Six stages, intake … merge.
     assert [s["key"] for s in flow["stages"]] == [
         "intake", "design", "build", "integrate", "review", "merge"]
+    # A committed run keeps the Merge label — only a patch delivery relabels.
+    assert flow["stages"][-1]["label"] == "Merge"
     assert [s["state"] for s in flow["stages"]] == ["done", "approved", "approved",
                                                     "approved", "approved", "approved"]
     assert flow["legend"][0] == {"key": "in_progress", "label": "in progress"}
@@ -217,6 +221,50 @@ def test_no_publish_sha_and_no_worktree_hides_merge(tmp_path: Path) -> None:
     assert flow["merge"] is None
     assert [s["key"] for s in flow["stages"]] == [
         "intake", "design", "build", "integrate", "review"]
+
+
+def test_published_patch_artifact_shows_a_delivery_bar(tmp_path: Path) -> None:
+    """A recipe whose contract delivers a diff (framework-edit) never commits.
+
+    The publisher copies its artifacts into the run dir instead, so the run page
+    must show that delivery. Reading the absent commit as "nothing happened" is
+    the defect: the same blank bar for a run that produced a patch and a run that
+    produced nothing.
+    """
+    run = _run(tmp_path, _framework_nodes(), _FRAMEWORK_COLS,
+               card={"title": "Make the demo pass", "status": "published"})
+    _seed_framework_files(run, publish=False)
+    diff = str(run.run_dir / "framework-edit.diff")
+    (run.run_dir / "execute.log").write_text(
+        f"  [ok] publisher: preserved run-local artifact {diff}\n"
+        f"  [ok] publisher: preserved run-local artifact {run.run_dir / 'verdict.json'}\n"
+        "  [ok] publisher: 2 artifact(s) published\n")
+    flow = run_flow.build_flow(run)
+
+    assert flow["merge"] is not None
+    assert flow["merge"]["kind"] == "diff"
+    assert flow["merge"]["commit"] == ""
+    assert flow["merge"]["artifacts"] == [diff, str(run.run_dir / "verdict.json")]
+    assert {"label": "Proposed diff (not applied)", "ok": True} in flow["merge"]["checks"]
+    # The patch is the deliverable: no human merge step, and the stage is done.
+    assert flow["merge"]["human"] is None
+    assert flow["merge"]["state"] == "approved"
+    assert [s["key"] for s in flow["stages"]][-1] == "merge"
+    assert flow["stages"][-1]["state"] == "approved"
+    # The stage must not claim a merge: the contract says the diff is not applied.
+    assert flow["stages"][-1]["label"] == "Patch"
+
+
+def test_a_log_with_neither_commit_nor_artifact_hides_merge(tmp_path: Path) -> None:
+    """Only the publisher's own lines count — a passing gate is not a delivery."""
+    run = _run(tmp_path, _framework_nodes(), _FRAMEWORK_COLS)
+    _seed_framework_files(run, publish=False)
+    (run.run_dir / "execute.log").write_text(
+        "  [ok] oracle-gates: pre-publish pass\n"
+        "  [ok] publisher: level gate pass (required=None)\n"
+        "  [skip] rollback — no failures\n")
+    flow = run_flow.build_flow(run)
+    assert flow["merge"] is None
 
 
 def test_worktree_present_and_unmerged_needs_the_human(tmp_path: Path, monkeypatch) -> None:

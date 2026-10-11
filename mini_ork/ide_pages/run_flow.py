@@ -5,8 +5,9 @@ optional Merge, for the IDE's Graph view.
 ticket, the stage chips, and the per-stage detail — design nodes with their
 revise loops, build packages with Implementer lanes and critics, the integrate
 check tiers, the review hub with its rubric / level / model / axis spokes, the
-merge checklist (only when code merged), the rollback record, and the node-event
-timeline. Nothing here starts a model or writes to the run dir.
+delivery checklist (when the run committed, published a patch, or waits on a
+human), the rollback record, and the node-event timeline. Nothing here starts a
+model or writes to the run dir.
 
 Read-only and **fail-soft**: every section reads the run's own artefacts through
 the existing tolerant readers (``run._yaml`` / ``run._tail``,
@@ -56,6 +57,11 @@ _RANK = {"sent_back": 0, "failed": 0, "in_progress": 1, "pending": 2, "skipped":
 # The publisher's commit line (``publisher.py:166``): ``[publish] committed N
 # file(s): <sha>``. The sha is what the merge bar shows.
 _PUBLISH_RE = re.compile(r"\[publish\]\s+committed\s+\d+\s+file\(s\):\s*([0-9a-fA-F]{7,40})")
+# The publisher's artifact line: ``[ok] publisher: preserved run-local artifact
+# <path>``. A recipe whose artifact contract declares ``outputs`` (framework-edit
+# and its kin) delivers by patch and never reaches the commit path, so these
+# paths — not a sha — are its delivery evidence.
+_ARTIFACT_RE = re.compile(r"\[ok\]\s+publisher:\s+preserved run-local artifact\s+(\S+)")
 # A revise round's section header names its sender: ``## <node> (<type>)``.
 _REVISE_SECTION_RE = re.compile(r"^##\s+(\S+)\s+\((\w+)\)", re.MULTILINE)
 
@@ -526,10 +532,7 @@ def _publish_sha(run: Run) -> str | None:
     repo: the publisher's commit message carries ``[run <id>]``.
     Returns ``None`` when no commit is found.
     """
-    logs = [run.run_dir / "execute.log"]
-    for pattern in ("recover-*.log", "repair-*.log"):
-        logs += sorted(run.run_dir.glob(pattern))
-    for log in logs:
+    for log in _publisher_logs(run):
         for line in _tail(log, 2000):
             m = _PUBLISH_RE.search(line)
             if m:
@@ -560,6 +563,32 @@ def _target_repo_commit(run: Run) -> str | None:
     return out or None
 
 
+def _publisher_logs(run: Run) -> list[Path]:
+    """The logs a publisher writes to: ``execute.log`` plus any revive log."""
+    logs = [run.run_dir / "execute.log"]
+    for pattern in ("recover-*.log", "repair-*.log"):
+        logs += sorted(run.run_dir.glob(pattern))
+    return logs
+
+
+def _published_artifacts(run: Run) -> list[str]:
+    """The publisher's run-local artifacts, when the recipe delivers a patch.
+
+    A recipe whose ``artifact_contract.yaml`` declares ``outputs`` — framework-edit
+    and its kin — publishes by copying the diff into the run dir and *does not
+    commit*: ``publisher.py`` reaches its commit path only for the empty-outputs
+    in-place recipes. So the delivery evidence is the publisher's own log line,
+    and its absence is not "nothing happened" — it is "this recipe does not commit".
+    """
+    artifacts: list[str] = []
+    for log in _publisher_logs(run):
+        for line in _tail(log, 2000):
+            m = _ARTIFACT_RE.search(line)
+            if m and m.group(1) not in artifacts:
+                artifacts.append(m.group(1))
+    return artifacts
+
+
 def _workspace_waiting(run: Run) -> bool:
     """``True`` when a worktree still holds real work for the human to merge.
 
@@ -584,15 +613,23 @@ def _workspace_waiting(run: Run) -> bool:
 
 
 def _merge(run: Run, hub: dict[str, Any] | None, integrate_state: str) -> dict[str, Any] | None:
-    """The merge bar — present only when code merged or a published worktree waits.
+    """The delivery bar — present when the run committed, published a patch, or a
+    published worktree waits.
 
-    Code merged: the publisher's ``[publish] committed … <sha>`` line. A
-    worktree still waits only for a ``published`` run whose branch has real
-    work (``task_state`` rule 3) — a rolled-back / failed / running run with a
-    kept empty worktree never grows a merge stage.
+    Three deliveries, one bar. *Committed*: the publisher's ``[publish] committed
+    … <sha>`` line — an in-place recipe that changed the tree itself. *Patch*: the
+    publisher's run-local artifacts — a recipe whose contract says deliver a diff
+    and do not commit, so the bar reports the patch rather than reading as a run
+    that did nothing. A worktree still waits only for a ``published`` run whose
+    branch has real work (``task_state`` rule 3) — a rolled-back / failed / running
+    run with a kept empty worktree never grows a delivery stage. A run that
+    delivered nothing has no bar: the absence is the signal.
     """
     sha = _publish_sha(run)
-    published = sha is not None
+    # A committed run has a sha; only then is the artifact list irrelevant. The
+    # reverse — artifacts with no sha — is the patch-delivery case, not an error.
+    artifacts = _published_artifacts(run) if sha is None else []
+    published = sha is not None or bool(artifacts)
     waiting = str(run.card.get("status") or "").strip().lower() == "published" \
         and _workspace_waiting(run)
     if not (published or waiting):
@@ -602,13 +639,16 @@ def _merge(run: Run, hub: dict[str, Any] | None, integrate_state: str) -> dict[s
               {"label": "Checks green", "ok": integrate_state == "approved"}]
     if sha:
         checks.append({"label": f"Committed {sha[:7]}", "ok": True})
+    elif artifacts:
+        checks.append({"label": "Proposed diff (not applied)", "ok": True})
     # Human only when a person must make the merge: a worktree is waiting.
     # An in-place publish (the run committed its own change) has no human step.
     human: dict[str, Any] | None = None
     if waiting:
         human = {"label": "Human", "sub": "makes the final merge", "state": "in_progress"}
-    return {"state": "approved" if published else "in_progress",
-            "commit": sha or "", "checks": checks, "human": human}
+    kind = "commit" if sha else ("diff" if artifacts else "worktree")
+    return {"state": "approved" if published else "in_progress", "kind": kind,
+            "commit": sha or "", "artifacts": artifacts, "checks": checks, "human": human}
 
 
 def _rollback(run: Run) -> dict[str, Any] | None:
@@ -657,14 +697,16 @@ def _timeline(run: Run) -> list[dict[str, Any]]:
 
 # ── stages ──────────────────────────────────────────────────────────────────
 
-def _stages(states: dict[str, str]) -> list[dict[str, Any]]:
+def _stages(states: dict[str, str], labels: dict[str, str] | None = None) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
+    overrides = labels or {}
     n = 0
     for key in _STAGE_KEYS:
         if key not in states:
             continue
         n += 1
-        out.append({"key": key, "label": _STAGE_LABELS[key], "n": n, "state": states[key]})
+        out.append({"key": key, "label": overrides.get(key, _STAGE_LABELS[key]),
+                    "n": n, "state": states[key]})
     return out
 
 
@@ -719,10 +761,14 @@ def build_flow(run: Run) -> dict[str, Any]:
     if merge is not None:
         states["merge"] = str(merge.get("state") or "pending")
 
+    # A patch delivery is not a merge — the contract says do not apply the diff —
+    # so the stage must not claim one. Keep "Merge" where a human still merges.
+    stage_labels = {"merge": "Patch"} if (merge or {}).get("kind") == "diff" else None
+
     ticket = {"id": run.id, "title": str(run.card.get("title") or run.id), "state": "done"}
     return {
         "ticket": ticket,
-        "stages": _stages(states),
+        "stages": _stages(states, stage_labels),
         "design": design,
         "build": build,
         "integrate": integrate,
