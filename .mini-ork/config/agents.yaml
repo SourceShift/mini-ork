@@ -1,51 +1,68 @@
-# Lane policy override for the recursive-self-improve recipe.
+# Lane policy override — operative for this home ($MINI_ORK_HOME/config/agents.yaml).
 #
-# Copy or symlink to $MINI_ORK_HOME/config/agents.yaml before running
-# bin/mini-ork-self-improve. The outer runner stages this automatically
-# under $MINI_ORK_RUN_DIR/.mini-ork/config/agents.yaml when MINI_ORK_HOME
-# points at the run-specific home.
+# Operator directive 2026-10-09:
+#   * gate keepers / verifiers / reviewers must be INTELLIGENT models —
+#     MiniMax-M3, GLM-5.3, or DeepSeek-V4-Flash;
+#   * free OpenRouter lanes used as much as possible;
+#   * several lanes in flight at once.
 #
-# Diversity rationale: synthesizer is Opus (Anthropic). Researchers run on
-# MiniMax (perf), Moonshot Kimi (correctness), and OpenAI Codex (arch + arxiv).
-# Avoid GLM here because (a) the default `reviewer` lane already maps to opus
-# and (b) GLM as a research voter on patches that may later add Anthropic
-# adapters introduces a subtle conflict-of-interest under the same provider
-# family clustering.
+# The binding constraint on the second item: every `*_free` lane is a
+# `openai-chat` TRANSPORT — tool-less (see _LOCAL_ONLY_LANE_KINDS in
+# mini_ork/dispatch/providers.py). It takes a prompt and returns text and
+# cannot edit files, so it can never be a code-producing role
+# (implementer / worker / publisher / healer). Free lanes are therefore used
+# for ADVISORY, NON-GATING work (`advisor_*` lanes below). They also pull from
+# a globally shared upstream pool, so two of them 429'd on a live probe — never
+# let one sit on a path that must complete.
+#
+# Families: minimax | glm | deepseek_flash are three DISTINCT families, which
+# is what makes the gate panel decorrelated (Krippendorff alpha collapses when
+# judges share a family — see the v0.2-pt14 note in config/agents.yaml).
 
 lanes:
-  # Canonical loop-role lanes.
-  # 2026-06-09: planner switched codex → opus after Codex gpt-5.5 hit
-  # 'Selected model is at capacity' mid-iter-4 and the cascade killed
-  # iters 5-17. Opus is more capacity-stable but ~3x cost; the budget
-  # already accounts for opus on synthesizer so the marginal increase
-  # is one extra opus call per iter. Switch back to codex once OpenAI
-  # capacity stabilizes if cost matters more than throughput.
-  planner: opus
-  decomposer: opus           # framework-edit planner node routes here; absent
-                             # from this override = unresolved-lane planner fail
-  researcher: codex          # bottleneck-scan fallback if model_lane unset
-  implementer: codex
-  worker: codex
-  reviewer: opus             # opus_synthesizer routes through here when
-                             # workflow.yaml uses model_lane: reviewer; we
-                             # use opus_lens explicitly for clarity instead.
-  verifier: codex
-  reflector: codex
-  publisher: codex
-  rollback: codex
-  brain: opus
+  # ── producers: agentic + tool-capable ────────────────────────────────────
+  planner: glm             # deep reasoning; GLM-5.3
+  decomposer: glm
+  implementer: minimax     # MiniMax-M3 — the code-writing workhorse
+  worker: minimax          # code-fix's implementer node routes through `worker`
+  publisher: minimax
+  rollback: minimax
+  healer: minimax
+  bdd_runner: minimax
+  researcher: minimax
 
-  # Heterogeneous-family lens lanes (must match workflow.yaml node.model_lane).
-  minimax_lens: minimax      # perf lens — MiniMax-M3
-  kimi_lens: kimi            # correctness lens — Moonshot Kimi
-  codex_lens: codex          # arch + arxiv lens — OpenAI Codex wrapper
-  opus_lens: opus            # synthesizer + final patch reviewer — Anthropic Opus
+  # ── gate keepers: intelligent, one distinct family each ──────────────────
+  reviewer: minimax        # MiniMax-M3
+  spec_reviewer: minimax
+  judge: glm               # advisory eval node — GLM-5.3
+  eval: deepseek_flash     # DeepSeek-V4-Flash
+  verifier: deepseek_flash
+  reflector: glm           # non-gating, but feeds the learning loop — keep it
+                           # intelligent; a junk lesson is worse than no lesson
+
+  # ── advisory: free, tool-less, NEVER gating ──────────────────────────────
+  # Available for bulk/opinion work that must not hold a verdict. Wire a role
+  # here only when losing its output cannot change a run's outcome.
+  advisor_a: north_mini_free     # cohere/north-mini-code — code-shaped advice
+  advisor_b: dots_note_free      # dots-studio/dots-3-note-preview
+  advisor_c: nemotron_free       # nvidia/nemotron-3-ultra-550b-a55b
+  advisor_d: laguna_free         # poolside/laguna-s-2.1 — flaky, opportunistic
+  advisor_e: gemma4_free         # google/gemma-4-31b-it — 429'd, opportunistic
+
+  brain: glm
+
+  # ── heterogeneous lens lanes (recursive-self-improve / audit panels) ─────
+  # Must match workflow.yaml node.model_lane. Distinct families by design.
+  minimax_lens: minimax
+  glm_lens: glm
+  kimi_lens: kimi
+  codex_lens: codex
+  opus_lens: opus
+  deepseek_lens: deepseek_flash
 
 budget:
-  # Per-iteration cap. Outer runner enforces wall-clock; this is the dollar
-  # guard. Tuned for one full 6-lens iteration (~30 min, mostly Opus synth).
+  # Raised in step with MO_DAILY_BUDGET_USD=225 (see secrets.local.sh) so the
+  # recipe-level guard cannot trip before the dispatch circuit does.
   per_run_usd: 12.00
-  # Per-epic / per-outer-loop cap. Set ~5h worth of iterations.
   per_epic_usd: 50.00
-  # Daily hard cap. Outer runner refuses to start a new iteration once hit.
-  daily_cap_usd: 60.00
+  daily_cap_usd: 225.00

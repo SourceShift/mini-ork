@@ -496,3 +496,7 @@ mini-ork is **Apache-2.0** licensed, early, and research-grade. Use a dedicated 
 changes, keep a verifier with every behavior claim, and run the focused checks for the
 surface you change. The contribution workflow and quality gates are in
 [AGENTS.md](AGENTS.md); project direction lives in [GOVERNANCE.md](GOVERNANCE.md).
+
+## Usage
+
+Run `mini-ork run code-fix ./kickoff.md` to execute a task from a verifiable kickoff.
