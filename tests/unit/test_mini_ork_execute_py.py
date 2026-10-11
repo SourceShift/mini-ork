@@ -186,10 +186,14 @@ def test_router_respects_pins_no_monoculture():
         assert rp == lens, f"pinned {lens} must be preserved"
 
 
-def test_learning_static_lane_parity(monkeypatch):
-    # Hermetic: no agents.yaml in reach, so every role is unmapped.
-    for k in ("MINI_ORK_HOME", "MINI_ORK_ROOT"):
-        monkeypatch.delenv(k, raising=False)
+def test_learning_static_lane_parity(tmp_path, monkeypatch):
+    # Hermetic: no agents.yaml in reach, so every role is unmapped. Point
+    # MINI_ORK_HOME at an empty directory (rather than merely unsetting it) so
+    # no ambient home with a real agents.yaml mapping can leak in.
+    home = tmp_path / "mini-ork-home"
+    home.mkdir()
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+    monkeypatch.delenv("MINI_ORK_ROOT", raising=False)
     cases = {
         ("reviewer", "reviewer"): "opus_lens",
         ("researcher", "researcher"): "kimi_lens",

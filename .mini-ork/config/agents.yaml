@@ -59,6 +59,7 @@ lanes:
   codex_lens: codex
   opus_lens: opus
   deepseek_lens: deepseek_flash
+  laguna_lens: laguna_free   # poolside/laguna-s-2.1 — 3rd judge of audit-judge-panel-3l
 
 budget:
   # Raised in step with MO_DAILY_BUDGET_USD=225 (see secrets.local.sh) so the
