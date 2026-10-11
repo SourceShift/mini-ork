@@ -233,6 +233,7 @@ def _inbox(home: Path, now: int, errors: dict[str, str], ctx: dict[str, Any],
     # every recent run's status and kickoff, which is all a lineage needs to
     # find the sibling that settled it.
     settled: set[str] = set()
+    recent: list[Any] = []
     try:
         recent, _ = list_runs(Path(home), limit=_CANDIDATE_LIMIT, offset=0)
         for run in recent:
@@ -244,8 +245,37 @@ def _inbox(home: Path, now: int, errors: dict[str, str], ctx: dict[str, Any],
     except Exception as exc:  # noqa: BLE001 — without it we show rows we might hide
         errors["inbox settled"] = f"{type(exc).__name__}: {exc}"
 
+    # The questions. A run blocked on an ask is a state the outcome resolver
+    # describes ("needs you") but cannot *show* — only the ask file holds the
+    # question itself, and a question the operator cannot read is not
+    # answerable. One listdir per recent run that has an ``asks`` dir; a run
+    # without one costs a failed ``listdir`` and nothing else.
+    asking: list[tuple[str, str, str, int, int]] = []
+    epoch = _run_mod()._epoch
+    for run in recent:
+        run_id = str(run.get("run_id") or "")
+        created = epoch(run.get("created_at"))
+        # ``list_runs`` rows carry both stamps as ISO strings; an unparseable
+        # one is kept rather than dropped, the way ``_in_window`` treats an
+        # unknown start.
+        if not run_id or (created is not None and created < cutoff):
+            continue
+        asks = _run_mod().open_asks(_run_dir(home, run_id))
+        if not asks:
+            continue
+        # Same reasons to leave as any other row: the change landed elsewhere,
+        # a later attempt published, the operator hid it, auto-repair owns it.
+        key = lineage_key(str(run.get("recipe") or ""), str(run.get("kickoff_path") or ""))
+        if (key and key in settled) or _landed(home, run_id) or _dismissed(home, run_id) \
+                or _repairing(home, run_id):
+            continue
+        asking.append((run_id, str(run.get("title") or run_id), str(asks[0]["question"]),
+                       len(asks), epoch(run.get("updated_at")) or 0))
+    asking.sort(key=lambda item: -item[4])
+
     waiting: list[tuple[Any, int]] = []
     superseded = 0
+    asking_ids = {item[0] for item in asking}
     for key in order:
         members = groups[key]
         head_row, head_flags = members[0]  # newest attempt: the task's live state
@@ -254,6 +284,11 @@ def _inbox(home: Path, now: int, errors: dict[str, str], ctx: dict[str, Any],
         # inbox, dead ancestors and all.
         if head_flags["landed"] or head_flags["dismissed"] or key in settled:
             continue
+        # A run paused on a question is owned by the questions group above,
+        # which carries the question text instead of only the state it leaves
+        # the run in. Not counted as superseded either: nothing settled it.
+        if head_row.run_id in asking_ids:
+            continue
         waiting.append((head_row, len(members)))
         superseded += len(members) - 1
 
@@ -261,7 +296,12 @@ def _inbox(home: Path, now: int, errors: dict[str, str], ctx: dict[str, Any],
     # outranks a failure the human can defer, regardless of age.
     waiting.sort(key=lambda pair: (pair[0].state != "needs_you", -(pair[0].started_at or 0)))
 
-    ctx["needs_you"] = sum(1 for row, _ in waiting if row.state == "needs_you")
+    # Every run left in ``asking`` is one the questions group shows instead of a
+    # ``waiting`` row, and an unanswered ask is by definition the operator's —
+    # the engine pauses the run on it. So it counts as "needs you" even though
+    # it never reached ``waiting``.
+    ctx["needs_you"] = sum(1 for row, _ in waiting if row.state == "needs_you") + len(asking)
+    ctx["questions"] = len(asking)
     ctx["failed"] = sum(1 for row, _ in waiting if row.state != "needs_you")
     ctx["repairing"] = len(repairing_rows)
     ctx["superseded"] = superseded
@@ -269,6 +309,18 @@ def _inbox(home: Path, now: int, errors: dict[str, str], ctx: dict[str, Any],
     noise_total = sum(1 for _, flags in classified if flags["noise"])
 
     sections: list[dict[str, Any]] = []
+    if asking:
+        items = [
+            S.warn(question,
+                   f"{count} questions · {title}" if count > 1 else title,
+                   acts=[S.btn("Answer", S.open_run(run_id, title, "questions"), "primary"),
+                         _dismiss_button(run_id)])
+            for run_id, title, question, count, _ in asking
+        ]
+        sections.append(S.lst(
+            "Needs your answer", items, full=True,
+            note="Runs paused on a question. Answer on the run's Questions tab and the run "
+                 "continues from where it stopped."))
     shown = waiting[:_ROW_CAP]
     for row, attempts in shown[:_DETAILED_ROWS]:
         sections += S.guarded(errors, row.run_id,
@@ -325,6 +377,8 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
                          lambda: _inbox(home, now, errors, ctx, show_all))
     chips = [S.chip(f"✋ needs you {ctx.get('needs_you', 0)}", "yellow"),
              S.chip(f"✗ failed {ctx.get('failed', 0)}", "red")]
+    if ctx.get("questions"):
+        chips.append(S.chip(f"? {ctx['questions']} waiting for an answer", "yellow"))
     if ctx.get("repairing"):
         chips.append(S.chip(f"⟳ being repaired {ctx['repairing']}", "blue"))
     if ctx.get("superseded"):

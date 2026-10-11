@@ -551,16 +551,23 @@ def agents(title: str, rows: Iterable[Any], **opt: Any) -> dict[str, Any]:
 
 
 def composer(placeholder: str, cli_args: Iterable[str], *, title: str = "",
-             **opt: Any) -> dict[str, Any]:
+             home: bool = True, **opt: Any) -> dict[str, Any]:
     """An input box that runs ``mini-ork <cli> …`` — the IDE appends typed text.
 
     ``title`` labels the box (e.g. "Steer the run"); it is the section title, so
     the layout keys (``full`` / ``col`` / ``note``) still ride ``**opt``.
     ``cli_args`` is the argv prefix as a list; the typed text becomes its last
     argument — e.g. ``["board", "steer", run_id, "--text"]``.
+
+    ``home=False`` has the same meaning as on :func:`cli`: the subcommand's own
+    parser rejects ``--home``, so the IDE leaves it off and the subcommand reads
+    ``MINI_ORK_HOME`` instead, which the action path always sets.
     """
-    return _section("composer", title, {"placeholder": str(placeholder),
-                                        "cli": [str(a) for a in cli_args]}, **opt)
+    data: dict[str, Any] = {"placeholder": str(placeholder),
+                            "cli": [str(a) for a in cli_args]}
+    if not home:
+        data["home"] = False
+    return _section("composer", title, data, **opt)
 
 
 def column(title: str, cards: Iterable[Any], *, c: str = "sub") -> dict[str, Any]:

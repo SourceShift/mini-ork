@@ -27,8 +27,9 @@ TABS = [("dag", "DAG"), ("kickoff", "Kickoff"), ("overview", "Overview"), ("agen
 # The v2 tab bar (``MINI_ORK_IDE_SPEC=2``): the story replaces the overview and
 # the graph replaces the DAG. The old keys still resolve (``dag`` → ``graph``,
 # ``overview`` → ``story``) so a stale IDE link lands somewhere sensible.
-V2_TABS = [("story", "Story"), ("graph", "Graph"), ("kickoff", "Kickoff"),
-           ("agents", "Agents"), ("learnings", "Learnings"), ("artifacts", "Artifacts")]
+V2_TABS = [("story", "Story"), ("graph", "Graph"), ("questions", "Questions"),
+           ("kickoff", "Kickoff"), ("agents", "Agents"), ("learnings", "Learnings"),
+           ("artifacts", "Artifacts")]
 V2_ALIASES = {"dag": "graph", "overview": "story"}
 
 # The kickoff text is capped well above the 20 KB the run card shows — the kickoff
@@ -946,6 +947,89 @@ def _resolve_kickoff(run: Run) -> tuple[str, str]:
     return "", ""
 
 
+def _ask_index(name: str) -> tuple[int, str]:
+    """``ask-10.json`` sorts after ``ask-9.json``: the number orders, the name breaks ties."""
+    digits = name[len("ask-"):-len(".json")]
+    return (int(digits), name) if digits.isdigit() else (1 << 31, name)
+
+
+def open_asks(run_dir: Path) -> list[dict[str, Any]]:
+    """The run's *unanswered* asks (``asks/ask-N.json``, ``ask@1``), in ask order.
+
+    One dict per ask that still waits on a human: ``{"ask_id", "question",
+    "options", "default"}``. An ask carrying an ``answer`` is a fact about the
+    run, not a question, so it is left out — the same rule
+    ``orchestration.run_reaper._has_unanswered_ask`` uses to decide that a run
+    is blocked. A file that cannot be read, parsed, or that holds no question is
+    skipped: one bad ask costs its own row, never the tab (or the inbox).
+    """
+    asks_dir = run_dir / "asks"
+    try:
+        names = [n for n in os.listdir(asks_dir)
+                 if n.startswith("ask-") and n.endswith(".json")]
+    except OSError:  # no asks dir, or unreadable — the same answer: none
+        return []
+    out: list[dict[str, Any]] = []
+    for name in sorted(names, key=_ask_index):
+        try:
+            data = json.loads((asks_dir / name).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict) or str(data.get("answer") or "").strip():
+            continue
+        question = str(data.get("question") or "").strip()
+        if not question:
+            continue
+        default = data.get("default")
+        out.append({
+            "ask_id": str(data.get("ask_id") or name[:-len(".json")]),
+            "question": question,
+            "options": [str(o) for o in data.get("options") or [] if str(o).strip()],
+            "default": None if default is None else str(default),
+        })
+    return out
+
+
+def _questions_tab(run: Run) -> list[dict[str, Any]]:
+    """What the run is waiting to be told, and one box per question to tell it.
+
+    The whole loop already exists in the engine — ``plan._write_ask_files``
+    writes the asks, ``resume --answer`` records an answer and continues the run
+    — so this tab is the surface that was missing, not new machinery. Answering
+    is ``mini-ork resume <run> --answer ask-N=<text>``; the composer appends the
+    typed text as the last argument of that argv.
+    """
+    errors: dict[str, str] = {}
+
+    def build() -> list[dict[str, Any]]:
+        asks = open_asks(run.run_dir)
+        if not asks:
+            return S.callout(
+                "No open questions",
+                "This run is not waiting on an answer. A question lands here — and in the "
+                "inbox — when the planner stops on something only you can decide.",
+                tone="green", icon="✓", full=True)
+        sections: list[dict[str, Any]] = [S.callout(
+            f"{len(asks)} question{'s' if len(asks) > 1 else ''} waiting",
+            "The run continues once every one is answered — same run id, same recipe, "
+            "from where it stopped.",
+            tone="yellow", icon="✋", full=True)]
+        for ask in asks:
+            text = ask["question"]
+            if ask["options"]:
+                text += "\n\n" + "\n".join(f"- {o}" for o in ask["options"])
+            if ask["default"] is not None:
+                text += f"\n\nIf you don't answer, the run will use: “{ask['default']}”"
+            sections.append(S.callout(str(ask["ask_id"]), text, tone="yellow", full=True))
+            sections.append(S.composer(
+                "Your answer… (Enter to send)",
+                ["resume", run.id, "--answer", f"{ask['ask_id']}="],
+                title=f"Answer {ask['ask_id']}", home=False, full=True))
+        return sections
+
+    return S.guarded(errors, "Questions", build)
+
+
 def _kickoff_tab(run: Run) -> list[dict[str, Any]]:
     errors: dict[str, str] = {}
 
@@ -1686,6 +1770,7 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
     sections = {
         "story": lambda: _story_tab(run, outcome),
         "graph": lambda: _dag_tab(run, node),
+        "questions": lambda: _questions_tab(run),
         "kickoff": lambda: _kickoff_tab(run),
         "agents": lambda: _agents_tab(run),
         "learnings": lambda: _learnings_tab(run),
@@ -1693,6 +1778,12 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
     }[resolved]()
     chips = [S.chip(outcome["state"], outcome["tone"]),
              S.chip(S.money(_cost(run))), S.chip(_elapsed(run))]
+    # A run that stopped on a question says so in the header: the Questions tab
+    # is otherwise an empty tab on every run that never asked anything, and a
+    # blocked run would look like any other.
+    waiting = len(open_asks(run.run_dir))
+    if waiting:
+        chips.insert(0, S.chip(f"✋ {waiting} question{'s' if waiting > 1 else ''}", "yellow"))
     title = _title_v2(run)
     page = S.page("run", title, _sub_v2(run), chips_=chips, actions=[],
                   tabs=V2_TABS, tab=resolved,
