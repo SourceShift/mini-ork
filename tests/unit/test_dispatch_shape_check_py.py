@@ -161,8 +161,13 @@ def test_default_dispatch_receives_accept_for_planner(monkeypatch, tmp_path):
     _isolate_cli(monkeypatch)
     captured = {}
 
-    def spy(model, prompt, out_file, timeout_s, max_turns, accept="__MISSING__"):
+    # on_attempt (the failed-attempt ledger sink) is part of the default
+    # dispatcher's grown contract, threaded like accept; caller-supplied
+    # dispatch_fn still gets the bare 5-arg historic shape.
+    def spy(model, prompt, out_file, timeout_s, max_turns, accept="__MISSING__",
+            on_attempt=None):
         captured["accept"] = accept
+        captured["on_attempt"] = on_attempt
         Path(out_file).write_text('{"ok": true}')
         return 0
 
@@ -170,13 +175,15 @@ def test_default_dispatch_receives_accept_for_planner(monkeypatch, tmp_path):
     out = str(tmp_path / "out.txt")
     L.llm_dispatch(_cli_argv("planner", out), dispatch_fn=None)
     assert captured["accept"] is looks_like_json
+    assert callable(captured["on_attempt"])
 
 
 def test_default_dispatch_omits_accept_for_prose_node(monkeypatch, tmp_path):
     _isolate_cli(monkeypatch)
     captured = {}
 
-    def spy(model, prompt, out_file, timeout_s, max_turns, accept="__MISSING__"):
+    def spy(model, prompt, out_file, timeout_s, max_turns, accept="__MISSING__",
+            on_attempt=None):
         captured["accept"] = accept
         Path(out_file).write_text("free-form prose is fine here")
         return 0
