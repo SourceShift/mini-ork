@@ -46,29 +46,29 @@ verifier reads it verbatim; you cannot write files yourself). It must end
 with ONE fenced ```json block — the structured sidecar — and nothing after
 it.
 
-Five sections, in this exact order, same as the other lanes:
+Five sections, numbered and written in EXACTLY this order — 1, 2, 3, 4, 5;
+never swap 4 and 5. Your output ceiling is tight: keep every `reasoning`
+field to ONE sentence (≤ 25 words), every `evidence_checked` to ONE receipt,
+no preamble, no restating findings. The JSON block at the end MUST complete —
+if you feel the length pressure, cut prose, never the JSON.
 
-1. `Discovery Evidence` — state plainly: "briefing-only lane, no live
-   discovery". List the briefing receipts you adjudicated against. Include a
-   `### Cross-Finding Observations` subsection: systemic patterns shared by
-   the six findings.
-2. `Finding Verdicts` — one block per finding F1..F6, each with:
+1. `Discovery Evidence` — one line: "briefing-only lane, no live discovery",
+   then the receipts you adjudicated against as a short list. Add a
+   `### Cross-Finding Observations` subsection: 2–3 systemic patterns shared
+   by the six findings.
+2. `Finding Verdicts` — one block per finding F1..F6, each EXACTLY:
    - `finding_id`
    - `verdict`: `confirmed` | `partially_confirmed` | `refuted` | `unverifiable`
-     (here it means: adjudicated from the briefing — internally valid and
-     consistent / valid but overstated / self-contradictory or causally
-     broken / cannot be settled from the briefing)
+     (here: internally valid and consistent / valid but overstated /
+     self-contradictory or causally broken / cannot be settled from the briefing)
    - `severity`: `critical` | `high` | `medium` | `low`
-   - `evidence_checked`: briefing receipts quoted for this finding
-   - `reasoning`: the adjudication, including corrected numbers if any
-3. `Fix Verdicts` — one block per fix S1..S6, same fields plus
-   `finding_id`, and a `fix_gap` note where the fix leaves part of its
-   finding open. `fix_gap` lives ONLY in this markdown section — the JSON
-   sidecar's `fixes` entries carry EXACTLY the five keys shown below and
-   nothing else (the panel gate rejects a lane whose sidecar keys differ
-   from the other lanes').
-4. `Recommended Fix Order` — your ranking of S1..S6 with one-line rationale.
-5. `Open Questions` — what a live-measuring lane or the human should check.
+   - `evidence_checked`: ONE briefing receipt
+   - `reasoning`: ONE sentence
+3. `Fix Verdicts` — one block per fix S1..S6, same shape plus `finding_id`,
+   plus an optional `fix_gap` phrase (markdown only — NEVER a JSON key). The
+   JSON sidecar's `fixes` entries carry EXACTLY the five keys shown below.
+4. `Recommended Fix Order` — one line: your ranking of S1..S6.
+5. `Open Questions` — at most six one-line questions.
 
 Then the fenced json block, EXACTLY this schema (same as the other lanes):
 

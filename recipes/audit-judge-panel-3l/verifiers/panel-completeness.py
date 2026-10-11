@@ -159,11 +159,24 @@ def check_lane_json(lane: str, node: str, source: str = "file") -> None:
             return  # the report-miss was already failed above
         text = open(report, encoding="utf-8", errors="replace").read()
         fences = re.findall(r"```json\s*(.*?)```", text, re.S)
-        if not fences:
-            fail(f"{lane}:sidecar_not_json:no fenced json block in {os.path.basename(report)}")
-            ev.write(f"MISSING embedded sidecar in {report}\n")
-            return
-        raw = fences[-1]
+        if fences:
+            raw = fences[-1]
+        else:
+            # Unterminated final fence: free-tier models routinely emit the
+            # complete JSON object and then die before the closing ``` (the
+            # round-5 artifact ended `...]}\n}` with one opening fence and no
+            # closer). Take everything after the LAST ```json opener to EOF,
+            # trim trailing backticks/whitespace, and let json.loads judge
+            # whether the object is actually complete — a truncated object
+            # still fails below, so this widens extraction, not validation.
+            m = None
+            for m in re.finditer(r"```json\s*", text):
+                pass
+            if m is None:
+                fail(f"{lane}:sidecar_not_json:no fenced json block in {os.path.basename(report)}")
+                ev.write(f"MISSING embedded sidecar in {report}\n")
+                return
+            raw = text[m.end():].rstrip().rstrip("`").rstrip()
     else:
         match = os.path.join(RUN_DIR, "context-*.json")
         cand = os.path.join(RUN_DIR, f"context-{node}.json")
