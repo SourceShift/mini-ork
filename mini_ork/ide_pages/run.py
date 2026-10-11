@@ -439,7 +439,6 @@ def _review_actions(run: Run) -> list[dict[str, Any]]:
 
 
 def _actions(run: Run) -> list[dict[str, Any]]:
-    web = _serve_url(run.id)
     acts: list[dict[str, Any]] = []
     if _running(run):
         acts.extend(_stop_kill_actions(run))
@@ -447,7 +446,6 @@ def _actions(run: Run) -> list[dict[str, Any]]:
         acts.extend(_review_actions(run))
         acts.append(S.btn("Certify this change", S.page_link("verify", "certify", run=run.id)))
         acts.append(S.btn("Open run folder", S.reveal(str(run.run_dir)), "ghost"))
-    acts.append(S.btn("Open in web UI", S.url(web) if web else None, "ghost"))
     return acts
 
 
