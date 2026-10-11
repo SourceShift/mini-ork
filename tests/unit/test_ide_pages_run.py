@@ -133,6 +133,16 @@ def test_dag_layers_the_workflow_and_attributes_cost(home: Path) -> None:
     assert nodes["planner"]["state"] == "done" and nodes["planner"]["lane"] == "glm"
     assert nodes["implementer"]["lane"] == "minimax" and nodes["implementer"]["cost"] == "$0.07"
     assert nodes["test"]["lane"] == "shell" and nodes["test"]["cost"] == ""
+    # A deterministic node ran on no model, so it carries no role: the IDE
+    # prints the role right after the serving lane, and "command · verifier"
+    # would read as the lane that served it.
+    assert nodes["test"]["role"] == "" and nodes["publisher"]["role"] == ""
+    # ...while a node that did serve on a model keeps the lane it ran on.
+    assert nodes["implementer"]["role"] == "worker"
+    # The stage label still names what the column is *about*, blank role or not.
+    assert page["graph"]["heads"] == ["planner", "worker", "verifier", "reviewer",
+                                      "publisher", "stage 5"]
+    assert nodes["test"]["stage_lane"] == "verifier"
     assert nodes["rollback"]["state"] == "skipped"
     assert nodes["implementer"]["do"] == {"set": {"node": "implementer"}}
     # Nothing running or failed: the last finished node is inspected.
@@ -140,6 +150,17 @@ def test_dag_layers_the_workflow_and_attributes_cost(home: Path) -> None:
     coalition = _section(page, "pills")
     assert coalition["title"].startswith("Coalition")
     json.dumps(page)
+
+
+def test_inspector_names_no_lane_for_a_deterministic_node(home: Path) -> None:
+    """A shell node ran on no lane, so the one its role declares must not be
+    shown as if it had — the row read "shell · verifier" and was read as a
+    model that served the node."""
+    _seed(home)
+    page = build_page(home, "run", "dag", {"run": RUN, "node": "test"})
+    items = {i["k"]: i["v"] for i in _section(page, "inspector")["items"]}
+    assert items["Lane"] == "shell"
+    assert items["Provider"] == "deterministic · no model"
 
 
 def test_inspector_shows_the_selected_nodes_real_output(home: Path) -> None:

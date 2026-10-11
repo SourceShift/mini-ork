@@ -612,7 +612,16 @@ def _graph(run: Run, wanted: str | None = None) -> dict[str, Any]:
             # than editing ``spec.dag_node``'s positional signature (the
             # additive spec.py change was rejected to keep the diff inside
             # the kickoff's 4-file scope).
-            node_dict["role"] = n.role_lane
+            #
+            # A deterministic node ran on no model, so ``role_lane`` — the lane
+            # agents.yaml *declares* for its role — names nothing that served
+            # it. The IDE prints this field beside the serving lane
+            # (``lane_label(family) · role``), so a shell node would read
+            # "command · minimaxm3_lens": a MiniMax node, which it is not. The
+            # declaration still names the *stage*, so it moves to
+            # ``stage_lane`` for ``_head_for`` instead of being dropped here.
+            node_dict["role"] = "" if n.family == "shell" else n.role_lane
+            node_dict["stage_lane"] = n.role_lane
             node_dict["dur"] = _wall(n)
             node_dict["gates"] = ", ".join(n.gates) or "—"
             col.append(node_dict)
@@ -658,7 +667,10 @@ def _dag_tab(run: Run, wanted: str | None) -> list[dict[str, Any]]:
                     else " · ".join(p for p in (str(prov.get("model") or ""), str(prov.get("kind") or "")) if p)
                     or sel.family)
         items = [
-            ("Lane", f"{sel.family} · {sel.role_lane}" if sel.role_lane and sel.role_lane != sel.family
+            # A shell node ran on no lane, so the lane its role declares would
+            # read here as the lane that served it — "shell · minimaxm3_lens".
+            ("Lane", f"{sel.family} · {sel.role_lane}"
+             if sel.role_lane and sel.role_lane != sel.family and sel.family != "shell"
              else sel.family, f"fam:{sel.family}"),
             ("Provider", provider),
             ("Gates", ", ".join(sel.gates) or "—"),
@@ -709,11 +721,16 @@ def _dag_tab(run: Run, wanted: str | None) -> list[dict[str, Any]]:
 
 
 def _head_for(col: list[dict[str, Any]], idx: int) -> str:
-    """One stage label per DAG column: the first node's role, else ``stage N``."""
+    """One stage label per DAG column: the lane its nodes declare, else ``stage N``.
+
+    Read from ``stage_lane`` rather than ``role`` because ``role`` is blank on
+    a deterministic node — the label names the *stage*, not who served the
+    node, and a column may hold nothing but shell steps.
+    """
     for node_dict in col:
-        role = str(node_dict.get("role") or "")
-        if role:
-            return role
+        lane = str(node_dict.get("stage_lane") or node_dict.get("role") or "")
+        if lane:
+            return lane
     return f"stage {idx}"
 
 
