@@ -166,12 +166,51 @@ def _write_apply_sentinels():
             and os.path.getsize(os.path.join(WORK_PARENT, "diff-applied.post.sha256")) > 0)
 
 
+def _materialise_submodules(root, dest):
+    """Copy the target's submodule content into the extracted copy.
+
+    ``git archive`` writes a submodule gitlink as an EMPTY directory, so a target
+    that vendors code that way hands the copy a hole where the vendored tree
+    should be: paths the target really has read as absent, and neither the diff
+    nor a test that needs them can work. Re-archive each submodule at the commit
+    the target records and unpack it over the same path.
+
+    Read from the target's own checkout instead of fetching: a verifier that
+    reaches the network stops being reproducible, and the remote may no longer
+    serve that commit. A submodule the target has not initialised has nothing
+    local to read, so it is skipped rather than guessed at."""
+    if not os.path.isfile(os.path.join(root, ".gitmodules")):
+        return
+    listed = subprocess.run(
+        ["git", "-C", root, "config", "-f", os.path.join(root, ".gitmodules"),
+         "--get-regexp", r"^submodule\..*\.path$"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    for line in listed.stdout.splitlines():
+        path = line.partition(" ")[2].strip()
+        if not path:
+            continue
+        source = os.path.join(root, path)
+        recorded = subprocess.run(
+            ["git", "-C", root, "rev-parse", "--verify", "-q", f"HEAD:{path}"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True).stdout.strip()
+        if not recorded or not os.path.exists(os.path.join(source, ".git")):
+            continue
+        archived = subprocess.run(["git", "-C", source, "archive", recorded],
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        if archived.returncode != 0:
+            continue
+        target = os.path.join(dest, path)
+        os.makedirs(target, exist_ok=True)
+        tarfile.open(fileobj=io.BytesIO(archived.stdout)).extractall(target)
+
+
 def _make_patched_copy():
     shutil.rmtree(WORK_PARENT, ignore_errors=True)
     os.makedirs(WORKTREE)
     archive = subprocess.run(["git", "-C", REPO_ROOT, "archive", _base_ref()],
                              stdout=subprocess.PIPE, check=True).stdout
     tarfile.open(fileobj=io.BytesIO(archive)).extractall(WORKTREE)
+    _materialise_submodules(REPO_ROOT, WORKTREE)
     if not _assert_copy_is_own_git_root():
         return False
     sentinel = _diff_sentinel_path()

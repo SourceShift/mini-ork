@@ -14,12 +14,21 @@ from the recorded base (``pre-implementer-ref``), not HEAD, or the diff reads as
 'already applied' and fails again.
 
 The verifiers now prefer ``MO_TARGET_CWD`` and archive ``pre-implementer-ref``.
+
+Third: the target vendors its crate as a submodule too, so archiving the right
+repo is still not enough — ``git archive`` writes a gitlink as an EMPTY
+directory, and the copy loses the vendored tree the target really has. Both
+verifiers now materialise each submodule from the target's own checkout. The
+fixture below used to build ``ui/`` with ``mkdir``, which is exactly why the
+suite stayed green over the hole; ``_add_submodule`` replaces that.
 """
 from __future__ import annotations
 
+import io
 import os
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -61,6 +70,16 @@ def _diff(target: Path, rel: str, new_text: str) -> str:
     diff = _git(target, "diff")
     _git(target, "checkout", "-q", "--", rel)
     return diff
+
+
+def _add_submodule(target: Path, name: str, crate: Path) -> None:
+    """Register ``crate`` as a REAL submodule of ``target`` at ``name``.
+
+    A path created with ``mkdir`` models the world before the vendoring move and
+    cannot fail the way production does: ``git archive`` copies a directory, so a
+    fixture built from one never shows the hole a gitlink leaves."""
+    _git(target, "-c", "protocol.file.allow=always", "submodule", "add", str(crate), name)
+    _git(target, "commit", "-q", "-m", f"vendor {name}")
 
 
 def _name(verifier: str) -> str:
@@ -135,3 +154,44 @@ def test_copy_uses_base_ref_when_head_already_carries_the_patch(tmp_path: Path,
     (run_dir / "framework-edit.diff").write_text(diff)
     rows = _run_verifier(run_dir, verifier, engine=engine, target=target, base_ref=base)
     assert rows[cid] == "true", rows
+
+
+def _vendored(tmp_path: Path) -> tuple[Path, Path, str]:
+    """The target vendors ``ui/`` as a REAL submodule — what production looks like
+    now. The diff touches a superproject file, because git cuts no diff across a
+    gitlink, so "the diff applied" can no longer be the proof that the copy is
+    faithful: only the vendored tree can show that."""
+    crate = _init(tmp_path / "crate", {"Cargo.toml": "[package]\n", "src/page.rs": "// a\n"})
+    target = _init(tmp_path / "target", {"mod.py": "V = 1\n"})
+    _add_submodule(target, "ui", crate)
+    engine = _init(tmp_path / "engine", {"mod.py": "V = 1\n"})
+    return engine, target, _diff(target, "mod.py", "V = 2\n")
+
+
+def _copied(run_dir: Path, verifier: str, rel: str) -> Path:
+    return run_dir / f"verifier-{_name(verifier)}-work" / "repo" / rel
+
+
+@pytest.mark.parametrize("verifier,cid", CASES)
+def test_copy_carries_a_vendored_submodule(tmp_path: Path, verifier: str,
+                                           cid: str) -> None:
+    """``git archive`` leaves a gitlink as an EMPTY directory, so the copy must
+    rebuild the vendored tree or paths the target really has read as absent."""
+    engine, target, diff = _vendored(tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "framework-edit.diff").write_text(diff)
+    rows = _run_verifier(run_dir, verifier, engine=engine, target=target)
+    assert rows[cid] == "true", rows
+    assert _copied(run_dir, verifier, "ui/src/page.rs").read_text() == "// a\n", \
+        "the vendored submodule is missing from the copy"
+
+
+def test_archive_alone_is_what_loses_the_submodule(tmp_path: Path) -> None:
+    """Teeth: the raw archive the verifier starts from has no ``ui/src/page.rs``
+    at all, so a copy that has one can only have materialised the submodule."""
+    _, target, _ = _vendored(tmp_path)
+    archive = subprocess.run(["git", "-C", str(target), "archive", "HEAD"],
+                             check=True, capture_output=True).stdout
+    names = tarfile.open(fileobj=io.BytesIO(archive)).getnames()
+    assert "ui/src/page.rs" not in names, names
