@@ -1,0 +1,22 @@
+name: skill_smoke
+description: >
+  Skill-registry smoke test. Two researcher nodes — one granted a skill by
+  name, one not — plus a deterministic verifier that proves the grant reached
+  the granted node's harness and never reached the control. Exercises the
+  full seam: workflow.yaml `skills:` → MO_SKILLS envelope → per-node
+  materialization into `.claude/skills/` → harness-visible SKILL.md →
+  release after the node. Expected wall time ~40s, cost ~$0.10.
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+matches:
+  keywords:
+    - skill-smoke
+    - skills-smoke
+  path_globs: []
+  regex: []
+
+default_gates: []
+risk_class: low
+version: "0.1.0"

@@ -21,11 +21,24 @@ working tree a human also uses:
 * release removes only the links *we* created, and only while they are still
   links to *our* source. A directory a node created in the meantime is its
   output, not our scaffolding, and is left alone.
+
+**Sandbox runs copy instead of link.** A symlink carries an absolute host
+path; inside a container that bind-mounts only the run's shared drive, the
+registry's directory is not mounted, so the link dangles. When the node's
+harness is spawned into a workspace (``MO_SANDBOX_SCOPE=agent`` /
+``MO_SANDBOX_BACKEND`` other than host), grants are *copied* into the
+checkout — the copy rides the bind mount, so it resolves in the container.
+Release removes a copy only while it is still the directory we created.
+
+A registry entry is a directory that contains a ``SKILL.md``. Anything else
+(a stray directory, a file) is not a skill and is skipped at load time, so a
+grant can never materialize something the harness would choke on.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -33,6 +46,10 @@ from pathlib import Path
 
 #: Where a harness looks for skills, relative to the directory the node runs in.
 SKILL_DIR_RELATIVE = os.path.join(".claude", "skills")
+
+#: The file that names a skill directory. Same contract as the Zed editor's
+#: skill system (``crates/agent_skills``), so one directory serves both.
+SKILL_FILE = "SKILL.md"
 
 
 class SkillRegistryError(ValueError):
@@ -58,15 +75,96 @@ def skill_source_dirs(env: Mapping[str, str] | None = None) -> list[Path]:
 
 
 def load_skills(env: Mapping[str, str] | None = None) -> dict[str, Path]:
-    """``{name: directory}`` for every skill the registries define."""
+    """``{name: directory}`` for every skill the registries define.
+
+    A directory without a ``SKILL.md`` is not a skill: it is skipped here
+    rather than symlinked into a node's checkout, where the harness would
+    find a name it cannot open. ``invalid_skill_entries`` reports those so
+    ``mini-ork skills validate`` can name them.
+    """
     skills: dict[str, Path] = {}
     for directory in skill_source_dirs(env):
         if not directory.is_dir():
             continue
         for entry in sorted(directory.iterdir()):
-            if entry.is_dir() and entry.name not in skills:
+            if (
+                entry.is_dir()
+                and (entry / SKILL_FILE).is_file()
+                and entry.name not in skills
+            ):
                 skills[entry.name] = entry
     return skills
+
+
+def invalid_skill_entries(env: Mapping[str, str] | None = None) -> list[Path]:
+    """Registry directories that look like a skill but have no ``SKILL.md``."""
+    bad: list[Path] = []
+    for directory in skill_source_dirs(env):
+        if not directory.is_dir():
+            continue
+        for entry in sorted(directory.iterdir()):
+            if entry.is_dir() and not (entry / SKILL_FILE).is_file():
+                bad.append(entry)
+    return bad
+
+
+def describe_skill(directory: str | Path) -> dict[str, str]:
+    """``{name, description}`` from a skill directory's ``SKILL.md`` frontmatter.
+
+    Stdlib-only parse of the leading ``---`` block: ``name:`` and
+    ``description:`` keys, with indented continuation lines folded into the
+    value. Missing frontmatter degrades to the directory name and an empty
+    description — a listing must not crash on a hand-written skill.
+    """
+    d = Path(directory)
+    name = d.name
+    description = ""
+    try:
+        text = (d / SKILL_FILE).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {"name": name, "description": description}
+    lines = text.splitlines()
+    if lines and lines[0].strip() == "---":
+        key: str | None = None
+        for line in lines[1:]:
+            if line.strip() == "---":
+                break
+            if line[:1] not in (" ", "\t") and ":" in line:
+                key, _, value = line.partition(":")
+                key = key.strip()
+                value = value.strip()
+                if key == "name" and value:
+                    name = value
+                elif key == "description":
+                    # Strip a yaml block-scalar marker (">", "|", ">-"): the
+                    # text is what matters, not the folding style.
+                    description = value.lstrip(">|-").strip()
+            elif key == "description" and line.strip():
+                # Folded/yaml continuation of the description value.
+                description = (description + " " + line.strip()).strip()
+    return {"name": name, "description": description}
+
+
+def resolve_materialize_mode(env: Mapping[str, str] | None = None) -> str:
+    """``"symlink"`` on host dispatch, ``"copy"`` when the harness is sandboxed.
+
+    ``MO_SKILLS_MODE`` wins outright (an operator pin for odd setups). Otherwise
+    a sandboxed harness spawn (``MO_SANDBOX_SCOPE=agent``, or a non-host
+    ``MO_SANDBOX_BACKEND``) means the registry's absolute paths are not visible
+    inside the workspace, so grants must be copied in.
+    """
+    e = os.environ if env is None else env
+    pinned = str(e.get("MO_SKILLS_MODE") or "").strip().lower()
+    if pinned in ("symlink", "copy"):
+        return pinned
+    if pinned:
+        sys.stderr.write(f"[skills] unknown MO_SKILLS_MODE {pinned!r}; ignoring\n")
+    if str(e.get("MO_SANDBOX_SCOPE") or "").strip() == "agent":
+        return "copy"
+    backend = str(e.get("MO_SANDBOX_BACKEND") or "").strip()
+    if backend and backend != "host":
+        return "copy"
+    return "symlink"
 
 
 def target_skills_dir(working_directory: str | Path) -> Path:
@@ -76,14 +174,32 @@ def target_skills_dir(working_directory: str | Path) -> Path:
 
 @dataclass
 class MaterializedSkills:
-    """The links created for one node. ``release()`` is idempotent."""
+    """The entries created for one node. ``release()`` is idempotent.
 
+    ``created`` holds symlinks; ``created_copies`` holds directories copied in
+    for sandboxed spawns (a copy rides the bind mount; a symlink would dangle).
+    ``granted`` mirrors what the caller asked for, so the outcome triple
+    (created / missing / skipped) can be recorded per node without re-deriving
+    the request.
+    """
+
+    granted: list[str] = field(default_factory=list)
     created: list[Path] = field(default_factory=list)
+    created_copies: list[Path] = field(default_factory=list)
     missing: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
 
+    def outcome(self) -> dict[str, list[str]]:
+        """The grant outcome for a node event: names only, no paths."""
+        return {
+            "granted": list(self.granted),
+            "created": [p.name for p in self.created] + [p.name for p in self.created_copies],
+            "missing": list(self.missing),
+            "skipped": list(self.skipped),
+        }
+
     def release(self) -> None:
-        """Remove only the links we made, and only while they are still ours."""
+        """Remove only what we made, and only while it is still ours."""
         while self.created:
             link = self.created.pop()
             try:
@@ -93,6 +209,14 @@ class MaterializedSkills:
                 # its output, not our scaffolding, so it stays.
             except OSError as exc:
                 sys.stderr.write(f"[skills] could not remove {link}: {exc}\n")
+        while self.created_copies:
+            tree = self.created_copies.pop()
+            try:
+                if tree.is_dir() and not tree.is_symlink():
+                    shutil.rmtree(tree)
+                # Replaced by something else: the node's output, not ours.
+            except OSError as exc:
+                sys.stderr.write(f"[skills] could not remove {tree}: {exc}\n")
 
     def __enter__(self) -> MaterializedSkills:
         return self
@@ -107,25 +231,33 @@ def materialize_skills(
     *,
     registry: Mapping[str, Path] | None = None,
     env: Mapping[str, str] | None = None,
+    mode: str = "",
 ) -> MaterializedSkills:
-    """Symlink each granted skill into the node's checkout.
+    """Link (or, sandboxed, copy) each granted skill into the node's checkout.
 
     Returns a handle whose ``release()`` undoes it. A name the registry does not
     define is reported and skipped rather than failing the node — the same
     posture the MCP registry takes with an unconfigured server, so a typo costs
-    a warning and not a run.
+    a warning and not a run. ``mode`` defaults to
+    ``resolve_materialize_mode(env)``: symlink on host dispatch, copy when the
+    harness itself is spawned into a sandboxed workspace.
     """
     names = [str(name).strip() for name in granted if str(name).strip()]
-    handle = MaterializedSkills()
+    handle = MaterializedSkills(granted=names)
     if not names:
         return handle
 
+    resolved_mode = mode or resolve_materialize_mode(env)
     sources = dict(registry) if registry is not None else load_skills(env)
     destination = target_skills_dir(working_directory)
 
     for name in names:
         source = sources.get(name)
-        if source is None:
+        if source is None or not (source / SKILL_FILE).is_file():
+            # Unknown, or a registry entry without a SKILL.md (load_skills
+            # filters those; an explicitly passed registry map might not).
+            # Either way the harness would get a name it cannot open — the
+            # same warning-and-skip posture as a typo.
             handle.missing.append(name)
             sys.stderr.write(
                 f"[skills] {name!r} is granted but no skill by that name is in "
@@ -140,10 +272,17 @@ def materialize_skills(
             continue
         try:
             destination.mkdir(parents=True, exist_ok=True)
-            link.symlink_to(source.resolve())
+            if resolved_mode == "copy":
+                shutil.copytree(source, link)
+                handle.created_copies.append(link)
+            else:
+                link.symlink_to(source.resolve())
+                handle.created.append(link)
         except OSError as exc:
-            raise SkillRegistryError(f"cannot link skill {name!r} into {destination}: {exc}") from exc
-        handle.created.append(link)
+            raise SkillRegistryError(
+                f"cannot materialize skill {name!r} into {destination} "
+                f"({resolved_mode}): {exc}"
+            ) from exc
     return handle
 
 

@@ -73,7 +73,15 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
     (h / "config").mkdir()
     (h / "config" / "mcp_servers.json").write_text(json.dumps(REGISTRY))
-    (h / "config" / "skills" / "arxiv-search").mkdir(parents=True)
+    # A "present" skill must be grantable: the registry resolves names to
+    # directories holding a SKILL.md, and a grant to a hollow entry is
+    # silently skipped — so a hollow dir here would read "not found".
+    arxiv = h / "config" / "skills" / "arxiv-search"
+    arxiv.mkdir(parents=True)
+    (arxiv / "SKILL.md").write_text(
+        "---\nname: arxiv-search\ndescription: search arxiv\n---\n\n# arxiv-search\n",
+        encoding="utf-8",
+    )
 
     run_dir = h / "runs" / RUN
     run_dir.mkdir(parents=True)

@@ -695,11 +695,22 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     # and released when it ends, wrapping exactly the handler call: a grant is
     # scoped to one node, so a skill the reviewer was not granted is simply not
     # there while the reviewer runs. The finally covers every return path and a
-    # handler that raises.
+    # handler that raises. Materialization mode (symlink vs copy) follows the
+    # harness spawn: a sandboxed spawn cannot follow host-absolute symlinks.
     _materialized_skills = materialize_skills(
         granted_skills(compiled_workflow, node_id),
         context_env("MO_TARGET_CWD", "") or os.getcwd(),
     )
+    if _materialized_skills.granted:
+        # The grant outcome is a node fact, not stderr: a missing or shadowed
+        # skill costs a warning, not a run, but it must be findable after the
+        # run from the node's event stream (the typo would otherwise be
+        # invisible once the terminal scrolls away). Emitted BEFORE the handler
+        # so it is recorded even when the handler dies.
+        mo_node_emit(
+            run_id, node_id, node_type, "skills",
+            json.dumps(_materialized_skills.outcome()), db=db,
+        )
     try:
         rc, finish_reason = handler(ctx)
     finally:

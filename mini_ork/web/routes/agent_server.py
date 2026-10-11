@@ -510,7 +510,11 @@ def _conversation_info(record: dict[str, Any]) -> dict[str, Any]:
     Required-by-type fields the canvas reads are filled honestly: mini-ork
     owns the agent/LLM server-side, so ``agent.llm.model`` names the lane
     policy rather than a client LLM, and ``persistence_dir`` is the run
-    directory namespace the id maps to.
+    directory namespace the id maps to. ``activated_knowledge_skills`` stays
+    empty on purpose: skills are granted per NODE (workflow.yaml ``skills:``,
+    materialized at the node boundary), and a conversation-level list would
+    claim an activation that has not happened yet. The registry a run grants
+    from is served by ``POST /api/skills``.
     """
     return {
         "id": record["id"],

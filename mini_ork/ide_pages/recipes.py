@@ -92,7 +92,17 @@ def _recipe_sections(home: Path, args: dict[str, str], errors: dict[str, str],
 
     def flow() -> dict[str, Any]:
         nodes = [n for n in workflow.get("nodes") or [] if isinstance(n, dict)]
-        items = [(str(n.get("name")), str(n.get("model_lane") or n.get("type") or ""),
+
+        def _sub(n: dict) -> str:
+            lane = str(n.get("model_lane") or n.get("type") or "")
+            skills = n.get("skills") or []
+            if isinstance(skills, str):
+                skills = [p.strip() for p in skills.split(",") if p.strip()]
+            if skills:
+                lane = (lane + " · " if lane else "") + f"skills: {', '.join(map(str, skills))}"
+            return lane
+
+        items = [(str(n.get("name")), _sub(n),
                   "cyan" if n.get("type") == "verifier" else "text") for n in nodes]
         return S.flow("Flow", items or [("no nodes in workflow.yaml", "", "sub")], col=2)
 
@@ -114,6 +124,16 @@ def _recipe_sections(home: Path, args: dict[str, str], errors: dict[str, str],
                 lane = str(n["model_lane"])
                 fam = lanes.get(lane, "")
                 items.append(S.dot(f"{n.get('name')} → {lane}", fam))
+        # Skills granted per node — the same declaration the executor
+        # materializes at dispatch (see docs/CONFIG.md § Skills). Listed so a
+        # recipe reader sees the capability grants, not just the lanes.
+        for n in workflow.get("nodes") or []:
+            if isinstance(n, dict) and n.get("skills"):
+                skills = n["skills"]
+                if isinstance(skills, str):
+                    skills = [p.strip() for p in skills.split(",") if p.strip()]
+                items.append(S.dot(f"{n.get('name')} grants skills",
+                                   ", ".join(map(str, skills))))
         return S.lst("Contract", items, col=2)
 
     def checks() -> dict[str, Any]:

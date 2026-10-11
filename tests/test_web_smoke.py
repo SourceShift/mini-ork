@@ -2884,7 +2884,15 @@ def test_workspace_static_routes_answer_the_canvas_vocabulary(tmp_path: Path, mo
         }
         subdirs = client.get("/api/file/search_subdirs").json()
         assert subdirs["path"] == "." and subdirs["next_page_id"] is None
-        assert client.post("/api/skills").json() == {"skills": []}
+        # /api/skills serves the real registry (run/operator/project tiers).
+        # The shape is asserted, not the count: the registry follows env vars
+        # this test does not pin, so an empty list is legal, a missing field
+        # is not.
+        skills_payload = client.post("/api/skills").json()
+        assert isinstance(skills_payload.get("skills"), list)
+        for entry in skills_payload["skills"]:
+            assert set(entry) >= {"name", "description", "source", "path"}
+            assert entry["source"] in ("run", "operator", "project")
         sdk = client.get("/api/automation/sdk-version").json()
         assert sdk["sdk_version"] == AGENT_SERVER_PROTOCOL_VERSION
 
