@@ -41,6 +41,8 @@ Flags:
   --max-iters N        Hard stop after N dispatches (default unlimited)
   --budget-cap-usd X   Daily cost cap; refuses to dispatch when exceeded
                        (defaults to MO_DAILY_BUDGET_USD or 50.0)
+  --epic ID            Only dispatch the named epic(s); repeatable. Intersects
+                       the ready-set after it is picked (see MO_SCHED_EPIC_FILTER)
   --dry-run            Print what would be dispatched, do not invoke runner
   --help
 
@@ -51,6 +53,12 @@ Exit codes:
   3   max-iters reached
   4   --once only: a pre-dispatch hook deferred (exit 75); nothing consumed.
       Without --once the scheduler idles --idle-secs and re-probes instead.
+
+Epic allow-list (intersects the ready-set; the SQL and dep semantics are not
+touched, so an empty intersection is a normal idle, never an error):
+  MO_SCHED_EPIC_FILTER          comma-separated epic ids; only those are
+                                dispatched. `--epic ID` (repeatable) supplies
+                                the same list and overrides the env var.
 
 Retry loop (all opt-in; defaults keep the historic one-shot behaviour):
   MO_SCHED_MAX_ATTEMPTS=N       failed epics return to 'not started' until N
@@ -166,16 +174,39 @@ def effective_priority(epic_id: str, db: str | None = None) -> int:
         con.close()
 
 
-def pick_ready(db: str | None = None) -> list[str]:
+def _resolve_epic_filter(only) -> set[str] | None:
+    """The epic allow-list this pass, or None when no filter is in force.
+
+    Explicit ``only`` (a collection of ids — the CLI's ``--epic`` flags) wins
+    and the env var is then ignored; ``only=None`` falls back to
+    ``MO_SCHED_EPIC_FILTER`` (comma-separated). Whitespace around ids is
+    stripped and empty segments are dropped, so ``"a, b,"`` reads as {a, b}.
+    An empty/absent result means no filtering — the historical behaviour."""
+    if only is None:
+        only = os.environ.get("MO_SCHED_EPIC_FILTER", "").split(",")
+    elif isinstance(only, str):
+        only = only.split(",")
+    ids = {str(e).strip() for e in only if str(e).strip()}
+    return ids or None
+
+
+def pick_ready(db: str | None = None, only=None) -> list[str]:
     """Priority-ordered ready-set (Track B5 inheritance; ties oldest-first).
     Same query as bash _pick_next_epic WITHOUT the LIMIT 1 — the pool consumes
     the whole list. Within one priority tier the LEAST-attempted epic goes first,
     so a retrying epic can never starve the others (a first-failed-first retry
-    rule spun one step nine times while four other failures waited)."""
+    rule spun one step nine times while four other failures waited).
+
+    ``only`` restricts the result to a set of epic ids *after* the query runs;
+    the ready-set SQL (priority inheritance, hard-dep gating, attempt ordering)
+    is untouched. None falls back to MO_SCHED_EPIC_FILTER. The filter is a pure
+    intersection, so naming an epic that is not ready simply omits it and an
+    empty intersection yields [] — the caller's normal idle path."""
     try:
         ensure_retry_schema(db)
     except sqlite3.OperationalError:
         return []
+    keep = _resolve_epic_filter(only)
     con = _conn(db)
     try:
         rows = con.execute("""
@@ -206,7 +237,10 @@ def pick_ready(db: str | None = None) -> list[str]:
                       AND d.resolved_at IS NULL)
              ORDER BY ef.eff DESC, COALESCE(e.attempts, 0) ASC, e.created_at ASC
         """).fetchall()
-        return [r[0] for r in rows]
+        ready = [r[0] for r in rows]
+        if keep is not None:
+            ready = [e for e in ready if e in keep]
+        return ready
     except sqlite3.OperationalError:
         return []
     finally:
@@ -695,11 +729,12 @@ def run_pool(root: str, home: str, recipe: str = "epic-runner",
              db: str | None = None, max_parallel: int | None = None,
              max_iters: int = 0, budget_cap: float | None = None,
              dry_run: bool = False, runner_cmd: list[str] | None = None,
-             stats: dict | None = None) -> int:
+             stats: dict | None = None, only=None) -> int:
     """WIN #1 — bounded concurrent pool over the whole ready-set. Drains the
     queue: dispatches up to `max_parallel` epics at once, and as each finishes
     (cascading its deps), newly-ready epics join. Returns count dispatched.
-    Budget/cost-pause are re-checked before every admission, like the bash loop."""
+    Budget/cost-pause are re-checked before every admission, like the bash loop.
+    ``only`` is the epic allow-list forwarded to pick_ready (see its docstring)."""
     if max_parallel is None:
         max_parallel = int(os.environ.get("MO_SCHED_MAX_PARALLEL", "3"))
     if budget_cap is None:
@@ -715,8 +750,8 @@ def run_pool(root: str, home: str, recipe: str = "epic-runner",
         while True:
             if cost_pause_active(home) or today_cost_usd(db) >= budget_cap:
                 break
-            ready = [] if deferred else [e for e in pick_ready(db) if e not in
-                     {v for v in in_flight.values()} and e not in crashed]
+            ready = [] if deferred else [e for e in pick_ready(db, only=only)
+                     if e not in {v for v in in_flight.values()} and e not in crashed]
             while ready and len(in_flight) < max_parallel and (
                     max_iters <= 0 or dispatched < max_iters):
                 epic = ready.pop(0)
@@ -766,6 +801,7 @@ def main(
     max_iters = 0
     dry_run = False
     budget_cap = float(os.environ.get("MO_DAILY_BUDGET_USD", "50.0"))
+    epic_filter: list[str] = []
 
     def value_after(index: int, flag: str) -> str | None:
         if index + 1 < len(args):
@@ -785,6 +821,12 @@ def main(
         elif arg in {"--help", "-h"}:
             sys.stdout.write(_USAGE)
             return 0
+        elif arg == "--epic":
+            value = value_after(i, arg)
+            if value is None:
+                return 2
+            epic_filter.append(value)
+            i += 2
         elif arg in {"--idle-secs", "--max-iters", "--budget-cap-usd"}:
             value = value_after(i, arg)
             if value is None:
@@ -803,6 +845,10 @@ def main(
         else:
             sys.stderr.write(f"scheduler: unknown flag {arg}\n")
             return 2
+
+    # An explicit --epic list wins over MO_SCHED_EPIC_FILTER; no flag → None so
+    # pick_ready reads the env var itself. Never mutates os.environ.
+    only = epic_filter or None
 
     if not os.path.isfile(db):
         sys.stderr.write(f"scheduler: state.db not found at {db}\n")
@@ -825,7 +871,7 @@ def main(
             )
             return 2
 
-        ready = pick_ready(db)
+        ready = pick_ready(db, only=only)
         if not ready:
             if once:
                 sys.stdout.write("scheduler: queue empty (--once) → exit 0\n")
@@ -852,6 +898,7 @@ def main(
             dry_run=dry_run,
             runner_cmd=runner_cmd,
             stats=stats,
+            only=only,
         )
         dispatched_total += dispatched
         if stats.get("deferred"):

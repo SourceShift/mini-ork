@@ -15,6 +15,7 @@ from .routes import (
     artifacts as artifacts_routes,
     control as control_routes,
     dispatch as dispatch_routes,
+    features,
     fingerprint,
     fleet,
     ide as ide_routes,
@@ -80,6 +81,10 @@ def create_app(home: Path | None = None, dev_cors: bool = True) -> FastAPI:
         )
 
     app.include_router(fleet.router)
+    # The controllable-feature catalogue (`GET /api/v1/features`) — the wizard
+    # and IDE read it to render the knob list. Backed by the process-memory
+    # registry, so it needs no DB and is served before the SPA catch-all.
+    app.include_router(features.router)
     # run-artifacts (DB registry over run_artifacts). Mounted at
     # /artifact-records so it cannot shadow run_detail's /artifacts
     # filesystem-scan endpoints the SPA consumes.
