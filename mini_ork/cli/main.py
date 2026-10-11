@@ -98,6 +98,7 @@ _NATIVE_MODULE_SUBS = {
     "node-agent": "mini_ork.cli.node_agent",
     "nodes": "mini_ork.cli.nodes",
     "triage": "mini_ork.cli.triage",
+    "threads": "mini_ork.threads.cli",
 }
 
 _HELP = """mini-ork — task operating system for agents (v0.1)

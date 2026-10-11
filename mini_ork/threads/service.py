@@ -307,8 +307,13 @@ def _resolve_db(db: str | None, home: Path | str) -> str:
     """One path for the whole call, so the store and the traces read agree.
 
     Resolved once and threaded through every store call rather than left to
-    ``store``'s per-call env lookup: two readers of one state.db that resolve
     the path differently is exactly the bug a dual-sourced schema invites.
+
+    ``db`` → ``home/state.db``, with no environment in the chain on purpose: a
+    caller that named a home meant it, and reading ``MINI_ORK_DB`` here would let
+    a developer's shell silently redirect a call that passed an explicit tmp
+    home. The CLI resolves ``MINI_ORK_DB`` itself and passes the result as ``db``,
+    which is where that precedence belongs.
     """
     return db if db else str(Path(home) / "state.db")
 
