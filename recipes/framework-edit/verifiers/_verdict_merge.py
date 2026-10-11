@@ -78,14 +78,22 @@ def write_verdict(static_pass="", files_changed="", tests_pass=""):
     # Recompute pass — both required keys are now guaranteed present.
     cur["pass"] = bool(cur["static_pass"]) and bool(cur["tests_pass"])
 
-    # Enforce schema: files_changed:int, others:bool.
-    cur["files_changed"] = int(cur["files_changed"])
-    cur["static_pass"] = bool(cur["static_pass"])
-    cur["tests_pass"] = bool(cur["tests_pass"])
-    cur["pass"] = bool(cur["pass"])
+    # Enforce the artifact_contract verdict_schema exactly: only the four
+    # declared keys, emitted in the declared order. ``sort_keys=True`` would
+    # emit alphabetical order (files_changed, pass, static_pass, tests_pass),
+    # which the reviewer's reject condition names verbatim, so build an
+    # ordered dict instead. Foreign keys left in verdict.json by an earlier
+    # run-level writer (dispatched/failed_nodes/source/verdict) are dropped
+    # here so the recipe-owned verdict never carries executor bookkeeping.
+    ordered = {
+        "files_changed": int(cur["files_changed"]),
+        "tests_pass": bool(cur["tests_pass"]),
+        "static_pass": bool(cur["static_pass"]),
+        "pass": bool(cur["pass"]),
+    }
 
     fd, tmp = tempfile.mkstemp(prefix=".verdict.json.", dir=run_dir)
     with os.fdopen(fd, "w") as f:
-        json.dump(cur, f, indent=2, sort_keys=True)
+        json.dump(ordered, f, indent=2)
         f.write("\n")
     os.replace(tmp, verdict_path)

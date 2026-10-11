@@ -311,19 +311,27 @@ def _candidate_delta_entries(candidate_cwd: str, base_ref: str = "") -> list[tup
     seen: set[str] = set()
 
     proc = subprocess.run(
-        ["git", "status", "--porcelain", "--untracked-files=all"],
+        ["git", "status", "--porcelain", "-z", "--untracked-files=all"],
         cwd=candidate_cwd, capture_output=True, text=True,
     )
     if proc.returncode == 0:
-        for line in proc.stdout.splitlines():
-            if not line or len(line) < 3:
+        # `-z` NUL-separates entries and prints pathnames verbatim (no
+        # C-quoting), so a path with spaces/quotes/non-ASCII survives the
+        # round-trip. The old line-split parser kept git's literal double
+        # quotes, so every such test file was silently never overlaid. A
+        # rename is `XY <new>\0<old>\0`: the new path is the entry itself and
+        # the old path is the following field, which we skip.
+        fields = [f for f in proc.stdout.split("\0") if f]
+        i = 0
+        while i < len(fields):
+            entry = fields[i]
+            i += 1
+            if len(entry) < 4:
                 continue
-            # Renames print as `XY old -> new`; keep the new path.
-            if " -> " in line:
-                prefix, _, new_part = line.partition(" -> ")
-                status, rel_path = prefix[:2], new_part.strip()
-            else:
-                status, rel_path = line[:2], line[3:].strip()
+            status, rel_path = entry[:2], entry[3:]
+            if "R" in status or "C" in status:
+                if i < len(fields):
+                    i += 1  # skip the rename source (old path)
             # Skip ignored files (status `!!`) and empties.
             if not rel_path or status == "!!" or rel_path in seen:
                 continue

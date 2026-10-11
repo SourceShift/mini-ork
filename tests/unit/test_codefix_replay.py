@@ -586,6 +586,31 @@ def test_overlay_carries_js_ts_test_paths(tmp_path):
     assert "server/routes/__tests__/authorQuestions.test.ts" in out["replay"]["overlaid_tests"], out["replay"]
 
 
+def test_overlay_carries_test_path_with_space(tmp_path):
+    """A test path containing a space must still reach the base.
+
+    `git status --porcelain` without `-z` C-quotes such a path
+    (`"tests/unit with space/bug_fix.test.ts"`); the old parser kept the
+    literal double quotes, so `_is_test_path` rejected the quoted string and
+    the overlay silently skipped the file. This pins the NUL-delimited fix.
+    """
+    repo = _make_repo(
+        tmp_path,
+        mod_src="def add(a, b):\n    return a - b\n",
+        test_src="from mod import add\n\ndef test_add():\n    assert add(2, 3) == 5\n",
+    )
+    (repo / "mod.py").write_text("def add(a, b):\n    return a + b\n")
+    d = repo / "tests" / "unit with space"
+    d.mkdir(parents=True)
+    (d / "bug_fix.test.ts").write_text("// ts regression test\n")
+
+    out = _run_verifier(repo, tmp_path, replay="1", run_id="overlay-space-path")
+
+    assert out["verifier"] == "test"
+    assert "replay" in out, out
+    assert "tests/unit with space/bug_fix.test.ts" in out["replay"]["overlaid_tests"], out["replay"]
+
+
 # ── 8. base load failure of a candidate-ADDED module (defect #16) ───────────
 # The overlay carries a candidate's new test onto the base, but a test that
 # imports a module the candidate ADDED cannot load there: jest reports
