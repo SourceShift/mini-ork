@@ -364,7 +364,17 @@ def append_message(
                 (turn, now, thread_id),
             )
         else:
-            con.execute("UPDATE threads SET updated_at = ? WHERE id = ?", (now, thread_id))
+            # An explicit turn must still advance the allocator, or the next
+            # `turn=None` re-allocates a turn that already has rows: the mirror
+            # writes attempt 1's turn 1 explicitly, and the follow-up would then
+            # be handed turn 1 again — putting two rounds under one number and
+            # naming the continuation's run after the wrong turn. `max` because
+            # a projected run output can legitimately attach to an earlier turn.
+            con.execute(
+                "UPDATE threads SET last_turn = MAX(last_turn, ?), updated_at = ? "
+                "WHERE id = ?",
+                (int(turn), now, thread_id),
+            )
 
         try:
             cursor = con.execute(

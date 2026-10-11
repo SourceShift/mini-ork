@@ -95,6 +95,30 @@ def test_a_turn_is_allocated_once_and_never_reused(db: str):
     assert [m.turn for m in transcript] == [1, 1, 2]
 
 
+def test_an_explicit_turn_still_advances_the_allocator(db: str):
+    """The mirror path writes attempt 1's turn 1 explicitly. If that left
+    last_turn at 0 the follow-up would be handed turn 1 again — two rounds
+    under one number, and the continuation's run named after the wrong turn."""
+    store.open_thread("t1", db=db)
+    store.append_message("t1", role=MessageRole.USER, text="mirrored", turn=1, db=db)
+
+    assert store.get_thread("t1", db=db).last_turn == 1
+    follow_up = store.append_message("t1", role=MessageRole.USER, text="next", db=db)
+    assert follow_up.turn == 2
+
+
+def test_a_projected_output_does_not_pull_the_allocator_backwards(db: str):
+    """A run's output can attach to an earlier turn than the newest; the
+    allocator must keep the maximum, not take the last write."""
+    store.open_thread("t1", db=db)
+    store.append_message("t1", role=MessageRole.USER, text="one", db=db)      # turn 1
+    store.append_message("t1", role=MessageRole.USER, text="two", db=db)      # turn 2
+    store.append_message("t1", role=MessageRole.ASSISTANT, text="…",
+                         turn=1, event_id="late", db=db)
+
+    assert store.get_thread("t1", db=db).last_turn == 2
+
+
 def test_a_repeated_event_id_is_the_same_row(db: str):
     store.open_thread("t1", db=db)
     turn = store.append_message("t1", role=MessageRole.USER, text="go", db=db).turn

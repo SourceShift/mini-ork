@@ -54,12 +54,18 @@ DEFAULT_RECIPE = "code-fix"
 #: the text; this bounds how many we hand it.
 _HISTORY_LIMIT = 24
 
-#: ``task_runs`` statuses that mean the run is over. Mirrors the canvas's own
-#: map (``web/routes/agent_server.py``) without importing it — this module must
-#: stay importable with no web server and no fastapi installed. Any other
-#: status, including one this list has not seen, reads as *still running*, which
-#: is the safe direction: it steers rather than spawning a second run.
-_TERMINAL_TASK_STATUSES = frozenset({"published", "rolled_back", "failed"})
+#: ``task_runs`` terminal statuses and the run status each settles to. Mirrors
+#: the canvas's own map (``web/routes/agent_server.py``) without importing it —
+#: this module must stay importable with no web server and no fastapi installed.
+#: Any other status, including one this map has not seen, reads as *still
+#: running*, which is the safe direction: it steers rather than spawning a
+#: second run.
+_TERMINAL_TASK_STATUS_MAP = {
+    "published": RunStatus.FINISHED,
+    "rolled_back": RunStatus.ERROR,
+    "failed": RunStatus.ERROR,
+}
+_TERMINAL_TASK_STATUSES = frozenset(_TERMINAL_TASK_STATUS_MAP)
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +83,7 @@ class Delivery:
     message_id: int
     run_id: str | None = None
     kickoff_path: str | None = None
+    log_path: str | None = None
     detail: str | None = None
 
     @property
@@ -91,6 +98,7 @@ class Delivery:
             "message_id": self.message_id,
             "run_id": self.run_id,
             "kickoff_path": self.kickoff_path,
+            "log_path": self.log_path,
             "detail": self.detail,
         }
 
@@ -130,11 +138,21 @@ def deliver(
 
     runs = store.runs_for(thread_id, db=path)
     live = store.live_run(thread_id, db=path)
+    # A run this thread still calls live but the runner has already finished is
+    # the ordinary case for a canvas conversation: the run writes task_runs,
+    # whoever launched it wrote thread_runs, and nothing tells the thread. Left
+    # unreconciled a finished conversation would be *steered* — a no-op — where
+    # it should continue.
+    if live is not None and _settle_if_terminal(path, live):
+        runs = store.runs_for(thread_id, db=path)
+        live = None
     live_run_id = live.run_id if live is not None else None
     if live_run_id is None and _task_run_active(path, runs[-1].run_id if runs else thread_id):
-        # Not marked live here, but task_runs says the run is still going — the
-        # crash window between launch_run and link_run. Steering it is the only
-        # safe move: launching would put two runs on one thread.
+        # The mirror image: not marked live here, but task_runs says the run is
+        # still going — the crash window between launch_run and link_run, or a
+        # conversation created before threads existed (no thread_runs rows, only
+        # the run id, which is the thread id). Steering is the only safe move:
+        # launching would put two runs on one thread.
         live_run_id = runs[-1].run_id if runs else thread_id
     if live_run_id is not None:
         message = store.append_message(
@@ -185,6 +203,7 @@ def deliver(
         thread_id, "launched" if attempt == 1 else "continued",
         message.turn, message.id, run_id=run_id,
         kickoff_path=result.get("kickoff_path"),
+        log_path=result.get("log_path"),
     )
 
 
@@ -265,10 +284,24 @@ def _trace_outcome(path: str, run_id: str) -> tuple[str | None, tuple[str, ...]]
     return verdict, ((artifact,) if artifact else ())
 
 
-def _task_run_active(path: str, run_id: str) -> bool:
-    """Whether ``task_runs`` shows this run still going. Best-effort.
+def _settle_if_terminal(path: str, run: ThreadRun) -> bool:
+    """Settle ``run`` when ``task_runs`` already shows it over. True if it did.
 
-    A missing table or an unknown run id is ``False`` — the caller has already
+    The run status is not guessed from the task status text:
+    ``_TERMINAL_TASK_STATUS_MAP`` is the one place the two vocabularies meet.
+    """
+    status = _task_run_status(path, run.run_id)
+    settled = _TERMINAL_TASK_STATUS_MAP.get(status or "")
+    if settled is None:
+        return False
+    store.settle_run(run.run_id, settled, db=path)
+    return True
+
+
+def _task_run_status(path: str, run_id: str) -> str | None:
+    """``task_runs.status`` for a run, or ``None``. Best-effort.
+
+    A missing table or an unknown run id is ``None`` — the caller has already
     consulted the thread's own live index, and this only widens the net.
     """
     try:
@@ -280,10 +313,16 @@ def _task_run_active(path: str, run_id: str) -> bool:
         finally:
             con.close()
     except sqlite3.Error:
-        return False
+        return None
     if row is None:
-        return False
-    return str(row[0] or "") not in _TERMINAL_TASK_STATUSES
+        return None
+    return str(row[0] or "")
+
+
+def _task_run_active(path: str, run_id: str) -> bool:
+    """Whether ``task_runs`` shows this run still going."""
+    status = _task_run_status(path, run_id)
+    return status is not None and status not in _TERMINAL_TASK_STATUSES
 
 
 def _link_issue(issue_uid: str, run_id: str, path: str) -> None:

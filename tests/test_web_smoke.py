@@ -969,11 +969,15 @@ def test_agent_server_send_event_steers_running_conversation(
     )
 
 
-def test_agent_server_send_event_terminal_409(tmp_path, monkeypatch) -> None:
-    """A mini-ork conversation is a one-shot DAG: sends after terminal status
-    409 (the real agent-server would loop the agent; we diverge loudly
-    instead of silently steering a dead run)."""
-    from fastapi import HTTPException
+def test_agent_server_send_event_terminal_continues_thread(tmp_path, monkeypatch) -> None:
+    """A send after the run ended CONTINUES the same conversation.
+
+    This was the 409: a mini-ork conversation was a one-shot DAG, so a
+    follow-up had to be a new conversation. It no longer is — attempt 2 runs
+    under a new run id in the SAME conversation, and its kickoff carries the
+    prior turn and the prior outcome, which is the entire reason a continuation
+    is not just a second conversation.
+    """
     from mini_ork.web.routes import agent_server as mod
     import mini_ork.web.control as control
 
@@ -984,13 +988,36 @@ def test_agent_server_send_event_terminal_409(tmp_path, monkeypatch) -> None:
     )
     _seed_state_db(tmp_path, "conv-send-3", status="failed")
 
-    with pytest.raises(HTTPException) as exc:
-        mod.send_conversation_event(
-            {"role": "user", "content": "one more thing", "run": True},
-            "conv-send-3",
-            home=tmp_path,
-        )
-    assert exc.value.status_code == 409
+    out = mod.send_conversation_event(
+        {"role": "user", "content": "one more thing", "run": True},
+        "conv-send-3",
+        home=tmp_path,
+    )
+    assert out["ok"] is True
+
+    assert len(launches) == 2
+    assert launches[0]["run_id"] == "conv-send-3"
+    assert launches[1]["run_id"] == "conv-send-3-t2"   # attempt 2, new run id
+    kickoff = launches[1]["kickoff"]
+    assert "one more thing" in kickoff
+    assert "done work" in kickoff                      # the prior turn
+    assert "Outcome: error" in kickoff                 # the prior run failed
+    # Same conversation, running again — not a second one.
+    info = mod.get_conversation("conv-send-3", home=tmp_path)
+    assert info["id"] == "conv-send-3"
+    assert info["execution_status"] == "running"
+    # persistence_dir keeps its meaning across a continuation: the new run's
+    # log, not the kickoff.
+    assert info["persistence_dir"].endswith("conv-send-3-t2.log")
+
+    # One continuous transcript across both runs.
+    page = mod.search_conversation_events("conv-send-3", home=tmp_path, sort_order="TIMESTAMP")
+    user_texts = [
+        e["llm_message"]["content"][0]["text"]
+        for e in page["items"]
+        if e.get("llm_message", {}).get("role") == "user"
+    ]
+    assert user_texts == ["done work", "one more thing"]
 
 
 def test_agent_server_send_event_rejects_bad_requests(tmp_path) -> None:

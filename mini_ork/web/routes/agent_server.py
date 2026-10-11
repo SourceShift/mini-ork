@@ -66,6 +66,9 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
+from mini_ork.threads import kickoff as _kickoff
+from mini_ork.threads.model import ThreadOrigin
+
 from ..deps import get_home, get_home_lenient
 
 # The agent-server wire version this fork was cut against
@@ -570,7 +573,9 @@ def create_conversation(
     }
 
     if initial_text:
-        kickoff = f"# {title or 'Conversation'}\n\n{initial_text}\n" if title else f"{initial_text}\n"
+        kickoff = _kickoff.compose(
+            _kickoff.Kickoff(title=title or "Conversation", task=initial_text)
+        )
         result = control.launch_run(home, recipe, kickoff, run_id=conversation_id)
         if not result.get("ok"):
             raise HTTPException(
@@ -585,6 +590,10 @@ def create_conversation(
         # log path as the one launcher-visible handle on the run's filesystem.
         record["persistence_dir"] = str(result.get("log_path") or "")
         record["messages"].append({"text": initial_text, "ts": now})
+        _mirror_new_thread(
+            home, conversation_id, title=title or "", recipe=recipe,
+            text=initial_text, kickoff_path=result.get("kickoff_path"),
+        )
 
     _save_conversation(home, record)
     return _conversation_info(record)
@@ -782,20 +791,26 @@ def _message_event(
 
 
 def _refresh_execution_status(home: Path, record: dict[str, Any]) -> None:
-    """Lift execution_status from the live task_runs row, in place.
+    """Lift execution_status from the thread's LATEST run, in place.
 
     The sidecar records launch-time state ("running"); the run's real
     trajectory lives in task_runs. Terminal statuses map onto the canvas
     ConversationExecutionStatus vocabulary; a live/unknown row keeps
     "running"; no row yet (run still bootstrapping) keeps the sidecar value.
+
+    The run asked about is the thread's newest, not the conversation id: after
+    a follow-up the conversation is running again under a second run id, and
+    reading only attempt 1 would report a finished conversation forever.
     """
     if not record.get("run_launched"):
         return
+    runs = _thread_runs(home, str(record["id"]))
+    run_id = runs[-1].run_id if runs else str(record["id"])
     db = _state_db(home)
     if db is None:
         return
     try:
-        row = db.row("SELECT status FROM task_runs WHERE id = ?", (record["id"],))
+        row = db.row("SELECT status FROM task_runs WHERE id = ?", (run_id,))
     except Exception:
         return
     if not row:
@@ -826,12 +841,19 @@ def _conversation_events(home: Path, record: dict[str, Any]) -> list[dict[str, A
 
     db = _state_db(home)
     if record.get("run_launched") and db is not None and db.has_table("run_events"):
+        # Across EVERY run of the thread, so a follow-up's transcript continues
+        # in the same conversation instead of starting a second one. The user
+        # turns above come from the sidecar ledger, which is dual-written with
+        # the thread's messages and keeps these event ids stable (the canvas
+        # dedupes on them, so re-sourcing them would renumber history).
+        run_ids = [run.run_id for run in _thread_runs(home, cid)] or [cid]
+        placeholders = ", ".join("?" for _ in run_ids)
         rows = db.rows(
-            """
+            f"""
             SELECT event_id AS id, event_type, payload_json, created_at
-            FROM run_events WHERE run_id = ? ORDER BY created_at ASC
+            FROM run_events WHERE run_id IN ({placeholders}) ORDER BY created_at ASC
             """,
-            (cid,),
+            tuple(run_ids),
         )
         for row in rows:
             try:
@@ -862,8 +884,13 @@ def _conversation_events(home: Path, record: dict[str, Any]) -> list[dict[str, A
                 )
 
         if db.has_table("task_runs"):
+            # The newest run's outcome closes the transcript; an earlier run's
+            # `-final` stays in history, which is the honest record of a thread
+            # that was continued.
+            final_id = run_ids[-1]
             tr = db.row(
-                "SELECT status, verdict, ended_at FROM task_runs WHERE id = ?", (cid,)
+                "SELECT status, verdict, ended_at FROM task_runs WHERE id = ?",
+                (final_id,),
             )
             if tr and str(tr.get("status") or "") in _TERMINAL_RUN_STATUSES:
                 status = str(tr["status"])
@@ -872,7 +899,7 @@ def _conversation_events(home: Path, record: dict[str, Any]) -> list[dict[str, A
                     text += f" — verdict {tr['verdict']}"
                 events.append(
                     _message_event(
-                        f"{cid}-final",
+                        f"{final_id}-final",
                         _epoch_to_iso(tr.get("ended_at")),
                         "assistant",
                         text,
@@ -881,6 +908,65 @@ def _conversation_events(home: Path, record: dict[str, Any]) -> list[dict[str, A
 
     events.sort(key=lambda e: (e["timestamp"], e["id"]))
     return events
+
+
+def _thread_db(home: Path) -> str:
+    return str(Path(home) / "state.db")
+
+
+def _mirror_new_thread(
+    home: Path,
+    conversation_id: str,
+    *,
+    title: str,
+    recipe: str,
+    text: str,
+    kickoff_path: Any,
+) -> None:
+    """Record a canvas conversation's first turn in the thread tables.
+
+    The sidecar stays the canvas's own store of record, but a conversation IS a
+    thread — same id, same first run id — so the thread tables must know about
+    it or a later follow-up would look like a brand-new thread and try to launch
+    attempt 1 twice.
+
+    Best-effort, and swallowed the way this module swallows every other
+    best-effort step. A mirror that fails (a locked or unwritable state.db)
+    costs the conversation its *continuations*, which degrade to steered
+    no-ops — not its start, and not the run now spawning. Raising here would
+    500 a create whose run is already launched, which is strictly worse: the
+    caller would retry and launch a second one.
+    """
+    from mini_ork.threads import store as thread_store
+    from mini_ork.threads.model import MessageRole, ThreadOrigin
+
+    try:
+        db = _thread_db(home)
+        thread_store.open_thread(
+            conversation_id, title=title, origin=ThreadOrigin.IDE, recipe=recipe, db=db
+        )
+        thread_store.append_message(
+            conversation_id, role=MessageRole.USER, text=text, turn=1, db=db
+        )
+        thread_store.link_run(
+            conversation_id, conversation_id, attempt=1, recipe=recipe,
+            kickoff_path=kickoff_path, db=db,
+        )
+    except Exception:
+        return
+
+
+def _thread_runs(home: Path, conversation_id: str) -> list[Any]:
+    """The thread's runs, oldest first; empty when there is no thread row yet
+    (a conversation that predates the thread tables, or one whose mirror write
+    failed). Callers fall back to the conversation id, which IS the first run id.
+    """
+    from mini_ork.threads import store as thread_store
+
+    try:
+        return thread_store.runs_for(conversation_id, db=_thread_db(home))
+    except Exception:
+        return []
 
 
 def _load_conversation_or_404(home: Path, conversation_id: str) -> dict[str, Any]:
@@ -971,19 +1057,24 @@ def send_conversation_event(
 ) -> dict[str, Any]:
     """Send a message / start the agent loop (`ConversationClient.sendEvent`).
 
-    Body is a SendMessageRequest plus ``run: true``. Three regimes:
-      - run not launched → this message BECOMES the kickoff (launch_run,
-        same seam as conversation-create): the idle→running promise.
+    Body is a SendMessageRequest plus ``run: true``. This is
+    :func:`mini_ork.threads.service.deliver` — one state machine for every
+    sender, so the same call serves the canvas, a chat transport and the CLI:
+
+      - run not launched → this message BECOMES the kickoff: idle→running.
       - run live         → operator steering injection (control.steer_run):
         the message rides the next context_assemble pack of any in-flight
         node; it does NOT spawn a second run.
-      - run terminal     → 409: a mini-ork conversation is a one-shot DAG;
-        follow-ups need a new conversation (documented divergence from the
-        real agent-server, which would loop the agent again).
+      - run terminal     → a NEW run in the SAME conversation, carrying the
+        transcript and the prior outcome. (This used to be a 409: a mini-ork
+        conversation was a one-shot DAG. It no longer is — the canvas already
+        handles finished→running, because the real agent-server loops its
+        agent the same way.)
+
     Sent text is appended to the sidecar ledger either way, so it projects
     as a user MessageEvent immediately.
     """
-    from .. import control
+    from mini_ork.threads.service import deliver
 
     record = _load_conversation_or_404(home, conversation_id)
     # The send payload IS the message ({role, content[], run}) — unlike
@@ -992,45 +1083,36 @@ def send_conversation_event(
     if not text:
         raise HTTPException(status_code=400, detail="message text required")
 
-    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if not record.get("title"):
+        # deliver() writes the same title into the thread row, so the two
+        # records agree on what this conversation is called.
+        record["title"] = text.splitlines()[0][:80]
 
-    if not record.get("run_launched"):
-        if not record.get("title"):
-            record["title"] = text.splitlines()[0][:80]
-        kickoff = (
-            f"# {record['title']}\n\n{text}\n" if record.get("title") else f"{text}\n"
+    out = deliver(
+        home, conversation_id, text,
+        title=str(record.get("title") or ""),
+        origin=ThreadOrigin.IDE,
+        recipe=str(record.get("recipe") or DEFAULT_CONVERSATION_RECIPE),
+        source="agent-server-canvas",
+    )
+    if out.action == "error":
+        raise HTTPException(
+            status_code=500,
+            detail=f"run launch failed: {out.detail or 'unknown'}",
         )
-        recipe = str(record.get("recipe") or DEFAULT_CONVERSATION_RECIPE)
-        result = control.launch_run(home, recipe, kickoff, run_id=conversation_id)
-        if not result.get("ok"):
-            raise HTTPException(
-                status_code=500,
-                detail=f"run launch failed: {result.get('error', 'unknown')}",
-            )
+
+    if out.action in ("launched", "continued"):
+        # A continuation may reuse a finished conversation, so the record has
+        # to be told the run is going again — the canvas switches back to a
+        # live status on exactly this transition.
         record["run_launched"] = True
-        record["execution_status"] = "running"
-        record["persistence_dir"] = str(result.get("log_path") or "")
-    else:
-        _refresh_execution_status(home, record)
-        if record["execution_status"] in ("finished", "error"):
-            raise HTTPException(
-                status_code=409,
-                detail="conversation run already finished — start a new conversation",
-            )
-        db = _state_db(home)
-        if db is None:
-            raise HTTPException(
-                status_code=500, detail="state db unavailable for steering"
-            )
-        result = control.steer_run(
-            db, conversation_id, text, source="agent-server-canvas"
-        )
-        if not result.get("ok"):
-            raise HTTPException(
-                status_code=500,
-                detail=f"steering failed: {result.get('error', 'unknown')}",
-            )
+        if out.log_path:
+            # Same field, same meaning as create: the run's log file.
+            record["persistence_dir"] = str(out.log_path)
 
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if out.action != "duplicate":
+        record["execution_status"] = "running"
     record.setdefault("messages", []).append({"text": text, "ts": now})
     record["updated_at"] = now
     _save_conversation(home, record)
