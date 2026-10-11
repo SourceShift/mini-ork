@@ -3,7 +3,7 @@
 Covers the 12 acceptance criteria in
 ``kickoffs/auto/run-orchestrator.md`` §Done When. The core is pure — no DB,
 lane, or model — so every case runs against plain values. The impure adapter
-(``on_node_boundary``) is exercised only for its default-off contract (never
+(``on_node_boundary``) is exercised only for its default-on contract (never
 called into here), which is the load-bearing invariant.
 
 The test file deliberately clears ``MO_RUN_ORCHESTRATOR`` explicitly rather than
@@ -16,18 +16,20 @@ from mini_ork.orchestration import runner_orchestrator as ro
 
 
 # ── flag ─────────────────────────────────────────────────────────────────────
-def test_flag_default_off(monkeypatch):
+def test_flag_default_on(monkeypatch):
     monkeypatch.delenv("MO_RUN_ORCHESTRATOR", raising=False)
-    assert ro.enabled() is False
+    assert ro.enabled() is True
 
 
-def test_flag_on_truthy_variants(monkeypatch):
-    for value in ("1", "true", "YES", "on"):
-        monkeypatch.setenv("MO_RUN_ORCHESTRATOR", value)
-        assert ro.enabled() is True, value
-    for value in ("0", "off", ""):
+def test_flag_off_needs_explicit_opt_out(monkeypatch):
+    for value in ("0", "false", "NO", "Off"):
         monkeypatch.setenv("MO_RUN_ORCHESTRATOR", value)
         assert ro.enabled() is False, value
+    # Explicit "on", empty (≡ unset), and a typo all stay on: a typo must not
+    # silently disable the layer — MO_ORCH_BUDGET_USD is the real brake.
+    for value in ("1", "true", "YES", "on", "", "bannana"):
+        monkeypatch.setenv("MO_RUN_ORCHESTRATOR", value)
+        assert ro.enabled() is True, value
 
 
 # ── decisions ────────────────────────────────────────────────────────────────

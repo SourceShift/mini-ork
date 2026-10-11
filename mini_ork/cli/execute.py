@@ -1066,12 +1066,13 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                     statuses[field[0]] = "failed"
                     fail_count += 1
 
-            # ── per-run orchestrator (MO_RUN_ORCHESTRATOR=1; default off) ──
+            # ── per-run orchestrator (default on; MO_RUN_ORCHESTRATOR=0 opts out) ──
             # Observe each node outcome at the wave boundary and pick one of
             # advance/help/repair/mutate/promote (see
-            # mini_ork/orchestration/runner_orchestrator.py). With the flag unset
-            # this block is inert: nothing is imported and nothing is called, so
-            # the default path is byte-identical to before.
+            # mini_ork/orchestration/runner_orchestrator.py). With the flag
+            # explicitly disabled this block is inert: nothing is imported and
+            # nothing is called. Green nodes are skipped outright, so the
+            # no-fail path pays one ledger read per wave.
             #
             # Wired only on this dependency-graph path. The other ``_parallel``
             # call sites below (parallel / partitioned / serial dispatch) stay
@@ -3566,7 +3567,7 @@ def _open_state_db(db_path):
 def _orchestrator_act(run_dir, db, run_id, outcomes, retry_edges, *, revision_state):
     """Realize one per-run-orchestrator action per failed node in this wave.
 
-    Called (only when ``MO_RUN_ORCHESTRATOR`` is on) once per dependency-graph
+    Called (unless ``MO_RUN_ORCHESTRATOR`` explicitly disables the layer) once per dependency-graph
     wave with that wave's ``outcomes`` — ``(field, rc, finish_reason)`` tuples.
     For each failed node it asks the pure decision core (``on_node_boundary``)
     for one Action and performs the side effect, reusing existing machinery:

@@ -192,6 +192,8 @@ human_gate:
 | `MINI_ORK_BUDGET_USD` | `0` | Run cost cap in USD (0 = no limit; fires `budget_gate`) |
 | `MINI_ORK_DRY_RUN` | `0` | `1` = classify + plan only, no execution |
 | `MINI_ORK_VERBOSE` | `0` | `1` = debug-level log output |
+| `MO_RUN_ORCHESTRATOR` | `on` | `0`/`false`/`no`/`off` disables the per-run orchestrator (the adaptive layer that picks advance/help/repair/mutate/promote at node boundaries). Default on; a typo'd value stays on |
+| `MO_ORCH_BUDGET_USD` | `1.0` | Orchestrator spend cap in USD, measured against the run's real cost-ledger spend. Once the run has spent the cap the orchestrator goes quiet for the rest of the wave — this is the brake that makes default-on safe |
 
 ### Planner context injection
 

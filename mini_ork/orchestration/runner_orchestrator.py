@@ -12,9 +12,15 @@ them into ONE decision: at a node boundary, pick one of five actions
 
     advance · help · repair · mutate · promote
 
-from the node's typed outcome, and emit a learnable trace row. It ships behind
-``MO_RUN_ORCHESTRATOR=1`` — **default off**. With the flag unset the loop is
-byte-identical to today: nothing here is imported and nothing is called.
+from the node's typed outcome, and emit a learnable trace row. It is
+**default on**: every dependency-graph run gets it with no flag. Opt out per
+environment with ``MO_RUN_ORCHESTRATOR=0`` — with the flag explicitly
+disabled the loop is byte-identical to a no-orchestrator run: nothing is
+imported and nothing is called. The safety story that makes default-on
+tenable: green nodes are skipped outright (``rc == 0 → continue``), every
+action is bounded by ``MO_ORCH_BUDGET_USD`` (default $1) against the run's
+real spend, HELP messages pass ``guard_steer``, and the whole adapter is
+fail-safe — an orchestrator error can never take a run down.
 
 ## Pure core / impure adapter
 
@@ -94,7 +100,7 @@ ALL_ACTIONS = (ADVANCE, HELP, REPAIR, MUTATE, PROMOTE)
 # ── env contract ─────────────────────────────────────────────────────────────
 _ENV_FLAG = "MO_RUN_ORCHESTRATOR"
 _ENV_BUDGET = "MO_ORCH_BUDGET_USD"
-_TRUTHY = frozenset({"1", "true", "yes", "on"})
+_FALSY = frozenset({"0", "false", "no", "off"})
 _DEFAULT_BUDGET_USD = 1.0
 
 # Content-only nudges cost a little; a harness proposal costs a little more.
@@ -145,8 +151,14 @@ class Action:
 
 # ── flag / budget ────────────────────────────────────────────────────────────
 def enabled() -> bool:
-    """True when ``MO_RUN_ORCHESTRATOR`` is truthy (``1/true/yes/on``, any case)."""
-    return os.environ.get(_ENV_FLAG, "").strip().lower() in _TRUTHY
+    """True unless ``MO_RUN_ORCHESTRATOR`` is explicitly falsy (``0/false/no/off``, any case).
+
+    Default ON: unset, empty, or any unrecognized value enables the
+    orchestrator. Only an explicit opt-out disables it. Unrecognized values
+    stay "on" deliberately — a typo must not silently disable the layer;
+    the ``MO_ORCH_BUDGET_USD`` cap is the real brake, not this flag.
+    """
+    return os.environ.get(_ENV_FLAG, "").strip().lower() not in _FALSY
 
 
 def budget_ok(spent_usd: float) -> bool:

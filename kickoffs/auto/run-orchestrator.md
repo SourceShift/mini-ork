@@ -1,5 +1,12 @@
 # Per-run orchestrator — full loop scaffold (default off)
 
+> **Status update (2026-10-11):** the orchestrator shipped default-off as this
+> kickoff specifies, and the default has since been **flipped to ON**. Current
+> contract: enabled unless `MO_RUN_ORCHESTRATOR=0/false/no/off` (see
+> `docs/CONFIG.md` §Run behavior and
+> `mini_ork/orchestration/runner_orchestrator.py`). Everything below is the
+> original spec and reads as-of shipping.
+
 ## Goal
 
 Give every mini-ork run an **orchestrator observer** that sits at each DAG node
