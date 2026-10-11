@@ -105,7 +105,7 @@ experience and feeds it forward:
 
 | Feature | Where | What it gives you |
 |---|---|---|
-| Read-only web UI | `bin/mini-ork-serve` + `mini_ork/web/` + `ui/` | FastAPI + React over `state.db`: fleet view, per-run DAG forensics, agent transcripts, cost breakdowns. |
+| Read-only API | `bin/mini-ork serve` + `mini_ork/web/` | FastAPI JSON API over `state.db`: fleet summary, per-run DAG forensics, agent transcripts, cost breakdowns. The native UI is the Rust IDE in the `zed-mini-ork` fork (crate source at `ui/`). |
 | Trajectory metrics | `bin/mini-ork-metrics` + UI `/trajectory` | Cross-cycle cost trend, wall-time trend, finding-discovery rate, gradient yield per recipe. |
 | Coalition audit panel | UI `/fingerprint` | Which families ran which lens, per recipe, per run. |
 | Run event stream | `lib/mo_node_events.sh` (`run_events`) | Node-level lifecycle events for live progress. |

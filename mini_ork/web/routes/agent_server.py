@@ -1,5 +1,10 @@
 """OpenHands agent-server protocol shim (SE-3 UI fork, Slice 1).
 
+Historical note: the OpenHands agent-canvas SPA this shim was written for no
+longer ships in this repo (the UI is now the native Rust IDE in the
+`zed-mini-ork` fork). The routes stay because they still speak the agent-server
+wire protocol a canvas client expects, and nothing else mounts them.
+
 The forked OpenHands agent-canvas SPA won't leave its "add a backend"
 onboarding screen until the host it probes speaks the *agent-server* wire
 protocol. The probe (`ui/src/hooks/query/use-backends-health.ts::probeBackend`)
@@ -64,10 +69,17 @@ from fastapi.responses import JSONResponse
 from ..deps import get_home, get_home_lenient
 
 # The agent-server wire version this fork was cut against
-# (ui/config/defaults.json → versions.agentServer). Must stay a 3-part semver
-# at or above compatibility.minimumAgentServer, or the canvas rejects us with
-# AgentServerUnknownVersionError / AgentServerUnsupportedVersionError.
+# (the canvas's ui/config/defaults.json → versions.agentServer, still 1.39.1).
+# Must stay a 3-part semver at or above AGENT_SERVER_MINIMUM_VERSION, or the
+# canvas rejects us with AgentServerUnknownVersionError /
+# AgentServerUnsupportedVersionError.
 AGENT_SERVER_PROTOCOL_VERSION = "1.39.1"
+
+# The floor the canvas accepts (`compatibility.minimumAgentServer` in its
+# ui/config/defaults.json). That canvas tree no longer ships in this repo, so
+# this constant is now the owner of the floor: the smoke test parses both
+# constants and asserts the advertised version clears it.
+AGENT_SERVER_MINIMUM_VERSION = "1.28.0"
 
 # Process start, for the ServerInfo.uptime field the canvas surfaces in its
 # backend-details panel.

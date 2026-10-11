@@ -104,35 +104,6 @@ jobs:
         if: matrix.shard == 'rest'
         run: python -m pytest tests/ -q -p no:cacheprovider --ignore=tests/unit
 
-  ui:
-    name: ui typecheck + build
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: pnpm/action-setup@v6
-        with:
-          version: 11
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: ui/pnpm-lock.yaml
-
-      - name: Install deps
-        working-directory: ui
-        run: pnpm install --frozen-lockfile
-
-      - name: Typecheck
-        working-directory: ui
-        run: pnpm typecheck
-
-      - name: Build SPA
-        working-directory: ui
-        run: pnpm build
-
   web-smoke:
     name: web smoke tests
     runs-on: ubuntu-latest

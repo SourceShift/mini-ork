@@ -1,4 +1,4 @@
-"""Python port of bin/mini-ork-serve — boot the local observability UI.
+"""Python port of bin/mini-ork-serve — boot the local observability API.
 
 Strangler-fig parity port of the launcher. The server itself is already Python
 (``mini_ork.web.app:app``); this replicates the bash entrypoint's arg parsing,
@@ -16,7 +16,7 @@ import sys
 
 _USAGE = """Usage: mini-ork serve [--port N] [--host ADDR] [--home DIR] [--reload]
 
-Boot the local read-only observability UI. Binds 127.0.0.1:7090 by default.
+Boot the local read-only observability API. Binds 127.0.0.1:7090 by default.
 
 Options:
   --port N      HTTP port (default 7090)
@@ -26,10 +26,10 @@ Options:
   --help        This message
 
 Requirements:
-  Run make web-deps from the repo root.
+  Install the web extras (fastapi + uvicorn) via `make install`.
 
-The UI bundle (web/dist) is auto-served when built. Without it, the API
-remains usable at /api/v1/... and a JSON hint is returned at /.
+This server is API-only: it serves the JSON API at /api/v1/... and returns a
+JSON hint at /. The mini-ork UI is the Rust IDE in the zed-mini-ork fork.
 """
 
 
@@ -93,7 +93,7 @@ def main(argv: list[str] | None = None, *, root: str | None = None,
         return 1
     if not _deps_present():
         sys.stderr.write("mini-ork serve: missing 'fastapi' or 'uvicorn'\n")
-        sys.stderr.write("  Run 'make web-deps' from the repo root, or follow docs/UI.md.\n")
+        sys.stderr.write("  Install them with 'make install', or pip install fastapi 'uvicorn[standard]'.\n")
         return 1
 
     sys.stdout.write(
@@ -101,7 +101,7 @@ def main(argv: list[str] | None = None, *, root: str | None = None,
         f"  host : {opts['host']}:{opts['port']}\n"
         f"  home : {resolved_home}\n"
         f"  db   : {db_path}\n"
-        f"  ui   : http://{opts['host']}:{opts['port']}/  (api: /api)\n\n")
+        f"  api  : http://{opts['host']}:{opts['port']}/api\n\n")
     cmd = uvicorn_argv(opts["host"], opts["port"], opts["reload"])
     if not _exec:
         return 0

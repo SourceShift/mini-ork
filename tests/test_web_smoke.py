@@ -285,18 +285,22 @@ def test_agent_server_info_clears_frontend_compatibility_floor() -> None:
     contract: if the version regresses below the floor (or stops being a
     clean triple), the forked agent-canvas throws
     AgentServerUnsupportedVersionError / AgentServerUnknownVersionError and the
-    'add a backend' wall never drops. The floor is read from the same file the
-    UI reads (ui/config/defaults.json) so this test tracks the real contract."""
-    from mini_ork.web.routes.agent_server import server_info
+    'add a backend' wall never drops. The floor used to be read from the canvas's
+    ui/config/defaults.json; that tree no longer ships here, so the floor is now
+    owned by agent_server.AGENT_SERVER_MINIMUM_VERSION (which pins the canvas's
+    compatibility.minimumAgentServer) and this test tracks the real contract."""
+    from mini_ork.web.routes.agent_server import (
+        AGENT_SERVER_MINIMUM_VERSION,
+        server_info,
+    )
 
-    defaults = json.loads((ROOT / "ui" / "config" / "defaults.json").read_text())
-    floor = _semver_tuple(defaults["compatibility"]["minimumAgentServer"])
+    floor = _semver_tuple(AGENT_SERVER_MINIMUM_VERSION)
 
     out = server_info()
     reported = _semver_tuple(out["version"])
     assert reported >= floor, (
         f"advertised agent-server version {out['version']} is below the canvas "
-        f"floor {defaults['compatibility']['minimumAgentServer']} — onboarding will break"
+        f"floor {AGENT_SERVER_MINIMUM_VERSION} — onboarding will break"
     )
     # ServerInfo requires uptime + idle_time (ui typescript-client base.d.ts).
     assert isinstance(out["uptime"], (int, float))

@@ -1,5 +1,10 @@
 # OpenHands-native-surface — coverage matrix (synthesis)
 
+> **SUPERSEDED (2026-10-11).** The OpenHands agent-canvas frontend and the
+> pre-fork `ui.old/` tree were removed from the repo; the UI is now the native
+> Rust IDE in the `zed-mini-ork` fork (crate source at `ui/`). Kept as an audit
+> trail alongside `openhands-native-surface.spec.md`, not as a live contract.
+
 Synthesized from three lens reports: `glm` (endpoint enumeration), `minimax`
 (data contracts → FE surfaces), `opus` (subsystem/flow + spec critique).
 One factual dispute between lenses was adjudicated against the source tree

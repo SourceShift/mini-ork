@@ -157,8 +157,11 @@ def create_app(home: Path | None = None, dev_cors: bool = True) -> FastAPI:
             }
         )
 
-    # SPA: serve built React bundle when present. Falls back to API-only mode
-    # during early dev when web/dist hasn't been built yet.
+    # SPA: serve a built React bundle when one is present at mini_ork/web/static/.
+    # Nothing in this repo builds one any more — the mini-ork UI is the Rust IDE
+    # in the zed-mini-ork fork — so on a normal checkout this is dormant and the
+    # API-only branch below serves /. It is kept so a hand-placed bundle still
+    # works, and because the 404-refusal contract below is worth preserving.
     if STATIC_DIR.exists() and (STATIC_DIR / "index.html").exists():
         app.mount(
             "/assets",
@@ -237,8 +240,8 @@ def create_app(home: Path | None = None, dev_cors: bool = True) -> FastAPI:
                     "message": "mini-ork observability API is running",
                     "ui_built": False,
                     "api_index": "/api",
-                    "hint": "Run `pnpm --dir web build` to ship the SPA bundle, "
-                    "or `pnpm --dir web dev` for live React dev server on :5173",
+                    "hint": "API-only. The mini-ork UI is the Rust IDE in the "
+                    "zed-mini-ork fork; this server serves the JSON API at /api.",
                 }
             )
 

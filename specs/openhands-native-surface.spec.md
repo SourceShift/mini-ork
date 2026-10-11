@@ -1,5 +1,13 @@
 # Feature: Expose mini-ork's Native Surface in the OpenHands Agent-Canvas FE
 
+> **SUPERSEDED (2026-10-11).** The OpenHands agent-canvas frontend this spec
+> builds against was removed from the repo along with the pre-fork `ui.old/`
+> tree. mini-ork's UI is now the native Rust IDE in the `zed-mini-ork` fork
+> (crate source at `ui/`), which reaches the backend through the CLI and the
+> `/ide/*` read surface instead of the agent-server wire protocol. This spec is
+> kept as an audit trail for that work, not as a build contract — its open
+> question about reusing `ui.old/` (below) is now moot.
+
 > **Coverage-panel amendments folded in 2026-08-26.** A 3-lens mini-ork audit
 > (`specs/openhands-native-surface.coverage.md`, run `ui-parity-1787735868`)
 > catalogued 52 backend capabilities across 16 route modules and found 16

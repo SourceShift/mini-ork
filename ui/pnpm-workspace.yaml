@@ -1,8 +1,0 @@
-auto-install-peers: true
-allowBuilds:
-  '@heroui/shared-utils': true
-  '@openrouter/sdk': true
-  electron-winstaller: true
-  esbuild: true
-  msw: true
-  unrs-resolver: true

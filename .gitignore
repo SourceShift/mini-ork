@@ -50,7 +50,10 @@ node_modules/
 .pnpm-store/
 .runtime/
 mini_ork/web/static/
-ui/tsconfig.tsbuildinfo
+# The ui/ crate is the source for the Rust IDE in the zed-mini-ork fork; it
+# does not build here (needs the Zed workspace), but a stray `cargo` run inside
+# it must not litter the repo.
+ui/target/
 
 # Commercial / private deliverables (e.g. customer-specific business plans).
 # Open-source repo carries the recipe, not the customer-named output.
@@ -126,8 +129,6 @@ claude_code_zai_env.sh
 # Self-improve iter artifact written to the repo root by recursive-self-improve.
 .mini-ork-iter-report.md
 
-tests/ui/snapshots/*.png
-tests/ui/test-results/
 *.apply-rollback-*
 
 # ---------------------------------------------------------------------------
