@@ -28,6 +28,13 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `tests/test_sdd_e2e_dryrun.py` runs the deterministic spine on a fixture repo with no
   LLM lane.
 
+### Changed
+
+- chore(ui): the IDE crate has its own repository,
+  [`SourceShift/mini-ork-ui`](https://github.com/SourceShift/mini-ork-ui), vendored here as the
+  `ui/` git submodule — and in the `zed-mini-ork` fork at `crates/mini_ork_ui/` — instead of being
+  checked in. Clone with `--recurse-submodules`; edit the crate in its own repo.
+
 ---
 
 ### Fixed

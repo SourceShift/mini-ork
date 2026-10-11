@@ -5,8 +5,11 @@ built as a fork of Zed, living in the **`zed-mini-ork`** repository. It draws
 the Threads board, run forensics, project switcher and setup pages natively in
 the fork's window.
 
-This repository owns the IDE's **source**: the `mini_ork_ui` crate is checked in
-at [`ui/`](../ui). It reaches mini-ork only through the CLI (`mini-ork board …`,
+The IDE's source lives in its own repository,
+[`SourceShift/mini-ork-ui`](https://github.com/SourceShift/mini-ork-ui), which
+this repo vendors as a git submodule at `ui/` (the fork vendors the same crate
+at `crates/mini_ork_ui/`). Edit the crate there, not here — this repo cannot
+compile it. It reaches mini-ork only through the CLI (`mini-ork board …`,
 `automations …`, `init`) and, when a server is already up, the HTTP read surface
 below. There is no web frontend here any more — the old React SPA and the
 OpenHands `agent-canvas` fork it was replaced with have both been removed.
