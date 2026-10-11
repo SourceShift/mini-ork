@@ -75,6 +75,15 @@ else
     git clone --depth 1 --branch "$REF" "$URL" "$TARGET"
 fi
 
+# ui/ is the IDE crate (SourceShift/mini-ork-ui). Nothing in the Python runtime
+# reads it, so this is best-effort: a clone without it still installs, it just
+# leaves ui/ empty until someone runs the same command by hand.
+if ! git -C "$TARGET" submodule update --init --recursive --depth 1; then
+    echo "mini-ork: could not fetch the ui/ submodule; the IDE crate stays empty" >&2
+    echo "  (the Python runtime does not need it) — retry with:" >&2
+    echo "  git -C $TARGET submodule update --init --recursive" >&2
+fi
+
 if [ "${INSTALL_SYSTEM_DEPS:-1}" = "1" ] && [ -e "$TARGET/scripts/install-system-deps.sh" ]; then
     sh "$TARGET/scripts/install-system-deps.sh"
 fi

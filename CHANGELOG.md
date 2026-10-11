@@ -34,6 +34,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   [`SourceShift/mini-ork-ui`](https://github.com/SourceShift/mini-ork-ui), vendored here as the
   `ui/` git submodule — and in the `zed-mini-ork` fork at `crates/mini_ork_ui/` — instead of being
   checked in. Clone with `--recurse-submodules`; edit the crate in its own repo.
+  `install.sh` now fills the submodule in (best-effort — the Python runtime does not need it, so a
+  fetch failure warns and continues), and `docs/UI.md` gained a *Building the IDE* section pointing at
+  `git clone --recurse-submodules` + `script/mini-ork-build` in the fork.
 
 ---
 

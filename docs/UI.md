@@ -14,6 +14,24 @@ compile it. It reaches mini-ork only through the CLI (`mini-ork board …`,
 below. There is no web frontend here any more — the old React SPA and the
 OpenHands `agent-canvas` fork it was replaced with have both been removed.
 
+## Building the IDE
+
+The crate cannot be built from this repo: it is a member of the fork's cargo
+workspace and inherits `edition` and every dependency from it, so the build lives
+in `zed-mini-ork`.
+
+```bash
+git clone --recurse-submodules git@github.com:SourceShift/zed-mini-ork.git
+cd zed-mini-ork
+script/mini-ork-build                 # ~1 min after the first, long, build
+open -a "mini-ork IDE" ~/path/to/project
+```
+
+`script/mini-ork-build` materialises the crate submodule itself
+(`script/mini-ork-sync-ui`) and refuses to run if it is missing. Full detail —
+job limits, `sccache`, `mini-ork-check` for a seconds-long type-check while
+editing — is in the fork's `MINI-ORK.md`.
+
 ```bash
 mini-ork serve        # JSON API at http://127.0.0.1:7090
 ```

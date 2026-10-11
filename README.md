@@ -215,13 +215,20 @@ runs the same full install as `make install`. Or from a checkout:
 
 ~~~bash
 # Get mini-ork and install the full runtime (macOS, Linux, or WSL).
-git clone https://github.com/SourceShift/mini-ork.git
+git clone --recurse-submodules https://github.com/SourceShift/mini-ork.git
 cd mini-ork
 make install
 
 # Open a new terminal if the installer changed PATH, then confirm it uses .venv.
 mini-ork version
 ~~~
+
+`--recurse-submodules` fills in `ui/`, the IDE crate
+([`SourceShift/mini-ork-ui`](https://github.com/SourceShift/mini-ork-ui)). The
+Python runtime does not need it, so a clone without it still works — but `ui/`
+will be an empty directory, and `git submodule update --init` fills it in later.
+Mini-ork cannot compile the crate itself; see [docs/UI.md](docs/UI.md) for how to
+build the IDE.
 
 On native Windows PowerShell, install the OS prerequisites with `winget` first
 (`Python.Python.3.11`, `Git.Git`, `jqlang.jq`, `MikeFarah.yq`, and `SQLite.SQLite`), then
