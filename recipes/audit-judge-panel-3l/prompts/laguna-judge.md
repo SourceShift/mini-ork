@@ -63,7 +63,10 @@ Five sections, in this exact order, same as the other lanes:
    - `reasoning`: the adjudication, including corrected numbers if any
 3. `Fix Verdicts` — one block per fix S1..S6, same fields plus
    `finding_id`, and a `fix_gap` note where the fix leaves part of its
-   finding open.
+   finding open. `fix_gap` lives ONLY in this markdown section — the JSON
+   sidecar's `fixes` entries carry EXACTLY the five keys shown below and
+   nothing else (the panel gate rejects a lane whose sidecar keys differ
+   from the other lanes').
 4. `Recommended Fix Order` — your ranking of S1..S6 with one-line rationale.
 5. `Open Questions` — what a live-measuring lane or the human should check.
 
