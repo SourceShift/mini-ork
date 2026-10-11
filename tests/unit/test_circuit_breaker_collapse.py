@@ -82,8 +82,8 @@ def _seed_collapse_history(db: str, task_class: str,
     """rows = list of {step, score, anchor, directives?, run_id?, created_at?}.
 
     ``directives`` is the per-row INTEGER count (matches the migration's
-    column type); the breaker coerces it to ``[]`` when feeding the
-    detector, so a value of 0 is the most common shape.
+    column type); the breaker's row mapper expands it to
+    ``list(range(count))`` when feeding the detector.
     """
     con = sqlite3.connect(db)
     now = _now()
@@ -236,50 +236,43 @@ def test_seeded_healthy_no_trip(db, monkeypatch):
 #     crash and must NOT trip.
 # ──────────────────────────────────────────────────────────────────────────────
 def test_missing_table_fail_open(monkeypatch, tmp_path):
-    """Stash 0060 out of db/migrations/, init_db, then expect no-trip.
+    """Build a DB from a migrations tree that omits 0060, then expect no-trip.
 
-    Uses ``shutil.move`` for cross-FS safety (the test tmp_path is on
-    /var/folders while the repo lives on /Volumes). The fixture-scoped
-    ``db`` is not used: this test needs a DB without migration 0060
-    applied, which is impossible to construct via the fixture.
+    The previous approach moved the tracked 0060 file out of the live
+    ``REPO/db/migrations`` directory before init_db. That races any
+    concurrent init_db from parallel test workers and strands the
+    migration stashed if the process dies between the move and the
+    finally-block restore. Copying the migrations into the test tmp dir
+    and deleting 0060 from the copy gives the same "table never created"
+    DB without ever touching the live repo tree.
     """
     monkeypatch.delenv("MO_CB_COLLAPSE", raising=False)
-    mig_dir = REPO / "db" / "migrations"
-    target = mig_dir / "0060_collapse_history.sql"
-    stash = mig_dir / "0060_collapse_history.sql.stash"
-    if target.exists():
-        shutil.move(str(target), str(stash))
-        renamed = True
-    else:
-        renamed = False
-    try:
-        # Fresh DB without the migration applied.
-        db_dir = tmp_path / "db-no-mig"
-        db_dir.mkdir()
-        dbp = str(db_dir / "state.db")
-        rc, out, err = mig.init_db(db=dbp, root=str(REPO))
-        assert rc == 0, f"init_db failed:\n{out}\n{err}"
+    fake_root = tmp_path / "repo"
+    shutil.copytree(str(REPO / "db" / "migrations"),
+                    str(fake_root / "db" / "migrations"))
+    (fake_root / "db" / "migrations" / "0060_collapse_history.sql").unlink()
 
-        now = _now()
-        _seed_task_runs(dbp, [
-            {"id": "run-no-table", "task_class": "code_fix", "recipe": "code-fix",
-             "artifact_hash": "dddd" * 4, "cost_usd": 0.05,
-             "created_at": now - 1},
-        ])
-        _reset_cb_state(dbp)
+    dbp = str(tmp_path / "state.db")
+    rc, out, err = mig.init_db(db=dbp, root=str(fake_root))
+    assert rc == 0, f"init_db failed:\n{out}\n{err}"
 
-        obj, rc = cb.check_liveness_breaker(
-            "run-no-table", db=dbp, policy="or",
-        )
-        assert rc == 0
-        assert obj["verdict"] == "PROCEED"
-        assert obj["collapse"]["fired"] is False
-        assert obj["collapse"]["history_rows"] == 0
-        # Rationale mentions "missing" so an operator can see fail-open.
-        assert "missing" in obj["collapse"]["rationale"].lower()
-    finally:
-        if renamed:
-            shutil.move(str(stash), str(target))
+    now = _now()
+    _seed_task_runs(dbp, [
+        {"id": "run-no-table", "task_class": "code_fix", "recipe": "code-fix",
+         "artifact_hash": "dddd" * 4, "cost_usd": 0.05,
+         "created_at": now - 1},
+    ])
+    _reset_cb_state(dbp)
+
+    obj, rc = cb.check_liveness_breaker(
+        "run-no-table", db=dbp, policy="or",
+    )
+    assert rc == 0
+    assert obj["verdict"] == "PROCEED"
+    assert obj["collapse"]["fired"] is False
+    assert obj["collapse"]["history_rows"] == 0
+    # Rationale mentions "missing" so an operator can see fail-open.
+    assert "missing" in obj["collapse"]["rationale"].lower()
 
 
 # ──────────────────────────────────────────────────────────────────────────────

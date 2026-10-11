@@ -264,9 +264,10 @@ def _eval_collapse_signal(
     auto/rsi-i4-collapse-halt-repair.md). A missing table is fail-open
     (logged once). An empty result set is a normal no-fire; we do NOT log
     on empty rows (only on the OperationalError that signals "table is
-    absent"). The directives column stores an INTEGER count; coerce to
-    ``[]`` because the detector's ``_directive_counts`` only reads the
-    set-len.
+    absent"). The directives column stores an INTEGER count; the row
+    mapper expands it to ``list(range(count))`` so the detector's
+    ``_directive_counts`` (``len(set(...))``) recovers the per-step count
+    and ``diversity_trend`` can report narrowing.
 
     Test seam: when ``collapse_history`` is a Sequence, the DB is skipped
     entirely. This keeps the unit tests for ``_eval_collapse_signal`` free
@@ -313,7 +314,8 @@ def _eval_collapse_signal(
             ).fetchall()
             history = [
                 {"step": r["step"], "score": r["score"],
-                 "anchor": r["anchor"], "directives": []}
+                 "anchor": r["anchor"],
+                 "directives": list(range(int(r["directives"] or 0)))}
                 for r in rows
             ]
         except sqlite3.OperationalError:

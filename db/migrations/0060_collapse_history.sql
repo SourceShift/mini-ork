@@ -32,9 +32,9 @@ CREATE TABLE IF NOT EXISTS collapse_history (
     step        INTEGER NOT NULL,
     score       REAL    NOT NULL,
     anchor      REAL    NOT NULL,
-    directives  INTEGER NOT NULL DEFAULT 0,   -- count, not list (the detector
-                                              -- coerces 0 → [] via the
-                                              -- breaker's row mapper)
+    directives  INTEGER NOT NULL DEFAULT 0,   -- count, not list (the breaker's
+                                              -- row mapper expands the count
+                                              -- into list(range(count)))
     run_id      TEXT,                          -- nullable: writer may not have
                                               -- the run_id available at flush
     created_at  INTEGER NOT NULL

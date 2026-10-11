@@ -299,6 +299,46 @@ def test_anchor_probe_excluded_from_gate_solved_set(db, tmp_path, capsys, monkey
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# (1b) apply_run records run_id from MINI_ORK_RUN_ID (kickoff item 2: "run_id
+#      if available"). Complements (1), which pins the None case when the env
+#      var is unset — together they cover both branches of the clause.
+# ──────────────────────────────────────────────────────────────────────────────
+def test_apply_run_records_run_id_from_env(db, tmp_path, capsys, monkeypatch):
+    from mini_ork.learning import probe_scorer as ps
+    _seed_gradient(db, target="prompts/reviewer.md", task_class="code_fix")
+    target = tmp_path / "reviewer.md"
+    target.write_text("ORIGINAL PROMPT\n")
+    monkeypatch.setenv("MO_APPLY_SCORER", "probe")
+    monkeypatch.setenv("MO_APPLY_ENABLED", "1")
+    monkeypatch.setenv("MINI_ORK_RUN_ID", "run-42")
+
+    probe_out = {
+        "before": 1 / 3,
+        "after": 0 / 3,
+        "n": 3,
+        "pertask_json": json.dumps({
+            "before": [1, 1, 1],
+            "after":  [0, 0, 0],
+            "ids":    ["p1.md", "p2.md", "p3.md"],
+        }),
+        "runs": [],
+        "cost_usd": 0.12,
+        "control_n": 1,
+        "control_solved": [1, 1, 1],
+        "anchor_solved_frac": 1.0,
+        "directives": 1,
+    }
+    monkeypatch.setattr(ps, "probe_score", lambda *a, **k: dict(probe_out))
+
+    rc = ap.apply_run("code_fix", "prompt_file", "prompts/reviewer.md",
+                      str(target), db=db)
+    assert rc == 0
+    rows = _collapse_rows(db)
+    assert len(rows) == 1, f"expected 1 collapse_history row, got {rows}"
+    assert rows[0]["run_id"] == "run-42"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # (2) A second decision increments step (0-based start, MAX(step)+1).
 # ──────────────────────────────────────────────────────────────────────────────
 def test_second_decision_increments_step(db, tmp_path, capsys, monkeypatch):
