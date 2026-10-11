@@ -17,6 +17,7 @@ from .routes import (
     dispatch as dispatch_routes,
     fingerprint,
     fleet,
+    ide as ide_routes,
     idea_tree as idea_tree_routes,
     learning,
     node_live as node_live_routes,
@@ -118,6 +119,13 @@ def create_app(home: Path | None = None, dev_cors: bool = True) -> FastAPI:
     # under ``<run_dir>/agent-<node>.live.jsonl``. Mounted before the SPA
     # catch-all so a polling client never hits the index.html fallback.
     app.include_router(node_live_routes.router)
+    # The desktop IDE's read surface (prefix /ide): the `mini-ork board`
+    # payloads served from this process so the IDE does not pay a Python
+    # interpreter per poll. Mounted before the SPA catch-all; "/ide/" is in
+    # _NON_SPA_PREFIXES so an unimplemented /ide path 404s instead of being
+    # answered with index.html, which an SDK client would parse as a silent
+    # empty result.
+    app.include_router(ide_routes.router)
 
     @app.get("/api")
     def api_index() -> JSONResponse:
@@ -167,6 +175,7 @@ def create_app(home: Path | None = None, dev_cors: bool = True) -> FastAPI:
         # implemented". Same refusal-of-silent-empty posture as the CORS note.
         _NON_SPA_PREFIXES = (
             "api/",
+            "ide/",
             "server_info",
             "alive",
             "health",

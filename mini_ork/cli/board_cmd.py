@@ -913,38 +913,62 @@ def main(rest: list[str], root: str) -> int:
                          "[retry <run_id> [--ack-change] [--force] [--dry-run]] "
                          "[page <key> [--tab T] [--arg k=v]] [--home H] [--json]\n")
         return 2
+    home = (Path(args.home) if args.home else _default_home()).expanduser().absolute()
+    error = validate(args)
+    if error:
+        sys.stderr.write(error + "\n")
+        return 2
+    try:
+        payload = build_payload(home, args)
+    except ValueError as exc:
+        sys.stderr.write(f"mini-ork board runs: {exc}\n")
+        return 2
+    sys.stdout.write(json.dumps(payload, default=str) + "\n")
+    return 0 if payload.get("ok", True) is not False else 1
+
+
+def validate(args) -> str | None:
+    """The verb-level usage checks, shared by `main` and the IDE HTTP route.
+
+    Returns the message to print, or None when the parsed argv is well formed.
+    Factored out alongside `build_payload` so a request over loopback cannot be
+    held to a weaker contract than the same read over a subprocess.
+    """
     # The third positional is meaningful for `gate approve|reject <inbox_id>`
     # (the inbox id) and `node <run_id> <node_id>` (the node id). Any other
     # verb that gets one is a usage error, not a silent extra.
     if args.target and args.verb not in ("gate", "node"):
-        sys.stderr.write(f"mini-ork board {args.verb}: unexpected extra argument {args.target!r}\n")
-        return 2
-    home = (Path(args.home) if args.home else _default_home()).expanduser().absolute()
+        return f"mini-ork board {args.verb}: unexpected extra argument {args.target!r}"
     if args.verb == "gate":
         if not args.run_id or args.run_id not in ("approve", "reject"):
-            sys.stderr.write("mini-ork board gate: action must be 'approve' or 'reject'\n")
-            return 2
+            return "mini-ork board gate: action must be 'approve' or 'reject'"
         if not args.target:
-            sys.stderr.write("mini-ork board gate: an inbox id is required\n")
-            return 2
+            return "mini-ork board gate: an inbox id is required"
     elif args.verb == "node":
         if not args.run_id:
-            sys.stderr.write("mini-ork board node: a run id is required\n")
-            return 2
+            return "mini-ork board node: a run id is required"
         if not args.target:
-            sys.stderr.write("mini-ork board node: a node id is required\n")
-            return 2
+            return "mini-ork board node: a node id is required"
     elif args.verb == "steer":
         if not args.run_id:
-            sys.stderr.write("mini-ork board steer: a run id is required\n")
-            return 2
+            return "mini-ork board steer: a run id is required"
         if not args.text:
-            sys.stderr.write("mini-ork board steer: --text is required\n")
-            return 2
+            return "mini-ork board steer: --text is required"
     elif args.verb != "show" and args.verb != "runs" and not args.run_id:
         what = "a page key" if args.verb == "page" else "a run id"
-        sys.stderr.write(f"mini-ork board {args.verb}: {what} is required\n")
-        return 2
+        return f"mini-ork board {args.verb}: {what} is required"
+    return None
+
+
+def build_payload(home: Path, args) -> dict[str, Any]:
+    """The JSON payload for a parsed `board` argv.
+
+    The single source of truth for what a `board` read answers, shared by the
+    CLI (`main`) and the IDE's HTTP route (`web/routes/ide.py`), so a read over
+    loopback and one over a fresh subprocess cannot drift. Raises ValueError
+    for an argv whose verb-level arguments are out of range (`runs`'s
+    offset/limit); the verb-target checks are `validate`'s.
+    """
     # Reads first fail the runs whose dispatcher provably died, so no view
     # below lists a dead run as in flight (orchestration/run_reaper.py).
     reap_errors: dict[str, str] = {}
@@ -983,17 +1007,23 @@ def main(rest: list[str], root: str) -> int:
                              ack_change=args.ack_change, force=args.force,
                              dry_run=args.dry_run, lanes=args.lane)
     elif args.verb == "runs":
-        try:
-            payload = _runs_verb(home, args.query, args.offset, args.limit)
-        except ValueError as exc:
-            sys.stderr.write(f"mini-ork board runs: {exc}\n")
-            return 2
+        payload = _runs_verb(home, args.query, args.offset, args.limit)
     else:
         payload = act(home, args.verb, args.run_id)
     if reap_errors:
         payload.setdefault("errors", {}).update(reap_errors)
-    sys.stdout.write(json.dumps(payload, default=str) + "\n")
-    return 0 if payload.get("ok", True) is not False else 1
+    return payload
+
+
+def payload_for_verb(home: Path, argv: list[str]) -> dict[str, Any]:
+    """Parse a `board` argv (as `main` would, minus `--home`) and return its
+    payload. The HTTP route uses this so its reads run the identical code.
+    """
+    args = build_parser().parse_args(argv)
+    error = validate(args)
+    if error:
+        raise ValueError(error)
+    return build_payload(home, args)
 
 
 def build_parser() -> argparse.ArgumentParser:

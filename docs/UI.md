@@ -24,6 +24,26 @@ The SPA bundle is served from `mini_ork/web/static/` (built with
 | `/trajectory/self-improve/:id` | Self-improve iteration | "What did one self-improvement iteration do?" |
 | `/fingerprint` | Detection fingerprint | "Is my review panel actually heterogeneous?" |
 
+### `/ide/*` — the desktop IDE's read surface
+
+The Zed fork's mini-ork panel polls the board and opens pages by running
+`mini-ork board … --json` as a subprocess, which costs a Python interpreter per
+read. When a server is already up, the panel asks these routes instead and
+falls back to the subprocess for anything they do not answer.
+
+| Route | Answers | CLI equivalent |
+|---|---|---|
+| `GET /ide/board?shell=1` | the shell poll (header, runs, counts) | `board --json --shell` |
+| `GET /ide/page?key=…&tab=…&arg=…` | one IDE page | `board page <key> …` |
+| `GET /ide/node?run=…&node=…&view=…&offset=…` | one node's detail | `board node <run> <node> …` |
+| `GET /ide/runs?query=…&offset=…&limit=…` | run search | `board runs …` |
+
+Every route parses the argv it would have been invoked with and hands it to
+`board_cmd.payload_for_verb`, so both paths run the same code; `?home=` scopes
+the read to a project (the schema's `X-Mini-Ork-Home` header works too), so one
+server serves whichever project is open. Writes — `merge`, `gate`, `retry`,
+`steer` — are deliberately **not** here: they stay on the subprocess path.
+
 ---
 
 ## Global chrome (every page)
