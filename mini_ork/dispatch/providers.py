@@ -2277,11 +2277,20 @@ def dispatch_with_fallback(
     *,
     per_attempt_timeout_s: float | None = None,
     accept: Callable[[DispatchResult], bool] | None = None,
+    on_attempt: Callable[[str, DispatchResult], None] | None = None,
 ) -> DispatchResult:
     """Dispatch ``request`` trying each lane in ``lanes`` in order, returning the
     first result that succeeds with non-empty output. A lane that fails preflight
     (dead/unset key), times out (a HUNG lane — the recurring stall), returns a
     non-zero rc, or emits empty text is abandoned and the next lane is tried.
+
+    ``on_attempt`` is an optional per-lane observer (fail-soft: an exception in
+    it never breaks the walk) called as ``on_attempt(lane, result)`` after EVERY
+    attempt — the winner included. The llm_dispatch wrapper passes a sink that
+    writes a failed-attempt ``llm_calls`` row per dead lane, so a fallback chain
+    that ends on a healthy lane still leaves ledger evidence of which lanes died
+    and why (run-1791619207-22518: minimax silent death + codex rc=1 left only
+    stream files — no llm_calls rows — and triage had to parse raw streams).
 
     This is the fix for the single biggest reliability failure: one flaky/hung
     lane (codex flaky in some envs, glm/kimi/minimax gateways hang in others)
@@ -2321,6 +2330,12 @@ def dispatch_with_fallback(
         )
         result = dispatch_model(req, root)
         tried.append(lane)
+        if on_attempt is not None:
+            # Telemetry observer must never decide the walk's outcome.
+            try:
+                on_attempt(lane, result)
+            except Exception:  # noqa: BLE001 — fail-soft by contract
+                pass
         if result.ok and (result.text or "").strip():
             if accept is None or accept(result):
                 if i > 0:

@@ -414,7 +414,8 @@ def write_llm_calls_row(db, provider, model_id, tier, feature_name, actor, statu
 
 # ── model-level dispatch (delegates to the ported mini_ork.dispatch core) ──
 
-def mo_llm_dispatch(model, prompt, out_file, timeout_s=1500, max_turns=60, accept=None) -> int:
+def mo_llm_dispatch(model, prompt, out_file, timeout_s=1500, max_turns=60, accept=None,
+                    on_attempt=None) -> int:
     """Provider call via mini_ork.dispatch; writes out_file + .cost/.err.log sidecars.
     Returns 0 on success, the provider rc otherwise. (llm_calls is owned by the
     llm_dispatch wrapper, matching the bash split.)
@@ -424,14 +425,19 @@ def mo_llm_dispatch(model, prompt, out_file, timeout_s=1500, max_turns=60, accep
     wrong-shape lane triggers fallback; on the single-lane path there is nobody
     to fall back to, so a clean-but-wrong-shape result is downgraded to
     ok=False/rc=SHAPE_REJECT_RC here — the same signal, so the caller never
-    writes a structurally-broken artifact that the verifier will kill late."""
+    writes a structurally-broken artifact that the verifier will kill late.
+
+    ``on_attempt`` is the per-lane observer from ``dispatch_with_fallback``
+    (fail-soft there); threaded on the multi-lane path only — a single-lane
+    failure is the final result and already gets its own failed row from the
+    wrapper, so an attempt row would duplicate it."""
     from mini_ork.dispatch.models import DispatchRequest
     from mini_ork.dispatch.predicates import SHAPE_REJECT_RC
     from mini_ork.dispatch.providers import dispatch_model, dispatch_with_fallback
     lanes = [m.strip() for m in str(model).split(",") if m.strip()] or [str(model)]
     req = DispatchRequest(model=lanes[0], prompt=prompt, timeout_s=float(timeout_s))
     if len(lanes) > 1:
-        res = dispatch_with_fallback(req, lanes, accept=accept)
+        res = dispatch_with_fallback(req, lanes, accept=accept, on_attempt=on_attempt)
     else:
         res = dispatch_model(req)
         if accept is not None and res.ok and (res.text or "").strip() and not accept(res):
@@ -519,12 +525,53 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
         else:
             i += 1
 
+    # Telemetry identity is node-scoped, not result-scoped — hoisted above the
+    # cost circuit / lane fuse so a REFUSED dispatch (nothing attempted, rc
+    # 42/43) still leaves an llm_calls row. A node that never dispatched used
+    # to leave the ledger blank, and triage could not tell "refused by a
+    # guard" from "crashed before the row write" without parsing streams.
+    feature = f"mini-ork:{node_type or 'unknown'}"
+    actor = os.environ.get("MO_LANE_ACTOR") or node_type or os.environ.get("USER", "unknown")
+    tier = os.environ.get("MO_LANE_TIER", "default")
+    # Bound early (the guards below fire before lane resolution) so the
+    # refusal row names the requested lane even when nothing resolved it.
+    model = model_override or os.environ.get("MINI_ORK_DEFAULT_MODEL", "sonnet")
+
+    def _write_refusal_row(kind: str, message: str) -> None:
+        """Ledger row for a dispatch that a guard refused before any attempt.
+
+        ``feature_name`` gets a ``:refused`` suffix so the row is visible in
+        the ledger but stays OUTSIDE the lane-fuse window (``check_lane_fuse``
+        matches ``feature_name LIKE '%:<node>'``): a refusal row naming the
+        fuse's own category must not keep the fuse open forever, and must not
+        break a genuine failure streak either. ``retryable=0`` — no lane
+        change recovers a budget halt. Zero cost/duration: nothing ran.
+
+        ``kind`` (cost_limit / the fuse category) rides in ``metadata_json``
+        and, when it is a provider vocabulary word, in ``error_category``: the
+        llm_calls CHECK constraint pins the category column to the provider
+        vocabulary, and "cost_limit" is not a provider error — a reader that
+        wants the refusal reason reads metadata, not the category column."""
+        category = kind if kind in ("auth", "quota", "capacity", "request", "safety",
+                                    "network", "stream", "provider", "config") else "unknown"
+        try:
+            write_llm_calls_row(
+                db, "", str(model), tier, feature + ":refused", actor,
+                "failed", 0, "0", redact_secrets(message[:200]),
+                error_category=category, retryable=0,
+                metadata_json=json.dumps({"refused": kind}))
+        except Exception:  # noqa: BLE001 — telemetry must never change the rc
+            pass
+
     # cost circuit breaker
     if cost_circuit_open(db, os.environ.get("MO_DAILY_BUDGET_USD", "50")):
         from mini_ork import cost_ledger
         spent = cost_ledger.spent_last_24h(db)
         sys.stderr.write(f"[cost_circuit_open] spent_today=${spent} "
                          f"budget=${os.environ.get('MO_DAILY_BUDGET_USD', '50')} — halting dispatch\n")
+        _write_refusal_row("cost_limit",
+                           f"cost circuit open: ${spent:.2f} spent in 24h against "
+                           f"MO_DAILY_BUDGET_USD={os.environ.get('MO_DAILY_BUDGET_USD', '50')}")
         return 42
 
     # model resolution: override > agents.yaml lane > env default > sonnet
@@ -538,6 +585,9 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
             if check_lane_fuse(db, node_type, category):
                 sys.stderr.write(f"[lane_fuse_open] lane={node_type} error_category={category} "
                                  f"consecutive_failures=3 — halting dispatch\n")
+                _write_refusal_row(category,
+                                   f"lane fuse open: 3 consecutive {category} failures "
+                                   f"on lane={node_type}")
                 return 43
 
     tmp_out = ""
@@ -581,17 +631,70 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
     start_ms = int(time.time() * 1000)
     attempt = 1
     rc = 1
+
+    def _attempt_sink(lane: str, result) -> None:
+        """Per-lane failed-attempt ledger row (the ``on_attempt`` observer).
+
+        A fallback chain used to leave ONE row for the final result only, so
+        the lanes that died mid-chain (minimax silent death, codex rc=1 in
+        run-1791619207-22518) existed nowhere but the live-stream files. This
+        sink writes one failed row per dead lane, attributed to THAT lane, with
+        the provider's own classified error. Cost and tokens are pinned to 0:
+        the wrapper's final success/failure row carries the sidecar numbers,
+        and ``cost_ledger.spent_last_24h`` sums every ``llm_calls.cost_usd`` —
+        duplicating partial usage here would double-count spend against the
+        daily budget. The ``metadata_json`` attempt marker lets a reader tell
+        attempt rows from final rows. The winning attempt is not recorded (the
+        success row below already names the serving lane)."""
+        try:
+            ok = bool(getattr(result, "ok", False))
+            text = (getattr(result, "text", "") or "").strip()
+            if ok and text:
+                return
+            err = redact_secrets((getattr(result, "error", "") or "empty output")[:200])
+            category = classify_error(err, getattr(result, "rc", 1))
+            write_llm_calls_row(
+                db, provider_for_model(lane), lane, tier, feature, actor, "failed",
+                int(getattr(result, "duration_ms", 0) or 0), "0", err,
+                metadata_json=json.dumps({"dispatch_attempt": attempt, "chain": str(model)}),
+                error_category=category, retryable=int(error_retryable(category)))
+        except Exception:  # noqa: BLE001 — telemetry must never break dispatch
+            pass
+
     while True:
         for side in (out_file + ".err.log",):
             try:
                 os.remove(side)
             except OSError:
                 pass
-        if _default_dispatch and accept_fn is not None:
+        # The attempt sink + accept predicate go only to the default
+        # dispatcher; a caller-supplied dispatch_fn keeps the historic 5-arg
+        # contract (mirrors the accept threading above).
+        _kwargs = {}
+        if _default_dispatch:
+            _kwargs["on_attempt"] = _attempt_sink
+            if accept_fn is not None:
+                _kwargs["accept"] = accept_fn
+        try:
             rc = dispatch_fn(model, prompt_text, out_file, timeout_s, max_turns,
-                             accept=accept_fn)
-        else:
-            rc = dispatch_fn(model, prompt_text, out_file, timeout_s, max_turns)
+                             **_kwargs)
+        except Exception as exc:
+            # A crash inside the dispatcher used to escape to the caller's
+            # ``except Exception → rc=1`` with NO ledger row — the same
+            # stream-only blind spot as a dead lane. Record the crash, then
+            # re-raise: the caller's contract (exception → rc=1 + text) is
+            # unchanged, it just stops being invisible.
+            try:
+                write_llm_calls_row(
+                    db, provider_for_model(str(model).split(",", 1)[0]), str(model),
+                    tier, feature, actor, "failed",
+                    int(time.time() * 1000) - start_ms, "0",
+                    redact_secrets(f"dispatcher crashed: {exc}"[:200]),
+                    error_category=classify_error(str(exc)),
+                    retryable=int(error_retryable(classify_error(str(exc)))))
+            except Exception:  # noqa: BLE001 — never mask the original crash
+                pass
+            raise
         if rc == 0:
             break
         probe = ""
@@ -632,9 +735,6 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
         pass
     provider = provider_for_model(selected_model)
     _write_lane_sidecar(selected_model)
-    feature = f"mini-ork:{node_type or 'unknown'}"
-    actor = os.environ.get("MO_LANE_ACTOR") or node_type or os.environ.get("USER", "unknown")
-    tier = os.environ.get("MO_LANE_TIER", "default")
 
     if rc == 0:
         duration_ms = int(time.time() * 1000) - start_ms

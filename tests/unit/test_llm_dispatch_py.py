@@ -206,3 +206,136 @@ def test_retry_loop_stub(tmp_path, monkeypatch):
     # a success llm_calls row was written
     n = _sql(db, "SELECT COUNT(*) FROM llm_calls WHERE status='success';").stdout.strip()
     assert n == "1"
+
+
+# ── failed-attempt / refusal ledger rows (run-1791619207-22518 triage gap) ──
+
+def test_cost_circuit_refusal_row(tmp_path):
+    """rc=42 used to leave the ledger empty — triage could not tell a budget
+    refusal from a crash. Now one :refused row, zero cost, retryable=0."""
+    hp, db_p = _seed(tmp_path, "cpr")
+    _sql(db_p, "INSERT INTO llm_calls (provider,model_id,tier,feature_name,cost_usd,status) "
+               "VALUES ('anthropic','sonnet','default','mini-ork:worker',100.0,'success');")
+    old = dict(os.environ)
+    os.environ.update({"MINI_ORK_ROOT": str(REPO), "MINI_ORK_HOME": hp, "MINI_ORK_DB": db_p,
+                       "MO_DAILY_BUDGET_USD": "50"})
+    try:
+        rp = ld.llm_dispatch(["--node-type", "planner", "--prompt-text", "hi"], root=str(REPO))
+    finally:
+        os.environ.clear(); os.environ.update(old)
+    assert rp == 42
+    rows = _sql(db_p, "SELECT feature_name, status, error_category, retryable, cost_usd, "
+                      "metadata_json FROM llm_calls WHERE feature_name LIKE '%:refused';").stdout
+    assert "mini-ork:planner:refused" in rows
+    assert "failed" in rows and "unknown" in rows   # CHECK-constrained vocab; kind below
+    assert '"refused": "cost_limit"' in rows        # refusal kind rides in metadata
+    parts = rows.split("|")
+    assert parts[3].strip() == "0"                  # retryable=0
+    assert parts[4].strip() in ("0", "0.0")         # zero cost — nothing ran
+
+
+def test_lane_fuse_refusal_row(tmp_path):
+    import pytest
+    hp, db_p = _seed(tmp_path, "fpr")
+    cols = _sql(db_p, "PRAGMA table_info(llm_calls);").stdout
+    if "error_category" not in cols or "retryable" not in cols:
+        pytest.skip("llm_calls lacks error_category/retryable columns")
+    for _ in range(3):
+        _sql(db_p, "INSERT INTO llm_calls (provider,model_id,tier,feature_name,input_tokens,"
+                   "output_tokens,total_tokens,cost_usd,duration_ms,status,metadata_json,"
+                   "error_category,retryable) VALUES ('gateway','sonnet','default',"
+                   "'mini-ork:planner',0,0,0,0,0,'failed','{}','capacity',1);")
+    old = dict(os.environ)
+    os.environ.update({"MINI_ORK_ROOT": str(REPO), "MINI_ORK_HOME": hp, "MINI_ORK_DB": db_p,
+                       "MO_FUSE_ENABLED": "1", "MO_DAILY_BUDGET_USD": "1000"})
+    try:
+        rp = ld.llm_dispatch(["--node-type", "planner", "--prompt-text", "hi"], root=str(REPO))
+    finally:
+        os.environ.clear(); os.environ.update(old)
+    assert rp == 43
+    rows = _sql(db_p, "SELECT feature_name, error_category FROM llm_calls "
+                      "WHERE feature_name LIKE '%:refused';").stdout
+    assert "mini-ork:planner:refused" in rows and "capacity" in rows
+
+
+def test_multilane_attempt_rows(tmp_path):
+    """A fallback chain that fails on every lane writes ONE failed row per
+    dead lane (attributed to THAT lane, zero cost) plus the final failure row.
+    Before: only the final row — dead lanes existed solely in stream files."""
+    hp, db_p = _seed(tmp_path, "ar")
+    old = dict(os.environ)
+    os.environ.update({"MINI_ORK_ROOT": str(REPO), "MINI_ORK_HOME": hp, "MINI_ORK_DB": db_p,
+                       "MO_DAILY_BUDGET_USD": "1000", "MO_DISPATCH_RETRY_BASE_S": "0",
+                       "MO_DISPATCH_RETRY_MAX_SLEEP_S": "1"})
+    try:
+        rp = ld.llm_dispatch(
+            ["--node-type", "worker", "--prompt-text", "hi",
+             "--model", "no-such-lane-a,no-such-lane-b", "--timeout", "5"],
+            root=str(REPO))
+    finally:
+        os.environ.clear(); os.environ.update(old)
+    assert rp != 0
+    rows = _sql(db_p, "SELECT model_id, feature_name, status, cost_usd, metadata_json "
+                      "FROM llm_calls WHERE status='failed' "
+                      "AND metadata_json LIKE '%dispatch_attempt%';").stdout
+    # one attempt row per dead lane, named for that lane, zero-cost
+    assert "no-such-lane-a" in rows and "no-such-lane-b" in rows
+    assert "mini-ork:worker" in rows
+    parts = [ln.split("|") for ln in rows.strip().splitlines() if ln.strip()]
+    assert len(parts) == 2
+    for p in parts:
+        assert float(p[3]) == 0.0          # cost pinned: spent_last_24h sums it
+    # the final failure row is still there, without the attempt marker
+    final = _sql(db_p, "SELECT COUNT(*) FROM llm_calls WHERE status='failed' "
+                       "AND metadata_json NOT LIKE '%dispatch_attempt%' "
+                       "AND feature_name='mini-ork:worker';").stdout.strip()
+    assert final == "1"
+
+
+def test_dispatcher_crash_writes_row(tmp_path, monkeypatch):
+    """An exception inside the dispatcher escaped to the caller with NO ledger
+    row (the caller maps any exception to rc=1). Now: one failed row naming the
+    crash, then the exception propagates unchanged."""
+    import pytest
+    hp, db_p = _seed(tmp_path, "cr")
+    monkeypatch.setenv("MINI_ORK_ROOT", str(REPO))
+    monkeypatch.setenv("MINI_ORK_HOME", hp)
+    monkeypatch.setenv("MINI_ORK_DB", db_p)
+    monkeypatch.setenv("MO_DAILY_BUDGET_USD", "1000")
+
+    def _boom(*a, **k):
+        raise RuntimeError("kaboom mid-dispatch")
+
+    monkeypatch.setattr(ld, "mo_llm_dispatch", _boom)
+    with pytest.raises(RuntimeError, match="kaboom"):
+        ld.llm_dispatch(["--node-type", "worker", "--prompt-text", "hi",
+                         "--model", "glm"], root=str(REPO))
+    rows = _sql(db_p, "SELECT status, error_message FROM llm_calls "
+                      "WHERE feature_name='mini-ork:worker';").stdout
+    assert "failed" in rows and "dispatcher crashed: kaboom" in rows
+
+
+def test_fallback_on_attempt_observer(monkeypatch):
+    """dispatch_with_fallback reports every lane attempt to on_attempt (the
+    winner too), and an observer exception never breaks the walk."""
+    from mini_ork.dispatch import providers as prov
+    from mini_ork.dispatch.models import DispatchRequest, DispatchResult
+
+    def fake_dispatch_model(req, root=None, **kw):
+        if req.model == "dead-lane":
+            return DispatchResult(ok=False, rc=1, error="429 capacity", model=req.model)
+        return DispatchResult(ok=True, rc=0, text="served", model=req.model)
+
+    monkeypatch.setattr(prov, "dispatch_model", fake_dispatch_model)
+    seen = []
+
+    def observer(lane, result):
+        seen.append((lane, result.ok))
+        if lane == "dead-lane":
+            raise ValueError("observer bug must not break dispatch")
+
+    res = prov.dispatch_with_fallback(
+        DispatchRequest(model="dead-lane", prompt="p", timeout_s=1),
+        ["dead-lane", "live-lane"], on_attempt=observer)
+    assert res.ok and res.text == "served"
+    assert seen == [("dead-lane", False), ("live-lane", True)]
