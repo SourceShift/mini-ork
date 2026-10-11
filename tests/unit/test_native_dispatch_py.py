@@ -41,6 +41,7 @@ def test_all_former_exec_subs_registered_natively():
         "repair",
         "features",
         "threads",
+        "intake",
     }
     assert expected == set(_NATIVE_MODULE_SUBS)
     for sub in expected:

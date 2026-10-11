@@ -510,6 +510,43 @@ def live_run(thread_id: str, db: str | None = None) -> ThreadRun | None:
         con.close()
 
 
+def live_run_for_issue(issue_uid: str, db: str | None = None) -> ThreadRun | None:
+    """The run currently working an issue, found through ``pm_links``.
+
+    The ledger answers "has a run ever worked this ticket"; only this answers
+    "is one working it *now*", which is the question the poller asks before it
+    starts a second run.
+
+    It is a join because ``pm_links`` holds edges and no status: the run's
+    association with the issue is ``kind='run'`` with ``to_uid`` spelt
+    ``run:<run id>`` (see :func:`mini_ork.threads.service._link_issue`), and
+    liveness lives in ``thread_runs`` alone. The ``running`` predicate is served
+    by the partial ``idx_thread_runs_live`` index, so this stays one seek.
+
+    ``None`` covers three states a caller treats the same — no link, no run
+    row, and no ``pm_links`` table at all, which is what a home that has never
+    synced a PM source looks like.
+    """
+    con = _conn(db)
+    try:
+        ensure_schema(db)
+        record = con.execute(
+            "SELECT r.* FROM pm_links AS l "
+            "JOIN thread_runs AS r ON r.run_id = substr(l.to_uid, 5) "
+            "WHERE l.from_uid = ? AND l.kind = 'run' AND r.status = 'running' "
+            "ORDER BY r.attempt DESC LIMIT 1",
+            (issue_uid,),
+        ).fetchone()
+        return _run_from(record) if record is not None else None
+    except sqlite3.Error:
+        # `pm_links` belongs to the PM mirror, which has its own schema and its
+        # own migration. A home that has never synced one has no such table,
+        # and "no run is working this" is the honest reading of that.
+        return None
+    finally:
+        con.close()
+
+
 def runs_for(thread_id: str, db: str | None = None) -> list[ThreadRun]:
     """Every launch in a thread, oldest attempt first."""
     con = _conn(db)

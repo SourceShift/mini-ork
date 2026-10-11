@@ -19,6 +19,24 @@
 #
 # Note: this is not config/providers.yaml, which registers LLM *lanes*. The
 # two are unrelated despite the shared word.
+#
+# INTAKE TRIGGERS. `mini-ork intake once` starts a run for a ticket whose
+# source declares a trigger. All four keys are opt-in and ANDed, and a source
+# with none of them set starts NOTHING — a first poll against a real board must
+# not launch an agent per ticket, so the safe default is inert and `--dry-run`
+# is a way to look rather than a way to be safe.
+#
+#   trigger_label      the ticket must carry this label ('agent', 'ai-ready')
+#   trigger_assignee   it must be assigned to this login
+#   trigger_states     comma-separated normalized states it must be in
+#                      (backlog, todo, in_progress, blocked, in_review, done,
+#                      canceled) — `todo` rather than `backlog` means
+#                      "promised", not merely "known"
+#   trigger_recipe     not a rule: the recipe the launched run uses. Setting
+#                      only this still leaves the source inert.
+#
+# `trigger_label` on its own is the usual setup: the label is the human act
+# that says "an agent should do this".
 
 sources:
   local:
@@ -35,6 +53,8 @@ sources:
   #   owner: acme                 # the org or user that owns the repository
   #   repo: app                   # the repository itself
   #   # api_url: https://github.acme.dev/api/v3   # GitHub Enterprise only
+  #   trigger_label: agent        # uncomment to let intake start these tickets
+  #   trigger_recipe: code-fix    # the recipe a launched run uses
 
   # linear:
   #   enabled: false

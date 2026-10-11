@@ -127,6 +127,22 @@ def resolve_home(home: str | os.PathLike | None) -> Path:
     return (Path.cwd() / ".mini-ork").resolve()
 
 
+def resolve_db(home: Path, db: str | os.PathLike | None = None) -> str:
+    """The state database for ``home``: ``db`` → ``MINI_ORK_DB`` → ``home/state.db``.
+
+    Every CLI that can be pointed at a home resolves through here, because the
+    modules underneath do not agree on their own: ``threads.store`` honours
+    ``MINI_ORK_DB`` when handed ``None`` while ``threads.service`` resolves from
+    the home it was given, so an entry point that passes ``None`` through can
+    write one file and read another. One chain, one answer.
+
+    Beside :func:`resolve_home` rather than in a CLI because it is the same kind
+    of decision — where this invocation's state lives — and every surface that
+    already imports the home resolver needs this one too.
+    """
+    return str(db or os.environ.get("MINI_ORK_DB") or Path(home) / "state.db")
+
+
 _dbs: dict[Path, StateDB] = {}
 _dbs_lock = threading.Lock()
 

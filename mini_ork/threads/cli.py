@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -237,8 +236,8 @@ def _cmd_deliver(verb: str, argv: list[str]) -> int:
 def _targets(args: argparse.Namespace) -> tuple[Path, str]:
     """``(home, db_path)`` for one invocation, with both created if missing.
 
-    ``db`` is ``--db`` → ``MINI_ORK_DB`` → ``home/state.db`` — the same chain the
-    service resolves, so the reader and the writer cannot land on two files. It
+    The chain itself lives in :func:`mini_ork.web.db.resolve_db`, so this and
+    the intake CLI cannot drift into reading one file and writing another. It
     cannot be left to the store's own env lookup: that one knows nothing of
     ``--home``, so ``threads send --home X`` would write X while ``threads list
     --home X`` read ``$MINI_ORK_HOME`` — or worse, ``cwd/.mini-ork``.
@@ -249,8 +248,10 @@ def _targets(args: argparse.Namespace) -> tuple[Path, str]:
     Creating the schema on a read is already the store's behaviour
     (``ensure_schema``); creating the directory it lives in is the same act.
     """
+    from mini_ork.web.db import resolve_db
+
     home = _home(args)
-    db = args.db or os.environ.get("MINI_ORK_DB") or str(home / "state.db")
+    db = resolve_db(home, args.db)
     home.mkdir(parents=True, exist_ok=True)
     Path(db).parent.mkdir(parents=True, exist_ok=True)
     return home, db
