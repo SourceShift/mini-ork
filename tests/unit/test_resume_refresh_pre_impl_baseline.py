@@ -61,6 +61,20 @@ def _external_advance(repo: Path) -> str:
     return _git(repo, "rev-parse", "HEAD")
 
 
+def _divergent_baseline(repo: Path, base: str) -> str:
+    """A commit that still exists but is NOT an ancestor of HEAD (a baseline on
+    a divergent line, e.g. a rewritten branch the run no longer descends from)."""
+    (repo / "SIDE.txt").write_text("side line\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "side line")
+    side = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "reset", "-q", "--hard", base)
+    (repo / "MAIN.txt").write_text("main line\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "main line")
+    return side
+
+
 def _ledger(tmp_path: Path, notes: str, run_id: str = "run-r1") -> Path:
     db = tmp_path / "state.db"
     con = sqlite3.connect(db)
@@ -223,6 +237,64 @@ def test_unreadable_ledger_fails_closed(tmp_path):
     assert ex._refresh_stale_pre_impl_baseline(
         str(run_dir), str(repo), db=str(empty), run_id="run-r1") is False
     assert (run_dir / "pre-implementer-ref").read_text().strip() == base
+
+
+def test_orphaned_baseline_ignores_a_recorded_impl_moved_base(tmp_path, monkeypatch):
+    """A baseline that is NOT an ancestor of HEAD cannot contribute a commit to
+    HEAD, so the run's own impl_moved_base ledger note must not block the
+    refresh: only a forward-ancestor baseline can launder a committed change."""
+    repo = tmp_path / "repo"
+    head = _init_repo(repo)
+    recorded = (f"impl_moved_base: HEAD {head[:12]} is not the run's starting "
+                "commit; the implementer committed.")
+
+    # (a) the baseline object no longer exists (rewritten/gc'd main) → exit 128.
+    d_gone = tmp_path / "gone"
+    d_gone.mkdir()
+    run_dir = _run_dir(d_gone, "f" * 40)
+    db = _ledger(d_gone, recorded)
+    assert exh._implementer_moved_base(str(run_dir), str(repo)) != ""
+    assert ex._refresh_stale_pre_impl_baseline(
+        str(run_dir), str(repo), db=str(db), run_id="run-r1") is True
+    assert not (run_dir / "pre-implementer-ref").exists()
+
+    # (b) the baseline object still exists but diverged from HEAD → exit 1.
+    side = _divergent_baseline(repo, head)
+    d_side = tmp_path / "side"
+    d_side.mkdir()
+    run_dir = _run_dir(d_side, side)
+    db = _ledger(d_side, recorded)
+    assert exh._implementer_moved_base(str(run_dir), str(repo)) != ""
+    assert ex._refresh_stale_pre_impl_baseline(
+        str(run_dir), str(repo), db=str(db), run_id="run-r1") is True
+    assert not (run_dir / "pre-implementer-ref").exists()
+
+    # The pre-dispatch capture re-snapshots the CURRENT HEAD, not the orphan.
+    monkeypatch.setenv("MO_TARGET_CWD", str(repo))
+    ex._capture_pre_impl_baseline(str(run_dir))
+    assert (run_dir / "pre-implementer-ref").read_text().strip() == \
+        _git(repo, "rev-parse", "HEAD")
+
+
+def test_forward_ancestor_with_recorded_failure_still_refused(tmp_path):
+    """The complement: a proper-ancestor baseline IS the laundering shape, so the
+    ancestry probe classifies it as an ancestor and the ledger refusal decides."""
+    repo = tmp_path / "repo"
+    base = _init_repo(repo)
+    _external_advance(repo)
+    (repo / "D.txt").write_text("SECOND EXTERNAL ADVANCE\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "second external advance")
+    run_dir = _run_dir(tmp_path, base)
+    db = _ledger(tmp_path, f"impl_moved_base: HEAD {base[:12]} is not the run's "
+                           "starting commit; the implementer committed.")
+
+    assert ex._baseline_is_ancestor_of_head(str(run_dir), str(repo)) is True
+    assert ex._refresh_stale_pre_impl_baseline(
+        str(run_dir), str(repo), db=str(db), run_id="run-r1") is False
+    # Refused: the stale baseline is left in place, so the guard still fires.
+    assert (run_dir / "pre-implementer-ref").read_text().strip() == base
+    assert exh._implementer_moved_base(str(run_dir), str(repo)) != ""
 
 
 # ── (f) the planner gate: only an implementer rerun triggers a refresh ───────

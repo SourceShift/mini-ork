@@ -2008,6 +2008,56 @@ def _impl_moved_base_recorded(db, run_id):
                for seg in notes.split("; "))
 
 
+def _baseline_is_ancestor_of_head(run_dir, target):
+    """Is the recorded ``pre-implementer-ref`` an ancestor of the target HEAD?
+
+    ``git merge-base --is-ancestor <baseline> HEAD`` exits 0 when the baseline
+    is a (possibly equal) ancestor, 1 when it diverged from HEAD, and 128 when
+    the baseline object no longer exists (rewritten/gc'd main). Only exit 0
+    proves the baseline is still a pre-tree of HEAD and so only 0 lets the
+    invariant-2 ledger gate decide; any other exit means the baseline is
+    orphaned and can be dropped. Returns ``None`` when the probe cannot run at
+    all (unreadable baseline, git missing) — the caller must then defer to the
+    ledger gate rather than refresh blindly.
+    """
+    try:
+        baseline = open(os.path.join(run_dir, "pre-implementer-ref")).read().strip()
+    except OSError:
+        return None
+    if not baseline:
+        return None
+    try:
+        probe = subprocess.run(
+            ["git", "-C", target, "merge-base", "--is-ancestor", baseline, "HEAD"],
+            capture_output=True, text=True)
+    except OSError:
+        return None
+    return probe.returncode == 0
+
+
+def _drop_pre_impl_baseline(run_dir, moved_reason):
+    """Invalidate the stale baseline pair and report the drop. Returns True iff
+    the snapshot was removed.
+
+    ``pre-implementer-ref`` AND ``pre-implementer-untracked`` are removed
+    together: the capture's idempotence gate is the ref file's existence and it
+    rewrites both, so invalidating only one would pair a fresh baseline with a
+    stale untracked inventory (harvest-time mis-exclusion).
+    """
+    try:
+        os.remove(os.path.join(run_dir, "pre-implementer-ref"))
+    except OSError:
+        return False
+    try:
+        os.remove(os.path.join(run_dir, "pre-implementer-untracked"))
+    except OSError:
+        pass
+    print("  [recover] refreshed stale pre-implementer-ref to the current target "
+          "HEAD; the pre-dispatch capture will re-snapshot. Stale reason: "
+          f"{moved_reason}", file=sys.stderr)
+    return True
+
+
 def _refresh_stale_pre_impl_baseline(run_dir, target, *, db=None, run_id=None):
     """Re-snapshot a stale ``pre-implementer-ref`` against the CURRENT target
     HEAD, on a resume that re-runs the implementer. Returns True iff refreshed.
@@ -2036,9 +2086,14 @@ def _refresh_stale_pre_impl_baseline(run_dir, target, *, db=None, run_id=None):
         failed ``impl_moved_base``, the movement is attributable to the run
         itself — refuse, keep the stale baseline, and let the guard keep failing
         loudly. A committed change can never be laundered into an empty harvest.
-      * Invariant 4 (orphaned baselines) — a baseline object that no longer
-        exists (rewritten main) already returns a reason from
-        ``_implementer_moved_base``, so it flows through this same refresh path.
+      * Invariant 4 (orphaned baselines) — when the recorded baseline is not an
+        ancestor of HEAD, it is orphaned: either its object is gone (a
+        rewritten/gc'd main) or it diverged onto another line. A non-ancestor
+        baseline cannot contribute any commit to HEAD, so there is nothing a
+        refresh could launder — the snapshot is dropped unconditionally,
+        skipping the ledger refusal below. Only a FORWARD-ancestor baseline
+        reaches the invariant-2 gate. If the ancestry probe cannot run at all
+        (unreadable baseline, git unavailable) the ledger gate still decides.
 
     When it does refresh, it removes ``pre-implementer-ref`` AND
     ``pre-implementer-untracked`` together: the capture's idempotence gate is the
@@ -2063,6 +2118,14 @@ def _refresh_stale_pre_impl_baseline(run_dir, target, *, db=None, run_id=None):
     moved = _implementer_moved_base(run_dir, target)
     if not moved:
         return False  # invariant 1: the recorded baseline is still valid
+    if _baseline_is_ancestor_of_head(run_dir, target) is False:
+        # Invariant 4: the baseline is NOT an ancestor of HEAD — it diverged
+        # (merge-base exit 1) or its object is gone (exit 128, a rewritten/gc'd
+        # main). Neither can contribute any commit to HEAD, so a refresh cannot
+        # launder anything: drop the stale snapshot unconditionally, skipping
+        # the ledger refusal below. A ``None`` probe result (cannot classify)
+        # deliberately falls through to that ledger gate instead.
+        return _drop_pre_impl_baseline(run_dir, moved)
     if _impl_moved_base_recorded(db, run_id):
         print("  [recover] refusing to refresh pre-implementer-ref: this run's "
               "ledger already records an impl_moved_base failure, so the HEAD "
@@ -2070,18 +2133,7 @@ def _refresh_stale_pre_impl_baseline(run_dir, target, *, db=None, run_id=None):
               "external advance — refreshing would launder a committed change "
               "into an empty harvest.", file=sys.stderr)
         return False
-    try:
-        os.remove(ref_path)
-    except OSError:
-        return False
-    try:
-        os.remove(os.path.join(run_dir, "pre-implementer-untracked"))
-    except OSError:
-        pass
-    print("  [recover] refreshed stale pre-implementer-ref to the current target "
-          "HEAD; the pre-dispatch capture will re-snapshot. Stale reason: "
-          f"{moved}", file=sys.stderr)
-    return True
+    return _drop_pre_impl_baseline(run_dir, moved)
 
 
 def _harvest_framework_edit_ground_truth(run_dir, target):
