@@ -24,6 +24,18 @@ sources:
   local:
     enabled: true
 
+  # A GitHub repository. One entry per repository: the source id is the
+  # registry id, so `github` and `github-core` are two independent sources with
+  # their own token keys. `github` is the only one with an adapter so far, and
+  # it reads — create/update/comment are not implemented yet, so the board
+  # shows GitHub issues without offering a write it would refuse.
+  # github:
+  #   enabled: true
+  #   token_env: GITHUB_TOKEN     # a PAT; read-only (public_repo / repo:read)
+  #   owner: acme                 # the org or user that owns the repository
+  #   repo: app                   # the repository itself
+  #   # api_url: https://github.acme.dev/api/v3   # GitHub Enterprise only
+
   # linear:
   #   enabled: false
   #   token_env: LINEAR_API_KEY   # a personal API key, read-only is enough for the board
