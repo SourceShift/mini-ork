@@ -51,6 +51,7 @@ lanes:
   # node.model_lane: minimax_lens (NOT auto-added to existing 4-lens
   # workflows — that's a per-recipe cost-budget decision).
   minimax_lens: minimax  # MiniMax (Anthropic-compatible gateway, M3)
+  laguna_lens: laguna_free  # poolside/laguna-s-2.1 — 3rd judge of audit-judge-panel-3l
   # Dedicated judge lane for advisory eval nodes (recipes/code-fix workflow.yaml
   # node `eval`). Split out of `reviewer` because the eval node's lane string is
   # ALSO what reaches the judge: the node's resolved lane is published into
