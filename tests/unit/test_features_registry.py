@@ -84,6 +84,82 @@ def test_feature_off_contributes_nothing() -> None:
     assert reg.resolve_selection({"oracle_gates": ""}) == {}
 
 
+def test_resolve_defaults_materializes_an_explicit_off() -> None:
+    """The persisted-default path and the per-run path must disagree, on purpose.
+
+    ``resolve_selection`` is additive: an off feature contributes nothing, so
+    the engine's own default stands. That is right for a run's overrides and
+    wrong for a *persisted default*, whose only job is to override that default
+    — for a default-ON feature, "contribute nothing" leaves it on, so
+    ``features set oracle_gates off`` would do nothing at all.
+    """
+    assert reg.resolve_selection({"oracle_gates": "0"}) == {}
+    assert reg.resolve_defaults({"oracle_gates": "0"}) == {"MO_ORACLE_GATES_AUTO": "0"}
+    # and an on value is identical on both paths
+    on = {"MO_ORACLE_GATES_AUTO": "1"}
+    assert reg.resolve_selection({"oracle_gates": "1"}) == on
+    assert reg.resolve_defaults({"oracle_gates": "1"}) == on
+
+
+def test_resolve_defaults_uses_each_feature_s_own_off_value() -> None:
+    """Off is not one value: three built-ins prove it, from source."""
+    # a plain kill switch reads "!= 1"
+    assert reg.resolve_defaults({"plan_qa_gate": "off"}) == {"MINI_ORK_EXECUTE_GATE": "0"}
+    # the review panel is split() as a lane list, so "0" would be a lane named 0
+    assert reg.resolve_defaults({"review_panel": "off"}) == {"MO_REVIEW_PANEL": ""}
+    # the engine's own fallback there is the neutral "probe" scorer, not "0"
+    assert reg.resolve_defaults({"code_arm_scorer": "off"}) == {
+        "MO_APPLY_SCORER": "probe", "MO_APPLY_CODE_PATCH": "", "MO_APPLY_PROBE_MAX_TASKS": "0"}
+
+
+def test_resolve_defaults_gates_premium_like_resolve_selection() -> None:
+    gated = reg.resolve_defaults({"review_panel": "codex kimi glm"}, accept_premium=False)
+    assert "MO_REVIEW_PANEL" not in gated
+    allowed = reg.resolve_defaults({"review_panel": "codex kimi glm"}, accept_premium=True)
+    assert allowed["MO_REVIEW_PANEL"] == "codex kimi glm"
+
+
+def test_is_off_reads_the_human_words_too() -> None:
+    for word in ("off", "OFF", " false ", "no", "none", "0", ""):
+        assert reg.is_off(word), word
+    for on in ("on", "1", "codex", "3"):
+        assert not reg.is_off(on), on
+    assert reg.is_off(None)
+
+
+def test_engine_default_differs_from_the_wizard_suggestion_where_it_must() -> None:
+    """``default`` is what the wizard suggests; ``effective_default`` is what runs.
+
+    They part company in exactly two places, both read from the engine's own
+    read site rather than assumed. Showing the suggestion as the running value
+    would claim a cost the engine is not paying.
+    """
+    ca = reg.get_feature("code_arm_scorer")
+    assert ca.default == "1" and ca.effective_default == "0"  # engine falls back to "probe"
+    rec = reg.get_feature("recursion")
+    assert rec.default == "3" and rec.effective_default == "0"  # read from a recipe, not the env
+    # everywhere else they agree, and tier keeps reading the *suggestion*
+    assert reg.get_feature("plan_qa_gate").effective_default == "1"
+    assert ca.tier == "premium"  # the suggestion costs x2, even though nothing is on
+
+
+def test_off_knobs_are_derived_for_the_features_that_do_not_override() -> None:
+    assert reg.get_feature("oracle_gates").off_knobs == {"MO_ORACLE_GATES_AUTO": "0"}
+    # a count feature switches off its enable knob AND its count
+    assert reg.get_feature("assay_relations").off_knobs == {
+        "MO_ASSAY_RELATIONS": "0", "MO_ASSAY_RELATIONS_K": "0"}
+    # a text feature's count knob is a lane list, so off is empty, not "0"
+    assert reg.get_feature("review_panel").off_knobs == {"MO_REVIEW_PANEL": ""}
+
+
+def test_json_carries_what_the_page_needs_to_price_a_feature() -> None:
+    js = {f["id"]: f for f in reg.catalogue_json()["features"]}
+    assert js["assay_relations"]["cost_per_unit"] == 0.07  # to price a non-default count
+    assert js["code_arm_scorer"]["engine_default"] == "0"
+    assert js["plan_qa_gate"]["engine_default"] == "1"
+    assert js["review_panel"]["off_knobs"] == {"MO_REVIEW_PANEL": ""}
+
+
 def test_catalogue_renders_both_tiers() -> None:
     md = reg.catalogue_markdown()
     assert "Baseline" in md and "Premium" in md

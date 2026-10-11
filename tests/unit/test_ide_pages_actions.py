@@ -175,6 +175,98 @@ def test_every_cli_action_parses(home: Path) -> None:
     assert not failures, failures
 
 
+def _walk_cli_prefixes(node: object) -> list[dict]:
+    """Every ``{"cli": [...]}`` dict, including composer prefixes.
+
+    :func:`_walk_cli_actions` follows ``do`` only, which skips a composer: its
+    ``cli`` is a *prefix* the IDE appends typed text to, so it carries neither a
+    complete argv nor a ``do``. The ``home`` flag rides the same dict, so a
+    composer is exactly as capable of handing a subcommand an argument its
+    parser rejects — the very bug this file's ``home`` test exists to stop.
+    """
+    out: list[dict] = []
+    if isinstance(node, dict):
+        cli = node.get("cli")
+        if isinstance(cli, list) and cli:
+            out.append(node)
+        for value in node.values():
+            out.extend(_walk_cli_prefixes(value))
+    elif isinstance(node, list):
+        for value in node:
+            out.extend(_walk_cli_prefixes(value))
+    return out
+
+
+def _module_source(head: str) -> str | None:
+    """The source of the module a subcommand dispatches into, or ``None``."""
+    from mini_ork.cli import main as cli_main
+
+    module_map = getattr(cli_main, "_NATIVE_MODULE_SUBS", None) or {}
+    name = module_map.get(head) or f"mini_ork.cli.{head.replace('-', '_')}"
+    try:
+        module = importlib.import_module(name)
+    except Exception:  # noqa: BLE001 — a module we cannot import is not ours to judge
+        return None
+    path = getattr(module, "__file__", None)
+    if not path:
+        return None
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def test_a_homeless_subcommand_is_never_sent_home(home: Path) -> None:
+    """A subcommand whose parser has no ``--home`` must carry ``home=False``.
+
+    ``board.rs run_action`` appends ``--home <home>`` unless the action's dict
+    says ``"home": false``, so a page that forgets the flag hands the
+    subcommand an argument its parser rejects and the button exits 2 —
+    silently, because the action path runs with no TTY. Five such sites had
+    shipped (``prefs rm``/``prefs set`` in learn's rules/memory/code, and
+    ``memory-lifecycle``'s retire/reactivate).
+
+    The set of homeless verbs is read from each subcommand module's **own
+    source** rather than hard-coded here, so a verb that loses ``--home`` later
+    is covered the day it changes, and one that gains it stops being flagged.
+    It looks for the ``"--home"`` *string literal* a parser must contain, not a
+    bare mention: ``mini_ork/cli/features.py`` documents that it takes no
+    ``--home``, and a prose mention must not read as support for the flag.
+    This complements :func:`test_every_cli_action_parses`: that one proves an
+    appended ``--home`` is *accepted* where it is sent, this one proves it is
+    never sent where it is not.
+    """
+    seen: set[str] = set()
+    failures: list[str] = []
+    for key in PAGES:
+        tabs = ("__none__",) + _PAGE_TABS.get(key, ())
+        for tab in tabs:
+            page = build_page(home, key, args=_page_args_for(key),
+                              tab=None if tab == "__none__" else tab)
+            for action in _walk_cli_prefixes(page):
+                cli = action.get("cli") or []
+                if not cli:
+                    continue
+                head = str(cli[0])
+                source = _module_source(head)
+                if source is None or '"--home"' in source or "'--home'" in source:
+                    continue
+                # A homeless verb was reached. If the page already says so, that
+                # is the correct state and there is nothing to report.
+                seen.add(head)
+                if action.get("home", True) is False:
+                    continue
+                failures.append(
+                    f"{key}/{tab}: {head!r} rejects --home but {cli!r} would be sent with it"
+                )
+    assert not failures, failures
+    # A vacuous pass (the walk reached no homeless verb at all) would mean it
+    # went blind, not that the pages are correct. Setup's Features tab renders a
+    # control per registered feature whatever the home holds, so the walk must
+    # always reach `features` — even though every one of its actions is correct.
+    assert "features" in seen, sorted(seen)
+
+
 def test_board_action_routes_through_board_cmd_parser(home: Path) -> None:
     """``board``-verb CLI actions pass through ``board_cmd.build_parser()``.
 
@@ -207,6 +299,6 @@ _PAGE_TABS: dict[str, tuple[str, ...]] = {
     "context": ("active", "library"),
     "nodes": ("fleet", "queue"),
     "orch": ("intake",),
-    "setup": ("readiness", "zed", "projects", "health"),
+    "setup": ("readiness", "features", "settings", "zed", "projects", "health"),
     "run": ("dag", "overview", "agents", "learnings", "artifacts"),
 }

@@ -24,6 +24,14 @@ features (≤1.5×) keep their existing defaults. :func:`premium_unselected`
 returns the premium features a selection turned on without opting in — the
 launch gate's input.
 
+Off is a value, not an absence. The engine's kill switch for a knob is almost
+always ``"0"``, but not universally: a :data:`KIND_TEXT` knob the engine splits
+(e.g. ``MO_REVIEW_PANEL``) must be the empty string, and a knob with a non-``"0"``
+engine default (``MO_APPLY_SCORER`` defaults to ``"probe"``) needs its own value.
+Each :class:`Feature` therefore carries :attr:`Feature.off_knobs`. Per-run
+selections ignore them (:func:`resolve_selection` omits off features); persisted
+defaults materialize them (:func:`resolve_defaults`).
+
 Read-only and stdlib-only on purpose: the CLI, the ACP command, and the skill
 generator all import this on hot paths, so it must stay cheap and dependency-free.
 """
@@ -51,6 +59,20 @@ _COST_MODELS = frozenset({COST_FIXED, COST_ADDITIVE, COST_PARALLEL})
 
 _OFF = (None, "", "0")
 
+#: Everything a user might type to mean "off", beyond the engine's own tokens.
+_OFF_WORDS = frozenset({"off", "false", "no", "none", "0", ""})
+
+
+def is_off(value: str | None) -> bool:
+    """Whether ``value`` means "this feature is disabled".
+
+    The engine's own tokens are ``None`` / ``""`` / ``"0"`` (:data:`_OFF`), but a
+    human typing a value (or an older ``features.yaml``) may write ``"off"`` or
+    ``"false"`` — which ``_OFF`` would treat as *enabled*. This is the one place
+    that decides, so callers never re-derive the token set.
+    """
+    return value is None or str(value).strip().lower() in _OFF_WORDS
+
 
 @dataclass(frozen=True)
 class Feature:
@@ -70,12 +92,23 @@ class Feature:
     kind: str = KIND_BOOL
     count_knob: str = ""
     default: str = ""
+    #: The value in force when nothing sets this feature's knob, when it differs
+    #: from :attr:`default` (which is what the wizard *suggests*). Only two
+    #: built-ins diverge, and both are read from source rather than assumed:
+    #: ``code_arm_scorer``'s engine fallback for its primary knob is the neutral
+    #: ``probe`` scorer, and ``recursion``'s count is read only from a recipe.
+    #: Left empty, :attr:`effective_default` returns :attr:`default`.
+    engine_default: str = ""
     cost_model: str = COST_FIXED
     cost_multiplier: float = 1.0  # COST_FIXED only
     cost_per_unit: float = 0.0  # additive/parallel
     unit: str = ""
     applies_to: tuple[str, ...] = ()  # () = every recipe
     docs: str = "docs/operator/feature-flags.md"
+    #: The env values that switch this feature *off* explicitly (see module
+    #: docstring, "Off is a value, not an absence"). Empty means "compute the
+    #: default rule in ``__post_init__``".
+    off_knobs: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.kind not in _VALUE_KINDS:
@@ -84,6 +117,24 @@ class Feature:
             raise ValueError(f"feature {self.id!r}: unknown cost_model {self.cost_model!r}")
         if self.cost_model != COST_FIXED and self.cost_per_unit <= 0.0:
             raise ValueError(f"feature {self.id!r}: {self.cost_model} needs cost_per_unit > 0")
+        if not self.off_knobs:
+            object.__setattr__(self, "off_knobs", self._derive_off_knobs())
+
+    def _derive_off_knobs(self) -> dict[str, str]:
+        """The off-rule for features that do not override it.
+
+        Most knobs are kill switches, so ``"0"`` turns them off. Two shapes
+        differ and are the reason this is computed rather than constant: a
+        :data:`KIND_TEXT` feature carries no knobs, only a count knob the engine
+        splits as a lane list (``"0"`` would be a lane *named* "0", so off is the
+        empty string); a knobless :data:`KIND_BOOL` synthesizes ``MO_<ID>``.
+        """
+        off = {k: "0" for k in self.knobs}
+        if self.count_knob:
+            off[self.count_knob] = "" if self.kind == KIND_TEXT else "0"
+        elif self.kind == KIND_BOOL and not self.knobs:
+            off[f"MO_{self.id.upper()}"] = "0"
+        return off
 
     # ── derived ──────────────────────────────────────────────────────────────
 
@@ -112,6 +163,19 @@ class Feature:
         return max(1.0, self.cost_per_unit * n)  # parallel
 
     @property
+    def effective_default(self) -> str:
+        """The value in force when nothing sets this feature's knob.
+
+        Usually :attr:`default`. They differ where the engine's own fallback for
+        the primary knob is not the suggested value — see :attr:`engine_default`
+        — and there the difference is material: reporting the suggestion as the
+        running value would claim a cost the engine is not paying. :attr:`tier`
+        deliberately keeps using :attr:`default`, because it answers a different
+        question: what suggesting this feature costs.
+        """
+        return self.engine_default or self.default
+
+    @property
     def tier(self) -> str:
         """``"premium"`` when this feature's default already exceeds the threshold."""
         return "premium" if self.multiplier(self.default) > PREMIUM_THRESHOLD else "baseline"
@@ -128,9 +192,12 @@ class Feature:
             "knobs": dict(self.knobs),
             "count_knob": self.count_knob,
             "default": self.default,
+            "engine_default": self.effective_default,
             "unit": self.unit,
             "cost_model": self.cost_model,
             "cost_multiplier": round(self.multiplier(self.default), 3),
+            "cost_per_unit": self.cost_per_unit,
+            "off_knobs": dict(self.off_knobs),
             "tier": self.tier,
             "applies_to": list(self.applies_to),
             "docs": self.docs,
@@ -209,6 +276,35 @@ def resolve_selection(
     for fid, value in selection.items():
         feat = CONTROLLABLE_FEATURES.get(fid)
         if feat is None or fid in blocked or value in _OFF:
+            continue
+        env.update({k: str(v) for k, v in feat.knobs.items()})
+        if feat.count_knob:
+            env[feat.count_knob] = str(value)
+        elif feat.kind == KIND_BOOL and len(feat.knobs) == 0:
+            env[f"MO_{fid.upper()}"] = "1"
+    return env
+
+
+def resolve_defaults(
+    selection: Mapping[str, str], *, accept_premium: bool = False
+) -> dict[str, str]:
+    """Materialize a *persisted default* selection into env overrides.
+
+    Sibling of :func:`resolve_selection` with the opposite treatment of "off".
+    A per-run selection is additive — an off feature contributes nothing, so the
+    engine's own default stands. A *persisted* default exists precisely to
+    override that default, so an off feature must emit its explicit off knobs
+    (:attr:`Feature.off_knobs`) or a default-ON feature could never be turned
+    off. The ON path is identical to :func:`resolve_selection`.
+    """
+    blocked = {f.id for f in premium_unselected(selection)} if not accept_premium else set()
+    env: dict[str, str] = {}
+    for fid, value in selection.items():
+        feat = CONTROLLABLE_FEATURES.get(fid)
+        if feat is None or fid in blocked:
+            continue
+        if is_off(value):
+            env.update(feat.off_knobs)
             continue
         env.update({k: str(v) for k, v in feat.knobs.items()})
         if feat.count_knob:
@@ -400,6 +496,9 @@ def _load_builtins() -> None:
             cost_model=COST_PARALLEL,
             cost_per_unit=1.0,
             unit="lanes",
+            # Engine splits this as a lane list, so "0" would be a lane named
+            # "0"; off is the empty string.
+            off_knobs={"MO_REVIEW_PANEL": ""},
         ),
         Feature(
             id="code_arm_scorer",
@@ -409,9 +508,20 @@ def _load_builtins() -> None:
             kind=KIND_COUNT,
             count_knob="MO_APPLY_PROBE_MAX_TASKS",
             default="1",
+            # Unset, the engine falls back to the neutral "probe" scorer, so the
+            # feature is not running at all — the registry default is a
+            # suggestion, not the runtime value.
+            engine_default="0",
             cost_model=COST_PARALLEL,
             cost_per_unit=2.0,
             unit="probes",
+            # The engine's own default for MO_APPLY_SCORER is "probe", not "0";
+            # "0" would select an unknown scorer (neutral score), not off.
+            off_knobs={
+                "MO_APPLY_SCORER": "probe",
+                "MO_APPLY_CODE_PATCH": "",
+                "MO_APPLY_PROBE_MAX_TASKS": "0",
+            },
         ),
         Feature(
             id="recursion",
@@ -421,6 +531,9 @@ def _load_builtins() -> None:
             kind=KIND_COUNT,
             count_knob="MO_RECURSION_MAX_ITERATIONS",
             default="3",
+            # The engine reads this count from a recipe, never from the
+            # environment (cli/execute.py:853), so unset means no iteration.
+            engine_default="0",
             cost_model=COST_PARALLEL,
             cost_per_unit=1.0,
             unit="iterations",

@@ -10,6 +10,12 @@ it. Two write-side verbs keep a skill in step with the registry:
 ``check-skill`` is what makes "a new feature is added to the skill
 automatically" a *guarantee* rather than a habit: register a feature, forget to
 re-render, and the gate goes red instead of the skill silently omitting it.
+
+Two further verbs persist a choice for every future run in the project, into
+``.mini-ork/config/features.yaml`` (see :mod:`mini_ork.features.store`):
+``set <id> <value>`` and ``unset <id>``. They read the project from
+``$MINI_ORK_HOME`` and take no ``--home`` — the IDE action path sets the
+environment, not the argv (see ``board.rs`` ``run_action``).
 """
 
 from __future__ import annotations
@@ -36,9 +42,16 @@ Usage:
   mini-ork features [--json] [--recipe <r>]      print the catalogue
   mini-ork features render-skill [--path <f>]    rewrite the skill's generated block
   mini-ork features check-skill  [--path <f>]    exit 1 if that block is stale
+  mini-ork features set <id> <value>             persist a default value for this project
+                     [--accept-premium]          required to turn a premium feature on
+  mini-ork features unset <id>                   drop a persisted default
+  mini-ork features set-env <NAME> <value>       persist a raw setting (e.g. a cap)
+  mini-ork features unset-env <NAME>             drop a raw setting
 
 The catalogue is read from mini_ork.features.registry — the single source of
 truth shared by this command, the wizard skill, and the /wizard thread command.
+``set``/``unset`` write .mini-ork/config/features.yaml, loaded at startup below
+the real environment. A value may be ``on``/``off`` a count, or a lane list.
 """
 
 
@@ -75,12 +88,73 @@ def _render_stale(path: Path, block: str) -> bool:
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="mini-ork features", add_help=False, usage=argparse.SUPPRESS)
     p.add_argument("sub", nargs="?", default="list",
-                   choices=["list", "render-skill", "check-skill"])
+                   choices=["list", "render-skill", "check-skill", "set", "unset",
+                            "set-env", "unset-env"])
+    p.add_argument("rest", nargs="*")
     p.add_argument("--json", action="store_true")
     p.add_argument("--recipe", default=None)
     p.add_argument("--path", default=DEFAULT_SKILL)
+    p.add_argument("--accept-premium", action="store_true")
     p.add_argument("-h", "--help", action="store_true")
     return p
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The parser, under the name every other subcommand module exposes.
+
+    Callers that enumerate subcommands (the IDE action walker looks up
+    ``build_parser`` / ``_build_parser`` to check an emitted argv parses) find
+    this one; the runtime entry point stays :func:`main`.
+    """
+    return _parser()
+
+
+def _set_unset(args: argparse.Namespace) -> int:
+    """Persist (or drop) one feature's project default. Returns an exit code."""
+    from mini_ork.features import store
+
+    if args.sub in ("set-env", "unset-env"):
+        if len(args.rest) < 1:
+            sys.stderr.write(f"usage: mini-ork features {args.sub} <NAME> [<value>]\n")
+            return 2
+        name = args.rest[0]
+        try:
+            if args.sub == "unset-env":
+                if not store.unset_env(name):
+                    sys.stderr.write(f"{name} is not set\n")
+                    return 1
+            else:
+                if len(args.rest) < 2:
+                    sys.stderr.write(f"usage: mini-ork features set-env {name} <value>\n")
+                    return 2
+                store.set_env(name, " ".join(args.rest[1:]))
+        except store.StoreError as exc:
+            sys.stderr.write(f"{exc}\n")
+            return 2
+        sys.stdout.write(f"{args.sub} {name} → {store.store_path()}\n")
+        return 0
+
+    if args.sub == "unset":
+        if len(args.rest) != 1:
+            sys.stderr.write("usage: mini-ork features unset <id>\n")
+            return 2
+        if not store.unset_feature(args.rest[0]):
+            sys.stderr.write(f"{args.rest[0]} is not set\n")
+            return 1
+        sys.stdout.write(f"unset {args.rest[0]} → {store.store_path()}\n")
+        return 0
+
+    if len(args.rest) < 2:
+        sys.stderr.write("usage: mini-ork features set <id> <value> [--accept-premium]\n")
+        return 2
+    feature_id, value = args.rest[0], " ".join(args.rest[1:])
+    try:
+        store.set_feature(feature_id, value, accept_premium=args.accept_premium)
+    except store.StoreError as exc:
+        sys.stderr.write(f"{exc}\n")
+        return 2
+    sys.stdout.write(f"{feature_id} = {value} → {store.store_path()}\n")
+    return 0
 
 
 def main(argv=None, *, root=None) -> int:
@@ -99,6 +173,9 @@ def main(argv=None, *, root=None) -> int:
         else:
             sys.stdout.write(catalogue_markdown(args.recipe))
         return 0
+
+    if args.sub in ("set", "unset", "set-env", "unset-env"):
+        return _set_unset(args)
 
     block = _block(args.recipe)
     path = _skill_path(args, root)

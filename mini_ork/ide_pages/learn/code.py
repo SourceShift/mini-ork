@@ -569,7 +569,8 @@ def _rule_action(area: str, cluster: dict[str, Any], *, is_file: bool) -> dict[s
     glob = _rule_glob(area, is_file=is_file)
     text = f"In {area}: avoid this recurring review finding — {rep}"
     return S.cli("prefs", "set", f"review-{slug}", text, "--scope", "path", "--target", glob,
-                 confirm=f"Add a rule for {glob}? Every run that touches it will be told this.")
+                 confirm=f"Add a rule for {glob}? Every run that touches it will be told this.",
+                 home=False)
 
 
 def _repo_file(file: Any) -> Path | None:
