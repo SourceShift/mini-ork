@@ -179,3 +179,59 @@ five keys or none.
 | `MINI_ORK_ACTIVE_STALE_SECONDS` | `21600` (6h) | Fleet view staleness threshold |
 | `MINI_ORK_RUN_STALE_SECONDS` | `"1800"` | Run-detail staleness threshold |
 | `MINI_ORK_PROJECTS_FILE` | *(flag)* | Project registry file for the switcher |
+
+## The wizard and the controlled-feature registry
+
+A **controlled feature** is a runtime behavior a user may enable, disable, or
+tune per run. Instead of three hand-maintained lists, one registry describes
+them all:
+
+* `mini_ork.features.registry` — the source of truth. Each entry is a
+  `Feature` (env knobs, a value kind, and a cost model) registered with
+  `register_feature(...)`.
+* `mini-ork features [--json] [--recipe <r>]` — print the catalogue for a human
+  or a script.
+* `/wizard` in a mini-ork Thread — walks a user through recipe → features →
+  plan → start, showing each feature and its projected cost.
+
+Add a feature once, in the registry, and it appears on all three surfaces. The
+skill file `skills/wizard/SKILL.md` carries a generated block between the
+`<!-- BEGIN GENERATED:features -->` / `<!-- END GENERATED:features -->`
+sentinels; `mini-ork features check-skill` exits non-zero when that block no
+longer matches the registry. A feature that is registered but not re-rendered
+is a **red gate**, not a silent omission — that is what makes "new features are
+added to the wizard automatically" a guarantee rather than a habit. Run
+`mini-ork features render-skill` to resync.
+
+### Premium features (the cost gate)
+
+A feature whose own multiplier exceeds **1.5×** is *premium*. Premium features
+are off for a wizard-launched run unless the user explicitly opts in
+(`MO_ACCEPT_PREMIUM=1`), so a stray click cannot triple a bill; baseline
+features (≤1.5×) keep their existing defaults. The check runs **server-side**,
+in `mini_ork.web.control.launch_run`, and the response reports what was dropped
+as `blocked_premium` — a caller cannot slip a premium knob past it by posting
+raw env to `POST /api/v1/runs`.
+
+### Two tiers
+
+Both tiers carry the same selection; they differ in where it is stored and who
+may set it.
+
+**Simple tier — one laptop.** No server, daemon, or cloud account. The
+selection is passed as per-run env overrides (via `/wizard`, or by hand in
+`config/secrets.local.sh` / the process env). `mini-ork features` needs only
+the standard library. It fails closed: `gate_env` removes premium knobs unless
+`MO_ACCEPT_PREMIUM=1`, off features contribute nothing, and an unknown feature
+id is ignored rather than guessed — a missing value is never a silent empty
+string.
+
+**Secure tier — a shared or hostile deployment.** The run is launched through
+`mini-ork serve` behind Bearer auth (`mini_ork.web.auth.require_token`), and
+which features a node may use is narrowed by scoping — the run-scoped
+`config/skills/` directory and per-node provider config (see `docs/CONFIG.md`)
+decide which features a node is even offered. The registry holds no secrets and
+reads only stdlib; the premium gate is enforced in the launch path, not in the
+UI, so it holds when the caller is another process rather than the Thread. One
+config file chooses the tier, so a user starts simple and switches without
+rewriting call sites.

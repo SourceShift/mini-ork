@@ -35,7 +35,7 @@ block around the JSON itself, no commentary before or after. Schema:
   ],
   "decomposition": [
     {
-      "id": "implementer",
+      "id": "produce-the-diff",
       "description": "produce the unified diff per the kickoff scope",
       "node_type": "implementer",
       "depends_on": []
@@ -83,6 +83,11 @@ block around the JSON itself, no commentary before or after. Schema:
   `planner | researcher | implementer | reviewer | verifier |
    reflector | publisher | rollback`. Anything else fails the
   D-008b validator.
+- **`decomposition[].id` MUST be a short unique descriptive slug**
+  naming the step's job (e.g. `"produce-the-diff"`,
+  `"verify-diff-applies"`) — never the bare `node_type`, and never
+  the same id twice. Duplicate role-named ids render as identical
+  rows in the IDE's planner card and make steps unaddressable.
 - **No placeholder values.** Strings wrapped in `<>` (e.g.
   `"<TODO>"`) are rejected as `placeholder_plan`.
 - **Do NOT add recipe-authoring nodes.** This is a code-edit recipe,

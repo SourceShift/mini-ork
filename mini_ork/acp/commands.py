@@ -215,6 +215,11 @@ COMMANDS: list[AvailableCommand] = [
         "Draft a kickoff with the orchestrator, check it, then start the run.",
         "what the run should do",
     ),
+    _cmd(
+        "wizard",
+        "Set up a run interactively: recipe, features and their cost, plan — then start.",
+        "what the run should do (optional)",
+    ),
 ]
 
 
@@ -908,6 +913,53 @@ async def handle_kickoff(
     )
 
 
+async def handle_wizard(
+    agent: Any, session_id: str, arg: str
+) -> _RewriteToOrchestrate | str:
+    """``/wizard [task]`` — configure a run, see the plan, then start it.
+
+    Thread-only carve-out, mirroring :func:`handle_kickoff`: the handler never
+    starts a run. It rewrites the turn to the orchestrator with the wizard
+    intent, so the orchestrator follows the **wizard skill** — present the
+    controllable features (baseline always-on, premium opt-in) from the live
+    registry, let the user enable/tune each, show the plan and projected cost,
+    and start the run only on accept. The feature list is never written here;
+    it is read from ``mini_ork.features`` so a new feature needs no edit to
+    this command.
+    """
+    if session_id not in getattr(agent, "_thread_sessions", set()):
+        return (
+            "The wizard sets up a run in a mini-ork thread — start one "
+            "from New Thread."
+        )
+    what = arg.strip() or "Ask what the run should do."
+    # The orchestrator cannot see the thread's pickers, so name the recipe.
+    cfg = (getattr(agent, "_thread_config", {}) or {}).get(session_id) or {}
+    recipe = str(cfg.get("recipe") or getattr(agent, "_recipe", "") or "")
+    recipe_hint = f" (the thread's Recipe picker suggests {recipe})" if recipe else ""
+    intent = (
+        f"The user wants to set up a mini-ork run with the wizard{recipe_hint}: "
+        f"{what}\n"
+        "Follow your wizard steps: 1) choose the recipe and target; 2) present "
+        "the controllable features from `mini-ork features --json` — baseline is "
+        "on, premium is opt-in and must not be enabled without the user asking — "
+        "and let the user enable/disable or tune each (panel lanes, probe count, "
+        "recursion iterations, caps); 3) show the resulting plan and the "
+        "projected cost as a multiple of a plain run; 4) start the run only when "
+        "the user accepts, exporting the chosen feature knobs (and "
+        "MO_ACCEPT_PREMIUM=1 for any premium feature)."
+    )
+    return _RewriteToOrchestrate(
+        intent_text=intent,
+        recipe_id=None,
+        bridge=(
+            "Handing this to the orchestrator. I'll walk you through the recipe, "
+            "the features and their cost, and the plan — then start the run when "
+            "you accept."
+        ),
+    )
+
+
 async def handle_recipe_edit(agent: Any, session_id: str, arg: str) -> str | _RewriteToOrchestrate:
     """Thread-side: rewrite to orchestrator to edit an existing recipe.
 
@@ -1344,6 +1396,7 @@ HANDLERS: dict[str, Handler] = {
     "automation": handle_automation,
     "automation new": handle_automation_new,
     "kickoff": handle_kickoff,
+    "wizard": handle_wizard,
     "automation run": handle_automation_run,
     "automation pause": handle_automation_pause,
     "automation resume": handle_automation_resume,
@@ -1384,6 +1437,7 @@ __all__ = [
     "handle_recipe_new",
     "handle_recipe_edit",
     "handle_automation_new",
+    "handle_wizard",
     "_spawn",
     "_run",
     "_probe",

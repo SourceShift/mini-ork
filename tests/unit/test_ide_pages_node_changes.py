@@ -244,6 +244,68 @@ def test_changes_view_planner_has_plan_items_no_files(home: Path) -> None:
     assert "No code changed" in out["diff_note"]
 
 
+def test_changes_view_planner_role_named_steps_show_description(home: Path) -> None:
+    """Steps whose id IS the node_type must not render as N identical
+    "implementer" rows (the framework-edit planner habit): the
+    description takes over the row, and true duplicates get a suffix."""
+    repo, base_sha = _seed_git_repo(home.absolute().parent)
+    _seed(home, repo=repo, base_sha=base_sha)
+    run_dir = home / "runs" / RUN
+    (run_dir / "plan.json").write_text(
+        json.dumps(
+            {
+                "objective": "demo planner objective",
+                "steps": [
+                    {"id": "implementer", "node_type": "implementer",
+                     "description": "broaden test-file detection to jest patterns"},
+                    {"id": "implementer", "node_type": "implementer",
+                     "description": "mirror the dispatch in scripts/run_heldout.py grade()"},
+                    {"id": "implementer", "node_type": "implementer",
+                     "description": ""},
+                    {"id": "implementer", "node_type": "implementer",
+                     "description": None},
+                    {"id": "verify-things", "node_type": "verifier",
+                     "description": "run every check"},
+                ],
+            }
+        )
+    )
+    out = build_node(home, RUN, "planner", view="changes")
+    assert out["ok"] is True
+    items = out["result"]["items"]
+    titles = [str(it.get("t") or "") for it in items]
+    # Role-named rows carry their (distinguishing) description, not the id.
+    assert "broaden test-file detection to jest patterns" in titles
+    assert "mirror the dispatch in scripts/run_heldout.py grade()" in titles
+    # No description → falls back to the id; a second bare one gets a
+    # suffix so both rows stay addressable.
+    assert "implementer" in titles
+    assert "implementer (2)" in titles
+    # A descriptive id keeps the id as the row text.
+    assert "verify-things" in titles
+    assert "implementer (3)" not in titles
+    # The role is still visible on every role-named row's sub line.
+    subs = [str(it.get("sub") or "") for it in items]
+    assert any(s.startswith("implementer") for s in subs)
+
+
+def test_planner_step_title_truncates_long_descriptions() -> None:
+    from mini_ork.ide_pages.node_changes import _planner_step_title
+    long = "word " * 40  # 200 chars, single line after whitespace squash
+    title = _planner_step_title(
+        {"id": "implementer", "node_type": "implementer",
+         "description": "  split\n  across\n  lines  "}, "implementer", "implementer")
+    assert title == "split across lines"
+    title = _planner_step_title(
+        {"id": "implementer", "node_type": "implementer",
+         "description": long}, "implementer", "implementer")
+    assert len(title) == 98 and title.endswith("…")
+    # Descriptive id always wins, long description or not.
+    assert _planner_step_title(
+        {"id": "verify-things", "description": long}, "verify-things", "verifier"
+    ) == "verify-things"
+
+
 def test_changes_view_implementer_has_files_diff_commits(home: Path) -> None:
     repo, base_sha = _seed_git_repo(home.absolute().parent)
     _seed(home, repo=repo, base_sha=base_sha)

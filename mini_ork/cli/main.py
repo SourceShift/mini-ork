@@ -58,6 +58,7 @@ _NATIVE_MODULE_SUBS = {
     "traceotter": "mini_ork.cli.traceotter",
     "metrics": "mini_ork.cli.metrics",
     "metric-anchor": "mini_ork.cli.metric_anchor",
+    "features": "mini_ork.cli.features",
     "rollback": "mini_ork.cli.rollback",
     "resume": "mini_ork.cli.resume",
     "recover": "mini_ork.recovery.planner",

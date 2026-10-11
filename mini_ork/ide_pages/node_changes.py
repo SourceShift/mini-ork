@@ -182,6 +182,24 @@ def _result_items(run: Run, node: Node) -> tuple[str, list[dict[str, Any]]]:
     return _other_node_items(run.run_dir, node)
 
 
+def _planner_step_title(s: dict[str, Any], sid: str, stype: str) -> str:
+    """Row text for one plan step: a descriptive ``id`` when it has one,
+    the (truncated) ``description`` otherwise.
+
+    Framework-edit planners routinely name every step after its role
+    (``id == node_type == "implementer"``); rendering that verbatim turns
+    N role-named steps into N identical rows. The description is the only
+    distinguishing field in that shape, so it takes over the row and the
+    role stays visible in the sub line.
+    """
+    if sid and sid != stype:
+        return sid
+    desc = " ".join(str(s.get("description") or "").split())
+    if len(desc) > 100:
+        desc = desc[:97] + "…"
+    return desc or sid or stype
+
+
 def _planner_items(run_dir: Path) -> tuple[str, list[dict[str, Any]]]:
     plan_path = run_dir / "plan.json"
     if not plan_path.is_file():
@@ -198,6 +216,7 @@ def _planner_items(run_dir: Path) -> tuple[str, list[dict[str, Any]]]:
         items.append(S.item(objective, "objective"))
     steps = plan.get("steps") or plan.get("decomposition") or []
     if isinstance(steps, list):
+        seen_titles: dict[str, int] = {}
         for s in steps:
             if not isinstance(s, dict):
                 continue
@@ -205,7 +224,14 @@ def _planner_items(run_dir: Path) -> tuple[str, list[dict[str, Any]]]:
             stype = str(s.get("type") or s.get("node_type") or "")
             lane = str(s.get("lane") or s.get("model_lane") or "")
             sub = " · ".join(p for p in (stype, lane) if p)
-            items.append(S.item(sid, sub, m="☰", mc="blue"))
+            title = _planner_step_title(s, sid, stype)
+            # Identical descriptions (or bare role ids with no description)
+            # still collide; number them so every row stays addressable.
+            n = seen_titles.get(title, 0) + 1
+            seen_titles[title] = n
+            if n > 1:
+                title = f"{title} ({n})"
+            items.append(S.item(title, sub, m="☰", mc="blue"))
     if not items:
         items.append(S.dot("plan.json has no steps"))
     return ("Planner plan", items)
