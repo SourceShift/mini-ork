@@ -1,0 +1,37 @@
+# pm.yaml — project-management sources for this project.
+#
+# Which tools hold work, and the vault key each one signs in with. Read by
+# mini_ork/pm/config.py; consumed by mini_ork/pm/providers/*.
+#
+# Resolution order (first hit wins), matching config/providers.yaml:
+#   1. $MINI_ORK_PM                         (explicit override)
+#   2. $MINI_ORK_HOME/config/pm.yaml        (per-project, gitignored dir)
+#   3. <repo>/config/pm.yaml                (this file)
+#
+# Secrets NEVER go in this file — only the NAME of the key that holds one.
+# `token_env` is resolved through mini_ork/dispatch/vault.py, so the same line
+# works whether the key lives in the environment, in a 0600 secrets.local.sh
+# beside the project, in sops, in `pass`, or in OpenBao. A missing key is a
+# clear error; an empty string is never read as "no credential needed".
+#
+# `local` — mini-ork's own epics — is the one source with no credential, no
+# network and no config beyond being switched on.
+#
+# Note: this is not config/providers.yaml, which registers LLM *lanes*. The
+# two are unrelated despite the shared word.
+
+sources:
+  local:
+    enabled: true
+
+  # linear:
+  #   enabled: false
+  #   token_env: LINEAR_API_KEY   # a personal API key, read-only is enough for the board
+  #   team: ENG                   # the team key the issues live in
+
+  # jira:
+  #   enabled: false
+  #   token_env: JIRA_API_TOKEN
+  #   site: https://acme.atlassian.net
+  #   email_env: JIRA_EMAIL       # the account the token belongs to
+  #   project: ENG
