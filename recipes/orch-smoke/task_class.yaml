@@ -1,0 +1,22 @@
+name: orch_smoke
+description: >
+  Orchestrator default-on smoke test. A deterministic failing verifier node
+  proves the per-run orchestrator fires with MO_RUN_ORCHESTRATOR unset:
+  expect exactly one ``orchestrator.<kind>`` row in run_events for
+  fail_probe. Zero LLM cost — the only executed code is the failing script.
+  Expected: run fails (that is the point), no publish, orchestrator event
+  present.
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+matches:
+  keywords:
+    - orch-smoke
+    - orchestrator-smoke
+  path_globs: []
+  regex: []
+
+default_gates: []
+risk_class: low
+version: "0.1.0"
