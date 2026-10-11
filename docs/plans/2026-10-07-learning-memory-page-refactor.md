@@ -327,3 +327,29 @@ in Rules and whether they help.
 | P7a preferences reach every node | `learn-prefs` | running |
 | P7b Memory tab | — | after P7a + restructure |
 | P10 usefulness audit | — | last: Opus lenses grade the live JSON of every tab against the contract above; findings become one fix round |
+
+## Data-path reliability (2026-10-11)
+
+The "Your code" tab rendered empty on the researcher project, and the cause was
+not the page: **reflect never reaches its last step there.** The tab's only
+producer (`code_findings.harvest`) was side channel #8 of 8, so every truncated
+pass — an exception, a timeout, or the SIGKILL a killed reflect leaves — took it
+with them. The researcher home shows the shape: 1930 `execution_traces` rows
+still `running`, newest successful pass 2026-08-30, and `code_findings` empty.
+
+Eight defects were fixed on the engine side (no page code writes; every new page
+statement is still a SELECT):
+
+| # | Defect | Fix |
+|---|---|---|
+| D1 | `code_findings` ran 8th of 8, so any truncation lost the tab's data | moves first, before `rp.reflection_run` (`cli/reflect.py`) |
+| D2 | reflect's stdout/stderr and exit code were discarded into a closed pipe | `<run_dir>/reflect.log` for every outcome, kill included (`cli/main.py`) |
+| D3 | a flat 360 s bound against passes that reach 5538 s | bound derives from the slowest of the last 20 successful passes ×3, floored 360 s, ceiling `MO_REFLECT_TIMEOUT_MAX_SECONDS`; `MO_REFLECT_TIMEOUT_SECONDS` still pins |
+| D4 | four different empties all returned `{runs: 0}` | `harvest()` returns `reason` (`ok`/`no_home`/`no_runs_dir`/`no_db`/`db_home_mismatch`/`db_error`) + the home/db it used |
+| D5 | `home` and `MINI_ORK_DB` could name two projects silently | harvest refuses and logs when no run dir exists in that DB's `task_runs` |
+| D6 | engine drift was invisible | engine root + version (+ short commit in `doctor`) printed in the reflect log and `mini-ork doctor`, against `schema_migrations.mini_ork_version` |
+| D7 | one empty-state sentence for three situations | the Harvest line and the areas empty state name which: no runs dir / reflect never finished (with leaked `running` count) / finished and found nothing |
+| D8 | the finalizer only ran where a parent run runs | age-guarded sweep at reflect start and at `serve` startup, so a home whose runs have stopped heals too |
+
+Still open on the deployment side: the researcher's vendored engine at
+`.mini-ork` predates all of this and must be re-synced before the tab can fill.

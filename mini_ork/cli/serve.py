@@ -9,6 +9,7 @@ the composed uvicorn argv without launching it.
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import os
 import sys
@@ -104,6 +105,15 @@ def main(argv: list[str] | None = None, *, root: str | None = None,
     cmd = uvicorn_argv(opts["host"], opts["port"], opts["reload"])
     if not _exec:
         return 0
+    # Heal the reflect rows a hard-killed parent left 'running'. The run-start
+    # sweep only reaches a home that starts a run, so a project whose runs have
+    # stopped keeps a phantom pass forever — and `serve` is the one process
+    # guaranteed to be up for a home the IDE is looking at. Age-guarded by the
+    # helper, at startup only (never on a page read, which must stay read-only),
+    # and best-effort: the UI must boot even when the DB is mid-write.
+    with contextlib.suppress(Exception):
+        from mini_ork import trace_store
+        trace_store.finalize_reflect_traces(db=db_path)
     os.chdir(root)
     os.execvp(cmd[0], cmd)  # replaces process, mirroring bash `exec`
 

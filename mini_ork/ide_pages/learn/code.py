@@ -153,11 +153,74 @@ def _harvest_summary(home: Path) -> tuple[int, int]:
     return int(row.get("n") or 0), int(row.get("last") or 0)
 
 
+def _runs_dir(home: Path) -> Path:
+    """Where ``harvest`` reads from — the same ``home/runs`` the writer uses."""
+    return Path(home) / "runs"
+
+
+def _reflect_state(home: Path) -> dict[str, int]:
+    """What the reflect lifecycle says about this home: three integers, SELECT-only.
+
+    The page must never write (reflect is the sole writer of these tables), so
+    this reads the very ``execution_traces`` table ``reflect.py`` writes and
+    nothing else: when the newest ``__reflect__`` pass finished, when the newest
+    one started whatever its fate, and how many are still marked 'running'. A
+    'running' row is the fingerprint of a reflect killed mid-pipeline (only the
+    parent that spawned one finalizes it), so a home with an empty harvest AND
+    leaking 'running' rows is saying the harvest never got its turn — a
+    different problem from a home with nothing to harvest yet.
+    """
+    state = {"last_success": 0, "last_attempt": 0, "running": 0}
+    from mini_ork.web.db import StateDB
+
+    try:
+        conn = StateDB(Path(_db_path(home)))
+    except (FileNotFoundError, OSError):
+        return state
+    if not conn.has_table("execution_traces"):
+        return state
+    row = conn.row(
+        "SELECT "
+        "MAX(CASE WHEN status='success' THEN CAST(strftime('%s', created_at) AS INTEGER) END) AS done, "
+        "MAX(CAST(strftime('%s', created_at) AS INTEGER)) AS tried, "
+        "SUM(CASE WHEN status='running' THEN 1 ELSE 0 END) AS running "
+        "FROM execution_traces WHERE task_class='__reflect__'")
+    if not row:
+        return state
+    return {"last_success": int(row.get("done") or 0),
+            "last_attempt": int(row.get("tried") or 0),
+            "running": int(row.get("running") or 0)}
+
+
+def _empty_note(home: Path) -> str:
+    """ONE sentence naming why there is nothing to show.
+
+    Three different situations used to render the identical "Updated after every
+    reflect pass." — no runs at all, runs whose reflect never finished, and a
+    harvest that ran and found nothing — and only the first is cured by waiting.
+    Every branch here is a read: a directory test and SELECTs.
+    """
+    runs = _runs_dir(home)
+    if not runs.is_dir():
+        return f"No runs to harvest yet — {runs} does not exist."
+    state = _reflect_state(home)
+    if not state["last_success"]:
+        if not state["last_attempt"]:
+            return "No reflect pass has run in this home yet."
+        age = S.age(state["last_attempt"], int(time.time()))
+        stuck = (f" {state['running']} pass(es) are still marked running — a reflect "
+                 f"that was killed leaves its row that way.") if state["running"] else ""
+        return f"Reflect has never finished here (newest attempt {age} ago).{stuck}"
+    age = S.age(state["last_success"], int(time.time()))
+    return (f"Reflect last finished {age} ago and harvested nothing — open that "
+            f"run's reflect.log for what it reached.")
+
+
 def _freshness(home: Path) -> dict[str, Any]:
     n, last = _harvest_summary(home)
-    note = "Updated after every reflect pass."
     if not n:
-        return S.kv(KV_TITLE, [("Harvested", "nothing yet", "sub", note)])
+        return S.kv(KV_TITLE, [("Harvested", "nothing yet", "sub", _empty_note(home))])
+    note = "Updated after every reflect pass."
     now = int(time.time())
     plural = "" if n == 1 else "s"
     return S.kv(KV_TITLE, [("Harvested", f"{n} run{plural} · last {S.age(last, now)} ago",
@@ -194,9 +257,15 @@ def _areas_table(home: Path, args: dict[str, str]) -> dict[str, Any]:
     days = _days(args)
     rows = areas(db=db, since_days=days)
     if not rows:
-        return S.lst(AREAS_TITLE,
-                     [S.dot("No review findings yet. They appear after your runs are reviewed.")],
-                     full=True)
+        items = [S.dot("No review findings yet. They appear after your runs are reviewed.")]
+        # The same three-state note the Harvest line carries: a table that is
+        # empty because nothing could be harvested reads exactly like one that
+        # is empty because nothing was found, and only this line tells them
+        # apart.
+        note = _empty_note(home)
+        if note:
+            items.append(S.dot(note, "sub"))
+        return S.lst(AREAS_TITLE, items, full=True)
     now = int(time.time())
     selected = str(args.get("area") or "")
     # ONE membership rule for both views (reviewer, round 2). ``areas()`` groups

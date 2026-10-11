@@ -198,19 +198,223 @@ def _module_env(root):
     return env
 
 
-def _reflect_timeout_seconds() -> int:
-    """The wall-clock bound on the post-verdict reflect child.
+_REFLECT_TIMEOUT_FALLBACK = 360
+_REFLECT_TIMEOUT_HEADROOM = 3
+_REFLECT_TIMEOUT_CEILING = 21600
+_REFLECT_TIMEOUT_SAMPLE = 20
+
+
+def _reflect_durations(db: str | None = None,
+                       *, sample: int = _REFLECT_TIMEOUT_SAMPLE) -> list[int]:
+    """Durations, in seconds, of the most recent *successful* reflect passes.
+
+    Read through the same ladder every other reader uses (explicit arg →
+    ``MINI_ORK_DB`` → ``$MINI_ORK_HOME/state.db``). Returns ``[]`` when the DB
+    or the table is missing: a home that has never completed a reflect has no
+    recorded work to size a bound from, and an empty list is the honest answer
+    rather than a guess.
+    """
+    path = db or os.environ.get("MINI_ORK_DB") or os.path.join(
+        os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork"),
+        "state.db")
+    if not path or not os.path.exists(path):
+        return []
+    import sqlite3  # noqa: PLC0415 — only this diagnostic needs it
+    try:
+        con = sqlite3.connect(path, timeout=2.0)
+    except sqlite3.Error:
+        return []
+    try:
+        rows = con.execute(
+            "SELECT duration_ms FROM execution_traces "
+            "WHERE task_class='__reflect__' AND status='success' "
+            "AND duration_ms IS NOT NULL AND duration_ms > 0 "
+            "ORDER BY created_at DESC LIMIT ?",
+            (sample,),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        try:
+            con.close()
+        except sqlite3.Error:
+            pass
+    return [int(r[0]) // 1000 for r in rows if r and r[0]]
+
+
+def _reflect_timeout(db: str | None = None) -> tuple[int, str]:
+    """``(seconds, why)`` — the wall-clock bound on the post-verdict reflect child.
 
     Reflect runs after the verdict is already final, so it can never change the
     outcome — only hold the process open. A lane that never returns used to
     wedge `mini-ork run` forever; the campaign launcher worked around it with a
     six-minute shell watchdog. That bound belongs in the code that spawns the
     child, not in the script that calls it.
+
+    A *flat* bound is wrong in both directions. The successful passes on the
+    live homes average 363 s but reach 5538 s, so 360 s kills real work — and
+    because ``code_findings`` is the last of eight sequential side channels,
+    every kill took the "Your code" tab's only data source with it. The bound is
+    therefore derived from the work this home has actually recorded: the
+    slowest of the last ``_REFLECT_TIMEOUT_SAMPLE`` successful passes, times
+    ``_REFLECT_TIMEOUT_HEADROOM``, floored at the legacy default and capped.
+
+    ``MO_REFLECT_TIMEOUT_SECONDS`` still pins an explicit bound (an operator who
+    set it outranks the derivation) and ``MO_REFLECT_TIMEOUT_MAX_SECONDS`` moves
+    the ceiling. Fail-closed: an unreadable DB, no recorded pass, or a malformed
+    value all fall back to the floor, and the second element always names the
+    rule that produced the number so the log line can be read back.
     """
+    pinned = os.environ.get("MO_REFLECT_TIMEOUT_SECONDS")
+    if pinned:
+        try:
+            return max(1, int(pinned)), "pinned by MO_REFLECT_TIMEOUT_SECONDS"
+        except ValueError:
+            return _REFLECT_TIMEOUT_FALLBACK, (
+                f"MO_REFLECT_TIMEOUT_SECONDS={pinned!r} is not an integer; "
+                f"floor {_REFLECT_TIMEOUT_FALLBACK}s")
     try:
-        return max(1, int(os.environ.get("MO_REFLECT_TIMEOUT_SECONDS", "360")))
+        ceiling = max(1, int(os.environ.get(
+            "MO_REFLECT_TIMEOUT_MAX_SECONDS", str(_REFLECT_TIMEOUT_CEILING))))
     except ValueError:
-        return 360
+        ceiling = _REFLECT_TIMEOUT_CEILING
+    durations = _reflect_durations(db)
+    if not durations:
+        return _REFLECT_TIMEOUT_FALLBACK, (
+            f"no successful reflect recorded; floor {_REFLECT_TIMEOUT_FALLBACK}s")
+    slowest = max(durations)
+    derived = min(ceiling, slowest * _REFLECT_TIMEOUT_HEADROOM)
+    if derived <= _REFLECT_TIMEOUT_FALLBACK:
+        return _REFLECT_TIMEOUT_FALLBACK, (
+            f"slowest of {len(durations)} recent pass(es) {slowest}s; "
+            f"floor {_REFLECT_TIMEOUT_FALLBACK}s")
+    return derived, (
+        f"{_REFLECT_TIMEOUT_HEADROOM}x the slowest of {len(durations)} recent "
+        f"pass(es) ({slowest}s), ceiling {ceiling}s")
+
+
+def _reflect_timeout_seconds() -> int:
+    """The bound alone, for a caller with no log to write the reason into.
+
+    ``mini_ork.cli.execute_handlers`` imports this name; the signature and the
+    return type it binds to stay as they are.
+    """
+    return _reflect_timeout()[0]
+
+
+def engine_version(root: str | None = None) -> str:
+    """The version of the engine checkout that is running, or "" if unknown.
+
+    More than one engine can serve one project — the IDE's ``serve`` and the
+    copy vendored in the project's own ``.mini-ork`` — and they drift (the
+    researcher's is 34 lines behind on ``reflect.py`` alone). A version alone
+    cannot tell two checkouts at the same version apart, so the *root* is
+    printed beside it wherever this is used; "" is the honest answer for a
+    checkout with no readable pyproject, and callers render it as "?".
+    """
+    base = root or os.environ.get("MINI_ORK_ROOT") or str(
+        Path(__file__).resolve().parents[2])
+    try:
+        import tomllib  # noqa: PLC0415 — py311+, and only this diagnostic needs it
+        with open(os.path.join(base, "pyproject.toml"), "rb") as fh:
+            doc = tomllib.load(fh)
+    except (OSError, ValueError):
+        return ""
+    return str((doc.get("project") or {}).get("version") or "")
+
+
+def _engine_commit(root: str | None = None) -> str:
+    """The running checkout's short commit, or "" — ``doctor``'s drift tie-break.
+
+    Two checkouts of the same release differ only by commit, so the version
+    comparison alone cannot see the drift this is here to expose. Best-effort
+    and quiet: a checkout with no git, or none at all, is not a doctor failure.
+    """
+    base = root or os.environ.get("MINI_ORK_ROOT") or str(
+        Path(__file__).resolve().parents[2])
+    try:
+        proc = subprocess.run(
+            ["git", "-C", base, "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
+def _db_engine_version(home: str) -> str:
+    """The engine version recorded in a home's ``schema_migrations``, or "".
+
+    ``migrate`` stamps the version of the engine that applied each migration
+    onto its row, so the newest row names the last engine that touched this DB
+    — the other half of the drift check. "" for a missing DB, a pre-version DB
+    (the column arrived with a migration), or a DB with no rows yet.
+    """
+    path = os.environ.get("MINI_ORK_DB") or os.path.join(home, "state.db")
+    if not os.path.exists(path):
+        return ""
+    import sqlite3  # noqa: PLC0415 — only this diagnostic needs it
+    try:
+        con = sqlite3.connect(path, timeout=2.0)
+    except sqlite3.Error:
+        return ""
+    try:
+        row = con.execute(
+            "SELECT mini_ork_version FROM schema_migrations "
+            "ORDER BY applied_at DESC LIMIT 1").fetchone()
+    except sqlite3.Error:
+        return ""
+    finally:
+        try:
+            con.close()
+        except sqlite3.Error:
+            pass
+    return str(row[0]) if row and row[0] else ""
+
+
+def _reflect_log_name() -> str:
+    """``reflect.log``; a rehearsal gets its own file, as ``execute.log`` does."""
+    return ("reflect.dryrun.log"
+            if os.environ.get("MINI_ORK_DRY_RUN", "0") == "1" else "reflect.log")
+
+
+def _child_text(value) -> str:
+    """A captured child stream as text, whichever of the two it arrived as.
+
+    ``subprocess.TimeoutExpired`` hands back bytes even when the parent asked
+    for text, so the killed pass would otherwise reach the log as a ``b'…'``
+    repr — the one case this log exists for.
+    """
+    if not value:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return str(value)
+
+
+def _write_reflect_log(run_dir: str, head: str, status: str,
+                       out: str, err: str) -> str:
+    """Write the reflect child's whole output under ``<run_dir>/reflect.log``.
+
+    Returns the path, or "" when it could not be written — the outcome is
+    already on stdout, and a diagnostic that fails must never fail the run it
+    is diagnosing.
+    """
+    text = f"{head}exit:   {status}\n"
+    if out:
+        text += f"\n── reflect stdout ──\n{out}"
+    if err:
+        text += f"\n── reflect stderr ──\n{err}"
+    path = os.path.join(run_dir, _reflect_log_name())
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    except OSError as exc:
+        sys.stderr.write(f"  [reflect] log not written to {path}: {exc}\n")
+        return ""
+    return path
 
 
 def resolve_recipe(root: str, task_class: str) -> str:
@@ -1138,17 +1342,44 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
     # ── reflect (best-effort, Python-sole entrypoint) ──
     if os.environ.get("MO_AUTO_REFLECT", "1") == "1":
         sys.stdout.write("── reflect (auto, since run start) ──\n")
+        reflect_db = context_env("MINI_ORK_DB") or os.path.join(home, "state.db")
+        reflect_bound, reflect_bound_why = _reflect_timeout(reflect_db)
+        # The child's output used to go into a pipe that was discarded on
+        # return, so a reflect that died mid-pipeline left no evidence of where
+        # it died — the researcher home's 1930 leaked 'running' rows are all
+        # there is to show for months of passes. The log is written for every
+        # outcome, the kill included, and it names the engine and the DB so a
+        # drifted vendored copy or a home/DB mismatch is visible in the artifact
+        # rather than only in a process list.
+        reflect_head = (
+            "=== mini-ork reflect (auto) ===\n"
+            f"since:  {t0}\n"
+            f"bound:  {reflect_bound}s ({reflect_bound_why})\n"
+            f"engine: {root} (v{engine_version(root) or '?'})\n"
+            f"home:   {home}\n"
+            f"db:     {reflect_db}\n"
+        )
+        reflect_out = ""
+        reflect_err = ""
+        reflect_status = ""
         try:
-            subprocess.run(
+            completed = subprocess.run(
                 [sys.executable, "-m", "mini_ork.cli.reflect", "--since", str(t0)],
                 capture_output=True,
-                timeout=_reflect_timeout_seconds(),
+                text=True,
+                timeout=reflect_bound,
                 env={
                     **_module_env(root),
                     "MO_REFLECTION_BATCH": os.environ.get("MO_REFLECTION_BATCH", "25"),
                 },
             )
-        except subprocess.TimeoutExpired:
+            reflect_out = _child_text(completed.stdout)
+            reflect_err = _child_text(completed.stderr)
+            reflect_status = f"exit {completed.returncode}"
+        except subprocess.TimeoutExpired as exc:
+            reflect_out = _child_text(exc.stdout)
+            reflect_err = _child_text(exc.stderr)
+            reflect_status = f"timed out after {reflect_bound}s; skipped"
             sys.stdout.write("── reflect (timed out; skipped) ──\n")
         finally:
             # A timed-out reflect is SIGKILLed by subprocess.run, so its own
@@ -1160,6 +1391,14 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
             # reflect row.
             with contextlib.suppress(Exception):
                 trace_store.finalize_reflect_traces(run_id)
+        reflect_log = ""
+        if _run_dir and _run_dir != "." and os.path.isdir(_run_dir):
+            reflect_log = _write_reflect_log(
+                _run_dir, reflect_head, reflect_status, reflect_out, reflect_err)
+        sys.stdout.write(
+            f"── reflect ({reflect_status}"
+            f"{f'; log: {reflect_log}' if reflect_log else ''}) ──\n"
+        )
 
     # ── trajectory retention (roadmap Step 2 / A2): best-effort TTL prune of
     # turn_jsonl artifacts. MO_TRAJECTORY_TTL_DAYS=0 disables; never gates.
@@ -1275,6 +1514,31 @@ def _doctor_handler(rest, root):
         print(f"  [OK]      MINI_ORK_DB={os.environ['MINI_ORK_DB']}")
     else:
         print("  [WARN]    MINI_ORK_DB unset (default: $MINI_ORK_HOME/state.db)")
+    # Which engine is running, and which one last wrote this home. Two engines
+    # can serve one project (the IDE's serve, the copy vendored in the project's
+    # .mini-ork) and they drift; the commit is what separates two checkouts of
+    # the same release, the recorded DB version is what separates a home from a
+    # newer engine that never migrated it.
+    print("")
+    print("Engine:")
+    engine_root = os.environ.get("MINI_ORK_ROOT") or root
+    engine_ver = engine_version(engine_root)
+    engine_commit = _engine_commit(engine_root)
+    print(f"  [OK]      root: {engine_root} "
+          f"(v{engine_ver or '?'}{f' @{engine_commit}' if engine_commit else ''})")
+    recorded = _db_engine_version(home)
+    if not recorded:
+        print("  [WARN]    home DB records no engine version "
+              "(never migrated by a versioned engine, or no schema_migrations row)")
+    elif not engine_ver:
+        print(f"  [WARN]    home DB last migrated by v{recorded}; this engine's "
+              "version could not be read")
+    elif recorded == engine_ver:
+        print(f"  [OK]      home DB last migrated by v{recorded} (this engine)")
+    else:
+        print(f"  [WARN]    home DB last migrated by v{recorded}, this engine is "
+              f"v{engine_ver} — a newer engine has written this home; run "
+              "`mini-ork migrate` from the engine you mean to use")
     print("")
     print("Provider preflight:")
     for tool, name in (("claude", "anthropic"), ("codex", "codex")):

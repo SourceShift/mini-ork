@@ -931,21 +931,34 @@ def harvest(home, *, run_ids=None, db=None) -> dict:
     Skips run dirs already recorded in ``code_findings_runs`` unless they are
     explicitly listed in ``run_ids`` (INSERT OR IGNORE keeps it idempotent per
     fingerprint). Returns ``{"runs", "findings", "with_file",
-    "skipped_unparseable"}``.
+    "skipped_unparseable", "reason", "home", "db"}``.
+
+    ``reason`` is why the pass ended where it did: ``ok`` (it ran to the end,
+    even if it found nothing), ``no_home``, ``no_runs_dir``, ``no_db``,
+    ``db_home_mismatch`` (see the guard below) or ``db_error``. Without it every
+    one of those shapes returned the same ``{"runs": 0, "findings": 0}``, so a
+    caller could not tell "there is nothing to harvest yet" from "this never
+    ran" from "this cannot run here" — the ambiguity the empty "Your code" tab
+    was read through. ``home`` and ``db`` are echoed for the same reason: they
+    are the two settings a mismatch shows up in.
 
     ``run_ids``, when given, restricts the harvest to exactly those run dirs
     (already-recorded runs are still re-read, since the caller asked for them).
     """
 
-    stats = {"runs": 0, "findings": 0, "with_file": 0, "skipped_unparseable": 0}
+    stats = {"runs": 0, "findings": 0, "with_file": 0, "skipped_unparseable": 0,
+             "reason": "ok", "home": home or "", "db": _resolve_db(db) or ""}
     if not home:
+        stats["reason"] = "no_home"
         return stats
     runs_dir = os.path.join(home, "runs")
     if not os.path.isdir(runs_dir):
+        stats["reason"] = "no_runs_dir"
         return stats
     ensure_schema(db)
     con = _open(db)
     if con is None:
+        stats["reason"] = "no_db"
         return stats
     repo_root = os.environ.get("MINI_ORK_ROOT") or os.getcwd()
     wanted = set(run_ids) if run_ids else set()
@@ -968,7 +981,29 @@ def harvest(home, *, run_ids=None, db=None) -> dict:
                                         else "stuck")
         except sqlite3.Error:
             status_of = {}
-        for name in sorted(os.listdir(runs_dir)):
+        entries = sorted(os.listdir(runs_dir))
+        # ── home/DB consistency (D5) ──
+        # `home` decides where the runs are read from, `db` where the findings
+        # are written. They are independent settings, so they can name two
+        # different projects — and when they do, every run dir is a stranger to
+        # that DB: the pass reports 0 forever while its caller reads it as
+        # "nothing to harvest yet". Refuse and log rather than write, because a
+        # mismatched write is the one outcome a re-run cannot undo: those runs
+        # would be marked harvested in the wrong project. An empty `task_runs`
+        # (a fresh project) is not evidence of a mismatch, so the guard stays
+        # out of the way there — matching this function's rule that foreign run
+        # dirs are harvested.
+        if status_of and entries and not any(name in status_of for name in entries):
+            stats["reason"] = "db_home_mismatch"
+            print(
+                f"  [warn] code_findings: refusing to harvest {runs_dir} into "
+                f"{stats['db']}: none of its {len(entries)} run dir(s) exist in that "
+                f"DB's task_runs ({len(status_of)} row(s)). Point MINI_ORK_DB at this "
+                f"home's own state.db.",
+                file=sys.stderr,
+            )
+            return stats
+        for name in entries:
             if name in done and name not in wanted:
                 continue
             if wanted and name not in wanted:
@@ -1018,6 +1053,7 @@ def harvest(home, *, run_ids=None, db=None) -> dict:
             stats["with_file"] += with_file
             stats["skipped_unparseable"] += skipped
     except sqlite3.Error as e:
+        stats["reason"] = "db_error"
         print(f"  [warn] code_findings: harvest failed: {e}", file=sys.stderr)
     finally:
         try:

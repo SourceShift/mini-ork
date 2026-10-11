@@ -236,6 +236,16 @@ def main(argv: list[str] | None = None) -> int:
 
     _trace_state: dict = {"terminal": False}
     if not dry_run:
+        # Heal the rows a hard-killed reflect left 'running' BEFORE opening our
+        # own. Until now the only sweep lived at the run-start boundary, so a
+        # home whose runs have stopped (the researcher's) kept a phantom pass
+        # forever and every reader of execution_traces counted it. Age-guarded
+        # (the helper's 12 min default), so a reflect genuinely in flight is
+        # never touched; best-effort, because reflect must run even when the DB
+        # is mid-write.
+        with contextlib.suppress(Exception):
+            from mini_ork import trace_store  # noqa: PLC0415
+            trace_store.finalize_reflect_traces(db=db_path)
         _trace_write(
             json.dumps({
                 "trace_id": trace_id,
@@ -295,6 +305,53 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write("  [warn] --task-class filter not yet implemented in reflection_run; ignoring\n")
 
     reflect_start_ts = int(time.time())
+
+    # ── side-channel: code findings (MO_CODE_FINDINGS) ──────────────────────
+    # Harvest reviewer/verifier findings out of the run dirs into the
+    # code_findings tables, so the "Your code" tab can group what reviews keep
+    # finding in the same file.
+    #
+    # FIRST, before the pipeline and before every other channel. This is the
+    # only producer of that tab's data and the cheapest step in the file (it
+    # reads run dirs; it calls no model), yet as the eighth of eight it was the
+    # first casualty of every truncation — an exception, a timeout, or the
+    # SIGKILL a killed reflect leaves behind — which is how a home can show
+    # 1930 leaked 'running' reflect rows and a tab that has been empty since
+    # August. It also depends on nothing below it: it reads the run dirs'
+    # review and verdict artifacts, never another channel's output.
+    # Default ON with the same `get(name, "1") != "0"` opt-out form as its
+    # neighbours. harvest() calls ensure_schema itself, so there is no schema
+    # step here, and the whole block is fail-soft — a side-channel must never
+    # crash reflect.
+    #
+    # The import sits INSIDE the try, unlike the neighbouring side-channels
+    # that import above theirs (they fail-soft on the *call* only). This block
+    # pulls a heavier dependency chain (sqlite/glob/subprocess + the learning
+    # package), so an ImportError here must degrade to the
+    # `[code_findings] skipped:` line rather than crash reflect — do not
+    # "restore" it to match the neighbours.
+    if os.environ.get("MO_CODE_FINDINGS", "1") != "0":
+        try:
+            from mini_ork.learning import code_findings
+            cf_stats = code_findings.harvest(mini_ork_home, db=db_path)
+        except Exception as exc:  # a side-channel must never crash reflect
+            sys.stderr.write(f"  [code_findings] skipped: {exc}\n")
+            cf_stats = None
+        if cf_stats is not None:
+            sys.stdout.write(
+                f"  [code_findings] harvested {cf_stats.get('runs', 0)} run(s), "
+                f"{cf_stats.get('findings', 0)} finding(s)\n"
+            )
+            # A harvest that changed nothing because it *could not* is not the
+            # same as one that found nothing, and only ``reason`` says which —
+            # so a pass that stopped short says so on stderr, one line, with the
+            # two settings the stop depends on. The stdout line above stays
+            # byte-identical on the happy path.
+            if cf_stats.get("reason") not in (None, "ok"):
+                sys.stderr.write(
+                    f"  [code_findings] nothing harvested: {cf_stats.get('reason')} "
+                    f"(home={cf_stats.get('home')}, db={cf_stats.get('db')})\n"
+                )
 
     run_stdout = io.StringIO()
     with contextlib.redirect_stdout(run_stdout):
@@ -493,33 +550,6 @@ def main(argv: list[str] | None = None) -> int:
             f"  [lane_router] recomputed advantage for {lanes_updated or 0} "
             f"(lane, task_class) pair(s)\n"
         )
-
-    # ── side-channel: code findings (MO_CODE_FINDINGS) ──────────────────────
-    # Harvest reviewer/verifier findings out of the run dirs into the
-    # code_findings tables, so the "Your code" tab can group what reviews keep
-    # finding in the same file. Runs AFTER the other side-channels (it only
-    # reads their outputs' run dirs). Default ON with the same
-    # `get(name, "1") != "0"` opt-out form as its neighbours. harvest() calls
-    # ensure_schema itself, so there is no schema step here, and the whole block
-    # is fail-soft — a side-channel must never crash reflect.
-    #
-    # The import sits INSIDE the try, unlike the neighbouring side-channels that
-    # import above theirs (they fail-soft on the *call* only). This block pulls a
-    # heavier dependency chain (sqlite/glob/subprocess + the learning package),
-    # so an ImportError here must degrade to the `[code_findings] skipped:` line
-    # rather than crash reflect — do not "restore" it to match the neighbours.
-    if os.environ.get("MO_CODE_FINDINGS", "1") != "0":
-        try:
-            from mini_ork.learning import code_findings
-            cf_stats = code_findings.harvest(mini_ork_home, db=db_path)
-        except Exception as exc:  # a side-channel must never crash reflect
-            sys.stderr.write(f"  [code_findings] skipped: {exc}\n")
-            cf_stats = None
-        if cf_stats is not None:
-            sys.stdout.write(
-                f"  [code_findings] harvested {cf_stats.get('runs', 0)} run(s), "
-                f"{cf_stats.get('findings', 0)} finding(s)\n"
-            )
 
     # ── GEPA optimizer block intentionally NOT ported (default path skipped) ──
 
