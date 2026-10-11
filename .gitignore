@@ -50,10 +50,6 @@ node_modules/
 .pnpm-store/
 .runtime/
 mini_ork/web/static/
-# The ui/ crate is the source for the Rust IDE in the zed-mini-ork fork; it
-# does not build here (needs the Zed workspace), but a stray `cargo` run inside
-# it must not litter the repo.
-ui/target/
 
 # Commercial / private deliverables (e.g. customer-specific business plans).
 # Open-source repo carries the recipe, not the customer-named output.
