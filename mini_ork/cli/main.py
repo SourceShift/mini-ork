@@ -59,6 +59,7 @@ _NATIVE_MODULE_SUBS = {
     "metrics": "mini_ork.cli.metrics",
     "metric-anchor": "mini_ork.cli.metric_anchor",
     "features": "mini_ork.cli.features",
+    "skills": "mini_ork.cli.skills",
     "rollback": "mini_ork.cli.rollback",
     "resume": "mini_ork.cli.resume",
     "recover": "mini_ork.recovery.planner",

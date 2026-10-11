@@ -1,0 +1,12 @@
+# skill-smoke is a registry smoke test: its artifacts (lens-granted.md,
+# lens-control.md, verifier sidecars) live in the run dir and are checked
+# there by verifiers/skills-isolation.py.
+#
+# outputs[] means "canonical repo paths the publisher copies + git-commits
+# the source_artifact to". A smoke run must not commit anything, so outputs
+# stays empty — the publisher takes its skip path and still marks the run
+# published.
+source_artifact: lens-granted.md
+outputs: []
+success_verifiers:
+  - skills-isolation

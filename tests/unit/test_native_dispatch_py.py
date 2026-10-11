@@ -40,6 +40,7 @@ def test_all_former_exec_subs_registered_natively():
         "triage",
         "repair",
         "features",
+        "skills",
         "threads",
         "intake",
     }

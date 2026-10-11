@@ -285,18 +285,59 @@ def conversation_workspace_file(conversation_id: str, file_path: str) -> Any:
 
 @router.post("/api/skills")
 def list_skills() -> dict[str, Any]:
-    """The workspace skills list.
+    """The workspace skills list, from the actual skill registry.
 
-    mini-ork has no skill marketplace — its recipes under ``recipes/<slug>/``
-    are the reusable-unit mechanism, and they are versioned with the repo
-    rather than installed into a workspace. An empty list is therefore the
-    accurate answer, not a placeholder: the canvas renders it as "no skills
-    installed", which is exactly the situation.
+    Serves ``dispatch/skill_registry.load_skills`` — the same three sources
+    (run / operator / project) a workflow grant resolves against, with the
+    description read out of each ``SKILL.md``'s frontmatter. First
+    definition of a name wins, mirroring grant resolution, so the list a
+    user picks from is the list a node can actually get.
 
     POST rather than GET is the canvas's choice (it sends a body carrying the
     runtime scope); the route is a pure read and ignores it.
     """
-    return {"skills": []}
+    import os
+    from pathlib import Path
+
+    from mini_ork.dispatch.skill_registry import describe_skill, load_skills
+
+    env = os.environ
+    # The tier follows WHICH env base contains the skill, never a positional
+    # index: skill_source_dirs drops sources whose env var is unset, so
+    # index 0 is only "run" when a run dir is actually set.
+    bases = (
+        (str(env.get("MINI_ORK_RUN_DIR") or ""), "run"),
+        (str(env.get("MINI_ORK_HOME") or ""), "operator"),
+        (str(env.get("MINI_ORK_ROOT") or ""), "project"),
+    )
+
+    def _tier_of(directory) -> str:
+        try:
+            resolved = directory.resolve()
+        except OSError:
+            resolved = directory
+        for base, tier in bases:
+            if not base:
+                continue
+            try:
+                resolved.relative_to(Path(base).resolve())
+                return tier
+            except (OSError, ValueError):
+                continue
+        return "project"
+
+    skills: list[dict[str, Any]] = []
+    for name, directory in sorted(load_skills(env).items()):
+        meta = describe_skill(directory)
+        skills.append(
+            {
+                "name": name,
+                "description": meta["description"],
+                "source": _tier_of(directory),
+                "path": str(directory),
+            }
+        )
+    return {"skills": skills}
 
 
 @router.get("/api/automation/sdk-version")

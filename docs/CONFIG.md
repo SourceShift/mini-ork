@@ -512,8 +512,48 @@ A name no registry defines is a warning, not a failure — the same posture the
 MCP registry takes with an unconfigured server, so a typo costs a line of
 stderr rather than a run.
 
+A registry entry is a directory that contains a `SKILL.md` (with `name:`
+and `description:` frontmatter — the same file the Zed editor's skill system
+reads). A directory without one is not a skill: it is skipped at load time,
+and `mini-ork skills validate` names every such entry plus skills whose
+frontmatter carries no description.
+
+When the node's harness itself is spawned into a sandbox
+(`MO_SANDBOX_SCOPE=agent`, or a non-host `MO_SANDBOX_BACKEND`), grants are
+**copied** into the checkout instead of symlinked: a symlink carries an
+absolute host path the container cannot follow, while a copy rides the
+bind-mounted drive. `MO_SKILLS_MODE=symlink|copy` pins the behavior
+regardless of sandbox config. Release removes a copy only while it is still
+the directory the executor created.
+
+Every grant is also a **node event**: at dispatch time the executor emits a
+`skills` event (granted / created / missing / skipped) to the run's event
+stream, so a missing or shadowed skill is findable after the run, not only
+in scrolling stderr. The Zed run pages surface grants too — the node page
+shows a Skills row, the recipe page lists per-node grants.
+
+Operators get `mini-ork skills`:
+
+```
+mini-ork skills list [--json]     # every grantable skill + its registry tier
+mini-ork skills show <name>       # print a skill's SKILL.md
+mini-ork skills validate          # fail on entries a grant would skip
+mini-ork skills promote <id>      # TraceOtter-mined procedure → registry skill
+```
+
+`promote` closes the distillation loop's last mile: a procedure TraceOtter
+mined out of real trajectories (`.mini-ork/traceotter/skills.json`) becomes
+a directory in the operator registry (or `--to root` for the repo's
+`.agents/skills/`), grantable to future runs. The web canvas serves the same
+registry at `POST /api/skills`.
+
 This is the two-tier shape again: the simple tier is a directory in
 `.agents/skills/`, committed or dropped in by hand, with no server involved;
 the secure, multi-tenant tier is the same directory content served from the
 run's own `config/skills/`, so a shared deployment controls which nodes see
 which skills without anyone editing a checkout.
+
+(Not to be confused with the repo-root `skills/` directory: that holds the
+features wizard's generated `SKILL.md` — a feature-inventory surface, not a
+grant registry. Grants resolve only against the three sources in the table
+above.)
