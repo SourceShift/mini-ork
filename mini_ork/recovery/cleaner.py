@@ -22,6 +22,8 @@ import subprocess
 import sys
 import time
 
+from mini_ork.verify.pm import run_argv
+
 
 def _git(root, *args):
     return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True)
@@ -193,10 +195,13 @@ def main(argv=None, *, root=None, home=None, spawn=None, gauntlet=None) -> int:
                 continue
             reuse_ok = True
             if os.path.isfile(os.path.join(repo_root, "package.json")):
-                if subprocess.run(["npm", "run", "-s", "type-check"], cwd=repo_root,
+                # repo_root is the target repo: resolve ITS manager. A hardcoded
+                # `npm run` cannot start at all against a pnpm-only devEngines
+                # repo, so this predicate would wrongly refuse a good branch.
+                if subprocess.run(run_argv(repo_root, "type-check"), cwd=repo_root,
                                   capture_output=True).returncode != 0:
                     reuse_ok = False
-                elif subprocess.run(["npm", "run", "-s", "build"], cwd=repo_root,
+                elif subprocess.run(run_argv(repo_root, "build"), cwd=repo_root,
                                     capture_output=True).returncode != 0:
                     reuse_ok = False
             if not reuse_ok:

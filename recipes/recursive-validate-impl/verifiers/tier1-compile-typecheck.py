@@ -9,8 +9,19 @@
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
+
+# mini-ork's verifiers are standalone scripts. The executor exports PYTHONPATH
+# (`mini_ork/cli/execute.py`, _run_verifier_ref), but walk up to the engine root
+# anyway so a hand-run or a caller that forgets it still imports.
+_engine = os.path.dirname(os.path.realpath(__file__))
+while not os.path.isdir(os.path.join(_engine, "mini_ork")) and _engine != os.path.dirname(_engine):
+    _engine = os.path.dirname(_engine)
+if _engine not in sys.path:
+    sys.path.insert(0, _engine)
+from mini_ork.verify.pm import describe, exec_argv, run_argv  # noqa: E402
 
 RUN_DIR = os.environ["MINI_ORK_RUN_DIR"]
 
@@ -54,6 +65,7 @@ ev.write(f"touched_files={len(TOUCHED_FILES)}\n")
 ev.write(f"source_files={len(SOURCE_FILES)}\n")
 ev.write(f"shell_files={len(SHELL_FILES)}\n")
 ev.write(f"artifact_files={len(ARTIFACT_FILES)}\n")
+ev.write(describe(".") + "\n")
 ev.flush()
 
 tsc_rc = 0
@@ -67,8 +79,14 @@ except OSError:
     pass
 
 if SOURCE_FILES and os.path.isfile("package.json") and "type-check:touched" in pkg:
-    tsc_rc = subprocess.run(["pnpm", "type-check:touched"] + SOURCE_FILES,
-                            stdout=ev, stderr=subprocess.STDOUT).returncode
+    # The manager is a property of the TARGET repo, never the engine host. A
+    # hardcoded `pnpm` here fails against an npm repo (and `npx` below fails
+    # against a pnpm repo) — a TOOLCHAIN failure that gets read as a CODE
+    # failure, which is how one bad lint call cascaded into 10 failed nodes.
+    tsc_argv = run_argv(".", "type-check:touched", *SOURCE_FILES)
+    ev.write(f"$ {shlex.join(tsc_argv)}\n")
+    ev.flush()
+    tsc_rc = subprocess.run(tsc_argv, stdout=ev, stderr=subprocess.STDOUT).returncode
 else:
     ev.write("no TypeScript/JavaScript source files for tier1 typecheck\n")
     ev.flush()
@@ -81,12 +99,21 @@ if SOURCE_FILES and any(os.path.isfile(f) for f in
                  "elsewhere, e.g. pre-commit hooks; eslint may structurally exclude "
                  "the touched tree)\n")
     elif lint_cmd:
-        import shlex
-        lint_rc = subprocess.run(shlex.split(lint_cmd) + SOURCE_FILES,
+        lint_argv = shlex.split(lint_cmd) + SOURCE_FILES
+        ev.write(f"$ {shlex.join(lint_argv)}\n")
+        ev.flush()
+        lint_rc = subprocess.run(lint_argv,
                                  stdout=ev, stderr=subprocess.STDOUT, timeout=600).returncode
         ev.write(f"lint via MO_TIER1_LINT_CMD rc={lint_rc}\n")
     else:
-        lint_rc = subprocess.run(["npx", "eslint"] + SOURCE_FILES,
+        # `npx eslint` against a repo declaring devEngines.packageManager=pnpm
+        # makes npm refuse to start (EBADDEVENGINES) before eslint runs at all.
+        # exec_argv prefers the repo's own node_modules/.bin/eslint, then its
+        # declared manager — never the engine host's npm.
+        lint_argv = exec_argv(".", "eslint", *SOURCE_FILES)
+        ev.write(f"$ {shlex.join(lint_argv)}\n")
+        ev.flush()
+        lint_rc = subprocess.run(lint_argv,
                                  stdout=ev, stderr=subprocess.STDOUT).returncode
 else:
     ev.write("no source files for eslint or no eslint config found\n")

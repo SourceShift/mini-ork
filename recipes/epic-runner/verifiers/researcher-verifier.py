@@ -13,7 +13,21 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _lib import EvidenceLog, check_pnpm_workspace, check_psql_credentials_set, emit_verifier_json  # noqa: E402
+# mini-ork's verifiers are standalone scripts. The executor exports PYTHONPATH
+# (`mini_ork/cli/execute.py`, _run_verifier_ref), but walk up to the engine root
+# anyway so a hand-run or a caller that forgets it still imports.
+_engine = os.path.dirname(os.path.abspath(__file__))
+while not os.path.isdir(os.path.join(_engine, "mini_ork")) and _engine != os.path.dirname(_engine):
+    _engine = os.path.dirname(_engine)
+if _engine not in sys.path:
+    sys.path.insert(0, _engine)
+from _lib import (  # noqa: E402
+    EvidenceLog,
+    check_node_repo_with_script,
+    check_psql_credentials_set,
+    emit_verifier_json,
+)
+from mini_ork.verify.pm import exec_argv, run_argv  # noqa: E402
 
 NAME = "researcher"
 
@@ -61,11 +75,14 @@ def _typecheck_touched():
     if not files:
         log.write("skip: no .ts/.tsx files changed\n")
         return True
-    if not check_pnpm_workspace(REPO):
-        log.write(f"pnpm workspace missing at {REPO}; cannot run type-check:touched\n")
+    if not check_node_repo_with_script(REPO, "type-check:touched"):
+        log.write(f"{REPO} package.json declares no type-check:touched script\n")
         return False
-    return subprocess.run(["pnpm", "--dir", REPO, "type-check:touched"] + files,
-                          stdout=log._ev, stderr=subprocess.STDOUT).returncode == 0
+    # Resolve the manager from REPO and run there: `pnpm --dir REPO` assumed the
+    # manager, and npm refuses to start against a pnpm-only devEngines repo.
+    argv = run_argv(REPO, "type-check:touched", *files)
+    log.write(f"$ {' '.join(argv)}\n")
+    return subprocess.run(argv, cwd=REPO, stdout=log._ev, stderr=subprocess.STDOUT).returncode == 0
 
 
 def _test_candidates_for_changed_file(path):
@@ -109,11 +126,13 @@ def _jest_related_tests():
     if not os.path.isfile(os.path.join(REPO, "server", "jest.config.js")):
         log.write(f"missing jest config at {REPO}/server/jest.config.js\n")
         return False
-    return subprocess.run(
-        ["npx", "--prefix", REPO, "jest",
-         "--config", os.path.join(REPO, "server", "jest.config.js"),
-         "--findRelatedTests"] + inputs + ["--runInBand", "--forceExit"],
-        stdout=log._ev, stderr=subprocess.STDOUT).returncode == 0
+    argv = exec_argv(
+        REPO, "jest",
+        "--config", os.path.join(REPO, "server", "jest.config.js"),
+        "--findRelatedTests", *inputs, "--runInBand", "--forceExit")
+    log.write(f"$ {' '.join(argv)}\n")
+    return subprocess.run(argv, cwd=REPO,
+                          stdout=log._ev, stderr=subprocess.STDOUT).returncode == 0
 
 
 def _sql_probe():
@@ -153,7 +172,7 @@ log.write(f"typecheck_files={TYPECHECK_FILE_LIST}\n")
 log.write(f"jest_inputs={JEST_INPUT_LIST}\n")
 
 log.record_check("typecheck-passed",
-                 "pnpm type-check:touched passes for changed TypeScript files, or is skipped when none changed",
+                 "type-check:touched passes for changed TypeScript files, or is skipped when none changed",
                  _typecheck_touched)
 log.record_check("jest-passed",
                  "jest related tests pass when changed or adjacent tests exist, or are skipped when none apply",

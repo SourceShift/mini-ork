@@ -17,13 +17,23 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tarfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# mini-ork's verifiers are standalone scripts. The executor exports PYTHONPATH
+# (`mini_ork/cli/execute.py`, _run_verifier_ref), but walk up to the engine root
+# anyway so a hand-run or a caller that forgets it still imports.
+_engine = os.path.dirname(os.path.realpath(__file__))
+while not os.path.isdir(os.path.join(_engine, "mini_ork")) and _engine != os.path.dirname(_engine):
+    _engine = os.path.dirname(_engine)
+if _engine not in sys.path:
+    sys.path.insert(0, _engine)
 from _verdict_merge import write_verdict  # noqa: E402
+from mini_ork.verify.pm import run_argv  # noqa: E402
 
 RUN_DIR = os.environ["MINI_ORK_RUN_DIR"]
 
@@ -96,6 +106,8 @@ def _run(argv, cwd=None, shell=False):
     if shell:
         return subprocess.run(argv, shell=True, cwd=cwd, stdout=_ev,
                               stderr=subprocess.STDOUT).returncode == 0
+    _ev.write(f"$ {shlex.join(argv)}\n")
+    _ev.flush()
     return subprocess.run(argv, cwd=cwd, stdout=_ev,
                           stderr=subprocess.STDOUT).returncode == 0
 
@@ -282,9 +294,13 @@ _check("python-compile-clean", "changed Python files compile", _python_compile_c
 
 def _typescript_typecheck():
     if any(re.search(r"\.(ts|tsx)$", f) for f in _changed_file_lines()):
-        if os.path.isfile(os.path.join(WORKTREE, "ui", "package.json")):
-            return _run(["pnpm", "--dir", os.path.join(WORKTREE, "ui"), "typecheck"])
-        return _run(["npm", "--prefix", WORKTREE, "run", "typecheck"])
+        # The manager is a property of the repo being checked (WORKTREE/ui), not
+        # of the host: `pnpm --dir` assumed pnpm and `npm --prefix` assumed npm,
+        # and each fails against the other's repo. Resolve per root, run there.
+        ui = os.path.join(WORKTREE, "ui")
+        if os.path.isfile(os.path.join(ui, "package.json")):
+            return _run(run_argv(ui, "typecheck"), cwd=ui)
+        return _run(run_argv(WORKTREE, "typecheck"), cwd=WORKTREE)
     _ev.write("skip: no ts/tsx files changed\n")
     _ev.flush()
     return True

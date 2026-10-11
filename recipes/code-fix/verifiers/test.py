@@ -52,6 +52,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -109,6 +110,19 @@ except Exception:                       # pragma: no cover — defensive only
     detect_runners = None               # type: ignore[assignment]
     parse_results_dir = None            # type: ignore[assignment]
     _TEST_RESULTS_AVAILABLE = False
+
+
+try:
+    # Same late-import seam: resolve the TARGET repo's package manager rather
+    # than guessing from whichever manager is on the engine host's PATH.
+    from mini_ork.verify.pm import run_argv, runnable_manager
+except Exception:                       # pragma: no cover — defensive only
+    def run_argv(root, script, *extra):
+        manager = "pnpm" if shutil.which("pnpm") else "npm"
+        return [manager, "run", script, *extra]
+
+    def runnable_manager(root="."):
+        return "pnpm" if shutil.which("pnpm") else ("npm" if shutil.which("npm") else "")
 
 
 def _child_env(environ=None):
@@ -871,20 +885,20 @@ def detect_test_cmd():
     if os.environ.get("MINI_ORK_TEST_CMD"):
         return os.environ["MINI_ORK_TEST_CMD"]
 
-    # npm / pnpm / yarn — check package.json scripts first.
+    # npm / pnpm / yarn / bun — check package.json scripts first. The manager is
+    # a property of THIS repo (devEngines/packageManager/lockfile), never of the
+    # engine host's PATH.
     if os.path.isfile("package.json"):
         scripts = _package_scripts()
         for candidate in ("test", "test:unit", "test:ci"):
             if candidate in scripts:
-                if shutil.which("pnpm"):
-                    return f"pnpm run {candidate}"
-                if shutil.which("npm"):
-                    return "npm test"
-        # Fallback: npm test without package.json script parsing
-        if shutil.which("pnpm"):
-            return "pnpm test"
-        if shutil.which("npm"):
-            return "npm test"
+                # Gate on a RUNNABLE manager so a polyglot repo with no node
+                # manager installed still falls through to pytest/cargo/go.
+                if runnable_manager("."):
+                    return shlex.join(run_argv(".", candidate))
+        # Fallback: run the repo's own `test` script (no script parsing needed).
+        if runnable_manager("."):
+            return shlex.join(run_argv(".", "test"))
 
     # Python pytest
     if shutil.which("pytest"):

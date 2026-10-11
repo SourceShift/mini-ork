@@ -10,8 +10,19 @@ import glob
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
+
+# mini-ork's verifiers are standalone scripts. The executor exports PYTHONPATH
+# (`mini_ork/cli/execute.py`, _run_verifier_ref), but walk up to the engine root
+# anyway so a hand-run or a caller that forgets it still imports.
+_engine = os.path.dirname(os.path.realpath(__file__))
+while not os.path.isdir(os.path.join(_engine, "mini_ork")) and _engine != os.path.dirname(_engine):
+    _engine = os.path.dirname(_engine)
+if _engine not in sys.path:
+    sys.path.insert(0, _engine)
+from mini_ork.verify.pm import exec_argv, run_argv  # noqa: E402
 
 RUN_DIR = os.environ["MINI_ORK_RUN_DIR"]
 
@@ -94,14 +105,16 @@ else:
                 vcfg = c
                 break
         if vcfg:
-            argv = ["npx", "vitest", "run", "--config", vcfg] + TEST_FILES
+            argv = exec_argv(".", "vitest", "run", "--config", vcfg, *TEST_FILES)
         else:
-            argv = ["npx", "vitest", "run"] + TEST_FILES
+            argv = exec_argv(".", "vitest", "run", *TEST_FILES)
     elif os.path.isfile("server/jest.config.js"):
         env = {**os.environ, "JEST_GUARD_SOFT": "1"}
-        argv = ["pnpm", "test:server", "--runTestsByPath"] + TEST_FILES
+        argv = run_argv(".", "test:server", "--runTestsByPath", *TEST_FILES)
     else:
-        argv = ["npx", "jest", "--runTestsByPath"] + TEST_FILES
+        argv = exec_argv(".", "jest", "--runTestsByPath", *TEST_FILES)
+    ev.write(f"$ {shlex.join(argv)}\n")
+    ev.flush()
     jest_rc = subprocess.run(argv, env=env, stdout=ev, stderr=subprocess.STDOUT).returncode
     passed = jest_rc == 0
 

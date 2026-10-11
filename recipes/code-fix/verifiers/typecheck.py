@@ -58,6 +58,19 @@ except Exception:                       # pragma: no cover — defensive only
         return env
 
 
+try:
+    # Same late-import seam as above: resolve the TARGET repo's package manager
+    # rather than guessing from the engine host's PATH.
+    from mini_ork.verify.pm import run_argv, runnable_manager
+except Exception:                       # pragma: no cover — defensive only
+    def run_argv(root, script, *extra):
+        manager = "pnpm" if shutil.which("pnpm") else "npm"
+        return [manager, "run", script, *extra]
+
+    def runnable_manager(root="."):
+        return "pnpm" if shutil.which("pnpm") else ("npm" if shutil.which("npm") else "")
+
+
 def _child_env(environ=None):
     """Environment for the target repo's type-check command.
 
@@ -160,15 +173,18 @@ def detect_typecheck():
     if explicit:
         return _Detected(explicit, "full")
 
-    # npm / pnpm / yarn — check package.json scripts first.
+    # npm / pnpm / yarn / bun — check package.json scripts first. The manager is
+    # a property of THIS repo (its devEngines/packageManager/lockfile), never of
+    # whichever manager happens to be on the engine host's PATH.
     if os.path.isfile("package.json"):
         scripts = _package_scripts()
         for candidate in _SCRIPT_CANDIDATES:
             if candidate in scripts:
-                if shutil.which("pnpm"):
-                    return _Detected(f"pnpm run {candidate}", "full")
-                if shutil.which("npm"):
-                    return _Detected(f"npm run {candidate}", "full")
+                # Gate on a RUNNABLE manager: with none installed this falls
+                # through to tsc/mypy/cargo/go rather than promising a command
+                # that cannot start.
+                if runnable_manager("."):
+                    return _Detected(shlex.join(run_argv(".", candidate)), "full")
 
     # TypeScript project marker required before we trust a tsc binary.
     if _has_ts_marker():

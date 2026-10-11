@@ -14,7 +14,9 @@
 #
 # Optional env:
 #   MINI_ORK_PLAYWRIGHT_CMD   — override the playwright invocation
-#                               (default: npx playwright test)
+#                               (default: WORKDIR's own playwright — the repo's
+#                               node_modules/.bin first, then its declared
+#                               package manager)
 #   MINI_ORK_VERDICT_DIR      — directory to write bdd-verdict.json into
 #   MINI_ORK_BDD_TIMEOUT_SEC  — wall-clock timeout for the playwright run
 #                               (default: 300)
@@ -31,6 +33,16 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timezone
+
+# mini-ork's verifiers are standalone scripts. The executor exports PYTHONPATH
+# (`mini_ork/cli/execute.py`, _run_verifier_ref), but walk up to the engine root
+# anyway so a hand-run or a caller that forgets it still imports.
+_engine = os.path.dirname(os.path.realpath(__file__))
+while not os.path.isdir(os.path.join(_engine, "mini_ork")) and _engine != os.path.dirname(_engine):
+    _engine = os.path.dirname(_engine)
+if _engine not in sys.path:
+    sys.path.insert(0, _engine)
+from mini_ork.verify.pm import exec_argv  # noqa: E402
 
 SUB_EPIC_ID = os.environ.get("SUB_EPIC_ID", "")
 WORKDIR = os.environ.get("WORKDIR", "")
@@ -74,7 +86,11 @@ if not spec_file:
 
 # ─── Configuration ───────────────────────────────────────────────────────
 
-playwright_cmd = os.environ.get("MINI_ORK_PLAYWRIGHT_CMD", "npx playwright test")
+# WORKDIR is the implementer's worktree — the manager is a property of THAT
+# repo. `npx` against a pnpm-only devEngines repo makes npm refuse to start
+# before playwright runs; exec_argv prefers WORKDIR's own node_modules/.bin.
+playwright_cmd = (os.environ.get("MINI_ORK_PLAYWRIGHT_CMD")
+                  or shlex.join(exec_argv(WORKDIR, "playwright", "test")))
 timeout_sec = float(os.environ.get("MINI_ORK_BDD_TIMEOUT_SEC", "300"))
 verdict_dir = os.environ.get("MINI_ORK_VERDICT_DIR", "")
 json_results_file = ""

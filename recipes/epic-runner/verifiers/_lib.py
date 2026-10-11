@@ -42,8 +42,24 @@ class EvidenceLog:
         self._tsv.close()
 
 
-def check_pnpm_workspace(repo):
-    return os.path.isdir(repo) and os.path.isfile(os.path.join(repo, "pnpm-workspace.yaml"))
+def check_node_repo_with_script(repo, script):
+    """``repo`` is a Node project whose ``package.json`` declares ``script``.
+
+    Manager-neutral on purpose. The previous gate here was
+    ``os.path.isfile(repo/pnpm-workspace.yaml)``, which failed **closed** on
+    every non-pnpm repo before the typecheck argv was reached — the mirror image
+    of the hardcoded ``pnpm`` argv this file was fixed for. The real contract is
+    "the repo declares the script we are about to run", which is what this tests.
+    """
+    if not os.path.isdir(repo):
+        return False
+    try:
+        with open(os.path.join(repo, "package.json"), encoding="utf-8", errors="replace") as fh:
+            pkg = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    scripts = pkg.get("scripts") if isinstance(pkg, dict) else None
+    return isinstance(scripts, dict) and script in scripts
 
 
 def check_psql_credentials_set():
