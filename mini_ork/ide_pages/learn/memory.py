@@ -132,7 +132,7 @@ def _pref_acts(p: dict) -> list[dict[str, Any]]:
     return [S.btn(
         "Remove",
         S.cli("prefs", "rm", key, "--scope", scope, "--target", target,
-              confirm=f"Remove preference '{key}'?"),
+              confirm=f"Remove preference '{key}'?", home=False),
         "ghost",
     )]
 
@@ -484,12 +484,13 @@ def _memory_review_table(home: Path) -> dict[str, Any]:
         state_label = "retired" if retired else "active"
         state_color = "sub" if retired else "text"
         if retired:
-            action = S.cli("memory-lifecycle", "--reactivate", str(cid))
+            action = S.cli("memory-lifecycle", "--reactivate", str(cid), home=False)
         else:
             action = S.cli(
                 "memory-lifecycle", "--retire", str(cid), "--reason", _RETIRE_REASON,
                 confirm=("Retire this memory? It stops being injected; "
                          "reactivate any time."),
+                home=False,
             )
         rate_cell = (S.cell(f"{info['rate']:.0f}%", _pass_rate_colour(info["rate"]))
                      if info["rate"] is not None else S.muted("—"))

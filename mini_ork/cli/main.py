@@ -1471,11 +1471,30 @@ def _load_secret_store_env() -> None:
         os.environ.setdefault(name, value)
 
 
+def _load_feature_defaults() -> None:
+    """Apply the per-project feature/setting defaults from features.yaml.
+
+    Loaded BEFORE the secret store. Both writers use ``setdefault``, so the
+    first caller wins; an IDE toggle (features.yaml) must therefore beat a stale
+    hand-edit in secrets.local.sh, while a real environment variable still beats
+    both. Precedence: env > features.yaml > secrets.local.sh > engine default.
+    A malformed file degrades to a warning — ``mini-ork help`` must not fail."""
+    from mini_ork.features.store import effective_env
+    try:
+        overrides = effective_env()
+    except Exception as exc:  # noqa: BLE001 — a bad file must never break the CLI
+        sys.stderr.write(f"warning: feature defaults not loaded: {exc}\n")
+        return
+    for name, value in overrides.items():
+        os.environ.setdefault(name, value)
+
+
 def main(argv=None, *, root=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     root = root or os.environ.get("MINI_ORK_ROOT") or os.path.dirname(
         os.path.dirname(os.path.realpath(__file__)))
     os.environ["MINI_ORK_ROOT"] = root
+    _load_feature_defaults()
     _load_secret_store_env()
     # NOTE: main() deliberately does NOT publish a derived MINI_ORK_DB. A
     # process-wide default here is indistinguishable from an operator-set one,

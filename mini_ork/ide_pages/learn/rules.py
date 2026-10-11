@@ -108,7 +108,7 @@ def _remove_action(key: str, scope: str, target: str, source: str) -> dict[str, 
     if source.startswith("file:"):
         return S.open_path(source[len("file:"):])
     return S.cli("prefs", "rm", key, "--scope", scope, "--target", target,
-                 confirm=f"Remove rule '{key}'?")
+                 confirm=f"Remove rule '{key}'?", home=False)
 
 
 def _your_rules(home: Path, now: int) -> dict[str, Any]:
@@ -253,7 +253,8 @@ def _rule_detail(home: Path, rule: str) -> list[dict[str, Any]]:
         actions.append(S.btn(
             "Make it mine",
             S.cli("prefs", "set", f"learned-{pid[:12]}", lesson, "--scope", "global",
-                  confirm=f"Copy this lesson into your own rules as 'learned-{pid[:12]}'?"),
+                  confirm=f"Copy this lesson into your own rules as 'learned-{pid[:12]}'?",
+                  home=False),
             "ghost"))
     actions.append(S.btn("Close", S.set_args(rule=""), "ghost"))
     return [S.markdown(f"Rule · {pid}", body, full=True, actions=actions)]

@@ -6,9 +6,9 @@ here. A feature is *premium* when its own cost multiplier exceeds the
 catalogue's ``premium_threshold``; the threshold is shown in the header so the
 tier split stays auditable.
 
-This page is a listing only. It draws no control that would turn a feature on —
-that lives in ``mini-ork features`` and the run's wizard — so nothing here can
-change a run's cost.
+This page is a listing only, and stays that way: it draws no control that could
+change a run's cost. The controls live on **Setup & health → Features**, which
+reads this same registry in-process so the two can never disagree.
 """
 from __future__ import annotations
 
@@ -60,7 +60,8 @@ def _catalogue() -> list[dict[str, Any]]:
         ("Features", f"{len(features)} ({premium} premium)", "text",
          "as shipped, before any recipe narrows the set"),
     ], full=True, note="Read-only: turning a feature on or off is done by "
-                       "mini-ork features, not from here.")
+                       "mini-ork features, not from here.",
+        actions=[S.btn("Turn features on or off", S.page_link("setup", "features"), "primary")])
     table = S.table("Features", [S.col(fr=1.4), S.col(fr=1.8), S.col(90), S.col(80)],
                     ["feature", "id", "tier", "cost"], rows, full=True,
                     note="Tier reflects the feature's own default; a recipe may apply only some of these.")

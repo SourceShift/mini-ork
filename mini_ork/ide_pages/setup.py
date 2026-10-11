@@ -18,8 +18,8 @@ from typing import Any
 
 from mini_ork.ide_pages import spec as S
 
-TABS = [("readiness", "Readiness"), ("zed", "Zed wiring"), ("projects", "Projects"),
-        ("health", "Health & exports")]
+TABS = [("readiness", "Readiness"), ("features", "Features"), ("settings", "Settings"),
+        ("zed", "Zed wiring"), ("projects", "Projects"), ("health", "Health & exports")]
 
 _WORKER_ROLES = ("implementer", "reviewer", "planner")
 _SERVE_URL = "http://127.0.0.1:7090"
@@ -309,6 +309,229 @@ def _health(home: Path) -> list[dict[str, Any]]:
     return out
 
 
+# ── configuration (features & settings) ────────────────────────────────────
+
+def _secret_names() -> dict[str, str]:
+    """Names from the credential store.
+
+    Read for *presence* and source attribution only — a value from here is never
+    rendered. A store with bad permissions raises by design, so this degrades to
+    empty rather than blanking the page.
+    """
+    try:
+        from mini_ork.dispatch.secrets import read_secret_exports
+        return read_secret_exports()
+    except Exception:  # noqa: BLE001 — an unreadable store is not a page error
+        return {}
+
+
+def _external_env(home: Path, data: dict[str, Any], secrets: dict[str, str]) -> dict[str, str]:
+    """``os.environ`` minus what the two stores contributed.
+
+    This process already loaded features.yaml and the secret store into the
+    environment (``main._load_feature_defaults``). To say where a value *came
+    from* we must subtract the stores' own contribution, or every knob would be
+    misattributed to a real environment variable.
+    """
+    from mini_ork.features import store
+    contributed = set(store.effective_env(store.store_path(home)).keys()) | set(secrets)
+    return {name: value for name, value in os.environ.items() if name not in contributed}
+
+
+def _raw_state(name: str, *, data: dict[str, Any], env_only: dict[str, str],
+               secrets: dict[str, str]) -> tuple[str, str]:
+    """``(value, source)`` for a raw env knob: env > features.yaml env: > secrets > default."""
+    if env_only.get(name):
+        return env_only[name], "env"
+    if data.get("env", {}).get(name) is not None:
+        return data["env"][name], "project"
+    if secrets.get(name):
+        return secrets[name], "secrets"
+    return "", "default"
+
+
+#: Where an effective value came from, in the words the page's reader uses —
+#: both tabs name a source identically so a value's provenance reads the same
+#: wherever it is shown.
+_SOURCES = {"env": "environment", "project": "features.yaml", "secrets": "secrets",
+            "default": "engine default"}
+
+#: The blast radius of accepting premium, worded once so both the toggle's
+#: confirm dialog and the composer's note say the same thing.
+_OPT_IN = ("Opts this project into premium features for every future run — including wizard "
+           "launches that name no premium feature.")
+
+
+def _premium_confirm(feat: Any, value: str) -> str:
+    return f"{feat.label} multiplies run cost by ×{feat.multiplier(value):g}. {_OPT_IN}"
+
+
+def _feature_controls(feats: list[Any], states: dict[str, dict[str, Any]], *, title: str,
+                      premium: bool) -> list[dict[str, Any]]:
+    """Toggle chips for bool features, a composer for the ones carrying a value."""
+    from mini_ork.features.registry import KIND_BOOL
+
+    chips, composers = [], []
+    for feat in feats:
+        cur = states[feat.id]
+        if feat.kind == KIND_BOOL:
+            on = not cur["off"]
+            confirm = _premium_confirm(feat, "1") if premium and not on else None
+            chips.append({"t": feat.label, "on": on,
+                          "do": S.cli("features", "set", feat.id, "off" if on else "on",
+                                      home=False, confirm=confirm)})
+            continue
+        # A value carrying feature: the box's text is the value, so a premium one
+        # needs the opt-in in its argv — the action path can pass no flag the
+        # user cannot see, and a bare `set` would refuse it (exit 2) instead.
+        args = ["features", "set", feat.id] + (["--accept-premium"] if premium else [])
+        note = f"{feat.description} Type `off` to disable it."
+        if premium:
+            note = f"{note} {_OPT_IN}"
+        # When off, the box suggests the wizard's value: the point of an empty
+        # box is to show what one could type, not to restate that it is off.
+        composers.append(S.composer(
+            str(cur["value"] if not cur["off"] else feat.default),
+            args, home=False, title=feat.label, note=note))
+    out: list[dict[str, Any]] = []
+    if chips:
+        out.append(S.chips(title, chips, full=True))
+    out.extend(composers)
+    return out
+
+
+def _features_tab(home: Path) -> list[dict[str, Any]]:
+    from mini_ork.features import store
+    from mini_ork.features.registry import CONTROLLABLE_FEATURES
+
+    path = store.store_path(home)
+    data = store.load(path)
+    secrets = _secret_names()
+    env_only = _external_env(home, data, secrets)
+    feats = sorted(CONTROLLABLE_FEATURES.values(), key=lambda f: f.id)
+    states = {f.id: store.current(f, environ=env_only, data=data, secrets=secrets) for f in feats}
+
+    rows = []
+    for feat in feats:
+        cur = states[feat.id]
+        premium = feat.tier == "premium"
+        rows.append([
+            S.cell(feat.label, "text", b=True),
+            S.mono(feat.id),
+            S.cell("premium" if premium else "baseline", "yellow" if premium else "green"),
+            S.cell(f"×{cur['multiplier']:g}", "sub", mono=True),
+            S.cell("off" if cur["off"] else cur["value"], "muted" if cur["off"] else "text"),
+            S.cell(_SOURCES.get(cur["source"], cur["source"]), "sub"),
+            S.cell(feat.default or "—", "dim", mono=True),
+        ])
+    table = S.table("Features",
+                    [S.col(fr=1.3), S.col(fr=1.1), S.col(70), S.col(60), S.col(fr=0.8), S.col(85),
+                     S.col(fr=0.7)],
+                    ["feature", "id", "tier", "cost", "now", "from", "wizard"], rows, full=True,
+                    note="`now` is the value in force right now and `from` says where it came "
+                         "from. `cost` is this feature's own multiplier at that value — nothing "
+                         "else. `wizard` is what the wizard *suggests*, which is not always what "
+                         "the engine does when nothing is set: leave the code-arm scorer unset "
+                         "and it is off, whatever the suggestion says.")
+
+    baseline = [f for f in feats if f.tier != "premium"]
+    premium_feats = [f for f in feats if f.tier == "premium"]
+    sections: list[dict[str, Any]] = [table, S.kv("How this works", [
+        ("File", str(path).replace(os.path.expanduser("~"), "~", 1), "text",
+         "written by the controls below; loaded at startup below the real environment"),
+        ("Precedence", "environment > features.yaml > secrets.local.sh > engine default", "text"),
+        ("Scope", "these persist as this project's default for every future run", "text"),
+    ], full=True)]
+    sections += _feature_controls(baseline, states, title="Baseline — on / off", premium=False)
+    if premium_feats:
+        sections.append(S.callout(
+            "Premium features",
+            "Turning one of these on multiplies run cost beyond ×1.5 and records a project-wide "
+            "opt-in: a **real** environment has to prove it before the feature runs and every "
+            "future run inherits it, including wizard launches that name no premium feature.",
+            tone="orange"))
+        sections += _feature_controls(premium_feats, states, title="Premium — on / off", premium=True)
+    return sections
+
+
+def _settings_tab(home: Path) -> list[dict[str, Any]]:
+    from mini_ork import settings_catalogue as settings
+    from mini_ork.features import store
+
+    data = store.load(store.store_path(home))
+    secrets = _secret_names()
+    env_only = _external_env(home, data, secrets)
+    sections: list[dict[str, Any]] = []
+
+    for group in settings.GROUPS:
+        rows = []
+        for setting in settings.settings_for(group):
+            value, source = _raw_state(setting.name, data=data, env_only=env_only, secrets=secrets)
+            shown = setting.default if source == "default" else value
+            acts = ([S.btn("Clear", S.cli("features", "unset-env", setting.name, home=False), "ghost")]
+                    if source == "project" else [])
+            effect = setting.effect + (f" · {setting.note}" if setting.note else "")
+            rows.append({"cells": [
+                S.cell(setting.label, "text", b=True),
+                S.mono(setting.name),
+                S.cell(shown, "muted" if source == "default" else "text"),
+                S.cell(_SOURCES.get(source, source), "sub"),
+                S.cell(setting.default, "sub", mono=True),
+                S.cell(effect, "sub"),
+            ], "acts": acts})
+        sections.append(S.table(group,
+                                [S.col(fr=1.3), S.col(fr=1.7), S.col(80), S.col(60), S.col(60), S.col(fr=2)],
+                                ["setting", "variable", "value", "from", "default", "effect"], rows,
+                                full=True,
+                                note="'default' is what the engine uses when the variable is unset, "
+                                     "shown for reference — this page never writes it."))
+        sections.append(S.composer(f"{group}: <NAME> <value>", ["features", "set-env"], home=False,
+                                   title=f"Set a {group} value",
+                                   note="Type a variable and its value, e.g. "
+                                        "MO_DAILY_BUDGET_USD 20. Clear a project value with the "
+                                        "row's button."))
+
+    enabled = store.enabled_premium(data)
+    accept, accept_src = _raw_state(store.ACCEPT_PREMIUM_ENV, data=data, env_only=env_only,
+                                    secrets=secrets)
+    drop = [S.btn("Drop the opt-in", S.cli("features", "unset-env", store.ACCEPT_PREMIUM_ENV,
+                                           home=False), "warn")]
+    if enabled:
+        sections.append(S.callout(
+            "Premium opt-in is on",
+            f"MO_ACCEPT_PREMIUM is {accept_src}, so premium features are accepted project-wide. "
+            f"Enabled: {', '.join(enabled)}. Every future run inherits this, including wizard "
+            "launches that name no premium feature. Turning a feature off does **not** drop the "
+            "opt-in — use the button below.", tone="orange", actions=drop))
+    else:
+        sections.append(S.lst("Premium opt-in", [
+            S.warn("Accepted project-wide",
+                   f"MO_ACCEPT_PREMIUM is {accept_src}, but no premium feature is on. "
+                   "It still pre-accepts premium for every future wizard launch.",
+                   acts=drop) if accept else
+            S.dot("Not accepted",
+                  "no premium feature is on, and MO_ACCEPT_PREMIUM is unset")], full=True,
+            note="Set from a premium feature's toggle, which is where the cost is disclosed."))
+
+    files = [("Providers", home / "config" / "providers.yaml"),
+             ("Pricing", home / "config" / "pricing.yaml"),
+             ("Cost advisor", home / "config" / "cost-advisor.yaml"),
+             ("Scope patterns", home / "config" / "scope-patterns.yaml"),
+             ("Agents", home / "config" / "agents.yaml")]
+    items = []
+    for label, path in files:
+        shown = str(path).replace(os.path.expanduser("~"), "~", 1)
+        acts = [S.btn("Open", S.open_path(str(path)), "ghost")] if path.is_file() else []
+        items.append(S.dot(label, f"{shown} · {'present' if path.is_file() else 'not created yet'}", acts))
+    items.append(S.dot("Credentials", "set with `mini-ork providers configure <lane>` in a terminal — "
+                                      "never from this page",
+                       [S.btn("Lanes & providers", S.page_link("lanes"), "ghost")]))
+    sections.append(S.lst("Edited by hand", items, full=True,
+                          note="These files are edited in your editor. mini-ork self-improve rewrites "
+                               "agents.yaml; a credential is never entered through this page."))
+    return sections
+
+
 # ── page ───────────────────────────────────────────────────────────────────
 
 def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
@@ -317,6 +540,10 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     sections: list[dict[str, Any]] = []
     if tab == "readiness":
         sections += S.guarded(errors, "mini-ork acp --setup", lambda: _readiness(home))
+    elif tab == "features":
+        sections += S.guarded(errors, "Features", lambda: _features_tab(home))
+    elif tab == "settings":
+        sections += S.guarded(errors, "Settings", lambda: _settings_tab(home))
     elif tab == "zed":
         sections += S.guarded(errors, "Zed wiring", lambda: _zed(home))
     elif tab == "projects":
