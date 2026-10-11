@@ -37,6 +37,21 @@
 #
 # `trigger_label` on its own is the usual setup: the label is the human act
 # that says "an agent should do this".
+#
+# INTAKE WEBHOOKS. The other way a ticket starts work, and the one that needs a
+# server. `mini-ork serve` answers POST /api/v1/intake/{source} when
+# MO_INTAKE_WEBHOOKS=1 is set in the serving process, verifying the provider's
+# HMAC over the raw body against a shared secret. Add the NAME of the vault key
+# holding that secret — never the secret itself:
+#
+#   webhook_secret_env: GITHUB_WEBHOOK_SECRET
+#
+# Two things this tier insists on, and they are why polling is the one to try
+# first. There is no TLS anywhere in mini-ork, so the body crosses in cleartext
+# unless a reverse proxy terminates it; and the route refuses with 503 while the
+# vault reports a protection gap, i.e. while the secret resolves from `env` or a
+# plain file. A shared secret that guards an inbound port wants sops, `command`
+# or OpenBao behind it. The trigger rules above apply identically either way.
 
 sources:
   local:
@@ -55,6 +70,7 @@ sources:
   #   # api_url: https://github.acme.dev/api/v3   # GitHub Enterprise only
   #   trigger_label: agent        # uncomment to let intake start these tickets
   #   trigger_recipe: code-fix    # the recipe a launched run uses
+  #   # webhook_secret_env: GITHUB_WEBHOOK_SECRET   # tier B: see INTAKE WEBHOOKS above
 
   # linear:
   #   enabled: false

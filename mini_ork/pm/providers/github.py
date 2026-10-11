@@ -58,6 +58,7 @@ from mini_ork.pm.model import (
     LinkKind,
     Priority,
     ProviderIdentity,
+    make_uid,
     split_uid,
 )
 from mini_ork.pm.provider import (
@@ -294,6 +295,40 @@ class GithubProvider:
                 "is_pull_request": "pull_request" in payload,
             },
         )
+
+    # ── webhooks ───────────────────────────────────────────────────────────
+
+    def uid_from_webhook(self, payload: Mapping[str, Any]) -> str | None:
+        """Which issue a webhook payload names, or ``None`` when it names none.
+
+        Identity only, and that restraint is the point: a webhook is a
+        *notification* that something changed, not the data itself. The ticket
+        the agent reads is fetched with :meth:`get`, so it is what GitHub serves
+        now rather than whatever a POST carried. The one thing that cannot be
+        fetched without already knowing it is *which* issue, and that is all
+        this reads.
+
+        ``None`` covers every payload that names no workable issue: a push, a
+        pull request (which shares the issues API but is not a ticket), a
+        deleted or transferred issue, and — importantly — an issue in another
+        repository. One source serves one repository, so a payload signed with
+        this source's secret must not be able to name someone else's issue.
+        """
+        if str(payload.get("action") or "") in ("deleted", "transferred"):
+            return None
+        issue = payload.get("issue")
+        if not isinstance(issue, Mapping) or "pull_request" in issue:
+            return None
+        repository = payload.get("repository")
+        full_name = (
+            str(repository.get("full_name") or "") if isinstance(repository, Mapping) else ""
+        )
+        if full_name and full_name != f"{self._owner}/{self._repo}":
+            return None
+        number = issue.get("number")
+        if not isinstance(number, int) or isinstance(number, bool):
+            return None
+        return make_uid(self.id, f"{self._owner}/{self._repo}#{number}")
 
     # ── reads ──────────────────────────────────────────────────────────────
 

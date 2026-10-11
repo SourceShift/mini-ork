@@ -20,6 +20,7 @@ from .routes import (
     fleet,
     ide as ide_routes,
     idea_tree as idea_tree_routes,
+    intake as intake_routes,
     learning,
     node_live as node_live_routes,
     projects,
@@ -131,6 +132,11 @@ def create_app(home: Path | None = None, dev_cors: bool = True) -> FastAPI:
     # answered with index.html, which an SDK client would parse as a silent
     # empty result.
     app.include_router(ide_routes.router)
+    # Intake webhooks (opt-in via MO_INTAKE_WEBHOOKS=1, enforced in the handler).
+    # A source pushing a signed ticket is the one foreign-origin POST this app
+    # is meant to answer, so the route carries its own HMAC rather than the
+    # local-caller guard. "/api/" is already in _NON_SPA_PREFIXES.
+    app.include_router(intake_routes.router)
 
     @app.get("/api")
     def api_index() -> JSONResponse:
