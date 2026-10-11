@@ -19,8 +19,13 @@ Census of **807 failed runs**:
 | base state | count | recoverable in place? |
 |---|---:|---|
 | no base file | 580 | yes (base written fresh at recover) |
-| base is ancestor of HEAD | 53 | reuse-only (guard fires if implementer re-runs) |
-| base **orphaned** | **174** | **no** |
+| base is ancestor of HEAD | 59 | reuse-only (guard fires if implementer re-runs) |
+| base object missing (gc'd) | 1 | was no → now yes (`bf5a02e9`) |
+| base **orphaned** (diverged) | **91** | was no → **now yes** (`bf5a02e9`) |
+| base not in the repo (other target / gc'd) | 76 | unknown target |
+
+(An earlier count said 174 orphaned; it lumped in the 76 whose base object is
+not even in the mini-ork repo. Corrected 2026-10-11.)
 
 ## Done this session
 
@@ -33,31 +38,34 @@ Census of **807 failed runs**:
 
 ## Remaining tasks
 
-### T1 — Decide fate of 174 orphaned-base failed runs  ·  **BLOCKED on you**
-- **What:** 174 failed runs can't be revived in place. Each is either still-wanted
-  (→ fresh re-launch) or superseded (→ close).
-- **How to list them:** run the classification (in the triage doc) or:
-  `sqlite3 .mini-ork/state.db "SELECT id FROM task_runs WHERE status='failed'"`,
-  then per run check `git merge-base --is-ancestor <base> HEAD`.
-- **If wanted — fresh re-launch** (NOT `recover`; a fresh run gets a correct base):
+### T1 — Orphaned-base failed runs  ·  **RESOLVED (2026-10-11)**
+- **Done:** corrected census = **91** confirmed orphaned (base in the mini-ork
+  repo but diverged from HEAD), + **76** whose base object isn't in the repo
+  (other target / gc'd). Of the 91: **43 landed** on `origin/main` → superseded,
+  **20** not-landed (first rounds of landed series), **28** no-artifact
+  (reviews / migrations / child runs). Full table:
+  `docs/todos/2026-10-11-orphaned-run-census.md`.
+- **Gates closed:** 13, 26, 28 (superseded); 27 was not pending.
+- **Reviving is now possible** (fix `bf5a02e9` unblocks recover) but **do NOT**
+  recover one against the PRIMARY while a peer run is live — a live
+  framework-edit stashes the launching tree, and these runs target
+  `/Volumes/docker-ssd/ps/mini-ork`. Re-launch **fresh in a worktree**:
   ```bash
+  make worktree SLUG=<slug>
+  cd /Volumes/docker-ssd/ps/mini-ork-worktrees/<slug>
+  MINI_ORK_HOME=/Volumes/docker-ssd/ps/mini-ork/.mini-ork \
   MO_TARGET_CWD=$PWD MO_ALLOW_FRAMEWORK_CWD=1 \
-  MINI_ORK_AGENTS=$PWD/.mini-ork/config/agents.local.yaml \
-    bin/mini-ork run kickoffs/auto/<slug>.md
+  MINI_ORK_AGENTS=/Volumes/docker-ssd/ps/mini-ork/.mini-ork/config/agents.local.yaml \
+    /Volumes/docker-ssd/ps/mini-ork/bin/mini-ork run framework-edit <abs kickoff>
   ```
-- **If superseded — close its gate:**
-  `bin/mini-ork board gate reject <inbox_id> --note "superseded: <reason>"`
 
-### T2 — Refine the base-drift fix (optional)  ·  **open**
-- **What:** landed fix refuses to refresh when the run's ledger records a prior
-  `impl_moved_base`, so a run that *already* tripped the guard stays blocked even
-  when its base is orphaned by an external rewrite (proved live on
-  `rsi-i1-control-arm-…115150`).
-- **Sharper rule:** also refresh when the base is **not an ancestor** of HEAD
-  (can't carry the implementer's prior change into HEAD). Caveat: a forward
-  ancestor base is ambiguous with a laundered commit — keep failing closed there.
-- **Where:** `mini_ork/recovery/planner.py`, `mini_ork/cli/execute.py` (commit
-  `7e113de9`). Route via mini-ork `framework-edit` (multi-file rule).
+### T2 — Refine the base-drift fix  ·  **DONE (2026-10-11)**
+- Landed **`bf5a02e9`** via framework-edit `run-1791723941-11171` (verdict pass,
+  9 nodes / 0 failed, rubric 8/8). A baseline that is **not** an ancestor of
+  HEAD now refreshes unconditionally, skipping the ledger refusal; only a
+  forward-ancestor baseline reaches it. +2 tests; live smoke green (fixed engine
+  refreshes + guard passes on `run-1791541963-98230`; old engine refuses +
+  FAILs). See the triage doc.
 
 ### T3 — Compact the memory index  ·  **open, low risk**
 - `~/.claude/projects/-Volumes-docker-ssd-ps-mini-ork/memory/MEMORY.md` is

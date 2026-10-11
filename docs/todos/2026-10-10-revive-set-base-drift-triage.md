@@ -124,3 +124,45 @@ ambiguous with a laundered commit, so the current code fails closed. Net effect:
 the fix safely unblocks resumes with **no** prior recorded move; the 174
 orphaned-base runs that already recorded `impl_moved_base` are still best handled
 by a fresh re-launch (see *Escape hatch* above).
+
+## Second fix landed — orphaned baselines refresh unconditionally (2026-10-11)
+
+The first fix refused to refresh when the run's ledger recorded a prior
+`impl_moved_base`, which left the whole orphaned class blocked (proved live on
+`rsi-i1-control-arm`). Committed **`bf5a02e9`** via mini-ork `framework-edit`
+run `run-1791723941-11171` (verdict `pass`, 9 nodes / 0 failed, rubric 8/8):
+
+- `mini_ork/cli/execute.py` — test ancestry FIRST: a baseline that is **not** an
+  ancestor of HEAD (merge-base exit 1, or 128 when the object is gone) is
+  dropped unconditionally, skipping the ledger refusal; only a forward-ancestor
+  baseline reaches it. Factored `_drop_pre_impl_baseline`.
+- `tests/unit/test_resume_refresh_pre_impl_baseline.py` — +2 tests (orphaned +
+  recorded ledger → refresh; forward-ancestor + recorded → still refused).
+  10 passed in the green gate.
+
+**Live smoke** (`run-1791541963-98230`, real run dir + real ledger + real
+target `/Volumes/docker-ssd/ps/mini-ork`):
+
+| engine | `_refresh_stale_pre_impl_baseline` | guard after refresh |
+|---|---|---|
+| fixed (`bf5a02e9`) | **True** (`[recover] refreshed stale pre-implementer-ref …`) | **pass** (baseline dropped) |
+| old | `False` (`refusing … ledger already records impl_moved_base`) | FAIL |
+
+## Orphaned-run census + disposition (2026-10-11)
+
+Full split of the 807 failed runs: **580** no-base / **59** ancestor / **91**
+orphaned / **1** missing / **76** other-repo. Of the 91 orphaned, **43** carry
+their change on `origin/main` (landed → superseded), **20** are not-landed
+(first rounds of a series whose later round landed), **28** have no
+`framework-edit.diff` (reviews / migrations / child runs). Detail:
+`2026-10-11-orphaned-run-census.md`.
+
+The 4 still-open orphan gates were closed: **13**, **26** (rsi-i2-verifier-audit
+repair — the i2 series landed via `…135337`), **28** (`rsi-i1` — surfaces in the
+tree), **27** (`needs-change-reasons-subullets` — not-landed, 2-day-old stale;
+re-launch fresh if wanted).
+
+**Do NOT revive an orphaned `framework-edit` run against the PRIMARY while a
+peer run is live**: a live framework-edit stashes the launching tree, and these
+runs target `/Volumes/docker-ssd/ps/mini-ork`. Route any fresh re-launch through
+a worktree.
