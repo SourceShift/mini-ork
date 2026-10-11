@@ -107,6 +107,43 @@ def _recipe_dir_is_recipe(path: Path) -> bool:
     return True
 
 
+def _safe_recipe_id(recipe_id: str) -> bool:
+    """Whether ``recipe_id`` is a single directory name.
+
+    ``find_recipe`` joins it onto a recipes root, so a separator or a ``..``
+    would read outside the catalog. The two-YAML predicate would still contain
+    it, but a lookup should not be the thing standing between a run's ``recipe``
+    field and an arbitrary directory.
+    """
+    return bool(recipe_id) and Path(recipe_id).name == recipe_id and recipe_id != ".."
+
+
+def _recipe_dirs(home: Path | None) -> tuple[Path | None, Path] | None:
+    """The two ``recipes/`` roots a session sees: ``(project, engine)``.
+
+    ``project`` is None when the two collapse to the same real directory, so
+    each recipe is listed once as ``engine``. None overall when the engine root
+    cannot be resolved — `list_recipes` then offers nothing, and `find_recipe`
+    must not find a recipe the picker would not have offered.
+    """
+    try:
+        from mini_ork.web.control import _mini_ork_root
+
+        engine_dir = _mini_ork_root() / "recipes"
+    except Exception:
+        return None
+    project_dir: Path | None = home / "recipes" if home is not None else None
+    if project_dir is not None:
+        # ``Path.resolve()`` so symlinks collapse; ``Path.samefile()`` would
+        # raise on a broken symlink.
+        try:
+            if project_dir.resolve() == engine_dir.resolve():
+                project_dir = None
+        except OSError:
+            pass
+    return project_dir, engine_dir
+
+
 def _build_entry(
     recipe_dir: Path, *, source: str, shadows_engine: bool
 ) -> RecipeInfo:
@@ -150,33 +187,10 @@ def list_recipes(home: Path | None) -> list[RecipeInfo]:
     ``recipes/`` directory, or a YAML error all degrade to the entries
     that can be read.
     """
-    try:
-        from mini_ork.web.control import _mini_ork_root
-
-        engine_root = _mini_ork_root()
-    except Exception:
+    dirs = _recipe_dirs(home)
+    if dirs is None:
         return []
-    engine_recipes_dir = engine_root / "recipes"
-
-    project_recipes_dir: Path | None = None
-    if home is not None:
-        project_recipes_dir = home / "recipes"
-
-    # Same-directory dedup: a dev checkout where home is the engine
-    # (or where the project symlinks to the engine's recipes dir) must
-    # list each recipe once, as ``engine``. Use ``Path.resolve()`` so
-    # symlinks collapse; ``Path.samefile()`` would raise on a broken
-    # symlink.
-    same_dir = False
-    if project_recipes_dir is not None:
-        try:
-            same_dir = (
-                project_recipes_dir.resolve() == engine_recipes_dir.resolve()
-            )
-        except OSError:
-            same_dir = False
-    if same_dir:
-        project_recipes_dir = None
+    project_recipes_dir, engine_recipes_dir = dirs
 
     # Engine ids (needed to mark project recipes as shadowing).
     engine_ids: set[str] = set()
@@ -227,10 +241,28 @@ def list_recipes(home: Path | None) -> list[RecipeInfo]:
 def find_recipe(recipe_id: str, home: Path | None) -> RecipeInfo | None:
     """Return the entry with id ``recipe_id`` or ``None`` if absent.
 
-    Uses the same resolution as :func:`list_recipes` — a project entry
-    with the same id shadows the engine's.
+    Resolves exactly as :func:`list_recipes` does — a project entry with the
+    same id shadows the engine's — but reads only that recipe's two YAML files
+    rather than enumerating the catalog and scanning it. Enumerating is ~40
+    directories × 2 YAML parses; callers that ask one-recipe-per-row (the inbox
+    page the IDE opens most) were paying that per row, which is seconds of
+    parsing to answer a question about a single directory.
     """
-    for entry in list_recipes(home):
-        if entry.id == recipe_id:
-            return entry
+    if not _safe_recipe_id(recipe_id):
+        return None
+    dirs = _recipe_dirs(home)
+    if dirs is None:
+        return None
+    project_recipes_dir, engine_recipes_dir = dirs
+    if project_recipes_dir is not None:
+        project = project_recipes_dir / recipe_id
+        if _recipe_dir_is_recipe(project):
+            return _build_entry(
+                project,
+                source="project",
+                shadows_engine=_recipe_dir_is_recipe(engine_recipes_dir / recipe_id),
+            )
+    engine = engine_recipes_dir / recipe_id
+    if _recipe_dir_is_recipe(engine):
+        return _build_entry(engine, source="engine", shadows_engine=False)
     return None

@@ -1,0 +1,33 @@
+name: audit_judge_panel_3l
+version: "0.1.0"
+description: >
+  Three-lane read-only judge panel: two tool-ful lanes (opus_lens +
+  minimax_lens) independently verify audit findings against the live state
+  DB and source, plus one advisory lane (laguna_lens on the free OpenRouter
+  poolside/laguna-s-2.1:free — tool-less, judges from the briefing alone),
+  then a synthesizer reconciles the three reports into one verdict matrix.
+
+matches:
+  keywords:
+    - audit judge panel three lane
+    - three-lane audit judge panel
+    - judge audit findings
+    - audit verdict panel
+  regex: []
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+
+risk_class: low
+
+cost_model:
+  min_usd: 2
+  max_usd: 20
+  per_lens_usd: 5
+
+runtime_model:
+  min_minutes: 5
+  max_minutes: 45

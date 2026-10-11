@@ -269,6 +269,79 @@ def test_find_recipe_hit_and_miss(monkeypatch, tmp_path):
     assert miss is None
 
 
+def test_find_recipe_agrees_with_list_recipes(monkeypatch, tmp_path):
+    """Every entry ``list_recipes`` offers, ``find_recipe`` returns identically.
+
+    ``find_recipe`` does not enumerate: it reads the one recipe directory the id
+    names, because callers ask it per row and enumerating is ~40 directories ×
+    2 YAML parses each. That shortcut is only sound if it resolves what the
+    enumeration would have — including the project-shadows-engine rule.
+    """
+    engine = tmp_path / "engine"
+    engine.mkdir()
+    engine_recipes = engine / "recipes"
+    _write_recipe(engine_recipes, "shared", description="Engine shared", nodes=3)
+    _write_recipe(engine_recipes, "engine-only", description="Engine only", nodes=1)
+    _patch_engine(monkeypatch, engine)
+
+    home = tmp_path / "home" / ".mini-ork"
+    project_recipes = home / "recipes"
+    _write_recipe(project_recipes, "shared", description="Project shared", nodes=5)
+    _write_recipe(project_recipes, "project-only", description="Project only", nodes=2)
+
+    listed = {e.id: e for e in recipes_catalog.list_recipes(home)}
+    assert set(listed) == {"shared", "engine-only", "project-only"}
+    assert listed["shared"].source == "project"
+    assert listed["shared"].shadows_engine is True
+
+    for recipe_id, expected in listed.items():
+        found = recipes_catalog.find_recipe(recipe_id, home)
+        assert found == expected, f"{recipe_id} diverged from list_recipes"
+    assert recipes_catalog.find_recipe("absent", home) is None
+
+
+def test_find_recipe_agrees_when_home_is_the_engine(monkeypatch, tmp_path):
+    """The same-directory collapse resolves as ``engine`` for both paths.
+
+    A dev checkout where ``home/recipes`` IS ``engine/recipes`` lists each
+    recipe once as engine; ``find_recipe`` must not call it ``project``.
+    """
+    engine = tmp_path / "engine"
+    engine.mkdir()
+    engine_recipes = engine / "recipes"
+    _write_recipe(engine_recipes, "alpha", description="Alpha")
+    _patch_engine(monkeypatch, engine)
+
+    listed = {e.id: e for e in recipes_catalog.list_recipes(engine)}
+    assert listed["alpha"].source == "engine"
+    assert recipes_catalog.find_recipe("alpha", engine) == listed["alpha"]
+
+
+def test_find_recipe_refuses_an_id_that_is_a_path(monkeypatch, tmp_path):
+    """A recipe id is one directory name.
+
+    ``find_recipe`` joins the id onto a recipes root, so a separator or a
+    ``..`` would read outside the catalog. The caller passes a run's ``recipe``
+    field through here, which is data, not a trusted literal. The sibling
+    directory below has both YAML files, so without the guard the ``..`` id
+    would resolve to it.
+    """
+    engine = tmp_path / "engine"
+    engine.mkdir()
+    engine_recipes = engine / "recipes"
+    _write_recipe(engine_recipes, "alpha", description="Alpha")
+    _write_recipe(engine, "sneaky", description="Not under recipes/")
+    _patch_engine(monkeypatch, engine)
+    home = tmp_path / "home" / ".mini-ork"
+    home.mkdir(parents=True)
+
+    assert (engine / "sneaky" / "workflow.yaml").is_file()
+    for recipe_id in ("../sneaky", "..", ".", "alpha/../alpha", "a/b", ""):
+        assert recipes_catalog.find_recipe(recipe_id, home) is None, recipe_id
+    # `list_recipes` never offered it either — the two agree on absence.
+    assert "sneaky" not in {e.id for e in recipes_catalog.list_recipes(home)}
+
+
 def test_home_none_lists_engine_only(monkeypatch, tmp_path):
     """``home=None`` skips the project scan; engine entries are listed."""
     engine = tmp_path / "engine"
