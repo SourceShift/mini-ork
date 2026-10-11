@@ -220,14 +220,23 @@ def _projects(home: Path) -> dict[str, Any]:
         is_current = h == current
         status = (S.cell("current", "green") if is_current
                   else S.muted("ready") if (h / "state.db").is_file() else S.cell("missing", "red"))
+        # The project this window is showing keeps its row but not its Remove:
+        # switching back would put it in the list again.
+        acts = [] if is_current else [
+            S.btn("Remove", S.project_forget(
+                str(h.parent),
+                confirm=f"Remove {h.parent.name} from the project list? The folder and its runs stay."),
+                "ghost")]
         rows.append({"cells": [S.cell(h.parent.name, "text", b=is_current),
                                S.muted(str(h.parent).replace(os.path.expanduser("~"), "~", 1)), status],
-                     "sel": is_current, "do": None if is_current else S.project(str(h.parent))})
+                     "sel": is_current, "do": None if is_current else S.project(str(h.parent)),
+                     "acts": acts})
     actions = [S.btn("Add project", S.project_pick(), "primary"),
                S.btn("Open registry", S.open_path(str(file)) if file.is_file() else None)]
     return S.table("Projects", [S.col(fr=1), S.col(fr=1.4), S.col(80)], ["project", "path", ""], rows,
                    full=True, actions=actions,
-                   note=f"Click a project to switch this window to it. Known homes come from "
+                   note=f"Click a project to switch this window to it; Remove forgets the entry and "
+                        f"leaves the folder alone. Known homes come from "
                         f"{str(file).replace(os.path.expanduser('~'), '~', 1)} (shared with mini-ork serve).")
 
 

@@ -102,6 +102,13 @@ def test_projects_mark_the_current_one(home: Path, tmp_path: Path) -> None:
     assert by_name["proj"]["sel"] is True and by_name["proj"]["cells"][2]["t"] == "current"
     assert by_name["other"]["cells"][2]["t"] == "ready" and by_name["other"]["do"]["project"].endswith("other")
     assert by_name["gone"]["cells"][2]["t"] == "missing"
+    # Every row but the current one can be forgotten, and forgetting is
+    # confirmed because the reader cannot see the registry from here.
+    assert by_name["proj"]["acts"] == []
+    for name in ("other", "gone"):
+        forget = by_name[name]["acts"][0]["do"]
+        assert forget["project_forget"].endswith(name)
+        assert forget["confirm"].startswith(f"Remove {name} ") and "stay" in forget["confirm"]
 
 
 def test_health_and_exports(home: Path, monkeypatch) -> None:

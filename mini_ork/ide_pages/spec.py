@@ -143,8 +143,21 @@ def project(path: str) -> dict[str, Any]:
 
 
 def project_pick() -> dict[str, Any]:
-    """Ask for a project folder, then switch the IDE window to it."""
+    """Ask for a project folder, then switch the IDE window to it.
+
+    A folder that is not yet a mini-ork project is offered an initialize step
+    first, so this is also "add a project".
+    """
     return {"project_pick": True}
+
+
+def project_forget(path: str, confirm: str | None = None) -> dict[str, Any]:
+    """Drop the project rooted at ``path`` from the IDE's project list.
+
+    Only the registry entry goes: the folder, its ``.mini-ork`` and every run
+    in it are untouched, which is why the confirm text should say so.
+    """
+    return _with_confirm({"project_forget": path}, confirm)
 
 
 def url(u: str) -> dict[str, Any]:
@@ -228,12 +241,18 @@ def col(width: int | None = None, *, fr: float = 1.0, min: int = 0) -> dict[str,
 
 def table(title: str, cols: list[dict[str, Any]], head: list[str],
           rows: Iterable[Any], **opt: Any) -> dict[str, Any]:
-    """``rows``: lists of cells (str or :func:`cell`), or ``{"cells", "do", "sel"}``."""
+    """``rows``: lists of cells (str or :func:`cell`), or ``{"cells", "do", "sel", "acts"}``.
+
+    ``acts`` are :func:`btn` buttons drawn at the row's end, beside the cells, the
+    way :func:`lst` items carry theirs — a row can then open on click *and* offer
+    a second action without one stealing the other's click.
+    """
     out_rows = []
     for r in rows:
         r = r if isinstance(r, dict) else {"cells": r}
         cells = [c if isinstance(c, dict) else cell(c) for c in r.get("cells") or []]
-        out_rows.append({"cells": cells, "do": r.get("do"), "sel": bool(r.get("sel"))})
+        out_rows.append({"cells": cells, "do": r.get("do"), "sel": bool(r.get("sel")),
+                         "acts": list(r.get("acts") or [])})
     return _section("table", title, {"cols": cols, "head": head, "rows": out_rows}, **opt)
 
 
