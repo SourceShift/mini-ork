@@ -103,6 +103,39 @@ def _run_parser(prog: str) -> argparse.ArgumentParser:
     return parser
 
 
+def _status_parser(prog: str = "mini-ork intake status") -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=prog, add_help=False, usage=argparse.SUPPRESS)
+    _common(parser)
+    return parser
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The whole ``mini-ork intake`` surface as one parser.
+
+    ``main`` dispatches verb-first by hand, so an unknown verb prints the usage
+    text rather than letting argparse exit — but the IDE's "did the button
+    dispatch?" check (``tests/unit/test_ide_pages_actions.py``) needs one parser
+    carrying every verb. Building it from the *same* ``_run_parser`` the command
+    uses is what keeps that second view from drifting from the first.
+    """
+    parser = argparse.ArgumentParser(
+        prog="mini-ork intake", add_help=False, usage=argparse.SUPPRESS
+    )
+    subs = parser.add_subparsers(dest="verb")
+    subs.add_parser(
+        "once", parents=[_run_parser("mini-ork intake once")], usage=argparse.SUPPRESS
+    )
+    poll = subs.add_parser(
+        "poll", parents=[_run_parser("mini-ork intake poll")], usage=argparse.SUPPRESS
+    )
+    poll.add_argument("--interval", type=float, default=DEFAULT_INTERVAL)
+    poll.add_argument("--passes", type=int, default=None)
+    subs.add_parser(
+        "status", parents=[_status_parser()], usage=argparse.SUPPRESS
+    )
+    return parser
+
+
 def _sources(args: argparse.Namespace) -> list[str]:
     """The sources a run should touch.
 
@@ -213,10 +246,7 @@ def _announce(report: intake_poll.PollReport, as_json: bool) -> None:
 
 
 def _cmd_status(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="mini-ork intake status", add_help=False,
-                                     usage=argparse.SUPPRESS)
-    _common(parser)
-    args = parser.parse_args(argv)
+    args = _status_parser().parse_args(argv)
 
     _, db = _targets(args)
     statuses = intake_poll.source_statuses(db)

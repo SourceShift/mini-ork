@@ -206,6 +206,7 @@ _PAGE_TABS: dict[str, tuple[str, ...]] = {
     "learn": ("patterns", "gradients", "memory"),
     "context": ("active", "library"),
     "nodes": ("fleet", "queue"),
+    "orch": ("intake",),
     "setup": ("readiness", "zed", "projects", "health"),
     "run": ("dag", "overview", "agents", "learnings", "artifacts"),
 }

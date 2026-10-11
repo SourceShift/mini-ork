@@ -30,6 +30,7 @@ PAGES: dict[str, str] = {
     "dags": "DAGs",
     "setup": "Setup & health",
     "features": "Features",
+    "thread": "Thread",
 }
 
 

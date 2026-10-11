@@ -19,7 +19,8 @@ from typing import Any
 from mini_ork.ide_pages import spec as S
 
 TABS = [("session", "Session"), ("kickoffs", "Kickoffs"), ("races", "Races"),
-        ("planner", "Classify & plan"), ("coord", "Coordination")]
+        ("planner", "Classify & plan"), ("coord", "Coordination"),
+        ("intake", "Intake")]
 
 _WORKSPACE_LABELS = {"worktree": "New worktree per task", "in-place": "In place (this checkout)"}
 _HISTORY_THREADS = 8
@@ -427,6 +428,127 @@ def _spawn_tree(home: Path, now: int) -> dict[str, Any]:
     return S.code("Spawn tree", lines[:40])
 
 
+# ── intake ─────────────────────────────────────────────────────────────────
+
+# ``(registered, enabled)`` → what ``mini-ork intake status`` calls it. A source
+# the config enables but no adapter could be built for is *skipped*, which is its
+# own answer: the config is fine and the token is not.
+_SOURCE_STATE = {
+    (False, False): ("skipped", "sub"),
+    (False, True): ("skipped", "sub"),
+    (True, False): ("disabled", "yellow"),
+    (True, True): ("registered", "green"),
+}
+
+# What one ledger row did. ``launched``/``continued`` put a run on the machine;
+# ``steered`` reached one already there; ``skipped`` is a board's normal state.
+_ACTION_TONE = {
+    "launched": "green",
+    "continued": "green",
+    "steered": "blue",
+    "duplicate": "sub",
+    "skipped": "sub",
+    "failed": "red",
+    "ignored": "sub",
+}
+
+
+def _trigger_text(rules: Any) -> str:
+    """A source's rules as one AND-joined line, or the reason there is nothing.
+
+    Deliberately the same reading ``mini-ork intake status`` prints, so a person
+    comparing the tab and the terminal is not comparing two phrasings.
+    """
+    if not rules.configured:
+        return "no trigger configured"
+    parts = []
+    if rules.label is not None:
+        parts.append(f"label {rules.label!r}")
+    if rules.assignee is not None:
+        parts.append(f"assignee {rules.assignee!r}")
+    if rules.states:
+        parts.append("state in (" + ", ".join(str(state) for state in rules.states) + ")")
+    return " AND ".join(parts) or "no trigger configured"
+
+
+def _intake(home: Path, errors: dict[str, str]) -> list[dict[str, Any]]:
+    """Every source, its trigger, its last sync — and what arrived lately."""
+    from mini_ork.intake.poll import source_statuses
+    from mini_ork.web.db import resolve_db
+
+    statuses = source_statuses(resolve_db(home))
+    rows = []
+    for status in statuses:
+        state, colour = _SOURCE_STATE[(status.registered, status.enabled)]
+        detail = status.skipped_reason or status.sync_error or ""
+        rows.append(
+            [
+                S.cell(status.source, "text", b=True),
+                S.cell(state, colour),
+                S.cell(_trigger_text(status.trigger), "sub" if not status.trigger.configured
+                       else "text"),
+                S.cell(status.trigger.recipe or "—", "sub", mono=True),
+                S.cell(str(status.mirrored), "sub", mono=True),
+                S.cell(status.synced_at or "never", "sub"),
+                S.cell(detail, "red" if status.sync_error else "sub"),
+            ]
+        )
+    sections: list[dict[str, Any]] = [
+        S.table(
+            "Sources",
+            [S.col(fr=1.0), S.col(90), S.col(fr=2.0), S.col(fr=1.0),
+             S.col(70), S.col(fr=1.0), S.col(fr=1.6)],
+            ["source", "state", "trigger", "recipe", "mirrored", "synced", "note"],
+            rows,
+            full=True,
+            note="All four rule keys are opt-in and ANDed. A source with none of them "
+                 "starts NOTHING — a first poll against a real board must not launch an "
+                 "agent per ticket.",
+        )
+    ]
+    if not any(status.trigger.configured for status in statuses if status.registered):
+        sections.append(
+            S.callout(
+                "Nothing will start",
+                "No registered source has a trigger. Add `trigger_label`, "
+                "`trigger_assignee` or `trigger_states` under a source in "
+                "`config/pm.yaml` — the label is the human act that says an agent "
+                "should do this.",
+                tone="orange",
+            )
+        )
+    sections += S.guarded(errors, "Recent arrivals", lambda: _arrivals(home))
+    return sections
+
+
+def _arrivals(home: Path) -> dict[str, Any]:
+    """The intake ledger, newest first — what a trigger acted on, and what folded."""
+    records = _rows(
+        home,
+        "SELECT provider, action, issue_uid, thread_id, created_at FROM intake_events "
+        "ORDER BY id DESC LIMIT 25",
+    )
+    rows = [
+        [
+            S.cell(record.get("provider") or "", "text", b=True),
+            S.cell(record.get("action") or "", _ACTION_TONE.get(str(record.get("action")), "sub")),
+            S.mono(record.get("issue_uid") or "—"),
+            S.mono(record.get("thread_id") or "—"),
+            S.cell(str(record.get("created_at") or ""), "sub"),
+        ]
+        for record in records
+    ]
+    return S.table(
+        "Recent arrivals",
+        [S.col(fr=1.0), S.col(90), S.col(fr=2.0), S.col(fr=2.0), S.col(fr=1.4)],
+        ["source", "action", "issue", "thread", "when"],
+        rows,
+        full=True,
+        note="The ledger that makes a webhook replay or a re-poll a no-op: one row per "
+             "arrival, keyed by provider and delivery id.",
+    )
+
+
 # ── page ───────────────────────────────────────────────────────────────────
 
 def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
@@ -444,11 +566,27 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
         sections += S.guarded(errors, "Races", lambda: _races(home, now))
     elif tab == "planner":
         sections += S.guarded(errors, "Classify & plan", lambda: _planner(home))
+    elif tab == "intake":
+        sections += S.guarded(errors, "Intake", lambda: _intake(home, errors))
     else:
         sections += S.guarded(errors, "Coordination", lambda: _coord(home, now))
+    actions = [S.btn("New thread", S.thread(""), "primary")]
+    if tab == "intake":
+        # Both are the CLI verb, so the tab adds no path to a running agent that
+        # `mini-ork intake` does not already have. The preview starts nothing and
+        # therefore asks nothing; the real pass confirms first.
+        actions = [
+            S.btn("Preview a pass", S.cli("intake", "once", "--dry-run")),
+            S.btn(
+                "Poll now",
+                S.cli("intake", "once", confirm="Start the runs this pass selects?"),
+                "primary",
+            ),
+            S.btn("Open threads", S.page_link("thread"), "ghost"),
+        ]
     return S.page("orch", "Orchestrator & intake",
-                  "How work gets in: the orchestrator thread, kickoffs, races, the planner, and "
-                  "multi-agent coordination.",
+                  "How work gets in: the orchestrator thread, kickoffs, races, the planner, "
+                  "multi-agent coordination, and the tickets that start runs on their own.",
                   chips_=[S.chip("mini-ork acp")],
-                  actions=[S.btn("New thread", S.thread(""), "primary")],
+                  actions=actions,
                   tabs=TABS, tab=tab, args=args, sections=sections, errors=errors)
