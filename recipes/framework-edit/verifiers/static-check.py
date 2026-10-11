@@ -6,7 +6,9 @@
 #
 # Inputs (via env):
 #   MINI_ORK_RUN_DIR — run directory set by the native execute runtime
-#   MINI_ORK_ROOT    — optional repo root
+#   MO_TARGET_CWD    — the run's TARGET repo/worktree (the repo under test);
+#                      preferred over MINI_ORK_ROOT, which names the ENGINE
+#   MINI_ORK_ROOT    — engine repo root (fallback when MO_TARGET_CWD is unset)
 #
 # Output: JSON to stdout. Exit code is always 0; caller reads .pass.
 
@@ -24,7 +26,44 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _verdict_merge import write_verdict  # noqa: E402
 
 RUN_DIR = os.environ["MINI_ORK_RUN_DIR"]
-REPO_ROOT = os.environ.get("MINI_ORK_ROOT") or os.getcwd()
+
+
+def _target_repo_root():
+    """The repo UNDER TEST — the run's target worktree, not the engine.
+
+    ``MINI_ORK_ROOT`` names the engine the run executes from. On a worktree-first
+    run that is a DIFFERENT repo from the target whose tree framework-edit.diff
+    was cut against (``MO_TARGET_CWD``). Archiving the engine silently omits
+    paths the target still has — notably a path the engine has since converted to
+    a git submodule, which ``git archive`` renders as an empty directory — so a
+    diff valid against the target cannot apply to the copy. Prefer the target."""
+    for key in ("MO_TARGET_CWD", "MINI_ORK_TARGET_REPO"):
+        val = os.environ.get(key)
+        if val and os.path.isdir(val):
+            return val
+    return os.environ.get("MINI_ORK_ROOT") or os.getcwd()
+
+
+def _base_ref():
+    """The commit the diff was cut against (``pre-implementer-ref``).
+
+    framework-edit commits the implementer's patch, so a re-verify after that
+    commit sees a HEAD that ALREADY contains the diff; archiving HEAD then makes
+    the diff read as 'already applied' and fail. Archive the recorded base so the
+    throwaway copy is always the tree the diff applies onto. Falls back to HEAD
+    when no recorded base resolves."""
+    try:
+        with open(os.path.join(RUN_DIR, "pre-implementer-ref"), encoding="utf-8") as fh:
+            ref = fh.read().strip()
+    except OSError:
+        ref = ""
+    if ref and subprocess.run(["git", "-C", REPO_ROOT, "cat-file", "-e", f"{ref}^{{commit}}"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+        return ref
+    return "HEAD"
+
+
+REPO_ROOT = _target_repo_root()
 NAME = "static-check"
 DIFF = os.path.join(RUN_DIR, "framework-edit.diff")
 EVIDENCE = os.path.join(RUN_DIR, f"verifier-{NAME}.log")
@@ -118,7 +157,7 @@ def _write_apply_sentinels():
 def _make_patched_copy():
     shutil.rmtree(WORK_PARENT, ignore_errors=True)
     os.makedirs(WORKTREE)
-    archive = subprocess.run(["git", "-C", REPO_ROOT, "archive", "HEAD"],
+    archive = subprocess.run(["git", "-C", REPO_ROOT, "archive", _base_ref()],
                              stdout=subprocess.PIPE, check=True).stdout
     tarfile.open(fileobj=io.BytesIO(archive)).extractall(WORKTREE)
     if not _assert_copy_is_own_git_root():
