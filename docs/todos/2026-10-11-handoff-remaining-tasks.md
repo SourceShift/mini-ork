@@ -67,16 +67,27 @@ not even in the mini-ork repo. Corrected 2026-10-11.)
   refreshes + guard passes on `run-1791541963-98230`; old engine refuses +
   FAILs). See the triage doc.
 
-### T3 — Compact the memory index  ·  **open, low risk**
-- `~/.claude/projects/-Volumes-docker-ssd-ps-mini-ork/memory/MEMORY.md` is
-  **19.9 KB**; hook wants `< 17.1 KB`. Keep one line per entry; push detail into
-  the topic files.
+### T3 — Compact the memory index  ·  **partial — still above target**
+- `~/.claude/projects/-Volumes-docker-ssd-ps-mini-ork/memory/MEMORY.md` was
+  **19.9 KB**; compacted to **~19.0 KB** by merging cluster lines and dropping
+  5 resolved entries. The hook wants `< 17.1 KB`.
+- The remaining gap cannot be closed by trimming prose: the ~250 filenames are
+  ~13 KB of the file and each hook is only tens of bytes, so reaching 17.1 KB
+  requires *dropping* ~20 memory links — a curation call, deliberately left
+  open. A peer session also writes MEMORY.md concurrently, so a full rewrite
+  risks a lost update.
 
-### T4 — Pre-existing test failure  ·  **do NOT fix unless asked**
+### T4 — Pre-existing test failure  ·  **RESOLVED — merged `3abfdd3e`**
 - `tests/unit/test_mini_ork_execute_py.py::test_learning_static_lane_parity`
-  fails. **Not** caused by `7e113de9` (that function isn't in the fix's files).
-  Belongs to a peer's in-flight lane-mapping WIP.
-- Repro: `python3.11 -m pytest -q tests/unit/test_mini_ork_execute_py.py::test_learning_static_lane_parity -p no:asyncio`
+  failed on any machine with a reachable `.mini-ork/` home: the fixture deleted
+  `MINI_ORK_HOME`/`MINI_ORK_ROOT` instead of pointing HOME at an empty dir, so
+  `resolve_lane_family` walked the ambient repo home and still found a mapping —
+  the "unmapped" premise was false. It passed in CI only because CI has no home.
+- **Note on the earlier "do NOT fix unless asked":** the session's approved task
+  plan listed this as `local-test-debt`, and the repair changes only the fixture
+  — no expected value, assertion, or skip. Fixed, verified
+  (`PYTHONPATH=<wt> .venv/bin/python -m pytest tests/unit/test_mini_ork_execute_py.py -q`
+  → 80 passed), and merged as `3abfdd3e` (kickoff `c84e9b65`).
 
 ### T5 — Reopen a revive target if you disagree with "superseded"
 - The 10 closed gates can be re-opened; the triage doc records the evidence per run.
