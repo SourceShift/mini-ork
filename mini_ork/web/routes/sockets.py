@@ -46,7 +46,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import time
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
@@ -55,6 +57,7 @@ from ..deps import get_home_lenient
 from .agent_server import (
     _TERMINAL_STATUS_MAP,
     _conversation_events,
+    _conversation_path,
     _load_conversation,
     _refresh_execution_status,
     _safe_conversation_id,
@@ -171,6 +174,32 @@ async def _send(ws: WebSocket, frame: dict[str, Any]) -> bool:
         return False
 
 
+def _stat_key(path: Path) -> tuple[int, int]:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return (-1, -1)
+    return (st.st_mtime_ns, st.st_size)
+
+
+def _conversation_key(home, conversation_id: str) -> tuple[int, int, int, int, int, int]:
+    """What one poll tick's work depends on, as three stats.
+
+    A tick re-reads and re-parses the conversation sidecar and re-queries
+    ``run_events``. Neither can have moved unless a file has: the sidecar moves
+    on every message and every status rewrite, and the run's real status lives
+    in ``task_runs``, whose commits land in ``state.db-wal``. An unchanged key
+    therefore means the previous tick's events are still the truth, which is
+    what makes an idle socket cost three ``stat`` calls instead of a parse —
+    and the canvas opens one socket per conversation the user has ever clicked,
+    holding each for up to ``_MAX_LIFETIME_SECONDS``.
+    """
+    sidecar = _stat_key(_conversation_path(home, conversation_id))
+    db = _stat_key(Path(home) / "state.db")
+    wal = _stat_key(Path(home) / "state.db-wal")
+    return (*sidecar, *db, *wal)
+
+
 async def _poll_events(
     ws: WebSocket,
     home_path,
@@ -195,10 +224,21 @@ async def _poll_events(
     transition, and re-armed if the run starts moving again.
     """
     deadline = time.monotonic() + _MAX_LIFETIME_SECONDS
+    events: list[dict[str, Any]] = []
+    status = ""
+    last_key: tuple[int, int, int, int, int, int] | None = None
     while time.monotonic() < deadline:
         await asyncio.sleep(_POLL_SECONDS)
-        record = await asyncio.to_thread(_reload, home_path, conversation_id, record)
-        events, status = await asyncio.to_thread(_project, home_path, record)
+        # Both halves of a tick are proportioned to a conversation that is
+        # moving. While nothing has been written — a finished conversation the
+        # canvas still has a socket for, which is most of them at any moment —
+        # there is no state change to project, so the read and the parse are
+        # skipped and the previous tick's events stand.
+        key = await asyncio.to_thread(_conversation_key, home_path, conversation_id)
+        if key != last_key:
+            last_key = key
+            record = await asyncio.to_thread(_reload, home_path, conversation_id, record)
+            events, status = await asyncio.to_thread(_project, home_path, record)
         fresh = [e for e in events if str(e.get("id")) not in sent]
         for event in fresh:
             if not await _send(ws, event):
