@@ -21,6 +21,7 @@ from __future__ import annotations
 import fnmatch
 import os
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -205,6 +206,33 @@ def fetch_bundle(repo: str, bundle: str | os.PathLike[str], ref: str) -> str:
 # --------------------------------------------------------------------------- replica
 
 
+def _materialise_submodules(repo: str) -> None:
+    """Fetch the replica's submodule content, when the snapshot has any.
+
+    ``read-tree`` restores a gitlink — the pointer, not the tree — so a replica
+    built from the bundle alone has the vendored PATH and none of its files, and
+    nothing says so until something imports them. Check each submodule out from
+    the URL the superproject records.
+
+    Warn instead of raising: the URL may be unreachable from the node, and a
+    replica whose tracked tree still matches the snapshot is not corrupt just
+    because a build input did not arrive — aborting every sync would turn a
+    configuration gap the operator has to see into a sync nobody can complete.
+    The warning is the whole signal, so the file:line of this call site is where
+    a missing crate on a remote node gets diagnosed.
+
+    Safe before the tree verification that follows: ``submodule update`` checks
+    out exactly the commit the index already records, and ``git add -A`` hashes
+    a gitlink as that commit whether or not its content is present, so the tree
+    it computes is unchanged either way."""
+    if not Path(repo, ".gitmodules").exists():
+        return
+    r = _git(repo, "submodule", "update", "--init", "--recursive", check=False)
+    if r.returncode != 0:
+        print(f"mini-ork: submodules not materialised in {repo}: "
+              f"{r.stderr.decode(errors='replace').strip()}", file=sys.stderr)
+
+
 def materialize(remote_repo: str, bundle: str | os.PathLike[str], snap: Snap, head: str) -> str:
     """Make the replica's worktree exactly ``snap.tree`` with HEAD detached at
     ``head`` (the local HEAD) when the bundle carried it, so ``git status`` in the
@@ -222,6 +250,7 @@ def materialize(remote_repo: str, bundle: str | os.PathLike[str], snap: Snap, he
     _git(remote_repo, "read-tree", "--reset", "-u", snap.tree)   # tracked paths := snap
     _git(remote_repo, "clean", "-fdq")                           # stray untracked (not ignored)
     _git(remote_repo, "reset", "-q")                             # index := HEAD again
+    _materialise_submodules(remote_repo)                         # vendored trees: pointer -> content
     got = worktree_tree(remote_repo, ())
     if got != snap.tree:
         raise SyncIntegrityError(f"materialize: worktree tree {got} != snapshot tree {snap.tree}")

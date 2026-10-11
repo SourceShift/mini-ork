@@ -133,6 +133,62 @@ def test_materialize_removes_stray_replica_files(local, tmp_path):
     assert not Path(remote, "stray.txt").exists()
 
 
+@pytest.fixture
+def vendored(tmp_path) -> str:
+    """A local checkout that vendors ``ui/`` as a REAL submodule — the shape the
+    engine repo itself now has. A fixture built with ``mkdir`` would model the
+    world before the vendoring move and could never fail the way production
+    does: only a gitlink makes the restored copy leave a hole."""
+    crate = tmp_path / "crate"
+    crate.mkdir()
+    _git(crate, "init", "-q")
+    _git(crate, "config", "user.email", "t@t")
+    _git(crate, "config", "user.name", "t")
+    (crate / "src").mkdir()
+    (crate / "src" / "page.rs").write_text("// a\n")
+    _git(crate, "add", "-A")
+    _git(crate, "commit", "-q", "-m", "crate")
+
+    repo = tmp_path / "vendor"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    (repo / "README.md").write_text("hi\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "init")
+    _git(repo, "-c", "protocol.file.allow=always", "submodule", "add", str(crate), "ui")
+    _git(repo, "commit", "-q", "-m", "vendor ui")
+    return str(repo)
+
+
+def test_materialize_carries_a_vendored_submodule(vendored, tmp_path, monkeypatch):
+    """A gitlink travels as a pointer, so the replica needs the content fetched
+    separately or it arrives with the vendored PATH and none of its files."""
+    # The fixture submodule is a local path, so the clone needs the file
+    # transport — which git 2.38+ refuses for a submodule UNLESS the permission
+    # comes from the environment or the command line. Setting
+    # protocol.file.allow in the replica's own config does NOT work: repo config
+    # is untrusted here precisely because a cloned repo could ship it, so only
+    # GIT_ALLOW_PROTOCOL (or -c) counts. Production reaches an https URL and
+    # needs neither.
+    monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file")
+    remote = str(tmp_path / "remote")
+    _materialize(vendored, remote)
+    assert Path(remote, "ui", "src", "page.rs").read_text() == "// a\n"
+
+
+def test_the_bundle_alone_leaves_the_submodule_empty(vendored, tmp_path, monkeypatch):
+    """Teeth: nothing in the bundle, fetch or read-tree can produce that file, so
+    a replica that has one can only have run ``submodule update``. This is the
+    pre-fix behaviour, pinned so the hole cannot silently return."""
+    monkeypatch.setattr(ts, "_materialise_submodules", lambda *_: None)
+    remote = str(tmp_path / "remote")
+    _materialize(vendored, remote)
+    assert not Path(remote, "ui", "src", "page.rs").exists()
+    assert Path(remote, "README.md").exists()  # the superproject still synced
+
+
 # --------------------------------------------------------------------------- delta
 
 

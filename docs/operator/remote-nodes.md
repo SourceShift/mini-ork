@@ -271,8 +271,13 @@ Every diff is computed by git (`mini_ork/remote/tree_sync.py`).
   is kept. The remote result stays fetchable at `refs/mo/remote/<run>/latest`
   for a manual merge. Edits made between spawns are not conflicts; the next
   sync-up carries them over.
-- **Not supported yet:** submodules travel as gitlinks and Git LFS files as
-  pointers.
+- **Submodules:** the replica's gitlink is checked out from the URL the
+  superproject records, so a repo that vendors a crate as a submodule (this one
+  does) delivers the vendored tree too, not just an empty directory. The node
+  must be able to reach that URL — an unreachable URL is a warning on the node's
+  stderr (`mini-ork: submodules not materialised in <path>: ...`), not a failed
+  sync: the tracked tree still matches, only the vendored content is missing.
+  Git LFS files still travel as pointers.
 
 ## Run dir on the remote side
 
