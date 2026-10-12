@@ -408,6 +408,99 @@ def test_real_recipes_compile_and_expose_retry_edges():
             assert max_rounds == 2
 
 
+# ── escalation wiring: a `recursion:` block turns `escalates_to` into a repair ─
+
+def _escalation_workflow(**extra) -> dict:
+    """A loop-shaped DAG: verify -> synth, with an escalation to a reflector
+    that feeds a replanner, whose `recursive` edge re-enters at the implementer.
+
+    Mirrors ``recipes/recursive-validate-impl``: the escalation target is a
+    FORWARD node (not an ancestor), which is why it cannot be a ``retries``
+    edge and needs the separate map.
+    """
+    return {
+        "version": "0.2.0",
+        "task_class": "loop_demo",
+        "nodes": [
+            {"name": "planner", "type": "planner", "dispatch_mode": "serial"},
+            {"name": "implementer", "type": "implementer", "dispatch_mode": "serial"},
+            {"name": "tier1", "type": "verifier", "verifier_ref": "v.py",
+             "dispatch_mode": "serial"},
+            {"name": "synth", "type": "reviewer", "dispatch_mode": "serial"},
+            {"name": "reflector", "type": "reflector", "dispatch_mode": "serial"},
+            {"name": "replanner", "type": "planner", "dispatch_mode": "serial"},
+        ],
+        "edges": [
+            {"from": "planner", "to": "implementer", "edge_type": "depends_on"},
+            {"from": "implementer", "to": "tier1", "edge_type": "verifies"},
+            {"from": "tier1", "to": "synth", "edge_type": "depends_on"},
+            {"from": "synth", "to": "reflector", "edge_type": "escalates_to",
+             "condition": "fail"},
+            {"from": "reflector", "to": "replanner", "edge_type": "depends_on"},
+            {"from": "replanner", "to": "implementer", "edge_type": "depends_on",
+             "recursive": True},
+        ],
+        **extra,
+    }
+
+
+def test_escalates_to_stays_inert_without_a_recursion_block(tmp_path):
+    """The opt-out is the declaration. 30+ recipes carry `escalates_to` edges
+    that mean "a human handles this"; none of them may start self-repairing."""
+    cw = _compile_yaml(tmp_path, _escalation_workflow())
+    assert cw.escalation_edges == {}
+    assert cw.recursive_children == {}
+
+
+def test_recursion_block_publishes_the_escalation_loop(tmp_path):
+    """With the block, the escalation is a repair channel and the loop's
+    back-edge is published so the reset can reach the loop body."""
+    cw = _compile_yaml(tmp_path, _escalation_workflow(recursion={
+        "max_iterations": 5,
+        "convergence_check": "all_dod_probes_pass",
+        "budget_cap_per_iter_usd": 20.0,
+        "budget_cap_total_usd": 60.0,
+        "divergence_kill": "same signature twice -> escalate",
+    }))
+    assert cw.escalation_edges["synth"].target == "reflector"
+    assert cw.escalation_edges["synth"].max_rounds == 5   # the declared cap
+    assert cw.recursive_children == {"replanner": ("implementer",)}
+    # Still not a `retries` edge: the two maps stay apart so the ancestor
+    # invariant `retries` is validated against is not weakened.
+    assert "synth" not in cw.retry_edges
+
+
+def test_retries_edge_outranks_an_escalation_on_the_same_source(tmp_path):
+    """A source that names its own revise target and cap wins outright; the
+    escalation must not silently replace it."""
+    workflow = _escalation_workflow(recursion={
+        "max_iterations": 5,
+        "convergence_check": "all_dod_probes_pass",
+        "budget_cap_per_iter_usd": 20.0,
+        "budget_cap_total_usd": 60.0,
+        "divergence_kill": "n/a",
+    })
+    workflow["edges"].append(
+        {"from": "synth", "to": "implementer", "edge_type": "retries",
+         "max_rounds": 3})
+    cw = _compile_yaml(tmp_path, workflow)
+    assert cw.retry_edges["synth"].target == "implementer"
+    assert cw.retry_edges["synth"].max_rounds == 3
+    assert "synth" not in cw.escalation_edges
+
+
+def test_recursive_validate_impl_declares_a_usable_loop():
+    """The recipe whose panel escalation died with no repair round
+    (run-1791798883-27913) must compile to an executable one."""
+    cw = compile_workflow(str(REPO / "recipes" / "recursive-validate-impl" / "workflow.yaml"))
+    assert cw.escalation_edges["tier4_synth"].target == "reflector"
+    assert cw.escalation_edges["tier4_synth"].max_rounds == 5
+    assert "implementer" in cw.recursive_children["replanner"]
+    # Type-1/2/3 verifier failures escalate the same way.
+    for tier in ("tier1_compile", "tier2_unit", "tier3_property"):
+        assert cw.escalation_edges[tier].target == "reflector"
+
+
 # ── DoD 9: a revise target OUTSIDE the closure is skipped, not fatal ──────────
 
 def test_revise_target_outside_closure_is_skipped(tmp_path, monkeypatch):

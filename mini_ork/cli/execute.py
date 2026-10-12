@@ -861,12 +861,16 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     # the existing ``for source, (target, max_rounds) in retry_edges.items():``
     # pattern keeps working.
     retry_edges: dict[str, CompiledRetryEdge] = {}
+    escalation_edges: dict[str, CompiledRetryEdge] = {}
+    recursive_children: dict[str, tuple[str, ...]] = {}
     if workflow and os.path.isfile(workflow):
         from mini_ork.workflow import compile_workflow
 
         compiled = compile_workflow(workflow)
         control_parents = compiled.control_parents
         retry_edges = compiled.retry_edges
+        escalation_edges = compiled.escalation_edges
+        recursive_children = compiled.recursive_children
 
         # A recipe that declares a `recursion:` block owns its own loop caps.
         # Publish them so the driver honors the declaration instead of its own
@@ -883,6 +887,14 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 "MO_RECURSION_BUDGET_CAP_TOTAL_USD": f"{recursion.budget_cap_total_usd:.2f}",
                 "MO_RECURSION_DIVERGENCE_KILL": recursion.divergence_kill,
             })
+
+    # One repair map for the round loop: a `retries` edge and an escalated
+    # `escalates_to` edge mean the same thing to it -- send the findings back to
+    # `target` and re-run from there. They stay separate maps on the compiled
+    # workflow because they need different caps and target rules; here they
+    # converge so every consumer downstream (the round loop, the orchestrator's
+    # `has_retries_edge` signal) sees one view.
+    repair_edges: dict[str, CompiledRetryEdge] = {**retry_edges, **escalation_edges}
 
     fail_count = 0
     abstain_count = 0
@@ -1022,7 +1034,16 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         round_used: dict[str, int] = {}
 
         def _control_descendants(target: str) -> set[str]:
-            """``target`` plus every node reachable from it through control parents."""
+            """``target`` plus everything a re-run of it must redo.
+
+            Control parents carry the forward graph. ``recursive_children``
+            carries the recipe's loop back-edge (``replanner -> implementer``),
+            which is excluded from control parents on purpose -- counting it
+            forward would leave the implementer waiting on a replanner that
+            only ever runs *after* it. Here the walk is backwards from a repair
+            entry point, so following it is exactly right: it is what carries a
+            reset past the escalation target into the loop body.
+            """
             descendants = {target}
             frontier = [target]
             while frontier:
@@ -1030,7 +1051,8 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 for node_id, field in fields_by_id.items():
                     if node_id in descendants:
                         continue
-                    if current in control_parents.get(node_id, ()):
+                    if current in control_parents.get(node_id, ()) \
+                            or node_id in recursive_children.get(current, ()):
                         descendants.add(node_id)
                         frontier.append(node_id)
             return descendants
@@ -1136,7 +1158,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
             except Exception:
                 _orch_enabled = lambda: False  # noqa: E731
             if _orch_enabled():
-                _orchestrator_act(live_run_dir, db, run_id, outcomes, retry_edges,
+                _orchestrator_act(live_run_dir, db, run_id, outcomes, repair_edges,
                                   revision_state=locals())
 
             # ── revise loop (retries edges) ────────────────────────────────
@@ -1158,7 +1180,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
             #      ``MO_REVISE_ROUNDS`` + per-edge ``max_rounds`` caps (F6).
             revise_groups: dict[str, list[tuple[tuple, int, str]]] = {}
             for field, rc, finish_reason in outcomes:
-                if rc == 0 or rc == _levels.ABSTAIN_RC or field[0] not in retry_edges:
+                if rc == 0 or rc == _levels.ABSTAIN_RC or field[0] not in repair_edges:
                     # An abstention sends nothing back: the findings would be
                     # about a tool that never ran, and re-running the implementer
                     # is the "reflect on the code and replan" the audit forbids.
@@ -1169,7 +1191,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                     print(f"[revise] skipped for {field[0]}: reviewer verdict unparseable "
                           "— no findings to send back", file=sys.stderr)
                     continue
-                edge = retry_edges[field[0]]
+                edge = repair_edges[field[0]]
                 target, max_rounds = edge.target, edge.max_rounds
                 cap = min(max_rounds, revise_rounds_cap)
                 if round_used.get(target, 0) >= cap:
@@ -1192,9 +1214,9 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
             # shared (a wave that produces both an rc-failed node and a
             # condition-fired verifier fires ONE combined round).
             for field, rc, finish_reason in outcomes:
-                if rc != 0 or field[0] not in retry_edges:
+                if rc != 0 or field[0] not in repair_edges:
                     continue
-                edge = retry_edges[field[0]]
+                edge = repair_edges[field[0]]
                 # No condition declared on this edge — nothing to evaluate.
                 # The legacy 2-tuple contract keeps this branch implicit
                 # (CompiledRetryEdge.condition is None for the legacy shape).
@@ -1245,7 +1267,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                     (field, rc, CONDITION_FIRED_FINISH_REASON))
             if revise_groups:
                 for target, failed_sources in revise_groups.items():
-                    _target_edge = retry_edges[failed_sources[0][0][0]]
+                    _target_edge = repair_edges[failed_sources[0][0][0]]
                     _target_max = _target_edge.max_rounds
                     round_no = round_used.get(target, 0) + 1
                     round_used[target] = round_no

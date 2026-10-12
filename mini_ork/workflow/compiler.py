@@ -109,6 +109,18 @@ class CompiledWorkflow:
     # when the edge declares ``condition:``. The runtime reads this map to
     # drive the revise loop; D3 wires the predicate evaluator into firing.
     retry_edges: dict[str, CompiledRetryEdge] = field(default_factory=dict)
+    # source -> CompiledRetryEdge for `escalates_to` edges, but ONLY when the
+    # workflow declares a `recursion:` block. Kept out of ``retry_edges`` so the
+    # two differ where they must: a `retries` edge names its own target and cap
+    # and must loop back to an ANCESTOR, while an escalation names a forward
+    # target (``tier4_synth -> reflector``) and takes its cap from the recipe's
+    # ``recursion.max_iterations``. Recipes without the block publish nothing.
+    escalation_edges: dict[str, CompiledRetryEdge] = field(default_factory=dict)
+    # source -> nodes reachable from it only through `recursive: true` back-edges
+    # (``replanner -> implementer``). Also published only when a `recursion:` block
+    # is declared. The runtime follows these when it scopes a repair round, which
+    # is what carries the reset past the escalation target and back into the loop.
+    recursive_children: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     def node_fields(self, separator: str) -> list[str]:
         return [self.nodes[node_id].dispatch_fields(separator) for node_id in self.topological_order]
@@ -483,6 +495,37 @@ def compile_workflow(path: str | Path) -> CompiledWorkflow:
             condition=compiled_condition,
         )
 
+    # A recipe that declares a `recursion:` block owns a repair loop, and its
+    # `escalates_to` edges are that loop's way back up. Live, they are inert:
+    # the compile strips `escalates_to` from control_parents (the loop would be
+    # a cycle), and nothing else reads them, so a failed reviewer only blocks
+    # its descendants -- the run dies with no repair round even though the
+    # recipe declares one. Observed as run-1791798883-27913 (panel ESCALATE on
+    # `tier4_synth`, recipe declares `tier4_synth -> reflector -> replanner ->
+    # implementer`, run terminal anyway). Recipes WITHOUT the block are
+    # untouched, so the operator path (an escalation is a human's to handle)
+    # stays the default and only a recipe that asks for a loop gets one.
+    escalation_edges: dict[str, CompiledRetryEdge] = {}
+    recursive_children: dict[str, tuple[str, ...]] = {}
+    from mini_ork.workflow.recursion import load_recursion_config
+
+    recursion = load_recursion_config(workflow_path)
+    if recursion is not None:
+        for raw_edge in raw_edges:
+            edge = _mapping(raw_edge, context="workflow edge")
+            source = str(edge.get("from") or "").strip()
+            target = str(edge.get("to") or "").strip()
+            if bool(edge.get("recursive", False)):
+                recursive_children[source] = recursive_children.get(source, ()) + (target,)
+            elif str(edge.get("edge_type") or "depends_on") == "escalates_to" \
+                    and source not in retry_edges and source not in escalation_edges:
+                # An explicit `retries` edge on the same source wins: it names
+                # its own target and its own cap.
+                escalation_edges[source] = CompiledRetryEdge(
+                    target=target,
+                    max_rounds=recursion.max_iterations,
+                )
+
     return CompiledWorkflow(
         path=workflow_path,
         nodes=nodes,
@@ -491,4 +534,6 @@ def compile_workflow(path: str | Path) -> CompiledWorkflow:
         bindings=tuple(bindings),
         control_parents=control_parents,
         retry_edges=retry_edges,
+        escalation_edges=escalation_edges,
+        recursive_children=recursive_children,
     )
