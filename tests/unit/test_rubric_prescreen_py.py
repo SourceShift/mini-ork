@@ -366,7 +366,6 @@ def test_build_parse_error_payload():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fake_dispatch_emitting(payload):
-    from mini_ork.dispatch import llm_dispatch
     def fake(argv, *, root):
         print(payload)
         return 0
