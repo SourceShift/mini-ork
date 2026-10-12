@@ -69,6 +69,14 @@ edges:
   - { from: final_reviewer,   to: publisher,         edge_type: depends_on }
   - { from: final_reviewer,   to: rollback,          edge_type: escalates_to }
   - { from: epic_verifier,    to: rollback,          edge_type: escalates_to }
+  # The reflector is the repair entry point: it runs once the verdict exists,
+  # and a failing reflection revises the dispatch wave rather than the whole
+  # run. ``depends_on`` (not ``escalates_to``) is what orders it — the compiler
+  # keeps ``escalates_to`` out of ``control_parents``, so a node reachable only
+  # by one has no parents and is therefore ready before anything has run.
+  - { from: epic_verifier,    to: reflector,         edge_type: depends_on }
+  - { from: final_reviewer,   to: reflector,         edge_type: depends_on }
+  - { from: reflector,        to: epic_dispatcher,   edge_type: retries, max_rounds: 1 }
 
 rollback_strategy: keep_run_artifacts_discard_partial_publish
 max_self_correction_iterations: 0

@@ -86,6 +86,10 @@ class Run:
     calls: list[dict[str, Any]]
     recipe_dir: Path | None
     workspace: Any
+    # The recipe's declared edges, verbatim from ``workflow.yaml``. ``cols`` is a
+    # projection of these that drops feedback; keeping the raw list is what lets
+    # the canvas draw the edges the recipe actually declares.
+    edges: list[dict[str, Any]] = field(default_factory=list)
 
 
 # ── reading ─────────────────────────────────────────────────────────────────
@@ -402,9 +406,10 @@ def _load(home: Path, run_id: str, *, with_files: bool = True) -> Run | None:
     except Exception:  # noqa: BLE001
         workspace = None
     order = [n for c in cols for n in c]
+    edges = [e for e in (wf.get("edges") or []) if isinstance(e, dict)]
     return Run(id=run_id, home=home, run_dir=run_dir, row=row, card=card,
                nodes=[nodes[n] for n in order if n in nodes], cols=cols, calls=calls,
-               recipe_dir=recipe_dir, workspace=workspace)
+               recipe_dir=recipe_dir, workspace=workspace, edges=edges)
 
 
 # ── header ──────────────────────────────────────────────────────────────────
@@ -648,14 +653,63 @@ def _selected(run: Run, wanted: str | None) -> Node | None:
     return run.nodes[0] if run.nodes else None
 
 
+# Which kind survives when two edges join the same pair. Mirrors
+# ``ui/src/thumb.rs``'s ``edge_priority`` so the board thumbnails and the full
+# canvas name the same relationship for the same pair.
+_EDGE_KIND_ORDER = ("verifies", "escalates_to", "retries", "supplies_context_to", "depends_on")
+
+
+def _edge_rank(kind: str) -> int:
+    try:
+        return _EDGE_KIND_ORDER.index(kind)
+    except ValueError:
+        return len(_EDGE_KIND_ORDER)
+
+
+def _graph_edges(run: Run) -> list[dict[str, Any]]:
+    """The recipe's edges, shaped for the canvas.
+
+    Only edges whose endpoints reached the drawing survive: a runtime-only node
+    is named by no edge, and an edge to a node the run never placed would
+    dangle. ``feedback`` marks the edges that loop back — ``_layers`` keeps those
+    out of the column ordering on purpose, so the canvas draws them as arcs
+    rather than pretending they are forward steps.
+    """
+    col_of: dict[str, int] = {}
+    for index, col in enumerate(run.cols):
+        for nid in col:
+            col_of[nid] = index
+    best: dict[tuple[str, str], dict[str, Any]] = {}
+    for edge in run.edges:
+        src, dst = str(edge.get("from") or ""), str(edge.get("to") or "")
+        if not src or not dst or src == dst:
+            continue
+        if src not in col_of or dst not in col_of:
+            continue
+        kind = str(edge.get("edge_type") or "depends_on")
+        recursive = bool(edge.get("recursive"))
+        item = {
+            "from": src,
+            "to": dst,
+            "edge_type": kind,
+            "condition": str(edge.get("condition") or ""),
+            "recursive": recursive,
+            "feedback": recursive or kind == "retries" or col_of[dst] <= col_of[src],
+        }
+        prev = best.get((src, dst))
+        if prev is None or _edge_rank(kind) < _edge_rank(str(prev["edge_type"])):
+            best[(src, dst)] = item
+    return sorted(best.values(), key=lambda e: (col_of[e["from"]], e["from"], col_of[e["to"]], e["to"]))
+
+
 def _graph(run: Run, wanted: str | None = None) -> dict[str, Any]:
     """The run's node graph — the DAG columns plus the header the IDE draws.
 
     ``_dag_tab``'s ``dag`` section and the page's top-level ``graph`` key both
     build from here, so they cannot drift::
 
-        {"cols": [[node_dict]], "heads": [str], "run_title": str,
-         "recipe": str, "state": <outcome state word>}
+        {"cols": [[node_dict]], "heads": [str], "edges": [edge_dict],
+         "run_title": str, "recipe": str, "state": <outcome state word>}
     """
     sel = _selected(run, wanted)
     by_id = {n.id: n for n in run.nodes}
@@ -693,6 +747,7 @@ def _graph(run: Run, wanted: str | None = None) -> dict[str, Any]:
     return {
         "cols": cols,
         "heads": [_head_for(col, idx) for idx, col in enumerate(cols)],
+        "edges": _graph_edges(run),
         "run_title": str(run.card.get("title") or ""),
         "recipe": str(run.card.get("recipe") or run.row.get("recipe") or ""),
         "state": O.state_word(run),
@@ -717,6 +772,7 @@ def _dag_tab(run: Run, wanted: str | None) -> list[dict[str, Any]]:
         # ``heads`` kwarg — mutate the returned dict in place so the kickoff's
         # "stage label per column" reaches the IDE without a spec.py edit.
         sec["heads"] = graph["heads"]
+        sec["edges"] = graph["edges"]
         sec["run_title"] = graph["run_title"]
         sec["recipe"] = graph["recipe"]
         return sec
