@@ -971,13 +971,46 @@ def dispatch_key(kickoff_path: str) -> str:
     return f"{path}#sha256:{hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]}"
 
 
+def _blocks_dispatch(row: dict[str, Any]) -> bool:
+    """Whether a pending ``retry_precondition`` row should refuse a dispatch.
+
+    Every other consumer of this gate already exempts
+    ``retry_hint.NO_CHANGE_KINDS`` — a ``needs_change`` of ``interrupted`` or
+    ``not-started``, where "resuming IS the fix": ``recover``'s ``--ack-change``
+    gate (``recovery/planner.py``), ``board retry`` (``cli/board_cmd.py``), the
+    outcome page (``ide_pages/outcome.py``), and ``auto_repair.decide``. This
+    start guard did not, so a run whose node was interrupted refused every
+    re-dispatch of its own kickoff with rc=75 — while the very hint that raised
+    the gate told the operator to run ``mini-ork recover <run> --strategy
+    resume``, which re-dispatches that same kickoff and was refused again. An
+    automated caller cannot pass ``--ack-change``, so an epic-runner child whose
+    implementer was interrupted looped on 75 forever (run-1791788217-61320's
+    child, 2026-10-12). A row whose hint cannot be read still blocks: an
+    unreadable gate is not a licence to dispatch.
+    """
+    context = row.get("context")
+    hint = context.get("hint") if isinstance(context, dict) else None
+    if not isinstance(hint, dict):
+        return True
+    try:
+        from mini_ork.recovery import retry_hint
+    except Exception:  # noqa: BLE001
+        return True
+    needs = hint.get("needs_change")
+    kind = str(needs.get("kind") or "") if isinstance(needs, dict) else ""
+    return kind not in retry_hint.NO_CHANGE_KINDS
+
+
 def pending_fix_for_kickoff(home: Path, kickoff_path: str) -> dict[str, Any] | None:
     """A pending ``retry_precondition`` row for this kickoff's task
     (:func:`dispatch_key`), or ``None`` when the run may proceed.
 
     Rows written before the task was part of the key (a bare path, no ``#``)
     never block: they cannot tell one step of a loop from another.
-    ``MO_IGNORE_PENDING_FIX=1`` short-circuits the check.
+    ``MO_IGNORE_PENDING_FIX=1`` short-circuits the check. A row whose
+    ``needs_change`` kind needs no operator change (see :func:`_blocks_dispatch`)
+    is skipped rather than returned, so it informs the inbox without refusing
+    the dispatch.
     """
     if os.environ.get(MO_IGNORE_PENDING_FIX) == "1":
         return None
@@ -998,8 +1031,11 @@ def pending_fix_for_kickoff(home: Path, kickoff_path: str) -> dict[str, Any] | N
     for row in rows:
         if row.get("gate_id") != GATE_ID:
             continue
-        if str(row.get("blocks_dispatch_for") or "") == want:
-            return row
+        if str(row.get("blocks_dispatch_for") or "") != want:
+            continue
+        if not _blocks_dispatch(row):
+            continue
+        return row
     return None
 
 
