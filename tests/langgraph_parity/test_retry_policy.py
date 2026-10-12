@@ -605,8 +605,14 @@ def test_handler_raise_releases_materialized_skills(tmp_path, monkeypatch):
     )
 
     class _Recorder:
+        # Mirrors the real MaterializedSkills surface: granted (list the
+        # node_start emit block reads) + outcome() + release().
         def __init__(self):
             self.released = False
+            self.granted = []
+
+        def outcome(self):
+            return {"granted": self.granted}
 
         def release(self):
             self.released = True
