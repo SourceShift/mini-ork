@@ -57,8 +57,10 @@ def test_unsupported_axes_reports_only_declared_and_refused_axes():
         "skills",
         "agent_doc",
     )
-    # claude translates mcp_servers (--mcp-config) but not skills/agent_doc.
-    assert env.unsupported_axes(ENGINES["claude"].capabilities()) == ("skills", "agent_doc")
+    # claude translates mcp_servers (--mcp-config) and skills (the registry
+    # materializer symlinks into <target>/.claude/skills, which the CLI reads
+    # natively) but not agent_doc.
+    assert env.unsupported_axes(ENGINES["claude"].capabilities()) == ("agent_doc",)
 
 
 # ── Workflow contract ────────────────────────────────────────────────────────

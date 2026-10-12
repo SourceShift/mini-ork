@@ -1,0 +1,7 @@
+# orch-smoke is an engagement smoke test, not a producer: its only artifact
+# is the verifier sidecar in the run dir. outputs[] stays empty so the
+# publisher takes its skip path and commits nothing.
+source_artifact: verifier-result-fail-probe.json
+outputs: []
+success_verifiers:
+  - fail-probe

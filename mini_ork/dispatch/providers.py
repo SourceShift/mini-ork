@@ -2146,6 +2146,14 @@ class ClaudeEngine(HarnessEngine):
                 resume=True,
                 session_capture=True,
                 mcp_servers=True,
+                # The skills translation is NOT a CLI flag: the executor
+                # materializes granted skills into <target>/.claude/skills/
+                # at the node boundary (dispatch/skill_registry), and the
+                # claude CLI reads that directory natively. Declaring the
+                # axis here lets a workflow grant `skills:` on claude lanes;
+                # a False here used to rc=66-reject the very grants the
+                # materializer had already placed.
+                skills=True,
             ),
             command_builder=_claude_command_builder,
         )

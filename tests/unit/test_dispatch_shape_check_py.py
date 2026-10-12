@@ -62,6 +62,46 @@ def test_looks_like_json_rejects_non_json(text):
     assert looks_like_json(_mk(text)) is False
 
 
+# ── the planner whose plan is a FILE, not the reply ──
+
+def _plan_gate(monkeypatch, tmp_path, text):
+    """The planner gate as ``_shape_predicate_for`` builds it for a plan file."""
+    artifact = tmp_path / "epic-runner-plan.json"
+    monkeypatch.setenv("MO_PLAN_ARTIFACT", str(artifact))
+    if text is not None:
+        artifact.write_text(text)
+    return L._shape_predicate_for("planner")
+
+
+def test_declared_plan_artifact_is_gated_on_the_file_not_the_reply(monkeypatch, tmp_path):
+    # The lane wrote the plan with a tool and answered with a summary line. The
+    # reply is prose by design (the prompt says "write the plan file and nothing
+    # else"); the plan is on disk. Gating the reply rejects a planner that did its
+    # job — run-1791788217-61320 lost 47 minutes to exactly this.
+    assert _plan_gate(monkeypatch, tmp_path, '{"epics": [], "waves": []}')(object()) is True
+
+
+@pytest.mark.parametrize("text", [None, "", "   ",
+                                  "I have written the plan to the run directory."])
+def test_declared_plan_artifact_still_rejects_a_missing_or_non_json_file(
+        monkeypatch, tmp_path, text):
+    # Same post-condition as before — "is there a well-formed plan?" — so a lane
+    # that produced no artifact is still the SE-3 failure the gate exists for.
+    assert _plan_gate(monkeypatch, tmp_path, text)(object()) is False
+
+
+def test_no_declared_artifact_keeps_the_reply_gate_and_prose_nodes_ungated(monkeypatch):
+    monkeypatch.delenv("MO_PLAN_ARTIFACT", raising=False)
+    assert L._shape_predicate_for("planner") is L._NODE_SHAPE_PREDICATES["planner"]
+    assert L._shape_predicate_for("reviewer") is None
+
+
+def test_shape_check_kill_switch_still_wins_over_a_declared_artifact(monkeypatch, tmp_path):
+    monkeypatch.setenv("MO_PLAN_ARTIFACT", str(tmp_path / "plan.json"))
+    monkeypatch.setenv("MO_SHAPE_CHECK", "0")
+    assert L._shape_predicate_for("planner") is None
+
+
 # ── dispatch_with_fallback + accept predicate ──
 
 def test_wrong_shape_first_lane_falls_back_to_good_shape(monkeypatch):

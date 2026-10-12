@@ -505,3 +505,140 @@ def test_dry_run_stub_still_rejected():
     # an empty shell: no objective, no steps
     empty = {**_VALID, "objective": "", "decomposition": []}
     assert plan.validate_plan(json.dumps(empty)) == "placeholder_plan"
+
+
+def test_declared_plan_name_reads_the_artifact_contract(tmp_path):
+    """The contract is the only place a recipe's plan name is written down
+    before the run happens (epic-runner: ``epic-runner-plan.json``)."""
+    bare = tmp_path / "no-contract"
+    bare.mkdir()
+    assert plan._declared_plan_name(str(bare)) == ""
+    recipe = tmp_path / "epic-runner"
+    recipe.mkdir()
+    (recipe / "artifact_contract.yaml").write_text(
+        "source_artifact: \"${MINI_ORK_RUN_DIR}/epic-runner-delivery.json\"\n"
+        "required_artifacts:\n"
+        "  - \"${MINI_ORK_RUN_DIR}/epic-runner-delivery.json\"\n"
+        "  - \"${MINI_ORK_RUN_DIR}/epic-runner-plan.json\"\n")
+    assert plan._declared_plan_name(str(recipe)) == "epic-runner-plan.json"
+
+
+def test_plan_artifact_records_first_only_as_a_last_resort(tmp_path):
+    """A ``state.db`` carried over from another checkout keeps absolute
+    ``plan_path`` values pointing at that home, so a run-local file wins."""
+    run_dir = tmp_path / "runs" / "run-1"
+    run_dir.mkdir(parents=True)
+    elsewhere = tmp_path / "other" / "plan.json"
+    elsewhere.parent.mkdir()
+    elsewhere.write_text("{}")
+    assert plan.plan_artifact(run_dir, str(elsewhere)) == elsewhere
+    local = run_dir / "sweep-plan.json"
+    local.write_text("{}")
+    assert plan.plan_artifact(run_dir, str(elsewhere)) == local
+
+
+# ── a recipe whose planner writes a run-dir FILE, not a reply ──
+
+
+def _plan_recipe(tmp_path, home, name="epic-runner", contract=None):
+    """A recipe dir under the home with a plan-artifact contract, the way
+    epic-runner's is written before any run happens."""
+    rdir = Path(home) / "recipes" / name
+    rdir.mkdir(parents=True)
+    (rdir / "artifact_contract.yaml").write_text(contract if contract is not None else (
+        "required_artifacts:\n"
+        "  - \"${MINI_ORK_RUN_DIR}/" + name + "-delivery.json\"\n"
+        "  - \"${MINI_ORK_RUN_DIR}/" + name + "-plan.json\"\n"))
+    return rdir
+
+
+_EPIC_PLAN = {"objective": "Ship the epic", "epics": ["wit-2-documents"],
+              "waves": [["e1"]]}
+
+
+def test_declared_plan_artifact_is_adopted_without_the_llm(tmp_path):
+    """A revived run re-enters the planner with its plan already in the run dir.
+    Re-planning it would spend a full-length call to reproduce a file that is
+    sitting right there — so the stage adopts it and never dispatches."""
+    home, db = _home(tmp_path, "adopt")
+    _plan_recipe(tmp_path, home)
+    (tmp_path / "epic-runner-plan.json").write_text(json.dumps(_EPIC_PLAN))
+    k, out = _kick(tmp_path), str(tmp_path / "adopt.out.json")
+
+    def exploding_dispatch(*_a, **_k):
+        raise AssertionError("the planner LLM must not run when the artifact is on disk")
+
+    rc = _run_py_dispatch(home, db, k, out, exploding_dispatch,
+                          extra={"MINI_ORK_RECIPE": "epic-runner"})
+    assert rc == 0
+    assert "Ship the epic" in Path(out).read_text()
+
+
+def test_a_lane_that_writes_the_plan_file_survives_a_shape_reject(tmp_path):
+    """rc=65 means the *reply* was not JSON. epic-runner's planner prompt says
+    "write the plan file and nothing else", so its reply is prose by design and
+    the gate rejects a planner that did its job (run-1791788217-61320: 47
+    minutes, a schema-valid plan on disk, run failed the same minute)."""
+    home, db = _home(tmp_path, "shapereject")
+    _plan_recipe(tmp_path, home)
+    k, out = _kick(tmp_path), str(tmp_path / "rej.out.json")
+
+    def prose_reply_then_write(_task_class, _node_type, _prompt):
+        (tmp_path / "epic-runner-plan.json").write_text(json.dumps(_EPIC_PLAN))
+        return 65, "I have written the plan to the run directory."
+
+    rc = _run_py_dispatch(home, db, k, out, prose_reply_then_write,
+                          extra={"MINI_ORK_RECIPE": "epic-runner"})
+    assert rc == 0
+    assert "Ship the epic" in Path(out).read_text()
+
+
+def test_a_recipe_with_no_declared_plan_still_fails_on_a_shape_reject(tmp_path):
+    """The adoption must not become a blanket amnesty for a failed planner: a
+    recipe that declares no plan artifact has nowhere to look, so rc=65 still
+    ends the run."""
+    home, db = _home(tmp_path, "nodeclared")
+    k, out = _kick(tmp_path), str(tmp_path / "nd.out.json")
+    rc = _run_py_dispatch(home, db, k, out,
+                          lambda *_a: (65, "sorry, no JSON here"),
+                          extra={"MINI_ORK_RECIPE": "no-such-recipe-xyz"})
+    assert rc == 1
+    assert not Path(out).exists()
+
+
+def test_declared_plan_artifact_predicts_the_path_before_the_file_exists(tmp_path):
+    """The dispatch boundary installs its gate *before* the lane runs, so the
+    artifact must be namable while absent — which is why this is not
+    ``plan_artifact`` (that one requires the file to be present)."""
+    home, db = _home(tmp_path, "predict")
+    _plan_recipe(tmp_path, home)
+    run_dir = tmp_path / "runs" / "run-predict"
+    run_dir.mkdir(parents=True)
+
+    predicted = plan._declared_plan_artifact(str(REPO), "epic-runner", str(run_dir))
+    assert predicted == str(run_dir / "epic-runner-plan.json")
+    assert not Path(predicted).exists()
+
+    # A recipe that declares no plan artifact predicts nothing — the gate then
+    # stays on the reply, as before.
+    assert plan._declared_plan_artifact(str(REPO), "no-such-recipe-xyz", str(run_dir)) == ""
+    assert plan._declared_plan_artifact(str(REPO), "", str(run_dir)) == ""
+
+
+def test_read_declared_plan_judges_the_file_the_way_the_gate_does(tmp_path):
+    """Adoption must agree with the gate: if the boundary accepted this file as
+    the planner's output, the stage that follows cannot then refuse it."""
+    good = tmp_path / "good.json"
+    good.write_text(json.dumps(_EPIC_PLAN))
+    assert plan._read_declared_plan(str(good)) != ""
+    # the gate's tolerance survives the round trip
+    fenced = tmp_path / "fenced.json"
+    fenced.write_text("```json\n" + json.dumps(_EPIC_PLAN) + "\n```")
+    assert plan._read_declared_plan(str(fenced)) != ""
+    # absent, empty and prose are all the same answer
+    assert plan._read_declared_plan(str(tmp_path / "absent.json")) == ""
+    empty = tmp_path / "empty.json"; empty.write_text("  ")
+    assert plan._read_declared_plan(str(empty)) == ""
+    prose = tmp_path / "prose.json"; prose.write_text("I wrote the plan somewhere else.")
+    assert plan._read_declared_plan(str(prose)) == ""
+    assert plan._read_declared_plan("") == ""

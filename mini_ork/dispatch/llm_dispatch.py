@@ -26,7 +26,11 @@ import time
 from collections.abc import Callable
 
 from mini_ork.context import context_env
-from mini_ork.dispatch.predicates import SHAPE_REJECT_RC, looks_like_json
+from mini_ork.dispatch.predicates import (
+    SHAPE_REJECT_RC,
+    looks_like_json,
+    looks_like_json_text,
+)
 
 
 def _accepts_kwarg(fn, name: str) -> bool:
@@ -617,10 +621,49 @@ _NODE_SHAPE_PREDICATES: dict[str, Callable[[object], bool]] = {
 }
 
 
+def _plan_artifact_predicate(path: str) -> Callable[[object], bool]:
+    """Shape gate for a planner whose plan is a run-dir FILE, not its reply.
+
+    ``cli/plan.py`` publishes ``MO_PLAN_ARTIFACT`` when the recipe's
+    ``artifact_contract.yaml`` requires a plan artifact under
+    ``${MINI_ORK_RUN_DIR}`` — today only ``recipes/epic-runner``, whose
+    ``epic-runner-plan.json`` is read by the dispatcher, the aggregator, the
+    verifier and three prompts, and whose prompt ends "Write the plan file and
+    nothing else". Nothing anywhere reads that lane's reply.
+
+    An agentic lane serving such a contract does the work with a tool and
+    answers with a summary line, so the reply-text predicate rejects a planner
+    that did its job. That is exactly what killed run-1791788217-61320: 4 lanes,
+    13 dispatches, 47 minutes, and a schema-valid plan sitting in the run dir
+    the whole time — the run was failed at 09:43:23, the same minute the file was
+    written.
+
+    The post-condition is unchanged — "is there a well-formed plan?" — read from
+    the surface that carries it. The structural check is literally the same one
+    (``looks_like_json_text``), so the two surfaces cannot disagree about what a
+    plan looks like. A missing or unparseable file is the SE-3 failure the gate
+    exists to catch, so it still returns False there.
+    """
+    def check(_result: object) -> bool:
+        try:
+            text = open(path, encoding="utf-8", errors="ignore").read()
+        except OSError:
+            return False
+        return looks_like_json_text(text)
+    return check
+
+
 def _shape_predicate_for(node_type: str) -> Callable[[object], bool] | None:
     if os.environ.get("MO_SHAPE_CHECK", "1") == "0":
         return None
-    return _NODE_SHAPE_PREDICATES.get(node_type)
+    predicate = _NODE_SHAPE_PREDICATES.get(node_type)
+    if predicate is None:
+        return None
+    if node_type == "planner":
+        artifact = os.environ.get("MO_PLAN_ARTIFACT", "").strip()
+        if artifact:
+            return _plan_artifact_predicate(artifact)
+    return predicate
 
 
 def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:

@@ -1852,3 +1852,98 @@ def test_execute_gate_bypasses_override_dryrun_and_zero_question(tmp_path):
     assert _gate(blocking, False, "0") is False   # operator override
     assert _gate(blocking, True, "1") is False    # dry-run skip
     assert _gate(zero_q, False, "1") is False     # needs_answers + 0 questions = not a real block
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Revise-loop reviewer evidence: panel-gate conventions + overwrite recovery.
+# run-1791760519-72158 D1 (p1-2): tier4_synth wrote panel-verdict.json with
+# verdict+reasons+dod_probe_results, rubric-prescreen overwrote it with its
+# scoring shape, review-verdict.json carried only the bare word — the revise
+# round then had nothing actionable ("the change needs a revision").
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_reviewer_evidence_candidates_prefer_classic_then_envelope(tmp_path):
+    (tmp_path / "review-tier4_synth.json").write_text("{}")
+    (tmp_path / "review-verdict.json").write_text("{}")
+    got = ex._reviewer_evidence_candidates(str(tmp_path), "tier4_synth")
+    assert [os.path.basename(p) for p in got] == [
+        "review-tier4_synth.json", "review-verdict.json"]
+
+
+def test_reviewer_evidence_candidates_recover_overwritten_panel(tmp_path):
+    (tmp_path / "panel-verdict.json").write_text('{"panel_score": 75.0}')
+    (tmp_path / "panel-verdict.json.stdout.md").write_text("```json\n{}\n```")
+    got = ex._reviewer_evidence_candidates(str(tmp_path), "tier4_synth")
+    # stdout.md ranks ABOVE the overwritten file: the agent's own object is there.
+    assert [os.path.basename(p) for p in got] == [
+        "panel-verdict.json.stdout.md", "panel-verdict.json"]
+
+
+def test_load_review_json_tolerates_fenced_echo(tmp_path):
+    p = tmp_path / "cap.md"
+    p.write_text('Panel verdict saved. Echoing:\n\n```json\n{"verdict": "ESCALATE"}\n```\n')
+    obj, _body = ex._load_review_json(str(p))
+    assert obj == {"verdict": "ESCALATE"}
+
+
+def test_revise_failure_section_surfaces_failed_panel_probes(tmp_path):
+    (tmp_path / "panel-verdict.json.stdout.md").write_text(
+        "```json\n" + json.dumps({
+            "verdict": "ESCALATE",
+            "reasons": ["P2 contradiction"],
+            "dod_probe_results": [
+                {"id": "P1", "panel_consensus": "pass"},
+                {"id": "P2", "panel_consensus": "fail", "lenses_fail": ["glm"]},
+            ],
+        }) + "\n```")
+    section = ex._revise_failure_section(
+        str(tmp_path), ("tier4_synth", "reviewer"), "verdict_fail")
+    assert "review evidence: panel-verdict.json.stdout.md" in section
+    assert "verdict: ESCALATE" in section
+    assert "reasons:" in section
+    assert "failed probe P2" in section
+    assert "failed probe P1" not in section
+
+
+def test_revise_failure_section_keeps_classic_notes_shape(tmp_path):
+    (tmp_path / "review-rev1.json").write_text(
+        json.dumps({"verdict": "needs_revision", "notes": ["n1", "n2"]}))
+    section = ex._revise_failure_section(
+        str(tmp_path), ("rev1", "reviewer"), "verdict_revise")
+    assert "review evidence: review-rev1.json" in section
+    assert "verdict: needs_revision" in section
+    assert "- n1" in section and "- n2" in section
+
+
+def test_revise_failure_section_no_evidence_is_explicit(tmp_path):
+    section = ex._revise_failure_section(
+        str(tmp_path), ("tier4_synth", "reviewer"), "verdict_fail")
+    assert "(no reviewer evidence produced)" in section
+
+
+def test_node_revise_artifacts_reviewer_lists_all_conventions(tmp_path):
+    names = [os.path.basename(a) for a in
+             ex._node_revise_artifacts(str(tmp_path), ("tier4_synth", "reviewer"))]
+    assert names == ["review-tier4_synth.json", "review-verdict.json",
+                     "panel-verdict.json.stdout.md", "panel-verdict.json"]
+
+
+def test_review_verdict_envelope_merges_blocker_evidence(tmp_path):
+    rf = tmp_path / "panel-verdict.json"
+    rf.write_text(json.dumps({
+        "verdict": "ESCALATE",
+        "reasons": ["r1"],
+        "dod_probe_results": [{"id": "P1", "panel_consensus": "fail"}],
+        "panel_score": 75.0,
+    }))
+    env = exh._review_verdict_envelope(str(rf), "ESCALATE")
+    assert env["verdict"] == "ESCALATE"
+    assert env["reasons"] == ["r1"]
+    assert "dod_probe_results" in env
+    assert "panel_score" not in env   # a score is not blocker evidence
+
+
+def test_review_verdict_envelope_prose_degrades_to_verdict_only(tmp_path):
+    rf = tmp_path / "review-x.json"
+    rf.write_text("looks good overall")
+    assert exh._review_verdict_envelope(str(rf), "pass") == {"verdict": "pass"}

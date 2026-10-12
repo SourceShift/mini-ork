@@ -83,3 +83,71 @@ def test_recovery_filter_bad_budget(capsys, monkeypatch):
                                       repair_budget="abc", workflow="")
     assert rc == 2
     assert "must be a positive number" in capsys.readouterr().err
+
+
+def _plan_db(tmp_path):
+    import sqlite3
+
+    db = str(tmp_path / "state.db")
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE task_runs (id TEXT PRIMARY KEY, plan_path TEXT, updated_at INTEGER)")
+    con.execute("INSERT INTO task_runs VALUES ('run-1', '', 0)")
+    con.commit()
+    con.close()
+    return db
+
+
+def test_record_plan_artifact_stamps_an_empty_plan_path(tmp_path):
+    """A recipe that plans inside its DAG (epic-runner) left ``plan_path`` null,
+    so every reader keyed on the column reported "no plan" for a run whose plan
+    was on disk the whole time."""
+    import sqlite3
+
+    run_dir = tmp_path / "runs" / "run-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "epic-runner-plan.json").write_text('{"objective": "o"}')
+    db = _plan_db(tmp_path)
+
+    ex._record_plan_artifact(db, "run-1", str(run_dir))
+
+    con = sqlite3.connect(db)
+    row = con.execute("SELECT plan_path FROM task_runs WHERE id='run-1'").fetchone()
+    con.close()
+    assert row[0] == str(run_dir / "epic-runner-plan.json")
+
+
+def test_record_plan_artifact_never_overwrites_a_recorded_plan(tmp_path):
+    """``mini-ork plan`` recorded the plan the DAG was built from; a later scan
+    by name must not replace it."""
+    import sqlite3
+
+    run_dir = tmp_path / "runs" / "run-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "plan.json").write_text("{}")
+    db = _plan_db(tmp_path)
+    con = sqlite3.connect(db)
+    con.execute("UPDATE task_runs SET plan_path='/elsewhere/plan.json' WHERE id='run-1'")
+    con.commit()
+    con.close()
+
+    ex._record_plan_artifact(db, "run-1", str(run_dir))
+
+    con = sqlite3.connect(db)
+    row = con.execute("SELECT plan_path FROM task_runs WHERE id='run-1'").fetchone()
+    con.close()
+    assert row[0] == "/elsewhere/plan.json"
+
+
+def test_record_plan_artifact_is_quiet_when_no_plan_exists(tmp_path):
+    import sqlite3
+
+    run_dir = tmp_path / "runs" / "run-1"
+    run_dir.mkdir(parents=True)
+    db = _plan_db(tmp_path)
+
+    ex._record_plan_artifact(db, "run-1", str(run_dir))
+
+    con = sqlite3.connect(db)
+    row = con.execute("SELECT plan_path FROM task_runs WHERE id='run-1'").fetchone()
+    con.close()
+    assert row[0] == ""

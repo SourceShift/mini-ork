@@ -88,7 +88,16 @@ from mini_ork.runtime.run_roots import (  # noqa: F401
 )
 from mini_ork.runtime.contract import run_check  # noqa: F401 -- routing helper
 from mini_ork.execute_compat import normalize_implementer_summary, write_json_atomic
+from mini_ork.recovery.condition import evaluate_condition
+from mini_ork.recovery.dag import CompiledRetryEdge
 from mini_ork.verify import levels as _levels
+
+# Sentinel finish_reason set when a `retries` edge fires from its `condition:`
+# predicate (rather than from a non-zero exit). The value is opaque to the
+# executor; ``_revise_failure_section`` only branches on it to pick the
+# compact-JSON-dump fallback (C4 of p1-1-condition-edges). The rc channel stays
+# authoritative; the predicate only ever fires when ``rc == 0``.
+CONDITION_FIRED_FINISH_REASON = "condition_fired"
 
 _SEP = "\x1f"
 _NODE_TYPE_ORDER = ("planner", "researcher", "transform", "implementer", "reviewer", "verifier",
@@ -846,13 +855,22 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     dispatch_mode = _resolve_dispatch_mode(args.dispatch_mode_override, workflow)
     fields_list = [tuple((e.split(_SEP) + [""] * 8)[:8]) for e in node_ids]
     control_parents: dict[str, tuple[str, ...]] = {}
-    retry_edges: dict[str, tuple[str, int]] = {}
+    # ``CompiledRetryEdge`` is backward-compatible with the legacy
+    # ``(target, max_rounds)`` tuple shape (see recovery/dag.py). When the
+    # ``condition:`` clause is absent the instance iterates as a 2-tuple so
+    # the existing ``for source, (target, max_rounds) in retry_edges.items():``
+    # pattern keeps working.
+    retry_edges: dict[str, CompiledRetryEdge] = {}
+    escalation_edges: dict[str, CompiledRetryEdge] = {}
+    recursive_children: dict[str, tuple[str, ...]] = {}
     if workflow and os.path.isfile(workflow):
         from mini_ork.workflow import compile_workflow
 
         compiled = compile_workflow(workflow)
         control_parents = compiled.control_parents
         retry_edges = compiled.retry_edges
+        escalation_edges = compiled.escalation_edges
+        recursive_children = compiled.recursive_children
 
         # A recipe that declares a `recursion:` block owns its own loop caps.
         # Publish them so the driver honors the declaration instead of its own
@@ -869,6 +887,14 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 "MO_RECURSION_BUDGET_CAP_TOTAL_USD": f"{recursion.budget_cap_total_usd:.2f}",
                 "MO_RECURSION_DIVERGENCE_KILL": recursion.divergence_kill,
             })
+
+    # One repair map for the round loop: a `retries` edge and an escalated
+    # `escalates_to` edge mean the same thing to it -- send the findings back to
+    # `target` and re-run from there. They stay separate maps on the compiled
+    # workflow because they need different caps and target rules; here they
+    # converge so every consumer downstream (the round loop, the orchestrator's
+    # `has_retries_edge` signal) sees one view.
+    repair_edges: dict[str, CompiledRetryEdge] = {**retry_edges, **escalation_edges}
 
     fail_count = 0
     abstain_count = 0
@@ -1008,7 +1034,16 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         round_used: dict[str, int] = {}
 
         def _control_descendants(target: str) -> set[str]:
-            """``target`` plus every node reachable from it through control parents."""
+            """``target`` plus everything a re-run of it must redo.
+
+            Control parents carry the forward graph. ``recursive_children``
+            carries the recipe's loop back-edge (``replanner -> implementer``),
+            which is excluded from control parents on purpose -- counting it
+            forward would leave the implementer waiting on a replanner that
+            only ever runs *after* it. Here the walk is backwards from a repair
+            entry point, so following it is exactly right: it is what carries a
+            reset past the escalation target into the loop body.
+            """
             descendants = {target}
             frontier = [target]
             while frontier:
@@ -1016,7 +1051,8 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 for node_id, field in fields_by_id.items():
                     if node_id in descendants:
                         continue
-                    if current in control_parents.get(node_id, ()):
+                    if current in control_parents.get(node_id, ()) \
+                            or node_id in recursive_children.get(current, ()):
                         descendants.add(node_id)
                         frontier.append(node_id)
             return descendants
@@ -1106,12 +1142,13 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                     statuses[field[0]] = "failed"
                     fail_count += 1
 
-            # ── per-run orchestrator (MO_RUN_ORCHESTRATOR=1; default off) ──
+            # ── per-run orchestrator (default on; MO_RUN_ORCHESTRATOR=0 opts out) ──
             # Observe each node outcome at the wave boundary and pick one of
             # advance/help/repair/mutate/promote (see
-            # mini_ork/orchestration/runner_orchestrator.py). With the flag unset
-            # this block is inert: nothing is imported and nothing is called, so
-            # the default path is byte-identical to before.
+            # mini_ork/orchestration/runner_orchestrator.py). With the flag
+            # explicitly disabled this block is inert: nothing is imported and
+            # nothing is called. Green nodes are skipped outright, so the
+            # no-fail path pays one ledger read per wave.
             #
             # Wired only on this dependency-graph path. The other ``_parallel``
             # call sites below (parallel / partitioned / serial dispatch) stay
@@ -1121,7 +1158,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
             except Exception:
                 _orch_enabled = lambda: False  # noqa: E731
             if _orch_enabled():
-                _orchestrator_act(live_run_dir, db, run_id, outcomes, retry_edges,
+                _orchestrator_act(live_run_dir, db, run_id, outcomes, repair_edges,
                                   revision_state=locals())
 
             # ── revise loop (retries edges) ────────────────────────────────
@@ -1129,9 +1166,21 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
             # back to the edge's target (normally the implementer) instead of
             # blocking its descendants. Group the failures by target so several
             # gates failing in one wave produce ONE combined revise round.
+            #
+            # Two firing sources feed this loop:
+            #   1. The rc channel (F11 of p1-1-condition-edges): ``rc != 0`` on
+            #      a node with a ``retries`` edge. This is the historical path
+            #      and is unchanged by the new feature.
+            #   2. The condition channel (F5/F6): ``rc == 0`` AND the node's
+            #      retries edge declares a ``condition:`` clause whose predicate
+            #      fires on the node's output artifact. The rc channel stays
+            #      authoritative; a missing/non-JSON artifact or a bad pointer
+            #      suppresses the fire (F2/F3) and the round simply doesn't
+            #      happen. Condition-fired rounds share the same
+            #      ``MO_REVISE_ROUNDS`` + per-edge ``max_rounds`` caps (F6).
             revise_groups: dict[str, list[tuple[tuple, int, str]]] = {}
             for field, rc, finish_reason in outcomes:
-                if rc == 0 or rc == _levels.ABSTAIN_RC or field[0] not in retry_edges:
+                if rc == 0 or rc == _levels.ABSTAIN_RC or field[0] not in repair_edges:
                     # An abstention sends nothing back: the findings would be
                     # about a tool that never ran, and re-running the implementer
                     # is the "reflect on the code and replan" the audit forbids.
@@ -1142,7 +1191,8 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                     print(f"[revise] skipped for {field[0]}: reviewer verdict unparseable "
                           "— no findings to send back", file=sys.stderr)
                     continue
-                target, max_rounds = retry_edges[field[0]]
+                edge = repair_edges[field[0]]
+                target, max_rounds = edge.target, edge.max_rounds
                 cap = min(max_rounds, revise_rounds_cap)
                 if round_used.get(target, 0) >= cap:
                     continue
@@ -1157,14 +1207,82 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                           "is outside this run's node closure", file=sys.stderr)
                     continue
                 revise_groups.setdefault(target, []).append((field, rc, finish_reason))
+            # Second pass: condition-fired rounds (rc==0 + condition predicate
+            # fired on the node's output artifact). The rc-fired loop above
+            # stays unchanged; this is a parallel channel that lands sources
+            # in the same ``revise_groups`` map so the round-merge logic is
+            # shared (a wave that produces both an rc-failed node and a
+            # condition-fired verifier fires ONE combined round).
+            for field, rc, finish_reason in outcomes:
+                if rc != 0 or field[0] not in repair_edges:
+                    continue
+                edge = repair_edges[field[0]]
+                # No condition declared on this edge — nothing to evaluate.
+                # The legacy 2-tuple contract keeps this branch implicit
+                # (CompiledRetryEdge.condition is None for the legacy shape).
+                if edge.condition is None:
+                    continue
+                artifact_text = _condition_artifact_text(live_run_dir, field)
+                outcome = evaluate_condition(edge.condition, artifact_text)
+                if outcome.warning:
+                    # F2/F3: surface the diagnostic so the operator can see
+                    # why a predicate did or did not fire. The warning is
+                    # always printed regardless of ``fired`` — a fired
+                    # predicate with a warning is the negated-missing-key
+                    # case and is informational, not an error.
+                    print(
+                        f"[revise] {field[0]} condition: {outcome.warning}",
+                        file=sys.stderr,
+                    )
+                if not outcome.fired:
+                    continue
+                target = edge.target
+                cap = min(edge.max_rounds, revise_rounds_cap)
+                if round_used.get(target, 0) >= cap:
+                    # Round cap applies symmetrically to condition-fired and
+                    # rc-fired rounds (F6). The cap was already checked for
+                    # any rc-fired sources in the same wave — same target,
+                    # same cap.
+                    print(
+                        f"[revise] {field[0]} condition fired but cap "
+                        f"{cap} reached; not re-running {target}",
+                        file=sys.stderr,
+                    )
+                    continue
+                if target not in fields_by_id:
+                    # Same "target outside closure" guard as the rc path. A
+                    # condition-fired round that has nowhere to land cannot
+                    # be sent back; surface the diagnostic and let the node
+                    # stand as a pass.
+                    print(f"[revise] skipped for {field[0]}: revise target "
+                          f"'{target}' is outside this run's node closure",
+                          file=sys.stderr)
+                    continue
+                # Mark the source with a sentinel finish_reason so the
+                # feedback section can pick the compact-JSON-dump fallback
+                # (C4 of p1-1-condition-edges) when none of the standard
+                # reason keys are populated. The rc stays 0 — only the
+                # marker changes.
+                revise_groups.setdefault(target, []).append(
+                    (field, rc, CONDITION_FIRED_FINISH_REASON))
             if revise_groups:
                 for target, failed_sources in revise_groups.items():
-                    _target_max = retry_edges[failed_sources[0][0][0]][1]
+                    _target_edge = repair_edges[failed_sources[0][0][0]]
+                    _target_max = _target_edge.max_rounds
                     round_no = round_used.get(target, 0) + 1
                     round_used[target] = round_no
                     reset_ids = _control_descendants(target)
                     feedback_path = _write_revise_feedback(
                         live_run_dir, round_no, _target_max, failed_sources)
+                    # C4 of p1-1-condition-edges: a condition-fired round
+                    # with empty feedback is forbidden (issue-#13 bug class).
+                    # An implementer re-running with no findings will guess
+                    # and waste the round; fail closed before the next wave.
+                    for _src_field, _src_rc, _src_fr in failed_sources:
+                        if _src_fr != CONDITION_FIRED_FINISH_REASON:
+                            continue
+                        _check_condition_feedback_nonempty(
+                            live_run_dir, _src_field, feedback_path)
                     _archive_revise_round(
                         live_run_dir, round_no,
                         [fields_by_id[node_id] for node_id in reset_ids
@@ -1254,6 +1372,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         elif rollback_fields:
             print("  [skip] rollback — no failures (escalates_to edge not triggered)")
         _emit_run_verdict(live_run_dir, fail_count, len(fields_list), task_class=task_class)
+        _record_plan_artifact(db, run_id, live_run_dir)
         _post_run_learning(db, live_run_dir, run_id, task_class, fail_count=fail_count)
         if fail_count > 0:
             set_status(db, run_id, "failed")
@@ -1603,6 +1722,50 @@ def _extract_verdict(root, review_file) -> str:
 
 
 VERIFIER_PRODUCED_ARTIFACTS = frozenset({"verdict.json"})
+
+
+def _record_plan_artifact(db, run_id: str, run_dir: str) -> None:
+    """Stamp ``task_runs.plan_path`` with the plan the run actually produced.
+
+    ``plan_path`` was only ever written by ``mini-ork plan`` — the generic plan
+    runtime. A recipe that plans *inside* its DAG leaves it empty: epic-runner's
+    planner is an LLM node that writes ``epic-runner-plan.json`` mid-run, so the
+    column stayed null and every reader keyed on it (or on a literal
+    ``plan.json``) reported "no plan" for a run whose plan was sitting in the run
+    directory. Called after the DAG, i.e. after that write can have happened.
+
+    Best-effort by design: the plan is already on disk, and a DB hiccup here
+    must never turn a green run red. An existing non-empty ``plan_path`` is
+    never overwritten — ``mini-ork plan`` recorded the plan the DAG was built
+    from, which outranks anything found by name afterwards.
+    """
+    if not db or not run_id or not run_dir:
+        return
+    try:
+        # Imported lazily: the resolver lives beside the plan runtime so the
+        # writer and the run-page readers share one definition.
+        from mini_ork.cli.plan import plan_artifact
+
+        path = plan_artifact(run_dir)
+    except Exception as exc:  # noqa: BLE001 — recording is best-effort
+        sys.stderr.write(f"[warn] plan artifact resolution failed: {exc}\n")
+        return
+    if path is None:
+        return
+    try:
+        con = sqlite3.connect(db, timeout=15.0)
+        try:
+            con.execute("PRAGMA busy_timeout = 15000")
+            con.execute(
+                "UPDATE task_runs SET plan_path = ?, updated_at = ? "
+                "WHERE id = ? AND (plan_path IS NULL OR plan_path = '')",
+                (str(path), int(time.time()), run_id),
+            )
+            con.commit()
+        finally:
+            con.close()
+    except Exception as exc:  # noqa: BLE001 — recording is best-effort
+        sys.stderr.write(f"[warn] could not record plan_path for {run_id}: {exc}\n")
 
 
 def _required_artifacts_ok(plan_path, *, skip_verifier_outputs=False) -> bool:
@@ -3405,6 +3568,93 @@ def _verifier_stem(field) -> str:
     return stem
 
 
+def _condition_artifact_text(run_dir: str, field) -> str | None:
+    """Read the artifact body the condition predicate should evaluate against.
+
+    For a verifier node this is the same ``verifier_<stem>.json`` the
+    publisher consumes (per F4 of p1-1-condition-edges: "the same
+    evidence-json machinery ``_verifier_stem`` uses"). For other node types
+    we return ``None`` for now — extending the surface is a separate
+    feature; the spec asks the operator to author conditions against the
+    verifier evidence path, which is the only artifact every gate-shaped
+    node produces.
+
+    Returns the file body as a string (NOT a parsed dict) so the predicate
+    can distinguish a parse failure from a schema mismatch when it runs
+    ``evaluate_condition``. ``None`` means "no artifact at this path";
+    the predicate treats that as a missing artifact (F2: warn, do not fire).
+    """
+    node_type = field[1] if len(field) > 1 else ""
+    if node_type == "verifier":
+        stem = _verifier_stem(field)
+        evidence = os.path.join(run_dir, f"verifier_{stem}.json")
+        if os.path.isfile(evidence):
+            try:
+                with open(evidence, encoding="utf-8") as fh:
+                    return fh.read()
+            except OSError:
+                return None
+    return None
+
+
+def _check_condition_feedback_nonempty(
+    run_dir: str, field, feedback_path: str
+) -> None:
+    """C4 of p1-1-condition-edges: a condition-fired round with empty
+    feedback is forbidden (issue-#13 bug class).
+
+    An implementer re-running with no findings will guess and waste the
+    round. The condition-fired path already prefers the standard reason
+    keys (``error_summary``, ``reasons``, ``failed_checks``, ``verdict``)
+    and falls back to a compact JSON dump of the artifact; the only way
+    feedback can be empty is if every standard key was empty AND the
+    artifact itself is empty / no artifact was written. Surface that
+    as a hard error so the operator can fix the verifier rather than
+    re-running blind.
+    """
+    node_id = field[0]
+    node_type = field[1] if len(field) > 1 else ""
+    if node_type != "verifier":
+        return
+    stem = _verifier_stem(field)
+    evidence = os.path.join(run_dir, f"verifier_{stem}.json")
+    body = ""
+    if os.path.isfile(evidence):
+        try:
+            with open(evidence, encoding="utf-8", errors="replace") as fh:
+                body = fh.read()
+        except OSError:
+            body = ""
+    if not body:
+        raise RuntimeError(
+            f"condition-fired round for {node_id} produced empty feedback "
+            f"(C4): verifier_{stem}.json is missing or empty; the predicate "
+            f"fired but the implementer would re-run blind. Fix the verifier "
+            f"to populate reasons/error_summary/failed_checks/verdict, or "
+            f"drop the condition: clause from the edge."
+        )
+    # The compact-JSON-dump fallback in ``_revise_failure_section`` is the
+    # last line of defence: the artifact text is present but no standard
+    # key was populated. C4 forbids the round firing with truly empty
+    # feedback; the compact dump ensures the section is at least the
+    # artifact body. This check is satisfied as long as the artifact
+    # body is non-empty.
+    if os.path.isfile(feedback_path):
+        try:
+            with open(feedback_path, encoding="utf-8", errors="replace") as fh:
+                content = fh.read()
+        except OSError:
+            content = ""
+        if node_id and content and f"## {node_id} (verifier)" not in content:
+            # The condition-fired source did not land a section. The writer
+            # in ``_write_revise_feedback`` always emits one per source, so
+            # the only way to land here is a logic error upstream.
+            raise RuntimeError(
+                f"condition-fired round for {node_id} missing a section in "
+                f"{feedback_path} (C4)"
+            )
+
+
 def _tail_lines(path: str, count: int) -> list[str]:
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
@@ -3463,6 +3713,54 @@ def _verifier_log_candidates(run_dir: str, stem: str) -> list[str]:
     return [p for p in out if os.path.isfile(p)]
 
 
+def _reviewer_evidence_candidates(run_dir: str, node_id: str) -> list[str]:
+    """Existing reviewer-evidence paths, in preference order.
+
+    A reviewer's file depends on its node class: the classic reviewer writes
+    ``review-<id>.json``; a panel gate (recursive-validate-impl/tier4_synth)
+    writes ``panel-verdict.json`` — which rubric-prescreen may later overwrite
+    with its scoring shape, the agent's own object surviving only in
+    ``panel-verdict.json.stdout.md`` (write_preserving_agent's capture). The
+    engine-written ``review-verdict.json`` envelope (verdict + merged reasons)
+    is the most stable of the four. Only paths that exist are returned."""
+    out = [os.path.join(run_dir, f"review-{node_id}.json"),
+           os.path.join(run_dir, "review-verdict.json"),
+           os.path.join(run_dir, "panel-verdict.json.stdout.md"),
+           os.path.join(run_dir, "panel-verdict.json")]
+    return [p for p in out if os.path.isfile(p)]
+
+
+def _load_review_json(path: str):
+    """(dict-or-None, raw-body) for a reviewer evidence file.
+
+    Tolerates the agent echo's ```json fences and surrounding prose (the
+    ``.stdout.md`` capture holds both): plain ``json.loads`` first, then the
+    first brace-balanced object via ``raw_decode`` scans. Mirrors
+    ``_parse_verifier_json``'s banner tolerance for the reviewer side."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            body = fh.read()
+    except OSError:
+        return None, ""
+    try:
+        obj = json.loads(body)
+        if isinstance(obj, dict):
+            return obj, body
+    except ValueError:
+        pass
+    decoder = json.JSONDecoder()
+    start = body.find("{")
+    while start != -1:
+        try:
+            obj, _end = decoder.raw_decode(body, start)
+            if isinstance(obj, dict):
+                return obj, body
+        except ValueError:
+            pass
+        start = body.find("{", start + 1)
+    return None, body
+
+
 def _revise_failure_section(run_dir: str, field, finish_reason: str) -> str:
     """One per-source section of a revise feedback file."""
     node_id, node_type = field[0], field[1]
@@ -3498,7 +3796,29 @@ def _revise_failure_section(run_dir: str, field, finish_reason: str) -> str:
         if summary:
             lines.append(f"error summary: {summary}")
         else:
-            lines.append("(no verifier evidence produced)")
+            # C4 of p1-1-condition-edges: a condition-fired round with empty
+            # feedback is forbidden. When the standard reason keys are all
+            # empty AND the round was condition-fired, fall back to a compact
+            # JSON dump of the artifact (capped at 4000 chars) so the
+            # implementer has SOMETHING to work with — the predicate said
+            # "fire" and the implementer needs to know why. The rc path keeps
+            # the historical "(no verifier evidence produced)" message; an
+            # rc-failed verifier with no reasons is the operator's
+            # responsibility, not a bug in this feature.
+            if finish_reason == CONDITION_FIRED_FINISH_REASON and body:
+                lines.append(
+                    "condition fired: artifact contains no reason keys "
+                    "(error_summary / reasons / failed_checks / verdict); "
+                    "falling back to compact artifact dump:"
+                )
+                try:
+                    compact_obj = json.loads(body)
+                    compact = json.dumps(compact_obj, separators=(",", ":"))
+                except Exception:
+                    compact = body
+                lines.append(compact[:4000])
+            else:
+                lines.append("(no verifier evidence produced)")
         # The verifier's OWN error lines — the substance a reviewer/implementer
         # needs. A round file carrying only the JSON verdict ("post-patch
         # failing; see log") makes the next attempt fix blind (issue #13), so
@@ -3520,20 +3840,20 @@ def _revise_failure_section(run_dir: str, field, finish_reason: str) -> str:
                     lines.extend(line.rstrip("\n") for line in tail)
                     break
     elif node_type == "reviewer":
-        review_file = os.path.join(run_dir, f"review-{node_id}.json")
-        body = ""
-        if os.path.isfile(review_file):
-            try:
-                with open(review_file, encoding="utf-8", errors="replace") as fh:
-                    body = fh.read()
-            except OSError:
-                body = ""
-        data = None
-        if body:
-            try:
-                data = json.loads(body)
-            except Exception:
-                data = None
+        # A reviewer's evidence file depends on its node class (see
+        # _reviewer_evidence_candidates); the first candidate that parses to a
+        # dict wins. A missing classic review-<id>.json used to leave the
+        # section empty, so a failed panel-gate run revised blind
+        # (run-1791760519-72158 D1: feedback was only "the change needs a
+        # revision" while panel-verdict.json held per-lens blockers).
+        data, body, source_name = None, "", ""
+        for candidate in _reviewer_evidence_candidates(run_dir, node_id):
+            data, body = _load_review_json(candidate)
+            if data is not None:
+                source_name = os.path.basename(candidate)
+                break
+        if source_name:
+            lines.append(f"review evidence: {source_name}")
         if isinstance(data, dict):
             lines.append(f"verdict: {data.get('verdict', 'unknown')}")
             notes = data.get("notes")
@@ -3545,8 +3865,19 @@ def _revise_failure_section(run_dir: str, field, finish_reason: str) -> str:
                     lines.append(f"notes: {notes}")
             elif data.get("reasons"):
                 lines.append(f"reasons: {json.dumps(data['reasons'])[:4000]}")
-        else:
+            # Panel-gate probes: the actionable unit is the FAILED probe, and
+            # a passing majority hides it in a long list — surface only the
+            # probes whose panel_consensus is not a pass, bounded.
+            probes = data.get("dod_probe_results")
+            if isinstance(probes, list):
+                for probe in probes:
+                    if isinstance(probe, dict) and probe.get("panel_consensus") != "pass":
+                        lines.append(f"failed probe {probe.get('id', '?')}: "
+                                     f"{json.dumps(probe)[:1500]}")
+        elif body:
             lines.append(f"(review file unparseable): {body[:4000]}")
+        else:
+            lines.append("(no reviewer evidence produced)")
     else:
         lines.append(f"finish reason: {finish_reason or 'failed'}")
     return "\n".join(lines)
@@ -3585,7 +3916,15 @@ def _node_revise_artifacts(run_dir: str, field) -> list[str]:
     if node_type == "verifier":
         return [os.path.join(run_dir, f"verifier_{_verifier_stem(field)}.json")]
     if node_type == "reviewer":
-        return [os.path.join(run_dir, f"review-{node_id}.json")]
+        # Same convention set as _reviewer_evidence_candidates: a panel-gate
+        # reviewer leaves panel-verdict.json (+ the .stdout.md capture) and
+        # the engine-written review-verdict.json envelope. Archiving them
+        # keeps the next round's section reading FRESH evidence, not the
+        # round that just failed. Missing files are skipped by the caller.
+        return [os.path.join(run_dir, f"review-{node_id}.json"),
+                os.path.join(run_dir, "review-verdict.json"),
+                os.path.join(run_dir, "panel-verdict.json.stdout.md"),
+                os.path.join(run_dir, "panel-verdict.json")]
     if node_type == "implementer":
         return [os.path.join(run_dir, f"impl-{node_id}.log")]
     return []
@@ -3640,7 +3979,7 @@ def _open_state_db(db_path):
 def _orchestrator_act(run_dir, db, run_id, outcomes, retry_edges, *, revision_state):
     """Realize one per-run-orchestrator action per failed node in this wave.
 
-    Called (only when ``MO_RUN_ORCHESTRATOR`` is on) once per dependency-graph
+    Called (unless ``MO_RUN_ORCHESTRATOR`` explicitly disables the layer) once per dependency-graph
     wave with that wave's ``outcomes`` — ``(field, rc, finish_reason)`` tuples.
     For each failed node it asks the pure decision core (``on_node_boundary``)
     for one Action and performs the side effect, reusing existing machinery:

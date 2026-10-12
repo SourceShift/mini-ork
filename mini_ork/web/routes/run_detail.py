@@ -146,9 +146,15 @@ def list_inputs(
         if tr.get("recipe")
         else None
     )
+    # ``plan_path`` is empty for a recipe whose planner writes its own artefact
+    # (epic-runner), so fall back to the run dir — otherwise the link is dropped
+    # while the plan sits on disk.
+    from mini_ork.ide_pages.run import plan_artifact
+
+    plan_path = plan_artifact(home / "runs" / task_run_id, str(tr.get("plan_path") or ""))
     candidates = [
         ("kickoff", "Kickoff", tr.get("kickoff_path"), "markdown"),
-        ("plan", "Plan", tr.get("plan_path"), "plan"),
+        ("plan", "Plan", str(plan_path) if plan_path else None, "plan"),
         ("workflow", f"Recipe workflow ({tr.get('recipe')})", workflow_path, "yaml"),
         ("run_profile", "Run profile", str(home / "runs" / task_run_id / "run_profile.json"), "json"),
         (

@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Any
 
 from mini_ork.ide_pages import spec as S
-from mini_ork.ide_pages.run import Node, Run
+from mini_ork.ide_pages.run import Node, Run, plan_artifact, plan_steps
 
 # ── caps (kickoff §1, §2 — fresh constants, do NOT reuse board_cmd._DIFF_LIMIT)
 
@@ -172,7 +172,7 @@ def _result_items(run: Run, node: Node) -> tuple[str, list[dict[str, Any]]]:
     """Project the node's result artefacts onto ``(title, items)``."""
     ntype = str(node.type or "")
     if ntype in ("planner", "decomposer"):
-        return _planner_items(run.run_dir)
+        return _planner_items(run)
     if _is_review_node(node):
         return _review_items(run, node)
     if ntype in ("verifier", "test", "typecheck", "static_check"):
@@ -200,21 +200,23 @@ def _planner_step_title(s: dict[str, Any], sid: str, stype: str) -> str:
     return desc or sid or stype
 
 
-def _planner_items(run_dir: Path) -> tuple[str, list[dict[str, Any]]]:
-    plan_path = run_dir / "plan.json"
-    if not plan_path.is_file():
-        return ("Planner plan", [S.dot("No plan.json recorded")])
+def _planner_items(run: Run) -> tuple[str, list[dict[str, Any]]]:
+    plan_path = plan_artifact(run.run_dir, str(run.row.get("plan_path") or ""))
+    if plan_path is None:
+        return ("Planner plan", [S.dot("No plan recorded")])
+    name = plan_path.name
     try:
         plan = json.loads(plan_path.read_text(encoding="utf-8", errors="replace"))
     except (OSError, json.JSONDecodeError):
-        return ("Planner plan", [S.bad("plan.json failed to parse")])
+        return ("Planner plan", [S.bad(f"{name} failed to parse")])
     if not isinstance(plan, dict):
-        return ("Planner plan", [S.dot("plan.json is not an object")])
+        return ("Planner plan", [S.dot(f"{name} is not an object")])
     items: list[dict[str, Any]] = []
     objective = str(plan.get("objective") or "").strip()
     if objective:
         items.append(S.item(objective, "objective"))
     steps = plan.get("steps") or plan.get("decomposition") or []
+    step_rows = 0
     if isinstance(steps, list):
         seen_titles: dict[str, int] = {}
         for s in steps:
@@ -232,8 +234,17 @@ def _planner_items(run_dir: Path) -> tuple[str, list[dict[str, Any]]]:
             if n > 1:
                 title = f"{title} ({n})"
             items.append(S.item(title, sub, m="☰", mc="blue"))
+            step_rows += 1
+    # Keyed on the STEP rows, not on ``items``: an epic-runner plan carries an
+    # objective too, and an objective-only pane would hide all eight epics. The
+    # objective itself is already the first row, so ``plan_steps`` returning it
+    # as the last-resort single row must not repeat it.
+    if not step_rows:
+        items.extend(S.item(title, note, m="☰", mc="blue")
+                     for _sid, title, note in plan_steps(plan)
+                     if title and title != objective)
     if not items:
-        items.append(S.dot("plan.json has no steps"))
+        items.append(S.dot(f"{name} has no steps"))
     return ("Planner plan", items)
 
 

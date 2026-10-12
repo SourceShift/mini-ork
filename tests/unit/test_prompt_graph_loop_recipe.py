@@ -57,7 +57,10 @@ def test_recipe_preserves_feedback_and_approved_summary_routes():
     assert reflection["recursive"] is True
     assert reflection["from_output"] == "refinement_prompt"
     assert feedback["recursive"] is True
-    assert feedback["condition"] == "revise"
+    assert feedback["condition"] == {
+        "pointer": "/status",
+        "match": {"const": "revision_requested"},
+    }
     assert feedback["from_output"] == "human_decision"
     assert finalization["edge_type"] == "human_decision_gate"
     assert finalization["condition"] == "approved"

@@ -216,6 +216,43 @@
         "outputs": {
           "type": ["array", "object"],
           "description": "Typed artifact output ports. Each output declares name, path, kind, and optional visibility."
+        },
+        "retry": {
+          "type": "object",
+          "description": "Per-node RetryPolicy for infra-level attempts (transient infrastructure failures only). Defaults mirror LangGraph's current RetryPolicy. The retry block governs infra attempts on this node; a `retries` edge still governs revise rounds — the two caps compose independently. On terminal failure an ERROR checkpoint row is persisted so the P1.2/P1.3 resume path re-dispatches the node.",
+          "additionalProperties": false,
+          "properties": {
+            "max_attempts": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 50,
+              "default": 3,
+              "description": "Maximum number of attempts including the first. Default matches LangGraph's RetryPolicy."
+            },
+            "initial_interval": {
+              "type": "number",
+              "minimum": 0,
+              "default": 0.5,
+              "description": "Seconds to wait before the first retry. Default matches LangGraph's RetryPolicy."
+            },
+            "backoff_factor": {
+              "type": "number",
+              "minimum": 1,
+              "default": 2.0,
+              "description": "Multiplier on the previous interval after each attempt. Default matches LangGraph's RetryPolicy."
+            },
+            "max_interval": {
+              "type": "number",
+              "minimum": 0,
+              "default": 128.0,
+              "description": "Upper bound (seconds) on the wait between retries. Default matches LangGraph's RetryPolicy."
+            },
+            "jitter": {
+              "type": "boolean",
+              "default": true,
+              "description": "Apply bounded jitter to each wait interval. Default matches LangGraph's RetryPolicy."
+            }
+          }
         }
       }
     },
@@ -247,9 +284,36 @@
           ]
         },
         "condition": {
-          "type": "string",
-          "description": "Optional CEL/shell expression that must evaluate to truthy for this edge to activate. Empty string = unconditional.",
-          "default": ""
+          "description": "Edge-activation predicate. A plain string is treated as a legacy marker (ignored by the runtime). An object is a jsonschema-backed predicate evaluated against the source node's output artifact (F5/F6 of p1-1-condition-edges): the predicate fires when `jsonschema.validate(resolve(pointer, output_json), match)` succeeds (or fails when `negate: true`). Currently consumed on `retries` edges only; the rc channel stays authoritative on every other edge type.",
+          "oneOf": [
+            {
+              "type": "string",
+              "description": "Legacy string form. Preserved so existing recipes that declare `condition: pass` / `condition: fail` on `depends_on` / `escalates_to` edges keep compiling. The runtime does not act on it.",
+              "default": ""
+            },
+            {
+              "type": "object",
+              "description": "jsonschema-backed predicate evaluated on the source node's output artifact (F5 of p1-1-condition-edges). Compile-time errors: unknown keys, non-string pointer, non-dict match, non-bool negate (C2).",
+              "additionalProperties": false,
+              "required": ["pointer", "match"],
+              "properties": {
+                "pointer": {
+                  "type": "string",
+                  "description": "RFC 6901 JSON pointer into the source node's output artifact JSON. Empty pointers are rejected at compile time (they would match the whole document by accident).",
+                  "minLength": 1
+                },
+                "match": {
+                  "type": "object",
+                  "description": "JSON Schema fragment validated against the resolved pointer value. The runtime uses jsonschema's Draft7 validator."
+                },
+                "negate": {
+                  "type": "boolean",
+                  "description": "Optional. When true, the predicate fires when `jsonschema.validate` FAILS (or when the pointer resolves to nothing). Default false.",
+                  "default": false
+                }
+              }
+            }
+          ]
         },
         "from_output": {
           "type": "string",

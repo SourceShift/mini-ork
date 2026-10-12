@@ -1035,3 +1035,124 @@ def test_finding_item_snippet_is_capped_at_100_chars() -> None:
     snippet = item["sub"].split(" · ", 1)[1]
     assert len(snippet) == 100, len(snippet)
     assert snippet.endswith("…"), snippet
+
+
+# ── a recipe that names its own plan artefact (2026-10-12) ─────────────────
+
+def test_changes_view_planner_reads_a_recipe_named_plan(home: Path) -> None:
+    """``recipes/epic-runner/prompts/planner.md`` tells the planner to write
+    ``epic-runner-plan.json`` — a different name AND a different shape
+    (``epics[]``/``waves[]``, no ``steps``). Nothing records that path in
+    ``task_runs.plan_path`` either, so the node pane said "No plan.json
+    recorded" for a run whose 12 KB plan was sitting in the run dir.
+    """
+    repo, base_sha = _seed_git_repo(home.absolute().parent)
+    _seed(home, repo=repo, base_sha=base_sha)
+    run_dir = home / "runs" / RUN
+    (run_dir / "plan.json").unlink()
+    (run_dir / "epic-runner-plan.json").write_text(json.dumps({
+        "objective": "ship the communication transports",
+        "epics": [
+            {"id": "wit-3", "title": "Stage 3 — communication transports",
+             "depends_on": ["wit-2"]},
+            {"id": "wit-4", "title": "Stage 4 — intake webhooks"},
+        ],
+        "waves": [["wit-3"], ["wit-4"]],
+    }))
+
+    out = build_node(home, RUN, "planner", view="changes")
+
+    items = out["result"]["items"]
+    titles = [str(it.get("t") or "") for it in items]
+    assert "Stage 3 — communication transports" in titles, titles
+    assert "Stage 4 — intake webhooks" in titles, titles
+    assert not any("No plan" in t for t in titles), titles
+    subs = [str(it.get("sub") or "") for it in items]
+    # The wave index and the dependency are the two facts a step row has
+    # no way to carry.
+    assert "wave 0 · depends on wit-2" in subs, subs
+    assert "wave 1" in subs, subs
+
+
+def test_plan_artifact_resolution_order(tmp_path: Path) -> None:
+    from mini_ork.ide_pages.run import plan_artifact
+
+    run_dir = tmp_path / "run-1"
+    run_dir.mkdir()
+    elsewhere = tmp_path / "elsewhere.json"
+    elsewhere.write_text("{}")
+
+    # Nothing on disk but the recorded path (a --out plan, say).
+    assert plan_artifact(run_dir, str(elsewhere)) == elsewhere
+    # A recipe-named plan outranks the recorded path: a state.db carried over
+    # from another checkout still points at THAT checkout's home.
+    recipe_plan = run_dir / "epic-runner-plan.json"
+    recipe_plan.write_text("{}")
+    assert plan_artifact(run_dir, str(elsewhere)) == recipe_plan
+    # The generic name wins over any recipe-prefixed one.
+    canonical = run_dir / "plan.json"
+    canonical.write_text("{}")
+    assert plan_artifact(run_dir, str(elsewhere)) == canonical
+    # A run with no plan at all resolves to nothing rather than to the
+    # recorded path's directory.
+    assert plan_artifact(tmp_path / "no-such-run", str(elsewhere)) == elsewhere
+
+
+def test_plan_artifact_picks_the_newest_recipe_plan(tmp_path: Path) -> None:
+    import os as _os
+
+    from mini_ork.ide_pages.run import plan_artifact
+
+    run_dir = tmp_path / "run-2"
+    run_dir.mkdir()
+    old = run_dir / "alpha-plan.json"
+    new = run_dir / "zeta-plan.json"
+    old.write_text("{}")
+    new.write_text("{}")
+    _os.utime(old, (1_000_000, 1_000_000))
+    _os.utime(new, (2_000_000, 2_000_000))
+    assert plan_artifact(run_dir) == new
+
+
+def test_plan_artifact_prefers_the_declared_recipe_plan(tmp_path: Path) -> None:
+    """The recipe's own contract outranks a stray ``*-plan.json`` by name."""
+    from mini_ork.ide_pages.run import plan_artifact
+
+    recipe = tmp_path / "recipes" / "epic-runner"
+    recipe.mkdir(parents=True)
+    (recipe / "artifact_contract.yaml").write_text(
+        "required_artifacts:\n"
+        '  - "${MINI_ORK_RUN_DIR}/epic-runner-delivery.json"\n'
+        '  - "${MINI_ORK_RUN_DIR}/epic-runner-plan.json"\n')
+    run_dir = tmp_path / "run-3"
+    run_dir.mkdir()
+    (run_dir / "zzz-plan.json").write_text("{}")
+    declared = run_dir / "epic-runner-plan.json"
+    declared.write_text("{}")
+    assert plan_artifact(run_dir, recipe_dir=recipe) == declared
+    # A run-local plan.json is the generic runtime's own file and still wins.
+    canonical = run_dir / "plan.json"
+    canonical.write_text("{}")
+    assert plan_artifact(run_dir, recipe_dir=recipe) == canonical
+
+
+def test_plan_steps_normalizes_every_plan_shape() -> None:
+    """Three shapes, one normal form: steps, epic-runner's epics[]+waves[], objective."""
+    from mini_ork.ide_pages.run import plan_steps
+
+    assert plan_steps({"steps": [{"id": "s1", "description": "do it",
+                                  "node_type": "implementer"}]}) == [("s1", "do it", "implementer")]
+    # A step whose id is just its role is titled by its description, so N
+    # role-named steps do not render as N identical rows.
+    assert plan_steps({"decomposition": [{"id": "implementer", "node_type": "implementer",
+                                          "description": "wire the endpoint"}]}) == [
+        ("implementer", "wire the endpoint", "implementer")]
+    epics = plan_steps({
+        "objective": "ship it",
+        "epics": [{"id": "wit-1", "title": "One"}, {"id": "wit-2", "title": "Two",
+                                                    "depends_on": ["wit-1"]}],
+        "waves": [["wit-1"], ["wit-2"]],
+    })
+    assert epics == [("wit-1", "One", "wave 0"), ("wit-2", "Two", "wave 1 · depends on wit-1")]
+    assert plan_steps({"objective": "ship it"}) == [("", "ship it", "")]
+    assert plan_steps({}) == []

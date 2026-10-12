@@ -115,14 +115,10 @@ def _expect_for(probe: str) -> str:
 def _materialize(card: dict, spec_text: str) -> tuple[dict, list[str]]:
     sid = card["spec_id"]
     labeled: dict[str, str] = {}
-    unlabeled: list[str] = []
     for fence in _fences(spec_text):
         segs, had = _split_labeled(fence)
         if had:
             labeled.update(segs)
-        else:
-            unlabeled.append(fence)
-    spec_script = "\n".join(unlabeled).strip("\n")
     probes, unprobeable, problems = [], [], []
     for a in card["acceptance"]:
         aid, kind, text = a["id"], a["gate"]["kind"], a.get("text", "")

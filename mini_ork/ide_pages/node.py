@@ -54,7 +54,7 @@ from mini_ork.ide_pages.node_changes import (
     build_changes_view,
     plain_reason,
 )
-from mini_ork.ide_pages.run import Run, Node, _epoch, _load, _wall, _REVIEW_TYPES
+from mini_ork.ide_pages.run import Run, Node, _epoch, _load, _wall, _REVIEW_TYPES, plan_artifact
 
 # Live-detection window per the kickoff §"live": running AND transcript grew
 # in the last 120 s. Named so a future tweak is one edit.
@@ -510,11 +510,34 @@ def _meta(node: Node, run: "Run") -> str:
     return " · ".join(parts) if parts else "—"
 
 
+def _declared_skills(run: "Run", node_id: str) -> list[str]:
+    """The skills this node's workflow grants it (workflow.yaml ``skills:``).
+
+    The declaration is what a grant MEANS; the runtime outcome (created /
+    missing / skipped) is recorded as a ``skills`` node event at dispatch
+    time and shows in the node's event stream. This reads the recipe
+    snapshot the run carries, so it works for finished runs too.
+    """
+    if run.recipe_dir is None:
+        return []
+    from mini_ork.ide_pages.run import _yaml
+
+    wf = _yaml(run.recipe_dir / "workflow.yaml")
+    for n in wf.get("nodes") or []:
+        if isinstance(n, dict) and n.get("name") == node_id:
+            declared = n.get("skills") or []
+            if isinstance(declared, str):
+                return [p.strip() for p in declared.split(",") if p.strip()]
+            return [str(s) for s in declared]
+    return []
+
+
 def _kv_items(node: Node, duration: str, run: "Run") -> list[dict[str, str]]:
     tokens_v = "—"
     tokens = _node_tokens(node, run)
     if tokens is not None:
         tokens_v = f"{tokens:,}"
+    skills = _declared_skills(run, node.id)
     return [
         {"k": "Lane", "v": node.role_lane or "—", "c": "text"},
         {"k": "Provider", "v": node.family or "—", "c": "text"},
@@ -523,6 +546,8 @@ def _kv_items(node: Node, duration: str, run: "Run") -> list[dict[str, str]]:
                                                   if node.calls else ""), "c": "text"},
         {"k": "Duration", "v": duration, "c": "text"},
         {"k": "Tokens", "v": tokens_v, "c": "text" if tokens is not None else "muted"},
+        {"k": "Skills", "v": ", ".join(skills) or "—",
+         "c": "text" if skills else "muted"},
         {"k": "Gates", "v": ", ".join(node.gates) or "—", "c": "text"},
     ]
 
@@ -2964,8 +2989,9 @@ def _overview_lens_headline(run_dir: Path, node: Node) -> dict[str, str]:
 
 
 def _overview_planner_headline(run_dir: Path) -> dict[str, str]:
-    """``plan.json`` ``objective`` field."""
-    plan = _read_json_safely(str(run_dir / "plan.json"))
+    """The plan artefact's ``objective`` field."""
+    plan_path = plan_artifact(run_dir)
+    plan = _read_json_safely(str(plan_path)) if plan_path else None
     if isinstance(plan, dict):
         obj = str(plan.get("objective") or "").strip()
         if obj:

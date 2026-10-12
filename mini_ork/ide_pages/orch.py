@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from mini_ork.ide_pages import spec as S
+from mini_ork.ide_pages.run import plan_artifact, plan_steps
 
 TABS = [("session", "Session"), ("kickoffs", "Kickoffs"), ("races", "Races"),
         ("planner", "Classify & plan"), ("coord", "Coordination"),
@@ -309,7 +310,10 @@ def _kickoff_key(home: Path, run: dict[str, Any]) -> str:
 # ── classify & plan ────────────────────────────────────────────────────────
 
 def _planner(home: Path) -> list[dict[str, Any]]:
-    found = _latest_run_with(home, "run_profile.json", "plan.json")
+    # Keyed on the profile alone: requiring a literal plan.json hid every run
+    # whose recipe plans with its own artefact (epic-runner), so this page
+    # reported "no run classified yet" while such runs sat in the run dir.
+    found = _latest_run_with(home, "run_profile.json")
     if found is None:
         return [S.lst("Classification", [S.dot("No run has been classified yet")], full=True)]
     run_id, run_dir = found
@@ -326,7 +330,8 @@ def _planner(home: Path) -> list[dict[str, Any]]:
             ("status", profile.get("profile_status") or "—",
              "green" if profile.get("profile_status") == "ready" else "yellow"),
         ], actions=[S.btn("Open run", S.open_run(run_id, str(profile.get("user_goal") or "")), "ghost")]))
-    plan = _read_json(run_dir / "plan.json")
+    plan_path = plan_artifact(run_dir)
+    plan = _read_json(plan_path) if plan_path else None
     if isinstance(plan, dict):
         items = []
         for step in plan.get("decomposition") or []:
@@ -338,9 +343,15 @@ def _planner(home: Path) -> list[dict[str, Any]]:
                                          str(step.get("target_file") or "")) if x)
             items.append(S.dot(f"{step.get('step', '·')} · {first}", sub))
         if not items:
-            items = [S.dot(str(plan.get("objective") or "Plan has no steps"))]
+            # Whatever the recipe called its plan, it is a plan: epic-runner's
+            # planner emits epics[] + waves[], which the decomposition loop
+            # above cannot see.
+            items = [S.dot(title, note if note not in (title, sid) else "")
+                     for sid, title, note in plan_steps(plan)]
+        if not items:
+            items = [S.dot("Plan has no steps")]
         out.append(S.lst(f"Plan · {short}", items, note=str(plan.get("objective") or "")[:300],
-                         actions=[S.btn("Open plan.json", S.open_path(str(run_dir / "plan.json")), "ghost")]))
+                         actions=[S.btn(f"Open {plan_path.name}", S.open_path(str(plan_path)), "ghost")]))
     questions = profile.get("human_questions") if isinstance(profile, dict) else None
     q_items = []
     for q in questions or []:

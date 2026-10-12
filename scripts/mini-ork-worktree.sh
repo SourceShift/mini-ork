@@ -24,6 +24,49 @@ WORKTREES_DIR="${MINI_ORK_WORKTREES_DIR:-/Volumes/docker-ssd/ps/mini-ork-worktre
 BRANCH_PREFIX="${MINI_ORK_BRANCH_PREFIX:-wt}"
 OWNERSHIP_FILE="${MINI_ORK_OWNERSHIP_FILE:-$WORKTREES_DIR/.ownership}"
 
+# ── lock ───────────────────────────────────────────────────────────────────
+# Serialises the two check-then-act sequences in this script, neither of which
+# is atomic on its own:
+#   * create — `assert_no_ownership_conflict` then `register_ownership`: two
+#     concurrent creates can both pass the check against the same registry and
+#     both register, putting two live worktrees on one file surface. That is
+#     precisely the collision the registry exists to prevent.
+#   * merge — the re-rebase onto origin/main then `push HEAD:main`: two merges
+#     interleaving push a non-fast-forward or a branch rebased onto a stale main.
+# `mkdir` is the atomic primitive (it exists or it does not, on every
+# filesystem) — the same lock researcher's scripts/codex-worktree.sh takes,
+# kept here so both repos serialize the same way.
+#
+# Held only across those pairs. The merge's green gate runs for minutes, so it
+# runs *outside* the lock and the rebase is re-run once inside to catch a main
+# that moved meanwhile — waiting threads time out after 30 s.
+LOCK_DIR="${MINI_ORK_WORKTREE_LOCK:-${TMPDIR:-/tmp}/mini-ork-worktree.lockdir}"
+LOCK_HELD=0
+
+release_lock() {
+  if [ "$LOCK_HELD" -eq 1 ]; then
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+    LOCK_HELD=0
+  fi
+}
+
+trap release_lock EXIT
+
+acquire_lock() {
+  local attempts=0
+  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 300 ]; then
+      # A stale lockdir is the usual cause once a create has been killed
+      # mid-flight; name the path so the operator can remove it deliberately
+      # rather than wait another 30 s.
+      die "timed out waiting for $LOCK_DIR (remove it if no worktree command is running)"
+    fi
+    sleep 0.1
+  done
+  LOCK_HELD=1
+}
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -148,6 +191,9 @@ create_worktree() {
   [ -n "$branch" ] || branch="${BRANCH_PREFIX}/${safe_slug}"
   wt="$WORKTREES_DIR/$safe_slug"
 
+  # The claim check, the create and the register are one decision — two creates
+  # that interleave here both pass the check against the same registry.
+  acquire_lock
   if [ "${#owns[@]}" -gt 0 ]; then
     assert_no_ownership_conflict "$safe_slug" "${owns[@]}"
   fi
@@ -160,6 +206,14 @@ create_worktree() {
   # ALLOW_WORKTREE_BRANCH_CREATE=1 satisfies the reference-transaction guard.
   ALLOW_WORKTREE_BRANCH_CREATE=1 git -C "$ROOT" worktree add -b "$branch" "$wt" "$base"
 
+  if [ "${#owns[@]}" -gt 0 ]; then
+    register_ownership "$safe_slug" "${owns[@]}"
+    echo "[mo-worktree] claimed: ${owns[*]}" >&2
+  fi
+  # The claim is registered, so the lock has done its job — the submodule clone
+  # below is slow (network) and touches nothing another worktree command reads.
+  release_lock
+
   # A fresh worktree carries submodule gitlinks but none of their content, so a
   # repo that vendors code that way starts with an empty directory where the
   # vendored tree should be (the IDE crate, in this repo). A linked worktree
@@ -170,10 +224,6 @@ create_worktree() {
   git -C "$wt" submodule update --init --recursive \
     || echo "[mo-worktree] warning: submodules not materialised in $wt" >&2
 
-  if [ "${#owns[@]}" -gt 0 ]; then
-    register_ownership "$safe_slug" "${owns[@]}"
-    echo "[mo-worktree] claimed: ${owns[*]}" >&2
-  fi
   echo "[mo-worktree] ready: $wt  (branch $branch)"
 }
 
@@ -195,7 +245,13 @@ merge_worktree() {
   # with MINI_ORK_TEST_CMD (e.g. a scoped pytest path for a fast, focused gate).
   local test_cmd="${MINI_ORK_TEST_CMD:-python3 -m pytest -q}"
   ( cd "$wt" && eval "$test_cmd" ) || die "green gate failed ($test_cmd) in $wt; fix before merging"
+  # The gate above runs for minutes, so it ran unlocked; main may have moved
+  # while it did. Re-rebase under the lock (a no-op unless it did) and push in
+  # the same critical section, so two merges cannot interleave a stale push.
+  acquire_lock
+  git -C "$wt" rebase origin/main
   git -C "$wt" push origin "HEAD:main"
+  release_lock
   echo "[mo-worktree] merged $branch -> origin/main. Tear down with: scripts/mini-ork-worktree.sh clean $slug"
 }
 

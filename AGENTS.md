@@ -46,6 +46,36 @@ make worktree-clean SLUG=<slug>      # remove worktree + delete branch
 - Merge is `push HEAD:main` (no PR); never `reset --hard` or revert main.
 - One-time per clone: `make install-hooks` (activates `.githooks/`).
 
+`scripts/mini-ork-worktree.sh` is the same flow without `make` (and is what the
+targets call). It takes an mkdir lock (`$MINI_ORK_WORKTREE_LOCK`, default
+`$TMPDIR/mini-ork-worktree.lockdir`, 30 s wait) around the two check-then-act
+pairs — the claim-check/register on create, and the re-rebase/push on merge — so
+two concurrent agents cannot both pass an ownership check or interleave a stale
+push. The green gate runs outside the lock, so a long gate never blocks another
+worktree command.
+
+**Merge discipline (the part that goes wrong):**
+
+- **Never `git add -A`.** It sweeps other sessions' work into your commit. Stage
+  explicit paths, or `git add <dir>` for a directory you own end to end.
+- **Scope assertion.** Read `git diff --stat` before committing: if the diff
+  contains files, and especially *deletions* of files you never touched or
+  authored, your base is stale — rebase, do not merge.
+- **Mandatory post-merge refresh.** After pushing, run
+  `git -C <repo> fetch origin main && git -C <repo> merge --ff-only origin/main`.
+  Local `main` is stale until it does; a later worktree created from it starts
+  behind.
+- **If `--ff-only` refuses, STOP.** That means local `main` and `origin/main`
+  diverged (someone pushed while you worked). Do **not** `git merge origin/main`
+  plain, do **not** `git reset --hard`, do **not** `--no-verify` past it.
+  Reconcile so that every commit on both sides survives — a merge commit keeps
+  all of them; a rebase rewrites them — and never rewrite a commit that is not
+  yours.
+- **On smoke failure, fix forward** — from a NEW worktree off latest `main`.
+  Never revert `main`, never `git reset --hard`.
+- **Commit, merge, push — without being asked.** A finished, verified change is
+  shipped, not parked in a worktree.
+
 ## Quality gates (run before committing)
 
 ```bash

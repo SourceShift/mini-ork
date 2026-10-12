@@ -49,6 +49,85 @@ from mini_ork.execute_compat import (
     node_strict_handshake,
 )
 from mini_ork.workflow.store import make_artifact_store
+from mini_ork.workflow.retry import (  # P1.4 per-node retry block
+    ErrorRow,
+    compute_backoff,
+    default_retry_policy,
+    load_retry_policies,
+    mark_retry_error,
+    record_attempt,
+    retryable_finish_reason,
+    should_retry,
+)
+
+
+# ── P1.4 per-node retry helpers ──────────────────────────────────────────────
+# Kept module-local so the dispatch_node loop stays one tight block. Each
+# helper fails soft — a missing workflow file, no outputs declared, or a
+# declared path that doesn't resolve are all normal cases (the loop must
+# not raise, or a recipe without the block loses the retry envelope).
+
+
+def _load_retry_policy(workflow: str, node_id: str):
+    """Resolve the RetryPolicy for ``node_id`` from ``workflow``'s YAML.
+
+    Returns the per-node policy if the workflow declares one, else the
+    LangGraph defaults via :func:`default_retry_policy`. The cache is
+    per-dispatch call so a workflow that was re-written between two
+    nodes re-parses (a recipe reload during a long run is rare but
+    real). Compilation errors raise so a malformed ``retry:`` block is
+    not silently swallowed (see :func:`parse_retry_policy`).
+    """
+    if not workflow:
+        return default_retry_policy()
+    try:
+        policies = load_retry_policies(workflow)
+    except ValueError:
+        # A malformed ``retry:`` block fails closed. The docstring above is
+        # the contract ("compilation errors raise … not silently
+        # swallowed") — panel run-1791760519 D1 found this except was
+        # swallowing exactly what it promised to raise.
+        raise
+    except (OSError, TypeError):
+        return default_retry_policy()
+    return policies.get(node_id, default_retry_policy())
+
+
+def _declared_output_paths(compiled_workflow, node_id: str, run_dir: str):
+    """The declared output paths for ``node_id`` under ``run_dir``.
+
+    Returns a list of absolute paths. Each is a file the node is
+    expected to write under the workflow's output port contract; the
+    retry loop deletes these on every failed attempt so the next
+    attempt starts clean (F3). An empty list means the node has no
+    declared outputs (verifier/publisher/eval) and ``del`` is a no-op —
+    those handlers manage their own state.
+    """
+    if compiled_workflow is None:
+        return []
+    node = compiled_workflow.nodes.get(node_id)
+    if node is None:
+        return []
+    out: list[str] = []
+    for output in node.outputs.values():
+        # The output path is declared relative to the run root. The
+        # dispatcher writes under ``run_dir_eff`` so the absolute
+        # target is the join — anything the failed attempt wrote under
+        # that name is dropped on retry.
+        out.append(os.path.join(run_dir, output.path))
+    return out
+
+
+def _discard_attempt_outputs(paths: list[str]) -> None:
+    """Delete every file in ``paths`` if it exists. Best-effort (F3)."""
+    for path in paths:
+        try:
+            if path and os.path.isfile(path):
+                os.unlink(path)
+        except OSError:
+            # A read-only file or a path that disappeared mid-loop is
+            # fine: the next attempt will overwrite or skip it.
+            pass
 
 
 def _execute_module():
@@ -700,15 +779,90 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     # and released when it ends, wrapping exactly the handler call: a grant is
     # scoped to one node, so a skill the reviewer was not granted is simply not
     # there while the reviewer runs. The finally covers every return path and a
-    # handler that raises.
+    # handler that raises. Materialization mode (symlink vs copy) follows the
+    # harness spawn: a sandboxed spawn cannot follow host-absolute symlinks.
     _materialized_skills = materialize_skills(
         granted_skills(compiled_workflow, node_id),
         context_env("MO_TARGET_CWD", "") or os.getcwd(),
     )
+    if _materialized_skills.granted:
+        # The grant outcome is a node fact, not stderr: a missing or shadowed
+        # skill costs a warning, not a run, but it must be findable after the
+        # run from the node's event stream (the typo would otherwise be
+        # invisible once the terminal scrolls away). Emitted BEFORE the handler
+        # so it is recorded even when the handler dies.
+        mo_node_emit(
+            run_id, node_id, node_type, "skills",
+            json.dumps(_materialized_skills.outcome()), db=db,
+        )
+    # P1.4 — per-node ``retry:`` block: a bounded attempt loop for
+    # infra-level failures (timeout / provider_limit / network / …).
+    # The ``retries`` edge still drives revise rounds for code-shaped
+    # rejections; its cap (max_rounds) is independent from this loop's
+    # ``max_attempts`` (F5). On a retryable failure the loop discards
+    # the failed attempt's declared output files (F3), sleeps with the
+    # documented backoff envelope (F1, F6), and re-invokes the handler.
+    # On terminal failure an ERROR checkpoint row is persisted (F4) so
+    # the P1.2/P1.3 resume path re-dispatches this node.
+    _retry_policy = _load_retry_policy(workflow, node_id)
+    _retry_outputs = _declared_output_paths(compiled_workflow, node_id,
+                                             run_dir_eff)
+    _finish_reason_history: list[str] = []
+    _attempt = 0
+    rc = 0
+    finish_reason = "done"
     try:
-        rc, finish_reason = handler(ctx)
+        while True:
+            _attempt += 1
+            rc, finish_reason = handler(ctx)
+            _finish_reason_history.append(str(finish_reason))
+            record_attempt(run_dir_eff, node_id, _attempt, str(finish_reason), int(rc))
+            if not should_retry(rc, finish_reason, _attempt, _retry_policy):
+                break
+            # F3 — wipe the declared output paths so the next attempt starts
+            # from a clean slate. Anything the failed handler wrote to the
+            # run dir under the declared names is dropped; the handler
+            # re-creates them on the next pass. Best-effort: a missing file
+            # is not an error here, only "the previous attempt didn't write
+            # it" (which is the same end state we want).
+            _discard_attempt_outputs(_retry_outputs)
+            # F6 — bounded-jitter sleep. ``compute_backoff`` returns 0.0 on
+            # attempt 1 (never called for that case) and is clamped at
+            # ``max_interval``; ``time.sleep`` is fine because the entire
+            # dispatch lives on a worker thread that is free to block.
+            _wait = compute_backoff(_retry_policy, attempt=_attempt)
+            if _wait > 0:
+                print(
+                    f"  [retry] node_id={node_id} attempt {_attempt}->{_attempt + 1} "
+                    f"rc={rc} finish_reason={finish_reason} wait={_wait:.2f}s",
+                    file=sys.stderr,
+                )
+                time.sleep(_wait)
     finally:
+        # A grant is scoped to one node and materialized once, above. The
+        # release must cover EVERY exit path — the terminal break, normal
+        # completion, and a handler that raises mid-attempt (the :770
+        # contract). The old shape released only after the loop, so a
+        # raising handler leaked the grant (panel run-1791760519 D1).
         _materialized_skills.release()
+    # F4 — terminal failure: persist an ERROR row so the resume path
+    # re-dispatches. Only written when the loop actually exhausted the
+    # cap on a retryable failure; a code-shaped rejection that left the
+    # cap untouched is owned by the ``retries`` edge, not here.
+    if rc != 0 and _attempt >= _retry_policy.max_attempts \
+            and any(retryable_finish_reason(fr) for fr in _finish_reason_history):
+        try:
+            _error_row = ErrorRow(
+                node_id=node_id,
+                attempt=_attempt,
+                max_attempts=_retry_policy.max_attempts,
+                finish_reasons=tuple(_finish_reason_history),
+                policy=_retry_policy.to_dict(),
+            )
+            mark_retry_error(run_dir_eff, _error_row, db_path=db, run_id=run_id)
+        except Exception as _exc:  # noqa: BLE001 — best-effort sidecar
+            print(f"  [retry] failed to persist ERROR row for {node_id}: {_exc}",
+                  file=sys.stderr)
     # Handlers that never call trace() (verifier/publisher/rollback/eval) must
     # still close their node — an orphaned node_start renders the node
     # permanently "running" in the DAG. trace() pops the start-map entry, so
@@ -1506,6 +1660,38 @@ def _append_run_note(db: str, run_id: str, note: str) -> None:
         print(f"  [warn] could not record '{note}' in task_runs.notes: {exc}", file=sys.stderr)
 
 
+_REVIEW_EVIDENCE_KEYS = (
+    "notes", "reasons", "blockers", "findings", "dod_probe_results",
+    "failure_pattern",
+)
+
+
+def _review_verdict_envelope(review_file: str, verdict: str) -> dict:
+    """``{"verdict": <word>}`` plus the blocker evidence the review file holds.
+
+    review-verdict.json is the cross-process channel the publisher and the
+    revise loop read. A bare verdict word starves every revise round:
+    run-1791760519-72158 D1 (p1-2) had a tier4_synth panel verdict ESCALATE
+    with per-lens ``dod_probe_results`` in the review file, the envelope
+    carried only the word, and the implementer's repair attempt was blind.
+    Merge the finding-bearing keys (bounded by json.dumps at the read side);
+    a prose/unparseable review file degrades to today's verdict-only shape.
+    """
+    envelope: dict = {"verdict": verdict}
+    try:
+        with open(review_file, encoding="utf-8", errors="replace") as fh:
+            parsed = json.load(fh)
+    except (OSError, ValueError):
+        return envelope
+    if not isinstance(parsed, dict):
+        return envelope
+    for key in _REVIEW_EVIDENCE_KEYS:
+        value = parsed.get(key)
+        if value:
+            envelope[key] = value
+    return envelope
+
+
 def _handle_reviewer(ctx: NodeDispatch):
     review_file, is_panel_gate, is_synth = _classify_review_node(
         ctx.recipe_eff, ctx.node_id, ctx.root, ctx.run_dir)
@@ -1579,7 +1765,7 @@ def _handle_reviewer(ctx: NodeDispatch):
     try:
         with open(os.path.join(ctx.run_dir, "review-verdict.json"), "w",
                   encoding="utf-8") as handle:
-            json.dump({"verdict": verdict}, handle)
+            json.dump(_review_verdict_envelope(review_file, verdict), handle)
     except OSError:
         pass
     vn = verdict.lower()

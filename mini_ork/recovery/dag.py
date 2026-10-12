@@ -31,8 +31,99 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from typing import Any, Iterator
 
-__all__ = ["DAG", "load_dag"]
+from mini_ork.recovery.condition import CompiledCondition
+
+__all__ = ["CompiledRetryEdge", "DAG", "load_dag"]
+
+
+class CompiledRetryEdge:
+    """A compiled ``retries`` edge: target node, max rounds, optional condition.
+
+    Backward-compatible with the prior 2-tuple shape ``(target, max_rounds)``:
+    when ``condition`` is ``None`` the instance iterates as a 2-tuple, indexes
+    as a 2-tuple, and compares equal to the matching 2-tuple. This lets the
+    legacy ``for source, (target, max_rounds) in retry_edges.items():`` pattern
+    keep working for recipes that do not declare a condition (A2 of
+    ``p1-1-condition-edges`` — D2/D3 add consumers of the third element).
+
+    When a ``CompiledCondition`` is set, the instance iterates / indexes /
+    compares as a 3-tuple so the new wiring can ``for source, (target,
+    max_rounds, condition) in retry_edges.items():``.
+
+    This class is intentionally not a ``NamedTuple``: NamedTuples' ``__iter__``
+    always yields all fields regardless of which are set, which would break
+    the existing 2-tuple destructuring tests.
+    """
+
+    __slots__ = ("target", "max_rounds", "condition")
+
+    def __init__(
+        self,
+        target: str,
+        max_rounds: int,
+        condition: CompiledCondition | None = None,
+    ) -> None:
+        self.target = target
+        self.max_rounds = max_rounds
+        self.condition = condition
+
+    def __iter__(self) -> Iterator[Any]:
+        if self.condition is None:
+            yield self.target
+            yield self.max_rounds
+        else:
+            yield self.target
+            yield self.max_rounds
+            yield self.condition
+
+    def __len__(self) -> int:
+        return 2 if self.condition is None else 3
+
+    def __getitem__(self, index: int) -> Any:
+        if index == 0:
+            return self.target
+        if index == 1:
+            return self.max_rounds
+        if index == 2:
+            if self.condition is None:
+                raise IndexError(
+                    "CompiledRetryEdge index 2 out of range (no condition set)"
+                )
+            return self.condition
+        raise IndexError(f"CompiledRetryEdge index {index} out of range")
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, CompiledRetryEdge):
+            return (
+                self.target == other.target
+                and self.max_rounds == other.max_rounds
+                and self.condition == other.condition
+            )
+        if isinstance(other, tuple):
+            if self.condition is None and len(other) == 2:
+                return (self.target, self.max_rounds) == other
+            if self.condition is not None and len(other) == 3:
+                return (self.target, self.max_rounds, self.condition) == other
+            return False
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        if self.condition is None:
+            return hash((self.target, self.max_rounds, None))
+        return hash((self.target, self.max_rounds, self.condition))
+
+    def __repr__(self) -> str:
+        if self.condition is None:
+            return (
+                f"CompiledRetryEdge(target={self.target!r}, "
+                f"max_rounds={self.max_rounds})"
+            )
+        return (
+            f"CompiledRetryEdge(target={self.target!r}, "
+            f"max_rounds={self.max_rounds}, condition={self.condition!r})"
+        )
 
 
 @dataclasses.dataclass(frozen=True)

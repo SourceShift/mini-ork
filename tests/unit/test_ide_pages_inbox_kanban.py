@@ -107,9 +107,13 @@ def test_inbox_row_is_a_callout_with_the_outcome_and_an_open_run_button(home: Pa
     page = build_page(home, "inbox")
     row = _section(page, "callout", "Needs me now")
     assert row["full"] is True and row["tone"] == "yellow"
+    # The outcome's own actions come first, then the two every row carries:
+    # "Open run", then "Dismiss" last (a destructive action never sits above
+    # the one the operator came for).
     labels = [a["label"] for a in row["actions"]]
-    assert labels[-1] == "Open run"
-    assert row["actions"][-1]["do"] == {"run": "run-needs", "title": "Needs me now"}
+    assert labels[-2:] == ["Open run", "Dismiss"]
+    assert row["actions"][-2]["do"] == {"run": "run-needs", "title": "Needs me now"}
+    assert row["actions"][-1]["do"]["cli"] == ["board", "dismiss", "run-needs"]
 
     chips = {c["t"]: c["c"] for c in page["chips"]}
     assert chips == {"✋ needs you 1": "yellow", "✗ failed 0": "red"}
@@ -131,13 +135,14 @@ def test_inbox_caps_rows_and_links_the_runs_page(home: Path) -> None:
     for i in range(30):
         _failed(home, f"run-{i:02d}", f"Failed {i:02d}", now - 1000 + i, recipe="")
     page = build_page(home, "inbox")
-    # The newest rows get a full outcome card; the rest of the 25 are compact
-    # rows, so the page stays fast on a large home.
+    # Only the newest 6 rows get a full outcome card (each one loads its run
+    # and resolves an outcome); rows 7-20 are compact, and everything past the
+    # 20-row cap collapses into one link, so the page stays fast on a large home.
     callouts = [s for s in page["sections"] if s["type"] == "callout"]
-    assert len(callouts) == 8
-    assert len(_section(page, "list", "Also waiting")["items"]) == 25 - 8
+    assert len(callouts) == 6
+    assert len(_section(page, "list", "Also waiting")["items"]) == 20 - 6
     more = _section(page, "list", "More")
-    assert more["items"][0]["t"] == "5 more…"
+    assert more["items"][0]["t"] == "10 more…"
     assert more["items"][0]["acts"][0]["do"] == {"page": "runs"}
 
 
@@ -159,10 +164,10 @@ def test_a_broken_row_costs_its_row_only(home: Path, monkeypatch: pytest.MonkeyP
 
     good = inbox_page._row
 
-    def boom(home_: Path, run_id: str):
-        if run_id == "run-b":
+    def boom(home_: Path, row_: Any, attempts_: int, now_: int):
+        if row_.run_id == "run-b":
             raise RuntimeError("disk gone")
-        return good(home_, run_id)
+        return good(home_, row_, attempts_, now_)
 
     monkeypatch.setattr(inbox_page, "_row", boom)
     page = build_page(home, "inbox")

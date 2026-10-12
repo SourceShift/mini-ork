@@ -77,7 +77,8 @@ def test_every_tab_builds(home: Path, monkeypatch) -> None:
         page = orch.build(home, key, {})
         check_page(page, "orch")
         assert page["tab"] == key and page["sections"]
-        assert [t["key"] for t in page["tabs"]] == ["session", "kickoffs", "races", "planner", "coord"]
+        assert [t["key"] for t in page["tabs"]] == [
+            "session", "kickoffs", "races", "planner", "coord", "intake"]
         assert page["errors"] == {}, page["errors"]
     assert orch.build(home, "nonsense", {})["tab"] == "session"
 

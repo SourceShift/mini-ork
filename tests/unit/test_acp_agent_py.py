@@ -3557,6 +3557,14 @@ def test_authenticate_succeeds_when_readiness_passes(tmp_path, monkeypatch):
     monkeypatch.setattr(agent_mod, "_SETUP_PASS_CACHE", {})
     monkeypatch.setattr(acp_setup, "_run", lambda *a, **k: _FakeProc(0, stdout='{"loggedIn": true}'))
     monkeypatch.setattr(acp_setup.shutil, "which", lambda name: "/usr/bin/claude")
+    # The third check reads the lane map out of the checkout's own
+    # ``.mini-ork/config/agents.yaml`` and probes each lane's credential, so it
+    # fails in any repo where the worker-lane keys are not exported. The
+    # scenario under test is "every readiness check passes", so the probe is
+    # stubbed the way ``test_ide_pages_setup`` stubs it.
+    monkeypatch.setattr(
+        acp_setup, "_check_provider_credentials",
+        lambda *a, **k: acp_setup.Check(name="lanes", ok=True, detail="ok"))
     monkeypatch.setenv("MO_ACP_SKIP_SETUP_CHECK", "1")
 
     agent = MiniOrkAcpAgent()
