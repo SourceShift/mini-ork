@@ -37,6 +37,7 @@ def test_resolve_plan_missing_errors(capsys, tmp_path, monkeypatch):
     monkeypatch.delenv("MINI_ORK_WORKFLOW", raising=False)
     monkeypatch.delenv("MINI_ORK_RECOVERY_CLOSURE", raising=False)
     monkeypatch.delenv("MINI_ORK_RECOVERY_FROM", raising=False)
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
     path, rc = ex._resolve_plan_path("", str(tmp_path), from_node="", recovery_active=False)
     assert rc == 2 and path == ""
     assert "No plan.json found" in capsys.readouterr().err
@@ -53,8 +54,53 @@ def test_resolve_plan_newest_wins(tmp_path, monkeypatch):
     os.utime(older / "plan.json", (1000, 1000))
     os.utime(newer / "plan.json", (2000, 2000))
     monkeypatch.delenv("MINI_ORK_WORKFLOW", raising=False)
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
     path, rc = ex._resolve_plan_path("", str(tmp_path), from_node="", recovery_active=False)
     assert rc == 0 and path == str(newer / "plan.json")
+
+
+def test_resolve_plan_prefers_the_runs_own_plan_over_a_strangers(tmp_path, monkeypatch):
+    """A run whose plan is not named ``plan.json`` must still resolve its OWN.
+
+    epic-runner's planner writes ``epic-runner-plan.json``, so the home-wide
+    newest-``plan.json`` walk adopted whichever *other* run finished last --
+    typically the epic child's framework-edit plan. Its artifact contract then
+    expanded against the parent's ``MINI_ORK_RUN_DIR``, so ``epic_verifier``
+    required a ``framework-edit.diff`` the parent never writes and the run
+    false-failed the hollow-run guard despite a passing rubric
+    (run-1791785967-43108, 2026-10-12).
+    """
+    runs = tmp_path / "runs"
+    parent = runs / "run-parent"
+    child = runs / "run-parent-epic"
+    parent.mkdir(parents=True)
+    child.mkdir(parents=True)
+    (parent / "epic-runner-plan.json").write_text("{}")
+    # The child's plan.json is NEWER, so the old walk would have chosen it.
+    (child / "plan.json").write_text("{}")
+    os.utime(parent / "epic-runner-plan.json", (1000, 1000))
+    os.utime(child / "plan.json", (2000, 2000))
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(parent))
+    monkeypatch.delenv("MINI_ORK_WORKFLOW", raising=False)
+    path, rc = ex._resolve_plan_path("", str(tmp_path), from_node="", recovery_active=False)
+    assert rc == 0 and path == str(parent / "epic-runner-plan.json")
+
+
+def test_resolve_plan_own_plan_json_beats_a_newer_stranger(tmp_path, monkeypatch):
+    """Even a plain ``plan.json`` is resolved from THIS run when one exists."""
+    runs = tmp_path / "runs"
+    mine = runs / "run-mine"
+    theirs = runs / "run-theirs"
+    mine.mkdir(parents=True)
+    theirs.mkdir(parents=True)
+    (mine / "plan.json").write_text("{}")
+    (theirs / "plan.json").write_text("{}")
+    os.utime(mine / "plan.json", (1000, 1000))
+    os.utime(theirs / "plan.json", (2000, 2000))
+    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(mine))
+    monkeypatch.delenv("MINI_ORK_WORKFLOW", raising=False)
+    path, rc = ex._resolve_plan_path("", str(tmp_path), from_node="", recovery_active=False)
+    assert rc == 0 and path == str(mine / "plan.json")
 
 
 def test_recovery_filter_requires_context(capsys, monkeypatch):

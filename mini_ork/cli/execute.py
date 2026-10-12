@@ -612,17 +612,35 @@ def _resolve_plan_path(plan_path: str, home: str, *, from_node: str,
     open('') / a bad path). bash requires a plan even in workflow mode (it's
     used for run_dir / task_run_id / plan_content)."""
     if not plan_path:
-        newest, newest_mtime = "", -1.0
-        for dirpath, _dirs, files in os.walk(os.path.join(home, "runs")):
-            if "plan.json" in files:
-                p = os.path.join(dirpath, "plan.json")
-                try:
-                    m = os.path.getmtime(p)
-                except OSError:
-                    continue
-                if m > newest_mtime:
-                    newest, newest_mtime = p, m
-        plan_path = newest
+        # Prefer THIS run's own plan, whatever the recipe named it. The walk
+        # below spans every run in the home, so a run with no ``plan.json`` of
+        # its own adopts whichever OTHER run finished last -- typically a child.
+        # That child's artifact contract then expands against THIS run's
+        # ``MINI_ORK_RUN_DIR``: epic-runner's ``epic_verifier`` borrowed its
+        # child's framework-edit plan and false-failed the hollow-run guard for
+        # a ``framework-edit.diff`` the parent never writes
+        # (run-1791785967-43108, 2026-10-12). Borrowing a stranger's plan is
+        # never right, so a run we can name resolves its own plan or none.
+        run_dir = os.environ.get("MINI_ORK_RUN_DIR", "")
+        if run_dir:
+            from mini_ork.cli.plan import plan_artifact  # noqa: PLC0415 -- lazy: plan.py imports execute
+            own = plan_artifact(run_dir)
+        else:
+            own = None
+        if own is not None:
+            plan_path = str(own)
+        elif not run_dir:
+            newest, newest_mtime = "", -1.0
+            for dirpath, _dirs, files in os.walk(os.path.join(home, "runs")):
+                if "plan.json" in files:
+                    p = os.path.join(dirpath, "plan.json")
+                    try:
+                        m = os.path.getmtime(p)
+                    except OSError:
+                        continue
+                    if m > newest_mtime:
+                        newest, newest_mtime = p, m
+            plan_path = newest
     # E2 recovery: a from-workflow recovery derives node_ids from MINI_ORK_WORKFLOW
     # and its run_dir from MINI_ORK_RUN_DIR, so it does NOT require a plan.json — the
     # original plan may be gone, or recovery may be driven purely from the workflow +
