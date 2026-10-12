@@ -1324,6 +1324,17 @@ def _case_interrupted(home: Path, run_id: str) -> dict[str, Any] | None:
         both use *insertion* order (``created_at`` then ``rowid`` — the same
         ordering the workflow viewer uses, ``web/repositories.py``).
 
+    A node the reaper closed with the synthetic ``interrupted`` marker stays
+    interrupted until a fresh ``node_start`` re-opens it: a real ``node_end``
+    that arrives *after* that marker and before any later start — the orphaned
+    worker finishing late, which the kill/reap never reached because only the
+    dispatcher's pid was signalled — is the tail of the same unfinished attempt
+    and does not close the node. A restarted node is unaffected: its new
+    ``node_start`` bumps ``latest_start_seq`` past the marker, so the guard no
+    longer suppresses its ends. Without that rule the late end cancels the
+    interruption and the run falls through to case 5 ("Failed at <a node that
+    succeeded>; cause not classified").
+
     Declines — returns ``None`` — when ``run_events`` is unreadable, when every
     started node also ended (a genuine failure owns the run, and its own case
     must fire), or when a failing ``node_end`` was emitted after the chosen
@@ -1354,6 +1365,7 @@ def _case_interrupted(home: Path, run_id: str) -> dict[str, Any] | None:
     starts: dict[str, int] = {}
     ends: dict[str, int] = {}
     latest_start_seq: dict[str, int] = {}
+    interrupted_seq: dict[str, int] = {}
     failing_end_seq: list[int] = []
     for seq, ev in enumerate(ordered):
         et = ev.get("event_type")
@@ -1376,7 +1388,19 @@ def _case_interrupted(home: Path, run_id: str) -> dict[str, Any] | None:
             # and ``recover`` write for a dead attempt
             # (``web.control._close_dangling_node_events``: verdict CRASH,
             # interrupted true). It records that the step never finished, so
-            # it does not close the node.
+            # it does not close the node — and we remember the moment, so a
+            # later real end from the same attempt cannot close it either.
+            interrupted_seq[nid] = seq
+            continue
+        elif interrupted_seq.get(nid, -1) > latest_start_seq.get(nid, -1):
+            # A real ``node_end`` whose node was interrupted after its latest
+            # start is the orphaned worker finishing late: the dispatcher was
+            # killed (or the run reaped) mid-node, but the child process kept
+            # running and wrote a genuine ``node_end`` — with a nonzero
+            # ``duration_ms`` — into an already-terminal run. That end belongs
+            # to the attempt the synthetic close already declared unfinished, so
+            # it must not heal the node back to "ended" and hide the
+            # interruption.
             continue
         else:
             ends[nid] = ends.get(nid, 0) + 1

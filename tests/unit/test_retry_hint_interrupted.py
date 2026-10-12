@@ -404,3 +404,64 @@ def test_a_skipped_sibling_after_the_start_does_not_veto(home: Path) -> None:
     hint = retry_hint._case_interrupted(home, RUN)
     assert hint is not None
     assert hint["failed_node"] == "implementer"
+
+
+def test_orphaned_worker_late_end_does_not_heal_the_interruption(home: Path) -> None:
+    """A leaked worker's real ``node_end`` must not cancel the interruption.
+
+    ``board kill`` / the reaper SIGTERM the dispatcher's pid (and its
+    ``.pid`` pids) only — a worker child in the same process group is not
+    signalled. It runs on, and minutes later writes a *genuine* ``node_end``
+    (nonzero ``duration_ms``) into an already-terminal run. The synthetic
+    ``interrupted`` close already declared that attempt unfinished; the late
+    end belongs to the same attempt, so counting it would empty ``open_nodes``
+    and drop the run to case 5 — naming a *sibling that succeeded* as the
+    failure. Regression: ``run-1791749955-70478``.
+    """
+    _seed_run(home, RUN)
+    _insert_events(home, RUN, [
+        _start("planner"), _end("planner", "done"),
+        _start("minimax_drafter"), _end("minimax_drafter", "done"),
+        _start("opus_arbiter"),
+        ("node_end", {"node_id": "opus_arbiter", "verdict": "CRASH",
+                      "interrupted": True, "duration_ms": 0}),
+        # …the orphaned worker finishes FOUR MINUTES later and reports success.
+        ("node_end", {"node_id": "opus_arbiter", "finish_reason": "pass",
+                      "duration_ms": 342_220}),
+    ])
+
+    hint = retry_hint._case_interrupted(home, RUN)
+    assert hint is not None
+    assert hint["failed_node"] == "opus_arbiter"
+    assert hint["from_node"] == "opus_arbiter"
+    assert hint["strategy"] == "resume"
+    assert (hint["needs_change"] or {}).get("kind") == "interrupted"
+
+    # compute() must reach case 1.6 — not fall through to case 5 blaming the
+    # node that finished (``minimax_drafter``).
+    full = retry_hint.compute(home, RUN)
+    assert full is not None
+    assert full["failed_node"] == "opus_arbiter"
+    assert full["retryable"] is True
+    assert (full["needs_change"] or {}).get("kind") == "interrupted"
+
+
+def test_late_end_for_a_restarted_node_is_not_suppressed(home: Path) -> None:
+    """The late-end guard is scoped to the interrupted attempt.
+
+    A fresh ``node_start`` clears the interruption marker, so a real end that
+    follows a restart is counted normally — the guard must not pin a node
+    interrupted forever. Here the restarted node then fails: the end is counted
+    and its failing reason vetoes the case, exactly as for any other failure.
+    """
+    _seed_run(home, RUN)
+    _insert_events(home, RUN, [
+        _start("implementer"),
+        ("node_end", {"node_id": "implementer", "verdict": "CRASH",
+                      "interrupted": True, "duration_ms": 0}),
+        _start("implementer"), _end("implementer", "error"),
+    ])
+    # The restart's failing end is seen (not swallowed by the stale marker):
+    # the case declines via the failing-end veto, not by the node reading closed.
+    assert retry_hint._case_interrupted(home, RUN) is None
+
