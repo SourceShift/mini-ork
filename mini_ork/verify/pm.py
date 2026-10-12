@@ -161,3 +161,42 @@ def describe(root: str = ".") -> str:
     """One-line resolution summary, for a verifier's evidence log."""
     return (f"package manager: declared={declared_manager(root) or '-'} "
             f"lockfile={lockfile_manager(root) or '-'} resolved={package_manager(root)}")
+
+
+# ── spawn-failure provenance (audit 2026-10-11) ──────────────────────────────
+# A shell-out verifier that fails must say WHY, or the engine reads "the tool
+# could not run" as "the code is wrong": one npm refusal on a pnpm repo
+# (EBADDEVENGINES) cascaded into 10 failed nodes and a rollback of code no tool
+# had checked. A verifier emits the return value as `failure_kind`; `toolchain`
+# turns its verdict into an abstention (UNVERIFIED) instead of a refutation.
+_SPAWN_FAILURES = (
+    "command not found",                                    # sh
+    "No such file or directory",                            # execve ENOENT
+    "ENOENT",                                               # node spawn
+    "EBADDEVENGINES",                                       # npm refuses the wrong manager
+    "not recognized as an internal or external command",    # cmd.exe
+    "could not determine executable to run",               # npx, no local install
+)
+
+
+def classify_spawn(argv, rc, output):  # noqa: ARG001 — argv is part of the contract
+    """``"toolchain"`` when a shell-out never started its tool, else ``""``.
+
+    A verifier emits this as ``failure_kind``: ``toolchain`` makes its verdict an
+    abstention — the checks it would have made say nothing about the code — so a
+    single bad runner call stops cascading into a rollback (audit 2026-10-11).
+    ``""`` is the fail-closed default: the caller keeps today's behaviour, which
+    for a failed shell-out means a plain refutation.
+
+    LOGIC HAND-OFF: ``_SPAWN_FAILURES`` is a conservative seed. Which pattern (or
+    rc) separates "the tool never started" from "the tool ran and rejected the
+    input" is domain knowledge about the runners — refine it here. Every
+    shell-out verifier calls this one function, so a fix here is a fix everywhere.
+    """
+    if rc == 127:  # the shell's own "command not found"
+        return "toolchain"
+    text = output or ""
+    for needle in _SPAWN_FAILURES:
+        if needle in text:
+            return "toolchain"
+    return ""
