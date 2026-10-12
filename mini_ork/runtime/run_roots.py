@@ -165,6 +165,37 @@ def resolve_run_roots(run_dir: str, *, env: Mapping[str, str] | None = None) -> 
     )
 
 
+class RunTargetMissing(RuntimeError):
+    """The target recorded in ``run_profile.json`` no longer exists on disk."""
+
+
+def require_run_target(*, roots: RunRoots | None) -> str:
+    """The run's target, or raise ``RunTargetMissing`` naming the missing path.
+
+    ``load_run_roots`` deliberately trusts the persisted ``roots.target``
+    without touching the filesystem — cheap, and correct for a run still in
+    flight. But a run *resumed* after its worktree was cleaned then hands a
+    phantom ``cwd`` to every node: the implementer spawns in a directory that
+    is gone, produces nothing, and the run dies with an empty log and no clue
+    why. Callers about to *use* the target call this instead, so the missing
+    path is named at the point of use together with the two ways to fix it.
+
+    A ``None`` record (legacy run dir) yields ``""``; the caller keeps its own
+    lazy resolution. This only ever rejects a *recorded* target.
+    """
+    if roots is None:
+        return ""
+    target = roots.target
+    if not target or os.path.isdir(target):
+        return target
+    raise RunTargetMissing(
+        f"the target recorded for this run no longer exists: {target}\n"
+        "  It was captured in run_profile.json when the run started and is gone\n"
+        "  now (a worktree cleaned up after the run?). Re-create that directory,\n"
+        "  or resume against a fresh checkout by setting MO_TARGET_CWD=<path>."
+    )
+
+
 def load_run_roots(run_dir: str) -> RunRoots | None:
     """Load a persisted ``roots`` record from ``run_profile.json``.
 

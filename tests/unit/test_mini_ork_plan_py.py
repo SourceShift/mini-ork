@@ -404,6 +404,43 @@ def test_repair_exhausted_hard_fail(tmp_path, capsys):
     assert "PLAN REJECTED" in captured.err
 
 
+def test_planner_dispatch_failure_records_a_verdict(tmp_path, capsys):
+    """A plan-stage dispatch failure must leave a verdict, not a NULL: a run
+    that dies before the planner ever returns otherwise shows `failed` with
+    nothing red inside it, and the scheduler logs `verdict=unknown`.
+
+    The run card is written by the ``run``/epic path before the planner is
+    invoked, so it is seeded here the same way."""
+    home, db = _home(tmp_path, "dispatch-fail")
+    k = _kick(tmp_path)
+    out = str(tmp_path / "dispatch-fail.json")
+    con = sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO task_runs (id, recipe, status, created_at, updated_at, "
+        "task_class, kickoff_path, workflow_version) VALUES (?,?,?,?,?,?,?,?)",
+        ("run-fixed-1", "code_fix", "classified", 1, 1, "code_fix", k, "latest"))
+    con.commit()
+    con.close()
+
+    def dispatch(_task_class, _node_type, _prompt):
+        return 4, "[llm_dispatch FAIL model=glm,minimax,codex rc=4]"
+
+    rc = _run_py_dispatch(home, db, k, out, dispatch)
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "LLM dispatch failed for planner node" in captured.err
+    con = sqlite3.connect(db)
+    status, verdict, notes = con.execute(
+        "SELECT status, verdict, notes FROM task_runs WHERE id='run-fixed-1'").fetchone()
+    con.close()
+    assert status == "failed"
+    # The value is not a member of the ``verdict`` CHECK enum, so it lands in
+    # ``notes`` — but the run IS marked failed, which it was not before.
+    assert verdict is None
+    assert "planner_dispatch_rc_4" in notes
+
+
 def test_mo_plan_deterministic_fallback_opt_in(tmp_path):
     home, db = _home(tmp_path, "repair-fallback")
     k = _kick(tmp_path)

@@ -1063,12 +1063,19 @@ def _case_lane_unavailable(home: Path, run_id: str, run_dir: Path,
     newest row was always a post-workflow call. When no workflow-alias failure
     exists the case declines (returns ``None``) and cases 4/5 decide.
     Evaluated BEFORE cases 4 and 5.
+
+    A run that died in the *plan stage* — no ``node_start`` was ever written —
+    has no alias map at all, so the node-scoped logic below cannot run. That
+    case is delegated to ``_case_planner_lane``: the planner's own quota/auth
+    failure is just as actionable, and it is the only explanation available.
     """
     rows = _failed_lane_rows(home, run_id)
     if not rows:
         return None
     starts, ends = _node_start_lanes(home, run_id)
     by_alias, node_alias = _workflow_alias_map(starts)
+    if not starts:
+        return _case_planner_lane(home, run_id, rows)
     if not by_alias:
         return None
 
@@ -1180,6 +1187,76 @@ def _case_lane_unavailable(home: Path, run_id: str, run_dir: Path,
             "nodes": using_names,
             "suggestions": suggestions,
             "code": code,
+        },
+        "notes": [],
+        "command": command,
+        "computed_at": _now_iso(),
+    }
+
+
+def _case_planner_lane(home: Path, run_id: str,
+                       rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Plan-stage quota/auth failure → the same lane-switch hint, but no node.
+
+    Only for a run that recorded *no* ``node_start`` at all: the planner LLM
+    call is what failed, so there is no workflow node to name and the
+    node-scoped logic in ``_case_lane_unavailable`` cannot run. The failed
+    row's alias (``planner``) stands in for the node, and ``from_node`` stays
+    empty so a repair re-plans from the top rather than resuming a node that
+    never existed.
+
+    Only a *categorised* row (``quota``/``auth``) qualifies: a plan-stage row
+    the executor could not classify is not evidence of a dead lane, and
+    guessing one here would switch a healthy lane. Those fall through to case 5
+    as before.
+    """
+    dead = [r for r in rows
+            if str(r.get("error_category") or "") in ("quota", "auth")]
+    if not dead:
+        return None
+    row = dead[0]
+    alias = _row_alias(row)
+    lane = str(row.get("model_id") or "")
+    provider = str(row.get("provider") or "")
+    if not alias or not lane:
+        return None
+    error_kind = str(row.get("error_category") or "quota")
+    detail = str(row.get("error_message") or "")[:400]
+
+    suggestions: list[dict[str, str]] = []
+    try:
+        from mini_ork.recovery import lane_suggest
+        suggestions = lane_suggest.suggest(
+            home, failed_lane=lane, alias=alias, node_types=["planner"],
+            db=db_for(home), limit=3,
+        )
+    except Exception:  # noqa: BLE001 — suggestions are advisory, never fatal
+        suggestions = []
+
+    command = ""
+    if suggestions:
+        command = f"mini-ork recover {run_id} --lane {alias}={suggestions[0]['lane']}"
+    summary = (f"{lane} is out of quota before planning"
+               if error_kind == "quota"
+               else f"{lane} rejected the credentials before planning")
+    return {
+        "version": HINT_VERSION,
+        "run_id": run_id,
+        "failed_node": alias,
+        "retryable": True,
+        "strategy": "resume",
+        "from_node": None,
+        "needs_change": {
+            "kind": "lane",
+            "summary": summary,
+            "detail": detail,
+            "lane": lane,
+            "alias": alias,
+            "provider": provider,
+            "error_kind": error_kind,
+            "nodes": [alias],
+            "suggestions": suggestions,
+            "code": False,
         },
         "notes": [],
         "command": command,

@@ -750,3 +750,71 @@ def test_suggest_code_lanes_follow_policy_order_over_success_count(home: Path) -
     assert "deepseek" in lanes and "opus" in lanes
     assert lanes.index("deepseek") < lanes.index("opus")
     assert "glm" not in lanes
+
+
+# ── 6. plan-stage death: the planner's own call failed, no node ran ─────────
+# run-1791785967-43108 (epic-runner / "Linear adapter"): ZERO ``run_events``,
+# the run card ``failed`` with a NULL verdict, and the only explanation a
+# ``llm_calls`` row — the planner's Codex call hit its usage limit. Before this
+# case the hint fell through to case 5 ("Failed at ?"), which is exactly the
+# "can't see at which node it failed and why" report.
+
+
+def _seed_plan_stage(home: Path, *, error_category: str | None = "quota") -> Path:
+    """A run that died BEFORE any workflow node started: no ``run_events`` at
+    all, a failed planner call, and a healthy lane for the suggestion ranking."""
+    ts = int(time.time())
+    run_dir = home / "runs" / RUN
+    run_dir.mkdir(parents=True)
+    kickoff = home / "kickoffs" / "demo.md"
+    kickoff.parent.mkdir(parents=True, exist_ok=True)
+    kickoff.write_text("# plan-stage test\n", encoding="utf-8")
+    con = sqlite3.connect(home / "state.db")
+    con.execute(
+        "INSERT INTO task_runs (id, recipe, status, cost_usd, created_at, updated_at, "
+        "ended_at, task_class, kickoff_path, workflow_version) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (RUN, "framework-edit", "failed", 0.0, ts, ts + 100, ts + 80,
+         "framework_edit", str(kickoff), "latest"))
+    con.commit()
+    con.close()
+    _insert_llm_call(
+        home, model_id="codex", status="failed", run_id=RUN,
+        feature_name="mini-ork:planner", actor="planner", provider="openai",
+        error_message=CODEX_QUOTA_TEXT, error_category=error_category, retryable=0,
+    )
+    for _ in range(5):
+        _insert_llm_call(home, model_id="deepseek", status="success")
+    (run_dir / "plan.json").write_text('{"objective": "x"}', encoding="utf-8")
+    (run_dir / "run_profile.json").write_text(
+        json.dumps({"kickoff_path": str(kickoff), "recipe": "framework-edit"}),
+        encoding="utf-8",
+    )
+    return run_dir
+
+
+def test_plan_stage_quota_returns_a_lane_hint_without_a_node(home: Path) -> None:
+    _seed_plan_stage(home)
+    hint = retry_hint.compute(home, RUN)
+    assert hint is not None
+    assert hint["retryable"] is True
+    assert hint["strategy"] == "resume"
+    nc = hint["needs_change"]
+    assert nc["kind"] == "lane"
+    assert nc["alias"] == "planner"
+    assert nc["lane"] == "codex"
+    assert nc["error_kind"] == "quota"
+    assert "quota" in nc["summary"]
+    assert hint["failed_node"] == "planner"
+    assert hint["from_node"] is None  # no node to resume: a repair re-plans
+    assert nc["suggestions"], "a healthy lane must be suggested"
+    assert hint["command"].startswith(f"mini-ork recover {RUN} --lane planner=")
+
+
+def test_plan_stage_uncategorised_row_is_not_a_dead_lane(home: Path) -> None:
+    """The older ``unknown`` row (a generic ``codex exec rc=1``) is not evidence
+    of a dead lane; switching a healthy lane on it would be a guess."""
+    _seed_plan_stage(home, error_category="unknown")
+    hint = retry_hint.compute(home, RUN)
+    if hint is not None:
+        assert hint["needs_change"]["kind"] != "lane"

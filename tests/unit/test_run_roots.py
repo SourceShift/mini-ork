@@ -23,6 +23,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
@@ -204,6 +206,37 @@ def test_load_run_roots_returns_none_for_legacy_run_dir(tmp_path):
 def test_load_run_roots_returns_none_for_missing_run_dir(tmp_path):
     assert run_roots.load_run_roots("") is None
     assert run_roots.load_run_roots(str(tmp_path / "absent")) is None
+
+
+def test_require_run_target_accepts_an_existing_recorded_target(tmp_path):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    run_dir = tmp_path / "run"
+    _write_profile(run_dir, roots={"target": str(repo)})
+    roots = run_roots.load_run_roots(str(run_dir))
+    assert roots is not None
+    assert run_roots.require_run_target(roots=roots) == str(repo)
+
+
+def test_require_run_target_rejects_a_target_that_is_gone(tmp_path):
+    """The smoke-run failure: the recorded worktree was cleaned, so a resumed
+    node would spawn into a phantom cwd and die with an empty log. The missing
+    path must be named, with the way to fix it."""
+    gone = tmp_path / "worktrees" / "orch-default-on"
+    run_dir = tmp_path / "run"
+    _write_profile(run_dir, roots={"target": str(gone)})
+    roots = run_roots.load_run_roots(str(run_dir))
+    assert roots is not None
+    with pytest.raises(run_roots.RunTargetMissing) as excinfo:
+        run_roots.require_run_target(roots=roots)
+    message = str(excinfo.value)
+    assert str(gone) in message
+    assert "MO_TARGET_CWD" in message
+
+
+def test_require_run_target_is_empty_for_a_legacy_run_dir():
+    """No persisted roots → "" so the caller keeps its own lazy resolution."""
+    assert run_roots.require_run_target(roots=None) == ""
 
 
 # ─── Divergence: pinned record rescues baseline + implementer from cwd drift

@@ -163,17 +163,40 @@ def _charge_cost(db, run_id):
         pass
 
 
+# ``task_runs.verdict`` is constrained to the reviewer enum or NULL. A
+# plan-stage reason (``parse_error``, ``planner_dispatch_rc_4``, …) is not a
+# member, and writing it raised — which, because the status and the verdict are
+# set in ONE statement, threw away the ``status='failed'`` write too. Every
+# ``_mark_failed`` call in this module was therefore a silent no-op, and a run
+# whose plan was rejected was left exactly as it was found.
+_VERDICT_ENUM = ("APPROVE", "REQUEST_CHANGES", "ESCALATE", "CRASH")
+
+
 def _mark_failed(db, run_id, verdict):
+    """Mark the run failed, recording ``verdict`` where the schema can hold it.
+
+    The status is written unconditionally. The verdict column is written only
+    when the value is one the CHECK constraint accepts; any other value is
+    appended to ``notes`` instead (the ``'; '``-separated slot the retry
+    machinery already reads for ``killed-by-user``), so the reason survives
+    without fighting the schema.
+    """
     if not (db and os.path.isfile(db) and run_id):
         return
     import sqlite3
+    now = int(time.time())
+    legal = verdict if verdict in _VERDICT_ENUM else None
+    reason = "" if legal else (verdict or "")
     try:
         con = sqlite3.connect(db, timeout=5)
         con.execute("PRAGMA busy_timeout=5000")
-        now = int(time.time())
         con.execute("UPDATE task_runs SET status='failed', verdict=COALESCE(verdict, ?), "
                     "updated_at=?, ended_at=COALESCE(ended_at, ?) WHERE id=?",
-                    (verdict, now, now, run_id))
+                    (legal, now, now, run_id))
+        if reason:
+            con.execute("UPDATE task_runs SET notes = CASE WHEN COALESCE(notes, '') = '' "
+                        "THEN ? ELSE notes || '; ' || ? END WHERE id=?",
+                        (reason, reason, run_id))
         con.commit(); con.close()
     except Exception:
         pass
@@ -904,6 +927,12 @@ def main(argv=None, *, root=None, dispatch=None) -> int:
         if rc != 0:
             sys.stderr.write(f"LLM dispatch failed for planner node (rc={rc}): {_dispatch_error_detail(raw)}\n")
             _charge_cost(db, run_id)
+            # Record WHY the run died. Without this the run keeps whatever
+            # status it had, so the board shows a red run with nothing red
+            # inside it — no node ever ran, and the only explanation (the
+            # planner's LLM call) lives in ``llm_calls``, which no surface
+            # attributes to the run.
+            _mark_failed(db, run_id, f"planner_dispatch_rc_{rc}")
             _trace_plan(trace_id, task_class, "failure", db, reason=f"planner_dispatch_rc_{rc}")
             return 1
 

@@ -34,7 +34,11 @@ from mini_ork.dispatch.run_env import RunEnvError, effective_node_overrides, loa
 from mini_ork.dispatch.secrets import SecretStoreError
 from mini_ork.dispatch.skill_registry import granted_skills, materialize_skills
 from mini_ork.dispatch.vault import vault_environment
-from mini_ork.runtime.run_roots import load_run_roots
+from mini_ork.runtime.run_roots import (
+    RunTargetMissing,
+    load_run_roots,
+    require_run_target,
+)
 from mini_ork.verify import levels as _levels
 from mini_ork.cli.main import _module_env, _reflect_timeout_seconds
 from mini_ork.observability.node_events import _now_ms, mo_node_emit, mo_node_end, mo_node_start
@@ -1308,7 +1312,16 @@ def _handle_implementer(ctx: NodeDispatch):
     # dirs created before epic 01 landed). The drive redirect still applies on
     # top of the resolved target — see req #4 of remote-nodes-01.
     roots = load_run_roots(ctx.run_dir_eff or ctx.run_dir)
-    target = roots.target if roots else _resolve_target_cwd(ctx.run_dir_eff)
+    if roots is not None:
+        # A recorded target that is gone is a hard stop, not a silent phantom
+        # cwd for the implementer to spawn into. Name it and say how to fix it.
+        try:
+            target = require_run_target(roots=roots)
+        except RunTargetMissing as exc:
+            print(f"  [cwd] {exc}", file=sys.stderr)
+            return 1, "config"
+    else:
+        target = _resolve_target_cwd(ctx.run_dir_eff)
     # P1b: opt-in shared-drive routing. No-op unless MO_SHARED_DRIVE_BACKEND is
     # set, so the default host-tree cwd is unchanged; when set, every node in the
     # run shares one virtual drive (lazy import keeps the seam side-effect-free).
