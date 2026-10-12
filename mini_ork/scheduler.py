@@ -266,7 +266,16 @@ def cost_pause_active(home: str | None = None) -> bool:
 
 def resolve_kickoff(epic_id: str, root: str, recipe: str,
                     db: str | None = None) -> str | None:
-    """kickoff_path column -> kickoffs/<id>.md -> recipe example (bash order)."""
+    """kickoff_path column -> kickoffs/<id>.md (bash order minus the example).
+
+    An epic with no kickoff column AND no on-disk ``kickoffs/<id>.md`` returns
+    ``None``; the caller (only ``dispatch_epic``) escalates it instead of falling
+    back to ``recipes/<recipe>/example-kickoff.md``. The bash rung silently
+    burned model budget on the example whenever ``epics add`` or ingest forgot
+    a kickoff; the explicit escalation makes a missing kickoff a visible
+    operator problem rather than a default that "looks like" a real one.
+    The ``recipe`` argument is kept for signature stability with existing callers.
+    """
     con = _conn(db)
     try:
         row = con.execute("SELECT kickoff_path FROM epics WHERE id=?",
@@ -277,9 +286,6 @@ def resolve_kickoff(epic_id: str, root: str, recipe: str,
     if kp and os.path.isfile(os.path.join(root, kp)):
         return os.path.join(root, kp)
     cand = os.path.join(root, "kickoffs", f"{epic_id}.md")
-    if os.path.isfile(cand):
-        return cand
-    cand = os.path.join(root, "recipes", recipe, "example-kickoff.md")
     if os.path.isfile(cand):
         return cand
     return None
@@ -653,6 +659,18 @@ def dispatch_epic(epic_id: str, root: str, home: str, recipe: str,
     recipe = (epic.get("recipe") or "").strip() or recipe
     kickoff = resolve_kickoff(epic_id, root, recipe, db)
     if not kickoff:
+        if dry_run:
+            # A dry-run is a preview, not a real dispatch: the 'escalated' status
+            # is a real-dispatch outcome and must not leak into the queue. The
+            # --once contract returns rc=0 on a clean preview, so print what the
+            # next real dispatch would see and exit cleanly — otherwise
+            # ``scheduler --once --dry-run`` would burn any kickoff-less epic
+            # the operator was just inspecting.
+            sys.stdout.write(
+                f"  [dry-run] would dispatch: {epic_id} (no kickoff — "
+                f"would escalate at dispatch)\n"
+            )
+            return "no_kickoff_dry_run", 0
         _set_status(db, epic_id, "escalated", " [scheduler: no kickoff]")
         return "no_kickoff", 1
 

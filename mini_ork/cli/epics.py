@@ -26,6 +26,22 @@ _USAGE = """Usage: mini-ork epics <subcommand> [args]
   ingest <roadmap.md>          Parse roadmap markdown -> epics + deps
   split <roadmap.md>           Emit per-epic kickoff files under kickoffs/auto/
                                and set epics.kickoff_path for each.
+  add --title T [--kickoff PATH] [--priority N] [--recipe R] [--json]
+                               Queue one epic from a title plus a kickoff file.
+                               The id is the title slug; a clash with an
+                               existing id adds "-2", "-3", ... in insertion
+                               order. The kickoff file is copied to
+                               kickoffs/auto/<id>.md and recorded in
+                               epics.kickoff_path. Status 'not started' on
+                               insert; --priority (integer) sets the base
+                               priority used by the scheduler; --recipe pins
+                               the scheduler's per-epic recipe; --json emits
+                               the new epic as JSON on stdout. --kickoff is
+                               optional — the row is inserted with a NULL
+                               kickoff_path and the scheduler will escalate
+                               it on dispatch. Refuses with rc=2 if --kickoff
+                               is set but points at a non-existent file, an
+                               empty file, or a whitespace-only file.
   list [--status STATUS]       List epics (default: active, non-archived)
   ready                        List ready-to-dispatch epics
   show <epic_id>               Show one epic + its deps
@@ -75,6 +91,100 @@ def _slugify(title: str) -> str:
     s = re.sub(r"[^a-z0-9-]+", "-", title.lower().strip()).strip("-")
     s = re.sub(r"-+", "-", s)
     return s or "epic"
+
+
+def _unique_id(base: str, con) -> str:
+    """Return the first id of the form base, base-2, base-3, ... unused in epics."""
+    if not con.execute("SELECT 1 FROM epics WHERE id=?", (base,)).fetchone():
+        return base
+    n = 2
+    while con.execute("SELECT 1 FROM epics WHERE id=?", (f"{base}-{n}",)).fetchone():
+        n += 1
+    return f"{base}-{n}"
+
+
+def _add(rest: list[str], db: str, root: str) -> int:
+    """`epics add --title T [--kickoff PATH] [--priority N] [--recipe R] [--json]`.
+
+    Refuses with rc=2 when --title is missing/empty, --kickoff is set but
+    missing/empty/whitespace-only, --priority is set but not an integer, or
+    an unknown flag is passed. On success: ensures the priority + retry
+    schema, copies the source kickoff into ``kickoffs/auto/<id>.md`` (creating
+    the directory if needed), and inserts one ``epics`` row with status
+    'not started' — the kickoff_path column set so ``resolve_kickoff`` finds
+    it without the ``kickoffs/<id>.md`` fallback rung.
+    """
+    import json as _json
+    title = ""
+    kickoff_src = None
+    priority = None
+    recipe = None
+    as_json = False
+    i = 0
+    while i < len(rest):
+        flag = rest[i]
+        if flag == "--title" and i + 1 < len(rest):
+            title = rest[i + 1]; i += 2
+        elif flag == "--kickoff" and i + 1 < len(rest):
+            kickoff_src = rest[i + 1]; i += 2
+        elif flag == "--priority" and i + 1 < len(rest):
+            val = rest[i + 1]
+            if not re.fullmatch(r"-?[0-9]+", val):
+                sys.stderr.write(f"add: --priority must be an integer (got: {val})\n")
+                return 2
+            priority = int(val); i += 2
+        elif flag == "--recipe" and i + 1 < len(rest):
+            recipe = rest[i + 1]; i += 2
+        elif flag == "--json":
+            as_json = True; i += 1
+        else:
+            sys.stderr.write(f"add: unknown or incomplete flag {flag}\n"); return 2
+    title = title.strip()
+    if not title:
+        sys.stderr.write("add: --title is required\n"); return 2
+    if kickoff_src is not None:
+        if not os.path.isfile(kickoff_src):
+            sys.stderr.write(f"add: --kickoff not found: {kickoff_src}\n"); return 2
+        try:
+            content = Path(kickoff_src).read_text(encoding="utf-8")
+        except OSError as err:
+            sys.stderr.write(f"add: cannot read --kickoff {kickoff_src}: {err}\n")
+            return 2
+        if not content.strip():
+            sys.stderr.write("add: --kickoff is empty\n"); return 2
+
+    from mini_ork import scheduler  # local import: scheduler owns the migrations
+    scheduler.ensure_priority_column(db)
+    _ensure_retry_schema(db)
+    con = sqlite3.connect(db)
+    try:
+        epic_id = _unique_id(_slugify(title), con)
+        auto_dir = Path(root) / "kickoffs" / "auto"
+        auto_dir.mkdir(parents=True, exist_ok=True)
+        dest_rel = f"kickoffs/auto/{epic_id}.md"
+        if kickoff_src is not None:
+            (auto_dir / f"{epic_id}.md").write_text(content, encoding="utf-8")
+        con.execute(
+            "INSERT INTO epics(id, title, status, kickoff_path) VALUES(?, ?, 'not started', ?)",
+            (epic_id, title[:200], dest_rel if kickoff_src is not None else None))
+        if priority is not None:
+            con.execute("UPDATE epics SET priority=? WHERE id=?", (priority, epic_id))
+        if recipe is not None:
+            con.execute("UPDATE epics SET recipe=? WHERE id=?", (recipe, epic_id))
+        con.commit()
+    finally:
+        con.close()
+
+    if as_json:
+        sys.stdout.write(_json.dumps({
+            "id": epic_id, "title": title, "status": "not started",
+            "priority": priority, "recipe": recipe,
+            "kickoff_path": dest_rel if kickoff_src is not None else None,
+        }) + "\n")
+    else:
+        kickoff_note = f" -> {dest_rel}" if kickoff_src is not None else " (no kickoff — will escalate at dispatch)"
+        sys.stdout.write(f"add: queued {epic_id}{kickoff_note}\n")
+    return 0
 
 
 def _parse_epics(text: str):
@@ -373,6 +483,8 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
         return ingest(rest[0], db) if rest else (sys.stderr.write("roadmap.md path required\n") or 2)
     if sub == "split":
         return split(rest[0], db, root) if rest else (sys.stderr.write("roadmap.md path required\n") or 2)
+    if sub == "add":
+        return _add(rest, db, root)
     if sub == "list":
         status = ""
         for i, a in enumerate(rest):
