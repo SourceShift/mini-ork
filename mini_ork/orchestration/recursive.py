@@ -283,6 +283,12 @@ def mo_recursive_approve_spawn(
                     f"max_parallel_children is {policy['max_parallel_children']}"
                 )
 
+            # Upsert, not INSERT: a caller that re-spawns the same logical child
+            # (the epic-runner dispatcher derives child_run_id from parent+epic id,
+            # so a retried epic reuses it) would otherwise die on
+            # run_spawns.child_run_id's UNIQUE constraint. Reusing the row also
+            # keeps the descendant cap honest -- a retry does not consume a second
+            # lifetime slot -- and preserves created_at as the first-spawn record.
             con.execute(
                 """
                 INSERT INTO run_spawns(
@@ -291,6 +297,19 @@ def mo_recursive_approve_spawn(
                   status, policy_snapshot_json, created_at, updated_at
                 )
                 VALUES (?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, 'approved', ?, ?, ?)
+                ON CONFLICT(child_run_id) DO UPDATE SET
+                  spawn_id=excluded.spawn_id,
+                  parent_run_id=excluded.parent_run_id,
+                  root_run_id=excluded.root_run_id,
+                  depth=excluded.depth,
+                  recipe=excluded.recipe,
+                  kickoff_path=excluded.kickoff_path,
+                  child_workspace=excluded.child_workspace,
+                  authority_level=excluded.authority_level,
+                  allow_child_spawn=excluded.allow_child_spawn,
+                  status='approved',
+                  policy_snapshot_json=excluded.policy_snapshot_json,
+                  updated_at=excluded.updated_at
                 """,
                 (
                     spawn_id,

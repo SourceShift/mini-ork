@@ -311,6 +311,45 @@ def test_approve_spawn_terminal_children_release_budget(temp_db, monkeypatch):
     assert sp["status"] == "approved"
 
 
+def test_approve_spawn_reuses_child_row_on_redispatch(temp_db):
+    """Regression: re-approving the same logical child is an UPSERT, not an INSERT.
+
+    The epic-runner dispatcher derives ``child_run_id`` as
+    ``{parent_run_id}-{epic_id}`` (recipes/epic-runner/lib/epic_dispatcher.py), so
+    retrying a failed epic reuses the id. A plain INSERT died on
+    ``run_spawns.child_run_id``'s UNIQUE constraint (sqlite3.IntegrityError
+    raised out of cli/spawn.py), and the revive never reached its child.
+
+    Reuse must keep the row, not duplicate it: exactly one ``run_spawns`` row
+    before and after, ``created_at`` surviving as the first-spawn record, and the
+    mutable columns (status, kickoff, authority) taking the new values.
+    """
+    parent_id = "parent-redis"
+    _seed_parent(temp_db, parent_id)
+    _seed_spawn(temp_db, "sp-orig", parent_id, "child-redis", status="failed")
+
+    # A retry after a failed attempt: same child id, new kickoff + authority.
+    py.mo_recursive_approve_spawn(
+        parent_id, "child-redis", "code-fix", "/tmp/new-k.md",
+        "/tmp/ws", 1, 0.7, 1,
+    )
+
+    spawns = _row_dicts(temp_db, "run_spawns")
+    assert len(spawns) == 1, f"re-dispatch must reuse the row, got {spawns}"
+    sp = spawns[0]
+    assert sp["status"] == "approved", "the retried child returns to approved"
+    assert sp["kickoff_path"] == "/tmp/new-k.md"
+    assert abs(float(sp["authority_level"]) - 0.7) <= 1e-6
+    assert sp["allow_child_spawn"] == 1
+    # created_at is the first-spawn record and must survive the upsert.
+    assert sp["created_at"] == 0, "created_at must not be rewritten on retry"
+    assert sp["updated_at"] > 0, "updated_at must advance to the re-dispatch"
+    assert sp["spawn_id"] != "sp-orig", "a fresh spawn_id is minted per approval"
+
+    # The child task_run is likewise upserted, not duplicated: parent + child only.
+    assert len(_row_dicts(temp_db, "task_runs")) == 2
+
+
 def test_approve_spawn_blocked_by_outstanding_children(temp_db, monkeypatch):
     """Non-terminal (approved/running) children DO consume the budget: once
     ``max_children_per_run`` are outstanding, a further spawn is blocked. Keeps
