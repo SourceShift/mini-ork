@@ -26,9 +26,9 @@ The repo-surface anchors used throughout:
   dispatch-mode helpers in `_resolve_dispatch_mode` at
   `mini_ork/cli/execute.py:317`, parallel-batch dispatch in
   `_run_parallel_batch` at `mini_ork/cli/execute.py:489`, outcome
-  classification in `classify_outcome` at `mini_ork/cli/execute.py:216`,
-  steering guard in `guard_steer` at `mini_ork/cli/execute.py:321`, and
-  `_post_run_learning` at `mini_ork/cli/execute.py:1450`.
+  classification in `classify_outcome` at `mini_ork/orchestration/runner_orchestrator.py:216`,
+  steering guard in `guard_steer` at `mini_ork/orchestration/runner_orchestrator.py:321`, and
+  `_post_run_learning` at `mini_ork/cli/execute.py:1473`.
 - `mini_ork/recovery/dag.py` — DAG model (`DAG` at
   `mini_ork/recovery/dag.py:130`, `load_dag` at
   `mini_ork/recovery/dag.py:175`) and `CompiledRetryEdge` at
@@ -66,7 +66,7 @@ stateful.
    `run_events` table written by `mini_ork/observability/node_events.py:235`
    already records node lifecycle rows on the same insert path; mini-ork just
    does not replay from them — `classify_outcome` at
-   `mini_ork/cli/execute.py:216` decides the terminal finish reason off the
+   `mini_ork/orchestration/runner_orchestrator.py:216` decides the terminal finish reason off the
    last row, not the whole history. *Adopt?* `extend`.
 3. **Workflow versioning with `PATCHED` / `getVersion()`.** *Why:* lets a
    non-backwards-compatible code change ship without forking in-progress runs.
@@ -77,8 +77,8 @@ stateful.
    `partial` — tighten the load path to refuse mismatched versions.
 4. **Signals, queries, and the update RPC.** *Why:* external mid-flight
    intervention without forking the run. *Partial surface:* the steering
-   guard at `mini_ork/cli/execute.py:321` (`guard_steer`) and renderer at
-   `mini_ork/cli/execute.py:334` (`steer_message`) are exactly this in
+   guard at `mini_ork/orchestration/runner_orchestrator.py:321` (`guard_steer`) and renderer at
+   `mini_ork/orchestration/runner_orchestrator.py:334` (`steer_message`) are exactly this in
    miniature, fed by `steer_run` at `mini_ork/web/control.py:550`. The
    surface is the same shape as Temporal updates; the gap is that mini-ork's
    guard rejects messages that touch routing/termination (`guard_steer` only
@@ -92,7 +92,7 @@ stateful.
    a recipe kickoff yet. *Adopt?* `extend`.
 6. **Continue-as-new bound.** *Why:* caps history growth on long-running
    workflows. *Partial surface:* `_post_run_learning` at
-   `mini_ork/cli/execute.py:1450` performs a write-back at run close that is
+   `mini_ork/cli/execute.py:1473` performs a write-back at run close that is
    analogous (a checkpoint-style summary), but mini-ork has no in-run
    continue-as-new analogue. *Adopt?* `adopt` — but only after the
    durable-replay story above lands; otherwise the continue-as-new loses
@@ -162,7 +162,7 @@ lessons Airflow learned the hard way.
 1. **XCom-style small-payload inter-task data.** *Why:* tiny values
    (decisions, IDs, short summaries) should not require an artifact round-trip.
    *Partial surface:* the `run_events` table records `(key, value)`-style
-   payloads — see `_emit` at `mini_ork/cli/execute.py:415` — but there is no
+   payloads — see `mo_node_emit` at `mini_ork/observability/node_events.py:165` — but there is no
    queryable XCom view; consumers have to scrape `run_events` rows. *Adopt?*
    `partial`.
 2. **Scheduler with backfills and catchup.** *Why:* mini-ork has no
@@ -190,7 +190,7 @@ lessons Airflow learned the hard way.
    `partial` — surface cache hits as attempt counts in the run summary.
 6. **DAG-level `start_date` / `end_date` filters.** *Why:* lets old DAGs
    stop accepting new runs. *Partial surface:* `_post_run_learning` at
-   `mini_ork/cli/execute.py:1450` runs once at close but there is no
+   `mini_ork/cli/execute.py:1473` runs once at close but there is no
    pre-flight guard against running an expired recipe. *Adopt?* `adopt`.
 
 ---
@@ -213,7 +213,7 @@ parity gap.
 2. **Sensors / triggers that wait on an upstream state.** *Why:* lets a run
    start only when its source data is ready, instead of polling. *Partial
    surface:* the steering channel (`steer_run` at
-   `mini_ork/web/control.py:550`, guard at `mini_ork/cli/execute.py:321`)
+   `mini_ork/web/control.py:550`, guard at `mini_ork/orchestration/runner_orchestrator.py:321`)
    can nudge a running node; the gap is that there is no *wait-for-state*
    primitive — the run has to keep retrying. *Adopt?* `adopt`.
 3. **Materialized asset catalog.** *Why:* in Dagster, every run leaves a
@@ -334,7 +334,7 @@ distributed execution.
 1. **Distributed actor model.** *Why:* lets a node fan out to many workers
    without the engine owning the cluster. *Partial surface:* the remote
    session path in `_provision_remote_session` at
-   `mini_ork/cli/execute.py:1422` and the node-agent HTTP server at
+   `mini_ork/cli/execute.py:1445` and the node-agent HTTP server at
    `mini_ork/remote/node_agent/app.py` (see `post_session` referenced at
    `mini_ork/remote/node_agent/images.py:406`) is a hand-rolled actor
    surface; there is no Ray-style autoscaler on top. *Adopt?* `partial` —
@@ -411,11 +411,11 @@ test -f mini_ork/remote/node_agent/app.py
 awk 'NR==804' mini_ork/cli/execute.py        # main entry
 awk 'NR==317' mini_ork/cli/execute.py        # _resolve_dispatch_mode
 awk 'NR==489' mini_ork/cli/execute.py        # _run_parallel_batch
-awk 'NR==216' mini_ork/cli/execute.py        # classify_outcome
-awk 'NR==321' mini_ork/cli/execute.py        # guard_steer
-awk 'NR==334' mini_ork/cli/execute.py        # steer_message
-awk 'NR==1422' mini_ork/cli/execute.py       # _provision_remote_session
-awk 'NR==1450' mini_ork/cli/execute.py       # _post_run_learning
+awk 'NR==216' mini_ork/orchestration/runner_orchestrator.py        # classify_outcome
+awk 'NR==321' mini_ork/orchestration/runner_orchestrator.py        # guard_steer
+awk 'NR==334' mini_ork/orchestration/runner_orchestrator.py        # steer_message
+awk 'NR==1445' mini_ork/cli/execute.py       # _provision_remote_session
+awk 'NR==1473' mini_ork/cli/execute.py       # _post_run_learning
 awk 'NR==548' mini_ork/cli/execute.py        # ExecuteArgs
 awk 'NR==649' mini_ork/cli/execute.py        # _apply_recovery_filter
 awk 'NR==41'  mini_ork/recovery/dag.py       # CompiledRetryEdge
