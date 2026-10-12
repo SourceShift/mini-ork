@@ -357,3 +357,59 @@ def test_build_parse_error_payload():
         "items": [],
         "parse_error_diagnostic": diag,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# panel-verdict.json merge (run-1791760519-72158 D1): the prescreen write used
+# to clobber a panel-gate agent's verdict+reasons with its scoring shape; it
+# must merge with existing keys authoritative + a namespaced "prescreen" key.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fake_dispatch_emitting(payload):
+    from mini_ork.dispatch import llm_dispatch
+    def fake(argv, *, root):
+        print(payload)
+        return 0
+    return fake
+
+
+def test_run_score_preserves_agent_panel_verdict(tmp_path, monkeypatch):
+    kickoff = tmp_path / "kickoff.md"
+    kickoff.write_text("# Kickoff\nbody\n")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "panel-verdict.json").write_text(json.dumps({
+        "verdict": "ESCALATE",
+        "reasons": ["cross-lens contradiction on probe P2"],
+        "dod_probe_results": [{"id": "P1", "panel_consensus": "pass"}],
+    }))
+    monkeypatch.setattr(
+        "mini_ork.dispatch.llm_dispatch.llm_dispatch",
+        _fake_dispatch_emitting(json.dumps({"pass": True, "score": 6, "items": []})))
+    rp.mo_rubric_run_score(
+        kickoff_path=str(kickoff), run_dir=str(run_dir),
+        task_class="recursive_validate_impl",
+        mini_ork_root=str(REPO), mini_ork_home=str(tmp_path))
+    merged = json.loads((run_dir / "panel-verdict.json").read_text())
+    assert merged["verdict"] == "ESCALATE"                    # agent keys authoritative
+    assert merged["reasons"][0].startswith("cross-lens")
+    assert merged["panel_score"] == 75.0                      # fills only absent keys
+    assert merged["prescreen"]["pass"] is True                # namespaced, refreshable
+
+
+def test_run_score_fresh_dir_keeps_prescreen_shape(tmp_path, monkeypatch):
+    kickoff = tmp_path / "kickoff.md"
+    kickoff.write_text("# Kickoff\nbody\n")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setattr(
+        "mini_ork.dispatch.llm_dispatch.llm_dispatch",
+        _fake_dispatch_emitting(json.dumps({"pass": False, "score": 2, "items": []})))
+    rp.mo_rubric_run_score(
+        kickoff_path=str(kickoff), run_dir=str(run_dir),
+        task_class="generic",
+        mini_ork_root=str(REPO), mini_ork_home=str(tmp_path))
+    doc = json.loads((run_dir / "panel-verdict.json").read_text())
+    assert doc["panel_score"] == 25.0
+    assert doc["pass"] is False
+    assert doc["prescreen"]["panel_score"] == 25.0

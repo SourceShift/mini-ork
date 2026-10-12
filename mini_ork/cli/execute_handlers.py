@@ -1502,6 +1502,38 @@ def _append_run_note(db: str, run_id: str, note: str) -> None:
         print(f"  [warn] could not record '{note}' in task_runs.notes: {exc}", file=sys.stderr)
 
 
+_REVIEW_EVIDENCE_KEYS = (
+    "notes", "reasons", "blockers", "findings", "dod_probe_results",
+    "failure_pattern",
+)
+
+
+def _review_verdict_envelope(review_file: str, verdict: str) -> dict:
+    """``{"verdict": <word>}`` plus the blocker evidence the review file holds.
+
+    review-verdict.json is the cross-process channel the publisher and the
+    revise loop read. A bare verdict word starves every revise round:
+    run-1791760519-72158 D1 (p1-2) had a tier4_synth panel verdict ESCALATE
+    with per-lens ``dod_probe_results`` in the review file, the envelope
+    carried only the word, and the implementer's repair attempt was blind.
+    Merge the finding-bearing keys (bounded by json.dumps at the read side);
+    a prose/unparseable review file degrades to today's verdict-only shape.
+    """
+    envelope: dict = {"verdict": verdict}
+    try:
+        with open(review_file, encoding="utf-8", errors="replace") as fh:
+            parsed = json.load(fh)
+    except (OSError, ValueError):
+        return envelope
+    if not isinstance(parsed, dict):
+        return envelope
+    for key in _REVIEW_EVIDENCE_KEYS:
+        value = parsed.get(key)
+        if value:
+            envelope[key] = value
+    return envelope
+
+
 def _handle_reviewer(ctx: NodeDispatch):
     review_file, is_panel_gate, is_synth = _classify_review_node(
         ctx.recipe_eff, ctx.node_id, ctx.root, ctx.run_dir)
@@ -1575,7 +1607,7 @@ def _handle_reviewer(ctx: NodeDispatch):
     try:
         with open(os.path.join(ctx.run_dir, "review-verdict.json"), "w",
                   encoding="utf-8") as handle:
-            json.dump({"verdict": verdict}, handle)
+            json.dump(_review_verdict_envelope(review_file, verdict), handle)
     except OSError:
         pass
     vn = verdict.lower()

@@ -631,13 +631,29 @@ def mo_rubric_run_score(
         file=__import__("sys").stderr,
     )
 
-    # Panel verdict for the promotion gate: 0-8 → 0-100.
+    # Panel verdict for the promotion gate: 0-8 → 0-100. MERGE, never
+    # overwrite: recursive-validate-impl's tier4_synth owns panel-verdict.json
+    # (verdict + reasons + dod_probe_results), and a fresh clobber destroyed
+    # the only canonical copy of the blockers the revise loop feeds on
+    # (run-1791760519-72158 D1: the agent's ESCALATE + per-lens probes were
+    # replaced by {panel_score, pass, source: rubric-prescreen}). Existing
+    # keys stay authoritative (setdefault); the payload also lands under a
+    # namespaced "prescreen" key so the score is refreshable on re-runs.
     if score != -1:
+        prescreen = build_panel_verdict(int(score), passed, task_class)
+        existing: dict = {}
+        try:
+            with open(verdict_path) as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                existing = loaded
+        except (OSError, ValueError):
+            existing = {}
+        for key, value in prescreen.items():
+            existing.setdefault(key, value)
+        existing["prescreen"] = prescreen
         with open(verdict_path, "w") as f:
-            json.dump(
-                build_panel_verdict(int(score), passed, task_class),
-                f,
-            )
+            json.dump(existing, f)
 
     # Learning hook: persist as an execution trace. Mirror bash lines
     # 346-360: if ``trace_write`` is not available, skip silently.

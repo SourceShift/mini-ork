@@ -3390,6 +3390,54 @@ def _verifier_log_candidates(run_dir: str, stem: str) -> list[str]:
     return [p for p in out if os.path.isfile(p)]
 
 
+def _reviewer_evidence_candidates(run_dir: str, node_id: str) -> list[str]:
+    """Existing reviewer-evidence paths, in preference order.
+
+    A reviewer's file depends on its node class: the classic reviewer writes
+    ``review-<id>.json``; a panel gate (recursive-validate-impl/tier4_synth)
+    writes ``panel-verdict.json`` — which rubric-prescreen may later overwrite
+    with its scoring shape, the agent's own object surviving only in
+    ``panel-verdict.json.stdout.md`` (write_preserving_agent's capture). The
+    engine-written ``review-verdict.json`` envelope (verdict + merged reasons)
+    is the most stable of the four. Only paths that exist are returned."""
+    out = [os.path.join(run_dir, f"review-{node_id}.json"),
+           os.path.join(run_dir, "review-verdict.json"),
+           os.path.join(run_dir, "panel-verdict.json.stdout.md"),
+           os.path.join(run_dir, "panel-verdict.json")]
+    return [p for p in out if os.path.isfile(p)]
+
+
+def _load_review_json(path: str):
+    """(dict-or-None, raw-body) for a reviewer evidence file.
+
+    Tolerates the agent echo's ```json fences and surrounding prose (the
+    ``.stdout.md`` capture holds both): plain ``json.loads`` first, then the
+    first brace-balanced object via ``raw_decode`` scans. Mirrors
+    ``_parse_verifier_json``'s banner tolerance for the reviewer side."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            body = fh.read()
+    except OSError:
+        return None, ""
+    try:
+        obj = json.loads(body)
+        if isinstance(obj, dict):
+            return obj, body
+    except ValueError:
+        pass
+    decoder = json.JSONDecoder()
+    start = body.find("{")
+    while start != -1:
+        try:
+            obj, _end = decoder.raw_decode(body, start)
+            if isinstance(obj, dict):
+                return obj, body
+        except ValueError:
+            pass
+        start = body.find("{", start + 1)
+    return None, body
+
+
 def _revise_failure_section(run_dir: str, field, finish_reason: str) -> str:
     """One per-source section of a revise feedback file."""
     node_id, node_type = field[0], field[1]
@@ -3447,20 +3495,20 @@ def _revise_failure_section(run_dir: str, field, finish_reason: str) -> str:
                     lines.extend(line.rstrip("\n") for line in tail)
                     break
     elif node_type == "reviewer":
-        review_file = os.path.join(run_dir, f"review-{node_id}.json")
-        body = ""
-        if os.path.isfile(review_file):
-            try:
-                with open(review_file, encoding="utf-8", errors="replace") as fh:
-                    body = fh.read()
-            except OSError:
-                body = ""
-        data = None
-        if body:
-            try:
-                data = json.loads(body)
-            except Exception:
-                data = None
+        # A reviewer's evidence file depends on its node class (see
+        # _reviewer_evidence_candidates); the first candidate that parses to a
+        # dict wins. A missing classic review-<id>.json used to leave the
+        # section empty, so a failed panel-gate run revised blind
+        # (run-1791760519-72158 D1: feedback was only "the change needs a
+        # revision" while panel-verdict.json held per-lens blockers).
+        data, body, source_name = None, "", ""
+        for candidate in _reviewer_evidence_candidates(run_dir, node_id):
+            data, body = _load_review_json(candidate)
+            if data is not None:
+                source_name = os.path.basename(candidate)
+                break
+        if source_name:
+            lines.append(f"review evidence: {source_name}")
         if isinstance(data, dict):
             lines.append(f"verdict: {data.get('verdict', 'unknown')}")
             notes = data.get("notes")
@@ -3472,8 +3520,19 @@ def _revise_failure_section(run_dir: str, field, finish_reason: str) -> str:
                     lines.append(f"notes: {notes}")
             elif data.get("reasons"):
                 lines.append(f"reasons: {json.dumps(data['reasons'])[:4000]}")
-        else:
+            # Panel-gate probes: the actionable unit is the FAILED probe, and
+            # a passing majority hides it in a long list — surface only the
+            # probes whose panel_consensus is not a pass, bounded.
+            probes = data.get("dod_probe_results")
+            if isinstance(probes, list):
+                for probe in probes:
+                    if isinstance(probe, dict) and probe.get("panel_consensus") != "pass":
+                        lines.append(f"failed probe {probe.get('id', '?')}: "
+                                     f"{json.dumps(probe)[:1500]}")
+        elif body:
             lines.append(f"(review file unparseable): {body[:4000]}")
+        else:
+            lines.append("(no reviewer evidence produced)")
     else:
         lines.append(f"finish reason: {finish_reason or 'failed'}")
     return "\n".join(lines)
@@ -3512,7 +3571,15 @@ def _node_revise_artifacts(run_dir: str, field) -> list[str]:
     if node_type == "verifier":
         return [os.path.join(run_dir, f"verifier_{_verifier_stem(field)}.json")]
     if node_type == "reviewer":
-        return [os.path.join(run_dir, f"review-{node_id}.json")]
+        # Same convention set as _reviewer_evidence_candidates: a panel-gate
+        # reviewer leaves panel-verdict.json (+ the .stdout.md capture) and
+        # the engine-written review-verdict.json envelope. Archiving them
+        # keeps the next round's section reading FRESH evidence, not the
+        # round that just failed. Missing files are skipped by the caller.
+        return [os.path.join(run_dir, f"review-{node_id}.json"),
+                os.path.join(run_dir, "review-verdict.json"),
+                os.path.join(run_dir, "panel-verdict.json.stdout.md"),
+                os.path.join(run_dir, "panel-verdict.json")]
     if node_type == "implementer":
         return [os.path.join(run_dir, f"impl-{node_id}.log")]
     return []
