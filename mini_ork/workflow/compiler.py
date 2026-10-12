@@ -13,6 +13,13 @@ from typing import Any, Mapping
 
 import yaml
 
+from mini_ork.recovery.condition import (
+    ConditionSchemaError,
+    compile_condition,
+    validate_condition_schema,
+)
+from mini_ork.recovery.dag import CompiledRetryEdge
+
 
 class WorkflowCompileError(ValueError):
     """Raised when a workflow cannot be executed safely as an artifact graph."""
@@ -97,7 +104,11 @@ class CompiledWorkflow:
     # failed source's findings back to an ancestor (normally the implementer) for
     # a bounded number of rounds. Excluded from control_parents (the graph stays
     # acyclic); the runtime reads this map to drive the revise loop.
-    retry_edges: dict[str, tuple[str, int]] = field(default_factory=dict)
+    # source -> CompiledRetryEdge for `retries` edges. ``CompiledRetryEdge``
+    # carries ``(target, max_rounds)`` and an optional ``CompiledCondition``
+    # when the edge declares ``condition:``. The runtime reads this map to
+    # drive the revise loop; D3 wires the predicate evaluator into firing.
+    retry_edges: dict[str, CompiledRetryEdge] = field(default_factory=dict)
 
     def node_fields(self, separator: str) -> list[str]:
         return [self.nodes[node_id].dispatch_fields(separator) for node_id in self.topological_order]
@@ -423,7 +434,7 @@ def compile_workflow(path: str | Path) -> CompiledWorkflow:
     # `retries` edges are collected and validated AFTER control parents are
     # built, because the target-must-be-ancestor check needs the reachability
     # implied by the control graph. A source may declare at most one revise edge.
-    retry_edges: dict[str, tuple[str, int]] = {}
+    retry_edges: dict[str, CompiledRetryEdge] = {}
     for raw_edge in raw_edges:
         edge = _mapping(raw_edge, context="workflow edge")
         if str(edge.get("edge_type") or "depends_on") != "retries":
@@ -446,7 +457,31 @@ def compile_workflow(path: str | Path) -> CompiledWorkflow:
                 f"retries edge {source} -> {target} must loop back to an ancestor of "
                 f"{source} through control parents"
             )
-        retry_edges[source] = (target, int(raw_max))
+        # ``condition:`` is optional. When declared, it must pass the C2
+        # compile-time validation (unknown keys, non-string pointer,
+        # non-dict match, non-bool negate) BEFORE the workflow is accepted.
+        # ``ConditionSchemaError`` is a ``ValueError`` subclass — re-raise as
+        # ``WorkflowCompileError`` so the compiler surfaces a uniform error
+        # class regardless of which validator raised. The message already
+        # includes the schema path so the recipe author can locate the
+        # offending key in their workflow.yaml.
+        compiled_condition = None
+        if edge.get("condition") is not None:
+            try:
+                validate_condition_schema(edge)
+            except ConditionSchemaError as exc:
+                raise WorkflowCompileError(
+                    f"retries edge {source} -> {target} {exc}"
+                ) from exc
+            compiled_condition = compile_condition(
+                edge,
+                source_path=f"edges[{raw_edges.index(raw_edge)}].condition",
+            )
+        retry_edges[source] = CompiledRetryEdge(
+            target=target,
+            max_rounds=int(raw_max),
+            condition=compiled_condition,
+        )
 
     return CompiledWorkflow(
         path=workflow_path,
