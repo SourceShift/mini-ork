@@ -1,0 +1,55 @@
+name: orch_smoke_default_on
+version: "0.1.0"
+description: >
+  Engagement harness proving the per-run orchestrator is default-on. Runs
+  the orch_smoke declaration exactly as declared (fail_probe stays failing
+  on purpose, never fixed) with MO_RUN_ORCHESTRATOR unset, and asserts
+  exactly one orchestrator.<kind> event row for fail_probe in run_events.
+  The run is EXPECTED to fail; that failure is the engagement signal. The
+  only declared artifact is the run-dir sidecar — nothing under the
+  target working tree.
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+matches:
+  # 9 keywords (well above the 3-entry floor) so the orch_smoke_default_on
+  # task class wins classification on epics that name the engagement proof
+  # by any of its native terms.
+  keywords:
+    - orch-smoke
+    - orchestrator-smoke
+    - orchestrator default-on
+    - orchestrator engagement
+    - fail_probe
+    - mo_run_orchestrator
+    - run_events
+    - orchestrator event row
+    - failing verifier
+  # Strong-signal regex: kickoff that names the engagement proof by its
+  # output (run_events row count) or its proof target (the run dir
+  # sidecar path) routes here directly.
+  regex:
+    - "orchestrator\\.[a-z_]+"
+    - "verifier-result-fail-probe\\.json"
+    - "keep_artifacts_discard_publish"
+
+default_gates:
+  - budget_gate
+
+risk_class: low
+# Read-mostly: the run is deterministic, fail_probe is intentionally
+# failing, and no source files outside ${MINI_ORK_RUN_DIR} are touched.
+# The orchestrator row is the only side effect and is captured by the
+# canonical run_events writer (no log scraping).
+
+cost_model:
+  min_usd: 0.10
+  max_usd: 2.00
+  # 3 small LLM researchers + 2 zero-LLM verifiers; the fail_probe leg
+  # itself is zero-LLM, zero-network, deterministic.
+  per_researcher_usd: 0.40
+
+runtime_model:
+  min_minutes: 1
+  max_minutes: 8

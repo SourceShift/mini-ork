@@ -1,0 +1,57 @@
+version: "0.1.0"
+task_class: orch_smoke_default_on
+description: >
+  Orchestrator default-on engagement harness. Wraps the orch_smoke
+  declaration EXACTLY as declared (fail_probe → publisher via depends_on,
+  fail_probe → rollback via escalates_to, keep_artifacts_discard_publish)
+  with three family-diverse researcher lenses (codex / glm / kimi) and a
+  pure-python engagement_check verifier. fail_probe is intentionally
+  failing and is never fixed; this run is expected to FAIL — that failure
+  is the signal, not a defect. The engagement_check asserts exactly one
+  orchestrator.<kind> run_events row for fail_probe with MO_RUN_ORCHESTRATOR
+  unset, proving the per-run orchestrator fires by default.
+
+nodes:
+  # ── floor leg: 3 distinct model_lane families (HARD heterogeneity floor) ──
+  # Each lens is small/cheap; budget_gate caps the LLM spend. Parallel
+  # dispatch so the wave finishes in one researcher pass.
+  - { name: smoke_context_lens,     type: researcher, model_lane: codex_lens,
+      prompt_ref: prompts/smoke-context-lens.md,     dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: engagement_design_lens, type: researcher, model_lane: glm_lens,
+      prompt_ref: prompts/engagement-design-lens.md, dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: determinism_lens,       type: researcher, model_lane: kimi_lens,
+      prompt_ref: prompts/determinism-lens.md,       dispatch_mode: parallel, gates: [budget_gate] }
+
+  # ── smoke leg: EXACT orch-smoke declaration, never edited ──
+  # rc=1 every invocation, writes verifier-result-fail-probe.json with pass=false.
+  - { name: fail_probe, type: verifier, prompt_ref: null,
+      verifier_ref: verifiers/fail-probe.py, dispatch_mode: serial }
+
+  # ── proof leg: engagement_check, NOT a control child of fail_probe ──
+  # Asserts exactly one orchestrator.<kind> run_events row for fail_probe.
+  # No edge from fail_probe (anti-pattern: blocked children of failed
+  # parents are dropped). Waits on the 3 researchers via verifies edges
+  # — fail_probe is zero-LLM and instant, so it finishes well before the
+  # LLM lenses return.
+  - { name: engagement_check, type: verifier, prompt_ref: null,
+      verifier_ref: verifiers/engagement-check.py, dispatch_mode: serial }
+
+  # ── universal tail: publisher (depends_on) + rollback (escalates_to) ──
+  - { name: publisher, type: publisher, prompt_ref: null, dispatch_mode: serial }
+  - { name: rollback,  type: rollback,  prompt_ref: null, dispatch_mode: serial }
+
+edges:
+  # Researchers supply context to the engagement proof (verifies = gate).
+  - { from: smoke_context_lens,     to: engagement_check, edge_type: verifies }
+  - { from: engagement_design_lens, to: engagement_check, edge_type: verifies }
+  - { from: determinism_lens,       to: engagement_check, edge_type: verifies }
+
+  # EXACT orch-smoke edges — do not change. fail_probe's failure must
+  # block publisher and escalate to rollback; the recipe-creator's
+  # invariant 'exact-as-declared' binds every drafter here.
+  - { from: fail_probe, to: publisher, edge_type: depends_on }
+  - { from: fail_probe, to: rollback,  edge_type: escalates_to }
+
+# Same rollback strategy as orch-smoke. The expected-failing run keeps
+# its artifacts (the sidecar is the proof) and skips publish.
+rollback_strategy: keep_artifacts_discard_publish

@@ -1,0 +1,15 @@
+# orch-smoke-default-on is an engagement proof, not a producer of repo
+# artifacts. Its only declared output is the run-dir sidecar the failing
+# verifier writes; nothing under the target working tree.
+#
+# Deliberate divergence from orch-smoke's contract: orch-smoke sets
+# outputs: [] so the publisher takes its skip path. Here we declare
+# the sidecar explicitly so the engagement proof is auditable from the
+# contract alone, and we keep the publisher skipped (D-037: nothing
+# under the working tree ⇒ nothing to copy + commit).
+source_artifact: verifier-result-fail-probe.json
+outputs:
+  - ${MINI_ORK_RUN_DIR}/verifier-result-fail-probe.json
+success_verifiers:
+  - fail-probe
+  - engagement-check
