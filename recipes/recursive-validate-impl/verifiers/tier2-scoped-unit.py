@@ -24,6 +24,32 @@ if _engine not in sys.path:
     sys.path.insert(0, _engine)
 from mini_ork.verify.pm import exec_argv, run_argv  # noqa: E402
 
+
+def _root_multi_project_config() -> str:
+    """The repo's root jest config *iff* it declares ``projects``.
+
+    A repo that keeps two jest projects (frontend specs on jsdom, server specs
+    on node) ships a root config whose entire purpose is to route each test
+    path to the project whose ``testMatch`` claims it. Sending every test file
+    this node was handed to ``test:server`` instead makes jest answer
+    "No tests found, exiting with code 1" for ``src/**`` specs — which the node
+    then reads as a CODE failure (run-1791821930-72687, 2026-10-12: two
+    frontend specs failed tier2 with "No files found in <repo root>" while
+    `jest --config jest.config.js --listTests` claimed both).
+    """
+    for cfg in ("jest.config.js", "jest.config.ts", "jest.config.mjs", "jest.config.cjs"):
+        if not os.path.isfile(cfg):
+            continue
+        try:
+            with open(cfg, encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        if re.search(r"\bprojects\s*:", text):
+            return cfg
+    return ""
+
+
 RUN_DIR = os.environ["MINI_ORK_RUN_DIR"]
 
 try:
@@ -110,7 +136,18 @@ else:
             argv = exec_argv(".", "vitest", "run", *TEST_FILES)
     elif os.path.isfile("server/jest.config.js"):
         env = {**os.environ, "JEST_GUARD_SOFT": "1"}
-        argv = run_argv(".", "test:server", "--runTestsByPath", *TEST_FILES)
+        root_cfg = _root_multi_project_config()
+        if root_cfg:
+            # The repo's own router beats picking a side: it claims every test
+            # file this node was handed, in one run. Keep the repo's load guard
+            # when it ships one — the guard is the reason `test:server` exists
+            # as a script rather than a bare jest call.
+            extra = ["--config", root_cfg, "--runTestsByPath", *TEST_FILES]
+            guard = "scripts/jest-guard.sh"
+            argv = (["bash", guard, "raw", "--", *extra] if os.path.isfile(guard)
+                    else exec_argv(".", "jest", *extra))
+        else:
+            argv = run_argv(".", "test:server", "--runTestsByPath", *TEST_FILES)
     else:
         argv = exec_argv(".", "jest", "--runTestsByPath", *TEST_FILES)
     ev.write(f"$ {shlex.join(argv)}\n")
