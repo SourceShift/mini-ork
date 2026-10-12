@@ -26,7 +26,7 @@ _USAGE = """Usage: mini-ork epics <subcommand> [args]
   ingest <roadmap.md>          Parse roadmap markdown -> epics + deps
   split <roadmap.md>           Emit per-epic kickoff files under kickoffs/auto/
                                and set epics.kickoff_path for each.
-  add --title T [--kickoff PATH] [--priority N] [--recipe R] [--json]
+  add --title T --kickoff PATH [--priority N] [--recipe R] [--json]
                                Queue one epic from a title plus a kickoff file.
                                The id is the title slug; a clash with an
                                existing id adds "-2", "-3", ... in insertion
@@ -36,12 +36,10 @@ _USAGE = """Usage: mini-ork epics <subcommand> [args]
                                insert; --priority (integer) sets the base
                                priority used by the scheduler; --recipe pins
                                the scheduler's per-epic recipe; --json emits
-                               the new epic as JSON on stdout. --kickoff is
-                               optional — the row is inserted with a NULL
-                               kickoff_path and the scheduler will escalate
-                               it on dispatch. Refuses with rc=2 if --kickoff
-                               is set but points at a non-existent file, an
-                               empty file, or a whitespace-only file.
+                               the new epic as JSON on stdout. Refuses with
+                               rc=2 if --kickoff is missing, points at a
+                               non-existent file, an empty file, or a
+                               whitespace-only file.
   list [--status STATUS]       List epics (default: active, non-archived)
   ready                        List ready-to-dispatch epics
   show <epic_id>               Show one epic + its deps
@@ -104,15 +102,17 @@ def _unique_id(base: str, con) -> str:
 
 
 def _add(rest: list[str], db: str, root: str) -> int:
-    """`epics add --title T [--kickoff PATH] [--priority N] [--recipe R] [--json]`.
+    """`epics add --title T --kickoff PATH [--priority N] [--recipe R] [--json]`.
 
-    Refuses with rc=2 when --title is missing/empty, --kickoff is set but
-    missing/empty/whitespace-only, --priority is set but not an integer, or
-    an unknown flag is passed. On success: ensures the priority + retry
-    schema, copies the source kickoff into ``kickoffs/auto/<id>.md`` (creating
-    the directory if needed), and inserts one ``epics`` row with status
-    'not started' — the kickoff_path column set so ``resolve_kickoff`` finds
-    it without the ``kickoffs/<id>.md`` fallback rung.
+    Refuses with rc=2 when --title is missing/empty, --kickoff is missing
+    entirely (--kickoff is required), --kickoff points at a non-existent
+    file, an empty file, or a whitespace-only file, --priority is set but
+    not an integer, or an unknown flag is passed. On success: ensures the
+    priority + retry schema, copies the source kickoff into
+    ``kickoffs/auto/<id>.md`` (creating the directory if needed), and
+    inserts one ``epics`` row with status 'not started' — the kickoff_path
+    column set so ``resolve_kickoff`` finds it without the
+    ``kickoffs/<id>.md`` fallback rung.
     """
     import json as _json
     title = ""
@@ -142,16 +142,17 @@ def _add(rest: list[str], db: str, root: str) -> int:
     title = title.strip()
     if not title:
         sys.stderr.write("add: --title is required\n"); return 2
-    if kickoff_src is not None:
-        if not os.path.isfile(kickoff_src):
-            sys.stderr.write(f"add: --kickoff not found: {kickoff_src}\n"); return 2
-        try:
-            content = Path(kickoff_src).read_text(encoding="utf-8")
-        except OSError as err:
-            sys.stderr.write(f"add: cannot read --kickoff {kickoff_src}: {err}\n")
-            return 2
-        if not content.strip():
-            sys.stderr.write("add: --kickoff is empty\n"); return 2
+    if kickoff_src is None:
+        sys.stderr.write("add: --kickoff is required\n"); return 2
+    if not os.path.isfile(kickoff_src):
+        sys.stderr.write(f"add: --kickoff not found: {kickoff_src}\n"); return 2
+    try:
+        content = Path(kickoff_src).read_text(encoding="utf-8")
+    except OSError as err:
+        sys.stderr.write(f"add: cannot read --kickoff {kickoff_src}: {err}\n")
+        return 2
+    if not content.strip():
+        sys.stderr.write("add: --kickoff is empty\n"); return 2
 
     from mini_ork import scheduler  # local import: scheduler owns the migrations
     scheduler.ensure_priority_column(db)
@@ -162,11 +163,10 @@ def _add(rest: list[str], db: str, root: str) -> int:
         auto_dir = Path(root) / "kickoffs" / "auto"
         auto_dir.mkdir(parents=True, exist_ok=True)
         dest_rel = f"kickoffs/auto/{epic_id}.md"
-        if kickoff_src is not None:
-            (auto_dir / f"{epic_id}.md").write_text(content, encoding="utf-8")
+        (auto_dir / f"{epic_id}.md").write_text(content, encoding="utf-8")
         con.execute(
             "INSERT INTO epics(id, title, status, kickoff_path) VALUES(?, ?, 'not started', ?)",
-            (epic_id, title[:200], dest_rel if kickoff_src is not None else None))
+            (epic_id, title[:200], dest_rel))
         if priority is not None:
             con.execute("UPDATE epics SET priority=? WHERE id=?", (priority, epic_id))
         if recipe is not None:
@@ -179,11 +179,11 @@ def _add(rest: list[str], db: str, root: str) -> int:
         sys.stdout.write(_json.dumps({
             "id": epic_id, "title": title, "status": "not started",
             "priority": priority, "recipe": recipe,
-            "kickoff_path": dest_rel if kickoff_src is not None else None,
+            "kickoff_path": dest_rel,
         }) + "\n")
     else:
-        kickoff_note = f" -> {dest_rel}" if kickoff_src is not None else " (no kickoff — will escalate at dispatch)"
-        sys.stdout.write(f"add: queued {epic_id}{kickoff_note}\n")
+        sys.stderr.write(f"add: queued {epic_id} -> {dest_rel}\n")
+        sys.stdout.write(f"{epic_id}\n")
     return 0
 
 

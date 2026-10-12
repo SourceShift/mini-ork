@@ -111,14 +111,29 @@ def test_add_inserts_row_and_copies_kickoff(tmp_path: Path) -> None:
 # ── acceptance #2: add refuses with rc=2 and inserts no row ──────────────────
 
 def test_add_refuses_when_kickoff_flag_missing(tmp_path: Path) -> None:
-    """No --kickoff at all: the row still lands (the dispatcher will escalate)."""
+    """No --kickoff at all: ``add`` refuses with rc=2 and inserts no row."""
     w = _world(tmp_path)
-    rc = ep.main(["add", "--title", "Plan only"], db=w["db"], root=w["root"])
-    assert rc == 0  # add allows skipping kickoff; dispatch is what escalates
-    # but the row was still inserted, and the kickoff column is NULL
-    row = _row(w["db"], "SELECT id, kickoff_path FROM epics WHERE id='plan-only'")
-    assert row == ("plan-only", None)
+    stderr = io.StringIO()
+    with redirect_stderr(stderr):
+        rc = ep.main(["add", "--title", "Plan only"], db=w["db"], root=w["root"])
+    assert rc == 2
+    assert "--kickoff is required" in stderr.getvalue()
+    assert _rows(w["db"], "SELECT id FROM epics WHERE id='plan-only'") == []
     assert not (Path(w["root"]) / "kickoffs" / "auto" / "plan-only.md").exists()
+
+
+def test_add_plain_stdout_is_just_the_id(tmp_path: Path) -> None:
+    """Plain (non-JSON) success: stdout is exactly ``<id>\\n``; the queued note goes to stderr."""
+    w = _world(tmp_path)
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        rc = ep.main(["add", "--title", "Investigate the bug",
+                      "--kickoff", w["kickoff_src"]],
+                     db=w["db"], root=w["root"])
+    assert rc == 0
+    assert out.getvalue() == "investigate-the-bug\n"
+    assert ("add: queued investigate-the-bug -> "
+            "kickoffs/auto/investigate-the-bug.md\n") in err.getvalue()
 
 
 def test_add_refuses_when_kickoff_is_nonexistent(tmp_path: Path) -> None:
