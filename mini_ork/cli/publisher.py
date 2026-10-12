@@ -287,6 +287,29 @@ def _run_local_output_status(dst, out, run_dir, required=True):
     return "missing"
 
 
+def _delegated_to_children(db, run_id):
+    """True when ``run_id`` spawned child runs, so its implementation was delegated.
+
+    A delegating run owns no repository edits of its own — its children do the
+    implementing — so an authored patch it cannot produce is expected, not a
+    delivery failure. Returns False (never raises) when the DB is unreadable or
+    predates ``run_spawns``: a home that cannot prove delegation keeps the
+    strict reading.
+    """
+    if not db or not run_id or not os.path.isfile(db):
+        return False
+    import sqlite3  # noqa: PLC0415
+    con = sqlite3.connect(db, timeout=15.0)
+    try:
+        row = con.execute(
+            "SELECT 1 FROM run_spawns WHERE parent_run_id = ? LIMIT 1", (run_id,)).fetchone()
+    except sqlite3.Error:
+        return False
+    finally:
+        con.close()
+    return row is not None
+
+
 def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file="", verdict_env=""):
     """Port of bash publisher branch (:2909-3200). The panel found the port stubbed
     this to `set_status('published')` — this restores the two BLOCKING gates + delivery:
@@ -459,6 +482,22 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
                                     recipe or "code-fix", os.environ.get("MINI_ORK_NODE_DESC", "implementer"),
                                     run_id or "local")
         if abstain_path and os.path.isfile(abstain_path):
+            # A run that DELEGATED its implementation to child runs, under a
+            # contract declaring `outputs: []`, has nothing of its own to
+            # publish: that is epic-runner's smoke_shape no-commit path by
+            # contract ("outputs: [] so the publisher takes the no-commit
+            # path"). Filing it as `failed` reported a green epic —
+            # epic_verifier pass, final_reviewer pass 23/23 — as a delivery
+            # failure (run-1791785967-43108, 2026-10-12). The abstain still
+            # records that nothing was committed; only the status differs.
+            if _delegated_to_children(db, run_id):
+                msg = ("publisher: the run delegated its implementation to child runs and its "
+                       "contract declares outputs: [] — nothing of its own to deliver")
+                print(f"  [ok] {msg}", file=sys.stderr)
+                if db and run_id and os.path.isfile(db):
+                    from mini_ork.orchestration.run_reaper import finalize_passed  # noqa: PLC0415
+                    finalize_passed(db, run_id, msg + "; artifact left in the run dir")
+                return 0, "done"
             # The approved change could not be committed as the run's own patch:
             # nothing was delivered, so the run is not "published". Exit 0 so no
             # rollback discards the work left in the tree.
