@@ -21,7 +21,7 @@ while not os.path.isdir(os.path.join(_engine, "mini_ork")) and _engine != os.pat
     _engine = os.path.dirname(_engine)
 if _engine not in sys.path:
     sys.path.insert(0, _engine)
-from mini_ork.verify.pm import describe, exec_argv, run_argv  # noqa: E402
+from mini_ork.verify.pm import classify_spawn, describe, exec_argv, run_argv  # noqa: E402
 
 RUN_DIR = os.environ["MINI_ORK_RUN_DIR"]
 
@@ -71,6 +71,13 @@ ev.flush()
 tsc_rc = 0
 lint_rc = 0
 shell_rc = 0
+# The failing tool's argv + captured output, so a failed run can say WHY it
+# failed: `classify_spawn` reads them to tell "the tool could not run"
+# (toolchain) from "the tool ran and rejected the input" (code).
+tsc_argv = []
+lint_argv = []
+tsc_out = ""
+lint_out = ""
 
 pkg = ""
 try:
@@ -86,7 +93,12 @@ if SOURCE_FILES and os.path.isfile("package.json") and "type-check:touched" in p
     tsc_argv = run_argv(".", "type-check:touched", *SOURCE_FILES)
     ev.write(f"$ {shlex.join(tsc_argv)}\n")
     ev.flush()
-    tsc_rc = subprocess.run(tsc_argv, stdout=ev, stderr=subprocess.STDOUT).returncode
+    _tsc = subprocess.run(tsc_argv, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, text=True)
+    ev.write(_tsc.stdout)
+    ev.flush()
+    tsc_rc = _tsc.returncode
+    tsc_out = _tsc.stdout
 else:
     ev.write("no TypeScript/JavaScript source files for tier1 typecheck\n")
     ev.flush()
@@ -102,8 +114,11 @@ if SOURCE_FILES and any(os.path.isfile(f) for f in
         lint_argv = shlex.split(lint_cmd) + SOURCE_FILES
         ev.write(f"$ {shlex.join(lint_argv)}\n")
         ev.flush()
-        lint_rc = subprocess.run(lint_argv,
-                                 stdout=ev, stderr=subprocess.STDOUT, timeout=600).returncode
+        _lint = subprocess.run(lint_argv, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True, timeout=600)
+        ev.write(_lint.stdout)
+        lint_rc = _lint.returncode
+        lint_out = _lint.stdout
         ev.write(f"lint via MO_TIER1_LINT_CMD rc={lint_rc}\n")
     else:
         # `npx eslint` against a repo declaring devEngines.packageManager=pnpm
@@ -113,8 +128,11 @@ if SOURCE_FILES and any(os.path.isfile(f) for f in
         lint_argv = exec_argv(".", "eslint", *SOURCE_FILES)
         ev.write(f"$ {shlex.join(lint_argv)}\n")
         ev.flush()
-        lint_rc = subprocess.run(lint_argv,
-                                 stdout=ev, stderr=subprocess.STDOUT).returncode
+        _lint = subprocess.run(lint_argv, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True)
+        ev.write(_lint.stdout)
+        lint_rc = _lint.returncode
+        lint_out = _lint.stdout
 else:
     ev.write("no source files for eslint or no eslint config found\n")
     ev.flush()
@@ -127,13 +145,26 @@ if SHELL_FILES:
 
 passed = tsc_rc == 0 and lint_rc == 0 and shell_rc == 0
 
-ev.close()
-print(json.dumps({
+# A failed run says WHY. `classify_spawn` returns "toolchain" when a tool never
+# started — the manager refused, the binary is missing — which the engine reads
+# as an ABSTENTION, not a refutation of the code (audit 2026-10-11). A tool that
+# ran and rejected the input is "code". Absent on a pass, so the pass bytes are
+# unchanged.
+envelope = {
     "verifier": "tier1-compile-typecheck",
     "pass": passed,
     "evidence_path": EVIDENCE,
     "tsc_rc": tsc_rc,
     "lint_rc": lint_rc,
     "shell_rc": shell_rc,
-}))
+}
+if not passed:
+    envelope["failure_kind"] = (
+        classify_spawn(tsc_argv, tsc_rc, tsc_out)
+        or classify_spawn(lint_argv, lint_rc, lint_out)
+        or "code"
+    )
+
+ev.close()
+print(json.dumps(envelope))
 sys.exit(0 if passed else 1)

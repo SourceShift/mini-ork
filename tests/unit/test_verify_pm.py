@@ -155,6 +155,27 @@ def test_describe_names_both_inputs(tmp_path):
     assert "declared=pnpm" in line and "resolved=pnpm" in line
 
 
+# ── layer 1b: spawn-failure provenance ────────────────────────────────────
+
+
+def test_classify_spawn_toolchain_on_a_manager_refusal():
+    """The production shape: the manager refused to start the tool."""
+    assert pm.classify_spawn(["pnpm", "run", "type-check:touched"], 1, EBADDEVENGINES) == "toolchain"
+
+
+def test_classify_spawn_toolchain_on_missing_binary():
+    assert pm.classify_spawn(["eslint"], 127, "") == "toolchain"          # sh's own ee
+    assert pm.classify_spawn(["eslint"], 1, "sh: eslint: command not found") == "toolchain"
+    assert pm.classify_spawn(["node", "x.js"], 1, "Error: spawn ENOENT") == "toolchain"
+
+
+def test_classify_spawn_is_fail_closed():
+    """The tool ran and rejected the input is NOT our call — "" keeps today's
+    behaviour (the caller maps it to `code`). Nothing here abstains."""
+    assert pm.classify_spawn(["eslint", "a.ts"], 1, "a.ts:3:1 error Unexpected var") == ""
+    assert pm.classify_spawn(["eslint", "a.ts"], 0, "") == ""
+
+
 # ── layer 2: end-to-end regression on the real verifier ───────────────────
 
 
@@ -232,6 +253,22 @@ def test_tier1_reaches_the_repo_own_eslint_on_a_pnpm_only_repo(tmp_path):
     # is a 5-second diagnosis from the log alone.
     assert "node_modules/.bin/eslint" in evidence
     assert "package manager:" in evidence
+
+
+def test_tier1_emits_toolchain_failure_kind_when_the_manager_refuses(tmp_path):
+    """The manager itself refuses (EBADDEVENGINES): the tool never started, so
+    the failure carries ``failure_kind: toolchain`` — the provenance the abstain
+    edge reads. Pre-fix this was a bare ``tsc_rc: 1`` read as a code failure."""
+    repo, run_dir = _build_fixture(tmp_path)
+    # The DECLARED manager refuses to run the script, exactly as npm did.
+    _stub(repo / "bin" / "pnpm",
+          f"#!/bin/sh\nprintf '%s' '{EBADDEVENGINES}' >&2\nexit 1\n")
+    rc, payload, evidence = _run_verifier(repo, run_dir)
+
+    assert payload["pass"] is False, evidence
+    assert rc == 1
+    assert payload["tsc_rc"] == 1, evidence
+    assert payload["failure_kind"] == "toolchain", evidence
 
 
 def test_the_old_npx_argv_is_red_on_this_fixture(tmp_path):
