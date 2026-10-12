@@ -45,7 +45,19 @@ def looks_like_json(result: DispatchResult) -> bool:
     Returns False only for text that is *definitely* not JSON — a prose refusal,
     a truncated fragment, an error stub, or empty output.
     """
-    text = (result.text or "").strip()
+    return looks_like_json_text(result.text or "")
+
+
+def looks_like_json_text(text: str) -> bool:
+    """``looks_like_json`` over raw text the harness did not carry as a result.
+
+    A recipe may declare its plan as a run-dir FILE the lane writes rather than
+    as its reply (``llm_dispatch._plan_artifact_predicate``). It is the same
+    structural question with the same answer, so it is the same code: a second
+    copy of "what does a plan look like" would drift, and the copy that drifts
+    is invariably the one no incident test covers.
+    """
+    text = (text or "").strip()
     if not text:
         return False
     if _parses_as_json(text):

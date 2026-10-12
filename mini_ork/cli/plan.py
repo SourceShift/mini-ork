@@ -32,6 +32,7 @@ import time
 from pathlib import Path
 
 from mini_ork.context import apply_env_overrides, context_env
+from mini_ork.dispatch.predicates import looks_like_json_text
 
 # ── extracted pure helpers (mini_ork.planning) — re-exported for parity ──
 # Plan-JSON shape/extraction/validation and the deterministic recipe fallback +
@@ -50,6 +51,7 @@ from mini_ork.planning.plan_schema import (  # noqa: F401
 )
 from mini_ork.planning.recipe_plan import (  # noqa: F401
     overlay_plan,
+    recipe_dir,
     recipe_fallback_plan,
 )
 
@@ -167,6 +169,46 @@ def plan_artifact(run_dir, recorded: str = "", *, recipe_dir=None) -> Path | Non
         if candidate.is_file():
             return candidate
     return None
+
+
+def _declared_plan_artifact(root, recipe, run_dir, workflow_path="") -> str:
+    """Where a recipe's declared plan artifact *will* be, or "".
+
+    ``plan_artifact`` above answers "where is this run's plan"; this answers
+    "where will it be". The difference is the whole point: the dispatch boundary
+    must install its shape gate *before* the planner lane runs, when the file
+    does not exist yet, so it cannot ask a resolver that requires the file to be
+    present. It asks the recipe's declared name instead — and asks
+    ``_declared_plan_name``, the same function ``plan_artifact`` consults, so a
+    recipe that renames its plan moves both readers at once.
+    """
+    if not recipe:
+        return ""
+    try:
+        rdir = recipe_dir(recipe, root, workflow_path or None)
+    except Exception:
+        return ""
+    if rdir is None:
+        return ""
+    name = _declared_plan_name(str(rdir))
+    return os.path.join(run_dir, name) if name else ""
+
+
+def _read_declared_plan(path: str) -> str:
+    """A declared plan artifact's text, or "" when it is absent or not JSON.
+
+    Judged by ``looks_like_json_text`` — the predicate that gated the dispatch.
+    Reusing it is the point: if the boundary accepted this file as the planner's
+    output, the adoption here must agree, or a lane could pass the gate and be
+    rejected by the very stage that follows it.
+    """
+    if not path:
+        return ""
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="ignore").strip()
+    except OSError:
+        return ""
+    return text if looks_like_json_text(text) else ""
 
 
 _USAGE = """Usage: mini-ork plan <kickoff.md> [--task-class <name>] [--out <plan.json>] [--dry-run]
@@ -945,6 +987,16 @@ def main(argv=None, *, root=None, dispatch=None) -> int:
     # ── get raw plan: MO_GIVEN_PLAN | force-recipe-fallback | LLM dispatch ──
     recipe = os.environ.get("MINI_ORK_RECIPE", "")
     given = os.environ.get("MO_GIVEN_PLAN", "")
+    # A recipe that declares its plan as a run-dir artifact hands the harness a
+    # FILE, not a reply (epic-runner's planner prompt says "write the plan file
+    # and nothing else"). Publish the path so the dispatch boundary gates the
+    # plan where it actually lives — and clear it otherwise, so a nested planner
+    # cannot inherit an outer run's artifact.
+    declared_plan = _declared_plan_artifact(root, recipe, run_dir, workflow)
+    if declared_plan:
+        apply_env_overrides({"MO_PLAN_ARTIFACT": declared_plan})
+    else:
+        os.environ.pop("MO_PLAN_ARTIFACT", None)
     # Static-recipe-plan skip. A forced recipe whose workflow.yaml is the fixed
     # dispatch DAG gives the planner LLM nothing to decide — recipe_fallback_plan
     # renders the identical plan (nodes + edges + artifact contract) from
@@ -971,6 +1023,9 @@ def main(argv=None, *, root=None, dispatch=None) -> int:
             _trace_plan(trace_id, task_class, "success", db,
                         final_artifact_ref=out_file, reviewer_verdict="recipe_fallback")
             return 0
+    # "" on every path but the one below that adopts a recipe-declared artifact:
+    # MO_GIVEN_PLAN is a third source of a plan, and it is not an adoption.
+    adopted = ""
     if given:
         if not os.access(given, os.R_OK):
             sys.stderr.write(f"MO_GIVEN_PLAN is set but not readable: {given}\n")
@@ -984,17 +1039,44 @@ def main(argv=None, *, root=None, dispatch=None) -> int:
             sys.stderr.write("LLM dispatch unavailable (no seam provided)\n")
             _trace_plan(trace_id, task_class, "failure", db)
             return 1
-        rc, raw = dispatch_fn(task_class, "planner", prompt)
-        if rc != 0:
-            sys.stderr.write(f"LLM dispatch failed for planner node (rc={rc}): {_dispatch_error_detail(raw)}\n")
+        # The declared artifact can already be on disk before the dispatch: a
+        # revived run re-enters the planner with its plan sitting in the run
+        # dir, and re-planning it would cost a full-length call to reproduce a
+        # file that is right there.
+        adopted = _read_declared_plan(declared_plan)
+        if adopted:
+            sys.stderr.write(f"plan: using the recipe's declared plan artifact "
+                             f"{declared_plan} (planner LLM skipped)\n")
+        else:
+            rc, raw = dispatch_fn(task_class, "planner", prompt)
+            # Charge before judging: a rejected dispatch still spent tokens — the
+            # abandoned epic-runner planner call in run-1791788217-61320 produced
+            # 17,757 output tokens before the shape gate refused the lane.
             _charge_cost(db, run_id)
-            _trace_plan(trace_id, task_class, "failure", db, reason=f"planner_dispatch_rc_{rc}")
-            return 1
+            if rc != 0:
+                # rc=65 is a shape reject: the dispatch boundary judged the
+                # lane's *reply*. A planner whose contract is "write the plan
+                # file and nothing else" answers in prose by design, so before
+                # failing the run, look where its plan actually belongs.
+                adopted = _read_declared_plan(declared_plan)
+                if not adopted:
+                    sys.stderr.write(f"LLM dispatch failed for planner node (rc={rc}): {_dispatch_error_detail(raw)}\n")
+                    _trace_plan(trace_id, task_class, "failure", db, reason=f"planner_dispatch_rc_{rc}")
+                    return 1
+                sys.stderr.write(f"plan: planner dispatch rc={rc} but the recipe's declared plan "
+                                 f"artifact is on disk ({declared_plan}) — adopting it\n")
 
+    if adopted:
+        raw = adopted
     plan_json = extract_plan_json(raw)
-    if not given:
-        _charge_cost(db, run_id)
-    verdict = validate_plan(plan_json)
+    # An adopted file IS the recipe's own plan contract, checked by the recipe's
+    # own success verifier downstream. This module's schema describes a
+    # DIFFERENT planner (a JSON reply carrying verifier_contract/decomposition),
+    # so validating an adopted artifact here rejects the only plan the recipe
+    # has — and the repair loop spends two more full dispatches learning that
+    # (run-1791788217-61320: verdict "missing_verifier_contract" for a plan the
+    # run's own verifier declares complete).
+    verdict = "ok" if adopted else validate_plan(plan_json)
 
     if not given and verdict in _RECOVERABLE_VERDICTS:
         assert dispatch_fn is not None
