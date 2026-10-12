@@ -90,6 +90,71 @@ class Run:
 
 # ── reading ─────────────────────────────────────────────────────────────────
 
+# Re-exported here because every run-page reader already imports from this
+# module; the resolver itself lives beside ``_plan_file_name`` and the
+# ``task_runs.plan_path`` write it mirrors, so the writer and the readers share
+# one definition of "the run's plan".
+from mini_ork.cli.plan import plan_artifact  # noqa: E402
+
+
+def plan_steps(plan: Any) -> list[tuple[str, str, str]]:
+    """``(id, title, note)`` for every step a plan declares, whatever its shape.
+
+    Three shapes serve the same role on the run pages: the generic runtime's
+    ``steps[]`` / ``decomposition[]``; epic-runner's ``epics[]`` ordered by
+    ``waves[][]``; and a plan that carries nothing but an ``objective``. A reader
+    that knows one shape draws an empty pane for a perfectly good plan of
+    another — the epic-runner node reported "No plan" over eight declared epics
+    for exactly that reason. Shape knowledge lives here once; each page decides
+    only how a row is drawn.
+    """
+    if not isinstance(plan, dict):
+        return []
+    steps = plan.get("steps") or plan.get("decomposition") or []
+    rows: list[tuple[str, str, str]] = []
+    if isinstance(steps, list):
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            sid = str(step.get("id") or step.get("name") or step.get("step") or "")
+            stype = str(step.get("type") or step.get("node_type") or "")
+            lane = str(step.get("lane") or step.get("model_lane") or "")
+            note = " · ".join(part for part in (stype, lane) if part)
+            # Framework-edit planners routinely name every step after its role
+            # (``id == node_type == "implementer"``); rendering that verbatim
+            # turns N role-named steps into N identical rows, so a description
+            # takes the row over and the role stays in the note.
+            title = " ".join(str(step.get("description") or step.get("action") or "").split())
+            if len(title) > 100:
+                title = title[:97] + "…"
+            rows.append((sid, title or sid or stype, note))
+    if rows:
+        return rows
+    epics = plan.get("epics")
+    if isinstance(epics, list):
+        wave_of: dict[str, int] = {}
+        for index, wave in enumerate(plan.get("waves") or []):
+            if isinstance(wave, list):
+                for epic_id in wave:
+                    wave_of.setdefault(str(epic_id), index)
+        for epic in epics:
+            if not isinstance(epic, dict):
+                continue
+            epic_id = str(epic.get("id") or "")
+            depends = [str(dep) for dep in (epic.get("depends_on") or [])]
+            note = " · ".join(part for part in (
+                f"wave {wave_of[epic_id]}" if epic_id in wave_of else "",
+                "depends on " + ", ".join(depends) if depends else "",
+            ) if part)
+            rows.append((epic_id,
+                         str(epic.get("title") or "").strip() or epic_id,
+                         note))
+    if rows:
+        return rows
+    objective = str(plan.get("objective") or "").strip()
+    return [("", objective, "")] if objective else []
+
+
 def _yaml(path: Path) -> dict[str, Any]:
     try:
         import yaml
@@ -742,7 +807,9 @@ def _overview_tab(run: Run, *, include_retry: bool = True) -> list[dict[str, Any
         if kick and Path(kick).is_file():
             items.append(S.dot(Path(kick).name, "What the run was asked to do · " + _size(Path(kick)),
                                [S.btn("Open", S.open_path(kick), "ghost")]))
-        for name, what in (("plan.json", "The planner's objective and steps"),
+        plan_path = plan_artifact(run.run_dir, str(run.row.get("plan_path") or ""))
+        for name, what in ((plan_path.name if plan_path else "plan.json",
+                            "The planner's objective and steps"),
                            ("run_profile.json", "Task class and risk the classifier assigned"),
                            # Audit only: no model reads this file. What the planner
                            # actually received is learned/planner.md.
@@ -1575,6 +1642,18 @@ def _read_run_json(run: Run, name: str) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _read_run_plan(run: Run) -> dict[str, Any]:
+    """The run's plan object, whatever name the recipe gave the file."""
+    path = plan_artifact(run.run_dir, str((run.row or {}).get("plan_path") or ""))
+    if path is None:
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def _clip(text: str, limit: int) -> str:
     """``text`` cut at the last word boundary before ``limit``, ellipsis included."""
     text = " ".join(text.split())
@@ -1608,7 +1687,7 @@ def _desc_intent(run: Run) -> str:
     the run card's title. No prompt change is needed for this: the field the
     planner is already required to emit is exactly the sentence wanted here.
     """
-    objective = str(_read_run_json(run, "plan.json").get("objective") or "").strip()
+    objective = str(_read_run_plan(run).get("objective") or "").strip()
     if objective:
         return objective
     goal = str(_run_profile(run).get("user_goal") or "").strip()

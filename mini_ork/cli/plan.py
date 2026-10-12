@@ -21,6 +21,7 @@ fallback, dry-run/gate placeholders, overlay, DB write) is transcribed verbatim.
 from __future__ import annotations
 
 import contextlib
+import functools
 import hashlib
 import io
 import json
@@ -83,6 +84,89 @@ def _plan_file_name(dry_run: bool) -> str:
     so the rehearsal/live distinction is theirs to draw.
     """
     return "plan.dryrun.json" if dry_run else "plan.json"
+
+
+def _is_plan_artifact_name(name: str) -> bool:
+    """``plan.json`` is the generic plan runtime's name. A recipe whose planner is
+    an LLM node names the artefact after itself — epic-runner's planner prompt
+    writes ``epic-runner-plan.json`` — and that is a plan too."""
+    return name == "plan.json" or name.endswith("-plan.json")
+
+
+@functools.lru_cache(maxsize=64)
+def _declared_plan_name(recipe_dir: str) -> str:
+    """The plan artefact a recipe declares in ``artifact_contract.yaml``.
+
+    The contract is the recipe's own statement of what a run produces; for
+    epic-runner its ``required_artifacts`` is the only place
+    ``epic-runner-plan.json`` is written down *before* the run happens. Cached
+    because the IDE resolves a plan once per rendered run row and the recipe
+    directory is a pure function of the path.
+    """
+    try:
+        import yaml
+
+        with open(os.path.join(recipe_dir, "artifact_contract.yaml"), encoding="utf-8") as handle:
+            contract = yaml.safe_load(handle) or {}
+    except (OSError, ValueError, ImportError):
+        return ""
+    if not isinstance(contract, dict):
+        return ""
+    for key in ("required_artifacts", "source_artifact", "outputs"):
+        raw = contract.get(key)
+        for entry in raw if isinstance(raw, list) else [raw]:
+            base = os.path.basename(os.path.expandvars(str(entry or "")))
+            if base and _is_plan_artifact_name(base):
+                return base
+    return ""
+
+
+def _plan_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def plan_artifact(run_dir, recorded: str = "", *, recipe_dir=None) -> Path | None:
+    """The run's plan file, whatever the recipe chose to call it.
+
+    ``task_runs.plan_path`` is written by ``mini-ork plan`` — the generic plan
+    runtime — so a recipe that plans inside its DAG (epic-runner: a planner LLM
+    node writes ``epic-runner-plan.json``) leaves it empty and every reader keyed
+    on a literal ``plan.json`` reports "no plan" for a run whose plan is sitting
+    in the directory.
+
+    Run-dir-local candidates come first and ``recorded`` last: a ``state.db``
+    carried over from another checkout keeps absolute ``plan_path`` values
+    pointing at *that* checkout's home, so trusting the DB first would serve
+    another tree's plan.
+
+    1. ``<run_dir>/plan.json`` — the generic plan runtime's name.
+    2. the recipe's declared plan artefact (``artifact_contract.yaml``).
+    3. the newest ``*-plan.json`` in the run dir.
+    4. ``recorded``, when that file still exists.
+    """
+    if run_dir is None:
+        return None
+    run_dir = Path(run_dir)
+    canonical = run_dir / "plan.json"
+    if canonical.is_file():
+        return canonical
+    if recipe_dir:
+        declared = _declared_plan_name(str(recipe_dir))
+        if declared:
+            candidate = run_dir / declared
+            if candidate.is_file():
+                return candidate
+    found = [path for path in run_dir.glob("*-plan.json") if path.is_file()]
+    if found:
+        return max(found, key=_plan_mtime)
+    if recorded:
+        candidate = Path(recorded)
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 _USAGE = """Usage: mini-ork plan <kickoff.md> [--task-class <name>] [--out <plan.json>] [--dry-run]

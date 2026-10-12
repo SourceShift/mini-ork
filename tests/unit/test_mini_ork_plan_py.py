@@ -468,3 +468,33 @@ def test_dry_run_stub_still_rejected():
     # an empty shell: no objective, no steps
     empty = {**_VALID, "objective": "", "decomposition": []}
     assert plan.validate_plan(json.dumps(empty)) == "placeholder_plan"
+
+
+def test_declared_plan_name_reads_the_artifact_contract(tmp_path):
+    """The contract is the only place a recipe's plan name is written down
+    before the run happens (epic-runner: ``epic-runner-plan.json``)."""
+    bare = tmp_path / "no-contract"
+    bare.mkdir()
+    assert plan._declared_plan_name(str(bare)) == ""
+    recipe = tmp_path / "epic-runner"
+    recipe.mkdir()
+    (recipe / "artifact_contract.yaml").write_text(
+        "source_artifact: \"${MINI_ORK_RUN_DIR}/epic-runner-delivery.json\"\n"
+        "required_artifacts:\n"
+        "  - \"${MINI_ORK_RUN_DIR}/epic-runner-delivery.json\"\n"
+        "  - \"${MINI_ORK_RUN_DIR}/epic-runner-plan.json\"\n")
+    assert plan._declared_plan_name(str(recipe)) == "epic-runner-plan.json"
+
+
+def test_plan_artifact_records_first_only_as_a_last_resort(tmp_path):
+    """A ``state.db`` carried over from another checkout keeps absolute
+    ``plan_path`` values pointing at that home, so a run-local file wins."""
+    run_dir = tmp_path / "runs" / "run-1"
+    run_dir.mkdir(parents=True)
+    elsewhere = tmp_path / "other" / "plan.json"
+    elsewhere.parent.mkdir()
+    elsewhere.write_text("{}")
+    assert plan.plan_artifact(run_dir, str(elsewhere)) == elsewhere
+    local = run_dir / "sweep-plan.json"
+    local.write_text("{}")
+    assert plan.plan_artifact(run_dir, str(elsewhere)) == local

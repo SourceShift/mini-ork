@@ -54,7 +54,7 @@ from mini_ork.ide_pages.node_changes import (
     build_changes_view,
     plain_reason,
 )
-from mini_ork.ide_pages.run import Run, Node, _epoch, _load, _wall, _REVIEW_TYPES
+from mini_ork.ide_pages.run import Run, Node, _epoch, _load, _wall, _REVIEW_TYPES, plan_artifact
 
 # Live-detection window per the kickoff §"live": running AND transcript grew
 # in the last 120 s. Named so a future tweak is one edit.
@@ -2989,8 +2989,9 @@ def _overview_lens_headline(run_dir: Path, node: Node) -> dict[str, str]:
 
 
 def _overview_planner_headline(run_dir: Path) -> dict[str, str]:
-    """``plan.json`` ``objective`` field."""
-    plan = _read_json_safely(str(run_dir / "plan.json"))
+    """The plan artefact's ``objective`` field."""
+    plan_path = plan_artifact(run_dir)
+    plan = _read_json_safely(str(plan_path)) if plan_path else None
     if isinstance(plan, dict):
         obj = str(plan.get("objective") or "").strip()
         if obj:

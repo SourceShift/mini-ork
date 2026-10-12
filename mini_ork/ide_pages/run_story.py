@@ -44,7 +44,7 @@ from mini_ork.ide_pages.node_changes import (
     _snippet_line,
     _verifier_items,
 )
-from mini_ork.ide_pages.run import Node, Run, _wall
+from mini_ork.ide_pages.run import Node, Run, _wall, plan_artifact, plan_steps
 
 # The five state words the IDE draws for a story step.
 _STATES = ("done", "running", "failed", "skipped", "pending")
@@ -310,29 +310,29 @@ def _checks_body(run_dir: Path, node: Node) -> list[dict[str, Any]]:
     return [S.block_lines([(str(i.get("t") or ""), str(i.get("mc") or "sub")) for i in items])]
 
 
-def _planner_body(run_dir: Path) -> list[dict[str, Any]]:
-    """Planner: the objective plus up to six plan steps as markdown."""
-    plan = _read_json(run_dir / "plan.json")
+def _planner_body(run_dir: Path, recorded: str = "") -> list[dict[str, Any]]:
+    """Planner: the objective plus up to six plan steps as markdown.
+
+    ``plan_steps`` normalises the plan shapes (generic ``steps[]``,
+    epic-runner's ``epics[]``, objective-only), so this step lists the epics for
+    a recipe that plans with an LLM node instead of showing a bare objective.
+    """
+    plan_path = plan_artifact(run_dir, recorded)
+    plan = _read_json(plan_path) if plan_path else None
     if not isinstance(plan, dict):
         return []
     parts: list[str] = []
     objective = str(plan.get("objective") or "").strip()
     if objective:
         parts.append(objective)
-    steps = plan.get("steps") or plan.get("decomposition") or []
-    if isinstance(steps, list):
-        for step in steps[:_PLAN_STEPS]:
-            if not isinstance(step, dict):
-                continue
-            sid = str(step.get("id") or step.get("name") or "")
-            desc = str(step.get("description") or step.get("type")
-                       or step.get("node_type") or "")
-            if sid and desc:
-                parts.append(f"- **{sid}** — {desc}")
-            elif sid:
-                parts.append(f"- **{sid}**")
-            elif desc:
-                parts.append(f"- {desc}")
+    for sid, title, note in plan_steps(plan)[:_PLAN_STEPS]:
+        if sid and sid != title:
+            line = f"- **{sid}** — {title}"
+        else:
+            line = f"- **{title or sid}**"
+        if note:
+            line += f"  \n  {note}"
+        parts.append(line)
     return [S.block_md("\n\n".join(parts))] if parts else []
 
 
@@ -371,7 +371,7 @@ def _step_body(run: Run, node: Node, ntype: str, give_files: bool,
         if ntype in _VERIFIER_TYPES:
             return _checks_body(run.run_dir, node)
         if ntype in _PLANNER_TYPES:
-            return _planner_body(run.run_dir)
+            return _planner_body(run.run_dir, str(run.row.get("plan_path") or ""))
         return _other_body(run, node)
 
     try:

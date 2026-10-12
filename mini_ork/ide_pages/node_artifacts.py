@@ -23,7 +23,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from mini_ork.ide_pages.run import Run, Node
+from mini_ork.ide_pages.run import Run, Node, plan_artifact
 
 # ── caps (kickoff §1, §2 — fresh constants; do NOT reuse node_changes caps) ──
 
@@ -158,8 +158,9 @@ def _inputs_for(run: Run, node: Node) -> list[dict[str, Any]]:
         kickoff = str((run.row or {}).get("kickoff_path") or "")
         if kickoff:
             candidates.append((Path(kickoff), "run"))
+        plan_name = (plan_artifact(run_dir) or Path("plan.json")).name
         for name in _RUN_LEVEL_FALLBACKS:
-            if name == "plan.json" and str(node.type or "") in ("planner", "decomposer"):
+            if name == plan_name and str(node.type or "") in ("planner", "decomposer"):
                 continue  # the planner WRITES the plan; it is not given it
             candidates.append((run_dir / name, "run"))
 
@@ -321,7 +322,7 @@ def _by_kind_outputs(run: Run, node: Node) -> list[tuple[Path, str]]:
     ntype = str(node.type or "")
     out: list[tuple[Path, str]] = []
     if ntype in ("planner", "decomposer"):
-        out.append((run_dir / "plan.json", nid))
+        out.append((plan_artifact(run_dir) or run_dir / "plan.json", nid))
     elif ntype == "researcher":
         for p in _node_report_paths(run_dir, nid):
             out.append((p, nid))

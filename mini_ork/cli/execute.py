@@ -1372,6 +1372,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         elif rollback_fields:
             print("  [skip] rollback — no failures (escalates_to edge not triggered)")
         _emit_run_verdict(live_run_dir, fail_count, len(fields_list), task_class=task_class)
+        _record_plan_artifact(db, run_id, live_run_dir)
         _post_run_learning(db, live_run_dir, run_id, task_class, fail_count=fail_count)
         if fail_count > 0:
             set_status(db, run_id, "failed")
@@ -1721,6 +1722,50 @@ def _extract_verdict(root, review_file) -> str:
 
 
 VERIFIER_PRODUCED_ARTIFACTS = frozenset({"verdict.json"})
+
+
+def _record_plan_artifact(db, run_id: str, run_dir: str) -> None:
+    """Stamp ``task_runs.plan_path`` with the plan the run actually produced.
+
+    ``plan_path`` was only ever written by ``mini-ork plan`` — the generic plan
+    runtime. A recipe that plans *inside* its DAG leaves it empty: epic-runner's
+    planner is an LLM node that writes ``epic-runner-plan.json`` mid-run, so the
+    column stayed null and every reader keyed on it (or on a literal
+    ``plan.json``) reported "no plan" for a run whose plan was sitting in the run
+    directory. Called after the DAG, i.e. after that write can have happened.
+
+    Best-effort by design: the plan is already on disk, and a DB hiccup here
+    must never turn a green run red. An existing non-empty ``plan_path`` is
+    never overwritten — ``mini-ork plan`` recorded the plan the DAG was built
+    from, which outranks anything found by name afterwards.
+    """
+    if not db or not run_id or not run_dir:
+        return
+    try:
+        # Imported lazily: the resolver lives beside the plan runtime so the
+        # writer and the run-page readers share one definition.
+        from mini_ork.cli.plan import plan_artifact
+
+        path = plan_artifact(run_dir)
+    except Exception as exc:  # noqa: BLE001 — recording is best-effort
+        sys.stderr.write(f"[warn] plan artifact resolution failed: {exc}\n")
+        return
+    if path is None:
+        return
+    try:
+        con = sqlite3.connect(db, timeout=15.0)
+        try:
+            con.execute("PRAGMA busy_timeout = 15000")
+            con.execute(
+                "UPDATE task_runs SET plan_path = ?, updated_at = ? "
+                "WHERE id = ? AND (plan_path IS NULL OR plan_path = '')",
+                (str(path), int(time.time()), run_id),
+            )
+            con.commit()
+        finally:
+            con.close()
+    except Exception as exc:  # noqa: BLE001 — recording is best-effort
+        sys.stderr.write(f"[warn] could not record plan_path for {run_id}: {exc}\n")
 
 
 def _required_artifacts_ok(plan_path, *, skip_verifier_outputs=False) -> bool:
