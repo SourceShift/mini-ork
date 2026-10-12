@@ -149,7 +149,7 @@ edges:
   - { from: draft_executor, to: human_review_packet, edge_type: supplies_context_to, from_output: draft_artifact, to_input: draft_artifact }
   - { from: reflection_loop, to: recursive_plan_composer, edge_type: retries, recursive: true, from_output: refinement_prompt, to_input: refinement_prompt }
   - { from: human_review_packet, to: human_feedback_gate, edge_type: verifies_user_choice, from_output: review_packet, to_input: review_packet }
-  - { from: human_feedback_gate, to: semantic_flow_extractor, edge_type: retries, condition: revise, recursive: true, from_output: human_decision, to_input: human_feedback }
+  - { from: human_feedback_gate, to: semantic_flow_extractor, edge_type: retries, condition: {pointer: "/status", match: {const: revision_requested}}, recursive: true, from_output: human_decision, to_input: human_feedback }
   - { from: human_feedback_gate, to: summary_finalizer, edge_type: human_decision_gate, condition: approved, from_output: human_decision, to_input: human_decision }
   - { from: recursive_plan_composer, to: summary_finalizer, edge_type: supplies_context_to, from_output: agent_plan, to_input: agent_plan }
   - { from: source_researcher, to: summary_finalizer, edge_type: supplies_context_to, from_output: source_corpus, to_input: source_corpus }
