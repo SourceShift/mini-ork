@@ -78,20 +78,21 @@ def enabled(environ=None):
     return context_env("MO_LEVEL_VECTOR", "1") == "1"
 
 
-def read_verifier_payload(path, verifier):
-    """The LAST JSON object in ``path`` whose ``verifier`` field equals ``verifier``.
+def _iter_json_objects(path):
+    """Every dict parseable from ``path``, bottom-up.
 
-    The evidence file is NOT pure JSON: ``_run_verifier_ref`` merges stdout+stderr,
+    Evidence files are NOT pure JSON: ``_run_verifier_ref`` merges stdout+stderr,
     so ``verifier_test.json`` starts with ``[test] running: …`` stderr lines, and
-    ``verifier_behavioral.json`` is ``indent=2`` multi-line JSON. Scan bottom-up
-    for the last line whose ``lstrip()`` starts with ``{``, then try the whole
-    remainder and the single line. Returns ``None`` when absent or unparsable.
+    ``verifier_behavioral.json`` is ``indent=2`` multi-line JSON. Scan from the
+    last line whose ``lstrip()`` starts with ``{``, trying each such line as the
+    whole remainder first and then as that single line, so the LAST blob (the
+    verifier's own envelope) is yielded before anything it may contain.
     """
     try:
         with open(path, encoding="utf-8") as handle:
             lines = handle.readlines()
     except OSError:
-        return None
+        return
     for i in range(len(lines) - 1, -1, -1):
         if not lines[i].lstrip().startswith("{"):
             continue
@@ -100,8 +101,18 @@ def read_verifier_payload(path, verifier):
                 obj = json.loads(text)
             except (ValueError, TypeError):
                 continue
-            if isinstance(obj, dict) and obj.get("verifier") == verifier:
-                return obj
+            if isinstance(obj, dict):
+                yield obj
+
+
+def read_verifier_payload(path, verifier):
+    """The LAST JSON object in ``path`` whose ``verifier`` field equals ``verifier``.
+
+    Returns ``None`` when absent or unparsable.
+    """
+    for obj in _iter_json_objects(path):
+        if obj.get("verifier") == verifier:
+            return obj
     return None
 
 
@@ -120,6 +131,48 @@ def _read_json_dict(path):
 # at the run root is a recipe verifier's declared output.
 _CONTRACT_EVIDENCE_EXCLUDE = {"verifier_test.json", "verifier_behavioral.json"}
 
+# ── Verifier failure provenance (audit 2026-10-11) ───────────────────────────
+# A verdict used to be a bare boolean, so "the tool ran and rejected the input"
+# and "the tool could not be started" were both `pass: false` — one bad lint call
+# (npm refusing to start on a pnpm repo, EBADDEVENGINES) cascaded into 10 failed
+# nodes and a rollback of an implementation no tool had actually checked. A
+# verifier may now declare WHY it failed:
+#   code       the tool ran and rejected the input          → REFUTED
+#   toolchain  the tool could not be run at all (spawn failure, a refusal like
+#              EBADDEVENGINES, a missing binary)            → UNVERIFIED
+#   infra      sandbox/network/OOM                          → UNVERIFIED
+# FAIL-CLOSED: an absent or unrecognised value keeps the verdict a plain
+# boolean, so every existing verdict keeps today's meaning and only an explicit
+# ABSTAINING_KINDS member ever abstains. `infra` ships declared but
+# non-abstaining until a verifier can actually detect it.
+FAILURE_KINDS = ("code", "toolchain", "infra")
+ABSTAINING_KINDS = frozenset({"toolchain"})
+# The executor's third node outcome: 0 pass / 1 refuted / 3 abstained. A
+# subprocess rc cannot collide — no verifier exits 3, and MO_BEHAV_ABSTAIN_EXIT
+# (the canonical verifier's own abstain rc) defaults to 1.
+ABSTAIN_RC = 3
+
+
+def failure_kind(obj):
+    """``obj['failure_kind']`` when it is a recognised kind, else ``""`` (fail-closed)."""
+    if not isinstance(obj, dict):
+        return ""
+    kind = obj.get("failure_kind")
+    return kind if kind in FAILURE_KINDS else ""
+
+
+def abstain_kind(obj):
+    """The abstention ``obj`` declares, else ``""``.
+
+    Only an :data:`ABSTAINING_KINDS` member abstains, and never on a verdict that
+    already passed: a contradictory ``{"pass": true, "failure_kind": "toolchain"}``
+    stays a pass rather than becoming an abstention.
+    """
+    kind = failure_kind(obj)
+    if kind and kind in ABSTAINING_KINDS and obj.get("pass") is not True:
+        return kind
+    return ""
+
 
 def _read_verifier_evidence(path):
     """The last JSON object in ``path`` shaped like a recipe verifier's envelope.
@@ -131,34 +184,61 @@ def _read_verifier_evidence(path):
     (bool ``pass`` + list ``checks``) distinguishes it from the inner check
     objects, which fail the guard.
     """
-    try:
-        with open(path, encoding="utf-8") as handle:
-            lines = handle.readlines()
-    except OSError:
-        return None
-    for i in range(len(lines) - 1, -1, -1):
-        if not lines[i].lstrip().startswith("{"):
-            continue
-        for text in ("\n".join(lines[i:]), lines[i]):
-            try:
-                obj = json.loads(text)
-            except (ValueError, TypeError):
-                continue
-            if (
-                isinstance(obj, dict)
-                and isinstance(obj.get("pass"), bool)
-                and isinstance(obj.get("checks"), list)
-            ):
-                return obj
+    for obj in _iter_json_objects(path):
+        if isinstance(obj.get("pass"), bool) and isinstance(obj.get("checks"), list):
+            return obj
     return None
+
+
+def abstained_kinds(run_dir):
+    """Sorted distinct abstention kinds across a run's verifier evidence.
+
+    The field only ever appears on a verifier's own envelope, so the bottom-up
+    scan takes the last dict carrying a recognised ``failure_kind`` per file —
+    no shape guard, which matters because the recipe verifiers that shell out
+    (e.g. tier1-compile-typecheck) publish ``pass`` without a ``checks`` list and
+    would fail :func:`_read_verifier_evidence`'s envelope guard.
+
+    Falls back to the run-level ``verdict.json`` / ``run-verdict.json``
+    ``failure_kinds`` stamp: under remote placement the local copy of a
+    verifier's evidence is best-effort, so the stamp is the second witness.
+    """
+    if not run_dir:
+        return []
+    kinds = set()
+    try:
+        names = sorted(
+            name for name in os.listdir(run_dir)
+            if name.startswith("verifier_") and name.endswith(".json")
+        )
+    except OSError:
+        names = []
+    for name in names:
+        for obj in _iter_json_objects(os.path.join(run_dir, name)):
+            kind = abstain_kind(obj)
+            if kind:
+                kinds.add(kind)
+                break  # the file's own envelope; nothing deeper can declare it
+    if not kinds and not names:
+        # Only when there is no local verifier evidence at all. With evidence
+        # present but silent, the files are authoritative — falling back here
+        # would resurrect a previous attempt's stamp in a reused run dir and
+        # withhold a run whose runner has since been fixed.
+        for stamp in ("verdict.json", "run-verdict.json"):
+            data = _read_json_dict(os.path.join(run_dir, stamp))
+            for kind in (data or {}).get("failure_kinds") or []:
+                if kind in FAILURE_KINDS:
+                    kinds.add(str(kind))
+    return sorted(kinds)
 
 
 def _contract_from_recipe_verifiers(run_dir):
     """``(PROVEN|REFUTED|UNVERIFIED|None, reason)`` from verifier_<stem>.json
     evidence at the run root. ``None`` = no such file (the caller decides n/a
     vs UNVERIFIED from the task class). Any demonstrated failure (envelope
-    ``pass:false`` or a failed gating check) REFUTES; an unparsable evidence
-    file with no refutation is UNVERIFIED (abstain — never a pass)."""
+    ``pass:false`` or a failed gating check) REFUTES; an envelope that declares
+    it could not run its tool (:func:`abstain_kind`) and an unparsable evidence
+    file with no refutation are both UNVERIFIED (abstain — never a pass)."""
     if not run_dir:
         return None, ""
     try:
@@ -175,6 +255,11 @@ def _contract_from_recipe_verifiers(run_dir):
         if obj is None:
             verdicts[name] = "unparsable"
             continue
+        if abstain_kind(obj):
+            # The tool could not run, so its checks say nothing about the code:
+            # an abstention outranks a failed gating check. Never "proven".
+            verdicts[name] = "abstained"
+            continue
         gating_failed = any(
             isinstance(check, dict)
             and check.get("gating") is True
@@ -187,6 +272,9 @@ def _contract_from_recipe_verifiers(run_dir):
     if "refuted" in verdicts.values():
         bad = ", ".join(n for n, v in verdicts.items() if v == "refuted")
         return REFUTED, f"recipe verifier evidence REFUTED ({bad})"
+    if "abstained" in verdicts.values():
+        bad = ", ".join(n for n, v in verdicts.items() if v == "abstained")
+        return UNVERIFIED, f"recipe verifier could not run ({bad})"
     if "unparsable" in verdicts.values():
         bad = ", ".join(n for n, v in verdicts.items() if v == "unparsable")
         return UNVERIFIED, f"recipe verifier evidence unparsable ({bad})"

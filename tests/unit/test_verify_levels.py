@@ -315,6 +315,69 @@ def test_contract_refuted_by_recipe_verifier_evidence(tmp_path):
     assert vector3["contract"] == PROVEN
 
 
+def test_contract_recipe_verifier_toolchain_failure_abstains(tmp_path):
+    """A recipe verifier that could not run its tool (``failure_kind: toolchain``)
+    is UNVERIFIED — an abstention — never REFUTED (audit 2026-10-11: npm refusing
+    to start on a pnpm repo before eslint ran). Fail-closed: ``code`` and an
+    absent key keep the verdict exactly as it was (REFUTED)."""
+    rd = _run_dir(tmp_path, name="recipe_toolchain")
+    (rd / "verifier_schema.json").write_text(
+        '{"pass": false, "failure_kind": "toolchain", '
+        '"checks": [{"id": "envelope", "pass": false, "gating": true}]}\n',
+        encoding="utf-8",
+    )
+    vector, reasons = L.derive_levels(str(rd), "verified_artifact")
+    assert vector["contract"] == UNVERIFIED
+    assert "could not run" in reasons["contract"]
+    assert L.publish_decision(
+        vector, required=L.required_levels("verified_artifact")) == "abstain"
+
+    # failure_kind: code -> the tool ran and rejected the input -> REFUTED
+    rd2 = _run_dir(tmp_path, name="recipe_code")
+    (rd2 / "verifier_schema.json").write_text(
+        '{"pass": false, "failure_kind": "code", '
+        '"checks": [{"id": "envelope", "pass": false, "gating": true}]}\n',
+        encoding="utf-8",
+    )
+    vector2, _ = L.derive_levels(str(rd2), "verified_artifact")
+    assert vector2["contract"] == REFUTED
+
+    # key absent -> REFUTED (nothing changes for a verifier that never declared)
+    rd3 = _run_dir(tmp_path, name="recipe_absent")
+    (rd3 / "verifier_schema.json").write_text(
+        '{"pass": false, "checks": [{"id": "envelope", "pass": false, "gating": true}]}\n',
+        encoding="utf-8",
+    )
+    vector3, _ = L.derive_levels(str(rd3), "verified_artifact")
+    assert vector3["contract"] == REFUTED
+
+
+def test_abstained_kinds_scan_and_fail_closed_accessors(tmp_path):
+    """``abstained_kinds`` is the publisher guard's input: it scans every
+    ``verifier_*.json`` and returns only genuine abstentions, and the accessors
+    abstain only on an explicit ABSTAINING_KINDS member (fail-closed)."""
+    rd = _run_dir(tmp_path, name="abstain_scan")
+    (rd / "verifier_schema.json").write_text(
+        '{"pass": false, "failure_kind": "toolchain", "checks": []}\n', encoding="utf-8")
+    (rd / "verifier_lint.json").write_text(
+        '{"pass": false, "failure_kind": "code", "checks": []}\n', encoding="utf-8")
+    assert L.abstained_kinds(str(rd)) == ["toolchain"]
+
+    rd2 = _run_dir(tmp_path, name="no_abstain")
+    (rd2 / "verifier_schema.json").write_text('{"pass": true, "checks": []}\n', encoding="utf-8")
+    assert L.abstained_kinds(str(rd2)) == []
+
+    rd3 = _run_dir(tmp_path, name="empty_abstain")
+    assert L.abstained_kinds(str(rd3)) == []
+
+    # accessors
+    assert L.abstain_kind({"pass": False, "failure_kind": "toolchain"}) == "toolchain"
+    assert L.abstain_kind({"pass": False, "failure_kind": "infra"}) == ""   # declared, not abstaining
+    assert L.abstain_kind({"pass": False, "failure_kind": "weird"}) == ""   # unrecognised
+    assert L.abstain_kind({"pass": False}) == ""                           # absent
+    assert L.abstain_kind({"pass": True, "failure_kind": "toolchain"}) == ""  # never over a pass
+
+
 def test_contract_required_but_no_evidence_abstains(tmp_path):
     # verified_artifact with NO evidence at all: contract is UNVERIFIED (a
     # required level may never ride an absent instrument to publish), and the
@@ -467,6 +530,19 @@ def test_emit_run_verdict_bytes(tmp_path, monkeypatch):
     for key in ("levels", "levels_reasons", "levels_required", "levels_ok", "levels_decision"):
         assert key in obj
     assert obj["levels_ok"] is True
+
+    # a run that abstained flips the verdict and appends failure_kinds (last),
+    # but keeps the four byte-stable pairs at the head
+    monkeypatch.setenv("MO_LEVEL_VECTOR", "1")
+    rda = tmp_path / "abstain"; rda.mkdir()
+    (rda / "verifier_schema.json").write_text(
+        '{"pass": false, "failure_kind": "toolchain", "checks": []}\n', encoding="utf-8")
+    ex._emit_run_verdict(str(rda), 0, 3)
+    obj_a = json.loads((rda / "verdict.json").read_text())
+    assert obj_a["verdict"] == "abstain"
+    assert obj_a["failed_nodes"] == 0
+    assert list(obj_a.keys())[:4] == ["verdict", "failed_nodes", "dispatched", "source"]
+    assert obj_a["failure_kinds"] == ["toolchain"]
 
     # dry_run with the knob on -> no levels key
     monkeypatch.setenv("MO_LEVEL_VECTOR", "1")

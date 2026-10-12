@@ -651,10 +651,17 @@ def _real_error_lines(path: str, max_lines: int = 40, max_bytes: int = 6000) -> 
 def _failing_verifier_sections(run_dir: Path) -> list[str]:
     """One section per failing verifier: checks + the real captured error text."""
     from mini_ork.cli import execute as execute_mod
+    from mini_ork.verify import levels as _levels  # noqa: PLC0415
+
     sections: list[str] = []
     for path in sorted(run_dir.glob("verifier_*.json")):
         data = _read_json(path)
         if not isinstance(data, dict):
+            continue
+        if _levels.abstain_kind(data):
+            # The tool could not run: there is nothing here to repair in the
+            # artifact, and a "here is what to fix" section would send the
+            # implementer after a defect no verifier observed (§failure_kind).
             continue
         status = str(data.get("status") or "").upper()
         if not (data.get("pass") is False or status in ("REFUTED", "FAIL")):

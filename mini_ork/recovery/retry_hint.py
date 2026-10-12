@@ -251,6 +251,13 @@ def _node_artifacts(run_dir: Path, node_name: str,
 
 
 def _verifier_failed(payload: dict[str, Any]) -> bool:
+    from mini_ork.verify import levels as _levels  # noqa: PLC0415
+
+    if _levels.abstain_kind(payload):
+        # The verifier could not run its tool, so this is not a verdict about the
+        # code: never name this node as the one to send back for repair
+        # (§failure_kind, audit 2026-10-11).
+        return False
     if payload.get("pass") is False:
         return True
     return str(payload.get("status") or "").upper() in ("UNVERIFIED", "REFUTED", "FAIL")

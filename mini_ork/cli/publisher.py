@@ -258,6 +258,18 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
         if not ok:
             print("  [BLOCK] publisher: panel verdict is not approved — publish refused", file=sys.stderr)
             return 1, "verdict_fail"
+    # ── verifier abstention gate (§failure_kind, audit 2026-10-11) ──────────
+    # A verifier that could not run its tool abstained. The level-vector gate
+    # below cannot catch this: `recursive_validate_impl` declares no required
+    # levels, so `publish_decision` returns "publish" without reading evidence.
+    # Checked BEFORE that gate so the withhold does not depend on MO_LEVEL_VECTOR
+    # or on the publisher being a control descendant of the abstaining verifier.
+    abstained = _levels.abstained_kinds(run_dir)
+    if abstained:
+        print(f"  [ABSTAIN] publisher: a verifier could not run its tool "
+              f"({', '.join(abstained)}) — publish withheld")
+        set_status(db, run_id, "failed")
+        return 0, "levels_unverified"
     # ── level-vector gate (MO_LEVEL_VECTOR): publish only when every required
     # level is PROVEN. `refute` fails the run (the rollback it triggers is the
     # right compensation); `abstain` withholds the commit WITHOUT rolling back

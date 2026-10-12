@@ -216,6 +216,10 @@ def test_execute_run_verifier_ref_py_json_verdict(tmp_path):
     bad = tmp_path / "bad.py"
     bad.write_text("print('{\"pass\": false}')\n")
     assert ex._run_verifier_ref(str(bad), str(ev), cwd=str(tmp_path)) == 1
+    # a toolchain abstention rides its own rc; the boolean pass is moot
+    abstain = tmp_path / "abstain.py"
+    abstain.write_text("print('{\"pass\": false, \"failure_kind\": \"toolchain\"}')\n")
+    assert ex._run_verifier_ref(str(abstain), str(ev), cwd=str(tmp_path)) == 3
 
 
 def test_execute_run_verifier_ref_sh_deprecated_still_runs(tmp_path):
