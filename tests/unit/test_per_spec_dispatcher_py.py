@@ -391,3 +391,50 @@ def test_dispatch_waves_zero_is_rejected(tmp_path, monkeypatch):
     run_dir = _build_run_dir(tmp_path)
     env = _dispatch_env(run_dir, tmp_path, MO_DISPATCH_WAVES="0")
     assert _run_dispatch(monkeypatch, env) == 1
+
+
+# ── resume reuses a delivered child ───────────────────────────────────────
+
+
+def test_dispatch_reuses_a_delivered_child_instead_of_relaunching(tmp_path, monkeypatch):
+    """A resume must not re-implement a deliverable whose child already published.
+
+    ``_launch_child`` derives ``child_run_id`` as ``{parent}--{spec}--{deliverable}``,
+    so a re-dispatched run addresses the *same* child directory. run-1791790859-83222
+    resumed with its D1/D3 children already approved and every other deliverable
+    pending; without this guard the dispatcher re-ran the two finished children
+    (paying for the work twice) and only then dispatched the remaining four.
+    """
+    run_dir = _build_run_dir(tmp_path)
+    env = _dispatch_env(run_dir, tmp_path)
+    published = Path(env["MINI_ORK_HOME"]) / "runs" / "parent-test--lens-a--D0"
+    published.mkdir(parents=True)
+    (published / "panel-verdict.json").write_text(
+        json.dumps({"verdict": "APPROVE"}), encoding="utf-8"
+    )
+
+    assert _run_dispatch(monkeypatch, env) == 0
+
+    record = _records(run_dir)[("lens-a", "D0")]
+    assert record["status"] == "delivered"
+    assert record["child_run_id"] == "parent-test--lens-a--D0"
+    assert record["verdict_path"].endswith("panel-verdict.json")
+    assert "parent-test--lens-a--D0" not in _spans(tmp_path), (
+        "an already-published child must not be relaunched"
+    )
+
+
+def test_dispatch_relaunches_a_child_whose_verdict_did_not_pass(tmp_path, monkeypatch):
+    """Only a pass is reusable; a failed or unreadable child is dispatched again."""
+    run_dir = _build_run_dir(tmp_path)
+    env = _dispatch_env(run_dir, tmp_path)
+    failed = Path(env["MINI_ORK_HOME"]) / "runs" / "parent-test--lens-a--D0"
+    failed.mkdir(parents=True)
+    (failed / "panel-verdict.json").write_text(
+        json.dumps({"verdict": "ESCALATE"}), encoding="utf-8"
+    )
+
+    assert _run_dispatch(monkeypatch, env) == 0
+
+    assert _records(run_dir)[("lens-a", "D0")]["status"] == "delivered"
+    assert "parent-test--lens-a--D0" in _spans(tmp_path), "a non-passing child must be relaunched"

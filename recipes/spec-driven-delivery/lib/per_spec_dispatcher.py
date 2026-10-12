@@ -819,6 +819,40 @@ def _collect_child(
     return record
 
 
+def _reuse_delivered_child(
+    spec_id: str,
+    deliverable_id: str,
+    run_dir: Path,
+    home: Path,
+    parent_run_id: str,
+) -> dict[str, Any] | None:
+    """Return a ``delivered`` record when this deliverable's child already passed.
+
+    ``_launch_child`` derives ``child_run_id`` as
+    ``{parent}--{spec}--{deliverable}``, so a re-dispatched run addresses the
+    *same* child directory. Without this check a resume re-launched children
+    that had already published — re-implementing finished work, and on a
+    partially-completed run paying for it twice. The verdict is read with
+    ``_read_child_verdict``, the same reader the collect path uses, so
+    ``delivered`` here means exactly what it means there.
+    """
+    child_run_id = f"{parent_run_id}--{spec_id}--{deliverable_id}"
+    child_dir = home / "runs" / child_run_id
+    if not child_dir.is_dir():
+        return None
+    verdict = _read_child_verdict(child_dir)
+    if verdict is None or verdict.get("pass") is not True:
+        return None
+    return _record_for(
+        spec_id, deliverable_id,
+        child_kickoff=run_dir / "child-kickoffs" / f"{spec_id}--{deliverable_id}.md",
+        status=STATUS_DELIVERED,
+        child_run_id=child_run_id,
+        child_run_dir=str(child_dir),
+        verdict_path=_str(verdict.get("_source_path")),
+    )
+
+
 def _prepare(
     spec_id: str,
     deliverable_id: str,
@@ -829,11 +863,14 @@ def _prepare(
     spec_dep_specs: dict[str, list[str]],
     records: dict[tuple[str, str], dict[str, Any]],
     run_dir: Path,
-) -> tuple[dict[str, Any], None] | tuple[None, list[tuple[str, str]]]:
+    home: Path | None = None,
+    parent_run_id: str = "",
+) -> tuple[dict[str, Any] | None, list[tuple[str, str]]]:
     """Pre-dispatch checks shared by the serial and the wave paths.
 
     Returns ``(record, dep_pairs)``. A non-None ``record`` means DO NOT
-    launch: ``pending`` (a dependency failed or is blocked — never
+    launch: ``delivered`` (the child already published — resume, never
+    restart), ``pending`` (a dependency failed or is blocked — never
     re-dispatched in this run) or ``blocked`` (SpecCard/gates insufficient;
     a structured ASK artifact was written). ``(None, dep_pairs)`` means
     cleared for launch with those dependency pairs for the kickoff.
@@ -841,6 +878,13 @@ def _prepare(
     Raises ``ValueError`` on a malformed dependency — the caller fails
     closed rather than guessing a dep.
     """
+    if home is not None and parent_run_id:
+        reuse = _reuse_delivered_child(
+            spec_id, deliverable_id, run_dir, home, parent_run_id
+        )
+        if reuse is not None:
+            return reuse, []
+
     dep_pairs = _effective_deps(spec_id, deliverable, cards, spec_dep_specs)
     for dep_spec, dep_did in dep_pairs:
         dep_status = records.get((dep_spec, dep_did), {}).get("status")
@@ -851,7 +895,7 @@ def _prepare(
                 status=STATUS_PENDING,
             )
             record["reason"] = "dependency failed or blocked"
-            return record, None
+            return record, []
 
     ok, ask = _validate_for_dispatch(spec_id, deliverable, card, gates_doc)
     if not ok and ask is not None:
@@ -862,7 +906,7 @@ def _prepare(
             status=STATUS_BLOCKED,
             ask_path=str(ask_path),
         )
-        return record, None
+        return record, []
     return None, dep_pairs
 
 
@@ -974,6 +1018,7 @@ def dispatch() -> int:
                         blocked_record, dep_pairs = _prepare(
                             spec_id, deliverable_id, deliverable, card, gates_doc,
                             cards, spec_dep_specs, records, run_dir,
+                            home, parent_run_id,
                         )
                     except ValueError as exc:
                         print(f"per_spec_dispatcher: {spec_id}/{deliverable_id}: {exc}",
@@ -1030,6 +1075,7 @@ def dispatch() -> int:
                 blocked_record, dep_pairs = _prepare(
                     spec_id, deliverable_id, deliverable, card, gates_doc,
                     cards, spec_dep_specs, records, run_dir,
+                    home, parent_run_id,
                 )
             except ValueError as exc:
                 print(f"per_spec_dispatcher: {spec_id}/{deliverable_id}: {exc}", file=sys.stderr)
