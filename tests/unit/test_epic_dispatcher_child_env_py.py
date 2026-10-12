@@ -68,3 +68,30 @@ def test_child_env_keeps_repo_policy_and_sets_child_identity(monkeypatch, tmp_pa
 def test_child_env_reflects_publish_gating(tmp_path):
     env = _load()._child_env(tmp_path, tmp_path, "run-parent", False)
     assert env["MINI_ORK_EPIC_PUBLISH"] == "false"
+
+
+def test_clear_stale_child_baseline_drops_only_the_baseline(tmp_path):
+    """A re-dispatched child must re-snapshot its baseline, not inherit the
+    previous attempt's.
+
+    ``execute._snapshot_pre_impl_ref`` is idempotent, so a child re-spawned into
+    the same deterministic run dir kept an old ``pre-implementer-ref`` and failed
+    ``impl_moved_base`` for a base that never moved. Only the two baseline files
+    go; the child's checkpoints and artifacts survive the clear.
+    """
+    child = tmp_path / "runs" / "run-parent-epic"
+    child.mkdir(parents=True)
+    (child / "pre-implementer-ref").write_text("e28d17be3765\n")
+    (child / "pre-implementer-untracked").write_text("stray.md\n")
+    (child / "plan.json").write_text("{}\n")
+
+    _load()._clear_stale_child_baseline(child)
+
+    assert not (child / "pre-implementer-ref").exists()
+    assert not (child / "pre-implementer-untracked").exists()
+    assert (child / "plan.json").exists(), "checkpoints must survive the clear"
+
+
+def test_clear_stale_child_baseline_is_a_noop_for_a_first_dispatch(tmp_path):
+    """A first dispatch has no run dir yet; clearing must not raise."""
+    _load()._clear_stale_child_baseline(tmp_path / "runs" / "run-parent-epic")

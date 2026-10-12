@@ -270,6 +270,32 @@ def _child_env(home: Path, root: Path, parent_run_id: str, publish_enabled: bool
     return env
 
 
+# A child's recorded pre-implementer baseline, from ``cli/execute._snapshot_pre_impl_ref``.
+# It is idempotent on purpose -- an implementer's repeat iterations must keep the
+# base their first attempt measured against -- but that makes it wrong for a
+# *re-dispatched* child, which is a new instance wearing the same run dir.
+_STALE_CHILD_BASELINE = ("pre-implementer-ref", "pre-implementer-untracked")
+
+
+def _clear_stale_child_baseline(child_dir: Path) -> None:
+    """Drop a re-dispatched child's stale pre-implementer baseline.
+
+    The dispatcher derives ``child_run_id`` from ``{parent}-{epic}``, so a retried
+    epic re-spawns into the *same* run dir. ``_snapshot_pre_impl_ref`` writes
+    ``pre-implementer-ref`` once and then refuses to overwrite it, so the retry
+    inherits the previous attempt's baseline -- a commit the target has since
+    moved past. ``execute_handlers._implementer_moved_base`` then fails the
+    implementer for a base that never actually moved: run-1791788217-61320's
+    child held a baseline from before two engine commits while HEAD sat two
+    commits ahead, so it failed ``impl_moved_base`` and skipped every verifier.
+    Clearing the file makes the fresh child re-snapshot the current tree.
+    """
+    if not child_dir.is_dir():
+        return
+    for name in _STALE_CHILD_BASELINE:
+        (child_dir / name).unlink(missing_ok=True)
+
+
 def dispatch() -> int:
     run_dir = Path(os.environ["MINI_ORK_RUN_DIR"]).resolve()
     root = Path(os.environ.get("MINI_ORK_ROOT", Path.cwd())).resolve()
@@ -327,6 +353,7 @@ def dispatch() -> int:
             kickoff_path = kickoff_dir / f"{epic_id}.md"
             kickoff_path.write_text(kickoff + "\n", encoding="utf-8")
             child_run_id = f"{parent_run_id}-{epic_id}"
+            _clear_stale_child_baseline(home / "runs" / child_run_id)
             spawn_override = os.environ.get("MINI_ORK_EPIC_SPAWN_BIN")
             spawn_bin = Path(spawn_override) if spawn_override else root / "bin" / "mini-ork-spawn"
             cmd = _spawn_command(spawn_bin, root, parent_run_id, child_run_id, kickoff_path, publish_enabled)
