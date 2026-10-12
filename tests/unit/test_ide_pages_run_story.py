@@ -43,13 +43,14 @@ def _iso(epoch: int) -> str:
 # ── a bare Run for the unit-level tests (no DB, no recipe) ───────────────────
 
 def _run(tmp_path: Path, nodes: list[Node], cols: list[list[str]],
-         calls: list[dict] | None = None) -> Run:
+         calls: list[dict] | None = None,
+         edges: list[dict] | None = None) -> Run:
     home = tmp_path / ".mini-ork"
     run_dir = home / "runs" / "run-1"
     run_dir.mkdir(parents=True, exist_ok=True)
     return Run(id="run-1", home=home, run_dir=run_dir, row={}, card={},
                nodes=nodes, cols=cols, calls=list(calls or []),
-               recipe_dir=None, workspace=None)
+               recipe_dir=None, workspace=None, edges=list(edges or []))
 
 
 def _step(story: dict, step_id: str) -> dict:
@@ -394,3 +395,82 @@ def test_layers_ignore_revise_loop_edges() -> None:
     ]
     flat = [n for col in run_page._layers(nodes, edges) for n in col]
     assert flat.index("implementer") < flat.index("test_verifier") < flat.index("reviewer")
+
+
+# ── _graph's edge list: the canvas draws these, not a fan-out ────────────────
+
+_NODES = [Node(id=n, type="shell", state="pending") for n in
+          ("planner", "implementer", "test_verifier", "reviewer", "publisher")]
+_COLS = [["planner"], ["implementer"], ["test_verifier"], ["reviewer"], ["publisher"]]
+
+
+def test_graph_edges_carry_the_declared_kind(tmp_path: Path) -> None:
+    edges = [
+        {"from": "planner", "to": "implementer", "edge_type": "depends_on"},
+        {"from": "implementer", "to": "test_verifier", "edge_type": "verifies"},
+    ]
+    run = _run(tmp_path, _NODES, _COLS, edges=edges)
+    got = run_page._graph(run)["edges"]
+
+    assert [(e["from"], e["to"], e["edge_type"]) for e in got] == [
+        ("planner", "implementer", "depends_on"),
+        ("implementer", "test_verifier", "verifies"),
+    ]
+    assert all(e["feedback"] is False for e in got)
+
+
+def test_a_retries_edge_is_feedback(tmp_path: Path) -> None:
+    edges = [
+        {"from": "planner", "to": "implementer", "edge_type": "depends_on"},
+        {"from": "reviewer", "to": "implementer", "edge_type": "retries"},
+    ]
+    run = _run(tmp_path, _NODES, _COLS, edges=edges)
+    by_pair = {(e["from"], e["to"]): e for e in run_page._graph(run)["edges"]}
+
+    # ``_layers`` drops retries on purpose, so the column of the target is
+    # still to the left of the source: both routes agree it is a back edge.
+    assert by_pair[("reviewer", "implementer")]["feedback"] is True
+    assert by_pair[("planner", "implementer")]["feedback"] is False
+
+
+def test_a_dangling_or_self_edge_is_dropped(tmp_path: Path) -> None:
+    edges = [
+        {"from": "planner", "to": "implementer", "edge_type": "depends_on"},
+        {"from": "planner", "to": "ghost_node", "edge_type": "depends_on"},
+        {"from": "ghost_node", "to": "implementer", "edge_type": "depends_on"},
+        {"from": "implementer", "to": "implementer", "edge_type": "retries"},
+        {"from": "", "to": "implementer", "edge_type": "depends_on"},
+    ]
+    run = _run(tmp_path, _NODES, _COLS, edges=edges)
+
+    assert [(e["from"], e["to"]) for e in run_page._graph(run)["edges"]] == [
+        ("planner", "implementer")]
+
+
+def test_one_edge_per_pair_keeping_the_stronger_kind(tmp_path: Path) -> None:
+    edges = [
+        {"from": "implementer", "to": "test_verifier", "edge_type": "depends_on"},
+        {"from": "implementer", "to": "test_verifier", "edge_type": "verifies"},
+    ]
+    run = _run(tmp_path, _NODES, _COLS, edges=edges)
+    got = run_page._graph(run)["edges"]
+
+    assert len(got) == 1 and got[0]["edge_type"] == "verifies"
+
+
+def test_a_recipe_without_edges_sends_an_empty_list(tmp_path: Path) -> None:
+    # No workflow.yaml → ``_load`` leaves ``edges`` empty; the IDE then falls
+    # back to its own fan-out rather than drawing nothing.
+    run = _run(tmp_path, _NODES, _COLS)
+
+    assert run_page._graph(run)["edges"] == []
+
+
+def test_the_dag_section_carries_the_edges(home: Path, monkeypatch) -> None:
+    _seed(home)
+    monkeypatch.setenv("MINI_ORK_IDE_SPEC", "1")
+    page = run_page.build(home, None, {"run": RUN})
+
+    dag = next(s for s in page["sections"] if s["type"] == "dag")
+    assert dag["edges"], dag
+    assert "edges" in page["graph"]
