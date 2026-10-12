@@ -833,6 +833,11 @@ def test_run_verifier_ref(tmp_path):
     assert ex._run_verifier_ref(str(bad), str(tmp_path / "e2"), cwd=str(tmp_path)) == 1
     assert ex._run_verifier_ref(str(empty), str(tmp_path / "e3"), cwd=str(tmp_path)) == 1  # vacuous
     assert ex._run_verifier_ref(str(env_ok), str(tmp_path / "e4"), cwd=str(tmp_path)) == 0
+    abstain = tmp_path / "abstain.sh"
+    abstain.write_text(
+        '#!/usr/bin/env bash\necho \'{"pass": false, "failure_kind": "toolchain"}\'\n')
+    # a toolchain abstention is neither pass (0) nor refuted (1): its own rc
+    assert ex._run_verifier_ref(str(abstain), str(tmp_path / "e5"), cwd=str(tmp_path)) == 3
 
 
 def test_live_publisher_and_rollback_status(tmp_path, monkeypatch):

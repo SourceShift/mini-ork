@@ -35,6 +35,7 @@ from mini_ork.dispatch.secrets import SecretStoreError
 from mini_ork.dispatch.skill_registry import granted_skills, materialize_skills
 from mini_ork.dispatch.vault import vault_environment
 from mini_ork.runtime.run_roots import load_run_roots
+from mini_ork.verify import levels as _levels
 from mini_ork.cli.main import _module_env, _reflect_timeout_seconds
 from mini_ork.observability.node_events import _now_ms, mo_node_emit, mo_node_end, mo_node_start
 from mini_ork.execute_compat import (
@@ -1671,6 +1672,12 @@ def _handle_transform(ctx: NodeDispatch):
 
 VERIFIER_NOT_EXECUTED = "verifier_not_executed"
 
+# §failure_kind (audit 2026-10-11): the verdict a verifier node carries when it
+# could not run its tool at all (spawn failure, a refusal like EBADDEVENGINES, a
+# missing binary). Not a judgement about the code, so no node is at fault — the
+# runner must be fixed and the run re-attempted.
+VERIFIER_ABSTAINED = "verifier_abstained"
+
 
 def _verifier_not_executed(ctx: NodeDispatch, why: str):
     """Fail a verifier node that never ran its script — loudly, with a reason
@@ -1703,7 +1710,9 @@ def _write_evidence_ledger_row(ctx: NodeDispatch, script: str, ev: str, rc: int,
         tree = _el.tree_hash(target) if target else None
         ac_id = _el.verifier_ac_id(ev) or f"verifier:{vstem}"
         _el.append_row(ctx.run_dir_eff or ctx.run_dir, ac_id=ac_id, probe=script,
-                       verdict="pass" if rc == 0 else "fail", log=ev, tree=tree)
+                       verdict="pass" if rc == 0 else
+                       ("abstain" if rc == _levels.ABSTAIN_RC else "fail"),
+                       log=ev, tree=tree)
     except Exception as exc:  # noqa: BLE001 — enrichment must never fail the node
         print(f"  [warn] evidence-ledger write skipped: {exc}", file=sys.stderr)
 
@@ -1804,6 +1813,21 @@ def _handle_verifier(ctx: NodeDispatch):
         # rows the abstain gate's calibration window also reads.
         if rc == 0:
             return _publish_success()
+        if rc == _levels.ABSTAIN_RC:
+            # A toolchain abstention: the tool could not run, so this says
+            # nothing about the code. `indeterminate` (not `fail`) also keeps it
+            # out of the abstain gate's `verdict IN ('pass','fail')` calibration
+            # window, and finish_reason stays the CHECK-legal `done`.
+            _record_verifier_result(ctx, "indeterminate")
+            ctx.node_verdict = VERIFIER_ABSTAINED
+            line = (f"  [abstain] verifier node {ctx.node_id}: {VERIFIER_ABSTAINED} "
+                    "(the verifier could not run its tool)")
+            print(line, file=sys.stderr)
+            print(line)
+            _append_run_note(
+                ctx.db, ctx.run_id,
+                f"{VERIFIER_ABSTAINED}: node {ctx.node_id} (toolchain failure)")
+            return _levels.ABSTAIN_RC, "done"
         _record_verifier_result(ctx, "fail")
         return 1, "error"
 

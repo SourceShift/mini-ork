@@ -102,6 +102,25 @@ def test_missing_verifier_ref_is_verifier_not_executed(tmp_path, monkeypatch, ca
     assert "verifier node pre_retirement_parity: verifier_not_executed" in capsys.readouterr().err
 
 
+def test_verifier_abstain_records_verifier_abstained(tmp_path, monkeypatch, capsys) -> None:
+    # A verifier that could not run its tool (rc 3, ABSTAIN_RC) is neither pass
+    # nor fail: finish_reason stays the CHECK-legal "done", the node verdict is
+    # verifier_abstained, and a run note records it (§failure_kind audit).
+    db = _seed(tmp_path)
+
+    def abstaining_verifier(script, evidence_path, **_kw):
+        Path(evidence_path).write_text('{"pass": false, "failure_kind": "toolchain"}\n')
+        return 3
+
+    rc, fr = _self_migrate(tmp_path, db, monkeypatch, "pre_retirement_parity",
+                           "verifiers/pre-retirement-parity.py", abstaining_verifier)
+    assert (rc, fr) == (3, "done")
+    finish, payload = _node_end(db, "pre_retirement_parity")
+    assert finish == "done" and payload["verdict"] == "verifier_abstained"
+    assert "verifier_abstained: node pre_retirement_parity (toolchain failure)" in _notes(db)
+    assert "[abstain] verifier node pre_retirement_parity: verifier_abstained" in capsys.readouterr().err
+
+
 def test_missing_required_artifact_before_running_is_verifier_not_executed(tmp_path) -> None:
     db = _seed(tmp_path)
     rd = tmp_path / "run"

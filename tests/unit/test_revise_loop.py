@@ -89,9 +89,12 @@ if counter:
     except OSError:
         pass
 behavior = os.environ.get("{env}", "pass")
-fail = behavior == "fail" or (behavior == "fail_first" and n == 0)
-print(json.dumps({{"pass": not fail,
-                   "reasons": ["{name}: synthetic round-0 failure"] if fail else []}}))
+fail = behavior in ("fail", "fail_toolchain") or (behavior == "fail_first" and n == 0)
+payload = {{"pass": not fail,
+            "reasons": ["{name}: synthetic round-0 failure"] if fail else []}}
+if behavior == "fail_toolchain":
+    payload["failure_kind"] = "toolchain"
+print(json.dumps(payload))
 '''
 
 
@@ -261,6 +264,45 @@ def test_opt_out_with_zero_rounds(tmp_path, monkeypatch):
     assert state["implementer"] == 1          # no revise round
     assert state["rollback"] == 1
     assert rc != 0
+
+
+# ── §failure_kind: a toolchain abstention is not a failure ────────────────────
+
+def test_abstained_verifier_withholds_and_keeps_the_edit(tmp_path, monkeypatch):
+    """A verifier that could not run its tool (``failure_kind: toolchain``)
+    abstains — the audit's whole point: it must NOT send findings back to the
+    implementer (no revise round), must NOT roll back, and must withhold the
+    publish with rc 0. The control below shows the same fixture WITHOUT the kind
+    still fails and rolls back."""
+    monkeypatch.setenv("MO_LEVEL_VECTOR", "1")  # the run verdict carries failure_kinds
+    rc, state, run_dir = _run(
+        tmp_path, monkeypatch, workflow=_base_workflow(),
+        reviewer_verdicts=["pass"], typecheck="fail_toolchain", test="pass",
+    )
+    assert rc == 0
+    assert state["rollback"] == 0
+    assert state["implementer"] == 1
+    assert not (run_dir / "revise" / "round-1.md").exists()
+
+    verdict = json.loads((run_dir / "verdict.json").read_text())
+    assert verdict["verdict"] == "abstain"
+    assert verdict["failed_nodes"] == 0
+    assert verdict["failure_kinds"] == ["toolchain"]
+
+
+def test_control_without_failure_kind_still_fails_and_rolls_back(tmp_path, monkeypatch):
+    # No failure_kind: the identical failing verifier is a real failure — the
+    # fail-closed half. MO_REVISE_ROUNDS=0 keeps the retries edge from absorbing
+    # it into a revise round, so the terminal failure is what we observe.
+    rc, state, run_dir = _run(
+        tmp_path, monkeypatch, workflow=_base_workflow(),
+        reviewer_verdicts=["pass"], typecheck="fail", test="pass",
+        revise_rounds="0",
+    )
+    assert rc != 0
+    assert state["rollback"] == 1
+    verdict = json.loads((run_dir / "verdict.json").read_text())
+    assert verdict["failed_nodes"] >= 1
 
 
 # ── DoD 4: one round for a shared target ──────────────────────────────────────

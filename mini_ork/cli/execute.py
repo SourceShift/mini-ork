@@ -329,7 +329,16 @@ def _emit_run_verdict(run_dir, fail_count, dispatched, *, dry_run=False, task_cl
     # (same name) does not.
     if not dry_run and os.path.isfile(panel) and not is_rubric_prescreen(panel):
         return
-    verdict = "fail" if fail_count > 0 else "pass"
+    # An abstention is neither a pass nor a failure: a verifier could not run its
+    # tool, so the run is unproven (§failure_kind, audit 2026-10-11). A real
+    # failure outranks it — that run IS failed. `dry_run` keeps today's bytes.
+    abstained = _levels.abstained_kinds(run_dir) if (run_dir and not dry_run) else []
+    if fail_count > 0:
+        verdict = "fail"
+    elif abstained:
+        verdict = "abstain"
+    else:
+        verdict = "pass"
     verdict_path = os.path.join(
         run_dir, "verdict.dryrun.json" if dry_run else "verdict.json")
     if os.path.isfile(verdict_path):
@@ -355,6 +364,10 @@ def _emit_run_verdict(run_dir, fail_count, dispatched, *, dry_run=False, task_cl
             "source": "execute@run-level",
         }
         payload.update(report)
+        # Appended AFTER the four byte-stable pairs, and only when a run actually
+        # abstained, so the no-abstention bytes are unchanged.
+        if abstained:
+            payload["failure_kinds"] = abstained
         try:
             open(verdict_path, "w").write(
                 json.dumps(payload, separators=(",", ":"), ensure_ascii=False) + "\n")
@@ -858,6 +871,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
             })
 
     fail_count = 0
+    abstain_count = 0
     out: list[str] = []
     if dry_run:
         # partitioned reorders by node_type group; others keep NODE_IDS order.
@@ -963,7 +977,14 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     work_fields = [field for field in selected if field[1] != "rollback"]
 
     def _count_failures(outcomes):
-        return sum(1 for _field, rc, _finish_reason in outcomes if rc != 0)
+        # An abstention is not a failure: the tool could not run, so nothing
+        # about the code was refuted (audit 2026-10-11).
+        return sum(1 for _field, rc, _finish_reason in outcomes
+                   if rc != 0 and rc != _levels.ABSTAIN_RC)
+
+    def _count_abstains(outcomes):
+        return sum(1 for _field, rc, _finish_reason in outcomes
+                   if rc == _levels.ABSTAIN_RC)
 
     # Revise-loop cap read once per run: 0 (or negative) restores the legacy
     # block-descendants-and-rollback behaviour exactly.
@@ -977,7 +998,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         selected parent succeeded; failed parents block descendants without
         executing a publisher or consumer against partial state.
         """
-        nonlocal fail_count
+        nonlocal fail_count, abstain_count
         pending = {field[0]: field for field in work_fields}
         statuses: dict[str, str] = {}
         order = {field[0]: index for index, field in enumerate(work_fields)}
@@ -1006,12 +1027,28 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 parents = set(control_parents.get(node_id, ())) & selected_ids
                 failed = sorted(
                     parent for parent in parents
-                    if statuses.get(parent) in {"failed", "blocked"}
+                    if statuses.get(parent) in {"failed", "blocked", "abstained"}
                 )
                 if failed:
                     blocked.append((node_id, failed))
             for node_id, failed in blocked:
                 pending.pop(node_id)
+                abstained_parents = [p for p in failed if statuses.get(p) == "abstained"]
+                if abstained_parents and len(abstained_parents) == len(failed):
+                    # Every blocker abstained, so a tool that could not run is
+                    # all that stands between this node and its gate: it is
+                    # unverified too, never a failure. Counting these as failures
+                    # is what rolled back a tree no verifier had checked.
+                    statuses[node_id] = "abstained"
+                    abstain_count += 1
+                    print(
+                        f"  [skip] node_id={node_id} unverified: parent(s) abstained: "
+                        f"{', '.join(abstained_parents)}",
+                        file=sys.stderr,
+                    )
+                    continue
+                # A real failure anywhere in the blocker set outranks an
+                # abstention (fail-closed): the node is blocked and counted.
                 statuses[node_id] = "blocked"
                 fail_count += 1
                 print(
@@ -1062,6 +1099,9 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
             for field, rc, _finish_reason in outcomes:
                 if rc == 0:
                     statuses[field[0]] = "success"
+                elif rc == _levels.ABSTAIN_RC:
+                    statuses[field[0]] = "abstained"
+                    abstain_count += 1
                 else:
                     statuses[field[0]] = "failed"
                     fail_count += 1
@@ -1092,7 +1132,10 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
             # gates failing in one wave produce ONE combined revise round.
             revise_groups: dict[str, list[tuple[tuple, int, str]]] = {}
             for field, rc, finish_reason in outcomes:
-                if rc == 0 or field[0] not in retry_edges:
+                if rc == 0 or rc == _levels.ABSTAIN_RC or field[0] not in retry_edges:
+                    # An abstention sends nothing back: the findings would be
+                    # about a tool that never ran, and re-running the implementer
+                    # is the "reflect on the code and replan" the audit forbids.
                     continue
                 if finish_reason == REVIEWER_VERDICT_UNPARSEABLE:
                     # Nothing to send back: the reviewer judged nothing. Re-running
@@ -1170,20 +1213,26 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         elif dependency_aware:
             _dispatch_dependency_graph()
         elif dispatch_mode == "parallel":
-            fail_count += _count_failures(_parallel(work_fields))
+            _oc = _parallel(work_fields)
+            fail_count += _count_failures(_oc)
+            abstain_count += _count_abstains(_oc)
         elif dispatch_mode == "partitioned":
             for node_type in _NODE_TYPE_ORDER:
                 if node_type == "rollback":
                     continue
                 group = [field for field in work_fields if field[1] == node_type]
-                fail_count += _count_failures(_parallel(group))
+                _oc = _parallel(group)
+                fail_count += _count_failures(_oc)
+                abstain_count += _count_abstains(_oc)
         else:
             pending = []
 
             def _flush_pending():
-                nonlocal fail_count, pending
+                nonlocal fail_count, abstain_count, pending
                 if pending:
-                    fail_count += _count_failures(_parallel(pending))
+                    _oc = _parallel(pending)
+                    fail_count += _count_failures(_oc)
+                    abstain_count += _count_abstains(_oc)
                     pending = []
 
             for field in work_fields:
@@ -1194,7 +1243,9 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                     continue
                 _flush_pending()
                 rc, _fr = _dispatch_serial(field)
-                if rc != 0:
+                if rc == _levels.ABSTAIN_RC:
+                    abstain_count += 1
+                elif rc != 0:
                     fail_count += 1
             _flush_pending()
 
@@ -1210,6 +1261,24 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
             _maybe_triage_failed_run(db, run_id, home, root)
             sys.stderr.write(f"execute: {fail_count} node(s) failed\n")
             return 1
+        if abstain_count > 0:
+            # §failure_kind: a verifier could not run its tool, so its node — and
+            # every node it gated — is unverified rather than wrong. Withhold the
+            # publish and keep the edit for a re-run once the runner is fixed.
+            # Deliberately NOT routed to auto-repair, which would replan work no
+            # tool had checked. rc 0 mirrors the publisher's own abstain contract
+            # (revert_branch must not destroy an abstained edit).
+            from mini_ork.cli.execute_handlers import _append_run_note  # noqa: PLC0415
+
+            set_status(db, run_id, "failed")
+            _append_run_note(
+                db, run_id,
+                f"abstained: {abstain_count} node(s) unverified (a verifier could "
+                "not run its tool) — publish withheld")
+            sys.stderr.write(
+                f"[ABSTAIN] execute: {abstain_count} node(s) unverified "
+                "(toolchain) — publish withheld, edit kept\n")
+            return 0
         # F4: a recipe with NO publisher node never writes a terminal status, so
         # an all-green run left the row at "executing" — the board read it as
         # phantom "working" forever and the reaper's liveness probe had to guess.
@@ -1724,6 +1793,11 @@ def _run_verifier_ref(script, evidence_path, *, plan_path="", artifact_path="", 
         return rc  # non-JSON evidence → propagate the script's rc
     if not isinstance(payload, dict) or "pass" not in payload:
         return rc
+    if _levels.abstain_kind(payload):
+        # The verifier declared it could not run its tool (audit 2026-10-11).
+        # That is an abstention, not a verdict about the code: a distinct rc so
+        # the dispatch loop can leave fail_count alone and withhold the publish.
+        return _levels.ABSTAIN_RC
     return 0 if payload.get("pass") is True else 1
 
 
