@@ -221,6 +221,55 @@ def _spawn_command(
     return cmd
 
 
+# Environment names that describe *this node's* run, which a spawned epic child
+# must not inherit. The child is a different run in a different recipe, so
+# anything naming the parent's recipe, run directory, or recovery closure makes
+# it believe it is continuing this node's work. Concretely, MINI_ORK_RECOVERY_*
+# reaching a framework-edit child made it recompute an epic-runner closure (see
+# cli/execute.py:658), which resolved to `epic_dispatcher` -- a node the child's
+# recipe does not have -- yielding a two-node closure that skipped the child's
+# own implementer. The child then had no diff to publish and failed.
+_CHILD_ENV_DROP = (
+    "MINI_ORK_RECIPE",
+    "MINI_ORK_WORKFLOW",
+    "MINI_ORK_TASK_CLASS",
+    "MINI_ORK_RUN_DIR",
+    "MINI_ORK_RUN_ID",
+    "MINI_ORK_PARENT_RUN_ID",
+    "MINI_ORK_LEASE_TOKEN",
+    "MINI_ORK_ALLOW_CHILD_SPAWN",
+    "MINI_ORK_NODE_INPUT_DIR",
+    "MINI_ORK_NODE_INPUT_MANIFEST",
+    "MO_NODE_ID",
+    "MO_NODE_TYPE",
+    "MO_NODE_ATTEMPT",
+    "MO_INPUT_HASH",
+)
+_CHILD_ENV_DROP_PREFIX = ("MINI_ORK_RECOVERY_",)
+
+
+def _child_env(home: Path, root: Path, parent_run_id: str, publish_enabled: bool) -> dict[str, str]:
+    """The environment for a spawned epic child: repo config in, node state out.
+
+    Every inherited ``MO_*`` policy knob (budgets, lanes, gates) is kept, because
+    those are repo-wide. Dropped is exactly the set that names this node's run --
+    see ``_CHILD_ENV_DROP`` -- and the child's own identity is set explicitly.
+    ``MINI_ORK_EPIC_PUBLISH`` is the gateway the child's publisher reads, and
+    ``MINI_ORK_PARENT_RUN_ID`` links the child back to the epic that spawned it.
+    """
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if name not in _CHILD_ENV_DROP and not name.startswith(_CHILD_ENV_DROP_PREFIX)
+    }
+    env["MINI_ORK_HOME"] = str(home)
+    env["MINI_ORK_ROOT"] = str(root)
+    env.setdefault("MINI_ORK_DB", str(home / "state.db"))
+    env["MINI_ORK_EPIC_PUBLISH"] = "true" if publish_enabled else "false"
+    env["MINI_ORK_PARENT_RUN_ID"] = parent_run_id
+    return env
+
+
 def dispatch() -> int:
     run_dir = Path(os.environ["MINI_ORK_RUN_DIR"]).resolve()
     root = Path(os.environ.get("MINI_ORK_ROOT", Path.cwd())).resolve()
@@ -281,11 +330,7 @@ def dispatch() -> int:
             spawn_override = os.environ.get("MINI_ORK_EPIC_SPAWN_BIN")
             spawn_bin = Path(spawn_override) if spawn_override else root / "bin" / "mini-ork-spawn"
             cmd = _spawn_command(spawn_bin, root, parent_run_id, child_run_id, kickoff_path, publish_enabled)
-            env = os.environ.copy()
-            env["MINI_ORK_HOME"] = str(home)
-            env["MINI_ORK_ROOT"] = str(root)
-            env.setdefault("MINI_ORK_DB", str(home / "state.db"))
-            env["MINI_ORK_EPIC_PUBLISH"] = "true" if publish_enabled else "false"
+            env = _child_env(home, root, parent_run_id, publish_enabled)
             log_path = run_dir / f"epic-dispatch-{epic_id}.log"
             log = log_path.open("w", encoding="utf-8")
             proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, text=True, env=env)
