@@ -33,7 +33,6 @@ import os
 import random
 import sqlite3
 import sys
-import time
 from pathlib import Path
 
 import pytest
