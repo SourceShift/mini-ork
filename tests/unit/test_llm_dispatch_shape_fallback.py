@@ -35,10 +35,21 @@ def _argv_with_model(node_type: str, out: str, model: str) -> list[str]:
             "--model", model]
 
 
-def _isolate(monkeypatch):
-    """Neutralise the cost circuit + telemetry so a test needs no live state.db."""
+def _isolate(monkeypatch, tmp_path):
+    """Neutralise the cost circuit, telemetry AND the lane ledger.
+
+    The ledger redirect is not optional. ``MINI_ORK_DB``/``MINI_ORK_HOME``
+    default to the tree pytest runs in, so without them the lane fuse reads the
+    DEVELOPER'S real ``state.db`` — this helper claimed "a test needs no live
+    state.db" while the ambient one leaked in. Nothing observed it while the
+    fuse only ever saw the lone lead lane; once it started running on the
+    composed chain, a locally quota-fused ``codex`` silently narrowed the chain
+    under test and the assertion read as a routing bug.
+    """
     monkeypatch.setattr(L, "cost_circuit_open", lambda *a, **k: False)
     monkeypatch.setattr(L, "write_llm_calls_row", lambda *a, **k: None)
+    monkeypatch.setenv("MINI_ORK_HOME", str(tmp_path))
+    monkeypatch.setenv("MINI_ORK_DB", str(tmp_path / "state.db"))
     monkeypatch.delenv("MO_SHAPE_CHECK", raising=False)
     monkeypatch.delenv("MO_FUSE_ENABLED", raising=False)
     monkeypatch.delenv("MO_DISPATCH_MAX_ATTEMPTS", raising=False)
@@ -49,7 +60,7 @@ def _isolate(monkeypatch):
 
 
 def test_planner_without_model_override_gets_fallback_chain(monkeypatch, tmp_path):
-    _isolate(monkeypatch)
+    _isolate(monkeypatch, tmp_path)
     seen = {}
 
     def spy(model, prompt, out_file, timeout_s, max_turns):
@@ -65,7 +76,7 @@ def test_planner_without_model_override_gets_fallback_chain(monkeypatch, tmp_pat
 
 
 def test_prose_node_without_model_override_stays_single_lane(monkeypatch, tmp_path):
-    _isolate(monkeypatch)
+    _isolate(monkeypatch, tmp_path)
     seen = {}
 
     def spy(model, prompt, out_file, timeout_s, max_turns):
@@ -80,7 +91,7 @@ def test_prose_node_without_model_override_stays_single_lane(monkeypatch, tmp_pa
 
 
 def test_explicit_model_override_is_not_chained(monkeypatch, tmp_path):
-    _isolate(monkeypatch)
+    _isolate(monkeypatch, tmp_path)
     seen = {}
 
     def spy(model, prompt, out_file, timeout_s, max_turns):
@@ -96,7 +107,7 @@ def test_explicit_model_override_is_not_chained(monkeypatch, tmp_path):
 
 
 def test_shape_reject_retries_within_max_attempts(monkeypatch, tmp_path):
-    _isolate(monkeypatch)
+    _isolate(monkeypatch, tmp_path)
     monkeypatch.setattr(L, "backoff_seconds", lambda n: 0)
     monkeypatch.setenv("MO_DISPATCH_MAX_ATTEMPTS", "2")
     calls = {"n": 0}
@@ -113,7 +124,7 @@ def test_shape_reject_retries_within_max_attempts(monkeypatch, tmp_path):
 
 
 def test_shape_reject_recovers_on_retry(monkeypatch, tmp_path):
-    _isolate(monkeypatch)
+    _isolate(monkeypatch, tmp_path)
     monkeypatch.setattr(L, "backoff_seconds", lambda n: 0)
     monkeypatch.setenv("MO_DISPATCH_MAX_ATTEMPTS", "3")
     calls = {"n": 0}
