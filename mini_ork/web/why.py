@@ -53,6 +53,7 @@ def aggregate(
         "evidence_refs": [],
         "self_improve_notes": None,
         "trace_verdicts": [],
+        "lane_failures": [],
         "summary": "no diagnostic data found",
     }
 
@@ -144,9 +145,60 @@ def aggregate(
             (task_run_id, task_run_id, task_run_id),
         )
 
-    # 6. Summarize — pick the most user-facing line
+    # 6. llm_calls — which LANE failed, and why.
+    #
+    # Without this the aggregation answers "no specific failure signal found" for
+    # the most common death there is: a run whose dispatch chain died at its
+    # first node never reached the point of writing execute.log or a verifier
+    # result, so every signal above is legitimately empty. Every lane that failed
+    # is nevertheless already in llm_calls, with the provider's own classified
+    # error, one row per dead lane — it was simply never read here. The terminal
+    # lane is the one that ended the walk; the earlier rows are what the cascade
+    # tried and abandoned.
+    if db.has_table("llm_calls"):
+        cols = {r["name"] for r in db.rows("PRAGMA table_info(llm_calls)")}
+        if {"run_id", "status"} <= cols:
+            wanted = [c for c in ("id", "ts", "provider", "model_id", "feature_name",
+                                  "error_category", "error_message", "retryable", "status")
+                      if c in cols]
+            from mini_ork.dispatch.llm_dispatch import error_message_head
+
+            for row in db.rows(
+                f"SELECT {', '.join(wanted)} FROM llm_calls "
+                "WHERE run_id = ? AND status = 'failed' ORDER BY id ASC",
+                (task_run_id,),
+            ):
+                out["lane_failures"].append({
+                    "lane": row.get("model_id"),
+                    "provider": row.get("provider"),
+                    "role": row.get("feature_name"),
+                    "category": row.get("error_category"),
+                    "message": error_message_head(row.get("error_message"), limit=300),
+                })
+
+    # 7. Summarize — pick the most user-facing line
     out["summary"] = _summarize(out)
     return out
+
+
+def _lane_label(failure: dict[str, Any]) -> str:
+    """``lane(category)`` for the chain summary, naming the two categories the
+    ledger's vocabulary cannot.
+
+    ``llm_calls.error_category`` is pinned by a CHECK constraint to the PROVIDER
+    error vocabulary, which has no value for a mini-ork-level rejection — a reply
+    of the right kind but the wrong shape. The message is the only place that
+    distinction lives, so derive it here rather than printing "unknown" for the
+    failure that actually happens most (two of four lanes on a live chain,
+    2026-10-12).
+    """
+    category = str(failure.get("category") or "").strip()
+    if not category or category == "unknown":
+        if re.search(r"shape check", str(failure.get("message") or ""), re.IGNORECASE):
+            category = "shape"
+        else:
+            category = "error"
+    return f"{failure.get('lane') or '?'}({category})"
 
 
 def _summarize(diag: dict[str, Any]) -> str:
@@ -169,6 +221,15 @@ def _summarize(diag: dict[str, Any]) -> str:
     notes = diag.get("self_improve_notes") or {}
     if notes.get("outcome") in ("failed", "rejected", "aborted", "timed_out"):
         return f"self_improve outcome: {notes['outcome']} (notes: {notes.get('raw', '')})"
+
+    # Lane failures outrank the catch-alls below: when the dispatch chain is what
+    # died, the lane ledger is the whole story, and "all verifiers passed" or
+    # "no specific failure signal found" would read as if nothing had gone wrong.
+    lanes = diag.get("lane_failures") or []
+    if lanes:
+        chain = ", ".join(_lane_label(f) for f in lanes)
+        terminal = lanes[-1].get("message") or ""
+        return f"dispatch chain died: {chain}" + (f" — {terminal}" if terminal else "")
 
     if verifiers and all(v["pass"] for v in verifiers):
         return "all verifiers passed — failure occurred at orchestrator level (check execute.log tail)"

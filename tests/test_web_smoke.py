@@ -1646,56 +1646,65 @@ def test_legacy_rows_with_zero_cache_still_query(tmp_path: Path) -> None:
     assert rows[0]["cached_input_tokens"] == 0
 
 
-def test_lane_fuse_trips_after_three_retryable_failures(tmp_path: Path) -> None:
+def test_lane_fuse_trips_after_three_transient_failures(tmp_path: Path) -> None:
+    """Three consecutive transient failures on ONE LANE open the fuse.
+
+    Keyed on ``model_id``, not ``feature_name``: the lane is what actually ran,
+    and the node role is the same string whichever lane served it — so a
+    role-keyed fuse could never open on a fallback tail lane at all.
+    """
     db_path = tmp_path / "state.db"
     con = sqlite3.connect(db_path)
     con.executescript(
         """
         CREATE TABLE llm_calls (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
-          feature_name TEXT NOT NULL,
-          status TEXT NOT NULL,
-          error_category TEXT,
-          retryable INTEGER
+          ts TEXT NOT NULL DEFAULT (datetime('now')),
+          model_id TEXT, feature_name TEXT NOT NULL,
+          status TEXT NOT NULL, error_category TEXT, retryable INTEGER
         );
-        INSERT INTO llm_calls(feature_name, status, error_category, retryable)
+        INSERT INTO llm_calls(model_id, feature_name, status, error_category, retryable)
         VALUES
-          ('framework_edit:glm_lens', 'failed', 'network', 1),
-          ('framework_edit:glm_lens', 'failed', 'network', 1),
-          ('framework_edit:glm_lens', 'failed', 'network', 1);
+          ('glm', 'framework_edit:glm_lens', 'failed', 'network', 1),
+          ('glm', 'framework_edit:glm_lens', 'failed', 'network', 1),
+          ('glm', 'framework_edit:glm_lens', 'failed', 'network', 1);
         """
     )
     con.close()
 
     from mini_ork.dispatch.llm_dispatch import check_lane_fuse
 
-    assert check_lane_fuse(str(db_path), "glm_lens", "network") is True
+    assert check_lane_fuse(str(db_path), "glm", "network", strikes=3) is True
+    # The role it ran under is not what the fuse watches.
+    assert check_lane_fuse(str(db_path), "glm_lens", "network", strikes=3) is False
 
 
-def test_lane_fuse_ignores_nonretryable_failures(tmp_path: Path) -> None:
+def test_lane_fuse_trips_on_a_terminal_category_it_cannot_retry(tmp_path: Path) -> None:
+    """``auth`` is written ``retryable=0`` because retrying cannot fix it.
+
+    A fuse that demanded ``retryable=1`` was therefore blind to the categories
+    that actually kill a run — it could only ever fire on the self-healing ones.
+    Terminal categories now trip after a single strike.
+    """
     db_path = tmp_path / "state.db"
     con = sqlite3.connect(db_path)
     con.executescript(
         """
         CREATE TABLE llm_calls (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
-          feature_name TEXT NOT NULL,
-          status TEXT NOT NULL,
-          error_category TEXT,
-          retryable INTEGER
+          ts TEXT NOT NULL DEFAULT (datetime('now')),
+          model_id TEXT, feature_name TEXT NOT NULL,
+          status TEXT NOT NULL, error_category TEXT, retryable INTEGER
         );
-        INSERT INTO llm_calls(feature_name, status, error_category, retryable)
-        VALUES
-          ('framework_edit:glm_lens', 'failed', 'auth', 0),
-          ('framework_edit:glm_lens', 'failed', 'auth', 0),
-          ('framework_edit:glm_lens', 'failed', 'auth', 0);
+        INSERT INTO llm_calls(model_id, feature_name, status, error_category, retryable)
+        VALUES ('glm', 'framework_edit:glm_lens', 'failed', 'auth', 0);
         """
     )
     con.close()
 
     from mini_ork.dispatch.llm_dispatch import check_lane_fuse
 
-    assert check_lane_fuse(str(db_path), "glm_lens", "auth") is False
+    assert check_lane_fuse(str(db_path), "glm", "auth", strikes=1) is True
 
 
 def test_agents_endpoint_legacy_null_snapshot_uses_fallback(tmp_path: Path, monkeypatch) -> None:

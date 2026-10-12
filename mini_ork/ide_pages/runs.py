@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from mini_ork.dispatch.llm_dispatch import error_message_head
 from mini_ork.ide_pages import spec as S
 
 TABS = [("runs", "All runs"), ("active", "Active & control"), ("hooks", "Event hooks")]
@@ -49,6 +50,39 @@ def _total_runs(home: Path) -> int:
     return int(rows[0].get("n") or 0) if rows else 0
 
 
+def _failure_reasons(home: Path, run_ids: list[str]) -> dict[str, str]:
+    """Per run, why it died: the newest failed lane call in ``llm_calls``.
+
+    The table showed a failed run's step but never WHY, so a delegation could die
+    at the planner node for a day with the board reading only "failed at plan".
+    The reason was already in the ledger — ``llm_calls`` carries one row per dead
+    lane, with the provider's own classified error — it was simply never joined
+    to the run it belongs to. The LAST row wins because the terminal lane is the
+    one whose failure ended the walk (the earlier rows are the lanes the cascade
+    tried and abandoned).
+    """
+    db = _db(home)
+    if not run_ids or not db.has_table("llm_calls"):
+        return {}
+    placeholders = ",".join("?" for _ in run_ids)
+    rows = db.rows(
+        "SELECT run_id, model_id, error_category, error_message FROM llm_calls "
+        f"WHERE run_id IN ({placeholders}) AND status = 'failed' "
+        "ORDER BY id ASC",
+        tuple(run_ids),
+    )
+    out: dict[str, str] = {}
+    for r in rows or []:
+        run_id = str(r.get("run_id") or "")
+        if not run_id:
+            continue
+        lane = str(r.get("model_id") or "?")
+        category = str(r.get("error_category") or "").strip()
+        head = error_message_head(r.get("error_message"), limit=70)
+        out[run_id] = f"{lane}: {category or 'error'}" + (f" — {head}" if head else "")
+    return out
+
+
 def _all_runs(home: Path, args: dict[str, str], now: int,
               ctx: dict[str, Any]) -> list[dict[str, Any]]:
     current = (args.get("filter") or "all").replace("-", "_")
@@ -64,29 +98,42 @@ def _all_runs(home: Path, args: dict[str, str], now: int,
               "done": f"✓ done {counts.get('done', 0)}"}
     chips = S.chips("", [{"t": labels[k], "on": k == current, "do": S.set_args(filter=k)}
                          for k in FILTERS], full=True)
+    reasons = _failure_reasons(home, [r.run_id for r in rows])
     table_rows = []
     for r in rows:
         mark, colour = S.STATE_MARK.get(r.state, S.STATE_MARK["working"])
         step_colour = "red" if r.state == "failed" else "yellow" if r.state == "needs_you" else "muted"
         title = r.title or r.run_id
+        reason = reasons.get(r.run_id, "")
+        if not reason:
+            why = S.muted("—")
+        elif r.state == "done":
+            # A green run that logged lane failures is not a failed run: the
+            # cascade absorbed them and a later lane served. Say that, rather
+            # than colouring "why" red on a run that succeeded.
+            why = S.muted("↺ recovered")
+        else:
+            why = S.cell(reason, "red")
         table_rows.append({
             "cells": [S.cell(mark, colour), S.cell(title, "text"), S.muted(r.recipe),
-                      S.cell(r.step or "—", step_colour), S.muted(S.age(r.started_at, now)),
+                      S.cell(r.step or "—", step_colour), why,
+                      S.muted(S.age(r.started_at, now)),
                       S.mono(S.money(r.cost_usd)), S.mono(_change(r.added, r.removed))],
             "do": S.open_run(r.run_id, title),
         })
     if not table_rows:
-        table_rows = [[S.muted(""), S.muted("No runs here yet"), "", "", "", "", ""]]
+        table_rows = [[S.muted(""), S.muted("No runs here yet"), "", "", "", "", "", ""]]
     shown = f"Showing the latest {len(rows)}. " if len(rows) >= _RUN_LIMIT else ""
     project_total = _total_runs(home)
     if project_total > total:
         shown += f"Counts cover the latest {total} of {project_total} runs. "
     table = S.table(
-        "", [S.col(18), S.col(fr=1, min=180), S.col(110), S.col(fr=0.6, min=120), S.col(46),
-             S.col(56), S.col(64)],
-        ["", "run", "recipe", "step", "age", "cost", "change"], table_rows, full=True,
+        "", [S.col(18), S.col(fr=1, min=180), S.col(110), S.col(fr=0.6, min=120),
+             S.col(fr=1.2, min=220), S.col(46), S.col(56), S.col(64)],
+        ["", "run", "recipe", "step", "why", "age", "cost", "change"], table_rows, full=True,
         note=f"{shown}Filter like /runs needs-you or /runs failed recipe:code-fix. "
-             "Click a run to open its card.")
+             "Click a run to open its card. “why” is the failing LANE from llm_calls — "
+             "the terminal rung of the fallback chain that ended the run.")
     return [chips, table]
 
 

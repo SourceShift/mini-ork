@@ -162,12 +162,47 @@ def test_lane_fuse(tmp_path):
                    "'mini-ork:planner',0,0,0,0,0,'failed','{}','capacity',1);")
     old = dict(os.environ)
     os.environ.update({"MINI_ORK_ROOT": str(REPO), "MINI_ORK_HOME": hp, "MINI_ORK_DB": db_p,
-                       "MO_FUSE_ENABLED": "1", "MO_DAILY_BUDGET_USD": "1000"})
+                       "MO_FUSE_ENABLED": "1", "MO_DAILY_BUDGET_USD": "1000",
+                       # capacity is a TRANSIENT category: watched only on the
+                       # opt-in, because halting on one is the false positive
+                       # the default set avoids.
+                       "MO_FUSE_TRANSIENT": "1"})
     try:
-        rp = ld.llm_dispatch(["--node-type", "planner", "--prompt-text", "hi"], root=str(REPO))
+        # A one-lane chain: the fuse refuses only when NOTHING survives the drop.
+        rp = ld.llm_dispatch(["--node-type", "planner", "--model", "sonnet",
+                              "--prompt-text", "hi"], root=str(REPO))
     finally:
         os.environ.clear(); os.environ.update(old)
     assert rp == 43
+
+
+def test_lane_fuse_narrows_a_chain_instead_of_refusing(tmp_path):
+    """A fused lane in the middle of a chain is DROPPED, and the rest run.
+
+    Refusing only when every lane is dead is the point: a quota-walled tail lane
+    would otherwise cost a full attempt-timeout on every dispatch before the walk
+    abandoned it — the stall the fallback chain exists to prevent.
+    """
+    hp, db_p = _seed(tmp_path, "fpn")
+    for _ in range(3):
+        _sql(db_p, "INSERT INTO llm_calls (provider,model_id,tier,feature_name,input_tokens,"
+                   "output_tokens,total_tokens,cost_usd,duration_ms,status,metadata_json,"
+                   "error_category,retryable) VALUES ('gateway','dead-lane','default',"
+                   "'mini-ork:planner',0,0,0,0,0,'failed','{}','capacity',1);")
+    old = dict(os.environ)
+    os.environ.update({"MINI_ORK_ROOT": str(REPO), "MINI_ORK_HOME": hp, "MINI_ORK_DB": db_p,
+                       "MO_FUSE_ENABLED": "1", "MO_FUSE_TRANSIENT": "1",
+                       "MO_DAILY_BUDGET_USD": "1000", "MO_DISPATCH_RETRY_BASE_S": "0",
+                       "MO_DISPATCH_RETRY_MAX_SLEEP_S": "1"})
+    try:
+        rp = ld.llm_dispatch(["--node-type", "planner",
+                              "--model", "dead-lane,no-such-lane-b",
+                              "--prompt-text", "hi", "--timeout", "5"], root=str(REPO))
+    finally:
+        os.environ.clear(); os.environ.update(old)
+    # The chain still ran (and failed on the lane that was actually alive), so
+    # it was NOT refused for the dead lane's sake.
+    assert rp != 43
 
 
 def test_lane_resolution(tmp_path):
@@ -247,9 +282,11 @@ def test_lane_fuse_refusal_row(tmp_path):
                    "'mini-ork:planner',0,0,0,0,0,'failed','{}','capacity',1);")
     old = dict(os.environ)
     os.environ.update({"MINI_ORK_ROOT": str(REPO), "MINI_ORK_HOME": hp, "MINI_ORK_DB": db_p,
-                       "MO_FUSE_ENABLED": "1", "MO_DAILY_BUDGET_USD": "1000"})
+                       "MO_FUSE_ENABLED": "1", "MO_DAILY_BUDGET_USD": "1000",
+                       "MO_FUSE_TRANSIENT": "1"})
     try:
-        rp = ld.llm_dispatch(["--node-type", "planner", "--prompt-text", "hi"], root=str(REPO))
+        rp = ld.llm_dispatch(["--node-type", "planner", "--model", "sonnet",
+                              "--prompt-text", "hi"], root=str(REPO))
     finally:
         os.environ.clear(); os.environ.update(old)
     assert rp == 43

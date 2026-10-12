@@ -45,6 +45,51 @@ def _event(home: Path, run_id: str, kind: str, payload: dict, *, at: int, beat_m
     con.close()
 
 
+def _lane_call(home: Path, run_id: str, lane: str, *, status: str = "failed",
+               category: str = "quota", message: str = "") -> None:
+    con = sqlite3.connect(home / "state.db")
+    con.execute(
+        "INSERT INTO llm_calls (ts, provider, model_id, tier, feature_name, actor, run_id, "
+        "status, cost_usd, duration_ms, error_category, error_message, retryable) "
+        "VALUES (datetime('now'),'openai',?,1,'mini-ork:planner','scheduler',?,?,0,0,?,?,0)",
+        (lane, run_id, status, category, message))
+    con.commit()
+    con.close()
+
+
+def test_why_column_names_the_lane_that_ended_the_run(home: Path) -> None:
+    """A failed run must say WHICH LANE failed, not just that it failed.
+
+    The board showed a failed run's step and nothing else, so a delegation could
+    die at the planner node for a day with every row reading "failed at —". The
+    answer was already in ``llm_calls``, where the fallback walk records one row
+    per dead lane; it was simply never joined to the run.
+    """
+    _run(home, "run-1791000009-ffffff", "failed", ago=120)
+    _lane_call(home, "run-1791000009-ffffff", "glm", category="unknown",
+               message="dispatch result failed shape check (looks_like_json)")
+    _lane_call(home, "run-1791000009-ffffff", "codex", category="quota",
+               message='{"type":"turn.failed","error":{"message":"You\'ve hit your usage limit."}}')
+
+    rows = _section(build_page(home, "runs", args={"filter": "failed"}), "table")["rows"]
+
+    why_cell = rows[0]["cells"][4]
+    # The TERMINAL lane is the one that ended the walk, and its message is the
+    # human-readable part of the envelope, not the envelope itself.
+    assert why_cell["t"] == "codex: quota — You've hit your usage limit."
+    assert why_cell["c"] == "red"
+
+
+def test_why_column_marks_a_done_run_that_lost_lanes_as_recovered(home: Path) -> None:
+    """A green run is not a failed one: the cascade absorbed the loss."""
+    _run(home, "run-1791000010-gggggg", "published", ago=60)
+    _lane_call(home, "run-1791000010-gggggg", "codex", category="quota", message="usage limit")
+
+    rows = _section(build_page(home, "runs", args={"filter": "done"}), "table")["rows"]
+
+    assert rows[0]["cells"][4]["t"] == "↺ recovered"
+
+
 def _section(p: dict, kind: str, title: str = "") -> dict:
     return next(s for s in p["sections"] if s["type"] == kind and (not title or s["title"] == title))
 
@@ -61,7 +106,7 @@ def test_all_runs_lists_every_run_with_a_filter(home: Path) -> None:
     assert [c["t"] for c in chips["items"]][0] == "All 3"
     assert chips["items"][0]["on"] and chips["items"][3]["do"] == {"set": {"filter": "failed"}}
     table = _section(p, "table")
-    assert table["head"] == ["", "run", "recipe", "step", "age", "cost", "change"]
+    assert table["head"] == ["", "run", "recipe", "step", "why", "age", "cost", "change"]
     assert len(table["rows"]) == 3
     assert all(r["do"]["run"].startswith("run-") for r in table["rows"])
     failed = build_page(home, "runs", args={"filter": "failed"})

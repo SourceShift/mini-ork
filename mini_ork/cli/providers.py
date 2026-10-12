@@ -152,6 +152,24 @@ def _credential_status(
     return tuple(rows), health
 
 
+def _open_fuses(lane: str) -> str:
+    """The lane's open fuse categories, comma-joined ("" when none).
+
+    A fused lane is the one unhealthy state no credential check can see: the key
+    is present and the endpoint answers, yet every dispatch on that lane fails
+    the same way. It is the state codex sat in for a day while this command
+    reported it configured (2026-10-12).
+    """
+    from mini_ork.context import context_env
+    from mini_ork.dispatch.llm_dispatch import check_lane_fuse, fuse_categories
+
+    db = context_env("MINI_ORK_DB") or os.path.join(
+        context_env("MINI_ORK_HOME") or ".mini-ork", "state.db")
+    return ",".join(
+        category for category, strikes in fuse_categories()
+        if check_lane_fuse(db, lane, category, strikes=strikes))
+
+
 def _print_status(models: tuple[tuple[str, str], ...], root: str | Path) -> int:
     store = secret_store_path()
     stored = read_secret_exports(store)
@@ -175,6 +193,11 @@ def _print_status(models: tuple[tuple[str, str], ...], root: str | Path) -> int:
                 exit_code = 2
         if not health.ok and not any(status == "missing" for _, status, _ in rows):
             print(f"{'':<20} {'':<12} {'health':<22} {health.reason}")
+            exit_code = 2
+        fuses = _open_fuses(lane)
+        if fuses:
+            print(f"{'':<20} {'':<12} {'fuse':<22} OPEN ({fuses}) — dispatches "
+                  f"skip this lane until the window expires")
             exit_code = 2
     return exit_code
 

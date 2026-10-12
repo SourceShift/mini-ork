@@ -16,6 +16,7 @@ bash gateway provider taxonomy (distinct from mini_ork.dispatch's finer one).
 """
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
@@ -26,6 +27,25 @@ from collections.abc import Callable
 
 from mini_ork.context import context_env
 from mini_ork.dispatch.predicates import SHAPE_REJECT_RC, looks_like_json
+
+
+def _accepts_kwarg(fn, name: str) -> bool:
+    """True when ``fn`` can be called with ``name=``.
+
+    The default dispatcher takes the per-attempt observer and the shape
+    predicate; a caller-supplied ``dispatch_fn`` historically kept the bare
+    5-arg contract and must not be handed them. Gating the observer on "is this
+    the default dispatcher" silently disabled per-lane ledger rows for EVERY
+    caller that passed its own dispatcher (2026-10-12) — the exact blind spot
+    the observer exists to close, re-opened one layer up. Introspection failure
+    degrades to False, i.e. the historic behaviour, rather than raising.
+    """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 # ── pure helpers (verbatim regex transcriptions) ──
@@ -96,6 +116,27 @@ def redact_secrets(s: str) -> str:
     s = re.sub(r"(ANTHROPIC_(AUTH_TOKEN|API_KEY)|[A-Z_]+_API_KEY)=[^\s\"']+", r"\1=[REDACTED]", s)
     s = re.sub(r"[a-fA-F0-9]{32,}", "[REDACTED_HEX]", s)
     return s
+
+
+def error_message_head(raw: object, *, limit: int = 200) -> str:
+    """The human-readable part of a provider error, for a UI or a log line.
+
+    ``llm_calls.error_message`` is a bounded TAIL slice of the provider's output,
+    so a JSON envelope arrives cut at the front — ``:19 AM."}
+    {"type":"turn.failed","error":{"message":"You've hit your usage limit...``.
+    The envelope's own ``message`` field is the readable part. Falls back to the
+    whitespace-collapsed raw text when the payload is not an envelope, so a
+    plain-text error is passed through unchanged.
+    """
+    text = " ".join(str(raw or "").split())
+    match = re.search(r'"message"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
+    if not match:
+        return text[:limit]
+    try:
+        inner = json.loads('"' + match.group(1) + '"')
+    except ValueError:
+        inner = match.group(1)
+    return str(inner)[:limit]
 
 
 def strip_protocol_blocks(out_file: str) -> None:
@@ -335,26 +376,116 @@ def cost_circuit_open(db, budget) -> bool:
     return cost_ledger.spent_last_24h(db) >= float(budget)
 
 
-def check_lane_fuse(db, lane, category) -> bool:
-    """True if the fuse is OPEN (last 3 lane calls all failed same retryable cat)."""
+# A lane fuse trips when a lane's last N calls all failed with the SAME
+# category. How many strikes depends on whether the category can heal itself: a
+# terminal category is evidence the lane is dead right now and one strike is
+# enough, while a transient one may be a blip and keeps the historic three.
+_FUSE_TERMINAL = ("quota", "auth", "config")
+_FUSE_TRANSIENT = ("capacity", "network", "stream", "provider")
+_FUSE_TERMINAL_STRIKES = 1
+_FUSE_TRANSIENT_STRIKES = 3
+_FUSE_WINDOW_HOURS = 6
+
+
+def _fuse_window_hours() -> int:
+    return _int_or(os.environ.get("MO_FUSE_WINDOW_HOURS"), _FUSE_WINDOW_HOURS)
+
+
+def fuse_categories() -> tuple[tuple[str, int], ...]:
+    """The ``(category, strikes)`` pairs the fuse watches.
+
+    Terminal categories are watched by default; the transient ones stay opt-in
+    behind ``MO_FUSE_TRANSIENT=1``, because halting on a transient category is
+    the false positive the old all-off default avoided. ``MO_FUSE_TERMINAL``
+    replaces the terminal set outright.
+    """
+    terminal = tuple(
+        c.strip() for c in os.environ.get(
+            "MO_FUSE_TERMINAL", ",".join(_FUSE_TERMINAL)).split(",") if c.strip())
+    watch = [(c, _FUSE_TERMINAL_STRIKES) for c in terminal]
+    if os.environ.get("MO_FUSE_TRANSIENT", "0") == "1":
+        watch += [(c, _FUSE_TRANSIENT_STRIKES) for c in _FUSE_TRANSIENT]
+    return tuple(watch)
+
+
+def check_lane_fuse(db, lane: str, category: str, *, strikes: int = 3) -> bool:
+    """True when the fuse is OPEN — this lane's last ``strikes`` calls all failed
+    with ``category``, within the recency window.
+
+    Keyed on ``model_id`` (the lane that actually ran), NOT ``feature_name``
+    (the node that requested it). A fallback tail lane's failures are recorded
+    against the lane, never against the node, so a role-keyed fuse could never
+    open on one: codex failed 4/4 for a day and stayed the terminal rung of
+    every coding chain (2026-10-12).
+
+    The ``retryable`` filter is gone for the same reason. ``error_retryable``
+    marks only the SELF-HEALING categories, so a quota wall — written
+    ``retryable=0`` precisely because retrying cannot help it — was invisible to
+    a fuse that demanded ``retryable=1``.
+
+    The recency window is what stops a fuse wedging a lane forever: a fused lane
+    records no new rows, so without a window its own last failure would hold the
+    fuse open indefinitely. After the window the lane is eligible again.
+
+    ``ts`` is compared through ``datetime()`` on both sides. The column stores
+    ISO-8601 (``...T06:00:00.000Z``) while ``datetime('now')`` yields a
+    space-separated string, and ``'T'`` (0x54) sorts above ``' '`` (0x20) — so a
+    raw string comparison drops the *time* half of the window and keeps every row
+    from today.
+    """
     if not (db and os.path.isfile(db) and lane and category):
+        return False
+    if _int_or(strikes, 0) < 1:
         return False
     try:
         con = sqlite3.connect(db, timeout=5.0)
         con.execute("PRAGMA busy_timeout=5000")
         cols = {r[1] for r in con.execute("PRAGMA table_info(llm_calls)").fetchall()}
-        if not {"status", "feature_name", "error_category", "retryable"} <= cols:
+        if not {"status", "model_id", "feature_name", "error_category", "ts"} <= cols:
             con.close(); return False
         rows = con.execute(
-            "SELECT status, error_category, retryable FROM llm_calls WHERE feature_name LIKE ? "
-            "ORDER BY id DESC LIMIT 3", (f"%:{lane}",)).fetchall()
+            "SELECT status, error_category FROM llm_calls "
+            "WHERE model_id = ? AND feature_name NOT LIKE '%:refused' "
+            "AND datetime(ts) > datetime('now', ?) "
+            "ORDER BY id DESC LIMIT ?",
+            (lane, f"-{_fuse_window_hours()} hours", _int_or(strikes, 1))).fetchall()
         con.close()
     except Exception:
         return False
-    if len(rows) != 3:
+    if len(rows) != _int_or(strikes, 1):
         return False
-    return all(status == "failed" and err == category and _int_or(retryable, 0) == 1
-               for status, err, retryable in rows)
+    return all(status == "failed" and err == category for status, err in rows)
+
+
+def _apply_lane_fuse(db, chain: str) -> tuple[str, str]:
+    """Narrow a comma-joined chain by dropping lanes whose fuse is open.
+
+    Returns ``(chain, refused_category)``. ``refused_category`` is non-empty
+    only when EVERY lane is fused: then there is nothing left to dispatch to and
+    the caller refuses (rc 43) rather than walking a chain of known-dead lanes.
+    A partially-fused chain is narrowed and logged — a quota-walled tail lane
+    costs a full attempt-timeout before the walk abandons it, which is exactly
+    the stall the fallback chain exists to prevent.
+    """
+    lanes = [m.strip() for m in str(chain).split(",") if m.strip()]
+    if not lanes or not (db and os.path.isfile(db)):
+        return chain, ""
+    fused: dict[str, str] = {}
+    for lane in lanes:
+        for category, strikes in fuse_categories():
+            if check_lane_fuse(db, lane, category, strikes=strikes):
+                fused[lane] = category
+                break
+    if not fused:
+        return chain, ""
+    if len(fused) == len(lanes):
+        return chain, fused[lanes[0]]
+    kept = [lane for lane in lanes if lane not in fused]
+    sys.stderr.write(
+        f"[lane_fuse_skip] dropping fused lanes "
+        f"{','.join(f'{l}({c})' for l, c in fused.items())} from chain — "
+        f"dispatching {'/'.join(kept)}\n")
+    return ",".join(kept), ""
 
 
 # ── llm_calls row writer (family-aware cost math + schema-adaptive cols) ──
@@ -542,7 +673,7 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
 
         ``feature_name`` gets a ``:refused`` suffix so the row is visible in
         the ledger but stays OUTSIDE the lane-fuse window (``check_lane_fuse``
-        matches ``feature_name LIKE '%:<node>'``): a refusal row naming the
+        excludes ``feature_name LIKE '%:refused'``): a refusal row naming the
         fuse's own category must not keep the fuse open forever, and must not
         break a genuine failure streak either. ``retryable=0`` — no lane
         change recovers a budget halt. Zero cost/duration: nothing ran.
@@ -579,16 +710,24 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
     if not model_override and node_type:
         model = resolve_lane_model(node_type, root, home)
 
-    # lane fuse
-    if os.environ.get("MO_FUSE_ENABLED", "0") == "1" and os.path.isfile(db):
-        for category in ("capacity", "network", "stream", "provider"):
-            if check_lane_fuse(db, node_type, category):
-                sys.stderr.write(f"[lane_fuse_open] lane={node_type} error_category={category} "
-                                 f"consecutive_failures=3 — halting dispatch\n")
-                _write_refusal_row(category,
-                                   f"lane fuse open: 3 consecutive {category} failures "
-                                   f"on lane={node_type}")
-                return 43
+    # lane fuse — on by default, because a fuse that is off by default is not a
+    # safety system. Keyed on the LANE (llm_calls.model_id), not the node role:
+    # a fallback tail lane's failures are recorded against the lane, so a
+    # role-keyed fuse could never open on one and codex stayed the terminal rung
+    # of every coding chain for a day of 100% quota failures (2026-10-12).
+    # Terminal categories only unless MO_FUSE_TRANSIENT=1.
+    if os.environ.get("MO_FUSE_ENABLED", "1") == "1" and os.path.isfile(db):
+        chain, refused = _apply_lane_fuse(db, model)
+        if refused:
+            sys.stderr.write(
+                f"[lane_fuse_open] every lane in {model} failed consecutively with "
+                f"error_category={refused} — halting dispatch\n")
+            _write_refusal_row(
+                refused,
+                f"lane fuse open: every lane in chain {model} failed consecutively "
+                f"with {refused}")
+            return 43
+        model = chain
 
     tmp_out = ""
     if not out_file:
@@ -667,13 +806,15 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
                 os.remove(side)
             except OSError:
                 pass
-        # The attempt sink + accept predicate go only to the default
-        # dispatcher; a caller-supplied dispatch_fn keeps the historic 5-arg
-        # contract (mirrors the accept threading above).
+        # Thread the observer and the shape predicate into any dispatcher that
+        # declares them, not just the default one. A caller-supplied dispatch_fn
+        # that accepts them was silently starved of per-lane ledger rows and of
+        # the shape check — the gate used to be `if _default_dispatch`.
         _kwargs = {}
-        if _default_dispatch:
+        if _default_dispatch or _accepts_kwarg(dispatch_fn, "on_attempt"):
             _kwargs["on_attempt"] = _attempt_sink
-            if accept_fn is not None:
+            if accept_fn is not None and (
+                    _default_dispatch or _accepts_kwarg(dispatch_fn, "accept")):
                 _kwargs["accept"] = accept_fn
         try:
             rc = dispatch_fn(model, prompt_text, out_file, timeout_s, max_turns,

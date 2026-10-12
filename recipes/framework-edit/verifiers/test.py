@@ -289,6 +289,108 @@ else:
     _check("web-smoke-tests-skipped", "tests/test_web_smoke.py absent in target repo; skipping web-smoke",
            lambda: True)
 
+
+# ── epic acceptance: run the kickoff's OWN verification commands ─────────────
+# Everything above proves the diff EXISTS and APPLIES. None of it proves the
+# epic's feature WORKS: this verifier never ran the tests the epic was written to
+# add, so an epic could reach verdict=pass with its package absent and every new
+# test failing. That is not hypothetical — a whole delegation's epics were gated
+# by a synthesized `py_compile` of the test file itself (2026-10-12).
+#
+# The kickoff's `## Verification commands` are the authoritative acceptance bar:
+# they are the instruction the epic was dispatched with, and they were written to
+# be run "from the run's working tree, so mini_ork resolves to the tree under
+# test" — which is exactly the patched throwaway copy below.
+_VERIFY_CMDS_PROFILE = os.path.join(RUN_DIR, "run_profile.json")
+_VERIFY_CMDS_SECTION = re.compile(
+    r"^##\s+Verification commands\s*$(.*?)(?=^##\s|\Z)",
+    re.MULTILINE | re.DOTALL)
+_VERIFY_CMD_TIMEOUT_S = int(os.environ.get("MO_EPIC_VERIFY_TIMEOUT_S", "300"))
+
+
+def _profile_field(name):
+    try:
+        with open(_VERIFY_CMDS_PROFILE, encoding="utf-8") as fh:
+            return json.load(fh).get(name)
+    except (OSError, ValueError):
+        return None
+
+
+def _epic_verification_commands():
+    """The kickoff's acceptance commands, in order, deduped, capped.
+
+    ``run_profile.json`` already carries the parsed list (the profile gate reads
+    that section), so prefer it; fall back to parsing the kickoff markdown, so a
+    run whose profile predates the field is still gated.
+    """
+    raw = _profile_field("verification_command") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    cmds = [str(c) for c in raw if str(c).strip()]
+    if not cmds:
+        kickoff = str(_profile_field("kickoff_path") or "")
+        if kickoff and os.path.isfile(kickoff):
+            try:
+                with open(kickoff, encoding="utf-8") as fh:
+                    section = _VERIFY_CMDS_SECTION.search(fh.read())
+            except OSError:
+                section = None
+            if section:
+                cmds = re.findall(r"`([^`\n]+)`", section.group(1))
+    out = []
+    for cmd in cmds:
+        cmd = cmd.strip().strip("`").strip()
+        if cmd and cmd not in out:
+            out.append(cmd)
+    return out[:4]
+
+
+def _sh(cmd):
+    """Run one acceptance command the way a human would, with this verifier's
+    interpreter standing in for a bare ``pytest``: a throwaway archive has no
+    console script on PATH, and the interpreter running this file is the one
+    guaranteed to import the tree under test."""
+    if cmd.split(" ")[0] == "pytest":
+        return f"{sys.executable} -m pytest" + cmd[len("pytest"):]
+    return cmd
+
+
+def _epic_verification_commands_pass():
+    if os.environ.get("MO_EPIC_VERIFY_CMDS") == "0":
+        return True
+    if not os.path.isdir(WORKTREE):
+        _ev.write("  patched copy absent — cannot run the kickoff's commands\n")
+        return False
+    env = scrubbed_test_env()
+    env["PYTHONPATH"] = "."
+    env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
+    for cmd in _epic_verification_commands():
+        _ev.write(f"  $ {_sh(cmd)}\n")
+        _ev.flush()
+        try:
+            proc = subprocess.run(_sh(cmd), shell=True, cwd=WORKTREE, env=env,
+                                  stdout=_ev, stderr=subprocess.STDOUT,
+                                  timeout=_VERIFY_CMD_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            _ev.write(f"  TIMEOUT after {_VERIFY_CMD_TIMEOUT_S}s\n")
+            _ev.flush()
+            return False
+        if proc.returncode != 0:
+            _ev.write(f"  rc={proc.returncode}\n")
+            _ev.flush()
+            return False
+    return True
+
+
+if _epic_verification_commands():
+    _check("epic-verification-commands-pass",
+           "the kickoff's own ## Verification commands pass in the patched copy",
+           _epic_verification_commands_pass)
+else:
+    _check("epic-verification-commands-none",
+           "kickoff declares no ## Verification commands; nothing to execute",
+           lambda: True)
+
 checks = []
 with open(CHECKS_TSV) as f:
     for line in f:

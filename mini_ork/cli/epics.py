@@ -264,7 +264,11 @@ def _synth_verify(paths):
     if shells:
         cmds.append("shellcheck " + " ".join(shells[:5]))
     if pys:
-        cmds.append("python3 -m py_compile " + " ".join(pys[:5]))
+        # ``sys.executable``, not a bare ``python3``: on this host python3 is
+        # 3.9 and cannot even ``import mini_ork`` (dataclass slots are 3.10+),
+        # so a synthesized check sent every epic down a lane that fails before
+        # it tests anything.
+        cmds.append(f"{sys.executable} -m py_compile " + " ".join(pys[:5]))
     if sqls:
         cmds.append("# Apply: sqlite3 .mini-ork/state.db < " + sqls[0])
     if not cmds:

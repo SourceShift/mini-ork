@@ -998,11 +998,24 @@ def required_secret_envs(
 # One cached 1-token request per lane per _PROBE_TTL_S turns that into a
 # fail-fast "lane preflight failed" naming the real cause.
 _PROBE_TTL_S = 600
+# A quota wall heals on payment, which is an hour-scale event, not a ten-minute
+# one — so a probe that learned "out of quota" is cached longer. Re-probing every
+# ten minutes would spend a request per lane per tick to relearn the same wall.
+_PROBE_QUOTA_TTL_S = 3600
 _PROBE_DEAD = {
     401: "API key rejected (HTTP 401)",
     402: "out of credit (HTTP 402)",
     403: "access denied (HTTP 403)",
 }
+# Same vocabulary classify_error uses for the ``quota`` category: the words a
+# gateway uses when the key has no credit left, as opposed to when it is merely
+# being asked to slow down.
+_PROBE_QUOTA_RE = re.compile(
+    r"usage limit|exceeded your current quota|insufficient credits"
+    r"|insufficient balance|out of credits|purchase credits|credit limit"
+    r"|credit balance|quota exceeded|billing",
+    re.IGNORECASE,
+)
 
 
 def _probe_enabled(runtime: Mapping[str, str]) -> bool:
@@ -1015,9 +1028,15 @@ def _probe_enabled(runtime: Mapping[str, str]) -> bool:
     return True
 
 
-def _http_post_status(url: str, key: str, model: str) -> int | None:
-    """HTTP status of a 1-token Messages request; None when no HTTP answer
-    arrived (DNS, refused, timeout) — that is 'unknown', not 'dead'."""
+def _http_post_probe(url: str, key: str, model: str) -> tuple[int | None, str]:
+    """``(status, body_snippet)`` of a 1-token Messages request.
+
+    The body is returned because a 429 alone cannot be classified: the same
+    status carries both "slow down, retry in a second" and "this key has no
+    credit left, come back after you pay", and the only place that distinction
+    lives is the message. Bounded to 512 chars so a chatty gateway cannot bloat
+    the probe cache.
+    """
     body = json.dumps({"model": model or "probe", "max_tokens": 1,
                        "messages": [{"role": "user", "content": "ping"}]}).encode()
     req = urllib.request.Request(url, data=body, method="POST", headers={
@@ -1025,20 +1044,33 @@ def _http_post_status(url: str, key: str, model: str) -> int | None:
         "anthropic-version": "2023-06-01", "content-type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=8) as resp:
-            return int(resp.status)
+            return int(resp.status), _decode_body(resp.read(512))
     except urllib.error.HTTPError as exc:
-        return int(exc.code)
+        try:
+            return int(exc.code), _decode_body(exc.read(512))
+        except (OSError, ValueError):
+            return int(exc.code), ""
     except (urllib.error.URLError, OSError, ValueError):
-        return None
+        return None, ""
+
+
+def _decode_body(raw: bytes) -> str:
+    try:
+        return raw.decode("utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        return ""
 
 
 def _live_probe(model: str, entry: Mapping, key: str,
                 runtime: Mapping[str, str]) -> str | None:
     """Reason string when the gateway definitively refuses this key, else None.
 
-    Only 401/402/403 count as dead. Any other HTTP answer (2xx, a 400 about the
-    request shape, 429, 5xx) proves the key is accepted or the outage is
-    transient, and no HTTP answer at all is unknown — neither blocks a run.
+    A bare 401/402/403 is dead. A bare 429 or 5xx is NOT: it proves the key is
+    accepted and the outage is transient, so blocking on it would be the false
+    positive this whole guard exists to avoid. The one exception is a 429 whose
+    body carries quota vocabulary — that is a funding wall wearing a throttle's
+    status code, and it is cached as dead with a longer TTL. No HTTP answer at
+    all is unknown and blocks nothing.
     """
     url = str(entry.get("base_url") or "").rstrip("/") + "/v1/messages"
     cache_path = Path(runtime.get("MINI_ORK_HOME") or ".mini-ork") / "lane-probe-cache.json"
@@ -1052,14 +1084,19 @@ def _live_probe(model: str, entry: Mapping, key: str,
     now = time.time()
     hit = cache.get(model)
     if (isinstance(hit, dict) and hit.get("fp") == fingerprint
-            and now - float(hit.get("at", 0)) < _PROBE_TTL_S):
+            and now - float(hit.get("at", 0))
+            < float(hit.get("ttl", _PROBE_TTL_S))):
         dead = hit.get("dead")
     else:
-        status = _http_post_status(url, key, str(entry.get("model") or ""))
+        status, body = _http_post_probe(url, key, str(entry.get("model") or ""))
         if status is None:
             return None  # unknown: do not cache, do not block
         dead = _PROBE_DEAD.get(status)
-        cache[model] = {"fp": fingerprint, "at": now, "dead": dead}
+        ttl = _PROBE_TTL_S
+        if dead is None and status == 429 and _PROBE_QUOTA_RE.search(body):
+            dead = f"out of quota (HTTP 429: {body.strip()[:120]})"
+            ttl = _PROBE_QUOTA_TTL_S
+        cache[model] = {"fp": fingerprint, "at": now, "dead": dead, "ttl": ttl}
         try:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = cache_path.with_name(cache_path.name + f".{os.getpid()}.tmp")
@@ -1101,6 +1138,17 @@ def lane_health(
             reason = _live_probe(model, entry, str(runtime[str(api_key_env)]), runtime)
             if reason:
                 return LaneHealth(False, f"{reason} — every dispatch on this lane would fail")
+    elif isinstance(entry, Mapping) and entry.get("kind") in {
+        "anthropic-native", "codex-native", "opencode-native",
+    }:
+        # Nothing cheap can be asserted about a native lane: there is no key to
+        # read and no endpoint to ping, the CLI owns auth. Say so, rather than
+        # falling through to a bare "ok" that reads as a passed probe. This is
+        # why `doctor` printed `[OK] codex (codex CLI present)` while codex was
+        # 100% quota-walled and the terminal rung of every coding chain
+        # (2026-10-12). Still ok=True: an unprobed lane must not block a run.
+        return LaneHealth(
+            True, "ok (unprobed: native lane — auth owned by the CLI)")
     return LaneHealth(True, "ok")
 
 
@@ -2330,21 +2378,16 @@ def dispatch_with_fallback(
         )
         result = dispatch_model(req, root)
         tried.append(lane)
-        if on_attempt is not None:
-            # Telemetry observer must never decide the walk's outcome.
-            try:
-                on_attempt(lane, result)
-            except Exception:  # noqa: BLE001 — fail-soft by contract
-                pass
-        if result.ok and (result.text or "").strip():
-            if accept is None or accept(result):
-                if i > 0:
-                    sys.stderr.write(
-                        f"[dispatch] lane fallback: {'/'.join(tried[:-1])} failed → "
-                        f"served by {lane}\n"
-                    )
-                return result
-            # ran clean but produced the wrong shape → a fallback-worthy failure.
+        # Evaluate the shape predicate BEFORE the observer. A lane that ran clean
+        # but emitted the wrong shape is a dead lane as far as the walk is
+        # concerned, and the ledger observer must see that verdict. Observing
+        # first hid every wrong-shape lane: the observer skips a result that is
+        # ok+non-empty, so a chain that collapsed on shape left rows for the
+        # terminal lane only and the lanes walked before it vanished from the
+        # ledger entirely (observed on run-1791785211-80557: the chain read
+        # glm,minimax,codex but only codex left rows).
+        if (accept is not None and result.ok and (result.text or "").strip()
+                and not accept(result)):
             result = replace(
                 result,
                 ok=False,
@@ -2352,16 +2395,29 @@ def dispatch_with_fallback(
                 error="dispatch result failed shape check "
                 f"({getattr(accept, '__name__', 'accept')})",
             )
+        if on_attempt is not None:
+            # Telemetry observer must never decide the walk's outcome.
+            try:
+                on_attempt(lane, result)
+            except Exception:  # noqa: BLE001 — fail-soft by contract
+                pass
+        if result.ok and (result.text or "").strip():
+            if i > 0:
+                sys.stderr.write(
+                    f"[dispatch] lane fallback: {'/'.join(tried[:-1])} failed → "
+                    f"served by {lane}\n"
+                )
+            return result
+        if result.rc == SHAPE_REJECT_RC:
             sys.stderr.write(
                 f"[dispatch] lane {lane} produced wrong shape "
                 f"(rc={result.rc} {result.error[:80]}); trying next\n"
             )
-            last = result
-            continue
-        sys.stderr.write(
-            f"[dispatch] lane {lane} failed (rc={result.rc} "
-            f"{(result.error or 'empty output')[:80]}); trying next\n"
-        )
+        else:
+            sys.stderr.write(
+                f"[dispatch] lane {lane} failed (rc={result.rc} "
+                f"{(result.error or 'empty output')[:80]}); trying next\n"
+            )
         last = result
     if last is None:
         return DispatchResult(ok=False, rc=2, error="no lanes provided",

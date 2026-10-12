@@ -725,6 +725,65 @@ def dispatch_epic(epic_id: str, root: str, home: str, recipe: str,
     return verdict, rc
 
 
+def reclaim_stale(db: str | None = None, *, older_than_s: int | None = None) -> list[str]:
+    """Return epics wedged at 'in progress' back to 'not started'.
+
+    ``pick_ready`` only ever selects 'not started', so an epic left 'in progress'
+    by a scheduler that was killed — or that crashed before its dispatch
+    resolved — is unpickable forever: the queue drains to nothing while real work
+    remains. A scheduler starting up is the right moment to repair that, because
+    nothing of ours is in flight yet.
+
+    Nothing is reclaimed while its run is still alive. A run is live when its
+    ``task_runs`` row exists, has not ended, and is in a pre-terminal status, so
+    a second scheduler sharing the database cannot steal work mid-flight. The
+    grace window (``MO_SCHED_RECLAIM_AFTER_S``, default 900s) covers the rest: an
+    epic touched more recently than that is assumed to belong to a live peer.
+    """
+    if older_than_s is None:
+        older_than_s = int(os.environ.get("MO_SCHED_RECLAIM_AFTER_S", "900"))
+    # ``last_run_id`` is added by the retry-schema migration, not by 0001. Without
+    # this call a home predating it raises "no such column" below, the error is
+    # swallowed, and reclaim silently returns [] — on exactly the older homes
+    # most likely to be wedged. Ensure the column before reading it.
+    ensure_retry_schema(db)
+    con = _conn(db)
+    try:
+        has_runs = bool(con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'"
+        ).fetchone())
+        stale = con.execute(
+            "SELECT e.id, e.last_run_id FROM epics e "
+            "WHERE e.status = 'in progress' AND e.archived_at IS NULL "
+            "AND e.updated_at < strftime('%Y-%m-%dT%H:%M:%fZ','now', ?)",
+            (f"-{int(older_than_s)} seconds",)).fetchall()
+        reclaimed = []
+        for epic_id, run_id in stale:
+            if run_id and has_runs and con.execute(
+                    "SELECT 1 FROM task_runs WHERE id=? AND ended_at IS NULL "
+                    "AND status NOT IN ('failed','published','rolled_back')",
+                    (run_id,)).fetchone():
+                continue  # a live run still owns this epic
+            why = f" (run {run_id} not live)" if run_id else " (no run recorded)"
+            cur = con.execute(
+                "UPDATE epics SET status='not started', notes=COALESCE(notes,'') || ? "
+                "WHERE id=? AND status='in progress'",
+                (f" [scheduler: reclaimed from stale 'in progress'{why}]", epic_id))
+            if cur.rowcount == 1:
+                reclaimed.append(epic_id)
+        con.commit()
+    except sqlite3.Error as err:
+        sys.stderr.write(f"scheduler: stale-epic reclaim failed: {err}\n")
+        return []
+    finally:
+        con.close()
+    if reclaimed:
+        sys.stderr.write(
+            f"scheduler: reclaimed {len(reclaimed)} stale 'in progress' epic(s) "
+            f"→ 'not started': {', '.join(reclaimed)}\n")
+    return reclaimed
+
+
 def run_pool(root: str, home: str, recipe: str = "epic-runner",
              db: str | None = None, max_parallel: int | None = None,
              max_iters: int = 0, budget_cap: float | None = None,
@@ -735,12 +794,16 @@ def run_pool(root: str, home: str, recipe: str = "epic-runner",
     (cascading its deps), newly-ready epics join. Returns count dispatched.
     Budget/cost-pause are re-checked before every admission, like the bash loop.
     ``only`` is the epic allow-list forwarded to pick_ready (see its docstring)."""
+    ensure_priority_column(db)
+    ensure_retry_schema(db)
+    # Reclaim AFTER the migrations above: it reads epics.last_run_id, which only
+    # the retry schema adds, so running it first silently no-ops on an old home.
+    if not dry_run:
+        reclaim_stale(db)
     if max_parallel is None:
         max_parallel = int(os.environ.get("MO_SCHED_MAX_PARALLEL", "3"))
     if budget_cap is None:
         budget_cap = float(os.environ.get("MO_DAILY_BUDGET_USD", "50.0"))
-    ensure_priority_column(db)
-    ensure_retry_schema(db)
 
     dispatched = 0
     deferred = False

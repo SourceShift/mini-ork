@@ -69,11 +69,18 @@ def dispatch_chain(node_type: str, lead: str, root: str | None = None) -> str:
     ``sonnet`` and the run failed naming the wrong lane). The LEAD is never
     filtered: it is explicit intent (workflow pin or operator override), and a
     typo there should fail loud. ``MO_FALLBACK_*`` overrides are still honoured,
-    filtered by the same rule.
+    filtered by the same rule. A drop that leaves the chain short is reported
+    loudly (``[dispatch_chain_short]``) — a tail that quietly collapsed to
+    nothing is how every coding node ended up single-homed on one lane.
     """
     tail = ""
     if node_type in _CODING_ROLES:
-        tail = os.environ.get("MO_FALLBACK_CODING", "minimax,codex,sonnet")
+        # Same-kind gateway lanes by default. The shipped default used to end at
+        # ``codex`` — an ambient-login native lane of a DIFFERENT kind, so a
+        # gateway outage had no same-kind rung to fall to, and codex's own quota
+        # wall removed the last one (2026-10-12). codex stays available as an
+        # explicit opt-in (``MO_FALLBACK_CODING=...,codex``).
+        tail = os.environ.get("MO_FALLBACK_CODING", "minimax,kimi,deepseek_flash")
     elif node_type in _REVIEW_ROLES:
         tail = os.environ.get("MO_FALLBACK_REVIEW", "opus,kimi,sonnet")
     if not tail:
@@ -86,13 +93,26 @@ def dispatch_chain(node_type: str, lead: str, root: str | None = None) -> str:
             out.append(x)
     known = _registry_known_lanes(root)
     if known is not None and out[1:]:
-        kept = [out[0]] + [x for x in out[1:] if x in known]
-        for dead in [x for x in out[1:] if x not in known]:
+        dropped = [x for x in out[1:] if x not in known]
+        out = [out[0]] + [x for x in out[1:] if x in known]
+        for dead in dropped:
             sys.stderr.write(
-                f"[dispatch] fallback tail lane {dead!r} has no providers.yaml "
-                f"entry — dropping from chain\n"
+                f"[dispatch_chain_drop] fallback tail lane {dead!r} for "
+                f"node_type={node_type} has no providers.yaml entry — dropping "
+                f"from chain\n"
             )
-        out = kept
+        # A warning, not a refusal: a short chain is legitimate when the operator
+        # set MO_FALLBACK_CODING to one lane. But a tail that collapsed to
+        # nothing is the failure this whole file exists to prevent, so it must
+        # not be silent — the chain used to read `glm,minimax,codex` while the
+        # registry had quietly removed a rung.
+        if dropped and len(out) < 3:
+            sys.stderr.write(
+                f"[dispatch_chain_short] node_type={node_type} "
+                f"chain={','.join(out)} ({len(out)} lane(s)) after dropping "
+                f"{','.join(dropped)} — a lead-lane failure now has "
+                f"{len(out) - 1} fallback lane(s)\n"
+            )
     return ",".join(out)
 
 

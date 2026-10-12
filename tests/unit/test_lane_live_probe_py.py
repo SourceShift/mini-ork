@@ -34,11 +34,11 @@ def lane(tmp_path, monkeypatch):
     def env(**extra):
         return {"FAKE_DS_KEY": "sk-test", "MINI_ORK_HOME": str(home), "MO_LANE_PROBE": "1", **extra}
 
-    def answer(status):
+    def answer(status, body=""):
         def fake(url, key, model):
             calls.append((url, key, model))
-            return status
-        monkeypatch.setattr(p, "_http_post_status", fake)
+            return status, body
+        monkeypatch.setattr(p, "_http_post_probe", fake)
 
     return env, answer, calls
 
@@ -61,6 +61,28 @@ def test_any_other_http_answer_keeps_the_lane(lane, status):
     answer(status)
 
     assert p.lane_health("fakeds", environment=env()).ok
+
+
+def test_429_with_quota_wording_is_a_funding_wall(lane):
+    """The same status carries two opposite verdicts; only the body says which.
+
+    A bare 429 is a throttle that heals in seconds and must never block a run —
+    that is the false positive this guard exists to avoid. A 429 whose body says
+    the account is out of credit is a funding wall that heals in hours, which is
+    why the probe reads the body rather than the status alone.
+    """
+    env, answer, calls = lane
+    answer(429, '{"error":{"message":"You have exceeded your current quota"}}')
+
+    health = p.lane_health("fakeds", environment=env())
+
+    assert not health.ok
+    assert "out of quota" in health.reason
+
+    # ...and it is cached long enough that a re-probe does not spend a request
+    # relearning the same wall.
+    assert p.lane_health("fakeds", environment=env()).ok is False
+    assert len(calls) == 1
 
 
 def test_no_http_answer_is_unknown_not_dead_and_is_not_cached(lane):

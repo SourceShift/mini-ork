@@ -62,6 +62,13 @@ def _status(db: str, epic_id: str) -> str:
     return str(row[0])
 
 
+def _notes(db: str, epic_id: str) -> str:
+    con = sqlite3.connect(db)
+    row = con.execute("SELECT notes FROM epics WHERE id=?", (epic_id,)).fetchone()
+    con.close()
+    return str(row[0]) if row and row[0] else ""
+
+
 @pytest.fixture
 def cli_world(tmp_path: Path) -> dict[str, str]:
     home = tmp_path / ".mini-ork"
@@ -128,8 +135,15 @@ def test_public_launcher_has_one_native_owner() -> None:
 
 
 def test_generated_verification_classifies_launcher_as_python() -> None:
+    """An extensionless launcher is compiled as Python, by the interpreter
+    running THIS code.
+
+    It used to say ``python3``, which on this host is 3.9 and cannot import
+    ``mini_ork`` at all — so the generated check failed for every epic that had
+    one, on the interpreter alone.
+    """
     commands = epics._synth_verify(["bin/mini-ork-scheduler"])
-    assert commands == ["python3 -m py_compile bin/mini-ork-scheduler"]
+    assert commands == [f"{sys.executable} -m py_compile bin/mini-ork-scheduler"]
 
 
 def test_effective_priority_and_ready_order_golden(graph_world: dict[str, str]) -> None:
@@ -382,3 +396,62 @@ def test_today_cost_usd_falls_back_to_task_runs(tmp_path: Path) -> None:
     con.close()
 
     assert scheduler.today_cost_usd(db) == pytest.approx(1.25)
+
+
+# ── stale 'in progress' reclaim ──────────────────────────────────────────────
+
+def test_reclaim_returns_a_wedged_epic_to_the_queue(tmp_path: Path) -> None:
+    """``pick_ready`` only selects 'not started', so an epic left 'in progress'
+    by a killed scheduler is unpickable forever — the queue drains to nothing
+    while real work remains. Startup is the right moment to repair it."""
+    db = _init_db(tmp_path / "reclaim")
+    _seed(db, "epic-wedged", status="in progress")
+
+    assert scheduler.reclaim_stale(db, older_than_s=0) == ["epic-wedged"]
+    assert _status(db, "epic-wedged") == "not started"
+
+
+def test_reclaim_leaves_a_live_run_alone(tmp_path: Path) -> None:
+    """A second scheduler sharing the database must not steal work mid-flight."""
+    db = _init_db(tmp_path / "reclaim-live")
+    scheduler.ensure_retry_schema(db)  # adds last_run_id; 0001 does not
+    _seed(db, "epic-running", status="in progress")
+    con = sqlite3.connect(db)
+    con.execute("UPDATE epics SET last_run_id='run-live' WHERE id='epic-running'")
+    con.execute(
+        "INSERT INTO task_runs (id, recipe, status, task_class, kickoff_path, created_at, updated_at) "
+        "VALUES ('run-live', 'epic-runner', 'executing', 'epic', '', 0, 0)")
+    con.commit()
+    con.close()
+
+    assert scheduler.reclaim_stale(db, older_than_s=0) == []
+    assert _status(db, "epic-running") == "in progress"
+
+
+def test_reclaim_ignores_a_run_that_already_ended(tmp_path: Path) -> None:
+    """The epic is only wedged when the run it points at is gone."""
+    db = _init_db(tmp_path / "reclaim-dead")
+    scheduler.ensure_retry_schema(db)  # adds last_run_id; 0001 does not
+    _seed(db, "epic-abandoned", status="in progress")
+    con = sqlite3.connect(db)
+    con.execute("UPDATE epics SET last_run_id='run-dead' WHERE id='epic-abandoned'")
+    con.execute(
+        "INSERT INTO task_runs (id, recipe, status, task_class, kickoff_path, created_at, updated_at, ended_at) "
+        "VALUES ('run-dead', 'epic-runner', 'failed', 'epic', '', 0, 0, 1)")
+    con.commit()
+    con.close()
+
+    assert scheduler.reclaim_stale(db, older_than_s=0) == ["epic-abandoned"]
+    assert "reclaimed from stale 'in progress'" in _notes(db, "epic-abandoned")
+
+
+def test_the_grace_window_protects_a_freshly_touched_epic(tmp_path: Path) -> None:
+    db = _init_db(tmp_path / "reclaim-grace")
+    _seed(db, "epic-fresh", status="in progress")
+
+    assert scheduler.reclaim_stale(db, older_than_s=900) == []
+    assert _status(db, "epic-fresh") == "in progress"
+
+
+def test_reclaim_is_a_no_op_on_an_empty_queue(tmp_path: Path) -> None:
+    assert scheduler.reclaim_stale(_init_db(tmp_path / "reclaim-empty")) == []

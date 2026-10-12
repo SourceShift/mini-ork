@@ -74,7 +74,7 @@ def test_chain_lead_is_family_not_alias(tmp_path, monkeypatch):
     home = _write_agents(tmp_path)
     monkeypatch.setenv("MINI_ORK_HOME", home)
     monkeypatch.setenv("MINI_ORK_ROOT", home)
-    monkeypatch.delenv("MO_FALLBACK_CODING", raising=False)  # default: minimax,codex,sonnet
+    monkeypatch.delenv("MO_FALLBACK_CODING", raising=False)  # default: minimax,kimi,deepseek_flash
     chain = dispatch_chain("implementer", resolve_lane_family("codex_lens"))
     parts = chain.split(",")
     assert parts[0] == "codex", f"chain lead must be codex, got {parts[0]!r} in {chain!r}"
@@ -100,7 +100,7 @@ def test_dead_tail_lane_dropped(tmp_path, monkeypatch, capsys):
     home = _write_providers(tmp_path, "minimax", "codex")  # no sonnet
     monkeypatch.setenv("MINI_ORK_HOME", home)
     monkeypatch.setenv("MINI_ORK_ROOT", home)
-    monkeypatch.delenv("MO_FALLBACK_CODING", raising=False)
+    monkeypatch.setenv("MO_FALLBACK_CODING", "minimax,sonnet")
     chain = dispatch_chain("implementer", "codex", root=home)
     assert chain == "codex,minimax", chain
     assert "sonnet" in capsys.readouterr().err  # the drop is logged, not silent
@@ -110,6 +110,7 @@ def test_registered_tail_lane_kept(tmp_path, monkeypatch):
     home = _write_providers(tmp_path, "minimax", "codex", "sonnet")
     monkeypatch.setenv("MINI_ORK_HOME", home)
     monkeypatch.setenv("MINI_ORK_ROOT", home)
+    monkeypatch.setenv("MO_FALLBACK_CODING", "minimax,sonnet")
     chain = dispatch_chain("implementer", "codex", root=home)
     assert chain == "codex,minimax,sonnet", chain
 
@@ -149,4 +150,6 @@ def test_empty_registry_fails_open(tmp_path, monkeypatch):
     monkeypatch.setenv("MINI_ORK_PROVIDERS", str(empty))
     monkeypatch.delenv("MO_FALLBACK_CODING", raising=False)
     chain = dispatch_chain("implementer", "codex", root=str(tmp_path))
-    assert chain == "codex,minimax,sonnet", chain
+    # An empty registry must NOT be read as "nothing is registered": the whole
+    # shipped tail survives, and a dead lane surfaces at preflight by name.
+    assert chain == "codex,minimax,kimi,deepseek_flash", chain

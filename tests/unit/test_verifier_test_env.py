@@ -26,6 +26,7 @@ Four groups, in priority order:
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -261,7 +262,12 @@ def _load_fwedit_verifier(monkeypatch, tmp_path):
     )
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    try:
+        spec.loader.exec_module(mod)
+    except SystemExit:
+        # The verifier is a script: it runs its checks and exits 0 at import.
+        # The module object survives, which is what the callers want.
+        pass
     return mod, captured, worktree
 
 
@@ -299,3 +305,63 @@ def test_rsi_verifier_keeps_its_allowlist_env():
     assert "ENV_KEEP" in src
     for name in ("MINI_ORK_SECRETS", "MINI_ORK_DB", "MINIMAX_API_KEY"):
         assert f'"{name}"' not in src.split("ENV_KEEP")[1].split("}")[0]
+
+
+# ── 6. the kickoff's acceptance commands ARE executed ────────────────────────
+#
+# The framework-edit verifier was shape-only: it proved the diff applied and the
+# tree imported, never that the kickoff's own acceptance commands passed. An epic
+# could be marked done with a red suite. These pin the commands it now runs.
+
+
+def _profile(mod, tmp_path, payload: dict) -> None:
+    (tmp_path / "run" / "run_profile.json").write_text(json.dumps(payload))
+
+
+def test_acceptance_commands_come_from_the_profile_first(monkeypatch, tmp_path):
+    mod, _cap, _wt = _load_fwedit_verifier(monkeypatch, tmp_path)
+    _profile(mod, tmp_path, {"verification_command": [
+        "python3.11 -m pytest tests/unit -q", "ruff check mini_ork"]})
+
+    assert mod._epic_verification_commands() == [
+        "python3.11 -m pytest tests/unit -q", "ruff check mini_ork"]
+
+
+def test_acceptance_commands_dedupe_and_cap(monkeypatch, tmp_path):
+    """A kickoff that repeats its one command must not run it four times, and an
+    unbounded list must not run the verifier out of its budget."""
+    mod, _cap, _wt = _load_fwedit_verifier(monkeypatch, tmp_path)
+    _profile(mod, tmp_path, {"verification_command": [f"cmd-{i}" for i in range(9)]})
+
+    assert mod._epic_verification_commands() == ["cmd-0", "cmd-1", "cmd-2", "cmd-3"]
+
+    _profile(mod, tmp_path, {"verification_command": ["same", "same", "same"]})
+    assert mod._epic_verification_commands() == ["same"]
+
+
+def test_acceptance_commands_fall_back_to_parsing_the_kickoff(monkeypatch, tmp_path):
+    """A run whose profile predates the ``verification_command`` field is still
+    gated, by reading the section out of the kickoff markdown."""
+    mod, _cap, _wt = _load_fwedit_verifier(monkeypatch, tmp_path)
+    kickoff = tmp_path / "kickoff.md"
+    kickoff.write_text(
+        "# Do the thing\n\n## Verification commands\n\n"
+        "Run from the worktree:\n\n"
+        "- `python3.11 -m pytest tests/unit/test_thing.py -q`\n"
+        "- `ruff check mini_ork/thing.py`\n\n"
+        "## Next section\n\n`not-a-command`\n")
+    _profile(mod, tmp_path, {"kickoff_path": str(kickoff)})
+
+    assert mod._epic_verification_commands() == [
+        "python3.11 -m pytest tests/unit/test_thing.py -q",
+        "ruff check mini_ork/thing.py"]
+
+
+def test_a_bare_pytest_is_swapped_for_this_interpreter(monkeypatch, tmp_path):
+    """The throwaway archive has no console scripts on PATH, and the interpreter
+    running the verifier is the one guaranteed to import the tree under test."""
+    mod, _cap, _wt = _load_fwedit_verifier(monkeypatch, tmp_path)
+
+    assert mod._sh("pytest tests/unit -q") == f"{sys.executable} -m pytest tests/unit -q"
+    assert mod._sh("python3.11 -m pytest -q") == "python3.11 -m pytest -q"
+    assert mod._sh("ruff check mini_ork") == "ruff check mini_ork"

@@ -9,9 +9,20 @@ escalate to a systemic halt when N+ providers are simultaneously throttled,
 and sleep until every named provider's cool-down expires.
 
 The bash source stays in place (strangler-fig co-existence). The Python
-functions below are called by Python drivers and exercised by parity tests in
-``tests/unit/test_throttle_guard_py.py`` that invoke the live bash subprocess
-on identical inputs and assert byte-identical state.
+functions below are exercised only by the parity tests in
+``tests/unit/test_throttle_guard_py.py``.
+
+NOT WIRED INTO DISPATCH. Nothing in ``mini_ork/`` imports this module: the
+cooldown it computes is never consulted before a lane is tried, so a lane this
+module would have parked is still dispatched on. Read it as a library, not as a
+control. The live equivalent is the lane fuse in ``dispatch/llm_dispatch.py``
+(``check_lane_fuse`` / ``_apply_lane_fuse``), which is keyed on the provider lane
+in ``llm_calls.model_id`` and consulted on every dispatch.
+
+This note exists because the docstring above reads as though the throttling is
+in force, and that is what let a 100%-quota-walled lane stay the terminal rung of
+every coding chain for a day while every reader — including this one — assumed
+something was watching (2026-10-12).
 """
 from __future__ import annotations
 
