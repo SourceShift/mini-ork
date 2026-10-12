@@ -43,14 +43,26 @@ if READY is not True or not TOUCHED.strip():
         "pass": False,
         "evidence_path": EVIDENCE,
         "reason": "no implementer artifact ready_for_tier1=true with non-empty touched_files",
-        "property_rc": 1,
-        "mutation_rc": 0,
+        "property_rc": None,
+        "mutation_rc": None,
+        "checks_ran": [],
+        "checks_skipped": ["property", "mutation"],
+        "vacuous": True,
     }))
     sys.exit(0)
 
 passed = True
-property_rc = 0
-mutation_rc = 0
+# An rc belongs to a check that RAN. Neither check runs on most repos (no
+# stryker config, no wired property run), and reporting `mutation_rc: 0` for a
+# skip is indistinguishable from "mutation testing ran and passed" — which is
+# how a vacuous pass reads to the tier-4 panel and to `_latest_evidence_json`'s
+# `pass is True` gate in doc-to-features-loop. `None` means "not attempted";
+# the top-level `vacuous` flag says whether ANY check actually executed.
+# (kimi's hard-rule finding on run-1791821930-72687, 2026-10-12.)
+property_rc = None
+mutation_rc = None
+checks_ran = []
+checks_skipped = []
 
 pkg = ""
 try:
@@ -61,6 +73,9 @@ except OSError:
 if os.path.isfile("node_modules/.bin/fast-check") or '"fast-check"' in pkg:
     ev.write(f"property tests not yet wired for this repo; touched files: {TOUCHED}\n")
     ev.flush()
+    checks_skipped.append("property: fast-check present but no property run is wired")
+else:
+    checks_skipped.append("property: no fast-check")
 
 if os.path.isfile("stryker.conf.json") or os.path.isfile("stryker.conf.js"):
     ev.write("running mutation tests; this may take 5-30 min\n")
@@ -69,11 +84,13 @@ if os.path.isfile("stryker.conf.json") or os.path.isfile("stryker.conf.js"):
     ev.flush()
     mutation_rc = subprocess.run(mutation_argv,
                                  stdout=ev, stderr=subprocess.STDOUT).returncode
+    checks_ran.append("mutation")
     if mutation_rc != 0:
         passed = False
 else:
     ev.write("no mutation tooling configured - skipping\n")
     ev.flush()
+    checks_skipped.append("mutation: no stryker.conf.json/.js")
 
 ev.close()
 print(json.dumps({
@@ -82,5 +99,8 @@ print(json.dumps({
     "evidence_path": EVIDENCE,
     "property_rc": property_rc,
     "mutation_rc": mutation_rc,
+    "checks_ran": checks_ran,
+    "checks_skipped": checks_skipped,
+    "vacuous": not checks_ran,
 }))
 sys.exit(0)
