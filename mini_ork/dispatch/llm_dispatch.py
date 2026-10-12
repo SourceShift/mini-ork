@@ -694,6 +694,17 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
         except Exception:  # noqa: BLE001 — telemetry must never change the rc
             pass
 
+    def _halt_on_fuse(chain: str, refused: str) -> int:
+        """Refuse a dispatch whose every lane is fused. Returns the refusal rc."""
+        sys.stderr.write(
+            f"[lane_fuse_open] every lane in {chain} failed consecutively with "
+            f"error_category={refused} — halting dispatch\n")
+        _write_refusal_row(
+            refused,
+            f"lane fuse open: every lane in chain {chain} failed consecutively "
+            f"with {refused}")
+        return 43
+
     # cost circuit breaker
     if cost_circuit_open(db, os.environ.get("MO_DAILY_BUDGET_USD", "50")):
         from mini_ork import cost_ledger
@@ -716,17 +727,17 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
     # role-keyed fuse could never open on one and codex stayed the terminal rung
     # of every coding chain for a day of 100% quota failures (2026-10-12).
     # Terminal categories only unless MO_FUSE_TRANSIENT=1.
+    #
+    # Applied TWICE. Here, on the resolution-time model; and again below, after
+    # the shape-contract expansion appends the role's fallback tail. That tail is
+    # composed outside this gate, so a fused tail lane used to ride in unfused:
+    # the planner's tail kept reaching a kimi whose key was rejected, once per
+    # attempt, all day (2026-10-12). A second pass is cheap — ``_apply_lane_fuse``
+    # returns early when the ledger is absent or nothing is fused.
     if os.environ.get("MO_FUSE_ENABLED", "1") == "1" and os.path.isfile(db):
         chain, refused = _apply_lane_fuse(db, model)
         if refused:
-            sys.stderr.write(
-                f"[lane_fuse_open] every lane in {model} failed consecutively with "
-                f"error_category={refused} — halting dispatch\n")
-            _write_refusal_row(
-                refused,
-                f"lane fuse open: every lane in chain {model} failed consecutively "
-                f"with {refused}")
-            return 43
+            return _halt_on_fuse(model, refused)
         model = chain
 
     tmp_out = ""
@@ -766,6 +777,13 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
             model = dispatch_chain(node_type, resolve_lane_family(model, root, home), root)
         except Exception:
             pass
+
+    # Second fuse pass — the chain above did not exist when the first one ran.
+    if os.environ.get("MO_FUSE_ENABLED", "1") == "1" and os.path.isfile(db):
+        chain, refused = _apply_lane_fuse(db, model)
+        if refused:
+            return _halt_on_fuse(model, refused)
+        model = chain
 
     start_ms = int(time.time() * 1000)
     attempt = 1

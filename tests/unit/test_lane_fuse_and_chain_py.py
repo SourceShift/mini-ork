@@ -25,7 +25,10 @@ CREATE TABLE llm_calls (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts TEXT NOT NULL DEFAULT (datetime('now')),
   provider TEXT, model_id TEXT, tier INTEGER, feature_name TEXT,
-  status TEXT, error_category TEXT, error_message TEXT, retryable INTEGER
+  status TEXT, error_category TEXT, error_message TEXT, retryable INTEGER,
+  actor TEXT, duration_ms INTEGER, cost_usd REAL, iter INTEGER,
+  run_id TEXT, traceparent TEXT, input_tokens INTEGER, output_tokens INTEGER,
+  total_tokens INTEGER, metadata_json TEXT, session_id TEXT
 );
 """
 
@@ -219,3 +222,76 @@ def test_error_message_head_unwraps_a_truncated_envelope() -> None:
 
 def test_error_message_head_passes_plain_text_through() -> None:
     assert L.error_message_head("  connection   reset \n") == "connection reset"
+
+
+# ── the fuse runs a SECOND time, after the tail is composed ──────────────────
+
+def test_a_fused_tail_lane_is_dropped_from_the_shape_contract_chain(
+        db: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The planner's fallback tail is composed BELOW the fuse gate.
+
+    So the chain the fuse narrowed was not the chain that dispatched: a fused
+    tail lane rode in unfused. Live, the planner's ``glm,minimax,kimi,
+    deepseek_flash`` kept reaching a kimi whose key was rejected — once per
+    attempt, all day, every row in the ledger reading ``mini-ork:planner``
+    (2026-10-12). Ordering, not logic: the guard evaluated a different string
+    than the one dispatched.
+    """
+    _fail(db, "kimi", "auth", n=1)
+
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    monkeypatch.setenv("MINI_ORK_HOME", str(tmp_path))
+    monkeypatch.setenv("MINI_ORK_ROOT", str(tmp_path))
+    monkeypatch.delenv("MO_FUSE_ENABLED", raising=False)
+    monkeypatch.delenv("MO_FUSE_TRANSIENT", raising=False)
+    monkeypatch.delenv("MO_SHAPE_CHECK", raising=False)
+    monkeypatch.setattr(L, "resolve_lane_model", lambda *_a, **_k: "glm")
+    monkeypatch.setattr(L, "resolve_lane_family", lambda model, *_a, **_k: model)
+    import mini_ork.dispatch.routing as routing
+    monkeypatch.setattr(routing, "dispatch_chain",
+                        lambda *_a, **_k: "glm,minimax,kimi,deepseek_flash")
+
+    seen: list[str] = []
+
+    def fake(model, prompt, out, timeout, turns):
+        seen.append(model)
+        Path(out).write_text("{}")
+        return 0
+
+    rc = L.llm_dispatch(
+        ["--node-type", "planner", "--prompt-text", "p",
+         "--out", str(tmp_path / "out.json")],
+        dispatch_fn=fake)
+
+    assert rc == 0
+    assert seen == ["glm,minimax,deepseek_flash"], seen
+
+
+def test_a_fully_fused_shape_contract_chain_is_refused(
+        db: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The second pass must refuse too, not dispatch into a dead chain."""
+    _fail(db, "kimi", "auth", n=1)
+
+    monkeypatch.setenv("MINI_ORK_DB", db)
+    monkeypatch.setenv("MINI_ORK_HOME", str(tmp_path))
+    monkeypatch.setenv("MINI_ORK_ROOT", str(tmp_path))
+    monkeypatch.delenv("MO_FUSE_ENABLED", raising=False)
+    monkeypatch.delenv("MO_SHAPE_CHECK", raising=False)
+    monkeypatch.setattr(L, "resolve_lane_model", lambda *_a, **_k: "glm")
+    monkeypatch.setattr(L, "resolve_lane_family", lambda model, *_a, **_k: model)
+    import mini_ork.dispatch.routing as routing
+    monkeypatch.setattr(routing, "dispatch_chain", lambda *_a, **_k: "kimi")
+
+    calls: list[str] = []
+
+    def fake(model, prompt, out, timeout, turns):
+        calls.append(model)
+        return 0
+
+    rc = L.llm_dispatch(
+        ["--node-type", "planner", "--prompt-text", "p",
+         "--out", str(tmp_path / "out.json")],
+        dispatch_fn=fake)
+
+    assert rc == 43
+    assert calls == []
