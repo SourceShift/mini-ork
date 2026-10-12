@@ -668,6 +668,44 @@ def _real_error_lines(path: str, max_lines: int = 40, max_bytes: int = 6000) -> 
     return out
 
 
+def _declared_evidence_path(data: dict, run_dir: Path) -> str:
+    """The verifier's own ``evidence_path``, when it points inside ``run_dir``.
+
+    A verifier records where it wrote its log, and that name need not match the
+    ``verifier_<stem>.log`` / ``evidence/<stem>.log`` conventions
+    :func:`mini_ork.cli.execute._verifier_log_candidates` searches:
+    ``tier1-compile-typecheck`` writes ``tier1-evidence.log`` and leaves only a
+    one-line JSON summary at ``evidence/<stem>.log``, so the stem-based search
+    finds a file with no tool output at all.
+
+    Only a path inside ``run_dir`` is honoured — an absolute path read out of a
+    run artifact must not become an arbitrary-file read.
+    """
+    raw = str(data.get("evidence_path") or "").strip()
+    if not raw:
+        return ""
+    try:
+        root = os.path.realpath(str(run_dir))
+        full = os.path.realpath(raw)
+        if os.path.commonpath([root, full]) != root:
+            return ""
+    except (OSError, ValueError):
+        return ""
+    return full if os.path.isfile(full) else ""
+
+
+def _log_tail(paths: list[str], max_lines: int = 20) -> tuple[str, list[str]]:
+    """``(path, last max_lines)`` of the first readable log in ``paths``."""
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            continue
+        return path, lines[-max_lines:]
+    return "", []
+
+
 def _failing_verifier_sections(run_dir: Path) -> list[str]:
     """One section per failing verifier: checks + the real captured error text."""
     from mini_ork.cli import execute as execute_mod
@@ -706,17 +744,37 @@ def _failing_verifier_sections(run_dir: Path) -> list[str]:
                 if isinstance(log, str) and log.strip():
                     lines.extend(log.splitlines()[:8])
         real = []
-        for candidate in execute_mod._verifier_log_candidates(str(run_dir), stem):
+        declared = _declared_evidence_path(data, run_dir)
+        logs = list(execute_mod._verifier_log_candidates(str(run_dir), stem))
+        if declared:
+            # The verifier's declared log is the tool output; a stem-derived
+            # sibling may be only a summary of it. Prefer the declaration.
+            logs = [declared] + [path for path in logs if path != declared]
+        for candidate in logs:
             real = _real_error_lines(candidate)
             if real:
                 lines.append(f"verifier errors ({os.path.basename(candidate)}):")
                 lines.extend(real)
                 break
         if not real:
-            lines.append(
-                "the build/test output was not captured; re-run the verification "
-                "command first and read its errors"
-            )
+            shown, tail = _log_tail(logs)
+            if tail:
+                # The log exists and has content, but no line is error-shaped:
+                # the command died before reaching source errors — a toolchain
+                # or environment wall. Saying "nothing was captured" here sent
+                # the implementer to re-run a command that cannot succeed, so
+                # the round made no progress and auto-repair gave up with "the
+                # same failure signature repeats" (run-1791821930-72687,
+                # 2026-10-12: the npm `EBADDEVENGINES` refusal sat unread in
+                # `evidence_path` while the round claimed no output existed).
+                lines.append(f"the verification command reported no source-level "
+                             f"error lines; raw tail of {os.path.basename(shown)}:")
+                lines.extend(tail)
+            else:
+                lines.append(
+                    "the build/test output was not captured; re-run the verification "
+                    "command first and read its errors"
+                )
         sections.append("\n".join(lines))
     return sections
 

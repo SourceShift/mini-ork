@@ -2632,6 +2632,20 @@ def _handle_rollback(ctx: NodeDispatch):
                       file=sys.stderr, flush=True)
             else:
                 _revert_inplace_diff(run_dir, ctx.root)
+    elif strategy == "keep_partial_drain_discard_failed_iter":
+        # Declared by recipes/recursive-validate-impl/workflow.yaml. "keep_partial"
+        # means the failed iteration's edit stays in the target tree on purpose:
+        # the run is re-entered from the failing node, so discarding the edit
+        # would force a re-implement. Previously unhandled, so the node fell
+        # through to the bare "[ok] rollback complete" line, which reads as if a
+        # revert had happened when nothing had been touched (run-1791821930-72687,
+        # 2026-10-12 — the work was still committed in the worktree afterwards).
+        print("  [ok] rollback: strategy keep_partial_drain_discard_failed_iter — "
+              "partial work kept in the target tree (the run re-enters from the failing node)",
+              file=sys.stderr, flush=True)
+    elif strategy:
+        print(f"  [warn] rollback: unhandled rollback_strategy {strategy!r} — "
+              "no working-tree compensation applied", file=sys.stderr, flush=True)
     print("  [ok] rollback complete")
     # NOTE: bash traces NO rollback node (:3205-3223 has no _trace_write_node_rich).
     # Tracing it with status=success would write a spurious +1-reward execution_traces

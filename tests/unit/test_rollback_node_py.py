@@ -121,3 +121,51 @@ def test_handle_rollback_reports_when_there_is_nothing_to_revert(
 
     assert (rc, finish) == (0, "done")
     assert "nothing to revert" in capsys.readouterr().err
+
+
+def _workflow(tmp_path: Path, strategy: str) -> str:
+    path = tmp_path / "workflow.yaml"
+    path.write_text(f"rollback_strategy: {strategy}\n", encoding="utf-8")
+    return str(path)
+
+
+def test_a_declared_keep_partial_strategy_keeps_the_tree_and_says_so(
+        tmp_path, monkeypatch, capsys):
+    """``recursive-validate-impl`` declares keep_partial_drain_discard_failed_iter.
+
+    The handler had no branch for it, so the node fell through to the bare
+    "[ok] rollback complete" line — indistinguishable, in the log, from a revert
+    that had run. The work was in fact untouched (run-1791821930-72687: its
+    implementer's commit was still at HEAD afterwards, and `git reflog` shows no
+    reset). Name the strategy so the log cannot be misread again.
+    """
+    db = str(tmp_path / "state.db")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("MINI_ORK_ROOT", str(tmp_path))
+    work = tmp_path / "impl.ts"
+    work.write_text("KEPT\n", encoding="utf-8")
+    _record_changes(run_dir, [str(work)])
+
+    ctx = _ctx(db, tmp_path, run_dir, recipe="recursive-validate-impl")
+    ctx.workflow = _workflow(tmp_path, "keep_partial_drain_discard_failed_iter")
+    rc, finish = ex._handle_rollback(ctx)
+
+    assert (rc, finish) == (0, "done")
+    assert "keep_partial_drain_discard_failed_iter" in capsys.readouterr().err
+    assert work.read_text(encoding="utf-8") == "KEPT\n"
+
+
+def test_an_unhandled_strategy_warns_instead_of_going_quiet(
+        tmp_path, monkeypatch, capsys):
+    """A strategy nobody implements must not silently no-op."""
+    db = str(tmp_path / "state.db")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("MINI_ORK_ROOT", str(tmp_path))
+
+    ctx = _ctx(db, tmp_path, run_dir)
+    ctx.workflow = _workflow(tmp_path, "some_future_strategy")
+    ex._handle_rollback(ctx)
+
+    assert "unhandled rollback_strategy 'some_future_strategy'" in capsys.readouterr().err
