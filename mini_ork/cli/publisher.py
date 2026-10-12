@@ -212,6 +212,62 @@ def _kickoff_guard(run_dir, db, run_id):
     return 1, "verdict_fail"
 
 
+def _outputs_from_contract(d):
+    """outputs[] entries as ``(path, required)`` tuples.
+
+    A bare string or a mapping without ``required`` means required=True
+    (fail-closed default — existing recipes keep their behavior). Only an
+    explicit ``required: false`` opts out; the schema
+    (schemas/artifact_contract.schema.json) allows the flag.
+    """
+    out: list[tuple[str, bool]] = []
+    for o in (d.get("outputs") or []):
+        if isinstance(o, dict) and o.get("path"):
+            out.append((o["path"], bool(o.get("required", True))))
+        elif isinstance(o, str):
+            out.append((o, True))
+    return out
+
+
+def _run_local_output_status(dst, out, run_dir, required=True):
+    """Classify a run-local publish output.
+
+    Returns ``present`` / ``glob_present`` / ``optional_absent`` / ``missing``.
+
+    Two green-run shapes a strict required-only check got wrong (first
+    all-green SDD child, run-1791790859-83222--p1-5-parity-suite-and-docs--D1):
+
+    - ``required: false`` entries (reflector.json / replan.json) are
+      failure-loop artifacts; a green pass legitimately produces neither, and
+      demanding them failed the publisher on a run where every gate APPROVED.
+    - template paths like ``tier4-{family}.md`` name a FAMILY of files
+      (tier4-glm.md, tier4-kimi.md, ...). The literal brace path never exists
+      on disk; the contract means "the pattern's matches in the run dir".
+    """
+    if os.path.isfile(dst) and os.path.getsize(dst) > 0:
+        return "present"
+    if os.path.isdir(dst) and os.listdir(dst):
+        return "present"
+    base = os.path.basename(out)
+    parts = re.split(r"(\{[^{}]+\})", base)
+    if any(p.startswith("{") and p.endswith("}") for p in parts):
+        # fnmatch does NOT expand braces — translate {token} → [^/]+ ourselves.
+        pattern = "".join(
+            "[^/]+" if (p.startswith("{") and p.endswith("}")) else re.escape(p)
+            for p in parts
+        )
+        rx = re.compile(pattern + r"\Z")
+        try:
+            names = os.listdir(run_dir)
+        except OSError:
+            names = []
+        if any(rx.match(n) for n in names):
+            return "glob_present"
+    if not required:
+        return "optional_absent"
+    return "missing"
+
+
 def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file="", verdict_env=""):
     """Port of bash publisher branch (:2909-3200). The panel found the port stubbed
     this to `set_status('published')` — this restores the two BLOCKING gates + delivery:
@@ -360,11 +416,7 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
         d = yaml.safe_load(open(contract, encoding="utf-8")) or {}
         if isinstance(d, dict):
             src_name = d.get("source_artifact") or "synthesis.md"
-            for o in (d.get("outputs") or []):
-                if isinstance(o, dict) and o.get("path"):
-                    outputs.append(o["path"])
-                elif isinstance(o, str):
-                    outputs.append(o)
+            outputs = _outputs_from_contract(d)
     except Exception:
         pass
     if not outputs:
@@ -420,7 +472,7 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
     published_count = 0
     failed_count = 0
     run_root = os.path.realpath(run_dir)
-    for out in outputs:
+    for out, out_required in outputs:
         out = _envsubst(out)
         # A BARE relative filename (no directory component) is a run-local
         # artifact the producer wrote into run_dir — e.g. goal-loop's
@@ -444,12 +496,18 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
         # Preserve each run-local output byte-for-byte and fail closed when the
         # producer omitted one.
         if run_local:
-            if os.path.isfile(dst) and os.path.getsize(dst) > 0:
+            status = _run_local_output_status(dst, out, run_dir,
+                                              required=out_required)
+            if status == "present":
                 print(f"  [ok] publisher: preserved run-local artifact {out}")
                 published_count += 1
-            elif os.path.isdir(dst) and os.listdir(dst):
-                print(f"  [ok] publisher: preserved run-local artifact {out}")
+            elif status == "glob_present":
+                print(f"  [ok] publisher: preserved run-local artifact {out} "
+                      "(template matches)")
                 published_count += 1
+            elif status == "optional_absent":
+                print(f"  [ok] publisher: optional artifact absent "
+                      f"(green path): {out}")
             else:
                 print(f"  [fail] publisher: missing run-local artifact {out}",
                       file=sys.stderr)

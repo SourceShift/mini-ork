@@ -40,7 +40,9 @@ outputs:
     description: "Aggregate child verdicts with shape {total, delivered, failed, blocked, pending, pass_rate, deliverables[]}."
   - path: "${MINI_ORK_RUN_DIR}/reflector.json"
     mime: application/json
-    description: "Strict JSON failure pattern over failed deliverables for the next loop iteration."
+    required: false
+    description: "Strict JSON failure pattern over failed deliverables for the next loop iteration. Optional: a green pass has no failed deliverables and writes none."
   - path: "${MINI_ORK_RUN_DIR}/replan.json"
     mime: application/json
-    description: "contract_revision entries against SpecCards, each citing gate evidence."
+    required: false
+    description: "contract_revision entries against SpecCards, each citing gate evidence. Optional: written only when a loop iteration revises the contract."
