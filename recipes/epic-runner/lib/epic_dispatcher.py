@@ -139,6 +139,25 @@ def _load_child_verdict(child_dir: Path, exit_code: int) -> dict[str, Any]:
     return {"pass": exit_code == 0}
 
 
+def _prior_passed_verdict(child_dir: Path) -> dict[str, Any] | None:
+    """A prior attempt's verdict, but only when it *explicitly* passed.
+
+    ``_load_child_verdict`` infers ``pass`` from an exit code when no verdict
+    file exists, so it answers True for a child that never ran. Re-entry needs
+    the opposite bias: reuse a child only against evidence that it finished, so
+    read the file and return it solely when it carries ``pass: true``.
+    """
+    verdict_path = child_dir / "verdict.json"
+    if not verdict_path.is_file():
+        return None
+    try:
+        data = _load_json(verdict_path)
+    except Exception as exc:
+        print(f"  [epic] ignoring unreadable prior verdict {verdict_path}: {exc}", file=sys.stderr)
+        return None
+    return data if data.get("pass") is True else None
+
+
 def _files_written(child_dir: Path, verdict: dict[str, Any]) -> list[str]:
     files = verdict.get("files_written") or verdict.get("files_changed")
     if isinstance(files, list):
@@ -353,7 +372,26 @@ def dispatch() -> int:
             kickoff_path = kickoff_dir / f"{epic_id}.md"
             kickoff_path.write_text(kickoff + "\n", encoding="utf-8")
             child_run_id = f"{parent_run_id}-{epic_id}"
-            _clear_stale_child_baseline(home / "runs" / child_run_id)
+            prior_dir = home / "runs" / child_run_id
+            prior = _prior_passed_verdict(prior_dir)
+            if prior is not None:
+                # Re-entry (``recover --from-node epic_dispatcher``) replays the
+                # whole wave, so a child that already passed would be re-spawned
+                # and re-implement into a target tree that already holds its own
+                # output — its diff cannot apply and the run false-fails
+                # (impl_diff_unusable; run-1791785128-75074-wit-2-documents,
+                # 2026-10-12). Reuse the passed child instead of restarting it.
+                rec = records[epic_id]
+                rec["status"] = STATUS_PASSED
+                rec["child_run_id"] = child_run_id
+                rec["child_run_dir"] = str(prior_dir)
+                rec["verdict"] = prior
+                rec["files_written"] = _files_written(prior_dir, prior)
+                artifact = prior_dir / "framework-edit.diff"
+                rec["final_artifact_ref"] = str(artifact) if artifact.exists() else ""
+                rec["error"] = ""
+                continue
+            _clear_stale_child_baseline(prior_dir)
             spawn_override = os.environ.get("MINI_ORK_EPIC_SPAWN_BIN")
             spawn_bin = Path(spawn_override) if spawn_override else root / "bin" / "mini-ork-spawn"
             cmd = _spawn_command(spawn_bin, root, parent_run_id, child_run_id, kickoff_path, publish_enabled)
