@@ -196,12 +196,21 @@ def require_run_target(*, roots: RunRoots | None) -> str:
     )
 
 
-def load_run_roots(run_dir: str) -> RunRoots | None:
+def load_run_roots(run_dir: str, *, target_override: str = "") -> RunRoots | None:
     """Load a persisted ``roots`` record from ``run_profile.json``.
 
     Returns ``None`` when the profile is missing, malformed, or carries no
     ``roots`` key (legacy run dir). Consumers treat ``None`` as "use today's
     lazy resolution" so behaviour is byte-identical for in-flight runs.
+
+    ``target_override`` re-points the edit surface when the *recorded* target no
+    longer exists — the run's worktree was cleaned up after it started, and a
+    resume would otherwise hand a phantom cwd to every node. Only a recorded
+    target that is genuinely gone is overridden, and only by a path that exists;
+    everything else in the record (``run_dir``, ``home``, ``engine``) is kept.
+    With no usable override the recorded value stands, and
+    ``require_run_target`` fails the run closed — the operator gets a named
+    path instead of a spawn error from a directory that is not there.
     """
     if not run_dir:
         return None
@@ -219,6 +228,13 @@ def load_run_roots(run_dir: str) -> RunRoots | None:
     if not isinstance(raw, dict):
         return None
     target = raw.get("target", "") or ""
+    exec_cwd = raw.get("exec_cwd") or None
+    if target and not os.path.isdir(target) \
+            and target_override and os.path.isdir(target_override):
+        target = target_override
+        # The recorded drive cwd was resolved off the deleted target; drop it so
+        # the caller re-resolves against the replacement.
+        exec_cwd = None
     if not target:
         return None
     return RunRoots(
@@ -226,7 +242,7 @@ def load_run_roots(run_dir: str) -> RunRoots | None:
         run_dir=raw.get("run_dir", "") or "",
         home=raw.get("home", "") or "",
         engine=raw.get("engine", "") or "",
-        exec_cwd=(raw.get("exec_cwd") or None),
+        exec_cwd=exec_cwd,
     )
 
 

@@ -1311,7 +1311,8 @@ def _handle_implementer(ctx: NodeDispatch):
     # fall back to today's lazy resolution when the record is absent (legacy run
     # dirs created before epic 01 landed). The drive redirect still applies on
     # top of the resolved target — see req #4 of remote-nodes-01.
-    roots = load_run_roots(ctx.run_dir_eff or ctx.run_dir)
+    roots = load_run_roots(ctx.run_dir_eff or ctx.run_dir,
+                           target_override=os.environ.get("MO_TARGET_CWD", ""))
     if roots is not None:
         # A recorded target that is gone is a hard stop, not a silent phantom
         # cwd for the implementer to spawn into. Name it and say how to fix it.

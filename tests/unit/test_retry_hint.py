@@ -138,6 +138,18 @@ def _write_impl_log(run_dir: Path, node_id: str, lines: list[str]) -> None:
                                                   encoding="utf-8")
 
 
+def _insert_node_start(home: Path, run_id: str, node_id: str) -> None:
+    """A ``node_start`` row — marks the run as having entered a node."""
+    con = sqlite3.connect(home / "state.db")
+    con.execute(
+        "INSERT INTO run_events (event_id, run_id, event_type, payload_json, created_at) "
+        "VALUES (?,?,?,?,?)",
+        (f"ev-{run_id}-start-{node_id}", run_id, "node_start",
+         json.dumps({"node_id": node_id}), int(time.time()) - 10))
+    con.commit()
+    con.close()
+
+
 def _insert_attempt(home: Path, run_id: str, node_id: str, failure_class: str) -> None:
     con = sqlite3.connect(home / "state.db")
     con.execute(
@@ -469,6 +481,10 @@ def test_auth_detection_matches_http_401_unauthorized(home: Path) -> None:
 
 def test_case_5_unknown_returns_unclassified(home: Path) -> None:
     run_dir = _seed_run(home, RUN, status="failed")
+    # A node that STARTED: without this the run reads as "planned but never
+    # executed" (case 4.5) rather than "ran, and nothing classified the
+    # failure" — which is the shape this case exists for.
+    _insert_node_start(home, RUN, "implementer")
     _write_verifier(run_dir, "live_smoke",
                     {"verifier": "live_smoke", "pass": True, "status": "PROVEN"})
     _write_verifier(run_dir, "static-check",

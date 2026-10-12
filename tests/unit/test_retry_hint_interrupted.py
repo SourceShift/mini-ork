@@ -146,8 +146,8 @@ def _insert_events_same_second(home: Path, run_id: str,
 # ── case 1.6 ───────────────────────────────────────────────────────────────
 
 
-def test_hint_version_is_3() -> None:
-    assert retry_hint.HINT_VERSION == 3
+def test_hint_version_is_current() -> None:
+    assert retry_hint.HINT_VERSION == 4
 
 
 def test_dangling_start_is_interrupted(home: Path) -> None:

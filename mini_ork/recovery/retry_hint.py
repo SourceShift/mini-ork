@@ -11,7 +11,8 @@ in front of a verifier JSON, or a missing ``node_attempts`` row all return
 ``None`` or fall through to the next case. The module never raises for a
 missing input — only for an actual bug.
 
-The 5-way classifier (first match wins) lives in :func:`compute`. The cache
+The classifier (first match wins) lives in :func:`compute`; the case list is
+enumerated in the comment block above each branch. The cache
 wrapper :func:`load_or_compute` writes ``<run_dir>/retry-hint.json`` only
 when ``write=True`` and the cache is older than every file the hint reads,
 so a fresh verifier JSON automatically invalidates the cached hint.
@@ -49,14 +50,20 @@ from mini_ork.web.db import db_for
 # abstained with no failing node is retryable ``verify``, not unclassified.
 # v3 (2026-10-08): the interrupted branch (case 1.6) — a node that started and
 # never ended is retryable ``resume`` from that node, not unclassified.
-HINT_VERSION = 3
+# v4 (2026-10-12): three branches for the run that died *before* any node ran —
+# ``stopped`` (case 1.7, the operator killed it), ``not-started`` (case 3.6, a
+# plan with no execution), and a wider verifier-reason read that also consults
+# ``missing``/``failures`` (a structured verifier's failure was reaching case 5
+# as "cause not classified" while its own artefact held the exact list).
+HINT_VERSION = 4
 CACHE_FILENAME = "retry-hint.json"
 
 # needs_change kinds whose retry needs no change: re-running the step IS the fix.
-# An ``interrupted`` run (case 1.6) stopped mid-node; the hint's own command
-# (``mini-ork recover <run> --strategy resume``) resumes it, so the gates must
-# not demand ``--ack-change``/``--force`` for it.
-NO_CHANGE_KINDS = frozenset({"interrupted"})
+# An ``interrupted`` run (case 1.6) stopped mid-node; a ``not-started`` run
+# (case 3.6) never entered a node. The hint's own command
+# (``mini-ork recover <run> --strategy resume``) resumes either, so the gates
+# must not demand ``--ack-change``/``--force`` for them.
+NO_CHANGE_KINDS = frozenset({"interrupted", "not-started"})
 
 # Finish reasons that end a node without failing it — the same set
 # ``acp/task_state._TERMINAL_OK_FINISH`` uses (kept local: this module imports
@@ -134,6 +141,27 @@ def _current_run_status(home: Path, run_id: str) -> str:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _run_notes(home: Path, run_id: str) -> str:
+    """The run's ``task_runs.notes`` — the ``'; '``-separated operator log.
+
+    ``fleet.run_card`` does not project ``notes``, and the two markers that
+    distinguish "died at birth" from a real failure — the reaper's
+    ``reaped: dispather pid N gone`` and the operator's ``killed-by-user`` —
+    live only there. Empty string when the DB, table or row is unavailable
+    (fail-soft, like every other read in this module).
+    """
+    try:
+        db = db_for(home)
+        if not db.has_table("task_runs"):
+            return ""
+        rows = db.rows("SELECT notes FROM task_runs WHERE id = ? LIMIT 1", (run_id,))
+    except Exception:  # noqa: BLE001 — missing DB/schema: never raise
+        return ""
+    if not rows:
+        return ""
+    return str(rows[0].get("notes") or "")
 
 
 def _run_card(home: Path, run_id: str) -> dict[str, Any] | None:
@@ -273,10 +301,15 @@ def _review_failed(review: dict[str, Any]) -> bool:
     return str(review.get("verdict") or "").lower() in _RETRY_VERDICTS
 
 
-def _first_failed_node(run_dir: Path, recipe: str, home: Path
+def _first_failed_node(run_dir: Path, nodes: list[dict[str, Any]],
+                       edges: list[dict[str, Any]]
                        ) -> tuple[str | None, dict[str, Any]]:
-    """First node in workflow topo order whose run artefact says it failed."""
-    nodes, edges = _recipe_workflow(home, recipe)
+    """First node in workflow topo order whose run artefact says it failed.
+
+    ``nodes``/``edges`` come from the caller so a run whose recipe cannot be
+    resolved (a per-run synthesised recipe, a deleted engine worktree) can pass
+    the node names recovered from ``run_events`` instead.
+    """
     order = _topo_order(nodes, edges)
     name_to_node = {str(n.get("name")): n for n in nodes if n.get("name")}
     for name in order:
@@ -291,10 +324,10 @@ def _first_failed_node(run_dir: Path, recipe: str, home: Path
     return None, {}
 
 
-def _failed_review(run_dir: Path, recipe: str, home: Path
+def _failed_review(run_dir: Path, nodes: list[dict[str, Any]],
+                   edges: list[dict[str, Any]]
                    ) -> tuple[str | None, dict[str, Any] | None]:
     """The first reviewer/judge (topo order) whose verdict asks for a revision."""
-    nodes, edges = _recipe_workflow(home, recipe)
     name_to_node = {str(n.get("name")): n for n in nodes if n.get("name")}
     for name in _topo_order(nodes, edges):
         review = _node_artifacts(run_dir, name, name_to_node.get(name, {})).get("review")
@@ -380,8 +413,16 @@ def _extract_implementer_notes(run_dir: Path) -> list[str]:
 
 
 def _verifier_reason(payload: dict[str, Any]) -> str:
-    """The verifier's reason field — first 800 chars across the candidate keys."""
-    for key in ("reason", "error_summary", "reasons", "detail"):
+    """The verifier's reason field — first 800 chars across the candidate keys.
+
+    ``missing`` and ``failures`` are read too: a *structured* verifier
+    (``panel-completeness``) reports its failure as a list of absent keys rather
+    than prose. Without them the run reached case 5 as "the cause was not
+    classified" while the verifier's own artefact held the exact list — the
+    most informative file in the run dir, unread.
+    """
+    for key in ("reason", "error_summary", "reasons", "detail", "missing",
+                "failures", "blocking"):
         v = payload.get(key)
         if v:
             text = "; ".join(str(x) for x in v) if isinstance(v, list) else str(v)
@@ -769,6 +810,133 @@ def _case_unknown(run_dir: Path, failed_name: str | None, run_id: str,
         },
         "notes": [],
         "command": "",
+        "computed_at": _now_iso(),
+    }
+
+
+def _nodes_from_events(home: Path, run_id: str) -> list[dict[str, Any]]:
+    """Node names recovered from ``run_events``, in first-start order.
+
+    The fallback for :func:`_recipe_workflow` when the recipe cannot be
+    resolved: a run whose workflow was synthesised per-run (``orch-smoke``) or
+    whose engine root has since been deleted leaves ``find_recipe`` empty, and
+    every artefact lookup keyed on node names then comes back blind — the run
+    classifies as "Failed at ?" although its node events name every node that
+    ran. Ordering is by first ``node_start`` so it stands in for topo order.
+    """
+    events = _run_node_events(home, run_id)
+    if not events:
+        return []
+    names: list[str] = []
+    for ev in events:
+        if ev.get("event_type") != "node_start":
+            continue
+        try:
+            payload = json.loads(ev.get("payload_json") or "{}")
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        nid = str(payload.get("node_id") or "")
+        if nid and nid not in names:
+            names.append(nid)
+    return [{"name": nid} for nid in names]
+
+
+def _case_stopped(notes: str, run_id: str) -> dict[str, Any] | None:
+    """Case 1.7 — a run the operator killed is not a failure to diagnose.
+
+    ``board kill`` and the CLI append ``killed-by-user`` to ``task_runs.notes``
+    (``'; '``-separated, append-only). ``auto_repair`` already refuses to touch
+    such a run — but only once the hint says so. Without this case a killed run
+    that never started a node falls through to case 5, and the board shows an
+    unexplained red row for work the operator deliberately stopped.
+
+    Evaluated AFTER case 1.6: a run killed *mid-node* has a dangling
+    ``node_start`` and is still an ``interrupted`` run (whose own consumer
+    carries the ``killed-by-user`` veto). This case only claims the runs that
+    died before any node began.
+    """
+    if not any(seg.strip().startswith("killed-by-user") for seg in notes.split(";")):
+        return None
+    return {
+        "version": HINT_VERSION,
+        "run_id": run_id,
+        "failed_node": None,
+        "retryable": False,
+        "strategy": "none",
+        "from_node": None,
+        "needs_change": {
+            "kind": "stopped",
+            "summary": "Stopped by the operator — not a failure to repair",
+            "detail": notes[:800],
+            "evidence": "task_runs.notes: killed-by-user",
+        },
+        "notes": [],
+        "command": "",
+        "computed_at": _now_iso(),
+    }
+
+
+def _case_not_started(home: Path, run_dir: Path, run_id: str, notes: str,
+                      nodes: list[dict[str, Any]],
+                      edges: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Case 3.6 — the run never entered a node, so nothing has to be redone.
+
+    Two shapes reach here, both with zero ``node_start`` events:
+
+      * a ``plan.json`` and no execution — the run died in the hand-off from
+        planning to execution (the dispatcher was reaped, or the first node's
+        spawn failed). The plan is already paid for, so the cheap fix is to
+        resume at the top of the workflow rather than re-plan: the hint points
+        ``--from-node`` at the first node.
+      * no ``plan.json`` either — the dispatcher died during planning and left
+        nothing but the reaper's ``notes`` (``reaped: dispatcher pid N gone``).
+        There is nothing to reuse, but that note *is* the whole story, so it is
+        surfaced instead of a bare "?".
+
+    Evaluated LAST, just before case 5: it asserts an absence, so every case
+    with something positive to report (a dead lane, an infra attempt) must win
+    first. A plan-stage quota death also has zero ``node_start`` events, and its
+    cause — not its emptiness — is what the operator needs
+    (``_case_planner_lane`` owns it).
+    """
+    events = _run_node_events(home, run_id)
+    if events is None:
+        return None
+    if any(ev.get("event_type") == "node_start" for ev in events):
+        return None
+    has_plan = (run_dir / "plan.json").is_file()
+    order = _topo_order(nodes, edges)
+    first_node = order[0] if order else None
+
+    if has_plan:
+        summary = ("The plan was built but no node ever ran — resume from the "
+                   "first node instead of re-planning")
+        evidence = "plan.json present; 0 node_start events"
+    else:
+        summary = "The run stopped before executing: no node ever started"
+        evidence = "0 node_start events"
+    from_node = first_node if has_plan else None
+    command = " ".join(
+        ["mini-ork recover", run_id, "--strategy", "resume"]
+        + (["--from-node", from_node] if from_node else [])
+    )
+    return {
+        "version": HINT_VERSION,
+        "run_id": run_id,
+        "failed_node": from_node,
+        "retryable": True,
+        "strategy": "resume",
+        "from_node": from_node,
+        "needs_change": {
+            "kind": "not-started",
+            "summary": summary,
+            "detail": notes[:800] or _tail_log(run_dir, ""),
+            "evidence": evidence,
+        },
+        "notes": [],
+        "command": command,
         "computed_at": _now_iso(),
     }
 
@@ -1566,15 +1734,30 @@ def compute(home: Path, run_id: str) -> dict[str, Any] | None:
     if interrupted_hint is not None:
         return interrupted_hint
 
+    # Case 1.7 — the operator killed the run before it entered a node. Not a
+    # failure; never auto-repaired.
+    notes = _run_notes(home, run_id)
+    stopped_hint = _case_stopped(notes, run_id)
+    if stopped_hint is not None:
+        return stopped_hint
+
+    # The workflow's node names + edges, shared by every case below. When the
+    # recipe cannot be resolved (a per-run synthesised recipe, a deleted engine
+    # worktree) fall back to the nodes that actually ran, so artefact lookups
+    # are not blind — ``([], [])`` here is what made a run report "Failed at ?".
+    nodes, edges = _recipe_workflow(home, recipe)
+    if not nodes:
+        nodes = _nodes_from_events(home, run_id)
+
     # A reviewer that asked for a revision outranks any verifier outcome: the
     # change was judged wrong, so retrying it unchanged cannot help.
-    review_name, failed_review = _failed_review(run_dir, recipe, home)
+    review_name, failed_review = _failed_review(run_dir, nodes, edges)
     if failed_review is not None:
         code = _case_code(review_name, None, failed_review, run_id, sibling_hard_fail=None)
         if code is not None:
             return code
 
-    failed_name, artifacts = _first_failed_node(run_dir, recipe, home)
+    failed_name, artifacts = _first_failed_node(run_dir, nodes, edges)
     verifier = artifacts.get("verifier") if isinstance(artifacts.get("verifier"), dict) else None
     review = artifacts.get("review") if isinstance(artifacts.get("review"), dict) else None
 
@@ -1587,7 +1770,6 @@ def compute(home: Path, run_id: str) -> dict[str, Any] | None:
     # Case 3 — code revision needed. Look up the sibling hard-fail payload
     # up front so an UNVERIFIED target (case 2 filtered out) still surfaces
     # the REFUTED sibling's reason as the operator-facing detail.
-    nodes, edges = _recipe_workflow(home, recipe)
     sibling_hard_fail = _find_other_verifier_hard_failed(
         run_dir, nodes, edges, failed_name or "",
     ) if failed_name else None
@@ -1596,8 +1778,8 @@ def compute(home: Path, run_id: str) -> dict[str, Any] | None:
     if code is not None:
         return code
 
-    # Case 3.5 — a dead lane (quota/auth) on an LLM node. Runs BEFORE cases 4
-    # and 5 so a quota failure surfaces as a lane switch, not a silent resume.
+    # Case 3.5 — a dead lane (quota/auth) on an LLM node. Runs BEFORE cases 4,
+    # 4.5 and 5 so a quota failure surfaces as a lane switch, not a silent resume.
     lane_hint = _case_lane_unavailable(home, run_id, run_dir, recipe)
     if lane_hint is not None:
         return lane_hint
@@ -1606,6 +1788,15 @@ def compute(home: Path, run_id: str) -> dict[str, Any] | None:
     trouble = _case_provider_trouble(home, run_id, run_dir, failed_name, verifier)
     if trouble is not None:
         return trouble
+
+    # Case 4.5 — the run never started a node. Deliberately the last resort
+    # before case 5: it is a statement about *absence*, so every case that has
+    # something positive to say (a dead lane, an infra attempt) must win. A
+    # plan-stage quota death also has zero ``node_start`` events, and its cause
+    # is what the operator needs, not its emptiness.
+    not_started = _case_not_started(home, run_dir, run_id, notes, nodes, edges)
+    if not_started is not None:
+        return not_started
 
     # Case 5 — unclassified. Surface the most recent failed LLM-node as the
     # best-effort label so the operator doesn't read a bare "?".

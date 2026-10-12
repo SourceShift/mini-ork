@@ -381,3 +381,55 @@ def test_mini_ork_target_repo_pointing_at_engine_is_ignored(tmp_path, monkeypatc
     monkeypatch.setenv("MINI_ORK_ROOT", str(engine))
 
     assert run_roots.resolve_run_roots(str(run_dir)).target == str(bare)
+
+# ─── A recorded target that is gone: override or fail closed (audit 2026-10-12)
+
+
+def test_recorded_target_that_exists_is_kept_even_with_an_override(tmp_path):
+    """The override is ONLY for a target that is genuinely missing — a live
+    worktree must not be silently re-pointed by a stray ``MO_TARGET_CWD``."""
+    live = tmp_path / "live"
+    live.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    run_dir = tmp_path / "run"
+    _write_profile(run_dir, roots={"target": str(live)})
+
+    roots = run_roots.load_run_roots(str(run_dir), target_override=str(other))
+
+    assert roots is not None and roots.target == str(live)
+
+
+def test_missing_recorded_target_is_overridden_by_an_existing_path(tmp_path):
+    """The resumed run gets the replacement target, not a phantom cwd."""
+    gone = tmp_path / "worktree-that-was-cleaned"
+    replacement = tmp_path / "fresh"
+    replacement.mkdir()
+    run_dir = tmp_path / "run"
+    _write_profile(run_dir, roots={"target": str(gone), "exec_cwd": str(gone)})
+
+    roots = run_roots.load_run_roots(str(run_dir), target_override=str(replacement))
+
+    assert roots is not None
+    assert roots.target == str(replacement)
+    # The drive cwd was resolved off the deleted target; it must re-resolve.
+    assert roots.exec_cwd is None
+
+
+def test_missing_recorded_target_with_a_nonexistent_override_stays_missing(tmp_path):
+    """Fail closed: an override that does not exist is not a replacement, and
+    the recorded path stands so ``require_run_target`` rejects the run."""
+    gone = tmp_path / "gone"
+    also_gone = tmp_path / "also-gone"
+    run_dir = tmp_path / "run"
+    _write_profile(run_dir, roots={"target": str(gone)})
+
+    roots = run_roots.load_run_roots(str(run_dir), target_override=str(also_gone))
+
+    assert roots is not None and roots.target == str(gone)
+    try:
+        run_roots.require_run_target(roots=roots)
+    except run_roots.RunTargetMissing:
+        pass
+    else:  # pragma: no cover - the assertion below is the point
+        raise AssertionError("a missing target must fail closed")

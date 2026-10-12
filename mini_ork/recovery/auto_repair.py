@@ -493,6 +493,26 @@ def decide(home: Path, run_id: str) -> dict[str, Any]:
             signature=signature,
         )
 
+    # 3.6 A run a person stopped before it entered a node (``kind ==
+    # "stopped"``, retry hint case 1.7) is never auto-resumed. The mid-node
+    # kill is caught above by the ``interrupted`` branch's ``killed-by-user``
+    # veto; this is its sibling for the run that died with no node at all.
+    if hint_kind == "stopped":
+        return _decision("none", reason="stopped by the user — not auto-resumed",
+                         signature=signature)
+
+    # 3.7 Planned but never executed (``kind == "not-started"``, retry hint case
+    # 4.5): no node ran, so there is nothing to change — re-entering at the
+    # first node IS the fix.
+    if hint_kind == "not-started":
+        node = str((hint or {}).get("from_node") or "") or None
+        return _decision(
+            "infra",
+            from_node=node,
+            reason=f"no node ever started{' — resume from ' + node if node else ''}",
+            signature=signature,
+        )
+
     # 4. Infra / provider trouble → same node, same lane.
     if _is_infra(home, run_id, hint, nc, failed_node, fail_reason):
         return _decision(
