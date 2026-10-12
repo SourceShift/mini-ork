@@ -31,10 +31,12 @@ outputs:
     description: "One heterogeneous panel report per family: codex, kimi, minimax, and glm."
   - path: "${MINI_ORK_RUN_DIR}/reflector.json"
     mime: application/json
-    description: "Strict JSON failure pattern, general lesson, and plan mutation."
+    required: false
+    description: "Strict JSON failure pattern, general lesson, and plan mutation. Optional: written only on an escalation loop iteration, never on a green pass."
   - path: "${MINI_ORK_RUN_DIR}/replan.json"
     mime: application/json
-    description: "Mutated plan generated from reflector.json and the previous plan."
+    required: false
+    description: "Mutated plan generated from reflector.json and the previous plan. Optional: written only when reflection escalates."
   - path: "${MINI_ORK_RUN_DIR}/panel-verdict.json"
     mime: application/json
     description: "Merged tier-4 approval, request-changes, or escalation decision."

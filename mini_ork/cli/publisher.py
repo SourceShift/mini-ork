@@ -40,6 +40,14 @@ def set_status(db, run_id, new_status):  # late binding — avoids the execute<-
         raise RuntimeError(f"set_status({new_status!r}) for {run_id} did not persist (row says {row[0]!r})")
     return None
 
+# The advisory rubric pre-screen's whole payload (rubric_scoring.build_panel_verdict).
+# A file carrying ANY key outside this set has panel-authored content merged in —
+# tier4_synth owns panel-verdict.json and writes verdict/reasons/dod_probe_results.
+_PRESCREEN_VERDICT_KEYS = frozenset(
+    {"panel_score", "pass", "source", "task_class", "scale", "prescreen"}
+)
+
+
 def is_rubric_prescreen(path) -> bool:
     """True when ``path`` is the advisory rubric pre-screen's score file.
 
@@ -47,13 +55,24 @@ def is_rubric_prescreen(path) -> bool:
     — the same name a real panel gate uses. It records a score; it never
     approves a commit, satisfies the panel approval gate, or replaces the run
     verdict (K0.5b AC1).
+
+    The pre-screen MERGES (``setdefault``) into a verdict the panel already
+    wrote, so the ``source: rubric-prescreen`` stamp lands on a real panel
+    verdict that carries no ``source`` of its own. Keying on ``source`` alone
+    then reads an APPROVED panel as "no panel verdict" and refuses the publish
+    (runs -1791790859-83222--…--D1/D3: verdict APPROVE, every gate green,
+    blocked "missing panel verdict" because the prescreen had stamped the
+    file). A *pure* prescreen holds only ``build_panel_verdict``'s keys;
+    anything more is the panel's verdict and must be honored.
     """
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, ValueError):
         return False
-    return isinstance(data, dict) and data.get("source") == "rubric-prescreen"
+    if not isinstance(data, dict) or data.get("source") != "rubric-prescreen":
+        return False
+    return set(data) <= _PRESCREEN_VERDICT_KEYS
 
 
 def _recipe_root(root):
