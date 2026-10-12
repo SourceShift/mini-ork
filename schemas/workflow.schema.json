@@ -216,6 +216,43 @@
         "outputs": {
           "type": ["array", "object"],
           "description": "Typed artifact output ports. Each output declares name, path, kind, and optional visibility."
+        },
+        "retry": {
+          "type": "object",
+          "description": "Per-node RetryPolicy for infra-level attempts (transient infrastructure failures only). Defaults mirror LangGraph's current RetryPolicy. The retry block governs infra attempts on this node; a `retries` edge still governs revise rounds — the two caps compose independently. On terminal failure an ERROR checkpoint row is persisted so the P1.2/P1.3 resume path re-dispatches the node.",
+          "additionalProperties": false,
+          "properties": {
+            "max_attempts": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 50,
+              "default": 3,
+              "description": "Maximum number of attempts including the first. Default matches LangGraph's RetryPolicy."
+            },
+            "initial_interval": {
+              "type": "number",
+              "minimum": 0,
+              "default": 0.5,
+              "description": "Seconds to wait before the first retry. Default matches LangGraph's RetryPolicy."
+            },
+            "backoff_factor": {
+              "type": "number",
+              "minimum": 1,
+              "default": 2.0,
+              "description": "Multiplier on the previous interval after each attempt. Default matches LangGraph's RetryPolicy."
+            },
+            "max_interval": {
+              "type": "number",
+              "minimum": 0,
+              "default": 128.0,
+              "description": "Upper bound (seconds) on the wait between retries. Default matches LangGraph's RetryPolicy."
+            },
+            "jitter": {
+              "type": "boolean",
+              "default": true,
+              "description": "Apply bounded jitter to each wait interval. Default matches LangGraph's RetryPolicy."
+            }
+          }
         }
       }
     },
