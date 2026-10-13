@@ -73,6 +73,11 @@ _TERMINAL_OK_FINISH = ("done", "skipped", "abstain", "levels_unverified")
 # Reviewer/eval/judge verdicts that mean "the change was wrong".
 _RETRY_VERDICTS = ("needs_revision", "reject", "fail")
 
+# The publisher's own abstain signals. When one of these is the publisher's
+# LATEST ``node_end``, the withheld publish — not any other node — is the run's
+# real last word, so case 5 names the publisher (``_last_unfinished_node``).
+_ABSTAIN_FINISH = ("publish_abstain", "levels_unverified", "abstain")
+
 # Tokens that mean the provider rejected the call on credentials grounds.
 # The bare "401"/"403" digits live in a separate regex pass (see ``_looks_like_http_auth``)
 # because implementation logs routinely contain ``tokens_in=14012`` or ``cost=$0.21`` —
@@ -787,12 +792,79 @@ def _latest_impl_log_node(run_dir: Path) -> str | None:
     return name or None
 
 
+def _end_finish_reasons(home: Path, run_id: str) -> dict[str, str] | None:
+    """``node_id -> finish_reason`` from each node's LATEST ``node_end``.
+
+    Rows arrive in insertion order, so a later write wins: a node that failed
+    and was then re-run to ``done`` reads as ``done``. ``None`` when the
+    lifecycle is unreadable — the caller must then not claim a node is finished
+    rather than guess.
+    """
+    events = _run_node_events(home, run_id)
+    if events is None:
+        return None
+    out: dict[str, str] = {}
+    for ev in events:
+        if ev.get("event_type") != "node_end":
+            continue
+        try:
+            payload = json.loads(ev.get("payload_json") or "{}")
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        node_id = str(payload.get("node_id") or ev.get("node_id") or "")
+        if node_id:
+            out[node_id] = str(payload.get("finish_reason") or "")
+    return out
+
+
+def _publisher_node(ends: dict[str, str]) -> str:
+    """The latest node id whose name looks like a publisher (``""`` on miss)."""
+    found = ""
+    for node_id in ends:
+        if "publisher" in node_id.lower():
+            found = node_id
+    return found
+
+
+def _last_unfinished_node(home: Path, run_id: str, run_dir: Path,
+                          fallback: str | None) -> str | None:
+    """``fallback``, unless a node that has NOT finished ``done`` can be named.
+
+    The done-node invariant for case 5: a node that finished ``done`` is not
+    where the run stopped, so it must not be the *preferred* label — naming it
+    sends the operator hunting a fix in a step that succeeded. When the
+    fallback finished ``done`` (or is absent), the publisher is named instead
+    *if it abstained*: the withheld publish is then the run's real last word.
+
+    When neither is available the fallback is kept as the best-effort label
+    (the summary already says the cause was not classified) rather than
+    regressing to a bare "?": this hint is advisory, and an unnameable node is
+    worse than an imprecise one. The lifecycle being unreadable (``None``)
+    likewise keeps the fallback — absence of evidence is not evidence that the
+    node finished.
+    """
+    ends = _end_finish_reasons(home, run_id)
+    if ends is None:
+        return fallback
+    if fallback and str(ends.get(fallback) or "").lower() != "done":
+        return fallback
+    publisher = _publisher_node(ends)
+    if publisher and str(ends.get(publisher) or "").lower() in _ABSTAIN_FINISH:
+        return publisher
+    return fallback
+
+
 def _case_unknown(run_dir: Path, failed_name: str | None, run_id: str,
                   fallback_name: str | None = None) -> dict[str, Any]:
     """Case 5: not classified — surface the last log lines so the operator can decide.
 
     ``fallback_name`` is the most recent failed LLM-node (when no
-    verifier/reviewer fired) so the summary names something concrete.
+    verifier/reviewer fired) so the summary names something concrete. It is
+    computed by :func:`_last_unfinished_node`, so it never names a node whose
+    latest ``node_end`` finished ``done`` — and names the publisher when the
+    publish was withheld.
     """
     label = failed_name or fallback_name
     return {
@@ -1799,10 +1871,13 @@ def compute(home: Path, run_id: str) -> dict[str, Any] | None:
         return not_started
 
     # Case 5 — unclassified. Surface the most recent failed LLM-node as the
-    # best-effort label so the operator doesn't read a bare "?".
+    # best-effort label so the operator doesn't read a bare "?". The label must
+    # prefer a node that has NOT finished ``done`` (done-node invariant) and
+    # names the publisher when it abstained: see ``_last_unfinished_node``.
     _, fallback_node = _failure_class_for_any(home, run_id)
     if not fallback_node:
         fallback_node = _latest_impl_log_node(run_dir)
+    fallback_node = _last_unfinished_node(home, run_id, run_dir, fallback_node)
     return _case_unknown(run_dir, failed_name, run_id, fallback_name=fallback_node)
 
 
