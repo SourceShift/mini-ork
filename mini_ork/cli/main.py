@@ -21,6 +21,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Mapping, Sequence
 
 from mini_ork import trace_store
 from mini_ork.context import (
@@ -34,6 +35,7 @@ from mini_ork.dispatch import agents_config, config_resolve, deadline_budget
 from mini_ork.dispatch.run_env import RunEnvError, load_run_env
 from mini_ork.dispatch.secrets import SecretStoreError
 from mini_ork.dispatch.vault import VaultError
+from mini_ork.features import gate_env
 from mini_ork.vcs import repo_integrity_guard
 from mini_ork.gates import rubric_prescreen
 from mini_ork.orchestration import concord_run
@@ -123,6 +125,8 @@ Recipe runner:
   run <kickoff.md>               Classify kickoff, resolve recipe, then walk
                                    classify → plan → execute → verify
   run <recipe-name> <kickoff.md> Force a recipe, then walk the same lifecycle
+  run … --set K=V                Repeatable env override; premium feature knobs
+                                   are dropped unless MO_ACCEPT_PREMIUM=1
 
 Self-improvement:
   self-improve                   Recursive self-improvement of this checkout in a
@@ -1019,12 +1023,42 @@ def _budget_preflight(sink) -> int | None:
     return RC_BLOCKED
 
 
+def _gate_set_overrides(
+    pairs: Sequence[str], base_env: Mapping[str, str]
+) -> tuple[dict[str, str], list[str], str]:
+    """Parse repeatable ``--set K=V`` values and strip premium feature knobs.
+
+    Pure — no I/O — so the ``run`` flag is unit-testable without driving the
+    lifecycle. Returns ``(filtered_env, blocked_feature_ids, error)``:
+
+    * a pair without ``=`` yields ``({}, [], "--set requires K=V")`` and the
+      caller writes ``error`` to stderr and returns 2;
+    * otherwise the merged overrides go through
+      :func:`mini_ork.features.gate_env`, with ``accept_premium`` read from the
+      pairs overlaid on ``base_env`` — so ``--set MO_ACCEPT_PREMIUM=1`` unlocks
+      premium in the same invocation — and ``blocked_feature_ids`` names any
+      premium feature whose knobs were dropped.
+    """
+    overrides: dict[str, str] = {}
+    for pair in pairs:
+        key, sep, value = pair.partition("=")
+        if not sep:
+            return {}, [], "--set requires K=V"
+        overrides[key] = value
+    accept = overrides.get(
+        "MO_ACCEPT_PREMIUM", base_env.get("MO_ACCEPT_PREMIUM", "")
+    ) not in ("", "0")
+    filtered, blocked = gate_env(overrides, accept_premium=bool(accept))
+    return filtered, blocked, ""
+
+
 def _run_lifecycle_impl(argv, root, sink) -> int:
     t0 = int(time.time())
-    # ── flag pre-parse: pull --deadline / --placement / --env out ──
+    # ── flag pre-parse: pull --deadline / --placement / --env / --set out ──
     deadline = ""
     placement = ""
     node_env = ""
+    set_pairs: list[str] = []
     rest = []
     i = 0
     while i < len(argv):
@@ -1059,8 +1093,29 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
             node_env = argv[i + 1]; i += 2
         elif a.startswith("--env="):
             node_env = a.split("=", 1)[1]; i += 1
+        elif a == "--set":
+            if i + 1 >= len(argv):
+                sys.stderr.write("--set requires K=V\n"); return 2
+            set_pairs.append(argv[i + 1]); i += 2
+        elif a.startswith("--set="):
+            set_pairs.append(a.split("=", 1)[1]); i += 1
         else:
             rest.append(a); i += 1
+
+    # ── --set K=V: parse, gate premium knobs, publish before recipe resolution ──
+    # The filtered overrides are published here so dispatch, the session factory
+    # and gen_profile all read them; a blocked premium feature is announced once
+    # and the run continues with the survivors (never an abort).
+    if set_pairs:
+        set_env, blocked, set_err = _gate_set_overrides(set_pairs, context_env_snapshot())
+        if set_err:
+            sys.stderr.write(set_err + "\n"); return 2
+        if blocked:
+            sys.stderr.write(
+                "mini-ork: premium feature(s) not enabled: " + ", ".join(blocked)
+                + " — set MO_ACCEPT_PREMIUM=1 to enable premium features\n")
+        if set_env:
+            publish_env(set_env)
 
     # remote-nodes-14 §1: the flag wins over MO_PLACEMENT / MO_NODE_ENV; the
     # resolved values are published so dispatch, the session factory and
