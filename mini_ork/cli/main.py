@@ -773,6 +773,41 @@ def _gen_profile_or_reuse(kickoff, root, recipe, task_class, profile_path, agent
                        recipe_base=rbase)
 
 
+def _prior_run_roots(profile_path) -> dict | None:
+    """The ``roots`` an existing ``run_profile.json`` already pinned, if any."""
+    try:
+        roots = json.load(open(profile_path, encoding="utf-8")).get("roots")
+    except Exception:
+        return None
+    return roots if isinstance(roots, dict) and roots else None
+
+
+def _pin_run_roots_early(profile_path, prior_roots: dict | None) -> None:
+    """Pin the run's roots right after the profile is written, before planning.
+
+    Roots used to be pinned only at the pre-implementer baseline, so the
+    planner dispatched with none. Under ``--placement remote`` the planner lane
+    is a remote spawn, and a remote spawn without the run's pinned roots refuses
+    to start (it cannot translate a single host path), so every remote run died
+    in its planner (Daytona e2e, run-1791910667-50438). ``gen_profile`` rewrites
+    the whole profile, so roots an earlier cycle pinned are carried over first:
+    a resumed run keeps its original roots, as ``persist_run_roots`` promises.
+    """
+    from mini_ork.runtime.run_roots import persist_run_roots
+
+    run_dir = os.path.dirname(str(profile_path))
+    if prior_roots:
+        try:
+            prof = json.load(open(profile_path, encoding="utf-8"))
+            if isinstance(prof, dict) and "roots" not in prof:
+                prof["roots"] = prior_roots
+                with open(profile_path, "w", encoding="utf-8") as fh:
+                    json.dump(prof, fh, indent=2, sort_keys=True)
+        except (OSError, ValueError):
+            pass
+    persist_run_roots(run_dir)
+
+
 def _grep_kv(text: str, key: str) -> str:
     for line in text.splitlines():
         if line.startswith(key + "="):
@@ -1273,8 +1308,10 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
     # resolved path is byte-equivalent to the prior "home/config/agents.yaml".
     agents_path = agents_config.overlay_or(
         os.path.join(home, "config", "agents.yaml"), home=home)
+    prior_roots = _prior_run_roots(profile_path)
     data = _gen_profile_or_reuse(kickoff, root, recipe, task_class, profile_path,
                                  agents_path, rbase)
+    _pin_run_roots_early(profile_path, prior_roots)
     sys.stdout.write(f"profile_path={profile_path}\n")
     sys.stdout.write(f"profile_status={data['profile_status']}\n")
     sys.stdout.write(f"profile_confidence={data['confidence']:.2f}\n")
