@@ -11,19 +11,21 @@
 > **Every epic below must ship both tiers** (`CLAUDE.md`): the no-server simple tier and the
 > secure, cloud-scalable tier, selected by one config file, failing closed on a missing secret.
 
-**Status (2026-10-13).** The first scheduler pass (2026-10-12) delivered none of these cleanly:
-every planner dispatch failed (`llm_dispatch FAIL … rc=4/65`) and the one child that passed
-(Linear) wrote into the engine checkout, so its publisher abstained. The work was salvaged by hand:
+**Status (2026-10-13, end of day): all delivered.** The first scheduler pass (2026-10-12)
+delivered none of these cleanly: every planner dispatch failed (`llm_dispatch FAIL … rc=4/65`, dead
+minimax/kimi/codex lanes) and the one child that passed (Linear) wrote into the engine checkout, so
+its publisher abstained. Two root causes were fixed — children now inherit the epic's target repo
+(`668b1198`) and the home lane overlay no longer leads with dead lanes — and the rest re-ran:
 
 | id | state |
 |---|---|
-| wit-2-documents | landed — package + tests salvaged from the escalated run |
-| wit-2-attachment-section | not built (depends on wit-2-documents) |
+| wit-2-documents | landed `4598b66b` — salvaged from the escalated run |
+| wit-2-attachment-section | landed `f4d5bb75` — engine half; the Rust renderer is a mini-ork-ui follow-up |
 | wit-3-integrations | Telegram transport landed `bb258b91`; Slack/Discord not built |
 | wit-4-linear | landed `4379ff03` |
-| wit-4-jira | not built — the run died at the planner |
-| wit-5-writeback | not built (depends on wit-4-linear, wit-4-jira) |
-| board-shows-imported-tickets | queued 2026-10-13 — see the last section |
+| wit-4-jira | landed `976c9e41` |
+| wit-5-writeback | landed `1be093e8` — gated; no caller yet |
+| board-shows-imported-tickets | landed `d28c2b0f` |
 
 ---
 

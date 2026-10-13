@@ -1,5 +1,8 @@
 # EPIC — Work intake, communication and file handling: the Thread as one primitive
 
+> **Update 2026-10-13:** the delivery-order table in §3 is current — Linear, Jira, write-back and
+> the ticket board are shipped; the Stage 2 Rust renderer and Slack/Discord remain.
+>
 > **Status: Stages 0 and 1 are SHIPPED (10 commits, `90695bb4` @ 2026-10-11). Stages 2 and 3 are
 > planned and unbuilt.** This epic exists because the feature landed as a sequence of commits
 > across three subsystems (`pm/`, `threads/`, `intake/`) plus an IDE surface, and nothing in the
@@ -212,10 +215,10 @@ original plan's.
 | 7 | `intake/{trigger,poll}.py` + `cli/intake_cmd.py` (tier A) | ✅ `e29fa1b3` |
 | 8 | `web/routes/intake.py` + `intake/{webhooks,dispatch}.py` (tier B) | ✅ `5dd61439` |
 | 9 | IDE `thread` page + `intake` tab on the cold `orch` page | ✅ `90695bb4` |
-| 10 | **Stage 2** — `mini_ork/documents/` + `document` section + attachments | 🟡 `mini_ork/documents/` landed (salvaged from the escalated `wit-2-documents` run); `document` section + attachments planned |
+| 10 | **Stage 2** — `mini_ork/documents/` + `document` section + attachments | 🟡 engine done: documents `4598b66b`, attachments + `document` section payload `f4d5bb75`; Rust renderer in mini-ork-ui pending |
 | 11 | **Stage 3** — `mini_ork/integrations/` transports | 🟡 Telegram landed `bb258b91`; Slack/Discord planned |
-| 12 | Linear, then Jira adapters | 🟡 Linear landed `4379ff03`; Jira planned |
-| 13 | Write-back behind capability + `write_back: true` | ⬜ planned |
+| 12 | Linear, then Jira adapters | ✅ Linear `4379ff03`, Jira `976c9e41`; tickets on the Board's Tasks tab `d28c2b0f` |
+| 13 | Write-back behind capability + `write_back: true` | ✅ `1be093e8` (`mini_ork/pm/writeback.py`; no caller yet) |
 
 ---
 
