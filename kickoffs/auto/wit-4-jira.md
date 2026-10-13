@@ -28,6 +28,8 @@ the key. The commented `jira:` stanza in `config/pm.yaml` becomes a worked examp
 - `mini_ork/pm/providers/jira.py`
 - `tests/unit/test_pm_jira.py`
 - `config/pm.yaml`
+- `mini_ork/pm/providers/__init__.py` — register `jira` in `_CONFIGURED`, as `linear` is
+- `mini_ork/pm/providers/linear.py` — read-only reference: the same-shape adapter to mirror
 
 ## Verification commands
 - `python3.11 -c "import mini_ork.pm.providers.jira"`
