@@ -507,8 +507,12 @@ def gen_profile(kickoff_path, root, recipe, task_class, profile_path, agents_pat
         wanted = {n.lower() for n in names}
         current = None
         lines = []
+        in_fence = False
         for raw in text.splitlines():
-            m = re.match(r"^\s*#{2,6}\s+(.+?)\s*$", raw)
+            if raw.lstrip().startswith("```"):
+                in_fence = not in_fence
+            # A shell comment inside a fenced block (``## …``) is not a heading.
+            m = None if in_fence else re.match(r"^\s*#{2,6}\s+(.+?)\s*$", raw)
             if m:
                 title = m.group(1).strip().lower()
                 current = title if any(w in title for w in wanted) else None
@@ -613,7 +617,40 @@ def gen_profile(kickoff_path, root, recipe, task_class, profile_path, agents_pat
     # pushing real commands past the cap (run-1791853722-board-k3 ran a bare
     # runner over 8647 tests and timed out, never reaching the kickoff's
     # `ruff check`). Keep it as the no-section fallback with its cap of three.
-    _explicit_verify = _bullet_only(section_lines([
+    def _section_commands(lines):
+        # Bullets outside fences, and every command inside a fenced block, in
+        # document order. A kickoff writes a long command as one fenced shell
+        # line split with ``\`` continuations; reading only bullets left the
+        # section empty, fell through to the whole-kickoff regex scan, and the
+        # verifier ran a bare ``pytest`` over the full suite until it timed
+        # out (cloud-providers A1/A2, 2026-10-13). Continuations are joined;
+        # blank lines, ``#`` comments and a leading ``$ `` prompt are dropped.
+        out, buf, in_fence = [], "", False
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                if buf:
+                    out.append(buf)
+                    buf = ""
+                in_fence = not in_fence
+                continue
+            if not in_fence:
+                out.extend(_bullet_only([line]))
+                continue
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.startswith("$ "):
+                stripped = stripped[2:].strip()
+            buf = f"{buf} {stripped}" if buf else stripped
+            if buf.endswith("\\"):
+                buf = buf[:-1].rstrip()
+                continue
+            out.append(buf)
+            buf = ""
+        if buf:
+            out.append(buf)
+        return out
+    _explicit_verify = _section_commands(section_lines([
         "verification command", "verification commands", "proof of success"]))
     _explicit = []
     for _c in _explicit_verify:

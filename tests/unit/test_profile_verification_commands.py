@@ -143,6 +143,70 @@ def test_explicit_section_dedups_repeated_bullets(tmp_path):
     assert data["verification_command"] == ["pytest tests/unit/test_widget.py"]
 
 
+def test_fenced_block_with_continuations_is_the_explicit_section(tmp_path):
+    """A fenced shell block in the section is read command by command, with
+    ``\\`` continuations joined. Prose elsewhere naming ``python3.11 -m pytest``
+    must not leak in. Before the fix the section looked empty (bullets only),
+    the whole-kickoff regex took over, and the verifier ran a bare ``pytest``
+    over the full suite until its 300 s timeout (cloud-providers A1/A2)."""
+    data = _drive_gen_profile(
+        tmp_path,
+        """# Epic
+
+## Run rules
+
+- Run tests with `python3.11 -m pytest`.
+
+## Verification command
+
+```bash
+python3.11 -m pytest -q tests/unit/test_a.py \\
+  tests/unit/test_b.py
+ruff check mini_ork/runtime
+```
+
+## Acceptance
+
+- it works
+""",
+    )
+    assert data["verification_command"] == [
+        "python3.11 -m pytest -q tests/unit/test_a.py tests/unit/test_b.py",
+        "ruff check mini_ork/runtime",
+    ]
+
+
+def test_fence_comments_prompts_and_bullets_in_document_order(tmp_path):
+    """A ``## comment`` inside the fence is a shell comment, not a heading that
+    ends the section; a ``$ `` prompt is dropped; bullets outside the fence keep
+    their place in document order."""
+    data = _drive_gen_profile(
+        tmp_path,
+        """# Epic
+
+## Verification commands
+
+- `make lint`
+
+```sh
+## unit layer first
+$ pytest -q tests/unit/test_a.py
+
+# then the CLI read
+MINI_ORK_ROOT=$PWD python3.11 -m mini_ork.cli.main sandbox-gc --dry-run
+```
+
+- `ruff check x.py`
+""",
+    )
+    assert data["verification_command"] == [
+        "make lint",
+        "pytest -q tests/unit/test_a.py",
+        "MINI_ORK_ROOT=$PWD python3.11 -m mini_ork.cli.main sandbox-gc --dry-run",
+        "ruff check x.py",
+    ]
+
+
 # ── 2. The verifier drops its own silent cap ────────────────────────────────
 #
 # ``tests/unit/test_verifier_test_env.py`` already loads the framework-edit
