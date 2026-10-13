@@ -435,12 +435,15 @@ def compute_recovery(
       1. Load the DAG from workflow.yaml.
       2. For each node, ask ``is_node_reusable`` → reuse set.
       3. The earliest non-reusable node in topo order is the
-         ``failed_node`` (the root of the closure). It is the
-         FIRST node whose upstream chain is still intact but whose
-         own outputs are not safe to skip.
-      4. The closure is ``failed_node + every descendant of failed_node``.
-         A node whose only "data flow" path runs through the failed node
-         must rerun; a parallel branch's node does NOT.
+         ``failed_node`` (reported to the operator as the root cause).
+         It is the FIRST node whose upstream chain is still intact but
+         whose own outputs are not safe to skip.
+      4. The closure starts at ``failed_node + its descendants`` and grows
+         to a fixpoint: any non-reusable node that gates a node already in
+         the closure joins it. A node whose only "data flow" path runs
+         through a non-reusable node must rerun; a parallel branch that is
+         itself reusable does NOT, and neither does an unexecuted control
+         node (``rollback``) that gates nothing.
       5. If ``from_node`` is supplied, the closure is overridden to
          ``from_node + descendants(from_node)`` — operator wants a
          wider rerun. ``failed_node`` is recomputed to ``from_node``
@@ -463,12 +466,20 @@ def compute_recovery(
     )
     all_set = set(dag.node_ids)
 
-    # Find the earliest non-reusable node in topo order — the closure root.
-    failed_node: str | None = None
-    for nid in dag.topo:
-        if nid not in reuse:
-            failed_node = nid
-            break
+    # A node may only be skipped when nothing downstream of it reruns.
+    # Seeding from the earliest non-reusable node alone is unsound for a DAG
+    # with sibling branches (implementer → {typecheck, test} → reviewer): the
+    # later sibling is neither reused nor a descendant of the earlier one, so
+    # it lands in neither set — execute then counts it a failed parent of
+    # reviewer and skips the rest of the run, and `recover` can never reach a
+    # terminal verdict. Grow the closure to a fixpoint instead.
+    #
+    # Not every non-reusable node joins: a recipe's `rollback` carries no row,
+    # is a parentless root (its `escalates_to` edge is excluded as control
+    # flow) and gates nothing, so it stays out. Pulling it in would legitimately
+    # revert the branch. Only a node that GATES an already-rerunning node does.
+    non_reusable = [nid for nid in dag.topo if nid not in reuse]
+    failed_node: str | None = non_reusable[0] if non_reusable else None
 
     if from_node:
         if from_node not in all_set:
@@ -483,6 +494,15 @@ def compute_recovery(
         closure = set()
     else:
         closure = dag.descendants(failed_node)
+        changed = True
+        while changed:
+            changed = False
+            for nid in non_reusable:
+                if nid in closure:
+                    continue
+                if dag.descendants(nid) & closure:
+                    closure |= dag.descendants(nid)
+                    changed = True
 
     # No node may appear in BOTH reuse and rerun (kickoff §3 fix 2):
     # the status printer and downstream consumers assume the sets are

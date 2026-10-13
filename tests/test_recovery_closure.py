@@ -320,6 +320,37 @@ def test_scenario_5_parallel_branch_closure(
     assert "C" in plan.closure
 
 
+def test_scenario_5b_every_non_reusable_sibling_enters_the_closure(
+    tmp_path: Path, db_path: str, run_dir: str
+) -> None:
+    """Both branches failed: the closure seeds from BOTH, not just the
+    earliest one in topo order.
+
+    ``implementer → {typecheck, test} → reviewer`` is the real shape this
+    guards (run run-1791887097-86207). Rooting only at the earliest
+    non-reusable node leaves B2 in neither ``reuse`` nor ``closure``;
+    execute then counts B2 as a failed parent of C and skips it, so the
+    revive can never reach a terminal verdict.
+    """
+    run_id = "run-s5b-001"
+    recipe = "framework-edit"
+    tc = "framework_edit"
+    workflow = tmp_path / "wf.yaml"
+    _parallel_workflow(workflow)
+    for n in ("A1", "A2"):
+        art = _seed_artifact(run_dir, f"{n}.md", f"out-{n}".encode())
+        _seed_success_row(db_path, run_id, n, recipe=recipe, task_class=tc,
+                          run_dir=run_dir, artifact_rel=art)
+    plan = rp.plan_recovery(
+        str(workflow), run_id, db_path, run_dir,
+        recipe=recipe, task_class=tc, strategy="resume",
+    )
+    assert plan.reuse == {"A1", "A2"}, f"reuse={plan.reuse}"
+    assert plan.closure == {"B1", "B2", "C"}, f"closure={plan.closure}"
+    assert plan.failed_node == "B1"
+    assert plan.first_node == "B1"
+
+
 # ─── --from-node override ───────────────────────────────────────────────────
 
 def test_from_node_widens_closure(
