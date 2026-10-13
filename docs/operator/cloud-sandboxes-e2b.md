@@ -41,6 +41,16 @@ with the E2B CLI and name it in `provider_options.template`. A setup script on
 
 ## Verified
 
+- 2026-10-13: `mini-ork run code-fix <kickoff> --placement remote --env e2b`
+  (run-1791917474-996). The planner, implementer, typecheck, pytest (replay +
+  mutation adequacy) and reviewer ran in an E2B microVM on the `base` template
+  with the example profile's `setup`. The fix was published as a commit in the
+  local checkout, the sandbox was killed at run end, and no secret reached the
+  run dir. E2B needed no E2B-specific fix: everything came from the shared
+  sandbox-node base.
+- `nodes doctor --env e2b --recipe code-fix`: 10/10, with the lanes answering
+  from inside the microVM.
+
 - 2026-10-13: `scripts/smoke_sandbox_node.py --provider e2b` passed 7/7: create
   + boot 23.6 s, health through the traffic-token proxy, engine pre-staged,
   bearer 404/401, user site untouched, attach, release.

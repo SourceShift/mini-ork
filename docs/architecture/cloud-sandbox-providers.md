@@ -259,6 +259,19 @@ test:
 | The provider's `pip --user` bootstrap shadowed the system site and broke pytest | node-agent deps go into a system-site venv (`a602d58e`) |
 | The live sidecar split stream-json lines, and the replay never mapped sandbox paths, so a verified run abstained from publishing | `_LineTee` + `PathMap.to_host` (`88a3f99e`) |
 
+## Providers
+
+| Provider | Module | Status (2026-10-13) |
+|---|---|---|
+| `static` | `providers/static.py` | today's `nodes.yaml` / `MO_NODE_URL` behaviour |
+| `daytona` | `providers/daytona.py` | full `code-fix` run verified live; smoke 7/7 |
+| `e2b` | `providers/e2b.py` | full `code-fix` run verified live; smoke 7/7; doctor 10/10 |
+
+Every sandbox cloud shares `providers/sandbox_node.py` (`SandboxNodeProvider`).
+A new cloud is a `SandboxHandle` adapter (upload, run, start_background,
+endpoint + auth headers, delete) plus four hooks. Use
+`scripts/smoke_sandbox_node.py --provider <name>` as its live acceptance test.
+
 ## Live probe (2026-10-13, SDK 0.224.0, app.daytona.io)
 
 | Check | Result |
