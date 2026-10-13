@@ -198,6 +198,21 @@ def task_name_for_kickoff(kickoff_text: str) -> str:
     return ""
 
 
+def _extract_kickoff_title(markdown: str) -> str:
+    """First ``# H1`` heading text from a kickoff markdown, ``""`` when none.
+
+    Mirrors the title extraction the kickoff spec / slug already use
+    (see :func:`mini_ork.kickoff_lint.slug` and
+    :func:`task_name_for_kickoff`) so the ``/task`` queue path and the
+    saved file use the same name. ``""`` is the "no title" signal the
+    queue handler falls back to the saved-file stem for.
+    """
+    import re as _re
+
+    m = _re.search(r"(?m)^#\s+(.+?)\s*$", markdown or "")
+    return m.group(1).strip() if m else ""
+
+
 def _mint_thread_id() -> str:
     """Mint an ``orch-…`` session id for a thread (orchestrator) session.
 
@@ -658,6 +673,12 @@ class MiniOrkAcpAgent:
         # ``_dispatch_slash`` stores the intent here, then returns None so the
         # caller falls through to ``_prompt_thread`` which picks it up.
         self._thread_rewrites: dict[str, str] = {}
+        # thread session ids that asked to ``/task`` — when a kickoff
+        # approval fires on one of these, ``_offer_kickoff_draft_approval``
+        # swaps Start run for Queue on board (the first button), and the
+        # queue handler clears the mark. A later ``/kickoff`` in the same
+        # thread therefore still offers Start run first.
+        self._task_queue_sessions: set[str] = set()
         # session ids currently being loaded from a persisted thread. A
         # replayed update must NOT be re-recorded (kickoff §"load_session"):
         # the simplest guard is a per-load set checked at the top of
@@ -3018,30 +3039,49 @@ class MiniOrkAcpAgent:
         save vs. change vs. discard) because the kickoff is one document
         rather than a tree — there is no equivalent of "Update" since
         re-drafting the same slug already overwrites the staged file.
+
+        When ``session_id`` is in ``self._task_queue_sessions`` (the user
+        typed ``/task`` earlier in this thread) the first button swaps
+        from "Start run" to "Queue on board" so the same flow queues the
+        draft on the board instead of running it. Save / Change / Discard
+        keep their identities so the existing tests around those three
+        stay green; the queue handler clears the mark on firing.
         """
         if self._conn is None:
             return
+        queue_mode = session_id in getattr(self, "_task_queue_sessions", set())
+        if queue_mode:
+            options = [
+                PermissionOption(option_id="queue", name="Queue on board", kind="allow_once"),
+                PermissionOption(option_id="save", name="Save only", kind="allow_always"),
+                PermissionOption(option_id="change", name="Change something", kind="reject_once"),
+                PermissionOption(option_id="discard", name="Discard", kind="reject_always"),
+            ]
+            title = f"Queue {recipe} task?" if recipe else "Queue task?"
+        else:
+            options = [
+                PermissionOption(option_id="run", name="Start run", kind="allow_once"),
+                PermissionOption(option_id="save", name="Save only", kind="allow_always"),
+                PermissionOption(option_id="change", name="Change something", kind="reject_once"),
+                PermissionOption(option_id="discard", name="Discard", kind="reject_always"),
+            ]
+            title = f"Start {recipe} run?" if recipe else "Start run?"
         try:
             response = await self._conn.request_permission(
                 session_id=session_id,
                 tool_call=ToolCallUpdate(
                     tool_call_id=tool_call_id,
                     kind="edit",
-                    title=f"Start {recipe} run?" if recipe else "Start run?",
+                    title=title,
                     status="pending",
                 ),
-                options=[
-                    PermissionOption(option_id="run", name="Start run", kind="allow_once"),
-                    PermissionOption(option_id="save", name="Save only", kind="allow_always"),
-                    PermissionOption(option_id="change", name="Change something", kind="reject_once"),
-                    PermissionOption(option_id="discard", name="Discard", kind="reject_always"),
-                ],
+                options=options,
             )
         except Exception:  # noqa: BLE001 — UI is best-effort, the draft survives
             return
         outcome = getattr(response, "outcome", None)
         option_id = getattr(outcome, "option_id", None) if outcome is not None else None
-        if option_id in ("run", "save"):
+        if option_id in ("run", "save", "queue"):
             await self._emit(session_id, ToolCallProgress(
                 session_update="tool_call_update",
                 tool_call_id=tool_call_id,
@@ -3051,6 +3091,8 @@ class MiniOrkAcpAgent:
             await self._handle_kickoff_run(session_id, draft_id, recipe=recipe)
         elif option_id == "save":
             await self._handle_kickoff_save(session_id, draft_id, recipe=recipe)
+        elif option_id == "queue":
+            await self._handle_kickoff_queue(session_id, draft_id, recipe=recipe)
         elif option_id == "change":
             await self._handle_kickoff_change(session_id, draft_id)
             await self._emit(session_id, ToolCallProgress(
@@ -3066,8 +3108,12 @@ class MiniOrkAcpAgent:
                 status="failed",
             ))
         else:  # dismissed
-            await self._emit(session_id, self._build_refusal_message(
-                "Kickoff kept — ask me to start it when you're ready."))
+            if queue_mode:
+                await self._emit(session_id, self._build_refusal_message(
+                    "Task kept — ask me to queue it when you're ready."))
+            else:
+                await self._emit(session_id, self._build_refusal_message(
+                    "Kickoff kept — ask me to start it when you're ready."))
             await self._emit(session_id, ToolCallProgress(
                 session_update="tool_call_update",
                 tool_call_id=tool_call_id,
@@ -3114,6 +3160,30 @@ class MiniOrkAcpAgent:
         kickoff later via ``/run`` or
         ``mini-ork run <recipe> .mini-ork/kickoffs/<name>.md``.
         """
+        target = await self._persist_kickoff_draft(session_id, draft_id)
+        if target is None:
+            return
+        home = self._home_for(session_id)
+        rel = target.relative_to(home.parent)
+        await self._emit(session_id, self._build_refusal_message(
+            f"Saved `.mini-ork/kickoffs/{target.name}`. "
+            "Run it later with `/run` or "
+            f"`mini-ork run {recipe or '<recipe>'} {rel}`."
+        ))
+        await self._emit_file_links(session_id, [target])
+
+    async def _persist_kickoff_draft(
+        self, session_id: str, draft_id: str
+    ) -> Path | None:
+        """Move the staged draft to ``<home>/kickoffs/<slug>.md``; return the
+        saved path, or ``None`` after emitting a refusal on I/O failure.
+
+        Shared by :meth:`_handle_kickoff_save` (the existing ``save`` option)
+        and :meth:`_handle_kickoff_queue` (the ``/task`` Queue on board
+        option). Collision handling (``, ``-2``, ``-3`` …) and the
+        staged-draft delete match the prior ``save`` behaviour byte-for-byte
+        so a refactor here cannot drift the user-visible messages.
+        """
         from mini_ork.kickoff_lint import slug as _slug
 
         home = self._home_for(session_id)
@@ -3145,14 +3215,8 @@ class MiniOrkAcpAgent:
             await self._emit(session_id, self._build_refusal_message(
                 f"`save` failed for `{draft_id}`: {exc}"
             ))
-            return
-        rel = target.relative_to(home.parent)
-        await self._emit(session_id, self._build_refusal_message(
-            f"Saved `.mini-ork/kickoffs/{target.name}`. "
-            "Run it later with `/run` or "
-            f"`mini-ork run {recipe or '<recipe>'} {rel}`."
-        ))
-        await self._emit_file_links(session_id, [target])
+            return None
+        return target
 
     async def _handle_kickoff_change(
         self, session_id: str, draft_id: str
@@ -3181,6 +3245,88 @@ class MiniOrkAcpAgent:
         await self._emit(session_id, self._build_refusal_message(
             "Kickoff discarded."
         ))
+
+    async def _handle_kickoff_queue(
+        self, session_id: str, draft_id: str, *, recipe: str = ""
+    ) -> None:
+        """``queue`` → save the staged draft, then call ``epics add`` so the
+        task lands on the board (not run now). Used by the ``/task`` command.
+
+        Reuses :meth:`_persist_kickoff_draft` for the staged → kickoffs
+        move (so the slug + collision logic is identical to ``save``),
+        then invokes the ``epics add`` CLI in-process via
+        :func:`mini_ork.cli.epics.main` with captured stdout/stderr —
+        never a shell string. The title is the kickoff's first ``# H1``
+        heading (else the slug); the JSON output is parsed for the epic
+        id and surfaced to the user. A non-zero return code or a parse
+        failure shows the captured output verbatim with no success
+        message — the same fail-closed posture the kickoff §Agent spec
+        takes on save errors.
+        """
+        import contextlib
+        import io
+        import json as _json
+
+        # The session mark is consumed exactly once: the approval fired,
+        # so a later /kickoff in this same thread offers Run first again.
+        mark = getattr(self, "_task_queue_sessions", None)
+        if mark is not None and session_id in mark:
+            mark.discard(session_id)
+
+        target = await self._persist_kickoff_draft(session_id, draft_id)
+        if target is None:
+            return
+        home = self._home_for(session_id)
+        try:
+            markdown = target.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            markdown = ""
+        title = _extract_kickoff_title(markdown) or target.stem
+
+        # Capture stdout/stderr from epics add so the user sees any error
+        # verbatim; a non-zero rc becomes a refusal with no success line.
+        from mini_ork.cli import epics as _epics
+        db = str(home / "state.db")
+        root = str(home.parent)
+        argv = ["add", "--title", title, "--kickoff", str(target), "--json"]
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        rc = 1
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                rc = _epics.main(argv, db=db, root=root)
+            except SystemExit as exc:  # argparse / refusals that call sys.exit
+                rc = int(exc.code) if isinstance(exc.code, int) else 2
+            except Exception as exc:  # noqa: BLE001 — surface, never propagate
+                stderr.write(f"queue: epics add raised: {exc}\n")
+                rc = 2
+        if rc != 0:
+            err_text = (stderr.getvalue() + stdout.getvalue()).strip() or "unknown error"
+            await self._emit(session_id, self._build_refusal_message(
+                f"`queue` failed: {err_text}"
+            ))
+            return
+        # Parse the JSON the success path emits; on parse failure show
+        # the captured text instead of a fake success line.
+        epic_id: str | None = None
+        try:
+            payload = _json.loads(stdout.getvalue().strip() or "{}")
+            if isinstance(payload, dict) and payload.get("id"):
+                epic_id = str(payload["id"])
+        except _json.JSONDecodeError:
+            epic_id = None
+        if not epic_id:
+            err_text = (stdout.getvalue() + stderr.getvalue()).strip() or "no epic id in response"
+            await self._emit(session_id, self._build_refusal_message(
+                f"`queue` failed: {err_text}"
+            ))
+            return
+        rel = target.relative_to(home.parent)
+        await self._emit(session_id, self._build_refusal_message(
+            f"Queued `{epic_id}` on the board from `.mini-ork/{rel.as_posix()}`. "
+            "The scheduler will pick it up."
+        ))
+        await self._emit_file_links(session_id, [target])
 
     async def _offer_recipe_test_run(self, session_id: str, recipe_id: str) -> None:
         """After creating a recipe: offer to run it now on its example kickoff."""

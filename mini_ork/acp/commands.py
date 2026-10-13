@@ -216,6 +216,11 @@ COMMANDS: list[AvailableCommand] = [
         "what the run should do",
     ),
     _cmd(
+        "task",
+        "Draft a kickoff with the orchestrator, then queue it on the board (no run).",
+        "what the task should do",
+    ),
+    _cmd(
         "wizard",
         "Set up a run interactively: recipe, features and their cost, plan — then start.",
         "what the run should do (optional)",
@@ -913,6 +918,55 @@ async def handle_kickoff(
     )
 
 
+async def handle_task(
+    agent: Any, session_id: str, arg: str
+) -> _RewriteToOrchestrate | str:
+    """``/task [task]`` — draft a kickoff, then queue it on the board.
+
+    Mirrors :func:`handle_kickoff`: thread-only carve-out, rewrite to the
+    orchestrator with the task intent. The orchestrator runs the same
+    kickoff drafting steps (``describe_recipe`` → interview → ``draft_kickoff``),
+    but the resulting approval dialog is a 5-button set with **Queue on
+    board** placed first instead of Start run — the user is putting work
+    on the board, not running it now. The session mark set below makes
+    :meth:`MiniOrkAcpAgent._offer_kickoff_draft_approval` swap the run
+    button for a queue button on this thread; the mark is consumed (and
+    cleared) the moment the approval fires, so a later ``/kickoff`` in
+    the same thread still offers run first.
+    """
+    if session_id not in getattr(agent, "_thread_sessions", set()):
+        return (
+            "Tasks are written in a mini-ork thread — start one "
+            "from New Thread."
+        )
+    what = arg.strip() or "Ask what the task should do."
+    # The orchestrator cannot see the thread's pickers, so name the recipe.
+    cfg = (getattr(agent, "_thread_config", {}) or {}).get(session_id) or {}
+    recipe = str(cfg.get("recipe") or getattr(agent, "_recipe", "") or "code-fix")
+    # Mark the session so _offer_kickoff_draft_approval swaps Run for
+    # Queue. _task_queue_sessions is a set the agent already owns (tests
+    # inject via setattr on a partial-mock agent); we tolerate the mark
+    # being absent so a bare-MiniOrkAcpAgent test fixture does not
+    # AttributeError here.
+    mark = getattr(agent, "_task_queue_sessions", None)
+    if mark is not None:
+        mark.add(session_id)
+    intent = (
+        f"The user wants a task for the {recipe} recipe (the thread's Recipe "
+        f"picker; suggest another if it fits better) and the result queued on "
+        f"the board (not run now): {what} Follow your kickoff steps; the user "
+        "will queue the draft, not start it."
+    )
+    return _RewriteToOrchestrate(
+        intent_text=intent,
+        recipe_id=None,
+        bridge=(
+            "Handing this to the orchestrator. When the task is ready "
+            "you'll see it here with a Queue on board button."
+        ),
+    )
+
+
 async def handle_wizard(
     agent: Any, session_id: str, arg: str
 ) -> _RewriteToOrchestrate | str:
@@ -1396,6 +1450,7 @@ HANDLERS: dict[str, Handler] = {
     "automation": handle_automation,
     "automation new": handle_automation_new,
     "kickoff": handle_kickoff,
+    "task": handle_task,
     "wizard": handle_wizard,
     "automation run": handle_automation_run,
     "automation pause": handle_automation_pause,

@@ -122,3 +122,20 @@ want to check it first"), or types `/kickoff …`:
   addressed before saying the kickoff is ready.
 - Summarize in one or two lines. Never call `start_run` for a kickoff
   the user wants to check — the user starts it with the button.
+
+Drafting a task the user wants queued on the board:
+
+When the user asks for work to put on the board ("queue this for later",
+"put a task on the board for …", or types `/task …`):
+
+- Follow the same kickoff-drafting steps above — `describe_recipe`,
+  scope / success-criteria interview, `draft_kickoff` with the markdown.
+  The user wants a real kickoff the board can run, not a one-liner.
+- The intent text names the recipe (the orchestrator cannot see the
+  thread's Recipe picker) and tells the orchestrator the user wants to
+  queue, not run.
+- The agent shows the staged draft as a new-file diff with the lint
+  findings, and offers **Queue on board** / Save only / Change
+  something / Discard. Do not call `start_run` — the user queues with
+  the button. `Queue on board` calls `epics add` with the saved
+  kickoff file; the board's scheduler picks the task up.
