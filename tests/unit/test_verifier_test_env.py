@@ -327,18 +327,55 @@ def test_acceptance_commands_come_from_the_profile_first(monkeypatch, tmp_path):
         "python3.11 -m pytest tests/unit -q", "ruff check mini_ork"]
 
 
-def test_acceptance_commands_dedupe_no_cap(monkeypatch, tmp_path):
-    """A kickoff that repeats its one command must not run it four times. The
-    unbounded list no longer runs through the verifier's own silent ``[:4]``
-    cap — the kickoff's explicit ``## Verification commands`` section is the
-    acceptance bar, and every command it declares reaches the verifier."""
-    mod, _cap, _wt = _load_fwedit_verifier(monkeypatch, tmp_path)
-    _profile(mod, tmp_path, {"verification_command": [f"cmd-{i}" for i in range(9)]})
+def test_acceptance_commands_dedupe_and_cap(monkeypatch, tmp_path):
+    """A kickoff that repeats its one command must not run it four times. An
+    unbounded list must not run the verifier out of its budget — when the
+    kickoff declares more than the module's command limit, ``pass`` fails
+    fast and never starts a subprocess. With the limit or fewer, every
+    command the kickoff declared runs."""
+    mod, captured, _wt = _load_fwedit_verifier(monkeypatch, tmp_path)
 
+    # dedupe + complete ordered list returned by the commands accessor
+    _profile(mod, tmp_path, {"verification_command": [f"cmd-{i}" for i in range(9)]})
     assert mod._epic_verification_commands() == [f"cmd-{i}" for i in range(9)]
 
     _profile(mod, tmp_path, {"verification_command": ["same", "same", "same"]})
     assert mod._epic_verification_commands() == ["same"]
+
+    # The verifier is a script: its bottom-of-file body closes the evidence
+    # handle once module exec completes. Re-open in append mode and point the
+    # module's _ev at the new handle so writes from the late call land on disk.
+    evidence_path = tmp_path / "run" / "verifier-test.log"
+
+    # Over the limit (9 declared, limit 4): _epic_verification_commands_pass
+    # fails loudly with the budget message, never starting a subprocess.
+    _profile(mod, tmp_path, {"verification_command": [f"cmd-{i}" for i in range(9)]})
+    pre_size = evidence_path.stat().st_size
+    pre_captured = len(captured)
+    mod._ev = open(evidence_path, "a")
+    try:
+        assert mod._epic_verification_commands_pass() is False
+    finally:
+        mod._ev.close()
+    log_after = evidence_path.read_text()[pre_size:]
+    assert "9 commands declared, limit is 4 — split the kickoff" in log_after
+    assert len(captured) == pre_captured, (
+        "over-limit guard must short-circuit the command loop")
+
+    # Within the limit (4 declared): every command runs end-to-end.
+    _profile(mod, tmp_path, {"verification_command": [
+        "cmd-0", "cmd-1", "cmd-2", "cmd-3"]})
+    pre_captured = len(captured)
+    mod._ev = open(evidence_path, "a")
+    try:
+        assert mod._epic_verification_commands_pass() is True
+    finally:
+        mod._ev.close()
+    new_runs = captured[pre_captured:]
+    assert len(new_runs) == 4
+    assert all(isinstance(r["argv"], str) for r in new_runs)
+    assert [r["argv"] for r in new_runs] == [
+        "cmd-0", "cmd-1", "cmd-2", "cmd-3"]
 
 
 def test_acceptance_commands_fall_back_to_parsing_the_kickoff(monkeypatch, tmp_path):

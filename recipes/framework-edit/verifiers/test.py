@@ -306,6 +306,11 @@ _VERIFY_CMDS_SECTION = re.compile(
     r"^##\s+Verification commands\s*$(.*?)(?=^##\s|\Z)",
     re.MULTILINE | re.DOTALL)
 _VERIFY_CMD_TIMEOUT_S = int(os.environ.get("MO_EPIC_VERIFY_TIMEOUT_S", "300"))
+# A kickoff that declares more than this many acceptance commands cannot be
+# run end-to-end inside the per-command timeout window above the limit; the
+# budget guard in _epic_verification_commands_pass rejects it loudly instead
+# of silently dropping the tail.
+_EPIC_VERIFICATION_COMMAND_LIMIT = 4
 
 
 def _profile_field(name):
@@ -317,11 +322,15 @@ def _profile_field(name):
 
 
 def _epic_verification_commands():
-    """The kickoff's acceptance commands, in order, deduped, capped.
+    """The kickoff's acceptance commands, in order, deduped.
 
     ``run_profile.json`` already carries the parsed list (the profile gate reads
     that section), so prefer it; fall back to parsing the kickoff markdown, so a
     run whose profile predates the field is still gated.
+
+    The list is unbounded here: every command the kickoff declared reaches the
+    budget guard in ``_epic_verification_commands_pass``, which fails loudly
+    on over-limit kickoffs rather than silently dropping the tail.
     """
     raw = _profile_field("verification_command") or []
     if isinstance(raw, str):
@@ -342,8 +351,10 @@ def _epic_verification_commands():
         cmd = cmd.strip().strip("`").strip()
         if cmd and cmd not in out:
             out.append(cmd)
-    # Every command the kickoff declared runs. The previous [:4] cap was
-    # dropping the verification bar the kickoff's explicit "## Verification
+    # Every command the kickoff declared reaches the budget guard in
+    # _epic_verification_commands_pass, which fails loudly on over-limit
+    # kickoffs instead of silently dropping the tail. The old silent [:4] cap
+    # was masking the verification bar the kickoff's explicit "## Verification
     # commands" section set (run-1791853722-board-k3 timed out on a bare
     # runner over 8647 tests, never reaching the kickoff's `ruff check`).
     return out
@@ -365,10 +376,17 @@ def _epic_verification_commands_pass():
     if not os.path.isdir(WORKTREE):
         _ev.write("  patched copy absent — cannot run the kickoff's commands\n")
         return False
+    cmds = _epic_verification_commands()
+    if len(cmds) > _EPIC_VERIFICATION_COMMAND_LIMIT:
+        _ev.write(
+            f"  {len(cmds)} commands declared, limit is "
+            f"{_EPIC_VERIFICATION_COMMAND_LIMIT} — split the kickoff\n")
+        _ev.flush()
+        return False
     env = scrubbed_test_env()
     env["PYTHONPATH"] = "."
     env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
-    for cmd in _epic_verification_commands():
+    for cmd in cmds:
         _ev.write(f"  $ {_sh(cmd)}\n")
         _ev.flush()
         try:
