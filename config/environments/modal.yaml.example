@@ -1,0 +1,33 @@
+# config/environments/modal.yaml.example — run a run's agent nodes in a Modal
+# Sandbox (gVisor; one per run, terminated at run end).
+#
+#   cp config/environments/modal.yaml.example "$MINI_ORK_HOME/config/environments/modal.yaml"
+#   mini-ork run code-fix <kickoff> --placement remote --env modal
+#
+# MODAL_TOKEN_ID / MODAL_TOKEN_SECRET (from `modal token new`) are read through
+# the vault chain and fail closed. Sandboxes live in the Modal app named by
+# MO_MODAL_APP (default mini-ork-nodes, created on first use).
+#
+# Guide: docs/operator/cloud-sandboxes-modal.md
+
+provider: modal
+
+provider_options: {}
+  # timeout_s: 21600      # default MO_SANDBOX_MAX_AGE; Modal's max is 24 h
+  # environment: main     # Modal environment (default: the token's)
+
+# Any registry image; default is Modal's debian_slim + git + curl.
+image: python:3.12
+resources: { cpus: 2, memory: 4g }
+
+setup: |
+  apt-get update -qq && apt-get install -y -qq nodejs npm >/dev/null
+  npm install -g --silent @anthropic-ai/claude-code
+  python3 -m pip install --quiet --disable-pip-version-check pytest
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+secrets: [ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN]
+
+network: full     # allowlist is refused: Modal filters egress by CIDR, not domain

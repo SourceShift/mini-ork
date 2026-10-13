@@ -161,6 +161,7 @@ _LAZY_PROVIDERS: dict[str, str] = {
     "static": "mini_ork.remote.providers.static",
     "daytona": "mini_ork.remote.providers.daytona",
     "e2b": "mini_ork.remote.providers.e2b",
+    "modal": "mini_ork.remote.providers.modal_sandbox",
 }
 
 
