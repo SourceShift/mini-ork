@@ -266,6 +266,15 @@ test:
 | `static` | `providers/static.py` | today's `nodes.yaml` / `MO_NODE_URL` behaviour |
 | `daytona` | `providers/daytona.py` | full `code-fix` run verified live; smoke 7/7 |
 | `e2b` | `providers/e2b.py` | full `code-fix` run verified live; smoke 7/7; doctor 10/10 |
+| `modal` | `providers/modal_sandbox.py` | offline-verified (11 fake-SDK tests); live pending a Modal token |
+| Vercel Sandbox | — | researched (`vercel-sandbox` 0.9 sync SDK: `create_sandbox(ports=…)`, `run_process`, `routes`). Not built: routes are public URLs (only the node-agent bearer would guard them) and it is unknown whether they reach a loopback-bound port; needs `VERCEL_TOKEN`/`TEAM_ID`/`PROJECT_ID` to probe |
+| Kubernetes Agent Sandbox | — | researched (kubernetes-sigs `Sandbox` CRD, `k8s-agent-sandbox` 1.0). Design: reach the node-agent through the sandbox-router (Gateway, or `kubectl port-forward` locally) with `X-Sandbox-ID` / `X-Sandbox-Namespace` / `X-Sandbox-Port: 7091` as `NodeEndpoint.headers`; a `SandboxTemplate` image carrying git, Python and the agent CLI. Needs a cluster to verify |
+
+Shortlist source: the five platforms most teams shortlist in 2026 (E2B,
+Daytona, Modal, Cloudflare Sandbox SDK, Vercel Sandbox), plus Kubernetes
+Agent Sandbox for self-hosted clusters. Cloudflare's Sandbox SDK runs behind a
+deployed Worker and its disk resets after 10 idle minutes, which makes it a
+poor host for a run-long node-agent.
 
 Every sandbox cloud shares `providers/sandbox_node.py` (`SandboxNodeProvider`).
 A new cloud is a `SandboxHandle` adapter (upload, run, start_background,
