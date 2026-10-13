@@ -336,12 +336,23 @@ class DaytonaProvider:
 
     @staticmethod
     def _boot_script(*, base: str, state: str, sha: str, opts: DaytonaOptions) -> str:
+        """The one-shot bootstrap. Missing node-agent deps go into a dedicated
+        venv that also sees the system site-packages, never ``pip --user``: a
+        user-site install shadows the system for the code under test too.
+        (``fastapi --user`` pulled an ``opentelemetry-api`` that broke every
+        pytest run in the sandbox at plugin load, Daytona e2e
+        run-1791913440-97590.) The interpreter the node-agent must use is
+        recorded in ``node-python`` for start and revive."""
         py = shlex.quote(opts.python)
         q = shlex.quote
+        venv = base + "/venv"
         deps = " ".join(f"{imp}={req}" for imp, req in _NODE_AGENT_DEPS)
-        install = (f'  {py} -m pip install --user --quiet --disable-pip-version-check $missing\n'
-                   if opts.bootstrap else
-                   '  echo "node-agent deps missing: $missing (bootstrap disabled)" >&2; exit 3\n')
+        install = (
+            f"  {py} -m venv --system-site-packages {q(venv)}\n"
+            f"  {q(venv + '/bin/python')} -m pip install --quiet --disable-pip-version-check $missing\n"
+            f"  node_py={q(venv + '/bin/python')}\n"
+            if opts.bootstrap else
+            '  echo "node-agent deps missing: $missing (bootstrap disabled)" >&2; exit 3\n')
         return (
             "set -euo pipefail\n"
             "umask 077\n"
@@ -349,6 +360,7 @@ class DaytonaProvider:
             f"tar -xzf {q(base + '/engine.tar.gz')} -C {q(state + '/engines/' + sha)}\n"
             f"rm -f {q(base + '/engine.tar.gz')}\n"
             f"chmod 600 {q(base + '/node-token')}\n"
+            f"node_py={py}\n"
             "missing=\"\"\n"
             f"for pair in {deps}; do\n"
             f'  {py} -c "import ${{pair%%=*}}" 2>/dev/null || missing="$missing ${{pair#*=}}"\n'
@@ -356,7 +368,8 @@ class DaytonaProvider:
             'if [ -n "$missing" ]; then\n'
             f"{install}"
             "fi\n"
-            f"PYTHONPATH={q(state + '/engines/' + sha)} {py} -c 'import mini_ork.remote.node_agent.app'\n"
+            f'printf "%s\\n" "$node_py" > {q(base + "/node-python")}\n'
+            f"PYTHONPATH={q(state + '/engines/' + sha)} \"$node_py\" -c 'import mini_ork.remote.node_agent.app'\n"
         )
 
     def _start_node_agent(self, sandbox: Any, *, base: str, meta: Mapping[str, Any]) -> None:
@@ -365,7 +378,8 @@ class DaytonaProvider:
         engine = f"{meta['state']}/engines/{meta['sha']}"
         command = (
             f"cd {q(base)} && MO_NODE_TOKEN=\"$(cat {q(base + '/node-token')})\" "
-            f"PYTHONPATH={q(engine)} {q(str(meta['python']))} -m mini_ork.cli.node_agent "
+            f"PYTHONPATH={q(engine)} \"$(cat {q(base + '/node-python')} 2>/dev/null "
+            f"|| echo {q(str(meta['python']))})\" -m mini_ork.cli.node_agent "
             f"--runtime host --state-dir {q(str(meta['state']))} --bind 127.0.0.1 "
             f"--port {int(meta['port'])} >> {q(base + '/node-agent.log')} 2>&1"
         )

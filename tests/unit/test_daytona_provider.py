@@ -423,3 +423,30 @@ def test_endpoints_claim_the_profile_setup_was_applied(cloud):
     node = _create(profile=_profile(setup="pip install --user pytest"))
     assert node.setup_applied is True
     assert dt.DaytonaProvider().attach(node.handle, env=ENV).setup_applied is True
+
+
+def test_bootstrap_installs_into_a_venv_never_the_user_site(cloud):
+    """``pip --user`` shadowed the system site for the code under test too: a
+    user-site fastapi pulled an opentelemetry-api that broke every pytest run in
+    the sandbox (Daytona e2e run-1791913440-97590)."""
+    node = _create()
+    sb = cloud.sandboxes[node.handle]
+    boot = sb.files["/home/daytona/.mini-ork-node/boot.sh"].decode()
+    assert "--user" not in boot
+    assert "-m venv --system-site-packages" in boot
+    assert '> /home/daytona/.mini-ork-node/node-python' in boot
+    (_, cmd, _), = sb.session_cmds
+    assert "/home/daytona/.mini-ork-node/node-python" in cmd     # starts from the recorded python
+
+
+def test_generated_boot_scripts_are_valid_bash():
+    import subprocess
+    import tempfile
+
+    for boot in (True, False):
+        script = dt.DaytonaProvider._boot_script(
+            base="/home/daytona/.mini-ork-node", state="/home/daytona/.mini-ork-node/state",
+            sha="a" * 40, opts=dt.DaytonaOptions(bootstrap=boot))
+        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as fh:
+            fh.write(script)
+        assert subprocess.run(["bash", "-n", fh.name]).returncode == 0

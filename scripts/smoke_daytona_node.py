@@ -77,6 +77,14 @@ def main() -> int:
         status, _ = _get(f"{node.url}/v1/sessions/{run_id}", dict(node.headers))
         check("no bearer rejected", status == 401, f"HTTP {status}")
 
+        from mini_ork.remote.providers import daytona as dt
+
+        sandbox = dt._client(env).get(node.handle)
+        user_site = (sandbox.process.exec("python3 -m pip list --user 2>/dev/null | tail -n +3",
+                                          timeout=60).result or "").strip()
+        check("bootstrap leaves the user site untouched", not user_site,
+              f"user-site packages: {user_site.splitlines()[:5] or 'none'}")
+
         again = provider.attach(node.handle, env=env)
         check("attach finds the same node",
               again is not None and again.url == node.url and again.token == node.token)
