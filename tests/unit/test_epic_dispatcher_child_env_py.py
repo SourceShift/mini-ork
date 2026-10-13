@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 from pathlib import Path
+
+import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 _DISPATCHER = REPO / "recipes" / "epic-runner" / "lib" / "epic_dispatcher.py"
@@ -141,3 +144,85 @@ def test_prior_passed_verdict_is_none_when_the_file_is_unreadable(tmp_path):
     (child / "verdict.json").write_text("{not json")
 
     assert _load()._prior_passed_verdict(child) is None
+
+
+# ── which repo a spawned child edits ────────────────────────────────────────
+#
+# run-1791785967-43108 declared the intake-delegation worktree as its target,
+# but the dispatcher never passed it on. The child resolved its target from its
+# kickoff copy under <home>/runs/, i.e. the engine checkout, wrote the Linear
+# adapter there, and the parent's publisher found no authored patch.
+
+
+def _git_repo(path: Path) -> Path:
+    path.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    return path.resolve()
+
+
+def test_child_target_prefers_the_declared_epic_repo(monkeypatch, tmp_path):
+    monkeypatch.setenv("MINI_ORK_EPIC_TARGET_REPO", str(tmp_path))
+    plan = {"target_repo": "/somewhere/else"}
+
+    assert _load()._child_target(plan, tmp_path / "run") == str(tmp_path.resolve())
+
+
+def test_child_target_falls_back_to_the_plan_when_the_env_is_gone(monkeypatch, tmp_path):
+    """A `recover` launched from another shell no longer carries the variable;
+    the plan recorded what the planner was told."""
+    monkeypatch.delenv("MINI_ORK_EPIC_TARGET_REPO", raising=False)
+
+    assert _load()._child_target({"target_repo": str(tmp_path)}, tmp_path) == str(tmp_path.resolve())
+
+
+def test_child_target_ignores_an_unexpanded_placeholder(monkeypatch, tmp_path):
+    monkeypatch.delenv("MINI_ORK_EPIC_TARGET_REPO", raising=False)
+    monkeypatch.delenv("MO_TARGET_CWD", raising=False)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "run_profile.json").write_text(json.dumps({"roots": {"target": str(tmp_path)}}))
+
+    target = _load()._child_target({"target_repo": "$MINI_ORK_EPIC_TARGET_REPO"}, run_dir)
+
+    assert target == str(tmp_path), "with nothing declared the child follows its parent"
+
+
+def test_child_target_keeps_an_operator_pin(monkeypatch, tmp_path):
+    monkeypatch.delenv("MINI_ORK_EPIC_TARGET_REPO", raising=False)
+    monkeypatch.setenv("MO_TARGET_CWD", str(tmp_path))
+
+    module = _load()
+    assert module._child_target({}, tmp_path) == ""
+    assert module._child_env(tmp_path, tmp_path, "p", False)["MO_TARGET_CWD"] == str(tmp_path)
+
+
+def test_child_target_refuses_a_declared_repo_that_does_not_exist(monkeypatch, tmp_path):
+    monkeypatch.setenv("MINI_ORK_EPIC_TARGET_REPO", str(tmp_path / "gone"))
+
+    with pytest.raises(ValueError, match="gone"):
+        _load()._child_target({}, tmp_path)
+
+
+def test_a_child_resolves_the_declared_worktree_not_the_engine(monkeypatch, tmp_path):
+    """End to end through the ladder the child's nodes use (`resolve_run_roots`)."""
+    from mini_ork.runtime.run_roots import resolve_run_roots
+
+    monkeypatch.delenv("MO_TARGET_CWD", raising=False)
+    engine = _git_repo(tmp_path / "engine")
+    worktree = _git_repo(tmp_path / "worktree")
+    home = engine / ".mini-ork"
+    kickoff = home / "runs" / "run-p" / "children" / "run-p-epic" / "kickoff.md"
+    kickoff.parent.mkdir(parents=True)
+    kickoff.write_text("# epic\n")
+    child_dir = home / "runs" / "run-p-epic"
+    child_dir.mkdir(parents=True)
+    (child_dir / "run_profile.json").write_text(json.dumps({"kickoff_path": str(kickoff)}))
+    module = _load()
+
+    unpinned = module._child_env(home, engine, "run-p", False)
+    assert Path(resolve_run_roots(str(child_dir), env=unpinned).target).resolve() == engine
+
+    monkeypatch.setenv("MINI_ORK_EPIC_TARGET_REPO", str(worktree))
+    pinned = module._child_env(home, engine, "run-p", False,
+                               target=module._child_target({}, child_dir))
+    assert Path(resolve_run_roots(str(child_dir), env=pinned).target).resolve() == worktree

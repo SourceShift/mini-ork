@@ -49,7 +49,10 @@ lanes and are not counted as research-family diversity.
 The recipe reads these environment variables:
 
 - `MINI_ORK_EPIC_DOC` — path to the multi-epic markdown document.
-- `MINI_ORK_EPIC_TARGET_REPO` — target repository the child epics mutate.
+- `MINI_ORK_EPIC_TARGET_REPO` — target repository the child epics mutate. The
+  dispatcher pins it as each child's `MO_TARGET_CWD` (falling back to the plan's
+  `target_repo`, then to the parent run's own target), and refuses to spawn when
+  it names a directory that does not exist.
 - `MINI_ORK_EPIC_PUBLISH` — `true`/`false`; whether child framework-edit runs
   may publish.
 - `MINI_ORK_EPIC_VERIFIER_SCRIPT` — optional operator-supplied verifier script

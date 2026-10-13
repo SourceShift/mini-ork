@@ -267,7 +267,8 @@ _CHILD_ENV_DROP = (
 _CHILD_ENV_DROP_PREFIX = ("MINI_ORK_RECOVERY_",)
 
 
-def _child_env(home: Path, root: Path, parent_run_id: str, publish_enabled: bool) -> dict[str, str]:
+def _child_env(home: Path, root: Path, parent_run_id: str, publish_enabled: bool,
+               target: str = "") -> dict[str, str]:
     """The environment for a spawned epic child: repo config in, node state out.
 
     Every inherited ``MO_*`` policy knob (budgets, lanes, gates) is kept, because
@@ -275,6 +276,7 @@ def _child_env(home: Path, root: Path, parent_run_id: str, publish_enabled: bool
     see ``_CHILD_ENV_DROP`` -- and the child's own identity is set explicitly.
     ``MINI_ORK_EPIC_PUBLISH`` is the gateway the child's publisher reads, and
     ``MINI_ORK_PARENT_RUN_ID`` links the child back to the epic that spawned it.
+    ``target`` (see ``_child_target``) is pinned as ``MO_TARGET_CWD``.
     """
     env = {
         name: value
@@ -286,7 +288,54 @@ def _child_env(home: Path, root: Path, parent_run_id: str, publish_enabled: bool
     env.setdefault("MINI_ORK_DB", str(home / "state.db"))
     env["MINI_ORK_EPIC_PUBLISH"] = "true" if publish_enabled else "false"
     env["MINI_ORK_PARENT_RUN_ID"] = parent_run_id
+    if target:
+        env["MO_TARGET_CWD"] = target
     return env
+
+
+def _declared(value: Any) -> str:
+    # The planner copies ``$MINI_ORK_EPIC_TARGET_REPO`` into the plan verbatim, so
+    # with the variable unset the bare placeholder survives — it declares nothing.
+    text = str(value or "").strip()
+    return "" if not text or text.startswith("$") else text
+
+
+def _child_target(plan: dict[str, Any], run_dir: Path) -> str:
+    """The repo every spawned child edits, or ``""`` to keep an operator's pin.
+
+    Without an explicit ``MO_TARGET_CWD`` a child resolves its target from its
+    kickoff's directory, and the dispatcher writes that kickoff under
+    ``<home>/runs/`` — so the child edited whichever repo holds MINI_ORK_HOME,
+    not the one the epic named. run-1791785967-43108 declared the
+    ``intake-delegation`` worktree; its Linear child wrote into the engine
+    checkout, the parent's publisher found no authored patch, and the work was
+    stranded uncommitted on main.
+
+    Precedence: ``MINI_ORK_EPIC_TARGET_REPO``, then the plan's ``target_repo``
+    (it survives a ``recover`` whose env no longer carries the variable), then an
+    inherited ``MO_TARGET_CWD`` left untouched, then the parent run's own resolved
+    target so a child never diverges from its parent. A declared target that is
+    not a directory raises rather than falling through to some other tree.
+    """
+    for source, value in (
+        ("MINI_ORK_EPIC_TARGET_REPO", os.environ.get("MINI_ORK_EPIC_TARGET_REPO")),
+        ("the plan's target_repo", plan.get("target_repo")),
+    ):
+        declared = _declared(value)
+        if declared:
+            if not os.path.isdir(declared):
+                raise ValueError(
+                    f"{source} names {declared!r}, which is not a directory; refusing to "
+                    "spawn children that would fall back to another tree")
+            return str(Path(declared).resolve())
+    if os.environ.get("MO_TARGET_CWD"):
+        return ""
+    try:
+        roots = _load_json(run_dir / "run_profile.json").get("roots") or {}
+    except (OSError, ValueError):
+        return ""
+    target = str(roots.get("target") or "") if isinstance(roots, dict) else ""
+    return target if target and os.path.isdir(target) else ""
 
 
 # A child's recorded pre-implementer baseline, from ``cli/execute._snapshot_pre_impl_ref``.
@@ -350,6 +399,16 @@ def dispatch() -> int:
             },
         )
 
+    try:
+        child_target = _child_target(plan, run_dir)
+    except ValueError as exc:
+        for rec in records.values():
+            rec["status"] = STATUS_FAILED
+            rec["error"] = str(exc)
+        persist(0)
+        print(f"epic dispatcher: {exc}", file=sys.stderr)
+        return 1
+
     persist(0)
     waves_completed = 0
     failed_ids: set[str] = set()
@@ -395,7 +454,7 @@ def dispatch() -> int:
             spawn_override = os.environ.get("MINI_ORK_EPIC_SPAWN_BIN")
             spawn_bin = Path(spawn_override) if spawn_override else root / "bin" / "mini-ork-spawn"
             cmd = _spawn_command(spawn_bin, root, parent_run_id, child_run_id, kickoff_path, publish_enabled)
-            env = _child_env(home, root, parent_run_id, publish_enabled)
+            env = _child_env(home, root, parent_run_id, publish_enabled, target=child_target)
             log_path = run_dir / f"epic-dispatch-{epic_id}.log"
             log = log_path.open("w", encoding="utf-8")
             proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, text=True, env=env)
