@@ -1,0 +1,35 @@
+# config/environments/e2b.yaml.example — run a run's agent nodes in an E2B
+# sandbox (a Firecracker microVM; one per run, deleted at run end).
+#
+#   cp config/environments/e2b.yaml.example "$MINI_ORK_HOME/config/environments/e2b.yaml"
+#   mini-ork run code-fix <kickoff> --placement remote --env e2b
+#
+# E2B_API_KEY is read through the vault chain (env, then
+# $MINI_ORK_HOME/config/secrets.local.sh, or a sops/pass/op/OpenBao backend in
+# config/vault.yaml). A missing key fails the run before any API call.
+#
+# Guide: docs/operator/cloud-sandboxes-e2b.md
+
+provider: e2b
+
+provider_options:
+  # The default "base" template has Python 3.11, git and Node 20 but no agent
+  # CLI and ~0.5 GiB RAM. For real runs build a template with claude/opencode,
+  # your test tooling and more memory, and name it here.
+  template: ""
+  # E2B caps a sandbox at 1 h on Hobby and 24 h on Pro. The default is 1 h.
+  # timeout_s: 86400
+
+# Runs once per sandbox, before the node-agent starts. On the base template it
+# has to install the agent CLI the lanes use, plus test tooling.
+setup: |
+  npm install -g --silent @anthropic-ai/claude-code
+  python3 -m pip install --quiet --disable-pip-version-check pytest
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+secrets: [ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN]
+
+# full only: E2B egress allowlists are not wired yet (allowlist fails closed).
+network: full

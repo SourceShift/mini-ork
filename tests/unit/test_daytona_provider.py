@@ -16,6 +16,7 @@ import pytest
 
 from mini_ork.remote.providers import base
 from mini_ork.remote.providers import daytona as dt
+from mini_ork.remote.providers import sandbox_node as sn
 
 
 # --- fake SDK ---------------------------------------------------------------------
@@ -167,10 +168,10 @@ def cloud(monkeypatch, tmp_path):
     c = FakeCloud()
     monkeypatch.setitem(sys.modules, "daytona", c.module())
     # node-agent health: up once a session command started it
-    monkeypatch.setattr(dt, "_http_ok", lambda url, headers, timeout=10.0: any(
+    monkeypatch.setattr(sn, "http_ok", lambda url, headers, timeout=10.0: any(
         f"-{sid}." in url for sid in c.node_up))
-    monkeypatch.setattr(dt, "_engine_archive", lambda root: ("a" * 40, b"TARGZ"))
-    monkeypatch.setattr(dt.time, "sleep", lambda s: None)
+    monkeypatch.setattr(sn, "engine_archive", lambda root: ("a" * 40, b"TARGZ"))
+    monkeypatch.setattr(sn.time, "sleep", lambda s: None)
     # never the real secret store
     monkeypatch.setenv("MINI_ORK_HOME", str(tmp_path))
     monkeypatch.setenv("MINI_ORK_SECRETS", str(tmp_path / "secrets.local.sh"))
@@ -270,7 +271,9 @@ def test_profile_setup_runs_once_after_bootstrap(cloud):
     node = _create(profile=_profile(setup="npm i -g something"))
     sb = cloud.sandboxes[node.handle]
     assert sb.files["/home/daytona/.mini-ork-node/setup.sh"] == b"npm i -g something"
-    assert [c for c in sb.execs if "setup.sh" in c] and "boot.sh" in sb.execs[0]
+    boot_at = next(i for i, c in enumerate(sb.execs) if "boot.sh" in c)
+    setup_at = next(i for i, c in enumerate(sb.execs) if "setup.sh" in c)
+    assert boot_at < setup_at
 
 
 def test_sandbox_name_is_dns_safe_and_bounded():
@@ -310,7 +313,7 @@ def test_failed_bootstrap_deletes_the_sandbox_and_reports_output(cloud):
 
 
 def test_node_agent_never_healthy_deletes_and_shows_log(cloud, monkeypatch):
-    monkeypatch.setattr(dt, "_http_ok", lambda *a, **k: False)
+    monkeypatch.setattr(sn, "http_ok", lambda *a, **k: False)
     with pytest.raises(base.ProviderUnavailableError, match="not healthy"):
         _create(profile=_profile(provider_options={"ready_timeout_s": 0.01}))
     assert cloud.sandboxes == {}
@@ -444,9 +447,9 @@ def test_generated_boot_scripts_are_valid_bash():
     import tempfile
 
     for boot in (True, False):
-        script = dt.DaytonaProvider._boot_script(
+        script = sn.boot_script(
             base="/home/daytona/.mini-ork-node", state="/home/daytona/.mini-ork-node/state",
-            sha="a" * 40, opts=dt.DaytonaOptions(bootstrap=boot))
+            sha="a" * 40, opts=sn.BootOptions(bootstrap=boot))
         with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as fh:
             fh.write(script)
         assert subprocess.run(["bash", "-n", fh.name]).returncode == 0
