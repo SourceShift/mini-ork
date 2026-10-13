@@ -64,6 +64,11 @@ if you feel the length pressure, cut prose, never the JSON.
    - `severity`: `critical` | `high` | `medium` | `low`
    - `evidence_checked`: ONE briefing receipt
    - `reasoning`: ONE sentence
+   - `corrections`: any number or claim you dispute, with the value you
+     measured instead — a REQUIRED key on every finding, `[]` when you dispute
+     nothing. This lane adjudicates from the briefing alone, so it is usually
+     empty; the key must still be PRESENT, because the panel verifier requires
+     it on every finding and compares key sets across lanes.
 3. `Fix Verdicts` — one block per fix S1..S6, same shape plus `finding_id`,
    plus an optional `fix_gap` phrase (markdown only — NEVER a JSON key). The
    JSON sidecar's `fixes` entries carry EXACTLY the five keys shown below.
