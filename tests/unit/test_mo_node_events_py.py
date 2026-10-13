@@ -384,3 +384,50 @@ def tmp_db(tmp_path, monkeypatch):
     monkeypatch.setenv("MINI_ORK_DB", dbp)
     monkeypatch.setenv("MINI_ORK_HOME", str(home))
     return home
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (i) a finish_reason outside migration 0021's column enum keeps its node_end
+# ─────────────────────────────────────────────────────────────────────────────
+@pytest.mark.parametrize("reason", ["publish_abstain", "artifact_contract",
+                                    "impl_no_changes", "levels_unverified"])
+def test_a_finish_reason_outside_the_column_enum_keeps_the_node_end(tmp_db, reason):
+    """The CHECK used to reject the insert and the whole node_end was lost; the
+    row now lands with the column NULL and the exact reason in the payload."""
+    dbp = _seed_db(tmp_db)
+    py.mo_node_end("run-i", "publisher", "publisher", 12, "", "", reason)
+
+    con = sqlite3.connect(dbp)
+    try:
+        rows = _row_dict(con)
+    finally:
+        con.close()
+    assert len(rows) == 1, rows
+    assert rows[0]["event_type"] == "node_end"
+    assert rows[0]["finish_reason"] is None
+    assert json.loads(rows[0]["payload_json"])["finish_reason"] == reason
+
+
+def test_an_enum_finish_reason_still_fills_the_column(tmp_db):
+    dbp = _seed_db(tmp_db)
+    py.mo_node_end("run-j", "test", "verifier", 12, "", "", "verdict_fail")
+
+    con = sqlite3.connect(dbp)
+    try:
+        rows = _row_dict(con)
+    finally:
+        con.close()
+    assert [r["finish_reason"] for r in rows] == ["verdict_fail"]
+
+
+def test_a_publisher_that_abstained_is_not_read_as_interrupted(tmp_db):
+    """run-1791886249-29021: the publisher withheld an unattributable patch, its
+    node_end was dropped, and the retry hint sent auto-repair to "resume" it."""
+    from mini_ork.recovery import retry_hint
+
+    _seed_db(tmp_db)
+    py.mo_node_start("run-k", "publisher", "publisher")
+    assert retry_hint._case_interrupted(tmp_db, "run-k")["needs_change"]["kind"] == "interrupted"
+
+    py.mo_node_end("run-k", "publisher", "publisher", 40, "", "", "publish_abstain")
+    assert retry_hint._case_interrupted(tmp_db, "run-k") is None

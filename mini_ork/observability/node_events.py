@@ -231,10 +231,21 @@ def mo_node_emit(
             insert_cols.append("last_heartbeat_at")
             values.append(heartbeat_ms)
         placeholders = ",".join("?" for _ in insert_cols)
-        con.execute(
-            f"INSERT INTO run_events({', '.join(insert_cols)}) VALUES ({placeholders})",
-            values,
-        )
+        insert = f"INSERT INTO run_events({', '.join(insert_cols)}) VALUES ({placeholders})"
+        try:
+            con.execute(insert, values)
+        except sqlite3.IntegrityError:
+            # Migration 0021 CHECKs the finish_reason column against a fixed
+            # enum, but nodes end with reasons it lacks — publish_abstain,
+            # artifact_contract, impl_no_changes, levels_unverified and more.
+            # The rejected insert used to drop the whole node_end, so the node
+            # read as still running: the retry hint called a deliberate publish
+            # withhold an interruption and auto-repair re-ran it. Keep the row;
+            # the exact reason stays in payload_json, which is what readers parse.
+            if "finish_reason" not in insert_cols or payload.get("finish_reason") is None:
+                raise
+            values[insert_cols.index("finish_reason")] = None
+            con.execute(insert, values)
         con.commit()
     except sqlite3.Error:
         # Mirror bash `2>/dev/null || true` — observability must never break
