@@ -17,8 +17,10 @@ import argparse
 import os
 import sys
 
+from mini_ork.remote.providers import known_node_providers
 from mini_ork.runtime.sandbox_reaper import (
     DEFAULT_MAX_AGE_S,
+    known_sandbox_reapers,
     reap_sandboxes,
 )
 
@@ -33,6 +35,18 @@ def _default_max_age() -> int:
     return DEFAULT_MAX_AGE_S
 
 
+def _backend_choices() -> tuple[str, ...]:
+    """``--backend`` choices, computed when the parser is built.
+
+    Every registered sweep (:func:`known_sandbox_reapers`) plus every known node
+    provider, so a backend that registers itself shows up here without this file
+    being edited. Computed per call, not at import, so a reaper registered just
+    before the parse (a plugin's import) is already selectable.
+    """
+    names = ["all", *sorted(set(known_sandbox_reapers()) | set(known_node_providers()))]
+    return tuple(dict.fromkeys(names))
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="mini-ork sandbox-gc",
@@ -40,7 +54,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--backend",
-        choices=("all", "docker", "microvm"),
+        choices=_backend_choices(),
         default="all",
         help="which backend(s) to sweep (default: all)",
     )

@@ -132,7 +132,11 @@ def test_reap_sandboxes_docker_shape(install):
     assert out == {"docker": ["old111"]}
 
 
-def test_reap_sandboxes_all_has_both_keys(install):
+def test_reap_sandboxes_all_has_both_keys(install, monkeypatch):
+    # The LOCAL sweeps' shape; node providers are covered by
+    # test_sandbox_teardown_registry.py. Isolating them also keeps a unit test
+    # from ever reaching a real cloud API when a provider key is present.
+    monkeypatch.setattr(sandbox_reaper, "_provider_sweep_names", lambda backend: [])
     install(FakeDocker({"old111": 946_684_800.0}))
     out = sandbox_reaper.reap_sandboxes(backend="all", max_age_s=3600)
     assert set(out) == {"docker", "microvm"}
@@ -164,3 +168,25 @@ def test_max_age_falls_back_to_env(install, monkeypatch):
 
 def test_default_max_age_is_generous():
     assert sandbox_reaper.DEFAULT_MAX_AGE_S == 6 * 60 * 60
+
+
+# --- cloud-providers A2: the sweep registry ---------------------------------
+
+
+def test_builtin_sweeps_register_themselves_at_import():
+    """The two built-ins are reachable through the registry, which is what
+    ``reap_sandboxes`` and the ``sandbox-gc`` CLI's ``--backend`` choices read."""
+    assert {"docker", "microvm"} <= set(sandbox_reaper.known_sandbox_reapers())
+    assert sandbox_reaper._SWEEP_REAPERS["docker"] is sandbox_reaper.reap_docker
+    assert sandbox_reaper._SWEEP_REAPERS["microvm"] is sandbox_reaper.reap_microvm
+
+
+def test_reap_sandboxes_all_without_registrations_keeps_the_builtin_shape(install, monkeypatch):
+    """No extra reaper registered → the local part of ``all`` is still exactly
+    docker + microvm, in that order, with a key per backend even when nothing was
+    reaped (the CLI prints one line per key, so both the set and the order are
+    the CLI's format). Node providers follow; they are isolated here."""
+    monkeypatch.setattr(sandbox_reaper, "_provider_sweep_names", lambda backend: [])
+    install(FakeDocker({"old111": 946_684_800.0}))
+    out = sandbox_reaper.reap_sandboxes(backend="all", max_age_s=3600)
+    assert out == {"docker": ["old111"], "microvm": []}

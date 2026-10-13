@@ -52,6 +52,7 @@ from urllib import request as urllib_request
 from mini_ork.dispatch.live_stream import LiveWriter
 from mini_ork.dispatch.live_stream import live_file_path as _resolve_live_file_path
 from mini_ork.runtime.sandbox import register_workspace_backend
+from mini_ork.runtime.sandbox_reaper import register_marker_reaper
 
 __all__ = [
     "RemoteUnavailableError",
@@ -1698,6 +1699,76 @@ class RemoteWorkspace:
         self._owns_session = False
         return None
 
+    def session_id(self) -> str:
+        """The node session's id (``""`` before ``up()`` / after ``down()``).
+
+        Cloud-providers A2: the run-scoped session marker records this so an
+        out-of-process ``kill_run`` can find the session without reading a
+        private attribute — the counterpart of docker's ``_cid``.
+        """
+        return self._sid or ""
+
+
+def _reap_remote_marker(
+    info: Mapping[str, Any],
+    run_dir: Path,
+    *,
+    dry_run: bool = False,
+) -> list[str]:
+    """Immediate teardown of the node session a run-dir marker records.
+
+    The ``remote`` marker hook (cloud-providers A2), registered below so
+    ``sandbox_reaper.reap_by_marker`` finds it without this module being
+    imported up front. It is exactly the logic that used to be inline in
+    ``control.kill_run``: build the workspace from the marker's non-secret
+    ``node`` / ``token_env`` locator, replay the recorded session id, kill every
+    proc the session's journal knows about under a 10 s budget, then DELETE the
+    session. Best-effort and never raises — a missing node, a dead node-agent,
+    or a slow first kill must not break the kill path; the TTL reaper
+    (``sandbox_reaper.reap_sandboxes``) is the safety net."""
+    sid = str(info.get("session_id") or "").strip()
+    if not sid:
+        return []
+    if dry_run:
+        return [sid]
+    node_info = info.get("node") or {}
+    token_env = str(info.get("token_env") or "MO_NODE_TOKEN")
+    try:
+        ws = RemoteWorkspace(
+            node=_NodeRef(
+                name=str(node_info.get("name") or "kill_run"),
+                url=str(node_info.get("url") or os.environ.get("MO_NODE_URL", "")),
+                token=os.environ.get(token_env, ""),
+                max_sessions=1,
+            ),
+            token_env=token_env,
+            # The marker's run_id is the node's session key; a marker written
+            # before it existed falls back to the session id itself.
+            run_id=str(info.get("run_id") or "").strip() or sid,
+            image=os.environ.get("MO_SANDBOX_IMAGE") or "alpine:latest",
+            drive_root=os.environ.get("MO_SHARED_DRIVE_ROOT") or os.getcwd(),
+            engine_root=os.environ.get("MINI_ORK_ROOT") or os.getcwd(),
+            retries=1,
+            target_root=None,
+            run_dir=str(run_dir),  # where the pid journal lives
+        )
+    except Exception:  # noqa: BLE001 — no usable node config: nothing to reap
+        return []
+    # The session already exists (the marker proves it); skip up() by replaying
+    # the sid — up() is idempotent on the node-agent (POST /v1/sessions on a
+    # known run_id returns the existing sid).
+    ws._sid = sid
+    try:
+        ws.kill_all(budget_s=10.0)
+    except Exception:  # noqa: BLE001 — kill_all is best-effort by contract
+        pass
+    finally:
+        try:
+            ws.down()
+        except Exception:  # noqa: BLE001 — down() is best-effort by contract
+            pass
+    return [sid]
+
 
 def _factory(**kwargs: Any) -> RemoteWorkspace:
     """Build a :class:`RemoteWorkspace`, filling :env:`MO_NODE`-selected kwargs.
@@ -1781,10 +1852,13 @@ def register() -> None:
     register_workspace_backend("remote", _factory)
 
 
-# Import-time effect: register the factory. This is the ONLY thing importing
-# this module does — no socket, no env read, no subprocess — matching the
-# contract ``docker.py`` keeps for itself. The resolver still imports this
-# module lazily, so the default path (``MO_SANDBOX_BACKEND`` unset) never
-# loads it; the verified-by-test for that is
-# ``test_remote_module_not_imported_when_backend_unset``.
+# Import-time effect: register the factory and the marker hook. Those two dict
+# inserts are the ONLY thing importing this module does — no socket, no env
+# read, no subprocess — matching the contract ``docker.py`` keeps for itself.
+# The marker hook is what ``sandbox_reaper._LAZY_MARKER_REAPERS`` imports (the
+# ``serve`` process running ``kill_run`` never selects this backend, so it would
+# otherwise have no hook). The resolver still imports this module lazily, so the
+# default path (``MO_SANDBOX_BACKEND`` unset) never loads it; the verified-by-test
+# for that is ``test_remote_module_not_imported_when_backend_unset``.
 register()
+register_marker_reaper("remote", _reap_remote_marker)

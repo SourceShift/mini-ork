@@ -261,77 +261,24 @@ def kill_run(home: Path, db: StateDB, task_run_id: str) -> dict[str, Any]:
             except PermissionError:
                 survived.append(pid)
 
-    # Remote-nodes-02 (D2): marker-driven reap. SIGKILL bypasses the executor's
-    # Python ``finally`` (which would call ``Workspace.down()``), so the
-    # run-scoped container survives until the 6 h TTL reaper runs. Synchronously
-    # ``docker rm -f`` the cid the marker records — shortens the leak window
-    # from 6 h to immediate. Best-effort: a missing marker, an absent docker
-    # CLI, or a dead daemon must never raise out of kill_run.
+    # Remote-nodes-02 (D2) / cloud-providers A2: marker-driven reap. SIGKILL
+    # bypasses the executor's Python ``finally`` (which would call
+    # ``Workspace.down()``), so the run-scoped container or node session
+    # survives until the 6 h TTL reaper runs. One call into the teardown
+    # registry reaps it now — the registry resolves the backend's hook lazily
+    # (docker ``rm -f``, the remote session's ``kill_all`` + ``down``, or any
+    # backend that registered one), so this ``serve`` process needs neither the
+    # executor's env nor an import of the backend. Best-effort: the reaper
+    # never raises, and a marker-less run is a no-op.
     _marker_reaped = False
     marker = run_dir / ".workspace-session.json"
     if marker.exists():
         try:
-            info = json.loads(marker.read_text(encoding="utf-8"))
-            backend = info.get("backend")
-            cid = info.get("session_id")
-            if backend == "docker" and cid:
-                subprocess.run(
-                    ["docker", "rm", "-f", str(cid)],
-                    capture_output=True,
-                    timeout=10,
-                    check=False,
-                )
-            elif backend == "remote" and cid:
-                # remote-nodes-09: kill every spawned proc of the session
-                # under a 10 s total budget, then DELETE the session — mirrors
-                # the docker branch's "shorten the leak window" semantics.
-                # The remote backend has no list-procs endpoint, so the
-                # journal at <run_dir>/.remote-pids.jsonl is the authoritative
-                # source. Bounded + best-effort: a missing journal, a dead
-                # node-agent, or a slow first kill MUST never raise out of
-                # kill_run — the in-memory pid journal is advisory, the TTL
-                # reaper (``sandbox_reaper.reap_sandboxes``) is the safety
-                # net for anything that bypasses this branch.
-                try:
-                    from mini_ork.runtime.backends.remote import (
-                        RemoteWorkspace,
-                        _NodeRef,
-                    )
-                    # The marker says where the session lives (written at up());
-                    # this serve process need not share the executor's env.
-                    node_info = info.get("node") or {}
-                    token_env = info.get("token_env") or "MO_NODE_TOKEN"
-                    remote_ws = RemoteWorkspace(
-                        node=_NodeRef(name=node_info.get("name") or "kill_run",
-                                      url=node_info.get("url") or os.environ.get("MO_NODE_URL", ""),
-                                      token=os.environ.get(token_env, ""),
-                                      max_sessions=1),
-                        token_env=token_env,
-                        run_id=task_run_id,
-                        image=os.environ.get("MO_SANDBOX_IMAGE", "alpine:latest"),
-                        drive_root=os.environ.get("MO_SHARED_DRIVE_ROOT") or os.getcwd(),
-                        engine_root=os.environ.get("MINI_ORK_ROOT") or os.getcwd(),
-                        retries=1,
-                        target_root=None,
-                        run_dir=str(run_dir),   # where the pid journal lives
-                    )
-                    # The session already exists (marker proves it); skip up()
-                    # by replaying the sid — up() is idempotent on the
-                    # node-agent (POST /v1/sessions on a known run_id returns
-                    # the existing sid).
-                    remote_ws._sid = cid  # type: ignore[attr-defined]
-                    try:
-                        remote_ws.kill_all(budget_s=10.0)
-                    finally:
-                        remote_ws.down()
-                except (OSError, ValueError, subprocess.TimeoutExpired, ImportError):
-                    # ImportError kills RemoteWorkspace import-time (e.g. no
-                    # node-agent server reachable) — best-effort.
-                    pass
-            marker.unlink(missing_ok=True)
+            from mini_ork.runtime.sandbox_reaper import reap_by_marker
+
+            reap_by_marker(run_dir)
             _marker_reaped = True
-        except (OSError, ValueError, subprocess.TimeoutExpired):
-            # Fallback: the TTL reaper sweeps on its next tick.
+        except Exception:  # noqa: BLE001 — fallback: the TTL reaper sweeps next tick
             pass
 
     # Writeback to task_runs — mark failed regardless of whether pids were

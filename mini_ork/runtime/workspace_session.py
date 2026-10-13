@@ -61,6 +61,13 @@ __all__ = [
 _SESSION_REGISTRY: dict[tuple[str, str], "WorkspaceSession"] = {}
 _SESSION_LOCK = threading.Lock()
 
+# A backend whose session must OUTLIVE this process's handle: the run lifecycle
+# (rubric / verify) still runs checks on the node and releases the session at
+# the end of the run, so ``close_run_session(keep_remote=True)`` drops only this
+# handle and keeps the marker for the later processes and ``kill_run``. Listed
+# once here so no teardown branch names a backend (cloud-providers A2).
+_SESSION_OUTLIVES_HANDLE = frozenset({"remote"})
+
 
 def session_marker_path(run_dir: str | os.PathLike[str]) -> Path:
     """Path to the ``.workspace-session.json`` marker for a run.
@@ -133,29 +140,31 @@ def _node_locator(workspace: Workspace) -> dict[str, Any]:
             "token_env": getattr(workspace, "_token_env", "MO_NODE_TOKEN")}
 
 
-def _extract_session_id(workspace: Workspace, backend: str) -> str:
-    """Pull the backend's session id from its private state.
+def _extract_session_id(workspace: Workspace) -> str:
+    """Pull the backend's session id from its own state — no backend-name branch.
 
-    Backends store their runtime id differently (``_cid`` for docker, the
-    microVM name for microvm, ``None`` for local). The registry only needs a
+    A backend that exposes a callable ``session_id()`` is asked for it (the
+    contract cloud-providers A2 adds to ``RemoteWorkspace``); every other
+    backend stores its runtime id in private state (``_cid`` for docker, the
+    microVM name for microvm, ``None`` for local), so we take the first
+    non-empty of ``_cid`` / ``_sid`` / ``_name``. The registry only needs a
     string the marker file + ``kill_run`` reap can match — the docker cid is
-    the load-bearing case (it's what ``docker rm -f`` consumes). Other backends
-    return their ``str(workspace)`` as a stable identifier; absent that, the
-    run id alone is the marker.
+    the load-bearing case (it's what ``docker rm -f`` consumes). ``""`` is
+    fine for a backend with no persistent id (local): the marker still records
+    the backend so reapers can skip it.
     """
-    if backend == "docker":
-        cid = getattr(workspace, "_cid", None)
-        if cid:
-            return str(cid)
-    if backend == "remote":
-        sid = getattr(workspace, "_sid", None)
-        if sid:
-            return str(sid)
-    name = getattr(workspace, "_name", None)
-    if name:
-        return str(name)
-    # LocalWorkspace has no persistent id — empty string is fine, the marker
-    # still records the backend so reapers can skip it.
+    getter = getattr(workspace, "session_id", None)
+    if callable(getter):
+        try:
+            value = str(getter() or "").strip()
+        except Exception:  # noqa: BLE001 — an id is best-effort marker metadata
+            value = ""
+        if value:
+            return value
+    for attr in ("_cid", "_sid", "_name"):
+        value = getattr(workspace, attr, None)
+        if value:
+            return str(value)
     return ""
 
 
@@ -246,7 +255,7 @@ def _register(run_id: str, backend: str, ws: Workspace, env: Mapping[str, str]) 
     session = WorkspaceSession(
         workspace=ws,
         backend=backend,
-        session_id=_extract_session_id(ws, backend),
+        session_id=_extract_session_id(ws),
         run_dir=run_dir,
     )
     try:
@@ -337,7 +346,7 @@ def close_run_session(run_id: str, *, lock_timeout: float | None = None,
         if session.closed:
             continue
         session.closed = True
-        if keep_remote and session.backend == "remote":
+        if keep_remote and session.backend in _SESSION_OUTLIVES_HANDLE:
             # The run lifecycle still needs the node session (rubric/verify run
             # checks there) and releases it at the end: drop only this handle,
             # keep the marker so later processes and kill_run can find it.
