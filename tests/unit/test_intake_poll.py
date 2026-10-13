@@ -424,8 +424,15 @@ def test_the_cli_status_verb_explains_an_idle_setup(home, capsys):
     assert "nothing will start" in out
 
 
-def test_the_cli_status_verb_has_a_json_form(home, capsys):
+def test_the_cli_status_verb_has_a_json_form(home, capsys, monkeypatch, tmp_path):
     import json
+
+    # Pin the config: without this the status read falls through to the repo's
+    # shipped config/pm.yaml, whose disabled linear/jira examples are listed too.
+    # The shape of the JSON is under test here, not which sources the repo ships.
+    pm_yaml = tmp_path / "pm.yaml"
+    pm_yaml.write_text("sources:\n  local:\n    enabled: true\n")
+    monkeypatch.setenv("MINI_ORK_PM", str(pm_yaml))
 
     rc = intake_cmd.main(["status", "--home", str(home), "--json"])
     assert rc == 0
