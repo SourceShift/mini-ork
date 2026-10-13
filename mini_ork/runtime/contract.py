@@ -187,6 +187,32 @@ def _node_interpreter(argv: list[str]) -> list[str]:
     return argv
 
 
+def _check_env_delta(env: Mapping[str, str] | None,
+                     ambient: Mapping[str, str]) -> dict[str, str]:
+    """What a caller ADDED for this check, minus anything secret-named.
+
+    Callers build a check's env as ``{**os.environ, <their keys>}``. Forwarded
+    whole, that sent the control plane's PATH and HOME to the node (the macOS
+    PATH replaced the node's, so the code-fix test verifier found no pytest on
+    a sandbox that had it, Daytona e2e run-1791912327-41843) and every secret
+    the lifecycle exports into the process env (the D6 rule: only lane-scoped
+    secrets reach a node). Only keys the caller set or changed relative to
+    the ambient env cross, and never a secret-named one; the ambient env goes
+    through the isolation allowlist separately.
+    """
+    from mini_ork.remote.secrets_scope import is_secret_name
+
+    out: dict[str, str] = {}
+    for key, value in (env or {}).items():
+        key, value = str(key), str(value)
+        if is_secret_name(key):
+            continue
+        if ambient.get(key) == value or os.environ.get(key) == value:
+            continue
+        out[key] = value
+    return out
+
+
 def _placement_is_remote(env: Mapping[str, str]) -> bool:
     """Checks go remote exactly when the run's agent spawns do: ``MO_PLACEMENT=
     remote``, or the isolation selector (scope=agent + backend=remote). Without
@@ -301,8 +327,16 @@ def run_check(
             # The allowlist governs the AMBIENT env; what the caller hands this
             # check (plan / artifact paths) is meant for it and passes, translated.
             remote_env = isolated_env(env_snapshot, path_map)
-            remote_env.update(path_map.env({str(k): str(v) for k, v in (env or {}).items()}))
-            for key in [k for k in remote_env if k.startswith("MO_NODE_TOKEN")]:
+            remote_env.update(path_map.env(_check_env_delta(env, env_snapshot)))
+            # A check dispatches no lane, so it needs no secret at all. The
+            # isolation allowlist admits every *_API_KEY / provider prefix for
+            # AGENT spawns, which the dispatch layer then narrows to the lane's
+            # own keys (D6); a check skipped that narrowing and sent every LLM
+            # key in the process env to the node with every verifier run.
+            from mini_ork.remote.secrets_scope import is_secret_name
+
+            for key in [k for k in remote_env
+                        if k.startswith("MO_NODE_TOKEN") or is_secret_name(k)]:
                 remote_env.pop(key)
         if isinstance(argv_or_cmd, (list, tuple)):
             import shlex
