@@ -1,0 +1,822 @@
+{
+  "lens": "space-surveyor",
+  "report_source": "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md",
+  "snapshot_date": "2026-10-12",
+  "scope": "Seven external orchestration systems (Temporal, Argo Workflows, Apache Airflow, Prefect/Dagster, Restate, Windmill, Ray) surveyed for features that are genuinely adoptable by mini-ork, with each candidate marked against an existing partial surface in the engine or called out as a gap. The space-surveyor pass for the 20261012-langgraph-parity-survey family; siblings cover lens-D1 (langgraph auditor), lens-D3 (persistence / checkpointers), and lens-D4 (streaming modes).",
+  "citation_convention": "Every feature's claim line carries at least one inline citation — either a relative file:line anchor that resolves in the worktree or the literal 'GAP' for missing surfaces. The citation sits in the `citations` array of each claim (D1 hard rule C4), so a grep on the claim returns a citation.",
+  "yaml_convention": "Every feature ends with an `Adopt?` verdict from the closed enum {partial, extend, adopt, skip} (D1 hard rule F4). The verdict is preserved verbatim in each claim's `miniork_status`.",
+  "claims": [
+    {
+      "feature": "Temporal — durable event history with deterministic replay",
+      "section_ref": "§1.1",
+      "source_system": "temporal",
+      "semantics_summary": "The foundation that makes every other Temporal feature possible: workflows are deterministic replayers driven by an event history. The run_events table written by mini_ork/observability/node_events.py:235 already records node lifecycle rows on the same insert path; mini-ork just does not replay from them — classify_outcome at mini_ork/orchestration/runner_orchestrator.py:216 decides the terminal finish reason off the last row, not the whole history.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#1-temporal",
+        "mini_ork/observability/node_events.py:235",
+        "mini_ork/orchestration/runner_orchestrator.py:216"
+      ],
+      "miniork_status": "extend",
+      "value_chapter_epic": "Closes the durable-execution parity axis — without replay, no continue-as-new, no journaled resume, no signal/update queries worth their name; this single feature gates most of §1's downstream work.",
+      "value_any_task": "Any long-running recipe that crashes mid-run benefits; the journal becomes the foundation for every recovery story the chapter might tell.",
+      "effort": "high",
+      "recommended_phase": "chapter-l_backlog",
+      "proposed_shape": "Extend run_events into a replay source: have classify_outcome read the whole history (not just the last row) and add a replayer path that resumes from a chosen checkpoint row."
+    },
+    {
+      "feature": "Temporal — workflow versioning with PATCHED / getVersion()",
+      "section_ref": "§1.3",
+      "source_system": "temporal",
+      "semantics_summary": "Lets a non-backwards-compatible code change ship without forking in-progress runs. CompiledRetryEdge at mini_ork/recovery/dag.py:41 carries a version field that is consulted when reloading a workflow after recovery, but the consumer side at mini_ork/recovery/dag.py:175 (load_dag) ignores it on re-load.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#1-temporal",
+        "mini_ork/recovery/dag.py:41",
+        "mini_ork/recovery/dag.py:175"
+      ],
+      "miniork_status": "partial",
+      "value_chapter_epic": "Tightens the load path to refuse mismatched versions; small, scoped, and unblocks recipe-version-bump shipping.",
+      "value_any_task": "Every recipe benefits — author migrations become a one-line verification instead of a manual reconciliation.",
+      "effort": "low",
+      "recommended_phase": "chapter-n_backlog",
+      "proposed_shape": "Make load_dag at mini_ork/recovery/dag.py:175 honor the version on CompiledRetryEdge and refuse reload on mismatch."
+    },
+    {
+      "feature": "Temporal — signals, queries, and the update RPC",
+      "section_ref": "§1.4",
+      "source_system": "temporal",
+      "semantics_summary": "External mid-flight intervention without forking the run. The steering guard at mini_ork/orchestration/runner_orchestrator.py:321 (guard_steer) and renderer at mini_ork/orchestration/runner_orchestrator.py:334 (steer_message) are exactly this in miniature, fed by steer_run at mini_ork/web/control.py:550. The surface is the same shape as Temporal updates; the gap is that mini-ork's guard rejects messages that touch routing/termination (guard_steer only returns True for HELP-class messages), so the expressiveness is narrower than Temporal's full update protocol.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#1-temporal",
+        "mini_ork/orchestration/runner_orchestrator.py:321",
+        "mini_ork/orchestration/runner_orchestrator.py:334",
+        "mini_ork/web/control.py:550"
+      ],
+      "miniork_status": "partial",
+      "value_chapter_epic": "Keep the guard semantics; expose a typed-payload variant for richer queries — the steering channel is already mini-ork's update protocol in spirit.",
+      "value_any_task": "Recipes that need mid-flight parameter changes use steer_run today; a typed payload widens the addressable use cases without relaxing the guard.",
+      "effort": "medium",
+      "recommended_phase": "chapter-n_backlog",
+      "proposed_shape": "Add a typed-payload variant to steer_message; document guard_steer as the canonical safety filter."
+    },
+    {
+      "feature": "Temporal — schedules (cron + skip + backfill)",
+      "section_ref": "§1.5",
+      "source_system": "temporal",
+      "semantics_summary": "Cron-like scheduled recipe invocation with skip/backfill semantics. The scheduler module under mini_ork/scheduler.py exists but is outside the orchestration core — there is no bridge from a schedule hit to a recipe kickoff yet.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#1-temporal",
+        "mini_ork/scheduler.py"
+      ],
+      "miniork_status": "extend",
+      "value_chapter_epic": "Real cron-like schedules are the largest piece of the operational tooling the chapter currently lacks.",
+      "value_any_task": "Recipes that want nightly or hourly execution need it; today, recipes are kickoff-driven or ad-hoc CLI.",
+      "effort": "medium",
+      "recommended_phase": "chapter-l_backlog",
+      "proposed_shape": "Wire mini_ork/scheduler.py into the engine entry as a schedule-to-kickoff bridge."
+    },
+    {
+      "feature": "Temporal — continue-as-new bound",
+      "section_ref": "§1.6",
+      "source_system": "temporal",
+      "semantics_summary": "Caps history growth on long-running workflows by checkpointing and starting a fresh history. _post_run_learning at mini_ork/cli/execute.py:1473 performs a write-back at run close that is analogous (a checkpoint-style summary), but mini-ork has no in-run continue-as-new analogue.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#1-temporal",
+        "mini_ork/cli/execute.py:1473"
+      ],
+      "miniork_status": "adopt",
+      "value_chapter_epic": "Long-running recipes need a bound on history growth; this is contingent on the durable-replay story landing first.",
+      "value_any_task": "Any recipe whose run_events table would grow past practical limits benefits.",
+      "effort": "high",
+      "recommended_phase": "chapter-l_backlog",
+      "proposed_shape": "Add an in-run continue-as-new analogue: when run_events grows past a threshold, summarize and start a fresh history row."
+    },
+    {
+      "feature": "Argo Workflows — templated, reusable step definitions",
+      "section_ref": "§2.1",
+      "source_system": "argo_workflows",
+      "semantics_summary": "Lets the same step shape serve many recipes without copy-paste. The DAG model at mini_ork/recovery/dag.py:130 has edges and node IDs but no template indirection — every consumer embeds the concrete node.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#2-argo-workflows",
+        "mini_ork/recovery/dag.py:130"
+      ],
+      "miniork_status": "extend",
+      "value_chapter_epic": "Template indirection closes a long-standing recipe-authoring pain point: shared step shapes without copy-paste.",
+      "value_any_task": "Any recipe family with shared sub-shapes (e.g. verifier tiers, learning writeback) benefits.",
+      "effort": "medium",
+      "recommended_phase": "chapter-n_backlog",
+      "proposed_shape": "Add a template indirection layer to DAG at mini_ork/recovery/dag.py:130 — node IDs that resolve to a named template at compile time."
+    },
+    {
+      "feature": "Argo Workflows — artifact passing between steps with S3-compatible storage",
+      "section_ref": "§2.2",
+      "source_system": "argo_workflows",
+      "semantics_summary": "Large outputs cannot flow through the run_events table. mini_ork/cache.py:145 (emit) already records per-stage artifacts keyed by input_hash, but there is no first-class artifact bus between sibling nodes; consumers reach into the run directory.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#2-argo-workflows",
+        "mini_ork/cache.py:145"
+      ],
+      "miniork_status": "extend",
+      "value_chapter_epic": "A first-class artifact bus between sibling nodes closes the gap where consumers reach into the run directory.",
+      "value_any_task": "Recipes that pass large outputs between sibling stages use the new bus instead of filesystem-level sharing.",
+      "effort": "medium",
+      "recommended_phase": "chapter-n_backlog",
+      "proposed_shape": "Promote the input_hash-keyed emit at mini_ork/cache.py:145 into a sibling-node artifact bus surface."
+    },
+    {
+      "feature": "Argo Workflows — retry with backoff and exit-hook handlers",
+      "section_ref": "§2.3",
+      "source_system": "argo_workflows",
+      "semantics_summary": "The difference between transient retry and definitive failure is the first thing an on-call asks for. CompiledRetryEdge at mini_ork/recovery/dag.py:41 carries retry metadata that _apply_recovery_filter at mini_ork/cli/execute.py:649 honors, but there is no exit-handler node — on permanent failure the run just terminates and the recipe's reflect step learns about it.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#2-argo-workflows",
+        "mini_ork/recovery/dag.py:41",
+        "mini_ork/cli/execute.py:649"
+      ],
+      "miniork_status": "partial",
+      "value_chapter_epic": "Add an exit-handler node that fires on permanent failure; keeps the existing retry surface intact.",
+      "value_any_task": "Recipes that need a cleanup path on terminal failure use the exit handler.",
+      "effort": "low",
+      "recommended_phase": "chapter-n_backlog",
+      "proposed_shape": "Add a node type 'exit_handler' to the WorkflowNode enum; the executor routes to it on permanent failure."
+    },
+    {
+      "feature": "Argo Workflows — suspend / resume with TTL",
+      "section_ref": "§2.4",
+      "source_system": "argo_workflows",
+      "semantics_summary": "Long human-in-the-loop approvals should not hold a worker open. pause_cost_run at mini_ork/web/control.py:46 and resume_cost_run at mini_ork/web/control.py:86 are exactly this for cost-only pauses; the gap is that there is no DAG-level suspend for non-cost waits.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#2-argo-workflows",
+        "mini_ork/web/control.py:46",
+        "mini_ork/web/control.py:86"
+      ],
+      "miniork_status": "extend",
+      "value_chapter_epic": "DAG-level suspend with TTL closes the gap where cost-pause is the only pause primitive.",
+      "value_any_task": "Recipes that wait on human approvals or external systems benefit.",
+      "effort": "medium",
+      "recommended_phase": "chapter-n_backlog",
+      "proposed_shape": "Generalize pause_cost_run at mini_ork/web/control.py:46 into a DAG-level suspend with TTL."
+    },
+    {
+      "feature": "Argo Workflows — workflow-of-workflows (sub-workflows)",
+      "section_ref": "§2.5",
+      "source_system": "argo_workflows",
+      "semantics_summary": "One run spawning another with explicit parent-child linkage. mo_recursive_approve_spawn at mini_ork/orchestration/recursive.py:171 already inserts a run_spawns row linking parent to child with an authority_level gate (see default_authority_level at mini_ork/orchestration/recursive.py:116). This is more conservative than Argo's sub-workflow model because of the authority check, but it is the same shape.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#2-argo-workflows",
+        "mini_ork/orchestration/recursive.py:171",
+        "mini_ork/orchestration/recursive.py:116"
+      ],
+      "miniork_status": "partial",
+      "value_chapter_epic": "The authority gate is a deliberate hardening over Argo's sub-workflow model; preserve it and document why.",
+      "value_any_task": "Recipes that need parent-child composition use mo_recursive_approve_spawn today.",
+      "effort": "low",
+      "recommended_phase": "chapter-n_backlog",
+      "proposed_shape": "Document the authority-gated sub-workflow model as the canonical composition pattern."
+    },
+    {
+      "feature": "Argo Workflows — parameterization at submit time",
+      "section_ref": "§2.6",
+      "source_system": "argo_workflows",
+      "semantics_summary": "Lets the same workflow take different inputs without forking definitions. The ExecuteArgs dataclass at mini_ork/cli/execute.py:548 already parses most knobs from argv, and _parse_execute_argv at mini_ork/cli/execute.py:560 threads them through. The gap is that there is no recipe-level parameter schema — knobs are positional strings.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#2-argo-workflows",
+        "mini_ork/cli/execute.py:548",
+        "mini_ork/cli/execute.py:560"
+      ],
+      "miniork_status": "extend",
+      "value_chapter_epic": "A typed recipe-level parameter schema closes the gap where knobs are positional strings.",
+      "value_any_task": "Recipes that take runtime parameters declare them on a parameter block.",
+      "effort": "medium",
+      "recommended_phase": "chapter-n_backlog",
+      "proposed_shape": "Add a `parameters:` block to workflow.yaml (or task_class.yaml) with a jsonschema-typed schema."
+    },
+    {
+      "feature": "Apache Airflow — XCom-style small-payload inter-task data",
+      "section_ref": "§3.1",
+      "source_system": "apache_airflow",
+      "semantics_summary": "Tiny values (decisions, IDs, short summaries) should not require an artifact round-trip. The run_events table records (key, value)-style payloads — see mo_node_emit at mini_ork/observability/node_events.py:165 — but there is no queryable XCom view; consumers have to scrape run_events rows.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#3-apache-airflow",
+        "mini_ork/observability/node_events.py:165"
+      ],
+      "miniork_status": "partial",
+      "value_chapter_epic": "Surface a queryable XCom view on top of run_events instead of having consumers scrape rows.",
+      "value_any_task": "Recipes that pass small values between stages use the XCom view.",
+      "effort": "low",
+      "recommended_phase": "chapter-n_backlog",
+      "proposed_shape": "Add an XCom view query helper on top of run_events at mini_ork/observability/node_events.py:165."
+    },
+    {
+      "feature": "Apache Airflow — scheduler with backfills and catchup",
+      "section_ref": "§3.2",
+      "source_system": "apache_airflow",
+      "semantics_summary": "mini-ork has no scheduler at all today — runs are CLI- or kickoff-driven. mini_ork/scheduler.py exists as a module but is not wired into the engine entry; _resolve_dispatch_mode at mini_ork/cli/execute.py:317 selects serial / parallel / etc. but not a schedule this DAG at cron mode.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#3-apache-airflow",
+        "mini_ork/scheduler.py",
+        "mini_ork/cli/execute.py:317"
+      ],
+      "miniork_status": "extend",
+      "value_chapter_epic": "Real scheduling is the single largest operational-tooling gap; without it, Temporal's schedule feature and Airflow's scheduler feature are both blocked.",
+      "value_any_task": "Every recipe that wants time-based invocation benefits; today there is no cron path.",
+      "effort": "high",
+      "recommended_phase": "chapter-l_backlog",
+      "proposed_shape": "Wire mini_ork/scheduler.py into the engine entry; add a 'scheduled' dispatch mode to _resolve_dispatch_mode at mini_ork/cli/execute.py:317."
+    },
+    {
+      "feature": "Apache Airflow — connections and variables as first-class config",
+      "section_ref": "§3.3",
+      "source_system": "apache_airflow",
+      "semantics_summary": "Secrets and per-environment overrides should not be YAML literals in recipes. mini_ork/context.py:94 resolves MINI_ORK_DB and home paths, and mini_ork/cli/execute.py reads MINI_ORK_* env vars — the env contract already exists. The gap is the secret-store side: secrets come from the process env, not a vault.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#3-apache-airflow",
+        "mini_ork/context.py:94",
+        "mini_ork/cli/execute.py"
+      ],
+      "miniork_status": "adopt",
+      "value_chapter_epic": "Adopt the vault surface via the two-tier pattern (env now, vault later) — see config/vault.example.yaml.",
+      "value_any_task": "Recipes that need per-environment secrets use the vault tier; the env tier keeps the simple-tier shape.",
+      "effort": "medium",
+      "recommended_phase": "chapter-n_backlog",
+      "proposed_shape": "Land the vault tier described in config/vault.example.yaml; document the two-tier fallback (env → vault)."
+    },
+    {
+      "feature": "Apache Airflow — pools and SLAs",
+      "section_ref": "§3.4",
+      "source_system": "apache_airflow",
+      "semantics_summary": "Bound concurrency per resource; bound total wall-clock per task. _max_parallel at mini_ork/cli/execute.py:398 is mini-ork's whole concurrency story — global, not per-pool. SLAs do not exist.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#3-apache-airflow",
+        "mini_ork/cli/execute.py:398"
+      ],
+      "miniork_status": "extend",
+      "value_chapter_epic": "Per-pool concurrency and SLAs are both missing; one task adds both.",
+      "value_any_task": "Recipes with per-resource concurrency ceilings (e.g., GPU, rate-limited APIs) use pools.",
+      "effort": "medium",
+      "recommended_phase": "chapter-l_backlog",
+      "proposed_shape": "Replace _max_parallel at mini_ork/cli/execute.py:398 with a named-pool map and add a per-task SLA field."
+    },
+    {
+      "feature": "Apache Airflow — task instances with retry + try_number",
+      "section_ref": "§3.5",
+      "source_system": "apache_airflow",
+      "semantics_summary": "The operator needs to know this is attempt 3 of 7 without reading logs. record_hit at mini_ork/cache.py:129 records cache hits keyed by (epic_id, stage, input_hash) — the cache hit count is structurally similar to try_number but is not surfaced to the operator.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#3-apache-airflow",
+        "mini_ork/cache.py:129"
+      ],
+      "miniork_status": "partial",
+      "value_chapter_epic": "Surface cache hits as attempt counts in the run summary — one-line addition.",
+      "value_any_task": "Every recipe that retries benefits from operator-visible attempt counts.",
+      "effort": "low",
+      "recommended_phase": "chapter-n_backlog",
+      "proposed_shape": "Surface record_hit's cache hit count at mini_ork/cache.py:129 in the run_summary."
+    },
+    {
+      "feature": "Apache Airflow — DAG-level start_date / end_date filters",
+      "section_ref": "§3.6",
+      "source_system": "apache_airflow",
+      "semantics_summary": "Lets old DAGs stop accepting new runs. _post_run_learning at mini_ork/cli/execute.py:1473 runs once at close but there is no pre-flight guard against running an expired recipe.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#3-apache-airflow",
+        "mini_ork/cli/execute.py:1473"
+      ],
+      "miniork_status": "adopt",
+      "value_chapter_epic": "A pre-flight guard against running an expired recipe closes the operational gap.",
+      "value_any_task": "Recipes with a sunset date use the guard to refuse new runs.",
+      "effort": "low",
+      "recommended_phase": "chapter-n_backlog",
+      "proposed_shape": "Add an expires_on field to workflow.yaml and a pre-flight check that refuses runs after the expiry."
+    },
+    {
+      "feature": "Prefect/Dagster — asset-keyed runs",
+      "section_ref": "§4.1",
+      "source_system": "prefect",
+      "semantics_summary": "The operator thinks in this dashboard is stale, not the 02:00 DAG missed. cache.lookup at mini_ork/cache.py:107 keys by (epic_id, stage, input_hash) — the epic_id is the closest thing to an asset key in mini-ork today, but it is opaque to the UI; _classification_dag at mini_ork/ide_pages/dags.py:97 does not project it as a graph node.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#4-prefect--dagster-asset-aware-dag-schedulers",
+        "mini_ork/cache.py:107",
+        "mini_ork/ide_pages/dags.py:97"
+      ],
+      "miniork_status": "extend",
+      "value_chapter_epic": "The largest structural parity gap — asset-keyed runs would unlock sensors, asset catalog, and lineage views at once.",
+      "value_any_task": "Recipes that produce a tracked output (dashboard, model artifact) get asset-keyed freshness tracking.",
+      "effort": "high",
+      "recommended_phase": "chapter-l_backlog",
+      "proposed_shape": "Promote epic_id to a first-class asset key; project it as a node in _classification_dag at mini_ork/ide_pages/dags.py:97."
+    },
+    {
+      "feature": "Prefect/Dagster — sensors / triggers that wait on an upstream state",
+      "section_ref": "§4.2",
+      "source_system": "dagster",
+      "semantics_summary": "Lets a run start only when its source data is ready, instead of polling. The steering channel (steer_run at mini_ork/web/control.py:550, guard at mini_ork/orchestration/runner_orchestrator.py:321) can nudge a running node; the gap is that there is no wait-for-state primitive — the run has to keep retrying.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#4-prefect--dagster-asset-aware-dag-schedulers",
+        "mini_ork/web/control.py:550",
+        "mini_ork/orchestration/runner_orchestrator.py:321"
+      ],
+      "miniork_status": "adopt",
+      "value_chapter_epic": "A wait-for-state primitive closes the polling workaround.",
+      "value_any_task": "Recipes that depend on upstream freshness wait cleanly instead of polling.",
+      "effort": "medium",
+      "recommended_phase": "chapter-l_backlog",
+      "proposed_shape": "Add a 'wait_for_state' node type that blocks until a named asset state matches."
+    },
+    {
+      "feature": "Prefect/Dagster — materialized asset catalog",
+      "section_ref": "§4.3",
+      "source_system": "prefect",
+      "semantics_summary": "In Dagster, every run leaves a row in the asset catalog with a partition key. run_summary at mini_ork/cache.py:184 produces a job-level summary string; there is no per-asset catalog table.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#4-prefect--dagster-asset-aware-dag-schedulers",
+        "mini_ork/cache.py:184"
+      ],
+      "miniork_status": "extend",
+      "value_chapter_epic": "A per-asset catalog table is the durable surface behind asset-keyed runs.",
+      "value_any_task": "Recipes that produce tracked assets record catalog rows.",
+      "effort": "medium",
+      "recommended_phase": "chapter-l_backlog",
+      "proposed_shape": "Add a per-asset catalog table that run_summary at mini_ork/cache.py:184 writes into."
+    },
+    {
+      "feature": "Prefect/Dagster — flow-level retries with stateful checkpoints",
+      "section_ref": "§4.5",
+      "source_system": "dagster",
+      "semantics_summary": "Retries should resume from the last successful sub-step, not re-run the whole flow. mini_ork/cache.py:145 (emit) and lookup at mini_ork/cache.py:107 together give a per-stage cache that does this for cacheable stages; non-cacheable stages are still all-or-nothing.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#4-prefect--dagster-asset-aware-dag-schedulers",
+        "mini_ork/cache.py:145",
+        "mini_ork/cache.py:107"
+      ],
+      "miniork_status": "partial",
+      "value_chapter_epic": "Extend the per-stage cache to non-cacheable stages so the resume story covers everything.",
+      "value_any_task": "Recipes with mixed cacheable / non-cacheable stages benefit; retries resume mid-flow instead of restarting.",
+      "effort": "medium",
+      "recommended_phase": "chapter-n_backlog",
+      "proposed_shape": "Generalize the cache.emit / lookup pair at mini_ork/cache.py:107 to cover non-cacheable stages."
+    },
+    {
+      "feature": "Prefect/Dagster — dynamic fan-out at runtime",
+      "section_ref": "§4.6",
+      "source_system": "prefect",
+      "semantics_summary": "The number of subtasks is only known after the first task runs. _run_parallel_batch at mini_ork/cli/execute.py:489 and the mirror at mini_ork/orchestration/runner_orchestrator.py:489 already parallelize a fixed list; the gap is that the list is computed before the batch starts, not during it.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#4-prefect--dagster-asset-aware-dag-schedulers",
+        "mini_ork/cli/execute.py:489",
+        "mini_ork/orchestration/runner_orchestrator.py:489"
+      ],
+      "miniork_status": "extend",
+      "value_chapter_epic": "Dynamic fan-out closes the gap where the task list is fixed at batch start.",
+      "value_any_task": "Recipes whose subtask count depends on first-task results use the dynamic shape.",
+      "effort": "medium",
+      "recommended_phase": "chapter-n_backlog",
+      "proposed_shape": "Allow _run_parallel_batch at mini_ork/cli/execute.py:489 to accept a generator-shaped input list."
+    },
+    {
+      "feature": "Prefect/Dagster — versioned asset lineage",
+      "section_ref": "§4.7",
+      "source_system": "dagster",
+      "semantics_summary": "Know which run produced the row in the dashboard today. run_artifact_edges (see the module docstring at mini_ork/orchestration/recursive.py:18) is inserted by mo_recursive_record_artifact at mini_ork/orchestration/recursive.py:389, but the lineage view is not exposed in mini_ork/ide_pages/dags.py — _classification_dag at mini_ork/ide_pages/dags.py:97 shows the classification graph, not the artifact graph.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#4-prefect--dagster-asset-aware-dag-schedulers",
+        "mini_ork/orchestration/recursive.py:18",
+        "mini_ork/orchestration/recursive.py:389",
+        "mini_ork/ide_pages/dags.py:97"
+      ],
+      "miniork_status": "partial",
+      "value_chapter_epic": "Expose the lineage view in the IDE pages — close the gap where the artifact graph is internal-only.",
+      "value_any_task": "Every recipe that produces artifacts benefits from the visible lineage view.",
+      "effort": "low",
+      "recommended_phase": "chapter-n_backlog",
+      "proposed_shape": "Add a lineage view alongside _classification_dag at mini_ork/ide_pages/dags.py:97."
+    },
+    {
+      "feature": "Restate — durable queue with exactly-once semantics",
+      "section_ref": "§5.1",
+      "source_system": "restate",
+      "semantics_summary": "Lets external callers enqueue work without coordinating with the engine. dispatch_mode (see _resolve_dispatch_mode at mini_ork/cli/execute.py:317) selects serial / parallel for internal parallelism; there is no inbound queue surface at all.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#5-restate",
+        "mini_ork/cli/execute.py:317"
+      ],
+      "miniork_status": "adopt",
+      "value_chapter_epic": "An inbound queue surface is the largest missing entry point for external callers.",
+      "value_any_task": "Recipes that need external enqueue get a queue surface instead of CLI-only invocation.",
+      "effort": "high",
+      "recommended_phase": "chapter-l_backlog",
+      "proposed_shape": "Add an inbound queue surface alongside _resolve_dispatch_mode at mini_ork/cli/execute.py:317."
+    },
+    {
+      "feature": "Restate — idempotency keys with replay-safe handlers",
+      "section_ref": "§5.3",
+      "source_system": "restate",
+      "semantics_summary": "If a caller retries an enqueue, the handler runs once. The input_hash cache keyed by (epic_id, stage, input_hash) at mini_ork/cache.py:107 is structurally an idempotency-key cache for the internal dispatch path; there is no inbound idempotency contract.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#5-restate",
+        "mini_ork/cache.py:107"
+      ],
+      "miniork_status": "extend",
+      "value_chapter_epic": "Generalize input_hash into an idempotency key the UI surfaces — small step, real value.",
+      "value_any_task": "Recipes that need replay-safe handler semantics get them via the existing input_hash path.",
+      "effort": "low",
+      "recommended_phase": "chapter-n_backlog",
+      "proposed_shape": "Surface the input_hash cache key at mini_ork/cache.py:107 as an idempotency key in the run summary."
+    },
+    {
+      "feature": "Restate — journaled execution with deterministic replay",
+      "section_ref": "§5.4",
+      "source_system": "restate",
+      "semantics_summary": "Restart from the journal after a crash. run_events written by mini_ork/observability/node_events.py:235 is the journal; the engine does not currently read it on resume — _apply_recovery_filter at mini_ork/cli/execute.py:649 is the only resume path and it filters nodes, not events.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#5-restate",
+        "mini_ork/observability/node_events.py:235",
+        "mini_ork/cli/execute.py:649"
+      ],
+      "miniork_status": "extend",
+      "value_chapter_epic": "Read run_events on resume instead of just filtering nodes — the journal is the source of truth.",
+      "value_any_task": "Recipes that crash mid-run benefit from journal-driven resume instead of node-filter-driven recovery.",
+      "effort": "medium",
+      "recommended_phase": "chapter-l_backlog",
+      "proposed_shape": "Make _apply_recovery_filter at mini_ork/cli/execute.py:649 consult the run_events journal on resume."
+    },
+    {
+      "feature": "Restate — awakeables (callbacks that wake a suspended workflow)",
+      "section_ref": "§5.5",
+      "source_system": "restate",
+      "semantics_summary": "A workflow can pause waiting for an external system that will call back later. The steering channel (steer_run at mini_ork/web/control.py:550) is exactly this for the operator — the gap is that no automated system can produce a wake-up.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#5-restate",
+        "mini_ork/web/control.py:550"
+      ],
+      "miniork_status": "extend",
+      "value_chapter_epic": "Let automated systems produce wake-ups on the steering channel — same shape, wider source.",
+      "value_any_task": "Recipes that wait on external callbacks get automated wake-ups instead of operator-only.",
+      "effort": "medium",
+      "recommended_phase": "chapter-l_backlog",
+      "proposed_shape": "Allow steer_run at mini_ork/web/control.py:550 to accept a programmatic payload from any caller."
+    },
+    {
+      "feature": "Restate — saga / compensating handlers",
+      "section_ref": "§5.7",
+      "source_system": "restate",
+      "semantics_summary": "Workflows that fan out to many side effects need a way to roll back on partial failure. merge_decisions at mini_ork/orchestration/recursive.py:436 and the run_spawns lifecycle (mo_recursive_approve_spawn at mini_ork/orchestration/recursive.py:171) cover a forward merge; there is no saga-rollback path.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#5-restate",
+        "mini_ork/orchestration/recursive.py:436",
+        "mini_ork/orchestration/recursive.py:171"
+      ],
+      "miniork_status": "adopt",
+      "value_chapter_epic": "A saga-rollback path complements the forward merge — needed for any fan-out to side effects.",
+      "value_any_task": "Recipes that fan out to many side effects roll back on partial failure.",
+      "effort": "high",
+      "recommended_phase": "chapter-l_backlog",
+      "proposed_shape": "Add a saga-rollback node type that walks back a forward merge_decisions sequence at mini_ork/orchestration/recursive.py:436."
+    },
+    {
+      "feature": "Windmill — versioned scripts with explicit input/output schemas",
+      "section_ref": "§6.1",
+      "source_system": "windmill",
+      "semantics_summary": "The UI can render a form from the schema, and the engine can validate at submit. ExecuteArgs at mini_ork/cli/execute.py:548 and the _parse_execute_argv path at mini_ork/cli/execute.py:560 give typed argv parsing, but the schema is hand-rolled and not surfaced to mini_ork/ide_pages/.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#6-windmill",
+        "mini_ork/cli/execute.py:548",
+        "mini_ork/cli/execute.py:560"
+      ],
+      "miniork_status": "extend",
+      "value_chapter_epic": "Surface the argv schema to the UI for non-engineer triggering.",
+      "value_any_task": "Recipes that want a UI form for triggering benefit from surfaced schemas.",
+      "effort": "medium",
+      "recommended_phase": "chapter-n_backlog",
+      "proposed_shape": "Surface ExecuteArgs at mini_ork/cli/execute.py:548 to mini_ork/ide_pages/ for form rendering."
+    },
+    {
+      "feature": "Windmill — flows-as-code with auto-generated UI",
+      "section_ref": "§6.2",
+      "source_system": "windmill",
+      "semantics_summary": "Lets a non-engineer trigger the same flow the engineer wrote. The mini_ork/ide_pages/ builder pattern (see build(home, tab, args) at mini_ork/ide_pages/dags.py:132) gives an HTML view of existing runs; there is no authoring surface in mini_ork/ide_pages/ — the entry point is still the kickoff file.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#6-windmill",
+        "mini_ork/ide_pages/dags.py:132"
+      ],
+      "miniork_status": "adopt",
+      "value_chapter_epic": "An authoring surface in mini_ork/ide_pages/ closes the gap where the kickoff file is the only entry point.",
+      "value_any_task": "Recipes that want a UI authoring path get one instead of YAML-only.",
+      "effort": "high",
+      "recommended_phase": "chapter-l_backlog",
+      "proposed_shape": "Extend the mini_ork/ide_pages/ builder at mini_ork/ide_pages/dags.py:132 with an authoring surface for kickoff files."
+    },
+    {
+      "feature": "Windmill — per-step result cache keyed by script version + inputs",
+      "section_ref": "§6.3",
+      "source_system": "windmill",
+      "semantics_summary": "A re-run with the same script+inputs returns the prior result. lookup at mini_ork/cache.py:107 is exactly this for input_hash, but the cache key does not include the script version.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#6-windmill",
+        "mini_ork/cache.py:107"
+      ],
+      "miniork_status": "partial",
+      "value_chapter_epic": "Extend the cache key with script version so a version bump invalidates the cache.",
+      "value_any_task": "Recipes that iterate on the script benefit from version-aware cache invalidation.",
+      "effort": "low",
+      "recommended_phase": "chapter-n_backlog",
+      "proposed_shape": "Add script_version to the lookup key at mini_ork/cache.py:107."
+    },
+    {
+      "feature": "Windmill — concurrent step runs with global concurrency limits",
+      "section_ref": "§6.4",
+      "source_system": "windmill",
+      "semantics_summary": "Stop accidentally running 200 scrapers in parallel. _max_parallel at mini_ork/cli/execute.py:398 is the whole concurrency story — one global limit, no per-script limit.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#6-windmill",
+        "mini_ork/cli/execute.py:398"
+      ],
+      "miniork_status": "extend",
+      "value_chapter_epic": "Per-script concurrency limits complement the global cap.",
+      "value_any_task": "Recipes that hit rate-limited APIs use per-script caps.",
+      "effort": "medium",
+      "recommended_phase": "chapter-n_backlog",
+      "proposed_shape": "Replace the single _max_parallel at mini_ork/cli/execute.py:398 with a per-script map keyed on script name."
+    },
+    {
+      "feature": "Windmill — suspend/resume with resume tokens",
+      "section_ref": "§6.5",
+      "source_system": "windmill",
+      "semantics_summary": "A long approval should resume from where it paused, not replay the whole flow. pause_cost_run at mini_ork/web/control.py:46 and the mirror resume_cost_run at mini_ork/web/control.py:86 exist for cost pauses; there is no flow-level suspend with a checkpoint.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#6-windmill",
+        "mini_ork/web/control.py:46",
+        "mini_ork/web/control.py:86"
+      ],
+      "miniork_status": "extend",
+      "value_chapter_epic": "Flow-level suspend with a checkpoint token closes the gap where only cost pauses are supported.",
+      "value_any_task": "Recipes that pause for long approvals use the flow-level suspend.",
+      "effort": "medium",
+      "recommended_phase": "chapter-n_backlog",
+      "proposed_shape": "Generalize pause_cost_run at mini_ork/web/control.py:46 into flow-level suspend that emits a resume token."
+    },
+    {
+      "feature": "Windmill — workspace + folder scoping",
+      "section_ref": "§6.6",
+      "source_system": "windmill",
+      "semantics_summary": "A Windmill workspace isolates scripts, schedules, and variables per team. The workspaces module (mini_ork/workspaces.py — see the entries at mini_ork/__init__.py) exists but is not consumed by the recipe runner.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#6-windmill",
+        "mini_ork/workspaces.py",
+        "mini_ork/__init__.py"
+      ],
+      "miniork_status": "partial",
+      "value_chapter_epic": "Wire mini_ork/workspaces.py into the recipe runner so per-team isolation is real.",
+      "value_any_task": "Recipes that want per-team scoping use the workspace module.",
+      "effort": "low",
+      "recommended_phase": "chapter-n_backlog",
+      "proposed_shape": "Consume mini_ork/workspaces.py from the recipe runner entry."
+    },
+    {
+      "feature": "Ray — distributed actor model",
+      "section_ref": "§7.1",
+      "source_system": "ray",
+      "semantics_summary": "Lets a node fan out to many workers without the engine owning the cluster. The remote session path in _provision_remote_session at mini_ork/cli/execute.py:1445 and the node-agent HTTP server at mini_ork/remote/node_agent/app.py (see post_session referenced at mini_ork/remote/node_agent/images.py:406) is a hand-rolled actor surface; there is no Ray-style autoscaler on top.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#7-ray",
+        "mini_ork/cli/execute.py:1445",
+        "mini_ork/remote/node_agent/app.py",
+        "mini_ork/remote/node_agent/images.py:406"
+      ],
+      "miniork_status": "partial",
+      "value_chapter_epic": "The actor surface exists — the autoscaler is the missing piece. Targets Ray as execution substrate rather than re-implementing distributed execution.",
+      "value_any_task": "Recipes that fan out to many workers use the existing actor surface; future autoscaler adoption is a documented gap.",
+      "effort": "medium",
+      "recommended_phase": "deferred",
+      "proposed_shape": "Document the actor surface as the canonical distributed-execution recipe; defer the autoscaler as a future option."
+    },
+    {
+      "feature": "Ray — workflow DAG driver with re-execution on failure",
+      "section_ref": "§7.2",
+      "source_system": "ray",
+      "semantics_summary": "One engine call can drive many @ray.remote calls and recover from any single failure. nodes_from_workflow at mini_ork/orchestration/runner_orchestrator.py:236 reads the same workflow shape, but the recovery path (_apply_recovery_filter at mini_ork/cli/execute.py:649) only filters nodes, not re-executes them.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#7-ray",
+        "mini_ork/orchestration/runner_orchestrator.py:236",
+        "mini_ork/cli/execute.py:649"
+      ],
+      "miniork_status": "extend",
+      "value_chapter_epic": "Extend the recovery path to re-execute failed nodes, not just filter them.",
+      "value_any_task": "Recipes that need single-node re-execution on partial failure use the extended path.",
+      "effort": "medium",
+      "recommended_phase": "chapter-l_backlog",
+      "proposed_shape": "Extend _apply_recovery_filter at mini_ork/cli/execute.py:649 with a re-execution branch for failed nodes."
+    },
+    {
+      "feature": "Ray — pluggable resource requests (CPU/GPU/custom)",
+      "section_ref": "§7.3",
+      "source_system": "ray",
+      "semantics_summary": "Let the recipe ask for 1 GPU without hard-coding. dispatch_mode selects a parallelism shape (_resolve_dispatch_mode at mini_ork/cli/execute.py:317); there is no per-node resource request.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#7-ray",
+        "mini_ork/cli/execute.py:317"
+      ],
+      "miniork_status": "extend",
+      "value_chapter_epic": "Per-node resource requests (CPU/GPU) are the missing ingredient for cross-cutting compute parity.",
+      "value_any_task": "Recipes that need GPU or specific CPU counts declare them on the node.",
+      "effort": "medium",
+      "recommended_phase": "chapter-l_backlog",
+      "proposed_shape": "Add a resources: block to WorkflowNode with cpu / gpu / custom fields."
+    },
+    {
+      "feature": "Ray — object store for inter-actor payloads",
+      "section_ref": "§7.4",
+      "source_system": "ray",
+      "semantics_summary": "Large outputs should not move through a control plane. The input-hash cache at mini_ork/cache.py:107 references payloads by hash but does not store them — there is no object store, only references.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#7-ray",
+        "mini_ork/cache.py:107"
+      ],
+      "miniork_status": "adopt",
+      "value_chapter_epic": "An object store behind the hash-cache reference surface enables a real artifact bus.",
+      "value_any_task": "Recipes that pass large outputs use the object store instead of hash-only references.",
+      "effort": "high",
+      "recommended_phase": "chapter-l_backlog",
+      "proposed_shape": "Add an object store module that backs the input-hash reference at mini_ork/cache.py:107."
+    },
+    {
+      "feature": "Ray — autoscaling based on backlog",
+      "section_ref": "§7.5",
+      "source_system": "ray",
+      "semantics_summary": "The cluster grows when work queues up. _max_parallel at mini_ork/cli/execute.py:398 is a static cap; _run_parallel_batch at mini_ork/cli/execute.py:489 does not observe backlog.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#7-ray",
+        "mini_ork/cli/execute.py:398",
+        "mini_ork/cli/execute.py:489"
+      ],
+      "miniork_status": "adopt",
+      "value_chapter_epic": "Backlog-aware autoscaling closes the static-cap gap.",
+      "value_any_task": "Recipes with variable load use backlog-aware scaling.",
+      "effort": "high",
+      "recommended_phase": "chapter-l_backlog",
+      "proposed_shape": "Add a backlog observer to _run_parallel_batch at mini_ork/cli/execute.py:489 that grows the cap when work queues."
+    },
+    {
+      "feature": "Ray — task-level metrics (counters, histograms)",
+      "section_ref": "§7.6",
+      "source_system": "ray",
+      "semantics_summary": "The operator sees per-step latency, not aggregate run latency. finish_reason_for_failure at mini_ork/orchestration/runner_orchestrator.py:107 is the only per-step telemetry exposed in the runner; there are no histograms.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md#7-ray",
+        "mini_ork/orchestration/runner_orchestrator.py:107"
+      ],
+      "miniork_status": "adopt",
+      "value_chapter_epic": "Counters + histograms are the missing telemetry shape the runner already emits.",
+      "value_any_task": "Recipes that want per-step latency visibility get the new metrics.",
+      "effort": "medium",
+      "recommended_phase": "chapter-l_backlog",
+      "proposed_shape": "Emit counters + histograms from finish_reason_for_failure at mini_ork/orchestration/runner_orchestrator.py:107."
+    }
+  ],
+  "top_10_backlog": [
+    {
+      "rank": 1,
+      "title": "Real scheduler: wire mini_ork/scheduler.py into the engine entry as a schedule-to-kickoff bridge",
+      "rationale": "Airflow §3.2 + Temporal §1.5 both hinge on the same missing scheduler; the largest single operational-tooling gap in the chapter.",
+      "claims": ["§3.2", "§1.5"],
+      "recommended_phase": "chapter-l_backlog"
+    },
+    {
+      "rank": 2,
+      "title": "Asset-keyed runs + sensors + asset catalog: promote epic_id to a first-class asset key",
+      "rationale": "Prefect/Dagster §1 + §2 + §3 form the asset-keyed parity triangle; resolving it unlocks sensors, catalog, and lineage at once.",
+      "claims": ["§4.1", "§4.2", "§4.3"],
+      "recommended_phase": "chapter-l_backlog"
+    },
+    {
+      "rank": 3,
+      "title": "Durable replay from run_events: have classify_outcome read the whole history",
+      "rationale": "Temporal §1 + Restate §4 share the journaled-execution parity axis; without it no continue-as-new, no journaled resume.",
+      "claims": ["§1.1", "§5.4"],
+      "recommended_phase": "chapter-l_backlog"
+    },
+    {
+      "rank": 4,
+      "title": "Inbound queue surface: external enqueue for engineers without coordinate rules",
+      "rationale": "Restate §1 is the cleanest queue gap; without it mini-ork has no inbound entry point for external callers.",
+      "claims": ["§5.1"],
+      "recommended_phase": "chapter-l_backlog"
+    },
+    {
+      "rank": 5,
+      "title": "Vault tier: env-now / vault-later two-tier pattern for secrets",
+      "rationale": "Airflow §3 demands secrets out of YAML; the two-tier pattern preserves the simple tier while closing the secret gap.",
+      "claims": ["§3.3"],
+      "recommended_phase": "chapter-n_backlog"
+    },
+    {
+      "rank": 6,
+      "title": "Saga rollback path: complement the forward merge_decisions with a backward walker",
+      "rationale": "Restate §7 closes the partial-failure rollback gap; needed for any fan-out to side effects.",
+      "claims": ["§5.7"],
+      "recommended_phase": "chapter-l_backlog"
+    },
+    {
+      "rank": 7,
+      "title": "Per-pool concurrency + SLAs: replace _max_parallel with a named-pool map and per-task SLAs",
+      "rationale": "Airflow §4 closes the global-cap gap; one task adds both per-pool caps and per-task SLAs.",
+      "claims": ["§3.4"],
+      "recommended_phase": "chapter-l_backlog"
+    },
+    {
+      "rank": 8,
+      "title": "Resume-token flow-level suspend: generalize pause_cost_run to a checkpointed suspend",
+      "rationale": "Argo §4 + Windmill §5 share the suspend-with-token gap; one generalization closes both.",
+      "claims": ["§2.4", "§6.5"],
+      "recommended_phase": "chapter-n_backlog"
+    },
+    {
+      "rank": 9,
+      "title": "Dynamic fan-out + object store: feed real subtask lists and back-do hits",
+      "rationale": "Prefect/Dagster §6 + Ray §4 share the dynamic shape; the object store backs it for large outputs.",
+      "claims": ["§4.6", "§7.4"],
+      "recommended_phase": "chapter-l_backlog"
+    },
+    {
+      "rank": 10,
+      "title": "Telemetry + IDE lineage: surface task-level metrics + run_artifact_edges in the IDE pages",
+      "rationale": "Ray §6 + Prefect/Dagster §7 share the visibility story; counters/histograms on the runner, lineage view on the IDE pages.",
+      "claims": ["§7.6", "§4.7"],
+      "recommended_phase": "chapter-l_backlog"
+    }
+  ],
+  "chapter_epic_remaining_blockers": [
+    {
+      "id": "B1",
+      "title": "Operational tooling — scheduler + per-pool concurrency + SLAs",
+      "detail": "mini_ork has no real scheduler, no per-pool concurrency, and no per-task SLAs. Airflow §3.2 + §3.4 and Temporal §1.5 are all blocked on this; the chapter epic owns wiring mini_ork/scheduler.py + replacing _max_parallel with a named-pool map + adding a per-task SLA field."
+    },
+    {
+      "id": "B2",
+      "title": "Asset-keyed parity — asset-keyed runs + sensors + catalog + lineage",
+      "detail": "The largest structural parity gap. Prefect/Dagster §4.1 + §4.2 + §4.3 + §4.7 form a coupled decision; the chapter epic owns promoting epic_id to a first-class asset key and surfacing the lineage view in mini_ork/ide_pages/dags.py."
+    },
+    {
+      "id": "B3",
+      "title": "Durable execution — journal-driven replay + continue-as-new",
+      "detail": "Temporal §1.1 + §1.6 + Restate §5.4 share the journaled-execution parity axis; the chapter epic owns reading run_events on resume and adding an in-run continue-as-new analogue."
+    },
+    {
+      "id": "B4",
+      "title": "Inbound surfaces — queue + object store + awakeables",
+      "detail": "mini-ork has no inbound queue, no object store, and no automated wake-ups. Restate §5.1 + §5.5 + Ray §7.4 are coupled; the chapter epic owns shipping the queue surface + the object store behind input_hash + generalizing steer_run to programmatic payloads."
+    },
+    {
+      "id": "B5",
+      "title": "Saga / compensating handlers — rollback path for fan-out to side effects",
+      "detail": "merge_decisions at mini_ork/orchestration/recursive.py:436 covers forward merge, no saga rollback. Restate §5.7 is the concrete gap; the chapter epic owns adding a saga-rollback node type."
+    },
+    {
+      "id": "B6",
+      "title": "Secrets — vault tier with env-tier fallback",
+      "detail": "Secrets come from the process env today; Airflow §3.3 demands a vault tier. The chapter epic owns shipping config/vault.example.yaml with the env-tier fallback so the simple tier stays simple."
+    },
+    {
+      "id": "B7",
+      "title": "UI authoring — flows-as-code with auto-generated UI",
+      "detail": "The kickoff file is the only entry point today; Windmill §6.2 demands a UI authoring surface. The chapter epic owns extending mini_ork/ide_pages/dags.py:132 with a kickoff-authoring surface."
+    },
+    {
+      "id": "B8",
+      "title": "Resume tokens — checkpoint-token suspend that survives long approvals",
+      "detail": "pause_cost_run at mini_ork/web/control.py:46 is cost-only. Argo §2.4 + Windmill §6.5 share the suspend-with-token gap; the chapter epic owns generalizing to flow-level suspend with a checkpoint token."
+    },
+    {
+      "id": "B9",
+      "title": "Citation convention C4 propagation",
+      "detail": "D1 hard rule C4 requires every feature's claim line to carry at least one inline citation; the sidecar preserves this invariant via the `citations` field, but downstream sibling lenses (D1 / D3 / D4) and any chapter synthesis must propagate the same invariant."
+    }
+  ],
+  "sidecar_metadata": {
+    "d1_report": "docs/research/20261012-langgraph-parity-survey/report-space-surveyor.md",
+    "sibling_lenses": {
+      "D1": "langgraph auditor",
+      "D3": "persistence / checkpointers",
+      "D4": "streaming modes"
+    },
+    "surveyed_systems": [
+      "temporal",
+      "argo_workflows",
+      "apache_airflow",
+      "prefect",
+      "dagster",
+      "restate",
+      "windmill",
+      "ray"
+    ],
+    "claim_count": 40,
+    "min_required_claims": 12,
+    "distinct_source_systems": 8,
+    "min_required_distinct_source_systems": 6,
+    "hard_rules_preserved": [
+      "C4 (every claim line has a citation) — preserved by the `citations` field on every claim",
+      "F4 (every concept either has an Adopt? verdict) — preserved by `miniork_status` on every claim",
+      "F1 (breadth-defensible baseline) — preserved; this sidecar lists 40 features across 7 surveyed systems per D1's coverage map",
+      "F5/Q2 (no invented requirements beyond the D1 report) — every claim's `proposed_shape` is the D1-prescribed analog"
+    ]
+  }
+}
