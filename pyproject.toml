@@ -40,6 +40,13 @@ runtime = ["verifiers>=0.2.0,<0.3"]
 # optional add. The bring-your-own-evaluator seam (backends.py) imports without
 # it; only the framework-composing adapters require it. Attribution: THIRD_PARTY.md
 optimize = ["gepa>=0.1.4,<0.2"]
+# Document preview extraction (mini_ork/documents/). The default tier is the
+# host rasteriser (macOS qlmanage/sips, pdftoppm from poppler) and needs no
+# Python dependency at all; this extra is the *predictable* tier for a host
+# without one. It is optional by design: when it is absent the PDF extractor
+# fails closed with a message naming what to install, rather than degrading to
+# a blank preview. Required deps stay PyYAML + jsonschema.
+documents = ["pymupdf>=1.24,<2"]
 web = ["fastapi>=0.110", "uvicorn[standard]>=0.29"]
 # ACP (Agent Client Protocol) stdio agent — `mini-ork acp`. Bounded to the
 # 0.12 line because the ACP wire schema shifts between minor releases.
