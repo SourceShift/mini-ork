@@ -13,6 +13,7 @@
 # Output: JSON to stdout. Exit code is always 0; caller reads .pass.
 
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -22,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tomllib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # mini-ork's verifiers are standalone scripts. The executor exports PYTHONPATH
@@ -329,6 +331,71 @@ def _python_compile_clean():
 
 
 _check("python-compile-clean", "changed Python files compile", _python_compile_clean)
+
+
+def _has_ruff_lint_table(pyproject_path):
+    """True iff the patched copy's pyproject.toml has a [tool.ruff.lint] table.
+
+    The patched copy's repo decides what 'blocking tier' means; an unrelated
+    pyproject (no lint table) has no project-specific blocking tier, so the
+    check skips rather than inventing one. Reading pyproject.toml: the file is
+    optional and may be unrelated to ruff; tomllib raises on broken TOML, which
+    we treat as 'no table' so a malformed file never masquerades as a
+    configured project."""
+    try:
+        with open(pyproject_path, "rb") as f:
+            data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+    ruff = data.get("tool", {}).get("ruff")
+    if not isinstance(ruff, dict):
+        return False
+    return isinstance(ruff.get("lint"), dict)
+
+
+def _resolve_ruff():
+    """Return argv to invoke ruff, or None if ruff is not available.
+
+    Resolution order: a ``ruff`` binary on PATH, else ``python -m ruff`` if the
+    ``ruff`` module is importable. The importability probe uses ``find_spec`` so
+    ruff is never actually imported into the verifier process — an import would
+    leak state across invocations and can raise on broken installs."""
+    binary = shutil.which("ruff")
+    if binary:
+        return [binary]
+    if importlib.util.find_spec("ruff") is not None:
+        return [sys.executable, "-m", "ruff"]
+    return None
+
+
+def _python_lint_blocking_tier():
+    py_files = [f for f in _changed_file_lines() if f.endswith(".py")]
+    if not py_files:
+        _ev.write("skip: no Python files changed\n")
+        _ev.flush()
+        return True
+    if not _has_ruff_lint_table(os.path.join(WORKTREE, "pyproject.toml")):
+        _ev.write("skip: pyproject.toml has no [tool.ruff.lint] table\n")
+        _ev.flush()
+        return True
+    argv = _resolve_ruff()
+    if argv is None:
+        _ev.write(
+            'ruff not found — install it the way CI does: pip install "ruff>=0.6"\n')
+        _ev.flush()
+        return False
+    # Only lint files that exist in the patched copy; deleted files are skipped
+    # so a deletion can't reintroduce findings the diff doesn't add.
+    targets = [os.path.join(WORKTREE, f) for f in py_files
+               if os.path.isfile(os.path.join(WORKTREE, f))]
+    if not targets:
+        return True
+    return _run([*argv, "check", *targets], cwd=WORKTREE)
+
+
+_check("python-lint-blocking-tier",
+       "ruff blocking-tier lint passes over changed Python files",
+       _python_lint_blocking_tier)
 
 
 def _typescript_typecheck():
