@@ -35,7 +35,10 @@ provider_options:
 # resources: { cpus: 2, memory: 4g, disk: 10g }
 
 # Runs once per sandbox, after the node-agent dependencies and before it starts.
-setup: ""
+# Install what your checks need: the code-fix test verifier runs inside the
+# sandbox, and without a runner it skips (the run cannot prove it executes).
+setup: |
+  python3 -m pip install --quiet --disable-pip-version-check pytest
 
 env:
   PYTHONUNBUFFERED: "1"

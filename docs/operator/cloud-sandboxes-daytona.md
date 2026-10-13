@@ -6,10 +6,11 @@ the agents' work there, brings their edits back into your local checkout, and
 deletes the sandbox when the run ends. You don't need a VM, Docker, or an open
 port on your machine.
 
-> **Status (2026-10-13):** the provider and `scripts/smoke_daytona_node.py`
-> are shipped and verified live. Step 4 (`--placement remote --env daytona`)
-> needs the RemoteWorkspace provider seam
-> (`kickoffs/cloud-providers-b-provider-seam.md`), which is in flight.
+> **Status (2026-10-13): verified end to end.** `mini-ork run code-fix <kickoff>
+> --placement remote --env daytona` ran the planner, implementer, typecheck, pytest
+> (base-vs-candidate replay and mutation adequacy) and reviewer in a Daytona sandbox,
+> published the fix as a commit in the local checkout, and deleted the sandbox
+> (run-1791915762-20011). `scripts/smoke_daytona_node.py` passes 7/7.
 
 The design is in
 [`docs/architecture/cloud-sandbox-providers.md`](../architecture/cloud-sandbox-providers.md).
@@ -97,6 +98,22 @@ dashboard.
 | `node bootstrap exited 3 … deps missing` | `bootstrap: false` on an image without the node-agent deps. Enable bootstrap or bake them in |
 | `node-agent … not healthy after 180s; log tail: …` | the log tail is the node-agent's own output. Debug with `MO_DAYTONA_KEEP_FAILED=1` to keep the sandbox |
 | `network: allowlist needs allow_domains` | an empty allowlist would block the LLM APIs; list them |
+
+## Lanes and test tooling on a remote node
+
+- **Lanes must authenticate without your laptop's login.** `anthropic-compat`
+  lanes (glm, deepseek_flash, …) carry their own token and work as-is. An
+  `anthropic-native` lane (opus, sonnet) uses your local Claude login, which
+  cannot travel: put `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) or
+  `ANTHROPIC_API_KEY` in the secret store and list it under `secrets:`, or keep
+  that role local with `MO_PLACEMENT_LOCAL_ROLES`. Without one, the remote
+  dispatch is refused up front with that message, and the fallback chain moves on.
+- **Install the project's test tooling in `setup:`.** Checks run inside the
+  sandbox. If the image lacks the runner (the default snapshot has no `pytest`),
+  the test verifier skips and the run's `executes` level stays unproven, which
+  withholds the publish.
+- `nodes doctor --env daytona --recipe <recipe>` makes a ~20-token call through
+  every lane the recipe uses, from inside a real sandbox, before you spend a run.
 
 ## Environment knobs
 

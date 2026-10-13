@@ -238,6 +238,27 @@ to put it, never an empty string sent to the API.
 | **B**: provider seam | `RemoteWorkspace` resolves its node through a provider (lazy in `up()`, attach-only in teardown), `_request` sends `NodeEndpoint.headers`, `static` provider = today's `select_node`, profile `provider:` field + schema, run-end and `kill_run` call `release_run_node`, `sandbox-gc` sweeps providers | framework-edit |
 | **C**: Daytona provider | `mini_ork/remote/providers/daytona.py`, the `daytona` extra, an example profile, a live e2e smoke | direct (needs live credentials) |
 
+All four shipped on 2026-10-13: contract `bfa9bf7f`, C `8ac86ae9`, A2
+`f0f9346f`, A1 `cc01439a`, B `b485f1d0`.
+
+### What the live end-to-end run found
+
+Remote placement had only ever run end to end against docker-runtime nodes. A
+Daytona node runs the node-agent on the **host** runtime, and a real
+`code-fix` run surfaced eight engine gaps. Each is fixed at the source with a
+test:
+
+| Gap | Fix |
+|---|---|
+| Run roots were pinned only at the implementer, so every remote planner was refused (no path map) | roots pinned right after the profile (`d774d0b6`) |
+| Profile `setup` was sent to docker image preparation: HTTP 500 on a host-runtime node | `NodeEndpoint.setup_applied`; the provider runs setup at boot (`cbc5d8fe`) |
+| The host runtime mapped canonical → real paths only on the way in, so agents reported `/home/…/runs/<id>/target/…` | output mapped real → canonical (`f6d8f42f`) |
+| An anthropic-native lane was spawned without a portable credential, misattributed to the requesting alias, and fused a healthy lane shut | refused before the spawn, as a `config` error |
+| Remote checks forwarded the control plane's whole env: your `PATH`/`HOME`, plus every LLM key (breaks D6) | only the caller's delta crosses, and no secret at all |
+| A recover of a remote run re-provisioned a node and never released it | recover releases at its end (`bb66260f`) |
+| The provider's `pip --user` bootstrap shadowed the system site and broke pytest | node-agent deps go into a system-site venv (`a602d58e`) |
+| The live sidecar split stream-json lines, and the replay never mapped sandbox paths, so a verified run abstained from publishing | `_LineTee` + `PathMap.to_host` (`88a3f99e`) |
+
 ## Live probe (2026-10-13, SDK 0.224.0, app.daytona.io)
 
 | Check | Result |
