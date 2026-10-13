@@ -41,6 +41,8 @@ a row.
 - ``agents`` ``rows`` of agent dicts (see :func:`agent_row`)
 - ``composer`` ``placeholder`` + ``cli`` — the IDE appends the typed text
 - ``columns`` ``cols`` of column dicts (see :func:`column`)
+- ``document`` ``kind`` (``grid``/``text``/``pages``) + the kind's own keys (see
+  :func:`document`)
 
 Colours are names, never hex: ``text body muted sub dim blue green red yellow
 purple cyan orange`` or a lane family ``fam:<lane>`` (``fam:sonnet``). The IDE
@@ -65,6 +67,7 @@ Any action may carry ``"confirm": "<question>"``.
 """
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Callable, Iterable
 from typing import Any
@@ -579,6 +582,136 @@ def column(title: str, cards: Iterable[Any], *, c: str = "sub") -> dict[str, Any
 def columns(title: str, cols: Iterable[Any], **opt: Any) -> dict[str, Any]:
     """Side-by-side columns; entries come from :func:`column`."""
     return _section("columns", title, {"cols": list(cols)}, **opt)
+
+
+# ── document ───────────────────────────────────────────────────────────────
+
+def _json_cell(v: Any) -> Any:
+    """One grid cell as a JSON primitive: ``str``/``int``/``bool``/``None`` kept.
+
+    Every other type — ``datetime``, ``Decimal``, ``bytes``, an object, and a
+    non-finite float — is stringified. ``json.dumps`` would write ``inf``/``nan``
+    as the bare ``Infinity``/``NaN`` literals, which a strict parser (Python's own
+    ``allow_nan=False``, ``serde_json`` in the renderer) rejects, so they cannot
+    ride through as floats.
+    """
+    if v is None or isinstance(v, (str, int, bool)):
+        return v
+    if isinstance(v, float):
+        return v if math.isfinite(v) else str(v)
+    return str(v)
+
+
+def _write_page_png(src: str, page: Any, image: bytes, directory: str) -> str:
+    """Write one page's PNG beside the attachment; return its absolute path.
+
+    The name is ``<basename(src)>.page-<N>.png`` — the *full* basename, so a
+    ``paper.pdf`` and a ``paper.PDF`` never collide on one sidecar. Identical
+    bytes are left in place (a page rebuild must not churn the mtime); otherwise
+    the PNG is written through a ``.tmp`` and ``os.replace``d, so a reader never
+    sees a half-written file. The name is a bare basename plus a fixed suffix, so
+    the target can never leave ``directory``.
+    """
+    name = f"{os.path.basename(src) or 'attachment'}.page-{int(page)}.png"
+    target = os.path.join(directory, name)
+    if os.path.dirname(target) != directory:  # the join cannot escape; fail loud if it does
+        raise ValueError(f"page image path escaped its directory: {target!r}")
+    raw = bytes(image)
+    try:
+        with open(target, "rb") as fh:
+            if fh.read() == raw:
+                return target
+    except FileNotFoundError:
+        pass
+    tmp = f"{target}.tmp"
+    with open(tmp, "wb") as fh:
+        fh.write(raw)
+    os.replace(tmp, target)
+    return target
+
+
+def document(title: str, preview: Any, *, out_dir: str | None = None, **opt: Any) -> dict[str, Any]:
+    """A preview of an attached document, from :func:`mini_ork.documents.extract`.
+
+    ``preview`` is one of the ``extract()`` preview models. The section's ``kind``
+    comes from the model's **class**, never from ``preview.kind`` (a
+    :class:`~mini_ork.documents.models.RasterisedPreview` carries
+    ``kind="rasterised"`` but this section is ``"pages"``). Per kind — this list
+    is the renderer's contract, and ``path`` is absolute in every arm:
+
+    - ``GridPreview`` → ``kind: "grid"``: ``columns`` (``list[str]``), ``rows``
+      (``list[list[str|int|float|bool|null]]`` — every cell coerced to a JSON
+      primitive, non-finite floats included, so the payload survives a strict
+      parser), ``total_rows``, ``total_columns``, ``truncated`` and, only when the
+      source names one, ``sheet``. The rows are emitted exactly as the preview
+      holds them and are never trimmed again: the showing-N-of-M facts are
+      ``len(rows)`` of ``total_rows``, with ``truncated`` the explicit signal.
+    - ``TextPreview`` → ``kind: "text"``: ``text`` and ``blocks`` — the document's
+      own paragraph/bullet lines, order and boundaries preserved.
+    - ``RasterisedPreview`` → ``kind: "pages"``: ``rasteriser`` (the tool that
+      rendered them) and ``pages``, a list of records, each a mapping of
+      ``"page"`` (1-based), ``"png"`` (absolute path), ``"width"`` and
+      ``"height"``. ``RasterPage.image`` is raw ``bytes`` and the
+      extractors' temporary PNGs are gone by the time this runs, so each page image
+      is written to ``<dir>/<name>.page-<N>.png`` beside the attachment (``<name>``
+      the full basename of ``path``) and only its path is emitted — **never** bytes
+      or base64. The write is idempotent and can never escape the directory it
+      writes to. ``width``/``height`` are ``null`` unless the rasteriser reported
+      them (the host thumbnail tools render page 1 only and give no size, so a
+      ``pages`` section may hold a single page).
+
+    ``out_dir`` overrides where the page PNGs are written (default: the
+    attachment's own directory); every emitted ``png`` is absolute either way.
+
+    Nothing here uploads anything: on both the simple and the secure tier an
+    attachment is a local file under the home, and this section carries paths to it,
+    not its bytes. Any other ``preview`` type raises ``TypeError`` rather than
+    emitting an empty section.
+
+    The builder is deliberately **not** gated on :func:`ide_level` — the caller
+    decides when to emit it, and an older IDE shows its generic placeholder.
+    """
+    from mini_ork.documents.models import GridPreview, RasterisedPreview, TextPreview
+
+    if not isinstance(preview, (GridPreview, TextPreview, RasterisedPreview)):
+        raise TypeError(
+            "S.document() needs a mini_ork.documents preview model, "
+            f"got {type(preview).__name__}")
+    src = os.path.abspath(os.fspath(preview.path))
+
+    if isinstance(preview, GridPreview):
+        data: dict[str, Any] = {
+            "kind": "grid",
+            "path": src,
+            "columns": [str(c) for c in preview.columns],
+            "rows": [[_json_cell(c) for c in row] for row in preview.rows],
+            "total_rows": int(preview.total_rows),
+            "total_columns": int(preview.total_columns),
+            "truncated": bool(preview.truncated),
+        }
+        if preview.sheet:
+            data["sheet"] = str(preview.sheet)
+    elif isinstance(preview, TextPreview):
+        data = {
+            "kind": "text",
+            "path": src,
+            "text": preview.text or "",
+            "blocks": [str(b) for b in preview.blocks],
+        }
+    else:
+        directory = os.path.abspath(out_dir) if out_dir else os.path.dirname(src)
+        os.makedirs(directory, exist_ok=True)
+        data = {
+            "kind": "pages",
+            "path": src,
+            "rasteriser": str(preview.rasteriser),
+            "pages": [
+                {"page": int(pg.page), "png": _write_page_png(src, pg.page, pg.image, directory),
+                 "width": pg.width, "height": pg.height}
+                for pg in preview.pages
+            ],
+        }
+    return _section("document", title, data, **opt)
 
 
 # ── page ───────────────────────────────────────────────────────────────────

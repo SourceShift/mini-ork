@@ -17,6 +17,8 @@ start work that the terminal does not already have.
 """
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -112,14 +114,108 @@ def _runs(thread: Any, db: str) -> dict[str, Any]:
     )
 
 
-def _transcript(thread: Any, db: str) -> dict[str, Any]:
+def _attachment_sections(path: str) -> list[dict[str, Any]]:
+    """The section one stored attachment contributes to the transcript.
+
+    A previewable file becomes a :func:`~mini_ork.ide_pages.spec.document`
+    section built from :func:`mini_ork.documents.extract`. The failures the
+    extractor raises are rendered rather than swallowed, so a file whose
+    contents the page cannot draw still shows *why*: an unsupported suffix is
+    the quiet case (one muted line carrying the path), while a file that claims
+    a supported format but cannot be read is a warning, because that is a
+    surprise worth colouring. Never an empty section.
+    """
+    from mini_ork.documents import (
+        DocumentExtractionError,
+        UnsupportedFormatError,
+        extract,
+    )
+
+    name = Path(path).name or path
+    cached = _cached_section(path)
+    if cached is not None:
+        return [cached]
+    try:
+        preview = extract(path)
+        section = S.document(name, preview, full=True)
+    except UnsupportedFormatError:
+        return [S.lst(name, [S.dot(path, "no preview for this format")], full=True)]
+    except DocumentExtractionError as error:
+        return [S.lst(name, [S.warn(name, str(error))], full=True)]
+    except Exception as error:  # noqa: BLE001 — one bad file must not blank the thread
+        return [S.lst(name, [S.warn(name, f"{type(error).__name__}: {error}")], full=True)]
+    _store_section(path, section)
+    return [section]
+
+
+# The page is rebuilt in a fresh process as often as every two seconds while it
+# is open, so extraction — a rasteriser process per PDF, pandas per workbook —
+# would rerun on every refresh. The built section is kept beside the attachment
+# and reused while the file's mtime and size are unchanged.
+_CACHE_SUFFIX = ".preview.json"
+
+
+def _fingerprint(path: str) -> list[int] | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return [st.st_mtime_ns, st.st_size]
+
+
+def _cached_section(path: str) -> dict[str, Any] | None:
+    stamp = _fingerprint(path)
+    if stamp is None:
+        return None
+    try:
+        with open(path + _CACHE_SUFFIX, encoding="utf-8") as fh:
+            cached = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(cached, dict) or cached.get("source") != stamp:
+        return None
+    section = cached.get("section")
+    if not isinstance(section, dict):
+        return None
+    # A pages preview points at sidecar PNGs; if one was removed, rebuild.
+    for page in section.get("pages") or ():
+        if not os.path.isfile(str(page.get("png") or "")):
+            return None
+    return section
+
+
+def _store_section(path: str, section: dict[str, Any]) -> None:
+    """Best effort: a cache that cannot be written only costs the next refresh."""
+    stamp = _fingerprint(path)
+    if stamp is None:
+        return
+    target = path + _CACHE_SUFFIX
+    try:
+        tmp = f"{target}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"source": stamp, "section": section}, fh)
+        os.replace(tmp, target)
+    except OSError:
+        pass
+
+
+def _transcript(thread: Any, db: str) -> list[dict[str, Any]]:
     from mini_ork.threads import store
+    from mini_ork.threads.model import MessageRole
 
     messages = store.messages(thread.id, limit=_MESSAGE_LIMIT, db=db)
     if not messages:
-        return S.callout("Transcript", "This thread has no messages yet.", tone="sub")
+        return [S.callout("Transcript", "This thread has no messages yet.", tone="sub")]
+
     lines: list[str] = []
+    attachments: list[str] = []
     for message in messages:
+        if message.role == MessageRole.FILE:
+            # A file turn has no prose of its own: its content is the stored
+            # path, which renders as its own document section below rather than
+            # as a markdown bullet.
+            attachments.extend(message.attachments)
+            continue
         who = _ROLE_LABEL.get(str(message.role), str(message.role))
         lines.append(f"### {who} · turn {message.turn}")
         lines.append("")
@@ -129,7 +225,21 @@ def _transcript(thread: Any, db: str) -> dict[str, Any]:
             lines.append(f"- attachment: `{path}`")
         if message.attachments:
             lines.append("")
-    return S.markdown("Transcript", "\n".join(lines).rstrip() + "\n", full=True)
+
+    sections: list[dict[str, Any]] = []
+    if lines:
+        sections.append(
+            S.markdown("Transcript", "\n".join(lines).rstrip() + "\n", full=True)
+        )
+    else:
+        # Only file turns: say so in the transcript's place rather than draw an
+        # empty body, and still show the documents below.
+        sections.append(
+            S.callout("Transcript", "This thread's turns carry files but no text.", tone="sub")
+        )
+    for path in attachments:
+        sections.extend(_attachment_sections(path))
+    return sections
 
 
 def _one(home: Path, thread_id: str) -> list[dict[str, Any]]:
@@ -161,7 +271,7 @@ def _one(home: Path, thread_id: str) -> list[dict[str, Any]]:
             full=True,
         ),
         _runs(thread, db),
-        _transcript(thread, db),
+        *_transcript(thread, db),
         S.composer(
             "Continue this thread…",
             ["threads", "send", thread.id, "--text"],
