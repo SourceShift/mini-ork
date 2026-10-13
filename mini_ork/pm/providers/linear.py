@@ -49,11 +49,15 @@ nowhere else:
   which :attr:`Page.has_more` covers because it follows Linear's own
   ``pageInfo`` rather than counting rows.
 
-**Read-only.** Linear's GraphQL API can create, update, transition and comment
-on an issue, and a later slice will do exactly that, gated by
-``Capabilities``. Declaring those capabilities now would mean carrying code
-with no caller; declaring them false is the honest statement of what this file
-does today.
+**Writes are gated, not read-only.** Linear's GraphQL API can create, update,
+link and search as well as comment and transition; this slice implements the
+last two and declares them through ``Capabilities``. ``create``, ``update`` and
+``link`` stay false — declaring a capability with no working code behind it
+would make the board offer a control it refuses. When this file does write, it
+is through :mod:`mini_ork.pm.writeback`, which refuses unless the operator opted
+the source in with ``write_back: true`` *and* the capability below is set; the
+adapter itself does no gating, because a second policy living in two places is
+a policy that drifts.
 """
 
 from __future__ import annotations
@@ -116,11 +120,12 @@ TYPES_BY_STATE: Mapping[IssueState, tuple[str, ...]] = {
     for state in IssueState
 }
 
-_ISSUES_QUERY = """
-query Issues($first: Int!, $after: String, $filter: IssueFilter) {
-  issues(first: $first, after: $after, filter: $filter) {
-    pageInfo { hasNextPage endCursor }
-    nodes {
+#: The issue fields every read and write selects, in one place so the mapped
+#: :class:`Issue` is the same shape whichever call produced it. Composed into
+#: both queries below rather than written twice: two copies of a selection list
+#: drift, and a field that goes missing here silently degrades an Issue rather
+#: than failing.
+_ISSUE_FIELDS = """\
       id
       identifier
       title
@@ -133,8 +138,50 @@ query Issues($first: Int!, $after: String, $filter: IssueFilter) {
       state { name type }
       assignee { name displayName }
       labels { nodes { name } }
-      team { key name }
-    }
+      team { key name }"""
+
+_ISSUES_QUERY = f"""
+query Issues($first: Int!, $after: String, $filter: IssueFilter) {{
+  issues(first: $first, after: $after, filter: $filter) {{
+    pageInfo {{ hasNextPage endCursor }}
+    nodes {{
+{_ISSUE_FIELDS}
+    }}
+  }}
+}}
+"""
+
+#: The team's workflow states, read once before a transition so the requested
+#: normalized state can be resolved to the id Linear wants.
+_WORKFLOW_STATES_QUERY = """
+query WorkflowStates($teamKey: String!) {
+  workflowStates(filter: {team: {key: {eq: $teamKey}}}) {
+    nodes { id name type }
+  }
+}
+"""
+
+#: The transition mutation: set one workflow state, and answer with the whole
+#: issue so the caller sees what actually happened rather than what was asked.
+_ISSUE_UPDATE = f"""
+mutation IssueUpdate($id: String!, $stateId: String!) {{
+  issueUpdate(id: $id, input: {{stateId: $stateId}}) {{
+    success
+    issue {{
+{_ISSUE_FIELDS}
+    }}
+  }}
+}}
+"""
+
+#: The comment mutation. The issue is named by its identifier (``ENG-123``),
+#: which Linear accepts wherever it takes an issue id, so no UUID lookup is
+#: needed before the write.
+_COMMENT_CREATE = """
+mutation CommentCreate($issueId: String!, $body: String!) {
+  commentCreate(input: {issueId: $issueId, body: $body}) {
+    success
+    comment { id body createdAt url user { name displayName } }
   }
 }
 """
@@ -177,18 +224,24 @@ def _requested_states(states: Sequence[IssueState]) -> frozenset[IssueState]:
     return frozenset(IssueState(state) for state in states)
 
 
-def _first_node(data: Mapping[str, Any], key: str) -> Mapping[str, Any] | None:
-    """The first node of a connection in a GraphQL ``data`` block, if any."""
+def _nodes(data: Mapping[str, Any], key: str) -> tuple[Mapping[str, Any], ...]:
+    """Every node of a connection in a GraphQL ``data`` block.
+
+    A missing connection, or one whose ``nodes`` is not a list, is no nodes —
+    the shape a caller can iterate over without a guard of its own.
+    """
     connection = data.get(key)
     if not isinstance(connection, Mapping):
-        return None
+        return ()
     nodes = connection.get("nodes")
     if not isinstance(nodes, Sequence) or isinstance(nodes, (str, bytes)):
-        return None
-    for node in nodes:
-        if isinstance(node, Mapping):
-            return node
-    return None
+        return ()
+    return tuple(node for node in nodes if isinstance(node, Mapping))
+
+
+def _first_node(data: Mapping[str, Any], key: str) -> Mapping[str, Any] | None:
+    """The first node of a connection in a GraphQL ``data`` block, if any."""
+    return next(iter(_nodes(data, key)), None)
 
 
 def _person_name(person: Any) -> str:
@@ -222,11 +275,13 @@ class LinearProvider:
 
     label = "Linear"
     capabilities = Capabilities(
-        # Reads only, today. See the module docstring.
+        # comment and transition are implemented and gated by
+        # mini_ork.pm.writeback; create/update/link are not, and saying so is
+        # what keeps the board from offering a control this adapter refuses.
         create=False,
         update=False,
-        transition=False,
-        comment=False,
+        transition=True,
+        comment=True,
         link=False,
         search=False,
         states=True,
@@ -525,19 +580,113 @@ class LinearProvider:
             if isinstance(item, Mapping)
         )
 
-    # ── writes: not supported yet ──────────────────────────────────────────
+    # ── writes ─────────────────────────────────────────────────────────────
+
+    def _mutation(
+        self, data: Mapping[str, Any], key: str, *, operation: str
+    ) -> Mapping[str, Any]:
+        """The payload of a GraphQL mutation, or a :class:`ProviderError`.
+
+        Linear answers a mutation it declined with HTTP 200 and
+        ``success: false`` beside its ``data``, so the transport succeeding is
+        not the write succeeding — the hazard the reads already handle for an
+        ``errors`` list, met again on the write side.
+        """
+        result = data.get(key)
+        if not isinstance(result, Mapping):
+            raise ProviderError(f"{self.id}: {operation} returned no result")
+        if result.get("success") is False:
+            raise ProviderError(f"{self.id}: {operation} was not accepted")
+        return result
+
+    def _identifier(self, uid: str) -> str:
+        """``uid`` → the identifier Linear's mutations take (``ENG-123``).
+
+        ``_locate`` validates the provider and the shape (raising ``KeyError``
+        for a foreign or malformed uid), and the identifier is rebuilt from it:
+        that is the string both mutations name the issue by.
+        """
+        team_key, number = self._locate(uid)
+        return f"{team_key}-{number}"
+
+    def comment(self, uid: str, body: str) -> Comment:
+        """Post ``body`` on the issue, oldest comments and this one apart.
+
+        One ``commentCreate`` mutation; the issue is named by its identifier,
+        which Linear accepts wherever it takes an issue id, so the write needs
+        no UUID lookup first.
+        """
+        identifier = self._identifier(uid)
+        data = self._graphql(
+            _COMMENT_CREATE,
+            {"issueId": identifier, "body": str(body)},
+            operation=f"comment on {identifier}",
+        )
+        result = self._mutation(data, "commentCreate", operation=f"comment on {identifier}")
+        node = result.get("comment")
+        node = node if isinstance(node, Mapping) else {}
+        return Comment(
+            issue_uid=uid,
+            author=_person_name(node.get("user")),
+            body=str(node.get("body") or ""),
+            created_at=node.get("createdAt"),
+            url=node.get("url"),
+            native_id=str(node["id"]) if node.get("id") is not None else None,
+        )
+
+    def transition(self, uid: str, state: IssueState) -> Issue:
+        """Move the issue to ``state``: one workflow-states read, then the update.
+
+        Linear's states are workspace-defined, so the target is resolved by its
+        stable ``type`` (see :data:`STATE_BY_TYPE`) and the first workflow state
+        whose type maps to ``state`` is used. A state Linear has no type for —
+        ``IN_REVIEW``, ``BLOCKED`` — matches nothing and raises
+        :class:`Unsupported` rather than moving the issue somewhere it was not
+        asked to go.
+        """
+        wanted = IssueState(state)
+        team_key, number = self._locate(uid)
+        identifier = f"{team_key}-{number}"
+        data = self._graphql(
+            _WORKFLOW_STATES_QUERY,
+            {"teamKey": team_key},
+            operation=f"workflow states for {team_key}",
+        )
+        state_id = next(
+            (
+                node.get("id")
+                for node in _nodes(data, "workflowStates")
+                if _state(node) is wanted and node.get("id") is not None
+            ),
+            None,
+        )
+        if state_id is None:
+            raise Unsupported(
+                self.id,
+                f"a {wanted.value} state (no Linear workflow state maps to it)",
+            )
+        data = self._graphql(
+            _ISSUE_UPDATE,
+            {"id": identifier, "stateId": str(state_id)},
+            operation=f"transition {identifier} to {wanted.value}",
+        )
+        result = self._mutation(
+            data, "issueUpdate", operation=f"transition {identifier} to {wanted.value}"
+        )
+        node = result.get("issue")
+        if not isinstance(node, Mapping):
+            raise ProviderError(
+                f"{self.id}: transition {identifier} returned no issue"
+            )
+        return self._issue(node)
+
+    # ── writes: still not supported ────────────────────────────────────────
 
     def create(self, draft: Draft) -> Issue:
         raise Unsupported(self.id, "create")
 
     def update(self, uid: str, patch: Patch) -> Issue:
         raise Unsupported(self.id, "update")
-
-    def transition(self, uid: str, state: IssueState) -> Issue:
-        raise Unsupported(self.id, "transition")
-
-    def comment(self, uid: str, body: str) -> Comment:
-        raise Unsupported(self.id, "comment")
 
     def link(self, from_uid: str, to_uid: str, kind: LinkKind) -> Link:
         raise Unsupported(

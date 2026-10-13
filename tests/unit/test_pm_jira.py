@@ -23,7 +23,8 @@ interesting part:
 * the cursor is Jira's opaque ``nextPageToken``, handed back as-is
 * the project is scoped server-side by JQL; state, label, assignee and priority
   are narrowed here, so a filter is never silently dropped
-* read-only: every write refuses, and ``link`` is among them
+* comment and transition are implemented and declared; create, update and
+  ``link`` still refuse, and the capability flags say exactly that
 """
 from __future__ import annotations
 
@@ -586,20 +587,19 @@ def test_comments_on_an_unknown_issue_raise_key_error(source, transport):
         source.comments("jira:ENG-404")
 
 
-# ── read-only ──────────────────────────────────────────────────────────────
+# ── the writes this adapter declares and the ones it refuses ────────────────
 
 
-def test_every_write_refuses_and_no_capability_claims_one(source, transport):
-    assert source.capabilities.read_only is True
-    assert source.capabilities.writes == ()
+def test_the_declared_writes_are_comment_and_transition(source):
+    assert source.capabilities.read_only is False
+    assert source.capabilities.writes == ("transition", "comment")
+
+
+def test_create_update_and_link_still_refuse_without_a_call(source, transport):
     with pytest.raises(Unsupported):
         source.create(Draft(title="x"))
     with pytest.raises(Unsupported):
         source.update("jira:ENG-1", Patch(title="x"))
-    with pytest.raises(Unsupported):
-        source.transition("jira:ENG-1", IssueState.DONE)
-    with pytest.raises(Unsupported):
-        source.comment("jira:ENG-1", "hello")
     with pytest.raises(Unsupported) as caught:
         source.link("jira:ENG-1", "jira:ENG-2", LinkKind.BLOCKS)
     assert "jira" in str(caught.value)

@@ -23,7 +23,8 @@ decides the three things this module does that Linear's does not:
   API v3 carries both as Atlassian Document Format — a recursive JSON tree of
   ``paragraph``/``heading``/``list``/``codeBlock`` nodes. :func:`adf_to_markdown`
   is the one place that flattens it, called for a description and for every
-  comment body, so the two never drift apart.
+  comment body, so the two never drift apart; :func:`markdown_to_adf` is its
+  inverse for the one document this adapter *writes*, a comment body.
 
 Where Jira and the model disagree, resolved here and nowhere else:
 
@@ -47,9 +48,14 @@ Where Jira and the model disagree, resolved here and nowhere else:
   semantics live in this file — where they are tested — instead of in a remote
   query grammar.
 
-**Read-only.** Jira's API can create, update, transition and comment on an
-issue. Declaring those capabilities now would carry code with no caller, so
-this slice declares them false and every write raises ``Unsupported``.
+**Writes are gated, not read-only.** Jira's API can create, update, link and
+comment; this slice implements ``comment`` and ``transition`` and declares them
+through ``Capabilities``, leaving ``create``/``update``/``link`` false because
+carrying a capability with no working code behind it would make the board offer
+a control it refuses. Every write goes through :mod:`mini_ork.pm.writeback`,
+which refuses unless the operator opted the source in with ``write_back: true``
+*and* the capability below is set; the adapter itself does no gating, because a
+policy split across two files is a policy that drifts.
 """
 
 from __future__ import annotations
@@ -166,6 +172,49 @@ def adf_to_markdown(document: Any) -> str:
     if not isinstance(document, Mapping):
         return ""
     return _blocks(document.get("content")).strip()
+
+
+def markdown_to_adf(text: str) -> Mapping[str, Any]:
+    """Plain text → a minimal ADF document, the inverse of :func:`adf_to_markdown`.
+
+    The one converter in the other direction, used for the single document this
+    adapter writes: a comment body. A body mini-ork posts is prose, so this
+    emits ``paragraph`` nodes and nothing else — no headings, lists or marks —
+    which is the smallest document Jira's v3 API accepts. Blank-line-separated
+    blocks become paragraphs and a line break inside one becomes a
+    ``hardBreak``, so a body survives a round trip through
+    :func:`adf_to_markdown` unchanged.
+
+    Kept beside the reader rather than in a module of its own: the two halves of
+    the conversion are one format, and splitting them is how they drift.
+    """
+    blocks: list[str] = []
+    buffer: list[str] = []
+    for line in str(text or "").split("\n"):
+        if line.strip():
+            buffer.append(line)
+        elif buffer:
+            blocks.append("\n".join(buffer))
+            buffer = []
+    if buffer:
+        blocks.append("\n".join(buffer))
+    if not blocks:
+        return {"version": 1, "type": "doc", "content": [{"type": "paragraph"}]}
+    return {
+        "version": 1,
+        "type": "doc",
+        "content": [_paragraph(block) for block in blocks],
+    }
+
+
+def _paragraph(block: str) -> Mapping[str, Any]:
+    """One paragraph node: its lines as text, joined by ``hardBreak`` nodes."""
+    content: list[dict[str, Any]] = []
+    for index, line in enumerate(block.split("\n")):
+        if index:
+            content.append({"type": "hardBreak"})
+        content.append({"type": "text", "text": line})
+    return {"type": "paragraph", "content": content}
 
 
 def _attr(node: Mapping[str, Any], name: str) -> Any:
@@ -386,11 +435,13 @@ class JiraProvider:
 
     label = "Jira"
     capabilities = Capabilities(
-        # Reads only, today. See the module docstring.
+        # comment and transition are implemented and gated by
+        # mini_ork.pm.writeback; create/update/link are not, and saying so is
+        # what keeps the board from offering a control this adapter refuses.
         create=False,
         update=False,
-        transition=False,
-        comment=False,
+        transition=True,
+        comment=True,
         link=False,
         search=False,
         states=True,
@@ -719,19 +770,101 @@ class JiraProvider:
             if isinstance(item, Mapping)
         )
 
-    # ── writes: not supported yet ──────────────────────────────────────────
+    # ── writes ─────────────────────────────────────────────────────────────
+
+    def _issue_path(self, key: str, *suffix: str) -> str:
+        """The URL for one issue and any path below it, the key quoted first.
+
+        The key comes from ``_locate`` and is already validated, but it is
+        quoted again here so a value that ever reaches this without passing
+        through ``_locate`` still cannot re-aim an authenticated request.
+        """
+        path = "/issue/" + urllib.parse.quote(key, safe="")
+        return self._url(path + "".join(f"/{segment}" for segment in suffix))
+
+    def comment(self, uid: str, body: str) -> Comment:
+        """Post ``body`` on the issue: ``POST /issue/{key}/comment``.
+
+        The body is sent as a minimal ADF document (see
+        :func:`markdown_to_adf`), because on v3 a comment is a document, not a
+        string. The key passes the same ``_locate`` validation every read uses,
+        so a malformed uid cannot reach the URL.
+        """
+        key = self._locate(uid)
+        payload = self._transport(
+            self._issue_path(key, "comment"),
+            method="POST",
+            operation=f"comment on {key}",
+            body={"body": markdown_to_adf(body)},
+        )
+        node = _mapping(payload)
+        # The server echoes the stored document; fall back to what was sent if
+        # an install answers without one.
+        rendered = adf_to_markdown(node.get("body"))
+        return Comment(
+            issue_uid=uid,
+            author=_display_name(node.get("author")),
+            body=rendered or str(body),
+            created_at=node.get("created"),
+            url=self._browse(key),
+            native_id=str(node["id"]) if node.get("id") is not None else None,
+        )
+
+    def transition(self, uid: str, state: IssueState) -> Issue:
+        """Move the issue: read its transitions, pick one, then ``POST`` it.
+
+        Jira has no status *type*, only workspace-defined statuses whose stable
+        ``statusCategory.key`` this adapter already maps (see
+        :data:`STATE_BY_CATEGORY`). The first transition landing in the
+        requested category is taken; a state no transition reaches —
+        ``IN_REVIEW``, ``BLOCKED``, ``CANCELED`` — raises :class:`Unsupported`
+        rather than moving the issue somewhere it was not asked to go.
+
+        The ``POST`` answers ``204 No Content``, so the issue the protocol
+        promises is read back once afterwards.
+        """
+        wanted = IssueState(state)
+        key = self._locate(uid)
+        payload = self._transport(
+            self._issue_path(key, "transitions"),
+            operation=f"transitions for {key}",
+        )
+        transitions = _mapping(payload).get("transitions")
+        transitions = (
+            transitions
+            if isinstance(transitions, Sequence) and not isinstance(transitions, (str, bytes))
+            else []
+        )
+        chosen = next(
+            (
+                item
+                for item in transitions
+                if isinstance(item, Mapping)
+                and item.get("id") is not None
+                and _status_state(_mapping(item.get("to"))) is wanted
+            ),
+            None,
+        )
+        if chosen is None:
+            raise Unsupported(
+                self.id,
+                f"a {wanted.value} status (no Jira transition lands in that category)",
+            )
+        self._transport(
+            self._issue_path(key, "transitions"),
+            method="POST",
+            operation=f"transition {key} to {wanted.value}",
+            body={"transition": {"id": str(chosen["id"])}},
+        )
+        return self.get(uid)
+
+    # ── writes: still not supported ────────────────────────────────────────
 
     def create(self, draft: Draft) -> Issue:
         raise Unsupported(self.id, "create")
 
     def update(self, uid: str, patch: Patch) -> Issue:
         raise Unsupported(self.id, "update")
-
-    def transition(self, uid: str, state: IssueState) -> Issue:
-        raise Unsupported(self.id, "transition")
-
-    def comment(self, uid: str, body: str) -> Comment:
-        raise Unsupported(self.id, "comment")
 
     def link(self, from_uid: str, to_uid: str, kind: LinkKind) -> Link:
         raise Unsupported(

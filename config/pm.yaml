@@ -14,6 +14,15 @@
 # beside the project, in sops, in `pass`, or in OpenBao. A missing key is a
 # clear error; an empty string is never read as "no credential needed".
 #
+# WRITE-BACK. `write_back: true` on a source opts it in to comment/transition
+# (see mini_ork/pm/writeback.py). It is OFF by default and gated twice — the
+# opt-in here AND the adapter's declared Capabilities — because a read token
+# is the ordinary case and a write needs a write-scoped one. Both tiers use
+# the same flag: the secure tier keeps the write token in sops or OpenBao, the
+# simple tier in `secrets.local.sh`, and a missing token fails closed either
+# way. Only `true` opts in; any other value — including the string "true" — is
+# read as off, so a typo can never silently enable a write.
+#
 # `local` — mini-ork's own epics — is the one source with no credential, no
 # network and no config beyond being switched on.
 #
@@ -78,13 +87,18 @@ sources:
   # reads over Linear's GraphQL API (https://api.linear.app/graphql): issues
   # are scoped to `team`, workflow states map onto the normalized states with
   # Linear's own state name kept beside them, and priority uses Linear's
-  # 1-urgent..4-low numbering. Reads only, like GitHub, so the board offers no
-  # write the adapter would refuse. Shipped disabled — flip `enabled` to true
-  # once `LINEAR_API_KEY` resolves through the vault.
+  # 1-urgent..4-low numbering. Reads only — the adapter also declares comment
+  # and transition (the board still offers no create/update/link it would
+  # refuse), but they stay off until `write_back: true` opts this source in.
+  # Shipped disabled — flip `enabled` to true once `LINEAR_API_KEY` resolves
+  # through the vault.
   linear:
     enabled: false
-    token_env: LINEAR_API_KEY   # a personal API key; a read-only key is enough
+    token_env: LINEAR_API_KEY   # a personal API key; a read-only key reads only
     team: ENG                   # the team KEY the issues live in (as in ENG-123)
+    # write_back: false         # OPT-IN: comment/transition. Needs a key WITH
+    #                           # write scope (tier B: sops/OpenBao, not a file),
+    #                           # and a missing key fails closed, as reads do.
     # api_url: https://linear.acme.dev/graphql   # a proxied or self-hosted endpoint
     # trigger_label: agent        # uncomment to let intake start these tickets
     # trigger_recipe: code-fix    # the recipe a launched run uses
@@ -98,15 +112,20 @@ sources:
   # over the REST API v3 (/rest/api/3): issues are scoped to `project`, the
   # status *category* maps onto the normalized states with Jira's own status
   # name kept beside it, priority maps from Jira's named priorities, and the
-  # ADF description and comment bodies are converted to markdown. Reads only,
-  # like GitHub and Linear. Shipped disabled — flip `enabled` to true once
-  # `JIRA_API_TOKEN` and `JIRA_EMAIL` resolve through the vault.
+  # ADF description and comment bodies are converted to markdown. Reads only —
+  # the adapter also declares comment and transition (create/update/link stay
+  # refused), but they stay off until `write_back: true` opts this source in.
+  # Shipped disabled — flip `enabled` to true once `JIRA_API_TOKEN` and
+  # `JIRA_EMAIL` resolve through the vault.
   jira:
     enabled: false
-    token_env: JIRA_API_TOKEN   # an API token; a read-only token is enough
+    token_env: JIRA_API_TOKEN   # an API token; a read-only token reads only
     email_env: JIRA_EMAIL       # the account the token belongs to (name only)
     site: https://acme.atlassian.net   # the install URL
     project: ENG                # the project KEY the issues live in (as in ENG-123)
+    # write_back: false         # OPT-IN: comment/transition. Needs a token WITH
+    #                           # write scope (tier B: sops/OpenBao, not a file),
+    #                           # and a missing token fails closed, as reads do.
     # api_url: https://jira.acme.dev/rest/api/3   # a proxied or self-hosted REST base
     # trigger_label: agent        # uncomment to let intake start these tickets
     # trigger_recipe: code-fix    # the recipe a launched run uses
