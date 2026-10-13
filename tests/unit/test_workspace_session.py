@@ -539,3 +539,63 @@ def test_signal_path_close_does_not_block_on_a_held_registry_lock(counting_backe
     assert backend.down_calls == 0
     ws_module.close_run_session("r-busy")
     assert backend.down_calls == 1
+
+
+# --- kill_run reaches the owner's whole process tree -------------------------
+
+
+def _alive(pid: int) -> bool:
+    """A zombie has already exited; only a running process counts as alive."""
+    out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+    stat = out.stdout.strip()
+    return bool(stat) and not stat.startswith("Z")
+
+
+def test_kill_run_also_kills_children_whose_argv_lacks_the_run_id(tmp_path):
+    """run-1791750091-88029: the per-spec dispatcher survived ``board kill`` and
+    kept launching children, because neither ``.pid`` nor ``pgrep -f <run_id>``
+    named it — and once its parent died it was re-parented out of reach."""
+    import time
+
+    from mini_ork.web import control
+
+    run_id = f"run-{uuid.uuid4().hex[:8]}"
+    run_dir = tmp_path / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    child_pid_file = tmp_path / "child.pid"
+    owner = subprocess.Popen([
+        sys.executable, "-c",
+        "import subprocess, time\n"
+        "child = subprocess.Popen(['sleep', '60'])\n"
+        f"open({str(child_pid_file)!r}, 'w').write(str(child.pid))\n"
+        "time.sleep(60)\n",
+    ])
+    child_pid = 0
+    try:
+        deadline = time.monotonic() + 10
+        while not (child_pid_file.exists() and child_pid_file.read_text()):
+            assert time.monotonic() < deadline, "the owner never started its child"
+            time.sleep(0.05)
+        child_pid = int(child_pid_file.read_text())
+        (run_dir / ".pid").write_text(str(owner.pid))
+
+        class FakeDB:  # type: ignore[misc] -- structural stub for StateDB
+            db_path = tmp_path / "state.db"
+
+            def row(self, sql, params=()):
+                return {"id": run_id, "status": "executing"}
+
+        with mock.patch.object(control, "_writeback_terminal", lambda *a, **k: None), \
+             mock.patch.object(control, "_close_dangling_node_events", lambda *a, **k: None):
+            out = control.kill_run(tmp_path, FakeDB(), run_id)  # type: ignore[arg-type]
+
+        assert child_pid in out["pids_targeted"], out
+        owner.wait(timeout=10)
+        deadline = time.monotonic() + 10
+        while _alive(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert not _alive(child_pid), "the owner's child outlived kill_run"
+    finally:
+        for pid in (owner.pid, child_pid):
+            if pid and _alive(pid):
+                os.kill(pid, 9)

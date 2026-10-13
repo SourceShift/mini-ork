@@ -160,6 +160,40 @@ def stop_run(home: Path, db: StateDB, task_run_id: str) -> dict[str, Any]:
     }
 
 
+def _with_descendants(pids: list[int]) -> list[int]:
+    """``pids`` plus every live descendant, parents first.
+
+    Must be snapshotted BEFORE any signal: a killed parent's children are
+    re-parented to init at once and can no longer be found from it. Never
+    includes this process or init. Best-effort: a failing ``ps`` returns
+    ``pids`` unchanged.
+    """
+    if not pids:
+        return pids
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid="],
+                             capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return pids
+    if out.returncode != 0:
+        return pids
+    children: dict[int, list[int]] = {}
+    for line in (out.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+            continue
+        children.setdefault(int(parts[1]), []).append(int(parts[0]))
+    tree: list[int] = []
+    queue = list(pids)
+    while queue:
+        pid = queue.pop(0)
+        if pid <= 1 or pid == os.getpid() or pid in tree:
+            continue
+        tree.append(pid)
+        queue.extend(children.get(pid, []))
+    return tree
+
+
 def kill_run(home: Path, db: StateDB, task_run_id: str) -> dict[str, Any]:
     """Hard kill: SIGTERM → 2s grace → SIGKILL the dispatcher pid.
 
@@ -179,6 +213,13 @@ def kill_run(home: Path, db: StateDB, task_run_id: str) -> dict[str, Any]:
             pids = [int(p) for p in pid_file.read_text().split() if p.strip().isdigit()]
         except (OSError, ValueError):
             pids = []
+        # The run's pool workers and a recipe's dispatcher subprocess carry no
+        # run id in their argv, so only the process tree reaches them. Killing
+        # just the owner left run-1791750091-88029's per-spec dispatcher
+        # running for two hours on 2026-10-13, launching new children into a
+        # killed run. Only the .pid owner is expanded: a pgrep match below can
+        # be a caller's own shell, whose tree must not be swept.
+        pids = _with_descendants(pids)
 
     # Fallback: pgrep for any bash/python process whose cmdline contains the
     # task_run_id. Useful when the .pid file is missing or stale.
