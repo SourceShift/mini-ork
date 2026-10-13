@@ -327,13 +327,15 @@ def test_acceptance_commands_come_from_the_profile_first(monkeypatch, tmp_path):
         "python3.11 -m pytest tests/unit -q", "ruff check mini_ork"]
 
 
-def test_acceptance_commands_dedupe_and_cap(monkeypatch, tmp_path):
-    """A kickoff that repeats its one command must not run it four times, and an
-    unbounded list must not run the verifier out of its budget."""
+def test_acceptance_commands_dedupe_no_cap(monkeypatch, tmp_path):
+    """A kickoff that repeats its one command must not run it four times. The
+    unbounded list no longer runs through the verifier's own silent ``[:4]``
+    cap — the kickoff's explicit ``## Verification commands`` section is the
+    acceptance bar, and every command it declares reaches the verifier."""
     mod, _cap, _wt = _load_fwedit_verifier(monkeypatch, tmp_path)
     _profile(mod, tmp_path, {"verification_command": [f"cmd-{i}" for i in range(9)]})
 
-    assert mod._epic_verification_commands() == ["cmd-0", "cmd-1", "cmd-2", "cmd-3"]
+    assert mod._epic_verification_commands() == [f"cmd-{i}" for i in range(9)]
 
     _profile(mod, tmp_path, {"verification_command": ["same", "same", "same"]})
     assert mod._epic_verification_commands() == ["same"]

@@ -342,7 +342,11 @@ def _epic_verification_commands():
         cmd = cmd.strip().strip("`").strip()
         if cmd and cmd not in out:
             out.append(cmd)
-    return out[:4]
+    # Every command the kickoff declared runs. The previous [:4] cap was
+    # dropping the verification bar the kickoff's explicit "## Verification
+    # commands" section set (run-1791853722-board-k3 timed out on a bare
+    # runner over 8647 tests, never reaching the kickoff's `ruff check`).
+    return out
 
 
 def _sh(cmd):

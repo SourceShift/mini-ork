@@ -598,8 +598,6 @@ def gen_profile(kickoff_path, root, recipe, task_class, profile_path, agents_pat
     success = bullets(section_lines(["success", "definition of done", "done when", "acceptance"]))
     scope_allow = bullets(section_lines(["scope allow", "in scope", "scope"]))
     scope_deny = bullets(section_lines(["scope deny", "out of scope", "forbidden"]))
-    commands = command_hints()
-
     def _bullet_only(lines):
         out = []
         for line in lines:
@@ -607,14 +605,27 @@ def gen_profile(kickoff_path, root, recipe, task_class, profile_path, agents_pat
             if m:
                 out.append(m.group(1).strip())
         return out
+    # The explicit "## Verification commands" section is the authoritative
+    # acceptance bar — when it exists, store exactly its bullets, in order,
+    # backtick-stripped and deduped, with no cap. command_hints() regex-scans
+    # the whole kickoff prose for runner invocations and was sweeping prose
+    # mentions ("…names the test runner…") into the verifier's slot 1 and
+    # pushing real commands past the cap (run-1791853722-board-k3 ran a bare
+    # runner over 8647 tests and timed out, never reaching the kickoff's
+    # `ruff check`). Keep it as the no-section fallback with its cap of three.
     _explicit_verify = _bullet_only(section_lines([
         "verification command", "verification commands", "proof of success"]))
+    _explicit = []
     for _c in _explicit_verify:
         _c = _c.strip()
         if _c.startswith("`") and _c.endswith("`") and len(_c) >= 2:
             _c = _c[1:-1].strip()
-        if _c and _c not in commands:
-            commands.append(_c)
+        if _c and _c not in _explicit:
+            _explicit.append(_c)
+    if _explicit:
+        commands = _explicit
+    else:
+        commands = command_hints()
 
     task_yaml = load_yaml(rbase / "recipes" / recipe / "task_class.yaml")
     artifact_yaml = load_yaml(rbase / "recipes" / recipe / "artifact_contract.yaml")
@@ -686,7 +697,7 @@ def gen_profile(kickoff_path, root, recipe, task_class, profile_path, agents_pat
             "env": {"MINI_ORK_PROVIDER_POLICY": str(Path(agents_path).resolve()) if lanes else ""},
         },
         "artifact_destination": outputs,
-        "verification_command": commands[:3],
+        "verification_command": commands if _explicit else commands[:3],
         "human_questions": questions,
         "confidence": round(confidence, 2),
         "profile_status": status,
