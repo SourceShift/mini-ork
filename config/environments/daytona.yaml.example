@@ -1,0 +1,50 @@
+# config/environments/daytona.yaml.example — run a run's agent nodes in a
+# Daytona sandbox (one per run, created on demand, deleted at run end).
+#
+#   cp config/environments/daytona.yaml.example "$MINI_ORK_HOME/config/environments/daytona.yaml"
+#   mini-ork run code-fix <kickoff> --placement remote --env daytona
+#
+# Credentials never go in this file. DAYTONA_API_KEY is read through the vault
+# chain: the environment, then $MINI_ORK_HOME/config/secrets.local.sh (0600)
+# for a laptop, or sops / pass / op / infisical / OpenBao declared in
+# config/vault.yaml for shared use. `mini-ork vault which DAYTONA_API_KEY`
+# shows which one serves it. A missing key fails the run before any API call.
+#
+# Guide: docs/operator/cloud-sandboxes-daytona.md
+# Design: docs/architecture/cloud-sandbox-providers.md
+
+provider: daytona
+
+provider_options:
+  # Leave empty for Daytona's default snapshot: Python, git, Node, claude and
+  # opencode are preinstalled; the node-agent's one missing dependency
+  # (fastapi) is installed on first boot (~2 s). For production, bake a
+  # snapshot with pinned CLIs and name it here — boot then skips installs.
+  snapshot: ""
+  # target: us              # Daytona region (default: the organization's)
+  # ttl_minutes: 360        # hard wall-clock cap, enforced by Daytona even if
+  #                         # this machine dies; defaults to MO_SANDBOX_MAX_AGE/60
+  # auto_stop_minutes: 0    # idle stop; 0 = off, so a long quiet agent turn
+  #                         # is never stopped mid-run (the TTL is the cap)
+  # bootstrap: true         # install missing node-agent deps at boot
+  # ready_timeout_s: 180
+
+# Instead of a snapshot, any registry image (Daytona builds and caches it).
+# resources apply to the image path only; a snapshot carries its own.
+# image: python:3.12
+# resources: { cpus: 2, memory: 4g, disk: 10g }
+
+# Runs once per sandbox, after the node-agent dependencies and before it starts.
+setup: ""
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+# Lane secrets (names only) the run may send to the node; values are resolved
+# on this machine per lane and injected per process (remote-nodes D6).
+secrets: [ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN]
+
+# full (default) or allowlist. allowlist maps to Daytona's domain_allow_list;
+# keep pypi.org + files.pythonhosted.org while bootstrap installs packages.
+network: full
+allow_domains: []

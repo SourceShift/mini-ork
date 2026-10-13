@@ -48,6 +48,10 @@ optimize = ["gepa>=0.1.4,<0.2"]
 # a blank preview. Required deps stay PyYAML + jsonschema.
 documents = ["pymupdf>=1.24,<2"]
 web = ["fastapi>=0.110", "uvicorn[standard]>=0.29"]
+# Daytona cloud sandboxes as remote nodes (mini_ork/remote/providers/daytona.py):
+# `provider: daytona` in an environment profile. Imported only when that
+# provider is selected; the floor is the first SDK verified live (2026-10-13).
+daytona = ["daytona>=0.224,<1"]
 # ACP (Agent Client Protocol) stdio agent — `mini-ork acp`. Bounded to the
 # 0.12 line because the ACP wire schema shifts between minor releases.
 acp = ["agent-client-protocol>=0.12,<0.13"]
