@@ -1,19 +1,33 @@
-"""Board — epics on the left, every run of the project on the right.
+"""Board — epics and imported tickets on the left, every run on the right.
 
 Two tabs:
 
-- ``tasks`` (default) — one ``columns`` section of epic cards. The columns
+- ``tasks`` (default) — one ``columns`` section of epic cards *and* the
+  tickets imported from the PM mirror (Linear, Jira, GitHub). The columns
   come from the scheduler's view of epics (``Backlog`` / ``Working`` /
   ``Needs you`` / ``Done``); every card carries the latest ``epic_attempts``
   row's run id when one exists, else the epic's kickoff path resolved
   against ``MINI_ORK_ROOT`` when the file is on disk, else no ``do`` key.
+  Mirror tickets are read through :mod:`mini_ork.pm.store` only — the page
+  makes no network call and imports no adapter, so a slow or broken source
+  can neither slow nor blank the board, and a mirror row whose ``provider``
+  is ``local`` is skipped (it is already drawn from the ``epics`` table).
 - ``runs`` — the live run board: four columns of fleet cards (Working /
   Needs you / Failed / Done), Done over a rolling 24-hour window.
+
+The two delivery tiers (see ``CLAUDE.md``) sit *upstream* of this page and it
+behaves the same under either: the simple tier keeps the mirror fresh with
+``mini-ork intake poll`` over stdlib HTTP and the key in ``secrets.local.sh``;
+the secure tier keeps it fresh with the signed intake webhook and keys in
+sops/OpenBao. The board only ever reads the mirror, so which tier filled it is
+not its business.
 
 A header ``New task`` thread action (``/task …``) opens a new mini-ork
 thread to author one. The thread action is a thread, not a ``cli`` —
 ``tests/unit/test_ide_pages_actions.py`` parses every ``cli`` action the
-IDE exposes, and ``/task`` is intentionally not a subcommand.
+IDE exposes, and ``/task`` is intentionally not a subcommand. A ``Sync
+tickets`` header button runs ``mini-ork intake once --dry-run``: it refreshes
+the mirror and starts nothing.
 """
 from __future__ import annotations
 
@@ -99,6 +113,23 @@ _TASK_COLUMNS = (
     ("Done", "green"),
 )
 _TASK_CAP = 30
+
+# The closed ``IssueState`` → (Tasks column, card state word, card mark). Every
+# state maps; ``canceled`` is deliberately absent from the draw path (it is
+# counted in the section note, never drawn). An unmapped word is "never
+# silently dropped", the same rule the epic mapping follows.
+_TICKET_STATE = {
+    "backlog": ("Backlog", "pending", "○"),
+    "todo": ("Backlog", "pending", "○"),
+    "in_progress": ("Working", "working", "●"),
+    "blocked": ("Needs you", "needs_you", "✋"),
+    "in_review": ("Needs you", "needs_you", "✋"),
+    "done": ("Done", "done", "✓"),
+}
+
+# The normalized priority, spelled for a card's meta row. ``Priority`` counts
+# up (``URGENT`` is the highest number), exactly as ``epics.priority`` does.
+_PRIORITY_LABELS = {0: "no priority", 1: "low", 2: "medium", 3: "high", 4: "urgent"}
 
 
 def _db(home: Path):
@@ -226,28 +257,25 @@ def _task_card(epic: dict[str, Any], latest_run_id: str | None,
     return {"id": eid, "title": title, "sub": sub, "state": _task_card_state(status),
             "mark": _task_card_mark(status), "meta": [], "do": do,
             # Internal — sorted on, stripped before the page serialises.
-            "_recency": int(recency)}
+            "_recency": int(recency),
+            "_priority": int(epic.get("priority") or 0)}
 
 
 def _sort_task_cards(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Sort by priority DESC, then by updated_at DESC (recency tie-break).
+    """Sort by priority DESC, then by recency DESC, then id — one order for all cards.
 
-    Each card carries an internal ``_recency`` ordinal — the SQL assigned it
-    to each row before the cards were built — so the second-level sort is
-    "newest first within the same priority tier". The kickoff says the cap
-    is 30 per column, so any card past the cap drops here.
+    Each card carries two internal ordinals set at build time: ``_priority``
+    (the row's own priority — ``epics.priority`` for an epic, the mirror
+    ``Priority`` for a ticket, both counting up) and ``_recency`` (the row's
+    rank in its source's newest-first read). Priority leads, so a flood of
+    low-priority tickets cannot push a prioritised epic off the board; the
+    recency ordinal then keeps the newest card first within a tier. The cap is
+    applied on this one order, so epics and tickets share it.
     """
     def key(card: dict[str, Any]) -> tuple[int, int, str]:
-        sub = str(card.get("sub") or "")
-        prio = 0
-        for part in sub.split(" · "):
-            if part.startswith("prio "):
-                try:
-                    prio = int(part[5:])
-                except ValueError:
-                    prio = 0
-                break
-        return (prio, int(card.get("_recency", 0) or 0), str(card.get("id") or ""))
+        return (int(card.get("_priority", 0) or 0),
+                int(card.get("_recency", 0) or 0),
+                str(card.get("id") or ""))
 
     return sorted(cards, key=key, reverse=True)
 
@@ -279,18 +307,140 @@ def _resolve_kickoff_path(home: Path, kickoff: str) -> str | None:
     return None
 
 
-def _tasks_board(home: Path, errors: dict[str, str]) -> list[dict[str, Any]]:
-    """One ``columns`` section: Backlog / Working / Needs you / Done."""
-    db = _db(home)
-    if not db.has_table("epics"):
-        # Missing table — the page must still build, with a single muted line
-        # in place of the board so the operator knows the create isn't here
-        # yet. S.guarded wraps the whole read so a missing table still costs
-        # only this one section.
-        return [S.lst("Tasks", [S.muted("No epics table — initialise the project "
-                                       "(``mini-ork init``) to see the Tasks column here.")],
-                       full=True)]
+def _iso_epoch(value: Any) -> int | None:
+    """An ISO-8601 sync stamp → a unix epoch, or ``None`` when unparseable."""
+    if not value:
+        return None
+    import datetime as dt
 
+    text = str(value).strip().replace("Z", "+00:00")
+    try:
+        return int(dt.datetime.fromisoformat(text).timestamp())
+    except ValueError:
+        return None
+
+
+def _ticket_column(state: str) -> tuple[str, str, str]:
+    """``IssueState`` → (Tasks column, card state word, card mark).
+
+    An unmapped state (a word this build does not know) is never silently
+    dropped: it lands in Needs you, the same rule the epic mapping follows.
+    """
+    return _TICKET_STATE.get(state, ("Needs you", "needs_you", "✋"))
+
+
+def _run_id_from_links(uid: str, links) -> str | None:
+    """The run id in a ``run`` link touching ``uid``, or ``None``.
+
+    ``links_for`` returns edges in both directions and the run endpoint is
+    spelt ``run:<run_id>`` (``mini_ork/threads/service.py``), so take the
+    endpoint that is not ``uid`` and strip the prefix; an edge whose far end is
+    another issue (``blocks`` / ``relates`` / ``parent``) is not a run link.
+    """
+    for link in links:
+        if str(link.kind) != "run":
+            continue
+        other = link.to_uid if link.from_uid == uid else link.from_uid
+        if other.startswith("run:"):
+            return other[len("run:"):]
+    return None
+
+
+def _ticket_card(row: Any, run_id: str | None, *, recency: int = 0) -> dict[str, Any]:
+    """One mirror-ticket card for the Tasks board.
+
+    ``title`` leads with the source's own key (``ENG-123``) so a person can
+    quote it; the ``sub`` line carries the provider and the source's *native*
+    state word, never only the normalized one. ``do`` opens the linked run when
+    the ticket has one, else the ticket's own URL, else there is no ``do`` key.
+    A run-linked ticket also gets an ``agent`` chip, so a person can see
+    mini-ork is working it.
+    """
+    provider = str(row.provider)
+    priority = int(row.priority)
+    meta = [S.meta_item(_PRIORITY_LABELS.get(priority, str(priority)), mono=True)]
+    if row.assignee:
+        meta.append(S.meta_item(str(row.assignee)))
+    meta.append(S.meta_item(provider, "cyan"))          # the source chip
+    if run_id:
+        meta.append(S.meta_item("agent", "green"))      # mini-ork is on it
+    if run_id:
+        do: dict[str, Any] | None = S.open_run(run_id, str(row.title))
+    elif row.url:
+        do = S.url(str(row.url))
+    else:
+        do = None
+    _column, state, mark = _ticket_column(str(row.state))
+    return {"id": row.uid, "title": f"{row.native_key} · {row.title}",
+            "sub": f"{provider} · {row.native_state}", "state": state, "mark": mark,
+            "meta": meta, "do": do,
+            # Internal — sorted on, stripped before the page serialises.
+            "_priority": priority, "_recency": int(recency)}
+
+
+def _freshness_items(home: Path, now: int) -> list[dict[str, Any]]:
+    """The list lines above the columns: the empty state, sync errors, or ages.
+
+    Never a blank board. With no external source enabled the one line names
+    ``config/pm.yaml`` and says what a source needs; a source whose last sync
+    recorded an ``error`` gets a warn line with the source id and that error
+    text — rendered verbatim, because it is already credential-scrubbed at
+    write time by ``mini_ork/pm/http.py`` and must never be re-derived from a
+    token here; a healthy source shows when it last synced.
+    """
+    from mini_ork.pm import store
+    from mini_ork.pm.config import load_config
+
+    try:
+        enabled = [s for s in load_config().enabled() if s.id != "local"]
+    except Exception:  # noqa: BLE001 — a broken config must not blank the board
+        return []
+    if not enabled:
+        return [S.muted("No PM source is enabled — add a source to config/pm.yaml "
+                        "with `enabled: true` and its `token_env` key in the vault "
+                        "(`mini-ork vault status`).")]
+    items: list[dict[str, Any]] = []
+    mirrored = [s for s in store.mirror_state(db=str(home / "state.db"))
+                if s.get("provider") != "local"]
+    errored = [s for s in mirrored if s.get("error")]
+    if errored:
+        for s in errored:
+            items.append(S.warn(str(s.get("provider")), str(s.get("error"))))
+        return items
+    for s in mirrored:
+        stamp = str(s.get("synced_at") or "")
+        epoch = _iso_epoch(stamp)
+        age = S.age(epoch, now) if epoch is not None else stamp
+        items.append(S.muted(f"{s.get('provider')} · synced {age} ago"))
+    return items
+
+
+def _source_actions(home: Path) -> list[dict[str, Any]]:
+    """Header buttons that set ``args['source']``: All / Epics / one per source.
+
+    ``all`` draws epics and every external ticket; ``local`` is epics only; a
+    provider id is that source's tickets only. The provider list is read from
+    the mirror, guarded so a missing table costs the buttons, never the page.
+    """
+    providers: list[str] = []
+    try:
+        from mini_ork.pm import store
+
+        providers = sorted({
+            str(s.get("provider"))
+            for s in store.mirror_state(db=str(home / "state.db"))
+            if s.get("provider") and s.get("provider") != "local"
+        })
+    except Exception:  # noqa: BLE001 — no mirror, no per-source buttons
+        providers = []
+    buttons = [S.btn("All", S.set_args(source="all")),
+               S.btn("Epics", S.set_args(source="local"))]
+    buttons.extend(S.btn(p, S.set_args(source=p)) for p in providers)
+    return buttons
+
+
+def _epic_buckets(home: Path, db, buckets: dict[str, list[dict[str, Any]]]) -> None:
+    """Fill ``buckets`` with the epic cards (today's read, unchanged)."""
     cols = _epics_table_columns(home)
     select_priority = ", e.priority" if "priority" in cols else ", 0 AS priority"
     select_attempts = ", e.attempts" if "attempts" in cols else ", 0 AS attempts"
@@ -322,7 +472,6 @@ def _tasks_board(home: Path, errors: dict[str, str]) -> list[dict[str, Any]]:
             if eid:
                 latest[eid] = str(r.get("run_id") or "")
 
-    buckets: dict[str, list[dict[str, Any]]] = {t: [] for t, _ in _TASK_COLUMNS}
     # Use the SQL order as the recency rank: row 0 is the newest, so a
     # descending sort keeps the most-recent card first within a priority tier.
     rows_list = list(rows)
@@ -341,16 +490,95 @@ def _tasks_board(home: Path, errors: dict[str, str]) -> list[dict[str, Any]]:
         buckets[column_title].append(_task_card(r, latest.get(eid), kickoff_abs,
                                                 recency=recency))
 
+
+def _tickets_into(home: Path, buckets: dict[str, list[dict[str, Any]]],
+                  source: str) -> int:
+    """Fill ``buckets`` with the mirror-ticket cards; return the canceled count.
+
+    Reads only the mirror (never a network call, never a mirror write), skips
+    ``local`` rows — those epics are already drawn from the ``epics`` table —
+    and applies ``source``: ``all`` keeps every provider, anything else keeps
+    just that one. ``canceled`` is not drawn; the count comes back so the
+    section note can report it. Every read goes through the home's ``state.db``
+    by explicit path, so a test's temp home never touches the developer's
+    mirror.
+    """
+    from mini_ork.pm import store
+
+    mirror_db = str(home / "state.db")
+    rows = [r for r in store.query_rows(db=mirror_db) if str(r.provider) != "local"]
+    if source not in ("all", "local"):
+        rows = [r for r in rows if str(r.provider) == source]
+    canceled = 0
+    total = len(rows)
+    for idx, r in enumerate(rows):
+        if str(r.state) == "canceled":
+            canceled += 1
+            continue
+        try:
+            links = store.links_for(r.uid, db=mirror_db)
+        except Exception:  # noqa: BLE001 — one bad edge must not blank a card
+            links = []
+        run_id = _run_id_from_links(r.uid, links)
+        column_title = _ticket_column(str(r.state))[0]
+        buckets[column_title].append(_ticket_card(r, run_id, recency=total - idx))
+    return canceled
+
+
+def _tasks_board(home: Path, args: dict[str, str], now: int,
+                 errors: dict[str, str]) -> list[dict[str, Any]]:
+    """The Tasks sections: a freshness list, then one ``columns`` section.
+
+    ``args['source']`` filters what is drawn — ``all`` (epics + every external
+    ticket), ``local`` (epics only), or a provider id (that source's tickets
+    only). Epics and tickets share one order and one per-column cap.
+    """
+    source = str((args or {}).get("source") or "all").strip() or "all"
+    show_epics = source in ("all", "local")
+    db = _db(home)
+    if show_epics and not db.has_table("epics"):
+        # Missing table — the page must still build, with a single muted line
+        # in place of the board so the operator knows the create isn't here
+        # yet. S.guarded wraps the whole read so a missing table still costs
+        # only this one section.
+        return [S.lst("Tasks", [S.muted("No epics table — initialise the project "
+                                       "(``mini-ork init``) to see the Tasks column here.")],
+                       full=True)]
+
+    buckets: dict[str, list[dict[str, Any]]] = {t: [] for t, _ in _TASK_COLUMNS}
+    if show_epics:
+        _epic_buckets(home, db, buckets)
+
+    canceled = 0
+    if source != "local":
+        try:
+            canceled = _tickets_into(home, buckets, source)
+        except Exception as exc:  # noqa: BLE001 — one broken mirror must not blank the board
+            errors["Tickets"] = f"{type(exc).__name__}: {exc}"
+
     out_cols: list[dict[str, Any]] = []
     for title, colour in _TASK_COLUMNS:
         cards = _sort_task_cards(buckets[title])[:_TASK_CAP]
-        # Strip the internal sort key before serialising.
+        # Strip the internal sort keys before serialising.
         for card in cards:
             card.pop("_recency", None)
+            card.pop("_priority", None)
         out_cols.append(S.column(title, cards, c=colour))
 
-    return [S.columns("Tasks", out_cols, full=True,
-                      note="Epics archived at the source level never appear here.")]
+    note = "Epics archived at the source level never appear here."
+    if canceled:
+        note += (f" {canceled} canceled ticket(s) from the sources are not shown.")
+
+    sections: list[dict[str, Any]] = []
+    try:
+        items = _freshness_items(home, now)
+    except Exception as exc:  # noqa: BLE001 — freshness must not blank the board
+        errors["Sources"] = f"{type(exc).__name__}: {exc}"
+        items = []
+    if items:
+        sections.append(S.lst("Sources", items, full=True))
+    sections.append(S.columns("Tasks", out_cols, full=True, note=note))
+    return sections
 
 
 # ── page ────────────────────────────────────────────────────────────────────
@@ -360,12 +588,19 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     tab = tab if tab in dict(TABS) else TABS[0][0]
     now = int(time.time())
     errors: dict[str, str] = {}
+    actions = [S.btn("New task", S.thread("/task "), "primary")]
     if tab == "runs":
         sections = S.guarded(errors, "Board", lambda: _board(home, now, errors))
     else:
-        sections = S.guarded(errors, "Tasks", lambda: _tasks_board(home, errors))
+        # The mirror controls ride the Tasks tab only: ``Sync tickets`` (an
+        # ``intake once --dry-run`` — refreshes the mirror, starts nothing)
+        # and the ``source`` filter buttons.
+        actions.append(S.btn("Sync tickets", S.cli("intake", "once", "--dry-run")))
+        actions.extend(_source_actions(home))
+        sections = S.guarded(errors, "Tasks",
+                             lambda: _tasks_board(home, args, now, errors))
     return S.page("kanban", "Board",
                   "Epics grouped by what the scheduler is doing with them, "
                   "or every run grouped by the state it is in.",
-                  actions=[S.btn("New task", S.thread("/task "), "primary")],
+                  actions=actions,
                   tabs=TABS, tab=tab, args=args, sections=sections, errors=errors)
