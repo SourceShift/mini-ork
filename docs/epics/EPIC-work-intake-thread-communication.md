@@ -150,7 +150,7 @@ Per `CLAUDE.md`, both tiers are part of done, one config file chooses, and a mis
 
 Preview in-app, agent writes.
 
-- **`mini_ork/documents/`** (package absent) — read-only extraction with **zero new required
+- **`mini_ork/documents/`** (landed; the IDE section and attachments below are not) — read-only extraction with **zero new required
   deps**: XLSX/CSV → grid (`pandas`+`pyarrow`, already installed); PPTX/DOCX → text/structure via
   stdlib `zipfile` + `xml.etree` (both are ZIP+XML); PDF → page rasterisation, host binary first
   (`qlmanage`/`sips`, `pdftoppm`) with pinned `pymupdf` behind an optional extra. **Fail closed
@@ -163,7 +163,7 @@ Preview in-app, agent writes.
 
 ### 2.2 Stage 3 — communication
 
-Transports over the same Thread. New package **`mini_ork/integrations/`** (absent).
+Transports over the same Thread. Package **`mini_ork/integrations/`** — the Telegram transport landed in `bb258b91`; Slack and Discord are not built.
 
 - **Simple tier (no public URL):** Telegram long-poll (`getUpdates`), Slack Socket Mode
   (outbound websocket), Discord Gateway. Keeps the runtime dep list at two.
@@ -207,9 +207,9 @@ original plan's.
 | 7 | `intake/{trigger,poll}.py` + `cli/intake_cmd.py` (tier A) | ✅ `e29fa1b3` |
 | 8 | `web/routes/intake.py` + `intake/{webhooks,dispatch}.py` (tier B) | ✅ `5dd61439` |
 | 9 | IDE `thread` page + `intake` tab on the cold `orch` page | ✅ `90695bb4` |
-| 10 | **Stage 2** — `mini_ork/documents/` + `document` section + attachments | ⬜ planned |
-| 11 | **Stage 3** — `mini_ork/integrations/` transports | ⬜ planned |
-| 12 | Linear, then Jira adapters | ⬜ planned |
+| 10 | **Stage 2** — `mini_ork/documents/` + `document` section + attachments | 🟡 `mini_ork/documents/` landed (salvaged from the escalated `wit-2-documents` run); `document` section + attachments planned |
+| 11 | **Stage 3** — `mini_ork/integrations/` transports | 🟡 Telegram landed `bb258b91`; Slack/Discord planned |
+| 12 | Linear, then Jira adapters | 🟡 Linear landed `4379ff03`; Jira planned |
 | 13 | Write-back behind capability + `write_back: true` | ⬜ planned |
 
 ---
