@@ -110,10 +110,11 @@ class _FakeWorkspace:
 def fake_backend(monkeypatch):
     """Register a recording ``fakebox`` backend and select it.
 
-    ``resolve_spawn_workspace`` builds an unknown-name backend through
-    ``get_workspace(name, root=…)``, so the factory takes ``**kwargs``. The
-    returned dict is mutable: set ``rc``/``stdout``/``stderr`` before calling
-    ``spawn()`` to shape the child's outcome.
+    ``resolve_spawn_workspace`` builds any non-``local`` backend through
+    ``get_workspace(name, image=…, drive_root=…, mount_path=…, env=…)``, so the
+    factory takes ``**kwargs``. The returned dict is mutable: set
+    ``rc``/``stdout``/``stderr`` before calling ``spawn()`` to shape the
+    child's outcome.
     """
     mod: dict = {"rc": 0, "stdout": "child ok\n", "stderr": ""}
 
@@ -232,8 +233,11 @@ def test_isolated_child_runs_in_the_workspace(env, kickoff, parent, fake_backend
     assert ws.spawn_kwargs["cwd"] == "/workspace/runs/p-iso/children/c-iso/worktree"
     assert ws.spawn_kwargs["stdin"] == ""
     assert ws.spawn_kwargs["timeout"] == spawn_mod._DEFAULT_CHILD_TIMEOUT
-    # The drive root handed to the factory is the run tree's parent.
-    assert fake_backend["kwargs"]["root"] == str(env)
+    # The isolated branch hands the factory drive-style kwargs (not the host
+    # ``root=`` the pre-catalog fall-through used): the drive root is the run
+    # tree's parent and the mount path is the in-sandbox view.
+    assert fake_backend["kwargs"]["drive_root"] == str(env)
+    assert fake_backend["kwargs"]["mount_path"] == "/workspace"
 
     child_env = ws.spawn_kwargs["env"]
     # …the run contract always rides (it is MINI_ORK_*, outside the MO_* list)
@@ -324,7 +328,9 @@ def test_drive_root_above_home_remaps_the_child_paths(env, kickoff, parent, fake
     spawn_mod.spawn(parent_run="p", kickoff=kickoff, child_run="c")
 
     ws = fake_backend["ws"]
-    assert fake_backend["kwargs"]["root"] == str(Path(env).parent)
+    # Same drive-style kwarg shape as the sibling test above, now the remapped
+    # drive root (the run tree's grandparent, i.e. ``MO_SHARED_DRIVE_ROOT``).
+    assert fake_backend["kwargs"]["drive_root"] == str(Path(env).parent)
     # The run tree is created directly on the drive…
     assert ws.spawn_kwargs["cwd"] == "/workspace/runs/p/children/c/worktree"
     assert ws.spawn_kwargs["argv"][-1] == "/workspace/runs/p/children/c/kickoff.md"

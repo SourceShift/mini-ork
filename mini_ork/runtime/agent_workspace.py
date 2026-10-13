@@ -15,22 +15,17 @@ Contract (opt-in, loud on error):
     default path never touches a Workspace).
   * ``local`` → a :class:`LocalWorkspace` (which itself delegates to
     ``mo_runtime_exec``) → observable parity with the unset path.
-  * ``microvm`` → a per-node :class:`MicrovmWorkspace` (hardware-isolated
-    microVM via the microsandbox SDK) bind-mounting the shared drive at
-    ``/workspace``. This is the **default-preferred** isolation: millisecond
-    boot, hardware isolation, and the *same* self-hosted server runs locally or
-    in the cloud — the scalable cloud-launch path.
-  * ``docker`` → a per-node :class:`DockerWorkspace` bind-mounting the shared
-    drive at ``/workspace``; the local/offline **fallback** when no microVM
-    server is available. ``exec_cwd`` is the in-container mount path, not the
-    host path. Both backend modules are imported *here, lazily*, so the default
-    path never imports either.
-  * ``remote`` → a per-run :class:`RemoteWorkspace` driving a node-agent over
-    HTTP (remote-nodes-06, kickoff §1). Selected through
-    ``$MO_NODE``/``$MO_NODE_URL``+``$MO_NODE_TOKEN`` and the
-    ``config/nodes.yaml`` registry. ``exec_cwd`` is the in-container mount
-    path; transport errors retry with bounded backoff and raise
-    :class:`RemoteUnavailableError` — never a silent host fallback.
+  * **any other name** → ``get_workspace(name, image=…, drive_root=…,
+    mount_path=MOUNT_PATH, env=…)`` and ``exec_cwd = MOUNT_PATH``. This one
+    name-agnostic path covers the built-ins — ``microvm`` (per-node microVM via
+    the microsandbox SDK; the **default-preferred** hardware isolation),
+    ``docker`` (per-node container; the local/offline fallback) and ``remote``
+    (a node-agent over HTTP, selected through ``$MO_NODE``/``$MO_NODE_URL`` +
+    ``$MO_NODE_TOKEN`` and ``config/nodes.yaml``; transport errors retry with
+    bounded backoff and raise :class:`RemoteUnavailableError` — never a silent
+    host fallback) — AND any backend registered or catalogued later. No ladder
+    here names a backend; :func:`get_workspace` lazy-imports a catalog backend
+    on first use, so the default path imports none of them.
   * unknown backend → ``ValueError`` from :func:`get_workspace` — never a silent
     host fallback.
 
@@ -97,37 +92,22 @@ def resolve_agent_workspace(
     if backend == "local":
         # Parity: LocalWorkspace.exec delegates straight to mo_runtime_exec.
         return get_workspace("local", root=node_cwd), node_cwd
-    if backend in ("microvm", "docker", "remote"):
-        # Lazy import: the container/microVM/remote backend is only pulled in
-        # when opted into, keeping the default path free of any SDK/CLI/HTTP
-        # dependency. microvm is the default-preferred isolation; docker the
-        # fallback; remote the data-plane backend (kickoff §1).
-        if backend == "microvm":
-            import mini_ork.runtime.backends.microvm as _microvm_backend  # noqa: F401
-        elif backend == "docker":
-            import mini_ork.runtime.backends.docker as _docker_backend  # noqa: F401
-        else:
-            # remote — imported lazily so the default path never imports it
-            # (verified by tests/unit/test_remote_workspace.py).
-            import mini_ork.runtime.backends.remote as _remote_backend  # noqa: F401
-
-        root = drive_root or (src.get(ENV_DRIVE_ROOT) or "").strip() or node_cwd
-        image = (src.get(ENV_IMAGE) or "").strip()
-        # ``remote`` factory needs the resolver's scoped env to honor
-        # ``MO_NODE_URL`` etc. without requiring the caller to set ``os.environ``.
-        # docker/microvm read env directly, so we don't forward it for them.
-        if backend == "remote":
-            ws = get_workspace(
-                backend, image=image, drive_root=root, mount_path=MOUNT_PATH,
-                env=dict(src),
-            )
-        else:
-            ws = get_workspace(
-                backend, image=image, drive_root=root, mount_path=MOUNT_PATH,
-            )
-        return ws, MOUNT_PATH
-    # Unknown backend → loud ValueError (never a silent host fallback).
-    return get_workspace(backend, root=node_cwd), node_cwd
+    # Any other name is a drive-mounting isolated backend (built-in or plugin):
+    # name-agnostic, so no backend name is listed here and adding one needs no
+    # edit to this file. ``get_workspace`` lazy-imports a catalog backend on
+    # first use (keeping the default path free of any SDK/CLI/HTTP dependency)
+    # and raises the loud ``ValueError`` for a name it cannot resolve — never a
+    # silent host fallback. The scoped ``env`` is forwarded so every factory
+    # (docker/microvm/remote alike) reads its config from the SAME source.
+    root = drive_root or (src.get(ENV_DRIVE_ROOT) or "").strip() or node_cwd
+    image = (src.get(ENV_IMAGE) or "").strip()
+    return (
+        get_workspace(
+            backend, image=image, drive_root=root, mount_path=MOUNT_PATH,
+            env=dict(src),
+        ),
+        MOUNT_PATH,
+    )
 
 
 def resolve_spawn_workspace(
@@ -142,9 +122,9 @@ def resolve_spawn_workspace(
     CLI *itself* (SE-3 SC3) rather than its tool-exec. ``backend`` is the explicit
     selector the dispatch layer already chose (``DispatchRequest.workspace``:
     ``docker``/``microvm``/``local``), NOT read from ``MO_SANDBOX_BACKEND`` here —
-    that decision was made upstream. Reuses the same lazy backend import and the
-    same image/drive kwargs as the tool-exec resolver so container config stays
-    defined in one place.
+    that decision was made upstream. Reuses the same name-agnostic isolated
+    branch and the same image/drive kwargs as the tool-exec resolver so container
+    config stays defined in one place.
 
     ``"host"`` (and ``""``) must never reach here: the host CLI spawn stays an
     in-process Popen inside ``dispatch``. An unknown backend raises a loud
@@ -159,25 +139,12 @@ def resolve_spawn_workspace(
     if backend == "local":
         # Parity: LocalWorkspace.spawn delegates straight to core.spawn_local.
         return get_workspace("local", root=cwd or os.getcwd())
-    if backend in ("microvm", "docker", "remote"):
-        # Lazy import so the default path never pulls the CLI/SDK/HTTP
-        # dependency; microvm is the default-preferred isolation, docker the
-        # fallback, remote the kickoff §1 backend.
-        if backend == "microvm":
-            import mini_ork.runtime.backends.microvm as _microvm_backend  # noqa: F401
-        elif backend == "docker":
-            import mini_ork.runtime.backends.docker as _docker_backend  # noqa: F401
-        else:
-            import mini_ork.runtime.backends.remote as _remote_backend  # noqa: F401
-        root = (src.get(ENV_DRIVE_ROOT) or "").strip() or cwd or os.getcwd()
-        image = (src.get(ENV_IMAGE) or "").strip()
-        if backend == "remote":
-            return get_workspace(
-                backend, image=image, drive_root=root, mount_path=MOUNT_PATH,
-                env=dict(src),
-            )
-        return get_workspace(
-            backend, image=image, drive_root=root, mount_path=MOUNT_PATH,
-        )
-    # Unknown backend → loud ValueError (never a silent host fallback).
-    return get_workspace(backend, root=cwd or os.getcwd())
+    # Any other name is an isolated backend — name-agnostic, exactly as in
+    # :func:`resolve_agent_workspace` (built-ins, plugins, and unknown names all
+    # land here; unknown → the loud ValueError from get_workspace).
+    root = (src.get(ENV_DRIVE_ROOT) or "").strip() or cwd or os.getcwd()
+    image = (src.get(ENV_IMAGE) or "").strip()
+    return get_workspace(
+        backend, image=image, drive_root=root, mount_path=MOUNT_PATH,
+        env=dict(src),
+    )

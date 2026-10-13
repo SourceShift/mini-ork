@@ -284,23 +284,29 @@ def _factory(**kwargs: Any) -> DockerWorkspace:
     Missing required config raises a clear ``RuntimeError`` (not a ``TypeError``
     traceback) so ``get_workspace("docker")`` with nothing configured fails
     loudly and legibly.
+
+    ``env`` is an optional scoped mapping: when ``get_workspace`` resolves
+    through the resolver, the caller's env (which may not be ``os.environ``) is
+    forwarded here so every config read comes from ONE source — the same
+    contract the ``remote`` factory already honors. Absent → ``os.environ``,
+    byte-for-byte today's behavior.
     """
-    image = kwargs.pop("image", None) or os.environ.get("MO_SANDBOX_IMAGE")
+    scoped_env = kwargs.pop("env", None)
+    src = scoped_env if scoped_env is not None else os.environ
+    image = kwargs.pop("image", None) or src.get("MO_SANDBOX_IMAGE")
     if not image:
         raise RuntimeError(
             "docker workspace requires an image: pass image= or set "
             "MO_SANDBOX_IMAGE"
         )
-    drive_root = kwargs.pop("drive_root", None) or os.environ.get(
-        "MO_SHARED_DRIVE_ROOT"
-    )
+    drive_root = kwargs.pop("drive_root", None) or src.get("MO_SHARED_DRIVE_ROOT")
     if not drive_root:
         raise RuntimeError(
             "docker workspace requires a drive_root: pass drive_root= or set "
             "MO_SHARED_DRIVE_ROOT"
         )
-    kwargs.setdefault("cpu", os.environ.get("MO_SANDBOX_CPU"))
-    kwargs.setdefault("memory", os.environ.get("MO_SANDBOX_MEMORY"))
+    kwargs.setdefault("cpu", src.get("MO_SANDBOX_CPU"))
+    kwargs.setdefault("memory", src.get("MO_SANDBOX_MEMORY"))
     return DockerWorkspace(image=image, drive_root=drive_root, **kwargs)
 
 

@@ -342,29 +342,42 @@ def _factory(**kwargs: Any) -> MicrovmWorkspace:
     Missing required config raises a clear ``RuntimeError`` (not a ``TypeError``
     traceback) so ``get_workspace("microvm")`` with nothing configured fails
     loudly and legibly.
+
+    ``env`` is an optional scoped mapping: when ``get_workspace`` resolves
+    through the resolver, the caller's env (which may not be ``os.environ``) is
+    forwarded here so EVERY config read — image, drive root and the CPU/memory
+    limits (via :func:`_int_env`) — comes from ONE source, the same contract the
+    ``remote`` factory already honors. Absent → ``os.environ``, byte-for-byte
+    today's behavior.
     """
-    image = kwargs.pop("image", None) or os.environ.get("MO_SANDBOX_IMAGE")
+    scoped_env = kwargs.pop("env", None)
+    src = scoped_env if scoped_env is not None else os.environ
+    image = kwargs.pop("image", None) or src.get("MO_SANDBOX_IMAGE")
     if not image:
         raise RuntimeError(
             "microvm workspace requires an image: pass image= or set "
             "MO_SANDBOX_IMAGE"
         )
-    drive_root = kwargs.pop("drive_root", None) or os.environ.get(
-        "MO_SHARED_DRIVE_ROOT"
-    )
+    drive_root = kwargs.pop("drive_root", None) or src.get("MO_SHARED_DRIVE_ROOT")
     if not drive_root:
         raise RuntimeError(
             "microvm workspace requires a drive_root: pass drive_root= or set "
             "MO_SHARED_DRIVE_ROOT"
         )
-    kwargs.setdefault("cpus", _int_env("MO_SANDBOX_CPU"))
-    kwargs.setdefault("memory", _int_env("MO_SANDBOX_MEMORY"))
+    kwargs.setdefault("cpus", _int_env("MO_SANDBOX_CPU", src))
+    kwargs.setdefault("memory", _int_env("MO_SANDBOX_MEMORY", src))
     return MicrovmWorkspace(image=image, drive_root=drive_root, **kwargs)
 
 
-def _int_env(name: str) -> int | None:
-    """Parse an int env var, or ``None`` when unset/blank (limits are optional)."""
-    raw = (os.environ.get(name) or "").strip()
+def _int_env(name: str, env: Mapping[str, str] | None = None) -> int | None:
+    """Parse an int env var, or ``None`` when unset/blank (limits are optional).
+
+    ``env`` defaults to ``os.environ`` so the existing one-arg callers are
+    unchanged; the factory passes its scoped env so a limit read honors the same
+    source as image/drive root.
+    """
+    src = os.environ if env is None else env
+    raw = (src.get(name) or "").strip()
     if not raw:
         return None
     try:

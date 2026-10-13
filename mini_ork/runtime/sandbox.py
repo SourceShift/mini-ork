@@ -14,13 +14,23 @@ mirrors the repo's registry-extension pattern (see
 ``register_node_handler`` / ``register_provider_kind``): a backend registers
 a factory by name and is resolved via :func:`get_workspace`.
 
+Backend resolution is name-agnostic: a factory registers by name, and a
+built-in backend that is not yet imported is reached through a **lazy catalog**
+(:data:`_LAZY_WORKSPACE_BACKENDS`, name → module path) that :func:`get_workspace`
+imports on first use. So adding a backend is one module that calls
+``register_workspace_backend(<name>, factory)`` at import plus one catalog line —
+callers never enumerate backend names.
+
 Import-time contract: pure stdlib + ``mini_ork.runtime.contract`` only, no
 third-party dependency, no I/O and no env mutation at import (registering the
 built-in ``local`` factory in a dict is the only import-time effect, matching
-the existing SOLID seams).
+the existing SOLID seams). The catalog holds module-path STRINGS — no backend
+module is imported at import time; ``importlib`` runs only inside
+:func:`get_workspace`'s registry-miss path.
 """
 from __future__ import annotations
 
+import importlib
 import os
 import tempfile
 from collections.abc import Mapping, Sequence
@@ -34,6 +44,8 @@ __all__ = [
     "LocalWorkspace",
     "WorkspaceFactory",
     "register_workspace_backend",
+    "register_lazy_workspace_backend",
+    "known_workspace_backends",
     "get_workspace",
 ]
 
@@ -160,6 +172,17 @@ WorkspaceFactory = Callable[..., Workspace]
 
 _WORKSPACE_BACKENDS: dict[str, WorkspaceFactory] = {}
 
+# Lazy catalog: name → importable module path for the built-in backends. Each
+# module registers its factory via ``register_workspace_backend`` at import, so
+# importing it makes the name resolvable. Kept as STRINGS (never module objects)
+# so this module's import-time surface stays stdlib-only — no backend module is
+# pulled in until ``get_workspace`` actually needs it.
+_LAZY_WORKSPACE_BACKENDS: dict[str, str] = {
+    "docker": "mini_ork.runtime.backends.docker",
+    "microvm": "mini_ork.runtime.backends.microvm",
+    "remote": "mini_ork.runtime.backends.remote",
+}
+
 
 def register_workspace_backend(name: str, factory: WorkspaceFactory) -> None:
     """Register a ``Workspace`` factory under ``name`` (SOLID extension seam).
@@ -172,15 +195,59 @@ def register_workspace_backend(name: str, factory: WorkspaceFactory) -> None:
     _WORKSPACE_BACKENDS[name] = factory
 
 
+def register_lazy_workspace_backend(name: str, module: str) -> None:
+    """Catalog ``name`` → importable ``module`` path for lazy resolution.
+
+    A backend NOT importable at this module's import time (a built-in kept off
+    the default path, or a plugin only reachable when selected) is reachable
+    through this catalog: :func:`get_workspace` imports ``module`` on first use,
+    and the module's import-time ``register_workspace_backend`` makes the name
+    resolvable. The ``module`` is stored as a string, so cataloguing costs no
+    import. Re-cataloguing a name overrides it (last write wins).
+
+    This is the API epic A2 (teardown registry) and epic B (node-provider seam)
+    add their backends through, so they never edit :func:`get_workspace`.
+    """
+    _LAZY_WORKSPACE_BACKENDS[name] = module
+
+
+def known_workspace_backends() -> list[str]:
+    """Every resolvable backend name — the sorted union of registered and
+    catalogued names.
+
+    Epic A2 (teardown registry) and epic B (node-provider seam) consume this to
+    enumerate backends without hardcoding the list, and :func:`get_workspace`'s
+    unknown-name error lists it.
+    """
+    return sorted(set(_WORKSPACE_BACKENDS) | set(_LAZY_WORKSPACE_BACKENDS))
+
+
 def get_workspace(backend: str = "local", **kwargs: Any) -> Workspace:
     """Resolve ``backend`` to a live ``Workspace``; unknown → ``ValueError``.
 
+    On a registry miss, a name in the lazy catalog is imported once (the module
+    registers its factory at import) and resolution is retried. An import
+    failure raises ``RuntimeError`` naming the backend and the module; a name
+    that is neither registered nor catalogued — or a catalog module that imports
+    but never registers — raises the existing ``ValueError``.
+
     ``kwargs`` pass through to the factory (e.g. ``root=`` for the local
-    backend, image/CPU/memory for a future cloud backend).
+    backend, image/drive_root/mount_path/env for an isolated backend).
     """
     factory = _WORKSPACE_BACKENDS.get(backend)
     if factory is None:
-        known = ", ".join(sorted(_WORKSPACE_BACKENDS)) or "(none)"
+        module = _LAZY_WORKSPACE_BACKENDS.get(backend)
+        if module is not None:
+            try:
+                importlib.import_module(module)
+            except Exception as exc:  # import failure → loud, never a silent miss
+                raise RuntimeError(
+                    f"workspace backend {backend!r} could not be imported from "
+                    f"module {module!r}: {exc}"
+                ) from exc
+            factory = _WORKSPACE_BACKENDS.get(backend)
+    if factory is None:
+        known = ", ".join(known_workspace_backends()) or "(none)"
         raise ValueError(
             f"unknown workspace backend {backend!r}; registered: {known}"
         )
