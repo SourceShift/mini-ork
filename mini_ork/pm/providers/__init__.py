@@ -29,7 +29,7 @@ acceptable.
 from __future__ import annotations
 
 from mini_ork.pm import config as pm_config
-from mini_ork.pm.providers import github, linear, local
+from mini_ork.pm.providers import github, jira, linear, local
 from mini_ork.pm.registry import register_provider
 
 #: mini-ork's own epics. The one source that needs no config, no network and no
@@ -43,6 +43,7 @@ register_provider(local.provider())
 _CONFIGURED = {
     "github": github.GithubProvider,
     "linear": linear.LinearProvider,
+    "jira": jira.JiraProvider,
 }
 
 _SKIPPED: list[tuple[str, str]] = []
@@ -82,4 +83,4 @@ def _register_configured() -> None:
 
 _register_configured()
 
-__all__ = ["github", "linear", "local", "skipped_sources"]
+__all__ = ["github", "jira", "linear", "local", "skipped_sources"]

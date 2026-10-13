@@ -90,9 +90,24 @@ sources:
     # trigger_recipe: code-fix    # the recipe a launched run uses
     # webhook_secret_env: LINEAR_WEBHOOK_SECRET   # tier B: see INTAKE WEBHOOKS above
 
-  # jira:
-  #   enabled: false
-  #   token_env: JIRA_API_TOKEN
-  #   site: https://acme.atlassian.net
-  #   email_env: JIRA_EMAIL       # the account the token belongs to
-  #   project: ENG
+  # A Jira project. Same shape as the other two — the source id is the registry
+  # id, so `jira` and `jira-ops` are two independent sources with their own
+  # `project` and their own key names. Jira is the heaviest to authenticate: an
+  # install URL, the account's email and an API token, sent as HTTP Basic, so
+  # BOTH halves are named here as vault keys and neither is a value. It reads
+  # over the REST API v3 (/rest/api/3): issues are scoped to `project`, the
+  # status *category* maps onto the normalized states with Jira's own status
+  # name kept beside it, priority maps from Jira's named priorities, and the
+  # ADF description and comment bodies are converted to markdown. Reads only,
+  # like GitHub and Linear. Shipped disabled — flip `enabled` to true once
+  # `JIRA_API_TOKEN` and `JIRA_EMAIL` resolve through the vault.
+  jira:
+    enabled: false
+    token_env: JIRA_API_TOKEN   # an API token; a read-only token is enough
+    email_env: JIRA_EMAIL       # the account the token belongs to (name only)
+    site: https://acme.atlassian.net   # the install URL
+    project: ENG                # the project KEY the issues live in (as in ENG-123)
+    # api_url: https://jira.acme.dev/rest/api/3   # a proxied or self-hosted REST base
+    # trigger_label: agent        # uncomment to let intake start these tickets
+    # trigger_recipe: code-fix    # the recipe a launched run uses
+    # webhook_secret_env: JIRA_WEBHOOK_SECRET   # tier B: see INTAKE WEBHOOKS above
