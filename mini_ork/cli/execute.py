@@ -3497,6 +3497,15 @@ def _make_checkpoint_fn(db, run_id, run_dir, recipe, task_class):
     # (design §7). On a normal run the env is unset → owner_token=None → no
     # fencing (preserves E1's contract).
     owner_token = os.environ.get("MINI_ORK_LEASE_TOKEN") or None
+    # A child run spawned by a recovered node (an SDD/epic child, any nested
+    # `mini-ork run`) inherits the recovering parent's token. Presenting it for
+    # the child's own run_id fails the fence on every node, so the child ends
+    # with no checkpoints and a later revive of it restarts from the planner.
+    # The token belongs to MINI_ORK_LEASE_RUN_ID; for any other run this is a
+    # normal, unfenced run. Unset (a pre-binding recover) keeps the old contract.
+    _lease_run = os.environ.get("MINI_ORK_LEASE_RUN_ID", "").strip()
+    if owner_token and _lease_run and _lease_run != run_id:
+        owner_token = None
     # Pre-compute the stable input/config hashes; both depend only on
     # resolved run-level fields so they are constant for a given (run,
     # recipe, task_class) and only vary by node_id (input_hash) — which

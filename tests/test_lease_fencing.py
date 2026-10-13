@@ -228,3 +228,56 @@ def test_stale_worker_cannot_publish_checkpoint(db_path, tmp_path):
         artifact_paths=[], run_dir=str(run_dir), started_at=now, ended_at=now,
     )
     assert rc_legacy == 0
+
+
+# ── token binding: a recovered parent's token must not fence its children ──
+
+
+def _checkpoint_rows(db_path: str, run_id: str) -> int:
+    con = sqlite3.connect(db_path)
+    try:
+        return con.execute(
+            "SELECT COUNT(*) FROM node_checkpoints WHERE run_id=?", (run_id,)).fetchone()[0]
+    finally:
+        con.close()
+
+
+def test_child_run_inheriting_parent_token_still_checkpoints(db_path, tmp_path, monkeypatch):
+    """2026-10-14: `recover` of an SDD parent exported its lease token, every
+    child the dispatcher spawned inherited it, and each child checkpoint was
+    fenced ("token … is not the live lease holder of run <child>") — so the
+    child ended with no checkpoints and could only be restarted, not revived."""
+    from mini_ork.cli import execute
+
+    now = int(time.time())
+    assert lease.acquire_lease(db_path, "parent", owner_token="P", now=now) == "P"
+    monkeypatch.setenv("MINI_ORK_LEASE_TOKEN", "P")
+    monkeypatch.setenv("MINI_ORK_LEASE_RUN_ID", "parent")
+
+    run_dir = tmp_path / "child"
+    run_dir.mkdir()
+    (run_dir / "implementer.md").write_text("done")
+    checkpoint = execute._make_checkpoint_fn(
+        db_path, "parent--spec--D1", str(run_dir), "recursive-validate-impl", "tc")
+    checkpoint("implementer", "success", "implementer", "implementer.md")
+
+    assert _checkpoint_rows(db_path, "parent--spec--D1") == 1
+
+
+def test_bound_token_is_still_fenced_for_its_own_run(db_path, tmp_path, monkeypatch):
+    from mini_ork.cli import execute
+
+    now = int(time.time())
+    assert lease.acquire_lease(db_path, "parent", owner_token="P", ttl_s=1, now=now - 10_000) == "P"
+    assert lease.acquire_lease(db_path, "parent", owner_token="Q", now=now) == "Q"
+    monkeypatch.setenv("MINI_ORK_LEASE_TOKEN", "P")
+    monkeypatch.setenv("MINI_ORK_LEASE_RUN_ID", "parent")
+
+    run_dir = tmp_path / "parent"
+    run_dir.mkdir()
+    (run_dir / "planner.md").write_text("done")
+    checkpoint = execute._make_checkpoint_fn(
+        db_path, "parent", str(run_dir), "spec-driven-delivery", "tc")
+    checkpoint("planner", "success", "planner", "planner.md")
+
+    assert _checkpoint_rows(db_path, "parent") == 0

@@ -118,7 +118,7 @@ def test_recover_acquires_lease_and_is_idempotent(tmp_path, db_path, monkeypatch
 
     monkeypatch.setenv("MINI_ORK_RUN_DIR", str(run_dir))
     monkeypatch.setenv("MINI_ORK_RECIPE", recipe)
-    for k in ("MINI_ORK_LEASE_TOKEN", "MINI_ORK_RECOVERY_REQUEST"):
+    for k in ("MINI_ORK_LEASE_TOKEN", "MINI_ORK_LEASE_RUN_ID", "MINI_ORK_RECOVERY_REQUEST"):
         monkeypatch.delenv(k, raising=False)
 
     # ── first recovery: acquires the lease, registers + dispatches once ──
@@ -141,6 +141,7 @@ def test_recover_acquires_lease_and_is_idempotent(tmp_path, db_path, monkeypatch
     assert req_owner == lease_owner[0]        # request fenced to the lease token
     assert from_node == "D"                   # closure entry
     assert os.environ.get("MINI_ORK_LEASE_TOKEN") == lease_owner[0]
+    assert os.environ.get("MINI_ORK_LEASE_RUN_ID") == run_id
 
     # ── second, concurrent recovery: lease still live → safe no-dispatch ──
     rc2 = rp.main([run_id, "--strategy", "resume", "--workflow", str(workflow), "--db", db_path])
