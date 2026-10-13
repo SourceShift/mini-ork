@@ -162,6 +162,92 @@ def test_mo_allow_test_changes_disables_guard(tmp_path):
     assert "tests weakened" not in out["error_summary"], out
 
 
+# ── 10. deletions the kickoff orders are not weakening ──────────────────────
+# A kickoff that retires a component names the tests to delete with it; the
+# 2026-10-13 deorch-k1/k4 runs were failed for following exactly that order.
+
+
+def _kickoff_env(tmp_path: Path, kickoff: Path) -> dict[str, str]:
+    """A run dir whose run_profile.json points at ``kickoff``."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(exist_ok=True)
+    (run_dir / "run_profile.json").write_text(
+        json.dumps({"kickoff_path": str(kickoff)}), encoding="utf-8")
+    return {"MINI_ORK_RUN_DIR": str(run_dir)}
+
+
+_KEEP = {"tests/test_keep.py": "def test_keep():\n    assert True\n",
+         "tests/test_x.py": "def test_x():\n    assert True\n"}
+
+
+def test_a_deletion_the_kickoff_orders_is_not_weakening(tmp_path):
+    repo = _make_repo(tmp_path, {
+        **_KEEP,
+        "docs/kickoff.md": "# Retire x\n\n- DELETE `tests/test_x.py` (x is gone).\n",
+    })
+    (repo / "tests" / "test_x.py").unlink()
+
+    rc, out = _run_verifier(repo, tmp_path, run_id="tamper-kickoff-orders",
+                            extra_env=_kickoff_env(tmp_path, repo / "docs" / "kickoff.md"))
+
+    assert rc == 0, out
+    assert out["pass"] is True, out
+
+
+def test_a_directory_the_kickoff_orders_deleted_covers_the_tests_under_it(tmp_path):
+    repo = _make_repo(tmp_path, {
+        **_KEEP,
+        "legacy/old/tests/test_old.py": "def test_old():\n    assert True\n",
+        "docs/kickoff.md": "- DELETE the directory `legacy/old` (including fixtures)\n",
+    })
+    (repo / "legacy" / "old" / "tests" / "test_old.py").unlink()
+
+    rc, out = _run_verifier(repo, tmp_path, run_id="tamper-kickoff-directory",
+                            extra_env=_kickoff_env(tmp_path, repo / "docs" / "kickoff.md"))
+
+    assert rc == 0, out
+    assert "tests weakened" not in out["error_summary"], out
+
+
+def test_absolute_kickoff_paths_resolve_against_the_repo(tmp_path):
+    repo = _make_repo(tmp_path, dict(_KEEP))
+    kickoff = tmp_path / "kickoff.md"
+    kickoff.write_text(f"- DELETE `{repo / 'tests' / 'test_x.py'}`\n", encoding="utf-8")
+    (repo / "tests" / "test_x.py").unlink()
+
+    rc, out = _run_verifier(repo, tmp_path, run_id="tamper-kickoff-absolute",
+                            extra_env=_kickoff_env(tmp_path, kickoff))
+
+    assert rc == 0, out
+    assert "tests weakened" not in out["error_summary"], out
+
+
+def test_a_deletion_the_kickoff_does_not_order_is_still_weakening(tmp_path):
+    repo = _make_repo(tmp_path, {
+        **_KEEP,
+        "docs/kickoff.md": "- DELETE `tests/test_other.py`\n- EDIT `tests/test_x.py`\n",
+    })
+    (repo / "tests" / "test_x.py").unlink()
+
+    rc, out = _run_verifier(repo, tmp_path, run_id="tamper-kickoff-not-ordered",
+                            extra_env=_kickoff_env(tmp_path, repo / "docs" / "kickoff.md"))
+
+    assert rc == 1, out
+    assert "tests/test_x.py: deleted" in out["error_summary"], out
+
+
+def test_a_patch_cannot_order_its_own_deletion_by_editing_the_kickoff(tmp_path):
+    repo = _make_repo(tmp_path, {**_KEEP, "docs/kickoff.md": "# Retire nothing\n"})
+    (repo / "docs" / "kickoff.md").write_text("- DELETE `tests/test_x.py`\n")
+    (repo / "tests" / "test_x.py").unlink()
+
+    rc, out = _run_verifier(repo, tmp_path, run_id="tamper-kickoff-self-grant",
+                            extra_env=_kickoff_env(tmp_path, repo / "docs" / "kickoff.md"))
+
+    assert rc == 1, out
+    assert "tests weakened" in out["error_summary"], out
+
+
 # ── source-level pin: the guard is wired before the suite runs ──────────────
 def test_tamper_guard_runs_before_suite():
     src = VERIFIER.read_text(encoding="utf-8")

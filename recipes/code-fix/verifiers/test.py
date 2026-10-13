@@ -690,6 +690,93 @@ def _is_guard_test_path(rel_path: str) -> bool:
     return False
 
 
+# A kickoff that retires a component orders its tests deleted ("DELETE
+# `server/x/__tests__/x.test.ts`", "DELETE the directory `recipes/y/`"). Failing
+# the implementer for doing exactly that sank the 2026-10-13 de-orchestration
+# runs (deorch-k1, deorch-k4), so a deletion the kickoff names on a delete or
+# remove line is not weakening. The kickoff is read as of HEAD when it lives in
+# the repo, so a patch cannot grant itself a deletion by editing it.
+_DELETE_LINE_RE = re.compile(r"\b(?:delete|remove)\b", re.IGNORECASE)
+
+
+def _repo_relative(path: str, toplevel: str) -> str | None:
+    """``path`` relative to the repo root, or None when it lies outside it.
+
+    Both sides go through the realpath of their nearest existing ancestor, so a
+    symlinked checkout path and the path of an already-deleted file compare.
+    """
+    head, tail = os.path.abspath(path), []
+    while not os.path.exists(head):
+        head, part = os.path.split(head)
+        if not part:
+            break
+        tail.append(part)
+    full = os.path.join(os.path.realpath(head), *reversed(tail))
+    root = os.path.realpath(toplevel)
+    if not full.startswith(root + os.sep):
+        return None
+    return os.path.relpath(full, root)
+
+
+def _kickoff_text(toplevel: str) -> str:
+    """The run's kickoff, from ``$MINI_ORK_RUN_DIR/run_profile.json``.
+
+    Read from HEAD when the kickoff is inside the repo (and refused when HEAD
+    does not have it); read from disk otherwise. ``""`` when unknown.
+    """
+    run_dir = os.environ.get("MINI_ORK_RUN_DIR", "")
+    if not run_dir:
+        return ""
+    try:
+        with open(os.path.join(run_dir, "run_profile.json"), encoding="utf-8") as fh:
+            kickoff = str(json.load(fh).get("kickoff_path") or "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+    if not kickoff:
+        return ""
+    rel = _repo_relative(kickoff, toplevel)
+    if rel is not None:
+        shown = subprocess.run(["git", "show", f"HEAD:{rel}"], cwd=toplevel,
+                               capture_output=True, text=True)
+        return shown.stdout if shown.returncode == 0 else ""
+    try:
+        with open(kickoff, encoding="utf-8") as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
+def _kickoff_ordered_deletions(toplevel: str) -> tuple[set[str], tuple[str, ...]]:
+    """``(paths, directories)`` the kickoff orders deleted, repo-relative.
+
+    Only lines with a delete/remove verb count. A token names a directory —
+    covering everything under it — when it ends in ``/`` or its line says
+    "directory"; any other token covers that exact path only.
+    """
+    paths: set[str] = set()
+    directories: list[str] = []
+    for line in _kickoff_text(toplevel).splitlines():
+        if not _DELETE_LINE_RE.search(line):
+            continue
+        whole_dir = "directory" in line.lower()
+        for word in line.split():
+            token = word.strip("`'\"()[]{},;:*").rstrip(".")
+            if "/" not in token or "://" in token:
+                continue
+            is_dir = whole_dir or token.endswith("/")
+            if os.path.isabs(token):
+                rel = _repo_relative(token, toplevel)
+            else:
+                rel = os.path.normpath(token[2:] if token.startswith("./") else token)
+            if rel is None or rel.startswith(".."):
+                continue
+            if is_dir:
+                directories.append(rel.rstrip("/") + "/")
+            else:
+                paths.add(rel)
+    return paths, tuple(directories)
+
+
 def _check_tests_tamper(cwd: str) -> tuple[bool, str]:
     """Return ``(violated, reason)`` for test-weakening changes vs HEAD.
 
@@ -707,6 +794,8 @@ def _check_tests_tamper(cwd: str) -> tuple[bool, str]:
         return False, ""
 
     violations: list[str] = []
+    ordered: tuple[set[str], tuple[str, ...]] | None = None
+    allowed: list[str] = []
 
     name_status = subprocess.run(
         ["git", "diff", "-M", "--name-status", "HEAD"],
@@ -726,7 +815,20 @@ def _check_tests_tamper(cwd: str) -> tuple[bool, str]:
             elif status == "D":
                 path = fields[1] if len(fields) > 1 else ""
                 if path and _is_guard_test_path(path):
-                    violations.append(f"{path}: deleted")
+                    if ordered is None:
+                        toplevel = subprocess.run(
+                            ["git", "rev-parse", "--show-toplevel"],
+                            cwd=cwd, capture_output=True, text=True,
+                        ).stdout.strip() or cwd
+                        ordered = _kickoff_ordered_deletions(toplevel)
+                    paths, directories = ordered
+                    if path in paths or path.startswith(directories):
+                        allowed.append(path)
+                    else:
+                        violations.append(f"{path}: deleted")
+    if allowed:
+        sys.stderr.write("[test] tamper guard: the kickoff orders these deletions: "
+                         + ", ".join(allowed) + "\n")
 
     diff = subprocess.run(
         ["git", "diff", "-U0", "HEAD"],
