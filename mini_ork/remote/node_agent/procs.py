@@ -29,7 +29,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 
 # ----- constants ------------------------------------------------------------
@@ -167,6 +167,75 @@ def _resolve_env(env_keys: Iterable[str]) -> dict[str, str]:
 
 
 # ----- registry -------------------------------------------------------------
+
+
+class _CanonicalOutput:
+    """Host runtime: rewrite this run's real dirs back to the sandbox view.
+
+    The docker runtime gives every proc the canonical view (``/workspace/…``,
+    ``/opt/mini-ork``) because the container really has those paths. The host
+    runtime only emulates it: argv, cwd and env are translated canonical → real
+    on the way in (:meth:`ProcRegistry._host_text`), so an agent sees, and
+    reports, the node's real paths. A planner's plan then named
+    ``/home/<user>/…/runs/<id>/target/calc.py`` and the control plane's
+    host-path guard refused the next node's prompt (Daytona e2e,
+    run-1791911811-5826). Mapping real → canonical on the way OUT makes the
+    host runtime's output indistinguishable from docker's.
+
+    One instance per stream: a root split across two reads is held back until
+    the next chunk (or :meth:`flush`) decides it. ``inner`` is the secret
+    redactor, applied first.
+    """
+
+    _BOUNDARY = re.compile(rb"[/\s'\":;,)\]}\\]")   # \\ : a JSON escape (``…\n``)
+
+    def __init__(self, roots: "list[tuple[str, str]]", inner: Any) -> None:
+        pairs: dict[bytes, bytes] = {}
+        for real, canonical in roots:
+            for variant in {real, os.path.realpath(real)}:
+                if variant and variant != canonical:
+                    pairs[variant.rstrip("/").encode()] = canonical.encode()
+        self._pairs = sorted(pairs.items(), key=lambda kv: -len(kv[0]))
+        self._inner = inner
+        self._buf = b""
+
+    def _rewrite(self, data: bytes, *, final: bool) -> bytes:
+        for real, canonical in self._pairs:
+            start = 0
+            while True:
+                i = data.find(real, start)
+                if i < 0:
+                    break
+                after = data[i + len(real):i + len(real) + 1]
+                if after and not self._BOUNDARY.match(after):
+                    start = i + 1            # a longer sibling name, not this root
+                    continue
+                if not after and not final:
+                    break                    # undecidable until the next chunk
+                data = data[:i] + canonical + data[i + len(real):]
+                start = i + len(canonical)
+        return data
+
+    def _held_tail(self, data: bytes) -> int:
+        """Length of the longest suffix that could still grow into a root."""
+        longest = 0
+        for real, _ in self._pairs:
+            for n in range(min(len(real), len(data)), longest, -1):
+                if real.startswith(data[-n:]):
+                    longest = n
+                    break
+        return longest
+
+    def redact(self, chunk: bytes) -> bytes:
+        data = self._rewrite(self._buf + self._inner.redact(chunk), final=False)
+        hold = self._held_tail(data)
+        self._buf = data[len(data) - hold:] if hold else b""
+        return data[:len(data) - hold] if hold else data
+
+    def flush(self) -> bytes:
+        out = self._rewrite(self._buf, final=True)
+        self._buf = b""
+        return out
 
 
 class ProcRegistry:
@@ -538,6 +607,14 @@ class ProcRegistry:
         # under ``_REDACT_MIN_LEN`` are ignored (false-positive risk).
         from ..secrets_scope import make_redactor, secret_values
         redactor = make_redactor(secret_values(ps.spec.env), min_length=_REDACT_MIN_LEN)
+        filters = {out_f: redactor, err_f: redactor}
+        if self.runtime == "host":
+            roots = [(str(self.state_dir.parent), "/workspace")]
+            engine_root = self._active_engine_root()
+            if engine_root is not None:
+                roots.append((str(engine_root), "/opt/mini-ork"))
+            filters = {out_f: _CanonicalOutput(roots, redactor),
+                       err_f: _CanonicalOutput(roots, redactor)}
         timed_out = False
         try:
             while True:
@@ -553,14 +630,14 @@ class ProcRegistry:
                         continue
                     chunk = os.read(fd, _READ_CHUNK)
                     if chunk:
-                        sink.write(redactor.redact(chunk))
+                        sink.write(filters[sink].redact(chunk))
                 ps.out_offset = out_path.stat().st_size
                 ps.err_offset = err_path.stat().st_size
                 if exited:
                     # The pipes can still hold far more than one read's worth
                     # (an agent CLI prints its whole JSON result as it exits);
                     # drain to EOF or the tail is silently lost.
-                    self._drain_to_eof(proc, out_f, err_f, redactor)
+                    self._drain_to_eof(proc, out_f, err_f, redactor, filters=filters)
                     break
                 if deadline is not None and time.time() >= deadline:
                     # A SIGKILL'd child returns a negative rc (-9). Per the
@@ -572,6 +649,13 @@ class ProcRegistry:
                     timed_out = True
                     break
         finally:
+            for sink, flt in filters.items():
+                tail = getattr(flt, "flush", lambda: b"")()
+                if tail:
+                    try:
+                        sink.write(tail)
+                    except OSError:
+                        pass
             try:
                 out_f.close()
             except OSError:
@@ -600,7 +684,8 @@ class ProcRegistry:
             self._persist(ps)
 
     @staticmethod
-    def _drain_to_eof(proc: subprocess.Popen, out_f, err_f, redactor=None) -> None:
+    def _drain_to_eof(proc: subprocess.Popen, out_f, err_f, redactor=None,
+                      filters=None) -> None:
         """Copy whatever is left in both pipes after exit, until EOF.
 
         Bounded by ``_DRAIN_DEADLINE_S``: a grandchild that inherited the pipe
@@ -620,7 +705,8 @@ class ProcRegistry:
                     continue
                 chunk = os.read(stream.fileno(), _READ_CHUNK)
                 if chunk:
-                    sink.write(redactor.redact(chunk) if redactor is not None else chunk)
+                    flt = (filters or {}).get(sink, redactor)
+                    sink.write(flt.redact(chunk) if flt is not None else chunk)
                 else:
                     open_streams.remove(pair)  # EOF
 
