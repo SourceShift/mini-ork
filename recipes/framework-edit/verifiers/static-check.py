@@ -61,6 +61,7 @@ except Exception:  # noqa: BLE001
         "mini_ork/gates/gate_bootstrap.py",
         "mini_ork/gates/abstain_gate.py",
         "mini_ork/recovery/circuit_breaker.py",
+        "mini_ork/recovery/escalation_policy.py",
         "mini_ork/dispatch/calibration.py",
         "mini_ork/recovery/auto_repair.py",
         "mini_ork/policies/engine.py",
@@ -480,24 +481,97 @@ def _run_kickoff_candidates():
     return out
 
 
-def _kickoff_is_auto_triage():
-    """True iff the run's OWN kickoff carries the auto-triage origin marker as
-    its FIRST line.
+def _first_line_is_marker(text):
+    """True iff ``text``'s FIRST line carries the auto-triage origin marker.
 
-    The run's kickoff is ``run_profile.json``'s ``kickoff_path`` (falling back to
-    ``RUN_DIR/kickoff.md``), never ``context-pack.json`` — which re-embeds the
-    kickoff text and holds other copies, so sniffing it would let an unrelated
-    string re-classify a run. The marker must be the FIRST line (``startswith``,
-    never a substring test): a human-authored kickoff that merely QUOTES the
-    marker in its spec text — this repo's own kickoffs do — must still read as
-    human, or the guard would fire on legitimate operator runs."""
+    ``startswith`` on the first line, never a substring test: a human-authored
+    kickoff that merely QUOTES the marker further down its spec text — this
+    repo's own kickoffs do — must still read as human, or the guard would fire
+    on legitimate operator runs. A leading BOM is tolerated as in the file read."""
+    first = text.split("\n", 1)[0] if text else ""
+    return first.lstrip("\ufeff").strip().startswith(ORIGIN_MARKER)
+
+
+def _read_kickoff():
+    """``(first_line, sha256_hex)`` of the first READABLE kickoff candidate.
+
+    The candidates are ``run_profile.json``'s ``kickoff_path`` first, then the
+    run-local ``kickoff.md`` (``_run_kickoff_candidates``) — never
+    ``context-pack.json``, which re-embeds the kickoff text and holds other
+    copies, so sniffing it would let an unrelated string re-classify a run.
+    Returns ``("", "")`` when no candidate is readable: a run with no kickoff
+    file at all, which neither the marker nor a sha drift can match."""
     for path in _run_kickoff_candidates():
         try:
-            with open(path, encoding="utf-8", errors="replace") as fh:
-                first_line = fh.readline()
+            with open(path, "rb") as fh:
+                data = fh.read()
         except OSError:
             continue
-        return first_line.lstrip("\ufeff").strip().startswith(ORIGIN_MARKER)
+        return (data.decode("utf-8", "replace").split("\n", 1)[0],
+                hashlib.sha256(data).hexdigest())
+    return "", ""
+
+
+def _load_pack():
+    """The run's pre-run context-pack v2 (``{}`` when absent or unreadable).
+
+    The pack is the snapshot taken before any node ran. A missing one — context
+    v2 off, or a hand-run fixture — keeps the file-only behaviour: the snapshot
+    and sha-drift signals simply never fire. The import is local (the walk-up
+    sys.path above already made the engine importable) so a stale engine that
+    predates ``context_v2`` still refuses on the file."""
+    try:
+        from mini_ork import context_v2
+    except Exception:  # noqa: BLE001 — no pack: fall back to file-only sniffing
+        return {}
+    try:
+        return context_v2.load_pack(RUN_DIR) or {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+_KICKOFF_DRIFT_EVIDENCED = [False]
+
+
+def _evidence_kickoff_drift():
+    """Record, once, that the kickoff file changed since the run started.
+
+    The refusal reason is otherwise invisible: an auto-opened run that edits its
+    own kickoff to hide the marker produces the same FAIL row as one that never
+    carried it. The exact line is contractual."""
+    if _KICKOFF_DRIFT_EVIDENCED[0]:
+        return
+    _KICKOFF_DRIFT_EVIDENCED[0] = True
+    _ev.write("frozen-kernel: kickoff modified since run start\n")
+    _ev.flush()
+
+
+def _kickoff_is_auto_triage():
+    """True iff the run is auto-opened (origin=auto-triage). Fail closed: ANY of
+    three signals marks it.
+
+    1. the PRE-RUN SNAPSHOT — ``context-pack.v2.json``'s ``kickoff_snapshot``,
+       the contract the run RECEIVED, as its first line. Rewriting the kickoff
+       file afterwards cannot un-mark this one, which is the whole point: the
+       auto-promoted kickoffs live under the mini-ork repo's ``kickoffs/auto/``,
+       which an auto fix epic's implementer can write.
+    2. the kickoff FILE's first line (today's behaviour).
+    3. sha DRIFT — the pack recorded a ``kickoff_sha256`` that no longer matches
+       the file. A run that rewrote its own contract gets no human privileges,
+       and the drift is written to the evidence log.
+
+    A missing pack keeps today's file-only behaviour (1 and 3 stay inactive)."""
+    pack = _load_pack()
+    snapshot = pack.get("kickoff_snapshot")
+    if isinstance(snapshot, str) and _first_line_is_marker(snapshot):
+        return True
+    first_line, sha = _read_kickoff()
+    if _first_line_is_marker(first_line):
+        return True
+    recorded = pack.get("kickoff_sha256")
+    if isinstance(recorded, str) and recorded and sha and sha != recorded:
+        _evidence_kickoff_drift()
+        return True
     return False
 
 

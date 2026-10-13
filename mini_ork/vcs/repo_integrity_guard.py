@@ -36,9 +36,11 @@ FROZEN_PATHS_DEFAULT: list[str] = [
     "mini_ork/gates/gate_bootstrap.py",
     "mini_ork/gates/abstain_gate.py",
     "mini_ork/recovery/circuit_breaker.py",
-    # The escalation policy, at the real paths that decide it (there is no
-    # mini_ork/recovery/escalation_policy.py): calibration.should_escalate,
+    # The escalation policy. escalation_policy.py is a FORWARD DECLARATION — the
+    # operator-owned module that admits auto fix epics lands in a later step;
+    # until it does, the decision is made at calibration.should_escalate,
     # auto_repair._escalate_lane, policies.engine.verifier_failure_escalation.
+    "mini_ork/recovery/escalation_policy.py",
     "mini_ork/dispatch/calibration.py",
     "mini_ork/recovery/auto_repair.py",
     "mini_ork/policies/engine.py",

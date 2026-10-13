@@ -10,9 +10,14 @@ paths:
   - mini_ork/gates/abstain_gate.py
   - mini_ork/recovery/circuit_breaker.py
   # The escalation policy — where an auto-opened run's escalation decision is
-  # actually made: the calibrated threshold (calibration.should_escalate), the
-  # lane escalation ladder (auto_repair._escalate_lane), and the
-  # escalate-after-N-failures policy (policies.engine.verifier_failure_escalation).
+  # made. escalation_policy.py is a FORWARD DECLARATION: it is the
+  # operator-owned module that admits auto fix epics, and it lands in a later
+  # step; freezing it now means the step that adds it cannot weaken it. Until it
+  # exists the decision is made at the calibrated threshold
+  # (calibration.should_escalate), the lane escalation ladder
+  # (auto_repair._escalate_lane), and the escalate-after-N-failures policy
+  # (policies.engine.verifier_failure_escalation).
+  - mini_ork/recovery/escalation_policy.py
   - mini_ork/dispatch/calibration.py
   - mini_ork/recovery/auto_repair.py
   - mini_ork/policies/engine.py

@@ -8,7 +8,13 @@ marker as the first line of its kickoff, and the ``frozen-kernel-guard`` check i
 touches a path in ``config/kernel-frozen.yaml``. The list is the engine's built-in
 default ∪ the target's committed ``git show HEAD:config/kernel-frozen.yaml`` — never
 the working-tree copy the diff itself edits — so a diff cannot unfreeze a path by
-deleting its own entry. A human-authored kickoff (no marker) is unaffected, and the
+deleting its own entry.
+
+The origin read is fail-closed across three signals: the PRE-RUN snapshot
+(``context-pack.v2.json``'s ``kickoff_snapshot``, the contract the run received),
+the kickoff file's first line, and a sha drift between the pack's
+``kickoff_sha256`` and the file. Rewriting the kickoff afterwards cannot un-mark
+the run. A human-authored kickoff (no marker, intact sha) is unaffected, and the
 legacy ``ALLOW_HIGH_BLAST_RADIUS`` token can never unlock the new check.
 
 Hermetic: temp git repos + the verifier run as a subprocess, mirroring the fixture
@@ -16,6 +22,7 @@ style of ``tests/unit/test_framework_edit_static_check.py``.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -36,6 +43,7 @@ paths:
   - mini_ork/gates/gate_bootstrap.py
   - mini_ork/gates/abstain_gate.py
   - mini_ork/recovery/circuit_breaker.py
+  - mini_ork/recovery/escalation_policy.py
   - mini_ork/dispatch/calibration.py
   - mini_ork/recovery/auto_repair.py
   - mini_ork/policies/engine.py
@@ -100,7 +108,8 @@ def _apply_edits_in_place(root: Path, edits: dict[str, str]) -> str:
 def _run_verifier(tmp: Path, root: Path, diff: str, *, kickoff: str | None = None,
                   profile_kickoff: str | None = None,
                   profile_path: str | None = None,
-                  context_pack: str = "{}\n") -> dict[str, str]:
+                  context_pack: str = "{}\n",
+                  context_pack_v2: str | None = None) -> dict[str, str]:
     """Run the verifier against ``diff`` in a run dir staged the way a real run is.
 
     A run's kickoff reaches the verifier through ``run_profile.json`` ->
@@ -108,11 +117,16 @@ def _run_verifier(tmp: Path, root: Path, diff: str, *, kickoff: str | None = Non
     a run-local ``kickoff.md``. ``kickoff=`` stages that fallback file, and
     ``profile_path=`` names a kickoff that is absent on disk (the fallback trigger).
     ``context_pack=`` seeds ``context-pack.json`` — the file the legacy
-    high-blast-radius guard reads the ALLOW token from."""
+    high-blast-radius guard reads the ALLOW token from. ``context_pack_v2=`` seeds
+    ``context-pack.v2.json`` — the PRE-RUN snapshot (``context_v2.load_pack``) the
+    origin test now reads ``kickoff_snapshot`` / ``kickoff_sha256`` from; the two
+    pack files are distinct and must not be conflated."""
     run_dir = tmp / "run"
     run_dir.mkdir(exist_ok=True)
     (run_dir / "framework-edit.diff").write_text(diff)
     (run_dir / "context-pack.json").write_text(context_pack)
+    if context_pack_v2 is not None:
+        (run_dir / "context-pack.v2.json").write_text(context_pack_v2)
     if kickoff is not None:
         (run_dir / "kickoff.md").write_text(kickoff)
     if profile_path is not None:
@@ -217,6 +231,79 @@ def test_profile_kickoff_path_absent_falls_back_to_run_file(tmp_path: Path) -> N
     assert rows["frozen-kernel-guard"] == "false"
 
 
+# ── origin read from the pre-run snapshot (context-pack.v2.json) ─────────────
+
+def _pack_v2(**extra: object) -> str:
+    """A minimal ``context-pack.v2.json`` body carrying ``extra`` top-level keys."""
+    return json.dumps({"version": 2, **extra})
+
+
+def test_snapshot_marker_refuses_stripped_kickoff_file(tmp_path: Path) -> None:
+    # The run RECEIVED an auto kickoff (snapshot starts with the marker) and then
+    # deleted the marker from the file on disk to read as human. The snapshot is
+    # the pre-run contract, so the refusal must survive the strip.
+    root = _base_repo(tmp_path)
+    diff = _apply_edits_in_place(root, {"mini_ork/recovery/circuit_breaker.py": "VALUE = 2\n"})
+    rows = _run_verifier(
+        tmp_path, root, diff,
+        profile_kickoff="# epic (marker stripped after run start)\n",
+        context_pack_v2=_pack_v2(kickoff_snapshot=f"{MARKER}\n\n# epic\n"))
+    assert rows["frozen-kernel-guard"] == "false"
+
+
+def test_sha_drift_refused_and_evidenced(tmp_path: Path) -> None:
+    # No marker anywhere, but the pack's recorded sha no longer matches the file:
+    # a run that rewrote its own contract gets no human privileges, and the drift
+    # is named in the evidence log so the reason is auditable.
+    root = _base_repo(tmp_path)
+    diff = _apply_edits_in_place(root, {"mini_ork/recovery/circuit_breaker.py": "VALUE = 2\n"})
+    rows = _run_verifier(
+        tmp_path, root, diff,
+        profile_kickoff="# epic (operator authored, no marker)\n",
+        context_pack_v2=_pack_v2(kickoff_snapshot="# the original contract\n",
+                                 kickoff_sha256="0" * 64))
+    assert rows["frozen-kernel-guard"] == "false"
+    log = (tmp_path / "run" / "verifier-static-check.log").read_text()
+    assert "frozen-kernel: kickoff modified since run start" in log
+
+
+def test_human_intact_sha_still_passes(tmp_path: Path) -> None:
+    # A human kickoff whose sha still matches the snapshot is unaffected: the new
+    # signals only ever ADD refusals. Frozen path in the diff, human origin → pass.
+    root = _base_repo(tmp_path)
+    diff = _apply_edits_in_place(root, {"mini_ork/recovery/circuit_breaker.py": "VALUE = 2\n"})
+    kickoff = "# epic (operator authored)\n"
+    sha = hashlib.sha256(kickoff.encode("utf-8")).hexdigest()
+    rows = _run_verifier(
+        tmp_path, root, diff, profile_kickoff=kickoff,
+        context_pack_v2=_pack_v2(kickoff_snapshot=kickoff, kickoff_sha256=sha))
+    assert rows["frozen-kernel-guard"] == "true"
+    assert rows["high-blast-radius-guard"] == "true"
+
+
+def test_snapshot_origin_allowed_path_still_passes(tmp_path: Path) -> None:
+    # Even an auto-opened run passes when the diff touches no frozen path — the
+    # snapshot signal gates on origin, not on the mere presence of a pack.
+    root = _base_repo(tmp_path)
+    diff = _apply_edits_in_place(root, {"mini_ork/recovery/retry_hint.py": "VALUE = 2\n"})
+    rows = _run_verifier(
+        tmp_path, root, diff,
+        profile_kickoff="# epic (marker stripped after run start)\n",
+        context_pack_v2=_pack_v2(kickoff_snapshot=f"{MARKER}\n\n# epic\n"))
+    assert rows["frozen-kernel-guard"] == "true"
+
+
+def test_no_pack_keeps_file_only_behaviour(tmp_path: Path) -> None:
+    # With no v2 pack the snapshot and sha-drift signals cannot fire: a human
+    # kickoff still passes and a marked kickoff file still refuses.
+    root = _base_repo(tmp_path)
+    diff = _apply_edits_in_place(root, {"mini_ork/recovery/circuit_breaker.py": "VALUE = 2\n"})
+    human = _run_verifier(tmp_path, root, diff, profile_kickoff="# epic (human)\n")
+    assert human["frozen-kernel-guard"] == "true"
+    marked = _run_verifier(tmp_path, root, diff, profile_kickoff=f"{MARKER}\n\n# epic\n")
+    assert marked["frozen-kernel-guard"] == "false"
+
+
 # ── _high_blast_radius_guard ────────────────────────────────────────────────
 
 # The legacy guard reads the ALLOW token from context-pack.json (the file that
@@ -282,7 +369,7 @@ def test_load_frozen_paths_missing_file_returns_nonempty_default(tmp_path: Path)
     from mini_ork.vcs.repo_integrity_guard import FROZEN_PATHS_DEFAULT, load_frozen_paths
     got = load_frozen_paths(str(tmp_path / "does-not-exist"))
     assert got == FROZEN_PATHS_DEFAULT
-    assert len(got) == 13
+    assert len(got) == 14
 
 
 def test_load_frozen_paths_garbage_file_returns_default(tmp_path: Path) -> None:
@@ -318,6 +405,15 @@ def test_frozen_hits_matches_globs_in_order() -> None:
 
 # ── every frozen entry names a real path ────────────────────────────────────
 
+# Forward declarations: frozen while the file they name does not exist yet, so
+# the step that adds it cannot weaken the surface. The exception is pinned by
+# test_pending_frozen_path_is_a_forward_declaration, which also fails once the
+# file lands — so an entry cannot linger here as cover for a stale path.
+_PENDING_FROZEN_PATHS = frozenset({
+    "mini_ork/recovery/escalation_policy.py",
+})
+
+
 def _matches_in_checkout(root: Path, pattern: str) -> list[str]:
     """Real repo-relative paths a frozen pattern covers, from a checkout."""
     import glob
@@ -328,22 +424,47 @@ def _matches_in_checkout(root: Path, pattern: str) -> list[str]:
 
 
 def test_every_frozen_entry_matches_a_real_path() -> None:
-    """No frozen entry may be a phantom.
+    """No frozen entry may be a phantom — except an explicitly declared pending one.
 
     A path that names nothing protects nothing — worse, it reads as protection
-    while leaving the surface open (the shipped list once named a
-    ``mini_ork/recovery/escalation_policy.py`` that has never existed). Every
-    entry in both the built-in floor and the committed ``config/kernel-frozen.yaml``
-    must match at least one real file in the checkout."""
+    while leaving the surface open. Every entry in both the built-in floor and
+    the committed ``config/kernel-frozen.yaml`` must match at least one real file
+    in the checkout, unless it is listed in ``_PENDING_FROZEN_PATHS`` — a
+    forward declaration frozen BEFORE the file lands, so the step that adds it
+    cannot quietly weaken the surface. Any other entry here is a regression."""
     from mini_ork.vcs.repo_integrity_guard import (
         FROZEN_PATHS_DEFAULT,
         load_frozen_paths,
     )
     file_list = load_frozen_paths(str(REPO))
     assert file_list, "config/kernel-frozen.yaml parsed to nothing"
-    for pattern in sorted(set(FROZEN_PATHS_DEFAULT) | set(file_list)):
+    entries = (set(FROZEN_PATHS_DEFAULT) | set(file_list)) - _PENDING_FROZEN_PATHS
+    for pattern in sorted(entries):
         assert _matches_in_checkout(REPO, pattern), (
             f"frozen entry {pattern!r} matches no real path in the checkout")
+
+
+def test_pending_frozen_path_is_a_forward_declaration() -> None:
+    """The one sanctioned exception is present in BOTH lists, and is genuinely
+    absent from the tree — so the exception cannot outlive the reason for it."""
+    from mini_ork.vcs.repo_integrity_guard import FROZEN_PATHS_DEFAULT, load_frozen_paths
+    for pending in _PENDING_FROZEN_PATHS:
+        assert pending in FROZEN_PATHS_DEFAULT
+        assert pending in load_frozen_paths(str(REPO))
+        assert not _matches_in_checkout(REPO, pending), (
+            f"pending entry {pending!r} now exists; drop it from _PENDING_FROZEN_PATHS")
+
+
+def test_escalation_policy_frozen_in_default_and_yaml() -> None:
+    """The new entry reaches both the built-in floor and the committed yaml, and
+    the sibling auto_repair.py stays frozen alongside it."""
+    from mini_ork.vcs.repo_integrity_guard import FROZEN_PATHS_DEFAULT, load_frozen_paths
+    floor = set(FROZEN_PATHS_DEFAULT)
+    yaml = set(load_frozen_paths(str(REPO)))
+    assert "mini_ork/recovery/escalation_policy.py" in floor
+    assert "mini_ork/recovery/escalation_policy.py" in yaml
+    assert "mini_ork/recovery/auto_repair.py" in floor
+    assert "mini_ork/recovery/auto_repair.py" in yaml
 
 
 def test_frozen_list_yaml_matches_builtin_floor() -> None:
