@@ -190,7 +190,7 @@ def test_kanban_groups_every_state_into_columns(home: Path) -> None:
     (landed_dir / "landed.json").write_text(json.dumps(
         {"commit": "deadbeef123", "repo": str(home), "note": ""}))
 
-    page = build_page(home, "kanban")
+    page = build_page(home, "kanban", tab="runs")
     assert page["ok"] is True and page["key"] == "kanban" and page["label"] == "Board"
 
     sec = _section(page, "columns")
@@ -221,7 +221,7 @@ def test_kanban_done_covers_only_the_last_24h(home: Path) -> None:
     now = int(time.time())
     _seed_run(home, "run-today", title="Today", status="published", created=now - 3600)
     _seed_run(home, "run-old", title="Last week", status="published", created=now - 8 * 86400)
-    page = build_page(home, "kanban")
+    page = build_page(home, "kanban", tab="runs")
     done = next(c for c in _section(page, "columns")["cols"] if c["title"] == "Done")
     assert [c["title"] for c in done["cards"]] == ["Today"]
 
@@ -230,7 +230,7 @@ def test_kanban_caps_each_column_at_30_newest_first(home: Path) -> None:
     now = int(time.time())
     for i in range(35):
         _failed(home, f"run-{i:02d}", f"Failed {i:02d}", now - 1000 + i)
-    page = build_page(home, "kanban")
+    page = build_page(home, "kanban", tab="runs")
     failed = next(c for c in _section(page, "columns")["cols"] if c["title"] == "Failed")
     assert failed["count"] == 30
     assert [c["title"] for c in failed["cards"]][:3] == ["Failed 34", "Failed 33", "Failed 32"]
