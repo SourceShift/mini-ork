@@ -23,6 +23,7 @@ every planner dispatch failed (`llm_dispatch FAIL … rc=4/65`) and the one chil
 | wit-4-linear | landed `4379ff03` |
 | wit-4-jira | not built — the run died at the planner |
 | wit-5-writeback | not built (depends on wit-4-linear, wit-4-jira) |
+| board-shows-imported-tickets | queued 2026-10-13 — see the last section |
 
 ---
 
@@ -194,3 +195,15 @@ description cleared to `""` is distinguishable from one left absent. `pytest tes
 stays green.
 
 - max attempts: 2
+
+---
+
+## Board shows imported tickets (id: board-shows-imported-tickets)
+
+Added 2026-10-13. The adapters above fill the PM mirror, but no page read it: the Board's Tasks
+tab (`d7450c87`) draws only mini-ork's own epics, so an imported Linear or Jira ticket was visible
+nowhere in the IDE. This epic puts mirror tickets on the same four columns as the epics, reading
+only the mirror (no network at page build), with an explicit empty state that names
+`config/pm.yaml` when no source is configured.
+
+Kickoff: `kickoffs/auto/board-shows-imported-tickets.md` (queued with `mini-ork epics add`).
