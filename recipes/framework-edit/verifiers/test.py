@@ -172,9 +172,34 @@ def _diff_sentinel_path():
     return ""
 
 
+# The base snapshot is committed so the copy behaves like a real checkout: HEAD
+# is the base tree, the applied diff is the working-tree change. With no commit,
+# every test that reads the engine sha or bundles the engine (`git rev-parse
+# HEAD`, `HEAD^{tree}`) failed in the copy alone — ten false failures on the
+# cloud-providers B run (run-1791906478-48004), all green in the real worktree.
+_BASE_COMMIT_ENV = {
+    "GIT_AUTHOR_NAME": "mini-ork-verifier", "GIT_AUTHOR_EMAIL": "verifier@mini-ork.local",
+    "GIT_COMMITTER_NAME": "mini-ork-verifier", "GIT_COMMITTER_EMAIL": "verifier@mini-ork.local",
+}
+
+
+def _commit_base_snapshot():
+    """Commit the copy's tree once, before the diff is applied (idempotent)."""
+    if subprocess.run(["git", "-C", WORKTREE, "rev-parse", "--verify", "-q", "HEAD"],
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+        return
+    env = {**os.environ, **_BASE_COMMIT_ENV}
+    subprocess.run(["git", "-C", WORKTREE, "add", "-A"], stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, env=env)
+    subprocess.run(["git", "-C", WORKTREE, "-c", "commit.gpgsign=false", "commit", "-q",
+                    "--no-verify", "--allow-empty", "-m", "verifier base snapshot"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+
+
 def _assert_copy_is_own_git_root():
     subprocess.run(["git", "-C", WORKTREE, "init"], stdout=subprocess.DEVNULL,
                    stderr=subprocess.DEVNULL)
+    _commit_base_snapshot()
     top = os.path.realpath(WORKTREE)
     r = subprocess.run(["git", "-C", WORKTREE, "rev-parse", "--show-toplevel"],
                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
