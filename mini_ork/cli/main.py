@@ -209,6 +209,10 @@ _REFLECT_TIMEOUT_FALLBACK = 360
 _REFLECT_TIMEOUT_HEADROOM = 3
 _REFLECT_TIMEOUT_CEILING = 21600
 _REFLECT_TIMEOUT_SAMPLE = 20
+# Slack added on top of the run's remaining --deadline when capping reflect:
+# enough for the child to notice the stop and flush its log, not enough to
+# meaningfully overshoot a budget the operator asked us to honour.
+_REFLECT_DEADLINE_GRACE = 120
 
 
 def _reflect_durations(db: str | None = None,
@@ -307,6 +311,42 @@ def _reflect_timeout_seconds() -> int:
     return type it binds to stay as they are.
     """
     return _reflect_timeout()[0]
+
+
+def _cap_reflect_to_deadline(bound: int, why: str, *,
+                            deadline_seconds: int,
+                            remaining_seconds: int,
+                            hit: bool) -> tuple[int, str]:
+    """``(seconds, why)`` — ``bound`` tightened to the run's remaining deadline.
+
+    ``--deadline N`` is the operator's statement of how long the whole run may
+    take, and the derived reflect bound (see ``_reflect_timeout``) knows nothing
+    about it: a home that once recorded a 5538 s pass can hand reflect a bound
+    far larger than the deadline the caller just asked us to honour. Reflect
+    still runs post-verdict, so shortening it cannot change the outcome — it
+    only stops the tail of a run from overshooting a budget that was set
+    deliberately.
+
+    Pure by construction: no I/O, no env reads, no ``deadline_budget`` call.
+    The call site owns the (guarded, best-effort) status lookup and hands the
+    three numbers in, which is what makes this testable without a live run.
+    ``deadline_seconds <= 0`` means no deadline was armed, so the bound is
+    returned untouched along with its original reason. Otherwise the cap is the
+    remaining budget (never negative — a spent or already-tripped deadline caps
+    at the grace alone) plus ``_REFLECT_DEADLINE_GRACE``; a cap that would not
+    actually shorten the bound leaves it — and its reason — alone. When it does
+    bite, the reason names the rule and keeps the original derivation after the
+    semicolon so the log line is still readable back.
+    """
+    if deadline_seconds <= 0:
+        return bound, why
+    capped = max(0, remaining_seconds) + _REFLECT_DEADLINE_GRACE
+    if capped >= bound:
+        return bound, why
+    note = "capped to the --deadline remainder"
+    if hit:
+        note += " (deadline already hit)"
+    return capped, f"{note} (+{_REFLECT_DEADLINE_GRACE}s grace); {why}"
 
 
 def engine_version(root: str | None = None) -> str:
@@ -1508,6 +1548,22 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
         sys.stdout.write("── reflect (auto, since run start) ──\n")
         reflect_db = context_env("MINI_ORK_DB") or os.path.join(home, "state.db")
         reflect_bound, reflect_bound_why = _reflect_timeout(reflect_db)
+        # Tighten that derived bound to what is left of the run's --deadline:
+        # reflect runs post-verdict, so it must not be the stage that blows a
+        # budget the caller set. Best-effort — an unarmed deadline or an
+        # unreadable status leaves the derived bound alone rather than wedging
+        # the child on a failed cap.
+        if deadline and int(deadline) > 0:
+            try:
+                st = deadline_budget.status(run_id)
+                reflect_bound, reflect_bound_why = _cap_reflect_to_deadline(
+                    reflect_bound, reflect_bound_why,
+                    deadline_seconds=int(deadline),
+                    remaining_seconds=int(st.get("remaining_seconds", 0) or 0),
+                    hit=bool(st.get("hit", False)),
+                )
+            except Exception:  # noqa: BLE001
+                pass
         # The child's output used to go into a pipe that was discarded on
         # return, so a reflect that died mid-pipeline left no evidence of where
         # it died — the researcher home's 1930 leaked 'running' rows are all
