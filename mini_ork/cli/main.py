@@ -1549,6 +1549,19 @@ def _execute_inprocess(rest, root):
 
 
 def _run_handler(rest, root):
+    # ``--resume <run_id>`` / ``--checkpoint-id <id>`` (P1.3). The preflight
+    # prints the one-line plan and HARD-ERRORS on an unknown run_id (C1 / F4 —
+    # no silent fresh-start fallback). A resume must NOT enter the lifecycle:
+    # that would classify and plan again and dispatch every node, so the
+    # printed skip list would be a lie. It re-dispatches only the plan's
+    # redispatch set against the run's existing plan.
+    from mini_ork.cli import run_resume
+
+    rc, sink = run_resume.run_with_resume(rest)
+    if rc != run_resume.RC_OK:
+        return rc
+    if sink.get("resume_id"):
+        return run_resume.dispatch_resume(sink, root=root)
     return _run_lifecycle(rest, root)
 
 

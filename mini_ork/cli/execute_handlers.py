@@ -459,6 +459,63 @@ def _write_learned_record(run_dir: str, node_id: str, node_type: str,
         pass
 
 
+def _record_step_completion(db, run_id, node_id, *, rc, retry_exhausted,
+                            artifact, run_dir, started_at):
+    """Write the P1.2 completion row for a node that just finished.
+
+    ``mini-ork run --resume`` skips a step only when this ledger says
+    ``succeeded``. The checkpointer module shipped without a runtime writer, so
+    the ledger stayed empty and every resume re-dispatched the whole run.
+
+    ``checkpoints`` opens its DB with a bare ``sqlite3.connect`` and switches it
+    to WAL before writing, so it would create a file for a missing path and
+    re-journal a DB that predates migration 0071 even though the insert then
+    fails. Both are probed read-only first and skipped. Best-effort: a ledger
+    write never fails a node.
+    """
+    if not (db and run_id and os.path.isfile(db)):
+        return
+    try:
+        probe = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5.0)
+        try:
+            has_ledger = probe.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'node_completion_checkpoints'").fetchone() is not None
+        finally:
+            probe.close()
+    except sqlite3.Error:
+        return
+    if not has_ledger:
+        return
+    try:
+        from mini_ork import checkpoints as ck  # noqa: PLC0415
+
+        if rc == 0:
+            status = "succeeded"
+        elif retry_exhausted:
+            status = "error"
+        else:
+            # An abstain (a verifier could not run its tool) lands here too:
+            # the node is unverified, so a resume must run it again.
+            status = "failed"
+        artifact_path = artifact_sha256 = None
+        if artifact and os.path.isfile(artifact):
+            with open(artifact, "rb") as fh:
+                artifact_sha256 = hashlib.sha256(fh.read()).hexdigest()
+            run_root = os.path.abspath(run_dir) + os.sep if run_dir else ""
+            absolute = os.path.abspath(artifact)
+            artifact_path = (os.path.relpath(absolute, run_root)
+                             if run_root and absolute.startswith(run_root) else absolute)
+        ck.record_completion(
+            db, run_id=run_id, step_id=node_id, node_id=node_id, status=status,
+            artifact_path=artifact_path, artifact_sha256=artifact_sha256,
+            rc=int(rc), started_at=started_at, ended_at=int(time.time()),
+        )
+    except Exception as exc:  # noqa: BLE001 — the ledger never fails a node
+        print(f"  [checkpoint] completion row for {node_id} not written: {exc}",
+              file=sys.stderr)
+
+
 @_node_publish_boundary
 def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
                   dispatch_fn, recipe="", workflow="", trace_fn=None,
@@ -499,10 +556,15 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     # _bootstrap_recipe_register) still emits exactly one pair per node, never
     # one per process.
     node_start_ms: dict[str, int] = {}
+    # The node's output as last reported to trace(); the completion row
+    # written after the attempt loop records it with its sha256.
+    completion_artifact: dict[str, str] = {}
 
     # Bind the resolved lane into every trace() call so agent_version_id is stamped
     # (bash passes the shell var dispatch_lane into _trace_write_node_rich's payload).
     def trace(node_id, status, node_type, output_file="", verdict="", finish_reason=""):
+        if output_file:
+            completion_artifact["path"] = output_file
         _base_trace(node_id, status, node_type, output_file, verdict, finish_reason,
                     lane=lane,
                     route_source=_route_prov.get("route_source", ""),
@@ -811,6 +873,7 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     _attempt = 0
     rc = 0
     finish_reason = "done"
+    _dispatch_started_s = int(time.time())
     try:
         while True:
             _attempt += 1
@@ -849,8 +912,9 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     # re-dispatches. Only written when the loop actually exhausted the
     # cap on a retryable failure; a code-shaped rejection that left the
     # cap untouched is owned by the ``retries`` edge, not here.
-    if rc != 0 and _attempt >= _retry_policy.max_attempts \
-            and any(retryable_finish_reason(fr) for fr in _finish_reason_history):
+    _retry_exhausted = (rc != 0 and _attempt >= _retry_policy.max_attempts
+                        and any(retryable_finish_reason(fr) for fr in _finish_reason_history))
+    if _retry_exhausted:
         try:
             _error_row = ErrorRow(
                 node_id=node_id,
@@ -863,6 +927,13 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         except Exception as _exc:  # noqa: BLE001 — best-effort sidecar
             print(f"  [retry] failed to persist ERROR row for {node_id}: {_exc}",
                   file=sys.stderr)
+    # After the attempt loop, so a node retried to success is recorded once as
+    # ``succeeded``, and verifier/publisher nodes — which bypass trace() — get a
+    # row too.
+    _record_step_completion(db, run_id, node_id, rc=rc,
+                            retry_exhausted=_retry_exhausted,
+                            artifact=completion_artifact.get("path", ""),
+                            run_dir=run_dir_eff, started_at=_dispatch_started_s)
     # Handlers that never call trace() (verifier/publisher/rollback/eval) must
     # still close their node — an orphaned node_start renders the node
     # permanently "running" in the DAG. trace() pops the start-map entry, so
