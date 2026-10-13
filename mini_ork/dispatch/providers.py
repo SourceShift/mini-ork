@@ -1952,7 +1952,11 @@ def _remote_lane_secrets(model: str, spec: ProviderSpec, env: Mapping[str, str],
     The profile named by ``MO_NODE_ENV`` must list each one (by its spawn key
     or by the lane's ``api_key_env``); an unlisted one is a setup error
     returned as a failed :class:`DispatchResult` before anything is sent."""
-    from ..remote.secrets_scope import SecretNotPermittedError, scoped_env
+    from ..remote.secrets_scope import (
+        _ANTHROPIC_NATIVE_AUTH_KEYS,
+        SecretNotPermittedError,
+        scoped_env,
+    )
 
     entry = _load_providers_registry(root).get(model)
     entry = entry if isinstance(entry, Mapping) else {}
@@ -1971,13 +1975,29 @@ def _remote_lane_secrets(model: str, spec: ProviderSpec, env: Mapping[str, str],
         store = read_secret_exports(secret_store_path(env))
     except Exception:  # noqa: BLE001 — an unreadable store means no stored values
         store = {}
+    kind = str(entry.get("kind") or "")
     try:
-        return scoped_env(spec.env, profile, store=store, lane=model,
-                          kind=str(entry.get("kind") or ""),
-                          api_key_env=str(entry.get("api_key_env") or ""),
-                          runtime=env, profile_path=profile_path)
+        scoped = scoped_env(spec.env, profile, store=store, lane=model, kind=kind,
+                            api_key_env=str(entry.get("api_key_env") or ""),
+                            runtime=env, profile_path=profile_path)
     except SecretNotPermittedError as exc:
         return DispatchResult(ok=False, rc=2, error=str(exc), model=model)
+    if kind == "anthropic-native" and not set(scoped) & _ANTHROPIC_NATIVE_AUTH_KEYS:
+        # An anthropic-native lane authenticates with the operator's local
+        # Claude login (the macOS Keychain), which cannot travel to a node.
+        # Spawned anyway, the CLI ran its default model with no key and failed
+        # as an auth error that triage and the lane fuse pinned on whichever
+        # lane alias requested it (Daytona e2e, run-1791910825-57872). Refuse
+        # here instead: before any network call, worded as a setup ("config")
+        # failure, so the fallback chain moves on and nothing fuses wrongly.
+        return DispatchResult(ok=False, rc=2, model=model, error=(
+            f"remote placement: lane {model!r} is anthropic-native and its api key is "
+            f"missing on the node: the local Claude login cannot travel. Put "
+            f"CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`) or ANTHROPIC_API_KEY "
+            f"in the secret store and list it under `secrets:` in "
+            f"{profile_path or 'the environment profile'}, or keep this role local "
+            f"with MO_PLACEMENT_LOCAL_ROLES"))
+    return scoped
 
 
 def _attach_isolation(request: DispatchRequest, env: Mapping[str, str], *,
