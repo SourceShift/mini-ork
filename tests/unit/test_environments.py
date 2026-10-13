@@ -62,6 +62,74 @@ def test_unknown_field_fails_schema_validation(tmp_path):
         load_profile("p", env=env)
 
 
+# --------------------------------------------------------------------------- provider seam (cloud-sandbox axis)
+
+PROVIDER_TEMPLATE = """\
+image: mini-ork/agent-node:latest
+provider: daytona
+provider_options: {snapshot: base, ttl_minutes: 30}
+"""
+
+
+def test_provider_and_provider_options_are_loaded(tmp_path):
+    prof = load_profile("p", env=_homes(tmp_path, PROVIDER_TEMPLATE))
+    assert prof.provider == "daytona"
+    assert prof.provider_options == {"snapshot": "base", "ttl_minutes": 30}
+    out = prof.to_dict()
+    assert out["provider"] == "daytona"
+    assert out["provider_options"] == {"snapshot": "base", "ttl_minutes": 30}
+
+
+def test_provider_options_override_wholesale_like_resources(tmp_path):
+    """A shadow present in both files replaces the whole value — the same
+    per-key rule ``resources`` follows — while a template-only key
+    (``provider:``) keeps flowing through."""
+    env = _homes(tmp_path, PROVIDER_TEMPLATE, shadow="provider_options: {ttl_minutes: 5}\n")
+    prof = load_profile("p", env=env)
+    assert prof.provider == "daytona"                       # template-only key survives
+    assert prof.provider_options == {"ttl_minutes": 5}      # the live dict replaces it
+
+
+def test_provider_keys_are_absent_from_a_providerless_profile(tmp_path):
+    """No provider named → the loader's output is exactly what shipped before
+    the seam: the two new keys are neither set nor emitted."""
+    prof = load_profile("p", env=_homes(tmp_path, TEMPLATE))
+    assert prof.provider == "" and prof.provider_options == {}
+    assert prof.to_dict() == {
+        "name": "p",
+        "node": "hetzner-1",
+        "image": "mini-ork/agent-node:latest",
+        "setup": "apt-get install -y jq\n",
+        "setup_timeout_s": 900.0,
+        "env": {},
+        "secrets": [],
+        "network": "full",
+        "allow_domains": [],
+        "resources": {"cpus": 2, "memory": "4g"},
+    }
+
+
+def test_resources_disk_is_accepted(tmp_path):
+    """``resources.disk`` (a provider that sizes a volume) passes the schema."""
+    templ = TEMPLATE.replace("{cpus: 2, memory: 4g}", "{cpus: 2, memory: 4g, disk: 10g}")
+    prof = load_profile("p", env=_homes(tmp_path, templ))
+    assert prof.resources["disk"] == "10g"
+
+
+def test_shipped_default_profile_round_trips_without_provider_keys(tmp_path):
+    """The committed default profile loads and its ``to_dict`` carries no
+    provider keys — the byte-identical guarantee for existing deployments."""
+    root, home = tmp_path / "root", tmp_path / "home"
+    (home / "config" / "environments").mkdir(parents=True)
+    (home / "config" / "environments" / "default.yaml").write_text(
+        (REPO / "config" / "environments" / "default.yaml.example").read_text(),
+        encoding="utf-8")
+    prof = load_profile("default", env={"MINI_ORK_ROOT": str(root), "MINI_ORK_HOME": str(home)})
+    assert prof.provider == "" and prof.provider_options == {}
+    assert "provider" not in prof.to_dict()
+    assert "provider_options" not in prof.to_dict()
+
+
 # --------------------------------------------------------------------------- image cache
 
 

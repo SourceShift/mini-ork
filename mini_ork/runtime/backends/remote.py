@@ -108,6 +108,11 @@ _REMOTE_OFFSET_CHECKPOINT_S = 5.0
 _CLAUDE_CONFIG_DIR_KEY = "CLAUDE_CONFIG_DIR"
 _CLAUDE_CONFIG_DIR_VALUE = "/workspace/home/.claude"
 
+# Cloud-sandbox axis: the env var a run uses to select a node provider when its
+# profile does not name one. Mirrors ``mini_ork.remote.providers.base.ENV_PROVIDER``
+# (kept as a literal so this module's import-time surface stays stdlib-only).
+_ENV_NODE_PROVIDER = "MO_NODE_PROVIDER"
+
 
 def _env_int_mb(name: str, default_mb: int) -> int:
     """Read ``name`` (megabytes) from env; clamp invalid to ``default_mb``.
@@ -310,12 +315,18 @@ class _NodeRef(NamedTuple):
     import-time surface stays stdlib-only. ``nodes.select_node`` returns a
     ``Node`` whose first 4 fields match this shape; the factory coerces via
     ``_NodeRef(**node._asdict())`` if a Node is passed.
+
+    ``headers`` carries provider-level auth (e.g. Daytona's
+    ``x-daytona-preview-token``) sent on EVERY request. It defaults to empty so
+    the legacy 4-arg construction (static / explicit-node nodes, tests) is
+    unchanged.
     """
 
     name: str
     url: str
     token: str
     max_sessions: int = 1
+    headers: Mapping[str, str] = {}
 
 
 class RemoteWorkspace:
@@ -345,6 +356,8 @@ class RemoteWorkspace:
         run_dir: str | None = None,
         profile: Any = None,
         queue_wait_s: float | None = None,
+        node_provider: str | None = None,
+        provider_env: Mapping[str, str] | None = None,
     ) -> None:
         # No isinstance guard on `node` — the typed signature already constrains
         # callers to ``_NodeRef`` (the factory coerces ``Node`` to ``_NodeRef``),
@@ -355,6 +368,20 @@ class RemoteWorkspace:
         if not image:
             raise ValueError("RemoteWorkspace requires a non-empty image")
         self._node = node
+        # Cloud-sandbox axis: when ``node_provider`` is set this workspace does
+        # NOT know its node yet — the placeholder ``node`` above has an empty
+        # URL and the node is obtained lazily by ``ensure_node``. Construction
+        # NEVER contacts the provider: a teardown path that constructed a
+        # workspace must not mint a sandbox.
+        self._node_provider = (str(node_provider).strip() or None) if node_provider else None
+        self._provider_env: Mapping[str, str] = dict(provider_env) if provider_env else {}
+        self._endpoint: Any = None            # the provider NodeEndpoint we adopted
+        self._endpoint_provider = ""          # provider name (never a secret)
+        self._provider_handle = ""            # provider's node id (never a secret)
+        # True once a provider-owned endpoint is adopted: ``_token`` then
+        # returns the endpoint's token and NEVER reads ``os.environ``, so an
+        # ambient MO_NODE_TOKEN cannot override a provider-minted bearer.
+        self._provider_owned_token = False
         self._run_id = run_id
         self._image = image
         # remote-nodes-14: the environment profile (epic 12) binds the session's
@@ -439,7 +466,14 @@ class RemoteWorkspace:
 
     def _token(self) -> str:
         """Read the bearer token at call time (never at import); fall back to
-        the token ``select_node`` resolved from the node's ``token_env``."""
+        the token ``select_node`` resolved from the node's ``token_env``.
+
+        A provider-owned token (a cloud sandbox mints its own bearer) is
+        returned verbatim and ``os.environ`` is never consulted — otherwise an
+        ambient ``MO_NODE_TOKEN`` set for some static node would silently
+        override it (kickoff constraint c:0)."""
+        if self._provider_owned_token:
+            return self._node.token
         return os.environ.get(self._token_env, "") or self._node.token
 
     def _request(
@@ -460,7 +494,19 @@ class RemoteWorkspace:
         4xx is treated as a programming error and re-raised as
         :class:`RemoteUnavailableError` immediately (a 401/403 means the token
         is wrong — retrying just lengthens the outage).
+
+        A provider-backed workspace whose node is not yet adopted attaches to
+        the run's recorded node first (never creates one — a plain request must
+        not mint a sandbox); if there is still no node URL the call fails
+        ``remote_unavailable`` rather than sending a malformed request.
         """
+        if not self._node.url and self._node_provider is not None:
+            self.ensure_node(create=False)
+        if not self._node.url:
+            raise RemoteUnavailableError(
+                f"remote workspace {self._run_id!r} has no node url"
+                + (f" (node provider {self._node_provider!r} unprovisioned)"
+                   if self._node_provider else ""))
         url = self._node.url.rstrip("/") + path
         if query:
             from urllib.parse import urlencode
@@ -470,8 +516,11 @@ class RemoteWorkspace:
         n_tries = max(1, int(retries if retries is not None else self._retries))
         for attempt in range(n_tries):
             req = urllib_request.Request(url, data=body, method=method)
-            if self._token():
-                req.add_header("Authorization", f"Bearer {self._token()}")
+            token = self._token()
+            if token:
+                req.add_header("Authorization", f"Bearer {token}")
+            for header_name, header_value in (self._node.headers or {}).items():
+                req.add_header(header_name, header_value)
             if content_type:
                 req.add_header("Content-Type", content_type)
             try:
@@ -531,6 +580,12 @@ class RemoteWorkspace:
         import subprocess
 
         t_up = time.monotonic()
+        # 0) Obtain this run's node through its provider (cloud-sandbox axis),
+        # before any traffic. The run's FIRST up() creates the node exactly
+        # once (under the run-dir lock); every later process attaches to the
+        # recorded one. Construction never did this — see ``ensure_node``.
+        if self._node_provider is not None:
+            self._setup_step("provision", lambda: self.ensure_node(create=True))
         # 1) Engine sha stage (idempotent).
         sha = self._current_engine_sha(subprocess)
         self._engine_sha = sha
@@ -569,6 +624,83 @@ class RemoteWorkspace:
             self._up_at = time.monotonic()
             self._setup_s = self._up_at - t_up
         return None
+
+    # ------------------------------------------------------------------ node provider
+
+    def ensure_node(self, *, create: bool) -> Any:
+        """Resolve this workspace's node through its node provider (lazy).
+
+        A provider-backed workspace is constructed with a contact-free
+        placeholder node and no URL. ``up()`` calls this with ``create=True`` to
+        adopt the run's node — creating it exactly once, under the run-dir lock,
+        or attaching to the one a peer already recorded. Teardown paths
+        (``kill_run``, run-end release) call it with ``create=False`` so they
+        only ever ATTACH to a recorded node; a run with no record returns
+        ``None`` and calls neither ``create`` nor ``attach``.
+
+        A workspace built without a provider (static / explicit node) is already
+        resolved: the call is a no-op returning its endpoint (or ``None``).
+
+        ``ProviderUnavailableError`` from the provider is re-raised as
+        :class:`RemoteUnavailableError`, the class the dispatch layer maps to
+        ``failure_class=remote_unavailable`` — the provider seam never leaks a
+        provider-shaped exception into the workspace API.
+        """
+        from mini_ork.remote.providers.base import (
+            ProviderUnavailableError,
+            acquire_run_node,
+            attach_run_node,
+            get_node_provider,
+        )
+
+        if self._node_provider is None:
+            return self._endpoint
+        if self._endpoint is not None and self._node.url:
+            return self._endpoint
+        run_dir = self._run_dir or ""
+        try:
+            if create:
+                endpoint = acquire_run_node(
+                    get_node_provider(self._node_provider),
+                    run_id=self._run_id,
+                    run_dir=run_dir,
+                    profile=self._profile,
+                    env=self._provider_env,
+                    engine_root=self._engine_root,
+                )
+            else:
+                endpoint = attach_run_node(run_dir, self._provider_env)
+        except ProviderUnavailableError as exc:
+            raise RemoteUnavailableError(
+                f"node provider {self._node_provider!r} unavailable: {exc}") from exc
+        if endpoint is None:
+            return None
+        self._adopt_endpoint(endpoint)
+        return endpoint
+
+    def _adopt_endpoint(self, endpoint: Any) -> None:
+        """Take the provider's :class:`NodeEndpoint` as this workspace's node.
+
+        Only the non-secret locator (name, url) and the endpoint's own token /
+        headers are held, in memory, for the life of the workspace. A provider
+        that mints its own bearer (any provider but ``static``) makes the token
+        provider-owned, so ``_token`` stops consulting ``os.environ``.
+        """
+        from mini_ork.remote.providers.base import DEFAULT_PROVIDER
+
+        self._endpoint = endpoint
+        self._endpoint_provider = str(getattr(endpoint, "provider", "") or "")
+        self._provider_handle = str(getattr(endpoint, "handle", "") or "")
+        self._node = _NodeRef(
+            name=str(getattr(endpoint, "name", "") or ""),
+            url=str(getattr(endpoint, "url", "") or ""),
+            token=str(getattr(endpoint, "token", "") or ""),
+            max_sessions=int(getattr(endpoint, "max_sessions", 1) or 1),
+            headers=dict(getattr(endpoint, "headers", None) or {}),
+        )
+        if getattr(endpoint, "token_env", ""):
+            self._token_env = endpoint.token_env
+        self._provider_owned_token = self._endpoint_provider not in ("", DEFAULT_PROVIDER)
 
     # ------------------------------------------------------------------ provisioning
 
@@ -1731,6 +1863,9 @@ def _reap_remote_marker(
         return []
     if dry_run:
         return [sid]
+    provider = str(info.get("provider") or "").strip()
+    if provider and provider != _default_provider_name():
+        return _reap_provider_marker(info, run_dir, sid, provider)
     node_info = info.get("node") or {}
     token_env = str(info.get("token_env") or "MO_NODE_TOKEN")
     try:
@@ -1770,6 +1905,72 @@ def _reap_remote_marker(
     return [sid]
 
 
+def _default_provider_name() -> str:
+    """The provider name that means "today's behavior" (no provider seam)."""
+    from mini_ork.remote.providers.base import DEFAULT_PROVIDER
+
+    return DEFAULT_PROVIDER
+
+
+def _reap_provider_marker(
+    info: Mapping[str, Any],
+    run_dir: Path,
+    sid: str,
+    provider: str,
+) -> list[str]:
+    """Teardown for a run whose node was OBTAINED from a provider.
+
+    The marker only names the provider (never a token or a header value), so
+    the workspace attaches to the recorded node through the provider seam
+    (``ensure_node(create=False)`` — never create), kills every proc the
+    session's journal knows about under a 10 s budget, DELETEs the session, and
+    finally destroys the provider's node via :func:`release_run_node` (which
+    reads the run dir's ``.node-provider.json`` record). Best-effort and never
+    raises — the TTL reaper is the safety net, exactly as for a static node."""
+    from mini_ork.remote.providers.base import release_run_node
+
+    env = dict(os.environ)
+    run_id = str(info.get("run_id") or "").strip() or sid
+    ws: RemoteWorkspace | None
+    try:
+        ws = RemoteWorkspace(
+            node=_NodeRef(name="kill_run", url="", token="", max_sessions=1),
+            run_id=run_id,
+            image=env.get("MO_SANDBOX_IMAGE") or "alpine:latest",
+            drive_root=env.get("MO_SHARED_DRIVE_ROOT") or os.getcwd(),
+            engine_root=env.get("MINI_ORK_ROOT") or os.getcwd(),
+            retries=1,
+            target_root=None,
+            run_dir=str(run_dir),  # where the pid journal lives
+            node_provider=provider,
+            provider_env=env,
+        )
+    except Exception:  # noqa: BLE001 — no usable node config: nothing to reap
+        ws = None
+    if ws is not None:
+        ws._sid = sid   # the marker proves the session existed; skip up()
+        try:
+            try:
+                # Attach only: a teardown must never mint a sandbox.
+                ws.ensure_node(create=False)
+            except Exception:  # noqa: BLE001 — a dead node is still released below
+                pass
+            try:
+                ws.kill_all(budget_s=10.0)
+            except Exception:  # noqa: BLE001 — kill_all is best-effort by contract
+                pass
+        finally:
+            try:
+                ws.down()
+            except Exception:  # noqa: BLE001 — down() is best-effort by contract
+                pass
+    try:
+        release_run_node(str(run_dir), env)
+    except Exception:  # noqa: BLE001 — release_run_node is best-effort by contract
+        pass
+    return [sid]
+
+
 def _factory(**kwargs: Any) -> RemoteWorkspace:
     """Build a :class:`RemoteWorkspace`, filling :env:`MO_NODE`-selected kwargs.
 
@@ -1793,6 +1994,48 @@ def _factory(**kwargs: Any) -> RemoteWorkspace:
 
         profile = load_profile(env_name, env=src)
     node = kwargs.pop("node", None)
+    # Cloud-sandbox axis: a profile that names a provider (or MO_NODE_PROVIDER)
+    # goes through the provider seam — the node is obtained lazily by the
+    # workspace's ``up()``, so construction here must NOT resolve or contact a
+    # node. The explicit-node / static-default path below is unchanged: with no
+    # provider named, behavior (and the image requirement) is exactly today's.
+    requested_provider = (
+        str(getattr(profile, "provider", "") or "").strip()
+        or (src.get(_ENV_NODE_PROVIDER) or "").strip()
+    )
+    if requested_provider and node is None:
+        run_id = (
+            kwargs.pop("run_id", None)
+            or src.get("MINI_ORK_RUN_ID")
+            or uuid.uuid4().hex[:12]
+        )
+        # The image is WAIVED on the provider path: the provider boots the node
+        # (and, for a cloud, its own base image). Fall back to the profile /
+        # MO_SANDBOX_IMAGE, then a neutral default; never raise for a missing one.
+        image = (
+            kwargs.pop("image", None)
+            or (getattr(profile, "image", None) if profile else None)
+            or src.get("MO_SANDBOX_IMAGE")
+            or "alpine:latest"
+        )
+        drive_root = kwargs.pop("drive_root", None) or src.get("MO_SHARED_DRIVE_ROOT")
+        if not drive_root:
+            drive_root = os.getcwd()
+        if src.get("MINI_ORK_RUN_DIR"):
+            kwargs.setdefault("run_dir", src.get("MINI_ORK_RUN_DIR"))
+        if src.get("MO_REMOTE_QUEUE_WAIT_S"):
+            kwargs.setdefault("queue_wait_s", float(src["MO_REMOTE_QUEUE_WAIT_S"]))
+        return RemoteWorkspace(
+            node=_NodeRef(name="", url="", token="", max_sessions=1),
+            run_id=run_id,
+            image=image,
+            drive_root=drive_root,
+            profile=profile,
+            node_provider=requested_provider,
+            provider_env=dict(src),
+            **kwargs,
+        )
+
     if node is None:
         from mini_ork.remote.nodes import select_node
 

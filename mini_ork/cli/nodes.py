@@ -38,6 +38,11 @@ CHECKS: tuple[str, ...] = (
     "session down",
 )
 
+# Check 0 (cloud-sandbox axis) runs ONLY when the profile names a node provider:
+# the run's node is obtained from the provider before any traffic, so checks 1+
+# have a URL. A provider-less doctor (the default) prints 1..9 exactly as before.
+CHECK_PROVISION = "node provisioned"
+
 AUTH_SMOKE_TIMEOUT_S = 30.0
 AUTH_SMOKE_PROMPT = "Reply with the single word OK."
 # The interpreter the in-session probe imports mini_ork with (the agent image
@@ -114,7 +119,8 @@ class _Report:
         self.failed = False
 
     def line(self, idx: int, status: str, detail: str) -> None:
-        self._out(f"{idx}. [{status}]\t{CHECKS[idx - 1]}\t{detail}")
+        label = CHECK_PROVISION if idx == 0 else CHECKS[idx - 1]
+        self._out(f"{idx}. [{status}]\t{label}\t{detail}")
         if status == "FAIL":
             self.failed = True
 
@@ -191,6 +197,15 @@ def doctor(*, env_name: str = "", recipe: str = "", lanes: Sequence[str] = (),
                 ws.down()
             except Exception:  # noqa: BLE001
                 pass
+        # Provider-backed runs also destroy the node the provider created, so
+        # the doctor leaves neither a session nor a recorded node behind.
+        if getattr(ws, "_node_provider", None) and env.get("MINI_ORK_RUN_DIR"):
+            try:
+                from mini_ork.remote.providers.base import release_run_node
+
+                release_run_node(env["MINI_ORK_RUN_DIR"], env)
+            except Exception:  # noqa: BLE001
+                pass
     if rc == 0:   # 9. session down — verified on the node
         try:
             ws._json("GET", f"/v1/sessions/{run_id}", retries=1)
@@ -211,6 +226,18 @@ def _checks(ws, env: dict, run_id: str, report: _Report, state: dict, *, recipe:
     where = ws._node.url
     steps: dict[str, dict] = {}
     ws.on_setup_step = lambda rec: steps.__setitem__(rec["step"], rec)
+
+    # 0. node provider provision (cloud-sandbox axis): obtain this run's node
+    #    before any traffic, so checks 1+ have a URL. No-op for a provider-less
+    #    doctor (the node came from the profile / MO_NODE).
+    if getattr(ws, "_node_provider", None):
+        try:
+            ws._setup_step("provision", lambda: ws.ensure_node(create=True))
+        except Exception as exc:  # noqa: BLE001
+            report.line(0, "FAIL", f"provision: {str(exc)[:300]}")
+            return 1
+        where = ws._node.url
+        report.line(0, "PASS", f"provider {ws._node_provider}")
 
     # 1. reachable (health is unauthenticated)
     try:

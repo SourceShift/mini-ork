@@ -68,8 +68,20 @@
         "memory": {
           "type": ["number", "string"],
           "description": "Memory limit (e.g. '4g' or 2147483648). Maps to --memory."
+        },
+        "disk": {
+          "type": ["number", "string"],
+          "description": "Disk limit (e.g. '10g' or 10737418240). Consumed by providers that size a volume (daytona)."
         }
       }
+    },
+    "provider": {
+      "type": "string",
+      "description": "Node provider that obtains this run's node (cloud-sandbox axis). Empty means today's behavior: use the node named by `node:` directly. E.g. 'static' (an operator-run node-agent) or 'daytona'. See mini_ork/remote/providers/base.py."
+    },
+    "provider_options": {
+      "type": "object",
+      "description": "Provider-specific options, passed to the provider's create(). Keys and validation belong to the provider (e.g. daytona's snapshot/ttl_minutes); unknown keys are rejected by the provider, not here."
     }
   }
 }

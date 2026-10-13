@@ -126,6 +126,11 @@ class Environment:
     network: str = "full"
     allow_domains: list[str] = field(default_factory=list)
     resources: dict | None = None
+    # Cloud-sandbox axis: which node provider obtains this run's node, and its
+    # per-provider options. Empty/falsey means "today's behavior" — the node
+    # named by ``node:`` (or ``MO_NODE``) is used directly, no provider seam.
+    provider: str = ""
+    provider_options: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         out: dict = {"name": self.name}
@@ -142,6 +147,12 @@ class Environment:
         out["allow_domains"] = list(self.allow_domains)
         if self.resources is not None:
             out["resources"] = dict(self.resources)
+        # Emitted only when set, so a provider-less profile's ``to_dict`` is
+        # byte-identical to what shipped before the seam.
+        if self.provider:
+            out["provider"] = self.provider
+        if self.provider_options:
+            out["provider_options"] = dict(self.provider_options)
         return out
 
 
@@ -286,6 +297,10 @@ def _to_environment(name: str, merged: dict) -> Environment:
     )
     resources_raw = merged.get("resources")
     resources = dict(resources_raw) if isinstance(resources_raw, dict) else None
+    provider_options_raw = merged.get("provider_options")
+    provider_options = (
+        dict(provider_options_raw) if isinstance(provider_options_raw, dict) else {}
+    )
     network = merged.get("network") or "full"
     if network not in ("full", "allowlist"):
         network = "full"
@@ -300,6 +315,8 @@ def _to_environment(name: str, merged: dict) -> Environment:
         network=network,
         allow_domains=allow_domains,
         resources=resources,
+        provider=str(merged.get("provider") or ""),
+        provider_options=provider_options,
     )
 
 

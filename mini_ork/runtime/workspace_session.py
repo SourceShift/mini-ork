@@ -132,12 +132,28 @@ def _resolve_backend_workspace(
 def _node_locator(workspace: Workspace) -> dict[str, Any]:
     """Where a remote session lives, for an out-of-process ``kill_run``: the
     node's name + URL and the NAME of the env var holding its token — never the
-    token itself (the marker is a file on disk)."""
+    token itself (the marker is a file on disk).
+
+    A node OBTAINED from a provider also records the provider name and its
+    handle, so the marker-driven reaper can route teardown through the provider
+    seam (attach + release) instead of only the node URL. Names and ids only —
+    never a token, never a provider auth header value (cloud-sandbox axis)."""
     node = getattr(workspace, "_node", None)
+    provider = str(getattr(workspace, "_endpoint_provider", "") or "")
+    handle = str(getattr(workspace, "_provider_handle", "") or "")
     if node is None or not getattr(node, "url", ""):
-        return {}
-    return {"node": {"name": getattr(node, "name", ""), "url": node.url},
-            "token_env": getattr(workspace, "_token_env", "MO_NODE_TOKEN")}
+        # Provider-backed but not yet adopted (e.g. a teardown constructed a
+        # workspace): name the provider so teardown can still route correctly.
+        return {"provider": provider} if provider else {}
+    locator: dict[str, Any] = {
+        "node": {"name": getattr(node, "name", ""), "url": node.url},
+        "token_env": getattr(workspace, "_token_env", "MO_NODE_TOKEN"),
+    }
+    if provider:
+        locator["provider"] = provider
+    if handle:
+        locator["handle"] = handle
+    return locator
 
 
 def _extract_session_id(workspace: Workspace) -> str:
@@ -285,13 +301,23 @@ def release_remote_session(run_id: str, run_dir: str, *, env: Mapping[str, str])
     Every dispatch / check of a run is its own process with its own workspace;
     they share ONE node session (the node keys sessions by run id). This
     closes this process's handle, then deletes the node session by run id and
-    drops the run dir's session marker + sync state. Best-effort."""
+    drops the run dir's session marker + sync state. Best-effort.
+
+    A run whose node came from a provider also DESTROYS that node here, via
+    :func:`release_run_node` against the run dir's provider record — a static
+    node (no record) is left for the operator, as before."""
     close_run_session(run_id)
     from mini_ork.runtime.backends.remote import _factory
 
     ws = _factory(env={**env, "MINI_ORK_RUN_ID": run_id, "MINI_ORK_RUN_DIR": run_dir})
     ws._sid = run_id          # the node accepts the run id in DELETE /v1/sessions/{id}
     ws.down()
+    try:
+        from mini_ork.remote.providers.base import release_run_node
+
+        release_run_node(run_dir, env)
+    except Exception:  # noqa: BLE001 — teardown is best-effort; TTL reaper is the net
+        pass
     if run_dir:
         for name in (".remote-sync-state.json",):
             try:
