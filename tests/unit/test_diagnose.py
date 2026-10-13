@@ -2,8 +2,9 @@
 
 Hermetic: every case builds a temp home + temp sqlite so the assertions pin the
 *shape* of the live failure (the ``run-1791914481-48337`` abstain run, a
-reviewer ``needs_revision``, a ``timeout``) rather than reading any real run
-directory. Fixture scaffolding mirrors ``tests/unit/test_retry_hint.py``.
+reviewer ``needs_revision``, a ``timeout``, a reaped lifecycle) rather than
+reading any real run directory. Fixture scaffolding mirrors
+``tests/unit/test_retry_hint.py``.
 """
 from __future__ import annotations
 
@@ -40,21 +41,28 @@ def home(tmp_path: Path) -> Path:
 
 
 def _seed(home: Path, *, run_id: str = RUN, status: str = "failed",
-          recipe: str = "framework-edit") -> Path:
+          recipe: str = "framework-edit", notes: str = "") -> Path:
     run_dir = home / "runs" / run_id
     run_dir.mkdir(parents=True)
     (run_dir / "run_profile.json").write_text(json.dumps({"recipe": recipe}))
     con = sqlite3.connect(home / "state.db")
     con.execute(
         "INSERT OR REPLACE INTO task_runs (id, recipe, status, cost_usd, created_at, "
-        "updated_at, ended_at, task_class, kickoff_path, workflow_version) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "updated_at, ended_at, task_class, kickoff_path, workflow_version, notes) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (run_id, recipe, status, 0.5, T0, T0 + 100, T0 + 80, "framework_edit",
-         "", "latest"),
+         "", "latest", notes or None),
     )
     con.commit()
     con.close()
     return run_dir
+
+
+def _set_notes(home: Path, run_id: str, notes: str) -> None:
+    con = sqlite3.connect(home / "state.db")
+    con.execute("UPDATE task_runs SET notes = ? WHERE id = ?", (notes, run_id))
+    con.commit()
+    con.close()
 
 
 def _event(home: Path, run_id: str, seq: int, event_type: str, payload: dict[str, Any]) -> None:
@@ -62,7 +70,8 @@ def _event(home: Path, run_id: str, seq: int, event_type: str, payload: dict[str
     con.execute(
         "INSERT INTO run_events (event_id, run_id, event_type, payload_json, created_at) "
         "VALUES (?,?,?,?,?)",
-        (f"evt-{event_type}-{seq}", run_id, event_type, json.dumps(payload), T0 + seq),
+        (f"evt-{run_id}-{event_type}-{seq}", run_id, event_type,
+         json.dumps(payload), T0 + seq),
     )
     con.commit()
     con.close()
@@ -96,48 +105,70 @@ def _assert_done_invariant(home: Path, run_id: str, result: dict[str, Any]) -> N
     )
 
 
-# ── R1 — the run-1791914481-48337 shape ────────────────────────────────────
+def _assert_contract(result: dict[str, Any]) -> None:
+    """The wire contract every result — matched or fall-through — must obey."""
+    assert result["layer"] in dx.LAYERS, result
+    assert result["routes_to"] in dx.ROUTES, result
+    for item in result["evidence"]:
+        assert set(item) == {"kind", "ref", "excerpt"}, item
+    if result["rule_id"] == dx.RULE_UNCLASSIFIED:
+        assert result["source"] == ""
+    else:
+        assert result["source"] == "rule", result
 
 
-def _seed_abstain(home: Path, run_id: str = RUN) -> Path:
-    """The live shape: every node done, the publisher withheld the publish."""
+# ── R1 — the run-1791914481-48337 shape (proven levels, withheld publish) ───
+
+
+def _seed_abstain(home: Path, run_id: str = RUN, *, levels_ok: bool = True,
+                  reason: str = "publish_abstain") -> Path:
+    """The live shape: every node done, the publisher withheld the publish.
+
+    ``levels_ok=True`` + ``reason="publish_abstain"`` is the ENGINE fault (R1);
+    ``levels_ok=False`` / ``reason="levels_unverified"`` is the change's own
+    unproven vector (R1b).
+    """
     run_dir = _seed(home, run_id=run_id)
     (run_dir / "publish-abstain.json").write_text(json.dumps({
         "reason": "authored patch did not apply",
         "detail": "the implementer's patch no longer applies to the target tree",
     }))
     (run_dir / "verdict.json").write_text(json.dumps({
-        "levels_decision": "abstain",
-        "levels": {"applies": "PROVEN", "executes": "n/a", "target": "UNVERIFIED",
-                   "preserve": "n/a", "contract": "n/a"},
-        "levels_reasons": {"target": "no test exercises the change"},
+        "verdict": "pass",
+        "source": "execute@run-level",
+        "levels": {"applies": "PROVEN", "executes": "PROVEN", "target": "PROVEN",
+                   "preserve": "PROVEN", "contract": "PROVEN"},
+        "levels_required": ["applies", "target"],
+        "levels_ok": levels_ok,
+        "levels_decision": "publish" if levels_ok else "abstain",
     }))
     _event(home, run_id, 1, "node_start", {"node_id": "implementer"})
     _event(home, run_id, 2, "node_end",
            {"node_id": "implementer", "finish_reason": "done"})
     _event(home, run_id, 3, "node_start", {"node_id": "publisher", "node_type": "publisher"})
     _event(home, run_id, 4, "node_end",
-           {"node_id": "publisher", "node_type": "publisher",
-            "finish_reason": "levels_unverified"})
+           {"node_id": "publisher", "node_type": "publisher", "finish_reason": reason})
     return run_dir
 
 
-def test_r1_publish_abstain_is_engine_deliver_publisher(home: Path) -> None:
+def test_r1_publish_abstain_with_proven_levels_is_engine_fix_epic(home: Path) -> None:
     _seed_abstain(home)
 
     result = dx.diagnose(home, RUN, write=False)
 
     assert result["rule_id"] == "R1"
     assert (result["layer"], result["stage"], result["node"]) == ("engine", "deliver", "publisher")
-    assert result["routes_to"] == "reverify"
-    assert result["confidence"] > 0.5
+    assert result["routes_to"] == "fix_epic"
+    assert result["source"] == "rule"
     refs = [e["ref"] for e in result["evidence"]]
     assert "publish-abstain.json" in refs
-    assert any(e["kind"] == "event" for e in result["evidence"])
+    assert any(e["kind"] == "event" and "publish_abstain" in e["excerpt"]
+               for e in result["evidence"])
+    _assert_contract(result)
     _assert_done_invariant(home, RUN, result)
 
 
-def test_r1_declines_when_the_publisher_later_finished_done(home: Path) -> None:
+def test_r1_publish_abstain_declines_when_the_publisher_later_finished_done(home: Path) -> None:
     """A retried publisher that PUBLISHED is not a withheld run — read the latest end."""
     run_dir = _seed_abstain(home)
     (run_dir / "publish-abstain.json").unlink()
@@ -149,7 +180,34 @@ def test_r1_declines_when_the_publisher_later_finished_done(home: Path) -> None:
 
     assert result["rule_id"] != "R1"
     assert result["node"] != "publisher"
+    _assert_contract(result)
     _assert_done_invariant(home, RUN, result)
+
+
+def test_r1b_levels_unverified_is_change_verify_reverify(home: Path) -> None:
+    """A withheld publish with an UNPROVEN level vector is the change's problem."""
+    _seed_abstain(home, levels_ok=False, reason="levels_unverified")
+
+    result = dx.diagnose(home, RUN, write=False)
+
+    assert result["rule_id"] == "R1b"
+    assert (result["layer"], result["stage"], result["node"]) == ("change", "verify", "publisher")
+    assert result["routes_to"] == "reverify"
+    assert any(e["kind"] == "event" and "levels_unverified" in e["excerpt"]
+               for e in result["evidence"])
+    _assert_contract(result)
+
+
+def test_r1_publish_abstain_without_a_level_stamp_is_change_not_engine(home: Path) -> None:
+    """``publish_abstain`` alone is not enough — no ``levels_ok`` stamp ⇒ R1b."""
+    run_dir = _seed_abstain(home)
+    (run_dir / "verdict.json").unlink()
+
+    result = dx.diagnose(home, RUN, write=False)
+
+    assert result["rule_id"] == "R1b"
+    assert result["layer"] == "change"
+    assert result["routes_to"] == "reverify"
 
 
 def test_diagnose_writes_diagnosis_json_only_when_asked(home: Path) -> None:
@@ -183,6 +241,7 @@ def test_r4_reviewer_needs_revision_is_change_review(home: Path) -> None:
     assert (result["layer"], result["stage"], result["node"]) == ("change", "review", "reviewer")
     assert result["routes_to"] == "revise"
     assert any(e["ref"] == "review-reviewer.json" for e in result["evidence"])
+    _assert_contract(result)
     _assert_done_invariant(home, RUN, result)
 
 
@@ -200,7 +259,8 @@ def test_r3_timeout_is_provider_retry(home: Path) -> None:
     assert result["rule_id"] == "R3"
     assert (result["layer"], result["stage"], result["node"]) == ("provider", "execute", "implementer")
     assert result["routes_to"] == "retry"
-    assert any("finish_reason=timeout" in e["detail"] for e in result["evidence"])
+    assert any("finish_reason=timeout" in e["excerpt"] for e in result["evidence"])
+    _assert_contract(result)
     _assert_done_invariant(home, RUN, result)
 
 
@@ -219,20 +279,298 @@ def test_r5_failing_verifier_is_change_verify(home: Path) -> None:
     assert (result["layer"], result["stage"]) == ("change", "verify")
     assert result["routes_to"] == "revise"
     assert any(e["ref"] == "verifier_test.json" for e in result["evidence"])
+    _assert_contract(result)
 
 
 # ── R6 — a node that started and never ended ───────────────────────────────
 
 
-def test_r6_dangling_node_start_is_engine_resume(home: Path) -> None:
+def test_r6_interrupted_without_a_note_is_provider_retry(home: Path) -> None:
+    """A dangling node is transport trouble, never a framework bug."""
     _seed(home)
     _event(home, RUN, 1, "node_start", {"node_id": "implementer", "node_type": "implementer"})
 
     result = dx.diagnose(home, RUN, write=False)
 
     assert result["rule_id"] == "R6"
-    assert (result["layer"], result["stage"], result["node"]) == ("engine", "execute", "implementer")
-    assert result["routes_to"] == "resume"
+    assert result["layer"] == "provider"
+    assert result["routes_to"] == "retry"
+    assert result["node"] == "implementer"
+    _assert_contract(result)
+
+
+def test_r6_interrupted_with_killed_by_user_note_is_user_none(home: Path) -> None:
+    """``board kill`` appends ``killed-by-user`` — a person stopped it: no action."""
+    _seed(home, notes="killed-by-user")
+    _event(home, RUN, 1, "node_start", {"node_id": "implementer", "node_type": "implementer"})
+
+    result = dx.diagnose(home, RUN, write=False)
+
+    assert result["rule_id"] == "R6"
+    assert result["layer"] == "user"
+    assert result["routes_to"] == "none"
+    assert result["node"] == "implementer"
+    assert any(e["kind"] == "note" for e in result["evidence"])
+    _assert_contract(result)
+
+
+def test_r6_interrupted_matches_the_note_per_segment_not_as_a_prefix(home: Path) -> None:
+    """Notes are append-only: an earlier note must not hide a later ``killed-by-user``."""
+    _seed(home, notes="reaped: dispatcher pid 4 gone; killed-by-user")
+    _event(home, RUN, 1, "node_start", {"node_id": "implementer", "node_type": "implementer"})
+
+    result = dx.diagnose(home, RUN, write=False)
+
+    assert (result["layer"], result["routes_to"]) == ("user", "none")
+    _assert_contract(result)
+
+
+def test_r6_interrupted_is_never_engine(home: Path) -> None:
+    """Neither with nor without the note may an interruption read as an engine fault."""
+    for notes in ("", "killed-by-user"):
+        run_id = f"run-int-{notes or 'plain'}"
+        _seed(home, run_id=run_id, notes=notes)
+        _event(home, run_id, 1, "node_start", {"node_id": "implementer"})
+
+        result = dx.diagnose(home, run_id, write=False)
+
+        assert result["layer"] != "engine", result
+        assert result["routes_to"] in {"retry", "none"}
+
+
+# ── RN — the ``task_runs.notes`` rules ─────────────────────────────────────
+
+
+def test_note_reaped_is_provider_retry(home: Path) -> None:
+    _seed(home, notes="reaped: dispatcher pid 4242 gone")
+    _event(home, RUN, 1, "node_start", {"node_id": "implementer", "node_type": "implementer"})
+
+    result = dx.diagnose(home, RUN, write=False)
+
+    # R6 (the dangling node) fires first and is the same verdict — provider/retry.
+    assert result["rule_id"] in {"R6", "RN"}
+    assert result["layer"] == "provider"
+    assert result["routes_to"] == "retry"
+    _assert_contract(result)
+
+
+def test_note_reaped_with_no_open_node_reports_an_unknown_stage(home: Path) -> None:
+    """A reaped run whose nodes all ended: the note is the only cause left."""
+    _seed(home, notes="reaped: no live dispatcher (pid 9 gone)")
+    _event(home, RUN, 1, "node_start", {"node_id": "planner"})
+    _event(home, RUN, 2, "node_end", {"node_id": "planner", "finish_reason": "done"})
+
+    result = dx.diagnose(home, RUN, write=False)
+
+    assert result["rule_id"] == "RN"
+    assert (result["layer"], result["stage"]) == ("provider", "unknown")
+    assert result["routes_to"] == "retry"
+    assert any(e["kind"] == "note" and e["ref"] == "task_runs.notes" for e in result["evidence"])
+    _assert_contract(result)
+
+
+def test_note_planner_dispatch_rc_is_provider_plan_planner_retry(home: Path) -> None:
+    _seed(home, notes="planner_dispatch_rc_43")
+
+    result = dx.diagnose(home, RUN, write=False)
+
+    assert result["rule_id"] == "RN"
+    assert (result["layer"], result["stage"], result["node"]) == ("provider", "plan", "planner")
+    assert result["routes_to"] == "retry"
+    _assert_contract(result)
+
+
+def test_note_lifecycle_exited_on_an_exception_with_a_traceback_is_engine(home: Path) -> None:
+    """Only a traceback inside mini-ork's own source makes the crash an engine fault.
+
+    No node failed and none is dangling: the lifecycle process itself died, and
+    its own log is the only witness that the exception came from mini-ork.
+    """
+    run_dir = _seed(home, notes="lifecycle exited on an exception before a verdict")
+    (run_dir / "execute.log").write_text(
+        "Traceback (most recent call last):\n"
+        '  File "/x/mini_ork/recovery/diagnose.py", line 12, in _diagnose\n'
+        "    raise RuntimeError('boom')\n"
+        "RuntimeError: boom\n"
+    )
+    _event(home, RUN, 1, "node_start", {"node_id": "planner", "node_type": "planner"})
+    _event(home, RUN, 2, "node_end",
+           {"node_id": "planner", "node_type": "planner", "finish_reason": "done"})
+
+    result = dx.diagnose(home, RUN, write=False)
+
+    assert result["rule_id"] == "RN"
+    assert result["layer"] == "engine"
+    assert result["routes_to"] == "fix_epic"
+    assert any(e["kind"] == "note" for e in result["evidence"])
+    assert any(e["kind"] == "log" for e in result["evidence"])
+    _assert_contract(result)
+
+
+def test_note_lifecycle_exited_on_an_exception_with_a_non_framework_traceback_stays_unclassified(
+        home: Path) -> None:
+    """A traceback in the consumer's code is not mini-ork's fault — do not label engine."""
+    run_dir = _seed(home, notes="lifecycle exited on an exception before a verdict")
+    (run_dir / "execute.log").write_text(
+        "Traceback (most recent call last):\n"
+        '  File "/tmp/target/app/parser.py", line 3, in parse\n'
+        "ValueError: bad input\n"
+    )
+
+    result = dx.diagnose(home, RUN, write=False)
+
+    assert result["layer"] == "unclassified"
+    assert result["source"] == ""
+    _assert_contract(result)
+
+
+def test_note_lifecycle_exited_on_an_exception_without_a_traceback_stays_unclassified(
+        home: Path) -> None:
+    """No traceback localises it, so the honest answer is ``unclassified``."""
+    _seed(home, notes="lifecycle exited on an exception before a verdict")
+
+    result = dx.diagnose(home, RUN, write=False)
+
+    assert result["rule_id"] == dx.RULE_UNCLASSIFIED
+    assert result["layer"] == "unclassified"
+    _assert_contract(result)
+
+
+def test_note_lifecycle_exited_without_a_verdict_stays_unclassified(home: Path) -> None:
+    """A model diagnoser owns this one in SDE-3 — the rule set must not guess."""
+    _seed(home, notes="lifecycle exited without a verdict")
+
+    result = dx.diagnose(home, RUN, write=False)
+
+    assert result["rule_id"] == dx.RULE_UNCLASSIFIED
+    assert result["layer"] == "unclassified"
+    assert result["source"] == ""
+    _assert_contract(result)
+
+
+# ── R7 / R8 — the retry-hint rules ─────────────────────────────────────────
+
+
+def test_r7_owner_only_fix_is_environment_owner(home: Path, monkeypatch) -> None:
+    from mini_ork.recovery import retry_hint as rh
+
+    _seed(home)
+    monkeypatch.setattr(rh, "load_or_compute", lambda *a, **k: {
+        "version": rh.HINT_VERSION, "run_id": RUN, "failed_node": "implementer",
+        "retryable": True, "strategy": "resume", "from_node": "implementer",
+        "needs_change": {"kind": "credentials", "summary": "the API key is missing",
+                         "detail": "", "evidence": ""},
+        "notes": [], "command": "", "computed_at": "2026-01-01T00:00:00Z",
+    })
+
+    result = dx.diagnose(home, RUN, write=False)
+
+    assert result["rule_id"] == "R7"
+    assert result["layer"] == "environment"
+    assert result["routes_to"] == "owner"
+    _assert_contract(result)
+
+
+def test_r8_lane_hint_is_model_swap_lane(home: Path, monkeypatch) -> None:
+    from mini_ork.recovery import retry_hint as rh
+
+    _seed(home)
+    monkeypatch.setattr(rh, "load_or_compute", lambda *a, **k: {
+        "version": rh.HINT_VERSION, "run_id": RUN, "failed_node": "implementer",
+        "retryable": True, "strategy": "lane", "from_node": "implementer",
+        "needs_change": {"kind": "lane", "summary": "flash is unavailable",
+                         "detail": "", "evidence": ""},
+        "notes": [], "command": "", "computed_at": "2026-01-01T00:00:00Z",
+    })
+
+    result = dx.diagnose(home, RUN, write=False)
+
+    assert result["rule_id"] == "R8"
+    assert result["layer"] == "model"
+    assert result["routes_to"] == "swap_lane"
+    _assert_contract(result)
+
+
+# ── the contract fields ────────────────────────────────────────────────────
+
+
+def test_every_rule_result_carries_the_literal_rule_source(home: Path) -> None:
+    """``source`` is ``"rule"`` on every rule result and ``""`` on the fall-through."""
+    _seed_abstain(home)
+    for run_id, seed in (
+        ("run-r1", lambda: _seed_abstain(home, "run-r1")),
+        ("run-r1b", lambda: _seed_abstain(home, "run-r1b", levels_ok=False,
+                                          reason="levels_unverified")),
+        ("run-plain", lambda: _seed(home, run_id="run-plain")),
+    ):
+        seed()
+        result = dx.diagnose(home, run_id, write=False)
+        assert result["source"] == ("rule" if run_id != "run-plain" else ""), result
+
+
+def test_evidence_items_carry_excerpt_and_never_detail(home: Path) -> None:
+    _seed_abstain(home)
+
+    result = dx.diagnose(home, RUN, write=False)
+
+    assert result["evidence"]
+    for item in result["evidence"]:
+        assert "excerpt" in item
+        assert "detail" not in item
+
+
+def test_layer_and_routes_values_are_inside_the_declared_enums(home: Path) -> None:
+    """Every value the suite can produce lies inside the contract enums."""
+    # R1
+    _seed_abstain(home)
+    # R1b
+    _seed_abstain(home, "run-r1b", levels_ok=False, reason="levels_unverified")
+    # R2
+    r2 = _seed(home, run_id="run-r2")
+    (r2 / "impl-implementer.log").write_text(
+        'Traceback (most recent call last):\n'
+        '  File "/x/mini_ork/foo.py", line 1, in f\n'
+        "ValueError: x\n"
+    )
+    _event(home, "run-r2", 1, "node_start", {"node_id": "implementer"})
+    _event(home, "run-r2", 2, "node_end",
+           {"node_id": "implementer", "finish_reason": "error"})
+    # R3
+    _seed(home, run_id="run-r3")
+    _event(home, "run-r3", 1, "node_end",
+           {"node_id": "implementer", "finish_reason": "timeout"})
+    # R4
+    r4 = _seed(home, run_id="run-r4")
+    (r4 / "review-reviewer.json").write_text(json.dumps({"verdict": "needs_revision"}))
+    # R5
+    r5 = _seed(home, run_id="run-r5")
+    (r5 / "verifier_test.json").write_text(json.dumps({"status": "FAIL", "pass": False}))
+    # R6 (provider + user)
+    _seed(home, run_id="run-r6", notes="killed-by-user")
+    _event(home, "run-r6", 1, "node_start", {"node_id": "implementer"})
+    _seed(home, run_id="run-r6p")
+    _event(home, "run-r6p", 1, "node_start", {"node_id": "implementer"})
+    # RN
+    _seed(home, run_id="run-rn", notes="planner_dispatch_rc_43")
+    # fall-through
+    _seed(home, run_id="run-none")
+
+    run_ids = ["run-1791914481-48337", "run-r1b", "run-r2", "run-r3", "run-r4",
+               "run-r5", "run-r6", "run-r6p", "run-rn", "run-none"]
+    seen_layers: set[str] = set()
+    seen_routes: set[str] = set()
+    for run_id in run_ids:
+        result = dx.diagnose(home, run_id, write=False)
+        seen_layers.add(result["layer"])
+        seen_routes.add(result["routes_to"])
+        _assert_contract(result)
+
+    assert seen_layers <= dx.LAYERS
+    assert seen_routes <= dx.ROUTES
+    for required in ("engine", "change", "provider", "user", "unclassified"):
+        assert required in seen_layers, (required, seen_layers)
+    for required in ("fix_epic", "reverify", "retry", "none", "revise", "human"):
+        assert required in seen_routes, (required, seen_routes)
 
 
 # ── the unclassified fall-through ──────────────────────────────────────────
@@ -248,6 +586,7 @@ def test_no_evidence_run_is_unclassified_at_zero_confidence(home: Path) -> None:
     assert result["confidence"] == 0.0
     assert result["evidence"] == []
     assert result["node"] is None
+    assert result["source"] == ""
 
 
 def test_done_node_invariant_never_names_a_finished_node(home: Path) -> None:
@@ -270,11 +609,9 @@ def test_diagnose_never_raises_on_a_missing_run(home: Path) -> None:
 
 
 def test_every_matching_rule_cites_evidence(home: Path) -> None:
-    """R1-R7 each cite at least one evidence item; only the fall-through may not."""
+    """Every matched rule cites at least one evidence item; only the fall-through may not."""
     _seed_abstain(home)
-    seeded = [
-        ("R1", dx.diagnose(home, RUN, write=False)),
-    ]
+    seeded = [("R1", dx.diagnose(home, RUN, write=False))]
     r4 = _seed(home, run_id="run-r4")
     (r4 / "review-reviewer.json").write_text(json.dumps({"verdict": "needs_revision"}))
     seeded.append(("R4", dx.diagnose(home, "run-r4", write=False)))
@@ -382,6 +719,23 @@ def test_replay_reports_the_layer_aggregate_and_writes_nothing(home: Path) -> No
     assert not (home / "runs" / RUN / "diagnosis.json").exists()
 
 
+def test_replay_rows_carry_source_and_evidence(home: Path) -> None:
+    _seed_abstain(home)
+    _seed(home, run_id="run-plain")
+
+    data = dx.replay(home, limit=10)
+
+    assert data["runs"]
+    for row in data["runs"]:
+        assert "source" in row
+        assert "evidence" in row
+        assert row["layer"] in dx.LAYERS
+        assert row["routes_to"] in dx.ROUTES
+        if row["rule_id"] != dx.RULE_UNCLASSIFIED:
+            assert row["source"] == "rule"
+            assert row["evidence"]
+
+
 def test_replay_limit_and_empty_home(home: Path) -> None:
     for i in range(3):
         _seed(home, run_id=f"run-{i}")
@@ -401,6 +755,21 @@ def test_cli_prints_json_without_writing(home: Path, capsys) -> None:
     payload = json.loads(capsys.readouterr().out)
     assert payload["layer"] == "engine"
     assert not (run_dir / "diagnosis.json").exists()
+
+
+def test_cli_out_writes_the_same_payload_as_json(home: Path, capsys, tmp_path: Path) -> None:
+    _seed_abstain(home)
+    out = tmp_path / "diagnosis-replay.json"
+
+    rc = dx.main(["--home", str(home), "--replay", "--limit", "5", "--json",
+                  "--no-write", "--out", str(out)])
+
+    assert rc == 0
+    printed = json.loads(capsys.readouterr().out)
+    written = json.loads(out.read_text())
+    assert written == printed
+    assert written["runs"]
+    assert all("source" in row and "evidence" in row for row in written["runs"])
 
 
 def test_cli_requires_a_run_id_unless_replaying(home: Path, capsys) -> None:

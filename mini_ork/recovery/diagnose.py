@@ -2,46 +2,72 @@
 
 ``auto_repair.decide`` answers *what should happen next*; ``retry_hint`` answers
 *what class of failure is this*. Neither names **who owns the failure** —
-which layer (``engine`` / ``provider`` / ``change`` / ``operator``), which stage
-(``plan`` / ``execute`` / ``verify`` / ``review`` / ``deliver``) and which node.
-This module adds exactly that answer, as a first-match-wins rule set:
+which layer (``engine`` / ``provider`` / ``change`` / ``environment`` …), which
+stage (``plan`` / ``execute`` / ``verify`` / ``review`` / ``deliver``) and which
+node. This module adds exactly that answer, as a first-match-wins rule set:
 
-  * ``R1`` publish withheld at the publisher      → engine / deliver / reverify
-  * ``R2`` traceback inside mini-ork's own source → engine / <stage> / framework-edit
-  * ``R3`` infra or provider trouble              → provider / execute / retry
-  * ``R4`` a reviewer asked for a revision        → change / review / revise
-  * ``R5`` a verifier refuted the change          → change / verify / revise
-  * ``R6`` a node started and never ended         → engine / execute / resume
-  * ``R7`` an owner-only fix (environment/credentials/budget) → operator / human
+  * ``R1``  publisher withheld with a proven level vector → engine / deliver / publisher
+  * ``R1b`` publisher withheld with unproven levels      → change / verify / reverify
+  * ``R2``  traceback inside mini-ork's own source       → engine / <stage> / fix_epic
+  * ``R3``  infra or provider trouble                    → provider / execute / retry
+  * ``R4``  a reviewer asked for a revision              → change / review / revise
+  * ``R5``  a verifier refuted the change                → change / verify / revise
+  * ``R6``  a node started and never ended               → user / none ( ``killed-by-user`` )
+                                                           else provider / <stage> / retry
+  * ``RN``  a ``task_runs.notes`` segment localises it   → provider / … / retry (see below)
+  * ``R7``  an owner-only fix (environment/credentials/budget) → environment / owner
+  * ``R8``  the retry hint points at an unavailable lane → model / swap_lane
 
 and an **unclassified fall-through** at confidence ``0.0``.
+
+The note rules (``RN``) run after the artefact/event rules and before the
+fall-through. They read the append-only ``task_runs.notes`` column — the same
+``"; "``-joined, per-segment ``str.startswith`` read ``auto_repair.decide``
+performs — because for a reaped or crashed lifecycle the notes are the only
+place the cause is written down:
+
+  * a ``reaped:`` segment            → provider / <stage of the last open node, else ``unknown``> / retry
+  * a ``planner_dispatch_rc_<N>``    → provider / plan / planner / retry
+  * ``lifecycle exited on an exception`` → engine / <stage> / fix_epic, but **only**
+    when R2's own traceback evidence also exists for the run; without it the run
+    stays unclassified.
+  * ``lifecycle exited without a verdict`` stays unclassified — a model diagnoser
+    owns it in a later epic; guessing here would be a confident lie.
 
 Two invariants make the answer trustworthy:
 
   * **Evidence is load-bearing.** Every matching rule cites at least one
-    evidence item (a file reference, a ``run_events`` id, a log excerpt or the
-    retry hint's own field). A rule that cannot cite evidence does not match:
-    the diagnosis degrades to ``unclassified`` rather than becoming a confident
-    guess. The unclassified fall-through is the one result with no evidence.
+    evidence item (a file reference, a ``run_events`` id, a log excerpt, a note
+    segment or the retry hint's own field), carried as
+    ``{"kind", "ref", "excerpt"}``. A rule that cannot cite evidence does not
+    match: the diagnosis degrades to ``unclassified`` rather than becoming a
+    confident guess. The unclassified fall-through is the one result with no
+    evidence. ``source`` is the literal ``"rule"`` on every rule result — the
+    cited *file* lives in ``evidence[].ref`` — and ``""`` on the fall-through.
   * **The done-node invariant.** ``node`` never names a node whose *latest*
     ``node_end`` finished ``done`` — a node that succeeded is not where the run
     stopped, so naming it sends the operator to a step with nothing to fix.
     The publisher's abstain is likewise read from its latest ``node_end``, so a
     publisher that was retried and later finished ``done`` is not misreported.
 
+``confidence`` is the **rule's own prior** — how reliable this rule's signal is
+in general — not a model's claim about this run. It never varies with the
+evidence; a rule is only ever matched or not.
+
 Read-only by construction: the module reads the run dir, ``run_events`` /
-``node_attempts`` and the reused helpers, and (when ``write=True``) writes only
-``<run_dir>/diagnosis.json``. It never raises — ``auto_repair.decide`` calls it
-on every failed run, so a missing run dir, a half-written artefact or an absent
-DB degrades to ``unclassified``.
+``node_attempts`` / ``task_runs.notes`` and the reused helpers, and (when
+``write=True``) writes only ``<run_dir>/diagnosis.json``. It never raises —
+``auto_repair.decide`` calls it on every failed run, so a missing run dir, a
+half-written artefact or an absent DB degrades to ``unclassified``.
 
 CLI::
 
     python3 -m mini_ork.recovery.diagnose <run_id> [--json] [--no-write]
-    python3 -m mini_ork.recovery.diagnose --replay [--limit N] [--json]
+    python3 -m mini_ork.recovery.diagnose --replay [--limit N] [--json] [--out PATH]
 
 ``--replay`` diagnoses the most recent terminal failed runs of the home and
-prints an aggregate; it never writes anything.
+prints an aggregate; it never writes a run dir. ``--out`` writes the same JSON
+payload to a path.
 """
 from __future__ import annotations
 
@@ -51,25 +77,62 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-DIAGNOSIS_VERSION = 1
+DIAGNOSIS_VERSION = 2
 DIAGNOSIS_FILE = "diagnosis.json"
 PUBLISH_ABSTAIN_FILE = "publish-abstain.json"
 
-# Layers — who owns the fix.
-LAYER_ENGINE = "engine"
-LAYER_PROVIDER = "provider"
+# Layers — who owns the fix. The enum the contract routes on.
 LAYER_CHANGE = "change"
-LAYER_OPERATOR = "operator"
+LAYER_MODEL = "model"
+LAYER_PROVIDER = "provider"
+LAYER_ENVIRONMENT = "environment"
+LAYER_ENGINE = "engine"
+LAYER_KICKOFF = "kickoff"
+LAYER_USER = "user"
 LAYER_UNCLASSIFIED = "unclassified"
+LAYERS = frozenset({
+    LAYER_CHANGE, LAYER_MODEL, LAYER_PROVIDER, LAYER_ENVIRONMENT,
+    LAYER_ENGINE, LAYER_KICKOFF, LAYER_USER, LAYER_UNCLASSIFIED,
+})
+
+# ``routes_to`` — what the next step should do about it.
+ROUTE_REVISE = "revise"
+ROUTE_REVERIFY = "reverify"
+ROUTE_SWAP_LANE = "swap_lane"
+ROUTE_RETRY = "retry"
+ROUTE_OWNER = "owner"
+ROUTE_FIX_EPIC = "fix_epic"
+ROUTE_KICKOFF_REPAIR = "kickoff_repair"
+ROUTE_NONE = "none"
+ROUTE_HUMAN = "human"
+ROUTES = frozenset({
+    ROUTE_REVISE, ROUTE_REVERIFY, ROUTE_SWAP_LANE, ROUTE_RETRY, ROUTE_OWNER,
+    ROUTE_FIX_EPIC, ROUTE_KICKOFF_REPAIR, ROUTE_NONE, ROUTE_HUMAN,
+})
+
+# ``source`` is the literal ``"rule"`` on every rule result: the diagnosis came
+# from the rule set, and the artefact it read is cited in ``evidence[].ref``.
+SOURCE_RULE = "rule"
+SOURCE_FALLTHROUGH = ""
 
 RULE_UNCLASSIFIED = "unclassified"
 
-# The publisher's own abstain signals. ``publisher.py`` returns them as the
+# The publisher's own withheld signals. ``publisher.py`` returns them as the
 # publisher node's ``finish_reason``; ``task_state._TERMINAL_OK_FINISH``
-# deliberately treats ``abstain`` / ``levels_unverified`` as NOT failures (a
-# withheld publish is not a crashed node), so R1 — not ``_failing_node`` — is
-# what names them.
+# deliberately treats them as NOT failures (a withheld publish is not a crashed
+# node), so R1 / R1b — not ``_failing_node`` — are what name them. Only
+# ``publish_abstain`` *with* a proven level vector is an engine fault; the rest
+# are the change's own problem (re-verify it).
 _ABSTAIN_FINISH = frozenset({"publish_abstain", "levels_unverified", "abstain"})
+_PUBLISH_ABSTAIN = "publish_abstain"
+
+# ``task_runs.notes`` vocabulary (append-only, ``"; "``-joined). Mirrors the
+# read ``auto_repair.decide`` performs for the killed-by-user marker.
+_NOTE_KILLED_BY_USER = "killed-by-user"
+_NOTE_REAPED = "reaped:"
+_NOTE_PLANNER_DISPATCH_RC = "planner_dispatch_rc_"
+_NOTE_LIFECYCLE_EXCEPTION = "lifecycle exited on an exception"
+_NOTE_LIFECYCLE_NO_VERDICT = "lifecycle exited without a verdict"
 
 # Node-id token → stage. Deterministic and I/O-free: the same shape
 # ``acp/task_state`` and ``ide_pages`` use to read a node's role off its name.
@@ -88,9 +151,9 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _ev(kind: str, ref: str, detail: str) -> dict[str, str]:
+def _ev(kind: str, ref: str, excerpt: str) -> dict[str, str]:
     """One evidence item: what kind of citation this is, where, and what it says."""
-    return {"kind": str(kind), "ref": str(ref), "detail": str(detail)[:400]}
+    return {"kind": str(kind), "ref": str(ref), "excerpt": str(excerpt)[:400]}
 
 
 def _read_json(path: Path) -> Any:
@@ -138,6 +201,51 @@ def _lifecycle(home: Path, run_id: str) -> list[dict[str, Any]] | None:
     ]
 
 
+def _notes(home: Path, run_id: str) -> str:
+    """``task_runs.notes`` for this run, or ``""``.
+
+    Fail-soft, like ``auto_repair.decide``'s own read: an unreadable or absent
+    notes column must never raise and must never be confused with a note that
+    *says* something. The caller re-derives meaning per ``"; "``-separated
+    segment.
+    """
+    try:
+        from mini_ork.web.db import db_for
+        db = db_for(Path(home))
+        if not db.has_table("task_runs"):
+            return ""
+        row = db.row("SELECT notes FROM task_runs WHERE id = ? LIMIT 1", (str(run_id),))
+        return str((row or {}).get("notes") or "")
+    except Exception:  # noqa: BLE001 — an unreadable notes column is "no notes"
+        return ""
+
+
+def _note_segments(home: Path, run_id: str) -> list[str]:
+    """The non-empty ``"; "``-separated segments of ``task_runs.notes``.
+
+    The exact split ``auto_repair.decide`` uses, so the two never disagree about
+    whether a note is present.
+    """
+    notes = _notes(home, run_id)
+    return [seg for seg in notes.split("; ") if seg.strip()]
+
+
+def _levels_ok(run_dir: Path) -> bool | None:
+    """The run-level report's ``levels_ok``, or ``None`` when it is not stamped.
+
+    The report is written to ``verdict.json`` — or ``run-verdict.json`` when a
+    recipe owns ``verdict.json`` as its own deliverable — by
+    ``cli/execute.py`` / ``verify/levels.py``. ``None`` (no stamp, or no file)
+    is treated as "not proven": only an explicit ``true`` makes a withheld
+    publish an engine fault.
+    """
+    for name in ("verdict.json", "run-verdict.json"):
+        data = _read_json(run_dir / name)
+        if isinstance(data, dict) and "levels_ok" in data:
+            return bool(data["levels_ok"])
+    return None
+
+
 def _payload(ev: dict[str, Any]) -> dict[str, Any]:
     from mini_ork.acp.task_state import _parse_payload
     return _parse_payload(ev.get("payload_json"))
@@ -182,6 +290,34 @@ def _last_match(ends: dict[str, dict[str, Any]], token: str) -> str:
     return found
 
 
+def _open_state(events: list[dict[str, Any]] | None) -> tuple[list[str], str]:
+    """``(open_nodes, last_open)`` for nodes that started and never ended.
+
+    Insertion order is preserved (``node_start`` order), so ``last_open`` is the
+    most recent node the run entered without a matching ``node_end`` — the node
+    an interruption or a reap actually stranded.
+    """
+    if not events:
+        return [], ""
+    starts: dict[str, int] = {}
+    ends_count: dict[str, int] = {}
+    order: list[str] = []
+    last_open = ""
+    for ev in events:
+        node_id, _t = _node_of(ev)
+        if not node_id:
+            continue
+        if ev.get("event_type") == "node_start":
+            starts[node_id] = starts.get(node_id, 0) + 1
+            if node_id not in order:
+                order.append(node_id)
+            last_open = node_id
+        elif ev.get("event_type") == "node_end":
+            ends_count[node_id] = ends_count.get(node_id, 0) + 1
+    open_nodes = [n for n in order if starts.get(n, 0) > ends_count.get(n, 0)]
+    return open_nodes, last_open
+
+
 def _stage_for(node_id: str | None, node_type: str = "") -> str:
     blob = f"{node_id or ''} {node_type or ''}".lower()
     for token, stage in _STAGE_TOKENS:
@@ -198,7 +334,7 @@ def _guard_node(node: str | None, ends: dict[str, dict[str, Any]]) -> str | None
 
 
 def _result(run_id: str, *, rule_id: str, layer: str, stage: str, node: str | None,
-            source: str, confidence: float, evidence: list[dict[str, str]],
+            confidence: float, evidence: list[dict[str, str]],
             routes_to: str, summary: str,
             ends: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     return {
@@ -208,7 +344,7 @@ def _result(run_id: str, *, rule_id: str, layer: str, stage: str, node: str | No
         "layer": layer,
         "stage": stage,
         "node": _guard_node(node, ends or {}),
-        "source": source,
+        "source": SOURCE_RULE,
         "confidence": float(confidence),
         "evidence": list(evidence),
         "routes_to": routes_to,
@@ -221,7 +357,8 @@ def _fallthrough(run_id: str, layer: str, summary: str) -> dict[str, Any]:
     """The unclassified result — no rule could cite evidence, so we say so.
 
     ``confidence`` is ``0.0`` and ``evidence`` is empty by construction: this is
-    the honest "nothing localised this failure" answer, not a guess.
+    the honest "nothing localised this failure" answer, not a guess. ``source``
+    is ``""`` — there is no rule behind it.
     """
     return {
         "version": DIAGNOSIS_VERSION,
@@ -230,10 +367,10 @@ def _fallthrough(run_id: str, layer: str, summary: str) -> dict[str, Any]:
         "layer": layer,
         "stage": "unknown",
         "node": None,
-        "source": "",
+        "source": SOURCE_FALLTHROUGH,
         "confidence": 0.0,
         "evidence": [],
-        "routes_to": "human",
+        "routes_to": ROUTE_HUMAN,
         "summary": summary,
         "computed_at": _now_iso(),
     }
@@ -319,70 +456,172 @@ def _failing_artifacts(run_dir: Path) -> tuple[str | None, str, str, str]:
 # ── the rules ────────────────────────────────────────────────────────────────
 
 
-def _rule_publish_abstain(run_dir: Path, run_id: str, ends: dict[str, dict[str, Any]]
-                          ) -> dict[str, Any] | None:
-    """R1 — the publisher withheld the publish."""
-    from mini_ork.acp.task_state import withheld_publish
+def _publisher_withheld(run_dir: Path, ends: dict[str, dict[str, Any]]
+                        ) -> tuple[str, str, dict[str, Any] | None] | None:
+    """``(publisher, finish_reason, abstain_artefact)`` when the publisher withheld.
+
+    ``None`` when the publisher's LATEST ``node_end`` finished ``done`` (it
+    published — whatever an older abstain artefact still says) or when nothing
+    in the run dir says it withheld. Read once by both R1 and R1b so the two can
+    never disagree about *whether* the run was withheld.
+    """
     pub = _last_match(ends, "publisher")
     reason = str((ends.get(pub) or {}).get("finish_reason") or "")
     if reason.lower() == "done":
-        # The LATEST publisher end finished ``done``: it published. Whatever an
-        # older abstain artefact still says, this run is not withheld.
         return None
     abstain = _read_json(run_dir / PUBLISH_ABSTAIN_FILE)
     abstain = abstain if isinstance(abstain, dict) else None
     if abstain is None and reason.lower() not in _ABSTAIN_FINISH:
         return None
+    return pub, reason, abstain
 
+
+def _abstain_evidence(pub: str, reason: str, abstain: dict[str, Any] | None,
+                      levels_ok: bool | None, event_id: str = ""
+                      ) -> list[dict[str, str]]:
+    """The shared citations both withhold rules build from."""
     evidence: list[dict[str, str]] = []
     if abstain is not None:
         evidence.append(_ev("file", PUBLISH_ABSTAIN_FILE,
                             f"publish withheld: {abstain.get('reason') or '?'} — "
                             f"{str(abstain.get('detail') or '')[:200]}"))
     if pub and reason:
-        evidence.append(_ev("event", f"run_events:{ends[pub].get('event_id') or '?'}",
-                            f"publisher {pub} latest node_end finish_reason={reason}"))
-    try:
-        levels = withheld_publish(run_dir, None)
-    except Exception:  # noqa: BLE001
-        levels = None
-    if levels:
+        evidence.append(_ev("event", f"run_events:{event_id or '?'}",
+                            f"publisher {pub} latest node_end finish_reason={reason} "
+                            f"(publish_abstain evidence)"))
+    if levels_ok is not None:
         evidence.append(_ev("report", "verdict.json",
-                            f"levels not proven: {', '.join(levels)}"))
-    if not evidence:
+                            f"run-level level vector proven={str(levels_ok).lower()}"))
+    return evidence
+
+
+def _rule_publish_abstain(run_dir: Path, run_id: str, ends: dict[str, dict[str, Any]]
+                          ) -> dict[str, Any] | None:
+    """R1 — the publisher withheld the publish although every level was proven.
+
+    Only ``finish_reason == "publish_abstain"`` with ``levels_ok`` true: the
+    change verified cleanly, so a withheld commit is the *engine's* fault (the
+    authored patch could not be committed) and warrants a fix epic. A withheld
+    publish whose levels are unproven is the change's own problem — R1b.
+    """
+    got = _publisher_withheld(run_dir, ends)
+    if got is None:
         return None
+    pub, reason, abstain = got
+    levels_ok = _levels_ok(run_dir)
+    if reason.lower() != _PUBLISH_ABSTAIN or levels_ok is not True:
+        return None
+    evidence = _abstain_evidence(pub, reason, abstain, levels_ok,
+                                 str((ends.get(pub) or {}).get("event_id") or ""))
     node = pub or "publisher"
     return _result(
         run_id, rule_id="R1", layer=LAYER_ENGINE, stage="deliver", node=node,
-        source=evidence[0]["ref"], confidence=0.9, evidence=evidence,
-        routes_to="reverify",
-        summary=f"the publisher withheld the publish ({node}) — re-verify, do not revise",
+        confidence=0.9, evidence=evidence, routes_to=ROUTE_FIX_EPIC,
+        summary=(f"the publisher withheld the publish at {node} although every "
+                 f"level was proven — the engine could not deliver the change"),
         ends=ends,
     )
+
+
+def _rule_withheld_unproven(run_dir: Path, run_id: str, ends: dict[str, dict[str, Any]]
+                            ) -> dict[str, Any] | None:
+    """R1b — the publisher withheld, but not as an engine fault.
+
+    ``levels_unverified`` / ``abstain`` finishes, or a ``publish_abstain`` whose
+    run-level report is missing or ``levels_ok=False``: the change itself is not
+    proven, so it goes back through verify rather than opening a fix epic.
+    """
+    got = _publisher_withheld(run_dir, ends)
+    if got is None:
+        return None
+    pub, reason, abstain = got
+    levels_ok = _levels_ok(run_dir)
+    if reason.lower() == _PUBLISH_ABSTAIN and levels_ok is True:
+        return None  # R1 owns it
+    evidence = _abstain_evidence(pub, reason, abstain, levels_ok,
+                                 str((ends.get(pub) or {}).get("event_id") or ""))
+    node = pub or "publisher"
+    return _result(
+        run_id, rule_id="R1b", layer=LAYER_CHANGE, stage="verify", node=node,
+        confidence=0.8, evidence=evidence, routes_to=ROUTE_REVERIFY,
+        summary=(f"the publisher withheld the publish at {node} with unproven "
+                 f"levels — re-verify, do not revise"),
+        ends=ends,
+    )
+
+
+def _traceback_evidence(failed_node: str | None, fail_reason: str, log: str
+                        ) -> list[dict[str, str]]:
+    """R2's citations: ``triage.blame`` attributed the failure to mini-ork's source.
+
+    Empty when the failure is not inside the framework tree — which is exactly
+    the test the note rule for ``lifecycle exited on an exception`` reuses, so a
+    crashed lifecycle is never labelled ``engine`` without a traceback behind it.
+    """
+    if not failed_node:
+        return []
+    try:
+        from mini_ork.triage.blame import NodeFailure, attribute
+        verdict, blamed = attribute(NodeFailure(
+            node_id=failed_node, finish_reason=fail_reason or None, log_excerpt=log or "",
+        ))
+    except Exception:  # noqa: BLE001
+        return []
+    if verdict != "mini_ork":
+        return []
+    evidence = [_ev("log", f"node:{failed_node}", f"{e.rule}: {e.detail}") for e in blamed]
+    if not evidence and log:
+        evidence = [_ev("log", f"node:{failed_node}", log[:300])]
+    return evidence
+
+
+def _log_traceback_evidence(run_dir: Path) -> list[dict[str, str]]:
+    """A mini-ork traceback found in the run's OWN logs, when no node localises it.
+
+    The second witness for ``lifecycle exited on an exception``: the lifecycle
+    process died outside any node (so ``_failing_node`` names nothing and R2 has
+    no node to blame), yet its log still carries the framework frame. Read
+    fail-soft — a missing run dir or an unreadable log is simply no evidence.
+    """
+    if not run_dir.is_dir():
+        return []
+    try:
+        from mini_ork.triage.blame import NodeFailure, attribute
+    except Exception:  # noqa: BLE001
+        return []
+    names = sorted(p for p in run_dir.glob("execute*.log"))
+    names += sorted(p for p in run_dir.glob("impl-*.log"))
+    for path in names:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if "Traceback (most recent call last)" not in text:
+            continue
+        excerpt = "\n".join(text.splitlines()[-40:])[:2000]
+        try:
+            verdict, blamed = attribute(NodeFailure(node_id=path.name, log_excerpt=excerpt))
+        except Exception:  # noqa: BLE001
+            continue
+        if verdict != "mini_ork":
+            continue
+        evidence = [_ev("log", f"log:{path.name}", f"{e.rule}: {e.detail}") for e in blamed]
+        if evidence:
+            return evidence
+    return []
 
 
 def _rule_framework_error(run_dir: Path, run_id: str, ends: dict[str, dict[str, Any]],
                           failed_node: str | None, fail_reason: str, log: str
                           ) -> dict[str, Any] | None:
     """R2 — a traceback inside mini-ork's own source (via ``triage.blame``)."""
-    if not failed_node:
-        return None
-    from mini_ork.triage.blame import NodeFailure, attribute
-    verdict, blamed = attribute(NodeFailure(
-        node_id=failed_node, finish_reason=fail_reason or None, log_excerpt=log or "",
-    ))
-    if verdict != "mini_ork":
-        return None
-    evidence = [_ev("log", f"node:{failed_node}", f"{e.rule}: {e.detail}") for e in blamed]
-    if not evidence and log:
-        evidence = [_ev("log", f"node:{failed_node}", log[:300])]
+    evidence = _traceback_evidence(failed_node, fail_reason, log)
     if not evidence:
         return None
     stage = _stage_for(failed_node, str((ends.get(failed_node) or {}).get("node_type") or ""))
     return _result(
         run_id, rule_id="R2", layer=LAYER_ENGINE, stage=stage, node=failed_node,
-        source=evidence[0]["ref"], confidence=0.85, evidence=evidence,
-        routes_to="framework-edit",
+        confidence=0.85, evidence=evidence, routes_to=ROUTE_FIX_EPIC,
         summary=f"an error inside mini-ork's own source at {failed_node} — framework fix",
         ends=ends,
     )
@@ -420,8 +659,7 @@ def _rule_infra(home: Path, run_id: str, run_dir: Path, ends: dict[str, dict[str
         return None
     return _result(
         run_id, rule_id="R3", layer=LAYER_PROVIDER, stage="execute", node=failed_node,
-        source=evidence[0]["ref"], confidence=0.8, evidence=evidence,
-        routes_to="retry",
+        confidence=0.8, evidence=evidence, routes_to=ROUTE_RETRY,
         summary=(f"infrastructure/provider failure"
                  f"{' at ' + failed_node if failed_node else ''} ({fail_reason or fc}) — retry"),
         ends=ends,
@@ -449,8 +687,7 @@ def _rule_review(run_dir: Path, run_id: str, ends: dict[str, dict[str, Any]],
         return None
     return _result(
         run_id, rule_id="R4", layer=LAYER_CHANGE, stage="review", node=node,
-        source=evidence[0]["ref"], confidence=0.85, evidence=evidence,
-        routes_to="revise",
+        confidence=0.85, evidence=evidence, routes_to=ROUTE_REVISE,
         summary=f"the reviewer asked for a revision at {node} — send the change back",
         ends=ends,
     )
@@ -475,49 +712,132 @@ def _rule_verifier(run_dir: Path, run_id: str, ends: dict[str, dict[str, Any]],
         return None
     return _result(
         run_id, rule_id="R5", layer=LAYER_CHANGE, stage="verify", node=node,
-        source=evidence[0]["ref"], confidence=0.8, evidence=evidence,
-        routes_to="revise",
+        confidence=0.8, evidence=evidence, routes_to=ROUTE_REVISE,
         summary=f"a verifier refuted the change at {node} — send the change back",
         ends=ends,
     )
 
 
-def _rule_interrupted(run_id: str, events: list[dict[str, Any]] | None,
+def _rule_interrupted(home: Path, run_id: str, events: list[dict[str, Any]] | None,
                       ends: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
-    """R6 — a node started and never ended."""
-    if not events:
-        return None
-    starts: dict[str, int] = {}
-    ends_count: dict[str, int] = {}
-    last_open = ""
-    for ev in events:
-        node_id, _t = _node_of(ev)
-        if not node_id:
-            continue
-        if ev.get("event_type") == "node_start":
-            starts[node_id] = starts.get(node_id, 0) + 1
-            last_open = node_id
-        elif ev.get("event_type") == "node_end":
-            ends_count[node_id] = ends_count.get(node_id, 0) + 1
-    open_nodes = [n for n in starts if starts[n] > ends_count.get(n, 0)]
+    """R6 — a node started and never ended.
+
+    The *default* is provider / retry: a node that vanished mid-flight is
+    transport trouble, not a framework bug — labelling it ``engine`` opened a
+    spurious fix epic for every interruption. The one exception is a run a
+    *person* stopped: ``board kill`` appends ``"killed-by-user"`` to
+    ``task_runs.notes`` (``web/control.py`` ``_writeback_terminal``), and notes
+    are append-only (``notes = COALESCE(notes || '; ', '') || ?``), so the
+    marker is matched per ``"; "``-separated segment exactly as
+    ``auto_repair.decide`` matches it.
+    """
+    open_nodes, last_open = _open_state(events)
     if not open_nodes:
         return None
     node = last_open if last_open in open_nodes else open_nodes[-1]
-    row = next((ev for ev in reversed(events)
+    node_type = str((ends.get(node) or {}).get("node_type") or "")
+    row = next((ev for ev in reversed(events or [])
                 if ev.get("event_type") == "node_start" and _node_of(ev)[0] == node), None)
-    evidence = [_ev("event", f"run_events:{(row or {}).get('event_id') or '?'}",
-                    f"{node} started and never ended — the run was interrupted mid-node")]
+    event_ref = f"run_events:{(row or {}).get('event_id') or '?'}"
+    killed_by_user = any(seg.startswith(_NOTE_KILLED_BY_USER)
+                         for seg in _note_segments(home, run_id))
+    if killed_by_user:
+        return _result(
+            run_id, rule_id="R6", layer=LAYER_USER, stage=_stage_for(node, node_type),
+            node=node, confidence=0.9,
+            evidence=[_ev("event", event_ref,
+                          f"{node} started and never ended — the run was stopped by the user"),
+                      _ev("note", "task_runs.notes",
+                          f"{_NOTE_KILLED_BY_USER}: a person stopped the run")],
+            routes_to=ROUTE_NONE,
+            summary=f"the run was stopped by the user during {node} — nothing to repair",
+            ends=ends,
+        )
     return _result(
-        run_id, rule_id="R6", layer=LAYER_ENGINE, stage="execute", node=node,
-        source=evidence[0]["ref"], confidence=0.9, evidence=evidence,
-        routes_to="resume",
-        summary=f"the run was interrupted during {node} — resume it",
+        run_id, rule_id="R6", layer=LAYER_PROVIDER, stage=_stage_for(node, node_type),
+        node=node, confidence=0.8,
+        evidence=[_ev("event", event_ref,
+                      f"{node} started and never ended — the run was interrupted mid-node")],
+        routes_to=ROUTE_RETRY,
+        summary=f"the run was interrupted during {node} — retry, it is not a code defect",
         ends=ends,
     )
 
 
-def _rule_operator(home: Path, run_id: str, ends: dict[str, dict[str, Any]],
-                   failed_node: str | None) -> dict[str, Any] | None:
+def _rule_notes(run_id: str, segments: list[str], open_nodes: list[str],
+                ends: dict[str, dict[str, Any]], failed_node: str | None,
+                traceback_evidence: list[dict[str, str]]) -> dict[str, Any] | None:
+    """RN — a ``task_runs.notes`` segment localises the cause.
+
+    Evaluated after the artefact/event rules and before the fall-through: for a
+    reaped or crashed lifecycle the notes are the only written cause. Order
+    within is killed-by-user → reaped → planner-dispatch → lifecycle-exception,
+    so the strongest signal wins when the append-only column carries several.
+    Most interruptions never reach here — R6 already named the dangling node —
+    but R6 declines when every node ended, and the notes are then all that is
+    left.
+    """
+    if not segments:
+        return None
+    for seg in segments:
+        if seg.startswith(_NOTE_KILLED_BY_USER):
+            node = open_nodes[-1] if open_nodes else None
+            return _result(
+                run_id, rule_id="RN", layer=LAYER_USER,
+                stage=_stage_for(node) if node else "unknown", node=node,
+                confidence=0.9,
+                evidence=[_ev("note", "task_runs.notes", seg)],
+                routes_to=ROUTE_NONE,
+                summary="the run was stopped by the user — nothing to repair",
+                ends=ends,
+            )
+    for seg in segments:
+        if seg.startswith(_NOTE_REAPED):
+            node = open_nodes[-1] if open_nodes else None
+            stage = _stage_for(node, "") if node else "unknown"
+            return _result(
+                run_id, rule_id="RN", layer=LAYER_PROVIDER, stage=stage, node=node,
+                confidence=0.8,
+                evidence=[_ev("note", "task_runs.notes", seg)],
+                routes_to=ROUTE_RETRY,
+                summary=(f"the reaper marked the run failed ({seg}) — the dispatcher "
+                         f"died, retry it"),
+                ends=ends,
+            )
+    for seg in segments:
+        if _NOTE_PLANNER_DISPATCH_RC in seg:
+            return _result(
+                run_id, rule_id="RN", layer=LAYER_PROVIDER, stage="plan", node="planner",
+                confidence=0.8,
+                evidence=[_ev("note", "task_runs.notes", seg)],
+                routes_to=ROUTE_RETRY,
+                summary=f"the planner dispatch failed ({seg}) — retry the plan step",
+                ends=ends,
+            )
+    for seg in segments:
+        if _NOTE_LIFECYCLE_EXCEPTION in seg:
+            if not traceback_evidence:
+                # No traceback backs it: an exception in the lifecycle is not
+                # enough to call it an engine fault. Stay unclassified.
+                return None
+            stage = _stage_for(failed_node,
+                               str((ends.get(failed_node or "") or {}).get("node_type") or ""))
+            return _result(
+                run_id, rule_id="RN", layer=LAYER_ENGINE, stage=stage, node=failed_node,
+                confidence=0.8,
+                evidence=[_ev("note", "task_runs.notes", seg), *traceback_evidence],
+                routes_to=ROUTE_FIX_EPIC,
+                summary=f"the lifecycle crashed on an exception ({seg}) with a traceback "
+                        f"in mini-ork's source — framework fix",
+                ends=ends,
+            )
+    # ``lifecycle exited without a verdict`` is deliberately NOT matched here: a
+    # model diagnoser owns it in a later epic, and guessing would be a lie.
+    return None
+
+
+def _rule_environment(home: Path, run_id: str, ends: dict[str, dict[str, Any]],
+                      failed_node: str | None) -> dict[str, Any] | None:
     """R7 — an owner-only fix (environment / credentials / budget)."""
     hint = _hint(home, run_id)
     nc = hint.get("needs_change") if isinstance(hint, dict) else None
@@ -531,10 +851,29 @@ def _rule_operator(home: Path, run_id: str, ends: dict[str, dict[str, Any]],
     evidence = [_ev("hint", f"retry_hint:{run_id}",
                     f"needs_change.kind={kind}: {str(nc.get('summary') or '')[:200]}")]
     return _result(
-        run_id, rule_id="R7", layer=LAYER_OPERATOR, stage=_stage_for(failed_node),
-        node=failed_node, source=evidence[0]["ref"], confidence=0.6, evidence=evidence,
-        routes_to="human",
+        run_id, rule_id="R7", layer=LAYER_ENVIRONMENT, stage=_stage_for(failed_node),
+        node=failed_node, confidence=0.6, evidence=evidence,
+        routes_to=ROUTE_OWNER,
         summary=f"owner-only fix required ({kind}) — the loop cannot make it",
+        ends=ends,
+    )
+
+
+def _rule_lane(home: Path, run_id: str, ends: dict[str, dict[str, Any]],
+               failed_node: str | None) -> dict[str, Any] | None:
+    """R8 — the retry hint points at an unavailable model lane."""
+    hint = _hint(home, run_id)
+    nc = hint.get("needs_change") if isinstance(hint, dict) else None
+    nc = nc if isinstance(nc, dict) else None
+    if not nc or str(nc.get("kind") or "") != "lane":
+        return None
+    evidence = [_ev("hint", f"retry_hint:{run_id}",
+                    f"needs_change.kind=lane: {str(nc.get('summary') or '')[:200]}")]
+    return _result(
+        run_id, rule_id="R8", layer=LAYER_MODEL, stage=_stage_for(failed_node),
+        node=failed_node, confidence=0.7, evidence=evidence,
+        routes_to=ROUTE_SWAP_LANE,
+        summary="the model lane is unavailable — swap the lane and retry",
         ends=ends,
     )
 
@@ -549,15 +888,26 @@ def _diagnose(home: Path, run_id: str) -> dict[str, Any]:
     failed_node, fail_reason = _failing(events)
     log = _tail(run_dir, failed_node)
     artifacts = _failing_artifacts(run_dir)
+    open_nodes, _last_open = _open_state(events)
+    # Computed once: both R2 and the lifecycle-exception note rule read it so
+    # the two can never disagree about whether a traceback was found. The note
+    # rule additionally accepts a traceback found in the run's own log when no
+    # failing node localised it — R2 itself must still name a node.
+    r2_evidence = _traceback_evidence(failed_node, fail_reason, log)
+    lifecycle_evidence = r2_evidence or _log_traceback_evidence(run_dir)
 
     for rule in (
         lambda: _rule_publish_abstain(run_dir, run_id, ends),
+        lambda: _rule_withheld_unproven(run_dir, run_id, ends),
         lambda: _rule_framework_error(run_dir, run_id, ends, failed_node, fail_reason, log),
         lambda: _rule_infra(home, run_id, run_dir, ends, failed_node, fail_reason, log),
         lambda: _rule_review(run_dir, run_id, ends, failed_node, fail_reason, artifacts),
         lambda: _rule_verifier(run_dir, run_id, ends, failed_node, fail_reason, artifacts),
-        lambda: _rule_interrupted(run_id, events, ends),
-        lambda: _rule_operator(home, run_id, ends, failed_node),
+        lambda: _rule_interrupted(home, run_id, events, ends),
+        lambda: _rule_notes(run_id, _note_segments(home, run_id), open_nodes, ends,
+                            failed_node, lifecycle_evidence),
+        lambda: _rule_environment(home, run_id, ends, failed_node),
+        lambda: _rule_lane(home, run_id, ends, failed_node),
     ):
         try:
             result = rule()
@@ -613,6 +963,13 @@ def write_diagnosis(home: Path, run_id: str, result: dict[str, Any]) -> None:
 
 # ── replay (read-only) ───────────────────────────────────────────────────────
 
+# The row fields the replay emits. ``source`` and the full ``evidence`` list are
+# carried so a reader can audit *why* a layer was assigned, not only the verdict.
+_RUN_ROW_FIELDS = (
+    "run_id", "rule_id", "layer", "stage", "node", "source",
+    "confidence", "evidence", "routes_to", "summary",
+)
+
 
 def _terminal_runs(home: Path, limit: int) -> list[str]:
     try:
@@ -645,9 +1002,7 @@ def replay(home: Path, *, limit: int = 25) -> dict[str, Any]:
     by_layer: dict[str, int] = {}
     for run_id in run_ids:
         d = diagnose(home, run_id, write=False)
-        runs.append({k: d.get(k) for k in
-                     ("run_id", "rule_id", "layer", "stage", "node",
-                      "confidence", "routes_to", "summary")})
+        runs.append({k: d.get(k) for k in _RUN_ROW_FIELDS})
         by_rule[str(d.get("rule_id"))] = by_rule.get(str(d.get("rule_id")), 0) + 1
         by_layer[str(d.get("layer"))] = by_layer.get(str(d.get("layer")), 0) + 1
     total = len(runs)
@@ -675,12 +1030,12 @@ def _format(result: dict[str, Any]) -> str:
     lines = [
         f"{result.get('run_id')}: {result.get('layer')}/{result.get('stage')}"
         f"{'/' + str(result['node']) if result.get('node') else ''}"
-        f"  [{result.get('rule_id')} conf={result.get('confidence')}]"
+        f"  [{result.get('rule_id')} src={result.get('source')} conf={result.get('confidence')}]"
         f"  → {result.get('routes_to')}",
         f"  {result.get('summary')}",
     ]
     for item in result.get("evidence") or []:
-        lines.append(f"  - {item.get('kind')}: {item.get('ref')} — {item.get('detail')}")
+        lines.append(f"  - {item.get('kind')}: {item.get('ref')} — {item.get('excerpt')}")
     return "\n".join(lines)
 
 
@@ -712,20 +1067,35 @@ def main(argv: list[str] | None = None) -> int:
                         help="diagnose the most recent terminal failed runs (read-only)")
     parser.add_argument("--limit", type=int, default=25,
                         help="how many runs --replay reads (default 25)")
+    parser.add_argument("--out", default="",
+                        help="write the JSON payload to this path (same bytes as --json)")
     args = parser.parse_args(argv)
 
     home = Path(args.home).expanduser() if args.home else _default_home()
 
     if args.replay:
         data = replay(home, limit=args.limit)
+        if args.out:
+            _write_payload(Path(args.out).expanduser(), data)
         print(json.dumps(data, indent=2) if args.json else _format_replay(data))
         return 0
 
     if not args.run_id:
         parser.error("run_id is required unless --replay is given")
     result = diagnose(home, args.run_id, write=not args.no_write)
+    if args.out:
+        _write_payload(Path(args.out).expanduser(), result)
     print(json.dumps(result, indent=2) if args.json else _format(result))
     return 0
+
+
+def _write_payload(path: Path, payload: dict[str, Any]) -> None:
+    """Write the JSON payload to *path* — best effort, never raises."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":
