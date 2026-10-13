@@ -3285,16 +3285,21 @@ class MiniOrkAcpAgent:
 
         # Capture stdout/stderr from epics add so the user sees any error
         # verbatim; a non-zero rc becomes a refusal with no success line.
+        # The kickoff copy lands under the root epics.main resolves
+        # (MINI_ORK_ROOT or os.getcwd()) — the same expression the scheduler
+        # uses at scheduler.run_loop, so the board row's kickoff_path and the
+        # scheduler's resolve_kickoff agree regardless of which project the
+        # IDE served this thread from. db still points at the session home's
+        # state.db so the epics row lives on the IDE's board, not the engine's.
         from mini_ork.cli import epics as _epics
         db = str(home / "state.db")
-        root = str(home.parent)
         argv = ["add", "--title", title, "--kickoff", str(target), "--json"]
         stdout = io.StringIO()
         stderr = io.StringIO()
         rc = 1
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             try:
-                rc = _epics.main(argv, db=db, root=root)
+                rc = _epics.main(argv, db=db)
             except SystemExit as exc:  # argparse / refusals that call sys.exit
                 rc = int(exc.code) if isinstance(exc.code, int) else 2
             except Exception as exc:  # noqa: BLE001 — surface, never propagate

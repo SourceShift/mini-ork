@@ -48,6 +48,7 @@ from acp.schema import (  # noqa: E402
 from mini_ork.acp import commands as cmds  # noqa: E402
 from mini_ork.acp.agent import MiniOrkAcpAgent  # noqa: E402
 from mini_ork.cli import epics as ep  # noqa: E402
+from mini_ork import scheduler as sched  # noqa: E402
 from mini_ork.stores import migrate as mig  # noqa: E402
 
 
@@ -168,8 +169,17 @@ def _kickoff_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[P
     )
     (proj / "present.py").write_text("x", encoding="utf-8")
     monkeypatch.setenv("MINI_ORK_HOME", str(home))
-    # Migrate the epics table — ``epics add`` needs it.
+    # Migrate the epics table — ``epics add`` needs it. ``db/init.sh`` looks
+    # up ``MINI_ORK_ROOT`` for the migrations directory, so it must remain
+    # unset (or set to the repo) for this call; we set it to ``proj`` AFTER
+    # the migration finishes so the queue flow picks the project root.
     _init_db_via_sh(home)
+    # Default the engine root to the project root so ``epics.main``'s
+    # default resolution (MINI_ORK_ROOT or os.getcwd()) lands the kickoff
+    # copy at ``proj/kickoffs/auto/<id>.md``, matching the display path
+    # the existing tests assert. Tests that intentionally separate engine
+    # root from project root override this setenv (the new test does).
+    monkeypatch.setenv("MINI_ORK_ROOT", str(proj))
     engine = tmp_path / "engine"
     docs = engine / "recipes" / "docs"
     (docs / "prompts").mkdir(parents=True)
@@ -464,3 +474,84 @@ def test_queue_failure_surfaces_epics_add_error(
     assert saved.is_file()
     # The session mark is still consumed — the approval fired even on error.
     assert thread not in agent._task_queue_sessions
+
+
+# ── acceptance #6: /task's engine root matches the scheduler's ───────────────
+
+
+def test_task_queue_uses_engine_root_resolvable_by_scheduler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """``/task`` queues the draft on the engine root, not on the session
+    project's parent — the same root expression the scheduler resolves
+    kickoffs against. The IDE serves many projects; queueing only worked
+    for those whose home happened to sit under the engine root.
+
+    Verifies the alignment end-to-end:
+      * ``MINI_ORK_ROOT`` is monkeypatched to a tmp engine root distinct
+        from the session project's parent before queue runs;
+      * the kickoff draft lands at the engine root (not the project root);
+      * ``mini_ork.scheduler.resolve_kickoff`` (the function
+        ``scheduler.run_loop`` calls) returns a path to an existing file
+        whose contents equal the staged draft — proof the board row is
+        runnable, not just queued.
+    """
+    proj, home = _kickoff_project(tmp_path, monkeypatch)
+    engine = tmp_path / "engine"  # sibling of proj, distinct root
+    # Override the fixture's MINI_ORK_ROOT=proj with the engine root.
+    # This MUST happen before the queue button fires — the approval
+    # inside _handle_kickoff_queue is where root resolution lives.
+    monkeypatch.setenv("MINI_ORK_ROOT", str(engine))
+
+    body = (
+        "# Cross-Root Audit\n\n"
+        "## Files in scope\n- `present.py`\n\n"
+        "## Success criteria\n- queue lands where the scheduler looks\n"
+    )
+    agent, thread = _thread_agent(proj, orchestrator_turn=_kickoff_turn(home, [], body))
+    agent._task_queue_sessions.add(thread)
+    conn = _SidConn()
+    conn.next_choice = "queue"
+    agent.on_connect(conn)
+    asyncio.run(agent.prompt(thread, [_text_block("/task across roots")]))
+
+    # The board row landed in the session project's state.db …
+    db = str(home / "state.db")
+    con = sqlite3.connect(db)
+    try:
+        rows = con.execute(
+            "SELECT id, kickoff_path FROM epics"
+        ).fetchall()
+    finally:
+        con.close()
+    assert len(rows) == 1
+    epic_id, kickoff_path = rows[0]
+    assert kickoff_path == f"kickoffs/auto/{epic_id}.md"
+
+    # … and the auto-copied kickoff lives under the engine root, not
+    # under the project root — provable both by filesystem and by what
+    # the scheduler's resolve_kickoff returns.
+    engine_auto = engine / "kickoffs" / "auto" / f"{epic_id}.md"
+    proj_auto = proj / "kickoffs" / "auto" / f"{epic_id}.md"
+    assert engine_auto.is_file(), (
+        f"queue should land under MINI_ORK_ROOT ({engine}), not under "
+        f"the project root ({proj}); got engine={engine_auto.exists()}, "
+        f"project={proj_auto.exists()}"
+    )
+    assert engine_auto.read_text(encoding="utf-8") == body
+
+    # The user-facing path display still anchors on home/kickoffs/<slug>
+    # (the staged draft moved by _persist_kickoff_draft), independent of
+    # where epics.add copied the auto version — only the board row's
+    # kickoff_path is engine-relative.
+    text = _chunks_text(conn)
+    assert f"Queued `{epic_id}`" in text
+    assert ".mini-ork/" in text  # relative to home.parent (display only)
+
+    # The scheduler resolves the kickoff against the engine root end-to-end.
+    resolved = sched.resolve_kickoff(epic_id, str(engine), "epic-runner", db)
+    assert resolved is not None, "scheduler.resolve_kickoff returned None"
+    resolved_path = Path(resolved)
+    assert resolved_path.is_file(), f"resolved kickoff {resolved_path} not on disk"
+    assert resolved_path.read_text(encoding="utf-8") == body
+    assert resolved_path == engine_auto
