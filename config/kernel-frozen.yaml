@@ -1,0 +1,21 @@
+version: 1
+# Paths an auto-opened (origin=auto-triage) framework-edit may never change.
+# fnmatch globs, repo-relative.
+paths:
+  - config/kernel-frozen.yaml
+  - recipes/framework-edit/verifiers/static-check.py
+  - mini_ork/vcs/repo_integrity_guard.py
+  - mini_ork/runtime/sandbox.py
+  - mini_ork/gates/gate_bootstrap.py
+  - mini_ork/gates/abstain_gate.py
+  - mini_ork/recovery/circuit_breaker.py
+  # The escalation policy — where an auto-opened run's escalation decision is
+  # actually made: the calibrated threshold (calibration.should_escalate), the
+  # lane escalation ladder (auto_repair._escalate_lane), and the
+  # escalate-after-N-failures policy (policies.engine.verifier_failure_escalation).
+  - mini_ork/dispatch/calibration.py
+  - mini_ork/recovery/auto_repair.py
+  - mini_ork/policies/engine.py
+  - mini_ork/dispatch/cost_pause.py
+  - mini_ork/stores/safety_events.py
+  - mini_ork/observability/bug_report.py
