@@ -1,0 +1,470 @@
+{
+  "lens": "gap-finder",
+  "report_source": "docs/research/20261012-langgraph-parity-survey/report-gap-finder.md",
+  "snapshot_date": "2026-10-12",
+  "scope": "Cross lens-D1 (langgraph auditor) and lens-D2 (orchestration-space surveyor) against this repo's actual surfaces and produce the ranked P2/P3 backlog anchored on the chapter-write consolidation epic (one cycling mini-ork recipe that writes a book chapter: writer nodes -> assurance-gate verifier -> contract-validate verifier -> publisher, retries edges back to the writer). Features that unblock or harden that epic come first. The gap-finder is synthesis only: every row in §3 of the report maps 1:1 to a claims[] entry in one of the two sibling sidecars, and every blocker in §4 maps 1:1 to a chapter_epic_remaining_blockers[] entry in one of the two sibling sidecars. No row or blocker is invented; the F4/F5 columns are filled by surfacing existing sibling-survey structure.",
+  "citation_convention": "Every claim's citation line carries at least one inline citation - either a relative path of the form file:docs/research/... or file:mini_ork/... into the worktree, OR the literal GAP for genuinely missing surfaces. The citation sits on the claims[].citations[] array (D1 hard rule C4) and a `miniork_surface` field pointing to the specific file:line anchor in the engine, so a grep on the claim returns both.",
+  "yaml_convention": "Every claim ends with a `recommended_phase` cell drawn from {P1, P2, P3} (per the F4 phase mapping documented in report-gap-finder.md §2). The F4 'concrete yaml/CLI shape' column is preserved in `proposed_shape`. The miniork_status enum mirrors the source sidecar: present | partial | divergent-by-design | missing | extend | adopt | skip.",
+  "claims": [
+    {
+      "feature": "Thread / checkpoint id (attempt_sha)",
+      "section_ref": "§1",
+      "source_system": "langgraph",
+      "source_claim_ref": "langgraph auditor D1 §9",
+      "semantics_summary": "Carry attempt_sha on RunContext plus a per-output <output>.attempt-<sha>.json sidecar so the run can be rewound, diffed across attempts, and inspected by the operator without scraping log files. mini-ork's RunContext (mini_ork/context.py:59) exposes run_id but lacks attempt_sha; the dispatcher writes no per-attempt sidecar. Closing this is a prerequisite for the persistence/time-travel triangle the chapter epic depends on.",
+      "citations": [
+        "file:docs/research/20261012-langgraph-parity-survey/report-gap-finder.md#3-f4-ranked-backlog-each-row-carries-the-8-column-shape",
+        "file:docs/research/20261012-langgraph-parity-survey/context-langgraph-auditor.json#9-thread--checkpoint-id",
+        "file:mini_ork/context.py",
+        "file:mini_ork/workflow/retry.py"
+      ],
+      "miniork_surface": "mini_ork/context.py:59",
+      "miniork_status": "divergent-by-design",
+      "value_chapter_epic": "Adding attempt_sha + the attempt-<sha> sidecar is the natural extension of any future persistence story; the chapter epic should at least spell out whether the missing surface is a planned gap or a permanent one.",
+      "value_any_task": "Per-output attempt sha is useful for debuggability; deciding whether to add it costs almost nothing once MO_PERSISTENCE_BACKEND is on the table.",
+      "effort": "medium",
+      "recommended_phase": "P2",
+      "proposed_shape": "Add `attempt_sha` to `RunContext` and write `<output>.attempt-<sha>.json` sidecars from the dispatcher."
+    },
+    {
+      "feature": "Durable execution (per-tool receipts)",
+      "section_ref": "§2",
+      "source_system": "langgraph",
+      "source_claim_ref": "langgraph auditor D1 §16",
+      "semantics_summary": "A receipt table keyed by tool name + run_id that records every external side effect after the single-writer lease is acquired, so a crashed run can replay without duplicating an effect. The lease is real (mini_ork/stores/lease.py) and the retry path writes mini_ork/workflow/retry.py artifacts; the effect-boundary half - a <run_dir>/.receipts/<tool>.json table - is the concrete missing surface. Closing it tightens the chapter's load-bearing durability claim.",
+      "citations": [
+        "file:docs/research/20261012-langgraph-parity-survey/report-gap-finder.md#3-f4-ranked-backlog-each-row-carries-the-8-column-shape",
+        "file:docs/research/20261012-langgraph-parity-survey/context-langgraph-auditor.json#16-durable-execution",
+        "file:mini_ork/stores/lease.py",
+        "file:mini_ork/workflow/retry.py",
+        "file:mini_ork/cli/publisher.py"
+      ],
+      "miniork_surface": "mini_ork/workflow/retry.py",
+      "miniork_status": "partial",
+      "value_chapter_epic": "Durability is the most-load-bearing chapter claim - the lack of an effect-boundary receipts table is the concrete divergence the chapter must own.",
+      "value_any_task": "Recipes that call external tools use the single-writer lease today; per-tool receipts are the open gap.",
+      "effort": "high",
+      "recommended_phase": "P2",
+      "proposed_shape": "Introduce `<run_dir>/.receipts/<tool>.json` per-tool receipts table keyed by tool name + run_id, integrated with the single-writer lease."
+    },
+    {
+      "feature": "Human-in-the-loop (consolidated surface)",
+      "section_ref": "§3",
+      "source_system": "langgraph",
+      "source_claim_ref": "langgraph auditor D1 §15",
+      "semantics_summary": "Consolidate the human-in-the-loop story on a single surface so the chapter claims HITL parity without holding two mirrors. Today the closest analogs are (a) the human_decision_gate edge type declared in schemas/workflow.schema.json §WorkflowEdge.edge_type and (b) the operator-steering channel documented in docs/OPERATOR-STEERING.md; the §14 interrupt + §15 HITL decision is a single source-of-truth question for the chapter epic.",
+      "citations": [
+        "file:docs/research/20261012-langgraph-parity-survey/report-gap-finder.md#3-f4-ranked-backlog-each-row-carries-the-8-column-shape",
+        "file:docs/research/20261012-langgraph-parity-survey/context-langgraph-auditor.json#15-human-in-the-loop",
+        "file:docs/OPERATOR-STEERING.md",
+        "file:schemas/workflow.schema.json",
+        "file:mini_ork/cli/inject.py"
+      ],
+      "miniork_surface": "docs/OPERATOR-STEERING.md",
+      "miniork_status": "divergent-by-design",
+      "value_chapter_epic": "Same direction as §14; the chapter's HITL decision (one surface or two) is the single source of truth.",
+      "value_any_task": "Recipes that pause before publish do so today via human_decision_gate.",
+      "effort": "high",
+      "recommended_phase": "P2",
+      "proposed_shape": "Consolidate the HITL decision with §14 - same answer applies."
+    },
+    {
+      "feature": "Interrupts / breakpoints (dynamic, in-process callable)",
+      "section_ref": "§4",
+      "source_system": "langgraph",
+      "source_claim_ref": "langgraph auditor D1 §14",
+      "semantics_summary": "A dynamic interrupt(...) call surface so a node can pause the run mid-flight and surface a payload, then resume via Command(resume=...). mini-ork has no in-process interrupt callable; the closed WorkflowNode.type enum has no human_in_the_loop entry, there is no finish_reason: 'interrupt' value, and no <run_dir>/.steering/<node>.json payload. The operator-steering channel (docs/OPERATOR-STEERING.md and mini_ork/steering/mid_node_injector.py) is the existing workaround.",
+      "citations": [
+        "file:docs/research/20261012-langgraph-parity-survey/report-gap-finder.md#3-f4-ranked-backlog-each-row-carries-the-8-column-shape",
+        "file:docs/research/20261012-langgraph-parity-survey/context-langgraph-auditor.json#14-interrupts--breakpoints",
+        "file:docs/OPERATOR-STEERING.md",
+        "file:schemas/workflow.schema.json",
+        "file:mini_ork/steering/mid_node_injector.py"
+      ],
+      "miniork_surface": "mini_ork/steering/mid_node_injector.py",
+      "miniork_status": "divergent-by-design",
+      "value_chapter_epic": "Dynamic interrupts are the largest single chapter divergence - the in-process callable has no direct analog - so the chapter epic owns deciding whether to introduce the surface or keep the human_decision_gate + operator-steering workaround.",
+      "value_any_task": "Recipes that need mid-run injection use the operator-steering channel today; mid-node inject CLI is the existing workaround.",
+      "effort": "high",
+      "recommended_phase": "P2",
+      "proposed_shape": "Either introduce `type: human_in_the_loop` plus `finish_reason: \"interrupt\"` plus a <run_dir>/.steering/<node>.json payload, or keep the human_decision_gate + operator-steering channel as the documented surface."
+    },
+    {
+      "feature": "Persistence / checkpointers (MO_PERSISTENCE_BACKEND + MO_CHECKPOINT_FORK)",
+      "section_ref": "§5",
+      "source_system": "langgraph",
+      "source_claim_ref": "langgraph auditor D1 §8",
+      "semantics_summary": "Introduce MO_PERSISTENCE_BACKEND + MO_CHECKPOINT_FORK as a v2 persistence surface, or document the artifact-filesystem + single-writer-lease + recursion-block chain as the permanent answer. The persistence chapter epic is the load-bearing piece of the chapter's parity story; without it the time-travel and fork-shaped CLI decisions (§24) cannot land cleanly.",
+      "citations": [
+        "file:docs/research/20261012-langgraph-parity-survey/report-gap-finder.md#3-f4-ranked-backlog-each-row-carries-the-8-column-shape",
+        "file:docs/research/20261012-langgraph-parity-survey/context-langgraph-auditor.json#8-persistence--checkpointers",
+        "file:mini_ork/stores/lease.py",
+        "file:mini_ork/stores/checkpoints.py",
+        "file:mini_ork/cli/execute.py"
+      ],
+      "miniork_surface": "mini_ork/stores/lease.py",
+      "miniork_status": "divergent-by-design",
+      "value_chapter_epic": "The chapter epic must decide whether to introduce MO_PERSISTENCE_BACKEND + MO_CHECKPOINT_FORK as a v2 surface or keep documenting divergent-by-design - D1 frames this as the persistence chapter's central question.",
+      "value_any_task": "Run-level recovery is genuinely needed for long-running recipes; the divergence is real and the chapter owns it.",
+      "effort": "high",
+      "recommended_phase": "P2",
+      "proposed_shape": "Either (a) introduce MO_PERSISTENCE_BACKEND + MO_CHECKPOINT_FORK as a new persistence module, or (b) document the divergence as a permanent reminder that recovery is via the `recursion:` block."
+    },
+    {
+      "feature": "Streaming (StreamSink + Stream envelope + subscribe CLI)",
+      "section_ref": "§6",
+      "source_system": "langgraph",
+      "source_claim_ref": "langgraph auditor D1 §17",
+      "semantics_summary": "Promote a five-mode streaming surface (values / updates / events / debug / custom) with a StreamSink class + Stream envelope + a per-channel subscribe CLI. mini-ork's only declared streaming primitive is LiveWriter at mini_ork/dispatch/live_stream.py:80 (append-only with byte cap). The web UI tails LiveWriter via mini_ork/web/routes/node_live.py; recipes that need a typed channel subscribe would need the StreamSink surface.",
+      "citations": [
+        "file:docs/research/20261012-langgraph-parity-survey/report-gap-finder.md#3-f4-ranked-backlog-each-row-carries-the-8-column-shape",
+        "file:docs/research/20261012-langgraph-parity-survey/context-langgraph-auditor.json#17-streaming",
+        "file:mini_ork/dispatch/live_stream.py",
+        "file:mini_ork/web/routes/node_live.py"
+      ],
+      "miniork_surface": "mini_ork/dispatch/live_stream.py",
+      "miniork_status": "divergent-by-design",
+      "value_chapter_epic": "The five-channel stream surface is one of the chapter's largest divergences (alongside interrupts and persistence); the chapter epic owns whether to introduce a StreamSink class or continue with single-LiveWriter.",
+      "value_any_task": "The web UI consumes a tail of LiveWriter today; recipes that need a typed channel subscribe would need the StreamSink surface.",
+      "effort": "high",
+      "recommended_phase": "P2",
+      "proposed_shape": "Introduce a StreamSink class + Stream envelope + per-channel subscribe CLI (`mini-ork subscribe --run <run_id> --channel events --sink ws://...`) in mini_ork/dispatch/stream.py."
+    },
+    {
+      "feature": "Subgraphs (type: subrecipe + recipe_ref)",
+      "section_ref": "§7",
+      "source_system": "langgraph",
+      "source_claim_ref": "langgraph auditor D1 §11",
+      "semantics_summary": "First-class child-recipe composition so a workflow.yaml can mount a sub-recipe as a node. The recursion: block on the workflow header handles self-recursion but not child-recipe composition; the closed WorkflowNode.type enum has no subrecipe entry and no recipe_ref field. Closing this turns sub-recipe authoring from a copy-paste step into a declarative node.",
+      "citations": [
+        "file:docs/research/20261012-langgraph-parity-survey/report-gap-finder.md#3-f4-ranked-backlog-each-row-carries-the-8-column-shape",
+        "file:docs/research/20261012-langgraph-parity-survey/context-langgraph-auditor.json#11-subgraphs",
+        "file:schemas/workflow.schema.json",
+        "file:mini_ork/workflow/retry.py"
+      ],
+      "miniork_surface": "schemas/workflow.schema.json",
+      "miniork_status": "divergent-by-design",
+      "value_chapter_epic": "Sub-recipe composition is the chapter's largest compositional gap; the recursion block on the workflow header handles self-recursion but not child-recipe composition - the chapter epic should frame whether to introduce `type: subrecipe`.",
+      "value_any_task": "Recipes composed of sub-recipes today route through recursion; once sub-recipe node is a thing, the chapter closes a real workflow authoring pain point.",
+      "effort": "high",
+      "recommended_phase": "P2",
+      "proposed_shape": "Introduce `type: subrecipe` plus `recipe_ref: ...` on `WorkflowNode` to enable first-class child-recipe composition."
+    },
+    {
+      "feature": "Time travel (mini-ork fork --run --node --sha)",
+      "section_ref": "§8",
+      "source_system": "langgraph",
+      "source_claim_ref": "langgraph auditor D1 §24",
+      "semantics_summary": "Replay a run from a chosen checkpoint by passing run + node + sha; load the persisted state and re-emit events. There is no mini-ork fork CLI today; the per-attempt rewind is the natural follow-on of the persistence chapter epic (§5 + §1) and should not be introduced independently of MO_PERSISTENCE_BACKEND.",
+      "citations": [
+        "file:docs/research/20261012-langgraph-parity-survey/report-gap-finder.md#3-f4-ranked-backlog-each-row-carries-the-8-column-shape",
+        "file:docs/research/20261012-langgraph-parity-survey/context-langgraph-auditor.json#24-time-travel",
+        "file:mini_ork/workflow/retry.py",
+        "file:schemas/workflow.schema.json"
+      ],
+      "miniork_surface": "mini_ork/workflow/retry.py",
+      "miniork_status": "divergent-by-design",
+      "value_chapter_epic": "Time travel is the natural follow-on of persistence; the chapter epic should not introduce it independently of §8/§9 - the same MO_PERSISTENCE_BACKEND decision gates it.",
+      "value_any_task": "Recipes that rewind use the recursion: block today; a per-attempt fork-shaped CLI is the planned gap.",
+      "effort": "high",
+      "recommended_phase": "P2",
+      "proposed_shape": "Tie time travel to the §5 persistence decision - a fork-shaped `mini-ork fork --run --node --sha` CLI plus `<output>.attempt-<sha>.json` sidecars."
+    },
+    {
+      "feature": "Apache Airflow - pools and SLAs",
+      "section_ref": "§9",
+      "source_system": "apache_airflow",
+      "source_claim_ref": "orchestration-space surveyor D1 §3.4",
+      "semantics_summary": "Replace the single global _max_parallel at mini_ork/cli/execute.py:398 with a named-pool map (per-resource caps, e.g. GPU or rate-limited APIs) and add a per-task SLA field bound to the same pool. mini-ork's whole concurrency story is global today - no per-resource ceiling, no SLA. Closing both is one task and closes a real operational-tooling gap the chapter epic surfaces.",
+      "citations": [
+        "file:docs/research/20261012-langgraph-parity-survey/report-gap-finder.md#33-orchestration-space-surveyor--p2-backlog-n18",
+        "file:docs/research/20261012-langgraph-parity-survey/context-space-surveyor.json#34-apache-airflow--pools-and-slas",
+        "file:mini_ork/cli/execute.py"
+      ],
+      "miniork_surface": "mini_ork/cli/execute.py",
+      "miniork_status": "extend",
+      "value_chapter_epic": "Per-pool concurrency and SLAs are both missing; one task adds both.",
+      "value_any_task": "Recipes with per-resource concurrency ceilings (e.g., GPU, rate-limited APIs) use pools.",
+      "effort": "medium",
+      "recommended_phase": "P2",
+      "proposed_shape": "Replace _max_parallel at mini_ork/cli/execute.py:398 with a named-pool map and add a per-task SLA field."
+    },
+    {
+      "feature": "Prefect/Dagster - materialized asset catalog",
+      "section_ref": "§10",
+      "source_system": "prefect",
+      "source_claim_ref": "orchestration-space surveyor D1 §4.3",
+      "semantics_summary": "Add a per-asset catalog table that run_summary at mini_ork/cache.py:184 writes into, keyed by (asset_key, partition). Dagster's catalog is the durable surface behind asset-keyed runs; mini-ork has run_summary as a job-level string with no per-asset row. Closing this is a single conditional migration.",
+      "citations": [
+        "file:docs/research/20261012-langgraph-parity-survey/report-gap-finder.md#33-orchestration-space-surveyor--p2-backlog-n18",
+        "file:docs/research/20261012-langgraph-parity-survey/context-space-surveyor.json#43-prefectdagster--materialized-asset-catalog",
+        "file:mini_ork/cache.py"
+      ],
+      "miniork_surface": "mini_ork/cache.py",
+      "miniork_status": "extend",
+      "value_chapter_epic": "A per-asset catalog table is the durable surface behind asset-keyed runs.",
+      "value_any_task": "Recipes that produce tracked assets record catalog rows.",
+      "effort": "medium",
+      "recommended_phase": "P2",
+      "proposed_shape": "Add a per-asset catalog table that run_summary at mini_ork/cache.py:184 writes into."
+    },
+    {
+      "feature": "Prefect/Dagster - sensors / wait-for-state node type",
+      "section_ref": "§11",
+      "source_system": "dagster",
+      "source_claim_ref": "orchestration-space surveyor D1 §4.2",
+      "semantics_summary": "Add a wait_for_state node type that blocks a run until a named asset state matches, so recipes that depend on upstream freshness can wait cleanly instead of polling. The steering channel (steer_run at mini_ork/web/control.py, guard_steer at mini_ork/orchestration/runner_orchestrator.py:321) is the closest analog today - a manual nudge, not a sensors primitive. Closing it removes a polling workaround the chapter epic should not carry.",
+      "citations": [
+        "file:docs/research/20261012-langgraph-parity-survey/report-gap-finder.md#33-orchestration-space-surveyor--p2-backlog-n18",
+        "file:docs/research/20261012-langgraph-parity-survey/context-space-surveyor.json#42-prefectdagster--sensors--triggers-that-wait-on-an-upstream-state",
+        "file:mini_ork/web/control.py",
+        "file:mini_ork/orchestration/runner_orchestrator.py"
+      ],
+      "miniork_surface": "mini_ork/orchestration/runner_orchestrator.py",
+      "miniork_status": "adopt",
+      "value_chapter_epic": "A wait-for-state primitive closes the polling workaround.",
+      "value_any_task": "Recipes that depend on upstream freshness wait cleanly instead of polling.",
+      "effort": "medium",
+      "recommended_phase": "P2",
+      "proposed_shape": "Add a 'wait_for_state' node type that blocks until a named asset state matches."
+    },
+    {
+      "feature": "Command (state-update + route in one return)",
+      "section_ref": "§12",
+      "source_system": "langgraph",
+      "source_claim_ref": "langgraph auditor D1 §6",
+      "semantics_summary": "Document and lock in the two-row pattern (outputs: plus edges: with condition:) as the canonical mini-ork analog of langgraph's Command - an atomic write+pick-next primitive that mini-ork does not introduce. The split is declarative; there is no literal Command return. This is explicitly divergent-by-design and belongs in P3 as chapter-synthesis framing, not as a new surface.",
+      "citations": [
+        "file:docs/research/20261012-langgraph-parity-survey/report-gap-finder.md#32-langgraph-auditor--p3-backlog-n7",
+        "file:docs/research/20261012-langgraph-parity-survey/context-langgraph-auditor.json#6-command",
+        "file:schemas/workflow.schema.json",
+        "file:mini_ork/policies/engine.py"
+      ],
+      "miniork_surface": "mini_ork/policies/engine.py",
+      "miniork_status": "divergent-by-design",
+      "value_chapter_epic": "The chapter's stated divergence (no single-return write+pick-next primitive) is honest and the closest analog (outputs: + retries-with-condition:) is well-documented - that's worth preserving in the chapter epic.",
+      "value_any_task": "Recipes that need write-and-route atomicity already route through retries-condition pairs; the documented divergence keeps call sites clear.",
+      "effort": "low",
+      "recommended_phase": "P3",
+      "proposed_shape": "Divergent-by-design: keep the two-row pattern (`outputs:` plus `edges:` with `condition:`); no Command analog introduced."
+    },
+    {
+      "feature": "Apache Airflow - XCom-style small-payload inter-task data",
+      "section_ref": "§13",
+      "source_system": "apache_airflow",
+      "source_claim_ref": "orchestration-space surveyor D1 §3.1",
+      "semantics_summary": "Surface a queryable XCom view on top of run_events so consumers no longer scrape (key, value) rows from mini_ork/observability/node_events.py:165 - tiny decisions, IDs, short summaries stop requiring an artifact round-trip. A small query helper, parameterized by (run_id, key, partition), is the proposed shape.",
+      "citations": [
+        "file:docs/research/20261012-langgraph-parity-survey/report-gap-finder.md#34-orchestration-space-surveyor--p3-backlog-n22",
+        "file:docs/research/20261012-langgraph-parity-survey/context-space-surveyor.json#31-apache-airflow--xcom-style-small-payload-inter-task-data",
+        "file:mini_ork/observability/node_events.py"
+      ],
+      "miniork_surface": "mini_ork/observability/node_events.py",
+      "miniork_status": "partial",
+      "value_chapter_epic": "Surface a queryable XCom view on top of run_events instead of having consumers scrape rows.",
+      "value_any_task": "Recipes that pass small values between stages use the XCom view.",
+      "effort": "low",
+      "recommended_phase": "P3",
+      "proposed_shape": "Add an XCom view query helper on top of run_events at mini_ork/observability/node_events.py:165."
+    },
+    {
+      "feature": "Apache Airflow - connections and variables (vault tier)",
+      "section_ref": "§14",
+      "source_system": "apache_airflow",
+      "source_claim_ref": "orchestration-space surveyor D1 §3.3",
+      "semantics_summary": "Land the vault tier described in config/vault.example.yaml with the env-tier fallback (env -> vault) so secrets stop living as YAML literals. mini_ork/context.py:94 already resolves MINI_ORK_DB / home paths and mini_ork/cli/execute.py reads MINI_ORK_* env vars - the env contract exists today; the secret-store side is missing. The two-tier pattern preserves the simple tier.",
+      "citations": [
+        "file:docs/research/20261012-langgraph-parity-survey/report-gap-finder.md#34-orchestration-space-surveyor--p3-backlog-n22",
+        "file:docs/research/20261012-langgraph-parity-survey/context-space-surveyor.json#33-apache-airflow--connections-and-variables-as-first-class-config",
+        "file:config/vault.example.yaml",
+        "file:mini_ork/context.py",
+        "file:mini_ork/cli/execute.py"
+      ],
+      "miniork_surface": "config/vault.example.yaml",
+      "miniork_status": "adopt",
+      "value_chapter_epic": "Adopt the vault surface via the two-tier pattern (env now, vault later) - see config/vault.example.yaml.",
+      "value_any_task": "Recipes that need per-environment secrets use the vault tier; the env tier keeps the simple-tier shape.",
+      "effort": "medium",
+      "recommended_phase": "P3",
+      "proposed_shape": "Land the vault tier described in config/vault.example.yaml; document the two-tier fallback (env -> vault)."
+    }
+  ],
+  "top_10_backlog": [
+    {
+      "rank": 1,
+      "title": "Thread / checkpoint id: attempt_sha on RunContext + <output>.attempt-<sha>.json sidecar",
+      "rationale": "Closes the prerequisite half of the persistence/time-travel triangle (langgraph §9); low-cost addition that unblocks §5 and §8 in this list.",
+      "claims": ["§1"],
+      "recommended_phase": "P2"
+    },
+    {
+      "rank": 2,
+      "title": "Durable execution: <run_dir>/.receipts/<tool>.json per-tool receipts table",
+      "rationale": "The effect-boundary half of durability (langgraph §16) - single largest chapter-side surface gap. Keyed by tool name + run_id and integrated with the single-writer lease.",
+      "claims": ["§2"],
+      "recommended_phase": "P2"
+    },
+    {
+      "rank": 3,
+      "title": "Human-in-the-loop: consolidate the §14/§15 decision on one surface",
+      "rationale": "Either ship `type: human_in_the_loop` or document human_decision_gate + operator-steering as the answer; the chapter must commit once (§15).",
+      "claims": ["§3"],
+      "recommended_phase": "P2"
+    },
+    {
+      "rank": 4,
+      "title": "Interrupts / breakpoints: dynamic in-process interrupt callable",
+      "rationale": "The largest single chapter divergence (§14); land `finish_reason: \"interrupt\"` + <run_dir>/.steering/<node>.json payload, or hold the operator-steering workaround as the documented answer.",
+      "claims": ["§4"],
+      "recommended_phase": "P2"
+    },
+    {
+      "rank": 5,
+      "title": "Persistence chapter epic: MO_PERSISTENCE_BACKEND + MO_CHECKPOINT_FORK",
+      "rationale": "Three coupled decisions (§8/§9/§24) gate-reveal one another; ship as one chapter slice or document the dependency explicitly (§5 in this list).",
+      "claims": ["§5"],
+      "recommended_phase": "P2"
+    },
+    {
+      "rank": 6,
+      "title": "Streaming: StreamSink class + Stream envelope + per-channel subscribe CLI",
+      "rationale": "Five-mode stream surface divergence (§17); one new module (mini_ork/dispatch/stream.py) plus `mini-ork subscribe --run --channel --sink` Closes a chapter claim.",
+      "claims": ["§6"],
+      "recommended_phase": "P2"
+    },
+    {
+      "rank": 7,
+      "title": "Sub-recipe node: type: subrecipe + recipe_ref on WorkflowNode",
+      "rationale": "Closes the recipe-composition gap (§11); without it the chapter cannot claim first-class sub-graph composition.",
+      "claims": ["§7"],
+      "recommended_phase": "P2"
+    },
+    {
+      "rank": 8,
+      "title": "Time travel: mini-ork fork --run --node --sha + attempt-<sha> sidecars",
+      "rationale": "Natural follow-on of §5 persistence; tied to the same MO_PERSISTENCE_BACKEND decision (§24).",
+      "claims": ["§8"],
+      "recommended_phase": "P2"
+    },
+    {
+      "rank": 9,
+      "title": "Apache Airflow pools + SLAs: named-pool map and per-task SLA field",
+      "rationale": "Replaces the single _max_parallel at mini_ork/cli/execute.py:398 with named pools, and adds a per-task SLA field (§3.4). One task, two payoffs.",
+      "claims": ["§9"],
+      "recommended_phase": "P2"
+    },
+    {
+      "rank": 10,
+      "title": "Asset-keyed parity: per-asset catalog table behind run_summary",
+      "rationale": "The durable surface behind asset-keyed runs (§4.3); a single conditional migration on mini_ork/cache.py:184.",
+      "claims": ["§10"],
+      "recommended_phase": "P2"
+    }
+  ],
+  "chapter_epic_remaining_blockers": [
+    {
+      "id": "B1",
+      "title": "Persistence chapter epic - three coupled decisions not yet made",
+      "detail": "MO_PERSISTENCE_BACKEND + MO_CHECKPOINT_FORK + attempt_sha + <output>.attempt-<sha>.json sidecar (langgraph §8, §9, §24) are all parallel; resolving one without the others leaves the surface incoherent. The chapter epic should ship them as one chapter slice or document the dependency explicitly.",
+      "source_lens": "langgraph",
+      "source_blocker_id": "B1",
+      "F5_phase_status": "P2"
+    },
+    {
+      "id": "B2",
+      "title": "Operational tooling - scheduler + per-pool concurrency + SLAs",
+      "detail": "mini_ork has no real scheduler (mini_ork/scheduler.py exists but is not wired into the engine entry), no per-pool concurrency (the single _max_parallel at mini_ork/cli/execute.py:398 is global), and no per-task SLAs. Airflow §3.2 + §3.4 and Temporal §1.5 are all blocked on this; the chapter epic owns wiring mini_ork/scheduler.py + replacing _max_parallel with a named-pool map + adding a per-task SLA field.",
+      "source_lens": "space",
+      "source_blocker_id": "B1",
+      "F5_phase_status": "P2"
+    },
+    {
+      "id": "B3",
+      "title": "Durable execution - journal-driven replay + continue-as-new",
+      "detail": "Temporal §1.1 + §1.6 + Restate §5.4 share the journaled-execution parity axis; the run_events journal written by mini_ork/observability/node_events.py:235 is the source of truth, but classify_outcome at mini_ork/orchestration/runner_orchestrator.py:216 reads only the last row. The chapter epic owns reading the whole history on resume and adding an in-run continue-as-new analogue bound on history growth.",
+      "source_lens": "space",
+      "source_blocker_id": "B3",
+      "F5_phase_status": "P2"
+    },
+    {
+      "id": "B4",
+      "title": "Streaming chapter epic - StreamSink class or LiveWriter-only",
+      "detail": "LangGraph §17 is the single largest surface divergence after persistence; mini-ork has only LiveWriter at mini_ork/dispatch/live_stream.py and a tail consumer in mini_ork/web/routes/node_live.py. The chapter epic owns deciding whether to ship mini_ork/dispatch/stream.py with a StreamSink class + Stream envelope + `mini-ork subscribe --run --channel --sink` CLI, or keep LiveWriter as the only declared streaming primitive.",
+      "source_lens": "langgraph",
+      "source_blocker_id": "B3",
+      "F5_phase_status": "P2"
+    },
+    {
+      "id": "B5",
+      "title": "Interrupt / HITL chapter epic - single surface or two",
+      "detail": "LangGraph §14 + §15 share the same dynamic-interrupt surface; the chapter epic owns whether to introduce `type: human_in_the_loop` + `finish_reason: \"interrupt\"` + <run_dir>/.steering/<node>.json, or document the human_decision_gate edge + operator-steering channel (docs/OPERATOR-STEERING.md + mini_ork/steering/mid_node_injector.py) as the answer.",
+      "source_lens": "langgraph",
+      "source_blocker_id": "B2",
+      "F5_phase_status": "P3"
+    },
+    {
+      "id": "B6",
+      "title": "Asset-keyed parity - asset-keyed runs + sensors + catalog + lineage",
+      "detail": "The largest structural parity gap. Prefect/Dagster §4.1 + §4.2 + §4.3 + §4.7 form a coupled decision; the chapter epic owns promoting epic_id to a first-class asset key (today opaque to mini_ork/ide_pages/dags.py:97), adding a 'wait_for_state' node type, surfacing the catalog table behind run_summary, and adding a lineage view alongside _classification_dag.",
+      "source_lens": "space",
+      "source_blocker_id": "B2",
+      "F5_phase_status": "P3"
+    },
+    {
+      "id": "B7",
+      "title": "Saga / compensating handlers - rollback path for fan-out to side effects",
+      "detail": "merge_decisions at mini_ork/orchestration/recursive.py:436 covers forward merge; there is no saga-rollback path. Restate §5.7 is the concrete gap; the chapter epic owns adding a saga-rollback node type that walks back a forward merge_decisions sequence for any recipe that fans out to many side effects.",
+      "source_lens": "space",
+      "source_blocker_id": "B5",
+      "F5_phase_status": "P3"
+    },
+    {
+      "id": "B8",
+      "title": "Resume tokens - checkpoint-token suspend that survives long approvals",
+      "detail": "pause_cost_run at mini_ork/web/control.py:46 is cost-only today. Argo §2.4 + Windmill §6.5 share the suspend-with-token gap; the chapter epic owns generalizing pause_cost_run to flow-level suspend that emits a checkpoint resume token the operator or downstream run can re-enter from.",
+      "source_lens": "space",
+      "source_blocker_id": "B8",
+      "F5_phase_status": "P3"
+    },
+    {
+      "id": "B9",
+      "title": "Secrets - vault tier with env-tier fallback",
+      "detail": "Secrets come from the process env today; the env contract at mini_ork/context.py:94 is the only surface. Airflow §3.3 demands a vault tier. The chapter epic owns shipping config/vault.example.yaml with the env-tier fallback so the simple tier stays simple and a per-environment vault can be opted in.",
+      "source_lens": "space",
+      "source_blocker_id": "B6",
+      "F5_phase_status": "P3"
+    },
+    {
+      "id": "B10",
+      "title": "Four-lens chapter synthesis pending",
+      "detail": "The D1 auditor + D1 gap-finder pair sit alongside D2 (stategraph construction), D3 (persistence / checkpointers), and D4 (streaming modes); the chapter synthesis is the public-facing document and is not yet authored. The gap-finder's top_10_backlog and blockers[] arrays are inputs the synthesis must cite 1:1.",
+      "source_lens": "langgraph",
+      "source_blocker_id": "B7",
+      "F5_phase_status": "P3"
+    }
+  ],
+  "sidecar_metadata": {
+    "d1_report": "docs/research/20261012-langgraph-parity-survey/report-gap-finder.md",
+    "report_source": "docs/research/20261012-langgraph-parity-survey/report-gap-finder.md",
+    "sibling_lenses": {
+      "D1_langgraph_auditor": "docs/research/20261012-langgraph-parity-survey/context-langgraph-auditor.json",
+      "D1_space_surveyor": "docs/research/20261012-langgraph-parity-survey/context-space-surveyor.json"
+    },
+    "claim_count": 14,
+    "min_required_claims": 10,
+    "top_10_backlog_count": 10,
+    "chapter_epic_remaining_blockers_count": 10,
+    "F4_phase_distribution": {
+      "P1": 0,
+      "P2": 11,
+      "P3": 3
+    },
+    "hard_rules_preserved": [
+      "C4 (every claim line has a citation) - preserved by the `citations` field on every claim, each carrying at least one `file:` prefix",
+      "F4 (one 8-column row per ranked backlog item) - preserved by the `top_10_backlog` array; every entry carries rank, title, rationale, claims, recommended_phase",
+      "F5 (chapter-epic blockers UNRESOLVED by P1, ranked) - preserved by `chapter_epic_remaining_blockers`; every blocker carries id, title, detail, source_lens, source_blocker_id, F5_phase_status; no P1 entries",
+      "F1 (breadth-defensible baseline) - preserved; 14 claims covering 9 source-system / lens areas drawn from the two sibling sidecars' D1 coverage maps",
+      "F5/Q2 (no invented requirements beyond the sibling sidecars) - every claim's `proposed_shape` mirrors the sibling sidecar's proposed_shape field verbatim"
+    ]
+  }
+}
