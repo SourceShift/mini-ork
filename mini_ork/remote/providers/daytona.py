@@ -400,9 +400,13 @@ class DaytonaProvider:
         headers = {_SKIP_WARNING_HEADER: "true"}
         if getattr(link, "token", None):
             headers[PREVIEW_TOKEN_HEADER] = str(link.token)
+        # Every endpoint handed out is of a sandbox whose boot (bootstrap +
+        # profile setup) finished: _boot writes the booted marker before it
+        # returns one, and _revive requires that marker.
         return NodeEndpoint(name=f"daytona:{getattr(sandbox, 'name', '') or sandbox.id}",
                             url=str(link.url).rstrip("/"), token=token, headers=headers,
-                            max_sessions=1, handle=str(sandbox.id), provider=NAME)
+                            max_sessions=1, handle=str(sandbox.id), provider=NAME,
+                            setup_applied=True)
 
     def _wait_ready(self, node: NodeEndpoint, timeout_s: float) -> bool:
         deadline = time.monotonic() + timeout_s

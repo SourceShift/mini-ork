@@ -414,3 +414,12 @@ def test_importing_the_provider_does_not_import_the_sdk():
             "print('daytona' in sys.modules)\n")
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
     assert out.stdout.strip() == "False"
+
+
+def test_endpoints_claim_the_profile_setup_was_applied(cloud):
+    """Every Daytona endpoint is of a fully booted sandbox (bootstrap + profile
+    setup done), so the remote workspace must not ask the host-runtime
+    node-agent to prepare a docker image."""
+    node = _create(profile=_profile(setup="pip install --user pytest"))
+    assert node.setup_applied is True
+    assert dt.DaytonaProvider().attach(node.handle, env=ENV).setup_applied is True

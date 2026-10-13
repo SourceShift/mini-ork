@@ -102,6 +102,10 @@ class NodeEndpoint:
     max_sessions: int = 1
     handle: str = ""
     provider: str = DEFAULT_PROVIDER
+    # True when the provider itself ran the profile's ``setup`` on the node (a
+    # sandbox booted with it). The remote workspace then skips the node-agent's
+    # docker image preparation, which a host-runtime node cannot do anyway.
+    setup_applied: bool = False
 
     def locator(self) -> dict[str, Any]:
         """The non-secret description of where this node lives (for markers)."""

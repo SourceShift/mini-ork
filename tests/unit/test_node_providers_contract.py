@@ -313,3 +313,9 @@ def test_importing_the_package_loads_no_provider_module():
             "print(','.join(bad))\n")
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
     assert out.stdout.strip() == ""
+
+
+def test_endpoint_setup_applied_defaults_false_and_stays_off_disk():
+    ep = base.NodeEndpoint(name="n", url="u")
+    assert ep.setup_applied is False
+    assert "setup_applied" not in ep.locator()

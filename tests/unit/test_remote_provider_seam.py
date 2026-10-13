@@ -73,6 +73,7 @@ class FakeProvider:
         self.released: list[str] = []
         self.alive: set[str] = set()
         self.seen_headers: list[dict[str, str]] = []
+        self.setup_applied = False
         self._lock = threading.Lock()
 
     def reset(self) -> None:
@@ -82,6 +83,7 @@ class FakeProvider:
             self.released.clear()
             self.alive.clear()
             self.seen_headers.clear()
+            self.setup_applied = False
 
     def _endpoint(self, handle: str) -> NodeEndpoint:
         # token_env points at the DEFAULT node-token name on purpose: a workspace
@@ -89,7 +91,8 @@ class FakeProvider:
         # MO_NODE_TOKEN instead of the provider-minted bearer.
         return NodeEndpoint(name=f"fake-{handle}", url=self.url, token=self.token,
                             token_env="MO_NODE_TOKEN", headers=dict(self.headers),
-                            max_sessions=4, handle=handle, provider=self.name)
+                            max_sessions=4, handle=handle, provider=self.name,
+                            setup_applied=self.setup_applied)
 
     def create(self, *, run_id: str, profile: Any, env: Any, engine_root: str) -> NodeEndpoint:
         with self._lock:
@@ -152,8 +155,9 @@ class _HeaderRecorder:
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         if scope.get("type") == "http":
-            self.sink.append({k.decode().lower(): v.decode()
-                              for k, v in scope.get("headers", [])})
+            seen = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
+            seen[":path"] = str(scope.get("path") or "")
+            self.sink.append(seen)
         await self.app(scope, receive, send)
 
 
@@ -214,13 +218,15 @@ def _git_repo(path: Path) -> Path:
 
 
 def _seam_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_id: str, *,
-              provider: str = "fake", profile: str = "seam") -> SimpleNamespace:
+              provider: str = "fake", profile: str = "seam",
+              setup: str = "") -> SimpleNamespace:
     """A home whose ``<profile>.yaml`` selects ``provider``, the run env, and
     the matching ``os.environ`` (production entrypoints read os.environ)."""
     home = tmp_path / "home"
     (home / "config" / "environments").mkdir(parents=True, exist_ok=True)
     (home / "config" / "environments" / f"{profile}.yaml").write_text(
-        f"provider: {provider}\nimage: alpine:latest\n", encoding="utf-8")
+        f"provider: {provider}\nimage: alpine:latest\n"
+        + (f"setup: {json.dumps(setup)}\n" if setup else ""), encoding="utf-8")
     run_dir = home / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     target = _git_repo(tmp_path / "target")
@@ -554,3 +560,42 @@ def test_default_path_byte_identical(tmp_path, monkeypatch):
     assert "provider" not in out and "provider_options" not in out
     assert set(out) == {"name", "image", "setup", "setup_timeout_s", "env",
                         "secrets", "network", "allow_domains", "resources"}
+
+
+def test_provider_applied_setup_skips_image_prepare(tmp_path, monkeypatch, seam):
+    """A provider that ran the profile's setup on the node itself (a cloud
+    sandbox at boot) makes up() skip the node-agent's docker image
+    preparation, which a host-runtime node cannot do (the live Daytona e2e
+    failed on POST /v1/images/prepare -> 500 before this)."""
+    seam.setup_applied = True
+    ctx = _seam_env(tmp_path, monkeypatch, "seam-setup-applied", setup="echo prepared")
+    from mini_ork.runtime.workspace_session import close_run_session, get_run_session
+
+    ws = get_run_session("seam-setup-applied", "remote", env=ctx.env)
+    try:
+        paths = [h.get(":path", "") for h in seam.seen_headers]
+        assert "/v1/images/prepare" not in paths, paths
+        assert "/v1/sessions" in paths
+        rc, out, _ = ws.spawn(["/bin/sh", "-c", "echo ok"], stdin="", timeout=30.0,
+                              env={"PATH": os.environ.get("PATH", "")}, cwd=str(ctx.run_dir))
+        assert rc == 0 and "ok" in out
+    finally:
+        close_run_session("seam-setup-applied")
+
+
+def test_setup_not_applied_by_provider_still_prepares_the_image(tmp_path, monkeypatch, seam):
+    """Without the provider's claim, a profile setup still goes to the
+    node-agent's image preparation, exactly as before (never a silent skip)."""
+    ctx = _seam_env(tmp_path, monkeypatch, "seam-setup-prepare", setup="echo prepared")
+    from mini_ork.runtime.backends.remote import RemoteUnavailableError
+    from mini_ork.runtime.workspace_session import close_run_session, get_run_session
+
+    try:
+        try:
+            get_run_session("seam-setup-prepare", "remote", env=ctx.env)
+        except RemoteUnavailableError:
+            pass        # the host-runtime test agent has no docker to build with
+        paths = [h.get(":path", "") for h in seam.seen_headers]
+        assert "/v1/images/prepare" in paths, paths
+    finally:
+        close_run_session("seam-setup-prepare")

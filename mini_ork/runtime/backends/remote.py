@@ -609,7 +609,14 @@ class RemoteWorkspace:
         # profile's prepared image when the profile declares a setup script.
         if creating:
             if self._profile is not None and (getattr(self._profile, "setup", "") or "").strip():
-                self._image = self._setup_step("image_prepare", self._prepare_image)
+                if getattr(self._endpoint, "setup_applied", False):
+                    # The node provider ran the setup on the node itself (a
+                    # cloud sandbox at boot); there is no image to prepare on a
+                    # host-runtime node. Recorded, not silently skipped.
+                    self._setup_step("image_prepare", lambda: None,
+                                     detail=f"applied by provider {self._endpoint_provider}")
+                else:
+                    self._image = self._setup_step("image_prepare", self._prepare_image)
             sess = self._setup_step("session_up", lambda: self._json(
                 "POST", "/v1/sessions", self._session_payload()))
             self._sid = sess.get("sid", self._run_id)
