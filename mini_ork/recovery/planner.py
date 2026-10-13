@@ -1386,6 +1386,20 @@ def cli_main(argv: list[str] | None = None, *, execute_fn=None) -> int:
             _rerun_rubric_prescreen(handoff)
         except Exception as _exc:  # noqa: BLE001
             print(f"[mini-ork-recover] rubric prescreen failed: {_exc}", file=sys.stderr)
+    # ── remote node release: a recover owns the run's lifecycle for its own
+    # span, like ``cli.main``'s ``_run_lifecycle`` (whose ``finally`` releases).
+    # Under ``--placement remote`` the resumed execute and the rubric refresh
+    # above open a session, and the lifecycle that started the run has already
+    # released its node, so a provider creates a FRESH one — which nothing else
+    # would release before the TTL (Daytona e2e run-1791912327-41843: auto-repair
+    # re-verified after the run and left a sandbox running). Placed after every
+    # check of this process and before auto-repair, whose child recover releases
+    # at its own end. No-op when the run is not remote.
+    try:
+        from mini_ork.cli.main import _release_remote_session  # noqa: PLC0415
+        _release_remote_session()
+    except Exception as _exc:  # noqa: BLE001 — teardown is best-effort; the TTL is the net
+        print(f"[mini-ork-recover] remote node release failed: {_exc}", file=sys.stderr)
     # ── retry-notify (kickoff lane-repair-resume §2): mirror ``mini_ork.cli.main``
     # so a re-failed recover reports the owner + fix steps like a fresh ``run``
     # does. Fail-soft — never changes the run's exit code. Only fires when the
