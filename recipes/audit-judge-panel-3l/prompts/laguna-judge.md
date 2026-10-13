@@ -32,12 +32,16 @@ anchors into the mini-ork source. Judge each one on these axes:
 4. **Fix adequacy** — for each S1..S6: does the proposed fix actually close
    the finding it names, or only paper over part of it? Name what it misses.
 
-Quote the receipt you relied on (`file:line`, SQL fragment, or number) in
-every `evidence_checked` list — quote it FROM THE BRIEFING, marked as such.
-Never claim you ran anything. A judge that fabricates discovery evidence is
-worse than one that abstains: if a finding cannot be adjudicated from the
-briefing alone, verdict it `unverifiable` and say what measurement would
-settle it.
+Quote the receipt you relied on VERBATIM from the briefing in every
+`evidence_checked` list, marked as such — copy the `file:line` anchor
+(e.g. `mini_ork/learning/writeback.py:34`) or the SQL fragment as the
+briefing writes it, never a bare figure. The panel verifier counts receipts
+by that shape across all three lanes, so a paraphrase ("617 traces") fails
+the panel even when the figure is right; the anchor is what makes the
+receipt checkable. Never claim you ran anything. A judge that fabricates
+discovery evidence is worse than one that abstains: if a finding cannot be
+adjudicated from the briefing alone, verdict it `unverifiable` and say what
+measurement would settle it.
 
 ## Output format
 
@@ -53,7 +57,8 @@ no preamble, no restating findings. The JSON block at the end MUST complete —
 if you feel the length pressure, cut prose, never the JSON.
 
 1. `Discovery Evidence` — one line: "briefing-only lane, no live discovery",
-   then the receipts you adjudicated against as a short list. Add a
+   then the receipts you adjudicated against as a short list, each carrying
+   its briefing `file:line` or SQL fragment. Add a
    `### Cross-Finding Observations` subsection: 2–3 systemic patterns shared
    by the six findings.
 2. `Finding Verdicts` — one block per finding F1..F6, each EXACTLY:
@@ -62,7 +67,8 @@ if you feel the length pressure, cut prose, never the JSON.
      (here: internally valid and consistent / valid but overstated /
      self-contradictory or causally broken / cannot be settled from the briefing)
    - `severity`: `critical` | `high` | `medium` | `low`
-   - `evidence_checked`: ONE briefing receipt
+   - `evidence_checked`: ONE briefing receipt, quoted verbatim — a
+     `file:line` anchor or a SQL fragment from the briefing, not a bare number
    - `reasoning`: ONE sentence
    - `corrections`: any number or claim you dispute, with the value you
      measured instead — a REQUIRED key on every finding, `[]` when you dispute
