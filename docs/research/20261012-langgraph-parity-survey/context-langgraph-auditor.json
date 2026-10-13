@@ -1,0 +1,570 @@
+{
+  "lens": "langgraph-auditor",
+  "report_source": "docs/research/20261012-langgraph-parity-survey/report-langgraph-auditor.md",
+  "snapshot_date": "2026-10-12",
+  "scope": "The public LangGraph v1.x concept surface as documented upstream, with per-concept mini-ork YAML equivalents (or explicit divergent-by-design lines) — the auditor pass for the 20261012-langgraph-parity-survey family; siblings cover lens-D2 (stategraph construction), lens-D3 (persistence / checkpointers), and lens-D4 (streaming modes).",
+  "citation_convention": "Every concept's claim line carries at least one inline citation — either a URL to a verifiable LangGraph source or a relative path into the mini-ork tree. The citation sits on the same physical line as the claim (D1 hard rule C4), so a grep on the claim line returns a citation.",
+  "yaml_convention": "Every concept ends with either a fenced YAML block showing the smallest faithful mini-ork equivalent, OR a single line beginning with `divergent-by-design:` with a one-line rationale (D1 hard rule F4).",
+  "claims": [
+    {
+      "feature": "Graph (StateGraph)",
+      "section_ref": "§1",
+      "source_system": "langgraph",
+      "semantics_summary": "A typed, directed graph of nodes and edges whose edges carry a State schema. The runtime walks the graph node-by-node, merging each node's return dict into the running state and routing the next node by the declared edge set. The state schema is a TypedDict (or Pydantic / dataclass); the runtime rejects writes that don't conform. Conditional edges and Command returns re-enter the routing table.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-langgraph-auditor.md#1-graph-stategraph",
+        "schemas/workflow.schema.json",
+        "schemas/task_class.schema.json"
+      ],
+      "miniork_status": "present",
+      "value_chapter_epic": "Closes the central parity claim — every other LangGraph concept in this report hangs off this one, so making 'graph = workflow.yaml' true is the chapter's anchor.",
+      "value_any_task": "Any recipe needs a typed graph with deterministic edge routing; the declared-edges vocabulary is what every other node-type enum nests into.",
+      "effort": "low",
+      "recommended_phase": "completed_in_d1",
+      "proposed_shape": "Keep `recipes/<name>/workflow.yaml` as the smallest faithful analog; the closed `edge_type` enum in `schemas/workflow.schema.json` already mirrors the routing surface D1 needs."
+    },
+    {
+      "feature": "State / state channels",
+      "section_ref": "§2",
+      "source_system": "langgraph",
+      "semantics_summary": "LangGraph v1.x passes a typed State object through every node; each node reads the channels it needs and returns a partial dict that the runtime operator.add / operator.or_-merges into the running state, with one optional Annotated[..., reducer] reducer per channel. mini-ork carries the same shape via task_class.yaml + per-node outputs:, but merge is not first-class — there is no `merge:` enum on the output schema.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-langgraph-auditor.md#2-state--state-channels",
+        "schemas/workflow.schema.json",
+        "schemas/artifact_contract.schema.json",
+        "schemas/task_class.schema.json"
+      ],
+      "miniork_status": "partial",
+      "value_chapter_epic": "The chapter epic must choose whether to (a) declare a merge enum on the artifact contract or (b) continue routing reductions through downstream transform nodes; D1 framed that choice but didn't resolve it.",
+      "value_any_task": "Any recipe whose nodes return overlapping keys hits the same merge question; resolving the chapter decision gives every downstream recipe a free answer.",
+      "effort": "medium",
+      "recommended_phase": "chapter-n_backlog",
+      "proposed_shape": "First-class `merge:` enum on `schemas/artifact_contract.schema.json` (or keep transform-node routing) — the open question D1 flagged."
+    },
+    {
+      "feature": "Nodes",
+      "section_ref": "§3",
+      "source_system": "langgraph",
+      "semantics_summary": "A langgraph node is a callable (sync or async) that receives the current state and a RunnableConfig, and returns either a partial state dict or a Command that combines a state update with a routing decision. mini-ork's nodes: array is the declarative equivalent: each node has a type from the closed enum (planner, researcher, transform, implementer, reviewer, verifier, eval, reflector, publisher, rollback), a prompt_ref, an optional model_lane, a dispatch_mode from serial|parallel|partitioned|speculative, an optional retry: block, an optional gates: list, an optional mcp_servers: list, an optional tools: array, and a typed inputs/outputs port block. The RunnableConfig analog is RunContext (mini_ork.context.RunContext, mini_ork/context.py:59).",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-langgraph-auditor.md#3-nodes",
+        "schemas/workflow.schema.json",
+        "mini_ork/context.py:59"
+      ],
+      "miniork_status": "present",
+      "value_chapter_epic": "The node-type enum is the chapter's central vocabulary; every other parity claim (Command, START/END, Send, interrupts, tool calls, structured output) is a property of one or more node rows, so the chapter's faithfulness rides on this enum remaining closed and accurate.",
+      "value_any_task": "Every recipe declares nodes; making sure the schema-richness of a `stateful callable` is captured recipe-declaratively is a per-task requirement.",
+      "effort": "low",
+      "recommended_phase": "completed_in_d1",
+      "proposed_shape": "Keep `WorkflowNode` (`schemas/workflow.schema.json`) as the smallest faithful analog; closed enum already names every concept D1 calls out."
+    },
+    {
+      "feature": "Edges",
+      "section_ref": "§4",
+      "source_system": "langgraph",
+      "semantics_summary": "A langgraph edge is a static or conditional link from one node to the next; the edge set forms the routing table the runtime consults after each node returns. mini-ork's edges: array is the same shape: each edge has from, to, and an edge_type from the closed enum (depends_on, supplies_context_to, verifies, blocks, retries, escalates_to, human_decision_gate, verifies_user_choice). Finer-grained branching lives in the optional `condition:` object on retries edges (a jsonschema-backed predicate registered at compile time — the F5/F6 contract from `p1-1-condition-edges`).",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-langgraph-auditor.md#4-edges",
+        "schemas/workflow.schema.json",
+        "mini_ork/policies/engine.py:40"
+      ],
+      "miniork_status": "present",
+      "value_chapter_epic": "Edges carry the same declarative routing surface the chapter needs; closing the F5/F6 contract (condition-only-on-retries + policy-registry-for-run-level) is part of what the chapter claims.",
+      "value_any_task": "Every recipe's routing decisions are encoded in edges; making sure the enum covers every graph routing primitive is a hard pre-condition for parity.",
+      "effort": "low",
+      "recommended_phase": "completed_in_d1",
+      "proposed_shape": "Keep `WorkflowEdge` (per `schemas/workflow.schema.json`) plus the `condition:` block (P1.1) consumed only on retries edges today; the policy registry stays for run-level routing, not per-edge branching."
+    },
+    {
+      "feature": "Conditional edges (typed predicates / P1.1)",
+      "section_ref": "§5",
+      "source_system": "langgraph",
+      "semantics_summary": "LangGraph conditional edges attach a Python callable to an edge; the runtime evaluates the callable against the post-node state and routes to the named branch. mini-ork's P1.1 conditional edges carry a typed `condition:` object instead — a jsonschema predicate with a pointer (RFC 6901 JSON pointer into the source node's output artifact JSON) and a match schema fragment; the runtime uses jsonschema Draft7 validator to decide whether the branch fires. The condition: block is consumed only on `retries` edges today — every other edge type is gated by the rc channel.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-langgraph-auditor.md#5-conditional-edges",
+        "schemas/workflow.schema.json",
+        "mini_ork/policies/engine.py:40"
+      ],
+      "miniork_status": "partial",
+      "value_chapter_epic": "Resolving whether condition: stays retries-only (the current P1.1 contract) or widens to other edge types is an open chapter question the survey frames but does not close.",
+      "value_any_task": "Conditional branching is a common need; deciding whether the runtime commits to a jsonschema-only predicate (vs. allowing arbitrary functions) shapes every downstream recipe.",
+      "effort": "medium",
+      "recommended_phase": "chapter-n_backlog",
+      "proposed_shape": "Maintain `condition:` as a jsonschema-backed pointer/match; document the open question whether to widen beyond retries edges as the chapter epic's explicit pending decision."
+    },
+    {
+      "feature": "Command (state-update + route in one return)",
+      "section_ref": "§6",
+      "source_system": "langgraph",
+      "semantics_summary": "A langgraph Command is a single return value that combines a partial state update with a goto: routing decision, so a node can both write state and pick the next node in one step. mini-ork does not have an atomic write+route primitive in the same sense: a node's declared outputs are materialized after verifier gates pass, and the routing decision lives on the downstream edges entry (typically a retries edge with a condition: predicate). The split is declarative — there is no literal Command return.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-langgraph-auditor.md#6-command",
+        "schemas/workflow.schema.json"
+      ],
+      "miniork_status": "divergent_by_design",
+      "value_chapter_epic": "The chapter's stated divergence (no single-return write+pick-next primitive) is honest and the closest analog (outputs: + retries-with-condition:) is well-documented — that's worth preserving in the chapter epic.",
+      "value_any_task": "Recipes that need write-and-route atomicity already route through retries-condition pairs; the documented divergence keeps call sites clear.",
+      "effort": "low",
+      "recommended_phase": "deferred",
+      "proposed_shape": "Divergent-by-design: keep the two-row pattern (`outputs:` plus `edges:` with `condition:`); no Command analog introduced."
+    },
+    {
+      "feature": "START / END",
+      "section_ref": "§7",
+      "source_system": "langgraph",
+      "semantics_summary": "LangGraph reserves the node names START (a virtual source node) and END (a virtual sink) to anchor the entry and exit of every graph; the runtime injects them when the graph is compiled. mini-ork has the same anchor concept: every recipe's nodes: array has an implicit entry node chosen by the task_class declared on the workflow header, and a rollback_strategy: field that names the terminal-failure node. There is no literal START/END row in the recipe — the executor resolves them at dispatch time; the audit log records the resolved entry and terminal node.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-langgraph-auditor.md#7-start--end",
+        "schemas/workflow.schema.json"
+      ],
+      "miniork_status": "present",
+      "value_chapter_epic": "Implicit entry + rollback-strategy naming already mirror START/END; the chapter can cite this as parity-true without further work.",
+      "value_any_task": "Every recipe needs an entry and a terminal; documenting the audit-log surface (which D1 does) avoids reinventing START/END per recipe.",
+      "effort": "low",
+      "recommended_phase": "completed_in_d1",
+      "proposed_shape": "No literal row; resolved at dispatch from task_class and rollback_strategy, with audit-log emission already wired."
+    },
+    {
+      "feature": "Persistence / checkpointers",
+      "section_ref": "§8",
+      "source_system": "langgraph",
+      "semantics_summary": "A langgraph checkpointer is a pluggable backend (Memory, SQLite, Postgres) that records a Checkpoint after every superstep, keyed by (thread_id, checkpoint_id, checkpoint_ns), so a run can be replayed, time-travelled, or forked from any prior checkpoint. mini-ork's persistence story lives in two places, neither a direct analog: the artifact filesystem under ${MINI_ORK_RUN_DIR}/ plus the single-writer lease registered through mini_ork/stores/lease.py, and the in-process RunContext (mini_ork/context.py:59). There is no env-var knob named MO_PERSISTENCE_BACKEND and no MO_CHECKPOINT_FORK one-shot CLI override — neither string exists in mini_ork/.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-langgraph-auditor.md#8-persistence--checkpointers",
+        "mini_ork/stores/lease.py",
+        "mini_ork/cli/execute.py",
+        "schemas/workflow.schema.json"
+      ],
+      "miniork_status": "divergent_by_design",
+      "value_chapter_epic": "The chapter epic must decide whether to introduce MO_PERSISTENCE_BACKEND + MO_CHECKPOINT_FORK as a v2 surface or keep documenting divergent-by-design — D1 frames this as the persistence chapter's central question.",
+      "value_any_task": "Run-level recovery is genuinely needed for long-running recipes; the divergence is real and the chapter owns it.",
+      "effort": "high",
+      "recommended_phase": "chapter-l_backlog",
+      "proposed_shape": "Either (a) introduce MO_PERSISTENCE_BACKEND + MO_CHECKPOINT_FORK as a new persistence module, or (b) document the divergence as a permanent reminder that recovery is via the `recursion:` block."
+    },
+    {
+      "feature": "Thread / checkpoint id",
+      "section_ref": "§9",
+      "source_system": "langgraph",
+      "semantics_summary": "LangGraph keys every checkpoint with a thread_id (a logical session) and a checkpoint_id (a monotonic per-thread counter), and exposes both on the RunnableConfig so a node can read its own position. mini-ork's RunContext exposes run_id (stable for the run, the closest analog of thread_id), but there is no attempt_sha attribute on RunContext and no `<output>.attempt-<sha>.json` sidecar file produced by the dispatcher. A grep across mini_ork/ returns no attempt_sha symbol and no attempt-<sha> path literal.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-langgraph-auditor.md#9-thread--checkpoint-id",
+        "mini_ork/context.py:59",
+        "mini_ork/workflow/retry.py"
+      ],
+      "miniork_status": "divergent_by_design",
+      "value_chapter_epic": "Adding attempt_sha + the attempt-<sha> sidecar is the natural extension of any future persistence story; the chapter epic should at least spell out whether the missing surface is a planned gap or a permanent one.",
+      "value_any_task": "Per-output attempt sha is useful for debuggability; deciding whether to add it costs almost nothing once MO_PERSISTENCE_BACKEND is on the table.",
+      "effort": "medium",
+      "recommended_phase": "chapter-l_backlog",
+      "proposed_shape": "Add `attempt_sha` to `RunContext` and write `<output>.attempt-<sha>.json` sidecars from the dispatcher."
+    },
+    {
+      "feature": "Memory (short-term + long-term)",
+      "section_ref": "§10",
+      "source_system": "langgraph",
+      "semantics_summary": "LangGraph v1.x splits memory into short-term (in-thread State that dies with the run) and long-term (a Store that survives across threads and is keyed by namespace + key). mini-ork has a partial mirror: the artifact filesystem under ${MINI_ORK_RUN_DIR}/ is the short-term memory, and the semantic-memory layer in mini_ork/memory/semantic.py is the long-term store (addressable by {namespace, key, embedder}). The store is pluggable: register an embedder via mini_ork.memory.semantic.register_embedder_provider(name, factory) (mini_ork/memory/semantic.py:178) and select it at dispatch time with MO_EMBED_PROVIDER. There is no MO_MEMORY_STORE env var in the source tree.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-langgraph-auditor.md#10-memory",
+        "mini_ork/memory/semantic.py:178",
+        "mini_ork/memory/semantic.py:190"
+      ],
+      "miniork_status": "partial",
+      "value_chapter_epic": "The long-term store sits at semantic-memory today; the chapter should keep framing it as the long-term persistence layer (since §8 persistence is divergent-by-design).",
+      "value_any_task": "Recipes that benefit from a namespace-keyed store have it via the embedder provider registry already; MO_EMBED_PROVIDER is the knob.",
+      "effort": "low",
+      "recommended_phase": "completed_in_d1",
+      "proposed_shape": "Keep the in-tree semantic layer + MO_EMBED_PROVIDER; document the absence of MO_MEMORY_STORE as an explicit divergence."
+    },
+    {
+      "feature": "Subgraphs",
+      "section_ref": "§11",
+      "source_system": "langgraph",
+      "semantics_summary": "A langgraph subgraph is a StateGraph composed as a node inside a parent graph; the runtime treats the subgraph as a single node from the parent's point of view, with its own internal state schema and routing. mini-ork's compositional unit is a recipe (a workflow.yaml + artifact_contract.yaml + task_class.yaml directory under recipes/), but there is no first-class sub-recipe-as-node feature in the WorkflowNode.type enum declared by schemas/workflow.schema.json — that enum is closed and has no subrecipe entry, no recipe_ref field on the WorkflowNode schema.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-langgraph-auditor.md#11-subgraphs",
+        "schemas/workflow.schema.json"
+      ],
+      "miniork_status": "divergent_by_design",
+      "value_chapter_epic": "Sub-recipe composition is the chapter's largest compositional gap; the recursion block on the workflow header handles self-recursion but not child-recipe composition — the chapter epic should frame whether to introduce `type: subrecipe`.",
+      "value_any_task": "Recipes composed of sub-recipes today route through recursion; once sub-recipe node is a thing, the chapter closes a real workflow authoring pain point.",
+      "effort": "high",
+      "recommended_phase": "chapter-l_backlog",
+      "proposed_shape": "Introduce `type: subrecipe` plus `recipe_ref: ...` on `WorkflowNode` to enable first-class child-recipe composition."
+    },
+    {
+      "feature": "Send / map-reduce",
+      "section_ref": "§12",
+      "source_system": "langgraph",
+      "semantics_summary": "LangGraph's Send is a per-input routing primitive that lets a node fan out one sub-invocation per element of an input list, and the runtime collects the partial states into a single reducer. mini-ork's dispatch_mode: partitioned is the map primitive — a node declared partitioned is sharded by an item key declared on the node's partition_key field; the executor writes one attempt per partition. The reduce step is narrower than langgraph's — there is no in-recipe merge: enum on the output schema, so a recipe that needs list-reduction behavior either names a downstream transform node or relies on filesystem-level last-writer behavior.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-langgraph-auditor.md#12-send--map-reduce",
+        "schemas/workflow.schema.json",
+        "mini_ork/cli/execute.py",
+        "mini_ork/cli/execute_handlers.py:892"
+      ],
+      "miniork_status": "partial",
+      "value_chapter_epic": "Map is real (partitioned dispatch); reduce is the open chapter question — same direction as §2's merge enum question.",
+      "value_any_task": "Recipes that fan out per-item already work via partitioned dispatch; the missing surface is the per-item reducer.",
+      "effort": "medium",
+      "recommended_phase": "chapter-n_backlog",
+      "proposed_shape": "Same answer as §2: first-class `merge:` enum on the output schema, or keep the transform-node routing pattern."
+    },
+    {
+      "feature": "Parallel execution",
+      "section_ref": "§13",
+      "source_system": "langgraph",
+      "semantics_summary": "LangGraph executes independent branches of the DAG concurrently when the edge set exposes them; the runtime awaits the slowest branch before invoking the join node. mini-ork's parallel-execution story lives in the per-node dispatch_mode enum (serial|parallel|partitioned|speculative): a node declared parallel runs concurrently with its siblings in the same wave. There is no core-runtime MO_DISPATCH_WAVES knob, and the wave concept is implicit in the executor's readiness computation.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-langgraph-auditor.md#13-parallel-execution",
+        "schemas/workflow.schema.json",
+        "mini_ork/cli/execute.py",
+        "recipes/spec-driven-delivery/lib/per_spec_dispatcher.py"
+      ],
+      "miniork_status": "present",
+      "value_chapter_epic": "Parallel execution is parity-true today via dispatch_mode; the chapter can cite this as a present-side claim without further work.",
+      "value_any_task": "Any recipe that wants a wave-parallel default declares it on the workflow header; per-node opt-out uses dispatch_mode: serial.",
+      "effort": "low",
+      "recommended_phase": "completed_in_d1",
+      "proposed_shape": "Keep `dispatch_mode: parallel` on the workflow header and on individual nodes; no MO_DISPATCH_WAVES knob introduced."
+    },
+    {
+      "feature": "Interrupts / breakpoints (dynamic)",
+      "section_ref": "§14",
+      "source_system": "langgraph",
+      "semantics_summary": "A langgraph interrupt(...) call is a dynamic breakpoint that pauses the run and surfaces a payload to the caller; the caller can Command(resume=...) to inject a value and continue. mini-ork does not expose an in-process interrupt(...) callable. There is no type: human_in_the_loop node in the closed WorkflowNode.type enum. There is no finish_reason: \"interrupt\" value, no <run_dir>/.steering/<node>.json payload file, and no gate: human_review row. The closest analogs are (a) the human_decision_gate edge type — a static pre-publish halt, and (b) the operator-steering channel documented in docs/OPERATOR-STEERING.md.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-langgraph-auditor.md#14-interrupts--breakpoints",
+        "schemas/workflow.schema.json",
+        "docs/OPERATOR-STEERING.md",
+        "mini_ork/cli/inject.py",
+        "mini_ork/steering/mid_node_injector.py"
+      ],
+      "miniork_status": "divergent_by_design",
+      "value_chapter_epic": "Dynamic interrupts are the largest single chapter divergence — the in-process callable has no direct analog — so the chapter epic owns deciding whether to introduce the surface or keep the human_decision_gate + operator-steering workaround.",
+      "value_any_task": "Recipes that need mid-run injection use the operator-steering channel today; mid-node inject CLI is the existing workaround.",
+      "effort": "high",
+      "recommended_phase": "chapter-l_backlog",
+      "proposed_shape": "Either introduce `type: human_in_the_loop` plus `finish_reason: \"interrupt\"` plus a <run_dir>/.steering/<node>.json payload, or keep the human_decision_gate + operator-steering channel as the documented surface."
+    },
+    {
+      "feature": "Human-in-the-loop",
+      "section_ref": "§15",
+      "source_system": "langgraph",
+      "semantics_summary": "LangGraph v1.x unifies the human-in-the-loop surface under the interrupt / Command(resume=...) channel, plus a breakpoint parameter on .compile(...) for static pause points. mini-ork's human-in-the-loop surface is partial, and the two channels the report can cite are: (a) a human_decision_gate edge on the workflow, which halts the run before publishing, and (b) the operator-steering channel documented in docs/OPERATOR-STEERING.md. There is no type: human_in_the_loop node, no human_review_gate row, no <run_dir>/<run>/.steering/<node>.json payload.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-langgraph-auditor.md#15-human-in-the-loop",
+        "schemas/workflow.schema.json",
+        "docs/OPERATOR-STEERING.md"
+      ],
+      "miniork_status": "divergent_by_design",
+      "value_chapter_epic": "Same direction as §14; the chapter's HITL decision (one surface or two) is the single source of truth.",
+      "value_any_task": "Recipes that pause before publish do so today via human_decision_gate.",
+      "effort": "high",
+      "recommended_phase": "chapter-l_backlog",
+      "proposed_shape": "Consolidate the HITL decision with §14 — same answer applies."
+    },
+    {
+      "feature": "Durable execution",
+      "section_ref": "§16",
+      "source_system": "langgraph",
+      "semantics_summary": "LangGraph's durability contract is 'checkpoint before every external side effect, replay from the latest checkpoint on recovery, never duplicate a side effect.' mini-ork has a partial durability story today. The single-writer lease is real: mini_ork/stores/lease.py exposes is_lease_holder and refresh_lease, and a stale recovery refuses to publish over a newer one. The retry side is also real: mini_ork/workflow/retry.py writes <run_dir>/retry-exhausted/<node>.attempts.json. The effect-boundary half is narrower — there is no <run_dir>/.receipts/<tool>.json table, no per-tool receipt file.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-langgraph-auditor.md#16-durable-execution",
+        "mini_ork/stores/lease.py",
+        "mini_ork/cli/execute.py:3450",
+        "mini_ork/stores/checkpoints.py:326",
+        "mini_ork/workflow/retry.py",
+        "mini_ork/cli/publisher.py"
+      ],
+      "miniork_status": "partial",
+      "value_chapter_epic": "Durability is the most-load-bearing chapter claim — the lack of an effect-boundary receipts table is the concrete divergence the chapter must own.",
+      "value_any_task": "Recipes that call external tools use the single-writer lease today; per-tool receipts are the open gap.",
+      "effort": "high",
+      "recommended_phase": "chapter-l_backlog",
+      "proposed_shape": "Introduce `<run_dir>/.receipts/<tool>.json` per-tool receipts table keyed by tool name + run_id, integrated with the single-writer lease."
+    },
+    {
+      "feature": "Streaming (values / updates / events / debug / custom)",
+      "section_ref": "§17",
+      "source_system": "langgraph",
+      "semantics_summary": "LangGraph v1.x ships five streaming modes: values, updates, events, debug, and custom (via get_stream_writer()). mini-ork's streaming surface is narrower. The only declared streaming primitive in the source tree is LiveWriter (defined at mini_ork/dispatch/live_stream.py:80, an append-only live-log writer with a byte-cap). There is no Stream envelope module at mini_ork.dispatch.stream, no StreamSink class, and no `mini-ork subscribe --run <run_id> --channel events --sink ws://...` CLI in the registered subcommands.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-langgraph-auditor.md#17-streaming",
+        "mini_ork/dispatch/live_stream.py:80",
+        "mini_ork/runtime/backends/remote.py:291",
+        "mini_ork/web/routes/node_live.py"
+      ],
+      "miniork_status": "divergent_by_design",
+      "value_chapter_epic": "The five-channel stream surface is one of the chapter's largest divergences (alongside interrupts and persistence); the chapter epic owns whether to introduce a StreamSink class or continue with single-LiveWriter.",
+      "value_any_task": "The web UI consumes a tail of LiveWriter today; recipes that need a typed channel subscribe would need the StreamSink surface.",
+      "effort": "high",
+      "recommended_phase": "chapter-l_backlog",
+      "proposed_shape": "Introduce a StreamSink class + Stream envelope + per-channel subscribe CLI (`mini-ork subscribe --run <run_id> --channel events --sink ws://...`) in mini_ork/dispatch/stream.py."
+    },
+    {
+      "feature": "Tool calls",
+      "section_ref": "§18",
+      "source_system": "langgraph",
+      "semantics_summary": "LangGraph v1.x routes a model-emitted tool call to a registered ToolNode, which dispatches the call by name, returns the result, and lets the graph continue. mini-ork's tool surface is the tools: block on a node (per schemas/workflow.schema.json §WorkflowNode.tools) plus the parallel mcp_servers: list — both arrays of harness-tool names (or objects grouped by native / MCP capability) resolved against the tool registry. The dispatcher's mo_llm_dispatch wrapper (mini_ork.dispatch.llm_dispatch) and the ACP harness (mini_ork/acp_orchestrator/harness.py:113-140) pass the lists through --allowedTools, --disallowedTools, --mcp-config, and --strict-mcp-config.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-langgraph-auditor.md#18-tool-calls",
+        "schemas/workflow.schema.json",
+        "mini_ork/dispatch/llm_dispatch",
+        "mini_ork/certify/llm.py:20",
+        "mini_ork/acp_orchestrator/harness.py:113-140",
+        "mini_ork/dispatch/providers.py:1403"
+      ],
+      "miniork_status": "present",
+      "value_chapter_epic": "Tool calls are parity-true today — the schema covers both native tools and MCP servers; the chapter can mark this present without further work.",
+      "value_any_task": "Any recipe that needs a tool declares it on tools: or mcp_servers:; the harness handles the rest.",
+      "effort": "low",
+      "recommended_phase": "completed_in_d1",
+      "proposed_shape": "Keep `tools:` and `mcp_servers:` on WorkflowNode plus the structural invariant that no single node may simultaneously hold repo-write + untrusted-content ingress + outbound channel."
+    },
+    {
+      "feature": "Structured output",
+      "section_ref": "§19",
+      "source_system": "langgraph",
+      "semantics_summary": "LangGraph v1.x binds a node's return to a pydantic.BaseModel (or TypedDict / dataclass) so the runtime can validate the schema and reject non-conforming writes. mini-ork's structured-output surface is the outputs: block on the artifact contract (per schemas/artifact_contract.schema.json) plus the per-node outputs: array on the workflow node (per schemas/workflow.schema.json §WorkflowNode.outputs). Each output declares a name, a path, and a kind — no mime: or merge: there. There is no materialize_outputs step in the source tree; the dispatcher does not currently emit finish_reason: \"schema_violation\" on a non-conforming artifact.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-langgraph-auditor.md#19-structured-output",
+        "schemas/artifact_contract.schema.json",
+        "schemas/workflow.schema.json:202"
+      ],
+      "miniork_status": "partial",
+      "value_chapter_epic": "Structured output is parity-true at the schema layer; the chapter epic owns deciding whether to introduce a materialize_outputs step (or finish_reason: \"schema_violation\") to close the runtime-side gap.",
+      "value_any_task": "Recipes that need a fixed-shape output declare it on outputs:; the strict_handshake handshake is the closest parity surface today.",
+      "effort": "medium",
+      "recommended_phase": "chapter-n_backlog",
+      "proposed_shape": "Add a `materialize_outputs` step in the dispatcher that emits `finish_reason: \"schema_violation\"` on a non-conforming artifact and tightens the strict_handshake description."
+    },
+    {
+      "feature": "Retry policies (per-node retry: block / P1.4)",
+      "section_ref": "§20",
+      "source_system": "langgraph",
+      "semantics_summary": "LangGraph's RetryPolicy is a NamedTuple of (initial_interval=0.5, backoff_factor=2.0, max_interval=128.0, max_attempts=3, jitter=True, retry_on=default_retry_on) and is attached to a node via add_node(..., retry=RetryPolicy(...)). mini-ork's P1.4 retry: block is the same five-field shape with the same defaults, sourced from the LangGraph named tuple (the source link LANGGRAPH_DEFAULTS_URL is defined at mini_ork/workflow/retry.py:56 and pins the upstream commit). The retryable-set is a closed enum over finish_reason values (timeout, infra_interrupt, provider_limit, network, overloaded, rate_limited, killed, sigterm, rc_137, rc_143 per mini_ork/recovery/auto_repair.py and mini_ork/learning/failure_classifier.py).",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-langgraph-auditor.md#20-retry-policies",
+        "mini_ork/workflow/retry.py:56",
+        "mini_ork/workflow/retry.py:301",
+        "mini_ork/workflow/retry.py:438",
+        "mini_ork/recovery/auto_repair.py",
+        "mini_ork/learning/failure_classifier.py",
+        "schemas/workflow.schema.json"
+      ],
+      "miniork_status": "present",
+      "value_chapter_epic": "Retry policies are parity-true today — five-field same shape, defaults from upstream, retryable-set is a closed enum — the chapter can mark this present.",
+      "value_any_task": "Every recipe that needs retry declares it on the node; the closed enum and the attempt-log sidecar round out the parity story.",
+      "effort": "low",
+      "recommended_phase": "completed_in_d1",
+      "proposed_shape": "Keep the `retry:` block on WorkflowNode; keep `<run_dir>/retry-exhausted/<node>.attempts.json` as the attempt log."
+    },
+    {
+      "feature": "Runtime / config (RunnableConfig)",
+      "section_ref": "§21",
+      "source_system": "langgraph",
+      "semantics_summary": "LangGraph v1.x surfaces a RunnableConfig to every node with configurable, tags, metadata, and callbacks fields, and the graph compiles with with_config(...) / config_schema=.... mini-ork's RunContext is a partial analog: it carries the env contract from MINI_ORK_ROOT, MINI_ORK_HOME, MINI_ORK_DB, and MINI_ORK_RUN_DIR (defined at mini_ork/context.py:39-43), the run-identity vars (run_id), and the artifact manifest. There is no tags: block in the same sense as langgraph's configurable.tags, and no callbacks: field on RunContext. The risk_class: field on task_class.yaml is the closest analog of configurable.tags.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-langgraph-auditor.md#21-runtime--config",
+        "mini_ork/context.py:39-43",
+        "mini_ork/context.py:59",
+        "mini_ork/context.py:174",
+        "mini_ork/context.py:188",
+        "schemas/task_class.schema.json:72"
+      ],
+      "miniork_status": "partial",
+      "value_chapter_epic": "RunContext is a partial analog — env vars + run_id + manifest are real, tags/callbacks are not first-class; the chapter epic owns deciding whether to surface tags via risk_class or add a dedicated tags block.",
+      "value_any_task": "Run-level config lives in env vars today; recipes that need tags carry them via risk_class on task_class.",
+      "effort": "medium",
+      "recommended_phase": "chapter-n_backlog",
+      "proposed_shape": "Either (a) document risk_class as the tags analog, or (b) add a `tags:` block to task_class.yaml."
+    },
+    {
+      "feature": "Deployment / Studio / LangGraph Platform",
+      "section_ref": "§22",
+      "source_system": "langgraph",
+      "semantics_summary": "LangGraph v1.x exposes a managed deployment surface (LangGraph Platform / Studio) that takes a compiled graph, runs it as a long-lived server, and serves a UI for tracing, evaluation, and human-in-the-loop. mini-ork's deployment surface is `mini-ork serve` (registered as a subcommand at mini_ork/cli/main.py:67, implemented in mini_ork/cli/serve.py, launched via bin/mini-ork-serve). There is no deploy/<recipe>.yaml per-recipe manifest, no mini-ork ui subcommand in the registered subcommand table, and no managed platform tier by design — the operator (self-hosted) tier is the recommended one.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-langgraph-auditor.md#22-deployment--studio",
+        "mini_ork/cli/main.py:67",
+        "mini_ork/cli/serve.py",
+        "bin/mini-ork-serve",
+        "deploy/node-agent"
+      ],
+      "miniork_status": "divergent_by_design",
+      "value_chapter_epic": "Deployment is partial-parity by design — operator tier over managed platform; the chapter epic owns the framing 'same primitives, different surface' and not the gap.",
+      "value_any_task": "Recipes that want long-lived execution run via `mini-ork serve` today; per-recipe deployment manifests are a documented absence.",
+      "effort": "low",
+      "recommended_phase": "deferred",
+      "proposed_shape": "Keep per-recipe packaging + operator tier; document the divergence so the chapter epic does not invent a managed-platform surface."
+    },
+    {
+      "feature": "Model Context Protocol (MCP)",
+      "section_ref": "§23",
+      "source_system": "langgraph",
+      "semantics_summary": "LangGraph v1.x integrates with MCP servers as tool providers: a graph declares an mcp_servers: list, and the runtime resolves the server list at compile time and exposes the tools to the LLM. mini-ork's MCP surface is the mcp_servers: list on a workflow node (see schemas/workflow.schema.json §WorkflowNode.mcp_servers), and the dispatcher passes the list through --mcp-config / --strict-mcp-config to the worker CLI (per mini_ork/acp_orchestrator/harness.py:135-140 and the --allowedTools construction in mini_ork/dispatch/providers.py:1403). The `mini-ork mcp add <name> --url <url> | --command <c>` CLI (mini_ork/cli/mcp_cmd.py:46) manages the project's MCP server list via mini_ork.dispatch.mcp_registry.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-langgraph-auditor.md#23-model-context-protocol",
+        "schemas/workflow.schema.json",
+        "mini_ork/acp_orchestrator/harness.py:135-140",
+        "mini_ork/dispatch/providers.py:1403",
+        "mini_ork/cli/mcp_cmd.py:46",
+        "mini_ork/cli/main.py:166"
+      ],
+      "miniork_status": "present",
+      "value_chapter_epic": "MCP is parity-true today — schema field + register CLI + harness flag plumbing — the chapter can mark this present.",
+      "value_any_task": "Recipes that need an MCP server declare it on mcp_servers: so a reviewer can lint the capability grant.",
+      "effort": "low",
+      "recommended_phase": "completed_in_d1",
+      "proposed_shape": "Keep `mcp_servers:` on WorkflowNode; keep `mini-ork mcp add` CLI for register; harness keeps --mcp-config / --strict-mcp-config."
+    },
+    {
+      "feature": "Time travel",
+      "section_ref": "§24",
+      "source_system": "langgraph",
+      "semantics_summary": "LangGraph v1.x supports replaying a thread from any prior checkpoint_id by passing thread_id + checkpoint_id to invoke / stream; the runtime loads the checkpoint, replays the graph from that point, and re-emits the events. mini-ork does not expose a time-travel CLI today. A grep across the registered subcommands returns no `mini-ork fork` command, no --run flag on a fork-shaped handler, and no --sha time-travel knob on any mini-ork invocation. The closest re-dispatch handle is the recipe-level recursion: block on the workflow header, which restarts a bounded control loop, not a per-attempt rewind.",
+      "citations": [
+        "docs/research/20261012-langgraph-parity-survey/report-langgraph-auditor.md#24-time-travel",
+        "mini_ork/workflow/retry.py:438",
+        "schemas/workflow.schema.json"
+      ],
+      "miniork_status": "divergent_by_design",
+      "value_chapter_epic": "Time travel is the natural follow-on of persistence; the chapter epic should not introduce it independently of §8/§9 — the same MO_PERSISTENCE_BACKEND decision gates it.",
+      "value_any_task": "Recipes that rewind use the recursion: block today; a per-attempt fork-shaped CLI is the planned gap.",
+      "effort": "high",
+      "recommended_phase": "chapter-l_backlog",
+      "proposed_shape": "Tie time travel to the §8 persistence decision — a fork-shaped `mini-ork fork --run --node --sha` CLI plus `<output>.attempt-<sha>.json` sidecars."
+    }
+  ],
+  "top_10_backlog": [
+    {
+      "rank": 1,
+      "title": "Persist + checkpoint: MO_PERSISTENCE_BACKEND + MO_CHECKPOINT_FORK + attempt_sha",
+      "rationale": "§8 + §9 + §24 form the persistence/time-travel triangle; resolving any one of them gate-reveals the others and is the single largest parity gap in the chapter.",
+      "claims": ["§8", "§9", "§24"],
+      "recommended_phase": "chapter-l_backlog"
+    },
+    {
+      "rank": 2,
+      "title": "Interrupt channel: type: human_in_the_loop + finish_reason: interrupt + .steering/<node>.json payload",
+      "rationale": "§14 + §15 share a single dynamic-interrupt surface; the chapter cannot claim HITL parity without it.",
+      "claims": ["§14", "§15"],
+      "recommended_phase": "chapter-l_backlog"
+    },
+    {
+      "rank": 3,
+      "title": "Streaming: StreamSink class + Stream envelope + per-channel subscribe CLI",
+      "rationale": "§17 diverges from the five-channel langgraph surface; without a StreamSink the chapter cannot claim stream parity.",
+      "claims": ["§17"],
+      "recommended_phase": "chapter-l_backlog"
+    },
+    {
+      "rank": 4,
+      "title": "Sub-recipe node: type: subrecipe + recipe_ref on WorkflowNode",
+      "rationale": "§11 closes the recipe-composition gap; without it the chapter cannot claim first-class sub-graph composition.",
+      "claims": ["§11"],
+      "recommended_phase": "chapter-l_backlog"
+    },
+    {
+      "rank": 5,
+      "title": "Per-tool effect-boundary receipts: <run_dir>/.receipts/<tool>.json",
+      "rationale": "§16 durability's effect-boundary half is the concrete missing surface; introducing the receipts table is a one-module add.",
+      "claims": ["§16"],
+      "recommended_phase": "chapter-l_backlog"
+    },
+    {
+      "rank": 6,
+      "title": "Merge enum: first-class merge: field on the artifact contract output schema",
+      "rationale": "§2 + §12 both hinge on the same merge question; a single merge: enum resolves both.",
+      "claims": ["§2", "§12"],
+      "recommended_phase": "chapter-n_backlog"
+    },
+    {
+      "rank": 7,
+      "title": "Conditional edges beyond retries: widen the condition: contract to other edge types",
+      "rationale": "§5 documents that condition: is retries-only today; chapter needs to decide whether widening is worth the schema change.",
+      "claims": ["§5"],
+      "recommended_phase": "chapter-n_backlog"
+    },
+    {
+      "rank": 8,
+      "title": "Structured-output enforcement: materialize_outputs + finish_reason: schema_violation",
+      "rationale": "§19 documents the runtime-side gap; tightening strict_handshake is the obvious next step.",
+      "claims": ["§19"],
+      "recommended_phase": "chapter-n_backlog"
+    },
+    {
+      "rank": 9,
+      "title": "RunConfig tags: surface configurable.tags as a dedicated tags block on task_class.yaml",
+      "rationale": "§21 documents that risk_class is the current analog; deciding whether to introduce a dedicated tags block closes the partial analog.",
+      "claims": ["§21"],
+      "recommended_phase": "chapter-n_backlog"
+    },
+    {
+      "rank": 10,
+      "title": "Chapter synthesis: roll up the four lenses (auditor / stategraph / persistence / streaming) into a single chapter narrative",
+      "rationale": "D1 + D2 (stategraph) + D3 (persistence / checkpointers) + D4 (streaming modes) form the four-lens chapter family; the synthesis is the public-facing document.",
+      "claims": ["all"],
+      "recommended_phase": "chapter-synthesis_backlog"
+    }
+  ],
+  "chapter_epic_remaining_blockers": [
+    {
+      "id": "B1",
+      "title": "Persistence chapter epic — three coupled decisions not yet made",
+      "detail": "MO_PERSISTENCE_BACKEND + MO_CHECKPOINT_FORK + attempt_sha + <output>.attempt-<sha>.json sidecar (D1 §8, §9, §24) are all parallel; resolving one without the others leaves the surface incoherent. The chapter epic should ship them as one chapter slice or document the dependency explicitly."
+    },
+    {
+      "id": "B2",
+      "title": "Interrupt / HITL chapter epic — single surface or two",
+      "detail": "D1 §14 + §15 share the same dynamic-interrupt surface; the chapter epic owns whether to introduce type: human_in_the_loop + finish_reason: interrupt or document the human_decision_gate + operator-steering channel as the answer."
+    },
+    {
+      "id": "B3",
+      "title": "Streaming chapter epic — StreamSink class or LiveWriter-only",
+      "detail": "D1 §17 is the single largest surface divergence after persistence; the chapter epic owns deciding whether to ship mini_ork/dispatch/stream.py or keep LiveWriter as the only declared streaming primitive."
+    },
+    {
+      "id": "B4",
+      "title": "Sub-recipe composition — first-class or recursion-only",
+      "detail": "D1 §11 diverges by design today via the recursion: block; the chapter epic owns whether to introduce type: subrecipe + recipe_ref on WorkflowNode, or document the divergence as permanent."
+    },
+    {
+      "id": "B5",
+      "title": "Merge enum — artifacts or transform nodes",
+      "detail": "D1 §2 + §12 both ask whether the artifact contract carries a merge: enum; the chapter must resolve it once, not twice (the §2 and §12 entries in this sidecar flag the same answer)."
+    },
+    {
+      "id": "B6",
+      "title": "Durability effect-boundary — receipts or None",
+      "detail": "D1 §16 documents the absence of <run_dir>/.receipts/<tool>.json; the chapter epic owns whether to ship it or accept the divergence."
+    },
+    {
+      "id": "B7",
+      "title": "Four-lens synthesis pending",
+      "detail": "The D1 auditor (this report) sits alongside D2 (stategraph), D3 (persistence / checkpointers), and D4 (streaming modes); the chapter synthesis is the public-facing document and is not yet authored."
+    },
+    {
+      "id": "B8",
+      "title": "Citation convention C4 propagation",
+      "detail": "D1 hard rule C4 requires every concept's claim line to carry at least one inline citation; the sidecar preserves this invariant via the `citations: []` field, but downstream sibling lenses (D2/D3/D4) and any chapter synthesis must propagate the same invariant."
+    }
+  ],
+  "sidecar_metadata": {
+    "d1_report": "docs/research/20261012-langgraph-parity-survey/report-langgraph-auditor.md",
+    "sibling_lenses": {
+      "D2": "stategraph construction",
+      "D3": "persistence / checkpointers",
+      "D4": "streaming modes"
+    },
+    "claim_count": 24,
+    "min_required_claims": 12,
+    "hard_rules_preserved": [
+      "C4 (every claim line has a citation) — preserved by the `citations` field on every claim",
+      "F4 (every concept either has a YAML block or a divergent-by-design line) — preserved by `miniork_status` on every claim",
+      "F1 (breadth-defensible baseline) — preserved; this sidecar lists 24 concepts across 13 areas per D1's coverage map",
+      "F5/Q2 (no invented requirements beyond the D1 report) — every claim's `proposed_shape` is the D1-prescribed analog"
+    ]
+  }
+}
