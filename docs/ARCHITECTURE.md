@@ -306,3 +306,9 @@ flowchart TD
 ```
 
 Self-evolution is evidence-gated: a candidate must beat the current version on the benchmark suite before promotion. There is **no human branch** in that gate — an ambiguous or unmeasured candidate is quarantined with its reason, never escalated. A quarantine is not re-proposed automatically, and clearing one is a manual, Python-level operator step (`version_registry.clear_quarantine`); there is no CLI for it. The machine-readable trail is `version_registry` + `apply_attempts` + `promotion_records` — the `audit_log` table exists and is append-only by trigger, but nothing in the Python runtime writes to it yet. See [SAFETY.md](SAFETY.md).
+
+---
+
+## LangGraph parity
+
+mini-ork's recipe shape (`workflow.yaml` + nodes + edges + gates) is conceptually close to LangGraph's `StateGraph` but the two runtimes pick different primitives as first-class. The 12-row concept → mini-ork surface → status table (`parity`, `partial`, `divergent-by-design`, `planned-P2`) lives at [LANGGRAPH_PARITY.md](LANGGRAPH_PARITY.md). Use it when porting a LangGraph recipe or sanity-checking whether a missing LangGraph feature is a deliberate deferral.
