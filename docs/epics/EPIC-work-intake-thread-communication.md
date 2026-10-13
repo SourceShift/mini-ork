@@ -156,6 +156,11 @@ Preview in-app, agent writes.
   (`qlmanage`/`sips`, `pdftoppm`) with pinned `pymupdf` behind an optional extra. **Fail closed
   and loudly when neither is available — never a blank pane.**
 - **IDE:** a new `document` section type — one arm in `render_section` plus `ui/src/documents.rs`.
+  Split 2026-10-13: the engine half (attachments in, the `document` section payload) is
+  `wit-2-attachment-section`; the Rust renderer is a follow-up in the `mini-ork-ui` repo
+  (commit there, push its main, bump the `ui` pin here and in zed-mini-ork) because that
+  crate compiles only inside the zed-mini-ork workspace and a run against this repo cannot
+  verify it.
 - **Attachments:** today `agent_server.py` explicitly drops non-text message parts. They become
   `thread_messages` rows of a file role referencing the stored path; the IDE needs a file picker.
 - **"Edit"** = a composer beside the preview; the agent edits with `python-pptx`/`openpyxl`/
