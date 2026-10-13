@@ -199,14 +199,33 @@ def doctor(*, env_name: str = "", recipe: str = "", lanes: Sequence[str] = (),
                 pass
         # Provider-backed runs also destroy the node the provider created, so
         # the doctor leaves neither a session nor a recorded node behind.
+        provider_name = str(getattr(ws, "_endpoint_provider", "") or "")
+        provider_handle = str(getattr(ws, "_provider_handle", "") or "")
+        released = False
         if getattr(ws, "_node_provider", None) and env.get("MINI_ORK_RUN_DIR"):
             try:
                 from mini_ork.remote.providers.base import release_run_node
 
-                release_run_node(env["MINI_ORK_RUN_DIR"], env)
+                released = release_run_node(env["MINI_ORK_RUN_DIR"], env)
             except Exception:  # noqa: BLE001
                 pass
-    if rc == 0:   # 9. session down — verified on the node
+    if rc == 0 and provider_handle:
+        # 9. for a provider node the node itself is gone after teardown, so
+        # asking it about the session can only fail (E2B's proxy answers 502
+        # for a deleted sandbox). Verify the release instead: the provider no
+        # longer has a node to attach to.
+        try:
+            from mini_ork.remote.providers.base import get_node_provider
+
+            gone = released and get_node_provider(provider_name).attach(
+                provider_handle, env=env) is None
+        except Exception as exc:  # noqa: BLE001
+            gone, why = False, f"release unconfirmed: {exc}"
+        else:
+            why = (f"torn down ({provider_name} node {provider_handle[:12]} released)" if gone
+                   else f"the {provider_name} node {provider_handle[:12]} is still alive")
+        report.line(9, "PASS" if gone else "FAIL", why)
+    elif rc == 0:   # 9. session down — verified on the node
         try:
             ws._json("GET", f"/v1/sessions/{run_id}", retries=1)
             report.line(9, "FAIL", "the session is still on the node after teardown")
