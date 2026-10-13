@@ -159,6 +159,25 @@ class PathMap:
                 return sandbox_prefix + "/" + rel.replace(os.sep, "/")
         return p
 
+    def to_host(self, p: str) -> str:
+        """Inverse of :meth:`path`: a sandbox path → the host path it mirrors.
+
+        What a remote agent reports (a ``Write`` to ``/workspace/target/x.py``)
+        names the sandbox; the control plane reads it against the local tree.
+        Longest sandbox prefix first; anything outside the map (including a
+        host path, as a local run reports) comes back unchanged."""
+        if not isinstance(p, str) or not p.startswith("/"):
+            return p
+        for host_prefix, sandbox_prefix in sorted(self.pairs, key=lambda kv: len(kv[1]),
+                                                  reverse=True):
+            if not host_prefix or not sandbox_prefix:
+                continue
+            if p == sandbox_prefix:
+                return host_prefix
+            if p.startswith(sandbox_prefix.rstrip("/") + "/"):
+                return host_prefix.rstrip("/") + p[len(sandbox_prefix.rstrip("/")):]
+        return p
+
     def argv(self, items: Sequence[str]) -> list[str]:
         """Apply :meth:`path` to each argv element."""
         return [self.path(str(s)) for s in items]

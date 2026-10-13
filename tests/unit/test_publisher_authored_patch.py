@@ -835,3 +835,22 @@ def test_an_abstained_in_place_commit_is_recorded(tmp_path, repo):
     record = json.loads((run_dir / "publish-abstain.json").read_text())
     assert record["reason"].startswith("publish-")
     assert _head(repo) == base
+
+
+def test_transcript_replay_of_a_remote_implementer_maps_sandbox_paths(tmp_path, repo):
+    """Under --placement remote the implementer's Edit names the sandbox path;
+    the run's own roots map it back, so a verified remote run publishes
+    instead of abstaining publish-no-authored-patch (Daytona e2e
+    run-1791914481-48337)."""
+    base = _head(repo)
+    run_dir = _make_run_dir(
+        tmp_path, repo, base, scope=["a.py"],
+        edits=[("Edit", {"file_path": "/workspace/target/a.py",
+                         "old_string": "line2\n", "new_string": "line2-run\n"})],
+    )
+    (repo / "a.py").write_text(BASE_A.replace("line2", "line2-run"))
+
+    authored = resolve_authored_patch(str(run_dir))
+    assert isinstance(authored, AuthoredPatch), authored
+    assert authored.source == "transcript-replay"
+    assert "line2-run" in authored.patch_text

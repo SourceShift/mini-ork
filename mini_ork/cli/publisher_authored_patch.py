@@ -547,6 +547,29 @@ def _record_ts(record: object) -> float | None:
         return None
 
 
+def _sandbox_to_host(run_real: str):
+    """``fp -> fp`` mapping a remote agent's sandbox paths back to the host.
+
+    Under ``--placement remote`` the implementer ran on a node and its
+    ``Write``/``Edit`` calls name ``/workspace/target/…``; read as-is, none
+    lived in the local repo, no edit replayed, and a verified run abstained
+    ``publish-no-authored-patch`` (Daytona e2e run-1791914481-48337). The run's
+    own pinned roots give the exact inverse of the map the dispatch applied.
+    A run without pinned roots maps nothing."""
+    if not run_real:
+        return lambda fp: fp
+    try:
+        from mini_ork.runtime.path_map import PathMap
+        from mini_ork.runtime.run_roots import load_run_roots
+
+        roots = load_run_roots(run_real)
+    except Exception:  # noqa: BLE001 — no roots, no translation
+        roots = None
+    if roots is None:
+        return lambda fp: fp
+    return PathMap.from_roots(roots).to_host
+
+
 def _collect_edits(path: str, real_repo: str, scope: list[str], run_real: str = "",
                    since: float | None = None):
     """Ordered in-repo, in-scope, non-failed (rel, tool, input) edits from a transcript.
@@ -563,6 +586,7 @@ def _collect_edits(path: str, real_repo: str, scope: list[str], run_real: str = 
     later rewrites the log, abstain ``publish-unattributable`` and blame a peer.
     """
     failed = _failed_tool_use_ids(path)
+    to_host = _sandbox_to_host(run_real)
     edits = []
     for record in _records_in(path):
         if since is not None:
@@ -577,7 +601,7 @@ def _collect_edits(path: str, real_repo: str, scope: list[str], run_real: str = 
             fp = inp.get("file_path")
             if not isinstance(fp, str) or not fp:
                 continue
-            rel = _repo_rel(fp, real_repo)
+            rel = _repo_rel(to_host(fp), real_repo)
             if rel is None:
                 continue
             if run_real and _under(os.path.join(real_repo, rel), run_real):

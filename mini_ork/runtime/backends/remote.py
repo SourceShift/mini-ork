@@ -329,6 +329,34 @@ class _NodeRef(NamedTuple):
     headers: Mapping[str, str] = {}
 
 
+class _LineTee:
+    """Assemble a stream's arbitrary byte ranges into whole lines for the live
+    sidecar. The node-agent streams stdout in chunks cut at any byte; teed
+    as-is, one stream-json event spanned several records and nothing parsing
+    the sidecar (the publisher's authored-patch replay among them) could read
+    the agent's tool calls (Daytona e2e run-1791914481-48337). The local spawn
+    already tees line by line; this gives the remote path the same contract."""
+
+    def __init__(self, writer: LiveWriter | None, stream: str) -> None:
+        self._writer = writer
+        self._stream = stream
+        self._buf = ""
+
+    def feed(self, data: str) -> None:
+        if self._writer is None or not data:
+            return
+        self._buf += data
+        *lines, self._buf = self._buf.split("\n")
+        for line in lines:
+            self._writer.write_line(line, self._stream)
+
+    def flush(self) -> None:
+        """Emit a trailing fragment that never got its newline, flagged."""
+        if self._writer is not None and self._buf:
+            self._writer.write_line(self._buf, self._stream, partial=True)
+        self._buf = ""
+
+
 class RemoteWorkspace:
     """A ``Workspace`` whose verbs drive a remote node-agent over HTTP.
 
@@ -1275,6 +1303,8 @@ class RemoteWorkspace:
         even on a hard restart."""
         out = io.StringIO()
         err = io.StringIO()
+        out_tee = _LineTee(live_writer, "stdout")
+        err_tee = _LineTee(live_writer, "stderr")
         out_off = 0  # byte offset of next expected stdout chunk (utf-8 encoded)
         err_off = 0  # byte offset of next expected stderr chunk
         # remote-nodes-09 §4: client-side deadline is ``timeout_s`` PLUS
@@ -1325,6 +1355,8 @@ class RemoteWorkspace:
                             idempotency_key=idempotency_key,
                             state="detached", rc=_TIMEOUT_RC, ended_at=int(time.time()),
                         )
+                    out_tee.flush()
+                    err_tee.flush()
                     return _TIMEOUT_RC, out.getvalue(), (
                         err.getvalue() + "\ninfra_interruption: reconnect window exceeded"
                     ).lstrip()
@@ -1383,14 +1415,12 @@ class RemoteWorkspace:
                 if stream == "out":
                     out.write(data)
                     out_off += len(data.encode("utf-8", "replace"))
-                    if live_writer is not None and data:
-                        live_writer.write_line(data, "stdout", partial=not data.endswith("\n"))
+                    out_tee.feed(data)
                     got_data = True
                 elif stream == "err":
                     err.write(data)
                     err_off += len(data.encode("utf-8", "replace"))
-                    if live_writer is not None and data:
-                        live_writer.write_line(data, "stderr", partial=not data.endswith("\n"))
+                    err_tee.feed(data)
                     got_data = True
                 elif stream == "exit":
                     last_state = str(msg.get("state", ""))
@@ -1405,6 +1435,8 @@ class RemoteWorkspace:
                         last_rc = _TIMEOUT_RC
                     if last_state == "spawn_failed":
                         last_rc = _SPAWN_FAILED_RC
+                    out_tee.flush()
+                    err_tee.flush()
                     return last_rc, out.getvalue(), err.getvalue()
 
             # Checkpoint offsets every N seconds so a hard restart still has a
@@ -1421,6 +1453,8 @@ class RemoteWorkspace:
                 # caller is willing to wait for the server's own kill to take
                 # effect.
                 self._kill_proc(pid)
+                out_tee.flush()
+                err_tee.flush()
                 return _TIMEOUT_RC, out.getvalue(), (
                     err.getvalue() + f"\ntimeout after {timeout}s"
                 ).lstrip()

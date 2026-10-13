@@ -823,3 +823,27 @@ def test_killed_exit_record_without_rc_maps_to_137():
     ws._request = lambda *a, **k: body  # type: ignore[method-assign]
     rc, out, err = ws._drain_stream(7, 30)
     assert rc == 137 and "partial" in out
+
+
+def test_remote_live_tee_assembles_whole_lines_across_chunks():
+    """The node-agent streams stdout cut at arbitrary bytes; the sidecar gets
+    one record per whole line, and a trailing fragment flushed as partial
+    (Daytona e2e run-1791914481-48337: 169 of 205 records were fragments)."""
+    from mini_ork.runtime.backends.remote import _LineTee
+
+    got: list[tuple[str, str, bool]] = []
+
+    class _W:
+        def write_line(self, line, stream="stdout", *, partial=False):
+            got.append((line, stream, partial))
+
+    tee = _LineTee(_W(), "stdout")
+    event = '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit"}]}}'
+    payload = event + "\n" + '{"type":"result"}' + "\n" + "tail-without-newline"
+    for i in range(0, len(payload), 7):            # 7-byte chunks split every line
+        tee.feed(payload[i:i + 7])
+    tee.flush()
+    assert got == [(event, "stdout", False), ('{"type":"result"}', "stdout", False),
+                   ("tail-without-newline", "stdout", True)]
+    tee.flush()                                     # idempotent
+    assert len(got) == 3

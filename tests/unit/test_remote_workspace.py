@@ -313,10 +313,14 @@ def test_node_agent_down_raises_remote_unavailable_no_local_subprocess(monkeypat
     # a git checkout). The contract we ASSERT here is that NO subprocess was
     # started that resembles a host-side fallback (no ``echo``, no
     # ``sh -c``). Filter for that.
-    fallback_calls = [
-        c for c in calls
-        if any("sh" in str(p) or "echo" in str(p) or "spawn" in str(p) for p in c[0][:1])
-    ]
+    # Match the PROGRAM, not a substring of the argv: a checkout path such as
+    # ".../publisher-remote-replay" contains "sh" and false-flagged the
+    # engine-sha git calls.
+    def _program(call):
+        argv = call[0][0] if call[0] else []
+        return os.path.basename(str(argv[0] if isinstance(argv, (list, tuple)) and argv else argv))
+
+    fallback_calls = [c for c in calls if _program(c) in {"sh", "bash", "zsh", "echo"}]
     assert fallback_calls == [], fallback_calls
 
 
