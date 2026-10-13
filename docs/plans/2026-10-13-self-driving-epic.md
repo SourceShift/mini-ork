@@ -102,6 +102,20 @@ attempt must change the failure signature (existing no-progress rule).
 
 SDE-1 and SDE-2 touch disjoint files and run in parallel.
 
+### Progress
+
+- **SDE-1 merged** (`f791a160`; pass 1 + one repair). Live replay over the 50
+  most recent failed runs: unclassified 54% → 22%; exactly one `engine`
+  diagnosis — `run-1791914481-48337`, `routes_to: fix_epic`.
+- **SDE-2 merged** (`73a11cde`; pass 1 + one repair). The auto-triage origin is
+  read from the pre-run kickoff snapshot; sha drift fails closed.
+  `escalation_policy.py` is a forward-declared frozen path — the commit that
+  adds it must drop it from `_PENDING_FROZEN_PATHS` in `test_frozen_kernel.py`.
+- **SDE-3 split:** `sde-3a-escalate` (wire the operator policy; diagnosis-driven
+  fix epic linked to the run; `waiting_on_fix`) then `sde-3b` (model diagnoser
+  for `unclassified`, outcome labels, LTT bar). 3a waits on the operator's
+  `should_escalate`.
+
 ## Two tiers
 
 - **Simple:** `mini-ork supervise --once` from cron/launchd or a foreground loop;
