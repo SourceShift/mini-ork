@@ -29,7 +29,7 @@ acceptable.
 from __future__ import annotations
 
 from mini_ork.pm import config as pm_config
-from mini_ork.pm.providers import github, local
+from mini_ork.pm.providers import github, linear, local
 from mini_ork.pm.registry import register_provider
 
 #: mini-ork's own epics. The one source that needs no config, no network and no
@@ -38,9 +38,11 @@ register_provider(local.provider())
 
 #: Adapters that need a ``SourceConfig``, keyed by the id they register under.
 #: The bare ``github`` id served a single repository first; a second repository
-#: is a second entry (``github-core``) with its own ``owner``/``repo``.
+#: is a second entry (``github-core``) with its own ``owner``/``repo``. A second
+#: Linear team is likewise a second entry (``linear-ops``) with its own ``team``.
 _CONFIGURED = {
     "github": github.GithubProvider,
+    "linear": linear.LinearProvider,
 }
 
 _SKIPPED: list[tuple[str, str]] = []
@@ -80,4 +82,4 @@ def _register_configured() -> None:
 
 _register_configured()
 
-__all__ = ["github", "local", "skipped_sources"]
+__all__ = ["github", "linear", "local", "skipped_sources"]

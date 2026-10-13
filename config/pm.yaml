@@ -59,9 +59,9 @@ sources:
 
   # A GitHub repository. One entry per repository: the source id is the
   # registry id, so `github` and `github-core` are two independent sources with
-  # their own token keys. `github` is the only one with an adapter so far, and
-  # it reads — create/update/comment are not implemented yet, so the board
-  # shows GitHub issues without offering a write it would refuse.
+  # their own token keys. The adapter reads — create/update/comment are not
+  # implemented yet, so the board shows GitHub issues without offering a write
+  # it would refuse.
   # github:
   #   enabled: true
   #   token_env: GITHUB_TOKEN     # a PAT; read-only (public_repo / repo:read)
@@ -72,10 +72,23 @@ sources:
   #   trigger_recipe: code-fix    # the recipe a launched run uses
   #   # webhook_secret_env: GITHUB_WEBHOOK_SECRET   # tier B: see INTAKE WEBHOOKS above
 
-  # linear:
-  #   enabled: false
-  #   token_env: LINEAR_API_KEY   # a personal API key, read-only is enough for the board
-  #   team: ENG                   # the team key the issues live in
+  # A Linear workspace, one entry per team. Same shape as the GitHub block —
+  # the source id is the registry id, so `linear` and `linear-ops` are two
+  # independent sources with their own token keys and their own `team`. It
+  # reads over Linear's GraphQL API (https://api.linear.app/graphql): issues
+  # are scoped to `team`, workflow states map onto the normalized states with
+  # Linear's own state name kept beside them, and priority uses Linear's
+  # 1-urgent..4-low numbering. Reads only, like GitHub, so the board offers no
+  # write the adapter would refuse. Shipped disabled — flip `enabled` to true
+  # once `LINEAR_API_KEY` resolves through the vault.
+  linear:
+    enabled: false
+    token_env: LINEAR_API_KEY   # a personal API key; a read-only key is enough
+    team: ENG                   # the team KEY the issues live in (as in ENG-123)
+    # api_url: https://linear.acme.dev/graphql   # a proxied or self-hosted endpoint
+    # trigger_label: agent        # uncomment to let intake start these tickets
+    # trigger_recipe: code-fix    # the recipe a launched run uses
+    # webhook_secret_env: LINEAR_WEBHOOK_SECRET   # tier B: see INTAKE WEBHOOKS above
 
   # jira:
   #   enabled: false
