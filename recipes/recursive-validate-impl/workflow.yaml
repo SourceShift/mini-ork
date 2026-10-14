@@ -56,8 +56,8 @@ edges:
 recursion:
   max_iterations: 5
   convergence_check: all_dod_probes_pass
-  budget_cap_per_iter_usd: 5.00
-  budget_cap_total_usd: 25.00
+  budget_cap_per_iter_usd: 20.00
+  budget_cap_total_usd: 60.00
   divergence_kill: |
     Iteration N+1 produces same verifier-fail signature as iteration N.
     Detected by hashing the failure-log sorted by stage. Two identical
