@@ -21,6 +21,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Mapping, Sequence
 
 from mini_ork import trace_store
 from mini_ork.context import (
@@ -34,6 +35,7 @@ from mini_ork.dispatch import agents_config, config_resolve, deadline_budget
 from mini_ork.dispatch.run_env import RunEnvError, load_run_env
 from mini_ork.dispatch.secrets import SecretStoreError
 from mini_ork.dispatch.vault import VaultError
+from mini_ork.features import gate_env
 from mini_ork.vcs import repo_integrity_guard
 from mini_ork.gates import rubric_prescreen
 from mini_ork.orchestration import concord_run
@@ -123,6 +125,8 @@ Recipe runner:
   run <kickoff.md>               Classify kickoff, resolve recipe, then walk
                                    classify → plan → execute → verify
   run <recipe-name> <kickoff.md> Force a recipe, then walk the same lifecycle
+  run … --set K=V                Repeatable env override; premium feature knobs
+                                   are dropped unless MO_ACCEPT_PREMIUM=1
 
 Self-improvement:
   self-improve                   Recursive self-improvement of this checkout in a
@@ -205,6 +209,10 @@ _REFLECT_TIMEOUT_FALLBACK = 360
 _REFLECT_TIMEOUT_HEADROOM = 3
 _REFLECT_TIMEOUT_CEILING = 21600
 _REFLECT_TIMEOUT_SAMPLE = 20
+# Slack added on top of the run's remaining --deadline when capping reflect:
+# enough for the child to notice the stop and flush its log, not enough to
+# meaningfully overshoot a budget the operator asked us to honour.
+_REFLECT_DEADLINE_GRACE = 120
 
 
 def _reflect_durations(db: str | None = None,
@@ -303,6 +311,42 @@ def _reflect_timeout_seconds() -> int:
     return type it binds to stay as they are.
     """
     return _reflect_timeout()[0]
+
+
+def _cap_reflect_to_deadline(bound: int, why: str, *,
+                            deadline_seconds: int,
+                            remaining_seconds: int,
+                            hit: bool) -> tuple[int, str]:
+    """``(seconds, why)`` — ``bound`` tightened to the run's remaining deadline.
+
+    ``--deadline N`` is the operator's statement of how long the whole run may
+    take, and the derived reflect bound (see ``_reflect_timeout``) knows nothing
+    about it: a home that once recorded a 5538 s pass can hand reflect a bound
+    far larger than the deadline the caller just asked us to honour. Reflect
+    still runs post-verdict, so shortening it cannot change the outcome — it
+    only stops the tail of a run from overshooting a budget that was set
+    deliberately.
+
+    Pure by construction: no I/O, no env reads, no ``deadline_budget`` call.
+    The call site owns the (guarded, best-effort) status lookup and hands the
+    three numbers in, which is what makes this testable without a live run.
+    ``deadline_seconds <= 0`` means no deadline was armed, so the bound is
+    returned untouched along with its original reason. Otherwise the cap is the
+    remaining budget (never negative — a spent or already-tripped deadline caps
+    at the grace alone) plus ``_REFLECT_DEADLINE_GRACE``; a cap that would not
+    actually shorten the bound leaves it — and its reason — alone. When it does
+    bite, the reason names the rule and keeps the original derivation after the
+    semicolon so the log line is still readable back.
+    """
+    if deadline_seconds <= 0:
+        return bound, why
+    capped = max(0, remaining_seconds) + _REFLECT_DEADLINE_GRACE
+    if capped >= bound:
+        return bound, why
+    note = "capped to the --deadline remainder"
+    if hit:
+        note += " (deadline already hit)"
+    return capped, f"{note} (+{_REFLECT_DEADLINE_GRACE}s grace); {why}"
 
 
 def engine_version(root: str | None = None) -> str:
@@ -1019,12 +1063,42 @@ def _budget_preflight(sink) -> int | None:
     return RC_BLOCKED
 
 
+def _gate_set_overrides(
+    pairs: Sequence[str], base_env: Mapping[str, str]
+) -> tuple[dict[str, str], list[str], str]:
+    """Parse repeatable ``--set K=V`` values and strip premium feature knobs.
+
+    Pure — no I/O — so the ``run`` flag is unit-testable without driving the
+    lifecycle. Returns ``(filtered_env, blocked_feature_ids, error)``:
+
+    * a pair without ``=`` yields ``({}, [], "--set requires K=V")`` and the
+      caller writes ``error`` to stderr and returns 2;
+    * otherwise the merged overrides go through
+      :func:`mini_ork.features.gate_env`, with ``accept_premium`` read from the
+      pairs overlaid on ``base_env`` — so ``--set MO_ACCEPT_PREMIUM=1`` unlocks
+      premium in the same invocation — and ``blocked_feature_ids`` names any
+      premium feature whose knobs were dropped.
+    """
+    overrides: dict[str, str] = {}
+    for pair in pairs:
+        key, sep, value = pair.partition("=")
+        if not sep:
+            return {}, [], "--set requires K=V"
+        overrides[key] = value
+    accept = overrides.get(
+        "MO_ACCEPT_PREMIUM", base_env.get("MO_ACCEPT_PREMIUM", "")
+    ) not in ("", "0")
+    filtered, blocked = gate_env(overrides, accept_premium=bool(accept))
+    return filtered, blocked, ""
+
+
 def _run_lifecycle_impl(argv, root, sink) -> int:
     t0 = int(time.time())
-    # ── flag pre-parse: pull --deadline / --placement / --env out ──
+    # ── flag pre-parse: pull --deadline / --placement / --env / --set out ──
     deadline = ""
     placement = ""
     node_env = ""
+    set_pairs: list[str] = []
     rest = []
     i = 0
     while i < len(argv):
@@ -1059,8 +1133,29 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
             node_env = argv[i + 1]; i += 2
         elif a.startswith("--env="):
             node_env = a.split("=", 1)[1]; i += 1
+        elif a == "--set":
+            if i + 1 >= len(argv):
+                sys.stderr.write("--set requires K=V\n"); return 2
+            set_pairs.append(argv[i + 1]); i += 2
+        elif a.startswith("--set="):
+            set_pairs.append(a.split("=", 1)[1]); i += 1
         else:
             rest.append(a); i += 1
+
+    # ── --set K=V: parse, gate premium knobs, publish before recipe resolution ──
+    # The filtered overrides are published here so dispatch, the session factory
+    # and gen_profile all read them; a blocked premium feature is announced once
+    # and the run continues with the survivors (never an abort).
+    if set_pairs:
+        set_env, blocked, set_err = _gate_set_overrides(set_pairs, context_env_snapshot())
+        if set_err:
+            sys.stderr.write(set_err + "\n"); return 2
+        if blocked:
+            sys.stderr.write(
+                "mini-ork: premium feature(s) not enabled: " + ", ".join(blocked)
+                + " — set MO_ACCEPT_PREMIUM=1 to enable premium features\n")
+        if set_env:
+            publish_env(set_env)
 
     # remote-nodes-14 §1: the flag wins over MO_PLACEMENT / MO_NODE_ENV; the
     # resolved values are published so dispatch, the session factory and
@@ -1453,6 +1548,22 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
         sys.stdout.write("── reflect (auto, since run start) ──\n")
         reflect_db = context_env("MINI_ORK_DB") or os.path.join(home, "state.db")
         reflect_bound, reflect_bound_why = _reflect_timeout(reflect_db)
+        # Tighten that derived bound to what is left of the run's --deadline:
+        # reflect runs post-verdict, so it must not be the stage that blows a
+        # budget the caller set. Best-effort — an unarmed deadline or an
+        # unreadable status leaves the derived bound alone rather than wedging
+        # the child on a failed cap.
+        if deadline and int(deadline) > 0:
+            try:
+                st = deadline_budget.status(run_id)
+                reflect_bound, reflect_bound_why = _cap_reflect_to_deadline(
+                    reflect_bound, reflect_bound_why,
+                    deadline_seconds=int(deadline),
+                    remaining_seconds=int(st.get("remaining_seconds", 0) or 0),
+                    hit=bool(st.get("hit", False)),
+                )
+            except Exception:  # noqa: BLE001
+                pass
         # The child's output used to go into a pipe that was discarded on
         # return, so a reflect that died mid-pipeline left no evidence of where
         # it died — the researcher home's 1930 leaked 'running' rows are all

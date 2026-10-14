@@ -128,3 +128,34 @@ def test_nonempty_dir_is_present(tmp_path):
     d.mkdir()
     (d / "a.json").write_text("{}")
     assert _run_local_output_status(str(d), "spec-cards", str(tmp_path)) == "present"
+
+
+def test_angle_bracket_template_in_a_subdirectory_matches(tmp_path):
+    """spec-driven-delivery's contract names ``spec-cards/<spec_id>.json``: the
+    family lives in a subdirectory and the placeholder uses angle brackets.
+    Treating it as a literal path failed run-1791884666-31084's publisher after
+    all four of its deliverables had delivered."""
+    cards = tmp_path / "spec-cards"
+    cards.mkdir()
+    for spec in ("b1-recipe", "b2-runner"):
+        (cards / f"{spec}.json").write_text("{}")
+    dst = cards / "<spec_id>.json"  # literal — never exists
+    assert _run_local_output_status(
+        str(dst), "${MINI_ORK_RUN_DIR}/spec-cards/<spec_id>.json", str(tmp_path)) == "glob_present"
+
+
+def test_angle_bracket_template_with_no_match_still_fails(tmp_path):
+    (tmp_path / "spec-cards").mkdir()
+    dst = tmp_path / "spec-cards" / "<spec_id>.json"
+    assert _run_local_output_status(
+        str(dst), "${MINI_ORK_RUN_DIR}/spec-cards/<spec_id>.json", str(tmp_path)) == "missing"
+
+
+def test_a_template_matches_only_its_own_directory(tmp_path):
+    """A matching name at the run dir's top level does not satisfy a template
+    that names a subdirectory."""
+    (tmp_path / "b1-recipe.json").write_text("{}")
+    (tmp_path / "gates").mkdir()
+    dst = tmp_path / "gates" / "<spec_id>.json"
+    assert _run_local_output_status(
+        str(dst), "${MINI_ORK_RUN_DIR}/gates/<spec_id>.json", str(tmp_path)) == "missing"

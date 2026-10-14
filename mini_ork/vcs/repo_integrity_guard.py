@@ -14,8 +14,134 @@ test can pin the TSV recovery-log timestamp.
 """
 from __future__ import annotations
 
+import fnmatch
 import os
 import subprocess
+
+# ── frozen kernel ───────────────────────────────────────────────────────────
+# The paths an auto-opened (origin=auto-triage) framework-edit epic may never
+# change: the escalation policy, the circuit breaker, the budget pause, the
+# abstention gate, the sandbox, the integrity guard, the verifier that enforces
+# all of this, and the list itself. This built-in list is the FLOOR: it is the
+# fail-closed fallback for a missing/unparsable ``config/kernel-frozen.yaml`` and
+# the guaranteed minimum every consumer unions with the file, so a diff can never
+# unfreeze a path by editing (or deleting) the list.
+FROZEN_CONFIG_RELPATH = os.path.join("config", "kernel-frozen.yaml")
+
+FROZEN_PATHS_DEFAULT: list[str] = [
+    "config/kernel-frozen.yaml",
+    "recipes/framework-edit/verifiers/static-check.py",
+    "mini_ork/vcs/repo_integrity_guard.py",
+    "mini_ork/runtime/sandbox.py",
+    "mini_ork/gates/gate_bootstrap.py",
+    "mini_ork/gates/abstain_gate.py",
+    "mini_ork/recovery/circuit_breaker.py",
+    # The escalation policy. escalation_policy.py is a FORWARD DECLARATION — the
+    # operator-owned module that admits auto fix epics lands in a later step;
+    # until it does, the decision is made at calibration.should_escalate,
+    # auto_repair._escalate_lane, policies.engine.verifier_failure_escalation.
+    "mini_ork/recovery/escalation_policy.py",
+    "mini_ork/dispatch/calibration.py",
+    "mini_ork/recovery/auto_repair.py",
+    "mini_ork/policies/engine.py",
+    "mini_ork/dispatch/cost_pause.py",
+    "mini_ork/stores/safety_events.py",
+    "mini_ork/observability/bug_report.py",
+]
+
+
+def _extract_paths(data: object) -> list[str]:
+    """Pull the ``paths:`` list out of a parsed kernel-frozen document.
+
+    A document that is not a mapping, has no ``paths`` key, or whose ``paths`` is
+    not a list of strings yields ``[]`` — the caller then falls back to the
+    built-in default rather than treating a malformed file as "no frozen paths"."""
+    if not isinstance(data, dict):
+        return []
+    paths = data.get("paths")
+    if not isinstance(paths, list):
+        return []
+    out = [p for p in paths if isinstance(p, str) and p.strip()]
+    return out
+
+
+def _minimal_parse(text: str) -> list[str]:
+    """Last-resort ``paths:`` extractor for when PyYAML is unavailable.
+
+    Reads the indented ``- <path>`` block under a ``paths:`` key. Deliberately
+    narrow: anything it cannot make sense of returns ``[]`` so the caller fails
+    closed to the built-in default."""
+    out: list[str] = []
+    in_paths = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if not line.startswith("- "):
+            in_paths = line == "paths:"
+            continue
+        if in_paths:
+            item = line[2:].strip().strip("'\"")
+            if item:
+                out.append(item)
+    return out
+
+
+def parse_frozen_paths(text: str) -> list[str]:
+    """Parse the frozen-path list from a kernel-frozen document string.
+
+    Returns the parsed paths, or ``[]`` when the text is empty/unparsable. The
+    pure-parse entry point (no filesystem, no fallback) exists so callers that
+    already hold the text — e.g. ``git show HEAD:config/kernel-frozen.yaml`` —
+    and callers deciding on a missing file can share one grammar."""
+    if not text or not text.strip():
+        return []
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return _minimal_parse(text)
+    try:
+        data = yaml.safe_load(text)
+    except Exception:
+        return _minimal_parse(text)
+    return _extract_paths(data)
+
+
+def load_frozen_paths(root: str) -> list[str]:
+    """Read ``<root>/config/kernel-frozen.yaml``; fail closed to the built-in list.
+
+    A missing, unreadable, empty, or unparsable file returns a copy of
+    ``FROZEN_PATHS_DEFAULT`` — never an empty list. Callers that want the file's
+    entries *in addition to* the guaranteed floor should union the two."""
+    path = os.path.join(str(root), FROZEN_CONFIG_RELPATH)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return list(FROZEN_PATHS_DEFAULT)
+    parsed = parse_frozen_paths(text)
+    if not parsed:
+        return list(FROZEN_PATHS_DEFAULT)
+    return parsed
+
+
+def frozen_hits(changed: list[str], patterns: list[str]) -> list[str]:
+    """Return the ``changed`` paths matching any frozen ``patterns`` (fnmatch).
+
+    Order-preserving and de-duplicated so callers can report the offending paths
+    verbatim. An empty ``patterns`` list yields ``[]`` — callers must pass the
+    fail-closed list, not an empty one."""
+    hits: list[str] = []
+    seen: set[str] = set()
+    for path in changed:
+        if path in seen:
+            continue
+        for pat in patterns:
+            if fnmatch.fnmatch(path, pat):
+                hits.append(path)
+                seen.add(path)
+                break
+    return hits
 
 
 def _git(cwd, *args) -> tuple[str, int]:

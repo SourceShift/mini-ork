@@ -348,6 +348,24 @@ def _first_finding(run_dir: Path) -> str:
     return ""
 
 
+def _escalation(run_dir: Path) -> str:
+    """The reviewer's stated action when its latest verdict is ESCALATE, else "".
+
+    ``review-verdict.json`` is rewritten by every reviewer/synth round, so it is
+    the verdict that failed the run, not an earlier round's.
+    """
+    data = _read_json(run_dir / "review-verdict.json")
+    if not isinstance(data, dict) or str(data.get("verdict") or "").strip().lower() != "escalate":
+        return ""
+    for key in ("next_action_recommended", "reasons", "notes"):
+        value = data.get(key)
+        if isinstance(value, list):
+            value = next((str(item) for item in value if str(item).strip()), "")
+        if value and str(value).strip():
+            return str(value).strip()[:300]
+    return "the reviewer asked for a person"
+
+
 def _signature(failed_node: str | None, reason: str, finding: str) -> str:
     raw = f"{failed_node or ''}|{reason or ''}|{finding or ''}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
@@ -380,10 +398,34 @@ def decide(home: Path, run_id: str) -> dict[str, Any]:
     """Pure policy — the repair decision for ``run_id`` (no side effects).
 
     Returns ``{"action", "from_node", "lanes", "ack_change", "feedback",
-    "reason", "signature"}``. ``action`` is one of ``none``, ``human``, ``lane``,
-    ``infra``, ``reverify``, ``prove`` or ``revise``. First match wins; the rule
-    order is the kickoff's policy table.
+    "reason", "signature", "diagnosis"}``. ``action`` is one of ``none``,
+    ``human``, ``lane``, ``infra``, ``reverify``, ``prove`` or ``revise``.
+    First match wins; the rule order is the kickoff's policy table.
+
+    ``diagnosis`` is ADDITIVE and never load-bearing: the typed
+    layer/stage/node naming of *who owns this failure*
+    (:func:`mini_ork.recovery.diagnose.diagnose`). It refines the rule-8
+    reason text and rides along into ``repair.json``; it changes no action.
+
+    Computed with ``write=False`` so ``decide`` stays side-effect-free — a
+    ``--dry-run`` sweep must leave the run dir untouched. :func:`apply` is the
+    half that persists it (``<run_dir>/diagnosis.json``).
     """
+    home = Path(home)
+    run_id = str(run_id)
+    try:
+        from mini_ork.recovery.diagnose import diagnose
+        diagnosis: dict[str, Any] | None = diagnose(home, run_id, write=False)
+    except Exception:  # noqa: BLE001 — a diagnosis failure must never break the loop
+        diagnosis = None
+    decision = _decide_policy(home, run_id, diagnosis)
+    decision["diagnosis"] = diagnosis
+    return decision
+
+
+def _decide_policy(home: Path, run_id: str,
+                   diagnosis: dict[str, Any] | None) -> dict[str, Any]:
+    """``decide``'s rule table. ``diagnosis`` is advisory (rule 8's reason)."""
     home = Path(home)
     if context_env("MO_AUTO_REPAIR", "1") == "0":
         return _decision("none", reason="auto-repair disabled (MO_AUTO_REPAIR=0)")
@@ -544,8 +586,20 @@ def decide(home: Path, run_id: str) -> dict[str, Any]:
             signature=signature,
         )
 
-    # 6. Code: revision exhausted → send the implementer back with the errors.
     node_type = _node_type(home, recipe, failed_node)
+
+    # 5.5 The reviewer ESCALATED: it judged the code right and the wall one only
+    # a person can clear (an unapplied migration, a spec or scope decision). A
+    # revise round re-implements code the reviewer called correct and meets the
+    # same wall — the researcher home's cjd-dfy-b3 / bhq-p7 and the RVI panels of
+    # c2 / w1 / m2a each burned one before reaching a human.
+    if node_type == "reviewer":
+        escalation = _escalation(run_dir)
+        if escalation:
+            return _decision("human", from_node=failed_node, signature=signature,
+                             reason=f"the reviewer escalated: {escalation}")
+
+    # 6. Code: revision exhausted → send the implementer back with the errors.
     if hint_kind == "code" or node_type in ("reviewer", "verifier", "eval") \
             or str(fail_reason).lower() in _FAIL_VERDICTS:
         impl = _first_node_of_type(home, recipe, "implementer")
@@ -564,10 +618,17 @@ def decide(home: Path, run_id: str) -> dict[str, Any]:
         return _decision("human", from_node=failed_node, signature=signature,
                          reason=f"owner-only fix required ({hint_kind})")
 
-    # 8. Anything else — hand over with the hint summary + last log lines.
+    # 8. Anything else — hand over with the diagnosis summary when it localised
+    # the failure (a named layer/stage/node reads better than a bare hint
+    # summary), else the hint summary + last log lines. The diagnosis refines
+    # the REASON only: the action and the stop rules are untouched.
+    from mini_ork.recovery.diagnose import LAYER_UNCLASSIFIED
     summary = str((hint or {}).get("needs_change", {}).get("summary", "")) \
         if isinstance(hint, dict) and isinstance(hint.get("needs_change"), dict) else ""
     reason = summary or str((hint or {}).get("notes") or "unclassified failure")
+    if isinstance(diagnosis, dict) and diagnosis.get("summary") \
+            and str(diagnosis.get("layer") or "") not in ("", LAYER_UNCLASSIFIED):
+        reason = str(diagnosis["summary"])
     return _decision("human", from_node=failed_node or (str((hint or {}).get("failed_node") or "") or None),
                      signature=signature, reason=reason or "unclassified failure")
 
@@ -884,6 +945,17 @@ def apply(home: Path, run_id: str, decision: dict[str, Any], *,
         "reason": decision.get("reason") or "",
         "signature": decision.get("signature") or "",
     }
+    # The typed diagnosis rides along with the attempt: ``repair.json`` then
+    # records not only what was tried but who owned the failure. Compact — the
+    # evidence list is deliberately left in ``diagnosis.json``, which ``apply``
+    # (the side-effecting half) persists here; ``decide`` stays pure.
+    dx = decision.get("diagnosis")
+    if isinstance(dx, dict):
+        from mini_ork.recovery.diagnose import write_diagnosis
+        write_diagnosis(home, run_id, dx)
+        attempt["diagnosis"] = {k: dx.get(k) for k in
+                                ("rule_id", "layer", "stage", "node",
+                                 "confidence", "routes_to", "summary")}
     prior_attempts = len(attempts)
     attempts.append(attempt)
     repair["attempts"] = attempts

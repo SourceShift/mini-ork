@@ -37,6 +37,48 @@ if _engine not in sys.path:
 from _verdict_merge import write_verdict  # noqa: E402
 from mini_ork.verify.pm import run_argv  # noqa: E402
 
+# The frozen-kernel guard logic + its built-in default list live in the engine
+# (mini_ork/vcs/repo_integrity_guard.py) so the verifier and the apply boundary
+# share one definition. If the engine predates it, fall back to an inline copy of
+# the floor — a stale engine must still refuse, never silently pass.
+try:  # noqa: E402
+    from mini_ork.vcs.repo_integrity_guard import (  # noqa: E402
+        FROZEN_CONFIG_RELPATH,
+        FROZEN_PATHS_DEFAULT,
+        frozen_hits,
+        load_frozen_paths,
+        parse_frozen_paths,
+    )
+except Exception:  # noqa: BLE001
+    import fnmatch as _fnmatch  # noqa: E402
+
+    FROZEN_CONFIG_RELPATH = os.path.join("config", "kernel-frozen.yaml")
+    FROZEN_PATHS_DEFAULT = [
+        "config/kernel-frozen.yaml",
+        "recipes/framework-edit/verifiers/static-check.py",
+        "mini_ork/vcs/repo_integrity_guard.py",
+        "mini_ork/runtime/sandbox.py",
+        "mini_ork/gates/gate_bootstrap.py",
+        "mini_ork/gates/abstain_gate.py",
+        "mini_ork/recovery/circuit_breaker.py",
+        "mini_ork/recovery/escalation_policy.py",
+        "mini_ork/dispatch/calibration.py",
+        "mini_ork/recovery/auto_repair.py",
+        "mini_ork/policies/engine.py",
+        "mini_ork/dispatch/cost_pause.py",
+        "mini_ork/stores/safety_events.py",
+        "mini_ork/observability/bug_report.py",
+    ]
+
+    def parse_frozen_paths(text):  # type: ignore[misc]
+        return []
+
+    def load_frozen_paths(root):  # type: ignore[misc]
+        return list(FROZEN_PATHS_DEFAULT)
+
+    def frozen_hits(changed, patterns):  # type: ignore[misc]
+        return [c for c in changed if any(_fnmatch.fnmatch(c, p) for p in patterns)]
+
 RUN_DIR = os.environ["MINI_ORK_RUN_DIR"]
 
 
@@ -415,9 +457,191 @@ def _typescript_typecheck():
 _check("typescript-typecheck-or-explicit-skip", "run typecheck when TS/TSX files changed", _typescript_typecheck)
 
 
+ORIGIN_MARKER = "<!-- mini-ork:origin=auto-triage -->"
+
+
+def _run_kickoff_candidates():
+    """The run's kickoff file, most authoritative source first.
+
+    ``run_profile.json`` records ``kickoff_path`` — the file the pipeline itself
+    read (``mini_ork/cli/execute.py``; ``context_v2.pack_for_run`` embeds THIS
+    file's text into the context pack). The runtime never writes a run-local
+    ``kickoff.md``, so that path is a fallback for hand-run fixtures only."""
+    out = []
+    profile = os.path.join(RUN_DIR, "run_profile.json")
+    try:
+        with open(profile, encoding="utf-8") as fh:
+            data = json.load(fh)
+        kp = data.get("kickoff_path") if isinstance(data, dict) else None
+        if isinstance(kp, str) and kp.strip():
+            out.append(kp)
+    except (OSError, ValueError):
+        pass
+    out.append(os.path.join(RUN_DIR, "kickoff.md"))
+    return out
+
+
+def _first_line_is_marker(text):
+    """True iff ``text``'s FIRST line carries the auto-triage origin marker.
+
+    ``startswith`` on the first line, never a substring test: a human-authored
+    kickoff that merely QUOTES the marker further down its spec text — this
+    repo's own kickoffs do — must still read as human, or the guard would fire
+    on legitimate operator runs. A leading BOM is tolerated as in the file read."""
+    first = text.split("\n", 1)[0] if text else ""
+    return first.lstrip("\ufeff").strip().startswith(ORIGIN_MARKER)
+
+
+def _read_kickoff():
+    """``(first_line, sha256_hex)`` of the first READABLE kickoff candidate.
+
+    The candidates are ``run_profile.json``'s ``kickoff_path`` first, then the
+    run-local ``kickoff.md`` (``_run_kickoff_candidates``) — never
+    ``context-pack.json``, which re-embeds the kickoff text and holds other
+    copies, so sniffing it would let an unrelated string re-classify a run.
+    Returns ``("", "")`` when no candidate is readable: a run with no kickoff
+    file at all, which neither the marker nor a sha drift can match."""
+    for path in _run_kickoff_candidates():
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            continue
+        return (data.decode("utf-8", "replace").split("\n", 1)[0],
+                hashlib.sha256(data).hexdigest())
+    return "", ""
+
+
+def _load_pack():
+    """The run's pre-run context-pack v2 (``{}`` when absent or unreadable).
+
+    The pack is the snapshot taken before any node ran. A missing one — context
+    v2 off, or a hand-run fixture — keeps the file-only behaviour: the snapshot
+    and sha-drift signals simply never fire. The import is local (the walk-up
+    sys.path above already made the engine importable) so a stale engine that
+    predates ``context_v2`` still refuses on the file."""
+    try:
+        from mini_ork import context_v2
+    except Exception:  # noqa: BLE001 — no pack: fall back to file-only sniffing
+        return {}
+    try:
+        return context_v2.load_pack(RUN_DIR) or {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+_KICKOFF_DRIFT_EVIDENCED = [False]
+
+
+def _evidence_kickoff_drift():
+    """Record, once, that the kickoff file changed since the run started.
+
+    The refusal reason is otherwise invisible: an auto-opened run that edits its
+    own kickoff to hide the marker produces the same FAIL row as one that never
+    carried it. The exact line is contractual."""
+    if _KICKOFF_DRIFT_EVIDENCED[0]:
+        return
+    _KICKOFF_DRIFT_EVIDENCED[0] = True
+    _ev.write("frozen-kernel: kickoff modified since run start\n")
+    _ev.flush()
+
+
+def _kickoff_is_auto_triage():
+    """True iff the run is auto-opened (origin=auto-triage). Fail closed: ANY of
+    three signals marks it.
+
+    1. the PRE-RUN SNAPSHOT — ``context-pack.v2.json``'s ``kickoff_snapshot``,
+       the contract the run RECEIVED, as its first line. Rewriting the kickoff
+       file afterwards cannot un-mark this one, which is the whole point: the
+       auto-promoted kickoffs live under the mini-ork repo's ``kickoffs/auto/``,
+       which an auto fix epic's implementer can write.
+    2. the kickoff FILE's first line (today's behaviour).
+    3. sha DRIFT — the pack recorded a ``kickoff_sha256`` that no longer matches
+       the file. A run that rewrote its own contract gets no human privileges,
+       and the drift is written to the evidence log.
+
+    A missing pack keeps today's file-only behaviour (1 and 3 stay inactive)."""
+    pack = _load_pack()
+    snapshot = pack.get("kickoff_snapshot")
+    if isinstance(snapshot, str) and _first_line_is_marker(snapshot):
+        return True
+    first_line, sha = _read_kickoff()
+    if _first_line_is_marker(first_line):
+        return True
+    recorded = pack.get("kickoff_sha256")
+    if isinstance(recorded, str) and recorded and sha and sha != recorded:
+        _evidence_kickoff_drift()
+        return True
+    return False
+
+
+def _target_committed_frozen_paths():
+    """The target's committed frozen list: ``git show HEAD:<relpath>``.
+
+    Read from the target's HEAD blob, never the working-tree copy the diff
+    modifies, so a diff cannot unfreeze a path by editing the list. Any failure
+    (no HEAD, absent file, git error) yields ``[]`` — the built-in default
+    still supplies the floor."""
+    r = subprocess.run(
+        ["git", "-C", REPO_ROOT, "show", f"HEAD:{FROZEN_CONFIG_RELPATH}"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    if r.returncode != 0:
+        return []
+    return parse_frozen_paths(r.stdout.decode("utf-8", "replace"))
+
+
+def _frozen_patterns():
+    """Engine built-in defaults ∪ engine checkout's file ∪ target HEAD's file.
+
+    Every source only ADDS paths, so deleting entries from ``kernel-frozen.yaml``
+    (in the diff or the checkout) cannot shrink the set below the engine's
+    built-in floor."""
+    pats = set(FROZEN_PATHS_DEFAULT)
+    pats.update(load_frozen_paths(_engine))
+    pats.update(_target_committed_frozen_paths())
+    return sorted(pats)
+
+
+def _emit_frozen_kernel_event(hits):
+    """Best-effort safety-event write for a frozen-kernel refusal.
+
+    A missing DB (the simple tier) or any other error is swallowed: recording
+    the refusal is a bonus, and an emit failure must NEVER turn the FAIL into a
+    pass. The check's return value is decided by the caller, not here."""
+    run_id = os.environ.get("MO_RUN_ID") or os.path.basename(RUN_DIR.rstrip(os.sep))
+    try:
+        from mini_ork.stores.safety_events import emit
+        emit("frozen-kernel-edit", "high",
+             json.dumps({"run_id": run_id, "paths": hits}),
+             run_id=run_id)
+    except Exception:  # noqa: BLE001 — best-effort, never fail the check open
+        pass
+
+
+def _frozen_kernel_guard():
+    """Refuse an auto-opened (origin=auto-triage) diff that touches a frozen path.
+
+    A human-authored kickoff (no marker) is unaffected: the legacy
+    high-blast-radius guard remains its only boundary. The ALLOW token can
+    NEVER unlock this check — it is not consulted at all."""
+    if not _kickoff_is_auto_triage():
+        return True
+    hits = frozen_hits(_changed_file_lines(), _frozen_patterns())
+    if not hits:
+        return True
+    _ev.write("frozen-kernel-refusal: " + ", ".join(hits) + "\n")
+    _ev.flush()
+    _emit_frozen_kernel_event(hits)
+    return False
+
+
 def _high_blast_radius_guard():
     if any(re.match(r"^(lib/circuit_breaker\.sh|lib/throttle-guard\.sh|\.mini-ork/config/)", f)
            for f in _changed_file_lines()):
+        # An auto-opened run never gets the token-unlock path: the marker means
+        # the evidence it carries is untrusted, so the legacy paths fail too.
+        if _kickoff_is_auto_triage():
+            return False
         # grep -R -q -E token RUN_DIR/context-pack.json RUN_DIR/kickoff.md
         pat = re.compile(r"(^|[^A-Z0-9_])ALLOW_HIGH_BLAST_RADIUS([^A-Z0-9_]|$)")
         for name in ("context-pack.json", "kickoff.md"):
@@ -432,6 +656,10 @@ def _high_blast_radius_guard():
 
 _check("high-blast-radius-guard", "high-blast-radius paths require explicit ALLOW_HIGH_BLAST_RADIUS token",
        _high_blast_radius_guard)
+
+_check("frozen-kernel-guard",
+       "an auto-opened (origin=auto-triage) run may not change frozen kernel paths",
+       _frozen_kernel_guard)
 
 # Build the changed-files list (static-check owns files_changed) and capture count.
 _changed_files()

@@ -1121,7 +1121,10 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
         if _req is not None:
             apply_env_overrides({"MINI_ORK_RECOVERY_REQUEST": _req[0]})
             _lease.mark_dispatched(db_path, _req[0], owner_token=_token, cost_usd=0.0)
-        apply_env_overrides({"MINI_ORK_LEASE_TOKEN": _token})
+        # The token fences THIS run only. Nested runs spawned by a node of the
+        # closure (SDD/epic children) inherit the env, so name the run the token
+        # belongs to; execute presents it only for that run.
+        apply_env_overrides({"MINI_ORK_LEASE_TOKEN": _token, "MINI_ORK_LEASE_RUN_ID": run_id})
 
     # ── Carry-patch restore (kickoff §3 fix 5). Runs AFTER the lease
     # block above so a refused second worker (another recovery is

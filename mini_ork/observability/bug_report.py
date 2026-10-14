@@ -538,7 +538,21 @@ def _render_promoted_kickoff(
     if task_class:
         context.append(f"- Originating task_class: `{task_class}`")
 
-    body: list[str] = [f"# Bug-promoted epic: {title}", ""]
+    body: list[str] = []
+
+    if recipe == _FRAMEWORK_EDIT_RECIPE:
+        # An auto-opened fix epic must never be able to edit the brakes that
+        # bound it. Stamp the origin as the first line so the framework-edit
+        # static verifier can tell an auto-promoted kickoff from an
+        # operator-authored one, and redact the legacy unlock token out of the
+        # evidence we embed — a promoted kickoff carries raw log excerpts, so a
+        # log line bearing ALLOW_HIGH_BLAST_RADIUS must not unlock anything.
+        body.append("<!-- mini-ork:origin=auto-triage -->")
+        body.append("")
+        desc = desc.replace("ALLOW_HIGH_BLAST_RADIUS", "<redacted-allow-token>")
+        fix = fix.replace("ALLOW_HIGH_BLAST_RADIUS", "<redacted-allow-token>")
+
+    body.extend([f"# Bug-promoted epic: {title}", ""])
 
     if recipe == _FRAMEWORK_EDIT_RECIPE:
         body.extend([

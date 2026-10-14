@@ -261,23 +261,29 @@ def _run_local_output_status(dst, out, run_dir, required=True):
       demanding them failed the publisher on a run where every gate APPROVED.
     - template paths like ``tier4-{family}.md`` name a FAMILY of files
       (tier4-glm.md, tier4-kimi.md, ...). The literal brace path never exists
-      on disk; the contract means "the pattern's matches in the run dir".
+      on disk; the contract means "the pattern's matches in that directory".
+      spec-driven-delivery writes the placeholder as ``<spec_id>`` and puts the
+      family in a subdirectory (``spec-cards/<spec_id>.json``); handling only
+      braces at the run dir's top level failed the publisher of every SDD
+      parent whose children all delivered (run-1791884666-31084).
     """
     if os.path.isfile(dst) and os.path.getsize(dst) > 0:
         return "present"
     if os.path.isdir(dst) and os.listdir(dst):
         return "present"
     base = os.path.basename(out)
-    parts = re.split(r"(\{[^{}]+\})", base)
-    if any(p.startswith("{") and p.endswith("}") for p in parts):
-        # fnmatch does NOT expand braces — translate {token} → [^/]+ ourselves.
-        pattern = "".join(
-            "[^/]+" if (p.startswith("{") and p.endswith("}")) else re.escape(p)
-            for p in parts
-        )
+    parts = re.split(r"(\{[^{}/]+\}|<[^<>/]+>)", base)
+
+    def _placeholder(part):
+        return (part.startswith("{") and part.endswith("}")) or \
+            (part.startswith("<") and part.endswith(">"))
+
+    if any(_placeholder(p) for p in parts):
+        # fnmatch does NOT expand braces — translate the token → [^/]+ ourselves.
+        pattern = "".join("[^/]+" if _placeholder(p) else re.escape(p) for p in parts)
         rx = re.compile(pattern + r"\Z")
         try:
-            names = os.listdir(run_dir)
+            names = os.listdir(os.path.dirname(dst) or run_dir)
         except OSError:
             names = []
         if any(rx.match(n) for n in names):
