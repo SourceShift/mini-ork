@@ -348,6 +348,24 @@ def _first_finding(run_dir: Path) -> str:
     return ""
 
 
+def _escalation(run_dir: Path) -> str:
+    """The reviewer's stated action when its latest verdict is ESCALATE, else "".
+
+    ``review-verdict.json`` is rewritten by every reviewer/synth round, so it is
+    the verdict that failed the run, not an earlier round's.
+    """
+    data = _read_json(run_dir / "review-verdict.json")
+    if not isinstance(data, dict) or str(data.get("verdict") or "").strip().lower() != "escalate":
+        return ""
+    for key in ("next_action_recommended", "reasons", "notes"):
+        value = data.get(key)
+        if isinstance(value, list):
+            value = next((str(item) for item in value if str(item).strip()), "")
+        if value and str(value).strip():
+            return str(value).strip()[:300]
+    return "the reviewer asked for a person"
+
+
 def _signature(failed_node: str | None, reason: str, finding: str) -> str:
     raw = f"{failed_node or ''}|{reason or ''}|{finding or ''}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
@@ -568,8 +586,20 @@ def _decide_policy(home: Path, run_id: str,
             signature=signature,
         )
 
-    # 6. Code: revision exhausted → send the implementer back with the errors.
     node_type = _node_type(home, recipe, failed_node)
+
+    # 5.5 The reviewer ESCALATED: it judged the code right and the wall one only
+    # a person can clear (an unapplied migration, a spec or scope decision). A
+    # revise round re-implements code the reviewer called correct and meets the
+    # same wall — the researcher home's cjd-dfy-b3 / bhq-p7 and the RVI panels of
+    # c2 / w1 / m2a each burned one before reaching a human.
+    if node_type == "reviewer":
+        escalation = _escalation(run_dir)
+        if escalation:
+            return _decision("human", from_node=failed_node, signature=signature,
+                             reason=f"the reviewer escalated: {escalation}")
+
+    # 6. Code: revision exhausted → send the implementer back with the errors.
     if hint_kind == "code" or node_type in ("reviewer", "verifier", "eval") \
             or str(fail_reason).lower() in _FAIL_VERDICTS:
         impl = _first_node_of_type(home, recipe, "implementer")

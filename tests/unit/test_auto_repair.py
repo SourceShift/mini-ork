@@ -788,3 +788,65 @@ def test_spawn_markers_do_not_leak_into_the_dispatched_execute(tmp_path, monkeyp
                       "--workflow", workflow, "--db", db], execute_fn=_exec)
     assert rc == 0
     assert seen == {"attempt": None, "run_id": None}
+
+
+# ── an ESCALATE verdict goes to a person, not to a revise round ──────────────
+
+
+def _seed_reviewer_failure(home: Path, finish_reason: str = "verdict_fail") -> None:
+    con = sqlite3.connect(home / "state.db")
+    con.execute(
+        "INSERT INTO run_events (event_id, run_id, event_type, payload_json, created_at) "
+        "VALUES (?,?,?,?,?)",
+        (f"{RUN}-reviewer-end", RUN, "node_end",
+         json.dumps({"node_id": "reviewer", "node_type": "reviewer",
+                     "finish_reason": finish_reason}), T0 + 50),
+    )
+    con.commit()
+    con.close()
+
+
+def test_reviewer_escalation_hands_the_run_to_a_person(home, monkeypatch, spawned):
+    run_dir = _seed(home)
+    _seed_reviewer_failure(home)
+    (run_dir / "review-verdict.json").write_text(json.dumps({
+        "verdict": "ESCALATE",
+        "next_action_recommended": "apply migration 011305 to the live DB, then re-run AC1",
+    }))
+    _stub_hint(monkeypatch, _hint(kind="code", summary="judged wrong", detail=""))
+
+    decision = ar.decide(home, RUN)
+
+    assert decision["action"] == "human"
+    assert decision["from_node"] == "reviewer"
+    assert "apply migration 011305" in decision["reason"]
+    ar.apply(home, RUN, decision)
+    assert _recover_spawns(spawned) == []
+
+
+def test_reviewer_escalation_reason_falls_back_to_its_notes(home, monkeypatch, spawned):
+    run_dir = _seed(home)
+    _seed_reviewer_failure(home)
+    (run_dir / "review-verdict.json").write_text(json.dumps({
+        "verdict": "escalate", "notes": ["", "the plan forbids running make migrate"],
+    }))
+    _stub_hint(monkeypatch, _hint(kind="code", summary="judged wrong", detail=""))
+
+    decision = ar.decide(home, RUN)
+
+    assert decision["action"] == "human"
+    assert "forbids running make migrate" in decision["reason"]
+
+
+def test_reviewer_needs_revision_with_events_still_revises(home, monkeypatch, spawned):
+    run_dir = _seed(home)
+    _seed_reviewer_failure(home, finish_reason="verdict_revise")
+    (run_dir / "review-verdict.json").write_text(json.dumps({
+        "verdict": "needs_revision", "notes": ["the grid columns are misaligned"],
+    }))
+    _stub_hint(monkeypatch, _hint(kind="code", summary="judged wrong", detail=""))
+
+    decision = ar.decide(home, RUN)
+
+    assert decision["action"] == "revise"
+    assert decision["from_node"] == "implementer"

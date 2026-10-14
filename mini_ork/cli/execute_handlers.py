@@ -1806,7 +1806,11 @@ def _handle_reviewer(ctx: NodeDispatch):
         prompt = (f"{ctx.prepend()}Review the implementation for: {ctx.node_desc}{ctx.learned}\n\n"
                   f"Plan:\n{ctx.plan_content}{ctx.artifact_context}{ctx.scope_guard()}\n\n{reviewer_inputs}\n"
                   f"{_reviewer_round_block(ctx.run_dir_eff or ctx.run_dir, ctx.run_id)}"
-                  'Respond with JSON: {"verdict": "pass|fail|needs_revision", "notes": []}\n'
+                  'Respond with JSON: {"verdict": "pass|fail|needs_revision|escalate", "notes": []}\n'
+                  'Use "escalate" only when the change itself is right and what blocks it is '
+                  'something only a person can do (apply a migration, settle a spec or scope '
+                  'question); name that action in notes. It hands the run to a person '
+                  'instead of another implementer round.\n'
                   f'AND write that exact JSON object to {review_file} — a Bash heredoc is fine. '
                   'That file is the artifact the runtime reads; an answer that is prose only is discarded.')
     marker = os.path.join(ctx.run_dir, f".dispatch-marker-{ctx.node_id}")
