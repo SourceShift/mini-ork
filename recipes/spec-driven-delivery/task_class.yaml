@@ -28,7 +28,7 @@ default_gates:
 
 risk_class: high
 max_parallel_runs: 1
-budget_cap_usd: 100
+budget_cap_usd: 400
 tags:
   - recursive
   - spec-driven
