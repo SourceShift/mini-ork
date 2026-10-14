@@ -47,11 +47,14 @@ DECLARED = {
         "budget_cap_per_iter_usd": 4.0,
         "budget_cap_total_usd": 20.0,
     },
+    # Caps raised 5/25 -> 20/60 (2026-10-14): per-iteration repair budgets of $5
+    # were killing healthy multi-lane children before their panels converged, and
+    # the exhaustion was reported as a failure the verdicts had already passed.
     "recursive-validate-impl": {
         "max_iterations": 5,
         "convergence_check": "all_dod_probes_pass",
-        "budget_cap_per_iter_usd": 5.0,
-        "budget_cap_total_usd": 25.0,
+        "budget_cap_per_iter_usd": 20.0,
+        "budget_cap_total_usd": 60.0,
     },
 }
 
