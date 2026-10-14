@@ -15,7 +15,8 @@ there).  This module supplies the three halves of that contract:
     it, so committing it would publish the unreviewed round-2 work (ide-orca-f2b);
   - a fresh run's implementer ``Write``/``Edit``/``MultiEdit`` calls replayed IN
     ORDER from its session transcript (failed ``is_error`` tool calls are skipped:
-    a rejected Edit followed by a successful retry is ordinary, not a peer edit);
+    a rejected Edit followed by a successful retry is ordinary, not a peer edit),
+    together with any plain ``mv`` / ``git mv`` it ran through Bash;
   - the implementer's own **emitted unified diff** in ``impl-<node>.log`` — the
     text ``mini_ork.cli.execute.apply_impl_output`` applies with ``git apply``, so
     it is the implementer's patch, not a tree delta;
@@ -53,6 +54,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -69,6 +71,10 @@ __all__ = [
 ]
 
 _TOOL_NAMES = frozenset({"Write", "Edit", "MultiEdit"})
+# Flags that leave ``mv SRC DST`` / ``git mv SRC DST`` a plain two-path rename.
+_MOVE_FLAGS = frozenset({"-f", "-n", "-v", "-i", "-k", "-fv", "-vf", "--"})
+# Shell operators after which the replay cannot know what a rename touched.
+_UNREPLAYABLE_SHELL = frozenset({"|", "||", "&", ">", ">>", "<", "(", ")", "`"})
 _SECTION_RE = re.compile(r"^diff --git ", re.M)
 _EMITTED_DIFF_RE = re.compile(r"(^--- .*?)(?=\n```|\Z)", re.S | re.M)
 
@@ -455,7 +461,13 @@ def _transcript_candidates(run_dir: str) -> list[str]:
         sid = ""
     if sid:
         add(os.path.join(run_dir, "sessions", f"{sid}.jsonl"))
-    add(os.path.join(run_dir, "agent-implementer.live.jsonl"))
+    live = os.path.join(run_dir, "agent-implementer.live.jsonl")
+    # A rotated sidecar keeps only its last two segments (``dispatch.live_stream``),
+    # so it no longer holds the session's first calls. Replaying it would blame a
+    # peer for an early Write it cannot see — or, worse, reconcile and publish a
+    # patch missing every file touched only in the lost segment.
+    if not os.path.isfile(live + ".1"):
+        add(live)
     if not out:
         sessions = os.path.join(run_dir, "sessions")
         try:
@@ -494,10 +506,53 @@ def _content_blocks(obj: object):
 
 
 def _tool_uses_in(obj: object):
-    """Yield ``(id, name, input)`` for Write/Edit/MultiEdit blocks in one record."""
+    """Yield ``(id, name, input)`` for Write/Edit/MultiEdit/Bash blocks in one record."""
     for block in _content_blocks(obj):
-        if block.get("type") == "tool_use" and block.get("name") in _TOOL_NAMES:
+        if block.get("type") == "tool_use" and (
+                block.get("name") in _TOOL_NAMES or block.get("name") == "Bash"):
             yield block.get("id"), block.get("name"), (block.get("input") or {})
+
+
+def _bash_moves(command: str) -> list[tuple[str, str]]:
+    """``(src, dst)`` for each plain ``mv`` / ``git mv`` in a Bash command.
+
+    An implementer that moves a file with Bash and then Edits it at the new path
+    authored both changes, but the Edit cannot replay against a base that has no
+    file there. Only segments joined by ``&&`` / ``;`` are read; a command that
+    changes directory, pipes, redirects, globs or passes another flag yields
+    nothing, and the tree comparison then decides exactly as before.
+    """
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return []
+    if any(token in _UNREPLAYABLE_SHELL for token in tokens):
+        return []
+    segments: list[list[str]] = [[]]
+    for token in tokens:
+        if token in ("&&", ";"):
+            segments.append([])
+        else:
+            segments[-1].append(token)
+    moves: list[tuple[str, str]] = []
+    for segment in segments:
+        if segment[:1] in (["cd"], ["pushd"], ["popd"]):
+            return []
+        if segment[:1] == ["mv"]:
+            args = segment[1:]
+        elif segment[:2] == ["git", "mv"]:
+            args = segment[2:]
+        else:
+            continue
+        flags = [arg for arg in args if arg.startswith("-")]
+        paths = [arg for arg in args if not arg.startswith("-")]
+        if (len(paths) != 2 or not set(flags) <= _MOVE_FLAGS
+                or any(ch in arg for arg in paths for ch in "*?[")):
+            continue
+        moves.append((paths[0], paths[1]))
+    return moves
 
 
 def _records_in(path: str):
@@ -598,6 +653,20 @@ def _collect_edits(path: str, real_repo: str, scope: list[str], run_real: str = 
         for tid, name, inp in _tool_uses_in(record):
             if tid is not None and tid in failed:
                 continue
+            if name == "Bash":
+                for src, dst in _bash_moves(str(inp.get("command") or "")):
+                    src_rel = _repo_rel(to_host(src), real_repo)
+                    dst_rel = _repo_rel(to_host(dst), real_repo)
+                    if src_rel is None or dst_rel is None:
+                        continue
+                    if dst.endswith("/") or os.path.isdir(os.path.join(real_repo, dst_rel)):
+                        dst_rel = f"{dst_rel}/{os.path.basename(src_rel)}"
+                    if run_real and any(_under(os.path.join(real_repo, rel), run_real)
+                                        for rel in (src_rel, dst_rel)):
+                        continue
+                    if _in_scope(src_rel, scope) and _in_scope(dst_rel, scope):
+                        edits.append((dst_rel, "Move", {"from": src_rel}))
+                continue
             fp = inp.get("file_path")
             if not isinstance(fp, str) or not fp:
                 continue
@@ -655,6 +724,18 @@ def _replay(repo: str, base_ref: str, edits) -> dict[str, str | None] | Abstain:
             files[rel] = _base_content(repo, base_ref, rel)
         if name == "Write":
             files[rel] = inp.get("content") if isinstance(inp.get("content"), str) else ""
+            continue
+        if name == "Move":
+            src = inp["from"]
+            if src not in files:
+                files[src] = _base_content(repo, base_ref, src)
+            if files[src] is None:
+                return Abstain(
+                    "publish-unattributable",
+                    f"{src}: the implementer moved it to {rel}, but the replay holds "
+                    "no such file — a peer created or removed it",
+                )
+            files[rel], files[src] = files[src], None
             continue
         replayed = _apply_edit(files[rel], inp)
         if replayed is None:

@@ -854,3 +854,98 @@ def test_transcript_replay_of_a_remote_implementer_maps_sandbox_paths(tmp_path, 
     assert isinstance(authored, AuthoredPatch), authored
     assert authored.source == "transcript-replay"
     assert "line2-run" in authored.patch_text
+
+
+# ── Bash renames and rotated live sidecars ───────────────────────────────────
+
+
+def _bash(tid: str, command: str) -> list[dict]:
+    return [
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": tid, "name": "Bash", "input": {"command": command}}]}},
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": tid, "is_error": False, "content": ""}]}},
+    ]
+
+
+def _tool(tid: str, name: str, payload: dict) -> dict:
+    return {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": tid, "name": name, "input": payload}]}}
+
+
+def test_a_file_the_run_wrote_then_moved_with_bash_replays(tmp_path, repo):
+    """2026-10-14 cjd-oh-f4-rail: the implementer wrote a test, `mv`d it into
+    `__tests__/` and edited it there. The Edit could not replay against a base
+    with no file at the new path, so a fully gated run abstained and blamed a peer.
+    """
+    base = _head(repo)
+    (repo / "pkg").mkdir()
+    run_dir = _make_run_dir(tmp_path, repo, base, records=[
+        _tool("tu-1", "Write", {"file_path": str(repo / "draft.py"), "content": "one\n"}),
+        *_bash("tu-2", "mv draft.py pkg/moved.py && ls pkg"),
+        _tool("tu-3", "Edit", {"file_path": str(repo / "pkg" / "moved.py"),
+                               "old_string": "one\n", "new_string": "two\n"}),
+    ])
+    (repo / "pkg" / "moved.py").write_text("two\n")
+
+    authored = resolve_authored_patch(str(run_dir))
+
+    assert isinstance(authored, AuthoredPatch), authored
+    assert "pkg/moved.py" in authored.patch_text
+    assert "draft.py" not in authored.patch_text.replace("pkg/moved.py", "")
+
+
+def test_a_git_mv_of_a_base_file_replays_as_a_rename(tmp_path, repo):
+    base = _head(repo)
+    run_dir = _make_run_dir(tmp_path, repo, base, records=[
+        *_bash("tu-1", "git mv b.py c.py"),
+        _tool("tu-2", "Edit", {"file_path": str(repo / "c.py"),
+                               "old_string": "line2\n", "new_string": "line2-run\n"}),
+    ])
+    _git(repo, "mv", "b.py", "c.py")
+    (repo / "c.py").write_text(BASE_A.replace("line2", "line2-run"))
+
+    authored = resolve_authored_patch(str(run_dir))
+
+    assert isinstance(authored, AuthoredPatch), authored
+    sha = land_patch(str(repo), authored.patch_text, "")
+    assert isinstance(sha, str), sha
+    assert "line2-run" in _git(repo, "show", f"{sha}:c.py").stdout
+    assert _git(repo, "cat-file", "-e", f"{sha}:b.py", check=False).returncode != 0
+
+
+def test_a_move_after_cd_is_not_followed(tmp_path, repo):
+    base = _head(repo)
+    (repo / "pkg").mkdir()
+    run_dir = _make_run_dir(tmp_path, repo, base, records=[
+        _tool("tu-1", "Write", {"file_path": str(repo / "pkg" / "draft.py"), "content": "one\n"}),
+        *_bash("tu-2", "cd pkg && mv draft.py moved.py"),
+        _tool("tu-3", "Edit", {"file_path": str(repo / "pkg" / "moved.py"),
+                               "old_string": "one\n", "new_string": "two\n"}),
+    ])
+    (repo / "pkg" / "moved.py").write_text("two\n")
+
+    authored = resolve_authored_patch(str(run_dir))
+
+    assert isinstance(authored, Abstain), authored
+    assert authored.reason == "publish-unattributable"
+
+
+def test_a_rotated_live_sidecar_is_not_replayed_as_the_whole_session(tmp_path, repo):
+    """The live sidecar keeps only its last two segments. Here the lost segment
+    held the Write of a.py; replaying what is left reconciled b.py alone and
+    would have published a patch without a.py."""
+    base = _head(repo)
+    run_dir = _make_run_dir(tmp_path, repo, base)
+    late_edit = _tool("tu-9", "Edit", {"file_path": str(repo / "b.py"),
+                                       "old_string": "line2\n", "new_string": "line2-run\n"})
+    (run_dir / "agent-implementer.live.jsonl").write_text(
+        json.dumps({"seq": 900, "stream": "stdout", "line": json.dumps(late_edit)}) + "\n")
+    (run_dir / "agent-implementer.live.jsonl.1").write_text(
+        json.dumps({"seq": 500, "stream": "meta", "line": "live segment rotated", "rotated": True}) + "\n")
+    (repo / "a.py").write_text(BASE_A.replace("line9", "line9-run"))
+    (repo / "b.py").write_text(BASE_A.replace("line2", "line2-run"))
+
+    authored = resolve_authored_patch(str(run_dir))
+
+    assert not isinstance(authored, AuthoredPatch), authored.patch_text
