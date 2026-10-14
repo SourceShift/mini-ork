@@ -1947,3 +1947,22 @@ def test_review_verdict_envelope_prose_degrades_to_verdict_only(tmp_path):
     rf = tmp_path / "review-x.json"
     rf.write_text("looks good overall")
     assert exh._review_verdict_envelope(str(rf), "pass") == {"verdict": "pass"}
+
+
+def test_default_dispatch_reports_an_escaping_exception_on_stderr(monkeypatch, capsys):
+    """Handlers keep only the rc of a failed dispatch; the cause must still reach
+    execute.log, or a failed node carries no reason at all."""
+    import sqlite3
+
+    from mini_ork.dispatch import llm_dispatch
+
+    def locked(argv, *, root):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(llm_dispatch, "llm_dispatch", locked)
+
+    rc, output = ex._default_llm_dispatch("/engine")("rvi", "reviewer", "synthesize")
+
+    assert rc == 1
+    assert "database is locked" in output
+    assert "[dispatch] reviewer: llm_dispatch raised" in capsys.readouterr().err

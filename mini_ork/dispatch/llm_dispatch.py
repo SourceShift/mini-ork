@@ -494,6 +494,12 @@ def _apply_lane_fuse(db, chain: str) -> tuple[str, str]:
 
 # ── llm_calls row writer (family-aware cost math + schema-adaptive cols) ──
 
+# The row is written AFTER the provider call returned, so a lock it cannot get
+# must never turn a paid, successful call into a failed node. Long enough to ride
+# out a busy home (every parallel run's nodes write to the same state.db).
+_LEDGER_BUSY_TIMEOUT_S = 30.0
+
+
 def write_llm_calls_row(db, provider, model_id, tier, feature_name, actor, status,
                         duration_ms, cost_usd, error_message, input_tokens=0, output_tokens=0,
                         metadata_json="{}", cached_input_tokens=0, cache_creation_input_tokens=0,
@@ -522,8 +528,34 @@ def write_llm_calls_row(db, provider, model_id, tier, feature_name, actor, statu
         _sess = _md.get("session_id") if isinstance(_md, dict) else None
     except Exception:
         _sess = None
-    con = sqlite3.connect(db, timeout=5)
-    con.execute("PRAGMA busy_timeout=5000")
+    try:
+        con = sqlite3.connect(db, timeout=_LEDGER_BUSY_TIMEOUT_S)
+    except sqlite3.Error as exc:
+        sys.stderr.write(f"[llm_calls] row not written ({status} {model_id}): {exc}\n")
+        return
+    try:
+        _insert_llm_calls_row(con, provider, model_id, tier, feature_name, actor, status,
+                              duration_ms, cost_usd, error_message, in_tok, out_tok,
+                              metadata_json, _sess, cached_in, cache_create,
+                              error_category, retryable, thinking_tokens,
+                              cost_input_uncached, cost_input_cached, cost_cache_write)
+    except sqlite3.Error as exc:
+        # Researcher home, 2026-10-14: a successful implementer ($5.90) and a
+        # panel synth that had already written APPROVE both ended `error` with
+        # no row — the shape of this INSERT raising out of llm_dispatch's success
+        # path (that home logs "database is locked" from its other writers),
+        # which the caller's `except Exception` turns into rc=1.
+        sys.stderr.write(f"[llm_calls] row not written ({status} {model_id}): {exc}\n")
+    finally:
+        con.close()
+
+
+def _insert_llm_calls_row(con, provider, model_id, tier, feature_name, actor, status,
+                          duration_ms, cost_usd, error_message, in_tok, out_tok,
+                          metadata_json, _sess, cached_in, cache_create,
+                          error_category, retryable, thinking_tokens,
+                          cost_input_uncached, cost_input_cached, cost_cache_write):
+    con.execute(f"PRAGMA busy_timeout={int(_LEDGER_BUSY_TIMEOUT_S * 1000)}")
     cols = {r[1] for r in con.execute("PRAGMA table_info(llm_calls)").fetchall()}
     insert_cols = ["provider", "model_id", "tier", "feature_name", "actor", "status",
                    "duration_ms", "cost_usd", "error_message", "iter", "run_id", "traceparent",
@@ -544,7 +576,7 @@ def write_llm_calls_row(db, provider, model_id, tier, feature_name, actor, statu
             insert_cols.append(name); values.append(val)
     ph = ",".join("?" for _ in insert_cols)
     con.execute(f"INSERT INTO llm_calls ({', '.join(insert_cols)}) VALUES ({ph})", values)
-    con.commit(); con.close()
+    con.commit()
 
 
 # ── model-level dispatch (delegates to the ported mini_ork.dispatch core) ──

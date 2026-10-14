@@ -1998,6 +1998,9 @@ def _default_llm_dispatch(root):
                 )
             return rc, captured.getvalue()
         except Exception as exc:
+            # Every handler keeps only the rc of a failed dispatch, so without this
+            # line the cause never reaches execute.log.
+            sys.stderr.write(f"  [dispatch] {node_type}: llm_dispatch raised {exc!r}\n")
             return 1, captured.getvalue() + str(exc)
     return d
 
