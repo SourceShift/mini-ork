@@ -14,6 +14,11 @@ Each workflow node may declare:
 - an edge with both `from_output` and `to_input`: the only valid producer to
   consumer handoff.
 
+Artifact records may also carry content-addressed transport fields
+(`blob_ref`, `sha256`, `slot`) when nodes run on isolated machines — see
+[artifact-transport.md](./artifact-transport.md) for the transport model,
+slots, and the schema delta.
+
 The compiler validates duplicate ports, required inputs, visibility, output-path
 ownership, and DAG readiness. At runtime, an edge is also a completion gate:
 independent ready nodes may run in parallel, but a consumer starts only after

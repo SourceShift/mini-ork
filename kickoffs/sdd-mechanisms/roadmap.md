@@ -491,3 +491,42 @@ This is an EXPERIMENT; the evidence for it is weak.
 Shipping shared contracts by default before the A/B result.
 ### Verification command
 `python3 -m pytest -q tests/unit/test_speckit_adapter.py`
+
+## P2 artifact transport for cloud runs (id: sdd-p2-artifact-transport)
+- recipe: docs
+Depends on: sdd-i5-evidence-ledger
+
+### Goal
+- Replace the local `path` as artifact identity with a content-addressed record
+  `{run_id, artifact_id, sha256, media_type, blob_ref}`, so a node's output is
+  resolvable from any machine that can reach the store — not only the machine
+  that wrote it.
+- Give each fan-out item its own artifact **slot**, so N parallel nodes never
+  collide on one tree (`tree_sync.apply_delta` is whole-tree + single-writer and
+  raises `SyncConflictError` on divergence), and the aggregator reads N slots.
+### Acceptance
+- AC1: `docs/architecture/artifact-transport.md` exists and answers, with
+  `file:line` citations, why a path contract fails under node isolation and how
+  `{run_id, artifact_id, sha256, blob_ref}` + per-item slots fix it.
+- AC2: the schema delta is stated as a concrete diff against the P1 artifact
+  record and `schemas/artifact_contract.schema.json`, with a back-compat rule
+  (a path-only artifact stays valid).
+- AC3: the fan-out slot change names its touch-point files and shows the yaml
+  shape for a 3-lens fan-out plus the aggregator's read path.
+- AC4: the verification plan lists >= 2 probe commands, each runnable, that
+  distinguish the current model from the proposed one.
+### Files in scope (candidates — confirm)
+- `mini_ork/orchestration/item_fanout.py`
+- `mini_ork/workflow/artifacts.py`
+- `mini_ork/gates/artifact_contract.py`
+- `mini_ork/remote/tree_sync.py`
+- `mini_ork/runtime/backends/remote.py`
+- `mini_ork/checkpoints/` (from P1 — read, do not edit its semantics)
+- `schemas/artifact_contract.schema.json`
+- `docs/architecture/artifact-transport.md` (new)
+- `docs/architecture/artifact-graph.md`
+### Out of scope
+Any change to P1's checkpointer/resume semantics; any network/object-store code
+(a design may name the store, it must not add an SDK); the IDE UI.
+### Verification command
+`bash -c 'test -f docs/architecture/artifact-transport.md && grep -q blob_ref docs/architecture/artifact-transport.md && grep -q artifact_id docs/architecture/artifact-transport.md && grep -q slot docs/architecture/artifact-transport.md'`
