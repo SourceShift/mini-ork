@@ -12,9 +12,12 @@ import importlib
 from pathlib import Path
 from typing import Any
 
-# key → the IDE tab label. ``run`` is one run's tab (``args["run"]``).
+# key → the IDE tab label. ``run`` is one run's tab (``args["run"]``) and
+# ``task`` one epic-or-mirrored-ticket's (``args["uid"]``) — both are opened per
+# id, so the IDE gives each id its own tab.
 PAGES: dict[str, str] = {
     "run": "Run",
+    "task": "Task",
     "orch": "Orchestrator",
     "inbox": "Inbox",
     "kanban": "Board",

@@ -7,9 +7,9 @@ Acceptance matrix for the Tasks tab (default):
    Backlog; ``in progress`` → Working; ``in review`` / ``blocked`` with a
    held_reason / ``escalated`` / unknown → Needs you; ``blocked`` without a
    held_reason → Backlog; ``done`` → Done.
-3. ``do`` prefers the latest ``epic_attempts`` row's run id; else the
-   kickoff path resolved against ``MINI_ORK_ROOT`` when the file is on
-   disk; else no ``do`` key.
+3. Every card's ``do`` opens the epic's own page (``page 'task'``, keyed by
+   uid). The latest attempt's run and the kickoff file used to be the card's
+   ``do``; they now live on that page.
 4. Archived epics are hidden.
 5. Each column caps at 30; sort is priority DESC then updated_at DESC.
 6. A home without an ``epics`` table still renders — one muted line in the
@@ -271,33 +271,45 @@ def test_unknown_status_lands_in_needs_you(home: Path) -> None:
     assert [c["id"] for c in cols["Needs you"]] == ["e-future"]
 
 
-# ── do: run / kickoff / neither ────────────────────────────────────────────
+# ── do: the epic's own page ────────────────────────────────────────────────
+#
+# A card gets exactly one ``do`` (``sections.rs::render_columns`` wires the whole
+# card to it and draws ``meta`` as text only), so repointing the card at the task
+# page is zero-sum: the latest attempt's run and the kickoff file the card used to
+# open directly now live on the page it opens. ``test_ide_pages_task.py`` pins
+# that page; these two pin the card's half of the trade.
 
 
-def test_do_prefers_latest_attempt_run_id(home: Path) -> None:
-    _seed_epic(home, "e-run", title="Has a run")
-    _seed_epic_attempt(home, "e-run", run_id="run-1", attempt=1)
-    _seed_epic_attempt(home, "e-run", run_id="run-2", attempt=2)
-    page = build_page(home, "kanban")
-    card = _cols(page)["Backlog"][0]
-    assert card["do"] == {"run": "run-2", "title": "Has a run"}
-
-
-def test_do_falls_back_to_kickoff_path_when_no_run(home: Path, tmp_path: Path) -> None:
-    """No ``epic_attempts`` row → the card opens the on-disk kickoff."""
+def test_do_opens_the_epics_own_page(home: Path, tmp_path: Path) -> None:
+    """A run, a kickoff, or neither — the card opens the same page regardless."""
     kickoff = tmp_path / "kickoff-fixture.md"
     kickoff.write_text("# Sample kickoff\n", encoding="utf-8")
+    _seed_epic(home, "e-run", title="Has a run")
+    _seed_epic_attempt(home, "e-run", run_id="run-2", attempt=2)
     _seed_epic(home, "e-kick", title="Has a kickoff", kickoff_path=str(kickoff))
-    page = build_page(home, "kanban")
-    card = _cols(page)["Backlog"][0]
-    assert card["do"] == {"path": str(kickoff)}
-
-
-def test_do_is_absent_when_neither_run_nor_kickoff(home: Path) -> None:
     _seed_epic(home, "e-naked", title="Naked epic")
-    page = build_page(home, "kanban")
-    card = _cols(page)["Backlog"][0]
-    assert card.get("do") is None
+
+    cards = {c["id"]: c for c in _cols(build_page(home, "kanban"))["Backlog"]}
+    for epic_id in ("e-run", "e-kick", "e-naked"):
+        assert cards[epic_id]["do"] == {"page": "task", "args": {"uid": epic_id}}
+
+
+def test_the_page_a_card_opens_still_reaches_the_run_and_the_kickoff(
+        home: Path, tmp_path: Path) -> None:
+    """The shortcuts the card gave up moved onto the page, they did not vanish."""
+    kickoff = tmp_path / "kickoff-fixture.md"
+    kickoff.write_text("# Sample kickoff\n", encoding="utf-8")
+    _seed_epic(home, "e-run", title="Has a run", kickoff_path=str(kickoff))
+    _seed_epic_attempt(home, "e-run", run_id="run-1", attempt=1)
+    _seed_epic_attempt(home, "e-run", run_id="run-2", attempt=2)
+
+    task = build_page(home, "task", args={"uid": "e-run"})
+    assert task["ok"] is True
+    # Newest first, and the row opens the run the card used to.
+    assert _section(task, "table", "Attempts")["rows"][0]["do"] == {
+        "run": "run-2", "title": "e-run · attempt 2"}
+    assert {a["label"]: a["do"] for a in task["actions"]}["Kickoff file"] == {
+        "path": str(kickoff)}
 
 
 # ── archived + cap + missing table ───────────────────────────────────────────

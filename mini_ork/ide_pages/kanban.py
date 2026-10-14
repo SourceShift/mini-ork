@@ -5,13 +5,13 @@ Two tabs:
 - ``tasks`` (default) — one ``columns`` section of epic cards *and* the
   tickets imported from the PM mirror (Linear, Jira, GitHub). The columns
   come from the scheduler's view of epics (``Backlog`` / ``Working`` /
-  ``Needs you`` / ``Done``); every card carries the latest ``epic_attempts``
-  row's run id when one exists, else the epic's kickoff path resolved
-  against ``MINI_ORK_ROOT`` when the file is on disk, else no ``do`` key.
-  Mirror tickets are read through :mod:`mini_ork.pm.store` only — the page
-  makes no network call and imports no adapter, so a slow or broken source
-  can neither slow nor blank the board, and a mirror row whose ``provider``
-  is ``local`` is skipped (it is already drawn from the ``epics`` table).
+  ``Needs you`` / ``Done``). Every card is a click into its own page
+  (``S.open_task`` → :mod:`mini_ork.ide_pages.task``), which is where the
+  epic's latest run, kickoff file and verbs live. Mirror tickets are read
+  through :mod:`mini_ork.pm.store` only — the page makes no network call and
+  imports no adapter, so a slow or broken source can neither slow nor blank
+  the board, and a mirror row whose ``provider`` is ``local`` is skipped (it
+  is already drawn from the ``epics`` table).
 - ``runs`` — the live run board: four columns of fleet cards (Working /
   Needs you / Failed / Done), Done over a rolling 24-hour window.
 
@@ -218,14 +218,14 @@ def _task_card_mark(status: str) -> str:
     return "•"
 
 
-def _task_card(epic: dict[str, Any], latest_run_id: str | None,
-               kickoff_abs: str | None, *, recency: int = 0) -> dict[str, Any]:
+def _task_card(epic: dict[str, Any], *, recency: int = 0) -> dict[str, Any]:
     """One epic card for the Tasks board.
 
-    ``do`` prefers the latest ``epic_attempts`` row's run id (``S.open_run``),
-    else the kickoff path resolved against ``MINI_ORK_ROOT`` when the file
-    exists on disk (``S.open_path``), else no ``do`` key — a card with no
-    target does not have a click handler.
+    Clicking the card opens the epic's own page (``S.open_task``), which is
+    where the latest attempt's run, the kickoff file and the epic's verbs live:
+    a card gets exactly one ``do`` (``sections.rs::render_columns`` wires the
+    whole card to it and draws ``meta`` as text only), so the shortcuts the card
+    used to carry moved onto the page rather than being lost.
     """
     eid = str(epic.get("id") or "")
     title = str(epic.get("title") or eid)
@@ -247,12 +247,7 @@ def _task_card(epic: dict[str, Any], latest_run_id: str | None,
         sub_parts.append(recipe)
     sub = " · ".join(p for p in sub_parts if p)
 
-    if latest_run_id:
-        do: dict[str, Any] | None = S.open_run(latest_run_id, title)
-    elif kickoff_abs:
-        do = S.open_path(str(kickoff_abs))
-    else:
-        do = None
+    do: dict[str, Any] | None = S.open_task(eid) if eid else None
 
     return {"id": eid, "title": title, "sub": sub, "state": _task_card_state(status),
             "mark": _task_card_mark(status), "meta": [], "do": do,
@@ -288,6 +283,10 @@ def _resolve_kickoff_path(home: Path, kickoff: str) -> str | None:
     1. literal ``kickoff_path`` if absolute and on disk,
     2. ``$MINI_ORK_ROOT/<kickoff_path>`` if set and on disk,
     3. ``<home>/<kickoff_path>`` as a last-ditch fallback.
+
+    The task page imports this rather than keeping a second copy: two
+    resolutions is how two pages come to disagree about which kickoff an epic
+    has.
     """
     if not kickoff:
         return None
@@ -351,10 +350,10 @@ def _ticket_card(row: Any, run_id: str | None, *, recency: int = 0) -> dict[str,
 
     ``title`` leads with the source's own key (``ENG-123``) so a person can
     quote it; the ``sub`` line carries the provider and the source's *native*
-    state word, never only the normalized one. ``do`` opens the linked run when
-    the ticket has one, else the ticket's own URL, else there is no ``do`` key.
-    A run-linked ticket also gets an ``agent`` chip, so a person can see
-    mini-ork is working it.
+    state word, never only the normalized one. ``do`` opens the ticket's own
+    page (``S.open_task``), which carries the linked run and the source URL as
+    its own actions. A run-linked ticket also gets an ``agent`` chip, so a
+    person can see mini-ork is working it.
     """
     provider = str(row.provider)
     priority = int(row.priority)
@@ -364,12 +363,7 @@ def _ticket_card(row: Any, run_id: str | None, *, recency: int = 0) -> dict[str,
     meta.append(S.meta_item(provider, "cyan"))          # the source chip
     if run_id:
         meta.append(S.meta_item("agent", "green"))      # mini-ork is on it
-    if run_id:
-        do: dict[str, Any] | None = S.open_run(run_id, str(row.title))
-    elif row.url:
-        do = S.url(str(row.url))
-    else:
-        do = None
+    do: dict[str, Any] | None = S.open_task(str(row.uid)) if row.uid else None
     _column, state, mark = _ticket_column(str(row.state))
     return {"id": row.uid, "title": f"{row.native_key} · {row.title}",
             "sub": f"{provider} · {row.native_state}", "state": state, "mark": mark,
@@ -459,19 +453,6 @@ def _epic_buckets(home: Path, db, buckets: dict[str, list[dict[str, Any]]]) -> N
         " FROM epics e WHERE e.archived_at IS NULL" + order_sql
     )
 
-    # Latest epic_attempts row per epic — the join target for ``do``.
-    latest: dict[str, str] = {}
-    if db.has_table("epic_attempts"):
-        for r in db.rows(
-            "SELECT ea.epic_id, ea.run_id FROM epic_attempts ea "
-            "JOIN (SELECT epic_id, MAX(attempt) AS mx FROM epic_attempts "
-            "GROUP BY epic_id) m ON m.epic_id = ea.epic_id AND m.mx = ea.attempt "
-            "WHERE ea.run_id IS NOT NULL"
-        ):
-            eid = str(r.get("epic_id") or "")
-            if eid:
-                latest[eid] = str(r.get("run_id") or "")
-
     # Use the SQL order as the recency rank: row 0 is the newest, so a
     # descending sort keeps the most-recent card first within a priority tier.
     rows_list = list(rows)
@@ -485,10 +466,8 @@ def _epic_buckets(home: Path, db, buckets: dict[str, list[dict[str, Any]]]) -> N
             r = dict(r)
             r["dependency_blocked"] = True
         column_title = _task_column_for(status, held)
-        kickoff_abs = _resolve_kickoff_path(home, str(r.get("kickoff_path") or ""))
         recency = total - idx  # higher = more recent
-        buckets[column_title].append(_task_card(r, latest.get(eid), kickoff_abs,
-                                                recency=recency))
+        buckets[column_title].append(_task_card(r, recency=recency))
 
 
 def _tickets_into(home: Path, buckets: dict[str, list[dict[str, Any]]],

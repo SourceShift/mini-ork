@@ -319,32 +319,50 @@ def test_no_external_source_still_builds_and_names_pm_yaml(
     assert "token_env" in text
 
 
-# ── do: run link / url / neither ───────────────────────────────────────────
+# ── do: the ticket's own page ──────────────────────────────────────────────
+#
+# A card gets exactly one ``do``, so repointing it at the task page is zero-sum:
+# the linked run and the source URL the card used to open directly are now on the
+# page it opens (``task.py`` draws both as its own actions). The chip that says
+# mini-ork is working the ticket stays on the card — ``meta`` is text, so it costs
+# no click.
 
 
-def test_run_link_opens_the_run_and_adds_an_agent_chip(home: Path) -> None:
+def test_do_opens_the_tickets_own_page(home: Path) -> None:
+    """A run link, a url, or neither — the card opens the same page regardless."""
+    _seed_issue(home, "linear", "ENG-7", title="Worked by mini-ork",
+                state=IssueState.IN_PROGRESS, native_state="In Progress")
+    store.link("linear:ENG-7", "run:run-abc123", LinkKind.RUN, db=str(home / "state.db"))
+    _seed_issue(home, "jira", "JIR-9", title="Nothing to open",
+                state=IssueState.IN_PROGRESS, native_state="In Progress")
+
+    cards = {c["id"]: c for c in _cols(build_page(home, "kanban"))["Working"]}
+    assert cards["linear:ENG-7"]["do"] == {"page": "task", "args": {"uid": "linear:ENG-7"}}
+    assert cards["jira:JIR-9"]["do"] == {"page": "task", "args": {"uid": "jira:JIR-9"}}
+
+
+def test_a_run_link_still_adds_the_agent_chip(home: Path) -> None:
+    """The chip is derived from the link, not from the card's ``do``."""
     _seed_issue(home, "linear", "ENG-7", title="Worked by mini-ork",
                 state=IssueState.IN_PROGRESS, native_state="In Progress")
     store.link("linear:ENG-7", "run:run-abc123", LinkKind.RUN, db=str(home / "state.db"))
     card = _cols(build_page(home, "kanban"))["Working"][0]
-    assert card["do"] == {"run": "run-abc123", "title": "Worked by mini-ork"}
     assert any(m["t"] == "agent" for m in card["meta"])
 
 
-def test_url_is_the_do_when_there_is_no_run_link(home: Path) -> None:
-    _seed_issue(home, "linear", "ENG-8", title="Open me",
+def test_the_page_a_ticket_card_opens_still_reaches_the_run_and_the_url(home: Path) -> None:
+    """The shortcuts the card gave up moved onto the page, they did not vanish."""
+    _seed_issue(home, "linear", "ENG-7", title="Worked by mini-ork",
                 state=IssueState.IN_PROGRESS, native_state="In Progress",
-                url="https://linear.app/acme/issue/ENG-8")
-    card = _cols(build_page(home, "kanban"))["Working"][0]
-    assert card["do"] == {"url": "https://linear.app/acme/issue/ENG-8"}
-    assert not any(m["t"] == "agent" for m in card["meta"])
+                url="https://linear.app/acme/issue/ENG-7")
+    store.link("linear:ENG-7", "run:run-abc123", LinkKind.RUN, db=str(home / "state.db"))
 
-
-def test_no_run_link_and_no_url_means_no_do(home: Path) -> None:
-    _seed_issue(home, "jira", "JIR-9", title="Nothing to open",
-                state=IssueState.IN_PROGRESS, native_state="In Progress")
-    card = _cols(build_page(home, "kanban"))["Working"][0]
-    assert card.get("do") is None
+    task = build_page(home, "task", args={"uid": "linear:ENG-7"})
+    assert task["ok"] is True
+    assert {a["label"]: a["do"] for a in task["actions"]}["Open in linear"] == {
+        "url": "https://linear.app/acme/issue/ENG-7"}
+    links = _section(task, "list", "Links")["items"]
+    assert links[0]["acts"][0]["do"]["run"] == "run-abc123"
 
 
 # ── shared cap + order ─────────────────────────────────────────────────────

@@ -132,6 +132,16 @@ def open_run(run_id: str, title: str = "", tab: str | None = None) -> dict[str, 
     return out
 
 
+def open_task(uid: str) -> dict[str, Any]:
+    """One task's own tab: an epic id, or a mirrored ticket's ``provider:key`` uid.
+
+    The IDE keys a task tab by ``uid`` the way :func:`open_run` keys a run tab by
+    ``run`` — ``page.rs::open_page`` dedupes every other page by page key alone,
+    so without that a second task would reuse the first tab and merge its args.
+    """
+    return {"page": "task", "args": {"uid": str(uid)}}
+
+
 def open_path(path: str) -> dict[str, Any]:
     return {"path": str(path)}
 
