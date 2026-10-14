@@ -52,6 +52,23 @@ from mini_ork import scheduler as sched  # noqa: E402
 from mini_ork.stores import migrate as mig  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _stub_thread_setup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin thread-setup readiness to "ready" for every test in this file.
+
+    ``agent.prompt`` on a thread first runs ``_enforce_thread_setup``, which
+    shells out to ``claude auth status`` and raises ``RequestError.auth_required``
+    when the host's orchestrator is not set up (``agent.py`` ``_enforce_thread_setup``).
+    That is a host property — true on a dev box with a configured CLI, false on a
+    bare CI runner — so it must never decide these tests. Pin the seam and clear
+    the per-cwd pass cache, the same idiom as ``test_acp_lane_repair.py``.
+    """
+    from mini_ork.acp import agent as acp_agent
+
+    monkeypatch.setattr(acp_agent, "_setup_readiness_for_thread", lambda cwd: [])
+    monkeypatch.setattr(acp_agent, "_SETUP_PASS_CACHE", {})
+
+
 # ── helpers (mirrored from test_acp_commands / test_acp_agent_py) ───────────
 
 

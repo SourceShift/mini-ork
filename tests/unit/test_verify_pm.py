@@ -116,13 +116,23 @@ def test_exec_argv_prefers_the_repo_own_binary(tmp_path):
     assert argv[1:] == ["a.ts"]
 
 
-def test_exec_argv_falls_back_to_the_declared_manager(tmp_path):
-    """No vendored binary → the DECLARED manager, never a default."""
+def test_exec_argv_falls_back_to_the_declared_manager(tmp_path, monkeypatch):
+    """No vendored binary → the DECLARED manager, never a default.
+
+    ``shutil.which`` is pinned so the declared manager reads as *installed*.
+    Unpinned, the result depends on the host PATH — a CI box with no pnpm falls
+    through to the bare ``[tool]`` argv, which is what made this assertion
+    environment-dependent. The pin also lets the assert be exact: the declared
+    manager wins, via its ``exec`` subcommand.
+    """
     _write(tmp_path, "package.json",
            json.dumps({"devEngines": {"packageManager": {"name": "pnpm"}}}))
+    monkeypatch.setattr(
+        pm.shutil, "which",
+        lambda name: "/usr/bin/pnpm" if name == "pnpm" else None,
+    )
     argv = pm.exec_argv(str(tmp_path), "eslint", "a.ts")
-    assert argv[0] in ("pnpm", "yarn", "bun", "npm")
-    assert argv[-1] == "a.ts"
+    assert argv == ["pnpm", "exec", "eslint", "a.ts"]
 
 
 def test_run_argv_forwards_npm_args_after_a_separator(tmp_path):

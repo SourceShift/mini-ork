@@ -1,11 +1,12 @@
 """CSV/TSV and XLSX → :class:`~mini_ork.documents.models.GridPreview`.
 
 Heavy readers are imported *inside* the functions so ``import mini_ork.documents``
-never pays for pandas/pyarrow. XLSX has a zero-dependency stdlib fallback: an
-``.xlsx`` is a ZIP of XML, so the first worksheet can be read with nothing but
-``zipfile`` + ``xml.etree`` when no pandas Excel engine is installed. A missing
-engine therefore degrades to a *working* preview, never to an empty grid — and
-when even that fails the error is explicit.
+never pays for pandas/pyarrow. Both formats have a zero-dependency stdlib
+fallback, so a missing engine degrades to a *working* preview, never to an empty
+grid — and when even that fails the error is explicit. An ``.xlsx`` is a ZIP of
+XML, readable with nothing but ``zipfile`` + ``xml.etree``; delimited text has
+the stdlib ``csv`` reader, chosen for the same explicit delimiter so the two
+tiers agree on the dialect.
 
 Delimited text is read with an explicit delimiter decided from the suffix
 (``.tsv`` → tab), never left to pandas' comma default: reading a tab-separated
@@ -39,7 +40,7 @@ _SHEET_XML = re.compile(r"xl/worksheets/sheet(\d+)\.xml\Z")
 
 
 def extract_csv(path: str, *, max_rows: int = DEFAULT_MAX_ROWS) -> GridPreview:
-    """Preview a CSV *or* TSV. Read via pandas, preferring the pyarrow engine.
+    """Preview a CSV *or* TSV. Read via pandas, else the stdlib ``csv`` reader.
 
     The delimiter is chosen from the suffix before the read — ``.tsv`` splits on
     tabs — so a tab-separated file is never silently returned as one column.
@@ -115,10 +116,38 @@ def _cell(value: Any) -> Any:
 
 
 def _read_csv(path: str) -> tuple[list[str], list[list[Any]]]:
-    import pandas as pd
+    """Read delimited text, pandas first, then the stdlib ``csv`` reader.
 
+    Two interchangeable tiers, the same shape as the XLSX readers: a host with
+    no pandas still gets a *working* grid from ``_read_csv_via_stdlib``. The
+    delimiter is decided once, before either tier, so the tiers can never
+    disagree on the dialect.
+    """
     separator = _separator(path)
-    frame = None
+    table = _read_csv_via_pandas(path, separator)
+    if table is None:
+        table = _read_csv_via_stdlib(path, separator)
+    return table
+
+
+def _read_csv_via_pandas(
+    path: str, separator: str
+) -> tuple[list[str], list[list[Any]]] | None:
+    """Read with pandas, or ``None`` when pandas is not importable.
+
+    Returning ``None`` (rather than raising ``ImportError``) is deliberate: a
+    bare interpreter with no pandas must still get a preview, from the stdlib
+    reader. A *parse* error from the C engine is not swallowed — it propagates
+    exactly as before, since pandas being present means the caller asked for
+    the pandas dialect.
+    """
+    try:
+        import pandas as pd
+    except Exception:
+        return None
+    # ``read_csv``'s stubs admit a dict return in the multi-``sep`` overloads;
+    # this call site never hits those, so bind to Any and read the frame.
+    frame: Any = None
     try:
         frame = pd.read_csv(path, sep=separator, engine="pyarrow")
     except Exception:
@@ -130,6 +159,43 @@ def _read_csv(path: str) -> tuple[list[str], list[list[Any]]]:
     columns = [str(c) for c in frame.columns]
     rows = [[_cell(v) for v in rec] for rec in frame.itertuples(index=False, name=None)]
     return columns, rows
+
+
+def _read_csv_via_stdlib(path: str, separator: str) -> tuple[list[str], list[list[Any]]]:
+    """Read sheet-less delimited text with the stdlib ``csv`` module only.
+
+    The zero-dependency tier. The delimiter is the same one the pandas tier
+    uses, so a tab-separated file is never flattened to one column, and a
+    quoted comma inside a field is handled by the reader's own quoting rules
+    rather than by a count heuristic. The first row is the header, matching the
+    pandas tier.
+    """
+    import csv
+
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+            records = list(csv.reader(handle, delimiter=separator))
+    except OSError as exc:
+        raise CorruptDocumentError(f"{path!r} could not be read: {exc}") from exc
+    if not records:
+        return [], []
+    header = [str(c) for c in records[0]]
+    rows = [[_coerce_text_cell(v) for v in rec] for rec in records[1:]]
+    return header, rows
+
+
+def _coerce_text_cell(value: str) -> Any:
+    """A stdlib-read field coerced the way pandas would have read it.
+
+    Empty fields become ``None`` (pandas' NaN) and numeric-looking fields become
+    ``int``/``float``, so the stdlib and pandas tiers are interchangeable — the
+    ``qty`` column of ``alpha,3`` reads as ``3`` either way. Genuinely textual
+    fields are returned verbatim; only the syntax pandas itself would interpret
+    is reinterpreted here.
+    """
+    if value == "":
+        return None
+    return _cell(_coerce_number(value))
 
 
 def _separator(path: str) -> str:

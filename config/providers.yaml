@@ -103,6 +103,19 @@ providers:
       CLAUDE_CODE_SUBAGENT_MODEL: deepseek-v4-flash
       CLAUDE_CODE_EFFORT_LEVEL: high
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+  # Same gateway as ``deepseek`` but the fast model, and the tail lane the
+  # committed ``MO_FALLBACK_CODING`` default ends at (``routing.py``). It MUST
+  # exist here or ``dispatch_chain`` drops it as an unknown tail lane and a
+  # coding node's last-resort rung silently collapses — the exact failure the
+  # tail-lane filter exists to surface. Same key as ``deepseek``.
+  deepseek_flash:
+    kind: anthropic-compat
+    family: gateway
+    model: deepseek-v4-flash
+    base_url: https://api.deepseek.com/anthropic
+    api_key_env: DEEPSEEK_API_KEY
+    extra_env:
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
   # Anthropic-native lanes with NO model pin and NO key export — the
   # ambient Claude Code login supplies auth + model (the cl_opus.sh /
   # cl_sonnet.sh "clear gateway pollution, export nothing" contract).
