@@ -226,6 +226,26 @@ COMMANDS: list[AvailableCommand] = [
         "Set up a run interactively: recipe, features and their cost, plan — then start.",
         "what the run should do (optional)",
     ),
+    _cmd(
+        "approve",
+        "Approve a parked node review (and resume), or approve the merge.",
+        "<run> [node]",
+    ),
+    _cmd(
+        "request-changes",
+        "Send a parked node back for revision; resumes the run from that node.",
+        "<run> <node> <what to change…>",
+    ),
+    _cmd(
+        "checkpoints",
+        "Per-node snapshots for a run (node, short sha, files changed, age).",
+        "<run>",
+    ),
+    _cmd(
+        "restore",
+        "Restore a worktree to a checkpointed node's tree (with a safety ref).",
+        "<run> <node>",
+    ),
 ]
 
 
@@ -1201,6 +1221,331 @@ async def handle_discard(agent: Any, session_id: str, arg: str) -> str:
     return f"Discarded {run_id} — its worktree and branch are gone."
 
 
+# ── /approve / /request-changes / /checkpoints / /restore ─────────────────────
+#
+# The four commands power Zed's parked-run review surface. They reuse the
+# existing review / approval / checkpoint helpers (``mini_ork.gates.node_review``,
+# ``mini_ork.gates.merge_approval``, ``mini_ork.vcs.node_checkpoint``,
+# ``mini_ork.cli.approvals_cmd._spawn_recover``) and the operator-steering
+# emit seam (``mini_ork.steering.operator_steering.emit``), so a
+# ``/approve`` from the in-app chat and ``mini-ork approvals approve`` from
+# the CLI land on the same inbox row. Errors are user-readable strings,
+# never raises — the dispatcher in :mod:`mini_ork.acp.agent` also wraps,
+# so a fault here never crashes the turn.
+
+
+def _parse_approve_arg(arg: str) -> tuple[str, str | None]:
+    """``/approve <run> [node]`` → ``(run, node_or_None)``.
+
+    Whitespace-split. Returns ``("", None)`` on an empty arg.
+    """
+    tokens = arg.strip().split()
+    if not tokens:
+        return "", None
+    return tokens[0], (tokens[1] if len(tokens) > 1 else None)
+
+
+def _parse_request_changes_arg(arg: str) -> tuple[str, str, str] | None:
+    """``/request-changes <run> <node> <note…>`` → ``(run, node, note)`` or ``None``.
+
+    The note may contain spaces; everything after the second token is the
+    note verbatim. Returns ``None`` when fewer than 3 tokens, so the
+    handler can emit a usage line. The CLI ``approvals reject`` path has
+    the same minimum-tokens contract.
+    """
+    tokens = arg.strip().split(None, 2)
+    if len(tokens) < 3:
+        return None
+    return tokens[0], tokens[1], tokens[2]
+
+
+def _ensure_safe_run_node(run: str, node: str) -> str | None:
+    """Return an error string if ``run`` or ``node`` is not a safe token; ``None`` if OK.
+
+    Reuses :func:`mini_ork.web.control._is_safe_token` so a slash command
+    cannot smuggle a path or shell metachar through the in-app chat.
+    """
+    if not run or not _is_safe_token(run):
+        return "invalid run id"
+    if not node or not _is_safe_token(node):
+        return "invalid node id"
+    return None
+
+
+def _safe_user() -> str:
+    """``zed:<getpass.getuser()>`` with a hard fallback for minimal containers."""
+    try:
+        return f"zed:{getpass.getuser()}"
+    except (OSError, KeyError):
+        return "zed:unknown"
+
+
+def _resume_parked_run(
+    *, home: Path, run_id: str, db: str, extra_args: list[str],
+) -> str:
+    """Resume a parked run once nothing is pending: the CLI's own helper.
+
+    Delegates to :func:`mini_ork.cli.approvals_cmd._maybe_resume_parked_run`
+    (rename ``.review-pause`` -> ``.review-pause.resolved``, spawn a detached
+    ``mini-ork recover``) so Zed and the CLI share one resume path. Returns
+    the helper's one-line message, or ``""`` when nothing was done; never
+    raises into the slash command.
+    """
+    from mini_ork.cli import approvals_cmd
+    try:
+        note = approvals_cmd._maybe_resume_parked_run(
+            home, run_id, db=db, extra_args=list(extra_args), no_resume=False,
+        )
+    except Exception as exc:  # noqa: BLE001 — a slash command must answer
+        return f"could not auto-resume {run_id}: {exc}\n"
+    return note or ""
+
+
+async def handle_approve(agent: Any, session_id: str, arg: str) -> str:
+    """``/approve <run> [node]`` — approve a node review (and resume), or
+    approve the merge when no node is named.
+
+    With a node: resolve the latest pending node review for
+    ``(run, node)`` as ``approved``, then if no other pending row
+    remains, rename ``.review-pause`` → ``.review-pause.resolved`` and
+    spawn a detached ``mini-ork recover --strategy resume``. Without a
+    node: the merge approval — passes the workspace's TREE sha and base
+    sha through to :func:`mini_ork.gates.merge_approval.approve`.
+    """
+    run_id, node = _parse_approve_arg(arg)
+    if not run_id:
+        return "Usage: `/approve <run> [node]`"
+    err = _ensure_safe_run_node(run_id, "x")  # validate the run token
+    if err:
+        return f"`/approve` failed: {err}"
+    home = agent._home_for(run_id)
+
+    from mini_ork.web.db import resolve_db
+    db = str(resolve_db(home, None))
+
+    if node is not None:
+        err2 = _ensure_safe_run_node(run_id, node)
+        if err2:
+            return f"`/approve` failed: {err2}"
+        from mini_ork.gates import node_review
+        from mini_ork.gates.node_review import ApprovalError
+        zed_user = _safe_user()
+        try:
+            node_review.approve_node(
+                run_id, node, approver=zed_user, db_path=db,
+            )
+        except ApprovalError as exc:
+            return f"`/approve` failed: {exc}"
+        except Exception as exc:  # noqa: BLE001
+            return f"`/approve` failed: {exc}"
+        # Resume if nothing is pending any more — does the sentinel
+        # rename + spawn through the test-friendly helper.
+        try:
+            note = _resume_parked_run(
+                home=home, run_id=run_id, db=db,
+                extra_args=["--strategy", "resume"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            note = f"could not auto-resume {run_id}: {exc}"
+        msg = f"Approved {node} on {run_id}."
+        if note:
+            msg += f"\n{note.strip()}"
+        return msg
+
+    # No node → approve the merge (the in-band equivalent of the
+    # CLI's ``approvals approve --no-resume`` workflow). The TREE sha
+    # is what ``workspaces.merge`` will write; the base sha is the
+    # worktree's recorded starting point.
+    from mini_ork import workspaces as _workspaces
+    ws = _workspaces.load(home, run_id)
+    if ws is None:
+        return f"Run {run_id} has no open workspace."
+    head_sha = _workspaces.content_sha(ws)
+    if not head_sha:
+        return f"`/approve` failed: cannot compute content sha for {run_id} at {ws.path}"
+    base_sha = ws.base_sha or ""
+    zed_user = _safe_user()
+    from mini_ork.gates import merge_approval
+    from mini_ork.gates.merge_approval import ApprovalError
+    try:
+        merge_approval.approve(
+            run_id, head_sha,
+            approver=zed_user, base_sha=base_sha,
+            branch=ws.branch, base_branch=ws.base_branch,
+            db_path=db,
+        )
+    except ApprovalError as exc:
+        return f"`/approve` failed: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        return f"`/approve` failed: {exc}"
+    return f"Approved merge of {run_id}."
+
+
+async def handle_request_changes(agent: Any, session_id: str, arg: str) -> str:
+    """``/request-changes <run> <node> <what to change…>`` — reject the
+    parked node review, emit a steering row, and resume the run from
+    that node.
+
+    Mirrors the CLI ``approvals reject`` body
+    (``mini_ork/cli/approvals_cmd.py:_cmd_reject``) so the in-app
+    command and the CLI command land on the same inbox / steering
+    rows. The detached ``mini-ork recover --from-node <node>
+    --strategy retry`` is spawned through the same ``_spawn_recover``
+    helper the agent's parked-run card uses.
+    """
+    parsed = _parse_request_changes_arg(arg)
+    if parsed is None:
+        return "Usage: `/request-changes <run> <node> <what to change…>`"
+    run_id, node, note = parsed
+    err = _ensure_safe_run_node(run_id, node)
+    if err:
+        return f"`/request-changes` failed: {err}"
+    home = agent._home_for(run_id)
+
+    from mini_ork.web.db import resolve_db
+    db = str(resolve_db(home, None))
+    zed_user = _safe_user()
+
+    from mini_ork.gates import node_review
+    from mini_ork.gates.node_review import ApprovalError
+    try:
+        node_review.request_changes(
+            run_id, node, approver=zed_user, note=note, db_path=db,
+        )
+    except ApprovalError as exc:
+        return f"`/request-changes` failed: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        return f"`/request-changes` failed: {exc}"
+
+    # Steering row: scope the DB to this run's home so a thread that
+    # serves several homes cannot leak the note into the wrong DB.
+    # ``operator_steering.emit`` has no ``db_path`` kwarg; it resolves
+    # ``MINI_ORK_DB`` itself, so we set it through a scoped env block.
+    # A failure here MUST be surfaced — the CLI ``_cmd_reject`` was made
+    # fail-loud for exactly this defect: a silent swallow let a retry
+    # run without the reviewer's note, repeating the original bug.
+    from mini_ork import context as _ctx
+    steering_warning = ""
+    try:
+        with _ctx.scoped_environ({"MINI_ORK_DB": db}):
+            from mini_ork.steering import operator_steering
+            operator_steering.emit(
+                message=f"Human reviewer requested changes to node {node}: {note}",
+                run_id=run_id,
+                role_target="any",
+                severity="warn",
+                source="review",
+            )
+    except Exception as exc:  # noqa: BLE001 — capture for the warning line
+        steering_warning = (
+            f"warning: reviewer note did NOT reach operator_steering "
+            f"({exc!r}); the retry will run without it."
+        )
+
+    try:
+        spawn_note = _resume_parked_run(
+            home=home, run_id=run_id, db=db,
+            extra_args=["--from-node", node, "--strategy", "retry"],
+        )
+    except Exception as exc:  # noqa: BLE001
+        spawn_note = f"could not auto-resume {run_id}: {exc}"
+    msg = f"Requested changes on {node} for {run_id}."
+    if spawn_note:
+        msg += f"\n{spawn_note.strip()}"
+    if steering_warning:
+        msg += f"\n{steering_warning}"
+    return msg
+
+
+async def handle_checkpoints(agent: Any, session_id: str, arg: str) -> str:
+    """``/checkpoints <run>`` — markdown table of the run's per-node
+    snapshots (node, short sha, files changed, age).
+
+    Reuses :func:`mini_ork.cli.board_cmd._act_checkpoints` so the
+    in-app command and ``mini-ork board checkpoints <run>`` render
+    the same rows. A run with no worktree record returns a
+    one-line refusal.
+    """
+    run_id = arg.strip().split()
+    run_id = run_id[0] if run_id else ""
+    if not run_id or not _is_safe_token(run_id):
+        return "Usage: `/checkpoints <run>`"
+    home = agent._home_for(run_id)
+    from mini_ork.cli import board_cmd
+    try:
+        result = board_cmd._act_checkpoints(home, run_id)
+    except Exception as exc:  # noqa: BLE001
+        return f"`/checkpoints` failed: {exc}"
+    if not isinstance(result, dict) or not result.get("ok"):
+        err = (
+            (result or {}).get("error")
+            or (result or {}).get("reason")
+            or "unknown error"
+        )
+        return f"`/checkpoints` failed: {err}"
+    items = result.get("checkpoints") or []
+    if not items:
+        return f"No checkpoints for {run_id}."
+    now = int(time.time())
+    rows = ["| node | sha | files | age |", "|---|---|---|---|"]
+    for ck in items:
+        node = str(ck.get("node") or "")
+        sha = str(ck.get("sha") or "")
+        files = ck.get("files_changed", 0)
+        try:
+            from mini_ork.acp.automation_view import _ago
+            age = _ago(int(ck.get("created") or 0), now)
+        except Exception:  # noqa: BLE001 — _ago is best-effort
+            age = "—"
+        rows.append(f"| `{node}` | `{sha[:6]}` | {files} | {age} |")
+    return f"Checkpoints for `{run_id}`:\n\n" + "\n".join(rows)
+
+
+async def handle_restore(agent: Any, session_id: str, arg: str) -> str:
+    """``/restore <run> <node>`` — restore the run's worktree to the
+    checkpointed tree, reporting ``restored_to`` and a safety ref the
+    user can use to undo the restore.
+
+    Refusals (``unknown node``, ``not the run's workspace``, ``run is
+    live``) come back from :func:`mini_ork.vcs.node_checkpoint.restore`
+    with the reason in ``result["reason"]``; the handler surfaces that
+    verbatim, no file is touched.
+    """
+    tokens = arg.strip().split()
+    if len(tokens) < 2:
+        return "Usage: `/restore <run> <node>`"
+    run_id, node = tokens[0], tokens[1]
+    err = _ensure_safe_run_node(run_id, node)
+    if err:
+        return f"`/restore` failed: {err}"
+    home = agent._home_for(run_id)
+    from mini_ork.cli import board_cmd
+    try:
+        result = board_cmd._act_restore(home, run_id, node)
+    except Exception as exc:  # noqa: BLE001
+        return f"`/restore` failed: {exc}"
+    if not isinstance(result, dict) or not result.get("ok"):
+        reason = (
+            (result or {}).get("reason")
+            or (result or {}).get("error")
+            or "unknown error"
+        )
+        return f"`/restore` refused: {reason}"
+    restored_to = str(result.get("restored_to") or "")
+    safety_ref = str(result.get("safety_ref") or "")
+    short = restored_to[:6] if restored_to else ""
+    # The safety ref is ``refs/mini-ork/ckpt/<run>/_pre-restore-<ts>``;
+    # the undo node is the ref's last segment.
+    safety_node = safety_ref.rsplit("/", 1)[-1] if safety_ref else ""
+    if safety_node:
+        undo = f"Undo with `/restore {run_id} {safety_node}`."
+    else:
+        undo = "No safety ref was recorded; the restore is permanent."
+    return (
+        f"Restored {run_id} to `{short}`. {undo}"
+    )
+
+
 # ── /automations / /automation … (Zed S6b-1) ─────────────────────────────────
 #
 # ``HANDLERS`` keys must be explicit so the longest-match dispatcher in
@@ -1470,6 +1815,10 @@ HANDLERS: dict[str, Handler] = {
     "workspaces": handle_workspaces,
     "merge": handle_merge,
     "discard": handle_discard,
+    "approve": handle_approve,
+    "request-changes": handle_request_changes,
+    "checkpoints": handle_checkpoints,
+    "restore": handle_restore,
     "automations": handle_automations,
     "automation": handle_automation,
     "automation new": handle_automation_new,

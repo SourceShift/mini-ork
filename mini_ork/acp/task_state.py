@@ -57,6 +57,10 @@ COST_PAUSE_DETAIL = (
     "/resume <run> continues it, /stop <run> ends it."
 )
 NEEDS_YOU_PREFIX = "Waiting for your answer: "
+# Detail line for the parked-run review sentinel (kickoff rule 1 — node
+# review). The awaiting list is joined with ``", "`` so the user sees every
+# node still pending review in one phrase.
+REVIEW_WAIT_PREFIX = "Waiting for your review: "
 PUBLISHED_DETAIL = "Published"
 WORKING_PREFIX = "Working: "
 STARTING_DETAIL = "Starting"
@@ -530,6 +534,34 @@ def task_state(run_dir: Path, snapshot: dict[str, Any]) -> TaskState:
             removed=0,
         )
 
+    # Rule 1.5 (parked review): a run whose ``status`` is ``"reviewing"``
+    # and that carries a ``.review-pause`` sentinel in its run dir is
+    # waiting on a human to ``/approve`` or ``/request-changes`` a node
+    # (kickoff §"Behaviour §1"). The sentinel's ``awaiting`` list names
+    # every node still under review; ``waiting_node`` is the node that
+    # was current when the run was parked (a hint, not a unique id —
+    # multiple nodes can be pending at once). Both halves are required:
+    # a ``reviewing`` row with no sentinel means the run's already past
+    # the park step, and a stray sentinel on a non-reviewing row is
+    # stale state from a previous cycle. Cheap: only paid when the row
+    # is parked and the sentinel is on disk.
+    if path is not None and status == "reviewing" and (path / ".review-pause").is_file():
+        pause = _read_json_obj(path / ".review-pause") or {}
+        waiting_node = str(pause.get("waiting_node") or "")
+        awaiting_raw = pause.get("awaiting")
+        awaiting = [str(n) for n in awaiting_raw if isinstance(n, (str, int))] \
+            if isinstance(awaiting_raw, list) else []
+        if not awaiting and waiting_node:
+            awaiting = [waiting_node]
+        if awaiting:
+            return TaskState(
+                state="needs_you",
+                detail=REVIEW_WAIT_PREFIX + ", ".join(awaiting),
+                step=_current_step(events),
+                added=0,
+                removed=0,
+            )
+
     # Rule 2: an execute_blocked event with human_questions.
     for ev in events:
         if ev.get("event_type") != "execute_blocked":
@@ -769,6 +801,17 @@ def run_mark(status: str | None, run_dir: Path | None) -> str:
         "published",
         "rolled_back",
         "failed",
+    ):
+        return MARKS["needs_you"]
+    # Mirrors ``task_state`` rule 1.5 — a parked review with a
+    # ``.review-pause`` sentinel in place is needs-you, not working.
+    # Both halves required so a reviewing row with no sentinel (already
+    # past the park) keeps its prior mark, and a stale sentinel on a
+    # non-reviewing row is ignored.
+    if (
+        path is not None
+        and status == "reviewing"
+        and (path / ".review-pause").is_file()
     ):
         return MARKS["needs_you"]
     if status in ("failed", "rolled_back") and path is not None:

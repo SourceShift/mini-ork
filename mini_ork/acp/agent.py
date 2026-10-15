@@ -744,6 +744,13 @@ class MiniOrkAcpAgent:
         # lifecycles (a review offer is discarded on merge / discard; a repair
         # offer is not). Mirrors the review set's "never re-fire" contract.
         self._lane_repair_emitted: set[str] = set()
+        # (run id, waiting_node) → True once the parked-run review card was
+        # offered (or the one-time message fired). Mirrors
+        # ``_ready_to_review_emitted``'s "one card per (run, waiting_node)"
+        # contract so a chatty follow loop does not re-ask on every poll. The
+        # key is the (run, waiting_node) pair, not just the run id — a re-park
+        # on a different node is a different question and must re-fire.
+        self._node_review_emitted: set[tuple[str, str]] = set()
         # run id → the ``/recover`` log path once a resume was started, so
         # ``_follow_in_thread`` can cite it if the resume never reaches the
         # executor (the reply the decision handler reads carries the path).
@@ -3536,6 +3543,13 @@ class MiniOrkAcpAgent:
             stop = await self._await_terminal(run_id)
             if stop == "cancelled":
                 return stop  # the run may still be going; leave its marker open
+            if stop == "review_resuming":
+                # Approved and handed to ``recover``, which has not flipped
+                # the row yet: end the turn, keep the marker open.
+                await self._emit(thread_id, self._build_refusal_message(
+                    f"Run {run_id} was approved and is resuming. "
+                    f"`/status {run_id}` to follow it."))
+                return "end_turn"
             ok = stop == "end_turn" and self._run_status.get(run_id) == "published"
             if ok and await self._deliver_to_zed(thread_id, run_id):
                 await self._emit(thread_id, ToolCallProgress(
@@ -3547,6 +3561,14 @@ class MiniOrkAcpAgent:
                 return stop
             if await self._offer_run_review(thread_id, run_id):
                 return stop  # S5 buttons/message — the marker stays open
+            # Parked-run review card: fires when the followed run ended
+            # ``reviewing`` with a ``.review-pause`` sentinel in place.
+            # Sits BEFORE the lane-repair branch so a parked run is not
+            # mis-read as a lane failure; the card replaces the
+            # "Ready to review" / repair prompts because the human
+            # decision it is asking for is a different one.
+            if await self._offer_node_review(thread_id, run_id):
+                return stop  # review card/message — marker stays open
             if not ok:
                 if resumes < _LANE_REPAIR_MAX_RESUMES:
                     repair = await self._offer_lane_repair(thread_id, run_id)
@@ -3691,6 +3713,339 @@ class MiniOrkAcpAgent:
             + ". Review it like any agent edit — **Review Changes**, or the changed-files"
             " bar above the message box — and Keep or Reject each change.\n\n"))
         return True
+
+    def _read_pause_payload(self, run_id: str) -> dict[str, Any] | None:
+        """``{"waiting_node", "awaiting", ...}`` from the LIVE ``.review-pause``,
+        or ``None`` when the run isn't parked.
+
+        The sentinel is the same file :func:`mini_ork.cli.approvals_cmd._maybe_resume_parked_run`
+        reads on resume, so the writer (``execute_handlers.py``) and the
+        readers (``task_state``, this method) agree on the shape. Returns
+        ``None`` for a missing or unparsable file so callers fall through
+        cleanly. The live file is the only source of truth: the
+        ``.review-pause.resolved`` audit file is a resume receipt, not a
+        parked-run signal, so reading it here would re-offer the card for
+        a run that already resumed and ended (e.g. ``failed`` /
+        ``published``) and let the stale card hijack the lane-repair /
+        marker-close path.
+        """
+        run_dir = self._home_for(run_id) / "runs" / run_id
+        path = run_dir / ".review-pause"
+        if not path.is_file():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _pending_awaiting_node_ids(
+        self, run_id: str, awaiting: list[str],
+    ) -> list[str]:
+        """``awaiting`` filtered to nodes that still have a pending inbox row.
+
+        ``.review-pause.awaiting`` is the snapshot the executor wrote when
+        it parked the run; the inbox is the live state. A node that was
+        already approved or rejected between parking and re-asking should
+        be skipped so we don't blow up on ``ApprovalError("no pending
+        node review …")`` from ``node_review.approve_node``.
+        """
+        try:
+            from mini_ork.gates import node_review
+            from mini_ork.web.db import resolve_db
+            home = self._home_for(run_id)
+            db = str(resolve_db(home, None))
+            pending = node_review.pending_for_run(run_id, db_path=db)
+        except Exception:  # noqa: BLE001 — best-effort
+            return list(awaiting)
+        # The pending row stores the node id inside ``context`` (``"node_id":
+        # "implementer"``), not at the top level — see ``_resolve_or_enqueue``
+        # in :mod:`mini_ork.gates.node_review`. Walk both layers so a
+        # top-level rename later cannot quietly desync.
+        def _node_id(p: dict[str, Any]) -> str:
+            if not isinstance(p, dict):
+                return ""
+            ctxt = p.get("context")
+            if isinstance(ctxt, dict):
+                cid = ctxt.get("node_id")
+                if cid:
+                    return str(cid)
+            return str(p.get("node_id") or "")
+
+        pending_ids = {_node_id(p) for p in pending}
+        return [n for n in awaiting if n in pending_ids]
+
+    async def _offer_node_review(self, thread_id: str, run_id: str) -> bool:
+        """Offer Approve / Request changes / Later buttons when a followed
+        run ends parked for node review.
+
+        The card is offered at the same hook point as the existing
+        Merge/Discard card (``_follow_in_thread`` after
+        ``_await_terminal`` returns ``end_turn``), with the same
+        active-turn contract: an active turn gets the buttons, an inactive
+        one gets a one-time text message pointing at ``/approve`` and
+        ``/request-changes``. ``tool_call_id`` is ``f"{run_id}:review"``
+        — fresh, no preceding ``ToolCallStart`` (the kickoff's contract;
+        Zed renders the card standalone).
+
+        Returns ``True`` when the card was offered OR the one-time
+        message fired; the caller (``_follow_in_thread``) leaves the
+        marker ``in_progress`` until the user picks. Returns ``False``
+        when the run is no longer parked (no active ``.review-pause``
+        sentinel) so the caller falls through to the existing logic.
+        """
+        # Status guard: a stale ``.review-pause`` on disk for a run that
+        # is no longer ``reviewing`` is leftover state from a previous
+        # cycle (the run was parked, approved, resumed, then ended
+        # ``failed`` / ``published``). Without this check the card would
+        # fire on the follow-up poll, the lane-repair offer would be
+        # skipped, and the ``<run>:parent`` marker would never close.
+        # ``_await_terminal`` already gates on the same status sentinel
+        # pair, so this stays in lock-step with that check.
+        if self._run_status.get(run_id) != "reviewing":
+            return False
+        pause = self._read_pause_payload(run_id)
+        if not pause:
+            return False
+        waiting_node = str(pause.get("waiting_node") or "")
+        awaiting_raw = pause.get("awaiting")
+        awaiting = [str(n) for n in awaiting_raw if isinstance(n, (str, int))] \
+            if isinstance(awaiting_raw, list) else []
+        if not awaiting and waiting_node:
+            awaiting = [waiting_node]
+        if not awaiting:
+            return False
+        dedup_key = (run_id, waiting_node or awaiting[0])
+        if dedup_key in self._node_review_emitted:
+            return True
+        self._node_review_emitted.add(dedup_key)
+        # Filter to awaiting nodes that still have a live inbox row, so a
+        # node already approved by another channel isn't re-approved (which
+        # would raise from ``approve_node``). The agent text below names
+        # whatever is left to resolve.
+        live_awaiting = self._pending_awaiting_node_ids(run_id, awaiting)
+        # One card per still-pending node, in order: a multi-node park walks
+        # every node here (the dedup key only stops a re-offer on the next
+        # poll). A node already resolved elsewhere is skipped; when nothing
+        # is live any more, the single card resolves to the resume check.
+        queue = live_awaiting or awaiting[:1]
+        active_turn = (
+            self._direct_runs.get(thread_id) == run_id
+            or self._orchestrator_tasks.get(thread_id) is not None
+        )
+        if active_turn and self._conn is not None:
+            for node in queue:
+                option_id = await self._ask_node_review(thread_id, run_id, node)
+                if option_id != "approve":
+                    await self._handle_node_review_decision(
+                        thread_id, run_id, [node], live_awaiting, option_id,
+                    )
+                    return True
+                await self._approve_parked_run(thread_id, run_id, [node], live_awaiting)
+            return True
+        # No active turn / no connection: a one-time message with the
+        # commands the user can type. Mirrors the merge card's
+        # ``_emit_ready_to_review_once`` fallback. The ``/approve`` form
+        # names the node — without it, ``handle_approve`` routes to the
+        # merge-approval branch, the run stays parked, and a workspace
+        # present at the same time would let the user merge a mid-run tree.
+        await self._emit(
+            thread_id,
+            self._build_refusal_message(
+                f"Run {run_id} is waiting for your review of {', '.join(queue)}: "
+                f"/approve {run_id} {queue[0]} or "
+                f"/request-changes {run_id} {queue[0]} <what to change>."
+            ),
+        )
+        return True
+
+    async def _ask_node_review(self, thread_id: str, run_id: str, node: str) -> str | None:
+        """Show the Approve / Request changes / Later card for one node and
+        return the picked option id (``None`` when dismissed or on error)."""
+        try:
+            response = await self._conn.request_permission(
+                session_id=thread_id,
+                tool_call=ToolCallUpdate(
+                    tool_call_id=f"{run_id}:review",
+                    kind="other",
+                    title=f"Review {node} of run {run_id}",
+                    status="pending",
+                ),
+                options=[
+                    PermissionOption(
+                        option_id="approve",
+                        name="Approve and resume",
+                        kind="allow_once",
+                    ),
+                    PermissionOption(
+                        option_id="changes",
+                        name="Request changes…",
+                        kind="reject_once",
+                    ),
+                    PermissionOption(
+                        option_id="later",
+                        name="Later",
+                        kind="reject_once",
+                    ),
+                ],
+            )
+        except Exception:  # noqa: BLE001 — UI is best-effort
+            return None
+        outcome = getattr(response, "outcome", None) if response is not None else None
+        return getattr(outcome, "option_id", None) if outcome is not None else None
+
+    async def _handle_node_review_decision(
+        self,
+        thread_id: str,
+        run_id: str,
+        awaiting: list[str],
+        live_awaiting: list[str],
+        option_id: str | None,
+    ) -> None:
+        """Apply the user's pick on the parked-run review card.
+
+        ``approve`` resolves the single node named on the card (the one
+        the human was shown) and — if no other pending row remains —
+        renames the sentinel and spawns a detached
+        ``mini-ork recover --strategy resume``; a multi-node parked run
+        stays open for the next awaiting node to get its own card.
+        ``changes`` directs the user to ``/request-changes`` (the
+        in-band verb, since the card cannot carry free text).
+        ``later`` / dismissed → a message listing both commands. Never
+        raises into the caller — every helper below catches its own
+        errors.
+        """
+        if option_id == "approve":
+            try:
+                await self._approve_parked_run(
+                    thread_id, run_id, awaiting, live_awaiting,
+                )
+            except Exception as exc:  # noqa: BLE001
+                await self._emit(
+                    thread_id,
+                    self._build_refusal_message(
+                        f"`/approve` failed: {exc}"
+                    ),
+                )
+            return
+        if option_id == "changes":
+            node = awaiting[0]
+            await self._emit(
+                thread_id,
+                self._build_refusal_message(
+                    f"To request changes, type `/request-changes {run_id} {node} <what to change>`."
+                ),
+            )
+            return
+        # ``later`` / dismissed / no outcome: the marker stays open and
+        # the user can type either verb when ready.
+        node = awaiting[0]
+        await self._emit(
+            thread_id,
+            self._build_refusal_message(
+                f"Run {run_id} is parked for review of {', '.join(awaiting)}. "
+                f"Type `/approve {run_id} {node}` to approve, or "
+                f"`/request-changes {run_id} {node} <what to change>` to send it back."
+            ),
+        )
+
+    async def _approve_parked_run(
+        self,
+        thread_id: str,
+        run_id: str,
+        awaiting: list[str],
+        live_awaiting: list[str],
+    ) -> None:
+        """Approve the single node named on the review card, then resume
+        the run (if no other pending row remains) and emit a one-line
+        confirmation.
+
+        The card title names only ``awaiting[0]``; approving every node
+        in ``live_awaiting`` would silently approve outputs the human
+        was never shown, so we resolve the named node and let the
+        follow loop fire a fresh card for the next awaiting node on
+        the next poll (the dedup key is ``(run, waiting_node)``, so
+        each next node gets its own card).
+
+        The rename-and-spawn resume goes through
+        :func:`mini_ork.acp.commands._resume_parked_run` — the same
+        helper ``/approve`` and ``/request-changes`` use — so all
+        three entry points land on the same resume code path. When
+        other pending rows remain (multi-node parked run), the helper
+        returns ``""`` and the marker stays open until the user
+        resolves the next awaiting node.
+        """
+        import getpass
+        try:
+            zed_user = f"zed:{getpass.getuser()}"
+        except (OSError, KeyError):
+            zed_user = "zed:unknown"
+
+        home = self._home_for(run_id)
+        from mini_ork.web.db import resolve_db
+        db = str(resolve_db(home, None))
+
+        named_node = awaiting[0]
+        # If the named node is already resolved by another channel, the
+        # approval is a no-op: skip the inbox write and fall through to
+        # the resume check. ``live_awaiting`` lists every still-pending
+        # node the snapshot knew about; ``named_node in live_awaiting``
+        # is the precise "is this the next thing the user was shown?"
+        # check, avoiding an ``ApprovalError("no pending node review …")``.
+        if named_node not in live_awaiting:
+            text = (
+                f"Approved {named_node} on {run_id} (already resolved). "
+                f"`/status {run_id}` to watch."
+            )
+            try:
+                from mini_ork.acp import commands as _commands
+                note = _commands._resume_parked_run(
+                    home=home, run_id=run_id, db=db,
+                    extra_args=["--strategy", "resume"],
+                )
+            except Exception as exc:  # noqa: BLE001
+                note = f"could not auto-resume {run_id}: {exc}"
+            if note:
+                text += f"\n{note.strip()}"
+            await self._emit(thread_id, self._build_refusal_message(text))
+            return
+
+        try:
+            from mini_ork.gates import node_review
+            node_review.approve_node(
+                run_id, named_node, approver=zed_user, db_path=db,
+            )
+        except Exception as exc:  # noqa: BLE001
+            await self._emit(
+                thread_id,
+                self._build_refusal_message(
+                    f"`/approve {run_id}` failed: {exc}"
+                ),
+            )
+            return
+
+        # Resume through the shared helper: if other awaiting nodes are
+        # still pending, the helper is a no-op and the marker stays open
+        # for the next card; if everything is resolved, it renames the
+        # sentinel and spawns the detached ``mini-ork recover``.
+        try:
+            from mini_ork.acp import commands as _commands
+            note = _commands._resume_parked_run(
+                home=home, run_id=run_id, db=db,
+                extra_args=["--strategy", "resume"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            note = f"could not auto-resume {run_id}: {exc}"
+
+        text = (
+            f"Approved {named_node} on {run_id}. `/status {run_id}` to watch."
+        )
+        if note:
+            text += f"\n{note.strip()}"
+        await self._emit(
+            thread_id,
+            self._build_refusal_message(text),
+        )
 
     async def _offer_run_review(self, thread_id: str, run_id: str, *, force: bool = False) -> bool:
         """Offer Merge / Discard / Keep buttons on the run's marker when the
@@ -4528,7 +4883,9 @@ class MiniOrkAcpAgent:
         The byte offset advances regardless of the cap, so a chatty node
         drains across subsequent polls instead of back-pressuring the loop.
 
-        The four ``LiveEvent.kind`` values map to two ACP update types:
+        The four ``LiveEvent.kind`` values map to two ACP update types
+        (built once by :meth:`_build_live_progress` and shared with
+        :meth:`_replay_live_for`):
 
         * ``thought`` → ``AgentThoughtChunk`` (agent's own reasoning);
         * ``text`` / ``tool`` / ``tool_output`` → ``ToolCallProgress`` chunks
@@ -4540,10 +4897,8 @@ class MiniOrkAcpAgent:
         Z-following: a ``LiveEvent`` whose ``path`` is non-empty also carries
         a single ``ToolCallLocation(path, line)`` so the editor's "follow the
         agent" crosshair can jump straight to the file the chunk describes.
-        Absolute paths are used as-is; relative paths are resolved against
-        the session's cwd (``self._sessions[session_id]``); when no cwd is
-        known the ``locations`` field is omitted (never guessed). The last
-        ``(path, line)`` per ``(session_id, node_id)`` is remembered so a
+        The shared helper applies the path → absolute → ``ToolCallLocation``
+        logic; this method only owns the per-poll dedup bookkeeping so a
         steady stream of tool calls on the same file does not reopen the
         same buffer on every chunk — only the first (or a changed) location
         re-asserts; the text chunk still flows.
@@ -4572,72 +4927,11 @@ class MiniOrkAcpAgent:
             new_locations: list[tuple[str, int | None] | None] = []
             for rec in records:
                 for ev in self._final_answer_once(session_id, node_id, normalize(rec)):
-                    if ev.kind == "thought":
-                        events.append(
-                            AgentThoughtChunk(
-                                session_update="agent_thought_chunk",
-                                content=TextContentBlock(
-                                    type="text",
-                                    text=f"[{node_id}] {ev.text}",
-                                ),
-                            )
-                        )
-                        new_locations.append(None)
-                    else:
-                        # Z-following: attach a single
-                        # ``ToolCallLocation(path, line)`` so the editor's
-                        # "follow the agent" crosshair can jump straight
-                        # to the file the chunk describes. Absolute paths
-                        # go through; relative paths join
-                        # ``self._sessions[session_id]``; an unknown cwd
-                        # omits ``locations`` (never guessed). A repeated
-                        # ``(path, line)`` for the same (session, node)
-                        # dedups to ``None`` so Zed does not reopen the
-                        # same buffer on every chunk — the text chunk
-                        # still flows.
-                        locations: list[ToolCallLocation] | None = None
-                        new_loc: tuple[str, int | None] | None = None
-                        path = getattr(ev, "path", "")
-                        if path:
-                            cwd = self._sessions.get(session_id) or ""
-                            if os.path.isabs(path):
-                                abs_path = path
-                            elif cwd:
-                                abs_path = os.path.normpath(
-                                    os.path.join(cwd, path)
-                                )
-                            else:
-                                abs_path = ""
-                            if abs_path:
-                                line = (
-                                    ev.line
-                                    if isinstance(ev.line, int) and ev.line >= 0
-                                    else None
-                                )
-                                key = (session_id, node_id)
-                                last = local_dedup.get(key)
-                                if last is None or last != (abs_path, line):
-                                    new_loc = (abs_path, line)
-                                    locations = [ToolCallLocation(
-                                        path=abs_path, line=line
-                                    )]
-                                    local_dedup[key] = new_loc
-                        events.append(
-                            ToolCallProgress(
-                                session_update="tool_call_update",
-                                tool_call_id=node_id,
-                                content=[
-                                    ContentToolCallContent(
-                                        type="content",
-                                        content=TextContentBlock(
-                                            type="text", text=ev.text
-                                        ),
-                                    )
-                                ],
-                                locations=locations,
-                            )
-                        )
-                        new_locations.append(new_loc)
+                    update, new_loc = self._build_live_progress(
+                        session_id, node_id, ev, local_dedup,
+                    )
+                    events.append(update)
+                    new_locations.append(new_loc)
             # Per-poll cap (kickoff §3): the byte offset already advanced
             # past these records, so subsequent polls keep making progress.
             # Only advance the durable dedup state for events actually
@@ -4647,6 +4941,96 @@ class MiniOrkAcpAgent:
                 await self._emit(session_id, update)
                 if new_loc is not None:
                     self._live_locations_sent[(session_id, node_id)] = new_loc
+
+    def _build_live_progress(
+        self,
+        session_id: str,
+        node_id: str,
+        ev: Any,
+        dedup: dict[tuple[str, str], tuple[str, int | None]] | None,
+    ) -> tuple[Any, tuple[str, int | None] | None]:
+        """One ``LiveEvent`` → ``(update, new_loc)``.
+
+        Shared by :meth:`_drain_live_for` (live path, with a per-poll
+        working-copy dedup that the caller advances) and
+        :meth:`_replay_live_for` (history replay, with ``dedup=None``
+        so EVERY replayed event with a path emits its location — the
+        replay is history, each file chip in Zed must be clickable,
+        even when two events in a row carry the same path).
+
+        The location construction is identical for both call sites:
+
+        * absolute ``LiveEvent.path`` → kept as-is;
+        * relative path → joined to the session's cwd
+          (``self._sessions[session_id]``);
+        * unknown cwd → ``locations`` is omitted (never guessed);
+        * the ``line`` field is a non-negative int when present,
+          else ``None``;
+        * a repeated ``(path, line)`` for the same ``(session, node)``
+          is deduped when ``dedup`` is not ``None`` (the caller advances
+          ``_live_locations_sent``). When ``dedup`` is ``None`` (replay)
+          every event with a path emits a location.
+
+        Returns ``(update, new_loc)``:
+
+        * ``update`` is an ``AgentThoughtChunk`` for ``kind == "thought"``
+          and a ``ToolCallProgress`` for every other kind;
+        * ``new_loc`` is the new ``(path, line)`` the caller should
+          remember, or ``None`` when no location was attached (the
+          thought branch, the text-without-path branch, a deduped
+          location, or replay with no path).
+        """
+        if ev.kind == "thought":
+            update = AgentThoughtChunk(
+                session_update="agent_thought_chunk",
+                content=TextContentBlock(
+                    type="text",
+                    text=f"[{node_id}] {ev.text}",
+                ),
+            )
+            return update, None
+        # text / tool / tool_output → ToolCallProgress; attach a single
+        # ``ToolCallLocation(path, line)`` for events that carry a path.
+        locations: list[ToolCallLocation] | None = None
+        new_loc: tuple[str, int | None] | None = None
+        path = getattr(ev, "path", "")
+        if path:
+            cwd = self._sessions.get(session_id) or ""
+            if os.path.isabs(path):
+                abs_path = path
+            elif cwd:
+                abs_path = os.path.normpath(os.path.join(cwd, path))
+            else:
+                abs_path = ""
+            if abs_path:
+                line = (
+                    ev.line
+                    if isinstance(ev.line, int) and ev.line >= 0
+                    else None
+                )
+                attach = True
+                if dedup is not None:
+                    key = (session_id, node_id)
+                    last = dedup.get(key)
+                    if last is not None and last == (abs_path, line):
+                        attach = False
+                if attach:
+                    new_loc = (abs_path, line)
+                    locations = [ToolCallLocation(path=abs_path, line=line)]
+                    if dedup is not None:
+                        dedup[key] = new_loc
+        update = ToolCallProgress(
+            session_update="tool_call_update",
+            tool_call_id=node_id,
+            content=[
+                ContentToolCallContent(
+                    type="content",
+                    content=TextContentBlock(type="text", text=ev.text),
+                )
+            ],
+            locations=locations,
+        )
+        return update, new_loc
 
     def _final_answer_once(self, session_id: str, node_id: str, events: list[Any]) -> list[Any]:
         """Pass live events through, keeping a node's final ``result`` only when
@@ -4673,40 +5057,33 @@ class MiniOrkAcpAgent:
         load replay. Each tail is opened from offset 0 and discarded at the
         end so a later ``_follow`` starts with a clean offset — there is no
         double-emission.
+
+        Per kickoff §2b, replay attaches a ``ToolCallLocation`` to every
+        event that carries a path — the replay is history, so each file
+        chip in Zed must be clickable. The dedup state
+        (``_live_locations_sent``) is the live drain's concern, so the
+        replay passes ``dedup=None`` to :meth:`_build_live_progress`,
+        which makes the helper attach a location to EVERY event that
+        carries a path (two events in a row sharing the same path both
+        re-assert it) and never advances the live dedup state.
         """
         for node_id in node_ids:
             tail = self._ensure_tail(session_id, node_id)
             records = tail.read_new()  # offset 0 on first use
             if not records:
                 continue
+            # ``dedup=None`` in the replay path: every replayed event
+            # with a path emits its location (the replay is history,
+            # each file chip in Zed must be clickable, even when two
+            # events in a row share the same path) and the live dedup
+            # ``_live_locations_sent`` is NEVER touched.
             events: list[Any] = []
             for rec in records:
                 for ev in self._final_answer_once(session_id, node_id, normalize(rec)):
-                    if ev.kind == "thought":
-                        events.append(
-                            AgentThoughtChunk(
-                                session_update="agent_thought_chunk",
-                                content=TextContentBlock(
-                                    type="text",
-                                    text=f"[{node_id}] {ev.text}",
-                                ),
-                            )
-                        )
-                    else:
-                        events.append(
-                            ToolCallProgress(
-                                session_update="tool_call_update",
-                                tool_call_id=node_id,
-                                content=[
-                                    ContentToolCallContent(
-                                        type="content",
-                                        content=TextContentBlock(
-                                            type="text", text=ev.text
-                                        ),
-                                    )
-                                ],
-                            )
-                        )
+                    update, _new_loc = self._build_live_progress(
+                        session_id, node_id, ev, None,
+                    )
+                    events.append(update)
             tail.offset = 0  # future polls start at offset 0, not replay
             # Tail is the last ``_LIVE_REPLAY_LIMIT`` events.
             for update in events[-_LIVE_REPLAY_LIMIT:]:
@@ -4962,6 +5339,7 @@ class MiniOrkAcpAgent:
         # Start-timeout clock runs once per turn (kicks off at the first poll).
         start_deadline = time.monotonic() + self._start_timeout_s
         pid_gone_observed = False
+        resume_deadline: float | None = None
         while True:
             if session_id in self._cancelled:
                 return "cancelled"
@@ -5000,6 +5378,37 @@ class MiniOrkAcpAgent:
                     return "refusal"
             if snapshot.get("status") in TERMINAL_STATUSES:
                 return "end_turn"
+            # Parked review: ``status == "reviewing"`` is not in
+            # ``TERMINAL_STATUSES`` (it has 12 consumers that would treat
+            # a paused run as finished). The run is blocked on a human
+            # decision — ``_follow_in_thread`` will offer the review
+            # card. Gating on the LIVE ``.review-pause`` sentinel is
+            # load-bearing: a ``reviewing`` row with no sentinel has
+            # already moved past the park step (the executor renamed it
+            # to ``.review-pause.resolved`` on resume). The audit file
+            # alone is NOT enough — it would also match a run whose
+            # resume just finished ``failed`` and is still indexed as
+            # ``reviewing`` because the executor hasn't flipped the
+            # row yet, and that race would close the marker as
+            # ``failed`` via the lane-repair fall-through. Keep polling
+            # in that case so the terminal-status check above wins.
+            if snapshot.get("status") == "reviewing":
+                run_dir = self._home_for(session_id) / "runs" / session_id
+                if (run_dir / ".review-pause").is_file():
+                    return "end_turn"
+                # Resolved (sentinel renamed to ``.review-pause.resolved``)
+                # but the row is still ``reviewing``: the resume is about to
+                # flip it, so keep polling for a bounded grace (30 polls).
+                # Never ``end_turn`` here — that sends ``_follow_in_thread``
+                # into the lane-repair fall-through and closes a resuming
+                # run's marker as failed. Past the grace (a resume that never
+                # started), hand back ``review_resuming``: the caller ends the
+                # turn and leaves the marker open.
+                if (run_dir / ".review-pause.resolved").is_file():
+                    if resume_deadline is None:
+                        resume_deadline = time.monotonic() + max(30 * self._poll_interval, 1.0)
+                    elif time.monotonic() >= resume_deadline:
+                        return "review_resuming"
             await asyncio.sleep(self._poll_interval)
 
     async def _follow(self, session_id: str) -> None:

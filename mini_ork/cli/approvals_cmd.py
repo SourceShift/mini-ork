@@ -291,7 +291,7 @@ def _maybe_resume_parked_run(
             f"(skipped spawn: --no-resume; sentinel at {resolved})\n"
         )
     try:
-        _pid, log_path = _spawn_recover(home, run_id, extra_args, log_path)
+        _pid, log_path = _spawn_recover(home, run_id, extra_args, log_path=log_path)
     except _LauncherMissingError:
         # Launcher cannot be spawned (e.g. uninstalled engine, broken
         # $MINI_ORK_ENGINE_ROOT). Don't traceback — the sentinel is
