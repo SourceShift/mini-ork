@@ -455,3 +455,65 @@ def test_the_grace_window_protects_a_freshly_touched_epic(tmp_path: Path) -> Non
 
 def test_reclaim_is_a_no_op_on_an_empty_queue(tmp_path: Path) -> None:
     assert scheduler.reclaim_stale(_init_db(tmp_path / "reclaim-empty")) == []
+
+
+# ── _verdict_from_log: two verdict shapes, one reader ────────────────────────
+def _verdict_home(tmp_path: Path, run_id: str, **files: object) -> tuple[str, str]:
+    """A home whose runs/<run_id>/ holds the given verdict files, plus the
+    dispatcher log naming that run. ``files`` keys are file stems."""
+    home = tmp_path / "vh"
+    run_dir = home / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    for name, payload in files.items():
+        text = payload if isinstance(payload, str) else json.dumps(payload)
+        (run_dir / f"{name}.json").write_text(text, encoding="utf-8")
+    log = tmp_path / "dispatch.log"
+    log.write_text(f"some runner output\nrun_id={run_id}\n", encoding="utf-8")
+    return str(log), str(home)
+
+
+def test_framework_edit_reads_its_run_verdict_word(tmp_path: Path) -> None:
+    """framework-edit's own verdict.json carries ``pass`` and not ``verdict``;
+    the word lives in run-verdict.json — reading only the first two files made
+    every such run 'unknown' and escalated it however well it ran."""
+    log, home = _verdict_home(
+        tmp_path, "run-fe",
+        **{"verdict": {"files_changed": 3, "tests_pass": True, "static_pass": True, "pass": True},
+           "run-verdict": {"verdict": "pass", "failed_nodes": 0},
+           "panel-verdict": {"panel_score": 87.5, "pass": True, "source": "rubric-prescreen"}})
+    assert scheduler._verdict_from_log(log, home) == "pass"
+
+
+def test_a_bare_boolean_is_read_when_no_file_carries_a_word(tmp_path: Path) -> None:
+    """The fallback: a run whose only verdicts are booleans still resolves."""
+    log, home = _verdict_home(tmp_path, "run-bool", **{"verdict": {"pass": True}})
+    assert scheduler._verdict_from_log(log, home) == "pass"
+    log, home = _verdict_home(tmp_path, "run-bool2", **{"verdict": {"pass": False}})
+    assert scheduler._verdict_from_log(log, home) == "fail"
+
+
+def test_the_runs_own_final_word_outranks_the_rubric_prescreen(tmp_path: Path) -> None:
+    """panel-verdict.json is an advisory prescreen, so it must not veto the run
+    in the boolean fallback — but its *word* keeps its original precedence."""
+    log, home = _verdict_home(
+        tmp_path, "run-pre",
+        **{"run-verdict": {"pass": False}, "panel-verdict": {"pass": True}})
+    assert scheduler._verdict_from_log(log, home) == "fail"
+    log, home = _verdict_home(
+        tmp_path, "run-word",
+        **{"run-verdict": {"verdict": "pass"}, "panel-verdict": {"verdict": "fail"}})
+    assert scheduler._verdict_from_log(log, home) == "fail"
+
+
+def test_no_verdict_anywhere_is_still_unknown(tmp_path: Path) -> None:
+    log, home = _verdict_home(tmp_path, "run-empty", **{"verdict": {"files_changed": 1}})
+    assert scheduler._verdict_from_log(log, home) == "unknown"
+    log, home = _verdict_home(tmp_path, "run-junk", **{"verdict": "[1, 2, 3]"})
+    assert scheduler._verdict_from_log(log, home) == "unknown"
+
+
+def test_a_log_without_a_run_id_is_unknown(tmp_path: Path) -> None:
+    log = tmp_path / "norun.log"
+    log.write_text("runner said nothing useful\n", encoding="utf-8")
+    assert scheduler._verdict_from_log(str(log), str(tmp_path)) == "unknown"
+    assert scheduler._verdict_from_log(str(tmp_path / "absent.log"), str(tmp_path)) == "unknown"

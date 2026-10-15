@@ -315,8 +315,43 @@ def _run_id_from_log(log_path: str) -> str:
     return ""
 
 
+def _read_verdict_file(path: str) -> dict:
+    """One verdict file's JSON object, or ``{}`` for anything unreadable.
+
+    A missing file, a directory, a truncated write mid-run and a payload that
+    is not an object at all are the same answer to the caller — "nothing to
+    learn here" — so they are flattened rather than raised. The caller's
+    problem is picking among several files that may each be one of those.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def _verdict_from_log(log_path: str, home: str) -> str:
-    """run_id= line -> runs/<run_id>/{panel-verdict,verdict}.json -> verdict."""
+    """run_id= line -> the run's verdict files -> a verdict word.
+
+    Two shapes reach this and both have to be read, because which file carries
+    which is a property of the *recipe*:
+
+    * ``{"verdict": "pass"}`` — a word. The run-level verdict every run writes
+      to ``run-verdict.json``, and which a recipe whose publisher writes one
+      puts in ``verdict.json`` instead (epic-runner delivery does).
+    * ``{"pass": true}`` — a bare boolean, and no word anywhere. That is
+      ``framework-edit``: its recipe verifier owns ``verdict.json`` and writes
+      the contract in its own shape, so reading ``verdict`` alone made *every*
+      framework-edit epic record "unknown" and escalate however well it ran
+      (five of five on this home before the fix).
+
+    ``panel-verdict.json`` is a third thing again — an advisory rubric
+    prescreen, which may carry either shape and is the least authoritative of
+    the three. It keeps its original precedence for a word, so no existing
+    run's verdict changes; it only loses to ``run-verdict.json`` in the
+    boolean fallback, where the run's own final word outranks a prescreen.
+    """
     run_id = ""
     try:
         with open(log_path, encoding="utf-8", errors="replace") as fh:
@@ -328,15 +363,20 @@ def _verdict_from_log(log_path: str, home: str) -> str:
         return "unknown"
     if not run_id:
         return "unknown"
-    for vfile in ("panel-verdict.json", "verdict.json"):
-        p = os.path.join(home, "runs", run_id, vfile)
-        if os.path.isfile(p):
-            try:
-                v = json.load(open(p, encoding="utf-8")).get("verdict", "")
-                if v:
-                    return v
-            except (OSError, ValueError):
-                continue
+    run_dir = os.path.join(home, "runs", run_id)
+    loaded = {
+        name: _read_verdict_file(os.path.join(run_dir, name))
+        for name in ("panel-verdict.json", "verdict.json", "run-verdict.json")
+    }
+    for data in loaded.values():
+        verdict = data.get("verdict", "")
+        if verdict:
+            return str(verdict)
+    # No word anywhere: fall back to a bare boolean, most final file first.
+    for name in ("run-verdict.json", "verdict.json", "panel-verdict.json"):
+        passed = loaded[name].get("pass")
+        if isinstance(passed, bool):
+            return "pass" if passed else "fail"
     return "unknown"
 
 
