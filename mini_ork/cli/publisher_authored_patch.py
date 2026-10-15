@@ -43,10 +43,16 @@ there).  This module supplies the three halves of that contract:
   that the authored patch does not carry are foreign.  They are listed in
   ``<run_dir>/publish-foreign-hunks.txt`` and left untouched.
 
-The two declared abstain reasons are ``publish-unattributable`` (authorship
-cannot be established) and ``publish-conflict`` (the patch no longer applies to
-HEAD).  Neither ever falls back to a whole-file ``git add`` or a silent
-``--3way`` merge.
+The declared abstain reasons are ``publish-unattributable`` (authorship cannot
+be established), ``publish-conflict`` (the patch no longer applies to HEAD),
+``publish-frozen-path`` (the patch touches a path declared frozen — see
+:func:`land_patch` and ``mini_ork.vcs.repo_integrity_guard``), plus the trivial
+``publish-empty`` / ``publish-no-authored-patch``.  None ever falls back to a
+whole-file ``git add`` or a silent ``--3way`` merge.
+
+A frozen-path edit is refused on every run, not only an auto-opened one, unless
+the operator sets the single documented token ``MO_ALLOW_FROZEN_EDIT=1`` (fail
+closed: unset, empty, or any other value refuses).
 """
 from __future__ import annotations
 
@@ -60,6 +66,12 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import NamedTuple
+
+from mini_ork.vcs.repo_integrity_guard import (
+    enforced_frozen_paths,
+    frozen_edit_allowed,
+    frozen_hits,
+)
 
 __all__ = [
     "Abstain",
@@ -286,6 +298,50 @@ def _paths_in_patch(patch_text: str) -> list[str]:
         path = _section_path(section)
         if path and path not in out:
             out.append(path)
+    return out
+
+
+def _diff_git_sides(section: str) -> list[str]:
+    """Both path sides of a section's ``diff --git a/<old> b/<new>`` header.
+
+    ``_section_path`` reads the ``---``/``+++`` blob headers, which a PURE
+    rename (``similarity index 100%``) and a mode-only change carry NEITHER of:
+    such a section would name no path at all and read as "touches nothing
+    frozen", so renaming a frozen fixture away — the strongest form of moving
+    the measurement floor — would land. Both sides are returned: for a rename
+    the a-side IS the frozen path being removed.
+
+    Only the unquoted header is split; git quotes both sides together when a
+    path needs escaping (and then ``_section_path`` reads the quoted blob
+    headers instead). The split is the LAST `` b/``, which is what git means
+    when a path itself contains that sequence.
+    """
+    lines = section.splitlines()
+    first = lines[0] if lines else ""
+    if not first.startswith("diff --git "):
+        return []
+    a_side, sep, b_side = first[len("diff --git "):].rpartition(" b/")
+    if not sep or not a_side.startswith("a/"):
+        return []
+    return [a_side[2:], b_side]
+
+
+def _frozen_scan_paths(patch_text: str) -> list[str]:
+    """Every path a patch section names — the input to the frozen check.
+
+    Broader than :func:`_paths_in_patch` on purpose: the scope filter and the
+    foreign-hunk comparison key on the file a section EDITS, while the frozen
+    check must see every path a section NAMES, whatever shape git chose to
+    emit — the blob headers, and both sides of the ``diff --git`` line (a
+    rename's old side, a copy's source, a mode-only change). Ordered, deduped.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for section in _patch_sections(patch_text):
+        for path in (_section_path(section), *_diff_git_sides(section)):
+            if path and path not in seen:
+                seen.add(path)
+                out.append(path)
     return out
 
 
@@ -1318,6 +1374,16 @@ def land_patch(repo: str, patch_text: str, branch: str, *, message: str = "") ->
     from the latter and committed onto HEAD would orphan or revert every commit
     that landed in between.  ``branch`` empty means "the branch HEAD points at".
 
+    A patch that touches a FROZEN path is refused here — before any git write —
+    with ``publish-frozen-path``, so a frozen edit is never applied or
+    committed.  The frozen list is ``enforced_frozen_paths(repo)`` (the target's
+    ``config/kernel-frozen.yaml`` unioned with the built-in floor), making the
+    enforcement origin-agnostic: it holds for a plain run and a triage run
+    alike.  Every path the patch names is checked, so a rename is caught on the
+    path it moves AWAY from, not only on the one it writes
+    (:func:`_frozen_scan_paths`).  The single operator override is
+    ``MO_ALLOW_FROZEN_EDIT=1``.
+
     On a clean ``git apply --cached --check`` the patch is applied to the private
     index, written to a tree, committed with ``-p HEAD``, and the branch ref is
     compare-and-swapped (``update-ref <ref> <new> <old>``).  A patch that no
@@ -1337,6 +1403,22 @@ def land_patch(repo: str, patch_text: str, branch: str, *, message: str = "") ->
         return Abstain("publish-empty", "the authored patch is empty")
     if not repo or not os.path.isdir(repo):
         return Abstain("publish-conflict", f"target repo is not a directory: {repo!r}")
+
+    # Frozen kernel paths: refuse the whole patch before any git write, so a
+    # forbidden edit is neither applied to the private index nor committed. The
+    # check reads every path the patch NAMES (_frozen_scan_paths — blob headers
+    # plus both sides of each `diff --git` line, so a rename of a frozen path is
+    # caught on its old side), so a mixed patch is refused whole — never
+    # filtered down to its ordinary sections (which would publish a partial
+    # change and disguise the violation).
+    frozen = frozen_hits(_frozen_scan_paths(patch_text), enforced_frozen_paths(repo))
+    if frozen and not frozen_edit_allowed():
+        named = ", ".join(frozen)
+        return Abstain(
+            "publish-frozen-path",
+            f"refusing to publish: {named} is frozen (config/kernel-frozen.yaml); "
+            "set MO_ALLOW_FROZEN_EDIT=1 to override a deliberate frozen edit",
+        )
 
     branch = (branch or "").strip()
     if not branch:

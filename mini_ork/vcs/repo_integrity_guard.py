@@ -11,6 +11,26 @@ compare-and-swap heal via ``git update-ref``.
 
 ``now_iso`` (bash's ``date -u +%Y-%m-%dT%H:%M:%SZ``) is injectable so the parity
 test can pin the TSV recovery-log timestamp.
+
+Frozen paths (the kernel floor)
+-------------------------------
+
+``config/kernel-frozen.yaml`` names the paths an authored patch may never
+change.  :func:`enforced_frozen_paths` returns that list UNIONED with the
+built-in ``FROZEN_PATHS_DEFAULT`` floor, so a working-tree copy of the file —
+or a diff that deletes an entry — can never unfreeze a path, and a missing or
+unparsable file still leaves the floor enforced.  The in-place publisher
+refuses any authored patch that touches one of them (abstain reason
+``publish-frozen-path``) before it is applied or published, on every run.
+
+Two tiers, one switch:
+
+* **simple/local (default) — refuse.**  Nothing to configure; the floor holds
+  whether or not ``config/kernel-frozen.yaml`` exists.
+* **operator/cloud — one scoped token.**  ``MO_ALLOW_FROZEN_EDIT=1``
+  (:func:`frozen_edit_allowed`) authorises a deliberate frozen-surface edit for
+  the operator who owns that surface.  It fails closed: unset, empty, or any
+  value other than ``1`` refuses.
 """
 from __future__ import annotations
 
@@ -142,6 +162,34 @@ def frozen_hits(changed: list[str], patterns: list[str]) -> list[str]:
                 seen.add(path)
                 break
     return hits
+
+
+def enforced_frozen_paths(root: str) -> list[str]:
+    """The frozen list a run's authored patch is checked against: file ∪ floor.
+
+    ``load_frozen_paths`` already fails closed to ``FROZEN_PATHS_DEFAULT`` for a
+    missing/unreadable/empty/unparsable file, but a file that merely DROPS a
+    floor entry (or a working-tree copy the diff itself rewrote) would still
+    parse to a shorter list.  Unioning the two — as ``load_frozen_paths``' own
+    docstring tells callers to do — means no edit to the file can unfreeze the
+    kernel floor.  Order-preserving: the file's entries first, then every floor
+    entry the file does not already name."""
+    merged = list(load_frozen_paths(root))
+    seen = set(merged)
+    for pat in FROZEN_PATHS_DEFAULT:
+        if pat not in seen:
+            merged.append(pat)
+            seen.add(pat)
+    return merged
+
+
+def frozen_edit_allowed() -> bool:
+    """Whether the operator set the single override token ``MO_ALLOW_FROZEN_EDIT=1``.
+
+    Default is refuse (fail closed): an unset, empty, or any value other than
+    ``1`` never authorises a frozen-path edit.  Read once at the refusal branch
+    of the publisher's ``land_patch``."""
+    return os.environ.get("MO_ALLOW_FROZEN_EDIT", "").strip() == "1"
 
 
 def _git(cwd, *args) -> tuple[str, int]:

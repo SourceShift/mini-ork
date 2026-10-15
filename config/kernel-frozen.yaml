@@ -1,5 +1,12 @@
 version: 1
-# Paths an auto-opened (origin=auto-triage) framework-edit may never change.
+# Paths no run's authored patch may change. Enforced by the in-place publisher
+# (mini_ork/cli/publisher_authored_patch.py land_patch) on EVERY run — a plain
+# run and an auto-opened (origin=auto-triage) framework-edit alike — which
+# refuses the patch (abstain reason publish-frozen-path) before it is applied or
+# published. The list is unioned with the engine's built-in floor
+# (mini_ork/vcs/repo_integrity_guard.FROZEN_PATHS_DEFAULT), so a diff cannot
+# unfreeze a path by rewriting this file; the operator's single override token
+# is MO_ALLOW_FROZEN_EDIT=1.
 # fnmatch globs, repo-relative.
 paths:
   - config/kernel-frozen.yaml
@@ -24,3 +31,8 @@ paths:
   - mini_ork/dispatch/cost_pause.py
   - mini_ork/stores/safety_events.py
   - mini_ork/observability/bug_report.py
+  # The code-fix probe fixtures are the measurement floor the code-fix probes
+  # score against: a run that edits them moves its own goalposts. The glob
+  # covers all three fixture subtrees (and any future one) — never a file list,
+  # so a new fixture is frozen the moment it lands.
+  - recipes/code-fix/probes/fixtures/**
