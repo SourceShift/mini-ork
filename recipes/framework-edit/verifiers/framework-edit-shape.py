@@ -102,8 +102,12 @@ def _no_meta_node_leakage():
 
 
 _check("no_meta_node_leakage", "derived workflow contains no meta-recipe node names", _no_meta_node_leakage)
-_check("exact_ten_nodes", "workflow has exactly 10 nodes",
-       lambda: len(_workflow().get("nodes") or []) == 10)
+# 10 nodes + the two blind-spec-test nodes (spec_test_author, spec_test_verifier).
+# The count is exact on purpose: a node added to workflow.yaml without this
+# check (and the lane map below) updated fails every framework-edit run's
+# success gate on the tree that ships, not just the run that added it.
+_check("exact_node_count", "workflow has exactly 12 nodes",
+       lambda: len(_workflow().get("nodes") or []) == 12)
 
 
 def _heterogeneity_floor():
@@ -128,10 +132,16 @@ def _lane_bindings_verbatim():
         "planner": "decomposer",
         "code_impact_lens": "minimax_lens",
         "prior_art_lens": "codex_lens",
+        # The spec-test author must be a DIFFERENT model from the implementer
+        # (codex_lens / DeepSeek): a second model reading the kickoff alone is
+        # the whole point of the blind suite, so the lane binding is asserted
+        # here, not merely present.
+        "spec_test_author": "glm_lens",
         "implementer": "codex_lens",
         "static_check_verifier": "verifier",
         "test_verifier": "verifier",
         "kickoff_contract_verifier": "verifier",
+        "spec_test_verifier": "verifier",
         "reviewer": "opus_lens",
         "publisher": "publisher",
         "rollback": "rollback",

@@ -39,4 +39,9 @@ def test_retries_and_escalates_to_are_not_dependencies(tmp_path: Path) -> None:
 def test_real_framework_edit_workflow_has_no_cycle() -> None:
     dag = load_dag(str(REPO / "recipes" / "framework-edit" / "workflow.yaml"))
     assert "reviewer" not in dag.parents["implementer"]
-    assert set(dag.parents["implementer"]) == {"code_impact_lens", "prior_art_lens"}
+    # spec_test_author is a real dependency: the blind spec tests are authored
+    # (from the kickoff alone) before the implementer starts, so they are an
+    # acceptance bar, not a retry/ephemeral edge. Verifiers and rollback still
+    # must not be parents.
+    assert set(dag.parents["implementer"]) == {
+        "code_impact_lens", "prior_art_lens", "spec_test_author"}

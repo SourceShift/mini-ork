@@ -400,7 +400,8 @@ def test_real_recipes_compile_and_expose_retry_edges():
     for recipe, sources in (
         ("code-fix", {"typecheck", "test", "reviewer"}),
         ("framework-edit", {"static_check_verifier", "test_verifier",
-                            "kickoff_contract_verifier", "reviewer"}),
+                            "kickoff_contract_verifier", "spec_test_verifier",
+                            "reviewer"}),
     ):
         cw = compile_workflow(str(REPO / "recipes" / recipe / "workflow.yaml"))
         assert set(cw.retry_edges) == sources

@@ -7,6 +7,13 @@ Rules:
 - Do not edit high-blast-radius files unless `scope_allow` explicitly names
   them.
 - Keep changes scoped to the planner and lens findings.
+- `${MINI_ORK_RUN_DIR}/spec-tests/` holds independent acceptance tests written
+  from the kickoff BEFORE this change existed. They are the run's blind spec
+  suite: your change must pass them, and they must NEVER be modified. Editing,
+  adding or deleting a file there is detected (a file touched after the author
+  node ended, or one the author listed that is gone, fails the spec-tests
+  verifier outright) and is not a way to make a failing clause pass — fix the
+  implementation instead.
 - Produce `${MINI_ORK_RUN_DIR}/framework-edit.diff` as a unified diff ready for
   `git apply`.
 - Do NOT write `${MINI_ORK_RUN_DIR}/verdict.json`. The verifier nodes own that

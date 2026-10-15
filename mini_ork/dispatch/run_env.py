@@ -37,6 +37,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 import yaml
 
@@ -48,7 +49,12 @@ class RunEnvError(ValueError):
 
 
 # An env value is a string once resolved; ``None`` means "remove this variable".
-EnvValue = str | None
+# ``Optional[str]``, not ``str | None``: this alias is EVALUATED at import time
+# (the annotations in this module are deferred by ``from __future__ import
+# annotations``), so PEP 604 syntax would make every importer of
+# ``execute_handlers`` fail to import on the standalone ``python3`` that recipe
+# verifiers — and the measures they run — execute under. Identical on 3.11+.
+EnvValue = Optional[str]
 
 # The executor's own per-node variables. A run file that sets one would race the
 # publish that carries the node's identity: whichever ran last would win, and
