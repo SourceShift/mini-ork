@@ -1171,6 +1171,51 @@ def _overview_tab(run: Run, *, include_retry: bool = True) -> list[dict[str, Any
             lines.append((text, "red" if fin and fin != "done" else "muted"))
         return S.code("Recent events", lines or [("No events recorded for this run.", "dim")])
 
+    def orchestrator() -> list[dict[str, Any]]:
+        """The per-run orchestrator, always shown — even when it never spoke.
+
+        It is armed on every dependency-graph run, but it emits a row only when
+        a node needs an intervention (help · repair · mutate · promote); a clean
+        run stays silent, which used to make the layer invisible. This section
+        is unconditional, so "on but quiet" reads as a fact, not an absence.
+        """
+        from mini_ork.web.db import db_for
+
+        db = db_for(run.home)
+        rows = db.rows("SELECT event_type, payload_json, created_at FROM run_events "
+                       "WHERE run_id = ? AND event_type LIKE 'orchestrator.%' "
+                       "ORDER BY created_at DESC, rowid DESC LIMIT 6", (run.id,)) \
+            if db.has_table("run_events") else []
+        try:
+            from mini_ork.orchestration import runner_orchestrator as _orch
+            armed = _orch.enabled()
+        except Exception:  # noqa: BLE001 — a missing import must not hide the layer
+            armed = True  # the layer is default-on
+        start = _epoch(run.row.get("created_at")) or 0
+        items = []
+        for r in reversed(rows):
+            try:
+                payload = json.loads(r.get("payload_json") or "{}")
+            except ValueError:
+                payload = {}
+            kind = str(r.get("event_type") or "").removeprefix("orchestrator.")
+            node = payload.get("node_id") or ""
+            reason = payload.get("reason") or ""
+            off = S.duration(max(0, int(r.get("created_at") or start) - start)) if start else ""
+            items.append(S.item(f"{off}  {kind}".strip(),
+                                " · ".join(x for x in (node, reason) if x),
+                                m="→", mc="yellow" if kind != "advance" else "blue"))
+        if not items:
+            items = [S.dot(
+                "Armed — no interventions this run" if armed else "Off (MO_RUN_ORCHESTRATOR)",
+                ("Speaks only when a DAG node needs help · repair · mutate · promote; "
+                 "green nodes are skipped, so a clean run stays quiet." if armed else
+                 "The per-run orchestrator is explicitly disabled for this engine."),
+                mc="green" if armed else "sub")]
+        return [S.lst(f"Orchestrator — {'armed' if armed else 'off'}", items, full=True,
+                      note="The per-run decision core at each dependency-graph wave. "
+                           "It never fails a run — it only picks an action.")]
+
     def files() -> dict[str, Any]:
         from mini_ork.cli.board_cmd import _card_fields
 
@@ -1188,6 +1233,7 @@ def _overview_tab(run: Run, *, include_retry: bool = True) -> list[dict[str, Any
     return ((S.guarded(errors, "Retry", retry_section) if include_retry else [])
             + S.guarded(errors, "Run inputs", inputs)
             + S.guarded(errors, "Why? — evidence", evidence)
+            + S.guarded(errors, "Orchestrator", orchestrator)
             + S.guarded(errors, "Correlation", correlation) + S.guarded(errors, "Recent events", recent)
             + S.guarded(errors, "Files changed", files))
 
