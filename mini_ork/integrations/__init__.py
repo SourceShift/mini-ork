@@ -21,6 +21,12 @@ What is here:
     poll for the simple tier and an HMAC-verified webhook for the secure tier,
     both over the same :func:`~mini_ork.threads.service.deliver` seam.
 
+``slack``
+    :class:`~mini_ork.integrations.slack.SlackTransport` — Socket Mode over the
+    hand-written :mod:`~mini_ork.integrations._ws` client for the simple tier
+    and an Events API webhook with Slack's ``v0`` signature for the secure tier,
+    over the same :func:`~mini_ork.threads.service.deliver` seam.
+
 **Importing this package is inert.** No token is resolved, no socket is opened,
 no ``getUpdates`` is called: a transport is a *class* here, and the work starts
 when one is constructed. That is deliberate — ``import mini_ork.integrations``
@@ -41,6 +47,15 @@ from mini_ork.integrations._base import (
     Transport,
     thread_key,
 )
+from mini_ork.integrations.slack import (
+    APP_TOKEN_VAULT_KEY as SLACK_APP_TOKEN_VAULT_KEY,
+    BOT_TOKEN_VAULT_KEY as SLACK_BOT_TOKEN_VAULT_KEY,
+    SIGNING_SECRET_VAULT_KEY as SLACK_SIGNING_SECRET_VAULT_KEY,
+    SlackConfigError,
+    SlackError,
+    SlackSignatureError,
+    SlackTransport,
+)
 from mini_ork.integrations.telegram import (
     NAME,
     TOKEN_VAULT_KEY,
@@ -52,8 +67,15 @@ from mini_ork.integrations.telegram import (
 
 __all__ = [
     "NAME",
+    "SLACK_APP_TOKEN_VAULT_KEY",
+    "SLACK_BOT_TOKEN_VAULT_KEY",
+    "SLACK_SIGNING_SECRET_VAULT_KEY",
     "TOKEN_VAULT_KEY",
     "PollResult",
+    "SlackConfigError",
+    "SlackError",
+    "SlackSignatureError",
+    "SlackTransport",
     "TRANSPORT_ORIGIN",
     "TelegramConfigError",
     "TelegramError",
