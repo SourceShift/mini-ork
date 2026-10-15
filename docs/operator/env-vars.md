@@ -40,6 +40,7 @@ A single environment variable gates every dispatch:
 | Variable | Default | Purpose |
 |---|---|---|
 | `MO_DAILY_BUDGET_USD` | `50` | Rolling-24-hour USD spend cap. Dispatch halts once trailing spend reaches it. |
+| `MO_LANE_HEALTH_GATE` | `"1"` | Pre-run lane-health gate. `1` probes every model the DAG will dispatch and aborts the run with rc=75 / `blocked_reason=lane_unhealthy` if any lane is dead. `0` skips enforcement (the run can still see per-dispatch refusals; see `MO_LANE_PROBE`). |
 
 The window is **rolling 24 hours**, not a calendar day. The gate sums
 `llm_calls.cost_usd` (falling back to `task_runs` on databases behind the
@@ -66,6 +67,30 @@ before the run:
 ```bash
 MO_DAILY_BUDGET_USD=400 mini-ork run framework-edit kickoff.md
 ```
+
+The lane-health gate (`MO_LANE_HEALTH_GATE`, default `"1"`) reads the same
+`lane_health()` machinery `dispatch_model` consults per node — the difference
+is that the gate runs **once, before any dispatch**, so a starved lane (e.g.
+`opus` with no credit, `deepseek` returning HTTP 402 "Insufficient Balance")
+aborts the run with rc=75 + `blocked_reason=lane_unhealthy` and a per-node
+message naming lane → role → node, plus a `recover --lane ...` fix line. The
+verdict vocabulary is the body regex `MO_LANE_PROBE` already shares: status
+`401/402/403`, or any 2xx/4xx/5xx carrying `credit balance is too low`,
+`insufficient (credit|balance|quota)`, `usage limit`, `out of credits`, or
+`billing`.
+
+Limitations:
+
+- `MO_LANE_PROBE=0` (or `MINI_ORK_DRY_RUN=1`, or running under pytest
+  without opt-in) downgrades the gate to key-presence — which for native
+  lanes (`anthropic-native`, `codex-native`, `opencode-native`) is a no-op
+  because they have no `api_key_env` to read. Use `MO_LANE_HEALTH_GATE=0`
+  to skip enforcement entirely instead.
+- An ambient login (no credential env var) is unknown and does not block. The
+  gate honours three credential env vars for `anthropic-native` lanes:
+  `ANTHROPIC_API_KEY` → `x-api-key`, else `ANTHROPIC_AUTH_TOKEN` →
+  `Authorization: Bearer`, else `CLAUDE_CODE_OAUTH_TOKEN` → Bearer + the
+  `anthropic-beta: oauth-2025-04-20` header.
 
 The `budget:` block in `agents.yaml` (`daily_cap_usd`, `per_run_usd`,
 `per_epic_usd`) is **display only**: the IDE lanes page renders it and the

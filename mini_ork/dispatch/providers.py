@@ -1011,7 +1011,8 @@ _PROBE_DEAD = {
 # gateway uses when the key has no credit left, as opposed to when it is merely
 # being asked to slow down.
 _PROBE_QUOTA_RE = re.compile(
-    r"usage limit|exceeded your current quota|insufficient credits"
+    r"credit balance is too low|usage limit|exceeded your current quota"
+    r"|insufficient (?:credit|balance|quota)|insufficient credits"
     r"|insufficient balance|out of credits|purchase credits|credit limit"
     r"|credit balance|quota exceeded|billing",
     re.IGNORECASE,
@@ -1037,11 +1038,33 @@ def _http_post_probe(url: str, key: str, model: str) -> tuple[int | None, str]:
     lives is the message. Bounded to 512 chars so a chatty gateway cannot bloat
     the probe cache.
     """
+    headers = {
+        "x-api-key": key, "authorization": f"Bearer {key}",
+        "anthropic-version": "2023-06-01", "content-type": "application/json",
+    }
+    return _http_post_result(url, headers, model)
+
+
+def _http_post_result(url: str, headers: Mapping[str, str],
+                      model: str) -> tuple[int | None, str]:
+    """``(status, body)`` primitive over a Messages-style POST.
+
+    Shared by ``_http_post_probe`` (compat) and ``_live_probe_native`` (native).
+    Full body (not 512-byte snippet) so a depleted-subscription 400/429 carrying
+    credit wording can be classified on the message, not just the status.
+    Bounded to 512 chars for the cache so a chatty gateway cannot bloat the
+    cache file.
+
+    Living alone here keeps both probes' HTTP shape one source of truth and
+    lets a single monkeypatch intercept both. ``_http_post_probe`` is kept as
+    the compat-side seam so ``tests/unit/test_lane_live_probe_py.py``'s
+    ``monkeypatch.setattr(p, "_http_post_probe", fake)`` (which records the
+    (url, key, model) call shape) keeps intercepting.
+    """
     body = json.dumps({"model": model or "probe", "max_tokens": 1,
                        "messages": [{"role": "user", "content": "ping"}]}).encode()
-    req = urllib.request.Request(url, data=body, method="POST", headers={
-        "x-api-key": key, "authorization": f"Bearer {key}",
-        "anthropic-version": "2023-06-01", "content-type": "application/json"})
+    req = urllib.request.Request(url, data=body, method="POST",
+                                 headers=dict(headers))
     try:
         with urllib.request.urlopen(req, timeout=8) as resp:
             return int(resp.status), _decode_body(resp.read(512))
@@ -1107,6 +1130,102 @@ def _live_probe(model: str, entry: Mapping, key: str,
     return f"{model}: {dead} at {url}" if dead else None
 
 
+def _native_credential(runtime: Mapping[str, str]) -> tuple[str, Mapping[str, str]] | None:
+    """Resolve a credential for an ``anthropic-native`` lane.
+
+    Returns ``(cred, headers_for_post)`` — the literal credential string and
+    the headers ``_http_post_result`` should send. Order matches the kickoff:
+
+      1. ``ANTHROPIC_API_KEY`` → ``x-api-key``;
+      2. ``ANTHROPIC_AUTH_TOKEN`` → ``authorization: Bearer``;
+      3. ``CLAUDE_CODE_OAUTH_TOKEN`` → ``authorization: Bearer`` plus
+         ``anthropic-beta: oauth-2025-04-20``.
+
+    No credential env var at all returns ``None`` (ambient-key/credentials-file
+    flows are unknown and do not block). Do NOT read
+    ``~/.claude/.credentials.json`` or shell out to the macOS Keychain — by
+    design that path stays unknown so the operator can run with --unset env.
+    """
+    api_key = str(runtime.get("ANTHROPIC_API_KEY") or "")
+    if api_key:
+        return api_key, {"x-api-key": api_key,
+                         "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"}
+    auth_token = str(runtime.get("ANTHROPIC_AUTH_TOKEN") or "")
+    if auth_token:
+        return auth_token, {"authorization": f"Bearer {auth_token}",
+                            "anthropic-version": "2023-06-01",
+                            "content-type": "application/json"}
+    oauth_token = str(runtime.get("CLAUDE_CODE_OAUTH_TOKEN") or "")
+    if oauth_token:
+        return oauth_token, {"authorization": f"Bearer {oauth_token}",
+                              "anthropic-version": "2023-06-01",
+                              "content-type": "application/json",
+                              "anthropic-beta": "oauth-2025-04-20"}
+    return None
+
+
+def _live_probe_native(model: str, entry: Mapping,
+                       runtime: Mapping[str, str]) -> str | None:
+    """Like :func:`_live_probe`, but for ``anthropic-native`` lanes.
+
+    The compat probe keys on a single ``api_key_env``; native lanes honor
+    three potential credential env vars (above). No credential env var → return
+    ``None``: ambient-key logins are unknown and out of scope [c:2].
+
+    Otherwise: 1-token Messages call to ``<base_url>/v1/messages`` (defaulting
+    to ``https://api.anthropic.com``), 8 s timeout, model ``entry.model or
+    "claude-haiku-4-5"``. Verdict vocabulary matches the compat probe exactly
+    (status + the same body regex), and the cache rides on
+    ``sha256(f"{url}|{cred}")[:16]`` so ``opus`` and ``sonnet`` sharing a
+    credential probe once per ``_PROBE_TTL_S``. Same atomic ``os.replace``
+    discipline: a partial write can never leave the operator with a stale
+    cache.
+    """
+    cred = _native_credential(runtime)
+    if cred is None:
+        return None
+    cred_str, headers = cred
+    url = str(entry.get("base_url") or "").strip() or "https://api.anthropic.com"
+    url = url.rstrip("/") + "/v1/messages"
+    cache_path = Path(runtime.get("MINI_ORK_HOME") or ".mini-ork") / "lane-probe-cache.json"
+    try:
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        if not isinstance(cache, dict):
+            cache = {}
+    except (OSError, ValueError):
+        cache = {}
+    fingerprint = hashlib.sha256(f"{url}|{cred_str}".encode()).hexdigest()[:16]
+    now = time.time()
+    hit = cache.get(model)
+    if (isinstance(hit, dict) and hit.get("fp") == fingerprint
+            and now - float(hit.get("at", 0))
+            < float(hit.get("ttl", _PROBE_TTL_S))):
+        dead = hit.get("dead")
+    else:
+        status, body = _http_post_result(url, headers, str(entry.get("model") or "claude-haiku-4-5"))
+        if status is None:
+            return None  # unknown: do not cache, do not block
+        dead = _PROBE_DEAD.get(status)
+        ttl = _PROBE_TTL_S
+        if dead is None and _PROBE_QUOTA_RE.search(body or ""):
+            dead = f"out of quota (HTTP {status}: {body.strip()[:120]})"
+            ttl = _PROBE_QUOTA_TTL_S
+        elif dead is None and status != 200 and status != 204:
+            # 400/404/429/5xx without quota wording → transient or wrong-model;
+            # the key is accepted. Fall through to "healthy" below.
+            pass
+        cache[model] = {"fp": fingerprint, "at": now, "dead": dead, "ttl": ttl}
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cache_path.with_name(cache_path.name + f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(cache), encoding="utf-8")
+            os.replace(tmp, cache_path)
+        except OSError:
+            pass
+    return f"{model}: {dead} at {url}" if dead else None
+
+
 def lane_health(
     model: str,
     root: str | os.PathLike[str] | None = None,
@@ -1138,8 +1257,21 @@ def lane_health(
             reason = _live_probe(model, entry, str(runtime[str(api_key_env)]), runtime)
             if reason:
                 return LaneHealth(False, f"{reason} — every dispatch on this lane would fail")
+    elif isinstance(entry, Mapping) and entry.get("kind") == "anthropic-native":
+        if _probe_enabled(runtime):
+            reason = _live_probe_native(model, entry, runtime)
+            if reason:
+                return LaneHealth(False, f"{reason} — every dispatch on this lane would fail")
+        # No credential env var OR the probe is off: still ok=True. The unprobed
+        # phrasing matters because `doctor` printed `[OK] codex (codex CLI
+        # present)` while codex was 100% quota-walled and the terminal rung of
+        # every coding chain (2026-10-12). "ok" alone reads as "we checked and
+        # it was fine"; "ok (unprobed: …)" makes the absence of a check
+        # legible.
+        return LaneHealth(
+            True, "ok (unprobed: native lane — auth owned by the CLI)")
     elif isinstance(entry, Mapping) and entry.get("kind") in {
-        "anthropic-native", "codex-native", "opencode-native",
+        "codex-native", "opencode-native",
     }:
         # Nothing cheap can be asserted about a native lane: there is no key to
         # read and no endpoint to ping, the CLI owns auth. Say so, rather than

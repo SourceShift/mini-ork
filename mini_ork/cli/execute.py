@@ -1194,8 +1194,37 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         # ``MO_NODE_GIT_CKPT`` gate, and matches every other target
         # site in this file (kickoff hr-node-ckpt-refs round 2).
         _node_git_ckpt(live_run_dir, run_id, "_start", overwrite=False)
-    set_status(db, run_id, "executing")
     selected = [f for f in fields_list if not filter_node_type or f[1] == filter_node_type]
+
+    # Pre-run lane-health gate (kickoff lane-health-gate): check every lane
+    # this run is about to dispatch against BEFORE we mark ``executing`` and
+    # start the node loop. A starved lane used to burn budget and return zero
+    # artifacts (provider 402 with no credit every node, etc.); refuse once
+    # with a caller-actionable message naming lane → role → node plus the
+    # ``recover --lane …`` fix. Sits AFTER the recovery filter and the
+    # dry-run early return, and BEFORE ``set_status('executing')``, so it is
+    # the single chokepoint for fresh ``run``, ``resume`` and ``recover``.
+    # Tests that inject a custom ``dispatch_fn`` skip the gate: the test
+    # owns the dispatch path, and a fake lane (e.g. ``"producer"`` in
+    # ``test_failed_parent_blocks_dependent_node``) would otherwise trip
+    # the gate's registry check. Production never passes ``dispatch_fn``,
+    # so the gate fires for every real ``run``/``resume``/``recover``.
+    if not dry_run and dispatch_fn is None:
+        from mini_ork.cli import lane_preflight
+
+        blocked = lane_preflight.enforce(
+            selected,
+            root=root, home=home, task_class=task_class,
+            db=db, run_id=run_id, run_dir=live_run_dir,
+        )
+        if blocked:
+            # The lifecycle scrapes these two stdout lines into
+            # ``sink["blocked_reason"]`` and exits with the gate's rc.
+            print(f"blocked_reason={blocked}")
+            print("verdict=blocked")
+            return lane_preflight.RC_BLOCKED
+
+    set_status(db, run_id, "executing")
 
     # Remote-nodes-02 (D2): tear the run-scoped workspace session down on
     # SIGTERM / Ctrl-C too, not only via the run-level ``finally`` below. The

@@ -11,6 +11,8 @@ variable is unset.*
 | Variable | Default | Effect |
 |---|---|---|
 | `MINI_ORK_EXECUTE_GATE` | `"1"` | Pre-dispatch gate on needs_answers plans (exit 6) |
+| `MO_LANE_HEALTH_GATE` | `"1"` | Pre-run lane-health gate (exit 75 on dead lane); set `0` to skip enforcement. Under `MO_LANE_PROBE=0` the gate degrades to key-presence only (a no-op for native lanes). |
+| `MO_LANE_PROBE` | env-derived | Probe-enabled switch for `lane_health`: `0` disables the live HTTP probe and `MINI_ORK_DRY_RUN=1` overrides to `0`. Under pytest without explicit `MO_LANE_PROBE=1` the probe is dark so tests never make a real HTTP call. |
 | `MO_APPLY_IMPL_OUTPUT` | `"1"` | Text-fallback capture: parse implementer output for a diff/fenced blocks when it applied nothing |
 | `MO_LEARNING_WRITEBACK` | `"1"` | GRPO advantage writeback after runs |
 | `MO_PRM_SCORE` | `"1"` | Process-reward heuristic scoring on traces |

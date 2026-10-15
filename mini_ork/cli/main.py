@@ -1706,6 +1706,28 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
     if not continue_lifecycle:
         return run_rc
 
+    # Pre-run lane-health gate (kickoff lane-health-gate): on rc=75, the gate
+    # already printed ``blocked_reason=lane_unhealthy`` and ``verdict=blocked``
+    # plus a fold-able ``lane_preflight=…`` JSON. Mirror them into the
+    # lifecycle sink exactly the same shape the budget preflight writes
+    # (``main.py:1074``), so rubric/verify/reflect skip with one rc=75 path
+    # rather than a per-reason switch. Returning BEFORE the auto-repair
+    # ``try:`` is intentional: a "run never started" must never spawn a
+    # recover cycle (per ``test_failed_run_lifecycle.py``'s
+    # maybe_repair-counts guard). Same placement as the existing parked-run
+    # branch — early, deterministic, single return.
+    if run_rc == 75:
+        bp = _grep_kv(execute_out, "blocked_reason") or "lane_unhealthy"
+        sink["verdict"] = "blocked"
+        sink["blocked_reason"] = bp
+        lp = _grep_kv(execute_out, "lane_preflight")
+        if lp:
+            try:
+                sink["lane_preflight"] = json.loads(lp)
+            except ValueError:
+                sink["lane_preflight_raw"] = lp
+        return run_rc
+
     # ── auto-repair: hand the failure off as soon as execute has decided it ──.
     # UNCONDITIONAL — a withheld publish sets status='failed' during execute
     # while run_rc == 0, so the status is already terminal when the hook runs and
