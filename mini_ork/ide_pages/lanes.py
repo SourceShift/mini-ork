@@ -9,6 +9,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import os
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,7 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     chips = [S.chip(f"{S.money(spent)} today")]
     if tab == "lanes":
         sections = (S.guarded(errors, "Lanes", lambda: _lanes_table(home))
+                    + S.guarded(errors, "Past decisions", lambda: _past_decisions(home))
                     + S.guarded(errors, "Credentials", lambda: _credentials(home))
                     + S.guarded(errors, "Bring your own provider", lambda: _byo(home)))
         if S.ide_level() >= 2:
@@ -345,6 +347,157 @@ def _byo(home: Path) -> dict[str, Any]:
     act = [S.btn("Add provider", S.open_path(str(path)))] if path.is_file() else []
     return S.lst("Bring your own provider", [S.dot("providers.yaml", f"{path} · kinds: {kinds}", act)],
                  full=True)
+
+
+# ── Past decisions (ContextNest capsule, lane + budget) ─────────────────────
+#
+# The kickoff (rank 8 — "What did I already decide for this kind of work?")
+# asks the Lanes tab to surface the ContextNest capsule's ``## Decisions``
+# and ``## Failures`` sections over the last 14 days, scoped to the project,
+# each opening its session. The capsule is text/markdown (not JSON): a
+# ``# Prompt Context`` header, a window line, then ``## Risks`` /
+# ``## Decisions`` / ``## Failures`` / ``## Verifications`` sections of
+# ``- …`` bullets. Bullets may carry a ``[kind xN]`` bracket prefix that
+# the parser strips defensively; bullets without a recognizable run id
+# render as plain rows. The capsule endpoint already takes a ``project=``
+# query parameter — the parser ALSO drops bullets whose recognizable path
+# sits outside the project (mirroring
+# :func:`mini_ork.cn_client.filter_by_project_path`'s fail-closed rule).
+
+_CAPSULE_SECTION_RE = re.compile(r"^##\s+(.+?)\s*$")
+_CAPSULE_BULLET_RE = re.compile(r"^-\s+(.*?)\s*$")
+_CAPSULE_BRACKET_RE = re.compile(r"^\[([^\]]+)\]\s*(.*)$")
+_CAPSULE_PATH_RE = re.compile(r"((?:/|\.\./)[^\s,;)]+)")
+_RUN_ID_RE = re.compile(r"run-\d{6,}-[A-Za-z0-9]{4,}")
+_PAST_DECISION_KINDS = ("Decisions", "Failures")
+_PAST_DECISION_SECTION_LIMIT = 30
+
+
+def _parse_capsule_atoms(md: str, kinds: tuple[str, ...] = _PAST_DECISION_KINDS
+                         ) -> list[dict[str, Any]]:
+    """Extract ``## <kind>`` bullets from a capsule markdown body.
+
+    Each surviving bullet becomes a dict ``{"kind", "text", "run_id",
+    "path"}``. ``kind`` is the section heading; ``text`` is the bullet body
+    after any ``[kind xN]`` bracket prefix; ``run_id`` is the first
+    ``run-<digits>-<short>`` token when present (else ``""``); ``path``
+    is the first ``/…`` token (else ``""``). The path is recognised even
+    when a ``file:line`` suffix follows (``/ps/mini-ork/foo.py:12``) so
+    the kickoff's plain paths and the suggested ``file:line`` shape both
+    work.
+    """
+    wanted = {k.lower() for k in kinds}
+    out: list[dict[str, Any]] = []
+    current_kind: str | None = None
+    for line in md.splitlines():
+        m = _CAPSULE_SECTION_RE.match(line)
+        if m:
+            current_kind = m.group(1).strip()
+            continue
+        if current_kind is None or current_kind.lower() not in wanted:
+            continue
+        b = _CAPSULE_BULLET_RE.match(line)
+        if not b:
+            continue
+        text = b.group(1).strip()
+        if not text:
+            continue
+        bracket = _CAPSULE_BRACKET_RE.match(text)
+        if bracket:
+            text = bracket.group(2).strip()
+        rid_m = _RUN_ID_RE.search(text)
+        run_id = rid_m.group(0) if rid_m else ""
+        path_m = _CAPSULE_PATH_RE.search(text)
+        path = path_m.group(1).rstrip(".,;:)") if path_m else ""
+        out.append({"kind": current_kind, "text": text, "run_id": run_id, "path": path})
+    return out
+
+
+def _past_decisions(home: Path) -> dict[str, Any]:
+    """Decisions and failures from the ContextNest capsule, scoped to the project.
+
+    Two cached_section slots — ``lane`` and ``budget`` — fan out from this
+    single section so the Lanes page carries a unified view. The
+    down / disabled / cached / config-error states are all rendered
+    through :func:`mini_ork.ide_pages._cn.section_status`, which keeps
+    the page building ``ok: true`` with no server.
+    """
+    from mini_ork.ide_pages import _cn
+    from mini_ork import cn_client
+
+    project = str(home.parent.resolve()) if home else ""
+
+    def _fetch(query: str) -> dict[str, Any]:
+        md = cn_client.capsule(query=query, since="14d", project=project)
+        if not md:
+            # An empty body would render as a silent empty table; raise so
+            # ``cached_section`` treats it like an unreachable read.
+            raise ConnectionError(f"capsule for query={query!r} returned empty body")
+        return {"md": md}
+
+    lane_payload = _cn.render_cached_section(
+        "decisions-lane", f"lane:{project}", lambda: _fetch("lane"))
+    budget_payload = _cn.render_cached_section(
+        "decisions-budget", f"budget:{project}", lambda: _fetch("budget"))
+
+    # Degraded states: the established one-line state from the first payload
+    # that carries the marker, so a down/disabled/cached/config-errored
+    # ContextNest renders through ``section_status`` (never silently empty).
+    for payload in (lane_payload, budget_payload):
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("_disabled") or payload.get("_unreachable") or payload.get("_config_error"):
+            return S.lst("Past decisions", [_cn.section_status(payload)], full=True)
+
+    # Healthy: parse bullets from both payloads, then filter to the project.
+    items: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for payload in (lane_payload, budget_payload):
+        if not isinstance(payload, dict):
+            continue
+        md = payload.get("md") or ""
+        if isinstance(md, str) and md:
+            for atom in _parse_capsule_atoms(md):
+                # The same atom can appear under both the lane and budget
+                # queries; dedupe by (kind, run_id, path) so a decision
+                # about both surfaces once, not twice.
+                key = (atom["kind"], atom["run_id"], atom["path"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                items.append(atom)
+
+    if project:
+        norm = project.rstrip("/")
+        # Defence in depth: ``cn_client.capsule`` already takes ``project=``,
+        # but any bullet whose recognizable path falls outside the project
+        # is dropped here, mirroring ``filter_by_project_path``'s rule that
+        # items with no path inside the project must not leak in.
+        items = [it for it in items if it["path"] and it["path"].startswith(norm + "/")]
+
+    if not items:
+        return S.lst("Past decisions",
+                     [S.dot("No decisions recorded",
+                            "ContextNest returned no decisions or failures for this project in the last 14 days")],
+                     full=True,
+                     note="Decisions and failures from ContextNest over the last 14 days.")
+
+    rows = []
+    for it in items[:_PAST_DECISION_SECTION_LIMIT]:
+        do = S.open_run(it["run_id"]) if it["run_id"] else None
+        rows.append({"cells": [
+            S.cell(it["kind"], "blue"),
+            S.cell(it["text"][:160] or "—", "text"),
+            S.muted(it["path"] or "—"),
+            S.mono(it["run_id"] or "—"),
+        ], "do": do})
+    return S.table(
+        "Past decisions",
+        [S.col(90), S.col(fr=1, min=240), S.col(fr=1, min=200), S.col(140)],
+        ["kind", "atom", "path", "run"],
+        rows,
+        note=f"ContextNest capsule · lane + budget · last 14 days · scoped to {project}",
+    )
 
 
 # ── Routing ────────────────────────────────────────────────────────────────
