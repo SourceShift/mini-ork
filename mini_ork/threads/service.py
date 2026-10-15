@@ -31,6 +31,7 @@ pattern (``tests/test_web_smoke.py``).
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -116,11 +117,18 @@ def deliver(
     external_id: str | None = None,
     issue_uid: str | None = None,
     source: str = "threads",
+    attachments: Sequence[str] = (),
     db: str | None = None,
 ) -> Delivery:
     """Deliver one message to a thread. See the module docstring for the four
     outcomes. ``ticket`` is a pre-rendered block carried into attempt 1's
-    kickoff; on a continuation it is already part of the transcript."""
+    kickoff; on a continuation it is already part of the transcript.
+
+    ``attachments`` are absolute paths already stored under the thread's
+    attachment directory (:mod:`mini_ork.threads.attachments`). Each becomes a
+    ``FILE`` row on this message's turn, and the run is told where they are —
+    in the kickoff of a launched or continued run, in the steer text of a live
+    one. A run that is never told a file exists cannot read it."""
     path = _resolve_db(db, home)
     thread = store.open_thread(
         thread_id, title=title, origin=origin, origin_ref=origin_ref,
@@ -159,8 +167,9 @@ def deliver(
             thread_id, role=MessageRole.USER, text=text,
             external_id=external_id, db=path,
         )
+        _record_attachments(thread_id, message.turn, attachments, path)
         control.steer_run(
-            _state_db(home), live_run_id, text,
+            _state_db(home), live_run_id, _with_attachments(text, attachments),
             source=source, severity="info",
         )
         return Delivery(thread_id, "steered", message.turn, message.id, run_id=live_run_id)
@@ -170,6 +179,7 @@ def deliver(
         thread_id, role=MessageRole.USER, text=text,
         external_id=external_id, db=path,
     )
+    _record_attachments(thread_id, message.turn, attachments, path)
     # attempt 1 reuses the thread id (the canvas already routes on it); a
     # continuation is '{id}-t{turn}', unique because the turn is.
     run_id = thread_id if attempt == 1 else f"{thread_id}-t{message.turn}"
@@ -180,8 +190,10 @@ def deliver(
             title=title or thread.title,
             task=text,
             ticket=ticket if attempt == 1 else None,
-            history=_history(path, thread_id, exclude_id=message.id),
+            history=_history(path, thread_id, exclude_id=message.id,
+                             current_turn=message.turn),
             prior=_prior(path, runs[-1]) if runs else None,
+            attachments=tuple(attachments),
         )
     )
 
@@ -235,14 +247,47 @@ def on_run_terminal(
     return store.get_thread(thread.id, db=path)
 
 
-def _history(path: str, thread_id: str, exclude_id: int) -> tuple[_kickoff.Turn, ...]:
-    """The transcript so far, oldest first, minus the message that is the task."""
-    rows = store.messages(thread_id, limit=_HISTORY_LIMIT, db=path)
-    return tuple(
-        _kickoff.Turn(role=str(row.role), text=row.text)
-        for row in rows
-        if row.id != exclude_id and row.text.strip()
-    )
+def _history(
+    path: str, thread_id: str, exclude_id: int, current_turn: int | None = None
+) -> tuple[_kickoff.Turn, ...]:
+    """The transcript so far, oldest first, minus the message that is the task.
+
+    A ``FILE`` row has no prose, so it is carried as the stored path(s) it holds —
+    otherwise an earlier attachment silently vanished from every continuation.
+    The current turn's files are left out: the kickoff lists them on their own.
+    """
+    turns: list[_kickoff.Turn] = []
+    for row in store.messages(thread_id, limit=_HISTORY_LIMIT, db=path):
+        if row.id == exclude_id:
+            continue
+        if str(row.role) == MessageRole.FILE.value:
+            if row.turn == current_turn:
+                continue
+            text = "\n".join(f"`{item}`" for item in row.attachments)
+        else:
+            text = row.text
+        if text.strip():
+            turns.append(_kickoff.Turn(role=str(row.role), text=text))
+    return tuple(turns)
+
+
+def _record_attachments(
+    thread_id: str, turn: int, attachments: Sequence[str], path: str
+) -> None:
+    """One ``FILE`` row per stored path, on the message's own turn."""
+    for item in attachments:
+        store.append_message(
+            thread_id, role=MessageRole.FILE, text="", turn=turn,
+            attachments=(str(item),), db=path,
+        )
+
+
+def _with_attachments(text: str, attachments: Sequence[str]) -> str:
+    """The steer text, with the stored paths appended so a live run can read them."""
+    if not attachments:
+        return text
+    listed = "\n".join(f"- `{item}`" for item in attachments)
+    return f"{text}\n\nAttached files:\n{listed}".strip()
 
 
 def _prior(path: str, run: ThreadRun) -> _kickoff.PriorRun:

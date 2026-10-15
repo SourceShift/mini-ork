@@ -73,6 +73,8 @@ class Kickoff:
     max_history: int = DEFAULT_MAX_HISTORY
     max_turn_chars: int = DEFAULT_MAX_TURN_CHARS
     max_total_chars: int = DEFAULT_MAX_TOTAL_CHARS
+    #: Absolute paths of files attached to this message; listed before the task.
+    attachments: tuple[str, ...] = ()
 
 
 #: A role's label in the transcript. ``file`` is an attachment — no prose.
@@ -96,6 +98,8 @@ def compose(spec: Kickoff) -> str:
         head_blocks.append("## Ticket" + SEP + spec.ticket.strip())
     if spec.prior is not None:
         head_blocks.append(_prior_section(spec.prior))
+    if spec.attachments:
+        head_blocks.append(_attachments_section(spec.attachments))
 
     task_block = "## Your task" + SEP + task
     head = SEP.join(head_blocks)
@@ -109,6 +113,18 @@ def compose(spec: Kickoff) -> str:
 
     blocks = [block for block in (*head_blocks, history_block, task_block) if block]
     return SEP.join(blocks) + "\n"
+
+
+def _attachments_section(paths: tuple[str, ...]) -> str:
+    """The files sent with this message, as paths the agent can open."""
+    lines = [
+        "## Attached files",
+        "",
+        "The user attached these files to this message. They are local paths you can read:",
+        "",
+    ]
+    lines.extend(f"- `{path}`" for path in paths)
+    return "\n".join(lines)
 
 
 def _prior_section(prior: PriorRun) -> str:

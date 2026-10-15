@@ -349,6 +349,27 @@ def test_an_unexpected_extraction_failure_warns_instead_of_blanking(home, tmp_pa
     assert any(s.get("title") == "Transcript" for s in _sections(page))
 
 
+def test_the_attach_button_runs_threads_attach_with_the_picked_paths(home, tmp_path):
+    """The button is a native picker whose paths are appended to its cli; run that
+    command exactly as the IDE would and the file lands on the thread."""
+    from mini_ork.threads import cli as threads_cli
+    from mini_ork.threads import store
+
+    _seed(home)
+    page = build_page(home, "thread", None, {"thread": THREAD_ID})
+    picks = [a["do"]["pick_files"] for s in _sections(page) for a in s.get("actions") or []
+             if isinstance(a.get("do"), dict) and "pick_files" in a["do"]]
+    assert len(picks) == 1
+    assert picks[0]["cli"] == ["threads", "attach", THREAD_ID]
+
+    picked = tmp_path / "notes.csv"
+    picked.write_text("a,b\n1,2\n")
+    argv = picks[0]["cli"][1:] + [str(picked)] + (["--home", str(home)] if picks[0]["home"] else [])
+    assert threads_cli.main(argv) == 0
+    files = [m for m in store.messages(THREAD_ID, db=str(home / "state.db")) if str(m.role) == "file"]
+    assert [Path(m.attachments[0]).name for m in files] == ["notes.csv"]
+
+
 def test_the_intake_tab_is_declared_on_the_orchestrator_page(home):
     page = build_page(home, "orch")
     assert ("intake", "Intake") in [(t["key"], t["label"]) for t in page["tabs"]]

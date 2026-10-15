@@ -218,3 +218,51 @@ def test_a_launch_links_the_issue_it_works(home: Path, launches: list[dict]) -> 
     links = pm_store.links_for("github:o/r#1", db=str(home / "state.db"))
     assert [link.kind for link in links] == [LinkKind.RUN]
     assert links[0].to_uid == "run:github-o-r-1"
+
+
+# ── attachments reach the run ───────────────────────────────────────────────
+#
+# A FILE row has no prose, and the history used to keep prose only, so a run
+# was never told an attached file existed — not the turn's own run, not a
+# later continuation.
+
+
+def test_a_launch_names_its_attachments_and_records_them_on_its_turn(
+    home: Path, launches: list[dict]
+) -> None:
+    from mini_ork.threads.model import MessageRole
+
+    out = service.deliver(home, "t1", "Summarise the sheet.",
+                          attachments=["/h/attachments/t1/q3.csv"])
+
+    kickoff = launches[0]["kickoff"]
+    assert "## Attached files" in kickoff
+    assert "`/h/attachments/t1/q3.csv`" in kickoff
+    rows = store.messages("t1", db=str(home / "state.db"))
+    files = [r for r in rows if r.role == MessageRole.FILE]
+    assert [(r.turn, r.attachments) for r in files] == [(out.turn, ("/h/attachments/t1/q3.csv",))]
+
+
+def test_a_continuation_carries_earlier_attachments_in_its_history(
+    home: Path, launches: list[dict]
+) -> None:
+    service.deliver(home, "t1", "Summarise the sheet.", attachments=["/h/a/q3.csv"])
+    service.on_run_terminal(home, "t1", RunStatus.FINISHED, text="Done.")
+
+    service.deliver(home, "t1", "Now chart it.")
+
+    kickoff = launches[1]["kickoff"]
+    assert "## Thread so far" in kickoff
+    assert "`/h/a/q3.csv`" in kickoff
+    assert "## Attached files" not in kickoff        # not this turn's file
+
+
+def test_a_steer_tells_the_live_run_where_the_file_is(
+    home: Path, launches: list[dict], steers: list[dict]
+) -> None:
+    service.deliver(home, "t1", "first")
+    service.deliver(home, "t1", "use this one", attachments=["/h/a/brief.docx"])
+
+    assert len(launches) == 1
+    assert "use this one" in steers[0]["message"]
+    assert "`/h/a/brief.docx`" in steers[0]["message"]

@@ -63,6 +63,9 @@ Actions (``do``) — what a button, row or chip does in the IDE:
 - ``{"thread": text}``             new mini-ork thread, ``text`` as its first prompt
 - ``{"project": abs}``             switch the IDE window to the project at ``abs``
 - ``{"project_pick": true}``       pick a project folder, then switch to it
+- ``{"pick_files": {"cli": [...], "prompt": p, "home": b}}``  native multi-file
+  picker; the chosen absolute paths are appended to ``cli`` and it runs like a
+  ``cli`` action (an IDE without it shows the button inert)
 Any action may carry ``"confirm": "<question>"``.
 """
 from __future__ import annotations
@@ -153,6 +156,16 @@ def reveal(path: str) -> dict[str, Any]:
 def project(path: str) -> dict[str, Any]:
     """Switch the IDE window to the mini-ork project rooted at ``path``."""
     return {"project": path}
+
+
+def pick_files(cli_args: Iterable[str], *, prompt: str = "", home: bool = True) -> dict[str, Any]:
+    """Ask for one or more files, then run ``mini-ork <cli_args> <paths…>``.
+
+    The paths are appended in the order the picker returns them, so ``cli_args``
+    is the argv prefix — e.g. ``["threads", "attach", thread_id]``. ``home`` has
+    the same meaning as on :func:`cli`.
+    """
+    return {"pick_files": {"cli": list(cli_args), "prompt": prompt, "home": home}}
 
 
 def project_pick() -> dict[str, Any]:

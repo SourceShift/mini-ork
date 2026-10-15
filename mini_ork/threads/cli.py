@@ -36,6 +36,7 @@ Usage:
   mini-ork threads show <id> [--json]
   mini-ork threads send <id> --text <t> [--title T] [--recipe R] ...
   mini-ork threads continue <id> --text <t> [--title T] [--recipe R] ...
+  mini-ork threads attach <id> <path>... [--json]
 
 Verbs:
   list       threads, most recently touched first
@@ -43,6 +44,8 @@ Verbs:
   send       deliver a message — the machine decides. A live run is *steered*;
              a finished thread starts a new attempt that carries the transcript
   continue   start the next attempt, refusing while a run is live
+  attach     copy local files onto the thread (one turn); the next send's run
+             is told where they are. Starts nothing on its own
 
 Common options:
   --text -   read the message from stdin
@@ -104,6 +107,8 @@ def main(argv=None, *, root=None) -> int:  # noqa: ARG001 - root is the dispatch
         return _cmd_show(rest)
     if verb in ("send", "continue"):
         return _cmd_deliver(verb, rest)
+    if verb == "attach":
+        return _cmd_attach(rest)
     sys.stderr.write(f"threads: unknown verb {verb!r}\n\n{_USAGE}")
     return 2
 
@@ -231,6 +236,52 @@ def _cmd_deliver(verb: str, argv: list[str]) -> int:
     else:
         sys.stderr.write(f"threads {verb}: {out.detail}\n")
     return 0 if out.ok else 1
+
+
+def _cmd_attach(argv: list[str]) -> int:
+    """Copy files onto an existing thread as ``FILE`` rows sharing one new turn.
+
+    Nothing is launched or steered: attaching is not a request. The files reach
+    a run through the next ``send`` — its kickoff carries every earlier
+    attachment (``threads.service._history``). The IDE's "Attach file…" button
+    runs this with the paths the native picker returned.
+    """
+    from mini_ork.threads import attachments
+    from mini_ork.threads.model import MessageRole
+
+    parser = argparse.ArgumentParser(prog="mini-ork threads attach", add_help=False,
+                                     usage=argparse.SUPPRESS)
+    parser.add_argument("id")
+    parser.add_argument("paths", nargs="*")
+    _common(parser)
+    args = parser.parse_args(argv)
+    if not args.paths:
+        sys.stderr.write("threads attach: name at least one file\n")
+        return 2
+    home, db = _targets(args)
+    if store.get_thread(args.id, db=db) is None:
+        sys.stderr.write(f"threads attach: no thread {args.id!r}\n")
+        return 1
+
+    stored: list[str] = []
+    for raw in args.paths:
+        try:
+            stored.append(str(attachments.store_file(home, args.id, raw).resolve()))
+        except (attachments.AttachmentError, OSError) as exc:
+            sys.stderr.write(f"threads attach: {exc}\n")
+            return 1
+    turn = None
+    for item in stored:
+        row = store.append_message(args.id, role=MessageRole.FILE, text="", turn=turn,
+                                   attachments=(item,), db=db)
+        turn = row.turn
+    if args.json:
+        sys.stdout.write(json.dumps({"thread_id": args.id, "turn": turn,
+                                     "attachments": stored}, indent=2) + "\n")
+    else:
+        for item in stored:
+            sys.stdout.write(f"attached: {item}\n")
+    return 0
 
 
 def _targets(args: argparse.Namespace) -> tuple[Path, str]:
