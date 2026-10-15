@@ -1697,8 +1697,13 @@ def _load_feature_defaults() -> None:
 
 def main(argv=None, *, root=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    # The engine root is the directory that CONTAINS ``mini_ork`` — three levels
+    # up from this file — because that is what ``_module_env`` puts on a spawned
+    # subcommand's PYTHONPATH. One level short (``mini_ork/`` itself) and the
+    # child dies inside site init: ``mini_ork/types.py`` then shadows the stdlib
+    # ``types`` module. bin/mini-ork reaches the same directory via parents[1].
     root = root or os.environ.get("MINI_ORK_ROOT") or os.path.dirname(
-        os.path.dirname(os.path.realpath(__file__)))
+        os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
     os.environ["MINI_ORK_ROOT"] = root
     _load_feature_defaults()
     _load_secret_store_env()

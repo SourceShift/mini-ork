@@ -4,6 +4,7 @@ The bash trampoline (`_bash_entrypoint_handler` → bin/mini-ork-* →
 runtime-select.sh → python -m) is gone; all subcommands resolve to a
 native module handler or an in-process handler.
 """
+import os
 import subprocess
 import sys
 
@@ -95,6 +96,37 @@ def test_native_dispatch_uses_python_m(monkeypatch):
     assert rc == 0
     assert seen["cmd"][:3] == [sys.executable, "-m", "mini_ork.cli.improve"]
     assert all("bin/mini-ork-" not in str(part) for part in seen["cmd"])
+
+
+def test_default_root_is_the_engine_root(monkeypatch, tmp_path):
+    """The default ``root`` is the directory that contains ``mini_ork``.
+
+    ``_native_module_handler`` hands ``root`` to ``_module_env`` as the child's
+    PYTHONPATH, so a root one level too deep — ``mini_ork/`` itself — makes every
+    spawned subcommand die inside site init, where ``mini_ork/types.py`` shadows
+    the stdlib ``types`` module and the interpreter aborts before ``main`` runs.
+    ``bin/mini-ork`` reaches the same directory via ``parents[1]``; this is the
+    ``python -m mini_ork.cli.main`` path, where nothing sets MINI_ORK_ROOT.
+    """
+    monkeypatch.delenv("MINI_ORK_ROOT", raising=False)
+    monkeypatch.setenv("MINI_ORK_HOME", str(tmp_path / ".mini-ork"))
+    seen = {}
+
+    class _P:
+        returncode = 0
+
+    def fake_run(cmd, **kw):
+        seen["env"] = kw["env"]
+        return _P()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert main(["improve", "--help"]) == 0
+    engine_root = seen["env"]["PYTHONPATH"]
+    assert os.path.isdir(os.path.join(engine_root, "mini_ork")), (
+        f"default root {engine_root!r} does not contain the mini_ork package — "
+        "a subcommand spawned with it as PYTHONPATH cannot import the engine"
+    )
+    assert seen["env"]["PYTHONSAFEPATH"] == "1"
 
 
 def test_native_subs_still_registered():
