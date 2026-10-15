@@ -6,7 +6,7 @@ TLS, no reverse proxy and no server. ``mini-ork serve`` is not involved at all.
 That is what makes this the tier that works on a laptop, and what the webhook
 tier (``intake/webhooks.py``) trades away for freshness.
 
-A pass is three steps, in this order because each one constrains the next:
+A pass is four steps, in this order because each one constrains the next:
 
 1. **Sync** — ``pm.store.sync`` pulls from the source into the mirror. It fails
    loudly and records the failure in ``pm_sync``, so a stale board is a *visible*
@@ -19,6 +19,12 @@ A pass is three steps, in this order because each one constrains the next:
    about to be dispatched is read in full.
 3. **Dispatch** — one :func:`~mini_ork.intake.dispatch.dispatch_issue` per
    survivor, which is where the ledger row is written.
+4. **Report** — :func:`~mini_ork.intake.report.report_pass` runs the return leg:
+   every linked run that has finished since the last pass settles its thread and,
+   write-back permitting, posts its outcome to its ticket. It rides this pass
+   rather than a hook in the runner so the loop that already exists closes the
+   loop that did not, and it can never raise — a write-back outage must not stop
+   a pass whose dispatching is already done.
 
 A ticket is therefore only ever dispatched after it exists in the mirror, which
 is also what puts it on the board: the two features read the same rows.
@@ -48,6 +54,7 @@ from mini_ork.pm.provider import Provider, ProviderError, Query
 from mini_ork.threads import store as thread_store
 
 from mini_ork.intake.dispatch import dispatch_issue, delivery_id_for
+from mini_ork.intake.report import ReportOutcome, report_pass
 from mini_ork.intake.trigger import Trigger, matches_trigger
 
 #: One page per pass. The adapters clamp their own ceiling (GitHub's is 100);
@@ -108,6 +115,10 @@ class PollReport:
     outcomes: tuple[Outcome, ...] = ()
     deferred: int = 0
     dry_run: bool = False
+    #: What the pass reported back — the return leg of the same trip. Separate
+    #: from ``outcomes`` because those count *dispatches* (what grows the
+    #: machine's load); a report posts to a ticket and starts nothing.
+    reported: tuple[ReportOutcome, ...] = ()
     error: str | None = None
 
     @property
@@ -133,9 +144,17 @@ class PollReport:
         A dry run's ``would-start`` **does** count. "This would have started
         two runs" is the entire product of ``--dry-run``, so reporting it as
         "nothing to start" would be exactly backwards.
+
+        A *reported* run counts for the same reason a dispatch does: a comment
+        appeared on someone's ticket. A report that was skipped (write-back off)
+        or merely previewed does not — like a skipped dispatch, it is the
+        ordinary state.
         """
         return bool(self.error) or any(
             outcome.action not in ("skipped", "duplicate") for outcome in self.outcomes
+        ) or any(
+            outcome.action in ("reported", "error", "would-report")
+            for outcome in self.reported
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -148,6 +167,7 @@ class PollReport:
             "started": self.started,
             "error": self.error,
             "outcomes": [outcome.to_dict() for outcome in self.outcomes],
+            "reported": [outcome.to_dict() for outcome in self.reported],
         }
 
 
@@ -263,6 +283,13 @@ def poll_once(
             )
         )
 
+    # The return leg. Runs that finished since the last pass settle their thread
+    # and (write-back permitting) report to their ticket, on the same schedule
+    # the poller already keeps — so the simple tier closes the loop with no new
+    # process. `report_pass` never raises, so a write-back outage cannot stop a
+    # pass whose real work — dispatching — is already done.
+    reported = tuple(report_pass(home, db=db, dry_run=dry_run, source=source_id))
+
     return PollReport(
         source=source_id,
         mirrored=mirrored,
@@ -270,6 +297,7 @@ def poll_once(
         outcomes=tuple(outcomes),
         deferred=deferred,
         dry_run=dry_run,
+        reported=reported,
     )
 
 

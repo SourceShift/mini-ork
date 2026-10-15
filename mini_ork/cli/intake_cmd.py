@@ -8,6 +8,7 @@ buys reach with none.
 
   intake once   [--source S] [--max-runs N] [--dry-run]   one pass now
   intake poll   [--interval SECS] [--passes N] ...        a pass every interval
+  intake report [--dry-run]                               report finished runs back
   intake status                                          what is set up, and why not
 
 The default source set is every registered source **except** ``local``.
@@ -33,6 +34,7 @@ import sys
 from pathlib import Path
 
 from mini_ork.intake import poll as intake_poll
+from mini_ork.intake import report as intake_report
 from mini_ork.pm.config import PmConfigError
 from mini_ork.pm.provider import ProviderError
 from mini_ork.pm.registry import UnknownProvider
@@ -44,11 +46,13 @@ Usage:
   mini-ork intake once  [--source S] [--max-runs N] [--dry-run] [--json]
   mini-ork intake poll  [--interval SECS] [--passes N] [--source S] \
 [--max-runs N] [--dry-run] [--json]
+  mini-ork intake report [--dry-run] [--json]
   mini-ork intake status [--json]
 
 Verbs:
   once     sync the sources and dispatch what their triggers select, then exit
   poll     the same pass, every --interval seconds, until interrupted
+  report   report finished linked runs back to their tickets, once each
   status   every source this build knows, its trigger, and its last sync
 
 Defaults:
@@ -103,6 +107,16 @@ def _run_parser(prog: str) -> argparse.ArgumentParser:
     return parser
 
 
+def _report_parser(prog: str = "mini-ork intake report") -> argparse.ArgumentParser:
+    """The secure tier's verb: a scheduler runs this against a webhook-driven
+    deployment, where the poll loop is not ticking. Same ``report_pass``, same
+    write-back gate, so the two tiers cannot drift."""
+    parser = argparse.ArgumentParser(prog=prog, add_help=False, usage=argparse.SUPPRESS)
+    parser.add_argument("--dry-run", dest="dry_run", action="store_true")
+    _common(parser)
+    return parser
+
+
 def _status_parser(prog: str = "mini-ork intake status") -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog=prog, add_help=False, usage=argparse.SUPPRESS)
     _common(parser)
@@ -130,6 +144,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     poll.add_argument("--interval", type=float, default=DEFAULT_INTERVAL)
     poll.add_argument("--passes", type=int, default=None)
+    subs.add_parser(
+        "report", parents=[_report_parser()], usage=argparse.SUPPRESS
+    )
     subs.add_parser(
         "status", parents=[_status_parser()], usage=argparse.SUPPRESS
     )
@@ -160,6 +177,8 @@ def main(argv=None, *, root=None) -> int:  # noqa: ARG001 - root is the dispatch
             return _cmd_run(rest, loop=False)
         if verb == "poll":
             return _cmd_run(rest, loop=True)
+        if verb == "report":
+            return _cmd_report(rest)
         if verb == "status":
             return _cmd_status(rest)
     except (ProviderError, PmConfigError, UnknownProvider) as exc:
@@ -238,11 +257,42 @@ def _announce(report: intake_poll.PollReport, as_json: bool) -> None:
         where = f" → {outcome.thread_id}" if outcome.thread_id else ""
         run = f" [run {outcome.run_id}]" if outcome.run_id else ""
         sys.stdout.write(f"  {outcome.action:<12} {outcome.issue_uid}{where}{run}\n")
+    for outcome in report.reported:
+        if outcome.action == "skipped":
+            continue
+        sys.stdout.write(
+            f"  {outcome.action:<12} {outcome.issue_uid} [run {outcome.run_id}]\n"
+        )
     parts = [f"{report.mirrored} mirrored", f"{report.considered} open"]
     parts.append(f"{report.previewed} would start" if report.dry_run else f"{report.started} started")
     if report.deferred:
         parts.append(f"{report.deferred} over --max-runs")
     sys.stdout.write(f"intake {report.source}: " + ", ".join(parts) + "\n")
+
+
+def _cmd_report(argv: list[str]) -> int:
+    """Report finished linked runs back to their tickets, once each.
+
+    The secure tier's entry point: a webhook-driven deployment has no poll loop
+    ticking, so its scheduler calls this. Whether anything is posted is decided
+    by the write-back gate alone — the same gate the poll loop consults — so the
+    two tiers fail closed identically. Exit 0 unless a source raised.
+    """
+    args = _report_parser().parse_args(argv)
+    home, db = _targets(args)
+    outcomes = intake_report.report_pass(home, db=db, dry_run=args.dry_run)
+
+    if args.json:
+        sys.stdout.write(json.dumps([o.to_dict() for o in outcomes], indent=2) + "\n")
+    elif not outcomes:
+        sys.stdout.write("intake report: nothing to report\n")
+    else:
+        for outcome in outcomes:
+            where = f" → {outcome.thread_id}" if outcome.thread_id else ""
+            sys.stdout.write(
+                f"  {outcome.action:<13} {outcome.issue_uid} [run {outcome.run_id}]{where}\n"
+            )
+    return 1 if any(outcome.action == "error" for outcome in outcomes) else 0
 
 
 def _cmd_status(argv: list[str]) -> int:
