@@ -209,7 +209,7 @@ def _workspaces(home: Path) -> list[dict[str, Any]]:
 
 
 _SHELL_KEYS: tuple[str, ...] = ("version", "project", "home", "generated_at", "header",
-                        "runs", "counts", "errors")
+                        "runs", "total", "counts", "errors")
 
 
 def _shell_subset(payload: dict[str, Any]) -> dict[str, Any]:
@@ -244,6 +244,10 @@ def _board_shell_payload(home: Path) -> dict[str, Any]:
         "generated_at": int(time.time()),
         "header": _section(errors, "header", lambda: header(home, counts), {}),
         "runs": runs,
+        # ``runs`` is one page (``_RUN_LIMIT``); ``total`` is the census. Only
+        # both together answer "is there another page", which is what the IDE
+        # shell's Load more control asks — see ``board()`` below.
+        "total": _count_runs(home),
         "counts": counts,
         "errors": errors,
     }
@@ -262,6 +266,11 @@ def board(home: Path) -> dict[str, Any]:
         "home": str(home.absolute()),
         "generated_at": int(time.time()),
         "runs": runs,
+        # The census beside the page: the IDE shell draws a "Load more" at the
+        # end of ``runs`` and has no other way to learn whether one is left.
+        # Same value ``board runs`` pages on (``_count_runs``), so the control
+        # and the CLI agree about where the runs end.
+        "total": _count_runs(home),
         "counts": counts,
         "learnings": _section(errors, "learnings", lambda: _learnings(home), []),
         "automations": _section(errors, "automations", lambda: _automations(home), []),

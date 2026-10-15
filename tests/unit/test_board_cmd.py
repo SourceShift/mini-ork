@@ -373,13 +373,16 @@ def test_shell_payload_skips_full_board_sections(home: Path, monkeypatch) -> Non
 
     payload = board_cmd._board_shell_payload(home)
     assert set(payload) == {
-        "version", "project", "home", "generated_at", "header", "runs", "counts", "errors"
+        "version", "project", "home", "generated_at", "header", "runs", "total", "counts", "errors"
     }
     assert payload["version"] == 1
     assert payload["project"] == home.absolute().parent.name
     assert payload["home"] == str(home.absolute())
     assert isinstance(payload["generated_at"], int) and payload["generated_at"] > 0
     assert isinstance(payload["runs"], list)
+    # The IDE shell's Load more control reads the census beside the page: it
+    # is the only field in the payload that can say whether a page is left.
+    assert isinstance(payload["total"], int)
     assert isinstance(payload["counts"], dict)
     assert isinstance(payload["errors"], dict)
 
@@ -401,7 +404,7 @@ def test_shell_payload_uses_build_parser_when_invoked_via_main(
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert set(payload) == {
-        "version", "project", "home", "generated_at", "header", "runs", "counts", "errors"
+        "version", "project", "home", "generated_at", "header", "runs", "total", "counts", "errors"
     }
 
 
