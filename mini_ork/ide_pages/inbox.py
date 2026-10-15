@@ -858,6 +858,248 @@ def _agent_sessions_section(home: Path) -> tuple[list[dict[str, Any]], int]:
                       full=True)], 0
 
 
+# ── ContextNest: "Shipped since yesterday" (Inbox rank 4) ──────────────────
+#
+# The kickoff rank-4 ask is to surface features shipped in the last 24 hours
+# (``GET /api/v1/features?since=24h``) so the operator can see what's landed
+# since yesterday at a glance. The endpoint takes no server-side ``project=``
+# filter — that field is keyed on session cwd, not files — so scoping is done
+# client-side on ``files[]`` against the project root (``home.parent.resolve()``,
+# the same rule ``_agent_sessions_section`` applies).
+#
+# A feature is "in-project" when at least one of its ``files[]`` entries
+# resolves inside the project root (relative paths joined to the root,
+# absolute paths taken as-is, ``..``-escapes rejected — the same
+# ``cn_session._opens_path`` convention). A feature with no in-project file
+# is dropped even when its session cwd matches the project (explicit
+# acceptance: a feature is a project feature only when one of its real
+# files lives in the project root).
+#
+# The section degrades to the one-line ``_cn.section_status`` state on
+# down/disabled/config-error and adds NO page chip — exactly the way
+# ``_agent_sessions_section`` adds a chip only on a healthy read with at
+# least one now item. The existing inbox (and ``test_ide_pages_inbox_kanban``
+# which does not stub CN) renders unchanged on every degraded path.
+#
+# The Re-test button seeds a **draft mini-ork agent thread** — a ``thread``
+# action carrying ``how_to_test`` verbatim as the draft thread's first
+# prompt — the page never executes the recipe. A feature without
+# ``how_to_test`` still gets the button; the seed text just stays shorter.
+
+_SHIPPED_SINCE = "24h"
+_SHIPPED_CACHE_SECTION = "inbox-shipped-today"
+_SHIPPED_ROW_LIMIT = 30
+
+
+def _fetch_shipped_recent() -> dict:
+    """``GET /api/v1/features?since=24h`` → ``dict``.
+
+    No ``project=`` query: that key filters by session cwd, which would let
+    cross-cwd features slip in; client-side ``files[]`` scoping against the
+    project root is the only correct gate. ``cn_client._get`` returns
+    ``"{}"`` on any network error, so :func:`_cn.render_cached_section`
+    converts the failure to the unreachable one-line state.
+    """
+    from mini_ork import cn_client
+    path = f"/api/v1/features?since={_url.quote(_SHIPPED_SINCE, safe='')}"
+    raw = cn_client._get(path)
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _feature_path_resolves_inside(raw: Any, project_root: Path) -> bool:
+    """Whether ``raw`` resolves to a path *contained in* ``project_root``.
+
+    Relative paths are joined to the root; absolute paths (and ``~``-led
+    paths) are taken as-is. Paths whose ``..`` components escape the root,
+    or absolute paths that point outside the project, do NOT resolve inside.
+    A missing or non-string ``raw`` returns ``False``. The file does NOT
+    need to exist on disk — the filter is about path containment, which is
+    cheap, deterministic, and never raises on a transient FS hiccup.
+    """
+    if not isinstance(raw, str) or not raw or project_root is None:
+        return False
+    try:
+        root = project_root.resolve()
+    except OSError:
+        return False
+    if raw.startswith("/") or raw.startswith("~"):
+        candidate = Path(raw)
+    else:
+        candidate = project_root / raw
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        return False
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _feature_files_inside(feature: dict[str, Any], project_root: Path) -> bool:
+    """A feature's ``files[]`` has at least one entry whose path resolves
+    inside the project root.
+
+    Mirrors ``cn_session._opens_path`` for resolution semantics, minus the
+    file-existence check (which the entry may not yet have — a feature
+    shipped "since yesterday" may name a path the in-flight session created
+    that the page's filesystem does not see).
+    """
+    if not isinstance(feature, dict):
+        return False
+    files_field = feature.get("files")
+    if not isinstance(files_field, list):
+        return False
+    for entry in files_field:
+        if isinstance(entry, str) and _feature_path_resolves_inside(entry, project_root):
+            return True
+        if isinstance(entry, dict):
+            for v in entry.values():
+                if isinstance(v, str) and _feature_path_resolves_inside(v, project_root):
+                    return True
+    return False
+
+
+def _feature_files_list(feature: dict[str, Any]) -> list[str]:
+    """The feature's ``files[]`` as a flat string list (handles ``{key: path}``
+    dict entries the way ``cn_session._files`` does — paths in CN are
+    sometimes raw strings, sometimes a single-key dict)."""
+    out: list[str] = []
+    files_field = feature.get("files")
+    if not isinstance(files_field, list):
+        return out
+    for entry in files_field:
+        if isinstance(entry, str):
+            out.append(entry)
+        elif isinstance(entry, dict):
+            out.extend(str(v) for v in entry.values() if isinstance(v, str))
+    return out
+
+
+def _feature_ts(feature: dict[str, Any]) -> int:
+    """Sort key (newest first); ``0`` sorts last when the field is absent."""
+    ts = feature.get("ts")
+    if isinstance(ts, (int, float)):
+        return int(ts)
+    if isinstance(ts, str):
+        try:
+            return int(float(ts))
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+def _shipped_today_section(home: Path) -> list[dict[str, Any]]:
+    """The "Shipped since yesterday" list, with one row per in-project feature.
+
+    A feature is included only when at least one of its ``files[]`` paths
+    resolves inside ``home.parent.resolve()`` (the project root). Features
+    with no in-project file are dropped — even when the session cwd
+    matches the project — because the kickoff's explicit acceptance says
+    "a feature is in-project only when one of its files lives in the
+    project root".
+
+    The section degrades to the one-line ``_cn.section_status`` state on
+    down/disabled/config-error; the page never raises here and adds NO
+    page chip (so the existing inbox renders unchanged on every degraded
+    path, and ``test_ide_pages_inbox_kanban`` keeps passing without a CN
+    stub). Each row carries:
+
+    * feature name (read from ``feature``/``name``/``label`` — the verified
+      2026-10-15 wire key is ``feature``; older payloads used ``name``);
+    * the verbatim files list as the row sub cell;
+    * an Open session link via ``S.page_link("cn_session", id=session_id)``;
+    * a Re-test button that seeds a draft mini-ork agent thread with
+      ``how_to_test`` verbatim as the first prompt — the page never runs
+      the recipe.
+
+    A feature without ``how_to_test`` still gets the Re-test button; the
+    seed text just stays shorter (the same rule ``cn_session._features``
+    follows).
+    """
+    from mini_ork.ide_pages import _cn as CN
+    try:
+        project_root = home.parent.resolve() if home else None
+        if project_root is None:
+            return [S.lst("Shipped since yesterday",
+                          [S.dot("Could not read this", "project root unknown")],
+                          full=True)]
+        scope = str(project_root)
+        payload = CN.render_cached_section(
+            _SHIPPED_CACHE_SECTION, scope,
+            lambda: _fetch_shipped_recent(),
+        )
+        if not isinstance(payload, dict):
+            return [S.lst("Shipped since yesterday",
+                          [S.dot("Could not read this", "ContextNest read failed")],
+                          full=True)]
+        if payload.get("_disabled") or payload.get("_unreachable") or payload.get("_config_error"):
+            return [S.lst("Shipped since yesterday",
+                          [CN.section_status(payload)], full=True)]
+
+        features_field = payload.get("features")
+        if not isinstance(features_field, list):
+            features_field = []
+        # Client-side scoping: a feature ships here only when one of its
+        # files resolves inside the project root. Out-of-project features
+        # (even ones whose session cwd matches the project) are dropped.
+        in_project = [f for f in features_field
+                      if isinstance(f, dict) and _feature_files_inside(f, project_root)]
+        in_project.sort(key=_feature_ts, reverse=True)
+        in_project = in_project[:_SHIPPED_ROW_LIMIT]
+        if not in_project:
+            return [S.lst("Shipped since yesterday",
+                          [S.dot("No features shipped in the last 24h",
+                                 "ContextNest returned no in-project features")],
+                          full=True)]
+        items: list[dict[str, Any]] = []
+        for feat in in_project:
+            name = (str(feat.get("feature") or feat.get("name") or feat.get("label") or "")
+                    .strip())
+            if not name:
+                continue
+            files = _feature_files_list(feat)
+            files_text = ", ".join(files) if files else "(no files recorded)"
+            how = str(feat.get("how_to_test") or "").strip()
+            session_id = str(feat.get("session_id") or "").strip()
+            seed = (
+                f"Re-test the **{name}** feature.\n\nHow to test:\n\n{how}\n"
+                if how
+                else f"Re-test the **{name}** feature."
+            )
+            acts: list[dict[str, Any]] = []
+            if session_id:
+                acts.append(S.btn("Open session",
+                                  S.page_link("cn_session", id=session_id), "ghost"))
+            acts.append(S.btn("Re-test", S.thread(seed), "default"))
+            items.append(S.dot(name, files_text,
+                               acts=acts, mc="green"))
+        if not items:
+            return [S.lst("Shipped since yesterday",
+                          [S.dot("No features shipped in the last 24h",
+                                 "ContextNest returned no in-project features")],
+                          full=True)]
+        return [S.lst("Shipped since yesterday", items, full=True,
+                      note="Features shipped in the last 24h, scoped to files "
+                           "inside this project. Re-test opens a draft agent "
+                           "thread with how_to_test as the first prompt — the "
+                           "page never runs the recipe itself.")]
+    except Exception:
+        # Defensive: a render-time bug must NEVER blank the page. A
+        # one-line dot section stands in so the operator can still see
+        # the rest of the inbox unchanged.
+        return [S.lst("Shipped since yesterday",
+                      [S.dot("Could not read this", "shipped-recent read failed")],
+                      full=True)]
+
+
 def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     now = int(time.time())
     show_all = str(args.get("show") or "").strip().lower() in ("all", "1", "true", "yes")
@@ -867,7 +1109,7 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
         errors, "Inbox",
         lambda: _inbox(home, now, errors, ctx, show_all))
     agent_sections, agent_now = _agent_sessions_section(home)
-    sections = sections + agent_sections
+    sections = sections + agent_sections + _shipped_today_section(home)
     chips = [S.chip(f"✋ needs you {ctx.get('needs_you', 0)}", "yellow"),
              S.chip(f"✗ failed {ctx.get('failed', 0)}", "red")]
     if ctx.get("questions"):
