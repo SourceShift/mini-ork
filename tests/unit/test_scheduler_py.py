@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import socket
 import sqlite3
 import stat
 import subprocess
@@ -499,6 +500,66 @@ def test_an_ended_run_on_the_same_kickoff_does_not_protect_the_epic(tmp_path: Pa
     _live_epic_run(db, "run-c", "/ps/mini-ork/kickoffs/auto/epic-dead.md", ended=True)
 
     assert scheduler.reclaim_stale(db, older_than_s=0) == ["epic-dead"]
+
+
+def _claimed_by(db: str, epic_id: str) -> str | None:
+    con = sqlite3.connect(db)
+    try:
+        row = con.execute("SELECT claimed_by FROM epics WHERE id=?", (epic_id,)).fetchone()
+    finally:
+        con.close()
+    return row[0] if row else None
+
+
+def _set_claimer(db: str, epic_id: str, claimed_by: str) -> None:
+    con = sqlite3.connect(db)
+    con.execute("UPDATE epics SET claimed_by=? WHERE id=?", (claimed_by, epic_id))
+    con.commit()
+    con.close()
+
+
+def test_a_claim_records_the_claiming_scheduler(tmp_path: Path) -> None:
+    db = _init_db(tmp_path / "claim-who")
+    _seed(db, "epic-c")
+
+    assert scheduler._claim(db, "epic-c") is True
+    assert _claimed_by(db, "epic-c") == f"{socket.gethostname()}:{os.getpid()}"
+
+
+def test_a_live_claimer_protects_an_epic_whose_run_already_ended(tmp_path: Path, monkeypatch) -> None:
+    """The settle window: the run is over, its scheduler is still running hooks.
+    Neither last_run_id nor a live task_runs row exists to protect the epic."""
+    db = _init_db(tmp_path / "claim-live")
+    scheduler.ensure_retry_schema(db)
+    _seed(db, "epic-settling", status="in progress")
+    _set_claimer(db, "epic-settling", f"{socket.gethostname()}:4242")
+    _live_epic_run(db, "run-done", "/ps/mini-ork/kickoffs/auto/epic-settling.md", ended=True)
+    monkeypatch.setattr(scheduler, "_is_scheduler_process", lambda pid: pid == 4242)
+
+    assert scheduler.reclaim_stale(db, older_than_s=0) == []
+    assert _status(db, "epic-settling") == "in progress"
+
+
+def test_a_dead_claimer_or_another_hosts_claim_does_not_protect(tmp_path: Path, monkeypatch) -> None:
+    db = _init_db(tmp_path / "claim-dead")
+    scheduler.ensure_retry_schema(db)
+    _seed(db, "epic-dead-claimer", status="in progress")
+    _seed(db, "epic-other-host", status="in progress")
+    _set_claimer(db, "epic-dead-claimer", f"{socket.gethostname()}:4243")
+    _set_claimer(db, "epic-other-host", "some-other-box:4242")
+    monkeypatch.setattr(scheduler, "_is_scheduler_process", lambda pid: pid == 4242)
+
+    assert sorted(scheduler.reclaim_stale(db, older_than_s=0)) == ["epic-dead-claimer", "epic-other-host"]
+
+
+def test_a_reused_pid_that_is_not_a_scheduler_does_not_protect(tmp_path: Path) -> None:
+    """This test process is alive but is not a scheduler — its pid must not count."""
+    db = _init_db(tmp_path / "claim-reused")
+    scheduler.ensure_retry_schema(db)
+    _seed(db, "epic-reused", status="in progress")
+    _set_claimer(db, "epic-reused", f"{socket.gethostname()}:{os.getpid()}")
+
+    assert scheduler.reclaim_stale(db, older_than_s=0) == ["epic-reused"]
 
 
 def test_reclaim_is_a_no_op_on_an_empty_queue(tmp_path: Path) -> None:

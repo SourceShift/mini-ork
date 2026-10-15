@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -116,6 +118,8 @@ _RETRY_COLUMNS = (
     ("recipe", "TEXT"),
     ("held_reason", "TEXT"),
     ("last_run_id", "TEXT"),
+    # "<host>:<pid>" of the scheduler that claimed the epic; see reclaim_stale.
+    ("claimed_by", "TEXT"),
 )
 
 
@@ -662,14 +666,56 @@ def _settle(db: str | None, epic_id: str, attempt: int, outcome: str, reason: st
 def _claim(db: str | None, epic_id: str) -> bool:
     """'not started' -> 'in progress', atomically. False when another scheduler
     (or anything else) moved the epic since it was picked."""
+    ensure_retry_schema(db)
     con = _conn(db)
     try:
-        cur = con.execute("UPDATE epics SET status='in progress' "
-                          "WHERE id=? AND status='not started'", (epic_id,))
+        cur = con.execute("UPDATE epics SET status='in progress', claimed_by=? "
+                          "WHERE id=? AND status='not started'", (_claimer_id(), epic_id))
         con.commit()
         return cur.rowcount == 1
     finally:
         con.close()
+
+
+def _claimer_id() -> str:
+    """This scheduler process, as recorded on the epics it claims."""
+    return f"{socket.gethostname()}:{os.getpid()}"
+
+
+def _is_scheduler_process(pid: int) -> bool:
+    """Whether ``pid`` is alive and is a mini-ork scheduler (not a reused pid)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass  # alive, owned by someone else; the command line still decides
+    except OSError:
+        return False
+    try:
+        cmd = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    # The two ways a scheduler runs: `python -m mini_ork.scheduler …` and
+    # `bin/mini-ork scheduler …`. A bare "scheduler" substring would let any
+    # process mentioning the word (a test file path, an editor) hold an epic.
+    return bool(_SCHEDULER_CMD.search(cmd))
+
+
+_SCHEDULER_CMD = re.compile(r"(?:-m\s+mini_ork\.scheduler|mini-ork\s+scheduler)(?:\s|$)")
+
+
+def _claimer_alive(claimed_by: str | None) -> bool:
+    """Whether the scheduler that claimed an epic is still running on this host.
+
+    Another host's claim cannot be checked from here, so it does not protect the
+    epic; the run-liveness rules still apply to it.
+    """
+    host, _, pid = str(claimed_by or "").rpartition(":")
+    if not host or host != socket.gethostname() or not pid.isdigit():
+        return False
+    return _is_scheduler_process(int(pid))
 
 
 def _escalate_crash(db: str | None, epic_id: str, exc: BaseException) -> None:
@@ -811,6 +857,13 @@ def reclaim_stale(db: str | None = None, *, older_than_s: int | None = None) -> 
     grace window (``MO_SCHED_RECLAIM_AFTER_S``, default 900s) covers the rest: an
     epic touched more recently than that is assumed to belong to a live peer.
 
+    First, the claimer: ``_claim`` records ``<host>:<pid>`` in ``claimed_by``,
+    and an epic whose claiming scheduler is still alive on this host is never
+    reclaimed. That covers the window no run row can — after the run ends but
+    before its scheduler settles the epic (post-verdict hooks and reflect took
+    43 minutes for cn-ui-verdict-outcome on 2026-10-15, and a peer's startup
+    reclaimed it mid-settle).
+
     The run is found two ways. ``epics.last_run_id`` names it only once an
     attempt has *finished* (``_record_attempt``), so a first attempt still in
     flight has none — and every scheduler that started more than the grace
@@ -833,12 +886,14 @@ def reclaim_stale(db: str | None = None, *, older_than_s: int | None = None) -> 
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'"
         ).fetchone())
         stale = con.execute(
-            "SELECT e.id, e.last_run_id, e.kickoff_path FROM epics e "
+            "SELECT e.id, e.last_run_id, e.kickoff_path, e.claimed_by FROM epics e "
             "WHERE e.status = 'in progress' AND e.archived_at IS NULL "
             "AND e.updated_at < strftime('%Y-%m-%dT%H:%M:%fZ','now', ?)",
             (f"-{int(older_than_s)} seconds",)).fetchall()
         reclaimed = []
-        for epic_id, run_id, kickoff in stale:
+        for epic_id, run_id, kickoff, claimed_by in stale:
+            if _claimer_alive(claimed_by):
+                continue  # its scheduler is still running or settling it
             if run_id and has_runs and con.execute(
                     "SELECT 1 FROM task_runs WHERE id=? AND ended_at IS NULL "
                     "AND status NOT IN ('failed','published','rolled_back')",
