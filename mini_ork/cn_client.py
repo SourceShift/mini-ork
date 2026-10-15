@@ -217,16 +217,28 @@ def _section_cache_path(section: str, scope: str) -> str:
 
 
 def _get_text(path: str, *, timeout: float | None = None) -> str:
+    # Resolve auth headers BEFORE the network try/except so a secure-tier
+    # missing-token error escapes as ``SecretStoreError`` — swallowing it
+    # into ``""`` would hide the config error behind a silent empty section.
+    # The simple tier returns an empty dict from ``_auth_headers`` and never
+    # touches the secret store, so the call stays free of side effects.
+    headers = _auth_headers()
     try:
-        with urllib.request.urlopen(_base() + path, timeout=timeout if timeout is not None else _timeout()) as r:
+        req = urllib.request.Request(_base() + path, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout if timeout is not None else _timeout()) as r:
             return r.read().decode("utf-8", "replace")
     except Exception:
         return ""
 
 
 def _get(path: str, *, timeout: float | None = None) -> str:
+    # Same auth-first contract as ``_get_text``: secure-tier misconfig must
+    # surface as ``SecretStoreError`` (named key, never the value), not as
+    # a ``"{}"`` fallback that papers over a missing bearer token.
+    headers = _auth_headers()
     try:
-        with urllib.request.urlopen(_base() + path, timeout=timeout if timeout is not None else _timeout()) as r:
+        req = urllib.request.Request(_base() + path, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout if timeout is not None else _timeout()) as r:
             return r.read().decode("utf-8", "replace")
     except Exception:
         return "{}"
@@ -238,8 +250,11 @@ def _post_json(path: str, body: str, *, timeout: float | None = None) -> str:
         headers.update(_auth_headers())
     except Exception:
         # A missing-key error from the secure tier must not be swallowed by
-        # the page helpers — they consult the raised ``SecretStoreError`` to
-        # surface the key. The read paths below all catch it explicitly.
+        # the page helpers — ``retrieve`` and ``cached_section`` consult the
+        # raised ``SecretStoreError`` to surface the key name (never the
+        # value). The read helpers (``_get_text`` / ``_get`` / ``available``)
+        # resolve ``_auth_headers`` themselves so the raise propagates from
+        # them too.
         raise
     try:
         req = urllib.request.Request(_base() + path, data=body.encode("utf-8"),
@@ -267,8 +282,14 @@ def available() -> bool:
     # The availability probe uses the short ping timeout, NOT the read
     # timeout — a slow CN must report down so the page renders the one-line
     # not-running message instead of blocking on the read budget.
+    # Resolve the bearer token before opening the socket so a missing key on
+    # the secure tier fails closed (SecretStoreError propagates) — a missing
+    # token is a config error, NOT a "down" answer, and must never be papered
+    # over with a cached ``False`` or a silent simple-tier fallback.
+    headers = _auth_headers()
     try:
-        req = urllib.request.Request(_base() + "/api/v1/substrate/health")
+        req = urllib.request.Request(_base() + "/api/v1/substrate/health",
+                                     headers=headers)
         with urllib.request.urlopen(req, timeout=_ping_timeout()) as r:
             code = str(r.status)
     except Exception:

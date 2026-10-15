@@ -501,3 +501,335 @@ def test_authorization_header_uses_bearer(fresh_env, monkeypatch) -> None:
             assert "super-secret-1234" not in p
     finally:
         srv.shutdown()
+
+
+# ── 10. secure-tier GETs and probe send Authorization ─────────────────────
+
+
+def test_secure_tier_available_sends_authorization(fresh_env, monkeypatch) -> None:
+    """On the secure tier, the availability probe sends
+    ``Authorization: Bearer <token>`` derived from the secret store."""
+    monkeypatch.setenv("CN_TIER", "secure")
+    monkeypatch.setenv("CN_TOKEN_KEY", "CN_TOKEN")
+    store = fresh_env / "secrets.local.sh"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text('export CN_TOKEN="probe-auth-1234"\n', encoding="utf-8")
+    os.chmod(store, 0o600)
+    monkeypatch.setenv("MINI_ORK_SECRETS", str(store))
+    monkeypatch.setenv("CN_BASE_URL", "http://127.0.0.1:1")
+    monkeypatch.setenv("CN_PING_TTL", "0")  # always probe
+    monkeypatch.setenv("CN_PING_TIMEOUT_SEC", "0.2")
+
+    captured: list = []
+
+    class _R:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b""
+
+    def _fake(req, timeout=None):
+        captured.append(req)
+        return _R()
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake)
+    cn_client.available()
+    assert captured, "urlopen was never called"
+    assert captured[0].headers.get("Authorization", "") == "Bearer probe-auth-1234"
+
+
+def test_secure_tier_get_path_sends_authorization(fresh_env, monkeypatch) -> None:
+    """A GET through the page-helper path (``inbox`` → ``_get``) sends the
+    bearer token on the secure tier. The probe (a separate ``_auth_headers``
+    call) also carries the header."""
+    monkeypatch.setenv("CN_TIER", "secure")
+    monkeypatch.setenv("CN_TOKEN_KEY", "CN_TOKEN")
+    store = fresh_env / "secrets.local.sh"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text('export CN_TOKEN="get-path-9876"\n', encoding="utf-8")
+    os.chmod(store, 0o600)
+    monkeypatch.setenv("MINI_ORK_SECRETS", str(store))
+    monkeypatch.setenv("CN_BASE_URL", "http://127.0.0.1:1")
+    monkeypatch.setenv("CN_PING_TTL", "0")
+    monkeypatch.setenv("CN_PING_TIMEOUT_SEC", "0.2")
+    monkeypatch.setenv("CN_TIMEOUT_SEC", "0.2")
+
+    captured: list = []
+
+    class _R:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b"{}"
+
+    def _fake(req, timeout=None):
+        captured.append(req)
+        return _R()
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake)
+    cn_client.inbox(3)
+    # 1 = availability probe, 2 = inbox GET. Both must carry Authorization.
+    assert len(captured) >= 2, captured
+    for req in captured:
+        assert req.headers.get("Authorization", "") == "Bearer get-path-9876"
+
+
+def test_secure_tier_get_text_sends_authorization(fresh_env, monkeypatch) -> None:
+    """``_get_text`` (used by the markdown renderers) also sends the
+    bearer token on the secure tier."""
+    monkeypatch.setenv("CN_TIER", "secure")
+    monkeypatch.setenv("CN_TOKEN_KEY", "CN_TOKEN")
+    store = fresh_env / "secrets.local.sh"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text('export CN_TOKEN="get-text-5555"\n', encoding="utf-8")
+    os.chmod(store, 0o600)
+    monkeypatch.setenv("MINI_ORK_SECRETS", str(store))
+
+    captured: list = []
+
+    class _R:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b""
+
+    def _fake(req, timeout=None):
+        captured.append(req)
+        return _R()
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake)
+    cn_client._get_text("/foo")
+    assert captured, "urlopen was never called"
+    assert captured[0].headers.get("Authorization", "") == "Bearer get-text-5555"
+
+
+# ── 11. secure-tier GETs and probe fail closed when the token is missing ──
+
+
+def test_secure_tier_get_fails_closed_when_token_missing(fresh_env, monkeypatch) -> None:
+    """On the secure tier, a missing bearer token makes ``_get`` raise
+    ``SecretStoreError`` (naming the KEY) BEFORE any request is sent. The
+    empty-dict fallback must NOT paper over the misconfiguration."""
+    monkeypatch.setenv("CN_TIER", "secure")
+    monkeypatch.setenv("CN_TOKEN_KEY", "CN_TOKEN")
+    monkeypatch.setenv("MINI_ORK_SECRETS", str(fresh_env / "missing.sh"))
+
+    def _fake(req, timeout=None):
+        raise AssertionError("urlopen must not be called when the token is missing")
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake)
+    with pytest.raises(SecretStoreError) as exc:
+        cn_client._get("/foo")
+    assert "CN_TOKEN" in str(exc.value)
+
+
+def test_secure_tier_get_text_fails_closed_when_token_missing(fresh_env, monkeypatch) -> None:
+    """``_get_text`` raises ``SecretStoreError`` when the token is missing —
+    the empty-string fallback is reserved for genuine network errors only."""
+    monkeypatch.setenv("CN_TIER", "secure")
+    monkeypatch.setenv("CN_TOKEN_KEY", "CN_TOKEN")
+    monkeypatch.setenv("MINI_ORK_SECRETS", str(fresh_env / "missing.sh"))
+
+    def _fake(req, timeout=None):
+        raise AssertionError("urlopen must not be called when the token is missing")
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake)
+    with pytest.raises(SecretStoreError) as exc:
+        cn_client._get_text("/foo")
+    assert "CN_TOKEN" in str(exc.value)
+
+
+def test_secure_tier_available_fails_closed_when_token_missing(fresh_env, monkeypatch) -> None:
+    """The availability probe also fails closed on a missing token — a
+    missing key is a CONFIG error, not a "down" answer."""
+    monkeypatch.setenv("CN_TIER", "secure")
+    monkeypatch.setenv("CN_TOKEN_KEY", "CN_TOKEN")
+    monkeypatch.setenv("MINI_ORK_SECRETS", str(fresh_env / "missing.sh"))
+    monkeypatch.setenv("CN_BASE_URL", "http://127.0.0.1:1")
+    monkeypatch.setenv("CN_PING_TTL", "0")  # always probe
+
+    def _fake(req, timeout=None):
+        raise AssertionError("urlopen must not be called when the token is missing")
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake)
+    with pytest.raises(SecretStoreError) as exc:
+        cn_client.available()
+    assert "CN_TOKEN" in str(exc.value)
+
+
+# ── 12. simple tier: no Authorization, no secret store access ─────────────
+
+
+def test_simple_tier_get_sends_no_authorization(fresh_env, monkeypatch) -> None:
+    """On the simple tier, ``_get`` does not touch the secret store and
+    sends no Authorization header — even when a secret store exists with
+    a CN_TOKEN entry, the simple tier must ignore it (no silent upgrade
+    to secure)."""
+    # No CN_TIER set — default is "simple" from the example yaml.
+    # Pre-create a secret store with a token. The simple tier must not
+    # read it; if it tried, the test would still pass functionally, but
+    # we tighten the assertion by also asserting the secret VALUE never
+    # appears in any captured request.
+    secret_value = "simple-tier-canary-7777"
+    store = fresh_env / "secrets.local.sh"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text(f'export CN_TOKEN="{secret_value}"\n', encoding="utf-8")
+    os.chmod(store, 0o600)
+    monkeypatch.setenv("MINI_ORK_SECRETS", str(store))
+
+    captured: list = []
+
+    class _R:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b"{}"
+
+    def _fake(req, timeout=None):
+        captured.append(req)
+        return _R()
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake)
+    cn_client._get("/foo")
+    assert captured, "urlopen was never called"
+    # No Authorization header on the simple tier.
+    assert "Authorization" not in captured[0].headers
+    # The secret value never appears in any outbound URL or header.
+    for req in captured:
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        assert secret_value not in url
+        assert secret_value not in str(req.headers)
+
+
+def test_simple_tier_available_sends_no_authorization(fresh_env, monkeypatch) -> None:
+    """The availability probe on the simple tier sends no Authorization
+    header and never opens the secret store file."""
+    # No CN_TIER set — default is "simple". Pre-create a secret store
+    # with a value; the simple tier must not read it.
+    secret_value = "available-canary-8888"
+    store = fresh_env / "secrets.local.sh"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text(f'export CN_TOKEN="{secret_value}"\n', encoding="utf-8")
+    os.chmod(store, 0o600)
+    monkeypatch.setenv("MINI_ORK_SECRETS", str(store))
+    monkeypatch.setenv("CN_PING_TTL", "0")
+
+    captured: list = []
+
+    class _R:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b""
+
+    def _fake(req, timeout=None):
+        captured.append(req)
+        return _R()
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake)
+    assert cn_client.available() is True
+    assert captured, "urlopen was never called"
+    assert "Authorization" not in captured[0].headers
+    for req in captured:
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        assert secret_value not in url
+        assert secret_value not in str(req.headers)
+
+
+# ── 13. cn status exits non-zero on a missing token ───────────────────────
+
+
+def test_cn_status_subprocess_missing_token_exits_nonzero(fresh_env, monkeypatch) -> None:
+    """End-to-end: ``python -m mini_ork.cli.cn_cmd status --json`` on the
+    secure tier with a missing token exits 5, names the KEY in stderr,
+    and the JSON payload has ``error == "secret_store_missing_key"``.
+    A "reachable: no" answer would mask the misconfiguration; this
+    command must instead tell the operator which export to add."""
+    env = os.environ.copy()
+    for k in ("MO_DISABLE_CN", "CN_BASE_URL", "CN_PING_TIMEOUT_SEC",
+              "CN_TIMEOUT_SEC"):
+        env.pop(k, None)
+    env["MINI_ORK_HOME"] = str(fresh_env)
+    env["PYTHONPATH"] = str(REPO)
+    env["CN_TIER"] = "secure"
+    env["CN_TOKEN_KEY"] = "CN_TOKEN"
+    env["MINI_ORK_SECRETS"] = str(fresh_env / "missing.sh")  # never created
+    proc = subprocess.run(
+        [sys.executable, "-m", "mini_ork.cli.cn_cmd", "status", "--json"],
+        env=env, capture_output=True, text=True, timeout=10,
+    )
+    # Non-zero exit distinguishes "fix the secret store" from "server is down".
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    # The KEY name is in stderr so the operator knows which export to add.
+    assert "CN_TOKEN" in proc.stderr
+    # The structured diagnostic on stdout is parseable JSON.
+    payload = json.loads(proc.stdout)
+    assert payload["error"] == "secret_store_missing_key"
+    assert payload["error_key"] == "CN_TOKEN"
+    assert payload["reachable"] is False
+    assert payload["tier"] == "secure"
+
+
+def test_cn_status_subprocess_token_value_never_leaks(fresh_env, monkeypatch) -> None:
+    """The token VALUE never appears in ``cn status`` output — neither
+    stdout nor stderr, on the success path or the error path."""
+    secret_value = "leak-canary-9999-zzzz"
+    env = os.environ.copy()
+    for k in ("MO_DISABLE_CN", "CN_PING_TIMEOUT_SEC", "CN_TIMEOUT_SEC"):
+        env.pop(k, None)
+    env["MINI_ORK_HOME"] = str(fresh_env)
+    env["PYTHONPATH"] = str(REPO)
+    env["CN_TIER"] = "secure"
+    env["CN_TOKEN_KEY"] = "CN_TOKEN"
+    env["CN_BASE_URL"] = "http://127.0.0.1:1"  # nothing listens here
+    env["CN_PING_TIMEOUT_SEC"] = "0.2"
+    store = fresh_env / "secrets.local.sh"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text(f'export CN_TOKEN="{secret_value}"\n', encoding="utf-8")
+    os.chmod(store, 0o600)
+    env["MINI_ORK_SECRETS"] = str(store)
+    proc = subprocess.run(
+        [sys.executable, "-m", "mini_ork.cli.cn_cmd", "status", "--json"],
+        env=env, capture_output=True, text=True, timeout=10,
+    )
+    # The token value must NEVER appear in any output stream.
+    assert secret_value not in proc.stdout, proc.stdout
+    assert secret_value not in proc.stderr, proc.stderr
+    # And the KEY name is fine to appear (the operator needs to know
+    # which export to set).
+    assert "CN_TOKEN" in proc.stdout or "CN_TOKEN" in proc.stderr
+
+
+def test_cn_status_runs_offline_secure_with_token(fresh_env, monkeypatch) -> None:
+    """``cn status`` on the secure tier with a valid token still answers
+    the reachability question (with a no, since the server is down) and
+    exits 0 — reachability is what ``status`` answers, not auth."""
+    from mini_ork.cli import cn_cmd
+
+    monkeypatch.setenv("CN_TIER", "secure")
+    monkeypatch.setenv("CN_TOKEN_KEY", "CN_TOKEN")
+    store = fresh_env / "secrets.local.sh"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text('export CN_TOKEN="ok-token-1111"\n', encoding="utf-8")
+    os.chmod(store, 0o600)
+    monkeypatch.setenv("MINI_ORK_SECRETS", str(store))
+    monkeypatch.setenv("CN_BASE_URL", "http://127.0.0.1:1")
+    monkeypatch.setenv("CN_PING_TIMEOUT_SEC", "0.2")
+
+    parser = cn_cmd.build_parser()
+    out = io.StringIO()
+    err = io.StringIO()
+    saved_stdout, saved_stderr = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = out, err
+    try:
+        rc = cn_cmd._cmd_status(parser.parse_args(["status", "--json"]))
+    finally:
+        sys.stdout, sys.stderr = saved_stdout, saved_stderr
+    assert rc == 0
+    payload = json.loads(out.getvalue())
+    assert payload["tier"] == "secure"
+    assert payload["token_key"] == "CN_TOKEN"
+    assert payload["reachable"] is False
+    # Token value never leaked into the JSON output.
+    assert "ok-token-1111" not in out.getvalue()
+    assert "ok-token-1111" not in err.getvalue()
