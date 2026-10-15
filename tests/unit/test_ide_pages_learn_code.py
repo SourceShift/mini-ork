@@ -78,6 +78,16 @@ def _section(page: dict, title: str) -> dict:
     return next(s for s in page["sections"] if s["title"] == title)
 
 
+def _flag(argv: list[str], name: str) -> str:
+    """The value of ``--name`` in a CLI argv — an AssertionError means it is absent."""
+    return argv[argv.index(name) + 1]
+
+
+def _target(row: dict) -> str:
+    """A recurring row's ``--target`` glob (the rule's file scope)."""
+    return _flag(row["do"]["cli"], "--target")
+
+
 def _build(home: Path, args: dict | None = None) -> dict:
     return learn.build(home, "code", args or {})
 
@@ -221,15 +231,21 @@ def test_area_detail_recurring_rule_and_findings(home: Path, monkeypatch) -> Non
     # The docstring cluster (2×) comes first; the singleton second.
     assert rec["rows"][0]["cells"][1]["t"] == "2×"
     action = rec["rows"][0]["do"]
-    assert action["cli"][:3] == ["prefs", "set", "review-" + action["cli"][2].split("-", 1)[1]]
     assert action["cli"][0:2] == ["prefs", "set"]
-    assert "--scope" in action["cli"] and "path" in action["cli"]
-    assert "--target" in action["cli"]
-    # ``svc/pay`` is a 2-segment key (shallower than the grouping depth), so it
-    # holds only its direct children and the rule targets exactly them — not the
-    # ``svc/pay/sub`` subtree, which is a different row (reviewer, round 2).
-    assert "svc/pay/*" in action["cli"]
-    assert "Add a rule for svc/pay/*?" in action["confirm"]
+    assert action["cli"][2].startswith("review-")
+    assert _flag(action["cli"], "--scope") == "path"
+    # Both members are direct children of ``svc/pay``, so the rule targets
+    # exactly those files — not the ``svc/pay/sub`` subtree, which is a
+    # different row (reviewer, round 2), and not the whole ``svc/pay`` area.
+    assert _target(rec["rows"][0]) == "svc/pay/*"
+    # LF-R4: the button drafts an INACTIVE, learned rule — it does not write a
+    # live operator rule.
+    assert _flag(action["cli"], "--origin") == "learned"
+    assert "--draft" in action["cli"]
+    assert "svc/pay/*" in action["confirm"]
+    low_confirm = action["confirm"].lower()
+    assert "inactive" in low_confirm and "draft" in low_confirm
+    assert "rules" in low_confirm
 
     findings = _section(page, L.FINDINGS_TITLE)
     assert len(findings["rows"]) == 3
@@ -256,7 +272,7 @@ def test_area_directory_excludes_sibling_prefix(home: Path, monkeypatch) -> None
         {"run_id": "r1", "file": "mini_ork/acp/server.py", "severity": "low",
          "issue": "cursor left open in the server loop"},
         {"run_id": "r2", "file": "mini_ork/acp/client.py", "severity": "low",
-         "issue": "retry budget check skipped on retry"},
+         "issue": "cursor left open in the server loop"},
         {"run_id": "r3", "file": "mini_ork/acp_orchestrator/state.py", "severity": "high",
          "issue": "state machine skips the terminal transition"},
         {"run_id": "r4", "file": "mini_ork/acp_orchestrator/plan.py", "severity": "high",
@@ -276,12 +292,13 @@ def test_area_directory_excludes_sibling_prefix(home: Path, monkeypatch) -> None
     files = sorted(r["cells"][0]["t"].rstrip(":") for r in _section(page, L.FINDINGS_TITLE)["rows"])
     assert files == ["mini_ork/acp/client.py", "mini_ork/acp/server.py"], files
 
-    # Every rule action is sourced from this area only, and targets its glob.
+    # The area's two findings recur, so they offer ONE rule — sourced from this
+    # area only and targeting its own files, never the sibling's.
     rec = _section(page, L.RECURRING_TITLE)
     assert rec["rows"], "the area's two findings should produce clusters"
-    for row in rec["rows"]:
-        assert "acp_orchestrator" not in row["cells"][0]["t"]
-        assert row["do"]["cli"][-1] == "mini_ork/acp/*"
+    assert rec["rows"][0]["cells"][1]["t"] == "2×"
+    assert "acp_orchestrator" not in rec["rows"][0]["cells"][0]["t"]
+    assert _target(rec["rows"][0]) == "mini_ork/acp/*"
 
     # The areas-table row for `mini_ork/acp` must likewise exclude the sibling
     # (its "recurring problems" cell is built through the same query path).
@@ -327,18 +344,19 @@ def test_area_extensionless_file_is_not_treated_as_directory(home: Path) -> None
     # The rule targets the file itself — no glob that can never match.
     rec = _section(page, L.RECURRING_TITLE)
     assert rec["rows"], "the file's three findings should cluster"
-    action = rec["rows"][0]["do"]
-    assert action["cli"][-1] == "bin/mini-ork"
-    assert "bin/mini-ork/**" not in action["confirm"]
+    assert _target(rec["rows"][0]) == "bin/mini-ork"
+    assert "bin/mini-ork/**" not in rec["rows"][0]["do"]["confirm"]
 
     # A sibling extensionless file is its own area, never swept in by the
-    # ``bin/mini-ork`` prefix query.
+    # ``bin/mini-ork`` prefix query. One finding there is not a RECURRING
+    # problem, so its row offers no rule at all (LF-R4).
     mk_page = _build(home, {"area": "Makefile"})
     mk = _section(mk_page, "Makefile")
     assert "1 findings in 1 run" in mk["text"], mk["text"]
     mk_rows = _section(mk_page, L.FINDINGS_TITLE)["rows"]
     assert [r["cells"][0]["t"] for r in mk_rows] == ["Makefile:"]
-    assert _section(mk_page, L.RECURRING_TITLE)["rows"][0]["do"]["cli"][-1] == "Makefile"
+    mk_row = _section(mk_page, L.RECURRING_TITLE)["rows"][0]
+    assert mk_row["do"] is None and mk_row["cells"][4]["t"] == "—"
 
 
 def test_area_detail_summary_matches_findings_it_lists(home: Path, monkeypatch) -> None:
@@ -581,7 +599,7 @@ def test_area_file_branch_not_crowded_out_by_prefix_siblings(home: Path, monkeyp
     assert [r["cells"][0]["t"] for r in _section(page, L.FINDINGS_TITLE)["rows"]] \
         == ["bin/mini-ork:"] * 3
     # The rule targets the file itself — never a glob that cannot match.
-    assert _section(page, L.RECURRING_TITLE)["rows"][0]["do"]["cli"][-1] == "bin/mini-ork"
+    assert _target(_section(page, L.RECURRING_TITLE)["rows"][0]) == "bin/mini-ork"
 
 
 def test_area_detail_honours_days_window(home: Path, monkeypatch) -> None:
@@ -620,6 +638,107 @@ def test_area_detail_close_button_clears_selection(home: Path) -> None:
     assert md["type"] == "markdown"
     close = next(a for a in md["actions"] if a["label"] == "Close area")
     assert close["do"] == {"set": {"area": "", "finding": ""}}
+
+
+# ── the "Make it a rule" DRAFT (LF-R4) ─────────────────────────────────────
+
+def test_rule_targets_the_member_file_not_the_area_glob(home: Path, monkeypatch) -> None:
+    """A cluster whose members are all in ONE file targets that file.
+
+    The area key is the grouping prefix (``mini_ork/ide_pages``), so targeting
+    the AREA emitted ``mini_ork/ide_pages/*`` — a rule injected into every run
+    that touches a sibling file, for a problem found only in ``node.py``.
+    """
+    file = "mini_ork/ide_pages/node.py"
+    _seed(home, [{"run_id": f"r{i}", "file": file, "severity": "high",
+                  "issue": "the log proxy leaks the writer handle"} for i in range(3)])
+    _repo_files(monkeypatch, file)
+
+    page = _build(home, {"area": "mini_ork/ide_pages"})
+    assert page["errors"] == {}, page["errors"]
+    row = _section(page, L.RECURRING_TITLE)["rows"][0]
+    assert _target(row) == file
+    assert _target(row) != "mini_ork/ide_pages/*"
+
+
+def test_rule_targets_dir_globstar_for_nested_members(home: Path, monkeypatch) -> None:
+    """Members that share a directory but not a parent get ``<dir>/**``.
+
+    Both files key to the same area (the grouping truncates at three segments),
+    but they are not direct children of one directory, so neither ``<dir>/*``
+    (too narrow) nor the area glob (too wide) describes them.
+    """
+    files = ["mini_ork/cli/sub/a.py", "mini_ork/cli/sub/deep/b.py"]
+    _seed(home, [{"run_id": f"r{i}", "file": f, "severity": "medium",
+                  "issue": "the shard counter goes stale under load"}
+                 for i, f in enumerate(files)])
+    _repo_files(monkeypatch, *files)
+
+    page = _build(home, {"area": "mini_ork/cli/sub"})
+    assert page["errors"] == {}, page["errors"]
+    assert _target(_section(page, L.RECURRING_TITLE)["rows"][0]) == "mini_ork/cli/sub/**"
+
+
+def test_one_member_cluster_offers_no_rule(home: Path, monkeypatch) -> None:
+    """One finding is not a recurring problem, so there is nothing to make a rule of."""
+    _seed(home, [{"run_id": "r0", "file": "mini_ork/solo/only.py", "severity": "medium",
+                  "issue": "a one-off problem, never seen again"}])
+    _repo_files(monkeypatch, "mini_ork/solo/only.py")
+
+    page = _build(home, {"area": "mini_ork/solo"})
+    assert page["errors"] == {}, page["errors"]
+    row = _section(page, L.RECURRING_TITLE)["rows"][0]
+    assert row["do"] is None, "a 1-member cluster must offer no rule"
+    assert row["cells"][4]["t"] == "—"
+
+
+def test_rule_draft_text_is_generalised(home: Path, monkeypatch) -> None:
+    """The drafted text keeps the problem and drops the verifier transcript.
+
+    ``clean_issue`` removes file:line references and severity words; on top of
+    that the action drops the sentence a verifier appends ("Reproduced: …
+    PASSED/FAILED") and its status tokens. A rule quoting a reproduction result
+    tells a future agent about a run, not about the code it will edit.
+    """
+    file = "mini_ork/ide_pages/node.py"
+    issue = ("The log proxy leaks the writer handle in mini_ork/ide_pages/node.py:42 "
+             "(medium). Reproduced: [False] PASSED, [True] FAILED.")
+    _seed(home, [{"run_id": f"r{i}", "file": file, "severity": "medium",
+                  "issue": issue} for i in range(3)])
+    _repo_files(monkeypatch, file)
+
+    page = _build(home, {"area": "mini_ork/ide_pages"})
+    assert page["errors"] == {}, page["errors"]
+    text = _section(page, L.RECURRING_TITLE)["rows"][0]["do"]["cli"][3]
+    low = text.lower()
+
+    assert text.startswith(f"Reviewers repeatedly found in {file}: "), text
+    assert "log proxy" in low, "the generalised substance must survive"
+    for banned in ("reproduced", "passed", "failed", "[true]", "[false]",
+                   ":42", "medium"):
+        assert banned not in low, (banned, text)
+
+
+def test_approved_learned_rule_does_not_reach_a_sibling_file(home: Path) -> None:
+    """The drafted rule's target is the FILE, so its siblings are untouched.
+
+    Approving promotes the draft (``active=1``); it does not widen its scope.
+    """
+    from mini_ork.memory import preferences
+
+    db = str(home / "state.db")
+    preferences.set_pref(
+        "review-node",
+        "Reviewers repeatedly found in mini_ork/ide_pages/node.py: the log proxy leaks",
+        scope="path", target="mini_ork/ide_pages/node.py",
+        origin="learned", source_ids=["k1"], db=db)
+
+    sibling = preferences.prefs_for(
+        "framework_edit", paths=["mini_ork/ide_pages/_cn.py"], db=db)
+    assert not any(r["key"] == "review-node" for r in sibling)
+    own = preferences.prefs_for(
+        "framework_edit", paths=["mini_ork/ide_pages/node.py"], db=db)
+    assert any(r["key"] == "review-node" for r in own)
 
 
 # ── the reflect harvest hook (E6) ──────────────────────────────────────────

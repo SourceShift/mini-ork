@@ -7,6 +7,9 @@ node prompt:
 - **Your rules** — ``user_preference_memory`` (scoped global / task_class /
   workflow / path) plus the legacy config files, injected FIRST in every
   researcher / implementer / reviewer prompt (``preferences.prefs_for``).
+  A rule the "Your code" tab drafted is listed here INACTIVE, labelled
+  ``learned draft`` and carrying the Approve action that promotes it — nothing
+  reaches an agent until it is approved.
 - **Learned rules (verified)** — ``emergent_patterns`` rows with
   ``status='approved'`` and a non-blank ``lesson_text``, injected under
   "Lessons from recurring patterns" (``context_assembler``).
@@ -111,6 +114,33 @@ def _remove_action(key: str, scope: str, target: str, source: str) -> dict[str, 
                  confirm=f"Remove rule '{key}'?", home=False)
 
 
+def _approve_action(key: str, scope: str, target: str) -> dict[str, Any]:
+    """The promotion a DRAFT is waiting for — never offered on a live rule.
+
+    Approving is what starts giving the rule to agents, so the confirm says so;
+    the action carries scope+target because they are part of the row's identity
+    (``(key, scope, scope_target)`` is the primary key), and ``prefs approve``
+    needs all three to find the row.
+    """
+    return S.cli("prefs", "approve", key, "--scope", scope, "--target", target,
+                 confirm=(f"Approve this draft rule for {_applies_to(scope, target)}? "
+                          f"Agents will be given it from the next run on."),
+                 home=False)
+
+
+def _origin_label(pref: dict) -> str:
+    """The source column: provenance, plus the draft state when it is one.
+
+    ``learned`` alone must not imply "live" — an unapproved draft is learned and
+    NOT given to anything, so it is labelled and flagged in the same cell.
+    """
+    origin = str(pref.get("origin") or "operator")
+    if origin == "learned":
+        return "learned draft" if not pref.get("active", 1) else "learned"
+    src = str(pref.get("source") or "")
+    return "file" if src.startswith("file:") else "you"
+
+
 def _your_rules(home: Path, now: int) -> dict[str, Any]:
     db_path = str(home / "state.db")
     prefs = _safe_list_prefs(db_path)
@@ -122,16 +152,27 @@ def _your_rules(home: Path, now: int) -> dict[str, Any]:
         value = str(p.get("value") or "")
         src = str(p.get("source") or "")
         given = _given_7d(scope, target, key, p, db_path, now)
-        out.append({"cells": [
-            S.cell(short(value, 140)),
-            S.muted(_applies_to(scope, target)),
-            S.mono(given) if given != "not yet" else S.muted("not yet"),
-            S.muted("file" if src.startswith("file:") else "you"),
-        ], "do": _remove_action(key, scope, target, src), "sel": False})
+        # A learned draft is listed here on purpose: this is the only place it
+        # can be approved, and until it is, no agent has been told it.
+        is_draft = (str(p.get("origin") or "operator") == "learned"
+                    and not p.get("active", 1))
+        row: dict[str, Any] = {
+            "cells": [
+                S.cell(short(value, 140)),
+                S.muted(_applies_to(scope, target)),
+                S.mono(given) if given != "not yet" else S.muted("not yet"),
+                S.muted(_origin_label(p)),
+            ],
+            "do": _remove_action(key, scope, target, src), "sel": False,
+        }
+        if is_draft:
+            row["acts"] = [S.btn("Approve", _approve_action(key, scope, target),
+                                 "primary")]
+        out.append(row)
     if not out:
         out = [[S.muted(_RULES_EMPTY), "", "", ""]]
     return S.table("Your rules",
-                   [S.col(fr=1, min=200), S.col(120), S.col(150), S.col(70)],
+                   [S.col(fr=1, min=200), S.col(120), S.col(150), S.col(90)],
                    ["rule", "applies to", "given to agents (7 days)", "source"],
                    out, full=True,
                    actions=[S.btn("Add a rule", S.thread(_ADD_RULE_THREAD), "primary")],

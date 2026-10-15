@@ -1,13 +1,22 @@
-"""Operator-set preferences and constraints.
+"""Operator-set preferences and constraints, plus drafted learned rules.
 
 Backed by ``user_preference_memory`` (db/migrations/0009_memory_namespaces.sql:109-121;
-CHECK extended by ``db/migrations/0065_preference_path_scope.sql``);
+CHECK extended by ``db/migrations/0065_preference_path_scope.sql``; provenance
+columns added by ``db/migrations/0074_preference_origin.sql``);
 scoped by ``scope ∈ {global, task_class, workflow, path}`` with ``scope_target``
 carrying the class, workflow, or file glob (empty for global). Also surfaces
 read-only entries from the legacy
 ``$MINI_ORK_HOME/config/{user_preferences,constraints}.json`` files via
 ``list_prefs`` / ``prefs_for`` so operators can see what the planner still ingests
 through ``context_assembler.context_assemble``.
+
+Every row also carries ``origin`` (``operator`` | ``learned``), ``source_ids``
+(the finding keys a learned rule was derived from), and ``active`` (LF-R4). A
+rule the "Make it a rule" button drafts is ``origin='learned', active=0``:
+``list_prefs`` shows it — the Rules tab offers Approve on it — while ``prefs_for``
+drops it, so a draft never reaches a prompt. ``approve_pref`` promotes it. Legacy
+file-sourced entries are read-only operator rules: no origin/active fields, so
+they behave as ``origin='operator', active=1``.
 
 A ``path`` rule's ``scope_target`` is a *relative file glob* (``**`` = any depth,
 ``*`` = one segment, a trailing ``/`` = the directory and everything under it).
@@ -18,10 +27,12 @@ DB resolution mirrors ``mini_ork.memory.store._db_path()``: explicit ``db`` arg 
 else ``$MINI_ORK_DB``, else ``$MINI_ORK_HOME/state.db``.
 
 Public API (kickoff contract, ``kickoffs/auto/learn-prefs.md:34-56`` +
-``kickoffs/auto/eng-path-rules.md``):
+``kickoffs/auto/eng-path-rules.md`` + ``kickoffs/auto/lf-r4-rule-action.md``):
 
-    set_pref(key, value, *, scope="global", target="", db=None) -> dict
+    set_pref(key, value, *, scope="global", target="", origin="operator",
+             source_ids=None, active=True, db=None) -> dict
     remove_pref(key, *, scope="global", target="", db=None) -> bool
+    approve_pref(key, *, scope, target, text=None, db=None) -> bool
     list_prefs(*, db=None) -> list[dict]
     prefs_for(task_class, workflow="", *, paths=None, db=None) -> list[dict]
     render_block(prefs) -> str
@@ -41,8 +52,24 @@ from ..context import context_env
 
 _USER_ID = "default"
 _VALID_SCOPES = ("global", "task_class", "workflow", "path")
+_VALID_ORIGINS = ("operator", "learned")
 _MAX_ENTRIES = 12
 _MAX_VALUE_CHARS = 600
+
+# The two prompt block headers. The operator heading is the pre-LF-R4 block,
+# byte for byte — out-of-scope consumers (``mini_ork/cli/execute.py``) and their
+# tests pin it, so it must not move. The learned heading and its close are new:
+# a rule the review harvester proposed is advice from findings, not an operator
+# order, and it is rendered as such (em dash U+2014, verbatim from the kickoff).
+OPERATOR_HEADING = (
+    "--- Operator preferences and constraints (set by the user; follow them) ---"
+)
+OPERATOR_CLOSE = "--- /operator preferences ---"
+LEARNED_HEADING = (
+    "--- Learned rules (from review findings — check they still apply "
+    "before following) ---"
+)
+LEARNED_CLOSE = "--- /learned rules ---"
 
 
 # ─── DB resolution (mirrors mini_ork.memory.store._db_path) ──────────────
@@ -249,6 +276,9 @@ CREATE TABLE IF NOT EXISTS user_preference_memory (
                       CHECK (scope IN ('global','task_class','workflow','path')),
   scope_target        TEXT    NOT NULL DEFAULT '',
   set_at              TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  origin              TEXT    NOT NULL DEFAULT 'operator',
+  source_ids          TEXT,
+  active              INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY (user_id, preference_key, scope, scope_target)
 );
 """
@@ -263,6 +293,13 @@ CREATE INDEX IF NOT EXISTS idx_user_pref_scope   ON user_preference_memory(scope
 # copy rows → drop-old → rename. Mirrors db/migrations/0065_preference_path_scope.sql;
 # unlike the SQL migration this path introspects ``sqlite_master`` for dependent
 # views/triggers (the migration drops/recreates the one known view by hand).
+#
+# Deliberately the PRE-0074 shape: this rebuild only fires for a table whose
+# CHECK predates migration 0065, and the origin/source_ids/active columns are
+# added by ``_add_origin_columns`` *after* it (see ``_ensure_schema_con``). Copying
+# six columns into a table that may not have nine keeps the statement valid on
+# every shape; a DB old enough to need the rebuild cannot have the columns yet
+# (0074 sorts after 0065).
 _REBUILD_TABLE_SQL = """
 CREATE TABLE user_preference_memory_new (
   user_id             TEXT    NOT NULL,
@@ -284,16 +321,20 @@ ALTER TABLE user_preference_memory_new RENAME TO user_preference_memory;
 
 
 def ensure_schema(db: str | None = None) -> None:
-    """Idempotent DDL so an unmigrated DB still accepts ``path`` rules.
+    """Idempotent DDL so an unmigrated DB still accepts ``path`` and learned rules.
 
-    Worktree DBs are routinely unmigrated (see migration
-    ``0065_preference_path_scope.sql``, whose rebuild this mirrors). Fast path:
-    the ``path`` scope is already in the CHECK. Otherwise the table is rebuilt
-    (create-new → copy rows → drop → rename), the three indexes the drop takes
-    with it are recreated, and any view/trigger that references the table is
-    dropped for the rebuild and recreated verbatim — otherwise the rename
-    aborts on SQLite >= 3.45 (see ``_dependent_schema_objects``). Cold-safe: a
-    missing table is created.
+    Worktree DBs are routinely unmigrated (see migrations
+    ``0065_preference_path_scope.sql`` and ``0074_preference_origin.sql``, whose
+    effects this mirrors). The CHECK widening and the origin/source_ids/active
+    columns are two INDEPENDENT checks: a table already carrying ``path`` still
+    needs the provenance columns, so the first cannot short-circuit the second.
+    The CHECK is widened by rebuilding (create-new → copy rows → drop → rename),
+    the three indexes the drop takes with it are recreated, and any view/trigger
+    that references the table is dropped for the rebuild and recreated verbatim —
+    otherwise the rename aborts on SQLite >= 3.45 (see
+    ``_dependent_schema_objects``). The columns are then added in place with
+    ``ALTER TABLE ADD COLUMN``. Cold-safe: a missing table is created with every
+    column from the start.
     """
     db_path = _resolve_db(db)
     con = sqlite3.connect(db_path)
@@ -341,8 +382,13 @@ def _ensure_schema_con(con: sqlite3.Connection) -> None:
         con.executescript(_CREATE_TABLE_SQL + _CREATE_INDEXES_SQL)
         return
     ddl = row[0] or ""
-    if "'path'" in ddl or '"path"' in ddl:
-        return  # already extended
+    if "'path'" not in ddl and '"path"' not in ddl:
+        _rebuild_for_path_scope(con)
+    _add_origin_columns(con)
+
+
+def _rebuild_for_path_scope(con: sqlite3.Connection) -> None:
+    """Widen the CHECK by rebuilding the table (see ``_REBUILD_TABLE_SQL``)."""
     deps = _dependent_schema_objects(con, "user_preference_memory")
     stmts = [
         # Drop dependents first so the RENAME's schema re-parse stays clean.
@@ -364,44 +410,121 @@ def _ensure_schema_con(con: sqlite3.Connection) -> None:
         raise
 
 
+# (name, column definition) — the three columns migration 0074 declares. Kept
+# as data so the ALTER and the comment above cannot drift from the migration.
+_ORIGIN_COLUMNS = (
+    ("origin", "TEXT NOT NULL DEFAULT 'operator'"),
+    ("source_ids", "TEXT"),
+    ("active", "INTEGER NOT NULL DEFAULT 1"),
+)
+
+
+def _add_origin_columns(con: sqlite3.Connection) -> None:
+    """Add any missing origin/source_ids/active column. Mirrors migration 0074.
+
+    This check must be INDEPENDENT of the CHECK-scope check above: the fast path
+    used to ``return`` as soon as ``'path'`` was in the DDL, so a DB migrated to
+    0065 but not 0074 (the common case — the table already accepts ``path``)
+    skipped every later addition. A DB in the migration-ordered state has all
+    three already, so this is a no-op there; ``PRAGMA table_info`` + ``ALTER
+    TABLE ADD COLUMN`` also avoids the rebuild path entirely, which is what keeps
+    it safe on a table that has a dependent view.
+    """
+    have = {r[1] for r in con.execute("PRAGMA table_info(user_preference_memory)")}
+    for name, decl in _ORIGIN_COLUMNS:
+        if name not in have:
+            con.execute(
+                f"ALTER TABLE user_preference_memory ADD COLUMN {name} {decl}")
+
+
 # ─── set_pref / remove_pref ──────────────────────────────────────────────
 
 
 def set_pref(key: str, value, *, scope: str = "global", target: str = "",
+            origin: str = "operator", source_ids=None, active: bool = True,
             db: str | None = None) -> dict:
     """Upsert a preference. Returns the stored row as a dict with ``source``.
 
-    Raises ``ValueError`` for an invalid ``scope`` or a ``global`` pref carrying a
-    non-empty ``target``. ``value`` is plain text stored as a JSON string so the
-    same column holds strings, numbers, and small objects.
+    Raises ``ValueError`` for an invalid ``scope``/``origin`` or a ``global`` pref
+    carrying a non-empty ``target``. ``value`` is plain text stored as a JSON
+    string so the same column holds strings, numbers, and small objects.
+
+    ``origin='learned'`` with ``active=False`` is the LF-R4 draft: the row is
+    stored (``list_prefs`` shows it, the Rules tab offers Approve) but
+    ``prefs_for`` drops it, so it never reaches a prompt. ``source_ids`` is the
+    list of finding keys the rule was derived from, stored as a JSON array.
     """
     _validate_scope(scope, target)
+    if origin not in _VALID_ORIGINS:
+        raise ValueError(
+            f"invalid origin {origin!r}; allowed: {', '.join(_VALID_ORIGINS)}"
+        )
     if not isinstance(value, str):
         value = json.dumps(value, ensure_ascii=False)
-    elif not value:
-        value = ""
+    if source_ids is not None and not isinstance(source_ids, str):
+        source_ids = json.dumps(list(source_ids), ensure_ascii=False)
     db_path = _resolve_db(db)
-    # An unmigrated DB (one that never ran migration 0065) still rejects a
-    # 'path' scope at the DDL CHECK; ensure the table accepts it first.
+    # An unmigrated DB (one that never ran migration 0065/0074) still rejects a
+    # 'path' scope at the DDL CHECK and lacks the provenance columns; ensure the
+    # table accepts both before writing.
     ensure_schema(db_path)
     con = sqlite3.connect(db_path)
     try:
         con.execute(
             "INSERT INTO user_preference_memory "
-            "(user_id, preference_key, preference_value, scope, scope_target, set_at) "
-            "VALUES (?, ?, ?, ?, ?, ?) "
+            "(user_id, preference_key, preference_value, scope, scope_target, set_at, "
+            " origin, source_ids, active) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(user_id, preference_key, scope, scope_target) DO UPDATE SET "
             "  preference_value=excluded.preference_value, "
-            "  set_at=excluded.set_at",
-            (_USER_ID, key, value, scope, target, _now_iso()),
+            "  set_at=excluded.set_at, "
+            "  origin=excluded.origin, "
+            "  source_ids=excluded.source_ids, "
+            "  active=excluded.active",
+            (_USER_ID, key, value, scope, target, _now_iso(),
+             origin, source_ids, 1 if active else 0),
         )
         con.commit()
     finally:
         con.close()
     return {
         "key": key, "value": value, "scope": scope, "target": target,
-        "set_at": _now_iso(), "source": "db",
+        "set_at": _now_iso(), "source": "db", "origin": origin,
+        "source_ids": source_ids, "active": 1 if active else 0,
     }
+
+
+def approve_pref(key: str, *, scope: str, target: str, text: str | None = None,
+                 db: str | None = None) -> bool:
+    """Promote a drafted rule to ``active=1``. Returns True when a row changed.
+
+    Approving does NOT re-brand the rule: a ``learned`` rule stays ``learned``
+    and keeps its provenance, it merely starts reaching ``prefs_for`` (and so the
+    "Learned rules" block). With ``text``, the approved value is replaced by it —
+    the operator edits the generalised draft before it goes live.
+
+    A row that does not exist reports failure rather than success, so the CLI and
+    the Rules tab can tell "approved" from "there was nothing to approve".
+    """
+    _validate_scope(scope, target)
+    db_path = _resolve_db(db)
+    ensure_schema(db_path)
+    con = sqlite3.connect(db_path)
+    try:
+        where = "user_id=? AND preference_key=? AND scope=? AND scope_target=?"
+        if text is None:
+            cur = con.execute(
+                "UPDATE user_preference_memory SET active=1 WHERE " + where,
+                (_USER_ID, key, scope, target))
+        else:
+            cur = con.execute(
+                "UPDATE user_preference_memory SET active=1, preference_value=? "
+                "WHERE " + where,
+                (str(text), _USER_ID, key, scope, target))
+        con.commit()
+        return cur.rowcount > 0
+    finally:
+        con.close()
 
 
 def remove_pref(key: str, *, scope: str = "global", target: str = "",
@@ -425,8 +548,43 @@ def remove_pref(key: str, *, scope: str = "global", target: str = "",
 # ─── list_prefs (DB + legacy file read-only entries) ──────────────────────
 
 
+def _db_rows(con: sqlite3.Connection) -> list[dict]:
+    """Every ``user_preference_memory`` row, oldest first, with LF-R4 provenance.
+
+    The provenance columns are selected only when the table actually has them
+    (``PRAGMA table_info``): a state.db that predates migration 0074 is read as
+    all-operator, active rules rather than raising ``no such column`` on a page
+    that must never blank.
+    """
+    cols = ["preference_key", "preference_value", "scope", "scope_target", "set_at"]
+    have = {r[1] for r in con.execute("PRAGMA table_info(user_preference_memory)")}
+    has_origin = {"origin", "source_ids", "active"} <= have
+    if has_origin:
+        cols += ["origin", "source_ids", "active"]
+    out: list[dict] = []
+    for row in con.execute(
+            f"SELECT {', '.join(cols)} FROM user_preference_memory "
+            "WHERE user_id=? ORDER BY set_at ASC", (_USER_ID,)):
+        r = dict(zip(cols, row))
+        out.append({
+            "key": r["preference_key"], "value": r["preference_value"],
+            "scope": r["scope"], "target": r["scope_target"],
+            "set_at": r["set_at"], "source": "db",
+            "origin": r["origin"] if has_origin else "operator",
+            "source_ids": r["source_ids"] if has_origin else None,
+            "active": r["active"] if has_origin else 1,
+        })
+    return out
+
+
 def list_prefs(*, db: str | None = None) -> list[dict]:
     """DB rows plus read-only entries from legacy JSON files (when present).
+
+    Every DB row carries ``origin``, ``source_ids`` and ``active`` (LF-R4): a
+    draft is LISTED here — the Rules tab is where it gets approved — even though
+    ``prefs_for`` drops it. Legacy file-sourced entries are operator rules with
+    no provenance, so they read back ``origin='operator', source_ids=None,
+    active=1``.
 
     Legacy files (read-only, never written by this module):
       - ``$MINI_ORK_HOME/config/user_preferences.json``: top-level dict,
@@ -439,18 +597,9 @@ def list_prefs(*, db: str | None = None) -> list[dict]:
     if os.path.exists(db_path):
         con = sqlite3.connect(db_path)
         try:
-            rows = con.execute(
-                "SELECT preference_key, preference_value, scope, scope_target, set_at "
-                "FROM user_preference_memory WHERE user_id=? ORDER BY set_at ASC",
-                (_USER_ID,),
-            ).fetchall()
+            out.extend(_db_rows(con))
         finally:
             con.close()
-        for key, val, scope, target, set_at in rows:
-            out.append({
-                "key": key, "value": val, "scope": scope, "target": target,
-                "set_at": set_at, "source": "db",
-            })
 
     cfg_dir = os.path.join(context_env("MINI_ORK_HOME", ".mini-ork"), "config")
     upath = os.path.join(cfg_dir, "user_preferences.json")
@@ -467,6 +616,11 @@ def list_prefs(*, db: str | None = None) -> list[dict]:
                         "target": "",
                         "set_at": "",
                         "source": f"file:{upath}",
+                        # A file-sourced entry is an operator rule by definition
+                        # and cannot be a draft: it is read-only.
+                        "origin": "operator",
+                        "source_ids": None,
+                        "active": 1,
                     })
         except (OSError, json.JSONDecodeError):
             pass
@@ -484,6 +638,9 @@ def list_prefs(*, db: str | None = None) -> list[dict]:
                     "target": "",
                     "set_at": "",
                     "source": f"file:{cpath}",
+                    "origin": "operator",
+                    "source_ids": None,
+                    "active": 1,
                 })
         except (OSError, json.JSONDecodeError):
             pass
@@ -504,9 +661,14 @@ def prefs_for(task_class: str, workflow: str = "",
     path; with ``paths=None`` no path rule is returned (a run that declared no
     file scope gets none). Caps: 12 entries total, 600 chars per value. Caps are
     applied per-row so the slice never truncates mid-row.
+
+    Only ACTIVE rows are returned (LF-R4): an unapproved learned draft is listed
+    by ``list_prefs`` but must never reach a prompt, so it is dropped here — the
+    one place every injection path funnels through. Operator rules are always
+    active; file-sourced entries default to active.
     """
     tc = task_class or ""
-    rows = list_prefs(db=db)
+    rows = [r for r in list_prefs(db=db) if r.get("active", 1)]
     selected: list[dict] = []
     by_scope: dict[str, list[dict]] = {
         "global": [], "task_class": [], "workflow": [], "path": [],
@@ -538,18 +700,36 @@ def prefs_for(task_class: str, workflow: str = "",
 
 
 def render_block(prefs: list[dict]) -> str:
-    """Format prefs as a fenced prompt block; empty string when no prefs.
+    """Format prefs as fenced prompt block(s); empty string when no prefs.
 
-    Shape (kickoff §"render_block"):
+    Two blocks (LF-R4), operator first:
         --- Operator preferences and constraints (set by the user; follow them) ---
         - <value>   [scope: task_class=<x>]
         --- /operator preferences ---
+        --- Learned rules (from review findings — check they still apply before following) ---
+        - <value>   [scope: path=<glob>]
+        --- /learned rules ---
+
+    A learned rule is advice harvested from review findings; it is NOT an
+    operator order, so it must not appear under the "set by the user" heading
+    (that heading is a claim about WHO set the rule). A prompt with only one kind
+    shows only that block. The operator-only output is byte-identical to the
+    pre-LF-R4 single block — ``mini_ork/cli/execute.py`` and its tests pin it.
     """
     if not prefs:
         return ""
-    lines = [
-        "--- Operator preferences and constraints (set by the user; follow them) ---",
+    operator = [p for p in prefs if str(p.get("origin") or "operator") != "learned"]
+    learned = [p for p in prefs if str(p.get("origin") or "operator") == "learned"]
+    blocks = [
+        b for b in (_render_lines(operator, OPERATOR_HEADING, OPERATOR_CLOSE),
+                    _render_lines(learned, LEARNED_HEADING, LEARNED_CLOSE)) if b
     ]
+    return "\n".join(blocks)
+
+
+def _render_lines(prefs: list[dict], heading: str, close: str) -> str:
+    """One fenced block, or ``""`` when every value is blank."""
+    lines = [heading]
     for p in prefs:
         value = str(p.get("value", "")).strip()
         if not value:
@@ -561,7 +741,7 @@ def render_block(prefs: list[dict]) -> str:
             lines.append(f"- {value}   [scope: {p['scope']}={target}]")
     if len(lines) == 1:
         return ""
-    lines.append("--- /operator preferences ---")
+    lines.append(close)
     return "\n".join(lines) + "\n"
 
 

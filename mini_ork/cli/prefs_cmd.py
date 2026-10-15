@@ -1,11 +1,18 @@
 """``mini-ork prefs`` — read/write operator preferences and constraints.
 
-Subcommands (kickoff §"`mini-ork prefs`" + §"`prefs preview`"):
+Subcommands (kickoff §"`mini-ork prefs`" + §"`prefs preview`" +
+``kickoffs/auto/lf-r4-rule-action.md``):
 
     prefs list [--json]
     prefs set <key> <value...> [--scope global|task_class|workflow|path] [--target X]
+                               [--origin operator|learned] [--source id,id,…] [--draft]
+    prefs approve <key> --scope … --target … [--text "…"]
     prefs rm <key> [--scope …] [--target …]
     prefs preview <kickoff.md> [--task-class X] [--node implementer|researcher|reviewer] [--json]
+
+``--origin learned --draft`` is how the "Your code" tab's "Make it a rule"
+button writes: the rule is stored INACTIVE, so it is listed (and approvable) but
+never injected. ``prefs approve`` is the promotion.
 
 ``prefs preview`` prints EXACTLY the learned block a node of the given type
 would receive for that kickoff — the operator-preference block followed by the
@@ -27,12 +34,14 @@ import sys
 from mini_ork.context import run_context_scope
 from mini_ork.memory import preferences
 from mini_ork.memory.preferences import (
+    approve_pref,
     list_prefs,
     remove_pref,
     set_pref,
 )
 
 _VALID_NODES = ("researcher", "implementer", "reviewer")
+_VALID_ORIGINS = ("operator", "learned")
 
 
 def _usage() -> str:
@@ -45,6 +54,7 @@ def _usage() -> str:
         "Actions:\n"
         "  prefs list                 List all prefs (DB + legacy files)\n"
         "  prefs set <key> <value...> Upsert a preference\n"
+        "  prefs approve <key>        Approve a draft rule so agents follow it\n"
         "  prefs rm <key>             Remove a preference\n"
         "  prefs preview <kickoff.md> Preview the learned block a node would get\n"
         "\n"
@@ -52,6 +62,10 @@ def _usage() -> str:
         "  --scope <scope>            global | task_class | workflow | path (default: global)\n"
         "  --target <name>            task_class / workflow name, or a file glob for\n"
         "                             scope=path (e.g. 'mini_ork/ide_pages/**')\n"
+        "  --origin <origin>          set: operator | learned (default: operator)\n"
+        "  --source <id,id,...>       set: finding keys a learned rule came from\n"
+        "  --draft                    set: store INACTIVE (approve it later)\n"
+        "  --text <value>             approve: replace the rule's value\n"
         "  --task-class <name>        preview: override the kickoff's task class\n"
         "  --node <type>              preview: researcher | implementer | reviewer\n"
         "  --json                     Emit JSON instead of text (list, preview)\n"
@@ -66,6 +80,10 @@ def _parse(argv: list[str]) -> dict:
         "positional": [],
         "scope": "global",
         "target": "",
+        "origin": "operator",
+        "source": None,
+        "draft": False,
+        "text": None,
         "task_class": "",
         "node": "implementer",
         "json": False,
@@ -81,6 +99,31 @@ def _parse(argv: list[str]) -> dict:
         if a == "--json":
             opts["json"] = True
             i += 1
+            continue
+        if a == "--draft":
+            opts["draft"] = True
+            i += 1
+            continue
+        if a == "--origin":
+            if i + 1 >= len(argv):
+                opts["error"] = "missing value for --origin"
+                return opts
+            opts["origin"] = argv[i + 1]
+            i += 2
+            continue
+        if a == "--source":
+            if i + 1 >= len(argv):
+                opts["error"] = "missing value for --source"
+                return opts
+            opts["source"] = argv[i + 1]
+            i += 2
+            continue
+        if a == "--text":
+            if i + 1 >= len(argv):
+                opts["error"] = "missing value for --text"
+                return opts
+            opts["text"] = argv[i + 1]
+            i += 2
             continue
         if a == "--scope":
             if i + 1 >= len(argv):
@@ -110,7 +153,7 @@ def _parse(argv: list[str]) -> dict:
             opts["node"] = argv[i + 1]
             i += 2
             continue
-        if a in ("list", "set", "rm", "preview"):
+        if a in ("list", "set", "approve", "rm", "preview"):
             opts["action"] = a
             i += 1
             continue
@@ -119,11 +162,26 @@ def _parse(argv: list[str]) -> dict:
     return opts
 
 
+def _origin_cell(row: dict) -> str:
+    """The origin column: ``operator`` | ``learned`` | ``learned draft``.
+
+    A draft says so in the same cell rather than in a fifth column — at a
+    glance, "learned" is provenance and "draft" is the state that decides
+    whether any agent has been told it yet.
+    """
+    origin = str(row.get("origin") or "operator")
+    if origin == "learned" and not row.get("active", 1):
+        return "learned draft"
+    return origin
+
+
 def _emit_table(rows: list, out) -> None:
     # The target column is wide enough for a path-scope glob (e.g.
     # ``mini_ork/ide_pages/**``) so ``prefs list`` shows the glob, not a
-    # truncated prefix.
-    out.write(f"{'key':<28} {'value':<40} {'scope':<10} {'target':<40} source\n")
+    # truncated prefix. ``origin`` carries the LF-R4 provenance (and marks a
+    # draft) so an operator can see what is waiting for approval.
+    out.write(f"{'key':<28} {'value':<40} {'scope':<10} {'target':<40} "
+              f"{'origin':<14} source\n")
     for r in rows:
         v = str(r.get("value", ""))
         if len(v) > 38:
@@ -132,6 +190,7 @@ def _emit_table(rows: list, out) -> None:
             f"{str(r.get('key',''))[:28]:<28} {v[:40]:<40} "
             f"{str(r.get('scope',''))[:10]:<10} "
             f"{str(r.get('target',''))[:40]:<40} "
+            f"{_origin_cell(r)[:14]:<14} "
             f"{r.get('source','')}\n"
         )
 
@@ -314,11 +373,43 @@ def main(argv=None, *, stdout=None, stderr=None) -> int:
             err.write("scope=global requires --target '' (omit --target)\n")
             out.write(_usage())
             return 2
+        if opts["origin"] not in _VALID_ORIGINS:
+            err.write(
+                f"invalid --origin {opts['origin']!r}; "
+                f"allowed: {', '.join(_VALID_ORIGINS)}\n"
+            )
+            out.write(_usage())
+            return 2
+        sources = [s for s in (opts["source"] or "").split(",") if s.strip()] or None
         try:
-            set_pref(key, value, scope=opts["scope"], target=opts["target"])
+            set_pref(key, value, scope=opts["scope"], target=opts["target"],
+                     origin=opts["origin"], source_ids=sources,
+                     active=not opts["draft"])
         except ValueError as exc:
             err.write(f"{exc}\n")
             return 2
+        return 0
+
+    if action == "approve":
+        pos = opts["positional"]
+        if len(pos) != 1:
+            err.write("usage: prefs approve <key> --scope … --target … [--text …]\n")
+            out.write(_usage())
+            return 2
+        key = pos[0]
+        if opts["scope"] == "global" and opts["target"]:
+            err.write("scope=global requires --target '' (omit --target)\n")
+            out.write(_usage())
+            return 2
+        try:
+            ok = approve_pref(key, scope=opts["scope"], target=opts["target"],
+                              text=opts["text"])
+        except ValueError as exc:
+            err.write(f"{exc}\n")
+            return 2
+        if not ok:
+            err.write(f"no such pref: {key} (scope={opts['scope']}, "
+                      f"target={opts['target']!r})\n")
         return 0
 
     if action == "rm":

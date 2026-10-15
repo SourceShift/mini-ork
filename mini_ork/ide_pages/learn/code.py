@@ -14,8 +14,10 @@ Two ideas carry it:
    146 live findings are ``other``), so ``recurring()`` clusters the findings'
    ``issue`` texts by TF-IDF cosine similarity. The same mistake written in
    five files collapses into ONE cluster the operator can act on — and the
-   action is ``prefs set --scope path``: a rule injected into every future run
-   whose file scope matches.
+   action drafts a ``prefs set --scope path ... --origin learned --draft`` rule
+   for exactly the files the cluster was found in. It is INACTIVE: nothing
+   reaches an agent until it is approved on the Rules tab, and it renders under
+   the "Learned rules" heading, never "set by the user".
 
 The page is strictly read-only: it never calls ``harvest`` (reflect is the sole
 writer), and every statement is a SELECT. A bare home degrades to an empty
@@ -454,10 +456,6 @@ def _area_detail(home: Path, args: dict[str, str], area: str) -> list[dict[str, 
     n_runs, worst = _area_stats(fs)
     last = max((int(f.get("ts") or 0) for f in fs), default=0)
     date = time.strftime("%Y-%m-%d", time.localtime(last)) if last else "—"
-    # A file area targets its own path; a directory area targets the glob that
-    # matches *its* group (see ``_rule_glob``). Decided from the data — the
-    # suffix cannot tell ``bin/mini-ork`` (file) from ``svc/pay`` (directory).
-    is_file = any(str(f.get("file") or "") == area.rstrip("/") for f in fs)
     lines = [f"{len(fs)} findings in {n_runs} run{'' if n_runs == 1 else 's'}, "
              f"worst {worst}, last {date}", "", "**Recurring problems**"]
     if clusters:
@@ -472,21 +470,33 @@ def _area_detail(home: Path, args: dict[str, str], area: str) -> list[dict[str, 
         S.markdown(area, "\n".join(lines), full=True,
                    actions=[S.btn("Close area", S.set_args(area="", finding=""), "ghost")])]
 
+    # A cluster with no defensible target (or a single member) carries no
+    # action at all, and its action cell says so with an em dash rather than
+    # offering a button whose rule could not be scoped to the findings it came
+    # from (kickoff §4).
+    recur_rows = []
+    for c in clusters:
+        action = _rule_action(c)
+        recur_rows.append({
+            "cells": [
+                S.cell(short(c["representative"], _REPR_DETAIL)),
+                S.cell(f"{c['n']}×"),
+                S.cell(c["n_runs"]),
+                S.cell(c["worst_severity"], _sev_colour(c["worst_severity"])),
+                S.cell("Make it a rule", "blue") if action else S.cell("—", "sub"),
+            ],
+            "do": action,
+        })
     out.append(S.table(
         RECURRING_TITLE,
         [S.col(fr=3, min=180), S.col(width=60), S.col(width=60), S.col(width=70),
          S.col(width=130)],
         ["problem", "times", "runs", "worst", "action"],
-        [{"cells": [
-            S.cell(short(c["representative"], _REPR_DETAIL)),
-            S.cell(f"{c['n']}×"),
-            S.cell(c["n_runs"]),
-            S.cell(c["worst_severity"], _sev_colour(c["worst_severity"])),
-            S.cell("Make it a rule", "blue"),
-        ], "do": _rule_action(area, c, is_file=is_file)} for c in clusters],
+        recur_rows,
         full=True,
-        note=("Pick a recurring problem and mini-ork will tell every run that touches "
-              "this path to avoid it.")))
+        note=("Pick a recurring problem and mini-ork will draft a rule for the files "
+              "it was found in — it reaches an agent once you approve it on the "
+              "Rules tab.")))
 
     selected = str(args.get("finding") or "")
     out.append(S.table(
@@ -533,44 +543,118 @@ def _finding_detail(f: dict[str, Any] | None) -> dict[str, Any]:
 
 # ── the "Make it a rule" action ────────────────────────────────────────────
 
-def _rule_glob(area: str, *, is_file: bool) -> str:
-    """The ``--target`` glob that matches *exactly* the findings one row sums
-    (reviewer, round 2).
+def _rule_target(all_files) -> str | None:
+    """The ``--target`` glob for a cluster, derived from its MEMBER files.
 
-    The rule must reach the same files the row and the detail agree on — no more,
-    or it is injected into runs touching a *different* row's files. The grouping
-    truncates a directory path to ``_DEPTH`` segments, so:
+    The rule must reach the files the problem was actually found in — no more.
+    Round 1 (and the pre-LF-R4 action) targeted the AREA glob instead: a cluster
+    whose members were all in ``mini_ork/ide_pages/node.py`` produced
+    ``mini_ork/ide_pages/*``, which is injected into runs touching its siblings
+    too. The kickoff's four rules, in order:
 
-    * a **file** area targets the file itself;
-    * a directory key **at max depth** (``_DEPTH`` segments) collapses every
-      deeper descendant into one group → ``key/**`` matches the whole group;
-    * a **shallower** directory key holds only its direct children (any deeper
-      file keys on its own longer prefix, a different row) → ``key/*``, so the
-      rule never leaks into a sibling row's subtree.
+    * one file → that file;
+    * every member a DIRECT child of one directory → ``<dir>/*``;
+    * otherwise all under a common directory → ``<dir>/**`` (only when that
+      common directory has at least two segments, so a repo-root pairing does
+      not degenerate into ``/**``);
+    * otherwise ``None`` — no defensible target, so no button.
+
+    Reads ``all_files`` (every member, never the capped top-3 display list).
     """
-    base = area.rstrip("/")
-    if is_file:
-        return base
-    segments = len([s for s in base.split("/") if s])
-    return base + ("/**" if segments >= _DEPTH else "/*")
+    files = sorted({str(f) for f in (all_files or []) if f})
+    if not files:
+        return None
+    if len(files) == 1:
+        return files[0]
+    dirs = {f.rsplit("/", 1)[0] if "/" in f else "" for f in files}
+    if len(dirs) == 1:
+        only = next(iter(dirs))
+        return f"{only}/*" if only else None
+    common = _common_dir(dirs)
+    if common and len(common.split("/")) >= 2:
+        return f"{common}/**"
+    return None
 
 
-def _rule_action(area: str, cluster: dict[str, Any], *, is_file: bool) -> dict[str, Any]:
-    """The "Make it a rule" CLI action for one recurring problem in ``area``.
+def _common_dir(dirs) -> str:
+    """The deepest directory shared by every path in ``dirs`` (``''`` if none).
 
-    ``is_file`` is decided by the data (see ``_membership``): a file area targets
-    its own path, a directory area the glob ``_rule_glob`` derives. It is a
-    required keyword so no caller can silently re-introduce the suffix guess that
-    treated ``bin/mini-ork`` (a file) as a directory and emitted a glob that never
-    matches (reviewer, round 2).
+    Segments, not characters: ``a/b`` and ``a/bc`` share nothing, while
+    ``a/b`` and ``a/b/c`` share ``a/b``. A member with no directory at all makes
+    the answer ``''`` — the common root.
     """
-    rep = cluster["representative"]
+    parts = [d.split("/") for d in dirs]
+    if any(not p for p in parts):
+        return ""
+    common = list(parts[0])
+    for p in parts[1:]:
+        i = 0
+        while i < len(common) and i < len(p) and common[i] == p[i]:
+            i += 1
+        common = common[:i]
+    return "/".join(common)
+
+
+# A sentence that reports a reproduction command/result, not the problem.
+_RE_REPRO = re.compile(r"(?i)^\s*reproduced\b")
+# Status tokens an automated reviewer appends to a finding's text.
+_RE_STATUS = re.compile(r"(?i)\[(?:true|false)\]|\b(?:passed|failed)\b")
+_DRAFT_PREFIX = "Reviewers repeatedly found in "
+_DRAFT_MAX = 240          # body cap, excluding the prefix
+
+
+def _generalise(issue: Any) -> str:
+    """A finding's text reduced to the problem itself.
+
+    File:line references and severity words go through
+    ``context_v2.clean_issue`` (the same cleaner the clusterer uses, imported
+    read-only here — that module is out of scope). On top of it the action drops
+    what only made sense in a verifier transcript: any sentence that starts
+    ``Reproduced`` and any ``[True]``/``[False]``/``PASSED``/``FAILED`` token.
+    A rule that quotes a reproduction result tells a future agent about a run,
+    not about the code.
+    """
+    from mini_ork.context_v2 import clean_issue   # lazy: read-only import
+
+    text = clean_issue(str(issue or ""))
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    text = " ".join(s for s in sentences if not _RE_REPRO.match(s))
+    text = _RE_STATUS.sub(" ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _draft_text(target: str, representative: Any) -> str:
+    """The rule text a draft starts from: generalised, prefixed, capped."""
+    body = _generalise(representative)
+    if len(body) > _DRAFT_MAX:
+        body = body[:_DRAFT_MAX].rstrip()
+    return f"{_DRAFT_PREFIX}{target}: {body}"
+
+
+def _rule_action(cluster: dict[str, Any]) -> dict[str, Any] | None:
+    """The "Make it a rule" CLI action for one recurring problem, or ``None``.
+
+    The action creates an INACTIVE, learned, file-scoped draft — it does not
+    write a live rule. Approving it on the Rules tab is what starts giving it to
+    agents, so the confirm string says exactly that. ``None`` means "no button":
+    a cluster of one is not a recurring problem, and a cluster whose member files
+    share no usable directory has no defensible target (see ``_rule_target``).
+    """
+    if int(cluster.get("n") or 0) < 2:
+        return None
+    target = _rule_target(cluster.get("all_files"))
+    if not target:
+        return None
+    rep = str(cluster.get("representative") or "")
     slug = hashlib.sha1(rep.encode("utf-8")).hexdigest()[:8]
-    glob = _rule_glob(area, is_file=is_file)
-    text = f"In {area}: avoid this recurring review finding — {rep}"
-    return S.cli("prefs", "set", f"review-{slug}", text, "--scope", "path", "--target", glob,
-                 confirm=f"Add a rule for {glob}? Every run that touches it will be told this.",
-                 home=False)
+    keys = [str(k) for k in cluster.get("finding_ids") or []]
+    return S.cli(
+        "prefs", "set", f"review-{slug}", _draft_text(target, rep),
+        "--scope", "path", "--target", target,
+        "--origin", "learned", "--source", ",".join(keys), "--draft",
+        confirm=(f"Create an inactive draft rule for {target}? It is not given to "
+                 f"any agent until you approve it on the Rules tab."),
+        home=False)
 
 
 def _repo_file(file: Any) -> Path | None:
@@ -648,7 +732,15 @@ def recurring(findings: list[dict[str, Any]], *, sim: float = _SIM,
     ``_dot`` is a true cosine. Each cluster::
 
         {"representative": <issue nearest the centroid>, "n", "n_runs",
-         "files": [top 3], "worst_severity", "finding_ids"}
+         "files": [top 3], "all_files": [every member file], "worst_severity",
+         "finding_ids"}
+
+    ``files`` is a DISPLAY list capped at three; ``all_files`` holds every member
+    file, uncapped. The cap is fine for a cell and wrong for a decision: the
+    "Make it a rule" target is derived from the member files, so building it from
+    the top-3 would silently mis-scope a cluster spread over more than three
+    files — the cap-then-aggregate defect family already fixed twice in this file
+    (f:51c3c885a5, f:6f09169399).
 
     Ordered by ``n`` then severity. Findings whose text has no tokens are kept
     as singletons so nothing is silently dropped — but a finding whose issue is
@@ -700,11 +792,13 @@ def recurring(findings: list[dict[str, Any]], *, sim: float = _SIM,
         sevs = [str(items[i].get("severity") or "low").lower() for i in members]
         worst = min(sevs, key=lambda s: _SEV_ORDER.get(s, 3))
         runs = {items[i].get("run_id") for i in members if items[i].get("run_id")}
+        member_files = [items[i].get("file") for i in members]
         out.append({
             "representative": str(items[rep_i].get("issue") or ""),
             "n": len(members),
             "n_runs": len(runs),
-            "files": _top_files([items[i].get("file") for i in members]),
+            "files": _top_files(member_files),
+            "all_files": _member_files(member_files),
             "worst_severity": worst,
             "finding_ids": [finding_key(items[i]) for i in members],
         })
@@ -718,3 +812,21 @@ def _top_files(files) -> list[str]:
         if f:
             counts[str(f)] = counts.get(str(f), 0) + 1
     return [f for f, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:3]]
+
+
+def _member_files(files) -> list[str]:
+    """Every distinct member file, in first-seen order — ``_top_files`` uncapped.
+
+    The "Make it a rule" target is a decision about the whole cluster, so it
+    reads this, never the three-item display list.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for f in files:
+        if not f:
+            continue
+        s = str(f)
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
