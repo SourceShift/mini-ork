@@ -310,6 +310,28 @@ def run_on_base(probes: list[dict], *, target_repo: str, base_ref: str,
 
 # ── AC3 + the pre-publish gate ─────────────────────────────────────────────
 
+#: ``status`` values that mean the verifier passed. Both are emitted by live
+#: verifiers — ``pass`` (grep-assert, link-verifier, deterministic-checks) and
+#: ``passed`` (per-feature-dispatch-results).
+_PASS_STATUS = ("pass", "passed")
+
+
+def _verdict(obj: dict) -> bool | None:
+    """A verifier verdict dict → its pass/fail, or ``None`` when it is not one.
+
+    Two verdict shapes are in the wild: ``{"pass": true}`` (test, static-check)
+    and ``{"status": "pass"}`` (the docs family). A ``status`` that is *not* a
+    pass returns ``None`` rather than ``False`` so the scan keeps looking for a
+    real verdict — this makes the change strictly additive: nothing that counted
+    as a pass before counts as anything else now.
+    """
+    if "pass" in obj:
+        return obj["pass"] is True
+    if "status" in obj and obj["status"] in _PASS_STATUS:
+        return True
+    return None
+
+
 def _evidence_pass(path: Path) -> bool | None:
     """``pass`` from a verifier evidence file (JSON, possibly after log lines)."""
     try:
@@ -323,21 +345,24 @@ def _evidence_pass(path: Path) -> bool | None:
                 obj = json.loads(line)
             except ValueError:
                 continue
-            if isinstance(obj, dict) and "pass" in obj:
-                return obj["pass"] is True
+            if isinstance(obj, dict):
+                verdict = _verdict(obj)
+                if verdict is not None:
+                    return verdict
     try:
         obj = json.loads(text)
     except ValueError:
         return None
-    return obj["pass"] is True if isinstance(obj, dict) and "pass" in obj else None
+    return _verdict(obj) if isinstance(obj, dict) else None
 
 
 def verify_proven(db: str, run_id: str, run_dir: str = "") -> tuple[bool, dict]:
     """Did a verifier of this run execute and pass?
 
     Proven = a verifier ``node_end`` ended ``done`` AND a verifier evidence file
-    in the run dir (``verifier_<stem>.json|.log`` / ``verifier-result-*.json``, what
-    the verifier node persists after running its script) reports ``pass: true``.
+    in the run dir (``verifier<sep><stem>.json|.log``, what the verifier node
+    persists after running its script) reports a pass — ``pass: true`` or
+    ``status: "pass"``.
     ``duration_ms`` is NOT used: the executor's fallback node_end records 0 for
     every verifier node since the Python port, run or not. A verifier node that
     returns ``done`` without running anything (``[warn] verifier node: no
@@ -368,9 +393,11 @@ def verify_proven(db: str, run_id: str, run_dir: str = "") -> tuple[bool, dict]:
             detail["errored"] += 1
     if run_dir:
         rd = Path(run_dir)
-        # .log = the same evidence under the pre-September name.
-        for f in sorted(set(rd.glob("verifier_*.json")) | set(rd.glob("verifier_*.log"))
-                        | set(rd.glob("verifier-result-*.json"))):
+        # .log = the same evidence under the pre-September name; the dash forms
+        # (verifier-test.stdout.json, verifier-static-check.log) are the shape the
+        # framework-edit recipe writes. Both separators must be globbed or a run
+        # that verified reads as vacuous.
+        for f in sorted(set(rd.glob("verifier*.json")) | set(rd.glob("verifier*.log"))):
             detail["evidence_files"] += 1
             if _evidence_pass(f):
                 detail["evidence_pass"] += 1

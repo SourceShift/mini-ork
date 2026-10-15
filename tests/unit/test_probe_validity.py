@@ -192,6 +192,42 @@ def test_verify_proven_needs_a_done_verifier_with_passing_evidence(db: str, tmp_
     assert pv.verify_proven(db, "r", str(run_dir))[0]
 
 
+def test_verify_proven_reads_both_live_evidence_shapes_and_dash_names(db: str, tmp_path: Path) -> None:
+    """The two shapes real verifiers write must both count — a run that verified
+    must not read as vacuous.
+
+    ``{"status": "pass"}`` is what the docs family emits (grep-assert,
+    link-verifier); a **dash**-named ``verifier-<stem>.stdout.json`` is what the
+    framework-edit family writes. Both were invisible to the detector: the docs
+    shape has no ``pass`` key, and the dash name missed a ``verifier_*`` glob.
+    """
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _verifier_end(db, "verifier", 0, "done")
+
+    (run_dir / "verifier_grep-assert.json").write_text(
+        '{"verifier":"grep-assert","status":"pass","passed":1,"failed":0,"total":1}\n')
+    assert pv.verify_proven(db, "r", str(run_dir))[1]["evidence_pass"] == 1   # docs shape
+    assert pv.verify_proven(db, "r", str(run_dir))[0]
+
+    (run_dir / "verifier_grep-assert.json").unlink()
+    (run_dir / "verifier-test.stdout.json").write_text(
+        '{"verifier":"test","pass":true,"verdict":"pass","reasons":[]}\n')
+    detail = pv.verify_proven(db, "r", str(run_dir))[1]
+    assert detail["evidence_files"] == 1 and detail["evidence_pass"] == 1     # dash name
+    assert pv.verify_proven(db, "r", str(run_dir))[0]
+
+    (run_dir / "verifier-test.stdout.json").write_text('{"verifier":"test","pass":false,"verdict":"fail"}\n')
+    assert pv.verify_proven(db, "r", str(run_dir))[0] is False                # a real fail is still not proof
+
+    (run_dir / "verifier-test.stdout.json").write_text('{"verifier":"grep-assert","status":"fail"}\n')
+    assert pv.verify_proven(db, "r", str(run_dir))[1]["evidence_pass"] == 0   # status:fail is not a pass
+    assert pv.verify_proven(db, "r", str(run_dir))[0] is False
+
+    (run_dir / "verifier-test.stdout.json").write_text('{"verifier":"grep-assert","status":"skipped"}\n')
+    assert pv.verify_proven(db, "r", str(run_dir))[0] is False                # skipped proves nothing either
+
+
 # ── the gate through the publisher ──────────────────────────────────────────
 
 def _publish(tmp_path, monkeypatch, db, repo, base, *, checks=None, flag="1"):
