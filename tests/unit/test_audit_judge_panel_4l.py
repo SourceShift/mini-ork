@@ -170,6 +170,36 @@ def test_non_enum_verdict_and_wrong_ids_fail(tmp_path):
     assert any(m.startswith("deepseek:fixes_not_kickoff_ids") for m in out["missing"])
 
 
+def test_wrapped_prose_and_fenced_snippets_are_not_fields(tmp_path):
+    # The first live run (learning-judge-4l-20261015125313) failed on glm's
+    # wrapped continuation "  severity=None path for prose" read as a field.
+    _make_panel(tmp_path)
+    report = tmp_path / "judge-glm-audit.md"
+    text = report.read_text(encoding="utf-8").replace(
+        "- reasoning: measured",
+        "- `evidence_checked`: `normalize_severity` `:153-168`; `_make_finding`\n"
+        "  severity=None path for prose; `min_severity()` default\n"
+        "```\nverdict: maybe\n```\n- reasoning: measured", 1)
+    report.write_text(text, encoding="utf-8")
+    rc, out = _run(tmp_path)
+    assert rc == 0, out["missing"]
+
+
+def test_extra_sidecar_keys_are_allowed_but_missing_ones_fail(tmp_path):
+    _make_panel(tmp_path)
+    side = _sidecar("deepseek")
+    side.update({"head_commit": "17b89cd9", "kickoff_path": "kickoffs/auto/x.md"})
+    (tmp_path / "context-deepseek_judge.json").write_text(json.dumps(side))
+    rc, out = _run(tmp_path)
+    assert rc == 0, out["missing"]
+
+    del side["solutions"]
+    (tmp_path / "context-deepseek_judge.json").write_text(json.dumps(side))
+    rc, out = _run(tmp_path)
+    assert rc == 1
+    assert "deepseek:sidecar_missing_keys:['solutions']" in out["missing"]
+
+
 def test_two_judges_served_by_one_model_fails(tmp_path):
     _make_panel(tmp_path)
     db = _calls_db(tmp_path / "state.db", [
