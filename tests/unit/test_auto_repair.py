@@ -364,17 +364,30 @@ def test_wait_for_spawner_blocks_until_the_spawner_exits(tmp_path):
 
     A child that dispatched immediately would set ``status='executing'`` and be
     flipped to ``failed`` by the spawner's teardown (``_close_run_record`` runs
-    after reflect). Spawner exits ~0.5 s in; the child wakes on the reparent,
-    well before the wait bound, and never early.
+    after reflect). Spawner exits ~1 s after the child has ARRIVED at the wait;
+    the child wakes on the reparent, well before the wait bound, and never early.
+
+    The spawner times its exit from the child's ``ready`` marker, not from
+    ``Popen``. A cold child start is not free — interpreter startup plus the
+    import chain costs 0.5-1 s here, where ``python3`` may be an older, slower
+    build than the suite's own interpreter and the machine is shared. A spawner
+    sleeping a fixed 0.5 s from ``Popen`` would then exit before the child ever
+    reached ``wait_for_spawner``, and the run would measure 0.00 s while the
+    wait behaved *correctly*: there is nothing left to wait for. Synchronizing
+    on the marker makes the observed window the thing under test, and the
+    child's own report says whether it woke while the spawner was still alive.
     """
     child = tmp_path / "child.py"
     child.write_text(
-        "import sys, time\n"
-        "sys.path.insert(0, sys.argv[1])\n"
+        "import os, sys, time\n"
+        "sys.path.insert(0, sys.argv[1])\n"  # repo
         "from mini_ork.recovery import auto_repair\n"
+        "open(sys.argv[3], 'w').write('ready')\n"  # spawner sleeps only from here
         "t0 = time.monotonic()\n"
         "auto_repair.wait_for_spawner()\n"
-        "open(sys.argv[2], 'w').write('%.3f' % (time.monotonic() - t0))\n",
+        "spawner_still_parent = os.getppid() == int(os.environ['MO_AUTO_REPAIR_WAIT_PID'])\n"
+        "open(sys.argv[2], 'w').write('%d|%.3f'\n"
+        "                            % (spawner_still_parent, time.monotonic() - t0))\n",
         encoding="utf-8")
     spawner = tmp_path / "spawner.py"
     spawner.write_text(
@@ -382,22 +395,28 @@ def test_wait_for_spawner_blocks_until_the_spawner_exits(tmp_path):
         "env = dict(os.environ)\n"
         "env['MO_AUTO_REPAIR_WAIT_PID'] = str(os.getpid())\n"
         "env['MO_AUTO_REPAIR_WAIT_S'] = '10'\n"  # bound: a broken wait fails, not hangs
-        # argv: <child> <out> <repo> — the child wants (repo, out) as 1,2.
-        "subprocess.Popen([sys.executable, sys.argv[1], sys.argv[3], sys.argv[2]],\n"
-        "                 cwd=sys.argv[3], env=env, start_new_session=True)\n"
-        "time.sleep(0.5)\n",
+        # argv: <child> <out> <ready> <repo> — the child wants (repo, out, ready).
+        "subprocess.Popen([sys.executable, sys.argv[1], sys.argv[4], sys.argv[2], sys.argv[3]],\n"
+        "                 cwd=sys.argv[4], env=env, start_new_session=True)\n"
+        "deadline = time.monotonic() + 30\n"  # a cold child start is no one's failure
+        "while not os.path.exists(sys.argv[3]) and time.monotonic() < deadline:\n"
+        "    time.sleep(0.02)\n"
+        "time.sleep(1.0)\n",
         encoding="utf-8")
     out = tmp_path / "woke.txt"
 
-    subprocess.run([sys.executable, str(spawner), str(child), str(out), str(REPO)],
+    subprocess.run([sys.executable, str(spawner), str(child), str(out),
+                    str(tmp_path / "ready.txt"), str(REPO)],
                    capture_output=True, timeout=60)
 
     deadline = time.monotonic() + 30
     while not out.exists() and time.monotonic() < deadline:
         time.sleep(0.05)
     assert out.exists(), "the spawned child never woke"
-    waited = float(out.read_text())
-    assert 0.3 <= waited < 5, f"child waited {waited:.2f}s (expected ~0.5s)"
+    early, _, waited = out.read_text().partition("|")
+    assert early == "0", "the child woke while the spawner was still alive"
+    waited = float(waited)
+    assert 0.3 <= waited < 5, f"child waited {waited:.2f}s (expected ~1.0s)"
 
 
 # ── withheld ─────────────────────────────────────────────────────────────────

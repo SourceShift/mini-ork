@@ -427,6 +427,29 @@ def _escalatable(diagnosis: dict[str, Any] | None) -> bool:
             and str(diagnosis.get("routes_to") or "") == ROUTE_FIX_EPIC)
 
 
+def _wants_model_diagnosis(decision: dict[str, Any],
+                           diagnosis: dict[str, Any] | None) -> bool:
+    """May ``decide`` spend a model call on this run's diagnosis?
+
+    Only when the rule set came back ``unclassified`` AND the rule policy is
+    live for the run. A ``none`` decision is every reason the loop is inert —
+    ``MO_AUTO_REPAIR=0``, a run parked on its fix epic, a run that is not failed,
+    a published run — so none of those ever dispatches, and a green run's
+    trivially-unclassified diagnosis costs nothing. ``MO_MODEL_DIAGNOSER``
+    (default on — the operator's aggressive-escalation decision) owns the
+    feature; ``MINI_ORK_DRY_RUN=1`` keeps a dry run off the provider.
+    """
+    if context_env("MO_MODEL_DIAGNOSER", "1") == "0":
+        return False
+    if context_env("MINI_ORK_DRY_RUN", "0") == "1":
+        return False
+    if str(decision.get("action") or "none") == "none":
+        return False
+    from mini_ork.recovery.diagnose import LAYER_UNCLASSIFIED
+    return (isinstance(diagnosis, dict)
+            and str(diagnosis.get("layer") or "") == LAYER_UNCLASSIFIED)
+
+
 def decide(home: Path, run_id: str) -> dict[str, Any]:
     """Pure policy — the repair decision for ``run_id`` (no side effects).
 
@@ -454,15 +477,33 @@ def decide(home: Path, run_id: str) -> dict[str, Any]:
     Computed with ``write=False`` so ``decide`` stays side-effect-free — a
     ``--dry-run`` sweep must leave the run dir untouched. :func:`apply` is the
     half that persists it (``<run_dir>/diagnosis.json``).
+
+    When the rule set comes back ``unclassified`` a *model* may diagnose the run
+    (``MO_MODEL_DIAGNOSER``, default on — ``diagnose(..., allow_model=True)``).
+    The rule policy runs FIRST, so ``MO_AUTO_REPAIR=0``, the parked-run guard
+    and every other inert case have already answered ``none`` before any
+    dispatch (see ``_wants_model_diagnosis``); a grounded model diagnosis then
+    re-runs the policy, which is how an engine-owned failure reaches
+    ``escalate``. The rule result stands whenever the model declines. The model
+    is asked at most once per run: ``apply`` persists its diagnosis, and the next
+    pass reuses it.
     """
     home = Path(home)
     run_id = str(run_id)
     try:
-        from mini_ork.recovery.diagnose import diagnose
+        from mini_ork.recovery.diagnose import SOURCE_MODEL, diagnose
         diagnosis: dict[str, Any] | None = diagnose(home, run_id, write=False)
     except Exception:  # noqa: BLE001 — a diagnosis failure must never break the loop
         diagnosis = None
     decision = _decide_policy(home, run_id, diagnosis)
+    if diagnosis is not None and _wants_model_diagnosis(decision, diagnosis):
+        try:
+            refined = diagnose(home, run_id, write=False, allow_model=True)
+        except Exception:  # noqa: BLE001 — the model diagnoser must never break the loop
+            refined = None
+        if isinstance(refined, dict) and str(refined.get("source") or "") == SOURCE_MODEL:
+            diagnosis = refined
+            decision = _decide_policy(home, run_id, diagnosis)
     decision["diagnosis"] = diagnosis
     return decision
 

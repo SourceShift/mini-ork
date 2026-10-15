@@ -20,6 +20,11 @@ node. This module adds exactly that answer, as a first-match-wins rule set:
 
 and an **unclassified fall-through** at confidence ``0.0``.
 
+``diagnose(..., allow_model=True)`` hands a fall-through to the *model*
+diagnoser (:mod:`mini_ork.recovery.diagnoser_llm`), which may return a grounded
+diagnosis with ``rule_id == "M1"`` and ``source == "model"`` instead. The rule
+result is kept whenever the model declines — see :func:`diagnose`.
+
 The note rules (``RN``) run after the artefact/event rules and before the
 fall-through. They read the append-only ``task_runs.notes`` column — the same
 ``"; "``-joined, per-segment ``str.startswith`` read ``auto_repair.decide``
@@ -110,10 +115,28 @@ ROUTES = frozenset({
     ROUTE_FIX_EPIC, ROUTE_KICKOFF_REPAIR, ROUTE_NONE, ROUTE_HUMAN,
 })
 
+# Stages — where in the pipeline the failure happened. The values
+# ``_stage_for`` can produce, plus ``unknown`` (the fall-through's own value).
+# Exported as the enum a model diagnoser validates its reply against
+# (``diagnoser_llm``): a stage outside this set is not a diagnosis, it is noise.
+STAGE_PLAN = "plan"
+STAGE_EXECUTE = "execute"
+STAGE_VERIFY = "verify"
+STAGE_REVIEW = "review"
+STAGE_DELIVER = "deliver"
+STAGE_UNKNOWN = "unknown"
+STAGES = frozenset({
+    STAGE_PLAN, STAGE_EXECUTE, STAGE_VERIFY, STAGE_REVIEW, STAGE_DELIVER,
+    STAGE_UNKNOWN,
+})
+
 # ``source`` is the literal ``"rule"`` on every rule result: the diagnosis came
 # from the rule set, and the artefact it read is cited in ``evidence[].ref``.
 SOURCE_RULE = "rule"
 SOURCE_FALLTHROUGH = ""
+# ``source`` on a model-made diagnosis (``diagnoser_llm``, rule id ``M1``): the
+# frozen escalation policy branches on this to require a confidence bar.
+SOURCE_MODEL = "model"
 
 RULE_UNCLASSIFIED = "unclassified"
 
@@ -365,7 +388,7 @@ def _fallthrough(run_id: str, layer: str, summary: str) -> dict[str, Any]:
         "run_id": str(run_id),
         "rule_id": RULE_UNCLASSIFIED,
         "layer": layer,
-        "stage": "unknown",
+        "stage": STAGE_UNKNOWN,
         "node": None,
         "source": SOURCE_FALLTHROUGH,
         "confidence": 0.0,
@@ -923,12 +946,34 @@ def _diagnose(home: Path, run_id: str) -> dict[str, Any]:
     )
 
 
-def diagnose(home: Path, run_id: str, *, write: bool = True) -> dict[str, Any]:
+def _cached_model_diagnosis(home: Path, run_id: str) -> dict[str, Any] | None:
+    """The persisted model diagnosis for this run, when one exists.
+
+    The at-most-once gate: a ``diagnosis.json`` whose ``source`` is ``"model"``
+    is the run's diagnosis already — re-dispatching a model for the same run
+    would pay twice for the same answer.
+    """
+    data = _read_json(_run_dir(home, run_id) / DIAGNOSIS_FILE)
+    if isinstance(data, dict) and str(data.get("source") or "") == SOURCE_MODEL:
+        return data
+    return None
+
+
+def diagnose(home: Path, run_id: str, *, write: bool = True,
+             allow_model: bool = False) -> dict[str, Any]:
     """The typed diagnosis for ``run_id``. Never raises.
 
     ``write=True`` persists ``<run_dir>/diagnosis.json`` (best effort — a
     read-only home degrades to "not written", never an error). ``write=False``
     is the read-only mode ``--replay`` and the IDE use.
+
+    ``allow_model=True`` additionally asks the model diagnoser
+    (:mod:`mini_ork.recovery.diagnoser_llm`) when — and only when — the rule set
+    came back ``unclassified``. The rule result stands whenever the model
+    declines, cannot ground its reply, or is refused as a self-diagnosis. A
+    model diagnosis is computed AT MOST ONCE per run: a persisted
+    ``diagnosis.json`` with ``source == "model"`` is reused verbatim instead of
+    dispatching again.
     """
     home = Path(home)
     run_id = str(run_id)
@@ -937,6 +982,18 @@ def diagnose(home: Path, run_id: str, *, write: bool = True) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 — auto_repair calls this on every failed run
         result = _fallthrough(run_id, LAYER_UNCLASSIFIED,
                               f"the run could not be read ({type(exc).__name__}: {exc})")
+    if allow_model and str(result.get("layer") or "") == LAYER_UNCLASSIFIED:
+        cached = _cached_model_diagnosis(home, run_id)
+        if cached is not None:
+            result = cached
+        else:
+            try:
+                from mini_ork.recovery.diagnoser_llm import diagnose_with_model
+                model_result = diagnose_with_model(home, run_id, result)
+            except Exception:  # noqa: BLE001 — the diagnoser must never break the loop
+                model_result = None
+            if model_result is not None:
+                result = model_result
     if write:
         write_diagnosis(home, run_id, result)
     return result
