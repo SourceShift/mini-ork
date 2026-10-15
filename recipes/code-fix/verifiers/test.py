@@ -982,10 +982,59 @@ def _package_scripts():
     return scripts if isinstance(scripts, dict) else {}
 
 
+def _profile_verification_command():
+    """The run's declared verification command, from ``run_profile.json``.
+
+    Read from ``${MINI_ORK_RUN_DIR}/run_profile.json``, falling back to
+    ``${MINI_ORK_HOME}/runs/${MINI_ORK_RUN_ID}/run_profile.json`` when
+    ``MINI_ORK_RUN_DIR`` is unset. Mirrors the shape of framework-edit's
+    ``_profile_field`` / ``_epic_verification_commands``: a bare string is
+    accepted, a list is normalized (entries stripped of surrounding
+    backticks/whitespace), deduped with order preserved, and joined with
+    `` && ``. ``""`` when the profile is missing, unreadable, malformed, or
+    carries no usable command, so ``detect_test_cmd()`` falls through to
+    auto-detect exactly as it did before this source existed. Never raises —
+    this runs at module import (``CMD = detect_test_cmd()``), so an escaping
+    exception would break every code-fix run, not just a profiled one.
+    """
+    run_dir = os.environ.get("MINI_ORK_RUN_DIR", "")
+    if run_dir:
+        profile_path = os.path.join(run_dir, "run_profile.json")
+    else:
+        profile_path = os.path.join(MINI_ORK_HOME, "runs", MINI_ORK_RUN_ID,
+                                    "run_profile.json")
+    try:
+        with open(profile_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    raw = data.get("verification_command")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return ""
+    cmds = []
+    for cmd in raw:
+        cmd = str(cmd).strip().strip("`").strip()
+        if cmd and cmd not in cmds:
+            cmds.append(cmd)
+    return " && ".join(cmds)
+
+
 def detect_test_cmd():
     # Explicit override wins.
     if os.environ.get("MINI_ORK_TEST_CMD"):
         return os.environ["MINI_ORK_TEST_CMD"]
+
+    # The run's declared verification command — the command the run was
+    # dispatched with — ranked between the explicit override above and the
+    # auto-detect chain below. Fail-open: a missing/empty/unreadable profile
+    # returns "" and detection falls through unchanged.
+    profile_cmd = _profile_verification_command()
+    if profile_cmd:
+        return profile_cmd
 
     # npm / pnpm / yarn / bun — check package.json scripts first. The manager is
     # a property of THIS repo (devEngines/packageManager/lockfile), never of the
@@ -1384,6 +1433,13 @@ def main():
             "error_summary": "no test runner detected — skipped",
         }, separators=(",", ":"), ensure_ascii=False))
         return 0
+
+    # Observability: record the resolved command at the top of the evidence
+    # stream so an operator can tell whether the run's declared verification
+    # command was used or detection fell through to a bare auto-detected
+    # runner. stderr only — the emit()/emit_unverified() JSON payloads keep
+    # their exact key set.
+    sys.stderr.write(f"[test] cmd: {CMD}\n")
 
     # ── Tamper guard (BEFORE the suite) ─────────────────────────────────
     # A patch that deletes/renames a test file or adds a skip marker to an
