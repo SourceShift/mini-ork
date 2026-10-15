@@ -68,7 +68,7 @@ def _section(page, title: str) -> dict:
 def test_empty_home(home: Path) -> None:
     page = context.build(home, None, {})
     check_page(page, "context")
-    assert page["tabs"] == [] and page["errors"] == {}
+    assert [t["key"] for t in page["tabs"]] == ["overview", "search"] and page["errors"] == {}
     assert page["chips"][0]["t"].startswith("not reachable") and page["chips"][0]["c"] == "yellow"
     # The six epic sections, in the order the IDE walks them. The old
     # 3-section layout (["Context pack", "Pre-fetch & hooks", "Cache"])
