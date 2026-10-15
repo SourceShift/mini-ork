@@ -1,30 +1,39 @@
-"""``board page lanes · past decisions`` — ContextNest capsule on the Lanes tab.
+"""``board page lanes · past decisions`` — ContextNest atoms on the Lanes tab.
 
-The kickoff (rank 8 — "What did I already decide for this kind of work?") asks
-the Lanes tab to render ContextNest capsule decision and failure atoms from
-the last 14 days, scoped to the project, each opening its session. The page
-goes through :func:`mini_ork.ide_pages._cn.render_cached_section` (two cached
-slots, one per query — lane and budget), and the parser tolerates bullets
-with or without the ``[kind xN]`` bracket prefix.
+The kickoff (rank 8 — "What did I already decide for this kind of work?")
+asks the Lanes tab to render ContextNest decision and failure atoms from
+the last 14 days, scoped to the project, each opening its session. The
+page goes through :func:`mini_ork.ide_pages._cn.render_cached_section`
+(two cached slots, one per ``kind`` — ``decision_made`` and ``failure``),
+and :func:`mini_ork.ide_pages._cn.section_status` renders the
+down / disabled / cached / config-error states so the page stays
+``ok: true`` with no server.
 
-The capsule endpoint serves text/markdown in the kickoff's verified live
-shape — ``# Prompt Context``, a window line, then ``## Risks`` /
-``## Decisions`` / ``## Failures`` / ``## Verifications`` sections of
-``- …`` bullets. Tests use synthetic data in exactly that shape, never
-invented JSON and never real transcript content.
+The atoms endpoint (``/api/v1/prompt-context/atoms``) returns JSON with
+``since`` / ``count`` / ``total_matched`` / ``atoms``; each atom carries
+``kind``, ``text``, ``session_id``, ``project`` and ``ts``
+(ISO-8601 UTC with milliseconds). Tests use synthetic data in exactly
+that shape, never invented JSON and never real transcript content.
 
-The tests reach :func:`mini_ork.cn_client.capsule` through the same module
+The tests reach :func:`mini_ork.cn_client._get` through the same module
 seam :mod:`tests.unit.test_cn_ui_coordination` uses for ``_coord_request``
-— monkeypatching the symbol lets one fake serve both cached-section slots
-without spinning up a real ContextNest, and keeps the test hermetic.
+— monkeypatching the symbol lets one fake serve both cached-section
+slots without spinning up a real ContextNest, and keeps the test
+hermetic. Stubbing ``capsule`` would silently keep testing the removed
+code path, which is why this module stubs ``_get`` only.
 """
 from __future__ import annotations
 
+import datetime as _dt
+import json
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from mini_ork import cn_client
+from mini_ork.ide_pages import _cn
 from mini_ork.ide_pages import lanes
 
 REPO = Path(__file__).resolve().parents[2]
@@ -34,13 +43,18 @@ REPO = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture
-def home(tmp_path: Path) -> Path:
+def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A temp ``.mini-ork`` home whose section cache lives inside the
+    test's tmp dir so no real slot is read or written."""
     from mini_ork.stores import migrate as mig
 
     h = tmp_path / "proj" / ".mini-ork"
     h.mkdir(parents=True)
     rc, _out, err = mig.init_db(db=str(h / "state.db"), root=str(REPO))
     assert rc == 0, err
+    monkeypatch.setenv("MINI_ORK_HOME", str(h))
+    monkeypatch.setenv("MO_DISABLE_CN", "0")
+    monkeypatch.setattr(cn_client, "available", lambda: True)
     return h
 
 
@@ -58,144 +72,365 @@ def _section(page: dict[str, Any], title: str) -> dict[str, Any]:
     )
 
 
-def _make_capsule(body: str):
-    """A fake ``cn_client.capsule`` that returns ``body`` for every query —
-    the lane and budget slots read the same synthetic markdown, which is
-    the right shape for these tests since the page treats both queries
-    as the same kind of feed (decisions/failures bullets)."""
-    def _fake(query: str = "", since: str = "14d", project: str = "") -> str:
-        return body
-    return _fake
+def _ts(seconds_ago: float) -> str:
+    """An ISO-8601 UTC ts with milliseconds, the kickoff's verified live shape."""
+    when = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=seconds_ago)
+    return when.strftime("%Y-%m-%dT%H:%M:%S.") + f"{when.microsecond // 1000:03d}Z"
 
 
-def _enable_capsule(monkeypatch: pytest.MonkeyPatch, body: str) -> None:
-    """Wire both ``capsule`` and ``available`` so the page's CN-up path runs."""
-    monkeypatch.setattr("mini_ork.cn_client.capsule", _make_capsule(body))
-    monkeypatch.setattr("mini_ork.cn_client.available", lambda: True)
+def _atom(text: str, project: str, *, kind: str = "decision_made",
+          sid: str, ts: str, i: int = 0) -> dict[str, Any]:
+    return {"id": f"cn-atom{i:04d}", "kind": kind, "text": text,
+            "session_id": sid, "project": project, "ts": ts, "metadata": {}}
+
+
+def _body(atoms: list[dict[str, Any]], total_matched: int | None = None) -> str:
+    return json.dumps({"since": "14d", "count": len(atoms),
+                       "total_matched": len(atoms) if total_matched is None else total_matched,
+                       "by_kind": {}, "atoms": atoms})
+
+
+@pytest.fixture
+def cn(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """A hermetic ContextNest: ``cn_client._get`` is stubbed per kind.
+
+    ``state["decision_made"]`` / ``state["failure"]`` hold the body ``_get``
+    returns for each kind query (a JSON string); ``state["error"]``, when
+    set, makes ``_get`` raise; ``state["calls"]`` records every requested
+    path so request-shape tests can assert on it.
+    """
+    state: dict[str, Any] = {"decision_made": _body([]), "failure": _body([]),
+                             "error": None, "calls": []}
+
+    def fake_get(path: str, *, timeout: float | None = None) -> str:
+        state["calls"].append(path)
+        if state["error"] is not None:
+            raise state["error"]
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+        kind = (query.get("kind") or [""])[0]
+        return state.get(kind, "{}")
+
+    monkeypatch.setattr(cn_client, "_get", fake_get)
+    return state
 
 
 # ── section rendering ───────────────────────────────────────────────────────
 
 
-def test_past_decisions_renders_decisions_and_failures_with_session(
-    home: Path, monkeypatch: pytest.MonkeyPatch,
+def test_past_decisions_renders_atoms_with_session_link(
+    home: Path, cn: dict[str, Any],
 ) -> None:
-    """Synthetic ``## Decisions`` and ``## Failures`` bullets in the verified
-    capsule shape render as rows; the canonical run id drives ``S.open_run``
-    on each row, and the ``[kind xN]`` bracket prefix is stripped
-    defensively."""
+    """Healthy atoms from both kinds render as rows: each carries its kind
+    label (``decision`` / ``failure``), the (truncated) text, and a
+    :func:`S.page_link` to the session page."""
     project = _project(home)
-    md = (
-        "# Prompt Context\n\n"
-        "## Risks\n"
-        f"- foreign risk at /other/repo/x.py run-1792000000-xxxx\n\n"
-        "## Decisions\n"
-        f"- [decision_made x1] use sqlite at {project}/mini_ork/foo.py run-1792000000-aaaa\n"
-        f"- retry the cache route at {project}/mini_ork/bar.py:12 run-1792000000-bbbb\n\n"
-        "## Failures\n"
-        f"- [failure_recorded x2] budget cap tripped at {project}/mini_ork/baz.py run-1792000000-cccc\n\n"
-        "## Verifications\n"
-        f"- (none)\n"
-    )
-    _enable_capsule(monkeypatch, md)
+    decision = _atom("Escalate the reviewer lane to opus after two failures",
+                     project, sid="f5671eaa-1111-4222-8333-444444444444",
+                     ts=_ts(3600), i=1)
+    failure = _atom("kimi_lens returned an empty artifact; the run routed to glm",
+                    project, kind="failure",
+                    sid="0c31d9bb-9999-4888-8777-666666666666",
+                    ts=_ts(7200), i=2)
+    cn["decision_made"] = _body([decision])
+    cn["failure"] = _body([failure])
 
     page = lanes.build(home, "lanes", {})
     section = _section(page, "Past decisions")
     assert section["type"] == "table"
     rows = section["rows"]
-    # The risks section is not requested; the verifications section is not a
-    # decision/failure either. Only the two Decisions + one Failures row remain.
-    assert len(rows) == 3
-    kinds = [r["cells"][0]["t"] for r in rows]
-    assert kinds == ["Decisions", "Decisions", "Failures"]
-    # Each row carries S.open_run wired to the canonical run id; the bracket
-    # prefix was stripped, the run id was extracted, and the path was kept.
-    expected_run_ids = [
-        "run-1792000000-aaaa", "run-1792000000-bbbb", "run-1792000000-cccc"]
-    for row, rid in zip(rows, expected_run_ids):
-        assert row["do"] == {"run": rid, "title": ""}
-    # The "atom" column carries the bullet body with the bracket prefix
-    # stripped off.
-    assert "use sqlite at" in rows[0]["cells"][1]["t"]
-    assert "[decision_made" not in rows[0]["cells"][1]["t"]
-    # ``file:line`` paths are kept; the trailing ``:12`` is treated as text.
-    assert "bar.py:12" in rows[1]["cells"][2]["t"]
+    assert len(rows) == 2, f"expected 2 rendered atoms, got {len(rows)}"
+
+    def _texts(row: dict[str, Any]) -> list[str]:
+        return [str(c.get("t")) for c in row.get("cells") or [] if isinstance(c, dict)]
+
+    def _action(row: dict[str, Any]) -> dict[str, Any] | None:
+        do = row.get("do")
+        return do if isinstance(do, dict) else None
+
+    def _row_with(rows: list[dict[str, Any]], needle: str) -> dict[str, Any] | None:
+        for row in rows:
+            if any(needle in t for t in _texts(row)):
+                return row
+        return None
+
+    drow = _row_with(rows, "Escalate the reviewer lane")
+    assert drow is not None, "decision atom text not rendered"
+    assert "decision" in _texts(drow), f"kind must render as 'decision', got {_texts(drow)}"
+    assert "Escalate the reviewer lane to opus after two failures" in _texts(drow)
+    assert _action(drow) == {
+        "page": "cn_session",
+        "args": {"id": "f5671eaa-1111-4222-8333-444444444444"},
+    }, "the row action must open the session page, never execute atom text"
+
+    frow = _row_with(rows, "kimi_lens returned an empty artifact")
+    assert frow is not None, "failure atom text not rendered"
+    assert "failure" in _texts(frow), f"kind must render as 'failure', got {_texts(frow)}"
+    assert "kimi_lens returned an empty artifact; the run routed to glm" in _texts(frow)
+    assert _action(frow) == {
+        "page": "cn_session",
+        "args": {"id": "0c31d9bb-9999-4888-8777-666666666666"},
+    }
 
 
-def test_past_decisions_drops_out_of_project_and_pathless_bullets(
-    home: Path, monkeypatch: pytest.MonkeyPatch,
+def test_past_decisions_drops_atoms_from_another_project(
+    home: Path, cn: dict[str, Any],
 ) -> None:
-    """Bullets without a recognizable path and bullets whose path sits outside
-    the project are both dropped, mirroring
-    :func:`mini_ork.cn_client.filter_by_project_path`'s fail-closed rule:
-    items with no path inside the project must not leak in."""
+    """An atom whose ``project`` is foreign, and an atom whose ``project``
+    is a nested checkout of the root, are both dropped — only the atom
+    whose ``project`` byte-equals the project root survives. Mirrors the
+    fail-closed rule ``mini_ork.cn_client.filter_by_project_path`` keeps."""
     project = _project(home)
-    md = (
-        "# Prompt Context\n\n"
-        "## Decisions\n"
-        f"- in-project: {project}/mini_ork/ok.py run-1792000000-aaaa\n"
-        f"- foreign: /other/repo/x.py run-1792000000-bbbb\n"
-        "- pathless: just a decision run-1792000000-cccc\n"
-        f"- in-project trailing slash: {project}/mini_ork/also.py run-1792000000-dddd\n"
-    )
-    _enable_capsule(monkeypatch, md)
+    foreign = _atom("lane routing budget for another project entirely",
+                    "/somewhere/else/project",
+                    sid="aaaaaaaa-0000-4000-8000-000000000001", ts=_ts(600), i=1)
+    nested = _atom("cost cap decided for a nested checkout of the root",
+                   project + "/child",
+                   sid="aaaaaaaa-0000-4000-8000-000000000002", ts=_ts(700), i=2)
+    own = _atom("provider fallback order decided for this root",
+                project, sid="aaaaaaaa-0000-4000-8000-000000000003",
+                ts=_ts(800), i=3)
+    cn["decision_made"] = _body([foreign, nested, own])
 
     page = lanes.build(home, "lanes", {})
     section = _section(page, "Past decisions")
     rows = section["rows"]
-    # Only the two in-project bullets survive; the foreign and the pathless
-    # are dropped (the pathless one would render with a no-action row, but
-    # the kickoff's fail-closed rule requires it be filtered out).
-    assert len(rows) == 2
-    run_ids = {r["do"]["run"] for r in rows}
-    assert run_ids == {"run-1792000000-aaaa", "run-1792000000-dddd"}
+
+    def _texts(row: dict[str, Any]) -> list[str]:
+        return [str(c.get("t")) for c in row.get("cells") or [] if isinstance(c, dict)]
+
+    def _row_with(rows: list[dict[str, Any]], needle: str) -> dict[str, Any] | None:
+        for row in rows:
+            if any(needle in t for t in _texts(row)):
+                return row
+        return None
+
+    assert len(rows) == 1, f"only the root's own atom may render, got {len(rows)} rows"
+    assert _row_with(rows, "provider fallback order decided") is not None
+    assert _row_with(rows, "another project") is None, "a foreign-project atom leaked in"
+    assert _row_with(rows, "nested checkout") is None, (
+        "an atom whose project is inside but not equal to the root must be dropped")
 
 
-def test_past_decisions_section_renders_one_liner_when_cn_down(
-    home: Path, monkeypatch: pytest.MonkeyPatch,
+def test_past_decisions_drops_atoms_without_vocabulary(
+    home: Path, cn: dict[str, Any],
 ) -> None:
-    """CN down → the section renders the established one-line state from
-    :func:`mini_ork.ide_pages._cn.section_status`, never silently empty."""
-    def _fake_capsule(query: str = "", since: str = "14d", project: str = "") -> str:
-        raise ConnectionError(f"down for {query}")
-    monkeypatch.setattr("mini_ork.cn_client.capsule", _fake_capsule)
-    monkeypatch.setattr("mini_ork.cn_client.available", lambda: False)
+    """Atoms whose ``text`` carries none of the lane / routing / budget
+    vocabulary are dropped, so the section stays on-topic."""
+    project = _project(home)
+    off_topic = _atom("Renamed the documentation index chapters and fixed two typos",
+                      project, sid="bbbbbbbb-0000-4000-8000-000000000001",
+                      ts=_ts(600), i=1)
+    on_topic = _atom("Rebalanced the cost cap across provider lanes",
+                     project, sid="bbbbbbbb-0000-4000-8000-000000000002",
+                     ts=_ts(700), i=2)
+    footnote_failure = _atom("The chapter renderer clipped a footnote",
+                             project, kind="failure",
+                             sid="bbbbbbbb-0000-4000-8000-000000000003",
+                             ts=_ts(800), i=3)
+    cn["decision_made"] = _body([off_topic, on_topic])
+    cn["failure"] = _body([footnote_failure])
 
     page = lanes.build(home, "lanes", {})
     section = _section(page, "Past decisions")
-    # The degraded path returns a list with the established one-line state.
+    rows = section["rows"]
+
+    def _texts(row: dict[str, Any]) -> list[str]:
+        return [str(c.get("t")) for c in row.get("cells") or [] if isinstance(c, dict)]
+
+    def _row_with(rows: list[dict[str, Any]], needle: str) -> dict[str, Any] | None:
+        for row in rows:
+            if any(needle in t for t in _texts(row)):
+                return row
+        return None
+
+    assert len(rows) == 1, f"only vocabulary-matching atoms may render, got {len(rows)} rows"
+    assert _row_with(rows, "Rebalanced the cost cap") is not None
+    assert _row_with(rows, "documentation index") is None
+    assert _row_with(rows, "footnote") is None
+
+
+def test_past_decisions_vocabulary_match_is_whole_word_and_case_insensitive(
+    home: Path, cn: dict[str, Any],
+) -> None:
+    """``cap`` inside ``capability`` and ``route`` inside ``router`` are
+    substring-only hits and must NOT match; ``CAP`` and ``OPUS`` must
+    match because the match is case-insensitive on the full token."""
+    project = _project(home)
+    capability = _atom("The capability matrix was re-derived for the docs",
+                       project, sid="cccccccc-0000-4000-8000-000000000001",
+                       ts=_ts(600), i=1)
+    router = _atom("Restarted the router daemon before the deploy",
+                   project, sid="cccccccc-0000-4000-8000-000000000002",
+                   ts=_ts(700), i=2)
+    upper = _atom("CAP raised for the OPUS lane on deepseek days",
+                  project, sid="cccccccc-0000-4000-8000-000000000003",
+                  ts=_ts(800), i=3)
+    cn["decision_made"] = _body([capability, router, upper])
+
+    page = lanes.build(home, "lanes", {})
+    section = _section(page, "Past decisions")
+    rows = section["rows"]
+
+    def _texts(row: dict[str, Any]) -> list[str]:
+        return [str(c.get("t")) for c in row.get("cells") or [] if isinstance(c, dict)]
+
+    def _row_with(rows: list[dict[str, Any]], needle: str) -> dict[str, Any] | None:
+        for row in rows:
+            if any(needle in t for t in _texts(row)):
+                return row
+        return None
+
+    assert len(rows) == 1, (
+        f"'capability' and 'router' are substring-only hits and must be dropped; got {len(rows)} rows")
+    assert _row_with(rows, "CAP raised") is not None, (
+        "case-insensitive vocabulary ('CAP', 'OPUS') must match")
+
+
+def test_past_decisions_rows_newest_first_cap_30_with_showing_note(
+    home: Path, cn: dict[str, Any],
+) -> None:
+    """The merged list sorts newest ts first, caps at 30 rows, and the
+    table note carries ``Showing 30 of N`` when capped."""
+    project = _project(home)
+    atoms = []
+    for i in range(45):
+        atoms.append(_atom(f"lane marker {i:02d} budget cap decided",
+                           project,
+                           kind="failure" if i % 9 == 0 else "decision_made",
+                           sid=f"dddddddd-{i:04d}-4000-8000-000000000000",
+                           ts=_ts((i + 1) * 100), i=i))
+    cn["decision_made"] = _body([a for a in atoms if a["kind"] == "decision_made"],
+                                total_matched=500)
+    cn["failure"] = _body([a for a in atoms if a["kind"] == "failure"],
+                          total_matched=496)
+
+    page = lanes.build(home, "lanes", {})
+    section = _section(page, "Past decisions")
+    rows = section["rows"]
+    assert len(rows) == 30, f"the merged list must cap at 30 rows, got {len(rows)}"
+
+    def _texts(row: dict[str, Any]) -> list[str]:
+        return [str(c.get("t")) for c in row.get("cells") or [] if isinstance(c, dict)]
+
+    def _marker(row: dict[str, Any]) -> str | None:
+        import re as _re
+        for t in _texts(row):
+            m = _re.search(r"lane marker \d\d", t)
+            if m:
+                return m.group(0)
+        return None
+
+    got = [_marker(r) for r in rows]
+    assert got == [f"lane marker {i:02d}" for i in range(30)], (
+        "rows must be the 30 NEWEST atoms (smallest seconds-ago first), newest first")
+    assert "failure" in _texts(rows[0]), "atom 00 is a failure; the newest overall must lead the merge"
+    note = str(section.get("note", ""))
+    assert "Showing 30 of 45" in note, (
+        f"the capped table must say 'Showing N of M' over the 45 matched atoms; note={note!r}")
+
+
+def test_past_decisions_atom_text_truncated_at_160_chars(
+    home: Path, cn: dict[str, Any],
+) -> None:
+    """An atom whose ``text`` is 255 chars renders only the first 160 —
+    the kickoff's truncation rule."""
+    project = _project(home)
+    text = "lane " + "abcdefghij" * 25  # 255 chars, vocabulary in the first word
+    cn["decision_made"] = _body([_atom(text, project,
+                                       sid="eeeeeeee-0000-4000-8000-000000000001",
+                                       ts=_ts(600), i=1)])
+
+    page = lanes.build(home, "lanes", {})
+    section = _section(page, "Past decisions")
+    rows = section["rows"]
+    assert len(rows) == 1
+
+    texts = [str(c.get("t")) for c in rows[0].get("cells") or [] if isinstance(c, dict)]
+    assert text[:160] in texts, "the rendered text must be exactly the first 160 chars"
+    assert text not in texts, "the full 255-char text must not render untruncated"
+
+
+def test_past_decisions_request_paths_carry_kinds_and_project(
+    home: Path, cn: dict[str, Any],
+) -> None:
+    """The two GETs hit ``/api/v1/prompt-context/atoms`` with
+    ``since=14d``, ``kind=decision_made`` / ``kind=failure``, the project
+    root, and ``limit=500`` — one per kind, both going through
+    :func:`mini_ork.cn_client._get`."""
+    project = _project(home)
+    cn["decision_made"] = _body([_atom("lane budget decision", project,
+                                       sid="ffffffff-0000-4000-8000-000000000001",
+                                       ts=_ts(600), i=1)])
+    lanes.build(home, "lanes", {})
+
+    calls = cn["calls"]
+    assert calls, "_past_decisions must read its atoms through cn_client._get"
+    endpoint = "/api/v1/prompt-context/atoms"
+    assert all(p.startswith(endpoint) for p in calls), (
+        f"every request must hit the atoms endpoint, got {calls}")
+    queries = [urllib.parse.parse_qs(urllib.parse.urlparse(p).query) for p in calls]
+    kinds = sorted(q.get("kind", [""])[0] for q in queries)
+    assert "decision_made" in kinds and "failure" in kinds, (
+        f"one list per kind must be requested, got kinds {kinds}")
+    for q in queries:
+        assert q.get("since") == ["14d"], f"since=14d must be carried, got {q}"
+        assert q.get("limit") == ["500"], f"limit=500 must be carried, got {q}"
+        assert q.get("project") == [project], (
+            f"the project root {project!r} must be carried, got {q}")
+
+
+def test_past_decisions_cn_down_renders_one_line_state(
+    home: Path, cn: dict[str, Any],
+) -> None:
+    """CN up but returning ``{}`` is a failed read — the section renders
+    the established one-line state from
+    :func:`mini_ork.ide_pages._cn.section_status`, never silently empty."""
+    cn["decision_made"] = "{}"
+    cn["failure"] = "{}"
+
+    page = lanes.build(home, "lanes", {})
+    section = _section(page, "Past decisions")
     assert section["type"] == "list"
     items = section["items"]
     assert len(items) == 1
-    item = items[0]
-    # "ContextNest" + the "not running" text are the rendered pieces.
-    assert "ContextNest" in (item.get("label") or "")
-    assert "not running" in (item.get("text") or "").lower() or \
-           "not running" in (item.get("t") or "").lower()
+    assert items[0] == _cn.section_status({"_unreachable": True}), (
+        f"the failed read must render the section_status one-liner, got {items[0]}")
 
 
-def test_past_decisions_section_renders_disabled_line_under_mo_disable_cn(
-    home: Path, monkeypatch: pytest.MonkeyPatch,
+def test_past_decisions_cn_disabled_renders_one_line_state(
+    home: Path, cn: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``MO_DISABLE_CN=1`` short-circuits and renders the disabled line."""
+    """``MO_DISABLE_CN=1`` short-circuits before any ``_get`` is fired."""
     monkeypatch.setenv("MO_DISABLE_CN", "1")
     try:
         page = lanes.build(home, "lanes", {})
         section = _section(page, "Past decisions")
         assert section["type"] == "list"
         item = section["items"][0]
-        # The disabled label and the established MO_DISABLE_CN=1 hint ride
-        # the same dot — ``label="ContextNest"``, ``text="off · MO_DISABLE_CN=1"``.
-        assert item.get("label") == "ContextNest"
-        assert "off" in item.get("text", "").lower()
-        assert "MO_DISABLE_CN=1" in item.get("text", "")
+        assert item == _cn.section_status({"_disabled": True}), (
+            f"MO_DISABLE_CN=1 must render the section_status one-liner, got {item}")
+        assert not cn["calls"], "a disabled ContextNest must not be read at all"
     finally:
         monkeypatch.delenv("MO_DISABLE_CN", raising=False)
 
 
-def test_past_decisions_section_is_only_on_lanes_tab(
-    home: Path, monkeypatch: pytest.MonkeyPatch,
+def test_past_decisions_cn_transport_error_renders_one_line_state(
+    home: Path, cn: dict[str, Any],
 ) -> None:
+    """A transport error (``_get`` raises ``OSError``) renders the
+    one-line state via ``section_status``."""
+    cn["error"] = OSError("connection refused")
+
+    page = lanes.build(home, "lanes", {})
+    section = _section(page, "Past decisions")
+    assert section["type"] == "list"
+    items = section["items"]
+    assert len(items) == 1
+    assert items[0] == _cn.section_status({"_unreachable": True}), (
+        f"a transport error must render the section_status one-liner, got {items[0]}")
+
+
+def test_past_decisions_section_is_only_on_lanes_tab(home: Path) -> None:
     """The kickoff asks for one 'Past decisions' section on the default
     'lanes' tab — not on routing, not on cost."""
     page_lanes = lanes.build(home, "lanes", {})
@@ -207,35 +442,39 @@ def test_past_decisions_section_is_only_on_lanes_tab(
     assert "Past decisions" not in [s["title"] for s in page_cost["sections"]]
 
 
-def test_past_decisions_empty_state_lists_dot_when_cn_up_no_items(
-    home: Path, monkeypatch: pytest.MonkeyPatch,
+def test_past_decisions_no_matches_renders_one_plain_row(
+    home: Path, cn: dict[str, Any],
 ) -> None:
-    """CN up with no decisions/failures for this project: a 'No decisions
-    recorded' dot replaces the table — never a silently empty table."""
-    md = (
-        "# Prompt Context\n\n"
-        "## Decisions\n\n"
-        "## Failures\n\n"
-    )
-    _enable_capsule(monkeypatch, md)
+    """CN up with no atoms for this project: a single 'No decisions
+    recorded' row replaces the table — never a silently empty table
+    and never the down state."""
+    cn["decision_made"] = _body([])
+    cn["failure"] = _body([])
 
     page = lanes.build(home, "lanes", {})
     section = _section(page, "Past decisions")
-    assert section["type"] == "list"
-    assert any("No decisions recorded" in i.get("t", "") for i in section["items"])
+    assert isinstance(section, dict)
+    if section.get("type") == "table":
+        rows = list(section.get("rows") or [])
+        assert len(rows) == 1, f"a healthy empty read renders ONE plain row, got {len(rows)}"
+        text = " ".join(str(c.get("t")) for c in rows[0].get("cells") or [] if isinstance(c, dict))
+    else:
+        items = list(section.get("items") or [])
+        assert len(items) == 1, f"a healthy empty read renders ONE plain row, got {len(items)}"
+        text = " ".join(str(v) for v in items[0].values() if isinstance(v, str))
+    assert "not running" not in text, "an empty-but-healthy read is not the down state"
+    assert "no" in text.lower(), f"the plain row must say there are none, got {text!r}"
+    assert "cn_session" not in json.dumps(section), "no atom row may render"
 
 
 def test_past_decisions_section_does_not_break_page(
-    home: Path, monkeypatch: pytest.MonkeyPatch,
+    home: Path, cn: dict[str, Any],
 ) -> None:
-    """Even when ContextNest raises mid-render, the page still builds with
-    ``ok: true`` and the existing sections are untouched. The kickoff
-    relies on the page continuing to build for the test_ide_pages_actions
-    action sweep."""
-    def _fake_capsule(query: str = "", since: str = "14d", project: str = "") -> str:
-        raise RuntimeError("kapow")
-    monkeypatch.setattr("mini_ork.cn_client.capsule", _fake_capsule)
-    monkeypatch.setattr("mini_ork.cn_client.available", lambda: True)
+    """Even when ContextNest raises mid-render, the page still builds
+    with ``ok: true`` and the existing sections are untouched. The
+    kickoff relies on the page continuing to build for the
+    ``test_ide_pages_actions`` action sweep."""
+    cn["error"] = RuntimeError("kapow")
 
     page = lanes.build(home, "lanes", {})
     assert page["ok"] is True
@@ -247,84 +486,27 @@ def test_past_decisions_section_does_not_break_page(
 
 
 def test_past_decisions_section_uses_only_existing_action_kinds(
-    home: Path, monkeypatch: pytest.MonkeyPatch,
+    home: Path, cn: dict[str, Any],
 ) -> None:
-    """The rows' ``do`` actions are only :func:`S.open_run` (or ``None``);
-    no new action kind is invented for the section. The
-    test_ide_pages_actions action sweep walks every action on every page,
-    so an unknown action kind would break it."""
+    """Each row's ``do`` action is :func:`S.page_link` (or ``None`` when
+    the atom carries no ``session_id``); no new action kind is invented
+    for the section. The ``test_ide_pages_actions`` action sweep walks
+    every action on every page, so an unknown action kind would break it."""
     project = _project(home)
-    md = (
-        "# Prompt Context\n\n"
-        "## Decisions\n"
-        f"- decision at {project}/mini_ork/foo.py run-1792000000-aaaa\n"
-        f"- decision without run id at {project}/mini_ork/bar.py\n"
-    )
-    _enable_capsule(monkeypatch, md)
+    cn["decision_made"] = _body([
+        _atom("provider fallback lane at the project root", project,
+              sid="11111111-1111-4111-8111-111111111111", ts=_ts(600), i=1),
+        _atom("budget cost cap at the project root", project,
+              sid="", ts=_ts(700), i=2),
+    ])
 
     page = lanes.build(home, "lanes", {})
     section = _section(page, "Past decisions")
     rows = section["rows"]
     assert len(rows) == 2
-    # First row has the run id — the action is S.open_run with that id.
+    # First row carries a session id — its action opens the cn_session page.
     assert isinstance(rows[0]["do"], dict)
-    assert "run" in rows[0]["do"]
-    assert rows[0]["do"]["run"] == "run-1792000000-aaaa"
-    # Second row has no run id — the action is None (a plain row).
+    assert rows[0]["do"].get("page") == "cn_session"
+    assert rows[0]["do"].get("args", {}).get("id") == "11111111-1111-4111-8111-111111111111"
+    # Second row carries no session id — the action is ``None`` (a plain row).
     assert rows[1]["do"] is None
-
-
-# ── parser unit tests (defensive coverage of the capsule bullet grammar) ──
-
-
-def test_parse_capsule_atoms_strips_bracket_and_extracts_run_id_and_path() -> None:
-    """The bullet parser strips ``[kind xN]`` prefixes, extracts the
-    canonical run id, and finds a recognizable path even when a
-    ``file:line`` suffix follows."""
-    from mini_ork.ide_pages.lanes import _parse_capsule_atoms
-
-    md = (
-        "## Decisions\n"
-        "- [decision_made x3] keep foo at /ps/mini-ork/foo.py run-1792000000-aaaa\n"
-        "- retry /ps/mini-ork/bar.py:12 run-1792000000-bbbb\n"
-    )
-    atoms = _parse_capsule_atoms(md)
-    assert len(atoms) == 2
-    assert atoms[0]["kind"] == "Decisions"
-    assert atoms[0]["run_id"] == "run-1792000000-aaaa"
-    assert atoms[0]["path"] == "/ps/mini-ork/foo.py"
-    # The bracket prefix was stripped from the text body.
-    assert atoms[0]["text"].startswith("keep foo at")
-    # Path detection tolerates a trailing ``:line`` suffix.
-    assert atoms[1]["path"] == "/ps/mini-ork/bar.py:12"
-    assert atoms[1]["run_id"] == "run-1792000000-bbbb"
-
-
-def test_parse_capsule_atoms_ignores_other_sections() -> None:
-    """Only ``## Decisions`` and ``## Failures`` produce atoms; ``## Risks``
-    and ``## Verifications`` are silently skipped."""
-    from mini_ork.ide_pages.lanes import _parse_capsule_atoms
-
-    md = (
-        "## Risks\n- risk /ps/mini-ork/r.py run-1792000000-aaaa\n"
-        "## Decisions\n- decision /ps/mini-ork/d.py run-1792000000-bbbb\n"
-        "## Failures\n- failure /ps/mini-ork/f.py run-1792000000-cccc\n"
-        "## Verifications\n- verification /ps/mini-ork/v.py run-1792000000-dddd\n"
-    )
-    atoms = _parse_capsule_atoms(md)
-    kinds = [a["kind"] for a in atoms]
-    assert kinds == ["Decisions", "Failures"]
-
-
-def test_parse_capsule_atoms_handles_missing_fields_defensively() -> None:
-    """A bullet with no path, no run id, and no bracket prefix still
-    parses without raising — the kickoff's fail-closed rule (project
-    filter) drops it from the rendered list, but the parser must not
-    throw on the way through."""
-    from mini_ork.ide_pages.lanes import _parse_capsule_atoms
-
-    md = "## Decisions\n- plain bullet with no path and no run id\n"
-    atoms = _parse_capsule_atoms(md)
-    assert len(atoms) == 1
-    assert atoms[0]["path"] == ""
-    assert atoms[0]["run_id"] == ""

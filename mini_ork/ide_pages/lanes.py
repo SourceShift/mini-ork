@@ -349,154 +349,227 @@ def _byo(home: Path) -> dict[str, Any]:
                  full=True)
 
 
-# ── Past decisions (ContextNest capsule, lane + budget) ─────────────────────
+# ── Past decisions (ContextNest atoms, lane + budget) ───────────────────────
 #
 # The kickoff (rank 8 — "What did I already decide for this kind of work?")
-# asks the Lanes tab to surface the ContextNest capsule's ``## Decisions``
-# and ``## Failures`` sections over the last 14 days, scoped to the project,
-# each opening its session. The capsule is text/markdown (not JSON): a
-# ``# Prompt Context`` header, a window line, then ``## Risks`` /
-# ``## Decisions`` / ``## Failures`` / ``## Verifications`` sections of
-# ``- …`` bullets. Bullets may carry a ``[kind xN]`` bracket prefix that
-# the parser strips defensively; bullets without a recognizable run id
-# render as plain rows. The capsule endpoint already takes a ``project=``
-# query parameter — the parser ALSO drops bullets whose recognizable path
-# sits outside the project (mirroring
-# :func:`mini_ork.cn_client.filter_by_project_path`'s fail-closed rule).
+# asks the Lanes tab to surface ContextNest decision and failure atoms over
+# the last 14 days, scoped to the project, each opening its session. The
+# atoms endpoint (``/api/v1/prompt-context/atoms``) returns JSON with
+# ``since`` / ``count`` / ``total_matched`` / ``atoms``; each atom carries
+# ``kind``, ``text``, ``session_id``, ``project`` and ``ts`` (ISO-8601 UTC
+# with milliseconds). Two cached_section slots — one per ``kind`` — fan out
+# from this single section; the down / disabled / cached / config-error
+# states are all rendered through
+# :func:`mini_ork.ide_pages._cn.section_status`, which keeps the page
+# building ``ok: true`` with no server. The vocabulary is whole-word,
+# case-insensitive (regex word boundaries) so ``cap`` does not match
+# ``capability`` and ``route`` does not match ``router``.
 
-_CAPSULE_SECTION_RE = re.compile(r"^##\s+(.+?)\s*$")
-_CAPSULE_BULLET_RE = re.compile(r"^-\s+(.*?)\s*$")
-_CAPSULE_BRACKET_RE = re.compile(r"^\[([^\]]+)\]\s*(.*)$")
-_CAPSULE_PATH_RE = re.compile(r"((?:/|\.\./)[^\s,;)]+)")
-_RUN_ID_RE = re.compile(r"run-\d{6,}-[A-Za-z0-9]{4,}")
-_PAST_DECISION_KINDS = ("Decisions", "Failures")
+import urllib.parse
+
+_VOCABULARY_RE = re.compile(
+    r"\b("
+    r"lane|lanes|routing|route|routed|model|provider|budget|cost|spend|cap|"
+    r"fallback|recipe|opus|sonnet|glm|minimax|deepseek|kimi|codex"
+    r")\b",
+    re.IGNORECASE,
+)
+_KIND_LABEL = {
+    "decision_made": "decision",
+    "failure": "failure",
+}
+_PAST_DECISION_KINDS = ("decision_made", "failure")
 _PAST_DECISION_SECTION_LIMIT = 30
+_PAST_DECISION_TEXT_LIMIT = 160
 
 
-def _parse_capsule_atoms(md: str, kinds: tuple[str, ...] = _PAST_DECISION_KINDS
-                         ) -> list[dict[str, Any]]:
-    """Extract ``## <kind>`` bullets from a capsule markdown body.
+def _kind_label(kind: str) -> str:
+    """Render an atom's ``kind`` as the short table label.
 
-    Each surviving bullet becomes a dict ``{"kind", "text", "run_id",
-    "path"}``. ``kind`` is the section heading; ``text`` is the bullet body
-    after any ``[kind xN]`` bracket prefix; ``run_id`` is the first
-    ``run-<digits>-<short>`` token when present (else ``""``); ``path``
-    is the first ``/…`` token (else ``""``). The path is recognised even
-    when a ``file:line`` suffix follows (``/ps/mini-ork/foo.py:12``) so
-    the kickoff's plain paths and the suggested ``file:line`` shape both
-    work.
+    ``decision_made`` → ``decision``; ``failure`` → ``failure``; anything
+    else falls through to the raw value (or ``atom`` when empty) so an
+    unknown kind still surfaces a row instead of silently dropping it.
     """
-    wanted = {k.lower() for k in kinds}
-    out: list[dict[str, Any]] = []
-    current_kind: str | None = None
-    for line in md.splitlines():
-        m = _CAPSULE_SECTION_RE.match(line)
-        if m:
-            current_kind = m.group(1).strip()
-            continue
-        if current_kind is None or current_kind.lower() not in wanted:
-            continue
-        b = _CAPSULE_BULLET_RE.match(line)
-        if not b:
-            continue
-        text = b.group(1).strip()
-        if not text:
-            continue
-        bracket = _CAPSULE_BRACKET_RE.match(text)
-        if bracket:
-            text = bracket.group(2).strip()
-        rid_m = _RUN_ID_RE.search(text)
-        run_id = rid_m.group(0) if rid_m else ""
-        path_m = _CAPSULE_PATH_RE.search(text)
-        path = path_m.group(1).rstrip(".,;:)") if path_m else ""
-        out.append({"kind": current_kind, "text": text, "run_id": run_id, "path": path})
-    return out
+    if kind in _KIND_LABEL:
+        return _KIND_LABEL[kind]
+    return kind or "atom"
+
+
+def _parse_iso_ts(ts: Any) -> _dt.datetime | None:
+    """Parse an atom ts (``YYYY-MM-DDTHH:MM:SS.mmmZ`` UTC) into a datetime.
+
+    Returns ``None`` on anything that isn't a non-empty string or that
+    fails :func:`datetime.fromisoformat`. The sort uses a derived key so
+    a missing-ts atom can never displace a real one to the top.
+    """
+    if not isinstance(ts, str) or not ts:
+        return None
+    try:
+        return _dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _atom_age(ts: Any) -> str:
+    """Render an atom ts as a short age string (``3h ago``, ``2d ago``).
+
+    A missing or malformed ts renders ``—`` so the row never carries a
+    bogus timestamp. The lookback is 14 days (kickoff) so an age beyond
+    ``14d`` is still an honest ``Nd`` rather than a confusing overflow.
+    """
+    when = _parse_iso_ts(ts)
+    if when is None:
+        return "—"
+    delta = _dt.datetime.now(_dt.timezone.utc) - when
+    seconds = int(delta.total_seconds())
+    if seconds < 0:
+        return "just now"
+    if seconds < 60:
+        return f"{seconds}s ago"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86400:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86400}d ago"
+
+
+def _read_atoms(project: str, kind: str) -> dict[str, Any]:
+    """Read ``/api/v1/prompt-context/atoms`` for one ``kind`` and return
+    the parsed body.
+
+    A failed read (``_get`` returns ``"{}"``) or an empty body becomes an
+    exception so :func:`mini_ork.cn_client.cached_section` renders it as
+    ``_unreachable`` instead of an empty dict papering over the failure.
+    A non-dict JSON body (server typo) becomes ``{"atoms": []}`` so the
+    page can still walk the list cleanly.
+    """
+    from mini_ork import cn_client
+
+    path = (
+        f"/api/v1/prompt-context/atoms"
+        f"?since=14d&kind={urllib.parse.quote(kind)}"
+        f"&project={urllib.parse.quote(project)}&limit=500"
+    )
+    body = cn_client._get(path)
+    if not body:
+        raise ConnectionError(f"atoms endpoint returned empty body for kind={kind!r}")
+    try:
+        data = json.loads(body)
+    except ValueError as exc:
+        raise ConnectionError(f"atoms endpoint returned invalid JSON for kind={kind!r}: {exc}")
+    if not isinstance(data, dict):
+        return {"atoms": []}
+    return data
 
 
 def _past_decisions(home: Path) -> dict[str, Any]:
-    """Decisions and failures from the ContextNest capsule, scoped to the project.
+    """Decisions and failures from ContextNest atoms, scoped to the project.
 
-    Two cached_section slots — ``lane`` and ``budget`` — fan out from this
-    single section so the Lanes page carries a unified view. The
+    Two ``_cn.render_cached_section`` slots — one per ``kind`` — fan out
+    from this single section so the Lanes page carries a unified view. The
     down / disabled / cached / config-error states are all rendered
     through :func:`mini_ork.ide_pages._cn.section_status`, which keeps
     the page building ``ok: true`` with no server.
     """
     from mini_ork.ide_pages import _cn
-    from mini_ork import cn_client
 
     project = str(home.parent.resolve()) if home else ""
 
-    def _fetch(query: str) -> dict[str, Any]:
-        md = cn_client.capsule(query=query, since="14d", project=project)
-        if not md:
-            # An empty body would render as a silent empty table; raise so
-            # ``cached_section`` treats it like an unreachable read.
-            raise ConnectionError(f"capsule for query={query!r} returned empty body")
-        return {"md": md}
-
-    lane_payload = _cn.render_cached_section(
-        "decisions-lane", f"lane:{project}", lambda: _fetch("lane"))
-    budget_payload = _cn.render_cached_section(
-        "decisions-budget", f"budget:{project}", lambda: _fetch("budget"))
+    decision_payload = _cn.render_cached_section(
+        "decisions-atom", f"decision_made:{project}",
+        lambda: _read_atoms(project, "decision_made"))
+    failure_payload = _cn.render_cached_section(
+        "decisions-atom", f"failure:{project}",
+        lambda: _read_atoms(project, "failure"))
 
     # Degraded states: the established one-line state from the first payload
     # that carries the marker, so a down/disabled/cached/config-errored
     # ContextNest renders through ``section_status`` (never silently empty).
-    for payload in (lane_payload, budget_payload):
+    for payload in (decision_payload, failure_payload):
         if not isinstance(payload, dict):
             continue
         if payload.get("_disabled") or payload.get("_unreachable") or payload.get("_config_error"):
             return S.lst("Past decisions", [_cn.section_status(payload)], full=True)
 
-    # Healthy: parse bullets from both payloads, then filter to the project.
+    # Healthy: read atoms from both payloads, then filter to the project.
     items: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str]] = set()
-    for payload in (lane_payload, budget_payload):
+    seen: set[tuple[str, str]] = set()
+    for payload in (decision_payload, failure_payload):
         if not isinstance(payload, dict):
             continue
-        md = payload.get("md") or ""
-        if isinstance(md, str) and md:
-            for atom in _parse_capsule_atoms(md):
-                # The same atom can appear under both the lane and budget
-                # queries; dedupe by (kind, run_id, path) so a decision
-                # about both surfaces once, not twice.
-                key = (atom["kind"], atom["run_id"], atom["path"])
-                if key in seen:
-                    continue
-                seen.add(key)
-                items.append(atom)
-
-    if project:
-        norm = project.rstrip("/")
-        # Defence in depth: ``cn_client.capsule`` already takes ``project=``,
-        # but any bullet whose recognizable path falls outside the project
-        # is dropped here, mirroring ``filter_by_project_path``'s rule that
-        # items with no path inside the project must not leak in.
-        items = [it for it in items if it["path"] and it["path"].startswith(norm + "/")]
+        for atom in payload.get("atoms") or []:
+            if not isinstance(atom, dict):
+                continue
+            # Fail-closed defence on top of the server-side ``project=``
+            # filter: keep an atom only when its ``project`` equals the
+            # project root byte-for-byte. A nested checkout's atom (e.g.
+            # ``/ps/mini-ork/child``) is NOT equal to the root, so it is
+            # dropped — same fail-closed rule the page has carried since
+            # the capsule parser.
+            if not project or atom.get("project") != project:
+                continue
+            text = str(atom.get("text") or "")
+            if not text:
+                continue
+            # Whole-word, case-insensitive vocabulary match: ``cap`` must
+            # not match ``capability`` and ``route`` must not match
+            # ``router``. An atom without any vocabulary term is dropped.
+            if not _VOCABULARY_RE.search(text):
+                continue
+            kind = str(atom.get("kind") or "")
+            sid = str(atom.get("session_id") or "")
+            # The same atom can appear under both ``kind`` queries if a
+            # downstream relay re-indexes them; dedupe by (kind, session_id)
+            # so a decision+failure re-tag of the same session surfaces
+            # once, not twice.
+            key = (kind, sid)
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append({
+                "kind": kind,
+                "text": text,
+                "ts": str(atom.get("ts") or ""),
+                "session_id": sid,
+            })
 
     if not items:
         return S.lst("Past decisions",
                      [S.dot("No decisions recorded",
-                            "ContextNest returned no decisions or failures for this project in the last 14 days")],
+                            "ContextNest returned no matching decisions or failures "
+                            "for this project in the last 14 days")],
                      full=True,
-                     note="Decisions and failures from ContextNest over the last 14 days.")
+                     note="Decisions and failures from ContextNest atoms over the last 14 days.")
 
+    # Newest ts first. A row whose ts is missing or unparseable sorts
+    # behind every real row (a derived key of 1) so a CN typo can never
+    # push noise above a real atom.
+    def _sort_key(it: dict[str, Any]) -> tuple[int, _dt.datetime]:
+        parsed = _parse_iso_ts(it.get("ts") or "")
+        return (0 if parsed is None else 1,
+                parsed or _dt.datetime.min.replace(tzinfo=_dt.timezone.utc))
+
+    items.sort(key=_sort_key, reverse=True)
+
+    total = len(items)
+    capped = items[:_PAST_DECISION_SECTION_LIMIT]
     rows = []
-    for it in items[:_PAST_DECISION_SECTION_LIMIT]:
-        do = S.open_run(it["run_id"]) if it["run_id"] else None
+    for it in capped:
+        do = S.page_link("cn_session", id=it["session_id"]) if it["session_id"] else None
         rows.append({"cells": [
-            S.cell(it["kind"], "blue"),
-            S.cell(it["text"][:160] or "—", "text"),
-            S.muted(it["path"] or "—"),
-            S.mono(it["run_id"] or "—"),
+            S.cell(_kind_label(it["kind"]), "blue"),
+            S.cell(it["text"][:_PAST_DECISION_TEXT_LIMIT] or "—", "text"),
+            S.muted(_atom_age(it["ts"])),
         ], "do": do})
+    note = f"ContextNest atoms · lane + budget · last 14 days · scoped to {project}"
+    if total > _PAST_DECISION_SECTION_LIMIT:
+        note = f"Showing {_PAST_DECISION_SECTION_LIMIT} of {total} · {note}"
     return S.table(
         "Past decisions",
-        [S.col(90), S.col(fr=1, min=240), S.col(fr=1, min=200), S.col(140)],
-        ["kind", "atom", "path", "run"],
+        [S.col(90), S.col(fr=1, min=240), S.col(80)],
+        ["kind", "atom", "age"],
         rows,
-        note=f"ContextNest capsule · lane + budget · last 14 days · scoped to {project}",
+        note=note,
     )
 
 
