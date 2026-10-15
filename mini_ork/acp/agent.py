@@ -80,6 +80,7 @@ from acp.schema import (
     StopReason,
     TerminalAuthMethod,
     TextContentBlock,
+    ToolCallLocation,
     ToolCallProgress,
     ToolCallStart,
     UsageUpdate,
@@ -705,6 +706,12 @@ class MiniOrkAcpAgent:
         # session id → node_id → LiveTail (Z3 live projection). Constructed
         # lazily on first node_start; held until session end.
         self._tails: dict[str, dict[str, LiveTail]] = {}
+        # (session_id, node_id) → last ``(path, line)`` the live projection
+        # attached as a ``ToolCallLocation``. Dedup so a chatty tool-use stream
+        # on the same file does not reopen the buffer in Zed on every chunk —
+        # the ``ToolCallProgress`` text chunk is still emitted; only the
+        # ``locations`` field is suppressed when it would repeat.
+        self._live_locations_sent: dict[tuple[str, str], tuple[str, int | None]] = {}
         # destination session id → last task_state title sent (Zed S1).
         # Keyed on the post-``_emit`` destination so a thread sees one
         # title per child-run state change. Mirrors ``_plan_emitted``'s
@@ -4507,6 +4514,17 @@ class MiniOrkAcpAgent:
 
         Each chunk is appended to the existing ``ToolCallProgress`` stream
         for the same ``tool_call_id`` — the SDK accumulates, never replaces.
+
+        Z-following: a ``LiveEvent`` whose ``path`` is non-empty also carries
+        a single ``ToolCallLocation(path, line)`` so the editor's "follow the
+        agent" crosshair can jump straight to the file the chunk describes.
+        Absolute paths are used as-is; relative paths are resolved against
+        the session's cwd (``self._sessions[session_id]``); when no cwd is
+        known the ``locations`` field is omitted (never guessed). The last
+        ``(path, line)`` per ``(session_id, node_id)`` is remembered so a
+        steady stream of tool calls on the same file does not reopen the
+        same buffer on every chunk — only the first (or a changed) location
+        re-asserts; the text chunk still flows.
         """
         started = self._started_nodes(session_id)
         if not started:
@@ -4516,7 +4534,20 @@ class MiniOrkAcpAgent:
             records = tail.read_new()
             if not records:
                 continue
+            # Working copy of the per-(session, node) ``locations`` dedup
+            # state for THIS poll. A second event in the same poll must
+            # see the first event's just-built location when deciding
+            # whether to dedup; advancing only ``_live_locations_sent``
+            # would let a same-poll repeat through. The durable
+            # ``_live_locations_sent`` advances only for events that
+            # actually emit below — events dropped by the per-poll cap
+            # must not poison the dedup against a location that never
+            # reached the wire.
+            local_dedup: dict[tuple[str, str], tuple[str, int | None]] = dict(
+                self._live_locations_sent
+            )
             events: list[Any] = []
+            new_locations: list[tuple[str, int | None] | None] = []
             for rec in records:
                 for ev in self._final_answer_once(session_id, node_id, normalize(rec)):
                     if ev.kind == "thought":
@@ -4529,7 +4560,46 @@ class MiniOrkAcpAgent:
                                 ),
                             )
                         )
+                        new_locations.append(None)
                     else:
+                        # Z-following: attach a single
+                        # ``ToolCallLocation(path, line)`` so the editor's
+                        # "follow the agent" crosshair can jump straight
+                        # to the file the chunk describes. Absolute paths
+                        # go through; relative paths join
+                        # ``self._sessions[session_id]``; an unknown cwd
+                        # omits ``locations`` (never guessed). A repeated
+                        # ``(path, line)`` for the same (session, node)
+                        # dedups to ``None`` so Zed does not reopen the
+                        # same buffer on every chunk — the text chunk
+                        # still flows.
+                        locations: list[ToolCallLocation] | None = None
+                        new_loc: tuple[str, int | None] | None = None
+                        path = getattr(ev, "path", "")
+                        if path:
+                            cwd = self._sessions.get(session_id) or ""
+                            if os.path.isabs(path):
+                                abs_path = path
+                            elif cwd:
+                                abs_path = os.path.normpath(
+                                    os.path.join(cwd, path)
+                                )
+                            else:
+                                abs_path = ""
+                            if abs_path:
+                                line = (
+                                    ev.line
+                                    if isinstance(ev.line, int) and ev.line >= 0
+                                    else None
+                                )
+                                key = (session_id, node_id)
+                                last = local_dedup.get(key)
+                                if last is None or last != (abs_path, line):
+                                    new_loc = (abs_path, line)
+                                    locations = [ToolCallLocation(
+                                        path=abs_path, line=line
+                                    )]
+                                    local_dedup[key] = new_loc
                         events.append(
                             ToolCallProgress(
                                 session_update="tool_call_update",
@@ -4542,12 +4612,19 @@ class MiniOrkAcpAgent:
                                         ),
                                     )
                                 ],
+                                locations=locations,
                             )
                         )
+                        new_locations.append(new_loc)
             # Per-poll cap (kickoff §3): the byte offset already advanced
             # past these records, so subsequent polls keep making progress.
-            for update in events[:limit]:
+            # Only advance the durable dedup state for events actually
+            # emitted — a dropped event must not poison the dedup against
+            # a location that never reached the wire.
+            for update, new_loc in zip(events[:limit], new_locations[:limit]):
                 await self._emit(session_id, update)
+                if new_loc is not None:
+                    self._live_locations_sent[(session_id, node_id)] = new_loc
 
     def _final_answer_once(self, session_id: str, node_id: str, events: list[Any]) -> list[Any]:
         """Pass live events through, keeping a node's final ``result`` only when

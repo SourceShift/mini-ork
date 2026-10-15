@@ -32,8 +32,9 @@ in ``self._tails[session_id][node_id]`` for the lifetime of the session.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 # Live-sidecar record schema (``mini_ork.dispatch.live_stream.LiveWriter``):
 #     {"seq": int, "stream": "stdout"|"stderr"|"meta", "t": float,
@@ -62,6 +63,13 @@ _DEFAULT_MAX_BYTES = 256_000
 
 _VALID_KINDS = frozenset({"text", "thought", "tool", "tool_output", "result"})
 
+# Tool names whose `tool_use` input carries a file path / notebook path that
+# the ACP projection can surface as an ACP ``ToolCallLocation``. Other tool
+# names (Bash, Grep, ...) leave ``path == ""`` so the live event is sent
+# without a ``locations`` field — Zed's "follow the agent" only fires on
+# file-touching tool calls.
+_LOCATION_TOOL_NAMES = frozenset({"Read", "Edit", "Write", "MultiEdit", "NotebookEdit"})
+
 
 @dataclass
 class LiveEvent:
@@ -70,10 +78,21 @@ class LiveEvent:
     ``kind`` ∈ ``{"text", "thought", "tool", "tool_output"}``. ``text`` is
     already capped at ``_TEXT_CAP`` and stripped; empty texts are dropped
     before reaching this shape (see ``normalize``).
+
+    ``path`` is the file the event's tool call touched (claude ``tool_use``
+    with a file-editing name, codex ``file_change``); ``line`` is the 0-based
+    line inside that file for a claude ``Read`` with an ``offset``, else
+    ``None``. Both fields default so the dataclass stays a drop-in for every
+    existing ``LiveEvent(kind=..., text=...)`` constructor call. They carry
+    ``field(compare=False)`` so existing tests that compare events by
+    ``kind`` + ``text`` are unaffected; new tests inspect ``.path`` /
+    ``.line`` directly.
     """
 
     kind: str
     text: str
+    path: str = field(default="", compare=False)
+    line: int | None = field(default=None, compare=False)
 
 
 class LiveTail:
@@ -224,8 +243,41 @@ def _claude_assistant(envelope: dict) -> list[LiveEvent]:
                 compact = repr(payload)
             if len(compact) > _TOOL_INPUT_CAP:
                 compact = compact[:_TOOL_INPUT_CAP] + "…"
-            out.append(LiveEvent(kind="tool", text=f"{name}: {compact}"))
+            path, line = _claude_tool_use_location(name, payload)
+            out.append(LiveEvent(kind="tool", text=f"{name}: {compact}",
+                                 path=path, line=line))
     return out
+
+
+def _claude_tool_use_location(name: str, payload: Any) -> tuple[str, int | None]:
+    """Pull the file location (path, 0-based line) from a claude tool_use input.
+
+    Only file-touching tool names (``Read``, ``Edit``, ``Write``, ``MultiEdit``,
+    ``NotebookEdit``) carry a path; everything else returns ``("", None)`` so
+    the live event is emitted without a ``locations`` candidate.
+
+    For a ``Read`` with an integer ``offset`` ≥ 1, ``line`` is ``offset - 1``
+    — ACP/Zed index lines from 0, claude's ``offset`` is 1-based. A missing
+    or zero ``offset`` leaves ``line`` ``None`` so the editor opens the file
+    at its first line rather than one line before it.
+    """
+    if name not in _LOCATION_TOOL_NAMES:
+        return "", None
+    if not isinstance(payload, dict):
+        return "", None
+    if name == "NotebookEdit":
+        path = str(payload.get("notebook_path") or "")
+    else:
+        path = str(payload.get("file_path") or "")
+    line: int | None = None
+    if name == "Read":
+        offset = payload.get("offset")
+        if isinstance(offset, bool):
+            # Defensive: ``bool`` is a subclass of ``int``; treat as "no offset".
+            offset = None
+        if isinstance(offset, int) and offset >= 1:
+            line = offset - 1
+    return path, line
 
 
 def _claude_user_tool_result(envelope: dict) -> list[LiveEvent]:
@@ -297,12 +349,30 @@ def _codex_item_completed(envelope: dict) -> list[LiveEvent]:
             ]
             paths = [p for p in paths if p]
             if paths:
-                out.append(LiveEvent(kind="tool", text=f"edited {', '.join(paths)}"))
+                # Only the FIRST non-empty path is surfaced as a
+                # ``ToolCallLocation`` (the live event's ``text`` still lists
+                # every edited path). Code paths often emit several files in
+                # one ``file_change``; the agent decides which one to follow
+                # by sending the first one and the operator opening the rest.
+                out.append(
+                    LiveEvent(
+                        kind="tool",
+                        text=f"edited {', '.join(paths)}",
+                        path=paths[0],
+                    )
+                )
     return out
 
 
 def _cap_and_strip(events: list[LiveEvent]) -> list[LiveEvent]:
-    """Drop empties, strip, and cap each ``text`` at ``_TEXT_CAP``."""
+    """Drop empties, strip, and cap each ``text`` at ``_TEXT_CAP``.
+
+    Carries ``path`` and ``line`` through unchanged so a normalized event
+    that was tagged with a file location still carries it onto the ACP
+    wire — the agent's ``_drain_live_for`` keys off those fields when it
+    decides whether to attach a ``ToolCallLocation`` to the projected
+    ``ToolCallProgress``.
+    """
     out: list[LiveEvent] = []
     for ev in events:
         if ev.kind not in _VALID_KINDS:
@@ -312,7 +382,11 @@ def _cap_and_strip(events: list[LiveEvent]) -> list[LiveEvent]:
             continue
         if len(text) > _TEXT_CAP:
             text = text[:_TEXT_CAP] + "…"
-        out.append(LiveEvent(kind=ev.kind, text=text))
+        out.append(
+            LiveEvent(
+                kind=ev.kind, text=text, path=ev.path, line=ev.line
+            )
+        )
     return out
 
 
