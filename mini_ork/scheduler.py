@@ -783,6 +783,19 @@ def dispatch_epic(epic_id: str, root: str, home: str, recipe: str,
     return verdict, rc
 
 
+def _live_run_for_kickoff(con: sqlite3.Connection, epic_id: str, kickoff: str | None) -> bool:
+    """Whether a live ``task_runs`` row was launched from this epic's kickoff."""
+    patterns = [f"%/runs/scheduler/kickoffs/{epic_id}-attempt-%"]
+    rel = str(kickoff or "").strip()
+    if rel:
+        patterns.append(rel if os.path.isabs(rel) else "%/" + rel.lstrip("./"))
+    clause = " OR ".join("kickoff_path LIKE ?" for _ in patterns)
+    return con.execute(
+        "SELECT 1 FROM task_runs WHERE ended_at IS NULL "
+        "AND status NOT IN ('failed','published','rolled_back') AND (" + clause + ")",
+        patterns).fetchone() is not None
+
+
 def reclaim_stale(db: str | None = None, *, older_than_s: int | None = None) -> list[str]:
     """Return epics wedged at 'in progress' back to 'not started'.
 
@@ -797,6 +810,15 @@ def reclaim_stale(db: str | None = None, *, older_than_s: int | None = None) -> 
     a second scheduler sharing the database cannot steal work mid-flight. The
     grace window (``MO_SCHED_RECLAIM_AFTER_S``, default 900s) covers the rest: an
     epic touched more recently than that is assumed to belong to a live peer.
+
+    The run is found two ways. ``epics.last_run_id`` names it only once an
+    attempt has *finished* (``_record_attempt``), so a first attempt still in
+    flight has none — and every scheduler that started more than the grace
+    window into a peer's first attempt reclaimed that live epic (2026-10-15:
+    three cn-ui epics read 'not started' for twenty minutes mid-run). So a live
+    run whose kickoff is this epic's — ``<root>/<kickoff_path>`` under any engine
+    root, or a retry's ``runs/scheduler/kickoffs/<id>-attempt-N.md`` — also
+    owns it.
     """
     if older_than_s is None:
         older_than_s = int(os.environ.get("MO_SCHED_RECLAIM_AFTER_S", "900"))
@@ -811,17 +833,19 @@ def reclaim_stale(db: str | None = None, *, older_than_s: int | None = None) -> 
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'"
         ).fetchone())
         stale = con.execute(
-            "SELECT e.id, e.last_run_id FROM epics e "
+            "SELECT e.id, e.last_run_id, e.kickoff_path FROM epics e "
             "WHERE e.status = 'in progress' AND e.archived_at IS NULL "
             "AND e.updated_at < strftime('%Y-%m-%dT%H:%M:%fZ','now', ?)",
             (f"-{int(older_than_s)} seconds",)).fetchall()
         reclaimed = []
-        for epic_id, run_id in stale:
+        for epic_id, run_id, kickoff in stale:
             if run_id and has_runs and con.execute(
                     "SELECT 1 FROM task_runs WHERE id=? AND ended_at IS NULL "
                     "AND status NOT IN ('failed','published','rolled_back')",
                     (run_id,)).fetchone():
                 continue  # a live run still owns this epic
+            if has_runs and _live_run_for_kickoff(con, epic_id, kickoff):
+                continue  # a first attempt in flight: no last_run_id yet
             why = f" (run {run_id} not live)" if run_id else " (no run recorded)"
             cur = con.execute(
                 "UPDATE epics SET status='not started', notes=COALESCE(notes,'') || ? "

@@ -453,6 +453,54 @@ def test_the_grace_window_protects_a_freshly_touched_epic(tmp_path: Path) -> Non
     assert _status(db, "epic-fresh") == "in progress"
 
 
+def _live_epic_run(db: str, run_id: str, kickoff_path: str, *, ended: bool = False) -> None:
+    con = sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO task_runs (id, recipe, status, task_class, kickoff_path, created_at, updated_at, ended_at) "
+        "VALUES (?, 'epic-runner', ?, 'epic', ?, 0, 0, ?)",
+        (run_id, "failed" if ended else "executing", kickoff_path, 1 if ended else None))
+    con.commit()
+    con.close()
+
+
+def test_a_first_attempt_in_flight_is_not_reclaimed(tmp_path: Path) -> None:
+    """last_run_id is written when an attempt finishes, so a first attempt in
+    flight has none. Its live run is found by kickoff — under any engine root."""
+    db = _init_db(tmp_path / "reclaim-first")
+    scheduler.ensure_retry_schema(db)
+    _seed(db, "epic-first", status="in progress")
+    con = sqlite3.connect(db)
+    con.execute("UPDATE epics SET kickoff_path='kickoffs/auto/epic-first.md' WHERE id='epic-first'")
+    con.commit()
+    con.close()
+    _live_epic_run(db, "run-a", "/ps/mini-ork-worktrees/engine-tip/kickoffs/auto/epic-first.md")
+
+    assert scheduler.reclaim_stale(db, older_than_s=0) == []
+    assert _status(db, "epic-first") == "in progress"
+
+
+def test_a_retry_in_flight_is_found_by_its_carry_over_kickoff(tmp_path: Path) -> None:
+    db = _init_db(tmp_path / "reclaim-retry")
+    scheduler.ensure_retry_schema(db)
+    _seed(db, "epic-retry", status="in progress")
+    _live_epic_run(db, "run-b", "/h/.mini-ork/runs/scheduler/kickoffs/epic-retry-attempt-2.md")
+
+    assert scheduler.reclaim_stale(db, older_than_s=0) == []
+
+
+def test_an_ended_run_on_the_same_kickoff_does_not_protect_the_epic(tmp_path: Path) -> None:
+    db = _init_db(tmp_path / "reclaim-ended")
+    scheduler.ensure_retry_schema(db)
+    _seed(db, "epic-dead", status="in progress")
+    con = sqlite3.connect(db)
+    con.execute("UPDATE epics SET kickoff_path='kickoffs/auto/epic-dead.md' WHERE id='epic-dead'")
+    con.commit()
+    con.close()
+    _live_epic_run(db, "run-c", "/ps/mini-ork/kickoffs/auto/epic-dead.md", ended=True)
+
+    assert scheduler.reclaim_stale(db, older_than_s=0) == ["epic-dead"]
+
+
 def test_reclaim_is_a_no_op_on_an_empty_queue(tmp_path: Path) -> None:
     assert scheduler.reclaim_stale(_init_db(tmp_path / "reclaim-empty")) == []
 
