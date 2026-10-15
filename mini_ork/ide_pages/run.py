@@ -13,14 +13,36 @@ import os
 import re
 import socket
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from mini_ork.ide_pages import _cn as _CN
 from mini_ork.ide_pages import outcome as O
 from mini_ork.ide_pages import spec as S
+from mini_ork.ide_pages.cn_file import (
+    _SECTION_BY_FILE as _CN_FILE_BY_FILE,
+    _fetch_by_file as _cn_file_fetch_by_file,
+    _fetch_summary as _cn_file_fetch_summary,
+    _last_ts_epoch as _cn_file_last_ts_epoch,
+    _unpack_summary as _cn_file_unpack_summary,
+)
 from mini_ork.orchestration import run_buddy
+
+
+def _node_session_id(run: "Run", node: Node) -> str | None:
+    """Lazy proxy for :func:`mini_ork.ide_pages.node._resolve_session_id`.
+
+    ``node.py`` imports ``Run`` / ``Node`` from this module at top level,
+    which means a top-level ``from mini_ork.ide_pages.node import …``
+    here would close the cycle. ``node_artifacts.py`` uses the same
+    pattern (lazy import inside a function); this keeps the discipline
+    consistent across the run / node pair.
+    """
+    from mini_ork.ide_pages.node import _resolve_session_id
+    return _resolve_session_id(run, node)
 
 TABS = [("dag", "DAG"), ("kickoff", "Kickoff"), ("overview", "Overview"), ("agents", "Agents"),
         ("learnings", "Learnings"), ("artifacts", "Artifacts")]
@@ -1380,26 +1402,71 @@ def _overview_tab(run: Run, *, include_retry: bool = True) -> list[dict[str, Any
                       note="The per-run decision core at each dependency-graph wave. "
                            "It never fails a run — it only picks an action.")]
 
-    def files() -> dict[str, Any]:
+    def files() -> list[dict[str, Any]]:
         from mini_ork.cli.board_cmd import _card_fields
 
         fields = _card_fields(run.card, run.home.absolute().parent)
+        # Resolve the per-file session-history once per render. The snapshot
+        # path keeps the finished run from re-fetching CN for the line; live
+        # runs go through the section cache so a slow CN still renders the
+        # one-line state under each row rather than a blank line.
+        snapshot = _read_run_memory_snapshot(run)
+        snapshot_files: dict[str, dict[str, Any]] = {}
+        if snapshot is not None and isinstance(snapshot.get("files"), list):
+            for entry in snapshot["files"]:
+                if not isinstance(entry, dict):
+                    continue
+                p = str(entry.get("path") or "")
+                if p:
+                    snapshot_files[p] = entry
         items = []
+        file_history_items: list[dict[str, Any]] = []
         for f in fields.get("files") or []:
             acts = [S.btn("Open", S.open_path(f["abs"]), "ghost")] if f.get("abs") else []
             items.append(S.item(f["path"], f"+{f['added']} −{f['removed']}", m="±", mc="blue",
                                 is_mono=True, acts=acts))
+            history = snapshot_files.get(str(f.get("path") or ""))
+            if history is None:
+                # Live fetch (the snapshot path doesn't apply to live runs).
+                sess = _cn_sessions_for_path(str(f.get("path") or ""))
+                matches = sess.get("matches") if isinstance(sess, dict) else None
+                if isinstance(matches, list) and matches:
+                    history = {"path": str(f.get("path") or ""),
+                               "session_ids": [str(m.get("session_id")) for m in matches
+                                               if isinstance(m, dict)
+                                               and str(m.get("session_id") or "").strip()],
+                               "last_ts": max((int(m.get("last_ts") or 0)
+                                              for m in matches if isinstance(m, dict)), default=0)}
+            if history and isinstance(history, dict) and history.get("session_ids"):
+                sids = [str(s) for s in (history.get("session_ids") or []) if str(s)]
+                last_ts = int(history.get("last_ts") or 0)
+                age = S.age(last_ts, int(time.time())) if last_ts else "—"
+                open_acts = [S.btn("Open", S.page_link("cn_session", id=sid), "ghost")
+                             for sid in sids[:3]]
+                file_history_items.append(S.item(
+                    str(f.get("path") or ""),
+                    f"{len(sids)} session{'s' if len(sids) != 1 else ''} · last touch {age}",
+                    m="•", mc="sub", acts=open_acts,
+                ))
         if not items:
             items = [S.dot("No file changes recorded")]
-        note = "From the run's cached diff; the worktree is gone." if run.card.get("files_from_cache") else ""
-        return S.lst("Files changed", items, full=True, note=note)
+        sections_list = [S.lst("Files changed", items, full=True,
+                                note=("From the run's cached diff; the worktree is gone."
+                                      if run.card.get("files_from_cache") else ""))]
+        if file_history_items:
+            sections_list.append(S.lst("Files changed · session history",
+                                       file_history_items, full=True,
+                                       note="Newest-first by summary.last_ts. Open jumps to the "
+                                            "source session."))
+        return sections_list
 
     return ((S.guarded(errors, "Retry", retry_section) if include_retry else [])
             + S.guarded(errors, "Run inputs", inputs)
             + S.guarded(errors, "Why? — evidence", evidence)
             + S.guarded(errors, "Orchestrator", orchestrator)
             + S.guarded(errors, "Correlation", correlation) + S.guarded(errors, "Recent events", recent)
-            + S.guarded(errors, "Files changed", files))
+            + S.guarded(errors, "Files changed", files)
+            + _run_memory_sections(run))
 
 
 def _resolve_kickoff(run: Run) -> tuple[str, str]:
@@ -2015,6 +2082,327 @@ def _branch(run: Run) -> str:
     return str(getattr(run.workspace, "branch", "") or "")
 
 
+# ── run memory: decisions + per-file history (ContextNest) ──────────────────
+#
+# The run page surfaces two ContextNest-derived memories per node session:
+# the ``decision_made`` / ``assumption`` / ``risk_flag`` atoms from each
+# node's trajectory (labelled with the node, each opening the source
+# ``cn_session`` page) and a per-file session-history line on the
+# changed-files view. Both are fetched via
+# :mod:`mini_ork.ide_pages._cn.render_cached_section` so a slow / down
+# ContextNest still renders the established one-line state instead of a
+# blank section.
+#
+# Once the run reaches a terminal state (``published`` / ``failed`` /
+# ``rolled_back``) the page writes a small JSON snapshot to
+# ``<run_dir>/contextnest-memory.json``. The finished page then reads the
+# snapshot without re-fetching ContextNest — the snapshot's atom text and
+# session ids are stable from then on, and a finished run never re-asks
+# CN. A live page also computes the same data, but never persists it.
+
+_RUN_MEMORY_SNAPSHOT = "contextnest-memory.json"
+_DECISION_KINDS = ("decision_made", "assumption", "risk_flag")
+
+
+def _read_run_memory_snapshot(run: Run) -> dict[str, Any] | None:
+    """The run-memory snapshot for a finished run, or ``None`` when the
+    file is missing or unreadable.
+
+    Returning ``None`` is the only signal that the page must fall through
+    to a live fetch — a corrupt snapshot degrades to the same path, so
+    the section never crashes the build on a transient write race."""
+    path = run.run_dir / _RUN_MEMORY_SNAPSHOT
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_run_memory_snapshot(run: Run, payload: dict[str, Any]) -> bool:
+    """Persist the snapshot for a finished run. Returns ``True`` when the
+    file was written; never raises — a missing / read-only run dir is
+    silently ignored so the page build never crashes on a snapshot write.
+
+    Live runs do not get a snapshot: the kickoff says "once the run
+    finishes" and persisting during the run would race a slow
+    ContextNest into a stale on-disk record."""
+    if _running(run):
+        return False
+    path = run.run_dir / _RUN_MEMORY_SNAPSHOT
+    try:
+        path.write_text(json.dumps(payload, ensure_ascii=False),
+                        encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+def _atom_ts_epoch(value: Any) -> int:
+    """Newest-first sort key for a trajectory atom's ``ts`` field.
+
+    Accepts the ISO-8601 string the verified live wire shape carries, the
+    int / float epochs older payloads used, and the missing-or-malformed
+    case (``0``) so an unparseable record sinks rather than blanking the
+    list. Mirrors the existing ``cn_session._record_ts`` discipline so
+    the run page and the session page can never disagree on recency."""
+    if value is None or value == "":
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            iso = value.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(iso)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.now().astimezone().tzinfo or
+                                datetime.now().tzinfo)
+            return int(dt.timestamp())
+        except (ValueError, TypeError):
+            return 0
+    return 0
+
+
+def _fetch_trajectory_records(session_id: str) -> dict[str, Any]:
+    """``GET /api/v1/sessions/<sid>/trajectory`` → ``dict``.
+
+    Mirrors the wire contract the run page reads (the same one
+    :mod:`mini_ork.ide_pages.cn_session` uses): ``records[]`` with
+    ``kind`` / ``content`` / ``ts``. ``cn_client._get`` returns ``"{}"``
+    on a down CN so the cached-section wrapper falls through to the
+    unreachable marker — this helper never raises on a network error."""
+    from mini_ork import cn_client
+    raw = cn_client._get(f"/api/v1/sessions/{urllib.parse.quote(session_id, safe='')}/trajectory")
+    try:
+        data = json.loads(raw) if raw else {}
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _node_decision_atoms(run: Run, node: Node) -> list[dict[str, Any]]:
+    """Fetch the node's trajectory, return its ``decision_made`` /
+    ``assumption`` / ``risk_flag`` records (newest first), or ``[]``.
+
+    The trajectory cache slot lives under the run's section cache, not
+    the page-level cache, so two runs do not share an atom window.
+    Each atom carries ``kind`` / ``content`` / ``ts``; older payloads
+    used ``summary`` / ``text`` — both keys are checked so a regression
+    that flips one to the other lights up at the unit test instead of
+    dropping atoms on the run page."""
+    sid = _node_session_id(run, node)
+    if not sid:
+        return []
+    payload = _CN.render_cached_section(
+        "run-node-trajectory", f"{run.id}__{node.id}__{sid}",
+        lambda sid=sid: _fetch_trajectory_records(sid),
+    )
+    if payload.get("_unreachable") or payload.get("_disabled") or payload.get("_config_error"):
+        return []
+    records = payload.get("records")
+    if not isinstance(records, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for r in records:
+        if not isinstance(r, dict):
+            continue
+        kind = str(r.get("kind") or "").strip().lower()
+        if kind not in _DECISION_KINDS:
+            continue
+        content = ""
+        for key in ("content", "summary", "text", "title"):
+            v = r.get(key)
+            if isinstance(v, str) and v.strip():
+                content = v.strip().replace("\n", " ")[:300]
+                break
+        if not content:
+            continue
+        out.append({"kind": kind, "content": content, "ts": str(r.get("ts") or "")})
+    out.sort(key=lambda a: _atom_ts_epoch(a["ts"]), reverse=True)
+    return out
+
+
+def _cn_sessions_for_path(path: str) -> dict[str, Any]:
+    """Read ``/sessions/by-file`` plus one summary fetch per match, return
+    ``{"matches": [{"session_id", "last_ts"}, ...]}`` ordered
+    newest-first by ``summary.last_ts`` (so two pages never show
+    different recency for the same file).
+
+    Reuses :mod:`mini_ork.ide_pages.cn_file`'s wire-shape decoders and
+    the ``_SECTION_BY_FILE`` cache key — the fan-out is the same
+    cn_file._sessions runs, so a cache populated by the file page is
+    readable here and vice-versa. Returns ``{}`` on a CN outage so the
+    caller renders the established one-line state rather than a silent
+    empty list."""
+    payload = _CN.render_cached_section(
+        _CN_FILE_BY_FILE, path, lambda: _cn_file_fetch_by_file(path)
+    )
+    if payload.get("_unreachable") or payload.get("_disabled") or payload.get("_config_error"):
+        return dict(payload)
+    matches = payload.get("matches")
+    if not isinstance(matches, list) or not matches:
+        return {"matches": []}
+    enriched: list[tuple[int, str]] = []
+    for m in matches:
+        if not isinstance(m, dict):
+            continue
+        sid = str(m.get("session_id") or "").strip()
+        if not sid:
+            continue
+        sp = _CN.render_cached_section(
+            _CN_FILE_BY_FILE, f"{path}__summary__{sid}",
+            lambda sid=sid: _cn_file_fetch_summary(sid),
+        )
+        if sp.get("_unreachable") or sp.get("_disabled") or sp.get("_config_error"):
+            inner: dict[str, Any] = {}
+        else:
+            inner = _cn_file_unpack_summary(sp) if isinstance(sp, dict) else {}
+        ts = _cn_file_last_ts_epoch(inner) if isinstance(inner, dict) else 0
+        enriched.append((ts, sid))
+    enriched.sort(key=lambda t: t[0], reverse=True)
+    return {"matches": [{"session_id": sid, "last_ts": ts} for ts, sid in enriched]}
+
+
+def _collect_run_memory(run: Run) -> dict[str, Any]:
+    """Build the full run-memory payload from live ContextNest data.
+
+    Returns the same shape the snapshot file carries: ``{"decisions":
+    [{node, session_id, atoms}], "files": [{path, session_ids, last_ts}]}``.
+    Each list is omitted when no entries were found, so a run with no
+    trajectory atoms and no file changes produces a snapshot that
+    still parses but renders empty sections — the page never invents
+    data the run never had.
+    """
+    decisions: list[dict[str, Any]] = []
+    for node in run.nodes:
+        atoms = _node_decision_atoms(run, node)
+        if not atoms:
+            continue
+        sid = _node_session_id(run, node) or ""
+        decisions.append({"node": node.id, "session_id": sid, "atoms": atoms})
+
+    files_payload: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    try:
+        from mini_ork.cli.board_cmd import _card_fields
+        fields = _card_fields(run.card, run.home.absolute().parent)
+    except Exception:  # noqa: BLE001 — a missing card must not blank the memory
+        fields = {}
+    for f in fields.get("files") or []:
+        if not isinstance(f, dict):
+            continue
+        path = str(f.get("path") or "")
+        if not path or path in seen_paths:
+            continue
+        seen_paths.add(path)
+        sess = _cn_sessions_for_path(path)
+        matches = sess.get("matches") if isinstance(sess, dict) else None
+        if not matches:
+            continue
+        sids = [str(m.get("session_id")) for m in matches if isinstance(m, dict)
+                and str(m.get("session_id") or "").strip()]
+        if not sids:
+            continue
+        last_ts = 0
+        for m in matches:
+            if isinstance(m, dict):
+                try:
+                    last_ts = max(last_ts, int(m.get("last_ts") or 0))
+                except (TypeError, ValueError):
+                    continue
+        files_payload.append({"path": path, "session_ids": sids, "last_ts": last_ts})
+
+    return {"schema": "contextnest-memory/v1", "decisions": decisions,
+            "files": files_payload}
+
+
+def _decisions_assumptions_section(run: Run) -> dict[str, Any]:
+    """The "Decisions and assumptions" section.
+
+    For each node with a session id and at least one trajectory atom of
+    a :data:`_DECISION_KINDS` kind, renders one sub-row carrying the
+    node id, the atom kind, the (truncated) text, and a ``cn_session``
+    link for the source session. A finished run reads the same data
+    from the run-memory snapshot and never re-asks ContextNest; a live
+    run fetches live and writes the snapshot on the first finished
+    build.
+    """
+    snapshot = _read_run_memory_snapshot(run)
+    if snapshot is not None and "decisions" in snapshot:
+        nodes_data = snapshot.get("decisions") or []
+        error = None
+    else:
+        try:
+            payload = _collect_run_memory(run)
+            nodes_data = payload.get("decisions") or []
+            error = None
+            # The first finished build writes the snapshot; subsequent
+            # finished builds read it. Live runs skip the write so a slow
+            # CN cannot corrupt an in-flight record.
+            if not _running(run):
+                _write_run_memory_snapshot(run, payload)
+        except Exception as exc:  # noqa: BLE001 — the section must not blank the page
+            return S.lst("Decisions and assumptions",
+                        [S.dot(f"Could not read this: {type(exc).__name__}: {exc}",
+                               mc="red")], full=True,
+                        note="ContextNest fetches raised; the run page is built "
+                             "from the snapshot on a finished run.")
+    if error:
+        return S.lst("Decisions and assumptions",
+                      [S.dot(error, mc="red")], full=True)
+    if not nodes_data:
+        return S.lst("Decisions and assumptions",
+                      [S.dot("No decision atoms recorded",
+                             "Each node session is queried once; nothing came back.")],
+                      full=True)
+    items: list[dict[str, Any]] = []
+    total_atoms = 0
+    for entry in nodes_data:
+        if not isinstance(entry, dict):
+            continue
+        node = str(entry.get("node") or "?")
+        sid = str(entry.get("session_id") or "")
+        for atom in entry.get("atoms") or []:
+            if not isinstance(atom, dict):
+                continue
+            kind = str(atom.get("kind") or "")
+            label = f"{kind}: {atom.get('content') or ''}"
+            sub_bits = [f"node {node}"]
+            ts = str(atom.get("ts") or "")
+            if ts:
+                sub_bits.append(ts)
+            acts = [S.btn("Open", S.page_link("cn_session", id=sid), "ghost")] if sid else []
+            items.append(S.item(label, " · ".join(sub_bits),
+                                m="•", mc="sub", acts=acts))
+            total_atoms += 1
+    if not items:
+        return S.lst("Decisions and assumptions",
+                      [S.dot("No decision atoms recorded")], full=True)
+    note = (f"{len(nodes_data)} node session{'s' if len(nodes_data) != 1 else ''} · "
+            f"{total_atoms} atom{'s' if total_atoms != 1 else ''} · "
+            "open jumps to the source session.")
+    return S.lst("Decisions and assumptions", items, full=True, note=note)
+
+
+def _run_memory_sections(run: Run) -> list[dict[str, Any]]:
+    """The run-page sections sourced from the run-memory snapshot.
+
+    Currently: "Decisions and assumptions" only — the per-file history
+    line lives inside the existing "Files changed" section so the
+    changed-files view itself gets the recency annotation. Both read
+    from the same snapshot (or compute once and persist it) so the
+    finished-run page renders without ever asking ContextNest.
+    """
+    try:
+        return [_decisions_assumptions_section(run)]
+    except Exception as exc:  # noqa: BLE001 — additive sections must not blank the page
+        return [S.lst("Decisions and assumptions",
+                      [S.dot(f"Could not read this: {type(exc).__name__}: {exc}",
+                             mc="red")], full=True)]
+
+
 def _title_v2(run: Run) -> str:
     """The kickoff title, else the goal's first line, else the run id.
 
@@ -2256,6 +2644,12 @@ def _story_tab(run: Run, outcome: dict[str, Any]) -> list[dict[str, Any]]:
     # costs the story, never the triage / callouts / hero above it.
     from mini_ork.ide_pages import run_story
 
+    # The snapshot path keeps a finished run from re-fetching ContextNest;
+    # live runs go through the section cache and never persist the snapshot.
+    # Placed before the story so the story stays the closing section the
+    # IDE scrolls to.
+    sections.extend(S.guarded({}, "Decisions and assumptions",
+                              lambda: _run_memory_sections(run)))
     sections.extend(S.guarded({}, "What happened", lambda: run_story.story_section(run)))
     # The buddy narrates the same stages from the outside, including one that
     # died mid-stage and so never reached the story above. Empty list — no

@@ -453,6 +453,34 @@ def _resolve_log_path(run_dir: Path, node_id: str) -> Path | None:
     return None
 
 
+def _resolve_session_id(run: "Run", node: Node) -> str | None:
+    """The node's session id, extracted from the resolver path.
+
+    The resolver's five-rule walk (live envelope sids →
+    ``llm_calls.session_id`` → newest post-start ``sessions/*.jsonl`` →
+    ``~/.claude/projects/*/<sid>.jsonl`` → live sidecar) is reused
+    verbatim: this helper delegates to :func:`_resolve_session_path`
+    and pulls the session id off the basename. When the resolver fell
+    back to the live sidecar (rule 5) or to a log proxy
+    (``impl-<node>.log`` / ``verifier_<node>.log`` / ``evidence/<node>.log``),
+    no real session id exists and ``None`` is returned.
+
+    Reused by the run page's "Decisions and assumptions" section so each
+    row can carry the source session id and open ``cn_session`` for it
+    from a finished-run snapshot without re-fetching ContextNest.
+    """
+    path = _resolve_session_path(run, node)
+    if path is None:
+        return None
+    name = path.name
+    if not name.endswith(".jsonl"):
+        return None
+    # rule 5 falls back to the live sidecar; that file is not a real session.
+    if name == f"agent-{node.id}.live.jsonl":
+        return None
+    return name[:-len(".jsonl")]
+
+
 def _live(node: Node, session_path: Path | None, log_path: Path | None) -> bool:
     """``live`` = running AND transcript/log grew in the last 120 s.
 
