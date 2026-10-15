@@ -34,6 +34,22 @@ from mini_ork.ide_pages import _cn as _cn_section
 _PACK_ROWS = 30
 _PACK_SCAN = 40
 
+# Page tabs. Two legacy tabs ("active", "library") plus a new "search"
+# tab the operator reaches via the IDE sidebar. ``TABS[0][0]`` is the
+# default when the IDE asks for ``tab=None`` (the contract in :func:`S.page`).
+TABS: list[tuple[str, str]] = [("active", "Active"), ("library", "Library"),
+                               ("search", "Search")]
+
+# Cache-slot file the ``cn search`` verb writes. The Search tab reads
+# this file directly — never re-hits ContextNest on a render — so the
+# section budget stays inside the IDE's per-page budget. The directory
+# is :func:`cn_client._section_cache_dir` (``$MINI_ORK_HOME/cache/cn/``);
+# the page reaches for it via the env so the two sides agree.
+_SEARCH_SLOT_NAME = "context.search__latest.json"
+_SEARCH_MODES: tuple[str, ...] = ("memories", "sessions", "features", "files")
+_SEARCH_DEFAULT_MODE = "memories"
+_SEARCH_DEFAULT_LIMIT = 20
+
 # context-pack.json key → the kind shown in the table.
 _KINDS = {
     "task_brief": "brief",
@@ -608,10 +624,396 @@ def _cn_llm_cache_section(state: _CnState) -> dict[str, Any]:
     return S.kv("ContextNest LLM cache", items, note=note)
 
 
+# ── Search tab ──────────────────────────────────────────────────────────
+#
+# The Search tab reads the cache slot the ``cn search`` verb wrote and
+# renders rows mode-by-mode. It NEVER calls ContextNest — the verb
+# already paid for the network read and the page keeps the render path
+# inside its per-render budget. The verb's contract:
+#
+#     {mode, query, all_projects, project, ts, count, result}
+#
+# ``result`` is one of ``{hits: [...]}`` (memories, sessions),
+# ``{features: [...]}`` (features), or ``{matches: [...]}`` (files). The
+# matching tab rebuilds with ``args["mode"]`` set when the operator
+# picks a mode chip; the all-projects chip carries an explicit
+# ``args["all_projects"] = "0"|"1"`` so the render path is fully
+# deterministic and the action's CLI prefix carries the matching
+# ``--all-projects`` only when the chip is on.
+
+
+def _search_slot_path(home: Path) -> Path:
+    """The slot file ``cn search`` wrote for this home.
+
+    Resolves through :func:`cn_client._section_cache_dir` so the CLI
+    and the page land on the same file: the verb reaches into the
+    helper, the page reconstructs the path on the read side.
+    """
+    return Path(cn_client._section_cache_dir()) / _SEARCH_SLOT_NAME
+
+
+def _read_search_slot(home: Path) -> dict | None:
+    """Return the slot envelope, or ``None`` when the slot is absent /
+    unreadable / shape-mismatched.
+
+    A malformed JSON, a non-dict body, or a missing ``mode`` field all
+    surface as ``None`` so the page renders the empty state. The verb
+    is the only writer, so any of those three is operator-visible
+    noise — a failed ``cn search`` write — and the right message is
+    "no search yet", not a per-env traceback.
+    """
+    path = _search_slot_path(home)
+    if not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    if not isinstance(raw.get("mode"), str) or not raw["mode"]:
+        return None
+    return raw
+
+
+def _project_label(args: dict[str, str], home: Path) -> str:
+    """The project-scope label rendered in the chip and the section note.
+
+    The all-projects opt-in lives in ``args["all_projects"] = "1"`` (the
+    chip's ``set_args`` action); the default (chip absent / ``"0"``)
+    drops other-project rows. The page reaches for ``home.parent`` —
+    the project root the IDE built this page for — so the text agrees
+    with the verb's ``git rev-parse --show-toplevel`` on the CLI side.
+    """
+    if args.get("all_projects") == "1":
+        return "all projects"
+    parent = home.parent if isinstance(home, Path) else Path(str(home)).parent
+    try:
+        return str(parent.resolve())
+    except OSError:
+        return str(parent)
+
+
+def _mode_chip(mode: str, active: str) -> dict[str, Any]:
+    """A filter chip for one search mode.
+
+    Clicking a chip rebuilds the page with ``args["mode"]`` set; the
+    chip's ``on`` flag tracks the active mode so the operator sees
+    which one is currently driving the section.
+    """
+    return {
+        "t": mode,
+        "on": mode == active,
+        "do": S.set_args(mode=mode) if mode != active else S.set_args(),
+    }
+
+
+def _search_mode_section(args: dict[str, str], home: Path) -> dict[str, Any]:
+    """Four mode chips + an all-projects chip (explicit, off by default)."""
+    active = args.get("mode") or _SEARCH_DEFAULT_MODE
+    if active not in _SEARCH_MODES:
+        active = _SEARCH_DEFAULT_MODE
+    show_all = args.get("all_projects") == "1"
+    items = [_mode_chip(m, active) for m in _SEARCH_MODES]
+    items.append({
+        "t": "all projects",
+        "on": show_all,
+        "do": S.set_args(all_projects="0") if show_all else S.set_args(all_projects="1"),
+    })
+    return S.chips("Search mode", items, full=True,
+                   note=f"project scope: {_project_label(args, home)}")
+
+
+def _search_composer(mode: str, show_all: bool) -> dict[str, Any]:
+    """An input box that runs ``cn search <mode> <query> [--all-projects]``.
+
+    The CLI verb has no ``--home`` flag (the kickoff lists ``cn`` with
+    the homeless-verb set), so the composer carries ``home=False``:
+    the IDE leaves ``--home`` off and the verb reads ``MINI_ORK_HOME``
+    from the environment instead. The all-projects flag rides the
+    prefix when the chip is on so the typed query stays the only IDE
+    input the operator has to compose.
+    """
+    prefix = ["cn", "search", mode]
+    if show_all:
+        prefix = [*prefix, "--all-projects"]
+    return S.composer(
+        "search query — runs `mini-ork cn search <mode> <query>`",
+        prefix,
+        title="Search",
+        home=False,
+        full=True,
+        note="Type a query and press enter. The result lands in the cache slot this tab reads.",
+    )
+
+
+def _search_row_session_id(item: dict[str, Any]) -> str:
+    """Best-effort ``session_id`` from a result row — across modes.
+
+    Memories wrap it as ``h["session_id"]``; sessions-by-feature as
+    ``h["session_id"]``; matches wrap ``m["session_id"]``; features
+    carry ``f["session_id"]``. Anything that isn't a string returns
+    ``""`` so the row's open action degrades to plain text instead of
+    building a dead link to a non-existent session.
+    """
+    if not isinstance(item, dict):
+        return ""
+    sid = item.get("session_id")
+    if isinstance(sid, str) and sid:
+        return sid
+    return ""
+
+
+def _render_memory_rows(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One row per atom hit — content / similarity / session id.
+
+    A row's action opens the session page via :func:`S.page_link` —
+    no CLI action — so a render-time render does not re-trigger ``cn
+    search`` on the home tab through the row click. The plain-text
+    fallback (``sub`` only) fires when the wire payload lacks a
+    ``session_id`` so the row stays informative rather than a broken
+    link.
+    """
+    rows: list[dict[str, Any]] = []
+    for h in hits:
+        if not isinstance(h, dict):
+            continue
+        content = str(h.get("content") or "").strip().replace("\n", " ")
+        if len(content) > 200:
+            content = content[:197] + "…"
+        try:
+            sim = float(h.get("similarity") or 0.0)
+        except (TypeError, ValueError):
+            sim = 0.0
+        sid = _search_row_session_id(h)
+        sub_bits = [f"sim={sim:.2f}"]
+        if sid:
+            sub_bits.append(f"session {sid[:8]}")
+        rows.append({
+            "m": "•", "mc": "sub",
+            "t": content or "(empty hit)",
+            "tc": "text",
+            "sub": " · ".join(sub_bits),
+            "mono": False,
+            "acts": ([S.btn("Open", S.page_link("cn_session", id=sid), "ghost")]
+                     if sid else []),
+        })
+    return rows
+
+
+def _render_session_rows(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One row per session hit — feature label / file count / session id."""
+    rows: list[dict[str, Any]] = []
+    for h in hits:
+        if not isinstance(h, dict):
+            continue
+        feat = str(h.get("feature") or h.get("name") or "").strip()
+        files = h.get("files") or []
+        n_files = len(files) if isinstance(files, list) else 0
+        sid = _search_row_session_id(h)
+        sub_bits = []
+        if n_files:
+            sub_bits.append(f"{n_files} file(s)")
+        if sid:
+            sub_bits.append(f"session {sid[:8]}")
+        rows.append({
+            "m": "•", "mc": "sub",
+            "t": feat or "(session)",
+            "tc": "text",
+            "sub": " · ".join(sub_bits) or "—",
+            "mono": False,
+            "acts": ([S.btn("Open", S.page_link("cn_session", id=sid), "ghost")]
+                     if sid else []),
+        })
+    return rows
+
+
+def _render_feature_rows(features: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One row per feature — name / layer / session id / how-to-test."""
+    rows: list[dict[str, Any]] = []
+    for f in features:
+        if not isinstance(f, dict):
+            continue
+        name = str(f.get("feature") or f.get("name") or "").strip()
+        layer = str(f.get("layer") or "?").strip() or "?"
+        sid = _search_row_session_id(f)
+        how = str(f.get("how_to_test") or "").strip()
+        if len(how) > 120:
+            how = how[:117] + "…"
+        sub_bits = [f"layer={layer}"]
+        if sid:
+            sub_bits.append(f"session {sid[:8]}")
+        rows.append({
+            "m": "•", "mc": "sub",
+            "t": name or "(feature)",
+            "tc": "text",
+            "sub": " · ".join(sub_bits),
+            "mono": False,
+            "acts": ([S.btn("Open", S.page_link("cn_session", id=sid), "ghost")]
+                     if sid else []),
+        })
+        if how:
+            # how-to-test rides on the same row's ``sub`` when present,
+            # so a long test seed doesn't get its own row that the IDE
+            # can't pair back to the feature it describes.
+            rows[-1]["sub"] = (rows[-1]["sub"] + f"\n  test: {how}").strip()
+    return rows
+
+
+def _render_file_rows(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One row per matched session — matched files / total files / last_ts."""
+    rows: list[dict[str, Any]] = []
+    for m in matches:
+        if not isinstance(m, dict):
+            continue
+        sid = _search_row_session_id(m)
+        files = m.get("matched_files") or m.get("files") or []
+        if not isinstance(files, list):
+            files = []
+        total = m.get("total_files")
+        last_ts = m.get("last_ts")
+        sub_bits = []
+        if files:
+            shown = ", ".join(str(x) for x in files[:3] if isinstance(x, str))
+            if len(files) > 3:
+                shown += f" (+{len(files) - 3})"
+            sub_bits.append(f"{len(files)} file(s): {shown}")
+        if isinstance(total, int):
+            sub_bits.append(f"of {total} touched")
+        if isinstance(last_ts, (int, float)) and last_ts:
+            sub_bits.append(time.strftime("%Y-%m-%d %H:%M",
+                                          time.localtime(int(last_ts))))
+        if sid:
+            sub_bits.append(f"session {sid[:8]}")
+        rows.append({
+            "m": "•", "mc": "sub",
+            "t": (files[0] if isinstance(files[0], str) else "(matches)")
+                 if files else f"session {sid[:8]}" if sid else "(matches)",
+            "tc": "text",
+            "sub": " · ".join(sub_bits) or "—",
+            "mono": True,
+            "acts": ([S.btn("Open", S.page_link("cn_session", id=sid), "ghost")]
+                     if sid else []),
+        })
+    return rows
+
+
+def _render_search_results(envelope: dict | None,
+                           requested_mode: str) -> dict[str, Any]:
+    """Render the result rows from the slot envelope.
+
+    The page drops the rows when the slot's mode doesn't match the
+    chip the operator has selected — switching modes after the search
+    is the realistic workflow, and rendering foreign rows would imply
+    a re-fetch the page never performed. ``ts`` is rendered as the
+    "as of HH:MM" label so a stale slot is visible without a
+    cache-section wrapper (the verb replaces, never refreshes on
+    read).
+    """
+    if not envelope:
+        return S.lst("Results", [
+            S.dot("No search yet — type a query above and press enter")
+        ], full=True)
+
+    if envelope.get("mode") != requested_mode:
+        # The mode chip moved off the slot's mode. The right behaviour
+        # is an empty state with an explicit message (not silent
+        # rendering) so the operator knows the rows they're about to
+        # type against do not match the chip.
+        other = envelope.get("mode") or "?"
+        return S.lst("Results", [
+            S.dot("Stale slot",
+                  f"last search ran in {other!r} mode; "
+                  f"type a new query to refresh"),
+        ], full=True)
+
+    mode = envelope.get("mode")
+    result = envelope.get("result") if isinstance(envelope.get("result"), dict) else {}
+    if mode == "memories":
+        items = result.get("hits") or []
+        rows = _render_memory_rows(items)
+        title_t = "Memories"
+    elif mode == "sessions":
+        items = result.get("hits") or []
+        rows = _render_session_rows(items)
+        title_t = "Sessions"
+    elif mode == "features":
+        items = result.get("features") or []
+        rows = _render_feature_rows(items)
+        title_t = "Features"
+    elif mode == "files":
+        items = result.get("matches") or []
+        rows = _render_file_rows(items)
+        title_t = "Files"
+    else:
+        rows = []
+        title_t = "Results"
+
+    count = int(envelope.get("count") or len(rows))
+    note_parts = [f"{count} row(s)"]
+    ts = envelope.get("ts")
+    if isinstance(ts, (int, float)) and ts:
+        note_parts.append(f"as of {time.strftime('%H:%M', time.localtime(int(ts)))}")
+    proj = envelope.get("project")
+    if proj and not envelope.get("all_projects"):
+        note_parts.append(f"project={proj}")
+    elif envelope.get("all_projects"):
+        note_parts.append("scope=all projects")
+    if not rows:
+        rows = [S.dot("No rows for this query", "—")]
+        return S.lst(title_t, rows, full=True, note=" · ".join(note_parts))
+    return S.lst(title_t, rows, full=True, note=" · ".join(note_parts))
+
+
+def _build_search_tab(home: Path, args: dict[str, str]) -> dict[str, Any]:
+    """The Search tab. NO ContextNest HTTP calls.
+
+    Reads the cache slot directly, builds a mode chip + all-projects
+    chip + composer, and renders the matched rows. The chip +
+    composer round-trip is the user's interaction model: pick a mode,
+    (un)tick all-projects, type a query. The verb does the rest.
+    """
+    requested_mode = args.get("mode") or _SEARCH_DEFAULT_MODE
+    if requested_mode not in _SEARCH_MODES:
+        requested_mode = _SEARCH_DEFAULT_MODE
+    show_all = args.get("all_projects") == "1"
+    envelope = _read_search_slot(home)
+
+    errors: dict[str, str] = {}
+    sections: list[dict[str, Any]] = []
+    sections += S.guarded(errors, "Search mode",
+                          lambda: _search_mode_section(args, home))
+    sections += S.guarded(errors, "Search",
+                          lambda: _search_composer(requested_mode, show_all))
+    sections += S.guarded(errors, "Results",
+                          lambda: _render_search_results(envelope, requested_mode))
+
+    return S.page(
+        "context", "Context (ContextNest)",
+        "Search ContextNest — type a query, run cn search, read the rows.",
+        chips_=[S.chip(f"mode={requested_mode}",
+                       "blue" if envelope else "sub"),
+                S.chip("all projects" if show_all else "this project",
+                       "yellow" if show_all else "green")],
+        actions=[],
+        tabs=TABS, tab="search", args=args,
+        sections=sections, errors=errors,
+    )
+
+
 # ── main entry point ────────────────────────────────────────────────────
 
 def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
-    del tab
+    # The Search tab never calls ContextNest — it reads the cache slot
+    # the CLI verb wrote. The render-path budget stays inside the IDE's
+    # per-render budget and ``test_cn_ui_context_page.py`` (which
+    # asserts the page only hits the five recorded live endpoints)
+    # keeps passing for the default tab.
+    if tab == "search":
+        return _build_search_tab(home, args)
+    # Legacy tabs ("active", "library", None) all render the default
+    # view; the IDE treats them as equivalents so adding new tabs is
+    # backwards-compatible.
     # The ping action must force a fresh probe, not the cached one —
     # CN_PING_TTL=0 is the env-side knob cn_client honours; the page
     # contributes only the contract.
@@ -635,8 +1037,15 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     sections += S.guarded(errors, "Context pack", lambda: _context_pack(home))
     sections += S.guarded(errors, "Context reuse (local)", lambda: _local_reuse_section(home))
     sections += S.guarded(errors, "ContextNest LLM cache", lambda: _cn_llm_cache_section(state))
+    # ``tab`` is meaningful now: we ship a TABS tuple so the IDE
+    # renders the search tab. Falls back to the first tab when the
+    # operator picks something we don't know (legacy callers from
+    # before this revision sent ``tab="active"`` or ``tab="library"``
+    # and never any other value).
+    active_tab = tab if tab in {k for k, _ in TABS} else TABS[0][0]
     return S.page("context", "Context (ContextNest)",
                   "What each agent is given to read, with the cite tag that put it there.",
                   chips_=[chip],
                   actions=[S.btn("Ping", S.set_args(ping=str(int(time.time()))), "ghost")],
+                  tabs=TABS, tab=active_tab,
                   args=args, sections=sections, errors=errors)
