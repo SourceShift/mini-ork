@@ -1222,6 +1222,8 @@ def _isolate_run(target, home, run_id, kickoff, source):
     # from ``cli/approvals_cmd.py``.
     from mini_ork import workspaces
 
+    # The lifecycle passes MINI_ORK_HOME as a str; workspaces joins with ``/``.
+    home = Path(home)
     if workspaces.load(home, run_id) is not None:
         return True, None
     name = workspaces.task_name(Path(kickoff).stem, run_id)

@@ -199,6 +199,27 @@ def test_rwm_mode_duck_typed_policy_is_accepted():
 # ── _isolate_run ───────────────────────────────────────────────────────────
 
 
+def test_rwm_isolate_accepts_str_home_and_target(tmp_path):
+    """The lifecycle hands ``_isolate_run`` MINI_ORK_HOME and the target as
+    plain strings (``os.environ``); a Path-only call path crashed every real
+    ``run --workspace worktree`` with ``str / str`` (live smoke 2026-10-15)."""
+    project = _init_repo(tmp_path)
+    home = _init_home(tmp_path)
+    kickoff = tmp_path / "kickoff.md"
+    kickoff.write_text("hello\n", encoding="utf-8")
+
+    ok, ws = cli_main._isolate_run(
+        str(project), str(home), "run-1700-strhome", str(kickoff), "policy")
+
+    assert ok is True
+    assert ws is not None
+    assert ws_mod.load(home, "run-1700-strhome") is not None
+    # A second call with str args sees the record and mints nothing new.
+    ok2, ws2 = cli_main._isolate_run(
+        str(project), str(home), "run-1700-strhome", str(kickoff), "policy")
+    assert ok2 is True and ws2 is None
+
+
 def test_rwm_isolate_mints_worktree_on_tmp_git_repo(tmp_path, capsys):
     """A fresh tmp repo + worktree-mode isolation mints a worktree.
 
