@@ -399,7 +399,8 @@ def test_compiler_rejects_negative_max_rounds(tmp_path):
 def test_real_recipes_compile_and_expose_retry_edges():
     for recipe, sources in (
         ("code-fix", {"typecheck", "test", "reviewer"}),
-        ("framework-edit", {"static_check_verifier", "test_verifier", "reviewer"}),
+        ("framework-edit", {"static_check_verifier", "test_verifier",
+                            "kickoff_contract_verifier", "reviewer"}),
     ):
         cw = compile_workflow(str(REPO / "recipes" / recipe / "workflow.yaml"))
         assert set(cw.retry_edges) == sources

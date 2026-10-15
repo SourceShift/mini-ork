@@ -102,8 +102,8 @@ def _no_meta_node_leakage():
 
 
 _check("no_meta_node_leakage", "derived workflow contains no meta-recipe node names", _no_meta_node_leakage)
-_check("exact_nine_nodes", "workflow has exactly 9 nodes",
-       lambda: len(_workflow().get("nodes") or []) == 9)
+_check("exact_ten_nodes", "workflow has exactly 10 nodes",
+       lambda: len(_workflow().get("nodes") or []) == 10)
 
 
 def _heterogeneity_floor():
@@ -131,6 +131,7 @@ def _lane_bindings_verbatim():
         "implementer": "codex_lens",
         "static_check_verifier": "verifier",
         "test_verifier": "verifier",
+        "kickoff_contract_verifier": "verifier",
         "reviewer": "opus_lens",
         "publisher": "publisher",
         "rollback": "rollback",
