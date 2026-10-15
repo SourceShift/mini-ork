@@ -115,6 +115,17 @@ SDE-1 and SDE-2 touch disjoint files and run in parallel.
   fix epic linked to the run; `waiting_on_fix`) then `sde-3b` (model diagnoser
   for `unclassified`, outcome labels, LTT bar). 3a waits on the operator's
   `should_escalate`.
+- **SDE-3a merged** (2026-10-15; policy `e76c13ab`, pass 1 + one repair). The
+  policy was written on the operator's delegation: hard stops non-engine →
+  fix-epic breaker → failed signature → daily cap; rule diagnoses escalate;
+  model diagnoses need 0.85 until 30 labels, then the calibrated bar, and an
+  uncertifiable bar refuses. Replay over 50 failed runs: exactly one escalates
+  (`run-1791914481-48337`). The repair made a `waiting_on_fix` run inert to
+  later sweeps (pass 1 let a sweep overwrite it with a give-up).
+- **VG-1 merged** (`a7caba16`): framework-edit's `kickoff_contract_verifier`
+  runs ```` ```measure ```` blocks from the pre-run snapshot and enforces the
+  kickoff's Required artifacts — the verifier gap that let SDE-1/2 pass 1 ship
+  untested. Next verifier gap: F3, blind spec tests on a second lane.
 
 ## Two tiers
 
