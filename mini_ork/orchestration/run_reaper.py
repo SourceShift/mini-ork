@@ -158,10 +158,6 @@ def close_run_record(db_path: str | Path, run_id: str, run_dir: Path, *,
     """
     if not run_id or (run_dir / ".cost-pause").exists():
         return None
-    if (run_dir / ".review-pause").exists():
-        # Human-review-paused: ``reviewing`` stays — ``mini-ork approvals`` is
-        # the next move. ``release_pid_file`` still runs in the caller.
-        return None
     if _has_unanswered_ask(run_dir):
         return None
     now = int(time.time()) if now is None else now
@@ -170,6 +166,13 @@ def close_run_record(db_path: str | Path, run_id: str, run_dir: Path, *,
         con.execute("PRAGMA busy_timeout = 15000")
         row = con.execute("SELECT status FROM task_runs WHERE id = ?", (run_id,)).fetchone()
         if row is None or row[0] in TERMINAL:
+            return None
+        # Human-review-paused: the executor parked it and set ``reviewing``;
+        # ``mini-ork approvals`` is the next move, so the status stays. The
+        # sentinel alone is not enough: a run resumed past the gate (e.g. a
+        # hand-run ``recover``) can still carry a stale ``.review-pause``,
+        # and exempting it then would strand the run as ``executing``.
+        if row[0] == "reviewing" and (run_dir / ".review-pause").exists():
             return None
         # A deadline exit returns 0 before verify runs: its verdict is unverified.
         if not crashed and rc == 0 and _verdict_passed(run_dir) and not (run_dir / ".deadline-hit").exists():
