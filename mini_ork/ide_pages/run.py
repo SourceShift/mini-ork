@@ -531,6 +531,130 @@ def _actions(run: Run) -> list[dict[str, Any]]:
     return acts
 
 
+# r-ide-review: the park / merge-review sections are additive — a page that
+# is not parked and not gated by ``before_merge=required`` gets no extra
+# section at all. Every helper absorbs its own failures (missing table, DB,
+# worktree) so the page build cannot raise on the way past them.
+
+
+def _is_parked_run(run: Run) -> bool:
+    """A run paused for human review (status ``reviewing`` + ``.review-pause``).
+
+    Mirrors the convention in ``cli.executors_handlers.park_reviewing_run``:
+    both the run-card status and the dotfile have to point at the same state
+    before we ask the operator to act. Either missing means the run is doing
+    something else, even if the other signal alone fired.
+    """
+    status = str(run.card.get("status") or "")
+    pause = (run.run_dir / ".review-pause").is_file()
+    return status == "reviewing" and pause
+
+
+def _parked_review_section(run: Run) -> list[dict[str, Any]]:
+    """The "Waiting for your review" callout for a parked run, or ``[]``.
+
+    Lists the awaiting nodes (the same rows ``mini-ork approvals list``
+    reports) and surfaces the Approve / Request-changes buttons for the
+    first awaiting node. A run parked with no inbox rows still gets the
+    callout — the operator has to know the run stopped for a human reason,
+    even when the node-review table does not say which node that was.
+    """
+    if not _is_parked_run(run):
+        return []
+    awaiting = _pending_node_ids(run)
+    if awaiting:
+        first = awaiting[0]
+        actions = [
+            S.btn("Approve",
+                  S.cli("approvals", "approve", run.id, "--node", first,
+                        confirm=(f"Approve {first}'s output and resume the run?"),
+                        home=False),
+                  "primary"),
+            S.btn("Request changes…",
+                  S.thread(f"/request-changes {run.id} {first} "),
+                  "default"),
+        ]
+        text = (f"Paused for human review of: "
+                f"{', '.join(awaiting)}.")
+    else:
+        actions = []
+        text = ("The run is paused for a human review. "
+                "Open its node pages to approve or request changes.")
+    return [S.callout(
+        "Waiting for your review", text,
+        tone="yellow", icon="✋", full=True, actions=actions,
+        note="Approve a node to resume, or request changes with a note.")]
+
+
+def _pending_node_ids(run: Run) -> list[str]:
+    """The distinct ``node_id`` values awaiting review for this run.
+
+    Reads the same DB the CLI ``approvals list`` reads — ``mo_inbox_gates``,
+    via ``node_review.pending_for_run`` — so the section never disagrees
+    with ``mini-ork approvals show <run>``. Errors fall through to ``[]``
+    so a missing / unreadable DB never blanks the callout.
+    """
+    try:
+        db_path = str(run.home / "state.db")
+        if not Path(db_path).is_file():
+            return []
+        from mini_ork.gates import node_review
+        rows = node_review.pending_for_run(run.id, db_path=db_path)
+    except Exception:  # noqa: BLE001 — pending review is optional
+        return []
+    out: list[str] = []
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        ctx = r.get("context") if isinstance(r.get("context"), dict) else {}
+        nid = str(ctx.get("node_id") or "").strip()
+        if nid and nid not in out:
+            out.append(nid)
+    return out
+
+
+def _merge_review_section(run: Run) -> list[dict[str, Any]]:
+    """The "Merge review" chip for a run whose policy requires human approval.
+
+    Reads ``review_policy.load_policy`` (the same source the executor uses)
+    and only fires when ``before_merge == "required"``. The state and the
+    approver come from ``merge_approval.status``. After
+    ``merge_approval.approve(...)`` the section still shows, just without
+    the Approve button — the operator can still see who cleared the merge.
+    """
+    if run.workspace is None:
+        return []
+    try:
+        from mini_ork.gates.review_policy import load_policy
+        policy = load_policy(home=run.home)
+    except Exception:  # noqa: BLE001 — a missing policy is not an error
+        return []
+    if str(getattr(policy, "before_merge", "off")) != "required":
+        return []
+    try:
+        from mini_ork.gates import merge_approval
+        st = merge_approval.status(run.id, db_path=str(run.home / "state.db"))
+    except Exception:  # noqa: BLE001 — a missing inbox row is "none"
+        st = {"state": "none", "head_sha": "", "approver": "", "inbox_id": None}
+    state = str(st.get("state") or "none")
+    approver = str(st.get("approver") or "")
+    if state == "approved":
+        items = [S.ok(f"approved by {approver}" if approver else "approved",
+                      "the merge can land")]
+        return [S.lst("Merge review", items, full=True,
+                      note="Human approval is on file for this run's merge.")]
+    label = "awaiting your approval" if state == "none" else f"state: {state}"
+    items = [S.warn("Merge review", label)]
+    return [S.lst("Merge review", items, full=True,
+                  note="A human must approve the merge before this run lands.",
+                  actions=[S.btn(
+                      "Approve merge",
+                      S.cli("approvals", "approve", run.id,
+                            confirm=f"Approve merging {run.id} into the base branch?",
+                            home=False),
+                      "primary")])]
+
+
 # ── node output ─────────────────────────────────────────────────────────────
 
 def _tail(path: Path, n: int) -> list[str]:
@@ -2213,6 +2337,11 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     run = _load(home, run_id)
     if run is None:
         return {"ok": False, "key": "run", "error": f"no run {run_id}"}
+    # The dock view has its own minimal panels (right-dock contract);
+    # compute the r-ide-review sections only when we're staying on the run
+    # tab. Doing it above the dock early-return means building two DB reads
+    # (parked review, merge review) for every dock render — an effort the
+    # dock doesn't use.
     if S.ide_level() >= 2 and (args.get("view") or "") == "dock":
         # The right dock panel: one column, its own tab bar. Imported here
         # (not at module top) — ``run_dock`` imports this module, so a
@@ -2229,9 +2358,18 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
         page["graph"] = _graph(run, args.get("node"))
         _attach_flow(page, run)
         return page
+    # r-ide-review: top-of-page review sections. Built once, returned (often
+    # empty) here, then prepended to whichever ``sections`` the tab picks.
+    review_sections = _parked_review_section(run) + _merge_review_section(run)
     if S.ide_level() >= 2:
         page = _build_v2(run, tab, args)
         _attach_flow(page, run)
+        # Additive on the story / graph / kickoff / agents / learnings /
+        # artifacts tabs at level 2: prepend the review sections so they
+        # own the top slot an empty ``Waiting for your review`` callout
+        # already reserved on every parked run.
+        if review_sections and isinstance(page.get("sections"), list):
+            page["sections"] = review_sections + page["sections"]
         return page
     tab = tab if tab in {k for k, _ in TABS} else "dag"
     done = sum(1 for n in run.nodes if n.state == "done")
@@ -2250,7 +2388,7 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     }[tab]()
     page = S.page("run", run.id, _sub(run), chips_=chips, actions=_actions(run), tabs=TABS,
                   tab=tab, args={"run": run.id, **({"node": args["node"]} if args.get("node") else {})},
-                  sections=sections, desc=_desc_fold(run, None, run.id))
+                  sections=review_sections + sections, desc=_desc_fold(run, None, run.id))
     # Additive at every level: the graph is available to an old IDE too.
     page["graph"] = _graph(run, args.get("node"))
     return page

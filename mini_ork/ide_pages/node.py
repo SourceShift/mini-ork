@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -607,10 +608,118 @@ def _actions(node: Node, run: "Run") -> list[dict[str, Any]]:
                         confirm=f"Kill {run.id}? SIGTERM, then SIGKILL after 2 s."),
                   "danger"),
         ]
+    # r-ide-review: finished nodes may carry review actions — a Restore button
+    # when this node left a checkpoint ref behind, and Approve / Request
+    # changes… buttons when its output is awaiting a human. ``Open run
+    # folder`` is always last: the kickoff says add, not replace — a finished
+    # node with neither review nor ckpt still shows it (the only button),
+    # but a finished node WITH one of the two also keeps it.
+    acts: list[dict[str, Any]] = []
+    if _has_ckpt_ref(run, node.id):
+        acts.append(S.btn(
+            "Restore to after this node",
+            S.cli("board", "restore", run.id, node.id,
+                  confirm=(f"Restore this run's worktree to its state right after "
+                          f"{node.id}? A safety checkpoint is taken first, so you "
+                          f"can undo it.")),
+            "warn"))
+    pending_node_ctx = _pending_review_for_node(run, node.id)
+    if pending_node_ctx is not None:
+        acts.append(S.btn(
+            "Approve",
+            S.cli("approvals", "approve", run.id, "--node", node.id,
+                  confirm=(f"Approve {node.id}'s output and resume the run?"),
+                  home=False),
+            "primary"))
+        acts.append(S.btn(
+            "Request changes…",
+            S.thread(f"/request-changes {run.id} {node.id} "),
+            "default"))
     # Kickoff fix #4: reveal path comes from the loaded Run's run_dir,
     # which already honours --home. Building a path from env/cwd here
     # ignores --home (CLAUDE.md: home is the path contract).
-    return [S.btn("Open run folder", S.reveal(str(run.run_dir)), "ghost")]
+    acts.append(S.btn("Open run folder", S.reveal(str(run.run_dir)), "ghost"))
+    return acts
+
+
+def _has_ckpt_ref(run: "Run", node_id: str) -> bool:
+    """True when ``refs/mini-ork/ckpt/<run>/<node>`` resolves in the run's tree.
+
+    The kickoff restricts this to a single ``git show-ref`` inside a try/except
+    so a missing ref — or no worktree at all — drops the Restore button, never
+    fails the page. The worktree resolves through ``workspaces.load`` first
+    (the live ``wt/<slug>`` tree); on failure we fall back to the run roots
+    target the executor recorded.
+    """
+    target = _ckpt_target(run)
+    if not target:
+        return False
+    ref = f"refs/mini-ork/ckpt/{run.id}/{node_id}"
+    try:
+        proc = subprocess.run(
+            ["git", "-C", target, "show-ref", "--verify", "--quiet", ref],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+def _ckpt_target(run: "Run") -> str:
+    """Best-effort worktree path the ckpt ref can be probed against.
+
+    Workspaces first (this is what ``board restore`` would itself look at);
+    fall back to the executor-recorded run roots target so a runs without a
+    tracked workspace still lets the kickoff's "else the run roots target"
+    arm resolve. Empty string on every failure, so callers exit cleanly when
+    there is no tree to look at (e.g. a run whose dispatcher never opened a
+    worktree).
+    """
+    ws = getattr(run, "workspace", None)
+    if ws is not None:
+        try:
+            wp = getattr(ws, "path", None)
+            if wp:
+                return str(wp)
+        except Exception:  # noqa: BLE001 — a broken workspace drop is not an error
+            pass
+    try:
+        from mini_ork.runtime.run_roots import load_run_roots
+        roots = load_run_roots(str(run.run_dir))
+        if roots is not None:
+            target = getattr(roots, "target", "") or ""
+            if target:
+                return target
+    except Exception:  # noqa: BLE001 — best-effort; the run roots loader may not exist
+        pass
+    return ""
+
+
+def _pending_review_for_node(run: "Run", node_id: str) -> dict[str, Any] | None:
+    """The pending ``node:<run>:<node_id>`` review row for this exact node, or ``None``.
+
+    Walks ``node_review.pending_for_run`` with the run's home DB and matches
+    on ``context.node_id``. The widest net the function can cast is
+    ``pending_for_run`` — same source ``mini-ork approvals list --json``
+    reads — so the inbox and the node page never disagree on which rows are
+    awaiting review. Any DB / table / context error drops the buttons
+    silently; the node page must still render.
+    """
+    try:
+        db_path = str(run.home / "state.db")
+        if not Path(db_path).is_file():
+            return None
+        from mini_ork.gates import node_review
+        rows = node_review.pending_for_run(run.id, db_path=db_path)
+    except Exception:  # noqa: BLE001 — pending review is optional display content
+        return None
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        ctx = r.get("context") if isinstance(r.get("context"), dict) else {}
+        if str(ctx.get("node_id") or "") == node_id:
+            return ctx
+    return None
 
 
 # ── transcript parsing ──────────────────────────────────────────────────────

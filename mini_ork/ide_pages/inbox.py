@@ -179,6 +179,160 @@ def _compact_item(row: Any, now: int) -> dict[str, Any]:
                        _dismiss_button(row.run_id)])
 
 
+# r-ide-review: "Awaiting review" — the human-approval inbox rows surfaced
+# on the page the operator sees first thing. Rows come from the same
+# ``pending`` read the CLI ``mini-ork approvals list`` runs — no subprocess,
+# no second source of truth — so the inbox can never disagree with what the
+# CLI would print. A missing DB / table / context drops the section silently.
+
+
+def _awaiting_review_rows(home: Path) -> list[dict[str, Any]]:
+    """Decode pending node / merge rows into the shape ``_awaiting_review_section`` draws.
+
+    Two families — and ONLY these two — surface here:
+
+    * ``node:<run>:<node>`` rows from ``review.after_node`` (a finished node
+      whose output is awaiting human review).
+    * ``merge:<run>`` rows from ``review.before_merge`` (a run whose merge is
+      blocked on approval).
+
+    The "awaiting-workspace" rows (open worktrees under a ``required`` merge
+    policy that have not yet been enqueued) are deliberately omitted: the CLI
+    walks that path via ``approvals_cmd._cmd_list``, but to know whether a
+    workspace still needs approval it must call ``workspaces.content_sha`` —
+    a ``git write-tree`` per open workspace, every page build. The kickoff
+    forbids subprocesses on page builds other than the one ``git show-ref``
+    on the node page; the inbox must stay strictly in-process. The CLI's
+    listing and the IDE listing can disagree here; the kickoff accepts that.
+
+    Returns ``[]`` on every failure (the inbox page must never raise here).
+    """
+    out: list[dict[str, Any]] = []
+    try:
+        db_path = str(Path(home) / "state.db")
+        if not Path(db_path).is_file():
+            return out
+        from mini_ork.gates.oversight_inbox import pending as pending_gates
+        try:
+            rows = pending_gates(db_path=db_path) or []
+        except Exception:  # noqa: BLE001 — pending() may self-bootstrap / fail
+            rows = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            gate_id = str(r.get("gate_id") or "")
+            feature = str(r.get("feature") or "")
+            ctx = r.get("context") if isinstance(r.get("context"), dict) else {}
+            row_age = _age_seconds(r.get("enqueued_at"))
+            enqueued_at = r.get("enqueued_at")
+            if gate_id.startswith("node:") and feature == "review.after_node":
+                run_id = str(ctx.get("run_id") or _gate_run_id(gate_id) or "")
+                node_id = str(ctx.get("node_id") or "")
+                if not run_id or not node_id:
+                    continue
+                out.append({
+                    "kind": "node", "run": run_id, "node": node_id,
+                    "node_type": str(ctx.get("node_type") or ""),
+                    "enqueued_at": _to_float(enqueued_at),
+                    "age_text": _age_str(row_age),
+                })
+            elif gate_id.startswith("merge:") and feature == "review.before_merge":
+                run_id = str(ctx.get("run_id") or _gate_run_id(gate_id) or "")
+                if not run_id:
+                    continue
+                out.append({
+                    "kind": "merge", "run": run_id, "node": "",
+                    "node_type": "",
+                    "enqueued_at": _to_float(enqueued_at),
+                    "age_text": _age_str(row_age),
+                })
+    except Exception:  # noqa: BLE001 — every failure path omits the section
+        return []
+    return out
+
+
+def _gate_run_id(gate_id: str) -> str:
+    """Second ``:``-segment of ``node:run:node:created_at`` / ``merge:run[:head]``."""
+    parts = gate_id.split(":", 2)
+    return parts[1] if len(parts) >= 2 else ""
+
+
+def _age_seconds(value: Any) -> int:
+    try:
+        return max(0, int(float(value or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _to_float(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _age_str(seconds: int) -> str:
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86400:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86400}d ago"
+
+
+def _awaiting_review_section(home: Path, now: int) -> list[dict[str, Any]]:
+    """``[callout]`` listing rows awaiting approval, or ``[]`` when empty.
+
+    The kickoff says the section is shown only when non-empty: an inbox with
+    nothing pending leaves no trace on the page. Per-row actions: Approve
+    for every row, Request changes… for node rows. Clicking the row opens
+    the run.
+    """
+    rows = _awaiting_review_rows(home)
+    if not rows:
+        return []
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        kind_label = "merge" if row["kind"] == "merge" else "node"
+        run_id = row["run"]
+        sub_bits = [kind_label]
+        if row["kind"] == "node":
+            sub_bits.append(row["node"] or "node")
+        if row["age_text"]:
+            sub_bits.append(row["age_text"])
+        sub = " · ".join(b for b in sub_bits if b)
+        actions: list[dict[str, Any]] = []
+        if row["kind"] == "node" and row["node"]:
+            actions.append(S.btn(
+                "Approve",
+                S.cli("approvals", "approve", run_id, "--node", row["node"],
+                      confirm=(f"Approve {row['node']}'s output and resume the run?"),
+                      home=False),
+                "primary"))
+            actions.append(S.btn(
+                "Request changes…",
+                S.thread(f"/request-changes {run_id} {row['node']} "),
+                "default"))
+        else:
+            actions.append(S.btn(
+                "Approve",
+                S.cli("approvals", "approve", run_id,
+                      confirm=f"Approve merging {run_id} into the base branch?",
+                      home=False),
+                "primary"))
+        items.append(S.dot(
+            f"{kind_label} · {row['node']}" if row["kind"] == "node"
+            else f"merge · {run_id}",
+            sub,
+            acts=[S.btn("Open run", S.open_run(run_id, run_id), "ghost"), *actions],
+        ))
+    return [S.lst(
+        "Awaiting review", items, full=True,
+        note="The same rows `mini-ork approvals list --json` reports. "
+             "Click a row to open the run, or approve / request changes inline.")]
+
+
 def _inbox(home: Path, now: int, errors: dict[str, str], ctx: dict[str, Any],
            show_all: bool) -> list[dict[str, Any]]:
     cutoff = now - _WINDOW_DAYS * 86400
@@ -373,8 +527,9 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     show_all = str(args.get("show") or "").strip().lower() in ("all", "1", "true", "yes")
     errors: dict[str, str] = {}
     ctx: dict[str, Any] = {}
-    sections = S.guarded(errors, "Inbox",
-                         lambda: _inbox(home, now, errors, ctx, show_all))
+    sections = _awaiting_review_section(home, now) + S.guarded(
+        errors, "Inbox",
+        lambda: _inbox(home, now, errors, ctx, show_all))
     chips = [S.chip(f"✋ needs you {ctx.get('needs_you', 0)}", "yellow"),
              S.chip(f"✗ failed {ctx.get('failed', 0)}", "red")]
     if ctx.get("questions"):
