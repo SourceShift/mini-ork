@@ -1,0 +1,41 @@
+# ContextNest client config (committed default).
+#
+# Copy to $MINI_ORK_HOME/config/contextnest.yaml to override locally. The
+# resolution order is: env > $MINI_ORK_HOME/config/contextnest.yaml > THIS
+# file. Every key has a sensible default — the file is here to make the
+# defaults visible and to give the operator one place to flip the tier.
+#
+#   mini-ork cn status    # show what the engine actually resolved
+
+# Tier: simple (no auth) | secure (bearer token).
+#   simple   — the default. No Authorization header; fails soft when CN is down.
+#   secure   — sends `Authorization: Bearer <token>` on every request. The
+#              token is resolved from $MINI_ORK_HOME/config/secrets.local.sh
+#              under the name `token_key` (default CN_TOKEN). A missing key
+#              raises SecretStoreError naming the key (fail closed).
+#              There is NO silent fall-back from secure to simple.
+tier: simple
+
+# Base URL for the ContextNest server. Overridden by CN_BASE_URL.
+base_url: http://127.0.0.1:28080
+
+# Secure-tier: the name of the secret-store key that holds the bearer token.
+# Overridden by CN_TOKEN_KEY. The engine reads the value from
+# $MINI_ORK_HOME/config/secrets.local.sh (the same file provider credentials
+# use — see config/secrets.example.sh).
+token_key: CN_TOKEN
+
+# Short timeout for the availability ping. Independent of the read timeout
+# so a slow CN reports down (and the page renders the one-line not-running
+# message) rather than blocking on the read budget. Overridden by
+# CN_PING_TIMEOUT_SEC.
+timeout_ping_s: 1.0
+
+# Read timeout for everything else (retrieve, sessions/by-file, graph, …).
+# Overridden by CN_TIMEOUT_SEC.
+timeout_read_s: 8.0
+
+# Section-cache TTL in seconds. The IDE page reads a JSON cache slot when
+# the live call fails (timeout / connection refused / non-dict response) so
+# a brief outage does not blank the page. Overridden by CN_CACHE_TTL_SEC.
+cache_ttl_s: 300

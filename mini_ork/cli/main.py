@@ -93,6 +93,7 @@ _NATIVE_MODULE_SUBS = {
     "collapse-check": "mini_ork.cli.collapse",
     "collapse-precursor": "mini_ork.cli.collapse_precursor",
     "automations": "mini_ork.cli.automations_cmd",
+    "cn": "mini_ork.cli.cn_cmd",
     "board": "mini_ork.cli.board_cmd",
     "gate-fuzz": "mini_ork.cli.gate_fuzz",
     "memory-lifecycle": "mini_ork.cli.memory_lifecycle",
@@ -165,6 +166,7 @@ Coordination:
   automations <sub>              Manage per-project scheduled recipe runs
                                    (list|add|remove|pause|resume|run|tick|
                                    scheduler status|install|uninstall)
+  cn status                      ContextNest tier, endpoint, reachability, latency
 
 Provider credentials:
   providers status <lane>                    Safely show configured or missing credentials

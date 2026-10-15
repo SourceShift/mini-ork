@@ -6,8 +6,22 @@ write memories (only fire-and-forget event/outcome posts), cite-tag every atom.
 The render_* functions are transcribed verbatim from the bash's embedded python
 so their markdown output byte-matches.
 
-Env: CN_BASE_URL, CN_TIMEOUT_SEC (8), CN_HOOK_TIMEOUT_SEC (3), CN_PING_TTL (30),
-MO_DISABLE_CN (1 → reads return {} / "", posts no-op).
+Two-tier configuration (``config/contextnest.yaml`` or
+``config/contextnest.example.yaml``):
+
+* ``simple``  — no auth header; the default. Tries CN; if it's down, fails soft.
+* ``secure``  — requires a bearer token resolved from the operator's secret
+  store (``mini_ork.dispatch.secrets.read_secret_exports``). A missing token
+  fails CLOSED: ``SecretStoreError`` names the key, the request is never sent,
+  and there is no silent fall-back to the simple tier.
+
+Env (highest precedence, beats both config files): CN_BASE_URL, MO_DISABLE_CN,
+CN_TIMEOUT_SEC, CN_HOOK_TIMEOUT_SEC, CN_PING_TTL, CN_PING_TIMEOUT_SEC,
+CN_TOKEN_KEY, CN_TIER.
+
+Wire contract: the ``/api/v1/tools/retrieve`` POST body uses ``top_k`` (the
+server's name); the Python parameter stays ``limit`` so existing callers do
+not change.
 """
 from __future__ import annotations
 
@@ -18,18 +32,109 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
+
+# ── tier / config loading (env > $MINI_ORK_HOME/config/contextnest.yaml >
+# config/contextnest.example.yaml) ──────────────────────────────────────────
+
+_DEFAULTS: dict = {
+    "tier": "simple",
+    "base_url": "http://127.0.0.1:28080",
+    "token_key": "CN_TOKEN",
+    "timeout_ping_s": 1.0,
+    "timeout_read_s": 8.0,
+    "cache_ttl_s": 300,
+}
+_VALID_TIERS = ("simple", "secure")
+
+
+def _home_dir() -> Path:
+    """The project home (where ``config/contextnest.yaml`` lives)."""
+    return Path(os.environ.get("MINI_ORK_HOME") or ".mini-ork")
+
+
+def _config_path() -> Path | None:
+    """The real local override, or ``None`` when only the example exists."""
+    return _home_dir() / "config" / "contextnest.yaml"
+
+
+def _example_path() -> Path:
+    """The committed default, walking up from the engine to ``config/``."""
+    here = Path(__file__).resolve().parent
+    # mini_ork/cn_client.py -> mini_ork/ -> <repo>/config/
+    for p in (here.parent / "config" / "contextnest.example.yaml",
+              here.parent.parent / "config" / "contextnest.example.yaml"):
+        if p.is_file():
+            return p
+    return here.parent.parent / "config" / "contextnest.example.yaml"
+
+
+def _load_yaml(path: Path) -> dict:
+    """One YAML document, or ``{}`` on absence / parse error (fail soft on
+    the config file — never on a missing key, which is what the secure tier
+    raises from)."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        import yaml  # type: ignore[import-untyped]
+        doc = yaml.safe_load(text)
+    except Exception:
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def _tier_config(*, _env: dict | None = None) -> dict:
+    """Resolve the tier config in env > real > example order.
+
+    ``_env`` is a test seam so unit tests can fake the environment without
+    mutating ``os.environ``."""
+    env = _env if _env is not None else dict(os.environ)
+
+    cfg = dict(_DEFAULTS)
+    real = _config_path()
+    if real is not None and real.is_file():
+        cfg.update(_load_yaml(real))
+    else:
+        cfg.update(_load_yaml(_example_path()))
+
+    # env beats file
+    if "CN_BASE_URL" in env:
+        cfg["base_url"] = env["CN_BASE_URL"]
+    if "CN_TOKEN_KEY" in env:
+        cfg["token_key"] = env["CN_TOKEN_KEY"]
+    if "CN_TIER" in env:
+        cfg["tier"] = env["CN_TIER"]
+    if "CN_PING_TIMEOUT_SEC" in env:
+        cfg["timeout_ping_s"] = float(env["CN_PING_TIMEOUT_SEC"])
+    if "CN_TIMEOUT_SEC" in env:
+        cfg["timeout_read_s"] = float(env["CN_TIMEOUT_SEC"])
+    if "CN_CACHE_TTL_SEC" in env:
+        cfg["cache_ttl_s"] = int(env["CN_CACHE_TTL_SEC"])
+
+    if cfg.get("tier") not in _VALID_TIERS:
+        cfg["tier"] = "simple"
+    return cfg
 
 
 def _base() -> str:
-    return os.environ.get("CN_BASE_URL", "http://127.0.0.1:28080")
+    return _tier_config()["base_url"]
 
 
 def _timeout() -> float:
-    return float(os.environ.get("CN_TIMEOUT_SEC", "8"))
+    return _tier_config()["timeout_read_s"]
 
 
 def _hook_timeout() -> float:
     return float(os.environ.get("CN_HOOK_TIMEOUT_SEC", "3"))
+
+
+def _ping_timeout() -> float:
+    """The availability probe has its OWN short timeout — independent of the
+    read timeout, so a slow CN is reported as down rather than blocking the
+    page render with the read timeout."""
+    return _tier_config()["timeout_ping_s"]
 
 
 def _ping_ttl() -> int:
@@ -38,6 +143,49 @@ def _ping_ttl() -> int:
 
 def _disabled() -> bool:
     return os.environ.get("MO_DISABLE_CN", "0") == "1"
+
+
+def _tier() -> str:
+    return _tier_config()["tier"]
+
+
+def _token_key() -> str:
+    return _tier_config()["token_key"]
+
+
+def _cache_ttl_s() -> int:
+    return int(_tier_config()["cache_ttl_s"])
+
+
+def _auth_headers() -> dict:
+    """Build the request headers; secure tier adds ``Authorization: Bearer …``.
+
+    The token is resolved lazily (every call), so a token that the operator
+    adds to the secret store after the engine starts is picked up on the next
+    request without restarting. A missing key in secure mode raises
+    ``SecretStoreError`` naming the key (NEVER the value), which the page
+    helpers render as a hard, key-naming error — never a silent fall-back to
+    the simple tier."""
+    headers: dict = {}
+    if _tier() != "secure":
+        return headers
+    # Import here so the simple tier never touches the secret store (and a
+    # missing secret store on a laptop does not break simple-tier users).
+    from mini_ork.dispatch.secrets import read_secret_exports, secret_store_path
+    key = _token_key()
+    if not key:
+        from mini_ork.dispatch.secrets import SecretStoreError
+        raise SecretStoreError(
+            "secure tier requires CN_TOKEN_KEY (or token_key in contextnest.yaml)"
+        )
+    exports = read_secret_exports(secret_store_path())
+    if key not in exports or not exports[key]:
+        from mini_ork.dispatch.secrets import SecretStoreError
+        raise SecretStoreError(
+            f"secret store is missing required key {key!r} for the secure CN tier"
+        )
+    headers["Authorization"] = f"Bearer {exports[key]}"
+    return headers
 
 
 def _ping_cache_file() -> str:
@@ -49,27 +197,54 @@ def _ping_cache_file() -> str:
     return os.path.join(d, "cn_ping.cache")
 
 
-def _get_text(path: str) -> str:
+def _section_cache_dir() -> str:
+    """Per-(section, scope) JSON files, one cache slot each.
+
+    The directory is created on demand; cache misses are silent. A separate
+    directory from the ping cache keeps a one-off render from clobbering the
+    short-lived ping state."""
+    d = os.path.join(os.environ.get("MINI_ORK_HOME", ".mini-ork"), "cache", "cn")
     try:
-        with urllib.request.urlopen(_base() + path, timeout=_timeout()) as r:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
+def _section_cache_path(section: str, scope: str) -> str:
+    safe = urllib.parse.quote(scope or "_root", safe="")
+    return os.path.join(_section_cache_dir(), f"{section}__{safe}.json")
+
+
+def _get_text(path: str, *, timeout: float | None = None) -> str:
+    try:
+        with urllib.request.urlopen(_base() + path, timeout=timeout if timeout is not None else _timeout()) as r:
             return r.read().decode("utf-8", "replace")
     except Exception:
         return ""
 
 
-def _get(path: str) -> str:
+def _get(path: str, *, timeout: float | None = None) -> str:
     try:
-        with urllib.request.urlopen(_base() + path, timeout=_timeout()) as r:
+        with urllib.request.urlopen(_base() + path, timeout=timeout if timeout is not None else _timeout()) as r:
             return r.read().decode("utf-8", "replace")
     except Exception:
         return "{}"
 
 
-def _post_json(path: str, body: str) -> str:
+def _post_json(path: str, body: str, *, timeout: float | None = None) -> str:
+    headers = {"Content-Type": "application/json"}
+    try:
+        headers.update(_auth_headers())
+    except Exception:
+        # A missing-key error from the secure tier must not be swallowed by
+        # the page helpers — they consult the raised ``SecretStoreError`` to
+        # surface the key. The read paths below all catch it explicitly.
+        raise
     try:
         req = urllib.request.Request(_base() + path, data=body.encode("utf-8"),
-                                     headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=_timeout()) as r:
+                                     headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout if timeout is not None else _timeout()) as r:
             return r.read().decode("utf-8", "replace")
     except Exception:
         return "{}"
@@ -89,9 +264,12 @@ def available() -> bool:
         except Exception:
             pass
     code = "000"
+    # The availability probe uses the short ping timeout, NOT the read
+    # timeout — a slow CN must report down so the page renders the one-line
+    # not-running message instead of blocking on the read budget.
     try:
         req = urllib.request.Request(_base() + "/api/v1/substrate/health")
-        with urllib.request.urlopen(req, timeout=_timeout()) as r:
+        with urllib.request.urlopen(req, timeout=_ping_timeout()) as r:
             code = str(r.status)
     except Exception:
         code = "000"
@@ -118,9 +296,19 @@ def capsule(query: str = "", since: str = "14d", project: str = "") -> str:
 
 
 def retrieve(query: str, limit: int = 8) -> str:
+    """POST /api/v1/tools/retrieve.
+
+    The wire body uses ``top_k`` (the server reads that key — see
+    ``src/api/tools.rs``). The Python parameter is kept as ``limit`` so every
+    existing call site and test continues to work unchanged. A secure-tier
+    request attaches the bearer token via ``_auth_headers``; if the token
+    key is missing from the secret store, the ``_post_json`` call raises
+    ``SecretStoreError`` (fail closed — never a silent simple-tier fallback).
+    """
     if _disabled() or not available():
         return "{}"
-    return _post_json("/api/v1/tools/retrieve", json.dumps({"query": query, "limit": int(limit)}))
+    return _post_json("/api/v1/tools/retrieve",
+                      json.dumps({"query": query, "top_k": int(limit)}))
 
 
 def sessions_by_file(path: str) -> str:
@@ -184,6 +372,201 @@ def inbox_filtered(urgency: str = "", limit: int = 10) -> str:
     if urgency:
         q += f"&urgency={urgency}"
     return _get(f"/api/v1/inbox?{q}")
+
+
+# ── section cache (one JSON file per (section, scope), short TTL) ───────────
+#
+# The IDE page calls into CN many times per render. The section cache is the
+# "rendering still works while CN is slow or briefly down" mechanism: a
+# successful render writes its payload + as_of timestamp; a render that hits
+# a timeout, a connection error, or a missing-token error reads the cached
+# payload and renders the "as of HH:MM" line. The TTL is short (default 5
+# minutes) so an operator who fixes the server sees fresh data on the next
+# page refresh without waiting out a long cache.
+
+
+def _read_section_cache(section: str, scope: str) -> tuple[dict | None, int]:
+    """Return ``(payload, age_seconds)`` for a cache slot, or ``(None, 0)``
+    when the slot is absent or unreadable. ``age_seconds`` is the wall-clock
+    age of the slot when readable, else ``0`` so the caller treats the slot
+    as a fresh cache miss and does NOT render an as-of label."""
+    path = _section_cache_path(section, scope)
+    if not os.path.isfile(path):
+        return None, 0
+    try:
+        raw = json.loads(open(path, encoding="utf-8").read())
+    except (OSError, ValueError):
+        return None, 0
+    if not isinstance(raw, dict):
+        return None, 0
+    ts = int(raw.get("_as_of", 0) or 0)
+    if not ts:
+        return None, 0
+    return raw, int(time.time()) - ts
+
+
+def _write_section_cache(section: str, scope: str, payload: dict) -> None:
+    """Persist one cache slot. Failures are silent — the cache is best-effort
+    graceful degradation, never a critical path."""
+    path = _section_cache_path(section, scope)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def cached_section(section: str, scope: str, fetch: callable) -> dict:
+    """Run ``fetch()`` with graceful degradation.
+
+    * ``fetch()`` returns a dict → write the cache slot, return the payload.
+    * ``fetch()`` raises ``SecretStoreError`` (secure-tier misconfig) → the
+      error is surfaced verbatim with the KEY name; cache is NOT consulted
+      (a config error must be loud, not papered over with stale data).
+    * ``fetch()`` raises anything else, or returns a non-dict / empty dict →
+      fall back to the cached slot if it is younger than the TTL; if no
+      cache or the cache is older, return ``{"_unreachable": True}`` so the
+      page renders the one-line "ContextNest is not running" message.
+
+    A successful call ALWAYS refreshes the cache, so the operator never sees
+    a TTL-stale value on a healthy read.
+    """
+    if _disabled():
+        return {"_disabled": True}
+    try:
+        payload = fetch()
+    except Exception as exc:  # noqa: BLE001 — see the two clauses above
+        from mini_ork.dispatch.secrets import SecretStoreError
+        if isinstance(exc, SecretStoreError):
+            # Re-raise with the key name; the page renders this as a hard
+            # config error, never as a silent simple-tier fallback.
+            raise
+        payload, age = _read_section_cache(section, scope)
+        if payload is not None and age < _cache_ttl_s():
+            return dict(payload, _from_cache=True, _age_seconds=age)
+        return {"_unreachable": True}
+    if not isinstance(payload, dict) or not payload:
+        cached, age = _read_section_cache(section, scope)
+        if cached is not None and age < _cache_ttl_s():
+            return dict(cached, _from_cache=True, _age_seconds=age)
+        return {"_unreachable": True}
+    out = dict(payload)
+    out["_as_of"] = int(time.time())
+    out["_from_cache"] = False
+    _write_section_cache(section, scope, out)
+    return out
+
+
+# ── scoping helpers (project path filter, run-id extraction, recent sessions) ──
+
+
+def _coerce_path(value) -> str:
+    """A value is a project path when it is a non-empty string that looks
+    like a path — starts with ``/`` (absolute) or contains a path separator.
+    ``None``, ints, booleans, empty strings, single tokens, and bare names
+    without separators are NOT project paths and must be dropped by the
+    project filter."""
+    if not isinstance(value, str):
+        return ""
+    s = value.strip()
+    if not s:
+        return ""
+    if s.startswith("/") or "/" in s or "\\" in s:
+        return s
+    return ""
+
+
+def filter_by_project_path(items, project_path: str) -> list:
+    """Drop items that carry no path inside ``project_path``.
+
+    ``items`` is an iterable of dicts. An item is kept when any of the
+    string fields (``path``, ``file``, ``cwd``, ``project_cwd``, ``uri``)
+    starts with ``project_path`` (``project_path`` is normalised so a
+    trailing slash does not silently reject ``/ps/mini-ork/foo`` when the
+    caller asked for ``/ps/mini-ork``).
+
+    Items without any recognisable path field are dropped — the run-id
+    extraction then has nothing to misread, and a foreign project leak is
+    impossible by construction.
+    """
+    if not project_path:
+        return list(items) if items else []
+    norm = project_path.rstrip("/")
+    keys = ("path", "file", "cwd", "project_cwd", "uri")
+    out: list = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        for k in keys:
+            v = item.get(k)
+            if isinstance(v, str) and v.startswith(norm + "/"):
+                out.append(item)
+                break
+    return out
+
+
+_RUN_ID_KEYS = ("run_id", "run", "task_run_id", "trace_id")
+
+
+def extract_run_id(item) -> str:
+    """Best-effort run-id from an item, or ``""`` when no field matches.
+
+    Only the canonical ``run-<digits>-<short>`` shape is accepted; anything
+    that does not byte-match is rejected so the rest of the page does not
+    build a hyperlink to a non-existent run.
+    """
+    if not isinstance(item, dict):
+        return ""
+    import re as _re
+    pattern = _re.compile(r"^run-\d{6,}-[A-Za-z0-9]{4,}$")
+    for k in _RUN_ID_KEYS:
+        v = item.get(k)
+        if isinstance(v, str) and pattern.match(v):
+            return v
+    # ``id`` last — too noisy to be a primary lookup, but some payloads put
+    # the run id there too. Same shape rule applies.
+    v = item.get("id")
+    if isinstance(v, str) and pattern.match(v):
+        return v
+    return ""
+
+
+def sessions_by_file_recent(path: str, project_path: str = "",
+                            limit: int = 5) -> list:
+    """Recent sessions for ``path``, scoped to ``project_path`` when set.
+
+    The raw payload is sorted newest-first by ``last_seen`` (falling back to
+    ``started_at`` / ``created_at``), the project filter is applied, and at
+    most ``limit`` items are returned as plain dicts. The string the
+    underlying HTTP call returns is parsed defensively: a non-JSON or empty
+    payload is treated as "no data", not as an error — the caller's
+    ``cached_section`` already arbitrates between the live read and the
+    cache slot."""
+    if not path or _disabled() or not available():
+        return []
+    raw = _get(f"/api/v1/sessions/by-file?path={_enc(path)}")
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return []
+    items = []
+    if isinstance(data, dict):
+        items = data.get("items") or data.get("sessions") or []
+    elif isinstance(data, list):
+        items = data
+    if project_path:
+        items = filter_by_project_path(items, project_path)
+
+    def _key(it):
+        for k in ("last_seen", "started_at", "created_at", "ts"):
+            v = it.get(k) if isinstance(it, dict) else None
+            if isinstance(v, (int, float)):
+                return -float(v)
+        return 0
+
+    items = sorted([it for it in items if isinstance(it, dict)],
+                   key=_key)
+    return items[: int(limit)]
 
 
 def _fire(path: str, body: str) -> None:
