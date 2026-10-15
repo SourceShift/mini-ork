@@ -15,11 +15,21 @@ not listed.
 
 A row that cannot be read costs its own row only (``spec.guarded``), never the
 page.
+
+The "From agent sessions" section is fed by ContextNest's per-urgency
+``/api/v1/inbox`` queries (now/soon/later) plus ``/api/v1/sessions/attention``
+for the "why" line. Items are scoped both server-side (``project=``) and
+client-side (``metadata.project_cwd`` must equal the project root — the same
+fail-closed rule ``lanes.py`` applies to atoms). The section degrades to the
+one-line ``_cn.section_status`` state when CN is down / disabled /
+config-errored, so the existing inbox renders unchanged in those paths.
 """
 from __future__ import annotations
 
 import json
+import re as _re
 import time
+import urllib.parse as _url
 from pathlib import Path
 from typing import Any
 
@@ -522,6 +532,332 @@ def _inbox(home: Path, now: int, errors: dict[str, str], ctx: dict[str, Any],
     return sections
 
 
+# ── ContextNest: "From agent sessions" (Inbox rank 1) ─────────────────────
+#
+# The kickoff (rank 1 — "Which sessions are blocked on me, and on which run?")
+# asks the Inbox page to surface ContextNest's per-urgency asks
+# (``/api/v1/inbox?urgency=now|soon|later&project=``) plus the per-session
+# ``why`` (``/api/v1/sessions/attention?project=``), bucketed now → soon →
+# later and capped at 30 rows total. Items are scoped to this project both
+# server-side (project=) and client-side (``metadata.project_cwd`` must equal
+# the project root — the same fail-closed rule ``lanes.py`` applies to atoms).
+# Each row opens the source session and, when the ask names a run id, opens
+# the run too. A chip on the page shows the "now" count, and the section
+# degrades to the one-line ``_cn.section_status`` state when CN is down /
+# disabled / config-errored, so the existing inbox renders unchanged in those
+# paths. Resolving an item is out of scope until ContextNest adds a resolve
+# route; no fake resolve button is wired.
+
+_URGENCY_ORDER = ("now", "soon", "later")
+_AGENT_SECTION_LIMIT = 30
+# Bounded word-boundary search: ``run-`` is preceded by a non-word character
+# (or text start), the digits are any run, and the trailing token is a
+# ``[A-Za-z0-9]`` followed by ``[A-Za-z0-9-]*`` — so ``run-123-456`` matches
+# (3 digits, 3 alnum) but ``runa-123-456`` does not, and a bare ``run-``
+# without a tail does not either. Bare substring matching would hyperlink
+# non-run text; the ``cn_client.extract_run_id`` anchored regex would miss
+# the acceptance's ``run-123-456`` fixture.
+_RUN_ID_RE = _re.compile(r"\brun-\d+-[A-Za-z0-9][A-Za-z0-9-]*")
+
+
+def _read_inbox_urgency(project: str, urgency: str) -> dict:
+    """Read ``/api/v1/inbox?urgency=<u>&project=<p>`` and return the parsed body.
+
+    A failed read (``_get`` returns ``"{}"``) returns ``{}`` so the
+    surrounding ``cached_section`` slot treats it as unreachable — the same
+    contract ``_read_atoms`` in ``lanes.py`` follows. A non-dict JSON body
+    (server typo) becomes ``{}`` for the same reason.
+    """
+    from mini_ork import cn_client
+    path = (
+        f"/api/v1/inbox?urgency={_url.quote(urgency)}"
+        f"&project={_url.quote(project)}&limit=30"
+    )
+    body = cn_client._get(path)
+    if not body:
+        return {}
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _read_sessions_attention(project: str) -> dict:
+    """Read ``/api/v1/sessions/attention?project=<p>`` and return the parsed body.
+
+    Same fail-soft contract as :func:`_read_inbox_urgency` so a single CN
+    outage degrades both reads to the same one-line state on the page.
+    """
+    from mini_ork import cn_client
+    path = f"/api/v1/sessions/attention?project={_url.quote(project)}"
+    body = cn_client._get(path)
+    if not body:
+        return {}
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _item_project_cwd(item: Any) -> str:
+    """The project root an inbox item claims, or ``""`` when the item has none.
+
+    Items carry the cwd under ``metadata.project_cwd``; older payloads use a
+    top-level ``project_cwd`` or ``cwd``. Only a non-empty string is treated
+    as a claim — anything else is rejected so the page can never leak a
+    foreign-project item through a missing field.
+    """
+    if not isinstance(item, dict):
+        return ""
+    for key in ("project_cwd", "cwd"):
+        v = item.get(key)
+        if isinstance(v, str) and v:
+            return v
+    meta = item.get("metadata")
+    if isinstance(meta, dict):
+        v = meta.get("project_cwd")
+        if isinstance(v, str) and v:
+            return v
+    return ""
+
+
+def _filter_sessions(sessions: Any, project: str) -> list:
+    """Drop attention sessions whose ``project_cwd`` is not the project root.
+
+    Same fail-closed defence as the inbox-item filter: server-side
+    ``project=`` is one layer, the client-side equality check is the
+    second. A nested checkout (``/ps/mini-ork/child``) is not equal to the
+    project root and is dropped.
+    """
+    if not project:
+        return []
+    out: list = []
+    for s in sessions or []:
+        if not isinstance(s, dict):
+            continue
+        v = s.get("project_cwd")
+        if isinstance(v, str) and v == project:
+            out.append(s)
+    return out
+
+
+def _attention_lookup(sessions: list) -> dict[str, dict]:
+    """Map ``session_id`` → attention record, so a row can render the "why" line."""
+    out: dict[str, dict] = {}
+    for s in sessions:
+        sid = str(s.get("session_id") or "")
+        if sid:
+            out[sid] = s
+    return out
+
+
+def _ask_text(item: dict) -> str:
+    """The ask itself, preferring the live ``content`` / ``subject`` / ``action`` fields."""
+    if not isinstance(item, dict):
+        return ""
+    for key in ("content", "subject", "action", "text", "body"):
+        v = item.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def _ask_session_id(item: dict) -> str:
+    """The session id, preferring ``session_id`` then the bare ``id`` field."""
+    if not isinstance(item, dict):
+        return ""
+    for key in ("session_id", "id"):
+        v = item.get(key)
+        if isinstance(v, str) and v:
+            return v
+    return ""
+
+
+def _attention_why(attention: dict) -> str:
+    """A short "why this needs you" line for the row sub cell.
+
+    The attention record carries ``attention_count`` and a ``by_kind`` map;
+    the shortest honest summary is the count plus the most-common kind.
+    Empty / malformed input renders ``""`` so the row's sub cell stays clean.
+    """
+    if not isinstance(attention, dict):
+        return ""
+    count = int(attention.get("attention_count") or 0)
+    by_kind = attention.get("by_kind") if isinstance(attention.get("by_kind"), dict) else {}
+    if not count and not by_kind:
+        return ""
+    if not by_kind:
+        return f"{count} pending" if count else ""
+    top = max(by_kind.items(), key=lambda kv: int(kv[1] or 0))
+    return f"{count} pending · {top[0]}"
+
+
+def _extract_run_id(text: str) -> str:
+    """A bounded word-boundary search for ``run-<digits>-<alnum>…`` in text.
+
+    The acceptance fixture ``run-123-456`` is looser than
+    :func:`mini_ork.cn_client.extract_run_id`'s ``run-\\d{6,}-[A-Za-z0-9]{4,}``
+    anchor, so the page needs its own bounded search. The leading ``run-``
+    is preceded by a non-word character (or text start) and the trailing
+    token is bounded by ``[A-Za-z0-9][A-Za-z0-9-]*`` — bare substring
+    matching would hyperlink non-run text.
+    """
+    if not text:
+        return ""
+    m = _RUN_ID_RE.search(text)
+    return m.group(0) if m else ""
+
+
+def _row_actions(ask_text: str, session_id: str) -> list[dict[str, Any]]:
+    """The buttons for one ask row: open the session, and the run when named."""
+    acts: list[dict[str, Any]] = []
+    if session_id:
+        acts.append(S.btn("Open session",
+                          S.page_link("cn_session", id=session_id), "ghost"))
+    run_id = _extract_run_id(ask_text)
+    if run_id:
+        acts.append(S.btn("Open run", S.open_run(run_id, run_id), "ghost"))
+    return acts
+
+
+def _build_bucketed_rows(items: list, sessions: list,
+                         project: str) -> tuple[list[dict[str, Any]], int]:
+    """Bucket items by urgency, drop foreign-project ones, cap at 30 rows total.
+
+    Returns ``(rows, overflow)`` where ``rows`` is the rendered slice and
+    ``overflow`` is the count of items dropped by the cap (carried in the
+    section note the way ``inbox.py``'s "N more…" rows do). The cap is
+    COMBINED across the three buckets — ``now`` fills first, then ``soon``,
+    then ``later`` — so a 25-now + 5-soon render carries a now-count of 25.
+    """
+    bucket_map: dict[str, list[dict]] = {u: [] for u in _URGENCY_ORDER}
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        if _item_project_cwd(it) != project:
+            continue
+        bucket = str(it.get("urgency") or "")
+        if bucket not in bucket_map:
+            continue
+        bucket_map[bucket].append(it)
+
+    by_sid = _attention_lookup(sessions)
+    rows: list[dict[str, Any]] = []
+    for urgency in _URGENCY_ORDER:
+        for it in bucket_map[urgency]:
+            ask = _ask_text(it)
+            sid = _ask_session_id(it)
+            why = _attention_why(by_sid.get(sid, {}))
+            label = ask or why or "(empty ask)"
+            sub_bits = [urgency]
+            if why:
+                sub_bits.append(why)
+            rows.append({
+                "urgency": urgency,
+                "text": label,
+                "sub": " · ".join(sub_bits),
+                "ask_text": ask,
+                "session_id": sid,
+            })
+    overflow = 0
+    if len(rows) > _AGENT_SECTION_LIMIT:
+        overflow = len(rows) - _AGENT_SECTION_LIMIT
+        rows = rows[:_AGENT_SECTION_LIMIT]
+    return rows, overflow
+
+
+def _agent_sessions_section(home: Path) -> tuple[list[dict[str, Any]], int]:
+    """The "From agent sessions" section + the "now" chip count.
+
+    Returns ``(sections, now_count)``. ``now_count`` is the number of "now"
+    items in the rendered 30-row slice — used by :func:`build` to add the
+    page chip ONLY on a healthy read with at least one now item, so a
+    degraded render adds no chip and the existing inbox kanban tests
+    (which do not stub CN) see no new chip.
+
+    Never raises: a render-time bug falls back to the one-line state so the
+    existing inbox renders unchanged.
+    """
+    from mini_ork.ide_pages import _cn
+    try:
+        project = str(home.parent.resolve()) if home else ""
+        if not project:
+            return [], 0
+        payloads: dict[str, dict] = {}
+        for urgency in _URGENCY_ORDER:
+            payloads[urgency] = _cn.render_cached_section(
+                "inbox-needs-you", f"{urgency}:{project}",
+                lambda u=urgency: _read_inbox_urgency(project, u),
+            )
+        payloads["attention"] = _cn.render_cached_section(
+            "sessions-attention", f"attention:{project}",
+            lambda: _read_sessions_attention(project),
+        )
+        # Degraded state from any of the four reads: the one-line state, with
+        # no chip and no bucket rows. The existing inbox renders unchanged.
+        for payload in payloads.values():
+            if not isinstance(payload, dict):
+                continue
+            if (payload.get("_disabled") or payload.get("_unreachable")
+                    or payload.get("_config_error")):
+                return [S.lst("From agent sessions",
+                              [_cn.section_status(payload)], full=True)], 0
+        # Healthy read: stamp the bucket on each item and collect.
+        items: list = []
+        for urgency in _URGENCY_ORDER:
+            for it in (payloads[urgency].get("items") or []):
+                if not isinstance(it, dict):
+                    continue
+                if _item_project_cwd(it) != project:
+                    continue
+                stamped = dict(it)
+                stamped["urgency"] = urgency
+                items.append(stamped)
+        sessions: list = []
+        if isinstance(payloads["attention"], dict):
+            sessions = _filter_sessions(
+                payloads["attention"].get("sessions") or [], project)
+        rows, overflow = _build_bucketed_rows(items, sessions, project)
+        if not rows:
+            return [S.lst("From agent sessions",
+                          [S.dot("No asks recorded",
+                                 "ContextNest returned no inbox or attention "
+                                 "rows for this project")],
+                          full=True,
+                          note="ContextNest asks · bucketed by urgency · "
+                               "scoped to this project")], 0
+        now_count = sum(1 for r in rows if r["urgency"] == "now")
+        sections: list[dict[str, Any]] = []
+        for urgency in _URGENCY_ORDER:
+            bucket_rows = [r for r in rows if r["urgency"] == urgency]
+            if not bucket_rows:
+                continue
+            items_list = [
+                S.dot(r["text"], r["sub"],
+                      acts=_row_actions(r["ask_text"], r["session_id"]))
+                for r in bucket_rows
+            ]
+            sections.append(S.lst(
+                f"From agent sessions · {urgency}", items_list, full=True))
+        if overflow:
+            sections.append(S.lst(
+                "More",
+                [S.dot(f"{overflow} more…",
+                       "Older asks beyond the 30-row cap; resolve them "
+                       "in ContextNest")],
+                full=True))
+        return sections, now_count
+    except Exception:
+        # Defensive: a render-time bug must NEVER blank the page. A
+        # one-line dot section stands in so the operator can still see
+        # the rest of the inbox unchanged.
+        return [S.lst("From agent sessions",
+                      [S.dot("Could not read this", "agent sessions read failed")],
+                      full=True)], 0
+
+
 def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     now = int(time.time())
     show_all = str(args.get("show") or "").strip().lower() in ("all", "1", "true", "yes")
@@ -530,6 +866,8 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     sections = _awaiting_review_section(home, now) + S.guarded(
         errors, "Inbox",
         lambda: _inbox(home, now, errors, ctx, show_all))
+    agent_sections, agent_now = _agent_sessions_section(home)
+    sections = sections + agent_sections
     chips = [S.chip(f"✋ needs you {ctx.get('needs_you', 0)}", "yellow"),
              S.chip(f"✗ failed {ctx.get('failed', 0)}", "red")]
     if ctx.get("questions"):
@@ -540,5 +878,7 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
         chips.append(S.chip(f"⤵ {ctx['superseded']} superseded", "sub"))
     if ctx.get("hidden") and not show_all:
         chips.append(S.chip(f"◌ {ctx['hidden']} filtered", "sub"))
+    if agent_now:
+        chips.append(S.chip(f"✋ now {agent_now}", "yellow"))
     return S.page("inbox", "Inbox", "What needs you first, then what failed.",
                   chips_=chips, sections=sections, errors=errors, args=args)
