@@ -331,6 +331,210 @@ def _resolve_dispatch_mode(override, wf_path) -> str:
     return "serial"
 
 
+# ContextNest atom ids are cn-<hex> tokens (verified shape cn-[a-f0-9]{8,40}).
+# The pre-existing hook (subagent-stop.sh) parsed these out of the prefetch
+# file the planner/worker rendered; the run-verdict settle reuses the same
+# pattern so the atom set the settle rewards is the same one the hook would
+# have rewarded at subagent-completion time. Kept module-level (rather than
+# nested in the settle helper) so the byte-stability tests can spot-check the
+# pattern once.
+_CN_ATOM_ID_RE = re.compile(r"cn-[a-f0-9]{8,40}")
+
+
+def _collect_cn_atom_ids(run_dir: str) -> list[str]:
+    """Gather every CN atom id the run was given, deduped, order-preserved.
+
+    Sources, in priority order:
+
+    1. ``<run_dir>/cn_prefetch/*.md`` — the per-worker prefetch records the
+       ``subagent-prefetch.sh`` hook wrote via
+       ``mini_ork.cli.cn_hook._prefetch``. The rendered atoms section embeds
+       ``cn-<hex>`` ids inline (see :func:`mini_ork.cn_client.render_atoms_md`),
+       so a regex sweep is exact and matches every atom the worker saw.
+
+    2. ``<run_dir>/learned/<node>.json`` ``sources`` records — the
+       ``_write_learned_record`` shape (execute_handlers.py:315) lists one
+       dict per row the LLM actually received. The ids are not always CN
+       atom ids (preferences and steering rows are local), but the JSON may
+       carry a ``cn-`` token in a text / id field worth crediting. We only
+       sweep the explicit CN-shape fields (``atom_id``, ``id``) so a
+       ``pref:<scope>:<target>:<key>`` doesn't leak into the settle.
+
+    Returns an empty list when the run dir is absent or no atom ids are
+    found — the settle then records a no-op and writes nothing.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    prefetch_dir = os.path.join(run_dir, "cn_prefetch")
+    if os.path.isdir(prefetch_dir):
+        try:
+            names = os.listdir(prefetch_dir)
+        except OSError:
+            names = []
+        for name in names:
+            if not name.endswith(".md"):
+                continue
+            try:
+                text = open(os.path.join(prefetch_dir, name), encoding="utf-8").read()
+            except OSError:
+                continue
+            for aid in _CN_ATOM_ID_RE.findall(text):
+                if aid not in seen:
+                    seen.add(aid)
+                    out.append(aid)
+
+    learned_dir = os.path.join(run_dir, "learned")
+    if os.path.isdir(learned_dir):
+        try:
+            names = os.listdir(learned_dir)
+        except OSError:
+            names = []
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            try:
+                rec = json.load(open(os.path.join(learned_dir, name), encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(rec, dict):
+                continue
+            sources = rec.get("sources") or []
+            if not isinstance(sources, list):
+                continue
+            for src in sources:
+                if not isinstance(src, dict):
+                    continue
+                for key in ("atom_id", "id"):
+                    val = src.get(key)
+                    if isinstance(val, str) and _CN_ATOM_ID_RE.fullmatch(val):
+                        if val not in seen:
+                            seen.add(val)
+                            out.append(val)
+
+    return out
+
+
+def _settle_cn_outcomes(run_dir: str, verdict: str) -> dict:
+    """One settle pass at run-verdict time.
+
+    Returns a small report dict for the run's own audit log. The settle is
+    IDEMPOTENT: a second call reads ``cn-outcomes.json`` and posts nothing
+    for atoms that already have an entry. It is also FORGIVING: CN-down,
+    missing atom ids, and any unexpected exception are recorded as
+    ``pending`` and never raised, so the verdict bytes stay untouched
+    (byte-stability tests 8 / 11 enforce the verdict invariants; the
+    settle writes a separate file and never edits ``verdict.json``).
+
+    Mapping (run-level outcome → CN outcome):
+
+    - ``"pass"``  → CN outcome ``"success"``  (run published)
+    - ``"fail"``  → CN outcome ``"failure"``  (run rejected or rolled back)
+    - ``"abstain"`` / ``"interrupted"`` / ``"parked"`` → no settle, no
+      CN posts — the run is unproven and crediting / debiting the
+      substrate would lie about what happened.
+
+    The settle record (``<run_dir>/cn-outcomes.json``) carries one entry
+    per atom the run was given::
+
+        {
+          "verdict": "pass" | "fail",
+          "settled_at": <unix ts>,
+          "atoms": {
+            "cn-<hex>": {"outcome": "success" | "failure",
+                          "result": {"status": "ok" | "pending" | "skipped",
+                                      ...},
+                          "settled_at": <unix ts>}
+          }
+        }
+
+    Atomic write (tmp + ``os.replace``) so an interrupted settle never
+    leaves a torn record the next call would have to interpret.
+    """
+    empty_report = {"settled": [], "pending": [], "skipped": []}
+    if not (run_dir and os.path.isdir(run_dir)):
+        return empty_report
+    if verdict not in ("pass", "fail"):
+        # abstain / interrupted / parked — no settle, no CN call
+        return empty_report
+
+    outcome_str = "success" if verdict == "pass" else "failure"
+    atom_ids = _collect_cn_atom_ids(run_dir)
+    if not atom_ids:
+        return empty_report
+
+    settle_path = os.path.join(run_dir, "cn-outcomes.json")
+    record: dict = {"verdict": verdict, "settled_at": None, "atoms": {}}
+    if os.path.isfile(settle_path):
+        try:
+            existing = json.load(open(settle_path, encoding="utf-8"))
+            if isinstance(existing, dict):
+                record = existing
+                if not isinstance(record.get("atoms"), dict):
+                    record["atoms"] = {}
+        except (OSError, ValueError):
+            record = {"verdict": verdict, "settled_at": None, "atoms": {}}
+
+    pending_atoms = [a for a in atom_ids if a not in record["atoms"]]
+    if not pending_atoms:
+        # Idempotent — every atom the run was given is already in the
+        # settle record. Mirror the verdict in case the prior settle ran
+        # under a different verdict (e.g. crash + retry that landed on a
+        # "pass" verdict after a first "fail" attempt).
+        record["verdict"] = verdict
+        try:
+            tmp = settle_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(record, f, ensure_ascii=False, sort_keys=True)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, settle_path)
+        except OSError:
+            pass
+        return empty_report
+
+    try:
+        from mini_ork import cn_client as _cn
+        result = _cn.settle_outcome_batch(outcome_str, pending_atoms)
+    except Exception as exc:  # noqa: BLE001 — settle never raises
+        result = {"status": "pending", "reason": f"unexpected:{type(exc).__name__}"}
+
+    now = int(time.time())
+    for aid in pending_atoms:
+        record["atoms"][aid] = {
+            "outcome": outcome_str,
+            "result": result,
+            "settled_at": now,
+        }
+    record["verdict"] = verdict
+    record["settled_at"] = now
+
+    try:
+        tmp = settle_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, settle_path)
+    except OSError:
+        # Atomic write failed (disk full, EROFS, …). Verdict bytes are
+        # untouched; the operator can re-run to retry the settle.
+        pass
+
+    # Bucket the result for the caller; "ok" / "pending" / "skipped" match
+    # the cn_client.settle_outcome_batch shape so the audit log has the
+    # same labels a CN call would.
+    bucket = {a: "pending" for a in pending_atoms}
+    if isinstance(result, dict) and result.get("status") == "ok":
+        bucket = {a: "settled" for a in pending_atoms}
+    elif isinstance(result, dict) and result.get("status") == "skipped":
+        bucket = {a: "skipped" for a in pending_atoms}
+    report = {"settled": [], "pending": [], "skipped": []}
+    for a, label in bucket.items():
+        report[label].append(a)
+    return report
+
+
 def _emit_run_verdict(run_dir, fail_count, dispatched, *, dry_run=False, task_class=""):
     # A rehearsal must not occupy the run's own record. A nested lifecycle that
     # inherits MINI_ORK_RUN_ID shares the run dir; when the rehearsal wrote
@@ -389,6 +593,12 @@ def _emit_run_verdict(run_dir, fail_count, dispatched, *, dry_run=False, task_cl
             return
         print(f"  [verdict] run-level {os.path.basename(verdict_path)}: {verdict} "
               f"(failed_nodes={fail_count}) levels_ok={str(report['levels_ok']).lower()}")
+        # Settle CN outcomes after the verdict bytes are on disk. A parked /
+        # interrupted run never reaches here, so the settle's "no atoms
+        # when abstain" branch is the only path that fires on an abstained
+        # verdict. CN-down leaves the verdict bytes untouched (settle
+        # writes a separate ``cn-outcomes.json``).
+        _settle_cn_outcomes(run_dir, verdict)
         return
     try:
         open(verdict_path, "w").write(
@@ -398,6 +608,10 @@ def _emit_run_verdict(run_dir, fail_count, dispatched, *, dry_run=False, task_cl
         return
     print(f"  [verdict] run-level {os.path.basename(verdict_path)}: {verdict} "
           f"(failed_nodes={fail_count})")
+    # Settle CN outcomes after the verdict bytes are on disk (byte-stable
+    # branch). Same contract as the level-vector branch above — verdict
+    # bytes first, settle second, never the reverse.
+    _settle_cn_outcomes(run_dir, verdict)
 
 
 def _max_parallel() -> int:

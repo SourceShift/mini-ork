@@ -629,6 +629,90 @@ def outcome_post(outcome: str, atom_ids_csv: str = "", evidence: str = "", sessi
     return 0
 
 
+# ── synchronous outcome settle (run-verdict path) ─────────────────────────────
+#
+# The hook's outcome_post is fire-and-forget on a daemon thread and discards
+# the response. The run-verdict settle path needs the opposite: a single
+# POST whose response body (``{updated, skipped_unknown, delta_applied}``) is
+# inspected so a settle that landed at CN can be recorded as such, and a
+# settle that CN refused (timeout, 5xx, missing key) is recorded as pending
+# instead of being lost. CN-down must NOT raise — the verdict bytes are the
+# cost of truth and the settle is audit metadata.
+#
+# ``_settle_outcome`` returns one of:
+#
+#   {"status": "ok",      "updated": int, "skipped_unknown": int,
+#                           "delta_applied": int}
+#   {"status": "pending",  "reason": str}   # CN disabled / unavailable / error
+#   {"status": "skipped",  "reason": str}   # no atom_ids to settle
+#
+# The hook path is unchanged (``outcome_post`` keeps its fire-and-forget
+# semantics so the subagent transcript post is not coupled to a synchronous
+# outcome call).
+
+
+def _settle_outcome(outcome: str, atom_ids: list[str], *, evidence: str = "",
+                    session_id: str = "") -> dict:
+    """Synchronous outcome POST for the run-verdict settle path.
+
+    Returns the parsed JSON body when CN accepts the request, or a
+    ``{"status": "pending", ...}`` dict when CN is disabled / unavailable /
+    errors out. Empty / missing atom_ids short-circuits to
+    ``{"status": "skipped", ...}`` without an HTTP call.
+    """
+    if _disabled():
+        return {"status": "pending", "reason": "cn_disabled"}
+    ids = [s for s in (a.strip() for a in atom_ids) if s]
+    if not ids:
+        return {"status": "skipped", "reason": "no_atom_ids"}
+    if not available():
+        return {"status": "pending", "reason": "cn_unavailable"}
+    body = {"atom_ids": ids, "outcome": outcome}
+    if evidence:
+        body["evidence"] = evidence[:480]
+    if session_id:
+        body["session_id"] = session_id
+    # Same auth-first contract as ``_post_json``: a secure-tier misconfig
+    # surfaces as ``SecretStoreError`` (named key, never the value). The
+    # settle path catches that and records it as pending so the verdict
+    # bytes stay untouched and the operator sees the missing-key signal.
+    try:
+        raw = _post_json("/api/v1/agent/outcome", json.dumps(body))
+    except Exception as exc:
+        return {"status": "pending", "reason": f"send_error:{type(exc).__name__}"}
+    try:
+        parsed = json.loads(raw) if raw and raw.strip() else {}
+    except ValueError:
+        return {"status": "pending", "reason": "bad_response_body"}
+    if not isinstance(parsed, dict):
+        return {"status": "pending", "reason": "bad_response_shape"}
+    # ``updated`` is the contract the live CN serves (2026-10-15 shape
+    # {updated, skipped_unknown, delta_applied}); fall back to None when
+    # the body omits it so the caller can still record "ok" against an
+    # older server.
+    return {
+        "status": "ok",
+        "updated": parsed.get("updated"),
+        "skipped_unknown": parsed.get("skipped_unknown"),
+        "delta_applied": parsed.get("delta_applied"),
+    }
+
+
+def settle_outcome_batch(outcome: str, atom_ids: list[str], *,
+                          evidence: str = "", session_id: str = "") -> dict:
+    """Settle one outcome per atom (one CN call covers the whole batch).
+
+    Used by the run-verdict settle: every atom the run was given gets the
+    SAME outcome string (``"success"`` for a published run, ``"failure"``
+    for a rejected / rolled-back run), so the batch endpoint is exactly
+    what the substrate wants — and one POST is cheaper than N. The return
+    shape mirrors :func:`_settle_outcome` so the caller can record the
+    batch result against every atom in the run-dir record.
+    """
+    return _settle_outcome(outcome, list(atom_ids), evidence=evidence,
+                           session_id=session_id)
+
+
 # ── graph projection (PR-6): mini-ork learning entities → CN's durable graph ──
 #
 # The server whitelists node labels and edge triples (anything else is a 400)

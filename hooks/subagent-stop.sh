@@ -95,50 +95,13 @@ if [ "${MO_DISABLE_CN:-0}" != "1" ]; then
   target_session="${child_session:-$parent_session}"
   python3 -m mini_ork.cli.cn_hook post "subagent_stop" "$target_session" \
     --cwd "$PWD" --transcript "$transcript_path" >/dev/null 2>&1 || true
-
-  # PR-6 outcome feedback (2026-06-17). If the worker consumed atoms via
-  # the prefetch hook (file at $MO_CN_PREFETCH_DIR/<sid>.md), extract the
-  # CN atom ids it referenced and POST outcome to CN's /agent/outcome
-  # endpoint. CN bumps last_accessed on each + adjusts a confidence
-  # signal capped at ±0.05 per call. Fire-and-forget; never blocks.
-  #
-  # Heuristic for atom_id extraction: scan the prefetch file for any
-  # `cn-<32 hex chars>` token (CN's canonical atom id shape). The
-  # prefetch file content (rendered by cn_render_atoms_md +
-  # cn_render_inbox_md + cn_render_features_md) embeds these inline in
-  # the "sess=<8 chars>" / "[id]" markup, but only `cn-` atom ids
-  # uniquely identify substrate atoms.
-  #
-  # Outcome classification: subagent_runs.status (set above by the
-  # UPDATE) → "success" | "failure". status comes from extract_field
-  # earlier in this hook; default to "neutral" when unknown.
-  if [ -n "${MO_CN_PREFETCH_DIR:-}" ]; then
-    _outcome_session="${child_session:-$parent_session}"
-    _prefetch_file="${MO_CN_PREFETCH_DIR}/${_outcome_session}.md"
-    if [ -f "$_prefetch_file" ]; then
-      # Extract cn-<hex>... atom ids. grep -oE keeps full matches; uniq
-      # dedups; tr+paste collapses to CSV.
-      _atom_ids_csv=$(grep -oE 'cn-[a-f0-9]{8,40}' "$_prefetch_file" 2>/dev/null \
-        | sort -u \
-        | head -20 \
-        | paste -sd, -)
-      if [ -n "$_atom_ids_csv" ]; then
-        # Map subagent status → outcome. "completed" / "ok" / etc. → success.
-        # "failed" / "cancelled" / etc. → failure. Anything else → neutral.
-        _outcome_str="neutral"
-        case "$new_status" in
-          completed|ok|success) _outcome_str="success" ;;
-          failed|cancelled|error|aborted) _outcome_str="failure" ;;
-        esac
-        # Evidence: first 240 chars of the worker's result_excerpt (already
-        # captured upstream in this hook). Keeps the outcome trace
-        # debuggable without paying the 480-char CN cap.
-        _evidence="${result_excerpt:0:240}"
-        python3 -m mini_ork.cli.cn_hook outcome "$_outcome_str" "$_atom_ids_csv" \
-          --evidence "$_evidence" --session "$_outcome_session" >/dev/null 2>&1 || true
-      fi
-    fi
-  fi
 fi
+
+# Outcome feedback moved to run-verdict finalisation (mini_ork.cli.execute).
+# Posting outcomes at subagent completion rewarded atoms on every partial
+# pass — including runs that later rolled back or were rejected — so the
+# signal drifted towards "every node succeeded". Settling at run-verdict
+# time stamps success on publish and failure on reject/rollback, so a
+# single audit point drives the outcome a worker saw.
 
 emit_continue
