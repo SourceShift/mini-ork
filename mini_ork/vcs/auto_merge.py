@@ -186,6 +186,26 @@ def _worktree_for(repo_root, branch) -> str:
     return ""
 
 
+def content_ids(repo: str, branch: str, target: str) -> tuple[str, str]:
+    """Return (merge_base, head_tree_sha) for ``branch`` against ``target``.
+
+    Pass the **tree** sha as ``head_sha`` (``branch^{tree}``) so a content id
+    is stable across squash-merges of identical content, and a rebase that
+    changes content correctly voids an existing approval. Any git failure
+    (missing branch, non-zero rc, empty stdout) returns ``("", "")`` so the
+    caller (``merge_approval.require``) holds — fail closed, because an
+    empty head can never match an approved row.
+    """
+    base, rc_b = _git(repo, "merge-base", target, branch)
+    # NOTE the doubled braces inside the f-string — `^{tree}` must be a
+    # literal ``^{tree}`` to git, not an interpolation of a local named
+    # ``tree``.
+    tree, rc_t = _git(repo, "rev-parse", f"{branch}^{{tree}}")
+    if rc_b or rc_t or not base or not tree:
+        return "", ""
+    return base, tree
+
+
 def auto_merge(repo_root, mini_orch_dir, job_id, *, mini_ork_home, state_db,
                now_iso=None, now_stamp="00000000-000000",
                log=None, log_raw=None) -> tuple[int, int, int]:
@@ -269,6 +289,22 @@ def auto_merge(repo_root, mini_orch_dir, job_id, *, mini_ork_home, state_db,
         commit_log, _ = _git(repo_root, "log", "--oneline", f"main..{branch}")
         if commit_count == 0:
             _emit(log, f"[auto-merge] skip {epic} — no commits ahead of main")
+            skipped += 1
+            continue
+
+        # Human-review gate: policy-aware hold BEFORE touching the mutex or the
+        # tree. ``require`` is a no-op when ``before_merge=off`` (no DB write,
+        # byte-for-byte unchanged); with policy required it enqueues a
+        # ``merge:<epic>`` row and returns ``(False, "awaiting human
+        # approval: …")``. We HOLD — never merge, never fail — so a human has
+        # to approve exactly this content (base + tree) before the squash.
+        from mini_ork.gates import merge_approval  # noqa: PLC0415
+        base, tree = content_ids(repo_root, branch, "main")
+        ok, why = merge_approval.require(
+            epic, base, tree, branch=branch, base_branch="main", db_path=state_db
+        )
+        if not ok:
+            _emit(log, f"[auto-merge] HELD {epic} — {why}")
             skipped += 1
             continue
 

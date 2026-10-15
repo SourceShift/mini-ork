@@ -559,8 +559,28 @@ logs, code paths, benchmark deltas, and arXiv references).
             record_success(db, run_id, it, branch, sha)
             promote_synthesis_findings(db, run_id, it, os.path.join(run_dir, "synthesis.md"))
         if opts["auto_merge"]:
-            subprocess.run(["git", "-C", root, "merge", "--no-ff",
-                            "-m", f"merge self-improve iter {it}", branch], capture_output=True)
+            # Human-review gate: policy-aware hold BEFORE the merge. ``require``
+            # is a no-op when ``before_merge=off`` (no DB write, byte-for-byte
+            # unchanged); with policy required it enqueues a
+            # ``merge:self-improve:<run_id>:iter-N`` row and returns
+            # ``(False, …)``. We print and skip the merge — the branch stays
+            # so a human can approve exactly this content later.
+            from mini_ork.gates import merge_approval  # noqa: PLC0415
+            from mini_ork.vcs.auto_merge import content_ids
+            cur_branch = subprocess.run(
+                ["git", "-C", root, "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True, text=True).stdout.strip()
+            base, tree = content_ids(root, branch, cur_branch or "main")
+            ok, why = merge_approval.require(
+                f"self-improve:{run_id}:iter-{it}", base, tree,
+                branch=branch, base_branch=cur_branch or "main", db_path=db,
+            )
+            if not ok:
+                print(f"  [iter] auto-merge HELD for review — {why}")
+            else:
+                subprocess.run(["git", "-C", root, "merge", "--no-ff",
+                                "-m", f"merge self-improve iter {it}", branch],
+                               capture_output=True)
     else:
         print(f"  [iter] discarding worktree (outcome={outcome})")
         with open(os.path.join(run_dir, "patches", f"iter-{it}.diff"), "wb") as fh:
