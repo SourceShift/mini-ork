@@ -902,18 +902,40 @@ def _render_search_results(envelope: dict | None,
                            requested_mode: str) -> dict[str, Any]:
     """Render the result rows from the slot envelope.
 
-    The page drops the rows when the slot's mode doesn't match the
-    chip the operator has selected — switching modes after the search
-    is the realistic workflow, and rendering foreign rows would imply
-    a re-fetch the page never performed. ``ts`` is rendered as the
-    "as of HH:MM" label so a stale slot is visible without a
-    cache-section wrapper (the verb replaces, never refreshes on
-    read).
+    Three states are mutually exclusive and checked in order:
+
+    * ``envelope is None`` (no slot): one dot row, "no search yet".
+    * ``envelope.get("error")`` is set: ONE red row carrying the error
+      string with the query as the sub line. The error row preempts
+      mode-specific rendering — the verb's body is unreliable when it
+      carries an error, and the page must never silently render a
+      "0 results" fallback that papers over a real CN failure. The
+      page's own quiet failure mode (a guarded-section crash, which
+      renders "Could not read this" in a guarded ``lst``) is distinct
+      from the verb's error envelope: the verb writes a known shape,
+      the page renders it as one red row, and downstream consumers can
+      tell the difference by counting red rows under the Results
+      section.
+    * The slot mode matches the chip: rows from ``envelope["result"]``
+      via the mode-specific renderer. ``ts`` is rendered as the "as of
+      HH:MM" label so a stale slot is visible without a cache-section
+      wrapper (the verb replaces, never refreshes on read).
     """
     if not envelope:
         return S.lst("Results", [
             S.dot("No search yet — type a query above and press enter")
         ], full=True)
+
+    error = envelope.get("error") if isinstance(envelope, dict) else None
+    if isinstance(error, str) and error:
+        # Error envelopes carry the query in the envelope's ``query``
+        # field; ride it on the row's sub line so the operator sees
+        # which query produced the error without re-reading stderr.
+        # One row, never the "No rows for this query" fallback —
+        # "0 results" would mask a real CN failure behind an innocuous
+        # empty-state line.
+        query = envelope.get("query") or ""
+        return S.lst("Results", [S.bad(error, query)], full=True)
 
     if envelope.get("mode") != requested_mode:
         # The mode chip moved off the slot's mode. The right behaviour

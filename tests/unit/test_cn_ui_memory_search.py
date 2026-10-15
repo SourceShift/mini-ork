@@ -227,17 +227,51 @@ def test_cn_subparser_has_no_home_flag() -> None:
 # ── 2. CLI verb — project resolution ──────────────────────────────────────
 
 
-def test_project_root_falls_back_to_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Without a git working tree, ``_project_root`` honours ``MINI_ORK_ROOT``."""
-    monkeypatch.setenv("MINI_ORK_ROOT", "/env-root")
+def test_project_root_prefers_mini_ork_home_parent(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """``MINI_ORK_HOME``'s resolved parent wins over git toplevel.
+
+    The verb scopes CN rows to the same project root the IDE Context page
+    uses (``home.parent``). When ``MINI_ORK_HOME`` is set, that resolves
+    the scope even when cwd sits inside a different git checkout (the
+    test runner's working tree).
+    """
+    monkeypatch.setenv("MINI_ORK_HOME", "/x/proj/.mini-ork")
+    assert cn_cmd._project_root() == "/x/proj"
+
+
+def test_project_root_falls_back_to_git_when_home_unset(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """No ``MINI_ORK_HOME`` → ``git rev-parse --show-toplevel`` of cwd."""
+    monkeypatch.delenv("MINI_ORK_HOME", raising=False)
+    monkeypatch.setattr(cn_cmd.subprocess, "run",
+                        mock.Mock(return_value=mock.Mock(stdout="/git/repo\n")))
+    assert cn_cmd._project_root() == "/git/repo"
+
+
+def test_project_root_ignores_mini_ork_root(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """``MINI_ORK_ROOT`` is the engine install, never the user project.
+
+    A previous revision fell back to ``MINI_ORK_ROOT`` when no git
+    toplevel resolved. The revised verb never reads ``MINI_ORK_ROOT``
+    for project scoping — it is reserved for the engine layout.
+    """
+    monkeypatch.setenv("MINI_ORK_ROOT", "/engine/install")
     monkeypatch.setattr(cn_cmd.subprocess, "run",
                         mock.Mock(side_effect=FileNotFoundError))
-    assert cn_cmd._project_root() == "/env-root"
+    assert cn_cmd._project_root() == ""
 
 
-def test_project_root_returns_empty_when_unresolved(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No git, no env → ``""`` so the verb falls back to unfiltered rows."""
-    monkeypatch.delenv("MINI_ORK_ROOT", raising=False)
+def test_project_root_returns_empty_when_unresolved(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """No ``MINI_ORK_HOME`` AND no git toplevel → ``""``.
+
+    The verb treats ``""`` as the fail-closed sentinel; ``_cmd_search``
+    converts that into a scope-resolution error envelope (exit 3)
+    unless ``--all-projects`` is the opt-in to the unfiltered state.
+    """
+    monkeypatch.delenv("MINI_ORK_HOME", raising=False)
     monkeypatch.setattr(cn_cmd.subprocess, "run",
                         mock.Mock(side_effect=FileNotFoundError))
     assert cn_cmd._project_root() == ""
@@ -246,62 +280,173 @@ def test_project_root_returns_empty_when_unresolved(monkeypatch: pytest.MonkeyPa
 # ── 3. CLI verb — mode handlers ───────────────────────────────────────────
 
 
-def test_do_memories_raises_timeout_for_retrieve(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``retrieve`` takes ~20 s on real CN; the verb raises CN_TIMEOUT_SEC
-    for the duration of the call and restores the prior value."""
-    captured: dict[str, str] = {}
+def _stub_post_json(monkeypatch: pytest.MonkeyPatch,
+                    canned: str = '{"hits": []}') -> dict[str, Any]:
+    """Patch ``cn_client._post_json`` (and ``_disabled`` / ``available``)
+    so ``_do_memories`` reaches the stub without ever calling
+    ContextNest. Returns the call-record dict so the test body can
+    inspect path, body, and timeout. ``_disabled`` / ``available`` are
+    stubbed so the new ``_disabled() / available()`` gate inside
+    ``_do_memories`` lets the call through; tests that need the
+    unavailable path stub them back to False or True directly.
+    """
+    captured: dict[str, Any] = {}
 
-    def _fake_retrieve(query: str, limit: int = 8) -> str:
-        captured["CN_TIMEOUT_SEC"] = os.environ.get("CN_TIMEOUT_SEC", "")
-        captured["query"] = query
-        captured["limit"] = str(limit)
-        return json.dumps({"hits": [
-            {"id": "h1", "content": "x",
-             "metadata": {"project_cwd": "/proj/foo.py"}},
-        ]})
+    def _record(path: str, payload: str,
+                *, timeout: float | None = None) -> str:
+        captured["path"] = path
+        captured["body"] = payload
+        captured["timeout"] = timeout
+        return canned
 
-    monkeypatch.setenv("CN_TIMEOUT_SEC", "8")
-    monkeypatch.setattr(cn_client, "retrieve", _fake_retrieve)
+    monkeypatch.setattr(cn_client, "_disabled", lambda: False)
+    monkeypatch.setattr(cn_client, "available", lambda: True)
+    monkeypatch.setattr(cn_client, "_post_json", _record)
+    return captured
+
+
+def test_do_memories_calls_post_json_with_query_top_k_and_budget(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_do_memories`` POSTs to ``/api/v1/tools/retrieve`` with
+    ``{"query", "top_k"}`` and the ``CN_SEARCH_TIMEOUT_SEC`` budget.
+
+    The verb reaches into :func:`cn_client._post_json` directly so the
+    read budget is read from ``CN_SEARCH_TIMEOUT_SEC`` (default ``90``)
+    rather than the legacy ``CN_TIMEOUT_SEC`` set/restore around
+    :func:`cn_client.retrieve`. The body keeps the ``top_k`` key
+    because that is what ``tools/retrieve`` reads on the wire.
+    """
+    captured = _stub_post_json(monkeypatch, canned=json.dumps({
+        "hits": [{"id": "h1", "metadata": {"cwd": "/proj/foo.py"}}],
+    }))
+    monkeypatch.delenv("CN_SEARCH_TIMEOUT_SEC", raising=False)
     out = cn_cmd._do_memories("foo", "/proj", False, 5)
-    assert captured["CN_TIMEOUT_SEC"] == "30"
-    assert captured["query"] == "foo"
-    assert captured["limit"] == "5"
+    assert captured["path"] == "/api/v1/tools/retrieve"
+    assert json.loads(captured["body"]) == {"query": "foo", "top_k": 5}
+    assert captured["timeout"] == pytest.approx(90.0)
     assert isinstance(out, list) and out and out[0]["id"] == "h1"
-    # and we restored the original budget on exit
-    assert os.environ["CN_TIMEOUT_SEC"] == "8"
 
 
-def test_do_memories_restores_prior_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("CN_TIMEOUT_SEC", raising=False)
-    monkeypatch.setattr(cn_client, "retrieve",
-                        lambda *a, **k: json.dumps({"hits": []}))
-    cn_cmd._do_memories("x", "", True, 1)
-    assert "CN_TIMEOUT_SEC" not in os.environ
+def test_do_memories_honours_cn_search_timeout_sec(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """``CN_SEARCH_TIMEOUT_SEC`` overrides the default 90 s read budget."""
+    captured = _stub_post_json(monkeypatch,
+                               canned=json.dumps({"hits": [{"id": "h1"}]}))
+    monkeypatch.setenv("CN_SEARCH_TIMEOUT_SEC", "12.5")
+    cn_cmd._do_memories("foo", "/proj", False, 5)
+    assert captured["timeout"] == pytest.approx(12.5)
 
 
-def test_do_memories_filters_by_project_path(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_do_memories_does_not_mutate_cn_timeout_sec(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_do_memories`` never reads or writes ``CN_TIMEOUT_SEC``.
+
+    A legacy revision set/restore ``CN_TIMEOUT_SEC="30"`` around the
+    call. The revised verb reads ``CN_SEARCH_TIMEOUT_SEC`` only — the
+    legacy shared read budget is no longer mutated by search. ``os.environ``
+    is byte-identical before and after the call, and ``CN_TIMEOUT_SEC``
+    keeps its pre-existing value (set to ``"8"`` here) verbatim.
+    """
+    monkeypatch.setenv("CN_TIMEOUT_SEC", "8")
+    before = dict(os.environ)
+    captured: dict[str, Any] = {}
+
+    def _fake_post_json(path: str, body: str,
+                        *, timeout: float | None = None) -> str:
+        captured["env"] = dict(os.environ)
+        return json.dumps({"hits": [{"id": "h1"}]})
+
+    monkeypatch.setattr(cn_client, "_disabled", lambda: False)
+    monkeypatch.setattr(cn_client, "available", lambda: True)
+    monkeypatch.setattr(cn_client, "_post_json", _fake_post_json)
+    cn_cmd._do_memories("foo", "/proj", False, 5)
+    assert os.environ.get("CN_TIMEOUT_SEC") == "8"
+    assert captured["env"].get("CN_TIMEOUT_SEC") == "8"
+    # And os.environ itself is unchanged.
+    assert dict(os.environ) == before
+
+
+def test_do_memories_raises_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``MO_DISABLE_CN=1`` → ``ContextNest is not reachable`` (no POST)."""
+    monkeypatch.setattr(cn_client, "_disabled", lambda: True)
+    monkeypatch.setattr(cn_client, "available", lambda: False)
+    called: list[str] = []
+    monkeypatch.setattr(cn_client, "_post_json",
+                        lambda *a, **k: (called.append("post"), "{}")[1])
+    with pytest.raises(cn_cmd.RetrieveFailed) as exc:
+        cn_cmd._do_memories("q", "/proj", False, 5)
+    assert "not reachable" in str(exc.value)
+    assert called == []  # never reached the wire
+
+
+def test_do_memories_raises_when_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``available()`` returning False → same envelope, same exit code path."""
+    monkeypatch.setattr(cn_client, "_disabled", lambda: False)
+    monkeypatch.setattr(cn_client, "available", lambda: False)
+    monkeypatch.setattr(cn_client, "_post_json", lambda *a, **k: "{}")
+    with pytest.raises(cn_cmd.RetrieveFailed) as exc:
+        cn_cmd._do_memories("q", "/proj", False, 5)
+    assert str(exc.value) == "ContextNest is not reachable"
+
+
+def test_do_memories_raises_when_body_has_no_hits(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """A body without a ``hits`` list is a failed retrieve (exit 4 path).
+
+    ``cn_client._post_json`` swallows timeouts and connection errors
+    into ``"{}"``. From the verb's perspective that is a body without
+    ``hits`` — the budget is the documented rationale (``"within
+    <budget> s"``). The verb turns this into :class:`RetrieveFailed`
+    so the centralised envelope + exit-4 path in :func:`_cmd_search`
+    fires.
+    """
+    monkeypatch.setattr(cn_client, "_disabled", lambda: False)
+    monkeypatch.setattr(cn_client, "available", lambda: True)
+    monkeypatch.setattr(cn_client, "_post_json",
+                        lambda *a, **k: "{}")
+    monkeypatch.setenv("CN_SEARCH_TIMEOUT_SEC", "12.5")
+    with pytest.raises(cn_cmd.RetrieveFailed) as exc:
+        cn_cmd._do_memories("q", "/proj", False, 5)
+    msg = str(exc.value)
+    assert msg.startswith("ContextNest retrieve did not answer within"), msg
+    assert "12.5" in msg
+
+
+def test_do_memories_filters_by_project_path(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Project filter keeps only hits whose path lies under ``project``.
+
+    With a non-empty ``project`` and ``all_projects=False`` (the verb's
+    fail-closed scope guarantee), only hits with a ``metadata.cwd``
+    under the project are kept.
+    """
     payload = json.dumps({
         "hits": [
-            {"id": "keep", "metadata": {"project_cwd": "/proj/foo.py"}},
-            {"id": "drop", "metadata": {"project_cwd": "/other/bar.py"}},
+            {"id": "keep", "metadata": {"cwd": "/proj/foo.py"}},
+            {"id": "drop", "metadata": {"cwd": "/other/bar.py"}},
             {"id": "no_path"},
         ],
     })
-    monkeypatch.delenv("CN_TIMEOUT_SEC", raising=False)
-    monkeypatch.setattr(cn_client, "retrieve", lambda *a, **k: payload)
+    monkeypatch.setattr(cn_client, "_disabled", lambda: False)
+    monkeypatch.setattr(cn_client, "available", lambda: True)
+    monkeypatch.setattr(cn_client, "_post_json", lambda *a, **k: payload)
     out = cn_cmd._do_memories("q", "/proj", False, 10)
     ids = [h["id"] for h in out]
     assert ids == ["keep"]
 
 
-def test_do_memories_all_projects_skips_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_do_memories_all_projects_skips_filter(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """``all_projects=True`` returns the unfiltered list."""
     payload = json.dumps({
         "hits": [
-            {"id": "keep", "metadata": {"project_cwd": "/proj/a.py"}},
-            {"id": "other", "metadata": {"project_cwd": "/other/b.py"}},
+            {"id": "keep", "metadata": {"cwd": "/proj/a.py"}},
+            {"id": "other", "metadata": {"cwd": "/other/b.py"}},
         ],
     })
-    monkeypatch.setattr(cn_client, "retrieve", lambda *a, **k: payload)
+    monkeypatch.setattr(cn_client, "_disabled", lambda: False)
+    monkeypatch.setattr(cn_client, "available", lambda: True)
+    monkeypatch.setattr(cn_client, "_post_json", lambda *a, **k: payload)
     out = cn_cmd._do_memories("q", "/proj", True, 10)
     assert {h["id"] for h in out} == {"keep", "other"}
 
