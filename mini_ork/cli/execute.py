@@ -59,6 +59,11 @@ from mini_ork.context import (  # noqa: F401 -- compatibility re-exports
     publish_env,
     run_context_scope,
 )
+# Per-node human review gate: ``REVIEW_PAUSE_RC`` is the exit code a node
+# returns when the executor parks the run for a human sign-off instead of
+# dispatching descendants. Mirror of ``mini_ork/gates/node_review.py``'s
+# constant so the executor can name the rc on both sides of the gate.
+from mini_ork.gates.node_review import REVIEW_PAUSE_RC  # noqa: F401
 
 
 # ── extracted modules (re-exported contracts; definitions live in the modules) ──
@@ -916,6 +921,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
 
     fail_count = 0
     abstain_count = 0
+    pause_count = 0  # nodes that returned REVIEW_PAUSE_RC (awaiting human review)
     out: list[str] = []
     if dry_run:
         # partitioned reorders by node_type group; others keep NODE_IDS order.
@@ -1035,12 +1041,18 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     def _count_failures(outcomes):
         # An abstention is not a failure: the tool could not run, so nothing
         # about the code was refuted (audit 2026-10-11).
+        # A park is not a failure either: the run is awaiting a human, not a
+        # broken tool or a wrong answer (kickoff hr-exec-park).
         return sum(1 for _field, rc, _finish_reason in outcomes
-                   if rc != 0 and rc != _levels.ABSTAIN_RC)
+                   if rc != 0 and rc != _levels.ABSTAIN_RC and rc != REVIEW_PAUSE_RC)
 
     def _count_abstains(outcomes):
         return sum(1 for _field, rc, _finish_reason in outcomes
                    if rc == _levels.ABSTAIN_RC)
+
+    def _count_pauses(outcomes):
+        return sum(1 for _field, rc, _finish_reason in outcomes
+                   if rc == REVIEW_PAUSE_RC)
 
     # Revise-loop cap read once per run: 0 (or negative) restores the legacy
     # block-descendants-and-rollback behaviour exactly.
@@ -1054,7 +1066,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         selected parent succeeded; failed parents block descendants without
         executing a publisher or consumer against partial state.
         """
-        nonlocal fail_count, abstain_count
+        nonlocal fail_count, abstain_count, pause_count
         pending = {field[0]: field for field in work_fields}
         statuses: dict[str, str] = {}
         order = {field[0]: index for index, field in enumerate(work_fields)}
@@ -1093,13 +1105,29 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 parents = set(control_parents.get(node_id, ())) & selected_ids
                 failed = sorted(
                     parent for parent in parents
-                    if statuses.get(parent) in {"failed", "blocked", "abstained"}
+                    if statuses.get(parent) in {"failed", "blocked", "abstained", "paused"}
                 )
                 if failed:
                     blocked.append((node_id, failed))
             for node_id, failed in blocked:
                 pending.pop(node_id)
                 abstained_parents = [p for p in failed if statuses.get(p) == "abstained"]
+                paused_parents = [p for p in failed if statuses.get(p) == "paused"]
+                if paused_parents and not abstained_parents and not [
+                    p for p in failed if statuses.get(p) in {"failed", "blocked"}
+                ]:
+                    # Every blocker is paused (reviewing) — propagate the pause
+                    # rather than counting this child as a failure. A paused
+                    # ancestor means a human is reviewing upstream work; we
+                    # leave that hand-off intact and never roll back the edit.
+                    statuses[node_id] = "paused"
+                    pause_count += 1
+                    print(
+                        f"  [skip] node_id={node_id} paused: parent(s) awaiting review: "
+                        f"{', '.join(paused_parents)}",
+                        file=sys.stderr,
+                    )
+                    continue
                 if abstained_parents and len(abstained_parents) == len(failed):
                     # Every blocker abstained, so a tool that could not run is
                     # all that stands between this node and its gate: it is
@@ -1122,6 +1150,26 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                     file=sys.stderr,
                 )
             if not pending:
+                break
+
+            # Pause drain must come BEFORE the ``if not ready:`` fallback so a
+            # parked node's deep descendants (a 4-node chain like
+            # ``impl → check → review → pub``) propagate the pause instead of
+            # falling into the defensive "unresolved workflow parents" branch,
+            # which would count them as failures. Without this ordering the run
+            # ends rc=1 / status=failed and rollback runs.
+            if pause_count > 0:
+                # A human-review pause ended the run already; do not start new
+                # work. In-flight serial/parallel work finishes, then the loop
+                # exits with `pause_count` counted and `fail_count` untouched.
+                for node_id in sorted(pending, key=order.__getitem__):
+                    pending.pop(node_id)
+                    statuses[node_id] = "paused"
+                    pause_count += 1
+                    print(
+                        f"  [skip] node_id={node_id} not dispatched: run paused for human review",
+                        file=sys.stderr,
+                    )
                 break
 
             ready = []
@@ -1168,6 +1216,9 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 elif rc == _levels.ABSTAIN_RC:
                     statuses[field[0]] = "abstained"
                     abstain_count += 1
+                elif rc == REVIEW_PAUSE_RC:
+                    statuses[field[0]] = "paused"
+                    pause_count += 1
                 else:
                     statuses[field[0]] = "failed"
                     fail_count += 1
@@ -1210,10 +1261,17 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
             #      ``MO_REVISE_ROUNDS`` + per-edge ``max_rounds`` caps (F6).
             revise_groups: dict[str, list[tuple[tuple, int, str]]] = {}
             for field, rc, finish_reason in outcomes:
-                if rc == 0 or rc == _levels.ABSTAIN_RC or field[0] not in repair_edges:
+                if (rc == 0
+                        or rc == _levels.ABSTAIN_RC
+                        or rc == REVIEW_PAUSE_RC
+                        or field[0] not in repair_edges):
                     # An abstention sends nothing back: the findings would be
                     # about a tool that never ran, and re-running the implementer
                     # is the "reflect on the code and replan" the audit forbids.
+                    # A pause (REVIEW_PAUSE_RC) sends nothing back either: a
+                    # human owns the next move, not another implementer round —
+                    # kicking off ``revise/round-1/`` would move the artifact
+                    # under review out of the run dir.
                     continue
                 if finish_reason == REVIEWER_ESCALATED:
                     # The reviewer said no code round can clear this; a revise
@@ -1371,6 +1429,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
             _oc = _parallel(work_fields)
             fail_count += _count_failures(_oc)
             abstain_count += _count_abstains(_oc)
+            pause_count += _count_pauses(_oc)
         elif dispatch_mode == "partitioned":
             for node_type in _NODE_TYPE_ORDER:
                 if node_type == "rollback":
@@ -1379,15 +1438,17 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 _oc = _parallel(group)
                 fail_count += _count_failures(_oc)
                 abstain_count += _count_abstains(_oc)
+                pause_count += _count_pauses(_oc)
         else:
             pending = []
 
             def _flush_pending():
-                nonlocal fail_count, abstain_count, pending
+                nonlocal fail_count, abstain_count, pause_count, pending
                 if pending:
                     _oc = _parallel(pending)
                     fail_count += _count_failures(_oc)
                     abstain_count += _count_abstains(_oc)
+                    pause_count += _count_pauses(_oc)
                     pending = []
 
             for field in work_fields:
@@ -1400,6 +1461,8 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 rc, _fr = _dispatch_serial(field)
                 if rc == _levels.ABSTAIN_RC:
                     abstain_count += 1
+                elif rc == REVIEW_PAUSE_RC:
+                    pause_count += 1
                 elif rc != 0:
                     fail_count += 1
             _flush_pending()
@@ -1409,6 +1472,16 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 _dispatch_serial(field)
         elif rollback_fields:
             print("  [skip] rollback — no failures (escalates_to edge not triggered)")
+        # A parked run must NOT emit a verdict, NOT stamp learning, NOT hand
+        # off to auto-repair — the edit under review must survive unchanged,
+        # and the operator must see one clear signal: status=reviewing, rc=9.
+        if fail_count == 0 and pause_count > 0:
+            set_status(db, run_id, "reviewing")
+            print(
+                f"[review] run {run_id} parked for human review — "
+                "mini-ork approvals list"
+            )
+            return REVIEW_PAUSE_RC
         _emit_run_verdict(live_run_dir, fail_count, len(fields_list), task_class=task_class)
         _record_plan_artifact(db, run_id, live_run_dir)
         _post_run_learning(db, live_run_dir, run_id, task_class, fail_count=fail_count)
@@ -3262,6 +3335,47 @@ def _intervention_gate_check(root, node_id, node_type, lane, node_desc):
         return True
 
 
+def _intervention_decision(root, node_id, node_type, lane, node_desc):
+    """Resolve ``intervention_gate.intervention_decision`` for the run.
+
+    Wires the executor's env into the gate: ``MINI_ORK_RUN_ID``,
+    ``MINI_ORK_RUN_DIR``, ``MINI_ORK_DB`` (with a ``MINI_ORK_HOME``-based
+    fallback so a direct ``mini-ork execute`` call still answers). Any
+    exception during the decision is swallowed: when the policy has NO
+    ``after_nodes`` we fall back to ``("proceed", {})`` (the gate is off,
+    do not surprise dispatch); otherwise we fail closed with
+    ``("block", {"error": ...})`` — the same posture as
+    ``intervention_gate.intervention_decision`` itself.
+    """
+    del root
+    try:
+        from mini_ork.gates import intervention_gate
+    except Exception as exc:  # noqa: BLE001
+        return ("block", {"error": f"intervention_decision import failed: {exc}"})
+    run_id = context_env("MINI_ORK_RUN_ID") or os.environ.get("MINI_ORK_RUN_ID") or ""
+    run_dir = context_env("MINI_ORK_RUN_DIR") or os.environ.get("MINI_ORK_RUN_DIR") or ""
+    home = (context_env("MINI_ORK_HOME")
+            or os.environ.get("MINI_ORK_HOME")
+            or os.path.join(os.getcwd(), ".mini-ork"))
+    db = (context_env("MINI_ORK_DB")
+          or os.environ.get("MINI_ORK_DB")
+          or os.path.join(home, "state.db"))
+    try:
+        return intervention_gate.intervention_decision(
+            run_id, node_id, node_type, lane, node_desc,
+            db_path=db, run_dir=run_dir,
+        )
+    except Exception as exc:  # noqa: BLE001 — gate hook must never raise
+        try:
+            from mini_ork.gates.review_policy import load_policy
+            policy = load_policy()
+        except Exception as inner:  # noqa: BLE001
+            return ("block", {"error": f"{exc}; policy load also failed: {inner}"})
+        if getattr(policy, "after_nodes", None):
+            return ("block", {"error": str(exc)})
+        return ("proceed", {})
+
+
 def _execute_gate_check(plan_path, run_dir, dry_run):
     """Port of bash execute pre-dispatch gate (:1142-1203). A plan with
     plan_status=needs_answers AND real human_questions must NOT dispatch: print the
@@ -4155,7 +4269,12 @@ def _orchestrator_act(run_dir, db, run_id, outcomes, retry_edges, *, revision_st
         spent_usd = float(_spent) if _spent is not None else 0.0
 
         for field, rc, finish_reason in outcomes:
-            if rc == 0:
+            if rc == 0 or rc == REVIEW_PAUSE_RC:
+                # A paused node is awaiting a human decision, not a failed
+                # one — the per-run orchestrator's ``on_node_boundary`` decision
+                # core treats ``rc != 0`` as a failure, which would steer/run
+                # repair/launch a mutate on a parked run. Skip it: the gate's
+                # ``park`` already settled the next move.
                 continue
             node_id, node_type = field[0], field[1]
             action = on_node_boundary({

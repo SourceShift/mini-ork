@@ -151,9 +151,16 @@ def close_run_record(db_path: str | Path, run_id: str, run_dir: Path, *,
     Passed (``rc == 0``, no exception, ``verdict.json`` pass) → ``published``
     via :func:`finalize_passed`; anything else → ``failed``. Returns the status
     it replaced, or ``None`` when nothing changed. A cost-paused run keeps its
-    status — it waits on ``mini-ork resume``.
+    status — it waits on ``mini-ork resume``. A human-review-paused run keeps
+    its ``reviewing`` status too (kickoff hr-exec-park): the executor parked it
+    for a person, ``.review-pause`` is the marker, and rewriting it to
+    ``failed`` here would undo the gate's hand-off.
     """
     if not run_id or (run_dir / ".cost-pause").exists():
+        return None
+    if (run_dir / ".review-pause").exists():
+        # Human-review-paused: ``reviewing`` stays — ``mini-ork approvals`` is
+        # the next move. ``release_pid_file`` still runs in the caller.
         return None
     if _has_unanswered_ask(run_dir):
         return None

@@ -169,6 +169,7 @@ _harvest_framework_edit_ground_truth = _execute_delegate(
 )
 _harvest_self_migrate_artifacts = _execute_delegate("_harvest_self_migrate_artifacts")
 _intervention_gate_check = _execute_delegate("_intervention_gate_check")
+_intervention_decision = _execute_delegate("_intervention_decision")
 _learned_block = _execute_delegate("_learned_block")
 _refresh_stale_pre_impl_baseline = _execute_delegate("_refresh_stale_pre_impl_baseline")
 _required_artifacts_ok = _execute_delegate("_required_artifacts_ok")
@@ -693,8 +694,58 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
 
     # Intervention gate (bash:2258-2262): runs FIRST, for every node type (including
     # planner/reflector), before the type-specific handling.
-    if not _intervention_gate_check(root, node_id, node_type, lane, node_desc):
+    #
+    # The gate returns one of "proceed" / "park" / "block" (kickoff hr-exec-park):
+    # - block: refuse to dispatch this node — the run is irrecoverable here.
+    # - park: do not dispatch this node AND signal the executor to stop the run
+    #   entirely (REVIEW_PAUSE_RC). The run is held for human review, never
+    #   marked failed; the edit under review must survive.
+    # - proceed: nothing is waiting; dispatch normally.
+    #
+    # Rollback is exempt: when a run has both a failure and a pause (e.g. a
+    # parked node AND a failed sibling), parking the rollback would skip the
+    # rollback the executor invokes below on ``fail_count > 0`` — leaving the
+    # edit under review in place but never unwinding the failed sibling. The
+    # kickoff requires rollback on that exact path.
+    decision = "proceed"
+    info: dict = {}
+    if node_type != "rollback":
+        decision, info = _intervention_decision(root, node_id, node_type, lane, node_desc)
+    if decision == "block":
+        print(f"[review] node_id={node_id} blocked: {info}", file=sys.stderr)
         return 1, "blocked"
+    if decision == "park":
+        # Persist a JSON sidecar the operator can grep for the awaiting list
+        # plus the inbox ids; the run ends in status="reviewing" so the
+        # board, the dashboard and any future auto-resume path all see the
+        # same hand-off. Then signal REVIEW_PAUSE_RC so the executor loop
+        # stops dispatching new nodes and ends the run with rc=9.
+        try:
+            from mini_ork.gates import node_review  # noqa: PLC0415
+            payload = {
+                "waiting_node": node_id,
+                "awaiting": list(info.get("awaiting") or []),
+                "inbox_ids": list(info.get("inbox_ids") or []),
+                "ts": int(time.time()),
+            }
+            os.makedirs(run_dir_eff, exist_ok=True)
+            try:
+                with open(os.path.join(run_dir_eff, ".review-pause"), "w") as fh:
+                    json.dump(payload, fh)
+            except OSError:
+                pass
+            publish_env({"MO_NODE_FINISH_REASON": "paused_for_review"})
+            first_awaiting = (info.get("awaiting") or ["?"])[0]
+            print(
+                f"[review] parked before {node_id}: awaiting human review of "
+                f"{first_awaiting} — mini-ork approvals approve {run_id or ''} "
+                f"--node {first_awaiting}",
+                file=sys.stderr,
+            )
+            return node_review.REVIEW_PAUSE_RC, "paused_for_review"
+        except Exception as exc:  # noqa: BLE001 — never raise out of a gate
+            print(f"[review] park failed for {node_id}: {exc}", file=sys.stderr)
+            return 1, "blocked"
 
     # planner/reflector don't dispatch an LLM — handled after the intervention gate
     # (bash routes them through the same gate then falls to their case). Early-phase

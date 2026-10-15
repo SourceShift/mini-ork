@@ -1238,6 +1238,35 @@ def _isolate_run(target, home, run_id, kickoff, source):
     return True, ws
 
 
+def _handle_execute_park(run_rc: int, execute_out: str, execute_err: str,
+                         run_id: str, run_dir: str | None) -> tuple[int, bool]:
+    """Tiny testable helper for the parked-run lifecycle branch (kickoff hr-exec-park).
+
+    Pure with respect to side effects: writes the parked line to stderr and
+    returns ``(rc, continue_lifecycle)``. ``continue_lifecycle`` is False iff
+    the run was parked — the caller must skip auto-repair, rubric, verify,
+    reflect and ``retry_notify``, mirroring the abstention's "not a failure,
+    publish withheld" rule.
+
+    Note: this helper does NOT re-write ``execute_out`` / ``execute_err`` — the
+    lifecycle already published them once, right after the execute subprocess
+    returned (kickoff hr-exec-park revision: a second copy confused operators
+    looking at the run log).
+    """
+    del execute_out, execute_err, run_dir
+    try:
+        from mini_ork.gates.node_review import REVIEW_PAUSE_RC  # noqa: PLC0415
+    except Exception:  # noqa: BLE001 — review module absent → no park possible
+        return run_rc, True
+    if run_rc != REVIEW_PAUSE_RC:
+        return run_rc, True
+    sys.stderr.write(
+        f"[review] run {run_id} parked for human review — "
+        "mini-ork approvals list\n"
+    )
+    return REVIEW_PAUSE_RC, False
+
+
 def _run_lifecycle_impl(argv, root, sink) -> int:
     t0 = int(time.time())
     # ── flag pre-parse: pull --deadline / --placement / --env / --set out ──
@@ -1655,14 +1684,27 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
         sys.stderr.write(f"deadline_hit after execute; best-so-far artifact: {artifact or '<none>'}\n")
         return run_rc
 
+    # Parked-run branch (kickoff hr-exec-park): skip auto-repair, rubric,
+    # verify, reflect, retry_notify — the edit under review must survive
+    # unchanged and only one exit signal goes back to the operator: rc=9.
     _run_dir = context_env("MINI_ORK_RUN_DIR", "")
     if not _run_dir and plan_path:
         _run_dir = os.path.dirname(plan_path)
     if _run_dir and _run_dir != "." and os.path.isdir(_run_dir):
+        # Write the execute log BEFORE the park branch so a parked run
+        # carries the same log a passing run does (kickoff hr-exec-park
+        # revision: previously returned before _write_execute_log).
         try:
             _write_execute_log(_run_dir, execute_out, execute_err)
         except OSError:
             pass
+
+    _run_dir_for_park = context_env("MINI_ORK_RUN_DIR", "")
+    run_rc, continue_lifecycle = _handle_execute_park(
+        run_rc, execute_out, execute_err, run_id, _run_dir_for_park,
+    )
+    if not continue_lifecycle:
+        return run_rc
 
     # ── auto-repair: hand the failure off as soon as execute has decided it ──.
     # UNCONDITIONAL — a withheld publish sets status='failed' during execute
