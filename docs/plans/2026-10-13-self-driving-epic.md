@@ -126,6 +126,19 @@ SDE-1 and SDE-2 touch disjoint files and run in parallel.
   runs ```` ```measure ```` blocks from the pre-run snapshot and enforces the
   kickoff's Required artifacts — the verifier gap that let SDE-1/2 pass 1 ship
   untested. Next verifier gap: F3, blind spec tests on a second lane.
+- **SDE-3b merged** (2026-10-15): ledger + calibrated bar `6f60a89c` (end to end:
+  35 right @0.95 + 5 wrong @0.30 → bar 0.95; confident-wrong history → refuse);
+  model diagnoser `a1f458f1` (verbatim-cited evidence, never the implementer's
+  model, asked once per run; live smoke on two real runs grounded both, ~$0.03
+  each, and found a cause the hand triage missed). Both were salvaged from runs
+  that failed only on harness bugs.
+- **VG-3 merged** `640f80d3` (blind spec tests by GLM before implementation) and
+  **VG-1b** `23722ba8` (kickoff commands keep `MINI_ORK_RUN_DIR`). The prose-scan
+  gap was fixed upstream by `ddc88c43`. Remaining VG-1c: measures on the engine
+  venv interpreter (`python3` on PATH is 3.9).
+- **Next: SDE-4 supervisor** — revive parked runs when their fix lands and label
+  the ledger; mark superseded failures; clear orphaned `repairing` state; per-epic
+  budget (gaps G1–G3 in `docs/todos/2026-10-15-failed-runs-4d-revive-plan.md`).
 
 ## Two tiers
 
