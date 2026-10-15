@@ -188,12 +188,31 @@ def _auth_headers() -> dict:
     return headers
 
 
+def _cache_home() -> str:
+    """The home a *cache* may write to, or ``""`` when there is none.
+
+    ``MINI_ORK_HOME`` wins outright. Without it, honour ``./.mini-ork`` only
+    when it already exists — a cache must never *create* a home, because
+    ``makedirs`` on a relative default writes into whatever directory the
+    process happens to sit in. That is how a ``.mini-ork`` appeared inside the
+    shipped ``mini-ork IDE.app/Contents/MacOS`` and invalidated the bundle's
+    code signature: an engine page rendered with the app bundle as its cwd.
+    """
+    home = os.environ.get("MINI_ORK_HOME")
+    if home:
+        return home
+    return ".mini-ork" if os.path.isdir(".mini-ork") else ""
+
+
 def _ping_cache_file() -> str:
-    d = os.path.join(os.environ.get("MINI_ORK_HOME", ".mini-ork"), "state")
+    home = _cache_home()
+    if not home:
+        return ""
+    d = os.path.join(home, "state")
     try:
         os.makedirs(d, exist_ok=True)
     except OSError:
-        pass
+        return ""
     return os.path.join(d, "cn_ping.cache")
 
 
@@ -203,17 +222,23 @@ def _section_cache_dir() -> str:
     The directory is created on demand; cache misses are silent. A separate
     directory from the ping cache keeps a one-off render from clobbering the
     short-lived ping state."""
-    d = os.path.join(os.environ.get("MINI_ORK_HOME", ".mini-ork"), "cache", "cn")
+    home = _cache_home()
+    if not home:
+        return ""
+    d = os.path.join(home, "cache", "cn")
     try:
         os.makedirs(d, exist_ok=True)
     except OSError:
-        pass
+        return ""
     return d
 
 
 def _section_cache_path(section: str, scope: str) -> str:
+    directory = _section_cache_dir()
+    if not directory:
+        return ""
     safe = urllib.parse.quote(scope or "_root", safe="")
-    return os.path.join(_section_cache_dir(), f"{section}__{safe}.json")
+    return os.path.join(directory, f"{section}__{safe}.json")
 
 
 def _get_text(path: str, *, timeout: float | None = None) -> str:
@@ -271,7 +296,7 @@ def available() -> bool:
         return False
     cache = _ping_cache_file()
     now = int(time.time())
-    if os.path.isfile(cache):
+    if cache and os.path.isfile(cache):
         try:
             ts, state = open(cache).read().split()[:2]
             if now - int(ts) < _ping_ttl():
@@ -294,10 +319,11 @@ def available() -> bool:
             code = str(r.status)
     except Exception:
         code = "000"
-    try:
-        open(cache, "w").write(f"{now} {'up' if code == '200' else 'down'}\n")
-    except OSError:
-        pass
+    if cache:
+        try:
+            open(cache, "w").write(f"{now} {'up' if code == '200' else 'down'}\n")
+        except OSError:
+            pass
     return code == "200"
 
 
@@ -412,7 +438,7 @@ def _read_section_cache(section: str, scope: str) -> tuple[dict | None, int]:
     age of the slot when readable, else ``0`` so the caller treats the slot
     as a fresh cache miss and does NOT render an as-of label."""
     path = _section_cache_path(section, scope)
-    if not os.path.isfile(path):
+    if not path or not os.path.isfile(path):
         return None, 0
     try:
         raw = json.loads(open(path, encoding="utf-8").read())
@@ -430,6 +456,8 @@ def _write_section_cache(section: str, scope: str, payload: dict) -> None:
     """Persist one cache slot. Failures are silent — the cache is best-effort
     graceful degradation, never a critical path."""
     path = _section_cache_path(section, scope)
+    if not path:
+        return
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
