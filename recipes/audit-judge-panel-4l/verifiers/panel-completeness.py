@@ -16,6 +16,11 @@
 #
 # rc IS the verdict (0 = complete, 1 = miss); the JSON on stdout explains it.
 
+# The runner execs this with its own interpreter, but an operator re-running
+# the gate by hand gets whatever ``python3`` is first on PATH (3.9 on macOS);
+# deferred annotations keep the ``X | None`` hints from failing at import there.
+from __future__ import annotations
+
 import glob
 import json
 import os
