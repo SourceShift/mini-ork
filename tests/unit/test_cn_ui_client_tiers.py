@@ -350,11 +350,19 @@ def test_sessions_by_file_recent_orders_and_scopes(fresh_env, monkeypatch) -> No
 
 
 def test_cn_status_runs_offline(fresh_env, monkeypatch) -> None:
-    """``cn status`` answers tier/endpoint/reachable/latency with no server
-    and exits 0 (reachable: no is a valid answer, not an error)."""
+    """``cn status`` answers tier/endpoint/reachable/latency with the
+    endpoint pinned to a dead port (127.0.0.1:9, nothing listens) and
+    exits 0 — reachable: no is a valid answer, not an error. The pin
+    keeps the test hermetic: a live ContextNest on the machine's real
+    port cannot mask the unreachable behavior under test."""
     from mini_ork.cli import cn_cmd
 
-    # No server, no env overrides.
+    # No real server: pin CN_BASE_URL to a port nothing listens on so
+    # the in-process probe sees a deterministic ECONNREFUSED instead of
+    # the operator's local CN (which may or may not be up). fresh_env
+    # has already cleared CN_BASE_URL, so this setenv is the effective
+    # endpoint for the probe path.
+    monkeypatch.setenv("CN_BASE_URL", "http://127.0.0.1:9")
     parser = cn_cmd.build_parser()
     args = parser.parse_args(["status", "--json"])
     rc = cn_cmd._cmd_status(args)
@@ -376,11 +384,17 @@ def test_cn_status_runs_offline(fresh_env, monkeypatch) -> None:
 def test_cn_status_subprocess_offline(fresh_env, monkeypatch) -> None:
     """End-to-end: ``python -m mini_ork.cli.cn_cmd status --json`` returns
     0 and a JSON document with the right shape — the subprocess path that
-    ``mini-ork cn status`` actually takes."""
+    ``mini-ork cn status`` actually takes. The child process inherits
+    ``CN_BASE_URL`` pointed at a dead port (127.0.0.1:9) so a live
+    ContextNest on the machine's real port cannot mask the probe."""
     env = os.environ.copy()
     for k in ("MO_DISABLE_CN", "CN_BASE_URL", "CN_TOKEN_KEY", "CN_TIER",
               "CN_PING_TIMEOUT_SEC", "CN_TIMEOUT_SEC", "MINI_ORK_SECRETS"):
         env.pop(k, None)
+    # Pin the child to a dead endpoint so the subprocess probe sees a
+    # deterministic ECONNREFUSED. MO_DISABLE_CN stays cleared so the
+    # simple-tier probe path is the one exercised.
+    env["CN_BASE_URL"] = "http://127.0.0.1:9"
     env["MINI_ORK_HOME"] = str(fresh_env)
     env["PYTHONPATH"] = str(REPO)
     proc = subprocess.run(
