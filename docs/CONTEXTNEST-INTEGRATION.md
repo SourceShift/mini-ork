@@ -61,18 +61,51 @@ We do **not** wrap `/api/v1/tools/store` from mini-ork. Canonical writes go thro
 
 Dispatch table mapping mini-ork's 8 workflow node types to role-specific CN endpoint combinations. Each role gets the slice of substrate it actually needs — pre-PR-3 every role got the same flat retrieve query.
 
-| Role | Sub-pack composition |
-|---|---|
-| **planner** | capsule (since=14d) + sessions-by-intent (task_class) + inbox (urgency=now) + basins (project=cwd) |
-| **researcher** | broad cn_retrieve (limit=8) + sessions-by-feature |
-| **implementer** / **worker** | sessions-by-file (per file in scope) + features-recent (48h) + graph neighbours of top retrieve hit |
-| **reviewer** / **verifier** | capsule (since=30d) post-hoc filtered to **only Failures + Verifications + Risks** sections (Decisions stripped) |
-| **reflector** | sessions-by-intent (task_class) + capsule (since=30d) full digest |
-| **publisher** / **rollback** | features-recent (24h) + inbox (all urgency tiers) |
+The 6 sub-pack definitions are pure CN orchestration and remain so; only the **planner** pack is wired at runtime. The Python port (`mini_ork/steering/context_role_packs.py::role_pack_md`) returns `""` for every role except `planner` — the other sub-packs are defined and unit-smoke-tested but never invoked, exactly as called out under "Gaps" below.
+
+| Role | Sub-pack composition | Runtime status |
+|---|---|---|
+| **planner** | capsule (since=14d) + sessions-by-intent (task_class) + inbox (urgency=now) + basins (project=cwd) | ✅ wired (`mini_ork/cli/plan.py:765` + `mini_ork/steering/context_role_packs.py:185`) |
+| **researcher** | broad cn_retrieve (limit=8) + sessions-by-feature | 🟡 defined, not invoked (returns `""`) |
+| **implementer** / **worker** | sessions-by-file (per file in scope) + features-recent (48h) + graph neighbours of top retrieve hit | 🟡 defined, not invoked (returns `""`) |
+| **reviewer** / **verifier** | capsule (since=30d) post-hoc filtered to **only Failures + Verifications + Risks** sections (Decisions stripped) | 🟡 defined, not invoked (returns `""`) |
+| **reflector** | sessions-by-intent (task_class) + capsule (since=30d) full digest | 🟡 defined, not invoked (returns `""`) |
+| **publisher** / **rollback** | features-recent (24h) + inbox (all urgency tiers) | 🟡 defined, not invoked (returns `""`) |
 
 Public entry: `context_role_pack_md <role> <task_brief_path> [files_csv]` → emits multi-section markdown. Empty when CN unreachable or `MO_DISABLE_CN=1`.
 
 Unknown role → falls back to `python3 -m mini_ork.context_assembler contextnest-atoms`.
+
+### Coord surface (`mini_ork/cn_client.py::coord_*`)
+
+The `coord_*` helpers in `mini_ork/cn_client.py` are mini-ork's principal-coordination surface against CN. They deliberately do **not** consult `available()` (a `mini-ork concord` run must keep retrying the upsert on each heartbeat even when the ping cache says "down") and do **not** route through `_fire` (which would swallow the very errors the CLI maps to exit codes). Connection errors raise `CoordUnavailable`; HTTP 4xx/5xx raise `CoordHTTPError(status, body)`.
+
+| Function | What | Endpoint |
+|---|---|---|
+| `coord_upsert_principal(principal_id, fields)` | Register (and heartbeat) a principal. | `PUT /api/v1/coord/principals/{id}` |
+| `coord_list_principals(status="active")` | List principals, newest `last_seen` first. | `GET /api/v1/coord/principals?status=…` |
+| `coord_get_principal(principal_id)` | One principal. | `GET /api/v1/coord/principals/{id}` |
+| `coord_end_principal(principal_id)` | Mark a principal ended. | `DELETE /api/v1/coord/principals/{id}` |
+| `coord_send(principal_id, sender, body)` | Send a message to a principal. | `POST /api/v1/coord/principals/{id}/messages` |
+| `coord_inbox(principal_id, unacked=True)` | Unacked messages. | `GET /api/v1/coord/principals/{id}/messages?unacked=…` |
+| `coord_hot_claims()` | Live activity-derived claims on hot files. | `GET /api/v1/coord/hot-claims` |
+| `coord_owns_violations(since=0)` | Recorded `--owns` scope violations. | `GET /api/v1/coord/owns-violations?since=<seq>` |
+| `coord_ack(principal_id, msg_id, by)` | Acknowledge a message. | `POST /api/v1/coord/principals/{id}/messages/{msg_id}/ack` |
+
+Wire timeout: `CN_COORD_TIMEOUT_SEC` (default 3 s). The CLI is the only consumer — `mini-ork concord` maps the raise-based outcomes to exit codes so an operator can tell "fix the secret store" (exit 5) from "server is down" (exit 3) from "server rejected the call" (exit 4).
+
+### Graph endpoints (`mini_ork/cn_client.py::graph_*`)
+
+The graph projection is the only deliberate exception to "no direct CN write path from mini-ork": it projects *derived* entities (`Run` / `Trace` / `GradientTarget` / `TaskClass` and the four whitelisted edge triples) that mini-ork already owns in its own sqlite. Best-effort, fire-and-forget, chunked at 500 combined items per request (the server 413s above 2000 and a full `failure_links` backfill is 2023 rows).
+
+| Function | What | Endpoint |
+|---|---|---|
+| `graph_upsert(nodes, edges, source="mini-ork")` | Project one batch of nodes/edges. | `POST /api/v1/graph/upsert` |
+| `graph_upsert_batched(nodes, edges, source="mini-ork")` | Chunked upsert; returns the number of requests fired. | `POST /api/v1/graph/upsert` (×N) |
+| `graph_neighbors(node_id, limit=8)` | Neighbours of a fragment. | `GET /api/v1/graph/neighbors?node_id=…&limit=…` |
+| `graph_path(src, dst)` | Shortest path between two nodes. | `GET /api/v1/graph/path?from=…&to=…` |
+
+Whitelisted edge triples (the server 400s on anything else): `HAS_TRACE` (Run→Trace), `LINKED_TO` (Trace→GradientTarget), `OF_CLASS` (Trace→TaskClass), `OF_CLASS` (GradientTarget→TaskClass). An edge endpoint that does not byte-equal a node id silently matches nothing server-side, so callers build edges with `_graph_edge` from the same id map.
 
 ### Planner pre-fetch (`bin/mini-ork-plan`)
 
@@ -239,3 +272,7 @@ All injections are best-effort + bounded (guarded by `MO_USE_ROLE_PACKS=1` /
 fail a plan/worker/node. Verified: PR-3 role-pack smoke 9/9, `test_cn_client`
 10/10, `test_context_assembler` 7/7, `bash -n` clean on all three files, no new
 shellcheck findings.
+
+### Status (2026-10-15): role packs are planner-only at runtime
+
+The "Gap 2" fix above landed chokepoints that *can* invoke other role packs, but the `mini_ork/cli/plan.py` and `mini_ork/steering/context_role_packs.py` Python port remains planner-only — the dispatcher short-circuits to `""` for any role other than `planner` (see the `role_pack_md` guard chain in `mini_ork/steering/context_role_packs.py:185-191`). Until the other five sub-packs are re-implemented in the Python port and given call sites in `mini_ork/cli/plan.py` (or whichever planner-side invocation point supersedes `bin/mini-ork-plan`), the `MO_USE_ROLE_PACKS=1` flag effectively means "planner only". The IDE Context page (`mini_ork/ide_pages/context.py`) reports this honestly under **What the planner receives**, so an operator looking at the page sees the actual runtime contract, not the six-role table above.
