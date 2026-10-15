@@ -1186,7 +1186,15 @@ def _live_probe_native(model: str, entry: Mapping,
     if cred is None:
         return None
     cred_str, headers = cred
-    url = str(entry.get("base_url") or "").strip() or "https://api.anthropic.com"
+    # The endpoint MUST be the one dispatch will use, or the probe grades a
+    # credential against a host that never sees it. A Claude Code session (or a
+    # launcher) that points ANTHROPIC_BASE_URL at a gateway ships that gateway's
+    # token in ANTHROPIC_AUTH_TOKEN; probing api.anthropic.com with it answers
+    # 401, which would abort EVERY run launched from that environment. Precedence
+    # mirrors the CLI: the provider entry's own base_url, then the ambient env.
+    url = (str(entry.get("base_url") or "").strip()
+           or str(runtime.get("ANTHROPIC_BASE_URL") or "").strip()
+           or "https://api.anthropic.com")
     url = url.rstrip("/") + "/v1/messages"
     cache_path = Path(runtime.get("MINI_ORK_HOME") or ".mini-ork") / "lane-probe-cache.json"
     try:

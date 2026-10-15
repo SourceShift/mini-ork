@@ -35,6 +35,9 @@ def lane(tmp_path, monkeypatch):
         "  fakesonnet:\n"
         "    kind: anthropic-native\n"
         "    base_url: https://gateway.invalid/anthropic\n"
+        "    model: claude-haiku-4-5\n"
+        "  fakebare:\n"
+        "    kind: anthropic-native\n"
         "    model: claude-haiku-4-5\n")
     monkeypatch.setenv("MINI_ORK_PROVIDERS", str(reg))
     home = tmp_path / "home"
@@ -195,3 +198,50 @@ def test_native_probe_skipped_under_pytest_without_opt_in(lane):
 
     assert p.lane_health("fakeopus", environment=quiet).ok
     assert calls == []
+
+
+# ── the probe target must be the endpoint dispatch uses ──────────────────────
+
+
+def test_ambient_anthropic_base_url_is_the_probe_target(lane):
+    """A native lane with no ``base_url`` in the registry inherits the ambient
+    ``ANTHROPIC_BASE_URL``. That pairing is the normal shape of a Claude Code
+    session (or launcher) routed through a gateway: the gateway's token sits in
+    ``ANTHROPIC_AUTH_TOKEN`` and api.anthropic.com has never seen it. Probing
+    the default host there answers 401 — a false abort for EVERY run in that
+    environment, which is why the probe must follow the CLI's own base_url."""
+    env, answer, calls = lane
+    answer(200)
+    e = env(ANTHROPIC_BASE_URL="https://envgw.invalid/anthropic")
+    e.pop("ANTHROPIC_API_KEY", None)
+    e["ANTHROPIC_AUTH_TOKEN"] = "sk-gateway-token"
+
+    assert p.lane_health("fakebare", environment=e).ok
+    assert calls[0][0] == "https://envgw.invalid/anthropic/v1/messages"
+    assert calls[0][1].get("authorization") == "Bearer sk-gateway-token"
+
+
+def test_registry_base_url_outranks_the_ambient_one(lane):
+    """Precedence mirrors the CLI: the provider entry's own ``base_url`` wins
+    over ``ANTHROPIC_BASE_URL``. Otherwise an operator who pinned a lane to a
+    specific gateway could have it silently re-pointed by their shell."""
+    env, answer, calls = lane
+    answer(200)
+
+    h = p.lane_health(
+        "fakeopus",
+        environment=env(ANTHROPIC_BASE_URL="https://envgw.invalid/anthropic"))
+
+    assert h.ok
+    assert calls[0][0] == "https://gateway.invalid/anthropic/v1/messages"
+
+
+def test_native_probe_defaults_to_anthropic_with_no_url_anywhere(lane):
+    """Neither the entry nor the environment names an endpoint → the default
+    host. This is the BYO-key case: a bare ``ANTHROPIC_API_KEY`` against the
+    real API, no gateway involved."""
+    env, answer, calls = lane
+    answer(200)
+
+    assert p.lane_health("fakebare", environment=env()).ok
+    assert calls[0][0] == "https://api.anthropic.com/v1/messages"
