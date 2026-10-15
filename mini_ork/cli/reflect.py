@@ -334,6 +334,16 @@ def main(argv: list[str] | None = None) -> int:
         try:
             from mini_ork.learning import code_findings
             cf_stats = code_findings.harvest(mini_ork_home, db=db_path)
+            # Harvest dedupes within a run, but rows written before that rule
+            # linger as verdict echoes of a reviewer's own row. Prune them right
+            # after the harvest that would have skipped them, inside the same
+            # fail-soft try (a prune failure is as harmless to reflect as a
+            # harvest failure), and stay quiet unless it actually removed rows.
+            cf_pruned = code_findings.prune_duplicates(db_path)
+            if cf_pruned > 0:
+                sys.stdout.write(
+                    f"  [code_findings] pruned {cf_pruned} duplicate(s)\n"
+                )
         except Exception as exc:  # a side-channel must never crash reflect
             sys.stderr.write(f"  [code_findings] skipped: {exc}\n")
             cf_stats = None

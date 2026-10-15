@@ -888,12 +888,32 @@ def _harvest_run(con, run_id, run_dir, repo_root):
     skipped = 0
     paths = _git_ls_files(repo_root)
     target_cwd = _run_target_cwd(run_dir)
-    for source, findings, ts, unparseable in _iter_run_files(run_dir):
+    # A run's verdict file echoes the findings its reviewers already reported, so
+    # one structured finding lands twice in the same run (the kickoff's 38 doubled
+    # rows): once as the reviewer's own source and once as ``review:verdict``.
+    # Dedupe within the run before insert on the normalized key
+    # (file, line, issue.strip()) — ``review:*`` sources only, so verifier rows
+    # are never collapsed (two verifiers failing for the same reason are two
+    # distinct checks, and a verifier row is never shadowed by a review). The
+    # verdict source is processed *last*, so a reviewer-reported finding keeps its
+    # non-verdict source and the echo is skipped, while a finding only the verdict
+    # carries still inserts. ``_fingerprint`` is untouched: existing rows keep
+    # their identity and an explicit re-harvest stays a no-op.
+    entries = list(_iter_run_files(run_dir))
+    entries.sort(key=lambda e: 1 if e[0] == "review:verdict" else 0)
+    seen_review: set = set()
+    for source, findings, ts, unparseable in entries:
         if unparseable:
             skipped += 1
+        is_review = source.startswith("review:")
         for finding in findings:
             file = normalize_file(finding["file"], repo_root=repo_root,
                                   known_paths=paths, target_cwd=target_cwd)
+            if is_review:
+                key = (file, finding["line"], (finding["issue"] or "").strip())
+                if key in seen_review:
+                    continue
+                seen_review.add(key)
             fingerprint = _fingerprint(
                 run_id, source, file, finding["line"], finding["issue"]
             )
@@ -1097,6 +1117,62 @@ def prune_receipts(db=None) -> int:
         except sqlite3.Error:
             pass
         return 0
+    finally:
+        try:
+            con.close()
+        except sqlite3.Error:
+            pass
+
+
+def prune_duplicates(db=None) -> int:
+    """Delete ``review:verdict`` rows an earlier harvest doubled with a
+    reviewer's own row.
+
+    The run-scoped dedupe in ``_harvest_run`` stops *new* verdict echoes, but rows
+    written before it linger (INSERT OR IGNORE by fingerprint keeps them), so a
+    table can carry each structured finding twice — once as the reviewer's source
+    and once as ``review:verdict``. This deletes exactly the echoes: a
+    ``review:verdict`` row is dropped when *another* ``review:*`` row in the same
+    run — same normalized ``(run_id, file, line, issue)``, with ``IFNULL`` so
+    NULL-bearing rows match the harvest key — reports it under a non-verdict
+    source. Verifier rows and verdict-only findings are never touched, so a
+    finding only the verdict carried survives.
+
+    Idempotent: a second call returns 0. Cold-safe like the rest of the write
+    path — a missing DB is a silent no-op and nothing here raises. Returns the
+    number of rows deleted.
+    """
+    con = _open(db)
+    if con is None:
+        return 0
+    try:
+        try:
+            cur = con.execute(
+                """
+                DELETE FROM code_findings
+                 WHERE source = 'review:verdict'
+                   AND EXISTS (
+                       SELECT 1
+                         FROM code_findings AS o
+                        WHERE o.run_id = code_findings.run_id
+                          AND o.source LIKE 'review:%'
+                          AND o.source <> 'review:verdict'
+                          AND IFNULL(o.file, '') = IFNULL(code_findings.file, '')
+                          AND IFNULL(o.line, -1) = IFNULL(code_findings.line, -1)
+                          AND o.issue = code_findings.issue
+                   )
+                """
+            )
+            deleted = int(cur.rowcount or 0)
+            con.commit()
+            return deleted
+        except sqlite3.Error as e:
+            print(f"  [warn] code_findings: prune_duplicates failed: {e}", file=sys.stderr)
+            try:
+                con.rollback()
+            except sqlite3.Error:
+                pass
+            return 0
     finally:
         try:
             con.close()
@@ -1327,6 +1403,8 @@ def _print_human(cmd, result) -> None:
                   f"worst={r['worst_severity']} [{cats}]")
     elif cmd == "prune":
         print(f"pruned {result} receipt row(s)")
+    elif cmd == "prune-duplicates":
+        print(f"pruned {result} duplicate row(s)")
     else:  # show
         for r in result:
             loc = r["file"] or ""
@@ -1360,6 +1438,8 @@ def main(argv=None) -> int:
     p_show.add_argument("path", help="file path prefix")
     sub.add_parser("prune", parents=[common],
                    help="delete harvested receipt notes (check reports, not problems)")
+    sub.add_parser("prune-duplicates", parents=[common],
+                   help="delete review:verdict rows echoing another review finding")
 
     args = ap.parse_args(argv)
     home = args.home or os.environ.get("MINI_ORK_HOME") or _DEFAULT_HOME
@@ -1370,6 +1450,8 @@ def main(argv=None) -> int:
         result = areas(db=args.db, since_days=args.days)
     elif args.cmd == "prune":
         result = prune_receipts(db=args.db)
+    elif args.cmd == "prune-duplicates":
+        result = prune_duplicates(db=args.db)
     else:  # show
         result = findings_for(args.path, db=args.db)
 
