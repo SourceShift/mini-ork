@@ -26,6 +26,7 @@ Four groups, in priority order:
 from __future__ import annotations
 
 import importlib.util
+import os
 import json
 import subprocess
 import sys
@@ -404,3 +405,41 @@ def test_a_bare_pytest_is_swapped_for_this_interpreter(monkeypatch, tmp_path):
     assert mod._sh("pytest tests/unit -q") == f"{sys.executable} -m pytest tests/unit -q"
     assert mod._sh("python3.11 -m pytest -q") == "python3.11 -m pytest -q"
     assert mod._sh("ruff check mini_ork") == "ruff check mini_ork"
+
+
+def test_a_command_naming_the_run_dir_gets_it_bound(monkeypatch, tmp_path):
+    """sde-3b2-ledger (2026-10-15): the kickoff wrote junit to
+    ``${MINI_ORK_RUN_DIR}/ledger-junit.xml``; the scrubbed replay env expanded it
+    empty and pytest crashed writing ``/ledger-junit.xml`` after 47 passing tests."""
+    mod, captured, _wt = _load_fwedit_verifier(monkeypatch, tmp_path)
+    run_dir = str(tmp_path / "run")
+
+    assert mod._bind_run_dir("ruff check mini_ork") == "ruff check mini_ork"
+    bound = mod._bind_run_dir('pytest -q --junitxml="${MINI_ORK_RUN_DIR}/j.xml"')
+    assert bound.startswith(f"MINI_ORK_RUN_DIR={run_dir}; ")
+
+    _profile(mod, tmp_path, {"verification_command": [
+        'pytest -q --junitxml="${MINI_ORK_RUN_DIR}/j.xml"', "ruff check mini_ork"]})
+    pre = len(captured)
+    mod._ev = open(tmp_path / "run" / "verifier-test.log", "a")
+    try:
+        assert mod._epic_verification_commands_pass() is True
+    finally:
+        mod._ev.close()
+    argvs = [r["argv"] for r in captured[pre:]]
+    assert argvs[0].startswith(f"MINI_ORK_RUN_DIR={run_dir}; ")
+    assert argvs[1] == "ruff check mini_ork"
+
+
+def test_the_bound_run_dir_expands_but_is_not_exported(monkeypatch, tmp_path):
+    """The binding must not undo the scrub: the command line sees the run dir, the
+    processes it starts (the tests) still do not."""
+    mod, _cap, _wt = _load_fwedit_verifier(monkeypatch, tmp_path)
+    cmd = mod._bind_run_dir(
+        'printf "%s|" "${MINI_ORK_RUN_DIR}"; '
+        'sh -c \'printf "%s" "${MINI_ORK_RUN_DIR:-unset}"\'')
+    env = {k: v for k, v in os.environ.items() if k != "MINI_ORK_RUN_DIR"}
+    env["PATH"] = "/usr/bin:/bin"
+    proc = subprocess.Popen(cmd, shell=True, env=env, stdout=subprocess.PIPE)
+    out, _ = proc.communicate(timeout=10)
+    assert out.decode() == f"{tmp_path / 'run'}|unset"

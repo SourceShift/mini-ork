@@ -17,6 +17,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -395,6 +396,20 @@ def _sh(cmd):
     return cmd
 
 
+def _bind_run_dir(cmd):
+    """Bind ``$MINI_ORK_RUN_DIR`` for a kickoff command that names it.
+
+    The replay env is scrubbed of it so the tests under the command never see the
+    live run dir, but a kickoff writing ``--junitxml="${MINI_ORK_RUN_DIR}/x.xml"``
+    then expanded it empty and crashed on a read-only ``/x.xml`` after every test
+    passed (sde-3b2-ledger, 2026-10-15). An unexported shell assignment reaches the
+    command line's expansion and not the processes the command starts.
+    """
+    if "MINI_ORK_RUN_DIR" not in cmd:
+        return cmd
+    return f"MINI_ORK_RUN_DIR={shlex.quote(RUN_DIR)}; {cmd}"
+
+
 def _epic_verification_commands_pass():
     if os.environ.get("MO_EPIC_VERIFY_CMDS") == "0":
         return True
@@ -415,7 +430,7 @@ def _epic_verification_commands_pass():
         _ev.write(f"  $ {_sh(cmd)}\n")
         _ev.flush()
         try:
-            proc = subprocess.run(_sh(cmd), shell=True, cwd=WORKTREE, env=env,
+            proc = subprocess.run(_bind_run_dir(_sh(cmd)), shell=True, cwd=WORKTREE, env=env,
                                   stdout=_ev, stderr=subprocess.STDOUT,
                                   timeout=_VERIFY_CMD_TIMEOUT_S)
         except subprocess.TimeoutExpired:
