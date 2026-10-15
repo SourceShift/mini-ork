@@ -5,12 +5,22 @@ is the only place a human acts. The verbs mirror the policy/ledger split:
 
   ``list [--json]``        pending ``merge:`` and ``node:`` rows in the inbox
   ``show <run_id> [--json]``  ``status()`` plus the run's pending node reviews
-  ``approve <run_id> [--head SHA | --node NODE_ID] [--note TEXT]``
+  ``approve <run_id> [--head SHA | --node NODE_ID] [--note TEXT]
+                              [--no-resume]``
                               resolve the pending row ``approved``
   ``reject <run_id> (--node NODE_ID)? --note TEXT``
                               resolve the pending row ``rejected`` (or the
                               ``request-changes`` alias verb)
   ``policy [--json]``    the loaded ``ReviewPolicy``
+
+A node ``approve`` / ``reject`` that resolves the LAST pending row of a
+parked run ALSO resumes it: the executor parked the run with rc 9 and a
+``.review-pause`` sentinel waiting on the inbox; once nothing is pending,
+``_spawn_recover`` launches ``mini-ork recover <run> --strategy resume``
+(or ``--from-node <node> --strategy retry`` for a request-changes) so the
+run picks up where it paused. ``--no-resume`` skips the spawn and prints
+the manual command instead — handy for tests, debugging, or operators who
+want to inspect state before letting the run proceed.
 
 Exit codes mirror the rest of the CLI surface: 0 ok, 1 a refused action (an
 ``ApprovalError`` from the ledger, a missing workspace, a failed ``git
@@ -26,6 +36,7 @@ import argparse
 import getpass
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -39,7 +50,7 @@ from mini_ork.gates.merge_approval import (
 from mini_ork.gates.oversight_inbox import pending
 from mini_ork.gates.review_policy import load_policy
 
-__all__ = ["main"]
+__all__ = ["main", "_spawn_recover", "_maybe_resume_parked_run"]
 
 
 _USAGE = """\
@@ -49,9 +60,9 @@ Usage:
   mini-ork approvals list [--json]
   mini-ork approvals show <run_id> [--json]
   mini-ork approvals approve <run_id> [--head SHA | --node NODE_ID]
-                                    [--note TEXT] [--base SHA]
-  mini-ork approvals reject <run_id> [--node NODE_ID] --note TEXT
-  mini-ork approvals request-changes <run_id> [--node NODE_ID] --note TEXT
+                                    [--note TEXT] [--base SHA] [--no-resume]
+  mini-ork approvals reject <run_id> [--node NODE_ID] --note TEXT [--no-resume]
+  mini-ork approvals request-changes <run_id> [--node NODE_ID] --note TEXT [--no-resume]
   mini-ork approvals policy [--json]
 
 Verbs:
@@ -60,6 +71,13 @@ Verbs:
   approve          resolve a pending row 'approved'
   reject           resolve a pending row 'rejected' (alias: request-changes)
   policy           print the resolved ReviewPolicy
+
+On a node ``approve`` / ``reject`` whose run was parked for review
+(.review-pause sentinel exists), the LAST pending row's resolution spawns
+``mini-ork recover <run_id> [--from-node <node>] [--strategy <retry|resume>]``
+detached and prints ``resumed <run_id> (log: <run_dir>/review-resume.log)``.
+``--no-resume`` opts out of the spawn (handy for tests / operators who
+want to inspect state before letting the run proceed).
 
 All verbs read from $MINI_ORK_HOME (default ./.mini-ork) and $MINI_ORK_DB.
 """
@@ -117,6 +135,187 @@ def _resolve_db_path(db: str | None) -> tuple[str, Path]:
     actual = resolve_db(home, db)
     Path(actual).parent.mkdir(parents=True, exist_ok=True)
     return actual, home
+
+
+def _launcher_path(home: Path) -> str:
+    """Absolute path to the ``bin/mini-ork`` launcher.
+
+    Resolution order (kickoff hr-review-resume §1.1):
+      1. ``$MINI_ORK_ENGINE_ROOT`` / ``$MINI_ORK_ROOT`` — the env pointer
+         the engine launcher itself honours.
+      2. ``<home>/engine`` pointer file (the install-default a
+         ``mini-ork init`` writes).
+      3. The repo root of this module — ``os.path.dirname(__file__)``'s
+         grandparent in the source checkout, which is what tests and a
+         bare ``python -m`` invocation both land on.
+    Returns a ``str`` path; the caller always shells out, never imports.
+    """
+    for var in ("MINI_ORK_ENGINE_ROOT", "MINI_ORK_ROOT"):
+        root = os.environ.get(var)
+        if root:
+            cand = Path(root) / "bin" / "mini-ork"
+            if cand.is_file():
+                return str(cand)
+    pointer = home / "engine"
+    if pointer.is_file():
+        try:
+            text = pointer.read_text(encoding="utf-8").strip()
+        except OSError:
+            text = ""
+        if text:
+            cand = Path(text) / "bin" / "mini-ork"
+            if cand.is_file():
+                return str(cand)
+    here = Path(os.path.dirname(os.path.realpath(__file__)))
+    for ancestor in (here, here.parent, here.parent.parent):
+        cand = ancestor / "bin" / "mini-ork"
+        if cand.is_file():
+            return str(cand)
+    # Last-resort: hope the path is on $PATH. ``bin/mini-ork`` is on PATH
+    # when the engine is installed, so this is the engine-shipped case.
+    return "bin/mini-ork"
+
+
+class _LauncherMissingError(RuntimeError):
+    """Raised by ``_spawn_recover`` when the launcher path is unusable.
+
+    The parent ``_maybe_resume_parked_run`` catches this and emits the
+    manual-resume hint instead of an opaque traceback (kickoff §1.1).
+    """
+
+
+def _spawn_recover(
+    home: Path, run_id: str, extra_args: list[str],
+    log_path: Path | None = None,
+) -> tuple[int, str]:
+    """Launch ``<launcher> recover <run_id> <extra_args…>`` detached.
+
+    The child process inherits ``os.environ`` MINUS ``MINI_ORK_RUN_ID`` and
+    ``MINI_ORK_RUN_DIR`` (the executor's path-resolution contract reads them
+    from the env, and a parked run was paused by a previous execute with
+    those keys set — clearing them lets ``recover`` resolve the run via
+    ``$MINI_ORK_HOME/runs/<run_id>`` as a fresh recovery call should).
+    ``start_new_session=True`` detaches the child from the CLI's process
+    group so a Ctrl-C on the CLI does not abort the resume. stdout/stderr
+    land in ``<run_dir>/review-resume.log`` so the operator can tail it.
+
+    Returns ``(pid, log_path)``; tests monkeypatch this function so they
+    don't actually fork. The detached Popen is fire-and-forget — we don't
+    wait, because the operator's terminal is meant to be free after this
+    verb returns.
+
+    On a missing launcher (``FileNotFoundError`` from the absolute-path
+    resolution) the caller falls back to a manual-resume hint rather than
+    tracing back from the parked-but-already-renamed sentinel.
+    """
+    run_dir = home / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_path or (run_dir / "review-resume.log")
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("MINI_ORK_RUN_ID", "MINI_ORK_RUN_DIR")}
+    argv = [_launcher_path(home), "recover", run_id, *extra_args]
+    log_fh = open(log_path, "ab", buffering=0)
+    try:
+        try:
+            proc = subprocess.Popen(
+                argv,
+                env=env,
+                stdout=log_fh,
+                stderr=log_fh,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+        except FileNotFoundError:
+            proc = None
+    finally:
+        log_fh.close()
+    if proc is None:
+        raise _LauncherMissingError(
+            f"could not spawn {argv[0]!r} — pass --no-resume and "
+            "run the recover command by hand"
+        )
+    return int(proc.pid), str(log_path)
+
+
+def _review_pause_sentinel(home: Path, run_id: str) -> Path:
+    """Path to ``<home>/runs/<run_id>/.review-pause``.
+
+    The executor parks a run with this sentinel at rc 9; renaming it to
+    ``.review-pause.resolved`` on resume keeps the file as an audit trail
+    (so an operator reading the run dir later sees WHEN the run was
+    released, even if the JSON body has aged out).
+    """
+    return home / "runs" / run_id / ".review-pause"
+
+
+def _maybe_resume_parked_run(
+    home: Path,
+    run_id: str,
+    *,
+    db: str,
+    extra_args: list[str],
+    no_resume: bool,
+) -> str | None:
+    """Resume a parked run if nothing is pending AND the sentinel exists.
+
+    Reads pending rows via the SAME ``db`` path the approval write
+    landed on — the resume decision must use the same DB the operator
+    just wrote, so ``approvals approve --db other.db`` cannot decide the
+    resume off the home-default DB. Returns a one-line operator-facing
+    status string when the run was resumed
+    (``"resumed <run> (log: <log_path>)"``) or skipped via ``--no-resume``
+    (``"resume with: mini-ork recover …"``); ``None`` when no action was
+    taken so the caller can keep its own output flow. Never raises — the
+    spawn helper is the only thing that can fail and we accept the
+    log-path tail is best-effort.
+    """
+    if node_review.pending_for_run(run_id, db_path=db):
+        return None
+    sentinel = _review_pause_sentinel(home, run_id)
+    if not sentinel.is_file():
+        return None
+    resolved = sentinel.with_name(sentinel.name + ".resolved")
+    try:
+        sentinel.rename(resolved)
+    except OSError:
+        # Best-effort rename; the run can still resume, the audit trail
+        # just won't be there. The operator will see the hint message.
+        pass
+    run_dir = home / "runs" / run_id
+    log_path = run_dir / "review-resume.log"
+    if no_resume:
+        cmd_args = ["recover", run_id, *extra_args]
+        return (
+            f"resume with: mini-ork {' '.join(cmd_args)}\n"
+            f"(skipped spawn: --no-resume; sentinel at {resolved})\n"
+        )
+    try:
+        _pid, log_path = _spawn_recover(home, run_id, extra_args, log_path)
+    except _LauncherMissingError:
+        # Launcher cannot be spawned (e.g. uninstalled engine, broken
+        # $MINI_ORK_ENGINE_ROOT). Don't traceback — the sentinel is
+        # already renamed, so the operator gets the manual command and
+        # can drive the resume themselves.
+        cmd_args = ["recover", run_id, *extra_args]
+        return (
+            f"approvals: could not auto-resume {run_id}; "
+            f"run by hand: mini-ork {' '.join(cmd_args)}\n"
+        )
+    return f"resumed {run_id} (log: {log_path})\n"
+
+
+def _db_path_for(home: Path) -> str:
+    """Resolve the ``state.db`` path for ``home`` (no caller override).
+
+    Legacy seam — only used by callers that don't yet track the resolved
+    DB themselves. The new approve/reject path passes the DB it just
+    wrote through to ``_maybe_resume_parked_run`` so resume decisions
+    can't desync from the inbox row.
+    """
+    from mini_ork.web.db import resolve_db
+
+    return str(resolve_db(home, None))
 
 
 def _cmd_list(args: argparse.Namespace) -> int:
@@ -290,8 +489,25 @@ def _cmd_approve(args: argparse.Namespace) -> int:
             return 1
         sys.stdout.write(
             f"approved {args.run_id} node={args.node} (inbox_id={inbox_id})\n"
-            f"resume with: mini-ork recover {args.run_id} --strategy resume\n"
         )
+        # Resume a parked run when this approval cleared the last pending
+        # node row (kickoff hr-review-resume §1.1). The helper returns
+        # ``None`` when other rows still await the operator OR the run
+        # was never parked — fall back to the pre-change hint so an
+        # operator approving an un-parked run still gets the manual
+        # command they used to.
+        status_line = _maybe_resume_parked_run(
+            home, args.run_id,
+            db=db,
+            extra_args=["--strategy", "resume"],
+            no_resume=bool(getattr(args, "no_resume", False)),
+        )
+        if status_line:
+            sys.stdout.write(status_line)
+        else:
+            sys.stdout.write(
+                f"resume with: mini-ork recover {args.run_id} --strategy resume\n"
+            )
         return 0
 
     head = args.head or ""
@@ -329,7 +545,7 @@ def _cmd_reject(args: argparse.Namespace) -> int:
     if not args.note:
         sys.stderr.write("approvals reject: --note TEXT is required\n")
         return 2
-    db, _home = _resolve_db_path(args.db)
+    db, home = _resolve_db_path(args.db)
     if args.node:
         try:
             inbox_id = node_review.request_changes(
@@ -343,9 +559,63 @@ def _cmd_reject(args: argparse.Namespace) -> int:
         except ApprovalError as exc:
             sys.stderr.write(f"approvals reject: {exc}\n")
             return 1
+        # Send the note to the agent (kickoff hr-review-resume §1.2) so
+        # the rerun reads it from its steering context. ``role_target='any'``
+        # is the safest default — the rerun is a fresh node dispatch and
+        # has no role-specific lane yet; the executor's per-role fetch will
+        # re-resolve on consume.
+        #
+        # Fail-loud (reviewer note round-1 medium): the previous behaviour
+        # swallowed every ``operator_steering.emit`` exception silently,
+        # so a rerun could proceed without the reviewer's note and nobody
+        # would know. We now ALWAYS write a stderr line — success or failure
+        # — so the operator sees whether the note reached the steering
+        # table. On any emit failure, we still spawn the rerun (fail-closed
+        # would break test_node_review.py's bootstrap; the rerun is useful
+        # and the note lives on the inbox row regardless), but the warning
+        # is loud enough to flag wiring issues for follow-up.
+        from mini_ork.steering import operator_steering
+
+        steering_ok = False
+        steering_error: str | None = None
+        try:
+            operator_steering.emit(
+                f"Human reviewer requested changes to node {args.node}: {args.note}",
+                run_id=args.run_id,
+                role_target="any",
+                severity="warn",
+                source="review",
+            )
+            steering_ok = True
+        except Exception as exc:  # noqa: BLE001 — surface to stderr, keep going
+            steering_error = f"{type(exc).__name__}: {exc}"
+        if steering_ok:
+            sys.stderr.write(
+                f"approvals reject: reviewer note delivered to operator_steering "
+                f"for node {args.node}\n"
+            )
+        else:
+            sys.stderr.write(
+                "approvals reject: WARN — could not deliver reviewer note to "
+                f"operator_steering ({steering_error}); the rerun will proceed "
+                "without your note in steering context. The note still lives "
+                "on the inbox row (request_changes inbox_id=" + str(inbox_id) +
+                "). Fix the steering wiring afterwards.\n"
+            )
         sys.stdout.write(
             f"rejected {args.run_id} node={args.node} (inbox_id={inbox_id})\n"
         )
+        # Resume via ``--from-node <node> --strategy retry`` so the
+        # reviewed node re-runs against the steering note; its fresh
+        # checkpoint then needs a new node review (kickoff §1.2).
+        status_line = _maybe_resume_parked_run(
+            home, args.run_id,
+            db=db,
+            extra_args=["--from-node", args.node, "--strategy", "retry"],
+            no_resume=bool(getattr(args, "no_resume", False)),
+        )
+        if status_line:
+            sys.stdout.write(status_line)
         return 0
     try:
         inbox_id = reject(
@@ -405,6 +675,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_approve.add_argument("--base", default="")
     p_approve.add_argument("--node", default="")
     p_approve.add_argument("--note", default="")
+    # ``--no-resume`` opts out of the detached ``recover`` spawn on the
+    # last-approval path; the CLI still prints the manual command so the
+    # operator can run it by hand. Tests use it to assert the manual hint
+    # without a real subprocess.
+    p_approve.add_argument("--no-resume", action="store_true")
     p_approve.set_defaults(_verb_handler=_cmd_approve)
 
     # ``request-changes`` is registered as its own subparser so the
@@ -417,6 +692,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_reject.add_argument("run_id")
     p_reject.add_argument("--note", default="")
     p_reject.add_argument("--node", default="")
+    p_reject.add_argument("--no-resume", action="store_true")
     p_reject.set_defaults(_verb_handler=_cmd_reject)
 
     p_request = subs.add_parser(
@@ -425,6 +701,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_request.add_argument("run_id")
     p_request.add_argument("--note", default="")
     p_request.add_argument("--node", default="")
+    p_request.add_argument("--no-resume", action="store_true")
     p_request.set_defaults(_verb_handler=_cmd_reject)
 
     p_policy = subs.add_parser("policy", add_help=False, usage=argparse.SUPPRESS)

@@ -346,6 +346,36 @@ def _task_class_for_recipe(recipe: str) -> str:
     return recipe.replace("-", "_")
 
 
+def _task_run_status(db: str, run_id: str) -> str:
+    """The ``task_runs.status`` for ``run_id`` (``""`` when missing/error).
+
+    Reads through the same module seam the recipe lookup uses (kickoff
+    hr-review-resume §2): a row whose status is ``reviewing`` is parked
+    waiting on a human review, NOT failed, and the planner must short-circuit
+    the hint gate that normally treats such rows as failures. A missing row,
+    a missing ``task_runs`` table (pre-0013 DBs), or any sqlite error all
+    degrade to ``""`` — the planner's existing "no signal" behaviour. The
+    function never raises; callers fall through to today's behaviour when
+    the lookup yields nothing.
+    """
+    import sqlite3
+
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return ""
+    try:
+        try:
+            row = con.execute(
+                "SELECT status FROM task_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return ""
+    finally:
+        con.close()
+    return str(row[0] or "").strip() if row else ""
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Hint-gate + restore-plan shims (kickoff §4 / §5)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -963,6 +993,37 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
         )
         return 1
 
+    # ── Parked-run gate (kickoff hr-review-resume §2): a run whose
+    # ``task_runs.status='reviewing'`` is parked waiting on a human
+    # review, not failed. While the inbox still has a pending node row
+    # for it, refuse ``recover`` so the operator doesn't bypass the
+    # review by spawning a fresh attempt against a stale tree. The
+    # hint that follows in stderr points at ``mini-ork approvals list``
+    # — the only path that resolves a parked run today, and the path
+    # the executor itself wires (a successful approve on the LAST
+    # pending row spawns ``recover --strategy resume`` for the operator
+    # automatically). ``--status`` exempts the gate (refusal is a
+    # dispatch-time concern, and the operator using ``--status`` is
+    # inspecting state, not bypassing review). ``--force`` lets an
+    # operator proceed anyway (e.g. the inbox row was orphaned and they
+    # want a clean retry); the run is still parked, so this is "I know
+    # what I'm doing."
+    _task_status = _task_run_status(db_path, run_id)
+    is_parked = _task_status == "reviewing"
+    if is_parked and not force and not status_only:
+        try:
+            from mini_ork.gates import node_review as _node_review
+
+            _pending = _node_review.pending_for_run(run_id, db_path=db_path)
+        except Exception:  # noqa: BLE001 — never block on a module hiccup
+            _pending = []
+        if _pending:
+            sys.stderr.write(
+                f"[mini-ork-recover] run {run_id} is awaiting human review "
+                "— mini-ork approvals list\n"
+            )
+            return 1
+
     # ── Lane repair (kickoff lane-repair-resume §1): parse + validate
     # ``--lane <alias>=<lane>``. Validation runs BEFORE the hint gate, status
     # print, and lease block, so a bad alias/lane exits 2 with the choices
@@ -1009,7 +1070,12 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
     # plan (kickoff §3 fix 3). Refusal is a DISPATCH-time concern; the
     # status printout gives the operator the picture they need to
     # decide whether to use ``--force`` / ``--ack-change``.
-    if hint is not None and not hint.get("retryable", True) and not force and not status_only:
+    # A parked run (status='reviewing') is NOT a failure, so the
+    # ``retryable: false`` / ``needs_change`` refusals do not apply
+    # to it — a parked run reaches this branch only when nothing is
+    # pending in the inbox, in which case it is exactly the resume
+    # the executor meant for it to be.
+    if (not is_parked) and hint is not None and not hint.get("retryable", True) and not force and not status_only:
         sys.stderr.write(
             f"[mini-ork-recover] retry-hint refuses this run "
             f"(strategy={hint.get('strategy')!r});"
@@ -1023,7 +1089,7 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
             sys.stderr.write(f"detail:  {nc['detail']}\n")
         sys.stderr.write("Pass --force to override.\n")
         return 1
-    if hint is not None and hint.get("needs_change") and not ack_change and not status_only:
+    if (not is_parked) and hint is not None and hint.get("needs_change") and not ack_change and not status_only:
         nc = hint["needs_change"]
         # A ``kind == 'lane'`` needs_change is satisfied by the operator's
         # ``--lane <alias>=<lane>`` flag — the flag IS the change (kickoff
