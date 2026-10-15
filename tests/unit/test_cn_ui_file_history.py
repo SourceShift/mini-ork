@@ -1,17 +1,22 @@
 """``cn_file`` page — fixture-driven coverage of every section path.
 
-The page reads four CN endpoints and the fixtures pin the **verified**
+The page reads three CN endpoints and the fixtures pin the **verified**
 live response shapes — not the shape the existing ``sessions_by_file_recent``
 helper parses (a different parser): by-file returns
 ``{query, matches: [{session_id, matched_files, total_files}]}``;
 session summary returns ``{summary: {goal, last_ts, …}}``; hot-claims
-returns ``{claims: [{path, principal_id, expires_at}]}``; the retrieve
-endpoint returns ``{hits: [{metadata: {kind, …}, content}]}`` with
-mixed kinds that the page must filter down to ``failure``.
+returns ``{claims: [{path, principal_id, expires_at}]}``; the atoms
+endpoint returns ``{atoms: [{id, kind, text, session_id, project, ts,
+metadata}]}`` (request: ``GET /api/v1/prompt-context/atoms?since=30d&
+kind=failure&project=<url-encoded root>&limit=500``) and file matching
+runs entirely client-side.
 
 Tests stub ``cn_client._get`` (the network entry point the page calls
-for by-file + per-session summary), ``cn_client.coord_hot_claims``, and
-``cn_client.retrieve`` so they are fast and never touch the network.
+for by-file, per-session summary, and the atoms feed) and
+``cn_client.coord_hot_claims`` so they are fast and never touch the
+network. ``cn_client.retrieve`` is patched to RAISE — the page must
+never call it, and a stub that quietly returns ``{}`` would let a
+regression pass the test suite.
 
 A per-test ``MINI_ORK_HOME`` keeps the section cache scoped to
 ``tmp_path``; otherwise a previous test's slot bleeds into the next one
@@ -74,10 +79,17 @@ def _stub_cn(monkeypatch: pytest.MonkeyPatch, *,
              summaries: dict[str, dict] | None = None,
              hot_claims: dict | None = None,
              failure_atoms: dict | None = None) -> list[str]:
-    """Stub the four network entry points the page calls.
+    """Stub the three network entry points the page calls.
 
     Returns the list of paths the page asked for, in call order, so
-    tests can assert against the wire contract.
+    tests can assert against the wire contract. ``cn_client.retrieve``
+    is always patched to raise — the page must never call it, and a
+    silent ``{}`` stub would let a regression pass the suite.
+
+    ``failure_atoms`` is the wire payload (``{atoms: [...]}``) the
+    atoms GET returns. Tests that pass it get matching failure rows;
+    tests that don't get an empty payload and the section renders the
+    "no failures" one-liner.
 
     Each fetch-stub returns a JSON string so the page's
     ``json.loads`` path runs for real; ``by_file`` defaults to
@@ -87,6 +99,10 @@ def _stub_cn(monkeypatch: pytest.MonkeyPatch, *,
     """
     paths: list[str] = []
     summaries = summaries or {}
+    failure_atoms = failure_atoms if failure_atoms is not None else {
+        "since": "30d", "count": 0, "total_matched": 0,
+        "by_kind": {}, "atoms": [],
+    }
 
     def _fake_get(path: str, *, timeout: float | None = None) -> str:
         del timeout
@@ -98,6 +114,8 @@ def _stub_cn(monkeypatch: pytest.MonkeyPatch, *,
             target = f"/sessions/{sid}/summary"
             if path.endswith(target):
                 return json.dumps(payload) if payload is not None else "{}"
+        if path.startswith("/api/v1/prompt-context/atoms"):
+            return json.dumps(failure_atoms)
         return "{}"
 
     monkeypatch.setattr(cn_client, "_get", _fake_get)
@@ -105,11 +123,15 @@ def _stub_cn(monkeypatch: pytest.MonkeyPatch, *,
         monkeypatch.setattr(
             "mini_ork.cn_client.coord_hot_claims", lambda: hot_claims
         )
-    if failure_atoms is not None:
-        monkeypatch.setattr(
-            "mini_ork.cn_client.retrieve",
-            lambda *_a, **_k: json.dumps(failure_atoms),
-        )
+    # The page must not call retrieve; a raising stub turns a regression
+    # into a loud traceback rather than a silent empty section.
+    monkeypatch.setattr(
+        "mini_ork.cn_client.retrieve",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError(
+            "cn_file must not call cn_client.retrieve; the failures "
+            "section reads GET /api/v1/prompt-context/atoms"
+        )),
+    )
     return paths
 
 
@@ -161,19 +183,36 @@ _HOT_CLAIMS: dict = {
     ],
 }
 
-# Verified retrieve shape: {hits: [{metadata: {kind, ts}, content}]}.
-# The first hit is a failure and must appear; the second is a decision
-# and must be filtered out.
-_FAILURE_HITS: dict = {
-    "hits": [
-        {"id": "a1", "content": "ImportError when loading cn_file.py",
-         "metadata": {"kind": "failure", "ts": "2026-10-15T11:00:00Z"}},
-        {"id": "a2",
-         "content": "Decided to use the cached_section wrapper",
-         "metadata": {"kind": "decision_made",
-                      "ts": "2026-10-15T11:30:00Z"}},
-    ],
-}
+# Verified atoms shape: {atoms: [{id, kind, text, session_id, project,
+# ts, metadata}]}. The page's client-side project check requires each
+# atom's ``project`` field to equal the resolved project root (the
+# ``cn_home.parent.resolve()`` value), so the fixtures below take the
+# root as a parameter and stamp it onto every atom. The first atom
+# names the page's file (must appear); the second is a decision atom
+# (must be filtered out).
+def _failure_atoms_payload(project_root: str) -> dict:
+    return {
+        "since": "30d",
+        "count": 2,
+        "total_matched": 2,
+        "by_kind": {"failure": 1, "decision_made": 1},
+        "atoms": [
+            {"id": "a1",
+             "text": "ImportError when loading cn_file.py",
+             "kind": "failure",
+             "session_id": "sess-fail",
+             "project": project_root,
+             "ts": "2026-10-15T11:00:00Z",
+             "metadata": {}},
+            {"id": "a2",
+             "text": "Decided to use the cached_section wrapper",
+             "kind": "decision_made",
+             "session_id": "sess-dec",
+             "project": project_root,
+             "ts": "2026-10-15T11:30:00Z",
+             "metadata": {}},
+        ],
+    }
 
 
 # ── 1. empty-args safe build ──────────────────────────────────────────────
@@ -290,23 +329,55 @@ def test_failure_atoms_filter_to_failure_kind_only(
 ) -> None:
     """The Recent-failures section surfaces failure-kind atoms only.
 
-    The retrieve endpoint returns a flat ``hits[]`` regardless of
-    ``kind``; the page must filter on ``metadata.kind == "failure"``
-    so a decision / verification / artifact never appears here.
+    The atoms endpoint returns a flat ``atoms[]`` regardless of
+    ``kind``; the page must filter on ``kind == "failure"`` so a
+    decision / verification / artifact never appears here. Each
+    atom's ``project`` field must equal the resolved project root so
+    the page's client-side project check keeps the row — a foreign
+    root would be dropped before the kind filter ever runs.
     """
     monkeypatch.delenv("MO_DISABLE_CN", raising=False)
+    project_root = str(cn_home.parent.resolve())
     _stub_cn(monkeypatch,
              by_file={"query": "x", "matches": []},
-             failure_atoms=_FAILURE_HITS)
+             failure_atoms=_failure_atoms_payload(project_root))
     page = cn_file.build(cn_home, None,
                          {"path": "mini_ork/ide_pages/cn_file.py"})
     fail = next(s for s in page["sections"]
                 if s.get("title") == "Recent failures")
     texts = [it["t"] for it in fail["items"]]
-    # Failure-kind atom surfaces.
+    # Failure-kind atom surfaces (the basename ``cn_file.py`` is in
+    # its text).
     assert any("ImportError" in t for t in texts), texts
     # Non-failure kind is filtered out.
     assert not any("cached_section" in t for t in texts), texts
+
+
+def test_failure_atoms_empty_payload_renders_no_match_line(
+    cn_home: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A healthy CN with zero atoms renders the no-match one-liner,
+    not the unreachable line — an empty-but-valid payload is not the
+    same as a CN outage.
+    """
+    monkeypatch.delenv("MO_DISABLE_CN", raising=False)
+    project_root = str(cn_home.parent.resolve())
+    _stub_cn(monkeypatch,
+             by_file={"query": "x", "matches": []},
+             failure_atoms={
+                 "since": "30d", "count": 0, "total_matched": 0,
+                 "by_kind": {}, "atoms": [],
+             })
+    page = cn_file.build(cn_home, None,
+                         {"path": "mini_ork/ide_pages/cn_file.py"})
+    fail = next(s for s in page["sections"]
+                if s.get("title") == "Recent failures")
+    texts = [it["t"] for it in fail["items"]]
+    assert texts == ["No failures in the last 30 days name this file"], texts
+    # Sanity: the project_root survived the wire trip and the stub
+    # was exercised — the failure-row assertion above is meaningful
+    # only if the page asked CN for atoms.
+    assert project_root  # touch the variable so the import doesn't warn
 
 
 # ── 5. outside project renders explanation, no calls ─────────────────────
@@ -382,7 +453,9 @@ def test_unreachable_cn_renders_one_liner(
     page's fetch wraps it in ``json.loads`` → ``{}`` → ``cached_section``
     falls through to the unreachable payload. The page renders the
     one-line "not running" dot for every section and the page itself
-    stays ``ok: true``.
+    stays ``ok: true``. ``cn_client.retrieve`` is patched to raise so
+    a regression that re-routes the failures section through it fails
+    loud rather than passing silently.
     """
     monkeypatch.delenv("MO_DISABLE_CN", raising=False)
     monkeypatch.setenv("CN_BASE_URL", "http://127.0.0.1:1")
@@ -400,8 +473,13 @@ def test_unreachable_cn_renders_one_liner(
         "mini_ork.cn_client.coord_hot_claims",
         lambda: (_ for _ in ()).throw(CoordUnavailable("down")),
     )
-    monkeypatch.setattr("mini_ork.cn_client.retrieve",
-                        lambda *_a, **_k: "{}")
+    monkeypatch.setattr(
+        "mini_ork.cn_client.retrieve",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError(
+            "cn_file must not call cn_client.retrieve; the failures "
+            "section reads GET /api/v1/prompt-context/atoms"
+        )),
+    )
 
     page = cn_file.build(cn_home, None,
                          {"path": "mini_ork/ide_pages/cn_file.py"})
@@ -417,13 +495,23 @@ def test_unreachable_cn_renders_one_liner(
 def test_disabled_cn_renders_disabled_one_liner(
     cn_home: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``MO_DISABLE_CN=1`` short-circuits and shows the disabled dot."""
+    """``MO_DISABLE_CN=1`` short-circuits and shows the disabled dot.
+    ``cn_client.retrieve`` is patched to raise — the disabled path
+    must not fetch at all, so a regression that bypasses the disable
+    flag via a direct retrieve call fails loud rather than silently
+    rendering a row.
+    """
     monkeypatch.setenv("MO_DISABLE_CN", "1")
     monkeypatch.setattr(cn_client, "_get", lambda *_a, **_k: "{}")
     monkeypatch.setattr("mini_ork.cn_client.coord_hot_claims",
                         lambda: {"claims": []})
-    monkeypatch.setattr("mini_ork.cn_client.retrieve",
-                        lambda *_a, **_k: "{}")
+    monkeypatch.setattr(
+        "mini_ork.cn_client.retrieve",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError(
+            "cn_file must not call cn_client.retrieve; the failures "
+            "section reads GET /api/v1/prompt-context/atoms"
+        )),
+    )
     page = cn_file.build(cn_home, None,
                          {"path": "mini_ork/ide_pages/cn_file.py"})
     assert page["ok"] is True
@@ -435,8 +523,8 @@ def test_disabled_cn_renders_disabled_one_liner(
 def test_page_never_calls_raw_session_dump(
     cn_home: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The page calls ``/sessions/by-file`` and ``/sessions/:id/summary``
-    only — never the raw dump.
+    """The page calls ``/sessions/by-file``, ``/sessions/:id/summary``, and
+    ``/api/v1/prompt-context/atoms`` only — never the raw session dump.
 
     The raw ``/api/v1/sessions/:id`` endpoint takes 12–20 s on large
     sessions (kickoff c:0). The stub records every path the page asks
@@ -457,6 +545,7 @@ def test_page_never_calls_raw_session_dump(
         ok = (
             "/sessions/by-file" in path
             or path.endswith("/summary")
+            or path.startswith("/api/v1/prompt-context/atoms")
         )
         assert ok, path
         # Belt-and-braces: no path may be the raw session-dump shape

@@ -11,10 +11,14 @@ file:
 * a Live holder row from ``GET /api/v1/coord/hot-claims`` filtered to
   claims whose ``path`` field matches the page's argument (foreign-path
   claims never leak across projects);
-* a Recent failures row from ``POST /api/v1/tools/retrieve`` filtered to
-  ``metadata.kind == "failure"`` (the endpoint ships other kinds too —
-  every verified CN response is a flat ``hits[]`` and the page must keep
-  the kind filter, not lift it);
+* a Recent failures row from ``GET /api/v1/prompt-context/atoms`` filtered
+  client-side: the request carries ``kind=failure``, ``since=30d``,
+  ``limit=500``, and the project root so CN's atoms endpoint ships a
+  bounded window of failure-shaped atoms; the page then keeps the atoms
+  whose ``project`` equals the resolved root and whose ``text`` names the
+  page's file (the project-relative path, the basename, or the basename
+  stem when the stem is at least 6 characters), sorted newest ``ts`` first,
+  capped at ten rows with a "Showing N of M" note when capped.
 
 Paths are resolved against ``home.parent`` (the project root). A path
 that escapes the root via ``..``, or is absolute and points elsewhere,
@@ -23,12 +27,19 @@ must never ask CN about a path it cannot verify belongs to the project.
 ``home.parent`` follows the ``cn_session`` convention so the same
 project-root logic covers both pages.
 
-Four endpoints, every one routed through
+Three endpoints, every one routed through
 :mod:`mini_ork.ide_pages._cn.render_cached_section` so a slow / down /
 disabled ContextNest still renders the one-line state and the page
 stays ``ok: true``. With no ``path`` argument the page renders an
 empty-state callout — the IDE actions sweep builds every page with
 empty args, and a ``path``-required page would fail that suite.
+
+The atoms endpoint takes ``kind=`` (one value) and ``q=`` is ignored
+server-side, so file matching runs entirely on the client: the server's
+project filter is treated as an index hint, not a containment
+guarantee, and ``limit=500`` may truncate — the page therefore re-checks
+``atom.project`` against the resolved root before deciding to render a
+row.
 """
 from __future__ import annotations
 
@@ -47,6 +58,12 @@ from mini_ork.ide_pages import spec as S
 # beyond that the operator wants a filter, not more rows.
 _SESSIONS_LIMIT = 30
 _FAILURES_LIMIT = 10
+# The atoms endpoint takes ``kind=`` (one value) and a project filter
+# hint; 500 is the smallest round number that comfortably fits a 30-day
+# window of failures for one project without truncation on the busy
+# files we have observed in production traces.
+_ATOMS_REQUEST_LIMIT = 500
+_ATOMS_SINCE = "30d"
 
 # Each (section, scope) pair caches independently. The by-file slot is
 # the raw payload; the per-session summary slots carry the recap fetch
@@ -113,24 +130,35 @@ def _fetch_hot_claims() -> dict:
         return {}
 
 
-def _fetch_failure_atoms(query: str) -> dict:
-    """``POST /api/v1/tools/retrieve`` → ``{"hits": [...]}``.
+def _fetch_failure_atoms(project_root: str) -> dict:
+    """``GET /api/v1/prompt-context/atoms`` → ``dict``.
 
-    The endpoint returns a flat ``hits[]`` regardless of kind; the page
-    filters by ``metadata.kind == "failure"`` so the Recent-failures
-    section never advertises a decision / verification / artifact. The
-    response is wrapped as ``{"hits": [...]}`` so the caller can pass
-    the dict straight into :func:`cn_client.cached_section`.
+    The request URL pins ``kind=failure``, ``since=30d``, ``limit=500``
+    and the resolved project root — CN's atoms endpoint takes ``kind=``
+    as a single value and ignores ``q=``, so file matching runs entirely
+    on the client (the request payload is kept narrow on purpose).
+
+    Returns ``{}`` when the wire payload is the ``{}`` fallback
+    ``cn_client._get`` writes on a down CN — :func:`cn_client.cached_section`
+    treats an empty dict as a miss and falls through to the unreachable
+    marker, which is what the section renders as the "not running"
+    one-liner. A healthy CN that genuinely answers ``{"atoms": []}``
+    keeps that payload verbatim so the page renders the no-match line
+    rather than papering the outage over.
     """
-    raw = cn_client.retrieve(query, limit=_FAILURES_LIMIT * 4)
+    qs = (f"since={_ATOMS_SINCE}&kind=failure"
+          f"&project={_enc(project_root)}&limit={_ATOMS_REQUEST_LIMIT}")
+    raw = cn_client._get(f"/api/v1/prompt-context/atoms?{qs}")
     try:
         data = json.loads(raw) if raw else {}
     except ValueError:
-        return {"hits": []}
-    if not isinstance(data, dict):
-        return {"hits": []}
-    hits = data.get("hits") or []
-    return {"hits": hits if isinstance(hits, list) else []}
+        return {}
+    if not isinstance(data, dict) or not data:
+        # Either a non-dict payload or the empty ``{}`` CN writes on a
+        # down service. Either way, fall through to the unreachable
+        # one-liner rather than paper over it with a no-match row.
+        return {}
+    return data
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -344,47 +372,139 @@ def _hot_claims(path: str) -> list[dict[str, Any]]:
                   note="From /coord/hot-claims. Empty means no live holder.")]
 
 
-def _failures(path: str) -> list[dict[str, Any]]:
-    """Recent failure atoms whose content or metadata names ``path``.
+def _failures(home: Path, path: str) -> list[dict[str, Any]]:
+    """Recent failure atoms whose ``text`` names ``path``.
 
-    The endpoint ships a flat ``hits[]`` regardless of ``kind``; the
-    page filters ``metadata.kind == "failure"`` so the section never
-    advertises a decision / verification / artifact. The query is the
-    path string itself, which is what ContextNest's substrate retrieval
-    is built to match against. A hit whose ``content`` is empty is
-    dropped — a failure with no message is just noise.
+    The atoms request pins ``kind=failure``, ``since=30d``, ``limit=500``
+    and the resolved project root; CN's project filter is treated as an
+    index hint (the wire payload can include atoms from a sibling
+    project when the filter mis-spells or a load spills over), so the
+    page re-checks ``atom.project`` against the resolved root and drops
+    every foreign-project atom before deciding what to render. File
+    matching runs entirely client-side: an atom whose ``text`` contains
+    the project-relative path, the basename, or the basename stem (when
+    the stem is at least 6 characters) is attributed to this file.
+    A short stem like ``init`` would match unrelated atom text and is
+    deliberately excluded.
+
+    Atoms are sorted newest ``ts`` first (a malformed timestamp sinks
+    to the tail), the list is capped at :data:`_FAILURES_LIMIT` rows,
+    and the section note reads "Showing N of M" when the cap truncates.
+    Each row carries a ``cn_session`` page link for the atom's
+    ``session_id`` so an operator can jump straight to the source
+    session.
     """
+    project_root_path = home.parent if isinstance(home, Path) else None
+    try:
+        project_root_str = (project_root_path.resolve().as_posix()
+                            if project_root_path is not None else "")
+    except OSError:
+        project_root_str = ""
+
     payload = CN.render_cached_section(
-        _SECTION_FAILURES, path, lambda: _fetch_failure_atoms(path)
+        _SECTION_FAILURES, path,
+        lambda: _fetch_failure_atoms(project_root_str),
     )
     if _is_error(payload):
         return [S.lst("Recent failures",
                       [CN.section_status(payload)], full=True)]
 
-    hits = payload.get("hits")
-    if not isinstance(hits, list) or not hits:
+    atoms = payload.get("atoms")
+    if not isinstance(atoms, list) or not atoms:
         return [S.lst("Recent failures",
-                      [S.dot("No failure atoms name this file")], full=True)]
+                      [S.dot("No failures in the last 30 days name this file")],
+                      full=True)]
 
-    items: list[dict[str, Any]] = []
-    for h in hits:
-        if not isinstance(h, dict):
+    basename = Path(path).name
+    stem = Path(path).stem
+    matched: list[dict[str, Any]] = []
+    for a in atoms:
+        if not isinstance(a, dict):
             continue
-        meta = h.get("metadata") or {}
-        kind = _str(meta.get("kind")).lower()
-        if kind != "failure":
+        # Re-check the project filter: CN's server-side project filter
+        # is an index hint, not a containment guarantee (``limit=500``
+        # may also spill into a sibling project). Equal-to-the-root is
+        # what counts — the resolved project root is the only string
+        # the page trusts.
+        if not project_root_str or _str(a.get("project")) != project_root_str:
             continue
-        content = _str(h.get("content"))
-        if not content:
+        kind = _str(a.get("kind")).lower()
+        if kind and kind != "failure":
             continue
-        ts = _str(meta.get("ts"))
-        sub = ts[:10] if ts else ""
-        items.append(S.bad(content[:160], sub))
-    if not items:
+        text = _str(a.get("text"))
+        if not text:
+            continue
+        if not _atom_names_file(text, path, basename, stem):
+            continue
+        matched.append({
+            "text": text,
+            "ts": _str(a.get("ts")),
+            "session_id": _str(a.get("session_id")),
+        })
+    if not matched:
         return [S.lst("Recent failures",
-                      [S.dot("No failure atoms name this file")], full=True)]
-    return [S.lst("Recent failures", items, full=True,
-                  note="From /api/v1/tools/retrieve, filtered to kind=failure.")]
+                      [S.dot("No failures in the last 30 days name this file")],
+                      full=True)]
+
+    matched.sort(key=lambda row: _atom_ts_epoch(row["ts"]), reverse=True)
+    cap = _FAILURES_LIMIT
+    head = matched[:cap]
+    items: list[dict[str, Any]] = []
+    for row in head:
+        ts = row["ts"]
+        sub = ts[:10] if ts else ""
+        acts = []
+        if row["session_id"]:
+            acts = [S.btn("Open", S.page_link("cn_session",
+                                               id=row["session_id"]),
+                          "ghost")]
+        items.append(S.bad(row["text"][:160], sub, acts=acts))
+    note = ""
+    if len(matched) > cap:
+        note = f"Showing {cap} of {len(matched)} matching atoms."
+    return [S.lst("Recent failures", items, full=True, note=note)]
+
+
+def _atom_names_file(text: str, rel_path: str, basename: str,
+                     stem: str) -> bool:
+    """Whether ``text`` is plausibly about ``rel_path``.
+
+    The match runs on verbatim substring containment so atom text is
+    displayed exactly as CN stored it — there is no ``eval`` or pattern
+    language here, just a substring scan over the project's three name
+    shapes. The basename stem is only counted when the stem is at least
+    six characters long, so a short stem like ``init`` never silently
+    attributes unrelated failures to ``src/init.py``.
+    """
+    if not text:
+        return False
+    if rel_path and rel_path in text:
+        return True
+    if basename and basename in text:
+        return True
+    if stem and len(stem) >= 6 and stem in text:
+        return True
+    return False
+
+
+def _atom_ts_epoch(ts: str) -> int:
+    """An epoch for newest-first sorting; ``0`` when missing sorts last.
+
+    Accepts the ISO-8601 string the atoms wire shape carries (``ts``
+    under :data:`_ATOMS_SINCE`); a malformed value drops to ``0`` —
+    the atom still renders, just at the tail of the list — rather than
+    raising and blanking the section.
+    """
+    if not ts:
+        return 0
+    try:
+        iso = ts.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except (ValueError, TypeError):
+        return 0
 
 
 # ── page entry ────────────────────────────────────────────────────────────
@@ -444,7 +564,7 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     sections += S.guarded(errors, "Live holder",
                           lambda: _hot_claims(rel))
     sections += S.guarded(errors, "Recent failures",
-                          lambda: _failures(rel))
+                          lambda: _failures(home, rel))
 
     return S.page(
         "cn_file",
