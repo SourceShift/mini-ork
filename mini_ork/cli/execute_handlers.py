@@ -1697,6 +1697,10 @@ def _classify_review_node(recipe_eff: str, node_id: str, root: str, run_dir: str
 
 
 REVIEWER_VERDICT_UNPARSEABLE = "reviewer_verdict_unparseable"
+# The reviewer judged the change and found the blocker is one no code round can
+# clear (an unrunnable test baseline, a plan contradiction, a migration to apply).
+# The revise loop skips it, as it skips an unparseable verdict.
+REVIEWER_ESCALATED = "reviewer_escalated"
 
 
 def _implementer_moved_base(run_dir: str, target: str) -> str:
@@ -1907,6 +1911,10 @@ def _handle_reviewer(ctx: NodeDispatch):
         _append_run_note(ctx.db, ctx.run_id, f"{REVIEWER_VERDICT_UNPARSEABLE}: node {ctx.node_id}")
         ctx.charge()
         return 1, REVIEWER_VERDICT_UNPARSEABLE
+    if vn == "escalate":
+        ctx.trace(ctx.node_id, "failure", "reviewer", review_file, verdict, "verdict_fail")
+        ctx.charge()
+        return 1, REVIEWER_ESCALATED
     fr = "verdict_revise" if vn in _REVIEW_REVISE else "verdict_fail"
     ctx.trace(ctx.node_id, "failure", "reviewer", review_file, verdict, fr)
     ctx.charge()

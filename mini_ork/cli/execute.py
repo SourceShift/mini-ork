@@ -1203,6 +1203,14 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                     # about a tool that never ran, and re-running the implementer
                     # is the "reflect on the code and replan" the audit forbids.
                     continue
+                if finish_reason == REVIEWER_ESCALATED:
+                    # The reviewer said no code round can clear this; a revise
+                    # would re-run the implementer on correct code
+                    # (run-1792059337-779: three escalates, two wasted rounds).
+                    print(f"[revise] skipped for {field[0]}: reviewer escalated "
+                          "— a person must act, not another implementer round",
+                          file=sys.stderr)
+                    continue
                 if finish_reason == REVIEWER_VERDICT_UNPARSEABLE:
                     # Nothing to send back: the reviewer judged nothing. Re-running
                     # the implementer would spend a full round on a format failure.
@@ -4156,6 +4164,7 @@ from mini_ork.cli.execute_handlers import (  # noqa: E402,F401
     register_implementer_submode,
     register_node_handler,
     REVIEWER_VERDICT_UNPARSEABLE,
+    REVIEWER_ESCALATED,
 )
 
 

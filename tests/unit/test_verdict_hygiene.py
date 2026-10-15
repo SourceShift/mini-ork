@@ -141,6 +141,17 @@ def test_unparseable_verdict_fails_explicitly_and_spends_no_revise_round(tmp_pat
     assert "reviewer_verdict_unparseable: node reviewer" in notes
 
 
+def test_an_escalate_verdict_spends_no_revise_round(tmp_path, monkeypatch, capsys):
+    """2026-10-15 run-1792059337-779: the reviewer escalated three times (the test
+    baseline itself exited 77) and the revise loop re-ran the implementer twice on
+    code it had called correct."""
+    rc, calls, _db = _run(tmp_path, monkeypatch, json.dumps({
+        "verdict": "escalate", "notes": ["the test baseline exits 77 before this diff"]}))
+    assert rc == 1
+    assert calls == {"implementer": 1, "reviewer": 1}
+    assert "[revise] skipped for reviewer: reviewer escalated" in capsys.readouterr().err
+
+
 def test_a_real_rejection_still_gets_its_revise_round(tmp_path, monkeypatch):
     rc, calls, _db = _run(tmp_path, monkeypatch,
                           json.dumps({"verdict": "needs_revision", "notes": ["missing test"]}))
