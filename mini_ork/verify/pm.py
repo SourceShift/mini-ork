@@ -195,6 +195,13 @@ def classify_spawn(argv, rc, output):  # noqa: ARG001 — argv is part of the co
     """
     if rc == 127:  # the shell's own "command not found"
         return "toolchain"
+    # A negative rc is a tool killed by a signal before it finished: it never
+    # reached a verdict on the code. m3b-activity-feed-backend-removal
+    # (2026-10-15) had its type-aware eslint SIGTERMed mid-run (lint_rc -15);
+    # labelled `code`, it bought an implementer revise round for code nothing
+    # had rejected. As an abstention the verifier is simply re-run.
+    if isinstance(rc, int) and rc < 0:
+        return "toolchain"
     text = output or ""
     for needle in _SPAWN_FAILURES:
         if needle in text:

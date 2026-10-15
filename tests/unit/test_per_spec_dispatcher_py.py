@@ -438,3 +438,82 @@ def test_dispatch_relaunches_a_child_whose_verdict_did_not_pass(tmp_path, monkey
 
     assert _records(run_dir)[("lens-a", "D0")]["status"] == "delivered"
     assert "parent-test--lens-a--D0" in _spans(tmp_path), "a non-passing child must be relaunched"
+
+
+# ── a failed child under auto-repair ──────────────────────────────────────
+
+
+def _failed_child(tmp_path: Path, repair_state: str | None):
+    import subprocess
+
+    child_dir = tmp_path / "home" / "runs" / "parent--S1--D1"
+    child_dir.mkdir(parents=True)
+    (child_dir / "verdict.json").write_text(json.dumps({"pass": False}), encoding="utf-8")
+    if repair_state is not None:
+        (child_dir / "repair.json").write_text(json.dumps({"state": repair_state}),
+                                               encoding="utf-8")
+    record = psd._record_for("S1", "D1", child_kickoff=None, status=psd.STATUS_PENDING,
+                             child_run_id="parent--S1--D1", child_run_dir=str(child_dir))
+    proc = subprocess.Popen(["sh", "-c", "exit 1"])
+    return child_dir, record, proc
+
+
+def _settle_repair_later(child_dir: Path, state: str, passed: bool) -> None:
+    import threading
+
+    def settle() -> None:
+        (child_dir / "verdict.json").write_text(json.dumps({"pass": passed}), encoding="utf-8")
+        (child_dir / "repair.json").write_text(json.dumps({"state": state}), encoding="utf-8")
+
+    threading.Timer(0.3, settle).start()
+
+
+def test_a_child_repaired_by_auto_repair_is_delivered(tmp_path, monkeypatch):
+    """2026-10-15 m3: m3b failed, auto-repair took it, and the dispatcher at once
+    sent m3d into the same worktree — two writers in one tree. It now waits, and
+    a repair that succeeds records the deliverable delivered, not failed."""
+    monkeypatch.setenv("MO_SDD_REPAIR_POLL_SEC", "0.05")
+    child_dir, record, proc = _failed_child(tmp_path, "repairing")
+    _settle_repair_later(child_dir, "repaired", passed=True)
+
+    out = psd._collect_child(record, proc, None, tmp_path / "child.log", tmp_path / "home")
+
+    assert out["status"] == psd.STATUS_DELIVERED
+    assert out.get("repaired") is True
+    assert "error" not in out
+
+
+def test_a_child_whose_repair_gives_up_stays_failed_after_the_wait(tmp_path, monkeypatch):
+    monkeypatch.setenv("MO_SDD_REPAIR_POLL_SEC", "0.05")
+    child_dir, record, proc = _failed_child(tmp_path, "repairing")
+    _settle_repair_later(child_dir, "gave_up", passed=False)
+
+    out = psd._collect_child(record, proc, None, tmp_path / "child.log", tmp_path / "home")
+
+    assert out["status"] == psd.STATUS_FAILED
+    assert psd._repair_state(child_dir) == "gave_up"
+
+
+def test_a_failed_child_without_a_repair_is_not_waited_on(tmp_path, monkeypatch):
+    import time as _time
+
+    monkeypatch.setenv("MO_SDD_REPAIR_POLL_SEC", "5")
+    _, record, proc = _failed_child(tmp_path, None)
+
+    started = _time.monotonic()
+    out = psd._collect_child(record, proc, None, tmp_path / "child.log", tmp_path / "home")
+
+    assert out["status"] == psd.STATUS_FAILED
+    assert _time.monotonic() - started < 2
+
+
+def test_a_repair_that_outlives_the_wait_is_recorded_failed(tmp_path, monkeypatch):
+    monkeypatch.setenv("MO_SDD_REPAIR_WAIT_SEC", "0")
+    monkeypatch.setenv("MO_SDD_REPAIR_POLL_SEC", "0.05")
+    _, record, proc = _failed_child(tmp_path, "repairing")
+    log_path = tmp_path / "child.log"
+
+    out = psd._collect_child(record, proc, None, log_path, tmp_path / "home")
+
+    assert out["status"] == psd.STATUS_FAILED
+    assert "still running after 0s" in log_path.read_text(encoding="utf-8")

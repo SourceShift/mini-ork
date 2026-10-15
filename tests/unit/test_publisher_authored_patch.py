@@ -949,3 +949,37 @@ def test_a_rotated_live_sidecar_is_not_replayed_as_the_whole_session(tmp_path, r
     authored = resolve_authored_patch(str(run_dir))
 
     assert not isinstance(authored, AuthoredPatch), authored.patch_text
+
+
+def test_a_single_earlier_session_holding_every_in_scope_edit_is_replayed(tmp_path, repo):
+    """2026-10-14 cjd-fishaudio-narration: the last revise round edited only an
+    out-of-scope file, so the latest implementer transcript held no in-scope edit,
+    and the one earlier session that held all 22 was never replayed — a reviewer-
+    approved run abstained `publish-no-authored-patch`."""
+    base = _head(repo)
+    run_dir = _make_run_dir(tmp_path, repo, base, scope=["a.py"])
+    sessions = run_dir / "sessions"
+    sessions.mkdir()
+    (run_dir / ".sessions").mkdir()
+    (run_dir / ".sessions" / "implementer.session").write_text("round2")
+    authored_edit = {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "tu-1", "name": "Edit", "input": {
+            "file_path": str(repo / "a.py"),
+            "old_string": "line2\n", "new_string": "line2-run\n"}}]}}
+    out_of_scope = {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "tu-2", "name": "Edit", "input": {
+            "file_path": str(repo / "b.py"),
+            "old_string": "line5\n", "new_string": "line5-pin\n"}}]}}
+    (sessions / "round1.jsonl").write_text(json.dumps(authored_edit) + "\n")
+    (sessions / "round2.jsonl").write_text(json.dumps(out_of_scope) + "\n")
+    now = time.time()
+    os.utime(sessions / "round1.jsonl", (now - 10, now - 10))
+    os.utime(sessions / "round2.jsonl", (now, now))
+    (repo / "a.py").write_text(BASE_A.replace("line2", "line2-run"))
+    (repo / "b.py").write_text(BASE_A.replace("line5", "line5-pin"))
+
+    authored = resolve_authored_patch(str(run_dir))
+
+    assert isinstance(authored, AuthoredPatch), authored
+    assert "line2-run" in authored.patch_text
+    assert "b.py" not in authored.patch_text

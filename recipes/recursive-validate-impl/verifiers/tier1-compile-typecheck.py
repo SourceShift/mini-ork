@@ -61,10 +61,21 @@ for path in TOUCHED_FILES:
     elif path.endswith(".sh"):
         SHELL_FILES.append(path)
 
+# A deliverable that removes a file still lists it in touched_files, and there
+# is nothing left to typecheck or lint. ESLint 8 aborts the whole run with "No
+# files matching the pattern" (exit 2) on a path that does not exist, so a
+# removal could never pass tier1 (m3a-run-log-reader-removal, 2026-10-15).
+DELETED_FILES = [p for p in SOURCE_FILES + SHELL_FILES if not os.path.exists(p)]
+SOURCE_FILES = [p for p in SOURCE_FILES if os.path.exists(p)]
+SHELL_FILES = [p for p in SHELL_FILES if os.path.exists(p)]
+
 ev.write(f"touched_files={len(TOUCHED_FILES)}\n")
 ev.write(f"source_files={len(SOURCE_FILES)}\n")
 ev.write(f"shell_files={len(SHELL_FILES)}\n")
 ev.write(f"artifact_files={len(ARTIFACT_FILES)}\n")
+ev.write(f"deleted_files={len(DELETED_FILES)}\n")
+for path in DELETED_FILES:
+    ev.write(f"  deleted: {path}\n")
 ev.write(describe(".") + "\n")
 ev.flush()
 

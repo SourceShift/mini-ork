@@ -875,11 +875,13 @@ def _resolve_from_transcripts(run_dir: str, repo: str, base_ref: str,
     run_real = os.path.realpath(run_dir)
     last: Abstain | None = None
     evidence = False
+    replayed: set[str] = set()
     for path in _transcript_candidates(run_dir):
         edits = _collect_edits(path, real_repo, scope, run_real)
         if not edits:
             continue
         evidence = True
+        replayed.add(path)
         outcome = _replay_edits(repo, base_ref, edits)
         if isinstance(outcome, AuthoredPatch):
             return outcome, evidence
@@ -889,9 +891,12 @@ def _resolve_from_transcripts(run_dir: str, repo: str, base_ref: str,
     # run's base does not contain, so replaying it alone can never reconcile for a
     # file an earlier round created.  Replay every session the run produced that
     # edited the repo, oldest first: still only the implementer's own calls (in the
-    # order it made them), and the tree comparison proves the chain.
+    # order it made them), and the tree comparison proves the chain.  A single
+    # contributing session counts too when the candidates above never replayed
+    # it: a last revise round that touched only out-of-scope files leaves every
+    # in-scope edit in an earlier round's transcript (cjd-fishaudio-narration).
     contributions = _session_contributions(run_dir, real_repo, scope)
-    if len(contributions) > 1:
+    if len(contributions) > 1 or (contributions and contributions[0][0] not in replayed):
         chained = [edit for _, edits in contributions for edit in edits]
         evidence = True
         outcome = _replay_edits(repo, base_ref, chained)

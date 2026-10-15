@@ -595,6 +595,40 @@ def _wait_for_child_verdict(child_dir: Path, log_path: Path) -> dict[str, Any] |
     return None
 
 
+def _repair_state(child_dir: Path) -> str:
+    try:
+        data = _load_json(child_dir / "repair.json")
+    except (OSError, json.JSONDecodeError):
+        return ""
+    return str(data.get("state") or "") if isinstance(data, dict) else ""
+
+
+def _wait_for_child_repair(child_dir: Path, log_path: Path) -> bool:
+    """Block while auto-repair is still working on a child that failed.
+
+    A failed child's lifecycle hands the run to auto-repair (``repair.json``
+    state ``repairing``) and exits, and the repair's recover keeps editing the
+    child's target tree. Dispatching the next deliverable into that tree meanwhile
+    puts two writers in one worktree (m3b's revise and m3d, 2026-10-15). True once
+    the repair settles; False when there was none, or it outlived
+    ``MO_SDD_REPAIR_WAIT_SEC``.
+    """
+    if _repair_state(child_dir) != "repairing":
+        return False
+    timeout = int(os.environ.get("MO_SDD_REPAIR_WAIT_SEC", "7200"))
+    poll = float(os.environ.get("MO_SDD_REPAIR_POLL_SEC", "15"))
+    deadline = time.monotonic() + max(timeout, 0)
+    while _repair_state(child_dir) == "repairing":
+        if time.monotonic() > deadline:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as fh:
+                fh.write(f"[dispatcher] auto-repair of {child_dir.name} still running after "
+                         f"{timeout}s; recording it failed\n")
+            return False
+        time.sleep(max(poll, 0.05))
+    return True
+
+
 def _child_implementer_summary(child_dir: Path) -> dict[str, Any]:
     summary_path = child_dir / "implementer-summary.json"
     if not summary_path.is_file():
@@ -816,6 +850,14 @@ def _collect_child(
     record["status"] = STATUS_DELIVERED if passed and proc.returncode == 0 else STATUS_FAILED
     if record["status"] == STATUS_FAILED:
         record["error"] = f"child exited {proc.returncode}; pass={verdict.get('pass')}"
+        if _wait_for_child_repair(child_dir, log_path):
+            repaired = _read_child_verdict(child_dir)
+            if (_repair_state(child_dir) == "repaired" and repaired is not None
+                    and repaired.get("pass") is True):
+                record["status"] = STATUS_DELIVERED
+                record["commit"] = _child_commit(repaired, child_dir)
+                record["repaired"] = True
+                record.pop("error", None)
     return record
 
 
