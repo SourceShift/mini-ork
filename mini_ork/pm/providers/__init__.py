@@ -61,33 +61,29 @@ def skipped_sources() -> tuple[tuple[str, str], ...]:
     return tuple(_SKIPPED)
 
 
-def adapter_for(source_id: str):
+def adapter_for(source_id: str, adapter: str | None = None):
     """The adapter class that serves ``source_id``, or ``None``.
 
-    The one answer to "which adapters this build has", read by a caller that
-    cannot ask the registry: ``mini-ork pm add`` builds a source from a config
-    the project has not written yet, so there is nothing registered to look up.
-    ``local`` is absent on purpose — it is unconditional, not configured.
+    The one answer to "which adapter builds this source", read by registration
+    and by callers that cannot ask the registry (``mini-ork pm add`` builds a
+    source from a config the project has not written yet). An explicit
+    ``adapter`` (the source's ``adapter:`` setting) wins; otherwise the id
+    itself, then its prefix before the first ``-`` — so ``github-core`` is a
+    second GitHub source. ``local`` is absent on purpose — it is unconditional,
+    not configured.
     """
-    return _CONFIGURED.get(str(source_id))
+    named = str(adapter or "").strip()
+    if named:
+        return _CONFIGURED.get(named)
+    sid = str(source_id)
+    return _CONFIGURED.get(sid) or _CONFIGURED.get(sid.split("-", 1)[0])
 
 
 def _factory_for(source: pm_config.SourceConfig) -> tuple[object | None, str]:
-    """The adapter that builds ``source``, and the adapter name it was looked up by.
-
-    An explicit ``adapter:`` setting wins, so any id can name its tool. Otherwise
-    the id itself (``github``), and then the id's prefix before the first ``-``
-    (``github-core`` → ``github``). Exact match only used to apply, so a second
-    repository or team — the shape config/pm.yaml documents — was silently
-    never registered.
-    """
+    """The adapter that builds ``source``, and the adapter name it was looked up by."""
     named = str(source.settings.get("adapter") or "").strip()
-    if named:
-        return _CONFIGURED.get(named), named
-    if source.id in _CONFIGURED:
-        return _CONFIGURED[source.id], source.id
-    prefix = source.id.split("-", 1)[0]
-    return _CONFIGURED.get(prefix), prefix
+    return (adapter_for(source.id, named or None),
+            named or (source.id if source.id in _CONFIGURED else source.id.split("-", 1)[0]))
 
 
 def _register_configured(configuration: pm_config.PmConfig | None = None) -> None:

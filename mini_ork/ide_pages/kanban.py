@@ -275,14 +275,46 @@ def _sort_task_cards(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rank in its source's newest-first read). Priority leads, so a flood of
     low-priority tickets cannot push a prioritised epic off the board; the
     recency ordinal then keeps the newest card first within a tier. The cap is
-    applied on this one order, so epics and tickets share it.
+    applied per source by :func:`_fair_share`.
     """
-    def key(card: dict[str, Any]) -> tuple[int, int, str]:
-        return (int(card.get("_priority", 0) or 0),
-                int(card.get("_recency", 0) or 0),
-                str(card.get("id") or ""))
+    return sorted(cards, key=_task_sort_key, reverse=True)
 
-    return sorted(cards, key=key, reverse=True)
+
+def _task_sort_key(card: dict[str, Any]) -> tuple[int, int, str]:
+    return (int(card.get("_priority", 0) or 0),
+            int(card.get("_recency", 0) or 0),
+            str(card.get("id") or ""))
+
+
+def _card_source(card: dict[str, Any]) -> str:
+    """``local`` for an epic card, the provider id for a ticket card (``uid`` prefix)."""
+    card_id = str(card.get("id") or "")
+    return card_id.split(":", 1)[0] if ":" in card_id else "local"
+
+
+def _fair_share(cards: list[dict[str, Any]], cap: int) -> list[dict[str, Any]]:
+    """At most ``cap`` cards, every source in the column represented.
+
+    One shared priority sort let whichever source had more high-priority cards
+    fill the column: with 30+ prioritised epics in Backlog, no imported ticket
+    was ever drawn on the "All" view, which is the view the merge exists for.
+    Each source is sorted on its own (priority, then recency), then the sources
+    take turns — strongest head first — until the cap. One source alone gets
+    the whole cap, exactly as before.
+    """
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for card in cards:
+        groups.setdefault(_card_source(card), []).append(card)
+    if len(groups) <= 1:
+        return _sort_task_cards(cards)[:cap]
+    ordered = sorted((_sort_task_cards(group) for group in groups.values()),
+                     key=lambda queue: _task_sort_key(queue[0]), reverse=True)
+    out: list[dict[str, Any]] = []
+    while len(out) < cap and any(ordered):
+        for queue in ordered:
+            if queue and len(out) < cap:
+                out.append(queue.pop(0))
+    return out
 
 
 def _resolve_kickoff_path(home: Path, kickoff: str) -> str | None:
@@ -547,7 +579,7 @@ def _tasks_board(home: Path, args: dict[str, str], now: int,
 
     out_cols: list[dict[str, Any]] = []
     for title, colour in _TASK_COLUMNS:
-        cards = _sort_task_cards(buckets[title])[:_TASK_CAP]
+        cards = _fair_share(buckets[title], _TASK_CAP)
         # Strip the internal sort keys before serialising.
         for card in cards:
             card.pop("_recency", None)
@@ -654,7 +686,7 @@ def _source_row(
         bits.append(f"synced {age} ago")
 
     acts: list[dict[str, Any]] = []
-    if provider is not None or _adapter_exists(source_id):
+    if provider is not None or _adapter_exists(source_id, source):
         # A source whose adapter is in this build is testable even when its
         # config is still incomplete — the point of the button is to find that
         # out, and the command's own error says which setting is missing.
@@ -665,10 +697,11 @@ def _source_row(
     return mark(source_id, " · ".join(bits), acts)
 
 
-def _adapter_exists(source_id: str) -> bool:
+def _adapter_exists(source_id: str, source: Any = None) -> bool:
     from mini_ork.pm.providers import adapter_for
 
-    return adapter_for(source_id) is not None
+    settings = getattr(source, "settings", None) or {}
+    return adapter_for(source_id, settings.get("adapter")) is not None
 
 
 def _sources_pane(home: Path, now: int) -> list[dict[str, Any]]:

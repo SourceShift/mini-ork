@@ -171,3 +171,15 @@ def test_the_local_stanza_is_not_reported_as_skipped():
     from mini_ork.pm.config import SourceConfig
 
     assert _register(SourceConfig(id="local", enabled=True, settings={})) == []
+
+
+def test_adapter_for_follows_the_same_rule_as_registration():
+    from mini_ork.pm.providers import adapter_for
+    from mini_ork.pm.providers.github import GithubProvider
+    from mini_ork.pm.providers.jira import JiraProvider
+
+    assert adapter_for("github") is GithubProvider
+    assert adapter_for("github-core") is GithubProvider
+    assert adapter_for("tracker", "jira") is JiraProvider
+    assert adapter_for("asana-eng") is None
+    assert adapter_for("local") is None

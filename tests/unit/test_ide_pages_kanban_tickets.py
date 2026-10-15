@@ -382,6 +382,27 @@ def test_shared_cap_and_order_keeps_prioritised_epics(home: Path) -> None:
     assert {f"e-{i}" for i in range(5)} <= kept            # every epic survives
 
 
+def test_a_large_epic_backlog_does_not_hide_every_ticket(home: Path) -> None:
+    """The inverse flood: 35 prioritised epics used to fill Backlog's 30 slots,
+    so an imported ticket never showed on the All view (live, 2026-10-15)."""
+    for i in range(35):
+        _seed_epic(home, f"e-{i}", title=f"Epic {i}", status="not started", priority=5)
+    _seed_issue(home, "github-cn", "SourceShift/ContextNest#205", title="Update API",
+                state=IssueState.BACKLOG, native_state="open", priority=Priority.NONE)
+    backlog = _cols(build_page(home, "kanban"))["Backlog"]
+    ids = [c["id"] for c in backlog]
+    assert len(backlog) == 30
+    assert "github-cn:SourceShift/ContextNest#205" in ids
+    assert sum(1 for i in ids if ":" not in i) == 29
+
+
+def test_one_source_alone_keeps_the_plain_priority_order(home: Path) -> None:
+    for i in range(3):
+        _seed_epic(home, f"e-{i}", title=f"Epic {i}", status="not started", priority=i)
+    backlog = _cols(build_page(home, "kanban"))["Backlog"]
+    assert [c["id"] for c in backlog] == ["e-2", "e-1", "e-0"]
+
+
 # ── the Sources tab ────────────────────────────────────────────────────────
 #
 # The connect-from-the-UI surface: declared sources with an explicit Test, the
