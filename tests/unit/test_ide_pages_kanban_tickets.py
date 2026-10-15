@@ -380,3 +380,125 @@ def test_shared_cap_and_order_keeps_prioritised_epics(home: Path) -> None:
     assert len(backlog) == 30                              # the shared cap
     kept = {c["id"] for c in backlog}
     assert {f"e-{i}" for i in range(5)} <= kept            # every epic survives
+
+
+# ── the Sources tab ────────────────────────────────────────────────────────
+#
+# The connect-from-the-UI surface: declared sources with an explicit Test, the
+# add boxes for what is not declared yet, and — the property the whole epic
+# turns on — no credential VALUE anywhere in the payload. The pane's section is
+# titled "PM sources" so it does not collide with the Tasks tab's "Sources"
+# sync list that the tests above read.
+
+_EMPTY_PM = "sources: {}\n"
+
+
+def _pane_rows(page: dict[str, Any]) -> list[dict[str, Any]]:
+    return _section(page, "list", "PM sources")["items"]
+
+
+def _pane_row(page: dict[str, Any], source_id: str) -> dict[str, Any]:
+    row = next((i for i in _pane_rows(page) if i["t"] == source_id), None)
+    assert row is not None, [i["t"] for i in _pane_rows(page)]
+    return row
+
+
+def _acts(page: dict[str, Any], source_id: str) -> dict[str, dict[str, Any]]:
+    return {a["label"]: a for a in _pane_row(page, source_id)["acts"]}
+
+
+def _sources_page(home: Path, **args: Any) -> dict[str, Any]:
+    return build_page(home, "kanban", args=args, tab="sources")
+
+
+def test_the_sources_tab_builds_and_lists_every_declared_source(home: Path) -> None:
+    page = _sources_page(home)
+    assert page["ok"] is True
+    assert [row["t"] for row in _pane_rows(page)] == ["jira", "linear", "local"]
+
+
+def test_a_source_row_offers_an_explicit_test_button(home: Path) -> None:
+    """Test is a button, never a side effect of opening the pane."""
+    acts = _acts(_sources_page(home), "linear")
+    assert acts["Test"]["do"] == {"cli": ["pm", "test", "linear"]}
+
+
+def test_a_source_row_offers_remove_and_local_does_not(home: Path) -> None:
+    page = _sources_page(home)
+    assert _acts(page, "linear")["Remove"]["do"] == {"cli": ["pm", "remove", "linear"]}
+    assert "Remove" not in _acts(page, "local")     # mini-ork's own epics are not a source
+
+
+def test_an_undeclared_addable_source_gets_an_add_box(
+    home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_pm(monkeypatch, tmp_path, _PM_LOCAL_ONLY)
+    boxes = _section(_sources_page(home), "composer", None)
+    assert boxes["cli"] == ["pm", "add", "linear", "--set"]  # first addable, in order
+
+
+def test_every_addable_source_gets_its_own_add_box(
+    home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_pm(monkeypatch, tmp_path, _PM_LOCAL_ONLY)
+    page = _sources_page(home)
+    prefixes = [s["cli"] for s in page["sections"] if s["type"] == "composer"]
+    assert ["pm", "add", "linear", "--set"] in prefixes
+    assert ["pm", "add", "jira", "--set"] in prefixes
+
+
+def test_a_declared_source_gets_no_add_box(
+    home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    page = _sources_page(home)
+    prefixes = [s["cli"] for s in page["sections"] if s["type"] == "composer"]
+    assert not any(prefix[:3] == ["pm", "add", "linear"] for prefix in prefixes)
+
+
+def test_the_sources_tab_never_carries_a_credential_value(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A value in a page payload is a value in a log. The pane holds key NAMES."""
+    monkeypatch.setenv("LINEAR_API_KEY", "lin_sentinel_value_never_in_a_payload")
+    monkeypatch.setenv("JIRA_API_TOKEN", "jira_sentinel_value_never_in_a_payload")
+    store.record_sync_error("linear", "linear: request failed (401 Unauthorized)",
+                            db=str(home / "state.db"))
+    payload = json.dumps(_sources_page(home))
+    assert "lin_sentinel_value_never_in_a_payload" not in payload
+    assert "jira_sentinel_value_never_in_a_payload" not in payload
+    assert "LINEAR_API_KEY" in payload                 # the name is fine; the value is not
+
+
+def test_a_source_with_a_sync_error_is_marked_and_scrubbed(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LINEAR_API_KEY", "lin_sentinel_value")
+    store.record_sync_error("linear", "linear: request failed (401 Unauthorized)",
+                            db=str(home / "state.db"))
+    row = _pane_row(_sources_page(home), "linear")
+    assert row["m"] == "!"                             # the warn mark
+    assert "401" in row["sub"]
+    assert "lin_sentinel_value" not in json.dumps(row)
+
+
+def test_the_sources_tab_says_what_to_do_when_nothing_is_declared(
+    home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_pm(monkeypatch, tmp_path, _EMPTY_PM)
+    page = _sources_page(home)
+    assert page["ok"] is True
+    rows = _pane_rows(page)
+    assert len(rows) == 1                              # the one muted hint
+    assert "config/pm.yaml" in rows[0]["t"]
+
+
+def test_the_default_tab_is_still_the_tasks_board(home: Path) -> None:
+    """Adding the Sources pane must not move the default tab out from under it."""
+    page = build_page(home, "kanban")
+    assert page["tab"] == "tasks"
+    _section(page, "columns", "Tasks")
+
+
+def test_the_sources_tab_is_advertised_in_the_tab_strip(home: Path) -> None:
+    tabs = {t["key"]: t["label"] for t in build_page(home, "kanban")["tabs"]}
+    assert tabs.get("sources") == "Sources"

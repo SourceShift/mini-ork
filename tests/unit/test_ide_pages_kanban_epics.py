@@ -144,7 +144,10 @@ def test_default_tab_is_tasks_with_new_task_thread_action(home: Path) -> None:
     assert page["ok"] is True
     assert page["tab"] == "tasks"
     tabs = [(t["key"], t["label"]) for t in page["tabs"]]
-    assert tabs == [("tasks", "Tasks"), ("runs", "Runs")]
+    # ``sources`` is the PM Sources pane — the connect-from-the-UI surface
+    # (declared sources, an explicit Test, and the Add boxes). It rides the
+    # strip without moving the default tab off ``tasks``.
+    assert tabs == [("tasks", "Tasks"), ("runs", "Runs"), ("sources", "Sources")]
     new_task = next((a for a in page["actions"] if a["label"] == "New task"), None)
     assert new_task is not None, page["actions"]
     assert new_task["kind"] == "primary"

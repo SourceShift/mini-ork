@@ -289,6 +289,11 @@ def test_board_action_routes_through_board_cmd_parser(home: Path) -> None:
 # covers the default tab; specific tab keys exercise the tab-specific
 # builders.
 _PAGE_TABS: dict[str, tuple[str, ...]] = {
+    # ``kanban`` is the one page with a non-default tab carrying ``cli``
+    # actions of its own (the Sources pane's Test / Add / Remove). Without an
+    # entry here the walk only ever built ``tasks``, so a malformed ``pm``
+    # action would have shipped unseen.
+    "kanban": ("tasks", "runs", "sources"),
     "runs": ("runs", "active", "hooks"),
     "changes": ("worktrees", "review"),
     "verify": ("certify", "autonomy"),

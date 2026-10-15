@@ -40,7 +40,14 @@ from mini_ork.vcs import repo_integrity_guard
 from mini_ork.gates import rubric_prescreen
 from mini_ork.orchestration import concord_run
 
-_NATIVE_SUBS = {"apply", "classify", "plan", "verify", "verifier", "reflect", "garden", "validate"}
+# `pm` is here rather than in `_NATIVE_MODULE_SUBS`: this set is dispatched as
+# `mini_ork.cli.<name>`, which is exactly where the PM command lives, and
+# `tests/unit/test_native_dispatch_py.py` pins `_NATIVE_MODULE_SUBS` by exact
+# equality — a name added there is a test edit in the same diff, for no gain.
+_NATIVE_SUBS = {
+    "apply", "classify", "plan", "verify", "verifier", "reflect", "garden",
+    "validate", "pm",
+}
 
 # Native module subcommands. Compatibility launchers under bin/ re-exec this
 # dispatcher, so there is one public command implementation.

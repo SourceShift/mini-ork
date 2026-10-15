@@ -59,6 +59,17 @@ def skipped_sources() -> tuple[tuple[str, str], ...]:
     return tuple(_SKIPPED)
 
 
+def adapter_for(source_id: str):
+    """The adapter class that serves ``source_id``, or ``None``.
+
+    The one answer to "which adapters this build has", read by a caller that
+    cannot ask the registry: ``mini-ork pm add`` builds a source from a config
+    the project has not written yet, so there is nothing registered to look up.
+    ``local`` is absent on purpose — it is unconditional, not configured.
+    """
+    return _CONFIGURED.get(str(source_id))
+
+
 def _register_configured() -> None:
     try:
         configuration = pm_config.load_config()
@@ -83,4 +94,4 @@ def _register_configured() -> None:
 
 _register_configured()
 
-__all__ = ["github", "jira", "linear", "local", "skipped_sources"]
+__all__ = ["adapter_for", "github", "jira", "linear", "local", "skipped_sources"]

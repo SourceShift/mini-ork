@@ -190,3 +190,135 @@ def load_config(
     except (OSError, yaml.YAMLError) as exc:
         raise PmConfigError(f"cannot read {path}: {exc}") from exc
     return parse_config(document, path=path)
+
+
+# ── writing ────────────────────────────────────────────────────────────────
+#
+# The write side exists so `mini-ork pm add` can declare a source, and it is
+# the *inverse* of the reader rather than a second opinion about the format:
+# `dump_config` emits exactly the keys `parse_config` folds back, so the pair
+# round-trips by construction. A written file still carries no value — only
+# the name of the key that holds one.
+
+_WRITTEN_HEADER = """\
+# pm.yaml — project-management sources for this project.
+#
+# Written by `mini-ork pm add` / `mini-ork pm remove`; edit it by hand freely,
+# and re-running a command keeps the keys it does not own.
+#
+# A credential VALUE never appears here. `token_env` names the vault key that
+# holds one, resolved through mini_ork/dispatch/vault.py, so the same line
+# works whether the key lives in the environment, in a 0600 secrets.local.sh,
+# in sops, in `pass`, or in OpenBao. `mini-ork pm sources` shows what is
+# declared; `mini-ork vault which <NAME>` names the store that serves a key.
+"""
+
+
+def write_config_path(environ: Mapping[str, str] | None = None) -> Path:
+    """Where a written ``pm.yaml`` goes: ``$MINI_ORK_PM``, else ``$MINI_ORK_HOME``.
+
+    Never ``<repo>/config/pm.yaml``. That file is the committed team default
+    and a fallback for *reading* only — a writer that derived its path from
+    ``load_config().path`` would rewrite the checked-in example the first time
+    anyone ran ``pm add`` with no home set.
+    """
+    environment = os.environ if environ is None else environ
+    override = str(environment.get(ENV_OVERRIDE) or "").strip()
+    if override:
+        return Path(override)
+    home = str(environment.get("MINI_ORK_HOME") or DEFAULT_HOME).strip()
+    return Path(home) / "config" / "pm.yaml"
+
+
+def dump_config(config: PmConfig) -> dict[str, Any]:
+    """The YAML document for ``config`` — the inverse of :func:`parse_config`.
+
+    Every source keeps its ``enabled`` flag, its ``token_env`` *name*, and the
+    settings the config layer does not interpret. ``parse_config(dump_config(c))``
+    reproduces ``c``'s sources, so the round trip is a property of the two
+    functions rather than of keeping two spellings in step.
+    """
+    sources: dict[str, Any] = {}
+    for source_id in sorted(config.sources):
+        source = config.sources[source_id]
+        entry: dict[str, Any] = {"enabled": bool(source.enabled)}
+        if source.token_env is not None:
+            entry["token_env"] = source.token_env
+        for key in sorted(source.settings, key=str):
+            entry[str(key)] = source.settings[key]
+        sources[str(source_id)] = entry
+    return {"sources": sources}
+
+
+def _existing_top_level(path: Path) -> Mapping[str, Any] | None:
+    """The file's own top-level keys, or ``None``. Never raises and never returns a value."""
+    if not path.is_file():
+        return None
+    import yaml
+
+    try:
+        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        # A file we cannot parse is a file whose extra keys we cannot keep.
+        # Writing the effective config is still better than refusing to write.
+        return None
+    return document if isinstance(document, Mapping) else None
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write ``text`` through a 0600 temp file and ``os.replace``.
+
+    Its own temp file in the target directory, so the replacement is atomic on
+    one filesystem and a crash cannot leave a half-written config where a
+    reader would find it mid-parse.
+    """
+    import tempfile
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".pm-", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except OSError as exc:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise PmConfigError(f"cannot write {path}: {exc}") from exc
+
+
+def write_config(
+    config: PmConfig,
+    path: Path | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> Path:
+    """Write ``config`` to ``pm.yaml`` atomically. Returns the path it wrote.
+
+    Top-level keys the dataclasses do not model are carried over from the file
+    already there, so a comment block or a key a future version added survives
+    a ``pm add``. Keys *inside* a source are all modelled — ``enabled``,
+    ``token_env``, and ``settings`` for everything else — so they round-trip
+    through the reader unchanged.
+    """
+    target = Path(path) if path is not None else write_config_path(environ)
+    document: dict[str, Any] = dump_config(config)
+    existing = _existing_top_level(target)
+    if existing is not None:
+        extras = {str(key): value for key, value in existing.items() if key != "sources"}
+        if extras:
+            document = {**extras, **document}
+    import yaml
+
+    try:
+        rendered = yaml.safe_dump(
+            document, sort_keys=False, default_flow_style=False, allow_unicode=True
+        )
+    except yaml.YAMLError as exc:
+        raise PmConfigError(f"cannot render {target}: {exc}") from exc
+    _atomic_write_text(target, _WRITTEN_HEADER + rendered)
+    return target

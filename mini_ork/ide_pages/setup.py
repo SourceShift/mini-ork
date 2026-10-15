@@ -523,13 +523,39 @@ def _settings_tab(home: Path) -> list[dict[str, Any]]:
         shown = str(path).replace(os.path.expanduser("~"), "~", 1)
         acts = [S.btn("Open", S.open_path(str(path)), "ghost")] if path.is_file() else []
         items.append(S.dot(label, f"{shown} · {'present' if path.is_file() else 'not created yet'}", acts))
-    items.append(S.dot("Credentials", "set with `mini-ork providers configure <lane>` in a terminal — "
-                                      "never from this page",
-                       [S.btn("Lanes & providers", S.page_link("lanes"), "ghost")]))
+    items.append(S.dot("Credentials", "lane keys with `mini-ork providers configure <lane>` in a "
+                                      "terminal; a PM source through the Board's Sources tab — "
+                                      f"both refuse to take a value here. Backend in force: "
+                                      f"{_vault_backend_label()}",
+                       [S.btn("Lanes & providers", S.page_link("lanes"), "ghost"),
+                        S.btn("Sources", S.page_link("kanban", "sources"), "ghost")]))
     sections.append(S.lst("Edited by hand", items, full=True,
                           note="These files are edited in your editor. mini-ork self-improve rewrites "
-                               "agents.yaml; a credential is never entered through this page."))
+                               "agents.yaml; a credential is entered at a terminal prompt or through "
+                               "the Board's Sources tab, and never through this page."))
     return sections
+
+
+def _vault_backend_label() -> str:
+    """The vault's backend chain, named for the Credentials row.
+
+    Names and readiness only: ``mini_ork.dispatch.vault`` never reports a value
+    — that is its whole contract — so this text is safe in a page payload. A
+    vault config that cannot be read is named rather than hidden, because the
+    row exists to tell a person where a credential would go.
+    """
+    try:
+        from mini_ork.dispatch.vault import vault_environment
+
+        statuses = vault_environment().status()
+    except Exception as exc:  # noqa: BLE001 — a broken vault must not blank the page
+        return f"unreadable ({type(exc).__name__}) — see config/vault.example.yaml"
+    if not statuses:
+        return "none configured"
+    return ", ".join(
+        item.backend if item.ready else f"{item.backend} (not ready)"
+        for item in statuses
+    )
 
 
 # ── page ───────────────────────────────────────────────────────────────────
