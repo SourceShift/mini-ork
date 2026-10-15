@@ -194,6 +194,37 @@ def test_overview_reads_verifier_files_with_log_lines_before_the_json(home: Path
     assert events[-1]["t"].split()[2:4] == ["node_end", "publisher"]
 
 
+def test_overview_always_shows_the_orchestrator_even_when_it_never_spoke(
+        home: Path, monkeypatch) -> None:
+    """A clean dependency-graph run leaves the orchestrator silent — it emits a
+    row only when a node needs help/repair/mutate/promote, and green nodes are
+    skipped. The Overview tab must still show the layer, so "armed but quiet"
+    reads as a fact instead of as a missing feature."""
+    monkeypatch.delenv("MO_RUN_ORCHESTRATOR", raising=False)  # default-on
+    _seed(home)
+    page = build_page(home, "run", "overview", {"run": RUN})
+    sec = next(s for s in page["sections"] if s["title"].startswith("Orchestrator"))
+    assert sec["title"] == "Orchestrator — armed"
+    assert sec["items"][0]["t"] == "Armed — no interventions this run"
+
+
+def test_overview_lists_the_orchestrators_interventions(home: Path, monkeypatch) -> None:
+    monkeypatch.delenv("MO_RUN_ORCHESTRATOR", raising=False)
+    _seed(home)
+    con = sqlite3.connect(home / "state.db")
+    con.execute("INSERT INTO run_events (event_id, run_id, event_type, payload_json, created_at) "
+                "VALUES (?,?,?,?,?)",
+                ("ev-orch", RUN, "orchestrator.mutate.proposed",
+                 json.dumps({"node_id": "implementer", "reason": "lane exhausted"}), T0 + 60))
+    con.commit()
+    con.close()
+    page = build_page(home, "run", "overview", {"run": RUN})
+    sec = next(s for s in page["sections"] if s["title"].startswith("Orchestrator"))
+    row = sec["items"][0]
+    assert "mutate.proposed" in row["t"]
+    assert row["sub"] == "implementer · lane exhausted"
+
+
 def test_agents_learnings_and_artifacts(home: Path) -> None:
     run_dir = _seed(home)
     agents = build_page(home, "run", "agents", {"run": RUN})
