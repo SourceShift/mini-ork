@@ -19,6 +19,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from mini_ork.context import scoped_environ
 from mini_ork.observability import bug_report
 from mini_ork.triage import blame as _blame
 from mini_ork.triage.blame import Evidence, NodeFailure
@@ -343,6 +344,129 @@ def triage_run(
             res.epic_id, res.kickoff_path = _epic_for_bug(db_s, res.bug_id, root_s)
         except Exception as exc:  # noqa: BLE001
             res.reason += f"; promote failed: {exc}"
+    return res
+
+
+_DIAGNOSIS_EXCERPT_CHARS = 80
+
+
+def diagnosis_title(diagnosis: dict) -> str:
+    """The bug title derived from a diagnosis — the escalation fingerprint seed.
+
+    ``f"[{layer}/{stage}] {node}: {first evidence excerpt, 80 chars}"``. Shared
+    by :func:`file_diagnosis` (which files it) and ``escalation.gather_inputs``
+    (which looks for an earlier fix epic for the *same* signature), so the two
+    can never drift apart.
+    """
+    layer = str(diagnosis.get("layer") or "")
+    stage = str(diagnosis.get("stage") or "")
+    node = str(diagnosis.get("node") or "?")
+    excerpt = ""
+    for ev in diagnosis.get("evidence") or []:
+        if isinstance(ev, dict):
+            excerpt = str(ev.get("excerpt") or "").strip()
+            if excerpt:
+                break
+    return f"[{layer}/{stage}] {node}: {excerpt}".strip()[:300]
+
+
+def diagnosis_fingerprint(diagnosis: dict) -> str:
+    """The dedupe fingerprint of :func:`diagnosis_title` (same normalizer)."""
+    return bug_report._fingerprint(diagnosis_title(diagnosis))
+
+
+def _diagnosis_description(diagnosis: dict) -> str:
+    """``summary`` + every evidence item as ``kind ref: excerpt``."""
+    lines = [str(diagnosis.get("summary") or "")]
+    for ev in diagnosis.get("evidence") or []:
+        if not isinstance(ev, dict):
+            continue
+        lines.append(
+            f"{ev.get('kind') or ''} {ev.get('ref') or ''}: {ev.get('excerpt') or ''}".strip()
+        )
+    return "\n".join(line for line in lines if line)
+
+
+def file_diagnosis(
+    run_id: str,
+    diagnosis: dict,
+    *,
+    home: str | os.PathLike[str] | None = None,
+    db: str | os.PathLike[str] | None = None,
+    root: str | os.PathLike[str] | None = None,
+    promote: bool = False,
+) -> TriageResult:
+    """File/promote a fix for a *typed diagnosis* — the escalation half.
+
+    ``triage_run`` re-decides blame from Python traceback frames
+    (:mod:`mini_ork.triage.blame`), so a delivery-stage engine fault with no
+    traceback is filed as ``consumer``/``unknown`` and never promoted. This
+    takes the attribution from the diagnosis instead, which already localised
+    the failure, and reuses the exact emit → sweep → fingerprint → promote →
+    epic sequence:
+
+      * ``agent_role="self-driving"``, severity ``high``, ``confidence`` from the
+        diagnosis, ``observed_in`` = the run dir;
+      * title = :func:`diagnosis_title`, description = the diagnosis summary +
+        every evidence item;
+      * re-filing the same fingerprint reuses the stored row — no ``frequency``
+        inflation — exactly as ``triage_run`` dedupes.
+
+    Deliberately does NOT swallow failures (unlike ``triage_run``, which reports
+    them in ``reason``): its caller ``escalation.escalate`` must know whether an
+    epic actually exists before it parks a run on one, and it wraps this call in
+    the never-raise contract (hard constraint ``c:0``).
+    """
+    home_s = resolve_home(home)
+    db_s = resolve_db(db, home=home_s)
+    root_s = resolve_root(root)
+    run_id = str(run_id)
+
+    res = TriageResult(run_id=run_id, recipe=_run_recipe(db_s, run_id))
+    res.blame = "mini_ork"
+    res.signature = diagnosis_fingerprint(diagnosis)
+    res.reason = str(diagnosis.get("summary") or "")
+    res.evidence = [
+        Evidence(rule=str(ev.get("kind") or ""), detail=str(ev.get("ref") or ""))
+        for ev in diagnosis.get("evidence") or []
+        if isinstance(ev, dict)
+    ]
+
+    title = diagnosis_title(diagnosis)
+    fp = res.signature
+    res.bug_id = _bug_id_for_fingerprint(db_s, fp)
+    if res.bug_id is None:
+        run_dir = os.path.join(home_s, "runs", run_id)
+        try:
+            confidence = float(diagnosis.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        # Scope the env so ``bug_report_promote`` (which resolves its own DB
+        # from ``MINI_ORK_DB``/``MINI_ORK_HOME``) writes the SAME state.db this
+        # call was pointed at rather than whatever the ambient env says.
+        with scoped_environ({"MINI_ORK_DB": db_s, "MINI_ORK_HOME": home_s}):
+            bug_report.bug_report_emit(
+                "self-driving",
+                "high",
+                title,
+                description=_diagnosis_description(diagnosis)[:4000],
+                suggested_fix="",
+                observed_in=run_dir,
+                confidence=confidence,
+                run_dir=run_dir,
+            )
+            bug_report.bug_report_sweep(since=0, home=home_s)
+        res.bug_id = _bug_id_for_fingerprint(db_s, fp)
+
+    if promote and res.bug_id is not None:
+        with scoped_environ({"MINI_ORK_DB": db_s, "MINI_ORK_HOME": home_s}):
+            bug_report.bug_report_promote(
+                top=1,
+                repo_root=root_s,
+                recipe=res.fix_recipe,
+                bug_ids=[res.bug_id],
+            )
+        res.epic_id, res.kickoff_path = _epic_for_bug(db_s, res.bug_id, root_s)
     return res
 
 
