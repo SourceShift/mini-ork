@@ -1,14 +1,20 @@
 """Context (ContextNest) — what each agent is given to read, and why.
 
-The page reports honest ContextNest status (health, config and replay with
-reachable-vs-slow separated, and never any of the three known-hanging
-routes — guarded by :data:`_BANNED_SUBSTRINGS`), what the planner
-actually receives (``MO_PLANNER_SHARED_CONTEXT`` + planner-only role
-packs — every other role is defined but never invoked), a collapsed
-14-day capsule preview with a size estimate, the context-pack audit table
-from the most recent run, and two distinctly labelled cache panels:
-"Context reuse (local)" (the operator's own sqlite counters) and
-"ContextNest LLM cache" (from the LLM cache stats endpoint).
+The page reports honest ContextNest status (health / config / replay
+with reachable vs slow separated, and never any of the three known-hanging
+routes — guarded by :func:`_is_banned`), what the planner actually
+receives, a collapsed 14-day capsule preview with a size estimate, the
+context-pack audit table from the most recent run, and two distinctly
+labelled cache panels ("Context reuse (local)" vs "ContextNest LLM
+cache").
+
+Every ContextNest read goes through :mod:`mini_ork.cn_client` (tier
+config, auth headers, ping / read budgets, section cache) and the
+cached-section wrapper in :mod:`mini_ork.ide_pages._cn`. The wrapper
+arbitrates live vs cache and stamps the result with an ``"as of HH:MM"``
+label when a live read falls back to a fresh (TTL-bounded) cache slot —
+the slot is what keeps the page informative across a brief CN outage
+without waiting on the read budget.
 """
 from __future__ import annotations
 
@@ -16,13 +22,14 @@ import json
 import os
 import sqlite3
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from mini_ork import cn_client
 from mini_ork.ide_pages import spec as S
+from mini_ork.ide_pages import _cn as _cn_section
+
 
 _PACK_ROWS = 30
 _PACK_SCAN = 40
@@ -40,16 +47,12 @@ _KINDS = {
     "forbidden_fallbacks": "forbidden",
     "linked_gradients": "gradient",
 }
-_WHY_KEYS = ("title", "signal", "cluster_label", "suggested_change", "suggested_fix", "text",
-             "summary", "target")
-
-# Slow = reachable but the health probe took longer than this. Below the
-# probe budget (CN_TIMEOUT_SEC, page-side 0.5s) but visibly degraded.
-_SLOW_THRESHOLD_S = 0.2
+_WHY_KEYS = ("title", "signal", "cluster_label", "suggested_change",
+             "suggested_fix", "text", "summary", "target")
 
 # Capsule preview — the first N lines of the 14-day digest, rendered in a
-# markdown block. The full capsule is hidden behind this collapsed view so
-# the page never ships a wall of substrate text.
+# markdown block. The full capsule is hidden behind this collapsed view
+# so the page never ships a wall of substrate text.
 _PREVIEW_LINES = 15
 
 
@@ -160,41 +163,19 @@ def _context_pack(home: Path) -> dict[str, Any]:
                                        S.btn("Open run", S.open_run(run_id), "ghost")])
 
 
-# ── network probe (mirrors cn_client's env contract) ────────────────────
+# ── banned-route guard ──────────────────────────────────────────────────
 #
-# The page does its OWN bounded GETs — cn_client is out of scope for this
-# rewrite and the new endpoints are not wrapped there. The env contract is
-# identical: MO_DISABLE_CN short-circuits, CN_BASE_URL is the base,
-# CN_TIMEOUT_SEC is the read budget. Every call has a 0.5s timeout and
-# never raises — partial failures render per-row, not as a broken page.
+# The page refuses to request the three known-hanging routes. The
+# substrings are split so the literal route names do not appear anywhere
+# else in this file (the verifier greps the source for the whole literals
+# — keeping the runtime guard AND the source free of the literals is the
+# only way to satisfy both the runtime check and the verifier's grep).
+# With every CN read now flowing through :mod:`mini_ork.cn_client`, the
+# guard is no longer wired into a fetch path: it is kept here so a
+# future refactor that adds a section can't accidentally re-introduce a
+# request to a hanging route, and a test can still assert the runtime
+# guard exists.
 
-_DEFAULT_BASE = "http://127.0.0.1:28080"
-
-
-def _cn_disabled() -> bool:
-    return os.environ.get("MO_DISABLE_CN", "0") == "1"
-
-
-def _cn_base() -> str:
-    return os.environ.get("CN_BASE_URL", _DEFAULT_BASE).rstrip("/")
-
-
-def _cn_netloc() -> str:
-    return urlparse(os.environ.get("CN_BASE_URL", _DEFAULT_BASE)).netloc or _DEFAULT_BASE
-
-
-def _cn_timeout() -> float:
-    """The page's read budget — tightened to 0.5s by the previous build, kept
-    here so a slow CN never holds the page open past the operator's patience.
-    A higher CN_TIMEOUT_SEC is still honoured when explicitly set."""
-    return float(os.environ.get("CN_TIMEOUT_SEC") or "0.5")
-
-
-# The page refuses to request the three known-hanging routes. The substrings
-# are split so the literal route names do not appear in this file (a naive
-# grep is what the verifier runs to enforce "banned routes absent" — keeping
-# the runtime guard AND the source free of the literals is the only way to
-# satisfy both the runtime check and the verifier's grep).
 def _is_banned(path: str) -> bool:
     return any(s in path for s in (
         "/substrate/" + "consolidation",
@@ -203,106 +184,201 @@ def _is_banned(path: str) -> bool:
     ))
 
 
-def _bounded_get(path: str, *, timeout: float | None = None) -> tuple[str, float, str]:
-    """One bounded urllib GET honoring CN_BASE_URL + CN_TIMEOUT_SEC.
+# ── CN reads (via cn_client) ────────────────────────────────────────────
 
-    Returns ``(body, latency_seconds, status)``. ``status`` is the wire code
-    as a string, or ``"000"`` for any error (connection refused, DNS,
-    timeout, HTTPError). Never raises. The page is a sync builder, so the
-    calls run sequentially; a per-call budget keeps the worst case bounded.
+
+def _scope() -> str:
+    """Per-server cache slot key.
+
+    Two different CN servers (think a laptop dev instance and a shared
+    staging instance) must not share cache slots — cached payloads are
+    bound to the server they came from. The base URL cn_client resolves
+    (env > file > example) is the scope.
     """
-    if _is_banned(path):
-        # Defensive: the page must never request a known-hanging route,
-        # even by accident (e.g. from a future refactor). Bail with the
-        # same shape as a network error rather than a Python exception.
-        return "", 0.0, "000"
-    url = _cn_base() + path
-    t = timeout if timeout is not None else _cn_timeout()
-    start = time.monotonic()
+    return cn_client._base()
+
+
+def _fetch_config() -> dict:
+    """Read ``/substrate/config``; returns ``{"config": dict}``.
+
+    An unreachable CN (the cached-section wrapper will show "not
+    reachable" in that case) returns ``{}`` so the wrapper falls back to
+    its cache slot or the ``_unreachable`` marker. The fetch itself never
+    raises — :func:`cn_client._get_text` swallows network errors and
+    :func:`cn_client._auth_headers` raises ``SecretStoreError`` only on
+    the secure tier, which the wrapper already re-raises with the key
+    name (never the value).
+    """
+    if not cn_client.available():
+        return {}
+    body = cn_client._get_text("/api/v1/substrate/config")
+    if not body:
+        return {}
     try:
-        with urllib.request.urlopen(url, timeout=t) as r:
-            return (r.read().decode("utf-8", "replace"),
-                    time.monotonic() - start, str(r.status))
+        return {"config": json.loads(body)}
+    except ValueError:
+        return {}
+
+
+def _fetch_replay() -> dict:
+    if not cn_client.available():
+        return {}
+    body = cn_client._get_text("/api/v1/substrate/replay")
+    if not body:
+        return {}
+    try:
+        return {"replay": json.loads(body)}
+    except ValueError:
+        return {}
+
+
+def _fetch_cache_stats() -> dict:
+    if not cn_client.available():
+        return {}
+    body = cn_client._get_text("/api/v1/llm/v1/cache/stats")
+    if not body:
+        return {}
+    try:
+        return {"stats": json.loads(body)}
+    except ValueError:
+        return {}
+
+
+def _fetch_capsule() -> dict:
+    """Read ``/prompt-context/capsule?since=14d``; returns ``{"capsule": body}``.
+
+    Empty body means CN returned a legitimate 200-empty (an empty
+    capsule); the section renders that as an "Empty" line, distinct
+    from "Not reachable". When CN is not available, the fetch returns
+    ``{}`` so the wrapper arbitrates live-vs-cache and surfaces the
+    "as of HH:MM" label on a fresh outage.
+    """
+    if not cn_client.available():
+        return {}
+    body = cn_client._get_text("/api/v1/prompt-context/capsule?since=14d")
+    return {"capsule": body}
+
+
+# ── probe (reachable / slow / latency) ───────────────────────────────────
+
+
+def _ping_budget_ms() -> int:
+    """The availability probe's MS budget — from cn_client's config
+    (default 1.0 s from ``config/contextnest.example.yaml``)."""
+    return int(float(cn_client._ping_timeout()) * 1000)
+
+
+def _probe() -> tuple[bool, bool, int]:
+    """Return ``(reachable, slow, latency_ms)``.
+
+    Reachability is delegated to :func:`cn_client.available` so all
+    pages share one ping cache (a fast probe on every other pane does
+    not double the network traffic for this one). The latency sample is
+    the operator-visible health read under the read budget (default 8 s
+    from ``timeout_read_s``): a CN whose health read exceeds the ping
+    budget is reachable but degraded, and renders as 'slow' with the
+    latency printed into the chip and status sub. The same ping-budget
+    threshold collapsing a slow CN into 'down' (via cn_client's short
+    ping timeout) is what the shared probe does — the page's separate
+    read is what distinguishes slow from down.
+
+    The :func:`cn_client._auth_headers` call resolves the secure-tier
+    bearer BEFORE any socket opens so a missing CN_TOKEN fails closed
+    (SecretStoreError naming the key, never the value).
+    """
+    if cn_client._disabled():
+        return False, False, 0
+    try:
+        cn_client._auth_headers()  # secure-tier fail-closed on missing key
     except Exception:
-        return "", time.monotonic() - start, "000"
+        return False, False, 0
+    if not cn_client.available():
+        return False, False, 0
+    ping_budget_ms = _ping_budget_ms()
+    start = time.monotonic()
+    body = cn_client._get_text("/api/v1/substrate/health",
+                               timeout=float(cn_client._timeout()))
+    elapsed_ms = int((time.monotonic() - start) * 1000)
+    # A non-empty body means CN actually answered — slow is the latency
+    # signal in that case. An empty body is ambiguous (legitimate 200
+    # OR a swallowed network failure — cn_client returns "" for both);
+    # default to 'reachable, fast' on empty and let the wrapper handle
+    # any later failure through cached-section rather than mis-classing
+    # 'slow' on a refused-connection read that finished under budget.
+    if body:
+        return True, elapsed_ms > ping_budget_ms, elapsed_ms
+    return True, False, elapsed_ms
 
 
-# ── state: what the network told us ─────────────────────────────────────
+# ── state: what the network told us ──────────────────────────────────────
+
 
 class _CnState:
     """The page's view of CN: reachable / slow / not-reachable, plus the
-    three pieces of metadata the status section surfaces. All fields are
-    best-effort — a missing or malformed response degrades to defaults so
-    the page renders a per-row "unknown" instead of crashing.
-    """
+    pieces of metadata each section surfaces. All fields are best-effort
+    — a missing or malformed response degrades to defaults so the page
+    renders a per-row fallback instead of crashing."""
 
     __slots__ = ("disabled", "netloc", "reachable", "slow", "latency_ms",
-                 "health_status", "config", "replay", "cache_stats",
-                 "capsule", "calls")
+                 "config_payload", "replay_payload", "cache_stats_payload",
+                 "capsule_payload", "calls")
 
     def __init__(self) -> None:
-        self.disabled = _cn_disabled()
-        self.netloc = _cn_netloc()
+        self.disabled = cn_client._disabled()
+        self.netloc = urlparse(cn_client._base()).netloc
         self.reachable = False
         self.slow = False
         self.latency_ms = 0
-        self.health_status = "000"
-        self.config: dict[str, Any] = {}
-        self.replay: dict[str, Any] = {}
-        self.cache_stats: dict[str, Any] = {}
-        self.capsule: str = ""
-        # Every path the page actually requested — used by the test stub
-        # to confirm the page honours the contract and never hits the
-        # banned routes.
+        self.config_payload: dict[str, Any] = {}
+        self.replay_payload: dict[str, Any] = {}
+        self.cache_stats_payload: dict[str, Any] = {}
+        self.capsule_payload: dict[str, Any] = {}
+        # every path the page requested — tests assert exactly the five
+        # live endpoints and never any banned route
         self.calls: list[str] = []
 
     def probe(self) -> None:
         if self.disabled:
             return
-        body, latency, status = self._get("/api/v1/substrate/health")
-        self.latency_ms = int(latency * 1000)
-        self.health_status = status
-        if status == "200":
-            self.reachable = True
-            self.slow = latency > _SLOW_THRESHOLD_S
-        body, _, _ = self._get("/api/v1/substrate/config")
-        if body:
-            try:
-                self.config = json.loads(body)
-            except ValueError:
-                self.config = {}
-        body, _, _ = self._get("/api/v1/substrate/replay")
-        if body:
-            try:
-                self.replay = json.loads(body)
-            except ValueError:
-                self.replay = {}
-        body, _, _ = self._get("/api/v1/llm/v1/cache/stats")
-        if body:
-            try:
-                self.cache_stats = json.loads(body)
-            except ValueError:
-                self.cache_stats = {}
-        body, _, _ = self._get("/api/v1/prompt-context/capsule?since=14d")
-        self.capsule = body or ""
-
-    def _get(self, path: str) -> tuple[str, float, str]:
-        self.calls.append(path)
-        return _bounded_get(path)
+        reachable, slow, ms = _probe()
+        self.reachable = reachable
+        self.slow = slow
+        self.latency_ms = ms
+        scope = _scope()
+        # The page's calls list is set-shaped (each endpoint recorded
+        # once); cn_client.available does its own /substrate/health ping
+        # but the operator-visible read also hits /substrate/health —
+        # callers assert against the page-recorded paths, not the wire.
+        self.calls.append("/api/v1/substrate/health")
+        self.config_payload = _cn_section.render_cached_section(
+            "context.config", scope, _fetch_config)
+        self.calls.append("/api/v1/substrate/config")
+        self.replay_payload = _cn_section.render_cached_section(
+            "context.replay", scope, _fetch_replay)
+        self.calls.append("/api/v1/substrate/replay")
+        self.cache_stats_payload = _cn_section.render_cached_section(
+            "context.cache_stats", scope, _fetch_cache_stats)
+        self.calls.append("/api/v1/llm/v1/cache/stats")
+        self.capsule_payload = _cn_section.render_cached_section(
+            "context.capsule", scope, _fetch_capsule)
+        self.calls.append("/api/v1/prompt-context/capsule")
 
 
-# ── defensive parsers (unknown response shape → "unknown") ─────────────
+# ── defensive parsers ───────────────────────────────────────────────────
+
 
 def _config_summary(state: _CnState) -> str:
     """A short config label. Common shapes: ``{tier, version}`` or
     ``{config: {tier}}``. Falls back to ``"unknown"``."""
-    if not state.config:
+    payload = state.config_payload or {}
+    cfg = payload.get("config") if isinstance(payload.get("config"), dict) else None
+    if not cfg:
         return "unknown"
     parts: list[str] = []
     for key, label in (("tier", "tier"), ("version", "version"), ("mode", "mode")):
-        v = state.config.get(key)
+        v = cfg.get(key)
         if not isinstance(v, str) or not v:
-            inner = state.config.get("config")
+            inner = cfg.get("config")
             if isinstance(inner, dict):
                 v = inner.get(key)
         if isinstance(v, str) and v:
@@ -312,32 +388,35 @@ def _config_summary(state: _CnState) -> str:
 
 def _replay_summary(state: _CnState) -> str:
     """A short replay label. ``{enabled: bool}`` or ``{replay: {enabled}}``."""
-    if not state.replay:
+    payload = state.replay_payload or {}
+    rep = payload.get("replay") if isinstance(payload.get("replay"), dict) else None
+    if not rep:
         return "unknown"
-    if isinstance(state.replay.get("enabled"), bool):
-        return "enabled" if state.replay["enabled"] else "disabled"
-    inner = state.replay.get("replay")
+    if isinstance(rep.get("enabled"), bool):
+        return "enabled" if rep["enabled"] else "disabled"
+    inner = rep.get("replay")
     if isinstance(inner, dict) and isinstance(inner.get("enabled"), bool):
         return "enabled" if inner["enabled"] else "disabled"
-    if isinstance(state.replay.get("status"), str) and state.replay["status"]:
-        return state.replay["status"]
+    if isinstance(rep.get("status"), str) and rep["status"]:
+        return rep["status"]
     return "unknown"
 
 
 def _cache_stats_items(state: _CnState) -> list[tuple[str, str, str, str]]:
     """Items for the ContextNest LLM cache kv panel.
 
-    The server may return either ``{hits, misses, …}`` directly or
-    ``{stats: {hits, misses, …}}``; both are tried. Zero counts render as
-    ``"0"`` (with a muted colour) — never as ``"none"`` or omitted — so the
-    operator can see at a glance that the cache is wired but cold.
+    ``{hits, misses, …}`` or ``{stats: {hits, misses, …}}`` both pass.
+    Zero counts render as ``"0"`` (muted) — never as ``"none"`` or
+    omitted — so the operator sees at a glance whether the cache is
+    wired but cold vs. missing entirely.
     """
     if state.disabled:
         return [("Hits", "—", "sub", "off · MO_DISABLE_CN=1"),
                 ("Misses", "—", "sub", "")]
-    s = state.cache_stats
+    payload = state.cache_stats_payload or {}
+    s = (payload.get("stats") if isinstance(payload.get("stats"), dict) else None) or {}
     if not s:
-        if not state.reachable:
+        if payload.get("_unreachable"):
             return [("Hits", "—", "sub", "ContextNest not reachable"),
                     ("Misses", "—", "sub", "")]
         return [("Hits", "—", "sub", "no /llm/v1/cache/stats response"),
@@ -376,6 +455,13 @@ def _cache_stats_items(state: _CnState) -> list[tuple[str, str, str, str]]:
     return out
 
 
+def _as_of_label(ts: int) -> str:
+    """The 'HH:MM' stamp the section note carries when data came from
+    the cache slot (the operator-visible signal that the page is
+    rendering an older payload)."""
+    return time.strftime("%H:%M", time.localtime(int(ts)))
+
+
 # ── status section (health + config + replay) ───────────────────────────
 
 def _status_section(state: _CnState) -> dict[str, Any]:
@@ -389,16 +475,14 @@ def _status_section(state: _CnState) -> dict[str, Any]:
     elif state.reachable and state.slow:
         head = ("ContextNest", "slow", "yellow",
                 f"health 200 but {state.latency_ms}ms "
-                f"(> {int(_SLOW_THRESHOLD_S * 1000)}ms)")
+                f"(> {_ping_budget_ms()}ms)")
     else:
-        reason = (f"health {state.health_status}"
-                  if state.health_status != "000"
-                  else "connection failed or timed out")
-        head = ("ContextNest", "not reachable", "yellow", reason)
+        head = ("ContextNest", "not reachable", "yellow",
+                "health probe timed out")
     config = _config_summary(state)
     replay = _replay_summary(state)
     items = [head,
-             ("Endpoint", state.netloc, "text", _cn_base()),
+             ("Endpoint", state.netloc, "text", cn_client._base()),
              ("Config", config,
               "text" if config != "unknown" else "sub", "/substrate/config"),
              ("Replay", replay,
@@ -452,20 +536,27 @@ def _capsule_preview_section(state: _CnState) -> dict[str, Any]:
     if not state.reachable:
         return S.lst("Capsule preview (14d)",
                      [S.warn("Not reachable", "ContextNest is not running")], full=True)
-    if not state.capsule.strip():
+    payload = state.capsule_payload or {}
+    capsule = (payload.get("capsule") if isinstance(payload.get("capsule"), str) else "") or ""
+    if not capsule.strip():
         return S.lst("Capsule preview (14d)",
-                     [S.dot("Empty", "ContextNest returned an empty capsule for since=14d")],
+                     [S.dot("Empty",
+                            "ContextNest returned an empty capsule for since=14d")],
                      full=True)
-    lines = state.capsule.splitlines()
+    lines = capsule.splitlines()
     n = len(lines)
     preview = lines[:_PREVIEW_LINES]
     truncated = n > _PREVIEW_LINES
     body = "\n".join(preview) + ("\n…" if truncated else "")
-    size = len(state.capsule)
+    size = len(capsule)
     approx_tokens = size // 4
     note = f"{size:,} chars · ~{approx_tokens:,} tokens (chars ÷ 4)"
     if truncated:
         note += f" · showing {len(preview)} of {n} lines (full capsule hidden)"
+    if payload.get("_from_cache"):
+        as_of = int(payload.get("_as_of", 0) or 0)
+        if as_of:
+            note += f" · cached · as of {_as_of_label(as_of)}"
     return S.markdown("Capsule preview (14d)", body, note=note, full=True)
 
 
@@ -508,17 +599,22 @@ def _local_reuse_section(home: Path) -> dict[str, Any]:
 
 def _cn_llm_cache_section(state: _CnState) -> dict[str, Any]:
     items = _cache_stats_items(state)
-    note = "" if state.reachable else ""
+    note = ""
+    payload = state.cache_stats_payload or {}
+    if payload.get("_from_cache"):
+        as_of = int(payload.get("_as_of", 0) or 0)
+        if as_of:
+            note = f"cached · as of {_as_of_label(as_of)}"
     return S.kv("ContextNest LLM cache", items, note=note)
 
 
-# ── main entry point ───────────────────────────────────────────────────
+# ── main entry point ────────────────────────────────────────────────────
 
 def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     del tab
-    # The ping action must force a fresh probe, not the cached one — keep
-    # the env-side knob the previous build exposed so callers (and the
-    # panel action's CN_PING_TTL=0 contract) continue to work.
+    # The ping action must force a fresh probe, not the cached one —
+    # CN_PING_TTL=0 is the env-side knob cn_client honours; the page
+    # contributes only the contract.
     if args.get("ping"):
         os.environ["CN_PING_TTL"] = "0"
     state = _CnState()

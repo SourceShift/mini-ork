@@ -35,6 +35,7 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
+from mini_ork import cn_client
 from mini_ork.ide_pages import context
 from mini_ork.stores import migrate as mig
 
@@ -122,12 +123,24 @@ def cn_server() -> tuple[http.server.HTTPServer, str]:
 
 
 @pytest.fixture()
-def home(tmp_path: Path) -> Path:
-    """An empty home (no run, no context pack) — the canonical "no data" fixture."""
+def home(tmp_path: Path, monkeypatch) -> Path:
+    """An empty home (no run, no context pack) — the canonical "no data" fixture.
+
+    Pins ``MINI_ORK_HOME`` to the tmp home so the cn_client ping cache
+    (``$MINI_ORK_HOME/state/cn_ping.cache``) and section cache
+    (``$MINI_ORK_HOME/cache/cn/``) do NOT resolve to the repo's
+    ``.mini-ork`` and share state across tests in the suite. The plan
+    found seven spurious ERRORs in one combined run from exactly this
+    cross-test pollution; the isolation is the fix."""
     h = tmp_path / "proj" / ".mini-ork"
     h.mkdir(parents=True)
     rc, _out, err = mig.init_db(db=str(h / "state.db"), root=str(REPO))
     assert rc == 0, err
+    for k in ("MO_DISABLE_CN", "CN_BASE_URL", "CN_TIER", "CN_TOKEN_KEY",
+              "CN_PING_TIMEOUT_SEC", "CN_TIMEOUT_SEC", "CN_CACHE_TTL_SEC",
+              "CN_PING_TTL", "MINI_ORK_SECRETS"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("MINI_ORK_HOME", str(h))
     return h
 
 
@@ -244,10 +257,35 @@ def test_reachable_chip(home: Path, monkeypatch, cn_server) -> None:
 
 
 def test_slow_chip(home: Path, monkeypatch) -> None:
-    """A real-delay server: the page must render 'slow' distinct from 'reachable'."""
+    """A handler delayed past the ping budget is 'slow' (reachable but
+    degraded, distinct from 'not reachable' which is what cn_client's
+    own ping collapses into on the short-timeout path).
+
+    The ping budget is :data:`timeout_ping_s` from
+    ``config/contextnest.example.yaml`` (default 1.0 s); the test
+    lowers it via ``CN_PING_TIMEOUT_SEC=0.2`` so a 500 ms delay exceeds
+    the budget without adding wall-clock seconds. The slow handler
+    returns a non-empty ``/substrate/health`` body — the page's slow
+    detection reads the body and measures the elapsed time, so an
+    empty 200 would not surface 'slow' (cn_client returns "" for both
+    a legitimate empty 200 and a swallowed network failure)."""
     class _SlowHandler(_StubHandler):
         def _sleep_query(self) -> float:
-            return 0.35  # 350ms — above the 200ms slow threshold
+            return 0.5  # 500ms — exceeds the 200ms ping budget below
+
+        def do_GET(self) -> None:  # noqa: N802 — http.server protocol
+            path = urlparse(self.path).path
+            self.server.calls.append(path)
+            if path == "/api/v1/substrate/health":
+                # The parent do_GET would sleep then send "" (empty
+                # body) — that path renders reachable, not slow, even
+                # at 500ms. To exercise the slow branch the test
+                # explicitly sends a non-empty body.
+                time.sleep(self._sleep_query())
+                self.server.capsule_body  # touch for attribute presence
+                self._send(json.dumps({"status": "ok"}))
+                return
+            super().do_GET()
 
     srv = http.server.HTTPServer(("127.0.0.1", 0), _SlowHandler)
     srv.calls = []  # type: ignore[attr-defined]
@@ -256,12 +294,21 @@ def test_slow_chip(home: Path, monkeypatch) -> None:
     srv.capsule_body = ""  # type: ignore[attr-defined]
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
+        # cn_client.available() ALSO does a /substrate/health probe
+        # under the ping budget. A 500ms delay with a 200ms budget
+        # would time out and write "down" to the ping cache; we
+        # pre-seed "up" so the probe enters its latency-measured
+        # branch instead of short-circuiting on the cached failure.
+        cache = cn_client._ping_cache_file()
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        open(cache, "w").write(f"{int(time.time())} up\n")
+        monkeypatch.setattr("mini_ork.cn_client.available", lambda: True)
+        monkeypatch.setenv("CN_PING_TIMEOUT_SEC", "0.2")
         monkeypatch.setenv("CN_BASE_URL", f"http://127.0.0.1:{srv.server_address[1]}")
         page = context.build(home, None, {})
         chip = page["chips"][0]
         assert chip["t"].startswith("slow · ") and chip["c"] == "yellow"
         assert "ms" in chip["t"]
-        # status section reports slow with the latency.
         status = _section(page, "ContextNest status")
         head = _kv_by_key(status)["ContextNest"]
         assert head["v"] == "slow"
@@ -609,6 +656,191 @@ def test_banned_routes_never_called(home: Path, monkeypatch, cn_server) -> None:
         for banned in _BANNED_SUBSTRINGS:
             assert banned not in path, f"page requested banned route {path!r}"
     assert srv.banned_hits == []  # type: ignore[attr-defined]
+
+
+# ── 8. New coverage on the cn_client-driven page ───────────────────────
+
+
+def test_slow_but_up_renders_reachable_under_default_budgets(home: Path, monkeypatch) -> None:
+    """A 0.7 s stub is reachable under the default ping budget
+    (``timeout_ping_s: 1.0`` from ``config/contextnest.example.yaml``).
+    The page reads ``timeout_ping_s`` through ``cn_client`` — the same
+    shared contract every other pane uses — so a 700 ms response is
+    under budget and must render as 'connected', not 'slow'. The
+    500 ms+ 'slow' test (above) deliberately lowers the budget via
+    ``CN_PING_TIMEOUT_SEC``; THIS test uses the budget as shipped.
+
+    The handler implements the latency in the GET method body — NOT via
+    :func:`_sleep_query`, because :meth:`_StubHandler._send` itself
+    applies the same sleep and a doubled delay would push the request
+    past the budget the test is meant to keep."""
+    class _SlowishHandler(_StubHandler):
+        def do_GET(self) -> None:  # noqa: N802 — http.server protocol
+            path = urlparse(self.path).path
+            self.server.calls.append(path)
+            if any(b in path for b in _BANNED_SUBSTRINGS):
+                self.server.banned_hits.append(path)
+            time.sleep(0.7)  # 700 ms — under the 1.0 s default ping budget
+            if path == "/api/v1/substrate/health":
+                # Non-empty body so the page's probe (which reads elapsed
+                # time around ``cn_client._get_text`` for non-empty
+                # bodies) actually has latency to measure. An empty 200
+                # would slip past the slow branch and render "connected"
+                # by luck, not because the request was fast.
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"status":"ok"}')
+                return
+            # Other endpoints return their stubs (200 with body) so the
+            # cache sections render.
+            override = self.server.overrides.get(path)
+            if override is not None:
+                self._send(override)
+                return
+            if path == "/api/v1/substrate/config":
+                self._send(json.dumps({"tier": "simple", "version": "0.42.0"}))
+            elif path == "/api/v1/substrate/replay":
+                self._send(json.dumps({"enabled": True}))
+            elif path == "/api/v1/llm/v1/cache/stats":
+                self._send(json.dumps({"hits": 0, "misses": 0, "entries": 0,
+                                       "size_bytes": 0, "hit_rate": 0.0}))
+            elif path == "/api/v1/prompt-context/capsule":
+                self._send(self.server.capsule_body)
+            else:
+                self._send("{}", status=404)
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _SlowishHandler)
+    srv.calls = []  # type: ignore[attr-defined]
+    srv.banned_hits = []  # type: ignore[attr-defined]
+    srv.overrides: dict[str, str] = {}  # type: ignore[attr-defined]
+    srv.capsule_body = ""  # type: ignore[attr-defined]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.setattr("mini_ork.cn_client.available", lambda: True)
+        monkeypatch.setenv("CN_BASE_URL", f"http://127.0.0.1:{srv.server_address[1]}")
+        page = context.build(home, None, {})
+        chip = page["chips"][0]
+        assert chip["t"].startswith("connected · ") and chip["c"] == "green"
+        status = _section(page, "ContextNest status")
+        head = _kv_by_key(status)["ContextNest"]
+        assert head["v"] == "reachable"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_secure_tier_reads_carry_authorization(home: Path, monkeypatch) -> None:
+    """Every CN read the page makes — health, config, replay, cache
+    stats, capsule — carries ``Authorization: Bearer <token>`` on the
+    secure tier. The page NEVER builds its own headers: it asks
+    ``cn_client`` to attach them, so the bearer resolution path is the
+    same one the CLI uses (``mini_ork.dispatch.secrets.read_secret_exports``)
+    and a missing key fails closed without the page knowing.
+
+    A handler that records the Authorization header on every request
+    confirms the page passed the bearer on all five endpoints; the
+    token VALUE never appears in the page payload (the secret-store
+    round-trip happens server-side, never into the page dict).
+    """
+    captured_headers: list = []
+
+    class _AuthHandler(_StubHandler):
+        def _send(self, body: str, *, status: int = 200) -> None:
+            captured_headers.append({
+                "path": urlparse(self.path).path,
+                "Authorization": self.headers.get("Authorization", ""),
+            })
+            delay = self._sleep_query()
+            if delay > 0:
+                time.sleep(delay)
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body.encode("utf-8") if isinstance(body, str) else body)
+
+    secret = "page-secure-bearer-1234567890"
+    store = home / "secrets.local.sh"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text(f'export CN_TOKEN="{secret}"\n', encoding="utf-8")
+    os.chmod(store, 0o600)
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _AuthHandler)
+    srv.calls = []  # type: ignore[attr-defined]
+    srv.banned_hits = []  # type: ignore[attr-defined]
+    srv.overrides: dict[str, str] = {}  # type: ignore[attr-defined]
+    srv.capsule_body = ""  # type: ignore[attr-defined]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.setenv("CN_TIER", "secure")
+        monkeypatch.setenv("CN_TOKEN_KEY", "CN_TOKEN")
+        monkeypatch.setenv("MINI_ORK_SECRETS", str(store))
+        monkeypatch.setenv("CN_BASE_URL", f"http://127.0.0.1:{srv.server_address[1]}")
+        # Force available() to True so the page enters its data-fetch
+        # path (the auth handshake is independent of the ping cache).
+        monkeypatch.setattr("mini_ork.cn_client.available", lambda: True)
+        page = context.build(home, None, {})
+        assert page["ok"] is True
+        # At least one request per live endpoint carried the bearer.
+        bearer_paths = {h["path"] for h in captured_headers
+                        if h["Authorization"].endswith(secret)}
+        expected = {"/api/v1/substrate/health", "/api/v1/substrate/config",
+                    "/api/v1/substrate/replay", "/api/v1/llm/v1/cache/stats",
+                    "/api/v1/prompt-context/capsule"}
+        assert expected.issubset(bearer_paths), (
+            f"missing Authorization on some endpoints: "
+            f"expected={expected}, captured={sorted(bearer_paths)}")
+        # The token VALUE never leaks into the page payload.
+        assert secret not in repr(page), "token value leaked into page payload"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_failed_read_after_good_read_renders_cached_as_of(home: Path, monkeypatch, cn_server) -> None:
+    """The cached-section wrapper arbitrates live-vs-cache: a successful
+    read populates the slot, and a subsequent live failure (CN down)
+    renders the cached payload with an ``"as of HH:MM"`` label.
+
+    Two renders against the SAME base URL keep the cache scope stable;
+    the second render shuts the stub down, so the live fetch fails and
+    the wrapper falls back to the slot written by the first render.
+    The 'ContextNest LLM cache' section surfaces both the cached values
+    and the as-of line — the operator-visible signal that the page is
+    showing older data."""
+    srv, base = cn_server
+    _set_override(srv, "/api/v1/llm/v1/cache/stats",
+                  json.dumps({"hits": 99, "misses": 1, "entries": 50}))
+    monkeypatch.setenv("CN_BASE_URL", base)
+    monkeypatch.setattr("mini_ork.cn_client.available", lambda: True)
+
+    page1 = context.build(home, None, {})
+    cache_section = next(s for s in page1["sections"]
+                         if s["title"] == "ContextNest LLM cache")
+    items = {i["k"]: i for i in cache_section["items"]}
+    assert items["Hits"]["v"] == "99"
+
+    # Tear the stub down so the second render's live reads fail. The
+    # cached-section wrapper catches the network failure and falls back
+    # to the slot written above.
+    srv.shutdown()
+    srv.server_close()
+    monkeypatch.setattr("mini_ork.cn_client.available", lambda: False)
+
+    page2 = context.build(home, None, {})
+    assert page2["ok"] is True
+    cache_section2 = next(s for s in page2["sections"]
+                          if s["title"] == "ContextNest LLM cache")
+    items2 = {i["k"]: i for i in cache_section2["items"]}
+    # Cached values are still rendered.
+    assert items2["Hits"]["v"] == "99"
+    # The as-of label is in the section note — that is what tells the
+    # operator the data is older than the live read attempt.
+    note = cache_section2.get("note", "")
+    assert "as of" in note
+    # And the stamp matches HH:MM format.
+    import re as _re
+    assert _re.search(r"\d{2}:\d{2}", note), f"note missing HH:MM stamp: {note!r}"
 
 
 # ── 9. Docs align with code ─────────────────────────────────────────────
