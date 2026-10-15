@@ -40,16 +40,27 @@ from mini_ork.ide_pages import cn_session
 
 @pytest.fixture()
 def cn_home(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
-    """Scope the CN section cache to this test's tmp_path.
+    """Scope the CN section cache to this test's tmp_path AND give the
+    page a real ``.mini-ork`` directory whose parent is the project root.
 
     ``cn_client._section_cache_dir`` reads ``MINI_ORK_HOME`` (defaulting
-    to ``.mini-ork`` in cwd). Pointing it at ``tmp_path`` keeps every
-    test starting from an empty cache, so a "fetch returns ``{}``" path
-    actually reaches the unreachable one-liner instead of falling back
-    to a previous test's stale payload.
+    to ``.mini-ork`` in cwd). Pointing it at ``tmp_path/proj/.mini-ork``
+    keeps every test starting from an empty cache, so a "fetch returns
+    ``{}``" path actually reaches the unreachable one-liner instead of
+    falling back to a previous test's stale payload.
+
+    The page reads ``home.parent`` as the project root for
+    Files-touched path resolution. Tests that need real files on disk
+    create them under ``cn_home.parent`` (``tmp_path/proj``) so
+    :func:`cn_session._opens_path` can resolve relative paths against
+    it; tests that only need to assert "no Open" pick paths that the
+    project does not contain.
     """
-    monkeypatch.setenv("MINI_ORK_HOME", str(tmp_path))
-    return tmp_path
+    project = tmp_path / "proj"
+    home = project / ".mini-ork"
+    home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+    return home
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -106,7 +117,12 @@ _FULL_SUMMARY: dict = {
         "goal": "Add the cn_session IDE page",
         "current_state": "Rewriting for the nested response shape",
         "progress": "Summary + open tasks render",
-        "domain": "/ps/mini-ork",
+        # ``tooling`` is a category, not a project root. File paths in the
+        # fixtures (``mini_ork/...``, ``tests/unit/...``) never start
+        # with ``tooling/``, so any future change that re-introduces a
+        # domain-join onto a file path lights up the verbatim-render
+        # assertions below.
+        "domain": "tooling",
         "topics": ["ide", "cn"],
         "top_jobs": ["summary", "trajectory"],
         "facts": ["fixture"],
@@ -342,19 +358,22 @@ def test_features_filter_to_this_session_only(
     assert "unrelated feature" not in item_names
 
 
-# ── 7. how_to_test is text only and seeds the thread message ─────────────
+# ── 7. how_to_test rides the Re-test thread seed verbatim ─────────────
 
 
-def test_how_to_test_is_text_only_and_seeds_thread_message(
+def test_how_to_test_rides_re_test_thread_seed_verbatim(
     cn_home: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``how_to_test`` is plain text and the Re-test cli action is its seed.
+    """``how_to_test`` rides the Re-test button's ``thread`` action
+    verbatim — no CLI action, no threads subcommand.
 
-    The text rides the ``--text`` argument of the Re-test button's
-    ``threads send`` action — that is the thread seed, not a shell
-    exec. Every other ``cli`` action in the page must NOT carry the
-    ``how_to_test`` string verbatim, and the seed action puts it only
-    after ``--text``, never as a positional or another flag.
+    Each Re-test button has a ``do`` whose only payload is the draft
+    agent thread text. The seed for a feature carries that feature's
+    name and the verbatim ``how_to_test`` string, so a human reviews
+    the test before the new thread runs it. A page-wide walk
+    confirms no ``cli`` action survives at all, so the IDE actions
+    sweep cannot parse a stale ``--text`` flag against the ``threads``
+    subcommand.
     """
     monkeypatch.delenv("MO_DISABLE_CN", raising=False)
     _stub_cn(monkeypatch, summary=_FULL_SUMMARY,
@@ -366,83 +385,114 @@ def test_how_to_test_is_text_only_and_seeds_thread_message(
     item_texts = [fe["t"] + " " + fe.get("sub", "") for fe in feats["items"]]
     assert any(_HOW in t for t in item_texts), item_texts
 
-    # 2) Walk every dict in the payload and pick out the cli actions.
+    # 2) Every Re-test button is a ``thread`` action whose text names
+    # the feature and quotes the ``how_to_test`` verbatim. The action's
+    # ``do`` carries no ``cli`` key, so the actions sweep cannot parse
+    # it as a subcommand.
+    thread_seeds_by_feature: dict[str, list[str]] = {}
+    for feat in feats["items"]:
+        name = feat["t"]
+        for act in (feat.get("acts") or []):
+            do = act.get("do") or {}
+            assert not isinstance(do.get("cli"), list), (name, do)
+            assert isinstance(do.get("thread"), str), (name, do)
+            thread_seeds_by_feature.setdefault(name, []).append(do["thread"])
+
+    summary_seeds = thread_seeds_by_feature.get("summary renderer", [])
+    trajectory_seeds = thread_seeds_by_feature.get("trajectory grouper", [])
+    assert len(summary_seeds) == 1, thread_seeds_by_feature
+    assert len(trajectory_seeds) == 1, thread_seeds_by_feature
+    assert _HOW in summary_seeds[0], summary_seeds
+    # the other feature's seed must NOT carry this session's
+    # how_to_test verbatim
+    assert _HOW not in trajectory_seeds[0], trajectory_seeds
+    for seed in summary_seeds + trajectory_seeds:
+        assert "Re-test the **" in seed, seed
+
+    # 3) Page-wide walk: NO cli action at all, and certainly no cli
+    # action whose argv starts with the threads subcommand.
     _walk(page, accum := [])
     cli_actions = [n for n in accum
                    if isinstance(n.get("cli"), list) and n["cli"]]
-
-    # The action whose --text contains ``how_to_test`` is the seed for
-    # the summary-renderer feature.
-    seed_actions = [a for a in cli_actions
-                    if a["cli"][0] == "threads"
-                    and _HOW in (a["cli"][a["cli"].index("--text") + 1]
-                                 if "--text" in a["cli"] else "")]
-    assert len(seed_actions) == 1, (cli_actions, seed_actions)
-    seed = seed_actions[0]["cli"]
-    assert seed[0] == "threads"
-    assert seed[1] == "send"
-    assert seed[2] == _SESSION_ID
-
-    text_idx = seed.index("--text")
-    assert _HOW in seed[text_idx + 1]
-    # how_to_test must NOT appear as anything other than the --text body.
-    bad_positions = [i for i, arg in enumerate(seed)
-                     if _HOW in str(arg) and i != text_idx + 1]
-    assert not bad_positions, (seed, bad_positions)
-
-    # 3) how_to_test never appears inside another feature's action.
-    other_seed = [a for a in cli_actions
-                  if a["cli"][0] == "threads" and a["cli"] is not seed]
-    for action in other_seed:
-        for arg in action["cli"]:
-            assert _HOW not in str(arg), (action, arg)
+    assert cli_actions == [], cli_actions
+    for n in accum:
+        if not isinstance(n.get("cli"), list):
+            continue
+        assert n["cli"][0] != "threads", (n, n["cli"])
 
 
-# ── 8. Re-test button is a threads-send cli action ────────────────────────
+# ── 8. Re-test button is a thread action, not a CLI action ─────────────
 
 
-def test_re_test_action_is_threads_send_with_recipe(
+def test_re_test_button_is_thread_action_with_no_threads_cli(
     cn_home: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The Re-test button dispatches ``mini-ork threads send ... --recipe code-fix``.
+    """The Re-test button is a ``thread`` action whose text names the
+    feature and quotes its ``how_to_test``; the page emits no
+    ``mini-ork threads send ... --recipe`` CLI action.
 
-    The sweep's ``test_every_cli_action_parses`` walks this action; the
-    threads CLI argparse accepts ``id`` as a positional and ``--text``,
-    ``--recipe``, ``--home`` as flags.
+    The sweep's :func:`test_every_cli_action_parses` walk has nothing
+    to parse on this page when features exist: every Re-test button is
+    a draft-thread action, not a CLI argv. The page also covers
+    itself against a future regression that re-adds a ``cli``
+    action — the walk explicitly fails on any ``cli`` whose head is
+    the ``threads`` subcommand.
     """
     monkeypatch.delenv("MO_DISABLE_CN", raising=False)
     _stub_cn(monkeypatch, summary=_FULL_SUMMARY,
              trajectory=_FULL_TRAJECTORY, features=_FULL_FEATURES)
     page = cn_session.build(cn_home, None, {"id": _SESSION_ID})
     feats = next(s for s in page["sections"] if s.get("title") == "Delivered features")
-    actions: list[dict] = []
+
+    # Every Re-test button is a thread action — one per feature in
+    # this session (the unrelated-session feature is filtered out).
+    re_test_buttons: list[dict] = []
     for it in feats["items"]:
-        actions.extend(it.get("acts") or [])
-    cli_actions = [a for a in actions if isinstance(a.get("do"), dict)
-                   and isinstance(a["do"].get("cli"), list)]
-    assert cli_actions, "no cli action on the Re-test button"
-    argv = cli_actions[0]["do"]["cli"]
-    assert argv[0] == "threads"
-    assert argv[1] == "send"
-    assert argv[2] == _SESSION_ID
-    assert "--text" in argv
-    assert "--recipe" in argv
-    assert argv[argv.index("--recipe") + 1] == "code-fix"
+        for act in (it.get("acts") or []):
+            if act.get("label") == "Re-test":
+                re_test_buttons.append(act)
+    assert len(re_test_buttons) == 2, re_test_buttons
+    for btn in re_test_buttons:
+        do = btn.get("do") or {}
+        assert isinstance(do.get("thread"), str), btn
+        assert "cli" not in do, btn
+
+    # The summary-renderer feature's seed carries its how_to_test.
+    summary_btn = next(b for b in re_test_buttons
+                       if _HOW in (b["do"]["thread"] or ""))
+    assert "Re-test the **summary renderer**" in summary_btn["do"]["thread"]
+
+    # Belt-and-braces: a page-wide walk finds no CLI action starting
+    # with ``threads`` anywhere in the payload.
+    _walk(page, accum := [])
+    bad = [a for a in accum
+           if isinstance(a.get("cli"), list) and a["cli"]
+           and a["cli"][0] == "threads"]
+    assert bad == [], bad
 
 
-# ── 9. files-touched rows union feature files and artifact metadata.path ──
+# ── 9. files-touched rows render verbatim and dedupe on the raw string ──
 
 
-def test_files_section_unions_feature_files_and_artifact_paths(
+def test_files_section_renders_paths_verbatim_and_dedupes_on_raw_string(
     cn_home: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Files-touched lists feature ``files`` AND artifact ``metadata.path``,
-    deduped. Relative paths resolve against the session's domain."""
+    """Files-touched lists feature ``files`` AND artifact ``metadata.path``
+    exactly as ContextNest shipped them — never joined onto ``domain``.
+
+    The fixture's ``domain`` is the category-shaped string ``"tooling"``
+    so any code that re-introduces a domain-join onto a file path
+    lights up the anti-prefix assertion: no rendered path carries the
+    ``tooling/`` prefix a domain-prefix join would produce.
+    """
     monkeypatch.delenv("MO_DISABLE_CN", raising=False)
-    # A feature whose file list overlaps with an artifact record's path.
+    # A feature whose file list overlaps with an artifact record's
+    # path; another feature ships a file no artifact mentions; an
+    # artifact record carries an absolute path.
     features = {"features": [
         {"name": "shared file", "session_id": _SESSION_ID,
-         "how_to_test": "x", "files": ["mini_ork/ide_pages/cn_session.py"]},
+         "how_to_test": "x",
+         "files": ["mini_ork/ide_pages/cn_session.py"]},
         {"name": "feature-only", "session_id": _SESSION_ID,
          "how_to_test": "y", "files": ["mini_ork/cn_client.py"]},
     ]}
@@ -457,35 +507,108 @@ def test_files_section_unions_feature_files_and_artifact_paths(
     page = cn_session.build(cn_home, None, {"id": _SESSION_ID})
     files = next(s for s in page["sections"] if s.get("title") == "Files touched")
     paths_rendered = [it["t"] for it in files["items"]]
-    # Feature-only relative path resolved against domain.
-    assert "/ps/mini-ork/mini_ork/cn_client.py" in paths_rendered
+    # Feature-only relative path rendered as-is, NOT joined onto domain.
+    assert "mini_ork/cn_client.py" in paths_rendered, paths_rendered
     # Artifact absolute path kept verbatim.
-    assert "/absolute/path.py" in paths_rendered
-    # Deduplication: same path from feature + artifact exactly once.
-    target = "/ps/mini-ork/mini_ork/ide_pages/cn_session.py"
+    assert "/absolute/path.py" in paths_rendered, paths_rendered
+    # Deduplication on the raw string: same path from feature + artifact
+    # exactly once.
+    target = "mini_ork/ide_pages/cn_session.py"
     assert paths_rendered.count(target) == 1, paths_rendered
+    # Anti-domain-prefix: no rendered path carries a ``tooling/`` prefix.
+    domain = _FULL_SUMMARY["summary"]["domain"]
+    assert not any(p.startswith(domain + "/") for p in paths_rendered), paths_rendered
 
 
-def test_relative_files_resolve_against_project(
+def test_files_open_action_only_for_paths_inside_project_root(
     cn_home: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A relative path from a feature's ``files`` joins the session's domain."""
+    """An Open button appears only for paths that resolve to an existing
+    regular file inside the project root (the parent of the
+    ``.mini-ork`` directory the page was built with). Missing files
+    and absolute paths outside the project stay plain text.
+    """
+    # Two real files in the project root (``cn_home.parent``).
+    (cn_home.parent / "mini_ork").mkdir(exist_ok=True)
+    (cn_home.parent / "mini_ork" / "present.py").write_text(
+        "# exists\n", encoding="utf-8")
+    (cn_home.parent / "sub_dir").mkdir(exist_ok=True)
+    (cn_home.parent / "sub_dir" / "present.py").write_text(
+        "# exists\n", encoding="utf-8")
+
     monkeypatch.delenv("MO_DISABLE_CN", raising=False)
     features = {"features": [
-        {"name": "fn", "session_id": _SESSION_ID, "how_to_test": "z",
-         "files": ["mini_ork/ide_pages/cn_session.py"]},
+        {"name": "mix", "session_id": _SESSION_ID, "how_to_test": "z",
+         "files": [
+             # existing relative paths → Open
+             "mini_ork/present.py",
+             "sub_dir/present.py",
+             # missing relative path → no Open
+             "mini_ork/missing.py",
+             # absolute path pointing outside the project → no Open
+             "/tmp/elsewhere.py",
+         ]},
     ]}
     _stub_cn(monkeypatch, summary=_FULL_SUMMARY,
-             trajectory=_FULL_TRAJECTORY, features=features)
+             trajectory={"records": []}, features=features)
     page = cn_session.build(cn_home, None, {"id": _SESSION_ID})
     files = next(s for s in page["sections"] if s.get("title") == "Files touched")
-    open_actions: list[dict] = []
+
+    # All four paths render verbatim.
+    paths_rendered = [it["t"] for it in files["items"]]
+    assert paths_rendered == [
+        "mini_ork/present.py",
+        "sub_dir/present.py",
+        "mini_ork/missing.py",
+        "/tmp/elsewhere.py",
+    ], paths_rendered
+
+    # Per-row Open-action shape.
+    opens_by_row: dict[str, list[dict]] = {}
     for it in files["items"]:
-        for a in it.get("acts") or []:
-            if isinstance(a.get("do"), dict) and "path" in a["do"]:
-                open_actions.append(a["do"])
-    assert any(a["path"] == "/ps/mini-ork/mini_ork/ide_pages/cn_session.py"
-               for a in open_actions), open_actions
+        acts = it.get("acts") or []
+        opens = [a for a in acts
+                 if isinstance(a.get("do"), dict) and "path" in a["do"]]
+        opens_by_row[it["t"]] = [a["do"] for a in opens]
+
+    # Existing project files get a single Open button pointing at the
+    # verbatim path.
+    assert opens_by_row["mini_ork/present.py"] == [{"path": "mini_ork/present.py"}]
+    assert opens_by_row["sub_dir/present.py"] == [{"path": "sub_dir/present.py"}]
+    # Missing file → no Open action.
+    assert opens_by_row["mini_ork/missing.py"] == []
+    # Absolute path outside project → no Open action.
+    assert opens_by_row["/tmp/elsewhere.py"] == []
+
+
+def test_files_path_with_dotdot_escaping_root_is_not_opened(
+    cn_home: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A path that resolves outside the project root via ``..`` must
+    not gain an Open action, even if the target file does happen to
+    exist.
+    """
+    sibling = cn_home.parent.parent / "outside.py"
+    sibling.write_text("# outside\n", encoding="utf-8")
+    try:
+        monkeypatch.delenv("MO_DISABLE_CN", raising=False)
+        features = {"features": [
+            {"name": "escape", "session_id": _SESSION_ID, "how_to_test": "z",
+             "files": ["../outside.py"]},
+        ]}
+        _stub_cn(monkeypatch, summary=_FULL_SUMMARY,
+                 trajectory={"records": []}, features=features)
+        page = cn_session.build(cn_home, None, {"id": _SESSION_ID})
+        files = next(s for s in page["sections"]
+                     if s.get("title") == "Files touched")
+        rows = {it["t"]: it for it in files["items"]}
+        assert "../outside.py" in rows, rows
+        opens = [a for a in (rows["../outside.py"].get("acts") or [])
+                 if isinstance(a.get("do"), dict) and "path" in a["do"]]
+        assert opens == [], opens
+    finally:
+        if sibling.exists():
+            sibling.unlink()
 
 
 # ── 10. features section has its OWN cache section ───────────────────────
@@ -766,14 +889,21 @@ def test_features_section_keeps_this_sessions_rows_behind_30_foreign(
 # ── 21. Files touched paths come from the same filtered set ──────────────
 
 
-def test_files_touched_does_not_list_paths_from_foreign_features(
+def test_files_touched_excludes_foreign_features_and_keeps_paths_verbatim(
     cn_home: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A feature from another session carries ``files``; that path MUST
     NOT appear in Files touched. Both "Delivered features" and "Files
     touched" go through the same ``_session_features`` helper, so the
     slice-before-filter bug cannot leak foreign paths into either
-    section in isolation."""
+    section in isolation.
+
+    Own-session paths render verbatim — they never gain a
+    domain-prefix. With the fixture's category-shaped ``"tooling"``
+    domain, an accidental domain-prefix join would produce paths
+    starting with ``tooling/``; the assertions below pin the
+    verbatim-only contract.
+    """
     monkeypatch.delenv("MO_DISABLE_CN", raising=False)
     features = {"features": [
         {"name": "mine", "session_id": _SESSION_ID, "how_to_test": "x",
@@ -786,10 +916,14 @@ def test_files_touched_does_not_list_paths_from_foreign_features(
     page = cn_session.build(cn_home, None, {"id": _SESSION_ID})
     files = next(s for s in page["sections"] if s.get("title") == "Files touched")
     paths_rendered = [it["t"] for it in files["items"]]
-    assert "/ps/mini-ork/mini_ork/mine.py" in paths_rendered
-    # Foreign path must not appear in either resolved or raw form.
+    # Own-session path rendered verbatim.
+    assert "mini_ork/mine.py" in paths_rendered, paths_rendered
+    # Foreign path must not appear in any form (no resolved, no raw).
     assert not any("secret.py" in p for p in paths_rendered), paths_rendered
     assert not any("foreign" in p for p in paths_rendered), paths_rendered
+    # No domain-prefix join.
+    domain = _FULL_SUMMARY["summary"]["domain"]
+    assert not any(p.startswith(domain + "/") for p in paths_rendered), paths_rendered
 
 
 # ── 22. missing started_at widens to the 365-day cap, not a tiny window ─

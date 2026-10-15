@@ -21,12 +21,20 @@ A single page summarises one ContextNest session:
   ``since=<days>`` window computed from ``summary.summary.started_at``
   (the endpoint takes no server-side session filter, so the page
   filters ``session_id == id`` client-side); each feature carries a
-  Re-test button that seeds a ``threads send`` message and never
-  executes ``how_to_test``;
+  Re-test button that seeds a **draft mini-ork agent thread**
+  (``thread`` action) carrying the ``how_to_test`` text verbatim as
+  the new thread's first prompt — the page never runs the test;
 * a files-touched list that is the deduplicated union of ``files`` on
   each feature and ``metadata.path`` on ``artifact``-kind records,
-  with in-project entries resolved against ``summary.summary.domain`` /
-  the project root and opened via ``S.open_path``.
+  rendered exactly as ContextNest ships them. A row opens via
+  ``S.open_path`` only when the raw path resolves to an existing
+  regular file inside the project root (the parent of the
+  ``.mini-ork`` directory the page was built with); every other path
+  — relative paths the project does not contain, absolute paths
+  outside the project, paths whose ``..`` components escape the
+  root — stays plain text rather than becoming a dead link.
+  ``summary.summary.domain`` is rendered as header / summary text
+  but is **never** used to resolve or prefix file paths.
 
 Three endpoints only. The raw ``/api/v1/sessions/:id`` dump takes 12–20 s
 on large sessions (kickoff c:0), so this page never asks for it. The
@@ -277,17 +285,6 @@ def _record_ts(record: dict[str, Any]) -> int:
     return 0
 
 
-def _resolve_path(raw: str, project: str) -> str:
-    """Make a path absolute against ``project`` when it isn't already."""
-    if not raw:
-        return ""
-    if raw.startswith("/") or raw.startswith("~"):
-        return raw
-    if project:
-        return str(Path(project) / raw)
-    return raw
-
-
 def _session_features(payload: dict[str, Any], session_id: str, *,
                      limit: int | None = None) -> list[dict[str, Any]]:
     """Features from ``payload`` whose ``session_id`` matches this session.
@@ -417,11 +414,15 @@ def _trajectory(session_id: str) -> list[dict[str, Any]]:
 def _features(session_id: str, inner: dict[str, Any]) -> list[dict[str, Any]]:
     """Delivered features: client-side session-id filter + Re-test seed.
 
-    The Re-test button seeds a ``threads send`` message and never
-    executes ``how_to_test`` itself (rule 4). ``how_to_test`` rides the
-    message body so a human can review it before the run starts. A
-    feature without ``how_to_test`` still gets the Re-test button — the
-    seed text just stays shorter.
+    The Re-test button seeds a **draft mini-ork agent thread** — a
+    ``thread`` action whose ``how_to_test`` text rides the new
+    thread's first prompt — and never executes ``how_to_test`` (rule
+    4). A feature without ``how_to_test`` still gets the Re-test
+    button; the seed text just stays shorter. There is no
+    ``mini-ork threads send`` CLI action on this page, so the IDE
+    actions sweep can never re-parse a ``--text`` flag against the
+    ``threads`` subcommand and the Re-test flow stays a draft-thread
+    one.
     """
     since = _since_days(inner)
     payload = CN.render_cached_section(
@@ -450,55 +451,95 @@ def _features(session_id: str, inner: dict[str, Any]) -> list[dict[str, Any]]:
         )
         items.append(
             S.ok(name, how or "(no how_to_test recorded)",
-                 acts=[S.btn("Re-test", S.cli(
-                     "threads", "send", session_id,
-                     "--text", seed,
-                     "--recipe", "code-fix",
-                 ), "default")])
+                 acts=[S.btn("Re-test", S.thread(seed), "default")])
         )
     if not items:
         return [S.lst("Delivered features",
                       [S.dot("No features delivered yet for this session")], full=True)]
     return [S.lst("Delivered features", items, full=True,
-                  note="Re-test seeds a thread with the how_to_test text — the test "
-                       "is never run from this page.")]
+                  note="Re-test opens a draft agent thread with how_to_test as the "
+                       "first prompt — the page never runs the test itself.")]
 
 
-def _files(project: str, feature_paths: list[str],
-           artifact_paths: list[str]) -> list[dict[str, Any]]:
-    """Files-touched: deduplicated union of feature files and artifact paths.
+def _opens_path(raw: str, project_root: Path | None) -> bool:
+    """Whether ``raw`` resolves to an existing regular file inside ``project_root``.
 
-    Features carry ``files`` (whatever the run touched); ``artifact``-kind
-    trajectory records carry ``metadata.path``. The page surfaces both,
-    deduplicated by absolute path so the same file doesn't render twice
-    across the two sources.
+    Relative paths are joined to ``project_root``; absolute paths are
+    taken as-is. The resolved path is required to live inside the
+    project root — paths whose ``..`` components escape the root, or
+    absolute paths that point outside the project, do not open. A
+    missing project root or any OS-level resolution error degrades
+    every path to "do not open" rather than raising, so the section
+    never blows up on a transient FS hiccup.
     """
+    if not raw or project_root is None:
+        return False
+    try:
+        root = project_root.resolve()
+    except OSError:
+        return False
+    if raw.startswith("/") or raw.startswith("~"):
+        candidate = Path(raw)
+    else:
+        candidate = project_root / raw
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        return False
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        return False
+    return resolved.is_file()
+
+
+def _files(home: Path, feature_paths: list[str],
+           artifact_paths: list[str]) -> list[dict[str, Any]]:
+    """Files-touched: verbatim paths, dedupe on the raw string.
+
+    Both feature ``files`` and artifact ``metadata.path`` values are
+    ContextNest's own records — the page does not consult the
+    filesystem to relocate them, and ``summary.summary.domain`` plays
+    no part in resolution (a category string must never be joined
+    onto a file path). Dedup happens on the raw string so a path
+    reaching the page twice (via a feature and an artifact, say)
+    renders once.
+
+    An Open button is rendered only when the raw path resolves to a
+    regular file inside ``home.parent`` (the project root). Every
+    other row is plain text with no Open action — the section never
+    offers a dead link.
+    """
+    project_root = home.parent if isinstance(home, Path) else None
+
     files: list[str] = []
     seen: set[str] = set()
     for raw in (*feature_paths, *artifact_paths):
         if not raw:
             continue
-        full = _resolve_path(raw, project)
-        if full and full not in seen:
-            seen.add(full)
-            files.append(full)
+        if raw not in seen:
+            seen.add(raw)
+            files.append(raw)
 
     if not files:
         return [S.lst("Files touched",
                       [S.dot("No files recorded")], full=True)]
 
     items: list[dict[str, Any]] = []
-    for full in files[:_FILES_LIMIT]:
-        items.append(S.dot(full, "", acts=[S.btn("Open", S.open_path(full), "ghost")]))
+    for raw in files[:_FILES_LIMIT]:
+        if _opens_path(raw, project_root):
+            items.append(S.dot(raw, "", acts=[S.btn("Open", S.open_path(raw), "ghost")]))
+        else:
+            items.append(S.dot(raw, "", acts=[]))
     return [S.lst("Files touched", items, full=True,
-                  note="Relative paths resolve against the session's project.")]
+                  note="Paths render verbatim. Open only appears when the file "
+                       "exists inside the project root.")]
 
 
 # ── page entry ────────────────────────────────────────────────────────────
 
 
 def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
-    del home, tab
     session_id = _str(args.get("id") or args.get("session_id"))
     if not session_id:
         # No id → empty state. The IDE actions sweep builds every page with
@@ -549,9 +590,12 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     goal = _str(inner.get("goal"))
     domain = _str(inner.get("domain"))
     last = _str(inner.get("last_ts") or inner.get("last_activity"))
-    project = domain  # ``domain`` is the project root for path resolution
+    # ``domain`` is rendered as header / summary text but is never used
+    # to resolve or prefix file paths — that work uses ``home.parent``
+    # in :func:`_files` so a category-shaped string cannot be joined
+    # onto a path.
 
-    sub_parts = [p for p in (project, f"last activity {last}" if last else "") if p]
+    sub_parts = [p for p in (domain, f"last activity {last}" if last else "") if p]
     sub = " · ".join(sub_parts) if sub_parts else session_id
 
     # Run id comes from trajectory records — not the summary. Fetch it
@@ -614,7 +658,7 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     sections += S.guarded(errors, "Delivered features",
                           lambda: _features(session_id, inner))
     sections += S.guarded(errors, "Files touched",
-                          lambda: _files(project, feature_paths, artifact_paths))
+                          lambda: _files(home, feature_paths, artifact_paths))
 
     chips: list[dict[str, Any]] = [S.chip("ContextNest")]
     if run_id:
