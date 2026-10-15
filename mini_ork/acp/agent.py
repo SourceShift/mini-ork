@@ -39,6 +39,7 @@ import os
 import secrets
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any, Awaitable, Callable, cast
 
@@ -228,6 +229,17 @@ def _mint_thread_id() -> str:
 # Populated by ``new_session`` + ``set_config_option`` and consumed by
 # ``prompt`` when routing the orchestrator vs direct paths.
 _THREAD_CONFIG_KEYS = ("mode", "model", "recipe", "workspace")
+
+# Words too common to say two texts are about the same thing: matching a draft
+# title against failure atoms on any of these named unrelated sessions.
+_PRIOR_ART_COMMON_WORDS = frozenset({
+    "about", "after", "also", "before", "been", "could", "does", "done", "each",
+    "from", "have", "into", "just", "like", "make", "more", "most", "only", "over",
+    "same", "should", "some", "such", "than", "that", "their", "them", "then",
+    "there", "these", "they", "this", "those", "title", "under", "unrelated",
+    "used", "uses", "using", "very", "were", "what", "when", "where", "which",
+    "while", "will", "with", "without", "would", "your",
+})
 
 # Mode ids the kickoff mandates. Anything else is rejected by
 # ``set_config_option`` as ``invalid_params``.
@@ -3053,6 +3065,160 @@ class MiniOrkAcpAgent:
             content=cast(Any, content),
         ))
 
+    def _render_kickoff_prior_art_block(
+        self, session_id: str, draft_id: str
+    ) -> str:
+        """Build the prior-art block appended to the kickoff draft card.
+
+        Computes prior art once for the draft title: ``cn_client.sessions_by_feature``
+        is the first source; on a miss (no hits, healthy CN) the function
+        falls back to failure atoms from
+        ``GET /api/v1/prompt-context/atoms?since=30d&kind=failure&project=<root>&limit=500``,
+        filtered to atoms whose ``project`` equals the project root and whose
+        ``text`` shares a significant word (length >= 4) with the title.
+        Renders at most three session-naming lines. When ContextNest is
+        unavailable, returns one "skipped" line instead of raising. Never
+        touches the capsule endpoint or ``/tools/retrieve`` — those would
+        block the card.
+        """
+        title = self._kickoff_draft_title(session_id, draft_id)
+        if not title:
+            return ""
+        hit_ids, skipped = self._compute_kickoff_prior_art(session_id, title=title)
+        if hit_ids:
+            lines = "\n".join(f"- {sid}" for sid in hit_ids[:3])
+            return f"Prior art:\n{lines}"
+        if skipped:
+            return f"Prior art: {skipped}"
+        return ""
+
+    def _kickoff_draft_title(self, session_id: str, draft_id: str) -> str:
+        """First H1 heading from the staged kickoff draft, ``""`` when missing.
+
+        Mirrors :func:`_extract_kickoff_title` but reads the file the caller
+        has already staged so we don't re-open the disk twice. All failures
+        degrade to ``""`` — no prior-art block — which is the established
+        no-title signal everywhere else in this module.
+        """
+        try:
+            home = self._home_for(session_id)
+            staged = home / "kickoff-drafts" / f"{draft_id}.md"
+            markdown = staged.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return ""
+        return _extract_kickoff_title(markdown)
+
+    def _compute_kickoff_prior_art(
+        self, session_id: str, *, title: str
+    ) -> tuple[list[str], str | None]:
+        """Return ``(session_ids, skipped_reason)`` for the kickoff draft title.
+
+        Up to three session ids are returned. ``skipped_reason`` is non-None
+        exactly when ContextNest is unavailable so the card can render a
+        one-line notice. All exceptions are swallowed — the draft card must
+        never block on ContextNest. Reads go through ``cn_client._get`` /
+        ``cn_client.sessions_by_feature`` only, and each endpoint fires at
+        most once per draft approval offer (the kickoff's hard guarantee).
+        """
+        from mini_ork import cn_client
+
+        try:
+            cn_available = bool(cn_client.available())
+        except Exception:
+            cn_available = False
+
+        hits_by_feature: list[str] = []
+        hits_atoms: list[str] = []
+
+        if cn_available:
+            # Source 1: ``/api/v1/sessions/by-feature?q=<title>`` (live
+            # wire shape: ``{query, hits: [{session_id, feature, ts, files,
+            # refs, layer}]}``; the empty ``{}`` is the CN-down signal).
+            raw = ""
+            try:
+                raw = cn_client.sessions_by_feature(title)
+            except Exception:
+                raw = ""
+            if raw and raw != "{}":
+                try:
+                    data = json.loads(raw)
+                except ValueError:
+                    data = None
+                if isinstance(data, dict):
+                    for h in (data.get("hits") or []):
+                        if not isinstance(h, dict):
+                            continue
+                        sid = h.get("session_id")
+                        if sid:
+                            hits_by_feature.append(str(sid))
+
+            # Source 2: ``/api/v1/prompt-context/atoms?since=30d&kind=failure
+            # &project=<root>&limit=500``. Atoms are filtered to project ==
+            # root and a shared significant word (len >= 4) with the title.
+            project_root = ""
+            try:
+                home = self._home_for(session_id)
+                project_root = str(home.parent.resolve()) if home else ""
+            except Exception:
+                project_root = ""
+            atoms_raw = ""
+            if project_root:
+                try:
+                    atoms_path = (
+                        "/api/v1/prompt-context/atoms"
+                        f"?since=30d&kind=failure"
+                        f"&project={urllib.parse.quote(project_root, safe='')}"
+                        f"&limit=500"
+                    )
+                    atoms_raw = cn_client._get(atoms_path)
+                except Exception:
+                    atoms_raw = ""
+            if atoms_raw and atoms_raw != "{}":
+                try:
+                    data = json.loads(atoms_raw)
+                except ValueError:
+                    data = None
+                if isinstance(data, dict):
+                    title_words = {
+                        w.lower()
+                        for w in re.findall(r"[A-Za-z][A-Za-z0-9_-]+", title)
+                        if len(w) >= 4
+                    } - _PRIOR_ART_COMMON_WORDS
+                    for a in (data.get("atoms") or []):
+                        if not isinstance(a, dict):
+                            continue
+                        if str(a.get("project") or "") != project_root:
+                            continue
+                        text = str(a.get("text") or "")
+                        text_words = {
+                            w.lower()
+                            for w in re.findall(r"[A-Za-z][A-Za-z0-9_-]+", text)
+                            if len(w) >= 4
+                        }
+                        if not (title_words & text_words):
+                            continue
+                        sid = a.get("session_id")
+                        if sid:
+                            hits_atoms.append(str(sid))
+
+        # Combine sources, dedupe in stable order (by-feature first, then
+        # atoms), cap at three session-naming lines for the card.
+        combined: list[str] = []
+        seen: set[str] = set()
+        for sid in hits_by_feature + hits_atoms:
+            if sid in seen:
+                continue
+            seen.add(sid)
+            combined.append(sid)
+            if len(combined) >= 3:
+                break
+
+        if combined:
+            return combined, None
+        if not cn_available:
+            return [], "skipped — ContextNest is unavailable"
+        return [], None
+
     async def _offer_kickoff_draft_approval(
         self, session_id: str, draft_id: str, *, tool_call_id: str, recipe: str
     ) -> None:
@@ -3092,6 +3258,15 @@ class MiniOrkAcpAgent:
                 PermissionOption(option_id="discard", name="Discard", kind="reject_always"),
             ]
             title = f"Start {recipe} run?" if recipe else "Start run?"
+        # Compute prior art exactly once for the draft title (never on
+        # keystrokes, never twice per draft). The lookup only hits the two
+        # cheap endpoints — capsule and /tools/retrieve are forbidden here
+        # (capsule carries no atom/session ids, /tools/retrieve takes 8-38s
+        # and would block the card). Failures swallow into a one-line
+        # "skipped" notice so a down ContextNest never breaks the card.
+        prior_art_block = self._render_kickoff_prior_art_block(session_id, draft_id)
+        if prior_art_block:
+            title = f"{title}\n\n{prior_art_block}"
         try:
             response = await self._conn.request_permission(
                 session_id=session_id,
