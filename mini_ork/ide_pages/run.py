@@ -659,6 +659,21 @@ def _wall(node: Node) -> str:
 _BUDDY_MAX_ITEMS = 12
 
 
+def _buddy_when(epoch: Any) -> str:
+    """A report's exact wall-clock time — ``HH:MM:SS`` for today, and the date
+    the moment it stops being "today". The buddy's ``at`` is the second the
+    boundary was observed, so this is when the line happened, not when it was
+    read."""
+    try:
+        when = datetime.fromtimestamp(int(epoch))
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ""
+    now = datetime.now()
+    if (when.year, when.month, when.day) == (now.year, now.month, now.day):
+        return when.strftime("%H:%M:%S")
+    return when.strftime("%b %d %H:%M")
+
+
 def _buddy_actions(report: dict[str, Any], *, run: Run) -> list[dict[str, Any]]:
     """The report's buttons, from its own argv lists — never a shell string."""
     buttons: list[dict[str, Any]] = []
@@ -693,6 +708,7 @@ def _buddy_item(report: dict[str, Any], *, run: Run) -> dict[str, Any]:
         " · ".join(part for part in (next_step, narrative) if part),
         m="✗" if signals else "✓",
         mc="red" if signals else "green",
+        when=_buddy_when(report.get("at")),
         acts=_buddy_actions(report, run=run),
     )
 
@@ -751,8 +767,9 @@ def _buddy_section(run: Run) -> list[dict[str, Any]]:
         title,
         [_buddy_item(r, run=run) for r in reports[:_BUDDY_MAX_ITEMS]],
         full=True,
-        note=("What the observer saw, newest first — one line per stage, plus anything it "
-              "worried about while a stage was still running. Nothing here changes the run."),
+        note=("What the observer saw, newest first — one line per stage stamped with the "
+              "local time it happened, plus anything it worried about while a stage was "
+              "still running. Nothing here changes the run."),
     )]
 
 
@@ -774,6 +791,9 @@ def _buddy_node_facts(run: Run, node: Node) -> list[dict[str, Any]]:
     newest = mine[-1]
     items = [{"k": "Buddy", "v": str(newest.get("summary") or "—"),
               "c": "red" if newest.get("signals") else "text"}]
+    when = _buddy_when(newest.get("at"))
+    if when:
+        items.append({"k": "When", "v": when, "c": "sub"})
     next_step = str(newest.get("next") or "")
     if next_step:
         items.append({"k": "Next", "v": next_step, "c": "sub"})

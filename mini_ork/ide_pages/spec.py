@@ -224,9 +224,11 @@ def chip(t: Any, c: str = "sub") -> dict[str, Any]:
 
 
 def item(t: Any, sub: Any = "", *, m: str = "•", mc: str = "sub", tc: str = "text",
-         is_mono: bool = False, acts: Iterable[dict[str, Any]] | None = None) -> dict[str, Any]:
+         is_mono: bool = False, when: Any = "", acts: Iterable[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """``when`` is the row's wall-clock stamp, drawn right-aligned in mono —
+    empty (the default) leaves the column out entirely."""
     return {"m": m, "mc": mc, "t": str(t), "tc": tc, "sub": "" if sub is None else str(sub),
-            "mono": is_mono, "acts": list(acts or [])}
+            "mono": is_mono, "when": "" if when is None else str(when), "acts": list(acts or [])}
 
 
 def ok(t: Any, sub: Any = "", acts: Iterable[dict[str, Any]] | None = None) -> dict[str, Any]:
