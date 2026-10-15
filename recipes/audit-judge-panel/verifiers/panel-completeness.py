@@ -11,7 +11,11 @@
 #                              consumer) can join them mechanically instead of
 #                              pattern-matching prose.
 #
-# Both halves are checked. The gate FAILS (non-zero rc) on any miss: an earlier
+# Both halves are checked, and so is the panel itself: llm_calls must show the
+# two judges served by two different model FAMILIES (R7a) — two pins of one
+# family (``opus`` and ``opus55``) are one judge wearing two names.
+#
+# The gate FAILS (non-zero rc) on any miss: an earlier
 # version printed {"pass": false} and then `sys.exit(0)` unconditionally, so the
 # runner — which reads rc, not the JSON — recorded a pass and the panel could
 # not fail at all. A gate that cannot fail is theater, and it is why two lanes
@@ -24,6 +28,27 @@ import json
 import os
 import re
 import sys
+
+# ── repo-root import shim (R7a) ─────────────────────────────────────────────
+# This gate runs as a standalone script OUTSIDE the package, so ``mini_ork`` is
+# importable only once a repo root is on sys.path: $MINI_ORK_ROOT when the
+# engine sets it, else this file's ``../../..`` (recipes/<recipe>/verifiers/).
+# The root chosen has to be the one that CARRIES the module, which is not
+# always the one the environment names: during a worktree run $MINI_ORK_ROOT is
+# the engine checkout, which lags the change under test while this verifier
+# ships inside the target checkout. Probed, not imported blind — Python binds
+# ``mini_ork`` to the first sys.path entry holding the package, so a later
+# entry can never rescue a missing SUBmodule.
+_SHIPPED_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..")
+)
+_MODULE = os.path.join("mini_ork", "verify", "panel_heterogeneity.py")
+_ROOT = os.environ.get("MINI_ORK_ROOT") or _SHIPPED_ROOT
+if not os.path.isfile(os.path.join(_ROOT, _MODULE)):
+    _ROOT = _SHIPPED_ROOT
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+import mini_ork.verify.panel_heterogeneity as panel_heterogeneity  # noqa: E402
 
 RUN_DIR = os.environ["MINI_ORK_RUN_DIR"]
 EVIDENCE = os.path.join(RUN_DIR, "verifier-panel-completeness.log")
@@ -43,6 +68,10 @@ LANES = [
     ("opus", "opus_judge", "judge-opus-audit.md"),
     ("minimax", "minimax_judge", "judge-minimax-audit.md"),
 ]
+# The judge aliases the workflow pins — the ``actor`` recorded in llm_calls.
+# Not derived from LANES: the alias, the lane and the node id are three
+# different spellings of one judge (``opus_lens`` / ``opus`` / ``opus_judge``).
+JUDGE_ALIASES = ["opus_lens", "minimax_lens"]
 SECTIONS = [
     "Discovery Evidence",
     "Finding Verdicts",
@@ -254,6 +283,20 @@ else:
                    "S1", "S2", "S3", "S4", "S5", "S6"):
         if not re.search(re.escape(needle), synth_text, re.I):
             fail(f"synthesis.md:missing_{needle}")
+
+# ── served model families (R7a) ─────────────────────────────────────────────
+# The two judges must be two model FAMILIES — ``opus`` and ``opus55`` are two
+# pins of one Anthropic family, and the lane-alias overlay can point both at
+# the same gateway. See mini_ork/verify/panel_heterogeneity.py.
+_run_id = os.environ.get("MINI_ORK_RUN_ID") or os.path.basename(RUN_DIR.rstrip("/"))
+_panel = panel_heterogeneity.check_panel(_run_id, JUDGE_ALIASES)
+if _panel["skipped"]:
+    ev.write(f"served_models: skipped ({_panel['skipped']})\n")
+else:
+    ev.write(f"served_models: served={json.dumps(_panel['served'])} "
+             f"families={json.dumps(_panel['families'])}\n")
+    for _problem in _panel["problems"]:
+        fail(f"served_models:{_problem}")
 
 ev.close()
 

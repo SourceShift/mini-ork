@@ -1,7 +1,8 @@
 """audit-judge-panel-4l: the workflow compiles, and its completeness gate both
 passes a complete four-lane panel and FAILS each way a panel can be hollow —
-a missing lane, a non-enum verdict, ids that are not the kickoff's, and two
-judges served by the same model."""
+a missing lane, a non-enum verdict, ids that are not the kickoff's, two judges
+served by one model family (R7a: ``opus`` + ``opus55`` count as one), and a
+judge served by a fallback tail lane instead of its own."""
 from __future__ import annotations
 
 import importlib.util
@@ -207,7 +208,36 @@ def test_two_judges_served_by_one_model_fails(tmp_path):
         ("deepseek_lens", "deepseek_flash"), ("minimax_lens", "minimax")])
     rc, out = _run(tmp_path, db)
     assert rc == 1
-    assert "served_models:opus_lens_and_glm_lens_both_served_by:glm" in out["missing"]
+    assert "served_models:same_family:opus_lens,glm_lens:zai" in out["missing"]
+
+
+def test_two_anthropic_pins_on_two_judges_fail(tmp_path):
+    # R7a: ``opus`` and ``opus55`` are two pins of ONE family, so a panel
+    # served by both is still one judge wearing two names. The old gate
+    # compared lane strings and read them as two different models.
+    _make_panel(tmp_path)
+    db = _calls_db(tmp_path / "state.db", [
+        ("opus_lens", "opus"), ("glm_lens", "opus55"),
+        ("deepseek_lens", "deepseek_flash"), ("minimax_lens", "minimax")])
+    rc, out = _run(tmp_path, db)
+    assert rc == 1
+    assert "served_models:same_family:opus_lens,glm_lens:anthropic" in out["missing"]
+
+
+def test_fallback_served_judge_fails(tmp_path):
+    # A judge whose first lane failed and was served by a different tail lane
+    # is not the judge the workflow pinned — the 3l incident's real shape.
+    _make_panel(tmp_path)
+    db = _calls_db(tmp_path / "state.db", [
+        ("opus_lens", "opus55"), ("glm_lens", "glm"),
+        ("deepseek_lens", "deepseek_flash"), ("minimax_lens", "minimax")])
+    con = sqlite3.connect(db)
+    con.execute("INSERT INTO llm_calls VALUES ('run-x', 'minimax_lens', 'glm', 'failed')")
+    con.commit()
+    con.close()
+    rc, out = _run(tmp_path, db)
+    assert rc == 1
+    assert "served_models:fallback:minimax_lens:served=minimax" in out["missing"]
 
 
 @pytest.mark.parametrize("rows", [[], [("opus_lens", "opus55"), ("glm_lens", "glm"),

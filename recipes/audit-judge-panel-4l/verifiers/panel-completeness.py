@@ -8,11 +8,14 @@
 #   context-<node>.json     the machine sidecar — ONE shared schema across all
 #                           four lanes, covering exactly the finding and fix ids
 #                           the KICKOFF declares (not a recipe-fixed F1..F6).
-#   llm_calls               the four judges were served by four DISTINCT models.
-#                           The 3-lane panel's gate never looked: its run
+#   llm_calls               the four judges were served by four DISTINCT model
+#                           FAMILIES, not four lane strings (R7a). The 3-lane
+#                           panel's gate never looked: its run
 #                           run-1791725633-31802 had opus_lens served by glm and
 #                           laguna_lens falling back to minimax, so a "three
 #                           family" panel was glm + minimax twice, and it passed.
+#                           Comparing lane strings would not have caught it
+#                           either — ``opus`` and ``opus55`` are one family.
 #
 # rc IS the verdict (0 = complete, 1 = miss); the JSON on stdout explains it.
 
@@ -25,11 +28,31 @@ import glob
 import json
 import os
 import re
-import sqlite3
 import sys
 
 RUN_DIR = os.environ["MINI_ORK_RUN_DIR"]
 EVIDENCE = os.path.join(RUN_DIR, "verifier-panel-completeness.log")
+
+# ── repo-root import shim (R7a) ─────────────────────────────────────────────
+# This gate runs as a standalone script OUTSIDE the package, so ``mini_ork`` is
+# importable only once a repo root is on sys.path: $MINI_ORK_ROOT when the
+# engine sets it, else this file's ``../../..`` (recipes/<recipe>/verifiers/).
+# The root chosen has to be the one that CARRIES the module, which is not
+# always the one the environment names: during a worktree run $MINI_ORK_ROOT is
+# the engine checkout, which lags the change under test while this verifier
+# ships inside the target checkout. Probed, not imported blind — Python binds
+# ``mini_ork`` to the first sys.path entry holding the package, so a later
+# entry can never rescue a missing SUBmodule.
+_SHIPPED_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..")
+)
+_MODULE = os.path.join("mini_ork", "verify", "panel_heterogeneity.py")
+_ROOT = os.environ.get("MINI_ORK_ROOT") or _SHIPPED_ROOT
+if not os.path.isfile(os.path.join(_ROOT, _MODULE)):
+    _ROOT = _SHIPPED_ROOT
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+import mini_ork.verify.panel_heterogeneity as panel_heterogeneity  # noqa: E402
 
 # (lane, node id, lane alias the workflow pins)
 LANES = [
@@ -304,13 +327,7 @@ def check_sidecar(lane: str, node: str, f_ids: list[str], s_ids: list[str],
     return obj
 
 
-# ── served models ───────────────────────────────────────────────────────────
-
-def _db_path() -> str:
-    if os.environ.get("MINI_ORK_DB"):
-        return os.environ["MINI_ORK_DB"]
-    return os.path.join(os.environ.get("MINI_ORK_HOME") or ".mini-ork", "state.db")
-
+# ── served model families ───────────────────────────────────────────────────
 
 def _expected_models() -> dict[str, set[str]]:
     """``MO_PANEL_EXPECT_MODELS="opus_lens=opus|opus55,glm_lens=glm"`` → map."""
@@ -323,47 +340,28 @@ def _expected_models() -> dict[str, set[str]]:
 
 
 def check_served_models(fail, ev) -> None:
-    """The judges must be four different models. Reads the successful judge
-    calls of THIS run from ``llm_calls`` (``actor`` = the pinned lens alias,
-    ``model_id`` = the lane that actually served it). No DB, no table, or no
-    rows for this run is recorded as skipped — tests and dry runs have none —
-    but any rows present are enforced."""
-    db = _db_path()
+    """The four judges must be four different model FAMILIES.
+
+    Reads the judge calls of THIS run from ``llm_calls`` (``actor`` = the
+    pinned lens alias, ``model_id`` = the lane that actually served it) and
+    grades the family each served lane resolves to — the check the raw
+    lane-string comparison could not make. A lens whose first lane failed and
+    was served by a different tail lane is a fallback failure; two aliases on
+    one family (``opus`` + ``opus55``, or the operator overlay remapping a
+    lens onto another judge's lane) are a same-family failure. Every problem is
+    a gate failure prefixed ``served_models:``. No DB, no table, or no rows for
+    this run is recorded as skipped — tests and dry runs have none — but any
+    rows present are enforced."""
     run_id = os.environ.get("MINI_ORK_RUN_ID") or os.path.basename(RUN_DIR.rstrip("/"))
     aliases = [alias for _l, _n, alias in LANES]
-    if not os.path.isfile(db):
-        ev.write(f"served_models: skipped (no db at {db})\n")
+    result = panel_heterogeneity.check_panel(run_id, aliases, expect=_expected_models())
+    if result["skipped"]:
+        ev.write(f"served_models: skipped ({result['skipped']})\n")
         return
-    try:
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5.0)
-        try:
-            rows = con.execute(
-                "SELECT actor, model_id FROM llm_calls WHERE run_id = ? AND status = 'success' "
-                f"AND actor IN ({','.join('?' * len(aliases))})",
-                [run_id, *aliases]).fetchall()
-        finally:
-            con.close()
-    except sqlite3.Error as exc:
-        ev.write(f"served_models: skipped ({exc})\n")
-        return
-    if not rows:
-        ev.write(f"served_models: skipped (no judge calls logged for {run_id})\n")
-        return
-    served: dict[str, set[str]] = {}
-    for actor, model in rows:
-        served.setdefault(actor, set()).add(str(model))
-    ev.write(f"served_models: {json.dumps({k: sorted(v) for k, v in served.items()})}\n")
-    expected = _expected_models()
-    for alias, models in served.items():
-        want = expected.get(alias)
-        if want and not models <= want:
-            fail(f"served_models:{alias}_served_by:{sorted(models - want)}_expected:{sorted(want)}")
-    seen: dict[str, str] = {}
-    for alias in aliases:
-        for model in sorted(served.get(alias, ())):
-            if model in seen and seen[model] != alias:
-                fail(f"served_models:{seen[model]}_and_{alias}_both_served_by:{model}")
-            seen.setdefault(model, alias)
+    ev.write(f"served_models: served={json.dumps(result['served'])} "
+             f"families={json.dumps(result['families'])}\n")
+    for problem in result["problems"]:
+        fail(f"served_models:{problem}")
 
 
 # ── synthesis ───────────────────────────────────────────────────────────────
