@@ -31,8 +31,12 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     spent = _spent_today(home)
     chips = [S.chip(f"{S.money(spent)} today")]
     if tab == "lanes":
-        sections = (S.guarded(errors, "Lanes", lambda: _lanes_table(home))
-                    + S.guarded(errors, "Past decisions", lambda: _past_decisions(home))
+        sections = S.guarded(errors, "Lanes", lambda: _lanes_table(home))
+        if S.ide_level() >= 2:
+            # ContextNest is a current-IDE surface: level 1 (env unset) keeps the
+            # old section list byte-identical, like every other new section here.
+            sections += S.guarded(errors, "Past decisions", lambda: _past_decisions(home))
+        sections = (sections
                     + S.guarded(errors, "Credentials", lambda: _credentials(home))
                     + S.guarded(errors, "Bring your own provider", lambda: _byo(home)))
         if S.ide_level() >= 2:

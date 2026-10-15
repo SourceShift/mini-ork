@@ -54,6 +54,9 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     assert rc == 0, err
     monkeypatch.setenv("MINI_ORK_HOME", str(h))
     monkeypatch.setenv("MO_DISABLE_CN", "0")
+    # The Past decisions section is a level-2 surface (env unset keeps the old
+    # page byte-identical), so these tests build the current IDE's page.
+    monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
     monkeypatch.setattr(cn_client, "available", lambda: True)
     return h
 
@@ -479,7 +482,9 @@ def test_past_decisions_section_does_not_break_page(
     page = lanes.build(home, "lanes", {})
     assert page["ok"] is True
     titles = [s["title"] for s in page["sections"]]
-    assert "Lanes" in titles
+    # Level 2 renames the Lanes table section to "All · Lanes" (the agents board
+    # goes above it); either title proves the existing section survived.
+    assert "All · Lanes" in titles
     assert "Past decisions" in titles
     assert "Credentials" in titles
     assert "Bring your own provider" in titles
