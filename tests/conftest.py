@@ -53,6 +53,16 @@ def _isolate_process_state():
     # caller's real file whenever the suite runs under a mini-ork run that
     # exported MINI_ORK_SECRETS (held-out tasks, framework-edit verifiers).
     os.environ.pop("MINI_ORK_SECRETS", None)
+    # Same hazard for the state database. A run exports MINI_ORK_DB/MINI_ORK_HOME
+    # for its nodes, so a verifier's pytest inherits the live home, and
+    # mini_ork.web.db.resolve_db prefers MINI_ORK_DB over the --home a test
+    # passes: on 2026-10-13 test_intake_poll, test_threads_cli and
+    # test_web_intake_route wrote their acme fixtures (tickets, threads stuck
+    # "running", intake events) into the operator's real state.db, and they
+    # showed up on the Board. Unset both, which is the environment CI runs in;
+    # a test that needs either sets it itself.
+    os.environ.pop("MINI_ORK_DB", None)
+    os.environ.pop("MINI_ORK_HOME", None)
     # Never let a test spawn a real, detached auto-repair `recover`: the run and
     # recover flows call auto_repair.maybe_repair on every failed run, and it is
     # on unless MO_AUTO_REPAIR is "0". Tests of the loop opt back in explicitly.

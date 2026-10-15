@@ -68,7 +68,7 @@ def age_ok(pr_url: str) -> bool:
     return (now - dt).total_seconds() / 3600.0 >= soak
 
 
-def auto_merge_pr_one(epic_id: str, *, state_db: str) -> int:
+def auto_merge_pr_one(epic_id: str, *, state_db: str, repo_root: str | None = None) -> int:
     if os.environ.get("MO_AUTO_MERGE", "0") != "1":
         return 2
     if gh_ready() != 0:
@@ -87,6 +87,26 @@ def auto_merge_pr_one(epic_id: str, *, state_db: str) -> int:
         return 2
     if not age_ok(pr_url):
         return 2
+
+    # Human-review gate: policy-aware hold BEFORE invoking `gh pr merge`.
+    # ``require`` is a no-op when ``before_merge=off`` (no DB write, no
+    # behaviour change); with policy required it enqueues a
+    # ``merge:<epic_id>`` row and returns ``(False, …)``. We HOLD (return 1
+    # — the bash-shaped permanent-fail rc the sweep counts as skipped) and
+    # never call `gh` so the PR is not merged before a human approves
+    # exactly this content (base + tree).
+    from mini_ork.gates import merge_approval  # noqa: PLC0415
+    from mini_ork.vcs.auto_merge import content_ids
+    branch = _sql(state_db, f"SELECT branch FROM epics WHERE id='{epic_id}';")
+    root = repo_root or os.environ.get("REPO_ROOT") or os.getcwd()
+    base, tree = content_ids(root, branch or "HEAD", "main")
+    ok, why = merge_approval.require(
+        epic_id, base, tree,
+        branch=branch or "", base_branch="main", db_path=state_db,
+    )
+    if not ok:
+        print(f"[auto-merge-pr] HELD {epic_id} — {why}")
+        return 1
 
     if subprocess.run(["gh", "pr", "merge", pr_url, "--squash", "--delete-branch", "--auto"],
                       capture_output=True).returncode == 0:

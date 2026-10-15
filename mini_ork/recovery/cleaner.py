@@ -10,7 +10,7 @@ The claude spawn (``_spawn_worker``) and gauntlet run (``_run_gauntlet``) are
 seams — overridable for tests; the default implementations shell out exactly as
 the bash does. Exit codes match the bash verbatim:
     0 success/reuse/noop-reuse · 2 usage · 3 lock · 4 no-brief · 5 not-main
-    6 no-commits · 7 required-checks-fail · 10 main-already-clean
+    6 no-commits · 7 required-checks-fail · 8 held-for-review · 10 main-already-clean
 
     main(argv=None, *, root=None, home=None, spawn=None, gauntlet=None) -> int
 """
@@ -210,6 +210,24 @@ def main(argv=None, *, root=None, home=None, spawn=None, gauntlet=None) -> int:
                 continue
             sys.stderr.write(f"[cleaner] reuse: {cand} PASSES tc+build — fast-path squash-merge\n")
             _git(repo_root, "checkout", "main")
+            # Human-review gate: policy-aware hold BEFORE the squash merge at
+            # the reuse site. We are already on main, so no extra checkout is
+            # needed. With policy required, ``require`` returns ``(False, …)``;
+            # we write the HELD verdict.json in the same place the FAIL site
+            # writes, leave the candidate branch unmerged, and return 8.
+            from mini_ork.gates import merge_approval  # noqa: PLC0415
+            from mini_ork.vcs.auto_merge import content_ids
+            _mo_db = os.environ.get("MINI_ORK_DB") or os.path.join(mo_home, "state.db")
+            _base, _tree = content_ids(repo_root, cand, "main")
+            _ok, _why = merge_approval.require(
+                f"cleaner:{cand}", _base, _tree,
+                branch=cand, base_branch="main", db_path=_mo_db,
+            )
+            if not _ok:
+                json.dump({"verdict": "HELD_FOR_REVIEW", "reason": _why, "branch": cand},
+                          open(os.path.join(out_dir, "verdict.json"), "w"))
+                sys.stderr.write(f"[cleaner] HELD for review — {_why}\n")
+                return 8
             _git(repo_root, "merge", "--squash", cand)
             if _git(repo_root, "diff", "--cached", "--quiet").returncode == 0:
                 _git(repo_root, "branch", "-D", cand)
@@ -304,6 +322,24 @@ def main(argv=None, *, root=None, home=None, spawn=None, gauntlet=None) -> int:
 
         sys.stderr.write(f"[cleaner] gauntlet PASS — squash-merging {branch} → main\n")
         _git(repo_root, "checkout", "main")
+        # Human-review gate at the gauntlet PASS site. HEAD is already on main
+        # (just checked out above), so a HELD leaves the branch unmerged and
+        # the repo on main. With policy required, ``require`` returns
+        # ``(False, …)``; we write the HELD verdict.json in the same place
+        # the FAIL site writes, leave the branch unmerged, and return 8.
+        from mini_ork.gates import merge_approval  # noqa: PLC0415
+        from mini_ork.vcs.auto_merge import content_ids
+        _mo_db = os.environ.get("MINI_ORK_DB") or os.path.join(mo_home, "state.db")
+        _base, _tree = content_ids(repo_root, branch, "main")
+        _ok, _why = merge_approval.require(
+            f"cleaner:{branch}", _base, _tree,
+            branch=branch, base_branch="main", db_path=_mo_db,
+        )
+        if not _ok:
+            json.dump({"verdict": "HELD_FOR_REVIEW", "reason": _why, "branch": branch},
+                      open(os.path.join(out_dir, "verdict.json"), "w"))
+            sys.stderr.write(f"[cleaner] HELD for review — {_why}\n")
+            return 8
         _git(repo_root, "merge", "--squash", branch)
         _git(repo_root, "commit", "--no-verify", "-m",
              f"chore(baseline): cleaner fixed {classification} blocker for {epic_id}\n\n"

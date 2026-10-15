@@ -24,7 +24,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from mini_ork.stores import migrate as mig  # noqa: E402
-from mini_ork.threads import cli  # noqa: E402
+from mini_ork.threads import cli, store  # noqa: E402
 
 
 @pytest.fixture
@@ -144,3 +144,39 @@ def test_an_unknown_verb_is_a_usage_error(capsys) -> None:
     code, _, err = _run(capsys, "frobnicate")
     assert code == 2
     assert "unknown verb" in err
+
+
+# ── attach ──────────────────────────────────────────────────────────────────
+
+
+def test_attach_copies_files_onto_one_turn_and_starts_nothing(
+    home: Path, capsys, tmp_path: Path, monkeypatch
+) -> None:
+    import mini_ork.web.control as control
+
+    _run(capsys, "send", "t1", "--text", "first", "--home", str(home))
+    steered: list = []
+    monkeypatch.setattr(control, "steer_run", lambda *a, **k: steered.append(a) or {"ok": True})
+    a, b = tmp_path / "q3.csv", tmp_path / "brief.docx"
+    a.write_text("x,y\n1,2\n")
+    b.write_bytes(b"PK")
+
+    code, out, _ = _run(capsys, "attach", "t1", str(a), str(b), "--home", str(home))
+
+    assert code == 0
+    stored = [line.split(": ", 1)[1] for line in out.splitlines()]
+    assert [Path(p).name for p in stored] == ["q3.csv", "brief.docx"]
+    assert all(Path(p).parent == home / "attachments" / "t1" for p in stored)
+    rows = [r for r in store.messages("t1", db=str(home / "state.db")) if str(r.role) == "file"]
+    assert len({r.turn for r in rows}) == 1 and len(rows) == 2
+    assert steered == []                                  # attaching is not a request
+
+
+def test_attach_needs_an_existing_thread_and_a_file(home: Path, capsys, tmp_path: Path) -> None:
+    f = tmp_path / "a.txt"
+    f.write_text("a")
+    assert _run(capsys, "attach", "nope", str(f), "--home", str(home))[0] == 1
+    _run(capsys, "send", "t1", "--text", "first", "--home", str(home))
+    assert _run(capsys, "attach", "t1", "--home", str(home))[0] == 2
+    code, _, err = _run(capsys, "attach", "t1", str(tmp_path / "missing.csv"), "--home", str(home))
+    assert code == 1 and "not a file" in err

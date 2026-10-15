@@ -962,6 +962,18 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     # a success means the writer failed best-effort and the runtime will
     # treat the node as not-reusable on the next attempt (design §4).
     checkpoint_writer = _make_checkpoint_fn(db, run_id, live_run_dir, recipe, task_class)
+    # F4b (per-node git checkpoints, kickoff hr-node-ckpt-refs): one
+    # ``_start`` ref per run, taken with ``overwrite=False`` so a resumed
+    # run keeps its original baseline. Fail-open, gated on
+    # ``MO_NODE_GIT_CKPT`` (default "1", "0" disables), lazy-imported so
+    # the vcs module is never a hard dep of ``mini_ork.cli.execute``.
+    if not dry_run:
+        # The target worktree is resolved inside ``_node_git_ckpt`` —
+        # passing the run dir (not a pre-resolved path) keeps the
+        # resolution inside the fail-open wrapper, after the
+        # ``MO_NODE_GIT_CKPT`` gate, and matches every other target
+        # site in this file (kickoff hr-node-ckpt-refs round 2).
+        _node_git_ckpt(live_run_dir, run_id, "_start", overwrite=False)
     set_status(db, run_id, "executing")
     selected = [f for f in fields_list if not filter_node_type or f[1] == filter_node_type]
 
@@ -3497,10 +3509,27 @@ def _make_checkpoint_fn(db, run_id, run_dir, recipe, task_class):
         is the source of truth in E2; recipe is a stable proxy in E1).
       - ``config_hash`` is a stable per-(task_class, recipe, run_id)
         sha256 — the resolved config slice mini-ork already knows.
+
+    The F4b per-node git checkpoint hook snapshots the worktree the node
+    edited, NOT the run directory. The target is resolved INSIDE
+    ``_node_git_ckpt`` (from ``run_dir``, via the persisted
+    ``run_profile.json`` ladder) rather than per-node or in this
+    closure, so a bad ``MO_SHARED_DRIVE_BACKEND`` never aborts the run
+    (kickoff hr-node-ckpt-refs round 2). The run dir is
+    ``.mini-ork/runs/<id>``, which is git-excluded in the engine repo —
+    snapshotting it would either capture the engine's HEAD tree or fall
+    through with ``[ckpt] not a git work tree``.
     """
     from mini_ork.stores import checkpoints as mc
     started_at = int(time.time())
     recipe_eff = recipe or "unknown"
+    # F4b (per-node git checkpoints, kickoff hr-node-ckpt-refs round 2):
+    # the snapshot target is resolved INSIDE ``_node_git_ckpt`` — passing
+    # ``run_dir`` (not a pre-resolved path) keeps the resolution inside
+    # the fail-open wrapper, after the ``MO_NODE_GIT_CKPT`` gate, and
+    # matches every other target site in this file. A bad
+    # ``MO_SHARED_DRIVE_BACKEND`` therefore never aborts the run, and
+    # the cost of ``load_run_roots`` is paid only when the gate is on.
     # E3 fencing: during a recovery dispatch, mini-ork-recover acquires the
     # run's single-writer lease and exports MINI_ORK_LEASE_TOKEN. Threading it
     # here makes every checkpoint publish present the token, so a stale worker
@@ -3556,7 +3585,7 @@ def _make_checkpoint_fn(db, run_id, run_dir, recipe, task_class):
                 refresh_lease(db, run_id, owner_token)
             except Exception:  # noqa: BLE001 — refresh is best-effort; fence decides
                 pass
-        mc.write_checkpoint(
+        ckpt_rc = mc.write_checkpoint(
             db, run_id, node_id,
             status="success", input_hash=input_hash,
             recipe_version=recipe_eff, config_hash=config_hash,
@@ -3565,8 +3594,67 @@ def _make_checkpoint_fn(db, run_id, run_dir, recipe, task_class):
             ended_at=int(time.time()), initiator="python",
             owner_token=owner_token, provider_session_id=provider_session_id,
         )
+        if ckpt_rc == 0:
+            # F4b (per-node git checkpoints, kickoff hr-node-ckpt-refs):
+            # capture the post-success worktree into a git ref so a run
+            # can roll any node's effect back. The hook is fail-open —
+            # a snapshot failure must NEVER fail the node that just
+            # succeeded, and a missing import must NEVER break
+            # ``import mini_ork.cli.execute`` for every other run.
+            # ``run_dir`` is passed (not a pre-resolved target) so the
+            # target resolution stays inside the fail-open wrapper and
+            # runs only when the ``MO_NODE_GIT_CKPT`` gate is on.
+            _node_git_ckpt(run_dir, run_id, node_id)
 
     return _cp
+
+
+def _node_git_ckpt(run_dir, run_id, node_id, *, overwrite=True):
+    """Fail-open per-node git checkpoint hook (kickoff hr-node-ckpt-refs).
+
+    Called from two places: the per-node ``_cp`` (right after a successful
+    ``mc.write_checkpoint``) and ``main()`` once with ``_start`` /
+    ``overwrite=False`` (the run's first ref). Either call must NEVER raise
+    and NEVER fail the surrounding node/run, so the whole body is wrapped
+    in a single ``try/except Exception: pass``. The ``node_checkpoint``
+    module is imported lazily — a missing or broken vcs module surfaces
+    as a silent skip rather than a hard import error on
+    ``import mini_ork.cli.execute``.
+
+    The snapshot target is resolved INSIDE the wrapper, AFTER the
+    ``MO_NODE_GIT_CKPT`` gate, using the same ladder as
+    ``execute.py:2207`` — the persisted ``run_profile.json`` roots.target
+    first, then ``MO_TARGET_CWD``, then ``os.getcwd()``. Keeping the
+    resolution here (rather than at the call site) means a bad
+    ``MO_SHARED_DRIVE_BACKEND`` propagates as a silent skip instead of
+    aborting ``main()`` before ``set_status('executing')`` (the round-1
+    HIGH bug: ``resolve_run_roots`` drove ``drive.up()`` outside the
+    fail-open wrapper)."""
+    if not run_id:
+        return
+    try:
+        gate = context_env("MO_NODE_GIT_CKPT", "1")
+        if str(gate).strip() == "0":
+            return
+        # Resolve the snapshot target from ``run_dir`` via the
+        # persisted ``run_profile.json`` ladder (kickoff round 2).
+        # ``load_run_roots`` is cheap (a JSON read; no drive side
+        # effects), and the persisted ``roots.target`` is what every
+        # other resume path relies on — so a run resumed with
+        # ``MO_TARGET_CWD`` unset still snaps the worktree the kickoff
+        # recorded, not the kickoff's git toplevel.
+        target = ""
+        roots = load_run_roots(run_dir)
+        if roots and getattr(roots, "target", None):
+            target = roots.target
+        if not target:
+            target = context_env("MO_TARGET_CWD") or os.getcwd()
+        if not target:
+            return
+        from mini_ork.vcs import node_checkpoint
+        node_checkpoint.snapshot(target, run_id, node_id, overwrite=overwrite)
+    except Exception:  # noqa: BLE001 — a checkpoint must never fail a node/run
+        pass
 
 
 _REVIEW_PASS = {"pass", "approve", "approved"}

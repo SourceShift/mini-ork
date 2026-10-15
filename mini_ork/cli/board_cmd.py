@@ -16,6 +16,8 @@ truth.
                                       resolve a mo_inbox_gates row
   board page <key> [--tab T] [--arg k=v ...]
                                       one IDE page as data (mini_ork.ide_pages)
+  board checkpoints <run_id>          per-node git checkpoints for a run
+  board restore <run_id> <node>       restore a run's worktree to a checkpoint
 
 Every section is computed independently: a section that fails comes back
 empty with its error in ``errors`` instead of failing the whole board.
@@ -939,6 +941,79 @@ def _default_home() -> Path:
     return Path(os.environ.get("MINI_ORK_HOME", "").strip() or (Path.cwd() / ".mini-ork"))
 
 
+def _resolve_worktree_for_run(home: Path, run_id: str) -> str | None:
+    """The worktree path for a checkpoint/restore verb.
+
+    Resolves via ``workspaces.load`` first (the canonical pointer), and
+    falls back to ``load_run_roots(<home>/runs/<run_id>).target`` for
+    in-place runs (the worktree was opened with ``--owns`` rather than
+    provisioned as a ``mini-ork worktree``). Returns None when neither
+    yields a directory — both ``checkpoints`` and ``restore`` then
+    return ``ok: False`` with the reason ``"no worktree for run"``."""
+    try:
+        from mini_ork import workspaces
+        ws = workspaces.load(home, run_id)
+        if ws is not None and Path(ws.path).is_dir():
+            return str(ws.path)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from mini_ork.runtime.run_roots import load_run_roots
+        run_dir = home / "runs" / run_id
+        if run_dir.is_dir():
+            roots = load_run_roots(str(run_dir))
+            if roots and getattr(roots, "target", None):
+                return roots.target
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _act_checkpoints(home: Path, run_id: str) -> dict[str, Any]:
+    """``board checkpoints <run_id>`` — list the run's per-node git refs."""
+    if not run_id:
+        return {"ok": False, "run_id": run_id, "error": "a run id is required"}
+    worktree = _resolve_worktree_for_run(home, run_id)
+    if not worktree:
+        return {"ok": False, "run_id": run_id, "error": "no worktree for run"}
+    try:
+        from mini_ork.vcs import node_checkpoint
+        items = node_checkpoint.list_checkpoints(worktree, run_id)
+    except Exception as exc:  # noqa: BLE001 — never let vcs errors blank the verb
+        return {"ok": False, "run_id": run_id, "error": f"{type(exc).__name__}: {exc}",
+                "worktree": worktree}
+    return {"ok": True, "run_id": run_id, "worktree": worktree, "checkpoints": items}
+
+
+def _act_restore(home: Path, run_id: str, node_id: str, *,
+                 force: bool = False) -> dict[str, Any]:
+    """``board restore <run_id> <node> [--force]`` — put the worktree back
+    to how it was at the named node. Refusals come back as
+    ``ok: False`` with a ``reason``; the calling ``main()`` echoes the
+    reason to stderr so the operator can see why nothing happened."""
+    if not run_id:
+        return {"ok": False, "error": "a run id is required"}
+    if not node_id:
+        return {"ok": False, "error": "a node id is required"}
+    worktree = _resolve_worktree_for_run(home, run_id)
+    if not worktree:
+        return {"ok": False, "error": "no worktree for run",
+                "run_id": run_id}
+    try:
+        from mini_ork.vcs import node_checkpoint
+        result = node_checkpoint.restore(
+            worktree, run_id, node_id, home=home, force=force,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                "run_id": run_id, "node": node_id, "worktree": worktree}
+    result = dict(result)
+    result.setdefault("run_id", run_id)
+    result.setdefault("node", node_id)
+    result.setdefault("worktree", worktree)
+    return result
+
+
 def main(rest: list[str], root: str) -> int:
     del root
     parser = build_parser()
@@ -950,6 +1025,8 @@ def main(rest: list[str], root: str) -> int:
                          "[node <run_id> <node_id> [--view V] [--offset N]] "
                          "[steer <run_id> --role R --severity S --text TEXT] "
                          "[retry <run_id> [--ack-change] [--force] [--dry-run]] "
+                         "[checkpoints <run_id>] "
+                         "[restore <run_id> <node> [--force]] "
                          "[page <key> [--tab T] [--arg k=v]] [--home H] [--json]\n")
         return 2
     home = (Path(args.home) if args.home else _default_home()).expanduser().absolute()
@@ -963,7 +1040,18 @@ def main(rest: list[str], root: str) -> int:
         sys.stderr.write(f"mini-ork board runs: {exc}\n")
         return 2
     sys.stdout.write(json.dumps(payload, default=str) + "\n")
-    return 0 if payload.get("ok", True) is not False else 1
+    if payload.get("ok", True) is False:
+        # The kickoff limits stderr writes to the two new verbs (restore
+        # carries ``reason``; checkpoints uses ``error``). Other verbs
+        # keep the pre-kickoff behaviour of exiting 1 silently — touching
+        # their stderr output would change behaviour the existing test
+        # suite (and other tooling) already expects.
+        if args.verb in ("restore", "checkpoints"):
+            reason = payload.get("reason") or payload.get("error")
+            if reason:
+                sys.stderr.write(f"{reason}\n")
+        return 1
+    return 0
 
 
 def validate(args) -> str | None:
@@ -975,8 +1063,9 @@ def validate(args) -> str | None:
     """
     # The third positional is meaningful for `gate approve|reject <inbox_id>`
     # (the inbox id) and `node <run_id> <node_id>` (the node id). Any other
-    # verb that gets one is a usage error, not a silent extra.
-    if args.target and args.verb not in ("gate", "node"):
+    # verb that gets one is a usage error, not a silent extra. ``restore``
+    # also takes a third positional — the node id to restore to.
+    if args.target and args.verb not in ("gate", "node", "restore"):
         return f"mini-ork board {args.verb}: unexpected extra argument {args.target!r}"
     if args.verb == "gate":
         if not args.run_id or args.run_id not in ("approve", "reject"):
@@ -993,6 +1082,11 @@ def validate(args) -> str | None:
             return "mini-ork board steer: a run id is required"
         if not args.text:
             return "mini-ork board steer: --text is required"
+    elif args.verb == "restore":
+        if not args.run_id:
+            return "mini-ork board restore: a run id is required"
+        if not args.target:
+            return "mini-ork board restore: a node id is required"
     elif args.verb != "show" and args.verb != "runs" and not args.run_id:
         what = "a page key" if args.verb == "page" else "a run id"
         return f"mini-ork board {args.verb}: {what} is required"
@@ -1055,6 +1149,10 @@ def build_payload(home: Path, args) -> dict[str, Any]:
         payload = _runs_verb(home, args.query, args.offset, args.limit)
     elif args.verb == "dismiss":
         payload = _act_dismiss(home, args.run_id, undo=args.undo)
+    elif args.verb == "checkpoints":
+        payload = _act_checkpoints(home, args.run_id)
+    elif args.verb == "restore":
+        payload = _act_restore(home, args.run_id, args.target, force=args.force)
     else:
         payload = act(home, args.verb, args.run_id)
     if reap_errors:
@@ -1080,7 +1178,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mini-ork board", add_help=False)
     parser.add_argument("verb", nargs="?", default="show",
                         choices=["show", "run", "merge", "discard", "dismiss", "stop", "kill",
-                                 "resume", "retry", "gate", "page", "node", "steer", "runs"])
+                                 "resume", "retry", "gate", "page", "node", "steer", "runs",
+                                 "checkpoints", "restore"])
     parser.add_argument("run_id", nargs="?")
     # `gate approve|reject <inbox_id>` puts the action in run_id and the id here;
     # `node <run_id> <node_id>` uses the same slot for the node id (the L464

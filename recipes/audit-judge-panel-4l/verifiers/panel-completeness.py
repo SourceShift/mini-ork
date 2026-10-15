@@ -73,8 +73,14 @@ EVIDENCE_RE = re.compile(r"sqlite3|SELECT |\bFROM [a-z_]+|\.py:\d+|:\d+\b", re.I
 # an optional list/blockquote marker), possibly wrapped in ** or backticks —
 # the anchoring audit-judge-panel-3l learned the hard way: an unanchored regex
 # read "**Magnitude verdict:** F4's …" as ``verdict: F4``.
-_LINE_START = r"^[ \t]*(?:[-*+>][ \t]+)?(?:>[ \t]*)?"
-_FIELD = r"[*`]*%s[*`]*[ \t]*[:=][ \t]*[*`]*[ \t]*([A-Za-z_]+)"
+#
+# A field is either at column 0 or behind a list/blockquote marker. An indented
+# line with NO marker is the wrapped continuation of the item above, never a
+# field, and only ``:`` separates a field from its value: the first live run
+# failed on glm's wrapped prose ``  severity=None path for prose; …`` (a code
+# reference) read as ``severity: None``.
+_LINE_START = r"^(?:[ \t]*[-*+>][ \t]+(?:>[ \t]*)?)?"
+_FIELD = r"[*`]*%s[*`]*[ \t]*:[ \t]*[*`]*[ \t]*([A-Za-z_]+)"
 VERDICT_RE = re.compile(_LINE_START + _FIELD % "verdict", re.I | re.M)
 SEVERITY_RE = re.compile(_LINE_START + _FIELD % "severity", re.I | re.M)
 
@@ -147,6 +153,18 @@ def declared_ids(text: str) -> tuple[list[str], list[str]]:
 
 # ── reports ─────────────────────────────────────────────────────────────────
 
+def _without_fences(text: str) -> str:
+    """``text`` with every fenced code block blanked out (line count kept)."""
+    out, in_fence = [], False
+    for line in text.splitlines():
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+            out.append("")
+            continue
+        out.append("" if in_fence else line)
+    return "\n".join(out)
+
+
 def heading_index(text: str, heading: str) -> int:
     """Index of the first heading line whose text starts with ``heading``."""
     m = re.search(r"^#{1,4}\s+(?:\d+\.\s*)?" + re.escape(heading) + r"\b",
@@ -162,8 +180,9 @@ def check_report(path: str, n_items: int, fail, ev) -> None:
     text = open(path, encoding="utf-8", errors="replace").read()
     lines = text.count("\n")
     evidence_hits = sum(1 for line in text.splitlines() if EVIDENCE_RE.search(line))
-    verdicts = VERDICT_RE.findall(text)
-    severities = SEVERITY_RE.findall(text)
+    prose = _without_fences(text)  # a quoted snippet is a receipt, not a field
+    verdicts = VERDICT_RE.findall(prose)
+    severities = SEVERITY_RE.findall(prose)
     idx = [heading_index(text, s) for s in SECTIONS]
     order_ok = all(i >= 0 for i in idx) and idx == sorted(idx)
     ev.write(f"{name}: lines={lines} evidence_hits={evidence_hits} "
@@ -382,12 +401,14 @@ def main() -> int:
             obj = check_sidecar(lane, node, f_ids, s_ids, fail)
             if obj is not None:
                 sidecars[lane] = obj
-        names = sorted(sidecars)
-        for i, a in enumerate(names):
-            for b in names[i + 1:]:
-                if set(sidecars[a]) != set(sidecars[b]):
-                    fail(f"cross_lane_top_level_keys_differ:{a}|{b}:"
-                         f"{sorted(set(sidecars[a]) ^ set(sidecars[b]))}")
+        # Every lane already must carry REQUIRED_TOP (check_sidecar), which is
+        # all a mechanical join needs. A lane that adds provenance keys on top
+        # (deepseek wrote head_commit + kickoff_path on the first live run)
+        # breaks nothing, so extras are recorded, not failed.
+        for lane in sorted(sidecars):
+            extra = sorted(set(sidecars[lane]) - REQUIRED_TOP)
+            if extra:
+                ev.write(f"{lane}: extra sidecar keys (allowed): {extra}\n")
         check_served_models(fail, ev)
         check_synthesis(f_ids, s_ids, fail)
     print(json.dumps({"verifier": "panel-completeness", "pass": not missing,

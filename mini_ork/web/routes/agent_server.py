@@ -68,6 +68,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
+from mini_ork.threads import attachments as _attachments
 from mini_ork.threads import kickoff as _kickoff
 from mini_ork.threads.model import MessageRole, ThreadOrigin
 
@@ -509,69 +510,18 @@ def _initial_message_text(payload: dict[str, Any]) -> str:
 # ── Non-text content parts (Stage 2: file attachments) ────────────────────────
 #
 # ``_flatten_message`` deliberately keeps only text parts. A file part is not
-# text and never becomes kickoff prose; instead each one is persisted under
-# ``<home>/attachments/<thread_id>/`` and recorded as its own ``MessageRole.FILE``
-# row, so the content survives the turn even though the run's task text does not
-# mention it. The shape mirrors ``mini_ork/acp/agent.py:_write_attached_image``,
-# adapted to the dict blocks this server receives (which may carry a
-# client-supplied filename that has to be sanitized).
+# text and never becomes kickoff prose; it is stored under
+# ``<home>/attachments/<thread_id>/`` by :mod:`mini_ork.threads.attachments` (the
+# one owner of naming, the size cap and confinement, shared with
+# ``mini-ork threads attach``) BEFORE the turn is delivered, so the run that turn
+# launches is told the file exists. ``threads.service.deliver(attachments=…)``
+# records one ``MessageRole.FILE`` row per file on the message's own turn.
 
-_ATTACHMENT_EXT_BY_MIME = {
-    "image/png": ".png",
-    "image/jpeg": ".jpg",
-    "image/jpg": ".jpg",
-    "image/gif": ".gif",
-    "image/webp": ".webp",
-    "application/pdf": ".pdf",
-    "text/plain": ".txt",
-    "application/json": ".json",
-    # The formats mini_ork.documents previews. Without these an office file
-    # landed as .bin and the thread page could never preview it.
-    "text/csv": ".csv",
-    "text/tab-separated-values": ".tsv",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
-    "application/vnd.ms-excel.sheet.macroenabled.12": ".xlsm",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
-    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
-}
-
-#: A decoded attachment larger than this is not stored. The conversation API is
-#: an inbound port; an unbounded base64 body is a way to fill the disk.
-_MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
-
-
-def _attachment_extension(mime_type: Any, client_name: str = "") -> str:
-    """Map a part's mime type to a filesystem extension; ``.bin`` fallback.
-
-    The mime type decides. Only when it names nothing (absent, or a generic
-    ``application/octet-stream``) may the client's own suffix stand in, and only
-    if it is one of the document formats :mod:`mini_ork.documents` previews — an
-    allow-list, so a client still cannot choose ``.sh`` or ``.exe``.
-    """
-    ext = _ATTACHMENT_EXT_BY_MIME.get(str(mime_type or "").lower(), ".bin")
-    if ext != ".bin":
-        return ext
-    from mini_ork.documents import SUPPORTED_FORMATS
-
-    suffix = Path(_sanitize_attachment_name(client_name)).suffix.lower()
-    return suffix if suffix in SUPPORTED_FORMATS else ".bin"
-
-
-def _sanitize_attachment_name(name: Any) -> str:
-    """A client-supplied filename reduced to a safe leaf name.
-
-    A client owns the name string, not the path, so every directory component
-    is dropped (both separators) and the special entries ``.``/``..`` are
-    rejected outright — ``../../x`` becomes ``x``, and a name that is nothing
-    but traversal becomes empty, which makes the caller allocate an integer
-    instead. NUL and path separators cannot survive, so the result never names
-    a path.
-    """
-    raw = str(name or "").strip().replace("\\", "/").replace("\x00", "")
-    leaf = raw.rsplit("/", 1)[-1]
-    if leaf in ("", ".", ".."):
-        return ""
-    return leaf[:120]
+#: Checked on the *encoded* length before decoding (base64 is 4 chars per 3
+#: bytes), so an oversized body is refused without allocating it.
+_MAX_ATTACHMENT_BYTES = _attachments.MAX_BYTES
+_attachment_extension = _attachments.extension
+_sanitize_attachment_name = _attachments.sanitize_name
 
 
 def _block_holder(block: dict[str, Any], key: str) -> dict[str, Any]:
@@ -631,7 +581,7 @@ def _file_blocks(message: Any) -> list[dict[str, Any]]:
     ``_flatten_message`` drops.
 
     A block qualifies when it declares itself a file or image. A qualifying
-    block with no payload is dropped at write time by :func:`_persist_file_parts`
+    block with no payload is dropped at write time by :func:`_store_file_parts`
     (its :func:`_block_data` is empty): a 0-byte stand-in is not a file worth a
     row. A plain-string content (the shape one existing caller sends) has no
     parts.
@@ -648,99 +598,56 @@ def _file_blocks(message: Any) -> list[dict[str, Any]]:
     ]
 
 
-def _next_free_integer(used: set[int]) -> int:
-    """The lowest integer not already used as a filename stem in the dir."""
-    n = 0
-    while n in used:
-        n += 1
-    return n
-
-
 def _write_attached_file(home: Path, thread_id: str, block: dict[str, Any]) -> Path:
-    """Decode a file/image block to ``<home>/attachments/<thread_id>/<name>``.
+    """Decode one file/image block into the thread's attachment directory.
 
-    The directory is created lazily. The name is the client's sanitized leaf
-    when it is usable and the next free integer otherwise, so turn 2's ``0.pdf``
-    never overwrites turn 1's. The extension comes from the mime map, NEVER from
-    the client name — a hostile name cannot choose an executable suffix. The
-    returned path is confined to the thread directory by construction and
-    re-checked before the write: a write outside it is the one failure this
-    feature exists to prevent, so it is asserted rather than assumed.
-
-    Decode failures raise (``binascii.Error``/``ValueError``); the caller decides
-    whether a bad part sinks the message.
+    Decode failures and an oversized or escaping attachment raise
+    (``binascii.Error``/``ValueError``); the caller decides whether a bad part
+    sinks the message.
     """
-    target_dir = Path(home) / "attachments" / thread_id
-    target_dir.mkdir(parents=True, exist_ok=True)
-    ext = _attachment_extension(_block_mime(block), _block_name(block))
     data = _block_data(block)
-    # Refuse before decoding: base64 is 4 chars per 3 bytes, so the encoded
-    # length bounds the decoded size without allocating it.
     if len(data) > (_MAX_ATTACHMENT_BYTES + 2) // 3 * 4:
         raise ValueError(f"attachment over {_MAX_ATTACHMENT_BYTES} bytes")
     raw = base64.b64decode(data, validate=True)
-
-    used: set[int] = set()
-    for existing in target_dir.iterdir():
-        if existing.stem.isdigit():
-            used.add(int(existing.stem))
-
-    stem = Path(_sanitize_attachment_name(_block_name(block))).stem
-    if not stem or set(stem) == {"."}:
-        stem = str(_next_free_integer(used))
-    target = target_dir / f"{stem}{ext}"
-    if target.exists():
-        n = 0
-        while (target_dir / f"{stem}-{n}{ext}").exists():
-            n += 1
-        target = target_dir / f"{stem}-{n}{ext}"
-
-    if target.resolve().parent != target_dir.resolve():
-        raise ValueError(f"attachment path escaped thread dir: {target}")
-
-    target.write_bytes(raw)
-    return target
+    return _attachments.store_bytes(
+        home, thread_id, raw, name=_block_name(block), mime=_block_mime(block)
+    )
 
 
-def _persist_file_parts(
-    home: Path, thread_id: str, message: Any, *, turn: int
-) -> list[Path]:
-    """Store every non-text content part and record one FILE row per part.
+def _store_file_parts(home: Path, thread_id: str, message: Any) -> list[str]:
+    """Store every non-text part of ``message``; return the stored absolute paths.
 
-    One row per part: ``role=MessageRole.FILE``, empty text, and the stored
-    absolute path in ``attachments`` — the shape
-    :class:`mini_ork.threads.model.MessageRole` documents. The row carries the
-    SAME ``turn`` as the message it arrived with, so the transcript shows the
-    file beside the text rather than opening a round of its own.
-
-    Best-effort, like the other thread-table writes in this module: a part whose
-    base64 is malformed, or a store that cannot be written, is skipped — the
-    turn has already been delivered (and maybe a run launched), and failing here
-    would 500 a request whose real work is done.
+    Best-effort per part: a part with no payload, malformed base64, or one over
+    the cap is skipped rather than failing a turn whose text is still valid.
+    Nothing is recorded in the thread tables here — the paths go to
+    ``deliver(attachments=…)`` (or the create path), which records them on the
+    message's own turn and names them in the kickoff.
     """
-    from mini_ork.threads import store as thread_store
-
-    written: list[Path] = []
+    stored: list[str] = []
     for block in _file_blocks(message):
         if not _block_data(block):
-            # No payload anywhere on the block: there is no file to decode, so
-            # nothing to store. base64.b64decode("", validate=True) would
-            # succeed and write a 0-byte file plus a FILE row for a part the
-            # client never sent bytes for — _file_blocks documents this skip.
+            # No payload anywhere on the block: a 0-byte stand-in is not a file.
             continue
         try:
             path = _write_attached_file(home, thread_id, block)
         except (binascii.Error, ValueError, OSError):
             continue
+        stored.append(str(path.resolve()))
+    return stored
+
+
+def _record_file_rows(home: Path, thread_id: str, paths: list[str], *, turn: int) -> None:
+    """One FILE row per stored path on ``turn``. Best-effort, like the mirror."""
+    from mini_ork.threads import store as thread_store
+
+    for path in paths:
         try:
             thread_store.append_message(
                 thread_id, role=MessageRole.FILE, text="", turn=turn,
-                attachments=(str(path.resolve()),), db=_thread_db(home),
+                attachments=(path,), db=_thread_db(home),
             )
         except Exception:
             continue
-        written.append(path)
-    return written
 
 
 def _conversation_info(record: dict[str, Any]) -> dict[str, Any]:
@@ -816,8 +723,12 @@ def create_conversation(
     }
 
     if initial_text:
+        # Files are stored before the launch so the kickoff can name them: a run
+        # that is never told a file exists cannot read it.
+        attached = _store_file_parts(home, conversation_id, payload.get("initial_message"))
         kickoff = _kickoff.compose(
-            _kickoff.Kickoff(title=title or "Conversation", task=initial_text)
+            _kickoff.Kickoff(title=title or "Conversation", task=initial_text,
+                             attachments=tuple(attached))
         )
         result = control.launch_run(home, recipe, kickoff, run_id=conversation_id)
         if not result.get("ok"):
@@ -839,7 +750,7 @@ def create_conversation(
         )
         # The first message's files ride turn 1, beside the text that launched
         # the run — the same shape a later send gets.
-        _persist_file_parts(home, conversation_id, payload.get("initial_message"), turn=1)
+        _record_file_rows(home, conversation_id, attached, turn=1)
 
     _save_conversation(home, record)
     return _conversation_info(record)
@@ -1343,24 +1254,22 @@ def send_conversation_event(
             leaf = _sanitize_attachment_name(_block_name(_file_blocks(payload)[0]))
             record["title"] = (leaf or "Attachment")[:80]
 
+    # Stored before delivery so the turn's run (or the steer into a live one)
+    # is told where each file is; deliver records the FILE rows on this turn.
+    attached = _store_file_parts(home, conversation_id, payload)
     out = deliver(
         home, conversation_id, text,
         title=str(record.get("title") or ""),
         origin=ThreadOrigin.IDE,
         recipe=str(record.get("recipe") or DEFAULT_CONVERSATION_RECIPE),
         source="agent-server-canvas",
+        attachments=attached,
     )
     if out.action == "error":
         raise HTTPException(
             status_code=500,
             detail=f"run launch failed: {out.detail or 'unknown'}",
         )
-
-    if out.action in ("launched", "continued", "steered"):
-        # The turn is delivered; persist any non-text parts beside it. Best
-        # effort on purpose — the run may already be launched and must not be
-        # un-launched by an attachment that could not be written.
-        _persist_file_parts(home, conversation_id, payload, turn=out.turn)
 
     if out.action in ("launched", "continued"):
         # A continuation may reuse a finished conversation, so the record has

@@ -34,12 +34,14 @@ from mini_ork.pm.registry import register_provider
 
 #: mini-ork's own epics. The one source that needs no config, no network and no
 #: credential, which is why it is registered first and unconditionally.
-register_provider(local.provider())
+_LOCAL = local.provider()
+register_provider(_LOCAL)
+LOCAL_ID = _LOCAL.id
 
-#: Adapters that need a ``SourceConfig``, keyed by the id they register under.
-#: The bare ``github`` id served a single repository first; a second repository
-#: is a second entry (``github-core``) with its own ``owner``/``repo``. A second
-#: Linear team is likewise a second entry (``linear-ops``) with its own ``team``.
+#: Adapters that need a ``SourceConfig``, keyed by adapter name. A source's id is
+#: its registry id, so one adapter serves many sources: ``github`` and
+#: ``github-core`` are two repositories, ``linear`` and ``linear-ops`` two teams.
+#: See :func:`_factory_for` for how an id finds its adapter.
 _CONFIGURED = {
     "github": github.GithubProvider,
     "linear": linear.LinearProvider,
@@ -59,18 +61,35 @@ def skipped_sources() -> tuple[tuple[str, str], ...]:
     return tuple(_SKIPPED)
 
 
-def adapter_for(source_id: str):
+def adapter_for(source_id: str, adapter: str | None = None):
     """The adapter class that serves ``source_id``, or ``None``.
 
-    The one answer to "which adapters this build has", read by a caller that
-    cannot ask the registry: ``mini-ork pm add`` builds a source from a config
-    the project has not written yet, so there is nothing registered to look up.
-    ``local`` is absent on purpose — it is unconditional, not configured.
+    The one answer to "which adapter builds this source", read by registration
+    and by callers that cannot ask the registry (``mini-ork pm add`` builds a
+    source from a config the project has not written yet). An explicit
+    ``adapter`` (the source's ``adapter:`` setting) wins; otherwise the id
+    itself, then its prefix before the first ``-`` — so ``github-core`` is a
+    second GitHub source. ``local`` is absent on purpose — it is unconditional,
+    not configured.
     """
-    return _CONFIGURED.get(str(source_id))
+    named = str(adapter or "").strip()
+    if named:
+        return _CONFIGURED.get(named)
+    sid = str(source_id)
+    return _CONFIGURED.get(sid) or _CONFIGURED.get(sid.split("-", 1)[0])
 
 
-def _register_configured() -> None:
+def _factory_for(source: pm_config.SourceConfig) -> tuple[object | None, str]:
+    """The adapter that builds ``source``, and the adapter name it was looked up by."""
+    named = str(source.settings.get("adapter") or "").strip()
+    return (adapter_for(source.id, named or None),
+            named or (source.id if source.id in _CONFIGURED else source.id.split("-", 1)[0]))
+
+
+def _register_configured(configuration: pm_config.PmConfig | None = None) -> None:
+    if configuration is not None:
+        _register_sources(configuration)
+        return
     try:
         configuration = pm_config.load_config()
     except pm_config.PmConfigError as exc:
@@ -79,12 +98,21 @@ def _register_configured() -> None:
         # own message the moment anyone asks about sources.
         _SKIPPED.append(("", str(exc)))
         return
+    _register_sources(configuration)
+
+
+def _register_sources(configuration: pm_config.PmConfig) -> None:
     for source in configuration.enabled():
-        factory = _CONFIGURED.get(source.id)
+        if source.id == LOCAL_ID:
+            continue  # registered above, unconditionally
+        factory, adapter = _factory_for(source)
         if factory is None:
             # Declared and enabled with no adapter in this build — a source
-            # from a newer version, or a name that never had one. Naming it is
-            # the config's job; inventing an error here would break imports.
+            # from a newer version, or a name that never had one. Recorded
+            # rather than raised: a bad name must not break `import mini_ork.pm`,
+            # but it must not vanish either.
+            _SKIPPED.append((source.id, f"no {adapter!r} adapter in this build "
+                             f"(known: {', '.join(sorted(_CONFIGURED))})"))
             continue
         try:
             register_provider(factory(source))

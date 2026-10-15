@@ -947,6 +947,19 @@ def _dag_tab(run: Run, wanted: str | None) -> list[dict[str, Any]]:
         return S.inspector(sel.id, sel.type or "node", _STATE_TEXT.get(sel.state, sel.state),
                            lines, items, full=True)
 
+    def totals() -> dict[str, Any]:
+        counts: dict[str, int] = {}
+        for n in run.nodes:
+            counts[n.state] = counts.get(n.state, 0) + 1
+        states = ", ".join(f"{k} {counts[k]}" for k in
+                           ("done", "running", "failed", "skipped", "pending") if k in counts)
+        return S.kv("Run totals", [
+            ("Cost", S.money(_cost(run))),
+            ("Wall time", _elapsed(run)),
+            ("Nodes", f"{len(run.nodes)} · {states}" if run.nodes else "no nodes"),
+            ("Recipe", str(run.card.get("recipe") or run.row.get("recipe") or "—")),
+        ], full=True)
+
     def build_coalition() -> dict[str, Any]:
         fams: dict[str, int] = {}
         for n in run.nodes:
@@ -979,7 +992,14 @@ def _dag_tab(run: Run, wanted: str | None) -> list[dict[str, Any]]:
                  sorted(fams.items(), key=lambda kv: (-kv[1], kv[0]))]
         return S.pills(title, pills, full=True, note=note)
 
-    return (S.guarded(errors, "DAG", build_dag) + S.guarded(errors, "Inspector", build_inspector)
+    # The DAG section stays first: the IDE draws it as the page's strip, and a
+    # test pins `sections[0]`. The roster and the totals follow it, so a run
+    # read without opening a node still answers "what ran, on what, for how
+    # much" — the same table the Agents tab shows, from one source.
+    return (S.guarded(errors, "DAG", build_dag)
+            + S.guarded(errors, "Roster", lambda: _roster_section(run))
+            + S.guarded(errors, "Totals", totals)
+            + S.guarded(errors, "Inspector", build_inspector)
             + S.guarded(errors, "Coalition", build_coalition)
             + S.guarded(errors, "Buddy", lambda: _buddy_section(run)))
 
@@ -1377,30 +1397,36 @@ def _kickoff_tab(run: Run) -> list[dict[str, Any]]:
     return S.guarded(errors, "Kickoff", build)
 
 
+def _roster_section(run: Run) -> dict[str, Any]:
+    """Every node of the run as one table: what it ran on, its state and cost.
+
+    Shared by the Graph tab's run-level panel and the Agents tab, so the two
+    cannot report different numbers for the same node.
+    """
+    rows = []
+    for n in run.nodes:
+        verdict, vc = _verdict(run, n)
+        ran = n.state not in ("pending", "skipped")
+        rows.append({"cells": [
+            S.cell(n.id, "text", b=True),
+            S.cell(n.family, f"fam:{n.family}"),
+            S.cell(_STATE_TEXT.get(n.state, n.state), _STATE_COLOUR.get(n.state, "sub")),
+            S.cell(verdict, vc),
+            S.mono(S.money(n.cost) if ran else "—"),
+            S.mono(_wall(n) if ran else "—"),
+            S.muted(", ".join(n.gates) or "—"),
+        ], "do": S.page_link("run", "dag", run=run.id, node=n.id)})
+    if not rows:
+        rows = [[S.muted("No nodes recorded"), "", "", "", "", "", ""]]
+    return S.table("Agent roster",
+                   [S.col(150), S.col(90), S.col(80), S.col(90), S.col(64), S.col(64),
+                    S.col(fr=1, min=140)],
+                   ["node", "family", "status", "verdict", "cost", "time", "gates"], rows,
+                   full=True, note="Where the money went inside the run. Click a row to inspect the node.")
+
+
 def _agents_tab(run: Run) -> list[dict[str, Any]]:
     errors: dict[str, str] = {}
-
-    def roster() -> dict[str, Any]:
-        rows = []
-        for n in run.nodes:
-            verdict, vc = _verdict(run, n)
-            ran = n.state not in ("pending", "skipped")
-            rows.append({"cells": [
-                S.cell(n.id, "text", b=True),
-                S.cell(n.family, f"fam:{n.family}"),
-                S.cell(_STATE_TEXT.get(n.state, n.state), _STATE_COLOUR.get(n.state, "sub")),
-                S.cell(verdict, vc),
-                S.mono(S.money(n.cost) if ran else "—"),
-                S.mono(_wall(n) if ran else "—"),
-                S.muted(", ".join(n.gates) or "—"),
-            ], "do": S.page_link("run", "dag", run=run.id, node=n.id)})
-        if not rows:
-            rows = [[S.muted("No nodes recorded"), "", "", "", "", "", ""]]
-        return S.table("Agent roster",
-                       [S.col(150), S.col(90), S.col(80), S.col(90), S.col(64), S.col(64),
-                        S.col(fr=1, min=140)],
-                       ["node", "family", "status", "verdict", "cost", "time", "gates"], rows,
-                       full=True, note="Where the money went inside the run. Click a row to inspect the node.")
 
     def run_level() -> dict[str, Any]:
         stages = run.card.get("cost_by_stage") or {}
@@ -1412,7 +1438,8 @@ def _agents_tab(run: Run) -> list[dict[str, Any]]:
         return S.bars("Cost by stage", items, full=True,
                       note="Every metered call of the run, including planning and reflection.")
 
-    return S.guarded(errors, "Agent roster", roster) + S.guarded(errors, "Cost by stage", run_level)
+    return (S.guarded(errors, "Agent roster", lambda: _roster_section(run))
+            + S.guarded(errors, "Cost by stage", run_level))
 
 
 # `tr-<type>-<node>-<hash>` is the trace-id format the gradient extractor writes

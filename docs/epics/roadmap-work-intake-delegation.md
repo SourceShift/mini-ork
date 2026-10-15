@@ -209,3 +209,19 @@ only the mirror (no network at page build), with an explicit empty state that na
 `config/pm.yaml` when no source is configured.
 
 Kickoff: `kickoffs/auto/board-shows-imported-tickets.md` (queued with `mini-ork epics add`).
+
+---
+
+## Follow-ups queued 2026-10-15
+
+The roadmap above shipped; three gaps it left are queued as their own epics, each with a kickoff
+under `kickoffs/auto/`:
+
+| id | kickoff | why |
+|---|---|---|
+| intake-report-back | `intake-report-back.md` | `pm/writeback.py` had no caller and `threads.service.on_run_terminal` none either, so a ticket never heard its run's outcome and thread runs stayed `running` |
+| chat-slack-transport | `chat-slack-transport.md` | Stage 3 shipped Telegram only; Slack Socket Mode + signed Events API, with a stdlib WebSocket client both chat transports share |
+| chat-discord-transport | `chat-discord-transport.md` | Discord Gateway + Ed25519-verified Interactions (behind an optional extra); runs after Slack, which lands the shared `_ws.py` |
+
+The Rust `document` renderer for the thread page is built in the mini-ork-ui repository, not here.
+

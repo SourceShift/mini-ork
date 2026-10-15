@@ -501,3 +501,40 @@ def test_main_no_args_defers(tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as exc:
         runpy.run_path(str(_MODULE_FILE), run_name="__main__")
     assert exc.value.code == 2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# driver JSON-line verdict (DoD #5) — last stdout line with `success` is
+# authoritative, free-text markers stay only as a non-JSON fallback.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_parse_attempt_passed_json_line_with_error_stderr_is_pass():
+    """Even with stderr containing 'error', the JSON `success: true` wins.
+
+    Agent-S debug logs emit ``[ERROR] openai …`` predictions on stderr even
+    on the success path; including stderr in the verdict would poison the
+    result. The last-line-JSON-first rule means we read the structured
+    ``success`` field instead.
+    """
+    stdout = 'progress noise\n{"success": true, "outcome": "DONE", "steps": 7}\n'
+    stderr = "[ERROR] openai chat completion failed once and was retried"
+    assert ags._parse_attempt_passed(stdout, stderr) is True
+
+
+def test_parse_attempt_passed_json_line_failure_is_fail():
+    """A JSON `success: false` report fails even if free-text says otherwise."""
+    stdout = (
+        'step noise\n[ERROR] openai 500 — retrying\n'
+        '{"success": false, "outcome": "ERROR", "steps": 3, "error": "boom"}\n'
+    )
+    stderr = "everything is fine"
+    assert ags._parse_attempt_passed(stdout, stderr) is False
+
+
+def test_parse_attempt_passed_no_json_falls_back_to_markers():
+    """Without a JSON report, the legacy free-text rules still apply."""
+    assert ags._parse_attempt_passed("task done\n", "") is True
+    assert ags._parse_attempt_passed("failed", "") is False
+    # Ambiguous (no success marker, no failure marker) is not-passed.
+    assert ags._parse_attempt_passed("nothing useful", "") is False

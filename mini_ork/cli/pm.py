@@ -236,7 +236,7 @@ def _provider_for(source: pm_config.SourceConfig) -> tuple[object | None, str]:
         # explain, so this is not a "skipped" source — ``providers`` itself
         # only ever skips what it tried to build (it walks ``enabled()``).
         return None, ""
-    factory = pm_providers.adapter_for(source.id)
+    factory = pm_providers.adapter_for(source.id, source.settings.get("adapter"))
     if factory is None:
         return None, "no adapter in this build"
     try:

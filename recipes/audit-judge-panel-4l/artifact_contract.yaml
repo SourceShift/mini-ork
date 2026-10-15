@@ -32,10 +32,11 @@ acceptance_criteria:
     Every verdict is one of confirmed|partially_confirmed|refuted|unverifiable
     and every severity is one of critical|high|medium|low.
   - >
-    Each lane writes ONE JSON sidecar (context-<node>.json) with the SAME key
-    set: schema_version, panel_id, lane, model, findings[], new_findings[],
-    fixes[], solutions[], fix_order[], counts{}, open_questions[],
-    read_only_attestation{}.
+    Each lane writes ONE JSON sidecar (context-<node>.json) carrying at least
+    the shared key set: schema_version, panel_id, lane, model, findings[],
+    new_findings[], fixes[], solutions[], fix_order[], counts{},
+    open_questions[], read_only_attestation{}. Extra provenance keys are
+    allowed; a missing shared key fails the lane.
   - >
     The four judges were served by four distinct models (llm_calls), so the
     panel is genuinely heterogeneous rather than one model under four names.

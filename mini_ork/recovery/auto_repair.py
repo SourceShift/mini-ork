@@ -7,6 +7,19 @@ rule "instead of accepting that these failed … always revive and fix":
     diagnose → pick a repair → apply it → resume the SAME run from the failed
     node → repeat, bounded → hand over to the human only when stuck.
 
+A diagnosis that blames the *engine* (``layer == "engine"``, ``routes_to ==
+"fix_epic"``) escapes that loop: ``decide`` returns ``escalate`` and
+``mini_ork.recovery.escalation`` opens a linked ``framework-edit`` fix epic, parks
+the run in ``waiting_on_fix`` and waits for it instead of handing over — see that
+module for the admission policy (``escalation_policy.should_escalate``, frozen)
+and :data:`_SPAWNABLE` for why nothing is spawned.
+
+A *parked* run (``repair.json`` state ``waiting_on_fix``) is INERT to this loop:
+the fix epic owns the failure, so ``decide`` returns ``none`` citing the epic
+before every other rule and ``apply`` leaves ``repair.json`` byte-identical and
+spawns nothing. Until SDE-4 revives the run, every later pass over the same
+failure is a pure no-op.
+
 ``decide`` is pure policy (no side effects): it reads the retry hint, the run's
 lifecycle events, the level report and the ``repair.json`` history and returns a
 decision dict. ``apply`` performs it: it writes the revise/prove feedback file,
@@ -374,10 +387,14 @@ def _signature(failed_node: str | None, reason: str, finding: str) -> str:
 def _decision(action: str, *, from_node: str | None = None,
               lanes: dict[str, str] | None = None, ack_change: bool = False,
               feedback: str = "", reason: str = "", signature: str = "",
-              stop: bool = False) -> dict[str, Any]:
+              stop: bool = False, fix_epic_id: str | None = None) -> dict[str, Any]:
     """A decision. ``stop`` marks a *stop rule* (attempts exhausted, budget,
     no progress) — a give-up the loop reached itself, as opposed to a first
     failure it hands over immediately. See ``apply``'s ``repair.json`` state.
+
+    ``fix_epic_id`` is ADDITIVE and carried only by the parked ``none`` decision
+    (the run is ``waiting_on_fix``, so the fix epic — not this loop — owns the
+    failure). It never changes an action; it names the epic the reason cites.
     """
     return {
         "action": action,
@@ -388,19 +405,46 @@ def _decision(action: str, *, from_node: str | None = None,
         "reason": reason,
         "signature": signature,
         "stop": bool(stop),
+        "fix_epic_id": fix_epic_id,
     }
 
 
 # ── policy ───────────────────────────────────────────────────────────────────
 
 
+def _escalatable(diagnosis: dict[str, Any] | None) -> bool:
+    """True when the diagnosis blames the engine *and* routes to a fix epic.
+
+    Both halves are required: ``layer == "engine"`` is who owns the failure, and
+    ``routes_to == "fix_epic"`` is the diagnosis's own recommendation that the
+    remedy is a change to mini-ork rather than to the run. A missing/invalid
+    diagnosis (``decide`` computes it best-effort) never escalates.
+    """
+    if not isinstance(diagnosis, dict):
+        return False
+    from mini_ork.recovery.diagnose import LAYER_ENGINE, ROUTE_FIX_EPIC
+    return (str(diagnosis.get("layer") or "") == LAYER_ENGINE
+            and str(diagnosis.get("routes_to") or "") == ROUTE_FIX_EPIC)
+
+
 def decide(home: Path, run_id: str) -> dict[str, Any]:
     """Pure policy — the repair decision for ``run_id`` (no side effects).
 
     Returns ``{"action", "from_node", "lanes", "ack_change", "feedback",
-    "reason", "signature", "diagnosis"}``. ``action`` is one of ``none``,
-    ``human``, ``lane``, ``infra``, ``reverify``, ``prove`` or ``revise``.
-    First match wins; the rule order is the kickoff's policy table.
+    "reason", "signature", "diagnosis", "fix_epic_id"}``. ``action`` is one of
+    ``none``, ``human``, ``lane``, ``infra``, ``reverify``, ``prove``,
+    ``revise`` or ``escalate``. First match wins; the rule order is the
+    kickoff's policy table, prefixed by two rules that outrank all of it: the
+    ``MO_AUTO_REPAIR=0`` opt-out, then the parked-run guard (a run in
+    ``waiting_on_fix`` decides ``none``, citing its fix epic).
+
+    ``escalate`` is the self-driving action: the diagnosis says the *engine* is
+    at fault and routes to a fix epic, so instead of a revise round the loop
+    opens a linked ``framework-edit`` epic and waits on it. It is not a repair of
+    this run (see ``_SPAWNABLE``), and the frozen operator policy
+    (``escalation_policy.should_escalate``) is what admits it — ``decide`` only
+    routes to it, gated on ``MO_AUTO_ESCALATE`` (default on, only the literal
+    ``"0"`` off) and the diagnosis's ``layer``/``routes_to``.
 
     ``diagnosis`` is ADDITIVE and never load-bearing: the typed
     layer/stage/node naming of *who owns this failure*
@@ -432,6 +476,25 @@ def _decide_policy(home: Path, run_id: str,
 
     run_dir = _run_dir(home, run_id)
     status = _run_status(home, run_id)
+    # The run is PARKED on a fix epic (SDE-3a's ``escalation.escalate`` wrote
+    # ``waiting_on_fix``): the epic owns the failure now, so this loop is inert.
+    # Placed before EVERY other rule — rule 1 included, so a parked run is not
+    # even re-classified by its status — because a parked run must not reach the
+    # stop rules (a second same-signature pass would record a "no progress"
+    # give-up on a run that is waiting, not stalling) nor the escalate rule (it
+    # already has its epic; a second one would double-file the failure). Only the
+    # ``MO_AUTO_REPAIR=0`` opt-out above outranks it. ``apply`` mirrors this with
+    # a byte-identical short-circuit; SDE-4 revives the run by clearing the state
+    # when the epic lands — that is the only thing that un-parks it.
+    repair = _load_repair(run_dir)
+    if str(repair.get("state") or "") == "waiting_on_fix":
+        fix_epic_id = str(repair.get("fix_epic_id") or "")
+        return _decision(
+            "none",
+            reason=f"waiting on fix epic {fix_epic_id}" if fix_epic_id
+                   else "waiting on a fix epic",
+            fix_epic_id=fix_epic_id or None,
+        )
     events = _events(home, run_id)
     # Rule 1 is "the run is not failed/rolled_back". A withheld publish counts
     # as failed even when the status flag disagrees (see ``_is_withheld``): the
@@ -461,7 +524,9 @@ def _decide_policy(home: Path, run_id: str,
         from mini_ork.acp.task_state import withheld_publish
         withheld = withheld_publish(run_dir, events)
 
-    repair = _load_repair(run_dir)
+    # ``repair`` is the snapshot the parked guard above already read: ``decide``
+    # is pure, so re-loading here could only disagree with it. One read per
+    # decide.
     attempts = list(repair.get("attempts") or [])
 
     finding = _first_finding(run_dir)
@@ -487,6 +552,25 @@ def _decide_policy(home: Path, run_id: str,
             and not (withheld and not failed_node):
         return _decision("human", from_node=failed_node, signature=signature, stop=True,
                          reason="no progress — the same failure signature repeats")
+
+    # 2.5 The engine is at fault → escalate to a fix epic (SDE-3a). A revise
+    # round re-implements the change against a failure the framework owns, which
+    # is the same wrong turn the reviewer-escalated branch (5.5) avoids; the run
+    # is parked in ``waiting_on_fix`` instead. Placed AFTER the stop rules so an
+    # exhausted/budget/short-circuiting run still gives up rather than opening a
+    # new epic, and BEFORE the lane rule so an engine fault outranks a dead lane.
+    # ``decide`` routes only: whether the escalation is *admitted* (daily cap,
+    # breaker, calibrated bar) is the frozen policy's call, made in ``apply``.
+    if context_env("MO_AUTO_ESCALATE", "1") != "0" and _escalatable(diagnosis):
+        stage = str(diagnosis.get("stage") or "?")
+        node = str(diagnosis.get("node") or "")
+        return _decision(
+            "escalate",
+            from_node=failed_node or (node or None),
+            reason=f"engine fault at {stage}{'/' + node if node else ''}"
+                   " — escalate to a fix epic",
+            signature=signature,
+        )
 
     # 3. Dead lane → switch it.
     if hint_kind == "lane" and isinstance(nc.get("suggestions"), list) and nc["suggestions"]:
@@ -903,11 +987,14 @@ def apply(home: Path, run_id: str, decision: dict[str, Any], *,
     """Perform ``decision``: write feedback, record the attempt, resume the run.
 
     Returns a result dict — for a spawn, ``{"pid", "log", "command", "attempt"}``;
-    for ``human``, ``{"action": "human", "gate": <bool>}``; for a dry/no-op,
-    ``{"action": <action>}``. Writes the attempt to ``repair.json`` and emits a
-    ``run_events`` ``auto_repair`` row in every case. ``wait_for_exit`` is for a
-    spawn made by the process that still owns the run record (see
-    ``wait_for_spawner``).
+    for ``human``, ``{"action": "human", "gate": <bool>}``; for an ``escalate``
+    that the policy admitted, ``{"escalated": true, "fix_epic_id", "fix_bug_id"}``
+    (nothing is spawned); for a dry/no-op, ``{"action": <action>}``. Writes the
+    attempt to ``repair.json`` and emits a ``run_events`` ``auto_repair`` row in
+    every case — except a ``none`` decision for a run parked on a fix epic, which
+    is a byte-identical no-op (``{"action": "none", "parked": true, ...}``).
+    ``wait_for_exit`` is for a spawn made by the process that still owns the run
+    record (see ``wait_for_spawner``).
     """
     home = Path(home)
     run_dir = _run_dir(home, run_id)
@@ -916,7 +1003,50 @@ def apply(home: Path, run_id: str, decision: dict[str, Any], *,
     attempts = list(repair.get("attempts") or [])
     n = len(attempts) + 1
 
+    # A run PARKED on a fix epic is inert (``decide``'s parked rule returned
+    # ``none``): the epic owns the failure, so applying the no-op must touch
+    # nothing. Returning here — before the escalate branch, the feedback write,
+    # the attempt append, ``_write_repair``, ``_emit_run_event`` and any spawn —
+    # keeps ``repair.json`` byte-identical and keeps the attempt count (and with
+    # it the no-progress/budget stop rules) from drifting on every sweep that
+    # re-decides a parked run. Keyed on the run's PERSISTED state, not the
+    # decision's reason, so whichever rationale produced the ``none`` (the parked
+    # rule, or ``MO_AUTO_REPAIR=0``) the parked record stands until SDE-4 revives
+    # the run.
+    if action == "none" and str(repair.get("state") or "") == "waiting_on_fix":
+        return {"action": "none", "parked": True,
+                "reason": decision.get("reason") or "",
+                "fix_epic_id": repair.get("fix_epic_id")}
+
     result: dict[str, Any] = {"action": action, "attempt": n}
+
+    # ``escalate`` (SDE-3a) is resolved BEFORE the attempt is recorded, because
+    # ``escalation.escalate`` rewrites ``repair.json`` itself (state
+    # ``waiting_on_fix`` + the epic it opened). The refusal path becomes an
+    # ordinary ``human`` hand-off carrying the policy's reason verbatim — the
+    # operator reads the cap/breaker/bar explanation, not a generic "handed over".
+    if action == "escalate":
+        from mini_ork.recovery import escalation
+        esc = escalation.escalate(home, run_id, decision.get("diagnosis") or {})
+        decision = dict(decision)
+        if esc.get("escalated"):
+            result["escalated"] = True
+            result["fix_epic_id"] = esc.get("fix_epic_id")
+            result["fix_bug_id"] = esc.get("fix_bug_id")
+            result["kickoff_path"] = esc.get("kickoff_path")
+            # Re-read: escalate() just wrote state/fix_epic_id/fix_bug_id/
+            # triaged, and the snapshot loaded above predates that. Without this
+            # the attempt append below would clobber the fix link.
+            repair = _load_repair(run_dir)
+            attempts = list(repair.get("attempts") or [])
+            n = len(attempts) + 1
+            result["attempt"] = n
+        else:
+            action = "human"
+            result["action"] = "human"
+            result["escalated"] = False
+            decision["reason"] = str(esc.get("reason") or "escalation refused")
+            result["reason"] = decision["reason"]
 
     if action in ("revise", "prove"):
         round_no, text = _compose_feedback(run_dir)
@@ -970,6 +1100,10 @@ def apply(home: Path, run_id: str, decision: dict[str, Any], *,
             repair.pop("state", None)
     elif action in _SPAWNABLE:
         repair["state"] = "repairing"
+    # ``escalate`` matches neither branch on purpose: ``escalation.escalate``
+    # already set ``waiting_on_fix`` and ``escalate`` must NOT be added to
+    # ``_SPAWNABLE`` — the run waits for its fix epic (SDE-4 revives it), it is
+    # not resumed here.
     repair["triaged"] = bool(repair.get("triaged", False))
     if action == "human":
         repair["triaged"] = _triage_on_give_up(home, run_id, repair)
@@ -1141,6 +1275,10 @@ def maybe_repair(home: Path, run_id: str, *, spawn: bool = True,
     DB status decides whether anything happens, so a green run pays only a few
     cheap reads. A withheld publish sets ``status='failed'`` while the flow's rc
     is 0, which is exactly why the hooks must not gate on rc.
+
+    A ``none`` decision is returned without applying it — so a run parked on its
+    fix epic is a pure no-op here (and ``apply``'s own parked short-circuit
+    covers a direct call).
 
     ``wait_for_exit`` belongs to those two hooks: they spawn while their own
     lifecycle still owns the run record, so the child is told to wait for them

@@ -269,6 +269,10 @@ def _one(home: Path, thread_id: str) -> list[dict[str, Any]]:
                 ("Updated", thread.updated_at or "", "sub", f"created {thread.created_at or ''}"),
             ],
             full=True,
+            # Attaching starts nothing: the next message's run is told where
+            # the files are (threads.service._history).
+            actions=[S.btn("Attach file…", S.pick_files(
+                ["threads", "attach", thread.id], prompt="Attach to thread"), "ghost")],
         ),
         _runs(thread, db),
         *_transcript(thread, db),

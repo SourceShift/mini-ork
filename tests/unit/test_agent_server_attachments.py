@@ -93,9 +93,12 @@ def test_text_and_file_part_yields_a_file_row_sharing_the_turn(sent):
     )
 
     assert out["ok"] is True
-    # The text part still drives the kickoff — file parts are not prose.
-    assert "look at this report" in launches[0]["kickoff"]
-    assert "report.pdf" not in launches[0]["kickoff"]
+    # The text part is the task; the file is named in its own section, by the
+    # stored path — a run never told a file exists cannot read it.
+    kickoff = launches[0]["kickoff"]
+    assert "look at this report" in kickoff
+    assert "## Attached files" in kickoff
+    assert str(home / "attachments" / "conv-att-1" / "report.pdf") in kickoff
 
     assert [r.role for r in rows] == ["user", "file"]
     user, file_row = rows

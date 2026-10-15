@@ -409,9 +409,7 @@ def test_frozen_hits_matches_globs_in_order() -> None:
 # the step that adds it cannot weaken the surface. The exception is pinned by
 # test_pending_frozen_path_is_a_forward_declaration, which also fails once the
 # file lands — so an entry cannot linger here as cover for a stale path.
-_PENDING_FROZEN_PATHS = frozenset({
-    "mini_ork/recovery/escalation_policy.py",
-})
+_PENDING_FROZEN_PATHS: frozenset[str] = frozenset()  # escalation_policy.py landed (SDE-3a)
 
 
 def _matches_in_checkout(root: Path, pattern: str) -> list[str]:
