@@ -3,10 +3,13 @@
 The merge paths will wire ``merge_approval.require(...)`` later; for now this
 is the only place a human acts. The verbs mirror the policy/ledger split:
 
-  ``list [--json]``        pending ``merge:`` rows in the inbox
-  ``show <run_id> [--json]``  ``status()`` for the named run
-  ``approve <run_id> [--head SHA] [--note TEXT]``  resolve the pending row ``approved``
-  ``reject <run_id> --note TEXT``                  resolve the pending row ``rejected``
+  ``list [--json]``        pending ``merge:`` and ``node:`` rows in the inbox
+  ``show <run_id> [--json]``  ``status()`` plus the run's pending node reviews
+  ``approve <run_id> [--head SHA | --node NODE_ID] [--note TEXT]``
+                              resolve the pending row ``approved``
+  ``reject <run_id> (--node NODE_ID)? --note TEXT``
+                              resolve the pending row ``rejected`` (or the
+                              ``request-changes`` alias verb)
   ``policy [--json]``    the loaded ``ReviewPolicy``
 
 Exit codes mirror the rest of the CLI surface: 0 ok, 1 a refused action (an
@@ -27,6 +30,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from mini_ork.gates import node_review
 from mini_ork.gates.merge_approval import (
     ApprovalError,
     approve,
@@ -40,21 +44,23 @@ __all__ = ["main"]
 
 
 _USAGE = """\
-mini-ork approvals — operate the merge-approval ledger.
+mini-ork approvals — operate the merge-approval and node-review ledger.
 
 Usage:
   mini-ork approvals list [--json]
   mini-ork approvals show <run_id> [--json]
-  mini-ork approvals approve <run_id> [--head SHA] [--note TEXT] [--base SHA]
-  mini-ork approvals reject <run_id> --note TEXT
+  mini-ork approvals approve <run_id> [--head SHA | --node NODE_ID]
+                                    [--note TEXT] [--base SHA]
+  mini-ork approvals reject <run_id> [--node NODE_ID] --note TEXT
+  mini-ork approvals request-changes <run_id> [--node NODE_ID] --note TEXT
   mini-ork approvals policy [--json]
 
 Verbs:
-  list       list pending merge:* rows in mo_inbox_gates
-  show       show the latest row for a run
-  approve    resolve a pending row 'approved'
-  reject     resolve a pending row 'rejected'
-  policy     print the resolved ReviewPolicy
+  list             list pending merge:* and node:* rows in mo_inbox_gates
+  show             show the latest merge row, plus pending node reviews
+  approve          resolve a pending row 'approved'
+  reject           resolve a pending row 'rejected' (alias: request-changes)
+  policy           print the resolved ReviewPolicy
 
 All verbs read from $MINI_ORK_HOME (default ./.mini-ork) and $MINI_ORK_DB.
 """
@@ -122,19 +128,44 @@ def _resolve_db_path(db: str | None) -> tuple[str, Path]:
 def _cmd_list(args: argparse.Namespace) -> int:
     db, _home_path = _resolve_db_path(args.db)
     rows = pending(db_path=db)
-    rows = [r for r in rows if (r.get("gate_id") or "").startswith("merge:") and r.get("feature") == "review.before_merge"]
+    merge_rows = [
+        dict(r) for r in rows
+        if (r.get("gate_id") or "").startswith("merge:")
+        and r.get("feature") == "review.before_merge"
+    ]
+    node_rows = [
+        dict(r) for r in rows
+        if (r.get("gate_id") or "").startswith("node:")
+        and r.get("feature") == "review.after_node"
+    ]
+    for r in merge_rows:
+        r.setdefault("context", {}).setdefault("kind", "merge")
+    for r in node_rows:
+        r.setdefault("context", {}).setdefault("kind", "node")
+
     if args.json:
-        sys.stdout.write(json.dumps(rows, indent=2, sort_keys=True) + "\n")
+        # Flat list preserves the existing output contract: callers iterate
+        # ``rows`` and look at ``feature`` / ``context.kind`` to branch.
+        combined = merge_rows + node_rows
+        sys.stdout.write(json.dumps(combined, indent=2, sort_keys=True) + "\n")
         return 0
-    if not rows:
-        sys.stdout.write("no pending merge approvals\n")
+    if not merge_rows and not node_rows:
+        sys.stdout.write("no pending approvals\n")
         return 0
-    for row in rows:
+    for row in merge_rows:
         ctx = row.get("context") or {}
-        run_id = (row.get("gate_id") or "").partition(":")[2]
+        run_id = ctx.get("run_id") or (row.get("gate_id") or "").partition(":")[2]
         sys.stdout.write(
-            f"{row['inbox_id']:<6} {run_id}  head={ctx.get('head_sha', ''):<10} "
-            f"branch={ctx.get('branch', '')}\n"
+            f"{row['inbox_id']:<6} merge  {run_id}  "
+            f"head={ctx.get('head_sha', ''):<10} branch={ctx.get('branch', '')}\n"
+        )
+    for row in node_rows:
+        ctx = row.get("context") or {}
+        run_id = ctx.get("run_id") or (row.get("gate_id") or "").partition(":")[2]
+        sys.stdout.write(
+            f"{row['inbox_id']:<6} node   {run_id}  "
+            f"node={ctx.get('node_id', ''):<20} "
+            f"type={ctx.get('node_type', '')}\n"
         )
     return 0
 
@@ -142,19 +173,52 @@ def _cmd_list(args: argparse.Namespace) -> int:
 def _cmd_show(args: argparse.Namespace) -> int:
     db, _home_path = _resolve_db_path(args.db)
     info = status(args.run_id, db_path=db)
+    node_rows = node_review.pending_for_run(args.run_id, db_path=db)
     if args.json:
-        sys.stdout.write(json.dumps(info, indent=2, sort_keys=True) + "\n")
+        payload = dict(info)
+        payload["nodes"] = node_rows
+        sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
         return 0
     sys.stdout.write(
         f"run_id={args.run_id}  state={info['state']}  "
         f"head_sha={info.get('head_sha', '')}  approver={info.get('approver', '')}  "
         f"inbox_id={info.get('inbox_id')}\n"
     )
+    if node_rows:
+        sys.stdout.write("pending node reviews:\n")
+        for row in node_rows:
+            ctx = row.get("context") or {}
+            sys.stdout.write(
+                f"  inbox_id={row['inbox_id']:<6} node={ctx.get('node_id', ''):<20} "
+                f"type={ctx.get('node_type', '')}\n"
+            )
     return 0
 
 
 def _cmd_approve(args: argparse.Namespace) -> int:
     db, home = _resolve_db_path(args.db)
+    # Node review branch: --node resolves a pending node row, no head/workspace
+    # required. Branch before the head-resolution block so a tmp run dir with
+    # no workspace still works (DoD 9).
+    if args.node:
+        try:
+            inbox_id = node_review.approve_node(
+                args.run_id,
+                args.node,
+                approver=_approver(),
+                note=args.note or "",
+                db_path=db,
+                env=os.environ,
+            )
+        except ApprovalError as exc:
+            sys.stderr.write(f"approvals approve: {exc}\n")
+            return 1
+        sys.stdout.write(
+            f"approved {args.run_id} node={args.node} (inbox_id={inbox_id})\n"
+            f"resume with: mini-ork recover {args.run_id} --strategy resume\n"
+        )
+        return 0
+
     head = args.head or ""
     base = args.base or ""
     if not head:
@@ -191,6 +255,23 @@ def _cmd_reject(args: argparse.Namespace) -> int:
         sys.stderr.write("approvals reject: --note TEXT is required\n")
         return 2
     db, _home = _resolve_db_path(args.db)
+    if args.node:
+        try:
+            inbox_id = node_review.request_changes(
+                args.run_id,
+                args.node,
+                approver=_approver(),
+                note=args.note,
+                db_path=db,
+                env=os.environ,
+            )
+        except ApprovalError as exc:
+            sys.stderr.write(f"approvals reject: {exc}\n")
+            return 1
+        sys.stdout.write(
+            f"rejected {args.run_id} node={args.node} (inbox_id={inbox_id})\n"
+        )
+        return 0
     try:
         inbox_id = reject(
             args.run_id,
@@ -247,13 +328,29 @@ def _build_parser() -> argparse.ArgumentParser:
     p_approve.add_argument("run_id")
     p_approve.add_argument("--head", default="")
     p_approve.add_argument("--base", default="")
+    p_approve.add_argument("--node", default="")
     p_approve.add_argument("--note", default="")
     p_approve.set_defaults(_verb_handler=_cmd_approve)
 
-    p_reject = subs.add_parser("reject", add_help=False, usage=argparse.SUPPRESS)
+    # ``request-changes`` is registered as its own subparser so the
+    # ``--db`` injection loop in ``main`` does not see the same parser
+    # twice (aliases would otherwise add the option string twice and
+    # trigger an ``ArgumentError`` before any verb runs).
+    p_reject = subs.add_parser(
+        "reject", add_help=False, usage=argparse.SUPPRESS
+    )
     p_reject.add_argument("run_id")
     p_reject.add_argument("--note", default="")
+    p_reject.add_argument("--node", default="")
     p_reject.set_defaults(_verb_handler=_cmd_reject)
+
+    p_request = subs.add_parser(
+        "request-changes", add_help=False, usage=argparse.SUPPRESS
+    )
+    p_request.add_argument("run_id")
+    p_request.add_argument("--note", default="")
+    p_request.add_argument("--node", default="")
+    p_request.set_defaults(_verb_handler=_cmd_reject)
 
     p_policy = subs.add_parser("policy", add_help=False, usage=argparse.SUPPRESS)
     p_policy.add_argument("--json", action="store_true")
