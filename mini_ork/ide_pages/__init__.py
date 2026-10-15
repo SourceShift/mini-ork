@@ -35,6 +35,7 @@ PAGES: dict[str, str] = {
     "features": "Features",
     "thread": "Thread",
     "cn_session": "CN session",
+    "cn_file": "CN file",
 }
 
 
