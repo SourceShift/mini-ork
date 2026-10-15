@@ -1,0 +1,44 @@
+# Human-review policy — when a run must pause for a human, and how the
+# approval is verified.
+#
+# Copy to $MINI_ORK_HOME/config/review.yaml. Absent → defaults (review off,
+# tier=simple). All three keys are optional; an empty file uses defaults.
+#
+# Two tiers, same YAML shape:
+#
+#   simple  — required for the simple tier; no signing key needed, the
+#             ledger row's `approver` field carries the human's name.
+#   secure  — every approval is HMAC-signed against MO_REVIEW_SIGNING_KEY.
+#             The key MUST come through the configured vault chain in
+#             `$MINI_ORK_HOME/config/vault.yaml`. The default chain is
+#             `env` then `file`; a secure-tier operator that does not
+#             want the run environment to hold the key should configure
+#             `vault.yaml` with a non-env backend (`sops`, `openbao`,
+#             `command`, …) so the chain's `env` entry is absent.
+#
+# Environment overrides (highest precedence) are read through MiniOrk's
+# `load_policy()` only:
+#
+#   MO_REVIEW_BEFORE_MERGE    "off" | "required"
+#   MO_REVIEW_AFTER_NODES     comma list, or the literal "all" (=every node)
+#   MO_REVIEW_TIER            "simple" | "secure"
+#
+# Inspect the resolved policy with `mini-ork approvals policy`.
+
+review:
+
+  # "off" → human review is never required. "required" → a human must approve
+  # before the run's diff lands. Anything else is a typo that closes the gate.
+  before_merge: required
+
+  # Node types whose output is held for a human reviewer. "*" means every
+  # node. An empty list (the default) means "no per-node gating" — the gate
+  # is purely a before-merge decision.
+  after_nodes:
+    - implementer
+
+  # "simple" → anyone with the CLI can approve; the ledger row's approver
+  # field carries the human's identity. "secure" → every approval is HMAC-
+  # signed against MO_REVIEW_SIGNING_KEY (sourced from the vault, never the
+  # environment).
+  tier: simple

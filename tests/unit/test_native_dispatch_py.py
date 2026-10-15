@@ -44,6 +44,8 @@ def test_all_former_exec_subs_registered_natively():
         "skills",
         "threads",
         "intake",
+        "cn",
+        "approvals",
     }
     assert expected == set(_NATIVE_MODULE_SUBS)
     for sub in expected:
