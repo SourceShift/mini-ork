@@ -34,11 +34,9 @@ from mini_ork.ide_pages import _cn as _cn_section
 _PACK_ROWS = 30
 _PACK_SCAN = 40
 
-# Page tabs. Two legacy tabs ("active", "library") plus a new "search"
-# tab the operator reaches via the IDE sidebar. ``TABS[0][0]`` is the
-# default when the IDE asks for ``tab=None`` (the contract in :func:`S.page`).
-TABS: list[tuple[str, str]] = [("active", "Active"), ("library", "Library"),
-                               ("search", "Search")]
+# ``TABS[0][0]`` is the default when the IDE asks for ``tab=None`` (the
+# contract in :func:`S.page`).
+TABS: list[tuple[str, str]] = [("overview", "Overview"), ("search", "Search")]
 
 # Cache-slot file the ``cn search`` verb writes. The Search tab reads
 # this file directly — never re-hits ContextNest on a render — so the
@@ -1033,9 +1031,6 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     # keeps passing for the default tab.
     if tab == "search":
         return _build_search_tab(home, args)
-    # Legacy tabs ("active", "library", None) all render the default
-    # view; the IDE treats them as equivalents so adding new tabs is
-    # backwards-compatible.
     # The ping action must force a fresh probe, not the cached one —
     # CN_PING_TTL=0 is the env-side knob cn_client honours; the page
     # contributes only the contract.
@@ -1059,11 +1054,6 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     sections += S.guarded(errors, "Context pack", lambda: _context_pack(home))
     sections += S.guarded(errors, "Context reuse (local)", lambda: _local_reuse_section(home))
     sections += S.guarded(errors, "ContextNest LLM cache", lambda: _cn_llm_cache_section(state))
-    # ``tab`` is meaningful now: we ship a TABS tuple so the IDE
-    # renders the search tab. Falls back to the first tab when the
-    # operator picks something we don't know (legacy callers from
-    # before this revision sent ``tab="active"`` or ``tab="library"``
-    # and never any other value).
     active_tab = tab if tab in {k for k, _ in TABS} else TABS[0][0]
     return S.page("context", "Context (ContextNest)",
                   "What each agent is given to read, with the cite tag that put it there.",

@@ -606,9 +606,9 @@ def test_cmd_search_all_projects_in_envelope(
 
 def test_default_tab_does_not_render_search_sections(
         home: Path, _no_cn_calls) -> None:
-    """``tab=None`` (and legacy ``tab="active"`` / ``tab="library"``)
-    render the original view — no Search-tab sections."""
-    for tab in (None, "active", "library"):
+    """``tab=None``, ``tab="overview"`` and an unknown tab render the
+    original view — no Search-tab sections."""
+    for tab in (None, "overview", "unknown"):
         page = context.build(home, tab, {})
         titles = [s["title"] for s in page["sections"]]
         for search_title in ("Search mode", "Search", "Results"):
@@ -628,13 +628,12 @@ def test_default_tab_keeps_existing_sections(
 
 def test_default_tab_has_no_tabs_set_on_page(
         home: Path, _no_cn_calls) -> None:
-    """Default tab carries the tab list (the IDE renders them).
-    The TABS tuple lists active/library/search."""
+    """Default tab carries the tab list (the IDE renders them)."""
     page = context.build(home, None, {})
     assert isinstance(page.get("tabs"), list)
     keys = [t["key"] for t in page["tabs"]]
-    assert keys == ["active", "library", "search"]
-    assert page["tab"] == "active"
+    assert keys == ["overview", "search"]
+    assert page["tab"] == "overview"
 
 
 # ── 6. Page — Search tab empty state ─────────────────────────────────────
