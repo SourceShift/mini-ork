@@ -355,3 +355,32 @@ def test_the_structural_guard_catches_a_real_offender(tmp_path):
 def test_resolver_recognises_every_manager_it_claims(tmp_path, manager):
     _write(tmp_path, "package.json", json.dumps({"packageManager": f"{manager}@1.0.0"}))
     assert pm.declared_manager(str(tmp_path)) == manager
+
+
+_ESLINT8 = ("#!/bin/sh\n"
+            "for f in \"$@\"; do\n"
+            "  [ -e \"$f\" ] || { echo \"No files matching the pattern \\\"$f\\\" were found.\"; exit 2; }\n"
+            "done\n"
+            ": > \"$(dirname \"$0\")/../../eslint-was-run\"\n"
+            "exit 0\n")
+
+
+def test_tier1_does_not_hand_a_deleted_file_to_eslint(tmp_path):
+    """2026-10-15 m3a-run-log-reader-removal: a removal lists the deleted file in
+    touched_files; ESLint 8 aborts with exit 2 on a path that does not exist, so
+    the deliverable could never pass tier1 and its revise round could not help."""
+    repo, run_dir = _build_fixture(tmp_path)
+    _stub(repo / "node_modules" / ".bin" / "eslint", _ESLINT8)
+    (run_dir / "implementer-summary.json").write_text(json.dumps({
+        "ready_for_tier1": True,
+        "touched_files": ["src/a.ts", "src/removed.test.ts"],
+    }), encoding="utf-8")
+
+    rc, payload, evidence = _run_verifier(repo, run_dir)
+
+    assert payload["lint_rc"] == 0, evidence
+    assert payload["pass"] is True, evidence
+    assert rc == 0
+    assert (repo / "eslint-was-run").is_file(), evidence
+    assert "deleted_files=1" in evidence
+    assert "deleted: src/removed.test.ts" in evidence
