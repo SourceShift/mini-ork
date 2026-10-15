@@ -55,6 +55,7 @@ __all__ = [
     "ProviderUnavailableError",
     "acquire_run_node",
     "attach_run_node",
+    "clear_stale_run_lock",
     "get_node_provider",
     "known_node_providers",
     "node_record_path",
@@ -361,6 +362,33 @@ def release_run_node(run_dir: str | os.PathLike[str], env: Mapping[str, str]) ->
         node_record_path(run_dir).unlink(missing_ok=True)
     except OSError:
         pass
+    return True
+
+
+def clear_stale_run_lock(run_dir: str | os.PathLike[str]) -> bool:
+    """Drop ``<run_dir>/.node-provider.lock`` once the run is provably terminal.
+
+    The lock is only a rendezvous: every process of a run opens the same file to
+    serialize provisioning (:class:`_RunLock`), and the ``flock`` — not the
+    file — is what excludes. A run that ends without removing it therefore
+    leaves a 0-byte artefact in its run dir, which the 48h failure triage found
+    sitting next to dead runs (§8.3) and which the next reader has to reason
+    about.
+
+    Deliberately NOT called from ``_RunLock.__exit__``: releasing the ``flock``
+    there is enough, and unlinking the path would hand a peer that is already
+    waiting a lock on a *fresh* inode while the exiting process still holds the
+    old one — two owners of one run's node. Only a terminal-state teardown may
+    call this: the run's own process after it wrote a terminal status, or the
+    reaper for a run whose owner provably died.
+
+    Best-effort — teardown must not fail because of a lock file. Returns
+    ``True`` when a file was removed.
+    """
+    try:
+        (Path(run_dir) / _LOCK_NAME).unlink()
+    except OSError:   # a missing lock is the normal case, not an error
+        return False
     return True
 
 

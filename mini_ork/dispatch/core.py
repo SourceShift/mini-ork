@@ -355,6 +355,111 @@ def _feed_stdin(proc: "subprocess.Popen[str]", stdin: str) -> None:
         pass
 
 
+# ── prompt-text host paths (remote-nodes-14 / D6, remote-early-death) ───────
+#
+# argv and env are strings the child RESOLVES, so a host path there must stay
+# fatal. Prompt text is prose the child READS — a recipe prompt that names a
+# host file outside the run's four roots is a documentation leak, not a broken
+# path, and killing the dispatch over it is what ended run-1791911811-5826
+# before its node ever booted (48h triage §8.1: the context pack named the
+# kickoff file, which sits under no shipped root and so had no translation).
+
+# Sandbox-safe stand-in for such a token. It is an ordinary ``/workspace/…``
+# path so the child reads a plausible path, and it carries no host prefix
+# component (``/home``, ``/Users``, …) that could re-trip the leak check.
+_UNMAPPED_PATH_PLACEHOLDER = "/workspace/unshared-host-path"
+# Characters that end a path token in prose: whitespace, quotes, brackets and
+# the punctuation that normally follows a path in a sentence.
+_PATH_TOKEN_END = frozenset(" \t\r\n\"'`()[]{}<>,;|")
+# The same boundary rule the leak check applies (``PathMap._contains_path_token``):
+# a prefix is a token only when it starts and ends at one of these.
+_PATH_BOUNDARY = ("/", ":", " ", "\t", "\n")
+
+
+def _is_path_token(value: str, start: int, prefix: str) -> bool:
+    end = start + len(prefix)
+    preceded = start == 0 or value[start - 1] in _PATH_BOUNDARY
+    followed = end == len(value) or value[end] in _PATH_BOUNDARY
+    return preceded and followed
+
+
+def _path_token_spans(value: str, prefix: str) -> list[tuple[int, int]]:
+    """``(start, end)`` of every ``prefix`` token in ``value``.
+
+    ``end`` covers the whole path token (up to the next delimiter) so a
+    replacement drops the entire path, not just its prefix."""
+    spans: list[tuple[int, int]] = []
+    idx = value.find(prefix)
+    while idx >= 0:
+        if _is_path_token(value, idx, prefix):
+            end = idx + len(prefix)
+            while end < len(value) and value[end] not in _PATH_TOKEN_END:
+                end += 1
+            spans.append((idx, end))
+            idx = value.find(prefix, end)
+        else:
+            idx = value.find(prefix, idx + 1)
+    return spans
+
+
+def _rewrite_path_tokens(value: str, prefix: str, placeholder: str) -> tuple[str, list[str]]:
+    """Replace every ``prefix`` token in ``value`` with ``placeholder``.
+
+    Whole-token replacement is load-bearing: rewriting only the prefix would turn
+    ``/Volumes/Users/x`` into ``<placeholder>/Users/x`` and re-leak on the very
+    next check. Returns the rewritten text and the tokens it replaced (the WARN
+    names them)."""
+    spans = _path_token_spans(value, prefix)
+    if not spans:
+        return value, []
+    out, cursor = [], 0
+    for start, end in spans:
+        out.append(value[cursor:start])
+        out.append(placeholder)
+        cursor = end
+    out.append(value[cursor:])
+    return "".join(out), [value[s:e] for s, e in spans]
+
+
+def _sanitize_prompt_host_paths(text: str, path_map: object) -> str:
+    """Rewrite residual *unmapped* host path tokens in prompt text.
+
+    Called only when the leak check has already failed on the text channel. Every
+    token under a forbidden prefix the map does NOT know (``DEFAULT_FORBIDDEN``
+    minus ``path_map.host_roots()``) is rewritten to
+    :data:`_UNMAPPED_PATH_PLACEHOLDER` and one WARN names the tokens and the
+    ``text`` channel, so the leak stays visible in the run log.
+
+    A token under a root the map DOES know still raises — that one is a real
+    translation bug, and papering over it would hide exactly what the check
+    exists for. The caller keeps argv/env fail-closed and re-runs the check on
+    the rewritten text, so a rewrite that does not fully clean the prompt is
+    fatal rather than merely unhelpful.
+    """
+    import logging
+
+    from mini_ork.runtime.path_map import DEFAULT_FORBIDDEN, UnmappedHostPathError
+
+    mapped = [root for root in path_map.host_roots() if root]
+    for root in mapped:
+        if _path_token_spans(text, root):
+            raise UnmappedHostPathError("text", text, tuple(mapped))
+    cleaned, replaced = text, []
+    for prefix in sorted({p for p in DEFAULT_FORBIDDEN if p} - set(mapped),
+                         key=len, reverse=True):
+        cleaned, tokens = _rewrite_path_tokens(cleaned, prefix, _UNMAPPED_PATH_PLACEHOLDER)
+        replaced.extend(tokens)
+    if not replaced:
+        # Nothing here is ours to rewrite; the caller's check was right.
+        raise UnmappedHostPathError("text", text, tuple(mapped))
+    logging.getLogger("mini_ork.dispatch").warning(
+        "host path in %s survives translation to remote backend: %r; rewrote the "
+        "unmapped host path token(s) to %s",
+        "text", replaced, _UNMAPPED_PATH_PLACEHOLDER,
+    )
+    return cleaned
+
+
 def _spawn_in_workspace(
     backend: str,
     argv: Sequence[str],
@@ -382,11 +487,15 @@ def _spawn_in_workspace(
 
     ``path_map`` (D4 / remote-nodes-03): when supplied, translate argv, env
     values, cwd, and stdin via the map BEFORE handing to ``ws.spawn``, then
-    assert no host prefixes survive. Under the ``remote`` backend a leak
-    raises (``UnmappedHostPathError``); under ``docker``/``local``/
-    ``microvm`` a leak logs a WARN per value so existing docker users stay
-    unbroken. The map applies here, and ONLY here, so the on-disk record in
-    ``runs/<id>/agent-<node>.prompt.json`` stays host-readable.
+    assert no host prefixes survive. Under the ``remote`` backend a leak on
+    argv/env raises (``UnmappedHostPathError``) — the child resolves those, so a
+    host path there is fatal — while a leak in the prompt TEXT is sanitized to
+    :data:`_UNMAPPED_PATH_PLACEHOLDER` with a WARN
+    (:func:`_sanitize_prompt_host_paths`); a text token under a mapped root still
+    raises. Under ``docker``/``local``/``microvm`` every leak logs a WARN per
+    value so existing docker users stay unbroken. The map applies here, and ONLY
+    here, so the on-disk record in ``runs/<id>/agent-<node>.prompt.json`` stays
+    host-readable.
     """
     from mini_ork.runtime.agent_workspace import resolve_spawn_workspace
     from mini_ork.runtime.path_map import UnmappedHostPathError
@@ -437,9 +546,25 @@ def _spawn_in_workspace(
                 # A real remote sandbox is expected to have every path
                 # translated; a leak means a host prefix slipped through and
                 # the child would point at a file that does not exist there.
-                path_map.assert_no_host_paths(
-                    argv=applied_argv, env=applied_env, text=applied_stdin
-                )
+                # argv/env stay fatal (the child resolves those). PROMPT TEXT is
+                # prose: an out-of-root host path quoted inside it is sanitized
+                # to a neutral sandbox path with a WARN, instead of ending the
+                # dispatch — that failure (run-1791911811-5826) killed the run
+                # before its node ever booted. A mapped-root survivor in the
+                # text is still a real translation bug and still raises.
+                try:
+                    path_map.assert_no_host_paths(
+                        argv=applied_argv, env=applied_env, text=applied_stdin
+                    )
+                except UnmappedHostPathError as exc:
+                    if exc.channel != "text":
+                        raise
+                    applied_stdin = _sanitize_prompt_host_paths(applied_stdin, path_map)
+                    # Re-check the sanitized text: whatever still leaks has no
+                    # safe rewrite and stays fatal.
+                    path_map.assert_no_host_paths(
+                        argv=applied_argv, env=applied_env, text=applied_stdin
+                    )
             else:
                 # docker/local/microvm — log + continue so existing users
                 # aren't silently broken by the new check. A WARN per leaked

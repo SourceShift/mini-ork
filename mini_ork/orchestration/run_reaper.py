@@ -34,6 +34,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from mini_ork.remote.providers.base import clear_stale_run_lock
+
 TERMINAL = frozenset({"published", "failed", "rolled_back"})
 PID_FILE = ".pid"
 # A process that started after its .pid was written is a different process
@@ -98,6 +100,92 @@ def _has_unanswered_ask(run_dir: Path) -> bool:
     return False
 
 
+# ── failure reason (derived from the run dir when the vocabulary has nothing) ─
+
+# A derived note is one line of the artefact; it rides in a notes column read by
+# humans and the IDE, so a whole repair log is never the answer.
+_MAX_DERIVED_NOTE = 400
+_FAILURE_WORD = re.compile(r"(?i)\b(?:fail|failed|fails|failure|error|crash|crashed)\b")
+_REPAIR_FAILED_STEP = re.compile(r"^step\s+\d+:.*\bfailed:", re.IGNORECASE)
+
+
+def _clip(line: str) -> str:
+    """One bounded, single-line note."""
+    line = line.strip()
+    return line if len(line) <= _MAX_DERIVED_NOTE else line[: _MAX_DERIVED_NOTE - 1] + "…"
+
+
+def _needs_change_note(run_dir: Path) -> str:
+    """The first failure line of ``NEEDS-CHANGE.md`` — the gate's own prose.
+
+    Headings and blank lines are skipped, and a line that reports a failure wins
+    over the first line of prose; the first remaining line is the fallback (a
+    file that names its failure without the word "failed" still says more than
+    the caller's fixed vocabulary does)."""
+    try:
+        text = (run_dir / "NEEDS-CHANGE.md").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    lines = [ln.strip() for ln in text.splitlines()
+             if ln.strip() and not ln.lstrip().startswith("#")]
+    for line in lines:
+        if _FAILURE_WORD.search(line):
+            return _clip(line)
+    return _clip(lines[0]) if lines else ""
+
+
+def _retry_hint_note(run_dir: Path) -> str:
+    """``retry-hint.json``'s ``detail`` — why the lane could not be retried."""
+    try:
+        data = json.loads((run_dir / "retry-hint.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    detail = data.get("detail") if isinstance(data, dict) else None
+    return _clip(detail) if isinstance(detail, str) and detail.strip() else ""
+
+
+def _repair_log_note(run_dir: Path) -> str:
+    """The first ``step N: … failed:`` line across ``repair-*.log``."""
+    for path in sorted(run_dir.glob("repair-*.log")):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for raw in text.splitlines():
+            line = raw.strip()
+            if _REPAIR_FAILED_STEP.match(line):
+                return _clip(line)
+    return ""
+
+
+def _derive_failure_note(run_dir: Path) -> str:
+    """A specific terminal-failure reason from the run dir's own artefacts.
+
+    The fixed vocabulary says a run ended without a verdict; it cannot say *why*
+    — and a run that died on a lane crash left the reason in its run dir all
+    along (NEEDS-CHANGE.md, the retry hint, the repair log). Ordered by
+    specificity: the gate's verdict prose, then the lane's retry detail, then the
+    first failed repair step.
+
+    Best-effort by contract: teardown must never raise because an artefact is
+    missing, unreadable, or malformed — an unreadable source falls through to the
+    next one, and no source at all returns ``""``.
+    """
+    return (_needs_change_note(run_dir) or _retry_hint_note(run_dir)
+            or _repair_log_note(run_dir))
+
+
+def _terminal_failure_notes(run_dir: Path, vocabulary: str, existing: str | None) -> str:
+    """What to append to ``notes`` for a terminal failure.
+
+    The vocabulary line plus the derived reason, ``"; "``-joined, each dropped
+    when the row already carries it so a re-closed run never says the same thing
+    twice. ``""`` means "leave the notes column as it is"."""
+    already = existing or ""
+    pieces = [vocabulary, _derive_failure_note(run_dir)]
+    return "; ".join(p for p in pieces if p and p not in already)
+
+
 # ── owner record (written by the run's own process) ─────────────────────────
 
 def claim_pid_file(run_dir: Path) -> Path:
@@ -155,6 +243,17 @@ def close_run_record(db_path: str | Path, run_id: str, run_dir: Path, *,
     its ``reviewing`` status too (kickoff hr-exec-park): the executor parked it
     for a person, ``.review-pause`` is the marker, and rewriting it to
     ``failed`` here would undo the gate's hand-off.
+
+    The failure note is the fixed vocabulary line *plus* whatever the run dir
+    says specifically (:func:`_derive_failure_note`) — §8.1 of the 48h triage:
+    run-1791911811-5826 died on a lane crash and recorded no reason at all.
+
+    Reaching a terminal status also clears the run's stale
+    ``.node-provider.lock`` (:func:`clear_stale_run_lock`) — including when the
+    row is ALREADY terminal on entry, because the publisher writes that status
+    mid-workflow and this call is the only teardown a published run gets: the
+    run is over either way, and the next reader must not find a provision lock
+    nothing holds.
     """
     if not run_id or (run_dir / ".cost-pause").exists():
         return None
@@ -164,8 +263,18 @@ def close_run_record(db_path: str | Path, run_id: str, run_dir: Path, *,
     con = sqlite3.connect(str(db_path), timeout=15.0)
     try:
         con.execute("PRAGMA busy_timeout = 15000")
-        row = con.execute("SELECT status FROM task_runs WHERE id = ?", (run_id,)).fetchone()
-        if row is None or row[0] in TERMINAL:
+        row = con.execute("SELECT status, notes FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        if row is None:
+            return None
+        if row[0] in TERMINAL:
+            # Terminal, but not by us: the publisher writes 'published' (or
+            # 'failed' on abstain) mid-workflow, BEFORE the executor's ``finally``
+            # reaches this call — and reap() only ever visits non-terminal rows,
+            # so nothing later compensates. The run is provably over either way,
+            # so its provisioning lock must not outlive it (AC3), exactly as on
+            # the terminal transitions below. A missing row stays untouched:
+            # there is no run whose lock this could be.
+            clear_stale_run_lock(run_dir)
             return None
         # Human-review-paused: the executor parked it and set ``reviewing``;
         # ``mini-ork approvals`` is the next move, so the status stays. The
@@ -179,6 +288,9 @@ def close_run_record(db_path: str | Path, run_id: str, run_dir: Path, *,
             con.close()
             done = finalize_passed(db_path, run_id, "lifecycle: passed; the workflow wrote no terminal status "
                                    "(no publish step ran)", now=now)
+            # ``finalize_passed`` only ever moves a non-terminal row, so the run
+            # is terminal now either way — no lock may outlive it.
+            clear_stale_run_lock(run_dir)
             return row[0] if done else None
         if _verdict_passed(run_dir) and not crashed and rc is None:
             return None  # outcome unknown: never fail finished work (bf2805dd)
@@ -190,8 +302,14 @@ def close_run_record(db_path: str | Path, run_id: str, run_dir: Path, *,
             note = "deadline hit before a verdict"
         else:
             note = "lifecycle exited without a verdict"
+        note = _terminal_failure_notes(run_dir, note, row[1])
         changed = _mark_failed(con, run_id, row[0], None, "CRASH" if crashed else None,
                                note, ended_at=now, now=now)
+        if changed:
+            # Terminal transition this process performed: drop the run's stale
+            # provision lock. Not on the ``not changed`` path — there the row
+            # moved on to something we cannot claim is terminal.
+            clear_stale_run_lock(run_dir)
         return row[0] if changed else None
     finally:
         con.close()
@@ -267,18 +385,23 @@ def _last_activity(con: sqlite3.Connection, run_id: str, updated_at: int) -> int
 
 def _mark_failed(con: sqlite3.Connection, run_id: str, status: str, updated_at: int | None,
                  verdict: str | None, note: str, *, ended_at: int, now: int) -> bool:
-    """``failed`` only if the row is still exactly as it was read (compare-and-set)."""
+    """``failed`` only if the row is still exactly as it was read (compare-and-set).
+
+    ``note`` is appended (``"; "``-joined, append-only); an EMPTY note leaves the
+    column untouched, which is how a caller says "the row already carries this
+    reason" without writing a stray separator."""
     guard, params = "", ()
     if updated_at is not None:
         guard, params = " AND updated_at = ?", (updated_at,)
     cur = con.execute(
         "UPDATE task_runs SET status = 'failed', verdict = COALESCE(verdict, ?), "
-        "notes = COALESCE(notes || '; ', '') || ?, updated_at = ?, "
+        "notes = CASE WHEN ? = '' THEN notes ELSE COALESCE(notes || '; ', '') || ? END, "
+        "updated_at = ?, "
         "ended_at = COALESCE(ended_at, ?), "
         "duration_ms = CASE WHEN COALESCE(duration_ms, 0) = 0 "
         "THEN MAX(COALESCE(ended_at, ?) - created_at, 0) * 1000 ELSE duration_ms END "
         f"WHERE id = ? AND status = ?{guard}",
-        (verdict, note, now, ended_at, ended_at, run_id, status, *params))
+        (verdict, note, note, now, ended_at, ended_at, run_id, status, *params))
     con.commit()
     return cur.rowcount == 1
 
@@ -329,6 +452,9 @@ def reap(home: Path, *, dry_run: bool = False, stale_after: int | None = None,
                 _close_dangling_node_events(db_for(home), run_id)
                 if found.verdict == "dead":
                     (run_dir / PID_FILE).unlink(missing_ok=True)
+                # The row is terminal now: no provision lock may outlive the run
+                # whose owner died (§8.3's 0-byte locks sat in exactly these dirs).
+                clear_stale_run_lock(run_dir)
             reaped.append(entry)
     finally:
         con.close()

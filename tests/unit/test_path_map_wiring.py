@@ -7,6 +7,7 @@ because the first cut shipped all of them gated on a ``request.path_map`` that
 nothing ever set.
 """
 import json
+import logging
 import os
 import sys
 
@@ -40,7 +41,7 @@ class _Recorder:
     def down(self):
         pass
 
-    def spawn(self, argv, *, stdin, timeout, env, cwd):
+    def spawn(self, argv, *, stdin, timeout, env, cwd, **kw):
         self.spawned = {"argv": list(argv), "stdin": stdin, "env": dict(env), "cwd": cwd}
         return 0, '{"result": "ok", "usage": {}}', ""
 
@@ -53,6 +54,17 @@ def recorder(monkeypatch):
     monkeypatch.setattr(core, "context_env_snapshot", lambda: {})
     yield rec
     sandbox._WORKSPACE_BACKENDS.pop("fake-pm", None)
+
+
+@pytest.fixture
+def remote_recorder(monkeypatch):
+    """Same double, resolved for the ``remote`` backend (a registered factory
+    wins over the lazily-imported real one, so no node is ever contacted)."""
+    rec = _Recorder()
+    sandbox.register_workspace_backend("remote", lambda **_kw: rec)
+    monkeypatch.setattr(core, "context_env_snapshot", lambda: {})
+    yield rec
+    sandbox._WORKSPACE_BACKENDS.pop("remote", None)
 
 
 def _all_strings(spawned):
@@ -89,14 +101,35 @@ def test_isolated_dispatch_translates_every_channel(roots, recorder, tmp_path):
     assert not [v for v in _all_strings(s) if host in v], "a host path reached the sandbox"
 
 
-def test_remote_leak_raises_naming_the_channel(roots, recorder):
-    with pytest.raises(UnmappedHostPathError) as exc:
+def test_remote_text_leak_is_rewritten_and_warned(roots, remote_recorder, caplog):
+    """remote-early-death-hardening AC1 changed this seam's contract: a host path
+    in the PROMPT TEXT is prose — it is rewritten to a sandbox-safe placeholder
+    and reported, not fatal (the fatal text leak ended run-1791911811-5826 before
+    its node ever booted). The leak check itself is still what fires."""
+    prompt = "also read /Users/someone/notes.md"
+    with caplog.at_level(logging.WARNING):
         dispatch(
-            DispatchRequest(model="test", prompt="also read /Users/someone/notes.md",
-                            workspace="remote", cwd=roots.target, path_map=PathMap.from_roots(roots)),
+            DispatchRequest(model="test", prompt=prompt, workspace="remote",
+                            cwd=roots.target, path_map=PathMap.from_roots(roots)),
             ["claude"], parse_text=lambda out: out,
         )
-    assert exc.value.channel == "text"
+    sent = remote_recorder.spawned["stdin"]
+    assert "/Users/someone/notes.md" not in sent and "/Users" not in sent
+    warned = [r.getMessage() for r in caplog.records
+              if r.levelno >= logging.WARNING and r.name == "mini_ork.dispatch"]
+    assert [m for m in warned if "/Users/someone/notes.md" in m and "text" in m], warned
+
+
+def test_remote_argv_leak_still_raises_naming_the_channel(roots, remote_recorder):
+    """argv is resolved by the child, so the fail-closed channel is unchanged."""
+    with pytest.raises(UnmappedHostPathError) as exc:
+        dispatch(
+            DispatchRequest(model="test", prompt="p", workspace="remote",
+                            cwd=roots.target, path_map=PathMap.from_roots(roots)),
+            ["claude", "--read", "/Users/someone/notes.md"], parse_text=lambda out: out,
+        )
+    assert exc.value.channel == "argv"
+    assert remote_recorder.spawned is None
 
 
 def test_remote_without_a_path_map_refuses(recorder):
