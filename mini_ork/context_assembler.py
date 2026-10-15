@@ -26,6 +26,7 @@ import sys
 import time
 
 from mini_ork.context import context_env
+from mini_ork.learning import themes
 from mini_ork.similarity import rank_raw
 
 FRAMEWORK_INTERNAL_PREFIXES = (
@@ -545,12 +546,18 @@ def failure_modes_md(task_class: str, limit: int = 5, db: str | None = None,
 
 def _verified_theme_lessons(dbp: str, task_class: str, limit: int,
                             sources: list[dict] | None = None) -> str:
-    """Verified theme lessons for ``task_class``; '' when there are none.
+    """Induced theme lessons for ``task_class``; '' when there are none.
+
+    Selection is delegated to ``themes.select_verified_themes`` — the same
+    selector ``context_v2.verified_themes`` uses — so both readers agree on
+    which themes a run sees and in what order: own task class first, then a
+    class that is one member of a comma-joined set, then the legacy ``'*'``
+    wildcard only for leftover slots.
 
     A row counts as verified when it carries ``status='verified'``, is a
     ``kind='task'`` theme, has a non-blank authored ``lesson_text`` (written
-    by grounded pattern induction, never invented here), and matches the task
-    class or the wildcard ``'*'``. Strongest first: ``n_runs`` then recency.
+    by grounded pattern induction, never invented here), and has a non-NULL
+    ``task_class``.
 
     Cold-safe by construction: missing table or columns is no section and no
     error — this runs on the prompt-injection path, where a raise would abort
@@ -561,27 +568,21 @@ def _verified_theme_lessons(dbp: str, task_class: str, limit: int,
     con = sqlite3.connect(dbp)
     con.execute("PRAGMA busy_timeout=5000")
     try:
-        rows = con.execute("""
-            SELECT theme_id, lesson_text, n_runs
-            FROM lesson_themes
-            WHERE status = 'verified' AND kind = 'task'
-              AND lesson_text IS NOT NULL AND TRIM(lesson_text) <> ''
-              AND (task_class = ? OR task_class = '*')
-            ORDER BY n_runs DESC, last_seen DESC LIMIT ?
-        """, (task_class, limit)).fetchall()
-    except sqlite3.OperationalError:
-        return ""
+        rows = themes.select_verified_themes(con, task_class, int(limit))
     finally:
         con.close()
     if not rows:
         return ""
-    out = [f"--- Verified lessons from prior runs ({task_class}) ---"]
-    for theme_id, lesson_text, n_runs in rows:
-        out.append(f"- {lesson_text.strip()}  (seen in {n_runs} runs)")
+    out = [
+        f"--- Lessons induced from prior runs ({task_class}; "
+        f"guardrail-checked, effect not yet measured) ---"
+    ]
+    for row in rows:
+        out.append(f"- {row['lesson_text']}  (seen in {row['n_runs']} runs)")
         if sources is not None:
-            sources.append({"kind": "theme", "id": theme_id,
-                            "text": lesson_text})
-    out.append("--- /verified lessons ---")
+            sources.append({"kind": "theme", "id": row["theme_id"],
+                            "text": row["lesson_text"]})
+    out.append("--- /induced lessons ---")
     return "\n".join(out)
 
 

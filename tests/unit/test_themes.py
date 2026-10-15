@@ -602,6 +602,112 @@ def test_assign_new_works_on_db_without_migration(tmp_path: Path) -> None:
     assert report == {"assigned": 0, "themes_new": 0, "themes_total": 0}
 
 
+# ── member-class task_class (LF-R1) ─────────────────────────────────────────
+
+
+def _seed_theme_members(db: str, theme_id: str, *, task_class: str | None,
+                        member_classes: list[str], n_runs: int = 5) -> None:
+    """One ``lesson_themes`` row plus one gradient per member class."""
+    th.ensure_schema(db)
+    con = sqlite3.connect(db)
+    con.row_factory = sqlite3.Row
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS gradient_records ("
+        " gradient_id TEXT PRIMARY KEY, target TEXT NOT NULL,"
+        " signal TEXT NOT NULL, suggested_change TEXT NOT NULL,"
+        " evidence TEXT NOT NULL, confidence REAL NOT NULL DEFAULT 0.0,"
+        " created_at INTEGER NOT NULL, task_class TEXT)"
+    )
+    con.execute(
+        "INSERT INTO lesson_themes (theme_id, kind, task_class, representative,"
+        " centroid, n_gradients, n_runs, first_seen, last_seen, lesson_text,"
+        " status) VALUES (?, 'task', ?, 'rep', ?, ?, ?, 1, 1, 'a lesson',"
+        " 'verified')",
+        (theme_id, task_class, th._centroid_to_blob({}), len(member_classes),
+         n_runs),
+    )
+    for i, cls in enumerate(member_classes):
+        gid = f"{theme_id}-g{i}"
+        con.execute(
+            "INSERT INTO gradient_records (gradient_id, target, signal,"
+            " suggested_change, evidence, confidence, created_at, task_class)"
+            " VALUES (?, 'workflow.node.researcher', ?, 'change', ?, 0.5, 1, ?)",
+            (gid, f"signal prose number {i} for {cls}", f"tr-{gid}", cls),
+        )
+        con.execute(
+            "INSERT INTO gradient_theme (gradient_id, theme_id, similarity)"
+            " VALUES (?, ?, 1.0)",
+            (gid, theme_id),
+        )
+    con.commit()
+    con.close()
+
+
+def _refresh(con: sqlite3.Connection, theme_id: str, n_members: int) -> None:
+    con.row_factory = sqlite3.Row
+    t = {
+        "theme_id": theme_id, "kind": "task", "centroid": {}, "n": n_members,
+        "n_at_refresh": 0, "representative": "", "first_seen": 0,
+        "last_seen": 0, "role": None, "task_class": "*",
+    }
+    th._refresh_theme(con, t, {}, 1700000000, 0.0)
+    con.commit()
+
+
+def _task_class_of(db: str, theme_id: str) -> str | None:
+    con = sqlite3.connect(db)
+    try:
+        row = con.execute(
+            "SELECT task_class FROM lesson_themes WHERE theme_id = ?",
+            (theme_id,),
+        ).fetchone()
+    finally:
+        con.close()
+    return row[0] if row else "<missing>"
+
+
+def test_refresh_theme_writes_member_class_pair_not_null(db: str) -> None:
+    """A two-class theme writes the sorted pair, not NULL (LF-R1: the old shape
+    wrote NULL for exactly two classes, so those themes could never inject)."""
+    _seed_theme_members(db, "th-two", task_class="*",
+                        member_classes=["framework_edit", "code_fix"])
+    con = sqlite3.connect(db)
+    try:
+        _refresh(con, "th-two", 2)
+    finally:
+        con.close()
+    assert _task_class_of(db, "th-two") == "code_fix,framework_edit"
+
+
+def test_refresh_theme_never_writes_star(db: str) -> None:
+    """Three classes -> the sorted triple; no member class -> NULL."""
+    _seed_theme_members(
+        db, "th-three", task_class="*",
+        member_classes=["framework_edit", "chapter_review", "code_fix"])
+    _seed_theme_members(db, "th-none", task_class="*", member_classes=[])
+    con = sqlite3.connect(db)
+    try:
+        _refresh(con, "th-three", 3)
+        _refresh(con, "th-none", 0)
+    finally:
+        con.close()
+    assert _task_class_of(db, "th-three") == (
+        "chapter_review,code_fix,framework_edit")
+    assert _task_class_of(db, "th-none") is None
+
+
+def test_reclassify_idempotent_and_cold_safe(tmp_path: Path) -> None:
+    """reclassify_themes repairs legacy NULL/'*' rows, is idempotent, and a
+    missing DB is 0 (never raises)."""
+    path = str(tmp_path / "legacy.db")
+    _seed_theme_members(path, "th-legacy", task_class="*",
+                        member_classes=["framework_edit", "code_fix"])
+    assert th.reclassify_themes(path) == 1
+    assert _task_class_of(path, "th-legacy") == "code_fix,framework_edit"
+    assert th.reclassify_themes(path) == 0
+    assert th.reclassify_themes(str(tmp_path / "missing.db")) == 0
+
+
 # ── backfill dry-run ────────────────────────────────────────────────────────
 
 

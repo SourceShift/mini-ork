@@ -76,8 +76,10 @@ __all__ = [
     "ensure_schema",
     "normalize",
     "promote",
+    "reclassify_themes",
     "role_of",
     "rollup_framework_bugs",
+    "select_verified_themes",
     "stats",
 ]
 
@@ -633,9 +635,19 @@ def assign_new(db_path: str | None = None, sim: float | None = None) -> dict:
     db_path = _resolve_db_path(db_path)
     con = _connect(db_path)
     try:
-        return _assign_new(con, sim)
+        report = _assign_new(con, sim)
     finally:
         con.close()
+    # Repair untouched legacy themes (``task_class`` still NULL or the old
+    # ``'*'``) into member-class sets, so the shared reader can serve the 32
+    # verified two-class themes a class-exact query used to miss. Fail-soft:
+    # a missing table or a locked DB must never break the assigner's report,
+    # and the fast empty-call path stays cheap (no stale rows -> 0).
+    try:
+        reclassify_themes(db_path)
+    except Exception:
+        pass
+    return report
 
 
 def _assign_new(con: sqlite3.Connection, sim: float | None = None) -> dict:
@@ -878,10 +890,14 @@ def _refresh_theme(
     )
     classes = _member_classes_con(con, tid)
     n_runs = _distinct_runs_con(con, member_ids)
-    task_class = (
-        next(iter(classes)) if len(classes) == 1
-        else ("*" if len(classes) >= 3 else None)
-    )
+    # A theme's ``task_class`` is its member-class set: the single class when
+    # there is one, otherwise the sorted classes joined by ``,``
+    # (``code_fix,framework_edit``). The old shape wrote ``'*'`` for a theme
+    # seen in >= 3 classes and NULL for exactly two, which made two-class
+    # themes unreadable by a class-exact reader and hid a three-class theme
+    # behind a wildcard. No member class -> NULL, as today. ``'*'`` is
+    # legacy-only and is never written here.
+    task_class = ",".join(sorted(classes)) if classes else None
 
     n = t["n"]
     at_refresh = t["n_at_refresh"] or 0
@@ -914,6 +930,170 @@ def _refresh_theme(
     t["representative"] = representative
     t["centroid"] = centroid
     t["n_at_refresh"] = at_refresh
+
+
+# ── Task-class repair + shared verified-theme selector ──────────────────────
+
+
+def _member_class_value(con: sqlite3.Connection, theme_id: str) -> str | None:
+    """The stored ``task_class`` value for ``theme_id``: the sorted member-class
+    set joined by ``,``, or NULL when the theme has no member class."""
+    classes = _member_classes_con(con, theme_id)
+    return ",".join(sorted(classes)) if classes else None
+
+
+def reclassify_themes(db: str | os.PathLike[str] | None = None) -> int:
+    """Repair legacy ``task_class`` values into member-class sets.
+
+    Every ``kind='task'`` theme whose ``task_class`` is NULL or the legacy
+    wildcard ``'*'`` is recomputed from ``_member_classes_con`` — the same rule
+    ``_refresh_theme`` now writes — and updated in place. Returns how many rows
+    actually changed (a NULL row with no member class stays NULL and does not
+    count).
+
+    Idempotent: after one pass no row has a NULL-or-``'*'`` value that differs
+    from its computed set, so a second call returns 0. Cold-safe: a missing DB
+    or a DB without the theme tables is 0, never a raise — this runs at the
+    tail of ``assign_new`` on the reflect path, where an exception would break
+    the assigner's report. The stored ``status`` column is never touched.
+    """
+    db_path = _resolve_db_path(db)
+    if not db_path or not os.path.isfile(db_path):
+        return 0
+    try:
+        con = _connect(db_path)
+    except sqlite3.Error:
+        return 0
+    try:
+        return _reclassify_con(con)
+    except sqlite3.Error:
+        return 0
+    finally:
+        con.close()
+
+
+def _reclassify_con(con: sqlite3.Connection) -> int:
+    """The connection-scoped core of :func:`reclassify_themes`."""
+    try:
+        rows = list(
+            con.execute(
+                "SELECT theme_id, task_class FROM lesson_themes"
+                " WHERE kind = 'task'"
+                "   AND (task_class IS NULL OR task_class = '*')"
+            )
+        )
+    except sqlite3.OperationalError:
+        # No lesson_themes table (fresh DB, no migration run) — nothing to do.
+        return 0
+    now = int(time.time())
+    changed = 0
+    for r in rows:
+        tid = r["theme_id"]
+        new_value = _member_class_value(con, tid)
+        if new_value == r["task_class"]:
+            continue
+        con.execute(
+            "UPDATE lesson_themes SET task_class = ?, updated_at = ?"
+            "  WHERE theme_id = ?",
+            (new_value, now, tid),
+        )
+        changed += 1
+    if changed:
+        con.commit()
+    return changed
+
+
+def select_verified_themes(
+    con: sqlite3.Connection, task_class: str, limit: int
+) -> list[dict]:
+    """The one shared selector for authored, verified theme lessons.
+
+    Both prompt readers — ``context_v2.verified_themes`` and
+    ``context_assembler._verified_theme_lessons`` — call this, so they can
+    never disagree about which lessons a run sees or in what order.
+
+    A row counts when it is ``status='verified'``, ``kind='task'``, carries a
+    non-blank authored ``lesson_text`` (written by grounded pattern induction,
+    never invented here) and has a non-NULL ``task_class``. Selected rows are
+    ranked in three tiers:
+
+    * tier 0 — ``task_class`` equals the requested class exactly;
+    * tier 1 — the class is one member of a comma-joined set
+      (``code_fix,framework_edit``);
+    * tier 2 — the legacy wildcard ``'*'``, only to fill leftover slots.
+
+    Within a tier the order is ``n_runs DESC, last_seen DESC``; the tier always
+    beats ``n_runs``, so one own-class theme outranks every wildcard however
+    many runs the wildcard has. A candidate whose ``lesson_text`` token set
+    (``_tokenize``) overlaps an already-selected one by
+    ``|A∩B| / min(|A|,|B|) >= 0.8`` is dropped as a near-duplicate — a check
+    against the selected page, not the whole pool, so distinct lessons in one
+    fan-out survive.
+
+    Returns ``[{theme_id, lesson_text, n_runs, task_class}]``, at most
+    ``limit`` rows. Cold-safe: a missing table or column is ``[]`` — this runs
+    on the prompt-injection path, where a raise would abort a dispatch whose
+    spend already happened.
+    """
+    if limit <= 0:
+        return []
+    try:
+        rows = list(
+            con.execute(
+                "SELECT theme_id, lesson_text, n_runs, task_class"
+                "  FROM lesson_themes"
+                " WHERE status = 'verified' AND kind = 'task'"
+                "   AND lesson_text IS NOT NULL AND TRIM(lesson_text) <> ''"
+                "   AND task_class IS NOT NULL"
+                " ORDER BY n_runs DESC, last_seen DESC"
+            )
+        )
+    except sqlite3.Error:
+        return []
+
+    def _tier(value: str) -> int | None:
+        if value == task_class:
+            return 0
+        if value == "*":
+            return 2
+        if task_class in (c.strip() for c in value.split(",")):
+            return 1
+        return None
+
+    ranked: list[tuple[int, tuple]] = []
+    for r in rows:
+        tier = _tier(str(r[3] or ""))
+        if tier is not None:
+            ranked.append((tier, r))
+    # Stable sort: rows are already in n_runs DESC, last_seen DESC order, so
+    # sorting on the tier alone preserves that order within each tier.
+    ranked.sort(key=lambda tr: tr[0])
+
+    out: list[dict] = []
+    selected_tokens: list[set[str]] = []
+    for _tier_no, r in ranked:
+        text = str(r[1]).strip()
+        tokens = set(_tokenize(text))
+        duplicate = False
+        for prev in selected_tokens:
+            denom = min(len(tokens), len(prev))
+            if denom and len(tokens & prev) / denom >= 0.8:
+                duplicate = True
+                break
+        if duplicate:
+            continue
+        out.append(
+            {
+                "theme_id": r[0],
+                "lesson_text": text,
+                "n_runs": int(r[2] or 0),
+                "task_class": r[3],
+            }
+        )
+        selected_tokens.append(tokens)
+        if len(out) >= limit:
+            break
+    return out
 
 
 # ── Promotion (candidate → verified lesson) ─────────────────────────────────

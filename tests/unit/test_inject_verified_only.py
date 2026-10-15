@@ -103,9 +103,10 @@ def test_verified_task_theme_is_injected(db, monkeypatch):
                 lesson="write the failing test before the fix")
     src: list[dict] = []
     md = ca.failure_modes_md("code-fix", 5, db=db, sources=src)
-    assert "--- Verified lessons from prior runs (code-fix) ---" in md
+    assert ("--- Lessons induced from prior runs (code-fix; "
+            "guardrail-checked, effect not yet measured) ---") in md
     assert "- write the failing test before the fix  (seen in 4 runs)" in md
-    assert "--- /verified lessons ---" in md
+    assert "--- /induced lessons ---" in md
     assert "auth.middleware" not in md, "raw gradient still excluded"
     assert {"kind": "theme", "id": "th-1",
             "text": "write the failing test before the fix"} in src

@@ -364,37 +364,29 @@ def prior_attempts(kickoff_path: str, *, db: str | None = None,
 
 def verified_themes(task_class: str, *, db: str | None = None,
                     limit: int = 5) -> list[dict]:
-    """Authored, verified theme lessons for ``task_class`` (or the ``'*'``
-    wildcard), strongest first. The v1 arm has carried these since the
-    ``lesson_themes`` table landed, but the v2 pack — the LIVE arm — never did,
-    so an approved lesson could reach a holdout run and not a normal one.
+    """Authored, verified theme lessons for ``task_class``. The v1 arm has
+    carried these since the ``lesson_themes`` table landed, but the v2 pack —
+    the LIVE arm — never did, so an approved lesson could reach a holdout run
+    and not a normal one.
 
-    A row counts only when it is ``status='verified'``, ``kind='task'``, and
-    carries a non-blank authored ``lesson_text`` (written by grounded pattern
-    induction — never invented here). Cold-safe: a missing table or column is
-    an empty list, because this runs on the injection path where a raise would
-    abort a dispatch whose spend already happened.
+    Selection is delegated to ``themes.select_verified_themes`` so this reader
+    and ``context_assembler._verified_theme_lessons`` can never disagree: own
+    task class first, then a class that is one member of a comma-joined set,
+    then the legacy ``'*'`` wildcard only for leftover slots. Cold-safe: a
+    missing table or column is an empty list, because this runs on the
+    injection path where a raise would abort a dispatch whose spend already
+    happened.
     """
     con = _connect_ro(db)
     if con is None or limit <= 0:
         return []
     try:
-        rows = con.execute(
-            """
-            SELECT theme_id, lesson_text, n_runs
-            FROM lesson_themes
-            WHERE status = 'verified' AND kind = 'task'
-              AND lesson_text IS NOT NULL AND TRIM(lesson_text) <> ''
-              AND (task_class = ? OR task_class = '*')
-            ORDER BY n_runs DESC, last_seen DESC LIMIT ?
-            """,
-            (task_class, int(limit)),
-        ).fetchall()
+        rows = themes.select_verified_themes(con, task_class, int(limit))
     except sqlite3.Error:
         return []
     finally:
         con.close()
-    return [{"id": f"t:{r['theme_id']}", "text": str(r["lesson_text"]).strip(),
+    return [{"id": f"t:{r['theme_id']}", "text": r["lesson_text"],
              "n_runs": int(r["n_runs"] or 0)} for r in rows]
 
 
@@ -593,7 +585,7 @@ def render(pack: dict, role: str = "planner", *, budget_chars: int = 6000) -> st
             lines.append("Hard constraints from the kickoff:")
             lines += [f"- [{c['id']}] {c['text']}" for c in constraints]
         if themes:
-            lines.append("Lessons verified on earlier runs of this task class:")
+            lines.append("Lessons induced from earlier runs (guardrail-checked; effect not yet measured):")
             lines += [f"- [{t['id']}] {t['text']}" for t in themes]
         if clusters:
             lines.append("Problems reviewers already found in these files. Do not repeat them:")
