@@ -381,6 +381,14 @@ def test_both_code_fix_contract_envelopes_survive_the_shape_guard(tmp_path):
     ``verifier_metamorphic.json`` (no relation spec → vacuous) — and *both*
     failed the guard, so contract was unreachable. A test covering one of them
     would have passed while the level stayed UNVERIFIED.
+
+    Parsing, though, is only half of it. Both of these outcomes are the
+    verifier saying it examined nothing, so both must ALSO abstain — the
+    engine's ``status: "unverified"`` marker, which ``eval_judge``,
+    ``execute_handlers`` and ``run_flow`` already read that way. Without it the
+    level mints PROVEN out of a skip, which is the failure this half pins: an
+    envelope that carries ``pass: true`` must not be read as a judgement the
+    tool never made.
     """
     empty = tmp_path / "target"
     empty.mkdir()
@@ -395,9 +403,32 @@ def test_both_code_fix_contract_envelopes_survive_the_shape_guard(tmp_path):
         parsed = L._read_verifier_evidence(str(rd / name))
         assert parsed is not None, f"{name} fails the envelope shape guard"
         assert parsed["checks"], f"{name} carries an empty checks list"
+        assert parsed["status"] == "unverified", f"{name} claims a judgement it did not make"
 
     vector, reasons = L.derive_levels(str(rd), "code_fix")
-    assert vector["contract"] == PROVEN, reasons["contract"]
+    assert vector["contract"] == UNVERIFIED, reasons["contract"]
+
+    # The level must still be reachable: a metamorphic relation that actually
+    # ran and held is a judgement, and PROVEN is the honest answer for it.
+    spec = tmp_path / "meta_spec.py"
+    spec.write_text(
+        "from mini_ork.learning.metamorphic import commutativity\n"
+        "def _add(x):\n"
+        "    a, b = x\n"
+        "    return a + b\n"
+        "TARGET = _add\n"
+        "SEED_INPUTS = [(2, 3), (10, 20)]\n"
+        "RELATIONS = [commutativity()]\n",
+        encoding="utf-8")
+    ran = _run_dir(tmp_path, name="codefix_ran")
+    (ran / "verifier_metamorphic.json").write_text(
+        _run_recipe_verifier("metamorphic.py", empty, {"MO_METAMORPHIC_SPEC": str(spec)}),
+        encoding="utf-8")
+    ran_parsed = L._read_verifier_evidence(str(ran / "verifier_metamorphic.json"))
+    assert ran_parsed["pass"] is True
+    assert ran_parsed.get("status") is None, "a real pass is not an abstention"
+    ran_vector, ran_reasons = L.derive_levels(str(ran), "code_fix")
+    assert ran_vector["contract"] == PROVEN, ran_reasons["contract"]
 
     # Negative control — the exact shapes these replaced. Both fail the guard
     # (the metamorphic one on an ``int`` count, the typecheck one on a missing

@@ -345,9 +345,12 @@ def _emit(*, passed: bool, reason: str, evidence: str | None, gating: bool) -> N
 
     ``gating`` is what separates a judgement from an absence of one: a check
     that ran and rejected the input refutes, while the "no toolchain here"
-    skip is emitted non-gating so it cannot refute code nothing examined.
+    skip is emitted non-gating so it cannot refute code nothing examined. That
+    same distinction rides ``status``, which the engine reads before ``pass``:
+    a non-gating outcome is an abstention, so it is marked ``unverified``
+    rather than left to read as a pass the tool never made.
     """
-    print(json.dumps({
+    payload = {
         "verifier": "typecheck", "pass": passed,
         "verdict": "pass" if passed else "fail",
         "evidence_path": evidence,
@@ -358,7 +361,10 @@ def _emit(*, passed: bool, reason: str, evidence: str | None, gating: bool) -> N
         "reasons": [] if passed else [f"typecheck failed; see {evidence}"],
         "checked_criteria": ["typecheck"],
         "error_summary": reason,
-    }, separators=(",", ":"), ensure_ascii=False))
+    }
+    if not gating:
+        payload["status"] = "unverified"
+    print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
 
 
 def _emit_pass(reason: str) -> int:

@@ -260,6 +260,15 @@ def _contract_from_recipe_verifiers(run_dir):
             # an abstention outranks a failed gating check. Never "proven".
             verdicts[name] = "abstained"
             continue
+        if str(obj.get("status") or "").strip().lower() == "unverified":
+            # A second way an envelope declares the same thing, and the one the
+            # rest of the engine already reads: `eval_judge._verifier_passed`,
+            # `execute_handlers` and `run_flow` all treat `status: unverified`
+            # as "this instrument could not judge", not as a pass. Reading it as
+            # one here minted a PROVEN contract level out of a skip — the
+            # verifier's own payload says it examined nothing.
+            verdicts[name] = "abstained"
+            continue
         gating_failed = any(
             isinstance(check, dict)
             and check.get("gating") is True
