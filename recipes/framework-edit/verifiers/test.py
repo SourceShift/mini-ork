@@ -424,6 +424,13 @@ def _epic_verification_commands_pass():
         _ev.flush()
         return False
     env = scrubbed_test_env()
+    # The kickoff declares run-local artifacts as ${MINI_ORK_RUN_DIR}/…, so its
+    # own acceptance commands must be able to resolve the run dir. The scrub
+    # above drops MINI_ORK_RUN_DIR along with the credentials; restore that ONE
+    # path (run-local, not a secret) and nothing else, so GLM_API_KEY et al.
+    # stay scrubbed. Without it `--junitxml="${MINI_ORK_RUN_DIR}/x.xml"` expands
+    # to `/x.xml` and the command dies (Errno 30, read-only file system).
+    env["MINI_ORK_RUN_DIR"] = RUN_DIR
     env["PYTHONPATH"] = "."
     env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
     for cmd in cmds:
