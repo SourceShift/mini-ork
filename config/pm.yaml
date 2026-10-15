@@ -68,9 +68,12 @@ sources:
 
   # A GitHub repository. One entry per repository: the source id is the
   # registry id, so `github` and `github-core` are two independent sources with
-  # their own token keys. The adapter reads — create/update/comment are not
-  # implemented yet, so the board shows GitHub issues without offering a write
-  # it would refuse.
+  # their own token keys. The adapter is found from the id: the id itself, then
+  # its prefix before the first `-` (`github-core` → github), or an explicit
+  # `adapter: github` for any other id. The same rule serves `linear-*` and
+  # `jira-*`. The adapter reads — create/update/comment are not implemented
+  # yet, so the board shows GitHub issues without offering a write it would
+  # refuse.
   # github:
   #   enabled: true
   #   token_env: GITHUB_TOKEN     # a PAT; read-only (public_repo / repo:read)

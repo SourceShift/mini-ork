@@ -103,3 +103,71 @@ def test_catalogue_is_json_safe_and_capability_shaped():
     assert local["capabilities"]["create"] is True
     # The one this whole package exists for: epics cannot be transitioned.
     assert local["capabilities"]["transition"] is False
+
+
+# ── one adapter, many sources ──────────────────────────────────────────────
+#
+# config/pm.yaml documents `github-core` / `linear-ops` / `jira-ops` as second
+# sources with their own repo/team. Registration used to look adapters up by
+# exact id, so every one of them was silently never registered.
+
+
+def _register(*sources):
+    from mini_ork.pm import providers
+    from mini_ork.pm.config import PmConfig
+
+    before = len(providers._SKIPPED)
+    providers._register_configured(PmConfig(sources={s.id: s for s in sources}, path=None))
+    added = providers._SKIPPED[before:]
+    del providers._SKIPPED[before:]
+    return added
+
+
+def test_a_suffixed_id_registers_with_its_prefix_adapter(unregistered):
+    from mini_ork.pm.config import SourceConfig
+    from mini_ork.pm.providers.github import GithubProvider
+    from mini_ork.pm.providers.linear import LinearProvider
+
+    skipped = _register(
+        SourceConfig(id="github-cn", enabled=True, token_env="GITHUB_TOKEN",
+                     settings={"owner": "acme", "repo": "cn"}),
+        SourceConfig(id="linear-ops", enabled=True, token_env="LINEAR_API_KEY",
+                     settings={"team": "OPS"}),
+    )
+    unregistered.extend(["github-cn", "linear-ops"])
+
+    assert skipped == []
+    assert isinstance(registry.get_provider("github-cn"), GithubProvider)
+    assert isinstance(registry.get_provider("linear-ops"), LinearProvider)
+    assert registry.get_provider("github-cn").id == "github-cn"  # uids stay per-source
+
+
+def test_an_explicit_adapter_setting_wins(unregistered):
+    from mini_ork.pm.config import SourceConfig
+    from mini_ork.pm.providers.jira import JiraProvider
+
+    skipped = _register(SourceConfig(
+        id="tracker", enabled=True, token_env="JIRA_API_TOKEN",
+        settings={"adapter": "jira", "site": "https://acme.atlassian.net",
+                  "email_env": "JIRA_EMAIL", "project": "ENG"}))
+    unregistered.append("tracker")
+
+    assert skipped == []
+    assert isinstance(registry.get_provider("tracker"), JiraProvider)
+
+
+def test_an_enabled_source_with_no_adapter_is_reported_not_dropped():
+    from mini_ork.pm.config import SourceConfig
+
+    skipped = _register(SourceConfig(id="asana-eng", enabled=True, token_env="X", settings={}))
+
+    assert [source for source, _ in skipped] == ["asana-eng"]
+    assert "'asana' adapter" in skipped[0][1]
+    with pytest.raises(registry.UnknownProvider):
+        registry.get_provider("asana-eng")
+
+
+def test_the_local_stanza_is_not_reported_as_skipped():
+    from mini_ork.pm.config import SourceConfig
+
+    assert _register(SourceConfig(id="local", enabled=True, settings={})) == []
