@@ -4,12 +4,16 @@ The kickoff (rank 4 — "Is another run editing my files, and who yields?") asks
 the Coordination tab to render the live state of Concord alongside the existing
 principals, hot claims and --owns violations:
 
-* Overlaps table from ``/api/v1/coord/overlaps`` — open first, capped at 30
-  rows, with one confirm-gated Ack button per row that calls
-  ``mini-ork cn ack-overlap <id>``.
+* Overlaps table from ``/api/v1/coord/overlaps`` — ``{id, kind, a, b,
+  state, count, first_seen}``, sorted open → escalated → acked (newest
+  first within each bucket), capped at 30 rows with a 'Showing N of M'
+  note; one confirm-gated Ack button per open / escalated row that calls
+  ``mini-ork cn ack-overlap <id>`` (never on acked rows).
 * Active path freezes from ``/api/v1/coord/freezes``.
-* Duplicate-work pairs from ``/api/v1/coord/topic-pairs`` — each side opens
-  its own session (run tab → thread → CN verb).
+* Duplicate-work pairs from ``/api/v1/coord/topic-pairs`` — ``{a, a_text,
+  b, b_text, similarity}``, sorted by similarity descending, each pair
+  shows both ids and both intents (cut to 120 characters), capped at 30
+  rows with a 'Showing N of M' note.
 
 The ack verb's POST happens through :func:`mini_ork.cn_client._coord_request`,
 which raises :class:`CoordUnavailable` on a connection error and
@@ -121,7 +125,7 @@ def _make_fake(overlaps=None, freezes=None, topic_pairs=None, *,
         if path == "/api/v1/coord/freezes":
             return {"freezes": list(freezes or [])}
         if path == "/api/v1/coord/topic-pairs":
-            return {"topic_pairs": list(topic_pairs or [])}
+            return {"pairs": list(topic_pairs or [])}
         return {}
 
     return _fake, seen
@@ -133,18 +137,19 @@ def _make_fake(overlaps=None, freezes=None, topic_pairs=None, *,
 def test_overlaps_section_renders_open_first_with_ack_action(
     home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """CN-up + two overlaps: the open row first; its Ack button is wired to
-    ``cn ack-overlap <id>`` with ``confirm`` and ``home=False``."""
+    """CN-up + three overlaps (open / escalated / acked): the open row
+    sorts first, its Ack button wires to ``cn ack-overlap <id>`` with
+    ``confirm`` and ``home=False``, the acked row carries no Ack."""
     monkeypatch.setattr("mini_ork.cn_client.available", lambda: True)
     now = int(time.time())
     fake, calls = _make_fake(
         overlaps=[
-            {"id": "ov-settled", "kind": "file", "paths": ["mini_ork/b.py"],
-             "principals": ["p3"], "status": "settled",
-             "first_seen": now - 1200},
-            {"id": "ov-open", "kind": "topic", "paths": ["mini_ork/a.py"],
-             "principals": ["p1", "p2"], "status": "open",
-             "first_seen": now - 60},
+            {"id": "ov-acked", "kind": "file", "a": "p3", "b": "p4",
+             "state": "acked", "count": 2, "first_seen": now - 1200},
+            {"id": "ov-escalated", "kind": "topic", "a": "p2", "b": "p5",
+             "state": "escalated", "count": 5, "first_seen": now - 300},
+            {"id": "ov-open", "kind": "topic", "a": "p1", "b": "p2",
+             "state": "open", "count": 7, "first_seen": now - 60},
         ],
         freezes=[],
         topic_pairs=[],
@@ -161,40 +166,72 @@ def test_overlaps_section_renders_open_first_with_ack_action(
     page = orch.build(home, "coord", {})
     section = _coord_table(page, "overlaps")
     rows = section["rows"]
-    assert len(rows) == 2
-    # Open is first even though "ov-settled" appears earlier in the payload.
+    assert len(rows) == 3
+    # Open is first even though "ov-acked" appears earlier in the payload;
+    # the escalated row sits ahead of the acked one.
     assert rows[0]["cells"][0]["t"] == "ov-open"
-    assert rows[1]["cells"][0]["t"] == "ov-settled"
-    # Status column carries the colour the design calls for.
-    assert rows[0]["cells"][4] == {"t": "open", "c": "yellow", "mono": False, "b": False}
-    assert rows[1]["cells"][4]["t"] == "settled"
-    # Each open row carries an Ack button whose action is the new verb.
-    ack = next(a for a in rows[0]["acts"] if a["label"] == "Ack")
-    assert ack["kind"] == "warn"
-    assert ack["do"]["cli"] == ["cn", "ack-overlap", "ov-open"]
-    assert ack["do"]["home"] is False
-    assert ack["do"]["confirm"]
-    # Ack posts to a stable HTTP verb/path through the seam.
+    assert rows[1]["cells"][0]["t"] == "ov-escalated"
+    assert rows[2]["cells"][0]["t"] == "ov-acked"
+    # The "a ↔ b" column carries both principals.
+    assert rows[0]["cells"][2]["t"] == "p1 ↔ p2"
+    assert rows[1]["cells"][2]["t"] == "p2 ↔ p5"
+    assert rows[2]["cells"][2]["t"] == "p3 ↔ p4"
+    # State column carries the colour the design calls for.
+    assert rows[0]["cells"][3] == {"t": "open", "c": "yellow",
+                                   "mono": False, "b": False}
+    assert rows[1]["cells"][3]["t"] == "escalated"
+    assert rows[1]["cells"][3]["c"] == "orange"
+    assert rows[2]["cells"][3]["t"] == "acked"
+    # Count column reads the numeric payload (and "—" is the value for
+    # a missing count, exercised in a separate test).
+    assert rows[0]["cells"][4]["t"] == "7"
+    assert rows[1]["cells"][4]["t"] == "5"
+    assert rows[2]["cells"][4]["t"] == "2"
+    # Open AND escalated rows carry an Ack button; acked does not.
+    ack_open = next(a for a in rows[0]["acts"] if a["label"] == "Ack")
+    assert ack_open["kind"] == "warn"
+    assert ack_open["do"]["cli"] == ["cn", "ack-overlap", "ov-open"]
+    assert ack_open["do"]["home"] is False
+    assert ack_open["do"]["confirm"]
+    ack_esc = next(a for a in rows[1]["acts"] if a["label"] == "Ack")
+    assert ack_esc["do"]["cli"] == ["cn", "ack-overlap", "ov-escalated"]
+    # The acked row has no row-level acts (the section keeps the
+    # action header; the cell-level "no button" is the gate's job).
+    assert not any(a["label"] == "Ack" for a in rows[2]["acts"])
+    # The end-of-section note announces the cap and the sort order.
+    note = section["note"].lower()
+    assert "showing 3 of 3" in note
+    assert "open" in note and "escalated" in note and "acked" in note
+    # The page walked the three GET endpoints through the seam.
     methods = [m for m, _p, _b in calls]
     assert "GET" in methods and methods.count("GET") >= 3
 
 
 def test_overlaps_cap_at_30_and_open_first(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """35 overlaps (10 open + 25 acknowledged/settled in interleaved order):
-    cap at 30 and every open row precedes every settled row."""
+    """35 overlaps (10 open + 10 escalated + 15 acked, interleaved): the
+    30-row cap holds, the note says 'Showing 30 of 35', and every open
+    row precedes every escalated which precedes every acked."""
     monkeypatch.setattr("mini_ork.cn_client.available", lambda: True)
     now = int(time.time())
     items = []
-    # Interleave 10 opens and 25 settles, oldest first within each bucket so a
-    # naive stable sort would put open rows scattered through the table.
-    for i in range(25):
-        items.append({"id": f"ov-settled-{i:02d}", "kind": "file",
-                      "paths": [f"path/{i}.py"], "principals": ["p"],
-                      "status": "settled", "first_seen": now - (200 + i)})
+    # Interleave 15 acked + 10 open + 10 escalated, oldest first within
+    # each bucket so a naive stable sort would scatter them through the
+    # table.
+    for i in range(15):
+        items.append({"id": f"ov-acked-{i:02d}", "kind": "file",
+                      "a": f"p{i}", "b": f"q{i}",
+                      "state": "acked", "count": 1,
+                      "first_seen": now - (200 + i)})
     for i in range(10):
         items.append({"id": f"ov-open-{i:02d}", "kind": "topic",
-                      "paths": [f"path/{i}.py"], "principals": ["p"],
-                      "status": "open", "first_seen": now - (100 + i)})
+                      "a": f"p{i}", "b": f"q{i}",
+                      "state": "open", "count": 1,
+                      "first_seen": now - (100 + i)})
+    for i in range(10):
+        items.append({"id": f"ov-esc-{i:02d}", "kind": "topic",
+                      "a": f"p{i}", "b": f"q{i}",
+                      "state": "escalated", "count": 1,
+                      "first_seen": now - (50 + i)})
     fake, _ = _make_fake(overlaps=items, freezes=[], topic_pairs=[])
     monkeypatch.setattr("mini_ork.cn_client._coord_request", fake)
     monkeypatch.setattr("mini_ork.cn_client.coord_list_principals",
@@ -207,12 +244,22 @@ def test_overlaps_cap_at_30_and_open_first(home: Path, monkeypatch: pytest.Monke
     section = _coord_table(page, "overlaps")
     rows = section["rows"]
     assert len(rows) == 30
-    # The open bucket is preserved; the last open row sits before any settled.
-    last_open_idx = max(i for i, r in enumerate(rows) if r["cells"][4]["t"] == "open")
-    first_settled_idx = min(
-        i for i, r in enumerate(rows) if r["cells"][4]["t"] != "open"
+    # The 30-row cap note rides on the section.
+    assert "Showing 30 of 35" in section["note"]
+    # The open bucket is preserved; the last open row sits before any
+    # escalated, and the last escalated sits before any acked.
+    last_open_idx = max(i for i, r in enumerate(rows) if r["cells"][3]["t"] == "open")
+    first_non_open = min(
+        i for i, r in enumerate(rows) if r["cells"][3]["t"] != "open"
     )
-    assert last_open_idx < first_settled_idx
+    last_esc_idx = max(
+        i for i, r in enumerate(rows) if r["cells"][3]["t"] == "escalated"
+    )
+    first_acked_idx = min(
+        i for i, r in enumerate(rows) if r["cells"][3]["t"] == "acked"
+    )
+    assert last_open_idx < first_non_open
+    assert last_esc_idx < first_acked_idx
 
 
 def test_freezes_section_renders_empty_state(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -255,15 +302,24 @@ def test_freezes_section_renders_rows(home: Path, monkeypatch: pytest.MonkeyPatc
     assert rows[1]["cells"][1]["t"] == "p8"
 
 
-def test_topic_pairs_section_per_side_action(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Each side of a duplicate-work pair owns an Open button. A run-id side
-    routes through S.open_run; a session-only side routes through the CN CLI."""
+def test_topic_pairs_section_renders_new_shape(
+    home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each pair shows the two principal ids and both intents (cut to
+    120 characters), with the similarity in the detail line. Strongest
+    pair sorts first; at most 30 pairs render with 'Showing N of M'."""
     monkeypatch.setattr("mini_ork.cn_client.available", lambda: True)
+    long_intent = "very long session intent " * 30
     fake, _ = _make_fake(topic_pairs=[
-        {"topic": "Basin-7", "a": {"run_id": "run-1791000007-aaaaaa", "title": "auth-fix"},
-         "b": {"session_id": "sess-1", "principal_id": "run:def"}},
-        {"topic": "Basin-8", "a": {"thread_id": "orch-1791000008-t1"},
-         "b": {"id": "sess-2"}},
+        {"a": "p1", "b": "p2",
+         "a_text": "fix login flow", "b_text": "rewrite auth handler",
+         "similarity": 0.42},
+        {"a": "p3", "b": "p4",
+         "a_text": long_intent, "b_text": long_intent,
+         "similarity": 0.91},
+        {"a": "p5", "b": "p6",
+         "a_text": "refactor scheduler", "b_text": "rewrite scheduler",
+         "similarity": 0.77},
     ])
     monkeypatch.setattr("mini_ork.cn_client._coord_request", fake)
     monkeypatch.setattr("mini_ork.cn_client.coord_list_principals",
@@ -275,19 +331,57 @@ def test_topic_pairs_section_per_side_action(home: Path, monkeypatch: pytest.Mon
     page = orch.build(home, "coord", {})
     section = _coord_list(page, "duplicate")
     items = section["items"]
-    assert len(items) == 2
+    assert len(items) == 3
 
-    # Pair 1: A's run id is canonical → S.open_run; B has a session id → CN CLI.
-    acts1 = items[0]["acts"]
-    assert acts1[0]["label"] == "Open A" and acts1[1]["label"] == "Open B"
-    assert acts1[0]["do"] == {"run": "run-1791000007-aaaaaa", "title": "auth-fix"}
-    assert acts1[1]["do"]["cli"] == ["cn", "session", "sess-1"]
-    assert acts1[1]["do"]["home"] is False
+    # Similarity descending → 0.91 first, then 0.77, then 0.42.
+    assert items[0]["t"] == "p3 ↔ p4"
+    assert items[0]["sub"].endswith("similarity 0.91")
+    assert items[1]["t"] == "p5 ↔ p6"
+    assert items[1]["sub"].endswith("similarity 0.77")
+    assert items[2]["t"] == "p1 ↔ p2"
+    assert items[2]["sub"].endswith("similarity 0.42")
 
-    # Pair 2: A has a thread id; B has a session id. No run id anywhere.
-    acts2 = items[1]["acts"]
-    assert acts2[0]["do"]["thread"].startswith("/continue orch-1791000008-t1")
-    assert acts2[1]["do"]["cli"] == ["cn", "session", "sess-2"]
+    # The 120-char cut: both sides of the long pair carry at most 120
+    # characters of intent text in the detail line.
+    expected_cut = (long_intent[:120] + "  ×  " + long_intent[:120]
+                    + "  ·  similarity 0.91")
+    assert items[0]["sub"] == expected_cut
+    # The two short intents render in full (no ellipsis, no cut).
+    assert "fix login flow" in items[2]["sub"]
+    assert "rewrite auth handler" in items[2]["sub"]
+
+    # No actions: the pair's per-side open verbs were removed with the
+    # rewrite — the OLD shape (Open A / Open B → run tab, thread, CN CLI)
+    # is dead code now that the payloads carry plain ids instead.
+    for it in items:
+        assert not it["acts"]
+    # The section's note says "Showing 3 of 3".
+    assert "Showing 3 of 3" in section["note"]
+
+
+def test_topic_pairs_section_cap_at_30(
+    home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """40 pairs: the cap holds at 30; the note says 'Showing 30 of 40'."""
+    monkeypatch.setattr("mini_ork.cn_client.available", lambda: True)
+    pairs = [
+        {"a": f"p{i}", "b": f"q{i}",
+         "a_text": "intent a", "b_text": "intent b",
+         "similarity": float(i) / 100.0}
+        for i in range(40)
+    ]
+    fake, _ = _make_fake(topic_pairs=pairs)
+    monkeypatch.setattr("mini_ork.cn_client._coord_request", fake)
+    monkeypatch.setattr("mini_ork.cn_client.coord_list_principals",
+                        lambda status="active": {"principals": []})
+    monkeypatch.setattr("mini_ork.cn_client.coord_hot_claims", lambda: {"claims": []})
+    monkeypatch.setattr("mini_ork.cn_client.coord_owns_violations",
+                        lambda since=0: {"violations": []})
+
+    page = orch.build(home, "coord", {})
+    section = _coord_list(page, "duplicate")
+    assert len(section["items"]) == 30
+    assert "Showing 30 of 40" in section["note"]
 
 
 # ── CN-down fallback ────────────────────────────────────────────────────────
@@ -324,7 +418,7 @@ def test_coordination_section_failure_yields_guarded_section(
         if path == "/api/v1/coord/freezes":
             return {"freezes": []}
         if path == "/api/v1/coord/topic-pairs":
-            return {"topic_pairs": []}
+            return {"pairs": []}
         return {}
 
     monkeypatch.setattr("mini_ork.cn_client._coord_request", fake)
@@ -443,8 +537,8 @@ def test_coordination_ack_action_parses_in_actions_sweep(
     monkeypatch.setattr("mini_ork.cn_client.available", lambda: True)
     now = int(time.time())
     fake, _ = _make_fake(
-        overlaps=[{"id": "ov-7", "kind": "file", "paths": ["a.py"],
-                   "principals": ["p"], "status": "open",
+        overlaps=[{"id": "ov-7", "kind": "file", "a": "p1", "b": "p2",
+                   "state": "open", "count": 3,
                    "first_seen": now - 60}],
     )
     monkeypatch.setattr("mini_ork.cn_client._coord_request", fake)

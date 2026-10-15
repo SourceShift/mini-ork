@@ -409,53 +409,57 @@ def _coord(home: Path, now: int) -> list[dict[str, Any]]:
             return S.lst("Scope violations (--owns)", items or [S.ok("No --owns violations recorded")])
 
         def overlaps() -> dict[str, Any]:
-            """Open-first, capped at 30 overlaps with one confirm-gated Ack per row.
+            """Open → escalated → acked, capped at 30, with one confirm-gated
+            Ack per open/escalated row.
 
-            ``/api/v1/coord/overlaps`` returns an envelope (``{"overlaps": [...]}``)
-            where each overlap carries ``id``, ``kind``, ``paths``, ``principals``,
-            ``status``, and either ``first_seen`` (epoch int) or ``created_at``
-            (ISO string). The Ack button posts to
+            ``/api/v1/coord/overlaps`` returns an envelope
+            (``{"overlaps": [...]}``) where each overlap carries ``id``,
+            ``kind``, ``a`` and ``b`` (principal ids), ``state``
+            (``open`` / ``escalated`` / ``acked``), a numeric ``count``, and
+            ``first_seen`` (epoch int). The Ack button posts to
             ``/api/v1/coord/overlaps/<id>/ack`` through the new
-            ``mini-ork cn ack-overlap`` verb — ``home=False`` because the cn
-            parser rejects ``--home``, and ``confirm`` so the IDE does not
-            silently bind the operator's choice to the click.
-
-            Sort key: ``(0, age)`` for ``status == "open"`` so open rows
-            cluster at the top in age order, then ``(1, age)`` for
-            acknowledged/settled rows. ``age = _epoch(first_seen|created_at)``
-            so a payload that uses either field renders correctly.
+            ``mini-ork cn ack-overlap`` verb — ``home=False`` because the
+            cn parser rejects ``--home``, and ``confirm`` so the IDE does
+            not silently bind the operator's choice to the click. Ack
+            never appears on already-acked rows.
             """
             data = cn_client._coord_request(
                 "GET", "/api/v1/coord/overlaps"
             ) or {}
             items = [it for it in (data.get("overlaps") or data.get("items") or [])
                      if isinstance(it, dict)]
-            items = sorted(items, key=lambda o: _overlap_sort_key(o, now))
+            total = len(items)
+            items.sort(key=_overlap_sort_key)
             items = items[:30]
+            rendered = len(items)
 
             rows: list[dict[str, Any]] = []
             for o in items:
                 oid = str(o.get("id") or o.get("overlap_id") or "")
-                paths = o.get("paths") or []
-                if isinstance(paths, str):
-                    paths = [paths]
-                principals_ = o.get("principals") or []
-                if isinstance(principals_, str):
-                    principals_ = [principals_]
-                status = str(o.get("status") or "—")
+                a = str(o.get("a") or "—")
+                b = str(o.get("b") or "—")
                 kind = str(o.get("kind") or "—")
-                age_epoch = _epoch(o.get("first_seen") or o.get("created_at"))
+                state = str(o.get("state") or "acked")
+                count_raw = o.get("count")
+                if isinstance(count_raw, (int, float)):
+                    count_text = str(int(count_raw))
+                else:
+                    count_text = "—"
+                age_epoch = _epoch(o.get("first_seen"))
                 row: dict[str, Any] = {
                     "cells": [
                         S.mono(oid or "—"),
                         S.cell(kind, "sub"),
-                        S.cell(", ".join(str(p) for p in paths) if paths else "—", "text"),
-                        S.cell(", ".join(str(p) for p in principals_) if principals_ else "—", "sub"),
-                        S.cell(status, "yellow" if status == "open" else "sub"),
+                        S.cell(f"{a} ↔ {b}", "text"),
+                        S.cell(state,
+                               "yellow" if state == "open"
+                               else "orange" if state == "escalated"
+                               else "sub"),
+                        S.mono(count_text),
                         S.mono(S.age(age_epoch, now) if age_epoch else "—"),
                     ],
                 }
-                if oid:
+                if oid and state in ("open", "escalated"):
                     ack_action = S.cli(
                         "cn", "ack-overlap", oid,
                         confirm=f"Acknowledge overlap {oid}?",
@@ -465,15 +469,19 @@ def _coord(home: Path, now: int) -> list[dict[str, Any]]:
                 rows.append(row)
             if not rows:
                 rows = [[S.muted("No live overlaps"), "", "", "", "", ""]]
+                note = "No overlaps reported."
+            else:
+                note = (f"Showing {rendered} of {total}. "
+                        "Open rows sort first, then escalated, then acked. "
+                        "Ack posts to /api/v1/coord/overlaps/<id>/ack "
+                        "through `mini-ork cn ack-overlap` (run with confirm).")
             return S.table(
                 "Overlaps · concord",
-                [S.col(fr=1), S.col(70), S.col(fr=2), S.col(fr=1.5),
-                 S.col(60), S.col(50)],
-                ["id", "kind", "paths", "principals", "status", "age"],
+                [S.col(fr=1), S.col(70), S.col(fr=2), S.col(70),
+                 S.col(50), S.col(50)],
+                ["id", "kind", "a ↔ b", "state", "count", "age"],
                 rows, full=True,
-                note="Open rows sort first; at most 30 are shown. "
-                     "Ack posts to /api/v1/coord/overlaps/<id>/ack through "
-                     "`mini-ork cn ack-overlap` (run with confirm).",
+                note=note,
             )
 
         def freezes() -> dict[str, Any]:
@@ -504,41 +512,57 @@ def _coord(home: Path, now: int) -> list[dict[str, Any]]:
         def topic_pairs() -> dict[str, Any]:
             """Pairs of live sessions CN scored as the same basin.
 
-            Each side's payload carries ``run_id`` (open the run via the
-            canonical run tab), ``thread_id`` (continue in a thread), or
-            ``session_id`` (fall back to a CN CLI verb). The dispatch mirrors
-            how other tabs link sessions: a ``run-<digits>-<short>`` id rides
-            :func:`S.open_run`, then :func:`S.thread`, then a CN CLI verb.
+            Each pair carries ``a`` and ``b`` (principal ids), a textual
+            ``a_text`` / ``b_text`` for each side (the session's intent),
+            and a numeric ``similarity`` (0..1). The intents are cut to
+            120 characters so a session with a long kickoff does not push
+            another column off the page; pairs are sorted by similarity,
+            highest first.
             """
             data = cn_client._coord_request(
                 "GET", "/api/v1/coord/topic-pairs"
             ) or {}
-            pairs = [it for it in (data.get("topic_pairs") or data.get("pairs")
+            pairs = [it for it in (data.get("pairs") or data.get("topic_pairs")
                                     or data.get("items") or [])
                      if isinstance(it, dict)]
+            total = len(pairs)
+
+            def _similarity_key(p: dict[str, Any]) -> float:
+                sim = p.get("similarity")
+                if isinstance(sim, (int, float)):
+                    return float(sim)
+                return 0.0
+
+            pairs.sort(key=_similarity_key, reverse=True)
+            pairs = pairs[:30]
+            rendered = len(pairs)
+
             items: list[dict[str, Any]] = []
             for p in pairs:
-                a = p.get("a") or p.get("side_a") or {}
-                b = p.get("b") or p.get("side_b") or {}
-                topic = str(p.get("topic") or p.get("basin") or "duplicate work")
-                a_label = _side_label(a)
-                b_label = _side_label(b)
+                a = str(p.get("a") or "—")
+                b = str(p.get("b") or "—")
+                a_text = _truncate(p.get("a_text"), 120)
+                b_text = _truncate(p.get("b_text"), 120)
+                sim = p.get("similarity")
+                if isinstance(sim, (int, float)):
+                    sim_text = f"{float(sim):.2f}"
+                else:
+                    sim_text = "—"
                 items.append(S.dot(
-                    topic,
-                    f"{a_label}  ×  {b_label}",
+                    f"{a} ↔ {b}",
+                    f"{a_text}  ×  {b_text}  ·  similarity {sim_text}",
                     mc="yellow",
-                    acts=[
-                        S.btn("Open A", _open_side(a), "ghost"),
-                        S.btn("Open B", _open_side(b), "ghost"),
-                    ],
                 ))
             if not items:
                 items = [S.dot("No duplicate-work pairs reported")]
+                note = "Two live sessions scored as the same basin would show here."
+            else:
+                note = (f"Showing {rendered} of {total}. Two live sessions scored "
+                        "as the same basin; the strongest pair sits at the top.")
             return S.lst(
                 "Duplicate work · concord",
                 items,
-                note="Two live sessions scored as the same basin; open each "
-                     "side to compare their plans.",
+                note=note,
             )
 
         errors: dict[str, str] = {}
@@ -556,59 +580,32 @@ def _coord(home: Path, now: int) -> list[dict[str, Any]]:
     return out
 
 
-def _overlap_sort_key(overlap: dict[str, Any], now: int) -> tuple[int, int]:
-    """``(0, -age)`` for open overlaps, ``(1, -age)`` for everything else.
+def _overlap_sort_key(overlap: dict[str, Any]) -> tuple[int, int]:
+    """``(bucket, -age)`` — open (0) → escalated (1) → acked (2); anything
+    else lands at bucket 3 so it never out-orders a real state.
 
-    Sorting by ``(status_bucket, -age)`` keeps every open row ahead of
-    settled rows even when their timestamps differ; the inner term is the
-    negation of ``age`` (epoch from ``first_seen|created_at``), so a NEWER
-    row in either bucket sorts before an older one — the youngest open row
-    wins the tie-break within the open bucket and the oldest settled row
-    anchors the tail. ``now`` is accepted but unused today — the
-    future-shaped caller keeps the signature stable when the contract grows
-    a tie-breaker column.
+    The inner term is the negation of ``age`` (epoch from ``first_seen``),
+    so a NEWER overlap in any bucket sorts FIRST. ``now`` is intentionally
+    not threaded through — the key is pure on the row itself so the sort
+    is stable across renders.
     """
-    status = str(overlap.get("status") or "")
-    bucket = 0 if status == "open" else 1
-    age = _epoch(overlap.get("first_seen") or overlap.get("created_at")) or 0
-    # Invert the age so a NEWER overlap sorts FIRST within a bucket: ``-age``
-    # maps a higher epoch to a smaller key, which ``sorted`` ranks first.
+    state = str(overlap.get("state") or "")
+    bucket = _OVERLAP_STATE_BUCKET.get(state, 3)
+    age = _epoch(overlap.get("first_seen")) or 0
     return (bucket, -age if age else 0)
 
 
-def _side_label(side: Any) -> str:
-    """The compact label shown in the duplicate-work pair's detail line."""
-    if not isinstance(side, dict):
-        return "?"
-    for k in ("title", "label", "session_id", "principal_id", "id"):
-        v = side.get(k)
-        if isinstance(v, str) and v:
-            return v[:32]
-    return "?"
+# State → bucket for the Overlaps sort. Unknown states (or a missing one)
+# sort AFTER acked so they never silently demote a real row to the tail.
+_OVERLAP_STATE_BUCKET = {"open": 0, "escalated": 1, "acked": 2}
 
 
-def _open_side(side: Any) -> dict[str, Any] | None:
-    """Open one side of a duplicate-work pair: run tab → thread → CN verb.
-
-    Falls back through :func:`mini_ork.cn_client.extract_run_id`, which
-    applies the canonical ``run-<digits>-<short>`` shape check; non-conforming
-    payloads degrade to a thread prompt. A payload missing every link field
-    returns ``None`` so the wrapping :func:`S.btn` renders a disabled button.
-    """
-    from mini_ork import cn_client
-
-    if isinstance(side, dict):
-        run = cn_client.extract_run_id(side)
-        if run:
-            return S.open_run(run, str(side.get("title") or ""))
-        thread = side.get("thread_id")
-        if isinstance(thread, str) and thread:
-            return S.thread(f"/continue {thread}")
-        for k in ("session_id", "id"):
-            sid = side.get(k)
-            if isinstance(sid, str) and sid:
-                return S.cli("cn", "session", sid, home=False)
-    return None
+def _truncate(text: Any, limit: int) -> str:
+    """``text`` cut to ``limit`` characters; ``None`` / non-strings → ``""``."""
+    if text is None:
+        return ""
+    s = str(text)
+    return s[:limit] if len(s) > limit else s
 
 
 def _spawn_tree(home: Path, now: int) -> dict[str, Any]:
