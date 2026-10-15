@@ -1,9 +1,7 @@
-"""``mini-ork cn status`` — one screenful of ContextNest connectivity.
+"""``mini-ork cn`` — the operator-facing ContextNest verbs.
 
-The ContextNest IDE panels answer "is it on, where, and how fast?" every
-refresh. ``cn status`` is the operator-facing equivalent: the same fields,
-emitted as JSON (or a one-line text), exit code 0 whether the server is up
-or not — "reachable: no" is a valid answer, not an error. The command
+``cn status`` answers "is it on, where, and how fast?" every refresh. The
+ContextNest IDE panels ask the same question and share the same fields. The
 intentionally never reveals the bearer token; the secure-tier key is named
 so the operator knows which one to export.
 
@@ -12,10 +10,17 @@ the command exits non-zero, names the missing KEY (never the value) on
 stderr, and refuses to probe the server. Scripts and CI can therefore
 distinguish "fix the secret store" (exit 5) from "server is down" (exit 0).
 
-Wire: ``GET /api/v1/substrate/health`` with the short ping timeout, plus
-the resolved tier/base-url/token-key. Exit codes: 0 always for reachability
-questions; 2 on a usage error (e.g. ``mini-ork cn`` with no subcommand);
-5 on a secure-tier secret-store misconfiguration.
+``cn ack-overlap <id>`` posts to ``/api/v1/coord/overlaps/<id>/ack`` through
+the raise-based :func:`mini_ork.cn_client._coord_request` seam. It maps a
+``CoordUnavailable`` to exit 3 and a ``CoordHTTPError`` to exit 4, so the
+IDE panel can render a precise failure next to the Ack button rather than a
+generic stderr trace.
+
+Wire: ``GET /api/v1/substrate/health`` (ping), plus the resolve-at-call
+seam :func:`mini_ork.cn_client._coord_request`. Exit codes: 0 on a positive
+ack or reachable ``status``; 2 on a usage error; 3 when ContextNest is
+unreachable; 4 on an HTTP 4xx/5xx; 5 on a secure-tier secret-store
+misconfiguration.
 """
 from __future__ import annotations
 
@@ -33,6 +38,8 @@ from mini_ork.dispatch.secrets import SecretStoreError
 # Exit codes — kept small and named for the caller, not the implementation.
 EXIT_OK = 0
 EXIT_USAGE = 2
+EXIT_COORD_UNREACHABLE = 3
+EXIT_COORD_HTTP = 4
 EXIT_SECRET_CONFIG = 5
 
 
@@ -46,6 +53,15 @@ def build_parser() -> argparse.ArgumentParser:
     status = sub.add_parser("status", help="show tier, endpoint, reachability, latency")
     status.add_argument("--json", action="store_true",
                         help="emit JSON instead of a one-line text")
+    ack = sub.add_parser("ack-overlap",
+                         help="POST /api/v1/coord/overlaps/<id>/ack")
+    ack.add_argument("overlap_id",
+                     help="the overlap id returned by /api/v1/coord/overlaps")
+    ack.add_argument("--by", default=None,
+                     help="principal acknowledging; defaults to $CONCORD_PRINCIPAL "
+                          "or human:$USER")
+    ack.add_argument("--json", action="store_true",
+                     help="emit the server response as JSON")
     return parser
 
 
@@ -105,6 +121,50 @@ def _report_secret_error(exc: SecretStoreError, *, token_key: str,
         }
         sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
     return EXIT_SECRET_CONFIG
+
+
+def _ack_default_by() -> str:
+    """The default ``--by`` for ``cn ack-overlap``: $CONCORD_PRINCIPAL else human:$USER."""
+    return os.environ.get("CONCORD_PRINCIPAL") or f"human:{os.environ.get('USER', 'unknown')}"
+
+
+def _cmd_ack_overlap(args: argparse.Namespace) -> int:
+    """POST ``/api/v1/coord/overlaps/<id>/ack`` through the raise-based seam.
+
+    :func:`mini_ork.cn_client._coord_request` raises ``CoordUnavailable`` on a
+    connection error (mapped to :data:`EXIT_COORD_UNREACHABLE`, exit 3) and
+    ``CoordHTTPError`` on a 4xx/5xx (:data:`EXIT_COORD_HTTP`, exit 4). On a
+    successful ack the parsed JSON body is echoed on stdout, either as JSON
+    with ``--json`` or as a one-line ``ack-overlap: <id> acknowledged`` text.
+    The id is URL-escaped through :func:`mini_ork.cn_client._enc` so an overlap
+    id carrying ``/`` or another reserved character does not break the path.
+    """
+    by = args.by if args.by else _ack_default_by()
+    try:
+        payload = cn_client._coord_request(
+            "POST",
+            f"/api/v1/coord/overlaps/{cn_client._enc(args.overlap_id)}/ack",
+            {"by": by},
+        )
+    except cn_client.CoordUnavailable as exc:
+        sys.stderr.write(
+            f"mini-ork cn ack-overlap: ContextNest unavailable: {exc}\n"
+        )
+        return EXIT_COORD_UNREACHABLE
+    except cn_client.CoordHTTPError as exc:
+        sys.stderr.write(
+            f"mini-ork cn ack-overlap: ContextNest returned "
+            f"{exc.status}: {exc.body}\n"
+        )
+        return EXIT_COORD_HTTP
+    if args.json:
+        sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    else:
+        overlap_id = (
+            payload.get("id") if isinstance(payload, dict) else None
+        ) or args.overlap_id
+        sys.stdout.write(f"ack-overlap: {overlap_id} acknowledged\n")
+    return EXIT_OK
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
@@ -172,6 +232,8 @@ def main(rest: list[str], root: str) -> int:
         return int(exc.code or EXIT_USAGE)
     if args.subcommand is None or args.subcommand == "status":
         return _cmd_status(args)
+    if args.subcommand == "ack-overlap":
+        return _cmd_ack_overlap(args)
     sys.stderr.write(f"mini-ork cn: unknown subcommand {args.subcommand!r}\n")
     return EXIT_USAGE
 
