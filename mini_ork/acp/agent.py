@@ -2220,8 +2220,20 @@ class MiniOrkAcpAgent:
                 or ""
             )
             title = f"{base} (mini-ork race, {keep_lane})" if base else f"mini-ork race, {keep_lane}"
+            # Lazy ``getpass`` import — the human's merge click here is the
+            # approval when the run's review policy requires it. ``os.environ``
+            # for the run subprocess carries ``MINI_ORK_RUN_ID`` /
+            # ``MINI_ORK_RUN_DIR``; ``merge_approval._refuse_if_in_run``
+            # therefore refuses any ``approval`` call from inside a run, but
+            # the agent subprocess is *not* in-run when this handler fires
+            # from a Zed thread (a8dbc2dd).
+            import getpass
             try:
-                result = _workspaces.merge(keep_ws, message=title)
+                zed_user = f"zed:{getpass.getuser()}"
+            except (OSError, KeyError):
+                zed_user = "zed:unknown"
+            try:
+                result = _workspaces.merge(keep_ws, message=title, approver=zed_user)
             except Exception as exc:  # noqa: BLE001
                 await self._emit(
                     session_id,
@@ -2251,7 +2263,7 @@ class MiniOrkAcpAgent:
             ]
             for _lane, _rid, ws in others:
                 try:
-                    _workspaces.discard(ws)
+                    _workspaces.discard(ws, approver=zed_user)
                 except Exception:
                     pass
             await self._emit(
@@ -3765,12 +3777,22 @@ class MiniOrkAcpAgent:
 
         home = self._home_for(run_id)
         ws = _workspaces.load(home, run_id)
+        # Lazy ``getpass`` import — the human's card click here is the
+        # approval (merge) / rejection (discard) when the run's review
+        # policy requires it. Resolved before the branch so BOTH paths
+        # carry it; a name defined only inside the ``merge`` branch would
+        # ``NameError`` on the discard path and be swallowed below.
+        import getpass
+        try:
+            zed_user = f"zed:{getpass.getuser()}"
+        except (OSError, KeyError):
+            zed_user = "zed:unknown"
         if option_id == "merge" and ws is not None:
             # The task's own title is what the user wants in git history.
             base = self._thread_titles.get(thread_id) or self._run_base_titles.get(run_id) or ""
             message = f"{base} (mini-ork {run_id})" if base else f"mini-ork run {run_id}"
             try:
-                result = _workspaces.merge(ws, message=message)
+                result = _workspaces.merge(ws, message=message, approver=zed_user)
             except Exception as exc:  # noqa: BLE001
                 result = {"ok": False, "error": str(exc)}
             if result.get("ok"):
@@ -3800,7 +3822,7 @@ class MiniOrkAcpAgent:
             return
         if option_id == "discard" and ws is not None:
             try:
-                _workspaces.discard(ws)
+                _workspaces.discard(ws, approver=zed_user)
             except Exception as exc:  # noqa: BLE001
                 await self._emit(
                     thread_id,

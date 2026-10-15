@@ -26,7 +26,6 @@ import argparse
 import getpass
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -81,11 +80,15 @@ def _home() -> Path:
 
 
 def _resolve_head(home: Path, run_id: str) -> tuple[str, str]:
-    """Resolve ``(head_sha, base_sha)`` from ``mini_ork.workspaces.load(home, run_id)``.
+    """Resolve ``(tree_sha, base_sha)`` for the run's open workspace.
 
-    Returns ``("", "")`` if the workspace cannot be loaded — the caller will
-    then take the explicit ``--head`` / ``--base`` path or surface the
-    helpful message.
+    ``head_sha`` here is the **tree** sha (``git write-tree`` against a
+    per-call scratch index) — the same value :func:`workspaces.merge`
+    computes at write time. A CLI approval against this sha therefore
+    matches the gate the merge will run, instead of an early ``HEAD`` that
+    Step 1 of ``merge`` is about to overwrite with a fresh commit. Returns
+    ``("", "")`` if the workspace cannot be loaded — the caller takes the
+    explicit ``--head`` / ``--base`` path or surfaces the helpful message.
     """
     try:
         from mini_ork import workspaces  # local import: keeps the CLI usable
@@ -94,24 +97,15 @@ def _resolve_head(home: Path, run_id: str) -> tuple[str, str]:
     ws = workspaces.load(home, run_id)
     if ws is None:
         return "", ""
-    try:
-        completed = subprocess.run(
-            ["git", "-C", str(ws.path), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    tree = workspaces.content_sha(ws)
+    if not tree:
+        # ``content_sha`` returns ``""`` for any git error. An explicit
+        # ``ApprovalError`` here keeps the old behaviour of failing with a
+        # useful message instead of the silent "no workspace" fallback.
         raise ApprovalError(
-            f"cannot resolve HEAD for {run_id!r}: {exc}"
-        ) from exc
-    if completed.returncode != 0:
-        raise ApprovalError(
-            f"git rev-parse HEAD failed for {run_id!r} at {ws.path}: "
-            f"{(completed.stderr or '').strip() or 'exit ' + str(completed.returncode)}"
+            f"cannot compute content sha for {run_id!r} at {ws.path}"
         )
-    return completed.stdout.strip(), (ws.base_sha or "")
+    return tree, (ws.base_sha or "")
 
 
 def _resolve_db_path(db: str | None) -> tuple[str, Path]:
@@ -126,7 +120,7 @@ def _resolve_db_path(db: str | None) -> tuple[str, Path]:
 
 
 def _cmd_list(args: argparse.Namespace) -> int:
-    db, _home_path = _resolve_db_path(args.db)
+    db, home_path = _resolve_db_path(args.db)
     rows = pending(db_path=db)
     merge_rows = [
         dict(r) for r in rows
@@ -143,13 +137,62 @@ def _cmd_list(args: argparse.Namespace) -> int:
     for r in node_rows:
         r.setdefault("context", {}).setdefault("kind", "node")
 
+    # Workspaces awaiting a human Merge decision. Read-only: no DB writes
+    # beyond what ``is_approved`` / ``content_sha`` already do. Skipped
+    # unless the policy's ``before_merge`` is ``required`` — this is the
+    # run-loop-shaped gate ``workspaces.merge`` enforces at write time.
+    awaiting_rows: list[dict] = []
+    try:
+        from mini_ork import workspaces  # local import keeps the CLI usable
+        from mini_ork.gates import merge_approval
+    except ImportError:
+        workspaces = None  # type: ignore[assignment]
+        merge_approval = None  # type: ignore[assignment]
+    if workspaces is not None and merge_approval is not None:
+        try:
+            policy = load_policy(home=home_path)
+        except (ValueError, OSError):
+            policy = None
+        if policy is not None and policy.before_merge == "required":
+            pending_runs = {
+                (row.get("gate_id") or "").partition(":")[2]
+                for row in merge_rows
+            }
+            try:
+                open_workspaces = workspaces.list_open(home_path)
+            except OSError:
+                open_workspaces = []
+            for ws in open_workspaces:
+                if ws.run_id in pending_runs:
+                    continue  # already listed as a pending merge row
+                tree = workspaces.content_sha(ws)
+                if not tree:
+                    continue
+                if merge_approval.is_approved(
+                    ws.run_id, tree,
+                    base_sha=ws.base_sha,
+                    db_path=db,
+                    env=os.environ,
+                ):
+                    continue  # already approved against the current content
+                if not _task_run_published(ws.run_id, db):
+                    continue
+                awaiting_rows.append({
+                    "kind": "merge",
+                    "state": "awaiting",
+                    "run": ws.run_id,
+                    "branch": ws.branch,
+                    "tree": tree,
+                    "base_sha": ws.base_sha,
+                })
+
     if args.json:
         # Flat list preserves the existing output contract: callers iterate
         # ``rows`` and look at ``feature`` / ``context.kind`` to branch.
-        combined = merge_rows + node_rows
+        combined = merge_rows + node_rows + awaiting_rows
         sys.stdout.write(json.dumps(combined, indent=2, sort_keys=True) + "\n")
         return 0
-    if not merge_rows and not node_rows:
+    if not merge_rows and not node_rows and not awaiting_rows:
         sys.stdout.write("no pending approvals\n")
         return 0
     for row in merge_rows:
@@ -167,7 +210,39 @@ def _cmd_list(args: argparse.Namespace) -> int:
             f"node={ctx.get('node_id', ''):<20} "
             f"type={ctx.get('node_type', '')}\n"
         )
+    for row in awaiting_rows:
+        sys.stdout.write(
+            f"{'—':<6} awaiting  {row['run']}  "
+            f"branch={row['branch']}\n"
+        )
     return 0
+
+
+def _task_run_published(run_id: str, db_path: str) -> bool:
+    """``True`` iff ``task_runs.status='published'`` for ``run_id``.
+
+    The ``task_runs`` table lives behind migration 0013; pre-migration DBs
+    never see this row and we simply skip the workspace (the legacy
+    approval flow still gates a merge via ``merge:`` inbox rows).
+    """
+    import sqlite3
+
+    try:
+        con = sqlite3.connect(db_path)
+    except sqlite3.OperationalError:
+        return False
+    try:
+        try:
+            row = con.execute(
+                "SELECT status FROM task_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return False
+    finally:
+        con.close()
+    if row is None:
+        return False
+    return row[0] == "published"
 
 
 def _cmd_show(args: argparse.Namespace) -> int:

@@ -29,9 +29,10 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 
 @dataclass(frozen=True)
@@ -61,7 +62,12 @@ class Workspace:
     home: Path = field(default_factory=Path)
 
 
-def _git(args: list[str], cwd: Path | str, timeout: int = 120) -> tuple[int, str, str]:
+def _git(
+    args: list[str],
+    cwd: Path | str,
+    timeout: int = 120,
+    env: "Mapping[str, str] | None" = None,
+) -> tuple[int, str, str]:
     """Run one git subcommand, return ``(rc, stdout, stderr)``.
 
     A single seam so tests can exercise the real subprocess path without
@@ -69,7 +75,17 @@ def _git(args: list[str], cwd: Path | str, timeout: int = 120) -> tuple[int, str
     non-existent ``cwd`` (Z-W1: callers probe ``main_checkout`` /
     ``is_linked_worktree`` against unknown paths) surfaces as ``rc=128``
     instead of a ``FileNotFoundError`` so callers can fall through.
+
+    ``env`` is merged onto the inherited environment (caller wins on
+    conflict) — used by :func:`content_sha` to point ``GIT_INDEX_FILE``
+    at a per-call scratch index without mutating ``os.environ``.
     """
+    merged_env: dict[str, str] | None
+    if env is None:
+        merged_env = None
+    else:
+        merged_env = dict(os.environ)
+        merged_env.update(env)
     try:
         proc = subprocess.run(
             ["git", *args],
@@ -77,6 +93,7 @@ def _git(args: list[str], cwd: Path | str, timeout: int = 120) -> tuple[int, str
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=merged_env,
         )
     except subprocess.TimeoutExpired as exc:
         return (124, "", f"git timeout: {exc}")
@@ -542,12 +559,86 @@ def status(ws: Workspace) -> dict[str, Any]:
     }
 
 
-def merge(ws: Workspace, message: str) -> dict[str, Any]:
+def content_sha(ws: Workspace) -> str:
+    """The worktree's TREE sha without touching HEAD, the real index, or files.
+
+    ``merge`` step 1 commits the worktree's uncommitted changes first, so a
+    HEAD taken before merging can never equal the tree being merged — but a
+    TREE sha can. Runs ``read-tree HEAD`` + ``add -A`` + ``write-tree``
+    against a per-call ``GIT_INDEX_FILE=<tmpfile>`` so HEAD and the real
+    index are never touched. Returns the tree sha (without quotes); ``""``
+    on any git error (``O_NONBLOCK`` quirks on macOS, missing tmp, rc!=0).
+
+    The temp index MUST live outside the worktree: ``git add -A`` walks the
+    worktree and would otherwise pick up the index file itself, polluting
+    the tree. We keep it in the system temp dir with a per-call prefix and
+    resolve symlinks so macOS's ``/tmp -> /private/tmp`` rewrite does not
+    confuse git's path comparison. The ``.lock`` companion file git
+    creates alongside is unlinked in the same ``finally``.
+
+    For the same content, this equals ``git rev-parse <ws.branch>^{tree}``
+    after ``merge``'s own step-1 commit. The CLI approval at
+    :mod:`mini_ork.cli.approvals_cmd` uses this helper so a CLI approval
+    matches what ``merge`` will compute at write time.
+
+    Edge case not covered by the spec: a force-added ignored file that is
+    staged in the real index but absent from HEAD gets dropped here (the
+    tmp index is seeded from HEAD only). Note this is a known divergence;
+    the kickoff's DoD does not exercise it.
+    """
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=tempfile.gettempdir(),
+            prefix=".mo-content-sha-",
+            delete=False,
+        ) as tmp:
+            tmp_path = os.path.realpath(tmp.name)
+    except OSError:
+        return ""
+    try:
+        env = {"GIT_INDEX_FILE": tmp_path}
+        rc, _, _ = _git(["read-tree", "HEAD"], ws.path, env=env)
+        if rc != 0:
+            return ""
+        rc, _, _ = _git(["add", "-A"], ws.path, env=env)
+        if rc != 0:
+            return ""
+        rc, out, _ = _git(["write-tree"], ws.path, env=env)
+        if rc != 0:
+            return ""
+        return out.strip()
+    except OSError:
+        return ""
+    finally:
+        for suffix in ("", ".lock"):
+            try:
+                os.unlink(tmp_path + suffix)
+            except OSError:
+                pass
+
+
+def merge(
+    ws: Workspace, message: str, *, approver: str | None = None
+) -> dict[str, Any]:
     """Fast-forward (or merge-commit) ``ws.branch`` into ``ws.project``.
 
     For an adopted workspace (``ws.adopted``): the merge still happens
     against the project's current branch (the main checkout), but the
     worktree + branch stay — only the record is deleted.
+
+    When the operator's ``review.yaml`` (or ``MO_REVIEW_BEFORE_MERGE``)
+    sets ``before_merge: required``, the merge is gated on a human
+    approval bound to the worktree's TREE sha:
+
+    * ``approver`` set → record the approval first (the user's
+      "Merge" click is the approval).
+    * then ``merge_approval.require`` checks for an approved row
+      matching this content; if missing, it enqueues a pending row
+      and the project is left untouched.
+
+    Policy ``off`` skips the gate and merges as before. Approval errors
+    are surfaced as ``{"ok": False, "error": ...}``; the gate refuses
+    adds ``needs_approval: True`` so callers can render a hint.
     """
     if not ws.path.is_dir():
         return {"ok": False, "error": f"worktree gone: {ws.path}"}
@@ -572,6 +663,64 @@ def merge(ws: Workspace, message: str) -> dict[str, Any]:
     if int(ahead.strip() or 0) == 0:
         discard(ws)
         return {"ok": True, "merged": None}
+    # Step 2.5: review policy gate. Loads after the nothing-to-merge
+    # short-circuit so a no-op merge doesn't write a pending request;
+    # runs BEFORE any project mutation so the project is untouched on
+    # refusal. Lazy-import keeps ``workspaces`` importable without
+    # pulling the gate modules during boot.
+    try:
+        from mini_ork.gates.merge_approval import (  # noqa: PLC0415 — lazy for cycle isolation
+            ApprovalError,
+            approve as _gate_approve,
+            require as _gate_require,
+        )
+        from mini_ork.gates.review_policy import load_policy  # noqa: PLC0415
+    except ImportError as exc:
+        return {"ok": False, "error": f"approval gate unavailable: {exc}"}
+    try:
+        policy = load_policy(home=str(ws.home) if str(ws.home) else None)
+    except ValueError as exc:
+        return {"ok": False, "error": f"policy invalid: {exc}"}
+    if policy.before_merge == "required":
+        rc, tree_sha, _ = _git(
+            ["rev-parse", f"{ws.branch}^{{tree}}"], ws.path
+        )
+        if rc != 0:
+            return {"ok": False, "error": "could not compute merge tree"}
+        tree = tree_sha.strip()
+        if not tree:
+            return {"ok": False, "error": "could not compute merge tree"}
+        db_path = os.environ.get("MINI_ORK_DB") or str(
+            (ws.home or Path(".mini-ork")) / "state.db"
+        )
+        if approver:
+            try:
+                _gate_approve(
+                    ws.run_id,
+                    tree,
+                    approver=approver,
+                    base_sha=ws.base_sha,
+                    branch=ws.branch,
+                    base_branch=ws.base_branch,
+                    policy=policy,
+                    db_path=db_path,
+                )
+            except ApprovalError as exc:
+                # Includes "refuses inside a run" — the contract is that
+                # a never-merging surface surfaces the error verbatim,
+                # not as needs_approval.
+                return {"ok": False, "error": str(exc)}
+        ok, why = _gate_require(
+            ws.run_id,
+            ws.base_sha,
+            tree,
+            branch=ws.branch,
+            base_branch=ws.base_branch,
+            policy=policy,
+            db_path=db_path,
+        )
+        if not ok:
+            return {"ok": False, "error": why, "needs_approval": True}
     # Step 3: refuse when the project's current branch is not the base branch.
     rc, current_branch, _ = _git(["symbolic-ref", "--short", "HEAD"], project)
     if rc != 0 or current_branch.strip() != ws.base_branch:
@@ -614,7 +763,7 @@ def merge(ws: Workspace, message: str) -> dict[str, Any]:
     return {"ok": True, "merged": merged, "mode": mode}
 
 
-def discard(ws: Workspace) -> dict[str, Any]:
+def discard(ws: Workspace, *, approver: str | None = None) -> dict[str, Any]:
     """Remove the worktree, delete the branch, delete the record — idempotent.
 
     For an adopted workspace: reset the worktree to ``ws.base_sha`` and
@@ -622,7 +771,45 @@ def discard(ws: Workspace) -> dict[str, Any]:
     refuse (the user had dirty edits before the run started and we will
     not throw their work away). In either case the worktree directory and
     its branch are not touched — Zed owns them.
+
+    When ``approver`` is supplied AND the review policy's ``before_merge``
+    is ``required``, the run's pending (or most-recently-approved) row is
+    marked ``rejected`` BEFORE the worktree goes away — the human's
+    Discard click is the rejection. The ledger call is best-effort:
+    ``ApprovalError`` for "no row for this run" / "nothing to reject" is
+    silently swallowed so a Discard never fails because no one requested
+    the merge. Internal discards (e.g. merge's own step-2 short-circuit,
+    launch-failure cleanup) never pass ``approver`` and never touch the
+    ledger.
     """
+    if approver and str(ws.home):
+        try:
+            from mini_ork.gates.merge_approval import (  # noqa: PLC0415
+                ApprovalError,
+                reject as _gate_reject,
+            )
+            from mini_ork.gates.review_policy import load_policy  # noqa: PLC0415
+        except ImportError:
+            pass  # no ledger → nothing to reject
+        else:
+            try:
+                policy = load_policy(home=str(ws.home))
+            except (ValueError, OSError):
+                policy = None
+            if policy is not None and policy.before_merge == "required":
+                db_path = os.environ.get("MINI_ORK_DB") or str(
+                    (ws.home or Path(".mini-ork")) / "state.db"
+                )
+                try:
+                    _gate_reject(
+                        ws.run_id,
+                        approver=approver,
+                        note="discarded",
+                        db_path=db_path,
+                        env=os.environ,
+                    )
+                except ApprovalError:
+                    pass  # "nothing pending" — silent no-op
     project = ws.project
     if ws.adopted:
         if not ws.clean_at_start:

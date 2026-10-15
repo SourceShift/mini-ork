@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as _dt
+import getpass
 import os
 import subprocess
 import sys
@@ -1135,7 +1136,15 @@ async def handle_workspaces(agent: Any, session_id: str, arg: str) -> str:
 
 
 async def handle_merge(agent: Any, session_id: str, arg: str) -> str:
-    """``/merge [run]`` — fast-forward the run's workspace branch into its base."""
+    """``/merge [run]`` — fast-forward the run's workspace branch into its base.
+
+    The human's ``/merge`` click is the approval when the run's review
+    policy requires it. The ``approver`` kwarg is forwarded to
+    ``workspaces.merge``; that helper records the approval against the
+    worktree's TREE sha before stepping into the gate. ``getuser()`` can
+    fail in minimal containers (CI without ``LOGNAME``), so fall back to
+    ``unknown`` rather than refusing a Merge click.
+    """
     from mini_ork import workspaces as _workspaces
 
     run_id = _resolve_review_run_id(agent, session_id, arg)
@@ -1147,17 +1156,28 @@ async def handle_merge(agent: Any, session_id: str, arg: str) -> str:
         return f"Run {run_id} has no open workspace."
     message = _merge_message(agent, session_id, run_id)
     try:
-        result = _workspaces.merge(ws, message=message)
+        zed_user = f"zed:{getpass.getuser()}"
+    except (OSError, KeyError):
+        zed_user = "zed:unknown"
+    try:
+        result = _workspaces.merge(ws, message=message, approver=zed_user)
     except Exception as exc:  # noqa: BLE001
         return f"`/merge` failed: {exc}"
     if not isinstance(result, dict) or not result.get("ok"):
         err = (result.get("error") if isinstance(result, dict) else None) or "unknown error"
+        # Surface the gate's verbatim reason — the worktree is kept so the
+        # user can retry with the same diff once an approval lands.
         return f"`/merge` failed: {err}. The worktree is kept — fix it, then /merge {run_id}."
     return _format_merge_message(ws.base_branch, result)
 
 
 async def handle_discard(agent: Any, session_id: str, arg: str) -> str:
-    """``/discard [run]`` — remove the run's worktree + branch + record."""
+    """``/discard [run]`` — remove the run's worktree + branch + record.
+
+    Forward ``approver=`` to ``workspaces.discard``; the helper best-effort
+    rejects any pending ``merge:<run>`` row when the operator's review
+    policy requires it.
+    """
     from mini_ork import workspaces as _workspaces
 
     run_id = _resolve_review_run_id(agent, session_id, arg)
@@ -1168,7 +1188,11 @@ async def handle_discard(agent: Any, session_id: str, arg: str) -> str:
     if ws is None:
         return f"Run {run_id} has no open workspace."
     try:
-        result = _workspaces.discard(ws)
+        zed_user = f"zed:{getpass.getuser()}"
+    except (OSError, KeyError):
+        zed_user = "zed:unknown"
+    try:
+        result = _workspaces.discard(ws, approver=zed_user)
     except Exception as exc:  # noqa: BLE001
         return f"`/discard` failed: {exc}"
     if not isinstance(result, dict) or not result.get("ok"):

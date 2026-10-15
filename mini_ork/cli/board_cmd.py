@@ -499,11 +499,20 @@ def act(home: Path, verb: str, run_id: str) -> dict[str, Any]:
     ws = workspaces.load(home, run_id)
     if ws is None:
         return {"ok": False, "error": f"run {run_id} has no open workspace"}
+    # Lazy ``getpass`` import — the rest of this module never reads it, and
+    # the kickoff's edit scope is ``act()`` only. ``getuser()`` can fail in
+    # minimal containers, so fall back to ``unknown`` rather than 500ing the
+    # IDE's button click.
+    import getpass
+    try:
+        ide_user = f"ide:{getpass.getuser()}"
+    except (OSError, KeyError):
+        ide_user = "ide:unknown"
     if verb == "merge":
         title = _title_for(home, run_id)
         message = f"{title} (mini-ork {run_id})" if title else f"mini-ork run {run_id}"
-        return workspaces.merge(ws, message=message)
-    return workspaces.discard(ws)
+        return workspaces.merge(ws, message=message, approver=ide_user)
+    return workspaces.discard(ws, approver=ide_user)
 
 
 def _act_kill(home: Path, run_id: str) -> dict[str, Any]:
