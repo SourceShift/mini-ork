@@ -5,7 +5,10 @@
 `.mini-ork/runs/`. Nine `code-fix`, one `framework-edit`.
 
 > **UPDATED 2026-10-15 — action A (REPLAY) DONE. See §0.**
-> Two corrections to the first edition of this doc are in §5.
+> Two corrections to the first edition are in §5. **Every open item (B–F) is
+> dispositioned in §7, with the confirmed root causes and the product call in
+> §8.** Ships as two `framework-edit` runs: `remote-early-death-hardening`
+> (D+E) and `frozen-probe-fixtures` (C).
 
 ---
 
@@ -185,20 +188,116 @@ genuinely live defect in the set.**
 
 ---
 
-## 7. What's left to do (the user's call)
+## 7. Dispositions — every item, resolved on `HEAD` (2026-10-15)
 
-- **B** — Correct `_emit_pass` (`typecheck.py:337`) so the reason string reads
-  *abstained*, not *unparsable*. Cosmetic; NOT a publish blocker. *(Downgraded
-  from the first edition.)*
-- **C** — Enforce the frozen probe fixture at write time (§5). **The one live
-  defect.** Small.
-- **D** — Repro the `survives translation` crash on `HEAD` (diagnostic).
-- **E (new)** — Clear the stale `.node-provider.lock`/lease left by a
-  dirty-engine death, and surface that failure in `task_runs.notes` (§3).
-- **F (new)** — Decide whether a failed run should hard-block the queue (§6.1).
+Each item below was re-investigated on `origin/main` (`19e74c72`) before being
+dispositioned. Two changed severity once the evidence was read properly (§8).
+
+| item | disposition | ships as |
+|---|---|---|
+| **B** | **Dropped.** Cosmetic reason-string only; not a publish blocker. | — |
+| **C** | **Fix.** Frozen-probe-fixture declaration is prose; the enforcement mechanism exists but is unwired. | framework-edit `frozen-probe-fixtures` |
+| **D** | **Fix.** Confirmed live crash — a *remote* run dies when its assembled prompt names a host file outside the four mapped roots. | framework-edit `remote-early-death-hardening` |
+| **E** | **Fix.** `task_runs.notes` is blank exactly when the reason is knowable (5826 = `None` though `NEEDS-CHANGE.md` holds it); stale `.node-provider.lock` survives. | framework-edit `remote-early-death-hardening` |
+| **F** | **No change — the gate is correct.** Product call taken; rationale in §8.4. | — |
 
 **Explicitly NOT recommended:** re-fixing runs 1–3/5–8 (replayed → publishes),
 or treating runs 4/7 as code bugs.
+
+---
+
+## 8. Confirmed root causes (evidence added 2026-10-15)
+
+### 8.1 — D was MISATTRIBUTED in the first edition, and it is live
+
+The first edition called the `survives translation` crash a *repair-retry*
+artefact and "suspected live but unverified". Both are wrong. The crash is on
+the **implementer's own recipe prompt**, on a **remote** run:
+
+```
+.mini-ork/runs/run-1791911811-5826/NEEDS-CHANGE.md:8
+gateway lane 'deepseek_flash,minimax,kimi' (used by worker: implementer)
+failed: dispatcher crashed: host path in 'text' survives translation:
+'\n\n--- Recipe prompt (system context) ---\n# Implementer — code_fix …
+```
+
+The offending string is `/Volumes/docker-ssd/ps/mo-daytona-e2e-kickoff.md`,
+carried inside `context-pack.v2.json`. Structure of the defect:
+
+- The whole LLM prompt rides the **`stdin`** channel (`dispatch/core.py:223`
+  "The prompt rides on stdin"). `core.py:419` applies `path_map.text(stdin)`,
+  then `core.py:440` asserts no host path survives.
+- `PathMap` (`mini_ork/runtime/path_map.py:100`) maps exactly **four shipped
+  roots** — `target`, `run_dir`, `home`, `engine`. `text()` rewrites by prefix
+  *replace*, so a host path with **no sandbox counterpart cannot be rewritten**.
+- The kickoff at `/Volumes/docker-ssd/ps/mo-daytona-e2e-kickoff.md` is under
+  none of the four → it survives → on a **real** remote sandbox the assert is
+  **fatal** (`core.py:440`); the local/docker backends only `warning` it.
+
+Reproduced on `HEAD` with `PathMap.from_roots`:
+
+```
+prompt : "… Re-run the kickoff /Volumes/docker-ssd/ps/mo-daytona-e2e-kickoff.md …"
+text()  : unchanged (no mapped prefix matches)
+assert  : LEAK -> channel='text'
+control : "edit /Volumes/…/mo-daytona-e2e-target/calc.py" -> /workspace/target/calc.py -> OK
+```
+
+**Why the §0 replay still published:** its context pack did not happen to name
+an out-of-root host file. The crash is data-dependent, which is why it looks
+intermittent. **Ship:** sanitize residual host paths *in the text channel only*;
+keep `argv`/`env` fail-closed (those the child actually `open`s).
+
+### 8.2 — C: the frozen mechanism exists and is unwired
+
+`mini_ork/vcs/repo_integrity_guard.py` already implements a fail-closed frozen
+list — `config/kernel-frozen.yaml` (`paths:` fnmatch globs), `load_frozen_paths`
+(falls back to a built-in list on a missing/unparsable file) and
+`frozen_hits(changed, patterns)`. **Nothing calls `frozen_hits` or
+`load_frozen_paths`** (grep: zero call sites outside the module); the only
+consumer of the module is `cli/main.py:1556 check_and_heal()`.
+
+Separately: the code arm is already safe — `probe_scorer.py:787` **deletes**
+`probes/` from each arm's worktree copy, so an arm never touches the real
+fixture. The hazard is a **plain run targeting the repo** (run `82118`), which
+can edit `recipes/code-fix/probes/fixtures/**` in the primary. The declaration
+in `probe-{1,2,3}.md` is prose; `kernel-frozen.yaml`'s own header scopes it to
+"auto-opened (origin=auto-triage) framework-edit" runs only.
+
+**Ship:** list the fixture globs in `config/kernel-frozen.yaml` **and** enforce
+`frozen_hits` on the authored patch (publish/apply), not only for auto-triage.
+
+### 8.3 — E: notes are blank exactly when the reason is knowable
+
+`task_runs.notes` across the failure set:
+
+```
+48337 None   97590 None   41843 None   5826 None   57872 None
+90288 'planner_dispatch_rc_1'   79155 'planner_dispatch_rc_43'   50438 'planner_dispatch_rc_1'
+82118 'reaped: dispatcher pid … gone'   61320 'planner_dispatch_rc_65; reaped: …'
+```
+
+`close_run_record` (`mini_ork/orchestration/run_reaper.py:147`) writes a note
+from a fixed vocabulary ("lifecycle exited without a verdict", "deadline hit
+before a verdict", …). A **worker-node** dispatch crash (5826) has no
+`planner_dispatch_rc_*` marker, so it falls through to `None` — even though the
+exact reason sits in the run dir (`NEEDS-CHANGE.md`, `retry-hint.json`,
+`repair-*.log`). **Ship:** derive the note from those artefacts when the
+vocabulary has nothing to say. Also: `.node-provider.lock` (0 bytes,
+`remote/providers/base.py:73`) is released but never unlinked; clear it for a
+run that reached a terminal state.
+
+### 8.4 — F: the block is correct (decision)
+
+`dispatch_key` (`recovery/retry_notify.py:951`) scopes a pending fix to
+`<kickoff realpath>#<first non-empty line>` — the *task*, not the queue. A
+credential failure therefore re-blocks **only that kickoff+step**, and is
+skipped entirely when `needs_change.kind ∈ {interrupted, not-started}`
+(`NO_CHANGE_KINDS`). Refusing to re-dispatch a step that will fail identically
+saves money; the escape hatch (`--ack-change`, `MO_IGNORE_PENDING_FIX=1`) is
+named in the message. **Product call: keep it.** The first edition's "a single
+credential failure parks the queue" overstated the blast radius — it parks one
+task, which is the point.
 
 ---
 
