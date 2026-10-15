@@ -96,7 +96,12 @@ ALLOW_HIGH_BLAST_RADIUS: this operator-authored step intentionally edits auto_re
 - same fingerprint whose earlier epic `failed` → refused;
 - `MO_AUTO_ESCALATE=0` → `decide` returns what it returned before this step;
 - a `change`-layer diagnosis never escalates;
-- `file_diagnosis` attributes from the diagnosis even when no traceback exists.
+- `file_diagnosis` attributes from the diagnosis even when no traceback exists;
+- the policy as wired (commit `d1606e13`): a `model`-source engine diagnosis at
+  confidence 0.90 with 0 labels escalates (bootstrap bar 0.85), at 0.80 is
+  refused with the bar in the reason, and with ≥30 labels and
+  `calibrated_bar=None` is refused as uncertifiable — `gather_inputs` must pass
+  `source` / `confidence` through unchanged so these paths are reachable.
 
 Also run `tests/unit/test_auto_repair.py tests/unit/test_triage_failures_py.py tests/unit/test_triage_auto_repair_gate.py tests/unit/test_diagnose.py tests/unit/test_frozen_kernel.py`.
 
