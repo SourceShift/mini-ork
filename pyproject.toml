@@ -40,6 +40,14 @@ runtime = ["verifiers>=0.2.0,<0.3"]
 # optional add. The bring-your-own-evaluator seam (backends.py) imports without
 # it; only the framework-composing adapters require it. Attribution: THIRD_PARTY.md
 optimize = ["gepa>=0.1.4,<0.2"]
+# Chat transports (mini_ork/integrations/): Discord's Interactions tier verifies
+# `X-Signature-Ed25519` over the raw body, and Ed25519 is not something this repo
+# hand-rolls. Optional by design: the Gateway tier and `import
+# mini_ork.integrations.discord` need nothing, and the webhook *fails closed*
+# with a message naming this extra when the package is absent — an endpoint that
+# accepted unverified input would be worse than one that refuses to start.
+# Required deps stay PyYAML + jsonschema.
+integrations = ["cryptography>=42"]
 # Document preview extraction (mini_ork/documents/). The default tier is the
 # host rasteriser (macOS qlmanage/sips, pdftoppm from poppler) and needs no
 # Python dependency at all; this extra is the *predictable* tier for a host

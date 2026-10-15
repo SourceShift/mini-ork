@@ -27,6 +27,15 @@ What is here:
     and an Events API webhook with Slack's ``v0`` signature for the secure tier,
     over the same :func:`~mini_ork.threads.service.deliver` seam.
 
+``discord``
+    :class:`~mini_ork.integrations.discord.DiscordTransport` — the Discord
+    Gateway over the same :mod:`~mini_ork.integrations._ws` client for the
+    simple tier and an Ed25519-signed Interactions webhook for the secure tier.
+    The webhook's signature check is the one place this package uses a
+    third-party library: ``cryptography`` lives behind the ``integrations``
+    extra and is imported lazily, so nothing here needs it until a signed
+    delivery has to be verified.
+
 **Importing this package is inert.** No token is resolved, no socket is opened,
 no ``getUpdates`` is called: a transport is a *class* here, and the work starts
 when one is constructed. That is deliberate — ``import mini_ork.integrations``
@@ -47,6 +56,14 @@ from mini_ork.integrations._base import (
     Transport,
     thread_key,
 )
+from mini_ork.integrations.discord import (
+    BOT_TOKEN_VAULT_KEY as DISCORD_BOT_TOKEN_VAULT_KEY,
+    PUBLIC_KEY_VAULT_KEY as DISCORD_PUBLIC_KEY_VAULT_KEY,
+    DiscordConfigError,
+    DiscordError,
+    DiscordSignatureError,
+    DiscordTransport,
+)
 from mini_ork.integrations.slack import (
     APP_TOKEN_VAULT_KEY as SLACK_APP_TOKEN_VAULT_KEY,
     BOT_TOKEN_VAULT_KEY as SLACK_BOT_TOKEN_VAULT_KEY,
@@ -66,11 +83,17 @@ from mini_ork.integrations.telegram import (
 )
 
 __all__ = [
+    "DISCORD_BOT_TOKEN_VAULT_KEY",
+    "DISCORD_PUBLIC_KEY_VAULT_KEY",
     "NAME",
     "SLACK_APP_TOKEN_VAULT_KEY",
     "SLACK_BOT_TOKEN_VAULT_KEY",
     "SLACK_SIGNING_SECRET_VAULT_KEY",
     "TOKEN_VAULT_KEY",
+    "DiscordConfigError",
+    "DiscordError",
+    "DiscordSignatureError",
+    "DiscordTransport",
     "PollResult",
     "SlackConfigError",
     "SlackError",
