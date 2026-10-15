@@ -10,6 +10,10 @@ The motivating shape is ``run-1791914481-48337``: an engine fault at
 ``deliver/publisher`` with ``routes_to: fix_epic`` and no traceback — the case
 ``triage_run`` cannot file (it re-decides blame from traceback frames) and
 ``auto_repair.decide`` used to hand to a human.
+
+The parked half (SDE-3a pass 2): once a run is in ``waiting_on_fix`` the fix
+epic owns the failure, so ``decide`` returns ``none`` citing it and ``apply`` /
+``maybe_repair`` leave ``repair.json`` byte-identical and spawn nothing.
 """
 from __future__ import annotations
 
@@ -369,16 +373,70 @@ def test_escalate_twice_reuses_the_bug_row_and_the_epic(home, monkeypatch, spawn
                  (esc.ESCALATE_EVENT,))[0][0] == 2
 
 
-def test_repeat_failure_is_stopped_not_re_escalated(home, monkeypatch, spawned):
-    """The stop rules outrank the escalate rule — deliberately.
+def test_parked_run_is_inert_to_auto_repair(home, monkeypatch, spawned):
+    """Once parked on a fix epic, the loop does NOTHING to the run.
 
-    ``escalate`` sits *after* rule 2 (the kickoff's placement), so a run that
-    fails a second time with the SAME signature is a no-progress give-up rather
-    than a second fix epic: the loop has already parked it on one. The result
-    must still be a single bug row and a single epic.
+    ``escalation.escalate`` recorded ``waiting_on_fix`` + the epic, so the epic
+    owns the failure now. Every later pass over the same failure — the sweep,
+    the recovered run's own hook, a re-decide — must therefore be a pure no-op:
+    ``decide`` returns ``none`` citing the epic, and ``apply`` leaves
+    ``repair.json`` byte-identical (no attempt appended, no state flip, no run
+    event) and spawns nothing. Pass 1 kept the stop rules ahead of the escalate
+    rule and recorded a second same-signature pass as a "no progress" give-up —
+    which is the wrong verdict for a run that is waiting, not stalling, and
+    which also drifted the attempt count on every sweep.
+    """
+    _stub_diagnosis(monkeypatch, ENGINE_DIAGNOSIS)
+    first = ar.apply(home, RUN, ar.decide(home, RUN))
+    assert first["escalated"] is True
+    assert _read_repair(home)["state"] == "waiting_on_fix"
+
+    repair_path = home / "runs" / RUN / "repair.json"
+    before = repair_path.read_bytes()
+    events_before = _count(home, "run_events")
+
+    decision = ar.decide(home, RUN)
+    assert decision["action"] == "none"
+    assert decision["stop"] is False
+    assert decision["fix_epic_id"] == first["fix_epic_id"]
+    assert "waiting on fix epic" in decision["reason"]
+    assert first["fix_epic_id"] in decision["reason"]
+
+    result = ar.apply(home, RUN, decision)
+    assert result["action"] == "none"
+    assert result["parked"] is True
+    assert result["fix_epic_id"] == first["fix_epic_id"]
+    assert repair_path.read_bytes() == before  # byte-identical: nothing written
+
+    # ``maybe_repair`` is the production entry point for that decision: a none
+    # decision reaches it too, and must leave the record alone (`_mark_repaired_if_done`
+    # is gated on published/done, so a still-failed parked run is never rewritten).
+    assert ar.maybe_repair(home, RUN) is not None
+    assert repair_path.read_bytes() == before
+
+    # Nothing re-filed, nothing re-notified, nothing spawned.
+    assert _count(home, "run_events") == events_before
+    assert _count(home, "bug_reports") == 1
+    assert _count(home, "epics") == 1
+    assert _count(home, "mo_inbox_gates") == 1
+    assert _recover_spawns(spawned) == []
+
+
+def test_a_run_that_is_not_parked_keeps_the_pass_1_stop(home, monkeypatch, spawned):
+    """The guard keys on ``waiting_on_fix`` alone — any other state is pass 1.
+
+    A run whose park was cleared (SDE-4 revived it; or the state was rewritten)
+    is an ordinary failed run again: the same failure signature must hit the
+    no-progress stop rule and be recorded as a ``human`` give-up, exactly as it
+    was before the guard existed.
     """
     _stub_diagnosis(monkeypatch, ENGINE_DIAGNOSIS)
     ar.apply(home, RUN, ar.decide(home, RUN))
+
+    repair_path = home / "runs" / RUN / "repair.json"
+    repaired = json.loads(repair_path.read_text())
+    repaired["state"] = "repairing"  # NOT waiting_on_fix any more
+    repair_path.write_text(json.dumps(repaired))
 
     second = ar.decide(home, RUN)
     assert second["action"] == "human"
@@ -389,6 +447,32 @@ def test_repeat_failure_is_stopped_not_re_escalated(home, monkeypatch, spawned):
     assert _count(home, "bug_reports") == 1
     assert _count(home, "epics") == 1
     assert _recover_spawns(spawned) == []
+
+
+def test_mo_auto_repair_zero_outranks_the_parked_guard(home, monkeypatch, spawned):
+    """The off switch is checked first: a parked run reports it verbatim.
+
+    ``MO_AUTO_REPAIR=0`` sits above the parked guard in ``_decide_policy``, so
+    the operator's opt-out reason wins over the parked reason, ``maybe_repair``
+    never even decides, and the parked record stands untouched either way (the
+    ``apply`` short-circuit keys on the run's state, not on the reason).
+    """
+    _stub_diagnosis(monkeypatch, ENGINE_DIAGNOSIS)
+    first = ar.apply(home, RUN, ar.decide(home, RUN))
+    assert first["escalated"] is True
+
+    repair_path = home / "runs" / RUN / "repair.json"
+    before = repair_path.read_bytes()
+
+    monkeypatch.setenv("MO_AUTO_REPAIR", "0")
+    decision = ar.decide(home, RUN)
+    assert decision["action"] == "none"
+    assert "MO_AUTO_REPAIR=0" in decision["reason"]
+    assert "waiting on fix epic" not in decision["reason"]
+
+    assert ar.maybe_repair(home, RUN) is None
+    assert ar.apply(home, RUN, decision)["action"] == "none"
+    assert repair_path.read_bytes() == before
 
 
 def test_apply_escalate_keeps_the_parked_state_and_appends_the_attempt(home, monkeypatch,
