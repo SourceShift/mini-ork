@@ -57,6 +57,9 @@ class StaticProvider:
     """The default provider: re-select the operator's node, never create one."""
 
     name = NAME
+    kind = "self-hosted node-agent (config/nodes.yaml)"
+    sdk_module = ""
+    credential_keys: tuple[str, ...] = ()
 
     def create(self, *, run_id: str, profile: Any, env: Mapping[str, str],
                engine_root: str) -> NodeEndpoint:

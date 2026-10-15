@@ -258,6 +258,12 @@ class SandboxNodeProvider:
     verbs (``create`` / ``attach`` / ``release`` / ``reap``) are shared."""
 
     name = ""
+    # What the UI shows about this provider without touching the network: a
+    # one-line description, the SDK module that must be importable, and the
+    # credential NAMES it reads through the vault (never values).
+    kind = "cloud sandbox per run"
+    sdk_module = ""
+    credential_keys: tuple[str, ...] = ()
 
     # --- hooks ---------------------------------------------------------------
 

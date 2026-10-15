@@ -229,6 +229,9 @@ class _DaytonaSandbox:
 
 class DaytonaProvider(SandboxNodeProvider):
     name = NAME
+    kind = "Daytona sandbox per run"
+    sdk_module = "daytona"
+    credential_keys = ("DAYTONA_API_KEY",)
 
     def boot_options(self, profile: Any, env: Mapping[str, str]) -> BootOptions:
         return DaytonaOptions.resolve(profile, env).boot

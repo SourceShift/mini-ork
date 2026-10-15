@@ -196,6 +196,9 @@ class _E2BSandbox:
 
 class E2BProvider(SandboxNodeProvider):
     name = NAME
+    kind = "E2B Firecracker microVM per run"
+    sdk_module = "e2b"
+    credential_keys = ("E2B_API_KEY",)
 
     def boot_options(self, profile: Any, env: Mapping[str, str]) -> BootOptions:
         return E2BOptions.resolve(profile, env).boot

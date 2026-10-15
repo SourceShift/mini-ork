@@ -206,6 +206,9 @@ class _ModalSandbox:
 
 class ModalProvider(SandboxNodeProvider):
     name = NAME
+    kind = "Modal gVisor sandbox per run"
+    sdk_module = "modal"
+    credential_keys = ("MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET")
 
     def boot_options(self, profile: Any, env: Mapping[str, str]) -> BootOptions:
         return ModalOptions.resolve(profile, env).boot

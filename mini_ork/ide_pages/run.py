@@ -445,6 +445,17 @@ def _state_chip(run: Run) -> dict[str, Any]:
     return S.chip("running", "blue")
 
 
+def _placement_chip(run: Run) -> dict[str, Any] | None:
+    """``remote · <environment>`` for a run whose nodes executed off this machine
+    (``run_profile.json`` records the resolved placement and ``--env``), so a
+    run on a Daytona/E2B/Modal sandbox or a remote node says so in its header."""
+    profile = _json_obj(run.run_dir / "run_profile.json") or {}
+    if str(profile.get("placement") or "").strip().lower() != "remote":
+        return None
+    env = str(profile.get("environment") or "").strip()
+    return S.chip(f"remote · {env}" if env else "remote", "blue")
+
+
 def _elapsed(run: Run) -> str:
     start = _epoch(run.row.get("created_at"))
     end = _epoch(run.row.get("ended_at")) if not _running(run) else None
@@ -1928,6 +1939,9 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
     }[resolved]()
     chips = [S.chip(outcome["state"], outcome["tone"]),
              S.chip(S.money(_cost(run))), S.chip(_elapsed(run))]
+    placement = _placement_chip(run)
+    if placement:
+        chips.insert(1, placement)
     # A run that stopped on a question says so in the header: the Questions tab
     # is otherwise an empty tab on every run that never asked anything, and a
     # blocked run would look like any other.
@@ -1992,6 +2006,9 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     done = sum(1 for n in run.nodes if n.state == "done")
     chips = [_state_chip(run), S.chip(f"{done}/{len(run.nodes)} nodes"),
              S.chip(S.money(_cost(run))), S.chip(_elapsed(run))]
+    placement = _placement_chip(run)
+    if placement:
+        chips.insert(1, placement)
     sections = {
         "dag": lambda: _dag_tab(run, args.get("node")),
         "kickoff": lambda: _kickoff_tab(run),
