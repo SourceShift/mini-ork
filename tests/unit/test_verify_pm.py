@@ -179,6 +179,11 @@ def test_classify_spawn_toolchain_on_missing_binary():
     assert pm.classify_spawn(["node", "x.js"], 1, "Error: spawn ENOENT") == "toolchain"
 
 
+def test_classify_spawn_toolchain_on_a_tool_killed_by_a_signal():
+    assert pm.classify_spawn(["eslint", "a.ts"], -15, "") == "toolchain"
+    assert pm.classify_spawn(["eslint", "a.ts"], -9, "partial output") == "toolchain"
+
+
 def test_classify_spawn_is_fail_closed():
     """The tool ran and rejected the input is NOT our call — "" keeps today's
     behaviour (the caller maps it to `code`). Nothing here abstains."""
@@ -384,3 +389,16 @@ def test_tier1_does_not_hand_a_deleted_file_to_eslint(tmp_path):
     assert (repo / "eslint-was-run").is_file(), evidence
     assert "deleted_files=1" in evidence
     assert "deleted: src/removed.test.ts" in evidence
+
+
+def test_tier1_abstains_when_eslint_is_killed_by_a_signal(tmp_path):
+    """A linter killed mid-run said nothing about the code: tier1 must abstain
+    (failure_kind toolchain), not report a code failure that buys a revise."""
+    repo, run_dir = _build_fixture(tmp_path)
+    _stub(repo / "node_modules" / ".bin" / "eslint", "#!/bin/sh\nkill -TERM $$\n")
+
+    rc, payload, evidence = _run_verifier(repo, run_dir)
+
+    assert payload["pass"] is False, evidence
+    assert payload["lint_rc"] == -15, evidence
+    assert payload["failure_kind"] == "toolchain", evidence
