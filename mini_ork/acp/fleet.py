@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from mini_ork.acp import node_status
 from mini_ork.acp.diffs import cached_or_computed
 from mini_ork.acp.history import list_runs
 from mini_ork.acp.task_state import MARKS, run_mark, task_state
@@ -361,7 +362,7 @@ def _steps(home: Path, run_id: str) -> list[dict[str, Any]]:
         state = "running"
         if end_ts is not None:
             finish_reason = str((end_payload or {}).get("finish_reason") or "")
-            state = "failed" if finish_reason not in ("done", "") else "done"
+            state, _ = node_status.node_end_state(end_payload)
         out.append(
             {
                 "node_id": node_id,

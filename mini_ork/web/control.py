@@ -500,6 +500,12 @@ def _close_dangling_node_events(db: StateDB, task_run_id: str) -> None:
                 "node_type": ntype,
                 "verdict": "CRASH",
                 "interrupted": True,
+                # ``interrupted`` is in run_events.finish_reason's own CHECK
+                # vocabulary, so the synthetic row is self-describing for every
+                # reader instead of relying on them to interpret ``verdict``.
+                # Without it a reader keyed on finish_reason alone saw "" and
+                # reported the node "done" (run-1791930074-82118).
+                "finish_reason": "interrupted",
                 "duration_ms": 0,
             }
             con.execute(

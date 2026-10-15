@@ -97,6 +97,9 @@ def seed_event(
     node_type: str = "",
     model_lane: str = "",
     finish_reason: str = "",
+    verdict: str = "",
+    interrupted: bool = False,
+    error: str = "",
     created_at: int = NOW - 100,
 ) -> None:
     """Insert one run_events lifecycle row with a node payload."""
@@ -107,6 +110,12 @@ def seed_event(
         payload["model_lane"] = model_lane
     if finish_reason:
         payload["finish_reason"] = finish_reason
+    if verdict:
+        payload["verdict"] = verdict
+    if interrupted:
+        payload["interrupted"] = True
+    if error:
+        payload["error"] = error
     con = sqlite3.connect(home / "state.db")
     con.execute(
         """
@@ -341,6 +350,46 @@ def test_card_steps_with_durations_and_failed_step(home: Path):
     out = fl.render_card(card, now=NOW, serve_url=None)
     assert "| `planner` | planner | `opus` | 0m40s | done |" in out
     assert "| `implementer` | implementer | `codex` | 2m30s | failed (error) |" in out
+
+
+def test_reaper_kill_close_step_reads_failed_not_done(home: Path):
+    """The reaper's synthetic ``node_end`` must read "failed" here too.
+
+    Regression for run-1791930074-82118: ``_steps`` classified on
+    ``finish_reason`` alone, so the kill-close payload (verdict CRASH,
+    interrupted, no finish_reason) became ``done`` on the node view while
+    ``task_state`` read the same row as CRASH in the run header. Both now read
+    ``mini_ork.acp.node_status``, so the two cannot disagree.
+    """
+    seed_run(home, run_id="r-kill", status="failed",
+             created_at=NOW - 400, updated_at=NOW)
+    seed_event(home, run_id="r-kill", event_id="e1", event_type="node_start",
+               node_id="test", node_type="verifier", model_lane="shell",
+               created_at=NOW - 120)
+    seed_event(home, run_id="r-kill", event_id="e2", event_type="node_end",
+               node_id="test", node_type="verifier", model_lane="shell",
+               verdict="CRASH", interrupted=True, created_at=NOW)
+
+    step = fl.run_card(home, "r-kill")["steps"][0]
+    assert step["state"] == "failed"
+    assert step["finish_reason"] == ""
+
+    # Same payload, same answer: the run-header reader must not disagree.
+    from mini_ork.acp import node_status, task_state
+
+    payload = {"node_id": "test", "node_type": "verifier", "verdict": "CRASH",
+               "interrupted": True, "duration_ms": 0}
+    assert node_status.node_end_state(payload)[0] == step["state"]
+    assert task_state._node_end_failure(payload) == "CRASH"
+
+    # The reaper now also writes the marker itself, so a fresh row needs no
+    # interpretation at all.
+    seed_event(home, run_id="r-kill", event_id="e3", event_type="node_end",
+               node_id="other", node_type="verifier", model_lane="shell",
+               verdict="CRASH", interrupted=True, finish_reason="interrupted",
+               created_at=NOW)
+    steps = {s["node_id"]: s for s in fl.run_card(home, "r-kill")["steps"]}
+    assert steps["other"]["state"] == "failed"
 
 
 def test_a_new_attempt_after_a_revise_verdict_is_running(home: Path):

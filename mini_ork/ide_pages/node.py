@@ -54,7 +54,8 @@ from mini_ork.ide_pages.node_changes import (
     build_changes_view,
     plain_reason,
 )
-from mini_ork.ide_pages.run import Run, Node, _epoch, _load, _wall, _REVIEW_TYPES, plan_artifact
+from mini_ork.ide_pages.run import (Run, Node, _epoch, _load, _wall, _STATE_TEXT,
+                                    _REVIEW_TYPES, plan_artifact)
 
 # Live-detection window per the kickoff §"live": running AND transcript grew
 # in the last 120 s. Named so a future tweak is one edit.
@@ -2838,6 +2839,38 @@ def _overview_failure_reason(run: Run, node: Node, run_dir: Path) -> str | None:
     return None
 
 
+def _overview_friendly_reason(run: Run, node: Node, run_dir: Path) -> str | None:
+    """A plain-language reason for a failed node, else ``None``.
+
+    Prefers the retry hint's own one-line summary (``retry_hint.load_or_compute``
+    with ``write=False``, the same read the run page and the outcome panel use)
+    when that hint is about this node — it already classifies the interesting
+    shapes, including the reaper's interrupted marker
+    (``_case_interrupted``: "Interrupted during <node>: the run stopped before
+    the step finished. Resume from it."). Falls back to the engine-local
+    ``_overview_failure_reason``.
+
+    Best-effort by construction: the hint cache and its DB reads must never
+    break a node tab, so every failure resolves to the local reason instead.
+    """
+    if node.state != "failed":
+        return None
+    summary = ""
+    try:
+        from mini_ork.recovery import retry_hint
+
+        hint = retry_hint.load_or_compute(run.home, run.id, write=False)
+        if isinstance(hint, dict):
+            failed_node = str(hint.get("failed_node") or "")
+            if failed_node in ("", node.id):
+                needs_change = hint.get("needs_change")
+                if isinstance(needs_change, dict):
+                    summary = str(needs_change.get("summary") or "").strip()
+    except Exception:  # noqa: BLE001 — a hint must never break a node tab
+        summary = ""
+    return summary or _overview_failure_reason(run, node, run_dir)
+
+
 def _overview_reviewer_headline(run_dir: Path, node: Node) -> dict[str, str]:
     """``"<verdict> — <first reason>"`` from ``review-<node>.json``.
 
@@ -3027,10 +3060,20 @@ def _overview_facts(run: Run, node: Node, run_dir: Path,
     """
     items: list[dict[str, Any]] = []
 
-    # Status — state (+ verdict colour from any review JSON).
-    state_text = str(node.state or "—")
-    state_color = _overview_state_color(run_dir, node, state_text)
+    # Status — state (+ verdict colour from any review JSON). The word comes
+    # from the page vocabulary (``run._STATE_TEXT``) rather than the raw state
+    # token, so this tab and the header's "K not run" agree; the *colour* still
+    # keys off the raw state, which is what ``_overview_state_color`` matches.
+    raw_state = str(node.state or "")
+    state_text = _STATE_TEXT.get(raw_state, raw_state or "—")
+    state_color = _overview_state_color(run_dir, node, raw_state or "—")
     items.append({"k": "Status", "v": state_text, "c": state_color})
+
+    # Reason — one plain-language line, only for a failed node. ``done`` nodes
+    # stay quiet; the per-kind headline below carries their story.
+    reason = _overview_friendly_reason(run, node, run_dir)
+    if reason:
+        items.append({"k": "Reason", "v": reason, "c": "red"})
 
     # Model — family · lane.
     model = " · ".join(p for p in (node.family, node.role_lane) if p) or "—"

@@ -27,6 +27,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from mini_ork.acp import node_status
+
 # Persistent per-run diffstat cache. Distinct from ``diffs.CACHE_NAME``
 # (``"acp-diffs.json"``), which is run-produced only. ``diffstat.json``
 # holds the *aggregated* ``(added, removed)`` so the per-poll ``board
@@ -153,46 +155,26 @@ def _current_step(events: list[dict[str, Any]]) -> str:
     return last_seen
 
 
-# ``finish_reason`` values a completed node carries. Anything else explicit
-# ("error", "timeout", "interrupted", …) is a failure. ``levels_unverified`` is
-# the publisher's own abstain signal (``publisher.py`` returns
-# ``(0, "levels_unverified")``); it is a withheld publish, not a crashed node —
-# treating it as a failure would blame the publisher and make every withheld
-# surface decline.
-_TERMINAL_OK_FINISH = ("done", "skipped", "abstain", "levels_unverified")
-
-# Payload ``verdict`` values that say the node's own judgement was negative.
-_FAIL_VERDICTS = (
-    "request_changes", "escalate", "crash", "needs_revision", "fail", "failed",
-)
+# The classification rule itself lives in ``mini_ork.acp.node_status`` so that
+# the node view (``acp.fleet._steps``) and this run-header reader cannot drift
+# apart again. These two names stay exported for the comments and callers that
+# cite them.
+_TERMINAL_OK_FINISH = node_status.TERMINAL_OK_FINISH
+_FAIL_VERDICTS = node_status.FAIL_VERDICTS
 
 
 def _node_end_failure(payload: dict[str, Any]) -> str | None:
     """The reason string when a ``node_end`` payload *says* it failed, else ``None``.
 
-    Only an explicit failure signal counts (kickoff change 1):
-
-    * a ``finish_reason`` other than ``done`` / ``skipped`` / ``abstain`` /
-      ``levels_unverified``;
-    * a ``verdict`` in ``{REQUEST_CHANGES, ESCALATE, CRASH, needs_revision,
-      fail, failed}`` (case-insensitive);
-    * a non-empty ``error``.
-
-    A missing ``finish_reason`` with no other failure signal is NOT a failure.
-    The live bug this rule closes: code-fix implementer ``node_end`` events
-    carry no ``finish_reason``, so the old "missing ⇒ unknown ⇒ failed" rule
-    blamed the implementer for a run that never failed at all.
+    Thin wrapper over :func:`mini_ork.acp.node_status.node_end_state`: only an
+    explicit failure signal counts (kickoff change 1), and a missing
+    ``finish_reason`` with no other failure signal is NOT a failure. The live
+    bug that rule closes: code-fix implementer ``node_end`` events carry no
+    ``finish_reason``, so the old "missing ⇒ unknown ⇒ failed" reading blamed
+    the implementer for a run that never failed at all.
     """
-    reason = payload.get("finish_reason")
-    if reason is not None and str(reason) != "":
-        reason = str(reason)
-        return None if reason in _TERMINAL_OK_FINISH else reason
-    verdict = str(payload.get("verdict") or "")
-    if verdict.lower() in _FAIL_VERDICTS:
-        return verdict
-    if str(payload.get("error") or ""):
-        return "error"
-    return None
+    state, reason = node_status.node_end_state(payload)
+    return reason if state == node_status.FAILED else None
 
 
 def _failing_node(events: list[dict[str, Any]]) -> tuple[str, str] | None:
