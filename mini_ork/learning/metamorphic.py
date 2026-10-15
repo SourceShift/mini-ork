@@ -78,6 +78,32 @@ class MetamorphicRelation:
     description: str = ""
 
 
+def vacuous_envelope(note: str) -> dict:
+    """The verdict for "no relation ran", in the shape both readers accept.
+
+    This used to be a bare ``{"verdict": "vacuous"}``, and that shape cost the
+    code-fix contract level everything: ``_read_verifier_evidence``
+    (``mini_ork/verify/levels.py``) accepts a recipe verifier's evidence only
+    when it carries a bool ``pass`` *and* a list ``checks``, so a missing key
+    or an int count classified ``verifier_metamorphic.json`` "unparsable" and
+    the contract level read UNVERIFIED for every run whose task supplied no
+    relations — a dead end, since that is the ordinary case.
+
+    Layer 0's exclusion is preserved, not dropped: ``status: "unverified"`` is
+    read by :func:`mini_ork.learning.eval_judge._verifier_passed` *before* the
+    ``pass`` short-circuit, so a vacuous run is still left out of the
+    execution reward rather than credited with a free pass. The single check is
+    non-gating, so this cannot refute a contract it never examined either.
+    """
+    return {
+        "pass": True, "status": "unverified", "verdict": "vacuous",
+        "checks_run": [], "failed_checks": [], "checked_criteria": [],
+        "checks": [{"name": "metamorphic", "pass": True, "gating": False,
+                    "detail": note}],
+        "note": note,
+    }
+
+
 @dataclass
 class MetamorphicResult:
     checks: int = 0
@@ -99,16 +125,22 @@ class MetamorphicResult:
 
     def to_verifier_json(self) -> dict:
         """Layer-0-compatible envelope. When no relation ever ran, emit a
-        ``vacuous`` verdict (not ``pass``) so ``execution_reward`` excludes it
-        instead of crediting a free pass — a metamorphic check that examined
-        nothing must never inflate the reward."""
+        ``vacuous`` verdict (see :func:`vacuous_envelope`) so ``execution_reward``
+        excludes it instead of crediting a free pass — a metamorphic check that
+        examined nothing must never inflate the reward."""
         if self.checks == 0:
-            return {"verdict": "vacuous", "checks": 0,
-                    "note": "no metamorphic relation ran"}
+            return vacuous_envelope("no metamorphic relation ran")
         return {
             "pass": self.passed,
+            "verdict": "pass" if self.passed else "fail",
             "pass_fraction": round(self.pass_fraction, 4),
-            "checks": self.checks,
+            "checks_run": ["metamorphic"],
+            "failed_checks": [] if self.passed else ["metamorphic"],
+            "checked_criteria": ["metamorphic"],
+            "checks": [{"name": "metamorphic", "pass": self.passed,
+                        "gating": True,
+                        "detail": f"{self.violations} violation(s) in "
+                                  f"{self.checks} relation check(s)"}],
             "violations": self.violations,
             "skipped": self.skipped,
             "per_relation": self.per_relation,

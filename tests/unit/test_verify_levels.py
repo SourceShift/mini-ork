@@ -352,6 +352,71 @@ def test_contract_recipe_verifier_toolchain_failure_abstains(tmp_path):
     assert vector3["contract"] == REFUTED
 
 
+_CODEFIX_VERIFIERS = Path(__file__).resolve().parents[2] / "recipes" / "code-fix" / "verifiers"
+
+
+def _run_recipe_verifier(script: str, tmp_path: Path, env_extra: dict) -> str:
+    """One code-fix recipe verifier's stdout, run from a bare directory.
+
+    A bare cwd is the point: ``detect_typecheck`` finds no `package.json`, no
+    tsconfig marker and no mypy config, so the typecheck verifier takes its
+    skip branch — the case that used to make the contract level unreachable.
+    """
+    env = {**os.environ, "PYTHONPATH": str(REPO) + os.pathsep + os.environ.get("PYTHONPATH", "")}
+    env.update(env_extra)
+    proc = subprocess.run([sys.executable, str(_CODEFIX_VERIFIERS / script)],
+                          capture_output=True, text=True, cwd=tmp_path, env=env)
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout
+
+
+def test_both_code_fix_contract_envelopes_survive_the_shape_guard(tmp_path):
+    """Every contract evidence file must parse, not just the one under test.
+
+    The defect this pins: ``_read_verifier_evidence`` accepts a recipe
+    verifier's envelope only with a bool ``pass`` *and* a list ``checks``, and
+    the deriver returns UNVERIFIED if **any** evidence file is unparsable. For
+    code-fix the contract level reads two files — ``verifier_typecheck.json``
+    (no mypy/pyright on the target → the skip path) and
+    ``verifier_metamorphic.json`` (no relation spec → vacuous) — and *both*
+    failed the guard, so contract was unreachable. A test covering one of them
+    would have passed while the level stayed UNVERIFIED.
+    """
+    empty = tmp_path / "target"
+    empty.mkdir()
+    rd = _run_dir(tmp_path, name="codefix_shapes")
+    (rd / "verifier_typecheck.json").write_text(
+        _run_recipe_verifier("typecheck.py", empty, {}), encoding="utf-8")
+    (rd / "verifier_metamorphic.json").write_text(
+        _run_recipe_verifier("metamorphic.py", empty, {"MO_METAMORPHIC_SPEC": ""}),
+        encoding="utf-8")
+
+    for name in ("verifier_typecheck.json", "verifier_metamorphic.json"):
+        parsed = L._read_verifier_evidence(str(rd / name))
+        assert parsed is not None, f"{name} fails the envelope shape guard"
+        assert parsed["checks"], f"{name} carries an empty checks list"
+
+    vector, reasons = L.derive_levels(str(rd), "code_fix")
+    assert vector["contract"] == PROVEN, reasons["contract"]
+
+    # Negative control — the exact shapes these replaced. Both fail the guard
+    # (the metamorphic one on an ``int`` count, the typecheck one on a missing
+    # ``checks`` key), which is what pinned the level at UNVERIFIED. Without
+    # this the test could pass for the wrong reason.
+    stale = _run_dir(tmp_path, name="codefix_stale")
+    (stale / "verifier_typecheck.json").write_text(
+        '{"verifier": "typecheck", "pass": true, "evidence_path": null, '
+        '"error_summary": "no typecheck tool detected — skipped"}\n',
+        encoding="utf-8")
+    (stale / "verifier_metamorphic.json").write_text(
+        '{"verdict": "vacuous", "checks": 0, "note": "no metamorphic relation ran"}\n',
+        encoding="utf-8")
+    for name in ("verifier_typecheck.json", "verifier_metamorphic.json"):
+        assert L._read_verifier_evidence(str(stale / name)) is None, name
+    stale_vector, _ = L.derive_levels(str(stale), "code_fix")
+    assert stale_vector["contract"] == UNVERIFIED
+
+
 def test_abstained_kinds_scan_and_fail_closed_accessors(tmp_path):
     """``abstained_kinds`` is the publisher guard's input: it scans every
     ``verifier_*.json`` and returns only genuine abstentions, and the accessors

@@ -334,11 +334,36 @@ def _tsc_overlay(root: str, files: list[str]) -> str | None:
     return handle.name
 
 
-def _emit_pass(reason: str) -> int:
+def _emit(*, passed: bool, reason: str, evidence: str | None, gating: bool) -> None:
+    """The verifier's envelope, in the shape the level deriver can read.
+
+    ``mini_ork/verify/levels.py::_read_verifier_evidence`` accepts a recipe
+    verifier's evidence only when it carries a bool ``pass`` *and* a list
+    ``checks``; an envelope without ``checks`` is classified "unparsable" and
+    the contract level becomes UNVERIFIED. Both of this verifier's outcomes
+    must therefore print one.
+
+    ``gating`` is what separates a judgement from an absence of one: a check
+    that ran and rejected the input refutes, while the "no toolchain here"
+    skip is emitted non-gating so it cannot refute code nothing examined.
+    """
     print(json.dumps({
-        "verifier": "typecheck", "pass": True, "evidence_path": None,
+        "verifier": "typecheck", "pass": passed,
+        "verdict": "pass" if passed else "fail",
+        "evidence_path": evidence,
+        "checks_run": ["typecheck"],
+        "failed_checks": [] if passed else ["typecheck"],
+        "checks": [{"name": "typecheck", "pass": passed, "gating": gating,
+                    "detail": reason}],
+        "reasons": [] if passed else [f"typecheck failed; see {evidence}"],
+        "checked_criteria": ["typecheck"],
         "error_summary": reason,
     }, separators=(",", ":"), ensure_ascii=False))
+
+
+def _emit_pass(reason: str) -> int:
+    """A pass with no tool behind it: an n/a, not a judgement about the code."""
+    _emit(passed=True, reason=reason, evidence=None, gating=False)
     return 0
 
 
@@ -429,10 +454,7 @@ def main():
         except OSError:
             pass
 
-    print(json.dumps({
-        "verifier": "typecheck", "pass": passed, "evidence_path": LOG_PATH,
-        "error_summary": error_summary,
-    }, separators=(",", ":"), ensure_ascii=False))
+    _emit(passed=passed, reason=error_summary, evidence=LOG_PATH, gating=True)
     return exit_code
 
 

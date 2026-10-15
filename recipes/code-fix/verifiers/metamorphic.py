@@ -71,7 +71,7 @@ def main() -> int:
         try:
             target, seeds, relations = _load_json_spec(json_spec)
         except Exception as exc:  # noqa: BLE001 — a broken spec must not crash the run
-            print(json.dumps({"verdict": "vacuous", "note": f"json spec load failed: {exc}"}))
+            print(json.dumps(mm.vacuous_envelope(f"json spec load failed: {exc}")))
             return 0
     elif spec_path and os.path.isfile(spec_path):
         try:
@@ -80,10 +80,10 @@ def main() -> int:
             seeds = list(mod.SEED_INPUTS)
             relations = list(getattr(mod, "RELATIONS", []))
         except Exception as exc:  # noqa: BLE001 — a broken spec must not crash the run
-            print(json.dumps({"verdict": "vacuous", "note": f"spec load failed: {exc}"}))
+            print(json.dumps(mm.vacuous_envelope(f"spec load failed: {exc}")))
             return 0
     else:
-        print(json.dumps({"verdict": "vacuous", "note": "no metamorphic spec"}))
+        print(json.dumps(mm.vacuous_envelope("no metamorphic spec")))
         return 0
 
     result = mm.check(target, seeds, relations)

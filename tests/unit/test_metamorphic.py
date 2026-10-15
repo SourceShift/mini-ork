@@ -114,7 +114,12 @@ def test_to_verifier_json_vacuous_when_nothing_ran():
     res = mm.check(lambda x: x, [1], [], check_immutability=False)
     env = res.to_verifier_json()
     assert env["verdict"] == "vacuous"          # examined nothing
-    assert "pass" not in env
+    # The exclusion rides `status: "unverified"`, which eval_judge reads BEFORE
+    # the `pass` short-circuit — not a missing `pass` key, which would fail
+    # _read_verifier_evidence's shape guard and leave the code-fix contract
+    # level permanently UNVERIFIED.
+    assert env["status"] == "unverified"
+    assert ej._verifier_passed(env) is None
 
 
 def test_to_verifier_json_pass_and_fail_shape():
