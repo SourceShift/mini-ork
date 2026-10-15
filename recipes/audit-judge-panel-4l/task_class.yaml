@@ -1,0 +1,33 @@
+name: audit_judge_panel_4l
+version: "0.1.0"
+description: >
+  Four-lane read-only judge panel: four tool-ful lanes from four model
+  families (opus_lens, glm_lens, deepseek_lens, minimax_lens) each verify an
+  auditor's findings against the live state DB and source, hunt for missed
+  findings and propose solutions; a synthesizer reconciles the four reports.
+  The kickoff declares the ids: a "## Findings" section whose items start with
+  F<n> and a "## Proposed fixes" section whose items start with S<n>.
+
+matches:
+  keywords:
+    - four lane audit judge panel
+    - four-lane judge panel
+    - 4-lane audit judge panel
+  regex: []
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+
+risk_class: low
+
+cost_model:
+  min_usd: 3
+  max_usd: 30
+  per_lens_usd: 5
+
+runtime_model:
+  min_minutes: 10
+  max_minutes: 60

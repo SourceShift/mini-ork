@@ -1,0 +1,42 @@
+task_class: audit_judge_panel_4l
+expected_artifact: composite
+success_verifiers:
+  - verifiers/panel-completeness.py
+failure_policy: request_changes
+rollback_policy: >
+  Keep all four judge reports and sidecars under runs/<id>/ for human
+  inspection. Discard synthesis if verification fails.
+
+source_artifact: synthesis.md
+# BARE run-local names, deliberately (see audit-judge-panel-3l): the publisher
+# resolves a name with no directory component against MINI_ORK_RUN_DIR and
+# preserves it there instead of committing it into the target repo. This panel
+# is read-only with respect to the target.
+outputs:
+  - judge-opus-audit.md
+  - judge-glm-audit.md
+  - judge-deepseek-audit.md
+  - judge-minimax-audit.md
+  - synthesis.md
+
+acceptance_criteria:
+  - All four judge reports and the synthesis exist under ${MINI_ORK_RUN_DIR}.
+  - >
+    Each judge report carries the SEVEN shared sections in this order:
+    Discovery Evidence, Finding Verdicts, New Findings, Fix Verdicts,
+    Proposed Solutions, Recommended Fix Order, Open Questions.
+  - >
+    The finding ids (F<n>) and fix ids (S<n>) are the ones the kickoff
+    declares, in the kickoff's order; every lane covers every id.
+  - >
+    Every verdict is one of confirmed|partially_confirmed|refuted|unverifiable
+    and every severity is one of critical|high|medium|low.
+  - >
+    Each lane writes ONE JSON sidecar (context-<node>.json) with the SAME key
+    set: schema_version, panel_id, lane, model, findings[], new_findings[],
+    fixes[], solutions[], fix_order[], counts{}, open_questions[],
+    read_only_attestation{}.
+  - >
+    The four judges were served by four distinct models (llm_calls), so the
+    panel is genuinely heterogeneous rather than one model under four names.
+  - Each report states that no file under $MO_TARGET_CWD was modified.
