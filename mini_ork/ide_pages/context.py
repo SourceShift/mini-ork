@@ -127,6 +127,13 @@ def _why(entry: dict[str, Any]) -> str:
     return ""
 
 
+# Cites longer than this many characters are shortened to fit the
+# 300-px cite column. Shortening yields ``cite[:20] + "…" + cite[-12:]``
+# bracketed, and the full cite rides on the why cell as
+# `` · cite: <full cite>`` so the operator can still click through.
+_CITE_SHORTEN_THRESHOLD = 34
+
+
 def _pack_rows(pack: dict[str, Any]) -> list[list[dict[str, Any]]]:
     rows: list[list[dict[str, Any]]] = []
 
@@ -134,7 +141,13 @@ def _pack_rows(pack: dict[str, Any]) -> list[list[dict[str, Any]]]:
         if isinstance(entry, dict):
             cite = entry.get("cite")
             if cite:
-                rows.append([S.mono(f"[{cite}]"), S.muted(kind), _why(entry) or "—"])
+                base_why = _why(entry) or "—"
+                if len(cite) > _CITE_SHORTEN_THRESHOLD:
+                    short = f"[{cite[:20]}…{cite[-12:]}]"
+                    why = f"{base_why} · cite: {cite}"
+                    rows.append([S.mono(short), S.muted(kind), why])
+                else:
+                    rows.append([S.mono(f"[{cite}]"), S.muted(kind), base_why])
             # nested lists (graph_context.linked_gradients, …)
             for key, value in entry.items():
                 if isinstance(value, list) and key != "cite":
@@ -155,7 +168,10 @@ def _pack_rows(pack: dict[str, Any]) -> list[list[dict[str, Any]]]:
 def _context_pack(home: Path) -> dict[str, Any]:
     found = _packs(home, 1)
     if not found:
-        return S.table("Context pack", [S.col(150), S.col(90), S.col(fr=1)],
+        # Cite column is 300 px so a long cite fits on one line; the
+        # shortened form (``cite[:20]…cite[-12:]``) is the operator's
+        # fallback when the cite would otherwise overflow.
+        return S.table("Context pack", [S.col(300), S.col(90), S.col(fr=1)],
                        ["cite", "kind", "why it was included"],
                        [[S.muted("No run has assembled a context pack yet"), "", ""]], full=True)
     run_id, path = found[0]
@@ -170,7 +186,7 @@ def _context_pack(home: Path) -> dict[str, Any]:
             note += f" of a {int(budget):,} budget"
     if len(rows) > _PACK_ROWS:
         note += f" · showing {_PACK_ROWS}"
-    return S.table(f"Context pack · {_short(run_id)} {node}", [S.col(150), S.col(90), S.col(fr=1)],
+    return S.table(f"Context pack · {_short(run_id)} {node}", [S.col(300), S.col(90), S.col(fr=1)],
                    ["cite", "kind", "why it was included"],
                    rows[:_PACK_ROWS] or [[S.muted("The pack cites nothing"), "", ""]], full=True,
                    note=note, actions=[S.btn("Open pack", S.open_path(str(path)), "ghost"),
@@ -401,19 +417,39 @@ def _config_summary(state: _CnState) -> str:
 
 
 def _replay_summary(state: _CnState) -> str:
-    """A short replay label. ``{enabled: bool}`` or ``{replay: {enabled}}``."""
+    """A short replay label rendering the real ``/api/v1/substrate/replay`` body.
+
+    Real shape (verified live, 2026-10-15): ``{wal_path, store_records,
+    llm_cache_records, other_records, unique_fragment_ids, enqueued, dry_run}``.
+    The summary joins the integer parts that are present —
+    ``"1,254,518 WAL records · 530,827 fragments"`` with thousands separators
+    — appends ``" · dry run"`` only when ``dry_run`` is truthy, and appends
+    ``" · N enqueued"`` (thousands-separated) only when ``enqueued`` is a
+    positive integer. ``"unknown"`` only when neither ``store_records`` nor
+    ``unique_fragment_ids`` is an integer (bools excluded so a JSON ``true``
+    does not render as ``"1 WAL records"``). The guessed ``enabled`` and
+    ``status`` shapes are gone — they were guesses the live endpoint never
+    returned, and a body in those shapes now surfaces as ``"unknown"``.
+    """
     payload = state.replay_payload or {}
     rep = payload.get("replay") if isinstance(payload.get("replay"), dict) else None
     if not rep:
         return "unknown"
-    if isinstance(rep.get("enabled"), bool):
-        return "enabled" if rep["enabled"] else "disabled"
-    inner = rep.get("replay")
-    if isinstance(inner, dict) and isinstance(inner.get("enabled"), bool):
-        return "enabled" if inner["enabled"] else "disabled"
-    if isinstance(rep.get("status"), str) and rep["status"]:
-        return rep["status"]
-    return "unknown"
+    parts: list[str] = []
+    sr = rep.get("store_records")
+    if isinstance(sr, int) and not isinstance(sr, bool):
+        parts.append(f"{sr:,} WAL records")
+    uf = rep.get("unique_fragment_ids")
+    if isinstance(uf, int) and not isinstance(uf, bool):
+        parts.append(f"{uf:,} fragments")
+    if not parts:
+        return "unknown"
+    if rep.get("dry_run"):
+        parts.append("dry run")
+    enq = rep.get("enqueued")
+    if isinstance(enq, int) and not isinstance(enq, bool) and enq > 0:
+        parts.append(f"{enq:,} enqueued")
+    return " · ".join(parts)
 
 
 def _cache_stats_items(state: _CnState) -> list[tuple[str, str, str, str]]:

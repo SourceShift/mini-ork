@@ -91,7 +91,14 @@ class _StubHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/v1/substrate/config":
             self._send(json.dumps({"tier": "simple", "version": "0.42.0"}))
         elif path == "/api/v1/substrate/replay":
-            self._send(json.dumps({"enabled": True}))
+            # Real-shape body (verified live 2026-10-15). Tests that need a
+            # different body set an override via ``_set_override``.
+            self._send(json.dumps({
+                "store_records": 1254518, "unique_fragment_ids": 530827,
+                "llm_cache_records": 0, "other_records": 0,
+                "enqueued": 0, "dry_run": True,
+                "wal_path": "/var/lib/contextnest/wal.jsonl",
+            }))
         elif path == "/api/v1/llm/v1/cache/stats":
             self._send(json.dumps({"hits": 0, "misses": 0, "entries": 0,
                                    "size_bytes": 0, "hit_rate": 0.0}))
@@ -347,13 +354,72 @@ def test_config_unknown_shape(home: Path, monkeypatch, cn_server) -> None:
     assert cfg["v"] == "unknown"
 
 
-def test_replay_disabled(home: Path, monkeypatch, cn_server) -> None:
+def test_replay_real_body_renders_counts_and_dry_run(home: Path, monkeypatch, cn_server) -> None:
+    """The real replay body shape renders as
+    ``"N WAL records · M fragments · dry run"`` (thousands separators).
+    """
     srv, base = cn_server
     monkeypatch.setenv("CN_BASE_URL", base)
-    _set_override(srv, "/api/v1/substrate/replay", json.dumps({"enabled": False}))
+    body = {"store_records": 1254518, "unique_fragment_ids": 530827,
+            "llm_cache_records": 0, "other_records": 0,
+            "enqueued": 0, "dry_run": True,
+            "wal_path": "/var/lib/contextnest/wal.jsonl"}
+    _set_override(srv, "/api/v1/substrate/replay", json.dumps(body))
     page = context.build(home, None, {})
     rep = _kv_by_key(_section(page, "ContextNest status"))["Replay"]
-    assert rep["v"] == "disabled"
+    assert rep["v"] == "1,254,518 WAL records · 530,827 fragments · dry run"
+
+
+def test_replay_positive_enqueued_appends_suffix(home: Path, monkeypatch, cn_server) -> None:
+    """``enqueued`` as a positive integer appends ``" · N enqueued"``;
+    a zero enqueued does not (and ``dry_run=false`` drops the dry-run suffix).
+    """
+    srv, base = cn_server
+    monkeypatch.setenv("CN_BASE_URL", base)
+    body = {"store_records": 1000, "unique_fragment_ids": 25,
+            "enqueued": 7, "dry_run": False}
+    _set_override(srv, "/api/v1/substrate/replay", json.dumps(body))
+    page = context.build(home, None, {})
+    rep = _kv_by_key(_section(page, "ContextNest status"))["Replay"]
+    assert rep["v"] == "1,000 WAL records · 25 fragments · 7 enqueued"
+
+
+def test_replay_empty_or_malformed_body_renders_unknown(home: Path, monkeypatch, cn_server) -> None:
+    """Empty, 200-empty, malformed JSON, or a body without integer counts
+    surfaces as ``"unknown"`` — never a guess.
+    """
+    srv, base = cn_server
+    monkeypatch.setenv("CN_BASE_URL", base)
+    _set_override(srv, "/api/v1/substrate/replay", "")  # 200-empty
+    page = context.build(home, None, {})
+    rep = _kv_by_key(_section(page, "ContextNest status"))["Replay"]
+    assert rep["v"] == "unknown"
+
+    _set_override(srv, "/api/v1/substrate/replay", "not json at all")
+    page = context.build(home, None, {})
+    rep = _kv_by_key(_section(page, "ContextNest status"))["Replay"]
+    assert rep["v"] == "unknown"
+
+    _set_override(srv, "/api/v1/substrate/replay",
+                  json.dumps({"store_records": "many", "wal_path": "/x"}))
+    page = context.build(home, None, {})
+    rep = _kv_by_key(_section(page, "ContextNest status"))["Replay"]
+    assert rep["v"] == "unknown"
+
+
+def test_replay_guessed_shapes_are_dropped(home: Path, monkeypatch, cn_server) -> None:
+    """The previously-guessed ``enabled`` / ``status`` shapes surface as
+    ``"unknown"`` — the page no longer pretends to know what those bodies mean.
+    """
+    srv, base = cn_server
+    monkeypatch.setenv("CN_BASE_URL", base)
+    for body in ({"enabled": False}, {"enabled": True},
+                 {"status": "running"},
+                 {"replay": {"enabled": True}}):
+        _set_override(srv, "/api/v1/substrate/replay", json.dumps(body))
+        page = context.build(home, None, {})
+        rep = _kv_by_key(_section(page, "ContextNest status"))["Replay"]
+        assert rep["v"] == "unknown", f"body {body!r} should render unknown"
 
 
 # ── 2. "What the planner receives" ──────────────────────────────────────
@@ -607,6 +673,90 @@ def test_context_pack_rows_carry_their_cites(home: Path, monkeypatch, cn_server)
     assert "~3,000 tokens of a 64,000 budget" in table["note"]
 
 
+# ── 6b. Cite cells fit their column ─────────────────────────────────────
+
+CITE_48 = "execution_traces/hr-review-resume-20261015152758"  # the kickoff's real cite
+
+
+def test_48_char_cite_shortened_with_full_cite_in_why(home: Path, monkeypatch, cn_server) -> None:
+    """A 48-character cite renders as ``cite[:20] + "…" + cite[-12:]`` inside
+    brackets, and the full cite rides on the why cell.
+    """
+    _, base = cn_server
+    monkeypatch.setenv("CN_BASE_URL", base)
+    now = int(time.time())
+    _run_with_pack(home, "run-1791000001-abcdef", {
+        "workflow_node": "planner",
+        "prior_similar_runs": [{"cite": CITE_48, "title": "a prior run"}],
+    }, now)
+    page = context.build(home, None, {})
+    table = _section(page, "Context pack · run-abcdef planner")
+    cite_cell, _kind, why = table["rows"][0]["cells"]
+    assert cite_cell["t"] == f"[{CITE_48[:20]}…{CITE_48[-12:]}]"
+    assert why["t"] == f"a prior run · cite: {CITE_48}"
+
+
+def test_shortened_cite_without_why_text_still_carries_the_full_cite(home: Path, monkeypatch, cn_server) -> None:
+    """When the cite was shortened and the entry carries no ``title``/``signal``
+    /etc., the why cell still surfaces the full cite so the operator can
+    click through.
+    """
+    _, base = cn_server
+    monkeypatch.setenv("CN_BASE_URL", base)
+    now = int(time.time())
+    _run_with_pack(home, "run-1791000001-abcdef", {
+        "workflow_node": "planner",
+        "constraints": [{"cite": CITE_48}],
+    }, now)
+    page = context.build(home, None, {})
+    table = _section(page, "Context pack · run-abcdef planner")
+    _cite_cell, _kind, why = table["rows"][0]["cells"]
+    assert why["t"].endswith(f" · cite: {CITE_48}")
+
+
+def test_short_cite_renders_unchanged_and_why_untouched(home: Path, monkeypatch, cn_server) -> None:
+    """A cite of 34 characters or fewer renders verbatim, and the why cell
+    does NOT gain a `` · cite:`` append — only shortened cites do.
+    """
+    _, base = cn_server
+    monkeypatch.setenv("CN_BASE_URL", base)
+    now = int(time.time())
+    _run_with_pack(home, "run-1791000001-abcdef", {
+        "workflow_node": "planner",
+        "task_brief": {"cite": "task_brief_path",
+                       "content": {"kickoff": "# Fix the page\n"}},
+    }, now)
+    page = context.build(home, None, {})
+    table = _section(page, "Context pack · run-abcdef planner")
+    cite_cell, _kind, why = table["rows"][0]["cells"]
+    assert cite_cell["t"] == "[task_brief_path]"
+    assert " · cite:" not in why["t"]
+
+
+def test_pack_table_cite_column_width_is_300(home: Path, monkeypatch, cn_server) -> None:
+    """Both pack tables (the empty 'Context pack' and the populated
+    'Context pack · <run> <node>') give the cite column ``S.col(300)``.
+    """
+    _, base = cn_server
+    monkeypatch.setenv("CN_BASE_URL", base)
+    # The empty table (no run has assembled a pack yet) — uses a home
+    # without any task_runs row in state.db.
+    empty_home = home  # the fixture's home has no runs either
+    page = context.build(empty_home, None, {})
+    table = _section(page, "Context pack")
+    assert table["cols"][0] == {"w": 300}
+
+    now = int(time.time())
+    _run_with_pack(home, "run-1791000001-abcdef", {
+        "workflow_node": "planner",
+        "task_brief": {"cite": "task_brief_path",
+                       "content": {"kickoff": "# Fix the page\n"}},
+    }, now)
+    page = context.build(home, None, {})
+    table = _section(page, "Context pack · run-abcdef planner")
+    assert table["cols"][0] == {"w": 300}
+
+
 # ── 7. Ping action + page contract ──────────────────────────────────────
 
 def test_ping_forces_a_fresh_probe(home: Path, monkeypatch, cn_server) -> None:
@@ -701,7 +851,14 @@ def test_slow_but_up_renders_reachable_under_default_budgets(home: Path, monkeyp
             if path == "/api/v1/substrate/config":
                 self._send(json.dumps({"tier": "simple", "version": "0.42.0"}))
             elif path == "/api/v1/substrate/replay":
-                self._send(json.dumps({"enabled": True}))
+                # Real-shape body (verified live 2026-10-15). Tests that need a
+                # different body set an override via ``_set_override``.
+                self._send(json.dumps({
+                    "store_records": 1254518, "unique_fragment_ids": 530827,
+                    "llm_cache_records": 0, "other_records": 0,
+                    "enqueued": 0, "dry_run": True,
+                    "wal_path": "/var/lib/contextnest/wal.jsonl",
+                }))
             elif path == "/api/v1/llm/v1/cache/stats":
                 self._send(json.dumps({"hits": 0, "misses": 0, "entries": 0,
                                        "size_bytes": 0, "hit_rate": 0.0}))
