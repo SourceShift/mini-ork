@@ -1390,3 +1390,26 @@ def test_runs_verb_search_path_paginates_with_correct_has_more(home: Path) -> No
     assert ids0.isdisjoint(ids5)
     assert ids5.isdisjoint(ids10)
     assert ids0.isdisjoint(ids10)
+
+
+def test_a_read_declares_the_flags_of_the_home_it_is_asked_for(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--home`` picks the flags in force, not the process's own home.
+
+    The IDE spawns every read as ``board page --home <project home>`` from the
+    app's own working directory, so a flag the project's ``features.yaml`` turns
+    on must be in force for that read — and it is the read that must notice.
+    """
+    monkeypatch.delenv("MINI_ORK_HOME", raising=False)
+    monkeypatch.delenv("MINI_ORK_FEATURES", raising=False)
+    monkeypatch.delenv("MO_BUDDY", raising=False)
+    _seed_run(home, "run-flag", "published")
+    (home / "config").mkdir(exist_ok=True)
+    (home / "config" / "features.yaml").write_text(
+        "features:\n  run_buddy: '1'\n", encoding="utf-8")
+
+    args = board_cmd.build_parser().parse_args(["page", "run", "--arg", "run=run-flag"])
+    payload = board_cmd.build_payload(home, args)
+    titles = [s.get("title", "") for s in payload.get("sections", [])]
+    assert any(t.startswith("Buddy — ") for t in titles), (payload.get("error"), titles)

@@ -13,7 +13,9 @@ fails in the full suite (the CI-only, single-process failure mode).
 This autouse fixture snapshots and restores ``os.environ`` and the working
 directory around every test, isolating that leakage suite-wide. It also closes
 and drops ``mini_ork.web.db``'s cached ``StateDB`` connections, which outlive a
-test's ``tmp_path`` and would otherwise read a reused path's old database.
+test's ``tmp_path`` and would otherwise read a reused path's old database, and
+restores ``mini_ork.features.store``'s memory of the defaults it applied, which
+has the same out-of-test lifetime as the environment it wrote.
 """
 from __future__ import annotations
 
@@ -77,6 +79,14 @@ def _isolate_process_state():
                 except Exception:  # noqa: BLE001 — a reset must never fail a test
                     pass
         db_mod._dbs.clear()
+    # ``features.store.apply_defaults`` writes ``os.environ`` and remembers the
+    # names it wrote so a later read for a *different* home may replace them —
+    # that memory is the only thing distinguishing our value from the operator's.
+    # The environment is restored below; the memory is module state and must be
+    # too, or one test's applied home would make the next test overwrite a
+    # variable it monkeypatched itself. Guarded by sys.modules, as above.
+    store_mod = sys.modules.get("mini_ork.features.store")
+    applied_snapshot = set(store_mod._applied) if store_mod is not None else None
     try:
         cwd_snapshot = os.getcwd()
     except OSError:
@@ -84,6 +94,9 @@ def _isolate_process_state():
     try:
         yield
     finally:
+        if applied_snapshot is not None and store_mod is not None:
+            store_mod._applied.clear()
+            store_mod._applied.update(applied_snapshot)
         os.environ.clear()
         os.environ.update(env_snapshot)
         if cwd_snapshot is not None:

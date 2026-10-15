@@ -310,3 +310,40 @@ def test_effective_env_never_writes_to_environ(tmp_path: Path, monkeypatch) -> N
     store.effective_env(path)
     assert os.environ["MO_ORACLE_GATES_AUTO"] == "keep"
     assert "MO_DAILY_BUDGET_USD" not in os.environ
+
+
+# ── apply_defaults ──────────────────────────────────────────────────────────
+
+
+def _home_with(tmp_path: Path, name: str, body: str) -> Path:
+    home = tmp_path / name
+    (home / "config").mkdir(parents=True)
+    (home / "config" / "features.yaml").write_text(body, encoding="utf-8")
+    return home
+
+
+def test_apply_defaults_follows_the_home_it_is_given(tmp_path: Path, monkeypatch) -> None:
+    """A process serving several homes reads the flags of the one asked for.
+
+    The IDE spawns every read as ``board page --home <project home>`` from the
+    app's own working directory, so the defaults loaded for the *process's* home
+    belong to a different project than the one being read: the read re-applies
+    its own file, and retracts what the other home had applied.
+    """
+    monkeypatch.delenv("MO_BUDDY", raising=False)
+    on = _home_with(tmp_path, "on", "features:\n  run_buddy: '1'\n")
+    off = _home_with(tmp_path, "off", "features: {}\n")
+    assert "MO_BUDDY" in store.apply_defaults(on)
+    assert os.environ["MO_BUDDY"] == "1"
+    assert store.apply_defaults(off) == set()
+    assert "MO_BUDDY" not in os.environ  # retracted along with the home
+
+
+def test_apply_defaults_never_overrides_an_operators_variable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Only names this module applied are ever replaced — env still wins."""
+    monkeypatch.setenv("MO_BUDDY", "0")
+    on = _home_with(tmp_path, "on", "features:\n  run_buddy: '1'\n")
+    store.apply_defaults(on)
+    assert os.environ["MO_BUDDY"] == "0"

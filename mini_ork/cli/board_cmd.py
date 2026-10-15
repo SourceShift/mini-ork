@@ -1008,6 +1008,12 @@ def build_payload(home: Path, args) -> dict[str, Any]:
     for an argv whose verb-level arguments are out of range (`runs`'s
     offset/limit); the verb-target checks are `validate`'s.
     """
+    # The feature flags in force must be the ones THIS home declared: the IDE
+    # reads every project with `--home` while the process's own home is the
+    # app's, so the defaults loaded at startup belong to the wrong project.
+    from mini_ork.features.store import apply_defaults
+
+    apply_defaults(home)
     # Reads first fail the runs whose dispatcher provably died, so no view
     # below lists a dead run as in flight (orchestration/run_reaper.py).
     reap_errors: dict[str, str] = {}

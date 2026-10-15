@@ -1685,15 +1685,15 @@ def _load_feature_defaults() -> None:
     first caller wins; an IDE toggle (features.yaml) must therefore beat a stale
     hand-edit in secrets.local.sh, while a real environment variable still beats
     both. Precedence: env > features.yaml > secrets.local.sh > engine default.
-    A malformed file degrades to a warning — ``mini-ork help`` must not fail."""
-    from mini_ork.features.store import effective_env
+    This home is only the *process's*; a command that re-points the home
+    (``board --home``) re-applies the file belonging to it —
+    :func:`mini_ork.features.store.apply_defaults`. A malformed file degrades to
+    a warning — ``mini-ork help`` must not fail."""
+    from mini_ork.features.store import apply_defaults
     try:
-        overrides = effective_env()
+        apply_defaults()
     except Exception as exc:  # noqa: BLE001 — a bad file must never break the CLI
         sys.stderr.write(f"warning: feature defaults not loaded: {exc}\n")
-        return
-    for name, value in overrides.items():
-        os.environ.setdefault(name, value)
 
 
 def main(argv=None, *, root=None) -> int:

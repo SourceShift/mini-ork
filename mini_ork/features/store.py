@@ -1,9 +1,11 @@
 """Persisted feature and setting defaults — ``.mini-ork/config/features.yaml``.
 
 The registry (:mod:`mini_ork.features.registry`) declares what is *controllable*;
-this module remembers what the user *chose*. It is loaded by
-:func:`mini_ork.cli.main._load_feature_defaults` and applied with
-``os.environ.setdefault``, so precedence is, first writer wins:
+this module remembers what the user *chose*. :func:`apply_defaults` is the one
+way it reaches ``os.environ`` — at startup by
+:func:`mini_ork.cli.main._load_feature_defaults`, and again per read by
+:func:`mini_ork.cli.board_cmd.build_payload`, which knows the home being read.
+Precedence is, first writer wins:
 
     real environment  >  features.yaml  >  secrets.local.sh  >  engine default
 
@@ -148,6 +150,43 @@ def effective_env(path: str | Path | None = None) -> dict[str, str]:
             continue
         env[name] = value
     return env
+
+
+# ── apply ───────────────────────────────────────────────────────────────────
+
+
+#: The names this module has put into ``os.environ`` from a defaults file. A
+#: name in here is *this module's*, not the operator's — which is what lets a
+#: read of another home replace it (see :func:`apply_defaults`).
+_applied: set[str] = set()
+
+
+def apply_defaults(home: str | Path | None = None) -> set[str]:
+    """Apply the store's overrides to ``os.environ``; return the names applied.
+
+    The file belongs to one *home*, but a process can serve several: the IDE
+    spawns every read as ``board page --home <project home>`` from the app's own
+    working directory, and ``mini-ork serve`` answers for whichever home a
+    request names. Applying the defaults once, for the process's own home, would
+    answer a read of home B with home A's flags — so the home being read applies
+    its own file, and the knobs an earlier home applied are retracted when the
+    new one does not mention them.
+
+    Precedence is unchanged — env > features.yaml > secrets.local.sh > engine
+    default — because only names *this module* applied are ever replaced; a
+    variable that was already in the environment is left alone.
+    """
+    overrides = effective_env(store_path(home))
+    for name, value in overrides.items():
+        if name in os.environ and name not in _applied:
+            continue
+        os.environ[name] = value
+    retracted = _applied - set(overrides)
+    for name in retracted:
+        os.environ.pop(name, None)
+    _applied.difference_update(retracted)
+    _applied.update(overrides)
+    return set(overrides)
 
 
 # ── write ───────────────────────────────────────────────────────────────────
