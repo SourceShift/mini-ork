@@ -10,6 +10,13 @@ pinned:
   is not a crash
 * the mirror survives a source failure: the rows stay and the failure is noted
 * links are idempotent and readable from both ends
+
+It also owns 0072, the body cache, because that is still this table: the
+columns are nullable with no default (NULL is "never read live", a state, not a
+fault), a leaner later sync never blanks a body an earlier one cached, and
+``cache_body``/``record_body_error`` move only what they name. The one rule
+that matters most here is the second of those — a regression in it silently
+empties every ticket page on the next poll, and nothing else would notice.
 """
 from __future__ import annotations
 
@@ -34,6 +41,7 @@ from mini_ork.pm.model import (  # noqa: E402
 from mini_ork.pm.provider import Page, ProviderError, Query  # noqa: E402
 
 MIGRATION = REPO / "db" / "migrations" / "0069_pm_mirror.sql"
+BODY_MIGRATION = REPO / "db" / "migrations" / "0072_pm_mirror_body.sql"
 
 
 def _issue(key: str, title: str = "Do the thing", provider: str = "local", **overrides) -> Issue:
@@ -226,3 +234,133 @@ def test_link_accepts_the_plain_string_kind(db: str):
     # a naive lookup would miss. The store resolves it instead.
     linked = store.link("local:e1", "local:e2", "blocks", db=db)
     assert linked.kind is LinkKind.BLOCKS
+
+
+# ── 0072: the body cache ────────────────────────────────────────────────────
+
+
+def test_the_body_columns_are_the_ones_0072_adds():
+    """Two writers, one schema — the pair that cannot be allowed to drift.
+
+    The runtime ``_ensure_body_columns`` and the migration must add the same
+    columns, or a fresh home and an upgraded one disagree about the table the
+    ticket page reads.
+    """
+    text = re.sub(r"\s+", " ", BODY_MIGRATION.read_text(encoding="utf-8"))
+    for name, decl in store.BODY_COLUMNS:
+        assert f"ADD COLUMN {name} {decl};" in text, name
+    # One guarded block, gated on the first column: they are added together or
+    # not at all, which is what makes the reapply a clean no-op.
+    assert "pragma_table_info" in text
+    assert text.count("ALTER TABLE pm_issues ADD COLUMN") == len(store.BODY_COLUMNS)
+
+
+def test_the_body_columns_are_nullable_with_no_default(db: str):
+    """NULL is "never read live" — a state the page must render, not a fault.
+
+    A ``DEFAULT ''`` would collapse it into "the source answered and the body is
+    empty", and an unreachable never-cached ticket would read exactly like an
+    empty one. This is the assertion that keeps the two apart.
+    """
+    import sqlite3
+
+    store.ensure_schema(db)
+    con = sqlite3.connect(db)
+    try:
+        columns = {r[1]: r for r in con.execute("PRAGMA table_info(pm_issues)")}
+    finally:
+        con.close()
+    for name, decl in store.BODY_COLUMNS:
+        column = columns[name]      # cid, name, type, notnull, dflt_value, pk
+        assert column[2] == decl, name
+        assert column[3] == 0, f"{name} must be nullable"
+        assert column[4] is None, f"{name} must have no default"
+
+
+def test_a_later_upsert_never_blanks_a_cached_body(db: str):
+    """The subtlest edit in the mirror, and the one with the loudest failure.
+
+    ``Issue`` spells "no description" as ``''``, so a leaner later sync — a page
+    that asked for no description, a source that stopped returning one — would
+    overwrite a cached body with an empty string, and every ticket page would
+    quietly go blank on the next poll.
+    """
+    store.upsert_issues(
+        "local", [_issue("e1", "Do the thing", description="the body text")], db)
+    assert store.row("local:e1", db=db).description == "the body text"
+
+    store.upsert_issues("local", [_issue("e1", "Do the thing, renamed")], db)
+
+    row = store.row("local:e1", db=db)
+    assert row.title == "Do the thing, renamed"      # the sync did update
+    assert row.description == "the body text"        # and did not blank
+    assert row.created_at is None or row.created_at == "", row.created_at
+
+
+def test_a_batch_that_carries_a_body_refreshes_the_cache(db: str):
+    """The other half: the sync path may warm the cache, not only preserve it."""
+    store.upsert_issues("local", [_issue("e1", description="first")], db)
+    store.upsert_issues(
+        "local",
+        [_issue("e1", description="second", created_at="2026-10-05T09:00:00.000Z")],
+        db,
+    )
+    row = store.row("local:e1", db=db)
+    assert row.description == "second"
+    assert row.created_at == "2026-10-05T09:00:00.000Z"
+
+
+def test_cache_body_stamps_the_read_and_clears_a_previous_error(db: str):
+    store.upsert_issues("local", [_issue("e1")], db)
+    assert store.record_body_error("local:e1", "local: unreachable", db) is True
+    assert store.row("local:e1", db=db).body_error == "local: unreachable"
+
+    assert store.cache_body(
+        "local:e1",
+        description="the body",
+        created_at="2026-10-05T09:00:00.000Z",
+        body_synced_at="2026-10-11T12:00:00.000Z",
+        db=db,
+    ) is True
+
+    row = store.row("local:e1", db=db)
+    assert row.description == "the body"
+    assert row.created_at == "2026-10-05T09:00:00.000Z"
+    assert row.body_synced_at == "2026-10-11T12:00:00.000Z"
+    # The source answered, so the reason it failed before is no longer true.
+    assert row.body_error is None
+
+
+def test_cache_body_stamps_itself_when_the_caller_does_not(db: str):
+    """An empty ``body_synced_at`` means "now" — one clock, inside the store.
+
+    A caller with its own instant (a batch sync) passes it and gets it back; a
+    caller that just read one ticket does not have to reach for a clock of its
+    own, which is how a page comes to stamp a read with a time it guessed.
+    """
+    store.upsert_issues("local", [_issue("e1")], db)
+    before = store._now()
+    store.cache_body("local:e1", description="b", created_at=None, db=db)
+    after = store._now()
+    stamp = store.row("local:e1", db=db).body_synced_at
+    assert before <= stamp <= after
+
+
+def test_cache_body_keeps_an_empty_description_verbatim(db: str):
+    """After a read, ``''`` is a fact. NULL is what "not read" is for."""
+    store.upsert_issues("local", [_issue("e1")], db)
+    store.cache_body("local:e1", description="", created_at=None, db=db)
+    assert store.row("local:e1", db=db).description == ""
+
+
+def test_a_body_larger_than_the_column_is_not_truncated_by_the_store(db: str):
+    """The store records what it was given; the *page* owns the display cap.
+
+    Asserted because the obvious "fix" — clipping on write — would destroy the
+    only copy, and a page that renders 200k of a 400k body must not have cost
+    the mirror the other 200k.
+    """
+    big = "x" * 500_000
+    store.upsert_issues("local", [_issue("e1")], db)
+    store.cache_body("local:e1", description=big, created_at=None, db=db)
+    assert len(store.row("local:e1", db=db).description) == len(big)

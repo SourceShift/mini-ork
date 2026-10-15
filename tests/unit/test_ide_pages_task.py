@@ -26,6 +26,11 @@ import pytest
 
 from mini_ork.ide_pages import PAGES, build_page
 
+#: A real adapter failure. The page's whole job on the ticket branch is to
+#: survive one of these, so the tests that fake an unreachable source raise the
+#: type an unreachable source raises.
+from mini_ork.pm.provider import ProviderError  # noqa: E402
+
 REPO = Path(__file__).resolve().parents[2]
 
 
@@ -106,6 +111,95 @@ def _seed_ticket(home: Path, uid: str, *, provider: str = "acme", native_key: st
         (uid, provider, native_key, "Ticket one", state, "In Progress", 3, 2, url,
          "someone", '["billing","q4"]', None, "Project X", "2026-10-09T00:00:00.000Z", now),
     ))
+
+
+def _cache_body(home: Path, uid: str, *, description: str | None = None,
+                created_at: str | None = None, body_synced_at: str | None = None,
+                body_error: str | None = None) -> None:
+    """Write 0072's body-cache columns directly, the way a past read left them."""
+    _sql(home, (
+        "UPDATE pm_issues SET description=?, created_at=?, body_synced_at=?, body_error=? "
+        "WHERE uid=?",
+        (description, created_at, body_synced_at, body_error, uid),
+    ))
+
+
+class FakeAcme:
+    """A source that answers from memory — no registry config, no socket.
+
+    Registered per test under the id the seeded mirror row names, so the page
+    resolves exactly the adapter the test means and nothing else. ``raising``
+    is a real :class:`ProviderError` (what an unreachable source produces);
+    ``comments_error`` is separate because a thread is best-effort while the
+    body is not.
+    """
+
+    id = "acme"
+    label = "Acme"
+
+    def __init__(self, issue=None, comments=(), *, raising: BaseException | None = None,
+                 comments_error: BaseException | None = None) -> None:
+        from mini_ork.pm.provider import Capabilities
+
+        self.capabilities = Capabilities()   # a read-only source
+        self.issue = issue
+        self.comment_list = list(comments)
+        self.raising = raising
+        self.comments_error = comments_error
+        self.calls: list[str] = []
+
+    def get(self, uid: str):
+        self.calls.append("get")
+        if self.raising is not None:
+            raise self.raising
+        return self.issue
+
+    def comments(self, uid: str):
+        self.calls.append("comments")
+        if self.comments_error is not None:
+            raise self.comments_error
+        return self.comment_list
+
+
+@pytest.fixture()
+def acme():
+    """Register a fake ``acme`` source for one test, and always take it back out.
+
+    The registry is process-global: a fake left behind would be resolved by
+    every later test that seeds an ``acme:`` mirror row.
+    """
+    from mini_ork.pm import registry
+
+    def install(provider):
+        registry.register_provider(provider, replace=True)
+        return provider
+
+    yield install
+    registry.unregister_provider("acme")
+
+
+def _an_issue(uid: str = "acme:ENG-1", **overrides):
+    from mini_ork.pm.model import Issue, IssueState, Priority, ProviderIdentity
+
+    fields = {
+        "identity": ProviderIdentity(provider="acme", key="ENG-1", project="Project X",
+                                     url="https://acme.example/ENG-1"),
+        "title": "Ticket one",
+        "state": IssueState.IN_PROGRESS,
+        "native_state": "In Progress",
+        "description": "## Problem\n\nThe widget falls over on start.\n",
+        "created_at": "2026-10-05T09:00:00.000Z",
+        "updated_at": "2026-10-09T00:00:00.000Z",
+        "priority": Priority.HIGH,
+    }
+    fields.update(overrides)
+    return Issue(**fields)
+
+
+def _a_comment(author: str, created_at: str, body: str = "a note"):
+    from mini_ork.pm.model import Comment
+
+    return Comment(issue_uid="acme:ENG-1", author=author, body=body, created_at=created_at)
 
 
 def _flat_sections(page: dict) -> list[dict]:
@@ -244,7 +338,8 @@ def test_epic_page_says_so_when_a_recorded_kickoff_vanished(home: Path) -> None:
     assert "Kickoff file" not in _actions(page)
 
 
-def test_ticket_page_is_mirror_only_and_says_so(home: Path) -> None:
+def test_ticket_page_carries_its_facts_links_and_actions(home: Path) -> None:
+    """The mirror half of the page, with no adapter registered for the source."""
     _seed_ticket(home, "acme:ENG-1")
     _sql(home, (
         "INSERT INTO pm_links (from_uid, to_uid, kind, created_at) VALUES (?,?,?,?)",
@@ -256,12 +351,6 @@ def test_ticket_page_is_mirror_only_and_says_so(home: Path) -> None:
     assert page["ok"] is True
     assert page["label"] == "Ticket one"
     assert page["sub"] == "Ticket · acme:ENG-1"
-
-    sections = _flat_sections(page)
-    assert sections[0]["type"] == "callout"
-    assert sections[0]["title"] == "Mirrored, not live"
-    # The mirror stores no body: a markdown section here would be a lie.
-    assert not [s for s in sections if s.get("type") == "markdown"]
 
     facts = {item["k"]: item for item in _section(page, "kv", "Ticket")["items"]}
     assert facts["Source"]["v"] == "acme:ENG-1"
@@ -279,6 +368,120 @@ def test_ticket_page_is_mirror_only_and_says_so(home: Path) -> None:
     labels = _actions(page)
     assert labels["Open in acme"]["do"] == {"url": "https://acme.example/ENG-1"}
     assert "Dispatch now" not in labels         # a ticket is not an epic
+
+
+def test_ticket_page_degrades_when_the_source_was_never_registered(home: Path) -> None:
+    """No adapter, no cached body: a callout that says so, not a traceback.
+
+    ``UnknownProvider`` is a ``KeyError``, not a ``ProviderError`` — the most
+    common misconfiguration in a checkout (a ticket whose Linear token is not
+    set up) is also the one a naive catch would let blank the tab.
+    """
+    _seed_ticket(home, "acme:ENG-1")
+
+    page = build_page(home, "task", args={"uid": "acme:ENG-1"})
+
+    assert page["ok"] is True
+    sections = _flat_sections(page)
+    assert sections[0]["type"] == "callout"
+    assert sections[0]["title"] == "Source unreachable"
+    # Nothing was ever cached, so a markdown section would be a lie.
+    assert "no body has ever been read" in sections[0]["text_md"]
+    assert "unknown pm provider 'acme'" in sections[0]["text_md"]
+    assert not [s for s in sections if s.get("type") == "markdown"]
+
+
+def test_ticket_page_reads_live_and_renders_body_created_and_comments(home: Path,
+                                                                     acme) -> None:
+    """The adapter answers: body, created date and thread, oldest first."""
+    _seed_ticket(home, "acme:ENG-1")
+    adapter = acme(FakeAcme(_an_issue(), [
+        # Deliberately newest-first: the page must order them, not trust them.
+        _a_comment("bob", "2026-10-07T10:00:00.000Z", "fixed upstream"),
+        _a_comment("ada", "2026-10-06T10:00:00.000Z", "reproduced on 3.12"),
+    ]))
+
+    page = build_page(home, "task", args={"uid": "acme:ENG-1"})
+
+    assert page["ok"] is True
+    assert adapter.calls == ["get", "comments"]
+    assert _flat_sections(page)[0]["title"] == "Read live"
+
+    body = _section(page, "markdown", "Description")
+    assert "The widget falls over on start." in body["text"]
+
+    thread = _section(page, "list", "Comments")["items"]
+    assert [i["t"] for i in thread] == ["ada", "bob"]         # oldest first
+    assert thread[0]["sub"].startswith("2026-10-06T10:00:00.000Z")
+    assert "ago" in thread[0]["sub"]
+    assert "reproduced on 3.12" not in thread[0]["t"]          # body is not the title
+
+    facts = {item["k"]: item for item in _section(page, "kv", "Ticket")["items"]}
+    # Created sits beside Updated, from the live read rather than the cache.
+    assert facts["Created"]["v"].startswith("2026-10-05T09:00:00.000Z")
+    assert facts["Updated"]["v"].startswith("2026-10-09T00:00:00.000Z")
+
+    # And the body it read is now cached, so the next open survives the source.
+    import sqlite3
+
+    con = sqlite3.connect(home / "state.db")
+    try:
+        cached = con.execute(
+            "SELECT description, created_at, body_synced_at, body_error FROM pm_issues "
+            "WHERE uid = 'acme:ENG-1'").fetchone()
+    finally:
+        con.close()
+    assert cached[0] == _an_issue().description
+    assert cached[1] == "2026-10-05T09:00:00.000Z"
+    assert cached[2]                                    # stamped as a live read
+    assert cached[3] is None                            # the source answered
+
+
+def test_ticket_page_renders_the_cached_body_and_why_when_the_source_is_down(
+        home: Path, acme) -> None:
+    """A failing source degrades to the last body read, plus the reason."""
+    _seed_ticket(home, "acme:ENG-1")
+    _cache_body(home, "acme:ENG-1", description="the old body",
+                created_at="2026-10-05T09:00:00.000Z",
+                body_synced_at="2026-10-09T00:00:00.000Z")
+    from mini_ork.pm.provider import ProviderError
+
+    acme(FakeAcme(raising=ProviderError("linear is down")))
+
+    page = build_page(home, "task", args={"uid": "acme:ENG-1"})
+
+    assert page["ok"] is True
+    sections = _flat_sections(page)
+    callout = sections[0]
+    assert callout["title"] == "Source unreachable"
+    # The three questions, in order: which source, how stale, why.
+    assert "acme:ENG-1" in callout["text_md"]
+    assert "2026-10-09T00:00:00.000Z" in callout["text_md"]
+    assert "ago" in callout["text_md"]
+    assert "ProviderError: linear is down" in callout["text_md"]
+
+    # The cached body is drawn, and labelled as cached rather than live.
+    cached = _section(page, "markdown", "Description (cached)")
+    assert cached["text"] == "the old body"
+    assert not [s for s in sections if s.get("title") == "Description"]
+
+
+def test_ticket_page_never_cached_source_down_is_still_ok(home: Path, acme) -> None:
+    """Nothing cached, source down: mirror facts and a callout, ok true."""
+    _seed_ticket(home, "acme:ENG-1")
+    from mini_ork.pm.provider import ProviderError
+
+    acme(FakeAcme(raising=ProviderError("timed out")))
+
+    page = build_page(home, "task", args={"uid": "acme:ENG-1"})
+
+    assert page["ok"] is True
+    assert not page["errors"], page["errors"]
+    sections = _flat_sections(page)
+    assert sections[0]["title"] == "Source unreachable"
+    assert "no body has ever been read" in sections[0]["text_md"]
+    assert not [s for s in sections if s.get("type") == "markdown"]
+    assert _section(page, "kv", "Ticket")["items"]      # the facts are still there
 
 
 def test_ticket_page_without_a_url_offers_no_dead_link(home: Path) -> None:
@@ -342,11 +545,12 @@ def test_the_actions_this_page_emits_really_do_resolve_their_home(home: Path) ->
     assert status == "not started"
 
 
-def test_the_page_is_cheap_and_offline(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """No adapter import, no socket — the Board's own rule, kept here.
+def test_an_epic_page_opens_no_socket_at_all(home: Path,
+                                             monkeypatch: pytest.MonkeyPatch) -> None:
+    """An epic reads ``state.db`` and the kickoff file and nothing else.
 
-    A slow or broken Linear/Jira source must not be able to block this tab: the
-    page reads ``state.db`` and the kickoff file and nothing else.
+    The Board's own rule, kept here: a slow or broken Linear/Jira source must
+    not be able to slow or blank an epic's tab.
     """
     import socket
 
@@ -354,12 +558,36 @@ def test_the_page_is_cheap_and_offline(home: Path, monkeypatch: pytest.MonkeyPat
         raise AssertionError("the task page opened a socket")
 
     _seed_epic(home, "e1", status="escalated")
-    _seed_ticket(home, "acme:ENG-1")
     monkeypatch.setattr(socket, "socket", _refuse)
     monkeypatch.setattr(socket, "create_connection", _refuse)
 
-    for uid in ("e1", "acme:ENG-1"):
-        assert build_page(home, "task", args={"uid": uid})["ok"] is True
+    assert build_page(home, "task", args={"uid": "e1"})["ok"] is True
+
+
+def test_a_ticket_page_survives_a_transport_that_explodes(home: Path, acme,
+                                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ticket *does* read its source — and must outlive it failing.
+
+    The page reaches exactly one adapter call, and the adapter is a black box:
+    an HTTP client whose socket layer refuses to connect can raise anything at
+    all, not just ``ProviderError``. Whatever comes back, the tab renders the
+    mirror's row with a callout — never ``{"ok": false}`` and never a traceback.
+    """
+    import socket
+
+    def _refuse(*_args, **_kwargs):
+        raise AssertionError("the task page opened a socket")
+
+    _seed_ticket(home, "acme:ENG-1")
+    acme(FakeAcme(raising=AssertionError("the task page opened a socket")))
+    monkeypatch.setattr(socket, "socket", _refuse)
+    monkeypatch.setattr(socket, "create_connection", _refuse)
+
+    page = build_page(home, "task", args={"uid": "acme:ENG-1"})
+
+    assert page["ok"] is True
+    assert _flat_sections(page)[0]["title"] == "Source unreachable"
+    assert _section(page, "kv", "Ticket")["items"]
 
 
 def test_an_epic_and_a_ticket_with_the_same_text_are_different_pages(home: Path) -> None:
@@ -384,3 +612,63 @@ def test_now_is_not_baked_into_a_rendered_age(home: Path) -> None:
     assert "ago" in created
     # Built in this test's window, so it cannot have been cached in the row.
     assert after - before < 60
+
+
+# ── the one page here that reads a source ───────────────────────────────────
+
+
+def test_safe_error_strips_credentials_but_keeps_the_diagnosis() -> None:
+    """What the callout and ``body_error`` are allowed to contain.
+
+    A redactor that eats the diagnosis is worse than the leak it prevents — a
+    person cannot fix "token …". So the word has to survive, the *value* must
+    not, and it is the shape (an ``=``/``:`` separator, a ``Bearer`` header, a
+    ``user:pass@`` authority) that decides which is which.
+    """
+    from mini_ork.ide_pages import task as task_page
+
+    class Boom(ProviderError):
+        pass
+
+    kept = task_page._safe_error(Boom("linear: token expired"))
+    assert kept == "Boom: linear: token expired"
+
+    assert "lin_api_secret" not in task_page._safe_error(
+        Boom("GET https://api.acme.example/v1?token=lin_api_secret failed"))
+    assert "ghp_deadbeef" not in task_page._safe_error(
+        Boom("https://x-access-token:ghp_deadbeef@github.com/acme/eng: 401"))
+    assert "github.com/acme/eng" in task_page._safe_error(
+        Boom("https://x-access-token:ghp_deadbeef@github.com/acme/eng: 401"))
+    assert "sk-live-abc" not in task_page._safe_error(
+        Boom("rejected: Authorization: Bearer sk-live-abc"))
+
+    # One line, bounded — a traceback never renders and never gets recorded.
+    long = task_page._safe_error(Boom("x" * 5000))
+    assert "\n" not in long
+    assert len(long) <= 301
+
+
+def test_a_credential_never_reaches_the_page_or_the_mirror(home: Path, acme) -> None:
+    """End to end: the token is in the adapter's message, nowhere else."""
+    import sqlite3
+
+    _seed_ticket(home, "acme:ENG-1")
+    acme(FakeAcme(raising=ProviderError(
+        "GET https://api.acme.example/v1/ENG-1?token=lin_api_secret123 failed; "
+        "fallback https://x-access-token:ghp_deadbeef@github.com/acme/eng")))
+
+    page = build_page(home, "task", args={"uid": "acme:ENG-1"})
+
+    assert page["ok"] is True
+    rendered = " ".join(s.get("text_md", "") for s in _flat_sections(page))
+    assert "lin_api_secret123" not in rendered
+    assert "ghp_deadbeef" not in rendered
+    assert "api.acme.example" in rendered        # the source is still named
+
+    con = sqlite3.connect(home / "state.db")
+    try:
+        stored = con.execute(
+            "SELECT body_error FROM pm_issues WHERE uid = 'acme:ENG-1'").fetchone()[0]
+    finally:
+        con.close()
+    assert stored and "lin_api_secret123" not in stored and "ghp_deadbeef" not in stored

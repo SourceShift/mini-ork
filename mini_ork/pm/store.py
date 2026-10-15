@@ -5,15 +5,25 @@ and the search box can answer without a network round-trip, and so a link
 between a mini-ork run and a Linear issue survives that issue being edited,
 renamed or moved on the remote side — none of which mini-ork controls. The row
 it holds is deliberately partial, which is why :class:`IssueRow` is its own
-type and not an :class:`~mini_ork.pm.model.Issue`: a caller that needs a
-description has to go back to the adapter that owns it, and cannot be fooled
-into thinking the mirror is complete.
+type and not an :class:`~mini_ork.pm.model.Issue`: a caller that needs the
+issue has to go back to the adapter that owns it, and cannot be fooled into
+thinking the mirror is complete.
 
-Two writers, one schema. :func:`ensure_schema` runs the same DDL the migration
-``0069_pm_mirror.sql`` does, because a state.db that predates the migration and
-a state.db that never ran one both have to work — the scheduler's
-``ensure_retry_schema`` sets that precedent. A test asserts the two texts agree,
-so the pair cannot drift apart quietly.
+The one exception is a *cache*, and it is labelled as one. A view that reads an
+issue live — the ticket page — may hand the body it just fetched back through
+:func:`cache_body`, so a source that is down later degrades to the last thing
+it said rather than to nothing. ``body_synced_at`` records when that read
+happened and ``body_error`` why the most recent one failed; NULL in either
+means "never read live", which is a real state and not an error. The cached
+columns are never authoritative: a caller that needs today's body still asks
+the adapter.
+
+Two writers, one schema. :func:`ensure_schema` runs the same DDL the migrations
+``0069_pm_mirror.sql`` (the tables) and ``0072_pm_mirror_body.sql`` (the body
+cache columns) do, because a state.db that predates a migration and a state.db
+that never ran one both have to work — the scheduler's
+``ensure_retry_schema`` sets that precedent. Tests assert the texts agree, so
+the pairs cannot drift apart quietly.
 """
 
 from __future__ import annotations
@@ -75,6 +85,27 @@ SCHEMA_SQL: tuple[str, ...] = (
     """,
 )
 
+#: The body-cache columns ``0072_pm_mirror_body.sql`` adds to ``pm_issues``.
+#: All four are nullable with NO default, and that is load-bearing: NULL means
+#: "this column has never been filled by a live read", which is a state a page
+#: has to be able to tell apart from "the source said the body is empty". A
+#: default of ``''`` would collapse the two.
+#:
+#: ``description``/``created_at`` are the cached body; ``body_synced_at`` is
+#: when the last successful read happened and ``body_error`` why the most
+#: recent read failed (NULL once one succeeds again).
+#:
+#: ``ALTER TABLE`` has no ``IF NOT EXISTS`` in SQLite, so both writers check
+#: ``PRAGMA table_info`` first — here in :func:`_ensure_body_columns`, and in
+#: the migration through the same ``.read|sh`` guard ``0058`` uses. A test
+#: holds the two texts together.
+BODY_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("description", "TEXT"),
+    ("created_at", "TEXT"),
+    ("body_synced_at", "TEXT"),
+    ("body_error", "TEXT"),
+)
+
 
 def _db_path(db: str | None) -> str:
     """Explicit path → ``MINI_ORK_DB`` → ``$MINI_ORK_HOME/state.db``.
@@ -103,8 +134,16 @@ def _conn(db: str | None) -> sqlite3.Connection:
 class IssueRow:
     """One mirror row: what the index knows, and nothing it does not.
 
-    There is no ``description`` and no ``native`` payload here — those live
-    behind the adapter. A view that needs them re-reads the issue by uid.
+    There is no ``native`` payload here — that lives behind the adapter, and a
+    view that needs it re-reads the issue by uid. The four body fields at the
+    end are a *cache* of the last live read and are labelled as such:
+
+    * ``description`` / ``created_at`` are what that read returned, or ``None``
+    * ``body_synced_at`` is when it happened, ``None`` if it never has
+    * ``body_error`` is why the most recent read failed, cleared by a success
+
+    A caller must still treat the adapter as the authority: ``None`` here means
+    "not known locally", never "the source has no body".
     """
 
     uid: str
@@ -122,9 +161,22 @@ class IssueRow:
     project: str | None
     updated_at: str | None
     synced_at: str
+    description: str | None = None
+    created_at: str | None = None
+    body_synced_at: str | None = None
+    body_error: str | None = None
 
 
 def _row_from(record: sqlite3.Row) -> IssueRow:
+    # The body columns arrive with 0072; ``_row_from`` is only ever called
+    # through a path that ran :func:`_ensure_body_columns` first, but a row
+    # built from a hand-written SELECT (a test, a future reader) must not
+    # explode over the one column it forgot.
+    keys = record.keys()
+
+    def body(name: str) -> str | None:
+        return record[name] if name in keys else None
+
     return IssueRow(
         uid=record["uid"],
         provider=record["provider"],
@@ -143,6 +195,10 @@ def _row_from(record: sqlite3.Row) -> IssueRow:
         project=record["project"],
         updated_at=record["updated_at"],
         synced_at=record["synced_at"],
+        description=body("description"),
+        created_at=body("created_at"),
+        body_synced_at=body("body_synced_at"),
+        body_error=body("body_error"),
     )
 
 
@@ -160,12 +216,35 @@ def _priority(value: int | None) -> Priority:
         return Priority.NONE
 
 
+def _ensure_body_columns(con: sqlite3.Connection) -> None:
+    """Add 0072's body-cache columns to an existing ``pm_issues``, once.
+
+    The runtime half of the migration. ``CREATE TABLE IF NOT EXISTS`` cannot
+    widen a table that already exists, so a state.db whose mirror predates 0072
+    — every developer's, and every one an earlier release wrote — needs the
+    ``ALTER`` here or ``SELECT description`` fails on the next page read. Same
+    ``PRAGMA table_info`` check the scheduler's ``ensure_retry_schema`` uses.
+    """
+    have = {record[1] for record in con.execute("PRAGMA table_info(pm_issues)")}
+    if not have:
+        return  # no table yet: SCHEMA_SQL has not run, or the db is not ours
+    for name, decl in BODY_COLUMNS:
+        if name not in have:
+            con.execute(f"ALTER TABLE pm_issues ADD COLUMN {name} {decl}")
+
+
+def _apply_schema(con: sqlite3.Connection) -> None:
+    """The one place both schema paths run: the tables, then 0072's columns."""
+    for statement in SCHEMA_SQL:
+        con.execute(statement)
+    _ensure_body_columns(con)
+
+
 def ensure_schema(db: str | None = None) -> None:
     """Idempotent: safe on every open, and on a database that never migrated."""
     con = _conn(db)
     try:
-        for statement in SCHEMA_SQL:
-            con.execute(statement)
+        _apply_schema(con)
         con.commit()
     finally:
         con.close()
@@ -188,12 +267,21 @@ def upsert_issues(
     An issue whose identity names a different source than ``provider_id`` is
     refused: the row would carry one provider in its uid and another in its
     column, and every later query would disagree with itself.
+
+    The body cache is written *only when this batch actually carries a body*,
+    and the update is a ``COALESCE`` against the stored value rather than an
+    assignment. That is the whole subtlety of this function: :class:`Issue`
+    spells "no description" as ``''``, and a leaner later sync — a page that
+    asked for no description, a source that stopped returning it — would
+    otherwise blank a body the ticket page had already cached. NULL here means
+    "this batch has nothing to say about the body", and the row keeps what it
+    had. ``body_error``/``body_synced_at`` are not touched at all: they belong
+    to :func:`cache_body` and :func:`record_body_error`.
     """
     stamp = synced_at or _now()
     con = _conn(db)
     try:
-        for statement in SCHEMA_SQL:
-            con.execute(statement)
+        _apply_schema(con)
         written = 0
         for issue in issues:
             if issue.identity.provider != provider_id:
@@ -206,8 +294,8 @@ def upsert_issues(
                 INSERT INTO pm_issues (uid, provider, native_key, title, state,
                                        native_state, priority, native_priority, url,
                                        assignee, labels, parent_uid, project,
-                                       updated_at, synced_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                       updated_at, synced_at, description, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(uid) DO UPDATE SET
                   title=excluded.title,
                   state=excluded.state,
@@ -220,7 +308,9 @@ def upsert_issues(
                   parent_uid=excluded.parent_uid,
                   project=excluded.project,
                   updated_at=excluded.updated_at,
-                  synced_at=excluded.synced_at
+                  synced_at=excluded.synced_at,
+                  description=COALESCE(excluded.description, pm_issues.description),
+                  created_at=COALESCE(excluded.created_at, pm_issues.created_at)
                 """,
                 (
                     issue.uid,
@@ -238,6 +328,10 @@ def upsert_issues(
                     issue.identity.project,
                     issue.updated_at,
                     stamp,
+                    # ``''`` is Issue's "no description", not a body: bind it
+                    # as NULL so COALESCE leaves the cached one in place.
+                    issue.description or None,
+                    issue.created_at or None,
                 ),
             )
             written += 1
@@ -251,6 +345,80 @@ def upsert_issues(
         )
         con.commit()
         return written
+    finally:
+        con.close()
+
+
+def cache_body(
+    uid: str,
+    *,
+    description: str | None,
+    created_at: str | None,
+    body_synced_at: str | None = None,
+    error: str | None = None,
+    db: str | None = None,
+) -> bool:
+    """Record what a *full* read of one ticket returned, onto its mirrored row.
+
+    The mirror is an index, and this is the one thing it is allowed to remember
+    beyond an index's columns — because the alternative is a ticket page that
+    shows nothing at all when a source is down. It is a cache and it is stamped
+    as one: ``body_synced_at`` says when the read happened (empty means now),
+    and ``body_error`` carries the reason a read failed — or ``None``, which a
+    successful call passes by omission and which clears a stale reason, because
+    the source just answered.
+
+    ``description`` is stored verbatim, ``''`` included: after a read, "the
+    source says there is no body" is a fact, and it is exactly what NULL is
+    reserved to *not* mean.
+
+    Deliberately an ``UPDATE``, never an upsert. A uid with no row means the
+    ticket was never mirrored, and minting a partial row here would put a
+    half-known issue on the board — the mirror is written by ``sync``, and only
+    widened by this. Returns whether a row changed, so a caller that wanted to
+    record something can tell that it did not.
+    """
+    con = _conn(db)
+    try:
+        _apply_schema(con)
+        cursor = con.execute(
+            """
+            UPDATE pm_issues
+               SET description = ?, created_at = ?, body_synced_at = ?, body_error = ?
+             WHERE uid = ?
+            """,
+            (description, created_at, body_synced_at or _now(), error, uid),
+        )
+        con.commit()
+        return cursor.rowcount > 0
+    finally:
+        con.close()
+
+
+def record_body_error(uid: str, error: str, db: str | None = None) -> bool:
+    """Remember why a live read failed, leaving the cached body and its age.
+
+    :func:`cache_body`'s sibling for the case where there is nothing new to
+    write: a caller that only learned the source is down has no body to offer,
+    and handing it the cached one to write back would be a read-modify-write
+    race for a value that is already on disk.
+
+    Only ``body_error`` moves. Clearing ``description`` or ``body_synced_at``
+    would destroy the very thing the caller is about to fall back to — the page
+    that calls this renders the cached body *and* this reason together.
+
+    ``error`` is shown to a person, so the caller owns redacting it: see
+    ``mini_ork.ide_pages.task._safe_error``, which strips the credentials a
+    source's own exception text may carry before anything reaches here.
+    """
+    con = _conn(db)
+    try:
+        _apply_schema(con)
+        cursor = con.execute(
+            "UPDATE pm_issues SET body_error = ? WHERE uid = ?", (str(error), uid)
+        )
+        con.commit()
+        return cursor.rowcount > 0
     finally:
         con.close()
 

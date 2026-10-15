@@ -1,22 +1,41 @@
 """Task — one epic, or one mirrored ticket, in full.
 
 A card on the Board opens here (:func:`mini_ork.ide_pages.spec.open_task`); the
-IDE gives each ``uid`` its own tab, the way it does for a run. Everything is
-read from the home's ``state.db`` and, for an epic, its kickoff file on disk: no
-PM adapter is imported and no network call is made — the same rule the Board
-follows, so a slow or broken Linear/Jira/GitHub source can neither slow nor
-blank this page.
+IDE gives each ``uid`` its own tab, the way it does for a run.
 
-An epic has a body to show: the kickoff file, the attempt history, the
-dependency edges in and out, and the open ``inbox`` items waiting for a human. A
-ticket does not: the mirror stores no body, no ``created_at`` and no comments
-(``mini_ork.pm.store.IssueRow`` says why), so the ticket view draws the columns
-the mirror does hold, links to the source, and says plainly that the rest is a
-live read it deliberately does not make.
+An epic is read from the home's ``state.db`` and its kickoff file on disk, and
+makes no network call at all: a slow or broken source can neither slow nor blank
+it. It has a body to show — the kickoff file, the attempt history, the
+dependency edges in and out, and the open ``inbox`` items waiting for a human.
+
+A ticket is the one page here that does read its source, and it is the only way
+to draw one honestly. The mirror holds an index row and no body
+(``mini_ork.pm.store.IssueRow``), so a ticket built from the mirror alone is a
+list of columns with a link beside it. This page therefore asks the row's own
+provider adapter for the issue once — body, created date, comments — and caches
+the body it just read back into the mirror, which is what lets the next render
+survive the source being down.
+
+Three rules bound that read, and each one is a failure seen before rather than a
+preference:
+
+* it degrades, never raises. An unregistered source (``UnknownProvider``, a
+  ``KeyError``, not a ``ProviderError``), an unreachable one, and one that
+  refuses the call all end the same way: the cached body, the mirror's columns,
+  and a callout naming the source, the age of the cache and the reason. A tab
+  is not a place to discover a stack trace.
+* it never prints or persists a credential. Error text comes back from
+  transports that put tokens in URLs; :func:`_safe_error` strips them before
+  either the callout or ``pm_issues.body_error`` sees the string.
+* it never writes to the source. There is no comment, transition, update or
+  create on this page — the only write here is the local cache of a body that
+  was already fetched, and ``mini_ork/pm/writeback.py`` is untouched.
 """
 from __future__ import annotations
 
+import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +70,65 @@ _OUTCOME_COLOUR = {"done": "green", "held": "yellow", "failed": "red", "not_run"
 # The normalized priority counts up (``Priority.URGENT`` is the highest number),
 # exactly as ``epics.priority`` does.
 _PRIORITY_LABELS = {0: "no priority", 1: "low", 2: "medium", 3: "high", 4: "urgent"}
+
+#: Shapes a source's own error text can carry a credential in. All of them are
+#: applied to every message this page prints or records — see :func:`_safe_error`.
+#:
+#: ``user:pass@host`` is the GitHub-style authority (``x-access-token:ghp_…@``).
+#: The key/value form catches ``?token=…`` on a URL and ``api_key: …`` in a
+#: payload. Each requires a word boundary and an explicit ``=``/``:``
+#: separator, so a plain "token expired" survives intact — a redactor that eats
+#: the diagnosis is worse than the leak it prevents, because it hides the
+#: reason from the person who has to fix it.
+#:
+#: An ``Authorization`` header gets its own pattern and its own order: it is
+#: two words (``Bearer <value>``, ``token <value>``), so a single-token rule
+#: would redact the scheme and leave the secret sitting next to it. It
+#: therefore runs first and takes the scheme with the value.
+_CREDENTIAL_URL = re.compile(r"//[^/@\s]*:[^/@\s]*@")
+_AUTH_HEADER = re.compile(r"(?i)\b(authorization)\s*[=:]\s*\S+(\s+\S+)?")
+_BEARER = re.compile(r"(?i)\b(bearer)\s+(\S+)")
+_SECRET_KV = re.compile(
+    r"(?i)\b(token|secret|password|passwd|api[_-]?key)\s*[=:]\s*(\S+)"
+)
+
+#: How much of an exception becomes a rendered line, and how much of a body
+#: becomes a section. One runaway must not cost a tab its usable pixels.
+_ERROR_CAP = 300
+
+
+def _safe_error(exc: BaseException) -> str:
+    """The one line of an exception a page may show, or record.
+
+    A source's message is written to be read by a person, but it is assembled
+    from whatever the transport said — and transports say things like
+    ``GET https://api.linear.app/...?token=lin_api_…`` or
+    ``https://x-access-token:ghp_…@github.com/…``. This page is a surface
+    someone demos and ``pm_issues.body_error`` is persisted, so the credentials
+    come out here rather than depending on every adapter having scrubbed its
+    own message. The traceback never renders: only the type name and the
+    message, collapsed onto one line and bounded.
+    """
+    text = f"{type(exc).__name__}: {exc}"
+    text = _CREDENTIAL_URL.sub("//", text)
+    text = _AUTH_HEADER.sub(lambda m: f"{m.group(1)}=…", text)
+    text = _BEARER.sub(lambda m: f"{m.group(1)}=…", text)
+    text = _SECRET_KV.sub(lambda m: f"{m.group(1)}=…", text)
+    text = " ".join(text.split())
+    return text if len(text) <= _ERROR_CAP else text[:_ERROR_CAP] + "…"
+
+
+def _capped(text: str) -> str:
+    """A body, truncated at :data:`_KICKOFF_CAP` with the cap named in the text.
+
+    The same ceiling the kickoff gets, for the same reason — an issue body is
+    an authored document drawn in one tab, and past this it is a runaway. The
+    note names the number so a reader can tell "the source is this long" from
+    "the page cut it off".
+    """
+    if len(text) <= _KICKOFF_CAP:
+        return text
+    return text[:_KICKOFF_CAP] + f"\n\n(truncated at {_KICKOFF_CAP:,} characters)\n"
 
 
 def _db(home: Path):
@@ -372,6 +450,15 @@ def _ticket(home: Path, uid: str, errors: dict[str, str]) -> Any:
         return None
 
 
+@dataclass(frozen=True, slots=True)
+class _Live:
+    """What one live read of a ticket produced — or why it produced nothing."""
+
+    issue: Any | None = None
+    comments: tuple[Any, ...] = ()
+    error: str = ""
+
+
 def _ticket_page(home: Path, uid: str, row: Any, args: dict[str, str],
                  errors: dict[str, str]) -> dict[str, Any]:
     now = int(time.time())
@@ -380,14 +467,15 @@ def _ticket_page(home: Path, uid: str, row: Any, args: dict[str, str],
     native_key = str(getattr(row, "native_key", "") or "")
     source = f"{provider}:{native_key}" if native_key else provider
     url = str(getattr(row, "url", "") or "")
-    sections: list[dict[str, Any]] = [S.callout(
-        "Mirrored, not live",
-        "This is the PM mirror's row, and the mirror deliberately stores no body, "
-        "no `created_at` and no comments — a view that needs them re-reads the issue "
-        "through its adapter. The Board makes no network call, so neither does this "
-        "page: open the source to see the rest.",
-        tone="orange", icon="•", full=True)]
-    sections.extend(S.guarded(errors, "Ticket", lambda: _ticket_facts(row, now)))
+    try:
+        live = _live_read(uid, provider)
+    except Exception as exc:  # noqa: BLE001 — a page must outlive its own bug
+        live = _Live(error=_safe_error(exc))
+    sections: list[dict[str, Any]] = []
+    # Body first: it is what a reader came for, and it is the one section that
+    # can be wrong in an interesting way (cached, stale, unreachable).
+    sections.extend(S.guarded(errors, "Body", lambda: _body_sections(home, uid, row, live, now)))
+    sections.extend(S.guarded(errors, "Ticket", lambda: _ticket_facts(row, live, now)))
     sections.extend(S.guarded(errors, "Links", lambda: _ticket_links(home, uid)))
     actions = [S.btn("Board", S.page_link("kanban"), "ghost")]
     if url:
@@ -396,7 +484,167 @@ def _ticket_page(home: Path, uid: str, row: Any, args: dict[str, str],
                  sections, actions, errors, args, label=title)
 
 
-def _ticket_facts(row: Any, now: int) -> dict[str, Any]:
+def _live_read(uid: str, provider_id: str) -> _Live:
+    """One adapter read of a ticket: the issue, its comments, or why not.
+
+    Every failure is data here rather than an exception, because the caller has
+    a real answer for each of them — the mirror's cached body and a callout.
+    The two catch clauses are deliberately separate:
+
+    * ``(ProviderError, KeyError)`` is the contract. A source that is
+      unreachable, or whose credential was refused, raises ``ProviderError``;
+      one that cannot do this *at all* raises ``Unsupported``, which is a
+      ``ProviderError``. A source that was never registered raises
+      ``UnknownProvider`` — a ``KeyError``, **not** a ``ProviderError`` — so
+      catching only the latter would let the most common misconfiguration
+      (a ticket whose source is not set up in this checkout) blank the page
+      instead of degrading it.
+    * ``Exception`` is the rest of it: ``pm.yaml`` that will not load, an
+      adapter factory that throws while being built. Those are not the ticket's
+      fault and must not cost the reader the page either.
+
+    Comments are best-effort within the read: a source with a body but no
+    comment listing loses the thread, not the body. There is no capability to
+    branch on — ``Capabilities`` describes *writes*; reading comments is
+    required of every source, and one that cannot raises ``Unsupported``,
+    which is what the catch below is for. ``intake.dispatch._comments`` follows
+    the same rule for the same reason.
+    """
+    if not provider_id:
+        return _Live(error="the mirror row names no provider")
+    from mini_ork.pm.provider import ProviderError
+
+    try:
+        from mini_ork.pm import registry
+
+        adapter = registry.get_provider(provider_id)
+    except (ProviderError, KeyError) as exc:
+        return _Live(error=_safe_error(exc))
+    except Exception as exc:  # noqa: BLE001 — a source that will not even build
+        return _Live(error=_safe_error(exc))
+    try:
+        issue = adapter.get(uid)
+    except (ProviderError, KeyError) as exc:
+        return _Live(error=_safe_error(exc))
+    try:
+        comments = tuple(adapter.comments(uid))
+    except (ProviderError, KeyError):
+        comments = ()
+    return _Live(issue=issue, comments=comments)
+
+
+def _body_sections(home: Path, uid: str, row: Any, live: _Live, now: int
+                   ) -> list[dict[str, Any]]:
+    """The ticket's body, comments and created date — live, or cached and said so.
+
+    The mirror write happens on the way out of both branches: a successful read
+    hands its body to :func:`mini_ork.pm.store.cache_body` (so the next render
+    survives a source that goes down), and a failed one records the redacted
+    reason through ``record_body_error``. Both are best-effort — a cache that
+    cannot be written is not a reason to blank a page that is otherwise
+    complete.
+    """
+    from mini_ork.pm import store
+
+    db = str(home / "state.db")
+    source = _source_of(row)
+    if live.error:
+        _remember(lambda: store.record_body_error(uid, live.error, db))
+        return _unreachable_sections(source, row, live.error, now)
+    _remember(lambda: store.cache_body(
+        uid,
+        description=str(getattr(live.issue, "description", "") or ""),
+        created_at=getattr(live.issue, "created_at", None),
+        db=db,
+    ))
+    return _live_sections(source, live, now)
+
+
+def _remember(write) -> None:
+    """Run one mirror write, and refuse to let it cost the page.
+
+    The ticket page is a read surface; the only thing it writes is the body it
+    already fetched. A locked or read-only ``state.db`` would otherwise turn
+    "the source answered" into a broken tab, which is strictly worse than a
+    page whose cache did not update.
+    """
+    try:
+        write()
+    except Exception:  # noqa: BLE001 — a cache write must never blank the tab
+        return
+
+
+def _source_of(row: Any) -> str:
+    provider = str(getattr(row, "provider", "") or "")
+    native_key = str(getattr(row, "native_key", "") or "")
+    return f"{provider}:{native_key}" if native_key else provider
+
+
+def _live_sections(source: str, live: _Live, now: int) -> list[dict[str, Any]]:
+    """A successful read, drawn: the callout, the body, then the thread."""
+    out: list[dict[str, Any]] = [S.callout(
+        "Read live",
+        f"The description, created date and comments below were just read from "
+        f"`{source}` through its adapter, and the body was cached into the "
+        f"mirror so the next open survives this source being down.",
+        tone="green", icon="✓", full=True)]
+    text = _capped(str(getattr(live.issue, "description", "") or ""))
+    if text:
+        out.append(S.markdown("Description", text, full=True))
+    else:
+        out.append(S.lst("Description", [S.dot(f"{source} carries no description "
+                                                "on this issue")], full=True))
+    out.append(_comments_section(source, live.comments, now))
+    return out
+
+
+def _unreachable_sections(source: str, row: Any, error: str, now: int
+                          ) -> list[dict[str, Any]]:
+    """A failed read, drawn: what the mirror last knew, and why it is all there is.
+
+    The callout names the source, the age of the cached body and the failure
+    itself, because those are the three questions a reader asks in that order —
+    "which source", "how stale is this", "what went wrong". The cached body is
+    drawn from the row and labelled as cached, so nobody mistakes it for the
+    live issue.
+    """
+    cached_at = getattr(row, "body_synced_at", None)
+    if cached_at:
+        cache_note = f"the body below was read {_stamp(cached_at, now)}"
+    else:
+        cache_note = "no body has ever been read for this ticket, so there is none to show"
+    out: list[dict[str, Any]] = [S.callout(
+        "Source unreachable",
+        f"**{source}** did not answer, so this page shows the mirror's row and "
+        f"nothing live — {cache_note}.\n\n"
+        f"The read failed with: `{error}`",
+        tone="orange", icon="!", full=True)]
+    text = _capped(str(getattr(row, "description", "") or ""))
+    if text:
+        out.append(S.markdown("Description (cached)", text, full=True))
+    return out
+
+
+def _comments_section(source: str, comments: tuple[Any, ...], now: int) -> dict[str, Any]:
+    """The thread, oldest first, as one list item per comment.
+
+    Ordered here rather than trusted: the :class:`~mini_ork.pm.model.Comment`
+    contract says a source returns them oldest first, and a page that reads a
+    conversation backwards is worse than one that spends a sort. A stable sort
+    on an absent timestamp keeps the source's order rather than inventing one.
+    """
+    if not comments:
+        return S.lst("Comments", [S.dot(f"No comments on this issue at {source}")], full=True)
+    ordered = sorted(comments, key=lambda c: str(getattr(c, "created_at", "") or ""))
+    items = [
+        S.item(str(getattr(c, "author", "") or "someone"),
+               _stamp(getattr(c, "created_at", None), now))
+        for c in ordered
+    ]
+    return S.lst("Comments", items, full=True)
+
+
+def _ticket_facts(row: Any, live: _Live, now: int) -> dict[str, Any]:
     priority = getattr(row, "priority", None)
     state = str(getattr(row, "state", "") or "")
     native_state = str(getattr(row, "native_state", "") or "")
@@ -412,6 +660,11 @@ def _ticket_facts(row: Any, now: int) -> dict[str, Any]:
             priority_label = _PRIORITY_LABELS.get(int(priority), str(priority))
         except (TypeError, ValueError):
             priority_label = str(priority)
+    # Created beside Updated, and from the live read when there was one: the
+    # mirror's cached date is the fallback, not the answer. The mirror has no
+    # ``created_at`` at all until a body read fills it, so the pair is only
+    # half there until then — which ``_kv_items`` states by dropping the row.
+    created = getattr(live.issue, "created_at", None) or getattr(row, "created_at", None)
     items = _kv_items([
         ("Source", f"{getattr(row, 'provider', '') or ''}:{getattr(row, 'native_key', '') or ''}"),
         ("State", state or "—", "text",
@@ -421,6 +674,7 @@ def _ticket_facts(row: Any, now: int) -> dict[str, Any]:
         ("Labels", labels or ""),
         ("Project", getattr(row, "project", "") or ""),
         ("Parent", getattr(row, "parent_uid", "") or ""),
+        ("Created", _stamp(created, now)),
         ("Updated", _stamp(getattr(row, "updated_at", None), now)),
         ("Synced", _stamp(getattr(row, "synced_at", None), now),
          "text", "when the mirror last read the source"),

@@ -239,6 +239,7 @@ def poll_once(
         if isinstance(issue, str):
             outcomes.append(Outcome(row.uid, "failed", issue))
             continue
+        _warm_body_cache(issue, db)
         if not issue.is_open:
             # The mirror said open; the source says otherwise. A row can be
             # stale — synced before the ticket closed, or a state the sync's
@@ -399,3 +400,29 @@ def _read(adapter: Provider, uid: str) -> Issue | str:
         return adapter.get(uid)
     except (ProviderError, KeyError) as exc:
         return f"could not read {uid}: {exc}"
+
+
+def _warm_body_cache(issue: Issue, db: str | None) -> None:
+    """Cache the body of a read this pass had to make anyway.
+
+    The dispatch path already pays for one full :meth:`Provider.get` per
+    candidate, so the description and created date are in hand for free — and
+    this is the only place in the daemon where that is true. Handing them to
+    the mirror is what lets the ticket page open a ticket it has never opened
+    before without a network call of its own, and lets it degrade to a real
+    body rather than to nothing when the source later fails.
+
+    Best-effort on purpose. A mirror write that fails is not a reason to fail a
+    pass whose real work — dispatching this ticket — is already decided, and
+    the ticket page re-reads live whenever it can, so the cache is an
+    optimization and never a dependency.
+    """
+    try:
+        pm_store.cache_body(
+            issue.uid,
+            description=issue.description or "",
+            created_at=issue.created_at,
+            db=db,
+        )
+    except Exception:  # noqa: BLE001 — the cache must not be able to fail a pass
+        return
