@@ -347,6 +347,24 @@ def _profile_field(name):
         return None
 
 
+def _kickoff_declares_commands():
+    """Whether the kickoff states its own verification commands; None when unknown.
+
+    Unknown (no readable kickoff, or a copy of this verifier without the mini_ork
+    package) keeps the profile's list, as before.
+    """
+    kickoff = str(_profile_field("kickoff_path") or "")
+    if not (kickoff and os.path.isfile(kickoff)):
+        return None
+    try:
+        with open(kickoff, encoding="utf-8") as fh:
+            text = fh.read()
+        from mini_ork.gates.profile_gate import declares_verification_command
+    except Exception:
+        return None
+    return declares_verification_command(text)
+
+
 def _epic_verification_commands():
     """The kickoff's acceptance commands, in order, deduped.
 
@@ -362,6 +380,12 @@ def _epic_verification_commands():
     if isinstance(raw, str):
         raw = [raw]
     cmds = [str(c) for c in raw if str(c).strip()]
+    if cmds and _kickoff_declares_commands() is False:
+        # With no verification section the profile falls back to regex-scanning
+        # the whole kickoff for runner invocations. Those are hints, not the
+        # kickoff's acceptance bar: vg-3-spec-tests (2026-10-15) was gated on the
+        # prose fragment "pytest files into" and a `<run_dir>` placeholder.
+        cmds = []
     if not cmds:
         kickoff = str(_profile_field("kickoff_path") or "")
         if kickoff and os.path.isfile(kickoff):

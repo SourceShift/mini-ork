@@ -443,3 +443,25 @@ def test_the_bound_run_dir_expands_but_is_not_exported(monkeypatch, tmp_path):
     proc = subprocess.Popen(cmd, shell=True, env=env, stdout=subprocess.PIPE)
     out, _ = proc.communicate(timeout=10)
     assert out.decode() == f"{tmp_path / 'run'}|unset"
+
+
+def test_regex_hints_from_a_kickoff_without_a_section_do_not_gate(monkeypatch, tmp_path):
+    """vg-3-spec-tests (2026-10-15): the kickoff had no verification section, so
+    the profile regex-scanned its prose and the verifier ran "pytest files into"."""
+    mod, _cap, _wt = _load_fwedit_verifier(monkeypatch, tmp_path)
+    kickoff = tmp_path / "kickoff.md"
+    kickoff.write_text("# VG-3\n\n## Mechanism\n\nwrite pytest files into the run dir\n")
+    _profile(mod, tmp_path, {"kickoff_path": str(kickoff), "verification_command": [
+        "pytest files into", "pytest -q <run_dir>/spec-tests"]})
+
+    assert mod._epic_verification_commands() == []
+
+
+def test_a_declared_section_keeps_the_profile_commands(monkeypatch, tmp_path):
+    mod, _cap, _wt = _load_fwedit_verifier(monkeypatch, tmp_path)
+    kickoff = tmp_path / "kickoff.md"
+    kickoff.write_text("# T\n\n## Proof of success\n\n- `ruff check mini_ork`\n")
+    _profile(mod, tmp_path, {"kickoff_path": str(kickoff),
+                             "verification_command": ["ruff check mini_ork"]})
+
+    assert mod._epic_verification_commands() == ["ruff check mini_ork"]
