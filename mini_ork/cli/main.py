@@ -136,6 +136,11 @@ Recipe runner:
   run <recipe-name> <kickoff.md> Force a recipe, then walk the same lifecycle
   run … --set K=V                Repeatable env override; premium feature knobs
                                    are dropped unless MO_ACCEPT_PREMIUM=1
+  run … --workspace worktree|in-place  Isolate edits on a fresh mini-ork/<run>
+                                       worktree. Default: worktree when the
+                                       review policy requires approval before
+                                       merge, otherwise in-place. Override
+                                       via MO_WORKSPACE_MODE or this flag.
 
 Self-improvement:
   self-improve                   Recursive self-improvement of this checkout in a
@@ -1102,6 +1107,135 @@ def _gate_set_overrides(
     return filtered, blocked, ""
 
 
+# Workspace isolation for ``mini-ork run``: every edit must land on its own
+# ``mini-ork/<run_id>`` worktree when the operator wants a human to look
+# before the changes merge. The flag and the env override the policy; the
+# policy (``MO_REVIEW_BEFORE_MERGE=required``) decides when neither is set.
+# The two helpers below are the pure seams — the lifecycle wires them
+# together and owns the ``MO_TARGET_CWD`` write, so unit tests can hit each
+# helper without driving a whole run.
+_WORKSPACE_WORKTREE = "worktree"
+_WORKSPACE_IN_PLACE = "in-place"
+_WORKSPACE_VALUES = (_WORKSPACE_WORKTREE, _WORKSPACE_IN_PLACE)
+_WORKSPACE_MODE_SOURCE_DEFAULT = "default"
+_WORKSPACE_MODE_SOURCE_POLICY = "policy"
+_WORKSPACE_MODE_SOURCE_ENV = "env"
+_WORKSPACE_MODE_SOURCE_FLAG = "flag"
+
+
+def _resolve_workspace_mode(argv, env, policy):
+    """Resolve ``mini-ork run``'s workspace mode from argv / env / policy.
+
+    Returns ``(mode, source, argv_rest)``:
+
+    * ``mode`` — one of ``_WORKSPACE_VALUES``;
+    * ``source`` — ``flag`` / ``env`` / ``policy`` / ``default``;
+    * ``argv_rest`` — ``argv`` with the ``--workspace`` flag stripped, so the
+      recipe/kickoff positional parser never sees the flag.
+
+    Precedence:
+
+    1. ``--workspace <v>`` / ``--workspace=<v>`` on ``argv``.
+    2. ``MO_WORKSPACE_MODE`` in ``env``.
+    3. ``policy.before_merge == "required"`` → ``worktree``.
+    4. Default: ``in-place``.
+
+    Raises ``ValueError`` on a bad ``--workspace`` value (missing argument,
+    or a value not in ``_WORKSPACE_VALUES``) or a bad ``MO_WORKSPACE_MODE``
+    value. The lifecycle call site writes the message to stderr and returns
+    ``2``. ``policy`` may be ``None`` or a duck-typed object exposing
+    ``before_merge``.
+    """
+    argv_rest: list[str] = []
+    i = 0
+    flag_value: str | None = None
+    while i < len(argv):
+        a = argv[i]
+        if a == "--workspace":
+            if i + 1 >= len(argv):
+                raise ValueError("--workspace requires <mode>")
+            v = argv[i + 1]
+            if v not in _WORKSPACE_VALUES:
+                raise ValueError(
+                    f"--workspace: expected worktree|in-place (got '{v}')"
+                )
+            flag_value = v
+            i += 2
+        elif a.startswith("--workspace="):
+            v = a.split("=", 1)[1]
+            if v not in _WORKSPACE_VALUES:
+                raise ValueError(
+                    f"--workspace: expected worktree|in-place (got '{v}')"
+                )
+            flag_value = v
+            i += 1
+        else:
+            argv_rest.append(a)
+            i += 1
+
+    if flag_value is not None:
+        return flag_value, _WORKSPACE_MODE_SOURCE_FLAG, argv_rest
+
+    env_val = (env.get("MO_WORKSPACE_MODE") or "").strip()
+    if env_val:
+        if env_val not in _WORKSPACE_VALUES:
+            raise ValueError(
+                f"MO_WORKSPACE_MODE: expected worktree|in-place (got '{env_val}')"
+            )
+        return env_val, _WORKSPACE_MODE_SOURCE_ENV, argv_rest
+
+    if policy is not None and getattr(policy, "before_merge", "") == "required":
+        return _WORKSPACE_WORKTREE, _WORKSPACE_MODE_SOURCE_POLICY, argv_rest
+
+    return _WORKSPACE_IN_PLACE, _WORKSPACE_MODE_SOURCE_DEFAULT, argv_rest
+
+
+def _isolate_run(target, home, run_id, kickoff, source):
+    """Mint a workspace worktree so the run edits on its own branch.
+
+    Three outcomes:
+
+    * Fresh worktree minted — returns ``(True, ws)`` where ``ws`` is the
+      :class:`mini_ork.workspaces.Workspace` record, AND emits the
+      one-line ``[workspace] run … isolated in … on …`` message to
+      stderr. The call site still publishes the new ``MO_TARGET_CWD``.
+    * An existing record is found (``workspaces.load`` non-``None``) — the
+      run already has a worktree (Zed thread or automation created it),
+      and the lifecycle must not mint a second. Returns ``(True, None)``
+      silently; ``target`` is reused unchanged.
+    * ``workspaces.create`` raises ``RuntimeError`` (target is not a git
+      repo, or ``git worktree add`` failed) — returns ``(False, message)``
+      starting with the fail-closed prefix the kickoff specifies.
+
+    Does NOT publish ``MO_TARGET_CWD``; the lifecycle call site owns that
+    so a unit test that calls this helper directly cannot leak the
+    worktree path into a later test in the same pytest process.
+
+    ``source`` is reserved for future, source-aware failure messages; the
+    current fail-closed contract is identical regardless of source, per
+    the kickoff's "no silent in-place fallback" rule.
+    """
+    del source  # see docstring
+    # Local import: ``workspaces`` lazily imports ``mini_ork.cli.zed_cmd``,
+    # which would pull the whole ``cli`` package back into this module's
+    # load path (cycle when imported at module load). Local-import pattern
+    # from ``cli/approvals_cmd.py``.
+    from mini_ork import workspaces
+
+    if workspaces.load(home, run_id) is not None:
+        return True, None
+    name = workspaces.task_name(Path(kickoff).stem, run_id)
+    try:
+        ws = workspaces.create(Path(target), Path(home), run_id, name=name)
+    except RuntimeError:
+        msg = f"[workspace] review required but target is not a git repo: {target}"
+        return False, msg
+    sys.stderr.write(
+        f"[workspace] run {run_id} isolated in {ws.path} on "
+        f"{ws.branch} (merge needs review)\n")
+    return True, ws
+
+
 def _run_lifecycle_impl(argv, root, sink) -> int:
     t0 = int(time.time())
     # ── flag pre-parse: pull --deadline / --placement / --env / --set out ──
@@ -1200,6 +1334,27 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
         # steps; _release_remote_session ends it when the lifecycle returns.
         publish_env({"MO_REMOTE_SESSION_SCOPE": "lifecycle"})
 
+    # ── workspace mode: --workspace flag beats MO_WORKSPACE_MODE beats the
+    # review policy (MO_REVIEW_BEFORE_MERGE=required) beats in-place ──
+    # Loaded here so ``--set MO_REVIEW_BEFORE_MERGE=required`` (published
+    # above) counts; a typo in the policy raises ``ValueError`` and we fail
+    # closed rather than silently fall back to in-place.
+    try:
+        from mini_ork.gates.review_policy import load_policy as _load_review_policy
+        _ws_home = os.environ.get("MINI_ORK_HOME") or os.path.join(
+            os.getcwd(), ".mini-ork")
+        _ws_policy = _load_review_policy(
+            home=_ws_home, env=context_env_snapshot())
+    except ValueError as exc:
+        sys.stderr.write(f"[review policy] {exc}\n")
+        return 2
+    try:
+        _ws_mode, _ws_source, rest = _resolve_workspace_mode(
+            rest, context_env_snapshot(), _ws_policy)
+    except ValueError as exc:
+        sys.stderr.write(f"{exc}\n")
+        return 2
+
     if not rest:
         sys.stderr.write("recipe name or kickoff.md path required\n"); return 2
     first = rest.pop(0)
@@ -1294,6 +1449,29 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
             return RC_BLOCKED
     except Exception:  # noqa: BLE001 — guard is best-effort, never break the run
         pass
+
+    # ── workspace isolation ──
+    # Mint a worktree now when the resolved mode is ``worktree``, so the
+    # profile / run roots / lane dispatch all read ``MO_TARGET_CWD`` pointing
+    # at the worktree rather than the operator's checkout. Done AFTER the
+    # pending-fix guard so a guarded run never mints an orphan worktree; the
+    # mode / home / policy locals were resolved earlier and survive until
+    # here. A non-git target fails closed with rc=2 — the kickoff's "no
+    # silent in-place fallback" rule. An existing record (Zed thread or
+    # automation) is reused as-is; the lifecycle does not mint a second.
+    if _ws_mode == _WORKSPACE_WORKTREE:
+        _ws_target = context_env("MO_TARGET_CWD", "") or os.getcwd()
+        _ok, _ws_info = _isolate_run(
+            _ws_target, _ws_home, run_id, kickoff, _ws_source)
+        if not _ok:
+            sys.stderr.write(_ws_info + "\n")
+            return 2
+        if _ws_info is not None:
+            # Fresh worktree minted; publish the new target so gen_profile
+            # and persist_run_roots both see the worktree path (W1 — bare
+            # ``os.environ[...]`` would be masked by an earlier contextvar).
+            # The helper already emitted the [workspace] line to stderr.
+            publish_env({"MO_TARGET_CWD": str(_ws_info.path)})
 
     # Every run is a Concord principal: register it (fail-open) so the node
     # workers this run spawns inherit CONCORD_PRINCIPAL. Concord must never
