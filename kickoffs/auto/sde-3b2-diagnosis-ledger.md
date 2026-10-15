@@ -15,9 +15,8 @@ All paths are relative to the repository root.
 
 ## Mechanism (exact spec)
 
-1. New migration `db/migrations/00NN_diagnosis_ledger.sql`, `NN` = the next free
-   number in `db/migrations/` at implementation time (0073 when this was written;
-   check for collisions): table `diagnosis_ledger` —
+1. New migration `db/migrations/0073_diagnosis_ledger.sql` (this exact name is
+   claimed for this worktree): table `diagnosis_ledger` —
    `id INTEGER PRIMARY KEY`, `run_id TEXT NOT NULL`, `source TEXT NOT NULL`,
    `layer TEXT`, `routes_to TEXT`, `confidence REAL`, `model_lane TEXT`,
    `signature TEXT`, `action TEXT`, `fix_epic_id TEXT`, `created_at INTEGER NOT NULL`,
@@ -43,7 +42,7 @@ All paths are relative to the repository root.
 
 ## Files in scope
 
-- db/migrations/00NN_diagnosis_ledger.sql (new)
+- db/migrations/0073_diagnosis_ledger.sql (new)
 - mini_ork/stores/diagnosis_ledger.py (new)
 - mini_ork/recovery/escalation.py
 - tests/unit/test_diagnosis_ledger.py (new)
