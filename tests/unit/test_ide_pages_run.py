@@ -10,6 +10,7 @@ import pytest
 
 from mini_ork.ide_pages import build_page
 from mini_ork.ide_pages import run as run_page
+from mini_ork.ide_pages.node import build_node
 from mini_ork.stores import migrate as mig
 
 REPO = Path(__file__).resolve().parents[2]
@@ -416,3 +417,152 @@ def test_kickoff_tab_reports_when_no_kickoff_is_found(home: Path) -> None:
     lst = _section(page, "list", "Kickoff")
     assert len(lst["items"]) == 1
     assert "No kickoff file recorded" in lst["items"][0]["t"]
+
+
+# ── the run buddy (MO_BUDDY) ─────────────────────────────────────────────────
+
+def _buddy_titles(page: dict) -> list[str]:
+    return [s["title"] for s in page["sections"] if s["title"].startswith("Buddy")]
+
+
+def _write_buddy_report(run_dir: Path, node: str, *, summary: str, signals: list[str] | None = None,
+                        at: int = T0 + 100) -> Path:
+    """One report artefact in the shape ``run_buddy.write_report`` writes."""
+    directory = run_dir / "buddy"
+    directory.mkdir(parents=True, exist_ok=True)
+    report = {
+        "v": 1, "at": at, "run_id": RUN, "node_id": node, "node_type": "verifier",
+        "phase": "stage", "elapsed_s": 5, "signals": signals if signals is not None else ["failed"],
+        "summary": summary, "detail": "", "next": f"Fix the cause, then resume from {node}.",
+        "narrative": "",
+        "actions": [
+            {"label": f"Resume from {node}", "argv": ["recover", RUN, "--from-node", node],
+             "confirm": f"Resume {RUN} from {node}?"},
+            {"label": "Open the run page", "argv": [],
+             "page": {"key": "run", "args": {"run": RUN}}},
+        ],
+    }
+    path = directory / f"{at}.json"
+    path.write_text(json.dumps(report))
+    (directory / "latest.json").write_text(json.dumps(report))
+    return path
+
+
+def _reap_the_test_node(home: Path) -> None:
+    """Rewrite ``test``'s node_end into the reaper's shape (run-1791930074-82118).
+
+    The synthetic row carries ``verdict: CRASH`` and ``interrupted`` and no
+    ``finish_reason`` — the payload that used to read "done" on the node tab
+    while the header read CRASH.
+    """
+    con = sqlite3.connect(home / "state.db")
+    rows = con.execute("SELECT event_id, payload_json FROM run_events "
+                       "WHERE run_id = ? AND event_type = 'node_end'", (RUN,)).fetchall()
+    for event_id, raw in rows:
+        if json.loads(raw).get("node_id") == "test":
+            con.execute("UPDATE run_events SET payload_json = ? WHERE event_id = ?", (
+                json.dumps({"node_id": "test", "node_type": "verifier", "verdict": "CRASH",
+                            "interrupted": True, "duration_ms": 0}), event_id))
+    con.commit()
+    con.close()
+
+
+def test_the_node_tab_reads_a_reaped_node_as_failed_with_a_reason(home: Path) -> None:
+    """The reported bug: the header said CRASH while the node's own tab said done."""
+    _seed(home)
+    _reap_the_test_node(home)
+    facts = {f["k"]: f for f in build_node(home, RUN, "test", view="overview")["facts"]}
+    assert facts["Status"]["v"] == "failed"
+    assert facts["Status"]["c"] == "red"
+    assert facts["Reason"]["v"] and facts["Reason"]["c"] == "red"
+
+
+def test_the_buddy_is_absent_from_the_page_and_the_node_tab_when_off(
+        home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MO_BUDDY", raising=False)
+    _seed(home)
+    assert _buddy_titles(build_page(home, "run", "dag", {"run": RUN})) == []
+    keys = [f["k"] for f in build_node(home, RUN, "test", view="overview")["facts"]]
+    assert "Buddy" not in keys and "Next" not in keys
+    # Off means off: a run nobody asked to watch leaves no artefact behind.
+    assert not (home / "runs" / RUN / "buddy").exists()
+
+
+def test_the_buddy_section_reports_each_stage_with_its_actions(
+        home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MO_BUDDY", "1")
+    _seed(home)
+    _write_buddy_report(home / "runs" / RUN, "test",
+                        summary="test failed — AssertionError: 3 != 4")
+    buddy = _section(build_page(home, "run", "dag", {"run": RUN}), "list", "Buddy — 1 report")
+    assert buddy["full"] is True
+    item = buddy["items"][0]
+    assert (item["m"], item["mc"]) == ("✗", "red")
+    assert "AssertionError" in item["t"]
+    assert "resume from test" in item["sub"].lower()
+    labels = [a["label"] for a in item["acts"]]
+    # The CLI action carries its argv and its confirm — a button cannot run
+    # unconfirmed, and no shell string is built anywhere.
+    resume = next(a for a in item["acts"] if a["label"] == "Resume from test")
+    assert resume["do"]["cli"] == ["recover", RUN, "--from-node", "test"]
+    assert resume["do"]["confirm"]
+    # The buddy's own "Open the run page" is what this page already is; it
+    # becomes the one jump that helps instead of a no-op.
+    assert "Open the run page" not in labels
+    assert "Show the graph" in labels
+
+
+def test_the_story_tab_carries_the_buddy_section(
+        home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``MINI_ORK_IDE_SPEC=2`` is what the IDE sets, and ``story`` is where it lands."""
+    monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
+    monkeypatch.setenv("MO_BUDDY", "1")
+    _seed(home)
+    _write_buddy_report(home / "runs" / RUN, "implementer",
+                        summary="implementer finished its stage.", signals=[])
+    page = build_page(home, "run", "story", {"run": RUN})
+    assert "Buddy — 1 report" in [s["title"] for s in page["sections"]]
+    item = _section(page, "list", "Buddy — 1 report")["items"][0]
+    assert (item["m"], item["mc"]) == ("✓", "green")
+
+
+def test_the_node_tab_shows_only_that_nodes_report(
+        home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MO_BUDDY", "1")
+    _seed(home)
+    run_dir = home / "runs" / RUN
+    _write_buddy_report(run_dir, "implementer", summary="implementer wrote 3 files", signals=[])
+    _write_buddy_report(run_dir, "test", summary="test failed — AssertionError: 3 != 4",
+                        at=T0 + 200)
+    facts = {f["k"]: f["v"] for f in build_node(home, RUN, "test", view="overview")["facts"]}
+    assert "AssertionError" in facts["Buddy"]
+    assert facts["Next"]
+    assert "implementer wrote 3 files" not in " ".join(facts.values())
+
+
+def test_a_dead_run_gets_a_report_at_read_time_and_only_one(
+        home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The dispatcher is gone, so no boundary report was ever written — the
+    read-time call writes one, and polling the page cannot write more."""
+    monkeypatch.setenv("MO_BUDDY", "1")
+    _seed(home)
+    _reap_the_test_node(home)
+    page = build_page(home, "run", "dag", {"run": RUN})
+    assert _buddy_titles(page) == ["Buddy — 1 report"]
+    written = sorted(p.name for p in (home / "runs" / RUN / "buddy").glob("*.json"))
+    assert "latest.json" in written and len(written) == 2
+    build_page(home, "run", "dag", {"run": RUN})
+    assert len(list((home / "runs" / RUN / "buddy").glob("*.json"))) == 2
+
+
+def test_the_flag_on_with_nothing_to_say_says_so(
+        home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A run whose nodes all finished cleanly has no reports — the section still
+    exists, so turning the flag on visibly does something."""
+    monkeypatch.setenv("MO_BUDDY", "1")
+    _seed(home)
+    buddy = _section(build_page(home, "run", "dag", {"run": RUN}), "list", "Buddy — 0 reports")
+    assert len(buddy["items"]) == 1
+    assert "Nothing to report yet" in buddy["items"][0]["t"]
+
+

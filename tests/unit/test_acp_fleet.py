@@ -372,14 +372,17 @@ def test_reaper_kill_close_step_reads_failed_not_done(home: Path):
 
     step = fl.run_card(home, "r-kill")["steps"][0]
     assert step["state"] == "failed"
-    assert step["finish_reason"] == ""
+    # The step carries the classifier's own reason, not a blank: the node tab's
+    # "Finish" row and its failure reason both read this field, and a failed
+    # node with nothing to show is the bug being fixed.
+    assert step["finish_reason"] == "CRASH"
 
     # Same payload, same answer: the run-header reader must not disagree.
     from mini_ork.acp import node_status, task_state
 
     payload = {"node_id": "test", "node_type": "verifier", "verdict": "CRASH",
                "interrupted": True, "duration_ms": 0}
-    assert node_status.node_end_state(payload)[0] == step["state"]
+    assert node_status.node_end_state(payload) == (step["state"], step["finish_reason"])
     assert task_state._node_end_failure(payload) == "CRASH"
 
     # The reaper now also writes the marker itself, so a fresh row needs no

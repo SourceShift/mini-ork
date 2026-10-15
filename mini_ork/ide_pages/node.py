@@ -54,8 +54,8 @@ from mini_ork.ide_pages.node_changes import (
     build_changes_view,
     plain_reason,
 )
-from mini_ork.ide_pages.run import (Run, Node, _epoch, _load, _wall, _STATE_TEXT,
-                                    _REVIEW_TYPES, plan_artifact)
+from mini_ork.ide_pages.run import (Run, Node, _buddy_node_facts, _epoch, _load, _wall,
+                                    _STATE_TEXT, _REVIEW_TYPES, plan_artifact)
 
 # Live-detection window per the kickoff §"live": running AND transcript grew
 # in the last 120 s. Named so a future tweak is one edit.
@@ -3112,6 +3112,11 @@ def _overview_facts(run: Run, node: Node, run_dir: Path,
         items.append({"k": "Exit code",
                       "v": str(rc),
                       "c": "red" if rc != 0 else "text"})
+
+    # Buddy — what the observer said about THIS node, last. Rows appear only
+    # when the flag is on and this node has a report, so a run without the
+    # buddy renders exactly the tab it always did.
+    items.extend(_buddy_node_facts(run, node))
 
     return items
 

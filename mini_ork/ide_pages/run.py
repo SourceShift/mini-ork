@@ -20,6 +20,7 @@ from typing import Any
 
 from mini_ork.ide_pages import outcome as O
 from mini_ork.ide_pages import spec as S
+from mini_ork.orchestration import run_buddy
 
 TABS = [("dag", "DAG"), ("kickoff", "Kickoff"), ("overview", "Overview"), ("agents", "Agents"),
         ("learnings", "Learnings"), ("artifacts", "Artifacts")]
@@ -647,6 +648,138 @@ def _wall(node: Node) -> str:
     return f"{max(0, end - node.start)}s"
 
 
+# ── the run buddy (MO_BUDDY) ────────────────────────────────────────────────
+# The buddy's reports are plain files under <run_dir>/buddy/ written by
+# ``mini_ork.orchestration.run_buddy`` — the same one-reader contract as
+# ``outcome.py`` reading verdict.json. This module only renders them; it never
+# decides whether a stage went badly (that is Part 1's classifier, at the write
+# site). Both surfaces below disappear entirely when the flag is off, so there
+# is exactly one owner of "is the buddy on".
+
+_BUDDY_MAX_ITEMS = 12
+
+
+def _buddy_actions(report: dict[str, Any], *, run: Run) -> list[dict[str, Any]]:
+    """The report's buttons, from its own argv lists — never a shell string."""
+    buttons: list[dict[str, Any]] = []
+    for action in report.get("actions") or []:
+        if not isinstance(action, dict):
+            continue
+        label = str(action.get("label") or "Do it")
+        argv = [str(a) for a in action.get("argv") or []]
+        if argv:
+            buttons.append(S.btn(label, S.cli(*argv, confirm=action.get("confirm")), "ghost"))
+            continue
+        page = action.get("page")
+        if not isinstance(page, dict):
+            continue
+        target = page.get("args") or {}
+        # The buddy's own "Open the run page" is what this page already IS, so
+        # on the run it belongs to it becomes the one jump that helps: to the
+        # graph, where the node cards carry the same verdict.
+        if str(page.get("key") or "") == "run" and str(target.get("run") or "") == run.id:
+            buttons.append(S.btn("Show the graph", S.page_link("run", "graph", run=run.id), "ghost"))
+        else:
+            buttons.append(S.btn(label, S.page_link(str(page.get("key") or "run"), **target), "ghost"))
+    return buttons
+
+
+def _buddy_item(report: dict[str, Any], *, run: Run) -> dict[str, Any]:
+    signals = [str(s) for s in report.get("signals") or []]
+    next_step = str(report.get("next") or "")
+    narrative = str(report.get("narrative") or "").strip()
+    return S.item(
+        str(report.get("summary") or "—"),
+        " · ".join(part for part in (next_step, narrative) if part),
+        m="✗" if signals else "✓",
+        mc="red" if signals else "green",
+        acts=_buddy_actions(report, run=run),
+    )
+
+
+def _buddy_subject(run: Run) -> Node | None:
+    """The node a read-time report is about: the one that stopped the run."""
+    stopped = [n for n in run.nodes if n.state in ("failed", "running")]
+    for node in stopped:
+        if node.state == "failed":
+            return node
+    return stopped[-1] if stopped else None
+
+
+def _buddy_reports(run: Run) -> list[dict[str, Any]]:
+    """The run's reports, newest first — the story read stage by stage.
+
+    Read-time trigger: a run whose dispatcher is gone (the reaper's case) never
+    wrote a boundary report, so the same pure assessment runs here and writes
+    one. It runs only while the run has *no* reports, so a page that is polled
+    cannot become a report per refresh.
+    """
+    try:
+        reports = run_buddy.read_reports(run.run_dir)
+    except Exception:  # noqa: BLE001 — an optional section must never blank a page
+        return []
+    if not reports and run_buddy.enabled():
+        node = _buddy_subject(run)
+        if node is not None:
+            report = run_buddy.assess(
+                run.home, run_id=run.id, node_id=node.id, node_type=node.type or "",
+                started_at=node.start if node.start is not None else time.time(),
+                phase="stage", only_when_worried=False,
+                failed=(node.state == "failed"),
+            )
+            if report:
+                reports = [report]
+    return list(reversed(reports))
+
+
+def _buddy_section(run: Run) -> list[dict[str, Any]]:
+    """The run panel's buddy section — an empty list (absent) when off.
+
+    Returns *sections*, plural, so the caller can put it through ``S.guarded``
+    like every other section without a ``None`` ever reaching the page.
+    """
+    if not run_buddy.enabled():
+        return []
+    reports = _buddy_reports(run)
+    title = f"Buddy — {len(reports)} report{'' if len(reports) == 1 else 's'}"
+    if not reports:
+        return [S.lst(title, [S.dot("Nothing to report yet",
+                                    "The buddy writes a line when a stage ends, and speaks "
+                                    "sooner only when it sees trouble.")], full=True,
+                      note="Run buddy is on.")]
+    return [S.lst(
+        title,
+        [_buddy_item(r, run=run) for r in reports[:_BUDDY_MAX_ITEMS]],
+        full=True,
+        note=("What the observer saw, newest first — one line per stage, plus anything it "
+              "worried about while a stage was still running. Nothing here changes the run."),
+    )]
+
+
+def _buddy_node_facts(run: Run, node: Node) -> list[dict[str, Any]]:
+    """This node's newest report, as the node tab's ``Buddy`` rows.
+
+    Read-only: the read-time write belongs to the run panel, so opening a node
+    never creates an artefact.
+    """
+    if not run_buddy.enabled():
+        return []
+    try:
+        mine = [r for r in run_buddy.read_reports(run.run_dir)
+                if str(r.get("node_id") or "") == node.id]
+    except Exception:  # noqa: BLE001 — the node tab renders without the buddy
+        return []
+    if not mine:
+        return []
+    newest = mine[-1]
+    items = [{"k": "Buddy", "v": str(newest.get("summary") or "—"),
+              "c": "red" if newest.get("signals") else "text"}]
+    next_step = str(newest.get("next") or "")
+    if next_step:
+        items.append({"k": "Next", "v": next_step, "c": "sub"})
+    return items
+
+
 # ── tabs ────────────────────────────────────────────────────────────────────
 
 def _selected(run: Run, wanted: str | None) -> Node | None:
@@ -847,7 +980,8 @@ def _dag_tab(run: Run, wanted: str | None) -> list[dict[str, Any]]:
         return S.pills(title, pills, full=True, note=note)
 
     return (S.guarded(errors, "DAG", build_dag) + S.guarded(errors, "Inspector", build_inspector)
-            + S.guarded(errors, "Coalition", build_coalition))
+            + S.guarded(errors, "Coalition", build_coalition)
+            + S.guarded(errors, "Buddy", lambda: _buddy_section(run)))
 
 
 def _head_for(col: list[dict[str, Any]], idx: int) -> str:
@@ -1906,6 +2040,10 @@ def _story_tab(run: Run, outcome: dict[str, Any]) -> list[dict[str, Any]]:
     from mini_ork.ide_pages import run_story
 
     sections.extend(S.guarded({}, "What happened", lambda: run_story.story_section(run)))
+    # The buddy narrates the same stages from the outside, including one that
+    # died mid-stage and so never reached the story above. Empty list — no
+    # section at all — when the flag is off.
+    sections.extend(S.guarded({}, "Buddy", lambda: _buddy_section(run)))
     # A live run can still be steered: the box runs ``mini-ork board steer
     # <run> --text <typed>``. Finished runs get no composer — there is nothing
     # left to steer. ``_running`` is the page's own running test (the one the

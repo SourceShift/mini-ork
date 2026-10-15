@@ -109,6 +109,7 @@ a tweak, go back to step 2 — the previous selection is the new starting point.
 | Plan Q&A gate | `plan_qa_gate` | `MINI_ORK_EXECUTE_GATE` | ×1 | 1 | all recipes |
 | PRM scoring | `prm_score` | `MO_PRM_SCORE` | ×1.05 | 1 | all recipes |
 | Reward stamp | `reward_stamp` | `MO_REWARD_STAMP` | ×1 | 1 | all recipes |
+| Run buddy | `run_buddy` | `MO_BUDDY` | ×1 (1+0.01×reports) | 0 | all recipes |
 
 **Premium — opt-in (>1.5×)**
 

@@ -362,7 +362,15 @@ def _steps(home: Path, run_id: str) -> list[dict[str, Any]]:
         state = "running"
         if end_ts is not None:
             finish_reason = str((end_payload or {}).get("finish_reason") or "")
-            state, _ = node_status.node_end_state(end_payload)
+            state, reason = node_status.node_end_state(end_payload)
+            # A node that ended without a ``finish_reason`` of its own — the
+            # reaper's kill-close (verdict CRASH, interrupted), or any row
+            # written before this seam — still owes its readers a word. The
+            # classifier's reason IS that word, so "Finish" reads CRASH rather
+            # than blank, and the node tab's failure reason has something to
+            # show. One classifier, one reason: no second vocabulary here.
+            if not finish_reason and state == node_status.FAILED:
+                finish_reason = reason
         out.append(
             {
                 "node_id": node_id,

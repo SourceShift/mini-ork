@@ -136,6 +136,47 @@ touched set is the child's working tree ∪ untracked ∪ `pre-implementer-ref�
 | `MO_ORACLE_GATES_AUTO` | `"1"` | Auto oracle-gate run pre-publish |
 | `MO_OPTIMIZER_MODEL` | `"minimax"` | GEPA optimizer lane |
 | `MO_OPTIMIZER_BUDGET` | `"4"` | GEPA optimizer budget |
+| `MO_BUDDY` | `"0"` | Run buddy: an observer that reports each stage (see below) |
+| `MO_BUDDY_INTERVAL_SECONDS` | `"180"` | How often the buddy re-checks a stage that is still running |
+| `MO_BUDDY_STALL_SECONDS` | `"300"` | Silence on the node's log that counts as stalled |
+| `MO_BUDDY_LONG_NODE_SECONDS` | `"900"` | Elapsed time at which a node counts as overrunning |
+| `MO_BUDDY_COST_USD` | `MO_ORCH_BUDGET_USD`, else `"1.0"` | Run spend at which the buddy worries |
+
+### Run buddy (`MO_BUDDY`)
+
+An optional observer that narrates a run **stage by stage** — what happened, what
+happens next, and what the operator can do about it. It is not a recipe node: no
+graph changes, nothing to add to a workflow. It hooks the node lifecycle
+(`mo_node_start` / `mo_node_end`) in `mini_ork/cli/execute_handlers.py`, so it
+fires for every node of every recipe.
+
+It writes one report at each stage boundary, and — inside a stage that is still
+running — re-checks every `MO_BUDDY_INTERVAL_SECONDS`. It speaks early only when
+one of four signals crosses a threshold: **stalled progress** (nothing new on the
+node's log), a **repeating error** (the same normalized line ≥3 times), a
+**duration overrun**, or a **cost overrun**. A healthy stage that ends normally
+gets its one line; a healthy stage that is still running gets nothing at all.
+
+Reports are append-only files at `<run_dir>/buddy/<epoch>.json`, plus a
+`latest.json` pointer. Both paths write files and nothing else — no DB row, not
+even from the stage boundary — so the ticker can never contend with the run's
+own writers. The run page and the node tab read those files — the same
+one-reader shape as `verdict.json` — and both surfaces disappear entirely when
+the flag is off, so the flag has exactly one owner.
+
+**Simple tier.** Unset, empty, `"0"`, `"false"`, `"no"`, `"off"` or a typo all
+mean *off* (fail closed, unlike `MO_RUN_ORCHESTRATOR`'s deliberate fail-open).
+Turned on, it needs no provider and no network: every report is built by a
+deterministic template from the signals and the node's log tail.
+
+**Secure tier.** Set `MO_BUDDY=1` with a provider configured and the same report
+is narrated by a model — spend capped by `MO_BUDDY_COST_USD` and recorded in
+`llm_calls` like any other call, so it shows up in the existing cost views. The
+buddy's actions are `argv` lists rendered by `spec.cli`, never shell strings, and
+each one carries a `confirm`.
+
+A failing buddy can never fail a run: every entry point returns `None` on any
+internal error, and a raising sampler is swallowed.
 
 ### Recipe-declared loop caps (`MO_RECURSION_*`)
 
