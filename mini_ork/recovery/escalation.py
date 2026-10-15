@@ -20,6 +20,13 @@ fix epic can therefore never edit the policy that admitted it.
 Python traceback frames, so a delivery-stage engine fault with no traceback is
 filed against mini-ork instead of being missed.
 
+Every diagnosis this loop *acts on* — an escalation it opened, or a refusal it
+handed to a human — is written to the SDE-3b2 diagnosis ledger
+(``mini_ork.stores.diagnosis_ledger``), which is what ``gather_inputs`` reads
+back (via ``labelled``) to calibrate the bar a model diagnosis must clear.
+Recording is best-effort: a ledger that cannot be written must never fail an
+escalation, so ``_record_ledger`` swallows its own errors.
+
 Hard constraint ``c:0``: :func:`escalate` never raises into the run. Any failure
 along the way — a broken home, an unreadable DB, a promote that produced no epic
 — degrades to ``{"escalated": false, "reason": "escalation error: ..."}`` and the
@@ -35,6 +42,7 @@ from pathlib import Path
 from typing import Any
 
 from mini_ork.context import context_env
+from mini_ork.recovery import escalation_policy
 from mini_ork.recovery.escalation_policy import (
     EscalationDecision,
     EscalationInputs,
@@ -198,14 +206,62 @@ def _collapse_tripped(db_path: Path, n: int) -> bool:
     return all(str(r[0] or "") in _TERMINAL_UNSUCCESSFUL for r in rows)
 
 
+def _labelled_model_rows(db_path: Path) -> list[tuple[float, bool]]:
+    """The labelled model diagnoses the calibration runs over (best effort).
+
+    A home with no ledger table yet — or one whose state.db cannot be read —
+    yields ``[]``, which is the bootstrap path, not an error: ``gather_inputs``
+    runs on *every* escalate, including from homes that predate migration 0073,
+    and must never be the thing that fails one.
+    """
+    try:
+        from mini_ork.stores import diagnosis_ledger
+        return diagnosis_ledger.labelled(db_path, "model")
+    except Exception:  # noqa: BLE001 — calibration input, never a hard failure
+        return []
+
+
+def _calibrated_bar(rows: list[tuple[float, bool]]) -> float | None:
+    """The LTT bar over labelled model diagnoses, or ``None`` when uncertifiable.
+
+    Below ``escalation_policy.MIN_LABELS`` there is nothing to calibrate and the
+    bar stays ``None`` — the frozen policy applies its bootstrap bar there, so
+    the threshold is only consulted at (or above) the policy's own label gate.
+    At or above it, an *uncertifiable* diagnoser (no threshold controls the risk)
+    also maps to ``None``: the policy reads that as "refuse", never as "wave
+    through on the bootstrap" — the fail-closed direction.
+
+    ``MIN_LABELS`` is imported from the policy rather than re-hard-coded, and
+    ``abstain_gate`` is imported lazily because importing it registers the gate
+    via the OCP seam — a side effect not worth paying on the overwhelmingly
+    common path where nothing is labelled yet.
+    """
+    if len(rows) < escalation_policy.MIN_LABELS:
+        return None
+    try:
+        from mini_ork.gates import abstain_gate
+        # (min_confidence, uncertifiable, accepted_n, accepted_wrong, bound)
+        bar, uncertifiable = abstain_gate._ltt_min_confidence(
+            rows, abstain_gate.alpha())[:2]
+    except Exception:  # noqa: BLE001 — uncomputable bar means uncertifiable
+        return None
+    return None if uncertifiable else float(bar)
+
+
 def gather_inputs(home: Path, run_id: str, diagnosis: dict) -> EscalationInputs:
     """Build the frozen policy's ``EscalationInputs`` for this diagnosis.
 
     ``layer`` / ``source`` / ``confidence`` are passed through from the
     diagnosis **unchanged** — the policy's rule-vs-model branch and its bar
-    comparison are only reachable if they are. ``calibrated_bar`` /
-    ``labelled_count`` are the SDE-3b placeholders (no labelled model diagnoses
-    exist yet).
+    comparison are only reachable if they are.
+
+    ``labelled_count`` / ``calibrated_bar`` come from the SDE-3b2 diagnosis
+    ledger (``mini_ork.stores.diagnosis_ledger``) over labelled **model**
+    diagnoses: the count of rows that can calibrate, and — once it reaches
+    ``escalation_policy.MIN_LABELS`` — the Learn-Then-Test bar they certify.
+    Below that gate, and whenever the diagnoser is uncertifiable, the bar is
+    ``None`` and the policy's bootstrap bar is what applies. The ledger is a
+    read here and nothing more: this module never writes it (``escalate`` does).
 
     ``run_id`` is carried for the caller's context; it is deliberately not
     load-bearing here (this run's own epic has not been filed yet when the
@@ -217,12 +273,13 @@ def gather_inputs(home: Path, run_id: str, diagnosis: dict) -> EscalationInputs:
     except (TypeError, ValueError):
         confidence = 0.0
     now = int(time.time())
+    rows = _labelled_model_rows(db_path)
     return EscalationInputs(
         layer=str(diagnosis.get("layer") or ""),
         source=str(diagnosis.get("source") or ""),
         confidence=confidence,
-        calibrated_bar=None,
-        labelled_count=0,
+        calibrated_bar=_calibrated_bar(rows),
+        labelled_count=len(rows),
         fix_epics_last_24h=_self_driving_promotions_since(db_path, now - _WINDOW_S),
         daily_cap=_daily_cap(),
         signature_fix_failed_before=_signature_fix_failed_before(
@@ -319,6 +376,31 @@ def _enqueue_oversight(home: Path, run_id: str, res: Any, reason: str) -> None:
         return
 
 
+def _record_ledger(home: Path, run_id: str, diagnosis: dict, *,
+                   action: str, fix_epic_id: str | None = None) -> None:
+    """Record the acted-on diagnosis in the SDE-3b2 ledger (best effort).
+
+    ``action`` is what the loop *did*: ``escalate`` when a fix epic was opened,
+    ``human`` when the policy refused or the fix could not be filed. Refusals
+    are recorded too — SDE-4 can only measure the diagnoser's error rate if it
+    sees both outcomes, not only the escalations that panned out.
+
+    The never-raise wrapper is not redundant with ``escalate``'s own ``c:0``
+    envelope: without it a broken ledger DB path would turn a *successful*
+    escalation into an ``escalation error`` and cost the run its fix epic. The
+    local import mirrors ``_enqueue_oversight``'s — this is a side channel, not
+    a load-bearing dependency of the decision.
+    """
+    try:
+        from mini_ork.stores import diagnosis_ledger
+        diagnosis_ledger.record(
+            Path(home) / "state.db", run_id, diagnosis,
+            action=action, fix_epic_id=fix_epic_id,
+        )
+    except Exception:  # noqa: BLE001 — the ledger must never fail an escalation
+        return
+
+
 # ── the action ───────────────────────────────────────────────────────────────
 
 
@@ -345,6 +427,9 @@ def escalate(home: Path, run_id: str, diagnosis: dict) -> dict[str, Any]:
     try:
         decision = should_escalate(gather_inputs(home, run_id, diagnosis))
         if not decision.escalate:
+            # The refusal is an outcome too: the loop acted on this diagnosis by
+            # handing the run to a human, and the ledger's calibration needs it.
+            _record_ledger(home, run_id, diagnosis, action="human")
             return {"escalated": False, "reason": decision.reason,
                     "fix_epic_id": None, "fix_bug_id": None}
 
@@ -359,10 +444,14 @@ def escalate(home: Path, run_id: str, diagnosis: dict) -> dict[str, Any]:
         if not res.epic_id:
             # A bug row without an epic is not a fix: parking the run on it
             # would leave it waiting for something that does not exist.
+            # ``apply`` turns this into the ordinary ``human`` hand-off too.
+            _record_ledger(home, run_id, diagnosis, action="human")
             return {"escalated": False,
                     "reason": f"escalation error: no fix epic was opened ({res.reason or 'promote produced no epic'})",
                     "fix_epic_id": None, "fix_bug_id": res.bug_id}
 
+        _record_ledger(home, run_id, diagnosis, action="escalate",
+                       fix_epic_id=res.epic_id)
         _record_waiting_on_fix(home, run_id, res)
         _emit_escalate_event(home, run_id, diagnosis, decision, res)
         _enqueue_oversight(home, run_id, res, decision.reason)
