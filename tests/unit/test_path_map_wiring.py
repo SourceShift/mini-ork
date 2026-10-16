@@ -59,12 +59,28 @@ def recorder(monkeypatch):
 @pytest.fixture
 def remote_recorder(monkeypatch):
     """Same double, resolved for the ``remote`` backend (a registered factory
-    wins over the lazily-imported real one, so no node is ever contacted)."""
+    wins over the lazily-imported real one, so no node is ever contacted).
+
+    Installed with ``monkeypatch.setitem``, NOT ``register_workspace_backend``
+    plus a teardown ``pop``: ``remote`` registers itself at import
+    (``backends/remote.py`` ends on a module-level ``register()``), and that
+    module is already imported by the time this fixture runs — any test module
+    that does ``from mini_ork.runtime.backends.remote import ...`` imports it at
+    collection, before a single test executes. A blind pop would therefore
+    delete the REAL factory for the rest of the process, and it could not come
+    back: ``get_workspace``'s lazy path re-imports a module that is already in
+    ``sys.modules``, so the module body never re-runs and never re-registers.
+    Every later remote test then dies with ``ValueError: unknown workspace
+    backend 'remote'; registered: docker, local, microvm, remote`` — the message
+    contradicting itself, because ``known_workspace_backends`` unions the lazy
+    catalog it is still listed in. ``setitem`` restores the prior entry (or its
+    absence) on teardown instead — the same idiom
+    ``test_workspace_backend_catalog.py`` uses.
+    """
     rec = _Recorder()
-    sandbox.register_workspace_backend("remote", lambda **_kw: rec)
+    monkeypatch.setitem(sandbox._WORKSPACE_BACKENDS, "remote", lambda **_kw: rec)
     monkeypatch.setattr(core, "context_env_snapshot", lambda: {})
     yield rec
-    sandbox._WORKSPACE_BACKENDS.pop("remote", None)
 
 
 def _all_strings(spawned):
