@@ -2,6 +2,15 @@
 
 Opt-in isolation: one cloud sandbox per **workflow node**, instead of one per run.
 
+**N, or N+1?** `MO_NODE_ISOLATION=1` on an N-node run boots **N node sandboxes
+plus one run-level sandbox — N+1, not N.** The extra one is not a leak. A
+process that belongs to no single node (session provisioning before the first
+node, and anything happening *between* nodes) has no node to be named after, so
+it stays on the run-level sandbox rather than being stranded with nowhere to run
+— `run_nodes.isolated_node` returns `""` for it, deliberately. Count by the
+`mo.node` label: the N node sandboxes each carry their own, the run-level one
+carries `mo.node=None`.
+
 Set `MO_NODE_ISOLATION=1` to turn it on. Absent or unreadable, nothing changes —
 the run keeps its single sandbox, byte-identical to before this feature existed.
 

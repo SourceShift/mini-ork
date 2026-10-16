@@ -7,8 +7,8 @@ MiniOrk's remote backend already moves a node's file writes between machines:
 materialises the bundle on the remote, and `apply_delta`
 (`mini_ork/remote/tree_sync.py:267`) carries the node's edits back as a binary
 git diff guarded by `SyncConflictError` (`mini_ork/remote/tree_sync.py:53`).
-`MO_SHARED_DRIVE_ROOT` (`mini_ork/runtime/backends/remote.py:1758`) is the only
-existing knob that hints at cross-machine state.
+`MO_SHARED_DRIVE_ROOT` (`mini_ork/runtime/backends/remote.py:1959`, `:2022`) is
+the only existing knob that hints at cross-machine state.
 
 The current model assumes **one shared disk**. A recipe today declares a
 `path` requirement ("write the report to `docs/research/<dir>/`"); when a cloud
@@ -26,6 +26,46 @@ half: a content-addressed artifact record so bytes are addressable from any
 machine, and per-item slots so parallel writers do not collide on one tree.
 The path contract described in [artifact-graph.md](./artifact-graph.md) stays
 valid for single-tree runs; this design layers on top of it.
+
+## Status: what ships today (verified 2026-10-16)
+
+**This document is a design, not a description of shipped behavior.** No commit
+implements the index/transport/materialize model below; the only reference to it
+inside the engine is a pointer comment at
+`mini_ork/remote/providers/run_nodes.py:20`. Read this section before treating
+any `outputs[]` entry as a cross-machine guarantee.
+
+What is actually enforced, per `_required_artifacts_ok`
+(`mini_ork/cli/execute.py:2126`):
+
+| `outputs[]` entry | Enforced? | Behavior |
+|---|---|---|
+| absolute (`/…`, or `${MINI_ORK_RUN_DIR}/…`) | **yes** | the path must exist and be non-empty at gate time, or the run fails |
+| relative (`docs/research/x.md`) | **no** | exempt as a "publish-target"; nothing creates its parent directory |
+
+The exemption is the `if not os.path.isabs(p) … continue` filter at
+`mini_ork/cli/execute.py:2153` — the whole of the enforcement. A recipe that
+declares a *relative* `path` requirement therefore gets no directory and no
+check: it publishes nothing, silently. The recipes that need the guarantee
+(`recipes/bug-audit-fe-be`, `recipes/blog-cohesion`) declare relative outputs
+today, so this gap is live — it is the gap this design exists to close, and it
+is **open**.
+
+What isolation adds today is a **sequential** handoff, not transport. The local
+worktree is the relay: a node's replica syncs down at teardown
+(`RemoteWorkspace._sync_down`) and the next node syncs up from it
+(`RemoteWorkspace._sync_up`), per [per-node-sandboxes.md](./per-node-sandboxes.md).
+That satisfies a recipe whose nodes run one after another — it is why
+`run-1792137016-90593` passed — but it gives a node no home for a declared
+`path`, and it does not survive two nodes writing at once, which is exactly the
+fan-out case in *D3* below.
+
+**The open decision.** Cross-node artifacts move either through a cloud shared
+filesystem (the stated preference) or by keeping the local relay and giving
+recipes a `path` contract that survives isolation. Until that is settled, the
+schema delta in *D2* is not applied and no engine code reads `blob_ref` or
+`slot`. The `MO_SHARED_DRIVE_ROOT` knob cited above is the existing hook the
+shared-filesystem branch would use; it is not wired to artifact transport.
 
 ## Why the path contract fails under node isolation
 
@@ -52,9 +92,10 @@ Under node isolation, that contract breaks for four reasons:
    so N-1 of them conflict. The exception names the diverging paths but does
    not auto-merge.
 4. **`MO_SHARED_DRIVE_ROOT` is the only shared-disk knob.**
-   `mini_ork/runtime/backends/remote.py:1758` reads `MO_SHARED_DRIVE_ROOT` and
-   falls back to `os.getcwd()` if unset; nothing else exposes a shared
-   filesystem. There is no notion of a remote-reachable blob store.
+   `mini_ork/runtime/backends/remote.py:1959` (and its env-dict sibling at
+   `:2022`) reads `MO_SHARED_DRIVE_ROOT` and falls back to `os.getcwd()` if
+   unset; nothing else exposes a shared filesystem. There is no notion of a
+   remote-reachable blob store.
 
 The taxonomy is therefore: the path contract assumes one shared disk; the
 transport assumes one shared *transport*; under node isolation neither holds.
