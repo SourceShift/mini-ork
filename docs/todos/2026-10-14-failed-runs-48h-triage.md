@@ -382,6 +382,113 @@ shipping blocker.
 
 ---
 
+## 10 — Post-merge regression found and fixed (2026-10-16)
+
+The §9 merge was not clean: it left `main` with a **test-isolation** regression.
+Found by re-running the full unit suite after the push, isolated by bisection,
+fixed at the source, merged as **`778a0686`**.
+
+### 10.1 — the symptom, and why it was not the flaky-gate story
+
+| suite state | result |
+|---|---|
+| full `tests/unit` at the pre-merge base `2e8367f7` | **4 failed**, 9478 passed |
+| full `tests/unit` at the post-merge `2d786fec` | **18 failed**, 9507 passed |
+
+§9.3 already documented a flaky green gate under concurrent load, so the first
+instinct was "contention again". It was not: the two runs differ by *14* new
+failures, and the failing set is stable — it reproduces every time, on an
+unloaded machine, from a fixed file list. **A flake does not reproduce on
+demand; a regression does.** The 4 base failures were unchanged.
+
+### 10.2 — isolating the cause
+
+Bisecting the implicated files: each of the three *new* test files shipped with
+the `59f14447` merge (`test_dispatch_text_sanitize`, `test_run_reaper_notes`,
+`test_node_provider_lock_cleanup`) leaves the remote test files green. Adding
+**`tests/unit/test_path_map_wiring.py`** — a pre-existing file that the merge
+*modified* — reproduces the wall on its own:
+
+```
+===== WITH test_dispatch_text_sanitize =====     61 passed
+===== WITH test_run_reaper_notes =====           66 passed
+===== WITH test_node_provider_lock_cleanup ===== 66 passed
+===== WITH test_path_map_wiring =====            15 failed, 49 passed   <-- the polluter
+===== CONTROL: remote files alone =====          55 passed
+```
+
+### 10.3 — the mechanism
+
+The merge replaced that file's old leak test with a new `remote_recorder`
+fixture, which installed its double by hijacking the **real** backend name:
+
+```python
+sandbox.register_workspace_backend("remote", lambda **_kw: rec)
+yield rec
+sandbox._WORKSPACE_BACKENDS.pop("remote", None)      # <-- deletes the REAL factory
+```
+
+A blind `pop` is only safe when the name is *test-owned* (the sibling
+`recorder` fixture's `"fake-pm"` never collides). `remote` is not:
+
+```mermaid
+sequenceDiagram
+    participant C as pytest collection
+    participant R as backends/remote.py
+    participant W as _WORKSPACE_BACKENDS
+    participant F as remote_recorder
+    participant G as get_workspace("remote")
+    C->>R: import (any test doing `from ...backends.remote import ...`)
+    R->>W: register() at module level -> real factory installed
+    F->>W: overwrite "remote" with the double
+    F->>W: teardown pop("remote") -> real factory GONE
+    G->>W: miss
+    G->>G: lazy catalog says import "mini_ork.runtime.backends.remote"
+    Note over G: already in sys.modules -> import is a no-op,<br/>module body never re-runs, never re-registers
+    G-->>G: ValueError
+```
+
+The give-away is that the error message contradicts itself — it names the
+backend unknown *while listing it as registered*, because
+`known_workspace_backends()` unions the lazy catalog the name is still in:
+
+```
+execute: remote_unavailable: unknown workspace backend 'remote'; registered: docker, local, microvm, remote
+```
+
+Every later test that resolved `workspace="remote"` then failed. That is why the
+victims are in *other* files (`test_secrets_scope.py`, the remote suites) and why
+running those files **alone** was green — nothing had popped the entry yet.
+
+### 10.4 — the fix
+
+Install the double with `monkeypatch.setitem`, which restores the prior entry
+(or its absence) on teardown — the idiom `test_workspace_backend_catalog.py`
+already uses. No production code changed; the leak was entirely in the fixture.
+
+Measured on one identical six-file selection
+(`test_path_map_wiring`, `test_remote_workspace`, `test_remote_node_hardening`,
+`test_run_mirror`, `test_remote_live_and_kill`, `test_secrets_scope`):
+
+| | result |
+|---|---|
+| before the fix | **7 failed**, 69 passed |
+| after the fix | **76 passed** |
+
+Shipped as `778a0686`, merged with that six-file selection as the gate.
+
+### 10.5 — the lesson worth keeping
+
+**A test that borrows a *real* registry name must restore it, not delete it.**
+Two compounding details made this permanent: the registration happens at
+*import* time, and `importlib.import_module` on a module already in
+`sys.modules` does not re-execute it — so a deleted registration is
+unrecoverable for the life of the process. A fixture that "cleans up" after
+itself with a blind `pop` is not cleaning up; it is destroying someone else's
+state. The self-contradicting `ValueError` is the fingerprint.
+
+---
+
 ## Appendix — evidence
 
 - Replay run dir: `.mini-ork/runs/run-1792047347-71903`
