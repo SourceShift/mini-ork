@@ -850,7 +850,7 @@ push was rejected as non-fast-forward *while the tree was green and nothing was 
 Two consecutive merges were lost that way in one session, which is the diagnostic detail worth
 keeping: **the failure looked like a conflict and was a stale base.** The fix re-fetches and
 re-rebases after the gate, and re-runs the gate if the rebase moved HEAD (the gated content changed,
-so the old green is not the new green). This is ~~a finding-closing landing~~ **[C-7: it is not — the remedy moves the race rather than closing it. See round 10.]**
+so the old green is not the new green). This is ~~a finding-closing landing~~ **[C-7: it is not — the remedy moves the race rather than closing it. See round 10. Superseded in round 13: the landed remedy `64a4a42d` does close it.]**
 
 **New interaction risk — recorded as a HYPOTHESIS with its check, deliberately not as a finding.**
 The remedy's `git rebase origin/main` is **the exact local-rebase operation the reversion guard
@@ -1165,4 +1165,53 @@ repo's `jest-guard` load refusal (R7 / inbox 38). The three landings above make 
 touch the node that actually failed, record its own end/spend, and stop the rubric grading a dead
 attempt — **none of them makes 779 green**, and the peer said so itself rather than implying the
 blocker was cleared.
+
+## Delivery — round 13 (C-7 superseded by the landed lock + retry; a peer retracts its own correction)
+
+**C-7 is superseded at the source, and I verified the replacement rather than taking the word for it.**
+Round 10 recorded C-7 — the push-race remedy `9f0c22b2` re-runs the gate after the re-fetch, so the
+window between re-fetch and push is again a whole gate and the race is moved, not closed. That was
+true of `9f0c22b2`. It is no longer true of `origin/main`: `64a4a42d` (*"fix(worktree): close the push
+race with a lock + retry, not a re-gate"*, +79/−17 in `scripts/mini_ork_worktree.py`) replaces it.
+Measured, not assumed:
+
+- `git merge-base --is-ancestor 64a4a42d origin/main` → **yes**.
+- The old re-gate's own string — `"green gate failed after re-rebasing"` — now returns **0** hits on
+  `origin/main:scripts/mini_ork_worktree.py`.
+- The replacement, read in the file: the green gate now runs **once, outside the lock** (its comment
+  says so outright — *"The green gate is deliberately NOT re-run inside this loop"*), then a bounded
+  `for attempt in range(1, attempts+1)` loop — `fetch → rebase → push`, the **push's own returncode
+  as the check**, `time.sleep(0.3)` between attempts, `MO_MERGE_PUSH_ATTEMPTS` default **5** — runs
+  inside an mkdir lock. Its code comment names C-7's own case (*"a peer lost a push to a gate narrowed
+  to 30 s"*) and states the accepted trade explicitly: a rebase can combine the branch with commits
+  that landed during the gate; that combination is not re-gated, and `_differential_verdict` names it
+  should it ever be found red.
+
+**The lock closes the same-machine race, and I checked the part the claim depends on.** A lock only
+serialises writers that share it, so the real question is whether *every* path that pushes `HEAD:main`
+takes it. Two such writers exist: `scripts/mini_ork_worktree.py` and the older
+`scripts/mini-ork-worktree.sh` (the port's predecessor, still referenced by `AGENTS.md:50` and the
+worktree guard). Both resolve the lock to the **same** path —
+`${MINI_ORK_WORKTREE_LOCK:-$TMPDIR/mini-ork-worktree.lockdir}` (`.py`: `_merge_lock_path()`, `:48`;
+`.sh`: `LOCK_DIR`, `:43`) — and both rebase→push **inside** the critical section, so the interval
+between the rebase and the push is milliseconds, not a gate. That is exactly the property C-7 said was
+missing.
+
+**The one residual, stated so it is not later mistaken for the closed race.** The `.sh` has the lock
+but **not** the bounded retry: `08761433` gave it `acquire_lock`/`release_lock` around
+`rebase → push`, with no `MO_MERGE_PUSH_ATTEMPTS` loop (measured: `grep -c MO_MERGE_PUSH_ATTEMPTS`
+→ **0**; its only `while` is inside `acquire_lock`, waiting for the lock). So a rejection from a peer
+**on another machine** — outside the mkdir lock — makes a `.sh` merge die where the `.py` merge would
+retry. This is not the observed loss: the lost pushes were to a same-machine peer during a narrowed
+gate, the mode the lock now covers. Recorded as an asymmetry to close, not as C-7 surviving.
+
+**`mini-ork-df` retracted its own C-24/C-26 correction, confirming round 12's refusal.** Round 12
+refused a correction aimed at "this document's C-24 rule" and "C-26 wording", because this document
+has no such items (`git grep -nE 'C-2[46]'` over tracked files → 0 hits; the corrections are C-1…C-7
+plus R11). The peer has now run the same check and withdrawn it — *"I asserted an anchor without
+resolving it, which is the `f70f977b` failure one level up"* — which is the sweep's own rule turned on
+itself: **a correction is a claim like any other, and it needs its target resolved before it is acted
+on.** Recorded because the inverse of accepting a good correction is refusing a mislocated one, and
+this is the one instance where two sessions agreed on that by independent measurement rather than by
+deference.
 
