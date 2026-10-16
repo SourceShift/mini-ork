@@ -1065,6 +1065,85 @@ def _profile_verification_command():
     return " && ".join(cmds)
 
 
+# A check reads as a test invocation when one of its words is `test`/`tests`/
+# `pytest`/`jest`/`vitest`/`spec`, delimited so `cjd-cc-sa1-test.sh` and
+# `npm run test` both match while `contest.py` does not.
+_TEST_CMD_RE = re.compile(
+    r"(?:^|[\s/_.-])(?:test|tests|pytest|jest|vitest|spec)(?:[\s/_.-]|$)",
+    re.IGNORECASE,
+)
+# ...and not when it is really the typecheck or lint gate.
+_NOT_TEST_CMD_RE = re.compile(
+    r"typecheck|type-check|\btsc\b|\blint\b|\beslint\b", re.IGNORECASE
+)
+# Commands that inspect the tree rather than run it. `verifier_contract.checks`
+# routinely carries greps asserting on the diff; one that merely mentions a
+# `*.test.tsx` path must not be mistaken for the suite.
+_INSPECTION_PREFIXES = frozenset(
+    {"grep", "rg", "find", "ls", "cat", "echo", "printf", "which", "command", "[", "!"}
+)
+
+
+def _looks_like_test_command(cmd: str) -> bool:
+    """True when ``cmd`` invokes a test suite rather than a typecheck or a grep.
+
+    The plan stores prose descriptions, not kinds, so the command string is the
+    only signal left. Deliberately narrow: a false positive here would make a
+    revive run the wrong gate, which is the defect this exists to prevent.
+    """
+    stripped = (cmd or "").strip()
+    if not stripped or _NOT_TEST_CMD_RE.search(stripped):
+        return False
+    if stripped.split(None, 1)[0].lower() in _INSPECTION_PREFIXES:
+        return False
+    return bool(_TEST_CMD_RE.search(stripped))
+
+
+def _plan_verification_command() -> str:
+    """The run's declared verification command, from ``plan.json``.
+
+    ``run_profile.json``'s ``verification_command`` is written by the profiler and
+    is frequently empty — the profiler *defers* when the kickoff declares its own
+    proof of success (``gates/profile_gate.declares_verification_command``). The
+    command the run is then actually dispatched with survives only in the plan's
+    ``verifier_contract.checks``, and a revive that cannot see it falls through to
+    auto-detect, silently substituting a different suite.
+
+    Measured on the researcher home 2026-10-16: reviving ``cjd-cc-sa1-sample``
+    lost ``bash …/cjd-cc-sa1-test.sh`` (a scoped compose suite that also exports
+    ``JEST_GUARD_SOFT=1``) and ran the repo's whole ``pnpm run test`` instead —
+    653/653 green became 762 failing, and the delta base refused under machine
+    load with rc=77 because the guard override went with the command. The run was
+    then judged against a command it had never been dispatched with.
+
+    Never raises — this runs at module import (``CMD = detect_test_cmd()``), so an
+    escaping exception would break every code-fix run, not just a revived one.
+    """
+    bases = (os.environ.get("MINI_ORK_RUN_DIR", ""),
+             os.path.join(MINI_ORK_HOME, "runs", MINI_ORK_RUN_ID))
+    for base in bases:
+        if not base:
+            continue
+        try:
+            with open(os.path.join(base, "plan.json"), encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        contract = data.get("verifier_contract")
+        checks = contract.get("checks") if isinstance(contract, dict) else None
+        if not isinstance(checks, list):
+            continue
+        for check in checks:
+            if not isinstance(check, dict):
+                continue
+            cmd = check.get("command")
+            if isinstance(cmd, str) and _looks_like_test_command(cmd):
+                return cmd.strip()
+    return ""
+
+
 def detect_test_cmd():
     # Explicit override wins.
     if os.environ.get("MINI_ORK_TEST_CMD"):
@@ -1077,6 +1156,14 @@ def detect_test_cmd():
     profile_cmd = _profile_verification_command()
     if profile_cmd:
         return profile_cmd
+
+    # The plan's declared check — the command a run whose kickoff declares its own
+    # proof was actually dispatched with. Ranked below the profile (an explicit
+    # profile declaration still wins) and above auto-detect, which would otherwise
+    # substitute the repo's default `test` script for the run's own.
+    plan_cmd = _plan_verification_command()
+    if plan_cmd:
+        return plan_cmd
 
     # npm / pnpm / yarn / bun — check package.json scripts first. The manager is
     # a property of THIS repo (devEngines/packageManager/lockfile), never of the
