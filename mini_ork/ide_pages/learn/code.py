@@ -19,6 +19,15 @@ Two ideas carry it:
    reaches an agent until it is approved on the Rules tab, and it renders under
    the "Learned rules" heading, never "set by the user".
 
+   Recurrence is counted in KICKOFFS, not rows (LF-R10): a cluster is recurring
+   only when the problem showed up in at least two distinct kickoffs and in at
+   least two ``(kickoff, file)`` pairs. Four restatements of one bug inside one
+   run are an emphasis, not a recurrence — they are listed under "Seen in one
+   kickoff" by ``seen_once()`` and offer no action. A kickoff is identified by
+   ``context_v2.kickoff_stem`` (revision suffixes ``-rN`` collapse, so
+   ``ide-node-stream-r3`` and ``-r4`` are ONE kickoff) and falls back to the run
+   id for generic kickoff names, which carry no identity of their own.
+
 The page is strictly read-only: it never calls ``harvest`` (reflect is the sole
 writer), and every statement is a SELECT. A bare home degrades to an empty
 state, never a traceback (each section is wrapped in ``S.guarded``).
@@ -61,6 +70,7 @@ KV_TITLE = "Harvest"
 DAYS_TITLE = "Days"
 AREAS_TITLE = "Your code: what reviews found, by area"
 RECURRING_TITLE = "Recurring problems"
+SEEN_ONCE_TITLE = "Seen in one kickoff"
 FINDINGS_TITLE = "Findings"
 FINDING_TITLE = "Finding"
 
@@ -68,6 +78,7 @@ _DAYS_DEFAULT = 30
 _DAYS_CHIPS = (7, 30, 90)
 _SIM = 0.35           # greedy-leader cosine threshold
 _TOP_CLUSTERS = 5     # clusters returned by recurring()
+_SEEN_ONCE_TOP = 10   # clusters returned by seen_once()
 _RECURRING_PER_AREA = 2   # representatives shown in an area row
 _REPR_MAX = 70        # area-row "recurring problems" cell cap
 _REPR_DETAIL = 160    # recurring-table problem cap
@@ -335,6 +346,11 @@ def _select_findings(conn, where: str, params: list, cutoff: int,
     Python *after* a SQL ``LIMIT 50``, so a crowd of newer prefix siblings
     (``bin/mini-ork-apply``, ``-bugs``, …) evicted ``bin/mini-ork``'s own rows
     before the filter saw them (kickoff #2).
+
+    LF-R10 also exposes each finding's ``kickoff_path`` (already joined for the
+    run title) so ``recurring()`` can count recurrence per KICKOFF instead of
+    per row. Additive: ``None`` when there is no join or the run has no
+    ``task_runs`` row, and every pre-existing key is untouched.
     """
     tr_cols = ", tr.kickoff_path, tr.status" if join else ""
     join_sql = " LEFT JOIN task_runs tr ON tr.id = f.run_id" if join else ""
@@ -351,6 +367,7 @@ def _select_findings(conn, where: str, params: list, cutoff: int,
             "run_id": r["run_id"],
             "run_title": _run_title(kick, r["run_id"]),
             "run_status": r["status"] if join else None,
+            "kickoff_path": kick,
             "source": r["source"],
             "file": r["file"],
             "line": r["line"],
@@ -461,8 +478,9 @@ def _area_detail(home: Path, args: dict[str, str], area: str) -> list[dict[str, 
     if clusters:
         for c in clusters:
             files = ", ".join(short(f, 60) for f in c["files"]) or "—"
-            lines.append(f"- **{c['n']}×** {short(c['representative'], _REPR_DETAIL)} "
-                         f"(files: {files})")
+            lines.append(f"- **{_occurrence_label(c)}** "
+                         f"{short(c['representative'], _REPR_DETAIL)} "
+                         f"(kickoffs: {c['kickoffs']}, files: {files})")
     else:
         lines.append("- none yet")
     # Close clears the area AND any open finding, so the header button does both.
@@ -470,18 +488,19 @@ def _area_detail(home: Path, args: dict[str, str], area: str) -> list[dict[str, 
         S.markdown(area, "\n".join(lines), full=True,
                    actions=[S.btn("Close area", S.set_args(area="", finding=""), "ghost")])]
 
-    # A cluster with no defensible target (or a single member) carries no
-    # action at all, and its action cell says so with an em dash rather than
+    # A cluster with no defensible target (or one that is not recurring) carries
+    # no action at all, and its action cell says so with an em dash rather than
     # offering a button whose rule could not be scoped to the findings it came
-    # from (kickoff §4).
+    # from (kickoff §4). Only ``recurring()`` clusters reach this table, so the
+    # "Make it a rule" floor and R4's target rules are the ones LF-R4 shipped.
     recur_rows = []
     for c in clusters:
         action = _rule_action(c)
         recur_rows.append({
             "cells": [
                 S.cell(short(c["representative"], _REPR_DETAIL)),
-                S.cell(f"{c['n']}×"),
-                S.cell(c["n_runs"]),
+                S.cell(_kickoffs_cell(c)),
+                S.cell(_files_cell(c)),
                 S.cell(c["worst_severity"], _sev_colour(c["worst_severity"])),
                 S.cell("Make it a rule", "blue") if action else S.cell("—", "sub"),
             ],
@@ -489,14 +508,32 @@ def _area_detail(home: Path, args: dict[str, str], area: str) -> list[dict[str, 
         })
     out.append(S.table(
         RECURRING_TITLE,
-        [S.col(fr=3, min=180), S.col(width=60), S.col(width=60), S.col(width=70),
+        [S.col(fr=3, min=180), S.col(width=80), S.col(fr=2, min=140), S.col(width=70),
          S.col(width=130)],
-        ["problem", "times", "runs", "worst", "action"],
+        ["problem", "kickoffs", "files", "worst", "action"],
         recur_rows,
         full=True,
         note=("Pick a recurring problem and mini-ork will draft a rule for the files "
               "it was found in — it reaches an agent once you approve it on the "
               "Rules tab.")))
+
+    # Seen in ONE kickoff: shown, never hidden — the operator needs to see the
+    # restatements too — but with no rule button, because one kickoff is not yet
+    # a recurrence (LF-R10). The kickoff stem is the item's label: it is the
+    # thing that would have to repeat for this to become a rule.
+    once = seen_once(fs)
+    if once:
+        out.append(S.lst(
+            SEEN_ONCE_TITLE,
+            [S.item(short(c["representative"], _REPR_DETAIL),
+                    f"{_occurrence_label(c)} in kickoff {_stems_label(c)} · "
+                    f"files: {_files_cell(c)}",
+                    m="·", tc="sub")
+             for c in once],
+            full=True,
+            note=("These were each seen in a single kickoff, so no rule is drafted. "
+                  "A problem becomes recurring — and reachable by the action above — "
+                  "when it shows up in a second kickoff.")))
 
     selected = str(args.get("finding") or "")
     out.append(S.table(
@@ -637,8 +674,10 @@ def _rule_action(cluster: dict[str, Any]) -> dict[str, Any] | None:
     The action creates an INACTIVE, learned, file-scoped draft — it does not
     write a live rule. Approving it on the Rules tab is what starts giving it to
     agents, so the confirm string says exactly that. ``None`` means "no button":
-    a cluster of one is not a recurring problem, and a cluster whose member files
-    share no usable directory has no defensible target (see ``_rule_target``).
+    a cluster seen in only one kickoff (``n`` IS ``occurrences`` since LF-R10, so
+    the floor reads the recurrence count) is not a recurring problem, and a
+    cluster whose member files share no usable directory has no defensible target
+    (see ``_rule_target``).
     """
     if int(cluster.get("n") or 0) < 2:
         return None
@@ -724,28 +763,91 @@ def _sum_vecs(vecs) -> dict[str, float]:
     return out
 
 
-def recurring(findings: list[dict[str, Any]], *, sim: float = _SIM,
-              top: int = _TOP_CLUSTERS) -> list[dict[str, Any]]:
-    """Greedy-leader clustering of the findings' ``issue`` texts (pure).
+def _kickoff_stem(path: Any) -> str:
+    """``context_v2.kickoff_stem`` — a kickoff's revision-insensitive identity.
+
+    Imported lazily (read-only) exactly as ``_generalise`` imports
+    ``clean_issue``: ``context_v2`` is out of this change's file scope and is
+    never edited here. ``""`` for a generic name (``kickoff.md``, ``probe-3.md``)
+    or a stem with no hyphen — those carry no identity, which is what forces the
+    run-id fallback in :func:`_member_stem`.
+    """
+    from mini_ork.context_v2 import kickoff_stem   # lazy: read-only import
+
+    return kickoff_stem(str(path) if path else None)
+
+
+def _member_stem(f: dict[str, Any]) -> str:
+    """Which KICKOFF a finding belongs to: its kickoff's stem, else its run id.
+
+    LF-R10 counts recurrence in kickoffs, not rows: ``ide-node-stream-r3`` and
+    ``-r4`` are one kickoff, so a problem found in both is still a one-kickoff
+    problem. A generic kickoff name has no stem — two unrelated ``kickoff.md``
+    runs must never merge — so those bucket by ``run_id`` instead, and so do
+    findings from runs with no ``task_runs`` row (``kickoff_path`` is ``None``).
+    """
+    return _kickoff_stem(f.get("kickoff_path")) or str(f.get("run_id") or "")
+
+
+def _is_recurring(c: dict[str, Any]) -> bool:
+    """LF-R10's floor: seen in ≥ 2 kickoffs AND in ≥ 2 ``(kickoff, file)`` pairs.
+
+    One kickoff restating a problem four times is an emphasis, not a recurrence,
+    and neither is a pattern spread across two files of a single run.
+    """
+    return int(c.get("occurrences") or 0) >= 2 and int(c.get("kickoffs") or 0) >= 2
+
+
+def _mixed_cluster(member_vecs: list[dict[str, float]], stems: list[str],
+                   sim: float) -> bool:
+    """A cluster spanning ≥ 2 kickoffs whose members joined only via the centroid.
+
+    The greedy-leader loop adds a member when it is close to the cluster's
+    running CENTROID; two members from different kickoffs can therefore end up
+    together without any cross-kickoff member PAIR reaching ``sim``. The
+    "same problem again in another kickoff" story is weaker there, so the table
+    says ``2 (mixed)`` instead of overclaiming. Judged on the retained member
+    vectors — pure, no DB.
+    """
+    if len(set(stems)) < 2:
+        return False
+    for a in range(len(member_vecs)):
+        for b in range(a + 1, len(member_vecs)):
+            if stems[a] == stems[b]:
+                continue
+            if _dot(member_vecs[a], member_vecs[b]) >= sim:
+                # A cross-kickoff pair stands on its own, so the cluster is not
+                # merely a centroid bridge — it is plainly the same problem.
+                return False
+    return True
+
+
+def _clusters(findings: list[dict[str, Any]], *, sim: float) -> list[dict[str, Any]]:
+    """Every cluster, worst-first (the body of :func:`recurring`).
 
     TF-IDF (IDF computed over *these* findings) + L2-normalized cosine, so
     ``_dot`` is a true cosine. Each cluster::
 
-        {"representative": <issue nearest the centroid>, "n", "n_runs",
-         "files": [top 3], "all_files": [every member file], "worst_severity",
+        {"representative": <issue nearest the centroid>, "n", "occurrences",
+         "n_members", "n_runs", "kickoffs", "stems", "files": [top 3],
+         "all_files": [every member file], "mixed", "worst_severity",
          "finding_ids"}
 
-    ``files`` is a DISPLAY list capped at three; ``all_files`` holds every member
-    file, uncapped. The cap is fine for a cell and wrong for a decision: the
-    "Make it a rule" target is derived from the member files, so building it from
-    the top-3 would silently mis-scope a cluster spread over more than three
-    files — the cap-then-aggregate defect family already fixed twice in this file
+    ``n`` IS ``occurrences`` (LF-R10) — the raw member count moved to
+    ``n_members`` — and ``occurrences`` counts distinct ``(kickoff stem, file)``
+    pairs, so a restatement inside one kickoff-file adds nothing. ``files`` is a
+    DISPLAY list capped at three; ``all_files`` holds every member file,
+    uncapped. The cap is fine for a cell and wrong for a decision: the "Make it
+    a rule" target is derived from the member files, so building it from the
+    top-3 would silently mis-scope a cluster spread over more than three files —
+    the cap-then-aggregate defect family already fixed twice in this file
     (f:51c3c885a5, f:6f09169399).
 
-    Ordered by ``n`` then severity. Findings whose text has no tokens are kept
-    as singletons so nothing is silently dropped — but a finding whose issue is
-    the ``(no issue)`` placeholder is *not* a problem at all, so it is dropped
-    before clustering (reviewer, round 2: it topped the live recurring table).
+    Ordered by ``kickoffs``, then ``occurrences``, then severity. Findings whose
+    text has no tokens are kept as singletons so nothing is silently dropped —
+    but a finding whose issue is the ``(no issue)`` placeholder is *not* a
+    problem at all, so it is dropped before clustering (reviewer, round 2: it
+    topped the live recurring table).
     """
     items = [f for f in findings
              if str(f.get("issue") or "").strip().lower() != _PLACEHOLDER_ISSUE]
@@ -784,7 +886,8 @@ def recurring(findings: list[dict[str, Any]], *, sim: float = _SIM,
     out: list[dict[str, Any]] = []
     for c in clusters:
         members = c["members"]
-        centroid = _l2norm(_sum_vecs(vecs[i] for i in members))
+        member_vecs = [vecs[i] for i in members]
+        centroid = _l2norm(_sum_vecs(member_vecs))
         if centroid:
             rep_i = max(members, key=lambda i: _dot(vecs[i], centroid))
         else:
@@ -793,17 +896,51 @@ def recurring(findings: list[dict[str, Any]], *, sim: float = _SIM,
         worst = min(sevs, key=lambda s: _SEV_ORDER.get(s, 3))
         runs = {items[i].get("run_id") for i in members if items[i].get("run_id")}
         member_files = [items[i].get("file") for i in members]
+        stems = [_member_stem(items[i]) for i in members]
+        # One occurrence = one (kickoff, file) pair. Four restatements of one
+        # bug in one run and one file are ONE occurrence (LF-R10).
+        occurrences = {(stems[k], str(member_files[k] or ""))
+                       for k in range(len(members))}
         out.append({
             "representative": str(items[rep_i].get("issue") or ""),
-            "n": len(members),
+            "n": len(occurrences),        # LF-R10: n IS occurrences
+            "occurrences": len(occurrences),
+            "n_members": len(members),
             "n_runs": len(runs),
+            "kickoffs": len(set(stems)),
+            "stems": sorted(set(stems)),
             "files": _top_files(member_files),
             "all_files": _member_files(member_files),
+            "mixed": _mixed_cluster(member_vecs, stems, sim),
             "worst_severity": worst,
             "finding_ids": [finding_key(items[i]) for i in members],
         })
-    out.sort(key=lambda c: (-c["n"], _SEV_ORDER.get(c["worst_severity"], _SEV_ORDER["low"])))
-    return out[:top]
+    out.sort(key=lambda c: (-c["kickoffs"], -c["occurrences"],
+                            _SEV_ORDER.get(c["worst_severity"], _SEV_ORDER["low"])))
+    return out
+
+
+def recurring(findings: list[dict[str, Any]], *, sim: float = _SIM,
+              top: int = _TOP_CLUSTERS) -> list[dict[str, Any]]:
+    """The clusters that are RECURRING — same problem in ≥ 2 kickoffs (pure).
+
+    LF-R10: recurrence is counted per kickoff, not per row, so ``fire`` in a
+    single run repeated four times never reaches this list. See ``_clusters``
+    for the shape and the ordering; ``seen_once`` returns the complement.
+    """
+    return [c for c in _clusters(findings, sim=sim) if _is_recurring(c)][:top]
+
+
+def seen_once(findings: list[dict[str, Any]], *, sim: float = _SIM,
+              top: int = _SEEN_ONCE_TOP) -> list[dict[str, Any]]:
+    """The clusters seen in only ONE kickoff (or in one kickoff-file) — pure.
+
+    The complement of :func:`recurring` over the same clustering, in the same
+    shape and order, so the two lists partition the clustered findings. These
+    are SHOWN (never hidden) but carry no action: one kickoff is not yet a
+    recurrence, so there is nothing to draft a rule from.
+    """
+    return [c for c in _clusters(findings, sim=sim) if not _is_recurring(c)][:top]
 
 
 def _top_files(files) -> list[str]:
@@ -830,3 +967,28 @@ def _member_files(files) -> list[str]:
             seen.add(s)
             out.append(s)
     return out
+
+
+# ── cluster display helpers (pure) ─────────────────────────────────────────
+
+def _occurrence_label(c: dict[str, Any]) -> str:
+    """``4×`` — how many kickoff-file occurrences the cluster was seen in."""
+    return f"{int(c.get('occurrences') or 0)}×"
+
+
+def _kickoffs_cell(c: dict[str, Any]) -> str:
+    """The table's kickoffs cell: the stem count, marked ``(mixed)`` when the
+    members joined only through the centroid (see :func:`_mixed_cluster`)."""
+    n = int(c.get("kickoffs") or 0)
+    return f"{n} (mixed)" if c.get("mixed") else str(n)
+
+
+def _files_cell(c: dict[str, Any]) -> str:
+    """The distinct member files, display-capped (``all_files`` drives decisions)."""
+    return ", ".join(short(f, 40) for f in c.get("files") or []) or "—"
+
+
+def _stems_label(c: dict[str, Any]) -> str:
+    """A cluster's kickoff stems, named — a stem-less cluster says so."""
+    stems = [s for s in c.get("stems") or [] if s]
+    return ", ".join(stems) or "an unnamed kickoff"
