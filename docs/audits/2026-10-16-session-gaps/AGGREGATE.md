@@ -147,7 +147,7 @@ in finding 3 is the same failure seen from the other side.
 | 6 | Artifact transport is a design doc only; node has no home for a recipe-declared `path` | `docs/architecture/artifact-transport.md`; `run_nodes.py:20` | `f5671eaa` G1 |
 | 7 | 6 of 15 SDD epics unimplemented; no IDE page renders any SDD mechanism | SDD paths I2/I4/I6/I7/I8/I9 | `8162bb3f` G1, G2 |
 | 8 | `not_needed` 5th bucket missing from the Rust board `Counts` (+ pin bump) | `mini-ork-ui/src/board.rs` | `f6e1ed90` G4 |
-| 9 | Orchestrator "Armed" over-promises on unwired `_parallel` paths | `execute.py:1163`; run Overview section | `d5471234` G2 |
+| 9 | Orchestrator "Armed" over-promises on unwired `_parallel` paths | `execute.py:1163`; run Overview section | `d5471234` G2 — **DELIVERED `0af700ca`** (round 7) |
 | 10 | Nine epics ship shadow / default-OFF | `MO_PROBE_VALIDITY=shadow`, etc. | `8162bb3f` G3 |
 | 11 | Lane-health no-ops for native lanes under `MO_LANE_PROBE=0` | pre-run gate | `3e207e26` G3 |
 
@@ -822,4 +822,46 @@ those five errors, so a bare count here is a hypothesis until its measurement is
 each P0 entry carries its command rather than its conclusion, and why P0 4d is filed as a decision to
 assign rather than a technical unblock. The useful discipline is the one `mini-ork-81` named and then
 applied to its own memory: **ask what question the check answers, not whether it passed.**
+
+---
+
+## Delivery — round 7 (two peer landings, one of them P1#9)
+
+**P1#9 is DELIVERED — `0af700ca`.** *"emit an orchestrator.armed receipt, so 'armed' is read not
+inferred"*. The run page tested `runner_orchestrator.enabled()` alone and printed *"Armed — no
+interventions this run"*, while the layer is default-on but **wired only on the dependency-graph
+path** (`execute.py`'s `while pending:` wave loop) — the other `_parallel` call sites never call it.
+So an enabled-but-unwired run rendered as armed: the word read as *"the layer chose to stay quiet"*
+when the truth was *"the layer structurally could not act here"*. The fix is the method note's own
+discipline applied to a UI claim: **the engine now writes one run-level `orchestrator.armed` row at
+the moment it commits to the wired path with the layer enabled, so the page reads a fact instead of
+inferring one** — distinguishing "armed and quiet" (receipt present) from "enabled but never wired"
+(absent). It needed a new `mo_run_emit` (a run-level row carries no `node_id`; `mo_node_emit` guards
+on a non-empty one) and lifted the schema-aware insert into a shared `_insert_event`.
+**Same shape as P0 4d and the method note — read, do not infer — which is now the third place the
+sweep has found it in the engine rather than in a session's reasoning.**
+
+**`9f0c22b2` lands the push-race remedy that round 4 said the reversion guard was not.**
+*"fix(worktree): re-fetch and re-rebase after the green gate, before pushing"*, in
+`scripts/mini_ork_worktree.py:541-556` (16 lines). The mechanism it names is exactly the race this
+document described: `merge_worktree` fetched `origin/main` once, ran the green gate **for minutes**,
+then pushed `HEAD:main` with no re-fetch — so a peer landing during the gate won the race and the
+push was rejected as non-fast-forward *while the tree was green and nothing was wrong with it*.
+Two consecutive merges were lost that way in one session, which is the diagnostic detail worth
+keeping: **the failure looked like a conflict and was a stale base.** The fix re-fetches and
+re-rebases after the gate, and re-runs the gate if the rebase moved HEAD (the gated content changed,
+so the old green is not the new green). This is a *finding-closing* landing, not a new gap.
+
+**New interaction risk — recorded as a HYPOTHESIS with its check, deliberately not as a finding.**
+The remedy's `git rebase origin/main` is **the exact local-rebase operation the reversion guard
+wedges** (`.githooks/post-commit:132-152` restores a file whose content equals a *parent* commit's
+blob — which is the working-tree state a rebase checkout produces), and the new rebase runs
+immediately after a commit and after a multi-minute gate. If the guard's ~60 s window is still live
+when that rebase starts, `9f0c22b2` may re-wedge the very operation it was written to unblock — from
+the opposite side of the same race. **I have not run it, so it is not a finding**, and the method
+note above is precisely why it is not being written as one: it would be a plausible conclusion
+inferred from two adjacent mechanisms, which is the error class this document catalogues five times.
+The cheap check is named: commit, then run `make worktree-merge` inside the guard's window and watch
+`.mini-ork/file-reversion-guard.log`. The commit's own verification (31 passed) exercises the script
+in tests, where the guard hook is not installed, so it does not settle this either way.
 
