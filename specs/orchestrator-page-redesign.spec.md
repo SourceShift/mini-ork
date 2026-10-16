@@ -803,9 +803,9 @@ Stated explicitly, with cost, so a reviewer can decline them knowingly.
       `test_board_cmd.py + test_ide_pages_actions.py` → 153 passed with the two
       pre-existing failures named below. Blocking lint (`ruff check mini_ork/ tests/`)
       and the advisory tier on both changed files: clean.
-- [ ] **Still open:** nothing functional. The P3 note's last sentence is now closed —
-      the classification table *is* the reader that wanted `_recent_profiles`, and it
-      reuses the walk rather than re-walking it.
+- [x] **Closed — nothing functional remains.** The P3 note's last sentence is now closed
+      too: the classification table *is* the reader that wanted `_recent_profiles`, and
+      it reuses the walk rather than re-walking it.
 
 ### P3 — Races and arrivals — **implemented 2026-10-16**
 - [x] FR-031 — `run_id` column: `SCHEMA_SQL` in `mini_ork/threads/store.py` (`INTAKE_COLUMNS`) + `db/migrations/0075_intake_events_run_id.sql` with the same `.read "|sh -c …"` `PRAGMA table_info` guard 0072/0074 use; `record_intake_event` gained `run_id: str | None = None`; `intake/dispatch.py` passes it where the run is started. *Migration number corrected from this spec's `0074` to `0075` — 0074 was taken.*
