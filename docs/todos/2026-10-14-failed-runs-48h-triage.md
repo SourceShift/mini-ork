@@ -9,6 +9,10 @@
 > dispositioned in §7, with the confirmed root causes and the product call in
 > §8.** Ships as two `framework-edit` runs: `remote-early-death-hardening`
 > (D+E) and `frozen-probe-fixtures` (C).
+>
+> **UPDATED 2026-10-16 — BOTH SHIPPED to `main`. See §9 for the outcome
+> receipt.** C = `e0e99542`; D+E = `59f14447`; F = no change (decision in
+> §8.4); B dropped. Nothing in §7/§8 is open any more.
 
 ---
 
@@ -298,6 +302,83 @@ saves money; the escape hatch (`--ack-change`, `MO_IGNORE_PENDING_FIX=1`) is
 named in the message. **Product call: keep it.** The first edition's "a single
 credential failure parks the queue" overstated the blast radius — it parks one
 task, which is the point.
+
+---
+
+## 9. Outcome — both fixes shipped (2026-10-16)
+
+Both `framework-edit` runs were harvested and merged to `main`; every item in
+§7 is now closed. The runs themselves are *not* the receipt — the merges are:
+
+| item | run | merge commit on `main` | files |
+|---|---|---|---|
+| **C** — frozen probe fixtures | `run-1792092531-89304` | **`e0e99542`** *fix(publish): enforce the frozen-path floor on every authored patch* | `config/kernel-frozen.yaml`, `mini_ork/vcs/repo_integrity_guard.py`, `mini_ork/cli/publisher_authored_patch.py`, `tests/unit/test_frozen_paths_enforced.py` |
+| **D + E** — remote early death, run notes, stale lock | `run-1792092528-89023` | **`59f14447`** *fix(dispatch): sanitize unmapped host paths in the prompt text channel* | `mini_ork/dispatch/core.py`, `mini_ork/orchestration/run_reaper.py`, `mini_ork/remote/providers/base.py`, `tests/unit/test_path_map_wiring.py` + 3 new test files |
+| **F** — queue block | — | none (decision, §8.4) | — |
+| **B** — `unparsable` vs `abstained` reason string | — | dropped (cosmetic) | — |
+
+### 9.1 — what C actually enforces
+
+`enforced_frozen_paths(root)` = the file's list **∪** the built-in
+`FROZEN_PATHS_DEFAULT` floor, so deleting or blanking
+`config/kernel-frozen.yaml` cannot widen what a run may edit.
+`publisher_authored_patch.land_patch()` refuses a patch touching a frozen path
+with an abstain reason that **names the path**, before apply/publish. One
+documented override: `MO_ALLOW_FROZEN_EDIT=1`, default refuse. The glob is
+`recipes/code-fix/probes/fixtures/**` (all three probes, and any future one).
+
+### 9.2 — what D actually enforces
+
+`_spawn_in_workspace` no longer dies on a host path in the **prompt text**:
+the text channel is sanitized (`_sanitize_prompt_host_paths` rewrites residual
+unmapped host-path *tokens* to `/workspace/unshared-host-path` and emits one
+WARN naming them), then the check is **re-run** — a rewrite that does not fully
+clean the prompt is still fatal. Two things stay fail-closed, deliberately:
+`argv`/`env` (the child resolves those) and a survivor under a **mapped** root
+(that one is a real translation bug, not prose).
+
+E: `close_run_record` now derives a note for a terminal failure whose fixed
+vocabulary yields none — `NEEDS-CHANGE.md` (first failure line) →
+`retry-hint.json` (`.detail`) → `repair-*.log` (first `step N: … failed:`) — so
+`run-1791911811-5826` would now record *host path in 'text' survives
+translation* instead of `notes = None`. The stale `.node-provider.lock` is
+dropped at terminal state, not inside `_RunLock.__exit__` (which must not race
+a live provisioner).
+
+### 9.3 — two caveats on the receipts
+
+1. **Run `run-1792092531-89304` (C) read `REFUTED` at run level**, and both of
+   its "failed" nodes were a **false negative from the measurement, not the
+   work**: its blind spec test `test_ac2_frozen_patch_refused_not_filtered`
+   asserts `docs/note.txt` is absent from the base commit, while the test's own
+   `_make_repo()` harness writes and commits that file. The assertion is
+   unsatisfiable regardless of the implementation; the other 7 spec tests
+   passed. The correct diff was salvaged, applied, gated and merged. Recorded
+   as a framework gap: the `spec_test_author` node can author a test that no
+   implementation can satisfy, and a run-level `REFUTED` then rolls back good
+   work. **A `REFUTED` verdict from a single spec test must be read before it
+   is believed.**
+2. **The green gate is load-sensitive on this machine.** `run-1792092528-89023`'s
+   first merge attempt ran the broad 959-test `-k` selection and reported
+   14 failed / 8 errors while ~6 other sessions were running their own suites.
+   Re-running the *same files* standalone — on the branch, and on a clean
+   checkout of `origin/main` for the base — showed the true picture: base
+   fails exactly 1 (`test_sandbox_teardown_registry::…gc_all_sweeps_lazy_providers`,
+   pre-existing), branch fails 0; the 8 errors are `test_workspace_conformance[docker]`
+   (no local docker). The merge therefore used the tight 111-test gate
+   (`path_map | text_sanitize | run_reaper | node_provider`) — green — with the
+   broader selection verified separately. **A clustered failure wall in a
+   concurrent-gate run is a hypothesis, not a verdict: re-measure at the base.**
+
+### 9.4 — still open (not part of this triage)
+
+`run-1792092528-89023` was harvested after its dispatcher exited without
+writing a terminal status, so its `task_runs` row still reads `executing` even
+though its work is on `main`. `mini-ork reap --dry-run` finds nothing to reap
+(the run holds markers the reaper treats as live), so this is the same
+post-verdict wedge family as
+`feedback_reflect_child_wedges_run_after_verdict` — a board-state wart, not a
+shipping blocker.
 
 ---
 
