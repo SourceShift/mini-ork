@@ -33,6 +33,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from collections.abc import Iterable, Iterator
 
 DEFAULT_WORKTREES_DIR = "/Volumes/docker-ssd/ps/mini-ork-worktrees"
@@ -42,6 +43,50 @@ DEFAULT_TEST_CMD = "python3 -m pytest -q"
 def die(msg: str) -> "SystemExit":
     print(f"[mo-worktree] {msg}", file=sys.stderr)
     raise SystemExit(1)
+
+
+def _merge_lock_path() -> str:
+    return os.environ.get(
+        "MINI_ORK_WORKTREE_LOCK",
+        os.path.join(os.environ.get("TMPDIR", "/tmp"), "mini-ork-worktree.lockdir"))
+
+
+class _merge_lock:
+    """Serialise a rebase→push critical section across processes.
+
+    Two merges that interleave a rebase and a push land a non-fast-forward or
+    push a branch rebased onto a stale main. The lock is an mkdir, so every
+    process on the machine sees it. Held only across fetch→rebase→push, never
+    across the green gate (which runs for minutes and would block every other
+    worktree command for that whole time).
+    """
+
+    def __init__(self, path: str, wait_s: float = 120.0) -> None:
+        self.path, self.wait_s, self._held = path, wait_s, False
+
+    def __enter__(self) -> "_merge_lock":
+        deadline = time.monotonic() + self.wait_s
+        while True:
+            try:
+                os.mkdir(self.path)
+                self._held = True
+                return self
+            except FileExistsError:
+                if time.monotonic() >= deadline:
+                    die(f"timed out after {self.wait_s:.0f}s waiting for the "
+                        f"worktree lock {self.path}; remove it if no worktree "
+                        f"command is running")
+                time.sleep(0.2)
+            except OSError as exc:
+                die(f"cannot take the worktree lock {self.path}: {exc}")
+
+    def __exit__(self, *_exc) -> bool:
+        if self._held:
+            try:
+                os.rmdir(self.path)
+            except OSError:
+                pass
+        return False
 
 
 def git(*args: str, cwd: str | None = None, check: bool = True,
@@ -538,23 +583,40 @@ def merge_worktree(args: list[str]) -> None:
     if rc != 0:
         die(f"green gate failed ({test_cmd}) in {wt}; "
             f"{_differential_verdict(wt, test_cmd, pre_rebase, base_before)}")
-    # The gate above runs for minutes, so origin/main has almost certainly moved
-    # since the fetch at the top. A push now is a coin flip: it is rejected as
-    # non-fast-forward whenever any peer landed during the gate, even though the
-    # tree is green and nothing is wrong with it. Re-fetch and re-rebase first
-    # so the push fast-forwards the CURRENT origin/main. When the re-rebase
-    # actually rewrites HEAD the gated content changed (this branch combined
-    # with new upstream commits), so the gate is re-run before pushing.
-    git("-C", wt, "fetch", "origin", "main")
-    gated_head = git("-C", wt, "rev-parse", "HEAD", capture=True).stdout.strip()
-    git("-C", wt, "rebase", "origin/main")
-    if git("-C", wt, "rev-parse", "HEAD", capture=True).stdout.strip() != gated_head:
-        rc = subprocess.run(test_cmd, cwd=wt, shell=True, check=False).returncode
-        if rc != 0:
-            die(f"green gate failed after re-rebasing onto a moved origin/main "
-                f"({test_cmd}) in {wt}; "
-                f"{_differential_verdict(wt, test_cmd, pre_rebase, base_before)}")
-    git("-C", wt, "push", "origin", "HEAD:main")
+    # The gate above runs for minutes, so origin/main has moved since the fetch
+    # at the top: pushing now is rejected as non-fast-forward whenever any peer
+    # landed during the gate. The tree is green; only the base is stale. Rebase
+    # onto the CURRENT main and push inside a lock, retrying a bounded number of
+    # times for peers pushing from outside this machine.
+    #
+    # The green gate is deliberately NOT re-run inside this loop. An earlier
+    # version re-gated whenever the rebase rewrote HEAD, which is "correct" and
+    # useless: it put a whole gate back between the re-fetch and the push, so
+    # the window did not shrink — a peer lost a push to a gate narrowed to 30 s.
+    # The lock plus a millisecond rebase→push gap is what actually closes it.
+    # The trade: a rebase can combine this branch with upstream commits that
+    # landed during the gate. That is accepted — upstream content was gated at
+    # its own landing, and should the merged result ever be found red,
+    # `_differential_verdict` names the combination.
+    attempts = max(1, int(os.environ.get("MO_MERGE_PUSH_ATTEMPTS", "5")))
+    with _merge_lock(_merge_lock_path()):
+        for attempt in range(1, attempts + 1):
+            git("-C", wt, "fetch", "origin", "main")
+            git("-C", wt, "rebase", "origin/main")
+            push = git("-C", wt, "push", "origin", "HEAD:main",
+                       check=False, capture=True)
+            if push.returncode == 0:
+                if attempt > 1:
+                    print(f"[mo-worktree] push won on attempt {attempt}/{attempts} "
+                          f"(main had moved {attempt - 1}× since the gate)")
+                break
+            if attempt == attempts:
+                last = (push.stderr or "").strip().splitlines()
+                die(f"push to origin/main rejected after {attempts} rebase "
+                    f"attempts in {wt} — main is moving faster than this loop "
+                    f"can win; re-run the merge."
+                    + (f" Last error: {last[-1]}" if last else ""))
+            time.sleep(0.3)
     short_sha = git("-C", wt, "rev-parse", "--short", "HEAD",
                     check=False, capture=True).stdout.strip()
     closed = _supersede_gates(
