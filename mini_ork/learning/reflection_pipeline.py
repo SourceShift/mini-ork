@@ -504,6 +504,19 @@ def _suggest_promotions_query(db_path: str, tbl: str, min_freq: int) -> list[dic
     return suggestions
 
 
+def _pattern_task_class(cluster_label: str | None) -> str | None:
+    """The task class a cluster label carries (the read-back's own parse).
+
+    A lazy import: ``mini_ork.context_assembler`` imports the learning package,
+    so a module-level import here would close a cycle. The parse has exactly one
+    definition — the one selection scopes with — and this calls it rather than
+    copying it, so a writer and a reader can never disagree about what a class
+    is.
+    """
+    from mini_ork.context_assembler import pattern_task_class
+    return pattern_task_class(cluster_label)
+
+
 def _persist_suggestions_upsert(db_path: str, suggestions_json: str) -> int:
     """Mirror bash persist_suggestions heredoc. Returns persisted count."""
     try:
@@ -543,6 +556,17 @@ def _persist_suggestions_upsert(db_path: str, suggestions_json: str) -> int:
         # uses, over this connection: opening a second one here would block on
         # the write lock this transaction holds and silently do nothing.
         pattern_store.add_lesson_column(con, "emergent_patterns")
+        # `task_class` (0077) is written when it is there and skipped when it is
+        # not, unlike lesson_text above: the read-back parses the class out of
+        # `cluster_label` on a database that never ran the migration, so the
+        # column is an optimisation here, never a precondition for inserting a
+        # pattern. Probed on this connection for the same reason 0056 is.
+        try:
+            has_task_class = bool(con.execute(
+                "SELECT COUNT(*) FROM pragma_table_info('emergent_patterns') "
+                "WHERE name='task_class'").fetchone()[0])
+        except sqlite3.OperationalError:
+            has_task_class = False
         # The preload keeps a re-mined cluster that has not been re-induced from
         # losing its authored lesson: the upsert below already treats the stored
         # lesson as authoritative, so this only matters for the INSERT-named
@@ -605,8 +629,8 @@ def _persist_suggestions_upsert(db_path: str, suggestions_json: str) -> int:
                 INSERT INTO emergent_patterns
                     (pattern_id, cluster_label, member_item_ids_json,
                      feature_set_json, strength_score, suggested_meta_adr,
-                     status, detected_at, resolved_at, lesson_text)
-                VALUES (?,?,?,?,?,?,?,?,NULL,?)
+                     status, detected_at, resolved_at, lesson_text{cls_col})
+                VALUES (?,?,?,?,?,?,?,?,NULL,?{cls_val})
                 ON CONFLICT(pattern_id) DO UPDATE SET
                     cluster_label        = excluded.cluster_label,
                     member_item_ids_json = excluded.member_item_ids_json,
@@ -625,8 +649,18 @@ def _persist_suggestions_upsert(db_path: str, suggestions_json: str) -> int:
                         WHEN emergent_patterns.status
                              IN ('approved','rejected','superseded')
                         THEN emergent_patterns.resolved_at
-                        ELSE NULL END
-                """,
+                        ELSE NULL END{cls_set}
+                """.format(
+                    cls_col=", task_class" if has_task_class else "",
+                    cls_val=", ?" if has_task_class else "",
+                    # The stored class is authoritative the same way the stored
+                    # lesson is: a pattern approved under one class must not be
+                    # silently re-scoped by a later re-mine of the same
+                    # pattern_id. A blank stored class is filled.
+                    cls_set=",\n                    task_class = COALESCE("
+                            "NULLIF(TRIM(emergent_patterns.task_class), ''), "
+                            "excluded.task_class)" if has_task_class else "",
+                ),
                 (
                     pid,
                     desc,
@@ -637,7 +671,7 @@ def _persist_suggestions_upsert(db_path: str, suggestions_json: str) -> int:
                     "proposed",
                     now,
                     lesson,
-                ),
+                ) + ((_pattern_task_class(desc),) if has_task_class else ()),
             )
             persisted += 1
         con.commit()

@@ -537,7 +537,8 @@ def failure_modes_md(task_class: str, limit: int = 5, db: str | None = None,
                                     lane=lane, node_id=node_id,
                                     sources=sources, read_only=read_only)
         if not block:
-            block = _static_emergent_block(dbp, emg_limit, sources=sources)
+            block = _static_emergent_block(dbp, emg_limit, task_class=task_class,
+                                           sources=sources)
         if block:
             out.append(block)
 
@@ -588,39 +589,199 @@ def _verified_theme_lessons(dbp: str, task_class: str, limit: int,
 
 # ── emergent-pattern read-back (static + utility-ranked) ─────────────────────
 
-def _approved_emergent_rows(dbp: str) -> list[tuple]:
+# A pattern's task class is carried by its cluster label, which the
+# deterministic miner renders as prose ("cluster: task_class=code_fix
+# status=failure (freq=11 in window)"). Migration 0077 promotes it to
+# `emergent_patterns.task_class` and backfills it with this same parse; the
+# read-back prefers the column and falls back to the label, so a database that
+# predates the migration scopes identically. Selection that ignores the class
+# is how a code_fix reviewer ended up reading __classify__ and __reflect__
+# patterns: 72% of injections were cross-class.
+_CLASS_MARKER = "task_class="
+# A `__`-prefixed class names a framework-internal stage, not a run's work.
+# Those patterns are the loop's own bookkeeping and are never offered as
+# cross-class guidance.
+_INTERNAL_CLASS_PREFIX = "__"
+# How many other-class patterns a class-scoped read may top up with when the
+# run's own class is thin. Default 1: enough that a cold class is not shown
+# nothing, few enough that the block stays about this run's work.
+_CROSS_CLASS_MAX_ENV = "MO_PATTERN_CROSS_CLASS_MAX"
+_CROSS_CLASS_MAX_DEFAULT = 1
+
+
+def pattern_task_class(cluster_label: str | None) -> str | None:
+    """The task class a cluster label carries; ``None`` when it carries none.
+
+    The class is the token after ``task_class=`` up to the next space (or to
+    the end of the label). A label with no such token — or an empty one — has
+    no class: ``None``, never ''. Internal classes (``__classify__``,
+    ``__reflect__``) parse like any other; excluding them is selection's job,
+    not the parse's.
+
+    Three writers must agree on what a class is, so the parse lives here:
+    ``db/migrations/0077_emergent_pattern_task_class.sql`` backfills the column
+    with the same parse in SQL, and ``mini_ork/learning/reflection_pipeline``
+    calls this function to fill the column on insert.
+    """
+    label = cluster_label or ""
+    idx = label.find(_CLASS_MARKER)
+    if idx < 0:
+        return None
+    rest = label[idx + len(_CLASS_MARKER):]
+    token = rest.split(" ", 1)[0].strip()
+    return token or None
+
+
+def _cross_class_max() -> int:
+    """``MO_PATTERN_CROSS_CLASS_MAX`` — other-class rows a scoped read may add.
+
+    Default 1. An unparseable value takes the default; a negative one clamps to
+    0, which is the fail-closed setting: own-class rows only.
+    """
+    try:
+        cap = int(os.environ.get(_CROSS_CLASS_MAX_ENV, _CROSS_CLASS_MAX_DEFAULT))
+    except (TypeError, ValueError):
+        cap = _CROSS_CLASS_MAX_DEFAULT
+    return max(0, cap)
+
+
+def _approved_rows_with_class(dbp: str) -> list[tuple[tuple, str | None]]:
+    """Approved rows, strongest first, each paired with its resolved class.
+
+    Each element is ``(5-tuple, class)`` where the 5-tuple is the shape every
+    reader of ``_approved_emergent_rows`` unpacks. The class comes from the
+    ``task_class`` column when there is one and it is non-blank, and from the
+    label otherwise — a database predating 0077, or a row an older pipeline
+    wrote into a migrated one, then scopes exactly as a backfilled one does.
+
+    Cold-safe: a missing table, or one predating any of these columns, is an
+    empty list and not an error — this runs on the prompt-injection path. Both
+    ``lesson_text`` (0056) and ``task_class`` (0077) are probed rather than
+    assumed: a database that predates either must keep the whole block it has
+    today, losing only what it does not have.
+    """
+    con = sqlite3.connect(dbp)
+    con.execute("PRAGMA busy_timeout=5000")
+    try:
+        try:
+            cols = {row[0] for row in con.execute(
+                "SELECT name FROM pragma_table_info('emergent_patterns')")}
+        except sqlite3.OperationalError:
+            return []
+        if not cols:
+            return []
+        select = (
+            "pattern_id, cluster_label, feature_set_json, strength_score, "
+            + ("lesson_text" if "lesson_text" in cols else "NULL")
+            + ", "
+            + ("task_class" if "task_class" in cols else "NULL")
+        )
+        try:
+            raw = con.execute(
+                f"SELECT {select} FROM emergent_patterns WHERE status='approved' "
+                "ORDER BY strength_score DESC, detected_at DESC"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+    finally:
+        con.close()
+    out: list[tuple[tuple, str | None]] = []
+    for pid, label, feats, strength, lesson, stored_class in raw:
+        cls = (stored_class or "").strip() or pattern_task_class(label)
+        out.append(((pid, label, feats, strength, lesson), cls))
+    return out
+
+
+def _is_cross_class(cls: str | None, task_class: str) -> bool:
+    """True when ``cls`` is a class a scoped read may borrow from the top-up.
+
+    Never the run's own class (those are selected outright), never an internal
+    ``__``-prefixed class, and never NULL/blank: an unknown class is not a
+    class, and the loop's own bookkeeping is not guidance about the work.
+    """
+    return bool(cls) and cls != task_class and not cls.startswith(
+        _INTERNAL_CLASS_PREFIX)
+
+
+def _cross_class_topup_size(own_count: int, limit: int | None) -> int:
+    """How many other-class rows the top-up may add.
+
+    Capped by ``MO_PATTERN_CROSS_CLASS_MAX`` and, when the caller named one, by
+    the room left under ``limit`` — the top-up fills a thin block, it does not
+    overrun the budget the caller set for it.
+    """
+    cap = _cross_class_max()
+    if limit is not None:
+        cap = min(cap, max(0, limit - own_count))
+    return cap
+
+
+def _cross_class_topup(rows: list[tuple[tuple, str | None]], task_class: str,
+                       own_count: int, limit: int | None) -> list[tuple]:
+    """The strongest non-internal other-class rows, at most the capped size."""
+    size = _cross_class_topup_size(own_count, limit)
+    if size <= 0:
+        return []
+    return [r for r, cls in rows if _is_cross_class(cls, task_class)][:size]
+
+
+def _emergent_pool(dbp: str, task_class: str | None = None,
+                   limit: int | None = None) -> tuple[list[tuple], bool]:
+    """The approved-pattern pool for a run, and whether class scoping applied.
+
+    Returns ``(rows, class_scoped)``, rows being the 5-tuples
+    ``_approved_emergent_rows`` returns. ``class_scoped`` says which pool they
+    came from; ``semantic_lessons_md`` keys its win/loss bookkeeping off it,
+    because only scoped selection creates the separate pool the ``#tc1`` era
+    exists to isolate.
+
+    ``task_class=None`` keeps today's unconditional contract: every approved
+    row, strongest first — what the other readers (reflections, JSON pack
+    entries) want.
+
+    With a class, the pool is that class's rows first, in strength order, then
+    at most ``MO_PATTERN_CROSS_CLASS_MAX`` (default 1) non-internal rows of
+    other classes — and that top-up is offered only while the own-class rows
+    are fewer than ``limit``, the caller's own budget for this block.
+
+    A class no row carries has no scoped pool to offer; the read degrades to
+    the unscoped one rather than to nothing, because the lessons are still
+    evidence and a database whose patterns all predate classification would
+    otherwise lose its whole block to a scoping change. ``class_scoped`` is
+    False there, as it is for ``task_class=None``.
+    """
+    rows = _approved_rows_with_class(dbp)
+    if task_class is None:
+        return [r for r, _cls in rows], False
+
+    own = [r for r, cls in rows if cls == task_class]
+    if own:
+        return own + _cross_class_topup(rows, task_class, len(own), limit), True
+
+    cross = [r for r, cls in rows if _is_cross_class(cls, task_class)]
+    if not cross:
+        return [r for r, _cls in rows], False
+    return cross[:_cross_class_topup_size(0, limit)], True
+
+
+def _approved_emergent_rows(dbp: str, task_class: str | None = None,
+                            limit: int | None = None) -> list[tuple]:
     """Approved (judge-gated) emergent patterns, strongest first.
 
     Returns 5-tuples ``(pattern_id, cluster_label, feature_set_json,
     strength_score, lesson_text)``.
 
+    ``task_class=None`` is every approved row — the pre-scoping contract, kept
+    for the readers that want it. With a class, the run's own rows come first
+    and a capped, non-internal cross-class top-up may follow; ``_emergent_pool``
+    holds the whole rule. ``limit`` is the caller's budget for the block it is
+    assembling and bounds the top-up only — every caller truncates its own
+    output — so ``None`` means the caller imposed no budget.
+
     Cold-safe: a missing table, or one predating any of these columns, is an
-    empty list and not an error — this runs on the prompt-injection path. The
-    ``lesson_text`` column is probed rather than assumed: it arrives with
-    migration 0056, and a database that predates it must lose only the lessons
-    (which it does not have) and keep the whole block it has today.
+    empty list and not an error.
     """
-    con = sqlite3.connect(dbp)
-    con.execute("PRAGMA busy_timeout=5000")
-    base = (
-        "SELECT pattern_id, cluster_label, feature_set_json, strength_score{extra} "
-        "FROM emergent_patterns WHERE status='approved' "
-        "ORDER BY strength_score DESC, detected_at DESC"
-    )
-    try:
-        return con.execute(base.format(extra=", lesson_text")).fetchall()
-    except sqlite3.OperationalError:
-        try:
-            return [
-                (pid, label, feats, strength, None)
-                for pid, label, feats, strength in con.execute(
-                    base.format(extra="")
-                ).fetchall()
-            ]
-        except sqlite3.OperationalError:
-            return []
-    finally:
-        con.close()
+    return _emergent_pool(dbp, task_class, limit)[0]
 
 
 def _emergent_text(
@@ -650,10 +811,15 @@ def _emergent_text(
     return f"[{feat}] {(cluster_label or '').strip()}"
 
 
-def _static_emergent_block(dbp: str, limit: int,
-                           *, sources: list[dict] | None = None) -> str:
+def _static_emergent_block(dbp: str, limit: int, *,
+                           task_class: str | None = None,
+                           sources: list[dict] | None = None) -> str:
     """Strength-ordered read-back — the pre-semantic behaviour, kept as the
     degradation path. Ordering is unchanged; only the LIMIT moved to Python.
+
+    ``task_class`` scopes the pool to the run's own class, plus the capped
+    non-internal cross-class top-up (``_emergent_pool``); ``None`` keeps the
+    old unscoped read.
 
     Approved patterns whose ``lesson_text`` is NULL/blank are skipped by
     default: the prompt as published must only carry authored guidance, never
@@ -664,7 +830,7 @@ def _static_emergent_block(dbp: str, limit: int,
     empty header — when nothing remains.
     """
     unlessoned = os.environ.get("MO_EMERGENT_INJECT_UNLESSONED", "0") == "1"
-    rows = _approved_emergent_rows(dbp)
+    rows = _approved_emergent_rows(dbp, task_class=task_class, limit=limit)
     if not unlessoned:
         rows = [r for r in rows if (r[4] or "").strip()]
     rows = rows[:limit]
@@ -709,6 +875,16 @@ def semantic_lessons_md(task_class: str, limit: int = 5, db: str | None = None,
     spend this call incurs is attributable to the decision that caused it
     (LIMBO, arXiv 2609.14138). They do not affect which memories are chosen.
 
+    The pool is the run's task class first, plus the capped non-internal
+    cross-class top-up (`_emergent_pool`) — the same scoping the static block
+    applies, so both paths select from one pool. The memory scope key carries a
+    `#tc1` suffix (`f"{task_class or 'generic'}#tc1"`) so a memory's win/loss
+    history from the scoped era is never mixed with the unscoped era's: the
+    pools differ, so their earning records must. A read that could not be
+    scoped — no class given, or a store whose patterns carry none — keeps the
+    legacy key, because its pool IS the unscoped pool and moving the key would
+    strand a track record that still describes exactly what is being read.
+
     `read_only=True` renders the block without touching the store at all: no
     finished-run sweep, no mirror upsert, no retrieval row. Each approved
     pattern is looked up by key and only the mirrors that already exist are
@@ -727,7 +903,7 @@ def semantic_lessons_md(task_class: str, limit: int = 5, db: str | None = None,
     dbp = _db_path(db)
     if not os.path.isfile(dbp):
         return ""
-    rows = _approved_emergent_rows(dbp)
+    rows, class_scoped = _emergent_pool(dbp, task_class, limit)
     if not rows:
         return ""
 
@@ -735,16 +911,21 @@ def semantic_lessons_md(task_class: str, limit: int = 5, db: str | None = None,
     # authored lesson is guidance; a cluster statistic masquerading as a
     # lesson is the defect (Trace2Skill 2603.25158). Opt-out
     # MO_EMERGENT_INJECT_UNLESSONED=1 keeps the prior behaviour. Done here in
-    # the injection path so `_approved_emergent_rows` keeps its unconditional
-    # contract — other readers (reflections, JSON pack entries) want every
-    # approved row regardless of authoring.
+    # the injection path so `_approved_emergent_rows` stays a pure read —
+    # other readers (reflections, JSON pack entries) want every approved row
+    # regardless of authoring.
     unlessoned = os.environ.get("MO_EMERGENT_INJECT_UNLESSONED", "0") == "1"
     if not unlessoned:
         rows = [r for r in rows if (r[4] or "").strip()]
     if not rows:
         return ""
 
-    scope = task_class or "generic"
+    # The scope key of the pool this read actually selected from. A scoped read
+    # starts the `#tc1` era: its pool is not the pool the unscoped era's
+    # win/loss history was earned against, so the two must not be averaged
+    # together. A read that could not be scoped keeps the legacy key.
+    base_scope = task_class or "generic"
+    scope = f"{base_scope}#tc1" if class_scoped else base_scope
     try:
         if not read_only:
             # Close the loop before reading. A run that already finished has its

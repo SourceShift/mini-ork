@@ -23,3 +23,18 @@ Add `multiply(a, b)` to `calc.py`, next to the existing `add(a, b)`.
 - AC1: `python3 -m pytest -q tests/test_multiply.py::test_multiply_integers` reports 1 passed.
 - AC2: `python3 -m pytest -q tests/test_multiply.py::test_multiply_edge_cases` reports 1 passed.
 - AC3 (precondition, passes before work starts): `python3 -m pytest -q tests/test_add.py` reports 1 passed.
+
+```bash
+# AC1
+python3 -m pytest -q tests/test_multiply.py::test_multiply_integers
+echo "AC1 pass"
+
+# AC2
+python3 -m pytest -q tests/test_multiply.py::test_multiply_edge_cases
+echo "AC2 pass"
+
+# AC3 (precondition)
+python3 -m pytest -q tests/test_add.py
+echo "AC3 pass"
+```
+

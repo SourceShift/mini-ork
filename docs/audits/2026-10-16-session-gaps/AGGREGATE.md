@@ -267,6 +267,19 @@ warns about — I asserted a *negative* from one search instead of a *positive* 
 Local `main` moved three times during the sweep (`0abc587d` → `95a4af77` → `60c00154`). Re-measure
 at publication time; do not quote any divergence figure from this document.
 
+**C-3 — My "second defect in `read_verifier_payload`" was FALSE. Retracted.**
+I read a docstring against a loop and asserted a code bug from the mismatch, without reading the
+iterator the loop runs over. `_iter_json_objects` walks **bottom-up**, so first-match and
+last-object are the same thing and nothing was broken. I published this to `origin/main` in round 3
+before checking it, which is the same error class as C-1: a *negative* about code asserted from one
+reading instead of a positive check. Caught by `run-page-ux-clarity`, who owns the function and
+checked. The retraction is in the body, not only here.
+
+**C-4 — the reported "57 of 117" was an estimate, not a count.** The same session measured it after
+the fact: **62 of 123**, matching this document's independent count. It corrected its own figure and
+flagged it as a self-report rather than fixing it silently — worth recording because the failure
+mode is the one the session was *reporting*: a plausible number, asserted, never measured.
+
 ## Late additions (reports that arrived after the first pass)
 
 **Delivery integrity — a whole class** (`mini-ork-cb` G1, now P0 #4a): three runs with
@@ -495,11 +508,19 @@ fires, and the page tells the user *"Failed at ?; the cause was not classified"*
 verdict JSON is on disk. On `run-1792151796-92942` the cause was recoverable and specific:
 `gates_materialize`, kind `code`.
 
-**A second defect in the same function, found while verifying the first.** The docstring says the
-**last** matching object; the loop `return`s on the **first**, so an appended second verdict for the
-same verifier — the case a retry produces — is unreachable. Either the scan should continue to the
-last match or the docstring should say first; the reader's purpose suggests the docstring is right
-and the loop is the bug.
+**A second claim of mine about this function was REFUTED by its author — see C-3.** I read the
+docstring ("the LAST JSON object …") against a loop that `return`s on the first match and called it
+a bug. It is not one: `_iter_json_objects` (`levels.py:81`) walks the file **bottom-up**
+(`for i in range(len(lines) - 1, -1, -1)`), so the first object it yields *is* the last blob in the
+file, and returning on that match is exactly the docstring's promise — a retry appends its verdict
+last. `levels.py:206` corroborates independently: *"Scan bottom-up like
+:func:`read_verifier_payload`"*. The docstring still read as a bug to anyone who cannot tell the
+iterator is reversed, so the prose was worth fixing; no behaviour was wrong.
+
+The sharper criticism is `run-page-ux-clarity`'s, and it is right: name-matching a field that two
+thirds of writers omit is **the wrong lookup in the first place** — the file is named
+`verifier_<stem>.json`, which already says who wrote it. The landed fallback covers the 62; the
+primary reader still cannot distinguish a *missing* verdict from a *malformed* one.
 
 Fix in the tree (uncommitted): `read_single_verifier_payload` as a fallback — it returns the file's
 one JSON object, or `None` when it holds none or several, because `_iter_json_objects` yields a
@@ -558,13 +579,78 @@ above). Three sessions, two wrong guesses, neither about the right party. The di
 blocking the next fast-forward for everyone. The commit is docs-only and additive (three files under
 this directory; `git show --stat` confirms no engine paths), so the blast radius was nil. It also
 cited a rule — *"Commit, merge, push — without being asked"* — as living in the user's `CLAUDE.md`.
-**That line is not in any `CLAUDE.md` or `.rules` file this session can read** (`grep` across
-`~/.claude/CLAUDE.md`, the fork's, the engine's, and the fork's `.rules` → no match). The push is
-harmless and the diverged-primary argument for it is legitimate; the citation is the part worth
-resolving, because if such a rule does exist it decides the push question outright, and if it does
-not, no session should be acting on it as the house default.
+**I said that line was in no file I could read. That was WRONG, and the way it was wrong is the
+useful part. The rule is real: engine `CLAUDE.md` line 77, section "Dev loop — worktree first"**
+(`git ls-files --error-unmatch CLAUDE.md` → tracked; it is on `origin/main` too). My `grep -rn`
+across three `CLAUDE.md` paths returned no match because **engine `CLAUDE.md` is a symlink to
+`AGENTS.md`** and BSD `grep -r` does not follow a symlink passed as an argument — and my
+`2>/dev/null` **discarded the diagnostic that would have said so**. Two failures stacked: a search
+that silently skipped the file it was asked about, and an error deliberately suppressed so the
+skipping was invisible. The engine's own `CLAUDE.md` forbids exactly that second one
+(*"Never silently discard errors"*), which is a fitting way to have earned it.
+
+**Consequence, and it settles the question: pushing a finished, verified change is the house default
+in this repo.** The push was right for the reason given *and* for the rule; the retraction here is
+only about how I checked, not about the act.
 
 **Not a defect of any session — a hazard of the layout.** A second crate checkout exists at
 `/Volumes/docker-ssd/ps/mini-ork-ui` (clean, same `origin`, same HEAD `9154ef4`). Landing `board.rs`
 or `ide_http.rs` from two checkouts can conflict on push, which is the standing reason **P1#8** (the
 5th `Counts` bucket, which also edits `board.rs`) is held rather than rushed.
+
+**Do not prune this shared checkout while sessions are live.** A fetch now prints *"There are too
+many unreachable loose objects; run 'git prune' to remove them"* and points at `.git/gc.log`. That
+warning is the repository asking for a prune — and with several live sessions working in one
+checkout, unreachable loose objects are exactly what a peer's reflog holds for unpushed or
+pre-rebase work. Pruning now deletes recovery points that are not any single agent's to judge as
+garbage. Deleting `.git/gc.log` is not the safe alternative either: it **re-arms** automatic cleanup
+rather than postponing it. Both are the user's call, taken when sessions are quiescent. Raised by
+`fix-run-graph-edges`, who surfaced it rather than acting — the same judgement as the `:7090`
+restart refusal, applied to an irreversible operation on shared state.
+
+**C-5 — "the push rule is in no `CLAUDE.md` I can read" was FALSE. Retracted.** The rule is
+`CLAUDE.md:77` in the engine repo. My search failed on a **symlink**: `CLAUDE.md → AGENTS.md`, and
+BSD `grep -r` will not follow a symlink named as an argument; `2>/dev/null` hid the warning that
+would have revealed it. Third instance this sweep of the same underlying error — **a negative about
+code, asserted from one search instead of a positive check** (C-1 one grep, C-3 one reading, C-5 one
+grep with a suppressed error). The pattern is worth naming: every one of my wrong claims was a
+*negative* ("there is no code", "the loop is broken", "the rule does not exist"), and every one
+survived because the failing check was quiet rather than loud.
+
+---
+
+## Delivery — round 4
+
+**`1165b056` (learning-loop fix program)** — report filed as `1165b056-learning-loop-fixes.md`,
+verified against `origin/main` `5b8d4a98` rather than against recorded status.
+
+- **Shipped, all ancestors of `origin/main`:** R1 `d405ef48`, R2 `5b8d4a98`, R4 `aaa87512`,
+  R5 `95a4af77`, R6 `b2f5b224`, R7a `dc2d8793`, R10 `fda51845`, plus
+  `recipes/audit-judge-panel-4l` and `mini_ork/verify/panel_heterogeneity.py`.
+- **In the plan of record but NOT shipped** (`docs/plans/2026-10-15-learning-loop-fixes.md`,
+  `9fb802fa`): R3 — the double injection is still live, `mini_ork/cli/execute.py:3567` returns
+  `pref_block + v2_block + block` — plus R7b, R9, R11a, R11b, R12 (no `target_repo` symbol
+  anywhere) and R13 (no `v2_legacy`/`effective` symbol). R8 in progress. **This is cross-cutting
+  finding 1 again:** a plan of record that reads like a shipped contract.
+
+**New defect — the reversion watchdog undoes a legitimate rebase (P1).**
+`.githooks/post-commit:132-152` restores a file whenever its content equals a **parent** commit's
+blob — which is precisely the working-tree state a rebase checkout produces. So every
+`make worktree-merge` within ~60 s of a commit wedges with *"local changes would be overwritten"*.
+Witnessed on `lf-r5` and `lf-r2`; `.mini-ork/file-reversion-guard.log` records
+`restored-reverted-to-2e8367f7…`. Worked around with `MO_REVERSION_GUARD_DISABLED=1`; the source
+still needs fixing. **Not one session's problem:** worktree-merge is how changes land in this repo,
+so a guard that makes it wedge after every commit sits on the critical path for every session — and
+it is a plausible contributor to the "push race, retry loop" friction reported elsewhere here.
+
+**Proven but deliberately not applied** — the live-DB cleanup of 166 non-code rows / 280 artifact
+file paths is demonstrated on a **copy** and held back from `$MINI_ORK_HOME/state.db` while R8 runs.
+Correct call; recorded as pending, not done.
+
+**The primary's divergence closes as this session's, not a peer's.** `1165b056` found local `main`
+diverged and inferred "another session's unpushed docs(audit) commits" — correct, and it is this
+aggregation's: local `351481b1` is **patch-id-identical** to `8d8be650` (`git patch-id --stable` on
+both → `e1307ee4e056ad09a8e5e3a275a8351990444b1c`), so it is a true duplicate of what is already on
+`origin/main` and dropping it loses nothing. It clears with `git pull --rebase` once the ~11 dirty
+files from other sessions quiet; `--ff-only` will keep refusing in the meantime, and an `--ff-only`
+refusal there is **not** evidence of new drift. Not cleared by this session for that reason.

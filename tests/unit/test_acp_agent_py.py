@@ -1667,11 +1667,11 @@ def test_slash_run_in_orchestrate_mode_launches_directly(tmp_path):
     fake_lanes = [{"id": "opus", "name": "Opus"}]
     fake_recipes = ["code-fix"]
 
-    seen_turn = {"called": False}
+    seen_turn = {"prompts": []}
 
     def fake_turn(lane, prompt, cwd, home, resume, on_event):
         async def _run() -> Any:
-            seen_turn["called"] = True
+            seen_turn["prompts"].append(str(prompt))
             return _TurnResult()  # noqa: F821 — defined below
 
         return _run()
@@ -1714,10 +1714,14 @@ def test_slash_run_in_orchestrate_mode_launches_directly(tmp_path):
         MiniOrkAcpAgent._launch = original_launch  # type: ignore[method-assign]
 
     assert turn_resp.stop_reason == "end_turn"
-    # The orchestrator was NOT invoked (slash command short-circuits).
-    assert seen_turn["called"] is False
-    # Direct mode launched one run with the slash payload.
+    # The orchestrator was never asked to INTERPRET the user's words — the
+    # slash command short-circuits to a direct launch. Since fae2a7a5 the run
+    # that launch starts has an orchestrator of its own, and that orchestrator
+    # narrates it on this same seam, so "the seam was touched" no longer means
+    # "the prompt was routed". The assertion is on what was asked instead.
     assert launched == [(launched[0][0], "fix x")]
+    assert seen_turn["prompts"], "the launched run's closing report should be narrated"
+    assert all("fix x" not in p for p in seen_turn["prompts"]), seen_turn["prompts"]
 
 
 def test_cancel_thread_session_cancels_orchestrator_task(tmp_path):
@@ -1897,8 +1901,11 @@ def test_child_run_streams_agent_output_into_the_thread(tmp_path):
         return {"status": "published", "events": [start, end],
                 "llm_calls": [{"cost_usd": 0.25, "total_tokens": 900}]}
 
+    turn_costs: list[float] = []
+
     def turn(lane, prompt, cwd, home, resume, on_event):
         async def _run():
+            turn_costs.append(0.5)
             for ev in _start_run_events(child):
                 await on_event(ev)
             return _Turn(cost_usd=0.5)
@@ -1928,7 +1935,13 @@ def test_child_run_streams_agent_output_into_the_thread(tmp_path):
     messages = [u.content.text for u in updates if isinstance(u, AgentMessageChunk)]
     assert f"mini-ork run {child} finished: published" in [m.strip() for m in messages]
     costs = [u.cost.amount for u in updates if isinstance(u, UsageUpdate)]
-    assert costs[-1] == pytest.approx(0.75)
+    # The thread's cost is every turn the orchestrator spent on it — the user's
+    # own turn, plus the run's closing report, which is a real orchestrator turn
+    # since fae2a7a5 — added to what the followed run itself spent. Asserted as
+    # that sum rather than as a literal, so the test states the contract instead
+    # of one instance of it.
+    assert turn_costs == [0.5, 0.5], "the user's turn, then the run's closing report"
+    assert costs[-1] == pytest.approx(sum(turn_costs) + 0.25)
 
 
 def test_direct_mode_run_streams_into_the_thread_not_a_run_session(tmp_path):
@@ -2042,6 +2055,7 @@ def test_thread_usage_is_sent_only_when_the_total_changes(tmp_path):
     proj = tmp_path / "proj"
     proj.mkdir()
     polls = {"n": 0}
+    orch = 0.05
 
     def reader(rid: str) -> dict:
         polls["n"] += 1
@@ -2049,12 +2063,22 @@ def test_thread_usage_is_sent_only_when_the_total_changes(tmp_path):
         return {"status": "published" if polls["n"] >= 5 else "executing",
                 "events": [], "llm_calls": calls}
 
-    agent, thread = _thread_agent(proj, launcher=lambda rid, kickoff: {"ok": True}, reader=reader)
+    def turn(lane, prompt, cwd, home, resume, on_event):
+        async def _run():
+            return _Turn(cost_usd=orch)
+        return _run()
+
+    agent, thread = _thread_agent(proj, launcher=lambda rid, kickoff: {"ok": True}, reader=reader,
+                                  orchestrator_turn=turn)
     conn = _SidConn()
     agent.on_connect(conn)
     asyncio.run(agent.prompt(thread, [_text_block("/run x")]))
     costs = [u.cost.amount for _, u in conn.sent if isinstance(u, UsageUpdate)]
-    assert costs == [pytest.approx(0.1), pytest.approx(0.3)]
+    # Three updates and no more. The run's total climbs 0.1 -> 0.3; the polls in
+    # between re-report 0.1, and re-reporting an unchanged total sends nothing.
+    # The third update is the run's closing report: since fae2a7a5 the run's own
+    # orchestrator narrates its end, and that turn's cost folds into the total.
+    assert costs == [pytest.approx(0.1), pytest.approx(0.3), pytest.approx(0.3 + orch)]
 
 
 # ── thread-session persistence (Z9c-2) ───────────────────────────────────
