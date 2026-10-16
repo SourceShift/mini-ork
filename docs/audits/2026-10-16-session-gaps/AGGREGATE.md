@@ -579,11 +579,19 @@ above). Three sessions, two wrong guesses, neither about the right party. The di
 blocking the next fast-forward for everyone. The commit is docs-only and additive (three files under
 this directory; `git show --stat` confirms no engine paths), so the blast radius was nil. It also
 cited a rule — *"Commit, merge, push — without being asked"* — as living in the user's `CLAUDE.md`.
-**That line is not in any `CLAUDE.md` or `.rules` file this session can read** (`grep` across
-`~/.claude/CLAUDE.md`, the fork's, the engine's, and the fork's `.rules` → no match). The push is
-harmless and the diverged-primary argument for it is legitimate; the citation is the part worth
-resolving, because if such a rule does exist it decides the push question outright, and if it does
-not, no session should be acting on it as the house default.
+**I said that line was in no file I could read. That was WRONG, and the way it was wrong is the
+useful part. The rule is real: engine `CLAUDE.md` line 77, section "Dev loop — worktree first"**
+(`git ls-files --error-unmatch CLAUDE.md` → tracked; it is on `origin/main` too). My `grep -rn`
+across three `CLAUDE.md` paths returned no match because **engine `CLAUDE.md` is a symlink to
+`AGENTS.md`** and BSD `grep -r` does not follow a symlink passed as an argument — and my
+`2>/dev/null` **discarded the diagnostic that would have said so**. Two failures stacked: a search
+that silently skipped the file it was asked about, and an error deliberately suppressed so the
+skipping was invisible. The engine's own `CLAUDE.md` forbids exactly that second one
+(*"Never silently discard errors"*), which is a fitting way to have earned it.
+
+**Consequence, and it settles the question: pushing a finished, verified change is the house default
+in this repo.** The push was right for the reason given *and* for the rule; the retraction here is
+only about how I checked, not about the act.
 
 **Not a defect of any session — a hazard of the layout.** A second crate checkout exists at
 `/Volumes/docker-ssd/ps/mini-ork-ui` (clean, same `origin`, same HEAD `9154ef4`). Landing `board.rs`
@@ -599,3 +607,12 @@ garbage. Deleting `.git/gc.log` is not the safe alternative either: it **re-arms
 rather than postponing it. Both are the user's call, taken when sessions are quiescent. Raised by
 `fix-run-graph-edges`, who surfaced it rather than acting — the same judgement as the `:7090`
 restart refusal, applied to an irreversible operation on shared state.
+
+**C-5 — "the push rule is in no `CLAUDE.md` I can read" was FALSE. Retracted.** The rule is
+`CLAUDE.md:77` in the engine repo. My search failed on a **symlink**: `CLAUDE.md → AGENTS.md`, and
+BSD `grep -r` will not follow a symlink named as an argument; `2>/dev/null` hid the warning that
+would have revealed it. Third instance this sweep of the same underlying error — **a negative about
+code, asserted from one search instead of a positive check** (C-1 one grep, C-3 one reading, C-5 one
+grep with a suppressed error). The pattern is worth naming: every one of my wrong claims was a
+*negative* ("there is no code", "the loop is broken", "the rule does not exist"), and every one
+survived because the failing check was quiet rather than loud.
