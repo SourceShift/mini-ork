@@ -143,3 +143,8 @@ class IntakeEvent:
     action: str | None
     detail: str | None
     created_at: str
+    #: The run this arrival started, when it started one. NULL for a row that
+    #: only folded into an existing run (a replay) and for every row written
+    #: before the column existed — ``thread_id`` is not a proxy, because one
+    #: thread can carry several runs.
+    run_id: str | None = None

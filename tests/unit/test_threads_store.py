@@ -250,3 +250,123 @@ def test_an_unknown_origin_or_status_reads_as_the_safe_default(db: str):
     thread = store.get_thread("t9", db=db)
     assert thread.status is ThreadState.IDLE
     assert thread.origin is ThreadOrigin.IDE
+
+
+# ── 0075: the ledger records which run an arrival started ───────────────────
+
+RUN_ID_MIGRATION = REPO / "db" / "migrations" / "0075_intake_events_run_id.sql"
+
+
+def test_the_widened_columns_agree_with_their_migration():
+    """``INTAKE_COLUMNS`` and ``0075`` are two writers for one schema.
+
+    The same rule as :func:`test_schema_matches_the_migration`: a runtime twin
+    is only safe while it writes the migration's own text, and this is what
+    keeps them agreeing.
+    """
+    text = RUN_ID_MIGRATION.read_text(encoding="utf-8")
+    without_comments = re.sub(r"--[^\n]*", " ", text)
+    normalized = re.sub(r"\s+", " ", without_comments).strip()
+    for name, declaration in store.INTAKE_COLUMNS:
+        statement = f"ALTER TABLE intake_events ADD COLUMN {name} {declaration};"
+        assert re.sub(r"\s+", " ", statement) in normalized, statement
+
+
+def test_a_ledger_written_before_the_column_is_widened_on_the_first_write(tmp_path: Path):
+    """The twin, not the migration, is what an IDE-only home relies on.
+
+    ``SCHEMA_SQL`` writes the pre-0075 table (its ``CREATE`` is pinned to
+    ``0070_threads.sql``), so a database built from it is exactly the ledger
+    this feature has to upgrade: the old row reads ``None`` — it recorded no
+    run — and the new one carries its id.
+    """
+    import sqlite3
+
+    db = str(tmp_path / "state.db")
+    con = sqlite3.connect(db)
+    for statement in store.SCHEMA_SQL:
+        con.execute(statement)
+    con.execute(
+        "INSERT INTO intake_events (provider, delivery_id, payload_hash, created_at) "
+        "VALUES ('github','old','h','2026-01-01T00:00:00.000Z')")
+    con.commit()
+    con.close()
+
+    store.record_intake_event("github", "new", "h2", issue_uid="github:o/r#2",
+                              thread_id="t1", run_id="run-1", db=db)
+
+    con = sqlite3.connect(db)
+    try:
+        rows = dict(con.execute("SELECT delivery_id, run_id FROM intake_events"))
+    finally:
+        con.close()
+    assert rows == {"old": None, "new": "run-1"}
+    # Every write re-runs the twin, so a second one must not add the column again.
+    store.record_intake_event("github", "newer", "h3", run_id="run-2", db=db)
+    assert store.intake_event("github", "newer", db=db).run_id == "run-2"
+
+
+def test_recorded_run_id_defaults_to_none(tmp_path: Path):
+    """Existing callers pass no run, and a reporting event started none."""
+    db = str(tmp_path / "state.db")
+    store.ensure_schema(db)
+    stored = store.record_intake_event("github", "d1", "h", action="reported", db=db)
+    assert stored.run_id is None
+    assert store.intake_event("github", "d1", db=db).run_id is None
+
+
+def test_the_migration_widens_a_legacy_ledger_and_can_run_twice(tmp_path: Path):
+    """A bare ``ALTER`` would hard-fail on the second pass — the guard is the point.
+
+    The re-apply is not hypothetical: the runtime twin adds the column on the
+    first write of new code, which can happen before the file is ever recorded.
+    """
+    import sqlite3
+
+    from mini_ork.stores import migrate as mig
+
+    db = str(tmp_path / "state.db")
+    con = sqlite3.connect(db)
+    con.execute(
+        """
+        CREATE TABLE intake_events (
+          id           INTEGER PRIMARY KEY AUTOINCREMENT,
+          provider     TEXT NOT NULL,
+          delivery_id  TEXT NOT NULL,
+          payload_hash TEXT NOT NULL,
+          issue_uid    TEXT,
+          thread_id    TEXT,
+          action       TEXT,
+          detail       TEXT,
+          created_at   TEXT NOT NULL,
+          UNIQUE (provider, delivery_id)
+        )
+        """)
+    con.execute("INSERT INTO intake_events (provider, delivery_id, payload_hash, created_at) "
+                "VALUES ('github','old','h','2026-01-01T00:00:00.000Z')")
+    con.commit()
+    con.close()
+
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    (migrations / RUN_ID_MIGRATION.name).write_text(RUN_ID_MIGRATION.read_text(encoding="utf-8"))
+
+    rc, out = mig.migrate_apply(str(migrations), dry_run=False, db=db, root=str(REPO))
+    assert rc == 0, out
+    con = sqlite3.connect(db)
+    try:
+        con.execute("DELETE FROM schema_migrations WHERE filename LIKE '0075%'")
+        con.commit()
+    finally:
+        con.close()
+    rc, out = mig.migrate_apply(str(migrations), dry_run=False, db=db, root=str(REPO))
+    assert rc == 0, out
+
+    con = sqlite3.connect(db)
+    try:
+        columns = [record[1] for record in con.execute("PRAGMA table_info(intake_events)")]
+        assert columns.count("run_id") == 1
+        assert con.execute("SELECT run_id FROM intake_events WHERE delivery_id='old'"
+                           ).fetchone()[0] is None
+    finally:
+        con.close()

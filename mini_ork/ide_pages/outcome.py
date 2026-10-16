@@ -493,16 +493,9 @@ def _gate_hint(gate: dict[str, Any]) -> dict[str, Any]:
 # ── counts / menu ──────────────────────────────────────────────────────────
 
 def _verifier_checks(run) -> tuple[int, int]:
-    rm = _run_mod()
-    passed = total = 0
-    for path in sorted(run.run_dir.glob("verifier_*.json")):
-        data = rm._json_obj(path)
-        if not isinstance(data, dict) or "pass" not in data:
-            continue
-        total += 1
-        if data.get("pass"):
-            passed += 1
-    return passed, total
+    """Delegates to :func:`mini_ork.ide_pages.run.verifier_check_counts`, which
+    the races panel also calls — the two pages must not disagree about one run."""
+    return _run_mod().verifier_check_counts(run.run_dir)
 
 
 def _findings_count(run) -> int | None:

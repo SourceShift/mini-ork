@@ -741,6 +741,26 @@ def _node_output(run: Run, node: Node) -> list[str]:
     return [ln for ln in _tail(d / "execute.log", 2000) if pat.search(ln)][-_OUTPUT_LINES:]
 
 
+def verifier_check_counts(run_dir: Path) -> tuple[int, int]:
+    """``(passed, total)`` over a run dir's ``verifier_*.json`` envelopes.
+
+    A file that is not a JSON object carrying a ``pass`` key is not a check and
+    is skipped, so a stray log fragment does not become a failure. Two pages
+    report this number — the run's outcome card and the races panel, where it is
+    the input to "keep this one or that one" — and they must agree, so the
+    definition lives here beside :func:`_json_obj` rather than in either page.
+    """
+    passed = total = 0
+    for path in sorted(Path(run_dir).glob("verifier_*.json")):
+        data = _json_obj(path)
+        if not isinstance(data, dict) or "pass" not in data:
+            continue
+        total += 1
+        if data.get("pass"):
+            passed += 1
+    return passed, total
+
+
 def _json_obj(path: Path) -> dict[str, Any] | None:
     """A JSON object from ``path`` — verifier files may carry log lines before it."""
     try:

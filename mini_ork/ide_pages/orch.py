@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from mini_ork.ide_pages import spec as S
-from mini_ork.ide_pages.run import plan_artifact, plan_steps
+from mini_ork.ide_pages.run import plan_artifact, plan_steps, verifier_check_counts
 
 TABS = [("session", "Session"), ("dispatch", "Dispatch"), ("decide", "Decide"),
         ("kickoffs", "Kickoffs"), ("races", "Races"), ("planner", "Classify & plan"),
@@ -36,6 +36,10 @@ _KICKOFF_LINT_NOTE = ("Lint checks: paths that do not exist, no success section,
 _CHIP_CAP = 12
 _RACE_SCAN = 200
 _RACE_WINDOW_S = 180
+#: Races the panel draws in full before it says how many it left out. Each race
+#: is its own section with its contestants, so this is a rendering budget like
+#: :data:`_CHIP_CAP` — the data is not truncated, only the drawing is.
+_RACE_PANEL_MAX = 5
 
 
 # ── shared reads ───────────────────────────────────────────────────────────
@@ -546,9 +550,55 @@ def _race_lane(run_dir: Path) -> str:
     return "?"
 
 
-def _races(home: Path, now: int) -> dict[str, Any]:
-    """Race contestants are runs carrying ``config/agents.race.yaml``; one race =
-    the contestants launched within a few minutes on the same kickoff."""
+def _race_keep_action(
+    home: Path, race: list[dict[str, Any]], winner: dict[str, Any]
+) -> tuple[dict[str, Any], str]:
+    """The "keep this contestant" button, and why it is off when it is off.
+
+    The confirm is a ``race-keep --dry-run`` answer rather than a sentence the
+    page composed: the page cannot compute which worktrees a discard frees, and
+    a confirm that guessed would be asking the operator to approve numbers
+    nobody checked. A plan that cannot be built — an unreadable kickoff, a
+    worktree already gone — disables the button, because a keep that would be
+    refused on click is worse than one that is visibly off.
+
+    ``--force`` rides along: the confirm is the approval. ``merge`` records it
+    against the worktree's tree sha and then checks for it — the same thing the
+    run page's Merge button does — so this asserts an approval rather than
+    skipping the gate.
+    """
+    from mini_ork.cli.board_cmd import _act_race_keep
+
+    winner_id = str(winner["id"])
+    siblings = [str(c["id"]) for c in race if str(c["id"]) != winner_id]
+    label = f"Keep {winner['lane']}"
+    plan = _act_race_keep(home, winner_id, siblings, dry_run=True)
+    if plan.get("ok") is not True:
+        return S.btn(label, None, "ghost"), str(plan.get("error") or "the plan was refused")
+
+    kept = f"{winner['lane']} ({winner_id})"
+    dropped = " · ".join(f"{c['lane']} ({c['id']})" for c in race if str(c["id"]) != winner_id)
+    frees = ", ".join(str(path) for path in (plan.get("frees") or []))
+    argv = ["board", "race-keep", winner_id]
+    for sibling in siblings:
+        argv += ["--discard", sibling]
+    return (
+        S.btn(label, S.cli(*argv, "--force", confirm=(
+            f"Keep {kept}. Discard {dropped or 'nothing'}. "
+            f"Frees: {frees or 'no worktree — this race used in-place workspaces'}.")), "primary"),
+        "",
+    )
+
+
+def _races(home: Path, now: int) -> list[dict[str, Any]]:
+    """One section per race — the contestants *are* the decision input.
+
+    A race is the contestants launched on one kickoff within a few minutes of
+    each other (``config/agents.race.yaml`` marks a contestant). The panel used
+    to be one row per race, which named neither the lane being kept nor the
+    worktrees being given up — and those are exactly what ``board race-keep``
+    needs, so the decision belonged somewhere the candidates were not on screen.
+    """
     open_ws: set[str] = set()
     wt_dir = home / "worktrees"
     if wt_dir.is_dir():
@@ -569,37 +619,79 @@ def _races(home: Path, now: int) -> dict[str, Any]:
                 break
         else:
             races.append([{**c, "_key": key, "_start": start}])
-    rows = []
-    for race in races:
-        lanes = " · ".join(c["lane"] for c in race)
-        verified = sum(1 for c in race if c.get("status") == "published")
-        open_n = sum(1 for c in race if c["id"] in open_ws)
-        cost = sum(float(c.get("cost_usd") or 0) for c in race)
-        kept = S.cell(f"undecided · {open_n} open", "yellow") if open_n else S.muted("—")
-        title = race[0]["_key"] or race[0]["id"]
-        rows.append({"cells": [title, S.muted(lanes),
-                               S.cell(f"{verified} / {len(race)}", "green" if verified else "red"),
-                               kept, S.mono(S.money(cost)), S.muted(S.age(race[0]["_start"], now))],
-                     "do": S.open_run(str(race[0]["id"]), title)})
-    if not rows:
-        rows = [[S.muted("No races yet — /race <task> runs one task on several models"), "", "", "", "", ""]]
+
     lanes_env = os.environ.get("MO_RACE_LANES")
     note = (f"Default lanes come from MO_RACE_LANES ({lanes_env})." if lanes_env
             else "Default lanes: MO_RACE_LANES, else the race picks from your configured lanes.")
-    return S.table("Races", [S.col(fr=1), S.col(150), S.col(70), S.col(110), S.col(60), S.col(50)],
-                   ["task", "lanes", "verified", "kept", "cost", "age"], rows, full=True,
-                   note=note + " A race costs about one run per model.",
-                   actions=[S.btn("New race", S.thread("/race "))])
+    note += " A race costs about one run per model."
+
+    if not races:
+        return [S.lst("Races", [S.item(
+            "No races yet", "/race <task> runs one task on several models",
+            acts=[S.btn("New race", S.thread("/race "), "primary")])], full=True, note=note)]
+
+    sections: list[dict[str, Any]] = []
+    for race in races[:_RACE_PANEL_MAX]:
+        title = race[0]["_key"] or str(race[0]["id"])
+        rows = []
+        for c in race:
+            passed, total = verifier_check_counts(c["run_dir"])
+            open_here = str(c["id"]) in open_ws
+            rows.append({
+                "cells": [
+                    S.cell(str(c["lane"]), "text", b=True),
+                    S.mono(str(c["id"])),
+                    S.cell(str(c.get("status") or ""), "sub"),
+                    S.cell(f"{passed}/{total}" if total else "—",
+                           "green" if total and passed == total else
+                           ("yellow" if total else "sub"), mono=True),
+                    S.mono(S.money(float(c.get("cost_usd") or 0))),
+                    # An open workspace is the worktree a keep would free; the
+                    # em dash says there is none to free, not that it is unknown.
+                    S.cell("open" if open_here else "—", "yellow" if open_here else "sub"),
+                ],
+                "acts": [S.btn("Open run", S.open_run(str(c["id"]), title), "ghost")],
+            })
+
+        actions: list[dict[str, Any]] = []
+        refusals: list[str] = []
+        for c in race:
+            action, why = _race_keep_action(home, race, c)
+            actions.append(action)
+            if why:
+                refusals.append(f"{c['lane']}: {why}")
+        detail = (f"{len(race)} contestants · started {S.age(race[0]['_start'], now)} · "
+                  f"keeping one merges it and discards the others. ")
+        detail += ("No keep is offered — " + "; ".join(refusals) if refusals else
+                   "The confirm names the runs discarded and the worktrees freed.")
+        sections.append(S.table(
+            f"Race · {title}",
+            [S.col(fr=1.4), S.col(fr=2.2), S.col(90), S.col(70), S.col(60), S.col(70)],
+            ["lane", "run", "outcome", "checks", "cost", "worktree"],
+            rows, full=True, note=detail, actions=actions,
+        ))
+    if len(races) > _RACE_PANEL_MAX:
+        sections.append(S.lst("Earlier races", [S.item(
+            f"{len(races) - _RACE_PANEL_MAX} more race(s) decided or awaiting a decision",
+            "Newest first — the panel draws the most recent ones in full.",
+            mc="sub")], full=True))
+    # The lanes note and the button that starts a race describe how a race is
+    # set up, which is not any one race's story — so they get their own line
+    # rather than riding on the newest contestant table.
+    sections.append(S.lst("Race lanes", [S.item("How lanes are chosen", note, mc="sub")],
+                          full=True, actions=[S.btn("New race", S.thread("/race "))]))
+    return sections
 
 
 def _kickoff_key(home: Path, run: dict[str, Any]) -> str:
-    from mini_ork.acp.history import _read_kickoff, _title_from_kickoff
+    """One run's task identity — see :func:`mini_ork.acp.history.kickoff_key`.
 
-    try:
-        text = _read_kickoff(home, str(run["id"]), run.get("kickoff_path"))
-    except Exception:  # noqa: BLE001
-        return ""
-    return _title_from_kickoff(text) or text[:80]
+    ``board race-keep`` refuses a discard whose run does not share the winner's
+    key, so the two must not spell "the same task" differently.
+    """
+    from mini_ork.acp.history import kickoff_key
+
+    return kickoff_key(home, str(run["id"]), run.get("kickoff_path"))
 
 
 # ── classify & plan ────────────────────────────────────────────────────────
@@ -1299,16 +1391,25 @@ def _intake(home: Path, errors: dict[str, str]) -> list[dict[str, Any]]:
         state, colour = _SOURCE_STATE[(status.registered, status.enabled)]
         detail = status.skipped_reason or status.sync_error or ""
         rows.append(
-            [
-                S.cell(status.source, "text", b=True),
-                S.cell(state, colour),
-                S.cell(_trigger_text(status.trigger), "sub" if not status.trigger.configured
-                       else "text"),
-                S.cell(status.trigger.recipe or "—", "sub", mono=True),
-                S.cell(str(status.mirrored), "sub", mono=True),
-                S.cell(status.synced_at or "never", "sub"),
-                S.cell(detail, "red" if status.sync_error else "sub"),
-            ]
+            {
+                "cells": [
+                    S.cell(status.source, "text", b=True),
+                    S.cell(state, colour),
+                    S.cell(_trigger_text(status.trigger),
+                           "sub" if not status.trigger.configured else "text"),
+                    S.cell(status.trigger.recipe or "—", "sub", mono=True),
+                    S.cell(str(status.mirrored), "sub", mono=True),
+                    S.cell(status.synced_at or "never", "sub"),
+                    S.cell(detail, "red" if status.sync_error else "sub"),
+                ],
+                # On demand, one source at a time — the same verb the tab's own
+                # "Poll now" runs, narrowed by `--source`. A source the registry
+                # never built has no adapter to call, so it gets no button
+                # rather than one that fails on stderr when pressed.
+                "acts": [S.btn("Sync", S.cli("intake", "once", "--source", status.source, confirm=(
+                    f"Poll {status.source} now? Every trigger it satisfies starts a run."
+                )), "ghost")] if status.registered else [],
+            }
         )
     sections: list[dict[str, Any]] = [
         S.table(
@@ -1345,29 +1446,53 @@ def _intake(home: Path, errors: dict[str, str]) -> list[dict[str, Any]]:
 
 def _arrivals(home: Path) -> dict[str, Any]:
     """The intake ledger, newest first — what a trigger acted on, and what folded."""
+    # `run_id` arrives with migration 0075 and its runtime twin, and a page can
+    # be the first thing to open a state.db an older release wrote — the IDE
+    # never migrates a home. So the column is probed, not assumed: on a ledger
+    # that has not widened yet the arrivals still render, every run an em dash,
+    # which is precisely what those rows recorded. Assuming the column would
+    # make `_rows` swallow the OperationalError and blank the whole table.
+    has_run_id = bool(_rows(
+        home, "SELECT 1 FROM pragma_table_info('intake_events') WHERE name = 'run_id'"
+    ))
+    columns = ("provider, action, issue_uid, thread_id" + (", run_id" if has_run_id else "")
+               + ", created_at")
     records = _rows(
         home,
-        "SELECT provider, action, issue_uid, thread_id, created_at FROM intake_events "
-        "ORDER BY id DESC LIMIT 25",
+        f"SELECT {columns} FROM intake_events ORDER BY id DESC LIMIT 25",
     )
-    rows = [
-        [
-            S.cell(record.get("provider") or "", "text", b=True),
-            S.cell(record.get("action") or "", _ACTION_TONE.get(str(record.get("action")), "sub")),
-            S.mono(record.get("issue_uid") or "—"),
-            S.mono(record.get("thread_id") or "—"),
-            S.cell(str(record.get("created_at") or ""), "sub"),
-        ]
-        for record in records
-    ]
+    rows = []
+    for record in records:
+        run_id = str(record.get("run_id") or "")
+        rows.append(
+            {
+                "cells": [
+                    S.cell(record.get("provider") or "", "text", b=True),
+                    S.cell(record.get("action") or "",
+                           _ACTION_TONE.get(str(record.get("action")), "sub")),
+                    S.mono(record.get("issue_uid") or "—"),
+                    S.mono(record.get("thread_id") or "—"),
+                    # An arrival that started no run — a replay that folded into
+                    # a live one, or a row written before the column existed —
+                    # says so with an em dash. That is a claim, and an empty
+                    # cell would read as a link that failed to draw.
+                    S.mono(run_id or "—", "sub" if not run_id else None),
+                    S.cell(str(record.get("created_at") or ""), "sub"),
+                ],
+                # Only a row that named a run gets the button: with nothing to
+                # open the action is absent, not disabled.
+                "acts": [S.btn("Open run", S.open_run(run_id), "ghost")] if run_id else [],
+            }
+        )
     return S.table(
         "Recent arrivals",
-        [S.col(fr=1.0), S.col(90), S.col(fr=2.0), S.col(fr=2.0), S.col(fr=1.4)],
-        ["source", "action", "issue", "thread", "when"],
+        [S.col(fr=1.0), S.col(90), S.col(fr=2.0), S.col(fr=2.0), S.col(fr=2.0), S.col(fr=1.4)],
+        ["source", "action", "issue", "thread", "run", "when"],
         rows,
         full=True,
         note="The ledger that makes a webhook replay or a re-poll a no-op: one row per "
-             "arrival, keyed by provider and delivery id.",
+             "arrival, keyed by provider and delivery id. `run` is the run the arrival "
+             "started; an em dash means it started none.",
     )
 
 

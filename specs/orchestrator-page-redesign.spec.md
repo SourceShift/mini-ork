@@ -54,11 +54,13 @@ or a shell.
 
 | Phase | Contents | Journeys | Risk |
 |---|---|---|---|
-| **P0 — Wiring** | No new verbs, no schema. Six payload fixes composing existing data. | J3, J4, J7, J8, J10 | Low |
-| **P1 — Dispatch** | `board start`, `kickoff new`, the Dispatch tab. | J1, J3 | Medium — spawns processes |
-| **P2 — Answers** | Recent-run profile scan, `board answer`, the blocked-on-you panel. | J5, J9 | Low |
-| **P3 — Races** | `board race-keep`, `intake_events.run_id`, arrivals link. | J2, J6 | Medium — schema + git merge |
+| **P0 — Wiring** ✅ | No new verbs, no schema. Six payload fixes composing existing data. | J3, J4, J7, J8, J10 | Low |
+| **P1 — Dispatch** ✅ | `board start`, `kickoff new`, the Dispatch tab. | J1, J3 | Medium — spawns processes |
+| **P2 — Answers** ✅ | Recent-run profile scan, `board answer`, the blocked-on-you panel. | J5, J9 | Low |
+| **P3 — Races** ✅ | `board race-keep`, `intake_events.run_id`, arrivals link, the race panel. | J2, J6 | Medium — schema + git merge |
 | **P4 — Attention** | The strip, once its four inputs exist. | all | Low |
+
+✅ = implemented (P0 2026-10-15, P1–P3 2026-10-16). P4 is the only phase left.
 
 Each phase is independently shippable and independently revertable. P0 delivers
 user-visible improvement with **zero new CLI surface** — it is the recommended first
@@ -307,11 +309,26 @@ approver=None)` both take a resolved `Workspace`, and `board_cmd.act` resolves i
   **shall** report per-run outcomes, so a partial failure is stated rather than
   masked. The overall result **shall** be `ok: False` when any step failed, and
   **shall** name which step.
-- **The system shall** record the operator identity as `approver`, using the same
-  `ide:<user>` fallback `act` already applies.
-- **When** `--force` is absent and the review policy requires approval, **the system
-  shall** propagate the merge gate's refusal (`needs_approval`) rather than bypassing
-  it.
+- **When** the merge is refused, **the system shall** stop before the first discard.
+  *(Safety: dropping the runners-up when the winner did not land leaves the race with
+  nothing, so "nothing is discarded unless the merge landed" is a rule, not an
+  ordering accident.)*
+- **The system shall** pass the operator identity as `approver` to every discard,
+  using the same `ide:<user>` fallback `act` already applies. *(A discard's approver is
+  an audit/rejection record — `discard` marks the pending approval row `rejected` — and
+  discarding never needs an approval, so it is always supplied.)*
+- **When** `--force` is absent, **the system shall** pass **no** approver to the merge
+  and **shall** propagate the merge gate's refusal (`needs_approval`), leaving the race
+  as it was. *(`merge`'s `approver` parameter **is** the approval: supplying one
+  records it. Absent `--force`, the verb has no human approval to record and the gate
+  must decide.)*
+- **When** `--force` is present, **the system shall** record the operator identity as
+  the merge's approver against the tree's sha. *(This is the reading `board merge` and
+  the run page's Merge button already follow: `--force` does not bypass the gate, it
+  answers it.)*
+- **The system shall** resolve the winner and every discard through the same
+  `workspaces.load` the page's grouping uses, and **shall** refuse the whole act when
+  the winner has no open workspace.
 
 #### FR-031: The intake ledger records which run an arrival started
 `intake_events` has no `run_id` (verified schema: `id, provider, delivery_id,
@@ -322,7 +339,9 @@ runs, so the thread is not a proxy for the run.
 - **The system shall** add a nullable `run_id TEXT` column to `intake_events`.
 - **The system shall** add the column on **both** schema paths: to `SCHEMA_SQL` in
   `mini_ork/threads/store.py` (fresh databases) **and** as migration
-  `db/migrations/0074_intake_events_run_id.sql` (existing databases).
+  `db/migrations/0075_intake_events_run_id.sql` (existing databases). *(Correction made
+  during implementation: this spec first cited `0074`, which was already taken; the
+  number is allocated at write time, not at spec time.)*
 - **Because** `ensure_schema` runs only `CREATE TABLE IF NOT EXISTS` statements and
   SQLite's `ALTER TABLE` has no `IF NOT EXISTS`, **the system shall** guard the
   upgrade with a `PRAGMA table_info` check before the `ALTER`, following the existing
@@ -334,15 +353,32 @@ runs, so the thread is not a proxy for the run.
 - **`record_intake_event` shall** accept an optional `run_id` and persist it, defaulting
   to `None` so existing callers are unaffected.
 - **`intake/dispatch.py` shall** pass the run id when it has one, from the point where
-  the run is actually started.
+  the run is actually started. *(Implementation note: `intake/report.py`'s
+  `record_intake_event` call deliberately still passes none. It records a **reported**
+  arrival — the ledger row for a ticket the reporter described — which starts no run by
+  construction, so the default is the correct answer there, not a missed call site.)
+  `dispatch.py` is the only caller that starts runs, and it is the only one that
+  changed.*
 
 #### FR-032: Arrivals link to their runs; old rows degrade
 - **The engine shall** render the arrivals ledger's run cell as an openable run when
   `run_id` is present.
 - **When** `run_id` is NULL — every row written before this feature — **the engine
   shall** render an em dash, not an error and not an empty action.
+- **When** `run_id` is NULL, **the engine shall** render no run action at all. *(Absent,
+  not disabled: a disabled button implies the state is temporary. An arrival that
+  started no run will never have one to open.)*
+- **The engine shall** probe whether the `run_id` column exists before selecting it,
+  and **shall** render the ledger without it when it does not. *(The IDE never migrates
+  a home, so a page can be the first thing to open a `state.db` an older release wrote.
+  `_rows` swallows `sqlite3.OperationalError` into `[]`, so assuming the column would
+  not raise — it would silently blank every row the ledger has, which is the failure
+  this requirement exists to prevent.)*
 - **The engine shall** render a per-source sync action using the existing
   `intake once --source <S>` verb, so a source can be polled on demand.
+- **When** a source is not registered, **the engine shall** render no sync action for
+  it — there is no adapter to call, and a button that fails on stderr is worse than no
+  button.
 
 #### FR-033: Race decision panel
 - **The engine shall** render one entry per race, not one table row per race, because
@@ -352,7 +388,24 @@ runs, so the thread is not a proxy for the run.
 - **The engine shall** render each "keep" action as `S.cli("board","race-keep",<winner>,
   "--discard",<sibling>,...)` carrying a `confirm` that names the run being kept, the
   runs being discarded, and the worktrees freed — populated from a `--dry-run` result
-  so the numbers are real, not estimated by the page.
+  so the numbers are real, not estimated by the page. *(The emitted argv carries
+  `--force` because the confirm **is** the human approval, the same doctrine the run
+  page's Merge button follows; `--force` records the approval rather than bypassing the
+  gate — see FR-030.)*
+- **The engine shall** render a keep action as disabled, with the reason stated in the
+  section note, when the plan cannot be built. *(A button that refuses on click is a
+  worse answer than one that says why it is off.)*
+- **The engine shall** draw only the newest `_RACE_PANEL_MAX` races in full and
+  **shall** summarise the remainder behind a single "Earlier races" entry.
+- **The engine shall** group a run by its kickoff's title. **When** a kickoff cannot be
+  read, **the engine shall** draw that run as its own race rather than guessing it into
+  someone else's. *(Fail-closed has a visible cost — the run appears alone — and that is
+  the correct direction when the next step discards worktrees. `board race-keep` refuses
+  on the same read, via the shared `acp.history.kickoff_key`.)*
+- **The engine shall** take the per-contestant check counts from the same helper the
+  run's outcome card uses (`run.verifier_check_counts`), so the two pages cannot report
+  different numbers for the same run. *(This is P2's "no re-walk" point honoured: the
+  race panel shares the definition rather than re-deriving it.)*
 
 ### Phase 4 — Attention
 
@@ -431,6 +484,13 @@ Each maps to one of the ten engineer journeys.
 **When** the engineer opens the Intake tab,
 **Then** the arrivals row for that ticket shows the run id as an openable action, and the row's action reads `launched`.
 
+*Satisfied by FR-031 + FR-032 — unit-level. Unit evidence:
+`test_an_arrival_that_started_a_run_links_to_it` (the row's fifth cell is the run id
+and its act is `Open run`, `do.run == "run-abc"`);
+`test_an_arrival_that_started_no_run_says_so_and_offers_nothing`. The live half — a
+real ticket through `intake/dispatch.py` into the ledger — is unrun; see the
+cross-cutting live-replay item.*
+
 ### AC-003: J3 — Draft, lint, run
 **Given** no saved kickoff matches the task,
 **When** the engineer types a sentence into the new-kickoff composer and submits,
@@ -456,6 +516,17 @@ A callout that says the same finding once is the whole requirement.
 **Given** four runs sharing one kickoff, all with open worktrees,
 **When** the engineer confirms the keep action for one of them,
 **Then** exactly that run's branch is merged, the other three worktrees are discarded, and the result reports per-run outcomes — **and** when one discard fails, the result is `ok: False` and names the failed step while the other discards still complete.
+
+*Satisfied by FR-030 + FR-033 — unit-level, with the git seams replaced. Unit
+evidence: `test_keep_merges_the_winner_then_discards_the_rest` (merge order, discard
+order, `discarded`/`failed` payload);
+`test_a_partial_discard_failure_is_reported_not_masked` (rc 1, `step: "discard"`,
+`discarded == [OTHER]`, `failed == [{LOSER, …}]`, and the loop continued);
+`test_one_keep_per_contestant_naming_the_others` + the seam
+`test_the_emitted_keep_argv_is_one_the_cli_accepts` (the page's button argv parses and
+plans through the real verb). A real `git merge` against a real worktree is unrun —
+that is a side effect on the shared engine, so `workspaces.merge`/`discard` are
+stubbed here; AC-006's live replay needs a runner.*
 
 ### AC-007: J7 — Change the orchestrator lane
 **Given** the defaults read `opus`,
@@ -556,9 +627,15 @@ Stated explicitly, with cost, so a reviewer can decline them knowingly.
       Extended to all eight tabs (`session, dispatch, decide, kickoffs, races, planner,
       coord, intake`) as part of P2. `pytest tests/unit/test_ide_pages_actions.py` →
       **4 passed**, so every action on every tab parses against its own parser.
-- [ ] **Stale assertions in `tests/unit/test_ide_pages_orch.py`: 5 failures, all
-      pre-dating P2 and caused by P1's own design changes — left unfixed per the working
-      agreement (tests are not touched until the implementer's change is confirmed).**
+- [ ] **Stale assertions in `tests/unit/test_ide_pages_orch.py`: 6 failures — 5
+      pre-dating P2 and caused by P1's own design changes, plus one new one caused by
+      P3's FR-033 — all left unfixed per the working agreement (tests are not touched
+      until the implementer's change is confirmed).**
+      The sixth, `test_races_group_contestants`, asserts the pre-FR-033 shape: one
+      table row per race. FR-033 deliberately reversed that (one *section* per race, the
+      contestants as its rows) because the contestants are the decision input and the
+      Keep buttons have to sit beside them — the test's own name is now the old
+      requirement. `tests/unit/test_ide_pages_orch_races.py` is its replacement.
       None is a P2 regression; each asserts a shape P1 deliberately changed:
       `test_every_tab_builds` pins the tab key list (`dispatch` added by FR-012);
       `test_thread_defaults_follow_the_env`, `test_mcp_pills_are_the_servers_tools` and
@@ -610,12 +687,14 @@ Stated explicitly, with cost, so a reviewer can decline them knowingly.
 - [x] Cross-check — `pytest tests/unit/test_ide_pages_node.py test_ide_pages_inbox_kanban.py test_ide_pages_thread.py test_ide_header_lanes_composer.py` → **95 passed**, i.e. the shared `--text` change did not disturb `steer`.
 - [ ] **Not done, still open:** P3's classification table was to *share* this scan; when FR-033 lands, `_recent_profiles` is the seam to reuse rather than re-walk.
 
-### P3 — Races and arrivals
-- [ ] FR-031 — `run_id` column: `SCHEMA_SQL` + `db/migrations/0074_intake_events_run_id.sql` with a `PRAGMA table_info` guard; extend `record_intake_event`; wire `intake/dispatch.py`; keep the schema/migration agreement test green.
-- [ ] FR-030 — `board race-keep`: resolve both ends through `workspaces.load`, verify kickoffs match, dry-run plan, per-run outcome reporting, `needs_approval` passthrough.
-- [ ] FR-032 — arrivals run link + per-source sync via `intake once --source`.
-- [ ] FR-033 — race decision panel; `confirm` populated from a `--dry-run`.
-- [ ] Tests: migration idempotency (run it twice), a NULL `run_id` row renders an em dash, a cross-kickoff discard is refused, a partial discard failure reports honestly.
+### P3 — Races and arrivals — **implemented 2026-10-16**
+- [x] FR-031 — `run_id` column: `SCHEMA_SQL` in `mini_ork/threads/store.py` (`INTAKE_COLUMNS`) + `db/migrations/0075_intake_events_run_id.sql` with the same `.read "|sh -c …"` `PRAGMA table_info` guard 0072/0074 use; `record_intake_event` gained `run_id: str | None = None`; `intake/dispatch.py` passes it where the run is started. *Migration number corrected from this spec's `0074` to `0075` — 0074 was taken.*
+- [x] FR-030 — `board race-keep <winner> [--discard RUN_ID ...] [--dry-run] [--force]` in `mini_ork/cli/board_cmd.py` (`_act_race_keep`, `verb` choice, `--discard` append, `validate` requires the run id, usage + stderr sets updated). Resolves both ends through `workspaces.load`, verifies kickoffs match via the shared `acp.history.kickoff_key`, dry-run plan, per-run outcome reporting, `needs_approval` passthrough, and nothing discarded unless the merge landed.
+- [x] FR-032 — `orch._arrivals` probes for the column and renders the run as an openable row action when present, an em dash with no action when NULL; `orch._intake`'s Sources rows carry a per-source `intake once --source <S>` act when the source is registered.
+- [x] FR-033 — `orch._races` + `_race_keep_action`: one `S.table(f"Race · {title}")` per race with the contestants as rows (lane/run/outcome/checks/cost/worktree, each row opening its run), one Keep per contestant with a `--dry-run`-populated `confirm`, `_RACE_PANEL_MAX = 5` newest in full plus an "Earlier races" summary.
+- [x] Tests — `tests/unit/test_board_race_keep.py` (15) + `tests/unit/test_ide_pages_orch_races.py` (14) + `tests/unit/test_ide_pages_orch_arrivals.py` (8) + 4 appended to `tests/unit/test_threads_store.py` (now 21), **58 passed**. Covered: dry-run touches nothing; an adopted worktree is not reported as freed; a repeated `--discard` is one worktree; cross-kickoff and unreadable-kickoff refusals call nothing; a winner with no workspace refuses; discarding the winner refuses; a missing run id exits 2; the merge message names the run; without `--force` the merge asserts no approval while the discard still records `ide:`; a refused merge stops before the first discard; a partial discard failure reports `discarded`/`failed` and continues; the reason reaches stderr. Pages: one section per race with exact argv and confirm text; the seam test feeds the emitted Keep argv back through `board_cmd.main([*argv[1:], "--dry-run", …])`; a keep that cannot be planned is off with the reason in the note; an unreadable kickoff makes a run its own race; the arrivals seam runs the emitted Sync argv through `intake_cmd.main` and asserts nothing started; the ledger renders without the column.
+- [x] Cross-check — `test_ide_pages_orch.py + test_ide_pages_actions.py + test_ide_pages_orch_decide.py + test_code_findings.py` → **supplemented**, see the stale-assertion note under P0.
+- [ ] **Not done, still open:** nothing functional. The P2 note stands — FR-033 shares `run.verifier_check_counts` rather than re-walking; the classification table (P4-adjacent) remains the only thing that would want `_recent_profiles`.
 
 ### P4 — Attention
 - [ ] FR-040 — the `triage` strip prepended to every tab; omitted when empty; counts shared with the tabs.

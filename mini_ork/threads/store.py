@@ -109,6 +109,18 @@ SCHEMA_SQL: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_intake_events_thread ON intake_events(thread_id)",
 )
 
+#: Columns 0075 adds to an ``intake_events`` that predates it, as
+#: ``(name, declaration)``. ``0075_intake_events_run_id.sql`` carries the same
+#: pair, and ``tests/unit/test_threads_store.py`` holds the two together.
+#:
+#: They are not in :data:`SCHEMA_SQL`'s ``CREATE``: that text has to stay
+#: byte-identical to ``0070_threads.sql`` (the agreement test above pins it), and
+#: editing a shipped migration trips the checksum-drift guard in
+#: ``mini_ork/stores/migrate.py``. So an existing ledger is widened by
+#: :func:`_ensure_intake_columns` instead — the same shape ``mini_ork/pm/store.py``
+#: uses for its body-cache columns.
+INTAKE_COLUMNS: tuple[tuple[str, str], ...] = (("run_id", "TEXT"),)
+
 
 def _db_path(db: str | None) -> str:
     """Explicit path → ``MINI_ORK_DB`` → ``$MINI_ORK_HOME/state.db``.
@@ -146,6 +158,7 @@ def _write(db: str | None) -> Iterator[sqlite3.Connection]:
         con.execute("BEGIN IMMEDIATE")
         for statement in SCHEMA_SQL:
             con.execute(statement)
+        _ensure_intake_columns(con)
         yield con
         con.commit()
     except Exception:
@@ -155,12 +168,30 @@ def _write(db: str | None) -> Iterator[sqlite3.Connection]:
         con.close()
 
 
+def _ensure_intake_columns(con: sqlite3.Connection) -> None:
+    """Add 0075's columns to an existing ``intake_events``, once.
+
+    The runtime half of the migration, for a ledger that predates it: a
+    ``CREATE TABLE IF NOT EXISTS`` cannot widen a table that already exists, so
+    without the ``ALTER`` here the first ``record_intake_event`` on an old
+    state.db fails on the unknown column. Same ``PRAGMA table_info`` check
+    ``mini_ork/pm/store.py``'s ``_ensure_body_columns`` uses.
+    """
+    have = {record[1] for record in con.execute("PRAGMA table_info(intake_events)")}
+    if not have:
+        return  # no table yet: SCHEMA_SQL has not run, or the db is not ours
+    for name, decl in INTAKE_COLUMNS:
+        if name not in have:
+            con.execute(f"ALTER TABLE intake_events ADD COLUMN {name} {decl}")
+
+
 def ensure_schema(db: str | None = None) -> None:
     """Idempotent: safe on every open, and on a database that never migrated."""
     con = _conn(db)
     try:
         for statement in SCHEMA_SQL:
             con.execute(statement)
+        _ensure_intake_columns(con)
         con.commit()
     finally:
         con.close()
@@ -219,6 +250,7 @@ def _intake_from(record: sqlite3.Row) -> IntakeEvent:
         action=record["action"],
         detail=record["detail"],
         created_at=record["created_at"],
+        run_id=record["run_id"],
     )
 
 
@@ -637,6 +669,7 @@ def record_intake_event(
     thread_id: str | None = None,
     action: str | None = None,
     detail: str | None = None,
+    run_id: str | None = None,
     db: str | None = None,
 ) -> IntakeEvent:
     """Record what an intake trigger did with one event. Idempotent per delivery.
@@ -644,14 +677,21 @@ def record_intake_event(
     A replayed webhook or a re-poll carries the same ``(provider, delivery_id)``;
     the unique index folds that to one row and the stored ``action`` is returned
     unchanged, so the caller can see it already happened rather than acting twice.
+
+    ``run_id`` is the run the arrival started, when it started one. The thread is
+    not a proxy for it — one thread carries several attempts — so a caller that
+    knows the run passes it; the default keeps every older caller writing the
+    same row it always did.
     """
     now = _now()
     with _write(db) as con:
         con.execute(
             "INSERT OR IGNORE INTO intake_events "
-            "(provider, delivery_id, payload_hash, issue_uid, thread_id, action, detail, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (provider, delivery_id, payload_hash, issue_uid, thread_id, action, detail, now),
+            "(provider, delivery_id, payload_hash, issue_uid, thread_id, action, detail, "
+            "run_id, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (provider, delivery_id, payload_hash, issue_uid, thread_id, action, detail,
+             run_id, now),
         )
         record = con.execute(
             "SELECT * FROM intake_events WHERE provider = ? AND delivery_id = ?",

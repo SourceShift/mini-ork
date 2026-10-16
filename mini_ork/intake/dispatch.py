@@ -267,6 +267,10 @@ def dispatch_issue(
         thread_id=thread_id,
         action=delivery.action,
         detail=delivery.detail,
+        # The ledger row is written here because here is where both halves are
+        # known — ``delivery`` is what started or steered the run, so this is
+        # the one place the arrival and its run meet.
+        run_id=delivery.run_id,
         db=db,
     )
     return Dispatch(

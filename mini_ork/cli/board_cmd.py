@@ -9,6 +9,9 @@ truth.
                                       workspaces, scheduler — one document
   board run <run_id> [--home H]       one run's card (markdown) + its open workspace
   board merge|discard <run_id>        act on a run's workspace
+  board race-keep <winner> [--discard RUN_ID ...] [--dry-run] [--force]
+                                      keep one race contestant: merge the winner,
+                                      discard the runners-up (same kickoff only)
   board stop <run_id>                 soft-stop a running run
   board kill <run_id>                 SIGTERM then SIGKILL after 2 s
   board resume <run_id>               resume a cost-paused run
@@ -940,6 +943,150 @@ def _act_answer(home: Path, run_id: str, texts: list[str],
     return result
 
 
+def _kickoff_paths(home: Path, run_ids: list[str]) -> dict[str, str | None]:
+    """``task_runs.kickoff_path`` for each id — the authoritative kickoff path.
+
+    :func:`mini_ork.acp.history.kickoff_key` falls back to
+    ``<home>/runs-inbox/<run_id>.md`` when handed ``None``, which covers what
+    ``control.launch_run`` stages. Reading the column first keeps the identity
+    check working for a run whose kickoff was written somewhere else.
+    """
+    if not run_ids:
+        return {}
+    from mini_ork.web.db import db_for
+
+    placeholders = ", ".join("?" for _ in run_ids)
+    try:
+        rows = db_for(home).rows(
+            f"SELECT id, kickoff_path FROM task_runs WHERE id IN ({placeholders})",
+            tuple(run_ids),
+        )
+    except Exception:  # noqa: BLE001 — no db just means the inbox fallback is used
+        return {}
+    return {str(row["id"]): row.get("kickoff_path") for row in rows}
+
+
+def _act_race_keep(
+    home: Path,
+    winner_run_id: str,
+    discards: list[str],
+    *,
+    dry_run: bool = False,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Keep one contestant of a race: merge the winner, discard the runners-up.
+
+    One call because the IDE action vocabulary cannot chain ``merge && discard
+    && discard``, and the half-decided race — winner merged, runners-up still
+    holding worktrees — is the state this verb exists to prevent.
+
+    Two safety rules, both fail-closed:
+
+    * **Every discard must share the winner's kickoff.** The page supplies the
+      sibling ids it displayed and a page is not a witness: an id from another
+      race would throw away a different task's work. An unreadable kickoff is
+      ``""``, and ``""`` never matches — not even another ``""``, because "could
+      not prove the same" must not read as "proved the same".
+    * **Nothing is discarded unless the merge landed.** Dropping the runners-up
+      when the winner did not make it leaves the race with nothing at all, so a
+      refused merge — including the review gate's ``needs_approval`` — stops the
+      call before the first discard.
+
+    ``--dry-run`` returns the plan (winner, the runs to discard, the worktrees
+    that would be freed) and touches nothing, so a caller can build a confirm
+    from real numbers instead of estimating them. ``--force`` is what supplies
+    the operator's approval to the merge; without it the review policy decides
+    and its refusal is propagated verbatim, ``needs_approval`` intact.
+    """
+    from mini_ork import workspaces
+    from mini_ork.acp.history import kickoff_key
+
+    winner = workspaces.load(home, winner_run_id)
+    if winner is None:
+        return {"ok": False, "step": "winner", "run_id": winner_run_id,
+                "error": f"run {winner_run_id} has no open workspace"}
+
+    targets: list[str] = []
+    for run_id in discards:
+        if run_id == winner_run_id:
+            return {"ok": False, "step": "plan", "run_id": run_id, "error":
+                    f"--discard names the winner ({run_id}) — keep it or discard "
+                    f"it, not both"}
+        if run_id not in targets:
+            targets.append(run_id)
+
+    paths = _kickoff_paths(home, [winner_run_id, *targets])
+    winner_key = kickoff_key(home, winner_run_id, paths.get(winner_run_id))
+    if not winner_key:
+        return {"ok": False, "step": "plan", "run_id": winner_run_id, "error":
+                f"the kickoff of {winner_run_id} cannot be read, so no discard can "
+                f"be checked against it — refusing rather than guessing"}
+    planned: list[dict[str, Any]] = []
+    for run_id in targets:
+        ws = workspaces.load(home, run_id)
+        if ws is None:
+            return {"ok": False, "step": "plan", "run_id": run_id,
+                    "error": f"run {run_id} has no open workspace"}
+        key = kickoff_key(home, run_id, paths.get(run_id))
+        if key != winner_key:
+            return {"ok": False, "step": "plan", "run_id": run_id, "error":
+                    f"run {run_id} is not a contestant of the same race as "
+                    f"{winner_run_id} (kickoff {key or 'unreadable'} vs "
+                    f"{winner_key}) — refusing to discard it"}
+        # An adopted worktree belongs to Zed: discarding the run resets it but
+        # frees no directory, and a confirm that promised otherwise would lie.
+        planned.append({"run_id": run_id, "worktree": str(ws.path),
+                        "frees_worktree": not ws.adopted})
+
+    plan: dict[str, Any] = {
+        "winner": winner_run_id,
+        "merge_worktree": str(winner.path),
+        "discard": planned,
+        "frees": [entry["worktree"] for entry in planned if entry["frees_worktree"]],
+    }
+    if dry_run:
+        return {"ok": True, "dry_run": True, **plan}
+
+    import getpass
+    try:
+        approver = f"ide:{getpass.getuser()}"
+    except (OSError, KeyError):
+        approver = "ide:unknown"
+
+    title = _title_for(home, winner_run_id)
+    message = f"{title} (mini-ork {winner_run_id})" if title else f"mini-ork run {winner_run_id}"
+    merged = workspaces.merge(winner, message=message,
+                              approver=approver if force else None)
+    if merged.get("ok") is not True:
+        out: dict[str, Any] = {"ok": False, "step": "merge", "run_id": winner_run_id,
+                               "merge": merged, **plan}
+        if merged.get("needs_approval"):
+            out["needs_approval"] = True
+        return out
+
+    discarded: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    for entry in planned:
+        # Re-loaded rather than reused: the merge above committed and deleted the
+        # winner's record, and a discard resolves its own record path.
+        ws = workspaces.load(home, entry["run_id"])
+        if ws is None:
+            failed.append({"run_id": entry["run_id"], "error": "workspace disappeared"})
+            continue
+        result = workspaces.discard(ws, approver=approver)
+        if result.get("ok") is True:
+            discarded.append({"run_id": entry["run_id"], "worktree": entry["worktree"]})
+        else:
+            failed.append({"run_id": entry["run_id"],
+                           "error": str(result.get("error") or "discard failed")})
+
+    out = {"ok": not failed, "merged": True, "merge": merged,
+           "discarded": discarded, "failed": failed, **plan}
+    if failed:
+        out["step"] = "discard"
+    return out
+
+
 def _clamp_runs_verb_args(offset: int, limit: int) -> tuple[int, int]:
     """Sanitise the verb's offset/limit — ``argparse`` only checks types."""
     if offset < 0:
@@ -1224,6 +1371,7 @@ def main(rest: list[str], root: str) -> int:
                          "[node <run_id> <node_id> [--view V] [--offset N]] "
                          "[steer <run_id> --role R --severity S --text TEXT] "
                          "[answer <run_id> --text T [--for Q ...]] "
+                         "[race-keep <winner> [--discard RUN_ID ...] [--dry-run] [--force]] "
                          "[retry <run_id> [--ack-change] [--force] [--dry-run]] "
                          "[checkpoints <run_id>] "
                          "[restore <run_id> <node> [--force]] "
@@ -1246,7 +1394,7 @@ def main(rest: list[str], root: str) -> int:
         # keep the pre-kickoff behaviour of exiting 1 silently — touching
         # their stderr output would change behaviour the existing test
         # suite (and other tooling) already expects.
-        if args.verb in ("restore", "checkpoints", "start", "answer"):
+        if args.verb in ("restore", "checkpoints", "start", "answer", "race-keep"):
             reason = payload.get("reason") or payload.get("error")
             if reason:
                 sys.stderr.write(f"{reason}\n")
@@ -1299,6 +1447,9 @@ def validate(args) -> str | None:
     elif args.verb == "start":
         if not args.kickoff:
             return "mini-ork board start: --kickoff <path> is required"
+    elif args.verb == "race-keep":
+        if not args.run_id:
+            return "mini-ork board race-keep: a winner run id is required"
     elif args.verb != "show" and args.verb != "runs" and not args.run_id:
         what = "a page key" if args.verb == "page" else "a run id"
         return f"mini-ork board {args.verb}: {what} is required"
@@ -1356,6 +1507,9 @@ def build_payload(home: Path, args) -> dict[str, Any]:
                              args.role, args.severity)
     elif args.verb == "answer":
         payload = _act_answer(home, args.run_id, args.text or [], args.answer_for)
+    elif args.verb == "race-keep":
+        payload = _act_race_keep(home, args.run_id, args.race_discard,
+                                 dry_run=args.dry_run, force=args.force)
     elif args.verb == "retry":
         payload = _act_retry(home, args.run_id,
                              ack_change=args.ack_change, force=args.force,
@@ -1408,7 +1562,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("verb", nargs="?", default="show",
                         choices=["show", "run", "merge", "discard", "dismiss", "stop", "kill",
                                  "resume", "retry", "gate", "page", "node", "steer", "answer",
-                                 "runs", "checkpoints", "restore", "start"])
+                                 "runs", "checkpoints", "restore", "start", "race-keep"])
     parser.add_argument("run_id", nargs="?")
     # `gate approve|reject <inbox_id>` puts the action in run_id and the id here;
     # `node <run_id> <node_id>` uses the same slot for the node id (the L464
@@ -1443,9 +1597,17 @@ def build_parser() -> argparse.ArgumentParser:
                              "(otherwise the verb refuses to spawn).")
     parser.add_argument("--force", action="store_true",
                         help="retry: bypass the retryable=false gate (e.g. for "
-                             "case-3 'code' revisions).")
+                             "case-3 'code' revisions). race-keep: supply the "
+                             "operator's merge approval, so a review policy of "
+                             "before_merge=required is satisfied rather than refused.")
     parser.add_argument("--dry-run", action="store_true",
-                        help="retry: return the hint only, never spawn.")
+                        help="retry: return the hint only, never spawn. race-keep: "
+                             "return the plan (winner, discards, freed worktrees) "
+                             "and perform no merge and no discard.")
+    parser.add_argument("--discard", dest="race_discard", action="append", default=[],
+                        help="race-keep: a contestant to discard alongside the winner "
+                             "(repeatable). Every id must belong to the same race as "
+                             "the winner.")
     parser.add_argument("--undo", action="store_true",
                         help="dismiss: clear the run's dismissal marker, so the "
                              "inbox shows it again. A dismissal hides a row, it "

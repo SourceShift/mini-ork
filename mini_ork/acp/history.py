@@ -108,6 +108,26 @@ def _title_from_kickoff(text: str) -> str:
     return ""
 
 
+def kickoff_key(home: Path, run_id: str, kickoff_path: str | None = None) -> str:
+    """What makes two runs "the same task" — the kickoff's title, or its head.
+
+    Two callers need the same answer and must not answer it differently: the
+    races page groups contestants by it, and ``board race-keep`` refuses a
+    discard whose run does not share the winner's. So the definition lives here,
+    beside the two readers it is built from, rather than being spelled once in a
+    page and once again in the CLI.
+
+    Returns ``""`` for a kickoff that cannot be read, which both callers treat
+    as "not provably the same task" — the safe direction when the next step is
+    discarding a worktree.
+    """
+    try:
+        text = _read_kickoff(home, run_id, kickoff_path)
+    except Exception:  # noqa: BLE001 — an unreadable kickoff is "", not a crash
+        return ""
+    return _title_from_kickoff(text) or text[:80]
+
+
 def read_snapshot(home: Path, run_id: str) -> dict[str, Any]:
     """task_run status + node lifecycle events + llm_calls for ``run_id``.
 
