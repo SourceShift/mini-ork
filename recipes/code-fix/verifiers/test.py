@@ -157,10 +157,12 @@ RED_BASE_LOG = os.path.join(LOG_DIR, "verifier_red_base_base.log")
 # fail — it never ran, so no pass and no regression may be attributed to it.
 _UNRUNNABLE_RC = frozenset({"126", "127", "77"})
 # The same states, as the output reports them (the rc is often masked by a
-# wrapper script that swallows the inner exit code).
+# wrapper script that swallows the inner exit code). "binary missing" is a
+# target repo's own guard phrasing, and its exit code is 1 — see
+# ``_baseline_unrunnable``.
 _UNRUNNABLE_LOG_RE = re.compile(
     r"command not found|No such file or directory|not executable"
-    r"|\brefus(?:e|ed)\b|REFUSE:",
+    r"|\bbinary missing\b|\brefus(?:e|ed)\b|REFUSE:",
     re.IGNORECASE,
 )
 
@@ -173,6 +175,15 @@ def _baseline_unrunnable(base_rc: str, base_log: str) -> str | None:
     the second as a red baseline is how a run with ZERO tests executed got
     certified green (a candidate whose ``node_modules`` exists but whose base
     worktree has none: candidate rc=0, base rc=127).
+
+    The log scan returns the line that matched, not just the class. The class
+    alone was not enough: a target repo's own guard can exit **1** — none of
+    ``_UNRUNNABLE_RC`` — with "local jest binary missing at
+    ./node_modules/.bin/jest; run pnpm install before dispatching mini-ork", and
+    the resulting "no per-test results on a red base" is what a reviewer read
+    next to ``base_rc=1`` before sending the operator to "repair the pre-existing
+    failing test suites on main" (run-1792045839-99014, 2026-10-15). The guard's
+    own line names the real cause, so it travels with the reason.
     """
     if str(base_rc) in _UNRUNNABLE_RC:
         return f"baseline did not execute tests (rc={base_rc})"
@@ -181,12 +192,16 @@ def _baseline_unrunnable(base_rc: str, base_log: str) -> str | None:
             text = fh.read()
     except OSError:
         return None
-    if _UNRUNNABLE_LOG_RE.search(text):
-        return (
-            f"baseline did not execute tests (rc={base_rc}; "
-            "its output reports a launch failure)"
-        )
-    return None
+    match = _UNRUNNABLE_LOG_RE.search(text)
+    if not match:
+        return None
+    start = text.rfind("\n", 0, match.start()) + 1
+    end = text.find("\n", match.start())
+    line = text[start:end if end != -1 else len(text)]
+    return (
+        f"baseline did not execute tests (rc={base_rc}; "
+        f"its output reports a launch failure: {' '.join(line.split())[:200]})"
+    )
 
 
 def _is_test_path(rel_path: str) -> bool:
