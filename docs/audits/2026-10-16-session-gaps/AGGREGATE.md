@@ -142,7 +142,7 @@ in finding 3 is the same failure seen from the other side.
 ### P1 — declared but never exercised, or emitted but unrenderable
 | # | gap | where | source |
 |---|---|---|---|
-| 5 | Deterministic-assignment fix never ran end-to-end; 3 declared cluster artifacts never produced | `0190e322`; `artifact_contract.yaml:27,30,33` | `732bb4cc` G1 |
+| 5 | Deterministic-assignment fix never ran end-to-end; 3 declared cluster artifacts never produced | `0190e322`; `artifact_contract.yaml:27,30,33` | `732bb4cc` G1 — **blocked on the user**, not on work (round 5) |
 | 6 | Artifact transport is a design doc only; node has no home for a recipe-declared `path` | `docs/architecture/artifact-transport.md`; `run_nodes.py:20` | `f5671eaa` G1 |
 | 7 | 6 of 15 SDD epics unimplemented; no IDE page renders any SDD mechanism | SDD paths I2/I4/I6/I7/I8/I9 | `8162bb3f` G1, G2 |
 | 8 | `not_needed` 5th bucket missing from the Rust board `Counts` (+ pin bump) | `mini-ork-ui/src/board.rs` | `f6e1ed90` G4 |
@@ -159,8 +159,8 @@ in finding 3 is the same failure seen from the other side.
 | 15 | No stage-report writer: the `<run>/buddy/` feed's writer was removed (`fae2a7a5`), leaving nothing to render | `f6e1ed90` G2 |
 | 16 | Orchestrator section is per-run and `LIMIT 6`; no cross-run view | `d5471234` G4 |
 | 17 | `MO_BUDDY_*` silently ignored after the rename to `MO_WATCH_*` | `f6e1ed90` G3 |
-| 18 | Dead scaffolding / stale worktrees: `_ide-engine`, `author-style-review` + `wt/author-style-review` | `d5471234` G3, `732bb4cc` G4 |
-| 19 | Untracked deliverables at risk: `git stash -u` strands run deliverables; 244 KB report + 1.2 MB corpus in gitignored `runs/`; tests live in `/tmp` outside CI | `8162bb3f` G4, `732bb4cc` G2, G3 |
+| 18 | Dead scaffolding / stale worktrees: `_ide-engine`, `author-style-review` + `wt/author-style-review` | `d5471234` G3, `732bb4cc` G4 — **`author-style-review` half DONE**; `_ide-engine` open (round 5) |
+| 19 | Untracked deliverables at risk: `git stash -u` strands run deliverables; 244 KB report + 1.2 MB corpus in gitignored `runs/`; tests live in `/tmp` outside CI | `8162bb3f` G4, `732bb4cc` G2, G3 — **`/tmp`-tests half DELIVERED `effc3881`** (round 5) |
 | 20 | Doc drift: `docs/todos/2026-10-14-failed-runs-48h-triage.md:375-376` says a run "still reads executing"; the DB says `published` | `83e57620` G4 |
 | 21 | Stale plan/record rows: `run-graph-plan` still `pending` while its three children are `completed` and verified | `6881f0ad` G3 — **CLOSED, wrong store** (round 2) |
 | 22 | Worktree run resolves a bare home → the level-2 spec path is untested there | `da0b8c69` G3 (mechanism) — **not actionable as written** (round 2) |
@@ -657,3 +657,40 @@ both → `e1307ee4e056ad09a8e5e3a275a8351990444b1c`), so it is a true duplicate 
 `origin/main` and dropping it loses nothing. It clears with `git pull --rebase` once the ~11 dirty
 files from other sessions quiet; `--ff-only` will keep refusing in the meantime, and an `--ff-only`
 refusal there is **not** evidence of new drift. Not cleared by this session for that reason.
+
+---
+
+## Delivery — round 5
+
+**P2#19 — the `/tmp` tests are now in CI, DELIVERED `effc3881`.** `tests/unit/test_author_style_imitation_review.py`,
+12 tests, merged via `make worktree-merge SLUG=style-assign-tests` — and it ports more than the
+scripts: in-process `importlib` loading for logic (matching `test_frontier_llm_research_recipe.py`),
+subprocess for the CLI exit-code contract, and pins the design itself (the clusterer publishes
+`families.json`, the contract declares all three cluster artifacts, `split.py` runs assign before
+split, and the clusterer prompt contains **no `technique_keys`** — the exact artefact the model used
+to hand-write, so its absence is now a test rather than a hope). Gate: `python3.11 -m pytest
+tests/unit -q -k "recipe or author_style"` → 450 passed; the file alone runs in 4.9 s.
+**Gate note worth keeping: bare `python3` does not work here (3.9, no fastapi) — it must be
+`python3.11`.** A gate that silently degrades to the wrong interpreter is the "verifier could not
+run" class this sweep has already seen once.
+
+**P2#18 — half of it was already done, by a different session, and was verified rather than
+re-done.** The `author-style-review` worktree directory *and* its `wt/author-style-review` ref were
+both already gone; the session checked the recipe content is still on `main` instead of repeating
+the cleanup. No session's claim needs correcting here, but the item is now honestly split:
+`author-style-review` closed, `_ide-engine` still open.
+
+**P1#5 — blocked on the user, and a peer refused to run it, correctly.** Running the
+deterministic-assignment recipe end-to-end is a **real-cost LLM run (~2 h, real money)**, so the
+session declined to launch it on a peer's instruction and raised it to its own user. That is the
+permission-laundering refusal applied where it actually costs something, and the aggregate now
+carries P1#5 as **blocked-on-user, not blocked-on-work** — it needs an authorisation, not an
+assignee.
+
+**The primary reconciled, and the retractions survived it.** Local `main` went through
+`57a589ae` ("reconcile a superseded duplicate") and `2eefcbc1` (merge of `origin/main`), and it is
+now **3 ahead / 1 behind** — no longer carrying the duplicate as a blocker. Verified directly rather
+than assumed, because a merge is exactly where a retraction can be silently reverted: the primary's
+`AGGREGATE.md` still contains C-3 (×3), C-5 (×2), the round-4 reversion-guard text, and P0 4c. It
+matches `origin/main` on every one of those. A wrong-side resolution here would have restored the
+false claim on the next push from the primary; it did not.
