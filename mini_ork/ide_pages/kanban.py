@@ -42,6 +42,7 @@ the mirror and starts nothing.
 from __future__ import annotations
 
 import os
+import re as _re
 import time
 from pathlib import Path
 from typing import Any
@@ -66,6 +67,27 @@ COLUMNS = (
     ("Done", "green", "done"),
 )
 
+# ── ContextNest attention badges (asks + overlaps) ─────────────────────────
+#
+# The board peeks the cache slots the inbox epic (``inbox.py``) and the
+# orchestrator's coord page (``orch.py``) write. The peek is read-only and
+# short-circuit — the board never waits on ContextNest and a cold cache
+# leaves cards byte-identical to the pre-change render.
+_BOARD_ASK_SECTION = "inbox-needs-you"
+_BOARD_OVERLAP_SECTION = "coord-overlaps"
+_ASK_URGENCIES = ("now", "soon", "later")
+_OVERLAP_BADGE_STATES = frozenset({"open", "escalated"})
+
+# A bounded word-boundary run id search. ``cn_client.extract_run_id`` is
+# anchored full-match (no ``\b``) and only inspects specific keys
+# (``run_id``/``run``/``task_run_id``/``trace_id``/``id``) on an item dict —
+# it can never fall back to a substring search of an item's ``content``,
+# which is the fallback route the Board's attention matcher needs when an
+# older payload surfaces the run id in plain text. The pattern matches the
+# acceptance fixture ``run-1792090100-a1b2c3`` (10 digits / 6 alnum); it is
+# the same one ``inbox._RUN_ID_RE`` uses to hyperlink a run from ask content.
+_RUN_ID_RE = _re.compile(r"\brun-\d+-[A-Za-z0-9][A-Za-z0-9-]*")
+
 
 def _fleet(home: Path, state: str):
     from mini_ork.acp.fleet import fleet_rows
@@ -77,32 +99,38 @@ def _change(added: int, removed: int) -> str:
     return f"+{added} −{removed}" if (added or removed) else ""
 
 
-def _card(row: Any) -> dict[str, Any]:
+def _card(row: Any, *, attention: dict | None = None) -> dict[str, Any]:
     title = row.title or row.run_id
     sub = f"{row.recipe} · {row.step}" if row.step else str(row.recipe or "")
     meta = [S.meta_item(S.money(row.cost_usd), mono=True)]
     change = _change(row.added, row.removed)
     if change:
         meta.append(S.meta_item(change, mono=True))
+    if attention:
+        meta.extend(_attention_meta_for_run(row.run_id, attention))
     return {"id": row.run_id, "title": title, "sub": sub, "state": row.state,
             "mark": row.mark, "meta": meta, "do": S.open_run(row.run_id, title)}
 
 
-def _cards(home: Path, state: str, now: int, *, window: int | None = None) -> list[dict[str, Any]]:
+def _cards(home: Path, state: str, now: int, *, window: int | None = None,
+           attention: dict | None = None) -> list[dict[str, Any]]:
     rows, _ = _fleet(home, state)
     if window is not None:
         rows = [r for r in rows
                 if (r.ended_at or r.started_at or 0) >= now - window]
     rows = sorted(rows, key=lambda r: r.ended_at or r.started_at or 0, reverse=True)
-    return [_card(r) for r in rows[:_CARD_CAP]]
+    return [_card(r, attention=attention) for r in rows[:_CARD_CAP]]
 
 
 def _board(home: Path, now: int, errors: dict[str, str]) -> list[dict[str, Any]]:
+    # One cache peek per board render — every column's cards share the same
+    # attention sets so the membership check on each card is O(1).
+    attention = _board_attention(_project_root(home))
     cols: list[dict[str, Any]] = []
     for title, colour, state in COLUMNS:
         window = _DONE_WINDOW if state == "done" else None
         try:
-            cards = _cards(home, state, now, window=window)
+            cards = _cards(home, state, now, window=window, attention=attention)
         except Exception as exc:  # noqa: BLE001 — one column must not blank the board
             errors[title] = f"{type(exc).__name__}: {exc}"
             cards = []
@@ -228,7 +256,9 @@ def _task_card_mark(status: str) -> str:
     return "•"
 
 
-def _task_card(epic: dict[str, Any], *, recency: int = 0) -> dict[str, Any]:
+def _task_card(epic: dict[str, Any], *, recency: int = 0,
+               attention: dict | None = None,
+               epic_run_ids: set[str] | None = None) -> dict[str, Any]:
     """One epic card for the Tasks board.
 
     Clicking the card opens the epic's own page (``S.open_task``), which is
@@ -236,6 +266,12 @@ def _task_card(epic: dict[str, Any], *, recency: int = 0) -> dict[str, Any]:
     a card gets exactly one ``do`` (``sections.rs::render_columns`` wires the
     whole card to it and draws ``meta`` as text only), so the shortcuts the card
     used to carry moved onto the page rather than being lost.
+
+    ``attention`` is the cached-sets dict from :func:`_board_attention`;
+    ``epic_run_ids`` carries the run ids the epic links to so a card
+    matches an ask or overlap without per-card sqlite reads. Both default
+    to ``None``/empty — a board that doesn't compute attention (or an
+    epic with no links) renders with the pre-change empty meta.
     """
     eid = str(epic.get("id") or "")
     title = str(epic.get("title") or eid)
@@ -259,8 +295,10 @@ def _task_card(epic: dict[str, Any], *, recency: int = 0) -> dict[str, Any]:
 
     do: dict[str, Any] | None = S.open_task(eid) if eid else None
 
+    attention_meta = _attention_meta_for_epic(epic_run_ids or set(),
+                                              attention or {})
     return {"id": eid, "title": title, "sub": sub, "state": _task_card_state(status),
-            "mark": _task_card_mark(status), "meta": [], "do": do,
+            "mark": _task_card_mark(status), "meta": list(attention_meta), "do": do,
             # Internal — sorted on, stripped before the page serialises.
             "_recency": int(recency),
             "_priority": int(epic.get("priority") or 0)}
@@ -387,7 +425,8 @@ def _run_id_from_links(uid: str, links) -> str | None:
     return None
 
 
-def _ticket_card(row: Any, run_id: str | None, *, recency: int = 0) -> dict[str, Any]:
+def _ticket_card(row: Any, run_id: str | None, *, recency: int = 0,
+                  attention: dict | None = None) -> dict[str, Any]:
     """One mirror-ticket card for the Tasks board.
 
     ``title`` leads with the source's own key (``ENG-123``) so a person can
@@ -396,6 +435,10 @@ def _ticket_card(row: Any, run_id: str | None, *, recency: int = 0) -> dict[str,
     page (``S.open_task``), which carries the linked run and the source URL as
     its own actions. A run-linked ticket also gets an ``agent`` chip, so a
     person can see mini-ork is working it.
+
+    Run-linked tickets also pick up the same ContextNest ask / overlap
+    badges as a Runs card would for the same ``run_id``; the lookup keys
+    on the link's run id, not the ticket's own id.
     """
     provider = str(row.provider)
     priority = int(row.priority)
@@ -405,6 +448,8 @@ def _ticket_card(row: Any, run_id: str | None, *, recency: int = 0) -> dict[str,
     meta.append(S.meta_item(provider, "cyan"))          # the source chip
     if run_id:
         meta.append(S.meta_item("agent", "green"))      # mini-ork is on it
+        if attention:
+            meta.extend(_attention_meta_for_run(run_id, attention))
     do: dict[str, Any] | None = S.open_task(str(row.uid)) if row.uid else None
     _column, state, mark = _ticket_column(str(row.state))
     return {"id": row.uid, "title": f"{row.native_key} · {row.title}",
@@ -475,8 +520,15 @@ def _source_actions(home: Path) -> list[dict[str, Any]]:
     return buttons
 
 
-def _epic_buckets(home: Path, db, buckets: dict[str, list[dict[str, Any]]]) -> None:
-    """Fill ``buckets`` with the epic cards (today's read, unchanged)."""
+def _epic_buckets(home: Path, db, buckets: dict[str, list[dict[str, Any]]],
+                  *, attention: dict | None = None) -> None:
+    """Fill ``buckets`` with the epic cards (today's read, unchanged).
+
+    ``attention`` is the cached-sets dict from :func:`_board_attention` —
+    empty / ``None`` means no badges, and each epic's run ids are read once
+    per row from the home db so the card's meta is computed without a second
+    SELECT per card.
+    """
     cols = _epics_table_columns(home)
     select_priority = ", e.priority" if "priority" in cols else ", 0 AS priority"
     select_attempts = ", e.attempts" if "attempts" in cols else ", 0 AS attempts"
@@ -509,11 +561,26 @@ def _epic_buckets(home: Path, db, buckets: dict[str, list[dict[str, Any]]]) -> N
             r["dependency_blocked"] = True
         column_title = _task_column_for(status, held)
         recency = total - idx  # higher = more recent
-        buckets[column_title].append(_task_card(r, recency=recency))
+        # One read per row: the badge matcher is set-intersect, not a per-id
+        # query, so an epic with no links renders with the pre-change empty
+        # meta (``set() & empty = empty``). The sqlite read is also
+        # unnecessary when *both* attention sets are empty — set-intersecting
+        # ``set()`` against anything is still empty, so the read would only
+        # produce ids the matcher is going to discard. Skipping it keeps a
+        # cold cache to its pre-change sqlite cost (the same shape the board
+        # had before this badge work landed).
+        asks_set = attention.get("asks", frozenset()) if attention else frozenset()
+        overlaps_set = attention.get("overlaps", frozenset()) if attention else frozenset()
+        epic_runs = (_epic_run_ids(home, eid)
+                     if (asks_set or overlaps_set) else set())
+        buckets[column_title].append(
+            _task_card(r, recency=recency, attention=attention,
+                       epic_run_ids=epic_runs),
+        )
 
 
 def _tickets_into(home: Path, buckets: dict[str, list[dict[str, Any]]],
-                  source: str) -> int:
+                  source: str, *, attention: dict | None = None) -> int:
     """Fill ``buckets`` with the mirror-ticket cards; return the canceled count.
 
     Reads only the mirror (never a network call, never a mirror write), skips
@@ -523,6 +590,10 @@ def _tickets_into(home: Path, buckets: dict[str, list[dict[str, Any]]],
     section note can report it. Every read goes through the home's ``state.db``
     by explicit path, so a test's temp home never touches the developer's
     mirror.
+
+    A ticket card with a run link gets the same attention badges as a Runs
+    card would for the same ``run_id`` — the lookup keys on the run id the
+    ticket's link carries, not the ticket's own id.
     """
     from mini_ork.pm import store
 
@@ -542,7 +613,9 @@ def _tickets_into(home: Path, buckets: dict[str, list[dict[str, Any]]],
             links = []
         run_id = _run_id_from_links(r.uid, links)
         column_title = _ticket_column(str(r.state))[0]
-        buckets[column_title].append(_ticket_card(r, run_id, recency=total - idx))
+        buckets[column_title].append(
+            _ticket_card(r, run_id, recency=total - idx, attention=attention),
+        )
     return canceled
 
 
@@ -566,14 +639,20 @@ def _tasks_board(home: Path, args: dict[str, str], now: int,
                                        "(``mini-ork init``) to see the Tasks column here.")],
                        full=True)]
 
+    # One cache peek per board render — epics and tickets share the same
+    # attention sets so every card does O(1) membership lookups instead of
+    # re-reading the cache slot for itself. A cold cache produces empty
+    # sets, which is the byte-identical pre-change render.
+    attention = _board_attention(_project_root(home))
+
     buckets: dict[str, list[dict[str, Any]]] = {t: [] for t, _ in _TASK_COLUMNS}
     if show_epics:
-        _epic_buckets(home, db, buckets)
+        _epic_buckets(home, db, buckets, attention=attention)
 
     canceled = 0
     if source != "local":
         try:
-            canceled = _tickets_into(home, buckets, source)
+            canceled = _tickets_into(home, buckets, source, attention=attention)
         except Exception as exc:  # noqa: BLE001 — one broken mirror must not blank the board
             errors["Tickets"] = f"{type(exc).__name__}: {exc}"
 
@@ -757,6 +836,260 @@ def _sources_pane(home: Path, now: int) -> list[dict[str, Any]]:
                  "shell history.",
         ))
     return sections
+
+
+# ── board attention (cache peek for asks + overlaps) ────────────────────────
+#
+# These helpers are the read-only counterpart of the inbox epic's
+# ``_agent_sessions_section`` and the orchestrator's coord ``overlaps``
+# section. Both write cache slots as they render their own pages; the board
+# peeks those slots via ``cn_client._read_section_cache`` — never via
+# ``cached_section`` and never via ``_get`` / ``_post_json`` / ``_get_text``.
+# Building the board therefore makes zero ContextNest network calls. A cold
+# cache returns ``(None, 0)`` per slot, the peeks short-circuit to ``[]``,
+# and the cards render with the pre-change meta (cost money on Runs,
+# empty on Tasks) — byte-identical to today.
+
+
+def _project_root(home: Path) -> str:
+    """The project root the inbox epic scopes its cache slots by.
+
+    The inbox epic derives it from ``home.parent.resolve()``; we mirror that
+    exact string so the boards and the inbox read the same slot. A missing
+    or unresolvable home yields ``""`` — peeking an empty scope name would
+    still be cheap, but every call site below short-circuits on it.
+    """
+    if home is None:
+        return ""
+    try:
+        return str(Path(home).parent.resolve())
+    except OSError:
+        return ""
+
+
+def _board_slot_fresh(age: int) -> bool:
+    """True when a peeked cache slot is within ContextNest's cache TTL.
+
+    The board reads the slots with ``cn_client._read_section_cache``, which
+    hands back the payload whatever its age. ``render_cached_section`` — the
+    path the source pages use — serves a cached payload only while
+    ``age < CN_CACHE_TTL_SEC`` (default 300 s), so the board applies the same
+    bound: a slot left behind hours ago must not badge a card with an ask the
+    operator answered since. A TTL knob that cannot be read fails closed (the
+    slot reads as stale) rather than badging from data of unknown age.
+    """
+    from mini_ork import cn_client
+
+    try:
+        return int(age) < int(cn_client._cache_ttl_s())
+    except Exception:  # noqa: BLE001 — an unreadable TTL is "not fresh"
+        return False
+
+
+def _peek_board_asks(project: str) -> list:
+    """The opens from the cached inbox slots — bucket by scope, not by item.
+
+    ``GET /api/v1/inbox`` items carry no ``urgency`` field (the kickoff's
+    verified wire shape), so the inbox epic buckets across three
+    ``(section, scope)`` slots — one per urgency — and the board peeks the
+    same three. ``cn_client._read_section_cache`` is read-only: a missing or
+    malformed slot returns ``(None, 0)`` and contributes nothing, so a cold
+    cache is exactly "no badges"; a slot older than the CN cache TTL is
+    treated the same way (:func:`_board_slot_fresh`). Duplicates across
+    urgencies are de-duped by item id so an ask refreshed in two buckets
+    does not double its contribution to ``_ASK_URGENCIES``'s downstream sets.
+    """
+    if not project:
+        return []
+    from mini_ork import cn_client
+    out: list = []
+    seen_ids: set[str] = set()
+    for urgency in _ASK_URGENCIES:
+        try:
+            payload, age = cn_client._read_section_cache(
+                _BOARD_ASK_SECTION, f"{urgency}:{project}",
+            )
+        except Exception:  # noqa: BLE001 — one bad slot must not blank the board
+            continue
+        if not isinstance(payload, dict) or not _board_slot_fresh(age):
+            continue
+        for it in payload.get("items") or []:
+            if not isinstance(it, dict):
+                continue
+            iid = str(it.get("id") or "")
+            if iid and iid in seen_ids:
+                continue
+            if iid:
+                seen_ids.add(iid)
+            out.append(it)
+    return out
+
+
+def _peek_board_overlaps(project: str) -> list:
+    """Open + escalated overlaps read from the cached coord slot.
+
+    The Orch > Coordination tab writes ``coord-overlaps`` (``GET
+    /api/v1/coord/overlaps``); the board reads the same. ``acked`` overlaps
+    are filtered out — the badge condition is "open overlaps on its paths",
+    so acked rows cannot fabricate an attention badge. A slot older than the
+    CN cache TTL is "no data", exactly like a missing one.
+    """
+    if not project:
+        return []
+    from mini_ork import cn_client
+    try:
+        payload, age = cn_client._read_section_cache(
+            _BOARD_OVERLAP_SECTION, "",
+        )
+    except Exception:  # noqa: BLE001
+        return []
+    if not isinstance(payload, dict) or not _board_slot_fresh(age):
+        return []
+    out: list = []
+    for o in payload.get("overlaps") or []:
+        if not isinstance(o, dict):
+            continue
+        if str(o.get("state") or "") in _OVERLAP_BADGE_STATES:
+            out.append(o)
+    return out
+
+
+def _ask_names_run(ask: dict) -> str:
+    """The run id this ask names, or ``""`` when it names no run.
+
+    ``metadata.task_id`` is the verified route the kickoff pins. The
+    bounded ``_RUN_ID_RE`` search of ``content`` is the same fallback the
+    inbox epic uses to hyperlink a run from ask text — duplicated here so
+    older payloads that surfaced the run id in content only still resolve.
+    """
+    if not isinstance(ask, dict):
+        return ""
+    meta = ask.get("metadata")
+    if isinstance(meta, dict):
+        val = meta.get("task_id")
+        if isinstance(val, str) and val:
+            return val
+    text = str(ask.get("content") or "")
+    if not text:
+        return ""
+    m = _RUN_ID_RE.search(text)
+    return m.group(0) if m else ""
+
+
+def _overlap_principal_ids(overlap: dict) -> set[str]:
+    """The principal ids on one overlap row (``a`` and ``b``).
+
+    Overlaps carry no ``paths`` field — the kickoff pins the verified shape
+    as ``{id, kind, a, b, state, count, first_seen}``. The badge matcher
+    must work from principal ids alone; "on its paths" becomes
+    "the card's run id is one of ``a`` / ``b``" with no path string in sight.
+    """
+    out: set[str] = set()
+    if not isinstance(overlap, dict):
+        return out
+    for key in ("a", "b"):
+        val = overlap.get(key)
+        if isinstance(val, str) and val:
+            out.add(val)
+    return out
+
+
+def _epic_run_ids(home: Path, epic_id: str) -> set[str]:
+    """The run ids linked to ``epic_id`` — match ask task_id and overlap principals.
+
+    Two sources: ``epics.last_run_id`` (the scheduler's recorded latest run,
+    added by :func:`mini_ork.scheduler.ensure_retry_schema`) and
+    ``epic_attempts.run_id`` (every attempt recorded against the epic).
+    A missing column or table is silently skipped — older homes or fresh
+    projects without the migration still read what is there. A missing
+    ``state.db`` returns ``{}`` so a test's blank home renders unchanged.
+    """
+    if not epic_id:
+        return set()
+    db_path = home / "state.db"
+    if not db_path.is_file():
+        return set()
+    out: set[str] = set()
+    try:
+        import sqlite3
+        con = sqlite3.connect(str(db_path))
+        try:
+            for sql, params in (
+                ("SELECT last_run_id FROM epics WHERE id=? AND last_run_id IS NOT NULL",
+                 (epic_id,)),
+                ("SELECT run_id FROM epic_attempts WHERE epic_id=? AND run_id IS NOT NULL",
+                 (epic_id,)),
+            ):
+                try:
+                    rows = list(con.execute(sql, params))
+                except sqlite3.OperationalError:
+                    # The column or table does not exist on this home — the
+                    # next query may still produce something.
+                    continue
+                for (v,) in rows:
+                    if v:
+                        out.add(str(v))
+        finally:
+            con.close()
+    except Exception:  # noqa: BLE001 — a bad read yields no ids; the card stays bare
+        return out
+    return out
+
+
+def _board_attention(project: str) -> dict:
+    """Two frozen sets the card builders do O(1) membership checks against.
+
+    ``asks`` — the run ids an open ask names. ``overlaps`` — the principal
+    ids an open or escalated overlap touches. Cards do set-intersect against
+    the run ids they own; an empty project string yields two empty frozensets
+    so cold / unconfigured homes read identically to today.
+    """
+    if not project:
+        return {"asks": frozenset(), "overlaps": frozenset()}
+    asks = _peek_board_asks(project)
+    overlaps = _peek_board_overlaps(project)
+    return {
+        "asks": frozenset(filter(None, (_ask_names_run(it) for it in asks))),
+        "overlaps": frozenset(pid for o in overlaps for pid in _overlap_principal_ids(o)),
+    }
+
+
+def _attention_meta_for_run(run_id: str, attention: dict) -> list:
+    """Meta additions for a Runs (or ticket-with-link) card.
+
+    ``run_id`` is the card's identifying id — a run id on the Runs board,
+    the run id a ticket's link carries on the Tasks board, or ``""`` / a
+    falsy value (no badge added). Order: ask first, overlap second — the
+    same order the kickoff ranks them as "open asks that name the card's
+    run, and one for open overlaps on its paths".
+    """
+    if not run_id:
+        return []
+    out: list = []
+    if run_id in attention.get("asks", frozenset()):
+        out.append(S.meta_item("✋ ask", "yellow"))
+    if run_id in attention.get("overlaps", frozenset()):
+        out.append(S.meta_item("↔ overlap", "orange"))
+    return out
+
+
+def _attention_meta_for_epic(epic_run_ids, attention: dict) -> list:
+    """Meta additions for a Tasks epic card — any of the epic's run ids matches.
+
+    An epic with no recorded run (a Backlog epic on its first attempt) gets
+    an empty set and therefore no badges — the same fail-closed rule
+    :func:`_overlap_principal_ids` already enforces: a card with no
+    identifying run matches nothing, and silent omission is preferred over
+    a fabricated badge.
+    """
+    if not epic_run_ids:
+        return []
+    out: list = []
+    if epic_run_ids & attention.get("asks", frozenset()):
+        out.append(S.meta_item("✋ ask", "yellow"))
+    if epic_run_ids & attention.get("overlaps", frozenset()):
+        out.append(S.meta_item("↔ overlap", "orange"))
+    return out
 
 
 # ── page ────────────────────────────────────────────────────────────────────

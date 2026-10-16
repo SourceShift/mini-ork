@@ -422,12 +422,35 @@ def _coord(home: Path, now: int) -> list[dict[str, Any]]:
             cn parser rejects ``--home``, and ``confirm`` so the IDE does
             not silently bind the operator's choice to the click. Ack
             never appears on already-acked rows.
+
+            The read also writes the ``coord-overlaps`` cache slot — the
+            slot the Runs / Tasks board's attention peek reads via
+            ``cn_client._read_section_cache``. The Board's peek is
+            read-only and never blocks on ContextNest, so a healthy
+            render here is what keeps the overlap badges on the board's
+            cards accurate. Scope is the empty string because the live
+            endpoint's filter is server-side, not per-project — the
+            board's matcher filters overlaps to the project's runs
+            itself. The write is best-effort: a cache failure is logged
+            out by ``_write_section_cache`` and cannot blank the page.
             """
             data = cn_client._coord_request(
                 "GET", "/api/v1/coord/overlaps"
             ) or {}
             items = [it for it in (data.get("overlaps") or data.get("items") or [])
                      if isinstance(it, dict)]
+            # Mirror the live envelope into ``coord-overlaps`` so the Board's
+            # attention peek has fresh data on the next board build. Always
+            # write when the read returned a usable envelope — an empty list
+            # is preferable to a stale slot still serving yesterday's badges.
+            try:
+                cn_client._write_section_cache("coord-overlaps", "", {
+                    "overlaps": list(items),
+                    "_as_of": int(time.time()),
+                    "_from_cache": False,
+                })
+            except Exception:  # noqa: BLE001 — best-effort graceful degradation
+                pass
             total = len(items)
             items.sort(key=_overlap_sort_key)
             items = items[:30]
