@@ -1,9 +1,15 @@
 """``mini-ork board steer`` answers with a receipt the IDE can show.
 
-Kickoff ``rp-e11b-steer-receipt``: the ``steer`` success path prints, as its
-LAST stdout line, ``Sent to <node> at HH:MM — the agent reads it at its next
-turn`` (or the queued wording when no node is running), and ``--json`` carries
-the same string under a ``receipt`` key. Errors keep today's exit codes.
+Kickoff ``rp-e11b-steer-receipt``: the ``steer`` success path returns
+``Sent to <node> at HH:MM — the agent reads it at its next turn`` (or the
+queued wording when no node is running) under a ``receipt`` key in its
+payload. Errors keep today's exit codes.
+
+The receipt rides **in** the JSON document, not as a trailing stdout line.
+Every ``board`` verb writes exactly one JSON document that callers
+``json.loads`` whole, so a second line would make the document unparseable
+(``Extra data``) — see ``test_board_steer_writes_a_row`` in
+``test_ide_pages_node.py``, which asserts that contract for this verb.
 
 Each test builds a hermetic home (real schema via the repo's migration runner,
 synthetic ``task_runs`` / ``run_events`` rows) and drives ``board_cmd.main`` —
@@ -131,9 +137,13 @@ def _run_main(*argv: str) -> tuple[int, str, str]:
     return rc, out.getvalue(), err.getvalue()
 
 
-def _last_line(stdout: str) -> str:
-    lines = [ln for ln in stdout.splitlines() if ln.strip()]
-    return lines[-1] if lines else ""
+def _receipt(stdout: str) -> str:
+    """The receipt string from a single-JSON-document stdout.
+
+    Parses the whole document, so a stray extra line fails here rather than
+    being quietly ignored.
+    """
+    return str(json.loads(stdout.strip())["receipt"])
 
 
 def _assert_local_clock(clock: str) -> None:
@@ -147,7 +157,7 @@ def _assert_local_clock(clock: str) -> None:
 
 
 def test_steer_running_run_prints_receipt_with_node(home: Path) -> None:
-    """A live run with an open node_start prints the receipt, naming that node."""
+    """A live run with an open node_start names that node in its receipt."""
     run_id = "run-live-1"
     _add_run(home, run_id, status="executing")
     now = int(time.time())
@@ -160,16 +170,16 @@ def test_steer_running_run_prints_receipt_with_node(home: Path) -> None:
                              "--home", str(home))
 
     assert rc == 0, f"steer failed rc={rc} err={err!r}"
-    line = _last_line(out)
+    line = _receipt(out)
     m = SENT_RE.match(line)
-    assert m, f"last stdout line is not the Sent receipt: {line!r} (stdout {out!r})"
+    assert m, f"payload['receipt'] is not the Sent receipt: {line!r} (stdout {out!r})"
     assert m.group("node") == "implementer", f"named {m.group('node')!r}, not implementer"
     _assert_local_clock(m.group("clock"))
     assert _steering_rows(home, run_id), "receipt claims Sent but no row was written"
 
 
 def test_steer_no_running_node_prints_queued_wording(home: Path) -> None:
-    """A live run between nodes (planner started and ended) prints the queued line."""
+    """A live run between nodes (planner started and ended) gets the queued line."""
     run_id = "run-between-1"
     _add_run(home, run_id, status="executing")
     now = int(time.time())
@@ -181,11 +191,11 @@ def test_steer_no_running_node_prints_queued_wording(home: Path) -> None:
                              "--home", str(home))
 
     assert rc == 0, f"steer failed rc={rc} err={err!r}"
-    line = _last_line(out)
+    line = _receipt(out)
     m = QUEUED_RE.match(line)
-    assert m, f"last stdout line is not the queued wording: {line!r} (stdout {out!r})"
+    assert m, f"payload['receipt'] is not the queued wording: {line!r} (stdout {out!r})"
     _assert_local_clock(m.group("clock"))
-    assert not SENT_RE.match(line), "queued case must not print the Sent wording"
+    assert not SENT_RE.match(line), "queued case must not carry the Sent wording"
     assert _steering_rows(home, run_id), "queued note was not written"
 
 

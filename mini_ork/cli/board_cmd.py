@@ -1473,12 +1473,12 @@ def main(rest: list[str], root: str) -> int:
         return 2
     sys.stdout.write(json.dumps(payload, default=str) + "\n")
     failed = payload.get("ok", True) is False
-    if args.verb == "steer" and not failed and not args.json and payload.get("receipt"):
-        # The IDE shows the command's LAST stdout line as the toast. The JSON
-        # line above stays for machine callers; the human receipt goes after
-        # it so it *is* that last line. With ``--json`` the receipt already
-        # rides in the payload, so nothing extra is printed.
-        sys.stdout.write(f"{payload['receipt']}\n")
+    # The steer receipt is delivered *in* the payload (``steer`` sets a
+    # ``receipt`` key), never as a second stdout line. Every verb here writes
+    # exactly one JSON document and callers ``json.loads`` it whole; a bare
+    # trailing line makes that document unparseable ("Extra data"). The IDE
+    # reads ``receipt`` off the payload, which is also what a person sees when
+    # they ask for one verb.
     if failed:
         # The kickoff limits stderr writes to the two new verbs (restore
         # carries ``reason``; checkpoints uses ``error``). Other verbs
