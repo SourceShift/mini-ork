@@ -600,6 +600,46 @@ Scope), so the table is read-only.*
 **When** the changed files are listed,
 **Then** none is under `crates/mini_ork_ui/` — the page payload changes only, and an unmodified IDE renders every existing section.
 
+*Verified 2026-10-16 against the fork, not by inspection alone.* Every tab of the
+redesigned page was built on the live home (`/Users/admin/ps/mini-ork/.mini-ork`,
+1628 `task_runs`) through the exact CLI route the IDE calls —
+`board_cmd page orch --tab <t> --home …`, for all eight of `TABS` — and the
+resulting payloads carried `errors: {}` and nine section types:
+
+| emitted on the live home | `page.rs::render_section` arm |
+|---|---|
+| `triage` (×8) | :843 |
+| `chips` (×5) | :876 |
+| `pills` (×1) | :875 |
+| `table` (×8) | :853 |
+| `list` (×11) | :855 |
+| `composer` (×6) | :847 |
+| `kv` (×1) | :854 |
+| `code` (×1) | :874 |
+| `callout` (×1) | :844 |
+
+The action side is the half a section table does not cover, because every button
+the redesign adds is a dict the *store* has to know how to carry out. The kit's
+action builders (`spec.py`) emit twelve keys, and `store.rs::perform` (:476)
+handles each: `cli` :483, `page`(+`tab`/`args`) :487, `set` :513, `run` :516,
+`path` :537, `reveal` :544, `url` :546, `thread` :548, `project` :550,
+`project_pick` :552, `pick_files` :554, `project_forget` :556. `open_task`
+resolves to `page: "task"` and so rides :487.
+
+Two things this check settles that "no changed file under `crates/`" does not:
+
+- **`set` is the picker idiom, and it is handled.** The classifications table's
+  row activation (FR-023) and the Races recipe pills (FR-016) both work in the
+  fork only because `store.rs:513` turns `{"set": {...}}` into
+  `page.set_args(...)` → `reload()`. A fork without that arm would draw the
+  table and drop every click.
+- **`confirm` guards reach every affordance.** `S.cli(..., confirm=…)` — the
+  `--force` revive (FR-021) and the race-keep discard (FR-014) — is honoured by
+  `page.rs::action_handler` (:521), which is the single path every button, row,
+  chip and lane card takes (`page.rs:558,970,1150,1302`,
+  `sections.rs:460,645,944,1281,1391`, `flow.rs:927,1185,1609`). Nothing in the
+  redesign can fire a destructive verb unguarded.
+
 ---
 
 ## Error Handling
