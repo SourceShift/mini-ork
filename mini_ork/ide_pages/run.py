@@ -804,6 +804,7 @@ def _wall(node: Node) -> str:
     if node.start is None:
         return "—"
     end = node.end if node.end is not None else int(time.time())
+    return f"{max(0, end - node.start)}s"
 
 
 # ── tabs ────────────────────────────────────────────────────────────────────
