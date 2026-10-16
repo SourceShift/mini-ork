@@ -900,7 +900,8 @@ Stated explicitly, with cost, so a reviewer can decline them knowingly.
       runs really is incomplete; that is the requirement working, not a defect. (On this
       machine's primary home the tick *is* installed, and the strip reports the real
       backlog: 4 runs parked on `needs_answers`.)
-- [ ] **Not done:** the live replay — see Cross-cutting.
+- [~] **Partly done:** the live replay — the CLI half ran on the primary home
+      (see Cross-cutting); the GUI half is the user's to run.
 
 ### Cross-cutting
 - [x] NFR — warm-page budget held on the default tab, **measured, not assumed**.
@@ -922,7 +923,40 @@ Stated explicitly, with cost, so a reviewer can decline them knowingly.
       renderer change. `crates/mini_ork_ui/src/sections.rs` *was* edited, but by the
       audit's rows 4-6 — pre-existing engine↔fork drift, authorised separately. See
       the conformance section.
-- [ ] Live replay for the ACs of each shipped phase, per the repo's gate-every-run-by-hand habit.
+- [~] Live replay for the ACs of each shipped phase, per the repo's gate-every-run-by-hand
+      habit. Split in two, because only one half is the engine's to run:
+
+      **CLI half — done 2026-10-16, on the primary home** (`/Users/admin/ps/mini-ork/.mini-ork`,
+      1628 `task_runs`, 58 of them profiled). Every one of the eight `TABS` was built
+      through the argv the IDE sends (`board_cmd page orch --tab <t> --home …`) and the
+      payloads came back with `errors: {}` — no tab depends on a fixture to render. The
+      AC most at risk from real data is AC-009, and it holds: the classifications table
+      returns **58 rows, confidences ascending** (`0.70, 0.75, 0.75 … 0.95`), exactly one
+      `sel` row, and row 0 selected by default so the table can never point at a run the
+      detail below is not showing. Sending a *middle* row's id back as the IDE would
+      (`--arg run_id=run-1792068761-cnui-ctx-b`) moved the mark to that row and produced
+      `Classification · 1-cnui-ctx-b` and `Plan · 1-cnui-ctx-b` carrying that run's own
+      objective — the J9 correction path, end to end, on real runs.
+
+      The live home also fixes what the head of the list means: its note reads
+      **`0 of 58 below confidence 0.7`**. The ordering *rule* is exercised by the
+      twelve-run fixture (AC-009); on this home there is no doubtful row to put at the
+      top, which is the requirement's own success state, not an untested path.
+
+      The same run doubles as the AC-012 payload census: **155 `{"set": …}` actions, 43
+      `cli`+`confirm`+`home` and 1 `cli`+`confirm`** (the guarded destructive verbs), plus
+      `page`(+`tab`/`args`), `run`+`title`, `path` and `thread` — every live `do` key is one
+      `store.rs::perform` handles, so no affordance on the redesigned page is a control
+      that draws and does nothing.
+
+      **GUI half — owed, and it is the user's to run.** Launching the IDE and clicking
+      the tabs is a front-end launch, which the standing instruction keeps off this
+      session's plate; it also needs the real window to confirm the *pixels* (the
+      conformance audit's row-1 fix — a list-act's `kind` — is only observable drawn).
+      What to look at, in order: the Orchestrator rail entry, then each tab for its
+      section set (`Session` = triage + 3 chips + pills + table, `Coordination` =
+      triage + 4 tables + 2 lists + code), a `confirm` prompt on any `--force`-guarded
+      action, and a classifications row click re-reading the detail beneath it.
 
 ---
 
