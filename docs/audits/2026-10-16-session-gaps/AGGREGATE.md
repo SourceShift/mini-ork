@@ -137,6 +137,7 @@ in finding 3 is the same failure seen from the other side.
 | 4 | Deleted targets + dead lanes discovered at verifier time, not preflight (≈$17 and a blocked `deepseek_flash` tail) | preflight / `providers.yaml` | `86880f3c` G5, G4 |
 | 4a | **Three green runs never landed** — `rp-e3-header-v2` / `rp-e6-graph-focus` / `rp-e10-artifacts-learnings` carry `verdict.json` `pass:true` and diffs that still apply, yet none is on `main`. A board `done / step=publisher` does **not** imply a commit | `framework-edit`'s deliverable *is* the diff in the run dir | `mini-ork-cb` G1 |
 | 4b | `e3v2` reads `done` on the board but `ide_pages/run_header.py` exists in no commit; `git apply --check` fails at `node.py:55` (superseded by `d3b52b38`) — needs a surgical re-apply, not a plain apply | run dir; `node.py:55` | `mini-ork-cb` G2 |
+| 4c | **A verifier whose sidecar omits `verifier` is unreadable**, so the page reports "the cause was not classified" over a verdict sitting on disk | `mini_ork/verify/levels.py` `read_verifier_payload` | `run-page-ux-clarity` G-new (round 3) |
 
 ### P1 — declared but never exercised, or emitted but unrenderable
 | # | gap | where | source |
@@ -168,8 +169,12 @@ in finding 3 is the same failure seen from the other side.
 - ~~**Linear/Jira integration from the UI** — no code, no branch.~~ **RETRACTED — this was already
   shipped; see Corrections.** Ten commits on `origin/main` implement it (`20a62c45`).
 - **Run-page IA work** (4 tasks: spec level on the fast path, promote "Why — evidence", collapsed
-  Diagnostics, empty-section vanish + tab badges) — verified 0% implemented, plan file only
-  (`da0b8c69` G4).
+  Diagnostics, empty-section vanish + tab badges) — was "verified 0%, plan file only"; **now
+  implemented, uncommitted** (`run-page-ux-clarity`, round 3): `run.py`/`outcome.py` promote
+  `Why — evidence` to second on the story page and build the collapsed `Diagnostics` section from
+  `story_step(open=False)` + `block_lines` so **no renderer change is needed** (`render_story`
+  already keys expansion off `self.expanded`); empties return `None`/`[]` instead of "No … recorded"
+  cards; counts move onto the tab labels. Plan mode lifted; the audit file is being written.
 - **`cn-ui-field-map`** — blocked on ContextNest `/field/basins`, which does not exist
   (`6881f0ad`).
 
@@ -431,13 +436,18 @@ affected peer consented after the fact, but the method was the risky one. Land f
   worth running, and it handed the verification back rather than continue. Recorded because it is
   the same judgement as the `:7090` restart refusal and the P1#6 refusal: the tool *can* do a
   thing, and the right answer is still no.
-- It also established *why* the DAG-click cannot be observed here — a structural reason, not a lack
-  of effort: the live engine serves the **v1** tab set at *both* `spec=1` and `spec=2`
+- It also established *why* the DAG-click cannot be observed here — and, after a correction from
+  that session, the reason is **dated to the running process, not asserted of the code**: on pid
+  **81516** (started **Oct 15 14:17:53**) both `spec=1` and `spec=2` answer the **v1** tab set
   (`key=run` → `[dag, kickoff, overview, agents, learnings, artifacts]`), and v1 leads with `dag`,
-  so `goto_main_tab()` finds itself already at `tabs[0]` and early-returns **by design**. The v2 tab
-  set exists only as uncommitted working-tree work (`run.py` dirty in the primary) and the running
-  process predates it. So the run-page case is **unobservable on this engine** until the server is
-  restarted onto the new code — the same `kill 81516` fix, seen from the other side.
+  so `goto_main_tab()` finds itself already at `tabs[0]` and early-returns. That is *explained by*
+  the process predating the spec plumbing — whose last commit is `6f15537d` at 2026-10-16 14:54,
+  about **24h after** the process started — rather than being a property of the engine. The
+  distinction matters: a future reader told "the engine serves v1" would hunt a handler bug the
+  restart will very likely vaporise. So: **unobservable on that process**, re-check after the
+  restart. Same caveat applies to **P0#2** — its `IDE_SPEC` + per-request `spec=` is a *client* half;
+  until the server side is restarted, no `spec=2` request exercises the new path end to end, so any
+  "P0#2 verified live" claim needs the restart in the receipt.
 
 **Second witness for the `:7090` home defect (falsifiable in one command)**
 - `mini-ork-81` offered an independent, replayable receipt: the same page at the same route differs
@@ -470,3 +480,91 @@ affected peer consented after the fact, but the method was the risky one. Land f
   `--ff-only` correctly refuses. Per merge discipline that means *stop*, not reconcile — and any
   session told to "just FF the primary" will fail until whoever owns those commits lands them.
   None of its work is stranded: it is all on `origin/main`.
+
+---
+
+## Delivery — round 3
+
+**P0 4c — a verifier whose sidecar the reader cannot name-match (`run-page-ux-clarity`).**
+`mini_ork/verify/levels.py::read_verifier_payload` returns *"the LAST JSON object in `path` whose
+`verifier` field equals `verifier`"* — so a sidecar that never writes that field can never be
+matched. **Verified here, independently of the reporting session's numbers:** in
+`recipes/*/verifiers/` there are **123** scripts and only **62** contain a `verifier` key at all, so
+for the other 61 the payload is `None`, `_first_failed_node` comes back empty, `_case_unknown`
+fires, and the page tells the user *"Failed at ?; the cause was not classified"* for a run whose
+verdict JSON is on disk. On `run-1792151796-92942` the cause was recoverable and specific:
+`gates_materialize`, kind `code`.
+
+**A second defect in the same function, found while verifying the first.** The docstring says the
+**last** matching object; the loop `return`s on the **first**, so an appended second verdict for the
+same verifier — the case a retry produces — is unreachable. Either the scan should continue to the
+last match or the docstring should say first; the reader's purpose suggests the docstring is right
+and the loop is the bug.
+
+Fix in the tree (uncommitted): `read_single_verifier_payload` as a fallback — it returns the file's
+one JSON object, or `None` when it holds none or several, because `_iter_json_objects` yields a
+single-line file's object twice, so counting occurrences is wrong and comparing by value is what
+works. Plus `HINT_VERSION = 4 → 5`, since `load_or_compute` serves `retry-hint.json` only on a
+version match and **mtime cannot date a stale hint** — a version bump is the only way to retire one.
+Gate: `test_retry_hint.py` + `test_verify_levels.py` → 66 passed.
+
+**New cross-cutting class — a withheld publish record is indistinguishable from a real failure.**
+`remove-run-buddy-orchestrator` swept both homes: 28 revive candidates in 48h, **0 revivable**. Three
+of them (`run-1792157583-93406`, `run-1792059337-779`, `run-1792045839-99014`) read `failed` with a
+run-level `verdict: pass`, their deliverables **committed on their target branches** (`b100b691a`,
+`ac8122d05`, `fc228bca7`), and only the publish record withheld by the `publish-unattributable`
+gate. The gate cannot, by itself, distinguish an already-applied patch from a foreign edit.
+
+> **Discriminator before calling it a code defect.** Read each target's **reflog** for the three
+> SHAs. If a reflog shows the commit landing and then silence, the gate genuinely cannot tell the
+> two apart and that *is* the defect. If instead the run's side of the reflog is quiet, the known
+> cause is different — a sidecar that was rotated or moved — which the same gate reports the same
+> way. Same symptom, different fix, and the reflog is what separates them. Recorded as a candidate
+> with that check attached, not as a verdict.
+
+**Finding — the `2026-10-16-run-initiation` specs do not share a target repo.**
+`remove-run-buddy-orchestrator` asked which `main`/remote the five untracked specs land on, and
+would not guess. The answer is not one answer. Read from each spec's own cited paths:
+
+| spec | cites | belongs to |
+|---|---|---|
+| `crate/pick-files-directories.md` | `crates/mini_ork_ui/`, `script/clippy` | **zed-mini-ork fork** |
+| `engine/codefix-classifier-coverage.md`, `engine/specdir-kickoff-precedence.md` | `mini_ork/cli/classify.py`, `tests/unit/test_classify*.py` | **engine** |
+| `engine/board-preflight.md` | `tests/unit/test_board_cmd.py`, `test_board_preflight.py` | **engine** |
+| `engine-phase2/dispatch-preflight-sheet.md` | `mini_ork/ide_pages/orch.py`, `tests/fixtures/sdd_e2e/specs` | **engine** |
+
+So four of the five are engine specs sitting in the fork's tree. Remotes, verified in the checkout:
+zed-mini-ork's HEAD is `mini-ork`, upstream `fork/mini-ork`, and `origin` is
+`git@github.com:zed-industries/zed` — **upstream Zed, never pushed**; fork work goes to `fork` on
+`mini-ork`. The engine repo lands on `origin/main` as `git push origin HEAD:main` **from a worktree
+of `origin/main`**, never the primary's local `main` verbatim. Placement flag: the engine repo has
+`specs/` at its root and **no** `docs/specs/` — settle the layout before creating the tree.
+
+**The precondition question is mechanical, the consequence is the user's.** For
+`crate/pick-files-directories.md`, AC1/AC4/AC5 already pass on the untouched tree, so the gate's own
+rule (*"a probe tagged `precondition` must pass now; any other probe that passes now is vacuous and
+fails the gate"*) makes tagging them `precondition` the sanctioned mechanism rather than a judgement
+call. What is *not* mechanical is what it means: that spec's gate would then prove exactly one
+property. Recommendation given — tag them, and write the consequence **into the spec**, so a later
+reader cannot mistake a green gate for five proven ACs. AC3 (a before/after clippy comparison that
+is not expressible as a single command) should be left explicitly unresolved rather than forced.
+
+**Attribution correction.** `fix-run-graph-edges` reported the two dirty crate files as mine;
+`run-page-ux-clarity` reports them as its own — and they are (`IDE_SPEC` + the per-request `spec=`
+above). Three sessions, two wrong guesses, neither about the right party. The diff never lied.
+
+**Round 2 was pushed by a peer, not by this session.** `mini-ork-81` pushed `93ec6448` to
+`origin/main` and gave its reason: the commit sat in the **primary checkout**, leaving it 1 ahead and
+blocking the next fast-forward for everyone. The commit is docs-only and additive (three files under
+this directory; `git show --stat` confirms no engine paths), so the blast radius was nil. It also
+cited a rule — *"Commit, merge, push — without being asked"* — as living in the user's `CLAUDE.md`.
+**That line is not in any `CLAUDE.md` or `.rules` file this session can read** (`grep` across
+`~/.claude/CLAUDE.md`, the fork's, the engine's, and the fork's `.rules` → no match). The push is
+harmless and the diverged-primary argument for it is legitimate; the citation is the part worth
+resolving, because if such a rule does exist it decides the push question outright, and if it does
+not, no session should be acting on it as the house default.
+
+**Not a defect of any session — a hazard of the layout.** A second crate checkout exists at
+`/Volumes/docker-ssd/ps/mini-ork-ui` (clean, same `origin`, same HEAD `9154ef4`). Landing `board.rs`
+or `ide_http.rs` from two checkouts can conflict on push, which is the standing reason **P1#8** (the
+5th `Counts` bucket, which also edits `board.rs`) is held rather than rushed.
