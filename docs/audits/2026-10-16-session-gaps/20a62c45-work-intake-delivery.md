@@ -103,11 +103,18 @@ see the launcher's venv re-exec). Two independent defects, and **the restart fix
    `no such table: epics`). Probed live:
 
 ```
-curl -s ":7090/ide/page?key=kanban&tab=tasks"                       → "No epics table — initialise
+curl -s ":7090/ide/page?key=kanban&tab=tasks"                       → 931 bytes,  sections:
+                                                                       "No epics table — initialise
                                                                        the project (`mini-ork init`)"
-curl -s -H 'X-Mini-Ork-Home: <repo>/.mini-ork' ":7090/ide/page?…"  → the real home's Freshness line
-                                                                       ("No PM source is enabled …")
+curl -s -H 'X-Mini-Ork-Home: <repo>/.mini-ork' ":7090/ide/page?…"  → 17343 bytes, the real home's
+                                                                       Freshness line ("No PM source
+                                                                       is enabled …") + four columns
 ```
+
+   Both HTTP 200, both valid JSON, neither empty — **an 18× size difference is the witness**, and it
+   is falsifiable in one command by anyone with the server up. Page key is `kanban`, not `board`
+   (`ide_pages/__init__.py:23` maps `"kanban": "Board"`); a request to any other route resolves
+   elsewhere and proves nothing.
 
    So the `X-Mini-Ork-Home` header **is** honoured and selects the right home — but any page read
    that omits it, or any IDE path that does not send it, is answered out of `/tmp` and shows an
