@@ -58,5 +58,10 @@ track it. This file is the first durable copy; the remaining WS-2..WS-11 should 
    classifications row click re-reading the detail beneath it. No tool call can substitute.
 2. **The user, for D1 / D2 / D6** and priority among **WS-2..WS-11**.
 3. **The user, for Linear/Jira credentials** and the secure-vs-simple tier choice.
-4. **A server restart** for the fifth bucket to appear in the IDE: the running `uvicorn`
-   (PID 81516) predates the change and holds the old bucket list in memory. The CLI already reads it.
+4. **Two fixes, not one, for the IDE to show the fifth bucket.** The running `uvicorn` (PID 81516)
+   predates the change and holds the old bucket list in memory — but it *also* runs against the
+   wrong home: its parent (`81476`) is `bin/mini-ork serve --port 7090 --home
+   /private/tmp/mo-smoke50/.mini-ork`, a temp smoke home with no `epics` table, so page reads that
+   omit `X-Mini-Ork-Home` render an empty board. `kill 81516`, then relaunch **without** the
+   `--home /private/tmp/...` flag. (Corrected: an earlier draft of this report, and of
+   `AGGREGATE.md`, called the restart a single one-action fix.)

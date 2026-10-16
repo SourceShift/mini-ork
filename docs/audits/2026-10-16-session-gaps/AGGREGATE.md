@@ -1,8 +1,9 @@
 # mini-ork + mini-ork-ui — aggregated session gaps
 
-**Collected:** 2026-10-16 · **Sources:** 10 Claude sessions working on the mini-ork engine,
-the `mini-ork-ui` crate, and the `zed-mini-ork` fork · **Scope:** mini-ork and its UI only
-(other workstreams were explicitly excluded).
+**Collected:** 2026-10-16 · **Sources:** 13 sessions filed reports, plus relayed
+correspondence from ≈6 more working on the mini-ork engine, the `mini-ork-ui` crate, and the
+`zed-mini-ork` fork · **Scope:** mini-ork and its UI only (other workstreams were explicitly
+excluded).
 
 Each session self-audited its own assignments — pulling its task list, then re-checking every
 status against git, the engine source, and the state DB, **never against the recorded value**.
@@ -31,6 +32,7 @@ The per-session files sit beside this one; this document is the synthesis.
 | `da0b8c69` | *(none — relayed inline)* | run-page IA + DAG zoom; crate pin | **plan mode, blocked** |
 | `20a62c45` | `20a62c45-work-intake-delivery.md` | work intake / delivery: Linear, Jira, board, threads, attachments | ✅ `60c00154` |
 | `mini-ork-cb` | `mini-ork-cb.md` | run delivery: green runs that never landed; C1–C27; SDD ratification | untracked |
+| `cb737d8d` | `cb737d8d-sdd-run-revive.md` | SDD run-initiation failure root-cause; revive monitor | ✅ `e13b67f2`, `a401f596`, `76d91e55`, `e0171807` |
 
 **Not reported** (messaged, no reply at collection time): the remaining sessions from the sweep.
 The request is idempotent — a late report dropped in this directory is folded in by re-running
@@ -130,7 +132,7 @@ in finding 3 is the same failure seen from the other side.
 | # | gap | where | source |
 |---|---|---|---|
 | 1 | Rubric grader ingests superseded attempts' files → green publish scores `pass=false` | `gates/rubric_scoring.py:141,166`; `rubric_prescreen.py:570` | `86880f3c` G1 |
-| 2 | Run page served at level 1 on the serve fast path (retired tabs) while subprocess serves level 2 | `crates/mini_ork_ui/src/ide_http.rs` (no `MINI_ORK_IDE_SPEC`) | `da0b8c69` G3 |
+| 2 | Run page served at level 1 on the serve fast path (retired tabs) while subprocess serves level 2 | `crates/mini_ork_ui/src/ide_http.rs` (no `MINI_ORK_IDE_SPEC`) | `da0b8c69` G3 — **fixed in the working tree, uncommitted** (round 2) |
 | 3 | `recover` re-runs the closure root, not the hint's node → escalation on a stale rc | recovery path; evidence in `run-1792059337-779` | `86880f3c` G2 |
 | 4 | Deleted targets + dead lanes discovered at verifier time, not preflight (≈$17 and a blocked `deepseek_flash` tail) | preflight / `providers.yaml` | `86880f3c` G5, G4 |
 | 4a | **Three green runs never landed** — `rp-e3-header-v2` / `rp-e6-graph-focus` / `rp-e10-artifacts-learnings` carry `verdict.json` `pass:true` and diffs that still apply, yet none is on `main`. A board `done / step=publisher` does **not** imply a commit | `framework-edit`'s deliverable *is* the diff in the run dir | `mini-ork-cb` G1 |
@@ -151,16 +153,16 @@ in finding 3 is the same failure seen from the other side.
 | # | gap | source |
 |---|---|---|
 | 12 | Revived rows keep the first attempt's `ended_at`/`cost_usd` | `86880f3c` G3 |
-| 13 | Isolation boots N+1 sandboxes (6 for 5 nodes) — disclosed, not a bug, but contradicts "one node per sandbox" | `f5671eaa` G2 |
-| 14 | Epic-runner reflector wired `depends_on` where the plan specified `escalates_to` → wrong runtime semantics | `6881f0ad` G2 |
+| 13 | Isolation boots N+1 sandboxes (6 for 5 nodes) — disclosed, not a bug, but contradicts "one node per sandbox" | `f5671eaa` G2 — **DELIVERED** `d0fd901f` (round 2) |
+| 14 | Epic-runner reflector wired `depends_on` where the plan specified `escalates_to` → wrong runtime semantics | `6881f0ad` G2 — **NOT A GAP, closed** (round 2) |
 | 15 | No stage-report writer: the `<run>/buddy/` feed's writer was removed (`fae2a7a5`), leaving nothing to render | `f6e1ed90` G2 |
 | 16 | Orchestrator section is per-run and `LIMIT 6`; no cross-run view | `d5471234` G4 |
 | 17 | `MO_BUDDY_*` silently ignored after the rename to `MO_WATCH_*` | `f6e1ed90` G3 |
 | 18 | Dead scaffolding / stale worktrees: `_ide-engine`, `author-style-review` + `wt/author-style-review` | `d5471234` G3, `732bb4cc` G4 |
 | 19 | Untracked deliverables at risk: `git stash -u` strands run deliverables; 244 KB report + 1.2 MB corpus in gitignored `runs/`; tests live in `/tmp` outside CI | `8162bb3f` G4, `732bb4cc` G2, G3 |
 | 20 | Doc drift: `docs/todos/2026-10-14-failed-runs-48h-triage.md:375-376` says a run "still reads executing"; the DB says `published` | `83e57620` G4 |
-| 21 | Stale plan/record rows: `run-graph-plan` still `pending` while its three children are `completed` and verified | `6881f0ad` G3 |
-| 22 | Worktree run resolves a bare home → the level-2 spec path is untested there | `da0b8c69` G3 (mechanism) |
+| 21 | Stale plan/record rows: `run-graph-plan` still `pending` while its three children are `completed` and verified | `6881f0ad` G3 — **CLOSED, wrong store** (round 2) |
+| 22 | Worktree run resolves a bare home → the level-2 spec path is untested there | `da0b8c69` G3 (mechanism) — **not actionable as written** (round 2) |
 
 ### Fully un-started
 - ~~**Linear/Jira integration from the UI** — no code, no branch.~~ **RETRACTED — this was already
@@ -290,7 +292,181 @@ missing.
 `threads: 3`, every external source `enabled: false`. The board correctly renders "add a source to
 config/pm.yaml". Blocked on the operator, not on code.
 
-**`:7090` serves pre-sync code** (`20a62c45` G4 — corroborates `f6e1ed90` G4 and `da0b8c69` G3):
-listener PID **81516**, started **Oct 15 14:17:53**, older than every shipped commit above. The
-delivered work is invisible in the IDE until an operator restarts. **One restart clears three
-sessions' "not visible in the IDE" reports** — this is the single highest-leverage action available.
+**`:7090` runs the wrong engine AND the wrong home — TWO fixes, not one**
+(`20a62c45` G4, corrected by that session after investigation; corroborates `f6e1ed90` G4 and
+`da0b8c69` G3). This document first called it "the single highest-leverage one-action fix". That
+was wrong, and a restart taken from it would appear to fail. The two defects:
+
+1. Listener PID **81516**, started **Oct 15 14:17:53**, predates every shipped commit — the
+   delivered work is invisible.
+2. **Its default home is `/tmp`.** The parent (`81476`) was launched as
+   `bin/mini-ork serve --port 7090 --home /private/tmp/mo-smoke50/.mini-ork` — a temp smoke home
+   whose `state.db` has no `epics` table. Confirmed here from the process argv. Any page read that
+   omits `X-Mini-Ork-Home` is answered out of that scratch project and renders an **empty board**;
+   the header *is* honoured, the **default** is what's broken.
+
+**Correct action: `kill 81516`, then relaunch WITHOUT `--home /private/tmp/...`.** Repeating the
+flag reproduces the empty board exactly. Note also that the restart is the user's server and their
+call — `mini-ork-81` correctly declined to take it on a peer's say-so, and so should any session
+that reads this.
+
+---
+
+## Delivery — round 1 (delegation)
+
+Delegated by fanning each gap back to the session that audited it. Status at close:
+
+**Delivered**
+- **P2#20** doc drift → `a6ef9ff2` on `origin/main` (`deliver-mini-ork-tasks`). Gated on a real
+  check (every changed path `.md`), not a trivially-true one.
+- **P2#17** stale `MO_BUDDY_*` → committed **locally** as `5e668ebb` (not pushed — see below).
+  Warn-once per variable, through the single funnel both knob readers already share. Verified:
+  `MO_BUDDY_STALL_SECONDS=42` warns once *and* still yields the default 300; second call silent;
+  40 watch tests pass; ruff clean.
+- **P1#7 + P1#10 (partial)** → `kickoffs/sdd-mechanisms/DECISIONS.md` @ `fc2c1d91`
+  (`mini-ork-39`): all 15 epics listed with declared path + verified status (9 landed, 6 missing),
+  and every landed epic now carries a recorded keep-shadow / shadow / unconditional decision
+  rather than a default.
+- **Consolidated-board epic** → `docs/epics/EPIC-consolidated-ticket-board.md` @ `16642bc3`
+  (`mini-ork-81`): documents shipped behaviour only — the single `buckets` map (`kanban.py:648`)
+  both `_epic_buckets:523` and `_tickets_into:582` fill, `_fair_share:333`, the no-network reader
+  rule, the Sources pane — with 8 acceptance criteria each naming the file it is checkable
+  against, and the user's open "alongside, not replacing" decision recorded. Gate: 50 passed.
+
+**Blocked on the user — routed, not fired**
+- **P1#7 epic implementation** (I2/I4/I6/I8 dependency-ready; I7 waits on I8, I9 on I4).
+  `mini-ork-39` declined to launch and gave three reasons, all correct: (1) the mini-ork contract
+  forbids launching the scheduler from an agent turn — it is reaped at the turn boundary, so it
+  must run under tmux/launchd/CI; (2) the SDD epics are **not ingested** (`mini-ork epics list` →
+  96 epics, zero `sdd-*`); (3) a bare `scheduler` drains **every** ready epic — 19 ready across
+  unrelated programmes (`libwit-se-*`, `rlm-*`, `ai-skill-*`, `frc-*`), so an unscoped run would
+  spend on the wrong work. Correct path: `epics ingest kickoffs/sdd-mechanisms/roadmap.md`, then
+  dispatch only `sdd` ids in a scoped loop under tmux. **A supervised, budget-spending run —
+  needs the user's go/no-go.**
+- **P1#8** (5th board bucket in the Rust `Counts`) — **held, not skipped**: `board.rs` is dirty in a
+  peer's crate checkout, so adding the field concurrently would collide with their uncommitted work.
+  Release once their edit lands.
+- **Run-page IA** (`da0b8c69`) — delegated to `run-page-ux-clarity` **conditionally**: that session
+  is in plan mode and cannot edit until its user approves.
+- **P0#2** (`ide_http.rs` spec level) — in flight by a peer; `MINI_ORK_IDE_SPEC` is now present and
+  the file is dirty. Deliberately not duplicated.
+
+**Reclassified — not a gap**
+- **P2#15** (no stage-report writer) — the writer was removed **deliberately** (`fae2a7a5`, "the run
+  buddy is gone"; `watch.py:21` records the move out of the deleted `run_buddy.py`). Building one
+  would resurrect a deliberately-removed mechanism. It is a **decision for the user**, not a
+  deliverable — delegating it as written would have been a regression.
+
+**New process finding — how changes land on `origin/main`**
+`deliver-mini-ork-tasks` reported local `main` diverged, an `--ff-only` refresh refusing, and
+concluded "origin/main is a curated mirror, so local main must never be pushed." Re-checked at
+close: divergence is `0/0` and `fc2c1d91` **is** on origin — a transient state, not a policy;
+`origin/main` does receive session pushes (that same session pushed `a6ef9ff2`). The durable rule
+underneath it is the one that matters: **push a commit built on `origin/main`, never the primary's
+local `main` verbatim**, because the primary can carry local-only commits. This aggregation pushed
+twice from the primary (`f8b0f3e0`); both times it published only docs/spec commits and the
+affected peer consented after the fact, but the method was the risky one. Land from a worktree of
+`origin/main`.
+
+---
+
+## Delivery — round 2 (delegation, continued)
+
+**Closed without code**
+- **P2#14** (reflector wired `depends_on`, not the plan's `escalates_to`) — **not a gap.**
+  `6881f0ad` reported the deviation; `fix-run-graph-edges` checked the in-repo rationale
+  (`recipes/epic-runner/workflow.yaml:72-76`, committed `1ab7ad14`) *against the compiler* rather
+  than accepting it: `workflow/compiler.py:405` adds a source to `parents[target]` only when
+  `not recursive and edge_type not in {"escalates_to", "retries"}`, so an `escalates_to`-only node
+  lands with **no control parents** and is schedulable before its predecessor ran; and `:498-501`
+  makes `escalates_to` a live loop only with a `recursion:` block, which epic-runner lacks
+  (`max_self_correction_iterations: 0`). The plan's edge would have been **inert and parentless**.
+  `depends_on` is a correction to the plan, not a regression.
+- **P2#21** (`run-graph-plan` stale `pending`) — **wrong store.** It is a ContextNest fragment
+  (`cn-fed07f7369f13ad3ad4bb3d9ac049260`, `task_id=run-graph-plan`, `kind=todo`,
+  `session_id=6881f0ad`, emitted `2026-10-16T10:44:07Z`), which is why `sqlite3 .mini-ork/state.db`
+  found nothing. ContextNest dedupes `tasks[]` by `task_id` keeping the last status, so the stale
+  row closes by emitting a later `completed` from the owning session — no HTTP write, no DB
+  mutation. **The lesson generalises: two task stores were being read as one.**
+
+**Delivered**
+- **P2#13** → `d0fd901f` on `origin/main` (`mini-ork-c4`): `docs/architecture/per-node-sandboxes.md`
+  now opens with an explicit "N, or N+1?" paragraph (N node sandboxes + one run-level; the extra is
+  the process with no node to name, which returns `""` from `run_nodes.isolated_node`), so the top
+  framing matches the Cost/Verified sections. The same commit fixed a dead anchor
+  (`artifact-transport.md` cited `remote.py:1758`; the real sites are `:1959`/`:2022`) and added a
+  **"Status: what ships today (verified 2026-10-16)"** section to that doc — it is a design, not
+  shipped behaviour, with what *is* enforced tabulated (absolute outputs yes; relative outputs
+  skipped at `execute.py:2153`; `_required_artifacts_ok` at `:2126`) and the two live recipes that
+  declare relative outputs named (`bug-audit-fe-be`, `blog-cohesion`).
+
+**Half-delivered, half the user's — and correctly not decided by an agent**
+- **P1#6** (a recipe-declared `path` has no home) → the *document* is now honest about the state
+  (`d0fd901f`), which needed no decision. The node-side home was **declined**: it resolves a fork
+  the user has an open, unanswered question on — cross-node artifacts through a cloud shared
+  filesystem (their stated preference) versus the local relay with a surviving `path` contract.
+  `mini-ork-c4` refused to pick a branch *and* refused to delete the promise from the contract,
+  because removing it forecloses the branch the user may choose. That is the right call: an agent
+  guessing here would silently answer the user's question with trivia.
+
+**Not actionable as written**
+- **P2#22** — `mini-ork-c4` cannot turn "a worktree run resolves a bare home, so the level-2 spec
+  path is untested there" into an artifact or a test. It needs the specific spec path and the
+  specific run.
+
+**Status changes in the tree, uncommitted**
+- **P0#2** (`ide_http.rs` missing `MINI_ORK_IDE_SPEC`) is **fixed in the working tree** but not
+  committed: `src/board.rs` gains a single `pub const IDE_SPEC: &str = "2"` and `src/ide_http.rs`
+  both sets it on a server it starts and sends it **per request** (`spec=`), with the reason in the
+  comment — a server already listening was started by someone else and defaults to level 1. One
+  constant, two read paths, because two literals is what produced the divergence.
+  **This is in-flight peer work, not this session's** — `fix-run-graph-edges` attributed the two
+  dirty files to me; the diff says P0#2. It also means **P1#8** (the 5th `Counts` bucket in
+  `board.rs`) is still colliding with an uncommitted file, so it stays held.
+
+**A peer refusing the right thing, again**
+- `fix-run-graph-edges` **stopped coordinate-clicking** after its synthetic clicks kept landing in
+  the user's live Alacritty terminal ("window Alacritty of application process alacritty"), where a
+  second agent session runs. Guessing screen coordinates over someone's live shell is not a check
+  worth running, and it handed the verification back rather than continue. Recorded because it is
+  the same judgement as the `:7090` restart refusal and the P1#6 refusal: the tool *can* do a
+  thing, and the right answer is still no.
+- It also established *why* the DAG-click cannot be observed here — a structural reason, not a lack
+  of effort: the live engine serves the **v1** tab set at *both* `spec=1` and `spec=2`
+  (`key=run` → `[dag, kickoff, overview, agents, learnings, artifacts]`), and v1 leads with `dag`,
+  so `goto_main_tab()` finds itself already at `tabs[0]` and early-returns **by design**. The v2 tab
+  set exists only as uncommitted working-tree work (`run.py` dirty in the primary) and the running
+  process predates it. So the run-page case is **unobservable on this engine** until the server is
+  restarted onto the new code — the same `kill 81516` fix, seen from the other side.
+
+**Second witness for the `:7090` home defect (falsifiable in one command)**
+- `mini-ork-81` offered an independent, replayable receipt: the same page at the same route differs
+  **18× in bytes** by header alone —
+  `curl -s ':7090/ide/page?key=kanban&tab=tasks'` → **931 bytes**, one item: *"No epics table —
+  initialise the project (`mini-ork init`) to see the Tasks column here."*; with
+  `-H 'X-Mini-Ork-Home: /Volumes/docker-ssd/ps/mini-ork/.mini-ork'` → **17343 bytes**, the four
+  Tasks columns. Both HTTP 200, both valid JSON. That is the empty board the argv predicts.
+  It also fixes this document's route: the page is `/ide/page?key=kanban&tab=tasks` — the key is
+  **`kanban`**, not `board` (`ide_pages/__init__.py:23`).
+
+**New reports folded in (arrived after round 1)**
+- **`cb737d8d`** — SDD run-initiation root-cause + revive monitor. Five specs / 36 ACs carry
+  **zero** executable fences → `gates-materialize` emits one `NO_EXECUTABLE_FENCE` per AC →
+  `test-validity` fails → 8 failed nodes; the recovery loop is non-convergent by construction (the
+  replanner writes SpecCards mutating `acceptance[ACn].gate.probe`, which `gates-materialize` never
+  reads — it rebuilds probes from the spec's own bash fences). Landed and on `origin/main`:
+  `e13b67f2` (`NO_EXECUTABLE_FENCE` WARNING), `a401f596` (the `# ACn precondition` marker could
+  never fire — an injected `set -euo pipefail` header meant the author's marker was never on line
+  0), `e0171807` (`specs --help` codes line now derived from `SEVERITY`, the literal having gone
+  stale the moment `e13b67f2` added a code), `76d91e55` (decision-record addendum recording that
+  lint did *not* close the guarantee the record claimed). **Open:** all five specs still have 0
+  fence headers — that authoring *is* the unblock; two ACs (`codefix-classifier-coverage.md` AC8,
+  `specdir-kickoff-precedence.md` AC7) cite a `tests/unit/test_classify.py` that does not exist,
+  and AC1 duplicates AC8 verbatim. **Blocked on the user for one thing:** which existing test
+  proves which AC — guessing writes `precondition` tags that fail the gate by construction.
+- **`mini-ork-c4`** — P2#13/P1#6 above, plus a merge-discipline flag: the primary checkout is
+  **diverged, not stale** (1 ahead / 1 behind `origin/main`, HEAD moving under it while sessions
+  work, siblings' live edits in the tree — `rubric_scoring.py`, `ide_pages/*`, `verify/levels.py`).
+  `--ff-only` correctly refuses. Per merge discipline that means *stop*, not reconcile — and any
+  session told to "just FF the primary" will fail until whoever owns those commits lands them.
+  None of its work is stranded: it is all on `origin/main`.
