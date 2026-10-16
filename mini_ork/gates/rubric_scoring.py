@@ -137,6 +137,58 @@ _MAX_READ_CHARS = 5_000_000
 # artifact dwarfs its companions still lists the companions' contents.
 _MIN_FILE_CHARS = 512
 
+# The narrative of an attempt that ended unresolved. Nothing clears these when
+# a run is revived, so they stay in the run dir and describe the attempt the
+# revive replaced — see _superseding_green_verdict.
+_SUPERSEDED_MARKERS = frozenset({
+    "NEEDS-CHANGE.md",
+    "rolled-back.json",
+    "retry-hint.json",
+    "retry-gate.json",
+    "diagnosis.json",
+    "owner.json",
+})
+
+# The run-level verdicts, most authoritative last. Either shape of "this run
+# passed" counts: ``{"pass": true}`` (verdict.json) or ``{"verdict": "pass"}``
+# (run-verdict.json).
+_RUN_VERDICTS = ("verdict.json", "run-verdict.json")
+
+
+def _superseding_green_verdict(run_dir: str) -> Optional[float]:
+    """Mtime of the newest run-level verdict, when that verdict says the run passed.
+
+    A revive leaves the previous attempt's escalation markers behind
+    (``NEEDS-CHANGE.md`` and friends), and the grader read them as this run's
+    own narrative: measured 2026-10-16, ``rubric.json`` for the revived
+    ``rp-e3-header-20261015-222115`` was written after a green publish and still
+    scored ``pass=false``, quoting the superseded attempt's NEEDS-CHANGE.md and
+    ``rolled-back.json``. A verdict written *after* a marker is the run's last
+    word on it, so a green one retires the marker; a red one leaves it standing
+    as the explanation. Returns ``None`` when there is no verdict, or when the
+    newest one is not a pass.
+    """
+    newest: Optional[tuple[float, bool]] = None
+    for name in _RUN_VERDICTS:
+        path = os.path.join(run_dir, name)
+        try:
+            with open(path, encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        passed = payload.get("pass") is True or payload.get("verdict") == "pass"
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        if newest is None or mtime > newest[0]:
+            newest = (mtime, passed)
+    if newest is None or not newest[1]:
+        return None
+    return newest[0]
+
 
 def artifact_summary(run_dir: str, max_chars: int = 12000) -> str:
     """Bounded work-product summary handed to the rubric grader.
@@ -161,16 +213,29 @@ def artifact_summary(run_dir: str, max_chars: int = 12000) -> str:
     the grader can distinguish a short artifact from a clipped view of
     a long one. Silently clipping made a complete document look like it
     ended mid-section, which the grader then failed on "no truncation".
+
+    A revived run's superseded markers are omitted rather than sampled, and
+    the omission is named in the summary so the grader knows they exist and
+    why they are not shown (see ``_superseding_green_verdict``).
     """
     try:
         names = sorted(os.listdir(run_dir))
     except FileNotFoundError:
         return ""
 
+    superseded_at = _superseding_green_verdict(run_dir)
     entries: list[tuple[str, int, bool]] = []
+    suppressed: list[str] = []
     for name in names:
         path = os.path.join(run_dir, name)
         if not os.path.isfile(path) or name.startswith("."):
+            continue
+        if (
+            superseded_at is not None
+            and name in _SUPERSEDED_MARKERS
+            and os.path.getmtime(path) < superseded_at
+        ):
+            suppressed.append(name)
             continue
         try:
             size = os.path.getsize(path)
@@ -181,7 +246,15 @@ def artifact_summary(run_dir: str, max_chars: int = 12000) -> str:
     if not entries:
         return ""
 
+    note = ""
+    if suppressed:
+        note = (
+            "### superseded, not shown (written by the attempt this run "
+            f"replaced): {', '.join(sorted(suppressed))}"
+        )
     header_cost = sum(len(f"### {n} ({s} bytes)") + 1 for n, s, _ in entries)
+    if note:
+        header_cost += len(note) + 1
     budget = max(max_chars - header_cost, 0)
 
     text = [(n, s) for n, s, t in entries if t]
@@ -215,6 +288,9 @@ def artifact_summary(run_dir: str, max_chars: int = 12000) -> str:
             quota[n] = min(quota[n], s)
 
     lines: list[str] = []
+    if note:
+        lines.append(note)
+        lines.append("")
     for name, size, is_text in entries:
         lines.append(f"### {name} ({size} bytes)")
         if is_text:
