@@ -1263,6 +1263,66 @@ def _compose_carry_and_edits(repo: str, base_ref: str, carry_text: str,
     return AuthoredPatch(patch, f"carry-patch:{carry_name}+transcript-replay")
 
 
+def _omitted_declared(run_dir: str, repo: str, base_ref: str,
+                      patch_text: str) -> list[str]:
+    """Declared in-scope files the tree changed that ``patch_text`` never carries.
+
+    ``_verify_against_tree`` proves each file a replay DID carry; it says nothing
+    about the files the replay never reached.  A run whose implementer generated a
+    module with Bash (``tsx scripts/emit-… > shared/types/x.ts``) or whose tests
+    were written outside the declared scope replays only part of its own change,
+    and the missing files are exactly those a peer's edit cannot explain: no
+    Write/Edit call ever named them.
+    """
+    declared = _declared_files(run_dir)
+    if not declared:
+        return []
+    scope = _scope(run_dir)
+    real_repo = os.path.realpath(repo)
+    carried = set(_paths_in_patch(patch_text))
+    out: list[str] = []
+    for raw in declared:
+        rel = _repo_rel(raw, real_repo)
+        if rel is None or rel in carried or not _in_scope(rel, scope):
+            continue
+        base = _base_content(repo, base_ref, rel)
+        try:
+            tree: str | None = _read_text(os.path.join(real_repo, rel))
+        except FileNotFoundError:
+            tree = None
+        except OSError:
+            continue  # unreadable: cannot prove it was dropped, so do not claim it
+        if base != tree:
+            out.append(rel)
+    return sorted(out)
+
+
+def _require_complete(result, run_dir: str, repo: str, base_ref: str | None):
+    """Refuse an authored patch that silently drops part of the run's own change.
+
+    Called on the transcript-replay and emitted-diff results right before they are
+    returned.  Publishing a partial patch is worse than abstaining: the landed
+    commit imports a file the patch never created, so it does not build — and the
+    publisher's own tree comparison already proved every file the patch DOES carry,
+    which is what makes the omission invisible.
+    """
+    if not isinstance(result, AuthoredPatch) or not base_ref:
+        return result
+    missing = _omitted_declared(run_dir, repo, base_ref, result.patch_text)
+    if not missing:
+        return result
+    named = ", ".join(missing[:4])
+    if len(missing) > 4:
+        named += f" (+{len(missing) - 4} more)"
+    return Abstain(
+        "publish-no-authored-patch",
+        f"the authored patch ({result.source}) omits {len(missing)} declared file(s) "
+        f"the tree changed against the pre-implementer base: {named} — the replay "
+        "reproduced the files it reached, but no Write/Edit names these, so "
+        "publishing would land a partial change",
+    )
+
+
 def resolve_authored_patch(run_dir: str, repo: str | None = None) -> AuthoredPatch | Abstain:
     """The run's AUTHORED patch, or an :class:`Abstain` when it cannot be proven.
 
@@ -1336,7 +1396,7 @@ def resolve_authored_patch(run_dir: str, repo: str | None = None) -> AuthoredPat
     if base_ref:
         replayed, evidence = _resolve_from_transcripts(run_dir, repo, base_ref, scope)
         if isinstance(replayed, AuthoredPatch):
-            return replayed
+            return _require_complete(replayed, run_dir, repo, base_ref)
         if evidence:
             # Evidence existed and did not reconcile: a peer's in-window edit.
             # Falling back here would commit exactly the change we must not.
@@ -1345,7 +1405,7 @@ def resolve_authored_patch(run_dir: str, repo: str | None = None) -> AuthoredPat
     # 2) the implementer's emitted diff (text/codex lanes print instead of editing).
     emitted = _resolve_from_emitted_diff(run_dir, repo, scope)
     if emitted is not None:
-        return emitted
+        return _require_complete(emitted, run_dir, repo, base_ref)
 
     # 3) declared files — the legacy shape only, and only with NO baseline.  With a
     #    pre-implementer-ref present the declared list is a whole-file TREE delta

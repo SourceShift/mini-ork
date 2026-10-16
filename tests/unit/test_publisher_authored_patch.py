@@ -983,3 +983,45 @@ def test_a_single_earlier_session_holding_every_in_scope_edit_is_replayed(tmp_pa
     assert isinstance(authored, AuthoredPatch), authored
     assert "line2-run" in authored.patch_text
     assert "b.py" not in authored.patch_text
+
+
+def test_a_replay_that_drops_a_declared_file_abstains(tmp_path, repo):
+    """2026-10-16 cjd-fishaudio-narration: the implementer generated a module with
+    ``tsx scripts/emit-…`` and left it out of its Write/Edit calls, so the replay
+    reconciled the files it DID carry and the declared b.py had no authored call at
+    all. Publishing that patch would land a.py alone — and a.py imports b.py."""
+    base = _head(repo)
+    run_dir = _make_run_dir(
+        tmp_path, repo, base, scope=["a.py", "b.py"],
+        edits=[("Edit", {"file_path": str(repo / "a.py"),
+                         "old_string": "line2\n", "new_string": "line2-run\n"})],
+        summary={"files_changed": [str(repo / "a.py"), str(repo / "b.py")]})
+    (repo / "a.py").write_text(BASE_A.replace("line2", "line2-run"))
+    (repo / "b.py").write_text(BASE_A.replace("line7", "line7-generated"))
+
+    authored = resolve_authored_patch(str(run_dir))
+
+    assert isinstance(authored, Abstain), authored.patch_text
+    assert authored.reason == "publish-no-authored-patch"
+    assert "b.py" in authored.detail
+
+
+def test_a_replay_covering_every_declared_change_still_publishes(tmp_path, repo):
+    """The completeness guard must not turn a whole authored change into an
+    abstain: every declared file the tree changed is in the patch here."""
+    base = _head(repo)
+    run_dir = _make_run_dir(
+        tmp_path, repo, base, scope=["a.py", "b.py"],
+        edits=[("Edit", {"file_path": str(repo / "a.py"),
+                         "old_string": "line2\n", "new_string": "line2-run\n"}),
+               ("Edit", {"file_path": str(repo / "b.py"),
+                         "old_string": "line7\n", "new_string": "line7-generated\n"})],
+        summary={"files_changed": [str(repo / "a.py"), str(repo / "b.py")]})
+    (repo / "a.py").write_text(BASE_A.replace("line2", "line2-run"))
+    (repo / "b.py").write_text(BASE_A.replace("line7", "line7-generated"))
+
+    authored = resolve_authored_patch(str(run_dir))
+
+    assert isinstance(authored, AuthoredPatch), authored
+    assert "line2-run" in authored.patch_text
+    assert "line7-generated" in authored.patch_text
