@@ -196,9 +196,18 @@ non-empty, and neither is code:
 1. Put one credential in place — `LINEAR_API_KEY`, or `JIRA_API_TOKEN` + `JIRA_EMAIL`, or
    `GITHUB_TOKEN` — as a key **name** in `.mini-ork/config/vault.yaml` or
    `secrets.local.sh`, then set that source `enabled: true` in `config/pm.yaml`.
-2. Restart the `mini-ork serve` on `:7090`. The IDE reads pages through it before it shells out to
-   `board page`, and the running server predates the commits in §1 — so this page is invisible in
-   the IDE until it restarts. (Measured 2026-10-16: listener PID 81516, up since Oct 15 14:17.)
+2. Restart the `mini-ork serve` on `:7090`, and **launch it without the `--home` its parent was
+   started with.** The IDE reads pages through that server before it shells out to `board page`, so
+   two independent defects hide this page until it restarts:
+
+   - the running server predates the commits in §1 (measured 2026-10-16: listener PID 81516, up
+     since Oct 15 14:17) — so it serves the *old* `kanban.py`; and
+   - its parent process (`81476`) was started as
+     `bin/mini-ork serve --port 7090 --home /private/tmp/mo-smoke50/.mini-ork` — a **temp smoke
+     home with no `epics` table**. A page read that omits the `X-Mini-Ork-Home` header is answered
+     out of `/tmp` and shows *"No epics table — initialise the project"*. Probed live: the same URL
+     with `-H 'X-Mini-Ork-Home: <repo>/.mini-ork'` returns the real board. The header is honoured;
+     the **default** is what is wrong, and dropping the flag is the fix.
 
 Then: **Sync tickets** on the Tasks tab, and confirm a ticket card appears beside the epics in its
 status column.

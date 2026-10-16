@@ -85,14 +85,37 @@ source credential exists in the vault. The Board renders correctly and truthfull
 (`kanban.py:466-480` — "No PM source is enabled — add a source to config/pm.yaml"). **Not a code
 gap; blocked on the operator.**
 
-### G4 — The `:7090` server is serving pre-sync code (correction to the epic doc)
+### G4 — The `:7090` server runs pre-sync code **and defaults to a `/tmp` smoke home**
 ```
 lsof -nP -iTCP:7090 -sTCP:LISTEN   → Python 81516, 127.0.0.1:7090 (LISTEN)
 ps -o pid,lstart -p 81516          → started Thu Oct 15 14:17:53 2026
+lsof -a -p 81516 -d cwd -Fn        → /Volumes/docker-ssd/ps/mini-ork
+ps -ww -o command= -p 81476        → bin/mini-ork serve --port 7090 --home /private/tmp/mo-smoke50/.mini-ork
 ```
-The running server predates the sync and every commit above. The engine half of my delivery is
-invisible in the IDE until it restarts. (The `EPIC-work-intake-thread-communication.md` §4 "reboot
-trap" still cites PID 55861 / Oct 10 — stale; the current PID is 81516.) **Operator action.**
+81516 is the re-exec'd child of 81476 (identical start second; `mini-ork serve` re-execs uvicorn —
+see the launcher's venv re-exec). Two independent defects, and **the restart fixes only the first**:
+
+1. **Pre-sync code.** Started Oct 15 14:17:53, before every commit in §1 — the engine half of the
+   delivery is invisible in the IDE. (The `EPIC-work-intake-thread-communication.md` §4 "reboot
+   trap" still cites PID 55861 / Oct 10; stale, current PID is 81516.)
+2. **A smoke home as the server default.** It was launched `--home /private/tmp/mo-smoke50/.mini-ork`
+   — a temp home whose `state.db` has **no `epics` table** (`sqlite3 … "SELECT 1 FROM epics"` →
+   `no such table: epics`). Probed live:
+
+```
+curl -s ":7090/ide/page?key=kanban&tab=tasks"                       → "No epics table — initialise
+                                                                       the project (`mini-ork init`)"
+curl -s -H 'X-Mini-Ork-Home: <repo>/.mini-ork' ":7090/ide/page?…"  → the real home's Freshness line
+                                                                       ("No PM source is enabled …")
+```
+
+   So the `X-Mini-Ork-Home` header **is** honoured and selects the right home — but any page read
+   that omits it, or any IDE path that does not send it, is answered out of `/tmp` and shows an
+   empty project. A restart that repeats the same `--home` reproduces this exactly. **Drop it.**
+
+**The correct restart is two changes, not one:** a fresh process (`kill 81516` first, or the port
+stays held by the old listener) launched **without** `--home /private/tmp/mo-smoke50/.mini-ork`.
+**Operator action.**
 
 ### G5 — The "re-dispatch the blocked epics" half of task 3 is unowned
 I repointed the home lane overlay off dead minimax, then restored it when minimax recovered. The
@@ -126,7 +149,10 @@ previews and `pick_files` are inside the pin; no orphaned crate commit.
 
 **The user (operator actions):**
 1. **Restart the `:7090` server** (PID 81516, up since Oct 15 14:17) so the IDE serves the synced
-   engine. Nothing else makes the delivered work visible.
+   engine — **and drop the `--home /private/tmp/mo-smoke50/.mini-ork` its parent (81476) was
+   started with.** Restarting with the same flag reproduces G4's second defect: the server would
+   still answer header-less page reads out of `/tmp`. Nothing else makes the delivered work
+   visible.
 2. **A ticket credential + `enabled: true`** for one source — `LINEAR_API_KEY`, or
    `JIRA_API_TOKEN` + `JIRA_EMAIL`, or `GITHUB_TOKEN`, in
    `.mini-ork/config/vault.yaml` / `secrets.local.sh` (key **names** only), then flip that source
