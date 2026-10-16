@@ -536,6 +536,41 @@ def _refresh_stale_baseline_for_resume(plan: RecoveryPlan, run_dir: str,
         return False
 
 
+def _clear_stale_stop_request(run_dir: str) -> bool:
+    """Drop a ``.stop-requested`` left behind by the attempt this recovery continues.
+
+    The flag is a *soft*-stop signal aimed at a running dispatcher: ``POST /stop``
+    writes it, the executor checks it before every node, and only the hard-kill
+    path unlinks it — so a run that was stopped rather than killed carries the
+    file into the grave. The executor checks it at the very first node, before any
+    dispatch, so `recover` used to skip the entire closure, fail the run again and
+    still exit 0. Reaching here means every refusal gate has passed and the run is
+    owned, so the marker can only be one this command exists to override.
+
+    Returns True when a marker was removed. A marker that cannot be removed is
+    reported and left in place: the recovery then behaves as it did before rather
+    than pretending the operator's stop was honoured.
+    """
+    if not run_dir:
+        return False
+    flag = os.path.join(run_dir, ".stop-requested")
+    try:
+        os.unlink(flag)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        sys.stderr.write(
+            f"[mini-ork-recover] could not clear {flag}: {exc} — the run will "
+            "stop at its first node instead of continuing\n"
+        )
+        return False
+    sys.stdout.write(
+        "[mini-ork-recover] cleared a stop request left by the previous "
+        "attempt; continuing\n"
+    )
+    return True
+
+
 def _format_restore_plan(
     run_dir: str,
     cli_carry_patch: str | None,
@@ -1241,6 +1276,11 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
     # movement the run's own ledger attributes to the prior implementer is
     # refused (never launder a committed change into an empty harvest).
     _refresh_stale_baseline_for_resume(plan, run_dir, db_path)
+
+    # A stop request is aimed at the dispatcher being replaced, not at this one.
+    # The executor honours it before the first node, so leaving it makes the
+    # closure a no-op that still reports the run as failed.
+    _clear_stale_stop_request(run_dir)
 
     # Active strategies: emit the env, print the plan, hand off to
     # the native executor which honors MINI_ORK_RECOVERY_FROM + CLOSURE.

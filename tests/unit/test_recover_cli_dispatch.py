@@ -61,6 +61,24 @@ def test_cli_dispatches_closure_then_releases_lease(tmp_path, monkeypatch):
     assert con.execute("SELECT status FROM recovery_requests WHERE run_id=?", (run_id,)).fetchone()[0] == "completed"
 
 
+def test_cli_clears_a_stale_stop_request_before_dispatching(tmp_path, monkeypatch):
+    """`POST /stop` writes `.stop-requested` and only the hard-kill path unlinks
+    it, so a stopped run carries the marker into `recover` — where execute honours
+    it before the first node, skipping the whole closure and failing the run again
+    while the command still exits 0."""
+    run_id, db, workflow = _setup(tmp_path, monkeypatch, recipe_env=True)
+    run_dir = Path(os.environ["MINI_ORK_RUN_DIR"])
+    (run_dir / ".stop-requested").write_text("1792142272\n")
+    calls = []
+
+    rc = rp.cli_main([run_id, "--workflow", workflow, "--db", db],
+                     execute_fn=lambda argv: calls.append(argv) or 0)
+
+    assert rc == 0
+    assert calls == [["--recovery"]]
+    assert not (run_dir / ".stop-requested").exists()
+
+
 def test_cli_propagates_executor_failure_and_still_releases(tmp_path, monkeypatch):
     run_id, db, workflow = _setup(tmp_path, monkeypatch, recipe_env=True)
     rc = rp.cli_main([run_id, "--workflow", workflow, "--db", db], execute_fn=lambda argv: 3)
