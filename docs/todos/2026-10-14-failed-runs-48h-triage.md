@@ -477,7 +477,28 @@ Measured on one identical six-file selection
 
 Shipped as `778a0686`, merged with that six-file selection as the gate.
 
-### 10.5 — the lesson worth keeping
+### 10.5 — full-suite confirmation
+
+The six-file selection is a probe, not the whole story — the same reasoning that
+made §9.3 distrust a scoped gate. Re-running the full `tests/unit` on the
+post-fix `main`, in a detached worktree rather than the shared primary:
+
+| suite state | result |
+|---|---|
+| pre-merge base `2e8367f7` | 4 failed, 9478 passed |
+| post-merge `2d786fec` | **18 failed**, 9507 passed |
+| post-fix `24893d48` | **2 failed**, 9593 passed |
+
+The two survivors are `test_acp_commands::test_serve_down_returns_command` and
+`test_node_agent::test_real_container_session` — both already red at the base.
+So the regression is closed: **the 14 failures the merge introduced are gone,
+and none of them was a pre-existing red being masked.** Two of the base's four
+pre-existing failures also cleared on this run, which is ordinary flake, not a
+fix. The run costs ~55 minutes of wall clock; that is the price of the check,
+and it is worth paying after any merge that touches a shared registry or a test
+fixture.
+
+### 10.6 — the lesson worth keeping
 
 **A test that borrows a *real* registry name must restore it, not delete it.**
 Two compounding details made this permanent: the registration happens at
