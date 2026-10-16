@@ -1528,13 +1528,25 @@ def build_payload(home: Path, args) -> dict[str, Any]:
         payload = act(home, args.verb, args.run_id)
     if reap_errors:
         payload.setdefault("errors", {}).update(reap_errors)
-    # A page records a broken source in ``errors`` and the IDE draws only the
-    # sections — so an error in that map but not on the page is one nobody sees.
-    # The reaper's error is merged just above, after the page was built, which is
-    # why this rides here rather than inside a page module: it is the last point
-    # that holds the whole map.
     errors = payload.get("errors")
     if isinstance(errors, dict) and isinstance(payload.get("sections"), list):
+        # The attention strip (FR-040) is prepended to every tab of the
+        # orchestrator page. It rides here, not inside ``orch.build``, because
+        # the reaper's error is merged into the map just above — and an error
+        # the strip cannot see is one it cannot report. It is also why the strip
+        # is built before the banner below: reading run profiles discovers parse
+        # failures that belong in that banner too.
+        if args.verb == "page" and payload.get("key") == "orch":
+            from mini_ork.ide_pages import orch
+
+            strip = orch.attention(home, str(payload.get("tab") or ""), errors)
+            if strip is not None:
+                payload["sections"].insert(0, strip)
+        # A page records a broken source in ``errors`` and the IDE draws only the
+        # sections — so an error in that map but not on the page is one nobody
+        # sees. The reaper's error is merged just above, after the page was
+        # built, which is why this rides here rather than inside a page module:
+        # it is the last point that holds the whole map.
         from mini_ork.ide_pages.spec import errors_callout
 
         banner = errors_callout(errors)

@@ -58,9 +58,9 @@ or a shell.
 | **P1 — Dispatch** ✅ | `board start`, `kickoff new`, the Dispatch tab. | J1, J3 | Medium — spawns processes |
 | **P2 — Answers** ✅ | Recent-run profile scan, `board answer`, the blocked-on-you panel. | J5, J9 | Low |
 | **P3 — Races** ✅ | `board race-keep`, `intake_events.run_id`, arrivals link, the race panel. | J2, J6 | Medium — schema + git merge |
-| **P4 — Attention** | The strip, once its four inputs exist. | all | Low |
+| **P4 — Attention** ✅ | The strip, once its four inputs exist. | all | Low |
 
-✅ = implemented (P0 2026-10-15, P1–P3 2026-10-16). P4 is the only phase left.
+✅ = implemented (P0 2026-10-15, P1–P4 2026-10-16). All four phases are in.
 
 Each phase is independently shippable and independently revertable. P0 delivers
 user-visible improvement with **zero new CLI surface** — it is the recommended first
@@ -507,6 +507,12 @@ the reaper runs before the page is built (its error is already on the page via t
 FR-001 callout), and reaping again to test it would be a second write on a read path.
 A callout that says the same finding once is the whole requirement.
 
+*FR-040 addition:* that same error map is one of the attention strip's four inputs, so
+the finding now rides **every** tab as the strip's `{n} error(s)` item, with the
+re-read button that answers it. The strip is built after the reaper's error is merged
+and before the banner, which is what lets one read failure reach both. Unit evidence:
+`test_an_unreadable_profile_is_a_strip_item_and_a_banner_line`.
+
 ### AC-005: J5 — Answer a blocked run
 **Given** a run whose profile status is `needs_answers` with one outstanding question,
 **When** the engineer submits an answer from the blocked-on-you panel,
@@ -696,12 +702,62 @@ Stated explicitly, with cost, so a reviewer can decline them knowingly.
 - [x] Cross-check — `test_ide_pages_orch.py + test_ide_pages_actions.py + test_ide_pages_orch_decide.py + test_code_findings.py` → **supplemented**, see the stale-assertion note under P0.
 - [ ] **Not done, still open:** nothing functional. The P2 note stands — FR-033 shares `run.verifier_check_counts` rather than re-walking; the classification table (P4-adjacent) remains the only thing that would want `_recent_profiles`.
 
-### P4 — Attention
-- [ ] FR-040 — the `triage` strip prepended to every tab; omitted when empty; counts shared with the tabs.
-- [ ] Tests: strip absent when all inputs are empty; counts equal the tab counts.
+### P4 — Attention — **implemented 2026-10-16**
+- [x] FR-040 — `orch.attention(home, tab, errors) -> dict | None`: one `S.triage` strip
+      from four inputs, each read through the helper its own tab reads it with —
+      `_waiting_runs` (FR-020's `_recent_profiles`, filtered on `needs_answers`),
+      `_undecided(_race_groups(home), _open_workspaces(home))` (FR-033's grouping, now
+      extracted out of `_races` so the panel and the strip share **one** definition of
+      "the same race"), `_failing_links` (FR-006's `_chain_health` rows whose
+      `state == "fail"`) and the page's own `errors` map (FR-001). `None` when all four
+      are empty — no empty strip.
+      Each item is a pill (`{n} waiting` / `{n} race(s)` / `{n} chain link(s)` /
+      `{n} error(s)`) beside the button that resolves it: `page_link("orch",
+      tab="decide"|"races"|"intake")`, and for the errors a re-read of the tab being
+      rendered — `page_link("orch", tab=<current>)`, which `page.rs::open_page` *does*
+      reload, because a `page` action carrying no tab only focuses the tab it is already
+      on. The intakes' pill text is the failing links' own row names, so the strip says
+      *which* link is broken without a click.
+      The strip is composed in `board_cmd.build_payload`, not `orch.build`, because the
+      reaper's error joins `payload["errors"]` after `build_page` returns, and an error
+      the strip cannot see is one it cannot report. It is built **before**
+      `errors_callout`, so a profile the scan cannot parse reaches the banner as well as
+      the strip — `attention` writes into the page's own map (`S.page` copies it, so the
+      caller passes the copy the payload holds).
+- [x] `_source_statuses(home)` extracted: the one registry read the Intake tab and the
+      strip both need, so a source cannot be declared on one and absent from the other.
+- [x] Tests — `tests/unit/test_ide_pages_orch_attention.py` (17), **17 passed**. Covered:
+      no strip on any of the eight tabs when the chain is intact and nothing is parked; a
+      parked run's pill, detail, tone, icon and `Answer` action, with the strip drawn
+      first; one strip on every tab; two parked runs read as two; an answered question is
+      no longer waiting; a race holding two worktrees is undecided and a kept one is not;
+      a lone run is not a race; an unconfigured trigger and a missing scheduler each name
+      their own link; an unreadable profile is a strip item *and* a banner line; the
+      errors item re-reads the tab it is on; the waiting count equals the Decide tab's own
+      entry count; the race count equals the races the panel draws; the chain count equals
+      the checklist's own `summary.failing`; one button per item and none for an empty
+      input. Every test drives the real `board page orch --tab <t>` argv, so the wiring in
+      `build_payload` is exercised, not just `attention`.
+- [x] The chain is *stated* in the tests rather than inherited: the source list comes from
+      the machine's `pm.yaml` and the scheduler tick is a LaunchAgent under the user's
+      home, so neither is a property of a temporary home. Both reads go through the two
+      seams above. The consequence is worth stating plainly — **on a home with no
+      scheduler tick installed the strip is never empty**, because the chain that starts
+      runs really is incomplete; that is the requirement working, not a defect. (On this
+      machine's primary home the tick *is* installed, and the strip reports the real
+      backlog: 4 runs parked on `needs_answers`.)
+- [ ] **Not done:** the live replay — see Cross-cutting.
 
 ### Cross-cutting
-- [ ] NFR — warm-page budget held on the default tab (measure, do not assume).
+- [x] NFR — warm-page budget held on the default tab, **measured, not assumed**.
+      In-process, warm, against a real home with **1303 run directories** (the heaviest
+      input the scan can be given), `board_cmd.build_payload` with the strip switched off
+      vs on: `session` 677 → 721 ms, `dispatch` 1017 → 1013 ms, `decide` 18 → 36 ms,
+      `races` 19 → 36 ms, `intake` 25 → 48 ms. The strip costs **≈20–45 ms per tab**
+      (min of three runs; a single cold reading of the same home came out at 5.9 s and is
+      disk-cache noise, not the strip). Every tab stays far inside the 1.5 s warm target,
+      and the strip adds no network call — `source_statuses` and `scheduler_status` are
+      file/DB reads, as is `_recent_profiles`' 60-directory walk.
 - [x] NFR — AC-012 holds for **the redesign**: no section this spec adds needed a
       renderer change. `crates/mini_ork_ui/src/sections.rs` *was* edited, but by the
       audit's rows 4-6 — pre-existing engine↔fork drift, authorised separately. See

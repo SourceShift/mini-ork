@@ -590,19 +590,28 @@ def _race_keep_action(
     )
 
 
-def _races(home: Path, now: int) -> list[dict[str, Any]]:
-    """One section per race — the contestants *are* the decision input.
+def _open_workspaces(home: Path) -> set[str]:
+    """Run ids with an open worktree record — what a keep would free.
 
-    A race is the contestants launched on one kickoff within a few minutes of
-    each other (``config/agents.race.yaml`` marks a contestant). The panel used
-    to be one row per race, which named neither the lane being kept nor the
-    worktrees being given up — and those are exactly what ``board race-keep``
-    needs, so the decision belonged somewhere the candidates were not on screen.
+    One read shared by the races panel and the attention strip: a race is
+    "undecided" exactly when its contestants still hold worktrees, and the two
+    views must not answer that differently.
     """
-    open_ws: set[str] = set()
     wt_dir = home / "worktrees"
-    if wt_dir.is_dir():
-        open_ws = {p.stem for p in wt_dir.glob("*.json")}
+    if not wt_dir.is_dir():
+        return set()
+    return {p.stem for p in wt_dir.glob("*.json")}
+
+
+def _race_groups(home: Path) -> list[list[dict[str, Any]]]:
+    """The races, grouped — contestants launched on one kickoff within a few
+    seconds of each other (``config/agents.race.yaml`` marks a contestant).
+
+    Grouping lives here rather than in :func:`_races` because FR-040's strip
+    counts undecided races with the same definition the panel draws them with;
+    two spellings of "the same race" would let the strip say 1 and the panel
+    show 2.
+    """
     contestants = []
     for r in _rows(home, "SELECT id, status, cost_usd, created_at, kickoff_path FROM task_runs "
                          "ORDER BY created_at DESC LIMIT ?", (_RACE_SCAN,)):
@@ -619,6 +628,27 @@ def _races(home: Path, now: int) -> list[dict[str, Any]]:
                 break
         else:
             races.append([{**c, "_key": key, "_start": start}])
+    return races
+
+
+def _undecided(groups: list[list[dict[str, Any]]], open_ws: set[str]) -> list[list[dict[str, Any]]]:
+    """The races nobody has decided yet: two or more contestants, and two or
+    more worktrees still open. Keeping one discards the others, so a race with
+    a single open worktree has already been decided."""
+    return [race for race in groups
+            if len(race) > 1 and sum(1 for c in race if str(c["id"]) in open_ws) > 1]
+
+
+def _races(home: Path, now: int) -> list[dict[str, Any]]:
+    """One section per race — the contestants *are* the decision input.
+
+    The panel used to be one row per race, which named neither the lane being
+    kept nor the worktrees being given up — and those are exactly what
+    ``board race-keep`` needs, so the decision belonged somewhere the candidates
+    were not on screen.
+    """
+    open_ws = _open_workspaces(home)
+    races = _race_groups(home)
 
     lanes_env = os.environ.get("MO_RACE_LANES")
     note = (f"Default lanes come from MO_RACE_LANES ({lanes_env})." if lanes_env
@@ -1327,6 +1357,19 @@ def _trigger_text(rules: Any) -> str:
     return " AND ".join(parts) or "no trigger configured"
 
 
+def _source_statuses(home: Path) -> list[Any]:
+    """Every intake source this build knows about.
+
+    The Intake tab and the attention strip both ask, and a source present in one
+    and missing from the other is the disagreement FR-040 forbids — so both read
+    it through here rather than each calling the registry themselves.
+    """
+    from mini_ork.intake.poll import source_statuses
+    from mini_ork.web.db import resolve_db
+
+    return source_statuses(resolve_db(home))
+
+
 def _chain_health(home: Path, statuses: list[Any]) -> dict[str, Any]:
     """The intake chain as a checklist — one row per link, each naming its fix.
 
@@ -1382,10 +1425,7 @@ def _chain_health(home: Path, statuses: list[Any]) -> dict[str, Any]:
 
 def _intake(home: Path, errors: dict[str, str]) -> list[dict[str, Any]]:
     """Every source, its trigger, its last sync — and what arrived lately."""
-    from mini_ork.intake.poll import source_statuses
-    from mini_ork.web.db import resolve_db
-
-    statuses = source_statuses(resolve_db(home))
+    statuses = _source_statuses(home)
     rows = []
     for status in statuses:
         state, colour = _SOURCE_STATE[(status.registered, status.enabled)]
@@ -1497,6 +1537,84 @@ def _arrivals(home: Path) -> dict[str, Any]:
 
 
 # ── page ───────────────────────────────────────────────────────────────────
+
+# ── the attention strip (FR-040) ───────────────────────────────────────────
+
+def _waiting_runs(home: Path, errors: dict[str, str]) -> list[dict[str, Any]]:
+    """The runs parked on a question nobody has answered."""
+    return [item for item in _recent_profiles(home, errors) if item["needs_answers"]]
+
+
+def _failing_links(home: Path) -> list[dict[str, Any]]:
+    """The intake checklist's failing rows.
+
+    Built through :func:`_chain_health` — the intake tab's own call — so the
+    strip's count and the tab's rows are the same objects and cannot drift. A
+    source that is switched off is ``NA``, not a fault: someone decided that.
+    """
+    checks = _chain_health(home, _source_statuses(home))
+    return [row for row in checks["rows"] if str(row.get("state") or "") == "fail"]
+
+
+def attention(home: Path, tab: str, errors: dict[str, str]) -> dict[str, Any] | None:
+    """FR-040 — one strip saying what is blocked on the reader, or ``None``.
+
+    Four inputs, each read through the helper its own tab reads it with, so the
+    strip cannot say 2 where the tab shows 3. Every item's button is the action
+    that resolves it, which is why the errors item's is a reload of this page: a
+    read that failed may succeed on the next one, and the banner at the foot of
+    the page carries the text.
+
+    ``errors`` is the page's own map and is written to in place — a run profile
+    that cannot be parsed is discovered here on tabs that would never have
+    looked, and it belongs with every other read failure in that banner.
+    """
+    waiting = _waiting_runs(home, errors)
+    races = _undecided(_race_groups(home), _open_workspaces(home))
+    links = _failing_links(home)
+
+    # (pill, what it is, the button that resolves it), in the order a reader
+    # should care: work already paid for that is stuck, then money still burning,
+    # then the chain that starts everything, then this page's own reads.
+    parts: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
+    if waiting:
+        n = len(waiting)
+        parts.append((
+            {"t": f"{n} waiting", "c": "yellow"},
+            f"{n} run{'s' if n != 1 else ''} waiting on an answer",
+            S.btn("Answer", S.page_link("orch", tab="decide"), "primary")))
+    if races:
+        n = len(races)
+        parts.append((
+            {"t": f"{n} race{'s' if n != 1 else ''}", "c": "orange"},
+            f"{n} undecided race{'s' if n != 1 else ''}",
+            S.btn("Decide", S.page_link("orch", tab="races"))))
+    if links:
+        n = len(links)
+        parts.append((
+            {"t": f"{n} chain link{'s' if n != 1 else ''}", "c": "red"},
+            "intake chain: " + ", ".join(str(row["name"]) for row in links),
+            S.btn("Fix the chain", S.page_link("orch", tab="intake"))))
+    if errors:
+        n = len(errors)
+        parts.append((
+            {"t": f"{n} error{'s' if n != 1 else ''}", "c": "red"},
+            "could not be read: " + ", ".join(errors),
+            S.btn("Re-read", S.page_link("orch", tab or None), "ghost")))
+    if not parts:
+        return None
+
+    total = len(waiting) + len(races) + len(links) + len(errors)
+    return S.triage(
+        f"{total} {'thing' if total == 1 else 'things'} "
+        f"{'needs' if total == 1 else 'need'} you",
+        tone="red" if any(pill["c"] == "red" for pill, _what, _do in parts) else "yellow",
+        icon="✋",
+        detail=" · ".join(what for _pill, what, _do in parts),
+        counts=[pill for pill, _what, _do in parts],
+        actions=[do for _pill, _what, do in parts],
+    )
+
 
 def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     tab = tab if tab in dict(TABS) else "session"
