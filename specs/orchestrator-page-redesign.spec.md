@@ -729,7 +729,7 @@ Stated explicitly, with cost, so a reviewer can decline them knowingly.
       Extended to all eight tabs (`session, dispatch, decide, kickoffs, races, planner,
       coord, intake`) as part of P2. `pytest tests/unit/test_ide_pages_actions.py` →
       **4 passed**, so every action on every tab parses against its own parser.
-- [ ] **Stale assertions in `tests/unit/test_ide_pages_orch.py`: 7 failures — 5
+- [x] **Stale assertions in `tests/unit/test_ide_pages_orch.py`: 7 failures — 5
       pre-dating P2 and caused by P1's own design changes, one caused by
       P3's FR-033, and one caused by FR-023 — all left unfixed per the working
       agreement (tests are not touched until the implementer's change is confirmed).**
@@ -756,6 +756,17 @@ Stated explicitly, with cost, so a reviewer can decline them knowingly.
       pins `_NATIVE_MODULE_SUBS` by exact set, and FR-011 added `kickoff` to it. Left
       unfixed under the same agreement — and worth naming here rather than leaving a red
       suite unexplained, because it is the one stale assertion the P1/P2 notes missed.
+
+      **Closed 2026-10-16 by a peer session (`ae1307d9`, "Refresh the orchestrator page
+      tests to the shapes the redesign shipped"), not by this spec's author.** It re-points
+      all eight — the seven here plus the `_NATIVE_MODULE_SUBS` set in
+      `test_native_dispatch_py.py` — at the shapes P1/P2/P3 shipped, which is the direction
+      this item always intended: the tests were stale, the page was not. Verified here
+      against the tree that commit now sits in: `pytest tests/unit/test_ide_pages_orch.py
+      tests/unit/test_native_dispatch_py.py tests/unit/test_ide_pages_actions.py -q --tb=no`
+      → **`23 passed in 48.59s`**, no failures and no deselections, so the three files the
+      redesign moved are green together and the "remaining 4 tests pass" note above is now
+      the whole file.
 
       **Measured against CI 2026-10-16, and the number is larger than this item used to
       claim.** On the commit *before* any of this work (`4174a8c7`, checked out into a
