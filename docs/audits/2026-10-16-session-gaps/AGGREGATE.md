@@ -794,3 +794,32 @@ unblocking. Recorded here so it is not mistaken for "someone has it".
 count of *verifiers*, not of *edits*. The measured edit set is the shared writer (1) plus the
 call sites that bypass it — 52 printing inline, 122 with no `_lib` reference. Directionally the same
 finding, but the file count was mine and it was not measured.
+
+---
+
+## Method note — the one error this sweep produced five times
+
+Every wrong claim below was **a check that passed while answering a narrower question than the one
+asked**. None was carelessness and none was a check that failed; each was a check that *succeeded*
+at the wrong scope, which is why each survived review.
+
+| the claim | the check that passed | the question actually being asked |
+|---|---|---|
+| C-1 — "there is no code that does this" | one `grep` for the obvious name | is there code anywhere under any other name |
+| C-3 — "the loop returns the wrong match" | one reading of the docstring's word "LAST" | does the loop's first match *equal* the last writer |
+| C-5 — "the push rule is in no `CLAUDE.md`" | one `grep -r` with `2>/dev/null` | does the rule exist in a *symlinked* file |
+| `-R` — "this is the fix for C-5" | the flag's documentation ("follow all symlinks") | does BSD grep follow a symlink passed as a *file argument* |
+| the stale re-read — "the harness invented a version" | two markers matched a plausible producer | did that version ever exist *on disk* |
+
+Two of the five were mine (C-1, C-3), one is shared (C-5 and its remedy, mine then corrected by
+`mini-ork-81`), and two are `mini-ork-81`'s own, retracted by it unprompted — the last one downgraded
+from "a version that never existed" to "a stale-but-real generation", which is the ordinary cache
+behaviour it looks like. **The class is not "unverified claim". It is "verified at the wrong scope",
+and it is invisible from inside the check.**
+
+**This applies to this document.** Every number above was produced by the same method that produced
+those five errors, so a bare count here is a hypothesis until its measurement is named — which is why
+each P0 entry carries its command rather than its conclusion, and why P0 4d is filed as a decision to
+assign rather than a technical unblock. The useful discipline is the one `mini-ork-81` named and then
+applied to its own memory: **ask what question the check answers, not whether it passed.**
+
