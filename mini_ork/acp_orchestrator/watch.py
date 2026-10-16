@@ -31,6 +31,7 @@ from __future__ import annotations
 import os
 import re
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -80,7 +81,29 @@ _TAIL_LINES = 200
 _LOG_TEMPLATES = ("verifier_{node}.log", "evidence/{node}.log", "impl-{node}.log")
 
 
+# The knobs below were renamed from ``MO_BUDDY_*`` when the run buddy became one
+# orchestrator per run (see the module docstring). The old names now read as
+# "unset", so an operator whose shell still exports them silently gets the
+# default — the rename is invisible from the outside. Say the new name once.
+_RENAMED_PREFIX = "MO_BUDDY_"
+_reported_renames: set[str] = set()
+
+
+def _report_renamed_knobs() -> None:
+    for name in sorted(n for n in os.environ if n.startswith(_RENAMED_PREFIX)):
+        if name in _reported_renames:
+            continue
+        _reported_renames.add(name)
+        replacement = "MO_WATCH_" + name[len(_RENAMED_PREFIX):]
+        warnings.warn(
+            f"{name} is ignored; it was renamed to {replacement}",
+            UserWarning,
+            stacklevel=3,
+        )
+
+
 def _env_int(name: str, default: int) -> int:
+    _report_renamed_knobs()
     try:
         value = int(str(os.environ.get(name, "")).strip())
     except (TypeError, ValueError):
@@ -89,6 +112,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _env_float(name: str, default: float) -> float:
+    _report_renamed_knobs()
     try:
         value = float(str(os.environ.get(name, "")).strip())
     except (TypeError, ValueError):
