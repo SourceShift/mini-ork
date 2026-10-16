@@ -6,6 +6,7 @@ findings, which problems keep coming back, and how does one become a rule.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from pathlib import Path
@@ -116,13 +117,21 @@ def test_recurring_groups_paraphrases_and_keeps_others_separate() -> None:
     assert big[0]["n_runs"] == 5
     assert big[0]["worst_severity"] == "high"
     assert len(big[0]["finding_ids"]) == 5
+    # These findings carry no ``kickoff_path``, so each buckets by its run id
+    # (LF-R10) — five runs, five kickoffs, five occurrences.
+    assert big[0]["kickoffs"] == 5
+    assert big[0]["n_members"] == 5
     # Paths and "BLOCKER" do not block grouping — all five collapse to one
     # cluster — yet the representative keeps the real finding text to show.
     stripped = L._strip_issue(big[0]["representative"])
     assert "app/handlers" not in stripped
     assert "BLOCKER" not in stripped
-    # The unrelated finding stays its own cluster.
-    assert any(c["n"] == 1 and "query drops pending rows" in c["representative"] for c in clusters)
+    # The unrelated finding is its own cluster — but a lone one is not
+    # RECURRING (LF-R10: one kickoff is not a recurrence), so it lives in
+    # seen_once(), not in the recurring list.
+    assert not any("query drops pending rows" in c["representative"] for c in clusters)
+    once = L.seen_once(findings)
+    assert any("query drops pending rows" in c["representative"] for c in once)
 
 
 def test_recurring_is_empty_for_no_findings() -> None:
@@ -142,9 +151,245 @@ def test_recurring_skips_the_no_issue_placeholder() -> None:
          "issue": "query drops pending rows"},
     ]
     clusters = L.recurring(findings)
-    assert all("(no issue)" not in c["representative"] for c in clusters)
-    assert [c["n"] for c in clusters] == [1]
-    assert clusters[0]["representative"] == "query drops pending rows"
+    # The placeholder is dropped, and the one real problem was seen in a single
+    # kickoff, so nothing is RECURRING here (LF-R10).
+    assert clusters == []
+    once = L.seen_once(findings)
+    assert len(once) == 1
+    assert "(no issue)" not in once[0]["representative"]
+    assert once[0]["representative"] == "query drops pending rows"
+    assert once[0]["occurrences"] == 1
+
+
+# ── recurring(): counted per KICKOFF, not per row (LF-R10) ─────────────────
+
+NODE = "mini_ork/ide_pages/node.py"
+SPEC = "mini_ork/ide_pages/spec.py"
+
+RETRY_1 = "Retry loop swallows the exception and hides the real failure from the operator"
+RETRY_2 = "The retry loop swallows exceptions so the real failure is hidden from the operator"
+RETRY_3 = "Swallowed exceptions in the retry loop hide the real failure from the operator"
+RETRY_4 = "The retry loop hides real failures by swallowing the exception"
+COST_1 = "Cost budget check divides by zero when the run has no spent cost"
+COST_2 = "Division by zero in the cost budget check for a run with zero spend"
+COST_3 = "The cost budget check divides by zero for runs with no spent cost"
+# Engineered word pools: m1~m2 are at cosine 0.5, m3 is 0.323 from each of them
+# but 0.373 from the pair's centroid — so m3 joins through the centroid only,
+# with no cross-kickoff member pair at the 0.35 threshold. That is `mixed`.
+MIX_1 = "Savanna loam falcon diesel pasture sonnet pellet oakum ember cobalt."
+MIX_2 = "Pepper saddle nimbus meadow cinder sonnet pellet oakum ember cobalt."
+MIX_3 = ("Savanna loam falcon diesel pasture pepper saddle nimbus meadow cinder "
+         "rowan spindle glider vetch quince mattock ledger coral.")
+
+
+def _kfind(fid, issue, run_id, kickoff=None, file=NODE, sev="high"):
+    """A findings row in the shape ``_select_findings`` returns."""
+    return {"id": fid, "run_id": run_id, "file": file, "line": 1, "severity": sev,
+            "category": "other", "issue": issue, "snippet": "", "verdict": "",
+            "ts": 1700000000, "kickoff_path": kickoff}
+
+
+def test_recurring_needs_two_kickoffs_not_merely_restatements() -> None:
+    """Four restatements of one bug in ONE kickoff are an emphasis, not a
+    recurrence (LF-R10) — they are shown by ``seen_once``, with one occurrence."""
+    fs = [_kfind(f"a{i}", text, "r1", "kickoffs/auto/lf-panel-r2.md")
+          for i, text in enumerate((RETRY_1, RETRY_2, RETRY_3, RETRY_4), 1)]
+    assert L.recurring(fs) == []
+    once = L.seen_once(fs)
+    assert len(once) == 1, once
+    assert once[0]["occurrences"] == 1 and once[0]["kickoffs"] == 1
+    assert once[0]["n_members"] == 4
+
+
+def test_recurring_collapses_kickoff_revisions_to_one_stem() -> None:
+    """``-r3`` and ``-r4`` are revisions of ONE kickoff, so a bug in both is
+    still a one-kickoff problem (LF-R10)."""
+    fs = [_kfind("b1", RETRY_1, "r1", "kickoffs/auto/ide-node-stream-r3.md"),
+          _kfind("b2", RETRY_2, "r2", "kickoffs/auto/ide-node-stream-r4.md")]
+    assert L.recurring(fs) == []
+    once = L.seen_once(fs)
+    assert len(once) == 1
+    assert once[0]["kickoffs"] == 1 and once[0]["occurrences"] == 1
+    assert once[0]["n_members"] == 2
+
+
+def test_two_distinct_kickoffs_are_recurring() -> None:
+    """Two DIFFERENT kickoffs carrying the same bug is the recurrence the tab
+    drafts a rule for; ``seen_once`` (the complement) is then empty."""
+    fs = [_kfind("b1", RETRY_1, "r1", "kickoffs/auto/node-overview.md"),
+          _kfind("b2", RETRY_2, "r2", "kickoffs/auto/ide-node-stream.md")]
+    rec = L.recurring(fs)
+    assert len(rec) == 1, rec
+    c = rec[0]
+    assert c["kickoffs"] == 2 and c["occurrences"] == 2 and c["n_members"] == 2
+    assert c["n"] == c["occurrences"]        # n IS occurrences now
+    assert c["mixed"] is False               # the two members are 0.62 cosine
+    assert set(c["finding_ids"]) == {"b1", "b2"}
+    assert L.seen_once(fs) == []
+
+
+def test_generic_kickoffs_bucket_by_run_id_and_null_kickoff_is_kept() -> None:
+    """A generic ``kickoff.md`` carries no identity, so two of them must not
+    merge — they bucket by run id. A finding from a run with no ``task_runs``
+    row (``kickoff_path`` None) is kept, and bucketed by its run id too."""
+    fs = [_kfind("c1", RETRY_1, "r1", "kickoffs/foo/kickoff.md"),
+          _kfind("c2", RETRY_2, "r2", "kickoffs/bar/kickoff.md"),
+          _kfind("c3", RETRY_3, "r3", None)]
+    rec = L.recurring(fs)
+    assert len(rec) == 1, rec
+    assert rec[0]["kickoffs"] == 3 and rec[0]["occurrences"] == 3
+    assert rec[0]["n_members"] == 3
+    assert set(rec[0]["finding_ids"]) == {"c1", "c2", "c3"}
+
+
+def test_cross_kickoff_cluster_below_sim_is_mixed() -> None:
+    """A cluster that spans two kickoffs only because a member attached to the
+    running centroid — with no cross-kickoff PAIR at ``_SIM`` — is ``mixed``."""
+    fs = [_kfind("m1", MIX_1, "r1", "kickoffs/auto/lf-cache-r1.md"),
+          _kfind("m2", MIX_2, "r2", "kickoffs/auto/lf-cache-r2.md"),
+          _kfind("m3", MIX_3, "r3", "kickoffs/auto/lf-iter-r1.md", file=SPEC)]
+    rec = L.recurring(fs)
+    assert len(rec) == 1, rec
+    assert rec[0]["mixed"] is True
+    # lf-cache-r1/-r2 are one kickoff (one file), lf-iter is the second.
+    assert rec[0]["kickoffs"] == 2
+    assert rec[0]["occurrences"] == 2
+    assert rec[0]["n_members"] == 3
+
+
+def test_occurrences_counts_kickoff_file_pairs() -> None:
+    """``occurrences`` is the number of distinct ``(kickoff, file)`` pairs: two
+    kickoffs over two files is four, while a restatement inside one file adds
+    nothing (``n`` is that value; the raw count is ``n_members``)."""
+    fs = [_kfind("b1", COST_1, "r4", "kickoffs/auto/cost-fix-r1.md", sev="critical"),
+          _kfind("b2", COST_2, "r5", "kickoffs/auto/budget-fix-r1.md", sev="critical"),
+          _kfind("b3", COST_3, "r4", "kickoffs/auto/cost-fix-r1.md", file=SPEC, sev="critical"),
+          _kfind("b4", COST_1, "r5", "kickoffs/auto/budget-fix-r1.md", file=SPEC, sev="critical"),
+          _kfind("b5", COST_2, "r5", "kickoffs/auto/budget-fix-r1.md", sev="critical")]
+    c = L.recurring(fs)[0]
+    assert c["kickoffs"] == 2
+    assert c["occurrences"] == 4
+    assert c["n"] == c["occurrences"]
+    assert c["n_members"] == 5
+    assert set(c["files"]) == {NODE, SPEC} and len(c["files"]) == len(set(c["files"]))
+
+
+def test_recurring_sorted_by_kickoffs_then_occurrences() -> None:
+    """The wider recurrence leads: three kickoffs beats two, whatever the
+    severity or the member count."""
+    a = [_kfind("a1", RETRY_1, "r1", "kickoffs/auto/node-overview.md"),
+         _kfind("a2", RETRY_2, "r2", "kickoffs/auto/ide-node-stream-r3.md"),
+         _kfind("a3", RETRY_3, "r3", "kickoffs/auto/lf-gate-r1.md")]
+    b = [_kfind("b1", COST_1, "r4", "kickoffs/auto/cost-fix-r1.md", sev="critical"),
+         _kfind("b2", COST_2, "r5", "kickoffs/auto/budget-fix-r1.md", sev="critical"),
+         _kfind("b3", COST_3, "r4", "kickoffs/auto/cost-fix-r1.md", file=SPEC, sev="critical"),
+         _kfind("b4", COST_1, "r5", "kickoffs/auto/budget-fix-r1.md", file=SPEC, sev="critical"),
+         _kfind("b5", COST_2, "r5", "kickoffs/auto/budget-fix-r1.md", sev="critical")]
+    rec = L.recurring(a + b)
+    assert len(rec) == 2
+    assert (rec[0]["kickoffs"], rec[0]["occurrences"]) == (3, 3)
+    assert set(rec[0]["finding_ids"]) == {"a1", "a2", "a3"}
+    assert (rec[1]["kickoffs"], rec[1]["occurrences"]) == (2, 4)
+    assert set(rec[1]["finding_ids"]) == {"b1", "b2", "b3", "b4", "b5"}
+
+
+def test_seen_once_partitions_the_clustered_findings() -> None:
+    """The two lists are a partition: recurring ∪ seen_once is every clustered
+    finding, and their intersection is empty."""
+    fs = [_kfind("a1", RETRY_1, "r1", "kickoffs/auto/node-overview.md"),
+          _kfind("a2", RETRY_2, "r2", "kickoffs/auto/ide-node-stream.md"),
+          _kfind("c1", COST_1, "r9", "kickoffs/auto/budget-fix-r2.md", file=SPEC, sev="medium"),
+          _kfind("c2", COST_2, "r9", "kickoffs/auto/budget-fix-r2.md", file=SPEC, sev="medium"),
+          _kfind("c3", COST_3, "r9", "kickoffs/auto/budget-fix-r2.md", file=SPEC, sev="medium")]
+    rec, once = L.recurring(fs), L.seen_once(fs)
+    assert len(rec) == 1 and len(once) == 1
+    for cluster in (rec[0], once[0]):
+        for key in ("representative", "n", "n_members", "kickoffs", "occurrences",
+                    "files", "mixed", "worst_severity", "finding_ids"):
+            assert key in cluster, key
+    rec_ids = {i for c in rec for i in c["finding_ids"]}
+    once_ids = {i for c in once for i in c["finding_ids"]}
+    assert rec_ids.isdisjoint(once_ids)
+    assert rec_ids | once_ids == {"a1", "a2", "c1", "c2", "c3"}
+    assert (once[0]["kickoffs"], once[0]["occurrences"]) == (1, 1)
+
+
+def test_rule_action_only_for_recurring_clusters() -> None:
+    """The "Make it a rule" button is offered only for a recurring cluster: a
+    one-kickoff cluster with FOUR restatements in one file has a perfectly
+    defensible target, and is still denied the action (LF-R10)."""
+    rec = L.recurring([_kfind("a1", RETRY_1, "r1", "kickoffs/auto/node-overview.md"),
+                       _kfind("a2", RETRY_2, "r2", "kickoffs/auto/ide-node-stream.md")])[0]
+    assert L._rule_action(rec) is not None
+    once = L.seen_once([_kfind("c1", COST_1, "r9", "kickoffs/auto/budget-fix-r2.md",
+                               file=SPEC, sev="medium"),
+                        _kfind("c2", COST_2, "r9", "kickoffs/auto/budget-fix-r2.md",
+                               file=SPEC, sev="medium"),
+                        _kfind("c3", COST_3, "r9", "kickoffs/auto/budget-fix-r2.md",
+                               file=SPEC, sev="medium")])[0]
+    assert once["occurrences"] == 1 and once["n_members"] == 3
+    assert L._rule_action(once) is None
+
+
+def test_kickoff_revisions_of_the_same_run_kickoff_are_not_recurring(home, monkeypatch) -> None:
+    """End to end: ``kickoff_path`` reaches the page through the ``task_runs``
+    join, and two runs of ONE kickoff's revisions are one kickoff, so the pair
+    is listed as seen-once — not offered as a recurrence to make a rule of."""
+    _seed(home, [
+        {"run_id": "r1", "file": "svc/pay/a.py", "issue": "docstring contradicts the code"},
+        {"run_id": "r2", "file": "svc/pay/a.py", "issue": "the docstring contradicts the code"},
+    ])
+    con = sqlite3.connect(home / "state.db")
+    con.execute("INSERT INTO task_runs VALUES (?,?,?)",
+                ("r1", "kickoffs/auto/pay-fix-r1.md", "done"))
+    con.execute("INSERT INTO task_runs VALUES (?,?,?)",
+                ("r2", "kickoffs/auto/pay-fix-r2.md", "done"))
+    con.commit()
+    con.close()
+    _repo_files(monkeypatch, "svc/pay/a.py")
+
+    page = _build(home, {"area": "svc/pay"})
+    assert page["errors"] == {}, page["errors"]
+    # `pay-fix-r1`/`-r2` collapse to the ONE stem `pay-fix`: the two runs are
+    # one kickoff, so this is not a recurrence (the run ids differ, so a
+    # run-id-bucketed implementation would wrongly call it one).
+    assert _section(page, L.RECURRING_TITLE)["rows"] == []
+    assert "pay-fix" in json.dumps(_section(page, L.SEEN_ONCE_TITLE))
+    assert "Make it a rule" not in json.dumps(page["sections"])
+
+
+def test_area_detail_renders_kickoff_columns_and_seen_once(home, monkeypatch) -> None:
+    """The detail's table reports KICKOFFS (with ``(mixed)`` where the cluster
+    only met through the centroid) and files, and lists the one-kickoff
+    restatements under "Seen in one kickoff" with no rule button among them."""
+    fs = [_kfind("a1", RETRY_1, "r1", "kickoffs/auto/node-overview.md"),
+          _kfind("a2", RETRY_2, "r2", "kickoffs/auto/ide-node-stream-r3.md"),
+          _kfind("c1", COST_1, "r9", "kickoffs/auto/budget-fix-r2.md", file=SPEC, sev="medium"),
+          _kfind("c2", COST_2, "r9", "kickoffs/auto/budget-fix-r2.md", file=SPEC, sev="medium"),
+          _kfind("c3", COST_3, "r9", "kickoffs/auto/budget-fix-r2.md", file=SPEC, sev="medium")]
+    monkeypatch.setattr(L, "_window_findings",
+                        lambda db, *, since_days, repo_only=True, repo_root=None: list(fs))
+    sections = L._area_detail(home, {"days": "30"}, "mini_ork/ide_pages")
+
+    rec = next(s for s in sections if s["title"] == L.RECURRING_TITLE)
+    assert rec["head"] == ["problem", "kickoffs", "files", "worst", "action"]
+    assert len(rec["rows"]) == 1                 # the recurring cluster only
+    assert rec["rows"][0]["cells"][1]["t"] == "2"
+    assert NODE in rec["rows"][0]["cells"][2]["t"]
+
+    dump = json.dumps(sections, default=str)
+    assert "Seen in one kickoff" in dump         # the restatements are shown …
+    assert "budget-fix" in dump                  # … labelled with their kickoff
+    assert dump.count("Make it a rule") == 1     # the recurring cluster's, only
+
+    mixed = [_kfind("m1", MIX_1, "r1", "kickoffs/auto/lf-cache-r1.md"),
+             _kfind("m2", MIX_2, "r2", "kickoffs/auto/lf-cache-r2.md"),
+             _kfind("m3", MIX_3, "r3", "kickoffs/auto/lf-iter-r1.md", file=SPEC)]
+    monkeypatch.setattr(L, "_window_findings",
+                        lambda db, *, since_days, repo_only=True, repo_root=None: list(mixed))
+    rows = next(s for s in L._area_detail(home, {"days": "30"}, "mini_ork/ide_pages")
+                if s["title"] == L.RECURRING_TITLE)["rows"]
+    assert rows[0]["cells"][1]["t"] == "2 (mixed)"
 
 
 # ── the tab ────────────────────────────────────────────────────────────────
@@ -228,8 +473,13 @@ def test_area_detail_recurring_rule_and_findings(home: Path, monkeypatch) -> Non
     assert "**Recurring problems**" in md["text"]
 
     rec = _section(page, L.RECURRING_TITLE)
-    # The docstring cluster (2×) comes first; the singleton second.
-    assert rec["rows"][0]["cells"][1]["t"] == "2×"
+    # The docstring cluster comes first: seen in two kickoffs (these two runs
+    # carry no ``task_runs`` row, so each buckets by its run id — LF-R10). The
+    # lone r3 finding is not a recurrence and is listed as seen-once instead.
+    assert rec["head"] == ["problem", "kickoffs", "files", "worst", "action"]
+    assert len(rec["rows"]) == 1
+    assert rec["rows"][0]["cells"][1]["t"] == "2"
+    assert rec["rows"][0]["cells"][2]["t"] == "svc/pay/a.py, svc/pay/b.py"
     action = rec["rows"][0]["do"]
     assert action["cli"][0:2] == ["prefs", "set"]
     assert action["cli"][2].startswith("review-")
@@ -296,7 +546,7 @@ def test_area_directory_excludes_sibling_prefix(home: Path, monkeypatch) -> None
     # area only and targeting its own files, never the sibling's.
     rec = _section(page, L.RECURRING_TITLE)
     assert rec["rows"], "the area's two findings should produce clusters"
-    assert rec["rows"][0]["cells"][1]["t"] == "2×"
+    assert rec["rows"][0]["cells"][1]["t"] == "2"
     assert "acp_orchestrator" not in rec["rows"][0]["cells"][0]["t"]
     assert _target(rec["rows"][0]) == "mini_ork/acp/*"
 
@@ -349,14 +599,17 @@ def test_area_extensionless_file_is_not_treated_as_directory(home: Path) -> None
 
     # A sibling extensionless file is its own area, never swept in by the
     # ``bin/mini-ork`` prefix query. One finding there is not a RECURRING
-    # problem, so its row offers no rule at all (LF-R4).
+    # problem (LF-R10: one kickoff, one occurrence), so the recurring table is
+    # empty, the problem is shown as seen-once, and no rule is offered at all.
     mk_page = _build(home, {"area": "Makefile"})
     mk = _section(mk_page, "Makefile")
     assert "1 findings in 1 run" in mk["text"], mk["text"]
     mk_rows = _section(mk_page, L.FINDINGS_TITLE)["rows"]
     assert [r["cells"][0]["t"] for r in mk_rows] == ["Makefile:"]
-    mk_row = _section(mk_page, L.RECURRING_TITLE)["rows"][0]
-    assert mk_row["do"] is None and mk_row["cells"][4]["t"] == "—"
+    assert _section(mk_page, L.RECURRING_TITLE)["rows"] == []
+    mk_dump = json.dumps(mk_page["sections"])
+    assert "Make it a rule" not in mk_dump
+    assert "tab indentation lost in the lint target" in mk_dump
 
 
 def test_area_detail_summary_matches_findings_it_lists(home: Path, monkeypatch) -> None:
@@ -557,8 +810,12 @@ def test_area_summary_counts_all_findings_while_table_is_capped(home: Path, monk
 
     # The table itself is capped …
     assert len(_section(page, L.FINDINGS_TITLE)["rows"]) == L._AREA_FINDINGS
-    # … but the clusters are computed over the full set, not the capped page.
-    assert _section(page, L.RECURRING_TITLE)["rows"][0]["cells"][1]["t"] == f"{n}×"
+    # … but the clusters are computed over the full set, not the capped page:
+    # all 60 restatements cluster (8 run-id kickoffs, one file), so the rendered
+    # kickoffs cell reads 8 — and the pure call sees every member.
+    assert _section(page, L.RECURRING_TITLE)["rows"][0]["cells"][1]["t"] == "8"
+    assert L.recurring(findings)[0]["n_members"] == n
+    assert L.recurring(findings)[0]["occurrences"] == 8
 
     # The live-proof invariant: the detail summary count equals the areas-table
     # count for the same area (both read the full set over the same window).
@@ -687,9 +944,12 @@ def test_one_member_cluster_offers_no_rule(home: Path, monkeypatch) -> None:
 
     page = _build(home, {"area": "mini_ork/solo"})
     assert page["errors"] == {}, page["errors"]
-    row = _section(page, L.RECURRING_TITLE)["rows"][0]
-    assert row["do"] is None, "a 1-member cluster must offer no rule"
-    assert row["cells"][4]["t"] == "—"
+    # Seen in one kickoff, so it is not recurring — listed as seen-once, with no
+    # action anywhere on the page (LF-R10).
+    assert _section(page, L.RECURRING_TITLE)["rows"] == []
+    dump = json.dumps(page["sections"])
+    assert "a one-off problem, never seen again" in dump
+    assert "Make it a rule" not in dump
 
 
 def test_rule_draft_text_is_generalised(home: Path, monkeypatch) -> None:
