@@ -816,6 +816,42 @@ Stated explicitly, with cost, so a reviewer can decline them knowingly.
       Whether `/run` *should* be quiet — the path a user takes to say "just do it" — is a
       product call, not a defect, and it is the user's to make.
 
+**The whole suite, run end to end, 2026-10-16.** `pytest tests/unit -q` (9946 collected,
+serial — the venv has neither `pytest-xdist` nor `pytest-timeout`) →
+
+      **`11 failed, 9895 passed, 15 skipped, 8 errors in 3533.93s (0:58:53)`**
+
+      The 11 are **not one thing**, and the earlier CI-derived claim above ("10 of the 11 are
+      not this work's") survives, but the local set is larger than CI's and needs its own
+      accounting. Classified by re-running each red file in isolation, which is what separates
+      a real red from a shared-state artifact:
+
+      | # | failing test | isolated | cause |
+      |---|---|---|---|
+      | 3 | the ACP agent trio above | red alone | `fae2a7a5`'s narration turn and orchestrator cost |
+      | 1 | `test_acp_commands.py::test_serve_down_returns_command` | — | the shared serve holds **127.0.0.1:7090** (`lsof` confirms a listener); the test needs the port free |
+      | 1 | `test_node_agent.py::test_real_container_session` | red alone | docker cannot bind-mount under the external volume: `mount source path '/Volumes/docker-ssd/ps/mini-ork/.mo-bindprobe-*/…/mo-home': mkdir /Volumes/docker-ssd: file exists` |
+      | 1 | `test_sandbox_teardown_registry.py::test_fresh_process_sandbox_gc_all_sweeps_lazy_providers` | red alone | the test wants the SDK-absent branch (`endswith('SDK_ABSENT')`) and this machine reports `SDK_LOADED` for every provider |
+      | 1 | `test_config_seam_env_overrides_py.py::test_coalition_gate_defaults_to_the_root_config` | red alone | resolved the checkout's own **`.mini-ork/config/.agents.effective.yaml`** instead of the test's tmp `agents.yaml` — the same CWD-dependency the web-smoke capability test has; that dotfile is generated, so a CI checkout has none and CI never sees this |
+      | 1 | `test_evidence_ledger.py::test_valid_rows_void_after_edit` | **green alone** | order-dependent in the 9946-test run, not a red |
+      | 3 | `test_acp_lane_repair.py` (the three resume/follow tests) | red alone, `3 failed, 19 passed in 44.84s` | each drives a real `mini-ork run` and the run dies on a **live provider quota**: `run-lane-1 stopped: minimax minimax is out of quota. Resume from prior_art_lens?`. The tests script the repair flow through to a *completed* run, so with the lane out of quota the flow stops early — `assert ['in_progress','failed'] == ['in_progress','completed']`, and prompt counts of 1 and 2 where 2 and 3 are expected |
+
+      plus **8 errors** in `test_workspace_conformance.py::*[docker]`, which are fixture setup
+      failures of the same bind-mount family as the container session above.
+
+      What this establishes for the redesign: **the three files it touches are green together**
+      (`test_ide_pages_orch.py`, `test_native_dispatch_py.py`, `test_ide_pages_actions.py` →
+      `23 passed`), and every other red traces to this machine — a port, a volume Docker
+      Desktop cannot share, an installed SDK, a generated dotfile, a **live provider quota** —
+      or to an ordering effect. None of them traces to the orchestrator page.
+
+      Two things this run exposes that are worth someone's attention and are **not** about
+      the redesign: the `minimax` lane is genuinely out of quota, which is why the
+      lane-repair tests cannot reach their expected end state and why any run routed there
+      will stop; and those three tests belong to the *unit* suite while depending on a live
+      provider being both reachable and funded, so their verdict is a property of the
+      machine and the account, not of the code under test.
+
 ### P1 — Dispatch
 - [x] FR-010 — `board start`: add `start` to `build_parser().choices`; add `--kickoff`, `--set` (append), `--run-id`, `--workspace`, `--init`, `--dry-run`; exempt `start` from `validate`'s run-id rule and require `--kickoff`; implement `_act_start` wrapping `web.control.launch_run`; fail closed on an uninitialised home.
       Verified by hand (10 probes, `.venv/bin/python`): no `--kickoff` → rc 2; **uninitialised home → rc 2 and no `runs-inbox` created** (fail-closed); `--init` proceeds; recipe resolves from front matter → `--recipe` → refusal; `--set X=1`/`--workspace` map into `extra_env`; a stubbed `launch_run` receives `(home, recipe, text, run_id, extra_env)` and a kickoff body; `launch_run` returning `ok:False` → rc 1 with the error on stderr. A **live spawn was not run** — starting a real run is a side effect on the shared engine, so `launch_run` was stubbed instead; AC-001's live replay needs a runner.
