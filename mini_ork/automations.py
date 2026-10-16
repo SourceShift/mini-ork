@@ -982,6 +982,73 @@ def _launch_agents_dir() -> Path:
     return Path.home() / "Library" / "LaunchAgents"
 
 
+def _boot_volume_log_dir() -> Path:
+    """``~/Library/Logs/mini-ork`` — where a launchd log must live off-volume.
+
+    Tests monkeypatch this seam (like ``_launch_agents_dir``) so they never
+    write into the real ``~/Library``.
+    """
+    return Path.home() / "Library" / "Logs" / "mini-ork"
+
+
+def _owning_device(path: Path) -> int | None:
+    """``st_dev`` of ``path`` or its nearest existing ancestor (``None``: none)."""
+    current = Path(path)
+    while True:
+        try:
+            return os.stat(current).st_dev
+        except OSError:
+            parent = current.parent
+            if parent == current:
+                return None
+            current = parent
+
+
+def _home_off_boot_volume(home: Path) -> bool:
+    """Is ``home`` on a different device from the user's home directory?
+
+    launchd opens ``StandardOutPath`` *itself*, before ``exec``, and a job
+    whose log file sits on a volume outside the job's namespace is refused with
+    ``EX_CONFIG`` (78) — the process never starts and the log file is never
+    created, so the only symptom is a scheduler that silently never fires.
+    ``launchctl bootstrap`` reports success while this happens, which is why
+    ``install`` must avoid the configuration rather than detect the refusal.
+
+    Evidence (2026-10-16): two researcher LaunchAgents whose log was under
+    ``/Volumes/...`` exited 78 on every load; both ran with ``{"fired": []}``
+    once their log moved to the boot volume. Comparing device ids with ``~/``
+    is the cheap, durable form of that test.
+    """
+    home_dev = _owning_device(home)
+    boot_dev = _owning_device(Path.home())
+    if home_dev is None or boot_dev is None:
+        return False  # cannot tell: keep the historical in-home log
+    return home_dev != boot_dev
+
+
+def _tick_log_path(home: Path) -> Path:
+    """The tick log path the scheduler will actually be able to open.
+
+    macOS + an off-boot-volume home → the boot volume, one file per home hash
+    (several homes share the directory). Everything else keeps the
+    home-adjacent log: cron executes the ``>>`` redirect through a shell, which
+    is not subject to launchd's spawn-time path rule.
+    """
+    if _platform_key() == "macos" and _home_off_boot_volume(home):
+        return _boot_volume_log_dir() / f"automations-tick-{_home_hash(home)}.log"
+    return Path(home) / _TICK_LOG_FILENAME
+
+
+def _installed_log_path(plist: Path) -> str | None:
+    """``StandardOutPath`` recorded in a written plist (``None`` if unreadable)."""
+    try:
+        data = plistlib.loads(Path(plist).read_bytes())
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return None
+    value = data.get("StandardOutPath") if isinstance(data, dict) else None
+    return value if isinstance(value, str) else None
+
+
 def _os_run(argv: list[str], *, check: bool = True, stdin_input: str | None = None,
             **kwargs: Any) -> subprocess.CompletedProcess:
     """Run a single OS command (launchctl / crontab). Tests monkeypatch this.
@@ -1031,7 +1098,7 @@ def _scheduled_command(home: Path) -> str:
 
 def _crontab_line(home: Path) -> str:
     env = " ".join(f"{k}={shlex.quote(v)}" for k, v in _scheduler_env(home).items())
-    log = shlex.quote(str(home / _TICK_LOG_FILENAME))
+    log = shlex.quote(str(_tick_log_path(home)))
     return (f"* * * * * {env} {_scheduled_command(home)} >> {log} 2>&1 "
             f"# mini-ork-automations-marker:{_home_hash(home)}")
 
@@ -1041,8 +1108,13 @@ def _plist_path(home: Path) -> Path:
 
 
 def _build_plist(home: Path) -> str:
-    """Return the LaunchAgent XML body (``plistlib`` escapes every value)."""
-    log_path = str(home / _TICK_LOG_FILENAME)
+    """Return the LaunchAgent XML body (``plistlib`` escapes every value).
+
+    The log goes through ``_tick_log_path``: launchd refuses a
+    ``StandardOutPath`` on a volume outside its namespace (``EX_CONFIG``, 78),
+    and the failure is invisible to ``bootstrap``.
+    """
+    log_path = str(_tick_log_path(home))
     return plistlib.dumps({
         "Label": _plist_label(home),
         "ProgramArguments": _tick_argv(home),
@@ -1070,6 +1142,17 @@ def install_scheduler(home: Path | str) -> dict[str, Any]:
     if key == "macos":
         agents_dir = _launch_agents_dir()
         agents_dir.mkdir(parents=True, exist_ok=True)
+        log_path = _tick_log_path(home)
+        # launchd opens StandardOutPath itself and creates no directories: a
+        # missing parent is another EX_CONFIG (78) that bootstrap cannot see.
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return {
+                "ok": False,
+                "error": f"cannot create scheduler log directory "
+                         f"{log_path.parent}: {exc}",
+            }
         plist = _plist_path(home)
         plist.write_text(_build_plist(home), encoding="utf-8")
         uid = os.getuid()
@@ -1157,7 +1240,7 @@ def scheduler_status(home: Path | str) -> dict[str, Any]:
     key = _platform_key()
     name = _platform_name()
     command = _scheduled_command(home)
-    log_path = home / _TICK_LOG_FILENAME
+    log_path = _tick_log_path(home)
     last_tick = None
     if log_path.is_file():
         try:
@@ -1168,7 +1251,7 @@ def scheduler_status(home: Path | str) -> dict[str, Any]:
             last_tick = None
     if key == "macos":
         plist = _plist_path(home)
-        return {
+        out = {
             "platform": name or "macos",
             "installed": plist.is_file(),
             "command": command,
@@ -1176,6 +1259,18 @@ def scheduler_status(home: Path | str) -> dict[str, Any]:
             "log_path": str(log_path),
             "last_tick": last_tick,
         }
+        stale = _installed_log_path(plist)
+        if stale is not None and stale != str(log_path):
+            # A plist installed before the off-boot-volume rule still points
+            # into the home: launchd refuses it at spawn (EX_CONFIG, 78) and
+            # the job never fires, while ``installed`` reads True.
+            out["stale_log_path"] = stale
+            out["warning"] = (
+                f"the installed plist logs to {stale}, outside the boot volume "
+                "if the home is off it — launchd will never start this job; "
+                "re-run 'mini-ork automations install' to rewrite it"
+            )
+        return out
     if key == "linux":
         home_hash = _home_hash(home)
         marker = f"mini-ork-automations-marker:{home_hash}"

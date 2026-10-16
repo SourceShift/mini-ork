@@ -227,6 +227,9 @@ def _project_scheduler(scheduler: dict[str, Any]) -> dict[str, Any]:
         tick = scheduler.get("last_tick")
         sub = f"checks every minute · last tick {tick}" if tick else "checks every minute · no tick yet"
         items = [S.ok(f"On · {platform} {where}".strip(), sub + " · missed firings are skipped")]
+        if scheduler.get("warning"):
+            # e.g. a plist whose log launchd refuses: 'On' but never fires.
+            items.append(S.warn("Installed but will not fire", str(scheduler["warning"])))
     else:
         items = [S.warn("Off", "automations will not fire")]
     action = (S.btn("Turn off", S.cli("automations", "scheduler", "uninstall",
@@ -234,7 +237,9 @@ def _project_scheduler(scheduler: dict[str, Any]) -> dict[str, Any]:
                     "danger")
               if on else S.btn("Turn on", S.cli("automations", "scheduler", "install"), "primary"))
     return S.lst("Project scheduler", items, full=True, actions=[action],
-                 note="Logs: .mini-ork/automations-tick.log and automations.log.")
+                 note="Logs: .mini-ork/automations-tick.log (macOS: ~/Library/Logs/mini-ork/ "
+                      "when the project is on another volume — launchd cannot log off the "
+                      "boot volume) and .mini-ork/automations.log.")
 
 
 def _db(home: Path):

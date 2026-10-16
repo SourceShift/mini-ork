@@ -829,6 +829,125 @@ class TestScheduler:
         data = plistlib.loads(auto._build_plist(home).encode())
         assert data["ProgramArguments"][-1] == str(home)
 
+    def test_macos_log_moves_to_the_boot_volume_when_the_home_is_off_volume(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """launchd refuses a StandardOutPath on another volume (EX_CONFIG, 78).
+
+        The job never reaches ``exec`` and the log file is never created, so an
+        in-home log on an external volume is a scheduler that silently never
+        fires — ``bootstrap`` still reports success. The plist must point at
+        the boot volume instead.
+        """
+        import plistlib
+
+        monkeypatch.setattr(auto, "_launch_agents_dir", lambda: tmp_path / "LA")
+        monkeypatch.setattr(auto, "_boot_volume_log_dir", lambda: tmp_path / "Logs")
+        monkeypatch.setattr(auto.platform, "system", lambda: "Darwin")
+        home = tmp_path / "Volumes" / "ext" / ".mini-ork"
+        # The home is on device 2; the user's home directory (and tmp_path) on 1.
+        monkeypatch.setattr(
+            auto, "_owning_device", lambda p: 2 if str(p) == str(home) else 1
+        )
+
+        data = plistlib.loads(auto._build_plist(home).encode())
+        log = data["StandardOutPath"]
+        assert data["StandardErrorPath"] == log
+        assert not Path(log).is_relative_to(home)
+        assert log == str(tmp_path / "Logs" / f"automations-tick-{auto._home_hash(home)}.log")
+        status = auto.scheduler_status(home)
+        assert status["log_path"] == log
+        assert "stale_log_path" not in status
+
+    def test_status_flags_a_plist_written_before_the_boot_volume_rule(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """``installed: True`` on a never-firing job is otherwise invisible."""
+        agents = tmp_path / "LaunchAgents"
+        agents.mkdir()
+        monkeypatch.setattr(auto, "_launch_agents_dir", lambda: agents)
+        monkeypatch.setattr(auto, "_boot_volume_log_dir", lambda: tmp_path / "Logs")
+        monkeypatch.setattr(auto.platform, "system", lambda: "Darwin")
+        home = tmp_path / "Volumes" / "ext" / ".mini-ork"
+        monkeypatch.setattr(
+            auto, "_owning_device", lambda p: 2 if str(p) == str(home) else 1
+        )
+        # The plist as the pre-fix installer wrote it: the log inside the home.
+        legacy = str(home / "automations-tick.log")
+        relocated = str(tmp_path / "Logs" / f"automations-tick-{auto._home_hash(home)}.log")
+        auto._plist_path(home).write_text(
+            auto._build_plist(home).replace(relocated, legacy), encoding="utf-8"
+        )
+
+        status = auto.scheduler_status(home)
+        assert status["installed"] is True
+        assert status["stale_log_path"] == str(home / "automations-tick.log")
+        assert "launchd" in status["warning"]
+
+    def test_macos_log_stays_in_home_on_the_boot_volume(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The relocation is conditional: a boot-volume home is unchanged."""
+        import plistlib
+
+        monkeypatch.setattr(auto.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(auto, "_owning_device", lambda p: 1)  # one device
+        home = tmp_path / ".mini-ork"
+
+        data = plistlib.loads(auto._build_plist(home).encode())
+        assert data["StandardOutPath"] == str(home / "automations-tick.log")
+
+    def test_linux_tick_log_is_never_relocated(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """cron runs the ``>>`` redirect in a shell — no spawn-time path rule."""
+        monkeypatch.setattr(auto.platform, "system", lambda: "Linux")
+        home = tmp_path / "Volumes" / "ext" / ".mini-ork"
+        monkeypatch.setattr(
+            auto, "_owning_device", lambda p: 2 if str(p) == str(home) else 1
+        )
+        assert auto._tick_log_path(home) == home / "automations-tick.log"
+
+    def test_install_macos_creates_the_launchd_log_directory(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """launchd creates no directories: bootstrap would still "succeed"."""
+        agents = tmp_path / "LaunchAgents"
+        agents.mkdir()
+        logs = tmp_path / "Logs"
+        monkeypatch.setattr(auto, "_launch_agents_dir", lambda: agents)
+        monkeypatch.setattr(auto, "_boot_volume_log_dir", lambda: logs)
+        monkeypatch.setattr(auto.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(auto, "_os_run",
+                            lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""))
+        home = tmp_path / "Volumes" / "ext" / ".mini-ork"
+        monkeypatch.setattr(
+            auto, "_owning_device", lambda p: 2 if str(p) == str(home) else 1
+        )
+
+        assert auto.install_scheduler(home)["ok"] is True
+        assert logs.is_dir()
+
+    def test_install_macos_reports_an_uncreatable_log_directory(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Fail closed: a log dir we cannot create is a job that cannot run."""
+        agents = tmp_path / "LaunchAgents"
+        agents.mkdir()
+        monkeypatch.setattr(auto, "_launch_agents_dir", lambda: agents)
+        monkeypatch.setattr(auto.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(auto, "_os_run",
+                            lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""))
+        blocker = tmp_path / "blocker"
+        blocker.write_text("not a directory\n")
+        monkeypatch.setattr(auto, "_tick_log_path", lambda h: blocker / "tick.log")
+        home = tmp_path / "home"
+        home.mkdir()
+
+        result = auto.install_scheduler(home)
+        assert result["ok"] is False
+        assert "log directory" in result["error"]
+
     def test_install_macos_falls_back_to_load_on_bootstrap_failure(
         self, tmp_path: Path, monkeypatch
     ) -> None:

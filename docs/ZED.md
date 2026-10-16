@@ -364,6 +364,14 @@ default server stays read-only.
   `.mini-ork/automations.log`. The scheduled job keeps the `PATH` of the
   shell that installed it (launchd and cron start with a bare one); after
   installing a new CLI, turn the scheduler off and on again.
+  A project on an **external volume** logs to
+  `~/Library/Logs/mini-ork/automations-tick-<hash>.log` instead: launchd
+  opens the log itself before it starts the job, and a log outside the boot
+  volume makes it refuse the job outright (`EX_CONFIG`, exit 78) — the job
+  then never runs and the log is never created, while the scheduler still
+  reads as "on". Re-run `mini-ork automations scheduler install` after
+  upgrading from a build that installed the in-home log (the page flags a
+  plist still pointing there).
 - **"claude CLI not found" when Zed is opened from the Dock.** Apps
   started from the Dock get a bare `PATH`. `mini-ork zed setup` writes the
   `PATH` of the shell you run it from into both Zed entries; run it again
