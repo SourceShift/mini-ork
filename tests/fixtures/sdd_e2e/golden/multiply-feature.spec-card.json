@@ -1,7 +1,7 @@
 {
   "spec_id": "multiply-feature",
   "source_path": "/fixture/sdd_e2e/specs/multiply-feature.md",
-  "source_hash": "sha256:055282baec89e19b1a1dd5d7aa80b8a585c17331f161f481937b0cd9949b7176",
+  "source_hash": "sha256:191c12b428da2473bd3d5a73384d3f6956c5a97d2a29abf9948320d62654aebd",
   "title": "Multiply two numbers",
   "clauses": {
     "functional": [
