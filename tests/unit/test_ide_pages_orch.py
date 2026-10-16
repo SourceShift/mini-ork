@@ -77,31 +77,52 @@ def test_every_tab_builds(home: Path, monkeypatch) -> None:
         page = orch.build(home, key, {})
         check_page(page, "orch")
         assert page["tab"] == key and page["sections"]
+        # FR-012 added `dispatch` second; FR-022 added `decide` third. The list is
+        # pinned as a requirement, not read back off `orch.TABS`.
         assert [t["key"] for t in page["tabs"]] == [
-            "session", "kickoffs", "races", "planner", "coord", "intake"]
+            "session", "dispatch", "decide", "kickoffs", "races", "planner", "coord", "intake"]
         assert page["errors"] == {}, page["errors"]
     assert orch.build(home, "nonsense", {})["tab"] == "session"
 
 
 def test_thread_defaults_follow_the_env(home: Path, monkeypatch) -> None:
-    # Thread defaults surface Model + Recipe + Workspace as the defaults the
-    # orchestrator proposes (the thread is a control plane; Mode is no
-    # longer offered as a picker).
-    monkeypatch.setenv("MO_ACP_DEFAULT_MODEL", "sonnet")
+    # Thread defaults surface Lane + Recipe + Workspace as three chip pickers whose
+    # selected chip is the default the orchestrator proposes (the thread is a
+    # control plane; Mode is no longer offered as a picker).
+    monkeypatch.setenv("MO_ACP_DEFAULT_MODEL", "opus")
     monkeypatch.setenv("MO_WORKSPACE_MODE", "in-place")
     monkeypatch.delenv("MO_ACP_RECIPE", raising=False)
-    page = orch.build(home, "session", {})
-    kv = {i["k"]: i for i in page["sections"][0]["items"]}
-    assert "Mode" not in kv
-    assert kv["Orchestrator lane"]["v"] == "sonnet" and kv["Orchestrator lane"]["sub"] == "MO_ACP_DEFAULT_MODEL"
-    assert kv["Recipe"]["v"] == "code-fix"
-    assert kv["Workspace"]["v"] == "In place (this checkout)"
+    by_title = {s["title"]: s for s in orch.build(home, "session", {})["sections"]}
+
+    def selected(title: str) -> dict:
+        chosen = [i for i in by_title[title]["items"] if i["on"]]
+        assert len(chosen) == 1, (title, [i["t"] for i in by_title[title]["items"]])
+        return chosen[0]
+
+    assert "Mode" not in by_title
+    assert "MO_ACP_DEFAULT_MODEL" in by_title["Orchestrator lane"]["note"]
+    lane = selected("Orchestrator lane")
+    assert lane["t"] == "Opus (Claude subscription)"
+    assert lane["do"]["cli"] == ["features", "set-env", "MO_ORCHESTRATOR_LANE", "opus"]
+    assert selected("Recipe")["t"] == "code-fix"
+    assert selected("Workspace")["t"] == "In place (this checkout)"
+
+
+def test_a_lane_outside_the_map_is_named(home: Path, monkeypatch) -> None:
+    # The lane axis is the lane map, so a model override naming nothing in it
+    # selects no chip — and the note has to say so, or the picker reads as
+    # "nothing is set" with no way back.
+    monkeypatch.setenv("MO_ACP_DEFAULT_MODEL", "no-such-lane")
+    lane_section = {s["title"]: s for s in orch.build(home, "session", {})["sections"]}["Orchestrator lane"]
+    assert not [i for i in lane_section["items"] if i["on"]]
+    assert "'no-such-lane' is not in the lane map" in lane_section["note"]
 
 
 def test_mcp_pills_are_the_servers_tools(home: Path) -> None:
     from mini_ork.mcp_context import server
 
-    pills = orch.build(home, "session", {})["sections"][1]
+    sections = orch.build(home, "session", {})["sections"]
+    pills = next(s for s in sections if s["title"].startswith("MCP context server"))
     names = [p["t"] for p in pills["items"]]
     assert names == [t["name"] for t in server.TOOL_DEFS] + [t["name"] for t in server._CONTROL_TOOL_DEFS]
     assert {p["c"] for p in pills["items"][len(server.TOOL_DEFS):]} == {"blue"}
@@ -116,9 +137,10 @@ def test_history_has_threads_and_runs(home: Path) -> None:
     store.append("orch-1791000000-t1", {"type": "meta", "cwd": str(home.parent)})
     store.append("orch-1791000000-t1", {"type": "user", "text": "Add dark mode"})
     store.append("orch-1791000000-t1", {"type": "costs", "costs": {"turn": 0.25, "run": 0.5}})
-    table = orch.build(home, "session", {})["sections"][2]
+    table = next(s for s in orch.build(home, "session", {})["sections"]
+                 if s["title"].startswith("History"))
     rows = {r["cells"][0]["t"]: r for r in table["rows"]}
-    assert rows["Add dark mode"]["cells"][1]["t"] == "thread"
+    assert rows["Add dark mode"]["cells"][1]["t"].endswith("thread")
     assert rows["Add dark mode"]["cells"][2]["t"] == "$0.75"
     assert rows["Fix the login loop"]["do"] == {"run": "run-1791000000-aaaaaa", "title": "Fix the login loop"}
 
@@ -134,9 +156,11 @@ def test_kickoffs_are_linted_and_link_their_runs(home: Path) -> None:
     con.execute("UPDATE task_runs SET kickoff_path = ? WHERE id = ?", (str(good), "run-1791000001-bbbbbb"))
     con.commit()
     con.close()
-    section = orch.build(home, "kickoffs", {})["sections"][0]
+    section = next(s for s in orch.build(home, "kickoffs", {})["sections"]
+                   if s["title"].startswith("Kickoffs"))
     items = {i["t"]: i for i in section["items"]}
-    assert "lint: The kickoff has no '# ' title line. (+" in items["good.md"]["sub"]
+    assert "lint: ⚠ The kickoff has no '# ' title line." in items["good.md"]["sub"]
+    assert "(+1 more)" in items["good.md"]["sub"]
     assert items["good.md"]["mc"] == "yellow" and "code-fix (default)" in items["good.md"]["sub"]
     assert "ran as run-1791000001-bbbbbb · published" in items["good.md"]["sub"]
     labels = [a["label"] for a in items["good.md"]["acts"]]
@@ -158,12 +182,18 @@ def test_races_group_contestants(home: Path) -> None:
         (run_dir / "config").mkdir()
         (run_dir / "config" / "agents.race.yaml").write_text(f"lanes:\n  implementer: {lane}\n")
     _run(home, "run-1791000009-solo99", kickoff="# Not a race\n")
-    rows = orch.build(home, "races", {})["sections"][0]["rows"]
-    assert len(rows) == 1
-    cells = [c["t"] for c in rows[0]["cells"]]
-    assert cells[0] == "Debounce search"
-    assert set(cells[1].split(" · ")) == {"sonnet", "glm"}
-    assert cells[2] == "1 / 2"
+    races = [s for s in orch.build(home, "races", {})["sections"]
+             if s["title"].startswith("Race · ")]
+    # One section per race (FR-033), the contestants as its rows: they are the
+    # decision input, so the Keep buttons sit beside them.
+    assert [s["title"] for s in races] == ["Race · Debounce search"]
+    rows = races[0]["rows"]
+    assert len(rows) == 2
+    assert {r["cells"][0]["t"] for r in rows} == {"sonnet", "glm"}
+    assert {r["cells"][2]["t"] for r in rows} == {"published", "failed"}
+    assert {a["label"] for r in rows for a in r["acts"]} == {"Open run"}
+    # A run whose kickoff matches no other run is not a race of its own.
+    assert "solo99" not in json.dumps(races)
 
 
 def test_planner_reads_the_latest_profile_and_plan(home: Path) -> None:
@@ -174,10 +204,16 @@ def test_planner_reads_the_latest_profile_and_plan(home: Path) -> None:
     (run_dir / "plan.json").write_text(json.dumps({"objective": "Add a toggle", "decomposition": [
         {"step": 1, "node_type": "implementer", "action": "Edit tokens.ts. Then more.", "target_file": "tokens.ts"}]}))
     sections = orch.build(home, "planner", {})["sections"]
-    kv = {i["k"]: i["v"] for i in sections[0]["items"]}
+    # FR-023 puts the classifications table first: the table is what you pick
+    # from, the selected run's detail is what follows the pick.
+    assert sections[0]["title"] == "Classifications"
+    detail = next(s for s in sections if s["title"].startswith("Classification · "))
+    kv = {i["k"]: i["v"] for i in detail["items"]}
     assert kv["task_class"] == "ui_change" and kv["confidence"] == "0.91"
-    assert sections[1]["items"][0]["t"] == "1 · Edit tokens.ts"
-    assert sections[2]["items"][0]["t"] == "Apply to API keys too?"
+    plan = next(s for s in sections if s["title"].startswith("Plan · "))
+    assert plan["items"][0]["t"] == "1 · Edit tokens.ts"
+    questions = next(s for s in sections if s["title"] == "Planner questions")
+    assert questions["items"][0]["t"] == "Apply to API keys too?"
 
 
 def test_coordination_without_contextnest(home: Path, monkeypatch) -> None:

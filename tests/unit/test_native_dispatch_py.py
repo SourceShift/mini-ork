@@ -44,6 +44,7 @@ def test_all_former_exec_subs_registered_natively():
         "skills",
         "threads",
         "intake",
+        "kickoff",
         "cn",
         "approvals",
     }
