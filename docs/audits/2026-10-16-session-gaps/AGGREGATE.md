@@ -640,8 +640,11 @@ blob — which is precisely the working-tree state a rebase checkout produces. S
 Witnessed on `lf-r5` and `lf-r2`; `.mini-ork/file-reversion-guard.log` records
 `restored-reverted-to-2e8367f7…`. Worked around with `MO_REVERSION_GUARD_DISABLED=1`; the source
 still needs fixing. **Not one session's problem:** worktree-merge is how changes land in this repo,
-so a guard that makes it wedge after every commit sits on the critical path for every session — and
-it is a plausible contributor to the "push race, retry loop" friction reported elsewhere here.
+so a guard that makes it wedge after every commit sits on the critical path for every session.
+It caused the two wedged rebases and the retry loops that followed them — but **not** the "push
+race" friction reported elsewhere here, which is a ref-update race on `origin`; the guard only ever
+touches the local working tree. (I inferred the causal link; the session that owns the defect
+corrected it, and the distinction matters because the two have different fixes.)
 
 **Proven but deliberately not applied** — the live-DB cleanup of 166 non-code rows / 280 artifact
 file paths is demonstrated on a **copy** and held back from `$MINI_ORK_HOME/state.db` while R8 runs.
