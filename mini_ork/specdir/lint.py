@@ -49,6 +49,7 @@ SEVERITY = {
     "DEP_CYCLE": ERROR,
     "DUP_ID": ERROR,
     "NO_ACCEPTANCE": ERROR,
+    "NO_EXECUTABLE_FENCE": WARNING,
     "NO_VERIFY_CMD": WARNING,
     "UI_PROBE_UNREACHABLE": WARNING,
     "VAGUE_CRITERIA": WARNING,
@@ -111,8 +112,13 @@ def _term_re(term: str) -> re.Pattern[str]:
     return re.compile(r"(?<!\w)" + r"\s+".join(map(re.escape, term.split())) + r"(?!\w)", re.I)
 
 
+def _has_executable_fence(doc: mdparse.Document) -> bool:
+    """A shell fence with a body — the only thing gates-materialize can probe."""
+    return any(f.lang in _SHELL_LANGS and f.body.strip() for f in doc.fences)
+
+
 def _has_verify_cmd(doc: mdparse.Document) -> bool:
-    if any(f.lang in _SHELL_LANGS and f.body.strip() for f in doc.fences):
+    if _has_executable_fence(doc):
         return True
     for _, line in doc.prose:
         for span in mdparse.inline_code_spans(line):
@@ -139,6 +145,12 @@ def lint_text(spec_id: str, text: str, size_bytes: int | None = None, *,
         out.append(_finding(spec_id, "NO_VERIFY_CMD",
                             "no backticked verify command (a shell code fence or an inline "
                             "`command args` span)"))
+    if acceptance and not _has_executable_fence(doc):
+        out.append(_finding(spec_id, "NO_EXECUTABLE_FENCE",
+                            "no executable ```bash fence — spec-driven-delivery builds every "
+                            "acceptance gate from the spec's own bash fences, so this spec is "
+                            "unprobeable in full and its run fails at gates_materialize (an "
+                            "inline `command args` span satisfies NO_VERIFY_CMD but not this)"))
 
     if acceptance:
         scope, note = "acceptance criteria", ""

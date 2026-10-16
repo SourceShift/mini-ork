@@ -26,3 +26,17 @@ row of one run to a CSV file.
 - AC2: an unknown run id exits with code 2 and creates no file.
 - AC3: a field value `a,"b"` round-trips through `csv.reader` unchanged.
 - Verify with `python3 -m pytest -q tests/example.py`.
+
+```bash
+# AC1
+python3 -m pytest -q tests/example.py -k ledger_rows
+echo "AC1 pass"
+
+# AC2
+python3 -m pytest -q tests/example.py -k unknown_run
+echo "AC2 pass"
+
+# AC3
+python3 -m pytest -q tests/example.py -k round_trip
+echo "AC3 pass"
+```

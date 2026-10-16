@@ -339,8 +339,8 @@ def test_duplicate_spec_ids_are_a_hard_error(tmp_path):
 
 def test_lint_codes_and_severities():
     assert set(lint_mod.CODES) == {
-        "NO_ACCEPTANCE", "NO_VERIFY_CMD", "VAGUE_CRITERIA", "OVERSIZE", "MISSING_SECTIONS",
-        "DUP_ID", "DEP_CYCLE", "UI_PROBE_UNREACHABLE",
+        "NO_ACCEPTANCE", "NO_EXECUTABLE_FENCE", "NO_VERIFY_CMD", "VAGUE_CRITERIA", "OVERSIZE",
+        "MISSING_SECTIONS", "DUP_ID", "DEP_CYCLE", "UI_PROBE_UNREACHABLE",
     }
     errors = {c for c, s in lint_mod.SEVERITY.items() if s == "error"}
     assert errors == {"DEP_CYCLE", "DUP_ID", "NO_ACCEPTANCE"}
@@ -377,6 +377,9 @@ _CLEAN = """# T
 - x
 ## Acceptance criteria
 - returns 3 for input `f(1, 2)`
+```bash
+echo "ok"
+```
 """
 
 
@@ -387,7 +390,7 @@ def test_lint_vague_terms_scoped_to_acceptance_and_configurable(monkeypatch):
     assert lint_mod.lint_text("t", in_code) == []  # inside a code span
     vague = _CLEAN + "- Works Correctly\n"
     [f] = lint_mod.lint_text("t", vague)
-    assert f.code == "VAGUE_CRITERIA" and "'correctly'" in f.message and "line 6" in f.message
+    assert f.code == "VAGUE_CRITERIA" and "'correctly'" in f.message and "line 9" in f.message
     assert lint_mod.lint_text("t", _CLEAN + "- incorrectly\n") == []  # word boundary
     monkeypatch.setenv("MO_SDD_VAGUE_TERMS", "returns, fast enough")
     assert [f.code for f in lint_mod.lint_text("t", vague)] == ["VAGUE_CRITERIA"]
@@ -420,8 +423,26 @@ def test_lint_headings_inside_fences_do_not_count():
 
 @pytest.mark.parametrize("heading", ["Definition of Done", "Success Criteria", "Done when", "ACCEPTANCE"])
 def test_lint_acceptance_heading_variants(heading):
-    text = f"# T\n## Edge cases\n## {heading}\n- exit code 0 from `make test`\n"
+    text = f"# T\n## Edge cases\n## {heading}\n- exit code 0 from `make test`\n```bash\nmake test\n```\n"
     assert lint_mod.lint_text("t", text) == []
+
+
+def test_lint_flags_a_spec_whose_acceptance_can_never_be_probed():
+    """An inline verify command satisfies NO_VERIFY_CMD but leaves every gate unprobeable.
+
+    spec-driven-delivery's ``gates-materialize`` builds each acceptance gate from
+    the spec's own ```bash fences, so a spec with acceptance criteria and no
+    fence fails the run at ``gates_materialize`` with one ``NO_EXECUTABLE_FENCE``
+    per criterion — while lint reported it clean. Both 2026-10-16 run-initiation
+    corpora (5 specs, 36 ACs) were exactly this shape, and two runs died on it.
+    """
+    no_fence = ("# T\n## Inputs\n- x\n## Acceptance criteria\n"
+                "- a\nVerify with `make test`.\n")
+    assert [f.code for f in lint_mod.lint_text("t", no_fence)] == ["NO_EXECUTABLE_FENCE"]
+    assert lint_mod.lint_text("t", no_fence + "```bash\nmake test\n```\n") == []
+    # No acceptance criteria: NO_ACCEPTANCE already reports it. Do not double-report.
+    bare = "# T\n## Inputs\n- x\nVerify with `make test`.\n"
+    assert [f.code for f in lint_mod.lint_text("t", bare)] == ["NO_ACCEPTANCE"]
 
 
 def test_lint_output_independent_of_file_creation_order(tmp_path):
