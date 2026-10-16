@@ -616,3 +616,41 @@ code, asserted from one search instead of a positive check** (C-1 one grep, C-3 
 grep with a suppressed error). The pattern is worth naming: every one of my wrong claims was a
 *negative* ("there is no code", "the loop is broken", "the rule does not exist"), and every one
 survived because the failing check was quiet rather than loud.
+
+---
+
+## Delivery — round 4
+
+**`1165b056` (learning-loop fix program)** — report filed as `1165b056-learning-loop-fixes.md`,
+verified against `origin/main` `5b8d4a98` rather than against recorded status.
+
+- **Shipped, all ancestors of `origin/main`:** R1 `d405ef48`, R2 `5b8d4a98`, R4 `aaa87512`,
+  R5 `95a4af77`, R6 `b2f5b224`, R7a `dc2d8793`, R10 `fda51845`, plus
+  `recipes/audit-judge-panel-4l` and `mini_ork/verify/panel_heterogeneity.py`.
+- **In the plan of record but NOT shipped** (`docs/plans/2026-10-15-learning-loop-fixes.md`,
+  `9fb802fa`): R3 — the double injection is still live, `mini_ork/cli/execute.py:3567` returns
+  `pref_block + v2_block + block` — plus R7b, R9, R11a, R11b, R12 (no `target_repo` symbol
+  anywhere) and R13 (no `v2_legacy`/`effective` symbol). R8 in progress. **This is cross-cutting
+  finding 1 again:** a plan of record that reads like a shipped contract.
+
+**New defect — the reversion watchdog undoes a legitimate rebase (P1).**
+`.githooks/post-commit:132-152` restores a file whenever its content equals a **parent** commit's
+blob — which is precisely the working-tree state a rebase checkout produces. So every
+`make worktree-merge` within ~60 s of a commit wedges with *"local changes would be overwritten"*.
+Witnessed on `lf-r5` and `lf-r2`; `.mini-ork/file-reversion-guard.log` records
+`restored-reverted-to-2e8367f7…`. Worked around with `MO_REVERSION_GUARD_DISABLED=1`; the source
+still needs fixing. **Not one session's problem:** worktree-merge is how changes land in this repo,
+so a guard that makes it wedge after every commit sits on the critical path for every session — and
+it is a plausible contributor to the "push race, retry loop" friction reported elsewhere here.
+
+**Proven but deliberately not applied** — the live-DB cleanup of 166 non-code rows / 280 artifact
+file paths is demonstrated on a **copy** and held back from `$MINI_ORK_HOME/state.db` while R8 runs.
+Correct call; recorded as pending, not done.
+
+**The primary's divergence closes as this session's, not a peer's.** `1165b056` found local `main`
+diverged and inferred "another session's unpushed docs(audit) commits" — correct, and it is this
+aggregation's: local `351481b1` is **patch-id-identical** to `8d8be650` (`git patch-id --stable` on
+both → `e1307ee4e056ad09a8e5e3a275a8351990444b1c`), so it is a true duplicate of what is already on
+`origin/main` and dropping it loses nothing. It clears with `git pull --rebase` once the ~11 dirty
+files from other sessions quiet; `--ff-only` will keep refusing in the meantime, and an `--ff-only`
+refusal there is **not** evidence of new drift. Not cleared by this session for that reason.
