@@ -538,6 +538,22 @@ def merge_worktree(args: list[str]) -> None:
     if rc != 0:
         die(f"green gate failed ({test_cmd}) in {wt}; "
             f"{_differential_verdict(wt, test_cmd, pre_rebase, base_before)}")
+    # The gate above runs for minutes, so origin/main has almost certainly moved
+    # since the fetch at the top. A push now is a coin flip: it is rejected as
+    # non-fast-forward whenever any peer landed during the gate, even though the
+    # tree is green and nothing is wrong with it. Re-fetch and re-rebase first
+    # so the push fast-forwards the CURRENT origin/main. When the re-rebase
+    # actually rewrites HEAD the gated content changed (this branch combined
+    # with new upstream commits), so the gate is re-run before pushing.
+    git("-C", wt, "fetch", "origin", "main")
+    gated_head = git("-C", wt, "rev-parse", "HEAD", capture=True).stdout.strip()
+    git("-C", wt, "rebase", "origin/main")
+    if git("-C", wt, "rev-parse", "HEAD", capture=True).stdout.strip() != gated_head:
+        rc = subprocess.run(test_cmd, cwd=wt, shell=True, check=False).returncode
+        if rc != 0:
+            die(f"green gate failed after re-rebasing onto a moved origin/main "
+                f"({test_cmd}) in {wt}; "
+                f"{_differential_verdict(wt, test_cmd, pre_rebase, base_before)}")
     git("-C", wt, "push", "origin", "HEAD:main")
     short_sha = git("-C", wt, "rev-parse", "--short", "HEAD",
                     check=False, capture=True).stdout.strip()
