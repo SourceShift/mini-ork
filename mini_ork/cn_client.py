@@ -525,14 +525,53 @@ def _coerce_path(value) -> str:
     return ""
 
 
+#: A project's linked worktrees live in a sibling of the checkout, named
+#: ``<repo>-worktrees/<slug>/``. That is where this repo does all of its work,
+#: so a memory recorded from a worktree names the *worktree* path (verified
+#: live 2026-10-16: ``metadata.project_cwd`` =
+#: ``/Volumes/docker-ssd/ps/mini-ork-worktrees/ide-node-stream``) and never the
+#: checkout the caller asked about.
+_WORKTREES_SUFFIX = "-worktrees"
+
+
+def project_roots(project: str) -> tuple[str, ...]:
+    """Every root that counts as ``project``: the checkout and its worktrees.
+
+    ContextNest attributes a session to its launch directory, and here that is
+    almost always a linked worktree, so a matcher that accepted only the
+    checkout itself would drop every memory this repo produces — ``cn search``
+    and ``cn seen-before`` both returned zero project-scoped hits against the
+    live server for exactly that reason.
+
+    The separator boundary is still the callers' job (they match ``root + "/"``),
+    so widening the set cannot leak ``/ps/mini-ork2`` into ``/ps/mini-ork``.
+
+    ``MINI_ORK_WORKTREES_DIR`` overrides the location. It is honoured only when
+    it keeps the conventional per-repo shape (``<name>-worktrees``), so pointing
+    one shared directory at several repos' worktrees cannot widen the scope.
+    """
+    norm = (project or "").rstrip("/")
+    if not norm:
+        return ()
+    roots = [norm]
+    wanted = norm + _WORKTREES_SUFFIX
+    for candidate in (wanted, os.environ.get("MINI_ORK_WORKTREES_DIR", "")):
+        cand = (candidate or "").rstrip("/")
+        if not cand or cand in roots:
+            continue
+        if os.path.basename(cand) == os.path.basename(norm) + _WORKTREES_SUFFIX:
+            roots.append(cand)
+    return tuple(roots)
+
+
 def filter_by_project_path(items, project_path: str) -> list:
     """Drop items that carry no path inside ``project_path``.
 
     ``items`` is an iterable of dicts. An item is kept when any of the
     string fields (``path``, ``file``, ``cwd``, ``project_cwd``, ``uri``)
-    starts with ``project_path`` (``project_path`` is normalised so a
-    trailing slash does not silently reject ``/ps/mini-ork/foo`` when the
-    caller asked for ``/ps/mini-ork``).
+    starts with one of :func:`project_roots` — the checkout, or a worktree of
+    it (``project_path`` is normalised so a trailing slash does not silently
+    reject ``/ps/mini-ork/foo`` when the caller asked for ``/ps/mini-ork``).
 
     Items without any recognisable path field are dropped — the run-id
     extraction then has nothing to misread, and a foreign project leak is
@@ -540,7 +579,7 @@ def filter_by_project_path(items, project_path: str) -> list:
     """
     if not project_path:
         return list(items) if items else []
-    norm = project_path.rstrip("/")
+    prefixes = tuple(r + "/" for r in project_roots(project_path))
     keys = ("path", "file", "cwd", "project_cwd", "uri")
     out: list = []
     for item in items or []:
@@ -548,7 +587,7 @@ def filter_by_project_path(items, project_path: str) -> list:
             continue
         for k in keys:
             v = item.get(k)
-            if isinstance(v, str) and v.startswith(norm + "/"):
+            if isinstance(v, str) and v.startswith(prefixes):
                 out.append(item)
                 break
     return out

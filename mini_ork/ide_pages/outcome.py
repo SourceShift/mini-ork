@@ -35,6 +35,8 @@ card's live ``task_state`` would otherwise route them to the wrong word:
 """
 from __future__ import annotations
 
+import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -184,6 +186,218 @@ def _step(run) -> str:
 
 
 # ── read-only file helpers ─────────────────────────────────────────────────
+
+# ── seen-before helpers (read-only, never call retrieve) ───────────────────
+#
+# The ``mini-ork cn seen-before <run-id>`` verb writes
+# ``<run_dir>/contextnest-seen-before.json`` once per run. The failed
+# outcome card reads THAT file verbatim — the page render path never
+# re-hits ContextNest (retrieve takes 8–38 s live; calling it on the
+# page-render path blows the page budget). When the file is absent, the
+# card surfaces a one-line "Find similar past failures" button that runs
+# the verb (the only path that writes the file). The same wire shape
+# feeds the failed node page.
+
+_SEEN_BEFORE_FILE = "contextnest-seen-before.json"
+_SEEN_BEFORE_PAGE_LIMIT = 3
+
+
+def _seen_before_path(run) -> str:
+    """Absolute path to the run's stored seen-before envelope.
+
+    The same convention the run page uses: ``$MINI_ORK_HOME/runs/<run-id>``.
+    Returns ``""`` when the run has no run_dir on disk; the caller
+    treats that as "no stored file" and renders the button row.
+    """
+    run_dir = getattr(run, "run_dir", None)
+    if run_dir is None:
+        return ""
+    return str(run_dir / _SEEN_BEFORE_FILE)
+
+
+def _read_seen_before(path: str) -> dict[str, Any] | None:
+    """Best-effort read of the stored envelope, or ``None`` on miss / parse error.
+
+    A missing or unparseable file is the same as "not yet cached": the
+    page renders the button row, not a broken-JSON error. A real envelope
+    carries ``hits: [{id, content, importance, similarity, metadata{},
+    session_id}]`` in the verified live 2026-10-15 shape; we walk the
+    top :data:`_SEEN_BEFORE_PAGE_LIMIT` by similarity.
+    """
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.loads(fh.read())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _seen_before_cards(envelope: dict[str, Any], *, run_id: str) -> list[dict[str, Any]]:
+    """Up to three evidence cards for the failed outcome card.
+
+    Each card's ``t`` is the hit's content (truncated to 240 chars so a
+    long memory does not push the action buttons off the card), ``sub``
+    carries ``sim=<score> age=<since>`` (age in compact "Nd"/"Nh" form,
+    never the raw epoch), and the row's ``do`` opens the hit's
+    ``cn_session`` page so the operator can drill into the trajectory.
+    Each card also carries the ``Helped`` / ``Wrong`` buttons, bound to
+    *that card's* atom id (the hit's ``id``) — see
+    :func:`_card_outcome_actions`.
+    """
+    raw_hits = envelope.get("hits") if isinstance(envelope, dict) else None
+    if not isinstance(raw_hits, list):
+        return []
+    sorted_hits = sorted(
+        (h for h in raw_hits if isinstance(h, dict)),
+        key=lambda h: float(h.get("similarity") or 0.0),
+        reverse=True,
+    )
+    ts = int(envelope.get("ts") or 0)
+    cards: list[dict[str, Any]] = []
+    for h in sorted_hits[:_SEEN_BEFORE_PAGE_LIMIT]:
+        content = str(h.get("content") or "").strip().replace("\n", " ")
+        if len(content) > 240:
+            content = content[:237] + "..."
+        try:
+            sim = float(h.get("similarity") or 0.0)
+        except (TypeError, ValueError):
+            sim = 0.0
+        age = _compact_age(ts)
+        sub = f"sim={sim:.2f} · {age}"
+        sid = h.get("session_id")
+        acts: list[dict[str, Any]] = []
+        if isinstance(sid, str) and sid:
+            acts.append(S.btn("Open session",
+                              S.page_link("cn_session", id=sid), "ghost"))
+        atom_id = h.get("id")
+        if isinstance(atom_id, str) and atom_id:
+            acts.extend(_card_outcome_actions(atom_id, run_id))
+        cards.append({
+            "m": "•",
+            "mc": "sub",
+            "t": content or "(empty memory)",
+            "tc": "text",
+            "sub": sub,
+            "mono": False,
+            "when": "",
+            "acts": acts,
+        })
+    return cards
+
+
+def _compact_age(ts: int) -> str:
+    """A short age string ("just now", "Nh", "Nd") for the card sub-line.
+
+    Missing or non-positive ``ts`` returns ``""`` so the sub-line drops
+    the bullet rather than showing a wall-clock stamp the operator
+    cannot place.
+    """
+    if not ts or ts <= 0:
+        return ""
+    delta = max(0, int(time.time()) - int(ts))
+    if delta < 60:
+        return "just now"
+    if delta < 3600:
+        return f"{delta // 60}m ago"
+    if delta < 86400:
+        return f"{delta // 3600}h ago"
+    return f"{delta // 86400}d ago"
+
+
+def _seen_before_section(run) -> dict[str, Any] | None:
+    """The Seen-before evidence section for the failed outcome card.
+
+    Renders NOTHING for a published / running / needs-you outcome — the
+    section is failure-only, because the cache is the failing-run cache.
+    The section is a ``list`` of up to three evidence cards plus the
+    Helped/Wrong action row when a stored envelope is present; when no
+    file is on disk, the section is a single button row that runs
+    ``mini-ork cn seen-before <run-id> --node <failing-node>`` so the
+    next render will have something to show.
+
+    The page NEVER calls retrieve — that lives in the verb. The Helped/
+    Wrong buttons are confirm-gated; the IDE surfaces a confirm prompt
+    on click, the CLI requires ``--yes`` (see
+    :func:`mini_ork.cli.cn_cmd._cmd_outcome`).
+    """
+    if state_word(run) != "failed":
+        return None
+    run_id = str(getattr(run, "id", "") or "")
+    if not run_id:
+        return None
+    path = _seen_before_path(run)
+    envelope = _read_seen_before(path)
+    if envelope is not None:
+        cards = _seen_before_cards(envelope, run_id=run_id)
+        if not cards:
+            # Stored file but empty hit list — the verb succeeded with
+            # nothing to show. A single "no similar past failures" row
+            # plus the Helped/Wrong action row is the truthful state.
+            cards = [{
+                "m": "•",
+                "mc": "sub",
+                "t": "No similar past failures in ContextNest.",
+                "tc": "text",
+                "sub": "",
+                "mono": False,
+                "when": "",
+                "acts": [],
+            }]
+        # Helped / Wrong live on each card's acts, bound to that card's
+        # atom id — a verdict lands on the memory that was shown, not on
+        # a run-scoped row the operator never saw.
+        return S.lst("Seen before", cards, full=True)
+    # No stored file. Surface the single "Find similar past failures"
+    # button. The button's CLI dispatches the verb on click — the page
+    # render itself is cache-slot-only.
+    failing = _failing_node_id(run) or ""
+    btn_args: list[str] = ["cn", "seen-before", run_id]
+    if failing:
+        btn_args += ["--node", failing]
+    button = S.btn("Find similar past failures",
+                   S.cli(*btn_args,
+                         confirm=f"Run the seen-before retrieve for {run_id}?",
+                         home=False))
+    return S.lst("Seen before", [{
+        "m": "•",
+        "mc": "sub",
+        "t": "No retrieve has been run for this run yet.",
+        "tc": "text",
+        "sub": "",
+        "mono": False,
+        "when": "",
+        "acts": [button],
+    }], full=True)
+
+
+def _card_outcome_actions(atom_id: str, run_id: str) -> list[dict[str, Any]]:
+    """The Helped / Wrong buttons for one seen-before evidence card.
+
+    Confirm-gated through :func:`S.cli` — the IDE shows a confirm
+    prompt, the CLI asks on the TTY. The action settles *this card's*
+    atom id (the hit's ``id``), so the operator's verdict lands on the
+    memory that was shown; ``--run`` carries the failing run's id for
+    provenance. The page passes ``home=False`` because ``mini-ork cn
+    outcome`` has no ``--home`` flag.
+    """
+    helped = S.btn(
+        "Helped",
+        S.cli("cn", "outcome", atom_id, "success", "--run", run_id,
+              confirm=f"Record {atom_id} as 'helped' for {run_id}?",
+              home=False),
+        "ghost",
+    )
+    wrong = S.btn(
+        "Wrong",
+        S.cli("cn", "outcome", atom_id, "failure", "--run", run_id,
+              confirm=f"Record {atom_id} as 'wrong' for {run_id}?",
+              home=False),
+        "ghost",
+    )
+    return [helped, wrong]
+
 
 def _hint(run) -> dict[str, Any] | None:
     """The retry hint, or ``None``. Never writes (``write=False``)."""
@@ -457,6 +671,16 @@ def _failed(run, hint: dict[str, Any] | None) -> dict[str, Any]:
     actions, revised = _failed_actions(run, hint)
     if revised and revised not in detail:
         detail = f"{detail.rstrip('. ')}. {revised}" if detail else revised
+    # The seen-before section is the failure-only evidence surface. A
+    # running / needs-you / done card carries no Seen-before row — the
+    # cache is the failing-run cache and a card without a failure has
+    # nothing to compare against. The callout is added directly here
+    # (rather than via ``_menu`` / ``_counts``) so the section is bound
+    # to the failed card specifically.
+    callouts: list[dict[str, Any]] = []
+    seen = _seen_before_section(run)
+    if seen is not None:
+        callouts.append(seen)
     return {
         "state": "failed",
         "tone": "red",
@@ -464,7 +688,7 @@ def _failed(run, hint: dict[str, Any] | None) -> dict[str, Any]:
         "text": text,
         "detail": detail,
         "actions": actions,
-        "callouts": [],
+        "callouts": callouts,
     }
 
 

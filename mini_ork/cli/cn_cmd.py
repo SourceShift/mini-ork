@@ -31,14 +31,47 @@ read budget; a body without a ``hits`` list (or ``available()`` returning
 False) writes an error envelope and exits 4 — callers distinguish scope
 vs. retrieve by the envelope's ``error`` field.
 
+``cn seen-before <run-id> [--node <node-id>]`` caches one
+``/api/v1/tools/retrieve`` POST per failing run/node into
+``<run_dir>/contextnest-seen-before.json`` — the immutable per-run file
+the failed outcome and failed node pages read on render. The verb reaches
+into :func:`mini_ork.cn_client._post_json` directly (same wire as
+:func:`mini_ork.cn_client.retrieve`, but with the ``CN_SEARCH_TIMEOUT_SEC``
+budget the verb reads) and never touches ``CN_TIMEOUT_SEC``; project
+scoping is the same fail-closed gate ``cn search`` honours
+(:data:`SCOPE_ERROR` → exit 3). A body without a ``hits`` list is treated
+as a retrieve failure (exit 4) and stores nothing — a partial write would
+poison the page's render cache. The envelope is written ONCE: a second
+call for the same run does NOT overwrite the stored file (immutable
+cache, never mutated), and the page always reads the file verbatim — the
+``mini-ork cn seen-before`` button is the only path that writes.
+
+``cn outcome <atom-id> success|failure --run <run-id>`` posts to
+``/api/v1/agent/outcome`` through the synchronous
+:func:`mini_ork.cn_client._settle_outcome` seam and reports the response's
+``updated`` field (NOT ``delta_applied`` — the documented live shape
+verified 2026-10-15; the verb never reads ``delta_applied``). The verb is
+confirm-gated: the IDE button passes a ``confirm`` through
+:func:`mini_ork.ide_pages.spec.cli`, and the CLI requires ``--yes`` (or an
+affirmative on the TTY prompt) before posting so a typed ``mini-ork cn
+outcome`` invocation does not silently mutate CN's memory on a yes-means-
+yes assumption. A secure-tier missing write-scoped key surfaces as a
+named :class:`SecretStoreError` (exit 5, key name only, never the value);
+CN disabled / unreachable returns the same pending reason the settle path
+records and exits 0 — the audit log captures the failure, the operator
+sees the same missing-key signal.
+
 Wire: ``GET /api/v1/substrate/health`` (ping),
-``POST /api/v1/tools/retrieve`` (memories), ``GET /api/v1/sessions/by-file``
-and ``/api/v1/sessions/by-feature`` and ``/api/v1/sessions/:id/summary``
-(files), ``GET /api/v1/features?project=...`` (features). Exit codes: 0 on
-a successful search write; 2 on a usage error; 3 on a scope-resolution
-failure OR ContextNest-unreachable; 4 on a retrieve-failure OR an HTTP
-4xx/5xx; 5 on a secure-tier secret-store misconfiguration. Both 3 and 4 are
-overloaded — the envelope's ``error`` field is the only discriminator.
+``POST /api/v1/tools/retrieve`` (memories / seen-before),
+``GET /api/v1/sessions/by-file`` and ``/api/v1/sessions/by-feature`` and
+``/api/v1/sessions/:id/summary`` (files), ``GET /api/v1/features?project=...``
+(features), ``POST /api/v1/agent/outcome`` (settle). Exit codes: 0 on a
+successful search / seen-before write / outcome settle; 2 on a usage
+error; 3 on a scope-resolution failure OR ContextNest-unreachable; 4 on
+a retrieve-failure OR an HTTP 4xx/5xx; 5 on a secure-tier secret-store
+misconfiguration. Both 3 and 4 are overloaded — the envelope's ``error``
+field (search) / the stderr reason (seen-before / outcome) is the only
+discriminator.
 """
 from __future__ import annotations
 
@@ -134,6 +167,72 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true",
         help="emit the result envelope as JSON instead of writing the "
              "cache slot",
+    )
+    seen = sub.add_parser(
+        "seen-before",
+        help="cache a ContextNest retrieve result for a failing run into "
+             "<run_dir>/contextnest-seen-before.json",
+    )
+    seen.add_argument(
+        "run_id",
+        help="the run id whose <run_dir>/contextnest-seen-before.json the "
+             "outcome and node pages read",
+    )
+    seen.add_argument(
+        "--node", default=None,
+        help="the failing node id; the verb reads the error tail from the "
+             "node's log / session transcript. Defaults to the run's "
+             "failing node when omitted.",
+    )
+    seen.add_argument(
+        "--all-projects", action="store_true",
+        help="include other projects' rows; default is this-project only",
+    )
+    seen.add_argument(
+        "--top-k", type=int, default=5,
+        help="the /api/v1/tools/retrieve top_k value (default 5). The page "
+             "renders the top 3 by similarity regardless.",
+    )
+    seen.add_argument(
+        "--json", action="store_true",
+        help="emit the envelope as JSON instead of writing the stored file",
+    )
+    outcome = sub.add_parser(
+        "outcome",
+        help="settle one atom's outcome (success|failure) against "
+             "/api/v1/agent/outcome; reports the response's `updated` field",
+    )
+    outcome.add_argument(
+        "atom_id",
+        help="the atom id to settle; the run page also accepts the run id "
+             "so the Helped/Wrong buttons can pass one stable value",
+    )
+    outcome.add_argument(
+        "outcome",
+        choices=("success", "failure"),
+        help="the outcome to record; the live 2026-10-15 wire accepts "
+             "either, and the response carries `updated`",
+    )
+    outcome.add_argument(
+        "--run", default=None,
+        help="the run id, used to scope evidence when the audit log "
+             "records the settle; defaults to none",
+    )
+    outcome.add_argument(
+        "--evidence", default="",
+        help="an optional evidence string the settle records against the "
+             "atom; capped at 480 chars by the cn_client seam",
+    )
+    outcome.add_argument(
+        "--yes", action="store_true",
+        help="skip the interactive confirm; the IDE buttons carry a "
+             "`confirm` payload that the IDE itself handles, so the CLI "
+             "still asks the operator on a typed invocation",
+    )
+    outcome.add_argument(
+        "--json", action="store_true",
+        help="emit the settle response as JSON instead of the one-line "
+             "`outcome: <atom_id> updated=<n>` text",
     )
     return parser
 
@@ -413,21 +512,30 @@ def _project_path_match(item, project: str) -> str:
     for files mode. The helper walks the common shapes so a foreign
     project leak is impossible by construction (an item with no path
     under ``project`` is dropped by the caller of this helper).
+
+    "Under ``project``" is :func:`mini_ork.cn_client.project_roots` — the
+    checkout *and* its ``<repo>-worktrees`` sibling. ContextNest records a
+    session against its launch directory, and this repo launches almost
+    everything from a worktree, so matching the checkout alone returned zero
+    project-scoped rows against the live server (measured 2026-10-16: 0 hits
+    scoped, 5 hits unscoped, every one of them this project's own files).
     """
     if not isinstance(item, dict) or not project:
         return ""
-    norm = project.rstrip("/")
+    prefixes = tuple(r + "/" for r in cn_client.project_roots(project))
+    if not prefixes:
+        return ""
     # Top-level keys first (matches :func:`cn_client.filter_by_project_path`).
     for key in ("path", "file", "cwd", "project_cwd", "uri"):
         v = item.get(key)
-        if isinstance(v, str) and v.startswith(norm + "/"):
+        if isinstance(v, str) and v.startswith(prefixes):
             return v
     # ``metadata`` is the canonical wire shape — verified 2026-10-15.
     meta = item.get("metadata")
     if isinstance(meta, dict):
         for key in ("project_cwd", "cwd", "path", "file"):
             v = meta.get(key)
-            if isinstance(v, str) and v.startswith(norm + "/"):
+            if isinstance(v, str) and v.startswith(prefixes):
                 return v
     # List-of-path fields: ``files`` / ``matched_files`` ship as a
     # list of strings (or one-level dicts whose values include a path).
@@ -435,11 +543,11 @@ def _project_path_match(item, project: str) -> str:
         v = item.get(key)
         if isinstance(v, list):
             for entry in v:
-                if isinstance(entry, str) and entry.startswith(norm + "/"):
+                if isinstance(entry, str) and entry.startswith(prefixes):
                     return entry
                 if isinstance(entry, dict):
                     for vv in entry.values():
-                        if isinstance(vv, str) and vv.startswith(norm + "/"):
+                        if isinstance(vv, str) and vv.startswith(prefixes):
                             return vv
     return ""
 
@@ -783,6 +891,470 @@ def _cmd_search(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# ── seen-before verb ───────────────────────────────────────────────────────
+#
+# ``cn seen-before <run-id> [--node <node-id>]`` resolves the run's failing
+# node, pulls an error-tail query from the node's log / session transcript,
+# POSTs one ``/api/v1/tools/retrieve`` through ``_post_json`` with
+# ``CN_SEARCH_TIMEOUT_SEC`` as the budget, filters the result to the
+# project's rows, and writes the envelope to
+# ``<run_dir>/contextnest-seen-before.json`` (an immutable per-run cache
+# the outcome and node pages read verbatim). The verb never touches
+# ``CN_TIMEOUT_SEC``; the search-mode memory path is the one that owns
+# that budget. A body without a ``hits`` list (including the empty
+# ``{}`` ``_post_json`` returns on a swallowed timeout) is treated as a
+# retrieve failure: NO file is written (a partial write would poison the
+# page's render cache) and the verb exits 4.
+#
+# Project scoping is the same fail-closed gate ``cn search`` honours:
+# ``--all-projects`` is the explicit opt-in to the unfiltered state. The
+# stored envelope carries provenance (``run_id``, ``node_id``, ``query``,
+# ``ts``) so a second open reads the file as the page's source of truth —
+# the page never re-fetches.
+#
+# The page renders the top 3 hits by similarity. ``top_k=5`` keeps the
+# page's three cards and the no-result case (when fewer than three hits
+# are project-scoped) from diverging from a more aggressive fetch.
+
+_SEEN_BEFORE_FILE = "contextnest-seen-before.json"
+_SEEN_BEFORE_TOPK = 5
+_SEEN_BEFORE_PAGE_LIMIT = 3
+_SEEN_BEFORE_TAIL_BYTES = 4096
+
+
+def _valid_run_id(run_id: str) -> bool:
+    """``True`` when *run_id* is one safe path segment.
+
+    The id names a directory under ``$MINI_ORK_HOME/runs``. A value
+    carrying a separator, a parent reference, an absolute path, or a NUL
+    would let the verb read or write outside that tree — and the
+    error-tail read feeds its bytes onto the ContextNest wire, so an
+    escaping id is an exfiltration path as well as a clobber. Rejecting
+    it keeps every id the operator names inside the runs directory.
+    """
+    if not run_id or run_id in (".", ".."):
+        return False
+    if run_id != os.path.basename(run_id):
+        return False
+    return "/" not in run_id and "\\" not in run_id and "\x00" not in run_id
+
+
+def _seen_before_path(run_id: str) -> str:
+    """Absolute path to the run's stored envelope.
+
+    The same convention the run page uses: ``$MINI_ORK_HOME/runs/<run-id>``.
+    ``MINI_ORK_HOME`` is required (the IDE path always sets it); a hands-on
+    CLI invocation without it gets an empty path, which :func:`_cmd_seen_before`
+    turns into a scope-resolution failure (exit 3). Returning ``""`` here is
+    the fail-closed sentinel the rest of the verb expects.
+    """
+    home = os.environ.get("MINI_ORK_HOME")
+    if not home or not _valid_run_id(run_id):
+        return ""
+    return os.path.join(home, "runs", run_id, _SEEN_BEFORE_FILE)
+
+
+def _read_error_tail(run_id: str, node_id: str | None) -> str:
+    """A short error-tail query from the failing node's artefacts.
+
+    Reads, in order:
+
+    1. ``<run_dir>/impl-<node_id>.log`` — the implementer's last stderr
+       tail. Capped to :data:`_SEEN_BEFORE_TAIL_BYTES` to keep the retrieve
+       query short.
+    2. ``<run_dir>/verifier_<node_id>.log`` — the verifier's output.
+    3. ``<run_dir>/evidence/<node_id>.log`` — the gate/shell evidence.
+    4. The last ``text`` / ``result`` entry of the node's session
+       transcript (``<run_dir>/sessions/<sid>.jsonl``), if discoverable.
+
+    A missing run dir or a missing node log returns ``""``; the verb then
+    falls back to the run id itself as the query so the retrieve still
+    has SOMETHING to send (a hit on the run id is more useful than a
+    refusal to search). The fallback is documented at the call site.
+    """
+    home = os.environ.get("MINI_ORK_HOME")
+    if not home or not _valid_run_id(run_id):
+        return ""
+    run_dir = Path(home) / "runs" / run_id
+    if not run_dir.is_dir():
+        return ""
+    if node_id:
+        for rel in (f"impl-{node_id}.log",
+                    f"verifier_{node_id}.log",
+                    f"evidence/{node_id}.log"):
+            path = run_dir / rel
+            if path.is_file():
+                try:
+                    raw = path.read_bytes()[-_SEEN_BEFORE_TAIL_BYTES:]
+                except OSError:
+                    continue
+                try:
+                    text = raw.decode("utf-8", "replace").strip()
+                except Exception:  # noqa: BLE001
+                    continue
+                if text:
+                    return text
+    sessions = run_dir / "sessions"
+    if sessions.is_dir():
+        try:
+            candidates = sorted(
+                sessions.glob("*.jsonl"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError:
+            candidates = []
+        for path in candidates:
+            try:
+                raw = path.read_bytes()[-_SEEN_BEFORE_TAIL_BYTES:]
+            except OSError:
+                continue
+            try:
+                lines = raw.decode("utf-8", "replace").splitlines()[-20:]
+            except Exception:  # noqa: BLE001
+                continue
+            for line in reversed(lines):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                for key in ("error", "result", "text", "content"):
+                    v = entry.get(key)
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()[:1024]
+                msg = entry.get("message")
+                if isinstance(msg, dict):
+                    content = msg.get("content")
+                    if isinstance(content, str) and content.strip():
+                        return content.strip()[:1024]
+    return ""
+
+
+def _do_seen_before_retrieve(query: str, project: str, all_projects: bool,
+                             top_k: int) -> list:
+    """POST ``/api/v1/tools/retrieve`` for the seen-before verb.
+
+    Mirrors :func:`_do_memories`: same wire, same project filter, same
+    fail-closed on a body without a ``hits`` list. ``top_k`` is the value
+    the verb passes through (default :data:`_SEEN_BEFORE_TOPK`); the page
+    renders the top :data:`_SEEN_BEFORE_PAGE_LIMIT` by similarity
+    regardless. The ``_disabled() / available()`` gate fires first so a
+    disabled or unreachable CN is reported as "ContextNest is not
+    reachable" rather than a budget-spent error.
+    """
+    if cn_client._disabled() or not cn_client.available():
+        raise RetrieveFailed("ContextNest is not reachable")
+    budget = float(os.environ.get("CN_SEARCH_TIMEOUT_SEC", "90"))
+    body = json.dumps({"query": query, "top_k": max(1, int(top_k))})
+    raw = cn_client._post_json("/api/v1/tools/retrieve", body, timeout=budget)
+    try:
+        data = json.loads(raw) if raw else {}
+    except ValueError:
+        raise RetrieveFailed(
+            f"ContextNest retrieve did not answer within {budget:g} s"
+        )
+    hits = data.get("hits") if isinstance(data, dict) else None
+    if not isinstance(hits, list):
+        raise RetrieveFailed(
+            f"ContextNest retrieve did not answer within {budget:g} s"
+        )
+    if all_projects:
+        return hits
+    return [h for h in hits if _project_path_match(h, project)]
+
+
+def _seen_before_exists(path: str) -> bool:
+    """``True`` when a stored envelope is already on disk.
+
+    The verb NEVER overwrites an existing file — the per-run cache is
+    immutable by contract. A second call for the same run exits 0 with a
+    one-line ``seen-before: <run_id> already cached`` text; ``--json``
+    echoes the existing envelope so the operator can see what is
+    there. This keeps a stale write (e.g. one captured against an
+    outdated CN corpus) from being silently replaced by a fresh run.
+    """
+    return bool(path) and os.path.isfile(path)
+
+
+def _read_seen_before(path: str) -> dict:
+    """Best-effort read of a stored envelope, or ``{}`` on miss / parse error.
+
+    The page treats an unparseable file the same as a missing one (the
+    page's render path is the slot, not the wire) — never raises.
+    """
+    if not path or not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_seen_before(path: str, envelope: dict) -> bool:
+    """Persist the envelope atomically; returns ``True`` on success.
+
+    Best-effort: a write failure exits 3 (the verb's data-loss path) and
+    prints the path on stderr so the operator can intervene. The page
+    reads the file verbatim — a partial write would render a malformed
+    JSON error on every refresh, so a failed write is treated like a
+    scope failure.
+    """
+    if not path:
+        return False
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except OSError as exc:
+        sys.stderr.write(
+            f"mini-ork cn seen-before: failed to create {path}: {exc}\n"
+        )
+        return False
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(envelope, fh, ensure_ascii=False)
+    except OSError as exc:
+        sys.stderr.write(
+            f"mini-ork cn seen-before: failed to write {path}: {exc}\n"
+        )
+        return False
+    return True
+
+
+def _cmd_seen_before(args: argparse.Namespace) -> int:
+    """Cache one retrieve per failing run/node.
+
+    Fail-closed scope: when ``--all-projects`` is off and the project
+    root cannot be resolved, the verb never calls CN and exits 3 with
+    :data:`SCOPE_ERROR` on stderr. The page's empty-state path is
+    different (no project, no rows) — the verb's fail-closed envelope
+    writes an error key so the page can render the operator-facing
+    message exactly once.
+
+    The stored envelope is written ONCE per run. A second call for the
+    same run short-circuits with exit 0 and ``--json`` echoes the
+    existing envelope; the file is never overwritten. A retrieve failure
+    (no ``hits`` list, CN disabled, CN unreachable, secure-tier
+    misconfig) writes nothing and exits 4 / 5 / 3 respectively — the
+    page stays on its no-stored-file empty state until the operator
+    succeeds.
+    """
+    run_id = str(args.run_id or "").strip()
+    if not run_id:
+        sys.stderr.write("mini-ork cn seen-before: run_id is required\n")
+        return EXIT_USAGE
+    if not _valid_run_id(run_id):
+        sys.stderr.write(
+            f"mini-ork cn seen-before: invalid run_id {run_id!r} "
+            f"(expected one path segment)\n"
+        )
+        return EXIT_USAGE
+    path = _seen_before_path(run_id)
+    if not path:
+        sys.stderr.write(
+            f"mini-ork cn seen-before: cannot resolve {run_id} run dir; "
+            f"set MINI_ORK_HOME to the project's .mini-ork directory\n"
+        )
+        return EXIT_COORD_UNREACHABLE
+
+    if _seen_before_exists(path):
+        if args.json:
+            existing = _read_seen_before(path)
+            sys.stdout.write(json.dumps(existing, ensure_ascii=False) + "\n")
+        else:
+            sys.stdout.write(
+                f"cn seen-before: {run_id} already cached at {path}\n"
+            )
+        return EXIT_OK
+
+    node_id = str(getattr(args, "node", None) or "").strip() or None
+    all_projects = bool(args.all_projects)
+    top_k = max(1, min(int(args.top_k or _SEEN_BEFORE_TOPK), 25))
+
+    project = _project_root()
+    if not all_projects and not project:
+        sys.stderr.write(f"mini-ork cn seen-before: {SCOPE_ERROR}\n")
+        return EXIT_COORD_UNREACHABLE
+
+    query = _read_error_tail(run_id, node_id)
+    if not query:
+        # A run dir without a log / session transcript still gets a
+        # useful retrieve: the run id itself is a free-text query that
+        # surfaces past runs ContextNest has indexed.
+        query = run_id
+
+    ts = int(time.time())
+    try:
+        hits = _do_seen_before_retrieve(query, project, all_projects, top_k)
+    except SecretStoreError as exc:
+        sys.stderr.write(
+            f"mini-ork cn seen-before: secure tier secret store error: {exc}\n"
+        )
+        return EXIT_SECRET_CONFIG
+    except RetrieveFailed as exc:
+        sys.stderr.write(f"mini-ork cn seen-before: {exc.message}\n")
+        return EXIT_COORD_HTTP
+
+    sorted_hits = sorted(
+        (h for h in hits if isinstance(h, dict)),
+        key=lambda h: float(h.get("similarity") or 0.0),
+        reverse=True,
+    )
+    envelope = {
+        "run_id": run_id,
+        "node_id": node_id,
+        "query": query,
+        "ts": ts,
+        "top_k": top_k,
+        "count": len(sorted_hits),
+        "all_projects": all_projects,
+        "project": project,
+        "hits": sorted_hits,
+    }
+
+    if args.json:
+        sys.stdout.write(json.dumps(envelope, ensure_ascii=False) + "\n")
+        return EXIT_OK
+
+    if not _write_seen_before(path, envelope):
+        return EXIT_COORD_UNREACHABLE
+
+    sys.stdout.write(
+        f"cn seen-before: {run_id} · {len(sorted_hits)} hit(s) · "
+        f"stored={path}\n"
+    )
+    return EXIT_OK
+
+
+# ── outcome verb ───────────────────────────────────────────────────────────
+#
+# ``cn outcome <atom-id> success|failure --run <run-id>`` is confirm-gated
+# and posts to ``/api/v1/agent/outcome`` through the synchronous settle
+# seam. The verb reports the response's ``updated`` field — NOT
+# ``delta_applied`` (the documented live 2026-10-15 shape; ``delta_applied``
+# is read by the audit log but is not the success metric the operator
+# sees). A secure-tier missing key surfaces as a named
+# :class:`SecretStoreError` (exit 5, key name only, never the value);
+# CN disabled / unreachable records ``pending`` and exits 0 — the audit
+# log captures the failure so the operator sees the missing-key signal.
+
+
+_OUTCOME_OK_TEXT = "outcome: {atom} {outcome} updated={updated}"
+
+
+def _confirm_outcome(atom_id: str, outcome: str, run_id: str) -> bool:
+    """TTY confirm for a typed ``cn outcome`` invocation.
+
+    The IDE buttons carry a ``confirm`` payload that the IDE itself
+    handles, so the IDE does not reach this helper. A typed CLI
+    invocation asks the operator on stderr (the same yes/no prompt the
+    other confirm-gated mini-ork subcommands use); ``--yes`` skips the
+    prompt.
+
+    Only an interactive stdin can answer the prompt. A pipe, /dev/null,
+    a daemonised process, or a captured-stdio harness has no human at
+    the terminal, so blocking on ``input()`` would either raise
+    ``OSError`` or deadlock; both degrade to the safe auto-answer path
+    :func:`mini_ork.cli.plan._can_prompt` already takes for the same
+    reason. ``MINI_ORK_NONINTERACTIVE=1`` forces that path explicitly.
+    Returns ``True`` when the invocation may proceed.
+    """
+    if os.environ.get("MINI_ORK_NONINTERACTIVE", "0") == "1":
+        return True
+    try:
+        if not sys.stdin.isatty():
+            return True
+    except (OSError, ValueError):
+        # A closed/detached stdin has no isatty — not a human.
+        return True
+    sys.stderr.write(
+        f"About to record outcome {outcome!r} for atom {atom_id!r} "
+        f"(run {run_id or '<none>'}).\n"
+    )
+    sys.stderr.write("Type 'yes' to continue: ")
+    sys.stderr.flush()
+    try:
+        line = input()
+    except (EOFError, KeyboardInterrupt):
+        sys.stderr.write("\n")
+        return False
+    return line.strip().lower() == "yes"
+
+
+def _outcome_settle_response(outcome: str, atom_id: str, run_id: str,
+                             evidence: str) -> dict:
+    """Call :func:`mini_ork.cn_client._settle_outcome` and return the dict.
+
+    Thin wrapper so the verb's body stays one read-the-result path; the
+    test layer patches :func:`mini_ork.cn_client._settle_outcome` directly
+    to drive success / pending / skipped / secure-tier outcomes.
+    """
+    return cn_client._settle_outcome(
+        outcome, [atom_id], evidence=evidence,
+        session_id=run_id or "",
+    )
+
+
+def _cmd_outcome(args: argparse.Namespace) -> int:
+    """Settle one atom against ``/api/v1/agent/outcome``.
+
+    Confirm-gated: a typed invocation requires ``--yes`` (or the TTY
+    prompt). The IDE buttons carry a ``confirm`` payload the IDE itself
+    resolves — they do not reach this prompt.
+
+    Reports the response's ``updated`` field on success; records
+    ``pending`` on a CN-down / config-error state and exits 0 so the
+    audit log captures the failure rather than the verb blowing up.
+    """
+    atom_id = str(args.atom_id or "").strip()
+    if not atom_id:
+        sys.stderr.write("mini-ork cn outcome: atom_id is required\n")
+        return EXIT_USAGE
+    outcome = str(args.outcome or "").strip()
+    if outcome not in ("success", "failure"):
+        sys.stderr.write(
+            f"mini-ork cn outcome: outcome must be 'success' or 'failure' "
+            f"(got {outcome!r})\n"
+        )
+        return EXIT_USAGE
+    run_id = str(args.run or "").strip() or ""
+    evidence = str(args.evidence or "")
+
+    if not args.yes and not _confirm_outcome(atom_id, outcome, run_id):
+        sys.stderr.write("mini-ork cn outcome: aborted\n")
+        return EXIT_USAGE
+
+    try:
+        result = _outcome_settle_response(outcome, atom_id, run_id, evidence)
+    except SecretStoreError as exc:
+        sys.stderr.write(
+            f"mini-ork cn outcome: secure tier secret store error: {exc}\n"
+        )
+        return EXIT_SECRET_CONFIG
+
+    if args.json:
+        sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+    else:
+        if result.get("status") == "ok":
+            updated = result.get("updated")
+            sys.stdout.write(
+                _OUTCOME_OK_TEXT.format(
+                    atom=atom_id, outcome=outcome, updated=updated,
+                ) + "\n"
+            )
+        else:
+            reason = str(result.get("reason") or "unknown")
+            sys.stdout.write(
+                f"outcome: {atom_id} pending ({reason})\n"
+            )
+    return EXIT_OK
+
+
 def main(rest: list[str], root: str) -> int:
     del root
     parser = build_parser()
@@ -796,6 +1368,10 @@ def main(rest: list[str], root: str) -> int:
         return _cmd_ack_overlap(args)
     if args.subcommand == "search":
         return _cmd_search(args)
+    if args.subcommand == "seen-before":
+        return _cmd_seen_before(args)
+    if args.subcommand == "outcome":
+        return _cmd_outcome(args)
     sys.stderr.write(f"mini-ork cn: unknown subcommand {args.subcommand!r}\n")
     return EXIT_USAGE
 
