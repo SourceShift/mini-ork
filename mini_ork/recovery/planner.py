@@ -428,6 +428,43 @@ def _load_retry_hint(
     return hint
 
 
+def _hint_entry_node(workflow: str, hint: dict) -> str | None:
+    """The node the hint says the run stopped on, when this workflow has it.
+
+    ``--strategy verify`` needs an explicit entry, and its fallback — "the
+    first verifier in topo order" — is a guess that can land on a SIBLING of
+    the node that actually failed. The closure is then that sibling's
+    descendants, so the failed node is never re-dispatched at all: measured
+    2026-10-16 on ``run-1792059337-779``, the hint said ``test`` but the entry
+    resolved to ``typecheck``, and the revive re-ran typecheck (fresh log)
+    while ``retry-exhausted/test.attempts.json`` kept its pre-revive mtime and
+    the reviewer escalated on the same stale rc=77. The hint already carries
+    the answer, so it is used as the default entry.
+
+    A hint that names a node this workflow does not have — a hint outliving a
+    workflow revision — returns ``None`` after a warning, so the caller keeps
+    today's fallback instead of refusing the recovery on a stale name.
+    """
+    candidate = str(hint.get("from_node") or hint.get("failed_node") or "")
+    if not candidate:
+        return None
+    try:
+        dag = load_dag(workflow)
+    except Exception as exc:  # noqa: BLE001 — an unreadable workflow keeps the fallback
+        sys.stderr.write(
+            f"[mini-ork-recover] could not read {workflow!r} to check the "
+            f"hint's from_node {candidate!r}: {exc}\n"
+        )
+        return None
+    if candidate in dag.node_ids:
+        return candidate
+    sys.stderr.write(
+        f"[mini-ork-recover] retry-hint from_node {candidate!r} is not a node "
+        f"of {workflow!r}; ignoring it\n"
+    )
+    return None
+
+
 def _format_hint_block(hint: dict) -> str:
     """One-line-per-field operator preview of the retry hint. Used on
     the ``--status`` path so the operator sees the change-needed /
@@ -1178,11 +1215,22 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
             )
             return 1
 
+    # ``verify`` picks its entry itself when the operator names no node, and
+    # that pick can land on a sibling of the run's failed node (see
+    # ``_hint_entry_node``). The hint knows which node the run stopped on, so
+    # it is the default entry there. Restricted to ``verify``: the other
+    # strategies start at the earliest stale node and a hint naming a node
+    # further downstream would narrow that closure past a genuinely stale
+    # upstream node. An explicit ``--from-node`` always wins.
+    from_node_eff = from_node
+    if not from_node_eff and strategy == "verify" and hint:
+        from_node_eff = _hint_entry_node(workflow, hint)
+
     try:
         plan = plan_recovery(
             workflow, run_id, db_path, run_dir,
             recipe=recipe, task_class=task_class,
-            from_node=from_node, strategy=strategy,
+            from_node=from_node_eff, strategy=strategy,
         )
     except RecoveryRefused as exc:
         # Strategy-specific refusals (verify without reusable upstream

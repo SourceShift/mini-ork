@@ -21,6 +21,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -859,6 +860,150 @@ def test_lease_held_blocks_restore_carry_patch(
     assert not (target / "from_restore.txt").exists(), (
         f"worktree mutated despite lease block; target contents: {list(target.iterdir())}"
     )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. The hint's failed node is the verify entry (P0#3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _sibling_verifiers_workflow(path: Path) -> None:
+    """``typecheck`` and ``test`` are SIBLINGS under the implementer; both
+    feed ``reviewer``.
+
+    This is the code-fix shape behind the P0#3 defect: with two independent
+    verifiers, "the first verifier in topo order" and "the node the run
+    actually failed on" are different nodes, and the closure of the former
+    does not contain the latter.
+    """
+    _write_workflow(
+        path,
+        nodes=[
+            {"name": "planner", "type": "planner", "model_lane": "glm_lens"},
+            {"name": "implementer", "type": "implementer",
+             "model_lane": "minimax_lens"},
+            {"name": "typecheck", "type": "verifier", "model_lane": "verifier"},
+            {"name": "test", "type": "verifier", "model_lane": "verifier"},
+            {"name": "reviewer", "type": "verifier", "model_lane": "verifier"},
+        ],
+        edges=[
+            {"from": "planner", "to": "implementer", "edge_type": "depends_on"},
+            {"from": "implementer", "to": "typecheck", "edge_type": "verifies"},
+            {"from": "implementer", "to": "test", "edge_type": "verifies"},
+            {"from": "typecheck", "to": "reviewer", "edge_type": "depends_on"},
+            {"from": "test", "to": "reviewer", "edge_type": "depends_on"},
+        ],
+    )
+
+
+def _write_hint(run_dir, run_id: str, from_node: str) -> None:
+    Path(run_dir, "retry-hint.json").write_text(json.dumps({
+        "version": 4,
+        "run_id": run_id,
+        "failed_node": from_node,
+        "retryable": True,
+        "strategy": "verify",
+        "from_node": from_node,
+        "needs_change": None,
+        "command": f"mini-ork recover {run_id} --strategy verify",
+    }))
+
+
+def _sibling_verifier_run(tmp_path, monkeypatch, run_id):
+    """A run whose only durable checkpoint is the implementer's — the 779
+    state (the run died before any verifier wrote a checkpoint row)."""
+    db, run_dir, recipe, _ = _setup_db(tmp_path)
+    _set_run_dir(monkeypatch, run_dir)
+    _seed_success(db, run_id, "implementer", recipe, "framework_edit", run_dir)
+    Path(run_dir, "plan.json").write_text(json.dumps({"objective": "x"}))
+    wf = tmp_path / "wf.yaml"
+    _sibling_verifiers_workflow(wf)
+    return db, run_dir, wf
+
+
+def test_verify_enters_at_the_hint_node_not_the_first_verifier(
+    tmp_path, monkeypatch, capsys
+):
+    """P0#3: the hint says ``test``; the revive must re-run ``test``.
+
+    Pre-fix the entry was ``typecheck`` (first verifier in topo order) and
+    the closure was ``{typecheck, reviewer}`` — ``test`` is ``typecheck``'s
+    SIBLING, so the node that actually failed was never re-dispatched and
+    the reviewer escalated on the same stale evidence however many times the
+    run was revived.
+    """
+    run_id = "run-hint-entry-1"
+    db, run_dir, wf = _sibling_verifier_run(tmp_path, monkeypatch, run_id)
+    _write_hint(run_dir, run_id, "test")
+
+    captured: dict = {}
+
+    def _fake_executor(_argv):
+        for key in ("MINI_ORK_RECOVERY_FROM", "MINI_ORK_RECOVERY_CLOSURE"):
+            captured[key] = os.environ.get(key)
+        return 0
+
+    rc = rp.cli_main(
+        [run_id, "--strategy", "verify", "--workflow", str(wf), "--db", db],
+        execute_fn=_fake_executor,
+    )
+    out_err = capsys.readouterr()
+    assert rc == 0, (rc, out_err)
+    assert captured.get("MINI_ORK_RECOVERY_FROM") == "test", captured
+    closure = set((captured.get("MINI_ORK_RECOVERY_CLOSURE") or "").split())
+    assert {"test", "reviewer"} <= closure, closure
+    assert "typecheck" not in closure, closure
+
+
+def test_operator_from_node_outranks_the_hint(tmp_path, monkeypatch, capsys):
+    """An explicit ``--from-node`` is the operator's decision and must not
+    be silently replaced by the hint's node."""
+    run_id = "run-hint-entry-2"
+    db, run_dir, wf = _sibling_verifier_run(tmp_path, monkeypatch, run_id)
+    _write_hint(run_dir, run_id, "test")
+
+    rc = rp.main(
+        [run_id, "--status", "--strategy", "verify", "--from-node", "typecheck",
+         "--workflow", str(wf), "--db", db],
+    )
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "entry: typecheck" in out, out
+
+
+def test_a_hint_node_missing_from_the_workflow_is_ignored(
+    tmp_path, monkeypatch, capsys
+):
+    """A hint outliving a workflow revision must not brick the recovery: the
+    unknown name is dropped with a warning and today's fallback stands."""
+    run_id = "run-hint-entry-3"
+    db, run_dir, wf = _sibling_verifier_run(tmp_path, monkeypatch, run_id)
+    _write_hint(run_dir, run_id, "ghost_verifier")
+
+    rc = rp.main(
+        [run_id, "--status", "--strategy", "verify", "--workflow", str(wf), "--db", db],
+    )
+    out_err = capsys.readouterr()
+    assert rc == 0, (rc, out_err)
+    assert "entry: typecheck" in out_err.out, out_err.out
+    assert "ignoring it" in out_err.err, out_err.err
+
+
+def test_a_verify_hint_does_not_narrow_a_resume(tmp_path, monkeypatch, capsys):
+    """The hint's node is the entry for ``verify`` only. ``resume`` starts at
+    the earliest stale node, and honouring a hint that names a node further
+    downstream would narrow that closure past a genuinely stale upstream
+    node."""
+    run_id = "run-hint-entry-4"
+    db, run_dir, wf = _sibling_verifier_run(tmp_path, monkeypatch, run_id)
+    _write_hint(run_dir, run_id, "test")
+
+    rc = rp.main(
+        [run_id, "--status", "--strategy", "resume", "--workflow", str(wf), "--db", db],
+    )
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "entry: typecheck" in out, out
+
 
 def test_a_recipe_carry_patch_alone_counts_as_rolled_back(tmp_path):
     """A recipe whose rollback saves the work only as its own carry patch
