@@ -370,15 +370,20 @@ a live provisioner).
    broader selection verified separately. **A clustered failure wall in a
    concurrent-gate run is a hypothesis, not a verdict: re-measure at the base.**
 
-### 9.4 — still open (not part of this triage)
+### 9.4 — resolved (open at triage time; re-checked 2026-10-16)
 
 `run-1792092528-89023` was harvested after its dispatcher exited without
-writing a terminal status, so its `task_runs` row still reads `executing` even
-though its work is on `main`. `mini-ork reap --dry-run` finds nothing to reap
-(the run holds markers the reaper treats as live), so this is the same
-post-verdict wedge family as
-`feedback_reflect_child_wedges_run_after_verdict` — a board-state wart, not a
-shipping blocker.
+writing a terminal status, so at triage time its `task_runs` row still read
+`executing` even though its work was on `main`. `mini-ork reap --dry-run` found
+nothing to reap (the run holds markers the reaper treats as live).
+
+That row has since reached a terminal state on its own: re-checked 2026-10-16,
+`select id, status from task_runs where id = 'run-1792092528-89023'` returns
+**`published`**. Nothing was wedged and no repair is owed. The observation is
+kept because it is the same post-verdict wedge family as
+`feedback_reflect_child_wedges_run_after_verdict` — a board-state wart, never a
+shipping blocker — and because a claim about a mutable row is only true as of
+the day it was read.
 
 ---
 
