@@ -1909,6 +1909,9 @@ def _post_run_learning(db, run_dir, run_id, task_class="", fail_count=None):
 def set_status(db, run_id, new_status, *, dry_run=False):
     """Retrying task_runs status write; terminal states stamp ended_at + duration_ms.
 
+    A live status clears both instead: the row has not ended, and this call is
+    the per-attempt boundary (see the branch below).
+
     Raises ``RuntimeError`` when the write cannot be made: after the retries for
     a locked/busy DB, at once for anything else (a missing table does not heal
     by waiting). It used to print ``[warn]`` and return, and a terminal status
@@ -1933,8 +1936,29 @@ def set_status(db, run_id, new_status, *, dry_run=False):
                         "ELSE duration_ms END WHERE id = ?",
                         (new_status, now, now, now, run_id))
                 else:
-                    con.execute("UPDATE task_runs SET status = ?, updated_at = ? WHERE id = ?",
-                                (new_status, int(time.time()), run_id))
+                    # A live status means the run has not ended, so the row must
+                    # carry no end stamp. This write is also the ATTEMPT boundary
+                    # — the executor marks ``executing`` once per ``run`` /
+                    # ``resume`` / ``recover`` (execute.py:1228) — and the
+                    # terminal branch above keeps the FIRST attempt's stamp via
+                    # ``COALESCE(ended_at, ?)``, deliberately, because several
+                    # writers can close one attempt (publisher, executor,
+                    # ``finalize_passed``) and must not fight over it. Nothing
+                    # distinguished a *second* attempt, so a revived row kept the
+                    # dead attempt's end for good: measured 2026-10-16,
+                    # run-1792059337-779 still read ``ended_at`` 2026-10-15
+                    # 13:04:07 with the first attempt's 48m ``duration_ms`` after
+                    # two revives, so an ``ended_at``-keyed monitor never saw the
+                    # recovery at all. ``duration_ms`` is reset with it (to 0,
+                    # the column is NOT NULL and that is the value the terminal
+                    # branch treats as "recompute from created_at") — leaving the
+                    # old value would pair a fresh ``ended_at`` with the previous
+                    # attempt's length. Same rule as
+                    # ``web.control._restore_status``.
+                    con.execute(
+                        "UPDATE task_runs SET status = ?, updated_at = ?, "
+                        "ended_at = NULL, duration_ms = 0 WHERE id = ?",
+                        (new_status, int(time.time()), run_id))
                 con.commit()
                 last_err = None
                 break

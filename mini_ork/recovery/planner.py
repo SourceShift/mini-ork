@@ -862,6 +862,34 @@ def _abandon_lease(db_path: str, run_id: str, req: Any, token: str | None) -> No
         _lease.release_lease(db_path, run_id, token)
 
 
+def _reconcile_recovered_cost(handoff: dict) -> None:
+    """Raise the run's ``cost_usd`` to the ledger total for this revival.
+
+    ``main._reconcile_run_cost`` is the only caller of
+    ``cost_ledger.reconcile_run_cost``, and it lives in ``mini_ork.cli.main``'s
+    lifecycle ``finally`` — a tail a ``recover`` never passes through. The
+    resumed execute does charge every node it runs (``charge_node_cost`` adds
+    to whatever the row already held), but nothing afterwards raises the stored
+    total to the ledger, so the revival's spend stayed invisible to every
+    reporter that reads ``task_runs.cost_usd``: measured 2026-10-16,
+    run-1792059337-779's ``llm_calls`` summed to $7.002127 while the row still
+    read $6.725933 after two revives.
+
+    Mirrors ``main``'s fail-soft contract — an unknown run, a missing table and
+    any ``sqlite3.Error`` all mean "do nothing", and a stored value is never
+    lowered.
+    """
+    if os.environ.get("MINI_ORK_DRY_RUN", "0") == "1":
+        return
+    db_path = str(handoff.get("db_path") or "")
+    run_id = str(handoff.get("run_id") or "")
+    if not db_path or not run_id:
+        return
+    from mini_ork import cost_ledger  # noqa: PLC0415 — scoped to the recover tail
+
+    cost_ledger.reconcile_run_cost(db_path, run_id)
+
+
 def _rerun_rubric_prescreen(handoff: dict) -> None:
     """Re-run the advisory rubric prescreen over the recovered run's artifacts.
 
@@ -1591,6 +1619,16 @@ def cli_main(argv: list[str] | None = None, *, execute_fn=None) -> int:
             _rerun_rubric_prescreen(handoff)
         except Exception as _exc:  # noqa: BLE001
             print(f"[mini-ork-recover] rubric prescreen failed: {_exc}", file=sys.stderr)
+    # ── cost reconcile: the other half of the lifecycle tail ``cli.main``
+    # owns. Placed with the rubric refresh above and for the same reason — both
+    # are teardown steps a recover would otherwise skip — and after every node
+    # of the closure, which is when ``main`` runs it. Fail-soft: an error here
+    # must not change the exit code the dispatch returned.
+    if handoff.get("db_path") and handoff.get("run_id"):
+        try:
+            _reconcile_recovered_cost(handoff)
+        except Exception as _exc:  # noqa: BLE001
+            print(f"[mini-ork-recover] cost reconcile failed: {_exc}", file=sys.stderr)
     # ── remote node release: a recover owns the run's lifecycle for its own
     # span, like ``cli.main``'s ``_run_lifecycle`` (whose ``finally`` releases).
     # Under ``--placement remote`` the resumed execute and the rubric refresh
