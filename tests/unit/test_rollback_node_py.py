@@ -14,6 +14,8 @@ import sqlite3
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from mini_ork.cli import execute_handlers as ex
@@ -129,15 +131,27 @@ def _workflow(tmp_path: Path, strategy: str) -> str:
     return str(path)
 
 
+@pytest.mark.parametrize("strategy,recipe", [
+    ("keep_partial_drain_discard_failed_iter", "recursive-validate-impl"),
+    ("keep_partial_pass_discard_failed_iter", "spec-driven-delivery"),
+    ("keep_partial_pass_discard_failed_iter", "doc-to-features-loop"),
+])
 def test_a_declared_keep_partial_strategy_keeps_the_tree_and_says_so(
-        tmp_path, monkeypatch, capsys):
-    """``recursive-validate-impl`` declares keep_partial_drain_discard_failed_iter.
+        tmp_path, monkeypatch, capsys, strategy, recipe):
+    """Every declared ``keep_partial_*`` strategy must name itself in the log.
 
-    The handler had no branch for it, so the node fell through to the bare
-    "[ok] rollback complete" line — indistinguishable, in the log, from a revert
-    that had run. The work was in fact untouched (run-1791821930-72687: its
-    implementer's commit was still at HEAD afterwards, and `git reflog` shows no
-    reset). Name the strategy so the log cannot be misread again.
+    ``keep_partial`` means the failed iteration's edit stays in the target tree on
+    purpose — the run re-enters from the failing node, so discarding the edit
+    would force a re-implement. Three recipes declare a variant
+    (``recursive-validate-impl``: drain; ``spec-driven-delivery`` and
+    ``doc-to-features-loop``: pass) and the handler had a branch for only the
+    first: the other two fell through to the bare "[ok] rollback complete" line,
+    indistinguishable in the log from a revert that had run — and were in fact
+    reported by the generic ``unhandled rollback_strategy`` warning. The work was
+    untouched in every case (run-1791821930-72687: the implementer's commit was
+    still at HEAD afterwards and ``git reflog`` shows no reset;
+    run-1792151796-92942 hit the warning path on spec-driven-delivery). Name the
+    strategy so the log cannot be misread again, and keep the tree.
     """
     db = str(tmp_path / "state.db")
     run_dir = tmp_path / "run"
@@ -147,12 +161,14 @@ def test_a_declared_keep_partial_strategy_keeps_the_tree_and_says_so(
     work.write_text("KEPT\n", encoding="utf-8")
     _record_changes(run_dir, [str(work)])
 
-    ctx = _ctx(db, tmp_path, run_dir, recipe="recursive-validate-impl")
-    ctx.workflow = _workflow(tmp_path, "keep_partial_drain_discard_failed_iter")
+    ctx = _ctx(db, tmp_path, run_dir, recipe=recipe)
+    ctx.workflow = _workflow(tmp_path, strategy)
     rc, finish = ex._handle_rollback(ctx)
 
     assert (rc, finish) == (0, "done")
-    assert "keep_partial_drain_discard_failed_iter" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert strategy in err
+    assert "unhandled rollback_strategy" not in err
     assert work.read_text(encoding="utf-8") == "KEPT\n"
 
 

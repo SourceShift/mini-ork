@@ -2791,15 +2791,21 @@ def _handle_rollback(ctx: NodeDispatch):
                       file=sys.stderr, flush=True)
             else:
                 _revert_inplace_diff(run_dir, ctx.root)
-    elif strategy == "keep_partial_drain_discard_failed_iter":
-        # Declared by recipes/recursive-validate-impl/workflow.yaml. "keep_partial"
-        # means the failed iteration's edit stays in the target tree on purpose:
-        # the run is re-entered from the failing node, so discarding the edit
-        # would force a re-implement. Previously unhandled, so the node fell
-        # through to the bare "[ok] rollback complete" line, which reads as if a
-        # revert had happened when nothing had been touched (run-1791821930-72687,
-        # 2026-10-12 — the work was still committed in the worktree afterwards).
-        print("  [ok] rollback: strategy keep_partial_drain_discard_failed_iter — "
+    elif strategy in ("keep_partial_drain_discard_failed_iter",
+                      "keep_partial_pass_discard_failed_iter"):
+        # "keep_partial" means the failed iteration's edit stays in the target
+        # tree on purpose: the run is re-entered from the failing node, so
+        # discarding the edit would force a re-implement. drain is declared by
+        # recipes/recursive-validate-impl/workflow.yaml; pass by the two
+        # recurse-until-every-deliverable-passes recipes,
+        # recipes/spec-driven-delivery/workflow.yaml and
+        # recipes/doc-to-features-loop/workflow.yaml — neither was handled, so
+        # both fell through to the bare "[ok] rollback complete" line, which
+        # reads as if a revert had happened when nothing had been touched
+        # (run-1791821930-72687, 2026-10-12 — the work was still committed in the
+        # worktree afterwards; run-1792151796-92942, 2026-10-16, hit it on
+        # spec-driven-delivery and logged the generic unhandled-strategy warning).
+        print(f"  [ok] rollback: strategy {strategy} — "
               "partial work kept in the target tree (the run re-enters from the failing node)",
               file=sys.stderr, flush=True)
     elif strategy:
