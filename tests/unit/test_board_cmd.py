@@ -641,7 +641,7 @@ def test_runs_output_is_stable_against_frozen_list(home: Path) -> None:
             "has_workspace": False,
         })
 
-    assert counts == {"working": 16, "needs_you": 1, "done": 11, "failed": 4}
+    assert counts == {"working": 16, "needs_you": 1, "done": 11, "failed": 4, "not_needed": 0}
     assert runs == expected
 
 

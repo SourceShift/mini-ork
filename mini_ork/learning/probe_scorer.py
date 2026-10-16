@@ -193,6 +193,7 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
 # so a run that dies is recognised as finished rather than waited on.
 _TERMINAL_STATUSES = frozenset({
     "published", "failed", "stopped", "aborted", "killed", "cancelled", "error",
+    "not_needed",
 })
 
 

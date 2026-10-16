@@ -283,7 +283,12 @@ def seed_run_config(home: Path, run_id: str, recipe: str, lane: str) -> Path:
     return overlay
 
 
-_RESULT_WORDS = {"published": "verified", "failed": "failed", "rolled_back": "rolled back"}
+_RESULT_WORDS = {
+    "published": "verified",
+    "failed": "failed",
+    "rolled_back": "rolled back",
+    "not_needed": "not needed",
+}
 
 
 def result_word(status: str | None) -> str:
@@ -337,6 +342,10 @@ def _mark_for_status(status: str) -> str:
         return "✗"
     if s == "rolled back" or s == "rolled_back":
         return "✗"
+    if s == "not needed" or s == "not_needed":
+        # Neither passed nor refuted — the operator closed the entry, so it is
+        # not evidence about either lane. Same glyph the board uses for it.
+        return "⊘"
     return "●"
 
 

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Path as PathParam
 
+from mini_ork.run_status import TERMINAL as TERMINAL_STATUSES
 from .. import agents as agent_mod, artifacts, recipes, why
 from ..db import StateDB
 from ..deps import get_db, get_home
@@ -23,7 +24,6 @@ from ..repositories import (
 
 router = APIRouter(prefix="/api/v1/task-runs", tags=["run-detail"])
 
-TERMINAL_STATUSES = {"published", "rolled_back", "failed"}
 # A non-terminal run with no status update AND no run_events for this long is
 # presumed abandoned (engine died without finalizing). The UI renders it as
 # stale instead of a live ticking run with active Stop/Kill controls.

@@ -37,9 +37,11 @@ import time
 from pathlib import Path
 from typing import Any
 
+from mini_ork import run_status
+
 SCHEMA_ID = "mini-ork.metrics.sdd/v1"
 RUN_DIR_SCHEMA_ID = "mini-ork.metrics.sdd.run-dirs/v1"
-TERMINAL = ("published", "failed", "rolled_back")
+TERMINAL = tuple(sorted(run_status.TERMINAL))
 # NULL-safe on purpose: verdict/notes are NULL on most rows, and NOT (NULL OR ...)
 # is NULL, which would drop every ordinary run from a `NOT crashed` filter.
 _CRASH_SQL = ("(coalesce(t.verdict,'') = 'CRASH' OR coalesce(t.notes,'') LIKE 'reaped:%' "

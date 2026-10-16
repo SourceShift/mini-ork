@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from mini_ork import not_needed as _not_needed
 from mini_ork.acp import node_status
 
 # Persistent per-run diffstat cache. Distinct from ``diffs.CACHE_NAME``
@@ -43,11 +44,15 @@ DIFFSTAT_VERSION = 1
 
 # Mark glyphs prefixed to a thread's title; the unicode minus in the
 # diff suffix (U+2212, "−") is NOT the ASCII "-" — copy the literal.
+# The mapping must stay ONE-TO-ONE: ``acp.fleet`` inverts it to recover a
+# state from a mark, and a duplicate glyph would silently bucket a run as
+# whichever key came first.
 MARKS: dict[str, str] = {
     "working": "●",     # ●
     "needs_you": "✋",   # ✋
     "done": "✓",        # ✓
     "failed": "✗",      # ✗
+    "not_needed": "⊘",  # ⊘
 }
 
 # Detail line for the cost-pause sentinel (kickoff rule 1). Exact
@@ -71,6 +76,9 @@ FAILED_AT_SUFFIX_CLOSE = ")"
 WITHHELD_PREFIX = "Not published: "
 WITHHELD_SUFFIX = " unverified — review and decide"
 LANDED_PREFIX = "Landed via "
+# Detail line for a run the operator closed. Reads the marker's ``reason`` when
+# one was given; otherwise the shared fallback in ``mini_ork.not_needed``.
+NOT_NEEDED_REASON_PREFIX = "Not needed: "
 
 # The level vocabulary and the run-dir files that carry it. Mirrors
 # ``mini_ork.verify.levels`` (``LEVELS``/``PROVEN``/``REFUTED``/``NA``) and
@@ -701,6 +709,27 @@ def task_state(run_dir: Path, snapshot: dict[str, Any]) -> TaskState:
             removed=0,
         )
 
+    # Rule 5.5 (not needed): the operator closed the run as unwanted work, so
+    # there is nothing to review, repair or merge — a fifth state, not a shade
+    # of failed. Sits AFTER the failed rules (which test ``status in
+    # ("failed","rolled_back")`` and so can never match a ``not_needed`` row)
+    # and after rule 3, whose worktree branch is deliberately not extended to
+    # this status: a run closed as unwanted must not come back as "ready to
+    # review" just because it left a worktree behind.
+    if status == "not_needed":
+        marker = _not_needed.read(path)
+        reason = str((marker or {}).get("reason") or "").strip()
+        return TaskState(
+            state="not_needed",
+            detail=(
+                NOT_NEEDED_REASON_PREFIX + reason
+                if reason else _not_needed.DEFAULT_DETAIL
+            ),
+            step=_current_step(events),
+            added=0,
+            removed=0,
+        )
+
     # Rule 6: anything else (None, classified, planned, executing, ...)
     # is working; the detail is the current step or "Starting".
     step = _current_step(events)
@@ -783,9 +812,10 @@ def run_mark(status: str | None, run_dir: Path | None) -> str:
     whose publisher withheld (``verdict.json`` says ``abstain``, no level
     refuted, no failing node) is "needs you"; a terminal run with an open
     workspace record whose branch still changes also flips to ✋ (S5);
-    published → done; failed / rolled_back → failed; anything else → working.
-    The mark is the prefix Zed's thread list shows next to the run's title, so
-    it must agree with ``task_state`` — both re-read the same helpers.
+    published → done; failed / rolled_back → failed; ``not_needed`` → ⊘;
+    anything else → working. The mark is the prefix Zed's thread list shows next
+    to the run's title, so it must agree with ``task_state`` — both re-read the
+    same helpers.
 
     The withheld branch is the one case the level report alone cannot settle: a
     stale ``abstain`` verdict.json over a run that actually died mid-node — a
@@ -801,6 +831,7 @@ def run_mark(status: str | None, run_dir: Path | None) -> str:
         "published",
         "rolled_back",
         "failed",
+        "not_needed",
     ):
         return MARKS["needs_you"]
     # Mirrors ``task_state`` rule 1.5 — a parked review with a
@@ -847,6 +878,10 @@ def run_mark(status: str | None, run_dir: Path | None) -> str:
         return MARKS["done"]
     if status in ("failed", "rolled_back"):
         return MARKS["failed"]
+    # Terminal, but neither a delivery nor a defect: the operator closed it.
+    # Checked before the fallthrough so a closed run is not counted as ●.
+    if status == "not_needed":
+        return MARKS["not_needed"]
     return MARKS["working"]
 
 

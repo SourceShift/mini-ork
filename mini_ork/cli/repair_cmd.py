@@ -27,9 +27,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from mini_ork import run_status as _run_status
 from mini_ork.recovery import auto_repair
 
-_TERMINAL = ("failed", "rolled_back")
+_TERMINAL = tuple(sorted(_run_status.UNSUCCESSFUL))
 
 
 def _usage() -> str:
@@ -172,7 +173,7 @@ def _failed_runs(home: Path, since_days: int, *,
             return []
         rows = db.rows(
             "SELECT id, recipe, status, created_at FROM task_runs "
-            "WHERE status IN ('failed','rolled_back') "
+            f"WHERE status IN {_run_status.SQL_UNSUCCESSFUL} "
             "   OR (status = 'published' AND created_at >= ?) "
             "ORDER BY updated_at DESC",
             (cutoff,),

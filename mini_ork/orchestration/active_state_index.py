@@ -35,6 +35,8 @@ import os
 import sqlite3
 from typing import Any
 
+from mini_ork import run_status as _run_status
+
 # Static 6-entry list — verbatim mirror of the bash heredoc at
 # lib/active_state_index.sh:194-203 (DECISION_VARIABLES).
 DECISION_VARIABLES: list[dict[str, str]] = [
@@ -152,13 +154,18 @@ def _pending_goals(
     max_n: int,
     task_class: str,
 ) -> list[dict[str, Any]]:
-    """Mirror _mo_asi_pending_goals (lib/active_state_index.sh:155)."""
+    """Runs still in flight, newest first.
+
+    The terminal set comes from :mod:`mini_ork.run_status` rather than an inline
+    literal: a ``not_needed`` run is over, so listing it as a pending goal would
+    keep asking the planner to pick up work the operator closed.
+    """
     if not _table_exists(con, "task_runs"):
         return []
     cur = con.execute(
-        """SELECT id, task_class, recipe, status, kickoff_path, created_at
+        f"""SELECT id, task_class, recipe, status, kickoff_path, created_at
            FROM task_runs
-           WHERE status NOT IN ('published','rolled_back','failed')
+           WHERE status NOT IN {_run_status.SQL_TERMINAL}
              AND (? = '__any__' OR task_class = ?)
            ORDER BY created_at DESC LIMIT ?""",
         (task_class, task_class, max_n),

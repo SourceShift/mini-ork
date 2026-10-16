@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from mini_ork import run_status as _run_status
 from mini_ork.learning.failure_classifier import (
     PROVIDER_LIMIT,
     auto_recoverable,
@@ -122,7 +123,7 @@ def _hint_path(home: Path, run_id: str) -> Path:
 # Terminal-failed run statuses. A non-terminal status (executing, queued, …) means
 # the run is still in flight or has been relaunched — a cached hint from the prior
 # failed attempt would mislead the operator, so ``load_or_compute`` returns ``None``.
-_TERMINAL_FAILED = ("failed", "rolled_back")
+_TERMINAL_FAILED = tuple(sorted(_run_status.UNSUCCESSFUL))
 
 
 def _current_run_status(home: Path, run_id: str) -> str:

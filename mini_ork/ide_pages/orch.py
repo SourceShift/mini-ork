@@ -948,6 +948,10 @@ def _outcome_cell(status: str) -> dict[str, Any]:
         return S.cell(f"✓ {status}", "green")
     if status in ("failed", "rolled_back"):
         return S.cell(f"✗ {status}", "red")
+    if status == "not_needed":
+        # Grouping a closed run with the still-going ones (the fallback) would
+        # read as "waiting on this"; it is finished, just not delivered.
+        return S.cell("⊘ not needed", "sub")
     return S.cell(f"· {status or 'classified'}", "sub")
 
 

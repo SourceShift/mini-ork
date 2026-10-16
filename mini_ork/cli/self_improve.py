@@ -27,6 +27,8 @@ import subprocess
 import sys
 import time
 
+from mini_ork import run_status as _run_status
+
 _USAGE = """Usage: mini-ork self-improve [flags]
 
 Flags:
@@ -80,7 +82,7 @@ def decide_outcome(converged, exec_rc, pass_bottle, pass_tests, pass_reg,
     else:
         outcome, notes = "failed", "planner-or-synth-failed"
     # Backstop: task_runs.status is dispatch-level ground truth.
-    if tr_status in ("failed", "rolled_back"):
+    if tr_status in _run_status.UNSUCCESSFUL:
         if outcome not in ("rejected", "failed", "timed_out", "aborted"):
             notes = f"{outcome}-overridden-by-task_runs.{tr_status};orig-notes={notes}"
             outcome = "rejected"

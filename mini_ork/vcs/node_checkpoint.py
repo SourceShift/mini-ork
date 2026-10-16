@@ -36,6 +36,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from mini_ork import run_status as _run_status
+
 # Match a single character that is NOT a valid ref-component character
 # (git's ref-format allowlist; same as the kickoff).
 _INVALID_REF_CHAR = re.compile(r"[^A-Za-z0-9._-]")
@@ -342,11 +344,12 @@ def _unique_safety_name(wt: Path, run_id: str) -> str:
 
 def _is_run_live(home: str | os.PathLike | Path, run_id: str) -> bool:
     """A run is "live" when its ``task_runs.status`` row in
-    ``<home>/state.db`` is none of ``published``, ``failed``,
-    ``rolled_back``, ``reviewing``. ``reviewing`` is the explicit
-    exception — that is the human-pause state where a restore is the
-    intended verb. A missing DB or row means "not live" so a run
-    outside the database (the unit-test case) is not gated."""
+    ``<home>/state.db`` is neither terminal nor ``reviewing``. The terminal
+    set comes from :mod:`mini_ork.run_status`, so ``not_needed`` counts as
+    over. ``reviewing`` is the explicit exception — that is the human-pause
+    state where a restore is the intended verb. A missing DB or row means
+    "not live" so a run outside the database (the unit-test case) is not
+    gated."""
     db_path = Path(home) / "state.db"
     if not db_path.is_file():
         return False
@@ -363,7 +366,7 @@ def _is_run_live(home: str | os.PathLike | Path, run_id: str) -> bool:
     if not row:
         return False
     status = str(row[0] or "").strip().lower()
-    return status not in ("published", "failed", "rolled_back", "reviewing")
+    return status != "reviewing" and not _run_status.is_terminal(status)
 
 
 def _is_workspace_of_run(

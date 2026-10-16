@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from mini_ork import run_status as _run_status
 from mini_ork.acp import task_state as _task_state
 
 try:
@@ -127,11 +128,11 @@ def _track_record(db: Any) -> dict[str, dict[str, Any]]:
     has_table = getattr(db, "has_table", None)
     if not callable(has_table) or not has_table("task_runs"):
         return empty
-    # ``TERMINAL_STATUSES`` is the project's stable closed set for "finished"
-    # runs (published + rolled_back + failed). Mirrors ``agent.py:99`` and
-    # ``server.py:442`` — the same definition lives in three places because
-    # the agent module deliberately does not import the FastAPI route graph.
-    finished_clause = "status IN ('published','rolled_back','failed')"
+    # ``run_status.SQL_TERMINAL`` is the project's stable closed set for
+    # "finished" runs, from the one module that defines it — the same definition
+    # used to live in three places because the agent module would not import the
+    # FastAPI route graph, and ``run_status`` imports nothing.
+    finished_clause = f"status IN {_run_status.SQL_TERMINAL}"
     rows = db.rows(
         "SELECT recipe, COUNT(*) AS runs, "
         "SUM(CASE WHEN status='published' THEN 1 ELSE 0 END) AS published, "

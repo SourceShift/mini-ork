@@ -44,6 +44,8 @@ from importlib import metadata as _imeta
 from pathlib import Path
 from typing import Any
 
+from mini_ork.run_status import TERMINAL as _TERMINAL_STATUSES
+
 # Public, re-exported so ``mini_ork.mcp_context.server.dispatch`` is the
 # testable surface for the in-process request/response loop.
 __all__ = [
@@ -658,9 +660,6 @@ def _workspaces(home: Path, args: dict[str, Any]) -> dict[str, Any]:
 # ── control tool: run_status ───────────────────────────────────────────────
 
 
-_TERMINAL_STATUSES = frozenset({"published", "rolled_back", "failed"})
-
-
 def _run_status(home: Path, args: dict[str, Any]) -> dict[str, Any]:
     run_id = args.get("run_id")
     if not isinstance(run_id, str) or not run_id.strip():
@@ -1049,7 +1048,7 @@ _CONTROL_TOOL_DEFS: list[dict[str, Any]] = [
         "name": "wait_for_run",
         "description": (
             "Poll run_status until the run reaches a terminal state "
-            "(published, rolled_back, failed) or timeout_s passes. "
+            "(published, rolled_back, failed, not_needed) or timeout_s passes. "
             "timeout_s is clamped to [30, 1800] (default 600). Returns the "
             "last status plus {terminal, waited_s}; when terminal, includes "
             "verdict.json and the last 30 lines of the launch log."

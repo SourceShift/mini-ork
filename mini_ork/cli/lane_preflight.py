@@ -42,6 +42,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from mini_ork import run_status as _run_status
+
 # Same EX_TEMPFAIL the budget preflight and the execute-needs-answers gate
 # use. Three call sites, one rc — the lifecycle only learns ``blocked`` once.
 RC_BLOCKED = 75
@@ -372,8 +374,8 @@ def _persist_blocked(
 
     * ``status='failed'``, ``verdict=COALESCE(verdict,'ESCALATE')``, notes
       appended with the gate's reason;
-    * guarded by ``AND status NOT IN ('published','rolled_back','failed')``
-      so a run that already settled is never overwritten;
+    * guarded by ``AND status NOT IN <run_status.SQL_TERMINAL>`` so a run that
+      already settled is never overwritten;
     * one ``run_events`` row ``event_type='lane_preflight_blocked'``.
 
     Swallows ``sqlite3.Error`` because the gate runs before the executor and a
@@ -391,8 +393,7 @@ def _persist_blocked(
                 "verdict=COALESCE(verdict,'ESCALATE'), updated_at=?, "
                 "ended_at=COALESCE(ended_at,?), "
                 "notes=COALESCE(notes || '; ','') || ? "
-                "WHERE id=? AND status NOT IN "
-                "('published','rolled_back','failed')",
+                f"WHERE id=? AND status NOT IN {_run_status.SQL_TERMINAL}",
                 (now, now, "lane preflight: lane_unhealthy", run_id),
             )
             con.execute(

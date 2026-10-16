@@ -68,6 +68,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
+from mini_ork.run_status import TERMINAL
 from mini_ork.threads import attachments as _attachments
 from mini_ork.threads import kickoff as _kickoff
 from mini_ork.threads.model import MessageRole, ThreadOrigin
@@ -894,10 +895,19 @@ def get_conversation(
 # A conversation with no launched run still serves its user messages, so an
 # idle conversation shows its own (empty) transcript instead of erroring.
 
-# task_runs terminal set (mini_ork/cli/execute.py set_status). Everything
-# else (running/blocked/needs_revision/…) means the run is still live.
-_TERMINAL_RUN_STATUSES = {"published", "rolled_back", "failed"}
-_TERMINAL_STATUS_MAP = {"published": "finished", "rolled_back": "error", "failed": "error"}
+# task_runs terminal set (mini_ork/run_status.py). Everything else
+# (running/blocked/needs_revision/…) means the run is still live.
+_TERMINAL_RUN_STATUSES = TERMINAL
+# Every terminal status needs an entry: the client's enum is
+# running/idle/finished, and a status that is missing here leaves the
+# conversation reading as still-running. `not_needed` is over, just not a
+# delivery, so it lands on the same "finished" the client already knows.
+_TERMINAL_STATUS_MAP = {
+    "published": "finished",
+    "rolled_back": "error",
+    "failed": "error",
+    "not_needed": "finished",
+}
 
 _MAX_EVENT_PAGE = 100  # EventService caps pages at 100; enforce server-side too
 

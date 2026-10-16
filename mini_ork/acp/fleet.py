@@ -31,13 +31,20 @@ from mini_ork.acp.task_state import MARKS, run_mark, task_state
 # Filter tokens the user may type on the ``/runs`` command line. The
 # kickoff explicitly accepts ``needs_you`` and the hyphen variant
 # ``needs-you``; internal comparison normalizes to the underscore form.
-FILTER_STATES: tuple[str, ...] = ("all", "working", "needs_you", "needs-you", "done", "failed")
-INTERNAL_STATES: tuple[str, ...] = ("all", "working", "needs_you", "done", "failed")
+# ``not_needed`` accepts its hyphen variant for the same reason.
+FILTER_STATES: tuple[str, ...] = (
+    "all", "working", "needs_you", "needs-you", "done", "failed",
+    "not_needed", "not-needed",
+)
+INTERNAL_STATES: tuple[str, ...] = (
+    "all", "working", "needs_you", "done", "failed", "not_needed",
+)
 STATE_LABELS: dict[str, str] = {
     "working": "Working",
     "needs_you": "Needs you",
     "done": "Done",
     "failed": "Failed",
+    "not_needed": "Not needed",
     "all": "All",
 }
 
@@ -450,7 +457,7 @@ def fleet_rows(
       1. Pull ``CANDIDATE_LIMIT`` candidate rows from ``history.list_runs``.
       2. For each candidate, call ``run_mark`` (cheap) and bucket the
          candidate by its ``state`` (``working``/``needs_you``/``done``/
-         ``failed``); the four buckets drive ``counts``.
+         ``failed``/``not_needed``); those buckets drive ``counts``.
       3. Apply ``state`` and ``recipe`` filters and slice to ``limit``.
       4. For the SHOWN rows only: one batched lifecycle-event query
          (``_events_by_run``), then ``task_state`` per row for the precise
@@ -470,9 +477,9 @@ def fleet_rows(
     try:
         candidates, _ = list_runs(Path(home), limit=CANDIDATE_LIMIT, offset=0)
     except Exception:  # noqa: BLE001
-        return [], {"working": 0, "needs_you": 0, "done": 0, "failed": 0}
+        return [], {state: 0 for state in INTERNAL_STATES if state != "all"}
 
-    counts: dict[str, int] = {"working": 0, "needs_you": 0, "done": 0, "failed": 0}
+    counts: dict[str, int] = {state: 0 for state in INTERNAL_STATES if state != "all"}
     cheap_states: dict[str, str] = {}
     for row in candidates:
         run_id = row.get("run_id") or ""
@@ -569,9 +576,11 @@ def rows_from_candidates(home: Path, candidates: list[dict[str, Any]]) -> list[F
 
         mark = MARKS.get(precise_state, MARKS["working"])
 
-        # ``ended_at`` only for done/failed; for working/needs_you it stays None
-        # so the renderer can show "elapsed" instead of "duration".
-        if precise_state not in ("done", "failed"):
+        # ``ended_at`` only for a state that has stopped; for working/needs_you
+        # it stays None so the renderer can show "elapsed" instead of
+        # "duration". ``not_needed`` is terminal — it stopped, so it keeps the
+        # row's ``ended_at`` and renders as a duration like done/failed.
+        if precise_state not in ("done", "failed", "not_needed"):
             ended_at = None
 
         rows.append(
@@ -615,6 +624,7 @@ def render_fleet(rows: list[FleetRow], counts: dict[str, int], *, state: str, no
         ("needs_you", "Needs you", int(counts.get("needs_you", 0))),
         ("done", "Done", int(counts.get("done", 0))),
         ("failed", "Failed", int(counts.get("failed", 0))),
+        ("not_needed", "Not needed", int(counts.get("not_needed", 0))),
     ]
     tab_line_parts: list[str] = []
     for key, label, count in tab_specs:
@@ -685,7 +695,8 @@ def render_fleet(rows: list[FleetRow], counts: dict[str, int], *, state: str, no
     parts.append("")
     parts.append(
         "Filter: `/runs working` · `/runs needs-you` · `/runs done` · "
-        "`/runs failed` · `/runs recipe:<id>` · details: `/status <run id>`"
+        "`/runs failed` · `/runs not-needed` · `/runs recipe:<id>` · "
+        "details: `/status <run id>`"
     )
     return "\n".join(parts)
 
@@ -820,7 +831,7 @@ def render_card(card: dict[str, Any], *, now: int, serve_url: str | None) -> str
 
     duration_text = "—"
     if isinstance(created, int):
-        if ts_state in ("done", "failed") and isinstance(updated, int):
+        if ts_state in ("done", "failed", "not_needed") and isinstance(updated, int):
             duration_text = _format_duration(max(0, int(updated) - int(created)))
         else:
             duration_text = _format_duration(max(0, int(now) - int(created)))

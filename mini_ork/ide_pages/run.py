@@ -393,7 +393,7 @@ def _load(home: Path, run_id: str, *, with_files: bool = True) -> Run | None:
         calls = []
     _attribute_calls(nodes, calls, now)
 
-    terminal = card.get("status") in ("published", "failed", "rolled_back")
+    terminal = card.get("status") in ("published", "failed", "rolled_back", "not_needed")
     for node in nodes.values():
         if node.start is None and node.calls:
             node.state = "done"
@@ -449,7 +449,12 @@ def _serve_url(run_id: str) -> str | None:
 
 
 def _running(run: Run) -> bool:
-    return run.card.get("status") not in ("published", "failed", "rolled_back")
+    # ``not_needed`` belongs here: a closed run is over, and leaving it out
+    # would keep the page polling it as live — and stamp its elapsed time with
+    # ``now`` forever — instead of showing the duration it actually ran.
+    return run.card.get("status") not in (
+        "published", "failed", "rolled_back", "not_needed",
+    )
 
 
 def _state_chip(run: Run) -> dict[str, Any]:
@@ -462,6 +467,9 @@ def _state_chip(run: Run) -> dict[str, Any]:
         return S.chip("rolled back", "red")
     if status == "failed":
         return S.chip("failed", "red")
+    if status == "not_needed":
+        # Neutral, not red: the run is over but nothing went wrong here.
+        return S.chip("not needed", "sub")
     if state == "needs_you":
         return S.chip("needs you", "yellow")
     return S.chip("running", "blue")

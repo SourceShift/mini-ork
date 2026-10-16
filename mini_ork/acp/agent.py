@@ -98,6 +98,7 @@ from mini_ork.acp import task_state as _task_state
 from mini_ork.acp.task_state import TaskState as _TaskState
 from mini_ork.acp.live import LiveTail, normalize
 from mini_ork.acp.threads import ThreadStore, title_from_text
+from mini_ork.run_status import TERMINAL as TERMINAL_STATUSES
 from mini_ork.web.control import _is_safe_token
 
 PROTOCOL_VERSION = 1
@@ -107,9 +108,10 @@ PROTOCOL_VERSION = 1
 # not a safe slug is rejected there rather than injected.
 DEFAULT_RECIPE = "code-fix"
 
-# Terminal task_run statuses. Mirrors mini_ork.web.routes.run_detail.TERMINAL_STATUSES
-# but duplicated here so this module does not import the FastAPI route graph.
-TERMINAL_STATUSES = frozenset({"published", "rolled_back", "failed"})
+# Terminal task_run statuses, from the one module that defines the set
+# (mini_ork/run_status.py). The old local copy existed so this module would not
+# import the FastAPI route graph; that module imports nothing, so the reason is
+# gone.
 
 # Poll cadence while a detached run is awaited, and the stop→kill grace window.
 _POLL_INTERVAL_S = float(os.environ.get("MO_ACP_POLL_SECONDS", "2.0"))

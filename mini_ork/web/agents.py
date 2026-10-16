@@ -22,12 +22,11 @@ import re
 from pathlib import Path
 from typing import Any
 
+from mini_ork.run_status import TERMINAL as _TERMINAL_RUN_STATUSES
+
 from . import artifacts, recipes
 from .db import StateDB
 from .repositories import derive_node_statuses
-
-# task_runs.status values after which no node can possibly still be running.
-_TERMINAL_RUN_STATUSES = {"published", "rolled_back", "failed"}
 
 
 def _snapshot_nodes(fp: dict[str, Any], dispatch_config_json: str | None) -> list[dict[str, Any]]:

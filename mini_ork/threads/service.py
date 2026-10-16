@@ -65,6 +65,9 @@ _TERMINAL_TASK_STATUS_MAP = {
     "published": RunStatus.FINISHED,
     "rolled_back": RunStatus.ERROR,
     "failed": RunStatus.ERROR,
+    # A run the operator closed is over, but it is not a failure to steer back
+    # from — FINISHED, matching the canvas's map.
+    "not_needed": RunStatus.FINISHED,
 }
 _TERMINAL_TASK_STATUSES = frozenset(_TERMINAL_TASK_STATUS_MAP)
 

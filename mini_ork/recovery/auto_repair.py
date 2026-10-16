@@ -66,6 +66,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from mini_ork import run_status as _run_status
 from mini_ork.context import context_env
 
 # ── tuning (env-overridable) ────────────────────────────────────────────────
@@ -78,7 +79,7 @@ _DEFAULT_ESCALATE_LANE = "opus"
 _DEFAULT_WAIT_S = 1800.0
 
 _ATTEMPT_FILE = "repair.json"
-_TERMINAL_FAILED = ("failed", "rolled_back")
+_TERMINAL_FAILED = tuple(sorted(_run_status.UNSUCCESSFUL))
 
 # Child env markers set by ``_spawn_recover``: the attempt number this child is
 # executing, the run it is repairing (``note_stuck`` needs both), and the pid of

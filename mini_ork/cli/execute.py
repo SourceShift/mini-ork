@@ -46,6 +46,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Callable  # noqa: F401 -- compatibility re-export for handlers
 
+from mini_ork import run_status as _run_status
 from mini_ork.context import (  # noqa: F401 -- compatibility re-exports
     ENV_DISPATCH_CHAIN,
     ENV_RESUME_SESSION_ID,
@@ -1902,7 +1903,7 @@ def set_status(db, run_id, new_status, *, dry_run=False):
     #1, zero-fallback)."""
     if dry_run or not db or not run_id or not os.path.isfile(db):
         return
-    terminal = {"published", "rolled_back", "failed"}
+    terminal = _run_status.TERMINAL
     last_err = None
     for attempt in range(3):
         try:
@@ -3680,7 +3681,7 @@ def _execute_gate_check(plan_path, run_dir, dry_run):
                     "updated_at=?, ended_at=COALESCE(ended_at,?), "
                     "notes=COALESCE(notes || '; ','') || "
                     "'execute gate: plan_status=needs_answers — nothing dispatched' "
-                    "WHERE id=? AND status NOT IN ('published','rolled_back','failed')",
+                    f"WHERE id=? AND status NOT IN {_run_status.SQL_TERMINAL}",
                     (now, now, run_id))
                 con.execute(
                     "INSERT INTO run_events(event_id, run_id, event_type, payload_json, created_at) "

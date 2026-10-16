@@ -33,6 +33,14 @@ import sys
 import time
 from collections import Counter
 
+from mini_ork import run_status as _run_status
+
+# This filter answers "is this run still moving?", so it wants the terminal set.
+# `approved` and `completed` are not in the schema's CHECK constraint today, but
+# a stale DB may still hold them; keeping them makes the filter a superset of
+# run_status.TERMINAL rather than a second, narrower definition of "over".
+_SQL_STILL_MOVING_EXCLUDES = _run_status.SQL_TERMINAL
+
 
 # Default knobs — same defaults as bash (lines 33-36).
 DEFAULT_THRESHOLD = 0.65
@@ -84,9 +92,10 @@ def _fetch_active_runs(con):
             SELECT id, status
               FROM task_runs
              WHERE (status IS NULL
-                    OR status NOT IN ('published','failed','rolled_back','approved','completed'))
+                    OR (status NOT IN ('approved','completed')
+                        AND status NOT IN {terminal}))
                AND created_at >= strftime('%s','now','-24 hours')
-            """
+            """.format(terminal=_SQL_STILL_MOVING_EXCLUDES)
         ).fetchall()
     except sqlite3.OperationalError:
         return []

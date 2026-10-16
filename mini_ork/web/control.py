@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -23,20 +24,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from mini_ork import not_needed as _not_needed
+from mini_ork import run_status as _run_status
 from mini_ork.features import gate_env
 
 from .db import StateDB
 
 # Statuses that may be controlled. Terminal statuses are excluded — killing
 # a published run is a no-op pattern that almost certainly means the user
-# is looking at the wrong row.
-CONTROLLABLE_STATUSES = {
-    "classified",
-    "planned",
-    "executing",
-    "verifying",
-    "reviewing",
-}
+# is looking at the wrong row. ``run_status.LIVE`` is that complement.
+CONTROLLABLE_STATUSES = frozenset(_run_status.LIVE)
+
+#: The schema value a closed run's ``task_runs.status`` takes.
+NOT_NEEDED = "not_needed"
+
+#: The breadcrumb the closure appends to ``task_runs.notes``. Shared with
+#: :func:`_strip_trailing_note` so the writer and the remover cannot drift: an
+#: undo that stripped a different spelling would leave the note behind and the
+#: next close would append a second one.
+NOT_NEEDED_NOTE = "not-needed"
 
 
 def _resolve_run_dir(home: Path, task_run_id: str) -> Path:
@@ -463,6 +469,147 @@ def _writeback_terminal(
         con.commit()
     finally:
         con.close()
+
+
+def _strip_trailing_note(notes: str | None, tag: str) -> str | None:
+    """Drop trailing ``; <tag>[: …]`` segments a since-reversed gesture wrote.
+
+    Only the tag's own segments are removed, and only from the end — a run's
+    earlier notes (its ``impl_moved_base`` reason, say) must survive verbatim.
+    Looped so an already-accumulated pair cleans up in one undo.
+    """
+    if notes is None:
+        return None
+    pattern = re.compile(rf"(?:^|;\s*){re.escape(tag)}(?::.*)?\s*$")
+    text = notes
+    while True:
+        stripped = pattern.sub("", text)
+        if stripped == text:
+            break
+        text = stripped
+    return text.strip() or None
+
+
+def _restore_status(
+    db_path: str, task_run_id: str, status: str, *, drop_note: str | None = None
+) -> None:
+    """Put a run back to ``status``, the undo half of :func:`mark_not_needed`.
+
+    ``ended_at`` is cleared only when the restored status is live. A run
+    reopened mid-flight must not keep the end stamp the closure gave it, while
+    one restored to ``failed`` or ``published`` must keep the stamp it already
+    had — clearing it there would make a settled run read as still running.
+
+    ``drop_note`` names a breadcrumb the reversed gesture appended; it is
+    removed in the same write so a close→undo→close cycle leaves exactly one.
+    """
+    import sqlite3
+
+    live = not _run_status.is_terminal(status)
+    now = int(time.time())
+    con = sqlite3.connect(db_path, timeout=5.0)
+    try:
+        con.execute("PRAGMA busy_timeout = 5000")
+        column = "ended_at = NULL, " if live else ""
+        if drop_note is None:
+            con.execute(
+                f"UPDATE task_runs SET status = ?, {column}updated_at = ? WHERE id = ?",
+                (status, now, task_run_id),
+            )
+        else:
+            row = con.execute(
+                "SELECT notes FROM task_runs WHERE id = ?", (task_run_id,)
+            ).fetchone()
+            cleaned = _strip_trailing_note(row[0] if row else None, drop_note)
+            con.execute(
+                f"UPDATE task_runs SET status = ?, notes = ?, {column}updated_at = ?"
+                " WHERE id = ?",
+                (status, cleaned, now, task_run_id),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+
+def mark_not_needed(
+    home: Path,
+    db: StateDB,
+    task_run_id: str,
+    *,
+    undo: bool = False,
+    reason: str = "",
+) -> dict[str, Any]:
+    """Close a run as unwanted work, or reopen it (``--undo``).
+
+    This is not :func:`_act_dismiss`'s dismissal, and the two must not be
+    merged: dismissal *hides* a row and leaves the run wherever it was — a
+    dismissed run may still be executing. Closing means the run is over.
+
+    ``task_runs.status`` alone cannot carry this. ``--undo`` has to restore what
+    the run *was*, and a status column holding ``not_needed`` does not remember,
+    so the closure writes ``<run_dir>/not-needed.json`` with the previous value.
+    The marker goes down FIRST: if the status write then fails we hold a marker
+    with no closure, which ``--undo`` still handles, whereas the reverse would
+    strand a closed run that nothing can reopen.
+    """
+    tr = db.row("SELECT id, status FROM task_runs WHERE id = ?", (task_run_id,))
+    if not tr:
+        return {"ok": False, "task_run_id": task_run_id, "error": "task_run not found"}
+
+    run_dir = _resolve_run_dir(home, task_run_id)
+    current = str(tr["status"] or "")
+
+    if undo:
+        marker = _not_needed.read(run_dir)
+        if marker is None:
+            return {
+                "ok": False,
+                "task_run_id": task_run_id,
+                "error": "this run was not closed as not-needed — nothing to restore",
+            }
+        previous = marker.get("previous_status")
+        if not isinstance(previous, str) or not previous:
+            # A marker with no usable previous value cannot be undone
+            # honestly; refusing beats inventing a status to restore.
+            return {
+                "ok": False,
+                "task_run_id": task_run_id,
+                "error": "the not-needed marker records no previous status",
+            }
+        _restore_status(
+            str(db.db_path), task_run_id, previous, drop_note=NOT_NEEDED_NOTE
+        )
+        _not_needed.clear(run_dir)
+        return {
+            "ok": True, "task_run_id": task_run_id, "action": "not_needed",
+            "mode": "restored", "status": previous,
+        }
+
+    if current == NOT_NEEDED:
+        # Idempotent: a second click is not an error, and re-stamping would
+        # overwrite the recorded previous_status with "not_needed" and destroy
+        # the only record of what to restore.
+        return {
+            "ok": True, "task_run_id": task_run_id, "action": "not_needed",
+            "mode": "unchanged", "status": current,
+        }
+
+    try:
+        _not_needed.write(run_dir, current, reason=reason, by="ide")
+    except OSError as exc:
+        return {
+            "ok": False, "task_run_id": task_run_id,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    _writeback_terminal(
+        db, task_run_id, status=NOT_NEEDED,
+        notes=NOT_NEEDED_NOTE + (f": {reason}" if reason else ""),
+    )
+    return {
+        "ok": True, "task_run_id": task_run_id, "action": "not_needed",
+        "mode": "closed", "previous_status": current,
+    }
 
 
 def _close_dangling_node_events(db: StateDB, task_run_id: str) -> None:

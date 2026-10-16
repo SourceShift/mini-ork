@@ -566,6 +566,22 @@ def _act_dismiss(home: Path, run_id: str, *, undo: bool = False) -> dict[str, An
     return {"ok": True, "run_id": run_id, "mode": "restored" if undo else "dismissed"}
 
 
+def _act_not_needed(
+    home: Path, run_id: str, *, undo: bool = False, reason: str = "",
+) -> dict[str, Any]:
+    """Close a run as unwanted work (``--undo`` reopens it).
+
+    Not ``dismiss``: dismissal hides a row and leaves the run running, whereas
+    this moves ``task_runs.status`` to its terminal ``not_needed`` value. The
+    write itself lives in ``web.control`` beside ``kill_run``/``stop_run`` —
+    this module holds no side effects of its own.
+    """
+    from mini_ork.web.control import mark_not_needed
+    from mini_ork.web.db import db_for
+
+    return mark_not_needed(home, db_for(home), run_id, undo=undo, reason=reason)
+
+
 # The board retry verb spawns a ``mini-ork recover`` subprocess under the same
 # detached shape as ``acp.commands._spawn``. We re-bind the import here so the
 # board tests can monkeypatch ``_retry_spawn`` and never actually launch.
@@ -1524,6 +1540,9 @@ def build_payload(home: Path, args) -> dict[str, Any]:
         payload = _runs_verb(home, args.query, args.offset, args.limit)
     elif args.verb == "dismiss":
         payload = _act_dismiss(home, args.run_id, undo=args.undo)
+    elif args.verb == "not-needed":
+        payload = _act_not_needed(home, args.run_id, undo=args.undo,
+                                  reason=args.note or "")
     elif args.verb == "checkpoints":
         payload = _act_checkpoints(home, args.run_id)
     elif args.verb == "restore":
@@ -1580,7 +1599,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("verb", nargs="?", default="show",
                         choices=["show", "run", "merge", "discard", "dismiss", "stop", "kill",
                                  "resume", "retry", "gate", "page", "node", "steer", "answer",
-                                 "runs", "checkpoints", "restore", "start", "race-keep"])
+                                 "runs", "checkpoints", "restore", "start", "race-keep",
+                                 "not-needed"])
     parser.add_argument("run_id", nargs="?")
     # `gate approve|reject <inbox_id>` puts the action in run_id and the id here;
     # `node <run_id> <node_id>` uses the same slot for the node id (the L464
@@ -1629,7 +1649,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--undo", action="store_true",
                         help="dismiss: clear the run's dismissal marker, so the "
                              "inbox shows it again. A dismissal hides a row, it "
-                             "never deletes a run.")
+                             "never deletes a run. not-needed: restore the status "
+                             "the run had before it was closed.")
     parser.add_argument("--lane", action="append", default=[],
                         help="retry: pin a lane for the spawned recover "
                              "(repeatable, <alias>=<lane>). Does not imply "

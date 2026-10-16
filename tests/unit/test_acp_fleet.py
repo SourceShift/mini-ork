@@ -195,7 +195,9 @@ def test_rows_and_counts_per_state(home: Path):
 
     rows, counts = fl.fleet_rows(home)
 
-    assert counts == {"working": 1, "needs_you": 1, "done": 1, "failed": 1}
+    # ``not_needed`` is a fifth bucket, not a shade of ``failed``: the operator
+    # can close a run as unwanted work, and it must not be counted as a defect.
+    assert counts == {"working": 1, "needs_you": 1, "done": 1, "failed": 1, "not_needed": 0}
     assert all(isinstance(r, FleetRow) for r in rows)
     by_id = {r.run_id: r for r in rows}
     assert by_id["r-done"].state == "done"
@@ -233,7 +235,7 @@ def test_limit_caps_shown_rows(home: Path):
     rows, counts = fl.fleet_rows(home, limit=5)
     assert len(rows) == 5
     # Counts cover every candidate, not just the shown slice.
-    assert counts == {"working": 0, "needs_you": 0, "done": 30, "failed": 0}
+    assert counts == {"working": 0, "needs_you": 0, "done": 30, "failed": 0, "not_needed": 0}
 
 
 def test_precise_state_only_computed_for_shown_rows(

@@ -28,6 +28,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 
 from mini_ork.orchestration import epic_graph
+from mini_ork.run_status import SQL_TERMINAL as _SQL_TERMINAL
 
 
 _USAGE = """mini-ork scheduler — autonomous multi-epic delivery loop.
@@ -838,7 +839,7 @@ def _live_run_for_kickoff(con: sqlite3.Connection, epic_id: str, kickoff: str | 
     clause = " OR ".join("kickoff_path LIKE ?" for _ in patterns)
     return con.execute(
         "SELECT 1 FROM task_runs WHERE ended_at IS NULL "
-        "AND status NOT IN ('failed','published','rolled_back') AND (" + clause + ")",
+        f"AND status NOT IN {_SQL_TERMINAL} AND (" + clause + ")",
         patterns).fetchone() is not None
 
 
@@ -896,7 +897,7 @@ def reclaim_stale(db: str | None = None, *, older_than_s: int | None = None) -> 
                 continue  # its scheduler is still running or settling it
             if run_id and has_runs and con.execute(
                     "SELECT 1 FROM task_runs WHERE id=? AND ended_at IS NULL "
-                    "AND status NOT IN ('failed','published','rolled_back')",
+                    f"AND status NOT IN {_SQL_TERMINAL}",
                     (run_id,)).fetchone():
                 continue  # a live run still owns this epic
             if has_runs and _live_run_for_kickoff(con, epic_id, kickoff):

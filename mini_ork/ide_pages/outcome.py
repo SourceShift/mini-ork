@@ -40,6 +40,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from mini_ork import run_status as _run_status
 from mini_ork.ide_pages import spec as S
 
 # The five verification levels, in report order (``mini_ork.verify.levels``).
@@ -50,8 +51,10 @@ LEVELS = ("applies", "executes", "target", "preserve", "contract")
 _PROVEN = "PROVEN"
 _REFUTED = "REFUTED"
 
-_TERMINAL = ("published", "failed", "rolled_back")
-_FAILED = ("failed", "rolled_back")
+# The two sets differ, and the badge rows that read them care: a `not_needed`
+# run is over, but it is not a failure to explain or repair.
+_TERMINAL = tuple(sorted(_run_status.TERMINAL))
+_FAILED = tuple(sorted(_run_status.UNSUCCESSFUL))
 
 
 def _run_mod():

@@ -99,6 +99,12 @@ def learning_update_conductor_outcomes(db) -> int:
         #
         # `ended_at IS NOT NULL` is also NOT a terminal test — 8 rows sit in `reviewing` with
         # ended_at set. Gate on the status set, which is what actually means "finished".
+        #
+        # `not_needed` is deliberately absent (the schema also admits it as of migration 0076):
+        # this query SETTLES the pending decision by scoring it, and `success` below is
+        # `status == "published"`. Including a run the operator closed would score it 0.0 and
+        # teach the loop that the recipe fails — a decision about the work, recorded as a fact
+        # about the code.
         if has_run_col:
             rows = con.execute(
                 "SELECT cd.id, tr.status, tr.verdict "

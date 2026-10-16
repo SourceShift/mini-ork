@@ -35,8 +35,8 @@ from pathlib import Path
 from typing import Any
 
 from mini_ork.remote.providers.base import clear_stale_run_lock
+from mini_ork.run_status import TERMINAL
 
-TERMINAL = frozenset({"published", "failed", "rolled_back"})
 PID_FILE = ".pid"
 # A process that started after its .pid was written is a different process
 # wearing a recycled pid. The slack absorbs mtime / lstart second rounding.
