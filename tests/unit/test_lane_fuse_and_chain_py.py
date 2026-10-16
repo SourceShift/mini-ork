@@ -187,7 +187,12 @@ def test_default_coding_tail_prefers_same_kind_gateway_lanes(
     chain = dispatch_chain("implementer", "minimax", str(REPO))
 
     assert chain.split(",")[-1] != "codex"
-    assert "glm" in chain and "deepseek_flash" in chain
+    # Only default-string facts here. Whether the tail survives filtering is a
+    # REGISTRY fact, not a default fact: a home without `deepseek_flash` drops
+    # it with a loud [dispatch_chain_drop] (covered by test_dead_tail_lane_dropped),
+    # so asserting its presence here goes red in that home for no reason — it did,
+    # on the researcher home whose registry has `deepseek`, not `deepseek_flash`.
+    assert "glm" in chain
     assert "kimi" not in chain
 
 
