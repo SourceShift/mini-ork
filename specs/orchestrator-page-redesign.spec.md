@@ -872,6 +872,12 @@ Stated explicitly, with cost, so a reviewer can decline them knowingly.
       disk-cache noise, not the strip). Every tab stays far inside the 1.5 s warm target,
       and the strip adds no network call — `source_statuses` and `scheduler_status` are
       file/DB reads, as is `_recent_profiles`' 60-directory walk.
+- [x] NFR — FR-023 did not move that budget. It reuses the same 60-directory walk
+      (no new scan reads the disk) and returns 58 rows on the primary home; three warm
+      reads of `board page orch --tab planner` end-to-end, interpreter start included:
+      **0.22 s / 0.16 s / 0.14 s**. The tab draws every scanned run rather than a
+      capped page of them, and at 58 rows that is still an order of magnitude inside
+      the 1.5 s target.
 - [x] NFR — AC-012 holds for **the redesign**: no section this spec adds needed a
       renderer change. `crates/mini_ork_ui/src/sections.rs` *was* edited, but by the
       audit's rows 4-6 — pre-existing engine↔fork drift, authorised separately. See
