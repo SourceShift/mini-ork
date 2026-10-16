@@ -571,6 +571,26 @@ def _clear_stale_stop_request(run_dir: str) -> bool:
     return True
 
 
+def _recovery_target_cwd(run_dir: str) -> str:
+    """The run's recorded target worktree, or ``""`` when none is recorded.
+
+    Deliberately NOT ``resolve_run_roots``: that ladder bottoms out at
+    ``os.getcwd()``, and a value guessed from the operator's shell is the very
+    thing this exists to keep out of a recovery (see the ``MO_TARGET_CWD``
+    override in ``cli_main``). Only the run's own ``run_profile.json``
+    ``roots.target`` is authoritative, and only while that path still exists —
+    a target that is gone is left for the run's own ``require_run_target`` to
+    name at first use, rather than being papered over here.
+    """
+    if not run_dir:
+        return ""
+    from mini_ork.runtime.run_roots import load_run_roots  # noqa: PLC0415
+
+    roots = load_run_roots(run_dir)
+    target = (roots.target if roots else "") or ""
+    return target if target and os.path.isdir(target) else ""
+
+
 def _format_restore_plan(
     run_dir: str,
     cli_carry_patch: str | None,
@@ -1360,6 +1380,29 @@ def cli_main(argv: list[str] | None = None, *, execute_fn=None) -> int:
         "MINI_ORK_WORKFLOW": handoff["workflow"],
         "MINI_ORK_RECIPE": handoff["recipe"] or None,
     }
+    # ── The closure must grade the run's own repo, not the operator's cwd ──
+    # Most nodes only ever see ``MO_TARGET_CWD`` because the IMPLEMENTER handler
+    # publishes it (execute_handlers ``publish_env({ENV_TARGET_CWD: target})``)
+    # and, per ``publish_env``'s leak-forever contract, it then stays set for
+    # every later node in the process. A closure that omits the implementer —
+    # ``--strategy verify``, or any verifier-rooted re-run — has nothing to
+    # publish it, so each verifier resolves the repo under test from
+    # ``MO_TARGET_CWD`` else ``MINI_ORK_TARGET_REPO`` else ``MINI_ORK_ROOT``
+    # else ``os.getcwd()``: the operator's directory. framework-edit's
+    # static-check then runs ``git -C <operator cwd> apply --check`` and fails
+    # ``diff-apply-check-clean`` on a diff that is perfectly good
+    # (rp-e3-header-20261015-222115 and rp-e6-graph-focus, 2026-10-16, both
+    # recovered from a neutral cwd and both re-verified green once the target
+    # was right). Recovering from another checkout is worse than failing: the
+    # verifiers would grade that checkout and report the run as passing.
+    #
+    # An operator-set ``MO_TARGET_CWD`` always wins (the documented lever for
+    # re-pointing a run whose worktree was cleaned), and an unresolvable target
+    # publishes nothing rather than a guess.
+    if not context_env("MO_TARGET_CWD").strip():
+        _target_cwd = _recovery_target_cwd(handoff["run_dir"])
+        if _target_cwd:
+            _overrides["MO_TARGET_CWD"] = _target_cwd
     if not context_env("MINI_ORK_TASK_CLASS").strip():
         _task_class = ""
         try:
