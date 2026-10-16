@@ -112,6 +112,16 @@ def _expect_for(probe: str) -> str:
     return re.escape(lits[-1]) if lits else "exit 0"
 
 
+def _marker_tags_precondition(body: str) -> bool:
+    """True when a comment line of the AC's fence segment names ``precondition``.
+
+    The segment body always begins with the injected ``set -euo pipefail``
+    header, so the author's ``# AC3 precondition`` marker is never on line 0.
+    """
+    return any(line.lstrip().startswith("#") and "precondition" in line.lower()
+               for line in body.split("\n"))
+
+
 def _materialize(card: dict, spec_text: str) -> tuple[dict, list[str]]:
     sid = card["spec_id"]
     labeled: dict[str, str] = {}
@@ -123,7 +133,7 @@ def _materialize(card: dict, spec_text: str) -> tuple[dict, list[str]]:
     for a in card["acceptance"]:
         aid, kind, text = a["id"], a["gate"]["kind"], a.get("text", "")
         tags = []
-        if "precondition" in text.lower() or "precondition" in labeled.get(aid, "").lower().split("\n")[0]:
+        if "precondition" in text.lower() or _marker_tags_precondition(labeled.get(aid, "")):
             tags.append("precondition")
         probe = labeled.get(aid)
         expect = None

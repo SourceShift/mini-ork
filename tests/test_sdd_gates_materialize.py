@@ -187,6 +187,40 @@ def test_precondition_tag_from_ac_text(tmp_path):
     assert g["probes"][0]["tags"] == ["precondition"]
 
 
+def test_precondition_tag_from_the_marker_line(tmp_path):
+    """The module's "or its marker line" path must actually fire.
+
+    ``_split_labeled`` prepends ``set -euo pipefail`` to every labeled segment,
+    so the body's first line is always that header and the old first-line check
+    could never see the author's own ``# AC1 precondition`` marker. The tag was
+    silently dropped and the probe then failed as vacuous — test-validity.py:
+    "any other probe that passes now is vacuous and fails the gate" — with
+    nothing in the output saying the tag had been lost.
+    """
+    text = '# S\n\n```bash\n# AC1 precondition\ncargo test --lib\necho "AC1 pass"\n```\n'
+    run = make_spec(tmp_path, "s-pre-marker", text,
+                    [ac("AC1", text="the suite is green on the untouched tree")])
+    code, out = run_materialize(run, tmp_path)
+    assert code == 0, out
+    g = gates_of(run, "s-pre-marker")
+    assert g["probes"][0]["tags"] == ["precondition"]
+
+
+def test_a_probe_that_merely_mentions_precondition_in_a_body_line_is_not_tagged(tmp_path):
+    """Only a comment line names the tag; the word inside the script does not.
+
+    ``tags`` decides whether the probe must pass on the untouched tree, so a
+    loose substring match over the whole body would silently exempt a real gate.
+    """
+    text = ('# S\n\n```bash\n# AC1\necho "precondition not met yet"\n'
+            'echo "AC1 pass"\n```\n')
+    run = make_spec(tmp_path, "s-pre-body", text, [ac("AC1", text="it holds")])
+    code, out = run_materialize(run, tmp_path)
+    assert code == 0, out
+    g = gates_of(run, "s-pre-body")
+    assert g["probes"][0]["tags"] == []
+
+
 def test_no_cards_is_malformed(tmp_path):
     run = tmp_path / "run"
     (run / "spec-cards").mkdir(parents=True)
