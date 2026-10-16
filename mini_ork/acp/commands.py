@@ -246,6 +246,11 @@ COMMANDS: list[AvailableCommand] = [
         "Restore a worktree to a checkpointed node's tree (with a safety ref).",
         "<run> <node>",
     ),
+    _cmd(
+        "orchestrator",
+        "Watch a run from this thread: narrate every stage, report failures, take steering.",
+        "optional run id — default: the newest run this thread launched",
+    ),
 ]
 
 
@@ -401,6 +406,36 @@ def _parse_recipes_arg(arg: str) -> tuple[str, str]:
 
 
 # ── handlers ─────────────────────────────────────────────────────────────────
+
+
+async def handle_orchestrator(agent: Any, session_id: str, arg: str) -> str:
+    """Make this thread the orchestrator for a run: watch it, narrate it.
+
+    Binds the run to the thread and starts the follower that narrates each
+    stage boundary and speaks up when a stage stalls, repeats an error or
+    overruns. The follower is detached, so this returns at once and the
+    narration streams into the thread as the run progresses — this command
+    never blocks on, and never launches, a run.
+    """
+    if session_id not in getattr(agent, "_thread_sessions", set()):
+        return (
+            "`/orchestrator` watches a run from a thread. Open a thread (or use "
+            "the Orchestrator button on a run) and try again."
+        )
+    run_id = _current_run_id(agent, session_id, arg)
+    if not run_id:
+        return "No run to watch — `/orchestrator <run>` names one and `/runs` lists them."
+    if not _is_safe_token(run_id):
+        return f"`/orchestrator` needs a run id; {run_id!r} is not one."
+    if _resolve_run_row(agent, run_id) is None:
+        return f"No run {run_id} in this project — `/runs` lists the recent ones."
+    # ``_start_child_follow`` is the one place a run becomes a thread's own
+    # (it appends to ``_thread_runs``, routes the run's cards into the thread
+    # and starts the follower), so ``/orchestrator`` and the orchestrator's
+    # own ``start_run`` bind a run the same way. It no-ops when this thread is
+    # already following the run.
+    await agent._start_child_follow(session_id, run_id)
+    return f"Watching {run_id} from here — I report each stage, and I will tell you if one stalls."
 
 
 async def handle_help(agent: Any, session_id: str, arg: str) -> str:
@@ -1819,6 +1854,7 @@ HANDLERS: dict[str, Handler] = {
     "request-changes": handle_request_changes,
     "checkpoints": handle_checkpoints,
     "restore": handle_restore,
+    "orchestrator": handle_orchestrator,
     "automations": handle_automations,
     "automation": handle_automation,
     "automation new": handle_automation_new,

@@ -138,47 +138,38 @@ touched set is the child's working tree ∪ untracked ∪ `pre-implementer-ref�
 | `MO_ORACLE_GATES_AUTO` | `"1"` | Auto oracle-gate run pre-publish |
 | `MO_OPTIMIZER_MODEL` | `"minimax"` | GEPA optimizer lane |
 | `MO_OPTIMIZER_BUDGET` | `"4"` | GEPA optimizer budget |
-| `MO_BUDDY` | `"0"` | Run buddy: an observer that reports each stage (see below) |
-| `MO_BUDDY_INTERVAL_SECONDS` | `"180"` | How often the buddy re-checks a stage that is still running |
-| `MO_BUDDY_STALL_SECONDS` | `"300"` | Silence on the node's log that counts as stalled |
-| `MO_BUDDY_LONG_NODE_SECONDS` | `"900"` | Elapsed time at which a node counts as overrunning |
-| `MO_BUDDY_COST_USD` | `MO_ORCH_BUDGET_USD`, else `"1.0"` | Run spend at which the buddy worries |
+| `MO_NODE_HEARTBEAT_SECONDS` | `"60"` | How often a running node writes a `node_heartbeat` row |
 
-### Run buddy (`MO_BUDDY`)
+### Node heartbeats (`MO_NODE_HEARTBEAT_SECONDS`)
 
-An optional observer that narrates a run **stage by stage** — what happened, what
-happens next, and what the operator can do about it. It is not a recipe node: no
-graph changes, nothing to add to a workflow. It hooks the node lifecycle
-(`mo_node_start` / `mo_node_end`) in `mini_ork/cli/execute_handlers.py`, so it
-fires for every node of every recipe.
+A node is a **blocking in-process call** — verifiers park in `run_check`'s Popen,
+agent lanes park in `dispatch.core` — so for the whole window it runs nothing
+else in the run process is awake to say the run is still alive. `Heartbeat`
+(`mini_ork/observability/heartbeat.py`) is that ticker: one `node_heartbeat` row
+per interval, started in `dispatch_node` right after `mo_node_start` and stopped
+in the same `finally` that releases the node's skill grants.
 
-It writes one report at each stage boundary, and — inside a stage that is still
-running — re-checks every `MO_BUDDY_INTERVAL_SECONDS`. It speaks early only when
-one of four signals crosses a threshold: **stalled progress** (nothing new on the
-node's log), a **repeating error** (the same normalized line ≥3 times), a
-**duration overrun**, or a **cost overrun**. A healthy stage that ends normally
-gets its one line; a healthy stage that is still running gets nothing at all.
+It writes a row and nothing else. No model call, no file, no read, so it cannot
+contend with the run's own writers, and every failure is swallowed — a broken
+heartbeat must never fail a node.
 
-Reports are append-only files at `<run_dir>/buddy/<epoch>.json`, plus a
-`latest.json` pointer. Both paths write files and nothing else — no DB row, not
-even from the stage boundary — so the ticker can never contend with the run's
-own writers. The run page and the node tab read those files — the same
-one-reader shape as `verdict.json` — and both surfaces disappear entirely when
-the flag is off, so the flag has exactly one owner.
+`mo_node_emit` sets `last_heartbeat_at` only for `node_start` and
+`node_heartbeat` (migration 0023), which is what three existing readers consume
+and previously starved for, because nothing emitted it:
 
-**Simple tier.** Unset, empty, `"0"`, `"false"`, `"no"`, `"off"` or a typo all
-mean *off* (fail closed, unlike `MO_RUN_ORCHESTRATOR`'s deliberate fail-open).
-Turned on, it needs no provider and no network: every report is built by a
-deterministic template from the signals and the node's log tail.
+* the reaper's newest-sign-of-life probe, `run_reaper._last_activity`
+  (`MAX(last_heartbeat_at)`, used by `mini-ork reap --stale-after`);
+* the run card's `beat`, rendered as "current node, last seen"
+  (`mini_ork/ide_pages/runs.py`);
+* `fleet`'s active-run filter (`mini_ork/web/routes/fleet.py`).
 
-**Secure tier.** Set `MO_BUDDY=1` with a provider configured and the same report
-is narrated by a model — spend capped by `MO_BUDDY_COST_USD` and recorded in
-`llm_calls` like any other call, so it shows up in the existing cost views. The
-buddy's actions are `argv` lists rendered by `spec.cli`, never shell strings, and
-each one carries a `confirm`.
+It is also the only signal a **hung** node produces, which is what makes a stall
+observable at all: a per-run orchestrator watches these rows to notice one.
 
-A failing buddy can never fail a run: every entry point returns `None` on any
-internal error, and a raising sampler is swallowed.
+**Simple tier.** Nothing to configure — heartbeats are always on, and the
+default interval (60 s) leaves a six-hour stale window covered with room to
+spare. A missing, unparseable or non-positive `MO_NODE_HEARTBEAT_SECONDS` falls
+back to the default rather than disabling the tick.
 
 ### Recipe-declared loop caps (`MO_RECURSION_*`)
 

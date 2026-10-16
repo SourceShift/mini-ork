@@ -539,20 +539,6 @@ def _load_builtins() -> None:
             unit="iterations",
             applies_to=("recursive-self-improve",),
         ),
-        Feature(
-            id="run_buddy",
-            label="Run buddy",
-            description=(
-                "An observer that reports what happened and what is next after each node, "
-                "and on an interval inside a long node. Speaks only when it sees trouble; "
-                "its model spend is capped by MO_BUDDY_COST_USD."
-            ),
-            knobs={"MO_BUDDY": "1"},
-            default="0",
-            cost_model=COST_ADDITIVE,
-            cost_per_unit=0.01,
-            unit="reports",
-        ),
     ]
     for f in blue:
         register_feature(f)

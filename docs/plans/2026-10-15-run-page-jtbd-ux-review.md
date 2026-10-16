@@ -1,5 +1,14 @@
 # Run page — Jobs-to-be-Done UX review (2026-10-15)
 
+> **Superseded in one part (2026-10-16).** Every **Buddy** finding below — the
+> Story/Graph section, its per-line report feed, and the "drop empty
+> *Buddy — 0 reports*" item (C17) — describes a surface that no longer exists.
+> The run buddy was removed; one orchestrator per run now narrates each stage
+> and takes steering in an agent thread, opened by the run page's
+> **Orchestrator** button (`{"thread": "/orchestrator <run>"}`) or
+> `/orchestrator` in any thread. The rest of the review — tabs, hero,
+> verification badges, the Inspector — stands as written.
+
 Scope: the mini-ork **run main page** in the IDE (Zed fork), i.e. `MiniOrkPage` with `key=run`
 (`zed-mini-ork/crates/mini_ork_ui/src/page.rs`, rendered element `#mini-ork-page`, `page.rs:2107-2128`),
 fed by the engine's page builder `mini_ork/ide_pages/run.py` (+ `outcome.py`, `run_story.py`,

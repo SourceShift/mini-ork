@@ -225,6 +225,188 @@ def _mint_thread_id() -> str:
     return f"orch-{int(time.time())}-{secrets.token_hex(3)}"
 
 
+# ── per-run watch narration ──────────────────────────────────────────────────
+# The per-run orchestrator answers four hooks: before a stage, during one, after
+# one, and at the end. Three of them are model turns — the prompts below are the
+# whole of what the model is told, so they must carry the run's facts and forbid
+# acting. The opening line is built here too, but deterministically and emitted
+# as plain text: it must appear the instant the thread opens, and it is facts
+# with no judgement in it.
+_WATCH_NO_TOOLS = (
+    "Do not call any tool. Do not start, stop or change anything — this is a "
+    "report, not an action."
+)
+
+
+def _watch_clock(seconds: float) -> str:
+    """A duration a human reads at a glance."""
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total}s"
+    if total < 3600:
+        return f"{total // 60}m{total % 60:02d}s"
+    return f"{total // 3600}h{(total % 3600) // 60:02d}m"
+
+
+def _watch_stage_summary(events: list[dict[str, Any]]) -> tuple[int, int, str]:
+    """``(seen, ended, live)`` — stages started, stages finished, live node id."""
+    started: set[str] = set()
+    ended: set[str] = set()
+    for event in events or []:
+        event_type = str(event.get("event_type") or "")
+        payload = event.get("payload_json") or {}
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except (json.JSONDecodeError, TypeError):
+                payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        node_id = str(payload.get("node_id") or event.get("node_id") or "node")
+        if event_type == "node_start":
+            started.add(node_id)
+        elif event_type == "node_end":
+            ended.add(node_id)
+    live = sorted(started - ended)
+    return len(started), len(ended), (live[-1] if live else "")
+
+
+def _watch_opening(run_id: str, snapshot: dict[str, Any]) -> str:
+    """The deterministic line a thread emits the moment it starts watching.
+
+    Facts only: which run, how far along, and what the user can say back. It is
+    not a model turn because it must be instant and exactly right, and because
+    it carries no judgement — the four narration hooks are where judgement
+    belongs.
+    """
+    status = str(snapshot.get("status") or "starting")
+    seen, ended, live = _watch_stage_summary(snapshot.get("events") or [])
+    if status in TERMINAL_STATUSES:
+        head = f"Run {run_id} has already finished: **{status}**."
+    elif live:
+        head = f"Watching {run_id} — on stage **{live}**, {ended} of {seen} done so far."
+    else:
+        head = f"Watching {run_id} — {status}, {ended} of {seen} stages done so far."
+    return (
+        f"{head}\n\n"
+        "I report each stage as it starts and ends, and I speak up if a stage "
+        "stalls, repeats the same error, or overruns. Ask me anything about "
+        "this run, or tell me to steer it.\n\n"
+        "A steer lands where the run can still accept one — a node that is "
+        "already running cannot be interrupted, so an instruction for it is "
+        "queued for the next stage. `/stop`, `/kill`, `/approve` and "
+        "`/request-changes` take effect at once, and `/recover --from-node "
+        "<id>` restarts a failed run from a stage. I say which when I take one."
+    )
+
+
+def _watch_boundary_prompt(
+    run_id: str, job: dict[str, Any], snapshot: dict[str, Any]
+) -> str:
+    """The 'before a stage' / 'after a stage' narration instruction."""
+    lines = [
+        "The run you are watching just changed stage.",
+        "",
+        f"Run: {run_id}",
+        f"Stage: {job['node_id']}"
+        + (f" (type: {job['node_type']})" if job.get("node_type") else ""),
+        f"Transition: {job['phase']}",
+    ]
+    if job.get("lane"):
+        lines.append(f"Lane: {job['lane']}")
+    if job.get("phase") == "end":
+        if job.get("verdict"):
+            lines.append(f"Verdict: {job['verdict']}")
+        if job.get("duration_ms") is not None:
+            try:
+                lines.append(f"Duration: {_watch_clock(float(job['duration_ms']) / 1000)}")
+            except (TypeError, ValueError):
+                pass
+        if job.get("finish_reason"):
+            lines.append(f"Finish reason: {job['finish_reason']}")
+    seen, ended, _ = _watch_stage_summary(snapshot.get("events") or [])
+    lines.append(f"Stages: {ended} of {seen} done")
+    lines += [
+        "",
+        "Report this to the user in one or two sentences: what just happened and "
+        "what happens next. Say plainly if the stage failed and why.",
+        _WATCH_NO_TOOLS,
+    ]
+    return "\n".join(lines)
+
+
+def _watch_trouble_prompt(
+    run_id: str,
+    node: dict[str, Any],
+    signals: list[dict[str, str]],
+    snapshot: dict[str, Any],
+) -> str:
+    """The 'during a stage' alert — only ever sent when ``judge`` tripped."""
+    lines = [
+        "The run you are watching is in trouble.",
+        "",
+        f"Run: {run_id}",
+        f"Stage: {node['node_id']}"
+        + (f" (type: {node['node_type']})" if node.get("node_type") else ""),
+        f"Running for {_watch_clock(time.time() - node['started_at'])}",
+        "Signals:",
+    ]
+    lines += [f"- {s.get('kind')}: {s.get('detail')}" for s in signals]
+    seen, ended, _ = _watch_stage_summary(snapshot.get("events") or [])
+    lines.append(f"Stages: {ended} of {seen} done")
+    lines += [
+        "",
+        "Tell the user in one or two sentences what is wrong and what they can "
+        "do about it — resume from this stage, stop the run, or wait. Be "
+        "concrete about which.",
+        _WATCH_NO_TOOLS,
+    ]
+    return "\n".join(lines)
+
+
+def _watch_closing(run_id: str, status: str, jobs: list[dict[str, Any]],
+                   snapshot: dict[str, Any]) -> str:
+    """The deterministic closing card the thread shows before the model's report."""
+    seen, ended, _ = _watch_stage_summary(snapshot.get("events") or [])
+    cost = sum(float(c.get("cost_usd") or 0.0) for c in (snapshot.get("llm_calls") or []))
+    line = f"Run {run_id} finished: **{status}** — {ended} of {seen} stages completed"
+    if cost:
+        line += f", ${cost:.2f}"
+    return line + ".\n\n"
+
+
+def _watch_closing_prompt(
+    run_id: str, status: str, jobs: list[dict[str, Any]], snapshot: dict[str, Any]
+) -> str:
+    """The run's terminal transition — the last of the four hooks."""
+    seen, ended, _ = _watch_stage_summary(snapshot.get("events") or [])
+    cost = sum(float(c.get("cost_usd") or 0.0) for c in (snapshot.get("llm_calls") or []))
+    lines = [
+        "The run you are watching has finished.",
+        "",
+        f"Run: {run_id}",
+        f"Final status: {status}",
+        f"Stages: {ended} of {seen} completed",
+    ]
+    if cost:
+        lines.append(f"Cost: ${cost:.2f}")
+    if jobs:
+        lines.append("Stages in this final step:")
+        lines += [
+            f"- {j['node_id']}: {j['phase']}"
+            + (f" ({j['verdict']})" if j.get("verdict") else "")
+            + (f" — {j['finish_reason']}" if j.get("finish_reason") else "")
+            for j in jobs
+        ]
+    lines += [
+        "",
+        "Give the user a short closing report: the outcome, which stage decided "
+        "it, and what to do next if anything went wrong.",
+        _WATCH_NO_TOOLS,
+    ]
+    return "\n".join(lines)
+
+
 # Per-session config a thread session carries alongside its cwd binding.
 # Populated by ``new_session`` + ``set_config_option`` and consumed by
 # ``prompt`` when routing the orchestrator vs direct paths.
@@ -673,6 +855,24 @@ class MiniOrkAcpAgent:
         # Commands that act on a run resolve the "current run" to ``runs[-1]``
         # unless the user typed an explicit run id.
         self._thread_runs: dict[str, list[str]] = {}
+        # ── per-run watch (the orchestrator that owns a run) ─────────────────
+        # run id → the node transitions already narrated to its thread. Keyed
+        # by RUN, not by thread: one thread may follow several children, and
+        # each narrates on its own timeline.
+        self._watch_seen: dict[str, set[str]] = {}
+        # run id → signal keys already raised ("<node>:<kind>"). A stall that
+        # lasts an hour is one alert, not sixty.
+        self._watch_signals: dict[str, set[str]] = {}
+        # runs whose opening line has been sent, so the first poll primes the
+        # transition set instead of replaying the whole history as narration.
+        self._watch_opened: set[str] = set()
+        # runs whose closing report has been given. ``_follow_in_thread``
+        # re-enters ``_await_terminal`` (lane repair, review offers), so the
+        # terminal poll is seen more than once; the mark clears again if a
+        # later boundary proves the run came back to life.
+        self._watch_closed: set[str] = set()
+        # run id → narration turns spent, against ``watch.narration_budget()``.
+        self._watch_turns: dict[str, int] = {}
         # thread session id → last cost total sent (each poll re-reports usage).
         self._usage_sent: dict[str, float] = {}
         # thread session ids that have already received their first user
@@ -3715,7 +3915,7 @@ class MiniOrkAcpAgent:
         """
         resumes = 0
         while True:
-            stop = await self._await_terminal(run_id)
+            stop = await self._await_terminal(run_id, thread_id=thread_id)
             if stop == "cancelled":
                 return stop  # the run may still be going; leave its marker open
             if stop == "review_resuming":
@@ -5509,7 +5709,16 @@ class MiniOrkAcpAgent:
         else:
             self._last_needs_you_sent.pop(dest, None)
 
-    async def _await_terminal(self, session_id: str) -> StopReason:
+    async def _await_terminal(
+        self, session_id: str, *, thread_id: str | None = None
+    ) -> StopReason:
+        """Poll ``session_id`` to a terminal status.
+
+        ``thread_id`` is set when this run is being followed *inside* an
+        orchestrator thread (``_follow_in_thread``): the poll then also narrates
+        the run's stage boundaries and raises its in-stage trouble on that
+        thread. Every other caller passes nothing and polls exactly as before.
+        """
         reader = self._reader or self._read_snapshot
         # Start-timeout clock runs once per turn (kicks off at the first poll).
         start_deadline = time.monotonic() + self._start_timeout_s
@@ -5520,6 +5729,8 @@ class MiniOrkAcpAgent:
                 return "cancelled"
             snapshot = reader(session_id) or {"status": None, "events": [], "llm_calls": []}
             await self._project_snapshot(session_id, snapshot)
+            if thread_id is not None:
+                await self._narrate_watch(thread_id, session_id, snapshot)
             if snapshot.get("status") is None:
                 # The run hasn't produced a task_runs row yet; look for an
                 # early death of the launcher (shebang interpreter bug, missing
@@ -5602,6 +5813,176 @@ class MiniOrkAcpAgent:
             if snapshot.get("status") in TERMINAL_STATUSES:
                 break
             await asyncio.sleep(self._poll_interval)
+
+    # ── per-run watch: the orchestrator narrates its own run ─────────────────
+
+    async def _narrate_watch(
+        self, thread_id: str, run_id: str, snapshot: dict[str, Any]
+    ) -> None:
+        """Narrate one poll of a followed run: stages, trouble, and the end.
+
+        The four hooks the per-run orchestrator answers, in the order they can
+        fire in a single poll:
+
+        * **before a stage** — a new ``node_start`` boundary;
+        * **during a stage** — a tripped signal, and *only* a tripped one (see
+          ``watch.judge``), which is what keeps a healthy run from spending a
+          turn per poll;
+        * **after a stage** — a new ``node_end`` boundary;
+        * **the end** — the run's terminal status, narrated with the stages
+          that arrived alongside it as one closing report.
+
+        The first poll of a run narrates nothing historical: it primes the
+        transition set and emits a single opening line built from the snapshot.
+        Attaching to a half-finished run must not replay its whole past as a
+        burst of turns.
+
+        Cost is bounded by construction — two turns per stage, one per tripped
+        signal *kind* per node, one opening, one closing — and then by
+        ``watch.narration_budget()`` as a brake on a runaway graph.
+        """
+        from mini_ork.acp_orchestrator import watch as _watch
+
+        events = snapshot.get("events") or []
+        if run_id not in self._watch_seen:
+            self._watch_seen[run_id] = set()
+        seen = self._watch_seen[run_id]
+        if run_id not in self._watch_opened:
+            self._watch_opened.add(run_id)
+            _watch.prime(events, seen)
+            await self._emit(
+                thread_id,
+                self._build_refusal_message(_watch_opening(run_id, snapshot)),
+            )
+            # No early return: a run that is already over still gets its
+            # closing report, and a run that is already in trouble still
+            # raises on this very poll.
+        status = str(snapshot.get("status") or "")
+        jobs = _watch.boundaries(events, seen)
+        if status in TERMINAL_STATUSES:
+            # Once per run: the follower re-enters this loop for lane repair
+            # and review offers, and the same terminal poll would otherwise
+            # close the run again every time.
+            if run_id not in self._watch_closed:
+                self._watch_closed.add(run_id)
+                await self._emit(
+                    thread_id,
+                    self._build_refusal_message(
+                        _watch_closing(run_id, status, jobs, snapshot)
+                    ),
+                )
+                await self._narrate(
+                    thread_id, run_id,
+                    _watch_closing_prompt(run_id, status, jobs, snapshot),
+                )
+            return
+        for job in jobs:
+            await self._narrate(
+                thread_id, run_id, _watch_boundary_prompt(run_id, job, snapshot)
+            )
+        if jobs:
+            # A boundary after a close means the run resumed (lane repair):
+            # its next end is a new ending worth reporting.
+            self._watch_closed.discard(run_id)
+        node = _watch.current_node(events)
+        if node is None:
+            return
+        signals = self._watch_signals.setdefault(run_id, set())
+        raised = _watch.judge(
+            _watch.sample(
+                self._home_for(run_id) / "runs" / run_id,
+                run_id=run_id,
+                node_id=node["node_id"],
+                node_type=node["node_type"],
+                started_at=node["started_at"],
+            )
+        )
+        # Only a signal kind not already raised on this node speaks: a stall
+        # that lasts an hour is one alert, not sixty.
+        fresh = [s for s in raised if _watch.signal_key(node["node_id"], s) not in signals]
+        if not fresh:
+            return
+        for signal in fresh:
+            signals.add(_watch.signal_key(node["node_id"], signal))
+        await self._narrate(
+            thread_id, run_id, _watch_trouble_prompt(run_id, node, fresh, snapshot)
+        )
+
+    async def _narrate(self, thread_id: str, run_id: str, instruction: str) -> None:
+        """Spend one orchestrator turn narrating, on the thread's conversation.
+
+        The turn resumes the thread's stored claude session, so the narration
+        has the same context as the user's own turns and reads as one voice —
+        and so the cost is a resume, not a fresh context per boundary.
+
+        Two guards, both about the ONE conversation this thread shares:
+
+        * a user turn already in flight (``_orchestrator_tasks``) wins — the
+          narration is dropped rather than racing it for the session id;
+        * the narration registers itself there too, so two narrations cannot
+          overlap either.
+
+        A narration turn is awaited, not fired and forgotten: the boundaries
+        must reach the user in the order they happened, and two concurrent
+        ``--resume`` calls on one claude session would diverge the history.
+        The cost of that ordering is that the poll pauses for the length of a
+        turn; a stage boundary landing mid-narration is narrated on the next
+        poll instead of losing its place.
+        """
+        from mini_ork.acp_orchestrator import watch as _watch
+
+        if thread_id in self._orchestrator_tasks:
+            return
+        if self._watch_turns.get(run_id, 0) >= _watch.narration_budget():
+            return
+        cfg = self._thread_config.get(thread_id) or {}
+        lane = str(cfg.get("model") or "opus")
+        home = self._home_for(thread_id)
+        cwd = self._sessions.get(thread_id) or os.getcwd()
+        turn = self._orchestrator_turn or self._default_orchestrator_turn
+
+        async def on_event(event: dict[str, Any]) -> None:
+            for update in _orchestration.map_event(event):
+                await self._emit(thread_id, update)
+
+        async def _run() -> Any:
+            kwargs: dict[str, Any] = {}
+            if turn is self._default_orchestrator_turn:
+                kwargs["workspace_mode"] = str(
+                    cfg.get("workspace") or _WORKSPACE_WORKTREE
+                )
+                kwargs["thread_id"] = thread_id
+            return await turn(
+                lane=lane,
+                prompt=instruction,
+                cwd=Path(cwd),
+                home=home,
+                resume=str(cfg.get("claude_session_id") or "") or None,
+                on_event=on_event,
+                **kwargs,
+            )
+
+        task = asyncio.create_task(_run())
+        self._orchestrator_tasks[thread_id] = task
+        self._watch_turns[run_id] = self._watch_turns.get(run_id, 0) + 1
+        try:
+            result = await task
+        except asyncio.CancelledError:
+            return
+        finally:
+            self._orchestrator_tasks.pop(thread_id, None)
+        if result is None:
+            return
+        new_session_id = getattr(result, "session_id", None)
+        if isinstance(new_session_id, str) and new_session_id:
+            if cfg.get("claude_session_id") != new_session_id:
+                self._record(thread_id, {"type": "claude_session", "id": new_session_id})
+            cfg["claude_session_id"] = new_session_id
+        costs = self._thread_costs.setdefault(thread_id, {})
+        costs["orchestrator"] = costs.get("orchestrator", 0.0) + float(
+            getattr(result, "cost_usd", 0.0) or 0.0
+        )
+        await self._emit(thread_id, self._thread_usage_update(thread_id))
 
     # ── launch/read/stop seams (deferred imports keep the module light) ──────
 

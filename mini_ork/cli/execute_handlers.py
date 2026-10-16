@@ -41,9 +41,8 @@ from mini_ork.runtime.run_roots import (
 )
 from mini_ork.verify import levels as _levels
 from mini_ork.cli.main import _module_env, _reflect_timeout_seconds
-from mini_ork.acp import node_status
+from mini_ork.observability.heartbeat import Heartbeat
 from mini_ork.observability.node_events import _now_ms, mo_node_emit, mo_node_end, mo_node_start
-from mini_ork.orchestration import run_buddy
 from mini_ork.execute_compat import (
     ARTIFACT_COMPLETION_LOG,
     declared_artifacts_ok,
@@ -895,22 +894,19 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     mo_node_start(run_id, node_id, node_type, model_lane=lane, db=db,
                   placement=placement, node_host=node_host, session_id=session_id)
     node_start_ms[node_id] = _now_ms()
-    # Run buddy (MO_BUDDY, off by default): a watchdog on the node currently
-    # running, so a stage that stalls, repeats one error, overruns its time or
-    # its cost is noticed while it is still running — not after it dies. The
-    # whole point is that a node is a *blocking in-process* call (verifiers park
-    # in run_check's Popen, agent lanes park in dispatch.core), so this thread
-    # is the only thing alive for the window that matters. It writes files
-    # under <run_dir>/buddy/ and never the DB, so it cannot contend with the
-    # run's own writers, and every entry point swallows its own errors: a
-    # broken buddy must never fail a node. ``home`` is the run dir's
-    # grandparent for the same reason retry_notify computes it that way —
-    # a real run dir IS <home>/runs/<run_id>.
-    _buddy_home = os.path.dirname(os.path.dirname(run_dir_eff))
-    _buddy_started = node_start_ms[node_id] / 1000.0
-    _buddy_watch = run_buddy.Watch(_buddy_home, run_id=run_id, node_id=node_id,
-                                   node_type=node_type, started_at=_buddy_started)
-    _buddy_watch.start()
+    # A node is a *blocking in-process* call (verifiers park in run_check's
+    # Popen, agent lanes park in dispatch.core), so for the whole window it runs
+    # nothing else here is awake to say the run is still alive. This ticker
+    # emits ``node_heartbeat`` rows — what the reaper's ``_last_activity``, the
+    # run card's ``beat`` and fleet's active-run filter all read, and starved
+    # for while nothing emitted them. It is also the only signal a *hung* node
+    # produces, which is what makes a stall noticeable now that the buddy is
+    # gone. One INSERT per interval and nothing else: no model call, no file
+    # writes, every failure swallowed, because observability must never fail a
+    # node. ``db`` is the handle this function already holds rather than an
+    # env re-resolution — see mini_ork/observability/heartbeat.py.
+    _heartbeat = Heartbeat(run_id, node_id, node_type, db=db)
+    _heartbeat.start()
     # Skills granted to this node are materialized into the checkout it runs in
     # and released when it ends, wrapping exactly the handler call: a grant is
     # scoped to one node, so a skill the reviewer was not granted is simply not
@@ -982,12 +978,12 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         # contract). The old shape released only after the loop, so a
         # raising handler leaked the grant (panel run-1791760519 D1).
         _materialized_skills.release()
-        # The buddy's thread is scoped to the node for the same reason and
-        # covers the same paths. Stopping here (not next to the boundary
-        # report below) is what makes a handler that raises mid-attempt stop
-        # its watcher too; a live thread after the node ended would keep
-        # reporting on a node that is no longer running.
-        _buddy_watch.stop()
+        # The heartbeat's thread is scoped to the node for the same reason and
+        # covers the same paths. Stopping here is what makes a handler that
+        # raises mid-attempt stop its ticker too; a live ticker after the node
+        # ended would keep writing heartbeats for a node that is over, which is
+        # exactly what the reaper reads as "still alive".
+        _heartbeat.stop()
     # F4 — terminal failure: persist an ERROR row so the resume path
     # re-dispatches. Only written when the loop actually exhausted the
     # cap on a retryable failure; a code-shaped rejection that left the
@@ -1025,18 +1021,6 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         mo_node_end(run_id, node_id, node_type,
                     max(0, _now_ms() - started) if started is not None else 0,
                     verdict=ctx.node_verdict, finish_reason=finish_reason, db=db)
-    # The buddy's stage line — written for EVERY node, success or failure, so
-    # the report reads as a story stage by stage instead of a list of alarms.
-    # Whether the stage failed is decided by the same classifier the node card
-    # and the run header use (Part 1), not by a fourth opinion: a node the
-    # header calls CRASH must not be narrated as a success here.
-    _buddy_state, _ = node_status.node_end_state(
-        {"finish_reason": finish_reason, "verdict": ctx.node_verdict})
-    run_buddy.report_boundary(
-        _buddy_home, run_id=run_id, node_id=node_id, node_type=node_type,
-        started_at=_buddy_started,
-        failed=(rc != 0 or _buddy_state == node_status.FAILED),
-    )
     return rc, finish_reason
 
 
