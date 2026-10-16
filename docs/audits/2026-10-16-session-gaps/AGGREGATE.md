@@ -589,3 +589,13 @@ not, no session should be acting on it as the house default.
 `/Volumes/docker-ssd/ps/mini-ork-ui` (clean, same `origin`, same HEAD `9154ef4`). Landing `board.rs`
 or `ide_http.rs` from two checkouts can conflict on push, which is the standing reason **P1#8** (the
 5th `Counts` bucket, which also edits `board.rs`) is held rather than rushed.
+
+**Do not prune this shared checkout while sessions are live.** A fetch now prints *"There are too
+many unreachable loose objects; run 'git prune' to remove them"* and points at `.git/gc.log`. That
+warning is the repository asking for a prune — and with several live sessions working in one
+checkout, unreachable loose objects are exactly what a peer's reflog holds for unpushed or
+pre-rebase work. Pruning now deletes recovery points that are not any single agent's to judge as
+garbage. Deleting `.git/gc.log` is not the safe alternative either: it **re-arms** automatic cleanup
+rather than postponing it. Both are the user's call, taken when sessions are quiescent. Raised by
+`fix-run-graph-edges`, who surfaced it rather than acting — the same judgement as the `:7090`
+restart refusal, applied to an irreversible operation on shared state.
