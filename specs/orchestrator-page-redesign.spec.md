@@ -768,8 +768,24 @@ Stated explicitly, with cost, so a reviewer can decline them knowingly.
       the branch's unit shards were red before it. CI's only *completed* run on `main` is
       the one on `8273e27d` — every earlier push superseded its own predecessor through
       the workflow's concurrency group, so CodeQL's green ticks were never a test verdict.
-      The 3 ACP failures are a separate, older thread; they are not stale-in-the-redesign
-      sense and nothing in this spec explains them.
+      The 3 ACP failures are **not** this spec's work either, and they are the same
+      *shape* of staleness: all three are left over from `fae2a7a5` ("One orchestrator per
+      run, and the run buddy is gone"), which made the orchestrator that owns a run narrate
+      it stage by stage and accumulate its own cost into `_thread_costs["orchestrator"]`
+      (`mini_ork/acp/agent.py:5035`). Each test still asserts the pre-merge arithmetic:
+      `test_thread_usage_is_sent_only_when_the_total_changes` expects the thread's total to
+      be the sum of the run's `cost_usd` alone, and now sees a third update — the
+      orchestrator turn's own 0.0064 on top of the 0.3; `test_child_run_streams_agent_output_into_the_thread`
+      expects `0.75` and sees `1.25`, the same missing term; and
+      `test_slash_run_in_orchestrate_mode_launches_directly` asserts `seen_turn["called"]
+      is False` on the strength of "the orchestrator was NOT invoked (slash command
+      short-circuits)". The routing is still what that test wants — `agent.py:1853` sends
+      `/run ` to `_prompt_thread_direct`, never to the orchestrator — but the run it
+      launches now *has* an orchestrator of its own that narrates it, and the test's fake
+      turn is shared between the two, so the flag flips. Worth a human's eye on that third
+      one before anyone refreshes the expectation: it is the only one of the three where
+      "the fake counts both kinds of turn" and "a `/run` now spends a model turn" produce
+      the same failure, and only the first of those is benign.
 
 ### P1 — Dispatch
 - [x] FR-010 — `board start`: add `start` to `build_parser().choices`; add `--kickoff`, `--set` (append), `--run-id`, `--workspace`, `--init`, `--dry-run`; exempt `start` from `validate`'s run-id rule and require `--kickoff`; implement `_act_start` wrapping `web.control.launch_run`; fail closed on an uninitialised home.
