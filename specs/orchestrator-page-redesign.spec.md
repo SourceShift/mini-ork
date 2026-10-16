@@ -785,10 +785,19 @@ Stated explicitly, with cost, so a reviewer can decline them knowingly.
       short-circuits)". The routing is still what that test wants — `agent.py:1853` sends
       `/run ` to `_prompt_thread_direct`, never to the orchestrator — but the run it
       launches now *has* an orchestrator of its own that narrates it, and the test's fake
-      turn is shared between the two, so the flag flips. Worth a human's eye on that third
-      one before anyone refreshes the expectation: it is the only one of the three where
-      "the fake counts both kinds of turn" and "a `/run` now spends a model turn" produce
-      the same failure, and only the first of those is benign.
+      turn is shared between the two, so the flag flips.
+
+      **Resolved 2026-10-16 by reading the path: the flip is by design, not an accidental
+      extra turn.** `_prompt_thread_direct` ends in `_follow_in_thread` (`agent.py:1991`),
+      and `_narrate_watch` (`agent.py:5821`) narrates *every followed run* — an opening
+      line, two turns per stage, one per tripped signal kind, and one closing report, with
+      `watch.narration_budget()` as the brake. A run that is already terminal on the first
+      poll still gets its closing report on purpose ("a run that is already over still gets
+      its closing report"). So a `/run` run spends narration turns because the owning
+      orchestrator narrates it, which is exactly what `fae2a7a5` set out to do — the third
+      test is stale like the other two, and no lazy fix to this file is hiding a cost bug.
+      Whether `/run` *should* be quiet — the path a user takes to say "just do it" — is a
+      product call, not a defect, and it is the user's to make.
 
 ### P1 — Dispatch
 - [x] FR-010 — `board start`: add `start` to `build_parser().choices`; add `--kickoff`, `--set` (append), `--run-id`, `--workspace`, `--init`, `--dry-run`; exempt `start` from `validate`'s run-id rule and require `--kickoff`; implement `_act_start` wrapping `web.control.launch_run`; fail closed on an uninitialised home.
