@@ -69,6 +69,29 @@ _MAX_KICKOFF_CHARS = 20_000
 _MAX_SLUG_LEN = 48
 
 
+def front_matter_recipe(text: str) -> str | None:
+    """The ``recipe:`` value in a kickoff's YAML front matter, or ``None``.
+
+    A kickoff declares its recipe on a front-matter line; this is the reader
+    both the Orchestrator's kickoff rows and ``board start`` resolve against, so
+    the recipe a row displays and the recipe a start launches cannot disagree.
+
+    Deliberately not a YAML parse: the front matter of a kickoff is a flat block
+    of scalars, and a kickoff with a malformed block must still yield its recipe
+    rather than raising on a page build. Stops at the closing ``---`` so a
+    ``recipe:`` in the kickoff *body* is not mistaken for the declaration.
+    """
+    if not (text or "").startswith("---"):
+        return None
+    for line in text.splitlines()[1:40]:
+        if line.strip() == "---":
+            break
+        key, _, value = line.partition(":")
+        if key.strip() == "recipe" and value.strip():
+            return value.strip().strip("'\"")
+    return None
+
+
 def slug(markdown: str) -> str:
     """A filename-safe slug derived from the kickoff's ``# Title`` line.
 

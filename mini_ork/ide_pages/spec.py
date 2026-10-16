@@ -772,6 +772,24 @@ def guarded(errors: dict[str, str], title: str, build: Callable[[], dict[str, An
     return out if isinstance(out, list) else [out]
 
 
+def errors_callout(errors: dict[str, str]) -> dict[str, Any] | None:
+    """A page's ``errors`` map as one callout, or ``None`` when it is empty.
+
+    Every builder reports a broken source through the shared ``errors`` map, and
+    some of those sources are not a section at all — the run reaper fails before
+    any section is built, so its error lands in the map with nothing on the page
+    to carry it. The payload has always shipped that map for callers reading
+    JSON; this is the half that makes it visible to the person looking at the
+    page. Returns ``None`` rather than an empty section, so a healthy page gains
+    no box.
+    """
+    if not errors:
+        return None
+    return callout("Some things could not be read",
+                   "\n".join(f"- **{k}** — {v}" for k, v in errors.items()),
+                   tone="orange")
+
+
 # ── formatting ─────────────────────────────────────────────────────────────
 
 def money(v: Any) -> str:

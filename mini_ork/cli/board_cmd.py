@@ -18,6 +18,9 @@ truth.
                                       one IDE page as data (mini_ork.ide_pages)
   board checkpoints <run_id>          per-node git checkpoints for a run
   board restore <run_id> <node>       restore a run's worktree to a checkpoint
+  board start --kickoff <path> [--recipe R] [--workspace worktree|in-place]
+              [--set K=V ...] [--run-id ID] [--init] [--dry-run]
+                                      launch a run from a kickoff file, detached
 
 Every section is computed independently: a section that fails comes back
 empty with its error in ``errors`` instead of failing the whole board.
@@ -1023,6 +1026,116 @@ def _act_restore(home: Path, run_id: str, node_id: str, *,
     return result
 
 
+def _home_initialised(home: Path) -> bool:
+    """Whether ``home`` is a mini-ork home rather than a typo.
+
+    The predicate ``MiniOrkClient._is_initialized`` applies: the state database
+    and the task-class config both exist. ``launch_run`` mkdirs the tree it is
+    handed, so without this check a mistyped ``--home`` starts a run against a
+    home that did not exist a second earlier.
+    """
+    return (home / "state.db").is_file() and (home / "config" / "task_classes").is_dir()
+
+
+def _start_env(args) -> tuple[dict[str, str], str]:
+    """``(extra_env, workspace_source)`` for ``board start``.
+
+    ``--set`` and ``--workspace`` are ``mini-ork run``'s own flags, mirrored so
+    a detached launch takes the arguments a foreground run would. ``--workspace``
+    becomes ``MO_WORKSPACE_MODE`` rather than a second mechanism: the child's own
+    resolver already reads that variable, and ``launch_run`` passes the pairs
+    through ``gate_env``, so premium gating is unchanged.
+
+    Raises ``ValueError`` on a malformed ``--set`` — a pair with no ``=`` would
+    otherwise reach the child as a bare environment name.
+    """
+    extra_env: dict[str, str] = {}
+    for pair in args.set_env or []:
+        key, sep, value = str(pair).partition("=")
+        if not sep or not key.strip():
+            raise ValueError(f"--set expects K=V, got {pair!r}")
+        extra_env[key.strip()] = value
+    if args.workspace:
+        extra_env["MO_WORKSPACE_MODE"] = args.workspace
+        return extra_env, "flag"
+    if os.environ.get("MO_WORKSPACE_MODE"):
+        return extra_env, "MO_WORKSPACE_MODE"
+    return extra_env, "default"
+
+
+def _act_start(home: Path, args) -> dict[str, Any]:
+    """Start a run from a kickoff file, detached.
+
+    ``web.control.launch_run`` is the launcher every HTTP route and the ACP agent
+    already use; this is its CLI face, so the IDE can start a run instead of only
+    opening a chat. The launch is detached by construction — ``launch_run``
+    returns once the child is spawned and never waits for the run.
+
+    Refusals carry ``stage: "usage"`` so ``main`` can exit 2 for a mistyped
+    invocation and 1 for a launch the launcher itself rejected.
+    """
+    import secrets
+
+    def refuse(error: str) -> dict[str, Any]:
+        return {"ok": False, "stage": "usage", "error": error}
+
+    kickoff = Path(str(args.kickoff)).expanduser().absolute()
+    if not kickoff.is_file():
+        return refuse(f"kickoff not found: {kickoff}")
+    try:
+        text = kickoff.read_text(encoding="utf-8")
+    except OSError as exc:
+        return refuse(f"could not read kickoff: {exc}")
+
+    if not _home_initialised(home) and not args.init:
+        return refuse(
+            f"{home} is not an initialised mini-ork home; refusing to start a run "
+            "against it. launch_run would create the tree it is given — pass "
+            "--init if creating a home here is genuinely what you want."
+        )
+
+    recipe = (args.recipe or "").strip()
+    recipe_source = "--recipe"
+    if not recipe:
+        from mini_ork import kickoff_lint
+
+        recipe = kickoff_lint.front_matter_recipe(text) or ""
+        recipe_source = "front matter"
+    if not recipe:
+        return refuse(
+            f"no recipe for {kickoff}: pass --recipe, or declare a `recipe:` line "
+            "in the kickoff's front matter"
+        )
+
+    try:
+        extra_env, workspace_source = _start_env(args)
+    except ValueError as exc:
+        return refuse(str(exc))
+
+    run_id = (args.run_id or "").strip() or f"run-{int(time.time())}-{secrets.token_hex(3)}"
+    if args.dry_run:
+        return {
+            "ok": True, "dry_run": True, "spawned": False,
+            "home": str(home), "run_id": run_id,
+            "recipe": recipe, "recipe_source": recipe_source,
+            "workspace": extra_env.get("MO_WORKSPACE_MODE", ""),
+            "workspace_source": workspace_source,
+            "kickoff": str(kickoff),
+            "kickoff_path": str(home / "runs-inbox" / f"{run_id}.md"),
+            "extra_env": sorted(extra_env),
+        }
+
+    from mini_ork.web.control import launch_run
+
+    result: dict[str, Any] = dict(launch_run(home, recipe, text, run_id=run_id,
+                                             extra_env=extra_env))
+    result.setdefault("recipe_source", recipe_source)
+    result.setdefault("kickoff", str(kickoff))
+    if not result.get("ok", True):
+        result["stage"] = "launch"
+    return result
+
+
 def main(rest: list[str], root: str) -> int:
     del root
     parser = build_parser()
@@ -1055,10 +1168,14 @@ def main(rest: list[str], root: str) -> int:
         # keep the pre-kickoff behaviour of exiting 1 silently — touching
         # their stderr output would change behaviour the existing test
         # suite (and other tooling) already expects.
-        if args.verb in ("restore", "checkpoints"):
+        if args.verb in ("restore", "checkpoints", "start"):
             reason = payload.get("reason") or payload.get("error")
             if reason:
                 sys.stderr.write(f"{reason}\n")
+        # A mistyped `board start` is a usage error (2); a launch the launcher
+        # itself rejected is a failure (1). `_act_start` marks which it was.
+        if args.verb == "start" and payload.get("stage") == "usage":
+            return 2
         return 1
     return 0
 
@@ -1096,6 +1213,9 @@ def validate(args) -> str | None:
             return "mini-ork board restore: a run id is required"
         if not args.target:
             return "mini-ork board restore: a node id is required"
+    elif args.verb == "start":
+        if not args.kickoff:
+            return "mini-ork board start: --kickoff <path> is required"
     elif args.verb != "show" and args.verb != "runs" and not args.run_id:
         what = "a page key" if args.verb == "page" else "a run id"
         return f"mini-ork board {args.verb}: {what} is required"
@@ -1162,10 +1282,24 @@ def build_payload(home: Path, args) -> dict[str, Any]:
         payload = _act_checkpoints(home, args.run_id)
     elif args.verb == "restore":
         payload = _act_restore(home, args.run_id, args.target, force=args.force)
+    elif args.verb == "start":
+        payload = _act_start(home, args)
     else:
         payload = act(home, args.verb, args.run_id)
     if reap_errors:
         payload.setdefault("errors", {}).update(reap_errors)
+    # A page records a broken source in ``errors`` and the IDE draws only the
+    # sections — so an error in that map but not on the page is one nobody sees.
+    # The reaper's error is merged just above, after the page was built, which is
+    # why this rides here rather than inside a page module: it is the last point
+    # that holds the whole map.
+    errors = payload.get("errors")
+    if isinstance(errors, dict) and isinstance(payload.get("sections"), list):
+        from mini_ork.ide_pages.spec import errors_callout
+
+        banner = errors_callout(errors)
+        if banner is not None:
+            payload["sections"].append(banner)
     return payload
 
 
@@ -1188,7 +1322,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("verb", nargs="?", default="show",
                         choices=["show", "run", "merge", "discard", "dismiss", "stop", "kill",
                                  "resume", "retry", "gate", "page", "node", "steer", "runs",
-                                 "checkpoints", "restore"])
+                                 "checkpoints", "restore", "start"])
     parser.add_argument("run_id", nargs="?")
     # `gate approve|reject <inbox_id>` puts the action in run_id and the id here;
     # `node <run_id> <node_id>` uses the same slot for the node id (the L464
@@ -1230,6 +1364,20 @@ def build_parser() -> argparse.ArgumentParser:
                         help="retry: pin a lane for the spawned recover "
                              "(repeatable, <alias>=<lane>). Does not imply "
                              "--ack-change/--force.")
+    parser.add_argument("--kickoff", default=None,
+                        help="start: the kickoff markdown to launch")
+    parser.add_argument("--recipe", default=None,
+                        help="start: recipe name (default: the kickoff's front matter)")
+    parser.add_argument("--set", dest="set_env", action="append", default=[],
+                        help="start: K=V passed to the launched run's environment "
+                             "(repeatable; mirrors `mini-ork run --set`)")
+    parser.add_argument("--workspace", default=None, choices=["worktree", "in-place"],
+                        help="start: workspace mode (mirrors `mini-ork run --workspace`)")
+    parser.add_argument("--run-id", default=None,
+                        help="start: the run id to use (default: generated)")
+    parser.add_argument("--init", action="store_true",
+                        help="start: allow launching against a --home that is not yet "
+                             "an initialised mini-ork home")
     parser.add_argument("--query", default=None,
                         help="full-text query for board runs (whitespace ANDed)")
     parser.add_argument("--limit", type=int, default=_RUNS_VERB_DEFAULT_LIMIT,

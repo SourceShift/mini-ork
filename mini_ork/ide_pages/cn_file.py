@@ -551,7 +551,7 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
                 f"`{raw}` resolves outside `{where}` — the page never asks "
                 f"ContextNest about paths it cannot verify against the "
                 f"project root.",
-                tone="warn",
+                tone="orange",
             )],
             errors={},
         )
