@@ -1381,20 +1381,25 @@ def cli_main(argv: list[str] | None = None, *, execute_fn=None) -> int:
         "MINI_ORK_RECIPE": handoff["recipe"] or None,
     }
     # ── The closure must grade the run's own repo, not the operator's cwd ──
-    # Most nodes only ever see ``MO_TARGET_CWD`` because the IMPLEMENTER handler
-    # publishes it (execute_handlers ``publish_env({ENV_TARGET_CWD: target})``)
-    # and, per ``publish_env``'s leak-forever contract, it then stays set for
-    # every later node in the process. A closure that omits the implementer —
-    # ``--strategy verify``, or any verifier-rooted re-run — has nothing to
-    # publish it, so each verifier resolves the repo under test from
-    # ``MO_TARGET_CWD`` else ``MINI_ORK_TARGET_REPO`` else ``MINI_ORK_ROOT``
-    # else ``os.getcwd()``: the operator's directory. framework-edit's
-    # static-check then runs ``git -C <operator cwd> apply --check`` and fails
-    # ``diff-apply-check-clean`` on a diff that is perfectly good
-    # (rp-e3-header-20261015-222115 and rp-e6-graph-focus, 2026-10-16, both
-    # recovered from a neutral cwd and both re-verified green once the target
-    # was right). Recovering from another checkout is worse than failing: the
-    # verifiers would grade that checkout and report the run as passing.
+    # ``MO_TARGET_CWD`` is written by the run *lifecycle* (``cli/main.py``,
+    # beside the workspace resolution) into the process env the executor and its
+    # node subprocesses inherit. ``recover`` never runs that lifecycle — it
+    # enters at the closure root and dispatches ``execute`` directly — so no
+    # recovered run has it, whatever the closure contains: measured 2026-10-16
+    # on the implementer-rooted ``rp-e3-header-v2-20261016-111144`` as well as
+    # the verifier-rooted ``rp-e3-header-20261015-222115``, both recording
+    # ``node-cmd/verifier_static-check.json`` with ``cwd=<worktree>`` and no
+    # ``MO_TARGET_CWD`` (every run the dispatcher launched has it).
+    #
+    # Each verifier then resolves the repo under test from ``MO_TARGET_CWD``
+    # else ``MINI_ORK_TARGET_REPO`` else ``MINI_ORK_ROOT`` else ``os.getcwd()``:
+    # the operator's directory. framework-edit's static-check runs
+    # ``git -C <operator cwd> apply --check`` and fails
+    # ``diff-apply-check-clean`` plus the four checks that depend on it, on a
+    # diff that is perfectly good — which is how three recoveries on 2026-10-16
+    # were each told "the change was judged wrong — it needs a revision".
+    # Recovering from another checkout is worse than failing: the verifiers
+    # would grade that checkout and report the run as passing.
     #
     # An operator-set ``MO_TARGET_CWD`` always wins (the documented lever for
     # re-pointing a run whose worktree was cleaned), and an unresolvable target
