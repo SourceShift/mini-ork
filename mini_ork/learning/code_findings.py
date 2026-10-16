@@ -80,6 +80,72 @@ def _is_receipt(text) -> bool:
     return bool(RECEIPT_RE.search(str(text or "")))
 
 
+# ── note classification (LF-R5 §1) ────────────────────────────────────────────
+# Not every harvested note names a defect. Reviews and verifiers also write
+# receipts (a passing check), harness notes (the run, not the change, failed)
+# and process complaints (the delivery broke a rule). Those were stored and then
+# injected under "Problems reviewers already found in these files", so a node
+# was told to avoid problems that were never problems. classify_note separates
+# them; only ``code`` is stored.
+#
+# The groups below are ordered receipt, harness, process, code — the first group
+# that matches wins, so a string that both reports a check and grumbles about
+# the process lands in the more specific "not a problem" bucket.
+
+# receipt -- a report of a *passing* check: the existing RECEIPT_RE words
+# ("PASS:", "ruff clean", "66 passed", "already applied", ...) plus the
+# framework-edit receipts RECEIPT_RE missed ("Diff inspected and in scope: …",
+# "diff applies cleanly to repo root", "diff-apply-check-clean").
+_RECEIPT_NOTE_RE = re.compile(
+    RECEIPT_RE.pattern
+    + r"|diff inspected|in scope:|applies cleanly|diff-apply-check-clean",
+    re.IGNORECASE,
+)
+
+# harness -- environment / gate / lane infrastructure: the run failed for a
+# reason that is not the change under review ("not the implementation",
+# "to clear the gate", "suite-adequacy", "module availability", "harness",
+# "rc=124", "quota", "rate limit", "usage limit", "lane (died|timed out)").
+_HARNESS_RE = re.compile(
+    r"not the implementation|to clear the gate|suite-adequacy|module availability"
+    r"|\bharness\b|\brc=124\b|\bquota\b|rate limit|usage limit"
+    r"|\blane\b[^.\n]*\b(?:died|timed out)\b",
+    re.IGNORECASE,
+)
+
+# process -- delivery / review-procedure complaints: the change may be fine but
+# the run broke a rule ("pushed to origin/main", "before the review",
+# "review-before-merge", "no approve is possible", "files_changed=[]",
+# "0-byte", "skipped_steps", "confidence 0.0", "merged before").
+_PROCESS_RE = re.compile(
+    r"pushed to origin/main|before the review|review-before-merge"
+    r"|no approve is possible|files_changed=\[\]|0-byte|skipped_steps"
+    r"|confidence 0\.0|merged before",
+    re.IGNORECASE,
+)
+
+_NOTE_CLASSIFIERS = (
+    ("receipt", _RECEIPT_NOTE_RE),
+    ("harness", _HARNESS_RE),
+    ("process", _PROCESS_RE),
+)
+
+
+def classify_note(text) -> str:
+    """Classify a note/issue string (kickoff §1): ``receipt`` | ``harness`` |
+    ``process`` | ``code``.
+
+    First matching group wins, in the order receipt, harness, process; no match
+    → ``code``. Deterministic and pure. ``code`` is the only class that names a
+    real problem in the code under review, so it is the only one stored.
+    """
+    s = str(text or "")
+    for label, rx in _NOTE_CLASSIFIERS:
+        if rx.search(s):
+            return label
+    return "code"
+
+
 # ── categorization ────────────────────────────────────────────────────────────
 # Deterministic keyword map, first match wins. Labels are the kickoff's
 # verbatim; keywords are matched case-insensitively as substrings/regexes.
@@ -151,10 +217,16 @@ def _is_pass(verdict) -> bool:
 
 
 def normalize_severity(severity, verdict=None) -> str:
-    """Normalize a severity token to ``high``/``medium``/``low`` (kickoff §4).
+    """Normalize a severity token to ``high``/``medium``/``low``/``unknown``
+    (kickoff §5).
 
     blocker/blocking/critical/high → high; medium → medium; low/minor/nit →
-    low; missing/unknown → medium when the verdict is not a pass, else low.
+    low; anything else — a missing token, or one we do not recognize — →
+    ``unknown``. A finding that carries no severity of its own is not
+    automatically "medium": that label let every unlabelled note through the
+    default ``MO_CONTEXT_V2_MIN_SEVERITY=medium`` floor (83% of rows), which is
+    what ``unknown`` (rank 0 in ``context_v2._SEVERITY_RANK``) fixes. ``verdict``
+    is accepted for signature compatibility and no longer decides the fallback.
     """
     if severity is not None:
         s = str(severity).strip().lower()
@@ -165,7 +237,7 @@ def normalize_severity(severity, verdict=None) -> str:
                 return "medium"
             if s == "low" or "minor" in s or "nit" in s:
                 return "low"
-    return "medium" if not _is_pass(verdict) else "low"
+    return "unknown"
 
 
 # ── parsing (pure) ────────────────────────────────────────────────────────────
@@ -481,7 +553,12 @@ def _parse_review_raw(text) -> list:
                         findings.extend(_dict_note_findings(item, verdict))
     else:
         findings.extend(_prose_to_findings(text, None))
-    return findings
+    # LF-R5 §2: apply the note classifier to EVERY review finding — prose items,
+    # dict notes and structured ``findings[]`` alike — and keep only the ones
+    # that name a real code problem. A structured process complaint (row 3791's
+    # "pushed to origin/main … before the reviewer node ran") used to bypass the
+    # prose filter entirely because it arrived as a dict.
+    return [f for f in findings if f and classify_note(f.get("issue")) == "code"]
 
 
 def _verifier_failed(obj) -> bool:
@@ -544,10 +621,29 @@ def _first_failed_check(obj):
     return None
 
 
-def _verifier_reason(obj) -> str:
+def _verifier_reason(obj) -> str | None:
     first_failed = _first_failed_check(obj)
     if first_failed:
         return first_failed
+    # A failed verifier that names NO failed check and whose only reasons/notes
+    # are receipts or harness notes has found nothing wrong with the change: the
+    # notes report a passing check ("diff-apply-check-clean: diff applies
+    # cleanly to repo root") or blame the environment. Recording them minted 63
+    # high-severity rows whose issue was the very receipt proving the check
+    # passed (kickoff §3). Return None so `_parse_verifier_raw` stores nothing.
+    # A non-empty reasons/notes list carrying a real problem still falls through
+    # to the joined-text path below; an empty one falls through to the other
+    # keys (``syntax_failures``, ``missing``, …).
+    rn = []
+    for key in ("reasons", "notes"):
+        value = obj.get(key)
+        if isinstance(value, list):
+            rn.extend(_as_text(x) for x in value)
+        elif isinstance(value, str) and value.strip():
+            rn.append(value)
+    rn = [t.strip() for t in ((x or "") for x in rn) if t.strip()]
+    if rn and all(classify_note(t) in ("receipt", "harness") for t in rn):
+        return None
     for key in ("reasons", "notes", "syntax_failures", "missing"):
         value = obj.get(key)
         if isinstance(value, list):
@@ -580,7 +676,11 @@ def _parse_verifier_raw(name, payload) -> list:
     if not _verifier_failed(obj):
         return []
     reason = _verifier_reason(obj)
-    issue = (reason or f"verifier {name} failed")[:_MAX_VERIFIER_REASON]
+    if reason is None:
+        # No named failed check and only receipt/harness notes: the verifier has
+        # not named a problem, so there is nothing to record (kickoff §3).
+        return []
+    issue = reason[:_MAX_VERIFIER_REASON]
     verdict = obj.get("verdict")
     return [
         _make_finding(
@@ -646,6 +746,19 @@ def _run_target_cwd(run_dir):
     return None
 
 
+# Run-artifact basenames (kickoff §4): files the run writes next to the code —
+# verdicts, plans, profiles, reviewer/verifier payloads, the context pack, lens
+# reports, the framework diff and logs. A finding filed under one of these
+# (live 2026-10-07: the top "area" was ``verifier_test.json`` with 49 findings)
+# is not code an engineer owns, so ``normalize_file`` returns None for it.
+_ARTIFACT_BASENAME_RE = re.compile(
+    r"^(?:verdict\.json|plan\.json|run_profile\.json|synthesis\.md"
+    r"|panel-verdict\.json|review-.*\.json|context-.*\.json"
+    r"|implementer[-_]summary\.json|verifier[-_].*\.json|lens-.*\.md"
+    r"|framework-edit\.diff|.*\.log)$"
+)
+
+
 _git_cache: dict[str, set | None] = {}
 
 
@@ -675,11 +788,15 @@ def _git_ls_files(repo) -> set | None:
 
 
 def normalize_file(file, *, repo_root=None, known_paths=None, target_cwd=None):
-    """Normalize a finding's file path (kickoff §5).
+    """Normalize a finding's file path (kickoff §4).
 
     Strips ``./`` and any leading absolute repo/worktree prefix (including the
-    run's ``target_cwd``). A bare filename (``node.py``) is resolved to the
-    unique matching repo path when exactly one matches; otherwise it stays bare.
+    run's ``target_cwd``). Returns ``None`` for a run artifact — a basename the
+    run itself writes (``verdict.json``, ``lens-*.md``, ``framework-edit.diff``,
+    ``*.log``, …) — and for a path that is still absolute after prefix
+    stripping: neither names code an engineer owns. A bare filename (``node.py``)
+    is otherwise resolved to the unique matching repo path when exactly one
+    matches; otherwise it stays bare.
     """
     if not file:
         return None
@@ -688,6 +805,8 @@ def normalize_file(file, *, repo_root=None, known_paths=None, target_cwd=None):
         return None
     f = re.sub(r"^\./", "", f)
     f = _strip_abs_prefix(f, target_cwd)
+    if f.startswith("/") or _ARTIFACT_BASENAME_RE.match(os.path.basename(f)):
+        return None
     if "/" not in f:
         paths = known_paths if known_paths is not None else _git_ls_files(repo_root)
         if paths is not None:
@@ -1087,14 +1206,17 @@ def harvest(home, *, run_ids=None, db=None) -> dict:
 
 
 def prune_receipts(db=None) -> int:
-    """Delete ``code_findings`` rows whose ``issue`` reads as a receipt (§5).
+    """Delete ``code_findings`` rows whose ``issue`` is not ``code`` under the
+    note classifier (kickoff §7).
 
-    The receipt rule stops *new* receipts at the parser, but rows already in the
-    table (harvested before the rule, INSERT OR IGNORE by fingerprint since)
-    linger — pruning is the only way to drop them, which is why the live proof
-    runs prune before rendering. Idempotent: a second call returns 0. Cold-safe
-    like the rest of the write path — a missing DB is a silent no-op, no error.
-    Returns the number of rows deleted.
+    The classifier stops *new* receipts / harness notes / process complaints at
+    the parser, but rows already in the table (harvested before the rule,
+    INSERT OR IGNORE by fingerprint since) linger — pruning is the only way to
+    drop them, which is why the live proof runs prune before rendering. Note it
+    now deletes every non-``code`` row, not just the literal receipts RECEIPT_RE
+    matched. Idempotent: a second call returns 0. Cold-safe like the rest of the
+    write path — a missing DB is a silent no-op, no error. Returns the number of
+    rows deleted.
     """
     con = _open(db)
     if con is None:
@@ -1105,7 +1227,7 @@ def prune_receipts(db=None) -> int:
         except sqlite3.Error as e:
             print(f"  [warn] code_findings: prune failed: {e}", file=sys.stderr)
             return 0
-        ids = [r[0] for r in rows if _is_receipt(r[1])]
+        ids = [r[0] for r in rows if classify_note(r[1]) != "code"]
         if ids:
             con.executemany("DELETE FROM code_findings WHERE id = ?", [(i,) for i in ids])
             con.commit()
@@ -1178,6 +1300,130 @@ def prune_duplicates(db=None) -> int:
             con.close()
         except sqlite3.Error:
             pass
+
+
+def clear_artifact_files(db=None) -> int:
+    """NULL ``file`` on rows filed under a run artifact (kickoff §7).
+
+    The parser stops *new* artifact-file rows (``normalize_file`` returns None
+    for them), but rows already in the table keep the artifact as their file and
+    the "Your code" tab groups by it — ``verdict.json`` was a top area. This
+    clears the path on every such row so those findings fall under no file
+    rather than a fake one. Idempotent: a second call returns 0 (the cleared
+    rows now have ``file = NULL`` and are skipped). Cold-safe and never raises —
+    a missing DB is a silent no-op. Returns the number of rows updated.
+    """
+    con = _open(db)
+    if con is None:
+        return 0
+    try:
+        try:
+            rows = con.execute(
+                "SELECT id, file FROM code_findings WHERE file IS NOT NULL"
+            ).fetchall()
+        except sqlite3.Error as e:
+            print(f"  [warn] code_findings: clear_artifact_files failed: {e}",
+                  file=sys.stderr)
+            return 0
+        # ``known_paths=set()`` keeps the pass hermetic: a bare filename is only
+        # ever an artifact here, never resolved against a live repo.
+        ids = [r[0] for r in rows
+               if normalize_file(r[1], known_paths=set()) is None]
+        if ids:
+            con.executemany(
+                "UPDATE code_findings SET file = NULL WHERE id = ?",
+                [(i,) for i in ids],
+            )
+            con.commit()
+        return len(ids)
+    except sqlite3.Error as e:
+        print(f"  [warn] code_findings: clear_artifact_files failed: {e}",
+              file=sys.stderr)
+        try:
+            con.rollback()
+        except sqlite3.Error:
+            pass
+        return 0
+    finally:
+        try:
+            con.close()
+        except sqlite3.Error:
+            pass
+
+
+def reharvest(home, *, db=None) -> dict:
+    """Re-read every run dir that still exists under ``home/runs`` (kickoff §7).
+
+    For each run dir present on disk this deletes that run's ``code_findings``
+    rows and harvests it again with the current parser, so rows written by an
+    older parser (before the note classifier, the artifact rule or the severity
+    change) are replaced by what the parser would write today. Runs whose dir is
+    gone keep their rows: there is nothing left to re-read, and dropping them
+    would lose data. This is a maintenance command — it is never called
+    automatically (``reflect`` runs only ``prune_receipts`` and
+    ``clear_artifact_files``).
+
+    Returns ``{"runs", "findings", "with_file", "skipped_unparseable", "reason",
+    "home", "db"}`` mirroring :func:`harvest`. Cold-safe and never raises: a
+    missing home, runs dir or DB is a no-op with a ``reason``, and a run that
+    fails mid-way is logged and left for the next pass.
+    """
+    stats = {"runs": 0, "findings": 0, "with_file": 0, "skipped_unparseable": 0,
+             "reason": "ok", "home": home or "", "db": _resolve_db(db) or ""}
+    if not home:
+        stats["reason"] = "no_home"
+        return stats
+    runs_dir = os.path.join(home, "runs")
+    if not os.path.isdir(runs_dir):
+        stats["reason"] = "no_runs_dir"
+        return stats
+    ensure_schema(db)
+    con = _open(db)
+    if con is None:
+        stats["reason"] = "no_db"
+        return stats
+    repo_root = os.environ.get("MINI_ORK_ROOT") or os.getcwd()
+    try:
+        for name in sorted(os.listdir(runs_dir)):
+            run_dir = os.path.join(runs_dir, name)
+            if not os.path.isdir(run_dir):
+                continue
+            # Per-run guard, exactly as in ``harvest``: one malformed dir must
+            # not abort the pass, and the rows it already had are re-read next
+            # time rather than half-deleted.
+            try:
+                con.execute("DELETE FROM code_findings WHERE run_id = ?", (name,))
+                con.execute("DELETE FROM code_findings_runs WHERE run_id = ?",
+                            (name,))
+                con.commit()
+                n, with_file, skipped = _harvest_run(con, name, run_dir, repo_root)
+                con.execute(
+                    "INSERT OR REPLACE INTO code_findings_runs (run_id, harvested_at, n) "
+                    "VALUES (?, ?, ?)",
+                    (name, int(time.time()), n),
+                )
+                con.commit()
+            except Exception as e:  # noqa: BLE001 — fail-soft by contract
+                try:
+                    con.rollback()
+                except sqlite3.Error:
+                    pass
+                print(f"  [warn] code_findings: reharvest {name} failed: {e}",
+                      file=sys.stderr)
+                continue
+            stats["runs"] += 1
+            stats["findings"] += n
+            stats["with_file"] += with_file
+            stats["skipped_unparseable"] += skipped
+    except sqlite3.Error as e:
+        stats["reason"] = "db_error"
+        print(f"  [warn] code_findings: reharvest failed: {e}", file=sys.stderr)
+    finally:
+        try:
+            con.close()
+        except sqlite3.Error:
+            pass
+    return stats
 
 
 # ── read-only queries ─────────────────────────────────────────────────────────
@@ -1405,6 +1651,10 @@ def _print_human(cmd, result) -> None:
         print(f"pruned {result} receipt row(s)")
     elif cmd == "prune-duplicates":
         print(f"pruned {result} duplicate row(s)")
+    elif cmd == "clear-artifact-files":
+        print(f"cleared {result} artifact file path(s)")
+    elif cmd == "reharvest":
+        print(f"reharvested {result['runs']} run(s), {result['findings']} finding(s)")
     else:  # show
         for r in result:
             loc = r["file"] or ""
@@ -1440,6 +1690,10 @@ def main(argv=None) -> int:
                    help="delete harvested receipt notes (check reports, not problems)")
     sub.add_parser("prune-duplicates", parents=[common],
                    help="delete review:verdict rows echoing another review finding")
+    sub.add_parser("clear-artifact-files", parents=[common],
+                   help="NULL the file on findings filed under run artifacts")
+    sub.add_parser("reharvest", parents=[common],
+                   help="re-read every run dir that still exists under home/runs")
 
     args = ap.parse_args(argv)
     home = args.home or os.environ.get("MINI_ORK_HOME") or _DEFAULT_HOME
@@ -1452,6 +1706,10 @@ def main(argv=None) -> int:
         result = prune_receipts(db=args.db)
     elif args.cmd == "prune-duplicates":
         result = prune_duplicates(db=args.db)
+    elif args.cmd == "clear-artifact-files":
+        result = clear_artifact_files(db=args.db)
+    elif args.cmd == "reharvest":
+        result = reharvest(home, db=args.db)
     else:  # show
         result = findings_for(args.path, db=args.db)
 

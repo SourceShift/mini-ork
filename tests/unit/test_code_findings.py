@@ -103,7 +103,8 @@ def test_parse_review_fenced_json_with_prose() -> None:
     findings = code_findings.parse_review(nonpass)
     f = next(f for f in findings if f["file"] == "mini_ork/acp/agent.py")
     assert f["line"] == 1529
-    assert f["severity"] == "medium"
+    # No severity token on the note → ``unknown`` (LF-R5 §5).
+    assert f["severity"] == "unknown"
 
 
 def test_parse_review_prose_bullets() -> None:
@@ -409,9 +410,12 @@ def test_normalize_severity() -> None:
     assert code_findings.normalize_severity("medium") == "medium"
     assert code_findings.normalize_severity("minor") == "low"
     assert code_findings.normalize_severity("nit") == "low"
-    # Missing severity defaults by verdict.
-    assert code_findings.normalize_severity(None, "needs_revision") == "medium"
-    assert code_findings.normalize_severity(None, "APPROVE") == "low"
+    # A missing (or unrecognized) severity is ``unknown``, not a verdict-derived
+    # medium/low: that label let every unlabelled note through the default
+    # context-v2 floor (LF-R5 §5).
+    assert code_findings.normalize_severity(None, "needs_revision") == "unknown"
+    assert code_findings.normalize_severity(None, "APPROVE") == "unknown"
+    assert code_findings.normalize_severity("severe") == "unknown"
 
 
 # ── file normalization ─────────────────────────────────────────────────────────
@@ -439,9 +443,11 @@ def test_normalize_file_strips_target_cwd() -> None:
     assert code_findings.normalize_file(
         "/Users/dev/other-repo/src/app/main.py", known_paths=set(), target_cwd=tc
     ) == "src/app/main.py"
+    # A path that is still absolute after prefix stripping names no file in this
+    # repo → None (LF-R5 §4).
     assert code_findings.normalize_file(
         "/elsewhere/x.py", known_paths=set(), target_cwd=tc
-    ) == "/elsewhere/x.py"
+    ) is None
 
 
 def test_bare_filename_resolves_via_git_ls_files(tmp_path: Path) -> None:

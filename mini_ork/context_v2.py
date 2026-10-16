@@ -41,7 +41,7 @@ import tempfile
 import time
 
 from mini_ork.context import context_env
-from mini_ork.learning import themes
+from mini_ork.learning import code_findings, themes
 from mini_ork.memory.preferences import paths_in_text
 
 MODES = ("off", "shadow", "on")
@@ -53,7 +53,12 @@ PACK_FILENAME = "context-pack.v2.json"
 # the cut is made visible (change 4).
 _VERIFY_CMD_MAX = 2000
 
-_SEVERITY_RANK = {"critical": 5, "blocker": 5, "high": 4, "medium": 3, "low": 2, "info": 1}
+# ``unknown`` (rank 0) is the label ``code_findings.normalize_severity`` gives a
+# finding that carried no severity token. It ranks below every real label, so the
+# default ``MO_CONTEXT_V2_MIN_SEVERITY=medium`` floor excludes it instead of
+# letting the old "medium" fallback pass 83% of rows (LF-R5 §5).
+_SEVERITY_RANK = {"critical": 5, "blocker": 5, "high": 4, "medium": 3, "low": 2,
+                  "info": 1, "unknown": 0}
 _SEVERITY_WORDS_RE = re.compile(
     r"\b(blocker|critical|major|minor|high|medium|low|nit|info|p[0-3])\b[:\s-]*", re.I)
 # A path with a directory (optionally :line[-line]), or a bare file name WITH a
@@ -315,12 +320,20 @@ def kickoff_stem(path: str | None) -> str:
 
 def prior_attempts(kickoff_path: str, *, db: str | None = None,
                    current_run: str | None = None, limit: int = 3) -> list[dict]:
-    """Earlier runs of the same kickoff file, newest first, with their findings."""
+    """Earlier runs of the same kickoff file, newest first, with their findings.
+
+    Each earlier finding is filtered before it is injected (LF-R5 §6): it must
+    clear ``min_severity()`` (so an unlabelled ``unknown`` row is dropped) and
+    its issue must classify as ``code`` under
+    :func:`mini_ork.learning.code_findings.classify_note` (so a receipt, harness
+    note or process complaint is never carried into the next run's prompt).
+    """
     if not kickoff_path:
         return []
     con = _connect_ro(db)
     if con is None:
         return []
+    floor = min_severity()
     out = []
     try:
         stem = kickoff_stem(kickoff_path)
@@ -344,7 +357,12 @@ def prior_attempts(kickoff_path: str, *, db: str | None = None,
                     "WHERE run_id = ? ORDER BY ts DESC LIMIT 20", (r["id"],)).fetchall()
             except sqlite3.Error:
                 found = []
-            ranked = sorted(found, key=lambda f: -_SEVERITY_RANK.get(
+            kept = [
+                f for f in found
+                if _SEVERITY_RANK.get(str(f["severity"] or "").lower(), 0) >= floor
+                and code_findings.classify_note(f["issue"]) == "code"
+            ]
+            ranked = sorted(kept, key=lambda f: -_SEVERITY_RANK.get(
                 str(f["severity"] or "").lower(), 0))[:3]
             out.append({
                 "id": f"p:{r['id']}",

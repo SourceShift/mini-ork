@@ -344,6 +344,24 @@ def main(argv: list[str] | None = None) -> int:
                 sys.stdout.write(
                     f"  [code_findings] pruned {cf_pruned} duplicate(s)\n"
                 )
+            # LF-R5: rows the OLD parser wrote (before the note classifier and
+            # the artifact-file rule) linger because the harvest is
+            # INSERT OR IGNORE by fingerprint. Drop the non-code ones and NULL
+            # the file on rows filed under a run artifact, right after the
+            # duplicate prune and inside the same fail-soft try (a maintenance
+            # failure is as harmless to reflect as a harvest failure). Both stay
+            # quiet unless they actually changed a row. ``reharvest`` is a
+            # manual command and is deliberately NOT run here.
+            cf_receipts = code_findings.prune_receipts(db_path)
+            if cf_receipts > 0:
+                sys.stdout.write(
+                    f"  [code_findings] pruned {cf_receipts} non-code row(s)\n"
+                )
+            cf_artifacts = code_findings.clear_artifact_files(db_path)
+            if cf_artifacts > 0:
+                sys.stdout.write(
+                    f"  [code_findings] cleared {cf_artifacts} artifact file path(s)\n"
+                )
         except Exception as exc:  # a side-channel must never crash reflect
             sys.stderr.write(f"  [code_findings] skipped: {exc}\n")
             cf_stats = None
