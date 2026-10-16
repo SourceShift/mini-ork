@@ -147,7 +147,7 @@ in finding 3 is the same failure seen from the other side.
 | 6 | Artifact transport is a design doc only; node has no home for a recipe-declared `path` | `docs/architecture/artifact-transport.md`; `run_nodes.py:20` | `f5671eaa` G1 |
 | 7 | 6 of 15 SDD epics unimplemented; no IDE page renders any SDD mechanism | SDD paths I2/I4/I6/I7/I8/I9 | `8162bb3f` G1, G2 |
 | 8 | `not_needed` 5th bucket missing from the Rust board `Counts` (+ pin bump) | `mini-ork-ui/src/board.rs` | `f6e1ed90` G4 |
-| 9 | Orchestrator "Armed" over-promises on unwired `_parallel` paths | `execute.py:1163`; run Overview section | `d5471234` G2 — **DELIVERED `0af700ca`** (round 7) |
+| 9 | Orchestrator "Armed" over-promises on unwired `_parallel` paths | `execute.py:1163`; run Overview section | `d5471234` G2 — engine half DELIVERED `0af700ca`; **page half BLOCKED** on a live `run.py` claim (round 8) |
 | 10 | Nine epics ship shadow / default-OFF | `MO_PROBE_VALIDITY=shadow`, etc. | `8162bb3f` G3 |
 | 11 | Lane-health no-ops for native lanes under `MO_LANE_PROBE=0` | pre-run gate | `3e207e26` G3 |
 
@@ -160,7 +160,7 @@ in finding 3 is the same failure seen from the other side.
 | 15 | No stage-report writer: the `<run>/buddy/` feed's writer was removed (`fae2a7a5`), leaving nothing to render | `f6e1ed90` G2 |
 | 16 | Orchestrator section is per-run and `LIMIT 6`; no cross-run view | `d5471234` G4 |
 | 17 | `MO_BUDDY_*` silently ignored after the rename to `MO_WATCH_*` | `f6e1ed90` G3 |
-| 18 | Dead scaffolding / stale worktrees: `_ide-engine`, `author-style-review` + `wt/author-style-review` | `d5471234` G3, `732bb4cc` G4 — **`author-style-review` half DONE**; `_ide-engine` open (round 5) |
+| 18 | Dead scaffolding / stale worktrees: `_ide-engine`, `author-style-review` + `wt/author-style-review` | `d5471234` G3, `732bb4cc` G4 — **DONE, both halves** (round 8) |
 | 19 | Untracked deliverables at risk: `git stash -u` strands run deliverables; 244 KB report + 1.2 MB corpus in gitignored `runs/`; tests live in `/tmp` outside CI | `8162bb3f` G4, `732bb4cc` G2, G3 — **`/tmp`-tests half DELIVERED `effc3881`** (round 5) |
 | 20 | Doc drift: `docs/todos/2026-10-14-failed-runs-48h-triage.md:375-376` says a run "still reads executing"; the DB says `published` | `83e57620` G4 |
 | 21 | Stale plan/record rows: `run-graph-plan` still `pending` while its three children are `completed` and verified | `6881f0ad` G3 — **CLOSED, wrong store** (round 2) |
@@ -733,7 +733,7 @@ been wrong about three times this sweep:
 grep '/verifiers/.*\.py$' | wc -l` → **124**. There is no shared envelope writer to fix once:
 `verify/pm.py` exposes `classify_spawn` and the manager resolvers, and **each verifier builds its own
 `envelope` dict and must set the key itself** (`tier1:165-180` is the whole pattern — `classify_spawn(...)
-or classify_spawn(...) or "code"`). So the sweep is genuinely per-file work, ~123 files, and its stated
+or classify_spawn(...) or "code"`). So the sweep is genuinely per-file work, ~123 files **[C-6: 123 is not the edit count and 124 is not the verifier count — see round 8]**, and its stated
 scope of 31 undercounts even the shell-out subset.
 
 **Why this is P0 and not a nit.** `classify_spawn` is correct, tested, and reachable — and in
@@ -769,7 +769,7 @@ that peer is in.
 least half write the JSON themselves by hand — and `verify/pm.py` deliberately has no envelope
 writer. `git grep -l '_lib' origin/main -- 'recipes/*/verifiers/*.py' | wc -l` → **2**, against a
 single `_lib` module in the whole tree. So **at most 2 of 124 verifiers route through any shared
-library at all.** The consequence is the part that makes this P0 rather than a chore: patched by
+library at all.** **[C-6 — this sentence is FALSE: it is 47 of 117 verifiers, and 124 is *files* (117 verifiers + 7 helpers), not verifiers. See the correction in round 8.]** The consequence is the part that makes this P0 rather than a chore: patched by
 hand, it is 123 independent edits with 123 chances to drift, *and the next verifier anyone writes
 silently rejoins the 123* — which is how the gap reopened after `2f7e4b81` closed its own half.
 
@@ -791,7 +791,7 @@ therefore open-and-unowned, not blocked:** it needs a decision to assign it, not
 unblocking. Recorded here so it is not mistaken for "someone has it".
 
 **One correction to round 6's own scope line.** Round 6 said the sweep is "~123 files"; that is the
-count of *verifiers*, not of *edits*. The measured edit set is the shared writer (1) plus the
+count of *verifiers*, not of *edits* **[C-6: the verifier count is 117; 124 counts files, seven of which are helper libraries — this correction repeated the unit error it was correcting]**. The measured edit set is the shared writer (1) plus the
 call sites that bypass it — 52 printing inline, 122 with no `_lib` reference. Directionally the same
 finding, but the file count was mine and it was not measured.
 
@@ -864,4 +864,89 @@ inferred from two adjacent mechanisms, which is the error class this document ca
 The cheap check is named: commit, then run `make worktree-merge` inside the guard's window and watch
 `.mini-ork/file-reversion-guard.log`. The commit's own verification (31 passed) exercises the script
 in tests, where the guard hook is not installed, so it does not settle this either way.
+
+---
+
+## Delivery — round 8 (P1#9 splits, P2#18 closes, and C-6 retracts round 6's own count)
+
+**P1#9 — the engine half is not the acceptance, and the page half is blocked on another session.**
+`0af700ca` is landed and verified (a run-level `orchestrator.armed` receipt, `mo_run_emit`, a shared
+`_insert_event`; gate 259 passed twice, ruff clean). But the *acceptance* — "an unwired run does not
+render as armed" — is unmet: the predicate and the literal *"Armed — no interventions this run"* live
+**inline in `mini_ork/ide_pages/run.py:1206-1249`**, and that file is held by worktree `rp-e6-land`
+(`wt/rp-e6-land`, session p238) with a staged, uncommitted patch. Verified directly —
+`git status --porcelain mini_ork/ide_pages/run.py` → ` M`, and `git worktree list` shows
+`rp-e6-land 937506bc`. So the row is **engine half delivered, page half blocked on a live owner**, and
+the blocker is another session's unlanded work, which no audit can route around. The fix in waiting,
+recorded so it is reviewable before the claim frees: fetch the receipt **by its own predicate**
+(`event_type = 'orchestrator.armed'`) instead of letting it compete for the parser's `LIMIT 6`
+intervention slots; filter it out of the displayed items so it cannot render as a fake intervention;
+then a genuine three-state branch — off / armed (receipt or activity) / enabled-but-no-wiring-signal,
+the third worded so it does not read as armed. **The existing `except Exception: armed = True` fallback
+is part of the over-promise and goes with it**: an exception is not evidence of arming.
+
+**P2#18 — DONE, both halves, and my round-5 entry was wrong about `_ide-engine`.** Verified rather than
+taken from either report: no `_ide-engine` directory at any `ps/*` path,
+`git rev-parse --verify wt/author-style-review` → *"Needed a single revision"* (the ref is gone), and
+neither appears in `git worktree list`. `mini-ork-df` gave the losslessness receipts — `_ide-engine` was
+a detached HEAD whose three commits are all ancestors of `origin/main`, and
+`git rev-list --count origin/main..wt/author-style-review` → 0 — and the "relaunch against the primary"
+half needed no action, because the live IDE's children already run with cwd `ps/mini-ork` and spawn the
+primary's `bin/mini-ork mcp-context`. **Two sessions reported this item and one was wrong:**
+`mini-ork-84` said the `author-style-review` half was done and `_ide-engine` still open — right on the
+first, wrong on the second. Recorded because it is the third time this sweep that a peer's report and
+the tree disagreed, and **the tree won every time.**
+
+**C-6 — "at most 2 of 124 verifiers route through any shared library" was FALSE, and it was mine.**
+Corrected: **47 of 117 verifiers route through a shared helper.** The unit was wrong as well — 124 is
+*files* under `recipes/*/verifiers/`, of which **117 are verifiers and 7 are helpers** (`basename`
+begins `_`), so every "of 124 verifiers" phrase in round 6 double-counted the seven libraries. Measured:
+
+```
+git ls-tree -r --name-only origin/main recipes/ | grep '^recipes/[^/]*/verifiers/.*\.py$'   → 124 files
+  … basename begins "_"  → 7 helpers        … basename does not begin "_"  → 117 verifiers
+git grep -l '_stage import\|_lib import\|_sdd_common import\|_verdict_merge import' \
+    origin/main -- 'recipes/*/verifiers/*.py' | grep -v '/verifiers/_' | wc -l             → 47
+```
+
+**How it was wrong is the useful part — the method note's class, a sixth time.** I grepped **one name**
+(`_lib`) and reasoned from it to "any shared library": a check that passed while answering a narrower
+question than the one asked. The tell is that a *different guess would have produced a different wrong
+number* — grep `_stage` instead and you get 47, grep `_lib` and you get 2. A check whose answer depends
+on which name you happened to guess was never measuring the property claimed. `mini-ork-84` supplied the
+framing and the alternate names (`_stage.py` ×4, `_sdd_common.py`, `_verdict_merge.py`).
+
+**The fix shape is better than round 6 said, and for a different reason.** The shared writer does not
+need inventing: **four recipes already carry the same `_stage.py`** — author-style, coord-technique,
+rsi-technique, verification-technique — differing only in docstring and lib-path constants (35 diff
+lines between two, no logic divergence). So the write-shape precedent is that template copy-pasted once
+per recipe, **not** `epic-runner/verifiers/_lib.py` (which, as round 6 correctly noted, carries no
+`failure_kind`). **Revised edit set: 7 helpers — of which 4 collapse to 1 template — plus the 70
+verifiers that hand-roll their envelope.** `_sdd_common.py:75-81` and `_verdict_merge.py:79` are already
+closer to correct (both derive `pass` from a predicate, `_sdd_common` has an explicit internal-error
+branch), so they sit nearer a shared writer than the template does.
+
+**And the instance round 6 folded in was described wrongly — in the direction that understates it.**
+Round 6 said author-style's verifiers "emit the same bare `{"verifier": ..., "pass": true}` envelope".
+That is not their mechanism: `git grep -ln 'print(json.dumps' … author-style-imitation-review/verifiers/*.py`
+→ **0**. Their envelope comes from `_stage.py:60`:
+
+```python
+rc = subprocess.run([sys.executable] + argv, check=False).returncode
+if rc != 0:
+    sys.exit(rc)                                            # failure path emits NO envelope
+print('{"verifier":"style-review-%s","pass":true}' % stage)  # success path: a literal, no predicate
+```
+
+A hardcoded literal on success and **silence on failure** — the gap in its strongest form, because on
+the failure path there is no envelope at all for `failure_kind` to live in. A worse instance than the
+one I wrote, in the recipe whose CI was landed the same day.
+
+**Method note, second instance — a silent zero is indistinguishable from a real zero.**
+`mini-ork-84` reported that `git grep -E` is POSIX ERE, does not support `\b`, and its first cut with a
+`\b` pattern returned **0**, "which would have corroborated the wrong number". A pattern that matches
+nothing and a pattern that *cannot* match anything print identically. Same failure as C-5's suppressed
+`2>/dev/null`, one layer down: there the error was discarded, here there was no error to discard.
+**Disposition: before trusting a zero, run a second pattern that should match the same population.**
+It applies to every count in this document.
 
