@@ -23,15 +23,38 @@ git, the engine source, or the state DB.
 | k1b-kickoff-required | `epics add` refuses a missing `--kickoff` | completed | **done** | `mini_ork/cli/epics.py:107-108` |
 | cleanup-tmux-worktrees | Kill idle tmux sessions + clean 2 worktrees | completed | **done** | `tmux ls` shows neither `board-tasks` nor `verify-fixes`; branch `wt/ui-pin-dag-bgclick` removed and `git worktree prune` clean |
 | memory-index | Index pointers for new worktree memories | completed | **done** | `MEMORY.md` lines 4-5 |
-| p240-crate-uncommitted | p240's uncommitted crate edits in the zed submodules | pending | **resolved** | all three UI checkouts (`mini-ork-ui`, `mini-ork/ui`, `zed-.../crates/mini_ork_ui`) report `0 files` dirty |
+| p240-crate-uncommitted | p240's uncommitted crate edits in the zed submodules | pending | **resolved** | at audit time all three UI checkouts reported `0 files` dirty. As of 2026-10-16 21:xx the zed checkout carries 2 dirty files again (`src/board.rs`, `src/ide_http.rs`) — newly identified as in-flight **P0#2** work (the level-1-on-the-fast-path gap: `board.rs` declares `pub const IDE_SPEC: &str = "2"`, `ide_http.rs` sets it per request), **not** p240's edits and **not** the peer's. Attributed by the peer session, not by me; I did not touch them. |
 | primary-main-refresh / engine-main-divergence | Fast-forward the primary's local `main` | pending (stale) | **done** | local `main` == `origin/main`; `git rev-list --left-right --count main...origin/main` → `0 0` (before this session's `63fc80a0`) |
 | rebuild-mini-ork / build-latest-ui | Build the IDE app | in_progress | **running** | `script/mini-ork-build` background task `b51xhv2c1` |
 
 ## (b) Missing features & gaps
 
 1. **The new behaviour is not yet live-smoke-tested.** The crate change is
-   pushed and type-checked, but the IDE binary has to be rebuilt and relaunched
-   before the click can be exercised. Build in flight as of this report.
+   pushed and type-checked. The IDE build landed and the app was relaunched, but
+   the click still could not be exercised, for a structural reason rather than a
+   missing step: the run-page case is a **deliberate no-op on the v1 tab set**,
+   where `dag` is `tabs[0]` and `goto_main_tab()` finds itself already there and
+   early-returns.
+   **The engine-half of the feature IS now verified live** (no GUI, no restart):
+   `GET /ide/page?key=run&arg=run=run-1792064947-000000` returns a `graph` object
+   carrying `edges` — 13 edges for `code-fix`, typed
+   (`depends_on`/`verifies`/`retries`/`escalates_to`), with `feedback: true` on
+   exactly the three `retries` back-edges. So "the engine emits the declared
+   edges" is measured, not inferred from source.
+   **Caveat on the tab-set probe, which I first over-read.** Requesting
+   `spec=1` and `spec=2` on the run page returned the *v1* tab set at both
+   levels. I initially wrote that as "the engine serves v1", which claims more
+   than the evidence supports: the process listening on `:7090` (pid 81516) was
+   started before the spec-level work — the same stale-engine trap this repo
+   records elsewhere — so a v1 answer is equally consistent with the handler
+   code lacking the per-request plumbing and with the running process predating
+   it. Those two are not distinguishable from this probe, and the spec path is
+   additionally split across a *client* half that is still uncommitted
+   (`src/board.rs`'s `IDE_SPEC`). What is safe to say: **on the live process**,
+   both levels answer v1, so the run-page click is unobservable there. What is
+   not safe to say, and is no longer said: that the current code serves v1.
+   The crate's v2 tab set is not in the committed tree — see the concurrent-edit
+   note below.
 2. **`real-graph-reflector-wiring` diverges from the plan — RESOLVED: the
    deviation is documented in-repo, and the doc is correct.** The plan
    (`~/.claude/plans/fluffy-squishing-locket.md`) specifies
@@ -82,6 +105,16 @@ git, the engine source, or the state DB.
   the compiler; `run-graph-plan` (gap 3) — record located in ContextNest, closed
   by task-status emission from the owning session. Neither needs a code change.
 
+## Concurrent edits (state may have moved since)
+
+`mini_ork/ide_pages/run.py` is being edited by another session
+(`p238@zed-mini-ork`) as of 2026-10-16T21:22:26Z, and `mini_ork/web/routes/ide.py`
+was already dirty at audit time. The line numbers cited above for the engine
+half (`run.py:114`, `:868`, `:974`) were stable when read and are the committed
+ones (`1ab7ad14`), but they may drift under that session's work. The live edge
+emission evidence in gap 1 does not depend on them: it came from the running
+engine answering HTTP, not from reading the file.
+
 ## Evidence commands actually run
 
 ```
@@ -93,4 +126,13 @@ MINI_ORK_TEST_CMD='python3.11 -m pytest -q tests/unit/test_ide_pages_run.py test
   make worktree-merge SLUG=ui-pin-dag-bgclick                        # 40 passed, 9ee820c1..63fc80a0
 sqlite3 .mini-ork/state.db "select status,count(*) from epics group by status"
 git -C <each ui checkout> status --porcelain                         # 0 files each
+git log --oneline -S'The reflector is the repair entry point' -- recipes/epic-runner/workflow.yaml
+                                                                     # -> 1ab7ad14, in origin/main
+curl -s 'http://127.0.0.1:7090/ide/page?key=run&arg=run=run-1792064947-000000'
+                                                                     # page.graph.edges = 13 typed edges,
+                                                                     # feedback:true on the 3 retries back-edges
+curl -s 'http://127.0.0.1:7090/ide/page?key=run&arg=run=<id>&spec=2' # v1 tab set returned; see gap 1 caveat
+curl -s 'http://127.0.0.1:7090/api/v1/inbox'                         # located cn-fed07f7… (run-graph-plan):
+                                                                     # ContextNest, not state.db
+git push origin HEAD:main                                            # 16642bc3..0d40fbcc
 ```
