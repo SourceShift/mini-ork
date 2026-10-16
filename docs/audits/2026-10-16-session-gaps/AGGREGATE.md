@@ -1078,3 +1078,91 @@ document that is tip-relative — every "behind", every "N commits since" — is
 rule is the same one the second method note gives for zeros: **name the measurement that would make it
 different.**
 
+---
+
+## Delivery — round 12 (three gaps delivered by a peer; the invented SHA sharpened; and a correction aimed at the wrong document)
+
+**Three delegated gaps are DELIVERED, all verified as ancestors of `origin/main`** (not taken on
+report — `git merge-base --is-ancestor <sha> origin/main` returns 0 for each):
+
+| gap | commit | what it fixes |
+|---|---|---|
+| **P0#1** | `37d39474` | the rubric graded a revived run against the attempt it *replaced* |
+| **P0#3** | `d1c0c871` | `recover --strategy verify` entered at the first verifier, not the hint's failed node |
+| **P2#12** | `f43022ea` | a revive never settled the run's row — stale `ended_at`, un-reconciled `cost_usd` |
+| *(doc)* | `c45b0390` | the session file recording the three SHAs and the cost mechanism |
+
+**P0#1 — the rubric read a dead attempt's leftovers.** `artifact_summary` now retires attempt-scoped
+markers (`NEEDS-CHANGE.md`, `rolled-back.json`, `retry-hint.json`, `retry-gate.json`, `diagnosis.json`,
+`owner.json`) that **predate the newest green run-level verdict**, and *names the omission* instead of
+dropping it silently. The naming matters as much as the retirement: a marker that vanishes without a
+line in the summary is the same failure one layer up. 28 passed; with the suppression neutered the two
+new behavioural tests fail. **This closes the finding this sweep recorded as "the rubric reads the
+superseded attempt's failure markers" — and note the pre-existing tell it explains: `rubric.json` and
+`panel-verdict.json` written after a green revive still said `pass=false`, quoting the dead attempt.**
+
+**P0#3 — the root cause was the entry node, not the checkpoint ledger.** `--strategy verify` resolved its
+entry as `--from-node` *or the first verifier in topological order*, and the hint's own `command` never
+carried `--from-node` — so the recover CLI ignored the answer the hint already held, picked `typecheck`,
+and the closure became `descendants(typecheck)`, which **excludes `test` — its sibling.** That is the
+mechanism behind a symptom this sweep recorded without explaining: every revive re-ran `typecheck` with
+a fresh log while `retry-exhausted/test.attempts.json` kept its old mtime and the reviewer escalated on
+the same stale `rc=77`. The hint's node is now the default entry **for `verify` only** (an explicit
+`--from-node` still wins; a hint naming an unknown node warns instead of refusing). Verified by
+construction — the hint node is in the dispatched closure, and a test asserts
+`MINI_ORK_RECOVERY_FROM == "test"` with `typecheck` absent. Neutered, 2 of 4 fail.
+
+**P2#12 — one cause per half, and both were structural rather than sloppy.** (a) `execute.set_status`
+writes terminal rows with `ended_at = COALESCE(ended_at, ?)` — a *within-attempt* rule (publisher,
+executor and `finalize_passed` can all close one attempt and must not fight over it) that **nothing
+scoped per attempt**, so a revived row kept the dead attempt's end forever; a live status now clears
+`ended_at`/`duration_ms`, which is the invariant `web.control._restore_status` already applied to a
+reopened run. (b) `main._reconcile_run_cost` is the *only* caller of `cost_ledger.reconcile_run_cost`
+and lives in the lifecycle tail a recover never enters, so the revival's spend never reached the row;
+the recover tail now reconciles beside the rubric-prescreen refresh, which is there for the same
+reason. End-to-end through the real `recover` cli_main with a fake executor: `ended_at` advances,
+`duration_ms` recomputes, `cost_usd` 6.725933 → 7.002127. **Explains the recorded symptom exactly —
+"the published row keeps the first attempt's `ended_at`/`cost_usd`".**
+
+**P1.2 (new) — two abstention contracts, and the ledger believes the wrong one.** The recipe-level
+abstention writes `status: "unverified"` and **exits 0** (`recipes/code-fix/verifiers/test.py:1244`
+`emit_unverified`, `return 0` at `:1276`), while the engine's abstain contract is **`ABSTAIN_RC = 3`**
+(`verify/levels.py`). So `_record_step_completion` maps `rc == 0 → succeeded` and **the ledger claims a
+check that never ran.** Verified the `rc == 0` half myself; the mapping is the peer's read.
+**Deliberately not fixed — it is a design call, not a one-liner:** reconciling two abstention
+vocabularies means deciding which is canonical, and P0 4d is the same decision seen from the other
+side (there, nothing *emits* `failure_kind`; here, something emits a *different* abstain signal that
+the reader does not recognise). Both belong to one owner because they are one question.
+
+**`f70f977b`, sharpened — the correction should say it names nothing, not substitute a pair for it.**
+`mini-ork-df` ran four checks and all four fail in the same direction: `git cat-file -t` *"Not a valid
+object name"*, `git rev-parse --verify` no commit, absent from refs/packed-refs/reflogs, `git ls-remote
+| grep` → 0, `git fetch origin f70f977b` → *"couldn't find remote ref"*. So it is not a pruned tip or an
+unfetched one; **the server refuses it by name**, and the only occurrences of the string anywhere are
+inside the two commit messages that cite it. Adopted wording: **no pair exists at `f70f977b`** — the
+measurement it was meant to carry is 8 behind / 3 ahead, taken at `0af700ca`. Substituting a pair
+against an unresolvable SHA would be the fabrication the SHA itself already is.
+
+**The ladder, in the tip-relative form that survives a moving origin** (`rev-list --left-right --count
+<tip>...main`): `0af700ca` → 8 / 3, `19b1b267` → 10 / 3, `d8633608` → 15 / 3. **`ahead` is 3 at every
+rung** — local `main`'s own commits do not move — while `behind` is a reading taken against a tip and
+means nothing without it. This supersedes the single pairs in rounds 9 and 10.
+
+**A correction aimed at the wrong document — recorded, not silently accepted.** `mini-ork-df` corrected
+"your own C-24 rule" and "your C-26 wording" describing a loop of *"a fetch, a rebase, a fast-forward
+check and a push"*. **This document has no C-24 and no C-26** — its corrections are C-1 … C-7 plus
+R11 — and it never described the landed loop as four steps: round 10 already recorded it as
+**`fetch → rebase → push`, three steps, with the gate hoisted out and the push's own exit code as the
+check** (`mini-ork-df`'s own wording, which agrees). So there is nothing here to correct, and the
+correction belongs to whatever document does carry those numbers. **Recorded because refusing a
+correction is as much a part of this sweep as accepting one**: a plausible correction aimed at text you
+do not have is the same shape as C-1/C-3/C-5/C-6 — a claim that *sounds* like it matches, unchecked
+against its own target. The mirror-image discipline: **verify the target before acting on the claim**,
+which is what this session did rather than editing a sentence that does not exist.
+
+**Not a fix, and not this sweep's:** run `1792059337-779` stays operator-blocked on the researcher
+repo's `jest-guard` load refusal (R7 / inbox 38). The three landings above make the *next* revive
+touch the node that actually failed, record its own end/spend, and stop the rubric grading a dead
+attempt — **none of them makes 779 green**, and the peer said so itself rather than implying the
+blocker was cleared.
+
