@@ -1,0 +1,239 @@
+# mini-ork + mini-ork-ui — aggregated session gaps
+
+**Collected:** 2026-10-16 · **Sources:** 10 Claude sessions working on the mini-ork engine,
+the `mini-ork-ui` crate, and the `zed-mini-ork` fork · **Scope:** mini-ork and its UI only
+(other workstreams were explicitly excluded).
+
+Each session self-audited its own assignments — pulling its task list, then re-checking every
+status against git, the engine source, and the state DB, **never against the recorded value**.
+The per-session files sit beside this one; this document is the synthesis.
+
+> **Reading rule — attested vs receipted.** Sessions were asked to separate what they
+> *witnessed this turn* (a command they ran, a ref they resolved) from what they *inherited*
+> from an earlier turn. Where a session flagged a claim as inherited, this aggregate keeps that
+> flag rather than promoting it to fact. Three sessions explicitly say their "tests green" line
+> was not re-run in the audit window (`d5471234` G5, `6881f0ad` G4, `fix-node-status-mismatch`).
+> Treat those as attested.
+
+## Coverage
+
+| session | report | what it owns | committed? |
+|---|---|---|---|
+| `f6e1ed90` (this session) | `f6e1ed90-orchestrator-page-pm.md` | orchestrator rail page PM brief; `not_needed` terminal state; verifier `failure_kind` | untracked |
+| `6881f0ad` | `6881f0ad-zed-ui-dag-click.md` | UI DAG zoom + background-click; crate pins; cn-ui epics | untracked |
+| `8162bb3f` | `8162bb3f-sdd-p2-recovery.md` | SDD P2 recovery / spec-driven delivery completeness | ✅ `beca73ef` |
+| `732bb4cc` | `732bb4cc-author-style-review.md` | author-style-review recipe; deterministic assignment | untracked |
+| `83e57620` | `83e57620-failed-run-triage.md` | 48h failed-run triage; regression fix | untracked |
+| `86880f3c` | `86880f3c-revive-monitor.md` | revive/monitor path; rubric scoring; recovery | ✅ `f3b52c8d` |
+| `d5471234` | `d5471234-orchestrator-always-visible.md` | per-run orchestrator section on the run Overview | ✅ `4c3836c4` (local `main`) |
+| `3e207e26` | `pre-run-lane-health-gate.md` | pre-run lane-health gate | untracked |
+| `f5671eaa` | `f5671eaa-per-node-sandboxes.md` | per-node sandbox isolation + artifact transport | untracked |
+| `da0b8c69` | *(none — relayed inline)* | run-page IA + DAG zoom; crate pin | **plan mode, blocked** |
+
+**Not reported** (messaged, no reply at collection time): the remaining sessions from the sweep.
+The request is idempotent — a late report dropped in this directory is folded in by re-running
+the aggregation.
+
+**Excluded as not unambiguously mini-ork/UI** — reported for transparency, not judged:
+`setup-health-config-hub` (`7464af`), `do` (Branch) (`82a523`).
+
+---
+
+## The cross-cutting findings — read these first
+
+**1. "Declared but never exercised" is the dominant failure shape.**
+Three independent sessions found the same pathology: a mechanism is declared in a contract, a
+design doc, or a spec, and **no run has ever produced it**.
+- `artifact_contract.yaml:27/30/33` declares three cluster artifacts; the deterministic-assignment
+  fix (`0190e322`, on `main`) has **never run end-to-end** — the one successful run's
+  `families.json` and `cluster-assignment.json` are absent and its `clusters.json` is the old
+  model-authored shape (`732bb4cc` G1).
+- `docs/architecture/artifact-transport.md` (`0792dc43`) is a **design + roadmap epic only** —
+  `git log -S artifact_transport -- mini_ork/` has no implementing commit, and the only engine
+  string match is a pointer comment at `remote/providers/run_nodes.py:20`. Artifacts still move by
+  local-worktree relay, so a node has **no home** for a recipe-declared `path` (`f5671eaa` G1).
+- 6 of 15 SDD epics have no implementation at their specified paths (`8162bb3f` G1).
+
+This is the highest-value class to close: the contract says the feature exists, so nothing else
+in the pipeline flags its absence.
+
+**2. Two different objects are both called "the orchestrator."**
+`d5471234` ships the **per-run decision core** (`orchestration/runner_orchestrator.py`) as a row
+on the run's Overview tab. `f6e1ed90` audits the **orchestrator rail page** with 8 tabs
+(`board page orch --tab <t>`). Different objects, one word — the user's "where is the
+orchestrator?" is ambiguous by construction, and the two surfaces will keep being confused until
+they are named apart in the UI.
+
+**3. The gates have blind spots that let real defects through.**
+Each of these was found *after* the defect shipped:
+- **Scoped merge gates cannot catch cross-file test pollution** — the polluter's file passes in
+  isolation; only a broad/combined run exposes it. That is exactly how `83e57620`'s regression
+  G1 shipped.
+- **CI green ticks are head-scoped.** `pre-run-lane-health-gate` verified "CI green" for run
+  `38565292891` at commit `38750445` (9/9 success) — but the *current* heads are red again in
+  `test_acp_agent_py.py` (3 tests) and `test_sdd_e2e_dryrun.py`. Superseded heads read
+  "cancelled," making CI a weak signal on a moving branch.
+- **Lane-health degrades to a no-op for native lanes** (opus/sonnet) under
+  `MO_LANE_PROBE=0` — the exact "opus had no credit" case — and ambient credential-file login is
+  never probed at all, by design (`pre-run-lane-health-gate` G3).
+- **Deleted targets are found at verifier time, not preflight.** Six engine runs
+  ($8.22 / $4.19 / $3.36 / $1.21 / $1.15 / $1.14) each failed one check because `roots.target` was
+  gone (`86880f3c` G5). **Dead lanes fail late too** — kimi 401 and a `deepseek_flash` fallback
+  tail dropped from every chain with no `providers.yaml` entry (`86880f3c` G4).
+
+**4. A revived run carries the previous attempt's residue — in the score and in the record.**
+- **Rubric contamination (a concrete, ready fix):** `artifact_summary`
+  (`gates/rubric_scoring.py:141`, listing at `:166`) hands the grader *every* top-level run-dir
+  file, so a revived run's `NEEDS-CHANGE.md` / `rolled-back.json` from the superseded attempt
+  score it `pass=false` **after a green publish**. Call site `gates/rubric_prescreen.py:570`.
+  `86880f3c` calls this the one concrete engine fix available.
+- **A `recover` re-runs the closure root, not the hint's node.** On `run-1792059337-779`
+  (hint `from_node=test`) the retry re-ran *typecheck* (fresh `verifier_typecheck.log` 23:06:06,
+  rc=0) while `retry-exhausted/test.attempts.json` kept its 13:00:09 mtime — and the reviewer
+  escalated on the **stale rc=77**. Exit 0, a real LLM verdict, the wrong node (`86880f3c` G2,
+  candidate defect, not proven).
+- **Observability:** a revived row keeps the *first* attempt's `ended_at`/`cost_usd`
+  (`779`: `ended_at` 2026-10-15 13:04:07, cost 6.73 after two revives) — `86880f3c` G3.
+
+**5. The UI cannot render what the engine now emits.**
+- The `not_needed` terminal state is **engine-side only** — the Rust client's `Counts`
+  (`mini-ork-ui/src/board.rs`) still has 4 tiles, so the UI cannot *show* a not-needed run
+  (`f6e1ed90` G4).
+- The **serve fast path lacks `MINI_ORK_IDE_SPEC`** (`grep -c` → 0 in `ide_http.rs`, 2 in
+  `board.rs`), so the run page is served at **level 1** (retired v1 tabs DAG/Kickoff/Overview)
+  while the subprocess path serves level 2. Verified live: `curl :7090` returned s1 code
+  `'Detail'` (`da0b8c69` G3). This is the highest-value UI gap.
+- **No IDE page renders any SDD mechanism** (`8162bb3f` G2).
+- The orchestrator's **"Armed" predicate is `enabled()` alone**, but the wiring exists only on
+  the dependency-graph `_parallel` path (`execute.py:1163`). On unwired `_parallel` call sites the
+  layer is *enabled but structurally cannot act*, yet the UI prints "Armed — no interventions this
+  run," implying a choice (`d5471234` G2).
+
+**6. Things land shadow / default-OFF.**
+Nine landed epics ship with their probe disabled (`MO_PROBE_VALIDITY=shadow`, etc.) — `8162bb3f`
+G3. Combined with finding 1, a shipped-but-shadowed feature is indistinguishable from an
+unimplemented one from the outside.
+
+**7. "Verified on a scoped gate" ≠ verified.**
+Named repeatedly: the full `tests/unit` timed out at 48:50 with no result (`6881f0ad` G6);
+`dd15418f` merged on a scoped 328-passed/1-skipped gate, not the suite (`f5671eaa` G3);
+audit turns citing inherited green claims (`d5471234` G5, `6881f0ad` G4). The scoped-gate class
+in finding 3 is the same failure seen from the other side.
+
+---
+
+## Ranked gap list
+
+### P0 — correctness or cost, fix available now
+| # | gap | where | source |
+|---|---|---|---|
+| 1 | Rubric grader ingests superseded attempts' files → green publish scores `pass=false` | `gates/rubric_scoring.py:141,166`; `rubric_prescreen.py:570` | `86880f3c` G1 |
+| 2 | Run page served at level 1 on the serve fast path (retired tabs) while subprocess serves level 2 | `crates/mini_ork_ui/src/ide_http.rs` (no `MINI_ORK_IDE_SPEC`) | `da0b8c69` G3 |
+| 3 | `recover` re-runs the closure root, not the hint's node → escalation on a stale rc | recovery path; evidence in `run-1792059337-779` | `86880f3c` G2 |
+| 4 | Deleted targets + dead lanes discovered at verifier time, not preflight (≈$17 and a blocked `deepseek_flash` tail) | preflight / `providers.yaml` | `86880f3c` G5, G4 |
+
+### P1 — declared but never exercised, or emitted but unrenderable
+| # | gap | where | source |
+|---|---|---|---|
+| 5 | Deterministic-assignment fix never ran end-to-end; 3 declared cluster artifacts never produced | `0190e322`; `artifact_contract.yaml:27,30,33` | `732bb4cc` G1 |
+| 6 | Artifact transport is a design doc only; node has no home for a recipe-declared `path` | `docs/architecture/artifact-transport.md`; `run_nodes.py:20` | `f5671eaa` G1 |
+| 7 | 6 of 15 SDD epics unimplemented; no IDE page renders any SDD mechanism | SDD paths I2/I4/I6/I7/I8/I9 | `8162bb3f` G1, G2 |
+| 8 | `not_needed` 5th bucket missing from the Rust board `Counts` (+ pin bump) | `mini-ork-ui/src/board.rs` | `f6e1ed90` G4 |
+| 9 | Orchestrator "Armed" over-promises on unwired `_parallel` paths | `execute.py:1163`; run Overview section | `d5471234` G2 |
+| 10 | Nine epics ship shadow / default-OFF | `MO_PROBE_VALIDITY=shadow`, etc. | `8162bb3f` G3 |
+| 11 | Lane-health no-ops for native lanes under `MO_LANE_PROBE=0` | pre-run gate | `3e207e26` G3 |
+
+### P2 — hygiene, evidence, and drift
+| # | gap | source |
+|---|---|---|
+| 12 | Revived rows keep the first attempt's `ended_at`/`cost_usd` | `86880f3c` G3 |
+| 13 | Isolation boots N+1 sandboxes (6 for 5 nodes) — disclosed, not a bug, but contradicts "one node per sandbox" | `f5671eaa` G2 |
+| 14 | Epic-runner reflector wired `depends_on` where the plan specified `escalates_to` → wrong runtime semantics | `6881f0ad` G2 |
+| 15 | No stage-report writer: the `<run>/buddy/` feed's writer was removed (`fae2a7a5`), leaving nothing to render | `f6e1ed90` G2 |
+| 16 | Orchestrator section is per-run and `LIMIT 6`; no cross-run view | `d5471234` G4 |
+| 17 | `MO_BUDDY_*` silently ignored after the rename to `MO_WATCH_*` | `f6e1ed90` G3 |
+| 18 | Dead scaffolding / stale worktrees: `_ide-engine`, `author-style-review` + `wt/author-style-review` | `d5471234` G3, `732bb4cc` G4 |
+| 19 | Untracked deliverables at risk: `git stash -u` strands run deliverables; 244 KB report + 1.2 MB corpus in gitignored `runs/`; tests live in `/tmp` outside CI | `8162bb3f` G4, `732bb4cc` G2, G3 |
+| 20 | Doc drift: `docs/todos/2026-10-14-failed-runs-48h-triage.md:375-376` says a run "still reads executing"; the DB says `published` | `83e57620` G4 |
+| 21 | Stale plan/record rows: `run-graph-plan` still `pending` while its three children are `completed` and verified | `6881f0ad` G3 |
+| 22 | Worktree run resolves a bare home → the level-2 spec path is untested there | `da0b8c69` G3 (mechanism) |
+
+### Fully un-started
+- **Linear/Jira integration from the UI** — no code, no branch. Blocked on credentials and on the
+  secure-vs-simple tier decision (`f6e1ed90` G5). The largest un-started item in the original ask.
+- **Run-page IA work** (4 tasks: spec level on the fast path, promote "Why — evidence", collapsed
+  Diagnostics, empty-section vanish + tab badges) — verified 0% implemented, plan file only
+  (`da0b8c69` G4).
+- **`cn-ui-field-map`** — blocked on ContextNest `/field/basins`, which does not exist
+  (`6881f0ad`).
+
+---
+
+## Contradictions found — and how they resolved
+
+**Crate tip `9154ef4` "unpushed" vs "pushed" — RESOLVED: pushed.**
+`da0b8c69` reported (severity: highest) that the superproject `e88610c48e` pins submodule
+`9154ef4` while `git log origin/main..main` in the crate listed it as unpushed, so a fresh clone
+could not check out the pinned sha. Two other reports (`6881f0ad`, `d5471234`) and a **direct
+check in this aggregation** disagree:
+```
+crate origin/main                  → 9154ef4
+crate git log origin/main..main    → (empty)
+submodule checkout log             → 9154ef4, clean
+superproject ls-tree HEAD          → 160000 commit 9154ef4
+```
+The claim was **true when observed and closed** by `6881f0ad`'s push (`0aefe69..9154ef4`) later
+the same day. Not outstanding. The general hazard it names — a peer committing in one crate
+checkout while another commits elsewhere — remains real; `da0b8c69` noted three UI checkouts in
+play.
+
+**`push-ui-919178b7` "stranded" — NON-ISSUE.** `919178b7` is an ancestor of crate HEAD `9154ef4`,
+which is on the crate's `origin/main` and pinned by mini-ork `63fc80a0` (`d5471234`).
+
+**`ff-local-main` "diverged, FF refused" — STALE.** Remote advanced to `63fc80a0`; local `main` is
+0 behind, ≥1 ahead (`d5471234`). The pre-compaction record was superseded.
+
+**`828252928`-run status "still executing" — STALE.** DB returns `published` (`83e57620` G4).
+
+---
+
+## Blocked on the user
+
+**Pixel confirmation (4 sessions, independently, for 4 different surfaces).** No tool call can
+assert a rendered GPUI row; each needs the IDE launched:
+1. Run → Overview: the `Orchestrator — armed` section should sit under "Why? — evidence"
+   (`d5471234`).
+2. The Orchestrator rail entry and its 8 tabs — the CLI half already ran `errors: {}`; the GUI
+   half is the spec's one open `[~]` item (`f6e1ed90` G1).
+3. Click the empty DAG background → returns to the run main page (`6881f0ad`).
+4. Run-page IA + zoom behaviour (`da0b8c69`).
+
+**Push local `main`.** It now carries audit commits from several sessions (`beca73ef`, `f3b52c8d`,
+`4c3836c4`) — not any one session's to push (`d5471234`, `mini-ork-df`).
+
+**Credentials / config.**
+- kimi lane returns 401, making bare `mini-ork validate` exit non-zero (`732bb4cc`, `86880f3c`).
+- `deepseek_flash` fallback tail has no `providers.yaml` entry (`86880f3c` G4).
+
+**Decisions.**
+- Priority among WS-2..WS-11 of the orchestrator-page PM brief (`f6e1ed90`).
+- Linear/Jira credentials **and** the secure-vs-simple tier choice (`f6e1ed90` G5).
+- Remove the leftover `_ide-engine` scaffolding or keep it deliberately (`d5471234` G3).
+- The still-open `ram-sentinel` question (`86880f3c`).
+- Whether the one-line doc fix (P2 #20) is worth a merge cycle (`83e57620`).
+
+## Verified-done (so they are *not* re-opened)
+
+Engine: `2f7e4b81` verifier `failure_kind` abstain (`f6e1ed90`); `d70f94cf` `run_status` /
+`not_needed` (`f6e1ed90`, `86880f3c`); `ae1307d9` orchestrator-page test refresh (`f6e1ed90`);
+`b3c80bb5` + `19e74c72` lane-health gate (`3e207e26`); `8f00468b`, `9ee820c1`, `16f11413`
+revive-path commits (`86880f3c`); `e0e99542`, `59f14447`, `778a0686`, `2d786fec`, `24893d48`,
+`6801221c` failed-run triage (`83e57620`); `dd15418f` per-node isolation (`f5671eaa`);
+`9ff1fea8` + `64251073` orchestrator section (`d5471234`); `0918cf4f` + `f950a3b3`
+author-style-review (`732bb4cc`); `6f60a89c`, `e76c13ab` SDE fixes (`f5671eaa`); `9154ef4` +
+`d00229f` crate DAG work (`6881f0ad`, `da0b8c69`).
+UI: `9154ef4` DAG zoom + background click, `cargo test -p mini_ork_ui --lib` → 46 passed
+(`6881f0ad`); crate pins `63fc80a0` (mini-ork) and `e88610c48e` (zed fork, pushed to `fork`).
+
+**Corrected by its own author, do not list:** `83e57620` retracts its prior F841 / `_wall()`
+gap — `ruff check --select F,E9` is clean and `run.py:831-835` is complete on `origin/main`.
