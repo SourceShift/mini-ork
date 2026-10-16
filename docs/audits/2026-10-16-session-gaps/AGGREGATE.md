@@ -850,7 +850,7 @@ push was rejected as non-fast-forward *while the tree was green and nothing was 
 Two consecutive merges were lost that way in one session, which is the diagnostic detail worth
 keeping: **the failure looked like a conflict and was a stale base.** The fix re-fetches and
 re-rebases after the gate, and re-runs the gate if the rebase moved HEAD (the gated content changed,
-so the old green is not the new green). This is a *finding-closing* landing, not a new gap.
+so the old green is not the new green). This is ~~a finding-closing landing~~ **[C-7: it is not — the remedy moves the race rather than closing it. See round 10.]**
 
 **New interaction risk — recorded as a HYPOTHESIS with its check, deliberately not as a finding.**
 The remedy's `git rebase origin/main` is **the exact local-rebase operation the reversion guard
@@ -974,4 +974,56 @@ third time this sweep that the right action was to halt and surface rather than 
 else's incomplete state. **Recorded as blocked-on-user, unchanged, and explicitly not urgent:** nothing
 is lost while it sits, because each of the landings in rounds 5–8 went through a detached worktree of
 `origin/main` and none of them depended on the primary's local `main`.
+
+---
+
+## Delivery — round 10 (C-7: the push-race remedy reopens the race; and a faithful record of a bad commit message)
+
+**C-7 — round 7 called `9f0c22b2` "a finding-closing landing". It closes nothing; it replaces one race
+window with another of the same length.** The mechanism, verified by reading the landed code rather
+than taken on report: the remedy does `fetch origin main` → `rebase origin/main` → **re-runs the entire
+`MINI_ORK_TEST_CMD` gate** → `push origin HEAD:main`. Rebasing onto a moved base *rewrites HEAD*, which
+is exactly why the re-gate is there — and it is correct to re-gate. But the consequence is that the
+interval between the re-fetch and the push is again a **whole gate**, so any peer landing inside it
+still wins and the push is still rejected as non-fast-forward. The window did not shrink; the re-gate
+restored it. Round 7's error was to read a *mechanism that addresses the stated cause* as a *fix that
+closes the finding* — the reader-side/input-side confusion this document has now catalogued seven times.
+
+**The peer receipt, which I did not reproduce myself and am labelling as such.** `mini-ork-df` lost
+non-fast-forward **after** the fix landed (23:40:25) with the gate narrowed to two test files — a ~30 s
+window — and it checked that the *executing* copy was the patched one before blaming the script:
+`make worktree-merge` runs `scripts/mini_ork_worktree.py` from the **primary working tree**, where the
+file is `M`, and `diff <(git show origin/main:scripts/mini_ork_worktree.py) scripts/mini_ork_worktree.py`
+is empty. I verified that last part myself — the primary's copy is `M` and diff-empty against
+`origin/main`, so the patched script is what ran. **The mechanism check is mine; the empirical loss is
+the peer's receipt, and both point the same way.**
+
+**What actually landed:** a bounded `fetch → rebase → push` **retry loop**, with the gate hoisted out of
+it — it succeeded on attempt 2. The trade the owner now has to make deliberately: gating once and
+re-basing+pushing in a tight loop accepts that the rebase may **combine the branch with new upstream
+commits**, which is the exact risk the re-gate was added to cover. So the choice is
+*re-gate (window stays open, correctness covered)* versus *tight loop (window mostly closed, combined
+content ships ungated)* — and that belongs to whoever owns the script, not to a default.
+
+**My round-7 hypothesis about the reversion guard is superseded, and it should not be left standing.**
+I speculated that the new `git rebase origin/main` might be wedged by the reversion guard's ~60 s
+window. `mini-ork-df`'s finding does not involve the guard at all and is better evidenced: the race
+persists because the re-gate reopens the window, independent of any hook. I am marking my speculation
+as superseded rather than leaving two competing explanations in the document — the guess was mine, it
+was untested, and a second untested explanation only muddies an evidenced one.
+
+**Faithful record of my own bad commit message.** The round-9 commit message states the primary's lag as
+*"8 behind / 3 ahead at origin `f70f977b`"*. **I did not measure that.** The document's line is the
+measured value — **3 ahead / 10 behind, origin `19b1b267`** — computed inside the patch; the number in
+the message was written by hand and is wrong in both figures and in the tip. Pushed history is not
+rewritten, so it stays wrong and this is the correction of record. **The failure is identical in shape
+to C-1/C-3/C-5/C-6: a number from adjacent knowledge instead of from the measurement, published before
+it was checked** — and the only reason it is caught at all is that the same value was *also* computed
+programmatically in the body, which disagreed with the hand-written one.
+
+**Rows 9 and 18 — `mini-ork-df`'s corrections to round 7 were already applied in round 8**, in the
+direction it suggests: row 9 now reads *engine half delivered, page half blocked on the `run.py` claim*,
+and row 18 reads *DONE, both halves*, with the "relaunch needed no action — it was a premise, not a
+finding" detail recorded. Its independently-arrived-at text is recorded here because two sessions
+converging on the same correction is the strongest signal this document has.
 
