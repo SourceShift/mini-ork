@@ -29,6 +29,8 @@ The per-session files sit beside this one; this document is the synthesis.
 | `3e207e26` | `pre-run-lane-health-gate.md` | pre-run lane-health gate | untracked |
 | `f5671eaa` | `f5671eaa-per-node-sandboxes.md` | per-node sandbox isolation + artifact transport | untracked |
 | `da0b8c69` | *(none — relayed inline)* | run-page IA + DAG zoom; crate pin | **plan mode, blocked** |
+| `20a62c45` | `20a62c45-work-intake-delivery.md` | work intake / delivery: Linear, Jira, board, threads, attachments | ✅ `60c00154` |
+| `mini-ork-cb` | `mini-ork-cb.md` | run delivery: green runs that never landed; C1–C27; SDD ratification | untracked |
 
 **Not reported** (messaged, no reply at collection time): the remaining sessions from the sweep.
 The request is idempotent — a late report dropped in this directory is folded in by re-running
@@ -131,6 +133,8 @@ in finding 3 is the same failure seen from the other side.
 | 2 | Run page served at level 1 on the serve fast path (retired tabs) while subprocess serves level 2 | `crates/mini_ork_ui/src/ide_http.rs` (no `MINI_ORK_IDE_SPEC`) | `da0b8c69` G3 |
 | 3 | `recover` re-runs the closure root, not the hint's node → escalation on a stale rc | recovery path; evidence in `run-1792059337-779` | `86880f3c` G2 |
 | 4 | Deleted targets + dead lanes discovered at verifier time, not preflight (≈$17 and a blocked `deepseek_flash` tail) | preflight / `providers.yaml` | `86880f3c` G5, G4 |
+| 4a | **Three green runs never landed** — `rp-e3-header-v2` / `rp-e6-graph-focus` / `rp-e10-artifacts-learnings` carry `verdict.json` `pass:true` and diffs that still apply, yet none is on `main`. A board `done / step=publisher` does **not** imply a commit | `framework-edit`'s deliverable *is* the diff in the run dir | `mini-ork-cb` G1 |
+| 4b | `e3v2` reads `done` on the board but `ide_pages/run_header.py` exists in no commit; `git apply --check` fails at `node.py:55` (superseded by `d3b52b38`) — needs a surgical re-apply, not a plain apply | run dir; `node.py:55` | `mini-ork-cb` G2 |
 
 ### P1 — declared but never exercised, or emitted but unrenderable
 | # | gap | where | source |
@@ -159,8 +163,8 @@ in finding 3 is the same failure seen from the other side.
 | 22 | Worktree run resolves a bare home → the level-2 spec path is untested there | `da0b8c69` G3 (mechanism) |
 
 ### Fully un-started
-- **Linear/Jira integration from the UI** — no code, no branch. Blocked on credentials and on the
-  secure-vs-simple tier decision (`f6e1ed90` G5). The largest un-started item in the original ask.
+- ~~**Linear/Jira integration from the UI** — no code, no branch.~~ **RETRACTED — this was already
+  shipped; see Corrections.** Ten commits on `origin/main` implement it (`20a62c45`).
 - **Run-page IA work** (4 tasks: spec level on the fast path, promote "Why — evidence", collapsed
   Diagnostics, empty-section vanish + tab badges) — verified 0% implemented, plan file only
   (`da0b8c69` G4).
@@ -234,6 +238,59 @@ author-style-review (`732bb4cc`); `6f60a89c`, `e76c13ab` SDE fixes (`f5671eaa`);
 `d00229f` crate DAG work (`6881f0ad`, `da0b8c69`).
 UI: `9154ef4` DAG zoom + background click, `cargo test -p mini_ork_ui --lib` → 46 passed
 (`6881f0ad`); crate pins `63fc80a0` (mini-ork) and `e88610c48e` (zed fork, pushed to `fork`).
+Intake / integrations: `4379ff03` (Linear), `8448f6bc` (Jira), `d28c2b0f` + `da2d3834` (board),
+`f4d5bb75` + `012d3fe9` (attachments), `1be093e8` (write-back), `d29b632b` (report-back),
+`991a8f59` (Slack), `7d09f02c` (Discord) — every one an ancestor of `origin/main` (`20a62c45`).
 
 **Corrected by its own author, do not list:** `83e57620` retracts its prior F841 / `_wall()`
 gap — `ruff check --select F,E9` is clean and `run.py:831-835` is complete on `origin/main`.
+
+---
+
+## Corrections to this document
+
+**C-1 — The "Linear/Jira un-started" claim was FALSE. Retracted.**
+I wrote it from an earlier grep that returned nothing and stated it as verified. The code had
+already shipped. Re-verified by `git merge-base --is-ancestor` on all ten commits (now listed under
+Verified-done); `20a62c45` caught it. This is precisely the failure class the aggregate's own §7
+warns about — I asserted a *negative* from one search instead of a *positive* check. The corrected
+"Fully un-started" list is now just: run-page IA (`da0b8c69` G4) and `cn-ui-field-map`.
+
+**C-2 — "local `main` is N ahead" lines are time-stamped, not live.**
+Local `main` moved three times during the sweep (`0abc587d` → `95a4af77` → `60c00154`). Re-measure
+at publication time; do not quote any divergence figure from this document.
+
+## Late additions (reports that arrived after the first pass)
+
+**Delivery integrity — a whole class** (`mini-ork-cb` G1, now P0 #4a): three runs with
+`verdict.json` `pass:true` and diffs that still apply, none on `main`. Root cause: for
+`framework-edit` the deliverable *is* the diff in the run dir, so a green board row never implies a
+commit. Strongest argument for extending the two-tier rule to runs — "done" must mean **landed**,
+not merely **judged**.
+
+**`C1` half-done, `C2`'s bug is silent** (`mini-ork-cb` G4): 0 of 27 implemented. `C1` is *half* —
+`page.rs:564` honours `confirm` but `src/store.rs:476` `perform` does not, so the node inspector
+and flow markers still act unconfirmed. `C2` is hidden: `page.rs:2060-2072` advances `seen_board`
+then reloads only if `may_reload()`, so background/mid-fetch bumps are **dropped, not queued**, and
+activation triggers no reload either.
+
+**SDD operator ratification is prompt-specified and unimplemented** (`mini-ork-cb` G5):
+`prompts/contract-compiler.md:109` reserves `acknowledged:true` to an operator, `spec_card.py:153`
+starts every card `draft`, and nothing writes either. `mini-ork specs` has `ingest|list|lint` only —
+a spec with a real gap parks at `ratification_check` forever; a clean one dispatches with **no human
+ever seeing the compiled contract**. Needs a user decision: option A (operator ratification gate)
+vs B (A + LLM spec-triage at ingest).
+
+**The consolidated board shipped as code but its epic was never written** (`20a62c45` G2): one
+`buckets` map filled by both `_epic_buckets` and `_tickets_into` (`kanban.py:5-6,523,582`, with
+`_fair_share:333`, `_source_actions:499`) — the behaviour is real, the requested artefact is
+missing.
+
+**The pm mirror is empty by design** (`20a62c45` G3): live `.mini-ork/state.db` → `pm_issues: 0`,
+`threads: 3`, every external source `enabled: false`. The board correctly renders "add a source to
+config/pm.yaml". Blocked on the operator, not on code.
+
+**`:7090` serves pre-sync code** (`20a62c45` G4 — corroborates `f6e1ed90` G4 and `da0b8c69` G3):
+listener PID **81516**, started **Oct 15 14:17:53**, older than every shipped commit above. The
+delivered work is invisible in the IDE until an operator restarts. **One restart clears three
+sessions' "not visible in the IDE" reports** — this is the single highest-leverage action available.
