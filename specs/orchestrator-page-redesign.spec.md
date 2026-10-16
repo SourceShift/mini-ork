@@ -768,6 +768,9 @@ Stated explicitly, with cost, so a reviewer can decline them knowingly.
       the branch's unit shards were red before it. CI's only *completed* run on `main` is
       the one on `8273e27d` — every earlier push superseded its own predecessor through
       the workflow's concurrency group, so CodeQL's green ticks were never a test verdict.
+      Confirmed a second time on `6c221aeb` (a peer session's commit, which carries every
+      commit above as ancestors): the same **11**, name for name, so a future reader can
+      take the list above as the pre-existing baseline instead of re-deriving it.
       The 3 ACP failures are **not** this spec's work either, and they are the same
       *shape* of staleness: all three are left over from `fae2a7a5` ("One orchestrator per
       run, and the run buddy is gone"), which made the orchestrator that owns a run narrate
