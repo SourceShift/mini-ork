@@ -19,7 +19,7 @@ git, the engine source, or the state DB.
 | cn-ui epics (16) | Deliver each cn-ui epic through its gate | mixed | **15 done, 1 blocked** | `_queries_/epics` in `/Volumes/docker-ssd/ps/mini-ork/.mini-ork/state.db`: `done 15, blocked 1`; sole non-done = `cn-ui-field-map` |
 | real-graph-engine-edges | Engine emits declared edge list | completed | **done** | `mini_ork/ide_pages/run.py:114` (`edges` field), `:868` (`_graph_edges`), `:974` (`sec["edges"]`) |
 | real-graph-ide-draws-edges | IDE parses + draws typed/directed edges | completed | **done** | `mini_ork-ui/src/graph.rs:210` (`edge_type` parse); feedback/back-edge tests at `:3281`, `:3291` |
-| real-graph-reflector-wiring | Wire epic-runner's reflector | completed | **done, ≠ plan** | `recipes/epic-runner/workflow.yaml:77-79` — shipped as `depends_on`, plan said `escalates_to` |
+| real-graph-reflector-wiring | Wire epic-runner's reflector | completed | **done, ≠ plan — documented** | `recipes/epic-runner/workflow.yaml:77-79` — shipped as `depends_on`, plan said `escalates_to`; rationale in-repo at `:72-76`, re-verified against `mini_ork/workflow/compiler.py:405,498-501` |
 | k1b-kickoff-required | `epics add` refuses a missing `--kickoff` | completed | **done** | `mini_ork/cli/epics.py:107-108` |
 | cleanup-tmux-worktrees | Kill idle tmux sessions + clean 2 worktrees | completed | **done** | `tmux ls` shows neither `board-tasks` nor `verify-fixes`; branch `wt/ui-pin-dag-bgclick` removed and `git worktree prune` clean |
 | memory-index | Index pointers for new worktree memories | completed | **done** | `MEMORY.md` lines 4-5 |
@@ -32,20 +32,32 @@ git, the engine source, or the state DB.
 1. **The new behaviour is not yet live-smoke-tested.** The crate change is
    pushed and type-checked, but the IDE binary has to be rebuilt and relaunched
    before the click can be exercised. Build in flight as of this report.
-2. **`real-graph-reflector-wiring` diverges from the plan.** The plan
+2. **`real-graph-reflector-wiring` diverges from the plan — RESOLVED: the
+   deviation is documented in-repo, and the doc is correct.** The plan
    (`~/.claude/plans/fluffy-squishing-locket.md`) specifies
-   `edge_type: escalates_to` for `epic_verifier → reflector` and
-   `final_reviewer → reflector`; the shipped recipe uses `depends_on`, and only
-   the return edge is `retries, max_rounds: 1`. A `depends_on` into the
-   reflector means it is scheduled on the normal success path, not as a
-   failure escalation — so the drawn graph reads correctly but the runtime
-   semantics are not what the plan intended.
-3. **`run-graph-plan` / `real-graph-*` records contradict each other.** The
-   plan task is still `pending` while all three child tasks are `completed` and
-   verifiably implemented — the plan entry is stale, not the code. `_layers`
-   still skips `retries` edges, which is deliberate (pinned by
-   `tests/unit/test_ide_pages_run_story.py`), so the plan's "not touched" note
-   holds.
+   `edge_type: escalates_to`; the shipped recipe uses `depends_on`
+   (`recipes/epic-runner/workflow.yaml:77-78`, committed in `1ab7ad14`) and
+   carries the rationale at `:72-76`. That rationale was re-verified against
+   the compiler, not taken on trust:
+   `mini_ork/workflow/compiler.py:405` adds a source to `parents[target]`
+   *only* when `not recursive and edge_type not in {"escalates_to", "retries"}`,
+   and ready-ness derives from `control_parents` — so an `escalates_to`-only
+   node would have **no control parents** and be schedulable before anything
+   ran. `:498-501` adds the second half: `escalates_to` becomes a live loop only
+   with a `recursion:` block, which epic-runner lacks. `depends_on` is therefore
+   a real correction to the plan, not a regression. Nothing left to do here.
+3. **`run-graph-plan` / `real-graph-*` records contradict each other —
+   RESOLVED: the record lives in ContextNest, not `state.db`.** The
+   `run-graph-plan` row is ContextNest fragment
+   `cn-fed07f7369f13ad3ad4bb3d9ac049260` (`task_id: run-graph-plan`,
+   `kind: todo`, `session_id: 6881f0ad-…`, emitted `2026-10-16T10:44:07Z`), which
+   is why `sqlite3 .mini-ork/state.db` found nothing — the two stores were being
+   conflated. ContextNest dedupes `tasks[]` by `task_id` and keeps the last
+   status per id, so the stale `pending` is closed by emitting
+   `run-graph-plan: completed` from a later turn of the owning session; no HTTP
+   write and no DB mutation are needed. `_layers` still skips `retries` edges,
+   which is deliberate (pinned by `tests/unit/test_ide_pages_run_story.py`), so
+   the plan's "not touched" note holds.
 4. **`cn-ui-field-map` is blocked**, not delivered: it needs ContextNest
    `/field/basins`, which does not exist yet.
 5. **Six pre-existing unit failures** (acp / config-seam / inbox / learning)
@@ -65,8 +77,10 @@ git, the engine source, or the state DB.
 - **Operator:** file the 6 drafted ContextNest prerequisite issues
   (`cn-ui.mo/contextnest-issue-drafts.md`) — awaiting explicit approval.
 - **Upstream:** ContextNest `/field/basins` for `cn-ui-field-map`.
-- **Another session:** the epic-runner reflector's runtime semantics (gap 2) if
-  `escalates_to` was the intent — that is a recipe change, not a crate change.
+- **Closed since first issue:** the epic-runner reflector's runtime semantics
+  (gap 2) — the deviation is documented in-repo and the doc checks out against
+  the compiler; `run-graph-plan` (gap 3) — record located in ContextNest, closed
+  by task-status emission from the owning session. Neither needs a code change.
 
 ## Evidence commands actually run
 
