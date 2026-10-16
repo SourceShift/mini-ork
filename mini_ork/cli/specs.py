@@ -27,7 +27,20 @@ import sys
 from pathlib import Path
 
 from mini_ork.specdir.index import INDEX_FILENAME, SpecIndexError, build_index, read_index, write_index
-from mini_ork.specdir.lint import Finding, has_errors, scan_and_lint
+from mini_ork.specdir.lint import Finding, SEVERITY, has_errors, scan_and_lint
+
+
+def _codes_line() -> str:
+    """Derive the Codes line from SEVERITY so the help cannot drift from the checks.
+
+    It was a literal, and it fell behind the moment a code was added. The whole
+    class of defect this help documents — two readers of one artifact disagreeing
+    because one of them is a hardcoded copy — is what the derivation prevents.
+    """
+    errors = sorted(code for code, severity in SEVERITY.items() if severity == "error")
+    warnings = sorted(code for code, severity in SEVERITY.items() if severity != "error")
+    return f"Codes: {', '.join(errors)} (error); {', '.join(warnings)} (warning)."
+
 
 _USAGE = """Usage: mini-ork specs <subcommand> [args]
 
@@ -43,11 +56,10 @@ _USAGE = """Usage: mini-ork specs <subcommand> [args]
                                {spec_id, code, severity, message}. Exits 1 on
                                any error-severity finding.
 
-Codes: NO_ACCEPTANCE, DUP_ID, DEP_CYCLE (error); NO_VERIFY_CMD,
-VAGUE_CRITERIA, OVERSIZE, MISSING_SECTIONS (warning).
+__CODES__
 Env: MO_SDD_SPEC_GLOB, MO_SDD_MIN_SPECS (default 1), MO_SDD_VAGUE_TERMS
 (comma-separated), MO_SDD_SPEC_MAX_BYTES (default 262144).
-"""
+""".replace("__CODES__", _codes_line())
 
 
 class _Parser(argparse.ArgumentParser):
