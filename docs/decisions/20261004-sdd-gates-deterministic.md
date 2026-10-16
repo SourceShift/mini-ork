@@ -90,3 +90,28 @@ ratification + reclassification already gate.
 - `docs/todos/20261004-specdir-lint-ui-fence-warning.md` — add a lint WARNING
   for specs whose ui-shaped ACs have no `agent-browser` fence and no
   testid+route literals (would have caught r3's 4 ACs at authoring time).
+
+## Addendum 2026-10-16 — the "lint requires ≥1 fence per SPEC" premise was false
+
+The Options section and the Maintainer note above both rest on "lint requires
+≥1 fence per SPEC". It did not. `NO_VERIFY_CMD` is satisfied by an *inline*
+`` `command args` `` span (`mini_ork/specdir/lint.py`), so a spec with
+acceptance criteria, no fence at all, and one backticked command linted clean.
+
+Measured: both 2026-10-16 run-initiation corpora — 5 specs, 36 ACs, zero fences
+— reported `lint clean (0 warning(s))` while `gates-materialize` built zero
+probes and failed with one `NO_EXECUTABLE_FENCE` per AC. The
+reflector→replanner loop cannot converge on that: it mutates SpecCard
+`acceptance[].gate.probe`, which `gates-materialize` ignores, rebuilding from
+the spec's fences every iteration. Two runs died on it; one was stopped
+mid-loop (round 2 of 6) rather than left to burn to the iteration cap.
+
+Landed `e13b67f2`: a `NO_EXECUTABLE_FENCE` WARNING that fires only when a spec
+has ≥1 acceptance criterion and no shell fence with a body. Narrower than the
+risk accepted above (that was about *per-AC* fence coverage): it enforces the
+≥1-fence-per-spec rule this record believed was already enforced. Warning, not
+error, so no existing corpus changes its `has_errors` result.
+
+Still open: the per-AC gap is unchanged — a spec with one fence and nine ACs
+still yields nine identical whole-spec probes. The follow-up below is unanswered
+and its todo file is not present under `docs/todos/`.
