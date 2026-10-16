@@ -138,7 +138,7 @@ in finding 3 is the same failure seen from the other side.
 | 4a | **Three green runs never landed** — `rp-e3-header-v2` / `rp-e6-graph-focus` / `rp-e10-artifacts-learnings` carry `verdict.json` `pass:true` and diffs that still apply, yet none is on `main`. A board `done / step=publisher` does **not** imply a commit | `framework-edit`'s deliverable *is* the diff in the run dir | `mini-ork-cb` G1 |
 | 4b | `e3v2` reads `done` on the board but `ide_pages/run_header.py` exists in no commit; `git apply --check` fails at `node.py:55` (superseded by `d3b52b38`) — needs a surgical re-apply, not a plain apply | run dir; `node.py:55` | `mini-ork-cb` G2 |
 | 4c | **A verifier whose sidecar omits `verifier` is unreadable**, so the page reports "the cause was not classified" over a verdict sitting on disk | `mini_ork/verify/levels.py` `read_verifier_payload` | `run-page-ux-clarity` G-new (round 3) |
-| 4d | **The abstain mechanism can almost never fire: 123 of 124 verifier scripts never emit `failure_kind`** — the runner is fixed and tested, but nothing in production hands it the input it keys on | `mini_ork/verify/pm.py:182` (`classify_spawn`); `recipes/recursive-validate-impl/verifiers/tier1-compile-typecheck.py:172` | new — round 6 |
+| 4d | **The abstain mechanism can almost never fire: 123 of 124 verifier scripts never emit `failure_kind`** — the runner is fixed and tested, but nothing in production hands it the input it keys on | `mini_ork/verify/pm.py:182` (`classify_spawn`); `recipes/recursive-validate-impl/verifiers/tier1-compile-typecheck.py:172` | new — round 6; fix is **one shared writer, not 123 patches** (addendum below) |
 
 ### P1 — declared but never exercised, or emitted but unrenderable
 | # | gap | where | source |
@@ -761,3 +761,36 @@ still the highest-leverage unfilled slot in the codebase this sweep found.
 (held by a peer), but the mechanism it holds is already landed — so the sweep does not collide with
 that edit, and the sweep touches only `recipes/*/verifiers/*.py` and `verify/pm.py`, neither of which
 that peer is in.
+
+### Round 6, addendum — what P0 4d actually costs, and why it is unowned
+
+**The cause is structural, not 123 oversights.** Each verifier prints its own envelope inline —
+`git grep -l 'print(json.dumps' origin/main -- 'recipes/*/verifiers/*.py' | wc -l` → **52**, so at
+least half write the JSON themselves by hand — and `verify/pm.py` deliberately has no envelope
+writer. `git grep -l '_lib' origin/main -- 'recipes/*/verifiers/*.py' | wc -l` → **2**, against a
+single `_lib` module in the whole tree. So **at most 2 of 124 verifiers route through any shared
+library at all.** The consequence is the part that makes this P0 rather than a chore: patched by
+hand, it is 123 independent edits with 123 chances to drift, *and the next verifier anyone writes
+silently rejoins the 123* — which is how the gap reopened after `2f7e4b81` closed its own half.
+
+**The leverage is a shared envelope writer, and a precedent for the shape already exists.**
+`recipes/epic-runner/verifiers/_lib.py` prints one envelope from a predicate (`"pass": not failed`,
+`:86`) rather than each verifier assembling its own. It does **not** yet carry `failure_kind` — the
+precedent is the writer *shape*, not the abstain key — so closing 4d is one helper gaining
+`failure_kind = classify_spawn(...)` at its shell-out site, plus call-site swaps for the 52 (and, for
+the other 72, whatever they use instead), and every verifier written afterwards inherits it. **The
+sweep's stated scope of "31 shell-out verifiers" undercounts the call sites and misreads the fix as
+per-file.**
+
+**Unowned, and it needs the user's go-ahead — a peer correctly declined to authorise it.**
+`mini-ork-84`, which re-derived every number above independently and supplied the shared-writer
+framing, declined to start it: a multi-file change across 123 files is routed through mini-ork by its
+user's standing instruction, and a peer request cannot authorise it. That is the third refusal this
+sweep and the right one — the same discipline as P1#5's ~2h run and the `:7090` restart. **P0 4d is
+therefore open-and-unowned, not blocked:** it needs a decision to assign it, not a technical
+unblocking. Recorded here so it is not mistaken for "someone has it".
+
+**One correction to round 6's own scope line.** Round 6 said the sweep is "~123 files"; that is the
+count of *verifiers*, not of *edits*. The measured edit set is the shared writer (1) plus the
+call sites that bypass it — 52 printing inline, 122 with no `_lib` reference. Directionally the same
+finding, but the file count was mine and it was not measured.
