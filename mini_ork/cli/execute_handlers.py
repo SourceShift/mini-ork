@@ -215,8 +215,13 @@ def _node_placement(node_type: str, lane: str, run_dir: str) -> tuple[str, str, 
             return "local", "", ""
     node_host = session_id = ""
     try:
-        from mini_ork.runtime.workspace_session import session_marker_path
-        data = json.loads(session_marker_path(run_dir).read_text(encoding="utf-8") or "{}")
+        # The run-level marker when the run shares one sandbox, else the first
+        # per-node one (``MO_NODE_ISOLATION``) — a run with N sandboxes has no
+        # single node host, and reporting the first is the honest "where is the
+        # work running" answer this field is for.
+        from mini_ork.runtime.workspace_session import read_session_marker
+
+        data = read_session_marker(run_dir)
         if isinstance(data, dict):
             session_id = str(data.get("session_id") or "")
             locator = data.get("node") if isinstance(data.get("node"), dict) else {}

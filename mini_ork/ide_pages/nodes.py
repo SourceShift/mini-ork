@@ -21,10 +21,10 @@ from pathlib import Path
 from typing import Any
 
 from mini_ork.ide_pages import spec as S
+from mini_ork.runtime.workspace_session import read_session_marker
 
 TABS = [("nodes", "Nodes"), ("env", "Environments & placement"), ("sandboxes", "Sandboxes")]
 
-_MARKER = ".workspace-session.json"
 _MARKER_SCAN = 120
 _DOCKER_TIMEOUT_S = 0.5
 _SANDBOX_LABEL = "mo.sandbox=1"
@@ -53,18 +53,17 @@ def _rows(home: Path, sql: str, params: tuple = ()) -> list[dict[str, Any]]:
 
 
 def _markers(home: Path) -> list[dict[str, Any]]:
-    """Workspace-session markers of recent runs (``backend``, ``session_id``, ``node``…)."""
+    """Workspace-session markers of recent runs (``backend``, ``session_id``, ``node``…).
+
+    One row per run, from the run-level marker or — for a run whose nodes each
+    got their own sandbox (``MO_NODE_ISOLATION``) — the first per-node one, so a
+    per-node run still shows a node here rather than dropping out of the table.
+    """
     out = []
     for r in _rows(home, "SELECT id, status FROM task_runs ORDER BY created_at DESC, rowid DESC LIMIT ?",
                    (_MARKER_SCAN,)):
-        path = home / "runs" / str(r["id"]) / _MARKER
-        if not path.is_file():
-            continue
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if isinstance(data, dict):
+        data = read_session_marker(home / "runs" / str(r["id"]))
+        if data:
             out.append({**data, "run_id": data.get("run_id") or r["id"], "status": r.get("status")})
     return out
 

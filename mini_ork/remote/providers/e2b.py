@@ -35,6 +35,7 @@ from mini_ork.remote.providers.base import (
     resolve_provider_secret,
 )
 from mini_ork.remote.providers.sandbox_node import (
+    LABEL_NODE,
     LABEL_PROVIDER,
     LABEL_RUN,
     LABEL_SANDBOX,
@@ -204,9 +205,9 @@ class E2BProvider(SandboxNodeProvider):
         return E2BOptions.resolve(profile, env).boot
 
     def spawn_sandbox(self, *, run_id: str, profile: Any,
-                      env: Mapping[str, str]) -> _E2BSandbox:
+                      env: Mapping[str, str], node_id: str = "") -> _E2BSandbox:
         opts = E2BOptions.resolve(profile, env)
-        labels = run_labels(NAME, run_id)
+        labels = run_labels(NAME, run_id, node_id)
         kwargs: dict[str, Any] = {
             "timeout": opts.timeout_s,
             "metadata": labels,
@@ -232,9 +233,18 @@ class E2BProvider(SandboxNodeProvider):
             if not getattr(pages, "has_next", False):
                 return items
 
-    def find_run_sandbox(self, *, run_id: str, env: Mapping[str, str]) -> _E2BSandbox | None:
+    def find_run_sandbox(self, *, run_id: str, env: Mapping[str, str],
+                         node_id: str = "") -> _E2BSandbox | None:
+        # e2b has no name to key on, so its metadata IS the idempotency key.
+        # A per-node lookup must therefore add mo.node to the query: matching on
+        # (provider, run) alone would return a sibling node's sandbox and hand
+        # this node another node's machine — the failure isolation exists to
+        # prevent, arriving as a success.
+        query = {LABEL_PROVIDER: NAME, LABEL_RUN: run_id[:63]}
+        if node_id:
+            query[LABEL_NODE] = node_id[:63]
         try:
-            found = self._query(env, {LABEL_PROVIDER: NAME, LABEL_RUN: run_id[:63]})
+            found = self._query(env, query)
         except ProviderUnavailableError:
             raise
         except Exception as exc:  # noqa: BLE001

@@ -167,7 +167,11 @@ def _run(tmp_path, monkeypatch, node, secrets: str):
     (run_dir / "run_profile.json").write_text(json.dumps(
         {"roots": asdict(resolve_run_roots(str(run_dir), env=os.environ))}))
     assert ex._provision_remote_session(run_id, str(run_dir), None)
-    return run_id, _SESSION_REGISTRY[(run_id, "remote")].workspace
+    # Look the session up by run id rather than by the exact key tuple: the key
+    # gains a node-id element when MO_NODE_ISOLATION is on, and this test is
+    # about which secrets a spawn carries, not about the registry's key shape.
+    key = next(k for k in _SESSION_REGISTRY if k[0] == run_id)
+    return run_id, _SESSION_REGISTRY[key].workspace
 
 
 class _Captured(Exception):

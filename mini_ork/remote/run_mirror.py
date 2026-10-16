@@ -56,6 +56,7 @@ DEFAULT_EXCLUDES: tuple[str, ...] = (
     "*.pid",
     ".stop-requested",
     ".workspace-session.json",
+    ".workspace-session.*.json",  # per-node sessions (MO_NODE_ISOLATION)
     ".remote-sync-state.json",  # epic 15 — the control plane's sync base
     "state.db*",
     "agent-*.live.jsonl",  # epic 09 — pre-skipped, ahead of time

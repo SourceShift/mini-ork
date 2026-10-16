@@ -8,14 +8,23 @@ once. A cloud contributes only a :class:`SandboxHandle` adapter (upload, run,
 start a background process, an endpoint URL + auth headers, delete) and four
 hooks on :class:`SandboxNodeProvider`.
 
+The same machinery serves **per-node** sandboxes: every hook takes an optional
+``node_id``, and a non-empty one makes :func:`sandbox_name` (the cloud
+idempotency key) and :func:`run_labels` carry that node. The isolation itself
+— which node gets which sandbox, and how the run dir records it — lives in
+:mod:`mini_ork.remote.providers.run_nodes`; a provider only has to thread the
+``node_id`` it is handed into the name and the labels, which is why a cloud
+added after this needs no per-node code of its own.
+
 The boot sequence, proven live on Daytona (``docs/architecture/
 cloud-sandbox-providers.md``):
 
 1. find this run's sandbox (a cloud-side idempotency key: a unique name, or
    ``mo.run`` metadata). Revive it when it finished booting and its node-agent
-   answers, else replace it. Never two sandboxes for one run.
+   answers, else replace it. Never two sandboxes for one run — or, per node,
+   for one ``(run, node)`` pair.
 2. create the sandbox, labelled ``mo.sandbox`` / ``mo.provider`` / ``mo.run`` /
-   ``mo.created`` for the TTL sweep.
+   ``mo.created`` (plus ``mo.node`` for a per-node sandbox) for the TTL sweep.
 3. upload ``git archive HEAD`` of the engine into the node-agent's engine store
    (``<state>/engines/<sha>``), so the remote workspace finds that sha in
    ``/v1/health`` and skips its own upload.
@@ -34,6 +43,7 @@ image preparation.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import secrets
@@ -52,6 +62,7 @@ __all__ = [
     "BootOptions",
     "DEFAULT_TTL_MIN",
     "LABEL_CREATED",
+    "LABEL_NODE",
     "LABEL_PROVIDER",
     "LABEL_RUN",
     "LABEL_SANDBOX",
@@ -63,6 +74,7 @@ __all__ = [
     "engine_archive",
     "http_ok",
     "memory_gib",
+    "node_label",
     "run_labels",
     "sandbox_name",
     "start_command",
@@ -75,6 +87,7 @@ LABEL_SANDBOX = "mo.sandbox"
 LABEL_PROVIDER = "mo.provider"
 LABEL_RUN = "mo.run"
 LABEL_CREATED = "mo.created"
+LABEL_NODE = "mo.node"               # per-node sandboxes only
 DEFAULT_TTL_MIN = 360                # = sandbox_reaper.DEFAULT_MAX_AGE_S
 _REVIVE_READY_S = 60.0
 # import name → pip requirement; what the node-agent itself needs to start.
@@ -85,10 +98,31 @@ NODE_AGENT_DEPS = (("fastapi", "fastapi"), ("uvicorn", "uvicorn[standard]"),
 # --- small shared helpers ------------------------------------------------------
 
 
-def sandbox_name(run_id: str) -> str:
-    """A DNS-safe, bounded name for a run's sandbox (a cloud idempotency key)."""
-    slug = re.sub(r"[^a-z0-9-]+", "-", run_id.lower()).strip("-")
-    return f"mo-{slug}"[:63].rstrip("-")
+def sandbox_name(run_id: str, node_id: str = "") -> str:
+    """A DNS-safe, bounded name for a sandbox (a cloud idempotency key).
+
+    With no ``node_id`` this is the run's single sandbox and the result is
+    byte-identical to before per-node sandboxes existed. With one, the name
+    carries the node, so the name alone stays the idempotency key: a lost
+    run-dir record still re-finds this node's sandbox, and two nodes of one run
+    can never converge on each other's sandbox.
+
+    That last clause is why the digest is unconditional on the per-node path.
+    Slugging is lossy — ``implementer:0`` and ``implementer_0`` both collapse to
+    ``implementer-0`` — so a name that is *only* a slug lets one node attach to
+    its sibling's sandbox, which is the failure this naming exists to prevent.
+    The digest is over the full ``run_id--node_id`` seed, so it separates any two
+    distinguishable (run, node) pairs; the slugged head is kept because a human
+    reading a cloud console still needs to recognise the node.
+    """
+    if not node_id:
+        slug = re.sub(r"[^a-z0-9-]+", "-", run_id.lower()).strip("-")
+        return f"mo-{slug}"[:63].rstrip("-")
+    seed = f"{run_id}--{node_id}"
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:8]
+    head_budget = 63 - len("mo-") - len(digest) - 1
+    head = re.sub(r"[^a-z0-9-]+", "-", seed.lower()).strip("-")[:head_budget]
+    return f"mo-{head.rstrip('-')}-{digest}"
 
 
 def memory_gib(raw: Any, *, provider: str = "sandbox") -> int | None:
@@ -112,10 +146,34 @@ def ttl_minutes_default(env: Mapping[str, str]) -> int:
     return max(1, int(max_age) // 60) if max_age.isdigit() else DEFAULT_TTL_MIN
 
 
-def run_labels(provider: str, run_id: str) -> dict[str, str]:
-    """The labels/metadata every mini-ork sandbox carries (GC + idempotency)."""
-    return {LABEL_SANDBOX: "1", LABEL_PROVIDER: provider, LABEL_RUN: run_id[:63],
-            LABEL_CREATED: str(int(time.time()))}
+def run_labels(provider: str, run_id: str, node_id: str = "") -> dict[str, str]:
+    """The labels/metadata every mini-ork sandbox carries (GC + idempotency).
+
+    ``mo.node`` appears only on a per-node sandbox, so a run-level sandbox's
+    labels stay exactly as they were. The GC query matches on ``mo.sandbox`` /
+    ``mo.provider``, so it sweeps per-node sandboxes with no change.
+
+    The node label is mapped through :func:`node_label` rather than passed raw:
+    a node id is not a label-safe string (``implementer:0`` is a real shape) and
+    these labels go straight into a cloud's create call, where an invalid value
+    fails the whole sandbox before it boots. The label is informational — GC
+    matches on the other two — so a plain mapping, with no digest, is the right
+    weight."""
+    labels = {LABEL_SANDBOX: "1", LABEL_PROVIDER: provider, LABEL_RUN: run_id[:63],
+              LABEL_CREATED: str(int(time.time()))}
+    if node_id:
+        labels[LABEL_NODE] = node_label(node_id)
+    return labels
+
+
+def node_label(node_id: str) -> str:
+    """A node id as a cloud label value: the run dir's node spelling, bounded.
+
+    Same character rule as ``safe_node_id`` (``[^A-Za-z0-9._-] -> "_"``) but
+    without its digest — collisions are harmless here because nothing keys on a
+    label, whereas they are not harmless on a path or a sandbox name.
+    """
+    return re.sub(r"[^A-Za-z0-9._-]", "_", node_id.strip())[:63]
 
 
 def http_ok(url: str, headers: Mapping[str, str], timeout: float = 10.0) -> bool:
@@ -255,7 +313,12 @@ class SandboxNodeProvider:
     """A :class:`~mini_ork.remote.providers.base.NodeProvider` over any sandbox cloud.
 
     Subclasses set ``name`` and implement the four hooks; the four NodeProvider
-    verbs (``create`` / ``attach`` / ``release`` / ``reap``) are shared."""
+    verbs (``create`` / ``attach`` / ``release`` / ``reap``) are shared.
+
+    ``create`` and the two lookup hooks take an optional ``node_id``. Empty is
+    the historical one-sandbox-per-run behavior; non-empty asks this cloud for
+    one sandbox per workflow node. The hooks only have to derive the name and
+    the labels from it — the isolation policy is not a provider concern."""
 
     name = ""
     # What the UI shows about this provider without touching the network: a
@@ -272,12 +335,15 @@ class SandboxNodeProvider:
         raise NotImplementedError
 
     def spawn_sandbox(self, *, run_id: str, profile: Any,
-                      env: Mapping[str, str]) -> SandboxHandle:
-        """Create the run's sandbox, labelled with :func:`run_labels`."""
+                      env: Mapping[str, str], node_id: str = "") -> SandboxHandle:
+        """Create this run's (or this node's) sandbox, labelled with
+        :func:`run_labels` and named with :func:`sandbox_name`."""
         raise NotImplementedError
 
-    def find_run_sandbox(self, *, run_id: str, env: Mapping[str, str]) -> SandboxHandle | None:
-        """The run's existing sandbox, if the cloud has one (idempotency)."""
+    def find_run_sandbox(self, *, run_id: str, env: Mapping[str, str],
+                         node_id: str = "") -> SandboxHandle | None:
+        """The existing sandbox for this run (or this node), if the cloud has
+        one — the idempotency half of :func:`sandbox_name`."""
         raise NotImplementedError
 
     def get_sandbox(self, handle: str, env: Mapping[str, str]) -> SandboxHandle | None:
@@ -291,17 +357,19 @@ class SandboxNodeProvider:
     # --- NodeProvider verbs ---------------------------------------------------
 
     def create(self, *, run_id: str, profile: Any, env: Mapping[str, str],
-               engine_root: str) -> NodeEndpoint:
+               engine_root: str, node_id: str = "") -> NodeEndpoint:
         boot = self.boot_options(profile, env)
-        existing = self.find_run_sandbox(run_id=run_id, env=env)
+        existing = self.find_run_sandbox(run_id=run_id, env=env, node_id=node_id)
         if existing is not None:
             # A peer lost the run-dir record, or a restart: reuse a booted,
-            # answering sandbox, else replace it. Never two for one run.
+            # answering sandbox, else replace it. Never two for one run — and
+            # with a node_id, never two for one (run, node).
             node = self._revive(existing, ready_timeout_s=_REVIVE_READY_S)
             if node is not None:
                 return node
             self._quiet_delete(existing, wait=True)
-        sandbox = self.spawn_sandbox(run_id=run_id, profile=profile, env=env)
+        sandbox = self.spawn_sandbox(run_id=run_id, profile=profile, env=env,
+                                     node_id=node_id)
         try:
             return self._boot(sandbox, boot=boot, engine_root=engine_root)
         except BaseException:

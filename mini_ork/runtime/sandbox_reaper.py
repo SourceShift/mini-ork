@@ -60,7 +60,9 @@ DEFAULT_MAX_AGE_S = 6 * 60 * 60  # 6 hours
 
 _DOCKER_BIN = "docker"
 _RUN_LABEL = "mo.sandbox=1"  # mirrors backends/docker.py::_RUN_LABEL
-_SESSION_MARKER = ".workspace-session.json"  # written by workspace_session.py
+# The session-marker NAME and its per-node variants live in
+# ``workspace_session`` (the module that writes them) — this module asks it,
+# rather than keeping a second copy of the naming rule to drift out of sync.
 
 # A TTL sweep: ``fn(*, max_age_s, dry_run) -> list[str]``.
 SweepReaper = Callable[..., list[str]]
@@ -372,7 +374,7 @@ def reap_by_marker(
     *,
     dry_run: bool = False,
 ) -> list[str]:
-    """Reap whatever ``<run_dir>/.workspace-session.json`` records; idempotent.
+    """Reap whatever session markers the run dir holds; idempotent.
 
     Remote-nodes-02 (D2): shortens the leak window for a killed run from the
     6 h TTL to immediate. Best-effort, never raises — a missing marker, an
@@ -383,31 +385,37 @@ def reap_by_marker(
     counterpart consumed by ``control.kill_run`` and the run-end sweep. The
     ``backend`` field selects the hook (:func:`register_marker_reaper`, or a
     lazily imported backend module), which receives the parsed marker and the
-    run dir. The marker is unlinked after the hook runs — and left in place
+    run dir. Each marker is unlinked after its hook runs — and left in place
     under ``dry_run`` — so a subsequent sweep does not re-read it. The TTL
     reaper stays as the safety net for crashes that never wrote the marker.
+
+    A run with per-node sandboxes (``MO_NODE_ISOLATION``) holds one marker per
+    node in addition to the run-level one, so this walks ALL of them. Reaping
+    only the run-level marker would leave every per-node sandbox — and the
+    secrets it was scoped — alive until the TTL: the exact window this function
+    exists to close.
     """
-    marker = Path(run_dir) / _SESSION_MARKER
-    if not marker.is_file():
-        return []
-    try:
-        info = json.loads(marker.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
-    if not isinstance(info, dict):
-        return []
-    hook = _resolve_marker_reaper(str(info.get("backend") or "").strip())
+    from mini_ork.runtime.workspace_session import session_marker_paths
+
     reaped: list[str] = []
-    if hook is not None:
+    for marker in session_marker_paths(run_dir):
         try:
-            reaped = list(hook(info, Path(run_dir), dry_run=dry_run))
-        except Exception:  # noqa: BLE001 — teardown never raises; TTL is the net
-            reaped = []
-    if not dry_run:
-        try:
-            marker.unlink()
-        except OSError:
-            pass
+            info = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(info, dict):
+            continue
+        hook = _resolve_marker_reaper(str(info.get("backend") or "").strip())
+        if hook is not None:
+            try:
+                reaped.extend(hook(info, Path(run_dir), dry_run=dry_run))
+            except Exception:  # noqa: BLE001 — teardown never raises; TTL is the net
+                pass
+        if not dry_run:
+            try:
+                marker.unlink()
+            except OSError:
+                pass
     return reaped
 
 

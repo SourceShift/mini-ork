@@ -72,7 +72,7 @@ def _placement_overlay(home, task_run_id: str, db: StateDB) -> tuple[str, str, s
     the node host from the live session marker, or — once the run has torn its
     session down and the marker is gone — from its ``remote.run.summary``
     event. Empty strings on a default run, so the payload keeps its shape."""
-    from mini_ork.runtime.workspace_session import session_marker_path
+    from mini_ork.runtime.workspace_session import read_session_marker
 
     placement = environment = node_host = ""
     run_dir = Path(home) / "runs" / task_run_id
@@ -86,7 +86,7 @@ def _placement_overlay(home, task_run_id: str, db: StateDB) -> tuple[str, str, s
     if placement != "remote":
         return placement, environment, ""
     try:
-        data = json.loads(session_marker_path(run_dir).read_text(encoding="utf-8") or "{}")
+        data = read_session_marker(run_dir)
         locator = data.get("node") if isinstance(data, dict) else None
         if isinstance(locator, dict):
             node_host = str(locator.get("name") or locator.get("url") or "")

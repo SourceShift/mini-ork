@@ -221,15 +221,15 @@ class ModalProvider(SandboxNodeProvider):
         return sdk.App.lookup(opts.app, **kwargs)
 
     def spawn_sandbox(self, *, run_id: str, profile: Any,
-                      env: Mapping[str, str]) -> _ModalSandbox:
+                      env: Mapping[str, str], node_id: str = "") -> _ModalSandbox:
         opts = ModalOptions.resolve(profile, env)
         sdk = _sdk()
         client = _client(env)
-        labels = run_labels(NAME, run_id)
+        labels = run_labels(NAME, run_id, node_id)
         image = (sdk.Image.from_registry(opts.image) if opts.image
                  else sdk.Image.debian_slim().apt_install("git", "curl"))
         kwargs: dict[str, Any] = {
-            "app": self._app(sdk, client, opts), "name": sandbox_name(run_id),
+            "app": self._app(sdk, client, opts), "name": sandbox_name(run_id, node_id),
             "tags": labels, "image": image, "env": dict(opts.env),
             "timeout": opts.timeout_s, "client": client,
         }
@@ -242,16 +242,17 @@ class ModalProvider(SandboxNodeProvider):
         except Exception as exc:  # noqa: BLE001
             raise _unavailable("sandbox create", exc) from exc
 
-    def find_run_sandbox(self, *, run_id: str, env: Mapping[str, str]) -> _ModalSandbox | None:
+    def find_run_sandbox(self, *, run_id: str, env: Mapping[str, str],
+                         node_id: str = "") -> _ModalSandbox | None:
+        name = sandbox_name(run_id, node_id)
         try:
-            sb = _sdk().Sandbox.from_name(_app_name(env), sandbox_name(run_id),
-                                          client=_client(env))
+            sb = _sdk().Sandbox.from_name(_app_name(env), name, client=_client(env))
         except ProviderUnavailableError:
             raise
         except Exception as exc:  # noqa: BLE001
             if _is(exc, "NotFoundError"):
                 return None
-            raise _unavailable(f"sandbox lookup {sandbox_name(run_id)}", exc) from exc
+            raise _unavailable(f"sandbox lookup {name}", exc) from exc
         return _ModalSandbox(sb, self._tags(sb))
 
     def get_sandbox(self, handle: str, env: Mapping[str, str]) -> _ModalSandbox | None:

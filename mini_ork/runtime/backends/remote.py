@@ -662,6 +662,18 @@ class RemoteWorkspace:
 
     # ------------------------------------------------------------------ node provider
 
+    def node_isolation(self) -> str:
+        """The node this workspace gets its OWN sandbox for, or ``""`` for the run's.
+
+        Reported, not acted on: :meth:`ensure_node` is the only caller, and
+        :func:`~mini_ork.runtime.workspace_session.get_run_session` asks the
+        same question through the same helper — so the workspace and the session
+        that caches it cannot disagree about whether two nodes share a machine.
+        """
+        from mini_ork.remote.providers import run_nodes
+
+        return run_nodes.isolated_node(self._provider_env)
+
     def ensure_node(self, *, create: bool) -> Any:
         """Resolve this workspace's node through its node provider (lazy).
 
@@ -673,6 +685,13 @@ class RemoteWorkspace:
         only ever ATTACH to a recorded node; a run with no record returns
         ``None`` and calls neither ``create`` nor ``attach``.
 
+        With :env:`MO_NODE_ISOLATION` set and :env:`MO_NODE_ID` naming the node
+        this process is dispatching, the same protocol runs one level down: one
+        sandbox per ``(run, node)`` with its own lock and record, so no two
+        nodes of a run share a machine. Without either, the run keeps the one
+        sandbox every node shares — the historical behavior, unchanged. Which
+        one is in force is reported by :meth:`node_isolation`.
+
         A workspace built without a provider (static / explicit node) is already
         resolved: the call is a no-op returning its endpoint (or ``None``).
 
@@ -681,6 +700,7 @@ class RemoteWorkspace:
         ``failure_class=remote_unavailable`` — the provider seam never leaks a
         provider-shaped exception into the workspace API.
         """
+        from mini_ork.remote.providers import run_nodes
         from mini_ork.remote.providers.base import (
             ProviderUnavailableError,
             acquire_run_node,
@@ -693,16 +713,30 @@ class RemoteWorkspace:
         if self._endpoint is not None and self._node.url:
             return self._endpoint
         run_dir = self._run_dir or ""
+        per_node = self.node_isolation()
         try:
             if create:
-                endpoint = acquire_run_node(
-                    get_node_provider(self._node_provider),
-                    run_id=self._run_id,
-                    run_dir=run_dir,
-                    profile=self._profile,
-                    env=self._provider_env,
-                    engine_root=self._engine_root,
-                )
+                if per_node:
+                    endpoint = run_nodes.acquire_node(
+                        get_node_provider(self._node_provider),
+                        run_id=self._run_id,
+                        node_id=per_node,
+                        run_dir=run_dir,
+                        profile=self._profile,
+                        env=self._provider_env,
+                        engine_root=self._engine_root,
+                    )
+                else:
+                    endpoint = acquire_run_node(
+                        get_node_provider(self._node_provider),
+                        run_id=self._run_id,
+                        run_dir=run_dir,
+                        profile=self._profile,
+                        env=self._provider_env,
+                        engine_root=self._engine_root,
+                    )
+            elif per_node:
+                endpoint = run_nodes.attach_node(run_dir, self._provider_env, per_node)
             else:
                 endpoint = attach_run_node(run_dir, self._provider_env)
         except ProviderUnavailableError as exc:
@@ -1967,8 +2001,15 @@ def _reap_provider_marker(
     session's journal knows about under a 10 s budget, DELETEs the session, and
     finally destroys the provider's node via :func:`release_run_node` (which
     reads the run dir's ``.node-provider.json`` record). Best-effort and never
-    raises — the TTL reaper is the safety net, exactly as for a static node."""
+    raises — the TTL reaper is the safety net, exactly as for a static node.
+
+    A run that used per-node sandboxes also frees those here, via
+    :func:`release_all_nodes` over ``<run_dir>/.nodes/``: they are keyed on
+    ``(run_id, node_id)``, so ``release_run_node`` — which reads the RUN-level
+    record — cannot see them, and a SIGKILLed run would otherwise leave every
+    node's sandbox, and the secrets it was scoped, alive to their TTL."""
     from mini_ork.remote.providers.base import release_run_node
+    from mini_ork.remote.providers.run_nodes import release_all_nodes
 
     env = dict(os.environ)
     run_id = str(info.get("run_id") or "").strip() or sid
@@ -2008,6 +2049,13 @@ def _reap_provider_marker(
     try:
         release_run_node(str(run_dir), env)
     except Exception:  # noqa: BLE001 — release_run_node is best-effort by contract
+        pass
+    try:
+        # Per-node sandboxes are invisible to the call above (keyed on
+        # (run_id, node_id), not on the run), so free them by walking the
+        # run dir's records — no env flag needed to know they exist.
+        release_all_nodes(str(run_dir), env)
+    except Exception:  # noqa: BLE001 — same contract; the TTL reaper is the net
         pass
     return [sid]
 

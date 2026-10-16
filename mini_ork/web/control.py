@@ -271,8 +271,13 @@ def kill_run(home: Path, db: StateDB, task_run_id: str) -> dict[str, Any]:
     # executor's env nor an import of the backend. Best-effort: the reaper
     # never raises, and a marker-less run is a no-op.
     _marker_reaped = False
-    marker = run_dir / ".workspace-session.json"
-    if marker.exists():
+    try:
+        from mini_ork.runtime.workspace_session import session_marker_paths
+
+        has_marker = bool(session_marker_paths(run_dir))
+    except Exception:  # noqa: BLE001 — no readable run dir: nothing to reap here
+        has_marker = False
+    if has_marker:
         try:
             from mini_ork.runtime.sandbox_reaper import reap_by_marker
 

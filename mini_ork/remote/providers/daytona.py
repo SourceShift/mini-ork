@@ -8,7 +8,8 @@ module is only the Daytona adapter.
 
 Daytona specifics:
 
-* idempotency key: the sandbox **name** ``mo-<run_id>``. Names are unique per
+* idempotency key: the sandbox **name** ``mo-<run_id>`` — or
+  ``mo-<run_id>-<node_id>`` for a per-node sandbox. Names are unique per
   organization, so a lost run-dir record still finds the same sandbox.
 * lifetime: a wall-clock ``ttl_minutes`` that Daytona enforces even if this
   machine dies, ``ephemeral=True`` (a stopped sandbox is deleted), and idle
@@ -237,17 +238,19 @@ class DaytonaProvider(SandboxNodeProvider):
         return DaytonaOptions.resolve(profile, env).boot
 
     def spawn_sandbox(self, *, run_id: str, profile: Any,
-                      env: Mapping[str, str]) -> _DaytonaSandbox:
+                      env: Mapping[str, str], node_id: str = "") -> _DaytonaSandbox:
         opts = DaytonaOptions.resolve(profile, env)
         client = _client(env, opts)
-        params = self._create_params(_sdk(), name=sandbox_name(run_id), run_id=run_id, opts=opts)
+        params = self._create_params(_sdk(), name=sandbox_name(run_id, node_id),
+                                     run_id=run_id, opts=opts, node_id=node_id)
         try:
             return _DaytonaSandbox(client.create(params, timeout=opts.create_timeout_s))
         except Exception as exc:  # noqa: BLE001
             raise _unavailable("sandbox create", exc) from exc
 
-    def find_run_sandbox(self, *, run_id: str, env: Mapping[str, str]) -> _DaytonaSandbox | None:
-        return self.get_sandbox(sandbox_name(run_id), env)
+    def find_run_sandbox(self, *, run_id: str, env: Mapping[str, str],
+                         node_id: str = "") -> _DaytonaSandbox | None:
+        return self.get_sandbox(sandbox_name(run_id, node_id), env)
 
     def get_sandbox(self, handle: str, env: Mapping[str, str]) -> _DaytonaSandbox | None:
         try:
@@ -264,10 +267,11 @@ class DaytonaProvider(SandboxNodeProvider):
         return [_DaytonaSandbox(sb) for sb in _client(env).list(query)]
 
     @staticmethod
-    def _create_params(sdk: Any, *, name: str, run_id: str, opts: DaytonaOptions) -> Any:
+    def _create_params(sdk: Any, *, name: str, run_id: str, opts: DaytonaOptions,
+                       node_id: str = "") -> Any:
         common: dict[str, Any] = {
             "name": name,
-            "labels": run_labels(NAME, run_id),
+            "labels": run_labels(NAME, run_id, node_id),
             "env_vars": dict(opts.env),
             "ttl_minutes": opts.ttl_minutes,
             "auto_stop_interval": opts.auto_stop_minutes,
