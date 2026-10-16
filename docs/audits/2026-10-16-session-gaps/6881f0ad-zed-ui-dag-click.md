@@ -45,10 +45,15 @@ git, the engine source, or the state DB.
    `spec=1` and `spec=2` on the run page returned the *v1* tab set at both
    levels. I initially wrote that as "the engine serves v1", which claims more
    than the evidence supports: the process listening on `:7090` (pid 81516) was
-   started before the spec-level work — the same stale-engine trap this repo
-   records elsewhere — so a v1 answer is equally consistent with the handler
-   code lacking the per-request plumbing and with the running process predating
-   it. Those two are not distinguishable from this probe, and the spec path is
+   started before the spec-level work — measured, not assumed:
+   `ps -p 81516 -o lstart=,etime=` → started `Thu Oct 15 14:17:53 2026`, up
+   `1 day 09:10` at check time, while the spec plumbing's last commit
+   (`6f15537d`) is `2026-10-16 14:54` and `spec.py`/`ide.py`/`run.py` carry
+   mtimes of `2026-10-16 23:17–23:22`. The process predates every relevant
+   change by more than a day. So a v1 answer is equally consistent with the
+   handler code lacking the per-request plumbing and with the running process
+   predating it — and here the second is demonstrably the case. Those two are
+   not distinguishable from this probe, and the spec path is
    additionally split across a *client* half that is still uncommitted
    (`src/board.rs`'s `IDE_SPEC`). What is safe to say: **on the live process**,
    both levels answer v1, so the run-page click is unobservable there. What is
