@@ -311,6 +311,12 @@ def sample(
 ) -> Observation:
     """Sample everything the signals need. Never raises on a missing file."""
     now = time.time() if now is None else now
+    # A missing ``created_at`` is not a node that has been idle since the
+    # epoch. Without a start there is no duration to measure, and "unknown"
+    # must not read as "overdue by nine years" — that would raise a stall on
+    # every live node whose row lost its timestamp, and spend a turn saying so.
+    if started_at <= 0:
+        started_at = now
     log = node_log(run_dir, node_id)
     lines = _tail(log)
     idle = now - started_at

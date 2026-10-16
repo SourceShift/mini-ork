@@ -136,6 +136,22 @@ def test_a_missing_log_falls_back_to_the_start_time(run_dir: Path):
     assert watch.STALLED in [s["kind"] for s in watch.judge(obs)]
 
 
+def test_an_event_with_no_created_at_is_not_a_stall(run_dir: Path):
+    """A row that lost its start time is "unknown", not "idle since 1970".
+
+    Reading it as a duration would raise a stall on every live node whose
+    ``created_at`` is missing or zero — and then spend a turn announcing it.
+    """
+    obs = watch.sample(run_dir, run_id="r1", node_id="test", started_at=0.0, now=NOW)
+    assert obs.idle_seconds == 0
+    assert obs.elapsed_seconds == 0
+    assert watch.judge(obs) == []
+    # ``current_node`` is where the 0 comes from: an event with no timestamp.
+    unstamped = {"event_type": "node_start", "payload_json": '{"node_id": "test"}'}
+    live = watch.current_node([unstamped])
+    assert live is not None and live["started_at"] == 0.0
+
+
 def test_stalled_progress(run_dir: Path):
     _log(run_dir, "test", ["still going"], mtime=NOW - 400)
     obs = watch.sample(run_dir, run_id="r1", node_id="test", node_type="verifier",
