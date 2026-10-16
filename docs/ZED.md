@@ -370,8 +370,8 @@ default server stays read-only.
   volume makes it refuse the job outright (`EX_CONFIG`, exit 78) — the job
   then never runs and the log is never created, while the scheduler still
   reads as "on". Re-run `mini-ork automations scheduler install` after
-  upgrading from a build that installed the in-home log (the page flags a
-  plist still pointing there).
+  upgrading from a build that installed the in-home log (the page flags any
+  installed plist whose log is not on the boot volume).
 - **"claude CLI not found" when Zed is opened from the Dock.** Apps
   started from the Dock get a bare `PATH`. `mini-ork zed setup` writes the
   `PATH` of the shell you run it from into both Zed entries; run it again

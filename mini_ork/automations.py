@@ -1004,8 +1004,9 @@ def _owning_device(path: Path) -> int | None:
             current = parent
 
 
-def _home_off_boot_volume(home: Path) -> bool:
-    """Is ``home`` on a different device from the user's home directory?
+def _off_boot_volume(path: Path) -> bool:
+    """Is ``path`` (or its nearest existing ancestor) on a different device
+    from the user's home directory?
 
     launchd opens ``StandardOutPath`` *itself*, before ``exec``, and a job
     whose log file sits on a volume outside the job's namespace is refused with
@@ -1019,11 +1020,11 @@ def _home_off_boot_volume(home: Path) -> bool:
     once their log moved to the boot volume. Comparing device ids with ``~/``
     is the cheap, durable form of that test.
     """
-    home_dev = _owning_device(home)
+    path_dev = _owning_device(Path(path))
     boot_dev = _owning_device(Path.home())
-    if home_dev is None or boot_dev is None:
+    if path_dev is None or boot_dev is None:
         return False  # cannot tell: keep the historical in-home log
-    return home_dev != boot_dev
+    return path_dev != boot_dev
 
 
 def _tick_log_path(home: Path) -> Path:
@@ -1034,7 +1035,7 @@ def _tick_log_path(home: Path) -> Path:
     home-adjacent log: cron executes the ``>>`` redirect through a shell, which
     is not subject to launchd's spawn-time path rule.
     """
-    if _platform_key() == "macos" and _home_off_boot_volume(home):
+    if _platform_key() == "macos" and _off_boot_volume(home):
         return _boot_volume_log_dir() / f"automations-tick-{_home_hash(home)}.log"
     return Path(home) / _TICK_LOG_FILENAME
 
@@ -1259,16 +1260,16 @@ def scheduler_status(home: Path | str) -> dict[str, Any]:
             "log_path": str(log_path),
             "last_tick": last_tick,
         }
-        stale = _installed_log_path(plist)
-        if stale is not None and stale != str(log_path):
-            # A plist installed before the off-boot-volume rule still points
-            # into the home: launchd refuses it at spawn (EX_CONFIG, 78) and
-            # the job never fires, while ``installed`` reads True.
-            out["stale_log_path"] = stale
+        installed_log = _installed_log_path(plist)
+        # Only the off-boot-volume case is a fault: a plist pointed at another
+        # boot-volume path (hand-fixed, or an older naming) still runs.
+        if installed_log is not None and _off_boot_volume(Path(installed_log)):
+            out["off_boot_volume_log_path"] = installed_log
             out["warning"] = (
-                f"the installed plist logs to {stale}, outside the boot volume "
-                "if the home is off it — launchd will never start this job; "
-                "re-run 'mini-ork automations install' to rewrite it"
+                f"the installed plist logs to {installed_log}, which is not on "
+                "the boot volume — launchd refuses to start this job (EX_CONFIG, "
+                "78) and the scheduler will never fire; re-run 'mini-ork "
+                "automations scheduler install' to rewrite the plist"
             )
         return out
     if key == "linux":

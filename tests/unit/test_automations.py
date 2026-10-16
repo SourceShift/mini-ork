@@ -857,9 +857,9 @@ class TestScheduler:
         assert log == str(tmp_path / "Logs" / f"automations-tick-{auto._home_hash(home)}.log")
         status = auto.scheduler_status(home)
         assert status["log_path"] == log
-        assert "stale_log_path" not in status
+        assert "off_boot_volume_log_path" not in status
 
-    def test_status_flags_a_plist_written_before_the_boot_volume_rule(
+    def test_status_flags_a_plist_whose_log_is_off_the_boot_volume(
         self, tmp_path: Path, monkeypatch
     ) -> None:
         """``installed: True`` on a never-firing job is otherwise invisible."""
@@ -869,8 +869,11 @@ class TestScheduler:
         monkeypatch.setattr(auto, "_boot_volume_log_dir", lambda: tmp_path / "Logs")
         monkeypatch.setattr(auto.platform, "system", lambda: "Darwin")
         home = tmp_path / "Volumes" / "ext" / ".mini-ork"
+        # Everything under <tmp>/Volumes is on device 2; ~/ and tmp_path on 1.
+        off_volume = str(home.parent.parent)
         monkeypatch.setattr(
-            auto, "_owning_device", lambda p: 2 if str(p) == str(home) else 1
+            auto, "_owning_device",
+            lambda p: 2 if str(p).startswith(off_volume) else 1,
         )
         # The plist as the pre-fix installer wrote it: the log inside the home.
         legacy = str(home / "automations-tick.log")
@@ -881,8 +884,34 @@ class TestScheduler:
 
         status = auto.scheduler_status(home)
         assert status["installed"] is True
-        assert status["stale_log_path"] == str(home / "automations-tick.log")
+        assert status["off_boot_volume_log_path"] == legacy
         assert "launchd" in status["warning"]
+
+    def test_status_accepts_a_hand_fixed_plist_log_on_the_boot_volume(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A different-but-on-boot-volume path is not a fault — only device is."""
+        agents = tmp_path / "LaunchAgents"
+        agents.mkdir()
+        monkeypatch.setattr(auto, "_launch_agents_dir", lambda: agents)
+        monkeypatch.setattr(auto.platform, "system", lambda: "Darwin")
+        home = tmp_path / "Volumes" / "ext" / ".mini-ork"
+        off_volume = str(home.parent.parent)
+        monkeypatch.setattr(
+            auto, "_owning_device",
+            lambda p: 2 if str(p).startswith(off_volume) else 1,
+        )
+        # Hand-edited to a boot-volume path with an older name (2026-10-16 fix).
+        auto._plist_path(home).write_text(
+            auto._build_plist(home).replace(
+                str(auto._tick_log_path(home)), str(tmp_path / "Logs" / "automations-tick-abcd1234.log")
+            ),
+            encoding="utf-8",
+        )
+
+        status = auto.scheduler_status(home)
+        assert "off_boot_volume_log_path" not in status
+        assert "warning" not in status
 
     def test_macos_log_stays_in_home_on_the_boot_volume(
         self, tmp_path: Path, monkeypatch
