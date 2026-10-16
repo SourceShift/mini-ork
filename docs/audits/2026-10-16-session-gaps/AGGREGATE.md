@@ -617,6 +617,20 @@ grep with a suppressed error). The pattern is worth naming: every one of my wron
 *negative* ("there is no code", "the loop is broken", "the rule does not exist"), and every one
 survived because the failing check was quiet rather than loud.
 
+**C-5, addendum — the obvious remedy is also wrong, measured.** `mini-ork-81` reproduced the
+symlink cause independently and then tested the fix I would have reached for: **`-R` fails exactly
+like `-r`.** BSD grep will not follow a symlink passed as a *file argument*, and "follow all
+symlinks" does not change the file-argument case — `grep -Rn <pat> CLAUDE.md` → rc=1, same as
+`-rn`. The two forms that do work are to **drop `-r` entirely** (`grep -n <pat> CLAUDE.md` succeeds,
+because non-recursive grep just opens the path) or to **name a directory**
+(`grep -rn <pat> .` finds it, reported as `AGENTS.md:77`). This is worth keeping precisely because
+it is the fourth instance of the same shape rather than a fifth unrelated error: a *plausible*
+remedy asserted from how the flag reads, not from running it. `mini-ork-81` also deleted its
+earlier em-dash theory of the cause for the same reason — a wrong-cause memory is worse than no
+memory — and its framing of the generalisation is sharper than mine: **a check that cannot fail
+loudly is not a check.** Both halves of line 77 are that discipline — the retraction is a check that
+was too quiet to fail, and "shipped, not parked" is the same rule applied to delivery.
+
 ---
 
 ## Delivery — round 4
