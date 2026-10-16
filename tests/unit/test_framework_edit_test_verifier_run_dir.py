@@ -67,15 +67,28 @@ def _diff_for(root: Path) -> str:
     return diff
 
 
-def _prepare(tmp: Path, command: str) -> tuple[Path, Path]:
+def _prepare(tmp: Path, command: str, repo_fn=_target_repo) -> tuple[Path, Path]:
     """A temp run dir declaring ``command`` plus the target repo it verifies."""
-    target = _target_repo(tmp)
+    target = repo_fn(tmp)
     run_dir = tmp / "run"
     run_dir.mkdir()
     (run_dir / "framework-edit.diff").write_text(_diff_for(target))
     (run_dir / "run_profile.json").write_text(
         json.dumps({"verification_command": [command]}))
     return run_dir, target
+
+
+def _target_repo_with_tests(tmp: Path) -> Path:
+    """The probe repo plus two collectable pytest files whose names overlap."""
+    root = _target_repo(tmp)
+    unit = root / "tests" / "unit"
+    unit.mkdir(parents=True)
+    (unit / "test_page_run.py").write_text("def test_ok():\n    assert True\n")
+    (unit / "test_page_run_graph_focus.py").write_text(
+        "def test_ok():\n    assert True\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "tests")
+    return root
 
 
 def _load_verifier(monkeypatch, run_dir: Path, target: Path, name: str):
@@ -137,6 +150,44 @@ def test_credentials_stay_scrubbed_for_kickoff_commands(tmp_path: Path,
     # file with no API-key names proves both halves at once.
     assert json.loads((run_dir / "env-keys.json").read_text()) == [], \
         "a provider credential leaked into the kickoff command's env"
+
+
+def test_redundant_test_path_is_dropped_before_pytest_runs(tmp_path: Path,
+                                                            monkeypatch) -> None:
+    """A file named both explicitly and by a glob must reach pytest once.
+
+    pytest-asyncio re-patches ``Module.collect`` per collection of a path and
+    recurses on the second, so the duplicate fails collection outright
+    (rp-e6-graph-focus, rp-e3-header, hr-exec-park, 2026-10-15) and the change
+    under test is judged wrong before a single test runs.
+    """
+    graph_focus = "tests/unit/test_page_run_graph_focus.py"
+    run_dir, target = _prepare(
+        tmp_path, f"pytest -q {graph_focus} tests/unit/test_page_run*.py",
+        repo_fn=_target_repo_with_tests)
+    _load_verifier(monkeypatch, run_dir, target, "fe_verifier_dedupe")
+
+    log = (run_dir / "verifier-test.log").read_text()
+    command_line = next(line for line in log.splitlines() if line.startswith("  $ "))
+    assert "tests/unit/test_page_run*.py" in command_line, command_line
+    assert graph_focus not in command_line, \
+        "the glob already collects it, so the explicit path must be dropped"
+    assert _rows(run_dir)[CHECK] == "true", _rows(run_dir)
+
+
+def test_a_command_the_rewrite_cannot_parse_is_left_alone(tmp_path: Path,
+                                                          monkeypatch) -> None:
+    """Quoted paths make ``str.split`` and ``shlex.split`` disagree; the runner
+    must then run the kickoff's command verbatim rather than guess a rewrite."""
+    run_dir, target = _prepare(
+        tmp_path, 'pytest -q "tests/unit/test_page_run.py" '
+                  "tests/unit/test_page_run*.py",
+        repo_fn=_target_repo_with_tests)
+    _load_verifier(monkeypatch, run_dir, target, "fe_verifier_dedupe_bail")
+
+    log = (run_dir / "verifier-test.log").read_text()
+    command_line = next(line for line in log.splitlines() if line.startswith("  $ "))
+    assert '"tests/unit/test_page_run.py"' in command_line, command_line
 
 
 def test_scrubbed_env_is_where_run_dir_is_lost() -> None:

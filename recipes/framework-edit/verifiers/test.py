@@ -12,6 +12,7 @@
 #
 # Output: JSON to stdout. Exit code is always 0; caller reads .pass.
 
+import glob
 import hashlib
 import io
 import json
@@ -420,6 +421,77 @@ def _sh(cmd):
     return cmd
 
 
+_GLOB_CHARS = frozenset("*?[")
+
+
+def _is_test_path_token(token):
+    return bool(token) and not token.startswith("-") and (
+        "/" in token or token.endswith(".py") or _GLOB_CHARS & set(token))
+
+
+def _dedupe_redundant_test_paths(cmd):
+    """Drop test paths a sibling glob in the same command already collects.
+
+    pytest-asyncio (0.23.4) re-wraps ``Module.collect`` on every collection of the
+    same path without an idempotence check, so a command naming a test file
+    explicitly *and* a glob matching it recurses until the interpreter raises
+    ``RecursionError`` during collection — before a single test runs. The change
+    under test is then judged wrong (rp-e6-graph-focus, rp-e3-header,
+    hr-exec-park, all 2026-10-15). The glob collects the identical set, so the
+    explicit copy is redundant rather than merely unhelpful.
+
+    Only whole whitespace-separated tokens are removed, and only when the command
+    needs no shell quoting — a command this cannot rewrite exactly is left alone
+    to fail loudly instead of silently collecting a different set of tests.
+    """
+    tokens = cmd.split()
+    try:
+        parsed = shlex.split(cmd)
+    except ValueError:
+        return cmd
+    if len(parsed) != len(tokens):
+        return cmd
+    if not any(os.path.basename(token) == "pytest" for token in tokens[:3]):
+        return cmd
+    if sum(1 for token in tokens if _is_test_path_token(token)) < 2:
+        return cmd
+
+    # ``glob.root_dir`` is 3.10+; this verifier runs on the target repo's
+    # interpreter, so match against fully-joined paths instead.
+    covered = set()
+    for token in tokens:
+        if _is_test_path_token(token) and _GLOB_CHARS & set(token):
+            covered.update(glob.glob(os.path.join(WORKTREE, token), recursive=True))
+
+    seen, redundant = set(), set()
+    for token in tokens:
+        if not _is_test_path_token(token) or _GLOB_CHARS & set(token):
+            continue
+        if token in seen or os.path.join(WORKTREE, token) in covered:
+            redundant.add(token)
+        seen.add(token)
+    if not redundant:
+        return cmd
+
+    # A glob-covered path goes entirely (the glob still collects it); an exact
+    # duplicate keeps its first occurrence, so one collection path survives.
+    covered_dupes = {token for token in redundant if token in covered}
+    pending = set(redundant)
+    kept = []
+    for token in tokens:
+        if token in covered_dupes:
+            continue
+        if token in pending:
+            pending.discard(token)
+            continue
+        kept.append(token)
+    _ev.write(
+        f"  [dedupe] dropped {', '.join(sorted(redundant))} — a sibling glob "
+        "in the same command already collects it (pytest-asyncio recurses on a "
+        "duplicate collection path)\n")
+    return " ".join(kept)
+
+
 def _bind_run_dir(cmd):
     """Bind ``$MINI_ORK_RUN_DIR`` for a kickoff command that names it.
 
@@ -458,6 +530,7 @@ def _epic_verification_commands_pass():
     env["PYTHONPATH"] = "."
     env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
     for cmd in cmds:
+        cmd = _dedupe_redundant_test_paths(cmd)
         _ev.write(f"  $ {_sh(cmd)}\n")
         _ev.flush()
         try:
