@@ -417,6 +417,48 @@ def _overlay_candidate_tests(base_wt: str, candidate_cwd: str, base_ref: str = "
     return sorted(overlaid)
 
 
+# Dependency directories `git worktree add` never brings: they are gitignored,
+# so the base worktree has the source but no deps and the runner dies before
+# executing a test. jest reports a missing module as a *configuration* error
+# (`Validation Error: ... cannot be found`) with rc=1 — not one of
+# `_UNRUNNABLE_RC`'s shell codes {126,127,77} — so `_opaque_delta` reads the
+# base log as "ran no tests" and parks the run UNVERIFIED with a reason that
+# names the wrong cause. Measured on the researcher home: 4 code-fix runs in
+# 48h (~$30) hit this, every one of them with a *green* candidate suite.
+#
+# Symlinking (never copying) the candidate's own dep dirs onto the base is the
+# same reasoning as the test-file overlay above — the base must be able to run
+# the suite or the delta proves nothing. A symlink keeps the disk cost at zero,
+# which is why the base gets no `node_modules` in the first place. Caveat: a
+# runner that caches *inside* its dep dir (jest's `cacheDirectory`, if
+# configured there) writes into the candidate's tree, not the base's.
+_DEPENDENCY_DIRS = ("node_modules", ".venv", "venv", "vendor/bundle")
+
+
+def _link_candidate_dependencies(base_wt: str, candidate_cwd: str) -> list[str]:
+    """Symlink the candidate's dependency dirs onto the base worktree.
+
+    Returns a sorted list of linked relative paths for the evidence stream.
+    Best-effort and silent on failure, exactly like `_overlay_candidate_tests`:
+    a missing dep dir, or one the base already has, must not fail the verifier.
+    """
+    linked: list[str] = []
+    for rel_path in _DEPENDENCY_DIRS:
+        src = os.path.join(candidate_cwd, rel_path)
+        dst = os.path.join(base_wt, rel_path)
+        if not os.path.isdir(src) or os.path.lexists(dst):
+            continue
+        try:
+            parent = os.path.dirname(dst)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            os.symlink(src, dst)
+            linked.append(rel_path)
+        except OSError:
+            pass
+    return sorted(linked)
+
+
 # ── #16: a base load failure caused by a candidate-ADDED module is proof ─────
 # The overlay carries a candidate's new test onto the base, but a test that
 # imports a module the candidate ADDED cannot load there: jest/ts-jest report
@@ -1306,6 +1348,12 @@ def _attach_overlaid_worktree(candidate_cwd: str, base_ref: str = "") -> tuple[s
     wt = _attach_git_worktree_base(base_ref)
     if wt is None:
         return None, []
+    linked = _link_candidate_dependencies(wt, candidate_cwd)
+    if linked:
+        # stderr only, like the resolved-command line above: the emit() JSON
+        # payloads keep their exact key set, so the audit trail rides the
+        # evidence stream instead of widening the contract.
+        sys.stderr.write(f"[test] base worktree deps linked: {', '.join(linked)}\n")
     return wt, _overlay_candidate_tests(wt, candidate_cwd, base_ref)
 
 
