@@ -757,6 +757,20 @@ Stated explicitly, with cost, so a reviewer can decline them knowingly.
       unfixed under the same agreement — and worth naming here rather than leaving a red
       suite unexplained, because it is the one stale assertion the P1/P2 notes missed.
 
+      **Measured against CI 2026-10-16, and the number is larger than this item used to
+      claim.** On the commit *before* any of this work (`4174a8c7`, checked out into a
+      throwaway worktree), `tests/unit/test_ide_pages_orch.py` + `test_native_dispatch_py.py`
+      already fail **7**, and `tests/unit/test_acp_agent_py.py` already fails **3**
+      (`test_slash_run_in_orchestrate_mode_launches_directly`,
+      `test_child_run_streams_agent_output_into_the_thread`,
+      `test_thread_usage_is_sent_only_when_the_total_changes`, all in its usage/thread
+      accounting). So **10 of the 11 failures CI reports today are not this work's**, and
+      the branch's unit shards were red before it. CI's only *completed* run on `main` is
+      the one on `8273e27d` — every earlier push superseded its own predecessor through
+      the workflow's concurrency group, so CodeQL's green ticks were never a test verdict.
+      The 3 ACP failures are a separate, older thread; they are not stale-in-the-redesign
+      sense and nothing in this spec explains them.
+
 ### P1 — Dispatch
 - [x] FR-010 — `board start`: add `start` to `build_parser().choices`; add `--kickoff`, `--set` (append), `--run-id`, `--workspace`, `--init`, `--dry-run`; exempt `start` from `validate`'s run-id rule and require `--kickoff`; implement `_act_start` wrapping `web.control.launch_run`; fail closed on an uninitialised home.
       Verified by hand (10 probes, `.venv/bin/python`): no `--kickoff` → rc 2; **uninitialised home → rc 2 and no `runs-inbox` created** (fail-closed); `--init` proceeds; recipe resolves from front matter → `--recipe` → refusal; `--set X=1`/`--workspace` map into `extra_env`; a stubbed `launch_run` receives `(home, recipe, text, run_id, extra_env)` and a kickoff body; `launch_run` returning `ok:False` → rc 1 with the error on stderr. A **live spawn was not run** — starting a real run is a side effect on the shared engine, so `launch_run` was stubbed instead; AC-001's live replay needs a runner.
