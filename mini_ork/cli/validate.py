@@ -24,6 +24,11 @@ Exit codes (mirror bash exactly):
 Known divergence: bash's ``--recipe`` with no following argument aborts
 under ``set -u`` (``$2: unbound variable``, exit 1). The port treats a
 missing ``--recipe`` value as a usage error (usage to stderr, exit 2).
+
+Known divergence: the port adds Check 5 (lane liveness, below), which the
+bash source never had. It is the only check that can touch the network — one
+cached 1-token probe per configured lane, ten-minute TTL — and it is a no-op
+whenever no probeable lane has its credential set.
 """
 from __future__ import annotations
 
@@ -257,6 +262,27 @@ def _check_agents_yaml(root: str, home: str, findings: Findings) -> None:
 # providers.yaml). A broken providers.yaml yields no warnings (bash heredoc
 # stderr is discarded).
 # ─────────────────────────────────────────────────────────────────────────────
+def _runtime_secret_env() -> tuple[dict[str, str] | None, str | None]:
+    """The environment the dispatcher actually resolves credentials from.
+
+    Every lane's env in ``providers.dispatch_model`` is built through
+    ``provider_environment()``: the owner-only local store overlaid by the
+    ambient environment. A check reading ``os.environ`` alone therefore reports
+    a store-backed credential as MISSING — observed 2026-10-16, where Check 4
+    named 12 lanes missing while the live probe authenticated against every one
+    of them, burying the single real fault (kimi, HTTP 401) in the noise.
+
+    Returns ``(runtime, None)``, or ``(None, message)`` when the store is
+    unreadable or permissive. Failing closed is the point: an unusable store
+    must never be reported as "credentials are fine, just not exported".
+    """
+    from mini_ork.dispatch import providers as providers_mod
+    try:
+        return providers_mod.provider_environment(), None
+    except Exception as exc:  # SecretStoreError and friends
+        return None, str(exc)
+
+
 def _check_provider_secrets(home: str, findings: Findings) -> None:
     import yaml
     # Honour the override the dispatcher already supports (dispatch/providers.py),
@@ -272,13 +298,107 @@ def _check_provider_secrets(home: str, findings: Findings) -> None:
             data = yaml.safe_load(f) or {}
     except Exception:
         return
+    # This check owns the unreadable-store message; Check 5 (which runs after
+    # it) returns quietly on the same condition rather than repeating it.
+    runtime, store_error = _runtime_secret_env()
+    if runtime is None:
+        findings.warn(
+            f"cannot read the local secret store: {store_error}",
+            f"check permissions on {home}/config/secrets.local.sh (owner-only, 0600)",
+        )
+        return
     for name, cfg in (data.get("providers") or {}).items():
         env_var = cfg.get("api_key_env") or cfg.get("env_key")
-        if env_var and not os.environ.get(env_var):
+        if env_var and not runtime.get(env_var):
             findings.warn(
                 f"provider secret missing: {name} -> {env_var}",
                 f"set it in {home}/config/secrets.local.sh",
             )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Check 5 — lane liveness. Check 4 proves a credential is PRESENT; a key that is
+# set can still be dead, and that is the failure this check exists for. ``kimi``
+# stayed in both ``dispatch_chain`` fallback tails with a 401-rejected key, so
+# every coding/review node that fell through to it died with a misleading
+# ``lane preflight failed`` instead of its lead's real error — and nothing at
+# instantiation said so, because no instantiation surface consulted the health
+# machinery that already existed.
+#
+# Reuses ``providers.lane_health`` (the same cached 1-token probe the run-start
+# ``lane_preflight`` gate calls), so validate and the run cannot disagree about
+# what "healthy" means. Cache lives at ``<home>/lane-probe-cache.json``
+# (``_PROBE_TTL_S`` = 600s), so repeat validates are free.
+#
+# Two deliberate non-findings, both of which would otherwise make CI red for
+# reasons that are not this check's to report:
+#   * a lane whose ``api_key_env`` is unset — Check 4 already names it;
+#   * a lane whose kind is not probeable — that is a providers.yaml shape
+#     problem, and ``lane_health`` answers it with "unsupported kind", which is
+#     not a liveness verdict.
+# ─────────────────────────────────────────────────────────────────────────────
+_PROBEABLE_KINDS = (
+    "anthropic-compat", "openai-compat", "openai-chat", "uhp", "anthropic-native",
+)
+
+
+def _check_lane_liveness(root: str, home: str, findings: Findings) -> None:
+    from mini_ork.dispatch import providers as providers_mod
+
+    providers_yaml = (
+        os.environ.get("MINI_ORK_PROVIDERS")
+        or os.path.join(home, "config", "providers.yaml")
+    )
+    try:
+        registry = providers_mod._load_providers_registry(root)
+    except (OSError, ValueError):
+        return  # a malformed registry is the dispatcher's to fail on, loudly
+    if not registry:
+        return
+    try:
+        runtime = providers_mod.provider_environment()
+    except Exception:
+        return  # Check 4 already reported the unreadable store it read first
+
+    probed = 0
+    unprobed: list[str] = []
+    for name, entry in registry.items():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("kind") not in _PROBEABLE_KINDS:
+            continue
+        try:
+            needed = providers_mod.required_secret_envs(name, root)
+        except ValueError:
+            continue
+        # CLI-owned auth (codex/opencode) declares no env var and is probed
+        # anyway; a gateway lane with a missing var is Check 4's finding.
+        if any(not runtime.get(var) for var in needed):
+            continue
+        health = providers_mod.lane_health(name, root, environment=runtime)
+        if health.ok:
+            # A native lane, or probes switched off: healthy, but nobody
+            # actually asked the far end. Count it as verified only if the
+            # probe ran — the reason string is where lane_health says which.
+            if "unprobed" in health.reason:
+                unprobed.append(name)
+            else:
+                probed += 1
+            continue
+        findings.error(
+            f"lane '{name}' is unhealthy: {health.reason}",
+            f"fix the credential in {home}/config/secrets.local.sh, or remove the "
+            f"lane from {providers_yaml} — every dispatch on it will fail",
+        )
+
+    # "validate: OK" must not imply a liveness check that never ran.
+    if probed == 0 and unprobed:
+        findings.warn(
+            f"lane liveness not verified for {len(unprobed)} lane(s): "
+            f"{', '.join(sorted(unprobed))}",
+            "set MO_LANE_PROBE=1 to probe live lanes (currently disabled by "
+            "MO_LANE_PROBE=0 or MINI_ORK_DRY_RUN=1)",
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -334,6 +454,7 @@ def main(argv: list[str] | None = None) -> int:
         _check_recipe(root, recipe, findings)
     _check_agents_yaml(root, home, findings)
     _check_provider_secrets(home, findings)
+    _check_lane_liveness(root, home, findings)
 
     # ── summary (order mirrors bash) ──
     e, w = findings.errors, findings.warnings

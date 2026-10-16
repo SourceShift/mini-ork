@@ -80,9 +80,20 @@ def dispatch_chain(node_type: str, lead: str, root: str | None = None) -> str:
         # gateway outage had no same-kind rung to fall to, and codex's own quota
         # wall removed the last one (2026-10-12). codex stays available as an
         # explicit opt-in (``MO_FALLBACK_CODING=...,codex``).
-        tail = os.environ.get("MO_FALLBACK_CODING", "minimax,kimi,deepseek_flash")
+        #
+        # ``kimi`` was replaced by ``glm`` (2026-10-16): kimi's credential went
+        # 401-dead in every home here and a shipped default is a promise that the
+        # lane can serve. A dead rung is worse than no rung — it converts the
+        # lead's real error into ``lane preflight failed`` and burns a retry
+        # discovering it. ``glm`` is the same kind (anthropic-compat / gateway),
+        # so the outage fallback property above is preserved.
+        tail = os.environ.get("MO_FALLBACK_CODING", "minimax,glm,deepseek_flash")
     elif node_type in _REVIEW_ROLES:
-        tail = os.environ.get("MO_FALLBACK_REVIEW", "opus,kimi,sonnet")
+        # ``sonnet`` is intentionally kept though most homes do not map it: the
+        # drop above is loud and names it, which is the desired signal on a home
+        # that never had it. A dead-but-registered lane (kimi) cannot signal —
+        # it fails at dispatch — so it is gone.
+        tail = os.environ.get("MO_FALLBACK_REVIEW", "opus,glm,sonnet")
     if not tail:
         return lead
     seen = set()

@@ -180,12 +180,15 @@ def test_transient_categories_stay_opt_in(monkeypatch: pytest.MonkeyPatch) -> No
 def test_default_coding_tail_prefers_same_kind_gateway_lanes(
         monkeypatch: pytest.MonkeyPatch) -> None:
     """The shipped default ended at ``codex`` — a native lane of a different
-    kind whose own quota wall then removed the last rung."""
+    kind whose own quota wall then removed the last rung. It also carried
+    ``kimi``, whose key was 401-rejected in every home here: a shipped default
+    is a promise the lane can serve, so a dead rung is worse than no rung."""
     monkeypatch.delenv("MO_FALLBACK_CODING", raising=False)
     chain = dispatch_chain("implementer", "minimax", str(REPO))
 
     assert chain.split(",")[-1] != "codex"
-    assert "kimi" in chain and "deepseek_flash" in chain
+    assert "glm" in chain and "deepseek_flash" in chain
+    assert "kimi" not in chain
 
 
 def test_an_env_opt_in_still_reaches_codex(monkeypatch: pytest.MonkeyPatch) -> None:

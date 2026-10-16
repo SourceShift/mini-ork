@@ -74,7 +74,7 @@ def test_chain_lead_is_family_not_alias(tmp_path, monkeypatch):
     home = _write_agents(tmp_path)
     monkeypatch.setenv("MINI_ORK_HOME", home)
     monkeypatch.setenv("MINI_ORK_ROOT", home)
-    monkeypatch.delenv("MO_FALLBACK_CODING", raising=False)  # default: minimax,kimi,deepseek_flash
+    monkeypatch.delenv("MO_FALLBACK_CODING", raising=False)  # default: minimax,glm,deepseek_flash
     chain = dispatch_chain("implementer", resolve_lane_family("codex_lens"))
     parts = chain.split(",")
     assert parts[0] == "codex", f"chain lead must be codex, got {parts[0]!r} in {chain!r}"
@@ -141,7 +141,7 @@ def test_broken_registry_fails_open(tmp_path, monkeypatch):
     monkeypatch.delenv("MO_FALLBACK_REVIEW", raising=False)
     chain = dispatch_chain("reviewer", "opus", root=str(tmp_path))
     # Unreadable registry → no filtering → the dead entry surfaces at preflight.
-    assert chain == "opus,kimi,sonnet", chain
+    assert chain == "opus,glm,sonnet", chain
 
 
 def test_empty_registry_fails_open(tmp_path, monkeypatch):
@@ -152,4 +152,4 @@ def test_empty_registry_fails_open(tmp_path, monkeypatch):
     chain = dispatch_chain("implementer", "codex", root=str(tmp_path))
     # An empty registry must NOT be read as "nothing is registered": the whole
     # shipped tail survives, and a dead lane surfaces at preflight by name.
-    assert chain == "codex,minimax,kimi,deepseek_flash", chain
+    assert chain == "codex,minimax,glm,deepseek_flash", chain

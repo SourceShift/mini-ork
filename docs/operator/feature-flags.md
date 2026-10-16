@@ -23,8 +23,8 @@ variable is unset.*
 | `MO_MAX_TRANSCRIPT_BYTES` | `"1048576"` | Transcript cap per node |
 | `MO_NODE_PROMPT_SHA` | *(flag)* | Record prompt sha in traces |
 | `MO_TRAJECTORY_TTL_DAYS` | `30` | turn_jsonl retention; 0 disables the run-end prune |
-| `MO_FALLBACK_CODING` | `"minimax,codex,sonnet"` | Fallback lane chain for coding roles |
-| `MO_FALLBACK_REVIEW` | `"opus,kimi,sonnet"` | Fallback lane chain for review roles |
+| `MO_FALLBACK_CODING` | `"minimax,glm,deepseek_flash"` | Fallback lane chain for coding roles |
+| `MO_FALLBACK_REVIEW` | `"opus,glm,sonnet"` | Fallback lane chain for review roles |
 | `MINI_ORK_LEASE_TOKEN` | *(flag)* | Single-writer lease token passed through recovery |
 | `MINI_ORK_RECOVERY_CLOSURE` | `""` | Recovery closure node set (set by `mini-ork recover`) |
 | `MINI_ORK_WORKFLOW_VERSION_ID` | *(flag)* | Pin the workflow version stamped in traces |

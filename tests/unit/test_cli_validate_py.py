@@ -279,6 +279,166 @@ def test_provider_secret_present_is_clean(env, capsys, monkeypatch):
     assert capsys.readouterr().out == "validate: OK\n"
 
 
+def test_store_backed_credential_is_not_reported_missing(env, capsys, monkeypatch):
+    """The dispatcher resolves credentials through `provider_environment` (the
+    owner-only store overlaid by the ambient env), so a check reading only
+    `os.environ` reports every store-backed lane as missing — 12 false warnings
+    on the live engine home, burying the one real fault."""
+    root, home = env
+    _recipe(root, "demo")
+    cfg = home / "config"
+    cfg.mkdir()
+    (cfg / "providers.yaml").write_text(
+        "providers:\n  glm:\n    api_key_env: GLM_STORE_ONLY_KEY\n", encoding="utf-8")
+    store = cfg / "secrets.local.sh"
+    store.write_text("export GLM_STORE_ONLY_KEY='from-the-store'\n", encoding="utf-8")
+    store.chmod(0o600)
+    monkeypatch.delenv("GLM_STORE_ONLY_KEY", raising=False)
+
+    assert validate.main(["--recipe", "demo"]) == 0
+    assert "provider secret missing" not in capsys.readouterr().err
+
+
+def test_unreadable_secret_store_warns_once(env, capsys, monkeypatch):
+    """Fail closed: a permissive store must not read as "credentials are fine,
+    just not exported", and the two checks must not both say so."""
+    root, home = env
+    _recipe(root, "demo")
+    cfg = home / "config"
+    cfg.mkdir()
+    (cfg / "providers.yaml").write_text(
+        "providers:\n  glm:\n    kind: anthropic-compat\n    api_key_env: GLM_KEY\n",
+        encoding="utf-8")
+    store = cfg / "secrets.local.sh"
+    store.write_text("export GLM_KEY='x'\n", encoding="utf-8")
+    store.chmod(0o644)  # world-readable: SecretStoreError
+    monkeypatch.setenv("GLM_KEY", "x")
+
+    assert validate.main(["--recipe", "demo"]) == 0
+    err = capsys.readouterr().err
+    assert err.count("cannot read the local secret store") == 1
+    assert "owner-only, 0600" in err
+
+
+# ── lane liveness (Check 5) ───────────────────────────────────────────────────
+# Check 4 proves a credential is PRESENT; Check 5 proves it WORKS. The gap is
+# the shipped failure: kimi sat in both dispatch_chain fallback tails with a
+# 401-rejected key, so every coding/review node that fell through to it died
+# with a misleading `lane preflight failed` and nothing at instantiation said
+# so. Every test here stubs `providers.lane_health` — the check must never
+# touch the network from a unit test, and the stub is the seam that proves the
+# check consults the SAME health function the run-start gate uses.
+
+def _gateway_lane(home: Path, *, name: str = "glm", key_env: str | None = "GLM_KEY",
+                  kind: str = "anthropic-compat") -> None:
+    cfg = home / "config"
+    cfg.mkdir(exist_ok=True)
+    key_line = f"    api_key_env: {key_env}\n" if key_env else ""
+    (cfg / "providers.yaml").write_text(
+        f"providers:\n  {name}:\n    kind: {kind}\n    model: m-{name}\n" + key_line,
+        encoding="utf-8")
+
+
+def _stub_health(monkeypatch, health):
+    from mini_ork.dispatch import providers as providers_mod
+    monkeypatch.setattr(providers_mod, "lane_health",
+                        lambda model, root=None, **kw: health)
+
+
+def test_dead_lane_is_an_error_not_a_warning(env, capsys, monkeypatch):
+    """The kimi shape: credential set, credential rejected."""
+    from mini_ork.dispatch.providers import LaneHealth
+    _root, home = env
+    _recipe(_root, "demo")
+    _gateway_lane(home)
+    monkeypatch.setenv("GLM_KEY", "set-but-dead")
+    _stub_health(monkeypatch, LaneHealth(
+        False, "API key rejected (HTTP 401) — every dispatch on this lane would fail"))
+
+    assert validate.main(["--recipe", "demo"]) == 1
+    captured = capsys.readouterr()
+    assert ("[error]   lane 'glm' is unhealthy: API key rejected (HTTP 401) — "
+            "every dispatch on this lane would fail\n") in captured.err
+    assert "secrets.local.sh" in captured.err
+    assert captured.err.endswith("validate: 1 error(s), 0 warning(s)\n")
+
+
+def test_healthy_probed_lane_is_clean(env, capsys, monkeypatch):
+    from mini_ork.dispatch.providers import LaneHealth
+    _root, home = env
+    _recipe(_root, "demo")
+    _gateway_lane(home)
+    monkeypatch.setenv("GLM_KEY", "live")
+    _stub_health(monkeypatch, LaneHealth(True, "ok"))
+
+    assert validate.main(["--recipe", "demo"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "validate: OK\n"
+    assert captured.err == ""
+
+
+def test_unset_credential_is_check_4s_finding_not_a_liveness_error(env, capsys, monkeypatch):
+    """An unset key must stay a warning: CI has no credentials, and a hard
+    error there would make every lint-only validate run red."""
+    from mini_ork.dispatch.providers import LaneHealth
+    _root, home = env
+    _recipe(_root, "demo")
+    _gateway_lane(home, key_env="GLM_ABSENT_KEY")
+    monkeypatch.delenv("GLM_ABSENT_KEY", raising=False)
+    _stub_health(monkeypatch, LaneHealth(False, "should never be consulted"))
+
+    assert validate.main(["--recipe", "demo"]) == 0
+    captured = capsys.readouterr()
+    assert "[warning] provider secret missing: glm -> GLM_ABSENT_KEY" in captured.err
+    assert "unhealthy" not in captured.err
+
+
+def test_unprobed_lanes_are_named_rather_than_read_as_verified(env, capsys, monkeypatch):
+    """A native lane, or probes switched off: ok, but nobody checked. Silence
+    here is how `validate: OK` comes to mean less than it reads."""
+    from mini_ork.dispatch.providers import LaneHealth
+    _root, home = env
+    _recipe(_root, "demo")
+    _gateway_lane(home, name="codexish", kind="anthropic-native", key_env=None)
+    _stub_health(monkeypatch, LaneHealth(
+        True, "ok (unprobed: native lane — auth owned by the CLI)"))
+
+    assert validate.main(["--recipe", "demo"]) == 0
+    captured = capsys.readouterr()
+    assert ("[warning] lane liveness not verified for 1 lane(s): codexish\n") in captured.err
+    assert "MO_LANE_PROBE=1" in captured.err
+
+
+def test_non_probeable_kind_is_skipped(env, capsys, monkeypatch):
+    """`lane_health` answers an unknown kind with "unsupported kind" — a
+    providers.yaml shape problem, not a liveness verdict, and not this check's."""
+    from mini_ork.dispatch.providers import LaneHealth
+    _root, home = env
+    _recipe(_root, "demo")
+    cfg = home / "config"
+    cfg.mkdir()
+    (cfg / "providers.yaml").write_text(
+        "providers:\n  odd:\n    api_key_env: ODD_KEY\n", encoding="utf-8")
+    monkeypatch.setenv("ODD_KEY", "x")
+    _stub_health(monkeypatch, LaneHealth(False, "provider 'odd' has unsupported kind: None"))
+
+    assert validate.main(["--recipe", "demo"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "validate: OK\n"
+
+
+def test_strict_mode_escalates_the_unprobed_warning(env, capsys, monkeypatch):
+    from mini_ork.dispatch.providers import LaneHealth
+    _root, home = env
+    _recipe(_root, "demo")
+    _gateway_lane(home, name="codexish", kind="anthropic-native", key_env=None)
+    _stub_health(monkeypatch, LaneHealth(True, "ok (unprobed: native lane)"))
+
+    assert validate.main(["--recipe", "demo", "--strict"]) == 1
+    assert capsys.readouterr().err.endswith(
+        "validate: 0 error(s), 1 warning(s) (strict mode)\n")
+
+
 # ── strict mode / summary ─────────────────────────────────────────────────────
 
 def test_strict_turns_warnings_into_exit_1(env, tmp_path, capsys):

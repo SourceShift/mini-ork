@@ -92,6 +92,38 @@ Limitations:
   `Authorization: Bearer`, else `CLAUDE_CODE_OAUTH_TOKEN` → Bearer + the
   `anthropic-beta: oauth-2025-04-20` header.
 
+### Lane liveness at instantiation (`mini-ork validate`)
+
+The gate above fires when a **run** starts. `mini-ork validate` (Check 5) asks
+the same `lane_health()` question at **configuration** time: every lane in the
+active `providers.yaml` whose credential is set gets one cached 1-token probe,
+and a lane that answers a definitive refusal (401/402/403, or a quota-walled
+429) is an **error**, not a warning:
+
+```
+[error]   lane 'kimi' is unhealthy: kimi: API key rejected (HTTP 401) at https://api.kimi.com/coding/v1/messages — every dispatch on this lane would fail
+          Fix: fix the credential in <home>/config/secrets.local.sh, or remove the lane from <home>/config/providers.yaml — every dispatch on it will fail
+```
+
+This exists because the run-start gate is too late to be the only one: a dead
+lane that only fires once a run has been planned, dispatched and paid for has
+already cost more than the probe. It is also the check that makes the shipped
+`MO_FALLBACK_CODING` / `MO_FALLBACK_REVIEW` defaults safe to trust.
+
+Deliberately **not** findings: a lane whose `api_key_env` is unset (the
+secret-presence check owns that message, so a credential-less CI does not go
+red), and a lane whose kind is not probeable (`codex-native`,
+`opencode-native`, or a malformed entry — no cheap assertion exists). When
+probes are off (`MO_LANE_PROBE=0`, `MINI_ORK_DRY_RUN=1`) or a lane is native
+with no credential var, validate says so rather than reporting a liveness check
+that never ran: `lane liveness not verified for N lane(s): …`.
+
+Credentials resolve through `provider_environment()` — the owner-only local
+store overlaid by the environment, the same resolution `dispatch_model` uses.
+Reading only `os.environ` reports every store-backed credential as missing;
+fixing that is what took one live home from 12 phantom "secret missing"
+warnings to the single real fault.
+
 The `budget:` block in `agents.yaml` (`daily_cap_usd`, `per_run_usd`,
 `per_epic_usd`) is **display only**: the IDE lanes page renders it and the
 Python SDK client prints it, but no gate reads it. `MO_DAILY_BUDGET_USD` is the
