@@ -863,6 +863,48 @@ def _act_node(home: Path, run_id: str, node_id: str | None,
     return build_node(home, run_id, node_id or "", view=view, offset=offset or 0)
 
 
+def _receipt_line(node: str) -> str:
+    """The one-line steer receipt the IDE shows as its toast.
+
+    ``HH:MM`` is deliberately LOCAL time: the toast is read by a person at
+    their desk, so the codebase's UTC-ISO convention (``scheduler.py``,
+    ``trace_store.py``) does not apply to this human-facing string.
+    """
+    clock = time.strftime("%H:%M")
+    if node:
+        return f"Sent to {node} at {clock} — the agent reads it at its next turn"
+    return f"Queued for the next node at {clock} — no node is running now"
+
+
+def _running_node(home: Path, run_id: str) -> str:
+    """The node a steer lands on: the last ``node_start`` with no ``node_end``.
+
+    Reuses the shared lifecycle derivation (``derive_node_statuses``) instead
+    of hand-rolling the event scan, so the receipt and the DAG agree on what
+    "running" means. One bounded read; a broken lifecycle degrades to ``""``
+    (the queued wording), never an exception out of the verb.
+    """
+    try:
+        from mini_ork.web.deps import db_for
+        from mini_ork.web.repositories import (
+            RunDetailRepository, derive_node_statuses,
+        )
+
+        events = RunDetailRepository(db_for(home)).fetch_node_lifecycle_events(run_id)
+    except Exception:  # noqa: BLE001 — a bad lifecycle read must not fail a steer
+        return ""
+    running = [
+        (info.get("started_at"), node_id)
+        for node_id, info in derive_node_statuses(events).items()
+        if info.get("status") == "running"
+    ]
+    if not running:
+        return ""
+    # The most recently started open node is the one a note reaches next.
+    running.sort(key=lambda pair: (pair[0] is None, pair[0] or 0))
+    return running[-1][1]
+
+
 def _act_steer(home: Path, run_id: str, text: str | None, role: str | None,
                severity: str | None) -> dict[str, Any]:
     """``board steer <run_id> --text ... --role ... --severity ...`` — inject an
@@ -872,14 +914,34 @@ def _act_steer(home: Path, run_id: str, text: str | None, role: str | None,
     ``source="ide"`` so a future audit can tell IDE-origin rows from CLI /
     dashboard ones. ``steer_run`` returns ``ok: false`` and a typed error on
     a bad role/severity — ``main()`` then exits 1.
+
+    A terminal run has no next turn to deliver to, so it is refused *before*
+    anything is written (same "not controllable (already terminal)" shape as
+    ``stop_run``). On success the payload carries a human ``receipt`` naming
+    the node the note reaches, or the queued wording when none is running.
     """
-    from mini_ork.web.control import steer_run
+    from mini_ork.web.control import CONTROLLABLE_STATUSES, steer_run
     from mini_ork.web.deps import db_for
 
-    return steer_run(db_for(home), run_id, text or "",
-                     role_target=role or "any",
-                     severity=severity or "info",
-                     source="ide")
+    db = db_for(home)
+    row = db.row("SELECT status FROM task_runs WHERE id = ?", (run_id,))
+    # An unknown run (``row is None``) falls through to ``steer_run``, which
+    # owns the "not found" message and keeps today's exit code.
+    if row is not None and row.get("status") not in CONTROLLABLE_STATUSES:
+        return {
+            "ok": False,
+            "error": (f"task_run status '{row.get('status')}' not controllable "
+                      "(already terminal)"),
+            "task_run_id": run_id,
+        }
+
+    payload = steer_run(db, run_id, text or "",
+                        role_target=role or "any",
+                        severity=severity or "info",
+                        source="ide")
+    if payload.get("ok"):
+        payload["receipt"] = _receipt_line(_running_node(home, run_id))
+    return payload
 
 
 def _act_answer(home: Path, run_id: str, texts: list[str],
@@ -1410,7 +1472,14 @@ def main(rest: list[str], root: str) -> int:
         sys.stderr.write(f"mini-ork board runs: {exc}\n")
         return 2
     sys.stdout.write(json.dumps(payload, default=str) + "\n")
-    if payload.get("ok", True) is False:
+    failed = payload.get("ok", True) is False
+    if args.verb == "steer" and not failed and not args.json and payload.get("receipt"):
+        # The IDE shows the command's LAST stdout line as the toast. The JSON
+        # line above stays for machine callers; the human receipt goes after
+        # it so it *is* that last line. With ``--json`` the receipt already
+        # rides in the payload, so nothing extra is printed.
+        sys.stdout.write(f"{payload['receipt']}\n")
+    if failed:
         # The kickoff limits stderr writes to the two new verbs (restore
         # carries ``reason``; checkpoints uses ``error``). Other verbs
         # keep the pre-kickoff behaviour of exiting 1 silently — touching
