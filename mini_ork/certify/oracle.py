@@ -97,15 +97,31 @@ _TEST_RESULT_RE = re.compile(
 #: not a real failing assertion.
 
 
+#: pytest's quiet flags, as whole words. `-q` and `-v` are ADDITIVE
+#: (`-q` is -1, `-v` is +1), so `pytest -q` plus our injected `-v` still nets
+#: to default verbosity and emits the progress line plus the
+#: `FAILED <id> - <reason>` short summary — neither matches _TEST_RESULT_RE,
+#: which puts the id BEFORE the status.
+_PYTEST_QUIET_RE = re.compile(r"(?<!\S)(?:-q+|--quiet)(?!\S)")
+
+
 def _ensure_pytest_verbose(cmd: str) -> str:
-    """Insert `-v --tb=no` into a pytest command that lacks verbose flags.
+    """Insert `-v --tb=no` into a pytest command, dropping any quiet flags.
 
     Non-pytest commands are returned unchanged; the caller is responsible
     for skipping the replay when the test runner cannot produce per-test
     output. We auto-augment so most callers don't have to think about it.
+
+    Quiet flags must be removed rather than merely out-voted, because the
+    runner's verbosity is the sum of its flags: leaving `-q` in place makes the
+    augmentation a no-op, the base side parses to zero tests, and the
+    `base_rc != 0 and not (base_pass or base_fail)` guard then reports a
+    genuinely red baseline as "could not run" — so no delta is minted and the
+    publisher abstains on an unproven `target` level.
     """
     if "pytest" not in cmd:
         return cmd
+    cmd = _PYTEST_QUIET_RE.sub("", cmd)
     if re.search(r"(?:^|\s)(?:-v\b|--verbose\b)", cmd):
         return cmd
     return re.sub(r"\bpytest\b", "pytest -v --tb=no", cmd, count=1)

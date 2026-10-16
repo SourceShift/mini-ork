@@ -27,9 +27,13 @@ VERIFIER = REPO_ROOT / "recipes" / "code-fix" / "verifiers" / "test.py"
 # `-p no:cacheprovider` keeps `.pytest_cache/` out of the candidate
 # working tree; otherwise the verifier leaves pytest's cache behind and
 # the "byte-identical" check on test 4 has to special-case it.
-# We deliberately do NOT pass `-q`: pytest resolves conflicting verbosity
-# flags by taking the LAST one, so a trailing `-q` would silence the
-# per-test lines the replay helper needs to parse.
+# We deliberately do NOT pass `-q`: the replay helper injects `-v --tb=no`
+# and pytest's verbosity options are ADDITIVE (-q is -1, -v is +1), so a `-q`
+# alongside it nets back to default output and the per-test lines vanish.
+# The helper strips quiet flags itself now (see
+# oracle._ensure_pytest_verbose, covered by test_replay_passes_for_real_fix_
+# with_quiet_flag), so avoiding `-q` here is belt-and-braces rather than a
+# requirement.
 TEST_CMD = "python3 -m pytest -p no:cacheprovider"
 
 
@@ -141,6 +145,38 @@ def test_replay_passes_for_real_fix(tmp_path):
     assert before_status == after_status, (
         f"git status changed\nbefore={before_status!r}\nafter={after_status!r}"
     )
+
+
+# ── 1b. a caller's `-q` must not defeat the verbose augmentation ───────────
+def test_replay_passes_for_real_fix_with_quiet_flag(tmp_path):
+    """`pytest -q` must not silence the per-test lines the delta gate parses.
+
+    pytest's verbosity options are ADDITIVE (-q is -1, -v is +1), so the
+    helper's injected `-v` was cancelled out whenever the caller's command
+    already carried `-q`. The base log then held only the
+    `FAILED <id> - <reason>` short summary, which _TEST_RESULT_RE cannot
+    match (it needs the id BEFORE the status), so a genuinely red baseline
+    was reported as "could not run" and no delta was minted — leaving the
+    `target` level unproven while the tests were in fact red-on-base and
+    green-on-candidate. The helper strips the quiet flags instead.
+    """
+    repo = _make_repo(
+        tmp_path,
+        mod_src="def add(a, b):\n    return a - b\n",
+        test_src="from mod import add\n\ndef test_add():\n    assert add(2, 3) == 5\n",
+    )
+    # Same shape as test 1: HEAD buggy, fix lives uncommitted in the tree.
+    (repo / "mod.py").write_text("def add(a, b):\n    return a + b\n")
+
+    out = _run_verifier(
+        repo, tmp_path, replay="1", run_id="replay-pass-quiet",
+        test_cmd="python3 -m pytest -q -p no:cacheprovider",
+    )
+
+    assert out["verifier"] == "test"
+    assert out["pass"] is True, out
+    overlap = out["replay"]["overlap"]
+    assert any("test_add" in tid for tid in overlap), overlap
 
 
 # ── 2. test passes on base too → fail (tests-do-not-exercise-change) ───────
