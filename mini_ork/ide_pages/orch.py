@@ -75,15 +75,6 @@ def _epoch(value: Any) -> int | None:
         return None
 
 
-def _latest_run_with(home: Path, *names: str) -> tuple[str, Path] | None:
-    """The newest run whose run dir holds one of ``names``."""
-    for row in _rows(home, "SELECT id FROM task_runs ORDER BY created_at DESC, rowid DESC LIMIT 60"):
-        run_dir = home / "runs" / str(row["id"])
-        if any((run_dir / n).is_file() for n in names):
-            return str(row["id"]), run_dir
-    return None
-
-
 def _read_json(path: Path) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -735,8 +726,12 @@ _WAIT_ALERT_S = int(os.environ.get("MO_DECIDE_ALERT_S") or 3600)
 #: tab rather than growing an unbounded column of questions.
 _DECIDE_LIMIT = 10
 #: How many of the newest runs are asked whether they hold a profile. The same
-#: newest-first window ``_latest_run_with`` scans.
+#: newest-first window both the Decide tab and the classifications table read.
 _PROFILE_SCAN = 60
+#: The confidence under which a classification is worth a second look. The
+#: classifications table orders by it and its note counts the rows under it —
+#: the router-tuning surface is the doubtful end of this list, not the newest.
+_LOW_CONFIDENCE = 0.7
 
 
 def _waited(seconds: int) -> str:
@@ -818,8 +813,13 @@ def _recent_profiles(home: Path, errors: dict[str, str],
 
     The wait is measured from the profile file's mtime: the question was asked
     when the gate wrote it, and nothing rewrites the file until it is answered.
+
+    Each row also carries what the *classification* reader needs — the run dir,
+    the router's own ``task_class`` and confidence, and the run's outcome — so
+    the classifications table reads the same walk rather than a second one that
+    could disagree with it about which runs hold a profile.
     """
-    rows = _rows(home, "SELECT id, created_at FROM task_runs "
+    rows = _rows(home, "SELECT id, created_at, task_class, status FROM task_runs "
                        "ORDER BY created_at DESC, rowid DESC LIMIT ?", (limit,))
     found: list[dict[str, Any]] = []
     for row in rows:
@@ -842,9 +842,13 @@ def _recent_profiles(home: Path, errors: dict[str, str],
         pending = _pending_questions(profile, answers)
         found.append({
             "run_id": run_id,
+            "run_dir": run_dir,
             "asked_at": asked_at,
             "created_at": str(row["created_at"] or ""),
             "recipe": str(profile.get("recipe") or ""),
+            "task_class": str(profile.get("task_class") or row["task_class"] or ""),
+            "confidence": profile.get("confidence"),
+            "status": str(row["status"] or ""),
             "profile_status": str(profile.get("profile_status") or ""),
             "pending": pending,
             "needs_answers": profile.get("profile_status") == "needs_answers" and bool(pending),
@@ -895,24 +899,107 @@ def _decide(home: Path, now: int, errors: dict[str, str]) -> list[dict[str, Any]
     return out
 
 
-def _planner(home: Path) -> list[dict[str, Any]]:
-    # Keyed on the profile alone: requiring a literal plan.json hid every run
-    # whose recipe plans with its own artefact (epic-runner), so this page
-    # reported "no run classified yet" while such runs sat in the run dir.
-    found = _latest_run_with(home, "run_profile.json")
-    if found is None:
+def _planner(home: Path, args: dict[str, Any], errors: dict[str, str]) -> list[dict[str, Any]]:
+    """The classifications table, then the row it has selected.
+
+    Keyed on the profile alone: requiring a literal ``plan.json`` hid every run
+    whose recipe plans with its own artefact (epic-runner), so this page
+    reported "no run classified yet" while such runs sat in the run dir.
+
+    The default selection is the first row — the least confident run — so the
+    panel below always details a row the reader can see highlighted. An
+    ``--arg run_id=`` that names no row is ignored rather than joined into a
+    path: the id arrives as a string from the IDE.
+    """
+    items = sorted(_recent_profiles(home, errors), key=_confidence_rank)
+    if not items:
         return [S.lst("Classification", [S.dot("No run has been classified yet")], full=True)]
-    run_id, run_dir = found
+    wanted = str(args.get("run_id") or "")
+    selected = next((item for item in items if item["run_id"] == wanted), items[0])
+    return [_classify_table(items, selected["run_id"])] + _classification_detail(selected)
+
+
+def _confidence(item: dict[str, Any]) -> float | None:
+    """The router's own confidence, when it recorded one.
+
+    ``run_profile.json`` is written by the profile gate, and a recipe that
+    plans without the gate leaves the field out — so "no confidence" is
+    ordinary and is not the same as a low one.
+    """
+    value = item.get("confidence")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _confidence_rank(item: dict[str, Any]) -> tuple[bool, float]:
+    """Lowest first; a profile that never recorded one sorts last.
+
+    Ranking a missing confidence as ``0.0`` would put every gate-skipping
+    recipe at the top of the very review queue this order exists to build.
+    """
+    confidence = _confidence(item)
+    return (confidence is None, confidence if confidence is not None else 0.0)
+
+
+def _outcome_cell(status: str) -> dict[str, Any]:
+    """The run's own status, plainly: landed, lost, or still going."""
+    if status == "published":
+        return S.cell(f"✓ {status}", "green")
+    if status in ("failed", "rolled_back"):
+        return S.cell(f"✗ {status}", "red")
+    return S.cell(f"· {status or 'classified'}", "sub")
+
+
+def _classify_table(items: list[dict[str, Any]], selected: str) -> dict[str, Any]:
+    """Every recent classification, the doubtful ones first, one row per run.
+
+    A row's click and its Review button are the same action: ``S.set_args``
+    re-reads this tab with ``--arg run_id=<row>``, which is what makes the plan
+    below follow the row rather than the newest run.
+    """
+    confidences = [_confidence(item) for item in items]
+    low = sum(1 for c in confidences if c is not None and c < _LOW_CONFIDENCE)
+    rows: list[dict[str, Any]] = []
+    for item, confidence in zip(items, confidences, strict=True):
+        run_id = item["run_id"]
+        pick = S.set_args(run_id=run_id)
+        rows.append({
+            "cells": [S.mono(run_id[-12:] if len(run_id) > 12 else run_id),
+                      S.cell(item["task_class"] or "—"),
+                      S.muted(item["recipe"] or "—"),
+                      S.mono("—" if confidence is None else f"{confidence:.2f}"),
+                      _outcome_cell(item["status"])],
+            "do": pick,
+            "sel": run_id == selected,
+            "acts": [S.btn("Review", pick, "ghost")],
+        })
+    return S.table("Classifications",
+                   [S.col(fr=1), S.col(fr=1), S.col(fr=1), S.col(56), S.col(130)],
+                   ["run", "task_class", "recipe", "conf", "outcome"], rows, full=True,
+                   note=f"{low} of {len(items)} below confidence {_LOW_CONFIDENCE:g}; "
+                        "lowest first, so a mis-route is a row near the top.")
+
+
+def _classification_detail(item: dict[str, Any]) -> list[dict[str, Any]]:
+    """The clicked run's own profile, plan and questions.
+
+    ``item`` is a row of the table above, so the run being detailed is one the
+    reader could see and click; an id that names no row never reaches here.
+    """
+    run_id, run_dir = item["run_id"], item["run_dir"]
     short = run_id[-12:] if len(run_id) > 12 else run_id
     out: list[dict[str, Any]] = []
     profile = _read_json(run_dir / "run_profile.json")
     if isinstance(profile, dict):
-        conf = profile.get("confidence")
+        # The same reading the table's own column makes, so a row that shows an
+        # em dash cannot detail a percentage beside it.
+        confidence = _confidence(profile)
         out.append(S.kv(f"Classification · {short}", [
             ("task_class", profile.get("task_class") or "—"),
             ("recipe", profile.get("recipe") or "—"),
             ("risk", profile.get("risk_tolerance") or "—"),
-            ("confidence", f"{float(conf):.2f}" if isinstance(conf, (int, float)) else "—"),
+            ("confidence", "—" if confidence is None else f"{confidence:.2f}"),
             ("status", profile.get("profile_status") or "—",
              "green" if profile.get("profile_status") == "ready" else "yellow"),
         ], actions=[S.btn("Open run", S.open_run(run_id, str(profile.get("user_goal") or "")), "ghost")]))
@@ -945,7 +1032,7 @@ def _planner(home: Path) -> list[dict[str, Any]]:
         if text:
             q_items.append(S.item(str(text), f"profile_gate · {short}", m="?", mc="yellow",
                                   acts=[S.btn("Answer", S.thread(f"Answer for {run_id}: "), "primary")]))
-    out.append(S.lst("Planner questions", q_items or [S.dot("No open questions", f"latest profiled run {short}")],
+    out.append(S.lst("Planner questions", q_items or [S.dot("No open questions", f"profiled run {short}")],
                      full=True, note="When the profile gate finds ambiguous inputs the run waits for "
                                      "answers, then resumes."))
     return out
@@ -1641,7 +1728,7 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     elif tab == "races":
         sections += S.guarded(errors, "Races", lambda: _races(home, now))
     elif tab == "planner":
-        sections += S.guarded(errors, "Classify & plan", lambda: _planner(home))
+        sections += S.guarded(errors, "Classify & plan", lambda: _planner(home, args, errors))
     elif tab == "intake":
         sections += S.guarded(errors, "Intake", lambda: _intake(home, errors))
     else:

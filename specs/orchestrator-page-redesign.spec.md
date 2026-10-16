@@ -5,8 +5,8 @@
 > `2026-10-15-orchestrator-intake-redesign.md` (the journey + FE/BE design).
 >
 > ⚠️ **The line anchors in both companions are stale.** They were taken against
-> `mini_ork/ide_pages/orch.py` at 604 lines; it is now **791** and the functions
-> have moved (`_arrivals` 485→723, `_planner` 312→312, `build` 565→753). Cite the
+> `mini_ork/ide_pages/orch.py` at 604 lines; it is now **~930** and the functions
+> have moved (`_arrivals` 485→723, `_planner` 312→900, `build` 565→1625). Cite the
 > **function name**, never the line, when implementing from them.
 
 ## Overview
@@ -56,11 +56,13 @@ or a shell.
 |---|---|---|---|
 | **P0 — Wiring** ✅ | No new verbs, no schema. Six payload fixes composing existing data. | J3, J4, J7, J8, J10 | Low |
 | **P1 — Dispatch** ✅ | `board start`, `kickoff new`, the Dispatch tab. | J1, J3 | Medium — spawns processes |
-| **P2 — Answers** ✅ | Recent-run profile scan, `board answer`, the blocked-on-you panel. | J5, J9 | Low |
+| **P2 — Answers** ✅ | Recent-run profile scan, `board answer`, the blocked-on-you panel, the classifications table. | J5, J9 | Low |
 | **P3 — Races** ✅ | `board race-keep`, `intake_events.run_id`, arrivals link, the race panel. | J2, J6 | Medium — schema + git merge |
 | **P4 — Attention** ✅ | The strip, once its four inputs exist. | all | Low |
 
-✅ = implemented (P0 2026-10-15, P1–P4 2026-10-16). All four phases are in.
+✅ = implemented (P0 2026-10-15, P1–P4 2026-10-16, P2's classifications table FR-023 the
+same day). All four phases are in, and every acceptance criterion now has something
+implementing it.
 
 Each phase is independently shippable and independently revertable. P0 delivers
 user-visible improvement with **zero new CLI surface** — it is the recommended first
@@ -243,9 +245,10 @@ string `"/kickoff "` — trailing space, no argument.
 ### Phase 2 — Answers
 
 #### FR-020: Recent-run profile scan
-`orch._planner` inspects only the newest run that holds a `run_profile.json`
-(verified: `_latest_run_with`). A run parked on `needs_answers` three runs back is
-invisible.
+The page had no scan at all: `orch._planner` inspected only the newest run holding a
+`run_profile.json` (a `_latest_run_with` helper that has since been deleted — FR-023
+replaced its one caller). A run parked on `needs_answers` three runs back was
+invisible, and no run's classification could be revisited.
 
 - **The engine shall** provide a helper returning the profiles of the most recent N
   runs (N=60), reading each run directory's `run_profile.json` through the existing
@@ -287,6 +290,28 @@ flips `profile_status` to `ready`, raises `confidence` to ≥0.9 and clears
   entry's tone with age.
 - **When** a run has been waiting beyond a configurable threshold, **the engine shall**
   include the run's recipe and start time so the cost of leaving it parked is visible.
+
+#### FR-023: The classifications table
+J9's surface. The tab reported one run — whichever was newest — so the router's recent
+decisions were unreviewable and a mis-route could not be looked up at all.
+
+- **The engine shall** render, on the Classify & plan tab, one `table` of the runs
+  FR-020's scan found, with the run, its task class, its recipe, its confidence and its
+  outcome as columns.
+- **The engine shall** order that table by confidence, lowest first, so the rows most
+  likely to be a mis-route come first.
+- **When** a profile records no confidence, **the engine shall** sort it after every run
+  that recorded one, rather than as the least confident — a gate-skipping recipe is not
+  a doubtful decision.
+- **The engine shall** state in the table's note how many of its rows fall below the
+  low-confidence threshold.
+- **When** a row is activated, **the engine shall** re-read the tab with that row's run
+  id (`S.set_args`) and **shall** render that run's classification, plan and open
+  questions below the table — not the newest run's.
+- **When** no run id is given, **the engine shall** detail the first row drawn, so the
+  detail never describes a run the table is not highlighting.
+- **When** the given run id names no row, **the engine shall** ignore it: the id arrives
+  as a string from the IDE and is never joined into a filesystem path.
 
 ### Phase 3 — Races and arrivals
 
@@ -549,6 +574,17 @@ stubbed here; AC-006's live replay needs a runner.*
 **When** the engineer opens the classifications table,
 **Then** all twelve appear ordered so the low-confidence rows are visible, and selecting a row shows **that** run's plan — not the newest run's.
 
+*Satisfied by FR-023 — unit-level, and rendered with existing vocabulary only (no fork
+change). Unit evidence: `test_twelve_profiled_runs_all_appear_ordered_by_confidence`
+(twelve rows, the confidence column ascending, the note reading `2 of 12 below
+confidence 0.7`, on a fixture where the doubtful runs are neither the newest nor
+adjacent); `test_selecting_a_row_shows_that_runs_plan_not_the_newest_runs` (the picked
+run is the *newer, higher-confidence* one — the panel proves the click, not the
+default); `test_argv_the_ide_sends_selects_the_row` (`--arg run_id=` through the real
+`board page` argv). The live half — a real router mis-route reviewed and acted on — is
+the same cross-cutting replay item; J9's correction path stays out of scope (§ Out of
+Scope), so the table is read-only.*
+
 ### AC-010: J10 — Resume a thread
 **Given** a prior orchestrator thread,
 **When** the engineer activates its row,
@@ -605,7 +641,7 @@ Stated explicitly, with cost, so a reviewer can decline them knowingly.
 
 ## Implementation TODO
 
-### P0 — Wiring (no new verbs, no schema) — **implemented 2026-10-15, not yet tested**
+### P0 — Wiring (no new verbs, no schema) — **implemented 2026-10-15, tested 2026-10-16**
 - [x] FR-001 — `spec.errors_callout(errors)`; appended in `board_cmd.build_payload`, not
       `orch.build`, because the reaper merges its error into `payload["errors"]` *after*
       `build_page` returns — a callout built inside `orch.build` would miss it.
@@ -653,10 +689,15 @@ Stated explicitly, with cost, so a reviewer can decline them knowingly.
       Extended to all eight tabs (`session, dispatch, decide, kickoffs, races, planner,
       coord, intake`) as part of P2. `pytest tests/unit/test_ide_pages_actions.py` →
       **4 passed**, so every action on every tab parses against its own parser.
-- [ ] **Stale assertions in `tests/unit/test_ide_pages_orch.py`: 6 failures — 5
-      pre-dating P2 and caused by P1's own design changes, plus one new one caused by
-      P3's FR-033 — all left unfixed per the working agreement (tests are not touched
-      until the implementer's change is confirmed).**
+- [ ] **Stale assertions in `tests/unit/test_ide_pages_orch.py`: 7 failures — 5
+      pre-dating P2 and caused by P1's own design changes, one caused by
+      P3's FR-033, and one caused by FR-023 — all left unfixed per the working
+      agreement (tests are not touched until the implementer's change is confirmed).**
+      The seventh, `test_planner_reads_the_latest_profile_and_plan`, asserts the
+      pre-FR-023 shape of the Planner tab: it indexes `sections[0]` and expects the
+      classification `kv` there. FR-023 puts the classifications table first, because
+      the table is what you pick from and the detail is what follows the pick;
+      `tests/unit/test_ide_pages_orch_classify.py` is its replacement.
       The sixth, `test_races_group_contestants`, asserts the pre-FR-033 shape: one
       table row per race. FR-033 deliberately reversed that (one *section* per race, the
       contestants as its rows) because the contestants are the decision input and the
@@ -669,7 +710,7 @@ Stated explicitly, with cost, so a reviewer can decline them knowingly.
       FR-003 turned the session tab's leading `kv` into three `chips` pickers;
       `test_kickoffs_are_linted_and_link_their_runs` expects the pre-FR-002 sub text
       (`"lint: The kickoff…"` where `_kickoff_parts` now writes
-      `"saved · lint: ⚠ The kickoff…"`). The remaining 5 tests in the file pass.
+      `"saved · lint: ⚠ The kickoff…"`). The remaining 4 tests in the file pass.
       A **seventh stale failure lives in another file**:
       `tests/unit/test_native_dispatch_py.py::test_all_former_exec_subs_registered_natively`
       pins `_NATIVE_MODULE_SUBS` by exact set, and FR-011 added `kickoff` to it. Left
@@ -720,7 +761,51 @@ Stated explicitly, with cost, so a reviewer can decline them knowingly.
       because the verb refuses a bare `--text` on a multi-question run.
 - [x] Tests — `tests/unit/test_board_answer.py` (11) + `tests/unit/test_ide_pages_orch_decide.py` (12), **22 passed**. Covered: single-question success flips the status and clears the questions; several-pending refusal lists the ids *and* writes nothing; paired `--for/--text` answers several in one call; `--for` by text; unknown id; count mismatch; no-pending; never-asked; unknown run; `--text` required; `steer` still reads its text; only parked runs listed, longest first; an answered and an unprofiled run excluded; per-question composers; id preserved for the unanswered half of a partly answered run; tone escalation and colour validity; the long-wait detail; an unreadable and a non-object profile into `errors`; a dict question normalised to its text. Plus the seam: the emitted composer argv, with the typed text appended, runs through `board_cmd.main` and answers the right question.
 - [x] Cross-check — `pytest tests/unit/test_ide_pages_node.py test_ide_pages_inbox_kanban.py test_ide_pages_thread.py test_ide_header_lanes_composer.py` → **95 passed**, i.e. the shared `--text` change did not disturb `steer`.
-- [ ] **Not done, still open:** P3's classification table was to *share* this scan; when FR-033 lands, `_recent_profiles` is the seam to reuse rather than re-walk.
+- [x] FR-023 — **the classifications table (AC-009, J9), the phase's own second journey.**
+      `orch._planner(home, args, errors)` now emits `S.table("Classifications")` —
+      every run the FR-020 scan found, one row per run (`run`, `task_class`, `recipe`,
+      `conf`, `outcome`) — followed by the *selected* run's detail
+      (`_classification_detail`). `_recent_profiles` gained `run_dir`, `task_class`,
+      `confidence`, `status` (its `SELECT` widened to match), so the table and the
+      Decide tab read **one** walk: the seam P2 and P3 each noted as owed, now taken.
+      Ordering is by confidence, lowest first (`_confidence_rank`), with a
+      profile that never recorded one sorting **last** — the profile gate is what
+      writes `confidence`, so a gate-skipping recipe (epic-runner) must not be
+      ranked as the worst decision the router ever made. The note counts the rows
+      under `_LOW_CONFIDENCE` (0.7): `{low} of {n} below confidence 0.7`.
+      Selection is `S.set_args(run_id=…)` on the row **and** on its `Review` button —
+      the same action twice, so a row is clickable anywhere and the affordance is also
+      a named control. The detail follows the selection, defaulting to the first row
+      (the least confident run), so the panel can never detail a run the table is not
+      highlighting. An `--arg run_id=` naming no row is ignored: the id is a string
+      from the IDE, and joining it into a path unvalidated would make the picker a
+      file read. `_latest_run_with` — the newest-profiled-run helper this replaces —
+      is deleted; it had no other caller.
+      *Renderer:* no fork change. `table` + `set` + `sel` are all existing vocabulary
+      in `crates/mini_ork_ui` (`page.rs` row `do`, `store.rs` `set`, `page.rs` `sel`),
+      so AC-012 holds.
+- [x] Tests — `tests/unit/test_ide_pages_orch_classify.py` (13), **13 passed**. Covered:
+      AC-009's own fixture — twelve profiled runs, two below 0.7, the confidence column
+      in ascending order and the note naming `2 of 12`; a gate-skipping recipe's missing
+      confidence read as `—` and sorted last; the row's five cells; `task_class` falling
+      back to the `task_runs` column; the three outcome tones; click and `Review` sharing
+      one action; selecting a row showing **that** run's plan and objective — the newer,
+      higher-confidence run, i.e. not the default, which is what proves the click drives
+      the panel; the single `sel` row, and by default the first; three unusable
+      `run_id` args (a traversal string, a stranger id, empty) each falling back; a run
+      with no plan artefact still detailing its classification; the end-to-end
+      `board page orch --tab planner --arg run_id=…` argv, with `page["args"]` echoed;
+      an unreadable profile named in `errors` **and** in the banner; an empty home
+      saying so.
+- [x] Cross-check — `test_ide_pages_orch_classify.py + test_ide_pages_orch_attention.py +
+      test_ide_pages_orch_decide.py + test_ide_pages_orch_races.py +
+      test_ide_pages_orch_arrivals.py + test_ide_pages_orch_sections.py` → **89 passed**;
+      `test_board_cmd.py + test_ide_pages_actions.py` → 153 passed with the two
+      pre-existing failures named below. Blocking lint (`ruff check mini_ork/ tests/`)
+      and the advisory tier on both changed files: clean.
+- [ ] **Still open:** nothing functional. The P3 note's last sentence is now closed —
+      the classification table *is* the reader that wanted `_recent_profiles`, and it
+      reuses the walk rather than re-walking it.
 
 ### P3 — Races and arrivals — **implemented 2026-10-16**
 - [x] FR-031 — `run_id` column: `SCHEMA_SQL` in `mini_ork/threads/store.py` (`INTAKE_COLUMNS`) + `db/migrations/0075_intake_events_run_id.sql` with the same `.read "|sh -c …"` `PRAGMA table_info` guard 0072/0074 use; `record_intake_event` gained `run_id: str | None = None`; `intake/dispatch.py` passes it where the run is started. *Migration number corrected from this spec's `0074` to `0075` — 0074 was taken.*
@@ -729,7 +814,7 @@ Stated explicitly, with cost, so a reviewer can decline them knowingly.
 - [x] FR-033 — `orch._races` + `_race_keep_action`: one `S.table(f"Race · {title}")` per race with the contestants as rows (lane/run/outcome/checks/cost/worktree, each row opening its run), one Keep per contestant with a `--dry-run`-populated `confirm`, `_RACE_PANEL_MAX = 5` newest in full plus an "Earlier races" summary.
 - [x] Tests — `tests/unit/test_board_race_keep.py` (15) + `tests/unit/test_ide_pages_orch_races.py` (14) + `tests/unit/test_ide_pages_orch_arrivals.py` (8) + 4 appended to `tests/unit/test_threads_store.py` (now 21), **58 passed**. Covered: dry-run touches nothing; an adopted worktree is not reported as freed; a repeated `--discard` is one worktree; cross-kickoff and unreadable-kickoff refusals call nothing; a winner with no workspace refuses; discarding the winner refuses; a missing run id exits 2; the merge message names the run; without `--force` the merge asserts no approval while the discard still records `ide:`; a refused merge stops before the first discard; a partial discard failure reports `discarded`/`failed` and continues; the reason reaches stderr. Pages: one section per race with exact argv and confirm text; the seam test feeds the emitted Keep argv back through `board_cmd.main([*argv[1:], "--dry-run", …])`; a keep that cannot be planned is off with the reason in the note; an unreadable kickoff makes a run its own race; the arrivals seam runs the emitted Sync argv through `intake_cmd.main` and asserts nothing started; the ledger renders without the column.
 - [x] Cross-check — `test_ide_pages_orch.py + test_ide_pages_actions.py + test_ide_pages_orch_decide.py + test_code_findings.py` → **supplemented**, see the stale-assertion note under P0.
-- [ ] **Not done, still open:** nothing functional. The P2 note stands — FR-033 shares `run.verifier_check_counts` rather than re-walking; the classification table (P4-adjacent) remains the only thing that would want `_recent_profiles`.
+- [x] **Closed — nothing functional remains.** FR-033 shares `run.verifier_check_counts` rather than re-walking, and the classification table — the reader P2's note and this one both named as the only thing that would want `_recent_profiles` — now reuses that walk (FR-023).
 
 ### P4 — Attention — **implemented 2026-10-16**
 - [x] FR-040 — `orch.attention(home, tab, errors) -> dict | None`: one `S.triage` strip
@@ -856,5 +941,5 @@ Every claim above was read from disk in the engine repo (`SourceShift/mini-ork`,
 | `db/migrations/` | repo root | Highest existing number is `0073`; this feature adds `0074` |
 | `orchestrator_lanes` | `mini_ork/acp_orchestrator/config.py` | The lane picker's options, ordered opus → sonnet → remainder |
 | `dispatch_issue`, `store.record_intake_event` call site | `mini_ork/intake/dispatch.py` | Where the run id must be threaded through |
-| `TABS`, `build`, `_kickoffs_section`, `_history`, `_thread_defaults`, `_races`, `_planner`, `_coord`, `_intake`, `_arrivals`, `_latest_run_with` | `mini_ork/ide_pages/orch.py` | The page under redesign — **791 lines, moved since the companion briefs** |
+| `TABS`, `build`, `_kickoffs_section`, `_history`, `_thread_defaults`, `_races`, `_planner`, `_classify_table`, `_classification_detail`, `_coord`, `_intake`, `_arrivals` | `mini_ork/ide_pages/orch.py` | The page under redesign — **moved since the companion briefs** |
 | CLI verb registry (no `kickoff` entry) | `mini_ork/cli/main.py` | `kickoff new` is a free top-level name; `run`'s `--set`/`--workspace` flags are the vocabulary `board start` mirrors |
