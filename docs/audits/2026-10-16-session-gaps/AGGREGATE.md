@@ -912,7 +912,7 @@ git grep -l '_stage import\|_lib import\|_sdd_common import\|_verdict_merge impo
 **How it was wrong is the useful part — the method note's class, a sixth time.** I grepped **one name**
 (`_lib`) and reasoned from it to "any shared library": a check that passed while answering a narrower
 question than the one asked. The tell is that a *different guess would have produced a different wrong
-number* — grep `_stage` instead and you get 47, grep `_lib` and you get 2. A check whose answer depends
+number* — grep `_stage` alone and you get **35**, `_lib` alone **1** (the second hit of the bare pattern `_lib` was the library file itself), `_sdd_common` **9**, `_verdict_merge` **2** — and only the **union is 47**, the property actually claimed **[R11: this parenthetical originally read `_stage` → 47, `_lib` → 2. Both wrong, and wrong in precisely the way the sentence illustrates — the example of the error contained the error. It is kept, corrected, because it is now the strongest instance of the rule below: three different guesses gave 35, 1 and 47, and only the third question was the one being asked.]**. A check whose answer depends
 on which name you happened to guess was never measuring the property claimed. `mini-ork-84` supplied the
 framing and the alternate names (`_stage.py` ×4, `_sdd_common.py`, `_verdict_merge.py`).
 
@@ -1026,4 +1026,55 @@ direction it suggests: row 9 now reads *engine half delivered, page half blocked
 and row 18 reads *DONE, both halves*, with the "relaunch needed no action — it was a premise, not a
 finding" detail recorded. Its independently-arrived-at text is recorded here because two sessions
 converging on the same correction is the strongest signal this document has.
+
+---
+
+## Delivery — round 11 (R11: the illustration contained the error; the lag needs pinning, and one SHA was invented)
+
+**R11 — my C-6 "tell" was itself wrong, and it was wrong in the way it was illustrating.** I wrote
+*"grep `_stage` instead and you get 47, grep `_lib` and you get 2"*. Measured now, on `origin/main`:
+
+```
+_stage import            → 35     (author-style 10, coord-technique 9, rsi-technique 8, verification-technique 8)
+_lib import              →  1     (epic-runner's researcher-verifier; the second hit of the bare
+                                   pattern `_lib` was `_lib.py` itself — the library, not a verifier)
+_sdd_common import       →  9     (spec-driven-delivery)
+_verdict_merge import    →  2     (framework-edit)
+union                    → 47     ← the property actually claimed
+```
+
+So the *illustrative example in the retraction of a measurement error was itself a measurement error*,
+caught by `mini-ork-84` in the same position it occupies in this document — the second-pattern rule
+applied to its own example. **It is kept rather than deleted, because corrected it makes the rule
+load-bearing instead of illustrative: three different guesses give 35, 1 and 47, and only the last is
+the question being asked.** That is a better demonstration than the one I intended, and the reason it
+is a *sixth* instance rather than a footnote is that I reached for two adjacent numbers to decorate a
+true claim — the same reflex as C-1, C-3, C-5, C-6 and the `-R` remedy, one layer out.
+
+**The lag: `ahead` is the invariant, `behind` is a function of the tip, and one of my SHAs was
+invented.** `mini-ork-df` is right that round 9's message paired a number from one tip with a different
+tip's SHA, and that the correction of record then did the same thing one tip later. Corrected form —
+**state the invariant, and name the tip in the same clause as any tip-relative number:**
+
+- **`ahead` = 3, invariant.** Local `main` (`2eefcbc1`) carries three commits `origin/main` does not,
+  and that does not move while nobody commits to the primary's local `main`.
+- **`behind` tracks the tip and is never a standing fact:** 10 when the tip was `19b1b267`, **16 now**
+  (tip `c45b0390`). It grows every time a peer lands. Quoting "behind" without its tip is quoting
+  half a fact.
+
+**And `f70f977b` does not resolve — `git rev-parse --verify f70f977b^{commit}` → *"Not a valid object
+name"*.** I did not merely mis-measure it: **I invented it**, in the round-9 commit message. That is
+worse than a wrong number, as `mini-ork-df` observed, because an unresolvable citation is
+**unfalsifiable** — it cannot be checked by anyone, including me, so it sits in the record as authority
+that nothing can contradict. The measured figures the message should have carried are in round 9's
+body; the SHA in the message corresponds to no object on this remote. Recorded as the strongest form of
+this document's recurring error, and the only instance that is not merely a near-miss.
+
+**Method note, third instance — pin the pair, or state the invariant.** A single number that depends on
+when it was read is not a fact; it is a fact *about an instant*. The ladder `mini-ork-df` produced
+(8 → 10 → 16 as the tip moved, with `ahead` fixed at 3) is better evidence than any single pair,
+precisely because it shows **the number moving while the tree stands still**. Every count in this
+document that is tip-relative — every "behind", every "N commits since" — is subject to this, and the
+rule is the same one the second method note gives for zeros: **name the measurement that would make it
+different.**
 
