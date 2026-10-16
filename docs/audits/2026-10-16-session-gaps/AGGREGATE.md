@@ -138,6 +138,7 @@ in finding 3 is the same failure seen from the other side.
 | 4a | **Three green runs never landed** — `rp-e3-header-v2` / `rp-e6-graph-focus` / `rp-e10-artifacts-learnings` carry `verdict.json` `pass:true` and diffs that still apply, yet none is on `main`. A board `done / step=publisher` does **not** imply a commit | `framework-edit`'s deliverable *is* the diff in the run dir | `mini-ork-cb` G1 |
 | 4b | `e3v2` reads `done` on the board but `ide_pages/run_header.py` exists in no commit; `git apply --check` fails at `node.py:55` (superseded by `d3b52b38`) — needs a surgical re-apply, not a plain apply | run dir; `node.py:55` | `mini-ork-cb` G2 |
 | 4c | **A verifier whose sidecar omits `verifier` is unreadable**, so the page reports "the cause was not classified" over a verdict sitting on disk | `mini_ork/verify/levels.py` `read_verifier_payload` | `run-page-ux-clarity` G-new (round 3) |
+| 4d | **The abstain mechanism can almost never fire: 123 of 124 verifier scripts never emit `failure_kind`** — the runner is fixed and tested, but nothing in production hands it the input it keys on | `mini_ork/verify/pm.py:182` (`classify_spawn`); `recipes/recursive-validate-impl/verifiers/tier1-compile-typecheck.py:172` | new — round 6 |
 
 ### P1 — declared but never exercised, or emitted but unrenderable
 | # | gap | where | source |
@@ -708,3 +709,55 @@ than assumed, because a merge is exactly where a retraction can be silently reve
 `AGGREGATE.md` still contains C-3 (×3), C-5 (×2), the round-4 reversion-guard text, and P0 4c. It
 matches `origin/main` on every one of those. A wrong-side resolution here would have restored the
 false claim on the next push from the primary; it did not.
+
+---
+
+## Delivery — round 6
+
+**The verifier-provenance plan is fully implemented, and its two declared follow-ons are both open.**
+The plan of record at `/Users/admin/.claude/plans/peaceful-brewing-alpaca.md` is **done, not pending** —
+`2f7e4b81` carries all eleven files it named (`verify/levels.py`, `cli/execute.py`,
+`cli/execute_handlers.py`, `cli/publisher.py`, `recovery/auto_repair.py`, `recovery/retry_hint.py`,
+four test modules), and every symbol it specified is on `origin/main`: `FAILURE_KINDS` (`levels.py:148`),
+`ABSTAINING_KINDS` (`:149`), `ABSTAIN_RC = 3` (`:153`), `abstain_count` (`execute.py:1138`), the
+`rc == _levels.ABSTAIN_RC` branches (`:1291`, `:1295`, `:1460`, `:1509`). Verified by ancestry and by
+reading the symbols, not from the plan's own status. **No session needs to start this work.**
+
+**P0 4d (new) — the mechanism is wired and cannot fire: 1 of 124 verifiers emits `failure_kind`.**
+The plan's own follow-on section says so — *"Emitter sweep — follow-on commits, after the core is
+green … each of the 31 shell-out verifiers gains `failure_kind`"* — and the sweep has not happened.
+Checked positively rather than by one grep, because "nothing emits it" is exactly the negative I have
+been wrong about three times this sweep:
+`git grep -l failure_kind origin/main -- 'recipes/*/verifiers/*.py'` → **1**
+(`tier1-compile-typecheck.py:172`, the reference); `git ls-tree -r --name-only origin/main recipes/ |
+grep '/verifiers/.*\.py$' | wc -l` → **124**. There is no shared envelope writer to fix once:
+`verify/pm.py` exposes `classify_spawn` and the manager resolvers, and **each verifier builds its own
+`envelope` dict and must set the key itself** (`tier1:165-180` is the whole pattern — `classify_spawn(...)
+or classify_spawn(...) or "code"`). So the sweep is genuinely per-file work, ~123 files, and its stated
+scope of 31 undercounts even the shell-out subset.
+
+**Why this is P0 and not a nit.** `classify_spawn` is correct, tested, and reachable — and in
+123 of 124 recipes nothing calls it, so a runner that never started still arrives at the engine as
+`pass: false` with no provenance, which is *precisely the 2026-10-11 incident the whole mechanism was
+built to stop* (one bad lint call → 10 failed nodes → rollback on an implementation never checked).
+The fix landed at the reading end; the writing end is still absent. **This is the fourth instance this
+sweep of one shape — a control that exists but has no input in practice:** `NO_EXECUTABLE_FENCE`
+shipped as a warning so the corpus still lints clean, the reversion guard fires on a state a rebase
+produces, and now the abstain vocabulary that no verifier speaks. Worth naming as a class, not four
+separate findings: **each was verified at the mechanism and never at the input**, and each passes its
+own tests.
+
+**The plan's learning hand-off is real and is the user's.** `classify_spawn` (`pm.py:182`) is *not* an
+empty stub — I expected one and checked, and it has a working body: `rc == 127` → `toolchain`, a negative
+`rc` (a tool killed by a signal before it reached a verdict — the `m3b-activity-feed-backend-removal`
+`lint_rc -15` case) → `toolchain`, then a conservative `_SPAWN_FAILURES` pattern list. The `# noqa:
+ARG001` is only because `argv` is contractual-and-unused. What is left for the user is the docstring's
+own ask: **which pattern or rc separates "the tool never started" from "the tool ran and rejected the
+input"** — domain knowledge about the runners, ≈8 lines, and *every* shell-out verifier calls this one
+function, so refining it here is refining it everywhere. Nothing downstream is blocked on it, and it is
+still the highest-leverage unfilled slot in the codebase this sweep found.
+
+**Concurrent-edit note, for whoever lands the sweep.** `mini_ork/cli/execute.py` is dirty at this audit
+(held by a peer), but the mechanism it holds is already landed — so the sweep does not collide with
+that edit, and the sweep touches only `recipes/*/verifiers/*.py` and `verify/pm.py`, neither of which
+that peer is in.
