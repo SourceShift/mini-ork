@@ -778,14 +778,20 @@ Stated explicitly, with cost, so a reviewer can decline them knowingly.
       (`mini_ork/acp/agent.py:5035`). Each test still asserts the pre-merge arithmetic:
       `test_thread_usage_is_sent_only_when_the_total_changes` expects the thread's total to
       be the sum of the run's `cost_usd` alone, and now sees a third update — the
-      orchestrator turn's own 0.0064 on top of the 0.3; `test_child_run_streams_agent_output_into_the_thread`
-      expects `0.75` and sees `1.25`, the same missing term; and
+      orchestrator turn's own **0.0062928** on top of the 0.3, i.e. the stream is
+      `[0.1, 0.30000000000000004, 0.30629280000000003]` where it was `[0.1, 0.3]` (`+0.0062928`);
+      `test_child_run_streams_agent_output_into_the_thread`
+      expects `0.75` and sees `1.25`, the same missing term (`+0.5`); and
       `test_slash_run_in_orchestrate_mode_launches_directly` asserts `seen_turn["called"]
       is False` on the strength of "the orchestrator was NOT invoked (slash command
       short-circuits)". The routing is still what that test wants — `agent.py:1853` sends
       `/run ` to `_prompt_thread_direct`, never to the orchestrator — but the run it
       launches now *has* an orchestrator of its own that narrates it, and the test's fake
       turn is shared between the two, so the flag flips.
+      Reproduced exactly on this HEAD: `pytest tests/unit/test_acp_agent_py.py -q --tb=no -rf`
+      → **`3 failed, 170 passed in 138.95s`**, the three named above and nothing else, so the
+      file is red by three and green by 170 — the rest of the ACP surface is unaffected by
+      whatever the redesign did.
 
       **Resolved 2026-10-16 by reading the path: the flip is by design, not an accidental
       extra turn.** `_prompt_thread_direct` ends in `_follow_in_thread` (`agent.py:1991`),
