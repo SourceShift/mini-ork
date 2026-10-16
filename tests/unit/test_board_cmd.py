@@ -1403,13 +1403,16 @@ def test_a_read_declares_the_flags_of_the_home_it_is_asked_for(
     """
     monkeypatch.delenv("MINI_ORK_HOME", raising=False)
     monkeypatch.delenv("MINI_ORK_FEATURES", raising=False)
-    monkeypatch.delenv("MO_BUDDY", raising=False)
-    _seed_run(home, "run-flag", "published")
+    monkeypatch.delenv("MO_REWARD_STAMP", raising=False)
     (home / "config").mkdir(exist_ok=True)
     (home / "config" / "features.yaml").write_text(
-        "features:\n  run_buddy: '1'\n", encoding="utf-8")
+        "features:\n  reward_stamp: '0'\n", encoding="utf-8")
 
-    args = board_cmd.build_parser().parse_args(["page", "run", "--arg", "run=run-flag"])
+    args = board_cmd.build_parser().parse_args(["page", "setup", "--tab", "features"])
     payload = board_cmd.build_payload(home, args)
-    titles = [s.get("title", "") for s in payload.get("sections", [])]
-    assert any(t.startswith("Buddy — ") for t in titles), (payload.get("error"), titles)
+    table = next(s for s in payload["sections"] if s.get("title") == "Features")
+    row = next(r for r in table["rows"] if r["cells"][1]["t"] == "reward_stamp")
+    now, source = row["cells"][4]["t"], row["cells"][5]["t"]
+    # The home's own file turned it off; the read must say so, and say where
+    # the value came from rather than falling through to the engine default.
+    assert (now, source) == ("off", "features.yaml"), (payload.get("error"), now, source)

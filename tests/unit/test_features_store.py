@@ -330,20 +330,20 @@ def test_apply_defaults_follows_the_home_it_is_given(tmp_path: Path, monkeypatch
     belong to a different project than the one being read: the read re-applies
     its own file, and retracts what the other home had applied.
     """
-    monkeypatch.delenv("MO_BUDDY", raising=False)
-    on = _home_with(tmp_path, "on", "features:\n  run_buddy: '1'\n")
+    monkeypatch.delenv("MO_REWARD_STAMP", raising=False)
+    on = _home_with(tmp_path, "on", "features:\n  reward_stamp: '0'\n")
     off = _home_with(tmp_path, "off", "features: {}\n")
-    assert "MO_BUDDY" in store.apply_defaults(on)
-    assert os.environ["MO_BUDDY"] == "1"
+    assert "MO_REWARD_STAMP" in store.apply_defaults(on)
+    assert os.environ["MO_REWARD_STAMP"] == "0"
     assert store.apply_defaults(off) == set()
-    assert "MO_BUDDY" not in os.environ  # retracted along with the home
+    assert "MO_REWARD_STAMP" not in os.environ  # retracted along with the home
 
 
 def test_apply_defaults_never_overrides_an_operators_variable(
     tmp_path: Path, monkeypatch
 ) -> None:
     """Only names this module applied are ever replaced — env still wins."""
-    monkeypatch.setenv("MO_BUDDY", "0")
-    on = _home_with(tmp_path, "on", "features:\n  run_buddy: '1'\n")
+    monkeypatch.setenv("MO_REWARD_STAMP", "1")
+    on = _home_with(tmp_path, "on", "features:\n  reward_stamp: '0'\n")
     store.apply_defaults(on)
-    assert os.environ["MO_BUDDY"] == "0"
+    assert os.environ["MO_REWARD_STAMP"] == "1"
