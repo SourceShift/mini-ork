@@ -702,7 +702,10 @@ Stated explicitly, with cost, so a reviewer can decline them knowingly.
 
 ### Cross-cutting
 - [ ] NFR — warm-page budget held on the default tab (measure, do not assume).
-- [ ] NFR — confirm no changed file lies under `crates/mini_ork_ui/` (AC-012).
+- [x] NFR — AC-012 holds for **the redesign**: no section this spec adds needed a
+      renderer change. `crates/mini_ork_ui/src/sections.rs` *was* edited, but by the
+      audit's rows 4-6 — pre-existing engine↔fork drift, authorised separately. See
+      the conformance section.
 - [ ] Live replay for the ACs of each shipped phase, per the repo's gate-every-run-by-hand habit.
 
 ---
@@ -727,17 +730,22 @@ each is data the engine sends and the fork discards.
 | 1 | a **list-act's `kind`** | `page.rs:1151` hard-codes `"ghost"` | FR-012's Start action is styled ghost, not primary — the tab's whole point reads as secondary | honour `b.get("kind")`, default `ghost` |
 | 2 | `check_row["do"]` | `render_checks_body_inner` never calls `action_handler` on a row | a per-check action (`verify.py:105` passes `open_path`) is dead | draw a row button when `do` is present |
 | 3 | `checks.summary["na"]` | `sections.rs:1076-1078` reads only passing/failing/pending | a checks section with `na` rows misreports its own header | render the `na` count |
-| 4 | `columns` section `title`/`note`/`actions`, card `id` | `render_columns` reads only `cols` (`sections.rs:339`) | `kanban.py:601` passes a `note` nobody sees | draw the generic card header for columns |
-| 5 | `story_step` `kind`/`model`/`meta`/`open`, section `title` | `render_story` reads neither | `run_story.py:432` passes `"What happened"` — invisible | draw the section title; surface `meta` |
-| 6 | `finding["source"]` | `render_findings_body_inner` reads 6 of 7 | minor | draw or drop the key engine-side |
-| 7 | **`tone="warn"`** (`cn_file.py:554`) | not a colour in `palette.rs:200-214` | a callout silently loses its colour and mark — **an emitter bug, not a renderer gap** | change the emitter to `orange` |
+| 4 | `columns` section `title`/`note`/`actions`, card `id` | `render_columns` reads only `cols` (`sections.rs:339`) | `kanban.py:601` passes a `note` nobody sees | draw the generic card header for columns — **fixed** |
+| 5 | `story_step` `kind`/`model`/`meta`/`open`, section `title` | `render_story` reads neither | `run_story.py:432` passes `"What happened"` — invisible | draw the section title; surface `meta` — **fixed** (the `open` half was already honoured by `page.rs`'s `seed_step_expansion`, which the audit missed) |
+| 6 | `finding["source"]` | `render_findings_body_inner` reads 6 of 7 | minor | draw or drop the key engine-side — **fixed** (drawn; the key has a reader on the story tab) |
+| 7 | **`tone="warn"`** (`cn_file.py:554`) | not a colour in `palette.rs:200-214` | a callout silently loses its colour and mark — **an emitter bug, not a renderer gap** | change the emitter to `orange` — **already resolved**: `cn_file.py` no longer emits `tone="warn"` |
 
 **AC-012 tension, resolved.** AC-012 ("no changed file under `crates/mini_ork_ui/`")
 was scoped to *the redesign*: its sections must need no new renderer work, and they
 don't — the locked architecture decision holds. The gaps above are **pre-existing
 engine↔fork drift**, not redesign work, and the instruction that authorised this pass
-was explicit that the fork must render what the engine emits. Rows 1-3 are fixed in
-the fork; rows 4-6 and the row-7 emitter bug are tracked here.
+was explicit that the fork must render what the engine emits. **All seven rows are
+now closed** — rows 1-3 by the fork's first pass, rows 4-6 by its second
+(`mini_ork_ui` `9283d3f`, amended to `0aefe69`), and row 7 in the engine, where the
+emitter had already stopped sending `tone="warn"`. The fork pass is verified by
+`script/mini-ork-check` (clean) and clippy parity against the pristine submodule
+(19 flagged locations before and after; none inside the changed regions) — the
+renderer has no unit tests by convention, so a pixel-level replay is still owed.
 Owner of a fork fix: the `mini_ork_ui` submodule repo — commit there, pin the
 submodule in `zed-mini-ork`, and push `fork`, never `origin`.
 
