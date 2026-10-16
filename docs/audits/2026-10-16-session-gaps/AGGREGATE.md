@@ -950,3 +950,28 @@ nothing and a pattern that *cannot* match anything print identically. Same failu
 **Disposition: before trusting a zero, run a second pattern that should match the same population.**
 It applies to every count in this document.
 
+---
+
+## Delivery — round 9 (P2#16's shape, and the primary supersedes its earlier reading)
+
+**P2#16 (per-run `LIMIT 6`) — undecided, and its cheap half shares P1#9's blocker.** The refinement is
+worth recording because it changes *where* the fix belongs, and the audit's own G1 naming collision is
+the reason: a cross-run view belongs in `mini_ork/ide_pages/runs.py` ("Runs & live execution"), **not**
+`orch.py` — `orch.py` is the engine-side surface (threads, kickoffs, races, planner), so putting a
+cross-run view there deepens exactly the collision G1 flags. The honest minimal fix is therefore not
+code at all: **say in the section note that it is per-run and capped at 6**, which removes the
+over-promise without inventing a surface. That half is blocked on `run.py`, alongside P1#9's page half,
+so the two should land together or not at all — landing one and leaving the other is how a page ends up
+half-honest.
+
+**The primary's lag supersedes every earlier reading in this document.** Measured now:
+`git rev-list --left-right --count HEAD...origin/main` → **3 ahead / 10 behind** (origin at `19b1b267`), against the
+`3 ahead / 3 behind` recorded in round 5 and the `3 ahead / 1 behind` that preceded it. The composition
+matters more than the count: two local merge commits plus a **duplicate of upstream `8d8be650`**, with
+17 dirty files from other sessions. A session refused `git merge --ff-only origin/main` and **stopped
+rather than resetting or plain-merging** — the correct call under the worktree discipline, and the
+third time this sweep that the right action was to halt and surface rather than to reconcile someone
+else's incomplete state. **Recorded as blocked-on-user, unchanged, and explicitly not urgent:** nothing
+is lost while it sits, because each of the landings in rounds 5–8 went through a detached worktree of
+`origin/main` and none of them depended on the primary's local `main`.
+
