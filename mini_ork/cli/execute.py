@@ -1343,6 +1343,22 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                         frontier.append(node_id)
             return descendants
 
+        # ── per-run orchestrator: wired, or merely enabled? ────────────────
+        # The layer is default-on, but it is *wired* only on this
+        # dependency-graph path — the other ``_parallel`` call sites stay
+        # unwired. ``enabled()`` alone therefore cannot tell the run page
+        # whether this run could actually be acted on, and the page read
+        # "armed" for both. Emit one ``orchestrator.armed`` receipt the moment
+        # the engine commits to this path, so "armed and quiet" becomes a fact
+        # the page reads back rather than an assumption it makes.
+        try:
+            from mini_ork.orchestration.runner_orchestrator import enabled as _orch_enabled
+        except Exception:
+            _orch_enabled = lambda: False  # noqa: E731
+        orch_on = _orch_enabled()
+        if orch_on:
+            _emit_orchestrator_armed(db, run_id)
+
         while pending:
             blocked = []
             for node_id in pending:
@@ -1470,19 +1486,16 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
             # ── per-run orchestrator (default on; MO_RUN_ORCHESTRATOR=0 opts out) ──
             # Observe each node outcome at the wave boundary and pick one of
             # advance/help/repair/mutate/promote (see
-            # mini_ork/orchestration/runner_orchestrator.py). With the flag
-            # explicitly disabled this block is inert: nothing is imported and
-            # nothing is called. Green nodes are skipped outright, so the
-            # no-fail path pays one ledger read per wave.
+            # mini_ork/orchestration/runner_orchestrator.py). ``orch_on`` was
+            # settled once above, alongside the ``orchestrator.armed`` receipt;
+            # with the flag disabled that flag is False and this block is inert.
+            # Green nodes are skipped outright, so the no-fail path pays one
+            # ledger read per wave.
             #
             # Wired only on this dependency-graph path. The other ``_parallel``
             # call sites below (parallel / partitioned / serial dispatch) stay
             # unwired — matching the kickoff's scope, not an oversight.
-            try:
-                from mini_ork.orchestration.runner_orchestrator import enabled as _orch_enabled
-            except Exception:
-                _orch_enabled = lambda: False  # noqa: E731
-            if _orch_enabled():
+            if orch_on:
                 _orchestrator_act(live_run_dir, db, run_id, outcomes, repair_edges,
                                   revision_state=locals())
 
@@ -4458,6 +4471,32 @@ def _open_state_db(db_path):
         return StateDB(db_path)
     except Exception:
         return None
+
+
+def _emit_orchestrator_armed(db, run_id: str) -> None:
+    """Write one ``orchestrator.armed`` receipt for this run.
+
+    Called exactly once, where the engine commits to the dependency-graph path
+    with the layer enabled. The run page reads the receipt back to tell two
+    states apart that ``runner_orchestrator.enabled()`` conflates:
+
+      * **armed and quiet** — the layer is on *this* path and simply had
+        nothing to do, because every node stayed green; and
+      * **enabled but never wired** — the layer is on globally, but this run
+        executed on a path that never calls it, so it structurally could not
+        act.
+
+    Only the first may read as "armed". Fail-safe: a missing table or an
+    unwritable DB costs the receipt, never the run.
+    """
+    try:
+        from mini_ork.observability.node_events import mo_run_emit
+
+        mo_run_emit(run_id, "orchestrator.armed",
+                    json.dumps({"reason": "wired on the dependency-graph path"}),
+                    db=db)
+    except Exception as exc:  # noqa: BLE001 — the receipt is best-effort
+        print(f"execute: orchestrator armed receipt skipped: {exc}", file=sys.stderr)
 
 
 def _orchestrator_act(run_dir, db, run_id, outcomes, retry_edges, *, revision_state):
