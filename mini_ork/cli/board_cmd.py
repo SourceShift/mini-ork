@@ -1261,14 +1261,19 @@ def _home_initialised(home: Path) -> bool:
     return (home / "state.db").is_file() and (home / "config" / "task_classes").is_dir()
 
 
-def _start_env(args) -> tuple[dict[str, str], str]:
-    """``(extra_env, workspace_source)`` for ``board start``.
+def _start_env(args) -> tuple[dict[str, str], str, str]:
+    """``(extra_env, workspace, workspace_source)`` for ``board start``.
 
     ``--set`` and ``--workspace`` are ``mini-ork run``'s own flags, mirrored so
     a detached launch takes the arguments a foreground run would. ``--workspace``
     becomes ``MO_WORKSPACE_MODE`` rather than a second mechanism: the child's own
     resolver already reads that variable, and ``launch_run`` passes the pairs
     through ``gate_env``, so premium gating is unchanged.
+
+    ``workspace`` is the mode the child will really run in, not just the flag:
+    when the flag is absent the child inherits the variable, so a caller that
+    reported only ``extra_env`` would name the source and not the value. That is
+    what the dry run has to show.
 
     Raises ``ValueError`` on a malformed ``--set`` — a pair with no ``=`` would
     otherwise reach the child as a bare environment name.
@@ -1281,10 +1286,11 @@ def _start_env(args) -> tuple[dict[str, str], str]:
         extra_env[key.strip()] = value
     if args.workspace:
         extra_env["MO_WORKSPACE_MODE"] = args.workspace
-        return extra_env, "flag"
-    if os.environ.get("MO_WORKSPACE_MODE"):
-        return extra_env, "MO_WORKSPACE_MODE"
-    return extra_env, "default"
+        return extra_env, args.workspace, "flag"
+    inherited = os.environ.get("MO_WORKSPACE_MODE") or ""
+    if inherited:
+        return extra_env, inherited, "MO_WORKSPACE_MODE"
+    return extra_env, "", "default"
 
 
 def _act_start(home: Path, args) -> dict[str, Any]:
@@ -1332,17 +1338,17 @@ def _act_start(home: Path, args) -> dict[str, Any]:
         )
 
     try:
-        extra_env, workspace_source = _start_env(args)
+        extra_env, workspace, workspace_source = _start_env(args)
     except ValueError as exc:
         return refuse(str(exc))
 
-    run_id = (args.run_id or "").strip() or f"run-{int(time.time())}-{secrets.token_hex(3)}"
+    run_id = (args.start_run_id or "").strip() or f"run-{int(time.time())}-{secrets.token_hex(3)}"
     if args.dry_run:
         return {
             "ok": True, "dry_run": True, "spawned": False,
             "home": str(home), "run_id": run_id,
             "recipe": recipe, "recipe_source": recipe_source,
-            "workspace": extra_env.get("MO_WORKSPACE_MODE", ""),
+            "workspace": workspace,
             "workspace_source": workspace_source,
             "kickoff": str(kickoff),
             "kickoff_path": str(home / "runs-inbox" / f"{run_id}.md"),
@@ -1637,7 +1643,11 @@ def build_parser() -> argparse.ArgumentParser:
                              "(repeatable; mirrors `mini-ork run --set`)")
     parser.add_argument("--workspace", default=None, choices=["worktree", "in-place"],
                         help="start: workspace mode (mirrors `mini-ork run --workspace`)")
-    parser.add_argument("--run-id", default=None,
+    # A distinct dest, not `run_id`: the positional above already claims that
+    # name, and argparse writes the positional's default over an optional that
+    # shares it — so `board start --run-id x` parsed to `run_id is None` and
+    # silently used a generated id. `_act_start` reads `start_run_id`.
+    parser.add_argument("--run-id", dest="start_run_id", default=None,
                         help="start: the run id to use (default: generated)")
     parser.add_argument("--init", action="store_true",
                         help="start: allow launching against a --home that is not yet "

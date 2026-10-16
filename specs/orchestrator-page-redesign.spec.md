@@ -624,9 +624,29 @@ Stated explicitly, with cost, so a reviewer can decline them knowingly.
 - [x] FR-006 — `orch._chain_health`: per-source registration, trigger and last-sync
       rows plus a Scheduler row; emitted at IDE spec level ≥ 2, with the old callout
       kept for level 1.
-- [ ] Tests: a unit test per section, asserting the new keys exist and that a missing
-      source degrades rather than raising. **Not written** — held per the working
-      agreement that test work starts after the implementer confirms.
+- [x] Tests: a unit test per section, asserting the new keys exist and that a missing
+      source degrades rather than raising. **Written 2026-10-16** —
+      `tests/unit/test_ide_pages_orch_sections.py` (25), **25 passed**. One section per
+      group: FR-001's banner (absent when the map is empty, one line per error, first
+      section of the page is the strip and the last is the banner), FR-002 (`_finding_text`'s
+      `{glyph} {msg} — {fix}`, the row's lint text and recipe, `(default)` when the file
+      declared none, the `Log` button only when `_run_log` finds a file, a lint *error*
+      still rendering red rather than being hidden), FR-003 (the three pickers, each
+      marking exactly one chip and writing `features set-env <VAR>` with `home=False`, the
+      lane picker reporting `MO_ACP_DEFAULT_MODEL` first, and an unreadable features store
+      degrading to a provenance instead of blanking the picker), FR-004 (a thread row
+      opens the thread, a run row the run, costs summed, and the empty history still
+      rendering a non-link placeholder), FR-005 (`_open_abs` refusing a relative path,
+      `_concord_stop`'s `--yes` + confirm + `home=False`, `_coord` degrading without
+      ContextNest) and FR-006 (states confined to `pass`/`na`/`fail`, a trigger row only
+      for a registered *and enabled* source, an unconfigured trigger failing its row, the
+      scheduler last and reporting its last tick, an unreadable scheduler failing rather
+      than passing, and the checklist appearing at IDE spec level 2 but not level 1).
+      **One defect found and fixed:** `_chain_health` computed `_SOURCE_STATE[...]` and
+      then discarded it, rendering a registered-but-disabled source as `pass` — while its
+      own docstring promises `na`, and the intake table beside it shows `disabled`. The
+      two views of one source disagreed; the row now reads `na` with
+      `registered but switched off`, the same reading `_SOURCE_STATE` already gave the table.
 - [x] **Add the orch tabs to `tests/unit/test_ide_pages_actions.py::_PAGE_TABS`.**
       It listed only `intake`, so the `cli` actions FR-003 and FR-005 add were outside
       the argv walk — the exact gap the `kanban` comment in that file describes.
@@ -650,6 +670,11 @@ Stated explicitly, with cost, so a reviewer can decline them knowingly.
       `test_kickoffs_are_linted_and_link_their_runs` expects the pre-FR-002 sub text
       (`"lint: The kickoff…"` where `_kickoff_parts` now writes
       `"saved · lint: ⚠ The kickoff…"`). The remaining 5 tests in the file pass.
+      A **seventh stale failure lives in another file**:
+      `tests/unit/test_native_dispatch_py.py::test_all_former_exec_subs_registered_natively`
+      pins `_NATIVE_MODULE_SUBS` by exact set, and FR-011 added `kickoff` to it. Left
+      unfixed under the same agreement — and worth naming here rather than leaving a red
+      suite unexplained, because it is the one stale assertion the P1/P2 notes missed.
 
 ### P1 — Dispatch
 - [x] FR-010 — `board start`: add `start` to `build_parser().choices`; add `--kickoff`, `--set` (append), `--run-id`, `--workspace`, `--init`, `--dry-run`; exempt `start` from `validate`'s run-id rule and require `--kickoff`; implement `_act_start` wrapping `web.control.launch_run`; fail closed on an uninitialised home.
@@ -658,7 +683,11 @@ Stated explicitly, with cost, so a reviewer can decline them knowingly.
       Verified by hand: drafted `fix-the-auth-middleware-timeout.md` lints **0 findings**; `MO_ACP_RECIPE=refactor` seeds `recipe: refactor`; `board start --dry-run` on a draft reads back `recipe=code-fix source=front matter` — the write→read loop closes. Overwrite → rc 2; empty goal → rc 2; no subverb → usage, rc 2.
 - [x] FR-012 — `orch`: the `dispatch` tab and its row actions. TABS gained `("dispatch", "Dispatch")` (second). Sections in FR-012's order: page-scoped recipe/workspace chips (`S.set_args`), the kickoff list, the `composer` bound to `S.cli("...", ["kickoff","new"])`, the lint panel for `args["kickoff"]`. `_kickoffs_section` was refactored onto a shared `_scan_kickoffs`/`_lint_badge`/`_kickoff_parts` so the two tabs cannot disagree.
       Verified by hand: all 7 tabs build at **both** IDE spec levels with no `errors`; the lint panel appears only when a kickoff is selected (checks at level 2, markdown fallback at level 1); a walked **23 `cli` actions parse against their own parsers, 0 failures** (`features` rejects `--home` and every such action carries `home=False`); AC-003's chain reproduced end to end — composer writes the file, the dispatch list shows it, its Start action is present, selecting it renders the lint panel. A live spawn: see FR-010.
-- [ ] Tests: parser round-trip (mirroring `tests/unit/test_board_cmd.py`'s guard), dry-run writes nothing, uninitialised home refuses, and a real spawn is asserted from `launch_run`'s return rather than by waiting for the run. **Not written** — held per the working agreement.
+- [x] Tests: parser round-trip (mirroring `tests/unit/test_board_cmd.py`'s guard), dry-run writes nothing, uninitialised home refuses, and a real spawn is asserted from `launch_run`'s return rather than by waiting for the run. **Written 2026-10-16** — `tests/unit/test_board_start.py` (19) and `tests/unit/test_kickoff_new.py` (11), **30 passed**. Every test drives the real `board start` / `kickoff new` argv through its own `main`, so the parser, `validate` and the exit-code split are on the path; `launch_run` is stubbed (a real spawn is a side effect on the shared engine), and the *one* thing asserted against real disk is the refusal — an uninitialised home must leave no `runs-inbox`, which is what `launch_run` would have created. `kickoff new` is asserted through the two readers that consume its output (`orch._scan_kickoffs` and `board start --dry-run`), not against the template's own text, so the write→read loop is the assertion.
+      **Two defects found and fixed in `board_cmd.py`:**
+      1. **`--run-id` was silently ignored.** `--run-id`'s dest collided with the positional `run_id`, and argparse writes the positional's default over an option that shares its name — `board start --run-id run-plan --kickoff K` parsed to `run_id is None` and launched under a generated id. The option now has its own dest (`start_run_id`). Nothing else read it, and the page never passes it (it lets the id be generated), which is why no walk found it.
+      2. **The dry run under-reported the workspace.** `_start_env` returned only the flag-derived pairs, so `board start --dry-run` with `MO_WORKSPACE_MODE` inherited from the environment reported `workspace: ""` beside `workspace_source: "MO_WORKSPACE_MODE"` — a source naming a value it did not show. `_start_env` now returns the effective mode as well, which is what FR-010 requires the dry run to report.
+      Also recorded by these tests, deliberately: `board start` consumes neither positional slot, so `board start run-x --kickoff K` launches under a *generated* id (pinned, because `--run-id` and the positional read alike), and a single stray positional is tolerated while two are a usage error.
 
 ### P2 — Answers — **implemented 2026-10-16**
 - [x] FR-020 — `orch._recent_profiles(home, errors, limit=60)`: the newest 60

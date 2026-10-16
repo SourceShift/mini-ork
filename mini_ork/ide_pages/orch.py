@@ -1386,12 +1386,18 @@ def _chain_health(home: Path, statuses: list[Any]) -> dict[str, Any]:
     """
     rows: list[dict[str, Any]] = []
     for status in statuses:
-        state, _ = _SOURCE_STATE[(status.registered, status.enabled)]
-        rows.append(S.check_row(
-            f"{status.source} source",
-            "pass" if status.registered else "na",
-            detail=status.skipped_reason or ("registered" if status.registered else "not registered"),
-        ))
+        # Only a source that is registered *and* enabled is a passing link: one
+        # that is switched off is ``na``, not a fault, because someone decided
+        # that — the reading ``_SOURCE_STATE`` gives the intake table's own
+        # state column, so the two views cannot disagree about one source.
+        if not status.registered:
+            state, detail = "na", "not registered"
+        elif status.enabled:
+            state, detail = "pass", "registered"
+        else:
+            state, detail = "na", "registered but switched off"
+        rows.append(S.check_row(f"{status.source} source", state,
+                                detail=status.skipped_reason or detail))
     registered = [s for s in statuses if s.registered and s.enabled]
     for status in registered:
         rows.append(S.check_row(
