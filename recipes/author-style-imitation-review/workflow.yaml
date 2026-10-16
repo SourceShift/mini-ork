@@ -219,7 +219,7 @@ nodes:
     dispatch_mode: serial
     gates: [budget_gate]
     inputs: { technique_catalog: { required: true } }
-    outputs: [{ name: technique_clusters, kind: json, path: clusters.json }]
+    outputs: [{ name: technique_clusters, kind: json, path: families.json }]
 
   - name: cluster_splitter
     type: verifier

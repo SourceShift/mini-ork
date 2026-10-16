@@ -24,9 +24,15 @@ outputs:
   - path: "${MINI_ORK_RUN_DIR}/technique-catalog.json"
     mime: application/json
     description: Canonical techniques with corpus-checked source ids and coverage accounting.
+  - path: "${MINI_ORK_RUN_DIR}/families.json"
+    mime: application/json
+    description: The clusterer's eight mechanism families — name, scope, membership criteria and discriminative keywords.
   - path: "${MINI_ORK_RUN_DIR}/clusters.json"
     mime: application/json
-    description: Eight mechanism families covering the catalog.
+    description: The deterministic assignment of every catalog technique to one of those families, plus its coverage.
+  - path: "${MINI_ORK_RUN_DIR}/cluster-assignment.json"
+    mime: application/json
+    description: Assignment audit — family sizes, empty-family repairs, and techniques assigned on a zero margin.
   - path: "${MINI_ORK_RUN_DIR}/review-pack.json"
     mime: application/json
     description: Per-family implementable techniques plus the written snapshot of what is already known to work.

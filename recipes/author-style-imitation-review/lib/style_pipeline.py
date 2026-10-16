@@ -555,6 +555,150 @@ def catalog(extraction_paths: list[Path], corpus_path: Path, catalog_out: Path, 
 # ---------------------------------------------------------------- split
 
 
+_STOPWORDS = frozenset(
+    """a an and are as at be because been but by can could for from has have how in into is it its
+    more most not of on or other our than that the their them there these they this to under using
+    used via was were what when where which while who will with within without would""".split()
+)
+
+
+def _words(text: object) -> list[str]:
+    """Lowercase word tokens with stopwords and 1-2 character tokens dropped.
+
+    No stemming: a deliberately shallow tokeniser is easier to audit than a
+    stemmer whose collisions would silently merge two families' vocabularies.
+    """
+    return [
+        w
+        for w in re.findall(r"[a-z0-9][a-z0-9\-_+.]*", str(text or "").lower())
+        if len(w) > 2 and w not in _STOPWORDS
+    ]
+
+
+def assign(families_path: Path, catalog_path: Path, clusters_out: Path, audit_out: Path) -> None:
+    """Assign every catalog technique to a model-defined family, deterministically.
+
+    The clusterer's job is judgment: what the families ARE. Deciding which of
+    several hundred techniques belongs in which family is mechanical, and asking
+    one generation to emit a several-hundred-entry mapping invites a duplicate-
+    key and missed-key debug loop instead of an answer. Here the model supplies
+    each family's name, scope, criteria and keywords (plus a few exemplars it is
+    sure of), and this stage does the assignment by lexical overlap, so the
+    result is reproducible, auditable, and reported.
+    """
+    expected_groups = group_count()
+    payload = _read_json(families_path)
+    families = payload.get("families") if isinstance(payload, dict) else None
+    if not isinstance(families, list) or len(families) != expected_groups:
+        raise PipelineError(
+            f"clusterer must define exactly {expected_groups} families, "
+            f"got {len(families) if isinstance(families, list) else 'none'}"
+        )
+    cat = _read_json(catalog_path)
+    techniques = [t for t in (cat.get("techniques") or []) if isinstance(t, dict) and t.get("key")]
+    if len(techniques) < expected_groups:
+        raise PipelineError(f"catalog has {len(techniques)} techniques; need at least {expected_groups} to fill the families")
+
+    family_text: list[set[str]] = []
+    family_keywords: list[list[str]] = []
+    for family in families:
+        if not isinstance(family, dict):
+            raise PipelineError("every family must be an object")
+        keywords = [str(k).lower() for k in (family.get("keywords") or []) if str(k).strip()]
+        family_keywords.append(keywords)
+        family_text.append(
+            set(_words(" ".join(str(family.get(f) or "") for f in ("name", "scope", "criteria"))))
+            | set(_words(" ".join(keywords)))
+        )
+
+    def score(index: int, tech: dict[str, Any]) -> float:
+        text = " ".join(str(tech.get(f) or "") for f in ("technique", "mechanism")).lower()
+        tokens = set(_words(text))
+        hits = sum(1 for kw in family_keywords[index] if kw and kw in text)
+        overlap = len(tokens & family_text[index])
+        return 3.0 * hits + overlap / (len(family_text[index]) ** 0.5 or 1.0)
+
+    exemplars: list[set[str]] = [
+        {str(k) for k in (f.get("exemplars") or [])} if isinstance(f, dict) else set() for f in families
+    ]
+
+    assigned: dict[str, int] = {}
+    margins: dict[str, float] = {}
+    for tech in techniques:
+        key = str(tech["key"])
+        scores = [score(i, tech) for i in range(expected_groups)]
+        # An exemplar the model named outright outranks any lexical score: it is
+        # the one place the clusterer still speaks about a specific technique.
+        for i, named in enumerate(exemplars):
+            if key in named:
+                scores[i] += 100.0
+        ranked = sorted(range(expected_groups), key=lambda i: (-scores[i], i))
+        assigned[key] = ranked[0]
+        margins[key] = scores[ranked[0]] - scores[ranked[1]]
+
+    # Every family must end up non-empty: split() fails on an empty group, and a
+    # family the model defined but no technique lexically reached is better
+    # repaired than fatal. Move the best-fitting technique from a family that can
+    # spare one, deterministically, lowest family index first.
+    repaired: list[dict[str, Any]] = []
+    for target in range(expected_groups):
+        if any(v == target for v in assigned.values()):
+            continue
+        best_key, best_gain = "", float("-inf")
+        for tech in techniques:
+            key = str(tech["key"])
+            current = assigned[key]
+            if sum(1 for v in assigned.values() if v == current) <= 1:
+                continue
+            gain = score(target, tech) - score(current, tech)
+            if gain > best_gain or (gain == best_gain and key < best_key):
+                best_key, best_gain = key, gain
+        if not best_key:
+            raise PipelineError(f"cannot populate family {target + 1}: no technique can be spared")
+        previous = assigned[best_key]
+        assigned[best_key] = target
+        repaired.append({"key": best_key, "from": f"G{previous + 1:02d}", "to": f"G{target + 1:02d}"})
+
+    groups = []
+    for index, family in enumerate(families, start=1):
+        keys = [str(t["key"]) for t in techniques if assigned[str(t["key"])] == index - 1]
+        groups.append(
+            {
+                "name": str(family.get("name") or f"G{index:02d}"),
+                "scope": str(family.get("scope") or ""),
+                "technique_keys": keys,
+            }
+        )
+    _write_json(clusters_out, {"groups": groups})
+
+    low_confidence = [
+        {"key": str(t["key"]), "group": f"G{assigned[str(t['key'])] + 1:02d}", "margin": round(margins[str(t["key"])], 3)}
+        for t in techniques
+        if margins[str(t["key"])] <= 0.0
+    ]
+    _write_json(
+        audit_out,
+        {
+            "family_count": expected_groups,
+            "technique_count": len(techniques),
+            "family_sizes": [len(g["technique_keys"]) for g in groups],
+            "repaired": repaired,
+            "low_confidence": low_confidence,
+        },
+    )
+    print(
+        json.dumps(
+            {
+                "groups": expected_groups,
+                "assigned": len(techniques),
+                "unassigned": 0,
+                "repaired": len(repaired),
+                "low_confidence": len(low_confidence),
+            }
+        )
+    )
+
+
 def split(clusters_path: Path, catalog_path: Path, papers_path: Path, out_dir: Path, unclustered_out: Path) -> None:
     """Validate the clusterer's grouping and write one bounded file per group."""
     expected_groups = group_count()
@@ -915,6 +1059,12 @@ def main() -> int:
     p.add_argument("--catalog-out", type=Path, required=True)
     p.add_argument("--papers-out", type=Path, required=True)
 
+    p = sub.add_parser("assign")
+    p.add_argument("--families", type=Path, required=True)
+    p.add_argument("--catalog", type=Path, required=True)
+    p.add_argument("--clusters-out", type=Path, required=True)
+    p.add_argument("--audit-out", type=Path, required=True)
+
     p = sub.add_parser("split")
     p.add_argument("--clusters", type=Path, required=True)
     p.add_argument("--catalog", type=Path, required=True)
@@ -957,6 +1107,8 @@ def main() -> int:
             shard(args.input, args.output)
         elif args.cmd == "catalog":
             catalog(args.extraction, args.corpus, args.catalog_out, args.papers_out)
+        elif args.cmd == "assign":
+            assign(args.families, args.catalog, args.clusters_out, args.audit_out)
         elif args.cmd == "split":
             split(args.clusters, args.catalog, args.papers, args.out_dir, args.unclustered_out)
         elif args.cmd == "pack":

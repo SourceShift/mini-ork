@@ -37,8 +37,10 @@ lives.
 - `technique-catalog.json` covers at least 95% of the corpus (its `coverage`
   block states covered/expected), and carries a technique count in the
   hundreds.
-- `clusters.json` has exactly eight groups covering at least 95% of catalog
-  techniques.
+- `families.json` defines exactly eight mechanism families, each with membership
+  criteria and discriminative keywords; `clusters.json` assigns every catalog
+  technique to one of them (no mapping is requested from the model — the
+  assignment is deterministic and audited in `cluster-assignment.json`).
 - `merged-review.json` carries scores from two independent reviewers, a
   `replicated_technique_count`, and disagreement flags.
 - `author-style-imitation-review.md` has Executive Summary, Techniques That
