@@ -109,7 +109,15 @@ def _corpus_sources(corpus_path: Path) -> dict[str, dict[str, Any]]:
     sources = corpus.get("sources") if isinstance(corpus, dict) else None
     if not isinstance(sources, list):
         raise PipelineError("source corpus has no sources list")
-    return {str(s["source_id"]): s for s in sources if isinstance(s, dict) and s.get("source_id")}
+    # Keys are unversioned so every membership test against a corpus id is
+    # version-insensitive in both directions: a shard worker that echoes
+    # arxiv:2604.05112v1 still resolves, and a corpus that keeps a suffix still
+    # matches an unversioned citation.
+    return {
+        _unversioned(str(s["source_id"])): s
+        for s in sources
+        if isinstance(s, dict) and s.get("source_id")
+    }
 
 
 def _unversioned(source_id: str) -> str:
@@ -471,7 +479,11 @@ def catalog(extraction_paths: list[Path], corpus_path: Path, catalog_out: Path, 
         for paper in payload.get("papers") or []:
             if not isinstance(paper, dict):
                 continue
-            sid = str(paper.get("source_id") or "")
+            # A shard worker may echo a versioned id (arxiv:2604.05112v1) for a
+            # paper the corpus holds unversioned. Comparing raw would drop a
+            # paper that IS in the corpus as an "unknown source" and undercount
+            # coverage, so normalise both sides at the boundary.
+            sid = _unversioned(str(paper.get("source_id") or ""))
             if sid not in corpus:
                 dropped_ids.add(sid)
                 continue
@@ -496,7 +508,7 @@ def catalog(extraction_paths: list[Path], corpus_path: Path, catalog_out: Path, 
         for tech in payload.get("shard_techniques") or []:
             if not isinstance(tech, dict) or not tech.get("technique"):
                 continue
-            ids = [str(i) for i in tech.get("source_ids") or []]
+            ids = [_unversioned(str(i)) for i in tech.get("source_ids") or []]
             valid = [i for i in ids if i in corpus]
             dropped_ids.update(i for i in ids if i not in corpus)
             if not valid:
