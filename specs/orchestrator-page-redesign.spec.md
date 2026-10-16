@@ -1038,11 +1038,21 @@ serial — the venv has neither `pytest-xdist` nor `pytest-timeout`) →
       twelve-run fixture (AC-009); on this home there is no doubtful row to put at the
       top, which is the requirement's own success state, not an untested path.
 
-      The same run doubles as the AC-012 payload census: **155 `{"set": …}` actions, 43
-      `cli`+`confirm`+`home` and 1 `cli`+`confirm`** (the guarded destructive verbs), plus
-      `page`(+`tab`/`args`), `run`+`title`, `path` and `thread` — every live `do` key is one
-      `store.rs::perform` handles, so no affordance on the redesigned page is a control
-      that draws and does nothing.
+      The AC-012 census is **structural, not a set of counts.** An earlier revision of this
+      item quoted one ("155 `{"set": …}` actions, 43 `cli`+`confirm`+`home` and 1
+      `cli`+`confirm`") as if it were a property of the page. It is not: re-measured across all
+      eight tabs on the same home, `confirm` is **2** at `MINI_ORK_IDE_SPEC` unset or `1` and
+      **51** at level `2` (what the fork sets, `crates/mini_ork_ui/src/board.rs:194`), while
+      `set` holds at 155 — and the same command at the same level moved its `cli`/`home`
+      totals between runs, because several tabs draw live machine state. Only the structural
+      claim is durable, and it holds: the page emits six verbs (`cli, page, set, run, path,
+      thread`) and nine section types (`chips, pills, table, triage, composer, list, kv,
+      code, checks`), **every verb has a branch in `store.rs::perform`** (`:476`; `cli :483`,
+      `page :487`, `set :513`, `run :516`, `path :537`) and **every type has an arm in
+      `page.rs`** (`table :896`, `kv :897`, `list :898`, `triage :886`, `composer :890`), with
+      `confirm` honoured at `page.rs:564`. So no affordance on the redesigned page is a
+      control that draws and does nothing — which is the property the census existed to show,
+      and the one that does not move when the machine does.
 
       **GUI half — owed, and it is the user's to run.** Launching the IDE and clicking
       the tabs is a front-end launch, which the standing instruction keeps off this
