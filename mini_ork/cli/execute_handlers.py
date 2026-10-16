@@ -21,7 +21,6 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
-from mini_ork import run_status
 from mini_ork.context import (
     ENV_DISPATCH_CHAIN,
     ENV_RESUME_SESSION_ID,
@@ -524,28 +523,6 @@ def _record_step_completion(db, run_id, node_id, *, rc, retry_exhausted,
               file=sys.stderr)
 
 
-def _run_is_live(db, run_id: str) -> bool:
-    """True while ``run_id``'s ``task_runs`` row is in a :data:`run_status.LIVE` status.
-
-    ``db`` is the state.db *path* (the same handle ``_node_attempt_no`` opens).
-    Fail-open: an unreadable database or an absent row reports live, so a failed
-    status read leaves the stop flag meaning what it always did rather than
-    silently forcing a run to keep dispatching.
-    """
-    try:
-        if not (isinstance(db, str) and db and os.path.isfile(db)):
-            return True
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5.0)
-        try:
-            row = con.execute("SELECT status FROM task_runs WHERE id = ?",
-                              (run_id,)).fetchone()
-        finally:
-            con.close()
-    except sqlite3.Error:
-        return True
-    return not (row and run_status.is_terminal(row[0]))
-
-
 @_node_publish_boundary
 def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
                   dispatch_fn, recipe="", workflow="", trace_fn=None,
@@ -715,15 +692,7 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     # for every real dispatch; the dry-run preview path is _dry_dispatch_node. ──
     # Cooperative soft-stop: UI POST /stop touches .stop-requested; bail BEFORE the
     # next node so an in-flight node finishes naturally (Stop=soft vs Kill=hard).
-    #
-    # Honour it only while the run is still live. The flag signals a *running*
-    # dispatcher and only the hard-kill path clears it, so a soft-stopped run
-    # leaves the file behind; `recover` always starts from a terminal row, where
-    # there is no in-flight node to finish and no dispatcher to signal. Reading
-    # the file there made the revive skip every node before dispatch and report
-    # "execute: N node(s) failed" while the command still exited 0 — so a resume
-    # inherited its predecessor's stop instead of continuing past it.
-    if os.path.isfile(os.path.join(run_dir_eff, ".stop-requested")) and _run_is_live(db, run_id):
+    if os.path.isfile(os.path.join(run_dir_eff, ".stop-requested")):
         print(f"  [stop] .stop-requested present — skipping node_id={node_id}", file=sys.stderr)
         return 1, "interrupted"
 
