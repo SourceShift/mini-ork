@@ -267,6 +267,19 @@ warns about — I asserted a *negative* from one search instead of a *positive* 
 Local `main` moved three times during the sweep (`0abc587d` → `95a4af77` → `60c00154`). Re-measure
 at publication time; do not quote any divergence figure from this document.
 
+**C-3 — My "second defect in `read_verifier_payload`" was FALSE. Retracted.**
+I read a docstring against a loop and asserted a code bug from the mismatch, without reading the
+iterator the loop runs over. `_iter_json_objects` walks **bottom-up**, so first-match and
+last-object are the same thing and nothing was broken. I published this to `origin/main` in round 3
+before checking it, which is the same error class as C-1: a *negative* about code asserted from one
+reading instead of a positive check. Caught by `run-page-ux-clarity`, who owns the function and
+checked. The retraction is in the body, not only here.
+
+**C-4 — the reported "57 of 117" was an estimate, not a count.** The same session measured it after
+the fact: **62 of 123**, matching this document's independent count. It corrected its own figure and
+flagged it as a self-report rather than fixing it silently — worth recording because the failure
+mode is the one the session was *reporting*: a plausible number, asserted, never measured.
+
 ## Late additions (reports that arrived after the first pass)
 
 **Delivery integrity — a whole class** (`mini-ork-cb` G1, now P0 #4a): three runs with
@@ -495,11 +508,19 @@ fires, and the page tells the user *"Failed at ?; the cause was not classified"*
 verdict JSON is on disk. On `run-1792151796-92942` the cause was recoverable and specific:
 `gates_materialize`, kind `code`.
 
-**A second defect in the same function, found while verifying the first.** The docstring says the
-**last** matching object; the loop `return`s on the **first**, so an appended second verdict for the
-same verifier — the case a retry produces — is unreachable. Either the scan should continue to the
-last match or the docstring should say first; the reader's purpose suggests the docstring is right
-and the loop is the bug.
+**A second claim of mine about this function was REFUTED by its author — see C-3.** I read the
+docstring ("the LAST JSON object …") against a loop that `return`s on the first match and called it
+a bug. It is not one: `_iter_json_objects` (`levels.py:81`) walks the file **bottom-up**
+(`for i in range(len(lines) - 1, -1, -1)`), so the first object it yields *is* the last blob in the
+file, and returning on that match is exactly the docstring's promise — a retry appends its verdict
+last. `levels.py:206` corroborates independently: *"Scan bottom-up like
+:func:`read_verifier_payload`"*. The docstring still read as a bug to anyone who cannot tell the
+iterator is reversed, so the prose was worth fixing; no behaviour was wrong.
+
+The sharper criticism is `run-page-ux-clarity`'s, and it is right: name-matching a field that two
+thirds of writers omit is **the wrong lookup in the first place** — the file is named
+`verifier_<stem>.json`, which already says who wrote it. The landed fallback covers the 62; the
+primary reader still cannot distinguish a *missing* verdict from a *malformed* one.
 
 Fix in the tree (uncommitted): `read_single_verifier_payload` as a fallback — it returns the file's
 one JSON object, or `None` when it holds none or several, because `_iter_json_objects` yields a
