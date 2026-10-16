@@ -19,9 +19,9 @@ from typing import Any
 from mini_ork.ide_pages import spec as S
 from mini_ork.ide_pages.run import plan_artifact, plan_steps
 
-TABS = [("session", "Session"), ("dispatch", "Dispatch"), ("kickoffs", "Kickoffs"),
-        ("races", "Races"), ("planner", "Classify & plan"), ("coord", "Coordination"),
-        ("intake", "Intake")]
+TABS = [("session", "Session"), ("dispatch", "Dispatch"), ("decide", "Decide"),
+        ("kickoffs", "Kickoffs"), ("races", "Races"), ("planner", "Classify & plan"),
+        ("coord", "Coordination"), ("intake", "Intake")]
 
 _WORKSPACE_LABELS = {"worktree": "New worktree per task", "in-place": "In place (this checkout)"}
 _HISTORY_THREADS = 8
@@ -603,6 +603,175 @@ def _kickoff_key(home: Path, run: dict[str, Any]) -> str:
 
 
 # ── classify & plan ────────────────────────────────────────────────────────
+
+#: How long a run may sit on ``needs_answers`` before the Decide tab starts
+#: naming the recipe and start time it is holding — the cost of leaving it
+#: parked. An operator tunes this to their own standby posture; one working hour
+#: by default.
+_WAIT_ALERT_S = int(os.environ.get("MO_DECIDE_ALERT_S") or 3600)
+#: Waiting runs drawn on the Decide tab. Past this the tab points at the Planner
+#: tab rather than growing an unbounded column of questions.
+_DECIDE_LIMIT = 10
+#: How many of the newest runs are asked whether they hold a profile. The same
+#: newest-first window ``_latest_run_with`` scans.
+_PROFILE_SCAN = 60
+
+
+def _waited(seconds: int) -> str:
+    """A wait at its coarsest useful grain: ``47m``, ``2h 05m``, ``3d 4h``."""
+    if seconds < 60:
+        return f"{max(seconds, 0)}s"
+    if seconds < 5400:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h {(seconds % 3600) // 60:02d}m"
+    return f"{seconds // 86400}d {(seconds % 86400) // 3600}h"
+
+
+def _wait_tone(seconds: int) -> tuple[str, str]:
+    """The marker + colour a wait earns. Steadily hotter with age, so a run
+    nobody has looked at for hours cannot read like one that just parked.
+    Colours are the renderer's names, never hex."""
+    if seconds >= 3 * _WAIT_ALERT_S:
+        return ("!!", "red")
+    if seconds >= _WAIT_ALERT_S:
+        return ("!", "orange")
+    if seconds >= 900:
+        return ("?", "yellow")
+    return ("?", "sub")
+
+
+def _clock(stamp: int) -> str:
+    """The wait's start as the operator's own wall clock."""
+    return time.strftime("%H:%M", time.localtime(stamp))
+
+
+def _question_text(value: Any) -> str:
+    """A profile question as its promptable text.
+
+    ``gen_profile`` writes plain strings, but the file is written by whatever
+    planner ran, so a dict degrades to its text — keyed the same way
+    ``plan._question_text`` keys it, because that is the key ``save_answers``
+    has to match on re-dispatch.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return str(value.get("text") or value.get("question") or value)
+    return str(value)
+
+
+def _pending_questions(profile: dict[str, Any],
+                       answers: dict[str, Any]) -> list[tuple[str, str]]:
+    """``[(id, text)]`` for the questions this run has not answered yet.
+
+    The id is the question's 1-based position (``q1``) over the *whole* list,
+    which is what ``board answer --for`` resolves — so the box the operator sees
+    and the argv the composer sends name the same question.
+    """
+    out: list[tuple[str, str]] = []
+    for index, raw in enumerate(profile.get("human_questions") or [], 1):
+        text = _question_text(raw)
+        if text and text not in answers:
+            out.append((f"q{index}", text))
+    return out
+
+
+def _recent_profiles(home: Path, errors: dict[str, str],
+                     limit: int = _PROFILE_SCAN) -> list[dict[str, Any]]:
+    """Every recent run that asked a question, longest-waiting first.
+
+    ``_latest_run_with`` answers "what did the newest run decide", so a run
+    parked on ``needs_answers`` three runs back is invisible to it. This walks
+    the same newest-first window and keeps each run that actually asked
+    something: a dir with no ``run_profile.json`` never asked, so it is skipped
+    without an error, while a profile that will not parse is recorded in
+    ``errors`` — a page that silently dropped it would report "nothing waiting"
+    while a run sat blocked.
+
+    The ``needs_answers`` predicate is ``web.control.get_profile``'s
+    (``profile_status == "needs_answers" and len(questions) > len(answers)``),
+    restated here because ``get_profile`` degrades an unparseable profile to
+    ``{}`` and so cannot report the parse failure FR-020 asks for.
+
+    The wait is measured from the profile file's mtime: the question was asked
+    when the gate wrote it, and nothing rewrites the file until it is answered.
+    """
+    rows = _rows(home, "SELECT id, created_at FROM task_runs "
+                       "ORDER BY created_at DESC, rowid DESC LIMIT ?", (limit,))
+    found: list[dict[str, Any]] = []
+    for row in rows:
+        run_id = str(row["id"])
+        run_dir = home / "runs" / run_id
+        profile_path = run_dir / "run_profile.json"
+        if not profile_path.is_file():
+            continue
+        try:
+            asked_at = int(profile_path.stat().st_mtime)
+            profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            errors[f"profile:{run_id}"] = f"run_profile.json unreadable: {exc}"
+            continue
+        if not isinstance(profile, dict):
+            errors[f"profile:{run_id}"] = "run_profile.json is not an object"
+            continue
+        answers = _read_json(run_dir / "profile-answers.json")
+        answers = answers if isinstance(answers, dict) else {}
+        pending = _pending_questions(profile, answers)
+        found.append({
+            "run_id": run_id,
+            "asked_at": asked_at,
+            "created_at": str(row["created_at"] or ""),
+            "recipe": str(profile.get("recipe") or ""),
+            "profile_status": str(profile.get("profile_status") or ""),
+            "pending": pending,
+            "needs_answers": profile.get("profile_status") == "needs_answers" and bool(pending),
+        })
+    found.sort(key=lambda item: item["asked_at"])
+    return found
+
+
+def _decide(home: Path, now: int, errors: dict[str, str]) -> list[dict[str, Any]]:
+    """The Decide tab: every run the profile gate parked, waiting longest first,
+    each with a composer per question so the typed text is the answer.
+
+    One box per question rather than one per run: ``board answer`` refuses a bare
+    ``--text`` when several questions are outstanding, because
+    ``save_answers`` clears them all at once and an answer attached to the wrong
+    one would take the others with it. Binding each box to its own ``--for`` is
+    what keeps a single-run answer unambiguous.
+    """
+    waiting = [item for item in _recent_profiles(home, errors) if item["needs_answers"]]
+    if not waiting:
+        return [S.lst("Blocked on you", [S.dot("Nothing is waiting for an answer")], full=True,
+                      note="A run lands here when the profile gate parks it on "
+                           "needs_answers. Answering it makes the run ready to re-dispatch.")]
+    out: list[dict[str, Any]] = []
+    for item in waiting[:_DECIDE_LIMIT]:
+        run_id = item["run_id"]
+        short = run_id[-12:] if len(run_id) > 12 else run_id
+        waited = max(now - item["asked_at"], 0)
+        marker, tone = _wait_tone(waited)
+        detail = f"waiting {_waited(waited)}"
+        if waited >= _WAIT_ALERT_S:
+            # Past the threshold the *cost* is the point: name what is parked.
+            detail += (f" · {item['recipe'] or 'no recipe'} · "
+                       f"started {item['created_at'][:16] or '—'}")
+        rows = [S.item(text, detail, m=marker, mc=tone, when=_clock(item["asked_at"]))
+                for _qid, text in item["pending"]]
+        out.append(S.lst(f"Blocked on you · {short}", rows, full=True,
+                         note="One box per question below; each answer is bound to its "
+                              "own question id, so it cannot land on another.",
+                         actions=[S.btn("Open run", S.open_run(run_id), "ghost")]))
+        for index, (qid, text) in enumerate(item["pending"], 1):
+            out.append(S.composer(f"Answer q{index}: {text[:80]}",
+                                  ["board", "answer", run_id, "--for", qid, "--text"],
+                                  title=f"Answer · {short}", full=True))
+    if len(waiting) > _DECIDE_LIMIT:
+        out.append(S.lst(f"{len(waiting) - _DECIDE_LIMIT} more waiting",
+                         [S.dot("See the Planner tab for the rest")], full=True))
+    return out
+
 
 def _planner(home: Path) -> list[dict[str, Any]]:
     # Keyed on the profile alone: requiring a literal plan.json hid every run
@@ -1216,6 +1385,8 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     elif tab == "dispatch":
         with _recipe_lookup_cached():
             sections += S.guarded(errors, "Dispatch", lambda: _dispatch(home, args))
+    elif tab == "decide":
+        sections += S.guarded(errors, "Decide", lambda: _decide(home, now, errors))
     elif tab == "kickoffs":
         sections += S.guarded(errors, "Kickoffs", lambda: _kickoffs(home))
     elif tab == "races":

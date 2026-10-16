@@ -303,7 +303,12 @@ _PAGE_TABS: dict[str, tuple[str, ...]] = {
     "learn": ("patterns", "gradients", "memory"),
     "context": ("active", "library"),
     "nodes": ("fleet", "queue"),
-    "orch": ("intake",),
+    # ``dispatch`` and ``decide`` carry ``cli`` actions of their own (the
+    # Dispatch pickers' ``board start`` and the Decide tab's ``board answer``
+    # composers). Listing every tab — not just ``intake`` — is what makes the
+    # walk catch a malformed action on any of them.
+    "orch": ("session", "dispatch", "decide", "kickoffs", "races", "planner",
+             "coord", "intake"),
     "setup": ("readiness", "features", "settings", "zed", "projects", "health"),
     "run": ("dag", "overview", "agents", "learnings", "artifacts"),
 }

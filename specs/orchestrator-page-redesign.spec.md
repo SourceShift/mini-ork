@@ -550,14 +550,23 @@ Stated explicitly, with cost, so a reviewer can decline them knowingly.
 - [ ] Tests: a unit test per section, asserting the new keys exist and that a missing
       source degrades rather than raising. **Not written** — held per the working
       agreement that test work starts after the implementer confirms.
-- [ ] **Add `"orch": ("session", "kickoffs", "races", "planner", "coord", "intake")`
-      to `tests/unit/test_ide_pages_actions.py::_PAGE_TABS`.** It lists only `intake`
-      today, so the `cli` actions FR-003 and FR-005 add are outside the argv walk. They
-      were verified by hand (all 6 tabs build; every emitted `cli` action parses against
-      its own parser) and by the 20 tests in `test_ide_pages_actions.py` +
-      `test_cn_ui_coordination.py`, which pass — but a future malformed action on those
-      two tabs would ship unseen, which is the exact gap the `kanban` comment in that
-      file describes.
+- [x] **Add the orch tabs to `tests/unit/test_ide_pages_actions.py::_PAGE_TABS`.**
+      It listed only `intake`, so the `cli` actions FR-003 and FR-005 add were outside
+      the argv walk — the exact gap the `kanban` comment in that file describes.
+      Extended to all eight tabs (`session, dispatch, decide, kickoffs, races, planner,
+      coord, intake`) as part of P2. `pytest tests/unit/test_ide_pages_actions.py` →
+      **4 passed**, so every action on every tab parses against its own parser.
+- [ ] **Stale assertions in `tests/unit/test_ide_pages_orch.py`: 5 failures, all
+      pre-dating P2 and caused by P1's own design changes — left unfixed per the working
+      agreement (tests are not touched until the implementer's change is confirmed).**
+      None is a P2 regression; each asserts a shape P1 deliberately changed:
+      `test_every_tab_builds` pins the tab key list (`dispatch` added by FR-012);
+      `test_thread_defaults_follow_the_env`, `test_mcp_pills_are_the_servers_tools` and
+      `test_history_has_threads_and_runs` index `sections[0]`/`[1]` positionally, and
+      FR-003 turned the session tab's leading `kv` into three `chips` pickers;
+      `test_kickoffs_are_linted_and_link_their_runs` expects the pre-FR-002 sub text
+      (`"lint: The kickoff…"` where `_kickoff_parts` now writes
+      `"saved · lint: ⚠ The kickoff…"`). The remaining 5 tests in the file pass.
 
 ### P1 — Dispatch
 - [x] FR-010 — `board start`: add `start` to `build_parser().choices`; add `--kickoff`, `--set` (append), `--run-id`, `--workspace`, `--init`, `--dry-run`; exempt `start` from `validate`'s run-id rule and require `--kickoff`; implement `_act_start` wrapping `web.control.launch_run`; fail closed on an uninitialised home.
@@ -568,11 +577,38 @@ Stated explicitly, with cost, so a reviewer can decline them knowingly.
       Verified by hand: all 7 tabs build at **both** IDE spec levels with no `errors`; the lint panel appears only when a kickoff is selected (checks at level 2, markdown fallback at level 1); a walked **23 `cli` actions parse against their own parsers, 0 failures** (`features` rejects `--home` and every such action carries `home=False`); AC-003's chain reproduced end to end — composer writes the file, the dispatch list shows it, its Start action is present, selecting it renders the lint panel. A live spawn: see FR-010.
 - [ ] Tests: parser round-trip (mirroring `tests/unit/test_board_cmd.py`'s guard), dry-run writes nothing, uninitialised home refuses, and a real spawn is asserted from `launch_run`'s return rather than by waiting for the run. **Not written** — held per the working agreement.
 
-### P2 — Answers
-- [ ] FR-020 — the recent-run profile scan, shared with P3's classification table.
-- [ ] FR-021 — `board answer <run_id> --text T` reusing the parser's existing `--text`; single-question enforcement; passthrough of `next_step_cli`.
-- [ ] FR-022 — the blocked-on-you panel with per-question composers.
-- [ ] Tests: answering a single-question run flips the status; a multi-question run refuses; a run with no questions refuses.
+### P2 — Answers — **implemented 2026-10-16**
+- [x] FR-020 — `orch._recent_profiles(home, errors, limit=60)`: the newest 60
+      `task_runs` rows, each run's `run_profile.json` read directly, sorted by the
+      profile file's mtime (longest wait first). A run dir with no profile is skipped
+      silently; an unparseable one is recorded under `errors["profile:<run_id>"]`, which
+      FR-001's callout then surfaces.
+      *Deviation, deliberate:* the `needs_answers` predicate is restated
+      (`profile_status == "needs_answers" and pending`) rather than delegated to
+      `web.control.get_profile`, because `get_profile` catches `JSONDecodeError` and
+      returns `{}` — it cannot distinguish "never asked" from "will not parse", which is
+      the distinction FR-020 requires. The predicate is the same two terms.
+- [x] FR-021 — `board answer <run_id> --text T [--for Q ...]`. `--text` became
+      `action="append"` (it was a single `store` shared with `steer`); the `steer`
+      branch joins the values (`" ".join`), so a one-`--text` steer is unchanged and the
+      repeatable-pair form is expressible. Refusals: several questions with a bare
+      `--text` (lists the ids); no pending questions; unknown `--for`; `--for`/`--text`
+      count mismatch; a question named twice; an unknown run (`stage: "usage"`). Every
+      refusal writes nothing. Success returns `save_answers`' payload verbatim, so
+      `next_step_cli` rides through unchanged. `answer` was added to the stderr-writing
+      verb set so the reason is visible on the CLI.
+      `--for` accepts either the `q<N>` id or the question's own text.
+- [x] FR-022 — the `decide` tab (`TABS`, third): one `list` per parked run, titled
+      `Blocked on you · <short>`, longest wait first, capped at `_DECIDE_LIMIT` (10)
+      with a pointer to the Planner tab past it. Wait duration on every row; tone
+      escalates with age (`sub` → `yellow` ≥15 m → `orange` ≥1 h → `red` ≥3 h) and past
+      `_WAIT_ALERT_S` (1 h, `MO_DECIDE_ALERT_S` to tune) the row also names the recipe
+      and the start time. One `composer` per *question*, bound to
+      `["board","answer",<run>,"--for",q<N>,"--text"]` — per question, not per run,
+      because the verb refuses a bare `--text` on a multi-question run.
+- [x] Tests — `tests/unit/test_board_answer.py` (11) + `tests/unit/test_ide_pages_orch_decide.py` (12), **22 passed**. Covered: single-question success flips the status and clears the questions; several-pending refusal lists the ids *and* writes nothing; paired `--for/--text` answers several in one call; `--for` by text; unknown id; count mismatch; no-pending; never-asked; unknown run; `--text` required; `steer` still reads its text; only parked runs listed, longest first; an answered and an unprofiled run excluded; per-question composers; id preserved for the unanswered half of a partly answered run; tone escalation and colour validity; the long-wait detail; an unreadable and a non-object profile into `errors`; a dict question normalised to its text. Plus the seam: the emitted composer argv, with the typed text appended, runs through `board_cmd.main` and answers the right question.
+- [x] Cross-check — `pytest tests/unit/test_ide_pages_node.py test_ide_pages_inbox_kanban.py test_ide_pages_thread.py test_ide_header_lanes_composer.py` → **95 passed**, i.e. the shared `--text` change did not disturb `steer`.
+- [ ] **Not done, still open:** P3's classification table was to *share* this scan; when FR-033 lands, `_recent_profiles` is the seam to reuse rather than re-walk.
 
 ### P3 — Races and arrivals
 - [ ] FR-031 — `run_id` column: `SCHEMA_SQL` + `db/migrations/0074_intake_events_run_id.sql` with a `PRAGMA table_info` guard; extend `record_intake_event`; wire `intake/dispatch.py`; keep the schema/migration agreement test green.

@@ -863,6 +863,83 @@ def _act_steer(home: Path, run_id: str, text: str | None, role: str | None,
                      source="ide")
 
 
+def _act_answer(home: Path, run_id: str, texts: list[str],
+                fors: list[str]) -> dict[str, Any]:
+    """``board answer <run_id> --text T [--for Q]`` — answer a run parked on
+    ``needs_answers`` from the CLI / IDE instead of the HTTP control plane.
+
+    ``save_answers`` keys the answers map by the question *text* (that is what
+    the planner writes into the kickoff on re-dispatch, see
+    ``plan._prompt_profile_questions``), so a single ``--text`` is only
+    unambiguous when exactly one question is outstanding. With several, we
+    refuse and list them rather than guess — an answer attached to the wrong
+    question silently misleads the planner. ``--for`` names the question (its
+    text, or its 1-based ``q<N>``), one per ``--text``.
+    """
+    from mini_ork.cli.plan import _question_text
+    from mini_ork.web.control import get_profile, save_answers
+
+    if not (home / "runs" / run_id).is_dir():
+        return {"ok": False, "run_id": run_id, "stage": "usage",
+                "error": f"run {run_id} not found"}
+
+    profile = get_profile(home, run_id)
+    questions = [_question_text(q) for q in (profile.get("questions") or [])]
+    answered = set((profile.get("answers") or {}).keys())
+    pending = [(f"q{index}", text)
+               for index, text in enumerate(questions, 1) if text not in answered]
+    if not pending:
+        return {
+            "ok": False, "run_id": run_id, "questions": [],
+            "error": f"run {run_id} has no pending questions "
+                     f"(profile_status={profile.get('profile_status') or 'unknown'})",
+        }
+
+    ids = [{"id": qid, "text": text} for qid, text in pending]
+    by_id = dict(pending)
+    id_of = {text: qid for qid, text in pending}
+    listing = ", ".join(f"{qid} ({text[:70]})" for qid, text in pending)
+
+    answers: dict[str, str] = {}
+    if fors:
+        if len(fors) != len(texts):
+            return {"ok": False, "run_id": run_id, "questions": ids,
+                    "error": f"{len(fors)} --for with {len(texts)} --text; "
+                             "pass one of each per question"}
+        for target, text in zip(fors, texts):
+            # ``--for`` names the question either way; what the answers map has
+            # to key on is its *text* — save_answers folds this map straight
+            # into the profile the planner re-reads, so an id here would answer
+            # a question the planner never asked.
+            question = by_id.get(target)
+            if question is None and target in id_of:
+                question = target
+            if question is None:
+                return {"ok": False, "run_id": run_id, "questions": ids,
+                        "error": f"no pending question {target!r}; pending: {listing}"}
+            if question in answers:
+                return {"ok": False, "run_id": run_id, "questions": ids,
+                        "error": f"question {target!r} answered twice"}
+            answers[question] = text
+    elif len(texts) > 1:
+        return {"ok": False, "run_id": run_id, "questions": ids,
+                "error": f"{len(texts)} --text without --for; pass one --text, "
+                         "or one --for per question"}
+    elif len(pending) > 1:
+        return {"ok": False, "run_id": run_id, "questions": ids,
+                "error": f"run {run_id} has {len(pending)} pending questions and a "
+                         f"single --text cannot name one; pass --for with each "
+                         f"--text. Pending: {listing}"}
+    else:
+        answers = {pending[0][1]: texts[0]}
+
+    result = save_answers(home, run_id, answers)
+    result.setdefault("run_id", run_id)
+    result["answered"] = [{"id": id_of.get(text, ""), "text": text}
+                          for text in answers]
+    return result
+
+
 def _clamp_runs_verb_args(offset: int, limit: int) -> tuple[int, int]:
     """Sanitise the verb's offset/limit — ``argparse`` only checks types."""
     if offset < 0:
@@ -1146,6 +1223,7 @@ def main(rest: list[str], root: str) -> int:
                          "[gate approve|reject <inbox_id> [--note TEXT]] "
                          "[node <run_id> <node_id> [--view V] [--offset N]] "
                          "[steer <run_id> --role R --severity S --text TEXT] "
+                         "[answer <run_id> --text T [--for Q ...]] "
                          "[retry <run_id> [--ack-change] [--force] [--dry-run]] "
                          "[checkpoints <run_id>] "
                          "[restore <run_id> <node> [--force]] "
@@ -1168,7 +1246,7 @@ def main(rest: list[str], root: str) -> int:
         # keep the pre-kickoff behaviour of exiting 1 silently — touching
         # their stderr output would change behaviour the existing test
         # suite (and other tooling) already expects.
-        if args.verb in ("restore", "checkpoints", "start"):
+        if args.verb in ("restore", "checkpoints", "start", "answer"):
             reason = payload.get("reason") or payload.get("error")
             if reason:
                 sys.stderr.write(f"{reason}\n")
@@ -1208,6 +1286,11 @@ def validate(args) -> str | None:
             return "mini-ork board steer: a run id is required"
         if not args.text:
             return "mini-ork board steer: --text is required"
+    elif args.verb == "answer":
+        if not args.run_id:
+            return "mini-ork board answer: a run id is required"
+        if not args.text:
+            return "mini-ork board answer: --text is required"
     elif args.verb == "restore":
         if not args.run_id:
             return "mini-ork board restore: a run id is required"
@@ -1269,7 +1352,10 @@ def build_payload(home: Path, args) -> dict[str, Any]:
     elif args.verb == "node":
         payload = _act_node(home, args.run_id, args.target, args.view, args.offset)
     elif args.verb == "steer":
-        payload = _act_steer(home, args.run_id, args.text, args.role, args.severity)
+        payload = _act_steer(home, args.run_id, " ".join(args.text or []),
+                             args.role, args.severity)
+    elif args.verb == "answer":
+        payload = _act_answer(home, args.run_id, args.text or [], args.answer_for)
     elif args.verb == "retry":
         payload = _act_retry(home, args.run_id,
                              ack_change=args.ack_change, force=args.force,
@@ -1321,8 +1407,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mini-ork board", add_help=False)
     parser.add_argument("verb", nargs="?", default="show",
                         choices=["show", "run", "merge", "discard", "dismiss", "stop", "kill",
-                                 "resume", "retry", "gate", "page", "node", "steer", "runs",
-                                 "checkpoints", "restore", "start"])
+                                 "resume", "retry", "gate", "page", "node", "steer", "answer",
+                                 "runs", "checkpoints", "restore", "start"])
     parser.add_argument("run_id", nargs="?")
     # `gate approve|reject <inbox_id>` puts the action in run_id and the id here;
     # `node <run_id> <node_id>` uses the same slot for the node id (the L464
@@ -1346,8 +1432,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="steer target role (default: any)")
     parser.add_argument("--severity", default="info",
                         help="steer severity: info|warn|critical (default: info)")
-    parser.add_argument("--text", default=None,
-                        help="steer message text")
+    parser.add_argument("--text", action="append", default=None,
+                        help="steer message text; answer: the answer text "
+                             "(repeat, paired with --for, to answer several questions)")
+    parser.add_argument("--for", dest="answer_for", action="append", default=[],
+                        help="answer: the question to answer (its text, or q<N>). "
+                             "Repeat alongside a matching --text to answer several.")
     parser.add_argument("--ack-change", action="store_true",
                         help="retry: acknowledge the hint's needs_change block "
                              "(otherwise the verb refuses to spawn).")
