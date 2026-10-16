@@ -1966,3 +1966,38 @@ def test_default_dispatch_reports_an_escaping_exception_on_stderr(monkeypatch, c
     assert rc == 1
     assert "database is locked" in output
     assert "[dispatch] reviewer: llm_dispatch raised" in capsys.readouterr().err
+
+
+# ── the soft-stop flag is a signal to a LIVE run only ──
+# `POST /stop` writes .stop-requested and nothing clears it on the soft path
+# (only the hard-kill path unlinks it), so a stopped run leaves the file behind.
+# `recover` always starts from a terminal row — there is no in-flight node to
+# finish and no dispatcher to signal — and used to read its predecessor's stop
+# as an instruction: every node was skipped before dispatch, the run was failed
+# again, and the command still exited 0.
+
+
+def test_stop_flag_is_ignored_by_a_recover_of_a_terminal_run(tmp_path, monkeypatch):
+    db = _seed_db(tmp_path, "stopterm"); _seed_task_run(db, status="failed")
+    rd = tmp_path / "run"; rd.mkdir()
+    (rd / ".stop-requested").write_text("1792142272\n")
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
+
+    rc, fr = ex.dispatch_node(_fields("res1_lens", "researcher", "kimi_lens"),
+                              root=str(REPO), run_dir=str(rd), plan_path=_plan(tmp_path),
+                              task_class="code_fix", db=db, run_id="r1",
+                              dispatch_fn=_fake("finding: X"))
+    assert (rc, fr) == (0, "done")
+
+
+def test_stop_flag_still_stops_a_live_run(tmp_path, monkeypatch):
+    db = _seed_db(tmp_path, "stoplive"); _seed_task_run(db, status="executing")
+    rd = tmp_path / "run"; rd.mkdir()
+    (rd / ".stop-requested").write_text("1792142272\n")
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
+
+    rc, fr = ex.dispatch_node(_fields("res1_lens", "researcher", "kimi_lens"),
+                              root=str(REPO), run_dir=str(rd), plan_path=_plan(tmp_path),
+                              task_class="code_fix", db=db, run_id="r1",
+                              dispatch_fn=_fake("finding: X"))
+    assert (rc, fr) == (1, "interrupted")
