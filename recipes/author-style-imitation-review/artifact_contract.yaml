@@ -1,0 +1,38 @@
+source_artifact: author-style-imitation-review.md
+task_class: author_style_imitation_review
+expected_artifact: composite
+
+success_verifiers:
+  - verifiers/verify.py
+
+failure_policy: escalate
+rollback_policy: keep_all_source_and_summary_artifacts
+
+description: >
+  Literature review of author-style imitation over a >=1000-paper corpus.
+  Inputs are the recipe's collection-plan.json (50 queries in 5 batches of 10,
+  the corpus floor, and the ranking policy; override with
+  MINI_ORK_COLLECTION_PLAN) and context/style-imitation-state.md (the
+  target-state snapshot the reviewers score against; override with
+  MO_STYLE_STATE_FILE). The contract fails rather than publish a report whose
+  arXiv citations are not all present in the collected corpus.
+
+outputs:
+  - path: "${MINI_ORK_RUN_DIR}/source-corpus.json"
+    mime: application/json
+    description: Audited >=1000-paper LibWit corpus merged from five independent batch searches, with retrieval metadata and ranking provenance.
+  - path: "${MINI_ORK_RUN_DIR}/technique-catalog.json"
+    mime: application/json
+    description: Canonical techniques with corpus-checked source ids and coverage accounting.
+  - path: "${MINI_ORK_RUN_DIR}/clusters.json"
+    mime: application/json
+    description: Eight mechanism families covering the catalog.
+  - path: "${MINI_ORK_RUN_DIR}/review-pack.json"
+    mime: application/json
+    description: Per-family implementable techniques plus the written snapshot of what is already known to work.
+  - path: "${MINI_ORK_RUN_DIR}/merged-review.json"
+    mime: application/json
+    description: Two-reviewer scores merged into a ranked list with replication counts and disagreement flags.
+  - path: "${MINI_ORK_RUN_DIR}/author-style-imitation-review.md"
+    mime: text/markdown
+    description: Final review naming the techniques that work, with a working combination and full evidence appendices.

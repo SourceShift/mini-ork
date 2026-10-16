@@ -1,0 +1,73 @@
+{
+  "source": "arxiv",
+  "date_from": "2023-01-01",
+  "required_source_count": 1000,
+  "results_per_query": 40,
+  "max_workers": 3,
+  "batch_size": 10,
+  "ranking_policy": "Rank by cross-batch topical coverage first (a paper matched by queries from several searcher batches sits closer to the centre of author-style imitation), then LibWit relevance score, then citation signals, then recency within the 2023-01-01 window. Keep one unversioned arXiv URL per paper and retain every matched topic for auditability.",
+  "anchor_paper": "arxiv:2509.14543",
+  "anchor_note": "Catch Me If You Can? Not Yet (EMNLP 2025) is the anchor. Its four measurement families - authorship attribution, authorship verification, style matching, AI detection - define the success metrics the reviewers score against.",
+  "query_batches": [
+    [
+      {"topic": "style-imitation", "query": "large language model imitate personal writing style from few examples in-context"},
+      {"topic": "personalization", "query": "personalized text generation user writing style preference alignment large language model"},
+      {"topic": "implicit-style", "query": "implicit writing style subtle authorial voice modeling large language model"},
+      {"topic": "author-conditioning", "query": "author-specific text generation conditioning on author identity large language model"},
+      {"topic": "style-consistency", "query": "style-consistent long-form generation maintaining an author voice"},
+      {"topic": "persona", "query": "persona prompting persona consistency stylistic fidelity in language models"},
+      {"topic": "sample-efficiency", "query": "few-shot style adaptation from a small number of writing samples"},
+      {"topic": "feature-control", "query": "stylometric feature control formality sentiment authorship in text generation"},
+      {"topic": "human-eval", "query": "human evaluation of perceived writing style similarity imitation"},
+      {"topic": "user-alignment", "query": "user-aligned generation personal voice assistive writing tool language model"}
+    ],
+    [
+      {"topic": "authorship-attribution", "query": "authorship attribution neural stylometry transformer"},
+      {"topic": "authorship-verification", "query": "authorship verification open-set same-author detection with language models"},
+      {"topic": "style-embedding", "query": "writing style embedding representation authorship neural network"},
+      {"topic": "contrastive-style", "query": "contrastive learning writing style representation author classification"},
+      {"topic": "fingerprinting", "query": "authorship fingerprinting of language models machine-generated text detection"},
+      {"topic": "disentanglement", "query": "disentangling content and style representation in text"},
+      {"topic": "stylometry-features", "query": "computational stylometry function words punctuation idiolect features"},
+      {"topic": "cross-domain-attribution", "query": "cross-domain cross-topic authorship attribution transfer"},
+      {"topic": "forensics", "query": "forensic authorship analysis benchmark evaluation dataset"},
+      {"topic": "attribution-vs-verification", "query": "authorship attribution versus verification metrics style similarity measurement"}
+    ],
+    [
+      {"topic": "style-transfer", "query": "text style transfer unsupervised paraphrasing"},
+      {"topic": "formality", "query": "formality style transfer rewriting formal informal text"},
+      {"topic": "controllable-generation", "query": "controllable text generation attribute control during decoding"},
+      {"topic": "author-rewrite", "query": "rewrite a text in the style of a given author language model"},
+      {"topic": "style-reward", "query": "reinforcement learning from human preference for style-controlled text generation"},
+      {"topic": "low-resource-transfer", "query": "low-resource style transfer data augmentation for text"},
+      {"topic": "preference-optimization-style", "query": "direct preference optimization for stylistic alignment of writing"},
+      {"topic": "style-preserving-edit", "query": "style-preserving text revision and editing models"},
+      {"topic": "transfer-evaluation", "query": "evaluation metrics for text style transfer meaning preservation"},
+      {"topic": "syntactic-control", "query": "hierarchical syntactic and stylistic control in text generation"}
+    ],
+    [
+      {"topic": "in-context-learning", "query": "in-context learning mechanisms demonstrations examples large language model"},
+      {"topic": "demonstration-selection", "query": "demonstration selection and retrieval of in-context examples"},
+      {"topic": "few-shot-prompting", "query": "few-shot prompting number of demonstrations effect on generation quality"},
+      {"topic": "instruction-following", "query": "instruction following adherence to style constraints large language model"},
+      {"topic": "long-context-conditioning", "query": "long context conditioning on a reference document large language model"},
+      {"topic": "prompt-optimization", "query": "automatic prompt optimization for personalized style generation"},
+      {"topic": "retrieval-grounded-style", "query": "retrieval augmented generation grounding style in an author corpus"},
+      {"topic": "demo-scaling", "query": "scaling number of demonstrations for style imitation large language model"},
+      {"topic": "self-refinement", "query": "self-refinement and critique for style consistency revision"},
+      {"topic": "role-play", "query": "role-play character voice simulation fidelity large language model"}
+    ],
+    [
+      {"topic": "lora-personalization", "query": "LoRA parameter efficient fine-tuning for personal writing style"},
+      {"topic": "style-vectors", "query": "activation steering style vectors representation control in language models"},
+      {"topic": "distillation-style", "query": "distilling an author style into a small language model"},
+      {"topic": "author-adapters", "query": "author-specific adapters personalization for text generation"},
+      {"topic": "ai-detection", "query": "AI-generated text detection and evasion stylistic human-likeness"},
+      {"topic": "benchmark", "query": "benchmark dataset for personal writing style imitation evaluation"},
+      {"topic": "automatic-metrics", "query": "automatic metrics for style similarity and authorship scoring"},
+      {"topic": "privacy-memorization", "query": "privacy and memorization risk when imitating a person's writing"},
+      {"topic": "cross-lingual-style", "query": "cross-lingual author style transfer multilingual writing"},
+      {"topic": "survey-personalization", "query": "survey of personalization and stylistic control in text generation"}
+    ]
+  ]
+}

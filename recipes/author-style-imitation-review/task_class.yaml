@@ -1,0 +1,36 @@
+name: author_style_imitation_review
+version: "0.1.0"
+description: >
+  Literature review of author-style imitation: collect 1000+ papers on making a
+  language model reproduce an individual's writing style, extract per-paper
+  techniques, cluster them into mechanism families, distill each family into
+  implementable techniques, and rank them by whether the evidence actually
+  supports them — using two independent reviewer lanes and a deterministic
+  citation-grounding verifier.
+
+matches:
+  keywords:
+    - author style imitation
+    - writing style replication
+    - imitate an author's writing
+    - personal writing style review
+    - stylometry literature review
+    - style transfer survey
+  regex: []
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+
+risk_class: low
+
+cost_model:
+  min_usd: 6
+  max_usd: 45
+  per_lens_usd: 1.5
+
+runtime_model:
+  min_minutes: 60
+  max_minutes: 360
