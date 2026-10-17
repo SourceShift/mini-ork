@@ -82,6 +82,18 @@ All paths are relative to the repository root.
    Stale rows remain visible nowhere else — do not delete them.
 5. **A flag for the risky half:** `MO_FINDINGS_STALENESS=0` disables only the
    snippet check (age still applies). Default on.
+6. **Close R5's residual in the same file.** R5 filters review findings through
+   `classify_note` in `_parse_review_raw`, but the VERIFIER path can still store
+   a **process** note: `_parse_verifier_raw` drops a failed verifier whose
+   notes are all receipt/harness, then falls through and persists one whose
+   only note is a delivery complaint. Zero such rows exist in the live table
+   today (verifier sources: 182 code, 63 receipt, 1 harness, 0 process), so the
+   hole is latent. Close it centrally in `_harvest_run`'s insert loop: at the
+   top of the per-finding loop, `continue` when
+   `classify_note(finding["issue"]) != "code"`. The review path's filter makes
+   this a no-op there; the verifier path gains the gate. Skip BEFORE the
+   `seen_review` bookkeeping so a skipped note cannot shadow a later real
+   finding with the same key.
 
 ## Files in scope
 
@@ -91,6 +103,7 @@ All paths are relative to the repository root.
 - `tests/unit/test_code_findings_staleness.py` (new)
 - `tests/unit/test_context_v2.py`
 - `tests/unit/test_ide_pages_learn_code.py`
+- `tests/unit/test_code_findings.py`
 
 ## Tests (`tests/unit/test_code_findings_staleness.py`, hermetic temp git repos + temp DB)
 
@@ -107,7 +120,10 @@ All paths are relative to the repository root.
   the fresh one; the pack's `n_findings_stale` equals the number dropped;
 - with `MO_FINDINGS_STALENESS=0`, the snippet-stale row comes back and the aged
   row still does not;
-- the tab hides a stale row and shows the hidden-count line.
+- the tab hides a stale row and shows the hidden-count line;
+- a failed verifier whose only reason is a process note ("pushed to
+  origin/main before the reviewer node ran") stores no `code_findings` row,
+  while the same payload with a real code complaint stores one.
 
 ## Verification commands
 
