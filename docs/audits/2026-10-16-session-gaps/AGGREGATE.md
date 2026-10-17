@@ -1215,3 +1215,86 @@ on.** Recorded because the inverse of accepting a good correction is refusing a 
 this is the one instance where two sessions agreed on that by independent measurement rather than by
 deference.
 
+## Delivery — round 14 (the `.sh` is to be orphaned, not hardened; three more receipts; and an uncommitted workstream of mine)
+
+**Superseded from round 13: the `.sh` has *two* asymmetries, and the remedy is not a port.** Round 13
+recorded one asymmetry (the `.sh` takes the lock but has no bounded retry) and suggested "a small port
+of the same loop". Both halves are now corrected.
+
+*The second asymmetry is the worse one, and I verified it.* The `.sh` fetches at `:242` — **before**
+the green gate (`:246`) — and its in-lock sequence (`:251-253`) is `acquire_lock; rebase origin/main;
+push origin HEAD:main; release_lock` with **no fetch inside the lock**. So it re-rebases onto the
+*pre-gate* cached remote-tracking ref, stale by however long the gate ran. The `.py` fetches *inside*
+the loop (`:604`). **A lock serialises writers; it cannot make a stale ref fresh** — so a `.sh` merge
+can push a non-fast-forward that no retry would have caused, and the earlier concern (no retry) is the
+smaller of the two.
+
+*Do not port the loop — orphan the script instead.* Three measured reasons:
+
+1. **Nothing calls it.** `git grep 'mini-ork-worktree\.sh'` over tracked files returns **zero call
+   sites** — every hit is prose: `.githooks/reference-transaction:79,105`, `AGENTS.md:50`, the bash
+   removal plan, a todo, and a comment in `self_improve.py:432`. The Makefile drives the `.py`
+   (`Makefile:49` → `scripts/mini_ork_worktree.py`; `worktree` / `worktree-merge` / `worktree-clean`
+   all route through it).
+2. **The plan intends it to disappear.** `docs/plans/2026-07-26-bash-removal-plan.md:159,164` lists
+   `mini-ork-worktree.sh` as a **port target**, and `scripts/mini_ork_worktree.py:8` self-describes as
+   *"Port of scripts/mini-ork-worktree.sh (bash-removal Phase 4)"*. A retry loop there adds a feature
+   to a file scheduled for deletion and would make the two paths diverge on a *second, invisible*
+   axis — strictly worse than the present asymmetry.
+3. **Two prose pointers are the whole reason a human would run the weaker script.**
+   `.githooks/reference-transaction:105` prints `scripts/mini-ork-worktree.sh create <task-slug>` as
+   the **remedy** for a rejected feature-branch creation, and `AGENTS.md:50` asserts the `.sh` *"is
+   what the targets call"* — **false** since `Makefile:49` was repointed to the `.py`. That sentence is
+   itself a defect to fix with the repoint.
+
+**Remedy: repoint both pointers at `scripts/mini_ork_worktree.py`, after which the `.sh` has zero
+readership and Phase 4 is a plain delete.** This is better than the port on both axes — it removes the
+exposure rather than hardening the thing that carries it, and it finishes a plan instead of entrenching
+it.
+
+**Blocker, verified — the guard working, not a defect.** The repoint is atomic with the hook-message
+change, because `tests/unit/test_githooks_py.py:141` pins `"scripts/mini-ork-worktree.sh create
+<task-slug>"` in the hook's stderr verbatim. And `lf-r14` holds the ownership claim on **both**
+`.githooks/post-commit` and `tests/unit/test_githooks_py.py` (`$WORKTREES_DIR/.ownership:61-62`), so a
+worktree that tries to make the edit is refused at create — correctly, on the live run. Land it when
+`lf-r14` frees the file.
+
+**Two more receipts for P0#3, and a new classifier defect (from `zed-mini-ork-4b`).**
+
+- **P0#3, third independent receipt.** Researcher home `run-1792157583-93406`: `test.attempts.json`
+  frozen at **15:39:45** (1 entry — the hint's `failed_node`), while `typecheck.attempts.json` moved to
+  **20:25:25** (2 entries, both `finish_reason: done`). The failed node was never in the closure —
+  `descendants(typecheck) ∌ test` again — and the row carried P2#12's attempt-1 `ended_at` after the
+  revive. Both of today's fixes now have a second-home receipt.
+- **New classifier defect, adjacent to P0 4d — quantified, mine to record.** Engine home
+  `run-1792151796-92942` ($3.171) and `run-1792151693-87094` ($0.55), both `spec-driven-delivery`,
+  died at `gates-materialize` with **0 probes**: `gates/<spec>.json` → `"probes": []`, `unprobeable: 5
+  × NO_EXECUTABLE_FENCE` (verified in the run dir), and `diagnosis.json` → `layer: change`,
+  `routes_to: revise` — *"a verifier refuted the change"* — though **0 probes is 0 evidence** and
+  nothing about the change was judged. `decide` step 6 fires on `node_type == verifier` before any
+  owner rule, so the revise round is spent re-entering `per_spec_dispatcher`. **The tell is `probes:
+  []`**; a gate that could not probe anything must not read as a refutation.
+- **A self-inflicted spec-test, framework-edit** (`run-1792185781-68028`): the run's own generated
+  spec test dies in its own helper (`_make_db` → `sqlite3.connect` on an unmade dir →
+  `OperationalError: unable to open database file`), and the verifier's `tamper-detection` freezes the
+  spec file after `spec_test_author`, so the implementer may not edit it and nothing else is in the
+  loop. `diagnose` R5 → `revise` (verifier node); two implementer rounds burned on an unfixable file;
+  6 paths rolled back, run salvaged. The lever is the hint's `kind` in `retry_hint.py` — a **policy
+  call**, recorded not made. Detector, if wanted: the failing nodeid's `E` line is a non-assertion
+  exception whose deepest frame is inside the spec dir ⇒ spec-author defect, not a change refutation.
+- **`659a3553` landed** (from `zed-mini-ork-4b`): code-fix `_baseline_unrunnable` now names the
+  matching log line, so a target repo's own guard exit-1 is not read as a red base — the `99014` root
+  cause. Not to be duplicated.
+
+**The shared checkout holds an uncommitted workstream of mine — recorded here as a risk, not a
+completion.** Five files are dirty in `/Volumes/docker-ssd/ps/mini-ork` and the edit trail is mine
+(verified against this session's own transcript, not asserted): `verify/levels.py` (adds
+`read_single_verifier_payload(path)`), `recovery/retry_hint.py` (`HINT_VERSION` 4 → 5), plus
+`ide_pages/outcome.py`, `ide_pages/run.py`, `ide_pages/spec.py`. They form one coherent workstream —
+the "`Failed at ?`" attribution for the verifier scripts whose payload carries no `verifier` field —
+and it is **half-built**: the read-side helper and its one caller exist, but the core (`execute.py` /
+`execute_handlers.py` from the abstain plan) does not. Two consequences worth stating plainly: peers
+are queuing *further* changes onto `retry_hint.py` on the belief it is mine (it is), and an
+uncommitted multi-file set in a checkout nine other sessions are editing is one careless `git add -A`
+from a mixed commit. It needs a scoped commit or an explicit park, by the user's call, not by drift.
+
