@@ -214,10 +214,26 @@ git merge-base --is-ancestor 899107f0 origin/main   # C18+C21 crumbs, worktree s
   triage action on a harness failure instead of saying it cannot tell. The harness
   reason outranks a provider signature; artifact verdicts stay `consumer`, infra
   reasons stay `unknown`. 41 + 13 tests, CLI proof pasted in the run log.
+- **C17** (`f0733db7`, run `run-1792249139-6289`, verdict pass) — the roster was drawn
+  twice (DAG and Agents); it now lives only on Agents. Call-to-node attribution is one
+  shared rule (`_match_calls`) so the cost column and the fallback note cannot
+  disagree. A node served by two models reads `first → last`, its row carries a
+  `fallback` list and a `⇄` marker, and the section note names each sequence plus the
+  failed-call count before the model that answered; one- and zero-model rows are
+  unchanged. The plan's Buddy clause was dropped as obsolete — that surface was removed
+  on 2026-10-16 and is not restored.
+- **C22** (`dd4f7a07`, run `run-1792251123-84567`, verdict pass) — one kind rule
+  (patch → json → log → jsonl → md → other) orders each node's artifact table, the
+  table's `sub` names the kinds present with counts, and every row — including the
+  pinned key artifacts — carries a machine-readable `kind` for the renderer's filter
+  (the box itself is the IDE's; the contract has no filter primitive). The row cap and
+  the single `… N more` accounting are unchanged. A side fix: `impl-<node>.patch` now
+  attributes to its node instead of falling into Run files, because the attribution
+  regex only knew extensions up to three letters.
 
 **Still open:** the IDE renderer halves (C1, C2, C12-render, C13-render, C14-render, C24,
-C26) and engine C17 (roster de-dupe + fallback flag, in flight: `wt/rp-c17`) plus the
-remaining C-series items. SDD option A-vs-B remains blocked on the user.
+C26), engine C23 (learnings promote/reject, in flight: `wt/rp-c23`) plus the remaining
+C-series items. SDD option A-vs-B remains blocked on the user.
 
 **Incident, same day:** the first C9+C12 dispatch was killed after its `code_impact_lens`
 found a deterministic scope conflict — the kickoff forbade editing the two tests that pin
