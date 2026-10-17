@@ -114,6 +114,7 @@ _NATIVE_MODULE_SUBS = {
     "intake": "mini_ork.cli.intake_cmd",
     "approvals": "mini_ork.cli.approvals_cmd",
     "kickoff": "mini_ork.cli.kickoff_cmd",
+    "orchestrator": "mini_ork.cli.orchestrator_cmd",
 }
 
 _HELP = """mini-ork — task operating system for agents (v0.1)

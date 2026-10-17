@@ -45,6 +45,7 @@ def test_all_former_exec_subs_registered_natively():
         "threads",
         "intake",
         "kickoff",
+        "orchestrator",
         "cn",
         "approvals",
     }
