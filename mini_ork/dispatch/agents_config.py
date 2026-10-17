@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import copy
 import os
+import sys
 import tempfile
 from pathlib import Path
 
@@ -139,6 +140,103 @@ def _load_yaml(path: str, what: str = "personal agents overlay") -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Lane identity — alias → lane → model → family
+# ---------------------------------------------------------------------------
+
+
+def _lane_identity(lane: str) -> tuple[str, str]:
+    """``(model, family)`` for ``lane``; never raises.
+
+    Family resolution is owned by ``mini_ork.verify.panel_heterogeneity`` and
+    imported LAZILY here: a module-level import would put ``verify`` on
+    ``dispatch``'s import path. An unreadable providers registry degrades to
+    the lane name as its own model/family — the same outcome ``lane_family``
+    gives an unknown lane — instead of taking a dispatch down over a warning.
+    """
+    try:
+        from mini_ork.verify.panel_heterogeneity import lane_family, lane_model
+
+        return lane_model(lane), lane_family(lane)
+    except Exception:
+        return lane, lane
+
+
+def lane_families(agents: dict) -> dict[str, dict]:
+    """Resolve an agents mapping's ``lanes:`` to ``{alias: {lane, model, family}}``.
+
+    Pure: it takes an already-loaded (merged) mapping and never mutates it.
+    Aliases whose value is not a non-empty string are skipped, and resolution
+    never raises — see :func:`_lane_identity`.
+
+    These are the CONFIGURED lanes, not proof of what served: the router's
+    fallback walk can serve a different member, so ``llm_calls.model_id`` /
+    ``traces.agent_version_id`` stay authoritative for what actually ran.
+    """
+    lanes = agents.get("lanes") if isinstance(agents, dict) else None
+    if not isinstance(lanes, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for alias, lane in lanes.items():
+        if not isinstance(lane, str) or not lane:
+            continue
+        model, family = _lane_identity(lane)
+        out[alias] = {"lane": lane, "model": model, "family": family}
+    return out
+
+
+def lane_family_warnings(agents: dict) -> list[str]:
+    """Advisory lines for families claimed by more than one ``*_lens`` alias.
+
+    A panel assembled from those aliases believes it has N families and has
+    fewer. The sweep is restricted to ``_lens`` aliases (the judge-panel
+    surface) so ordinary role aliases sharing a lane do not drown the signal.
+    One line per family, sorted for determinism; a family claimed by exactly
+    one alias produces no line. Never raises.
+    """
+    families = lane_families(agents)
+    grouped: dict[str, list[str]] = {}
+    try:
+        for alias, entry in families.items():
+            if not isinstance(alias, str) or not alias.endswith("_lens"):
+                continue
+            grouped.setdefault(entry["family"], []).append(alias)
+        lines = []
+        for family, aliases in grouped.items():
+            if len(aliases) < 2:
+                continue
+            aliases = sorted(aliases)
+            lane = families[aliases[0]]["lane"]
+            lines.append(
+                f"lane aliases {', '.join(aliases)} all resolve to family "
+                f"'{family}' (lane {lane}) — a panel using them is not "
+                "family-heterogeneous"
+            )
+        return sorted(lines)
+    except Exception:
+        return []
+
+
+def _family_warn_enabled() -> bool:
+    """``MO_LANE_FAMILY_WARN=0`` silences the advisory; anything else is on."""
+    return (os.environ.get("MO_LANE_FAMILY_WARN") or "").strip() != "0"
+
+
+def _warn_family_collapse(agents: dict) -> None:
+    """Write the family-collapse advisory to stderr; never raise, never route."""
+    if not _family_warn_enabled():
+        return
+    try:
+        lines = lane_family_warnings(agents)
+    except Exception:
+        return
+    for line in lines:
+        try:
+            print(f"[agents_config] {line}", file=sys.stderr)
+        except Exception:
+            return
+
+
+# ---------------------------------------------------------------------------
 # Effective path — the merged materialisation
 # ---------------------------------------------------------------------------
 
@@ -171,6 +269,17 @@ def effective_path(home: str | None = None, root: str | None = None) -> str:
     tmpl = template_path(home=home, root=root)
     over_p = personal_path(home=home)
     if over_p is None:
+        # No overlay: the returned path is byte-for-byte today's, but the
+        # template's own lane map is still what consumers will read — warn on
+        # it too. A malformed template must not start raising here: the
+        # warning is advisory and the path return is unchanged.
+        loaded: dict = {}
+        if Path(tmpl).is_file():
+            try:
+                loaded = _load_yaml(tmpl, "agents.yaml template")
+            except Exception:
+                loaded = {}
+        _warn_family_collapse(loaded)
         return tmpl
 
     h = _resolve_home(home)
@@ -194,6 +303,7 @@ def effective_path(home: str | None = None, root: str | None = None) -> str:
         except OSError:
             prev = ""
     if prev == body:
+        _warn_family_collapse(merged)
         return dest
 
     dest_dir = os.path.dirname(dest)
@@ -221,4 +331,5 @@ def effective_path(home: str | None = None, root: str | None = None) -> str:
         raise ValueError(
             f"cannot write effective agents.yaml at {dest}: {exc}"
         ) from exc
+    _warn_family_collapse(merged)
     return dest

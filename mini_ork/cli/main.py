@@ -557,7 +557,17 @@ def _resolve_recipe_base(root: str, recipe: str):
 def gen_profile(kickoff_path, root, recipe, task_class, profile_path, agents_path,
                 recipe_base=None) -> dict:
     """Verbatim transcription of the run-profile embedded python. Writes the
-    profile.json and returns the same dict (caller prints the key=value lines)."""
+    profile.json and returns the same dict (caller prints the key=value lines).
+
+    ``provider_policy.lane_families`` resolves each configured lane alias to
+    its lane, model and model family, and
+    ``provider_policy.lane_family_warnings`` records the family collapses in
+    the effective overlay. Both describe the CONFIGURED (effective) lanes:
+    they are what the run ASKED for, not proof of what served. The served
+    model per node is authoritative in ``llm_calls.model_id`` /
+    ``traces.agent_version_id`` — the router's fallback walk can serve a
+    different member, so a reader must not treat this map as what ran.
+    """
     root = Path(root)
     rbase = Path(recipe_base) if recipe_base else root
     kickoff = Path(kickoff_path)
@@ -811,7 +821,13 @@ def gen_profile(kickoff_path, root, recipe, task_class, profile_path, agents_pat
         "budget_cap_usd": task_yaml.get("budget_cap_usd"),
         "provider_policy": {
             "source": str(Path(agents_path).resolve()),
+            # `lanes` stays verbatim (readers depend on the alias map); the
+            # two additions resolve it. CONFIGURED, not served: llm_calls
+            # .model_id / traces.agent_version_id are authoritative for what
+            # actually ran (the router can fall back to another member).
             "lanes": lanes,
+            "lane_families": agents_config.lane_families({"lanes": lanes}),
+            "lane_family_warnings": agents_config.lane_family_warnings({"lanes": lanes}),
             "env": {"MINI_ORK_PROVIDER_POLICY": str(Path(agents_path).resolve()) if lanes else ""},
         },
         "artifact_destination": outputs,
