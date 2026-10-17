@@ -82,6 +82,7 @@ def test_operator_contract_constants_are_present():
         ".stop-requested",
         ".workspace-session.json",
         "state.db*",
+        ".orchestrator-watch.*",
     ):
         assert name in DEFAULT_EXCLUDES, f"missing exclude: {name!r}"
     assert any(p.endswith("live.jsonl") for p in DEFAULT_EXCLUDES)

@@ -1,4 +1,11 @@
-"""Per-run orchestrator — a pure decision core at each DAG node boundary.
+"""Per-run orchestrator — one decision core on two cadences.
+
+**Cadence 1, node boundaries** (:func:`on_node_boundary`): decide one action per
+node transition. **Cadence 2, between boundaries** (:func:`observe`): sample the
+live node, judge it, and speak only when it is in trouble. Both run under the
+same flag, budget and event prefix, so a run has exactly one orchestrator; the
+interval cadence is hosted by a detached ``mini-ork orchestrator watch``
+process because it must outlive the dispatcher it watches.
 
 Every mini-ork run already produces the raw material an orchestrator needs:
 typed failure classes (``mini_ork/learning/failure_classifier.py``), a
@@ -73,7 +80,9 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Mapping
 
 __all__ = [
@@ -83,7 +92,16 @@ __all__ = [
     "MUTATE",
     "PROMOTE",
     "ALL_ACTIONS",
+    "WATCH_EVENTS",
+    "WATCH_LOCK_FILE",
+    "WATCH_LOG_FILE",
+    "WATCH_STATE_FILE",
     "Action",
+    "SteerRequest",
+    "WatchConfig",
+    "WatchDecision",
+    "WatchInputs",
+    "WatchState",
     "enabled",
     "classify_outcome",
     "decide",
@@ -91,6 +109,13 @@ __all__ = [
     "guard_steer",
     "budget_ok",
     "on_node_boundary",
+    "load_watch_state",
+    "observe",
+    "save_watch_state",
+    "watch_active",
+    "watch_enabled",
+    "watch_state_path",
+    "watch_steer_message",
 ]
 
 # ── action vocabulary ────────────────────────────────────────────────────────
@@ -478,3 +503,491 @@ def on_node_boundary(ctx: Any, *, spent_usd: float = 0.0) -> Action | None:
         return action
     except Exception:
         return None
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Interval cadence — observe a live run between node boundaries
+# ════════════════════════════════════════════════════════════════════════════
+# The detection rules live in ``mini_ork.acp_orchestrator.watch`` (log mtime,
+# repeated lines, spend); this half owns the run-level policy on top of them:
+# when to speak, when to steer, and when to stop watching. Nothing here opens a
+# model call, writes ``.pid``, changes a run's status, or writes liveness.
+
+WATCH_EVENTS = (
+    "orchestrator.watching",
+    "orchestrator.signal",
+    "orchestrator.steered",
+    "orchestrator.ended",
+)
+WATCH_STATE_FILE = ".orchestrator-watch.json"
+WATCH_LOCK_FILE = ".orchestrator-watch.lock"
+WATCH_LOG_FILE = "orchestrator-watch.log"
+
+_ENV_WATCH = "MO_ORCH_WATCH"
+_ENV_INTERVAL = "MO_ORCH_WATCH_INTERVAL_S"
+_ENV_AUTONOMY = "MO_ORCH_WATCH_AUTONOMY"
+_ENV_MAX_STEERS = "MO_ORCH_WATCH_MAX_STEERS"
+_ENV_MAX_HOURS = "MO_ORCH_WATCH_MAX_HOURS"
+
+_DEFAULT_INTERVAL_S = 20.0
+_DEFAULT_MAX_STEERS = 2
+_DEFAULT_MAX_HOURS = 12.0
+_DEFAULT_AUTONOMY = "steer"
+_AUTONOMY = frozenset({"steer", "notify", "off"})
+# Only a node that is visibly stuck is worth a nudge. A long-running or
+# expensive node is reported, never steered: the remedy there is a human
+# decision, not an injection of text.
+_WATCH_STEERABLE = frozenset({"stalled", "repeating_error"})
+_MAX_STEER_ATTEMPTS = 3
+_STEER_TTL_SECS = 1800
+_STALE_AFTER_S = 60.0
+_MISSING_PID_TICKS = 2
+
+
+def watch_enabled() -> bool:
+    """True unless ``MO_ORCH_WATCH`` is explicitly falsy.
+
+    The spawn switch and the watcher read the same value, so a run that opts
+    out never starts a process that would immediately exit.
+    """
+    return os.environ.get(_ENV_WATCH, "").strip().lower() not in _FALSY
+
+
+@dataclass(frozen=True)
+class WatchConfig:
+    interval_s: float = _DEFAULT_INTERVAL_S
+    autonomy: str = _DEFAULT_AUTONOMY
+    max_steers: int = _DEFAULT_MAX_STEERS
+    max_hours: float = _DEFAULT_MAX_HOURS
+
+    @classmethod
+    def from_env(cls) -> "WatchConfig":
+        """Read the knobs; an unrecognized autonomy fails closed to ``notify``."""
+        try:
+            interval = float(os.environ.get(_ENV_INTERVAL, "") or _DEFAULT_INTERVAL_S)
+        except (TypeError, ValueError):
+            interval = _DEFAULT_INTERVAL_S
+        try:
+            max_steers = int(os.environ.get(_ENV_MAX_STEERS, "") or _DEFAULT_MAX_STEERS)
+        except (TypeError, ValueError):
+            max_steers = _DEFAULT_MAX_STEERS
+        try:
+            max_hours = float(os.environ.get(_ENV_MAX_HOURS, "") or _DEFAULT_MAX_HOURS)
+        except (TypeError, ValueError):
+            max_hours = _DEFAULT_MAX_HOURS
+        raw = (os.environ.get(_ENV_AUTONOMY, "") or _DEFAULT_AUTONOMY).strip().lower()
+        autonomy = raw if raw in _AUTONOMY else "notify"
+        return cls(
+            interval_s=interval if interval > 0 else _DEFAULT_INTERVAL_S,
+            autonomy=autonomy,
+            max_steers=max(0, max_steers),
+            max_hours=max_hours if max_hours > 0 else _DEFAULT_MAX_HOURS,
+        )
+
+    @property
+    def stale_after_s(self) -> float:
+        """How old the state may be before a reader stops trusting it."""
+        return max(_STALE_AFTER_S, 3.0 * self.interval_s)
+
+
+@dataclass
+class WatchState:
+    """What the watcher remembers across ticks. Persisted as JSON."""
+
+    pid: int = 0
+    started_at: float | None = None
+    last_tick: float | None = None
+    tick_count: int = 0
+    missing_pid_ticks: int = 0
+    steers: int = 0
+    last_status: str | None = None
+    ended_reason: str | None = None
+    signaled: dict[str, float] = field(default_factory=dict)
+    steered: dict[str, float] = field(default_factory=dict)
+    steer_attempts: dict[str, int] = field(default_factory=dict)
+    # Set by observe() when a nudge is due, cleared by the shell when the write
+    # succeeds. Kept across ticks so a failed write is retried, not forgotten.
+    pending: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "pid": self.pid,
+            "started_at": self.started_at,
+            "last_tick": self.last_tick,
+            "tick_count": self.tick_count,
+            "missing_pid_ticks": self.missing_pid_ticks,
+            "steers": self.steers,
+            "last_status": self.last_status,
+            "ended_reason": self.ended_reason,
+            "signaled": self.signaled,
+            "steered": self.steered,
+            "steer_attempts": self.steer_attempts,
+            "pending": self.pending,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "WatchState":
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            pid=_opt_int(data.get("pid")),
+            started_at=_opt_float(data.get("started_at")),
+            last_tick=_opt_float(data.get("last_tick")),
+            tick_count=_opt_int(data.get("tick_count")),
+            missing_pid_ticks=_opt_int(data.get("missing_pid_ticks")),
+            steers=_opt_int(data.get("steers")),
+            last_status=_opt_str(data.get("last_status")),
+            ended_reason=_opt_str(data.get("ended_reason")),
+            signaled=_float_map(data.get("signaled")),
+            steered=_float_map(data.get("steered")),
+            steer_attempts=_int_map(data.get("steer_attempts")),
+            pending=data.get("pending") if isinstance(data.get("pending"), dict) else None,
+        )
+
+
+@dataclass(frozen=True)
+class WatchInputs:
+    """One tick's inputs, already read by the shell.
+
+    ``probe`` is a ``run_reaper.Probe.verdict`` string
+    (``alive|dead|unknown|remote|paused|finished``); the shell maps a raising
+    probe to ``unknown`` so a permission error never kills the watcher.
+    """
+
+    status: str | None = None
+    events: tuple[dict[str, Any], ...] = ()
+    probe: str = "unknown"
+    probe_detail: str = ""
+    pid_present: bool = True
+    stop_requested: bool = False
+
+
+@dataclass(frozen=True)
+class SteerRequest:
+    key: str
+    node_id: str
+    kind: str
+    message: str
+    role_target: str = "any"
+    ttl_secs: int = _STEER_TTL_SECS
+
+
+@dataclass(frozen=True)
+class WatchDecision:
+    actions: tuple[tuple[str, dict[str, Any]], ...] = ()
+    steer: SteerRequest | None = None
+    exit_reason: str | None = None
+    exit_detail: str = ""
+
+
+def _opt_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _opt_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _opt_str(value: Any) -> str | None:
+    return str(value) if value is not None else None
+
+
+def _float_map(value: Any) -> dict[str, float]:
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, float] = {}
+    for key, entry in value.items():
+        number = _opt_float(entry)
+        if number is not None:
+            out[str(key)] = number
+    return out
+
+
+def _int_map(value: Any) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, int] = {}
+    for key, entry in value.items():
+        try:
+            out[str(key)] = int(entry)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def watch_state_path(run_dir: str | os.PathLike[str]) -> Path:
+    return Path(run_dir) / WATCH_STATE_FILE
+
+
+def load_watch_state(run_dir: str | os.PathLike[str]) -> WatchState:
+    """The persisted state, or a fresh one; a corrupt file never raises."""
+    try:
+        data = json.loads(watch_state_path(run_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return WatchState()
+    return WatchState.from_dict(data)
+
+
+def save_watch_state(run_dir: str | os.PathLike[str], state: WatchState) -> None:
+    """Atomically replace the state file, owner-only."""
+    path = watch_state_path(run_dir)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(state.to_dict(), sort_keys=True), encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def watch_active(
+    run_dir: str | os.PathLike[str],
+    *,
+    now: float | None = None,
+    stale_after_s: float | None = None,
+) -> bool:
+    """True when a live watcher process owns ``run_dir``.
+
+    Readers (the ACP thread, a second spawn attempt) use this to yield to the
+    sidecar. ``stale_after_s`` bounds a wedged-but-alive process to one
+    interval, after which the older observers resume.
+    """
+    state = load_watch_state(run_dir)
+    if state.ended_reason or state.tick_count <= 0 or state.last_tick is None:
+        return False
+    now = time.time() if now is None else now
+    stale_after = _STALE_AFTER_S if stale_after_s is None else stale_after_s
+    if now - state.last_tick > stale_after:
+        return False
+    return state.pid > 0 and _pid_alive(state.pid)
+
+
+def watch_steer_message(node_id: str, detail: str = "") -> str:
+    """A bounded nudge for a stuck node, built to pass :func:`guard_steer`.
+
+    The detail comes from a log tail and can contain a guard token by
+    accident; when it does the note is sent without it rather than dropped.
+    """
+    advice = (
+        "Keep the existing acceptance criteria and outputs unchanged; narrow the "
+        "next attempt to the single smallest edit that unblocks the goal, and build "
+        "on the work already in the tree rather than restarting."
+    )
+    base = f"Orchestrator note for {node_id}: this node looks stuck. {advice}"
+    if detail:
+        with_detail = f"Orchestrator note for {node_id}: {detail}. {advice}"
+        if len(with_detail) <= _STEER_MAX_CHARS and guard_steer(with_detail):
+            return with_detail
+    return base[:_STEER_MAX_CHARS]
+
+
+def observe(
+    *,
+    now: float,
+    run_id: str,
+    run_dir: str | os.PathLike[str],
+    inputs: WatchInputs,
+    state: WatchState,
+    config: WatchConfig | None = None,
+    sampler: Any = None,
+    judge_fn: Any = None,
+    enabled_fn: Any = None,
+    budget_fn: Any = None,
+) -> WatchDecision:
+    """One interval tick: decide what to say, steer, and whether to stop.
+
+    Pure given its inputs and the run dir's files: no DB, no model, no network.
+    The shell writes the returned actions and performs the steer; this function
+    mutates ``state`` so the caller can persist it either way.
+    """
+    config = config or WatchConfig.from_env()
+    actions: list[tuple[str, dict[str, Any]]] = []
+    state.tick_count += 1
+    state.last_tick = now
+    if state.started_at is None:
+        state.started_at = now
+    if inputs.status:
+        state.last_status = inputs.status
+
+    def ended(reason: str, detail: str = "") -> WatchDecision:
+        state.ended_reason = reason
+        actions.append(("orchestrator.ended", {
+            "reason": detail or reason,
+            "exit": reason,
+            "status": inputs.status or "",
+            "node_id": "",
+        }))
+        return WatchDecision(tuple(actions), None, reason, detail)
+
+    is_enabled = enabled_fn if enabled_fn is not None else enabled
+    if not is_enabled():
+        return ended("disabled", "the per-run orchestrator is disabled")
+    if config.autonomy == "off":
+        return ended("off", "the interval watcher is off (MO_ORCH_WATCH_AUTONOMY=off)")
+    elapsed = now - (state.started_at or now)
+    if elapsed > config.max_hours * 3600:
+        return ended("max-lifetime", f"watched for {config.max_hours:.0f}h")
+
+    from mini_ork import run_status
+
+    # Terminal first: teardown writes the status before it releases ``.pid``,
+    # so a probe taken at the same instant can still say ``dead``.
+    if inputs.status is not None and run_status.is_terminal(inputs.status):
+        return ended(f"terminal:{inputs.status}",
+                     f"run finished: {run_status.label(inputs.status)}")
+    if inputs.probe == "dead":
+        return ended("dispatcher-dead", inputs.probe_detail or "the dispatcher pid is gone")
+    if inputs.probe == "finished":
+        return ended("finished", inputs.probe_detail or "the run finished without a publish step")
+
+    # A remote run's local logs are not its logs, and a paused run is not
+    # stuck. Stay attached: the terminal transition is still worth recording.
+    if inputs.probe in ("remote", "paused"):
+        state.missing_pid_ticks = 0
+        _announce(actions, state, config, inputs)
+        return WatchDecision(tuple(actions), None)
+
+    if not inputs.pid_present:
+        state.missing_pid_ticks += 1
+        if state.missing_pid_ticks >= _MISSING_PID_TICKS:
+            return ended("owner-record-gone", "no .pid in the run dir for two ticks")
+        _announce(actions, state, config, inputs)
+        return WatchDecision(tuple(actions), None)
+    state.missing_pid_ticks = 0
+
+    _announce(actions, state, config, inputs)
+
+    from mini_ork.acp_orchestrator import watch
+
+    node = watch.current_node(list(inputs.events))
+    if node is None:
+        return WatchDecision(tuple(actions), None)
+
+    sample = sampler or watch.sample
+    observation = sample(
+        Path(run_dir),
+        run_id=run_id,
+        node_id=str(node.get("node_id") or ""),
+        node_type=str(node.get("node_type") or ""),
+        started_at=float(node.get("started_at") or 0.0),
+        now=now,
+    )
+    judge = judge_fn or watch.judge
+    signals = judge(observation) or []
+
+    node_id = observation.node_id
+    new_keys: list[tuple[str, dict[str, str]]] = []
+    for signal in signals:
+        key = watch.signal_key(node_id, signal)
+        if key in state.signaled:
+            continue
+        state.signaled[key] = now
+        new_keys.append((key, signal))
+        actions.append(("orchestrator.signal", {
+            "reason": str(signal.get("detail") or signal.get("kind") or ""),
+            "detail": str(signal.get("detail") or ""),
+            "kind": str(signal.get("kind") or ""),
+            "node_id": node_id,
+            "autonomy": config.autonomy,
+            "steers": state.steers,
+            "spent_usd": observation.spent_usd,
+            "interval_s": config.interval_s,
+        }))
+
+    steer = _steer_for(
+        new_keys, observation, inputs, state, config, budget_fn or budget_ok,
+    )
+    return WatchDecision(tuple(actions), steer)
+
+
+def _announce(
+    actions: list[tuple[str, dict[str, Any]]],
+    state: WatchState,
+    config: WatchConfig,
+    inputs: WatchInputs,
+) -> None:
+    """Emit ``orchestrator.watching`` on the first tick only."""
+    if state.tick_count != 1:
+        return
+    actions.append(("orchestrator.watching", {
+        "reason": "watching · no signal yet",
+        "node_id": "",
+        "autonomy": config.autonomy,
+        "interval_s": config.interval_s,
+        "status": inputs.status or "",
+    }))
+
+
+def _steer_for(
+    new_keys: list[tuple[str, dict[str, str]]],
+    observation: Any,
+    inputs: WatchInputs,
+    state: WatchState,
+    config: WatchConfig,
+    budget_fn: Any,
+) -> SteerRequest | None:
+    """The one nudge this tick may send, if every gate is open."""
+    if config.autonomy != "steer":
+        return None
+    from mini_ork import run_status
+
+    if inputs.status not in run_status.LIVE:
+        return None
+    if inputs.probe != "alive" or inputs.stop_requested:
+        return None
+    if state.steers >= config.max_steers:
+        return None
+    if not budget_fn(observation.spent_usd):
+        return None
+    pending = state.pending or {}
+    pending_key = str(pending.get("key") or "")
+    if pending_key and state.steer_attempts.get(pending_key, 0) < _MAX_STEER_ATTEMPTS:
+        state.steer_attempts[pending_key] = state.steer_attempts.get(pending_key, 0) + 1
+        return SteerRequest(
+            key=pending_key,
+            node_id=str(pending.get("node_id") or observation.node_id),
+            kind=str(pending.get("kind") or ""),
+            message=str(pending.get("message") or ""),
+            role_target=str(pending.get("role_target") or "any"),
+        )
+    for key, signal in new_keys:
+        kind = str(signal.get("kind") or "")
+        detail = str(signal.get("detail") or "")
+        if kind not in _WATCH_STEERABLE or key in state.steered:
+            continue
+        if state.steer_attempts.get(key, 0) >= _MAX_STEER_ATTEMPTS:
+            continue
+        message = watch_steer_message(observation.node_id, detail)
+        if not guard_steer(message):
+            continue
+        state.steer_attempts[key] = state.steer_attempts.get(key, 0) + 1
+        request = SteerRequest(
+            key=key,
+            node_id=observation.node_id,
+            kind=kind,
+            message=message,
+        )
+        state.pending = {
+            "key": request.key,
+            "node_id": request.node_id,
+            "kind": request.kind,
+            "message": request.message,
+            "role_target": request.role_target,
+        }
+        return request
+    return None

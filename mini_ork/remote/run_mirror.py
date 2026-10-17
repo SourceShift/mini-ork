@@ -61,6 +61,9 @@ DEFAULT_EXCLUDES: tuple[str, ...] = (
     "state.db*",
     "agent-*.live.jsonl",  # epic 09 — pre-skipped, ahead of time
     ".mo-run-mirror.json",  # this module's own sidecar
+    # The local orchestrator watcher's control plane. A mirrored state file
+    # would claim a live local watcher on the remote node.
+    ".orchestrator-watch.*",
 )
 
 # Per kickoff §2. Deny-list is a basename glob; a subdir cannot bypass it.
