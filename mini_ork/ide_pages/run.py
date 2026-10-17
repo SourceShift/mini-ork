@@ -2188,7 +2188,7 @@ def _learnings_tab(run: Run) -> list[dict[str, Any]]:
                                     acts=_lesson_acts("") if level2 else []))
         if not items:
             items = [S.dot("Nothing recorded", "Reflection writes gradients after the run's last node.")]
-        return S.lst("Produced by the run", items, full=True,
+        return S.lst("Written back" if level2 else "Produced by the run", items, full=True,
                      note="Gradients reflection wrote about this run's own nodes.")
 
     def available() -> list[dict[str, Any]]:
@@ -2292,11 +2292,18 @@ def _learnings_tab(run: Run) -> list[dict[str, Any]]:
             n = (db.row("SELECT COUNT(*) AS n FROM operator_steering WHERE run_id = ?", (run.id,)) or {}).get("n", 0)
             items.append(S.ok("Operator steering", f"{n} message(s) this run") if n
                          else S.dot("Operator steering", "none this run"))
-        summary = S.lst("Available to the run", items, full=True,
+        summary = S.lst("Injected into prompts" if level2 else "Available to the run",
+                        items, full=True,
                         note="The context the planner actually received (v2 pack), "
                              "plus each node's own injection ledger.")
         return [summary, *sections]
 
+    # The design reads "what it was given" before "what it taught": the
+    # injected lessons lead, the written-back gradients follow. Level 1 keeps
+    # the old order and the old titles byte for byte.
+    if level2:
+        return (S.guarded(errors, "Injected into prompts", available)
+                + S.guarded(errors, "Written back", produced))
     return (S.guarded(errors, "Produced by the run", produced)
             + S.guarded(errors, "Available to the run", available))
 
@@ -2458,8 +2465,15 @@ def _artifacts_tab(run: Run, *, changes: bool = False) -> list[dict[str, Any]]:
                            S.mono(f"−{f.get('removed') or 0}")],
                  "do": S.open_path(str(f.get("abs") or "")) if f.get("abs") else None}
                 for f in files]
+        # The design's sub-line totals the diff; level 1 keeps the page it had.
+        sub = ""
+        if S.ide_level() >= 2:
+            added = sum(int(f.get("added") or 0) for f in files)
+            removed = sum(int(f.get("removed") or 0) for f in files)
+            sub = (f"+{added} −{removed} · {len(files)} "
+                   f"file{'s' if len(files) != 1 else ''}")
         return S.table("Changes", [S.col(fr=1, min=240), S.col(60), S.col(60)],
-                       ["file", "added", "removed"], rows, full=True,
+                       ["file", "added", "removed"], rows, full=True, sub=sub,
                        note="The run's working-tree diff. Click a file to open it.")
 
     head = S.guarded(errors, "Changes", changed_files) if changes else []
