@@ -5886,6 +5886,15 @@ class MiniOrkAcpAgent:
             # A boundary after a close means the run resumed (lane repair):
             # its next end is a new ending worth reporting.
             self._watch_closed.discard(run_id)
+        # One run, one orchestrator: when the detached watcher owns this run,
+        # it is the trouble observer. The thread keeps the boundaries it is
+        # uniquely good at (they share the user's conversation); duplicating
+        # the sampling here would double every alert. A run with no live
+        # watcher keeps the old behaviour byte for byte.
+        from mini_ork.orchestration import runner_orchestrator as _orch
+
+        if _orch.watch_active(self._home_for(run_id) / "runs" / run_id):
+            return
         node = _watch.current_node(events)
         if node is None:
             return
