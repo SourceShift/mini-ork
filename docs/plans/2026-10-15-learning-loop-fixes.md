@@ -80,6 +80,25 @@ Not yet done: the live-DB cleanup proven on a copy in R5's review (166 non-code
 rows pruned, 280 artifact file paths cleared) is deliberately NOT applied while
 runs are live.
 
+## Status 2026-10-17 ~08:00 (wave 3a merged)
+
+R9 merged as `69469667`, R7b as `97b46ec8`, each reviewed clause by clause
+first. R7b carried one merge-time review fix: the implementer had shipped a
+`_FamilyWarningLine(str)` subclass that overrode `partition()` to keep a
+separator, because its own spec helper partitioned the warning line on
+`" all resolve to family "` and asserted the separator was still in the tail
+(`str.partition` never returns it). Production code shaped by a broken spec
+test is theater — the subclass was removed, the advisory line is a plain str,
+and the committed unit tests (which assert by suffix) pass unchanged. Live
+overlay verified to produce exactly the three expected lines: `zai` (glm,
+opus), `minimax` (kimi, minimax), `deepseek` (codex, deepseek).
+
+Also: the R7b merge's rebase stopped once with the pick applied but uncommitted
+(the sequencer rescheduled it as "patch contents already upstream"); staging the
+three paths and `git rebase --continue` completed it losslessly. The reversion
+guard wrote no new rows, so R14's rebase skip held during a real worktree
+rebase — `MO_REVERSION_GUARD_DISABLED=1` was not needed.
+
 ## Wave-3 resequencing (2026-10-17 ~00:40)
 
 The wave table above put R3, R9, R7b and R12 in one wave "touching disjoint
