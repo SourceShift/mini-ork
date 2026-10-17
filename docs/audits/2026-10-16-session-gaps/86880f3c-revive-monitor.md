@@ -35,6 +35,8 @@ fork `/Volumes/docker-ssd/ps/zed-mini-ork`, UI `/Volumes/docker-ssd/ps/mini-ork-
 | `foreign-file-run_status.py` | one untracked foreign file left untouched | note | **resolved by its author** | file now committed by `d70f94cf` ("board: a run the operator closes lands in a terminal not_needed state"), `git merge-base --is-ancestor d70f94cf origin/main` → IN |
 | `fix-unrunnable-baseline-reason` | a baseline that never started must name the line that says so | done | **landed + on origin/main** | `659a3553` — `git merge-base --is-ancestor 659a3553 origin/main` → IN, and `git log -1 origin/main` → same sha; new test `tests/unit/test_codefix_red_base.py::test_missing_local_binary_guard_is_unrunnable_not_red` fails `KeyError: 'base_unrunnable'` on the unmodified verifier; suite 11 passed, overlay+abstention 11 passed, ruff clean |
 | `classify-68028` | classify engine-home `run-1792185781-68028` | not revivable (live) | **left untouched — self-repairing** | row `status=failed` but the process is **alive**: `recovery.planner run-1792185781-68028 --from-node implementer --ack-change --force` (pid 57271, 01:53:44) with its own claude agent in `lane-gate-unverified`; blocker is the unsatisfiable spec test below |
+| `fix-spec-test-exception` | a failing spec test must name the exception it died of | done | **landed + on origin/main** | `af4f890f` — `recipes/framework-edit/verifiers/spec-tests.py` gains `failure_exceptions()` (first `E` line under each `___ test ___` traceback header, "real name" guard against pytest's `_ _ _ _` frame separator) and `_failure_clause()` puts `[ExcType: message]` ahead of the kickoff quote; new test `test_a_spec_test_that_dies_in_its_helper_names_the_exception` fails `KeyError: 'error'` on the unmodified verifier; `tests/unit/test_framework_edit_*.py` 98 passed, ruff clean, `git ls-remote origin refs/heads/main` → `af4f890f` |
+| `classify-93406` | classify researcher-home `run-1792157583-93406` | not revivable | **left untouched — work already landed by hand** | publisher abstained twice (`publish_abstain` at 15:42:47 and again at 20:26:59 on the second attempt) with `publish-unattributable: src/components/profileMaker/voice/StyleGuideEditor.tsx: the implementer's Edit does not replay against 7fbcf5859327`; the target worktree committed the run's own 9 changed files as `b100b691a` (+ docs `2dc249c27`) at 15:47:11, four minutes after the first abstain, so there is nothing left to publish; a third publisher run replays against the same stale base and abstains again |
 
 Six engine-home runs were reclassified this session from "genuine target-repo
 revision" to **not revivable**: `hr-exec-park-20261015141603`,
@@ -101,8 +103,10 @@ revision" to **not revivable**: `hr-exec-park-20261015141603`,
    auto-repair spawned a third, hopeless round; the run rolled back 6 paths,
    salvaged to `refs/mini-ork/salvage/run-1792185781-68028`. Fix site is
    `retry_hint.py` (hint `kind: code` — **peer-dirty, untouched**) or a new
-   terminal class in the executor's revise loop; a text-only change inside
-   `spec-tests.py` improves the reason but still routes to `revise`. Detector for
+   terminal class in the executor's revise loop. The reason half is now fixed —
+   `af4f890f` makes the failure carry `[sqlite3.OperationalError: unable to open
+   database file]` ahead of the kickoff quote — but the run still routes to
+   `revise`, so this class remains non-revivable. Detector for
    a monitor: the failing nodeid's `E` line is a non-assertion exception whose
    deepest frame is inside the spec dir ⇒ spec-author defect, not revivable.
 9. **A tool-level refusal is still recorded as a code failure (third instance of
