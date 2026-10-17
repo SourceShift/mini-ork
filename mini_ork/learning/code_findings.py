@@ -6,9 +6,12 @@ behind the "Your code" tab. Reviews and verifiers already say, per file, what
 is wrong; this module pulls those findings out of the run directories and
 indexes them in two tables:
 
-  code_findings       -- one row per finding, deduped by
-                         ``sha256(run_id|source|file|line|issue)``.
-  code_findings_runs  -- one row per harvested run dir (the incremental guard).
+  code_findings          -- one row per finding, deduped by
+                            ``sha256(run_id|source|file|line|issue)``.
+  code_findings_runs     -- one row per harvested run dir (the incremental guard).
+  code_findings_landing  -- one row per run whose diff was checked against
+                            origin/main (LF-R11b; ``landed_commit`` NULL means
+                            "checked and not landed").
 
 Same DB resolution and ``ensure_schema`` discipline as
 ``mini_ork/learning/ledger.py``: cold-safe (a missing DB is a silent no-op,
@@ -28,6 +31,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+
 
 _DEFAULT_HOME = ".mini-ork"
 _DEFAULT_DEPTH = 3
@@ -1095,6 +1099,293 @@ def max_age_days_from_env(environ=None) -> int:
     return value
 
 
+# ── landing on origin/main (LF-R11b) ──────────────────────────────────────────
+# A finding outlives the run that produced it. R11a's decays (age, and "the
+# snippet is gone at HEAD") miss the common case where the run's own change
+# LANDED on origin/main while the finding points at a line the change did not
+# touch: the snippet is still there, yet the run is merged and its reviewers'
+# complaints are answered or superseded. The identity here is git's own —
+# ``git patch-id --stable`` is invariant to rebase, cherry-pick and line drift —
+# so a run's ``framework-edit.diff`` and the commit that merged it share an id.
+#
+# Known limitation: a run that shipped SEVERAL commits has a union diff whose
+# patch-id no single commit carries, so it never matches and stays not-landed.
+# That is the safe direction: a missed landing keeps a finding, never hides one
+# wrongly. Every probe is fail-open — a git/subprocess error, a missing repo or
+# an unknown ref is treated as "not landed".
+
+_DEFAULT_LANDING_REF = "origin/main"
+_LANDING_OFF = {"0", "false", "no", "off"}
+
+
+def landing_enabled(environ=None) -> bool:
+    """True unless ``MO_FINDINGS_LANDING`` says off (``0``/``false``/``no``)."""
+    env = os.environ if environ is None else environ
+    return str(env.get("MO_FINDINGS_LANDING", "")).strip().lower() not in _LANDING_OFF
+
+
+def _run_diff_text(run_dir):
+    """The text of ``<run_dir>/framework-edit.diff``, else the first ``*.diff``
+    (sorted) in the run dir; None when neither exists or is empty.
+
+    A run that shipped several commits writes a union diff; see the limitation
+    note above. Never raises.
+    """
+    if not run_dir:
+        return None
+    path = os.path.join(str(run_dir), "framework-edit.diff")
+    if not os.path.isfile(path):
+        try:
+            candidates = sorted(glob.glob(os.path.join(str(run_dir), "*.diff")))
+        except OSError:
+            candidates = []
+        path = candidates[0] if candidates else None
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    return text if text.strip() else None
+
+
+def _patch_id_of_text(text) -> str | None:
+    """``git patch-id --stable`` of a diff text — a pure filter, no repo needed.
+
+    Empty text, a non-diff, or a failed command yields None. Never raises.
+    """
+    if not text or not str(text).strip():
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "patch-id", "--stable"],
+            input=str(text),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    tokens = (proc.stdout or "").split()
+    return tokens[0] if tokens else None
+
+
+def run_patch_id(run_dir) -> str | None:
+    """The patch-id of the run's own diff, or None when there is none.
+
+    Reads ``<run_dir>/framework-edit.diff`` (falling back to the first
+    ``*.diff``), so a run whose implementer wrote no diff has no identity to
+    look up and is never called landed.
+    """
+    text = _run_diff_text(run_dir)
+    return _patch_id_of_text(text) if text else None
+
+
+def _since_arg(value) -> str | None:
+    """``since`` as a git-friendly ISO-8601 string (epoch ints are UTC)."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(value)))
+        except (OverflowError, OSError, ValueError):
+            return None
+    s = str(value).strip()
+    return s or None
+
+
+def landed_patch_ids(repo_root, ref: str = _DEFAULT_LANDING_REF,
+                     *, since=None) -> dict:
+    """``{patch_id: commit_sha}`` for every non-merge commit reachable from
+    ``ref`` in ``repo_root``, newest commit winning a duplicate id.
+
+    One ``git log -p`` piped through one ``git patch-id --stable`` covers the
+    whole repo — the cost is bounded by ``since`` (a run's minimum finding ts),
+    not by one call per commit. Any git/subprocess error, a path that is not a
+    checkout, or an unknown ref → ``{}``: callers then treat every run as not
+    landed, because a broken probe must never hide history.
+    """
+    root = str(repo_root or "")
+    if not root or not os.path.isdir(root):
+        return {}
+    cmd = ["git", "-C", root, "log", "--no-merges", "--no-renames",
+           "--format=commit %H", "-p"]
+    since_arg = _since_arg(since)
+    if since_arg:
+        cmd.append(f"--since={since_arg}")
+    cmd.append(str(ref or _DEFAULT_LANDING_REF))
+    try:
+        log = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if log.returncode != 0 or not (log.stdout or "").strip():
+        return {}
+    try:
+        ids = subprocess.run(
+            ["git", "patch-id", "--stable"],
+            input=log.stdout,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if ids.returncode != 0:
+        return {}
+    out: dict[str, str] = {}
+    for line in (ids.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            # ``git log`` is newest-first, so the first sighting of a patch-id
+            # is the newest commit that carries it.
+            out.setdefault(parts[0], parts[1])
+    return out
+
+
+def annotate_landing(rows, *, db=None) -> list[dict]:
+    """Copy ``rows`` and add ``landed`` / ``landed_commit`` to each.
+
+    One query over ``code_findings_landing`` for the rows' distinct ``run_id``
+    values. A missing table, a DB error or an unknown run marks the row
+    ``landed: False`` — fail-open keeps findings. Never raises.
+    """
+    rows = list(rows or [])
+    if not rows:
+        return []
+    run_ids = sorted({str(r.get("run_id")) for r in rows
+                      if isinstance(r, dict) and r.get("run_id") is not None})
+    landed: dict[str, str | None] = {}
+    if run_ids:
+        con = _open(db)
+        if con is not None:
+            try:
+                placeholders = ", ".join("?" for _ in run_ids)
+                landed = {
+                    str(r[0]): r[1]
+                    for r in con.execute(
+                        f"SELECT run_id, landed_commit FROM code_findings_landing "
+                        f"WHERE run_id IN ({placeholders})",
+                        tuple(run_ids),
+                    )
+                }
+            except sqlite3.Error:
+                landed = {}
+            finally:
+                try:
+                    con.close()
+                except sqlite3.Error:
+                    pass
+    out: list[dict] = []
+    for r in rows:
+        annotated = dict(r) if isinstance(r, dict) else {"row": r}
+        run_id = str(annotated.get("run_id") or "")
+        commit = landed.get(run_id) if run_id else None
+        annotated["landed"] = bool(commit)
+        annotated["landed_commit"] = commit
+        out.append(annotated)
+    return out
+
+
+def check_landing(home, *, db=None, ref: str = _DEFAULT_LANDING_REF,
+                  repo_root=None) -> dict:
+    """Record, per run, whether its diff landed on ``ref`` (LF-R11b).
+
+    Walks the runs that have a ``code_findings`` row and no landing row for
+    this ``checked_ref``. For each: the run's patch-id (skipped when it has no
+    diff), the repo it targeted (``repo_identity(_run_target_cwd(run_dir))``,
+    else ``repo_root``, else ``MINI_ORK_ROOT``/cwd), and a per-repo
+    ``landed_patch_ids`` lookup cached across runs. ``since`` is the run's
+    minimum finding ``ts``, which bounds the ``git log`` walk.
+
+    ``landed_commit`` records the commit that carries the diff, or NULL when it
+    was checked and not found. A run with no diff gets no row at all. Rows are
+    never deleted here: hiding is a read-path decision.
+
+    Returns ``{"runs_checked", "landed", "reason", "home", "db", "ref"}`` with
+    the ``harvest`` reason vocabulary. Idempotent: a second call with the same
+    ref returns ``runs_checked == 0``. Cold-safe and never raises.
+    """
+    stats = {"runs_checked": 0, "landed": 0, "reason": "ok",
+             "home": home or "", "db": _resolve_db(db) or "", "ref": str(ref)}
+    if not home:
+        stats["reason"] = "no_home"
+        return stats
+    runs_dir = os.path.join(home, "runs")
+    if not os.path.isdir(runs_dir):
+        stats["reason"] = "no_runs_dir"
+        return stats
+    ensure_schema(db)
+    con = _open(db)
+    if con is None:
+        stats["reason"] = "no_db"
+        return stats
+    fallback_root = repo_root or os.environ.get("MINI_ORK_ROOT") or os.getcwd()
+    cache: dict[str, dict] = {}
+    try:
+        try:
+            pending = con.execute(
+                """
+                SELECT f.run_id, MIN(f.ts)
+                  FROM code_findings f
+                  LEFT JOIN code_findings_landing l
+                         ON l.run_id = f.run_id AND l.checked_ref = ?
+                 WHERE f.run_id IS NOT NULL AND l.run_id IS NULL
+                 GROUP BY f.run_id
+                """,
+                (str(ref),),
+            ).fetchall()
+        except sqlite3.Error as e:
+            stats["reason"] = "db_error"
+            print(f"  [warn] code_findings: check_landing failed: {e}",
+                  file=sys.stderr)
+            return stats
+        now = int(time.time())
+        for run_id, min_ts in pending:
+            run_id = str(run_id)
+            run_dir = os.path.join(runs_dir, run_id)
+            patch_id = run_patch_id(run_dir) if os.path.isdir(run_dir) else None
+            if not patch_id:
+                # No diff to identify: nothing to record, and a later pass may
+                # still find one (the run may not be finished).
+                continue
+            repo = repo_identity(_run_target_cwd(run_dir))
+            if not repo:
+                repo = fallback_root
+            if repo not in cache:
+                cache[repo] = landed_patch_ids(repo, ref=ref,
+                                               since=_epoch_seconds(min_ts))
+            landed_commit = cache[repo].get(patch_id)
+            try:
+                con.execute(
+                    "INSERT OR REPLACE INTO code_findings_landing "
+                    "(run_id, patch_id, checked_ref, landed_commit, checked_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (run_id, patch_id, str(ref), landed_commit, now),
+                )
+                con.commit()
+            except sqlite3.Error as e:
+                print(f"  [warn] code_findings: landing {run_id} failed: {e}",
+                      file=sys.stderr)
+                stats["reason"] = "db_error"
+                continue
+            stats["runs_checked"] += 1
+            if landed_commit:
+                stats["landed"] += 1
+    except Exception as e:  # noqa: BLE001 — cold-safe by contract
+        stats["reason"] = "db_error"
+        print(f"  [warn] code_findings: check_landing failed: {e}",
+              file=sys.stderr)
+    finally:
+        try:
+            con.close()
+        except sqlite3.Error:
+            pass
+    return stats
+
+
 # ── DB plumbing (mirrors ledger.py) ───────────────────────────────────────────
 
 
@@ -1132,7 +1423,7 @@ def _open(db=None) -> sqlite3.Connection | None:
     return con
 
 
-# Byte-consistent with db/migrations/0064_code_findings.sql + 0078 (see
+# Byte-consistent with db/migrations/0064_code_findings.sql + 0078 + 0079 (see
 # prior-art lens: ensure_schema DDL must not drift from the migrations).
 _DDL = """
 CREATE TABLE IF NOT EXISTS code_findings (
@@ -1158,6 +1449,15 @@ CREATE TABLE IF NOT EXISTS code_findings_runs (
     harvested_at INTEGER NOT NULL,
     n            INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS code_findings_landing (
+    run_id        TEXT PRIMARY KEY,
+    patch_id      TEXT NOT NULL DEFAULT '',
+    checked_ref   TEXT NOT NULL DEFAULT 'origin/main',
+    landed_commit TEXT,
+    checked_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_code_findings_landing_patch
+    ON code_findings_landing(patch_id);
 """
 
 
@@ -1170,8 +1470,9 @@ def _has_column(con, table: str, column: str) -> bool:
 
 def ensure_schema(db=None) -> None:
     """Idempotent CREATE TABLE + CREATE INDEX, plus the LF-R12 ``target_repo``
-    ALTER. Never raises — a CREATE failure is a warning, not a stop-the-line
-    event.
+    ALTER and the LF-R11b ``code_findings_landing`` twin (the same DDL
+    ``0079_code_findings_landing.sql`` applies). Never raises — a CREATE failure
+    is a warning, not a stop-the-line event.
 
     ``CREATE TABLE IF NOT EXISTS`` is a no-op on a DB migrated past 0064, so the
     new column is added explicitly when missing. This is the same column
@@ -2037,6 +2338,9 @@ def _print_human(cmd, result) -> None:
         print(f"reharvested {result['runs']} run(s), {result['findings']} finding(s)")
     elif cmd == "backfill-target-repo":
         print(f"backfilled {result} finding row(s) with a target repo")
+    elif cmd == "check-landing":
+        print(f"checked {result['runs_checked']} run(s), "
+              f"{result['landed']} landed on {result['ref']}")
     else:  # show
         for r in result:
             loc = r["file"] or ""
@@ -2078,6 +2382,13 @@ def main(argv=None) -> int:
                    help="re-read every run dir that still exists under home/runs")
     sub.add_parser("backfill-target-repo", parents=[common],
                    help="stamp target_repo on NULL rows from their run profiles")
+    p_landing = sub.add_parser("check-landing", parents=[common],
+                               help="record whether each run's diff landed on "
+                                    "origin/main")
+    p_landing.add_argument("--ref", default=_DEFAULT_LANDING_REF,
+                           help="git ref to search (default: origin/main)")
+    p_landing.add_argument("--repo-root", default=None,
+                           help="fallback repo when a run has no target cwd")
 
     args = ap.parse_args(argv)
     home = args.home or os.environ.get("MINI_ORK_HOME") or _DEFAULT_HOME
@@ -2096,6 +2407,9 @@ def main(argv=None) -> int:
         result = reharvest(home, db=args.db)
     elif args.cmd == "backfill-target-repo":
         result = backfill_target_repo(home, db=args.db)
+    elif args.cmd == "check-landing":
+        result = check_landing(home, db=args.db, ref=args.ref,
+                               repo_root=args.repo_root)
     else:  # show
         result = findings_for(args.path, db=args.db)
 

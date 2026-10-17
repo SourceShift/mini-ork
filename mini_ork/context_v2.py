@@ -344,12 +344,14 @@ def scope_findings_with_stats(paths: list[str], *, db: str | None = None,
 
     Returns ``(fresh_rows, stats)`` where ``stats`` carries
     ``n_findings_scanned`` (the pre-decay count), ``n_findings_stale`` (rows the
-    age window or the HEAD check dropped) and ``max_age_days``. The scan count
-    is taken from the same predicate applied without the age term, so the two
-    counts can never contradict each other.
+    age window or the HEAD check dropped), ``n_landed`` (rows dropped because
+    their run's diff landed on origin/main, LF-R11b) and ``max_age_days``. The
+    scan count is taken from the same predicate applied without the age term,
+    so the counts can never contradict each other; the two drop counts stay
+    separate.
     """
     max_age = code_findings.max_age_days_from_env()
-    stats = {"n_findings_scanned": 0, "n_findings_stale": 0,
+    stats = {"n_findings_scanned": 0, "n_findings_stale": 0, "n_landed": 0,
              "max_age_days": max_age}
     con = _connect_ro(db)
     if con is None:
@@ -395,6 +397,17 @@ def scope_findings_with_stats(paths: list[str], *, db: str | None = None,
         fresh = [r for r in annotated if not r.get("stale")]
         stats["n_findings_stale"] = max(
             0, stats["n_findings_scanned"] - len(fresh))
+        # LF-R11b: landing decay runs AFTER R11a's staleness decay. A row whose
+        # run's diff landed on origin/main is no longer offered; the count is
+        # kept separate from the stale count. MO_FINDINGS_LANDING=0 disables
+        # the drop (and the count) while leaving the rows untouched.
+        n_landed = 0
+        if fresh and code_findings.landing_enabled():
+            marked = code_findings.annotate_landing(fresh, db=db)
+            kept = [r for r in marked if not r.get("landed")]
+            n_landed = len(fresh) - len(kept)
+            fresh = kept
+        stats["n_landed"] = n_landed
         return fresh, stats
     except sqlite3.Error:
         return [], stats
@@ -818,6 +831,8 @@ def build(kickoff_path: str, *, task_class: str = "", db: str | None = None,
         # rows the age window and the HEAD check dropped and the window used.
         "n_findings_scanned": finding_stats["n_findings_scanned"],
         "n_findings_stale": finding_stats["n_findings_stale"],
+        # LF-R11b: beside the stale count, never merged into it.
+        "n_findings_landed": finding_stats.get("n_landed", 0),
         "max_age_days": finding_stats["max_age_days"],
         # Selection provenance, beside the count it explains: which reader
         # supplied the paths and the resolved list. Never edit authority.

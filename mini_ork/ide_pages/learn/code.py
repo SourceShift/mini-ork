@@ -54,9 +54,11 @@ from mini_ork.learning.code_findings import (
     _dir_prefix,
     _in_repo,
     _run_title,
+    annotate_landing,
     annotate_staleness,
     areas,
     engine_repo_identity,
+    landing_enabled,
 )
 from mini_ork.learning.themes import (
     _df_to_idf,
@@ -429,10 +431,11 @@ def _window_findings(db: str, *, since_days: int, repo_only: bool = True,
     set the areas table partitions and the detail filters.
 
     LF-R11a: rows whose ``snippet`` no longer occurs at their own repo's HEAD
-    are excluded here (age is already bounded by the ``days`` window). The
-    stale rows are not deleted; ``_window_findings_with_stats`` exposes them so
-    a section can report how many were hidden. The rest of this contract is
-    unchanged: see that function.
+    are excluded here (age is already bounded by the ``days`` window). LF-R11b:
+    rows whose run's diff landed on origin/main are excluded too (unless
+    ``MO_FINDINGS_LANDING=0``). Neither kind is deleted;
+    ``_window_findings_with_stats`` exposes both so a section can report how
+    many were hidden. The rest of this contract is unchanged: see that function.
     """
     return _window_findings_with_stats(
         db, since_days=since_days, repo_only=repo_only, repo_root=repo_root,
@@ -443,8 +446,10 @@ def _window_findings_with_stats(db: str, *, since_days: int,
                                 repo_only: bool = True,
                                 repo_root: str | None = None,
                                 target_repo: str | None = None
-                                ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """``(fresh_rows, stale_rows)`` for the window.
+                                ) -> tuple[list[dict[str, Any]],
+                                           list[dict[str, Any]],
+                                           list[dict[str, Any]]]:
+    """``(fresh_rows, stale_rows, landed_rows)`` for the window.
 
     The window (``int(time.time()) - days*86400``) and the ``_in_repo`` filter are
     the exact ones ``areas()`` applies (kickoff #4; reviewer, round 1), so the
@@ -465,6 +470,11 @@ def _window_findings_with_stats(db: str, *, since_days: int,
     the engine identity. ``max_age_days=0`` because the days window already
     bounds age — this hides snippet staleness only.
 
+    LF-R11b: after the stale split, rows whose run's diff landed on origin/main
+    are peeled off into a third list (``landed``), unless
+    ``MO_FINDINGS_LANDING=0``. They are hidden from the listing, never deleted,
+    and counted separately so the stale count never absorbs them.
+
     Read-only throughout: ``StateDB`` opens with ``query_only=ON``, the page's own
     convention (see ``_harvest_summary``).
     """
@@ -474,9 +484,9 @@ def _window_findings_with_stats(db: str, *, since_days: int,
     try:
         conn = StateDB(Path(db))
     except (FileNotFoundError, OSError):
-        return [], []
+        return [], [], []
     if not conn.has_table("code_findings"):
-        return [], []
+        return [], [], []
     join = conn.has_table("task_runs")
     with_repo = _has_target_repo(conn)
     where, params = "f.file IS NOT NULL", []
@@ -498,7 +508,13 @@ def _window_findings_with_stats(db: str, *, since_days: int,
     if repo_only and fs:
         keep = _in_repo({str(f["file"]) for f in fs if f.get("file")}, repo_root)
         fs = [f for f in fs if f.get("file") in keep]
-    return _split_stale(fs, repo_root=repo_root, target_repo=target_repo)
+    fresh, stale = _split_stale(fs, repo_root=repo_root, target_repo=target_repo)
+    landed: list[dict[str, Any]] = []
+    if fresh and landing_enabled():
+        marked = annotate_landing(fresh, db=db)
+        landed = [r for r in marked if r.get("landed")]
+        fresh = [r for r in marked if not r.get("landed")]
+    return fresh, stale, landed
 
 
 def _window_stale(db: str, *, since_days: int, repo_only: bool = True,
@@ -508,6 +524,18 @@ def _window_stale(db: str, *, since_days: int, repo_only: bool = True,
     return _window_findings_with_stats(
         db, since_days=since_days, repo_only=repo_only, repo_root=repo_root,
         target_repo=target_repo)[1]
+
+
+def _hidden_counts(db: str, *, since_days: int,
+                   area: str) -> tuple[int, int]:
+    """``(stale_count, landed_count)`` for ``area`` — the two hidden sets.
+
+    One window computation feeds both counts, so the stale line and the landing
+    line are separate numbers over the same set (LF-R11a / LF-R11b) and neither
+    can absorb the other.
+    """
+    _fresh, stale, landed = _window_findings_with_stats(db, since_days=since_days)
+    return (len(_membership(stale, area)), len(_membership(landed, area)))
 
 
 def _split_stale(fs: list[dict[str, Any]], *, repo_root: str | None = None,
@@ -590,12 +618,14 @@ def _area_detail(home: Path, args: dict[str, str], area: str) -> list[dict[str, 
     date = time.strftime("%Y-%m-%d", time.localtime(last)) if last else "—"
     lines = [f"{len(fs)} findings in {n_runs} run{'' if n_runs == 1 else 's'}, "
              f"worst {worst}, last {date}", "", "**Recurring problems**"]
-    # LF-R11a: stale rows are hidden, never deleted — say how many, so the
-    # operator can tell "quiet because fixed" from "quiet because hidden".
-    n_hidden = len(_membership(
-        _window_stale(db, since_days=_days(args)), area))
-    if n_hidden:
-        lines.insert(1, f"{n_hidden} finding(s) hidden as stale at HEAD")
+    # LF-R11a / LF-R11b: stale and landed rows are hidden, never deleted — say
+    # how many of each, on their own lines, so the operator can tell "quiet
+    # because fixed" from "quiet because hidden" and the two counts never merge.
+    n_stale, n_landed = _hidden_counts(db, since_days=_days(args), area=area)
+    if n_landed:
+        lines.insert(1, f"{n_landed} finding(s) hidden as landed on origin/main")
+    if n_stale:
+        lines.insert(1, f"{n_stale} finding(s) hidden as stale at HEAD")
     if clusters:
         for c in clusters:
             files = ", ".join(short(f, 60) for f in c["files"]) or "—"
