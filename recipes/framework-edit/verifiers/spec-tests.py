@@ -99,6 +99,10 @@ _SPEC_FILE_RE = re.compile(r"^test_.*\.py$")
 # `SKIPPED [n] file.py:line: reason`, which carries no nodeid to check.
 _ITEM_LINE_RE = re.compile(r"^(PASSED|FAILED|ERROR|XFAIL|XPASS)\s+(\S+)")
 _DESELECTED_RE = re.compile(r"(\d+)\s+deselected")
+# pytest's FAILURES section: a `___ test_name ___` header followed by the
+# traceback, whose exception line carries the `E` marker at column 0.
+_TRACEBACK_HEADER_RE = re.compile(r"^_+\s*(.+?)\s*_+$")
+_EXCEPTION_LINE_RE = re.compile(r"^E\s{2,}(\S.*)$")
 
 # Written by pytest itself, not by the author: running the suite (as the
 # implementer is told to) creates these, so they are not part of the fence.
@@ -572,6 +576,35 @@ def failed_items(output: str, selected: list[str]) -> list[str]:
     return list(dict.fromkeys(out))
 
 
+def _unit_key(token: str) -> str:
+    """The bare unit name: ``a/b.py::test_x[1-2]`` → ``test_x``."""
+    return _base_nodeid(token).rpartition("::")[2].split("[", 1)[0]
+
+
+def failure_exceptions(output: str) -> dict[str, str]:
+    """``{unit name: "ExcType: message"}`` from pytest's FAILURES section.
+
+    The short summary reports ``FAILED <nodeid>`` with no reason, so the only
+    place the cause appears is the first ``E`` line under the item's
+    ``___ test_name ___`` header. That line is what tells the operator whether
+    the clause was refuted or the test died before reaching it."""
+    found: dict[str, str] = {}
+    current = ""
+    for line in output.splitlines():
+        header = _TRACEBACK_HEADER_RE.match(line.strip())
+        if header:
+            name = header.group(1)
+            # pytest also separates traceback frames with `_ _ _ _`; that line
+            # matches the header shape but names nothing.
+            if any(ch.isalnum() for ch in name):
+                current = _unit_key(name)
+            continue
+        exception = _EXCEPTION_LINE_RE.match(line)
+        if exception and current:
+            found.setdefault(current, " ".join(exception.group(1).split())[:200])
+    return found
+
+
 def unselected_executed(output: str, selected: list[str]) -> list[str]:
     """Executed items that were NOT selected — the c:0 violation, if any.
 
@@ -751,8 +784,13 @@ def evaluate(run_dir: str, log) -> dict:
             result["error"])]
         return result
 
+    exceptions = failure_exceptions(output)
     for nodeid in failed_items(output, selected):
-        result["failures"].append({"test": nodeid, "kickoff": kickoff_quote(path, nodeid)})
+        failure = {"test": nodeid, "kickoff": kickoff_quote(path, nodeid)}
+        error = exceptions.get(_unit_key(nodeid))
+        if error:
+            failure["error"] = error
+        result["failures"].append(failure)
 
     checks = [
         {"name": "tamper-detection",
@@ -785,11 +823,24 @@ def _manifest_actual(manifest: list[str] | None) -> str:
     return f"all {len(manifest)} file(s) in the author's manifest are present"
 
 
+def _failure_clause(failure: dict) -> str:
+    """One failing test as the hint's detail and `NEEDS-CHANGE.md` will read it.
+
+    The exception comes before the kickoff quote because the detail is
+    truncated downstream, and a test that died before asserting says nothing
+    about the change the operator is being asked to revise."""
+    parts = [failure["test"]]
+    if failure.get("error"):
+        parts.append(f"[{failure['error']}]")
+    if failure["kickoff"]:
+        parts.append(f"← {failure['kickoff']}")
+    return " ".join(parts)
+
+
 def _pass_actual(rc, failures: list[dict]) -> str:
     if rc == 0:
         return "rc=0"
-    detail = "; ".join(f"{f['test']} ← {f['kickoff']}" if f["kickoff"] else f["test"]
-                       for f in failures)
+    detail = "; ".join(_failure_clause(f) for f in failures)
     return f"rc={rc}" + (f"; failing: {detail}" if detail else "")
 
 
