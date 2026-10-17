@@ -143,6 +143,32 @@ bad semantics were rewritten with it. R13 also edited
 new lift shape); the claim guard refused until it was explicitly claimed,
 same pattern as R3.
 
+## Status 2026-10-17 ~11:55 (wave 5 merged: R11b — plan complete)
+
+R11b merged as `220faf02` (rebased off two concurrent-session commits): the
+`code_findings_landing` table (`0079`, runtime twin in `ensure_schema`;
+`landed_commit` NULL = checked-and-not-landed), `run_patch_id` /
+`landed_patch_ids` / `check_landing` / `annotate_landing` /
+`landing_enabled` and a `check-landing` subcommand, landing decay in
+`scope_findings_with_stats` after R11a's staleness decay with separate
+`n_landed` / `n_findings_landed` counts, and the tab's own "hidden as
+landed on origin/main" line. `MO_FINDINGS_LANDING=0` restores dropped rows
+(and reports zero dropped, matching the kickoff's own test sentence).
+
+The run itself ended `failed` after one repair round: the reviewer blocked
+on an **import-time `builtins.pytest` mutation** the implementer added to
+`code_findings.py` because the frozen spec suite uses `pytest.raises` in
+`test_spec_landing_db.py` without importing pytest — a production module
+altering its verifier's environment and masking missing-import NameErrors
+repo-wide. The diff was recovered from the run dir and hand-corrected:
+the shim (and its call) removed, `import pytest` added to the spec file in
+the run dir, dead `_window_landed` dropped. Verification: the kickoff's
+6-file gate → 177 passed, the blind spec suite (21 tests, run from the
+worktree root so `_in_repo` resolves the repo) → 21 passed, ruff F,E9
+clean. The lesson recorded for future kickoffs: a spec author may emit
+`pytest.raises` without importing pytest; the fence must be fixed on the
+spec side, never served from the production import graph.
+
 ## Wave-3 resequencing (2026-10-17 ~00:40)
 
 The wave table above put R3, R9, R7b and R12 in one wave "touching disjoint
