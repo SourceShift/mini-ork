@@ -39,6 +39,11 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("MINI_ORK_HOME", str(h))
     monkeypatch.delenv("MINI_ORK_PM", raising=False)
     monkeypatch.delenv("MINI_ORK_SECRETS", raising=False)
+    # The adapters' conventional keys are ambient on a developer machine, and
+    # `add` now reuses a resolvable key instead of prompting. Clear them so a
+    # test that asserts "the value was stored" cannot pass on a stray export.
+    for key in ("LINEAR_API_KEY", "JIRA_API_TOKEN", "GITHUB_TOKEN"):
+        monkeypatch.delenv(key, raising=False)
     return h
 
 
@@ -131,6 +136,52 @@ def test_add_disable_declares_the_source_and_stores_nothing(home, monkeypatch, c
     assert "disabled" in out
     assert not _store(home).exists()
     assert load_config().source("linear").enabled is False
+
+
+def test_add_reuses_a_resolvable_key_without_reading_or_rewriting_it(
+    home, monkeypatch, capsys
+):
+    """The IDE path: no terminal, no prompt — a stored key is reused as-is."""
+    monkeypatch.setenv("LINEAR_API_KEY", SENTINEL)
+    rc = _run(monkeypatch, "add", "linear", "--set", "team=ENG")
+    out, err = capsys.readouterr()
+    assert rc == 0, err
+    assert "already resolves; nothing stored" in out
+    assert SENTINEL not in out and SENTINEL not in err
+    assert not _store(home).exists()               # nothing was rewritten
+    assert load_config().source("linear").enabled is True
+    assert load_config().source("linear").settings == {"team": "ENG"}
+
+
+def test_reuse_token_is_the_explicit_form_of_the_same_rule(home, monkeypatch, capsys):
+    monkeypatch.setenv("LINEAR_API_KEY", SENTINEL)
+    rc = _run(monkeypatch, "add", "linear", "--set", "team=ENG", "--reuse-token")
+    out, err = capsys.readouterr()
+    assert rc == 0, err
+    assert "already resolves; nothing stored" in out
+    assert SENTINEL not in out and SENTINEL not in err
+
+
+def test_reuse_token_refuses_a_missing_key_instead_of_prompting(
+    home, monkeypatch, capsys
+):
+    """An IDE button must fail before the click, not after a prompt with no TTY."""
+    rc = _run(monkeypatch, "add", "linear", "--set", "team=ENG", "--reuse-token")
+    _out, err = capsys.readouterr()
+    assert rc == 2
+    assert "LINEAR_API_KEY" in err
+    assert "not in the vault" in err
+    assert not (home / "config" / "pm.yaml").exists()
+    assert not _store(home).exists()
+
+
+def test_reuse_token_cannot_be_combined_with_a_value_on_stdin(home, monkeypatch, capsys):
+    monkeypatch.setenv("LINEAR_API_KEY", SENTINEL)
+    rc = _run(monkeypatch, "add", "linear", "--reuse-token",
+              "--token-stdin", stdin=SENTINEL)
+    _out, err = capsys.readouterr()
+    assert rc == 2
+    assert "mutually exclusive" in err
 
 
 def test_add_to_a_secure_tier_refuses_before_it_asks_for_a_value(

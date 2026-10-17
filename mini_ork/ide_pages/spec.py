@@ -60,6 +60,9 @@ Actions (``do``) — what a button, row or chip does in the IDE:
 - ``{"set": {...}}``               re-fetch this page with these args merged
 - ``{"run": run_id, "title": t, "tab": t}``    open a run's tab
 - ``{"path": abs}`` / ``{"reveal": abs}`` / ``{"url": u}``
+- ``{"terminal": {"cli", "cwd", "home"}}``  open a real terminal (a TTY), run
+  ``mini-ork <cli> --home <home>`` in it; no ``cli`` opens a shell — the only
+  action that can host a credential prompt
 - ``{"thread": text}``             new mini-ork thread, ``text`` as its first prompt
 - ``{"project": abs}``             switch the IDE window to the project at ``abs``
 - ``{"project_pick": true}``       pick a project folder, then switch to it
@@ -184,6 +187,24 @@ def project_forget(path: str, confirm: str | None = None) -> dict[str, Any]:
     in it are untouched, which is why the confirm text should say so.
     """
     return _with_confirm({"project_forget": path}, confirm)
+
+
+def terminal(cli_args: Iterable[str] | None = None, *, cwd: str | None = None,
+             home: bool = True) -> dict[str, Any]:
+    """Open a terminal in the IDE at ``cwd``, optionally running ``mini-ork``.
+
+    The one action that carries a TTY. ``cli`` actions run with stdin closed,
+    so a command that reads a credential (``pm add``'s hidden prompt) must run
+    here instead: the value is typed into a terminal, never into a page
+    payload, an argv, or a log. With no ``cli`` the action opens a plain shell
+    at ``cwd`` so a person can paste a displayed command.
+    """
+    spec: dict[str, Any] = {"home": home}
+    if cli_args:
+        spec["cli"] = list(cli_args)
+    if cwd:
+        spec["cwd"] = str(cwd)
+    return {"terminal": spec}
 
 
 def url(u: str) -> dict[str, Any]:
