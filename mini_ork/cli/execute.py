@@ -3536,6 +3536,19 @@ def _learned_block(root, task_class, node_type, lane="", node_id="",
     # the problems reviewers already found in this run's files, from the pack the
     # planner wrote. It sits after the operator's preferences and before the
     # learned failure modes. Any other arm, or any failure, adds nothing.
+    #
+    # The ARM — not whether the v2 block came out non-empty — decides whether
+    # the v1 block may render the induced themes: the v2 renderer carries those
+    # same verified themes, so a v2-arm node that also got the v1 section was
+    # shown every lesson twice. An empty pack is still the v2 arm and must not
+    # silently fall back to the v1 themes. Any failure reading the arm keeps
+    # today's v1 behaviour (themes included), matching the fail-soft contract.
+    v2_arm = False
+    try:
+        from mini_ork import context_v2
+        v2_arm = context_v2.arm(context_env("MINI_ORK_RUN_ID", "")) == "v2"
+    except Exception:
+        v2_arm = False
     v2_block = ""
     v2_sources: list[dict] = []
     try:
@@ -3554,7 +3567,7 @@ def _learned_block(root, task_class, node_type, lane="", node_id="",
         fm = context_assembler.failure_modes_md(
             task_class or "generic", 5, db=os.environ.get("MINI_ORK_DB"),
             node_type=node_type, lane=lane, node_id=node_id,
-            sources=sources,
+            sources=sources, include_themes=not v2_arm,
         ).strip()
         if fm:
             block = "\n\n" + fm + "\n"

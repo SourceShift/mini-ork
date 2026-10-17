@@ -366,14 +366,15 @@ def test_holdout_is_deterministic_and_respects_the_rate():
     assert all(cv.in_holdout(r, 1.0) for r in ids)
 
 
-def test_injects_only_when_on_and_not_held_out(monkeypatch):
+def test_arm_is_v2_only_when_on_and_not_held_out(monkeypatch):
+    """``injects()`` was removed (no callers); ``arm()`` is the one selector."""
     monkeypatch.setenv("MO_CONTEXT_V2_HOLDOUT", "0")
     monkeypatch.setenv("MO_CONTEXT_V2", "shadow")
-    assert not cv.injects("run-1")
+    assert cv.arm("run-1") == "shadow"
     monkeypatch.setenv("MO_CONTEXT_V2", "on")
-    assert cv.injects("run-1")
+    assert cv.arm("run-1") == "v2"
     monkeypatch.setenv("MO_CONTEXT_V2_HOLDOUT", "1")
-    assert not cv.injects("run-1")
+    assert cv.arm("run-1") == "holdout"
 
 
 # ── diff check / persistence ────────────────────────────────────────────────

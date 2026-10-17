@@ -28,6 +28,11 @@ Modes (``MO_CONTEXT_V2``): ``off`` | ``shadow`` (default — build and record th
 pack, inject nothing new) | ``on``. Under ``on``, a deterministic
 ``MO_CONTEXT_V2_HOLDOUT`` share of runs (default 0.2) keeps the v1 context so
 recurrence can be compared against a held-out arm.
+
+In the ``v2`` arm the pack's task_class-keyed sections replace their v1
+counterparts (failure modes, prior runs); the rest of the v1 learned block —
+verified emergent patterns, operator preferences, steering — is still rendered
+per node, so this is not a wholesale replacement of the v1 blocks.
 """
 from __future__ import annotations
 
@@ -105,11 +110,6 @@ def in_holdout(run_id: str, rate: float | None = None) -> bool:
         return False
     bucket = int(hashlib.sha1(run_id.encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
     return bucket < rate
-
-
-def injects(run_id: str) -> bool:
-    """True when v2 context replaces the v1 blocks for this run."""
-    return mode() == "on" and not in_holdout(run_id)
 
 
 # ── kickoff contract ─────────────────────────────────────────────────────────
@@ -680,6 +680,9 @@ def build(kickoff_path: str, *, task_class: str = "", db: str | None = None,
         "file_findings": clusters,
         "prior_attempts": prior,
         "themes": themes,
+        # R13 reads this marker to tell a run whose pack was built with the
+        # once-only theme wiring from one that predates it (``v2_legacy``).
+        "themes_once": True,
         "n_findings_scanned": len(findings),
         # Selection provenance, beside the count it explains: which reader
         # supplied the paths and the resolved list. Never edit authority.

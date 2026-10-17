@@ -729,28 +729,41 @@ def _inject_context(prompt, kickoff, task_class, db, out_file, dry_run) -> str:
     skipped: dict[str, str] = {}
     try:
         from mini_ork import context_assembler
-        for kind, producer in (("failure_modes", context_assembler.failure_modes_md),
-                               ("prior_runs", context_assembler.prior_runs_md)):
-            try:
-                block = producer(task_class, 5, db=db)
-            except Exception:
-                block = ""
-            if block:
-                v1_task_blocks.append((kind, block))
+        # Build the v2 block FIRST. The v1 task_class producers below run the
+        # UCB pattern path, which records a retrieval for every row it returns;
+        # computing them only to drop their output when the v2 block rendered
+        # credited UCB for context the planner never saw (LF-R3). The v1
+        # producers are called only when the v2 block is empty — the arm is not
+        # ``v2``, or the pack rendered nothing.
+        v2_block, _v2_pack, ledger_extra = _context_v2_planner(
+            kickoff, task_class, db, out_file, dry_run)
 
         # Raw gradients are EVIDENCE, not verified guidance (user rule
         # 2026-10-07): the graph-context block rides the same
         # MO_INJECT_UNVERIFIED opt-in as the node learned blocks. Default off.
-        graph_block = ""
-        if os.environ.get("MO_INJECT_UNVERIFIED", "") == "1":
-            try:
-                graph_block = context_assembler.graph_context_md(task_class, 5, db=db)
-            except Exception:
-                graph_block = ""
-        else:
+        # The ledger records the withholding on every arm — including ``v2``,
+        # where the block is absent because the v1 task blocks are replaced.
+        graph_opt_in = os.environ.get("MO_INJECT_UNVERIFIED", "") == "1"
+        if not graph_opt_in:
             skipped["graph_context"] = "unverified"
-        if graph_block:
-            v1_task_blocks.append(("graph_context", graph_block))
+        if not v2_block:
+            for kind, producer in (("failure_modes", context_assembler.failure_modes_md),
+                                   ("prior_runs", context_assembler.prior_runs_md)):
+                try:
+                    block = producer(task_class, 5, db=db)
+                except Exception:
+                    block = ""
+                if block:
+                    v1_task_blocks.append((kind, block))
+
+            graph_block = ""
+            if graph_opt_in:
+                try:
+                    graph_block = context_assembler.graph_context_md(task_class, 5, db=db)
+                except Exception:
+                    graph_block = ""
+            if graph_block:
+                v1_task_blocks.append(("graph_context", graph_block))
 
         # Other sessions' and other projects' material (the role pack, the
         # ContextNest attention inbox / recent sessions, the global
@@ -784,8 +797,6 @@ def _inject_context(prompt, kickoff, task_class, db, out_file, dry_run) -> str:
             skipped["contextnest_recent"] = "shared_context_off"
             skipped["active_state"] = "shared_context_off"
 
-        v2_block, _v2_pack, ledger_extra = _context_v2_planner(
-            kickoff, task_class, db, out_file, dry_run)
         # Record what was withheld and why, alongside the v2 arm metadata.
         ledger_extra = {**ledger_extra, "skipped_blocks": dict(skipped)}
         tagged = ([("context_v2", v2_block)] if v2_block else v1_task_blocks) + other_blocks
