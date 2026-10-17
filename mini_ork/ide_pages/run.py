@@ -2610,6 +2610,92 @@ def _lesson_item(title: str, lesson_id: str, usage: set[str] | None, level2: boo
     return S.item(title, sub, acts=_lesson_acts(lesson_id) if level2 else [])
 
 
+def _member_trace_ids(members_json: Any) -> list[str] | None:
+    """The trace ids a pattern's member JSON names, or ``None`` when unreadable.
+
+    Two shapes are live (see ``lessons_cmd._seen_in_runs``): bare trace-id
+    strings and ``{item_table, item_id}`` dicts. Anything that is not a JSON
+    list is unreadable — the caller drops the section rather than guessing a
+    membership it cannot prove.
+    """
+    try:
+        members = json.loads(members_json) if members_json else []
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(members, list):
+        return None
+    ids: list[str] = []
+    for m in members:
+        if isinstance(m, dict):
+            if (m.get("item_table") or "execution_traces") != "execution_traces":
+                continue
+            mid = m.get("item_id")
+        else:
+            mid = m
+        if mid:
+            ids.append(str(mid))
+    return ids
+
+
+def _proposed_lessons(run: Run) -> list[dict[str, Any]]:
+    """The run's "Proposed lessons" section, or ``[]`` when there is none.
+
+    A proposed pattern appears here only when ``member_item_ids_json`` names a
+    trace id from **this** run's own ``execution_traces`` rows — trace
+    membership is the only link between a run and a pattern. Every failure
+    (missing table, unreadable JSON) costs this section, never the tab.
+    """
+    from mini_ork.web.db import db_for
+
+    db = db_for(run.home)
+    if not (db.has_table("emergent_patterns") and db.has_table("execution_traces")):
+        return []
+    trace_ids = {str(r.get("trace_id") or "")
+                 for r in db.rows("SELECT trace_id FROM execution_traces WHERE run_id = ?",
+                                  (run.id,))}
+    trace_ids.discard("")
+    if not trace_ids:
+        return []
+    cols = "pattern_id, cluster_label, member_item_ids_json, strength_score"
+    try:
+        has_lesson = any(str(r.get("name") or "") == "lesson_text"
+                         for r in db.rows("PRAGMA table_info(emergent_patterns)", ()))
+    except Exception:  # noqa: BLE001 — an unreadable schema is just no lesson column
+        has_lesson = False
+    rows = db.rows(
+        f"SELECT {cols}{', lesson_text' if has_lesson else ''} "  # noqa: S608 — fixed cols
+        "FROM emergent_patterns WHERE status = 'proposed'",
+        (),
+    )
+    items: list[dict[str, Any]] = []
+    for r in rows:
+        members = _member_trace_ids(r.get("member_item_ids_json"))
+        if members is None:
+            return []  # unreadable membership: the whole section cannot be trusted
+        if not any(t in trace_ids for t in members):
+            continue
+        pid = str(r.get("pattern_id") or "")
+        lesson = str(r.get("lesson_text") or "").strip() if has_lesson else ""
+        title = (lesson or str(r.get("cluster_label") or ""))[:200]
+        try:
+            strength = float(r.get("strength_score") or 0.0)
+        except (TypeError, ValueError):
+            strength = 0.0
+        acts: list[dict[str, Any]] = []
+        if lesson:
+            do = S.cli("lessons", "promote", pid,
+                       confirm=f"Promote lesson {pid}? Future runs receive it.")
+            do["done"] = "Lesson promoted"
+            acts.append(S.btn("Promote", do, "primary"))
+        acts.append(_forget_action(pid))
+        items.append(S.item(title, f"{pid} · proposed · strength {strength:.0f}",
+                            m="✦", mc="purple", acts=acts))
+    if not items:
+        return []
+    return [S.lst(f"Proposed lessons · {len(items)}", items, full=True,
+                  note="Promote to give future runs this lesson; reject to stop proposing it.")]
+
+
 def _learnings_tab(run: Run) -> list[dict[str, Any]]:
     errors: dict[str, str] = {}
     # The Forget / Open-in-Learn buttons and the used/unused marking are IDE
@@ -2779,7 +2865,15 @@ def _learnings_tab(run: Run) -> list[dict[str, Any]]:
     # injected lessons lead, the written-back gradients follow. Level 1 keeps
     # the old order and the old titles byte for byte.
     if level2:
-        return (S.guarded(errors, "Injected into prompts", available)
+        # The proposed lessons sit before the injected sections: a lesson the
+        # operator can accept belongs ahead of the lessons already injected.
+        try:
+            proposed = _proposed_lessons(run)
+        except Exception as exc:  # noqa: BLE001 — one broken source, one lost section
+            errors["Proposed lessons"] = f"{type(exc).__name__}: {exc}"
+            proposed = []
+        return (proposed
+                + S.guarded(errors, "Injected into prompts", available)
                 + S.guarded(errors, "Written back", produced))
     return (S.guarded(errors, "Produced by the run", produced)
             + S.guarded(errors, "Available to the run", available))
