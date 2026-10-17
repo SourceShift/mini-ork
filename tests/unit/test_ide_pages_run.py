@@ -441,7 +441,9 @@ def test_level_two_dag_tab_carries_the_open_questions(
     assert len(composers) == 1
     assert composers[0]["title"] == "Answer ask-1"
     assert page["chips"][0]["t"] == "✋ 1 question"
-    assert page["tabs"][0]["label"] == "DAG · 1"
+    dag_tab = page["tabs"][0]
+    assert dag_tab["label"] == "DAG"
+    assert dag_tab["count"] == 1 and dag_tab["tone"] == "yellow"
 
 
 def test_level_two_kickoff_is_read_as_source(home: Path, monkeypatch) -> None:
@@ -608,10 +610,14 @@ def test_verification_tab_ships_the_level_vector_as_data(
         "levels_decision": "publish"}))
     monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
 
+    # ``verification`` is a retired key: it resolves to the Checks tab, which
+    # is the one place the level vector is drawn.
     page = build_page(home, "run", "verification", {"run": RUN})
-    assert page["tab"] == "verification"
-    assert [t["key"] for t in page["tabs"]][:3] == ["dag", "outcome", "verification"]
-    assert any(t["label"] == "Verification · 1" for t in page["tabs"])
+    assert page["tab"] == "checks"
+    assert [t["key"] for t in page["tabs"]][:3] == ["dag", "outcome", "checks"]
+    verification = next(t for t in page["tabs"] if t["key"] == "checks")
+    assert verification["label"] == "Checks"
+    assert verification["count"] == 2 and verification["tone"] == "green"
 
     levels = _section(page, "levels", "Levels")
     assert levels["decision"] == "publish"
@@ -632,4 +638,4 @@ def test_verification_tab_ships_the_level_vector_as_data(
     # The outcome callout offers the way here from the DAG tab.
     dag = build_page(home, "run", "dag", {"run": RUN})
     labels = [a["label"] for a in _section(dag, "callout")["actions"]]
-    assert "Verification" in labels
+    assert "Checks" in labels

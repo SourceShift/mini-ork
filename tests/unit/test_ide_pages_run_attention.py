@@ -353,8 +353,8 @@ def test_v2_tabs_and_outcome_tab_name_are_untouched():
     # The tab bar is main's: the needs-you lane adds a section to whichever
     # tab is open, never a tab of its own.
     assert [key for key, _ in run_page.V2_TABS] == [
-        "dag", "outcome", "verification", "kickoff", "agents", "learnings",
-        "artifacts",
+        "dag", "outcome", "checks", "kickoff", "agents",
+        "learnings", "artifacts",
     ]
     assert callable(run_page._story_tab)
     assert callable(run_page._outcome_tab)

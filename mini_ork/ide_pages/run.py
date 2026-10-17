@@ -51,11 +51,11 @@ TABS = [("dag", "DAG"), ("kickoff", "Kickoff"), ("overview", "Overview"), ("agen
 # the DAG leads, the outcome replaces the story, and the questions fold into the
 # DAG tab beside the nodes that stopped on them. Old keys still resolve so a
 # stale IDE link lands somewhere sensible.
-V2_TABS = [("dag", "DAG"), ("outcome", "Outcome"), ("verification", "Verification"),
-           ("kickoff", "Kickoff"), ("agents", "Agents"), ("learnings", "Learnings"),
-           ("artifacts", "Artifacts")]
+V2_TABS = [("dag", "DAG"), ("outcome", "Outcome"), ("checks", "Checks"),
+           ("kickoff", "Kickoff"), ("agents", "Agents"),
+           ("learnings", "Learnings"), ("artifacts", "Artifacts")]
 V2_ALIASES = {"story": "outcome", "graph": "dag", "questions": "dag",
-              "overview": "outcome"}
+              "overview": "outcome", "verification": "checks"}
 
 # The kickoff text is capped well above the 20 KB the run card shows — the kickoff
 # tab is the place to read the whole task brief. Beyond the cap we append a
@@ -3242,27 +3242,167 @@ def _title_v2(run: Run) -> str:
     return run.id
 
 
-def _v2_tabs(run: Run, waiting: int) -> list[tuple[str, str]]:
-    """``V2_TABS`` with a count appended where the tab has one to give.
+def _open_question_count(run: Run) -> int:
+    """The number the header chip shows: open ``asks/ask-N.json`` files.
 
-    Empty sections now vanish from the page rather than rendering a card whose
-    only content is its own emptiness, so the count is where "there is nothing
-    here" is said — in the tab bar, against the tab it is about. A tab with a
-    count of zero keeps its plain label: "Agents · 0" would be noise on every
-    run that has not started.
+    Deliberately not a "decisions blocking this run" count. A parked run and a
+    run stopped on a retry gate each wait on the operator with no ask file
+    behind them, but the chip beside the tab counts ask files only, and two
+    numbers for the same thing — one in the header, one in the tab bar — read
+    as a bug. Those runs are signalled by tone instead (see :func:`_v2_tabs`),
+    never by an extra count here.
+    """
+    return len(open_asks(run.run_dir))
+
+
+def _retry_decision_pending(run: Run) -> bool:
+    """True when ``retry-gate.json`` points at an unresolved inbox row."""
+    if not (run.run_dir / "retry-gate.json").is_file():
+        return False
+    from mini_ork.recovery.retry_notify import pending_fix_for_run
+
+    return pending_fix_for_run(run.home, run.run_dir) is not None
+
+
+def _questions_badge(run: Run) -> tuple[int, str]:
+    """``(count, tone)`` for the DAG tab: the open asks and who is waiting.
+
+    ``count`` is exactly what the header chip counts, so the tab bar and the
+    chip beside it cannot disagree. A run that waits on the operator without
+    an ask file — parked for review, or stopped on an unresolved retry gate —
+    keeps the attention tone at count 0 rather than inventing a number the
+    chip does not show. Nothing waiting is the quiet ``sub``.
+    """
+    count = _open_question_count(run)
+    if count:
+        return count, "yellow"
+    try:
+        waiting = _is_parked_run(run) or _retry_decision_pending(run)
+    except Exception:  # noqa: BLE001 — an unreadable marker costs only the tone
+        waiting = False
+    return 0, "yellow" if waiting else "sub"
+
+
+_CHECK_STATE_WORD = {"PROVEN": "PROVEN", "UNVERIFIED": "UNVERIFIED",
+                     "REFUTED": "FAILED", "FAILED": "FAILED"}
+_CHECK_ROW_STATE = {"PROVEN": "pass", "UNVERIFIED": "pending", "FAILED": "fail"}
+# Plain words for each level, in the kickoff's own vocabulary. The Checks tab
+# exists because "target UNVERIFIED" is not a sentence: the row says what the
+# level means before it says whether the run met it.
+_CHECK_LEVEL_MEANINGS = {
+    "applies": "the change applies to the true base and touches only the files "
+               "the kickoff named",
+    "executes": "every changed file compiles and the change runs at the true base",
+    "target": "the failing test now passes at the true base",
+    "preserve": "the rest of the suite still passes at the true base",
+    "contract": "the kickoff's promised artifact exists and matches its contract",
+}
+# Node types whose failure is a check the operator should see on this tab.
+_CHECK_NODE_TYPES = _REVIEW_TYPES | {"verifier", "gate"}
+
+
+def _failed_check_count(run: Run) -> int:
+    """Levels the evidence refuted, plus failed verification nodes.
+
+    ``UNVERIFIED`` is not a failure — the run simply has not proven that level
+    — so it never turns the badge red. A reviewer/verifier node that actually
+    failed is a check that failed even when the level vector is silent about
+    it (``hr-smoke-d-191036``: the reviewer died, the vector only abstained).
+    """
+    report = O.verification_report(run) or {}
+    levels = report.get("levels") if isinstance(report.get("levels"), dict) else {}
+    failed = sum(1 for value in levels.values()
+                 if str(value or "").upper() in ("REFUTED", "FAILED"))
+    failed += sum(1 for node in run.nodes
+                  if node.state == "failed" and node.type in _CHECK_NODE_TYPES)
+    return failed
+
+
+def _proven_count(run: Run) -> int:
+    report = O.verification_report(run) or {}
+    levels = report.get("levels") if isinstance(report.get("levels"), dict) else {}
+    return sum(1 for value in levels.values() if str(value or "").upper() == "PROVEN")
+
+
+def _checks_badge(run: Run) -> tuple[str | int, str]:
+    """``(count, tone)`` for the Checks tab: failed first, else proven.
+
+    A failed level is the one thing the badge must shout about, so it wins over
+    the proven count. When nothing failed the proven count is the useful
+    number; when the run has no vector at all the badge is quiet (``0 · sub``).
+    """
+    try:
+        failed = _failed_check_count(run)
+        if failed:
+            return f"{failed} ✗", "red"
+        proven = _proven_count(run)
+        if proven:
+            return proven, "green"
+    except Exception:  # noqa: BLE001 — a broken vector costs the badge, never the page
+        return 0, "sub"
+    return 0, "sub"
+
+
+def _learnings_count(run: Run) -> int:
+    """How many lessons this run wrote back (gradients + learning rows)."""
+    try:
+        from mini_ork.web.db import db_for
+
+        db = db_for(run.home)
+        n = 0
+        if db.has_table("gradient_records") and db.has_table("execution_traces"):
+            row = db.row("SELECT COUNT(*) AS n FROM gradient_records g "
+                         "JOIN execution_traces t ON t.trace_id = g.evidence "
+                         "WHERE t.run_id = ?", (run.id,)) or {}
+            n += int(row.get("n") or 0)
+        if db.has_table("learning_record"):
+            row = db.row("SELECT COUNT(*) AS n FROM learning_record WHERE run_id = ?",
+                         (run.id,)) or {}
+            n += int(row.get("n") or 0)
+        return n
+    except Exception:  # noqa: BLE001 — an unreadable ledger costs its badge
+        return 0
+
+
+def _v2_tabs(run: Run) -> list[dict[str, Any]]:
+    """``V2_TABS`` with a ``count``/``tone`` badge where the tab has one.
+
+    Labels stay the plain tab name (``Checks``, not ``Checks · 1``): the badge
+    is its own field (CONTRACT v2.1), so the IDE draws it and an older reader
+    still sees the same label. A tab whose content would be empty carries
+    ``count: 0`` — the quiet state — rather than dropping out of the bar.
     """
     from mini_ork.cli.board_cmd import _artifacts
 
-    counts = {
+    try:
+        # ``asks/`` holds conversation, not run output; counting it here would
+        # put the same number on two tabs and read as a second, phantom build.
+        artifacts = sum(1 for a in _artifacts(run.run_dir)
+                        if not str(a.get("path") or "").startswith("asks/"))
+    except Exception:  # noqa: BLE001
+        artifacts = 0
+    checks_count, checks_tone = _checks_badge(run)
+    badges: dict[str, tuple[str | int, str]] = {
         # The questions tab folded into the DAG; its count rides here so a
-        # stopped run still advertises itself from the tab bar.
-        "dag": waiting,
-        "verification": verifier_check_counts(run.run_dir)[1],
-        "agents": len(run.nodes),
-        "artifacts": len(_artifacts(run.run_dir)),
+        # stopped run still advertises itself from the tab bar. The header chip
+        # counts ask files only; the badge also counts the review/retry
+        # decisions that block a run with no ask file.
+        # Count is ask files only, matching the header chip. A parked run or an
+        # open retry decision is still waiting on the operator, so it keeps the
+        # attention tone even at count 0; a run with nothing waiting is quiet.
+        "dag": _questions_badge(run),
+        "checks": (checks_count, checks_tone),
+        "agents": (len(run.nodes), "sub"),
+        "learnings": (_learnings_count(run), "sub"),
+        "artifacts": (artifacts, "sub"),
     }
-    return [(key, f"{label} · {counts[key]}" if counts.get(key) else label)
-            for key, label in V2_TABS]
+    out: list[dict[str, Any]] = []
+    for key, label in V2_TABS:
+        entry: dict[str, Any] = {"key": key, "label": label}
+        if key in badges:
+            entry["count"], entry["tone"] = badges[key]
+        out.append(entry)
+    return out
 
 
 def _sub_v2(run: Run) -> str:
@@ -3649,6 +3789,144 @@ def _verification_tab(run: Run) -> list[dict[str, Any]]:
     return sections
 
 
+def _checks_evidence_action(run: Run, level: str, reason: str,
+                            envelopes: list[tuple[Path, dict[str, Any]]]
+                            ) -> dict[str, Any] | None:
+    """The click-through that decided ``level``, when one exists.
+
+    Two sources, in order of directness: the file the level's own reason names
+    (``verifier_test.json: …``), then a verifier envelope whose name or checks
+    talk about this level. A level with no decidable evidence gets no action —
+    a dead "Open evidence" button would be worse than none.
+    """
+    for name in re.findall(r"[A-Za-z0-9_.-]+\.(?:json|log|md|txt|patch)", reason or ""):
+        path = run.run_dir / name
+        try:
+            if path.is_file():
+                return S.open_path(str(path))
+        except OSError:
+            continue
+    pattern = re.compile(rf"\b{re.escape(level)}\b", re.I)
+    for path, envelope in envelopes:
+        try:
+            checks = envelope.get("checks")
+            words = [str(envelope.get("verifier") or ""), str(envelope.get("error_summary") or "")]
+            if isinstance(checks, list):
+                for check in checks:
+                    if isinstance(check, dict):
+                        words.extend(str(check.get(key) or "")
+                                     for key in ("name", "detail", "expected", "actual"))
+            if not any(pattern.search(word) for word in words):
+                continue
+            evidence = str(envelope.get("evidence_path") or "")
+            target = evidence if evidence and Path(evidence).is_file() else str(path)
+            return S.open_path(target)
+        except (OSError, TypeError, ValueError):
+            continue
+    return None
+
+
+def _checks_envelope_sections(run: Run) -> list[dict[str, Any]]:
+    """The checks behind the vector, one section per ``verifier_*.json``.
+
+    Same envelopes :func:`verifier_check_counts` counts, with each check's own
+    verdict and the file that decided it. One broken envelope costs its own
+    section, never the tab.
+    """
+    sections: list[dict[str, Any]] = []
+    for path in sorted(run.run_dir.glob("verifier_*.json")):
+        try:
+            envelope = _json_obj(path)
+            if not isinstance(envelope, dict):
+                continue
+            name = str(envelope.get("verifier") or path.stem.removeprefix("verifier_"))
+            checks = envelope.get("checks")
+            rows = []
+            if isinstance(checks, list):
+                for check in checks:
+                    if not isinstance(check, dict):
+                        continue
+                    check_passed = bool(check.get("pass"))
+                    detail = str(check.get("expected") or "").strip()
+                    if not check_passed:
+                        detail = " · ".join(part for part in
+                                            (detail, str(check.get("actual") or "").strip())
+                                            if part)
+                    rows.append(S.check_row(str(check.get("name") or "check"),
+                                            "pass" if check_passed else "fail",
+                                            detail=detail))
+            evidence = str(envelope.get("evidence_path") or "")
+            if evidence and Path(evidence).is_file():
+                actions = [S.btn("Open evidence", S.open_path(evidence), "ghost")]
+            else:
+                actions = [S.btn("Open check row", S.open_path(str(path)), "ghost")]
+            passed = bool(envelope.get("pass"))
+            title = f"{name} · {'pass' if passed else 'FAIL'}"
+            if rows:
+                sections.append(S.checks(
+                    title, rows, full=True, actions=actions,
+                    sub=f"{sum(1 for row in rows if row['state'] == 'pass')}/{len(rows)} checks"))
+            else:
+                item = S.ok(title) if passed else S.bad(title)
+                sections.append(S.lst(name, [item], full=True, actions=actions))
+        except Exception:  # noqa: BLE001 — one broken envelope costs its section
+            continue
+    return sections
+
+
+def _checks_tab(run: Run) -> list[dict[str, Any]]:
+    """The verification levels, one self-explaining row each.
+
+    Every row carries its state in the kickoff's three-word vocabulary, a
+    plain-words sentence saying what the level means, and — when the run's
+    evidence names one — a click-through to the file that decided it. Sources
+    are read fail-soft: a missing or malformed verdict costs the data on that
+    row, never the tab.
+    """
+    try:
+        report = O.verification_report(run) or {}
+    except Exception:  # noqa: BLE001 — a broken verdict costs the rows' data
+        report = {}
+    levels = report.get("levels") if isinstance(report.get("levels"), dict) else {}
+    reasons = report.get("levels_reasons") if isinstance(report.get("levels_reasons"), dict) else {}
+    envelopes: list[tuple[Path, dict[str, Any]]] = []
+    try:
+        for path in sorted(run.run_dir.glob("verifier_*.json")):
+            envelope = _json_obj(path)
+            if isinstance(envelope, dict):
+                envelopes.append((path, envelope))
+    except OSError:
+        envelopes = []
+
+    rows = []
+    for level in O.LEVELS:
+        raw = str(levels.get(level) or "").upper()
+        state = _CHECK_STATE_WORD.get(raw, "UNVERIFIED")
+        reason = str(reasons.get(level) or "").strip()
+        meaning = _CHECK_LEVEL_MEANINGS.get(level, "a required check on this run")
+        detail = f"{state} — {meaning}."
+        if reason:
+            detail += f" Why: {reason}"
+        rows.append(S.check_row(
+            level, _CHECK_ROW_STATE[state], detail=detail,
+            do=_checks_evidence_action(run, level, reason, envelopes)))
+    sections = [S.checks(
+        "Verification levels", rows, full=True,
+        note="PROVEN = the evidence at the true base shows it; UNVERIFIED = not "
+             "proven yet; FAILED = the evidence refutes it. Click a row to open "
+             "the file that decided it.")]
+    # The vector itself stays shipped as data for the renderer (``spec.levels``),
+    # and the per-check envelopes below mirror ``_checks_envelope_sections`` —
+    # so only the non-check sections of the old tab ride along here.
+    try:
+        sections.extend(s for s in _verification_tab(run)
+                        if s.get("type") != "checks")
+    except Exception:  # noqa: BLE001 — the data vector costs its section, not the tab
+        pass
+    sections.extend(_checks_envelope_sections(run))
+    return sections
+
+
 def _story_tab(run: Run, outcome: dict[str, Any]) -> list[dict[str, Any]]:
     """The retired Story tab: the outcome tab under its old name.
 
@@ -3698,7 +3976,7 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
     # The verdict row is a summary; the level vector, each decision's reason and
     # the checks behind ``checks n/m`` live in the Verification tab.
     callout_actions.append(
-        S.btn("Verification", S.page_link("run", "verification", run=run.id)))
+        S.btn("Checks", S.page_link("run", "checks", run=run.id)))
     callout_labels = {str(a.get("label") or "") for a in callout_actions}
     # A callout is drawn on the DAG and Outcome tabs only: on the others the
     # menu must keep the buttons no callout is showing.
@@ -3711,6 +3989,7 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
                                 callout_actions=callout_actions),
         "outcome": lambda: _outcome_tab(run, outcome, callout_actions, absorbed),
         "verification": lambda: _verification_tab(run),
+        "checks": lambda: _checks_tab(run),
         "kickoff": lambda: _kickoff_tab(run, code_presentation=True),
         "agents": lambda: _agents_tab(run),
         "learnings": lambda: _learnings_tab(run),
@@ -3745,7 +4024,7 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
     sub = title if title and title != run.id else _sub_v2(run)
     page = S.page("run", run.id, sub, chips_=chips,
                   actions=header["actions"] + actions,
-                  tabs=_v2_tabs(run, waiting), tab=resolved,
+                  tabs=_v2_tabs(run), tab=resolved,
                   args={"run": run.id, **({"node": node} if node else {})},
                   sections=sections, desc=_desc_fold(run, outcome, title),
                   label=header["label"], menu=menu,
