@@ -235,43 +235,120 @@ def _strip_glob(path: str) -> str:
     return re.sub(r"/\*\*?$", "", path).rstrip("/")
 
 
+def engine_identity() -> str | None:
+    """The engine checkout's repo identity — ``repo_identity(MINI_ORK_ROOT)``,
+    else the package parent (the mini-ork repository root).
+
+    Reads ``MINI_ORK_ROOT`` through ``context_env`` so a run-scoped binding wins
+    over the process env, matching every other reader in this module. Never
+    raises (``repo_identity`` is fail-soft).
+    """
+    return code_findings.engine_repo_identity(context_env("MINI_ORK_ROOT") or None)
+
+
+def resolve_target_repo(target_repo: str | None = None) -> str | None:
+    """The repo identity a selection is scoped to (LF-R12 §4).
+
+    An explicit ``target_repo`` wins; otherwise ``MO_TARGET_CWD`` (the directory
+    the dispatched agent ran in) is resolved with ``repo_identity``; otherwise
+    the engine checkout's identity. A cwd that no longer resolves (deleted,
+    non-git) degrades to the engine rather than ``None``, because ``None`` at
+    the query layer means "unscoped" and would turn the filter off.
+    """
+    if target_repo:
+        return target_repo
+    cwd = context_env("MO_TARGET_CWD")
+    if cwd:
+        ident = code_findings.repo_identity(cwd)
+        if ident:
+            return ident
+    return engine_identity()
+
+
+def _has_target_repo(con: sqlite3.Connection) -> bool:
+    """True when this DB carries the LF-R12 column.
+
+    A DB migrated only to 0064 (or a fixture built from that shape) has no
+    ``target_repo``; filtering on it would raise and blank every section. The
+    filter is skipped there — the same fail-soft rule the rest of the reader
+    follows for missing tables/columns.
+    """
+    try:
+        return any(r[1] == "target_repo"
+                   for r in con.execute("PRAGMA table_info(code_findings)"))
+    except sqlite3.Error:
+        return False
+
+
+def _repo_clause(target_repo: str | None, engine: str | None) -> tuple[str, list]:
+    """``(SQL predicate, params)`` for the registered-repo rule.
+
+    A row is kept when ``target_repo`` equals the current identity, or when it
+    is NULL AND the current identity IS the engine checkout. NULL is never a
+    wildcard (Q8): a finding with no recorded repo belongs to the engine only.
+    An unknown current identity yields a predicate that matches nothing rather
+    than every row.
+    """
+    if not target_repo:
+        return "0", []
+    if engine and target_repo == engine:
+        return "(target_repo = ? OR target_repo IS NULL)", [target_repo]
+    return "target_repo = ?", [target_repo]
+
+
 def _query_findings(con: sqlite3.Connection, prefix: str, limit: int,
-                    exclude_run: str | None) -> list[dict]:
+                    exclude_run: str | None, target_repo: str | None = None,
+                    engine: str | None = None) -> list[dict]:
+    if target_repo and _has_target_repo(con):
+        clause, clause_params = _repo_clause(target_repo, engine)
+    else:
+        clause, clause_params = "", []
+    where = "file LIKE ? ESCAPE '\\' AND (? = '' OR run_id != ?)"
+    if clause:
+        where += " AND " + clause
     rows = con.execute(
-        """
+        f"""
         SELECT id, fingerprint, run_id, file, line, severity, category, issue, ts
         FROM code_findings
-        WHERE file LIKE ? ESCAPE '\\' AND (? = '' OR run_id != ?)
+        WHERE {where}
         ORDER BY ts DESC LIMIT ?
         """,
-        (_like_escape(prefix) + "%", exclude_run or "", exclude_run or "", int(limit)),
+        [_like_escape(prefix) + "%", exclude_run or "", exclude_run or ""]
+        + clause_params + [int(limit)],
     ).fetchall()
     return [dict(r) for r in rows]
 
 
 def scope_findings(paths: list[str], *, db: str | None = None, limit: int = 300,
-                   exclude_run: str | None = None) -> list[dict]:
+                   exclude_run: str | None = None,
+                   target_repo: str | None = None) -> list[dict]:
     """Review/verifier findings for the in-scope paths, newest first.
 
     Each path matches as a prefix. A file with no findings of its own (often a
     new file) falls back to its parent directory, but only when that directory
     is at least three components deep — ``mini_ork/ide_pages/learn`` is a
-    neighbourhood, ``mini_ork/cli`` is half the codebase.
+    neighbourhood, ``mini_ork/cli`` is half the codebase. Both the exact-path
+    query and the parent fallback apply the same ``target_repo`` filter
+    (LF-R12 §4), so a sibling repo's findings can never leak in through the
+    fallback. ``target_repo=None`` reads unscoped, preserving the legacy call
+    shape; ``build`` always passes a resolved identity.
     """
     con = _connect_ro(db)
     if con is None:
         return []
+    engine = engine_identity()
     out: dict[int, dict] = {}
     try:
         for raw in paths:
             prefix = _strip_glob(raw)
             if not prefix:
                 continue
-            rows = _query_findings(con, prefix, limit, exclude_run)
+            rows = _query_findings(con, prefix, limit, exclude_run, target_repo, engine)
             if not rows and "." in os.path.basename(prefix):
                 parent = os.path.dirname(prefix)
                 if parent.count("/") >= 2:
-                    rows = _query_findings(con, parent + "/", limit, exclude_run)
+                    rows = _query_findings(con, parent + "/", limit, exclude_run,
+                                           target_repo, engine)
             for r in rows:
                 out.setdefault(r["id"], r)
     except sqlite3.Error:
@@ -310,7 +387,8 @@ def kickoff_stem(path: str | None) -> str:
 
 
 def prior_attempts(kickoff_path: str, *, db: str | None = None,
-                   current_run: str | None = None, limit: int = 3) -> list[dict]:
+                   current_run: str | None = None, limit: int = 3,
+                   target_repo: str | None = None) -> list[dict]:
     """Earlier runs of the same kickoff file, newest first, with their findings.
 
     Each earlier finding is filtered before it is injected (LF-R5 §6): it must
@@ -318,6 +396,11 @@ def prior_attempts(kickoff_path: str, *, db: str | None = None,
     its issue must classify as ``code`` under
     :func:`mini_ork.learning.code_findings.classify_note` (so a receipt, harness
     note or process complaint is never carried into the next run's prompt).
+
+    LF-R12 §4 adds the same repo filter as ``scope_findings``: a finding from an
+    earlier attempt at the same kickoff is still irrelevant when that attempt
+    ran against a different repository. ``target_repo=None`` leaves the scan
+    unscoped for legacy callers; ``build`` passes a resolved identity.
     """
     if not kickoff_path:
         return []
@@ -325,6 +408,8 @@ def prior_attempts(kickoff_path: str, *, db: str | None = None,
     if con is None:
         return []
     floor = min_severity()
+    engine = engine_identity()
+    repo_filter = bool(target_repo) and _has_target_repo(con)
     out = []
     try:
         stem = kickoff_stem(kickoff_path)
@@ -342,10 +427,16 @@ def prior_attempts(kickoff_path: str, *, db: str | None = None,
                 if r["kickoff_path"] == kickoff_path
                 or (stem and kickoff_stem(r["kickoff_path"]) == stem)][:int(limit)]
         for r in runs:
+            sql = ("SELECT file, line, severity, issue FROM code_findings "
+                   "WHERE run_id = ?")
+            params: list = [r["id"]]
+            if repo_filter:
+                clause, clause_params = _repo_clause(target_repo, engine)
+                sql += " AND " + clause
+                params += clause_params
+            sql += " ORDER BY ts DESC LIMIT 20"
             try:
-                found = con.execute(
-                    "SELECT file, line, severity, issue FROM code_findings "
-                    "WHERE run_id = ? ORDER BY ts DESC LIMIT 20", (r["id"],)).fetchall()
+                found = con.execute(sql, params).fetchall()
             except sqlite3.Error:
                 found = []
             kept = [
@@ -519,14 +610,21 @@ def _constraint_items(contract: dict) -> list[dict]:
 
 def build(kickoff_path: str, *, task_class: str = "", db: str | None = None,
           run_id: str | None = None, max_clusters: int = 5,
-          kickoff_text: str | None = None, run_dir: str | None = None) -> dict:
+          kickoff_text: str | None = None, run_dir: str | None = None,
+          target_repo: str | None = None) -> dict:
     """The v2 pack for one run. Never raises; unreadable inputs give empty sections.
 
     Selection scope: the kickoff's parsed ``files_in_scope`` when non-empty,
     else (with a ``run_dir``) the run profile's ``scope_allow`` via
     ``preferences.scope_paths``, else empty. The fallback is selection-only —
     ``contract`` is never back-filled, so it grants no edit authority (the
-    kickoff guard and the diff-scope checks keep reading the parse)."""
+    kickoff guard and the diff-scope checks keep reading the parse).
+
+    Repo scope (LF-R12 §4): ``target_repo`` is the identity findings must belong
+    to. When unset it is derived from ``MO_TARGET_CWD``, else the engine
+    checkout — so an injection can never quietly become unscoped. A NULL
+    ``target_repo`` column means ENGINE-LOCAL and is offered only when that
+    derived identity is the engine itself."""
     kickoff_bytes: bytes | None = None
     if kickoff_text is None:
         try:
@@ -554,12 +652,15 @@ def build(kickoff_path: str, *, task_class: str = "", db: str | None = None,
             scope_source = "profile"
     else:
         scope_source = "none"
-    findings = scope_findings(scope, db=db, exclude_run=run_id)
+    target_repo = resolve_target_repo(target_repo)
+    findings = scope_findings(scope, db=db, exclude_run=run_id,
+                              target_repo=target_repo)
     floor = min_severity()
     clusters = [c for c in cluster(findings)
                 if _SEVERITY_RANK.get(str(c["worst_severity"]).lower(), 0) >= floor]
     clusters = clusters[:max_clusters]
-    prior = prior_attempts(kickoff_path, db=db, current_run=run_id)
+    prior = prior_attempts(kickoff_path, db=db, current_run=run_id,
+                           target_repo=target_repo)
     themes = verified_themes(task_class, db=db)
     constraints = _constraint_items(contract)
     return {
@@ -745,8 +846,14 @@ def pack_for_run(run_dir: str, *, kickoff_path: str | None = None, task_class: s
         kickoff_path = kickoff_path or _profile_kickoff(run_dir)
         if not kickoff_path:
             return {}
+        # LF-R12 §4: the run profile names the directory the work targets; its
+        # repo identity is what this pack may select findings from. Without a
+        # recorded target the derivation inside ``build`` applies (MO_TARGET_CWD
+        # → engine), so an unprofiled run is never left unscoped.
+        target_cwd = code_findings._run_target_cwd(run_dir)
+        target_repo = code_findings.repo_identity(target_cwd) if target_cwd else None
         pack = build(kickoff_path, task_class=task_class, db=db, run_id=run_id,
-                     run_dir=run_dir)
+                     run_dir=run_dir, target_repo=target_repo)
         pack["arm"] = arm(run_id)
         write_json(os.path.join(run_dir, PACK_FILENAME), pack)
         return pack

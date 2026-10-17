@@ -41,6 +41,7 @@ A single environment variable gates every dispatch:
 |---|---|---|
 | `MO_DAILY_BUDGET_USD` | `50` | Rolling-24-hour USD spend cap. Dispatch halts once trailing spend reaches it. |
 | `MO_LANE_HEALTH_GATE` | `"1"` | Pre-run lane-health gate. `1` probes every model the DAG will dispatch and aborts the run with rc=75 / `blocked_reason=lane_unhealthy` if any lane is dead. `0` skips enforcement (the run can still see per-dispatch refusals; see `MO_LANE_PROBE`). |
+| `MO_LANE_REQUIRE_VERIFICATION` | `"0"` | Fail-closed switch for lanes the gate could **not** verify — `ok` but no probe answered (a native lane the CLI authenticates, a probe switched off, an endpoint that never replied). `0` (default) warns on stderr, records them under `unverified` in `<run_dir>/lane-preflight.json` with `verdict: proceed`, and starts the run. `1` aborts instead: rc=75, `blocked_reason=lane_unverified`, `verdict: blocked`. A dead lane always blocks first, as `lane_unhealthy`. |
 
 The window is **rolling 24 hours**, not a calendar day. The gate sums
 `llm_calls.cost_usd` (falling back to `task_runs` on databases behind the
@@ -79,17 +80,32 @@ verdict vocabulary is the body regex `MO_LANE_PROBE` already shares: status
 `insufficient (credit|balance|quota)`, `usage limit`, `out of credits`, or
 `billing`.
 
+Dead is not the same as unchecked. A lane that came back `ok` **without** a
+probe answering — a native lane whose auth the CLI owns, a probe switched off,
+or an endpoint that never replied — is reported as *unverified*
+(`verified=false`), named per waiting node, and written under the `unverified`
+key of `<run_dir>/lane-preflight.json`. By default such a run **proceeds**
+with a `warn:` line on stderr (`verdict: proceed`, no `blocked_reason=`
+machine line, no `task_runs` write). Set `MO_LANE_REQUIRE_VERIFICATION=1` to
+make an unverifiable lane abort instead: rc=75, `blocked_reason=lane_unverified`
+(the same `lane_preflight_blocked` run event, no new event type or status).
+A dead lane always wins: with a `lane_unhealthy` failure present the run is
+refused as `lane_unhealthy` regardless of this flag.
+
 Limitations:
 
 - `MO_LANE_PROBE=0` (or `MINI_ORK_DRY_RUN=1`, or running under pytest
-  without opt-in) downgrades the gate to key-presence — which for native
-  lanes (`anthropic-native`, `codex-native`, `opencode-native`) is a no-op
-  because they have no `api_key_env` to read. Use `MO_LANE_HEALTH_GATE=0`
-  to skip enforcement entirely instead.
-- An ambient login (no credential env var) is unknown and does not block. The
-  gate honours three credential env vars for `anthropic-native` lanes:
-  `ANTHROPIC_API_KEY` → `x-api-key`, else `ANTHROPIC_AUTH_TOKEN` →
-  `Authorization: Bearer`, else `CLAUDE_CODE_OAUTH_TOKEN` → Bearer + the
+  without opt-in) leaves the gate resting on key presence: the lane reads
+  `ok` with `verified=false`, and native lanes (`anthropic-native`,
+  `codex-native`, `opencode-native`) have no `api_key_env` to read at all.
+  Those lanes are unverified, not dead — see `MO_LANE_REQUIRE_VERIFICATION`
+  to fail closed on them, or `MO_LANE_HEALTH_GATE=0` to skip enforcement
+  entirely.
+- An ambient login (no credential env var) is unknown and does not block — it
+  is reported as unverified. The gate honours three credential env vars for
+  `anthropic-native` lanes: `ANTHROPIC_API_KEY` → `x-api-key`, else
+  `ANTHROPIC_AUTH_TOKEN` → `Authorization: Bearer`, else
+  `CLAUDE_CODE_OAUTH_TOKEN` → Bearer + the
   `anthropic-beta: oauth-2025-04-20` header.
 
 ### Lane liveness at instantiation (`mini-ork validate`)

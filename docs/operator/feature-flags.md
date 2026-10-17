@@ -11,8 +11,9 @@ variable is unset.*
 | Variable | Default | Effect |
 |---|---|---|
 | `MINI_ORK_EXECUTE_GATE` | `"1"` | Pre-dispatch gate on needs_answers plans (exit 6) |
-| `MO_LANE_HEALTH_GATE` | `"1"` | Pre-run lane-health gate (exit 75 on dead lane); set `0` to skip enforcement. Under `MO_LANE_PROBE=0` the gate degrades to key-presence only (a no-op for native lanes). |
-| `MO_LANE_PROBE` | env-derived | Probe-enabled switch for `lane_health`: `0` disables the live HTTP probe and `MINI_ORK_DRY_RUN=1` overrides to `0`. Under pytest without explicit `MO_LANE_PROBE=1` the probe is dark so tests never make a real HTTP call. |
+| `MO_LANE_HEALTH_GATE` | `"1"` | Pre-run lane-health gate (exit 75 on dead lane); set `0` to skip enforcement. Under `MO_LANE_PROBE=0` the gate rests on key presence, and those lanes are reported *unverified* (`verified=false`) rather than silently counted as checked. |
+| `MO_LANE_REQUIRE_VERIFICATION` | `"0"` | Fail-closed switch for the lane-health gate's unverified lanes. `0` (default) warns on stderr and proceeds, recording the lanes under `unverified` in `<run_dir>/lane-preflight.json` (`verdict: proceed`). `1` aborts the run instead (exit 75, `blocked_reason=lane_unverified`, `verdict: blocked`) when any lane is `ok` but `verified=false` — a native lane the CLI authenticates, a probe turned off, or a probe that got no answer. A dead lane always blocks first, as `lane_unhealthy`. |
+| `MO_LANE_PROBE` | env-derived | Probe-enabled switch for `lane_health`: `0` disables the live HTTP probe and `MINI_ORK_DRY_RUN=1` overrides to `0`. Under pytest without explicit `MO_LANE_PROBE=1` the probe is dark so tests never make a real HTTP call. A lane whose probe is off is `ok` but `verified=false` — see `MO_LANE_REQUIRE_VERIFICATION`. |
 | `MO_APPLY_IMPL_OUTPUT` | `"1"` | Text-fallback capture: parse implementer output for a diff/fenced blocks when it applied nothing |
 | `MO_LEARNING_WRITEBACK` | `"1"` | GRPO advantage writeback after runs |
 | `MO_PRM_SCORE` | `"1"` | Process-reward heuristic scoring on traces |
