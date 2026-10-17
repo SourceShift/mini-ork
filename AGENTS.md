@@ -47,13 +47,17 @@ make worktree-clean SLUG=<slug>      # remove worktree + delete branch
 - Merge is `push HEAD:main` (no PR); never `reset --hard` or revert main.
 - One-time per clone: `make install-hooks` (activates `.githooks/`).
 
-`scripts/mini-ork-worktree.sh` is the same flow without `make` (and is what the
-targets call). It takes an mkdir lock (`$MINI_ORK_WORKTREE_LOCK`, default
-`$TMPDIR/mini-ork-worktree.lockdir`, 30 s wait) around the two check-then-act
-pairs — the claim-check/register on create, and the re-rebase/push on merge — so
-two concurrent agents cannot both pass an ownership check or interleave a stale
-push. The green gate runs outside the lock, so a long gate never blocks another
-worktree command.
+`scripts/mini_ork_worktree.py` is the driver (`make worktree*` invokes it). The
+legacy `scripts/mini-ork-worktree.sh` is the shell original it replaced and is
+slated for deletion (bash-removal Phase 4) — do not run it, and do not add
+features to it: it re-rebases without re-fetching inside the lock and has no
+push retry. The Python driver takes an mkdir lock (`$MINI_ORK_WORKTREE_LOCK`,
+default `$TMPDIR/mini-ork-worktree.lockdir`, 30 s wait) around the two
+check-then-act pairs — the claim-check/register on create, and the
+fetch/rebase/push on merge — so two concurrent agents cannot both pass an
+ownership check or interleave a stale push. The green gate runs outside the
+lock, so a long gate never blocks another worktree command, and the push itself
+runs in a bounded retry (`MO_MERGE_PUSH_ATTEMPTS`, default 5).
 
 **Merge discipline (the part that goes wrong):**
 

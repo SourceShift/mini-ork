@@ -76,7 +76,7 @@ def main() -> int:
         # worktree-guard: keep implementation work off the main checkout.
         # Creating a feature branch here (zero -> commit on refs/heads/<x>,
         # x != main/master) is blocked; branch through a worktree instead.
-        # scripts/mini-ork-worktree.sh sets ALLOW_WORKTREE_BRANCH_CREATE=1
+        # scripts/mini_ork_worktree.py sets ALLOW_WORKTREE_BRANCH_CREATE=1
         # for its own `worktree add -b`.
         if os.environ.get("ALLOW_WORKTREE_BRANCH_CREATE", "") != "1":
             if ref.startswith("refs/heads/") and ref not in (
@@ -102,7 +102,7 @@ def main() -> int:
                         file=sys.stderr,
                     )
                     print(
-                        "    scripts/mini-ork-worktree.sh create <task-slug>",
+                        "    scripts/mini_ork_worktree.py create <task-slug>",
                         file=sys.stderr,
                     )
                     print(

@@ -197,7 +197,7 @@ def test_ref_tx_blocks_direct_feature_branch_creation(tx_repo: Path):
     r = _run_hook(REF_TX, ["prepared"], f"{ZERO} {sha} refs/heads/feat-x\n", tx_repo)
     assert r.returncode == 1
     assert "[worktree-guard] REJECT direct feature-branch creation: feat-x" in r.stderr
-    assert "scripts/mini-ork-worktree.sh create <task-slug>" in r.stderr
+    assert "scripts/mini_ork_worktree.py create <task-slug>" in r.stderr
     assert "ALLOW_WORKTREE_BRANCH_CREATE=1" in r.stderr
 
 
