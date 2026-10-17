@@ -75,6 +75,24 @@ def _repo_files(monkeypatch, *paths: str) -> None:
     monkeypatch.setattr(code_findings, "_git_ls_files", lambda *_: set(paths))
 
 
+def _head_repo(tmp_path: Path, files: dict[str, str]) -> str:
+    """A real git checkout holding ``files`` at HEAD — the repo LF-R11a's
+    staleness probe reads (as opposed to a synthetic, on-disk-less fixture)."""
+    import subprocess
+
+    repo = tmp_path / "head-repo"
+    repo.mkdir()
+    for rel, text in files.items():
+        p = repo / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@example.com",
+                    "-c", "user.name=T", "commit", "-q", "-m", "init"], check=True)
+    return str(repo)
+
+
 def _section(page: dict, title: str) -> dict:
     return next(s for s in page["sections"] if s["title"] == title)
 
@@ -450,7 +468,8 @@ def test_areas_table_rows_and_freshness(home: Path, monkeypatch) -> None:
     assert pay["do"] == {"set": {"area": "svc/pay"}}
 
 
-def test_area_detail_recurring_rule_and_findings(home: Path, monkeypatch) -> None:
+def test_area_detail_recurring_rule_and_findings(home: Path, monkeypatch,
+                                                 tmp_path: Path) -> None:
     _seed(home, [
         {"run_id": "r1", "file": "svc/pay/a.py", "line": 10, "severity": "high",
          "issue": "docstring contradicts the code", "snippet": "def pay(): ...",
@@ -463,6 +482,12 @@ def test_area_detail_recurring_rule_and_findings(home: Path, monkeypatch) -> Non
     ])
     # The detail applies the same repo-only membership as the areas table.
     _repo_files(monkeypatch, "svc/pay/a.py", "svc/pay/b.py", "svc/pay/c.py")
+    # LF-R11a: a row WITH a snippet is checked against its repo's HEAD. Point
+    # the engine identity at a real temp checkout that holds the quoted line, so
+    # r1 is live — a synthetic path absent from the engine checkout would be
+    # (correctly) hidden as file-missing.
+    head = _head_repo(tmp_path, {"svc/pay/a.py": "def pay(): ...\n"})
+    monkeypatch.setattr(L, "engine_repo_identity", lambda root=None: head)
 
     page = _build(home, {"area": "svc/pay"})
     assert page["errors"] == {}, page["errors"]

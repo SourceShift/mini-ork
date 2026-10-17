@@ -161,6 +161,22 @@ def test_scope_findings_excludes_the_current_run(tmp_path):
     assert cv.scope_findings(["a/b/c.py"], db=db, exclude_run="cur") == []
 
 
+def test_scope_findings_with_stats_reports_the_pre_decay_scan(tmp_path, monkeypatch):
+    """LF-R11a: the companion keeps ``scope_findings``' list shape and reports
+    the pre-decay scan count beside the drop count and the window used."""
+    monkeypatch.delenv("MO_CONTEXT_V2_MAX_AGE_DAYS", raising=False)
+    db = _db(tmp_path, findings=[
+        ("r1", "mini_ork/cli/reflect.py", "high", "reflect drops findings", "2026-10-06"),
+        ("r2", "mini_ork/cli/reflect.py", "medium", "reflect swallows errors", "2026-10-05"),
+    ])
+    rows, stats = cv.scope_findings_with_stats(["mini_ork/cli/reflect.py"], db=db)
+    plain = cv.scope_findings(["mini_ork/cli/reflect.py"], db=db)
+    assert [r["id"] for r in rows] == [r["id"] for r in plain]
+    assert stats["n_findings_scanned"] == 2
+    assert stats["n_findings_stale"] == 0
+    assert stats["max_age_days"] == 30
+
+
 def test_missing_db_or_tables_give_empty_sections(tmp_path):
     assert cv.scope_findings(["a/b.py"], db=str(tmp_path / "nope.db")) == []
     empty = tmp_path / "empty.db"

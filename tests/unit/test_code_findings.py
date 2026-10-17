@@ -632,8 +632,11 @@ def test_harvest_reads_underscore_verifier_file(tmp_path: Path, monkeypatch) -> 
     _write(d / "verifier_static-check.json", json.dumps({
         "verifier": "static-check",
         "pass": False,
-        "failed_checks": ["diff-apply-check-clean"],
-        "checks": [{"name": "diff-apply-check-clean", "expected": "applies cleanly",
+        # LF-R11a gates every harvested note through classify_note, so the
+        # failure text must name a code problem — a receipt-shaped check name
+        # ("diff-apply-check-clean: applies cleanly") is now correctly skipped.
+        "failed_checks": ["total-mismatch"],
+        "checks": [{"name": "total-mismatch", "expected": "the total includes the last element",
                     "pass": False}],
     }))
     stats = code_findings.harvest(str(home), db=str(db))
@@ -663,7 +666,7 @@ def test_harvest_reads_warning_prefixed_verifier_file(tmp_path: Path, monkeypatc
                "verifier": "static-check",
                "pass": False,
                "verdict": "fail",
-               "failed_checks": ["diff-apply-check-clean"],
+               "failed_checks": ["total-mismatch"],
            }))
     stats = code_findings.harvest(str(home), db=str(db))
     assert stats["findings"] == 1
@@ -673,6 +676,33 @@ def test_harvest_reads_warning_prefixed_verifier_file(tmp_path: Path, monkeypatc
     finally:
         con.close()
     assert src == "verifier:static-check"
+
+
+def test_harvest_gates_verifier_process_notes(tmp_path: Path, monkeypatch) -> None:
+    """LF-R11a: the verifier path still stored a delivery complaint (R5 filtered
+    only reviews). A failed verifier whose only reason is a process note must
+    store no row; the same payload with a code complaint stores one."""
+    monkeypatch.setattr(code_findings, "_git_ls_files", lambda *_: None)
+    home = tmp_path / "home"
+    db = _bare_db(tmp_path / "cf.db")
+    note = "pushed to origin/main before the reviewer node ran"
+    assert code_findings.classify_note(note) != "code"
+    _write(_run_dir(home, "procnote") / "verifier-static.json", json.dumps({
+        "pass": False, "reasons": [note],
+    }))
+    real = "mini_ork/widget.py computes the wrong total when the input list is empty"
+    assert code_findings.classify_note(real) == "code"
+    _write(_run_dir(home, "realbug") / "verifier-static.json", json.dumps({
+        "pass": False, "reasons": [real],
+    }))
+    stats = code_findings.harvest(str(home), db=str(db))
+    assert stats["findings"] == 1
+    con = sqlite3.connect(db)
+    try:
+        rows = con.execute("SELECT run_id, issue FROM code_findings").fetchall()
+    finally:
+        con.close()
+    assert rows == [("realbug", real)]
 
 
 def test_harvest_strips_run_target_cwd(tmp_path: Path, monkeypatch) -> None:

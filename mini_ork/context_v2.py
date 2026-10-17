@@ -298,25 +298,103 @@ def _repo_clause(target_repo: str | None, engine: str | None) -> tuple[str, list
 
 def _query_findings(con: sqlite3.Connection, prefix: str, limit: int,
                     exclude_run: str | None, target_repo: str | None = None,
-                    engine: str | None = None) -> list[dict]:
+                    engine: str | None = None,
+                    age_cutoff: int | None = None) -> list[dict]:
     if target_repo and _has_target_repo(con):
         clause, clause_params = _repo_clause(target_repo, engine)
     else:
         clause, clause_params = "", []
     where = "file LIKE ? ESCAPE '\\' AND (? = '' OR run_id != ?)"
+    params: list = [_like_escape(prefix) + "%", exclude_run or "", exclude_run or ""]
     if clause:
         where += " AND " + clause
+        params += clause_params
+    if age_cutoff is not None:
+        # LF-R11a: the max-age window is a SQL predicate, not a Python pass over
+        # an already-limited page — otherwise an old crowd would fill the LIMIT
+        # and hide the fresh rows the run should see.
+        where += " AND ts >= ?"
+        params.append(int(age_cutoff))
     rows = con.execute(
         f"""
-        SELECT id, fingerprint, run_id, file, line, severity, category, issue, ts
+        SELECT id, fingerprint, run_id, file, line, severity, category, issue,
+               snippet, ts
         FROM code_findings
         WHERE {where}
         ORDER BY ts DESC LIMIT ?
         """,
-        [_like_escape(prefix) + "%", exclude_run or "", exclude_run or ""]
-        + clause_params + [int(limit)],
+        params + [int(limit)],
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def _sort_newest(rows, limit: int) -> list[dict]:
+    return sorted(rows, key=lambda r: str(r.get("ts") or ""), reverse=True)[:limit]
+
+
+def scope_findings_with_stats(paths: list[str], *, db: str | None = None,
+                              limit: int = 300, exclude_run: str | None = None,
+                              target_repo: str | None = None) -> tuple[list[dict], dict]:
+    """``scope_findings`` plus the decay counts (LF-R11a).
+
+    Returns ``(fresh_rows, stats)`` where ``stats`` carries
+    ``n_findings_scanned`` (the pre-decay count), ``n_findings_stale`` (rows the
+    age window or the HEAD check dropped) and ``max_age_days``. The scan count
+    is taken from the same predicate applied without the age term, so the two
+    counts can never contradict each other.
+    """
+    max_age = code_findings.max_age_days_from_env()
+    stats = {"n_findings_scanned": 0, "n_findings_stale": 0,
+             "max_age_days": max_age}
+    con = _connect_ro(db)
+    if con is None:
+        return [], stats
+    engine = engine_identity()
+    # Staleness reads the target repo's HEAD: the explicit identity when given,
+    # else MO_TARGET_CWD's identity, else the engine checkout (R12's rule).
+    repo_root = resolve_target_repo(target_repo)
+    age_cutoff = int(time.time()) - max_age * 86400 if max_age > 0 else None
+    try:
+        # Phase 1 — the pre-decay scan. It also fixes the prefix/fallback choice
+        # for each scope path, so both phases read exactly the same path set.
+        scanned: dict[int, dict] = {}
+        prefixes: list[str] = []
+        for raw in paths:
+            prefix = _strip_glob(raw)
+            if not prefix:
+                continue
+            rows = _query_findings(con, prefix, limit, exclude_run, target_repo,
+                                   engine)
+            if not rows and "." in os.path.basename(prefix):
+                parent = os.path.dirname(prefix)
+                if parent.count("/") >= 2:
+                    prefix = parent + "/"
+                    rows = _query_findings(con, prefix, limit, exclude_run,
+                                           target_repo, engine)
+            prefixes.append(prefix)
+            for r in rows:
+                scanned.setdefault(r["id"], r)
+        stats["n_findings_scanned"] = len(_sort_newest(scanned.values(), limit))
+
+        # Phase 2 — the same prefixes with the age window pushed into SQL.
+        survivors: dict[int, dict] = {}
+        for prefix in prefixes:
+            for r in _query_findings(con, prefix, limit, exclude_run, target_repo,
+                                     engine, age_cutoff):
+                survivors.setdefault(r["id"], r)
+
+        annotated = code_findings.annotate_staleness(
+            _sort_newest(survivors.values(), limit),
+            repo_root=repo_root, max_age_days=max_age,
+        )
+        fresh = [r for r in annotated if not r.get("stale")]
+        stats["n_findings_stale"] = max(
+            0, stats["n_findings_scanned"] - len(fresh))
+        return fresh, stats
+    except sqlite3.Error:
+        return [], stats
+    finally:
+        con.close()
 
 
 def scope_findings(paths: list[str], *, db: str | None = None, limit: int = 300,
@@ -332,30 +410,15 @@ def scope_findings(paths: list[str], *, db: str | None = None, limit: int = 300,
     (LF-R12 §4), so a sibling repo's findings can never leak in through the
     fallback. ``target_repo=None`` reads unscoped, preserving the legacy call
     shape; ``build`` always passes a resolved identity.
+
+    LF-R11a: rows older than ``MO_CONTEXT_V2_MAX_AGE_DAYS`` (default 30) and
+    rows whose ``snippet`` no longer occurs at the target repo's HEAD are
+    dropped at read time. ``scope_findings_with_stats`` reports the counts;
+    this signature and return type are unchanged for every other caller.
     """
-    con = _connect_ro(db)
-    if con is None:
-        return []
-    engine = engine_identity()
-    out: dict[int, dict] = {}
-    try:
-        for raw in paths:
-            prefix = _strip_glob(raw)
-            if not prefix:
-                continue
-            rows = _query_findings(con, prefix, limit, exclude_run, target_repo, engine)
-            if not rows and "." in os.path.basename(prefix):
-                parent = os.path.dirname(prefix)
-                if parent.count("/") >= 2:
-                    rows = _query_findings(con, parent + "/", limit, exclude_run,
-                                           target_repo, engine)
-            for r in rows:
-                out.setdefault(r["id"], r)
-    except sqlite3.Error:
-        return []
-    finally:
-        con.close()
-    return sorted(out.values(), key=lambda r: str(r.get("ts") or ""), reverse=True)[:limit]
+    return scope_findings_with_stats(paths, db=db, limit=limit,
+                                     exclude_run=exclude_run,
+                                     target_repo=target_repo)[0]
 
 
 def run_findings(run_id: str, *, db: str | None = None) -> list[dict]:
@@ -653,8 +716,8 @@ def build(kickoff_path: str, *, task_class: str = "", db: str | None = None,
     else:
         scope_source = "none"
     target_repo = resolve_target_repo(target_repo)
-    findings = scope_findings(scope, db=db, exclude_run=run_id,
-                              target_repo=target_repo)
+    findings, finding_stats = scope_findings_with_stats(
+        scope, db=db, exclude_run=run_id, target_repo=target_repo)
     floor = min_severity()
     clusters = [c for c in cluster(findings)
                 if _SEVERITY_RANK.get(str(c["worst_severity"]).lower(), 0) >= floor]
@@ -683,7 +746,11 @@ def build(kickoff_path: str, *, task_class: str = "", db: str | None = None,
         # R13 reads this marker to tell a run whose pack was built with the
         # once-only theme wiring from one that predates it (``v2_legacy``).
         "themes_once": True,
-        "n_findings_scanned": len(findings),
+        # LF-R11a: the scan count stays the PRE-decay count, beside how many
+        # rows the age window and the HEAD check dropped and the window used.
+        "n_findings_scanned": finding_stats["n_findings_scanned"],
+        "n_findings_stale": finding_stats["n_findings_stale"],
+        "max_age_days": finding_stats["max_age_days"],
         # Selection provenance, beside the count it explains: which reader
         # supplied the paths and the resolved list. Never edit authority.
         "scope_source": scope_source,

@@ -54,6 +54,7 @@ from mini_ork.learning.code_findings import (
     _dir_prefix,
     _in_repo,
     _run_title,
+    annotate_staleness,
     areas,
     engine_repo_identity,
 )
@@ -342,7 +343,7 @@ def _areas_table(home: Path, args: dict[str, str]) -> dict[str, Any]:
 
 
 def _select_findings(conn, where: str, params: list, cutoff: int,
-                     join: bool) -> list[dict[str, Any]]:
+                     join: bool, with_target_repo: bool = False) -> list[dict[str, Any]]:
     """One SELECT over ``code_findings`` with the ``file`` predicate and the
     ``ts`` cutoff pushed into SQL, ahead of any limit.
 
@@ -360,17 +361,18 @@ def _select_findings(conn, where: str, params: list, cutoff: int,
     ``task_runs`` row, and every pre-existing key is untouched.
     """
     tr_cols = ", tr.kickoff_path, tr.status" if join else ""
+    repo_col = ", f.target_repo" if with_target_repo else ""
     join_sql = " LEFT JOIN task_runs tr ON tr.id = f.run_id" if join else ""
     sql = (
         "SELECT f.run_id, f.source, f.file, f.line, f.severity, f.category, "
-        "f.issue, f.snippet, f.verdict, f.ts" + tr_cols + " "
+        "f.issue, f.snippet, f.verdict, f.ts" + repo_col + tr_cols + " "
         "FROM code_findings f" + join_sql + " "
         f"WHERE {where} AND f.ts >= ? ORDER BY f.ts DESC"
     )
     out: list[dict[str, Any]] = []
     for r in conn.rows(sql, list(params) + [cutoff]):
         kick = r.get("kickoff_path") if join else None
-        out.append({
+        row = {
             "run_id": r["run_id"],
             "run_title": _run_title(kick, r["run_id"]),
             "run_status": r["status"] if join else None,
@@ -384,7 +386,12 @@ def _select_findings(conn, where: str, params: list, cutoff: int,
             "snippet": r["snippet"],
             "verdict": r["verdict"],
             "ts": r["ts"],
-        })
+        }
+        if with_target_repo:
+            # LF-R11a: staleness is checked against each row's OWN repo, so the
+            # identity travels with the row instead of being assumed.
+            row["target_repo"] = r.get("target_repo")
+        out.append(row)
     return out
 
 
@@ -418,12 +425,30 @@ def _has_target_repo(conn) -> bool:
 def _window_findings(db: str, *, since_days: int, repo_only: bool = True,
                      repo_root: str | None = None,
                      target_repo: str | None = None) -> list[dict[str, Any]]:
-    """Every finding in the ``since_days`` window, newest first — the one set the
-    areas table partitions and the detail filters.
+    """Every *live* finding in the ``since_days`` window, newest first — the one
+    set the areas table partitions and the detail filters.
+
+    LF-R11a: rows whose ``snippet`` no longer occurs at their own repo's HEAD
+    are excluded here (age is already bounded by the ``days`` window). The
+    stale rows are not deleted; ``_window_findings_with_stats`` exposes them so
+    a section can report how many were hidden. The rest of this contract is
+    unchanged: see that function.
+    """
+    return _window_findings_with_stats(
+        db, since_days=since_days, repo_only=repo_only, repo_root=repo_root,
+        target_repo=target_repo)[0]
+
+
+def _window_findings_with_stats(db: str, *, since_days: int,
+                                repo_only: bool = True,
+                                repo_root: str | None = None,
+                                target_repo: str | None = None
+                                ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """``(fresh_rows, stale_rows)`` for the window.
 
     The window (``int(time.time()) - days*86400``) and the ``_in_repo`` filter are
     the exact ones ``areas()`` applies (kickoff #4; reviewer, round 1), so the
-    groups that table renders partition *this* set and their counts sum to it
+    groups that table renders partition this set and their counts sum to it
     (reviewer, round 2).
 
     LF-R12 §5: ``target_repo`` is the tab's repo identity. Only rows whose
@@ -435,6 +460,11 @@ def _window_findings(db: str, *, since_days: int, repo_only: bool = True,
     the engine identity; an unresolvable identity keeps only NULL rows, so the
     tab fails closed rather than showing every repo's findings.
 
+    Staleness runs AFTER the full windowed set is materialized (never inside a
+    capped slice), grouped by each row's recorded ``target_repo``; NULL rows use
+    the engine identity. ``max_age_days=0`` because the days window already
+    bounds age — this hides snippet staleness only.
+
     Read-only throughout: ``StateDB`` opens with ``query_only=ON``, the page's own
     convention (see ``_harvest_summary``).
     """
@@ -444,12 +474,13 @@ def _window_findings(db: str, *, since_days: int, repo_only: bool = True,
     try:
         conn = StateDB(Path(db))
     except (FileNotFoundError, OSError):
-        return []
+        return [], []
     if not conn.has_table("code_findings"):
-        return []
+        return [], []
     join = conn.has_table("task_runs")
+    with_repo = _has_target_repo(conn)
     where, params = "f.file IS NOT NULL", []
-    if _has_target_repo(conn):
+    if with_repo:
         if target_repo is None:
             target_repo = engine_repo_identity()
         if not target_repo:
@@ -462,12 +493,52 @@ def _window_findings(db: str, *, since_days: int, repo_only: bool = True,
         else:
             where += " AND f.target_repo = ?"
             params.append(target_repo)
-    fs = _select_findings(conn, where, params, cutoff, join)
+    fs = _select_findings(conn, where, params, cutoff, join,
+                          with_target_repo=with_repo)
     if repo_only and fs:
         keep = _in_repo({str(f["file"]) for f in fs if f.get("file")}, repo_root)
         fs = [f for f in fs if f.get("file") in keep]
-    fs.sort(key=lambda f: int(f.get("ts") or 0), reverse=True)
-    return fs
+    return _split_stale(fs, repo_root=repo_root, target_repo=target_repo)
+
+
+def _window_stale(db: str, *, since_days: int, repo_only: bool = True,
+                  repo_root: str | None = None,
+                  target_repo: str | None = None) -> list[dict[str, Any]]:
+    """The stale half of ``_window_findings_with_stats`` — hidden, never deleted."""
+    return _window_findings_with_stats(
+        db, since_days=since_days, repo_only=repo_only, repo_root=repo_root,
+        target_repo=target_repo)[1]
+
+
+def _split_stale(fs: list[dict[str, Any]], *, repo_root: str | None = None,
+                 target_repo: str | None = None
+                 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Partition ``fs`` into ``(fresh, stale)`` via ``annotate_staleness``.
+
+    Rows are grouped by the ``target_repo`` they were harvested under — the R12
+    identity of the repo the run actually targeted — so a finding is never
+    judged stale against the engine checkout's HEAD. A row with no identity
+    (legacy/engine-local) uses the engine's identity, then the caller's
+    ``target_repo``/``repo_root`` as last resorts.
+    """
+    if not fs:
+        return [], []
+    engine = engine_repo_identity()
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for f in fs:
+        root = (f.get("target_repo") if isinstance(f, dict) else None) \
+            or engine or target_repo or repo_root or ""
+        groups.setdefault(str(root), []).append(f)
+    now = int(time.time())
+    fresh: list[dict[str, Any]] = []
+    stale: list[dict[str, Any]] = []
+    for root, group in groups.items():
+        for row in annotate_staleness(group, repo_root=root, now=now,
+                                      max_age_days=0):
+            (stale if row.get("stale") else fresh).append(row)
+    fresh.sort(key=lambda f: int(f.get("ts") or 0), reverse=True)
+    stale.sort(key=lambda f: int(f.get("ts") or 0), reverse=True)
+    return fresh, stale
 
 
 def _membership(all_fs: list[dict[str, Any]], area: str) -> list[dict[str, Any]]:
@@ -519,6 +590,12 @@ def _area_detail(home: Path, args: dict[str, str], area: str) -> list[dict[str, 
     date = time.strftime("%Y-%m-%d", time.localtime(last)) if last else "—"
     lines = [f"{len(fs)} findings in {n_runs} run{'' if n_runs == 1 else 's'}, "
              f"worst {worst}, last {date}", "", "**Recurring problems**"]
+    # LF-R11a: stale rows are hidden, never deleted — say how many, so the
+    # operator can tell "quiet because fixed" from "quiet because hidden".
+    n_hidden = len(_membership(
+        _window_stale(db, since_days=_days(args)), area))
+    if n_hidden:
+        lines.insert(1, f"{n_hidden} finding(s) hidden as stale at HEAD")
     if clusters:
         for c in clusters:
             files = ", ".join(short(f, 60) for f in c["files"]) or "—"

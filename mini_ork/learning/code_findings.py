@@ -883,6 +883,218 @@ def normalize_file(file, *, repo_root=None, known_paths=None, target_cwd=None):
     return f
 
 
+# ── staleness at HEAD (LF-R11a) ─────────────────────────────────────────────
+# A finding outlives the code it quoted. Two read-time decays: a max-age window
+# (``MO_CONTEXT_V2_MAX_AGE_DAYS``, default 30) and a HEAD check — a row whose
+# ``snippet`` no longer occurs in its file is either fixed or written against a
+# file that moved on. Nothing is deleted and no schema is added: ``snippet``
+# already holds the quoted line (R5), so staleness is computed on read.
+
+_MAX_AGE_DEFAULT = 30
+_MAX_AGE_WARNED = False
+
+
+def normalize_for_match(text) -> str:
+    """Whitespace-normalized text: ``" ".join(str(text).split())``.
+
+    A re-indented or re-wrapped line still matches the snippet the reviewer
+    quoted.
+    """
+    return " ".join(str(text).split())
+
+
+def _epoch_seconds(value):
+    """A ``ts`` value as epoch seconds, or None when it is not numeric.
+
+    Real rows store an INTEGER, but legacy fixtures (and pre-0064 databases)
+    can carry ISO date strings; those are not comparable to ``now`` and must
+    not be read as a tiny epoch ("2026-10-05" → 2026). None means "no age
+    verdict", never "very old".
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+def file_texts_at_head(repo_root, paths) -> dict:
+    """``{path: HEAD text | None}`` for ``paths`` under ``repo_root``.
+
+    One ``git -C repo_root cat-file --batch`` call fed ``HEAD:<path>`` for
+    every path, parsing the size-prefixed batch stream. A path that is not at
+    HEAD (untracked, or added after the last commit) falls back to the file on
+    disk; a path that exists in neither maps to ``None``. Any git/subprocess
+    failure — including a ``repo_root`` that is not a checkout — returns ``{}``:
+    callers then treat every row as fresh, because a broken probe must never
+    hide history.
+    """
+    unique: list[str] = []
+    seen: set[str] = set()
+    for p in paths or []:
+        if p is None:
+            continue
+        s = str(p)
+        if s not in seen:
+            seen.add(s)
+            unique.append(s)
+    if not unique:
+        return {}
+    root = str(repo_root or "")
+    if not root:
+        return {}
+    try:
+        proc = subprocess.run(
+            ["git", "-C", root, "cat-file", "--batch"],
+            input="".join(f"HEAD:{p}\n" for p in unique).encode("utf-8"),
+            capture_output=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    data = proc.stdout or b""
+    out: dict[str, str | None] = {}
+    pos = 0
+    for p in unique:
+        nl = data.find(b"\n", pos)
+        if nl < 0:
+            return {}
+        parts = data[pos:nl].split()
+        pos = nl + 1
+        if not parts:
+            return {}
+        if parts[-1] == b"missing":
+            # Not at HEAD: read the worktree file (untracked paths), or None.
+            try:
+                with open(os.path.join(root, p), "r", encoding="utf-8",
+                          errors="replace") as fh:
+                    out[p] = fh.read()
+            except OSError:
+                out[p] = None
+            continue
+        try:
+            size = int(parts[-1])
+        except ValueError:
+            return {}
+        body = data[pos:pos + size]
+        if len(body) < size:
+            return {}
+        pos += size
+        if data[pos:pos + 1] == b"\n":
+            pos += 1
+        out[p] = body.decode("utf-8", errors="replace")
+    return out
+
+
+def stale_reason(row, *, repo_root=None, file_texts=None, now=None,
+                 max_age_days=_MAX_AGE_DEFAULT):
+    """Why ``row`` is stale — ``"age"``, ``"file-missing"``, ``"snippet-absent"``
+    — or None when it is still live.
+
+    Order: age (``max_age_days > 0`` and ``now - ts`` exceeds it) → no ``file``
+    → no ``snippet`` (age-only: 1,282 of 1,669 live rows carry no snippet, and
+    inventing a verdict for them would be worse than the decay) → file missing
+    at HEAD → snippet not a whitespace-normalized substring of the HEAD text.
+
+    ``file_texts=None`` probes HEAD for this row alone; ``{}`` (or a path
+    absent from a non-empty map) means the probe could not decide, so the row
+    is fresh.
+    """
+    if now is None:
+        now = int(time.time())
+    if max_age_days and max_age_days > 0:
+        ts = _epoch_seconds(row.get("ts"))
+        if ts is not None and now - ts > int(max_age_days) * 86400:
+            return "age"
+    file = row.get("file")
+    if not file:
+        return None
+    snippet = row.get("snippet")
+    if not snippet:
+        return None
+    if file_texts is None:
+        file_texts = file_texts_at_head(repo_root, [file]) if repo_root else {}
+    if file not in file_texts:
+        return None
+    text = file_texts[file]
+    if text is None:
+        return "file-missing"
+    if normalize_for_match(snippet) not in normalize_for_match(text):
+        return "snippet-absent"
+    return None
+
+
+def annotate_staleness(rows, *, repo_root, now=None, max_age_days=_MAX_AGE_DEFAULT,
+                       environ=None) -> list[dict]:
+    """Copy ``rows`` and add ``stale`` / ``stale_reason`` to each.
+
+    One ``file_texts_at_head`` call covers the rows' distinct ``file`` values.
+    ``MO_FINDINGS_STALENESS=0`` disables only the HEAD half (age still applies)
+    and skips the probe entirely.
+    """
+    rows = list(rows or [])
+    if not rows:
+        return []
+    if now is None:
+        now = int(time.time())
+    env = os.environ if environ is None else environ
+    staleness_on = str(env.get("MO_FINDINGS_STALENESS", "")).strip().lower() \
+        not in {"0", "false", "no", "off"}
+    files: list[str] = []
+    seen: set[str] = set()
+    if staleness_on:
+        for r in rows:
+            f = r.get("file")
+            if f and str(f) not in seen:
+                seen.add(str(f))
+                files.append(str(f))
+    file_texts = file_texts_at_head(repo_root, files) if files else {}
+    out: list[dict] = []
+    for r in rows:
+        annotated = dict(r)
+        reason = stale_reason(annotated, repo_root=repo_root,
+                              file_texts=file_texts, now=now,
+                              max_age_days=max_age_days)
+        annotated["stale"] = reason is not None
+        annotated["stale_reason"] = reason
+        out.append(annotated)
+    return out
+
+
+def max_age_days_from_env(environ=None) -> int:
+    """``MO_CONTEXT_V2_MAX_AGE_DAYS`` → days; 30 when unset/empty.
+
+    ``0`` disables the window. A negative or non-integer value is a warning
+    (once per process, on stderr) and the 30-day default — never a silent 0.
+    """
+    global _MAX_AGE_WARNED
+    env = os.environ if environ is None else environ
+    raw = env.get("MO_CONTEXT_V2_MAX_AGE_DAYS")
+    if raw is None or str(raw).strip() == "":
+        return _MAX_AGE_DEFAULT
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        value = None
+    if value is None or value < 0:
+        if not _MAX_AGE_WARNED:
+            _MAX_AGE_WARNED = True
+            print(
+                f"  [code_findings] MO_CONTEXT_V2_MAX_AGE_DAYS={raw!r} is not a "
+                f"non-negative integer; using {_MAX_AGE_DEFAULT} days",
+                file=sys.stderr,
+            )
+        return _MAX_AGE_DEFAULT
+    return value
+
+
 # ── DB plumbing (mirrors ledger.py) ───────────────────────────────────────────
 
 
@@ -1119,6 +1331,14 @@ def _harvest_run(con, run_id, run_dir, repo_root):
             skipped += 1
         is_review = source.startswith("review:")
         for finding in findings:
+            # LF-R11a: the review path already filters through classify_note;
+            # the verifier path did not, so a failed verifier whose only note is
+            # a delivery complaint ("pushed to origin/main before the reviewer
+            # node ran") was still stored. Gate every source centrally, BEFORE
+            # ``seen_review`` bookkeeping, so a skipped note can never shadow a
+            # later real finding with the same (file, line, issue) key.
+            if classify_note(finding["issue"]) != "code":
+                continue
             file = normalize_file(finding["file"], repo_root=repo_root,
                                   known_paths=paths, target_cwd=target_cwd)
             if is_review:
