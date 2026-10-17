@@ -306,8 +306,14 @@ def _time_columns(steps: list[dict[str, Any]]) -> list[list[str]]:
     return cols
 
 
-def _attribute_calls(nodes: dict[str, Node], calls: list[dict[str, Any]], now: int) -> None:
-    """Give each llm_call to the node whose role lane and time window match."""
+def _match_calls(nodes: dict[str, Node], calls: list[dict[str, Any]], now: int
+                 ) -> list[tuple[Node, dict[str, Any]]]:
+    """Pair each llm_call with the node whose role lane and time window match.
+
+    The one attribution rule, shared by the cost/call counters and by the
+    roster's fallback read — so a node's family cell and its fallback note can
+    never disagree about which calls belong to it.
+    """
     # Index nodes by role_lane once — without it every call walked all N nodes,
     # turning a long run into O(N·M) when callers typically have hundreds of calls.
     nodes_by_lane_started: dict[str, list[Node]] = {}
@@ -318,6 +324,7 @@ def _attribute_calls(nodes: dict[str, Node], calls: list[dict[str, Any]], now: i
                 nodes_by_lane_started.setdefault(node.role_lane, []).append(node)
             else:
                 nodes_by_lane_idle.setdefault(node.role_lane, []).append(node)
+    matched: list[tuple[Node, dict[str, Any]]] = []
     for call in calls:
         actor = str(call.get("actor") or "")
         ts_raw = _epoch(call.get("ts"))
@@ -341,6 +348,13 @@ def _attribute_calls(nodes: dict[str, Node], calls: list[dict[str, Any]], now: i
                 best = idle[0]
         if best is None:
             continue
+        matched.append((best, call))
+    return matched
+
+
+def _attribute_calls(nodes: dict[str, Node], calls: list[dict[str, Any]], now: int) -> None:
+    """Give each llm_call to the node whose role lane and time window match."""
+    for best, call in _match_calls(nodes, calls, now):
         best.cost += float(call.get("cost_usd") or 0.0)
         best.calls += 1
         model = str(call.get("model_id") or "")
@@ -1722,8 +1736,9 @@ def _dag_tab(run: Run, wanted: str | None, *, select: bool = False,
                 + S.guarded(errors, "Verifiers", verifiers))
 
     # Level 1: the DAG section stays first (the IDE draws it as the page's
-    # strip, and a test pins `sections[0]`); roster and totals follow so the
-    # page still answers "what ran, on what, for how much".
+    # strip, and a test pins `sections[0]`); totals follow so the page still
+    # answers "for how much". The roster lives on Agents only — one table,
+    # one place, instead of the same rows drawn on two tabs.
     def totals() -> dict[str, Any]:
         counts: dict[str, int] = {}
         for n in run.nodes:
@@ -1764,7 +1779,6 @@ def _dag_tab(run: Run, wanted: str | None, *, select: bool = False,
                            lines, items, full=True)
 
     return (S.guarded(errors, "DAG", build_dag)
-            + S.guarded(errors, "Roster", lambda: _roster_section(run))
             + S.guarded(errors, "Totals", totals)
             + S.guarded(errors, "Inspector", build_inspector)
             + S.guarded(errors, "Coalition", build_coalition))
@@ -2175,23 +2189,70 @@ def _kickoff_tab(run: Run, *, code_presentation: bool = False) -> list[dict[str,
     return S.guarded(errors, "Kickoff", build)
 
 
+_ROSTER_NOTE = "Where the money went inside the run. Click a row to inspect the node."
+
+
+def _fallback_facts(calls: list[dict[str, Any]]) -> tuple[list[str], int, str]:
+    """Models in time order, plus the failed-before-success story, for one node.
+
+    A fallback is a node the executor served from more than one model: the
+    roster names the first and the last, and the note names the sequence. The
+    story is only told when a non-success call precedes a success — a failure
+    *after* the success is a fallback, but not a "failed call, then …".
+    """
+    ordered = sorted(calls, key=lambda c: _epoch(c.get("ts")) or 0)
+    models: list[str] = []
+    for call in ordered:
+        model = str(call.get("model_id") or "")
+        if model and model not in models:
+            models.append(model)
+    failed = 0
+    failed_then = ""
+    for call in ordered:
+        if str(call.get("status") or "") == "success":
+            if failed:
+                failed_then = str(call.get("model_id") or "")
+                break
+        else:
+            failed += 1
+    return models, failed, failed_then
+
+
+def _calls_by_node(run: Run) -> dict[str, list[dict[str, Any]]]:
+    """The run's calls grouped by the node the shared attribution rule gives them to."""
+    out: dict[str, list[dict[str, Any]]] = {}
+    for node, call in _match_calls({n.id: n for n in run.nodes}, run.calls, int(time.time())):
+        out.setdefault(node.id, []).append(call)
+    return out
+
+
 def _roster_section(run: Run, *, tokens: bool = False) -> dict[str, Any]:
     """Every node of the run as one table: what it ran on, its state and cost.
 
-    Shared by the Graph tab's run-level panel and the Agents tab, so the two
-    cannot report different numbers for the same node. ``tokens`` adds the
-    tokens column — the v2 Agents tab asks for it, the level-1 roster does not,
-    so its payload stays byte-identical.
+    The single roster builder — the Agents tab draws it. ``tokens`` adds the
+    tokens column — the v2 Agents tab asks for it, the level-1 payload does not,
+    so its shape stays byte-identical.
+
+    A node whose attributed calls carry more than one ``model_id`` fell back
+    mid-node: its family cell reads ``first → last``, it gains a ``⇄`` marker
+    cell and a ``fallback`` list on the row, and the section note names the
+    sequence. Zero- and one-model nodes render exactly as before.
     """
     from mini_ork.ide_pages.node import _node_tokens  # lazy: node.py imports this module
 
-    rows = []
+    by_node = _calls_by_node(run)
+    rows: list[dict[str, Any]] = []
+    fallback_lists: list[list[str] | None] = []
+    fell_back: list[tuple[str, str, int, str]] = []
     for n in run.nodes:
         verdict, vc = _verdict(run, n)
         ran = n.state not in ("pending", "skipped")
+        models, failed, failed_then = _fallback_facts(by_node.get(n.id, []))
+        fallback = models if len(models) > 1 else None
+        family = f"{models[0]} → {models[-1]}" if fallback else n.family
         cells = [
             S.cell(n.id, "text", b=True),
-            S.cell(n.family, f"fam:{n.family}"),
+            S.cell(family, f"fam:{models[-1]}" if fallback else f"fam:{n.family}"),
             S.cell(_STATE_TEXT.get(n.state, n.state), _STATE_COLOUR.get(n.state, "sub")),
             S.cell(verdict, vc),
             S.mono(S.money(n.cost) if ran else "—"),
@@ -2201,8 +2262,12 @@ def _roster_section(run: Run, *, tokens: bool = False) -> dict[str, Any]:
             cells.append(S.mono(f"{counted:,}" if counted is not None else "—"))
         cells.extend([S.mono(_wall(n) if ran else "—"),
                       S.muted(", ".join(n.gates) or "—")])
+        if fallback:
+            cells.append(S.muted("⇄"))
+            fell_back.append((n.id, f"{models[0]} → {models[-1]}", failed, failed_then))
         rows.append({"cells": cells,
                      "do": S.page_link("run", "dag", run=run.id, node=n.id)})
+        fallback_lists.append(fallback)
     head = ["node", "family", "status", "verdict", "cost"]
     widths = [S.col(150), S.col(90), S.col(80), S.col(90), S.col(64)]
     if tokens:
@@ -2212,8 +2277,25 @@ def _roster_section(run: Run, *, tokens: bool = False) -> dict[str, Any]:
     widths.extend([S.col(64), S.col(fr=1, min=140)])
     if not rows:
         rows = [[S.muted("No nodes recorded")] + ["" for _ in head[1:]]]
-    return S.table("Agent roster", widths, head, rows,
-                   full=True, note="Where the money went inside the run. Click a row to inspect the node.")
+    note = _ROSTER_NOTE
+    if fell_back:
+        details = []
+        for node_id, sequence, failed, failed_then in fell_back:
+            detail = f"{node_id}: {sequence}"
+            if failed and failed_then:
+                detail += (f"; {failed} failed call{'s' if failed != 1 else ''}, "
+                           f"then {failed_then}")
+            details.append(detail)
+        count = len(fell_back)
+        note += (f" {count} node{'s' if count != 1 else ''} fell back "
+                 f"{', '.join(f'({d})' for d in details)}.")
+    section = S.table("Agent roster", widths, head, rows, full=True, note=note)
+    # ``S.table`` keeps only the known row keys; the IDE's row badge rides
+    # ``fallback`` beside the cells, so attach it to the emitted rows.
+    for row, fallback in zip(section["rows"], fallback_lists):
+        if fallback:
+            row["fallback"] = fallback
+    return section
 
 
 def _agents_tab(run: Run) -> list[dict[str, Any]]:
