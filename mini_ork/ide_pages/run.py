@@ -2800,6 +2800,64 @@ _ARTIFACT_HEAD = ["file", "kind", "size", "from"]
 # run folder" row whose ``do`` reveals the run directory.
 _ARTIFACT_ROW_CAP = 200
 
+# The row-level ``kind`` is the file's extension, and this one rule feeds the
+# row key, the intra-table order and the count sub alike. It is deliberately
+# NOT the visible "kind" column: ``board_cmd._artifact_group`` fills that with a
+# semantic group (Diffs, Results, Logs…), and unifying the two would change the
+# column every level-1 table already draws.
+_ARTIFACT_KINDS = ("patch", "json", "log", "jsonl", "md", "other")
+_ARTIFACT_KIND_BY_SUFFIX = {
+    ".diff": "patch", ".patch": "patch",
+    ".json": "json", ".log": "log", ".jsonl": "jsonl", ".md": "md",
+}
+
+
+def _artifact_kind(name: str) -> str:
+    """The row-level kind, from the file name's extension.
+
+    A directory label ("evidence/") has no extension and is ``other`` — the
+    honest answer, since it is not one of the five file kinds.
+    """
+    return _ARTIFACT_KIND_BY_SUFFIX.get(Path(name.rstrip("/")).suffix.lower(), "other")
+
+
+def _artifact_kind_rank(name: str) -> int:
+    """Sort key for one bucket: ``patch → json → log → jsonl → md → other``.
+
+    Only the rank is returned, so Python's stable sort keeps the incoming
+    (``_artifacts`` path) order inside a kind.
+    """
+    return _ARTIFACT_KINDS.index(_artifact_kind(name))
+
+
+def _artifact_kind_sub(labels: list[str]) -> str:
+    """``2 json · 1 log · 1 patch`` for a table, or ``""`` when there is nothing
+    to summarise (fewer than two file rows).
+
+    Counts come from the same :func:`_artifact_kind` as the rows and the sort.
+    """
+    if len(labels) < 2:
+        return ""
+    counts = dict.fromkeys(_ARTIFACT_KINDS, 0)
+    for label in labels:
+        counts[_artifact_kind(label)] += 1
+    return " · ".join(f"{counts[kind]} {kind}"
+                      for kind in _ARTIFACT_KINDS if counts[kind])
+
+
+def _attach_row_kinds(section: dict[str, Any], labels: list[str]) -> dict[str, Any]:
+    """Re-attach the row-level ``kind`` after ``S.table`` rebuilt the rows.
+
+    ``spec.table`` keeps only ``cells``/``do``/``sel``/``acts`` on each row
+    (spec.py is out of scope here), so a ``kind`` set on the dict handed to it
+    is silently dropped. Attaching after the rebuild is what makes the key
+    reach the rendered page JSON. ``labels`` is parallel to the table's file
+    rows; the caller never passes a collapse or placeholder row.
+    """
+    for row, label in zip(section.get("rows") or [], labels):
+        row["kind"] = _artifact_kind(label)
+    return section
+
 # The kickoff's "Key artifacts" slots, in the order the tab must show them. The
 # diff is ONE slot whose first alternative wins; ``evidence`` is a directory.
 _KEY_ARTIFACTS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -2838,27 +2896,33 @@ def _key_artifacts(run: Run) -> list[tuple[str, Path]]:
 
 
 def _key_artifacts_section(run: Run) -> dict[str, Any]:
-    """The tab's first section: the handful of files a reviewer opens first."""
+    """The tab's first section: the handful of files a reviewer opens first.
+
+    Order and styling stay as they were; each file row additionally carries
+    the row-level ``kind`` (re-attached after ``S.table`` rebuilds the rows).
+    """
     from mini_ork.cli.board_cmd import _artifact_group
 
+    keys = _key_artifacts(run)
     rows: list[dict[str, Any]] = []
-    for label, path in _key_artifacts(run):
+    for label, path in keys:
         do = S.reveal(str(path)) if path.is_dir() else S.open_path(str(path))
         rows.append({"cells": [S.mono(label), S.cell(_artifact_group(label).lower()),
                                S.mono(_artifact_size(path)), S.muted("")],
-                     "do": do})
+                     "do": do, "kind": _artifact_kind(label)})
     if not rows:
         rows = [{"cells": [S.muted("No key artifacts yet"), "", "", ""]}]
-    return S.table("Key artifacts", _ARTIFACT_COLS, _ARTIFACT_HEAD, rows, full=True,
-                   note="The files a reviewer opens first — the diff, the verdicts, "
-                        "the rubric, the evidence and the run's log.")
+    section = S.table("Key artifacts", _ARTIFACT_COLS, _ARTIFACT_HEAD, rows, full=True,
+                      note="The files a reviewer opens first — the diff, the verdicts, "
+                           "the rubric, the evidence and the run's log.")
+    return _attach_row_kinds(section, [label for label, _ in keys])
 
 
 def _artifact_row(a: dict[str, Any], ids: set[str]) -> dict[str, Any]:
     """One file row, in the flat table's own columns."""
     return {"cells": [S.mono(a["path"]), S.cell(a["group"].lower()),
                       S.mono(_human(a["size"])), S.muted(_from(a["path"], ids))],
-            "do": S.open_path(a["abs"])}
+            "do": S.open_path(a["abs"]), "kind": _artifact_kind(a["path"])}
 
 
 def _artifact_file_sections(run: Run) -> list[dict[str, Any]]:
@@ -2866,6 +2930,8 @@ def _artifact_file_sections(run: Run) -> list[dict[str, Any]]:
 
     Attribution is the flat table's own :func:`_from` (``impl-<node>``,
     ``review-<node>``, …); a file that belongs to no node lands in "Run files".
+    Each bucket is ordered by the one :func:`_artifact_kind` rule, and a table
+    with two or more file rows gains a kind-count ``sub`` from the same rule.
     """
     from mini_ork.cli.board_cmd import _artifacts
 
@@ -2883,17 +2949,23 @@ def _artifact_file_sections(run: Run) -> list[dict[str, Any]]:
     ordered = [(f"From {n.id}", buckets[n.id]) for n in run.nodes if buckets[n.id]]
     ordered.append(("Run files", run_level))
 
-    rendered: list[tuple[str, list[dict[str, Any]]]] = []
+    rendered: list[dict[str, Any]] = []
     shown = 0
     for title, entries in ordered:
+        entries = sorted(entries, key=lambda a: _artifact_kind_rank(a["path"]))
         rows: list[dict[str, Any]] = []
+        labels: list[str] = []
         for a in entries:
             if shown >= cap:
                 break
             shown += 1
             rows.append(_artifact_row(a, ids))
+            labels.append(a["path"])
         if rows:
-            rendered.append((title, rows))
+            sub = _artifact_kind_sub(labels)
+            section = S.table(title, _ARTIFACT_COLS, _ARTIFACT_HEAD, rows, full=True,
+                              **({"sub": sub} if sub else {}))
+            rendered.append(_attach_row_kinds(section, labels))
 
     if not rendered:
         return [S.table("Run files", _ARTIFACT_COLS, _ARTIFACT_HEAD,
@@ -2904,13 +2976,12 @@ def _artifact_file_sections(run: Run) -> list[dict[str, Any]]:
     # the last thing the tab draws.
     collapsed = len(files) - shown
     if collapsed > 0:
-        rendered[-1][1].append({
+        rendered[-1]["rows"].append({
             "cells": [S.mono(f"+{collapsed} more in the run folder"), S.muted(""),
                       S.muted(""), S.muted("")],
             "do": S.reveal(str(run.run_dir))})
 
-    return [S.table(title, _ARTIFACT_COLS, _ARTIFACT_HEAD, rows, full=True)
-            for title, rows in rendered]
+    return rendered
 
 
 def _artifacts_tab(run: Run, *, changes: bool = False) -> list[dict[str, Any]]:
@@ -2964,7 +3035,11 @@ def _artifacts_tab(run: Run, *, changes: bool = False) -> list[dict[str, Any]]:
 
 # ── helpers ─────────────────────────────────────────────────────────────────
 
-_FROM = re.compile(r"^(?:agent-|impl-|verifier_|review-|lens-)([A-Za-z0-9_.-]+?)(?:\.live)?\.(?:jsonl|log|json|md)$")
+# ``patch``/``diff`` are named too: a node's ``impl-<node>.patch`` is the file
+# that node produced, and the grouped tab has to file it under ``From <node>``
+# rather than leaving it in "Run files" — the same attribution rule as its
+# json/log/md siblings.
+_FROM = re.compile(r"^(?:agent-|impl-|verifier_|review-|lens-)([A-Za-z0-9_.-]+?)(?:\.live)?\.(?:jsonl|log|json|md|patch|diff)$")
 
 
 def _from(rel: str, node_ids: set[str]) -> str:
