@@ -2420,10 +2420,6 @@ def main(argv=None) -> int:
     return 0
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
-
-
 def parse_review(text) -> list[dict]:
     """Parse one review payload into findings (pure: no DB, no git, no I/O).
 
@@ -2443,3 +2439,12 @@ def parse_verifier(name, payload) -> list[dict]:
     is the first path in that text, if any. Passed verifiers yield [].
     """
     return [f for f in _parse_verifier_raw(name, payload) if f]
+
+
+# The entrypoint goes LAST: ``python -m mini_ork.learning.code_findings``
+# executes the module top to bottom, so a guard above ``parse_review`` /
+# ``parse_verifier`` would run ``reharvest``/``harvest`` before the parsers
+# exist and fail with ``NameError: parse_review is not defined`` on every run
+# (live 2026-10-17, 619 runs). Imported use was never affected.
+if __name__ == "__main__":
+    raise SystemExit(main())

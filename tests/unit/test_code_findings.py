@@ -15,6 +15,7 @@ migrations, no live ``state.db``). Covers the kickoff's contract list:
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -948,3 +949,41 @@ def test_finding_with_no_text_and_no_snippet_is_dropped() -> None:
     assert "(no issue)" not in issues
     assert "real problem" in issues and "x = 1" in issues
     assert len(items) == 2
+
+
+# ── the module CLI runs as a SCRIPT, not just on import ─────────────────────
+
+
+def test_module_cli_reharvest_resolves_parsers(tmp_path) -> None:
+    """`python -m mini_ork.learning.code_findings reharvest` must find
+    ``parse_review``/``parse_verifier``.
+
+    Regression (live 2026-10-17): the ``if __name__ == "__main__"`` guard sat
+    above those two defs, so ``python -m`` ran ``main()`` before they existed
+    and every run failed with ``NameError: parse_review is not defined`` —
+    619 runs, zero findings harvested. Imported use never noticed.
+    """
+    home = tmp_path / "home"
+    d = _run_dir(home, "regress-cli-1")
+    _write(d / "review-reviewer.json", json.dumps({
+        "verdict": "needs_revision",
+        "findings": [{
+            "file": "mini_ork/regression_target.py",
+            "line": 7,
+            "snippet": "return compute()",
+            "severity": "high",
+            "issue": "the module CLI must read this finding",
+        }],
+    }))
+    db = _bare_db(tmp_path / "state.db")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(REPO)
+    proc = subprocess.run(
+        [sys.executable, "-m", "mini_ork.learning.code_findings",
+         "reharvest", "--home", str(home), "--db", str(db), "--json"],
+        cwd=str(REPO), capture_output=True, text=True, env=env, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "is not defined" not in proc.stderr, proc.stderr
+    result = json.loads(proc.stdout)
+    assert result["findings"] >= 1, result
