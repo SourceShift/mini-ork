@@ -321,33 +321,37 @@ def test_level_one_page_is_unchanged_plus_an_additive_graph(
     assert page["graph"]["state"] == "done"
 
 
-def test_level_two_starts_with_story_and_carries_the_graph_key(
+def test_level_two_starts_with_the_dag_and_carries_the_graph_key(
         home: Path, monkeypatch) -> None:
     _seed(home)
     monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
     page = build_page(home, "run", None, {"run": RUN})
-    assert [t["key"] for t in page["tabs"]][:2] == ["story", "graph"]
-    assert page["tab"] == "story"
-    assert page["title"] == "Make the demo pass"  # the kickoff title, not the run id
-    assert page["sections"][0]["type"] == "triage"  # one true outcome up front
-    assert page["actions"] == []  # header actions move into the triage
+    assert [t["key"] for t in page["tabs"]][:2] == ["dag", "outcome"]
+    assert page["tab"] == "dag"
+    # The header names the run by id; the human title is the sub line.
+    assert page["title"] == RUN
+    assert page["sub"] == "Make the demo pass"
+    assert page["sections"][0]["type"] == "callout"  # one true outcome up front
+    assert page["sections"][1]["type"] == "dag"
+    assert [a["label"] for a in page["actions"]] == ["Open run folder", "Orchestrator"]
+    assert page["field_labels"] is False
 
     graph_tab = build_page(home, "run", "graph", {"run": RUN})
-    assert graph_tab["tab"] == "graph"
+    assert graph_tab["tab"] == "dag"
     assert graph_tab["graph"]["cols"] == _section(graph_tab, "dag")["cols"]
     assert page["graph"]["cols"] == graph_tab["graph"]["cols"]
 
-    # A stale ``dag`` link still lands on the graph tab.
-    assert build_page(home, "run", "dag", {"run": RUN})["tab"] == "graph"
-    # …and ``overview`` lands on the story.
-    assert build_page(home, "run", "overview", {"run": RUN})["tab"] == "story"
+    # Stale links land where their content now lives.
+    assert build_page(home, "run", "story", {"run": RUN})["tab"] == "outcome"
+    assert build_page(home, "run", "overview", {"run": RUN})["tab"] == "outcome"
+    assert build_page(home, "run", "questions", {"run": RUN})["tab"] == "dag"
 
 
 def test_level_two_title_prefers_the_goal_over_the_recipe_placeholder(
         home: Path, monkeypatch) -> None:
     """No kickoff file → ``run_card`` titles the run ``"<recipe> run"``; the
     v2 title skips that placeholder for the operator's goal, and the goal and
-    criteria ride the hero section."""
+    criteria ride the Outcome tab's hero section."""
     run_dir = _seed(home)
     monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
     import sqlite3 as _sqlite3
@@ -361,10 +365,81 @@ def test_level_two_title_prefers_the_goal_over_the_recipe_placeholder(
         "success_criteria": ["it works", "it is fast"],
     }))
     page = build_page(home, "run", None, {"run": RUN})
-    assert page["title"] == "Ship the thing"
-    hero = _section(page, "hero", "What this run is for")
+    assert page["title"] == RUN
+    assert page["sub"] == "Ship the thing"
+    outcome = build_page(home, "run", "outcome", {"run": RUN})
+    hero = _section(outcome, "hero", "What this run is for")
     assert hero["goal"] == "Ship the thing\nsecond line"
     assert hero["criteria"] == ["it works", "it is fast"]
+    assert [c["label"] for c in hero["cells"]][:3] == ["nodes done", "cost", "wall time"]
+
+
+def test_level_two_dag_tab_embeds_the_node_detail_under_the_graph(
+        home: Path, monkeypatch) -> None:
+    _seed(home)
+    monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
+    page = build_page(home, "run", "dag", {"run": RUN, "node": "implementer"})
+    dag = _section(page, "dag", "DAG")
+    assert dag["select"] is True  # a click picks the node in place
+    assert dag["sub"] == "demo-recipe · 6 nodes"
+    titles = [s["title"] for s in page["sections"]]
+    assert titles.index("DAG") < titles.index("implementer")
+
+    kv = _section(page, "kv", "implementer")
+    assert kv["cols"] == 3 and kv["big"] is True
+    assert [i["k"] for i in kv["items"]][:3] == ["Status", "Lane", "Provider"]
+    assert "Started" in [i["k"] for i in kv["items"]]
+    assert "Tokens" in [i["k"] for i in kv["items"]]
+    assert kv["sub"] == "node · stage 2 of 6 · minimax"
+    # The deep node tab stays one button away.
+    assert kv["actions"][0]["label"] == "Open node"
+    assert kv["actions"][0]["do"]["args"]["node"] == "implementer"
+
+
+def test_level_two_dag_tab_carries_the_open_questions(
+        home: Path, monkeypatch) -> None:
+    run_dir = _seed(home)
+    monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
+    (run_dir / "asks").mkdir()
+    (run_dir / "asks" / "ask-1.json").write_text(json.dumps(
+        {"ask_id": "ask-1", "question": "Which database?"}))
+    page = build_page(home, "run", "dag", {"run": RUN})
+    composers = [s for s in page["sections"] if s["type"] == "composer"]
+    assert len(composers) == 1
+    assert composers[0]["title"] == "Answer ask-1"
+    assert page["chips"][0]["t"] == "✋ 1 question"
+    assert page["tabs"][0]["label"] == "DAG · 1"
+
+
+def test_level_two_kickoff_is_read_as_source(home: Path, monkeypatch) -> None:
+    _seed(home)
+    monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
+    page = build_page(home, "run", "kickoff", {"run": RUN})
+    code = _section(page, "code", "demo.md")
+    assert code["lines"][0]["t"] == "# Make the demo pass"
+    assert all(s["type"] != "markdown" for s in page["sections"])
+
+
+def test_level_two_artifacts_lead_with_the_changed_files(
+        home: Path, monkeypatch) -> None:
+    _seed(home)
+    monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
+    monkeypatch.setattr(run_page, "_card_files", lambda run: [
+        {"path": "calc.py", "abs": "/tmp/calc.py", "added": 12, "removed": 3}])
+    page = build_page(home, "run", "artifacts", {"run": RUN})
+    table = _section(page, "table", "Changes")
+    assert [c["t"] for c in table["rows"][0]["cells"]] == ["calc.py", "+12", "−3"]
+    assert table["rows"][0]["do"] == {"path": "/tmp/calc.py"}
+
+
+def test_level_two_agents_roster_counts_tokens(home: Path, monkeypatch) -> None:
+    _seed(home)
+    monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
+    page = build_page(home, "run", "agents", {"run": RUN})
+    roster = _section(page, "table", "Agent roster")
+    assert roster["head"] == ["node", "family", "status", "verdict", "cost", "tokens",
+                              "time", "gates"]
+    assert len(roster["rows"][0]["cells"]) == 8
 
 
 def test_kickoff_tab_renders_the_full_kickoff(home: Path) -> None:

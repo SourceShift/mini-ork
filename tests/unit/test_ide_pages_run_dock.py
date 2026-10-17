@@ -326,12 +326,12 @@ def test_without_the_spec_is_todays_page(home: Path, monkeypatch) -> None:
         "dag", "kickoff", "overview", "agents", "learnings", "artifacts"]
 
 
-def test_level_two_without_view_is_the_story(home: Path, monkeypatch) -> None:
+def test_level_two_without_view_is_the_dag(home: Path, monkeypatch) -> None:
     _seed(home)
     monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
     page = build_page(home, "run", None, {"run": RUN})
-    assert page["tab"] == "story"
-    assert page["sections"][0]["type"] == "triage"
+    assert page["tab"] == "dag"
+    assert page["sections"][0]["type"] == "callout"
 
 
 def test_last_line_splits_a_multi_line_entry() -> None:

@@ -558,7 +558,7 @@ def test_build_degrades_flow_to_null_on_error(home: Path, monkeypatch) -> None:
     assert page["flow"] is None
     assert "kaboom" in page["errors"]["flow"]
     # The rest of the page still renders.
-    assert page["sections"][0]["type"] == "triage"
+    assert page["sections"][0]["type"] == "callout"
 
 
 def test_reviewer_needs_revision_is_sent_back_not_failed() -> None:

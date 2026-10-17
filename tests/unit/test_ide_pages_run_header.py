@@ -276,12 +276,21 @@ def test_build_v2_passes_the_header_to_the_page(tmp_path, monkeypatch) -> None:
     still draws none of them."""
     run = _run(tmp_path, title="Fix the login loop")
     outcome = _running_outcome(run)
+    # A menu entry the page does not itself draw still rides the header through.
+    outcome["menu"].append(S.btn("Inspect run", S.reveal(str(run.run_dir)), "ghost"))
     monkeypatch.setattr(R.O, "resolve", lambda _run: outcome)
     for tab in ("story", "graph", "kickoff"):
         page = R._build_v2(run, tab, {"run": run.id})
         assert page["label"] == "Fix the login loop"
-        assert [a["label"] for a in page["actions"]] == ["Stop", "Kill"]
-        assert "Certify this change" not in [m["label"] for m in page["menu"]]
+        # The header's own controls lead; the redesign adds the run-folder and
+        # orchestrator buttons after them.
+        assert [a["label"] for a in page["actions"]][:2] == ["Stop", "Kill"]
+        menu_labels = [m["label"] for m in page["menu"]]
+        assert "Certify this change" not in menu_labels
+        # "Open run folder" is a page button too, so it is drawn once: the
+        # header's copy is subtracted from the menu.
+        assert "Open run folder" not in menu_labels
+        assert "Inspect run" in menu_labels
         assert isinstance(page["updated_at"], int)
         if tab == "story":
             assert page["sections"][0]["actions"] == []

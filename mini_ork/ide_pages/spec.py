@@ -294,10 +294,15 @@ def dot(t: Any, sub: Any = "", acts: Iterable[dict[str, Any]] | None = None,
 # ── sections ───────────────────────────────────────────────────────────────
 
 def _section(kind: str, title: str, data: dict[str, Any], *, note: str = "",
-             actions: Iterable[dict[str, Any]] | None = None, full: bool = False,
-             col: int | None = None, row_span: int | None = None) -> dict[str, Any]:
+             sub: str = "", actions: Iterable[dict[str, Any]] | None = None,
+             full: bool = False, col: int | None = None,
+             row_span: int | None = None) -> dict[str, Any]:
+    """``sub`` is the quiet line the design draws beside the section head
+    (``framework-edit · 7 nodes``); ``note`` is the footnote under the body."""
     out = {"type": kind, "title": title or "", "note": note or "",
            "actions": list(actions or []), "full": full, **data}
+    if sub:
+        out["sub"] = str(sub)
     if col in (1, 2):
         out["col"] = col
     if row_span:
@@ -327,14 +332,25 @@ def table(title: str, cols: list[dict[str, Any]], head: list[str],
     return _section("table", title, {"cols": cols, "head": head, "rows": out_rows}, **opt)
 
 
-def kv(title: str, items: Iterable[tuple | list], **opt: Any) -> dict[str, Any]:
-    """``items``: ``(k, v[, colour[, sub]])``."""
+def kv(title: str, items: Iterable[tuple | list], *, cols: int = 0,
+       big: bool = False, **opt: Any) -> dict[str, Any]:
+    """``items``: ``(k, v[, colour[, sub]])``.
+
+    ``cols`` lays the items out as a grid of that many columns, label above
+    value (:func:`S.kv`'s vertical list is the default and stays byte-identical
+    when ``cols`` is 0). ``big`` draws the value at the grid's heading size.
+    """
     out = []
     for i in items:
         i = list(i) + [None, None]
         out.append({"k": str(i[0]), "v": "" if i[1] is None else str(i[1]),
                     "c": i[2] or "text", "sub": "" if i[3] is None else str(i[3])})
-    return _section("kv", title, {"items": out}, **opt)
+    data: dict[str, Any] = {"items": out}
+    if cols:
+        data["cols"] = int(cols)
+    if big:
+        data["big"] = True
+    return _section("kv", title, data, **opt)
 
 
 def lst(title: str, items: Iterable[dict[str, Any]], **opt: Any) -> dict[str, Any]:
@@ -453,15 +469,34 @@ def meta_item(t: Any, c: str = "sub", *, mono: bool = False) -> dict[str, Any]:
 
 
 def hero(title: str, *, goal: str = "", criteria: Iterable[Any] = (), pill: Any = None,
-         meta: Iterable[Any] = (), **opt: Any) -> dict[str, Any]:
-    """A run's headline block. ``pill`` is ``(t, c)`` | ``str`` | ``None``."""
+         meta: Iterable[Any] = (), cells: Iterable[Any] = (), **opt: Any) -> dict[str, Any]:
+    """A run's headline block. ``pill`` is ``(t, c)`` | ``str`` | ``None``.
+
+    ``cells`` are the design's stat strip under the goal:
+    ``(value, label[, colour[, sub[, subcolour]]])``. They answer "how much,
+    how long, how far" in one row, so the outcome tab does not need a second
+    section for numbers that all come from the same run.
+    """
     opt.setdefault("full", True)
     return _section("hero", title, {
         "goal": str(goal),
         "criteria": [str(c) for c in criteria],
         "pill": _tc(pill),
         "meta": list(meta),
+        "cells": [_hero_cell(c) for c in cells],
     }, **opt)
+
+
+def _hero_cell(value: Any) -> dict[str, str]:
+    """One hero cell: ``(v, label[, c[, sub[, subc]]])`` or a dict."""
+    if isinstance(value, dict):
+        return {"v": str(value.get("v") or ""), "label": str(value.get("label") or ""),
+                "c": str(value.get("c") or "text"), "sub": str(value.get("sub") or ""),
+                "sc": str(value.get("sc") or "sub")}
+    parts = list(value) + [None] * 5
+    return {"v": "" if parts[0] is None else str(parts[0]),
+            "label": "" if parts[1] is None else str(parts[1]),
+            "c": parts[2] or "text", "sub": parts[3] or "", "sc": parts[4] or "sub"}
 
 
 def triage(text: str, *, tone: str = "muted", icon: str = "", detail: str = "",
