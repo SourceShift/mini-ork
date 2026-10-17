@@ -217,6 +217,13 @@ def _is_test_path(rel_path: str) -> bool:
     "fix + new test" patch on such a repo.
     """
     parts = rel_path.replace("\\", "/").split("/")
+    # Compiled bytecode is never test source, however test-shaped its name.
+    # Copying it onto the base can hand the base the candidate's own compiled
+    # code whenever the pyc's embedded source mtime still matches — the exact
+    # state the base-fail delta exists to see (2026-10-17, mo-daytona-e2e-target:
+    # `tests/__pycache__/test_calc.cpython-39.pyc` appeared in `overlaid_tests`).
+    if "__pycache__" in parts or parts[-1].endswith((".pyc", ".pyo")):
+        return False
     for seg in parts[:-1]:
         if seg in ("tests", "test", "__tests__"):
             return True
