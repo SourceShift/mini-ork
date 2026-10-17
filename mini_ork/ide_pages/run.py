@@ -504,6 +504,173 @@ def _cost(run: Run) -> float:
     return total if total > 0 else float(run.row.get("cost_usd") or 0.0)
 
 
+# ── spend against the caps ──────────────────────────────────────────────────
+#
+# The page has always shown a cost chip; C16 (the run-page JTBD review) asks for
+# the comparison that makes the number actionable — spent against the per-run
+# cap, the daily cap, and a projection while the run is still spending. The cap
+# comes from the watcher's own resolver so the page and the pause that actually
+# stops a run can never disagree.
+
+
+def _has_cost_data(run: Run) -> bool:
+    """Whether the run recorded a cost at all (a real ``$0.00`` still counts)."""
+    return run.card.get("cost_total") is not None or run.row.get("cost_usd") is not None
+
+
+def _per_run_cap() -> float | None:
+    """The run's spend cap, from ``watch.cost_cap_usd`` — never re-derived here.
+
+    Imported lazily and looked up on the module at call time: the fallback
+    chain (``MO_WATCH_COST_USD`` → ``MO_ORCH_BUDGET_USD`` → 1.0) lives in one
+    place, and a broken read returns ``None`` so the caller can show the spent
+    number without inventing a cap.
+    """
+    try:
+        from mini_ork.acp_orchestrator import watch
+
+        cap = float(watch.cost_cap_usd())
+    except Exception:  # noqa: BLE001 — a broken cap source costs the cap, not the page
+        return None
+    return cap if cap > 0 else None
+
+
+def _daily_cap() -> float:
+    """``MO_DAILY_BUDGET_USD`` (default 50.0), the scheduler's own knob."""
+    try:
+        value = float(str(os.environ.get("MO_DAILY_BUDGET_USD", "")).strip())
+    except (TypeError, ValueError):
+        return 50.0
+    return value if value > 0 else 50.0
+
+
+def _daily_spend(run: Run) -> float | None:
+    """Today's spend, only when it is one cheap query on the page's own DB.
+
+    The page already opens ``state.db``; a single ``SUM`` is affordable, while
+    anything more (or a closed home, as in a synthetic fixture) is omitted
+    rather than guessed.
+    """
+    try:
+        from datetime import datetime as _datetime
+
+        from mini_ork.web.db import db_for
+
+        db = db_for(run.home)
+        if not db.has_table("task_runs"):
+            return None
+        midnight = int(_datetime.now().replace(
+            hour=0, minute=0, second=0, microsecond=0).timestamp())
+        row = db.row(
+            "SELECT COALESCE(SUM(cost_usd), 0) AS n FROM task_runs "
+            "WHERE created_at >= ?", (midnight,))
+        return float((row or {}).get("n") or 0.0)
+    except Exception:  # noqa: BLE001 — an unreadable DB omits the daily number
+        return None
+
+
+def _recent_completion_seconds(run: Run) -> float | None:
+    """The recent-completion estimate: mean wall time of the recipe's last runs.
+
+    One query over ``task_runs``; ``None`` when the DB or the history is
+    missing, so the projection falls back to the run's own pace.
+    """
+    try:
+        from mini_ork.web.db import db_for
+
+        db = db_for(run.home)
+        if not db.has_table("task_runs"):
+            return None
+        recipe = str(run.card.get("recipe") or run.row.get("recipe") or "")
+        row = db.row(
+            "SELECT AVG(ended_at - created_at) AS avg_s FROM ("
+            " SELECT ended_at, created_at FROM task_runs"
+            " WHERE ended_at IS NOT NULL AND created_at IS NOT NULL AND recipe = ?"
+            " ORDER BY ended_at DESC LIMIT 20)", (recipe,))
+        avg = float((row or {}).get("avg_s") or 0.0)
+        return avg if avg > 0 else None
+    except Exception:  # noqa: BLE001 — no history means no completion estimate
+        return None
+
+
+def _projected_spend(run: Run, spent: float) -> float | None:
+    """``rate × completion estimate`` while a run is still spending.
+
+    Only a ``running`` run that has spent at least a minute's worth of elapsed
+    time projects; a finished run has nothing left to project. The estimate is
+    the recipe's recent mean duration when it looks further out than what the
+    run already took, else the run's own pace doubled (assume it is halfway).
+    """
+    if not _running(run) or spent <= 0:
+        return None
+    start = _epoch(run.row.get("created_at"))
+    if start is None:
+        return None
+    elapsed = int(time.time()) - start
+    if elapsed < 60:
+        return None
+    estimate = _recent_completion_seconds(run)
+    if estimate is None or estimate <= elapsed:
+        estimate = elapsed * 2
+    return round(spent / elapsed * estimate, 2)
+
+
+def _spend_numbers(run: Run) -> dict[str, float] | None:
+    """The outcome's ``spend`` block; ``None`` when the run recorded no cost.
+
+    ``remaining`` is clamped at zero, ``daily_cap`` and ``projected`` are
+    present only when they can be known — never fabricated.
+    """
+    if not _has_cost_data(run):
+        return None
+    spent = _cost(run)
+    out: dict[str, float] = {"spent": round(spent, 2)}
+    cap = _per_run_cap()
+    if cap is not None:
+        out["cap"] = round(cap, 2)
+        out["remaining"] = round(max(cap - spent, 0.0), 2)
+    out["daily_cap"] = round(_daily_cap(), 2)
+    projected = _projected_spend(run, spent)
+    if projected is not None:
+        out["projected"] = projected
+    return out
+
+
+def _spend_section(run: Run) -> dict[str, Any]:
+    """One compact Spend section: spent, caps, remaining and the projection.
+
+    Shared verbatim by the Checks and Outcome tabs so the two can never drift.
+    Every failure inside is absorbed: a broken cap source drops the cap and
+    leaves the spent sentence, never an exception and never a made-up number.
+    """
+    spent = _cost(run)
+    cap = _per_run_cap()
+    items: list[dict[str, Any]] = []
+    if cap is None:
+        items.append(S.dot(f"{S.money(spent)} spent",
+                           "per-run cap unavailable — the watcher could not be read"))
+    else:
+        remaining = max(cap - spent, 0.0)
+        sentence = (f"{S.money(spent)} of a {S.money(cap)} per-run cap"
+                    f" · {S.money(remaining)} left")
+        # Green strictly under the cap; at the cap the sentence already says
+        # nothing is left, so it carries the same warning tone as going over.
+        items.append(S.bad(sentence) if spent >= cap else S.ok(sentence))
+        daily_cap = _daily_cap()
+        daily_spent = _daily_spend(run)
+        if daily_spent is None:
+            items.append(S.dot(f"Daily cap {S.money(daily_cap)}"))
+        else:
+            items.append(S.dot(
+                f"Daily {S.money(daily_spent)} of a {S.money(daily_cap)} cap"))
+        projected = _projected_spend(run, spent)
+        if projected is not None:
+            items.append(S.dot(f"at this rate, ~{S.money(projected)} by the end"))
+    return S.lst(
+        "Spend", items, full=True,
+        note="What this run has spent against its per-run and daily caps.")
+
+
 def _sub(run: Run) -> str:
     parts = [str(run.card.get("recipe") or ""), str(run.card.get("title") or "")]
     ws = run.workspace
@@ -1665,7 +1832,12 @@ def _overview_tab(run: Run, *, include_retry: bool = True) -> list[dict[str, Any
         # but the operator action is to lift the cost cap (resume), not to ack
         # a code change. Treat it as the dedicated branch it is.
         if hint.get("retryable") and strategy == "resume-cost":
-            return S.lst("Retry", [S.ok(f"Resume this cost-paused run with `mini-ork resume {run.id}`.")],
+            # Name the cap that was hit, from the same watcher source the pause
+            # uses; the button and its confirmation stay byte-identical.
+            cap = _per_run_cap()
+            cap_text = f" (the {S.money(cap)} per-run cap)" if cap is not None else ""
+            return S.lst("Retry", [S.ok(
+                f"Resume this cost-paused run with `mini-ork resume {run.id}`{cap_text}.")],
                          full=True,
                          actions=[S.btn("Resume",
                                         S.cli("board", "retry", run.id,
@@ -3970,6 +4142,10 @@ def _outcome_tab(run: Run, outcome: dict[str, Any],
     if str(outcome.get("reason") or "").strip():
         triage["reason"] = str(outcome["reason"]).strip()
     sections = [triage]
+    # The Spend section sits directly under the outcome summary: the verdict
+    # says what happened, this says what it cost against its caps. One shared
+    # builder with the Checks tab so the two sections are always equal.
+    sections.append(_spend_section(run))
     dropped = set(absorbed or ())
     # The criteria checklist, directly under the verdict: the triage states what
     # happened, this states which of the run's promises the evidence actually
@@ -4273,6 +4449,9 @@ def _checks_tab(run: Run) -> list[dict[str, Any]]:
         note="PROVEN = the evidence at the true base shows it; UNVERIFIED = not "
              "proven yet; FAILED = the evidence refutes it. Click a row to open "
              "the file that decided it.")]
+    # Spend follows the level rows: the checks say whether the run proved what
+    # it promised, the section under them says what proving it cost.
+    sections.append(_spend_section(run))
     # The vector itself stays shipped as data for the renderer (``spec.levels``),
     # and the per-check envelopes below mirror ``_checks_envelope_sections`` —
     # so only the non-check sections of the old tab ride along here.
@@ -4346,6 +4525,12 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
     which run, and the title is the sentence they came for.
     """
     outcome = O.resolve(run)
+    # The IDE badges the header from this block without parsing sections. A run
+    # with no recorded cost emits no key at all, so the badge stays absent for
+    # a run that never spent rather than reading as $0.00 spent.
+    spend = _spend_numbers(run)
+    if spend is not None:
+        outcome["spend"] = spend
     keys = {k for k, _ in V2_TABS}
     wanted = (tab or "").strip()
     resolved = V2_ALIASES.get(wanted, wanted)
@@ -4450,6 +4635,10 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
     # kickoff's own heading, and a label above it would read as a field name.
     page["field_labels"] = False
     page["graph"] = _graph(run, node)
+    # The header badge reads this without walking sections; absent (never
+    # $0.00) when the run recorded no cost at all.
+    if spend is not None:
+        page["spend"] = spend
     return page
 
 
