@@ -1219,45 +1219,83 @@ def _dag_tab(run: Run, wanted: str | None, *, select: bool = False,
             sec["select"] = True
         return sec
 
-    def node_detail() -> list[dict[str, Any]]:
-        if sel is None:
-            return [S.lst("Node", [S.dot("No node selected", "Click a node in the DAG.")], full=True)]
+    def run_overview() -> list[dict[str, Any]]:
+        """The run's own state — what the DAG tab opens on until a node is clicked.
+
+        ``_selected`` answers a different question: which node the *canvas*
+        should point at (first failed, else the last that finished). Using that
+        answer to fill this box described the publisher on every finished run —
+        a node whose own cost, start and end say nothing about the run. The box
+        is about the run until a click makes it about a node.
+        """
+        nodes = run.nodes
+        done = sum(1 for node in nodes if node.state == "done")
+        skipped = sum(1 for node in nodes if node.state == "skipped")
+        passed, total = verifier_check_counts(run.run_dir)
+        findings = O._findings_count(run)  # noqa: SLF001 — same package's count
+        live = _running(run)
+        state = str(resolved_outcome.get("state") or "")
+        facts: list[tuple[Any, ...]] = [
+            ("Status", {"done": "done", "running": "running", "failed": "failed",
+                        "needs_you": "needs you"}.get(state, state or "—"),
+             str(resolved_outcome.get("tone") or "text")),
+            ("Cost", S.money(_cost(run))),
+            ("Started", _clock(_epoch(run.row.get("created_at")))),
+            ("Ended", "running" if live else _clock(
+                _epoch(run.row.get("ended_at")) or _epoch(run.row.get("updated_at")))),
+            ("Duration", _elapsed(run)),
+            ("Nodes", (f"{done}/{len(nodes)} done" +
+                       (f" · {skipped} not run" if skipped else ""))
+             if nodes else "no nodes"),
+            ("Checks", f"{passed}/{total}" if total else "—",
+             "green" if total and passed == total else "text"),
+            ("Findings", str(findings) if findings is not None else "—",
+             "red" if findings else "text"),
+            ("Recipe", str(run.card.get("recipe") or run.row.get("recipe") or "—")),
+        ]
+        sub = " · ".join(("run", "overall", "live" if live else "finished"))
+        return [S.kv("Run", facts, sub=sub, cols=3, big=True, full=True)]
+
+    def node_detail(node: Node) -> list[dict[str, Any]]:
         # Lazy: ``node.py`` imports this module (same dance as ``run_story``).
         from mini_ork.ide_pages.node import _kv_items, _resolve_prompt_file
 
-        items = _kv_items(sel, _wall(sel), run)
+        items = _kv_items(node, _wall(node), run)
         by_key = {item["k"]: item for item in items}
         facts: list[tuple[Any, ...]] = [
-            ("Status", _STATE_TEXT.get(sel.state, sel.state),
-             _STATE_COLOUR.get(sel.state, "sub")),
+            ("Status", _STATE_TEXT.get(node.state, node.state),
+             _STATE_COLOUR.get(node.state, "sub")),
             ("Lane", by_key["Lane"]["v"], by_key["Lane"]["c"]),
             ("Provider", by_key["Provider"]["v"], by_key["Provider"]["c"]),
             ("Cost", by_key["Cost"]["v"], by_key["Cost"]["c"]),
-            ("Started", _clock(sel.start)),
-            ("Ended", _clock(sel.end)),
-            ("Duration", _wall(sel)),
+            ("Started", _clock(node.start)),
+            ("Ended", _clock(node.end)),
+            ("Duration", _wall(node)),
             ("Tokens", by_key["Tokens"]["v"], by_key["Tokens"]["c"]),
             ("Skills", by_key["Skills"]["v"], by_key["Skills"]["c"]),
             ("Gates", by_key["Gates"]["v"], by_key["Gates"]["c"]),
         ]
-        if sel.finish and sel.finish != "done":
-            facts.append(("Finish", sel.finish, "red" if sel.state == "failed" else "text"))
-        if sel.prompt:
-            facts.append(("Prompt", sel.prompt, "muted"))
-        stage = next((i for i, column in enumerate(run.cols, 1) if sel.id in column), None)
+        if node.finish and node.finish != "done":
+            facts.append(("Finish", node.finish, "red" if node.state == "failed" else "text"))
+        if node.prompt:
+            facts.append(("Prompt", node.prompt, "muted"))
+        stage = next((i for i, column in enumerate(run.cols, 1) if node.id in column), None)
         sub = " · ".join(x for x in (
             "node",
             f"stage {stage} of {len(run.cols)}" if stage else "",
-            sel.family) if x)
-        actions = [S.btn("Open node", S.page_link("run", "dag", run=run.id, node=sel.id),
-                         "primary")]
-        prompt_path = _resolve_prompt_file(sel, run.recipe_dir)
+            node.family) if x)
+        actions = [S.btn("Open node", S.page_link("run", "dag", run=run.id, node=node.id),
+                         "primary"),
+                   # An empty ``set`` value removes the key (see the IDE's
+                   # ``set_args``), so the box can go back to describing the run.
+                   S.btn("Run overview", {"set": {"node": ""}}, "ghost")]
+        prompt_path = _resolve_prompt_file(node, run.recipe_dir)
         if prompt_path:
             actions.append(S.btn("Prompt", S.open_path(prompt_path), "ghost"))
-        sections = [S.kv(sel.id, facts, sub=sub, cols=3, big=True, actions=actions, full=True)]
-        lines = [(ln[:_LINE_CHARS], _colour(ln)) for ln in _node_output(run, sel)]
+        sections = [S.kv(node.id, facts, sub=sub, cols=3, big=True, actions=actions, full=True)]
+        lines = [(ln[:_LINE_CHARS], _colour(ln)) for ln in _node_output(run, node)]
         if lines:
-            sections.append(S.code(f"Transcript · {sel.id}", lines, full=True))
+            sections.append(S.code(f"Transcript · {node.id}", lines, full=True))
         return sections
 
     def verifiers() -> dict[str, Any]:
@@ -1322,12 +1360,19 @@ def _dag_tab(run: Run, wanted: str | None, *, select: bool = False,
         return S.pills(title, pills, full=True, note=note)
 
     if select:
+        # A click is the only thing that makes this tab about a node: ``wanted``
+        # names it, so the detail follows the click and never a guess.
+        explicit = next((n for n in run.nodes if n.id == wanted), None) if wanted else None
+
+        def detail() -> list[dict[str, Any]]:
+            return node_detail(explicit) if explicit is not None else run_overview()
+
         # The redesign's order: what the run decided, what it waits for, the
-        # graph, the node the graph points at, then who checked whom.
+        # graph, the run's own state (or the clicked node), then who checked whom.
         return (S.guarded(errors, "Outcome", outcome_block)
                 + S.guarded(errors, "Questions", questions)
                 + S.guarded(errors, "DAG", build_dag)
-                + S.guarded(errors, "Node", node_detail)
+                + S.guarded(errors, "Node", detail)
                 + S.guarded(errors, "Coalition", build_coalition)
                 + S.guarded(errors, "Verifiers", verifiers))
 

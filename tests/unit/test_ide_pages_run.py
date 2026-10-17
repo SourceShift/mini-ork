@@ -374,6 +374,39 @@ def test_level_two_title_prefers_the_goal_over_the_recipe_placeholder(
     assert [c["label"] for c in hero["cells"]][:3] == ["nodes done", "cost", "wall time"]
 
 
+def test_level_two_dag_tab_describes_the_run_until_a_node_is_clicked(
+        home: Path, monkeypatch) -> None:
+    """The box under the graph is about the run, not the last node it ran.
+
+    ``_selected``'s fallback (first failed, else the last that finished) is
+    what the *canvas* points at; filling the detail with it described the
+    publisher on every finished run, so that node's $0.00 and its one-second
+    start/end read as the run's own cost and lifetime.
+    """
+    _seed(home)
+    monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
+    page = build_page(home, "run", "dag", {"run": RUN})
+    kv = _section(page, "kv", "Run")
+    by_key = {i["k"]: i["v"] for i in kv["items"]}
+    assert [i["k"] for i in kv["items"]][:5] == [
+        "Status", "Cost", "Started", "Ended", "Duration"]
+    assert by_key["Cost"] == "$0.23"                 # the run's total
+    assert by_key["Nodes"] == "5/6 done · 1 not run"
+    assert by_key["Checks"] == "1/1"
+    assert kv["sub"] == "run · overall · finished"
+    # Nothing chose a node, so no node's transcript rides along.
+    assert all(not (s["type"] == "code" and s["title"].startswith("Transcript"))
+               for s in page["sections"])
+
+    # A click is the one thing that turns the box into a node — and the box
+    # offers the way back to the run's own state.
+    clicked = build_page(home, "run", "dag", {"run": RUN, "node": "publisher"})
+    node_kv = _section(clicked, "kv", "publisher")
+    assert node_kv["sub"].startswith("node · ")
+    assert node_kv["actions"][-1]["label"] == "Run overview"
+    assert node_kv["actions"][-1]["do"] == {"set": {"node": ""}}
+
+
 def test_level_two_dag_tab_embeds_the_node_detail_under_the_graph(
         home: Path, monkeypatch) -> None:
     _seed(home)
