@@ -223,6 +223,70 @@ def _module_env(root):
     return env
 
 
+# A node worker's identity must not leak into the run-level watcher: it would
+# claim to be that node. The venv flag and the dry-run flag describe the parent
+# invocation, not a detached observer.
+_ORCH_WATCH_CHILD_UNSET = (
+    "MINI_ORK_DRY_RUN",
+    "MINI_ORK_VENV_ACTIVE",
+    "MO_NODE_ID",
+    "MO_NODE_TYPE",
+    "CONCORD_PRINCIPAL",
+)
+
+
+def _start_orchestrator_watch(root, home, run_id, run_dir) -> bool:
+    """Spawn the run's detached interval watcher. Never changes the run's rc.
+
+    Called after ``load_run_env`` so ``config/env.yaml`` can opt this run out
+    (``MO_RUN_ORCHESTRATOR=0`` / ``MO_ORCH_WATCH=0``) and the child inherits
+    the run's own policy. The child outlives this process on purpose: watching
+    a dead dispatcher is its job, so there is no teardown call.
+    """
+    try:
+        from mini_ork.orchestration import runner_orchestrator as orch
+
+        if os.environ.get("MINI_ORK_DRY_RUN", "0") == "1":
+            return False
+        if not (orch.enabled() and orch.watch_enabled()):
+            return False
+        if orch.WatchConfig.from_env().autonomy == "off":
+            return False
+        if orch.watch_active(run_dir):
+            return False
+
+        from mini_ork.web.db import resolve_db
+
+        env = _module_env(root)
+        env.update({
+            "MINI_ORK_RUN_ID": run_id,
+            "MINI_ORK_HOME": str(home),
+            "MINI_ORK_PROJECT_HOME": str(home),
+            "MINI_ORK_ROOT": str(root),
+            "MINI_ORK_RUN_DIR": str(run_dir),
+            "MINI_ORK_DB": resolve_db(home),
+        })
+        for name in _ORCH_WATCH_CHILD_UNSET:
+            env.pop(name, None)
+
+        log_path = Path(run_dir) / orch.WATCH_LOG_FILE
+        with open(log_path, "ab") as log:
+            subprocess.Popen(
+                [sys.executable, "-m", "mini_ork.cli.orchestrator_cmd",
+                 "watch", run_id, "--home", str(home)],
+                cwd=root,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        return True
+    except Exception as exc:  # noqa: BLE001 — a run is never wedged by its observer
+        sys.stderr.write(f"[orchestrator] watcher not started: {exc}\n")
+        return False
+
+
 _REFLECT_TIMEOUT_FALLBACK = 360
 _REFLECT_TIMEOUT_HEADROOM = 3
 _REFLECT_TIMEOUT_CEILING = 21600
@@ -1635,6 +1699,11 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
         return 2
     if _run_env.run_level:
         publish_env(_run_env.run_level)
+    # One orchestrator per run: the interval half is a detached process that
+    # must outlive this dispatcher. Spawned after the run env is published so
+    # the child sees the run's own policy, and before any node runs so the
+    # first stall is observed. Best-effort in both directions.
+    _start_orchestrator_watch(root, home, run_id, run_dir)
     profile_path = os.path.join(run_dir, "run_profile.json")
     os.environ["MINI_ORK_PROFILE_PATH"] = profile_path
 

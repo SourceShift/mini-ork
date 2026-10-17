@@ -18,6 +18,13 @@ from mini_ork.cli import orchestrator_cmd as cmd
 from mini_ork.orchestration import runner_orchestrator as orch
 
 
+@pytest.fixture(autouse=True)
+def _enable_watch(monkeypatch):
+    # conftest disables the watcher suite-wide; this module is the opt-in.
+    monkeypatch.setenv("MO_ORCH_WATCH", "1")
+    monkeypatch.delenv("MO_ORCH_WATCH_AUTONOMY", raising=False)
+
+
 def _make_db(home, *, status="executing", run_id="run-1"):
     db = home / "state.db"
     con = sqlite3.connect(db)

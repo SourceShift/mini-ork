@@ -67,6 +67,10 @@ def _isolate_process_state():
     # recover flows call auto_repair.maybe_repair on every failed run, and it is
     # on unless MO_AUTO_REPAIR is "0". Tests of the loop opt back in explicitly.
     os.environ["MO_AUTO_REPAIR"] = "0"
+    # Same hazard for the per-run watcher: `mini-ork run` spawns it detached,
+    # and an in-process lifecycle test would leave a real process behind for
+    # every run it executes. Tests of the spawn opt back in explicitly.
+    os.environ["MO_ORCH_WATCH"] = "0"
     # Every in-process reader of state.db goes through mini_ork.web.db.db_for,
     # which caches a StateDB (holding a read-only sqlite connection) in the
     # process-wide ``_dbs`` dict, keyed by the home path. pytest reuses a
