@@ -98,3 +98,22 @@ def test_route_reports_a_bad_argv_as_a_client_error(home: Path) -> None:
     with pytest.raises(HTTPException) as caught:
         ide._read(home, ["page"])
     assert caught.value.status_code == 400
+
+
+def test_a_server_whose_engine_changed_refuses_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An edit after the boot import is invisible to the running process; the
+    read must fail (503 → the IDE's subprocess fallback) rather than serve the
+    shape the checkout no longer produces."""
+    monkeypatch.setattr(ide, "_checked_at", 0.0)
+    monkeypatch.setattr(ide, "_BOOT_STAMP", 100.0)
+    monkeypatch.setattr(ide, "_newest_source_mtime", lambda: 101.0)
+    with pytest.raises(HTTPException) as caught:
+        ide._refuse_stale_engine()
+    assert caught.value.status_code == 503
+
+
+def test_a_server_whose_engine_is_unchanged_answers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ide, "_checked_at", 0.0)
+    monkeypatch.setattr(ide, "_BOOT_STAMP", 100.0)
+    monkeypatch.setattr(ide, "_newest_source_mtime", lambda: 100.0)
+    ide._refuse_stale_engine()

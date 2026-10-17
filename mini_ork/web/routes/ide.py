@@ -20,6 +20,8 @@ with the `X-Mini-Ork-Home` header and one server can serve several projects.
 from __future__ import annotations
 
 import json
+import logging
+import time
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
@@ -27,7 +29,54 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from ..deps import get_home
 from ...cli import board_cmd
 
-router = APIRouter(prefix="/ide", tags=["ide"])
+logger = logging.getLogger(__name__)
+
+# A `mini-ork serve` imports the engine once and answers from that import for
+# as long as it lives; an edit on disk after the import is invisible to it.
+# Left alone, a long-lived server (a smoke server, the IDE's lazy one) keeps
+# serving the shape it booted with — the IDE reads that over loopback and
+# silently shows a page the checkout no longer produces. The guard below makes
+# that visible: once a source file is newer than the boot import, every /ide
+# read answers 503, which `ide_http` already treats as "no usable server" and
+# answers from a fresh subprocess instead.
+_ENGINE_ROOT = Path(__file__).resolve().parents[2]
+_STAMP_TTL_SECONDS = 2.0
+
+
+def _newest_source_mtime() -> float:
+    """The engine's own idea of "when was I last edited"."""
+    newest = 0.0
+    for path in _ENGINE_ROOT.rglob("*.py"):
+        try:
+            newest = max(newest, path.stat().st_mtime)
+        except OSError:
+            continue
+    return newest
+
+
+_BOOT_STAMP = _newest_source_mtime()
+_checked_at = 0.0
+
+
+def _refuse_stale_engine() -> None:
+    """503 when the engine changed under a running server."""
+    global _checked_at
+    now = time.monotonic()
+    if now - _checked_at < _STAMP_TTL_SECONDS:
+        return
+    _checked_at = now
+    if _newest_source_mtime() > _BOOT_STAMP:
+        logger.warning(
+            "mini-ork engine sources changed since this server started; "
+            "IDE reads fall back to the CLI until `mini-ork serve` restarts"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="mini-ork sources changed since this server started; restart `mini-ork serve`",
+        )
+
+
+router = APIRouter(prefix="/ide", tags=["ide"], dependencies=[Depends(_refuse_stale_engine)])
 
 
 def _json(payload: dict) -> Response:
