@@ -22,7 +22,7 @@ from typing import Any, Iterable
 from mini_ork.ide_pages import _cn as _CN
 from mini_ork.ide_pages import outcome as O
 from mini_ork.ide_pages import spec as S
-from mini_ork.ide_pages.run_header import build_header
+from mini_ork.ide_pages.run_header import build_header, copy_summary_action
 from mini_ork.ide_pages.cn_file import (
     _SECTION_BY_FILE as _CN_FILE_BY_FILE,
     _fetch_by_file as _cn_file_fetch_by_file,
@@ -3414,6 +3414,28 @@ def _sub_v2(run: Run) -> str:
     return " · ".join(p for p in parts if p)
 
 
+def _sub_worktree(sub: str, run: Run) -> str:
+    """Append `` · worktree <relpath>`` when the run has a workspace.
+
+    The v2 sub lost the worktree path the legacy ``_sub`` still draws, so a
+    reader could not tell where the change was written. Appended, never
+    substituted: the recipe / title / branch / id already on the line stay in
+    their order. The path is shown relative to the project root (home's
+    parent), the same rule ``_sub`` uses.
+    """
+    ws = run.workspace
+    if ws is None:
+        return sub
+    try:
+        shown = str(Path(ws.path).relative_to(run.home.absolute().parent))
+    except ValueError:
+        shown = str(ws.path)
+    except Exception:  # noqa: BLE001 — a broken workspace costs its segment
+        return sub
+    segment = f"worktree {shown}"
+    return f"{sub} · {segment}" if sub else segment
+
+
 def _read_run_json(run: Run, name: str) -> dict[str, Any]:
     """A JSON object from the run dir, ``{}`` when missing or unreadable."""
     try:
@@ -4028,6 +4050,15 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
     in_callout = callout_labels if resolved in ("dag", "outcome") else set()
     menu = [m for m in header["menu"]
             if str(m.get("label") or "") not in drawn | in_callout]
+    # A run parked for review has a change and its checks; the summary is safe
+    # to hand off now, so the page offers the entry the header withholds while
+    # a run is still in flight. One entry, on every tab.
+    if (str(outcome.get("state") or "") != "running"
+            and not any(str(m.get("label") or "") == "Copy summary" for m in menu)):
+        try:
+            menu.append(copy_summary_action(run, outcome))
+        except Exception:  # noqa: BLE001 — a broken summary costs its entry
+            pass
 
     errors: dict[str, str] = {}
     sections = {
@@ -4069,6 +4100,7 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
     # The design titles the run by its id and gives the human title the sub
     # line — a reader scanning the tab bar already knows which run.
     sub = title if title and title != run.id else _sub_v2(run)
+    sub = _sub_worktree(sub, run)
     page = S.page("run", run.id, sub, chips_=chips,
                   actions=header["actions"] + actions,
                   tabs=_v2_tabs(run), tab=resolved,
@@ -4076,6 +4108,7 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
                   sections=sections, errors=errors,
                   desc=_desc_fold(run, outcome, title),
                   label=header["label"], menu=menu,
+                  crumbs=header.get("crumbs") or (),
                   updated_at=header["updated_at"])
     # The header draws no GOAL / SPEC labels on this page: the sub is the
     # kickoff's own heading, and a label above it would read as a field name.
