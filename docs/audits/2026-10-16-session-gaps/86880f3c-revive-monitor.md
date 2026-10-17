@@ -106,9 +106,24 @@ revision" to **not revivable**: `hr-exec-park-20261015141603`,
    chain (`dispatch_chain_drop` line, no `providers.yaml` entry) rather than
    repaired or loudly failed. Remaining three runs in this cluster
    (`…6781-59220`, `…6890-69809` `planner_dispatch_rc_43`) are blocked by it.
+   **Fixed — `1172a9fd`** ("probe lane liveness at configuration time, and drop
+   the dead kimi default"): kimi is out of the shipped tail, and every dropped
+   tail lane is named loudly by `[dispatch_chain_drop]`/`[dispatch_chain_short]`
+   (`mini_ork/dispatch/routing.py:111`).
 5. **A deleted target is discovered at verifier time, not preflight** — six
    runs ($8.22, $4.19, $3.36, $1.21, $1.15, $1.14) reached the epic
-   verification command with `roots.target` already gone.
+   verification command with `roots.target` already gone. **Hypothesis refuted
+   2026-10-17 — the target was never the problem.** `sde-3b2-ledger`'s failing
+   check is `epic-verification-commands-pass`, and the evidence log's deepest
+   frame is `OSError: [Errno 30] Read-only file system: '/ledger-junit.xml'`:
+   the kickoff's `--junitxml="${MINI_ORK_RUN_DIR}/ledger-junit.xml"` expanded to
+   the filesystem root because `_epic_verification_commands_pass` scrubbed
+   `MINI_ORK_RUN_DIR` out of the child env along with the credentials. The
+   target existed throughout — rollback restored five paths inside it. Fixed
+   2026-10-15 16:53 by **`0f0be49f`** ("a kickoff command that names the run dir
+   gets it bound"): `test.py:496` binds it in the command and `:529` restores it
+   in the env. The worktrees being gone *now* is ordinary supervisor reaping,
+   not a run-time disappearance.
 6. **Researcher install is behind the engine** by the recovered-target fix
    (`ddc88c43`; `planner.py` grep 0 vs 2). Its recipe verifiers *are*
    byte-identical to the engine's, so only the CLI/planner path lags.
