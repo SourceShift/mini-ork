@@ -1653,10 +1653,55 @@ def _failing_links(home: Path) -> list[dict[str, Any]]:
     return [row for row in checks["rows"] if str(row.get("state") or "") == "fail"]
 
 
+#: How recent a watcher's last word must be to reach the strip. A signal older
+#: than this is history; the run page still has it.
+_WATCH_WINDOW_S = 15 * 60
+
+
+def _watch_signals(home: Path, now: int) -> list[dict[str, str]]:
+    """Live runs whose orchestrator raised trouble (or saw its owner die).
+
+    One entry per run, newest first. A signal is only interesting while the
+    run is still non-terminal; an ended ``dispatcher-dead`` row counts too
+    because the reaper may not have flipped the status yet.
+    """
+    from mini_ork import run_status
+
+    rows = _rows(
+        home,
+        "SELECT e.run_id, e.event_type, e.payload_json FROM run_events e "
+        "JOIN task_runs t ON t.id = e.run_id "
+        "WHERE e.event_type IN ('orchestrator.signal', 'orchestrator.ended') "
+        f"AND e.created_at >= ? AND t.status NOT IN {run_status.SQL_TERMINAL} "
+        "ORDER BY e.created_at DESC, e.rowid DESC LIMIT 50",
+        (now - _WATCH_WINDOW_S,),
+    )
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for row in rows:
+        run_id = str(row.get("run_id") or "")
+        if not run_id or run_id in seen:
+            continue
+        try:
+            payload = json.loads(row.get("payload_json") or "{}")
+        except ValueError:
+            payload = {}
+        if row.get("event_type") == "orchestrator.ended":
+            if payload.get("exit") != "dispatcher-dead":
+                continue
+        seen.add(run_id)
+        out.append({
+            "run": run_id,
+            "node": str(payload.get("node_id") or ""),
+            "reason": str(payload.get("reason") or ""),
+        })
+    return out
+
+
 def attention(home: Path, tab: str, errors: dict[str, str]) -> dict[str, Any] | None:
     """FR-040 — one strip saying what is blocked on the reader, or ``None``.
 
-    Four inputs, each read through the helper its own tab reads it with, so the
+    Five inputs, each read through the helper its own tab reads it with, so the
     strip cannot say 2 where the tab shows 3. Every item's button is the action
     that resolves it, which is why the errors item's is a reload of this page: a
     read that failed may succeed on the next one, and the banner at the foot of
@@ -1668,6 +1713,7 @@ def attention(home: Path, tab: str, errors: dict[str, str]) -> dict[str, Any] | 
     """
     waiting = _waiting_runs(home, errors)
     races = _undecided(_race_groups(home), _open_workspaces(home))
+    signals = _watch_signals(home, int(time.time()))
     links = _failing_links(home)
 
     # (pill, what it is, the button that resolves it), in the order a reader
@@ -1686,6 +1732,14 @@ def attention(home: Path, tab: str, errors: dict[str, str]) -> dict[str, Any] | 
             {"t": f"{n} race{'s' if n != 1 else ''}", "c": "orange"},
             f"{n} undecided race{'s' if n != 1 else ''}",
             S.btn("Decide", S.page_link("orch", tab="races"))))
+    if signals:
+        n = len(signals)
+        first = signals[0]
+        where = f"{first['run']} · {first['node']}" if first["node"] else first["run"]
+        parts.append((
+            {"t": f"{n} watching", "c": "orange"},
+            f"{n} run{'s' if n != 1 else ''} need attention: {where} — {first['reason']}",
+            S.btn("Open", S.page_link("run", run=first["run"]))))
     if links:
         n = len(links)
         parts.append((
@@ -1701,7 +1755,7 @@ def attention(home: Path, tab: str, errors: dict[str, str]) -> dict[str, Any] | 
     if not parts:
         return None
 
-    total = len(waiting) + len(races) + len(links) + len(errors)
+    total = len(waiting) + len(races) + len(signals) + len(links) + len(errors)
     return S.triage(
         f"{total} {'thing' if total == 1 else 'things'} "
         f"{'needs' if total == 1 else 'need'} you",

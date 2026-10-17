@@ -316,3 +316,93 @@ def test_the_strip_carries_one_button_per_item_and_none_for_what_is_empty(
     assert [b["label"] for b in strip["actions"]] == ["Answer", "Decide", "Re-read"]
     assert [b["kind"] for b in strip["actions"]] == ["primary", "default", "ghost"]
     assert strip["text"] == "3 things need you"
+
+
+# ── the orchestrator watcher's signals ─────────────────────────────────────
+
+def _signal(home: Path, run_id: str, *, event_type: str = "orchestrator.signal",
+            payload: dict | None = None, age_s: int = 60) -> None:
+    """One watcher event, ``age_s`` old, on a run the caller already created."""
+    con = sqlite3.connect(home / "state.db")
+    try:
+        con.execute(
+            "INSERT INTO run_events (event_id, run_id, event_type, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (f"{run_id}-{event_type}-{age_s}", run_id, event_type,
+             json.dumps(payload or {"kind": "stalled", "node_id": "impl",
+                                    "reason": "impl has been idle 12m"}),
+             int(time.time()) - age_s))
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_a_live_runs_fresh_signal_reaches_the_strip(home: Path, chain_intact, capsys) -> None:
+    _run(home, "run-stuck", status="executing")
+    _signal(home, "run-stuck")
+    strip = _strip(_page(home, "intake", capsys))
+    assert _pills(strip) == {"1 watching": "orange"}
+    assert strip["detail"] == "1 run need attention: run-stuck · impl — impl has been idle 12m"
+    assert strip["text"] == "1 thing needs you"
+    assert _button(strip, "Open")["do"] == {"page": "run", "args": {"run": "run-stuck"}}
+
+
+def test_a_finished_runs_signal_is_history_not_attention(
+        home: Path, chain_intact, capsys) -> None:
+    """The watcher writes its last rows before status settles; the tab refuses
+    to nag about a run that is already over."""
+    _run(home, "run-done", status="published")
+    _signal(home, "run-done")
+    assert _section(_page(home, "intake", capsys), "triage") is None
+
+
+def test_an_old_signal_ages_out(home: Path, chain_intact, capsys) -> None:
+    _run(home, "run-stale", status="executing")
+    _signal(home, "run-stale",
+            age_s=orch._WATCH_WINDOW_S + 60)
+    assert _section(_page(home, "intake", capsys), "triage") is None
+
+
+def test_a_dead_dispatcher_is_attention_even_before_the_reaper_flips_status(
+        home: Path, chain_intact, capsys) -> None:
+    """The reaper owns ``status``; the watcher's ``ended`` row is often first."""
+    _run(home, "run-orphan", status="executing")
+    _signal(home, "run-orphan", event_type="orchestrator.ended",
+            payload={"exit": "dispatcher-dead", "node_id": "impl",
+                     "reason": "dispatcher pid 42 is gone"})
+    strip = _strip(_page(home, "intake", capsys))
+    assert _pills(strip) == {"1 watching": "orange"}
+    assert "dispatcher pid 42 is gone" in strip["detail"]
+
+
+def test_an_ordinary_end_is_not_attention(home: Path, chain_intact, capsys) -> None:
+    """A run that finished normally, or whose watcher exited for its own
+    reasons, did not need the reader."""
+    _run(home, "run-ended", status="executing")
+    for index, exit_reason in enumerate(("terminal:executing", "max-lifetime", "disabled")):
+        _signal(home, "run-ended", event_type="orchestrator.ended",
+                payload={"exit": exit_reason}, age_s=60 + index)
+    assert _section(_page(home, "intake", capsys), "triage") is None
+
+
+def test_one_entry_per_run_newest_signal_first(home: Path, chain_intact, capsys) -> None:
+    """A run with four signals is one thing needing the reader, not four."""
+    _run(home, "run-noisy", status="executing")
+    for age in (300, 240, 180, 60):
+        _signal(home, "run-noisy", payload={
+            "kind": "stalled", "node_id": "impl", "reason": f"idle {age}s"}, age_s=age)
+    strip = _strip(_page(home, "intake", capsys))
+    assert _pills(strip) == {"1 watching": "orange"}
+    assert "idle 60s" in strip["detail"]
+    assert "idle 300s" not in strip["detail"]
+
+
+def test_the_signal_count_joins_the_other_items_in_the_total(
+        home: Path, chain_intact, capsys) -> None:
+    _parked(home, "run-parked")
+    _run(home, "run-stuck", status="executing")
+    _signal(home, "run-stuck")
+    strip = _strip(_page(home, "intake", capsys))
+    assert _pills(strip) == {"1 waiting": "yellow", "1 watching": "orange"}
+    assert strip["text"] == "2 things need you"
+    assert [b["label"] for b in strip["actions"]] == ["Answer", "Open"]
