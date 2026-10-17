@@ -194,15 +194,30 @@ git merge-base --is-ancestor 899107f0 origin/main   # C18+C21 crumbs, worktree s
   navigation exists and never a fabricated crumb; the v2 sub regains the worktree
   path; a `Copy summary` menu entry pastes goal, outcome line, verification vector,
   cost and the `mini-ork://run/<id>` link, each line best-effort.
+- **C10** (`5379395a`, run `run-1792243065-98237`, verdict pass, 329-test independent
+  re-run) — a `Did it meet the criteria` table under the outcome verdict, one row per
+  kickoff criterion marked met / unmet / unknown, decided by the verdict's own
+  criterion entries first, then a failed check, then a PROVEN level's evidence; an
+  undecided row says `No check names this criterion.` and only decided rows carry a
+  click-through. The rows are also stamped on `outcome["criteria"]`. Live check on the
+  run's own history: `run-1792243065-98237` renders `2 met · 0 unmet · 0 unknown`.
+- **C16** (`8e69e70a`, run `run-1792245136-98759`, verdict pass, 342-test independent
+  re-run) — a Spend section under the outcome and on Checks: spent vs the per-run cap
+  (the watcher's own resolver), today's spend vs the daily cap, remaining, and a
+  projection only for a running run past its first minute; the outcome carries a
+  `spend` block for the IDE. The run's first cut monkeypatched `json.dumps` globally
+  from a page module — removed before landing; the section is a plain dict.
+  Renders for `hr-smoke-b-152611`: `$0.84 of a $1.00 per-run cap · $0.16 left`,
+  `Daily $33.56 of a $225.00 cap`, `at this rate, ~$1.68 by the end`.
+- **Blame taxonomy** (`5c255d39`) — `impl_moved_base` and `dispatcher-dead` now
+  attribute to `mini_ork` (new `harness` evidence rule), so C25's callout offers the
+  triage action on a harness failure instead of saying it cannot tell. The harness
+  reason outranks a provider signature; artifact verdicts stay `consumer`, infra
+  reasons stay `unknown`. 41 + 13 tests, CLI proof pasted in the run log.
 
 **Still open:** the IDE renderer halves (C1, C2, C12-render, C13-render, C14-render, C24,
-C26) and the engine halves C10 (criteria checklist), C16 (cost cap), C17 (de-duplicate
-roster/Buddy) and the remaining C-series items. SDD option A-vs-B remains blocked on
-the user.
-
-**Follow-up found while landing C25:** `triage.blame` attributes
-`finish_reason=impl_moved_base` and ACP `dispatcher-dead` to `unknown`, though both are
-the harness's own outcome. The taxonomy should own them; not filed as a run yet.
+C26) and engine C17 (roster de-dupe + fallback flag, in flight: `wt/rp-c17`) plus the
+remaining C-series items. SDD option A-vs-B remains blocked on the user.
 
 **Incident, same day:** the first C9+C12 dispatch was killed after its `code_impact_lens`
 found a deterministic scope conflict — the kickoff forbade editing the two tests that pin
