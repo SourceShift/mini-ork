@@ -17,7 +17,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from mini_ork.ide_pages import _cn as _CN
 from mini_ork.ide_pages import outcome as O
@@ -1157,23 +1157,28 @@ def _graph(run: Run, wanted: str | None = None) -> dict[str, Any]:
 
 
 def _dag_tab(run: Run, wanted: str | None, *, select: bool = False,
-             outcome: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+             outcome: dict[str, Any] | None = None,
+             callout_actions: Iterable[dict[str, Any]] | None = None
+             ) -> list[dict[str, Any]]:
     """The redesign's DAG tab: outcome, questions, graph, the selected node,
     the coalition and the verifier rows — in the order the design reads.
 
     ``select`` is the run page's own DAG: a node click picks it in place
     (the IDE re-renders with ``args.node``) instead of opening the node tab.
     Level 1 keeps the old behaviour and the old section order.
+
+    ``callout_actions`` is the outcome's own buttons already filtered by the
+    caller: the header sits above every tab and draws up to two controls, so
+    the page subtracts those before handing the rest to the callout body — the
+    design's ``bodyActs``.
     """
     errors: dict[str, str] = {}
     sel = _selected(run, wanted)
     resolved_outcome = outcome if outcome is not None else O.resolve(run)
+    drawn_actions = list(callout_actions or ())
 
     def outcome_block() -> dict[str, Any]:
-        # The header draws this state's controls (Stop/Kill, Merge, the menu),
-        # and it sits directly above every tab, so the callout carries the
-        # reading only — the same rule ``build_header`` states for the triage.
-        actions: list[dict[str, Any]] = []
+        actions: list[dict[str, Any]] = list(drawn_actions)
         return S.callout(resolved_outcome.get("text") or "",
                          resolved_outcome.get("detail") or "",
                          tone=resolved_outcome.get("tone") or "muted",
@@ -3201,7 +3206,9 @@ def _desc_fold(run: Run, outcome: dict[str, Any] | None = None, title: str = "")
     return _desc_wrap(" ".join(p for p in (intent, rest) if p))
 
 
-def _outcome_tab(run: Run, outcome: dict[str, Any]) -> list[dict[str, Any]]:
+def _outcome_tab(run: Run, outcome: dict[str, Any],
+                 callout_actions: Iterable[dict[str, Any]] | None = None
+                 ) -> list[dict[str, Any]]:
     """The v2 outcome: what happened, what it was for, what it ran on.
 
     Order is the design's: the verdict, the evidence under it, the goal and
@@ -3210,10 +3217,14 @@ def _outcome_tab(run: Run, outcome: dict[str, Any]) -> list[dict[str, Any]]:
     decision material. Everything the old Overview tab carried that has no
     newer home (retry hints, inputs, orchestrator, correlation, events, files)
     tails the page rather than being dropped.
+
+    ``callout_actions`` is the outcome's own buttons minus the ones the header
+    draws, so the verdict carries the design's ``bodyActs`` without repeating
+    a control the header already offers.
     """
     triage = S.triage(outcome["text"], tone=outcome["tone"], icon=outcome["icon"],
                       detail=outcome["detail"], counts=outcome["counts"],
-                      actions=[], menu=[])
+                      actions=list(callout_actions or ()), menu=[])
     # The node and reason the triage names, when there is one. ``spec.triage``
     # has no keyword for them, so they are attached additively here — an IDE
     # that does not know the keys ignores them, and a run with no failed or
@@ -3344,48 +3355,65 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
     if resolved not in keys:
         resolved = "dag"
     node = args.get("node")
+
+    # The header fields are the same on every tab: the label names the run and
+    # the controls (Stop/Kill while it runs, Merge/Discard when it is done) sit
+    # beside them, so a user on the DAG tab can still stop a runaway run.
+    header = build_header(run, outcome)
+    actions = [a for a in (S.btn("Open run folder", S.open_path(str(run.run_dir))),
+                           _orchestrator_action(run)) if a]
+    # One label, one control: subtract everything the header draws — its own
+    # buttons plus the page's — before the outcome's remaining buttons go to
+    # the callout body (the design's ``bodyActs``).
+    drawn = {str(a.get("label") or "") for a in header["actions"] + actions}
+    callout_actions = [a for a in (outcome.get("actions") or [])
+                       if isinstance(a, dict) and str(a.get("label") or "") not in drawn]
+    # The design's done state offers the diff beside the verdict; the changes
+    # moved to the Artifacts tab, so the button goes there.
+    if str(outcome.get("state") or "") == "done" and _card_files(run):
+        callout_actions.append(
+            S.btn("Open diff", S.page_link("run", "artifacts", run=run.id)))
+    callout_labels = {str(a.get("label") or "") for a in callout_actions}
+    # A callout is drawn on the DAG and Outcome tabs only: on the others the
+    # menu must keep the buttons no callout is showing.
+    in_callout = callout_labels if resolved in ("dag", "outcome") else set()
+    menu = [m for m in header["menu"]
+            if str(m.get("label") or "") not in drawn | in_callout]
+
     sections = {
-        "dag": lambda: _dag_tab(run, node, select=True, outcome=outcome),
-        "outcome": lambda: _outcome_tab(run, outcome),
+        "dag": lambda: _dag_tab(run, node, select=True, outcome=outcome,
+                                callout_actions=callout_actions),
+        "outcome": lambda: _outcome_tab(run, outcome, callout_actions),
         "kickoff": lambda: _kickoff_tab(run, code_presentation=True),
         "agents": lambda: _agents_tab(run),
         "learnings": lambda: _learnings_tab(run),
         "artifacts": lambda: _artifacts_tab(run, changes=True),
     }[resolved]()
-    chips = [S.chip(O.chip_word(run, outcome["state"]), outcome["tone"]),
-             S.chip(S.money(_cost(run))), S.chip(_elapsed(run))]
-    placement = _placement_chip(run)
-    if placement:
-        chips.insert(1, placement)
+
+    # The design's header strip: state, how far, what it cost, which recipe.
+    # Placement and elapsed are this page's older chips; they trail the four
+    # the design names rather than pushing them out of order.
+    waiting = len(open_asks(run.run_dir))
+    chips = []
+    if waiting:
+        chips.append(S.chip(f"✋ {waiting} question{'s' if waiting > 1 else ''}", "yellow"))
+    chips.append(S.chip(O.chip_word(run, outcome["state"]), outcome["tone"]))
     done = sum(1 for n in run.nodes if n.state == "done")
     if run.nodes:
         chips.append(S.chip(f"{done}/{len(run.nodes)} nodes"))
+    chips.append(S.chip(S.money(_cost(run))))
     recipe = str(run.card.get("recipe") or run.row.get("recipe") or "")
     if recipe:
         chips.append(S.chip(recipe))
-    # A run that stopped on a question says so in the header: the questions
-    # folded into the DAG tab, so the tab bar can no longer carry the count.
-    waiting = len(open_asks(run.run_dir))
-    if waiting:
-        chips.insert(0, S.chip(f"✋ {waiting} question{'s' if waiting > 1 else ''}", "yellow"))
-    title = _title_v2(run)
-    # The header fields are the same on every tab: the label names the run and
-    # the controls (Stop/Kill while it runs, Merge/Discard when it is done) sit
-    # beside them, so a user on the DAG tab can still stop a runaway run.
-    # ``build_header`` owns "which controls for this state"; the triage below
-    # draws none, so nothing is offered twice.
-    header = build_header(run, outcome)
+    placement = _placement_chip(run)
+    if placement:
+        chips.append(placement)
+    chips.append(S.chip(_elapsed(run)))
 
+    title = _title_v2(run)
     # The design titles the run by its id and gives the human title the sub
     # line — a reader scanning the tab bar already knows which run.
     sub = title if title and title != run.id else _sub_v2(run)
-    actions = [a for a in (S.btn("Open run folder", S.open_path(str(run.run_dir))),
-                           _orchestrator_action(run)) if a]
-    # ``build_header`` only subtracts the outcome's own buttons from its menu;
-    # the run-folder button this page adds is also one of the outcome's menu
-    # entries, so subtract it here rather than drawing the same action twice.
-    drawn = {str(a.get("label") or "") for a in header["actions"] + actions}
-    menu = [m for m in header["menu"] if str(m.get("label") or "") not in drawn]
     page = S.page("run", run.id, sub, chips_=chips,
                   actions=header["actions"] + actions,
                   tabs=_v2_tabs(run, waiting), tab=resolved,
