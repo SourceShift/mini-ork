@@ -52,7 +52,7 @@ TABS = [("dag", "DAG"), ("kickoff", "Kickoff"), ("overview", "Overview"), ("agen
 # DAG tab beside the nodes that stopped on them. Old keys still resolve so a
 # stale IDE link lands somewhere sensible.
 V2_TABS = [("dag", "DAG"), ("outcome", "Outcome"), ("checks", "Checks"),
-           ("kickoff", "Kickoff"), ("agents", "Agents"),
+           ("changes", "Changes"), ("kickoff", "Kickoff"), ("agents", "Agents"),
            ("learnings", "Learnings"), ("artifacts", "Artifacts")]
 V2_ALIASES = {"story": "outcome", "graph": "dag", "questions": "dag",
               "overview": "outcome", "verification": "checks"}
@@ -3935,6 +3935,51 @@ def _story_tab(run: Run, outcome: dict[str, Any]) -> list[dict[str, Any]]:
     """
     return _outcome_tab(run, outcome)
 
+
+# Patch artefacts a run can leave behind, in the order the Changes tab's
+# "Open as patch" action prefers them.
+_PATCH_CANDIDATES = ("framework-edit.diff", "diff.patch", "changes.diff")
+
+
+def _patch_action(run: Run) -> dict[str, Any] | None:
+    """``Open as patch`` for the first patch artefact on disk, else ``None``.
+
+    A button is only emitted for a file that really exists — a dead link is
+    worse than no link.
+    """
+    for name in _PATCH_CANDIDATES:
+        path = run.run_dir / name
+        if path.is_file():
+            return S.btn("Open as patch", S.open_path(str(path)))
+    return None
+
+
+def _changes_tab(run: Run, errors: dict[str, str]) -> list[dict[str, Any]]:
+    """The Changes tab: the dock's changes sections, reused fail-soft.
+
+    The dock already owns the diff loader, the changed-file list and the
+    commits (``run_dock._changes_sections``), so this tab composes that
+    builder rather than re-deriving it. Imported lazily because ``run_dock``
+    imports this module — the same dance as ``_attach_flow``. A builder that
+    raises costs the tab one quiet empty-state section, never the page.
+    """
+    try:
+        from mini_ork.ide_pages import run_dock
+
+        sections = run_dock._changes_sections(run, errors)
+    except Exception:  # noqa: BLE001 — a broken builder must not blank the tab
+        sections = []
+    if not isinstance(sections, list) or not sections:
+        sections = [S.lst("Changed files",
+                          [S.dot("No changes recorded for this run")], full=False)]
+    action = _patch_action(run)
+    if action is not None:
+        first = dict(sections[0])
+        first["actions"] = [action, *(first.get("actions") or [])]
+        sections[0] = first
+    return sections
+
+
 def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     """The ``MINI_ORK_IDE_SPEC=2`` page: the run id, its outcome, its graph.
 
@@ -3984,12 +4029,14 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
     menu = [m for m in header["menu"]
             if str(m.get("label") or "") not in drawn | in_callout]
 
+    errors: dict[str, str] = {}
     sections = {
         "dag": lambda: _dag_tab(run, node, select=True, outcome=outcome,
                                 callout_actions=callout_actions),
         "outcome": lambda: _outcome_tab(run, outcome, callout_actions, absorbed),
         "verification": lambda: _verification_tab(run),
         "checks": lambda: _checks_tab(run),
+        "changes": lambda: _changes_tab(run, errors),
         "kickoff": lambda: _kickoff_tab(run, code_presentation=True),
         "agents": lambda: _agents_tab(run),
         "learnings": lambda: _learnings_tab(run),
@@ -4026,7 +4073,8 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
                   actions=header["actions"] + actions,
                   tabs=_v2_tabs(run), tab=resolved,
                   args={"run": run.id, **({"node": node} if node else {})},
-                  sections=sections, desc=_desc_fold(run, outcome, title),
+                  sections=sections, errors=errors,
+                  desc=_desc_fold(run, outcome, title),
                   label=header["label"], menu=menu,
                   updated_at=header["updated_at"])
     # The header draws no GOAL / SPEC labels on this page: the sub is the
