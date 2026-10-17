@@ -493,6 +493,149 @@ def _gate_hint(gate: dict[str, Any]) -> dict[str, Any]:
     return hint if isinstance(hint, dict) else {}
 
 
+# ── display words ──────────────────────────────────────────────────────────
+#
+# One table, one helper. The page is read by a person deciding "retry or
+# abandon", so a database enum must never reach a chip or the triage line. Every
+# emit site calls ``display_word`` rather than spelling the substitution inline:
+# a new enum then gets human words in one place instead of leaking snake_case.
+
+_DISPLAY_WORDS = {
+    "needs_change": "Needs changes",
+    "needs_you": "Needs you",
+    "awaiting_review": "Awaiting review",
+    "passed": "Passed",
+    "failed": "Failed",
+    "done": "Done",
+    "running": "Running",
+    "published": "Published",
+    "rolled_back": "Rolled back",
+    "not_needed": "Not needed",
+    "reviewing": "Reviewing",
+    "pending": "Pending",
+    "skipped": "Skipped",
+}
+
+
+def chip_word(run, state: str) -> str:
+    """The header chip's word for the outcome ``state``.
+
+    A run the database marks failed always says so on the chip, even when the
+    card's own word is ``needs_you`` (a retry gate is open): the reader must
+    not see "Needs you" on a run the database calls failed. Every other state
+    maps straight through :func:`display_word`, so a parked run still reads
+    "Needs you" and a published one "Done".
+    """
+    if state == "needs_you" and _status(run) in _FAILED:
+        return display_word("failed")
+    return display_word(state)
+
+
+def display_word(value: Any) -> str:
+    """``value`` as display text a person reads — never a database enum.
+
+    The table names the enums the run page actually renders; anything else is
+    spaced and capitalised, so a newly added enum still cannot put snake_case
+    on a chip. Empty input stays empty (the caller omits the field).
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    known = _DISPLAY_WORDS.get(raw.casefold())
+    if known:
+        return known
+    words = raw.replace("_", " ").strip()
+    return words[:1].upper() + words[1:]
+
+
+# ── triage subject ─────────────────────────────────────────────────────────
+
+# A node in one of these states is finished and must never be named as the
+# thing that failed or blocked the run (kickoff c:0).
+_PASSED_STATES = ("done", "passed")
+
+
+def _first_failed_node(run):
+    """The first node whose state is ``failed`` in story order, or ``None``."""
+    for node in run.nodes:
+        if str(getattr(node, "state", "") or "") == "failed":
+            return node
+    return None
+
+
+def _nameable(run, node_id: str) -> str:
+    """``node_id`` unless the story says that node is done/passed (then ``""``).
+
+    The lifecycle can disagree with the folded story after a recover re-run; the
+    page never names a node it also draws as finished.
+    """
+    for node in run.nodes:
+        if node.id == node_id:
+            return "" if str(node.state or "") in _PASSED_STATES else node_id
+    return node_id
+
+
+def _reason_for(run, node_id: str) -> str:
+    """``run._node_reason`` for ``node_id`` — its review → verifier → hint
+    fallbacks, imported rather than re-implemented (kickoff c:1)."""
+    for node in run.nodes:
+        if node.id == node_id:
+            try:
+                return str(_run_mod()._node_reason(run, node) or "").strip()
+            except Exception:  # noqa: BLE001 — a reason is never worth the page
+                return ""
+    return ""
+
+
+def _triage_subject(run) -> tuple[str, str]:
+    """The node the triage names and its one-line reason, or ``("", "")``.
+
+    The kickoff's rule order, first match wins:
+
+    1. the first node whose state is ``failed`` in story order;
+    2. else the node awaiting a human — a pending review, or the node an open
+       ask blocks on;
+    3. else the node of the open retry gate the callout is about.
+
+    A ``done``/``passed`` node is never named. When none of the rules finds a
+    node the caller omits the field rather than guessing.
+    """
+    failed = _first_failed_node(run)
+    if failed is not None:
+        return failed.id, _reason_for(run, failed.id)
+
+    rm = _run_mod()
+    try:
+        awaiting = rm._awaiting_node_ids(run)
+    except Exception:  # noqa: BLE001 — awaiting a human is optional
+        awaiting = []
+    for node_id in awaiting:
+        # The done/passed guard is absolute (c:0): a block is named only when
+        # the story does not already draw that node as finished. When the
+        # pending review's own node has finished, fall through to the next
+        # awaiting node and then to the gate rather than naming a passed node.
+        nameable = _nameable(run, node_id) if node_id else ""
+        if nameable:
+            return nameable, ""
+
+    gate = _pending_gate(run)
+    if isinstance(gate, dict):
+        hint = _gate_hint(gate)
+        for key in ("from_node", "failed_node", "node_id", "node"):
+            node_id = str(hint.get(key) or "").strip()
+            nameable = _nameable(run, node_id) if node_id else ""
+            if nameable:
+                return nameable, _reason_for(run, nameable)
+        ctxt = gate.get("context") if isinstance(gate.get("context"), dict) else {}
+        for key in ("node_id", "node"):
+            node_id = str(ctxt.get(key) or "").strip()
+            nameable = _nameable(run, node_id) if node_id else ""
+            if nameable:
+                return nameable, _reason_for(run, nameable)
+
+    return "", ""
+
+
 # ── counts / menu ──────────────────────────────────────────────────────────
 
 def _verifier_checks(run) -> tuple[int, int]:
@@ -650,9 +793,15 @@ def _failed(run, hint: dict[str, Any] | None) -> dict[str, Any]:
     card = _card_detail(run)
     if card == "Failed":  # task_state's FAILED_FALLBACK: no failing node recorded
         card = ""
-    node = ""
-    if isinstance(hint, dict):
-        node = str(hint.get("from_node") or hint.get("failed_node") or "")
+    # The story's own first failed node beats the hint's node: the hint may be
+    # a best-effort guess from an impl log, while a node the page draws as
+    # failed is the fact the reader can check. A done/passed node is never
+    # named (the hint can outlive a recover re-run that finished it).
+    first = _first_failed_node(run)
+    hint_node = str(hint.get("from_node") or hint.get("failed_node") or "") \
+        if isinstance(hint, dict) else ""
+    node = _nameable(run, first.id if first is not None else hint_node) \
+        if (first is not None or hint_node) else ""
     if card:
         text = card
     elif _failing_node_id(run) is None:
@@ -664,6 +813,10 @@ def _failed(run, hint: dict[str, Any] | None) -> dict[str, Any]:
     else:
         text = f"Failed at {node}" if node else "Failed"
     detail = _failure_detail(run, hint)
+    if not detail and node:
+        # The retry-hint notes are ``_node_reason``'s last fallback, so a run
+        # whose only record of the failure is the hint still says why.
+        detail = _reason_for(run, node)
     actions, revised = _failed_actions(run, hint)
     if revised and revised not in detail:
         detail = f"{detail.rstrip('. ')}. {revised}" if detail else revised
@@ -987,6 +1140,21 @@ def resolve(run) -> dict[str, Any]:
         else:
             out = _published(run)
     out.setdefault("callouts", [])
+    # Three readers of "who failed or is blocked": the chip (state), the triage
+    # text (the sentence) and these two fields (the node and the one-line
+    # reason). A run that already ended (landed / published) names no node —
+    # its chip says done and the triage must not contradict it.
+    node, reason = ("", "") if out["state"] == "done" else _triage_subject(run)
+    if out["state"] == "needs_you" and node and _first_failed_node(run) is not None:
+        # A retry gate over a run whose story records a failed node: the gate's
+        # hint can be stale (its node has since finished), so the headline names
+        # the node the page actually draws as failed. The gate's own callout
+        # below still carries the decision and its fix steps.
+        out["text"] = f"Failed at {node} · needs your decision"
+        if reason:
+            out["detail"] = reason
+    out["node"] = node
+    out["reason"] = reason
     out["counts"] = _counts(run)
     out["menu"] = _menu(run, out["actions"])
     return out

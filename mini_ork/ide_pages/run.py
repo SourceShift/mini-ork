@@ -668,6 +668,38 @@ def _pending_node_ids(run: Run) -> list[str]:
     return out
 
 
+def _awaiting_node_ids(run: Run, *, include_pending_reviews: bool = True) -> list[str]:
+    """The nodes a human still has to act on: pending review rows, then the
+    node an unanswered ask blocks on, in that order.
+
+    One owner for both readers: the DAG's focus (``_graph``) and the triage's
+    node both ask "who is waiting on a person?", so they cannot name different
+    nodes for the same run. ``include_pending_reviews`` lets ``_graph`` keep its
+    parked-only DB read (a dock render stays DB-free). Every reader fails soft
+    to ``[]``: one broken source costs its own rows, never the caller.
+    """
+    awaiting: list[str] = []
+    if include_pending_reviews:
+        awaiting.extend(_pending_node_ids(run))
+    try:
+        asks = run.run_dir / "asks"
+        for name in sorted(n for n in os.listdir(asks)
+                           if n.startswith("ask-") and n.endswith(".json")):
+            ask = _json_obj(asks / name)
+            if not isinstance(ask, dict) or str(ask.get("answer") or "").strip():
+                continue
+            nid = str(ask.get("node_id") or ask.get("node") or "").strip()
+            refs = ask.get("blocking_refs")
+            if not nid and isinstance(refs, list) and refs:
+                nid = str(refs[0]).strip()
+            if nid and nid not in awaiting:
+                awaiting.append(nid)
+                break
+    except Exception:  # noqa: BLE001 — asks are optional; never blank the caller
+        pass
+    return awaiting
+
+
 def _merge_review_section(run: Run) -> list[dict[str, Any]]:
     """The "Merge review" chip for a run whose policy requires human approval.
 
@@ -840,6 +872,13 @@ def _verdict(run: Run, node: Node) -> tuple[str, str]:
     return "—", "sub"
 
 
+# A review verdict that says the change passed. When the node itself is in a
+# failed state, such a file is the earlier attempt's leftover (a re-dispatched
+# reviewer whose last attempt died before writing its verdict is the common
+# case) — its note explains no failure and must not become the reason.
+_PASSING_VERDICTS = frozenset({"pass", "passed", "ok", "approve", "approved", "done"})
+
+
 def _node_reason(run: Run, node: Node) -> str:
     """One line saying why ``node`` failed or is blocked — ``""`` when nothing does.
 
@@ -848,9 +887,13 @@ def _node_reason(run: Run, node: Node) -> str:
     1. the node's verdict note — the first reason text of its
        ``review-<id>.json`` (``reasons`` → ``notes`` → ``findings``), the read
        ``ide_pages.node._overview_reviewer_headline(run_dir, node)`` uses, so the
-       DAG and the node tab name one vocabulary rather than two;
+       DAG and the node tab name one vocabulary rather than two. A review that
+       *passed* is skipped for a failed node: it is a leftover from an earlier
+       attempt and explains nothing about this failure;
     2. the first ``error`` / ``summary`` line of its ``verifier_<id>.json``;
-    3. ``retry-hint.json``'s ``notes[0]`` when its ``failed_node`` is this node.
+    3. ``retry-hint.json``'s ``notes[0]`` when its ``failed_node`` is this node;
+    4. the node's own ``finish`` (``verdict_fail``, ``error``, ``timeout``) in
+       display words, when no artefact explains it.
 
     Guarded: any exception returns ``""``. The caller omits the key, so a
     dotted or unreadable run dir costs the reason, never the page.
@@ -873,15 +916,20 @@ def _node_reason(run: Run, node: Node) -> str:
             lines = [ln.strip() for ln in str(text).splitlines() if ln.strip()]
             return lines[0] if lines else ""
 
-        # 1. the node's own verdict note.
+        # 1. the node's own verdict note — unless the review passed while the
+        #    node is down: that note describes an earlier, successful attempt.
         review = d / f"review-{node.id}.json"
         if review.is_file():
             obj = _json_obj(review)
             if isinstance(obj, dict):
-                for key in ("reasons", "notes", "findings"):
-                    text = first_line(obj.get(key))
-                    if text:
-                        return _clip(text, 80)
+                verdict = str(obj.get("verdict") or "").strip().lower()
+                stale_pass = (str(node.state or "") == "failed"
+                              and verdict in _PASSING_VERDICTS)
+                if not stale_pass:
+                    for key in ("reasons", "notes", "findings"):
+                        text = first_line(obj.get(key))
+                        if text:
+                            return _clip(text, 80)
 
         # 2. the first error / summary line of its verifier json.
         verifier = _json_obj(d / f"verifier_{node.id}.json")
@@ -897,6 +945,12 @@ def _node_reason(run: Run, node: Node) -> str:
             text = first_line(hint.get("notes"))
             if text:
                 return _clip(text, 80)
+
+        # 4. the node's own finish reason, in display words (never the raw
+        #    enum), when no artefact explains it.
+        finish = str(getattr(node, "finish", "") or "").strip()
+        if str(node.state or "") == "failed" and finish:
+            return _clip(O.display_word(finish), 80)
         return ""
     except Exception:  # noqa: BLE001 — a reason must never blank the page
         return ""
@@ -999,27 +1053,9 @@ def _graph(run: Run, wanted: str | None = None) -> dict[str, Any]:
     # The nodes a human still has to act on: a parked run's pending review
     # rows (the same DB read the parked callout makes — skipped unless the
     # run is actually parked, so a dock render stays DB-free), then an
-    # unanswered ask's node. ``open_asks`` projects no node id, so the ask
-    # file itself is read for the one it carries.
-    awaiting: list[str] = []
-    if _is_parked_run(run):
-        awaiting.extend(_pending_node_ids(run))
-    try:
-        asks = run.run_dir / "asks"
-        for name in sorted(n for n in os.listdir(asks)
-                           if n.startswith("ask-") and n.endswith(".json")):
-            ask = _json_obj(asks / name)
-            if not isinstance(ask, dict) or str(ask.get("answer") or "").strip():
-                continue
-            nid = str(ask.get("node_id") or ask.get("node") or "").strip()
-            refs = ask.get("blocking_refs")
-            if not nid and isinstance(refs, list) and refs:
-                nid = str(refs[0]).strip()
-            if nid and nid not in awaiting:
-                awaiting.append(nid)
-                break
-    except Exception:  # noqa: BLE001 — asks are optional; never blank the graph
-        pass
+    # unanswered ask's node. One helper with the triage's own reader, so the
+    # DAG focus and the triage never name different waiting nodes.
+    awaiting = _awaiting_node_ids(run, include_pending_reviews=_is_parked_run(run))
     holding = set(awaiting)
 
     def state_of(n: Node) -> str:
@@ -2898,9 +2934,18 @@ def _story_tab(run: Run, outcome: dict[str, Any]) -> list[dict[str, Any]]:
     header from ``run_header.build_header``, and drawing them in both places
     would offer every control twice (with two different toasts).
     """
-    sections = [S.triage(outcome["text"], tone=outcome["tone"], icon=outcome["icon"],
-                         detail=outcome["detail"], counts=outcome["counts"],
-                         actions=[], menu=[])]
+    triage = S.triage(outcome["text"], tone=outcome["tone"], icon=outcome["icon"],
+                      detail=outcome["detail"], counts=outcome["counts"],
+                      actions=[], menu=[])
+    # The node and reason the triage names, when there is one. ``spec.triage``
+    # has no keyword for them, so they are attached additively here — an IDE
+    # that does not know the keys ignores them, and a run with no failed or
+    # blocked node omits both rather than guessing.
+    if str(outcome.get("node") or "").strip():
+        triage["node"] = str(outcome["node"]).strip()
+    if str(outcome.get("reason") or "").strip():
+        triage["reason"] = str(outcome["reason"]).strip()
+    sections = [triage]
     sections.extend(outcome.get("callouts") or [])
     profile = _run_profile(run)
     goal = str(profile.get("user_goal") or "").strip()
@@ -2968,7 +3013,7 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
         "learnings": lambda: _learnings_tab(run),
         "artifacts": lambda: _artifacts_tab(run),
     }[resolved]()
-    chips = [S.chip(outcome["state"], outcome["tone"]),
+    chips = [S.chip(O.chip_word(run, outcome["state"]), outcome["tone"]),
              S.chip(S.money(_cost(run))), S.chip(_elapsed(run))]
     placement = _placement_chip(run)
     if placement:
