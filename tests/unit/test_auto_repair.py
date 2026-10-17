@@ -120,6 +120,7 @@ class _FakePopen:
         self.stdout = None
         self.stderr = None
         _CALLS.append((self.argv, dict(kw.get("env") or {})))
+        _SPAWN_CWDS.append(kw.get("cwd"))
 
     def communicate(self, input=None, timeout=None):
         return b"", b""
@@ -138,11 +139,13 @@ class _FakePopen:
 
 
 _CALLS: list[tuple[list[str], dict]] = []
+_SPAWN_CWDS: list[str | None] = []
 
 
 @pytest.fixture
 def spawned(monkeypatch):
     _CALLS.clear()
+    _SPAWN_CWDS.clear()
     monkeypatch.setattr(subprocess, "Popen", _FakePopen)
     return _CALLS
 
@@ -343,6 +346,54 @@ def test_a_non_lifecycle_spawn_is_not_told_to_wait(home, monkeypatch, spawned):
     ar.apply(home, RUN, ar.decide(home, RUN))  # sweep / board: no run record held
     _argv, env = _recover_spawns(spawned)[0]
     assert "MO_AUTO_REPAIR_WAIT_PID" not in env
+
+
+def _seed_roots(run_dir: Path, *, target: str, engine: str) -> None:
+    prof = json.loads((run_dir / "run_profile.json").read_text())
+    prof["roots"] = {"target": target, "run_dir": str(run_dir),
+                     "home": str(run_dir.parent.parent), "engine": engine}
+    (run_dir / "run_profile.json").write_text(json.dumps(prof))
+
+
+def test_a_gone_target_refuses_the_spawn_and_hands_the_run_over(
+        home, monkeypatch, spawned, tmp_path):
+    """A resume of a cleaned worktree cannot run; say so instead of spawning it.
+
+    ``recover`` resolves the recipe before it checks the target, so a spawn into
+    the dead tree dies on ``workflow.yaml not found`` — blaming the engine while
+    the real blocker is a missing directory.
+    """
+    run_dir = _seed(home)
+    gone = tmp_path / "cleaned-worktree"
+    _seed_roots(run_dir, target=str(gone), engine=str(REPO))
+    _stub_hint(monkeypatch, _hint(kind="code", summary="x", detail=""))
+
+    result = ar.apply(home, RUN, ar.decide(home, RUN))
+
+    assert _recover_spawns(spawned) == []
+    assert result["spawned"] is False and result["refused"] == "target-gone"
+    data = json.loads((run_dir / "repair.json").read_text())
+    assert data["state"] == "gave_up"
+    assert data["attempts"][-1]["action"] == "human"
+    assert str(gone) in data["attempts"][-1]["reason"]
+
+
+def test_a_dead_launch_root_falls_back_to_the_recorded_engine(
+        home, monkeypatch, spawned, tmp_path):
+    run_dir = _seed(home)
+    target = tmp_path / "target"
+    target.mkdir()
+    engine = tmp_path / "engine"
+    engine.mkdir()
+    _seed_roots(run_dir, target=str(target), engine=str(engine))
+    monkeypatch.setenv("MINI_ORK_ROOT", str(tmp_path / "gone-worktree"))
+    _stub_hint(monkeypatch, _hint(kind="code", summary="x", detail=""))
+
+    ar.apply(home, RUN, ar.decide(home, RUN))
+
+    _argv, env = _recover_spawns(spawned)[0]
+    assert env["MINI_ORK_ROOT"] == str(engine)
+    assert str(engine) in _SPAWN_CWDS
 
 
 def test_wait_for_spawner_is_a_noop_when_unmarked(monkeypatch):

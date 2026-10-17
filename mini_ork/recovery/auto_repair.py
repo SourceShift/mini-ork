@@ -1157,6 +1157,16 @@ def apply(home: Path, run_id: str, decision: dict[str, Any], *,
                                  wait_for_exit=wait_for_exit)
         result.update(spawned)
         result["command"] = spawned.get("command", "")
+        if spawned.get("spawned") is False:
+            # The attempt was recorded as ``repairing`` but nothing runs: hand
+            # the run over exactly as a child that bailed before dispatching
+            # does (``note_stuck``), so ``repair.json`` names the real blocker
+            # instead of promising a repair that never started.
+            handoff = _decision(
+                "human",
+                reason=f"the repair attempt could not resume the run: {spawned.get('reason', '')}",
+                stop=True)
+            apply(home, run_id, handoff, spawn=False)
     elif action in _SPAWNABLE and not spawn:
         result["spawned"] = False
     return result
@@ -1216,6 +1226,27 @@ def _spawn_recover(home: Path, run_id: str, run_dir: Path,
                    decision: dict[str, Any], n: int, *,
                    wait_for_exit: bool = False) -> dict[str, Any]:
     """Spawn a detached ``mini-ork recover`` for the SAME run, from the failed node."""
+    # A recorded target that is gone makes the resume impossible: the run's own
+    # ``require_run_target`` fails it closed at the first node. Spawning anyway
+    # only relocates the failure — the child resolves the recipe against its
+    # ``MINI_ORK_ROOT`` before any target check, so the repair log reads
+    # ``workflow.yaml not found: <dead worktree>/recipes/…`` and blames the
+    # engine install (observed on ``lf-r11b-20261017-105523``).
+    from mini_ork.runtime.run_roots import load_run_roots  # noqa: PLC0415
+    roots = load_run_roots(str(run_dir))
+    if roots is not None and roots.target and not os.path.isdir(roots.target):
+        return {
+            "spawned": False,
+            "refused": "target-gone",
+            "target": roots.target,
+            "reason": (
+                f"the target recorded for this run no longer exists: "
+                f"{roots.target} — a resume cannot pass its own target check; "
+                "restore that directory (or restart the run from its salvage "
+                "ref) before reviving"
+            ),
+            "command": "",
+        }
     argv = [sys.executable, "-m", "mini_ork.recovery.planner", str(run_id)]
     from_node = decision.get("from_node")
     if from_node:
@@ -1245,10 +1276,20 @@ def _spawn_recover(home: Path, run_id: str, run_dir: Path,
     env["MO_AUTO_REPAIR"] = "1"
     if wait_for_exit:
         env[_WAIT_PID_ENV] = str(os.getpid())
+    # ``recover`` resolves the recipe from ``MINI_ORK_ROOT`` (planner's
+    # ``_workflow_path``), so the inherited value must name a live engine
+    # checkout. A dispatch made from a worktree that was cleaned after the run
+    # leaves that dead path behind; the run's own ``roots.engine`` is the
+    # checkout that dispatched it.
+    launch_root = context_env("MINI_ORK_ROOT") or ""
+    if not os.path.isdir(launch_root):
+        engine_root = (roots.engine if roots is not None else "") or ""
+        launch_root = engine_root if os.path.isdir(engine_root) else os.getcwd()
+    env["MINI_ORK_ROOT"] = launch_root
     log_path = run_dir / f"repair-{n}.log"
-    cwd = context_env("MINI_ORK_ROOT") or os.getcwd()
-    proc = _spawn(argv, cwd=cwd, env=env, stdout_path=log_path)
+    proc = _spawn(argv, cwd=launch_root, env=env, stdout_path=log_path)
     return {
+        "spawned": True,
         "pid": getattr(proc, "pid", None),
         "log": str(log_path),
         "command": " ".join(argv),
