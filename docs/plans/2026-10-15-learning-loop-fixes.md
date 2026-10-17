@@ -68,13 +68,13 @@ the `schema_migrations` self-record; R2's `0075` collided with
 `0075_intake_events_run_id.sql` (landed by another merge) and was renumbered to
 `0077` in the code, the SQL, the ownership claim and the tests.
 
-Residual, to carry into R11a (which owns `code_findings.py`): R5 classifies
-review findings centrally (`_parse_review_raw`) and gates the verifier reason
-path, but the verifier path can still store a **process** note (a failed
-verifier whose only note is a delivery complaint). Zero such rows exist in the
-live table today (verifier sources: 182 code, 63 receipt, 1 harness, 0
-process) — the hole is latent, not live. A one-line central filter in the
-`_harvest_run` insert loop would close it.
+Residual, carried into R11a (which owns `code_findings.py`) as its mechanism
+item 6: R5 classifies review findings centrally (`_parse_review_raw`) and gates
+the verifier reason path, but the verifier path can still store a **process**
+note (a failed verifier whose only note is a delivery complaint). Zero such
+rows exist in the live table today (verifier sources: 182 code, 63 receipt, 1
+harness, 0 process) — the hole is latent, not live. R11a adds the one-line
+central filter in `_harvest_run`'s insert loop.
 
 Not yet done: the live-DB cleanup proven on a copy in R5's review (166 non-code
 rows pruned, 280 artifact file paths cleared) is deliberately NOT applied while
