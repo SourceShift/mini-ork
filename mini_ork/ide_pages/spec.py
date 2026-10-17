@@ -643,6 +643,29 @@ def checks(title: str, rows: Iterable[Any], *, summary: dict[str, Any] | None = 
     }, **opt)
 
 
+def level_row(name: str, value: str, *, required: bool | None = None,
+              reason: str = "") -> dict[str, Any]:
+    """One level for :func:`levels`.
+
+    ``required`` is ``None`` when the run never stamped its task class's
+    requirements — the renderer must not guess either way.
+    """
+    return {"name": str(name), "value": str(value),
+            "required": required, "reason": str(reason)}
+
+
+def levels(title: str, rows: Iterable[Any], *, decision: str = "",
+           task_class: str = "", **opt: Any) -> dict[str, Any]:
+    """The verification vector as data: value, requirement, reason per level.
+
+    The engine states the verdict and what the run had to prove; which levels
+    to foreground and how a value reads belong to the renderer.
+    """
+    return _section("levels", title, {"rows": list(rows),
+                                      "decision": str(decision),
+                                      "task_class": str(task_class)}, **opt)
+
+
 def agent_row(node_id: str, state: str, *, lane: str = "", model: str = "", step: str = "",
               last: str = "", cost: str = "", dur: str = "",
               do: dict[str, Any] | None = None) -> dict[str, Any]:

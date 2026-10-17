@@ -652,6 +652,16 @@ def _findings_count(run) -> int | None:
     return len(findings) if isinstance(findings, list) else None
 
 
+def verification_report(run) -> dict[str, Any] | None:
+    """The run's five-level report — ``run-verdict.json`` or a stamped verdict.
+
+    Public because the run page's Verification tab ships the whole vector as
+    data (``spec.levels``); the verdict row (:func:`_level_badges`) stays a
+    plain list of facts.
+    """
+    return _run_verdict(run)
+
+
 def _level_badges(run) -> list[dict[str, Any]]:
     rv = _run_verdict(run)
     levels = rv.get("levels") if isinstance(rv, dict) else None

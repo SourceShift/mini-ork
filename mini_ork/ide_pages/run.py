@@ -51,8 +51,9 @@ TABS = [("dag", "DAG"), ("kickoff", "Kickoff"), ("overview", "Overview"), ("agen
 # the DAG leads, the outcome replaces the story, and the questions fold into the
 # DAG tab beside the nodes that stopped on them. Old keys still resolve so a
 # stale IDE link lands somewhere sensible.
-V2_TABS = [("dag", "DAG"), ("outcome", "Outcome"), ("kickoff", "Kickoff"),
-           ("agents", "Agents"), ("learnings", "Learnings"), ("artifacts", "Artifacts")]
+V2_TABS = [("dag", "DAG"), ("outcome", "Outcome"), ("verification", "Verification"),
+           ("kickoff", "Kickoff"), ("agents", "Agents"), ("learnings", "Learnings"),
+           ("artifacts", "Artifacts")]
 V2_ALIASES = {"story": "outcome", "graph": "dag", "questions": "dag",
               "overview": "outcome"}
 
@@ -3079,6 +3080,7 @@ def _v2_tabs(run: Run, waiting: int) -> list[tuple[str, str]]:
         # The questions tab folded into the DAG; its count rides here so a
         # stopped run still advertises itself from the tab bar.
         "dag": waiting,
+        "verification": verifier_check_counts(run.run_dir)[1],
         "agents": len(run.nodes),
         "artifacts": len(_artifacts(run.run_dir)),
     }
@@ -3391,6 +3393,77 @@ def _outcome_tab(run: Run, outcome: dict[str, Any],
     return sections
 
 
+def _verification_tab(run: Run) -> list[dict[str, Any]]:
+    """The run's verification in full — the five-level vector and every check.
+
+    The vector is shipped as data (:func:`spec.levels`): value, whether the
+    task class required it, and why it abstained. Which levels to foreground,
+    and how an abstention that could not fail the run should read, is the
+    renderer's call — the engine does not decide that here.
+    """
+    report = O.verification_report(run) or {}
+    level_values = report.get("levels") if isinstance(report.get("levels"), dict) else {}
+    reasons = report.get("levels_reasons") if isinstance(report.get("levels_reasons"), dict) else {}
+    stamped = report.get("levels_required")
+    stamped_required = ([str(name) for name in stamped]
+                        if isinstance(stamped, list) else None)
+    profile = _run_profile(run)
+    task_class = str(profile.get("task_class") or run.row.get("task_class") or "")
+    decision = str(report.get("levels_decision") or "")
+    sections: list[dict[str, Any]] = []
+
+    if not level_values:
+        sections.append(S.callout(
+            "No verification report for this run",
+            "The executor stamps the five-level vector when it writes the run's "
+            "verdict; this run has neither `run-verdict.json` levels nor a stamped "
+            "`verdict.json`. The verifier checks below are the run's own evidence.",
+            tone="muted"))
+    else:
+        rows = []
+        for name in O.LEVELS:
+            rows.append(S.level_row(
+                name, str(level_values.get(name) or "—"),
+                required=(name in stamped_required) if stamped_required is not None else None,
+                reason=str(reasons.get(name) or "")))
+        sections.append(S.levels("Levels", rows, decision=decision,
+                                 task_class=task_class, full=True))
+
+    # One section per verifier envelope: the same files the ``checks n/m``
+    # count reads, with each check's own verdict rather than only the roll-up.
+    for path in sorted(run.run_dir.glob("verifier_*.json")):
+        envelope = _json_obj(path)
+        if not isinstance(envelope, dict):
+            continue
+        name = str(envelope.get("verifier") or path.stem.removeprefix("verifier_"))
+        checks = envelope.get("checks")
+        rows = []
+        if isinstance(checks, list):
+            for check in checks:
+                if not isinstance(check, dict):
+                    continue
+                check_passed = bool(check.get("pass"))
+                detail = str(check.get("expected") or "").strip()
+                if not check_passed:
+                    detail = " · ".join(part for part in
+                                        (detail, str(check.get("actual") or "").strip()) if part)
+                rows.append(S.check_row(str(check.get("name") or "check"),
+                                        "pass" if check_passed else "fail",
+                                        detail=detail))
+        evidence = str(envelope.get("evidence_path") or "")
+        actions = ([S.btn("Open evidence", S.open_path(evidence), "ghost")]
+                   if evidence and Path(evidence).is_file() else [])
+        passed = bool(envelope.get("pass"))
+        title = f"{name} · {'pass' if passed else 'FAIL'}"
+        if rows:
+            sections.append(S.checks(
+                title, rows, full=True, actions=actions,
+                sub=f"{sum(1 for row in rows if row['state'] == 'pass')}/{len(rows)} checks"))
+        else:
+            item = S.ok(title) if passed else S.bad(title)
+            sections.append(S.lst(name, [item], full=True, actions=actions))
+    return sections
+
 
 def _story_tab(run: Run, outcome: dict[str, Any]) -> list[dict[str, Any]]:
     """The retired Story tab: the outcome tab under its old name.
@@ -3432,6 +3505,10 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
     if str(outcome.get("state") or "") == "done" and _card_files(run):
         callout_actions.append(
             S.btn("Open diff", S.page_link("run", "artifacts", run=run.id)))
+    # The verdict row is a summary; the level vector, each decision's reason and
+    # the checks behind ``checks n/m`` live in the Verification tab.
+    callout_actions.append(
+        S.btn("Verification", S.page_link("run", "verification", run=run.id)))
     callout_labels = {str(a.get("label") or "") for a in callout_actions}
     # A callout is drawn on the DAG and Outcome tabs only: on the others the
     # menu must keep the buttons no callout is showing.
@@ -3443,6 +3520,7 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
         "dag": lambda: _dag_tab(run, node, select=True, outcome=outcome,
                                 callout_actions=callout_actions),
         "outcome": lambda: _outcome_tab(run, outcome, callout_actions),
+        "verification": lambda: _verification_tab(run),
         "kickoff": lambda: _kickoff_tab(run, code_presentation=True),
         "agents": lambda: _agents_tab(run),
         "learnings": lambda: _learnings_tab(run),

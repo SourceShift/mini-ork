@@ -587,3 +587,49 @@ def test_the_node_tab_reads_a_reaped_node_as_failed_with_a_reason(home: Path) ->
     assert facts["Status"]["v"] == "failed"
     assert facts["Status"]["c"] == "red"
     assert facts["Reason"]["v"] and facts["Reason"]["c"] == "red"
+
+# ── verification: the vector is data, the renderer decides how it reads ──────
+
+def test_verification_tab_ships_the_level_vector_as_data(
+        home: Path, monkeypatch) -> None:
+    """The engine states the verdict; the IDE decides how an abstention reads.
+
+    A level the run's task class never required cannot fail it, so the section
+    carries ``required`` per row and no colour, glyph or ranking — the renderer
+    is what dims an abstention that was never a failure.
+    """
+    run_dir = _seed(home)
+    (run_dir / "run-verdict.json").write_text(json.dumps({
+        "levels": {"applies": "PROVEN", "executes": "UNVERIFIED",
+                   "target": "UNVERIFIED", "preserve": "UNVERIFIED",
+                   "contract": "PROVEN"},
+        "levels_required": [],
+        "levels_reasons": {"executes": "the verifier wrote no post_rc"},
+        "levels_decision": "publish"}))
+    monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
+
+    page = build_page(home, "run", "verification", {"run": RUN})
+    assert page["tab"] == "verification"
+    assert [t["key"] for t in page["tabs"]][:3] == ["dag", "outcome", "verification"]
+    assert any(t["label"] == "Verification · 1" for t in page["tabs"])
+
+    levels = _section(page, "levels", "Levels")
+    assert levels["decision"] == "publish"
+    assert [row["name"] for row in levels["rows"]] == [
+        "applies", "executes", "target", "preserve", "contract"]
+    assert all(row["required"] is False for row in levels["rows"])
+    assert levels["rows"][1] == {
+        "name": "executes", "value": "UNVERIFIED", "required": False,
+        "reason": "the verifier wrote no post_rc"}
+    # No presentation keys ride the rows — colours and glyphs are the IDE's.
+    assert set(levels["rows"][0]) == {"name", "value", "required", "reason"}
+
+    # The verifier envelope rides behind the vector; this one carries no
+    # ``checks`` list, so it is its roll-up under the verifier's name.
+    rollup = _section(page, "list", "test")
+    assert rollup["items"][0]["t"] == "test · pass"
+
+    # The outcome callout offers the way here from the DAG tab.
+    dag = build_page(home, "run", "dag", {"run": RUN})
+    labels = [a["label"] for a in _section(dag, "callout")["actions"]]
+    assert "Verification" in labels
