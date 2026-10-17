@@ -230,10 +230,24 @@ git merge-base --is-ancestor 899107f0 origin/main   # C18+C21 crumbs, worktree s
   the single `… N more` accounting are unchanged. A side fix: `impl-<node>.patch` now
   attributes to its node instead of falling into Run files, because the attribution
   regex only knew extensions up to three letters.
+- **C23** (`cfba92f3`, run `run-1792253563-27493`, verdict **failed**, reworked by hand) —
+  `lessons promote <id>` approves a `proposed` row under `restore`'s authored-lesson
+  guard; `forget`/`restore` are untouched. The Learnings tab (spec 2) gains
+  `Proposed lessons · N` above the injected sections, linked to a run only by trace
+  membership in `member_item_ids_json`; rows carry Promote (confirm + done) and the
+  existing Forget, and a lessonless pattern offers no Promote so the page never names an
+  action the CLI would refuse. Unreadable member JSON or a missing table costs the
+  section, never the tab. **Incident:** the run failed only its own verification gate —
+  my kickoff passed `test_ide_pages_run_learnings*.py` and `test_ide_pages_run*.py` in
+  one pytest command, and the overlap trips pytest-asyncio's collection recursion. The
+  diff was reused, the glob dropped, an unrequested `resolved_at` write on the refusal
+  path removed, and the suite re-ran green (378). Lesson: the never-repeat-a-path rule
+  applies to globs too — a narrower glob that is a subset of a wider one is still a
+  duplicate.
 
 **Still open:** the IDE renderer halves (C1, C2, C12-render, C13-render, C14-render, C24,
-C26), engine C23 (learnings promote/reject, in flight: `wt/rp-c23`) plus the remaining
-C-series items. SDD option A-vs-B remains blocked on the user.
+C26) plus any remaining C-series items. The engine half of the plan is complete through
+C23. SDD option A-vs-B remains blocked on the user.
 
 **Incident, same day:** the first C9+C12 dispatch was killed after its `code_impact_lens`
 found a deterministic scope conflict — the kickoff forbade editing the two tests that pin
