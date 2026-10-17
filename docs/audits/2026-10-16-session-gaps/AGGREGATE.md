@@ -1381,3 +1381,35 @@ their owner.
 script has zero pointers and zero call sites; the delete is a plain `git rm` plus whatever the bash
 removal plan's checklist still asks for.
 
+## Delivery — round 17 (Phase 4 deletes the shell driver; and my own check was asking the wrong question)
+
+**Phase 4 landed — `b1c8e475`, verified on the pushed copy.** `origin/main` is exactly that commit;
+`git ls-tree origin/main scripts/mini-ork-worktree.sh` → **absent**; the commit is five files,
+23+/298−, including the 280-line deletion. The prose that would otherwise have dangled moved in the
+same commit: `AGENTS.md` now describes the Python driver only (`grep` for the `.sh` → **0**),
+`mini_ork/cli/self_improve.py:432` states the guard behaviour and the declaration it makes without
+comparing itself to a file that no longer exists, and the bash-removal plan marks the worktree target
+done (naming both the repoint `c7a84dc5` and the deletion date). Claims on the touched paths → **0**.
+
+**The correction, and it was mine.** In round 16 I told the peer I would verify "zero surviving
+references". That is the wrong expectation, and the peer pushed back before it became a false finding
+here: the check that matters is **zero invocation sites**, not zero *mentions*. The measured state is
+zero call sites (`make worktree*` unchanged; no code path invokes it) and **five surviving mention
+sites**, every one of which should survive:
+
+| site | count | why it stays |
+|---|---|---|
+| `docs/audits/…/AGGREGATE.md` | 6 | this record — an audit of a deleted file must name it |
+| `docs/plans/2026-07-26-bash-removal-plan.md` | 2 | intentional: "Done … repointed-away and then deleted"; a plan that deletes a file without naming it is worse than one that does |
+| `docs/todos/20261011-1830-…` | 1 | historical artifact of completed work — rewriting it would edit history to match the present |
+| `kickoffs/auto/lf-r14-reversion-guard.md` | 1 | same |
+| `scripts/mini_ork_worktree.py:8` | 1 | **provenance**, and it replaces the old "Port of …" line: leaving "Port of <deleted file>" would read as a live dependency |
+
+This is the sweep's recurring error in a new register: **"zero references" and "no live references" are
+different questions**, and only the second one is the property being established. A deletion is done
+when nothing *calls* the file; a deletion is **misrecorded** when the record pretends nothing *mentions*
+it, because the mentions are what tell the next reader that a file ever existed and why it went.
+
+**Still open in the same plan bullet, and unclaimed:** `readme-*.sh` remains a port target. It was
+never part of this thread.
+
