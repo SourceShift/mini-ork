@@ -120,11 +120,16 @@ revision" to **not revivable**: `hr-exec-park-20261015141603`,
    unmatched pattern; no rule ran). The epic is a **removal** epic, so the
    touched-file list naming a deleted file is expected. 10 of 15 nodes failed,
    and the parent verdict adds `contract: "recipe verifier evidence unparsable"`
-   over a well-formed JSON. Fix site is the tier1 verifier
-   (`recipes/recursive-validate-impl/verifiers/tier1-compile-typecheck.py`) plus
-   whatever the levels reader wants from that shape — **not patched**, and a fix
-   would also have to reach the researcher install, which lags the engine
-   (`researcher-install-lag` above).
+   over a well-formed JSON. **Closed 2026-10-17 — the class was already fixed,
+   by a commit that landed 25 minutes after this run ended:** `ee0e70fd`
+   ("tier1 does not lint or typecheck a deleted file", 2026-10-15 04:37:59)
+   filters `DELETED_FILES` out of `SOURCE_FILES`/`SHELL_FILES` before either
+   argv is built, so an all-deleted removal touches nothing and tier1 passes.
+   The run itself carries no `deleted_files=` evidence line, i.e. it executed
+   the pre-fix verifier; the researcher home's on-disk recipe copy is now
+   byte-identical to the engine's. The 10/15 nodes are historical casualties of
+   a fixed defect — no revive needed, and the run has aged out of the 48 h
+   sweep window anyway.
 
 ---
 
