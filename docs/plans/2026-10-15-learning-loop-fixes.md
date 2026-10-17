@@ -222,3 +222,22 @@ Witnessed on `lf-r5` and `lf-r2`; both merges were completed with
 `kickoffs/auto/lf-r14-reversion-guard.md`. Fix: require the watched commit to
 still be HEAD (and no rebase/am/merge in progress, detected per worktree)
 before any restore.
+
+## Status 2026-10-17 ~12:40 (post-merge findings maintenance)
+
+Ran, after the last live run left the DB: `reharvest` → `prune` →
+`clear-artifact-files` → `backfill-target-repo` → `check-landing`, with a
+timestamped `state.db.pre-maint-*` backup first. Results: 1276 run dirs
+re-parsed into **1742 findings** (991 with a file, 26 unparseable), prune and
+clear-artifact-files 0 (nothing left; no artifact-path rows), backfill 0
+(1562 legacy rows keep NULL because their profiles name no target cwd — the
+engine-local marker by design), check-landing **191 runs checked, 64 landed**.
+
+The pass exposed a real defect the suite could not see: `python -m
+mini_ork.learning.code_findings reharvest` failed for **619 runs** with
+`NameError: parse_review is not defined` and harvested nothing. The `if
+__name__ == "__main__"` guard sat above `parse_review`/`parse_verifier`, so
+script execution ran `main()` before those defs existed; every test imports
+the module, where they do exist. Fixed by moving the guard to the end of the
+file (`cb44beeb`) and pinned with a subprocess regression test that runs the
+module CLI against a temp home and asserts the finding is parsed.
