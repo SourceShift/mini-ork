@@ -428,10 +428,12 @@ def _iter_run(root, home, db, it, opts, parent, resolved_sha, soft_deadline, har
     branch = f"self-improve/iter-{it}-{ts}"
     record_run(db, run_id, it, "pending", "starting", wt_path, branch, soft_deadline, hard_deadline)
 
-    # self-improve/* is a deliberate programmatic worktree; declare it to the
-    # reference-transaction worktree-guard exactly as scripts/mini-ork-worktree.sh
-    # does, else the hook rejects the non-wt/* branch creation and every iter
-    # dies at worktree-add before any dispatch.
+    # self-improve/* is a deliberate programmatic worktree whose branch name is
+    # outside wt/*, so the reference-transaction worktree-guard would reject its
+    # creation. Declaring ALLOW_WORKTREE_BRANCH_CREATE=1 for this one
+    # `worktree add` is the same declaration the worktree driver makes; without
+    # it the hook rejects the branch and every iter dies at worktree-add before
+    # any dispatch.
     if subprocess.run(["git", "-C", root, "worktree", "add", "-b", branch, wt_path, parent],
                       capture_output=True,
                       env={**os.environ, "ALLOW_WORKTREE_BRANCH_CREATE": "1"}).returncode != 0:

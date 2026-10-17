@@ -5,7 +5,8 @@ Keep `main` clean: never branch/commit implementation work in the main
 checkout. Each task gets its own worktree + branch; when green it rebases onto
 origin/main and pushes straight to main; then the worktree is torn down.
 
-Port of scripts/mini-ork-worktree.sh (bash-removal Phase 4). Same subcommands,
+Successor to the shell original `scripts/mini-ork-worktree.sh`, which this port
+replaced and which was deleted on 2026-10-17 (bash-removal Phase 4). Same subcommands,
 claim registry location + format ($WORKTREES_DIR/.ownership, TSV slug<TAB>path),
 ALLOW_WORKTREE_BRANCH_CREATE=1 for `git worktree add` (the reference-transaction
 guard requires it), stderr message shapes, and exit codes (1 = error, 2 = usage).

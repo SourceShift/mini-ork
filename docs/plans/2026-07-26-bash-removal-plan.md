@@ -157,11 +157,15 @@ parity tests already prove equivalence.
   Python or keep as the one sanctioned script).
 - **Makefile**: retarget `serve/dev/test-obs/worktree*` to Python entry
   points (port `scripts/mini-ork-worktree.sh` — it is the worktree-first
-  dev loop, high value).
+  dev loop, high value). **Done:** the `worktree*` targets drive
+  `scripts/mini_ork_worktree.py`.
 - **.githooks**: port `pre-push`/`post-commit`/`reference-transaction` to
   Python (they're repo-critical: worktree guard + README drift).
 - **scripts/**: port or delete the 16 (most are one-off smokes → delete;
-  `mini-ork-worktree.sh` + `readme-*.sh` → port).
+  `mini-ork-worktree.sh` + `readme-*.sh` → port). **Done for the worktree
+  driver:** `scripts/mini_ork_worktree.py` is the port; the shell original was
+  repointed-away (`c7a84dc5`) and then deleted on 2026-10-17, once it had zero
+  call sites and zero live prose references.
 - **hooks/*.sh** (Claude Code integration): port to Python entry points or
   document as the one external bash surface (decision; they are
   Claude-side glue, not mini-ork runtime).
