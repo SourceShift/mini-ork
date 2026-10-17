@@ -161,6 +161,9 @@ diff was independently re-verified before merge:
 git merge-base --is-ancestor 18ffcae7 origin/main   # C3  triage names the real failing node  → true
 git merge-base --is-ancestor fdf55574 origin/main   # C4+C5 one Needs-you lane, explained decisions → true
 git merge-base --is-ancestor 7d0ac72a origin/main   # C9+C12 Checks tab + tab badges          → true
+git merge-base --is-ancestor a70f9271 origin/main   # C8  Changes tab on the main page         → true
+git merge-base --is-ancestor 22c36d27 origin/main   # C25 failed run says whose fault it is    → true
+git merge-base --is-ancestor 899107f0 origin/main   # C18+C21 crumbs, worktree sub, Copy summary → true
 ```
 
 - **C3** (`18ffcae7`) — the run rolled back (`impl_moved_base`, reviewer verdict on an
@@ -178,10 +181,28 @@ git merge-base --is-ancestor 7d0ac72a origin/main   # C9+C12 Checks tab + tab ba
   level vector still shipped as data, and per-envelope check rows; tab badges
   (`Checks · 1 ✗` red / proven count green, DAG question count). `verification` is now
   an alias for `checks` — the vector was being drawn on two tabs with two badges.
+- **C8** (`a70f9271`) — a `Changes` tab between Checks and Kickoff, reusing
+  `run_dock._changes_sections` (never a copy of it) with per-file open actions, and
+  an `Open as patch` header action only when the diff file exists. A broken or empty
+  diff costs the tab's content, never the page.
+- **C25** (`22c36d27`, run `run-1792235591-…`, verdict pass) — a failed run's outcome
+  now asks `mini_ork.triage.blame.attribute` and says whose fault it is in one
+  sentence; `mini_ork` blame adds a confirm-gated `Open triage --promote` action,
+  `consumer` and `unknown` add none. Every read failure falls closed to `unknown`.
+- **C18+C21** (`899107f0`, run `run-1792239907-45563`, verdict pass, 321-test
+  independent re-run) — header `crumbs` (epic › run › retry #N) with a `do` only where
+  navigation exists and never a fabricated crumb; the v2 sub regains the worktree
+  path; a `Copy summary` menu entry pastes goal, outcome line, verification vector,
+  cost and the `mini-ork://run/<id>` link, each line best-effort.
 
 **Still open:** the IDE renderer halves (C1, C2, C12-render, C13-render, C14-render, C24,
-C26) and the engine halves C8 (in flight: `wt/rp-c8-changes`), C18, C21, C25.
-SDD option A-vs-B remains blocked on the user.
+C26) and the engine halves C10 (criteria checklist), C16 (cost cap), C17 (de-duplicate
+roster/Buddy) and the remaining C-series items. SDD option A-vs-B remains blocked on
+the user.
+
+**Follow-up found while landing C25:** `triage.blame` attributes
+`finish_reason=impl_moved_base` and ACP `dispatcher-dead` to `unknown`, though both are
+the harness's own outcome. The taxonomy should own them; not filed as a run yet.
 
 **Incident, same day:** the first C9+C12 dispatch was killed after its `code_impact_lens`
 found a deterministic scope conflict — the kickoff forbade editing the two tests that pin
