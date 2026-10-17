@@ -452,3 +452,250 @@ def test_gate_fails_closed_when_secret_store_is_unreadable(tmp_path):
     assert {f.node_id for f in out} == {"n1", "n2"}
     for f in out:
         assert "credential store failed" in f.reason
+
+
+# ── unverified(): the lanes nobody actually checked ──────────────────────────
+# ``LaneHealth.ok`` means "not known bad". A native lane the CLI authenticates,
+# a probe switched off, or an endpoint that never answered are all ok — and all
+# unchecked. Those lanes are named here rather than silently read as verified.
+
+RUN_ID = "lp-run-1"
+UNVER_REASON = "ok (unprobed: MO_LANE_PROBE is off — key presence only)"
+
+
+def _fake_preflight(monkeypatch, health_by_model):
+    """Replace providers.preflight (the seam gate/unverified call) with a fake."""
+    import mini_ork.dispatch.providers as providers_mod
+
+    def fake(models, root=None, environment=None):
+        return {m: health_by_model[m] for m in models if m in health_by_model}
+
+    monkeypatch.setattr(providers_mod, "preflight", fake)
+
+
+def _make_min_db(tmp_path):
+    """A DB with just the two tables _persist_blocked touches."""
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(str(db))
+    try:
+        con.execute(
+            "CREATE TABLE task_runs (id TEXT PRIMARY KEY, status TEXT, "
+            "verdict TEXT, notes TEXT, updated_at INTEGER, ended_at INTEGER)")
+        con.execute(
+            "CREATE TABLE run_events (event_id TEXT, run_id TEXT, "
+            "event_type TEXT, payload_json TEXT, created_at INTEGER)")
+        con.execute(
+            "INSERT INTO task_runs (id, status) VALUES (?, 'executing')", (RUN_ID,))
+        con.commit()
+    finally:
+        con.close()
+    return str(db)
+
+
+def _run_row(db):
+    con = sqlite3.connect(db)
+    try:
+        return con.execute(
+            "SELECT status, verdict, notes FROM task_runs WHERE id=?", (RUN_ID,)
+        ).fetchone()
+    finally:
+        con.close()
+
+
+def _events(db):
+    con = sqlite3.connect(db)
+    try:
+        return con.execute("SELECT event_type, payload_json FROM run_events").fetchall()
+    finally:
+        con.close()
+
+
+def test_unverified_names_every_waiting_node(tmp_path, monkeypatch):
+    """One ``LaneUnverified`` per waiting node, naming lane, role and node id —
+    and ``gate`` still sees nothing (unverified is not a failure)."""
+    import mini_ork.dispatch.providers as providers_mod
+    _fake_preflight(monkeypatch, {
+        "glm": providers_mod.LaneHealth(True, UNVER_REASON, False),
+    })
+    fields = [_field("n1", "researcher", "glm"), _field("n2", "verifier", "glm")]
+
+    entries = lane_preflight.unverified(fields, root=REPO, home=str(tmp_path / "h"))
+
+    assert [e.node_id for e in entries] == ["n1", "n2"]
+    assert [e.role for e in entries] == ["researcher", "verifier"]
+    assert all(e.lane == "glm" and e.reason == UNVER_REASON for e in entries)
+    assert lane_preflight.gate(fields, root=REPO, home=str(tmp_path / "h")) == []
+
+
+def test_unverified_missing_preflight_result(tmp_path, monkeypatch):
+    """A model the probe returned no entry for is unverified, not dead."""
+    _fake_preflight(monkeypatch, {})
+    entries = lane_preflight.unverified(
+        [_field("n1", "researcher", "glm")], root=REPO, home=str(tmp_path / "h"),
+    )
+    assert len(entries) == 1
+    assert entries[0].reason == "no preflight result for this lane"
+
+
+def test_failure_and_unverified_lists_are_disjoint(tmp_path, monkeypatch):
+    """ok=False is a failure; ok=True + verified=False is unverified. Never
+    both."""
+    import mini_ork.dispatch.providers as providers_mod
+    LaneHealth = providers_mod.LaneHealth
+    _fake_preflight(monkeypatch, {
+        "glm": LaneHealth(False, "glm: out of credit (HTTP 402)"),
+        "cod": LaneHealth(True, UNVER_REASON, False),
+    })
+    fields = [_field("n1", "researcher", "glm"), _field("n2", "planner", "cod")]
+
+    failures = lane_preflight.gate(fields, root=REPO, home=str(tmp_path / "h"))
+    entries = lane_preflight.unverified(fields, root=REPO, home=str(tmp_path / "h"))
+
+    assert [f.node_id for f in failures] == ["n1"]
+    assert [e.node_id for e in entries] == ["n2"]
+
+
+def test_compat_lane_with_key_but_probe_off_is_unverified(tmp_path, monkeypatch):
+    """The explicit compat fall-through: the key is present but no probe ran, so
+    the lane is ok yet unverified — its reason says so."""
+    from mini_ork.dispatch import providers as providers_mod
+
+    reg = tmp_path / "providers.yaml"
+    reg.write_text(
+        "providers:\n"
+        "  spec-compat-lane:\n"
+        "    kind: anthropic-compat\n"
+        "    base_url: http://127.0.0.1:9/v1\n"
+        "    api_key_env: SPEC_COMPAT_KEY\n", encoding="utf-8")
+    monkeypatch.setenv("MINI_ORK_PROVIDERS", str(reg))
+
+    health = providers_mod.lane_health("spec-compat-lane", str(REPO), environment={
+        "MINI_ORK_HOME": str(tmp_path / "home"),
+        "SPEC_COMPAT_KEY": "sk-spec", "MO_LANE_PROBE": "0",
+    })
+
+    assert health.ok is True
+    assert health.verified is False
+    assert health.reason == UNVER_REASON
+
+
+def test_enforce_warns_and_proceeds_on_unverified_lane(tmp_path, monkeypatch, capsys):
+    """Default posture: an unverified lane warns, records the artifact with
+    ``verdict: proceed``, and starts the run — no machine line, no DB write."""
+    import mini_ork.dispatch.providers as providers_mod
+    monkeypatch.delenv("MO_LANE_REQUIRE_VERIFICATION", raising=False)
+    _fake_preflight(monkeypatch, {
+        "glm": providers_mod.LaneHealth(True, UNVER_REASON, False),
+    })
+    db = _make_min_db(tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    rc = lane_preflight.enforce(
+        [_field("n1", "researcher", "glm")],
+        root=REPO, home=str(tmp_path / "h"),
+        db=db, run_id=RUN_ID, run_dir=str(run_dir),
+    )
+
+    assert rc == ""
+    payload = json.loads((run_dir / "lane-preflight.json").read_text(encoding="utf-8"))
+    assert payload["verdict"] == "proceed"
+    assert payload["blocked_reason"] == ""
+    assert [e["node_id"] for e in payload["unverified"]] == ["n1"]
+    captured = capsys.readouterr()
+    assert any(
+        ln.startswith("warn:") and "cannot verify:" in ln
+        for ln in captured.err.splitlines()
+    ), captured.err
+    assert not any(
+        ln.startswith(("blocked_reason=", "verdict=", "lane_preflight="))
+        for ln in captured.out.splitlines()
+    ), captured.out
+    assert _run_row(db) == ("executing", None, None)
+    assert _events(db) == []
+
+
+def test_enforce_blocks_on_unverified_when_verification_required(
+    tmp_path, monkeypatch, capsys
+):
+    """``MO_LANE_REQUIRE_VERIFICATION=1`` turns an unverifiable lane into an
+    abort: rc string, artifact, task_runs failure, one run event, and the
+    machine lines carrying the new reason."""
+    import mini_ork.dispatch.providers as providers_mod
+    monkeypatch.setenv("MO_LANE_REQUIRE_VERIFICATION", "1")
+    _fake_preflight(monkeypatch, {
+        "glm": providers_mod.LaneHealth(True, UNVER_REASON, False),
+    })
+    db = _make_min_db(tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    rc = lane_preflight.enforce(
+        [_field("n1", "researcher", "glm")],
+        root=REPO, home=str(tmp_path / "h"),
+        db=db, run_id=RUN_ID, run_dir=str(run_dir),
+    )
+
+    assert rc == "lane_unverified"
+    payload = json.loads((run_dir / "lane-preflight.json").read_text(encoding="utf-8"))
+    assert payload["verdict"] == "blocked"
+    assert payload["blocked_reason"] == "lane_unverified"
+    status, verdict, notes = _run_row(db)
+    assert (status, verdict) == ("failed", "ESCALATE")
+    assert "lane_unverified" in (notes or "")
+    events = _events(db)
+    assert len(events) == 1 and events[0][0] == "lane_preflight_blocked"
+    captured = capsys.readouterr()
+    out_lines = captured.out.splitlines()
+    assert "blocked_reason=lane_unverified" in out_lines
+    assert "verdict=blocked" in out_lines
+    assert any(
+        ln.startswith("fix:") and "MO_LANE_REQUIRE_VERIFICATION=0" in ln
+        for ln in captured.err.splitlines()
+    ), captured.err
+
+
+def test_enforce_dead_lane_blocks_before_unverified(tmp_path, monkeypatch, capsys):
+    """A dead lane still blocks as ``lane_unhealthy`` even when unverified lanes
+    are present and verification is required."""
+    import mini_ork.dispatch.providers as providers_mod
+    LaneHealth = providers_mod.LaneHealth
+    monkeypatch.setenv("MO_LANE_REQUIRE_VERIFICATION", "1")
+    _fake_preflight(monkeypatch, {
+        "glm": LaneHealth(False, "glm: out of credit (HTTP 402)"),
+        "cod": LaneHealth(True, UNVER_REASON, False),
+    })
+
+    rc = lane_preflight.enforce(
+        [_field("n1", "researcher", "glm"), _field("n2", "planner", "cod")],
+        root=REPO, home=str(tmp_path / "h"),
+    )
+
+    assert rc == "lane_unhealthy"
+    assert "blocked_reason=lane_unhealthy" in capsys.readouterr().out
+
+
+def test_persist_blocked_takes_reason_from_payload_with_fallback(tmp_path):
+    """The reason is read from the payload, falling back to ``lane_unhealthy``
+    — so both block reasons land in the ``task_runs`` notes."""
+    first = tmp_path / "first"; first.mkdir()
+    db = _make_min_db(first)
+    lane_preflight._persist_blocked(db, RUN_ID, {"blocked_reason": "lane_unverified"})
+    assert "lane_unverified" in (_run_row(db)[2] or "")
+
+    second = tmp_path / "second"; second.mkdir()
+    db2 = _make_min_db(second)
+    lane_preflight._persist_blocked(db2, RUN_ID, {"verdict": "blocked"})
+    assert "lane_unhealthy" in (_run_row(db2)[2] or "")
+
+
+def test_print_machine_lines_reads_reason_from_payload(capsys):
+    """Both block reasons print a correct ``blocked_reason=`` line, keeping the
+    ``lane_preflight=<json>`` / ``verdict=blocked`` shape."""
+    lane_preflight._print_machine_lines({
+        "verdict": "blocked", "blocked_reason": "lane_unverified", "unverified": [],
+    })
+    out = capsys.readouterr().out.splitlines()
+    assert "blocked_reason=lane_unverified" in out
+    assert "verdict=blocked" in out
+    assert any(ln.startswith("lane_preflight=") for ln in out)

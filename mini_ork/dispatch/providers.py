@@ -958,8 +958,22 @@ def resolve_provider(
 
 @dataclass(frozen=True)
 class LaneHealth:
+    """One lane's pre-dispatch verdict.
+
+    ``ok`` answers "is this lane known-bad"; ``verified`` answers "did a probe
+    actually run". They are separate because a native lane (or a probe the
+    operator turned off) is ``ok`` on the strength of an unread credential or
+    nothing at all — ``ok`` alone there reads as "we checked and it was fine",
+    which is how `opus`/`deepseek` starved a whole run unnoticed. ``verified``
+    is False exactly when no probe ran or the probe got no answer, so a caller
+    that needs a checked lane (``MO_LANE_REQUIRE_VERIFICATION``) can tell the
+    difference. Trailing field with a default keeps every existing two-arg
+    construction working unchanged.
+    """
+
     ok: bool
     reason: str
+    verified: bool = True
 
 
 def provider_environment(
@@ -1085,8 +1099,8 @@ def _decode_body(raw: bytes) -> str:
 
 
 def _live_probe(model: str, entry: Mapping, key: str,
-                runtime: Mapping[str, str]) -> str | None:
-    """Reason string when the gateway definitively refuses this key, else None.
+                runtime: Mapping[str, str]) -> tuple[str | None, bool]:
+    """``(reason, probed)`` when the gateway definitively refuses this key.
 
     A bare 401/402/403 is dead. A bare 429 or 5xx is NOT: it proves the key is
     accepted and the outage is transient, so blocking on it would be the false
@@ -1094,6 +1108,10 @@ def _live_probe(model: str, entry: Mapping, key: str,
     body carries quota vocabulary — that is a funding wall wearing a throttle's
     status code, and it is cached as dead with a longer TTL. No HTTP answer at
     all is unknown and blocks nothing.
+
+    ``probed`` is True only when an HTTP answer came back (live or from the
+    cache), so ``lane_health`` can tell "checked and fine" from "never got an
+    answer" — the same distinction :func:`_live_probe_native` reports.
     """
     url = str(entry.get("base_url") or "").rstrip("/") + "/v1/messages"
     cache_path = Path(runtime.get("MINI_ORK_HOME") or ".mini-ork") / "lane-probe-cache.json"
@@ -1113,7 +1131,9 @@ def _live_probe(model: str, entry: Mapping, key: str,
     else:
         status, body = _http_post_probe(url, key, str(entry.get("model") or ""))
         if status is None:
-            return None  # unknown: do not cache, do not block
+            # Unknown: no answer from the gateway. Do not cache, do not block,
+            # and do not claim a probe ran.
+            return None, False
         dead = _PROBE_DEAD.get(status)
         ttl = _PROBE_TTL_S
         if dead is None and status == 429 and _PROBE_QUOTA_RE.search(body):
@@ -1127,7 +1147,7 @@ def _live_probe(model: str, entry: Mapping, key: str,
             os.replace(tmp, cache_path)
         except OSError:
             pass
-    return f"{model}: {dead} at {url}" if dead else None
+    return (f"{model}: {dead} at {url}" if dead else None), True
 
 
 def _native_credential(runtime: Mapping[str, str]) -> tuple[str, Mapping[str, str]] | None:
@@ -1166,12 +1186,12 @@ def _native_credential(runtime: Mapping[str, str]) -> tuple[str, Mapping[str, st
 
 
 def _live_probe_native(model: str, entry: Mapping,
-                       runtime: Mapping[str, str]) -> str | None:
+                       runtime: Mapping[str, str]) -> tuple[str | None, bool]:
     """Like :func:`_live_probe`, but for ``anthropic-native`` lanes.
 
     The compat probe keys on a single ``api_key_env``; native lanes honor
-    three potential credential env vars (above). No credential env var → return
-    ``None``: ambient-key logins are unknown and out of scope [c:2].
+    three potential credential env vars (above). No credential env var →
+    ``(None, False)``: ambient-key logins are unknown and out of scope [c:2].
 
     Otherwise: 1-token Messages call to ``<base_url>/v1/messages`` (defaulting
     to ``https://api.anthropic.com``), 8 s timeout, model ``entry.model or
@@ -1181,10 +1201,16 @@ def _live_probe_native(model: str, entry: Mapping,
     credential probe once per ``_PROBE_TTL_S``. Same atomic ``os.replace``
     discipline: a partial write can never leave the operator with a stale
     cache.
+
+    Returns ``(reason, probed)``: ``reason`` is the dead-lane message or
+    ``None``, ``probed`` is True only when an HTTP answer actually came back
+    (live or from the cache). ``probed=False`` with ``reason is None`` is the
+    "unknown" case — the far end never answered — which the caller must not
+    report as verified.
     """
     cred = _native_credential(runtime)
     if cred is None:
-        return None
+        return None, False
     cred_str, headers = cred
     # The endpoint MUST be the one dispatch will use, or the probe grades a
     # credential against a host that never sees it. A Claude Code session (or a
@@ -1213,7 +1239,9 @@ def _live_probe_native(model: str, entry: Mapping,
     else:
         status, body = _http_post_result(url, headers, str(entry.get("model") or "claude-haiku-4-5"))
         if status is None:
-            return None  # unknown: do not cache, do not block
+            # Unknown: no answer from the far end. Do not cache, do not block —
+            # and do not claim a probe ran (⇒ verified=False upstream).
+            return None, False
         dead = _PROBE_DEAD.get(status)
         ttl = _PROBE_TTL_S
         if dead is None and _PROBE_QUOTA_RE.search(body or ""):
@@ -1231,7 +1259,9 @@ def _live_probe_native(model: str, entry: Mapping,
             os.replace(tmp, cache_path)
         except OSError:
             pass
-    return f"{model}: {dead} at {url}" if dead else None
+    # An answer came back (live now, or from a cached earlier answer), so the
+    # caller may report the lane as actually probed.
+    return (f"{model}: {dead} at {url}" if dead else None), True
 
 
 def lane_health(
@@ -1261,23 +1291,51 @@ def lane_health(
                 False,
                 f"{model}: ${api_key_env} is not set — lane would die silently",
             )
-        if entry.get("kind") == "anthropic-compat" and _probe_enabled(runtime):
-            reason = _live_probe(model, entry, str(runtime[str(api_key_env)]), runtime)
-            if reason:
-                return LaneHealth(False, f"{reason} — every dispatch on this lane would fail")
+        if entry.get("kind") == "anthropic-compat":
+            if _probe_enabled(runtime):
+                reason, probed = _live_probe(
+                    model, entry, str(runtime[str(api_key_env)]), runtime,
+                )
+                if reason:
+                    return LaneHealth(False, f"{reason} — every dispatch on this lane would fail")
+                if probed:
+                    return LaneHealth(True, "ok")  # a probe ran and answered
+                # No answer at all: unknown, not dead (ok=True), and nobody
+                # verified it — same shape as the native unreachable branch.
+                return LaneHealth(
+                    True,
+                    "ok (unprobed: probe got no answer — key presence only)",
+                    False,
+                )
+            # Key present, probe off: the key is all we know. Make the absence
+            # of a check explicit (verified=False) rather than a bare ``ok``
+            # that reads as a passed probe.
+            return LaneHealth(
+                True,
+                "ok (unprobed: MO_LANE_PROBE is off — key presence only)",
+                False,
+            )
+        # openai-compat / openai-chat / uhp have no live probe at all: a present
+        # key is the whole check and the bare ``ok`` is their documented
+        # contract (tests/unit/test_uhp_dispatch.py pins it).
+        return LaneHealth(True, "ok")
     elif isinstance(entry, Mapping) and entry.get("kind") == "anthropic-native":
-        if _probe_enabled(runtime):
-            reason = _live_probe_native(model, entry, runtime)
+        if _probe_enabled(runtime) and _native_credential(runtime) is not None:
+            reason, probed = _live_probe_native(model, entry, runtime)
             if reason:
                 return LaneHealth(False, f"{reason} — every dispatch on this lane would fail")
-        # No credential env var OR the probe is off: still ok=True. The unprobed
+            if probed:
+                return LaneHealth(True, "ok")  # probe ran and the lane answered
+        # No credential env var, the probe is off, or the probe got no HTTP
+        # answer: still ok=True (an unprobed lane must not block a run), but
+        # nobody actually checked — verified=False says so. The unprobed
         # phrasing matters because `doctor` printed `[OK] codex (codex CLI
         # present)` while codex was 100% quota-walled and the terminal rung of
         # every coding chain (2026-10-12). "ok" alone reads as "we checked and
         # it was fine"; "ok (unprobed: …)" makes the absence of a check
         # legible.
         return LaneHealth(
-            True, "ok (unprobed: native lane — auth owned by the CLI)")
+            True, "ok (unprobed: native lane — auth owned by the CLI)", False)
     elif isinstance(entry, Mapping) and entry.get("kind") in {
         "codex-native", "opencode-native",
     }:
@@ -1288,7 +1346,7 @@ def lane_health(
         # 100% quota-walled and the terminal rung of every coding chain
         # (2026-10-12). Still ok=True: an unprobed lane must not block a run.
         return LaneHealth(
-            True, "ok (unprobed: native lane — auth owned by the CLI)")
+            True, "ok (unprobed: native lane — auth owned by the CLI)", False)
     return LaneHealth(True, "ok")
 
 

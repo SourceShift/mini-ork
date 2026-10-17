@@ -121,6 +121,97 @@ def test_no_credential_env_var_is_healthy_and_makes_no_http_call(lane):
     assert calls == []
 
 
+# ── verified: did a probe actually run? ──────────────────────────────────────
+# ``ok`` answers "known bad?", ``verified`` answers "did anyone check?". The
+# two-part return below is what lets the lane-health gate offer fail-closed
+# enforcement (MO_LANE_REQUIRE_VERIFICATION) without turning every native lane
+# into a blocking failure.
+
+
+def test_answered_probe_is_verified(lane):
+    """A probe that ran and answered (200) is a checked lane."""
+    env, answer, calls = lane
+    answer(200)
+
+    h = p.lane_health("fakeopus", environment=env())
+
+    assert h.ok is True
+    assert h.verified is True
+    assert calls  # a probe really ran
+
+
+def test_no_credential_lane_is_unverified(lane):
+    """No credential env var means no probe ran: ok (unknown, must not block)
+    but verified=False, so the gate can name it rather than read it as
+    checked."""
+    env, answer, calls = lane
+    bare = env()
+    for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+        bare.pop(key, None)
+
+    h = p.lane_health("fakeopus", environment=bare)
+
+    assert h.ok is True
+    assert h.verified is False
+    assert "unprobed" in h.reason
+    assert calls == []
+
+
+def test_probe_that_got_no_answer_is_unverified(lane):
+    """The far end never answered: unknown, not dead — ok stays True but no
+    probe result exists, so verified=False."""
+    env, answer, calls = lane
+    answer(None)
+
+    h = p.lane_health("fakeopus", environment=env())
+
+    assert h.ok is True
+    assert h.verified is False
+    assert calls  # it was attempted; it just never came back
+
+
+def test_probe_disabled_native_lane_is_unverified(lane):
+    """MO_LANE_PROBE=0 turns the probe off: the lane is ok but unchecked."""
+    env, answer, calls = lane
+    answer(200)
+
+    h = p.lane_health("fakeopus", environment=env(MO_LANE_PROBE="0"))
+
+    assert h.ok is True
+    assert h.verified is False
+    assert calls == []
+
+
+def test_dead_native_lane_is_a_failure_not_an_unverified_lane(lane):
+    """A 402 is a known-bad lane: ok=False. It is a failure (the gate blocks),
+    never an "unverified" entry."""
+    env, answer, _ = lane
+    answer(402)
+
+    h = p.lane_health("fakeopus", environment=env())
+
+    assert h.ok is False
+    assert "out of credit" in h.reason
+
+
+def test_codex_native_lane_is_unverified(tmp_path, monkeypatch):
+    """A codex-native lane has no key to read and no endpoint to ping: it is ok
+    (the CLI owns auth) but nobody checked — verified=False."""
+    reg = tmp_path / "providers.yaml"
+    reg.write_text(
+        "providers:\n"
+        "  fakecodex:\n"
+        "    kind: codex-native\n", encoding="utf-8")
+    monkeypatch.setenv("MINI_ORK_PROVIDERS", str(reg))
+
+    h = p.lane_health("fakecodex", environment={
+        "MINI_ORK_HOME": str(tmp_path / "home"), "MO_LANE_PROBE": "1"})
+
+    assert h.ok is True
+    assert h.verified is False
+    assert "unprobed" in h.reason
+
+
 def test_oauth_token_carries_beta_header_and_not_x_api_key(lane):
     env, answer, calls = lane
     answer(200)
