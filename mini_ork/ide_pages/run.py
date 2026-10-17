@@ -1872,13 +1872,13 @@ def _read_json_obj(path: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _injection_ledger(run: Run) -> list[dict[str, Any]]:
-    """Per-node rows from ``learned/<node>.json`` — what each node was given.
+def _injection_records(run: Run) -> list[dict[str, Any]]:
+    """The raw ``learned/<node>.json`` records — the run's injection ledger.
 
     ``learned/`` is the INJECTION ledger (what actually reached the model),
-    not produced learnings. Rendering it closes the "display != injection"
-    gap: the planner injects the v2 pack, so the tab must show the v2 blocks
-    (and each node's source ids / skipped blocks), not the v1 builder output.
+    not produced learnings. :func:`_injection_ledger` renders these for the
+    page; :func:`_injected_usage` reads the same records' ``sources[].id`` to
+    tell which pack items a node was actually given.
     """
     learned_dir = run.run_dir / "learned"
     if not learned_dir.is_dir():
@@ -1886,7 +1886,23 @@ def _injection_ledger(run: Run) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for p in sorted(learned_dir.glob("*.json")):
         d = _read_json_obj(p)
-        node = str(d.get("node_id") or p.stem)
+        # A missing/unparseable file still gets a row (its stem names the node),
+        # so a broken record is visible rather than silently dropped.
+        out.append({**d, "node_id": str(d.get("node_id") or p.stem)})
+    return out
+
+
+def _injection_ledger(run: Run) -> list[dict[str, Any]]:
+    """Per-node rows: what each node was given, and why the rest was skipped.
+
+    Rendering the INJECTION ledger (``learned/<node>.json``) closes the
+    "display != injection" gap: the planner injects the v2 pack, so the tab
+    must show the v2 blocks (and each node's source ids / skipped blocks), not
+    the v1 builder output.
+    """
+    out: list[dict[str, Any]] = []
+    for d in _injection_records(run):
+        node = str(d.get("node_id") or "")
         injected = bool(d.get("injected"))
         srcs = d.get("sources") if isinstance(d.get("sources"), list) else []
         kinds = sorted({str(s.get("kind") or "") for s in srcs if isinstance(s, dict)})
@@ -1905,8 +1921,74 @@ def _injection_ledger(run: Run) -> list[dict[str, Any]]:
     return out
 
 
+def _injected_usage(run: Run) -> set[str] | None:
+    """The pack item ids the ledger records as read or cited by a node.
+
+    ``None`` when the run has no injection ledger at all: the ledger cannot
+    tell, and the tab says so rather than guessing. A node "reads" an item by
+    being given it (the ledger's ``sources[].id``) and "cites" one by naming it
+    in the planner's ``context_used`` list
+    (:func:`mini_ork.context_v2.acknowledgements`).
+    """
+    records = _injection_records(run)
+    if not records:
+        return None
+    used: set[str] = set()
+    for d in records:
+        for s in d.get("sources") or []:
+            if isinstance(s, dict) and s.get("id") is not None:
+                used.add(str(s["id"]))
+    cited = _read_json_obj(run.run_dir / "plan.json").get("context_used")
+    if isinstance(cited, list):
+        used.update(str(c) for c in cited)
+    return used
+
+
+# What the Learnings tab says when the injection ledger has no field telling
+# whether an injected lesson was used — one note on the section, and the rows
+# stay unmarked (kickoff: "usage not recorded for this run").
+_USAGE_UNKNOWN = "usage not recorded for this run"
+
+
+def _forget_action(lesson_id: str) -> dict[str, Any]:
+    """The row's Forget button: ``lessons forget <id>``, confirmed.
+
+    ``S.btn`` carries no ``done`` toast, so the kickoff's success text rides
+    the action itself.
+    """
+    do = S.cli("lessons", "forget", lesson_id,
+               confirm=f"Forget lesson {lesson_id}? Future runs stop receiving it.")
+    do["done"] = "Lesson forgotten"
+    return S.btn("Forget", do, "ghost")
+
+
+def _lesson_acts(lesson_id: str) -> list[dict[str, Any]]:
+    """A lesson row's buttons: Forget (only when it has an id) + Open in Learn."""
+    acts = [_forget_action(lesson_id)] if lesson_id else []
+    acts.append(S.btn("Open in Learn", S.page_link("learn", "lessons"), "ghost"))
+    return acts
+
+
+def _lesson_item(title: str, lesson_id: str, usage: set[str] | None, level2: bool) -> dict[str, Any]:
+    """One injected lesson row: its id, its used/unused mark and its buttons.
+
+    ``usage`` is the id set the injection ledger records, or ``None`` when the
+    ledger cannot tell — and ``None`` marks nothing (the section carries
+    :data:`_USAGE_UNKNOWN` instead). Outside IDE spec 2 the row is exactly what
+    today's tab draws.
+    """
+    sub = lesson_id
+    if level2 and usage is not None and lesson_id:
+        sub = f"{lesson_id} · {'used' if lesson_id in usage else 'unused'}"
+    return S.item(title, sub, acts=_lesson_acts(lesson_id) if level2 else [])
+
+
 def _learnings_tab(run: Run) -> list[dict[str, Any]]:
     errors: dict[str, str] = {}
+    # The Forget / Open-in-Learn buttons and the used/unused marking are IDE
+    # spec 2 surfaces, like every other v2 field: an older IDE keeps getting
+    # exactly today's page.
+    level2 = S.ide_level() >= 2
 
     def produced() -> dict[str, Any]:
         from mini_ork.web.db import db_for
@@ -1944,13 +2026,16 @@ def _learnings_tab(run: Run) -> list[dict[str, Any]]:
                 except (TypeError, ValueError):
                     conf = 0.0
                 sub = f"{fix} · {node} · confidence {conf:.2f}"
-                items.append(S.item(title, sub, m="✦", mc="purple"))
+                items.append(S.item(title, sub, m="✦", mc="purple",
+                                    acts=_lesson_acts(str(g.get("gradient_id") or ""))
+                                    if level2 else []))
         if db.has_table("learning_record"):
             for r in db.rows("SELECT title, category, outcome, confidence FROM learning_record "
                              "WHERE run_id = ? ORDER BY rank LIMIT 20", (run.id,)):
                 items.append(S.item(str(r.get("title") or ""),
                                     f"{r.get('category')} · {r.get('outcome')} · confidence "
-                                    f"{float(r.get('confidence') or 0):.2f}", m="✦", mc="purple"))
+                                    f"{float(r.get('confidence') or 0):.2f}", m="✦", mc="purple",
+                                    acts=_lesson_acts("") if level2 else []))
         if not items:
             items = [S.dot("Nothing recorded", "Reflection writes gradients after the run's last node.")]
         return S.lst("Produced by the run", items, full=True,
@@ -1959,6 +2044,22 @@ def _learnings_tab(run: Run) -> list[dict[str, Any]]:
     def available() -> list[dict[str, Any]]:
         sections: list[dict[str, Any]] = []
         items: list[dict[str, Any]] = []
+        # The injection ledger drives both the "Injected per node" list and the
+        # used/unused mark on each injected lesson. A ledger that cannot be read
+        # costs those two facts, never the tab (nor the rest of this section).
+        try:
+            ledger = _injection_ledger(run)
+        except Exception as exc:  # noqa: BLE001 — one broken source, one lost list
+            errors["Injected per node"] = f"{type(exc).__name__}: {exc}"
+            ledger = []
+        try:
+            usage = _injected_usage(run) if level2 else None
+        except Exception as exc:  # noqa: BLE001
+            errors["Injected lesson usage"] = f"{type(exc).__name__}: {exc}"
+            usage = None
+        # The ledger cannot tell → say so on the sections that list injected
+        # lessons, and leave every row unmarked.
+        usage_note = _USAGE_UNKNOWN if (level2 and usage is None) else ""
         # Prefer the INJECTED artifact. The planner writes context-pack.v2.json
         # and SUPPRESSES the v1 builder output, so rendering v1 showed a pack the
         # model never saw. v2 first; v1 only as a fallback for older runs.
@@ -1969,19 +2070,22 @@ def _learnings_tab(run: Run) -> list[dict[str, Any]]:
             items.append(S.ok("Injected context", "v2 pack — what the planner received"))
             cons = v2.get("constraints") if isinstance(v2.get("constraints"), list) else []
             if cons:
-                detail = [S.item(f"{c.get('kind', '?')}: {str(c.get('text', ''))[:180]}",
-                                 str(c.get("id", "")))
+                detail = [_lesson_item(f"{c.get('kind', '?')}: {str(c.get('text', ''))[:180]}",
+                                       str(c.get("id", "")), usage, level2)
                           for c in cons if isinstance(c, dict)]
                 items.append(S.ok("Constraints", f"{len(cons)} injected"))
-                sections.append(S.lst(f"Constraints (injected) · {len(cons)}", detail, full=True))
+                sections.append(S.lst(f"Constraints (injected) · {len(cons)}", detail,
+                                      full=True, note=usage_note))
             else:
                 items.append(S.dot("Constraints", "none injected"))
             themes = v2.get("themes") if isinstance(v2.get("themes"), list) else []
             if themes:
-                detail = [S.item(str(t.get("text") or "")[:180], str(t.get("id") or ""))
+                detail = [_lesson_item(str(t.get("text") or "")[:180], str(t.get("id") or ""),
+                                       usage, level2)
                           for t in themes if isinstance(t, dict)]
                 items.append(S.ok("Verified lessons", f"{len(themes)} injected"))
-                sections.append(S.lst(f"Verified lessons (injected) · {len(themes)}", detail, full=True))
+                sections.append(S.lst(f"Verified lessons (injected) · {len(themes)}", detail,
+                                      full=True, note=usage_note))
             contract = v2.get("contract") if isinstance(v2.get("contract"), dict) else {}
             ff = v2.get("file_findings") if isinstance(v2.get("file_findings"), list) else []
             if ff:
@@ -2027,7 +2131,6 @@ def _learnings_tab(run: Run) -> list[dict[str, Any]]:
         else:
             items.append(S.dot("No context pack", "This run was not given a context pack."))
 
-        ledger = _injection_ledger(run)
         if ledger:
             items.append(S.ok("Per-node injection", f"{len(ledger)} node(s) recorded"))
             sections.append(S.lst(f"Injected per node · {len(ledger)}", ledger, full=True))
@@ -2048,6 +2151,134 @@ def _learnings_tab(run: Run) -> list[dict[str, Any]]:
             + S.guarded(errors, "Available to the run", available))
 
 
+# ── artifacts ───────────────────────────────────────────────────────────────
+#
+# Level 1 draws one flat "Artifacts" table; level 2 (the IDE's own spec) splits
+# the same rows into a "Key artifacts" header section plus one table per
+# producing node. Everything here is gated on ``S.ide_level()``, so an older IDE
+# keeps getting today's single table byte for byte.
+
+_ARTIFACT_COLS = [S.col(fr=1, min=200), S.col(110), S.col(70), S.col(110)]
+_ARTIFACT_HEAD = ["file", "kind", "size", "from"]
+
+# The tab draws at most this many FILE rows in total — the key artifacts count
+# toward it. Everything past the cap collapses into one final "+N more in the
+# run folder" row whose ``do`` reveals the run directory.
+_ARTIFACT_ROW_CAP = 200
+
+# The kickoff's "Key artifacts" slots, in the order the tab must show them. The
+# diff is ONE slot whose first alternative wins; ``evidence`` is a directory.
+_KEY_ARTIFACTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("file", ("review-diff.patch", "framework-edit.diff")),
+    ("file", ("verdict.json",)),
+    ("file", ("review-verdict.json",)),
+    ("file", ("rubric.json",)),
+    ("file", ("retry-hint.json",)),
+    ("dir", ("evidence",)),
+    ("file", ("execute.log",)),
+)
+
+
+def _artifact_size(path: Path) -> str:
+    """A key artifact's size: a directory sums the files under it."""
+    try:
+        if path.is_dir():
+            total = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+        else:
+            total = path.stat().st_size
+    except OSError:
+        return "—"
+    return _human(total)
+
+
+def _key_artifacts(run: Run) -> list[tuple[str, Path]]:
+    """``(label, path)`` for each key artifact that exists, in kickoff order."""
+    out: list[tuple[str, Path]] = []
+    for kind, names in _KEY_ARTIFACTS:
+        for name in names:
+            path = run.run_dir / name
+            if (path.is_dir() if kind == "dir" else path.is_file()):
+                out.append((name + ("/" if kind == "dir" else ""), path))
+                break
+    return out
+
+
+def _key_artifacts_section(run: Run) -> dict[str, Any]:
+    """The tab's first section: the handful of files a reviewer opens first."""
+    from mini_ork.cli.board_cmd import _artifact_group
+
+    rows: list[dict[str, Any]] = []
+    for label, path in _key_artifacts(run):
+        do = S.reveal(str(path)) if path.is_dir() else S.open_path(str(path))
+        rows.append({"cells": [S.mono(label), S.cell(_artifact_group(label).lower()),
+                               S.mono(_artifact_size(path)), S.muted("")],
+                     "do": do})
+    if not rows:
+        rows = [{"cells": [S.muted("No key artifacts yet"), "", "", ""]}]
+    return S.table("Key artifacts", _ARTIFACT_COLS, _ARTIFACT_HEAD, rows, full=True,
+                   note="The files a reviewer opens first — the diff, the verdicts, "
+                        "the rubric, the evidence and the run's log.")
+
+
+def _artifact_row(a: dict[str, Any], ids: set[str]) -> dict[str, Any]:
+    """One file row, in the flat table's own columns."""
+    return {"cells": [S.mono(a["path"]), S.cell(a["group"].lower()),
+                      S.mono(_human(a["size"])), S.muted(_from(a["path"], ids))],
+            "do": S.open_path(a["abs"])}
+
+
+def _artifact_file_sections(run: Run) -> list[dict[str, Any]]:
+    """One table per producing node, then the run-level files.
+
+    Attribution is the flat table's own :func:`_from` (``impl-<node>``,
+    ``review-<node>``, …); a file that belongs to no node lands in "Run files".
+    """
+    from mini_ork.cli.board_cmd import _artifacts
+
+    files = _artifacts(run.run_dir)
+    ids = {n.id for n in run.nodes}
+    buckets: dict[str, list[dict[str, Any]]] = {n.id: [] for n in run.nodes}
+    run_level: list[dict[str, Any]] = []
+    for a in files:
+        node = _from(a["path"], ids)
+        (buckets[node] if node in buckets else run_level).append(a)
+
+    # The key artifacts consume part of the row budget, so the tab as a whole
+    # stays under the cap.
+    cap = max(0, _ARTIFACT_ROW_CAP - len(_key_artifacts(run)))
+    ordered = [(f"From {n.id}", buckets[n.id]) for n in run.nodes if buckets[n.id]]
+    ordered.append(("Run files", run_level))
+
+    rendered: list[tuple[str, list[dict[str, Any]]]] = []
+    shown = 0
+    for title, entries in ordered:
+        rows: list[dict[str, Any]] = []
+        for a in entries:
+            if shown >= cap:
+                break
+            shown += 1
+            rows.append(_artifact_row(a, ids))
+        if rows:
+            rendered.append((title, rows))
+
+    if not rendered:
+        return [S.table("Run files", _ARTIFACT_COLS, _ARTIFACT_HEAD,
+                        [[S.muted("No artifacts yet"), "", "", ""]], full=True,
+                        note="Nothing in the run folder yet.")]
+
+    # Every file the cap left out is accounted for by this one row, which is
+    # the last thing the tab draws.
+    collapsed = len(files) - shown
+    if collapsed > 0:
+        rendered[-1][1].append({
+            "cells": [S.mono(f"+{collapsed} more in the run folder"), S.muted(""),
+                      S.muted(""), S.muted("")],
+            "do": S.reveal(str(run.run_dir))})
+
+    return [S.table(title, _ARTIFACT_COLS, _ARTIFACT_HEAD, rows, full=True)
+            for title, rows in rendered]
+
+
 def _artifacts_tab(run: Run) -> list[dict[str, Any]]:
     errors: dict[str, str] = {}
 
@@ -2062,11 +2293,13 @@ def _artifacts_tab(run: Run) -> list[dict[str, Any]]:
                          "do": S.open_path(a["abs"])})
         if not rows:
             rows = [[S.muted("No artifacts yet"), "", "", ""]]
-        return S.table("Artifacts", [S.col(fr=1, min=200), S.col(110), S.col(70), S.col(110)],
-                       ["file", "kind", "size", "from"], rows, full=True,
+        return S.table("Artifacts", _ARTIFACT_COLS, _ARTIFACT_HEAD, rows, full=True,
                        note="Only what the run produced, grouped. Click a file to open it.")
 
-    return S.guarded(errors, "Artifacts", table)
+    if S.ide_level() < 2:
+        return S.guarded(errors, "Artifacts", table)
+    return (S.guarded(errors, "Key artifacts", lambda: _key_artifacts_section(run))
+            + S.guarded(errors, "Artifacts", lambda: _artifact_file_sections(run)))
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────
