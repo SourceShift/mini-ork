@@ -258,6 +258,51 @@ def test_legacy_hatch_cannot_pass_an_unrunnable_baseline(tmp_path):
     assert out["base_unrunnable"] is True, out
 
 
+def test_missing_local_binary_guard_is_unrunnable_not_red(tmp_path):
+    """The target repo's own guard, verbatim: exits 1, never starts the runner.
+
+    ``scripts/miniork/test-touched.sh`` refuses before jest starts and exits
+    **1** with a bespoke line — not one of ``_UNRUNNABLE_RC`` {126,127,77}, and
+    not any of the phrases the log scan knew. So the failure landed in the
+    red-base bucket: ``_judge_red_base`` found no per-test results on either
+    side and abstained as ``red_base_unverified`` ("no per-test results on a red
+    base"). That reason is what the LLM reviewer read next to ``base_rc=1``, and
+    it answered with "repair the pre-existing failing test suites on main" — a
+    human action naming the wrong cause, plus a revise round the patch could not
+    satisfy (run-1792045839-99014, 2026-10-15).
+
+    A baseline whose runner is not installed never ran: it belongs in the
+    ``base_unrunnable`` bucket, and the reason must name the line that says so.
+    """
+    repo = _make_repo(tmp_path, {
+        "mod.py": RED_MOD,
+        "test_a.py": RED_TEST,
+        # Tracked, so the base worktree checks it out too: a runnability
+        # property of the *environment*, not of the candidate's diff.
+        "guard.py": (
+            "import sys\n"
+            "sys.stderr.write('[miniork-test] local jest binary missing at "
+            "./node_modules/.bin/jest; "
+            "run pnpm install before dispatching mini-ork\\n')\n"
+            "sys.exit(1)\n"
+        ),
+    })
+
+    rc, out = _run_verifier(
+        repo, tmp_path, run_id="redbase-local-binary-missing",
+        extra_env={"MINI_ORK_TEST_CMD": "python3 ./guard.py"},
+    )
+
+    assert rc == 0, out
+    assert out["pass"] is False, out
+    assert out["status"] == "unverified", out
+    assert out["base_unrunnable"] is True, out
+    assert "red_base_unverified" not in out, out
+    assert "did not execute tests" in out["error_summary"], out
+    # The cause, not just the class: the guard's own line is the actionable part.
+    assert "jest binary missing" in out["error_summary"], out
+
+
 # ── 6. env scrub: MO_CANARY does not leak into the child suite ──────────────
 def test_child_env_scrubs_mo_canary(tmp_path):
     repo = _make_repo(tmp_path, {

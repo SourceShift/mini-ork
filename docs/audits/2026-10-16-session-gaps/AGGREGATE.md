@@ -138,15 +138,16 @@ in finding 3 is the same failure seen from the other side.
 | 4a | **Three green runs never landed** — `rp-e3-header-v2` / `rp-e6-graph-focus` / `rp-e10-artifacts-learnings` carry `verdict.json` `pass:true` and diffs that still apply, yet none is on `main`. A board `done / step=publisher` does **not** imply a commit | `framework-edit`'s deliverable *is* the diff in the run dir | `mini-ork-cb` G1 |
 | 4b | `e3v2` reads `done` on the board but `ide_pages/run_header.py` exists in no commit; `git apply --check` fails at `node.py:55` (superseded by `d3b52b38`) — needs a surgical re-apply, not a plain apply | run dir; `node.py:55` | `mini-ork-cb` G2 |
 | 4c | **A verifier whose sidecar omits `verifier` is unreadable**, so the page reports "the cause was not classified" over a verdict sitting on disk | `mini_ork/verify/levels.py` `read_verifier_payload` | `run-page-ux-clarity` G-new (round 3) |
+| 4d | **The abstain mechanism can almost never fire: 123 of 124 verifier scripts never emit `failure_kind`** — the runner is fixed and tested, but nothing in production hands it the input it keys on | `mini_ork/verify/pm.py:182` (`classify_spawn`); `recipes/recursive-validate-impl/verifiers/tier1-compile-typecheck.py:172` | new — round 6; fix is **one shared writer, not 123 patches** (addendum below) |
 
 ### P1 — declared but never exercised, or emitted but unrenderable
 | # | gap | where | source |
 |---|---|---|---|
-| 5 | Deterministic-assignment fix never ran end-to-end; 3 declared cluster artifacts never produced | `0190e322`; `artifact_contract.yaml:27,30,33` | `732bb4cc` G1 |
+| 5 | Deterministic-assignment fix never ran end-to-end; 3 declared cluster artifacts never produced | `0190e322`; `artifact_contract.yaml:27,30,33` | `732bb4cc` G1 — **blocked on the user**, not on work (round 5) |
 | 6 | Artifact transport is a design doc only; node has no home for a recipe-declared `path` | `docs/architecture/artifact-transport.md`; `run_nodes.py:20` | `f5671eaa` G1 |
 | 7 | 6 of 15 SDD epics unimplemented; no IDE page renders any SDD mechanism | SDD paths I2/I4/I6/I7/I8/I9 | `8162bb3f` G1, G2 |
 | 8 | `not_needed` 5th bucket missing from the Rust board `Counts` (+ pin bump) | `mini-ork-ui/src/board.rs` | `f6e1ed90` G4 |
-| 9 | Orchestrator "Armed" over-promises on unwired `_parallel` paths | `execute.py:1163`; run Overview section | `d5471234` G2 |
+| 9 | Orchestrator "Armed" over-promises on unwired `_parallel` paths | `execute.py:1163`; run Overview section | `d5471234` G2 — engine half DELIVERED `0af700ca`; **page half BLOCKED** on a live `run.py` claim (round 8) |
 | 10 | Nine epics ship shadow / default-OFF | `MO_PROBE_VALIDITY=shadow`, etc. | `8162bb3f` G3 |
 | 11 | Lane-health no-ops for native lanes under `MO_LANE_PROBE=0` | pre-run gate | `3e207e26` G3 |
 
@@ -159,8 +160,8 @@ in finding 3 is the same failure seen from the other side.
 | 15 | No stage-report writer: the `<run>/buddy/` feed's writer was removed (`fae2a7a5`), leaving nothing to render | `f6e1ed90` G2 |
 | 16 | Orchestrator section is per-run and `LIMIT 6`; no cross-run view | `d5471234` G4 |
 | 17 | `MO_BUDDY_*` silently ignored after the rename to `MO_WATCH_*` | `f6e1ed90` G3 |
-| 18 | Dead scaffolding / stale worktrees: `_ide-engine`, `author-style-review` + `wt/author-style-review` | `d5471234` G3, `732bb4cc` G4 |
-| 19 | Untracked deliverables at risk: `git stash -u` strands run deliverables; 244 KB report + 1.2 MB corpus in gitignored `runs/`; tests live in `/tmp` outside CI | `8162bb3f` G4, `732bb4cc` G2, G3 |
+| 18 | Dead scaffolding / stale worktrees: `_ide-engine`, `author-style-review` + `wt/author-style-review` | `d5471234` G3, `732bb4cc` G4 — **DONE, both halves** (round 8) |
+| 19 | Untracked deliverables at risk: `git stash -u` strands run deliverables; 244 KB report + 1.2 MB corpus in gitignored `runs/`; tests live in `/tmp` outside CI | `8162bb3f` G4, `732bb4cc` G2, G3 — **`/tmp`-tests half DELIVERED `effc3881`** (round 5) |
 | 20 | Doc drift: `docs/todos/2026-10-14-failed-runs-48h-triage.md:375-376` says a run "still reads executing"; the DB says `published` | `83e57620` G4 |
 | 21 | Stale plan/record rows: `run-graph-plan` still `pending` while its three children are `completed` and verified | `6881f0ad` G3 — **CLOSED, wrong store** (round 2) |
 | 22 | Worktree run resolves a bare home → the level-2 spec path is untested there | `da0b8c69` G3 (mechanism) — **not actionable as written** (round 2) |
@@ -617,6 +618,20 @@ grep with a suppressed error). The pattern is worth naming: every one of my wron
 *negative* ("there is no code", "the loop is broken", "the rule does not exist"), and every one
 survived because the failing check was quiet rather than loud.
 
+**C-5, addendum — the obvious remedy is also wrong, measured.** `mini-ork-81` reproduced the
+symlink cause independently and then tested the fix I would have reached for: **`-R` fails exactly
+like `-r`.** BSD grep will not follow a symlink passed as a *file argument*, and "follow all
+symlinks" does not change the file-argument case — `grep -Rn <pat> CLAUDE.md` → rc=1, same as
+`-rn`. The two forms that do work are to **drop `-r` entirely** (`grep -n <pat> CLAUDE.md` succeeds,
+because non-recursive grep just opens the path) or to **name a directory**
+(`grep -rn <pat> .` finds it, reported as `AGENTS.md:77`). This is worth keeping precisely because
+it is the fourth instance of the same shape rather than a fifth unrelated error: a *plausible*
+remedy asserted from how the flag reads, not from running it. `mini-ork-81` also deleted its
+earlier em-dash theory of the cause for the same reason — a wrong-cause memory is worse than no
+memory — and its framing of the generalisation is sharper than mine: **a check that cannot fail
+loudly is not a check.** Both halves of line 77 are that discipline — the retraction is a check that
+was too quiet to fail, and "shipped, not parked" is the same rule applied to delivery.
+
 ---
 
 ## Delivery — round 4
@@ -633,15 +648,18 @@ verified against `origin/main` `5b8d4a98` rather than against recorded status.
   anywhere) and R13 (no `v2_legacy`/`effective` symbol). R8 in progress. **This is cross-cutting
   finding 1 again:** a plan of record that reads like a shipped contract.
 
-**New defect — the reversion watchdog undoes a legitimate rebase (P1).**
+**New defect — the reversion watchdog undoes a legitimate rebase (P1).** **[Resolved by `363b8562` — see round 15.]**
 `.githooks/post-commit:132-152` restores a file whenever its content equals a **parent** commit's
 blob — which is precisely the working-tree state a rebase checkout produces. So every
 `make worktree-merge` within ~60 s of a commit wedges with *"local changes would be overwritten"*.
 Witnessed on `lf-r5` and `lf-r2`; `.mini-ork/file-reversion-guard.log` records
 `restored-reverted-to-2e8367f7…`. Worked around with `MO_REVERSION_GUARD_DISABLED=1`; the source
 still needs fixing. **Not one session's problem:** worktree-merge is how changes land in this repo,
-so a guard that makes it wedge after every commit sits on the critical path for every session — and
-it is a plausible contributor to the "push race, retry loop" friction reported elsewhere here.
+so a guard that makes it wedge after every commit sits on the critical path for every session.
+It caused the two wedged rebases and the retry loops that followed them — but **not** the "push
+race" friction reported elsewhere here, which is a ref-update race on `origin`; the guard only ever
+touches the local working tree. (I inferred the causal link; the session that owns the defect
+corrected it, and the distinction matters because the two have different fixes.)
 
 **Proven but deliberately not applied** — the live-DB cleanup of 166 non-code rows / 280 artifact
 file paths is demonstrated on a **copy** and held back from `$MINI_ORK_HOME/state.db` while R8 runs.
@@ -654,3 +672,744 @@ both → `e1307ee4e056ad09a8e5e3a275a8351990444b1c`), so it is a true duplicate 
 `origin/main` and dropping it loses nothing. It clears with `git pull --rebase` once the ~11 dirty
 files from other sessions quiet; `--ff-only` will keep refusing in the meantime, and an `--ff-only`
 refusal there is **not** evidence of new drift. Not cleared by this session for that reason.
+
+---
+
+## Delivery — round 5
+
+**P2#19 — the `/tmp` tests are now in CI, DELIVERED `effc3881`.** `tests/unit/test_author_style_imitation_review.py`,
+12 tests, merged via `make worktree-merge SLUG=style-assign-tests` — and it ports more than the
+scripts: in-process `importlib` loading for logic (matching `test_frontier_llm_research_recipe.py`),
+subprocess for the CLI exit-code contract, and pins the design itself (the clusterer publishes
+`families.json`, the contract declares all three cluster artifacts, `split.py` runs assign before
+split, and the clusterer prompt contains **no `technique_keys`** — the exact artefact the model used
+to hand-write, so its absence is now a test rather than a hope). Gate: `python3.11 -m pytest
+tests/unit -q -k "recipe or author_style"` → 450 passed; the file alone runs in 4.9 s.
+**Gate note worth keeping: bare `python3` does not work here (3.9, no fastapi) — it must be
+`python3.11`.** A gate that silently degrades to the wrong interpreter is the "verifier could not
+run" class this sweep has already seen once.
+
+**P2#18 — half of it was already done, by a different session, and was verified rather than
+re-done.** The `author-style-review` worktree directory *and* its `wt/author-style-review` ref were
+both already gone; the session checked the recipe content is still on `main` instead of repeating
+the cleanup. No session's claim needs correcting here, but the item is now honestly split:
+`author-style-review` closed, `_ide-engine` still open.
+
+**P1#5 — blocked on the user, and a peer refused to run it, correctly.** Running the
+deterministic-assignment recipe end-to-end is a **real-cost LLM run (~2 h, real money)**, so the
+session declined to launch it on a peer's instruction and raised it to its own user. That is the
+permission-laundering refusal applied where it actually costs something, and the aggregate now
+carries P1#5 as **blocked-on-user, not blocked-on-work** — it needs an authorisation, not an
+assignee.
+
+**The primary reconciled, and the retractions survived it.** Local `main` went through
+`57a589ae` ("reconcile a superseded duplicate") and `2eefcbc1` (merge of `origin/main`), and it is
+now **3 ahead / 1 behind** — no longer carrying the duplicate as a blocker. Verified directly rather
+than assumed, because a merge is exactly where a retraction can be silently reverted: the primary's
+`AGGREGATE.md` still contains C-3 (×3), C-5 (×2), the round-4 reversion-guard text, and P0 4c. It
+matches `origin/main` on every one of those. A wrong-side resolution here would have restored the
+false claim on the next push from the primary; it did not.
+
+---
+
+## Delivery — round 6
+
+**The verifier-provenance plan is fully implemented, and its two declared follow-ons are both open.**
+The plan of record at `/Users/admin/.claude/plans/peaceful-brewing-alpaca.md` is **done, not pending** —
+`2f7e4b81` carries all eleven files it named (`verify/levels.py`, `cli/execute.py`,
+`cli/execute_handlers.py`, `cli/publisher.py`, `recovery/auto_repair.py`, `recovery/retry_hint.py`,
+four test modules), and every symbol it specified is on `origin/main`: `FAILURE_KINDS` (`levels.py:148`),
+`ABSTAINING_KINDS` (`:149`), `ABSTAIN_RC = 3` (`:153`), `abstain_count` (`execute.py:1138`), the
+`rc == _levels.ABSTAIN_RC` branches (`:1291`, `:1295`, `:1460`, `:1509`). Verified by ancestry and by
+reading the symbols, not from the plan's own status. **No session needs to start this work.**
+
+**P0 4d (new) — the mechanism is wired and cannot fire: 1 of 124 verifiers emits `failure_kind`.**
+The plan's own follow-on section says so — *"Emitter sweep — follow-on commits, after the core is
+green … each of the 31 shell-out verifiers gains `failure_kind`"* — and the sweep has not happened.
+Checked positively rather than by one grep, because "nothing emits it" is exactly the negative I have
+been wrong about three times this sweep:
+`git grep -l failure_kind origin/main -- 'recipes/*/verifiers/*.py'` → **1**
+(`tier1-compile-typecheck.py:172`, the reference); `git ls-tree -r --name-only origin/main recipes/ |
+grep '/verifiers/.*\.py$' | wc -l` → **124**. There is no shared envelope writer to fix once:
+`verify/pm.py` exposes `classify_spawn` and the manager resolvers, and **each verifier builds its own
+`envelope` dict and must set the key itself** (`tier1:165-180` is the whole pattern — `classify_spawn(...)
+or classify_spawn(...) or "code"`). So the sweep is genuinely per-file work, ~123 files **[C-6: 123 is not the edit count and 124 is not the verifier count — see round 8]**, and its stated
+scope of 31 undercounts even the shell-out subset.
+
+**Why this is P0 and not a nit.** `classify_spawn` is correct, tested, and reachable — and in
+123 of 124 recipes nothing calls it, so a runner that never started still arrives at the engine as
+`pass: false` with no provenance, which is *precisely the 2026-10-11 incident the whole mechanism was
+built to stop* (one bad lint call → 10 failed nodes → rollback on an implementation never checked).
+The fix landed at the reading end; the writing end is still absent. **This is the fourth instance this
+sweep of one shape — a control that exists but has no input in practice:** `NO_EXECUTABLE_FENCE`
+shipped as a warning so the corpus still lints clean, the reversion guard fires on a state a rebase
+produces, and now the abstain vocabulary that no verifier speaks. Worth naming as a class, not four
+separate findings: **each was verified at the mechanism and never at the input**, and each passes its
+own tests.
+
+**The plan's learning hand-off is real and is the user's.** `classify_spawn` (`pm.py:182`) is *not* an
+empty stub — I expected one and checked, and it has a working body: `rc == 127` → `toolchain`, a negative
+`rc` (a tool killed by a signal before it reached a verdict — the `m3b-activity-feed-backend-removal`
+`lint_rc -15` case) → `toolchain`, then a conservative `_SPAWN_FAILURES` pattern list. The `# noqa:
+ARG001` is only because `argv` is contractual-and-unused. What is left for the user is the docstring's
+own ask: **which pattern or rc separates "the tool never started" from "the tool ran and rejected the
+input"** — domain knowledge about the runners, ≈8 lines, and *every* shell-out verifier calls this one
+function, so refining it here is refining it everywhere. Nothing downstream is blocked on it, and it is
+still the highest-leverage unfilled slot in the codebase this sweep found.
+
+**Concurrent-edit note, for whoever lands the sweep.** `mini_ork/cli/execute.py` is dirty at this audit
+(held by a peer), but the mechanism it holds is already landed — so the sweep does not collide with
+that edit, and the sweep touches only `recipes/*/verifiers/*.py` and `verify/pm.py`, neither of which
+that peer is in.
+
+### Round 6, addendum — what P0 4d actually costs, and why it is unowned
+
+**The cause is structural, not 123 oversights.** Each verifier prints its own envelope inline —
+`git grep -l 'print(json.dumps' origin/main -- 'recipes/*/verifiers/*.py' | wc -l` → **52**, so at
+least half write the JSON themselves by hand — and `verify/pm.py` deliberately has no envelope
+writer. `git grep -l '_lib' origin/main -- 'recipes/*/verifiers/*.py' | wc -l` → **2**, against a
+single `_lib` module in the whole tree. So **at most 2 of 124 verifiers route through any shared
+library at all.** **[C-6 — this sentence is FALSE: it is 47 of 117 verifiers, and 124 is *files* (117 verifiers + 7 helpers), not verifiers. See the correction in round 8.]** The consequence is the part that makes this P0 rather than a chore: patched by
+hand, it is 123 independent edits with 123 chances to drift, *and the next verifier anyone writes
+silently rejoins the 123* — which is how the gap reopened after `2f7e4b81` closed its own half.
+
+**The leverage is a shared envelope writer, and a precedent for the shape already exists.**
+`recipes/epic-runner/verifiers/_lib.py` prints one envelope from a predicate (`"pass": not failed`,
+`:86`) rather than each verifier assembling its own. It does **not** yet carry `failure_kind` — the
+precedent is the writer *shape*, not the abstain key — so closing 4d is one helper gaining
+`failure_kind = classify_spawn(...)` at its shell-out site, plus call-site swaps for the 52 (and, for
+the other 72, whatever they use instead), and every verifier written afterwards inherits it. **The
+sweep's stated scope of "31 shell-out verifiers" undercounts the call sites and misreads the fix as
+per-file.**
+
+**Unowned, and it needs the user's go-ahead — a peer correctly declined to authorise it.**
+`mini-ork-84`, which re-derived every number above independently and supplied the shared-writer
+framing, declined to start it: a multi-file change across 123 files is routed through mini-ork by its
+user's standing instruction, and a peer request cannot authorise it. That is the third refusal this
+sweep and the right one — the same discipline as P1#5's ~2h run and the `:7090` restart. **P0 4d is
+therefore open-and-unowned, not blocked:** it needs a decision to assign it, not a technical
+unblocking. Recorded here so it is not mistaken for "someone has it".
+
+**One correction to round 6's own scope line.** Round 6 said the sweep is "~123 files"; that is the
+count of *verifiers*, not of *edits* **[C-6: the verifier count is 117; 124 counts files, seven of which are helper libraries — this correction repeated the unit error it was correcting]**. The measured edit set is the shared writer (1) plus the
+call sites that bypass it — 52 printing inline, 122 with no `_lib` reference. Directionally the same
+finding, but the file count was mine and it was not measured.
+
+---
+
+## Method note — the one error this sweep produced five times
+
+Every wrong claim below was **a check that passed while answering a narrower question than the one
+asked**. None was carelessness and none was a check that failed; each was a check that *succeeded*
+at the wrong scope, which is why each survived review.
+
+| the claim | the check that passed | the question actually being asked |
+|---|---|---|
+| C-1 — "there is no code that does this" | one `grep` for the obvious name | is there code anywhere under any other name |
+| C-3 — "the loop returns the wrong match" | one reading of the docstring's word "LAST" | does the loop's first match *equal* the last writer |
+| C-5 — "the push rule is in no `CLAUDE.md`" | one `grep -r` with `2>/dev/null` | does the rule exist in a *symlinked* file |
+| `-R` — "this is the fix for C-5" | the flag's documentation ("follow all symlinks") | does BSD grep follow a symlink passed as a *file argument* |
+| the stale re-read — "the harness invented a version" | two markers matched a plausible producer | did that version ever exist *on disk* |
+
+Two of the five were mine (C-1, C-3), one is shared (C-5 and its remedy, mine then corrected by
+`mini-ork-81`), and two are `mini-ork-81`'s own, retracted by it unprompted — the last one downgraded
+from "a version that never existed" to "a stale-but-real generation", which is the ordinary cache
+behaviour it looks like. **The class is not "unverified claim". It is "verified at the wrong scope",
+and it is invisible from inside the check.**
+
+**This applies to this document.** Every number above was produced by the same method that produced
+those five errors, so a bare count here is a hypothesis until its measurement is named — which is why
+each P0 entry carries its command rather than its conclusion, and why P0 4d is filed as a decision to
+assign rather than a technical unblock. The useful discipline is the one `mini-ork-81` named and then
+applied to its own memory: **ask what question the check answers, not whether it passed.**
+
+---
+
+## Delivery — round 7 (two peer landings, one of them P1#9)
+
+**P1#9 is DELIVERED — `0af700ca`.** *"emit an orchestrator.armed receipt, so 'armed' is read not
+inferred"*. The run page tested `runner_orchestrator.enabled()` alone and printed *"Armed — no
+interventions this run"*, while the layer is default-on but **wired only on the dependency-graph
+path** (`execute.py`'s `while pending:` wave loop) — the other `_parallel` call sites never call it.
+So an enabled-but-unwired run rendered as armed: the word read as *"the layer chose to stay quiet"*
+when the truth was *"the layer structurally could not act here"*. The fix is the method note's own
+discipline applied to a UI claim: **the engine now writes one run-level `orchestrator.armed` row at
+the moment it commits to the wired path with the layer enabled, so the page reads a fact instead of
+inferring one** — distinguishing "armed and quiet" (receipt present) from "enabled but never wired"
+(absent). It needed a new `mo_run_emit` (a run-level row carries no `node_id`; `mo_node_emit` guards
+on a non-empty one) and lifted the schema-aware insert into a shared `_insert_event`.
+**Same shape as P0 4d and the method note — read, do not infer — which is now the third place the
+sweep has found it in the engine rather than in a session's reasoning.**
+
+**`9f0c22b2` lands the push-race remedy that round 4 said the reversion guard was not.**
+*"fix(worktree): re-fetch and re-rebase after the green gate, before pushing"*, in
+`scripts/mini_ork_worktree.py:541-556` (16 lines). The mechanism it names is exactly the race this
+document described: `merge_worktree` fetched `origin/main` once, ran the green gate **for minutes**,
+then pushed `HEAD:main` with no re-fetch — so a peer landing during the gate won the race and the
+push was rejected as non-fast-forward *while the tree was green and nothing was wrong with it*.
+Two consecutive merges were lost that way in one session, which is the diagnostic detail worth
+keeping: **the failure looked like a conflict and was a stale base.** The fix re-fetches and
+re-rebases after the gate, and re-runs the gate if the rebase moved HEAD (the gated content changed,
+so the old green is not the new green). This is ~~a finding-closing landing~~ **[C-7: it is not — the remedy moves the race rather than closing it. See round 10. Superseded in round 13: the landed remedy `64a4a42d` does close it.]**
+
+**New interaction risk — recorded as a HYPOTHESIS with its check, deliberately not as a finding.**
+The remedy's `git rebase origin/main` is **the exact local-rebase operation the reversion guard
+wedges** (`.githooks/post-commit:132-152` restores a file whose content equals a *parent* commit's
+blob — which is the working-tree state a rebase checkout produces), and the new rebase runs
+immediately after a commit and after a multi-minute gate. If the guard's ~60 s window is still live
+when that rebase starts, `9f0c22b2` may re-wedge the very operation it was written to unblock — from
+the opposite side of the same race. **I have not run it, so it is not a finding**, and the method
+note above is precisely why it is not being written as one: it would be a plausible conclusion
+inferred from two adjacent mechanisms, which is the error class this document catalogues five times.
+The cheap check is named: commit, then run `make worktree-merge` inside the guard's window and watch
+`.mini-ork/file-reversion-guard.log`. The commit's own verification (31 passed) exercises the script
+in tests, where the guard hook is not installed, so it does not settle this either way.
+
+---
+
+## Delivery — round 8 (P1#9 splits, P2#18 closes, and C-6 retracts round 6's own count)
+
+**P1#9 — the engine half is not the acceptance, and the page half is blocked on another session.**
+`0af700ca` is landed and verified (a run-level `orchestrator.armed` receipt, `mo_run_emit`, a shared
+`_insert_event`; gate 259 passed twice, ruff clean). But the *acceptance* — "an unwired run does not
+render as armed" — is unmet: the predicate and the literal *"Armed — no interventions this run"* live
+**inline in `mini_ork/ide_pages/run.py:1206-1249`**, and that file is held by worktree `rp-e6-land`
+(`wt/rp-e6-land`, session p238) with a staged, uncommitted patch. Verified directly —
+`git status --porcelain mini_ork/ide_pages/run.py` → ` M`, and `git worktree list` shows
+`rp-e6-land 937506bc`. So the row is **engine half delivered, page half blocked on a live owner**, and
+the blocker is another session's unlanded work, which no audit can route around. The fix in waiting,
+recorded so it is reviewable before the claim frees: fetch the receipt **by its own predicate**
+(`event_type = 'orchestrator.armed'`) instead of letting it compete for the parser's `LIMIT 6`
+intervention slots; filter it out of the displayed items so it cannot render as a fake intervention;
+then a genuine three-state branch — off / armed (receipt or activity) / enabled-but-no-wiring-signal,
+the third worded so it does not read as armed. **The existing `except Exception: armed = True` fallback
+is part of the over-promise and goes with it**: an exception is not evidence of arming.
+
+**P2#18 — DONE, both halves, and my round-5 entry was wrong about `_ide-engine`.** Verified rather than
+taken from either report: no `_ide-engine` directory at any `ps/*` path,
+`git rev-parse --verify wt/author-style-review` → *"Needed a single revision"* (the ref is gone), and
+neither appears in `git worktree list`. `mini-ork-df` gave the losslessness receipts — `_ide-engine` was
+a detached HEAD whose three commits are all ancestors of `origin/main`, and
+`git rev-list --count origin/main..wt/author-style-review` → 0 — and the "relaunch against the primary"
+half needed no action, because the live IDE's children already run with cwd `ps/mini-ork` and spawn the
+primary's `bin/mini-ork mcp-context`. **Two sessions reported this item and one was wrong:**
+`mini-ork-84` said the `author-style-review` half was done and `_ide-engine` still open — right on the
+first, wrong on the second. Recorded because it is the third time this sweep that a peer's report and
+the tree disagreed, and **the tree won every time.**
+
+**C-6 — "at most 2 of 124 verifiers route through any shared library" was FALSE, and it was mine.**
+Corrected: **47 of 117 verifiers route through a shared helper.** The unit was wrong as well — 124 is
+*files* under `recipes/*/verifiers/`, of which **117 are verifiers and 7 are helpers** (`basename`
+begins `_`), so every "of 124 verifiers" phrase in round 6 double-counted the seven libraries. Measured:
+
+```
+git ls-tree -r --name-only origin/main recipes/ | grep '^recipes/[^/]*/verifiers/.*\.py$'   → 124 files
+  … basename begins "_"  → 7 helpers        … basename does not begin "_"  → 117 verifiers
+git grep -l '_stage import\|_lib import\|_sdd_common import\|_verdict_merge import' \
+    origin/main -- 'recipes/*/verifiers/*.py' | grep -v '/verifiers/_' | wc -l             → 47
+```
+
+**How it was wrong is the useful part — the method note's class, a sixth time.** I grepped **one name**
+(`_lib`) and reasoned from it to "any shared library": a check that passed while answering a narrower
+question than the one asked. The tell is that a *different guess would have produced a different wrong
+number* — grep `_stage` alone and you get **35**, `_lib` alone **1** (the second hit of the bare pattern `_lib` was the library file itself), `_sdd_common` **9**, `_verdict_merge` **2** — and only the **union is 47**, the property actually claimed **[R11: this parenthetical originally read `_stage` → 47, `_lib` → 2. Both wrong, and wrong in precisely the way the sentence illustrates — the example of the error contained the error. It is kept, corrected, because it is now the strongest instance of the rule below: three different guesses gave 35, 1 and 47, and only the third question was the one being asked.]**. A check whose answer depends
+on which name you happened to guess was never measuring the property claimed. `mini-ork-84` supplied the
+framing and the alternate names (`_stage.py` ×4, `_sdd_common.py`, `_verdict_merge.py`).
+
+**The fix shape is better than round 6 said, and for a different reason.** The shared writer does not
+need inventing: **four recipes already carry the same `_stage.py`** — author-style, coord-technique,
+rsi-technique, verification-technique — differing only in docstring and lib-path constants (35 diff
+lines between two, no logic divergence). So the write-shape precedent is that template copy-pasted once
+per recipe, **not** `epic-runner/verifiers/_lib.py` (which, as round 6 correctly noted, carries no
+`failure_kind`). **Revised edit set: 7 helpers — of which 4 collapse to 1 template — plus the 70
+verifiers that hand-roll their envelope.** `_sdd_common.py:75-81` and `_verdict_merge.py:79` are already
+closer to correct (both derive `pass` from a predicate, `_sdd_common` has an explicit internal-error
+branch), so they sit nearer a shared writer than the template does.
+
+**And the instance round 6 folded in was described wrongly — in the direction that understates it.**
+Round 6 said author-style's verifiers "emit the same bare `{"verifier": ..., "pass": true}` envelope".
+That is not their mechanism: `git grep -ln 'print(json.dumps' … author-style-imitation-review/verifiers/*.py`
+→ **0**. Their envelope comes from `_stage.py:60`:
+
+```python
+rc = subprocess.run([sys.executable] + argv, check=False).returncode
+if rc != 0:
+    sys.exit(rc)                                            # failure path emits NO envelope
+print('{"verifier":"style-review-%s","pass":true}' % stage)  # success path: a literal, no predicate
+```
+
+A hardcoded literal on success and **silence on failure** — the gap in its strongest form, because on
+the failure path there is no envelope at all for `failure_kind` to live in. A worse instance than the
+one I wrote, in the recipe whose CI was landed the same day.
+
+**Method note, second instance — a silent zero is indistinguishable from a real zero.**
+`mini-ork-84` reported that `git grep -E` is POSIX ERE, does not support `\b`, and its first cut with a
+`\b` pattern returned **0**, "which would have corroborated the wrong number". A pattern that matches
+nothing and a pattern that *cannot* match anything print identically. Same failure as C-5's suppressed
+`2>/dev/null`, one layer down: there the error was discarded, here there was no error to discard.
+**Disposition: before trusting a zero, run a second pattern that should match the same population.**
+It applies to every count in this document.
+
+---
+
+## Delivery — round 9 (P2#16's shape, and the primary supersedes its earlier reading)
+
+**P2#16 (per-run `LIMIT 6`) — undecided, and its cheap half shares P1#9's blocker.** The refinement is
+worth recording because it changes *where* the fix belongs, and the audit's own G1 naming collision is
+the reason: a cross-run view belongs in `mini_ork/ide_pages/runs.py` ("Runs & live execution"), **not**
+`orch.py` — `orch.py` is the engine-side surface (threads, kickoffs, races, planner), so putting a
+cross-run view there deepens exactly the collision G1 flags. The honest minimal fix is therefore not
+code at all: **say in the section note that it is per-run and capped at 6**, which removes the
+over-promise without inventing a surface. That half is blocked on `run.py`, alongside P1#9's page half,
+so the two should land together or not at all — landing one and leaving the other is how a page ends up
+half-honest.
+
+**The primary's lag supersedes every earlier reading in this document.** Measured now:
+`git rev-list --left-right --count HEAD...origin/main` → **3 ahead / 10 behind** (origin at `19b1b267`), against the
+`3 ahead / 3 behind` recorded in round 5 and the `3 ahead / 1 behind` that preceded it. The composition
+matters more than the count: two local merge commits plus a **duplicate of upstream `8d8be650`**, with
+17 dirty files from other sessions. A session refused `git merge --ff-only origin/main` and **stopped
+rather than resetting or plain-merging** — the correct call under the worktree discipline, and the
+third time this sweep that the right action was to halt and surface rather than to reconcile someone
+else's incomplete state. **Recorded as blocked-on-user, unchanged, and explicitly not urgent:** nothing
+is lost while it sits, because each of the landings in rounds 5–8 went through a detached worktree of
+`origin/main` and none of them depended on the primary's local `main`.
+
+---
+
+## Delivery — round 10 (C-7: the push-race remedy reopens the race; and a faithful record of a bad commit message)
+
+**C-7 — round 7 called `9f0c22b2` "a finding-closing landing". It closes nothing; it replaces one race
+window with another of the same length.** The mechanism, verified by reading the landed code rather
+than taken on report: the remedy does `fetch origin main` → `rebase origin/main` → **re-runs the entire
+`MINI_ORK_TEST_CMD` gate** → `push origin HEAD:main`. Rebasing onto a moved base *rewrites HEAD*, which
+is exactly why the re-gate is there — and it is correct to re-gate. But the consequence is that the
+interval between the re-fetch and the push is again a **whole gate**, so any peer landing inside it
+still wins and the push is still rejected as non-fast-forward. The window did not shrink; the re-gate
+restored it. Round 7's error was to read a *mechanism that addresses the stated cause* as a *fix that
+closes the finding* — the reader-side/input-side confusion this document has now catalogued seven times.
+
+**The peer receipt, which I did not reproduce myself and am labelling as such.** `mini-ork-df` lost
+non-fast-forward **after** the fix landed (23:40:25) with the gate narrowed to two test files — a ~30 s
+window — and it checked that the *executing* copy was the patched one before blaming the script:
+`make worktree-merge` runs `scripts/mini_ork_worktree.py` from the **primary working tree**, where the
+file is `M`, and `diff <(git show origin/main:scripts/mini_ork_worktree.py) scripts/mini_ork_worktree.py`
+is empty. I verified that last part myself — the primary's copy is `M` and diff-empty against
+`origin/main`, so the patched script is what ran. **The mechanism check is mine; the empirical loss is
+the peer's receipt, and both point the same way.**
+
+**What actually landed:** a bounded `fetch → rebase → push` **retry loop**, with the gate hoisted out of
+it — it succeeded on attempt 2. The trade the owner now has to make deliberately: gating once and
+re-basing+pushing in a tight loop accepts that the rebase may **combine the branch with new upstream
+commits**, which is the exact risk the re-gate was added to cover. So the choice is
+*re-gate (window stays open, correctness covered)* versus *tight loop (window mostly closed, combined
+content ships ungated)* — and that belongs to whoever owns the script, not to a default.
+
+**My round-7 hypothesis about the reversion guard is superseded, and it should not be left standing.**
+I speculated that the new `git rebase origin/main` might be wedged by the reversion guard's ~60 s
+window. `mini-ork-df`'s finding does not involve the guard at all and is better evidenced: the race
+persists because the re-gate reopens the window, independent of any hook. I am marking my speculation
+as superseded rather than leaving two competing explanations in the document — the guess was mine, it
+was untested, and a second untested explanation only muddies an evidenced one.
+
+**Faithful record of my own bad commit message.** The round-9 commit message states the primary's lag as
+*"8 behind / 3 ahead at origin `f70f977b`"*. **I did not measure that.** The document's line is the
+measured value — **3 ahead / 10 behind, origin `19b1b267`** — computed inside the patch; the number in
+the message was written by hand and is wrong in both figures and in the tip. Pushed history is not
+rewritten, so it stays wrong and this is the correction of record. **The failure is identical in shape
+to C-1/C-3/C-5/C-6: a number from adjacent knowledge instead of from the measurement, published before
+it was checked** — and the only reason it is caught at all is that the same value was *also* computed
+programmatically in the body, which disagreed with the hand-written one.
+
+**Rows 9 and 18 — `mini-ork-df`'s corrections to round 7 were already applied in round 8**, in the
+direction it suggests: row 9 now reads *engine half delivered, page half blocked on the `run.py` claim*,
+and row 18 reads *DONE, both halves*, with the "relaunch needed no action — it was a premise, not a
+finding" detail recorded. Its independently-arrived-at text is recorded here because two sessions
+converging on the same correction is the strongest signal this document has.
+
+---
+
+## Delivery — round 11 (R11: the illustration contained the error; the lag needs pinning, and one SHA was invented)
+
+**R11 — my C-6 "tell" was itself wrong, and it was wrong in the way it was illustrating.** I wrote
+*"grep `_stage` instead and you get 47, grep `_lib` and you get 2"*. Measured now, on `origin/main`:
+
+```
+_stage import            → 35     (author-style 10, coord-technique 9, rsi-technique 8, verification-technique 8)
+_lib import              →  1     (epic-runner's researcher-verifier; the second hit of the bare
+                                   pattern `_lib` was `_lib.py` itself — the library, not a verifier)
+_sdd_common import       →  9     (spec-driven-delivery)
+_verdict_merge import    →  2     (framework-edit)
+union                    → 47     ← the property actually claimed
+```
+
+So the *illustrative example in the retraction of a measurement error was itself a measurement error*,
+caught by `mini-ork-84` in the same position it occupies in this document — the second-pattern rule
+applied to its own example. **It is kept rather than deleted, because corrected it makes the rule
+load-bearing instead of illustrative: three different guesses give 35, 1 and 47, and only the last is
+the question being asked.** That is a better demonstration than the one I intended, and the reason it
+is a *sixth* instance rather than a footnote is that I reached for two adjacent numbers to decorate a
+true claim — the same reflex as C-1, C-3, C-5, C-6 and the `-R` remedy, one layer out.
+
+**The lag: `ahead` is the invariant, `behind` is a function of the tip, and one of my SHAs was
+invented.** `mini-ork-df` is right that round 9's message paired a number from one tip with a different
+tip's SHA, and that the correction of record then did the same thing one tip later. Corrected form —
+**state the invariant, and name the tip in the same clause as any tip-relative number:**
+
+- **`ahead` = 3, invariant.** Local `main` (`2eefcbc1`) carries three commits `origin/main` does not,
+  and that does not move while nobody commits to the primary's local `main`.
+  **[Round 16: the condition no longer holds — at tip `c7a84dc5` the shared checkout reads
+  **7 ahead / 31 behind**, so `ahead` is conditional, not invariant, and people do commit locally.]**
+- **`behind` tracks the tip and is never a standing fact:** 10 when the tip was `19b1b267`, **16 now**
+  (tip `c45b0390`). It grows every time a peer lands. Quoting "behind" without its tip is quoting
+  half a fact.
+
+**And `f70f977b` does not resolve — `git rev-parse --verify f70f977b^{commit}` → *"Not a valid object
+name"*.** I did not merely mis-measure it: **I invented it**, in the round-9 commit message. That is
+worse than a wrong number, as `mini-ork-df` observed, because an unresolvable citation is
+**unfalsifiable** — it cannot be checked by anyone, including me, so it sits in the record as authority
+that nothing can contradict. The measured figures the message should have carried are in round 9's
+body; the SHA in the message corresponds to no object on this remote. Recorded as the strongest form of
+this document's recurring error, and the only instance that is not merely a near-miss.
+
+**Method note, third instance — pin the pair, or state the invariant.** A single number that depends on
+when it was read is not a fact; it is a fact *about an instant*. The ladder `mini-ork-df` produced
+(8 → 10 → 16 as the tip moved, with `ahead` fixed at 3) is better evidence than any single pair,
+precisely because it shows **the number moving while the tree stands still**. Every count in this
+document that is tip-relative — every "behind", every "N commits since" — is subject to this, and the
+rule is the same one the second method note gives for zeros: **name the measurement that would make it
+different.**
+
+---
+
+## Delivery — round 12 (three gaps delivered by a peer; the invented SHA sharpened; and a correction aimed at the wrong document)
+
+**Three delegated gaps are DELIVERED, all verified as ancestors of `origin/main`** (not taken on
+report — `git merge-base --is-ancestor <sha> origin/main` returns 0 for each):
+
+| gap | commit | what it fixes |
+|---|---|---|
+| **P0#1** | `37d39474` | the rubric graded a revived run against the attempt it *replaced* |
+| **P0#3** | `d1c0c871` | `recover --strategy verify` entered at the first verifier, not the hint's failed node |
+| **P2#12** | `f43022ea` | a revive never settled the run's row — stale `ended_at`, un-reconciled `cost_usd` |
+| *(doc)* | `c45b0390` | the session file recording the three SHAs and the cost mechanism |
+
+**P0#1 — the rubric read a dead attempt's leftovers.** `artifact_summary` now retires attempt-scoped
+markers (`NEEDS-CHANGE.md`, `rolled-back.json`, `retry-hint.json`, `retry-gate.json`, `diagnosis.json`,
+`owner.json`) that **predate the newest green run-level verdict**, and *names the omission* instead of
+dropping it silently. The naming matters as much as the retirement: a marker that vanishes without a
+line in the summary is the same failure one layer up. 28 passed; with the suppression neutered the two
+new behavioural tests fail. **This closes the finding this sweep recorded as "the rubric reads the
+superseded attempt's failure markers" — and note the pre-existing tell it explains: `rubric.json` and
+`panel-verdict.json` written after a green revive still said `pass=false`, quoting the dead attempt.**
+
+**P0#3 — the root cause was the entry node, not the checkpoint ledger.** `--strategy verify` resolved its
+entry as `--from-node` *or the first verifier in topological order*, and the hint's own `command` never
+carried `--from-node` — so the recover CLI ignored the answer the hint already held, picked `typecheck`,
+and the closure became `descendants(typecheck)`, which **excludes `test` — its sibling.** That is the
+mechanism behind a symptom this sweep recorded without explaining: every revive re-ran `typecheck` with
+a fresh log while `retry-exhausted/test.attempts.json` kept its old mtime and the reviewer escalated on
+the same stale `rc=77`. The hint's node is now the default entry **for `verify` only** (an explicit
+`--from-node` still wins; a hint naming an unknown node warns instead of refusing). Verified by
+construction — the hint node is in the dispatched closure, and a test asserts
+`MINI_ORK_RECOVERY_FROM == "test"` with `typecheck` absent. Neutered, 2 of 4 fail.
+
+**P2#12 — one cause per half, and both were structural rather than sloppy.** (a) `execute.set_status`
+writes terminal rows with `ended_at = COALESCE(ended_at, ?)` — a *within-attempt* rule (publisher,
+executor and `finalize_passed` can all close one attempt and must not fight over it) that **nothing
+scoped per attempt**, so a revived row kept the dead attempt's end forever; a live status now clears
+`ended_at`/`duration_ms`, which is the invariant `web.control._restore_status` already applied to a
+reopened run. (b) `main._reconcile_run_cost` is the *only* caller of `cost_ledger.reconcile_run_cost`
+and lives in the lifecycle tail a recover never enters, so the revival's spend never reached the row;
+the recover tail now reconciles beside the rubric-prescreen refresh, which is there for the same
+reason. End-to-end through the real `recover` cli_main with a fake executor: `ended_at` advances,
+`duration_ms` recomputes, `cost_usd` 6.725933 → 7.002127. **Explains the recorded symptom exactly —
+"the published row keeps the first attempt's `ended_at`/`cost_usd`".**
+
+**P1.2 (new) — two abstention contracts, and the ledger believes the wrong one.** The recipe-level
+abstention writes `status: "unverified"` and **exits 0** (`recipes/code-fix/verifiers/test.py:1244`
+`emit_unverified`, `return 0` at `:1276`), while the engine's abstain contract is **`ABSTAIN_RC = 3`**
+(`verify/levels.py`). So `_record_step_completion` maps `rc == 0 → succeeded` and **the ledger claims a
+check that never ran.** Verified the `rc == 0` half myself; the mapping is the peer's read.
+**Deliberately not fixed — it is a design call, not a one-liner:** reconciling two abstention
+vocabularies means deciding which is canonical, and P0 4d is the same decision seen from the other
+side (there, nothing *emits* `failure_kind`; here, something emits a *different* abstain signal that
+the reader does not recognise). Both belong to one owner because they are one question.
+
+**`f70f977b`, sharpened — the correction should say it names nothing, not substitute a pair for it.**
+`mini-ork-df` ran four checks and all four fail in the same direction: `git cat-file -t` *"Not a valid
+object name"*, `git rev-parse --verify` no commit, absent from refs/packed-refs/reflogs, `git ls-remote
+| grep` → 0, `git fetch origin f70f977b` → *"couldn't find remote ref"*. So it is not a pruned tip or an
+unfetched one; **the server refuses it by name**, and the only occurrences of the string anywhere are
+inside the two commit messages that cite it. Adopted wording: **no pair exists at `f70f977b`** — the
+measurement it was meant to carry is 8 behind / 3 ahead, taken at `0af700ca`. Substituting a pair
+against an unresolvable SHA would be the fabrication the SHA itself already is.
+
+**The ladder, in the tip-relative form that survives a moving origin** (`rev-list --left-right --count
+<tip>...main`): `0af700ca` → 8 / 3, `19b1b267` → 10 / 3, `d8633608` → 15 / 3. **`ahead` is 3 at every
+rung** — local `main`'s own commits do not move — while `behind` is a reading taken against a tip and
+means nothing without it. **[Round 16: falsified at tip `c7a84dc5` — the shared checkout reads
+7 ahead / 31 behind, and local `main` gained commits, so `ahead` is not a standing fact either.]**
+This supersedes the single pairs in rounds 9 and 10.
+
+**A correction aimed at the wrong document — recorded, not silently accepted.** `mini-ork-df` corrected
+"your own C-24 rule" and "your C-26 wording" describing a loop of *"a fetch, a rebase, a fast-forward
+check and a push"*. **This document has no C-24 and no C-26** — its corrections are C-1 … C-7 plus
+R11 — and it never described the landed loop as four steps: round 10 already recorded it as
+**`fetch → rebase → push`, three steps, with the gate hoisted out and the push's own exit code as the
+check** (`mini-ork-df`'s own wording, which agrees). So there is nothing here to correct, and the
+correction belongs to whatever document does carry those numbers. **Recorded because refusing a
+correction is as much a part of this sweep as accepting one**: a plausible correction aimed at text you
+do not have is the same shape as C-1/C-3/C-5/C-6 — a claim that *sounds* like it matches, unchecked
+against its own target. The mirror-image discipline: **verify the target before acting on the claim**,
+which is what this session did rather than editing a sentence that does not exist.
+
+**Not a fix, and not this sweep's:** run `1792059337-779` stays operator-blocked on the researcher
+repo's `jest-guard` load refusal (R7 / inbox 38). The three landings above make the *next* revive
+touch the node that actually failed, record its own end/spend, and stop the rubric grading a dead
+attempt — **none of them makes 779 green**, and the peer said so itself rather than implying the
+blocker was cleared.
+
+## Delivery — round 13 (C-7 superseded by the landed lock + retry; a peer retracts its own correction)
+
+**C-7 is superseded at the source, and I verified the replacement rather than taking the word for it.**
+Round 10 recorded C-7 — the push-race remedy `9f0c22b2` re-runs the gate after the re-fetch, so the
+window between re-fetch and push is again a whole gate and the race is moved, not closed. That was
+true of `9f0c22b2`. It is no longer true of `origin/main`: `64a4a42d` (*"fix(worktree): close the push
+race with a lock + retry, not a re-gate"*, +79/−17 in `scripts/mini_ork_worktree.py`) replaces it.
+Measured, not assumed:
+
+- `git merge-base --is-ancestor 64a4a42d origin/main` → **yes**.
+- The old re-gate's own string — `"green gate failed after re-rebasing"` — now returns **0** hits on
+  `origin/main:scripts/mini_ork_worktree.py`.
+- The replacement, read in the file: the green gate now runs **once, outside the lock** (its comment
+  says so outright — *"The green gate is deliberately NOT re-run inside this loop"*), then a bounded
+  `for attempt in range(1, attempts+1)` loop — `fetch → rebase → push`, the **push's own returncode
+  as the check**, `time.sleep(0.3)` between attempts, `MO_MERGE_PUSH_ATTEMPTS` default **5** — runs
+  inside an mkdir lock. Its code comment names C-7's own case (*"a peer lost a push to a gate narrowed
+  to 30 s"*) and states the accepted trade explicitly: a rebase can combine the branch with commits
+  that landed during the gate; that combination is not re-gated, and `_differential_verdict` names it
+  should it ever be found red.
+
+**The lock closes the same-machine race, and I checked the part the claim depends on.** A lock only
+serialises writers that share it, so the real question is whether *every* path that pushes `HEAD:main`
+takes it. Two such writers exist: `scripts/mini_ork_worktree.py` and the older
+`scripts/mini-ork-worktree.sh` (the port's predecessor, still referenced by `AGENTS.md:50` and the
+worktree guard). Both resolve the lock to the **same** path —
+`${MINI_ORK_WORKTREE_LOCK:-$TMPDIR/mini-ork-worktree.lockdir}` (`.py`: `_merge_lock_path()`, `:48`;
+`.sh`: `LOCK_DIR`, `:43`) — and both rebase→push **inside** the critical section, so the interval
+between the rebase and the push is milliseconds, not a gate. That is exactly the property C-7 said was
+missing.
+
+**The one residual, stated so it is not later mistaken for the closed race.** The `.sh` has the lock
+but **not** the bounded retry: `08761433` gave it `acquire_lock`/`release_lock` around
+`rebase → push`, with no `MO_MERGE_PUSH_ATTEMPTS` loop (measured: `grep -c MO_MERGE_PUSH_ATTEMPTS`
+→ **0**; its only `while` is inside `acquire_lock`, waiting for the lock). So a rejection from a peer
+**on another machine** — outside the mkdir lock — makes a `.sh` merge die where the `.py` merge would
+retry. This is not the observed loss: the lost pushes were to a same-machine peer during a narrowed
+gate, the mode the lock now covers. Recorded as an asymmetry to close, not as C-7 surviving.
+
+**`mini-ork-df` retracted its own C-24/C-26 correction, confirming round 12's refusal.** Round 12
+refused a correction aimed at "this document's C-24 rule" and "C-26 wording", because this document
+has no such items (`git grep -nE 'C-2[46]'` over tracked files → 0 hits; the corrections are C-1…C-7
+plus R11). The peer has now run the same check and withdrawn it — *"I asserted an anchor without
+resolving it, which is the `f70f977b` failure one level up"* — which is the sweep's own rule turned on
+itself: **a correction is a claim like any other, and it needs its target resolved before it is acted
+on.** Recorded because the inverse of accepting a good correction is refusing a mislocated one, and
+this is the one instance where two sessions agreed on that by independent measurement rather than by
+deference.
+
+## Delivery — round 14 (the `.sh` is to be orphaned, not hardened; three more receipts; and an uncommitted workstream of mine)
+
+**Superseded from round 13: the `.sh` has *two* asymmetries, and the remedy is not a port.** Round 13
+recorded one asymmetry (the `.sh` takes the lock but has no bounded retry) and suggested "a small port
+of the same loop". Both halves are now corrected.
+
+*The second asymmetry is the worse one, and I verified it.* The `.sh` fetches at `:242` — **before**
+the green gate (`:246`) — and its in-lock sequence (`:251-253`) is `acquire_lock; rebase origin/main;
+push origin HEAD:main; release_lock` with **no fetch inside the lock**. So it re-rebases onto the
+*pre-gate* cached remote-tracking ref, stale by however long the gate ran. The `.py` fetches *inside*
+the loop (`:604`). **A lock serialises writers; it cannot make a stale ref fresh** — so a `.sh` merge
+can push a non-fast-forward that no retry would have caused, and the earlier concern (no retry) is the
+smaller of the two.
+
+*Do not port the loop — orphan the script instead.* Three measured reasons:
+
+1. **Nothing calls it.** `git grep 'mini-ork-worktree\.sh'` over tracked files returns **zero call
+   sites** — every hit is prose: `.githooks/reference-transaction:79,105`, `AGENTS.md:50`, the bash
+   removal plan, a todo, and a comment in `self_improve.py:432`. The Makefile drives the `.py`
+   (`Makefile:49` → `scripts/mini_ork_worktree.py`; `worktree` / `worktree-merge` / `worktree-clean`
+   all route through it).
+2. **The plan intends it to disappear.** `docs/plans/2026-07-26-bash-removal-plan.md:159,164` lists
+   `mini-ork-worktree.sh` as a **port target**, and `scripts/mini_ork_worktree.py:8` self-describes as
+   *"Port of scripts/mini-ork-worktree.sh (bash-removal Phase 4)"*. A retry loop there adds a feature
+   to a file scheduled for deletion and would make the two paths diverge on a *second, invisible*
+   axis — strictly worse than the present asymmetry.
+3. **Two prose pointers are the whole reason a human would run the weaker script.**
+   `.githooks/reference-transaction:105` prints `scripts/mini-ork-worktree.sh create <task-slug>` as
+   the **remedy** for a rejected feature-branch creation, and `AGENTS.md:50` asserts the `.sh` *"is
+   what the targets call"* — **false** since `Makefile:49` was repointed to the `.py`. That sentence is
+   itself a defect to fix with the repoint.
+
+**Remedy: repoint both pointers at `scripts/mini_ork_worktree.py`, after which the `.sh` has zero
+readership and Phase 4 is a plain delete.** This is better than the port on both axes — it removes the
+exposure rather than hardening the thing that carries it, and it finishes a plan instead of entrenching
+it.
+
+**Blocker, verified — the guard working, not a defect.** The repoint is atomic with the hook-message
+change, because `tests/unit/test_githooks_py.py:141` pins `"scripts/mini-ork-worktree.sh create
+<task-slug>"` in the hook's stderr verbatim. **[Round 16: this line citation is stale — `363b8562`
+added 218 lines to that test file and the pin moved to `:200`; the stable citation is the assertion
+string, not the line number.]** And `lf-r14` holds the ownership claim on **both**
+`.githooks/post-commit` and `tests/unit/test_githooks_py.py` (`$WORKTREES_DIR/.ownership:61-62`), so a
+worktree that tries to make the edit is refused at create — correctly, on the live run. Land it when
+`lf-r14` frees the file.
+
+**Two more receipts for P0#3, and a new classifier defect (from `zed-mini-ork-4b`).**
+
+- **P0#3, third independent receipt.** Researcher home `run-1792157583-93406`: `test.attempts.json`
+  frozen at **15:39:45** (1 entry — the hint's `failed_node`), while `typecheck.attempts.json` moved to
+  **20:25:25** (2 entries, both `finish_reason: done`). The failed node was never in the closure —
+  `descendants(typecheck) ∌ test` again — and the row carried P2#12's attempt-1 `ended_at` after the
+  revive. Both of today's fixes now have a second-home receipt.
+- **New classifier defect, adjacent to P0 4d — quantified, mine to record.** Engine home
+  `run-1792151796-92942` ($3.171) and `run-1792151693-87094` ($0.55), both `spec-driven-delivery`,
+  died at `gates-materialize` with **0 probes**: `gates/<spec>.json` → `"probes": []`, `unprobeable: 5
+  × NO_EXECUTABLE_FENCE` (verified in the run dir), and `diagnosis.json` → `layer: change`,
+  `routes_to: revise` — *"a verifier refuted the change"* — though **0 probes is 0 evidence** and
+  nothing about the change was judged. `decide` step 6 fires on `node_type == verifier` before any
+  owner rule, so the revise round is spent re-entering `per_spec_dispatcher`. **The tell is `probes:
+  []`**; a gate that could not probe anything must not read as a refutation.
+- **A self-inflicted spec-test, framework-edit** (`run-1792185781-68028`): the run's own generated
+  spec test dies in its own helper (`_make_db` → `sqlite3.connect` on an unmade dir →
+  `OperationalError: unable to open database file`), and the verifier's `tamper-detection` freezes the
+  spec file after `spec_test_author`, so the implementer may not edit it and nothing else is in the
+  loop. `diagnose` R5 → `revise` (verifier node); two implementer rounds burned on an unfixable file;
+  6 paths rolled back, run salvaged. The lever is the hint's `kind` in `retry_hint.py` — a **policy
+  call**, recorded not made. Detector, if wanted: the failing nodeid's `E` line is a non-assertion
+  exception whose deepest frame is inside the spec dir ⇒ spec-author defect, not a change refutation.
+- **`659a3553` landed** (from `zed-mini-ork-4b`): code-fix `_baseline_unrunnable` now names the
+  matching log line, so a target repo's own guard exit-1 is not read as a red base — the `99014` root
+  cause. Not to be duplicated.
+
+**The shared checkout holds an uncommitted workstream of mine — recorded here as a risk, not a
+completion.** Five files are dirty in `/Volumes/docker-ssd/ps/mini-ork` and the edit trail is mine
+(verified against this session's own transcript, not asserted): `verify/levels.py` (adds
+`read_single_verifier_payload(path)`), `recovery/retry_hint.py` (`HINT_VERSION` 4 → 5), plus
+`ide_pages/outcome.py`, `ide_pages/run.py`, `ide_pages/spec.py`. They form one coherent workstream —
+the "`Failed at ?`" attribution for the verifier scripts whose payload carries no `verifier` field —
+and it is **half-built**: the read-side helper and its one caller exist, but the core (`execute.py` /
+`execute_handlers.py` from the abstain plan) does not. Two consequences worth stating plainly: peers
+are queuing *further* changes onto `retry_hint.py` on the belief it is mine (it is), and an
+uncommitted multi-file set in a checkout nine other sessions are editing is one careless `git add -A`
+from a mixed commit. It needs a scoped commit or an explicit park, by the user's call, not by drift.
+
+## Delivery — round 15 (the reversion guard is fixed, and it unblocks the `.sh` repoint)
+
+**The reversion-guard P1 closes — `363b8562`, verified.** The defect recorded earlier in this document
+(*"the post-commit watchdog undoes a legitimate rebase"*, which made every `make worktree-merge` within
+~60 s of a commit wedge with *"local changes would be overwritten"*, worked around with
+`MO_REVERSION_GUARD_DISABLED=1`) is fixed on `origin/main`:
+`git merge-base --is-ancestor 363b8562 origin/main` → **yes**, touching exactly the two files it must
+(`.githooks/post-commit`, `tests/unit/test_githooks_py.py`, +301). The mechanism, read in the landed
+`.githooks/post-commit`: the guard now (a) requires the watched sha to still be `HEAD`, and (b) skips
+while any of `rebase-merge` / `rebase-apply` / `MERGE_HEAD` / `CHERRY_PICK_HEAD` / `REVERT_HEAD` is
+present, each resolved per-worktree with `git rev-parse --git-path <name>` — so the working-tree state
+a rebase checkout produces is no longer mistaken for a revert. The peer reports the scoped gate green
+(*"22 passed in 34.99s"*) and the branch fully merged; the code shape is what I verified directly.
+Consequence: `MO_REVERSION_GUARD_DISABLED=1` is no longer needed for worktree merges.
+
+**And it frees the `.sh` repoint — verified in the claim registry, not inferred.** Round 14 recorded
+the repoint as blocked on `lf-r14` claiming `.githooks/post-commit` and
+`tests/unit/test_githooks_py.py` (`$WORKTREES_DIR/.ownership:61-62`). After `363b8562`, the worktree is
+gone and **both claims are released**: the registry now carries **no** line for either path, and the
+only surviving `lf-r14` reference is the `learning-fixes` dispatcher's claim on
+`kickoffs/auto/lf-r14-reversion-guard.md` — its own kickoff, unrelated to the edit. So the
+repoint-then-delete remedy is **unblocked**: `reference-transaction:105` → `.py`, `AGENTS.md:50`'s
+false *"is what the targets call"* → corrected, and the `test_githooks_py.py:141` pin (now `:200` — see round 16) updated in the
+same atomic change.
+
+First claim stays with `mini-ork-df`, which found the remedy and said it would land it when the file
+freed. If it is not taken, this session takes it — the two are the same change and must not be made
+twice.
+
+## Delivery — round 16 (the repoint lands; and two of my own line-number claims were stale)
+
+**The `.sh` repoint landed — `c7a84dc5`, verified on the pushed copy.** `mini-ork-df` took the first
+claim and made the atomic change. Checked at `origin/main`, not in the worktree, and the tip *was* the
+commit (`origin/main` → `c7a84dc5`):
+
+- **Shape:** exactly three files, 14+/10− (`.githooks/reference-transaction`, `AGENTS.md`,
+  `tests/unit/test_githooks_py.py`). The `.sh` is **not** among them — Phase 4's deletion stayed
+  separate, as required.
+- **The hook now prints the live driver:** `reference-transaction:105` →
+  `scripts/mini_ork_worktree.py create <task-slug>`.
+- **The `:79` comment moved too, and it was a *third* false pointer.** Both drivers set
+  `ALLOW_WORKTREE_BRANCH_CREATE=1` (`.py:541-542`, `.sh:206-207`), so the comment was not wrong — it
+  named the retiring driver while explaining a guard that exists for the live one. It now names the
+  `.py`.
+- **`AGENTS.md:50`'s false clause is gone,** replaced by a statement of which driver runs and — better
+  than a silent repoint — the `.sh`'s own defect recorded where an operator would read it (*"it
+  re-rebases without re-fetching inside the lock"*).
+- **Claims released:** `grep` for the three paths in `$WORKTREES_DIR/.ownership` → **0**.
+- Peer-reported: the hook was re-parsed with `python3 -c compile(...)` before anything ran (a syntax
+  error there is a repo-wide outage, not a red test), and the scoped gate
+  `tests/unit/test_githooks_py.py` → **22 passed**.
+
+**Two of my own citations were stale, and the way they went stale is the point.**
+
+1. **`tests/unit/test_githooks_py.py:141` is no longer the pin — it is `:200`.** Round 14 cited `:141`;
+   `363b8562` added 218 lines to that same file ahead of the assertion, so a line number that was
+   correct when read became wrong when *someone else's* commit merged. `:141` is now a blank line.
+   **The stable citation is the assertion string** (`"scripts/mini_ork_worktree.py create
+   <task-slug>"`), which is what the test actually pins and what a reader can grep. A line number is
+   a claim against a file that other sessions are editing; the string is a claim against the file's
+   content. Corrected in place at round 14 and here.
+2. **"`ahead` is 3, invariant" is falsified — the shared checkout now reads 7 ahead / 31 behind at
+   `c7a84dc5`.** Round 12's bullet was *conditionally* right ("that does not move while nobody commits
+   to the primary's local `main`"), but the ladder line dropped the condition, and the condition was
+   violated: local `main` gained four commits. So `ahead` is not a standing fact either — only
+   `behind` was ever trivial to see through, and it needs its tip; `ahead` needs its condition.
+
+**Not done, and correctly so:** `mini-ork-df` found local `main` at 7 ahead / 31 behind and
+`git merge --ff-only origin/main` refusing (it later reported the same 7/31 from its side), and
+stopped — no reset, no plain merge. That is the right call: reconciling a divergence that is not
+yours hides whose commits were dropped. It clears when the local commits are pushed or discarded, by
+their owner.
+
+**Phase 4 (deleting `scripts/mini-ork-worktree.sh`) remains open and separate.** After this landing the
+script has zero pointers and zero call sites; the delete is a plain `git rm` plus whatever the bash
+removal plan's checklist still asks for.
+
+## Delivery — round 17 (Phase 4 deletes the shell driver; and my own check was asking the wrong question)
+
+**Phase 4 landed — `b1c8e475`, verified on the pushed copy.** `origin/main` is exactly that commit;
+`git ls-tree origin/main scripts/mini-ork-worktree.sh` → **absent**; the commit is five files,
+23+/298−, including the 280-line deletion. The prose that would otherwise have dangled moved in the
+same commit: `AGENTS.md` now describes the Python driver only (`grep` for the `.sh` → **0**),
+`mini_ork/cli/self_improve.py:432` states the guard behaviour and the declaration it makes without
+comparing itself to a file that no longer exists, and the bash-removal plan marks the worktree target
+done (naming both the repoint `c7a84dc5` and the deletion date). Claims on the touched paths → **0**.
+
+**The correction, and it was mine.** In round 16 I told the peer I would verify "zero surviving
+references". That is the wrong expectation, and the peer pushed back before it became a false finding
+here: the check that matters is **zero invocation sites**, not zero *mentions*. The measured state is
+zero call sites (`make worktree*` unchanged; no code path invokes it) and **five surviving mention
+sites**, every one of which should survive:
+
+| site | count | why it stays |
+|---|---|---|
+| `docs/audits/…/AGGREGATE.md` | 6 | this record — an audit of a deleted file must name it |
+| `docs/plans/2026-07-26-bash-removal-plan.md` | 2 | intentional: "Done … repointed-away and then deleted"; a plan that deletes a file without naming it is worse than one that does |
+| `docs/todos/20261011-1830-…` | 1 | historical artifact of completed work — rewriting it would edit history to match the present |
+| `kickoffs/auto/lf-r14-reversion-guard.md` | 1 | same |
+| `scripts/mini_ork_worktree.py:8` | 1 | **provenance**, and it replaces the old "Port of …" line: leaving "Port of <deleted file>" would read as a live dependency |
+
+This is the sweep's recurring error in a new register: **"zero references" and "no live references" are
+different questions**, and only the second one is the property being established. A deletion is done
+when nothing *calls* the file; a deletion is **misrecorded** when the record pretends nothing *mentions*
+it, because the mentions are what tell the next reader that a file ever existed and why it went.
+
+**Still open in the same plan bullet, and unclaimed:** `readme-*.sh` remains a port target. It was
+never part of this thread.
+

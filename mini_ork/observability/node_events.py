@@ -214,10 +214,87 @@ def mo_node_emit(
         **extra,
     }
 
-    event_id = _build_event_id(event_type, node_id)
-    now_s = int(time.time())
-    heartbeat_ms = _now_ms()
+    return _insert_event(
+        resolved_db,
+        event_id=_build_event_id(event_type, node_id),
+        run_id=run_id,
+        event_type=event_type,
+        payload=payload,
+        now_s=int(time.time()),
+        heartbeat_ms=_now_ms(),
+    )
 
+
+def mo_run_emit(
+    run_id: str,
+    event_type: str,
+    extra_json: str = _DEFAULT_EXTRA_JSON,
+    *,
+    db: str | None = None,
+) -> int:
+    """Emit a run-level ``run_events`` row: one that no node owns.
+
+    ``mo_node_emit`` names a node and mirrors the bash helper's guard — an
+    empty ``node_id`` prints to stderr and returns 0. A per-run fact belongs
+    to the run rather than to any node (the per-run orchestrator being wired
+    on this run's path, for one), so there is no node to name. This is the
+    same insert with the caller's ``extra_json`` as the whole payload:
+    ``run_events`` has no ``node_id`` column, node identity lives *inside*
+    ``payload_json``, and a run-level row simply carries none.
+
+    Same contract as ``mo_node_emit``: schema-aware and best-effort, always
+    returns 0. A missing DB, a missing table and an unreadable payload are
+    all silent no-ops — observability never breaks execution.
+    """
+    if not run_id:
+        print("mo_run_emit: run_id required", file=__import__("sys").stderr)
+        return 0
+    if not event_type:
+        print("mo_run_emit: event_type required", file=__import__("sys").stderr)
+        return 0
+
+    resolved_db = db if db is not None else _resolve_db()
+    if not resolved_db or not os.path.isfile(resolved_db):
+        return 0  # silent no-op if state.db missing (e.g. uninitialized test)
+
+    # Mirror mo_node_emit: parse extra_json, coerce non-dict, recover
+    # JSONDecodeError to the `_raw` envelope.
+    try:
+        extra = json.loads(extra_json) if extra_json else {}
+        if not isinstance(extra, dict):
+            extra = {"_raw": str(extra)}
+    except json.JSONDecodeError:
+        extra = {"_raw": extra_json}
+
+    return _insert_event(
+        resolved_db,
+        event_id=_build_event_id(event_type, "_run"),
+        run_id=run_id,
+        event_type=event_type,
+        payload=extra,
+        now_s=int(time.time()),
+        heartbeat_ms=_now_ms(),
+    )
+
+
+def _insert_event(
+    resolved_db: str,
+    *,
+    event_id: str,
+    run_id: str,
+    event_type: str,
+    payload: dict[str, Any],
+    now_s: int,
+    heartbeat_ms: int,
+) -> int:
+    """The schema-aware ``run_events`` insert, shared by both emitters.
+
+    Lifted verbatim out of :func:`mo_node_emit` so a run-level row
+    (:func:`mo_run_emit`) writes through the same path: same column
+    detection, same ``finish_reason`` CHECK recovery, same best-effort
+    contract — an observability failure returns 0 and never breaks
+    execution.
+    """
     con = sqlite3.connect(resolved_db, timeout=2.0)
     try:
         con.execute("PRAGMA busy_timeout = 2000")

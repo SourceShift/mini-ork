@@ -431,3 +431,58 @@ def test_a_publisher_that_abstained_is_not_read_as_interrupted(tmp_db):
 
     py.mo_node_end("run-k", "publisher", "publisher", 40, "", "", "publish_abstain")
     assert retry_hint._case_interrupted(tmp_db, "run-k") is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (j) mo_run_emit — a run-level row with no node behind it
+# ─────────────────────────────────────────────────────────────────────────────
+def test_mo_run_emit_writes_a_node_less_run_level_row(tmp_db):
+    """A per-run fact such as the orchestrator being wired has no node to name.
+
+    It must land on ``run_id``, carry the caller's payload verbatim, and name
+    no node: ``run_events`` has no ``node_id`` column, so a run-level row
+    simply does not carry one.
+    """
+    dbp = _seed_db(tmp_db)
+    rc = py.mo_run_emit("run-j", "orchestrator.armed",
+                        json.dumps({"reason": "wired on the dependency-graph path"}))
+
+    con = sqlite3.connect(dbp)
+    try:
+        rows = _row_dict(con)
+    finally:
+        con.close()
+    assert rc == 0
+    assert len(rows) == 1, rows
+    assert rows[0]["run_id"] == "run-j"
+    assert rows[0]["event_type"] == "orchestrator.armed"
+    payload = json.loads(rows[0]["payload_json"])
+    assert payload == {"reason": "wired on the dependency-graph path"}
+    assert "node_id" not in payload
+
+
+def test_mo_run_emit_guards_its_required_args(tmp_db, capsys):
+    """Empty run_id / event_type mirror mo_node_emit: stderr phrase, rc 0, no row."""
+    dbp = _seed_db(tmp_db)
+    assert py.mo_run_emit("", "orchestrator.armed") == 0
+    assert py.mo_run_emit("run-k", "") == 0
+
+    con = sqlite3.connect(dbp)
+    try:
+        rows = _row_dict(con)
+    finally:
+        con.close()
+    assert rows == []
+    assert "mo_run_emit: run_id required" in capsys.readouterr().err
+
+
+def test_mo_run_emit_is_a_silent_noop_without_a_state_db(tmp_path, monkeypatch):
+    """Observability never breaks execution: a missing DB is a no-op, and it
+    must not create the file it could not find."""
+    home = tmp_path / "unseeded"
+    home.mkdir()
+    monkeypatch.setenv("MINI_ORK_DB", str(home / "state.db"))
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+
+    assert py.mo_run_emit("run-l", "orchestrator.armed") == 0
+    assert not (home / "state.db").exists()

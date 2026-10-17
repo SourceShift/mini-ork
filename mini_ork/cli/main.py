@@ -36,6 +36,7 @@ from mini_ork.dispatch.run_env import RunEnvError, load_run_env
 from mini_ork.dispatch.secrets import SecretStoreError
 from mini_ork.dispatch.vault import VaultError
 from mini_ork.features import gate_env
+from mini_ork.kickoff_scope import heading_kind
 from mini_ork.vcs import repo_integrity_guard
 from mini_ork.gates import rubric_prescreen
 from mini_ork.orchestration import concord_run
@@ -556,7 +557,17 @@ def _resolve_recipe_base(root: str, recipe: str):
 def gen_profile(kickoff_path, root, recipe, task_class, profile_path, agents_path,
                 recipe_base=None) -> dict:
     """Verbatim transcription of the run-profile embedded python. Writes the
-    profile.json and returns the same dict (caller prints the key=value lines)."""
+    profile.json and returns the same dict (caller prints the key=value lines).
+
+    ``provider_policy.lane_families`` resolves each configured lane alias to
+    its lane, model and model family, and
+    ``provider_policy.lane_family_warnings`` records the family collapses in
+    the effective overlay. Both describe the CONFIGURED (effective) lanes:
+    they are what the run ASKED for, not proof of what served. The served
+    model per node is authoritative in ``llm_calls.model_id`` /
+    ``traces.agent_version_id`` — the router's fallback walk can serve a
+    different member, so a reader must not treat this map as what ran.
+    """
     root = Path(root)
     rbase = Path(recipe_base) if recipe_base else root
     kickoff = Path(kickoff_path)
@@ -582,6 +593,24 @@ def gen_profile(kickoff_path, root, recipe, task_class, profile_path, agents_pat
         # Blank lines are KEPT: bullets() needs them to tell a hard-wrapped
         # continuation (flush-left line directly after the item it continues)
         # from the first line of a new paragraph (separated by a blank).
+        return lines
+
+    def section_lines_kind(kind):
+        # Scope sections are classified by ``heading_kind``, not by a substring
+        # test: "## Out of scope" and "## Explicitly out of scope — do NOT
+        # touch" both CONTAIN "scope" and used to feed scope_allow (LF-R8).
+        current = False
+        lines = []
+        in_fence = False
+        for raw in text.splitlines():
+            if raw.lstrip().startswith("```"):
+                in_fence = not in_fence
+            m = None if in_fence else re.match(r"^\s*#{2,6}\s+(.+?)\s*$", raw)
+            if m:
+                current = heading_kind(m.group(1)) == kind
+                continue
+            if current:
+                lines.append(raw.rstrip())
         return lines
 
     def bullets(lines):
@@ -660,8 +689,10 @@ def gen_profile(kickoff_path, root, recipe, task_class, profile_path, agents_pat
         return list(dict.fromkeys(found))
 
     success = bullets(section_lines(["success", "definition of done", "done when", "acceptance"]))
-    scope_allow = bullets(section_lines(["scope allow", "in scope", "scope"]))
-    scope_deny = bullets(section_lines(["scope deny", "out of scope", "forbidden"]))
+    # Entry format is unchanged (raw bullet lines) so existing profile consumers
+    # keep working; only WHICH sections feed each list changed (LF-R8).
+    scope_allow = bullets(section_lines_kind("allow"))
+    scope_deny = bullets(section_lines_kind("deny"))
     def _bullet_only(lines):
         out = []
         for line in lines:
@@ -790,7 +821,13 @@ def gen_profile(kickoff_path, root, recipe, task_class, profile_path, agents_pat
         "budget_cap_usd": task_yaml.get("budget_cap_usd"),
         "provider_policy": {
             "source": str(Path(agents_path).resolve()),
+            # `lanes` stays verbatim (readers depend on the alias map); the
+            # two additions resolve it. CONFIGURED, not served: llm_calls
+            # .model_id / traces.agent_version_id are authoritative for what
+            # actually ran (the router can fall back to another member).
             "lanes": lanes,
+            "lane_families": agents_config.lane_families({"lanes": lanes}),
+            "lane_family_warnings": agents_config.lane_family_warnings({"lanes": lanes}),
             "env": {"MINI_ORK_PROVIDER_POLICY": str(Path(agents_path).resolve()) if lanes else ""},
         },
         "artifact_destination": outputs,

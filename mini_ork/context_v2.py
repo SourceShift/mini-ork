@@ -41,8 +41,8 @@ import tempfile
 import time
 
 from mini_ork.context import context_env
+from mini_ork.kickoff_scope import do_not_sentences, heading_kind, kickoff_scope
 from mini_ork.learning import code_findings, themes
-from mini_ork.memory.preferences import paths_in_text
 
 MODES = ("off", "shadow", "on")
 DEFAULT_MODE = "shadow"
@@ -71,8 +71,6 @@ _GENERIC_KICKOFF_STEMS = frozenset({
     "kickoff", "wave-kickoff", "child-kickoff", "example-kickoff", "strong", "weak"})
 _HEADING_RE = re.compile(r"^\s{0,3}(#{2,6})\s+(.+?)\s*$")
 _FENCE_RE = re.compile(r"^\s{0,3}(```|~~~)")
-_DO_NOT_RE = re.compile(
-    r"^\s*(?:[-*+]\s+)?(?:\*\*|__)?(do not|don't|never|must not)\b", re.I)
 _BACKTICK_CMD_RE = re.compile(r"`([^`\n]{3,300})`")
 _DIFF_HEADER_RE = re.compile(r"^diff --git a/(\S+) b/(\S+)\s*$")
 
@@ -162,24 +160,25 @@ def _bullets(lines: list[str]) -> list[str]:
 def parse_contract(kickoff_text: str) -> dict:
     """The kickoff's own constraints, parsed without an LLM.
 
-    ``files_in_scope`` — backticked paths in a "Files in scope" section;
-    ``out_of_scope`` — bullets of an "Out of scope" section;
-    ``do_not`` — every "Do NOT / Never / Must not" line outside code fences;
+    ``files_in_scope`` — ``kickoff_scope(text)["allow"]``: the paths of every
+    allow section, bare bullets included, with a scope entry required to look
+    like a file (a directory part, or a known file extension — a dotted symbol
+    such as ``code_findings.harvest`` is not one);
+    ``out_of_scope`` — the bullets of every deny section;
+    ``do_not`` — the sentences that START with "Do not / Don't / Never / Must
+    not" (``do_not_sentences``), capped at 10;
     ``verification`` — fenced commands (else backticked commands) in a
     "Verification" section.
+
+    The three scope readers agree by construction: ``files_in_scope``,
+    ``gen_profile``'s ``scope_allow`` and ``preferences.scope_paths`` all read
+    the same parser (LF-R8). Return keys are unchanged.
     """
     sections = _sections(kickoff_text)
-    files: list[str] = []
     out_of_scope: list[str] = []
     verification: list[str] = []
     for title, body in sections:
-        if "files in scope" in title:
-            for p in paths_in_text("\n".join(body)):
-                # ``paths_in_text`` also accepts dotted symbols (``code_findings.harvest``);
-                # a scope entry must look like a path: a directory part or a file extension.
-                if p not in files and ("/" in p or _FILE_EXT_RE.search(p)):
-                    files.append(p)
-        elif "out of scope" in title:
+        if heading_kind(title) == "deny":
             out_of_scope.extend(_bullets(body))
         elif "verification" in title or title.startswith("verify"):
             fenced = _fenced_blocks(body)
@@ -188,22 +187,14 @@ def parse_contract(kickoff_text: str) -> dict:
             else:
                 verification.extend(m.group(1).strip()
                                     for m in _BACKTICK_CMD_RE.finditer("\n".join(body)))
-    do_not: list[str] = []
-    in_fence = False
-    for line in (kickoff_text or "").splitlines():
-        if _FENCE_RE.match(line):
-            in_fence = not in_fence
-            continue
-        if in_fence or not _DO_NOT_RE.match(line):
-            continue
-        clean = re.sub(r"^\s*[-*+]\s+", "", line).strip().strip("*_").strip()
-        clean = clean[:200]
-        if clean and clean not in do_not:
-            do_not.append(clean)
+    # ``kickoff_scope`` also accepts dotted symbols (``code_findings.harvest``);
+    # a scope entry must look like a path: a directory part or a file extension.
+    files = [p for p in kickoff_scope(kickoff_text)["allow"]
+             if "/" in p or _FILE_EXT_RE.search(p)]
     return {
         "files_in_scope": files,
         "out_of_scope": out_of_scope[:10],
-        "do_not": do_not[:10],
+        "do_not": do_not_sentences(kickoff_text)[:10],
         "verification": verification[:5],
     }
 
@@ -528,8 +519,14 @@ def _constraint_items(contract: dict) -> list[dict]:
 
 def build(kickoff_path: str, *, task_class: str = "", db: str | None = None,
           run_id: str | None = None, max_clusters: int = 5,
-          kickoff_text: str | None = None) -> dict:
-    """The v2 pack for one run. Never raises; unreadable inputs give empty sections."""
+          kickoff_text: str | None = None, run_dir: str | None = None) -> dict:
+    """The v2 pack for one run. Never raises; unreadable inputs give empty sections.
+
+    Selection scope: the kickoff's parsed ``files_in_scope`` when non-empty,
+    else (with a ``run_dir``) the run profile's ``scope_allow`` via
+    ``preferences.scope_paths``, else empty. The fallback is selection-only —
+    ``contract`` is never back-filled, so it grants no edit authority (the
+    kickoff guard and the diff-scope checks keep reading the parse)."""
     kickoff_bytes: bytes | None = None
     if kickoff_text is None:
         try:
@@ -541,7 +538,23 @@ def build(kickoff_path: str, *, task_class: str = "", db: str | None = None,
     else:
         kickoff_bytes = kickoff_text.encode("utf-8")
     contract = parse_contract(kickoff_text)
-    findings = scope_findings(contract["files_in_scope"], db=db, exclude_run=run_id)
+    scope = contract["files_in_scope"]
+    if scope:
+        scope_source = "kickoff"
+    elif run_dir:
+        scope_source = "none"
+        try:
+            # Lazy import: context_v2 must not acquire an import-time dependency
+            # on mini_ork.memory (the prompt path also loads with it absent).
+            from mini_ork.memory import preferences
+            scope = preferences.scope_paths(run_dir) or []
+        except Exception:  # noqa: BLE001 — prompt path must fail soft
+            scope = []
+        if scope:
+            scope_source = "profile"
+    else:
+        scope_source = "none"
+    findings = scope_findings(scope, db=db, exclude_run=run_id)
     floor = min_severity()
     clusters = [c for c in cluster(findings)
                 if _SEVERITY_RANK.get(str(c["worst_severity"]).lower(), 0) >= floor]
@@ -567,6 +580,10 @@ def build(kickoff_path: str, *, task_class: str = "", db: str | None = None,
         "prior_attempts": prior,
         "themes": themes,
         "n_findings_scanned": len(findings),
+        # Selection provenance, beside the count it explains: which reader
+        # supplied the paths and the resolved list. Never edit authority.
+        "scope_source": scope_source,
+        "scope_paths": list(scope),
         "item_ids": ([c["id"] for c in constraints] + [c["id"] for c in clusters]
                      + [p["id"] for p in prior] + [t["id"] for t in themes]),
         "built_at": int(time.time()),
@@ -728,7 +745,8 @@ def pack_for_run(run_dir: str, *, kickoff_path: str | None = None, task_class: s
         kickoff_path = kickoff_path or _profile_kickoff(run_dir)
         if not kickoff_path:
             return {}
-        pack = build(kickoff_path, task_class=task_class, db=db, run_id=run_id)
+        pack = build(kickoff_path, task_class=task_class, db=db, run_id=run_id,
+                     run_dir=run_dir)
         pack["arm"] = arm(run_id)
         write_json(os.path.join(run_dir, PACK_FILENAME), pack)
         return pack

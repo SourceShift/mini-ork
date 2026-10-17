@@ -216,6 +216,56 @@ def test_failing_spec_test_reports_the_test_and_its_kickoff_quote(tmp_path) -> N
     assert "a rejected input must fail closed, never return an empty value" in section
 
 
+# A marked test that dies in its own helper before reaching the clause it
+# checks: no `mkdir` back the connect, exactly the shape of the generated spec
+# test that cost `run-1792185781-68028` two revise rounds and a rollback.
+BROKEN_HELPER = '''\
+import sqlite3
+
+
+def _connect(tmp_path, name):
+    return sqlite3.connect(str(tmp_path / name / "state.db"))
+
+
+def test_clause_holds(tmp_path):
+    """Kickoff: 'the persisted reason comes from the payload'."""
+    _connect(tmp_path, "second")
+'''
+
+
+def test_a_spec_test_that_dies_in_its_helper_names_the_exception(tmp_path) -> None:
+    """A clause that was never reached must not read as a refuted change.
+
+    The run's `pass` still depends on pytest's rc — this changes only what the
+    failure *says*, because that sentence is the interface: it becomes the
+    retry hint's `detail`, the auto-repair signature's text and the operator's
+    `NEEDS-CHANGE.md`. On `run-1792185781-68028` the operator was told "The
+    change was judged wrong — it needs a revision" while the failing spec test
+    had raised `sqlite3.OperationalError` in its own `_make_db`.
+
+    The exception goes BEFORE the kickoff quote so a truncated detail cannot
+    lose it.
+    """
+    run = _run_dir(tmp_path, files={"test_spec_a.py": BROKEN_HELPER})
+    proc = _invoke(run, _target(tmp_path))
+    assert proc.returncode == 1
+    payload = _payload(run)
+    assert payload["pass"] is False
+    assert payload["failed_checks"] == ["spec-tests-pass"]
+
+    failure = next(f for f in payload["failures"]
+                   if f["test"] == "test_spec_a.py::test_clause_holds")
+    assert "sqlite3.OperationalError" in failure["error"]
+    assert "unable to open database file" in failure["error"]
+
+    reason = payload["reason"]
+    assert "sqlite3.OperationalError: unable to open database file" in reason
+    assert reason.index("sqlite3.OperationalError") < reason.index("persisted reason")
+
+    log = (run / "verifier-spec-tests.log").read_text()
+    assert "sqlite3.OperationalError: unable to open database file" in log
+
+
 def test_a_module_that_fails_to_import_reports_each_of_its_clauses(tmp_path) -> None:
     """The likeliest failure of a blind test is an import of the module the
     kickoff names and the change never added. Every test in that module fails

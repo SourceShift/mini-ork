@@ -26,6 +26,7 @@ Seven cases:
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -219,6 +220,73 @@ def test_artifact_summary_truncation_label_is_exact(tmp_path):
     assert shown_lines == len(content.splitlines())
     assert shown_bytes == len(content.rstrip())
     assert out.rstrip().endswith("bytes shown]")
+
+
+def _marker_run(tmp_path, *, verdict: str, marker_after_verdict: bool = False) -> Path:
+    """A run dir shaped like a revived one: escalation markers plus a verdict."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    marker = run_dir / "NEEDS-CHANGE.md"
+    marker.write_text("the test check could not reach something it needs\n", encoding="utf-8")
+    hint = run_dir / "retry-hint.json"
+    hint.write_text('{"failed_node": "test"}\n', encoding="utf-8")
+    (run_dir / "run-verdict.json").write_text(
+        json.dumps({"verdict": verdict}) + "\n", encoding="utf-8"
+    )
+    verdict_at = (run_dir / "run-verdict.json").stat().st_mtime
+    offset = 10 if marker_after_verdict else -10
+    os.utime(marker, (verdict_at + offset, verdict_at + offset))
+    os.utime(hint, (verdict_at + offset, verdict_at + offset))
+    return run_dir
+
+
+def test_artifact_summary_drops_markers_the_green_verdict_superseded(tmp_path):
+    """Regression, measured on rp-e3-header-20261015-222115: the revive left the
+    previous attempt's NEEDS-CHANGE.md and retry-hint.json in the run dir, the
+    grader sampled them, and rubric.json scored a run that had published green
+    as pass=false."""
+    run_dir = _marker_run(tmp_path, verdict="pass")
+
+    out = rp.artifact_summary(str(run_dir))
+
+    assert "could not reach something it needs" not in out
+    assert "failed_node" not in out
+    assert "### NEEDS-CHANGE.md" not in out
+    # The omission is named, so the grader knows the artifacts exist.
+    assert "superseded, not shown" in out
+    assert "NEEDS-CHANGE.md" in out
+    assert "retry-hint.json" in out
+
+
+def test_artifact_summary_keeps_markers_a_failed_run_stands_on(tmp_path):
+    run_dir = _marker_run(tmp_path, verdict="fail")
+
+    out = rp.artifact_summary(str(run_dir))
+
+    assert "could not reach something it needs" in out
+    assert "superseded, not shown" not in out
+
+
+def test_artifact_summary_keeps_a_marker_written_after_the_green_verdict(tmp_path):
+    """repair.json is rewritten by the revive itself, and a marker that a *later*
+    event produced is this attempt's, not the superseded one's."""
+    run_dir = _marker_run(tmp_path, verdict="pass", marker_after_verdict=True)
+
+    out = rp.artifact_summary(str(run_dir))
+
+    assert "could not reach something it needs" in out
+
+
+def test_artifact_summary_without_a_verdict_is_unchanged(tmp_path):
+    """No verdict file at all (epic iter dirs, pre-verdict runs): nothing is
+    dropped, so the previous behaviour is preserved."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "NEEDS-CHANGE.md").write_text("still standing\n", encoding="utf-8")
+
+    out = rp.artifact_summary(str(run_dir))
+
+    assert "still standing" in out
 
 
 # ─────────────────────────────────────────────────────────────────────────────

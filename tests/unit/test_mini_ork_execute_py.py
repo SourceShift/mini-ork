@@ -377,6 +377,15 @@ def test_set_status_parity(tmp_path):
     ex.set_status(db_p, "r2", "reviewing")
     q2 = "SELECT status, ended_at FROM task_runs WHERE id='r2';"
     assert _sql(db_p, q2).stdout.strip() == "reviewing|"
+    # A live status is the per-attempt boundary: it must DROP a previous
+    # attempt's end stamp, because the terminal branch above keeps the first
+    # one it ever sees (COALESCE) and nothing else distinguishes attempt 2.
+    # Without this, a revived row kept the dead attempt's ended_at for good.
+    _seed_task_run(db_p, rid="r5", status="published")
+    _sql(db_p, "UPDATE task_runs SET ended_at=111, duration_ms=222 WHERE id='r5';")
+    ex.set_status(db_p, "r5", "executing")
+    q5 = "SELECT status, ended_at IS NULL, duration_ms FROM task_runs WHERE id='r5';"
+    assert _sql(db_p, q5).stdout.strip() == "executing|1|0"
 
 
 def test_charge_node_cost_parity(tmp_path):

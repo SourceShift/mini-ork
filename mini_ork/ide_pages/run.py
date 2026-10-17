@@ -828,6 +828,68 @@ def _verdict(run: Run, node: Node) -> tuple[str, str]:
     return "—", "sub"
 
 
+def _node_reason(run: Run, node: Node) -> str:
+    """One line saying why ``node`` failed or is blocked — ``""`` when nothing does.
+
+    Sources, in the kickoff's order:
+
+    1. the node's verdict note — the first reason text of its
+       ``review-<id>.json`` (``reasons`` → ``notes`` → ``findings``), the read
+       ``ide_pages.node._overview_reviewer_headline(run_dir, node)`` uses, so the
+       DAG and the node tab name one vocabulary rather than two;
+    2. the first ``error`` / ``summary`` line of its ``verifier_<id>.json``;
+    3. ``retry-hint.json``'s ``notes[0]`` when its ``failed_node`` is this node.
+
+    Guarded: any exception returns ``""``. The caller omits the key, so a
+    dotted or unreadable run dir costs the reason, never the page.
+    """
+    try:
+        d = run.run_dir
+
+        def first_line(value: Any) -> str:
+            """The first non-empty line of a str / list / dict payload."""
+            if isinstance(value, str):
+                text = value
+            elif isinstance(value, (list, tuple)):
+                text = next((str(v) for v in value if str(v).strip()), "")
+            elif isinstance(value, dict):
+                text = next((str(value.get(k) or "") for k in
+                             ("note", "text", "title", "summary")
+                             if str(value.get(k) or "").strip()), "")
+            else:
+                text = ""
+            lines = [ln.strip() for ln in str(text).splitlines() if ln.strip()]
+            return lines[0] if lines else ""
+
+        # 1. the node's own verdict note.
+        review = d / f"review-{node.id}.json"
+        if review.is_file():
+            obj = _json_obj(review)
+            if isinstance(obj, dict):
+                for key in ("reasons", "notes", "findings"):
+                    text = first_line(obj.get(key))
+                    if text:
+                        return _clip(text, 80)
+
+        # 2. the first error / summary line of its verifier json.
+        verifier = _json_obj(d / f"verifier_{node.id}.json")
+        if isinstance(verifier, dict):
+            for key in ("error", "summary", "error_summary"):
+                text = first_line(verifier.get(key))
+                if text:
+                    return _clip(text, 80)
+
+        # 3. retry-hint.json's notes[0], only for the node it names.
+        hint = _json_obj(d / "retry-hint.json")
+        if isinstance(hint, dict) and str(hint.get("failed_node") or "") == node.id:
+            text = first_line(hint.get("notes"))
+            if text:
+                return _clip(text, 80)
+        return ""
+    except Exception:  # noqa: BLE001 — a reason must never blank the page
+        return ""
+
+
 def _wall(node: Node) -> str:
     if node.start is None:
         return "—"
@@ -908,10 +970,52 @@ def _graph(run: Run, wanted: str | None = None) -> dict[str, Any]:
     build from here, so they cannot drift::
 
         {"cols": [[node_dict]], "heads": [str], "edges": [edge_dict],
-         "run_title": str, "recipe": str, "state": <outcome state word>}
+         "run_title": str, "recipe": str, "state": <outcome state word>,
+         "focus": <node id>}
+
+    ``focus`` is the node the DAG strip opens on — the first failed node in
+    DAG column order, else the node a human is holding, else the first
+    running node, else the last that finished. The key is omitted only when
+    the run has no nodes: there is nothing to open on, and a definite id
+    would be a lie. A failed or blocked ``node_dict`` also carries
+    ``reason`` — one line (≤ 80 chars) saying why — and omits that key when
+    no source has text.
     """
     sel = _selected(run, wanted)
     by_id = {n.id: n for n in run.nodes}
+
+    # The nodes a human still has to act on: a parked run's pending review
+    # rows (the same DB read the parked callout makes — skipped unless the
+    # run is actually parked, so a dock render stays DB-free), then an
+    # unanswered ask's node. ``open_asks`` projects no node id, so the ask
+    # file itself is read for the one it carries.
+    awaiting: list[str] = []
+    if _is_parked_run(run):
+        awaiting.extend(_pending_node_ids(run))
+    try:
+        asks = run.run_dir / "asks"
+        for name in sorted(n for n in os.listdir(asks)
+                           if n.startswith("ask-") and n.endswith(".json")):
+            ask = _json_obj(asks / name)
+            if not isinstance(ask, dict) or str(ask.get("answer") or "").strip():
+                continue
+            nid = str(ask.get("node_id") or ask.get("node") or "").strip()
+            refs = ask.get("blocking_refs")
+            if not nid and isinstance(refs, list) and refs:
+                nid = str(refs[0]).strip()
+            if nid and nid not in awaiting:
+                awaiting.append(nid)
+                break
+    except Exception:  # noqa: BLE001 — asks are optional; never blank the graph
+        pass
+    holding = set(awaiting)
+
+    def state_of(n: Node) -> str:
+        """The node's story state — a skipped finish overrides ``state``."""
+        if str(n.finish or "").strip().lower() == "skipped":
+            return "skipped"
+        return str(n.state or "").strip().lower() or "pending"
+
     cols: list[list[dict[str, Any]]] = []
     for c in run.cols:
         col = []
@@ -940,10 +1044,16 @@ def _graph(run: Run, wanted: str | None = None) -> dict[str, Any]:
             node_dict["stage_lane"] = n.role_lane
             node_dict["dur"] = _wall(n)
             node_dict["gates"] = ", ".join(n.gates) or "—"
+            # The kickoff: only a node that failed or is blocked gets a
+            # reason, and only when a source actually has text.
+            if state_of(n) == "failed" or n.id in holding:
+                reason = _node_reason(run, n)
+                if reason:
+                    node_dict["reason"] = reason
             col.append(node_dict)
         if col:
             cols.append(col)
-    return {
+    graph = {
         "cols": cols,
         "heads": [_head_for(col, idx) for idx, col in enumerate(cols)],
         "edges": _graph_edges(run),
@@ -951,6 +1061,43 @@ def _graph(run: Run, wanted: str | None = None) -> dict[str, Any]:
         "recipe": str(run.card.get("recipe") or run.row.get("recipe") or ""),
         "state": O.state_word(run),
     }
+    # "DAG column order" is the order the columns draw in, not ``run.nodes``:
+    # the failed node of ``hr-smoke-d-191036`` ran *before* the nodes that
+    # finished after it, and only the column order says so.
+    ordered: list[Node] = []
+    seen: set[str] = set()
+    for c in run.cols:
+        for nid in c:
+            n = by_id.get(nid)
+            if n is not None and n.id not in seen:
+                seen.add(n.id)
+                ordered.append(n)
+    for n in run.nodes:  # a node the workflow did not place still counts
+        if n.id not in seen:
+            seen.add(n.id)
+            ordered.append(n)
+    if ordered:
+        focus = ""
+        for n in ordered:  # 1. the first failed node
+            if state_of(n) == "failed":
+                focus = n.id
+                break
+        if not focus and awaiting:  # 2. a node awaiting a human
+            rank = {n.id: i for i, n in enumerate(ordered)}
+            placed = [(rank[nid], nid) for nid in awaiting if nid in rank]
+            focus = min(placed)[1] if placed else awaiting[0]
+        if not focus:  # 3. the first running node
+            for n in ordered:
+                if state_of(n) == "running":
+                    focus = n.id
+                    break
+        if not focus:  # 4. the last node that finished (a skipped one never ran)
+            for n in reversed(ordered):
+                if state_of(n) == "done":
+                    focus = n.id
+                    break
+        graph["focus"] = focus or ordered[-1].id
+    return graph
 
 
 def _dag_tab(run: Run, wanted: str | None) -> list[dict[str, Any]]:

@@ -1343,6 +1343,22 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                         frontier.append(node_id)
             return descendants
 
+        # ── per-run orchestrator: wired, or merely enabled? ────────────────
+        # The layer is default-on, but it is *wired* only on this
+        # dependency-graph path — the other ``_parallel`` call sites stay
+        # unwired. ``enabled()`` alone therefore cannot tell the run page
+        # whether this run could actually be acted on, and the page read
+        # "armed" for both. Emit one ``orchestrator.armed`` receipt the moment
+        # the engine commits to this path, so "armed and quiet" becomes a fact
+        # the page reads back rather than an assumption it makes.
+        try:
+            from mini_ork.orchestration.runner_orchestrator import enabled as _orch_enabled
+        except Exception:
+            _orch_enabled = lambda: False  # noqa: E731
+        orch_on = _orch_enabled()
+        if orch_on:
+            _emit_orchestrator_armed(db, run_id)
+
         while pending:
             blocked = []
             for node_id in pending:
@@ -1470,19 +1486,16 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
             # ── per-run orchestrator (default on; MO_RUN_ORCHESTRATOR=0 opts out) ──
             # Observe each node outcome at the wave boundary and pick one of
             # advance/help/repair/mutate/promote (see
-            # mini_ork/orchestration/runner_orchestrator.py). With the flag
-            # explicitly disabled this block is inert: nothing is imported and
-            # nothing is called. Green nodes are skipped outright, so the
-            # no-fail path pays one ledger read per wave.
+            # mini_ork/orchestration/runner_orchestrator.py). ``orch_on`` was
+            # settled once above, alongside the ``orchestrator.armed`` receipt;
+            # with the flag disabled that flag is False and this block is inert.
+            # Green nodes are skipped outright, so the no-fail path pays one
+            # ledger read per wave.
             #
             # Wired only on this dependency-graph path. The other ``_parallel``
             # call sites below (parallel / partitioned / serial dispatch) stay
             # unwired — matching the kickoff's scope, not an oversight.
-            try:
-                from mini_ork.orchestration.runner_orchestrator import enabled as _orch_enabled
-            except Exception:
-                _orch_enabled = lambda: False  # noqa: E731
-            if _orch_enabled():
+            if orch_on:
                 _orchestrator_act(live_run_dir, db, run_id, outcomes, repair_edges,
                                   revision_state=locals())
 
@@ -1896,6 +1909,9 @@ def _post_run_learning(db, run_dir, run_id, task_class="", fail_count=None):
 def set_status(db, run_id, new_status, *, dry_run=False):
     """Retrying task_runs status write; terminal states stamp ended_at + duration_ms.
 
+    A live status clears both instead: the row has not ended, and this call is
+    the per-attempt boundary (see the branch below).
+
     Raises ``RuntimeError`` when the write cannot be made: after the retries for
     a locked/busy DB, at once for anything else (a missing table does not heal
     by waiting). It used to print ``[warn]`` and return, and a terminal status
@@ -1920,8 +1936,29 @@ def set_status(db, run_id, new_status, *, dry_run=False):
                         "ELSE duration_ms END WHERE id = ?",
                         (new_status, now, now, now, run_id))
                 else:
-                    con.execute("UPDATE task_runs SET status = ?, updated_at = ? WHERE id = ?",
-                                (new_status, int(time.time()), run_id))
+                    # A live status means the run has not ended, so the row must
+                    # carry no end stamp. This write is also the ATTEMPT boundary
+                    # — the executor marks ``executing`` once per ``run`` /
+                    # ``resume`` / ``recover`` (execute.py:1228) — and the
+                    # terminal branch above keeps the FIRST attempt's stamp via
+                    # ``COALESCE(ended_at, ?)``, deliberately, because several
+                    # writers can close one attempt (publisher, executor,
+                    # ``finalize_passed``) and must not fight over it. Nothing
+                    # distinguished a *second* attempt, so a revived row kept the
+                    # dead attempt's end for good: measured 2026-10-16,
+                    # run-1792059337-779 still read ``ended_at`` 2026-10-15
+                    # 13:04:07 with the first attempt's 48m ``duration_ms`` after
+                    # two revives, so an ``ended_at``-keyed monitor never saw the
+                    # recovery at all. ``duration_ms`` is reset with it (to 0,
+                    # the column is NOT NULL and that is the value the terminal
+                    # branch treats as "recompute from created_at") — leaving the
+                    # old value would pair a fresh ``ended_at`` with the previous
+                    # attempt's length. Same rule as
+                    # ``web.control._restore_status``.
+                    con.execute(
+                        "UPDATE task_runs SET status = ?, updated_at = ?, "
+                        "ended_at = NULL, duration_ms = 0 WHERE id = ?",
+                        (new_status, int(time.time()), run_id))
                 con.commit()
                 last_err = None
                 break
@@ -4458,6 +4495,32 @@ def _open_state_db(db_path):
         return StateDB(db_path)
     except Exception:
         return None
+
+
+def _emit_orchestrator_armed(db, run_id: str) -> None:
+    """Write one ``orchestrator.armed`` receipt for this run.
+
+    Called exactly once, where the engine commits to the dependency-graph path
+    with the layer enabled. The run page reads the receipt back to tell two
+    states apart that ``runner_orchestrator.enabled()`` conflates:
+
+      * **armed and quiet** — the layer is on *this* path and simply had
+        nothing to do, because every node stayed green; and
+      * **enabled but never wired** — the layer is on globally, but this run
+        executed on a path that never calls it, so it structurally could not
+        act.
+
+    Only the first may read as "armed". Fail-safe: a missing table or an
+    unwritable DB costs the receipt, never the run.
+    """
+    try:
+        from mini_ork.observability.node_events import mo_run_emit
+
+        mo_run_emit(run_id, "orchestrator.armed",
+                    json.dumps({"reason": "wired on the dependency-graph path"}),
+                    db=db)
+    except Exception as exc:  # noqa: BLE001 — the receipt is best-effort
+        print(f"execute: orchestrator armed receipt skipped: {exc}", file=sys.stderr)
 
 
 def _orchestrator_act(run_dir, db, run_id, outcomes, retry_edges, *, revision_state):

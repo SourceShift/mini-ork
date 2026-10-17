@@ -1,12 +1,14 @@
 """Context v2: selection by files in scope + kickoff contract (mini_ork.context_v2)."""
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
 import pytest
 
 from mini_ork import context_v2 as cv
+from mini_ork.memory import preferences
 
 KICKOFF = """# Add the thing
 
@@ -198,6 +200,132 @@ def test_build_applies_the_severity_floor_and_lists_item_ids(tmp_path, monkeypat
     monkeypatch.setenv("MO_CONTEXT_V2_MIN_SEVERITY", "low")
     pack = cv.build(str(kickoff), db=db, run_id="cur")
     assert len(pack["file_findings"]) == 2
+
+
+# ── scope fallback: kickoff → profile → none (LF-R9) ────────────────────────
+
+PROSE_KICKOFF = """# Widget sweep
+
+## Goal
+
+The widget module keeps losing increments; make the suite green without
+widening the change.
+
+## Rules
+
+Edit files directly; keep the change small.
+"""
+
+
+def _write_profile(run_dir: Path, scope_allow, kickoff_path=None) -> str:
+    """A run_profile.json in the profiler's shape: raw kickoff bullet strings."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    profile = {"scope_allow": list(scope_allow)}
+    if kickoff_path is not None:
+        profile["kickoff_path"] = str(kickoff_path)
+    (run_dir / "run_profile.json").write_text(json.dumps(profile), encoding="utf-8")
+    return str(run_dir)
+
+
+def test_build_prefers_the_parsed_kickoff_scope_over_a_profile(tmp_path):
+    db = _db(tmp_path, findings=[
+        ("r1", "mini_ork/cli/reflect.py", "high", "reflect drops findings", "2026-10-06"),
+        ("r2", "mini_ork/unrelated.py", "high", "unrelated breakage", "2026-10-06"),
+    ])
+    kickoff = tmp_path / "eng-reflect.md"
+    kickoff.write_text(KICKOFF, encoding="utf-8")
+    run_dir = _write_profile(tmp_path / "run", ["`mini_ork/unrelated.py`"])
+
+    pack = cv.build(str(kickoff), db=db, run_dir=run_dir)
+
+    assert pack["scope_source"] == "kickoff"
+    assert pack["scope_paths"] == ["mini_ork/ide_pages/learn/code.py",
+                                   "mini_ork/cli/reflect.py"]
+    assert pack["scope_paths"] == pack["contract"]["files_in_scope"]
+    files = {f for c in pack["file_findings"] for f in c["files"]}
+    assert "mini_ork/cli/reflect.py" in files
+    assert "mini_ork/unrelated.py" not in files
+
+
+def test_build_falls_back_to_the_profile_scope_when_the_kickoff_parses_empty(tmp_path):
+    db = _db(tmp_path, findings=[
+        ("r1", "mini_ork/cli/reflect.py", "high", "reflect drops findings", "2026-10-06"),
+    ])
+    kickoff = tmp_path / "widget-sweep.md"
+    kickoff.write_text(PROSE_KICKOFF, encoding="utf-8")
+    run_dir = _write_profile(tmp_path / "run", ["`mini_ork/cli/reflect.py`: only this"])
+
+    assert cv.parse_contract(PROSE_KICKOFF)["files_in_scope"] == []
+    assert preferences.scope_paths(run_dir) == ["mini_ork/cli/reflect.py"]
+
+    pack = cv.build(str(kickoff), db=db, run_dir=run_dir)
+
+    assert pack["scope_source"] == "profile"
+    assert pack["scope_paths"] == preferences.scope_paths(run_dir)
+    files = {f for c in pack["file_findings"] for f in c["files"]}
+    assert "mini_ork/cli/reflect.py" in files
+    assert pack["n_findings_scanned"] == 1
+    # Selection only: the contract and its constraints are never back-filled.
+    assert pack["contract"]["files_in_scope"] == []
+    assert not [c for c in pack["constraints"] if c.get("kind") == "scope"]
+
+
+def test_build_prose_only_profile_invents_no_scope(tmp_path):
+    db = _db(tmp_path, findings=[
+        ("r1", "mini_ork/cli/reflect.py", "high", "reflect drops findings", "2026-10-06"),
+    ])
+    kickoff = tmp_path / "widget-sweep.md"
+    kickoff.write_text(PROSE_KICKOFF, encoding="utf-8")
+    run_dir = _write_profile(tmp_path / "run",
+                             ["keep the change small and focused",
+                              "stay within the named module"])
+
+    assert preferences.scope_paths(run_dir) == []
+
+    pack = cv.build(str(kickoff), db=db, run_dir=run_dir)  # no crash
+
+    assert pack["scope_source"] == "none"
+    assert pack["scope_paths"] == []
+    assert pack["file_findings"] == []
+    assert pack["n_findings_scanned"] == 0
+
+
+def test_build_without_a_run_dir_or_profile_stays_todays_behaviour(tmp_path):
+    db = _db(tmp_path, findings=[
+        ("r1", "mini_ork/cli/reflect.py", "high", "reflect drops findings", "2026-10-06"),
+    ])
+    kickoff = tmp_path / "widget-sweep.md"
+    kickoff.write_text(PROSE_KICKOFF, encoding="utf-8")
+    empty_dir = tmp_path / "run-without-profile"
+    empty_dir.mkdir()
+
+    pack_none = cv.build(str(kickoff), db=db)
+    pack_missing = cv.build(str(kickoff), db=db, run_dir=str(empty_dir))
+
+    for pack in (pack_none, pack_missing):
+        assert pack["scope_source"] == "none"
+        assert pack["scope_paths"] == []
+        assert pack["file_findings"] == []
+        assert pack["n_findings_scanned"] == 0
+
+
+def test_pack_for_run_threads_run_dir_into_the_fallback(tmp_path):
+    db = _db(tmp_path, findings=[
+        ("r1", "mini_ork/cli/reflect.py", "high", "reflect drops findings", "2026-10-06"),
+    ])
+    kickoff = tmp_path / "widget-sweep.md"
+    kickoff.write_text(PROSE_KICKOFF, encoding="utf-8")
+    run_dir = _write_profile(tmp_path / "run", ["`mini_ork/cli/reflect.py`"],
+                             kickoff_path=kickoff)
+
+    pack = cv.pack_for_run(run_dir, db=db)
+
+    assert pack["scope_source"] == "profile"
+    on_disk = json.loads((Path(run_dir) / cv.PACK_FILENAME).read_text(encoding="utf-8"))
+    assert on_disk["scope_source"] == "profile"
+    assert on_disk["scope_paths"] == ["mini_ork/cli/reflect.py"]
+    files = {f for c in on_disk["file_findings"] for f in c["files"]}
+    assert "mini_ork/cli/reflect.py" in files
 
 
 def test_render_keeps_constraints_and_drops_prior_first_under_budget(tmp_path):

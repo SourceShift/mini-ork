@@ -28,7 +28,9 @@ fork `/Volumes/docker-ssd/ps/zed-mini-ork`, UI `/Volumes/docker-ssd/ps/mini-ork-
 | `fix-target-scope` | every recovery gets the target, not just verifier-rooted ones | done | **landed + on origin/main** | `9ee820c1` — ancestor of `origin/main` (`63fc80a0`) |
 | `fix-pytest-asyncio-dup-paths` | drop test paths a sibling glob already collects | done | **landed + on origin/main** | `16f11413` — ancestor of `origin/main` |
 | `report-both-homes` | per-home report of failed / revived / left / code landed | completed | **completed** | delivered in-session (second firing report) |
-| `gap-rubric-contamination` | rubric/panel score a revived run against the superseded attempt's markers | documented, not fixed | **still open** | `mini_ork/gates/rubric_scoring.py:141 artifact_summary` lists every top-level file in the run dir (`:166 names = sorted(os.listdir(run_dir))`) and samples `.md/.json/.log`; called at `mini_ork/gates/rubric_prescreen.py:570`. No attempt scoping exists. Receipts: `rp-e3-header-20261015-222115/rubric.json` written 22:39:36 (after the green publish) still `pass=false`, quoting the dead attempt's `NEEDS-CHANGE.md` + `rolled-back.json` (01:50:57) |
+| `gap-rubric-contamination` | rubric/panel score a revived run against the superseded attempt's markers | documented, not fixed | **fixed + on origin/main** | `37d39474` — a green run-level verdict retires the older markers; `python3 -m pytest tests/unit/test_rubric_prescreen_py.py tests/unit/test_rubric_scoring_py.py -q` → 28 passed (pre-fix those two tests fail) |
+| `gap-hint-entry` | `recover --strategy verify` enters at the first verifier, which can be a SIBLING of the failed node | open (cause unread) | **fixed + on origin/main** | `d1c0c871` — the hint's node is the default verify entry; `tests/unit/test_recover_verify.py` §8 (2 behavioural + 2 guard tests) |
+| `gap-revive-row-settlement` | a revived row keeps the first attempt's `ended_at` / `cost_usd` | open | **fixed + on origin/main** | `f43022ea` — a live status clears the end stamp; the recover tail reconciles cost to the ledger; `tests/unit/test_recover_verify.py` §9 + `test_set_status_parity` |
 | `researcher-install-lag` | researcher install's in-tree mini-ork misses the target fix | open (`user_action later`, inbox `cn-0f1acdaf`) | **still open** | `git -C …/researcher/.mini-ork/mini_ork rev-parse --short HEAD` → `ddc88c43`; `grep -c _recovery_target_cwd` → **0** there vs **2** in the engine (`mini_ork/recovery/planner.py`) |
 | `rotate-dead-lanes` | rotate/re-pin the kimi (and deepseek fallback) lanes | open | **still open** | `runs/run-1792136293-92791/retry-hint.json` → `needs_change.kind=lane`, "kimi: API key rejected (HTTP 401) at https://api.kimi.com/coding/v1/messages"; `execute.log` also emits `[dispatch_chain_drop] fallback tail lane 'deepseek_flash' … has no providers.yaml entry` |
 | `leftover-cleanup-delta` | review the uncommitted leftover-cleanup delta (from m3a/m3b/m3d) | open | **moot** | `/Volumes/docker-ssd/ps/mini-ork-worktrees/miniork-leftover-cleanup` does not exist (`ls -d` → No such file or directory) |
@@ -61,6 +63,10 @@ revision" to **not revivable**: `hr-exec-park-20261015141603`,
    receive the attempt start time and ignore older artifacts; the sibling
    direction is to move superseded markers under `attempts/<n>/`.
    `mini_ork/gates/rubric_prescreen.py:570` is the call site.
+   **FIXED `37d39474`** (P0#1 of `AGGREGATE.md`) — a green run-level verdict
+   (`verdict.json` / `run-verdict.json`) retires the markers older than it and
+   the omission is named in the summary instead of being silently dropped; four
+   tests in `tests/unit/test_rubric_prescreen_py.py`.
 2. **`recover` re-runs the closure root, and the hint's own node may never
    re-dispatch.** On 779 the hint said `from_node: test`, but the revive
    re-ran `typecheck` (fresh log, rc=0), left `test`'s artifacts at their
@@ -70,10 +76,31 @@ revision" to **not revivable**: `hr-exec-park-20261015141603`,
    `test` was skipped was not read out of the executor). Consequence: monitor
    "progress" by `retry-exhausted/<node>.attempts.json` mtime, never by
    dispatch activity.
+   **CAUSE FOUND, FIXED `d1c0c871`** (P0#3 of `AGGREGATE.md`): the mechanism was
+   the entry node, not the checkpoint ledger. `--strategy verify` resolves its
+   entry as `--from-node` or the first verifier in topo order; the hint's own
+   `command` never carries `--from-node` (`retry_hint.py`), so the CLI ignored
+   the answer the hint held, picked `typecheck`, and the closure became
+   `descendants(typecheck)` — which excludes `test`, its **sibling**. The hint's
+   node is now the default verify entry (explicit `--from-node` still wins; a
+   hint naming a node the workflow lacks is ignored with a warning). Four tests
+   in `tests/unit/test_recover_verify.py` §8, two of them regression guards.
+   The `node_completion_checkpoints` wart found on the way — an abstaining
+   verifier (`exit 0`, `status: unverified`) is recorded as `succeeded`, so the
+   P1.2 ledger claims a check that never ran — is **still open**, deliberately
+   out of scope here.
 3. **Observability: a revived run's row keeps the first attempt's `ended_at`
    and `cost_usd`** (779: `ended_at 2026-10-15 13:04:07`, `cost_usd
    6.725933` after two revives), so an `ended_at`-keyed monitor never sees a
    recovery and the second attempt's spend is invisible.
+   **FIXED `f43022ea`** (P2#12 of `AGGREGATE.md`), one cause per half: a live
+   status now clears the end stamp (`execute.set_status` — that write is the
+   per-attempt boundary, and `COALESCE(ended_at, ?)` is a within-attempt rule,
+   the same invariant `web.control._restore_status` already applies), and the
+   recover tail reconciles `cost_usd` to the ledger beside the rubric refresh
+   (`main._reconcile_run_cost` was the reconcile's only caller and lives in the
+   lifecycle tail a recover never enters). Three tests in
+   `tests/unit/test_recover_verify.py` §9 + the `set_status` parity assertion.
 4. **Dead lanes fail late.** `run-1792136293-92791` spent a planner dispatch to
    discover a 401; the `deepseek_flash` fallback tail is dropped from every
    chain (`dispatch_chain_drop` line, no `providers.yaml` entry) rather than
@@ -150,10 +177,19 @@ revision" to **not revivable**: `hr-exec-park-20261015141603`,
   `/Users/admin/bin/ram-sentinel.py:844`) plus `launchctl kickstart -k
   gui/$(id -u)/com.user.ramsentinel` — still unanswered from before the
   context break.
-- **Nothing is blocked on this session.** No new engine fix was landed for 779
-  deliberately: the engine routes it to the owner as an environment failure
-  (`R7`), and the candidate defect in (b)2 is unproven, so patching it now
-  would be a blind change.
+- **Nothing is blocked on this session.** The three engine defects found against
+  779 are fixed and on `origin/main` (`37d39474`, `d1c0c871`, `f43022ea`) — but
+   **none of them makes 779 green**: they make a future revive touch the node
+  that actually failed, record the attempt's own end and spend, and stop the
+  rubric grading the dead attempt. 779 itself stays where (c) puts it — the
+  researcher repo's `jest-guard` load refusal is the owner's call.
+- **The abstain ledger wart left open** (see (b)2): an abstaining verifier
+  (`exit 0`, `status: unverified`) is written to `node_completion_checkpoints` as
+  `succeeded`, so the P1.2 ledger records a check that never ran. Fixing it means
+  reconciling two abstention contracts — the code-fix test verifier deliberately
+  exits 0 (`recipes/code-fix/verifiers/test.py:1678`) while the engine's
+  abstention rc is `ABSTAIN_RC = 3` (`verify/levels.py:176`) — which is a design
+  decision, not a one-liner, so it was not folded into the fix above.
 
 ## Verification commands actually run
 
@@ -169,7 +205,21 @@ grep -n "NEEDS-CHANGE|rolled-back.json" -r mini_ork                      # → r
 grep -c _recovery_target_cwd <researcher install>/recovery/planner.py    # → 0 (engine: 2)
 ```
 
-Engine checkout note: `HEAD` moved under this session (peer fast-forward
-`63fc80a0` at 23:13:09, then `beca73ef docs(audit): session gaps — SDD
-completeness, Zed-UI visibility, P2 recovery` at 23:13:24). Nothing was pushed
-from here; this file is committed scoped to itself only.
+Later, for the three fixes in (b) — each run in
+`mini-ork-worktrees/p2-row-settlement` (a worktree of `origin/main`) and pushed
+to `origin/main` after a re-fetch + re-rebase:
+
+```
+python3 -m pytest tests/unit/test_rubric_prescreen_py.py tests/unit/test_rubric_scoring_py.py \
+                  tests/unit/test_recover_verify.py tests/unit/test_mini_ork_execute_py.py -q  # → 140 passed
+# each fix neutered (guard → `if False`, or the pre-fix UPDATE) and re-run:
+#   P0#1 smoke  → the two suppression tests fail; P0#3 → 2 of 4 fail; P2#12 → 2 of 3 fail
+git merge-base --is-ancestor {37d39474,d1c0c871,f43022ea} origin/main     # → IN ×3
+```
+
+Engine checkout note: `HEAD` moved under this session repeatedly (peer
+fast-forwards through 23:13 and again at 23:40 — the audit rounds). The three
+fixes were committed in a worktree of `origin/main` and pushed from there
+(`git push origin HEAD:main`), so this session pushed nothing from the shared
+checkout and the shared `main`'s unpushed audit commits were left alone. This
+file's earlier revision was committed scoped to itself only.

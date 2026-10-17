@@ -21,6 +21,35 @@
 #    HEAD~1 state (i.e. been "reverted" by a racing process), restores it
 #    from HEAD via `git checkout HEAD -- <file>` and logs the recovery.
 #
+# Rebase/sequencer safety (LF-R14): the drift test in (3) also fires while
+# git is mid-rebase, and there it is wrong. `git rebase origin/main` checks
+# out the new base; for exactly the files our commit touched, that checkout's
+# content IS the parent blob the test matches on (the commit is the delta). A
+# restore there desyncs the tree from the rebase checkout and wedges the next
+# `pick` ("error: Your local changes to the following files would be
+# overwritten by merge" … "Could not execute the todo command"). Two
+# witnesses on 2026-10-16 wedged `make worktree-merge` this way.
+#
+# So the watchdog now skips instead of healing when either:
+#
+#   * an operation is in progress — `rebase-merge` / `rebase-apply` /
+#     `MERGE_HEAD` / `CHERRY_PICK_HEAD` / `REVERT_HEAD` exists. Each path is
+#     resolved with `git rev-parse --git-path <name>` so the probe is
+#     per-worktree (a linked worktree's state lives under
+#     `.git/worktrees/<name>/`, not the main checkout's git dir); or
+#   * HEAD is no longer the `sha` the watchdog was spawned with. The watchdog's
+#     premise was "HEAD is intact, the working tree was reverted" — this makes
+#     that premise a precondition. During a rebase / am / cherry-pick / merge
+#     HEAD is the operation's own commit, so a drifted blob is that
+#     operation's legitimate checkout, not a reversion.
+#
+# A skip is NOT a recovery: it restores nothing and appends no row to the log
+# (the log is a recovery ledger, and a rebase is routine). While HEAD is still
+# `sha` and no operation is in progress the pre-existing healing path is
+# unchanged. The HEAD-clobber branch-ref repair is deliberately outside the
+# HEAD==sha precondition — it exists precisely for the HEAD-moved case — but it
+# does stand down while a sequencer operation is in flight.
+#
 # Escape hatches:
 #   MO_REVERSION_GUARD_DISABLED=1 git commit ...   → skip the hook
 #   MO_REVERSION_GUARD_WATCH_S=N                   → tune watch window (default 60s)
@@ -55,12 +84,54 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# Sequencer / operation state files, named relative to the repository's git
+# dir. `git rev-parse --git-path <name>` resolves each one per-worktree, so the
+# existence probe stays correct in a linked worktree.
+_IN_PROGRESS_MARKERS = (
+    "rebase-merge",     # `git rebase` (merge backend) mid-flight
+    "rebase-apply",     # `git rebase` (apply backend) / `git am`
+    "MERGE_HEAD",       # `git merge` stopped before committing
+    "CHERRY_PICK_HEAD", # `git cherry-pick` with a conflict left in place
+    "REVERT_HEAD",      # `git revert` with a conflict left in place
+)
+
+
+def _git_path(repo_root: str, name: str) -> Path:
+    """Resolve `git rev-parse --git-path <name>` against the worktree root.
+
+    Git answers relative to the repo root for the main worktree (`.git/...`)
+    but absolutely for a linked one, so a relative answer is joined to
+    `repo_root` rather than to the current directory.
+    """
+    out = _git(repo_root, "rev-parse", "--git-path", name).stdout.strip()
+    if not out:
+        # `git rev-parse` failed (not a git dir) — nothing can be in progress.
+        return Path(repo_root) / name
+    p = Path(out)
+    return p if p.is_absolute() else Path(repo_root) / p
+
+
+def _operation_in_progress(repo_root: str) -> bool:
+    """True while a rebase / am / merge / cherry-pick / revert is mid-flight."""
+    return any(_git_path(repo_root, m).exists() for m in _IN_PROGRESS_MARKERS)
+
+
 def _watchdog(repo_root: str, sha: str, branch: str, files: list,
               watch_s: int, poll_s: int, log_path: str) -> None:
     end = time.time() + watch_s
     with open(log_path, "a", encoding="utf-8") as log:
         while time.time() < end:
             time.sleep(poll_s)
+
+            # ── in-progress-operation guard ───────────────────────────────
+            # A rebase / am / cherry-pick / revert / merge rewrites the tree on
+            # purpose: the working tree holds the sequencer's own checkout, and
+            # for the files our commit touched that checkout IS the parent blob
+            # the drift check below restores from. Healing there clobbers the
+            # checkout and the next `pick` aborts. Skip the whole poll while one
+            # is in flight. A skip is not a recovery, so it logs nothing.
+            if _operation_in_progress(repo_root):
+                continue
 
             # ── HEAD-clobber guard ────────────────────────────────────────
             # If we're still on the same branch but its tip was moved OFF our
@@ -110,6 +181,18 @@ def _watchdog(repo_root: str, sha: str, branch: str, files: list,
                                 f"restored-HEAD-clobbered-from-{cur_tip}\n"
                             )
                             log.flush()
+
+            # ── semantic guard: HEAD must still be our commit ─────────────
+            # The premise is "HEAD is intact, the working tree was reverted".
+            # Make it a precondition: heal files only while the watched commit
+            # is still HEAD. A rebase checks out the new base, so HEAD is the
+            # operation's commit and the drifted blob is that checkout, not a
+            # reversion. (The branch-ref repair above intentionally stays
+            # outside this guard — it exists for the HEAD-moved case.)
+            if _git(
+                repo_root, "rev-parse", "--verify", "--quiet", "HEAD"
+            ).stdout.strip() != sha:
+                continue
 
             for f in files:
                 if not f:

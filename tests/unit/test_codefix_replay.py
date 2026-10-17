@@ -403,6 +403,37 @@ def test_overlay_carries_untracked_test_passing_on_base(tmp_path):
     assert out["replay"]["overlap"] == [], out["replay"]
 
 
+def test_overlay_never_carries_compiled_bytecode_into_the_base(tmp_path):
+    """`tests/__pycache__/*.pyc` is not a test file, however test-shaped its name.
+
+    The overlay copies candidate test files onto the base and `playback` reads
+    them there. A `.pyc` is compiled from the candidate's test source, so
+    copying it in can make the base execute bytecode that does not correspond
+    to the base tree — the exact class of state the base-fail delta exists to
+    detect. Observed 2026-10-17 on `mo-daytona-e2e-target`, where
+    `tests/__pycache__/test_calc.cpython-39.pyc` appeared in `overlaid_tests`.
+    """
+    repo = _make_repo(
+        tmp_path,
+        mod_src="def add(a, b):\n    return a - b\n",
+        test_src="from mod import add\n\ndef test_add_trivial():\n    assert add(0, 0) == 0\n",
+    )
+    (repo / "mod.py").write_text("def add(a, b):\n    return a + b\n")
+    tests_dir = repo / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_bug_regression.py").write_text(
+        "from mod import add\n\ndef test_bug_fixed():\n    assert add(2, 3) == 5\n"
+    )
+    pycache = tests_dir / "__pycache__"
+    pycache.mkdir()
+    (pycache / "test_bug_regression.cpython-39.pyc").write_bytes(b"\x00bytecode")
+
+    out = _run_verifier(repo, tmp_path, replay="1", run_id="overlay-pycache")
+
+    assert out["pass"] is True, out
+    assert out["replay"]["overlaid_tests"] == ["tests/test_bug_regression.py"], out["replay"]
+
+
 def test_overlay_skips_non_test_source_changes(tmp_path):
     """A non-test source file changed in the candidate is NOT carried onto the base.
     The overlay is selective — only test paths cross over."""
