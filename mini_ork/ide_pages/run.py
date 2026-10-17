@@ -3606,6 +3606,337 @@ def _desc_fold(run: Run, outcome: dict[str, Any] | None = None, title: str = "")
     return _desc_wrap(" ".join(p for p in (intent, rest) if p))
 
 
+# ── success criteria: what the run proved, criterion by criterion ────────────
+#
+# The hero lists the kickoff's criteria as prose and the Checks tab lists the
+# levels, but nothing joined them: a green level never said *which* criterion it
+# proved. This checklist joins them — one row per criterion, decided by the
+# verdict's own criterion entries, then a failed check, then a PROVEN level's
+# evidence, in that order and stopping at the first source that names the
+# criterion. A run that merely finished decides nothing.
+
+# The hero caps its list at 8; both readers must agree on what the run promised.
+_CRITERIA_CAP = 8
+_CRITERIA_WHY_LIMIT = 120
+_CRITERIA_EVIDENCE_READ = 200_000
+# Four-plus-char function words a substring test would otherwise match on —
+# "without" in one criterion must not decide an unrelated check that also says
+# "without". Content words ("lint", "suite", "dependencies") stay matchable.
+_CRITERIA_STOPWORDS = frozenset({
+    "the", "and", "but", "for", "with", "without", "from", "into", "onto",
+    "over", "under", "this", "that", "these", "those", "there", "their",
+    "them", "they", "when", "what", "which", "while", "your", "yours",
+    "have", "has", "had", "been", "being", "were", "was", "are", "does",
+    "did", "doing", "each", "every", "than", "then", "also", "only", "must",
+    "should", "will", "shall", "would", "could", "stays", "still", "same",
+    "more", "most", "such", "some", "other", "otherwise", "after", "before",
+})
+_CRITERIA_MET_WORDS = frozenset({"met", "pass", "passed", "ok", "done", "true",
+                                 "yes", "green"})
+_CRITERIA_UNMET_WORDS = frozenset({"unmet", "fail", "failed", "error", "false",
+                                   "no", "red"})
+_CRITERIA_CHECK_FAIL_WORDS = frozenset({"fail", "failed", "error", "unmet"})
+
+
+def _criteria_words(text: Any) -> list[str]:
+    """Key words of ``text``: alphanumeric runs of 4+ chars, function words out."""
+    return [w for w in re.findall(r"[a-z0-9]+", str(text or "").casefold())
+            if len(w) >= 4 and w not in _CRITERIA_STOPWORDS]
+
+
+def _criterion_named(criterion: str, text: Any) -> bool:
+    """True when ``text`` names ``criterion`` through one of its key words.
+
+    A case-folded substring test on 4+ char words is the fallback the kickoff
+    prescribes when the codebase has no token normaliser of its own.
+    """
+    haystack = str(text or "").casefold()
+    return any(word in haystack for word in _criteria_words(criterion))
+
+
+def _criteria_read(path: Path) -> str:
+    """A file's text for criterion matching, empty when it cannot be read."""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")[:_CRITERIA_EVIDENCE_READ]
+    except OSError:
+        return ""
+
+
+def _criteria_path_action(run: Run, candidates: Iterable[Any]) -> dict[str, Any] | None:
+    """``S.open_path`` for the first candidate that is a real file, else ``None``.
+
+    ``candidates`` carry paths as the verdict wrote them; both absolute and
+    run-relative forms resolve through ``run.run_dir``. A link to a file that
+    does not exist is worse than no link, so only ``is_file`` earns one.
+    """
+    for value in candidates:
+        if not isinstance(value, str) or not value.strip():
+            continue
+        path = run.run_dir / value
+        try:
+            if path.is_file():
+                return S.open_path(str(path))
+        except OSError:
+            continue
+    return None
+
+
+def _criteria_envelopes(run: Run) -> list[tuple[Path, dict[str, Any]]]:
+    """Every readable ``verifier_*.json`` envelope, sorted by name."""
+    out: list[tuple[Path, dict[str, Any]]] = []
+    try:
+        paths = sorted(run.run_dir.glob("verifier_*.json"))
+    except OSError:
+        return out
+    for path in paths:
+        data = _json_obj(path)
+        if isinstance(data, dict):
+            out.append((path, data))
+    return out
+
+
+def _criteria_verdict_entries(run: Run) -> list[tuple[Path, dict[str, Any]]]:
+    """Criterion entries from the run's verdict files, in decision order.
+
+    ``run-verdict.json`` comes first (the executor's own report), then
+    ``framework-edit.verdict.json``. Both ``criteria`` and ``criteria_results``
+    shapes are read. A malformed file is simply absent — never fake evidence.
+    """
+    out: list[tuple[Path, dict[str, Any]]] = []
+    for name in ("run-verdict.json", "framework-edit.verdict.json"):
+        path = run.run_dir / name
+        data = _json_obj(path)
+        if not isinstance(data, dict):
+            continue
+        for key in ("criteria", "criteria_results"):
+            entries = data.get(key)
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if isinstance(entry, dict):
+                    out.append((path, entry))
+    return out
+
+
+def _criteria_state_word(value: Any) -> str:
+    if isinstance(value, bool):
+        return "met" if value else "unmet"
+    word = str(value or "").strip().casefold()
+    if word in _CRITERIA_MET_WORDS:
+        return "met"
+    if word in _CRITERIA_UNMET_WORDS:
+        return "unmet"
+    return "unknown"
+
+
+def _criteria_verdict_state(entry: dict[str, Any]) -> str:
+    """A verdict entry's decision, tolerating ``met`` / ``state`` / ``status``."""
+    for key in ("met", "state", "status", "verdict", "result"):
+        if key not in entry:
+            continue
+        state = _criteria_state_word(entry.get(key))
+        if state != "unknown":
+            return state
+    return "unknown"
+
+
+def _criteria_from_verdict(run: Run, entries: list[tuple[Path, dict[str, Any]]],
+                           criterion: str) -> dict[str, Any] | None:
+    """The first verdict entry naming ``criterion``, or ``None``."""
+    wanted = " ".join(criterion.split()).casefold()
+    for path, entry in entries:
+        raw = entry.get("criterion")
+        if raw is None:
+            raw = entry.get("c")
+        if not isinstance(raw, str):
+            continue
+        if " ".join(raw.split()).casefold() != wanted:
+            continue
+        state = _criteria_verdict_state(entry)
+        evidence: list[Any] = []
+        for key in ("evidence", "evidence_path", "path", "file", "artifact"):
+            value = entry.get(key)
+            if isinstance(value, str):
+                evidence.append(value)
+            elif isinstance(value, list):
+                evidence.extend(v for v in value if isinstance(v, str))
+        do = _criteria_path_action(run, evidence) or S.open_path(str(path))
+        name = Path(str((do or {}).get("path") or "")).name
+        if state == "met":
+            why = f"Run verdict marks this met — {name}." if name else \
+                "The run verdict marks this met."
+        elif state == "unmet":
+            why = f"Run verdict marks this unmet — {name}." if name else \
+                "The run verdict marks this unmet."
+        else:
+            why = "The run verdict records no decision for this criterion."
+        return {"c": criterion, "state": state,
+                "why": _clip(why, _CRITERIA_WHY_LIMIT), "do": do}
+    return None
+
+
+def _criteria_failed_checks(envelopes: list[tuple[Path, dict[str, Any]]]
+                            ) -> list[tuple[str, str, str]]:
+    """``(name, matched text, target)`` for every failed check/probe.
+
+    The matched text is the check's own title / command / detail — never the
+    whole envelope, so a passing sibling cannot lend it words it did not use.
+    """
+    out: list[tuple[str, str, str]] = []
+    for path, envelope in envelopes:
+        evidence = str(envelope.get("evidence_path") or "")
+        target = evidence if evidence and Path(evidence).is_file() else str(path)
+        found = False
+        for key in ("checks", "probes"):
+            items = envelope.get(key)
+            if not isinstance(items, list):
+                continue
+            for check in items:
+                if not isinstance(check, dict):
+                    continue
+                word = str(check.get("state") or check.get("status") or "").casefold()
+                if check.get("pass") is not False and word not in _CRITERIA_CHECK_FAIL_WORDS:
+                    continue
+                found = True
+                name = str(check.get("name") or check.get("title")
+                           or check.get("command") or check.get("probe") or "check")
+                text = " ".join(str(check.get(k) or "") for k in
+                                ("name", "title", "command", "probe", "detail",
+                                 "expected", "actual"))
+                out.append((name, text, target))
+        if not found and envelope.get("pass") is False:
+            # A verifier that failed before emitting per-check rows still states
+            # its case in its own summary; it decides only what it names.
+            name = str(envelope.get("verifier") or path.stem.removeprefix("verifier_"))
+            text = " ".join(str(envelope.get(k) or "") for k in
+                            ("verifier", "error_summary", "reason", "detail"))
+            out.append((name, text, target))
+    return out
+
+
+def _criteria_proven_levels(run: Run, envelopes: list[tuple[Path, dict[str, Any]]]
+                            ) -> list[tuple[str, str, str]]:
+    """``(level, reason, evidence text)`` for every PROVEN level in the report."""
+    try:
+        report = O.verification_report(run) or {}
+    except Exception:  # noqa: BLE001 — a broken verdict costs this source
+        return []
+    levels = report.get("levels") if isinstance(report.get("levels"), dict) else {}
+    reasons = report.get("levels_reasons") if isinstance(report.get("levels_reasons"), dict) else {}
+    out: list[tuple[str, str, str]] = []
+    for level, value in levels.items():
+        if str(value or "").strip().upper() != "PROVEN":
+            continue
+        reason = str(reasons.get(level) or "")
+        texts = [reason]
+        # The reason names the file that decided the level (``verifier_test.json:
+        # …``); its text is the evidence the criterion is matched against.
+        for name in re.findall(r"[A-Za-z0-9_.-]+\.(?:json|log|md|txt|patch)", reason):
+            texts.append(_criteria_read(run.run_dir / name))
+        for path, envelope in envelopes:
+            names = (path.name, str(envelope.get("verifier") or ""))
+            if not any(n and n in reason for n in names):
+                continue
+            texts.append(_criteria_read(Path(str(envelope.get("evidence_path") or ""))))
+        out.append((str(level), reason, "\n".join(t for t in texts if t)))
+    return out
+
+
+def _criteria_row(run: Run, criterion: str,
+                  verdict_entries: list[tuple[Path, dict[str, Any]]],
+                  failed_checks: list[tuple[str, str, str]],
+                  proven_levels: list[tuple[str, str, str]],
+                  envelopes: list[tuple[Path, dict[str, Any]]]) -> dict[str, Any]:
+    """One criterion's row, decided in the kickoff's source order."""
+    row = _criteria_from_verdict(run, verdict_entries, criterion)
+    if row is not None:
+        return row
+    for name, text, target in failed_checks:
+        if _criterion_named(criterion, text):
+            return {"c": criterion, "state": "unmet",
+                    "why": _clip(f"Check '{name}' failed.", _CRITERIA_WHY_LIMIT),
+                    "do": S.open_path(target)}
+    for level, reason, text in proven_levels:
+        if _criterion_named(criterion, text):
+            why = (f"Level {level} is PROVEN: {reason}." if reason
+                   else f"Level {level} is PROVEN.")
+            return {"c": criterion, "state": "met",
+                    "why": _clip(why, _CRITERIA_WHY_LIMIT),
+                    "do": _checks_evidence_action(run, level, reason, envelopes)
+                          or S.page_link("run", "checks", run=run.id)}
+    return {"c": criterion, "state": "unknown",
+            "why": "No check names this criterion.", "do": None}
+
+
+def _criteria_checklist(run: Run, outcome: dict[str, Any]) -> list[dict[str, Any]]:
+    """One row per kickoff success criterion: ``met`` / ``unmet`` / ``unknown``.
+
+    The list is the hero's — ``run_profile.json``'s ``success_criteria``, capped
+    the same way — so the two never disagree about what the run promised. Every
+    source is read fail-soft: a missing or malformed verdict costs ``unknown``
+    rows, never the section or the page. The rows are also stamped on
+    ``outcome["criteria"]`` so the IDE can draw them without parsing sections;
+    a run with no criteria gets no key.
+    """
+    try:
+        raw = _run_profile(run).get("success_criteria")
+    except Exception:  # noqa: BLE001 — an unreadable profile costs the checklist
+        return []
+    criteria = [str(c) for c in raw] if isinstance(raw, list) else []
+    criteria = criteria[:_CRITERIA_CAP]
+    if not criteria:
+        return []
+    try:
+        verdict_entries = _criteria_verdict_entries(run)
+    except Exception:  # noqa: BLE001 — one unreadable verdict costs its entries
+        verdict_entries = []
+    envelopes = _criteria_envelopes(run)
+    try:
+        failed_checks = _criteria_failed_checks(envelopes)
+    except Exception:  # noqa: BLE001
+        failed_checks = []
+    try:
+        proven_levels = _criteria_proven_levels(run, envelopes)
+    except Exception:  # noqa: BLE001
+        proven_levels = []
+    rows = [_criteria_row(run, criterion, verdict_entries, failed_checks,
+                          proven_levels, envelopes)
+            for criterion in criteria]
+    try:
+        outcome["criteria"] = rows
+    except (TypeError, AttributeError):
+        pass
+    return rows
+
+
+_CRITERIA_COLS = [S.col(90), S.col(fr=2, min=220), S.col(fr=3, min=260)]
+_CRITERIA_TONE = {"met": "green", "unmet": "red"}
+
+
+def _criteria_section(run: Run, outcome: dict[str, Any]) -> list[dict[str, Any]]:
+    """The checklist as one table section; empty when the run has no criteria."""
+    rows = _criteria_checklist(run, outcome)
+    if not rows:
+        return []
+    table_rows = []
+    for row in rows:
+        state = str(row["state"])
+        table_rows.append({
+            "cells": [S.cell(state.upper(), _CRITERIA_TONE.get(state, "sub"), b=True),
+                      S.cell(row["c"]),
+                      S.cell(row["why"], "sub")],
+            "do": row.get("do"),
+        })
+    met = sum(1 for row in rows if row["state"] == "met")
+    unmet = sum(1 for row in rows if row["state"] == "unmet")
+    return [S.table(
+        "Did it meet the criteria", _CRITERIA_COLS, ["", "Criterion", "Why"],
+        table_rows, full=True,
+        sub=f"{met} met · {unmet} unmet · {len(rows) - met - unmet} unknown",
+        note="A criterion is met only when the verdict or a PROVEN level "
+             "names it and its evidence.")]
+
+
 def _outcome_tab(run: Run, outcome: dict[str, Any],
                  callout_actions: Iterable[dict[str, Any]] | None = None,
                  absorbed: set[str] | tuple[str, ...] = ()
@@ -3640,6 +3971,11 @@ def _outcome_tab(run: Run, outcome: dict[str, Any],
         triage["reason"] = str(outcome["reason"]).strip()
     sections = [triage]
     dropped = set(absorbed or ())
+    # The criteria checklist, directly under the verdict: the triage states what
+    # happened, this states which of the run's promises the evidence actually
+    # proves. Additive — every existing section keeps its place below it.
+    sections.extend(S.guarded({}, "Did it meet the criteria",
+                              lambda: _criteria_section(run, outcome)))
     # The reason, directly under the verdict it explains. The Overview tab has
     # always carried this list; the story tab had no path to it at all, so a
     # failure was stated and never explained.
