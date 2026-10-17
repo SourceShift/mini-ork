@@ -105,6 +105,20 @@ revision" to **not revivable**: `hr-exec-park-20261015141603`,
    `spec-tests.py` improves the reason but still routes to `revise`. Detector for
    a monitor: the failing nodeid's `E` line is a non-assertion exception whose
    deepest frame is inside the spec dir ⇒ spec-author defect, not revivable.
+9. **A tool-level refusal is still recorded as a code failure (third instance of
+   the class).** `run-1792023423-m3--m3a-run-log-reader-removal--M3a` (researcher
+   home, $5.11): `verifier_tier1-compile-typecheck.json` says
+   `tsc_rc: 0, lint_rc: 2, failure_kind: "code"`, but `tier1-evidence.log` ends
+   with ESLint's *own* refusal — `No files matching the pattern
+   ".../__tests__/miniorkOverlayPaths.test.ts" were found` (ESLint exits 2 on an
+   unmatched pattern; no rule ran). The epic is a **removal** epic, so the
+   touched-file list naming a deleted file is expected. 10 of 15 nodes failed,
+   and the parent verdict adds `contract: "recipe verifier evidence unparsable"`
+   over a well-formed JSON. Fix site is the tier1 verifier
+   (`recipes/recursive-validate-impl/verifiers/tier1-compile-typecheck.py`) plus
+   whatever the levels reader wants from that shape — **not patched**, and a fix
+   would also have to reach the researcher install, which lags the engine
+   (`researcher-install-lag` above).
 
 ---
 
