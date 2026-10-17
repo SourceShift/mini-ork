@@ -16,6 +16,11 @@ Drives each hook as a subprocess with fixture stdin/env:
   post-commit
     (h) MO_REVERSION_GUARD_DISABLED=1 → exit 0, no log
     (i) watchdog restores a deleted file and writes the TSV log line
+    (j) a rebase checkout (HEAD moved off the watched sha) → no restore,
+        no log row                                     [LF-R14]
+    (k) a real reversion with HEAD at the watched sha → still healed  [LF-R14]
+    (l) a real rebase stopped mid-way → skip even though HEAD == sha  [LF-R14]
+    (m) the reversion case inside a linked worktree → still healed    [LF-R14]
 """
 from __future__ import annotations
 
@@ -85,6 +90,60 @@ def _run_hook(hook: Path, argv: list[str], stdin: str, repo: Path,
         cwd=repo,
         env=env,
     )
+
+
+def _commit_all(repo: Path, msg: str) -> str:
+    """Stage every change and commit; return the new HEAD sha."""
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", msg)
+    return _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+
+def _log_path(repo: Path) -> Path:
+    return repo / ".mini-ork" / "file-reversion-guard.log"
+
+
+def _log_rows(log: Path) -> list:
+    """Guard-log rows; a skip leaves the file absent or blank."""
+    if not log.is_file():
+        return []
+    return [ln for ln in log.read_text().splitlines() if ln.strip()]
+
+
+def _run_watchdog(repo: Path, sha: str, files: list, branch: str = "",
+                  log: Path | None = None, watch_s: str = "4",
+                  poll_s: str = "1") -> subprocess.CompletedProcess:
+    """Drive the detached `__watchdog__` argv mode directly (no commit-time
+    spawn), so a test controls exactly which sha/HEAD the guard sees."""
+    log = log or _log_path(repo)
+    (repo / ".mini-ork").mkdir(parents=True, exist_ok=True)
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": os.environ.get("HOME", ""),
+        "_MO_RG_REPO_ROOT": str(repo),
+        "_MO_RG_SHA": sha,
+        "_MO_RG_BRANCH": branch,
+        "_MO_RG_FILES": "\n".join(files),
+        "_MO_RG_WATCH_S": watch_s,
+        "_MO_RG_POLL_S": poll_s,
+        "_MO_RG_LOG": str(log),
+    }
+    return subprocess.run(
+        [sys.executable, str(POST_COMMIT), "__watchdog__"],
+        cwd=repo,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+
+def _git_path_exists(repo: Path, name: str) -> bool:
+    """Per-worktree existence probe, the way the hook resolves it."""
+    p = _git(repo, "rev-parse", "--git-path", name).stdout.strip()
+    return bool(p) and (repo / p).exists()
 
 
 def _call_main(mod, stdin_text: str, monkeypatch) -> int:
@@ -364,3 +423,162 @@ def test_post_commit_watchdog_restores_reverted_file(tmp_path: Path):
     assert action == f"restored-reverted-to-{parent}"
     assert (repo / "a.txt").read_text() == "v2\n"
     time.sleep(5)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# post-commit — LF-R14: the guard must not heal a rebase
+# ─────────────────────────────────────────────────────────────────────────────
+def test_post_commit_watchdog_skips_rebase_checkout(tmp_path: Path):
+    """A rebase checkout is not a reversion.
+
+    Commit A, then B changing `f`. A rebase checks out the new base, whose
+    content for `f` IS A's — the commit is the delta — so the drift test sees
+    the parent blob and would restore B's content, desyncing the tree from the
+    rebase and wedging the next `pick`. With HEAD no longer at the watched sha,
+    the watchdog must restore nothing and log nothing.
+    """
+    repo = _init_repo(tmp_path / "rb")
+    sha_a = _commit_file(repo, "f", "A content\n", "A")
+    sha_b = _commit_file(repo, "f", "B content\n", "B")
+
+    _git(repo, "checkout", "-q", "--detach", sha_a)
+    (repo / "f").write_text("A content\n")  # what the rebase checkout produces
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    assert head == sha_a and head != sha_b
+
+    log = _log_path(repo)
+    r = _run_watchdog(repo, sha_b, ["f"], branch="", log=log)
+    assert r.returncode == 0, r.stderr
+
+    assert (repo / "f").read_text() == "A content\n", (
+        "the rebase checkout must not be healed back to B's content"
+    )
+    assert _log_rows(log) == [], (
+        "a skip is not a recovery — the guard log must gain no row"
+    )
+
+
+def test_post_commit_watchdog_heals_reversion_at_watched_sha(tmp_path: Path):
+    """The case the hook exists for, unchanged.
+
+    HEAD is still the watched sha and no operation is in progress: a file
+    written back to its parent's content is restored from HEAD and logged in
+    the pre-existing TSV format (`restored-reverted-to-<parent>`).
+    """
+    repo = _init_repo(tmp_path / "rev")
+    parent = _commit_file(repo, "f", "A content\n", "A")
+    sha = _commit_file(repo, "f", "B content\n", "B")
+    branch = _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
+    assert branch
+    assert _git(repo, "rev-parse", "HEAD").stdout.strip() == sha
+
+    (repo / "f").write_text("A content\n")  # the racing dispatcher's reversion
+
+    r = _run_watchdog(repo, sha, ["f"], branch=branch)
+    assert r.returncode == 0, r.stderr
+
+    rows = _log_rows(_log_path(repo))
+    assert (repo / "f").read_text() == "B content\n", (
+        f"a genuine reversion must still be restored; log was {rows!r}"
+    )
+    assert rows, "watchdog wrote no recovery row"
+    ts, log_sha, log_file, action = rows[-1].split("\t")
+    assert ts.endswith("Z") and "T" in ts
+    assert log_sha == sha
+    assert log_file == "f"
+    assert action == f"restored-reverted-to-{parent}"
+
+
+def test_post_commit_watchdog_skips_in_progress_rebase(tmp_path: Path):
+    """HEAD can still equal the watched sha mid-rebase — the sequencer wins.
+
+    A real `git rebase` is stopped on a conflict, leaving git's own
+    `rebase-merge` (or `rebase-apply`) state behind. `f` is then written to a
+    parent blob (D^:f) that the pre-change watchdog would have healed; only the
+    in-progress guard can stop the restore.
+    """
+    repo = _init_repo(tmp_path / "inprog")
+    (repo / "f").write_text("base\n")
+    (repo / "g").write_text("gbase\n")
+    sha_a = _commit_all(repo, "A")
+    (repo / "f").write_text("B content\n")
+    _commit_all(repo, "B")  # main: A -> B  (f changed)
+
+    _git(repo, "checkout", "-q", "-b", "side", sha_a)
+    (repo / "g").write_text("side g\n")
+    _commit_all(repo, "C")  # side: A -> C  (g changed)
+
+    _git(repo, "checkout", "-q", "main")
+    (repo / "g").write_text("main g\n")
+    (repo / "f").write_text("main f\n")
+    _commit_all(repo, "D")  # main: A -> B -> D  (f, g changed)
+
+    _git(repo, "checkout", "-q", "side")
+    rebase = _git(repo, "rebase", "main")
+    assert rebase.returncode != 0, (
+        "setup expected the rebase to stop on a conflict; "
+        f"stdout={rebase.stdout!r} stderr={rebase.stderr!r}"
+    )
+    # Precondition: git really left a sequencer state behind, not a fabricated
+    # directory — otherwise this proves nothing about the git plumbing.
+    assert _git_path_exists(repo, "rebase-merge") or _git_path_exists(
+        repo, "rebase-apply"
+    ), "setup did not leave a real rebase in progress"
+
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    assert head
+    # D^:f — a genuine parent blob, so the pre-change watchdog would heal this.
+    (repo / "f").write_text("B content\n")
+    assert (repo / "f").read_text() != "main f\n"
+
+    log = _log_path(repo)
+    r = _run_watchdog(repo, head, ["f"], branch="", log=log)
+    assert r.returncode == 0, r.stderr
+
+    assert (repo / "f").read_text() == "B content\n", (
+        "the watchdog must not restore while a rebase is in progress, even "
+        "though HEAD still equals the watched sha"
+    )
+    assert _log_rows(log) == [], (
+        "an in-progress skip must append no guard-log row"
+    )
+
+
+def test_post_commit_watchdog_fires_in_linked_worktree(tmp_path: Path):
+    """The probe is per-worktree, not main-checkout-only.
+
+    A linked worktree's operation state lives under the main repo's
+    `.git/worktrees/<name>/`, so only a `git rev-parse --git-path` lookup
+    resolves it correctly. Run the reversion case inside `git worktree add`ed
+    tree: the guard must still fire there, and the main checkout's ledger must
+    stay untouched.
+    """
+    repo = _init_repo(tmp_path / "lw")
+    parent = _commit_file(repo, "f", "A content\n", "A")
+    sha = _commit_file(repo, "f", "B content\n", "B")
+
+    wt = tmp_path / "lw-linked"
+    added = _git(repo, "worktree", "add", "-q", "-b", "wtbranch", str(wt), sha)
+    assert added.returncode == 0, added.stderr
+    assert (wt / ".git").is_file(), "a linked worktree's .git is a gitdir file"
+    assert (wt / "f").read_text() == "B content\n"
+    assert not _git_path_exists(wt, "rebase-merge")
+    assert not _git_path_exists(wt, "MERGE_HEAD")
+
+    (wt / "f").write_text("A content\n")  # the racing dispatcher's reversion
+    log = _log_path(wt)
+    r = _run_watchdog(wt, sha, ["f"], branch="wtbranch", log=log)
+    assert r.returncode == 0, r.stderr
+
+    rows = _log_rows(log)
+    assert (wt / "f").read_text() == "B content\n", (
+        f"the guard must still fire in a linked worktree; log was {rows!r}"
+    )
+    assert rows, "watchdog wrote no recovery row"
+    _, log_sha, log_file, action = rows[-1].split("\t")
+    assert (log_sha, log_file, action) == (
+        sha, "f", f"restored-reverted-to-{parent}"
+    )
+    assert _log_rows(_log_path(repo)) == [], (
+        "the operation is worktree-local — the main checkout's log stays empty"
+    )
