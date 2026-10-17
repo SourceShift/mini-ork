@@ -53,6 +53,11 @@ MODES = ("off", "shadow", "on")
 DEFAULT_MODE = "shadow"
 DEFAULT_HOLDOUT = 0.2
 DEFAULT_SIM = 0.35
+# Paraphrase tolerance (LF-R13 §3): a reworded restatement often falls below the
+# TF-IDF cosine floor while sharing the same token set, or embeds to nearly the
+# same point. Both arms are additive — the TF-IDF rule above is unchanged.
+CONTAINMENT_MIN = 0.6
+EMBED_MIN = 0.6
 PACK_FILENAME = "context-pack.v2.json"
 # The full success command reaches every node; only an absurd one is cut, and
 # the cut is made visible (change 4).
@@ -633,18 +638,81 @@ def cluster(findings: list[dict], *, sim: float = DEFAULT_SIM) -> list[dict]:
     return clusters
 
 
+def _token_set(text: str) -> set[str]:
+    """The cleaned issue text's token set, using the same tokenizer the TF-IDF
+    arm uses (stopwords and short tokens already dropped)."""
+    return set(themes._tokenize(clean_issue(text)))
+
+
+def _containment(a: set[str], b: set[str]) -> float:
+    """``|a ∩ b| / min(|a|, |b|)`` — symmetric token containment; ``0.0`` when
+    either side is empty.
+
+    The smaller side is the denominator so a restatement that is either a
+    superset or a subset of the cluster's problem scores 1.0: "the verifier
+    ignores exit code 124" and "ignores exit code 124" contain each other,
+    which is exactly the paraphrase case the cosine floor misses. An
+    unrelated short note that happens to share two tokens with a long sentence
+    still stays below the floor because the shorter side carries the shared
+    tokens only in part.
+    """
+    if not a or not b:
+        return 0.0
+    return len(a & b) / min(len(a), len(b))
+
+
+def _embedding_cosine(a: str, b: str) -> float | None:
+    """Cosine of ``a`` and ``b`` under ``MO_EMBED_PROVIDER``, or ``None``.
+
+    Off unless a provider is named — no embedder lookup happens on the default
+    path. Provider vectors are unit-normalized, so the cosine is their dot
+    product. Any lookup/embed failure degrades to ``None``: a broken provider
+    must never break measurement (``get_embedder`` raises for an unregistered
+    name, and a real provider can fail at call time).
+    """
+    if not os.environ.get("MO_EMBED_PROVIDER", "").strip():
+        return None
+    try:
+        # Lazy import: context_v2 must load on the prompt path even when
+        # mini_ork.memory is unavailable (same rule as ``build``).
+        from mini_ork.memory.semantic import get_embedder
+        va, vb = get_embedder().embed([a, b])
+        return float(sum(x * y for x, y in zip(va, vb)))
+    except Exception:  # noqa: BLE001 — measurement must never raise
+        return None
+
+
 def recurrence(clusters: list[dict], findings: list[dict], *,
                sim: float = DEFAULT_SIM) -> dict[str, bool]:
     """``{cluster_id: True}`` when any of ``findings`` (one run's own review
-    findings) restates the cluster's problem. IDF is computed over both sides."""
+    findings) restates the cluster's problem.
+
+    A cluster recurs when any finding restates it by TF-IDF cosine (``>= sim``,
+    unchanged), token-set containment (``>= CONTAINMENT_MIN``), or — when
+    ``MO_EMBED_PROVIDER`` names a healthy embedder — embedding cosine
+    (``>= EMBED_MIN``). IDF is computed over both sides; the extra arms never
+    remove a hit the cosine arm found.
+    """
     reps = [clean_issue(c.get("representative") or "") for c in clusters]
     texts = [clean_issue(f.get("issue") or "") for f in findings]
     idf, unseen = _idf_over(reps + texts)
     vecs = [v for v in (themes._vector(t, idf, unseen) for t in texts) if v]
+    rep_sets = [_token_set(rep) for rep in reps]
+    text_sets = [_token_set(text) for text in texts]
     out = {}
-    for c, rep in zip(clusters, reps):
+    for c, rep, rep_set in zip(clusters, reps, rep_sets):
         cv = themes._vector(rep, idf, unseen)
-        out[c["id"]] = bool(cv) and any(themes._dot(cv, v) >= sim for v in vecs)
+        hit = bool(cv) and any(themes._dot(cv, v) >= sim for v in vecs)
+        if not hit:
+            hit = any(_containment(rep_set, ts) >= CONTAINMENT_MIN
+                      for ts in text_sets)
+        if not hit:
+            for text in texts:
+                cos = _embedding_cosine(rep, text)
+                if cos is not None and cos >= EMBED_MIN:
+                    hit = True
+                    break
+        out[c["id"]] = hit
     return out
 
 
@@ -964,6 +1032,14 @@ def write_injection_record(run_dir: str, node_id: str, *, text: str,
             "written_at": int(time.time()),
         }
         record.update(extra or {})
+        # LF-R13 §2: arm/held-out provenance for the planner injection. The
+        # planner's ledger_extra already carries ``context_v2.arm``; a run with
+        # no such extra (or a non-string arm) records None rather than guessing.
+        context_extra = (extra or {}).get("context_v2")
+        arm = context_extra.get("arm") if isinstance(context_extra, dict) else None
+        arm = arm if isinstance(arm, str) else None
+        record["arm"] = arm
+        record["held_out"] = (arm == "holdout") if arm is not None else None
         write_json(os.path.join(learned, f"{node_id}.json"), record)
         md_path = os.path.join(learned, f"{node_id}.md")
         if record["injected"]:
