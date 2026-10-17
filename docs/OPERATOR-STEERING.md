@@ -19,6 +19,24 @@ guidance between nodes, and the next node sees it in its context pack.
 - Cross-run lessons too specific to the current task to deserve a
   gradient promotion.
 
+## The built-in watcher
+
+You do not have to be the supervisor. Every real `mini-ork run` (not a dry
+run, and unless switched off) starts a detached,
+model-free watcher (`mini-ork orchestrator watch <run_id>`) that samples the
+live node every `MO_ORCH_WATCH_INTERVAL_S` seconds and injects into this same
+queue when a node stalls. Its rows carry `source = "orchestrator-watch"` — grep
+for that to tell an automatic nudge from your own — and severity `warn`, so an
+operator message that ranks higher always wins.
+
+It steers only on `stalled` and `repeating_error`; duration and cost overruns
+are signalled and never acted on. It is capped at `MO_ORCH_WATCH_MAX_STEERS`
+per run, obeys `MO_ORCH_BUDGET_USD`, respects a pending `.stop-requested`, and
+passes every message through the same `guard_steer` the CLI path uses. Set
+`MO_ORCH_WATCH_AUTONOMY=notify` to keep the signals and stop the nudges, or
+`MO_ORCH_WATCH=0` to run with no watcher at all. See
+`docs/operator/feature-flags.md` for the full knob list.
+
 ## API
 
 ### CLI

@@ -11,6 +11,20 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- feat(orchestrator): one orchestrator per run, on two cadences. The per-run
+  orchestrator keeps its node-boundary decisions and gains an interval cadence
+  hosted by one detached, model-free process per run (`mini-ork orchestrator
+  watch <run_id>`): every `MO_ORCH_WATCH_INTERVAL_S` (20 s) it samples the live
+  node with the ACP thread's own detector, writes `orchestrator.watching` /
+  `.signal` / `.steered` / `.ended` rows the run page already renders, and — on
+  a stall, within `MO_ORCH_WATCH_MAX_STEERS` and `MO_ORCH_BUDGET_USD`, and after
+  `guard_steer` — injects one operator-steering nudge. `MO_ORCH_WATCH_AUTONOMY`
+  selects `steer` (default) / `notify` / `off`. Zero model calls, one OS
+  process per run, never one per node. A live watcher suppresses the ACP
+  thread's duplicate sampling; the attention strip now names a run whose
+  watcher raised trouble or whose dispatcher died. See
+  `docs/operator/feature-flags.md` and `docs/OPERATOR-STEERING.md`.
+
 - feat(verify): the verification stack — six techniques from the 2000-paper verification review, ON by
   default (see `docs/architecture/verification-stack.md`). Metamorphic relations in the certify oracle
   (`certify/relations.py`, veto + rescue); differential base-vs-patch check (`certify/differential.py`, collateral-

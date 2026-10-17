@@ -140,6 +140,11 @@ touched set is the child's working tree ∪ untracked ∪ `pre-implementer-ref�
 | `MO_OPTIMIZER_MODEL` | `"minimax"` | GEPA optimizer lane |
 | `MO_OPTIMIZER_BUDGET` | `"4"` | GEPA optimizer budget |
 | `MO_NODE_HEARTBEAT_SECONDS` | `"60"` | How often a running node writes a `node_heartbeat` row |
+| `MO_ORCH_WATCH` | `"1"` | `0` stops `mini-ork run` from spawning the run's interval watcher |
+| `MO_ORCH_WATCH_INTERVAL_S` | `"20"` | Seconds between watcher ticks |
+| `MO_ORCH_WATCH_AUTONOMY` | `"steer"` | `steer` \| `notify` \| `off` — whether a stall is nudged or only signalled |
+| `MO_ORCH_WATCH_MAX_STEERS` | `"2"` | Nudges per run |
+| `MO_ORCH_WATCH_MAX_HOURS` | `"12"` | Wall-clock cap on the watcher's own lifetime |
 
 ### Node heartbeats (`MO_NODE_HEARTBEAT_SECONDS`)
 
@@ -165,12 +170,63 @@ and previously starved for, because nothing emitted it:
 * `fleet`'s active-run filter (`mini_ork/web/routes/fleet.py`).
 
 It is also the only signal a **hung** node produces, which is what makes a stall
-observable at all: a per-run orchestrator watches these rows to notice one.
+observable at all: a per-run orchestrator watches these rows to notice one (see
+*The per-run watcher* below).
 
 **Simple tier.** Nothing to configure — heartbeats are always on, and the
 default interval (60 s) leaves a six-hour stale window covered with room to
 spare. A missing, unparseable or non-positive `MO_NODE_HEARTBEAT_SECONDS` falls
 back to the default rather than disabling the tick.
+
+### The per-run watcher (`MO_ORCH_WATCH`)
+
+The per-run orchestrator has two cadences. At node boundaries it decides
+advance / help / repair / mutate / promote in-process (`on_node_boundary`).
+Between boundaries a detached plain-Python process per run (`mini-ork
+orchestrator watch <run_id>`) samples the live node on an interval and raises
+trouble. Both cadences live in `mini_ork/orchestration/runner_orchestrator.py`
+and share the run's `MO_RUN_ORCHESTRATOR` switch, `MO_ORCH_BUDGET_USD` budget
+and `guard_steer` check, so there is exactly one orchestrator per run.
+
+It makes **zero model calls**: it reads `run_events`, the node log's mtime and
+`<run>/.pid`, and writes `orchestrator.watching` / `.signal` / `.steered` /
+`.ended` rows. Detection is the ACP thread's own sampler
+(`mini_ork/acp_orchestrator/watch.py`), so its thresholds apply here too —
+`MO_WATCH_STALL_SECONDS` (300), `MO_WATCH_LONG_NODE_SECONDS` (900) and
+`MO_WATCH_COST_USD` (1.0). Kinds: `stalled`, `repeating_error`,
+`duration_overrun`, `cost_overrun`.
+
+Autonomy (`MO_ORCH_WATCH_AUTONOMY`, default `steer`):
+
+* `steer` — on `stalled` or `repeating_error`, write one `operator_steering`
+  row for the live node (severity `warn`, source `orchestrator-watch`, 30 min
+  TTL), capped by `MO_ORCH_WATCH_MAX_STEERS`. Duration and cost overruns are
+  never steered: they are statements about the run, not about the node.
+* `notify` — write the signal rows only. The run page and the attention strip
+  still show them.
+* `off` — the watcher exits at startup, before its first tick.
+
+Four things the watcher never does: it never writes `<run>/.pid` (a watcher pid
+there would mask a dead dispatcher), never writes `task_runs.status` (the
+reaper owns that), never sets `last_heartbeat_at` (only `node_start` and
+`node_heartbeat` do), and never changes the run's exit code. A crash leaves a
+traceback in `<run>/orchestrator-watch.log` and nothing else.
+
+It exits on: the run reaching a terminal status; the dispatcher's pid going
+dead; `.pid` missing for two ticks; `MO_ORCH_WATCH_MAX_HOURS`; or the flag
+being turned off. A `remote` or `paused` run is idled rather than exited — a
+remote run's local logs are not its logs, and a paused run is not stalled.
+
+**Simple tier.** Nothing to configure. The defaults are the safe ones, the
+spawn is best-effort (a failure prints one stderr line and the run continues),
+and `--once` runs a single tick for a seeded run dir without any daemon. Two
+watchers on one run cannot both run: a startup flock makes the second a no-op.
+
+**Secure tier.** The child is spawned with `start_new_session=True`, its own
+run-scoped environment (`MINI_ORK_RUN_ID`, `MINI_ORK_DB`, …), and node identity
+removed (`MO_NODE_ID`, `MO_NODE_TYPE`, `CONCORD_PRINCIPAL`, `MINI_ORK_DRY_RUN`).
+An explicit `--home` that holds neither `state.db` nor `config/` fails closed
+with rc 3 rather than falling back to the working directory.
 
 ### Recipe-declared loop caps (`MO_RECURSION_*`)
 

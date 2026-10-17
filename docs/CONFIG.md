@@ -194,6 +194,11 @@ human_gate:
 | `MINI_ORK_VERBOSE` | `0` | `1` = debug-level log output |
 | `MO_RUN_ORCHESTRATOR` | `on` | `0`/`false`/`no`/`off` disables the per-run orchestrator (the adaptive layer that picks advance/help/repair/mutate/promote at node boundaries). Default on; a typo'd value stays on |
 | `MO_ORCH_BUDGET_USD` | `1.0` | Orchestrator spend cap in USD, measured against the run's real cost-ledger spend. Once the run has spent the cap the orchestrator goes quiet for the rest of the wave — this is the brake that makes default-on safe |
+| `MO_ORCH_WATCH` | `1` | `0`/`false`/`no`/`off` stops `mini-ork run` from spawning the run's interval watcher. It makes no model calls; it costs nothing to leave on |
+| `MO_ORCH_WATCH_INTERVAL_S` | `20` | Seconds between watcher ticks. A non-positive or unparseable value keeps the default |
+| `MO_ORCH_WATCH_AUTONOMY` | `steer` | `steer` = signal **and** send one guard-checked nudge on a stall; `notify` = signal only; `off` = the watcher exits at startup. An unknown value is read as `notify`, the safer side |
+| `MO_ORCH_WATCH_MAX_STEERS` | `2` | Nudges per run, across every node |
+| `MO_ORCH_WATCH_MAX_HOURS` | `12` | Wall-clock cap on the watcher's own lifetime; it exits on its own after this |
 
 ### Planner context injection
 
