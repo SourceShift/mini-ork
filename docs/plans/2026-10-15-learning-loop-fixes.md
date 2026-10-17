@@ -53,3 +53,83 @@ Every kickoff carries a `measure` block (run by the kickoff-contract verifier
 from the pre-run snapshot) and a Required-artifacts list. After each run the
 diff is reviewed clause-by-clause against its kickoff before merge, because a
 green framework-edit verdict proves only that the implementer's own tests pass.
+
+## Status 2026-10-16 ~23:30 (waves 1 and 2a merged)
+
+Merged to `origin/main`, each with its kickoff read clause by clause first:
+R1 `d405ef48`, R6 `b2f5b224`, R4 `aaa87512`, R7a `dc2d8793` (wave 1);
+R5 `95a4af77`, R10 `fda51845`, R2 `5b8d4a98` (wave 2a). R8 is running
+(`lf-r8-20261016-231736`); R14 (below) runs beside it.
+
+Review fixes made at merge time, not by the runs: R4's `0074` migration was a
+bare `ALTER … ADD COLUMN` that dies on "duplicate column" where the runtime twin
+had already added the columns — rewritten to the guarded `.read|sh` idiom with
+the `schema_migrations` self-record; R2's `0075` collided with
+`0075_intake_events_run_id.sql` (landed by another merge) and was renumbered to
+`0077` in the code, the SQL, the ownership claim and the tests.
+
+Residual, to carry into R11a (which owns `code_findings.py`): R5 classifies
+review findings centrally (`_parse_review_raw`) and gates the verifier reason
+path, but the verifier path can still store a **process** note (a failed
+verifier whose only note is a delivery complaint). Zero such rows exist in the
+live table today (verifier sources: 182 code, 63 receipt, 1 harness, 0
+process) — the hole is latent, not live. A one-line central filter in the
+`_harvest_run` insert loop would close it.
+
+Not yet done: the live-DB cleanup proven on a copy in R5's review (166 non-code
+rows pruned, 280 artifact file paths cleared) is deliberately NOT applied while
+runs are live.
+
+## Wave-3 resequencing (2026-10-17 ~00:40)
+
+The wave table above put R3, R9, R7b and R12 in one wave "touching disjoint
+files". They are not disjoint: R3, R9 and R12 all edit `mini_ork/context_v2.py`,
+and R7b needs `mini_ork/cli/main.py`, which R8 holds. One live claim per file
+means the wave has to be serialised. Order, each step starting after the
+previous one merged and its claim cleared:
+
+| Step | Item | Files | Why here |
+|---|---|---|---|
+| 3a | R9 | `context_v2.py` | smallest context_v2 change; R12/R3 stack on it |
+| 3a | R7b | `agents_config.py`, `cli/main.py` | disjoint from R9; needs R8's `main.py` claim released |
+| 3b | R12 | `code_findings.py`, `context_v2.py`, `learn/code.py`, migration | after R9 (context_v2), and by then `lf-r10` has released `learn/code.py` |
+| 3c | R3 | `execute.py`, `plan.py`, `context_assembler.py`, `context_v2.py` | after R12; `execute.py` is free again (`orch-wired-receipt`'s claim no longer exists) |
+| 4 | R11a | `code_findings.py`, `context_v2.py`, `learn/code.py`, migration | after R12 |
+| 4 | R13 | `context_v2.py`, `execute_handlers.py`, `metrics_context.py`, `retirement.py` | after R11a |
+| 5 | R11b | `code_findings.py`, migration | after R11a |
+
+Kickoffs for this batch: `lf-r9-scope-fallback.md` and `lf-r7b-lane-provenance.md`
+written 2026-10-17 (R12's and R3's existed already). R9's seam is
+`pack_for_run`, which is the only `build()` caller that holds a `run_dir` — so
+the fallback is single-file and the other two callers keep kickoff-only
+behaviour. R7b's resolution reuses `panel_heterogeneity.lane_family` rather than
+growing a second family table.
+
+R11a design settled when its kickoff was written (2026-10-17): the panel's
+"capture file blob sha and line text at harvest" is half-already-true — R5
+populates `snippet` with the quoted line — so staleness is a READ-TIME
+computation (whitespace-normalized substring test against `HEAD:file`, one
+`git cat-file --batch` per selection) and R11a needs **no migration**. A
+`blob_sha` column would be a cache; it can be added later if the measured cost
+of the read path justifies it. Age window ships regardless
+(`MO_CONTEXT_V2_MAX_AGE_DAYS`, default 30, `0` disables). The snippet check is
+the risky half and ships behind `MO_FINDINGS_STALENESS=0`.
+
+Housekeeping done alongside: `make worktree-clean` on the merged `lf-r2` and
+`lf-r10` (both branches `MERGED`), which released `context_assembler.py`,
+`reflection_pipeline.py`, `ide_pages/learn/code.py` and `0077_*.sql`; and the
+`.ownership` claim `kickoffs/auto/lf-` was a prefix the claim guard does not
+expand, so each new kickoff file got an explicit claim line.
+
+### R14 — added 2026-10-16, outside the panel's R1–R13
+
+The post-commit file-reversion watchdog (`.githooks/post-commit:132-152`)
+restores a file whose working-tree blob equals a **parent** commit's blob —
+which is exactly the state a `git rebase origin/main` checkout produces. It
+therefore heals the rebase, the working tree stops matching the rebase's HEAD,
+and the next `pick` aborts with "Your local changes … would be overwritten".
+Witnessed on `lf-r5` and `lf-r2`; both merges were completed with
+`MO_REVERSION_GUARD_DISABLED=1` and a re-run after the 60 s window. Kickoff:
+`kickoffs/auto/lf-r14-reversion-guard.md`. Fix: require the watched commit to
+still be HEAD (and no rebase/am/merge in progress, detected per worktree)
+before any restore.
