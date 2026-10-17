@@ -648,7 +648,7 @@ verified against `origin/main` `5b8d4a98` rather than against recorded status.
   anywhere) and R13 (no `v2_legacy`/`effective` symbol). R8 in progress. **This is cross-cutting
   finding 1 again:** a plan of record that reads like a shipped contract.
 
-**New defect — the reversion watchdog undoes a legitimate rebase (P1).**
+**New defect — the reversion watchdog undoes a legitimate rebase (P1).** **[Resolved by `363b8562` — see round 15.]**
 `.githooks/post-commit:132-152` restores a file whenever its content equals a **parent** commit's
 blob — which is precisely the working-tree state a rebase checkout produces. So every
 `make worktree-merge` within ~60 s of a commit wedges with *"local changes would be overwritten"*.
@@ -1297,4 +1297,33 @@ and it is **half-built**: the read-side helper and its one caller exist, but the
 are queuing *further* changes onto `retry_hint.py` on the belief it is mine (it is), and an
 uncommitted multi-file set in a checkout nine other sessions are editing is one careless `git add -A`
 from a mixed commit. It needs a scoped commit or an explicit park, by the user's call, not by drift.
+
+## Delivery — round 15 (the reversion guard is fixed, and it unblocks the `.sh` repoint)
+
+**The reversion-guard P1 closes — `363b8562`, verified.** The defect recorded earlier in this document
+(*"the post-commit watchdog undoes a legitimate rebase"*, which made every `make worktree-merge` within
+~60 s of a commit wedge with *"local changes would be overwritten"*, worked around with
+`MO_REVERSION_GUARD_DISABLED=1`) is fixed on `origin/main`:
+`git merge-base --is-ancestor 363b8562 origin/main` → **yes**, touching exactly the two files it must
+(`.githooks/post-commit`, `tests/unit/test_githooks_py.py`, +301). The mechanism, read in the landed
+`.githooks/post-commit`: the guard now (a) requires the watched sha to still be `HEAD`, and (b) skips
+while any of `rebase-merge` / `rebase-apply` / `MERGE_HEAD` / `CHERRY_PICK_HEAD` / `REVERT_HEAD` is
+present, each resolved per-worktree with `git rev-parse --git-path <name>` — so the working-tree state
+a rebase checkout produces is no longer mistaken for a revert. The peer reports the scoped gate green
+(*"22 passed in 34.99s"*) and the branch fully merged; the code shape is what I verified directly.
+Consequence: `MO_REVERSION_GUARD_DISABLED=1` is no longer needed for worktree merges.
+
+**And it frees the `.sh` repoint — verified in the claim registry, not inferred.** Round 14 recorded
+the repoint as blocked on `lf-r14` claiming `.githooks/post-commit` and
+`tests/unit/test_githooks_py.py` (`$WORKTREES_DIR/.ownership:61-62`). After `363b8562`, the worktree is
+gone and **both claims are released**: the registry now carries **no** line for either path, and the
+only surviving `lf-r14` reference is the `learning-fixes` dispatcher's claim on
+`kickoffs/auto/lf-r14-reversion-guard.md` — its own kickoff, unrelated to the edit. So the
+repoint-then-delete remedy is **unblocked**: `reference-transaction:105` → `.py`, `AGENTS.md:50`'s
+false *"is what the targets call"* → corrected, and the `test_githooks_py.py:141` pin updated in the
+same atomic change.
+
+First claim stays with `mini-ork-df`, which found the remedy and said it would land it when the file
+freed. If it is not taken, this session takes it — the two are the same change and must not be made
+twice.
 
