@@ -760,22 +760,180 @@ def _needs_you(run) -> dict[str, Any]:
     }
 
 
+# The callout title is a contract with ``run._attention_lane``: once the
+# needs-you lane carries this decision, the story tab drops the callout so the
+# retry decision renders exactly once.
+GATE_CALLOUT_TITLE = "This run needs your decision"
+
+# ``retry_hint`` strategies rendered as the operator-facing verb (the kickoff's
+# ``Re-verify`` / ``Retry`` / ``Merge``), never as the raw enum.
+_STRATEGY_WORDS = {
+    "verify": "Re-verify",
+    "re-verify": "Re-verify",
+    "resume": "Resume",
+    "resume-cost": "Resume from the cost pause",
+    "retry": "Retry",
+    "merge": "Merge",
+    "none": "Retry",
+}
+
+
+def _strategy_word(raw: Any) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return "Retry"
+    return _STRATEGY_WORDS.get(text.lower(), f"Retry ({text})")
+
+
+def _gate_merged_hint(run, gate: dict[str, Any]) -> dict[str, Any]:
+    """The gate's own hint with anything it omits filled from ``retry-hint.json``.
+
+    The gate row is authoritative for the fields it carries; the persisted hint
+    is the fallback for the common case where ``fix_steps`` renders empty (a
+    retry-hint-only gate). Both reads fail soft to ``{}``.
+    """
+    merged: dict[str, Any] = {}
+    persisted = _hint(run)
+    if isinstance(persisted, dict):
+        merged.update(persisted)
+    own = _gate_hint(gate)
+    merged.update(own)
+    return merged
+
+
+def _estimated_cost(hint: dict[str, Any]) -> float | None:
+    """The hint's cost estimate, when it carries one (``None`` otherwise)."""
+    for key in ("estimated_cost_usd", "estimated_cost", "cost_estimate_usd",
+                "estimated_usd"):
+        raw = hint.get(key)
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def _verification_wording(run) -> str:
+    """Which levels are unverified, and the rule publishing enforces."""
+    rv = _run_verdict(run)
+    levels = rv.get("levels") if isinstance(rv, dict) else None
+    unverified: list[str] = []
+    if isinstance(levels, dict):
+        for name in LEVELS:
+            value = str(levels.get(name) or "").strip()
+            if value != _PROVEN:
+                unverified.append(f"{name} ({value or 'not recorded'})")
+    if unverified:
+        return ("Unverified levels: " + ", ".join(unverified)
+                + ". Publishing requires every level PROVEN.")
+    return "Publishing requires every level PROVEN."
+
+
+def _recover_command(run, hint: dict[str, Any]) -> str:
+    command = str(hint.get("command") or "").strip()
+    if command:
+        return command
+    strategy = str(hint.get("strategy") or "").strip().lower() or "retry"
+    if strategy not in _STRATEGY_WORDS:
+        strategy = "retry"
+    return f"mini-ork recover {run.id} --strategy {strategy}"
+
+
+def _gate_explanation(run, gate: dict[str, Any]) -> str:
+    """What approving this retry will do — never an empty string.
+
+    C4: every gate/retry callout says the strategy, the from-node, the exact
+    command, and (when known) the estimated cost. Where the gate's hint has no
+    ``fix_steps``, the persisted ``retry-hint.json`` supplies ``failed_node`` /
+    ``notes[0]`` / the command. A verification gate also names the unverified
+    levels and the every-level-PROVEN rule. A broken hint still yields generic
+    text naming the decision — a broken part costs detail, never the sentence.
+    """
+    hint = _gate_merged_hint(run, gate)
+    nc = hint.get("needs_change")
+    nc = nc if isinstance(nc, dict) else {}
+    summary = str(nc.get("summary") or "").strip()
+    strategy_raw = str(hint.get("strategy") or "").strip().lower()
+    from_node = str(hint.get("from_node") or hint.get("failed_node") or "").strip()
+
+    steps: list[str] = []
+    try:
+        from mini_ork.recovery import retry_notify
+
+        steps = [str(s).strip() for s in retry_notify.fix_steps(hint, home=run.home)
+                 if str(s).strip()]
+    except Exception:  # noqa: BLE001 — a broken steps renderer must not blank the gate
+        steps = []
+    raw_notes = hint.get("notes")
+    notes = [str(n).strip() for n in raw_notes if str(n).strip()] \
+        if isinstance(raw_notes, list) else []
+
+    lines: list[str] = []
+    headline = (f"{_strategy_word(strategy_raw)} from {from_node}" if from_node
+                else f"{_strategy_word(strategy_raw)} from the failed node")
+    lines.append(headline + ".")
+    if summary and summary not in headline:
+        lines.append(summary)
+    if steps:
+        lines.extend(f"{i}. {step}" for i, step in enumerate(steps, 1))
+    elif notes:
+        lines.append(f"Next: {notes[0]}")
+    else:
+        lines.append("No fix steps are recorded; the retry re-runs the failed node.")
+    lines.append(f"Command: {_recover_command(run, hint)}")
+    cost = _estimated_cost(hint)
+    if cost is not None:
+        lines.append(f"Estimated cost: {S.money(cost)}")
+    if strategy_raw in ("verify", "re-verify") or hint.get("verification") is True:
+        lines.append(_verification_wording(run))
+    return "\n".join(lines)
+
+
+def gate_attention_item(run) -> dict[str, Any] | None:
+    """The pending retry gate as one needs-you lane item, or ``None``.
+
+    The item carries the primary decision (Approve retry) plus a non-empty
+    explanation; the lane is the single place the retry decision renders, so
+    the outcome's own callout is dropped from the story tab when this exists.
+    The reject command is named in the detail rather than drawn as a second
+    board-gate control (the lane promises one decision, one block).
+    """
+    gate = _pending_gate(run)
+    if gate is None:
+        return None
+    inbox_id = str(gate.get("inbox_id") or "")
+    actions: list[dict[str, Any]] = []
+    if inbox_id:
+        actions.append(S.btn(
+            "Approve retry",
+            S.cli("board", "gate", "approve", inbox_id,
+                  confirm="Approve the retry and dispatch the fix?"),
+            "primary"))
+    lines = [ln.strip() for ln in _gate_explanation(run, gate).splitlines() if ln.strip()]
+    detail = "\n".join(lines[1:])
+    if inbox_id:
+        detail = (detail + "\n" if detail else "") + \
+            f"To leave the run as it is: mini-ork board gate reject {inbox_id}."
+    return {
+        "id": f"gate:{inbox_id or getattr(run, 'id', 'run')}",
+        "t": lines[0] if lines else "This run needs your decision.",
+        "sub": detail,
+        "acts": actions,
+    }
+
+
 def _gate_needs_you(run, gate: dict[str, Any]) -> dict[str, Any]:
     hint = _gate_hint(gate)
     nc = hint.get("needs_change")
     summary = str((nc or {}).get("summary") or "") if isinstance(nc, dict) else ""
     inbox_id = str(gate.get("inbox_id") or "")
-    steps: list[str] = []
-    if hint:
-        try:
-            from mini_ork.recovery import retry_notify
-
-            steps = retry_notify.fix_steps(hint, home=run.home)
-        except Exception:  # noqa: BLE001 — a broken steps renderer must not blank the gate
-            steps = []
-    text_md = "\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1))
+    text_md = _gate_explanation(run, gate)
     callout = S.callout(
-        "This run needs your decision", text_md, tone="orange",
+        GATE_CALLOUT_TITLE, text_md, tone="orange",
         actions=[
             S.btn("Approve retry",
                   S.cli("board", "gate", "approve", inbox_id,

@@ -744,6 +744,183 @@ def _merge_review_section(run: Run) -> list[dict[str, Any]]:
                       "primary")])]
 
 
+# ── the needs-you lane (v2 only) ───────────────────────────────────────────
+#
+# One ordered list of every decision on the run that waits on a person — the
+# parked review, the open retry gate, a cost pause, a merge approval, an
+# unanswered ask — emitted as ONE section at the top of every v2 tab. Empty
+# sources contribute nothing: a healthy run gets no section at all, never an
+# empty "Needs you" box. Each source is built behind its own try/except so a
+# broken part costs that item, never the tab (the same rule the rest of the
+# page follows).
+
+
+def _attention_item(text: str, detail: str, *, item_id: str,
+                    actions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """One lane item: ``id``, text, optional detail and its own buttons.
+
+    ``spec.item``'s shape carries the rendering; ``id`` is additive (an IDE
+    that does not know it ignores the key) and stable across renders so the
+    lane cannot shuffle under the operator between two builds.
+    """
+    item = S.item(text, detail, acts=actions or [])
+    item["id"] = item_id
+    return item
+
+
+def _parked_attention_items(run: Run) -> list[dict[str, Any]]:
+    """The parked run's review decision, or ``[]`` when the run is not parked."""
+    if not _is_parked_run(run):
+        return []
+    awaiting = _pending_node_ids(run)
+    if awaiting:
+        first = awaiting[0]
+        actions = [
+            S.btn("Approve",
+                  S.cli("approvals", "approve", run.id, "--node", first,
+                        confirm=f"Approve {first}'s output and resume the run?",
+                        home=False),
+                  "primary"),
+            S.btn("Request changes…",
+                  S.thread(f"/request-changes {run.id} {first} "),
+                  "default"),
+        ]
+        return [_attention_item(
+            f"Paused for human review of: {', '.join(awaiting)}.",
+            "Approve a node to resume, or request changes with a note.",
+            item_id=f"review:{run.id}:{first}", actions=actions)]
+    return [_attention_item(
+        "The run is paused for a human review. Open its node pages to approve "
+        "or request changes.",
+        "No node-review row names which node stopped it.",
+        item_id=f"review:{run.id}")]
+
+
+def _gate_attention_items(run: Run, outcome: dict[str, Any]) -> list[dict[str, Any]]:
+    """The open retry gate, when the outcome is a needs-you decision."""
+    if str(outcome.get("state") or "") != "needs_you":
+        return []
+    item = O.gate_attention_item(run)
+    return [item] if isinstance(item, dict) else []
+
+
+def _cost_pause_attention_items(run: Run) -> list[dict[str, Any]]:
+    """The cost-cap pause, or ``[]`` when the run is not paused on budget."""
+    try:
+        paused = (run.run_dir / ".cost-pause").is_file()
+    except OSError:
+        return []
+    if not paused:
+        return []
+    return [_attention_item(
+        "Paused at the cost cap",
+        "The run stopped spending at its budget cap. Resuming continues from "
+        "the same step with the remaining budget.",
+        item_id=f"cost-pause:{run.id}",
+        actions=[S.btn("Resume",
+                       S.cli("board", "resume", run.id,
+                             confirm=f"Resume cost-paused {run.id}?"),
+                       "primary")])]
+
+
+def _merge_attention_items(run: Run) -> list[dict[str, Any]]:
+    """The human merge approval, while the run still awaits it."""
+    if run.workspace is None:
+        return []
+    try:
+        from mini_ork.gates.review_policy import load_policy
+
+        policy = load_policy(home=run.home)
+    except Exception:  # noqa: BLE001 — a missing policy is not an error
+        return []
+    if str(getattr(policy, "before_merge", "off")) != "required":
+        return []
+    try:
+        from mini_ork.gates import merge_approval
+
+        st = merge_approval.status(run.id, db_path=str(run.home / "state.db"))
+    except Exception:  # noqa: BLE001 — a missing inbox row is "none"
+        st = {"state": "none", "approver": "", "inbox_id": None}
+    state = str(st.get("state") or "none")
+    if state == "approved":
+        # Nothing waits on a person: no item, hence no empty needs-you box.
+        return []
+    text = "Merge approval needed"
+    if state != "none":
+        text += f" · {state}"
+    return [_attention_item(
+        text, "A human must approve the merge before this run lands.",
+        item_id=f"merge:{run.id}",
+        actions=[S.btn("Approve merge",
+                       S.cli("approvals", "approve", run.id,
+                             confirm=f"Approve merging {run.id} into the base branch?",
+                             home=False),
+                       "primary")])]
+
+
+def _ask_attention_items(run: Run) -> list[dict[str, Any]]:
+    """One item per unanswered ``asks/ask-N.json``, in ask order."""
+    out: list[dict[str, Any]] = []
+    for ask in open_asks(run.run_dir):
+        question = str(ask.get("question") or "").strip()
+        if not question:
+            continue
+        detail: list[str] = []
+        options = [str(o) for o in ask.get("options") or [] if str(o).strip()]
+        if options:
+            detail.append("Options: " + ", ".join(options))
+        if ask.get("default") is not None:
+            detail.append(f"If unanswered, the run uses: “{ask['default']}”")
+        detail.append("Answer on the Questions tab; the run continues from where it stopped.")
+        out.append(_attention_item(
+            question, "\n".join(detail),
+            item_id=f"ask:{ask.get('ask_id') or len(out)}",
+            actions=[S.btn("Answer",
+                           S.page_link("run", "questions", run=run.id),
+                           "primary")]))
+    return out
+
+
+def _attention_lane(run: Run, outcome: dict[str, Any]
+                    ) -> tuple[list[dict[str, Any]], set[str]]:
+    """``(sections, absorbed_callout_titles)`` for the needs-you lane.
+
+    Sources are appended in a fixed order (parked review, open gate, cost
+    pause, merge approval, open asks) and each is guarded on its own. When the
+    gate item is present the outcome's own callout is "absorbed": the story tab
+    drops it so the retry decision renders exactly once. No items → no section.
+    """
+    items: list[dict[str, Any]] = []
+    absorbed: set[str] = set()
+    try:
+        items.extend(_parked_attention_items(run))
+    except Exception:  # noqa: BLE001 — one broken source costs its item
+        pass
+    try:
+        gate_items = _gate_attention_items(run, outcome)
+        if gate_items:
+            items.extend(gate_items)
+            absorbed.add(O.GATE_CALLOUT_TITLE)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        items.extend(_cost_pause_attention_items(run))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        items.extend(_merge_attention_items(run))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        items.extend(_ask_attention_items(run))
+    except Exception:  # noqa: BLE001
+        pass
+    if not items:
+        return [], absorbed
+    return [S.lst("Needs you", items, full=True,
+                  note="Everything on this run that waits on a person.")], absorbed
+
+
 # ── node output ─────────────────────────────────────────────────────────────
 
 def _tail(path: Path, n: int) -> list[str]:
@@ -3268,7 +3445,8 @@ def _desc_fold(run: Run, outcome: dict[str, Any] | None = None, title: str = "")
 
 
 def _outcome_tab(run: Run, outcome: dict[str, Any],
-                 callout_actions: Iterable[dict[str, Any]] | None = None
+                 callout_actions: Iterable[dict[str, Any]] | None = None,
+                 absorbed: set[str] | tuple[str, ...] = ()
                  ) -> list[dict[str, Any]]:
     """The v2 outcome: what happened, what it was for, what it ran on.
 
@@ -3282,6 +3460,10 @@ def _outcome_tab(run: Run, outcome: dict[str, Any],
     ``callout_actions`` is the outcome's own buttons minus the ones the header
     draws, so the verdict carries the design's ``bodyActs`` without repeating
     a control the header already offers.
+
+    ``absorbed`` names the callouts the needs-you lane already carries (the
+    retry decision, when the lane owns it): they are dropped here so one
+    decision has one block on the tab.
     """
     triage = S.triage(outcome["text"], tone=outcome["tone"], icon=outcome["icon"],
                       detail=outcome["detail"], counts=outcome["counts"],
@@ -3295,6 +3477,7 @@ def _outcome_tab(run: Run, outcome: dict[str, Any],
     if str(outcome.get("reason") or "").strip():
         triage["reason"] = str(outcome["reason"]).strip()
     sections = [triage]
+    dropped = set(absorbed or ())
     # The reason, directly under the verdict it explains. The Overview tab has
     # always carried this list; the story tab had no path to it at all, so a
     # failure was stated and never explained.
@@ -3370,7 +3553,8 @@ def _outcome_tab(run: Run, outcome: dict[str, Any],
     # ``Seen before`` rides the failed card's callouts. It is prior art on the
     # same failure, so it belongs with the decision material below the narrative
     # — not wedged between the verdict and the reason that explains it.
-    sections.extend(outcome.get("callouts") or [])
+    sections.extend(c for c in outcome.get("callouts") or []
+                    if str(c.get("title") or "") not in dropped)
     sections.extend(S.guarded({}, "Diagnostics", lambda: diagnostics_sections(run)))
     # A live run can still be steered: the box runs ``mini-ork board steer
     # <run> --text <typed>``. Finished runs get no composer — there is nothing
@@ -3487,7 +3671,13 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
     if resolved not in keys:
         resolved = "dag"
     node = args.get("node")
-
+    # One needs-you lane, at the top of every v2 tab. ``absorbed`` names the
+    # outcome callouts the lane already owns, so the tab does not draw the
+    # retry decision twice. A broken lane costs the lane, never the tab.
+    try:
+        lane, absorbed = _attention_lane(run, outcome)
+    except Exception:  # noqa: BLE001 — a broken lane must not blank the page
+        lane, absorbed = [], set()
     # The header fields are the same on every tab: the label names the run and
     # the controls (Stop/Kill while it runs, Merge/Discard when it is done) sit
     # beside them, so a user on the DAG tab can still stop a runaway run.
@@ -3519,13 +3709,15 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
     sections = {
         "dag": lambda: _dag_tab(run, node, select=True, outcome=outcome,
                                 callout_actions=callout_actions),
-        "outcome": lambda: _outcome_tab(run, outcome, callout_actions),
+        "outcome": lambda: _outcome_tab(run, outcome, callout_actions, absorbed),
         "verification": lambda: _verification_tab(run),
         "kickoff": lambda: _kickoff_tab(run, code_presentation=True),
         "agents": lambda: _agents_tab(run),
         "learnings": lambda: _learnings_tab(run),
         "artifacts": lambda: _artifacts_tab(run, changes=True),
     }[resolved]()
+    if lane:
+        sections = lane + sections
 
     # The design's header strip: state, how far, what it cost, which recipe.
     # Placement and elapsed are this page's older chips; they trail the four
@@ -3611,19 +3803,17 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
         page["graph"] = _graph(run, args.get("node"))
         _attach_flow(page, run)
         return page
-    # r-ide-review: top-of-page review sections. Built once, returned (often
-    # empty) here, then prepended to whichever ``sections`` the tab picks.
-    review_sections = _parked_review_section(run) + _merge_review_section(run)
     if S.ide_level() >= 2:
+        # Level 2 owns the top slot with the single needs-you lane built inside
+        # ``_build_v2`` (parked review, open gate, cost pause, merge approval,
+        # open asks) — one decision, one block on every tab.
         page = _build_v2(run, tab, args)
         _attach_flow(page, run)
-        # Additive on the story / graph / kickoff / agents / learnings /
-        # artifacts tabs at level 2: prepend the review sections so they
-        # own the top slot an empty ``Waiting for your review`` callout
-        # already reserved on every parked run.
-        if review_sections and isinstance(page.get("sections"), list):
-            page["sections"] = review_sections + page["sections"]
         return page
+    # r-ide-review (level 1 only): top-of-page review sections. Built once,
+    # returned (often empty) here, then prepended to whichever ``sections``
+    # the tab picks. Level 2 folds these sources into the attention lane.
+    review_sections = _parked_review_section(run) + _merge_review_section(run)
     tab = tab if tab in {k for k, _ in TABS} else "dag"
     done = sum(1 for n in run.nodes if n.state == "done")
     chips = [_state_chip(run), S.chip(f"{done}/{len(run.nodes)} nodes"),

@@ -293,7 +293,10 @@ def test_build_v2_passes_the_header_to_the_page(tmp_path, monkeypatch) -> None:
         assert "Inspect run" in menu_labels
         assert isinstance(page["updated_at"], int)
         if tab == "story":
-            assert page["sections"][0]["actions"] == []
+            # The triage keeps the outcome's body actions (the design's
+            # ``bodyActs``) — but never a control the header already draws.
+            triage_labels = {a["label"] for a in page["sections"][0]["actions"]}
+            assert not triage_labels & {"Stop", "Kill"}
             assert page["sections"][0]["menu"] == []
 
 
