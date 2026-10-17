@@ -9,7 +9,9 @@ not equal the resolved target).
 The target-resolution ladder is byte-identical to ``_resolve_target_cwd``
 in :mod:`mini_ork.cli.execute`: explicit ``MO_TARGET_CWD`` git toplevel,
 then the kickoff's git toplevel, then an explicit ``MINI_ORK_TARGET_REPO``
-that resolves to a non-engine git repo, then the kickoff dir, then cwd. The
+that resolves to a non-engine git repo, then the kickoff dir, then cwd. A
+kickoff staged under ``MINI_ORK_HOME`` is exempt from the kickoff rungs: it
+lives in the engine checkout and declares no target. The
 two helpers exist side-by-side so a parity test can cross-check them — and
 ``_resolve_target_cwd`` is reduced to a thin wrapper that delegates here.
 
@@ -108,6 +110,18 @@ def _repo_under_engine_guard(src: Mapping[str, str]) -> str:
     return top
 
 
+def _path_within(path: str, root: str) -> bool:
+    """True when ``path`` is ``root`` or lives under it (realpath-compared)."""
+    if not path or not root:
+        return False
+    try:
+        resolved_path = os.path.realpath(path)
+        resolved_root = os.path.realpath(root)
+    except OSError:
+        return False
+    return resolved_path == resolved_root or resolved_path.startswith(resolved_root + os.sep)
+
+
 def resolve_run_roots(run_dir: str, *, env: Mapping[str, str] | None = None) -> RunRoots:
     """Resolve the run's four roots from ``run_dir`` + current env.
 
@@ -132,19 +146,42 @@ def resolve_run_roots(run_dir: str, *, env: Mapping[str, str] | None = None) -> 
                 kickoff = ""
         if kickoff and os.path.isfile(kickoff):
             kdir = os.path.dirname(kickoff)
-            target = _git_toplevel_from_dir(kdir)
-            if not target:
+            # A kickoff staged under the run home lives in the engine checkout
+            # (``<home>/kickoffs/`` or ``<home>/runs/``), so its toplevel says
+            # where the kickoff is stored, not where the change goes. Reading it
+            # as a target pinned a run launched from its target worktree onto
+            # the engine, and the ground-truth gate then compared the worktree's
+            # base with the engine's HEAD and failed a good change
+            # (run-1792224150-80303). `MINI_ORK_ROOT` == the launch cwd is the
+            # signal that the engine was started from the tree it should edit.
+            if _path_within(kickoff, src.get("MINI_ORK_HOME", "") or ""):
                 # An explicit MINI_ORK_TARGET_REPO is a stronger signal of intent
-                # than the bare kickoff dir, so honor it — but ONLY once the
-                # kickoff's own repo has been ruled out (the "kickoff repo wins
-                # over cwd" guarantee above stays intact), and never when it
-                # resolves to the engine (the CWT-A hazard). When nothing
-                # qualifies, fall back to the kickoff dir for bash parity.
+                # than any inferred tree, but never when it resolves to the
+                # engine (the CWT-A hazard).
                 target = _repo_under_engine_guard(src)
-            if not target:
-                # Bash parity: dirname(kickoff) on git failure — preserves the
-                # CWT-A corruption fix. Never fall through to os.getcwd().
-                target = kdir
+                if not target:
+                    engine_top = _git_toplevel(src.get("MINI_ORK_ROOT", "") or "")
+                    cwd_top = _git_toplevel(os.getcwd())
+                    if engine_top and engine_top == cwd_top:
+                        target = engine_top
+                if not target:
+                    target = _git_toplevel_from_dir(kdir)
+            else:
+                target = _git_toplevel_from_dir(kdir)
+                if not target:
+                    # An explicit MINI_ORK_TARGET_REPO is a stronger signal of
+                    # intent than the bare kickoff dir, so honor it — but ONLY
+                    # once the kickoff's own repo has been ruled out (the
+                    # "kickoff repo wins over cwd" guarantee above stays
+                    # intact), and never when it resolves to the engine (the
+                    # CWT-A hazard). When nothing qualifies, fall back to the
+                    # kickoff dir for bash parity.
+                    target = _repo_under_engine_guard(src)
+                if not target:
+                    # Bash parity: dirname(kickoff) on git failure — preserves
+                    # the CWT-A corruption fix. Never fall through to
+                    # os.getcwd().
+                    target = kdir
     if not target:
         target = explicit or os.getcwd()
 
