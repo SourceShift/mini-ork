@@ -563,6 +563,116 @@ def _first_failed_node(run):
     return None
 
 
+# ── fault attribution ──────────────────────────────────────────────────────
+#
+# J24/C25: a failed run must answer "is this a mini-ork bug or a task fault?".
+# The verdict is NOT re-derived here — ``mini_ork.triage.blame.attribute`` owns
+# the rules (framework traceback frames → ``mini_ork``, a legitimate artifact
+# verdict or consumer-side traceback → ``consumer``, infra / unlocalisable →
+# ``unknown``). This page only feeds it the fields the run carries and renders
+# the answer. Every failure on the way — a missing module, an unreadable or
+# absent node log, a malformed node — fails closed to ``unknown``: a broken
+# diagnostic must never blank the outcome card or raise into the board.
+
+_BLAME_CALLOUT_TITLE = "Whose fault is this"
+_OPEN_TRIAGE_CONFIRM = "File a bug and queue a framework-edit fix epic?"
+
+
+def _failed_node_log(run, node_id: str) -> str:
+    """A bounded tail of the failed node's log, or ``""`` — never raises.
+
+    ``triage.failures._find_node_log`` already knows every stem a node's log is
+    written under (``verifier-<stem>.log``, ``<stem>.log``, ``impl-<stem>.log``,
+    ``logs/``, ``evidence/``) and reads only a bounded tail, so the page render
+    path reuses it rather than re-deriving the convention. Imported lazily: the
+    page never drags the triage I/O driver in at module load.
+    """
+    run_dir = getattr(run, "run_dir", None)
+    if run_dir is None or not node_id:
+        return ""
+    try:
+        from mini_ork.triage import failures as failures_mod
+
+        return failures_mod._find_node_log(Path(run_dir), node_id)
+    except Exception:  # noqa: BLE001 — a log read must never blank the card
+        return ""
+
+
+def _attribute_failure(run) -> tuple[str, list[Any]]:
+    """``(verdict, evidence)`` for the story's first failed node, fail-closed.
+
+    Uses exactly the fields the run page has (node id, type, ``finish`` and a
+    best-effort log excerpt); ``NodeFailure`` carries no exit code, and inventing
+    one would mean editing ``mini_ork/triage/`` (out of scope). Any failure —
+    missing ``triage`` module, unreadable log, bad node data — returns
+    ``("unknown", [])``: "we could not tell" is the honest verdict, never a
+    guess at the framework's fault.
+    """
+    try:
+        from mini_ork.triage import blame as blame_mod
+
+        first = _first_failed_node(run)
+        if first is None:
+            failure = blame_mod.NodeFailure(node_id="")
+        else:
+            node_id = str(getattr(first, "id", "") or "")
+            failure = blame_mod.NodeFailure(
+                node_id=node_id,
+                node_type=str(getattr(first, "type", "") or ""),
+                finish_reason=str(getattr(first, "finish", "") or "") or None,
+                log_excerpt=_failed_node_log(run, node_id),
+            )
+        verdict, evidence = blame_mod.attribute(failure)
+        return str(verdict), list(evidence)
+    except Exception:  # noqa: BLE001 — attribution optional: the card still renders
+        return "unknown", []
+
+
+def _first_evidence_line(evidence: list[Any]) -> str:
+    """The first non-empty ``Evidence.detail``, or ``""``."""
+    for item in evidence:
+        detail = str(getattr(item, "detail", "") or "").strip()
+        if detail:
+            return detail
+    return ""
+
+
+def _blame_sentence(verdict: str, evidence: list[Any]) -> str:
+    """The kickoff's one plain-words sentence for the blame verdict.
+
+    Each sentence names the first evidence line, so the operator can see *why*
+    the verdict was reached instead of trusting an unattributed label.
+    """
+    line = _first_evidence_line(evidence) or "no evidence line was recorded"
+    if verdict == "mini_ork":
+        return f"Looks like a mini-ork fault ({line}) — fix it at the source."
+    if verdict == "consumer":
+        return f"Looks like a task fault ({line}) — retry the failure, or adjust the kickoff."
+    return ("Can't tell yet whether this is a mini-ork fault or a task fault "
+            f"— the evidence is {line}.")
+
+
+def _blame_callout(run, verdict: str, evidence: list[Any]) -> dict[str, Any]:
+    """The failure-only blame callout, with ``Open triage`` on a mini-ork fault.
+
+    ``Open triage`` writes (it files a bug and queues a fix epic), so it is
+    confirm-gated; ``consumer`` / ``unknown`` add no button — the card's retry
+    actions already carry the task-fault path, and duplicating a retry here
+    would race the needs-you lane's single decision.
+    """
+    actions: list[dict[str, Any]] = []
+    if verdict == "mini_ork":
+        actions.append(S.btn(
+            "Open triage",
+            S.cli("triage", "--run", run.id, "--promote",
+                  confirm=_OPEN_TRIAGE_CONFIRM),
+            "primary",
+        ))
+    tone = "red" if verdict == "mini_ork" else "orange"
+    return S.callout(_BLAME_CALLOUT_TITLE, _blame_sentence(verdict, evidence),
+                     tone=tone, actions=actions)
+
+
 def _nameable(run, node_id: str) -> str:
     """``node_id`` unless the story says that node is done/passed (then ``""``).
 
@@ -994,7 +1104,13 @@ def _failed(run, hint: dict[str, Any] | None) -> dict[str, Any]:
     # nothing to compare against. The callout is added directly here
     # (rather than via ``_menu`` / ``_counts``) so the section is bound
     # to the failed card specifically.
-    callouts: list[dict[str, Any]] = []
+    # Fault attribution (J24/C25) rides only the failed card: whose bug is it,
+    # and — for a mini-ork fault — the confirm-gated triage action. It is added
+    # before the seen-before evidence so the answer to "what next?" precedes
+    # the supporting memories. ``consumer`` / ``unknown`` add no button; the
+    # retry actions above already carry the task-fault path.
+    blame_verdict, blame_evidence = _attribute_failure(run)
+    callouts: list[dict[str, Any]] = [_blame_callout(run, blame_verdict, blame_evidence)]
     seen = _seen_before_section(run)
     if seen is not None:
         callouts.append(seen)
@@ -1006,6 +1122,7 @@ def _failed(run, hint: dict[str, Any] | None) -> dict[str, Any]:
         "detail": detail,
         "actions": actions,
         "callouts": callouts,
+        "blame": blame_verdict,
     }
 
 
