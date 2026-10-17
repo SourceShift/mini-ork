@@ -760,6 +760,73 @@ _ARTIFACT_BASENAME_RE = re.compile(
 
 
 _git_cache: dict[str, set | None] = {}
+# Repo identities are keyed by the *path as given*. A harvest walks many run
+# dirs that may share one target repo, so recomputing `git rev-parse` per row
+# would both cost wall-clock and make the write path depend on git succeeding
+# every time.
+_repo_identity_cache: dict[str, str | None] = {}
+
+
+def repo_identity(path) -> str | None:
+    """The identity of the repository a path belongs to (LF-R12 §2).
+
+    ``git -C <path> rev-parse --path-format=absolute --git-common-dir`` returns
+    the COMMON git dir: for a plain checkout ``<repo>/.git``, and for a linked
+    worktree the main checkout's ``.git``. The identity is the realpath of that
+    dir's parent, so every worktree of one repository shares one identity and a
+    finding harvested in run A can be offered to run B only when both target
+    the same repository.
+
+    A path that exists but is not a git checkout (or a git command that fails)
+    falls back to ``os.path.realpath(path)``; a missing path — including
+    ``None`` and ``""`` — returns ``None``, which is also the ENGINE-LOCAL
+    marker for a row with no recorded repo. Results are cached per path and the
+    function never raises: it runs on the harvest write path, where an
+    exception would leave a run unmarked and re-dispatched forever.
+    """
+    try:
+        key = str(path) if path is not None else ""
+        if not key:
+            return None
+        if key in _repo_identity_cache:
+            return _repo_identity_cache[key]
+        result: str | None = None
+        if os.path.exists(key):
+            try:
+                out = subprocess.run(
+                    ["git", "-C", key, "rev-parse", "--path-format=absolute",
+                     "--git-common-dir"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                common = (out.stdout or "").strip()
+                if out.returncode == 0 and common:
+                    result = os.path.realpath(os.path.dirname(common.splitlines()[0]))
+                else:
+                    result = os.path.realpath(key)
+            except (OSError, subprocess.SubprocessError):
+                result = os.path.realpath(key)
+        _repo_identity_cache[key] = result
+        return result
+    except Exception:  # noqa: BLE001 — identity is advisory; never break harvest
+        return None
+
+
+def engine_repo_identity(root=None) -> str | None:
+    """The engine checkout's identity: ``repo_identity(MINI_ORK_ROOT)``, else
+    ``repo_identity`` of the package's parent (the mini-ork repository root).
+
+    ``root`` lets callers pass a context-scoped ``MINI_ORK_ROOT`` (context_v2
+    reads it through ``context_env``) instead of the process env. Never raises.
+    """
+    try:
+        if not root:
+            root = os.environ.get("MINI_ORK_ROOT") or os.path.dirname(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        return repo_identity(root)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _git_ls_files(repo) -> set | None:
@@ -853,8 +920,8 @@ def _open(db=None) -> sqlite3.Connection | None:
     return con
 
 
-# Byte-consistent with db/migrations/0064_code_findings.sql (see prior-art
-# lens: ensure_schema DDL must not drift from the migration).
+# Byte-consistent with db/migrations/0064_code_findings.sql + 0078 (see
+# prior-art lens: ensure_schema DDL must not drift from the migrations).
 _DDL = """
 CREATE TABLE IF NOT EXISTS code_findings (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -868,7 +935,8 @@ CREATE TABLE IF NOT EXISTS code_findings (
     issue        TEXT    NOT NULL,
     snippet      TEXT,
     verdict      TEXT,
-    ts           INTEGER NOT NULL
+    ts           INTEGER NOT NULL,
+    target_repo  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_code_findings_file     ON code_findings(file);
 CREATE INDEX IF NOT EXISTS idx_code_findings_run_id   ON code_findings(run_id);
@@ -881,15 +949,35 @@ CREATE TABLE IF NOT EXISTS code_findings_runs (
 """
 
 
+def _has_column(con, table: str, column: str) -> bool:
+    try:
+        return any(r[1] == column for r in con.execute(f"PRAGMA table_info({table})"))
+    except sqlite3.Error:
+        return False
+
+
 def ensure_schema(db=None) -> None:
-    """Idempotent CREATE TABLE + CREATE INDEX. Never raises — a CREATE failure
-    is a warning, not a stop-the-line event.
+    """Idempotent CREATE TABLE + CREATE INDEX, plus the LF-R12 ``target_repo``
+    ALTER. Never raises — a CREATE failure is a warning, not a stop-the-line
+    event.
+
+    ``CREATE TABLE IF NOT EXISTS`` is a no-op on a DB migrated past 0064, so the
+    new column is added explicitly when missing. This is the same column
+    ``0078_code_findings_target_repo.sql`` adds: a runtime ensure_schema may
+    reach the DB before that migration is recorded, and the migration's guarded
+    ALTER must then be a no-op (see the migration's header).
     """
     con = _open(db)
     if con is None:
         return
     try:
         con.executescript(_DDL)
+        if not _has_column(con, "code_findings", "target_repo"):
+            con.execute("ALTER TABLE code_findings ADD COLUMN target_repo TEXT")
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_code_findings_target_repo "
+            "ON code_findings(target_repo)"
+        )
         con.commit()
     except sqlite3.Error as e:
         print(f"  [warn] code_findings: ensure_schema failed: {e}", file=sys.stderr)
@@ -1007,6 +1095,11 @@ def _harvest_run(con, run_id, run_dir, repo_root):
     skipped = 0
     paths = _git_ls_files(repo_root)
     target_cwd = _run_target_cwd(run_dir)
+    # LF-R12 §3: every row this run inserts remembers WHICH repo the run
+    # targeted, so context_v2 and the "Your code" tab never offer a finding to
+    # an unrelated checkout. A run with no profile (or a cwd that is no longer
+    # on disk) stamps NULL — the ENGINE-LOCAL legacy shape, not a wildcard.
+    target_repo = repo_identity(target_cwd)
     # A run's verdict file echoes the findings its reviewers already reported, so
     # one structured finding lands twice in the same run (the kickoff's 38 doubled
     # rows): once as the reviewer's own source and once as ``review:verdict``.
@@ -1040,8 +1133,8 @@ def _harvest_run(con, run_id, run_dir, repo_root):
                 """
                 INSERT OR IGNORE INTO code_findings
                     (fingerprint, run_id, source, file, line, severity, category,
-                     issue, snippet, verdict, ts)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     issue, snippet, verdict, ts, target_repo)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     fingerprint,
@@ -1055,6 +1148,7 @@ def _harvest_run(con, run_id, run_dir, repo_root):
                     finding["snippet"],
                     finding["verdict"],
                     ts,
+                    target_repo,
                 ),
             )
             inserted = int(cur.rowcount or 0)
@@ -1426,6 +1520,72 @@ def reharvest(home, *, db=None) -> dict:
     return stats
 
 
+def backfill_target_repo(home, *, db=None) -> int:
+    """Fill ``target_repo`` on NULL rows whose run dir still has a profile.
+
+    LF-R12 §3: rows harvested before the column existed carry NULL, which the
+    readers treat as ENGINE-LOCAL. This walks the distinct run ids of those rows
+    and, for each run dir under ``home/runs`` that still has a
+    ``run_profile.json`` naming a target cwd, stamps
+    ``repo_identity(_run_target_cwd(run_dir))``. A run whose dir is gone, has no
+    profile, or whose target no longer exists keeps NULL — there is no identity
+    to recover, and inventing one would be worse than the legacy marker.
+
+    Idempotent: the UPDATE is scoped to ``target_repo IS NULL``, so a second
+    call returns 0. Cold-safe and never raises — a missing home or DB is a
+    silent no-op returning 0 (tests and the CLI pass explicit paths; the live DB
+    is never implied). Returns the number of rows updated.
+    """
+    if not home or not os.path.isdir(home):
+        return 0
+    try:
+        ensure_schema(db)
+        con = _open(db)
+        if con is None:
+            return 0
+        try:
+            try:
+                run_ids = [r[0] for r in con.execute(
+                    "SELECT DISTINCT run_id FROM code_findings "
+                    "WHERE target_repo IS NULL")]
+            except sqlite3.Error as e:
+                print(f"  [warn] code_findings: backfill failed: {e}", file=sys.stderr)
+                return 0
+            runs_dir = os.path.join(home, "runs")
+            filled = 0
+            for run_id in run_ids:
+                if not run_id:
+                    continue
+                run_dir = os.path.join(runs_dir, str(run_id))
+                if not os.path.isdir(run_dir):
+                    continue
+                if not os.path.isfile(os.path.join(run_dir, "run_profile.json")):
+                    continue
+                ident = repo_identity(_run_target_cwd(run_dir))
+                if not ident:
+                    continue
+                try:
+                    cur = con.execute(
+                        "UPDATE code_findings SET target_repo = ? "
+                        "WHERE run_id = ? AND target_repo IS NULL",
+                        (ident, run_id),
+                    )
+                    filled += int(cur.rowcount or 0)
+                except sqlite3.Error as e:
+                    print(f"  [warn] code_findings: backfill {run_id} failed: {e}",
+                          file=sys.stderr)
+            con.commit()
+            return filled
+        finally:
+            try:
+                con.close()
+            except sqlite3.Error:
+                pass
+    except Exception as e:  # noqa: BLE001 — cold-safe by contract
+        print(f"  [warn] code_findings: backfill failed: {e}", file=sys.stderr)
+        return 0
+
+
 # ── read-only queries ─────────────────────────────────────────────────────────
 
 
@@ -1655,6 +1815,8 @@ def _print_human(cmd, result) -> None:
         print(f"cleared {result} artifact file path(s)")
     elif cmd == "reharvest":
         print(f"reharvested {result['runs']} run(s), {result['findings']} finding(s)")
+    elif cmd == "backfill-target-repo":
+        print(f"backfilled {result} finding row(s) with a target repo")
     else:  # show
         for r in result:
             loc = r["file"] or ""
@@ -1694,6 +1856,8 @@ def main(argv=None) -> int:
                    help="NULL the file on findings filed under run artifacts")
     sub.add_parser("reharvest", parents=[common],
                    help="re-read every run dir that still exists under home/runs")
+    sub.add_parser("backfill-target-repo", parents=[common],
+                   help="stamp target_repo on NULL rows from their run profiles")
 
     args = ap.parse_args(argv)
     home = args.home or os.environ.get("MINI_ORK_HOME") or _DEFAULT_HOME
@@ -1710,6 +1874,8 @@ def main(argv=None) -> int:
         result = clear_artifact_files(db=args.db)
     elif args.cmd == "reharvest":
         result = reharvest(home, db=args.db)
+    elif args.cmd == "backfill-target-repo":
+        result = backfill_target_repo(home, db=args.db)
     else:  # show
         result = findings_for(args.path, db=args.db)
 

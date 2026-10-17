@@ -55,6 +55,7 @@ from mini_ork.learning.code_findings import (
     _in_repo,
     _run_title,
     areas,
+    engine_repo_identity,
 )
 from mini_ork.learning.themes import (
     _df_to_idf,
@@ -296,6 +297,12 @@ def _areas_table(home: Path, args: dict[str, str]) -> dict[str, Any]:
     for a in rows:
         key = str(a.get("key") or a["area"])
         fs = _membership(all_fs, key)
+        if not fs:
+            # ``areas()`` rolls up every repo in the window; the tab shows one
+            # repo's findings. An area with no row in the repo-scoped set (it
+            # belongs to another target repo) would otherwise render as a
+            # zero-count row, so it is not a row of this tab at all.
+            continue
         n_runs, worst = _area_stats(fs)
         prepared.append((key, str(a["area"]), fs, n_runs, worst))
     # Same ordering rule as ``_aggregate_areas`` — worst first, then most findings
@@ -395,8 +402,22 @@ def _group_key(file: Any, depth: int = _DEPTH) -> str:
     return _dir_prefix(f, depth) or f
 
 
+def _has_target_repo(conn) -> bool:
+    """True when the DB carries the LF-R12 ``target_repo`` column.
+
+    A DB migrated only to 0064 has no such column; filtering on it would make
+    the SQL raise and blank the tab, so the repo predicate is skipped there.
+    """
+    try:
+        return any(r.get("name") == "target_repo"
+                   for r in conn.rows("PRAGMA table_info(code_findings)"))
+    except Exception:  # noqa: BLE001 — a page section must never raise
+        return False
+
+
 def _window_findings(db: str, *, since_days: int, repo_only: bool = True,
-                     repo_root: str | None = None) -> list[dict[str, Any]]:
+                     repo_root: str | None = None,
+                     target_repo: str | None = None) -> list[dict[str, Any]]:
     """Every finding in the ``since_days`` window, newest first — the one set the
     areas table partitions and the detail filters.
 
@@ -404,6 +425,15 @@ def _window_findings(db: str, *, since_days: int, repo_only: bool = True,
     the exact ones ``areas()`` applies (kickoff #4; reviewer, round 1), so the
     groups that table renders partition *this* set and their counts sum to it
     (reviewer, round 2).
+
+    LF-R12 §5: ``target_repo`` is the tab's repo identity. Only rows whose
+    ``target_repo`` equals it are shown, plus NULL rows when that identity IS the
+    engine checkout (NULL is ENGINE-LOCAL, never a wildcard). The predicate is
+    pushed into the SQL ``WHERE`` — never a post-hoc Python filter — so it
+    composes with the window and cannot re-create the prefix/LIMIT defects this
+    file already fixed (f:6c09169399, f:51c3c885a5). When unset it resolves to
+    the engine identity; an unresolvable identity keeps only NULL rows, so the
+    tab fails closed rather than showing every repo's findings.
 
     Read-only throughout: ``StateDB`` opens with ``query_only=ON``, the page's own
     convention (see ``_harvest_summary``).
@@ -418,7 +448,21 @@ def _window_findings(db: str, *, since_days: int, repo_only: bool = True,
     if not conn.has_table("code_findings"):
         return []
     join = conn.has_table("task_runs")
-    fs = _select_findings(conn, "f.file IS NOT NULL", [], cutoff, join)
+    where, params = "f.file IS NOT NULL", []
+    if _has_target_repo(conn):
+        if target_repo is None:
+            target_repo = engine_repo_identity()
+        if not target_repo:
+            # Fail closed: no resolvable identity means only the legacy
+            # engine-local rows are intelligible.
+            where += " AND f.target_repo IS NULL"
+        elif target_repo == engine_repo_identity():
+            where += " AND (f.target_repo = ? OR f.target_repo IS NULL)"
+            params.append(target_repo)
+        else:
+            where += " AND f.target_repo = ?"
+            params.append(target_repo)
+    fs = _select_findings(conn, where, params, cutoff, join)
     if repo_only and fs:
         keep = _in_repo({str(f["file"]) for f in fs if f.get("file")}, repo_root)
         fs = [f for f in fs if f.get("file") in keep]
