@@ -1058,6 +1058,8 @@ tip's SHA, and that the correction of record then did the same thing one tip lat
 
 - **`ahead` = 3, invariant.** Local `main` (`2eefcbc1`) carries three commits `origin/main` does not,
   and that does not move while nobody commits to the primary's local `main`.
+  **[Round 16: the condition no longer holds — at tip `c7a84dc5` the shared checkout reads
+  **7 ahead / 31 behind**, so `ahead` is conditional, not invariant, and people do commit locally.]**
 - **`behind` tracks the tip and is never a standing fact:** 10 when the tip was `19b1b267`, **16 now**
   (tip `c45b0390`). It grows every time a peer lands. Quoting "behind" without its tip is quoting
   half a fact.
@@ -1146,7 +1148,9 @@ against an unresolvable SHA would be the fabrication the SHA itself already is.
 **The ladder, in the tip-relative form that survives a moving origin** (`rev-list --left-right --count
 <tip>...main`): `0af700ca` → 8 / 3, `19b1b267` → 10 / 3, `d8633608` → 15 / 3. **`ahead` is 3 at every
 rung** — local `main`'s own commits do not move — while `behind` is a reading taken against a tip and
-means nothing without it. This supersedes the single pairs in rounds 9 and 10.
+means nothing without it. **[Round 16: falsified at tip `c7a84dc5` — the shared checkout reads
+7 ahead / 31 behind, and local `main` gained commits, so `ahead` is not a standing fact either.]**
+This supersedes the single pairs in rounds 9 and 10.
 
 **A correction aimed at the wrong document — recorded, not silently accepted.** `mini-ork-df` corrected
 "your own C-24 rule" and "your C-26 wording" describing a loop of *"a fetch, a rebase, a fast-forward
@@ -1254,7 +1258,9 @@ it.
 
 **Blocker, verified — the guard working, not a defect.** The repoint is atomic with the hook-message
 change, because `tests/unit/test_githooks_py.py:141` pins `"scripts/mini-ork-worktree.sh create
-<task-slug>"` in the hook's stderr verbatim. And `lf-r14` holds the ownership claim on **both**
+<task-slug>"` in the hook's stderr verbatim. **[Round 16: this line citation is stale — `363b8562`
+added 218 lines to that test file and the pin moved to `:200`; the stable citation is the assertion
+string, not the line number.]** And `lf-r14` holds the ownership claim on **both**
 `.githooks/post-commit` and `tests/unit/test_githooks_py.py` (`$WORKTREES_DIR/.ownership:61-62`), so a
 worktree that tries to make the edit is refused at create — correctly, on the live run. Land it when
 `lf-r14` frees the file.
@@ -1320,10 +1326,58 @@ gone and **both claims are released**: the registry now carries **no** line for 
 only surviving `lf-r14` reference is the `learning-fixes` dispatcher's claim on
 `kickoffs/auto/lf-r14-reversion-guard.md` — its own kickoff, unrelated to the edit. So the
 repoint-then-delete remedy is **unblocked**: `reference-transaction:105` → `.py`, `AGENTS.md:50`'s
-false *"is what the targets call"* → corrected, and the `test_githooks_py.py:141` pin updated in the
+false *"is what the targets call"* → corrected, and the `test_githooks_py.py:141` pin (now `:200` — see round 16) updated in the
 same atomic change.
 
 First claim stays with `mini-ork-df`, which found the remedy and said it would land it when the file
 freed. If it is not taken, this session takes it — the two are the same change and must not be made
 twice.
+
+## Delivery — round 16 (the repoint lands; and two of my own line-number claims were stale)
+
+**The `.sh` repoint landed — `c7a84dc5`, verified on the pushed copy.** `mini-ork-df` took the first
+claim and made the atomic change. Checked at `origin/main`, not in the worktree, and the tip *was* the
+commit (`origin/main` → `c7a84dc5`):
+
+- **Shape:** exactly three files, 14+/10− (`.githooks/reference-transaction`, `AGENTS.md`,
+  `tests/unit/test_githooks_py.py`). The `.sh` is **not** among them — Phase 4's deletion stayed
+  separate, as required.
+- **The hook now prints the live driver:** `reference-transaction:105` →
+  `scripts/mini_ork_worktree.py create <task-slug>`.
+- **The `:79` comment moved too, and it was a *third* false pointer.** Both drivers set
+  `ALLOW_WORKTREE_BRANCH_CREATE=1` (`.py:541-542`, `.sh:206-207`), so the comment was not wrong — it
+  named the retiring driver while explaining a guard that exists for the live one. It now names the
+  `.py`.
+- **`AGENTS.md:50`'s false clause is gone,** replaced by a statement of which driver runs and — better
+  than a silent repoint — the `.sh`'s own defect recorded where an operator would read it (*"it
+  re-rebases without re-fetching inside the lock"*).
+- **Claims released:** `grep` for the three paths in `$WORKTREES_DIR/.ownership` → **0**.
+- Peer-reported: the hook was re-parsed with `python3 -c compile(...)` before anything ran (a syntax
+  error there is a repo-wide outage, not a red test), and the scoped gate
+  `tests/unit/test_githooks_py.py` → **22 passed**.
+
+**Two of my own citations were stale, and the way they went stale is the point.**
+
+1. **`tests/unit/test_githooks_py.py:141` is no longer the pin — it is `:200`.** Round 14 cited `:141`;
+   `363b8562` added 218 lines to that same file ahead of the assertion, so a line number that was
+   correct when read became wrong when *someone else's* commit merged. `:141` is now a blank line.
+   **The stable citation is the assertion string** (`"scripts/mini_ork_worktree.py create
+   <task-slug>"`), which is what the test actually pins and what a reader can grep. A line number is
+   a claim against a file that other sessions are editing; the string is a claim against the file's
+   content. Corrected in place at round 14 and here.
+2. **"`ahead` is 3, invariant" is falsified — the shared checkout now reads 7 ahead / 31 behind at
+   `c7a84dc5`.** Round 12's bullet was *conditionally* right ("that does not move while nobody commits
+   to the primary's local `main`"), but the ladder line dropped the condition, and the condition was
+   violated: local `main` gained four commits. So `ahead` is not a standing fact either — only
+   `behind` was ever trivial to see through, and it needs its tip; `ahead` needs its condition.
+
+**Not done, and correctly so:** `mini-ork-df` found local `main` at 7 ahead / 31 behind and
+`git merge --ff-only origin/main` refusing (it later reported the same 7/31 from its side), and
+stopped — no reset, no plain merge. That is the right call: reconciling a divergence that is not
+yours hides whose commits were dropped. It clears when the local commits are pushed or discarded, by
+their owner.
+
+**Phase 4 (deleting `scripts/mini-ork-worktree.sh`) remains open and separate.** After this landing the
+script has zero pointers and zero call sites; the delete is a plain `git rm` plus whatever the bash
+removal plan's checklist still asks for.
 
