@@ -22,6 +22,7 @@ from typing import Any
 from mini_ork.ide_pages import _cn as _CN
 from mini_ork.ide_pages import outcome as O
 from mini_ork.ide_pages import spec as S
+from mini_ork.ide_pages.run_header import build_header
 from mini_ork.ide_pages.cn_file import (
     _SECTION_BY_FILE as _CN_FILE_BY_FILE,
     _fetch_by_file as _cn_file_fetch_by_file,
@@ -514,13 +515,19 @@ def _sub(run: Run) -> str:
 
 
 def _stop_kill_actions(run: Run) -> list[dict[str, Any]]:
-    """Stop / Kill — the two controls a running run offers."""
+    """Stop / Kill — the two controls a running run offers.
+
+    ``pending`` is what the button says while the command runs and ``done``
+    the toast it shows after; a Stop takes effect at the next node boundary,
+    so its toast says *when* rather than pretending the run is gone.
+    """
     return [
         S.btn("Stop", S.cli("board", "stop", run.id,
-                            confirm="Stop this run after its current node?"), "warn"),
+                            confirm="Stop this run after its current node?"), "warn",
+              pending="Stopping…", done="Run will stop after this node"),
         S.btn("Kill", S.cli("board", "kill", run.id,
                             confirm=f"Kill {run.id}? SIGTERM, then SIGKILL after 2 s."),
-              "danger"),
+              "danger", pending="Killing…", done="Run killed"),
     ]
 
 
@@ -534,7 +541,12 @@ def _discard_action(run: Run) -> dict[str, Any] | None:
 
 
 def _review_actions(run: Run) -> list[dict[str, Any]]:
-    """Merge / Discard — the decision a finished run with a worktree needs."""
+    """Merge / Discard — the decision a finished run with a worktree needs.
+
+    The toasts name the branch the merge landed in (or that the worktree is
+    gone), so the operator does not have to check the tree to know what
+    happened.
+    """
     if run.workspace is None:
         return []
     base = getattr(run.workspace, "base_branch", "") or "base"
@@ -542,10 +554,10 @@ def _review_actions(run: Run) -> list[dict[str, Any]]:
         S.btn(f"Merge into {base}",
               S.cli("board", "merge", run.id,
                     confirm=f"Merge this run's branch into {base}?"),
-              "primary"),
+              "primary", pending="Merging…", done=f"Merged into {base}"),
         S.btn("Discard", S.cli("board", "discard", run.id,
                                confirm="Discard this run's worktree and branch?"),
-              "danger"),
+              "danger", pending="Discarding…", done="Worktree discarded"),
     ]
 
 
@@ -2879,10 +2891,16 @@ def _desc_fold(run: Run, outcome: dict[str, Any] | None = None, title: str = "")
 
 def _story_tab(run: Run, outcome: dict[str, Any]) -> list[dict[str, Any]]:
     """The v2 story: triage, the outcome's callouts, the goal/criteria hero,
-    then the step-by-step story — one row per pipeline node with its evidence."""
+    then the step-by-step story — one row per pipeline node with its evidence.
+
+    The triage keeps the outcome's *reading* — text, tone, icon, detail and
+    counts — and gives up its buttons: ``_build_v2`` draws those in the page
+    header from ``run_header.build_header``, and drawing them in both places
+    would offer every control twice (with two different toasts).
+    """
     sections = [S.triage(outcome["text"], tone=outcome["tone"], icon=outcome["icon"],
                          detail=outcome["detail"], counts=outcome["counts"],
-                         actions=outcome["actions"], menu=outcome["menu"])]
+                         actions=[], menu=[])]
     sections.extend(outcome.get("callouts") or [])
     profile = _run_profile(run)
     goal = str(profile.get("user_goal") or "").strip()
@@ -2962,10 +2980,18 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
     if waiting:
         chips.insert(0, S.chip(f"✋ {waiting} question{'s' if waiting > 1 else ''}", "yellow"))
     title = _title_v2(run)
-    page = S.page("run", title, _sub_v2(run), chips_=chips, actions=[],
+    # The header fields are the same on every tab: the label names the run and
+    # the controls (Stop/Kill while it runs, Merge/Discard when it is done) sit
+    # beside them, so a user on the Graph or Agents tab can still stop a
+    # runaway run. ``build_header`` owns "which controls for this state"; the
+    # triage above no longer draws any, so nothing is offered twice.
+    header = build_header(run, outcome)
+    page = S.page("run", title, _sub_v2(run), chips_=chips, actions=header["actions"],
                   tabs=V2_TABS, tab=resolved,
                   args={"run": run.id, **({"node": node} if node else {})},
-                  sections=sections, desc=_desc_fold(run, outcome, title))
+                  sections=sections, desc=_desc_fold(run, outcome, title),
+                  label=header["label"], menu=header["menu"],
+                  updated_at=header["updated_at"])
     page["graph"] = _graph(run, node)
     return page
 

@@ -200,9 +200,31 @@ def _with_confirm(action: dict[str, Any], confirm: str | None) -> dict[str, Any]
     return action
 
 
-def btn(label: str, do: dict[str, Any] | None = None, kind: str = "default") -> dict[str, Any]:
-    """A button. ``do=None`` draws it disabled (the design's no-op buttons)."""
+def btn(label: str, do: dict[str, Any] | None = None, kind: str = "default", *,
+        pending: str | None = None, done: str | None = None) -> dict[str, Any]:
+    """A button. ``do=None`` draws it disabled (the design's no-op buttons).
+
+    ``pending`` is the label the IDE draws while the command runs and ``done``
+    the toast text on success (contract v2.1); both ride the action dict, so a
+    caller that passes neither leaves ``do`` byte-identical. ``do=None`` is not
+    a dict, so there is nothing to carry them: the button stays disabled.
+    """
+    if isinstance(do, dict):
+        if pending is not None:
+            do["pending"] = pending
+        if done is not None:
+            do["done"] = done
     return {"label": label, "kind": kind if kind in KINDS else "default", "do": do}
+
+
+def copy(text: str, done: str = "Copied") -> dict[str, Any]:
+    """An action that puts ``text`` on the clipboard, toasting ``done``.
+
+    A plain action dict rather than a button: the IDE draws it wherever an
+    action fits (a menu row, a list item) and the renderer reads ``copy`` the
+    way it reads ``cli`` / ``page``.
+    """
+    return {"copy": str(text), "done": done}
 
 
 # ── cells, chips, list items ───────────────────────────────────────────────
@@ -741,21 +763,58 @@ def document(title: str, preview: Any, *, out_dir: str | None = None, **opt: Any
 
 # ── page ───────────────────────────────────────────────────────────────────
 
+def _tab(t: Any) -> dict[str, Any]:
+    """One tab entry: a ``(key, label)`` pair, or a dict with optional badge.
+
+    A dict may carry ``count`` (str or int) and ``tone`` (a :data:`COLOURS`
+    name); each is emitted only when the caller gave one, so a dict tab that
+    names neither renders exactly like the 2-tuple it replaces.
+    """
+    if not isinstance(t, dict):
+        key, label = t
+        return {"key": key, "label": label}
+    out: dict[str, Any] = {"key": t.get("key"), "label": t.get("label")}
+    if t.get("count") is not None:
+        out["count"] = t["count"]
+    if t.get("tone"):
+        out["tone"] = t["tone"]
+    return out
+
+
 def page(key: str, title: str, sub: str = "", *, chips_: Iterable[dict[str, Any]] = (),
-         actions: Iterable[dict[str, Any]] = (), tabs: Iterable[tuple[str, str]] = (),
+         actions: Iterable[dict[str, Any]] = (), tabs: Iterable[Any] = (),
          tab: str | None = None, args: dict[str, Any] | None = None,
          sections: Iterable[dict[str, Any]] = (), errors: dict[str, str] | None = None,
-         desc: str = "") -> dict[str, Any]:
+         desc: str = "", label: str = "", menu: Iterable[dict[str, Any]] = (),
+         crumbs: Iterable[dict[str, Any]] = (), updated_at: int | None = None) -> dict[str, Any]:
     """``desc`` is the page's own description, drawn under the title: at most
     one paragraph of :data:`mini_ork.ide_pages.run._DESC_LINES` lines, already
     wrapped, ``\\n``-separated. Empty (the default) leaves the header exactly
-    as it was before the field existed."""
-    tab_list = [{"key": k, "label": label} for k, label in tabs]
-    return {"ok": True, "key": key, "title": title, "sub": sub, "desc": desc,
-            "chips": list(chips_),
-            "actions": list(actions), "tabs": tab_list,
-            "tab": tab or (tab_list[0]["key"] if tab_list else ""), "args": dict(args or {}),
-            "sections": list(sections), "errors": dict(errors or {})}
+    as it was before the field existed.
+
+    ``tabs`` entries are ``(key, label)`` pairs or dicts (see :func:`_tab`).
+
+    The contract-v2.1 header fields — ``label`` (the IDE tab label, ≤ 40 chars
+    and never a run id), ``menu`` (secondary actions behind the header's ▾),
+    ``crumbs`` and ``updated_at`` — are emitted **only when non-empty**, so
+    every page built without them is byte-identical to what it was before they
+    existed. An IDE that does not know a key ignores it.
+    """
+    tab_list = [_tab(t) for t in tabs]
+    out = {"ok": True, "key": key, "title": title, "sub": sub, "desc": desc,
+           "chips": list(chips_),
+           "actions": list(actions), "tabs": tab_list,
+           "tab": tab or (tab_list[0]["key"] if tab_list else ""), "args": dict(args or {}),
+           "sections": list(sections), "errors": dict(errors or {})}
+    if label:
+        out["label"] = str(label)
+    if menu:
+        out["menu"] = list(menu)
+    if crumbs:
+        out["crumbs"] = list(crumbs)
+    if updated_at is not None:
+        out["updated_at"] = updated_at
+    return out
 
 
 def guarded(errors: dict[str, str], title: str, build: Callable[[], dict[str, Any] | list[dict[str, Any]]]
