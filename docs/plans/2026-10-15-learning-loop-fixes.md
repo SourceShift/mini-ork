@@ -99,6 +99,23 @@ three paths and `git rebase --continue` completed it losslessly. The reversion
 guard wrote no new rows, so R14's rebase skip held during a real worktree
 rebase — `MO_REVERSION_GUARD_DISABLED=1` was not needed.
 
+## Status 2026-10-17 ~09:40 (waves 3b and 3c merged)
+
+R12 merged as `72182582` (migration `0078`, `repo_identity` via the common git
+dir, `target_repo` on every harvested row, NULL = engine-local, a repo-scoped
+`scope_findings`/`prior_attempts`/`build` and tab, plus an idempotent
+`backfill-target-repo`). R3 merged as `1ec260da` (`include_themes` on
+`failure_modes_md`, arm-based suppression in `_learned_block`, v2 block built
+before the v1 UCB producers, `themes_once` marker, `injects()` deleted).
+
+One review note on R3: it edited `tests/unit/test_context_v2.py`, which is not
+in its kickoff's Files-in-scope. The edit is the necessary consequence of
+deleting `injects()` — the old assertion called it — and the worktree-merge
+claim guard refused the merge until the path was explicitly claimed, which is
+the behaviour working as intended. No other clause deviated; the `graph_context`
+relocation into the v1-only branch is prompt-neutral because that block was
+already dropped whenever a v2 block rendered.
+
 ## Wave-3 resequencing (2026-10-17 ~00:40)
 
 The wave table above put R3, R9, R7b and R12 in one wave "touching disjoint
