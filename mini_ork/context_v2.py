@@ -519,8 +519,14 @@ def _constraint_items(contract: dict) -> list[dict]:
 
 def build(kickoff_path: str, *, task_class: str = "", db: str | None = None,
           run_id: str | None = None, max_clusters: int = 5,
-          kickoff_text: str | None = None) -> dict:
-    """The v2 pack for one run. Never raises; unreadable inputs give empty sections."""
+          kickoff_text: str | None = None, run_dir: str | None = None) -> dict:
+    """The v2 pack for one run. Never raises; unreadable inputs give empty sections.
+
+    Selection scope: the kickoff's parsed ``files_in_scope`` when non-empty,
+    else (with a ``run_dir``) the run profile's ``scope_allow`` via
+    ``preferences.scope_paths``, else empty. The fallback is selection-only —
+    ``contract`` is never back-filled, so it grants no edit authority (the
+    kickoff guard and the diff-scope checks keep reading the parse)."""
     kickoff_bytes: bytes | None = None
     if kickoff_text is None:
         try:
@@ -532,7 +538,23 @@ def build(kickoff_path: str, *, task_class: str = "", db: str | None = None,
     else:
         kickoff_bytes = kickoff_text.encode("utf-8")
     contract = parse_contract(kickoff_text)
-    findings = scope_findings(contract["files_in_scope"], db=db, exclude_run=run_id)
+    scope = contract["files_in_scope"]
+    if scope:
+        scope_source = "kickoff"
+    elif run_dir:
+        scope_source = "none"
+        try:
+            # Lazy import: context_v2 must not acquire an import-time dependency
+            # on mini_ork.memory (the prompt path also loads with it absent).
+            from mini_ork.memory import preferences
+            scope = preferences.scope_paths(run_dir) or []
+        except Exception:  # noqa: BLE001 — prompt path must fail soft
+            scope = []
+        if scope:
+            scope_source = "profile"
+    else:
+        scope_source = "none"
+    findings = scope_findings(scope, db=db, exclude_run=run_id)
     floor = min_severity()
     clusters = [c for c in cluster(findings)
                 if _SEVERITY_RANK.get(str(c["worst_severity"]).lower(), 0) >= floor]
@@ -558,6 +580,10 @@ def build(kickoff_path: str, *, task_class: str = "", db: str | None = None,
         "prior_attempts": prior,
         "themes": themes,
         "n_findings_scanned": len(findings),
+        # Selection provenance, beside the count it explains: which reader
+        # supplied the paths and the resolved list. Never edit authority.
+        "scope_source": scope_source,
+        "scope_paths": list(scope),
         "item_ids": ([c["id"] for c in constraints] + [c["id"] for c in clusters]
                      + [p["id"] for p in prior] + [t["id"] for t in themes]),
         "built_at": int(time.time()),
@@ -719,7 +745,8 @@ def pack_for_run(run_dir: str, *, kickoff_path: str | None = None, task_class: s
         kickoff_path = kickoff_path or _profile_kickoff(run_dir)
         if not kickoff_path:
             return {}
-        pack = build(kickoff_path, task_class=task_class, db=db, run_id=run_id)
+        pack = build(kickoff_path, task_class=task_class, db=db, run_id=run_id,
+                     run_dir=run_dir)
         pack["arm"] = arm(run_id)
         write_json(os.path.join(run_dir, PACK_FILENAME), pack)
         return pack
