@@ -41,8 +41,8 @@ import tempfile
 import time
 
 from mini_ork.context import context_env
+from mini_ork.kickoff_scope import do_not_sentences, heading_kind, kickoff_scope
 from mini_ork.learning import code_findings, themes
-from mini_ork.memory.preferences import paths_in_text
 
 MODES = ("off", "shadow", "on")
 DEFAULT_MODE = "shadow"
@@ -71,8 +71,6 @@ _GENERIC_KICKOFF_STEMS = frozenset({
     "kickoff", "wave-kickoff", "child-kickoff", "example-kickoff", "strong", "weak"})
 _HEADING_RE = re.compile(r"^\s{0,3}(#{2,6})\s+(.+?)\s*$")
 _FENCE_RE = re.compile(r"^\s{0,3}(```|~~~)")
-_DO_NOT_RE = re.compile(
-    r"^\s*(?:[-*+]\s+)?(?:\*\*|__)?(do not|don't|never|must not)\b", re.I)
 _BACKTICK_CMD_RE = re.compile(r"`([^`\n]{3,300})`")
 _DIFF_HEADER_RE = re.compile(r"^diff --git a/(\S+) b/(\S+)\s*$")
 
@@ -162,24 +160,25 @@ def _bullets(lines: list[str]) -> list[str]:
 def parse_contract(kickoff_text: str) -> dict:
     """The kickoff's own constraints, parsed without an LLM.
 
-    ``files_in_scope`` — backticked paths in a "Files in scope" section;
-    ``out_of_scope`` — bullets of an "Out of scope" section;
-    ``do_not`` — every "Do NOT / Never / Must not" line outside code fences;
+    ``files_in_scope`` — ``kickoff_scope(text)["allow"]``: the paths of every
+    allow section, bare bullets included, with a scope entry required to look
+    like a file (a directory part, or a known file extension — a dotted symbol
+    such as ``code_findings.harvest`` is not one);
+    ``out_of_scope`` — the bullets of every deny section;
+    ``do_not`` — the sentences that START with "Do not / Don't / Never / Must
+    not" (``do_not_sentences``), capped at 10;
     ``verification`` — fenced commands (else backticked commands) in a
     "Verification" section.
+
+    The three scope readers agree by construction: ``files_in_scope``,
+    ``gen_profile``'s ``scope_allow`` and ``preferences.scope_paths`` all read
+    the same parser (LF-R8). Return keys are unchanged.
     """
     sections = _sections(kickoff_text)
-    files: list[str] = []
     out_of_scope: list[str] = []
     verification: list[str] = []
     for title, body in sections:
-        if "files in scope" in title:
-            for p in paths_in_text("\n".join(body)):
-                # ``paths_in_text`` also accepts dotted symbols (``code_findings.harvest``);
-                # a scope entry must look like a path: a directory part or a file extension.
-                if p not in files and ("/" in p or _FILE_EXT_RE.search(p)):
-                    files.append(p)
-        elif "out of scope" in title:
+        if heading_kind(title) == "deny":
             out_of_scope.extend(_bullets(body))
         elif "verification" in title or title.startswith("verify"):
             fenced = _fenced_blocks(body)
@@ -188,22 +187,14 @@ def parse_contract(kickoff_text: str) -> dict:
             else:
                 verification.extend(m.group(1).strip()
                                     for m in _BACKTICK_CMD_RE.finditer("\n".join(body)))
-    do_not: list[str] = []
-    in_fence = False
-    for line in (kickoff_text or "").splitlines():
-        if _FENCE_RE.match(line):
-            in_fence = not in_fence
-            continue
-        if in_fence or not _DO_NOT_RE.match(line):
-            continue
-        clean = re.sub(r"^\s*[-*+]\s+", "", line).strip().strip("*_").strip()
-        clean = clean[:200]
-        if clean and clean not in do_not:
-            do_not.append(clean)
+    # ``kickoff_scope`` also accepts dotted symbols (``code_findings.harvest``);
+    # a scope entry must look like a path: a directory part or a file extension.
+    files = [p for p in kickoff_scope(kickoff_text)["allow"]
+             if "/" in p or _FILE_EXT_RE.search(p)]
     return {
         "files_in_scope": files,
         "out_of_scope": out_of_scope[:10],
-        "do_not": do_not[:10],
+        "do_not": do_not_sentences(kickoff_text)[:10],
         "verification": verification[:5],
     }
 

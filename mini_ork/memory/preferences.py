@@ -48,6 +48,7 @@ import sqlite3
 import time
 
 from ..context import context_env
+from ..kickoff_scope import paths_in_line
 
 
 _USER_ID = "default"
@@ -179,43 +180,22 @@ def _glob_matches_any(glob: str, paths: list[str]) -> bool:
 
 # ─── file-scope extraction (kickoff → run_profile → path rules) ───────────
 
-_BACKTICK_RE = re.compile(r"`([^`]+)`")
-_EXT_RE = re.compile(r"\.[A-Za-z0-9]{1,8}$")
-
-
-def _looks_like_path(token: str) -> bool:
-    """True when a backticked token names a file path.
-
-    A path has a ``/`` or a trailing ``.<ext>``. A token ending in a glob ``**``
-    is a rule *target* (``mini_ork/ide_pages/**``), never a file the run edits,
-    so it is skipped — this is what keeps a path rule from matching itself.
-    """
-    t = token.strip()
-    if not t or t.endswith("**"):
-        return False
-    return "/" in t or bool(_EXT_RE.search(t))
-
-
-def _normalize_path(token: str) -> str:
-    t = token.strip()
-    while t.startswith("./"):
-        t = t[2:]
-    return t
-
 
 def paths_in_text(text: str) -> list[str]:
-    """Backticked path-like tokens in ``text``: normalized, order-preserving,
-    de-duplicated. Shared by ``scope_paths`` (run profiles) and the
-    ``prefs preview`` kickoff parser so both agree on what counts as a path."""
+    """Path-like tokens in ``text``: normalized, order-preserving, de-duplicated.
+
+    One line at a time through ``kickoff_scope.paths_in_line`` (LF-R8), so a
+    BARE bullet head counts (``- mini_ork/foo.py``) as well as a backticked
+    token, and the same rule answers for ``scope_paths`` (run profiles),
+    ``context_v2.parse_contract`` and the ``prefs preview`` kickoff parser.
+    """
     out: list[str] = []
     seen: set[str] = set()
-    for m in _BACKTICK_RE.finditer(text or ""):
-        if not _looks_like_path(m.group(1)):
-            continue
-        p = _normalize_path(m.group(1))
-        if p and p not in seen:
-            seen.add(p)
-            out.append(p)
+    for line in (text or "").splitlines():
+        for p in paths_in_line(line):
+            if p and p not in seen:
+                seen.add(p)
+                out.append(p)
     return out
 
 
@@ -223,17 +203,18 @@ def scope_paths(run_dir: str | None) -> list[str]:
     """The file paths a run declares in ``run_profile.json`` → ``scope_allow``.
 
     ``scope_allow`` is a list of raw kickoff bullet lines, so one entry may carry
-    several backticked paths (``"`a.py`, `b.py`"``). Every backticked path-like
-    token is extracted and normalized; the result is what ``prefs_for(paths=…)``
-    matches ``path``-scoped rules against.
+    several paths (``"`a.py`, `b.py`"``). ``paths_in_text`` extracts and
+    normalizes them (``kickoff_scope.paths_in_line``: backticked tokens AND bare
+    bullet heads); the result is what ``prefs_for(paths=…)`` matches
+    ``path``-scoped rules against.
 
     Two guards drop noise: scanning stops at the ``Do NOT …`` sentinel that
     terminates a real "Files in scope" list, and a token ending in a glob ``**``
     is skipped. Both are needed because the profiling heuristic that builds
-    ``scope_allow`` substring-matches section titles (mini_ork/cli/main.py:280),
-    so a heading like ``## Tests`` — whose title contains the word "scope" — can
-    leak a whole prose block into the list; without the guards such prose would
-    make a path rule fire for runs that merely *mention* the glob.
+    ``scope_allow`` substring-matches section titles, so before LF-R8 a heading
+    like ``## Tests`` — whose title contains the word "scope" — could leak a
+    whole prose block into the list; without the guards such prose would make a
+    path rule fire for runs that merely *mention* the glob.
 
     Missing file → ``[]`` (never raises): callers sit on the prompt-injection
     path and must fail soft.
@@ -258,7 +239,11 @@ def scope_paths(run_dir: str | None) -> list[str]:
             continue
         if entry.lstrip().startswith("Do NOT"):
             break
-        for p in paths_in_text(entry):
+        # A profile entry is the bullet's TEXT — ``gen_profile`` stripped the
+        # marker — and ``paths_in_line``'s bare-head rule applies to a LIST
+        # ITEM's first token, so restore the item before parsing (LF-R8).
+        item = entry if entry[:2] in ("- ", "* ", "+ ") else "- " + entry
+        for p in paths_in_text(item):
             if p not in seen:
                 seen.add(p)
                 out.append(p)

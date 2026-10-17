@@ -36,6 +36,7 @@ from mini_ork.dispatch.run_env import RunEnvError, load_run_env
 from mini_ork.dispatch.secrets import SecretStoreError
 from mini_ork.dispatch.vault import VaultError
 from mini_ork.features import gate_env
+from mini_ork.kickoff_scope import heading_kind
 from mini_ork.vcs import repo_integrity_guard
 from mini_ork.gates import rubric_prescreen
 from mini_ork.orchestration import concord_run
@@ -584,6 +585,24 @@ def gen_profile(kickoff_path, root, recipe, task_class, profile_path, agents_pat
         # from the first line of a new paragraph (separated by a blank).
         return lines
 
+    def section_lines_kind(kind):
+        # Scope sections are classified by ``heading_kind``, not by a substring
+        # test: "## Out of scope" and "## Explicitly out of scope — do NOT
+        # touch" both CONTAIN "scope" and used to feed scope_allow (LF-R8).
+        current = False
+        lines = []
+        in_fence = False
+        for raw in text.splitlines():
+            if raw.lstrip().startswith("```"):
+                in_fence = not in_fence
+            m = None if in_fence else re.match(r"^\s*#{2,6}\s+(.+?)\s*$", raw)
+            if m:
+                current = heading_kind(m.group(1)) == kind
+                continue
+            if current:
+                lines.append(raw.rstrip())
+        return lines
+
     def bullets(lines):
         # A wrapped kickoff bullet — a markdown list item whose text spills
         # onto an indented continuation line — must stay ONE item, so the
@@ -660,8 +679,10 @@ def gen_profile(kickoff_path, root, recipe, task_class, profile_path, agents_pat
         return list(dict.fromkeys(found))
 
     success = bullets(section_lines(["success", "definition of done", "done when", "acceptance"]))
-    scope_allow = bullets(section_lines(["scope allow", "in scope", "scope"]))
-    scope_deny = bullets(section_lines(["scope deny", "out of scope", "forbidden"]))
+    # Entry format is unchanged (raw bullet lines) so existing profile consumers
+    # keep working; only WHICH sections feed each list changed (LF-R8).
+    scope_allow = bullets(section_lines_kind("allow"))
+    scope_deny = bullets(section_lines_kind("deny"))
     def _bullet_only(lines):
         out = []
         for line in lines:
