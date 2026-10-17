@@ -154,8 +154,39 @@ e11b (`937506bc`, then the regression fix `d71a28d8`) → e6 (`51c37434`) → e1
   after `_wall()` (ours: a blank line, theirs: none). Resolved to main's two-blank-line spacing.
 - Green gate on the land worktree before merge: 255 passed, 1:27.
 
-**Still open:** the IDE renderer halves (C1, C2, C12, C13-render, C14-render, C24, C26) and
-the engine halves not covered by the four landed runs (C3, C4, C5, C8, C9, C12, C18, C21, C25).
+**Engine halves landed after (d) opened.** Each is a `framework-edit` run whose
+diff was independently re-verified before merge:
+
+```
+git merge-base --is-ancestor 18ffcae7 origin/main   # C3  triage names the real failing node  → true
+git merge-base --is-ancestor fdf55574 origin/main   # C4+C5 one Needs-you lane, explained decisions → true
+git merge-base --is-ancestor 7d0ac72a origin/main   # C9+C12 Checks tab + tab badges          → true
+```
+
+- **C3** (`18ffcae7`) — the run rolled back (`impl_moved_base`, reviewer verdict on an
+  earlier out-of-scope round); its final diff was scoped to 3 files and landed after
+  an independent 267-test run. `run.py` gained `_awaiting_node_ids`.
+- **C4+C5** (`fdf55574`) — one `Needs you` lane (`_attention_lane`) at the top of every
+  v2 tab, absorbing the parked review / open gate / cost pause / merge approval / open
+  asks, each with its own buttons; a healthy run renders no lane. Gate callouts always
+  state strategy, from-node, command and unverified levels, falling back to
+  `retry-hint.json`. Landing required a rebase over a peer's `_story_tab` →
+  `_outcome_tab` rename and a stale assert in `test_ide_pages_run_header.py` that was
+  **already red on main** (fixed to assert header-owned controls are not duplicated).
+- **C9+C12** (`7d0ac72a`, run `run-1792233993-49139`, 40m13s, $2.24, reviewer pass) —
+  a Checks tab with one plain-words row per level (state, meaning, deciding file), the
+  level vector still shipped as data, and per-envelope check rows; tab badges
+  (`Checks · 1 ✗` red / proven count green, DAG question count). `verification` is now
+  an alias for `checks` — the vector was being drawn on two tabs with two badges.
+
+**Still open:** the IDE renderer halves (C1, C2, C12-render, C13-render, C14-render, C24,
+C26) and the engine halves C8 (in flight: `wt/rp-c8-changes`), C18, C21, C25.
 SDD option A-vs-B remains blocked on the user.
+
+**Incident, same day:** the first C9+C12 dispatch was killed after its `code_impact_lens`
+found a deterministic scope conflict — the kickoff forbade editing the two tests that pin
+`V2_TABS` and the `"Verification · 1"` label. The kickoff was widened to those exact
+assertions and re-dispatched; the second run published green. Lesson: a page-shape change
+must name the shape pins it invalidates.
 
 ---
