@@ -116,6 +116,33 @@ the behaviour working as intended. No other clause deviated; the `graph_context`
 relocation into the v1-only branch is prompt-neutral because that block was
 already dropped whenever a v2 block rendered.
 
+## Status 2026-10-17 ~10:55 (wave 4 merged: R11a, R13)
+
+R11a merged as `3515640d`: read-time staleness (`stale_reason` →
+age, then snippet-not-at-`HEAD:file` via one `git cat-file --batch`),
+`MO_CONTEXT_V2_MAX_AGE_DAYS` (default 30, `0` disables) and
+`MO_FINDINGS_STALENESS=0` pushed into `scope_findings_with_stats`, stale
+counts in the pack and the tab, and the central `classify_note != "code"`
+skip in `_harvest_run` (R5 residual). R13 merged as `7c73545d`: symmetric
+containment recurrence (`CONTAINMENT_MIN = 0.6`), embedding arm gated on
+`MO_EMBED_PROVIDER`, arm/held-out provenance in the injection ledger,
+ITT-vs-delivered denominators with `v2_legacy` excluded from lift, and
+report-only `theme_candidates` / `rule_candidates` behind
+`memory-lifecycle --kind`.
+
+Four R13 review deviations were corrected before merge, all of them the
+implementer inventing semantics the kickoff did not ask for: an asymmetric
+containment denominator (subset restatements scored 0.5, now `min(len)`,
+so either-direction subset → 1.0), an unused `_token_set`, an invented
+"legacy arm recurred" branch for runs with zero findings (now every arm is
+measured by the same matcher), and `theme_candidates` anchoring its window
+at the oldest `last_seen` instead of a now-relative cut (a larger
+`max_age_days` must admit *fewer* rows). The two tests that encoded the
+bad semantics were rewritten with it. R13 also edited
+`tests/unit/test_context_v2_wiring.py` (kickoff-external, required by the
+new lift shape); the claim guard refused until it was explicitly claimed,
+same pattern as R3.
+
 ## Wave-3 resequencing (2026-10-17 ~00:40)
 
 The wave table above put R3, R9, R7b and R12 in one wave "touching disjoint
