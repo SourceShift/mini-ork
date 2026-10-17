@@ -33,6 +33,8 @@ fork `/Volumes/docker-ssd/ps/zed-mini-ork`, UI `/Volumes/docker-ssd/ps/mini-ork-
 | `rotate-dead-lanes` | rotate/re-pin the kimi (and deepseek fallback) lanes | open | **still open** | `runs/run-1792136293-92791/retry-hint.json` → `needs_change.kind=lane`, "kimi: API key rejected (HTTP 401) at https://api.kimi.com/coding/v1/messages"; `execute.log` also emits `[dispatch_chain_drop] fallback tail lane 'deepseek_flash' … has no providers.yaml entry` |
 | `leftover-cleanup-delta` | review the uncommitted leftover-cleanup delta (from m3a/m3b/m3d) | open | **moot** | `/Volumes/docker-ssd/ps/mini-ork-worktrees/miniork-leftover-cleanup` does not exist (`ls -d` → No such file or directory) |
 | `foreign-file-run_status.py` | one untracked foreign file left untouched | note | **resolved by its author** | file now committed by `d70f94cf` ("board: a run the operator closes lands in a terminal not_needed state"), `git merge-base --is-ancestor d70f94cf origin/main` → IN |
+| `fix-unrunnable-baseline-reason` | a baseline that never started must name the line that says so | done | **landed + on origin/main** | `659a3553` — `git merge-base --is-ancestor 659a3553 origin/main` → IN, and `git log -1 origin/main` → same sha; new test `tests/unit/test_codefix_red_base.py::test_missing_local_binary_guard_is_unrunnable_not_red` fails `KeyError: 'base_unrunnable'` on the unmodified verifier; suite 11 passed, overlay+abstention 11 passed, ruff clean |
+| `classify-68028` | classify engine-home `run-1792185781-68028` | not revivable (live) | **left untouched — self-repairing** | row `status=failed` but the process is **alive**: `recovery.planner run-1792185781-68028 --from-node implementer --ack-change --force` (pid 57271, 01:53:44) with its own claude agent in `lane-gate-unverified`; blocker is the unsatisfiable spec test below |
 
 Six engine-home runs were reclassified this session from "genuine target-repo
 revision" to **not revivable**: `hr-exec-park-20261015141603`,
@@ -83,6 +85,26 @@ revision" to **not revivable**: `hr-exec-park-20261015141603`,
    (`732bb4cc-author-style-review.md`, `f6e1ed90-orchestrator-page-pm.md`) —
    an aggregation round racing on one path; harmless but worth a convention
    (one file per session, commit only your own).
+8. **An unsatisfiable spec test makes a run permanently unconvergeable, and the
+   engine blames the change for it.** `run-1792185781-68028` (framework-edit,
+   target `lane-gate-unverified`): the run's own generated spec test dies in its
+   own helper — `db2 = _make_db(tmp_path / "second")` where `_make_db` does
+   `sqlite3.connect(...)` with no `mkdir`
+   (`<run>/spec-tests/test_spec_lane_preflight_unverified.py:549` calling `:100`),
+   so `1 failed, 25 passed` with a failure that never reaches an assertion.
+   `spec-tests-pass` is binary on pytest's rc
+   (`recipes/framework-edit/verifiers/spec-tests.py:771`, no abstain path; `:880`),
+   and the same verifier's `tamper-detection` (`tampered_files`, `:252`) fences
+   the spec dir at the author node's node_end — here `tamper-detection: True`, so
+   *no actor may repair the test*. `diagnose` records R5 "a verifier refuted the
+   change" → `revise` twice (00:22, 01:30, each a full implementer round) and
+   auto-repair spawned a third, hopeless round; the run rolled back 6 paths,
+   salvaged to `refs/mini-ork/salvage/run-1792185781-68028`. Fix site is
+   `retry_hint.py` (hint `kind: code` — **peer-dirty, untouched**) or a new
+   terminal class in the executor's revise loop; a text-only change inside
+   `spec-tests.py` improves the reason but still routes to `revise`. Detector for
+   a monitor: the failing nodeid's `E` line is a non-assertion exception whose
+   deepest frame is inside the spec dir ⇒ spec-author defect, not revivable.
 
 ---
 
