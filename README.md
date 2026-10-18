@@ -80,8 +80,12 @@ Methods, sample sizes, and what each number does *not* show: [docs/RESULTS.md](d
 > [warning](#warning-this-system-modifies-itself-unattended) before you turn it on.
 
 <p align="center">
-  <img src="https://github.com/SourceShift/mini-ork/raw/main/assets/mini-ork-hero.jpg" alt="An ork operator on a starship bridge overseeing many isolated workstreams, each a self-contained environment running its own crew." width="860">
+  <img src="https://github.com/SourceShift/mini-ork/raw/main/assets/mini-ork-ide.png" alt="The mini-ork IDE showing one run end to end: the thread it came from, a live DAG laid out across model-family lanes (minimax, codex, verifier, opus, publisher), per-node cost, and the verification verdict." width="1000">
 </p>
+
+<p align="center"><em>The mini-ork IDE, one run end to end: the thread it came from, the live DAG laid
+out across model families, per-node cost, and the verdict the checks returned — every node paid for,
+every claim checked.</em></p>
 
 ## 🎯 Why this exists
 
@@ -194,14 +198,6 @@ self-improvement loop has no approval prompt. See the [warning](#warning-this-sy
 | 🔁 **Self-improvement & learning** | Anti-Goodhart reward contract, cost-free bandit router, GRPO writeback, reflection pipeline, semantic long-term memory, and a closed apply loop. |
 | 📊 **Observability surface** | A FastAPI app (127.0.0.1:7090) with an SSE live event stream, run detail + DAG overlay, a "why did this fail" aggregator, learning dashboards, and OTel/Langfuse export. |
 | ⌨️ **Operator & dev ergonomics** | A stable CLI — `init`, `run`, `validate`, `doctor`, `providers`, `garden`, `serve`, `recover` — plus worktree-aware, file-surface-leased workflows for safe concurrent agents. |
-
-<p align="center">
-  <img src="assets/mini-ork-ide.png" alt="The mini-ork IDE showing one run end to end: the thread it came from, a live DAG laid out across model-family lanes (minimax, codex, verifier, opus, publisher), per-node cost, and the verification verdict." width="1000">
-</p>
-
-<p align="center"><em>The mini-ork IDE, one run end to end: the thread it came from, the live DAG laid
-out across model families, per-node cost, and the verdict the checks returned — every node paid for,
-every claim checked.</em></p>
 
 ## 🚀 Start here
 
