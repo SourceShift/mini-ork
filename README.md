@@ -80,7 +80,7 @@ Methods, sample sizes, and what each number does *not* show: [docs/RESULTS.md](d
 > [warning](#warning-this-system-modifies-itself-unattended) before you turn it on.
 
 <p align="center">
-  <img src="assets/mini-ork-hero.jpg" alt="An ork operator on a starship bridge overseeing many isolated workstreams, each a self-contained environment running its own crew." width="860">
+  <img src="https://github.com/SourceShift/mini-ork/raw/main/assets/mini-ork-hero.jpg" alt="An ork operator on a starship bridge overseeing many isolated workstreams, each a self-contained environment running its own crew." width="860">
 </p>
 
 ## 🎯 Why this exists
