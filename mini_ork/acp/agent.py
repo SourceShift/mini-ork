@@ -5524,13 +5524,23 @@ class MiniOrkAcpAgent:
                 continue
             emitted.add(key)
             new_events.append(ev)
-        # Live drain (Z3): any node whose node_start has already been emitted
-        # is followed here. Drain happens BEFORE the lifecycle events so a
-        # text chunk follows its tool call, and BEFORE the terminal message
-        # so nothing written at the very end is lost (kickoff §3).
+        updates = self._build_event_updates(new_events)
+        # Open every new node's tool call before its first live chunk. The
+        # drain below follows nodes whose ``node_start`` was recorded above,
+        # but a same-poll progress update sent before the ``ToolCallStart``
+        # that names its ``tool_call_id`` is an update for an unknown tool
+        # call: Zed renders it as a failed "Tool call not found" entry and
+        # returns before resolving its ``locations``, so the crosshair would
+        # skip that chunk — and, once the live dedup marks the path as sent,
+        # every later chunk for the same file too. The drain still runs
+        # before the remaining lifecycle events (``node_end``) and before
+        # the terminal message so final text is not lost (kickoff §3).
+        for update in updates:
+            if isinstance(update, ToolCallStart):
+                await self._emit(session_id, update)
+        updates = [update for update in updates if not isinstance(update, ToolCallStart)]
         if live:
             await self._drain_live_for(session_id)
-        updates = self._build_event_updates(new_events)
         updates.append(self._build_usage_update(snapshot.get("llm_calls")))
         status = snapshot.get("status")
         if status is not None:
