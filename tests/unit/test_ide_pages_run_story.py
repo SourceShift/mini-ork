@@ -351,9 +351,10 @@ def test_v2_outcome_tab_sections(home: Path, monkeypatch) -> None:
     assert kinds[0] == "triage"
     assert "What happened" in titles
     assert "hero" in kinds
-    # The Overview tail survives below the story instead of replacing it.
+    # The Overview tail survives below the story instead of replacing it. The
+    # changed files are the Changes tab's own content and are not repeated here.
     assert titles.index("What happened") < titles.index("Run inputs")
-    assert titles.index("What happened") < titles.index("Files changed")
+    assert "Files changed" not in titles
 
     story = page["sections"][titles.index("What happened")]
     assert story["type"] == "story"

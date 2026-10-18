@@ -80,9 +80,7 @@ def test_outcome_leads_with_the_runs_own_sentence(tmp_path: Path) -> None:
     outcome = {"text": "Failed at tier4_synth (cost_limit)"}
     run = _run(tmp_path, states=["done", "failed"], status="failed",
                ids=["judge", "tier4_synth"])
-    text = R._desc_outcome(run, outcome)
-    assert text.startswith("Failed at tier4_synth (cost_limit).")
-    assert "1/2 nodes done" in text and "1 failed" in text
+    assert R._desc_outcome(run, outcome) == "Failed at tier4_synth (cost_limit)."
 
 
 def test_outcome_falls_back_to_the_node_itself_without_an_outcome(tmp_path: Path) -> None:
@@ -92,9 +90,13 @@ def test_outcome_falls_back_to_the_node_itself_without_an_outcome(tmp_path: Path
     assert text.count("panel") == 1
 
 
-def test_outcome_counts_skipped_as_not_run(tmp_path: Path) -> None:
+def test_outcome_leaves_node_counts_to_the_chips(tmp_path: Path) -> None:
+    """The header's chips already count the nodes; the description stating the
+    same totals again was the header's most visible duplication."""
     run = _run(tmp_path, states=["done", "skipped"])
-    assert "1 not run" in R._desc_outcome(run, {"text": "Published"})
+    text = R._desc_outcome(run, {"text": "Published"})
+    assert text == "Published."
+    assert "not run" not in text and "nodes done" not in text
 
 
 # ── the fold ───────────────────────────────────────────────────────────────

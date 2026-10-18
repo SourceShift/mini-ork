@@ -788,12 +788,14 @@ def _level_badges(run) -> list[dict[str, Any]]:
 
 
 def _counts(run) -> list[dict[str, Any]]:
-    rm = _run_mod()
+    """The evidence badges under the verdict: checks, findings, levels.
+
+    Progress (nodes), cost and elapsed are the header chips' job. Repeating
+    them here made the verdict restate the chrome directly above it, so this
+    list answers only what the chips cannot: did the evidence pass, and what
+    did the checks find.
+    """
     out: list[dict[str, Any]] = []
-    n = len(run.nodes)
-    if n:
-        done = sum(1 for node in run.nodes if node.state == "done")
-        out.append({"t": f"{done}/{n} nodes", "c": "sub"})
     passed, total = _verifier_checks(run)
     if total:
         out.append({"t": f"checks {passed}/{total}",
@@ -802,12 +804,6 @@ def _counts(run) -> list[dict[str, Any]]:
     if findings is not None:
         out.append({"t": f"{findings} finding{'s' if findings != 1 else ''}",
                     "c": "red" if findings else "sub"})
-    cost = rm._cost(run)
-    if cost > 0:
-        out.append({"t": S.money(cost), "c": "sub"})
-    elapsed = rm._elapsed(run)
-    if elapsed and elapsed != "—":
-        out.append({"t": elapsed, "c": "sub"})
     out.extend(_level_badges(run))
     return out
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -328,9 +329,11 @@ def test_level_two_starts_with_the_dag_and_carries_the_graph_key(
     page = build_page(home, "run", None, {"run": RUN})
     assert [t["key"] for t in page["tabs"]][:2] == ["dag", "outcome"]
     assert page["tab"] == "dag"
-    # The header names the run by id; the human title is the sub line.
-    assert page["title"] == RUN
-    assert page["sub"] == "Make the demo pass"
+    # The header leads with the operator's goal; the run id is the copyable
+    # handle drawn beside the chips, and still travels in ``args``.
+    assert page["title"] == "Make the demo pass"
+    assert page["sub"] == "demo-recipe"
+    assert page["args"]["run"] == RUN
     assert page["sections"][0]["type"] == "callout"  # one true outcome up front
     assert page["sections"][1]["type"] == "dag"
     assert [a["label"] for a in page["actions"]] == ["Open run folder", "Orchestrator"]
@@ -365,13 +368,16 @@ def test_level_two_title_prefers_the_goal_over_the_recipe_placeholder(
         "success_criteria": ["it works", "it is fast"],
     }))
     page = build_page(home, "run", None, {"run": RUN})
-    assert page["title"] == RUN
-    assert page["sub"] == "Ship the thing"
+    assert page["title"] == "Ship the thing"
+    assert page["sub"] == "demo-recipe"
+    assert page["args"]["run"] == RUN
     outcome = build_page(home, "run", "outcome", {"run": RUN})
     hero = _section(outcome, "hero", "What this run is for")
     assert hero["goal"] == "Ship the thing\nsecond line"
     assert hero["criteria"] == ["it works", "it is fast"]
-    assert [c["label"] for c in hero["cells"]][:3] == ["nodes done", "cost", "wall time"]
+    # State, node count and cost are the header's chips; the hero repeats none
+    # of them and carries only the change it made.
+    assert hero["cells"] == []
 
 
 def test_level_two_dag_tab_describes_the_run_until_a_node_is_clicked(
@@ -387,12 +393,9 @@ def test_level_two_dag_tab_describes_the_run_until_a_node_is_clicked(
     monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
     page = build_page(home, "run", "dag", {"run": RUN})
     kv = _section(page, "kv", "Run")
-    by_key = {i["k"]: i["v"] for i in kv["items"]}
-    assert [i["k"] for i in kv["items"]][:5] == [
-        "Status", "Cost", "Started", "Ended", "Duration"]
-    assert by_key["Cost"] == "$0.23"                 # the run's total
-    assert by_key["Nodes"] == "5/6 done · 1 not run"
-    assert by_key["Checks"] == "1/1"
+    # Cost, node count and checks are the header chips / the outcome callout;
+    # this box answers only "what state, and since when".
+    assert [i["k"] for i in kv["items"]] == ["Status", "Started", "Ended"]
     assert kv["sub"] == "run · overall · finished"
     # Nothing chose a node, so no node's transcript rides along.
     assert all(not (s["type"] == "code" and s["title"].startswith("Transcript"))
@@ -639,3 +642,107 @@ def test_verification_tab_ships_the_level_vector_as_data(
     dag = build_page(home, "run", "dag", {"run": RUN})
     labels = [a["label"] for a in _section(dag, "callout")["actions"]]
     assert "Checks" in labels
+
+
+# ── evidence the page derives from run-local files ─────────────────────────
+
+def _bare_run(tmp_path: Path) -> "run_page.Run":
+    """A run with nothing but its folder: the helpers below read only files."""
+    home = tmp_path / "proj" / ".mini-ork"
+    run_dir = home / "runs" / "run-evidence"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_page.Run(
+        id="run-evidence", home=home, run_dir=run_dir,
+        row={}, card={}, nodes=[], cols=[], calls=[],
+        recipe_dir=None, workspace=None,
+    )
+
+
+def test_patch_changed_files_names_each_file_with_its_counts(tmp_path: Path) -> None:
+    """A delivered run's worktree is gone, so the patch is the only source that
+    can still name the files it changed — the card carried only totals."""
+    run = _bare_run(tmp_path)
+    (run.run_dir / "review-diff.patch").write_text(
+        "diff --git a/mini_ork/a.py b/mini_ork/a.py\n"
+        "--- a/mini_ork/a.py\n+++ b/mini_ork/a.py\n@@ -1 +1,2 @@\n-old\n+new\n+more\n"
+        "diff --git a/docs/b.md b/docs/b.md\n"
+        "--- /dev/null\n+++ b/docs/b.md\n@@ -0,0 +1 @@\n+hello\n",
+        encoding="utf-8")
+    files = run_page._patch_changed_files(run)
+    assert [(f["path"], f["added"], f["removed"]) for f in files] == [
+        ("mini_ork/a.py", 2, 1), ("docs/b.md", 1, 0)]
+    assert run_page._diff_totals(run) == (3, 1)
+
+
+def test_diff_totals_fall_back_to_the_recorded_diffstat(tmp_path: Path) -> None:
+    run = _bare_run(tmp_path)
+    (run.run_dir / "diffstat.json").write_text(
+        '{"added": 7, "removed": 2, "v": 1}', encoding="utf-8")
+    assert run_page._diff_totals(run) == (7, 2)
+
+
+def test_attempts_section_classifies_each_dispatch_on_its_own(tmp_path: Path) -> None:
+    """``retry-exhausted/<node>.attempts.json`` is named for the node's history,
+    not its final state: a later entry with ``done`` is a success even though
+    the file exists at all."""
+    run = _bare_run(tmp_path)
+    ledger = run.run_dir / "retry-exhausted"
+    ledger.mkdir()
+    (ledger / "impl-x.attempts.json").write_text(json.dumps([
+        {"attempt": 1, "finish_reason": "contract_missing", "rc": 1, "ts": T0},
+        {"attempt": 2, "finish_reason": "done", "rc": 0, "ts": T0 + 60},
+    ]), encoding="utf-8")
+    [section] = run_page._attempts_section(run)
+    assert section["title"] == "Attempts · 2"
+    assert [item["m"] for item in section["items"]] == ["✗", "✓"]
+    assert [item["t"] for item in section["items"]] == [
+        "impl-x · attempt 1", "impl-x · attempt 2"]
+    assert "contract_missing" in section["items"][0]["sub"]
+    assert "done" in section["items"][1]["sub"]
+
+
+def test_answered_asks_keeps_only_the_answered_in_ask_order(tmp_path: Path) -> None:
+    run = _bare_run(tmp_path)
+    asks = run.run_dir / "asks"
+    asks.mkdir()
+    (asks / "ask-1.json").write_text(
+        json.dumps({"question": "Which lane?", "answer": "worker"}), encoding="utf-8")
+    (asks / "ask-2.json").write_text(
+        json.dumps({"question": "Still open?"}), encoding="utf-8")
+    (asks / "ask-10.json").write_text(
+        json.dumps({"question": "Later?", "answer": "yes"}), encoding="utf-8")
+    answered = run_page.answered_asks(run.run_dir)
+    assert [(a["ask_id"], a["question"]) for a in answered] == [
+        ("ask-1", "Which lane?"), ("ask-10", "Later?")]
+
+
+def test_clock_names_the_day_outside_today() -> None:
+    today = time.localtime()
+    day = 2 if today.tm_yday != 2 else 3
+    same_year = int(time.mktime((today.tm_year, 1, day, 12, 0, 0, 0, 0, -1)))
+    assert run_page._clock(same_year) == time.strftime(
+        "%b %d %H:%M", time.localtime(same_year))
+    earlier = int(time.mktime((today.tm_year - 1, 6, 1, 12, 0, 0, 0, 0, -1)))
+    assert run_page._clock(earlier).startswith(f"{today.tm_year - 1}-06-01")
+
+
+def test_run_inputs_name_the_v2_pack_only_when_it_exists(tmp_path: Path) -> None:
+    run = _bare_run(tmp_path)
+    (run.run_dir / "context-pack.json").write_text("{}", encoding="utf-8")
+    v1 = _section({"sections": run_page._overview_tab(run)}, "list", "Run inputs")
+    assert [item["t"] for item in v1["items"]] == ["context-pack.json"]
+
+    (run.run_dir / "context-pack.v2.json").write_text("{}", encoding="utf-8")
+    both = _section({"sections": run_page._overview_tab(run)}, "list", "Run inputs")
+    assert [item["t"] for item in both["items"]] == ["context-pack.v2.json"]
+
+
+def test_artifacts_badge_skips_asks_and_live_transcripts(tmp_path: Path) -> None:
+    run = _bare_run(tmp_path)
+    (run.run_dir / "run.json").write_text("{}", encoding="utf-8")
+    (run.run_dir / "agent-x.live.jsonl").write_text("", encoding="utf-8")
+    asks = run.run_dir / "asks"
+    asks.mkdir()
+    (asks / "ask-1.json").write_text("{}", encoding="utf-8")
+    tabs = {tab["key"]: tab for tab in run_page._v2_tabs(run)}
+    assert tabs["artifacts"]["count"] == 1

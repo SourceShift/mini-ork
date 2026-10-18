@@ -198,14 +198,16 @@ def _workspace(tmp_path) -> SimpleNamespace:
                            path=str(tmp_path / "proj" / "wts" / "rp-x"))
 
 
-def test_sub_appends_the_worktree_after_the_title(tmp_path) -> None:
-    """C18: the v2 sub regains `` · worktree <relpath>`` after the title —
-    appended, never substituted."""
+def test_sub_appends_the_worktree_after_the_recipe_line(tmp_path) -> None:
+    """C18: the v2 sub regains `` · worktree <relpath>``. When the goal is the
+    page title the sub carries the recipe/branch line only — repeating the
+    title under itself was the header saying the same thing twice."""
     run = _run(tmp_path, card={"status": "published", "title": GOAL},
                workspace=_workspace(tmp_path))
-    sub = R._build_v2(run, "dag", {"run": RID})["sub"]
-    assert GOAL in sub and "worktree wts/rp-x" in sub
-    assert sub.index("worktree") > sub.index(GOAL)
+    page = R._build_v2(run, "dag", {"run": RID})
+    assert page["title"] == GOAL
+    assert GOAL not in page["sub"]
+    assert page["sub"] == "branch wt/rp-x · worktree wts/rp-x"
 
 
 def test_sub_without_a_title_keeps_recipe_branch_and_id(tmp_path) -> None:
@@ -222,5 +224,6 @@ def test_sub_without_a_title_keeps_recipe_branch_and_id(tmp_path) -> None:
 def test_sub_without_a_workspace_gains_no_worktree(tmp_path) -> None:
     """Only a run with a worktree names one — no fabricated path."""
     run = _run(tmp_path, card={"status": "published", "title": GOAL}, workspace=None)
-    sub = R._build_v2(run, "dag", {"run": RID})["sub"]
-    assert GOAL in sub and "worktree" not in sub
+    page = R._build_v2(run, "dag", {"run": RID})
+    assert page["title"] == GOAL
+    assert page["sub"] == "" and "worktree" not in page["sub"]

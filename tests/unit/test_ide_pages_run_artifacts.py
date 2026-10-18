@@ -134,7 +134,7 @@ def test_run_files_bucket_orders_all_six_kinds(
         home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The run-level bucket orders and sub-labels by the same six-kind rule."""
     run_id = _seed(home, "run-runfiles",
-                   files=("review-diff.patch", "run.json", "execute.log",
+                   files=("run.patch", "run.json", "run.log",
                           "trace.jsonl", "notes.md", "Makefile"))
     page = _page(monkeypatch, home, run_id)
 
@@ -142,7 +142,7 @@ def test_run_files_bucket_orders_all_six_kinds(
     rows = _file_rows(section)
     assert [r.get("kind") for r in rows] == ["patch", "json", "log", "jsonl", "md", "other"]
     assert [_row_text(r) for r in rows] == [
-        "review-diff.patch", "run.json", "execute.log", "trace.jsonl",
+        "run.patch", "run.json", "run.log", "trace.jsonl",
         "notes.md", "Makefile"]
     assert section.get("sub") == "1 patch · 1 json · 1 log · 1 jsonl · 1 md · 1 other"
 
@@ -163,10 +163,12 @@ def test_row_cap_holds_and_one_more_row_accounts_for_leftovers(
     file_tables = [s for s in _artifact_tables(page)
                    if s.get("title") != "Key artifacts"]
     assert sum(len(_file_rows(s)) for s in file_tables) == 3
+    # The three key files are already drawn above, so the leftover row counts
+    # only the six files the listing has not shown anywhere.
     more = [r for s in file_tables for r in (s.get("rows") or [])
             if _row_text(r).startswith("+")]
     assert len(more) == 1, [ _row_text(r) for r in more ]
-    assert _row_text(more[0]).startswith("+6 more")
+    assert _row_text(more[0]).startswith("+3 more")
     assert (file_tables[-1].get("rows") or [])[-1] is more[0]
 
 
@@ -176,7 +178,8 @@ def test_key_artifacts_first_and_its_rows_carry_kind(
     on each file row."""
     run_id = _seed(home, "run-key",
                    files=("framework-edit.diff", "verdict.json",
-                          "evidence/trace.log", "execute.log", "impl-imp.md"),
+                          "evidence/trace.log", "execute.log", "impl-imp.md",
+                          "run.json"),
                    nodes=(("imp", "implementer"),))
     page = _page(monkeypatch, home, run_id)
 
@@ -188,6 +191,13 @@ def test_key_artifacts_first_and_its_rows_carry_kind(
     kinds = {_row_text(r): r.get("kind") for r in _file_rows(key)}
     assert kinds == {"framework-edit.diff": "patch", "verdict.json": "json",
                      "evidence/": "other", "execute.log": "log"}
+    # The key files are drawn once, in the shortlist above — not again in the
+    # per-node and run-level tables below it.
+    listed = [_row_text(r) for s in _artifact_tables(page)[1:]
+              for r in _file_rows(s)]
+    assert "verdict.json" not in listed
+    assert "execute.log" not in listed
+    assert not any(p.startswith("evidence/") for p in listed)
 
 
 def test_every_emitted_file_row_kind_is_one_of_six(

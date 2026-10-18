@@ -177,6 +177,8 @@ def test_one_table_per_producing_node_then_run_files(tmp_path: Path) -> None:
     run = _run(tmp_path)
     _write(run.run_dir, "impl-implementer.json", "{}")
     _write(run.run_dir, "review-reviewer.jsonl", "{}\n")
+    _write(run.run_dir, "run.json", "{}")
+    # Key artifacts: drawn once in the shortlist, never again in a bucket.
     _write(run.run_dir, "verdict.json", "{}")
     _write(run.run_dir, "execute.log", "ran\n")
 
@@ -188,7 +190,9 @@ def test_one_table_per_producing_node_then_run_files(tmp_path: Path) -> None:
 
     assert names("From implementer") == ["impl-implementer.json"]
     assert names("From reviewer") == ["review-reviewer.jsonl"]
-    assert names("Run files") == ["verdict.json", "execute.log"]
+    assert names("Run files") == ["run.json"]
+    assert "verdict.json" not in names("Run files")
+    assert "execute.log" not in names("Run files")
     for title in ("From implementer", "From reviewer", "Run files"):
         assert by_title[title]["head"] == ["file", "kind", "size", "from"]
     assert by_title["From implementer"]["full"] is True
