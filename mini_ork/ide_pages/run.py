@@ -50,8 +50,8 @@ TABS = [("dag", "DAG"), ("kickoff", "Kickoff"), ("overview", "Overview"), ("agen
 # the graph replaces the DAG. The old keys still resolve (``dag`` → ``graph``,
 # ``overview`` → ``story``) so a stale IDE link lands somewhere sensible.
 V2_TABS = [("story", "Story"), ("graph", "Graph"), ("questions", "Questions"),
-           ("kickoff", "Kickoff"), ("agents", "Agents"), ("learnings", "Learnings"),
-           ("artifacts", "Artifacts")]
+           ("kickoff", "Kickoff"), ("agents", "Agents"), ("checks", "Checks"),
+           ("learnings", "Learnings"), ("artifacts", "Artifacts")]
 V2_ALIASES = {"dag": "graph", "overview": "story"}
 
 # The kickoff text is capped well above the 20 KB the run card shows — the kickoff
@@ -2699,6 +2699,19 @@ def _story_tab(run: Run, outcome: dict[str, Any]) -> list[dict[str, Any]]:
     return sections
 
 
+def _checks_tab(run: Run) -> list[dict[str, Any]]:
+    """The run's verifier checks, levels and review findings.
+
+    The dock keeps only the failing rows (a glance); this tab is the full
+    record, so the dock can point at it instead of growing a second tab bar.
+    Imported inside the call — ``run_dock`` imports this module at top level.
+    """
+    from mini_ork.ide_pages import run_dock
+
+    errors: dict[str, str] = {}
+    return run_dock.checks_sections(run, errors)
+
+
 def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     """The ``MINI_ORK_IDE_SPEC=2`` page: one true outcome, next action next to it."""
     outcome = O.resolve(run)
@@ -2714,6 +2727,7 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
         "questions": lambda: _questions_tab(run),
         "kickoff": lambda: _kickoff_tab(run),
         "agents": lambda: _agents_tab(run),
+        "checks": lambda: _checks_tab(run),
         "learnings": lambda: _learnings_tab(run),
         "artifacts": lambda: _artifacts_tab(run),
     }[resolved]()
@@ -2768,18 +2782,18 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     # (parked review, merge review) for every dock render — an effort the
     # dock doesn't use.
     if S.ide_level() >= 2 and (args.get("view") or "") == "dock":
-        # The right dock panel: one column, its own tab bar. Imported here
+        # The right dock panel: one glance column, no tab bar — the run page's
+        # tab bar is the only tab surface (one home per fact). Imported here
         # (not at module top) — ``run_dock`` imports this module, so a
         # top-level import would be circular (same dance as ``_story_tab``).
         from mini_ork.ide_pages import run_dock
 
-        t = tab if tab in {k for k, _ in run_dock.DOCK_TABS} else "changes"
         errors: dict[str, str] = {}
         sub = f"{O.state_word(run)} · {S.money(_cost(run))} · {_elapsed(run)}"
         page = S.page("run", _title_v2(run), sub, chips_=[], actions=[],
-                      tabs=run_dock.DOCK_TABS, tab=t,
+                      tabs=(), tab="",
                       args={"run": run.id, "view": "dock"},
-                      sections=run_dock.build(run, t, errors), errors=errors)
+                      sections=run_dock.build(run, errors=errors), errors=errors)
         page["graph"] = _graph(run, args.get("node"))
         _attach_flow(page, run)
         return page
