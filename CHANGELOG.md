@@ -30,6 +30,14 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- license: the copyright holder is now named. `LICENSE` was the untouched
+  Apache-2.0 boilerplate, so its appendix still read
+  `Copyright [yyyy] [name of copyright owner]` and no distribution metadata
+  named an author. It now carries `Copyright 2026 Amir Khakshour`,
+  `pyproject.toml` declares `license = "Apache-2.0"` (PEP 639) with
+  `license-files = ["LICENSE", "NOTICE"]`, and `authors` names Amir
+  Khakshour instead of the org. The wheel's `License` field had been empty;
+  it is now `License-Expression: Apache-2.0`.
 - release: one version source, and CI is the release gate. `pyproject.toml` now
   reads `mini_ork/version.py` (`dynamic = ["version"]`), so the distribution
   metadata, `mini-ork version`, the `--help` header and the ACP `initialize`

@@ -1,5 +1,6 @@
 [build-system]
-requires = ["setuptools>=69", "wheel"]
+# PEP 639 (`license = "Apache-2.0"`, `license-files`) needs setuptools>=77.
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -17,8 +18,12 @@ requires-python = ">=3.11"
 # accident, so it is declared, not optional. The lazy-import fallback in
 # mini_ork.verify.behavioral remains as defense-in-depth only.
 dependencies = ["PyYAML>=6.0", "jsonschema>=4.0"]
-license = { file = "LICENSE" }
-authors = [{ name = "SourceShift" }]
+# SPDX expression (PEP 639). The old `{ file = "LICENSE" }` table left the
+# wheel with an empty `License` field, so PyPI showed no licence at all; the
+# expression is rendered as `License-Expression: Apache-2.0`.
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Amir Khakshour" }]
 keywords = ["agents", "workflow", "orchestration", "multi-agent", "llm"]
 classifiers = [
   "Development Status :: 3 - Alpha",
