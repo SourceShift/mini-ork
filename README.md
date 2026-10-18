@@ -1,4 +1,4 @@
-> [!IMPORTANT]
+
 <p align="center">
   <img src="assets/mini-ork-icon.svg" alt="mini-ork" width="112" height="112">
 </p>
