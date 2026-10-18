@@ -59,7 +59,7 @@ exit code: 1
 > mini-ork 还包含一个可以改写自己提示词(prompt)和工作流、并且不经人工审核就直接推送改动的循环。它**默认是关闭的**。打开它之前,请先读完[这段警告](README.md#warning-this-system-modifies-itself-unattended)。
 
 <p align="center">
-  <img src="assets/mini-ork-hero.jpg" alt="一名 ork 操作员站在星舰舰桥上,俯瞰着许多相互隔离的工作流,每一个都是独立运行着自己一套班组的完整环境。" width="860">
+  <img src="https://github.com/SourceShift/mini-ork/raw/main/assets/mini-ork-hero.jpg" alt="一名 ork 操作员站在星舰舰桥上,俯瞰着许多相互隔离的工作流,每一个都是独立运行着自己一套班组的完整环境。" width="860">
 </p>
 
 ## 🚀 从这里开始
