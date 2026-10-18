@@ -195,6 +195,14 @@ self-improvement loop has no approval prompt. See the [warning](#warning-this-sy
 | 📊 **Observability surface** | A FastAPI app (127.0.0.1:7090) with an SSE live event stream, run detail + DAG overlay, a "why did this fail" aggregator, learning dashboards, and OTel/Langfuse export. |
 | ⌨️ **Operator & dev ergonomics** | A stable CLI — `init`, `run`, `validate`, `doctor`, `providers`, `garden`, `serve`, `recover` — plus worktree-aware, file-surface-leased workflows for safe concurrent agents. |
 
+<p align="center">
+  <img src="assets/mini-ork-ide.png" alt="The mini-ork IDE showing one run end to end: the thread it came from, a live DAG laid out across model-family lanes (minimax, codex, verifier, opus, publisher), per-node cost, and the verification verdict." width="1000">
+</p>
+
+<p align="center"><em>The mini-ork IDE, one run end to end: the thread it came from, the live DAG laid
+out across model families, per-node cost, and the verdict the checks returned — every node paid for,
+every claim checked.</em></p>
+
 ## 🚀 Start here
 
 `make install` installs the supported local runtime: required OS tools, a checkout-local
