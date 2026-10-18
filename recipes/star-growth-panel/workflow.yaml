@@ -1,0 +1,32 @@
+version: "0.1.0"
+task_class: star_growth_panel
+description: >
+  Four independent lens analysts — four model families, every one with live
+  read access to the reference checkout and the mini-ork tree — each produce a
+  shortlist of features worth adopting, from one distinct commercial lens.
+  A synthesizer reconciles the four shortlists into one ranked adoption plan
+  with effort, star impact and dependency order. All nodes are read-only with
+  respect to both repositories.
+
+nodes:
+  - { name: growth_lens, type: researcher, model_lane: codex_lens, prompt_ref: prompts/growth-lens.md, dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: activation_lens, type: researcher, model_lane: glm_lens, prompt_ref: prompts/activation-lens.md, dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: ecosystem_lens, type: researcher, model_lane: deepseek_lens, prompt_ref: prompts/ecosystem-lens.md, dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: capability_lens, type: researcher, model_lane: minimax_lens, prompt_ref: prompts/capability-lens.md, dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: synthesizer, type: reviewer, model_lane: reviewer, prompt_ref: prompts/synthesis.md, dispatch_mode: serial, gates: [budget_gate] }
+  - { name: lens_completeness, type: verifier, verifier_ref: verifiers/lens-completeness.py, dispatch_mode: serial }
+  - { name: publisher, type: publisher, prompt_ref: null, dispatch_mode: serial }
+  - { name: rollback, type: rollback, prompt_ref: null, dispatch_mode: serial }
+
+edges:
+  - { from: growth_lens, to: synthesizer, edge_type: supplies_context_to }
+  - { from: activation_lens, to: synthesizer, edge_type: supplies_context_to }
+  - { from: ecosystem_lens, to: synthesizer, edge_type: supplies_context_to }
+  - { from: capability_lens, to: synthesizer, edge_type: supplies_context_to }
+  - { from: synthesizer, to: lens_completeness, edge_type: verifies }
+  - { from: lens_completeness, to: publisher, edge_type: depends_on }
+  - { from: synthesizer, to: rollback, edge_type: escalates_to }
+  - { from: lens_completeness, to: rollback, edge_type: escalates_to }
+
+rollback_strategy: keep_lens_reports_discard_synthesis
+max_self_correction_iterations: 1

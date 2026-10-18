@@ -1,0 +1,226 @@
+{
+  "schema_version": "1",
+  "panel_id": "run-1792352699-84084",
+  "lane": "ecosystem",
+  "model": "deepseek-v4-flash",
+  "candidates": [
+    {
+      "candidate_id": "E1",
+      "name": "Recipe registry with install-by-name",
+      "evidence": [
+        "VISION.md:114-115 — plugin discovery, publisher status, provenance and security review live in ClawHub",
+        "docs/tools/plugin.md:40-43 — ClawHub is the default install source and primary discovery surface",
+        "docs/tools/plugin.md:51 — openclaw plugins install <package>",
+        "skills/clawhub/SKILL.md — search before claiming a capability is unavailable"
+      ],
+      "star_impact": "high",
+      "effort": "M",
+      "fit": "high",
+      "why": "Turns every recipe author into a distribution node; each external repo or post that says 'mini-ork recipe install <id>' advertises the project without maintainer effort.",
+      "first_step": "Add a remote source kind to mini_ork/recipes_catalog.py backed by a static registry.json (id, version, sha256, min_mini_ork_version, repo) and a mini-ork recipes search/install handler registered via register_subcommand in mini_ork/cli/main.py."
+    },
+    {
+      "candidate_id": "E2",
+      "name": "recipe init scaffold plus validate/pack contract",
+      "evidence": [
+        "docs/cli/plugins/authoring.md:16-22 — plugins init creates a minimal tool plugin and generates build/validate scripts",
+        "docs/cli/plugins/authoring.md:60-67 — plugins pack validates and writes a deterministic archive",
+        "docs/cli/plugins/authoring.md:85-93 — provider scaffold runs clawhub package validate and ships trusted-publishing metadata",
+        "docs/EXTENSION.md:26 — mini-ork currently tells authors to copy a shipped recipe"
+      ],
+      "star_impact": "high",
+      "effort": "M",
+      "fit": "high",
+      "why": "The moment a developer says 'I could wrap my workflow as a recipe' is the moment they become an author; a deterministic scaffold that produces a runnable dry-run converts most of them.",
+      "first_step": "Add mini_ork/cli/recipe_init.py registered as recipe-init, emitting task_class.yaml, workflow.yaml, artifact_contract.yaml, prompts/ and a verifier stub; add mini-ork recipe validate wrapping recipes/recipe-creator/verifiers/recipe-validator.py."
+    },
+    {
+      "candidate_id": "E3",
+      "name": "Portable recipe bundles (Claw / bundle-style plugins)",
+      "evidence": [
+        "docs/plugins/bundles.md:12-17 — four external bundle formats mapped into native features with a narrower trust boundary",
+        "docs/plugins/bundles.md:29-38 — install from directory, archive or marketplace",
+        "docs/cli/claws.md:12-14,40,50 — a Claw packages instructions, skills, plugins, MCP servers and automations; claws build makes a deterministic .tgz"
+      ],
+      "star_impact": "medium",
+      "effort": "M",
+      "fit": "high",
+      "why": "A single artifact is shareable in a way a directory tree is not: attach it to a release, link it in a README, hand it to a teammate, with no git submodule or copy step.",
+      "first_step": "Add schemas/recipe_bundle.schema.json and mini-ork recipe pack <dir> --out <tgz> writing a deterministic archive; accept mini-ork run ./bundle.tgz by unpacking into the run dir."
+    },
+    {
+      "candidate_id": "E4",
+      "name": "Migration importers from competing agent tools",
+      "evidence": [
+        "docs/cli/migrate.md:11 — bundled providers cover Claude, Codex CLI and Hermes; plugins can register additional providers",
+        "docs/cli/migrate.md:28 — openclaw migrate list",
+        "docs/cli/migrate.md:124 — Claude provider detects ~/.claude by default",
+        "extensions/migrate-claude/index.ts:9 — api.registerMigrationProvider(...)"
+      ],
+      "star_impact": "medium",
+      "effort": "M",
+      "fit": "medium",
+      "why": "Captures an existing user base at the moment of dissatisfaction ('I already have 40 Claude skills and commands') with a shareable 'switch without losing your setup' claim.",
+      "first_step": "Add mini_ork/cli/migrate.py registered as migrate with plan/apply; the first provider reads ~/.claude/skills/*/SKILL.md and .claude/commands/*.md into $MINI_ORK_ROOT/.agents/skills/, previews by default and never touches credentials."
+    },
+    {
+      "candidate_id": "E5",
+      "name": "Versioned extension SDK contract plus capability inspection",
+      "evidence": [
+        "docs/plugins/sdk-overview.md:11,25-36 — typed SDK contract, experimental status, pin host version, documented migration path",
+        "docs/plugins/architecture.md:38-52 — one registration API with many capability types",
+        "docs/plugins/architecture.md:90-100 — plugins inspect reports registered capabilities and compatibility signals",
+        "docs/gateway/external-apps.md:37 — stable packages for external apps, distinct from the in-process SDK",
+        "packages/plugin-sdk/package.json — explicit export map"
+      ],
+      "star_impact": "medium",
+      "effort": "M",
+      "fit": "high",
+      "why": "Developers build on a surface they can pin, test and inspect without reading core; that is the difference between a repository and a platform.",
+      "first_step": "Write docs/EXTENSION-SDK.md with a version table for the six register_* seams and a deprecation policy; add mini-ork extensions list --json reading PROVIDER_KIND_BUILDERS, GATE_EVALUATORS, node handlers, features, routing policies and subcommands."
+    },
+    {
+      "candidate_id": "E6",
+      "name": "In-CLI discovery (recipes and skills search)",
+      "evidence": [
+        "docs/tools/plugin.md:34-43 — openclaw plugins search is the first quick-start step",
+        "skills/clawhub/SKILL.md — search before claiming a capability is unavailable",
+        "docs/tools/plugin.md:123 — the source table makes results actionable",
+        "docs/tools/skills.md:27 — ClawHub card in the skills docs"
+      ],
+      "star_impact": "medium",
+      "effort": "S",
+      "fit": "high",
+      "why": "The first command a curious developer runs is a search; a populated result list proves the ecosystem exists, and an empty one proves it does not.",
+      "first_step": "Add mini_ork/cli/recipes_cmd.py with mini-ork recipes list and mini-ork recipes search <term>, backed by recipes_catalog.list_recipes and the matches.keywords field in task_class.yaml."
+    },
+    {
+      "candidate_id": "E7",
+      "name": "Provider breadth as a first-class extension surface",
+      "evidence": [
+        "extensions/ — 176 directories; docs/providers/ — 92 pages",
+        "docs/providers/index.md:9 — OpenClaw can use many LLM providers",
+        "extensions/deepseek/package.json — per-provider openclaw.install hints and publishToClawHub metadata",
+        "docs/plugins/architecture.md:38 — api.registerProvider(...) as one capability among many"
+      ],
+      "star_impact": "medium",
+      "effort": "M",
+      "fit": "high",
+      "why": "Every provider has a user community; 'works with your model' is a discovery vector and a small, well-scoped first contribution.",
+      "first_step": "Split config/providers.yaml entries into providers/<id>.yaml files carrying kind, family, model, docs_url and api_key_env; merge the directory with the single file in mini_ork/dispatch/providers.py and add mini-ork providers list --json."
+    },
+    {
+      "candidate_id": "E8",
+      "name": "Contributor funnel: correct CONTRIBUTING, issue routes, pre-PR review",
+      "evidence": [
+        "CONTRIBUTING.md:44 — hard cap of 20 open PRs per author",
+        "CONTRIBUTING.md:215,234,238 — AI-assisted PRs welcome, skills routed to ClawHub, good-first-issue link",
+        ".github/CODEOWNERS and three issue templates",
+        "skills/autoreview/SKILL.md — pre-PR review skill",
+        "docs/tools/plugin.md:147 — operator install policy can allow/warn/block"
+      ],
+      "star_impact": "medium",
+      "effort": "S",
+      "fit": "medium",
+      "why": "Stars follow contributors; a visible on-ramp turns a user into an author whose commits, posts and talks carry the name.",
+      "first_step": "Rewrite CONTRIBUTING.md for the Python runtime and worktree flow, and add .github/ISSUE_TEMPLATE/recipe_proposal.yml plus a good-first-issue section with 5-10 curated links."
+    },
+    {
+      "candidate_id": "E9",
+      "name": "Registry quality bar and signed feed",
+      "evidence": [
+        "docs/cli/plugins/marketplace.md:53-60 — hosted feed, clawhub-public profile, payload identity, DSSE verification, checksum pinning",
+        "docs/plugins/compatibility.md:20-30 — compatibility registry with statuses, owners, dates and removal gates",
+        "docs/tools/plugin.md:147 — operator install policy can allow/warn/block",
+        "docs/cli/plugins/authoring.md:85 — clawhub package validate"
+      ],
+      "star_impact": "medium",
+      "effort": "L",
+      "fit": "medium",
+      "why": "Teams adopt ecosystems they can defend in review; a security story turns individual stars into organizational adoption.",
+      "first_step": "Define schemas/recipe_registry.schema.json with version, sha256, min_mini_ork_version, author and review_status; make recipe install verify the checksum and refuse on mismatch, deferring signatures until third-party entries exist."
+    },
+    {
+      "candidate_id": "E10",
+      "name": "Skill exchange: mini-ork skills install over the shared SKILL.md format",
+      "evidence": [
+        "mini_ork/dispatch/skill_registry.py:1-80 — SKILL.md directories, run/operator/project tiers, .agents/skills shared with Zed",
+        "docs/CONFIG.md:471-520 — grant-by-name and precedence table",
+        "mini_ork/cli/skills.py:212-228 — list/show/validate/promote verbs",
+        "docs/tools/skills.md:32-46 — reference-side precedence model",
+        "docs/tools/creating-skills.md:207-228 — clawhub skill publish"
+      ],
+      "star_impact": "medium",
+      "effort": "S",
+      "fit": "high",
+      "why": "Skill authors are the largest contributor pool and the least likely to write framework code; because mini-ork already uses the same file format and .agents/skills location as OpenClaw and Zed, a skill written once is useful in three ecosystems.",
+      "first_step": "Add mini_ork skills install <name> [--dry-run] backed by a static skills/index.json; copy into $MINI_ORK_HOME/config/skills/<name>, run the existing validator and emit the same grant events."
+    }
+  ],
+  "shortlist": ["E2", "E1", "E10", "E6", "E8", "E3", "E5", "E7", "E4", "E9"],
+  "gap_analysis": [
+    {
+      "candidate_id": "E1",
+      "miniork_today": "mini_ork/recipes_catalog.py:174 lists recipes only under <home>/recipes and the engine recipes/ dir, with project shadowing at :241; mini_ork/cli/main.py:48-78 has no recipes subcommand.",
+      "gap": "No remote index, version/checksum metadata, install destination or source prefix; sharing requires a git clone or manual copy."
+    },
+    {
+      "candidate_id": "E2",
+      "miniork_today": "docs/EXTENSION.md:26 tells authors to copy a shipped recipe; recipes/recipe-creator/ is an LLM-driven recipe; mini_ork/cli/validate.py:407 validates a project, not a recipe directory.",
+      "gap": "No deterministic recipe init, template set or recipe validate/pack contract; the schema already lags the live dialect per docs/EXTENSION.md:32."
+    },
+    {
+      "candidate_id": "E3",
+      "miniork_today": "recipes are self-contained dirs (recipes/code-fix/ ships task class, workflow, artifact contract, prompts, verifiers, probes) and recipe-local register.py is loaded by mini_ork/cli/recipe_register.py.",
+      "gap": "No bundle manifest, deterministic pack command or install/unpack path; the format is defined by convention, not schema."
+    },
+    {
+      "candidate_id": "E4",
+      "miniork_today": "No migrate subcommand in mini_ork/cli/main.py:48-78; skills can be copied into .agents/skills or $MINI_ORK_HOME/config/skills; kickoffs are plain Markdown.",
+      "gap": "No preview/apply plan model, source detection, conflict handling or migration-provider registration seam."
+    },
+    {
+      "candidate_id": "E5",
+      "miniork_today": "Six register_* seams (providers.py:916, execute_handlers.py:3424, gate_registry.py:332, main.py:2203, features/registry.py:212, routing.py:336, semantic.py:178) documented in docs/EXTENSION.md.",
+      "gap": "No versioned compatibility policy, per-seam stability labels or introspection command proving what is registered in a process."
+    },
+    {
+      "candidate_id": "E6",
+      "miniork_today": "recipes_catalog.list_recipes returns every visible recipe with description and task class; task_class.yaml carries matches.keywords; the IDE thread pages consume it.",
+      "gap": "No user-facing recipes list/search CLI; discovery is only reachable through the IDE/thread session surfaces."
+    },
+    {
+      "candidate_id": "E7",
+      "miniork_today": "config/providers.yaml is one hand-maintained registry with several kind values; mini_ork/dispatch/providers.py:916 accepts new kinds; mini-ork providers status/configure handles credentials.",
+      "gap": "No per-provider files/packages, catalog command with docs URLs, or per-lane health matrix; adding a provider is a core config edit."
+    },
+    {
+      "candidate_id": "E8",
+      "miniork_today": "CONTRIBUTING.md, CODE_OF_CONDUCT.md, GOVERNANCE.md, MAINTAINERS.md, two issue templates, a PR template and CI exist.",
+      "gap": "CONTRIBUTING.md:19-27,58-70 still documents the removed bash runtime (tests/smoke.sh, shellcheck, bash arrays); no recipe/plugin proposal route, curated good-first-issue section, or pre-PR review skill."
+    },
+    {
+      "candidate_id": "E9",
+      "miniork_today": "config/vault.example.yaml demonstrates the simple/secure two-tier pattern; mini_ork/cli/skills.py:97 validates skill frontmatter; recipes are local and unreviewed by construction.",
+      "gap": "No checksums, provenance, compatibility floors or install policy hook on the recipe path; the codebase knows how to fail closed but the recipe path has no gate."
+    },
+    {
+      "candidate_id": "E10",
+      "miniork_today": "mini_ork/dispatch/skill_registry.py resolves SKILL.md directories across run/operator/project tiers and .agents/skills; mini-ork skills list/show/validate/promote exists at mini_ork/cli/skills.py:212-228; docs/CONFIG.md:471 documents grants and precedence.",
+      "gap": "No search, install, publish or remote index; the registry is local-only."
+    }
+  ],
+  "open_questions": [
+    "Where should community recipes live: a separate registry repo, or PRs to recipes/? If recipes stay in-tree, E1 and E3 drop in value and E2/E6 dominate.",
+    "Who is the primary audience: agent-workflow developers authoring recipes, or ops teams wiring providers/gates? The former ranks E2/E1/E3 above E7; the latter ranks E7/E9 higher.",
+    "Can mini-ork support arbitrary recipe code safely? Recipe-local register.py and verifier scripts are code execution; without a sandbox or review bar, E1/E3 need curation or a trust model.",
+    "Is there an existing distribution channel (PyPI packages, GitHub templates) that makes a new registry redundant? If so, E1 shrinks to a thin index and E3 becomes the main artifact.",
+    "Do Claude Code / Codex skill authors want a second registry, or is GitHub enough? If GitHub is enough, E10 shrinks to a documented import path absorbed by E4.",
+    "What is the maintainer capacity for review? A registry with no review is worse than none, and the answer decides whether E1 launches open or curated."
+  ],
+  "read_only_attestation": {
+    "reference_modified": false,
+    "target_modified": false,
+    "files_written": ["lens-ecosystem.md", "context-ecosystem_lens.json"]
+  }
+}
