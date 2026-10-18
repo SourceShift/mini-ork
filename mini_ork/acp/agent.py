@@ -33,6 +33,7 @@ import asyncio
 import base64
 import binascii
 import datetime as _dt
+import inspect
 import json
 import re
 import os
@@ -90,6 +91,14 @@ from acp.schema import (
 
 from mini_ork.acp import commands as _commands
 from mini_ork.acp import diffs as _diffs
+from mini_ork.acp.thread_cards import (
+    failure_card,
+    kickoff_card,
+    node_card,
+    review_card,
+    run_card,
+    with_meta,
+)
 from mini_ork.acp import history
 from mini_ork.acp import orchestration as _orchestration
 from mini_ork.acp import plan as _plan
@@ -480,6 +489,15 @@ _LANE_REPAIR_OFFERED = "offered"
 _LANE_REPAIR_DECLINED = "declined"
 _LANE_REPAIR_RESUMED = "resumed"
 
+# ``_offer_failure_recovery`` outcomes, mirroring the lane-repair contract:
+# ``_OFFERED`` leaves the marker open for the user's answer; ``_RESUMED`` says a
+# detached recover was spawned and the follower keeps going; ``_DECLINED`` and
+# ``_NONE`` both let the follower close the marker ``failed`` as today.
+_FAILURE_RECOVERY_NONE = "none"
+_FAILURE_RECOVERY_OFFERED = "offered"
+_FAILURE_RECOVERY_DECLINED = "declined"
+_FAILURE_RECOVERY_RESUMED = "resumed"
+
 
 def _extract_prompt_text(prompt: list[Any]) -> str:
     """Flatten the text content blocks of an ACP prompt into one string."""
@@ -847,6 +865,12 @@ class MiniOrkAcpAgent:
         self._routes: dict[str, tuple[str, str]] = {}
         # run id → last status the projection saw (closes the run's marker).
         self._run_status: dict[str, str] = {}
+        # run id → the snapshot ``_await_terminal`` saw when it handed the run
+        # back as terminated. ``_offer_run_review`` consumes the review facts
+        # (``task_state``) from it instead of polling the reader again: an
+        # extra read is observable to a stateful reader and used to shift the
+        # status the lane-repair resume waits for. One-shot: popped on use.
+        self._terminal_snapshot: dict[str, dict[str, Any]] = {}
         # thread session id → {"orchestrator" | run id: cost USD}; the thread
         # reports one cumulative cost instead of the latest run's.
         self._thread_costs: dict[str, dict[str, float]] = {}
@@ -969,6 +993,15 @@ class MiniOrkAcpAgent:
         # ``_follow_in_thread`` can cite it if the resume never reaches the
         # executor (the reply the decision handler reads carries the path).
         self._lane_repair_recover: dict[str, str] = {}
+        # run id → True once the non-lane failure card (or its one-time
+        # message) was offered for this incarnation of the run. Same
+        # per-incarnation lifecycle as ``_lane_repair_emitted`` — cleared when
+        # a failure-card resume starts and on replay, so a reopened thread can
+        # offer again (a load that resets ``_emitted`` must reset this too).
+        self._failure_recovery_emitted: set[str] = set()
+        # run id → the detached recover log path for a failure-card resume,
+        # cited when the resume never reaches the executor.
+        self._failure_recovery_recover: dict[str, str] = {}
         # Per-run env overlay merged into ``_launch``'s ``extra_env``.
         # Zed S7a: the race turn seeds each run's entry so
         # ``MO_ROUTING_POLICY=workflow_default`` survives the spawn.
@@ -3469,15 +3502,28 @@ class MiniOrkAcpAgent:
         prior_art_block = self._render_kickoff_prior_art_block(session_id, draft_id)
         if prior_art_block:
             title = f"{title}\n\n{prior_art_block}"
+        tool_call = ToolCallUpdate(
+            tool_call_id=tool_call_id,
+            kind="edit",
+            title=title,
+            status="pending",
+        )
+        # Projector-derived kickoff card, parsed from the staged draft. The
+        # permission call owns the tool-call id, so the card takes it too.
+        try:
+            staged = self._home_for(session_id) / "kickoff-drafts" / f"{draft_id}.md"
+            markdown = staged.read_text(encoding="utf-8")
+            card = kickoff_card(str(staged), markdown, recipe=recipe)
+            card["id"] = tool_call_id
+            tool_call = with_meta(tool_call, card)
+        except (OSError, UnicodeDecodeError, ValueError):
+            pass
+        except Exception:  # noqa: BLE001 — a card is best-effort
+            pass
         try:
             response = await self._conn.request_permission(
                 session_id=session_id,
-                tool_call=ToolCallUpdate(
-                    tool_call_id=tool_call_id,
-                    kind="edit",
-                    title=title,
-                    status="pending",
-                ),
+                tool_call=tool_call,
                 options=options,
             )
         except Exception:  # noqa: BLE001 — UI is best-effort, the draft survives
@@ -3878,16 +3924,39 @@ class MiniOrkAcpAgent:
             # worktree (``worktree``). See kickoff §Where a run works.
             prefix = "this worktree" if adopted else "worktree"
             title = f"{title} · {prefix} {worktree_branch}"
-        await self._emit(
-            thread_id,
-            ToolCallStart(
-                session_update="tool_call",
-                tool_call_id=f"{run_id}:parent",
-                title=title,
-                status="in_progress",
-                kind="other",
-            ),
+        # Projector-derived card: the run marker carries the same run card on
+        # the live path and on replay. The marker is opened before the run's
+        # first poll, so the snapshot is usually not readable yet; build from
+        # run_id + recipe + the cached ``_run_status`` (the kickoff's stated
+        # fallback). The marker itself is recorded in the thread JSONL, so this
+        # card survives a reopen without re-deriving it from run data.
+        card: dict[str, Any] | None = None
+        worktree = None
+        if worktree_branch:
+            worktree = {
+                "mode": "this worktree" if adopted else "worktree",
+                "branch": worktree_branch,
+            }
+        try:
+            cached_status = str(self._run_status.get(run_id) or "")
+            card = run_card(
+                {"status": cached_status} if cached_status else {},
+                run_id=run_id,
+                recipe=recipe,
+                worktree=worktree,
+            )
+        except Exception:  # noqa: BLE001 — a card is best-effort
+            card = None
+        update = ToolCallStart(
+            session_update="tool_call",
+            tool_call_id=f"{run_id}:parent",
+            title=title,
+            status="in_progress",
+            kind="other",
         )
+        if card is not None:
+            update = with_meta(update, card)
+        await self._emit(thread_id, update)
 
     async def _follow_in_thread(self, thread_id: str, run_id: str) -> StopReason:
         """Project routed ``run_id`` until it ends, then close its marker.
@@ -3947,8 +4016,10 @@ class MiniOrkAcpAgent:
             if await self._offer_node_review(thread_id, run_id):
                 return stop  # review card/message — marker stays open
             if not ok:
+                lane_outcome: str | None = None
                 if resumes < _LANE_REPAIR_MAX_RESUMES:
                     repair = await self._offer_lane_repair(thread_id, run_id)
+                    lane_outcome = repair
                     if repair == _LANE_REPAIR_RESUMED:
                         resumes += 1
                         # A later failure is a NEW one: forget this offer's
@@ -3978,6 +4049,36 @@ class MiniOrkAcpAgent:
                         # The user was told (buttons, or the one-time message);
                         # the marker stays ``in_progress`` until they answer.
                         return stop
+                # Non-lane failure: one failure card with the recovery
+                # choices, before the marker is closed ``failed``. A ``None``
+                # outcome (resume cap reached) still passes through — the
+                # offer refuses a lane hint itself, so the two channels never
+                # ask the same question twice.
+                if lane_outcome in (None, _LANE_REPAIR_NONE):
+                    recovery = await self._offer_failure_recovery(thread_id, run_id)
+                    if recovery == _FAILURE_RECOVERY_OFFERED:
+                        # Forensics chosen: the card stays open for the user.
+                        return stop
+                    if recovery == _FAILURE_RECOVERY_RESUMED:
+                        resumes += 1
+                        self._failure_recovery_emitted.discard(run_id)
+                        log_path = self._failure_recovery_recover.pop(run_id, "")
+                        self._run_status.pop(run_id, None)
+                        await self._emit(thread_id, ToolCallProgress(
+                            session_update="tool_call_update",
+                            tool_call_id=f"{run_id}:parent",
+                            status="in_progress",
+                        ))
+                        if await self._await_resume_started(run_id):
+                            continue  # follow the recovered run to its end
+                        await self._emit(
+                            thread_id,
+                            self._build_refusal_message(
+                                self._failure_recovery_no_start_message(
+                                    run_id, log_path
+                                )
+                            ),
+                        )
                 # ``declined`` / ``none`` — and the resume cap, or a resume
                 # that never started: the follower moves on from this failure,
                 # so a later one offers a fresh prompt.
@@ -4239,32 +4340,46 @@ class MiniOrkAcpAgent:
     async def _ask_node_review(self, thread_id: str, run_id: str, node: str) -> str | None:
         """Show the Approve / Request changes / Later card for one node and
         return the picked option id (``None`` when dismissed or on error)."""
+        options = [
+            PermissionOption(
+                option_id="approve",
+                name="Approve and resume",
+                kind="allow_once",
+            ),
+            PermissionOption(
+                option_id="changes",
+                name="Request changes…",
+                kind="reject_once",
+            ),
+            PermissionOption(
+                option_id="later",
+                name="Later",
+                kind="reject_once",
+            ),
+        ]
+        tool_call = ToolCallUpdate(
+            tool_call_id=f"{run_id}:review",
+            kind="other",
+            title=f"Review {node} of run {run_id}",
+            status="pending",
+        )
+        try:
+            card = review_card(
+                run_id,
+                {
+                    "status": self._run_status.get(run_id) or "reviewing",
+                    "detail": f"Waiting for review of {node}",
+                },
+                options,
+            )
+            tool_call = with_meta(tool_call, card)
+        except Exception:  # noqa: BLE001 — the card is best-effort
+            pass
         try:
             response = await self._conn.request_permission(
                 session_id=thread_id,
-                tool_call=ToolCallUpdate(
-                    tool_call_id=f"{run_id}:review",
-                    kind="other",
-                    title=f"Review {node} of run {run_id}",
-                    status="pending",
-                ),
-                options=[
-                    PermissionOption(
-                        option_id="approve",
-                        name="Approve and resume",
-                        kind="allow_once",
-                    ),
-                    PermissionOption(
-                        option_id="changes",
-                        name="Request changes…",
-                        kind="reject_once",
-                    ),
-                    PermissionOption(
-                        option_id="later",
-                        name="Later",
-                        kind="reject_once",
-                    ),
-                ],
+                tool_call=tool_call,
+                options=options,
             )
         except Exception:  # noqa: BLE001 — UI is best-effort
             return None
@@ -4452,7 +4567,9 @@ class MiniOrkAcpAgent:
         run_dir = self._home_for(run_id) / "runs" / run_id
         if not run_dir.is_dir():
             return False
-        snap = (self._reader or self._read_snapshot)(run_id) or {}
+        snap = self._terminal_snapshot.pop(run_id, None)
+        if snap is None:
+            snap = (self._reader or self._read_snapshot)(run_id) or {}
         ts = _task_state.task_state(run_dir, snap)
         if ts.state != "needs_you" or not ts.detail.startswith("Ready to review:"):
             return False
@@ -4468,24 +4585,35 @@ class MiniOrkAcpAgent:
 
         ws = _workspaces.load(self._home_for(run_id), run_id)
         base_branch = ws.base_branch if ws is not None else ""
+        options = [
+            PermissionOption(
+                option_id="merge",
+                name=f"Merge into {base_branch}" if base_branch else "Merge",
+                kind="allow_once",
+            ),
+            PermissionOption(option_id="discard", name="Discard changes", kind="reject_always"),
+            PermissionOption(option_id="keep", name="Keep for later", kind="reject_once"),
+        ]
+        tool_call = ToolCallUpdate(
+            tool_call_id=f"{run_id}:parent",
+            kind="edit",
+            title=f"Review run {run_id} (+{ts.added} −{ts.removed})",
+            status="pending",
+        )
+        try:
+            card = review_card(
+                run_id,
+                {"status": "reviewing", "detail": ts.detail},
+                options,
+            )
+            tool_call = with_meta(tool_call, card)
+        except Exception:  # noqa: BLE001 — the card is best-effort
+            pass
         try:
             response = await self._conn.request_permission(
                 session_id=thread_id,
-                tool_call=ToolCallUpdate(
-                    tool_call_id=f"{run_id}:parent",
-                    kind="edit",
-                    title=f"Review run {run_id} (+{ts.added} −{ts.removed})",
-                    status="pending",
-                ),
-                options=[
-                    PermissionOption(
-                        option_id="merge",
-                        name=f"Merge into {base_branch}" if base_branch else "Merge",
-                        kind="allow_once",
-                    ),
-                    PermissionOption(option_id="discard", name="Discard changes", kind="reject_always"),
-                    PermissionOption(option_id="keep", name="Keep for later", kind="reject_once"),
-                ],
+                tool_call=tool_call,
+                options=options,
             )
         except Exception:  # noqa: BLE001 — UI is best-effort, marker stays open
             return True
@@ -4672,18 +4800,28 @@ class MiniOrkAcpAgent:
         options.append(
             PermissionOption(option_id="abandon", name="Leave it", kind="reject_once")
         )
+        tool_call = ToolCallUpdate(
+            tool_call_id=f"{run_id}:parent",
+            kind="other",
+            title=(
+                f"{run_id} stopped: {lane} {summary_tail}. "
+                f"Resume from {failed_node}?"
+            ),
+            status="pending",
+        )
+        try:
+            card = review_card(
+                run_id,
+                {"status": "failed", "detail": f"Lane {lane} failed at {failed_node}"},
+                options,
+            )
+            tool_call = with_meta(tool_call, card)
+        except Exception:  # noqa: BLE001 — the card is best-effort
+            pass
         try:
             response = await self._conn.request_permission(
                 session_id=thread_id,
-                tool_call=ToolCallUpdate(
-                    tool_call_id=f"{run_id}:parent",
-                    kind="other",
-                    title=(
-                        f"{run_id} stopped: {lane} {summary_tail}. "
-                        f"Resume from {failed_node}?"
-                    ),
-                    status="pending",
-                ),
+                tool_call=tool_call,
                 options=options,
             )
         except Exception:  # noqa: BLE001 — UI is best-effort, marker stays open
@@ -4753,6 +4891,202 @@ class MiniOrkAcpAgent:
         """Announce a started resume whose row never left the terminal set."""
         see = f" — see `{log_path}`" if log_path else ""
         return f"The resume did not start{see}. Run `/recover {run_id}` to try again."
+
+    async def _offer_failure_recovery(self, thread_id: str, run_id: str) -> str:
+        """Offer Recover / Resume from node / Forensics / Leave on a failed run.
+
+        Called from ``_follow_in_thread`` after the lane-repair branch and
+        before the marker is closed ``failed``. Only non-lane failures reach
+        the card (a lane hint is owned by ``_offer_lane_repair``).
+
+        Returns one of ``_FAILURE_RECOVERY_OFFERED`` (card or message shown;
+        the marker stays open for a forensics request), ``_FAILURE_RECOVERY_RESUMED``
+        (a detached recover was spawned; the follower keeps going),
+        ``_FAILURE_RECOVERY_DECLINED`` (the user left it / dismissed), or
+        ``_FAILURE_RECOVERY_NONE`` (not our failure, or any internal error) —
+        the last two let the follower close the marker ``failed`` as today.
+
+        Never raises into the follower: every seam is wrapped. A missing or
+        malformed snapshot/hint still yields a minimal card.
+        """
+        try:
+            if run_id in self._failure_recovery_emitted:
+                # Already offered for this incarnation: do not re-post.
+                return _FAILURE_RECOVERY_OFFERED
+            # A race run surfaces its decision on the parent permission card.
+            if run_id in self._skip_review:
+                return _FAILURE_RECOVERY_NONE
+            try:
+                snapshot = (self._reader or self._read_snapshot)(run_id) or {}
+            except Exception:  # noqa: BLE001 — minimal card is still valid
+                snapshot = {}
+            # A run with no node event never reached a node: there is no failed
+            # node for the hint to name and nothing for ``recover --from-node``
+            # to resume. Keep today's plain ``failed`` close rather than ask a
+            # recovery question the run data cannot back.
+            events = snapshot.get("events") if isinstance(snapshot, dict) else None
+            has_node_event = isinstance(events, list) and any(
+                isinstance(event, dict)
+                and str(event.get("event_type") or "").startswith("node_")
+                for event in events
+            )
+            if not has_node_event:
+                return _FAILURE_RECOVERY_NONE
+            hint: dict[str, Any] | None = None
+            try:
+                from mini_ork.recovery import retry_hint
+
+                loaded = retry_hint.load_or_compute(
+                    self._home_for(run_id), run_id, write=False
+                )
+                # The production seam is synchronous; tests may inject an
+                # async stub. Support both without assuming one.
+                if inspect.isawaitable(loaded):
+                    loaded = await loaded
+                hint = loaded if isinstance(loaded, dict) else None
+            except Exception:  # noqa: BLE001 — minimal card is still valid
+                hint = None
+            # A lane failure was already answered by the lane-repair channel;
+            # do not ask a second, conflicting question.
+            needs_change = hint.get("needs_change") if isinstance(hint, dict) else None
+            if isinstance(needs_change, dict) and (
+                str(needs_change.get("kind") or "") == "lane"
+            ):
+                return _FAILURE_RECOVERY_NONE
+
+            run_dir = self._home_for(run_id) / "runs" / run_id
+            try:
+                diagnosis = run_dir / "diagnosis.json"
+                diagnosis_path = str(diagnosis) if diagnosis.is_file() else None
+            except (OSError, ValueError):
+                diagnosis_path = None
+
+            self._failure_recovery_emitted.add(run_id)
+            active_turn = (
+                self._direct_runs.get(thread_id) == run_id
+                or self._orchestrator_tasks.get(thread_id) is not None
+            )
+            if not active_turn or self._conn is None:
+                # No live UI to host the buttons: one message naming the exact
+                # command, then the follower closes the marker as today.
+                try:
+                    await self._emit(
+                        thread_id,
+                        self._build_refusal_message(
+                            f"Run {run_id} failed. Run `mini-ork recover {run_id}` "
+                            f"to resume; forensics are under `{run_dir}`."
+                        ),
+                    )
+                except Exception:  # noqa: BLE001 — never raise into the follower
+                    pass
+                return _FAILURE_RECOVERY_NONE
+
+            card = failure_card(
+                run_id, snapshot, hint, diagnosis_path=diagnosis_path
+            )
+            options = [
+                PermissionOption(
+                    option_id=str(action.get("option_id")),
+                    name=str(action.get("label") or action.get("option_id")),
+                    kind=(
+                        "reject_once"
+                        if action.get("option_id") == "leave"
+                        else "allow_once"
+                    ),
+                )
+                for action in card.get("actions") or []
+                if isinstance(action, dict)
+                and action.get("kind") == "permission"
+                and action.get("option_id")
+            ]
+            response = await self._conn.request_permission(
+                session_id=thread_id,
+                tool_call=with_meta(
+                    ToolCallUpdate(
+                        tool_call_id=f"{run_id}:failure",
+                        kind="other",
+                        title=f"Run {run_id} failed — recover?",
+                        status="pending",
+                    ),
+                    card,
+                ),
+                options=options,
+            )
+            outcome = getattr(response, "outcome", None) if response is not None else None
+            option_id = (
+                getattr(outcome, "option_id", None) if outcome is not None else None
+            )
+            return await self._handle_failure_recovery_decision(
+                thread_id, run_id, option_id, run_dir, diagnosis_path
+            )
+        except Exception:  # noqa: BLE001 — never raise into the follower
+            return _FAILURE_RECOVERY_NONE
+
+    async def _handle_failure_recovery_decision(
+        self,
+        thread_id: str,
+        run_id: str,
+        option_id: str | None,
+        run_dir: Path,
+        diagnosis_path: str | None,
+    ) -> str:
+        """Apply the user's pick on a failure card.
+
+        ``recover`` and ``resume:<node>`` reuse the detached ``/recover`` path
+        the lane repair uses; the reply's log path is the only proof a recover
+        was actually spawned, so a refused spawn reports ``DECLINED`` (never
+        ``RESUMED``). ``forensics`` names the path and leaves the card open;
+        ``leave``/dismissed lets the follower close the marker ``failed``.
+        """
+        if option_id == "forensics":
+            target = diagnosis_path or str(run_dir)
+            await self._emit(
+                thread_id,
+                self._build_refusal_message(
+                    f"Forensics: `{target}`"
+                ),
+            )
+            return _FAILURE_RECOVERY_OFFERED
+        if not isinstance(option_id, str):
+            return _FAILURE_RECOVERY_DECLINED
+        if option_id == "recover":
+            arg = run_id
+        elif option_id.startswith("resume:"):
+            node = option_id[len("resume:"):]
+            arg = f"{run_id} --from-node {node}" if node else run_id
+        else:
+            # ``leave`` / dismissed / an unknown option: close as today.
+            return _FAILURE_RECOVERY_DECLINED
+        from mini_ork.acp import commands as _commands_local
+
+        try:
+            reply = await _commands_local.handle(self, thread_id, "recover", arg)
+        except Exception as exc:  # noqa: BLE001 — surface, never raise
+            await self._emit(
+                thread_id,
+                self._build_refusal_message(f"`/recover` failed: {exc}"),
+            )
+            return _FAILURE_RECOVERY_DECLINED
+        if isinstance(reply, _commands_local.CommandReply):
+            text = reply.text
+            await self._emit(thread_id, self._build_refusal_message(text))
+            await self._emit_file_links(thread_id, reply.links)
+        else:
+            text = str(reply)
+            await self._emit(thread_id, self._build_refusal_message(text))
+        match = re.search(r"log: `([^`]+)`", text)
+        if not match:
+            # The recover refused or failed to spawn (the reply is already in
+            # the thread), so nothing resumed: report that honestly rather
+            # than claiming a resume.
+            return _FAILURE_RECOVERY_DECLINED
+        self._failure_recovery_recover[run_id] = match.group(1)
+        return _FAILURE_RECOVERY_RESUMED
+
+    def _failure_recovery_no_start_message(self, run_id: str, log_path: str) -> str:
+        """Announce a failure-card resume whose row never left the terminal set."""
+        see = f" — see `{log_path}`" if log_path else ""
+        return f"The recovery did not start{see}. Run `mini-ork recover {run_id}` to try again."
 
     async def _offer_thread_review(self, thread_id: str) -> None:
         """Orchestrator turn-end pass: walk the runs this thread followed
@@ -4956,12 +5290,23 @@ class MiniOrkAcpAgent:
 
     # ── read-model projection ────────────────────────────────────────────────
 
-    def _build_event_updates(self, events: list[dict[str, Any]] | None) -> list[Any]:
+    def _build_event_updates(
+        self,
+        events: list[dict[str, Any]] | None,
+        *,
+        run_id: str | None = None,
+        recipe: str | None = None,
+    ) -> list[Any]:
         """Project node lifecycle events into ToolCallStart/ToolCallProgress.
 
         Pure projection: every event in the batch becomes an update. Callers
         that poll repeatedly must pre-filter to *new* events (see
         ``_project_snapshot``) so each transition is emitted exactly once.
+
+        When a run context (``run_id`` + ``recipe``) is supplied, each update
+        also carries a projector-derived ``node_card``. The tool-call id stays
+        unprefixed here — ``_emit`` adds the routed run's prefix. Callers that
+        omit the context keep the pre-card behaviour exactly.
         """
         updates: list[Any] = []
         for ev in events or []:
@@ -4973,23 +5318,35 @@ class MiniOrkAcpAgent:
                     payload = {}
             node_id = str(payload.get("node_id") or ev.get("node_id") or "node")
             title = str(payload.get("node_type") or ev.get("node_type") or "node")
+            update: Any
             if ev.get("event_type") == "node_start":
-                updates.append(
-                    ToolCallStart(
-                        session_update="tool_call",
-                        tool_call_id=node_id,
-                        title=title,
-                        status="in_progress",
-                    )
+                update = ToolCallStart(
+                    session_update="tool_call",
+                    tool_call_id=node_id,
+                    title=title,
+                    status="in_progress",
                 )
             elif ev.get("event_type") == "node_end":
-                updates.append(
-                    ToolCallProgress(
-                        session_update="tool_call_update",
-                        tool_call_id=node_id,
-                        status="completed",
-                    )
+                update = ToolCallProgress(
+                    session_update="tool_call_update",
+                    tool_call_id=node_id,
+                    # The verdict is in the event payload; the card carries it
+                    # in full (status + detail).
+                    status="completed",
                 )
+            else:
+                continue
+            if run_id:
+                try:
+                    card = node_card(
+                        ev,
+                        run_id=run_id,
+                        recipe=recipe or self._recipe,
+                    )
+                    update = with_meta(update, card)
+                except Exception:  # noqa: BLE001 — card is best-effort
+                    pass
+            updates.append(update)
         return updates
 
     def _event_transition_key(self, ev: dict[str, Any]) -> str | None:
@@ -5530,7 +5887,14 @@ class MiniOrkAcpAgent:
         # so nothing written at the very end is lost (kickoff §3).
         if live:
             await self._drain_live_for(session_id)
-        updates = self._build_event_updates(new_events)
+        # The run context lets every node update carry its projector-derived
+        # card. Both the live projection and ``_replay_run_in_thread`` pass the
+        # same values, so a reopened thread reconstructs identical cards.
+        updates = self._build_event_updates(
+            new_events,
+            run_id=session_id,
+            recipe=self._recipes.get(session_id) or self._recipe,
+        )
         updates.append(self._build_usage_update(snapshot.get("llm_calls")))
         status = snapshot.get("status")
         if status is not None:
@@ -5765,6 +6129,7 @@ class MiniOrkAcpAgent:
                     )
                     return "refusal"
             if snapshot.get("status") in TERMINAL_STATUSES:
+                self._terminal_snapshot[session_id] = snapshot
                 return "end_turn"
             # Parked review: ``status == "reviewing"`` is not in
             # ``TERMINAL_STATUSES`` (it has 12 consumers that would treat
@@ -5783,6 +6148,7 @@ class MiniOrkAcpAgent:
             if snapshot.get("status") == "reviewing":
                 run_dir = self._home_for(session_id) / "runs" / session_id
                 if (run_dir / ".review-pause").is_file():
+                    self._terminal_snapshot[session_id] = snapshot
                     return "end_turn"
                 # Resolved (sentinel renamed to ``.review-pause.resolved``)
                 # but the row is still ``reviewing``: the resume is about to
@@ -6415,6 +6781,13 @@ class MiniOrkAcpAgent:
         # 2nd thread load fires the diff update again.
         self._diff_emitted = {key for key in self._diff_emitted if key[0] != run_id}
         self._text_seen = {key for key in self._text_seen if key[0] != run_id}
+        # The failure-card offer is per run incarnation. A replay is a fresh
+        # projection of the run (the same reason ``_emitted`` is reset), so a
+        # second load must be able to offer the card again instead of silently
+        # suppressing the first location.
+        self._failure_recovery_emitted.discard(run_id)
+        self._failure_recovery_recover.pop(run_id, None)
+        self._terminal_snapshot.pop(run_id, None)
         # Z6: the plan dedup lives on the destination (the thread) so reset
         # it here too — without this the thread would see no plan after a
         # replay because the canonical tuple still matches what an earlier
