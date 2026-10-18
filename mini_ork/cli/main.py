@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from mini_ork import trace_store
+from mini_ork.version import __version__
 from mini_ork.context import (
     apply_env_overrides,
     context_env,
@@ -116,7 +117,9 @@ _NATIVE_MODULE_SUBS = {
     "kickoff": "mini_ork.cli.kickoff_cmd",
 }
 
-_HELP = """mini-ork — task operating system for agents (v0.1)
+# The body stays a plain string: it documents `${NAME}` env vars, and an
+# f-string would read those braces as format fields.
+_HELP = f"mini-ork — task operating system for agents (v{__version__})\n" + """\
 
 Universal loop subcommands:
   classify <kickoff.md>          Route kickoff to a task_class
@@ -2130,7 +2133,7 @@ def _doctor_handler(rest, root):
 
 def _version_handler(rest, root):
     del rest, root
-    print("mini-ork 0.9.0 (universal task loop runtime)")
+    print(f"mini-ork {__version__} (universal task loop runtime)")
     return 0
 
 

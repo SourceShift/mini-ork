@@ -30,6 +30,16 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- release: one version source, and CI is the release gate. `pyproject.toml` now
+  reads `mini_ork/version.py` (`dynamic = ["version"]`), so the distribution
+  metadata, `mini-ork version`, the `--help` header and the ACP `initialize`
+  handshake cannot disagree — they did: `--help` said `v0.1` while `version`
+  said `0.9.0`. `release.yml` now calls `.github/workflows/ci.yml` as a
+  reusable workflow instead of running its own narrower ruff + unit gate, and
+  it fails closed when the pushed tag does not match `mini_ork/version.py` or
+  when the built wheel does not carry the tagged version. A `v*` tag can no
+  longer publish an artifact from a commit the full matrix never accepted.
+
 - chore(ui): the IDE crate has its own repository,
   [`SourceShift/mini-ork-ui`](https://github.com/SourceShift/mini-ork-ui), vendored here as the
   `ui/` git submodule — and in the `zed-mini-ork` fork at `crates/mini_ork_ui/` — instead of being

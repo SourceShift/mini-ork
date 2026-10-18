@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import runpy
 import shutil
 import stat
 import subprocess
@@ -13,7 +14,9 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 BIN = REPO / "bin" / "mini-ork"
-VERSION = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+# pyproject declares the version dynamically from mini_ork/version.py — the one
+# source. Read it directly; importing the package is not needed here.
+VERSION = runpy.run_path(str(REPO / "mini_ork" / "version.py"))["__version__"]
 
 
 def _installer_module():

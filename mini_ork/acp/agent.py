@@ -98,6 +98,7 @@ from mini_ork.acp import task_state as _task_state
 from mini_ork.acp.task_state import TaskState as _TaskState
 from mini_ork.acp.live import LiveTail, normalize
 from mini_ork.acp.threads import ThreadStore, title_from_text
+from mini_ork.version import __version__
 from mini_ork.run_status import TERMINAL as TERMINAL_STATUSES
 from mini_ork.web.control import _is_safe_token
 
@@ -1022,7 +1023,7 @@ class MiniOrkAcpAgent:
         )
         return InitializeResponse(
             protocol_version=PROTOCOL_VERSION,
-            agent_info=Implementation(name="mini-ork-acp", version="0.9.0"),
+            agent_info=Implementation(name="mini-ork-acp", version=__version__),
             agent_capabilities=AgentCapabilities(
                 load_session=True,
                 prompt_capabilities=PromptCapabilities(

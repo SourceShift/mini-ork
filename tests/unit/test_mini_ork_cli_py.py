@@ -10,7 +10,6 @@ import json
 import os
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,7 +18,7 @@ sys.path.insert(0, str(REPO))
 from mini_ork.cli import main as cli
 
 BIN = REPO / "bin" / "mini-ork"
-VERSION = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+VERSION = cli.__version__
 
 
 def _version_output() -> str:
