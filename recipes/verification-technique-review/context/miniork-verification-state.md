@@ -33,6 +33,25 @@ audit found three oracle gates at 0.8 and a fix brought them to 0.0; the
 equivalence operator made 4/4 correct-but-rejected surfaces PROVEN while 0/5
 wrong expectations passed.
 
+The 2026-10-18 review (`run verify-agentic-20261018-215339`, 2000 papers)
+shipped **eight** more instruments, documented in sections ⑦–⑭ of
+`docs/architecture/verification-stack.md`. Do not re-recommend these as new:
+
+| # | Technique | Module | Knob (default) |
+|---|---|---|---|
+| ⑦ | Oracle integrity audit (7 injected defects + 3 controls) | `mini_ork/gates/oracle_integrity.py` | `MO_ORACLE_INTEGRITY` (`1`) |
+| ⑧ | Judge validity vs execution evidence, per lane | `mini_ork/gates/judge_validity.py` | `MO_JUDGE_VALIDITY` (off), `MO_JUDGE_VALIDITY_MIN` (`0.80`, tighten-only) |
+| ⑨ | Reward↔evidence pairing (drop contradicted positive rewards) | `mini_ork/learning/reward_audit.py` + `learning/writeback.py` | `MO_REWARD_EVIDENCE_PAIRING` (`1`; `shadow`; `0`) |
+| ⑩ | Verifier mutation discrimination (6 mutations) | `mini_ork/gates/verifier_mutation.py` + `verify/catalog.py` | `MO_VERIFIER_MUTATION` (`1`), `MO_VERIFIER_MUTATION_MIN` (`0.8`) |
+| ⑪ | Split-conformal abstention gate | `mini_ork/gates/conformal_gate.py` | `MO_CONFORMAL_ORACLE` (off), `MO_CONFORMAL_ALPHA` (`0.10`) |
+| ⑫ | Discrimination-anchored test evidence | `mini_ork/certify/discrimination.py` + `certify/oracle.py` | `MO_ASSAY_DISCRIMINATION` (`1`), `MO_DISCRIMINATION_MIN` (`1.0`) |
+| ⑬ | Behavioral recomputation (two independent replays) | `mini_ork/certify/recompute.py` + `verify/behavioral.py` | declared `Observable.recompute` block |
+| ⑭ | Hidden regenerable ground truth (PoC variants) | `mini_ork/certify/hidden_checks.py` + `certify/oracle.py` | `MO_ASSAY_HIDDEN` (`1`), `MO_HIDDEN_TRIALS` (`2`), `MO_HIDDEN_CHECK_SECRET` |
+
+All eight have unit coverage; each was merged through a `framework-edit` run
+and a scoped green test gate. The review's remaining 51 "next" and 64 "watch"
+techniques are NOT shipped — they are still legitimate recommendations.
+
 ## Shipped and acting (the loop uses these today)
 
 - **Execution-anchored runtime (Crucible)** — `mini_ork/runtime/engine.py`. Runs a
