@@ -2033,6 +2033,27 @@ def _execute_inprocess(rest, root):
     return mini_ork_execute.main(rest, root=root)
 
 
+# Recovery scope is an in-process hand-off (`recovery.planner._emit_recovery_env`):
+# the closure, strategy and entry node name the DAG of the run that computed
+# them. A `run` started as a child process inherits them — the spec-driven
+# delivery dispatcher builds each child's env with `os.environ.copy()` — and
+# execute's `_apply_recovery_filter` then prunes the CHILD's DAG by the PARENT's
+# node names. run-1792151796-92942--pick-files-directories--D1, a 15-node
+# recursive-validate-impl child, ran only `publisher` because
+# `MINI_ORK_RECOVERY_FROM=test_validity` and its closure leaked from the
+# spec-driven-delivery parent; the panel never ran, so publish blocked on a
+# missing verdict. A fresh `run` starts with no inherited scope; `--resume`
+# and `recover` publish their own scope after this point.
+_INHERITED_RECOVERY_SCOPE_VARS = (
+    "MINI_ORK_RECOVERY_RUN_ID",
+    "MINI_ORK_RECOVERY_SKU",
+    "MINI_ORK_RECOVERY_CLOSURE",
+    "MINI_ORK_RECOVERY_STRATEGY",
+    "MINI_ORK_RECOVERY_FROM",
+    "MINI_ORK_RECOVERY_ACTIVE",
+)
+
+
 def _run_handler(rest, root):
     # ``--resume <run_id>`` / ``--checkpoint-id <id>`` (P1.3). The preflight
     # prints the one-line plan and HARD-ERRORS on an unknown run_id (C1 / F4 —
@@ -2040,6 +2061,8 @@ def _run_handler(rest, root):
     # that would classify and plan again and dispatch every node, so the
     # printed skip list would be a lie. It re-dispatches only the plan's
     # redispatch set against the run's existing plan.
+    for key in _INHERITED_RECOVERY_SCOPE_VARS:
+        os.environ.pop(key, None)
     from mini_ork.cli import run_resume
 
     rc, sink = run_resume.run_with_resume(rest)
