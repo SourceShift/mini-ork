@@ -5,6 +5,10 @@
 each built by a mini-ork `framework-edit` run with RSI on and proven by a real
 mini-ork run. All are ON by default.*
 
+*A second review on 2026-10-18 (`verify-agentic-20261018-215339`, 2000 arXiv
+papers) added eight more instruments — sections ⑦–⑭ — also each built by a
+mini-ork `framework-edit` run and merged after a scoped green test gate.*
+
 ## The rule everything here obeys
 
 mini-ork's verdicts are **anchored on what the code actually did**, never on what
@@ -231,6 +235,143 @@ REFUTED names its operator and the first differing key path (e.g. `$.db_path`).
 **Live result** (against a live `mini-ork serve`): 4/4 correct-but-rejected surfaces became PROVEN under their fitted
 operator, and 0/5 wrong expectations were approved under any operator.
 
+## The 2026-10 review: eight more instruments
+
+```mermaid
+flowchart TB
+  subgraph promote["promotion gate (mini_ork/gates/promotion_gate.py)"]
+    OI["⑦ ORACLE INTEGRITY<br/>gates/oracle_integrity.py"] --> Q["quarantined<br/>oracle_integrity_failed"]
+    JV["⑧ JUDGE VALIDITY<br/>gates/judge_validity.py"] --> Q2["quarantined<br/>judge_validity_below_threshold"]
+  end
+  subgraph grpo["GRPO writeback (mini_ork/learning/writeback.py)"]
+    RP["⑨ REWARD↔EVIDENCE PAIRING<br/>learning/reward_audit.py + writeback.py"]
+  end
+  subgraph catalog["verifier catalog / certificate (verify/catalog.py + certify/certificate.py)"]
+    VM["⑩ VERIFIER MUTATION<br/>gates/verifier_mutation.py"]
+  end
+  subgraph registry["gate registry — opt-in (mini_ork/gates/gate_registry.py)"]
+    CO["⑪ CONFORMAL ABSTENTION<br/>gates/conformal_gate.py"]
+  end
+  subgraph certify2["certify oracle (mini_ork/certify/oracle.py)"]
+    DI["⑫ DISCRIMINATION-ANCHORED TEST EVIDENCE<br/>certify/discrimination.py + oracle.py"]
+    HC["⑭ HIDDEN REGENERABLE GROUND TRUTH<br/>certify/hidden_checks.py + oracle.py + certificate.py"]
+  end
+  subgraph behav2["behavioral verifier (mini_ork/verify/behavioral.py)"]
+    BR["⑬ BEHAVIORAL RECOMPUTATION<br/>certify/recompute.py + verify/behavioral.py"]
+  end
+```
+
+## ⑦ Oracle integrity (G03-T02): `mini_ork/gates/oracle_integrity.py`
+
+**What it checks.** The integrity of the certify oracle's `judge` against seven injected defect classes (`silent_payload_non_delivery`, `frozen_result_swap`, `apply_fail_masked_as_pass`, `stale_evidence_replay`, `runner_error_as_pass`, `test_defect_as_failure`, `contract_violating_outcome`) and three controls (`known_good_proven`, `known_bad_refuted`, `known_empty_abstains`). Any injection the judge does not reject, or any control it rejects, fails the audit.
+
+**How it decides.**
+- **Pass.** Every defect rejected AND every control accepted.
+- **Fail.** Any defect accepted OR any control rejected. A failed audit is the latest record.
+- **Abstention.** A missing or unreadable record is *unmeasured*, never a pass; promotion is not blocked on it.
+
+**Knobs.**
+- `MO_ORACLE_INTEGRITY` (ON): promotion consumer of the audit.
+
+**Evidence.** Writes `<db dir>/oracle-integrity/latest.json`. When `MO_ORACLE_INTEGRITY` is on and the latest record failed, the promotion decision is `quarantined` with reason `oracle_integrity_failed`.
+
+## ⑧ Judge validity (G10-T03): `mini_ork/gates/judge_validity.py`
+
+**What it checks.** Whether each reviewer-lane family's approval history agrees with independent execution evidence. Per lane, the audit reads `execution_traces.reviewer_verdict` and `verifier_results` for the same run; rows with an unknown verdict or no verifier rows are skipped, never counted as agreement.
+
+**How it decides.**
+- **Per-lane accuracy** uses a Wilson lower bound. Below `MO_JUDGE_VALIDITY_MIN` the gate quarantines the promotion with reason `judge_validity_below_threshold`.
+- **Abstention.** A lane with fewer than 30 overlapping rows is unmeasured and admits; the gate never converts abstention into a pass.
+- **Off by default.** `MO_JUDGE_VALIDITY` unset disables it; `1` enables it.
+
+**Knobs.**
+- `MO_JUDGE_VALIDITY` (unset → off): master switch.
+- `MO_JUDGE_VALIDITY_MIN` (0.80): agreement floor; tighten-only (lower values clamp up).
+- `MO_JUDGE_VALIDITY_ROWS` (200): history rows audited per promotion check.
+
+**Evidence.** Per-lane envelopes written atomically to `<db dir>/judge-validity/<lane>.json`.
+
+## ⑨ Reward↔evidence pairing (G05-T01): `mini_ork/learning/reward_audit.py`, `mini_ork/learning/writeback.py`
+
+**What it checks.** That a run's reward agrees with its verifier results. `classify_run` labels a run `backed`, `contradicted`, or `unmeasured` from verifier results.
+
+**How it decides.** During GRPO advantage computation, a **positive** reward (≥ 0.5) that execution contradicts is dropped before group aggregation; negative rewards and unmeasured runs are untouched. Divergences are enqueued with kind `reward_evidence_divergence`, capped at 50 per call.
+- **Abstention.** Unmeasured runs do not drop rewards; mode `shadow` counts and enqueues without dropping rows.
+- **Off.** `0` / `off` restores the exact pre-pairing behaviour.
+
+**Knobs.**
+- `MO_REWARD_EVIDENCE_PAIRING` (ON): master switch.
+- `MO_REWARD_DIVERGENCE_ENQUEUE_LIMIT` (50): max reward-evidence divergences enqueued per writeback call.
+
+**Evidence.** A `reward_evidence_divergence` row per dropped reward (and per counted-but-not-dropped under `shadow`).
+
+## ⑩ Verifier mutation discrimination (G05-T03): `mini_ork/gates/verifier_mutation.py`, `mini_ork/verify/catalog.py`, `mini_ork/certify/certificate.py`
+
+**What it checks.** Whether a verifier's verdict moves when six deterministic mutations are applied to its observed output (`value_flip`, `field_drop`, `type_swap`, `list_reorder`, `truncate_string`, `status_swap`).
+
+**How it decides.** The baseline must be PROVEN. `kill_score = killed / (killed + survived)`. An UNVERIFIED variant counts as abstained, never as killed.
+- **`rank_verifiers`** drops only cards measured below the threshold; unmeasured cards are retained.
+- **Abstention.** An UNVERIFIED variant abstains; the gate never converts abstention into a kill.
+
+**Knobs.**
+- `MO_VERIFIER_MUTATION` (ON): mutation-discrimination scoring.
+- `MO_VERIFIER_MUTATION_MIN` (0.8): minimum kill score for a verifier card.
+
+**Evidence.** Writes a `<card>.mutation.json` sidecar; the certificate may carry `mutation_kill_score`.
+
+## ⑪ Conformal abstention (G07-T01): `mini_ork/gates/conformal_gate.py`
+
+**What it checks.** Whether the oracle's nonconformity score is safe to publish. A split-conformal threshold computed from labelled pass history decides.
+
+**How it decides.**
+- **Above threshold.** The gate defers and enqueues an oversight item with reason `conformal-threshold-exceeded`; the gate never converts abstention into a pass.
+- **Below threshold.** Admits.
+- **Off by default** (`MO_CONFORMAL_ORACLE=0`).
+
+**Knobs.**
+- `MO_CONFORMAL_ORACLE` (`0`): master switch.
+- `MO_CONFORMAL_ALPHA` (0.10): conformal risk level; tighten-only.
+- `MO_CONFORMAL_MIN_CALIB` (30): minimum calibration rows; raise-only.
+
+**Evidence.** The gate delegates to the existing `abstain_gate` calibration rather than re-implementing it.
+
+## ⑫ Discrimination-anchored test evidence (G06-T01): `mini_ork/certify/discrimination.py`, `mini_ork/certify/oracle.py`
+
+**What it checks.** Given candidate patches, a generated test must pass the correct candidate and fail the defective ones. The required discrimination rate is `MO_DISCRIMINATION_MIN` (default 1.0).
+
+**How it decides.** Called with `candidates=` on the oracle. A REFUTED discrimination result **downgrades PROVEN to UNVERIFIED**, never to REFUTED, because a non-discriminating test is weak evidence, not counter-evidence.
+
+**Knobs.**
+- `MO_ASSAY_DISCRIMINATION` (ON): master switch.
+- `MO_DISCRIMINATION_MIN` (1.0): required discrimination rate.
+
+**Evidence.** A `discrimination` block in the oracle's verdict detail.
+
+## ⑬ Behavioral recomputation (G02-T02): `mini_ork/certify/recompute.py`, `mini_ork/verify/behavioral.py`
+
+**What it checks.** A recorded operation sequence replays from its initial state twice, independently; an optional declared expected state or equivalence operator may be supplied. Two identical replays that disagree, or a mismatch with the declared expectation, is REFUTED with a first-divergence witness.
+
+**How it decides.**
+- **Abstention.** An apply exception, non-JSON state, empty record set, or invalid equivalence spec is UNVERIFIED.
+- **No separate on/off.** Enabled by declaring the `recompute:` block on a behavioral `Observable`; there is no separate knob.
+
+**Evidence.** A `recompute` block in the behavioral verdict detail.
+
+## ⑭ Hidden regenerable ground truth (G02-T08): `mini_ork/certify/hidden_checks.py`, `mini_ork/certify/oracle.py`, `mini_ork/certify/certificate.py`
+
+**What it checks.** From a precommitted parameter set, derives behaviour-neutral variants of the caller-supplied PoC by renaming top-level `def test_*` / `class Test*` identifiers and prepending a trial marker; assertions, imports, literals, order, and environment are unchanged.
+
+**How it decides.** A variant that fails while the visible PoC passes is REFUTED ("the patch depends on the test's identity").
+- **Abstention.** A harness status (`error` / `test_defect` / `apply_fail` / `no_run`) is an unmeasured trial, never a refutation.
+- **Key material.** Precedence is `MO_HIDDEN_CHECK_SECRET` → `run_id` → patch digest. The chosen source is recorded as `key_source` so a run without a secret never claims secret-backed hiding.
+
+**Knobs.**
+- `MO_ASSAY_HIDDEN` (ON): master switch.
+- `MO_HIDDEN_TRIALS` (2): hidden trials per judgement; a malformed value raises rather than guessing.
+- `MO_HIDDEN_CHECK_SECRET` (unset): key material for hidden-check variants.
+
+**Evidence.** The certificate carries `hidden_check_commitment` and `hidden_trials` when supplied.
+
 ## Fixes the live runs found
 
 The real-run smokes caught defects that unit tests had hidden. All are fixed:
@@ -251,6 +392,7 @@ Set its master knob to `0`, for one run or in `config/secrets.local.sh`:
 MO_ASSAY_RELATIONS=0 MO_ASSAY_DIFFERENTIAL=0 mini-ork certify ...      # oracle terms
 MO_SUITE_ADEQUACY=0 MO_LEVEL_VECTOR=0 mini-ork run code-fix kickoff.md # code-fix gates
 MO_PROMOTION_GATE_HACKABILITY=0 mini-ork promote --candidate <id>     # promotion consumer
+MO_ORACLE_INTEGRITY=0 MO_JUDGE_VALIDITY=0 MO_REWARD_EVIDENCE_PAIRING=0 MO_VERIFIER_MUTATION=0 MO_ASSAY_DISCRIMINATION=0 MO_ASSAY_HIDDEN=0 MO_CONFORMAL_ORACLE=0 mini-ork certify ...  # 2026-10 review opt-outs
 ```
 
 With a knob at `0`, verdicts are byte-identical to the pre-feature behaviour.
@@ -270,6 +412,16 @@ With a knob at `0`, verdicts are byte-identical to the pre-feature behaviour.
   - Code-fix adds up to 2 + `MAX_MUTANTS` suite runs per green verifier.
 - **Reviewer interaction.** The glm reviewer already rejects runs whose verifier reported `pass:false`. The level gate
   matters most where the verifier is *green but unproven*, which the reviewer approves.
+- **Honest limits (2026-10 review).** Two of the eight instruments are **OFF by default** because each changes
+  promotion outcomes: `MO_JUDGE_VALIDITY` (reviewer-vs-execution agreement) and `MO_CONFORMAL_ORACLE` (split-conformal
+  abstention). Both abstain rather than block when unmeasured — neither converts abstention into a pass — so flipping
+  either to `1` is a deliberate promotion-policy change, not a quality-of-life toggle.
+- **Hidden-check hiding is strongest with a secret.** With `MO_HIDDEN_CHECK_SECRET` set, the variant names are
+  unpredictable to the implementer. With only `run_id` or the patch digest they are reproducible by anyone who knows
+  those inputs — so the certificate records `key_source` rather than implying secret-backed hiding.
+- **Honest limits (2026-10 review).** Hidden-check hiding is strongest with `MO_HIDDEN_CHECK_SECRET` set; with only
+  `run_id` or a patch digest the variants are reproducible by an implementer who knows those inputs, and the certificate
+  records which source was used (`key_source`) so a run never claims secret-backed hiding when no secret was supplied.
 
 ## Re-running the live checks
 

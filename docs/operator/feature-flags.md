@@ -63,6 +63,22 @@ feature decides and the evidence it writes.
 | `MO_PROMOTION_GATE_HACKABILITY` | `"1"` | Promotion-gate consumer of the hackability records |
 | `MO_BEHAV_EQUIVALENCE` | *(unset → `exact`)* | Behavioral comparison operator: `exact`, `set`, `canonical`, `tolerant`, or a JSON spec |
 | `MO_BEHAV_EXPECT_BODY` | *(unset)* | Expected body (JSON) for the behavioral `expect_body` check |
+| `MO_ORACLE_INTEGRITY` | `"1"` | Promotion consumer of the oracle-integrity audit; a failed latest record → `quarantined` (`oracle_integrity_failed`) |
+| `MO_JUDGE_VALIDITY` | *(unset → off)* | `1` runs the reviewer-vs-execution agreement audit at promotion; a measured lane below the floor → `quarantined` (`judge_validity_below_threshold`) |
+| `MO_JUDGE_VALIDITY_MIN` | `0.80` | Agreement floor; tighten-only (lower values clamp up) |
+| `MO_JUDGE_VALIDITY_ROWS` | `200` | History rows audited per promotion check |
+| `MO_REWARD_EVIDENCE_PAIRING` | `"1"` | `1` drops positive rewards execution contradicts; `shadow` records and enqueues without dropping; `0`/`off` restores pre-pairing |
+| `MO_REWARD_DIVERGENCE_ENQUEUE_LIMIT` | `50` | Max reward-evidence divergences enqueued per writeback call |
+| `MO_VERIFIER_MUTATION` | `"1"` | Mutation-discrimination scoring of verifier cards; measured-below cards are dropped from ranking |
+| `MO_VERIFIER_MUTATION_MIN` | `0.8` | Minimum kill score for a verifier card |
+| `MO_ASSAY_DISCRIMINATION` | `"1"` | Candidates-discrimination term in the certify oracle |
+| `MO_DISCRIMINATION_MIN` | `1.0` | Required discrimination rate for a generated test |
+| `MO_CONFORMAL_ORACLE` | `"0"` | Split-conformal abstention gate; OFF by default |
+| `MO_CONFORMAL_ALPHA` | `0.10` | Conformal risk level; tighten-only |
+| `MO_CONFORMAL_MIN_CALIB` | `30` | Minimum calibration rows; raise-only |
+| `MO_ASSAY_HIDDEN` | `"1"` | Hidden regenerated PoC trials in the certify oracle |
+| `MO_HIDDEN_TRIALS` | `2` | Hidden trials per judgement; a malformed value raises |
+| `MO_HIDDEN_CHECK_SECRET` | *(unset)* | Key material for hidden-check variants; absent → `run_id`, then patch digest (recorded in `key_source`) |
 
 ### Verifier scoping (code-fix)
 

@@ -75,6 +75,8 @@ def build_certificate(
     duration_s: float,
     context_files: list | None = None,
     mutation_kill_score: float | None = None,
+    hidden_check_commitment: str | None = None,
+    hidden_trials: int | None = None,
 ) -> dict:
     """Assemble the certificate dict. Caller writes it to ``--out``.
 
@@ -93,6 +95,12 @@ def build_certificate(
     When ``None`` the key is omitted and the certificate is byte-identical to
     the pre-mutation-score shape; otherwise it lands in ``method`` and is
     sealed by the digest.
+
+    ``hidden_check_commitment`` / ``hidden_trials`` (optional): the
+    precommitted hidden-check parameter digest and the number of hidden
+    variants the oracle ran. When both are omitted the certificate is
+    byte-identical to the pre-hidden-check shape; supplying either adds it to
+    ``evidence`` so the digest seals it.
     """
     files = _parse_patch_files(patch_text)
     method: dict = {
@@ -106,6 +114,15 @@ def build_certificate(
         method["context_files"] = list(context_files)
     if mutation_kill_score is not None:
         method["mutation_kill_score"] = mutation_kill_score
+    evidence: dict = {
+        "probe": poc_plus,
+        "mr_pass_rate": mr_pass_rate,
+        "invariants": invariants,
+    }
+    if hidden_check_commitment is not None:
+        evidence["hidden_check_commitment"] = hidden_check_commitment
+    if hidden_trials is not None:
+        evidence["hidden_trials"] = hidden_trials
     base: dict = {
         "schema": "mini-ork.certificate/v1",
         "id": str(uuid.uuid4()),
@@ -128,11 +145,7 @@ def build_certificate(
             "summary": issue_text[:200],
         },
         "method": method,
-        "evidence": {
-            "probe": poc_plus,
-            "mr_pass_rate": mr_pass_rate,
-            "invariants": invariants,
-        },
+        "evidence": evidence,
         "cost": {
             "usd": cost_usd,
             "llm_calls": llm_calls,

@@ -345,6 +345,12 @@ def promotion_evaluate(
         except Exception:
             hk_enabled = True
 
+        # The judge-validity consumer (G10-T03) runs only on the promote
+        # branch, after the gate-hackability check. Initialised here so the
+        # final result can carry it only when the consumer actually ran; the
+        # key is absent on every other branch, preserving the legacy shape.
+        judge_val: dict[str, Any] | None = None
+
         # ── Decision logic (mirrors bash lines 123-140) ──
         if brun is None:
             # Zero benchmark_results rows: nothing was measured. The old
@@ -464,6 +470,70 @@ def promotion_evaluate(
                         )
                         rationale += f" gate-hackability:{parts}>{gate_hk['max']:g}"
 
+                # ── Judge-validity consumer (G10-T03) ─────────────────────
+                # The loop trusts a reviewer's approve/reject as a reward but
+                # never measured that reviewer against what executed. When the
+                # knob is on, each judge lane family's approvals are audited
+                # against verifier_results; a measured lane below the agreement
+                # floor quarantines the would-be promote. Unmeasured never
+                # blocks, and envelopes are written only for measured lanes.
+                try:
+                    from mini_ork.gates import judge_validity
+
+                    jv_enabled = judge_validity.enabled()
+                except Exception as exc:  # noqa: BLE001 — fail-open
+                    print(
+                        f"promotion_evaluate: judge-validity import failed: "
+                        f"{exc}",
+                        file=sys.stderr,
+                    )
+                    jv_enabled = False
+                if jv_enabled:
+                    jv: dict[str, Any] | None = None
+                    try:
+                        jv = judge_validity.promotion_check(db_path)
+                    except Exception as exc:  # noqa: BLE001 — fail-open
+                        print(
+                            f"promotion_evaluate: judge-validity check failed: "
+                            f"{exc}",
+                            file=sys.stderr,
+                        )
+                    if jv is not None:
+                        judge_val = {
+                            "status": "measured",
+                            "reason": jv.get("reason", ""),
+                            "admit": jv.get("admit"),
+                        }
+                        try:
+                            judge_validity.write_envelopes(db_path, jv)
+                        except Exception as exc:  # noqa: BLE001 — fail-open
+                            print(
+                                f"promotion_evaluate: judge-validity envelope "
+                                f"write failed: {exc}",
+                                file=sys.stderr,
+                            )
+                        if jv.get("admit") is False and decision == "promoted":
+                            decision = "quarantined"
+                            rationale += (
+                                " judge_validity_below_threshold:"
+                                f"{jv.get('reason', '')}"
+                            )
+                    else:
+                        # Unmeasured (or the check failed): report why and never
+                        # block. Re-running the audit is a cheap local read that
+                        # gives the result a truthful reason rather than a
+                        # placeholder.
+                        reason = "no measured lanes"
+                        try:
+                            unmeasured = judge_validity.audit(
+                                db_path, limit=judge_validity.rows_limit()
+                            )
+                            reason = unmeasured.get("reason", reason)
+                            judge_validity.write_envelopes(db_path, unmeasured)
+                        except Exception as exc:  # noqa: BLE001 — fail-open
+                            reason = f"audit unavailable: {exc}"
+                        judge_val = {"status": "unmeasured", "reason": reason}
+
         # ── Oracle-integrity consumer (vt8) ───────────────────────────────
         # The verdict judge is itself an instrument; an audit that could be
         # fooled by fabricated execution evidence means every PROVEN it emitted
@@ -547,6 +617,11 @@ def promotion_evaluate(
         # when MO_ORACLE_INTEGRITY is on, so the knob-off result is unchanged.
         if oi_enabled:
             result["oracle_integrity"] = oracle_int
+        # The judge-validity result is carried only when its consumer ran on
+        # the promote branch (and thus only when the knob is on), so the
+        # legacy result shape is unchanged when the guard is off.
+        if judge_val is not None:
+            result["judge_validity"] = judge_val
 
         # ── INSERT into promotion_records (mirrors bash lines 152-183) ──
         record_id = f"pr-{uuid.uuid4().hex[:16]}"
