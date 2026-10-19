@@ -33,6 +33,10 @@ The command writes local credentials to
 `$MINI_ORK_HOME/config/secrets.local.sh`, which is ignored by Git. See
 [provider triage](provider-triage.md) for provider-specific diagnosis.
 
+`MO_HIDDEN_CHECK_SECRET` belongs in `$MINI_ORK_HOME/config/secrets.local.sh`;
+when unset, hidden checks fall back to `run_id` then the patch digest and say
+so in the certificate (`key_source`).
+
 ## Cost
 
 A single environment variable gates every dispatch:
@@ -163,11 +167,15 @@ Two common extension selectors are:
 `escalates_to` rollback edges fire. Set it to `0` to restore the pre-revise
 behaviour (a failed node blocks its descendants and rollback runs).
 
-The verification stack — metamorphic relations, the differential check,
-mutation suite adequacy, the level vector, the gate-hackability audit, and the
-declared equivalence operator — is ON by default. Its knobs are listed under
-[Feature flags › Verification stack](feature-flags.md#verification-stack) and
-explained in [the verification stack](../architecture/verification-stack.md).
+The verification stack — six instruments from the 2026-10-05/06 review
+(metamorphic relations, the differential check, mutation suite adequacy, the
+level vector, the gate-hackability audit, and the declared equivalence operator)
+plus eight from the 2026-10-18 review (`verify-agentic-20261018-215339`) — is
+documented there. All but two are ON by default; judge validity
+(`MO_JUDGE_VALIDITY`) and conformal abstention (`MO_CONFORMAL_ORACLE`) are
+opt-in. Knobs are listed under [Feature flags › Verification
+stack](feature-flags.md#verification-stack) and explained in [the verification
+stack](../architecture/verification-stack.md).
 
 Do not use the retired `MINI_ORK_RUNTIME` selector. The supported framework
 runtime is native Python; shell execution remains available only for declared
