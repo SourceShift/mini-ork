@@ -2,16 +2,25 @@
 
 One place for the run's own supervisor, drawn like the node Stream tab: one
 panel with a status line, kind filters, a scrollable transcript, and the
-steering composer docked at its foot. The transcript is newest first — the
-question is "what is the supervisor doing now" — and it interleaves the
-events the orchestrator writes (``orchestrator.*``) with the steering rows
-that go *into* the run (``operator_steering``), so both halves of the story
-read in one order. The watcher's cadence, autonomy, steer count and budget
-ride the status line; nothing needs a card of its own.
+steering composer docked at its foot.
 
-Every read here is passive: ``run_events`` and ``operator_steering`` rows, the
-watcher's own state file, and the environment knobs. Nothing writes, so the
-page can render a live run without racing its watcher or its dispatcher.
+The supervisor is another agent, not a log. When a run was launched from an
+ACP thread that thread *is* the orchestrator — its turns, thinking, tool calls
+and replies are the live stream — and this tab reads that stream from the
+thread's JSONL (``<home>/acp-threads/<thread_id>.jsonl``) in the same entry
+grammar the node Stream uses. The composer then posts to the thread
+(``threads send``), which steers the orchestrator's live turn; a message sent
+after the run finished continues the thread.
+
+A run launched without a thread (straight from the CLI) has no LLM
+conversation to stream. It falls back to the watcher's own event log —
+``orchestrator.*`` rows interleaved with the ``operator_steering`` rows that
+go *into* the run — newest first, with the node-steering composer.
+
+Every read here is passive: thread JSONL, ``run_events`` and
+``operator_steering`` rows, the watcher's own state file, and the environment
+knobs. Nothing writes, so the page can render a live run without racing its
+watcher or its dispatcher.
 
 Wiring lives in ``run.py`` (the tab registration and the page's poll
 interval); this module owns only the tab's content so the two can be reviewed
@@ -41,6 +50,29 @@ _VIEWS = (
     ("steer", "steers"),
     ("lifecycle", "lifecycle"),
 )
+
+# The orchestrator stream's views. A conversation raises different questions
+# from an event log: what was said, what tools ran, what the watcher flagged,
+# and what the operator injected.
+_STREAM_VIEWS = (
+    ("all", "all"),
+    ("talk", "conversation"),
+    ("tools", "tools"),
+    ("signals", "signals"),
+    ("steers", "steers"),
+)
+
+# Caps for projecting a thread's JSONL into stream entries. A long-lived
+# thread can hold thousands of records; the tab is a window on the current
+# run's turn, not an archive.
+_MAX_RECORDS = 5000
+_MAX_ENTRY_TEXT = 20_000
+_TOOL_LINE_CHARS = 300
+_TOOL_LINES = 60
+# A run is launched mid-turn: the user prompt that started it is the last
+# ``user`` record at or before the run's start, with this much slack for the
+# gap between the prompt and the dispatcher's first write.
+_PROMPT_SLACK_S = 120
 
 # One glyph and colour per event kind. The glyph carries the category at a
 # glance; the colour is the row's left rule.
@@ -83,7 +115,9 @@ def _feed_section(title: str, items: list[dict[str, Any]], *, status: str,
                   status_c: str, meta: str, filters: list[dict[str, Any]],
                   empty: str, copy: str, note: str = "",
                   footer: dict[str, Any] | None = None,
-                  more: dict[str, Any] | None = None) -> dict[str, Any]:
+                  more: dict[str, Any] | None = None,
+                  entries: list[dict[str, Any]] | None = None,
+                  live: bool = False) -> dict[str, Any]:
     """The ``feed`` section the IDE draws: status line, filters, bounded rows.
 
     ``stream`` asks the IDE for the node-Stream layout: one panel with the
@@ -101,6 +135,11 @@ def _feed_section(title: str, items: list[dict[str, Any]], *, status: str,
         "status": status, "status_c": status_c, "meta": meta,
         "items": items, "filters": filters, "empty": empty, "copy": copy,
     }
+    if entries is not None:
+        # The orchestrator's own transcript: node-Stream entries, oldest
+        # first. The IDE draws these instead of `items` when present.
+        section["entries"] = entries
+        section["live"] = bool(live)
     if footer:
         section["footer"] = footer
     if more:
@@ -143,7 +182,8 @@ def _limit(args: dict[str, Any] | None) -> int:
 
 def _view(args: dict[str, Any] | None) -> str:
     raw = str((args or {}).get("orch_view") or "all")
-    return raw if raw in {key for key, _ in _VIEWS} else "all"
+    known = {key for key, _ in _VIEWS} | {key for key, _ in _STREAM_VIEWS}
+    return raw if raw in known else "all"
 
 
 def _category(kind: str) -> str:
@@ -336,7 +376,355 @@ def _steering_items(run: Any) -> list[tuple[float, dict[str, Any], str]]:
     return out
 
 
+# ── the orchestrator's own stream ───────────────────────────────────────────
+
+
+def _thread_id(run: Any) -> str:
+    """The ACP thread that owns this run, or ``""`` when none does.
+
+    Two persisted sources, cheapest first: ``owner.json`` (written at run
+    start from ``MO_RUN_OWNER=thread:<id>``, see
+    ``mini_ork.recovery.retry_notify.owner``) and the ``thread_runs`` join
+    the threads service writes. A run launched straight from the CLI has
+    neither — there is no orchestrator conversation to stream, only the
+    watcher's event log.
+    """
+    try:
+        from mini_ork.recovery import retry_notify
+
+        record = retry_notify.owner(run.home, run.id)
+    except Exception:  # noqa: BLE001 — a missing owner must not hide the tab
+        record = None
+    if isinstance(record, dict) and record.get("kind") == "thread":
+        candidate = str(record.get("id") or "")
+        if candidate:
+            return candidate
+
+    from mini_ork.web.db import db_for
+
+    try:
+        db = db_for(run.home)
+        if not db.has_table("thread_runs"):
+            return ""
+        rows = db.rows(
+            "SELECT thread_id FROM thread_runs WHERE run_id = ? "
+            "ORDER BY attempt DESC, id DESC LIMIT 1",
+            (run.id,),
+        )
+    except Exception:  # noqa: BLE001 — a missing DB is "no thread", not an error
+        return ""
+    return str(rows[0].get("thread_id") or "") if rows else ""
+
+
+def _thread_records(home: Any, thread_id: str) -> list[dict[str, Any]]:
+    """The thread's JSONL records, oldest first, capped to a recent window.
+
+    A malformed id or an unreadable file degrades to no records: the tab
+    still shows the watcher's log beside an empty transcript, which is a
+    better failure than a page that will not render.
+    """
+    from mini_ork.acp.threads import ThreadStore
+
+    try:
+        records = ThreadStore(home).read(thread_id)
+    except (OSError, ValueError):
+        return []
+    return records[-_MAX_RECORDS:]
+
+
+def _thread_meta(records: list[dict[str, Any]]) -> tuple[str, str]:
+    """The thread's lane and mode from its last ``config`` record."""
+    lane, mode = "", ""
+    for record in records:
+        if record.get("type") == "config":
+            lane = str(record.get("model") or lane)
+            mode = str(record.get("mode") or mode)
+    return lane, mode
+
+
+def _started_at(run: Any) -> int:
+    try:
+        return int(run.row.get("created_at") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _chunk_text(update: dict[str, Any]) -> str:
+    content = update.get("content")
+    if isinstance(content, dict):
+        return str(content.get("text") or "")
+    if isinstance(content, str):
+        return content
+    return ""
+
+
+def _tool_result_lines(update: dict[str, Any], failed: bool) -> list[dict[str, str]]:
+    """A tool result's text as ``{t, c}`` lines, capped like the node Stream."""
+    out: list[str] = []
+    content = update.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            inner = block.get("content")
+            text = inner.get("text") if isinstance(inner, dict) else block.get("text")
+            if not isinstance(text, str):
+                continue
+            out.extend(text.splitlines())
+    if not out:
+        return []
+    if len(out) > _TOOL_LINES:
+        hidden = len(out) - _TOOL_LINES
+        out = out[:_TOOL_LINES] + [f"… {hidden} more lines"]
+    return [
+        {"t": line[:_TOOL_LINE_CHARS], "c": "red" if failed else "body"}
+        for line in out
+    ]
+
+
+def _thread_stream(
+    records: list[dict[str, Any]], started: int,
+) -> list[tuple[float, dict[str, Any], str, str]]:
+    """The thread's records as node-Stream entries: ``(ts, entry, category, line)``.
+
+    Kinds mirror ``node.py``: a user prompt is ``user``, the assistant's
+    prose is ``text``, its reasoning ``think``, a tool call ``tool`` (with
+    the result as ``lines``), and everything else a ``note``. Chunks of one
+    message accumulate into a single entry so a transcript reads as messages
+    rather than as a delta log.
+    """
+    # Start at the prompt that launched this run: the last user record at or
+    # before the run's start. Earlier turns of the same thread belong to
+    # other runs and would push this one's story off the window.
+    start = 0
+    if started > 0:
+        for index, record in enumerate(records):
+            if record.get("type") == "user" and float(record.get("t") or 0) <= started + _PROMPT_SLACK_S:
+                start = index
+
+    out: list[tuple[float, dict[str, Any], str, str]] = []
+    tools: dict[str, int] = {}  # toolCallId → index into `out`
+    current: tuple[str, int] | None = None  # (kind, index) of a chunk entry
+
+    def push(ts: float, entry: dict[str, Any], category: str, line: str) -> int:
+        out.append((ts, entry, category, line))
+        return len(out) - 1
+
+    def append_chunk(ts: float, kind: str, text: str) -> None:
+        nonlocal current
+        if not text:
+            return
+        if current is not None and current[0] == kind:
+            entry = out[current[1]][1]
+            merged = str(entry.get("arg") or "") + text
+            entry["arg"] = merged[:_MAX_ENTRY_TEXT]
+            out[current[1]] = (out[current[1]][0], entry, out[current[1]][2], out[current[1]][3])
+            return
+        entry: dict[str, Any] = {"k": kind, "head": "Thinking… " if kind == "think" else "",
+                                 "arg": text[:_MAX_ENTRY_TEXT]}
+        current = (kind, push(ts, entry, "talk", text))
+
+    for record in records[start:]:
+        stamp = float(record.get("t") or 0)
+        rtype = record.get("type")
+        if rtype == "user":
+            text = str(record.get("text") or "").strip()
+            current = None
+            if text:
+                entry = {"k": "user", "head": "", "arg": text[:_MAX_ENTRY_TEXT]}
+                push(stamp, entry, "talk", text.splitlines()[0][:160])
+            continue
+        if rtype != "update":
+            continue
+        update = record.get("update")
+        if not isinstance(update, dict):
+            continue
+        kind = str(update.get("sessionUpdate") or update.get("session_update") or "")
+        if kind == "agent_message_chunk":
+            append_chunk(stamp, "text", _chunk_text(update))
+        elif kind == "agent_thought_chunk":
+            append_chunk(stamp, "think", _chunk_text(update))
+        elif kind == "tool_call":
+            current = None
+            title = str(update.get("title") or update.get("kind") or "tool")
+            entry = {"k": "tool", "head": title[:_TOOL_LINE_CHARS], "arg": "", "lines": []}
+            index = push(stamp, entry, "tools", title[:160])
+            tool_id = str(update.get("toolCallId") or "")
+            if tool_id:
+                tools[tool_id] = index
+        elif kind == "tool_call_update":
+            index = tools.get(str(update.get("toolCallId") or ""))
+            if index is None:
+                continue
+            status = str(update.get("status") or "")
+            failed = status in ("failed", "error", "cancelled")
+            lines = _tool_result_lines(update, failed)
+            if lines:
+                entry = out[index][1]
+                existing = entry.get("lines")
+                entry["lines"] = (existing if isinstance(existing, list) else []) + lines
+                out[index] = (out[index][0], entry, out[index][2], out[index][3])
+    return out
+
+
+def _event_stream(rows: list[dict[str, Any]]) -> list[tuple[float, dict[str, Any], str, str]]:
+    """Watcher events as stream entries — the no-thread run's transcript."""
+    out: list[tuple[float, dict[str, Any], str, str]] = []
+    for raw in rows:
+        kind = str(raw.get("event_type") or "").removeprefix("orchestrator.")
+        payload = _payload(raw.get("payload_json"))
+        signal = str(payload.get("kind") or "")
+        glyph = _MARKS.get(kind, ("•", "sub"))[0]
+        label = kind if kind != "signal" or not signal else signal
+        node = str(payload.get("node_id") or "")
+        reason = str(payload.get("reason") or payload.get("detail") or "")
+        detail = " · ".join(part for part in (node, reason) if part)
+        text = f"{glyph} {label}{(' · ' + detail) if detail else ''}"
+        stamp = float(raw.get("created_at") or 0)
+        out.append((stamp, {"k": "note", "head": "", "arg": text}, "signals", text))
+    return out
+
+
+def _steer_stream(run: Any) -> list[tuple[float, dict[str, Any], str, str]]:
+    """Steering rows as ``steer`` entries — what went into the run."""
+    now_ms = int(time.time() * 1000)
+    out: list[tuple[float, dict[str, Any], str, str]] = []
+    try:
+        rows = _steering_rows(run, limit=200)
+    except Exception:  # noqa: BLE001 — the thread transcript must still render
+        rows = []
+    for row in rows:
+        message = str(row.get("message") or "").strip()
+        if not message:
+            continue
+        target = str(row.get("role_target") or "any")
+        consumed = row.get("consumed_at")
+        expires_ms = int(row.get("expires_at") or 0)
+        if consumed:
+            state = "read"
+        elif expires_ms and expires_ms < now_ms:
+            state = "expired"
+        else:
+            state = "queued"
+        stamp = float(row.get("created_at") or 0) / 1000.0
+        out.append((
+            stamp,
+            {"k": "steer", "head": "", "arg": message},
+            "steers",
+            f"{target} · {state}: {message.splitlines()[0][:160]}",
+        ))
+    return out
+
+
+def _stream_footer(run: Any, thread_id: str) -> dict[str, Any]:
+    """The composer docked under the orchestrator's stream.
+
+    With a thread, the message goes to the orchestrator itself; a live turn
+    is steered by it, and a finished run's thread is continued by it. Without
+    one, there is no orchestrator to talk to, and the fallback steers the
+    running node — said plainly so the input is not mistaken for a chat.
+    """
+    if thread_id:
+        return {
+            "placeholder": "Message the orchestrator… (Enter to send)",
+            "cli": ["threads", "send", thread_id, "--text"],
+            "note": (
+                "⏵⏵ steers the orchestrator's live turn · after the run "
+                "finishes the same message continues this thread"
+            ),
+        }
+    if not _running(run):
+        return {"note": "This run is finished — steering is consumed only by a live run."}
+    return {
+        "placeholder": "Steer the running node… (Enter to send)",
+        "cli": ["board", "steer", run.id, "--role", "any", "--text"],
+        "note": (
+            "no orchestrator thread owns this run · ⏵⏵ lands as operator "
+            "steering, consumed on the node's next turn"
+        ),
+    }
+
+
+def _thread_feed(run: Any, args: dict[str, Any] | None, thread_id: str) -> dict[str, Any]:
+    """The run's orchestrator as a live transcript, oldest first."""
+    limit = _limit(args)
+    view = _view(args)
+    watcher = _watcher(run)
+    status, status_c, meta = _status_line(run, watcher)
+    records = _thread_records(run.home, thread_id)
+    lane, mode = _thread_meta(records)
+    if lane:
+        meta = f"orchestrator {lane}{(' · ' + mode) if mode else ''} · {meta}"
+    try:
+        rows, events_more = _events(run, limit)
+    except Exception:  # noqa: BLE001 — the thread transcript must still render
+        rows, events_more = [], False
+
+    merged = _thread_stream(records, _started_at(run))
+    merged.extend(_event_stream(rows))
+    merged.extend(_steer_stream(run))
+    merged.sort(key=lambda part: part[0])
+
+    counts = {key: 0 for key, _ in _STREAM_VIEWS}
+    lines: list[str] = []
+    kept: list[dict[str, Any]] = []
+    for _, entry, category, line in merged:
+        counts["all"] += 1
+        counts[category] = counts.get(category, 0) + 1
+        lines.append(line)
+        if view in ("all", category):
+            kept.append(entry)
+
+    # The stream is a window on its newest entries, like the node Stream: a
+    # long thread keeps the run's current turn on screen.
+    more = len(kept) > limit or events_more
+    if len(kept) > limit:
+        kept = kept[-limit:]
+
+    filters = [
+        {
+            "t": f"{label} {counts[key]}",
+            "on": view == key,
+            "do": S.set_args(orch_view=key),
+        }
+        for key, label in _STREAM_VIEWS
+    ]
+    empty = (
+        "This run's orchestrator thread is empty — no turns have been recorded yet."
+        if not counts["all"]
+        else f"No {dict(_STREAM_VIEWS).get(view, view)} in the last {counts['all']} entries."
+    )
+    return _feed_section(
+        "Orchestrator",
+        [],
+        status=status,
+        status_c=status_c,
+        meta=meta,
+        filters=filters,
+        empty=empty,
+        copy="\n".join(lines),
+        footer=_stream_footer(run, thread_id),
+        more=(
+            {
+                "t": f"Show earlier entries (window: {limit})",
+                "do": S.set_args(orch_limit=min(limit * 2, 5000)),
+            }
+            if more
+            else None
+        ),
+        entries=kept,
+        live=_running(run),
+    )
+
+
 def _feed(run: Any, args: dict[str, Any] | None) -> dict[str, Any]:
+    thread_id = _thread_id(run)
+    if thread_id:
+        return _thread_feed(run, args, thread_id)
+    return _event_feed(run, args)
+
+
+def _event_feed(run: Any, args: dict[str, Any] | None) -> dict[str, Any]:
     limit = _limit(args)
     view = _view(args)
     watcher = _watcher(run)
