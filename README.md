@@ -199,7 +199,7 @@ Your source checkouts and git history are never touched.
 
 | | |
 |---|---|
-| OS | macOS, Linux, WSL. Native Windows: install Python 3.11, Git, jq, yq, and SQLite with `winget`, then run `py -3 .\\scripts\\full_install.py` |
+| OS | macOS, Linux, WSL. Native Windows: install Python 3.11, Git, jq, yq, and SQLite with `winget`, then run `py -3 .\scripts\full_install.py` |
 | Python | 3.11 or 3.12 |
 | Git | required |
 | Docker | only for sandboxed verification (`certify`, Crucible) |
