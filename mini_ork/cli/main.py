@@ -1308,6 +1308,24 @@ def _handle_execute_park(run_rc: int, execute_out: str, execute_err: str,
     return REVIEW_PAUSE_RC, False
 
 
+def _apply_default_placement(
+    placement: str, node_env: str, env: Mapping[str, str]
+) -> tuple[str, str, bool]:
+    """Adopt ``MO_DEFAULT_NODE_ENV`` when the run specified no placement.
+
+    Returns ``(placement, node_env, defaulted)``. Explicit input wins;
+    ``MO_REMOTE_NODE=1`` (already inside a sandbox) skips the default.
+    """
+    if placement or node_env:
+        return placement, node_env, False
+    if (env.get("MO_REMOTE_NODE") or "").strip() == "1":
+        return placement, node_env, False
+    from mini_ork.remote.environments import default_node_env  # noqa: PLC0415
+
+    name = default_node_env(env)
+    return ("remote", name, True) if name else (placement, node_env, False)
+
+
 def _run_lifecycle_impl(argv, root, sink) -> int:
     t0 = int(time.time())
     # ── flag pre-parse: pull --deadline / --placement / --env / --set out ──
@@ -1378,6 +1396,8 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
     # gen_profile all read one answer. Unset → nothing published → today's run.
     placement = placement or context_env("MO_PLACEMENT", "").strip()
     node_env = node_env or context_env("MO_NODE_ENV", "").strip()
+    placement, node_env, placement_defaulted = _apply_default_placement(
+        placement, node_env, context_env_snapshot())
     if placement not in ("", "local", "remote"):
         sys.stderr.write(f"MO_PLACEMENT: expected local|remote (got '{placement}')\n"); return 2
     if placement == "remote":
@@ -1392,7 +1412,11 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
             except FileNotFoundError:
                 problem = f"--env: environment profile '{node_env}' not found"
             except ValueError as exc:   # schema violation or a secret-looking env key
-                problem = f"--env: environment profile '{node_env}' is invalid: {exc}"
+                if placement_defaulted:
+                    problem = (f"default environment '{node_env}' (MO_DEFAULT_NODE_ENV) "
+                               f"is invalid: {exc}")
+                else:
+                    problem = f"--env: environment profile '{node_env}' is invalid: {exc}"
         if problem:
             names = list_profiles(env=env_now)
             avail = ", ".join(names) if names else (

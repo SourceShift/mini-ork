@@ -9,9 +9,12 @@
 `mini-ork run code-fix <kickoff> --placement remote --env daytona` runs the
 run's agent nodes in a fresh Daytona sandbox. Nothing is pre-provisioned and no
 VM is left running. The diff lands in the local checkout exactly as it would
-for a local run. Adding E2B, Modal or a Kubernetes pod after that should take
-one module, without editing the resolver, the session registry, the reaper or
-the kill path.
+for a local run. A bare `mini-ork run code-fix <kickoff>` now adopts the
+`daytona` profile when one is configured (see [Default
+placement](#default-placement)); `--placement local` opts out for a single run.
+A laptop or CI checkout with no cloud profile keeps running locally. Adding
+E2B, Modal or a Kubernetes pod after that should take one module, without
+editing the resolver, the session registry, the reaper or the kill path.
 
 ## What exists today (discovery, 2026-10-13)
 
@@ -20,7 +23,7 @@ Two axes are already built, and only one of them knows about the cloud.
 | Axis | Selector | Backends | Where it runs |
 |---|---|---|---|
 | **Workspace backend**: isolate a process *on this host* | `MO_SANDBOX_BACKEND` + `MO_SANDBOX_SCOPE=tool\|agent` | `local`, `docker`, `microvm` (`mini_ork/runtime/backends/`) | the laptop, bind-mounting a shared drive at `/workspace` |
-| **Remote placement**: run nodes *on another machine* | `--placement remote --env <profile>` (`MO_PLACEMENT`, `MO_NODE_ENV`) | `remote` = `RemoteWorkspace` → a self-hosted `mini-ork node-agent` | any VM you run the node-agent on (`config/nodes.yaml`) |
+| **Remote placement**: run nodes *on another machine* | `--placement remote --env <profile>` (`MO_PLACEMENT`, `MO_NODE_ENV`); `<profile>` defaults to `MO_DEFAULT_NODE_ENV` (`daytona`) when configured | `remote` = `RemoteWorkspace` → a self-hosted `mini-ork node-agent` | any VM you run the node-agent on (`config/nodes.yaml`) |
 
 The node-agent protocol already handles the hard parts of remote execution:
 - git-snapshot tree sync up and down (`mini_ork/remote/tree_sync.py`)
@@ -87,6 +90,37 @@ provider: daytona            # static (default) | daytona | <plugin>
 
 `MO_NODE_PROVIDER` overrides it per invocation. With neither set, the provider
 is `static`, which is byte-for-byte today's behavior.
+
+### Default placement
+
+A bare `mini-ork run` adopts a cloud profile when one is configured, so a run
+on the operator's laptop lands in a Daytona sandbox without repeating
+`--placement remote --env daytona` every time. Resolution follows five rules:
+
+1. An explicit `--placement` / `MO_PLACEMENT` (including `--placement local`)
+   and an explicit `--env` / `MO_NODE_ENV` always win — their behavior is
+   unchanged.
+2. When the run named neither, it adopts `MO_DEFAULT_NODE_ENV` (default
+   `daytona`) **iff** a profile file for that name exists in the visible config
+   dirs. Adoption is exactly equivalent to passing `--placement remote --env
+   <name>`: the same validation, `MO_PLACEMENT` / `MO_NODE_ENV` /
+   `MO_REMOTE_SESSION_SCOPE=lifecycle` publishing, node acquisition and
+   run-end release all run unchanged.
+3. No such profile → nothing is published → the run stays local, exactly as
+   today. The committed repo ships only `*.yaml.example` files, which do not
+   count as profiles, so a fresh clone and CI stay local automatically.
+4. `MO_DEFAULT_NODE_ENV` set to an empty value or one of
+   `0|false|no|off|none|local` (case-insensitive) disables the default
+   entirely. `--placement local` remains the per-run opt-out.
+5. Inside a remote node (`MO_REMOTE_NODE=1`) the default is skipped: a
+   sandboxed run must never create a sandbox inside itself.
+
+An existing but invalid default profile fails the run **closed**: it exits 2
+with a message naming `MO_DEFAULT_NODE_ENV` and the profile instead of silently
+falling back to a host run. A missing provider credential is still reported by
+the provider's `ProviderUnavailableError` at node acquisition. Setting
+`MO_DEFAULT_NODE_ENV=e2b` selects a different provider profile when
+`config/environments/e2b.yaml` exists.
 
 ### The provider contract
 
