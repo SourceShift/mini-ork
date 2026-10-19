@@ -105,3 +105,50 @@ def test_mini_ork_package_frame_without_root_is_mini_ork():
     # No root given — shape alone resolves the package.
     v, _ = attribute(NodeFailure("impl", finish_reason="error", log_excerpt=_FW_TRACE))
     assert v == "mini_ork"
+
+
+def test_impl_moved_base_is_mini_ork_harness():
+    v, ev = attribute(NodeFailure("impl", finish_reason="impl_moved_base"), root=ROOT)
+    assert v == "mini_ork"
+    assert len(ev) == 1
+    assert ev[0].rule == "harness"
+    assert "finish_reason=impl_moved_base" in ev[0].detail
+
+
+def test_dispatcher_dead_is_mini_ork_harness():
+    v, ev = attribute(NodeFailure("impl", finish_reason="dispatcher-dead"), root=ROOT)
+    assert v == "mini_ork"
+    assert len(ev) == 1
+    assert ev[0].rule == "harness"
+    assert "finish_reason=dispatcher-dead" in ev[0].detail
+
+
+def test_harness_reason_wins_over_provider_signature():
+    # Reason precedence: the harness branch is checked before the provider probe,
+    # so a harness finish reason beats a 401 line in the log.
+    log = "HTTP 401 Unauthorized: invalid api key\n"
+    v, ev = attribute(
+        NodeFailure("impl", finish_reason="dispatcher-dead", log_excerpt=log), root=ROOT
+    )
+    assert v == "mini_ork"
+    assert ev[0].rule == "harness"
+    # Control: the same log with no harness reason still resolves to provider.
+    control_v, control_ev = attribute(
+        NodeFailure("impl", finish_reason="error", log_excerpt=log), root=ROOT
+    )
+    assert control_v == "unknown"
+    assert control_ev[0].rule == "provider"
+
+
+def test_harness_branch_leaves_verdict_timeout_and_traceback_unchanged():
+    v, ev = attribute(NodeFailure("review", finish_reason="verdict_fail"), root=ROOT)
+    assert v == "consumer"
+    assert not any(e.rule == "harness" for e in ev)
+
+    v, ev = attribute(NodeFailure("slow", finish_reason="timeout"), root=ROOT)
+    assert v == "unknown"
+    assert not any(e.rule == "harness" for e in ev)
+
+    v, ev = attribute(NodeFailure("impl", finish_reason="error", log_excerpt=_FW_TRACE), root=ROOT)
+    assert v == "mini_ork"
+    assert ev[0].rule == "traceback"

@@ -36,6 +36,7 @@ if str(REPO) not in sys.path:
 from acp.schema import (  # noqa: E402
     ToolCallLocation,
     ToolCallProgress,
+    ToolCallStart,
 )
 from mini_ork.acp.agent import MiniOrkAcpAgent  # noqa: E402
 from mini_ork.acp.live import normalize  # noqa: E402
@@ -399,3 +400,72 @@ def test_agent_omits_locations_when_session_has_no_known_cwd(tmp_path):
     assert text_chunks, "no live text chunks reached the projection"
     live_locs, _live_text = text_chunks[0]
     assert live_locs is None
+
+
+# ── ordering: a live chunk never precedes its tool-call card ────────────────
+
+
+def test_first_live_chunk_arrives_after_its_tool_call_card(tmp_path):
+    """A node's first live chunk must follow the ``ToolCallStart`` that names
+    its ``tool_call_id``.
+
+    ``_project_snapshot`` records a node's ``node_start`` and drains its live
+    tail in the same pass. The drain follows nodes whose start was *recorded*,
+    so a chunk emitted before the card is a progress update for a tool call
+    Zed has never been told about: it inserts a failed "Tool call not found"
+    entry and returns before resolving the chunk's ``locations``. The live
+    dedup would then mark that path as sent, suppressing the location on
+    every later chunk for the same file — the crosshair never follows it.
+    """
+    home = tmp_path / "home"
+    run_id = "run-order"
+    node = "implementer"
+    live = home / "runs" / run_id / f"agent-{node}.live.jsonl"
+    _write_live_lines(live, [
+        json.dumps({
+            "type": "assistant",
+            "message": {"content": [{
+                "type": "tool_use",
+                "name": "Edit",
+                "input": {"file_path": "/tmp/ordered.py", "new_text": "x"},
+            }]},
+        }),
+    ])
+
+    agent = MiniOrkAcpAgent(
+        home=str(home),
+        reader=lambda _rid: {"status": "executing", "events": [], "llm_calls": []},
+        poll_interval=0.01,
+        start_timeout=2.0,
+    )
+    conn = _FakeLocationConn()
+    agent._conn = conn
+    agent._sessions[run_id] = str(tmp_path)
+
+    snapshot = {
+        "status": "executing",
+        "events": [
+            {"event_type": "node_start",
+             "payload_json": json.dumps({"node_id": node, "node_type": node})},
+        ],
+        "llm_calls": [],
+    }
+    asyncio.run(agent._project_snapshot(run_id, snapshot))
+
+    card_at = next(
+        (i for i, u in enumerate(conn.captured)
+         if isinstance(u, ToolCallStart) and u.tool_call_id == node),
+        None,
+    )
+    chunk_at = next(
+        (i for i, u in enumerate(conn.captured)
+         if isinstance(u, ToolCallProgress) and u.tool_call_id == node
+         and getattr(u, "locations", None)),
+        None,
+    )
+    shapes = [type(u).__name__ for u in conn.captured]
+    assert card_at is not None, shapes
+    assert chunk_at is not None, shapes
+    assert card_at < chunk_at, (
+        "the first chunk with a location must follow its tool-call card"
+    )

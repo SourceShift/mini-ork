@@ -116,6 +116,55 @@ def test_unknown_id_exits_2(home: Path) -> None:
         assert "no such lesson" in err.getvalue().lower()
 
 
+def test_promote_proposed_row_approves_it(home: Path) -> None:
+    _seed(home, [("p-p", "proposed", "Lesson P", 1.0)])
+    out = io.StringIO()
+    assert lessons_cmd.main(["promote", "p-p"], stdout=out, stderr=io.StringIO()) == 0
+    status, resolved = _status(home, "p-p")
+    assert status == "approved"
+    assert resolved is not None
+
+
+def test_promote_proposed_row_without_a_lesson_exits_2(home: Path) -> None:
+    _seed(home, [("p-p", "proposed", "", 1.0)])
+    err = io.StringIO()
+    assert lessons_cmd.main(["promote", "p-p"], stdout=io.StringIO(), stderr=err) == 2
+    assert "no authored lesson" in err.getvalue()
+    assert _status(home, "p-p") == ("proposed", None)    # unchanged
+
+
+def test_promote_an_approved_row_exits_2(home: Path) -> None:
+    _seed(home, [("p-a", "approved", "Lesson A", 3.0)])
+    err = io.StringIO()
+    assert lessons_cmd.main(["promote", "p-a"], stdout=io.StringIO(), stderr=err) == 2
+    assert "it is not proposed" in err.getvalue()
+    assert _status(home, "p-a")[0] == "approved"         # unchanged
+
+
+def test_promote_unknown_id_exits_2(home: Path) -> None:
+    _seed(home, [("p-p", "proposed", "Lesson P", 1.0)])
+    err = io.StringIO()
+    assert lessons_cmd.main(["promote", "nope"], stdout=io.StringIO(), stderr=err) == 2
+    assert "no such lesson" in err.getvalue().lower()
+
+
+def test_promote_without_an_id_is_a_usage_error(home: Path) -> None:
+    _seed(home, [("p-p", "proposed", "Lesson P", 1.0)])
+    assert lessons_cmd.main(["promote"], stdout=io.StringIO(),
+                            stderr=io.StringIO()) == 2
+    assert _status(home, "p-p")[0] == "proposed"
+
+
+def test_forget_still_rejects_a_proposed_row(home: Path) -> None:
+    """Regression pin: promote is additive — forget's own behaviour is untouched."""
+    _seed(home, [("p-p", "proposed", "Lesson P", 1.0)])
+    assert lessons_cmd.main(["forget", "p-p"], stdout=io.StringIO(),
+                            stderr=io.StringIO()) == 0
+    status, resolved = _status(home, "p-p")
+    assert status == "rejected"
+    assert resolved is not None
+
+
 def test_usage_and_help(home: Path) -> None:
     assert lessons_cmd.main([], stdout=io.StringIO(), stderr=io.StringIO()) == 2
     assert lessons_cmd.main(["forget"], stdout=io.StringIO(), stderr=io.StringIO()) == 2

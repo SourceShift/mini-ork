@@ -99,6 +99,76 @@ three paths and `git rebase --continue` completed it losslessly. The reversion
 guard wrote no new rows, so R14's rebase skip held during a real worktree
 rebase — `MO_REVERSION_GUARD_DISABLED=1` was not needed.
 
+## Status 2026-10-17 ~09:40 (waves 3b and 3c merged)
+
+R12 merged as `72182582` (migration `0078`, `repo_identity` via the common git
+dir, `target_repo` on every harvested row, NULL = engine-local, a repo-scoped
+`scope_findings`/`prior_attempts`/`build` and tab, plus an idempotent
+`backfill-target-repo`). R3 merged as `1ec260da` (`include_themes` on
+`failure_modes_md`, arm-based suppression in `_learned_block`, v2 block built
+before the v1 UCB producers, `themes_once` marker, `injects()` deleted).
+
+One review note on R3: it edited `tests/unit/test_context_v2.py`, which is not
+in its kickoff's Files-in-scope. The edit is the necessary consequence of
+deleting `injects()` — the old assertion called it — and the worktree-merge
+claim guard refused the merge until the path was explicitly claimed, which is
+the behaviour working as intended. No other clause deviated; the `graph_context`
+relocation into the v1-only branch is prompt-neutral because that block was
+already dropped whenever a v2 block rendered.
+
+## Status 2026-10-17 ~10:55 (wave 4 merged: R11a, R13)
+
+R11a merged as `3515640d`: read-time staleness (`stale_reason` →
+age, then snippet-not-at-`HEAD:file` via one `git cat-file --batch`),
+`MO_CONTEXT_V2_MAX_AGE_DAYS` (default 30, `0` disables) and
+`MO_FINDINGS_STALENESS=0` pushed into `scope_findings_with_stats`, stale
+counts in the pack and the tab, and the central `classify_note != "code"`
+skip in `_harvest_run` (R5 residual). R13 merged as `7c73545d`: symmetric
+containment recurrence (`CONTAINMENT_MIN = 0.6`), embedding arm gated on
+`MO_EMBED_PROVIDER`, arm/held-out provenance in the injection ledger,
+ITT-vs-delivered denominators with `v2_legacy` excluded from lift, and
+report-only `theme_candidates` / `rule_candidates` behind
+`memory-lifecycle --kind`.
+
+Four R13 review deviations were corrected before merge, all of them the
+implementer inventing semantics the kickoff did not ask for: an asymmetric
+containment denominator (subset restatements scored 0.5, now `min(len)`,
+so either-direction subset → 1.0), an unused `_token_set`, an invented
+"legacy arm recurred" branch for runs with zero findings (now every arm is
+measured by the same matcher), and `theme_candidates` anchoring its window
+at the oldest `last_seen` instead of a now-relative cut (a larger
+`max_age_days` must admit *fewer* rows). The two tests that encoded the
+bad semantics were rewritten with it. R13 also edited
+`tests/unit/test_context_v2_wiring.py` (kickoff-external, required by the
+new lift shape); the claim guard refused until it was explicitly claimed,
+same pattern as R3.
+
+## Status 2026-10-17 ~11:55 (wave 5 merged: R11b — plan complete)
+
+R11b merged as `220faf02` (rebased off two concurrent-session commits): the
+`code_findings_landing` table (`0079`, runtime twin in `ensure_schema`;
+`landed_commit` NULL = checked-and-not-landed), `run_patch_id` /
+`landed_patch_ids` / `check_landing` / `annotate_landing` /
+`landing_enabled` and a `check-landing` subcommand, landing decay in
+`scope_findings_with_stats` after R11a's staleness decay with separate
+`n_landed` / `n_findings_landed` counts, and the tab's own "hidden as
+landed on origin/main" line. `MO_FINDINGS_LANDING=0` restores dropped rows
+(and reports zero dropped, matching the kickoff's own test sentence).
+
+The run itself ended `failed` after one repair round: the reviewer blocked
+on an **import-time `builtins.pytest` mutation** the implementer added to
+`code_findings.py` because the frozen spec suite uses `pytest.raises` in
+`test_spec_landing_db.py` without importing pytest — a production module
+altering its verifier's environment and masking missing-import NameErrors
+repo-wide. The diff was recovered from the run dir and hand-corrected:
+the shim (and its call) removed, `import pytest` added to the spec file in
+the run dir, dead `_window_landed` dropped. Verification: the kickoff's
+6-file gate → 177 passed, the blind spec suite (21 tests, run from the
+worktree root so `_in_repo` resolves the repo) → 21 passed, ruff F,E9
+clean. The lesson recorded for future kickoffs: a spec author may emit
+`pytest.raises` without importing pytest; the fence must be fixed on the
+spec side, never served from the production import graph.
+
 ## Wave-3 resequencing (2026-10-17 ~00:40)
 
 The wave table above put R3, R9, R7b and R12 in one wave "touching disjoint
@@ -152,3 +222,22 @@ Witnessed on `lf-r5` and `lf-r2`; both merges were completed with
 `kickoffs/auto/lf-r14-reversion-guard.md`. Fix: require the watched commit to
 still be HEAD (and no rebase/am/merge in progress, detected per worktree)
 before any restore.
+
+## Status 2026-10-17 ~12:40 (post-merge findings maintenance)
+
+Ran, after the last live run left the DB: `reharvest` → `prune` →
+`clear-artifact-files` → `backfill-target-repo` → `check-landing`, with a
+timestamped `state.db.pre-maint-*` backup first. Results: 1276 run dirs
+re-parsed into **1742 findings** (991 with a file, 26 unparseable), prune and
+clear-artifact-files 0 (nothing left; no artifact-path rows), backfill 0
+(1562 legacy rows keep NULL because their profiles name no target cwd — the
+engine-local marker by design), check-landing **191 runs checked, 64 landed**.
+
+The pass exposed a real defect the suite could not see: `python -m
+mini_ork.learning.code_findings reharvest` failed for **619 runs** with
+`NameError: parse_review is not defined` and harvested nothing. The `if
+__name__ == "__main__"` guard sat above `parse_review`/`parse_verifier`, so
+script execution ran `main()` before those defs existed; every test imports
+the module, where they do exist. Fixed by moving the guard to the end of the
+file (`cb44beeb`) and pinned with a subprocess regression test that runs the
+module CLI against a temp home and asserts the finding is parsed.

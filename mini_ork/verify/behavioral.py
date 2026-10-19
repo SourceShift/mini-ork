@@ -65,6 +65,7 @@ __all__ = [
     "run_ui_check",
     "run_journey_check",
     "run_function_check",
+    "run_recompute_check",
     "observable_from_env",
     "main",
     "register_surface_handler",
@@ -75,7 +76,7 @@ PROVEN = "PROVEN"
 REFUTED = "REFUTED"
 UNVERIFIED = "UNVERIFIED"
 
-_SURFACES = ("api", "ui", "journey", "function")
+_SURFACES = ("api", "ui", "journey", "function", "recompute")
 _METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
 _METAMORPHIC = ("idempotent_repeat", "order_invariant", "filtered_subset_of_unfiltered")
 
@@ -178,6 +179,7 @@ class Observable:
     extract: dict = field(default_factory=dict)
     module: str = ""
     function: str = ""
+    recompute: dict = field(default_factory=dict)
     seed_inputs: list = field(default_factory=list)
     relations: list[str] = field(default_factory=list)
     equivalence: EquivalenceSpec = field(default_factory=EquivalenceSpec)
@@ -265,6 +267,18 @@ class Observable:
         expect_body = data.get("expect_body")
         if expect_body_set and not _is_json_data(expect_body):
             raise ObservableError("observable.expect_body must contain only plain JSON data")
+        if "recompute" in data:
+            recompute_raw = data["recompute"]
+            if not isinstance(recompute_raw, dict):
+                raise ObservableError("observable.recompute must be a mapping")
+            if "records" not in recompute_raw:
+                raise ObservableError(
+                    "observable.recompute must declare a 'records' list"
+                )
+            if not isinstance(recompute_raw["records"], list):
+                raise ObservableError("observable.recompute.records must be a list")
+        else:
+            recompute_raw = {}
         return cls(
             surface=surface,
             target=target,
@@ -285,6 +299,7 @@ class Observable:
             extract=extract,
             module=str(data.get("module") or ""),
             function=str(data.get("function") or ""),
+            recompute=recompute_raw,
             seed_inputs=seed_inputs,
             relations=relations,
             equivalence=equivalence,
@@ -637,6 +652,28 @@ def _propose_relations(module: str, function: str, fn: Callable) -> dict | None:
     return metamorphic_proposer.to_spec(module, function, proposal)
 
 
+def _resolve_subject(
+    module_name: str, function_name: str
+) -> tuple[Callable[..., Any] | None, str]:
+    """Import ``module_name`` and resolve ``function_name`` to a callable.
+
+    Returns ``(callable, "")`` on success, or ``(None, reason)`` when the
+    subject cannot be reached or is not callable. Callers turn the reason into
+    an honest abstention (never an exception).
+    """
+    import importlib
+
+    target = ".".join(part for part in (module_name, function_name) if part)
+    try:
+        module = importlib.import_module(module_name)
+        fn = getattr(module, function_name)
+    except (ImportError, AttributeError) as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+    if not callable(fn):
+        return None, f"target {target!r} is not callable"
+    return fn, ""
+
+
 def run_function_check(obs: Observable) -> BehavioralVerdict:
     """Run function-level metamorphic checks with three-valued discipline."""
     target = ".".join(part for part in (obs.module, obs.function) if part)
@@ -651,24 +688,12 @@ def run_function_check(obs: Observable) -> BehavioralVerdict:
         )
 
     import copy
-    import importlib
 
     from mini_ork.learning import metamorphic as mm
 
-    try:
-        module = importlib.import_module(obs.module)
-        fn = getattr(module, obs.function)
-    except (ImportError, AttributeError) as exc:
-        checks = [Check("reachable", None, f"{type(exc).__name__}: {exc}")]
-        return BehavioralVerdict(
-            UNVERIFIED,
-            "function",
-            checks,
-            evidence=_summarize(UNVERIFIED, target, checks),
-            target=target,
-        )
-    if not callable(fn):
-        checks = [Check("reachable", None, f"target {target!r} is not callable")]
+    fn, resolution_error = _resolve_subject(obs.module, obs.function)
+    if resolution_error:
+        checks = [Check("reachable", None, resolution_error)]
         return BehavioralVerdict(
             UNVERIFIED,
             "function",
@@ -764,6 +789,65 @@ def run_function_check(obs: Observable) -> BehavioralVerdict:
         "function",
         checks,
         evidence=_summarize(status, target, checks),
+        target=target,
+    )
+
+
+def run_recompute_check(obs: Observable) -> BehavioralVerdict:
+    """Replay a declared record log through the subject's apply function.
+
+    Execution-anchored: two independent replays must agree on the final
+    functional state, and any declared ``expect_state`` must hold. A harness
+    failure (unreachable subject, ``apply`` raising, opaque state) abstains;
+    only a replay divergence or an expectation mismatch refutes.
+    """
+    target = ".".join(part for part in (obs.module, obs.function) if part)
+    if not obs.module or not obs.function:
+        checks = [Check("declared", None, "no module/function declared")]
+        return BehavioralVerdict(
+            UNVERIFIED,
+            "recompute",
+            checks,
+            evidence=_summarize(UNVERIFIED, target, checks),
+            target=target,
+        )
+
+    # Function-local import: keep behavioral's import-time graph unchanged and
+    # avoid a certify <-> verify cycle.
+    from mini_ork.certify import recompute as recompute_mod
+
+    fn, resolution_error = _resolve_subject(obs.module, obs.function)
+    if resolution_error:
+        checks = [Check("reachable", None, resolution_error)]
+        return BehavioralVerdict(
+            UNVERIFIED,
+            "recompute",
+            checks,
+            evidence=_summarize(UNVERIFIED, target, checks),
+            target=target,
+        )
+
+    # A missing recompute block abstains in ``check`` ("no recompute records
+    # declared") rather than raising: an undeclared log is not evidence
+    # against the subject.
+    records = obs.recompute.get("records") or []
+    result = recompute_mod.check(
+        fn,
+        records,
+        initial_state=obs.recompute.get("initial_state"),
+        expected_state=obs.recompute.get("expect_state"),
+        has_expected="expect_state" in obs.recompute,
+        equivalence=str(obs.recompute.get("equivalence") or "exact"),
+    )
+    checks = [
+        Check(entry["name"], entry["ok"], entry.get("detail", ""))
+        for entry in result.checks
+    ]
+    return BehavioralVerdict(
+        result.status,
+        "recompute",
+        checks,
+        evidence=result.evidence,
         target=target,
     )
 
@@ -1302,6 +1386,7 @@ register_surface_handler("api", run_api_check)
 register_surface_handler("ui", run_ui_check)
 register_surface_handler("journey", run_journey_check)
 register_surface_handler("function", run_function_check)
+register_surface_handler("recompute", run_recompute_check)
 
 
 if __name__ == "__main__":

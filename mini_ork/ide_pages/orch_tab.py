@@ -695,7 +695,7 @@ def _thread_feed(run: Any, args: dict[str, Any] | None, thread_id: str) -> dict[
         else f"No {dict(_STREAM_VIEWS).get(view, view)} in the last {counts['all']} entries."
     )
     return _feed_section(
-        "Orchestrator",
+        "Orchestrator activity",
         [],
         status=status,
         status_c=status_c,
@@ -768,7 +768,7 @@ def _event_feed(run: Any, args: dict[str, Any] | None) -> dict[str, Any]:
         else f"No {dict(_VIEWS)[view]} in the last {counts['all']} events."
     )
     section = _feed_section(
-        "Orchestrator",
+        "Orchestrator activity",
         items,
         status=status,
         status_c=status_c,

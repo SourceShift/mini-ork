@@ -38,10 +38,11 @@ import os
 import re
 import subprocess
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from mini_ork.certify import differential
+from mini_ork.certify import discrimination
 from mini_ork.certify import invariants as mr
 from mini_ork.certify import probe as poc_plus
 from mini_ork.certify import relations
@@ -590,6 +591,31 @@ def replay_check(
     }
 
 
+def _usable_candidates(raw) -> list[discrimination.Candidate]:
+    """Coerce a candidate pool into `Candidate`s, skipping malformed entries.
+
+    Accepts `Candidate`-like objects (attributes ``patch``/``correct``) and
+    mappings (``{"patch": ..., "correct": ...}``) so a caller can pass a corpus
+    manifest as plain JSON without importing the dataclass. Anything else —
+    ``None``, numbers, strings, a mapping missing either key, a non-bool
+    ``correct`` — is skipped, never raised on: a malformed pool entry is a
+    caller bug, not a reason to crash a judgement.
+    """
+    usable: list[discrimination.Candidate] = []
+    for entry in raw or []:
+        if isinstance(entry, Mapping):
+            patch, correct = entry.get("patch"), entry.get("correct")
+        else:
+            patch = getattr(entry, "patch", None)
+            correct = getattr(entry, "correct", None)
+        if not isinstance(patch, str) or not patch.strip():
+            continue
+        if not isinstance(correct, bool):
+            continue
+        usable.append(discrimination.Candidate(patch=patch, correct=correct))
+    return usable
+
+
 # ── Oracle judge ─────────────────────────────────────────────────────────────
 def judge(
     issue: str,
@@ -601,6 +627,7 @@ def judge(
     poc: str | None = None,
     dispatch: DispatchFn | None = None,
     context: CodeContext | None = None,
+    candidates: list | None = None,
 ) -> Verdict:
     """Judge `patch`. Nothing here reads `gold` — it is used only to LABEL the invariants
     for measurement, never to decide. Pass gold=None in production.
@@ -620,6 +647,14 @@ def judge(
     prompt the model with the BASE source AND structurally reject any candidate that does
     not import the code under test. SWE-bench-style callers omit `context` and the engine
     behaves exactly as before.
+
+    `candidates` (optional) is a pool of known-correct/known-bad patches
+    (`Candidate`-like objects or `{"patch", "correct"}` mappings). When supplied
+    and `MO_ASSAY_DISCRIMINATION` is on, a would-be PROVEN is re-examined: a
+    reproduction test that cannot separate the two classes is a defect in the
+    EVIDENCE, so PROVEN is withheld (downgraded to UNVERIFIED). The term can
+    never create PROVEN and never returns REFUTED. Omitted/disabled, the
+    judgement is byte-identical to before.
     """
     d_fn = dispatch or _default_dispatch()
 
@@ -778,6 +813,29 @@ def judge(
         if drec["verdict"] == REFUTED and verdict == PROVEN:
             verdict = REFUTED
             reason = drec["reason"]
+
+    # ── Term 5: discrimination (evidence quality; withhold-only) ────────────
+    # The PoC+ was validated against ONE correct patch. A candidate pool with
+    # known-correct/known-bad patches asks the missing question: can this test
+    # tell them apart? A test that cannot is a defect in the EVIDENCE, not
+    # proof against the patch — so the only verdict move allowed here is
+    # PROVEN -> UNVERIFIED. It never creates PROVEN and never emits REFUTED.
+    if verdict == PROVEN and candidates is not None and discrimination.enabled():
+        dres = discrimination.score(poc_src, _usable_candidates(candidates),
+                                    runner=runner)
+        detail["discrimination"] = {
+            "status": dres.status,
+            "discrimination": dres.discrimination,
+            "correct_accepted": dres.correct_accepted,
+            "correct_total": dres.correct_total,
+            "incorrect_rejected": dres.incorrect_rejected,
+            "incorrect_total": dres.incorrect_total,
+            "checks": dres.checks,
+            "evidence": dres.evidence,
+        }
+        if dres.status == discrimination.REFUTED:
+            verdict = UNVERIFIED
+            reason = f"the reproduction test does not discriminate: {dres.evidence}"
 
     return Verdict(verdict, reason, poc_plus=poc_src,
                    mr_pass_rate=(rate if n else None), mr_n=n,

@@ -28,6 +28,11 @@ Modes (``MO_CONTEXT_V2``): ``off`` | ``shadow`` (default — build and record th
 pack, inject nothing new) | ``on``. Under ``on``, a deterministic
 ``MO_CONTEXT_V2_HOLDOUT`` share of runs (default 0.2) keeps the v1 context so
 recurrence can be compared against a held-out arm.
+
+In the ``v2`` arm the pack's task_class-keyed sections replace their v1
+counterparts (failure modes, prior runs); the rest of the v1 learned block —
+verified emergent patterns, operator preferences, steering — is still rendered
+per node, so this is not a wholesale replacement of the v1 blocks.
 """
 from __future__ import annotations
 
@@ -48,6 +53,11 @@ MODES = ("off", "shadow", "on")
 DEFAULT_MODE = "shadow"
 DEFAULT_HOLDOUT = 0.2
 DEFAULT_SIM = 0.35
+# Paraphrase tolerance (LF-R13 §3): a reworded restatement often falls below the
+# TF-IDF cosine floor while sharing the same token set, or embeds to nearly the
+# same point. Both arms are additive — the TF-IDF rule above is unchanged.
+CONTAINMENT_MIN = 0.6
+EMBED_MIN = 0.6
 PACK_FILENAME = "context-pack.v2.json"
 # The full success command reaches every node; only an absurd one is cut, and
 # the cut is made visible (change 4).
@@ -105,11 +115,6 @@ def in_holdout(run_id: str, rate: float | None = None) -> bool:
         return False
     bucket = int(hashlib.sha1(run_id.encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
     return bucket < rate
-
-
-def injects(run_id: str) -> bool:
-    """True when v2 context replaces the v1 blocks for this run."""
-    return mode() == "on" and not in_holdout(run_id)
 
 
 # ── kickoff contract ─────────────────────────────────────────────────────────
@@ -298,25 +303,116 @@ def _repo_clause(target_repo: str | None, engine: str | None) -> tuple[str, list
 
 def _query_findings(con: sqlite3.Connection, prefix: str, limit: int,
                     exclude_run: str | None, target_repo: str | None = None,
-                    engine: str | None = None) -> list[dict]:
+                    engine: str | None = None,
+                    age_cutoff: int | None = None) -> list[dict]:
     if target_repo and _has_target_repo(con):
         clause, clause_params = _repo_clause(target_repo, engine)
     else:
         clause, clause_params = "", []
     where = "file LIKE ? ESCAPE '\\' AND (? = '' OR run_id != ?)"
+    params: list = [_like_escape(prefix) + "%", exclude_run or "", exclude_run or ""]
     if clause:
         where += " AND " + clause
+        params += clause_params
+    if age_cutoff is not None:
+        # LF-R11a: the max-age window is a SQL predicate, not a Python pass over
+        # an already-limited page — otherwise an old crowd would fill the LIMIT
+        # and hide the fresh rows the run should see.
+        where += " AND ts >= ?"
+        params.append(int(age_cutoff))
     rows = con.execute(
         f"""
-        SELECT id, fingerprint, run_id, file, line, severity, category, issue, ts
+        SELECT id, fingerprint, run_id, file, line, severity, category, issue,
+               snippet, ts
         FROM code_findings
         WHERE {where}
         ORDER BY ts DESC LIMIT ?
         """,
-        [_like_escape(prefix) + "%", exclude_run or "", exclude_run or ""]
-        + clause_params + [int(limit)],
+        params + [int(limit)],
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def _sort_newest(rows, limit: int) -> list[dict]:
+    return sorted(rows, key=lambda r: str(r.get("ts") or ""), reverse=True)[:limit]
+
+
+def scope_findings_with_stats(paths: list[str], *, db: str | None = None,
+                              limit: int = 300, exclude_run: str | None = None,
+                              target_repo: str | None = None) -> tuple[list[dict], dict]:
+    """``scope_findings`` plus the decay counts (LF-R11a).
+
+    Returns ``(fresh_rows, stats)`` where ``stats`` carries
+    ``n_findings_scanned`` (the pre-decay count), ``n_findings_stale`` (rows the
+    age window or the HEAD check dropped), ``n_landed`` (rows dropped because
+    their run's diff landed on origin/main, LF-R11b) and ``max_age_days``. The
+    scan count is taken from the same predicate applied without the age term,
+    so the counts can never contradict each other; the two drop counts stay
+    separate.
+    """
+    max_age = code_findings.max_age_days_from_env()
+    stats = {"n_findings_scanned": 0, "n_findings_stale": 0, "n_landed": 0,
+             "max_age_days": max_age}
+    con = _connect_ro(db)
+    if con is None:
+        return [], stats
+    engine = engine_identity()
+    # Staleness reads the target repo's HEAD: the explicit identity when given,
+    # else MO_TARGET_CWD's identity, else the engine checkout (R12's rule).
+    repo_root = resolve_target_repo(target_repo)
+    age_cutoff = int(time.time()) - max_age * 86400 if max_age > 0 else None
+    try:
+        # Phase 1 — the pre-decay scan. It also fixes the prefix/fallback choice
+        # for each scope path, so both phases read exactly the same path set.
+        scanned: dict[int, dict] = {}
+        prefixes: list[str] = []
+        for raw in paths:
+            prefix = _strip_glob(raw)
+            if not prefix:
+                continue
+            rows = _query_findings(con, prefix, limit, exclude_run, target_repo,
+                                   engine)
+            if not rows and "." in os.path.basename(prefix):
+                parent = os.path.dirname(prefix)
+                if parent.count("/") >= 2:
+                    prefix = parent + "/"
+                    rows = _query_findings(con, prefix, limit, exclude_run,
+                                           target_repo, engine)
+            prefixes.append(prefix)
+            for r in rows:
+                scanned.setdefault(r["id"], r)
+        stats["n_findings_scanned"] = len(_sort_newest(scanned.values(), limit))
+
+        # Phase 2 — the same prefixes with the age window pushed into SQL.
+        survivors: dict[int, dict] = {}
+        for prefix in prefixes:
+            for r in _query_findings(con, prefix, limit, exclude_run, target_repo,
+                                     engine, age_cutoff):
+                survivors.setdefault(r["id"], r)
+
+        annotated = code_findings.annotate_staleness(
+            _sort_newest(survivors.values(), limit),
+            repo_root=repo_root, max_age_days=max_age,
+        )
+        fresh = [r for r in annotated if not r.get("stale")]
+        stats["n_findings_stale"] = max(
+            0, stats["n_findings_scanned"] - len(fresh))
+        # LF-R11b: landing decay runs AFTER R11a's staleness decay. A row whose
+        # run's diff landed on origin/main is no longer offered; the count is
+        # kept separate from the stale count. MO_FINDINGS_LANDING=0 disables
+        # the drop (and the count) while leaving the rows untouched.
+        n_landed = 0
+        if fresh and code_findings.landing_enabled():
+            marked = code_findings.annotate_landing(fresh, db=db)
+            kept = [r for r in marked if not r.get("landed")]
+            n_landed = len(fresh) - len(kept)
+            fresh = kept
+        stats["n_landed"] = n_landed
+        return fresh, stats
+    except sqlite3.Error:
+        return [], stats
+    finally:
+        con.close()
 
 
 def scope_findings(paths: list[str], *, db: str | None = None, limit: int = 300,
@@ -332,30 +428,15 @@ def scope_findings(paths: list[str], *, db: str | None = None, limit: int = 300,
     (LF-R12 §4), so a sibling repo's findings can never leak in through the
     fallback. ``target_repo=None`` reads unscoped, preserving the legacy call
     shape; ``build`` always passes a resolved identity.
+
+    LF-R11a: rows older than ``MO_CONTEXT_V2_MAX_AGE_DAYS`` (default 30) and
+    rows whose ``snippet`` no longer occurs at the target repo's HEAD are
+    dropped at read time. ``scope_findings_with_stats`` reports the counts;
+    this signature and return type are unchanged for every other caller.
     """
-    con = _connect_ro(db)
-    if con is None:
-        return []
-    engine = engine_identity()
-    out: dict[int, dict] = {}
-    try:
-        for raw in paths:
-            prefix = _strip_glob(raw)
-            if not prefix:
-                continue
-            rows = _query_findings(con, prefix, limit, exclude_run, target_repo, engine)
-            if not rows and "." in os.path.basename(prefix):
-                parent = os.path.dirname(prefix)
-                if parent.count("/") >= 2:
-                    rows = _query_findings(con, parent + "/", limit, exclude_run,
-                                           target_repo, engine)
-            for r in rows:
-                out.setdefault(r["id"], r)
-    except sqlite3.Error:
-        return []
-    finally:
-        con.close()
-    return sorted(out.values(), key=lambda r: str(r.get("ts") or ""), reverse=True)[:limit]
+    return scope_findings_with_stats(paths, db=db, limit=limit,
+                                     exclude_run=exclude_run,
+                                     target_repo=target_repo)[0]
 
 
 def run_findings(run_id: str, *, db: str | None = None) -> list[dict]:
@@ -570,18 +651,81 @@ def cluster(findings: list[dict], *, sim: float = DEFAULT_SIM) -> list[dict]:
     return clusters
 
 
+def _token_set(text: str) -> set[str]:
+    """The cleaned issue text's token set, using the same tokenizer the TF-IDF
+    arm uses (stopwords and short tokens already dropped)."""
+    return set(themes._tokenize(clean_issue(text)))
+
+
+def _containment(a: set[str], b: set[str]) -> float:
+    """``|a ∩ b| / min(|a|, |b|)`` — symmetric token containment; ``0.0`` when
+    either side is empty.
+
+    The smaller side is the denominator so a restatement that is either a
+    superset or a subset of the cluster's problem scores 1.0: "the verifier
+    ignores exit code 124" and "ignores exit code 124" contain each other,
+    which is exactly the paraphrase case the cosine floor misses. An
+    unrelated short note that happens to share two tokens with a long sentence
+    still stays below the floor because the shorter side carries the shared
+    tokens only in part.
+    """
+    if not a or not b:
+        return 0.0
+    return len(a & b) / min(len(a), len(b))
+
+
+def _embedding_cosine(a: str, b: str) -> float | None:
+    """Cosine of ``a`` and ``b`` under ``MO_EMBED_PROVIDER``, or ``None``.
+
+    Off unless a provider is named — no embedder lookup happens on the default
+    path. Provider vectors are unit-normalized, so the cosine is their dot
+    product. Any lookup/embed failure degrades to ``None``: a broken provider
+    must never break measurement (``get_embedder`` raises for an unregistered
+    name, and a real provider can fail at call time).
+    """
+    if not os.environ.get("MO_EMBED_PROVIDER", "").strip():
+        return None
+    try:
+        # Lazy import: context_v2 must load on the prompt path even when
+        # mini_ork.memory is unavailable (same rule as ``build``).
+        from mini_ork.memory.semantic import get_embedder
+        va, vb = get_embedder().embed([a, b])
+        return float(sum(x * y for x, y in zip(va, vb)))
+    except Exception:  # noqa: BLE001 — measurement must never raise
+        return None
+
+
 def recurrence(clusters: list[dict], findings: list[dict], *,
                sim: float = DEFAULT_SIM) -> dict[str, bool]:
     """``{cluster_id: True}`` when any of ``findings`` (one run's own review
-    findings) restates the cluster's problem. IDF is computed over both sides."""
+    findings) restates the cluster's problem.
+
+    A cluster recurs when any finding restates it by TF-IDF cosine (``>= sim``,
+    unchanged), token-set containment (``>= CONTAINMENT_MIN``), or — when
+    ``MO_EMBED_PROVIDER`` names a healthy embedder — embedding cosine
+    (``>= EMBED_MIN``). IDF is computed over both sides; the extra arms never
+    remove a hit the cosine arm found.
+    """
     reps = [clean_issue(c.get("representative") or "") for c in clusters]
     texts = [clean_issue(f.get("issue") or "") for f in findings]
     idf, unseen = _idf_over(reps + texts)
     vecs = [v for v in (themes._vector(t, idf, unseen) for t in texts) if v]
+    rep_sets = [_token_set(rep) for rep in reps]
+    text_sets = [_token_set(text) for text in texts]
     out = {}
-    for c, rep in zip(clusters, reps):
+    for c, rep, rep_set in zip(clusters, reps, rep_sets):
         cv = themes._vector(rep, idf, unseen)
-        out[c["id"]] = bool(cv) and any(themes._dot(cv, v) >= sim for v in vecs)
+        hit = bool(cv) and any(themes._dot(cv, v) >= sim for v in vecs)
+        if not hit:
+            hit = any(_containment(rep_set, ts) >= CONTAINMENT_MIN
+                      for ts in text_sets)
+        if not hit:
+            for text in texts:
+                cos = _embedding_cosine(rep, text)
+                if cos is not None and cos >= EMBED_MIN:
+                    hit = True
+                    break
+        out[c["id"]] = hit
     return out
 
 
@@ -653,8 +797,8 @@ def build(kickoff_path: str, *, task_class: str = "", db: str | None = None,
     else:
         scope_source = "none"
     target_repo = resolve_target_repo(target_repo)
-    findings = scope_findings(scope, db=db, exclude_run=run_id,
-                              target_repo=target_repo)
+    findings, finding_stats = scope_findings_with_stats(
+        scope, db=db, exclude_run=run_id, target_repo=target_repo)
     floor = min_severity()
     clusters = [c for c in cluster(findings)
                 if _SEVERITY_RANK.get(str(c["worst_severity"]).lower(), 0) >= floor]
@@ -680,7 +824,16 @@ def build(kickoff_path: str, *, task_class: str = "", db: str | None = None,
         "file_findings": clusters,
         "prior_attempts": prior,
         "themes": themes,
-        "n_findings_scanned": len(findings),
+        # R13 reads this marker to tell a run whose pack was built with the
+        # once-only theme wiring from one that predates it (``v2_legacy``).
+        "themes_once": True,
+        # LF-R11a: the scan count stays the PRE-decay count, beside how many
+        # rows the age window and the HEAD check dropped and the window used.
+        "n_findings_scanned": finding_stats["n_findings_scanned"],
+        "n_findings_stale": finding_stats["n_findings_stale"],
+        # LF-R11b: beside the stale count, never merged into it.
+        "n_findings_landed": finding_stats.get("n_landed", 0),
+        "max_age_days": finding_stats["max_age_days"],
         # Selection provenance, beside the count it explains: which reader
         # supplied the paths and the resolved list. Never edit authority.
         "scope_source": scope_source,
@@ -894,6 +1047,14 @@ def write_injection_record(run_dir: str, node_id: str, *, text: str,
             "written_at": int(time.time()),
         }
         record.update(extra or {})
+        # LF-R13 §2: arm/held-out provenance for the planner injection. The
+        # planner's ledger_extra already carries ``context_v2.arm``; a run with
+        # no such extra (or a non-string arm) records None rather than guessing.
+        context_extra = (extra or {}).get("context_v2")
+        arm = context_extra.get("arm") if isinstance(context_extra, dict) else None
+        arm = arm if isinstance(arm, str) else None
+        record["arm"] = arm
+        record["held_out"] = (arm == "holdout") if arm is not None else None
         write_json(os.path.join(learned, f"{node_id}.json"), record)
         md_path = os.path.join(learned, f"{node_id}.md")
         if record["injected"]:

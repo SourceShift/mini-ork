@@ -132,6 +132,17 @@ def _conformal_threshold(scores: list[float], risk: float) -> float:
     return float(sorted_scores[q])
 
 
+def conformal_threshold(scores: list[float], risk: float) -> float:
+    """Public delegate to :func:`_conformal_threshold`.
+
+    Added for ``mini_ork.gates.conformal_gate``, which needs the same
+    split-conformal quantile index arithmetic but must not import a
+    private name or duplicate the math. Behaviour is identical to the
+    private helper; existing callers are untouched.
+    """
+    return _conformal_threshold(scores, risk)
+
+
 def _ltt_min_confidence(
     labelled: list[tuple[float, bool]],
     risk: float,
@@ -325,6 +336,19 @@ def _load_labelled_passes(
         c = max(0.0, min(1.0, c))
         labelled.append((c, is_wrong))
     return labelled
+
+
+def load_labelled_passes(
+    db_path: Optional[str], verifier_name: str
+) -> list[tuple[float, bool]]:
+    """Public delegate to :func:`_load_labelled_passes`.
+
+    Added for ``mini_ork.gates.conformal_gate`` so the second gate
+    reuses the existing labelled-history loader instead of
+    re-implementing the query. Behaviour is identical to the private
+    helper; existing callers are untouched.
+    """
+    return _load_labelled_passes(db_path, verifier_name)
 
 
 def _calibrated_error_from_margin(

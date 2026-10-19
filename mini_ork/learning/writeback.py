@@ -14,6 +14,7 @@ import os
 import sqlite3
 
 from mini_ork import cn_client
+from mini_ork.learning import reward_audit
 
 # Anti-Goodhart reward anchor (per arXiv 2601.18533 chain-veto semantics):
 # execution status is the PRIMARY (verified) anchor; the reviewer verdict can
@@ -285,8 +286,52 @@ def write_grpo_advantages(db) -> int:
         v = row["validity"]
         return not v or str(v).strip().lower() == "valid"
 
-    weight_rows = [(row, reward(row), recency_weight(row["created_at"]))
-                   for row in rows if _row_is_valid(row)]
+    # Evidence pairing (MO_REWARD_EVIDENCE_PAIRING, default on): a positive
+    # reward needs independent verifier evidence. `off`/`0` restores the
+    # pre-pairing behavior exactly; `shadow` counts and enqueues divergences
+    # but keeps the rows. Classification is memoized per distinct run_id — a
+    # large trace table must issue one query per run, not per row.
+    _pairing_mode = (os.environ.get("MO_REWARD_EVIDENCE_PAIRING", "1") or "1").strip().lower()
+    _pairing_enabled = _pairing_mode not in ("off", "0")
+    _pairing_shadow = _pairing_mode == "shadow"
+    _evidence_memo: dict[str, str] = {}
+    _divergences: list[dict] = []
+
+    def _evidence(run_id):
+        # Run ids are opaque TEXT keys (see the CN projection below): never
+        # int-cast them. A row without a run key cannot join to evidence.
+        if run_id is None:
+            return reward_audit.UNMEASURED
+        key = str(run_id)
+        if not key:
+            return reward_audit.UNMEASURED
+        if key not in _evidence_memo:
+            _evidence_memo[key] = reward_audit.classify_run(con, key)
+        return _evidence_memo[key]
+
+    weight_rows = []
+    for row in rows:
+        if not _row_is_valid(row):
+            continue
+        score = reward(row)
+        if _pairing_enabled:
+            evidence = _evidence(row["run_id"])
+            if evidence == reward_audit.CONTRADICTED and score >= reward_audit.DEFAULT_POSITIVE:
+                _divergences.append({
+                    "run_id": str(row["run_id"]) if row["run_id"] is not None else "",
+                    "trace_id": row["trace_id"],
+                    "status": row["status"],
+                    "reviewer_verdict": row["reviewer_verdict"],
+                    "reason": reward_audit.CONTRADICTED_REASON,
+                })
+            if not _pairing_shadow:
+                score, _ = reward_audit.pair(score, evidence)
+                if score is None:
+                    # Dropped BEFORE group aggregation — exactly like an
+                    # invalid row, so it perturbs neither the mean/variance nor
+                    # the cost tie-break.
+                    continue
+        weight_rows.append((row, score, recency_weight(row["created_at"])))
     groups = {}
     for row, score, w in weight_rows:
         groups.setdefault((node_type(row), row["task_class"]), []).append((row, score, w))
@@ -373,6 +418,16 @@ def write_grpo_advantages(db) -> int:
                  bucket["cost"] / runs, bucket["duration"] / runs, round(rel_adv, 6)))
             written += 1
     con.commit()
+
+    # Surface contradicted-run divergences to oversight. Guarded: a failure to
+    # enqueue must never change the learning outcome or the return value. The
+    # accepted count is local only — `written` stays the number of UPSERTs.
+    _divergences_enqueued = 0
+    if _divergences:
+        try:
+            _divergences_enqueued = reward_audit.enqueue_divergences(db, _divergences)
+        except Exception:
+            _divergences_enqueued = 0
 
     # Project Run / Trace / HAS_TRACE onto CN's graph. Only rows carrying a run
     # key can produce the edge — 260 of 2650 live rows have an empty run_id, and

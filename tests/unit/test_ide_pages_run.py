@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -337,33 +338,39 @@ def test_level_one_page_is_unchanged_plus_an_additive_graph(
     assert page["graph"]["state"] == "done"
 
 
-def test_level_two_starts_with_story_and_carries_the_graph_key(
+def test_level_two_starts_with_the_dag_and_carries_the_graph_key(
         home: Path, monkeypatch) -> None:
     _seed(home)
     monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
     page = build_page(home, "run", None, {"run": RUN})
-    assert [t["key"] for t in page["tabs"]][:2] == ["story", "graph"]
-    assert page["tab"] == "story"
-    assert page["title"] == "Make the demo pass"  # the kickoff title, not the run id
-    assert page["sections"][0]["type"] == "triage"  # one true outcome up front
-    assert page["actions"] == []  # header actions move into the triage
+    assert [t["key"] for t in page["tabs"]][:2] == ["dag", "outcome"]
+    assert page["tab"] == "dag"
+    # The header leads with the operator's goal; the run id is the copyable
+    # handle drawn beside the chips, and still travels in ``args``.
+    assert page["title"] == "Make the demo pass"
+    assert page["sub"] == "demo-recipe"
+    assert page["args"]["run"] == RUN
+    assert page["sections"][0]["type"] == "callout"  # one true outcome up front
+    assert page["sections"][1]["type"] == "dag"
+    assert [a["label"] for a in page["actions"]] == ["Open run folder", "Orchestrator"]
+    assert page["field_labels"] is False
 
     graph_tab = build_page(home, "run", "graph", {"run": RUN})
-    assert graph_tab["tab"] == "graph"
+    assert graph_tab["tab"] == "dag"
     assert graph_tab["graph"]["cols"] == _section(graph_tab, "dag")["cols"]
     assert page["graph"]["cols"] == graph_tab["graph"]["cols"]
 
-    # A stale ``dag`` link still lands on the graph tab.
-    assert build_page(home, "run", "dag", {"run": RUN})["tab"] == "graph"
-    # …and ``overview`` lands on the story.
-    assert build_page(home, "run", "overview", {"run": RUN})["tab"] == "story"
+    # Stale links land where their content now lives.
+    assert build_page(home, "run", "story", {"run": RUN})["tab"] == "outcome"
+    assert build_page(home, "run", "overview", {"run": RUN})["tab"] == "outcome"
+    assert build_page(home, "run", "questions", {"run": RUN})["tab"] == "dag"
 
 
 def test_level_two_title_prefers_the_goal_over_the_recipe_placeholder(
         home: Path, monkeypatch) -> None:
     """No kickoff file → ``run_card`` titles the run ``"<recipe> run"``; the
     v2 title skips that placeholder for the operator's goal, and the goal and
-    criteria ride the hero section."""
+    criteria ride the Outcome tab's hero section."""
     run_dir = _seed(home)
     monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
     import sqlite3 as _sqlite3
@@ -378,9 +385,115 @@ def test_level_two_title_prefers_the_goal_over_the_recipe_placeholder(
     }))
     page = build_page(home, "run", None, {"run": RUN})
     assert page["title"] == "Ship the thing"
-    hero = _section(page, "hero", "What this run is for")
+    assert page["sub"] == "demo-recipe"
+    assert page["args"]["run"] == RUN
+    outcome = build_page(home, "run", "outcome", {"run": RUN})
+    hero = _section(outcome, "hero", "What this run is for")
     assert hero["goal"] == "Ship the thing\nsecond line"
     assert hero["criteria"] == ["it works", "it is fast"]
+    # State, node count and cost are the header's chips; the hero repeats none
+    # of them and carries only the change it made.
+    assert hero["cells"] == []
+
+
+def test_level_two_dag_tab_describes_the_run_until_a_node_is_clicked(
+        home: Path, monkeypatch) -> None:
+    """The box under the graph is about the run, not the last node it ran.
+
+    ``_selected``'s fallback (first failed, else the last that finished) is
+    what the *canvas* points at; filling the detail with it described the
+    publisher on every finished run, so that node's $0.00 and its one-second
+    start/end read as the run's own cost and lifetime.
+    """
+    _seed(home)
+    monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
+    page = build_page(home, "run", "dag", {"run": RUN})
+    kv = _section(page, "kv", "Run")
+    # Cost, node count and checks are the header chips / the outcome callout;
+    # this box answers only "what state, and since when".
+    assert [i["k"] for i in kv["items"]] == ["Status", "Started", "Ended"]
+    assert kv["sub"] == "run · overall · finished"
+    # Nothing chose a node, so no node's transcript rides along.
+    assert all(not (s["type"] == "code" and s["title"].startswith("Transcript"))
+               for s in page["sections"])
+
+    # A click is the one thing that turns the box into a node — and the box
+    # offers the way back to the run's own state.
+    clicked = build_page(home, "run", "dag", {"run": RUN, "node": "publisher"})
+    node_kv = _section(clicked, "kv", "publisher")
+    assert node_kv["sub"].startswith("node · ")
+    assert node_kv["actions"][-1]["label"] == "Run overview"
+    assert node_kv["actions"][-1]["do"] == {"set": {"node": ""}}
+
+
+def test_level_two_dag_tab_embeds_the_node_detail_under_the_graph(
+        home: Path, monkeypatch) -> None:
+    _seed(home)
+    monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
+    page = build_page(home, "run", "dag", {"run": RUN, "node": "implementer"})
+    dag = _section(page, "dag", "DAG")
+    assert dag["select"] is True  # a click picks the node in place
+    assert dag["sub"] == "demo-recipe · 6 nodes"
+    titles = [s["title"] for s in page["sections"]]
+    assert titles.index("DAG") < titles.index("implementer")
+
+    kv = _section(page, "kv", "implementer")
+    assert kv["cols"] == 3 and kv["big"] is True
+    assert [i["k"] for i in kv["items"]][:3] == ["Status", "Lane", "Provider"]
+    assert "Started" in [i["k"] for i in kv["items"]]
+    assert "Tokens" in [i["k"] for i in kv["items"]]
+    assert kv["sub"] == "node · stage 2 of 6 · minimax"
+    # The deep node tab stays one button away.
+    assert kv["actions"][0]["label"] == "Open node"
+    assert kv["actions"][0]["do"]["args"]["node"] == "implementer"
+
+
+def test_level_two_dag_tab_carries_the_open_questions(
+        home: Path, monkeypatch) -> None:
+    run_dir = _seed(home)
+    monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
+    (run_dir / "asks").mkdir()
+    (run_dir / "asks" / "ask-1.json").write_text(json.dumps(
+        {"ask_id": "ask-1", "question": "Which database?"}))
+    page = build_page(home, "run", "dag", {"run": RUN})
+    composers = [s for s in page["sections"] if s["type"] == "composer"]
+    assert len(composers) == 1
+    assert composers[0]["title"] == "Answer ask-1"
+    assert page["chips"][0]["t"] == "✋ 1 question"
+    dag_tab = page["tabs"][0]
+    assert dag_tab["label"] == "DAG"
+    assert dag_tab["count"] == 1 and dag_tab["tone"] == "yellow"
+
+
+def test_level_two_kickoff_is_read_as_source(home: Path, monkeypatch) -> None:
+    _seed(home)
+    monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
+    page = build_page(home, "run", "kickoff", {"run": RUN})
+    code = _section(page, "code", "demo.md")
+    assert code["lines"][0]["t"] == "# Make the demo pass"
+    assert all(s["type"] != "markdown" for s in page["sections"])
+
+
+def test_level_two_artifacts_lead_with_the_changed_files(
+        home: Path, monkeypatch) -> None:
+    _seed(home)
+    monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
+    monkeypatch.setattr(run_page, "_card_files", lambda run: [
+        {"path": "calc.py", "abs": "/tmp/calc.py", "added": 12, "removed": 3}])
+    page = build_page(home, "run", "artifacts", {"run": RUN})
+    table = _section(page, "table", "Changes")
+    assert [c["t"] for c in table["rows"][0]["cells"]] == ["calc.py", "+12", "−3"]
+    assert table["rows"][0]["do"] == {"path": "/tmp/calc.py"}
+
+
+def test_level_two_agents_roster_counts_tokens(home: Path, monkeypatch) -> None:
+    _seed(home)
+    monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
+    page = build_page(home, "run", "agents", {"run": RUN})
+    roster = _section(page, "table", "Agent roster")
+    assert roster["head"] == ["node", "family", "status", "verdict", "cost", "tokens",
+                              "time", "gates"]
+    assert len(roster["rows"][0]["cells"]) == 8
 
 
 def test_kickoff_tab_renders_the_full_kickoff(home: Path) -> None:
@@ -495,3 +608,157 @@ def test_the_node_tab_reads_a_reaped_node_as_failed_with_a_reason(home: Path) ->
     assert facts["Status"]["v"] == "failed"
     assert facts["Status"]["c"] == "red"
     assert facts["Reason"]["v"] and facts["Reason"]["c"] == "red"
+
+# ── verification: the vector is data, the renderer decides how it reads ──────
+
+def test_verification_tab_ships_the_level_vector_as_data(
+        home: Path, monkeypatch) -> None:
+    """The engine states the verdict; the IDE decides how an abstention reads.
+
+    A level the run's task class never required cannot fail it, so the section
+    carries ``required`` per row and no colour, glyph or ranking — the renderer
+    is what dims an abstention that was never a failure.
+    """
+    run_dir = _seed(home)
+    (run_dir / "run-verdict.json").write_text(json.dumps({
+        "levels": {"applies": "PROVEN", "executes": "UNVERIFIED",
+                   "target": "UNVERIFIED", "preserve": "UNVERIFIED",
+                   "contract": "PROVEN"},
+        "levels_required": [],
+        "levels_reasons": {"executes": "the verifier wrote no post_rc"},
+        "levels_decision": "publish"}))
+    monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
+
+    # ``verification`` is a retired key: it resolves to the Checks tab, which
+    # is the one place the level vector is drawn.
+    page = build_page(home, "run", "verification", {"run": RUN})
+    assert page["tab"] == "checks"
+    assert [t["key"] for t in page["tabs"]][:3] == ["dag", "outcome", "checks"]
+    verification = next(t for t in page["tabs"] if t["key"] == "checks")
+    assert verification["label"] == "Checks"
+    assert verification["count"] == 2 and verification["tone"] == "green"
+
+    levels = _section(page, "levels", "Levels")
+    assert levels["decision"] == "publish"
+    assert [row["name"] for row in levels["rows"]] == [
+        "applies", "executes", "target", "preserve", "contract"]
+    assert all(row["required"] is False for row in levels["rows"])
+    assert levels["rows"][1] == {
+        "name": "executes", "value": "UNVERIFIED", "required": False,
+        "reason": "the verifier wrote no post_rc"}
+    # No presentation keys ride the rows — colours and glyphs are the IDE's.
+    assert set(levels["rows"][0]) == {"name", "value", "required", "reason"}
+
+    # The verifier envelope rides behind the vector; this one carries no
+    # ``checks`` list, so it is its roll-up under the verifier's name.
+    rollup = _section(page, "list", "test")
+    assert rollup["items"][0]["t"] == "test · pass"
+
+    # The outcome callout offers the way here from the DAG tab.
+    dag = build_page(home, "run", "dag", {"run": RUN})
+    labels = [a["label"] for a in _section(dag, "callout")["actions"]]
+    assert "Checks" in labels
+
+
+# ── evidence the page derives from run-local files ─────────────────────────
+
+def _bare_run(tmp_path: Path) -> "run_page.Run":
+    """A run with nothing but its folder: the helpers below read only files."""
+    home = tmp_path / "proj" / ".mini-ork"
+    run_dir = home / "runs" / "run-evidence"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_page.Run(
+        id="run-evidence", home=home, run_dir=run_dir,
+        row={}, card={}, nodes=[], cols=[], calls=[],
+        recipe_dir=None, workspace=None,
+    )
+
+
+def test_patch_changed_files_names_each_file_with_its_counts(tmp_path: Path) -> None:
+    """A delivered run's worktree is gone, so the patch is the only source that
+    can still name the files it changed — the card carried only totals."""
+    run = _bare_run(tmp_path)
+    (run.run_dir / "review-diff.patch").write_text(
+        "diff --git a/mini_ork/a.py b/mini_ork/a.py\n"
+        "--- a/mini_ork/a.py\n+++ b/mini_ork/a.py\n@@ -1 +1,2 @@\n-old\n+new\n+more\n"
+        "diff --git a/docs/b.md b/docs/b.md\n"
+        "--- /dev/null\n+++ b/docs/b.md\n@@ -0,0 +1 @@\n+hello\n",
+        encoding="utf-8")
+    files = run_page._patch_changed_files(run)
+    assert [(f["path"], f["added"], f["removed"]) for f in files] == [
+        ("mini_ork/a.py", 2, 1), ("docs/b.md", 1, 0)]
+    assert run_page._diff_totals(run) == (3, 1)
+
+
+def test_diff_totals_fall_back_to_the_recorded_diffstat(tmp_path: Path) -> None:
+    run = _bare_run(tmp_path)
+    (run.run_dir / "diffstat.json").write_text(
+        '{"added": 7, "removed": 2, "v": 1}', encoding="utf-8")
+    assert run_page._diff_totals(run) == (7, 2)
+
+
+def test_attempts_section_classifies_each_dispatch_on_its_own(tmp_path: Path) -> None:
+    """``retry-exhausted/<node>.attempts.json`` is named for the node's history,
+    not its final state: a later entry with ``done`` is a success even though
+    the file exists at all."""
+    run = _bare_run(tmp_path)
+    ledger = run.run_dir / "retry-exhausted"
+    ledger.mkdir()
+    (ledger / "impl-x.attempts.json").write_text(json.dumps([
+        {"attempt": 1, "finish_reason": "contract_missing", "rc": 1, "ts": T0},
+        {"attempt": 2, "finish_reason": "done", "rc": 0, "ts": T0 + 60},
+    ]), encoding="utf-8")
+    [section] = run_page._attempts_section(run)
+    assert section["title"] == "Attempts · 2"
+    assert [item["m"] for item in section["items"]] == ["✗", "✓"]
+    assert [item["t"] for item in section["items"]] == [
+        "impl-x · attempt 1", "impl-x · attempt 2"]
+    assert "contract_missing" in section["items"][0]["sub"]
+    assert "done" in section["items"][1]["sub"]
+
+
+def test_answered_asks_keeps_only_the_answered_in_ask_order(tmp_path: Path) -> None:
+    run = _bare_run(tmp_path)
+    asks = run.run_dir / "asks"
+    asks.mkdir()
+    (asks / "ask-1.json").write_text(
+        json.dumps({"question": "Which lane?", "answer": "worker"}), encoding="utf-8")
+    (asks / "ask-2.json").write_text(
+        json.dumps({"question": "Still open?"}), encoding="utf-8")
+    (asks / "ask-10.json").write_text(
+        json.dumps({"question": "Later?", "answer": "yes"}), encoding="utf-8")
+    answered = run_page.answered_asks(run.run_dir)
+    assert [(a["ask_id"], a["question"]) for a in answered] == [
+        ("ask-1", "Which lane?"), ("ask-10", "Later?")]
+
+
+def test_clock_names_the_day_outside_today() -> None:
+    today = time.localtime()
+    day = 2 if today.tm_yday != 2 else 3
+    same_year = int(time.mktime((today.tm_year, 1, day, 12, 0, 0, 0, 0, -1)))
+    assert run_page._clock(same_year) == time.strftime(
+        "%b %d %H:%M", time.localtime(same_year))
+    earlier = int(time.mktime((today.tm_year - 1, 6, 1, 12, 0, 0, 0, 0, -1)))
+    assert run_page._clock(earlier).startswith(f"{today.tm_year - 1}-06-01")
+
+
+def test_run_inputs_name_the_v2_pack_only_when_it_exists(tmp_path: Path) -> None:
+    run = _bare_run(tmp_path)
+    (run.run_dir / "context-pack.json").write_text("{}", encoding="utf-8")
+    v1 = _section({"sections": run_page._overview_tab(run)}, "list", "Run inputs")
+    assert [item["t"] for item in v1["items"]] == ["context-pack.json"]
+
+    (run.run_dir / "context-pack.v2.json").write_text("{}", encoding="utf-8")
+    both = _section({"sections": run_page._overview_tab(run)}, "list", "Run inputs")
+    assert [item["t"] for item in both["items"]] == ["context-pack.v2.json"]
+
+
+def test_artifacts_badge_skips_asks_and_live_transcripts(tmp_path: Path) -> None:
+    run = _bare_run(tmp_path)
+    (run.run_dir / "run.json").write_text("{}", encoding="utf-8")
+    (run.run_dir / "agent-x.live.jsonl").write_text("", encoding="utf-8")
+    asks = run.run_dir / "asks"
+    asks.mkdir()
+    (asks / "ask-1.json").write_text("{}", encoding="utf-8")
+    tabs = {tab["key"]: tab for tab in run_page._v2_tabs(run)}
+    assert tabs["artifacts"]["count"] == 1

@@ -1,0 +1,183 @@
+{
+  "schema_version": "1",
+  "panel_id": "run-1792352699-84084",
+  "lane": "capability",
+  "model": "MiniMax-M3",
+  "candidates": [
+    {
+      "candidate_id": "K1",
+      "name": "Spawn a research team in one command",
+      "evidence": [
+        "docs/concepts/multi-agent.md:117-183 — `openclaw agents team create` ships coordinator/researcher/writer/reviewer with AGENTS.md contracts and allowAgents wiring",
+        "docs/concepts/parallel-specialist-lanes.md:34-100 — lane contracts, chat budget, handoff, tool posture; phased rollout",
+        "README.md:18 — 'One Gateway runs it as a personal assistant on a laptop or as a shared team deployment; configuration is the only difference.'"
+      ],
+      "star_impact": "high",
+      "effort": "M",
+      "fit": "high",
+      "why": "The single most cargo-cult-worthy line in OpenClaw is 'I made a team in one command and they wrote me a launch plan while I watched.' mini-ork's recipe DAGs are technically equivalent but not visible.",
+      "first_step": "Add recipes/team-presets/ with research-team/launch-team/audit-team that wire existing node kinds (researcher -> implementer -> reviewer -> implementer with handoff contracts). Surface the team in mini_ork/ide_pages/kanban.py as a single 'team' card that fans out into per-specialist cards in the runs pane."
+    },
+    {
+      "candidate_id": "K2",
+      "name": "It remembers and consolidates while you sleep",
+      "evidence": [
+        "docs/concepts/memory.md:21-62 — USER.md/MEMORY.md/memory/YYYY-MM-DD.md/DREAMS.md layers with provenance classification",
+        "docs/concepts/dreaming.md:11-80 — light -> REM -> deep phases, deep writes MEMORY.md, DREAMS.md is the diary",
+        "docs/concepts/memory-builtin.md — SQLite FTS5 + sqlite-vec hybrid, separate read-only worker",
+        "mini_ork/memory/ — verified-outcome memory exists today; no continuous consolidation"
+      ],
+      "star_impact": "high",
+      "effort": "M",
+      "fit": "high",
+      "why": "'Tell it once, it remembers, and it tells you why it remembered' is the canonical personal-assistant promise. mini-ork has verified memory but no cross-session persona bootstrap.",
+      "first_step": "Add mini_ork/memory/diary/ — a background recipe-loop that reads project run history, writes <project>/.mini-ork/diary/YYYY-MM-DD.md, and lets the operator approve promotion into <project>/.mini-ork/MEMORY.md. Land behind MO_DIARY=1."
+    },
+    {
+      "candidate_id": "K3",
+      "name": "It's everywhere you already are",
+      "evidence": [
+        "README.md:18 — 'Discord, iMessage, Slack, Teams, Telegram, WhatsApp, and 20+ more'",
+        "docs/channels/ — 50+ channel guides enumerated (discord, telegram, slack, whatsapp, signal, matrix, msteams, imessage, line, mattermost, googlechat, nextcloud-talk, nostr, irc, sms, twitch, qqbot, synology-chat, feishu, wecom, x, yuanbao, zalo, ...)",
+        "docs/concepts/multi-agent.md:354-358 — multi-account per channel",
+        "mini_ork/integrations/ — discord.py + slack.py + telegram.py already exist"
+      ],
+      "star_impact": "high",
+      "effort": "M",
+      "fit": "medium",
+      "why": "Omnipresence is the 'I told Slack, Discord replied with the trace' demo. mini-ork ships three channels; the visibility of that surface is low. Cheapest path: PM-mirror chat-like adapters before chat-surface rebuild.",
+      "first_step": "Add GitHub Issues + Linear + Jira chat-like adapters under mini_ork/integrations/ so a recipe's awaiting input prompt can be answered from the operator's ticket tracker. Document in docs/architecture/integrations.md next to the existing three."
+    },
+    {
+      "candidate_id": "K4",
+      "name": "Swap the brain mid-flight",
+      "evidence": [
+        "docs/concepts/agent-runtimes.md:11-44 — provider vs model vs runtime vs channel; runtime is a separate knob from model",
+        "docs/concepts/model-failover.md:11-50 — auth-profile rotation within provider, then model fallback, then bounded same-model recovery preserving partial transcript",
+        "docs/concepts/models.md:11-44 — selection order: primary -> fallbacks -> auth failover",
+        "mini_ork/dispatch/llm_dispatch.py (49.9K) + routing.py (16.9K) + cost_pause.py + throttle_guard.py — heterogeneous lanes already exist"
+      ],
+      "star_impact": "high",
+      "effort": "S",
+      "fit": "high",
+      "why": "'It just kept going when the API rate-limited, and I can switch lanes without changing the recipe' is the model-swapping demo. The capability exists; the swap is operator-invisible.",
+      "first_step": "Add a 'live lane pivot' verb to mini_ork/ide_pages/run.py that swaps dispatch_model lanes mid-flight using partial-transcript preservation. Surface the current lane + two fallbacks in the run header."
+    },
+    {
+      "candidate_id": "K5",
+      "name": "You can interrupt it",
+      "evidence": [
+        "docs/concepts/queue-steering.md:11-50 — 'Steering does not interrupt a tool call that is already running. An assistant message's tool calls are a committed plan until one of them starts executing'; runtime boundary emits paired 'Skipped' results",
+        "docs/architecture/artifact-graph.md:23-27 — edges are completion gates in mini-ork"
+      ],
+      "star_impact": "medium",
+      "effort": "M",
+      "fit": "high",
+      "why": "'I yelled at it mid-thought and it changed course' is the canonical interactive-agent moment. mini-ork has no operator-facing queue and no between-node steer verb.",
+      "first_step": "Add a 'Steer' thread action to mini_ork/ide_pages/thread.py that appends a directive to the run; modify mini_ork/orchestration/runner_orchestrator.py to inject the directive into the next node's kickoff rather than the current one. Steering is between nodes, not within them."
+    },
+    {
+      "candidate_id": "K6",
+      "name": "Trust is built in: pairing + sandboxing as a capability",
+      "evidence": [
+        "docs/channels/pairing.md — 8-char pairing codes, 1-hour expiry, owner bootstrapping, 'Approve from the Control UI' queue",
+        "docs/automation/hooks.md:33-40 — 'Internal hooks are trusted code, not sandboxed scripts' (explicit warning as feature)",
+        "VISION.md:67-72 — 'Security in OpenClaw is a deliberate tradeoff: strong defaults without killing capability'",
+        "mini_ork/gates/ — 30 files including intervention_gate.py, merge_approval.py, promotion_gate.py, scope_overlap.py"
+      ],
+      "star_impact": "high",
+      "effort": "S",
+      "fit": "high",
+      "why": "'It asks before it does the destructive thing, and the code has an expiry, and there is a queue in the UI' is the safety-as-a-product moment. Capability exists but is invisible; only surfacing is missing.",
+      "first_step": "Add a 'Pending approvals' inbox card to mini_ork/ide_pages/inbox.py that lists every gate decision (mini_ork/gates/intervention_gate.py, merge_approval.py) currently awaiting operator input, with one-click approve/decline and a numeric prompt for CLI. Land behind MO_GATE_APPROVAL_UX=1."
+    },
+    {
+      "candidate_id": "K7",
+      "name": "Skills you can actually see and pick",
+      "evidence": [
+        "git ls-tree HEAD skills/ — 50 skills enumerated (1password, apple-notes, blogwatcher, camsnap, coding-agent, diagram-maker, gemini, gh-issues, github, meme-maker, notion, obsidian, peekaboo, spotify-player, summarize, weather, xurl, ...)",
+        "VISION.md:120-128 — 'New skills should be published through ClawHub first, not added to core by default'",
+        "README.md:89, 114 — ClawHub marketplace named",
+        "recipes/ — 50+ mini-ork recipes already exist with task_class.yaml + workflow.yaml + artifact_contract.yaml manifests"
+      ],
+      "star_impact": "medium",
+      "effort": "S",
+      "fit": "high",
+      "why": "'It already has 50 things it can do, and there is a marketplace' is the breadth demo. mini-ork's recipes are conceptually equivalent; repackaging + surfacing is essentially zero engineering.",
+      "first_step": "Add mini_ork/skills/manifest.py that walks recipes/<name>/ and emits a <name>.skill.yaml summarising inputs/outputs/required node types. Surface the union in a new IDE page mini_ork/ide_pages/skills.py that mirrors OpenClaw's skills pane."
+    },
+    {
+      "candidate_id": "K8",
+      "name": "Drive my computer (computer-use node)",
+      "evidence": [
+        "git show HEAD:extensions/cua-computer/package.json — CUA driver across darwin-universal, linux-{arm64,x64}, win32-{arm64,x64}; @trycua/cua-driver + rastermill",
+        "docs/concepts/computer-use.md (47.4K) — full computer-use docs, screenshot/click/type/file-transfer primitives",
+        "docs/nodes/ — node-host, session-hosting, talk, camera, presence, voicewake, media-playback",
+        "mini_ork/ — no platform-bridging module exists"
+      ],
+      "star_impact": "high",
+      "effort": "L",
+      "fit": "low",
+      "why": "'It can use my computer' is the canonical 2025/2026 reaction, but off-mission for mini-ork's task-OS audience. Mark deferred; only adopt if K1-K7 land and the next cycle is starved.",
+      "first_step": "Park. Add a one-paragraph docs/architecture/future-computer-use.md that scopes the surface (would need mini_ork/computer/, per-platform node-host binaries, screencast relay) and notes it as deferred behind K1-K7."
+    }
+  ],
+  "shortlist": ["K1", "K4", "K6", "K2", "K3", "K5", "K7", "K8"],
+  "gap_analysis": [
+    {
+      "candidate_id": "K1",
+      "miniork_today": "mini_ork/orchestration/ (conductor, runner, item-fanout, topology) plus recipes/ with 50+ DAGs including researcher-implementer-reviewer chains (recipes/recursive-self-improve/, recipes/audit-judge-panel-3l/). docs/architecture/artifact-graph.md:23-27 defines the edge-as-completion-gate contract. The AGENTS.md-equivalent lives in each recipe's kickoff.",
+      "gap": "No 'team preset' abstraction above the recipe. No IDE panel showing 'coordinator + 3 specialists' as a single entity. No one-command team spawn. Capability is atomic but not visible."
+    },
+    {
+      "candidate_id": "K2",
+      "miniork_today": "mini_ork/memory/ (preferences.py, retirement.py, semantic.py, store.py) plus docs/PYTHON-SDK.md:25-29 exposes verified-outcome memory as a primitive — a stronger primitive than OpenClaw's plaintext MEMORY.md. docs/architecture/verification-stack.md anchors the verdict on what the code did.",
+      "gap": "No continuous sweep; no diary; no bootstrap from MEMORY.md on a fresh session. Capability (verified memory) exists and is invisible; the consolidation loop is absent."
+    },
+    {
+      "candidate_id": "K3",
+      "miniork_today": "mini_ork/integrations/ has discord.py (47K), slack.py (33K), telegram.py (20K), plus _base.py and _ws.py. mini_ork/pm/ exposes the PM mirror that reads Linear/Jira/GitHub but read-only.",
+      "gap": "No chat-like inbound from PM sources. Operator cannot answer an awaiting-input prompt from a Linear ticket. Omnipresence surface is three chat channels plus a read-only PM mirror."
+    },
+    {
+      "candidate_id": "K4",
+      "miniork_today": "mini_ork/dispatch/llm_dispatch.py (49.9K) + routing.py (16.9K) + cost_pause.py + throttle_guard.py. mini_ork/lane_router.py does GRPO advantage + UCB routing. mini_ork/lane_helpers.py carries the specialist-lane helpers.",
+      "gap": "No IDE verb to swap lanes mid-run. No transcript-preservation rule for partial outputs on rate-limit (OpenClaw's model-failover.md:21-26 explicitly preserves partial output). Dispatch is real; the surface is one CLI flag deep."
+    },
+    {
+      "candidate_id": "K5",
+      "miniork_today": "mini_ork/orchestration/ owns the node sequence; mini_ork/ide_pages/thread.py is the thread action surface; docs/architecture/artifact-graph.md:23-27 makes the edge a completion gate.",
+      "gap": "No between-node directive injection. IDE has no 'Steer' thread action; runner has no between-node rewrite hook for the next kickoff. Steering as a concept does not exist in the operator UX."
+    },
+    {
+      "candidate_id": "K6",
+      "miniork_today": "30 files in mini_ork/gates/ including intervention_gate.py, merge_approval.py, promotion_gate.py, scope_overlap.py, gate_bootstrap.py. Gates block destructive ops and emit typed results.",
+      "gap": "No inbox card for pending gate decisions. Operator has to read a log. mini_ork/ide_pages/inbox.py lists run rows but not gate decisions. The 'wait, it asked before it did the destructive thing' UX is absent."
+    },
+    {
+      "candidate_id": "K7",
+      "miniork_today": "recipes/ has 50+ DAGs with task_class.yaml + workflow.yaml + artifact_contract.yaml manifests. mini_ork/extensions.py exposes the extension registry and recipe builder. mini_ork/registry-audit/recipe-list (via recipes/registry-audit/) is the only 'list recipes' surface today.",
+      "gap": "No skills pane; no per-skill manifest format; no 'browse 50 capabilities and pick one' surface. Recipes are loaded by classification, not by browsing."
+    },
+    {
+      "candidate_id": "K8",
+      "miniork_today": "Nothing — mini_ork/ has no platform-bridging module; recipes/ has no computer-use recipe; docs/architecture/ has no node-host design.",
+      "gap": "Everything missing — per-platform binaries, screenshot pipeline, screencast relay, click/type primitives, sandbox, audit trail. Capability is fully absent."
+    }
+  ],
+  "open_questions": [
+    "Is mini-ork's audience the engineer-who-runs-recipes or the operator-who-watches-agents? OpenClaw's headline is the second; mini-ork's posture is the first. K1/K4/K5/K6 require the second; if 'first,' K2 (project-scoped memory) and K7 (skills pane) carry more weight than K1.",
+    "Will the IDE surface be a primary differentiator or a secondary artifact? K1/K4/K5/K6 all assume primary (mini-ork already has 35 IDE page files, suggesting yes). If yes, K4 is the cheapest demo per line of code; if no, K7 is the cheapest entry.",
+    "Does mini-ork want a marketplace? OpenClaw's ClawHub is the marketplace for skills/plugins. K7 is much higher-impact if mini-ork commits to a 'skills marketplace' surface; much lower if recipes stay classification-driven. Decision must precede K7's first step.",
+    "What is the trust posture for destructive ops? K6's approval UX assumes gates already block destructive work. mini_ork's intervention_gate.py is the candidate; the open question is whether the gate list is the right surface, or whether mini-ork needs a separate 'dangerous verb' classifier.",
+    "How is 'long-lived persona' framed without crossing into personal-assistant territory? K2's risk depends on this. If 'project-only, operator-curated,' K2 ships; if 'persona-wide, model-decided,' K2 fails the synthesis guardrail and should be re-scoped or dropped."
+  ],
+  "read_only_attestation": {
+    "reference_modified": false,
+    "target_modified": false,
+    "files_written": [
+      "lens-capability.md",
+      "context-capability_lens.json"
+    ]
+  }
+}

@@ -1,0 +1,50 @@
+# Operator overlay — applied ON TOP of .mini-ork/config/agents.yaml via
+# agents_config.merge. THIS FILE WINS for every key it sets, which is why the
+# merged run config printed `implementer: deepseek` even after agents.yaml said
+# minimax. Keep the two in step.
+#
+# Operator directive 2026-10-09 (supersedes the 2026-09 three-lane campaign
+# that made deepseek the default for every producer):
+#   * gate keepers / verifiers / reviewers = intelligent, one distinct family
+#     each (MiniMax-M3, GLM-5.3, DeepSeek-V4-Flash);
+#   * deepseek PRO demoted off the code path (cost);
+#   * free OpenRouter lanes are tool-less — advisory only, never here.
+lanes:
+  # role lanes
+  brain: glm
+  planner: glm            # deep reasoning — GLM-5.3
+  reviewer: glm           # gate: family 1
+  verifier: deepseek_flash  # gate: family 2
+  judge: glm              # advisory eval node
+  eval: deepseek_flash
+  implementer: minimax    # MiniMax-M3 — code producer
+  worker: minimax
+  researcher: minimax
+  reflector: glm          # feeds the learning loop; a junk lesson is worse
+                          # than no lesson, so keep it off the cheap tail
+  decomposer: minimax
+  publisher: minimax
+  rollback: minimax
+  healer: minimax
+  spec_reviewer: minimax
+
+  # lens lanes (framework-edit / audit panels) — distinct families by design.
+  # deepseek PRO kept out; the flash tier carries the third family instead.
+  # RUN-SCOPED OVERRIDE (star-growth-panel, 2026-10-18): the 2026-10-09
+  # directive collapsed opus_lens onto glm and codex_lens onto deepseek_flash,
+  # so a four-lens panel has three families and two duplicates. This run needs
+  # four distinct tool-capable families. The ambient anthropic logins are both
+  # exhausted for the week (claude OAuth weekly limit; codex default model
+  # unsupported), so growth_lens runs on codex with MO_OAI_MODEL=gpt-5.6-luna,
+  # which smokes — family openai. Applied via MINI_ORK_AGENTS=<this file>; the
+  # shared .mini-ork overlay is untouched.
+  codex_lens: codex
+  kimi_lens: minimax
+  opus_lens: glm
+  minimax_lens: minimax
+  glm_lens: glm
+  deepseek_lens: deepseek_flash
+  # Third audit-panel lane (operator, 2026-10-11): free OpenRouter poolside
+  # laguna — tool-less (openai-chat), so briefing-only advisory judge duty in
+  # recipes/audit-judge-panel-3l, never a code-writing role.
+  laguna_lens: laguna_free

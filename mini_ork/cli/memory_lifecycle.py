@@ -24,6 +24,11 @@ from mini_ork.memory import (
     retire,
     retirement_state,
 )
+# New report-only readers. Imported directly: ``memory/__init__`` is outside
+# this change's file scope, and these never write.
+from mini_ork.memory.retirement import rule_candidates, theme_candidates
+
+_CANDIDATE_KINDS = ("semantic", "theme", "rule", "all")
 
 
 def _usage() -> str:
@@ -36,6 +41,8 @@ def _usage() -> str:
         "\n"
         "Actions:\n"
         "  --candidates         List obsolescence candidates in --scope\n"
+        "  --kind <kind>        With --candidates: semantic|theme|rule|all\n"
+        "                       (default: semantic; theme/rule need no --scope)\n"
         "  --retire ID          Retire memory ID (requires --reason)\n"
         "  --reactivate ID      Reactivate memory ID\n"
         "  --state ID           Print the retirement state of memory ID\n"
@@ -62,6 +69,7 @@ def _parse(argv):
         "enter": RETIRE_ENTER_UTILITY,
         "exit": RETIRE_EXIT_UTILITY,
         "min_uses": RETIRE_MIN_USES,
+        "kind": "semantic",
         "json": False,
         "help": False,
         "error": None,
@@ -113,6 +121,12 @@ def _parse(argv):
                 opts["error"] = "missing value for --scope"
                 break
             opts["scope"] = argv[i + 1]
+            i += 2
+        elif a == "--kind":
+            if i + 1 >= len(argv):
+                opts["error"] = "missing value for --kind"
+                break
+            opts["kind"] = argv[i + 1]
             i += 2
         elif a == "--reason":
             if i + 1 >= len(argv):
@@ -176,6 +190,48 @@ def main(argv=None, *, stdout=None, stderr=None) -> int:
     action = opts["action"]
 
     if action == "candidates":
+        kind = opts["kind"]
+        if kind not in _CANDIDATE_KINDS:
+            err.write(f"invalid --kind: {kind}\n")
+            out.write(_usage())
+            return 0
+        if kind != "semantic":
+            # Theme and learned-rule candidates are report-only and need no
+            # scope. ``all`` also folds in the semantic table when --scope is
+            # given (without it, the semantic reader has nothing to scan).
+            rows: list[dict] = []
+            if kind in ("theme", "all"):
+                try:
+                    rows.extend(theme_candidates())
+                except Exception:  # noqa: BLE001 — reporting CLI never raises
+                    pass
+            if kind in ("rule", "all"):
+                try:
+                    rows.extend(rule_candidates())
+                except Exception:  # noqa: BLE001
+                    pass
+            if kind == "all" and opts["scope"]:
+                try:
+                    rows.extend(candidates(
+                        opts["scope"], enter=opts["enter"],
+                        exit=opts["exit"], min_uses=opts["min_uses"]))
+                except ValueError:
+                    pass
+            if opts["json"]:
+                out.write(json.dumps(rows) + "\n")
+            else:
+                out.write(
+                    f"{'id':>16} {'state':>9} {'recommendation':>15}  evidence\n"
+                )
+                for r in rows:
+                    rid = (r.get("theme_id") or r.get("preference_key")
+                           or r.get("memory_id") or "")
+                    out.write(
+                        f"{str(rid):>16} {str(r.get('state', '')):>9} "
+                        f"{str(r.get('recommendation', '')):>15}  "
+                        f"{r.get('evidence', '')}\n"
+                    )
+            return 0
         if not opts["scope"]:
             err.write("--candidates requires --scope\n")
             out.write(_usage())

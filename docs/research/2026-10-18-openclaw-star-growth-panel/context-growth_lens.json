@@ -1,0 +1,123 @@
+{
+  "schema_version": "1",
+  "panel_id": "run-1792352699-84084",
+  "lane": "growth",
+  "model": "gpt-5.6-luna",
+  "candidates": [
+    {
+      "candidate_id": "G1",
+      "name": "Own the verified agent work category",
+      "evidence": ["README.md:1-22", "docs/index.md:25-30", "VISION.md:3-5"],
+      "star_impact": "high",
+      "effort": "S",
+      "fit": "high",
+      "why": "A consistent one-sentence category promise makes mini-ork understandable and retellable during a short GitHub scan.",
+      "first_step": "Rewrite README.md:2-28 around one defensible category sentence and a four-noun glossary for recipes, lanes, gates, and certificates."
+    },
+    {
+      "candidate_id": "G2",
+      "name": "Proof-first README landing page",
+      "evidence": ["README.md:3-16", "README.md:82-88", "docs/index.md:33-46", "docs/index.md:48-90"],
+      "star_impact": "high",
+      "effort": "S",
+      "fit": "high",
+      "why": "A visual hero, trust badges, and a direct action rail make existing mini-ork proof discoverable before a visitor reads implementation detail.",
+      "first_step": "Add a See it / Try it / Understand it / Extend it link rail to README.md:2-19."
+    },
+    {
+      "candidate_id": "G3",
+      "name": "Canonical install-to-aha path",
+      "evidence": ["README.md:24-66", "docs/index.md:155-204"],
+      "star_impact": "high",
+      "effort": "M",
+      "fit": "high",
+      "why": "A short path to a visible result converts a passive star into a firsthand recommendation.",
+      "first_step": "Make README.md:202-281 point to one mini-ork demo, starting with a no-provider dry run and optionally continuing to certify-demo."
+    },
+    {
+      "candidate_id": "G4",
+      "name": "Named architecture map",
+      "evidence": ["README.md:68-75", "docs/index.md:109-121", "docs/index.md:123-153"],
+      "star_impact": "high",
+      "effort": "S",
+      "fit": "high",
+      "why": "A stable diagram and vocabulary let developers place mini-ork in their stack and explain it without reading source.",
+      "first_step": "Add a kickoff to recipe to lanes to gates to artifact to learning diagram near README.md:187-200."
+    },
+    {
+      "candidate_id": "G5",
+      "name": "Citable why-mini-ork decision surface",
+      "evidence": ["docs/start/why-openclaw.md:21-61", "docs/positioning/why-mini-ork.md:34-55"],
+      "star_impact": "high",
+      "effort": "S",
+      "fit": "high",
+      "why": "A source-backed comparison page supplies the language for an internal adoption decision and differentiates mini-ork from generic orchestration.",
+      "first_step": "Link docs/positioning/why-mini-ork.md from the first README screen and add a current use-when / do-not-use-when matrix."
+    },
+    {
+      "candidate_id": "G6",
+      "name": "Measured evidence and limits trust bundle",
+      "evidence": ["README.md:60-80", "README.md:469-481", "docs/start/why-openclaw.md:33-57"],
+      "star_impact": "high",
+      "effort": "S",
+      "fit": "high",
+      "why": "Transparent measurements, failure cases, and safety limits make an agent runtime easier to trust and share.",
+      "first_step": "Add an evidence and limits box at README.md:60-80 linking each headline claim to docs/RESULTS.md and docs/SAFETY.md."
+    },
+    {
+      "candidate_id": "G7",
+      "name": "Visible release momentum loop",
+      "evidence": ["CHANGELOG.md:5-26", "docs/index.md:81-86"],
+      "star_impact": "medium",
+      "effort": "S",
+      "fit": "high",
+      "why": "A discoverable release trail gives a GitHub visitor confidence that a star is a useful bookmark for a living project.",
+      "first_step": "Add a What is new link and short rolling highlights block near README.md:493-510, sourced from CHANGELOG.md."
+    },
+    {
+      "candidate_id": "G8",
+      "name": "Authentic extension and contribution funnel",
+      "evidence": ["VISION.md:86-115", "README.md:114-118", "docs/index.md:69-70", "docs/index.md:150-152"],
+      "star_impact": "high",
+      "effort": "M",
+      "fit": "high",
+      "why": "A curated extension path gives developers a reason to invest in mini-ork and makes future utility visible without moving core scope.",
+      "first_step": "Add a maintained recipe/provider gallery entry point to docs/EXTENSION.md:1-18 with contribution and trust boundaries."
+    },
+    {
+      "candidate_id": "G9",
+      "name": "Small authentic visual identity",
+      "evidence": ["README.md:1-8", "README.md:118-145", "docs/index.md:25-30"],
+      "star_impact": "medium",
+      "effort": "S",
+      "fit": "medium",
+      "why": "A coherent visual treatment improves recall in the GitHub feed, but only after the proof and category narrative are credible.",
+      "first_step": "Define one consistent icon, phrase, and verified-run visual treatment in README.md:2-19 and validate it against the existing screenshot and CLI output."
+    }
+  ],
+  "shortlist": ["G1", "G5", "G2", "G4", "G6", "G3", "G7", "G8", "G9"],
+  "gap_analysis": [
+    {"candidate_id": "G1", "miniork_today": "README.md:8-28 and docs/positioning/why-mini-ork.md:214-217 already state the task-OS and verification thesis.", "gap": "The first screen lacks one short category sentence and a stable glossary that compresses the existing primitives."},
+    {"candidate_id": "G2", "miniork_today": "README.md:12-19 has badges and README.md:30-88 has a demo, results, warning, and IDE screenshot.", "gap": "There is no single first-screen action rail routing visitors to proof, trial, architecture, and extension surfaces."},
+    {"candidate_id": "G3", "miniork_today": "README.md:202-281 documents install, init, kickoff, dry-run, validate, and real-run paths.", "gap": "The visitor must choose among several setup paths before reaching a canonical observable aha moment."},
+    {"candidate_id": "G4", "miniork_today": "README.md:187-200 lists pillars and docs/ARCHITECTURE.md contains the detailed lifecycle.", "gap": "A compact visual end-to-end map is missing above the detailed architecture."},
+    {"candidate_id": "G5", "miniork_today": "docs/positioning/why-mini-ork.md:1-8 and :34-55 already provide the core comparison thesis.", "gap": "The README does not route first-time visitors prominently to a current decision matrix and non-goals."},
+    {"candidate_id": "G6", "miniork_today": "README.md:60-75 and :469-481 plus docs/RESULTS.md and docs/SAFETY.md already carry measurements and limits.", "gap": "Evidence, methodology, safety posture, and status are not packaged together near the hero."},
+    {"candidate_id": "G7", "miniork_today": "CHANGELOG.md:1-100 has release and feature history, while README.md:493-503 has a roadmap.", "gap": "Release momentum is not a prominent README discovery path or recurring highlights convention."},
+    {"candidate_id": "G8", "miniork_today": "docs/EXTENSION.md:1-18 and :26-220 document SDK, workflow, lane, and verifier extension points.", "gap": "There is no curated public gallery with maintained examples and a social publishing funnel."},
+    {"candidate_id": "G9", "miniork_today": "README.md:2-9 has an icon and tagline, and the existing screenshot supplies some visual language.", "gap": "There is no consistent visual system for verified runs, and adding lore before the core story is settled would be premature."}
+  ],
+  "open_questions": [
+    "Which defensible phrase should mini-ork own for G1: verified agent work, proof-carrying workflows, or another term?",
+    "Can a no-provider dry run show meaningful value, or must the canonical G3 path require a real repository and provider?",
+    "Which alternatives should the G5 decision page name first, and can every contrast be backed by current docs?",
+    "Are the measured results stable enough for G6 hero treatment, or should they remain a linked trust page until refreshed?",
+    "Who owns the first maintained gallery and its trust/versioning contract for G8?",
+    "Should mini-ork invest in an ork visual language at all, and can it reinforce evidence rather than become mascot theatre?"
+  ],
+  "read_only_attestation": {
+    "reference_modified": false,
+    "target_modified": false,
+    "files_written": ["lens-growth.md", "context-growth_lens.json"]
+  }
+}

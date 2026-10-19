@@ -23,7 +23,7 @@ from mini_ork.ide_pages import _cn as _CN
 from mini_ork.ide_pages import orch_tab
 from mini_ork.ide_pages import outcome as O
 from mini_ork.ide_pages import spec as S
-from mini_ork.ide_pages.run_header import build_header
+from mini_ork.ide_pages.run_header import build_header, copy_summary_action
 from mini_ork.ide_pages.cn_file import (
     _SECTION_BY_FILE as _CN_FILE_BY_FILE,
     _fetch_by_file as _cn_file_fetch_by_file,
@@ -53,11 +53,13 @@ TABS = [("dag", "DAG"), ("kickoff", "Kickoff"), ("overview", "Overview"),
 # the DAG leads, the outcome replaces the story, and the questions fold into the
 # DAG tab beside the nodes that stopped on them. Old keys still resolve so a
 # stale IDE link lands somewhere sensible.
-V2_TABS = [("dag", "DAG"), ("outcome", "Outcome"), ("orchestrator", "Orchestrator"),
-           ("kickoff", "Kickoff"), ("agents", "Agents"), ("checks", "Checks"),
+V2_TABS = [("dag", "DAG"), ("outcome", "Outcome"), ("checks", "Checks"),
+           ("changes", "Changes"), ("orchestrator", "Orchestrator"),
+           ("kickoff", "Kickoff"), ("agents", "Agents"),
            ("learnings", "Learnings"), ("artifacts", "Artifacts")]
 V2_ALIASES = {"story": "outcome", "graph": "dag", "questions": "dag",
-              "overview": "outcome", "orch": "orchestrator"}
+              "overview": "outcome", "verification": "checks",
+              "orch": "orchestrator"}
 
 # The kickoff text is capped well above the 20 KB the run card shows — the kickoff
 # tab is the place to read the whole task brief. Beyond the cap we append a
@@ -308,8 +310,14 @@ def _time_columns(steps: list[dict[str, Any]]) -> list[list[str]]:
     return cols
 
 
-def _attribute_calls(nodes: dict[str, Node], calls: list[dict[str, Any]], now: int) -> None:
-    """Give each llm_call to the node whose role lane and time window match."""
+def _match_calls(nodes: dict[str, Node], calls: list[dict[str, Any]], now: int
+                 ) -> list[tuple[Node, dict[str, Any]]]:
+    """Pair each llm_call with the node whose role lane and time window match.
+
+    The one attribution rule, shared by the cost/call counters and by the
+    roster's fallback read — so a node's family cell and its fallback note can
+    never disagree about which calls belong to it.
+    """
     # Index nodes by role_lane once — without it every call walked all N nodes,
     # turning a long run into O(N·M) when callers typically have hundreds of calls.
     nodes_by_lane_started: dict[str, list[Node]] = {}
@@ -320,6 +328,7 @@ def _attribute_calls(nodes: dict[str, Node], calls: list[dict[str, Any]], now: i
                 nodes_by_lane_started.setdefault(node.role_lane, []).append(node)
             else:
                 nodes_by_lane_idle.setdefault(node.role_lane, []).append(node)
+    matched: list[tuple[Node, dict[str, Any]]] = []
     for call in calls:
         actor = str(call.get("actor") or "")
         ts_raw = _epoch(call.get("ts"))
@@ -343,6 +352,13 @@ def _attribute_calls(nodes: dict[str, Node], calls: list[dict[str, Any]], now: i
                 best = idle[0]
         if best is None:
             continue
+        matched.append((best, call))
+    return matched
+
+
+def _attribute_calls(nodes: dict[str, Node], calls: list[dict[str, Any]], now: int) -> None:
+    """Give each llm_call to the node whose role lane and time window match."""
+    for best, call in _match_calls(nodes, calls, now):
         best.cost += float(call.get("cost_usd") or 0.0)
         best.calls += 1
         model = str(call.get("model_id") or "")
@@ -504,6 +520,173 @@ def _elapsed(run: Run) -> str:
 def _cost(run: Run) -> float:
     total = float(run.card.get("cost_total") or 0.0)
     return total if total > 0 else float(run.row.get("cost_usd") or 0.0)
+
+
+# ── spend against the caps ──────────────────────────────────────────────────
+#
+# The page has always shown a cost chip; C16 (the run-page JTBD review) asks for
+# the comparison that makes the number actionable — spent against the per-run
+# cap, the daily cap, and a projection while the run is still spending. The cap
+# comes from the watcher's own resolver so the page and the pause that actually
+# stops a run can never disagree.
+
+
+def _has_cost_data(run: Run) -> bool:
+    """Whether the run recorded a cost at all (a real ``$0.00`` still counts)."""
+    return run.card.get("cost_total") is not None or run.row.get("cost_usd") is not None
+
+
+def _per_run_cap() -> float | None:
+    """The run's spend cap, from ``watch.cost_cap_usd`` — never re-derived here.
+
+    Imported lazily and looked up on the module at call time: the fallback
+    chain (``MO_WATCH_COST_USD`` → ``MO_ORCH_BUDGET_USD`` → 1.0) lives in one
+    place, and a broken read returns ``None`` so the caller can show the spent
+    number without inventing a cap.
+    """
+    try:
+        from mini_ork.acp_orchestrator import watch
+
+        cap = float(watch.cost_cap_usd())
+    except Exception:  # noqa: BLE001 — a broken cap source costs the cap, not the page
+        return None
+    return cap if cap > 0 else None
+
+
+def _daily_cap() -> float:
+    """``MO_DAILY_BUDGET_USD`` (default 50.0), the scheduler's own knob."""
+    try:
+        value = float(str(os.environ.get("MO_DAILY_BUDGET_USD", "")).strip())
+    except (TypeError, ValueError):
+        return 50.0
+    return value if value > 0 else 50.0
+
+
+def _daily_spend(run: Run) -> float | None:
+    """Today's spend, only when it is one cheap query on the page's own DB.
+
+    The page already opens ``state.db``; a single ``SUM`` is affordable, while
+    anything more (or a closed home, as in a synthetic fixture) is omitted
+    rather than guessed.
+    """
+    try:
+        from datetime import datetime as _datetime
+
+        from mini_ork.web.db import db_for
+
+        db = db_for(run.home)
+        if not db.has_table("task_runs"):
+            return None
+        midnight = int(_datetime.now().replace(
+            hour=0, minute=0, second=0, microsecond=0).timestamp())
+        row = db.row(
+            "SELECT COALESCE(SUM(cost_usd), 0) AS n FROM task_runs "
+            "WHERE created_at >= ?", (midnight,))
+        return float((row or {}).get("n") or 0.0)
+    except Exception:  # noqa: BLE001 — an unreadable DB omits the daily number
+        return None
+
+
+def _recent_completion_seconds(run: Run) -> float | None:
+    """The recent-completion estimate: mean wall time of the recipe's last runs.
+
+    One query over ``task_runs``; ``None`` when the DB or the history is
+    missing, so the projection falls back to the run's own pace.
+    """
+    try:
+        from mini_ork.web.db import db_for
+
+        db = db_for(run.home)
+        if not db.has_table("task_runs"):
+            return None
+        recipe = str(run.card.get("recipe") or run.row.get("recipe") or "")
+        row = db.row(
+            "SELECT AVG(ended_at - created_at) AS avg_s FROM ("
+            " SELECT ended_at, created_at FROM task_runs"
+            " WHERE ended_at IS NOT NULL AND created_at IS NOT NULL AND recipe = ?"
+            " ORDER BY ended_at DESC LIMIT 20)", (recipe,))
+        avg = float((row or {}).get("avg_s") or 0.0)
+        return avg if avg > 0 else None
+    except Exception:  # noqa: BLE001 — no history means no completion estimate
+        return None
+
+
+def _projected_spend(run: Run, spent: float) -> float | None:
+    """``rate × completion estimate`` while a run is still spending.
+
+    Only a ``running`` run that has spent at least a minute's worth of elapsed
+    time projects; a finished run has nothing left to project. The estimate is
+    the recipe's recent mean duration when it looks further out than what the
+    run already took, else the run's own pace doubled (assume it is halfway).
+    """
+    if not _running(run) or spent <= 0:
+        return None
+    start = _epoch(run.row.get("created_at"))
+    if start is None:
+        return None
+    elapsed = int(time.time()) - start
+    if elapsed < 60:
+        return None
+    estimate = _recent_completion_seconds(run)
+    if estimate is None or estimate <= elapsed:
+        estimate = elapsed * 2
+    return round(spent / elapsed * estimate, 2)
+
+
+def _spend_numbers(run: Run) -> dict[str, float] | None:
+    """The outcome's ``spend`` block; ``None`` when the run recorded no cost.
+
+    ``remaining`` is clamped at zero, ``daily_cap`` and ``projected`` are
+    present only when they can be known — never fabricated.
+    """
+    if not _has_cost_data(run):
+        return None
+    spent = _cost(run)
+    out: dict[str, float] = {"spent": round(spent, 2)}
+    cap = _per_run_cap()
+    if cap is not None:
+        out["cap"] = round(cap, 2)
+        out["remaining"] = round(max(cap - spent, 0.0), 2)
+    out["daily_cap"] = round(_daily_cap(), 2)
+    projected = _projected_spend(run, spent)
+    if projected is not None:
+        out["projected"] = projected
+    return out
+
+
+def _spend_section(run: Run) -> dict[str, Any]:
+    """One compact Spend section: spent, caps, remaining and the projection.
+
+    Shared verbatim by the Checks and Outcome tabs so the two can never drift.
+    Every failure inside is absorbed: a broken cap source drops the cap and
+    leaves the spent sentence, never an exception and never a made-up number.
+    """
+    spent = _cost(run)
+    cap = _per_run_cap()
+    items: list[dict[str, Any]] = []
+    if cap is None:
+        items.append(S.dot(f"{S.money(spent)} spent",
+                           "per-run cap unavailable — the watcher could not be read"))
+    else:
+        remaining = max(cap - spent, 0.0)
+        sentence = (f"{S.money(spent)} of a {S.money(cap)} per-run cap"
+                    f" · {S.money(remaining)} left")
+        # Green strictly under the cap; at the cap the sentence already says
+        # nothing is left, so it carries the same warning tone as going over.
+        items.append(S.bad(sentence) if spent >= cap else S.ok(sentence))
+        daily_cap = _daily_cap()
+        daily_spent = _daily_spend(run)
+        if daily_spent is None:
+            items.append(S.dot(f"Daily cap {S.money(daily_cap)}"))
+        else:
+            items.append(S.dot(
+                f"Daily {S.money(daily_spent)} of a {S.money(daily_cap)} cap"))
+        projected = _projected_spend(run, spent)
+        if projected is not None:
+            items.append(S.dot(f"at this rate, ~{S.money(projected)} by the end"))
+    return S.lst(
+        "Spend", items, full=True,
+        note="What this run has spent against its per-run and daily caps.")
 
 
 def _sub(run: Run) -> str:
@@ -672,6 +855,38 @@ def _pending_node_ids(run: Run) -> list[str]:
     return out
 
 
+def _awaiting_node_ids(run: Run, *, include_pending_reviews: bool = True) -> list[str]:
+    """The nodes a human still has to act on: pending review rows, then the
+    node an unanswered ask blocks on, in that order.
+
+    One owner for both readers: the DAG's focus (``_graph``) and the triage's
+    node both ask "who is waiting on a person?", so they cannot name different
+    nodes for the same run. ``include_pending_reviews`` lets ``_graph`` keep its
+    parked-only DB read (a dock render stays DB-free). Every reader fails soft
+    to ``[]``: one broken source costs its own rows, never the caller.
+    """
+    awaiting: list[str] = []
+    if include_pending_reviews:
+        awaiting.extend(_pending_node_ids(run))
+    try:
+        asks = run.run_dir / "asks"
+        for name in sorted(n for n in os.listdir(asks)
+                           if n.startswith("ask-") and n.endswith(".json")):
+            ask = _json_obj(asks / name)
+            if not isinstance(ask, dict) or str(ask.get("answer") or "").strip():
+                continue
+            nid = str(ask.get("node_id") or ask.get("node") or "").strip()
+            refs = ask.get("blocking_refs")
+            if not nid and isinstance(refs, list) and refs:
+                nid = str(refs[0]).strip()
+            if nid and nid not in awaiting:
+                awaiting.append(nid)
+                break
+    except Exception:  # noqa: BLE001 — asks are optional; never blank the caller
+        pass
+    return awaiting
+
+
 def _merge_review_section(run: Run) -> list[dict[str, Any]]:
     """The "Merge review" chip for a run whose policy requires human approval.
 
@@ -712,6 +927,183 @@ def _merge_review_section(run: Run) -> list[dict[str, Any]]:
                             confirm=f"Approve merging {run.id} into the base branch?",
                             home=False),
                       "primary")])]
+
+
+# ── the needs-you lane (v2 only) ───────────────────────────────────────────
+#
+# One ordered list of every decision on the run that waits on a person — the
+# parked review, the open retry gate, a cost pause, a merge approval, an
+# unanswered ask — emitted as ONE section at the top of every v2 tab. Empty
+# sources contribute nothing: a healthy run gets no section at all, never an
+# empty "Needs you" box. Each source is built behind its own try/except so a
+# broken part costs that item, never the tab (the same rule the rest of the
+# page follows).
+
+
+def _attention_item(text: str, detail: str, *, item_id: str,
+                    actions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """One lane item: ``id``, text, optional detail and its own buttons.
+
+    ``spec.item``'s shape carries the rendering; ``id`` is additive (an IDE
+    that does not know it ignores the key) and stable across renders so the
+    lane cannot shuffle under the operator between two builds.
+    """
+    item = S.item(text, detail, acts=actions or [])
+    item["id"] = item_id
+    return item
+
+
+def _parked_attention_items(run: Run) -> list[dict[str, Any]]:
+    """The parked run's review decision, or ``[]`` when the run is not parked."""
+    if not _is_parked_run(run):
+        return []
+    awaiting = _pending_node_ids(run)
+    if awaiting:
+        first = awaiting[0]
+        actions = [
+            S.btn("Approve",
+                  S.cli("approvals", "approve", run.id, "--node", first,
+                        confirm=f"Approve {first}'s output and resume the run?",
+                        home=False),
+                  "primary"),
+            S.btn("Request changes…",
+                  S.thread(f"/request-changes {run.id} {first} "),
+                  "default"),
+        ]
+        return [_attention_item(
+            f"Paused for human review of: {', '.join(awaiting)}.",
+            "Approve a node to resume, or request changes with a note.",
+            item_id=f"review:{run.id}:{first}", actions=actions)]
+    return [_attention_item(
+        "The run is paused for a human review. Open its node pages to approve "
+        "or request changes.",
+        "No node-review row names which node stopped it.",
+        item_id=f"review:{run.id}")]
+
+
+def _gate_attention_items(run: Run, outcome: dict[str, Any]) -> list[dict[str, Any]]:
+    """The open retry gate, when the outcome is a needs-you decision."""
+    if str(outcome.get("state") or "") != "needs_you":
+        return []
+    item = O.gate_attention_item(run)
+    return [item] if isinstance(item, dict) else []
+
+
+def _cost_pause_attention_items(run: Run) -> list[dict[str, Any]]:
+    """The cost-cap pause, or ``[]`` when the run is not paused on budget."""
+    try:
+        paused = (run.run_dir / ".cost-pause").is_file()
+    except OSError:
+        return []
+    if not paused:
+        return []
+    return [_attention_item(
+        "Paused at the cost cap",
+        "The run stopped spending at its budget cap. Resuming continues from "
+        "the same step with the remaining budget.",
+        item_id=f"cost-pause:{run.id}",
+        actions=[S.btn("Resume",
+                       S.cli("board", "resume", run.id,
+                             confirm=f"Resume cost-paused {run.id}?"),
+                       "primary")])]
+
+
+def _merge_attention_items(run: Run) -> list[dict[str, Any]]:
+    """The human merge approval, while the run still awaits it."""
+    if run.workspace is None:
+        return []
+    try:
+        from mini_ork.gates.review_policy import load_policy
+
+        policy = load_policy(home=run.home)
+    except Exception:  # noqa: BLE001 — a missing policy is not an error
+        return []
+    if str(getattr(policy, "before_merge", "off")) != "required":
+        return []
+    try:
+        from mini_ork.gates import merge_approval
+
+        st = merge_approval.status(run.id, db_path=str(run.home / "state.db"))
+    except Exception:  # noqa: BLE001 — a missing inbox row is "none"
+        st = {"state": "none", "approver": "", "inbox_id": None}
+    state = str(st.get("state") or "none")
+    if state == "approved":
+        # Nothing waits on a person: no item, hence no empty needs-you box.
+        return []
+    text = "Merge approval needed"
+    if state != "none":
+        text += f" · {state}"
+    return [_attention_item(
+        text, "A human must approve the merge before this run lands.",
+        item_id=f"merge:{run.id}",
+        actions=[S.btn("Approve merge",
+                       S.cli("approvals", "approve", run.id,
+                             confirm=f"Approve merging {run.id} into the base branch?",
+                             home=False),
+                       "primary")])]
+
+
+def _ask_attention_items(run: Run) -> list[dict[str, Any]]:
+    """One item per unanswered ``asks/ask-N.json``, in ask order."""
+    out: list[dict[str, Any]] = []
+    for ask in open_asks(run.run_dir):
+        question = str(ask.get("question") or "").strip()
+        if not question:
+            continue
+        detail: list[str] = []
+        options = [str(o) for o in ask.get("options") or [] if str(o).strip()]
+        if options:
+            detail.append("Options: " + ", ".join(options))
+        if ask.get("default") is not None:
+            detail.append(f"If unanswered, the run uses: “{ask['default']}”")
+        detail.append("Answer on the Questions tab; the run continues from where it stopped.")
+        out.append(_attention_item(
+            question, "\n".join(detail),
+            item_id=f"ask:{ask.get('ask_id') or len(out)}",
+            actions=[S.btn("Answer",
+                           S.page_link("run", "questions", run=run.id),
+                           "primary")]))
+    return out
+
+
+def _attention_lane(run: Run, outcome: dict[str, Any]
+                    ) -> tuple[list[dict[str, Any]], set[str]]:
+    """``(sections, absorbed_callout_titles)`` for the needs-you lane.
+
+    Sources are appended in a fixed order (parked review, open gate, cost
+    pause, merge approval, open asks) and each is guarded on its own. When the
+    gate item is present the outcome's own callout is "absorbed": the story tab
+    drops it so the retry decision renders exactly once. No items → no section.
+    """
+    items: list[dict[str, Any]] = []
+    absorbed: set[str] = set()
+    try:
+        items.extend(_parked_attention_items(run))
+    except Exception:  # noqa: BLE001 — one broken source costs its item
+        pass
+    try:
+        gate_items = _gate_attention_items(run, outcome)
+        if gate_items:
+            items.extend(gate_items)
+            absorbed.add(O.GATE_CALLOUT_TITLE)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        items.extend(_cost_pause_attention_items(run))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        items.extend(_merge_attention_items(run))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        items.extend(_ask_attention_items(run))
+    except Exception:  # noqa: BLE001
+        pass
+    if not items:
+        return [], absorbed
+    return [S.lst("Needs you", items, full=True,
+                  note="Everything on this run that waits on a person.")], absorbed
 
 
 # ── node output ─────────────────────────────────────────────────────────────
@@ -844,6 +1236,13 @@ def _verdict(run: Run, node: Node) -> tuple[str, str]:
     return "—", "sub"
 
 
+# A review verdict that says the change passed. When the node itself is in a
+# failed state, such a file is the earlier attempt's leftover (a re-dispatched
+# reviewer whose last attempt died before writing its verdict is the common
+# case) — its note explains no failure and must not become the reason.
+_PASSING_VERDICTS = frozenset({"pass", "passed", "ok", "approve", "approved", "done"})
+
+
 def _node_reason(run: Run, node: Node) -> str:
     """One line saying why ``node`` failed or is blocked — ``""`` when nothing does.
 
@@ -852,9 +1251,13 @@ def _node_reason(run: Run, node: Node) -> str:
     1. the node's verdict note — the first reason text of its
        ``review-<id>.json`` (``reasons`` → ``notes`` → ``findings``), the read
        ``ide_pages.node._overview_reviewer_headline(run_dir, node)`` uses, so the
-       DAG and the node tab name one vocabulary rather than two;
+       DAG and the node tab name one vocabulary rather than two. A review that
+       *passed* is skipped for a failed node: it is a leftover from an earlier
+       attempt and explains nothing about this failure;
     2. the first ``error`` / ``summary`` line of its ``verifier_<id>.json``;
-    3. ``retry-hint.json``'s ``notes[0]`` when its ``failed_node`` is this node.
+    3. ``retry-hint.json``'s ``notes[0]`` when its ``failed_node`` is this node;
+    4. the node's own ``finish`` (``verdict_fail``, ``error``, ``timeout``) in
+       display words, when no artefact explains it.
 
     Guarded: any exception returns ``""``. The caller omits the key, so a
     dotted or unreadable run dir costs the reason, never the page.
@@ -877,15 +1280,20 @@ def _node_reason(run: Run, node: Node) -> str:
             lines = [ln.strip() for ln in str(text).splitlines() if ln.strip()]
             return lines[0] if lines else ""
 
-        # 1. the node's own verdict note.
+        # 1. the node's own verdict note — unless the review passed while the
+        #    node is down: that note describes an earlier, successful attempt.
         review = d / f"review-{node.id}.json"
         if review.is_file():
             obj = _json_obj(review)
             if isinstance(obj, dict):
-                for key in ("reasons", "notes", "findings"):
-                    text = first_line(obj.get(key))
-                    if text:
-                        return _clip(text, 80)
+                verdict = str(obj.get("verdict") or "").strip().lower()
+                stale_pass = (str(node.state or "") == "failed"
+                              and verdict in _PASSING_VERDICTS)
+                if not stale_pass:
+                    for key in ("reasons", "notes", "findings"):
+                        text = first_line(obj.get(key))
+                        if text:
+                            return _clip(text, 80)
 
         # 2. the first error / summary line of its verifier json.
         verifier = _json_obj(d / f"verifier_{node.id}.json")
@@ -901,6 +1309,12 @@ def _node_reason(run: Run, node: Node) -> str:
             text = first_line(hint.get("notes"))
             if text:
                 return _clip(text, 80)
+
+        # 4. the node's own finish reason, in display words (never the raw
+        #    enum), when no artefact explains it.
+        finish = str(getattr(node, "finish", "") or "").strip()
+        if str(node.state or "") == "failed" and finish:
+            return _clip(O.display_word(finish), 80)
         return ""
     except Exception:  # noqa: BLE001 — a reason must never blank the page
         return ""
@@ -910,14 +1324,30 @@ def _wall(node: Node) -> str:
     if node.start is None:
         return "—"
     end = node.end if node.end is not None else int(time.time())
-    return f"{max(0, end - node.start)}s"
+    seconds = max(0, end - node.start)
+    # Under a minute the raw seconds are the clearest unit; past that the
+    # page's own duration formatter keeps an hour-long node from reading
+    # "3725s".
+    return f"{seconds}s" if seconds < 60 else S.duration(seconds)
 
 
 def _clock(epoch: int | None) -> str:
-    """Wall-clock time of day — a start/end reads "when", a duration reads "how long"."""
+    """When something happened: time of day today, date and time otherwise.
+
+    A hostname-free ``14:03:22`` is unambiguous only while the reader is
+    looking at a run from today. Runs are re-opened days later, so a stamp
+    from another day carries that day; the year appears only when it differs
+    from the current one.
+    """
     if not epoch:
         return "—"
-    return time.strftime("%H:%M:%S", time.localtime(epoch))
+    stamp = time.localtime(epoch)
+    today = time.localtime()
+    if (stamp.tm_year, stamp.tm_yday) == (today.tm_year, today.tm_yday):
+        return time.strftime("%H:%M:%S", stamp)
+    if stamp.tm_year == today.tm_year:
+        return time.strftime("%b %d %H:%M", stamp)
+    return time.strftime("%Y-%m-%d %H:%M", stamp)
 
 
 # ── tabs ────────────────────────────────────────────────────────────────────
@@ -1010,27 +1440,9 @@ def _graph(run: Run, wanted: str | None = None) -> dict[str, Any]:
     # The nodes a human still has to act on: a parked run's pending review
     # rows (the same DB read the parked callout makes — skipped unless the
     # run is actually parked, so a dock render stays DB-free), then an
-    # unanswered ask's node. ``open_asks`` projects no node id, so the ask
-    # file itself is read for the one it carries.
-    awaiting: list[str] = []
-    if _is_parked_run(run):
-        awaiting.extend(_pending_node_ids(run))
-    try:
-        asks = run.run_dir / "asks"
-        for name in sorted(n for n in os.listdir(asks)
-                           if n.startswith("ask-") and n.endswith(".json")):
-            ask = _json_obj(asks / name)
-            if not isinstance(ask, dict) or str(ask.get("answer") or "").strip():
-                continue
-            nid = str(ask.get("node_id") or ask.get("node") or "").strip()
-            refs = ask.get("blocking_refs")
-            if not nid and isinstance(refs, list) and refs:
-                nid = str(refs[0]).strip()
-            if nid and nid not in awaiting:
-                awaiting.append(nid)
-                break
-    except Exception:  # noqa: BLE001 — asks are optional; never blank the graph
-        pass
+    # unanswered ask's node. One helper with the triage's own reader, so the
+    # DAG focus and the triage never name different waiting nodes.
+    awaiting = _awaiting_node_ids(run, include_pending_reviews=_is_parked_run(run))
     holding = set(awaiting)
 
     def state_of(n: Node) -> str:
@@ -1195,30 +1607,18 @@ def _dag_tab(run: Run, wanted: str | None, *, select: bool = False,
         a node whose own cost, start and end say nothing about the run. The box
         is about the run until a click makes it about a node.
         """
-        nodes = run.nodes
-        done = sum(1 for node in nodes if node.state == "done")
-        skipped = sum(1 for node in nodes if node.state == "skipped")
-        passed, total = verifier_check_counts(run.run_dir)
-        findings = O._findings_count(run)  # noqa: SLF001 — same package's count
         live = _running(run)
         state = str(resolved_outcome.get("state") or "")
+        # Cost, progress, checks and recipe are already on the header chips and
+        # in the callout above the graph. This box answers the one question
+        # nothing else on the tab does: when did it run.
         facts: list[tuple[Any, ...]] = [
             ("Status", {"done": "done", "running": "running", "failed": "failed",
                         "needs_you": "needs you"}.get(state, state or "—"),
              str(resolved_outcome.get("tone") or "text")),
-            ("Cost", S.money(_cost(run))),
             ("Started", _clock(_epoch(run.row.get("created_at")))),
             ("Ended", "running" if live else _clock(
                 _epoch(run.row.get("ended_at")) or _epoch(run.row.get("updated_at")))),
-            ("Duration", _elapsed(run)),
-            ("Nodes", (f"{done}/{len(nodes)} done" +
-                       (f" · {skipped} not run" if skipped else ""))
-             if nodes else "no nodes"),
-            ("Checks", f"{passed}/{total}" if total else "—",
-             "green" if total and passed == total else "text"),
-            ("Findings", str(findings) if findings is not None else "—",
-             "red" if findings else "text"),
-            ("Recipe", str(run.card.get("recipe") or run.row.get("recipe") or "—")),
         ]
         sub = " · ".join(("run", "overall", "live" if live else "finished"))
         return [S.kv("Run", facts, sub=sub, cols=3, big=True, full=True)]
@@ -1344,8 +1744,9 @@ def _dag_tab(run: Run, wanted: str | None, *, select: bool = False,
                 + S.guarded(errors, "Verifiers", verifiers))
 
     # Level 1: the DAG section stays first (the IDE draws it as the page's
-    # strip, and a test pins `sections[0]`); roster and totals follow so the
-    # page still answers "what ran, on what, for how much".
+    # strip, and a test pins `sections[0]`); totals follow so the page still
+    # answers "for how much". The roster lives on Agents only — one table,
+    # one place, instead of the same rows drawn on two tabs.
     def totals() -> dict[str, Any]:
         counts: dict[str, int] = {}
         for n in run.nodes:
@@ -1386,7 +1787,6 @@ def _dag_tab(run: Run, wanted: str | None, *, select: bool = False,
                            lines, items, full=True)
 
     return (S.guarded(errors, "DAG", build_dag)
-            + S.guarded(errors, "Roster", lambda: _roster_section(run))
             + S.guarded(errors, "Totals", totals)
             + S.guarded(errors, "Inspector", build_inspector)
             + S.guarded(errors, "Coalition", build_coalition))
@@ -1426,6 +1826,10 @@ def _overview_tab(run: Run, *, include_retry: bool = True) -> list[dict[str, Any
                            ("context-pack.v2.json", "Context selected for this run's files (context v2)"),
                            ("learned/planner.md", "Exactly what the planner was given")):
             p = d / name
+            if name == "context-pack.json" and (d / "context-pack.v2.json").is_file():
+                # v2 is the pack the planner actually consumed; the v1 file is
+                # still in the folder but listing both reads as two inputs.
+                continue
             if p.is_file():
                 items.append(S.dot(name, f"{what} · {_size(p)}", [S.btn("Open", S.open_path(str(p)), "ghost")]))
         if not items:
@@ -1454,7 +1858,12 @@ def _overview_tab(run: Run, *, include_retry: bool = True) -> list[dict[str, Any
         # but the operator action is to lift the cost cap (resume), not to ack
         # a code change. Treat it as the dedicated branch it is.
         if hint.get("retryable") and strategy == "resume-cost":
-            return S.lst("Retry", [S.ok(f"Resume this cost-paused run with `mini-ork resume {run.id}`.")],
+            # Name the cap that was hit, from the same watcher source the pause
+            # uses; the button and its confirmation stay byte-identical.
+            cap = _per_run_cap()
+            cap_text = f" (the {S.money(cap)} per-run cap)" if cap is not None else ""
+            return S.lst("Retry", [S.ok(
+                f"Resume this cost-paused run with `mini-ork resume {run.id}`{cap_text}.")],
                          full=True,
                          actions=[S.btn("Resume",
                                         S.cli("board", "retry", run.id,
@@ -1537,6 +1946,21 @@ def _overview_tab(run: Run, *, include_retry: bool = True) -> list[dict[str, Any
         return S.code("Recent events",
                       recent_lines(run) or [("No events recorded for this run.", "dim")])
 
+    def orchestrator() -> list[dict[str, Any]]:
+        """A pointer to the Orchestrator tab, which owns the whole layer.
+
+        The activity feed, the steering queue and the watcher's state moved to
+        their own tab; Overview keeps one link so the layer stays discoverable
+        from the page a reader arrives on.
+        """
+        return [S.lst("Orchestrator", [S.dot(
+            "The orchestrator has its own tab",
+            "Activity, the steering queue and the watcher's state live there.",
+            mc="sub",
+            acts=[S.btn("Open Orchestrator",
+                        S.page_link("run", "orchestrator", run=run.id), "ghost")])],
+            full=True)]
+
     def files() -> list[dict[str, Any]]:
         # Resolve the per-file session-history once per render. The snapshot
         # path keeps the finished run from re-fetching CN for the line; live
@@ -1596,14 +2020,7 @@ def _overview_tab(run: Run, *, include_retry: bool = True) -> list[dict[str, Any
             + S.guarded(errors, "Run inputs", inputs)
             + S.guarded(errors, "Why? — evidence",
                         lambda: why_section(run, title="Why? — evidence"))
-            + S.guarded(errors, "Orchestrator", lambda: [S.lst(
-                "Orchestrator", [S.dot(
-                    "The orchestrator has its own tab",
-                    "Activity, the steering queue and the watcher's state live there.",
-                    mc="sub",
-                    acts=[S.btn("Open Orchestrator",
-                                S.page_link("run", "orchestrator", run=run.id), "ghost")])],
-                full=True)])
+            + S.guarded(errors, "Orchestrator", orchestrator)
             + S.guarded(errors, "Correlation", correlation) + S.guarded(errors, "Recent events", recent)
             + S.guarded(errors, "Files changed", files)
             + _run_memory_sections(run))
@@ -1690,6 +2107,37 @@ def open_asks(run_dir: Path) -> list[dict[str, Any]]:
     return out
 
 
+def answered_asks(run_dir: Path) -> list[dict[str, Any]]:
+    """The asks a human already answered, in ask order.
+
+    The open list tells the operator what still waits; this one tells them
+    what they decided and why the run continued. It is read from the same
+    files (``answer`` non-empty) so the two lists can never count an ask
+    twice.
+    """
+    asks_dir = run_dir / "asks"
+    try:
+        names = [n for n in os.listdir(asks_dir)
+                 if n.startswith("ask-") and n.endswith(".json")]
+    except OSError:
+        return []
+    out: list[dict[str, Any]] = []
+    for name in sorted(names, key=_ask_index):
+        try:
+            data = json.loads((asks_dir / name).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        answer = str(data.get("answer") or "").strip()
+        question = str(data.get("question") or "").strip()
+        if not answer or not question:
+            continue
+        out.append({"ask_id": str(data.get("ask_id") or name[:-len(".json")]),
+                    "question": question, "answer": answer})
+    return out
+
+
 def _questions_tab(run: Run) -> list[dict[str, Any]]:
     """What the run is waiting to be told, and one box per question to tell it.
 
@@ -1704,11 +2152,21 @@ def _questions_tab(run: Run) -> list[dict[str, Any]]:
     def build() -> list[dict[str, Any]]:
         asks = open_asks(run.run_dir)
         if not asks:
-            return S.callout(
+            quiet: list[dict[str, Any]] = [S.callout(
                 "No open questions",
                 "This run is not waiting on an answer. A question lands here — and in the "
                 "inbox — when the planner stops on something only you can decide.",
-                tone="green", icon="✓", full=True)
+                tone="green", icon="✓", full=True)]
+            # A run that answered questions earlier keeps that record: "not
+            # waiting" and "never asked anything" are different histories.
+            answered = answered_asks(run.run_dir)
+            if answered:
+                rows = [S.item(a["ask_id"],
+                               f"{a['question'][:140]} → {a['answer'][:140]}")
+                        for a in answered[-5:]]
+                quiet.append(S.lst(f"Answered · {len(answered)}", rows, full=True,
+                                   note="The answers this run continued on."))
+            return quiet
         sections: list[dict[str, Any]] = [S.callout(
             f"{len(asks)} question{'s' if len(asks) > 1 else ''} waiting",
             "The run continues once every one is answered — same run id, same recipe, "
@@ -1754,23 +2212,70 @@ def _kickoff_tab(run: Run, *, code_presentation: bool = False) -> list[dict[str,
     return S.guarded(errors, "Kickoff", build)
 
 
+_ROSTER_NOTE = "Where the money went inside the run. Click a row to inspect the node."
+
+
+def _fallback_facts(calls: list[dict[str, Any]]) -> tuple[list[str], int, str]:
+    """Models in time order, plus the failed-before-success story, for one node.
+
+    A fallback is a node the executor served from more than one model: the
+    roster names the first and the last, and the note names the sequence. The
+    story is only told when a non-success call precedes a success — a failure
+    *after* the success is a fallback, but not a "failed call, then …".
+    """
+    ordered = sorted(calls, key=lambda c: _epoch(c.get("ts")) or 0)
+    models: list[str] = []
+    for call in ordered:
+        model = str(call.get("model_id") or "")
+        if model and model not in models:
+            models.append(model)
+    failed = 0
+    failed_then = ""
+    for call in ordered:
+        if str(call.get("status") or "") == "success":
+            if failed:
+                failed_then = str(call.get("model_id") or "")
+                break
+        else:
+            failed += 1
+    return models, failed, failed_then
+
+
+def _calls_by_node(run: Run) -> dict[str, list[dict[str, Any]]]:
+    """The run's calls grouped by the node the shared attribution rule gives them to."""
+    out: dict[str, list[dict[str, Any]]] = {}
+    for node, call in _match_calls({n.id: n for n in run.nodes}, run.calls, int(time.time())):
+        out.setdefault(node.id, []).append(call)
+    return out
+
+
 def _roster_section(run: Run, *, tokens: bool = False) -> dict[str, Any]:
     """Every node of the run as one table: what it ran on, its state and cost.
 
-    Shared by the Graph tab's run-level panel and the Agents tab, so the two
-    cannot report different numbers for the same node. ``tokens`` adds the
-    tokens column — the v2 Agents tab asks for it, the level-1 roster does not,
-    so its payload stays byte-identical.
+    The single roster builder — the Agents tab draws it. ``tokens`` adds the
+    tokens column — the v2 Agents tab asks for it, the level-1 payload does not,
+    so its shape stays byte-identical.
+
+    A node whose attributed calls carry more than one ``model_id`` fell back
+    mid-node: its family cell reads ``first → last``, it gains a ``⇄`` marker
+    cell and a ``fallback`` list on the row, and the section note names the
+    sequence. Zero- and one-model nodes render exactly as before.
     """
     from mini_ork.ide_pages.node import _node_tokens  # lazy: node.py imports this module
 
-    rows = []
+    by_node = _calls_by_node(run)
+    rows: list[dict[str, Any]] = []
+    fallback_lists: list[list[str] | None] = []
+    fell_back: list[tuple[str, str, int, str]] = []
     for n in run.nodes:
         verdict, vc = _verdict(run, n)
         ran = n.state not in ("pending", "skipped")
+        models, failed, failed_then = _fallback_facts(by_node.get(n.id, []))
+        fallback = models if len(models) > 1 else None
+        family = f"{models[0]} → {models[-1]}" if fallback else n.family
         cells = [
             S.cell(n.id, "text", b=True),
-            S.cell(n.family, f"fam:{n.family}"),
+            S.cell(family, f"fam:{models[-1]}" if fallback else f"fam:{n.family}"),
             S.cell(_STATE_TEXT.get(n.state, n.state), _STATE_COLOUR.get(n.state, "sub")),
             S.cell(verdict, vc),
             S.mono(S.money(n.cost) if ran else "—"),
@@ -1780,8 +2285,12 @@ def _roster_section(run: Run, *, tokens: bool = False) -> dict[str, Any]:
             cells.append(S.mono(f"{counted:,}" if counted is not None else "—"))
         cells.extend([S.mono(_wall(n) if ran else "—"),
                       S.muted(", ".join(n.gates) or "—")])
+        if fallback:
+            cells.append(S.muted("⇄"))
+            fell_back.append((n.id, f"{models[0]} → {models[-1]}", failed, failed_then))
         rows.append({"cells": cells,
                      "do": S.page_link("run", "dag", run=run.id, node=n.id)})
+        fallback_lists.append(fallback)
     head = ["node", "family", "status", "verdict", "cost"]
     widths = [S.col(150), S.col(90), S.col(80), S.col(90), S.col(64)]
     if tokens:
@@ -1791,8 +2300,25 @@ def _roster_section(run: Run, *, tokens: bool = False) -> dict[str, Any]:
     widths.extend([S.col(64), S.col(fr=1, min=140)])
     if not rows:
         rows = [[S.muted("No nodes recorded")] + ["" for _ in head[1:]]]
-    return S.table("Agent roster", widths, head, rows,
-                   full=True, note="Where the money went inside the run. Click a row to inspect the node.")
+    note = _ROSTER_NOTE
+    if fell_back:
+        details = []
+        for node_id, sequence, failed, failed_then in fell_back:
+            detail = f"{node_id}: {sequence}"
+            if failed and failed_then:
+                detail += (f"; {failed} failed call{'s' if failed != 1 else ''}, "
+                           f"then {failed_then}")
+            details.append(detail)
+        count = len(fell_back)
+        note += (f" {count} node{'s' if count != 1 else ''} fell back "
+                 f"{', '.join(f'({d})' for d in details)}.")
+    section = S.table("Agent roster", widths, head, rows, full=True, note=note)
+    # ``S.table`` keeps only the known row keys; the IDE's row badge rides
+    # ``fallback`` beside the cells, so attach it to the emitted rows.
+    for row, fallback in zip(section["rows"], fallback_lists):
+        if fallback:
+            row["fallback"] = fallback
+    return section
 
 
 def _agents_tab(run: Run) -> list[dict[str, Any]]:
@@ -2107,6 +2633,92 @@ def _lesson_item(title: str, lesson_id: str, usage: set[str] | None, level2: boo
     return S.item(title, sub, acts=_lesson_acts(lesson_id) if level2 else [])
 
 
+def _member_trace_ids(members_json: Any) -> list[str] | None:
+    """The trace ids a pattern's member JSON names, or ``None`` when unreadable.
+
+    Two shapes are live (see ``lessons_cmd._seen_in_runs``): bare trace-id
+    strings and ``{item_table, item_id}`` dicts. Anything that is not a JSON
+    list is unreadable — the caller drops the section rather than guessing a
+    membership it cannot prove.
+    """
+    try:
+        members = json.loads(members_json) if members_json else []
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(members, list):
+        return None
+    ids: list[str] = []
+    for m in members:
+        if isinstance(m, dict):
+            if (m.get("item_table") or "execution_traces") != "execution_traces":
+                continue
+            mid = m.get("item_id")
+        else:
+            mid = m
+        if mid:
+            ids.append(str(mid))
+    return ids
+
+
+def _proposed_lessons(run: Run) -> list[dict[str, Any]]:
+    """The run's "Proposed lessons" section, or ``[]`` when there is none.
+
+    A proposed pattern appears here only when ``member_item_ids_json`` names a
+    trace id from **this** run's own ``execution_traces`` rows — trace
+    membership is the only link between a run and a pattern. Every failure
+    (missing table, unreadable JSON) costs this section, never the tab.
+    """
+    from mini_ork.web.db import db_for
+
+    db = db_for(run.home)
+    if not (db.has_table("emergent_patterns") and db.has_table("execution_traces")):
+        return []
+    trace_ids = {str(r.get("trace_id") or "")
+                 for r in db.rows("SELECT trace_id FROM execution_traces WHERE run_id = ?",
+                                  (run.id,))}
+    trace_ids.discard("")
+    if not trace_ids:
+        return []
+    cols = "pattern_id, cluster_label, member_item_ids_json, strength_score"
+    try:
+        has_lesson = any(str(r.get("name") or "") == "lesson_text"
+                         for r in db.rows("PRAGMA table_info(emergent_patterns)", ()))
+    except Exception:  # noqa: BLE001 — an unreadable schema is just no lesson column
+        has_lesson = False
+    rows = db.rows(
+        f"SELECT {cols}{', lesson_text' if has_lesson else ''} "  # noqa: S608 — fixed cols
+        "FROM emergent_patterns WHERE status = 'proposed'",
+        (),
+    )
+    items: list[dict[str, Any]] = []
+    for r in rows:
+        members = _member_trace_ids(r.get("member_item_ids_json"))
+        if members is None:
+            return []  # unreadable membership: the whole section cannot be trusted
+        if not any(t in trace_ids for t in members):
+            continue
+        pid = str(r.get("pattern_id") or "")
+        lesson = str(r.get("lesson_text") or "").strip() if has_lesson else ""
+        title = (lesson or str(r.get("cluster_label") or ""))[:200]
+        try:
+            strength = float(r.get("strength_score") or 0.0)
+        except (TypeError, ValueError):
+            strength = 0.0
+        acts: list[dict[str, Any]] = []
+        if lesson:
+            do = S.cli("lessons", "promote", pid,
+                       confirm=f"Promote lesson {pid}? Future runs receive it.")
+            do["done"] = "Lesson promoted"
+            acts.append(S.btn("Promote", do, "primary"))
+        acts.append(_forget_action(pid))
+        items.append(S.item(title, f"{pid} · proposed · strength {strength:.0f}",
+                            m="✦", mc="purple", acts=acts))
+    if not items:
+        return []
+    return [S.lst(f"Proposed lessons · {len(items)}", items, full=True,
+                  note="Promote to give future runs this lesson; reject to stop proposing it.")]
+
+
 def _learnings_tab(run: Run) -> list[dict[str, Any]]:
     errors: dict[str, str] = {}
     # The Forget / Open-in-Learn buttons and the used/unused marking are IDE
@@ -2184,6 +2796,17 @@ def _learnings_tab(run: Run) -> list[dict[str, Any]]:
         # The ledger cannot tell → say so on the sections that list injected
         # lessons, and leave every row unmarked.
         usage_note = _USAGE_UNKNOWN if (level2 and usage is None) else ""
+
+        def toc(item: dict[str, Any]) -> None:
+            """A summary row, level 1 only.
+
+            On level 2 the sections below already carry the same counts, and
+            a table of contents that repeats every heading immediately above
+            the headings is noise. Level 1 keeps the list it always had.
+            """
+            if not level2:
+                items.append(item)
+
         # Prefer the INJECTED artifact. The planner writes context-pack.v2.json
         # and SUPPRESSES the v1 builder output, so rendering v1 showed a pack the
         # model never saw. v2 first; v1 only as a fallback for older runs.
@@ -2197,17 +2820,17 @@ def _learnings_tab(run: Run) -> list[dict[str, Any]]:
                 detail = [_lesson_item(f"{c.get('kind', '?')}: {str(c.get('text', ''))[:180]}",
                                        str(c.get("id", "")), usage, level2)
                           for c in cons if isinstance(c, dict)]
-                items.append(S.ok("Constraints", f"{len(cons)} injected"))
+                toc(S.ok("Constraints", f"{len(cons)} injected"))
                 sections.append(S.lst(f"Constraints (injected) · {len(cons)}", detail,
                                       full=True, note=usage_note))
             else:
-                items.append(S.dot("Constraints", "none injected"))
+                toc(S.dot("Constraints", "none injected"))
             themes = v2.get("themes") if isinstance(v2.get("themes"), list) else []
             if themes:
                 detail = [_lesson_item(str(t.get("text") or "")[:180], str(t.get("id") or ""),
                                        usage, level2)
                           for t in themes if isinstance(t, dict)]
-                items.append(S.ok("Verified lessons", f"{len(themes)} injected"))
+                toc(S.ok("Verified lessons", f"{len(themes)} injected"))
                 sections.append(S.lst(f"Verified lessons (injected) · {len(themes)}", detail,
                                       full=True, note=usage_note))
             contract = v2.get("contract") if isinstance(v2.get("contract"), dict) else {}
@@ -2216,16 +2839,16 @@ def _learnings_tab(run: Run) -> list[dict[str, Any]]:
                 detail = [S.item(str(f.get("file") or f.get("path") or "file"),
                                  str(f.get("finding") or f.get("summary") or "")[:160])
                           for f in ff if isinstance(f, dict)]
-                items.append(S.ok("File findings", f"{len(ff)} file(s)"))
+                toc(S.ok("File findings", f"{len(ff)} file(s)"))
                 sections.append(S.lst(f"File findings · {len(ff)}", detail, full=True))
             elif contract:
                 detail = _pack_kv_items(contract)
                 if detail:
-                    items.append(S.ok("Contract", f"{len(detail)} clause(s)"))
+                    toc(S.ok("Contract", f"{len(detail)} clause(s)"))
                     sections.append(S.lst("Contract (injected)", detail, full=True))
             pa = v2.get("prior_attempts") if isinstance(v2.get("prior_attempts"), list) else []
             if pa:
-                items.append(S.ok("Prior attempts", f"{len(pa)} attempt(s)"))
+                toc(S.ok("Prior attempts", f"{len(pa)} attempt(s)"))
         elif v1_path.is_file():
             items.append(S.ok("Context pack", "v1 builder output"))
             pack = _read_json_obj(v1_path)
@@ -2256,7 +2879,7 @@ def _learnings_tab(run: Run) -> list[dict[str, Any]]:
             items.append(S.dot("No context pack", "This run was not given a context pack."))
 
         if ledger:
-            items.append(S.ok("Per-node injection", f"{len(ledger)} node(s) recorded"))
+            toc(S.ok("Per-node injection", f"{len(ledger)} node(s) recorded"))
             sections.append(S.lst(f"Injected per node · {len(ledger)}", ledger, full=True))
 
         from mini_ork.web.db import db_for
@@ -2276,7 +2899,15 @@ def _learnings_tab(run: Run) -> list[dict[str, Any]]:
     # injected lessons lead, the written-back gradients follow. Level 1 keeps
     # the old order and the old titles byte for byte.
     if level2:
-        return (S.guarded(errors, "Injected into prompts", available)
+        # The proposed lessons sit before the injected sections: a lesson the
+        # operator can accept belongs ahead of the lessons already injected.
+        try:
+            proposed = _proposed_lessons(run)
+        except Exception as exc:  # noqa: BLE001 — one broken source, one lost section
+            errors["Proposed lessons"] = f"{type(exc).__name__}: {exc}"
+            proposed = []
+        return (proposed
+                + S.guarded(errors, "Injected into prompts", available)
                 + S.guarded(errors, "Written back", produced))
     return (S.guarded(errors, "Produced by the run", produced)
             + S.guarded(errors, "Available to the run", available))
@@ -2296,6 +2927,64 @@ _ARTIFACT_HEAD = ["file", "kind", "size", "from"]
 # toward it. Everything past the cap collapses into one final "+N more in the
 # run folder" row whose ``do`` reveals the run directory.
 _ARTIFACT_ROW_CAP = 200
+
+# The row-level ``kind`` is the file's extension, and this one rule feeds the
+# row key, the intra-table order and the count sub alike. It is deliberately
+# NOT the visible "kind" column: ``board_cmd._artifact_group`` fills that with a
+# semantic group (Diffs, Results, Logs…), and unifying the two would change the
+# column every level-1 table already draws.
+_ARTIFACT_KINDS = ("patch", "json", "log", "jsonl", "md", "other")
+_ARTIFACT_KIND_BY_SUFFIX = {
+    ".diff": "patch", ".patch": "patch",
+    ".json": "json", ".log": "log", ".jsonl": "jsonl", ".md": "md",
+}
+
+
+def _artifact_kind(name: str) -> str:
+    """The row-level kind, from the file name's extension.
+
+    A directory label ("evidence/") has no extension and is ``other`` — the
+    honest answer, since it is not one of the five file kinds.
+    """
+    return _ARTIFACT_KIND_BY_SUFFIX.get(Path(name.rstrip("/")).suffix.lower(), "other")
+
+
+def _artifact_kind_rank(name: str) -> int:
+    """Sort key for one bucket: ``patch → json → log → jsonl → md → other``.
+
+    Only the rank is returned, so Python's stable sort keeps the incoming
+    (``_artifacts`` path) order inside a kind.
+    """
+    return _ARTIFACT_KINDS.index(_artifact_kind(name))
+
+
+def _artifact_kind_sub(labels: list[str]) -> str:
+    """``2 json · 1 log · 1 patch`` for a table, or ``""`` when there is nothing
+    to summarise (fewer than two file rows).
+
+    Counts come from the same :func:`_artifact_kind` as the rows and the sort.
+    """
+    if len(labels) < 2:
+        return ""
+    counts = dict.fromkeys(_ARTIFACT_KINDS, 0)
+    for label in labels:
+        counts[_artifact_kind(label)] += 1
+    return " · ".join(f"{counts[kind]} {kind}"
+                      for kind in _ARTIFACT_KINDS if counts[kind])
+
+
+def _attach_row_kinds(section: dict[str, Any], labels: list[str]) -> dict[str, Any]:
+    """Re-attach the row-level ``kind`` after ``S.table`` rebuilt the rows.
+
+    ``spec.table`` keeps only ``cells``/``do``/``sel``/``acts`` on each row
+    (spec.py is out of scope here), so a ``kind`` set on the dict handed to it
+    is silently dropped. Attaching after the rebuild is what makes the key
+    reach the rendered page JSON. ``labels`` is parallel to the table's file
+    rows; the caller never passes a collapse or placeholder row.
+    """
+    for row, label in zip(section.get("rows") or [], labels):
+        row["kind"] = _artifact_kind(label)
+    return section
 
 # The kickoff's "Key artifacts" slots, in the order the tab must show them. The
 # diff is ONE slot whose first alternative wins; ``evidence`` is a directory.
@@ -2335,27 +3024,33 @@ def _key_artifacts(run: Run) -> list[tuple[str, Path]]:
 
 
 def _key_artifacts_section(run: Run) -> dict[str, Any]:
-    """The tab's first section: the handful of files a reviewer opens first."""
+    """The tab's first section: the handful of files a reviewer opens first.
+
+    Order and styling stay as they were; each file row additionally carries
+    the row-level ``kind`` (re-attached after ``S.table`` rebuilds the rows).
+    """
     from mini_ork.cli.board_cmd import _artifact_group
 
+    keys = _key_artifacts(run)
     rows: list[dict[str, Any]] = []
-    for label, path in _key_artifacts(run):
+    for label, path in keys:
         do = S.reveal(str(path)) if path.is_dir() else S.open_path(str(path))
         rows.append({"cells": [S.mono(label), S.cell(_artifact_group(label).lower()),
                                S.mono(_artifact_size(path)), S.muted("")],
-                     "do": do})
+                     "do": do, "kind": _artifact_kind(label)})
     if not rows:
         rows = [{"cells": [S.muted("No key artifacts yet"), "", "", ""]}]
-    return S.table("Key artifacts", _ARTIFACT_COLS, _ARTIFACT_HEAD, rows, full=True,
-                   note="The files a reviewer opens first — the diff, the verdicts, "
-                        "the rubric, the evidence and the run's log.")
+    section = S.table("Key artifacts", _ARTIFACT_COLS, _ARTIFACT_HEAD, rows, full=True,
+                      note="The files a reviewer opens first — the diff, the verdicts, "
+                           "the rubric, the evidence and the run's log.")
+    return _attach_row_kinds(section, [label for label, _ in keys])
 
 
 def _artifact_row(a: dict[str, Any], ids: set[str]) -> dict[str, Any]:
     """One file row, in the flat table's own columns."""
     return {"cells": [S.mono(a["path"]), S.cell(a["group"].lower()),
                       S.mono(_human(a["size"])), S.muted(_from(a["path"], ids))],
-            "do": S.open_path(a["abs"])}
+            "do": S.open_path(a["abs"]), "kind": _artifact_kind(a["path"])}
 
 
 def _artifact_file_sections(run: Run) -> list[dict[str, Any]]:
@@ -2363,34 +3058,53 @@ def _artifact_file_sections(run: Run) -> list[dict[str, Any]]:
 
     Attribution is the flat table's own :func:`_from` (``impl-<node>``,
     ``review-<node>``, …); a file that belongs to no node lands in "Run files".
+    Each bucket is ordered by the one :func:`_artifact_kind` rule, and a table
+    with two or more file rows gains a kind-count ``sub`` from the same rule.
+    Files the "Key artifacts" table already shows are skipped here.
     """
     from mini_ork.cli.board_cmd import _artifacts
 
     files = _artifacts(run.run_dir)
     ids = {n.id for n in run.nodes}
+    # A file already drawn in "Key artifacts" is not drawn again below: the
+    # reviewer's shortlist and the full listing are the same file list, and
+    # repeating the diff and the verdicts was most of the tab's length.
+    keys = _key_artifacts(run)
+    key_files = {label for label, _ in keys if not label.endswith("/")}
+    key_dirs = tuple(label for label, _ in keys if label.endswith("/"))
+    dropped = 0
     buckets: dict[str, list[dict[str, Any]]] = {n.id: [] for n in run.nodes}
     run_level: list[dict[str, Any]] = []
     for a in files:
+        if a["path"] in key_files or any(a["path"].startswith(d) for d in key_dirs):
+            dropped += 1
+            continue
         node = _from(a["path"], ids)
         (buckets[node] if node in buckets else run_level).append(a)
 
     # The key artifacts consume part of the row budget, so the tab as a whole
     # stays under the cap.
-    cap = max(0, _ARTIFACT_ROW_CAP - len(_key_artifacts(run)))
+    cap = max(0, _ARTIFACT_ROW_CAP - len(keys))
     ordered = [(f"From {n.id}", buckets[n.id]) for n in run.nodes if buckets[n.id]]
     ordered.append(("Run files", run_level))
 
-    rendered: list[tuple[str, list[dict[str, Any]]]] = []
+    rendered: list[dict[str, Any]] = []
     shown = 0
     for title, entries in ordered:
+        entries = sorted(entries, key=lambda a: _artifact_kind_rank(a["path"]))
         rows: list[dict[str, Any]] = []
+        labels: list[str] = []
         for a in entries:
             if shown >= cap:
                 break
             shown += 1
             rows.append(_artifact_row(a, ids))
+            labels.append(a["path"])
         if rows:
-            rendered.append((title, rows))
+            sub = _artifact_kind_sub(labels)
+            section = S.table(title, _ARTIFACT_COLS, _ARTIFACT_HEAD, rows, full=True,
+                              **({"sub": sub} if sub else {}))
+            rendered.append(_attach_row_kinds(section, labels))
 
     if not rendered:
         return [S.table("Run files", _ARTIFACT_COLS, _ARTIFACT_HEAD,
@@ -2399,15 +3113,14 @@ def _artifact_file_sections(run: Run) -> list[dict[str, Any]]:
 
     # Every file the cap left out is accounted for by this one row, which is
     # the last thing the tab draws.
-    collapsed = len(files) - shown
+    collapsed = len(files) - shown - dropped
     if collapsed > 0:
-        rendered[-1][1].append({
+        rendered[-1]["rows"].append({
             "cells": [S.mono(f"+{collapsed} more in the run folder"), S.muted(""),
                       S.muted(""), S.muted("")],
             "do": S.reveal(str(run.run_dir))})
 
-    return [S.table(title, _ARTIFACT_COLS, _ARTIFACT_HEAD, rows, full=True)
-            for title, rows in rendered]
+    return rendered
 
 
 def _artifacts_tab(run: Run, *, changes: bool = False) -> list[dict[str, Any]]:
@@ -2461,7 +3174,11 @@ def _artifacts_tab(run: Run, *, changes: bool = False) -> list[dict[str, Any]]:
 
 # ── helpers ─────────────────────────────────────────────────────────────────
 
-_FROM = re.compile(r"^(?:agent-|impl-|verifier_|review-|lens-)([A-Za-z0-9_.-]+?)(?:\.live)?\.(?:jsonl|log|json|md)$")
+# ``patch``/``diff`` are named too: a node's ``impl-<node>.patch`` is the file
+# that node produced, and the grouped tab has to file it under ``From <node>``
+# rather than leaving it in "Run files" — the same attribution rule as its
+# json/log/md siblings.
+_FROM = re.compile(r"^(?:agent-|impl-|verifier_|review-|lens-)([A-Za-z0-9_.-]+?)(?:\.live)?\.(?:jsonl|log|json|md|patch|diff)$")
 
 
 def _from(rel: str, node_ids: set[str]) -> str:
@@ -2810,11 +3527,168 @@ def _decisions_assumptions_section(run: Run) -> dict[str, Any] | None:
 # ── sections the two page families share ────────────────────────────────────
 
 
+# Patch artefacts a run can leave behind, most specific first. ``review-diff``
+# is the reviewer-facing full diff; the others are older names for the same
+# evidence. A run whose worktree was pruned keeps one of these on disk even
+# when the card's ``files`` list was never stamped, which is why the page
+# reads them before deciding a finished run changed nothing.
+_DIFF_PATCH_NAMES = ("review-diff.patch", "framework-edit.diff", "diff.patch", "changes.diff")
+_DIFF_FILE_HEADER = re.compile(r"^diff --git a/(.+?) b/(.+?)\s*$")
+
+
+def _patch_changed_files(run: Run) -> list[dict[str, Any]]:
+    """Per-file rows parsed from the run's recorded patch, ``[]`` when none.
+
+    ``diffstat.json`` carries only totals, so the patch is the one run-local
+    artefact that can still name the files after the worktree is gone. Counts
+    skip ``+++``/``---`` headers the same way ``git diff --numstat`` does.
+    """
+    from mini_ork.cli.board_cmd import _project_file
+
+    project = run.home.absolute().parent
+    for name in _DIFF_PATCH_NAMES:
+        path = run.run_dir / name
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        rows: dict[str, dict[str, Any]] = {}
+        current: dict[str, Any] | None = None
+        for line in lines:
+            header = _DIFF_FILE_HEADER.match(line)
+            if header:
+                current = rows.setdefault(header.group(2),
+                                          {"added": 0, "removed": 0})
+                continue
+            if current is None or line.startswith(("+++", "---")):
+                continue
+            if line.startswith("+"):
+                current["added"] += 1
+            elif line.startswith("-"):
+                current["removed"] += 1
+        if not rows:
+            continue
+        out = []
+        for rel, counts in rows.items():
+            display, absolute = _project_file(rel, project)
+            out.append({"path": display, "abs": absolute,
+                        "added": counts["added"], "removed": counts["removed"]})
+        return out
+    return []
+
+
 def _card_files(run: Run) -> list[dict[str, Any]]:
-    """The run card's changed-file rows — ``path``/``abs``/``added``/``removed``."""
+    """The run's changed-file rows — ``path``/``abs``/``added``/``removed``.
+
+    The card is the first source. A delivered run whose card carries no
+    ``files`` (the worktree was pruned before the card was stamped) falls back
+    to the recorded patch, so "no file changes recorded" is only said when
+    there is genuinely no evidence of a change.
+    """
     from mini_ork.cli.board_cmd import _card_fields
 
-    return list(_card_fields(run.card, run.home.absolute().parent).get("files") or [])
+    files = list(_card_fields(run.card, run.home.absolute().parent).get("files") or [])
+    if files:
+        return files
+    try:
+        return _patch_changed_files(run)
+    except Exception:  # noqa: BLE001 — a malformed patch costs the list, never the page
+        return []
+
+
+def _diff_totals(run: Run) -> tuple[int, int]:
+    """``(added, removed)`` for the run's change, from the file rows or diffstat."""
+    files = _card_files(run)
+    if files:
+        return (sum(int(f.get("added") or 0) for f in files),
+                sum(int(f.get("removed") or 0) for f in files))
+    try:
+        data = json.loads((run.run_dir / "diffstat.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0, 0
+    if not isinstance(data, dict):
+        return 0, 0
+    try:
+        return int(data.get("added") or 0), int(data.get("removed") or 0)
+    except (TypeError, ValueError):
+        return 0, 0
+
+
+def _diff_open_action(run: Run) -> dict[str, Any] | None:
+    """A button that opens the run's own diff, when one is on disk."""
+    for name in _DIFF_PATCH_NAMES:
+        path = run.run_dir / name
+        if path.is_file():
+            return S.btn("Open diff", S.open_path(str(path)))
+    return None
+
+
+def _landed_commit(run: Run) -> str:
+    """``<short sha> <subject>`` the publisher recorded, ``""`` when none.
+
+    A finished run that landed its change proves it here: the run folder keeps
+    the commit the publisher wrote, and without this row the page could not
+    tell a landed change from a discarded one.
+    """
+    try:
+        from mini_ork.ide_pages.node_changes import _fallback_recorded_commit
+
+        commits, _note = _fallback_recorded_commit(run)
+    except Exception:  # noqa: BLE001 — a missing commit costs its row, never the page
+        return ""
+    if not isinstance(commits, list) or not commits or not isinstance(commits[0], dict):
+        return ""
+    sha = str(commits[0].get("sha") or "")
+    subject = str(commits[0].get("subject") or "").strip()
+    if not sha:
+        return ""
+    return f"{sha[:12]} {subject}".strip()
+
+
+def _attempts_section(run: Run) -> list[dict[str, Any]]:
+    """Every dispatch of every node the retry loop had to re-run.
+
+    ``retry-exhausted/<node>.attempts.json`` is the attempt ledger — one entry
+    per dispatch, ``finish_reason`` and ``rc`` per entry. ``done`` with rc 0 is
+    a success (the file is named for the node's history, not its final state),
+    so the rows are classified per entry rather than per file. The ledger is
+    the only place a reader can see that an implementer took three tries; the
+    retry hint says where to continue, never how often it already tried.
+    """
+    ledger = run.run_dir / "retry-exhausted"
+    try:
+        paths = sorted(ledger.glob("*.attempts.json"))
+    except OSError:
+        return []
+    items: list[dict[str, Any]] = []
+    for path in paths:
+        node = path.name[:-len(".attempts.json")]
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        entries = data if isinstance(data, list) else [data]
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            finish = str(entry.get("finish_reason") or "")
+            rc = entry.get("rc")
+            passed = finish == "done" and rc in (0, "0", None)
+            when = _clock(int(entry["ts"])) if entry.get("ts") else ""
+            sub = " · ".join(x for x in
+                             (finish or "—",
+                              f"rc={rc}" if rc is not None else "",
+                              when) if x)
+            items.append(S.item(f"{node} · attempt {entry.get('attempt') or '?'}", sub,
+                                m="✓" if passed else "✗",
+                                mc="green" if passed else "red"))
+    if not items:
+        return []
+    return [S.lst(f"Attempts · {len(items)}", items, full=True,
+                  note="One row per dispatch of a node. A failed attempt stays "
+                       "listed after a later one succeeds.")]
 
 
 def why_section(run: Run, *, title: str = "Why — evidence") -> dict[str, Any]:
@@ -2829,11 +3703,13 @@ def why_section(run: Run, *, title: str = "Why — evidence") -> dict[str, Any]:
     change's to rewrite.
     """
     items = []
+    seen: set[str] = set()
     for path in sorted(run.run_dir.glob("verifier_*.json")):
         data = _json_obj(path)
         if data is None:
             continue
         name = str(data.get("verifier") or path.stem.removeprefix("verifier_"))
+        seen.add(name)
         rc = data.get("post_rc")
         rc_text = f" rc={rc}" if rc not in (None, "") else ""
         # The reason keys, in the order the engine's other failure readers try
@@ -2851,6 +3727,22 @@ def why_section(run: Run, *, title: str = "Why — evidence") -> dict[str, Any]:
             if evidence_path and Path(evidence_path).is_file() else []
         items.append(S.ok(f"{name} → PASS{rc_text}", sub, acts) if data.get("pass")
                      else S.bad(f"{name} → FAIL{rc_text}", sub, acts))
+    # Reviewers and lenses write ``review-<id>.json`` instead, so the verifier
+    # glob alone omitted half the panel: the DAG's Verifiers section counts
+    # them, and a page whose reason section disagreed with its own DAG read as
+    # two different outcomes for one run.
+    for node in run.nodes:
+        if node.id in seen:
+            continue
+        if not (node.type in _REVIEW_TYPES or "review" in node.id or "lens" in node.id):
+            continue
+        verdict, colour = _verdict(run, node)
+        if colour == "sub":
+            continue
+        reason = _node_reason(run, node)
+        sub = reason.splitlines()[0][:160] if reason else ""
+        label = f"{node.id} → {verdict.upper()}"
+        items.append(S.ok(label, sub) if colour == "green" else S.bad(label, sub))
     if not items:
         items = [S.dot("No verifiers have run",
                        "Zero verifiers would read vacuous, never success.")]
@@ -2993,26 +3885,170 @@ def _title_v2(run: Run) -> str:
     return run.id
 
 
-def _v2_tabs(run: Run, waiting: int) -> list[tuple[str, str]]:
-    """``V2_TABS`` with a count appended where the tab has one to give.
+def _open_question_count(run: Run) -> int:
+    """The number the header chip shows: open ``asks/ask-N.json`` files.
 
-    Empty sections now vanish from the page rather than rendering a card whose
-    only content is its own emptiness, so the count is where "there is nothing
-    here" is said — in the tab bar, against the tab it is about. A tab with a
-    count of zero keeps its plain label: "Agents · 0" would be noise on every
-    run that has not started.
+    Deliberately not a "decisions blocking this run" count. A parked run and a
+    run stopped on a retry gate each wait on the operator with no ask file
+    behind them, but the chip beside the tab counts ask files only, and two
+    numbers for the same thing — one in the header, one in the tab bar — read
+    as a bug. Those runs are signalled by tone instead (see :func:`_v2_tabs`),
+    never by an extra count here.
+    """
+    return len(open_asks(run.run_dir))
+
+
+def _retry_decision_pending(run: Run) -> bool:
+    """True when ``retry-gate.json`` points at an unresolved inbox row."""
+    if not (run.run_dir / "retry-gate.json").is_file():
+        return False
+    from mini_ork.recovery.retry_notify import pending_fix_for_run
+
+    return pending_fix_for_run(run.home, run.run_dir) is not None
+
+
+def _questions_badge(run: Run) -> tuple[int, str]:
+    """``(count, tone)`` for the DAG tab: the open asks and who is waiting.
+
+    ``count`` is exactly what the header chip counts, so the tab bar and the
+    chip beside it cannot disagree. A run that waits on the operator without
+    an ask file — parked for review, or stopped on an unresolved retry gate —
+    keeps the attention tone at count 0 rather than inventing a number the
+    chip does not show. Nothing waiting is the quiet ``sub``.
+    """
+    count = _open_question_count(run)
+    if count:
+        return count, "yellow"
+    try:
+        waiting = _is_parked_run(run) or _retry_decision_pending(run)
+    except Exception:  # noqa: BLE001 — an unreadable marker costs only the tone
+        waiting = False
+    return 0, "yellow" if waiting else "sub"
+
+
+_CHECK_STATE_WORD = {"PROVEN": "PROVEN", "UNVERIFIED": "UNVERIFIED",
+                     "REFUTED": "FAILED", "FAILED": "FAILED"}
+_CHECK_ROW_STATE = {"PROVEN": "pass", "UNVERIFIED": "pending", "FAILED": "fail"}
+# Plain words for each level, in the kickoff's own vocabulary. The Checks tab
+# exists because "target UNVERIFIED" is not a sentence: the row says what the
+# level means before it says whether the run met it.
+_CHECK_LEVEL_MEANINGS = {
+    "applies": "the change applies to the true base and touches only the files "
+               "the kickoff named",
+    "executes": "every changed file compiles and the change runs at the true base",
+    "target": "the failing test now passes at the true base",
+    "preserve": "the rest of the suite still passes at the true base",
+    "contract": "the kickoff's promised artifact exists and matches its contract",
+}
+# Node types whose failure is a check the operator should see on this tab.
+_CHECK_NODE_TYPES = _REVIEW_TYPES | {"verifier", "gate"}
+
+
+def _failed_check_count(run: Run) -> int:
+    """Levels the evidence refuted, plus failed verification nodes.
+
+    ``UNVERIFIED`` is not a failure — the run simply has not proven that level
+    — so it never turns the badge red. A reviewer/verifier node that actually
+    failed is a check that failed even when the level vector is silent about
+    it (``hr-smoke-d-191036``: the reviewer died, the vector only abstained).
+    """
+    report = O.verification_report(run) or {}
+    levels = report.get("levels") if isinstance(report.get("levels"), dict) else {}
+    failed = sum(1 for value in levels.values()
+                 if str(value or "").upper() in ("REFUTED", "FAILED"))
+    failed += sum(1 for node in run.nodes
+                  if node.state == "failed" and node.type in _CHECK_NODE_TYPES)
+    return failed
+
+
+def _proven_count(run: Run) -> int:
+    report = O.verification_report(run) or {}
+    levels = report.get("levels") if isinstance(report.get("levels"), dict) else {}
+    return sum(1 for value in levels.values() if str(value or "").upper() == "PROVEN")
+
+
+def _checks_badge(run: Run) -> tuple[str | int, str]:
+    """``(count, tone)`` for the Checks tab: failed first, else proven.
+
+    A failed level is the one thing the badge must shout about, so it wins over
+    the proven count. When nothing failed the proven count is the useful
+    number; when the run has no vector at all the badge is quiet (``0 · sub``).
+    """
+    try:
+        failed = _failed_check_count(run)
+        if failed:
+            return f"{failed} ✗", "red"
+        proven = _proven_count(run)
+        if proven:
+            return proven, "green"
+    except Exception:  # noqa: BLE001 — a broken vector costs the badge, never the page
+        return 0, "sub"
+    return 0, "sub"
+
+
+def _learnings_count(run: Run) -> int:
+    """How many lessons this run wrote back (gradients + learning rows)."""
+    try:
+        from mini_ork.web.db import db_for
+
+        db = db_for(run.home)
+        n = 0
+        if db.has_table("gradient_records") and db.has_table("execution_traces"):
+            row = db.row("SELECT COUNT(*) AS n FROM gradient_records g "
+                         "JOIN execution_traces t ON t.trace_id = g.evidence "
+                         "WHERE t.run_id = ?", (run.id,)) or {}
+            n += int(row.get("n") or 0)
+        if db.has_table("learning_record"):
+            row = db.row("SELECT COUNT(*) AS n FROM learning_record WHERE run_id = ?",
+                         (run.id,)) or {}
+            n += int(row.get("n") or 0)
+        return n
+    except Exception:  # noqa: BLE001 — an unreadable ledger costs its badge
+        return 0
+
+
+def _v2_tabs(run: Run) -> list[dict[str, Any]]:
+    """``V2_TABS`` with a ``count``/``tone`` badge where the tab has one.
+
+    Labels stay the plain tab name (``Checks``, not ``Checks · 1``): the badge
+    is its own field (CONTRACT v2.1), so the IDE draws it and an older reader
+    still sees the same label. A tab whose content would be empty carries
+    ``count: 0`` — the quiet state — rather than dropping out of the bar.
     """
     from mini_ork.cli.board_cmd import _artifacts
 
-    counts = {
+    try:
+        # ``asks/`` holds conversation, not run output; counting it here would
+        # put the same number on two tabs and read as a second, phantom build.
+        # Live transcripts (``*.live.jsonl``) are streamed while a node runs and
+        # would inflate the badge by one per in-flight node.
+        artifacts = sum(1 for a in _artifacts(run.run_dir)
+                        if not str(a.get("path") or "").startswith("asks/")
+                        and not str(a.get("path") or "").endswith(".live.jsonl"))
+    except Exception:  # noqa: BLE001
+        artifacts = 0
+    checks_count, checks_tone = _checks_badge(run)
+    badges: dict[str, tuple[str | int, str]] = {
         # The questions tab folded into the DAG; its count rides here so a
-        # stopped run still advertises itself from the tab bar.
-        "dag": waiting,
-        "agents": len(run.nodes),
-        "artifacts": len(_artifacts(run.run_dir)),
+        # stopped run still advertises itself from the tab bar. The header chip
+        # counts ask files only; the badge also counts the review/retry
+        # decisions that block a run with no ask file.
+        # Count is ask files only, matching the header chip. A parked run or an
+        # open retry decision is still waiting on the operator, so it keeps the
+        # attention tone even at count 0; a run with nothing waiting is quiet.
+        "dag": _questions_badge(run),
+        "checks": (checks_count, checks_tone),
+        "agents": (len(run.nodes), "sub"),
+        "learnings": (_learnings_count(run), "sub"),
+        "artifacts": (artifacts, "sub"),
     }
-    return [(key, f"{label} · {counts[key]}" if counts.get(key) else label)
-            for key, label in V2_TABS]
+    out: list[dict[str, Any]] = []
+    for key, label in V2_TABS:
+        entry: dict[str, Any] = {"key": key, "label": label}
+        if key in badges:
+            entry["count"], entry["tone"] = badges[key]
+        out.append(entry)
+    return out
 
 
 def _sub_v2(run: Run) -> str:
@@ -3022,6 +4058,28 @@ def _sub_v2(run: Run) -> str:
         parts.append(f"branch {branch}")
     parts.append(run.id)
     return " · ".join(p for p in parts if p)
+
+
+def _sub_worktree(sub: str, run: Run) -> str:
+    """Append `` · worktree <relpath>`` when the run has a workspace.
+
+    The v2 sub lost the worktree path the legacy ``_sub`` still draws, so a
+    reader could not tell where the change was written. Appended, never
+    substituted: the recipe / title / branch / id already on the line stay in
+    their order. The path is shown relative to the project root (home's
+    parent), the same rule ``_sub`` uses.
+    """
+    ws = run.workspace
+    if ws is None:
+        return sub
+    try:
+        shown = str(Path(ws.path).relative_to(run.home.absolute().parent))
+    except ValueError:
+        shown = str(ws.path)
+    except Exception:  # noqa: BLE001 — a broken workspace costs its segment
+        return sub
+    segment = f"worktree {shown}"
+    return f"{sub} · {segment}" if sub else segment
 
 
 def _read_run_json(run: Run, name: str) -> dict[str, Any]:
@@ -3107,20 +4165,22 @@ def _desc_headline(run: Run, node: Node) -> str:
 
 
 def _desc_outcome(run: Run, outcome: dict[str, Any] | None = None) -> str:
-    """What *happened*: the run's own outcome sentence, then the counts.
+    """What *happened*: the run's own outcome sentence, and nothing else.
 
     The lead is ``outcome.resolve(run)["text"]`` — the exact sentence the
     Story tab's triage box shows — so the header and the page cannot disagree
     about what became of the run. Only when that sentence is generic (it does
     not name the deciding node) is the node's own headline added; otherwise it
     would be the same news twice.
+
+    The counts (nodes, cost, elapsed) deliberately stay out: the triage counts
+    sit under the verdict on the page and the header chips already carry the
+    same numbers. Repeating them in the description made the header restate
+    the page instead of introducing it.
     """
     nodes = run.nodes
-    total = len(nodes)
-    if not total:
+    if not nodes:
         return ""
-    done = sum(1 for n in nodes if n.state == "done")
-    skipped = sum(1 for n in nodes if n.state == "skipped")
     failed = [n for n in nodes if n.state == "failed"]
     working = [n for n in nodes if n.state == "running"]
 
@@ -3132,16 +4192,7 @@ def _desc_outcome(run: Run, outcome: dict[str, Any] | None = None) -> str:
         detail = _desc_headline(run, failed[0])
         if detail:
             lead = f"{lead}: {detail}" if lead else detail
-
-    parts = [f"{done}/{total} nodes done"]
-    if skipped:
-        # "not run" is the word the rest of the page uses for this state.
-        parts.append(f"{skipped} not run")
-    if failed:
-        parts.append(f"{len(failed)} failed")
-    parts += [S.money(_cost(run)), _elapsed(run)]
-    counts = " · ".join(parts) + "."
-    return f"{lead}. {counts}" if lead else counts
+    return f"{lead}." if lead else ""
 
 
 def _desc_wrap(text: str, width: int = _DESC_LINE_CHARS, lines: int = _DESC_LINES) -> str:
@@ -3194,8 +4245,340 @@ def _desc_fold(run: Run, outcome: dict[str, Any] | None = None, title: str = "")
     return _desc_wrap(" ".join(p for p in (intent, rest) if p))
 
 
+# ── success criteria: what the run proved, criterion by criterion ────────────
+#
+# The hero lists the kickoff's criteria as prose and the Checks tab lists the
+# levels, but nothing joined them: a green level never said *which* criterion it
+# proved. This checklist joins them — one row per criterion, decided by the
+# verdict's own criterion entries, then a failed check, then a PROVEN level's
+# evidence, in that order and stopping at the first source that names the
+# criterion. A run that merely finished decides nothing.
+
+# The hero caps its list at 8; both readers must agree on what the run promised.
+_CRITERIA_CAP = 8
+_CRITERIA_WHY_LIMIT = 120
+_CRITERIA_EVIDENCE_READ = 200_000
+# Four-plus-char function words a substring test would otherwise match on —
+# "without" in one criterion must not decide an unrelated check that also says
+# "without". Content words ("lint", "suite", "dependencies") stay matchable.
+_CRITERIA_STOPWORDS = frozenset({
+    "the", "and", "but", "for", "with", "without", "from", "into", "onto",
+    "over", "under", "this", "that", "these", "those", "there", "their",
+    "them", "they", "when", "what", "which", "while", "your", "yours",
+    "have", "has", "had", "been", "being", "were", "was", "are", "does",
+    "did", "doing", "each", "every", "than", "then", "also", "only", "must",
+    "should", "will", "shall", "would", "could", "stays", "still", "same",
+    "more", "most", "such", "some", "other", "otherwise", "after", "before",
+})
+_CRITERIA_MET_WORDS = frozenset({"met", "pass", "passed", "ok", "done", "true",
+                                 "yes", "green"})
+_CRITERIA_UNMET_WORDS = frozenset({"unmet", "fail", "failed", "error", "false",
+                                   "no", "red"})
+_CRITERIA_CHECK_FAIL_WORDS = frozenset({"fail", "failed", "error", "unmet"})
+
+
+def _criteria_words(text: Any) -> list[str]:
+    """Key words of ``text``: alphanumeric runs of 4+ chars, function words out."""
+    return [w for w in re.findall(r"[a-z0-9]+", str(text or "").casefold())
+            if len(w) >= 4 and w not in _CRITERIA_STOPWORDS]
+
+
+def _criterion_named(criterion: str, text: Any) -> bool:
+    """True when ``text`` names ``criterion`` through one of its key words.
+
+    A case-folded substring test on 4+ char words is the fallback the kickoff
+    prescribes when the codebase has no token normaliser of its own.
+    """
+    haystack = str(text or "").casefold()
+    return any(word in haystack for word in _criteria_words(criterion))
+
+
+def _criteria_read(path: Path) -> str:
+    """A file's text for criterion matching, empty when it cannot be read."""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")[:_CRITERIA_EVIDENCE_READ]
+    except OSError:
+        return ""
+
+
+def _criteria_path_action(run: Run, candidates: Iterable[Any]) -> dict[str, Any] | None:
+    """``S.open_path`` for the first candidate that is a real file, else ``None``.
+
+    ``candidates`` carry paths as the verdict wrote them; both absolute and
+    run-relative forms resolve through ``run.run_dir``. A link to a file that
+    does not exist is worse than no link, so only ``is_file`` earns one.
+    """
+    for value in candidates:
+        if not isinstance(value, str) or not value.strip():
+            continue
+        path = run.run_dir / value
+        try:
+            if path.is_file():
+                return S.open_path(str(path))
+        except OSError:
+            continue
+    return None
+
+
+def _criteria_envelopes(run: Run) -> list[tuple[Path, dict[str, Any]]]:
+    """Every readable ``verifier_*.json`` envelope, sorted by name."""
+    out: list[tuple[Path, dict[str, Any]]] = []
+    try:
+        paths = sorted(run.run_dir.glob("verifier_*.json"))
+    except OSError:
+        return out
+    for path in paths:
+        data = _json_obj(path)
+        if isinstance(data, dict):
+            out.append((path, data))
+    return out
+
+
+def _criteria_verdict_entries(run: Run) -> list[tuple[Path, dict[str, Any]]]:
+    """Criterion entries from the run's verdict files, in decision order.
+
+    ``run-verdict.json`` comes first (the executor's own report), then
+    ``framework-edit.verdict.json``. Both ``criteria`` and ``criteria_results``
+    shapes are read. A malformed file is simply absent — never fake evidence.
+    """
+    out: list[tuple[Path, dict[str, Any]]] = []
+    for name in ("run-verdict.json", "framework-edit.verdict.json"):
+        path = run.run_dir / name
+        data = _json_obj(path)
+        if not isinstance(data, dict):
+            continue
+        for key in ("criteria", "criteria_results"):
+            entries = data.get(key)
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if isinstance(entry, dict):
+                    out.append((path, entry))
+    return out
+
+
+def _criteria_state_word(value: Any) -> str:
+    if isinstance(value, bool):
+        return "met" if value else "unmet"
+    word = str(value or "").strip().casefold()
+    if word in _CRITERIA_MET_WORDS:
+        return "met"
+    if word in _CRITERIA_UNMET_WORDS:
+        return "unmet"
+    return "unknown"
+
+
+def _criteria_verdict_state(entry: dict[str, Any]) -> str:
+    """A verdict entry's decision, tolerating ``met`` / ``state`` / ``status``."""
+    for key in ("met", "state", "status", "verdict", "result"):
+        if key not in entry:
+            continue
+        state = _criteria_state_word(entry.get(key))
+        if state != "unknown":
+            return state
+    return "unknown"
+
+
+def _criteria_from_verdict(run: Run, entries: list[tuple[Path, dict[str, Any]]],
+                           criterion: str) -> dict[str, Any] | None:
+    """The first verdict entry naming ``criterion``, or ``None``."""
+    wanted = " ".join(criterion.split()).casefold()
+    for path, entry in entries:
+        raw = entry.get("criterion")
+        if raw is None:
+            raw = entry.get("c")
+        if not isinstance(raw, str):
+            continue
+        if " ".join(raw.split()).casefold() != wanted:
+            continue
+        state = _criteria_verdict_state(entry)
+        evidence: list[Any] = []
+        for key in ("evidence", "evidence_path", "path", "file", "artifact"):
+            value = entry.get(key)
+            if isinstance(value, str):
+                evidence.append(value)
+            elif isinstance(value, list):
+                evidence.extend(v for v in value if isinstance(v, str))
+        do = _criteria_path_action(run, evidence) or S.open_path(str(path))
+        name = Path(str((do or {}).get("path") or "")).name
+        if state == "met":
+            why = f"Run verdict marks this met — {name}." if name else \
+                "The run verdict marks this met."
+        elif state == "unmet":
+            why = f"Run verdict marks this unmet — {name}." if name else \
+                "The run verdict marks this unmet."
+        else:
+            why = "The run verdict records no decision for this criterion."
+        return {"c": criterion, "state": state,
+                "why": _clip(why, _CRITERIA_WHY_LIMIT), "do": do}
+    return None
+
+
+def _criteria_failed_checks(envelopes: list[tuple[Path, dict[str, Any]]]
+                            ) -> list[tuple[str, str, str]]:
+    """``(name, matched text, target)`` for every failed check/probe.
+
+    The matched text is the check's own title / command / detail — never the
+    whole envelope, so a passing sibling cannot lend it words it did not use.
+    """
+    out: list[tuple[str, str, str]] = []
+    for path, envelope in envelopes:
+        evidence = str(envelope.get("evidence_path") or "")
+        target = evidence if evidence and Path(evidence).is_file() else str(path)
+        found = False
+        for key in ("checks", "probes"):
+            items = envelope.get(key)
+            if not isinstance(items, list):
+                continue
+            for check in items:
+                if not isinstance(check, dict):
+                    continue
+                word = str(check.get("state") or check.get("status") or "").casefold()
+                if check.get("pass") is not False and word not in _CRITERIA_CHECK_FAIL_WORDS:
+                    continue
+                found = True
+                name = str(check.get("name") or check.get("title")
+                           or check.get("command") or check.get("probe") or "check")
+                text = " ".join(str(check.get(k) or "") for k in
+                                ("name", "title", "command", "probe", "detail",
+                                 "expected", "actual"))
+                out.append((name, text, target))
+        if not found and envelope.get("pass") is False:
+            # A verifier that failed before emitting per-check rows still states
+            # its case in its own summary; it decides only what it names.
+            name = str(envelope.get("verifier") or path.stem.removeprefix("verifier_"))
+            text = " ".join(str(envelope.get(k) or "") for k in
+                            ("verifier", "error_summary", "reason", "detail"))
+            out.append((name, text, target))
+    return out
+
+
+def _criteria_proven_levels(run: Run, envelopes: list[tuple[Path, dict[str, Any]]]
+                            ) -> list[tuple[str, str, str]]:
+    """``(level, reason, evidence text)`` for every PROVEN level in the report."""
+    try:
+        report = O.verification_report(run) or {}
+    except Exception:  # noqa: BLE001 — a broken verdict costs this source
+        return []
+    levels = report.get("levels") if isinstance(report.get("levels"), dict) else {}
+    reasons = report.get("levels_reasons") if isinstance(report.get("levels_reasons"), dict) else {}
+    out: list[tuple[str, str, str]] = []
+    for level, value in levels.items():
+        if str(value or "").strip().upper() != "PROVEN":
+            continue
+        reason = str(reasons.get(level) or "")
+        texts = [reason]
+        # The reason names the file that decided the level (``verifier_test.json:
+        # …``); its text is the evidence the criterion is matched against.
+        for name in re.findall(r"[A-Za-z0-9_.-]+\.(?:json|log|md|txt|patch)", reason):
+            texts.append(_criteria_read(run.run_dir / name))
+        for path, envelope in envelopes:
+            names = (path.name, str(envelope.get("verifier") or ""))
+            if not any(n and n in reason for n in names):
+                continue
+            texts.append(_criteria_read(Path(str(envelope.get("evidence_path") or ""))))
+        out.append((str(level), reason, "\n".join(t for t in texts if t)))
+    return out
+
+
+def _criteria_row(run: Run, criterion: str,
+                  verdict_entries: list[tuple[Path, dict[str, Any]]],
+                  failed_checks: list[tuple[str, str, str]],
+                  proven_levels: list[tuple[str, str, str]],
+                  envelopes: list[tuple[Path, dict[str, Any]]]) -> dict[str, Any]:
+    """One criterion's row, decided in the kickoff's source order."""
+    row = _criteria_from_verdict(run, verdict_entries, criterion)
+    if row is not None:
+        return row
+    for name, text, target in failed_checks:
+        if _criterion_named(criterion, text):
+            return {"c": criterion, "state": "unmet",
+                    "why": _clip(f"Check '{name}' failed.", _CRITERIA_WHY_LIMIT),
+                    "do": S.open_path(target)}
+    for level, reason, text in proven_levels:
+        if _criterion_named(criterion, text):
+            why = (f"Level {level} is PROVEN: {reason}." if reason
+                   else f"Level {level} is PROVEN.")
+            return {"c": criterion, "state": "met",
+                    "why": _clip(why, _CRITERIA_WHY_LIMIT),
+                    "do": _checks_evidence_action(run, level, reason, envelopes)
+                          or S.page_link("run", "checks", run=run.id)}
+    return {"c": criterion, "state": "unknown",
+            "why": "No check names this criterion.", "do": None}
+
+
+def _criteria_checklist(run: Run, outcome: dict[str, Any]) -> list[dict[str, Any]]:
+    """One row per kickoff success criterion: ``met`` / ``unmet`` / ``unknown``.
+
+    The list is the hero's — ``run_profile.json``'s ``success_criteria``, capped
+    the same way — so the two never disagree about what the run promised. Every
+    source is read fail-soft: a missing or malformed verdict costs ``unknown``
+    rows, never the section or the page. The rows are also stamped on
+    ``outcome["criteria"]`` so the IDE can draw them without parsing sections;
+    a run with no criteria gets no key.
+    """
+    try:
+        raw = _run_profile(run).get("success_criteria")
+    except Exception:  # noqa: BLE001 — an unreadable profile costs the checklist
+        return []
+    criteria = [str(c) for c in raw] if isinstance(raw, list) else []
+    criteria = criteria[:_CRITERIA_CAP]
+    if not criteria:
+        return []
+    try:
+        verdict_entries = _criteria_verdict_entries(run)
+    except Exception:  # noqa: BLE001 — one unreadable verdict costs its entries
+        verdict_entries = []
+    envelopes = _criteria_envelopes(run)
+    try:
+        failed_checks = _criteria_failed_checks(envelopes)
+    except Exception:  # noqa: BLE001
+        failed_checks = []
+    try:
+        proven_levels = _criteria_proven_levels(run, envelopes)
+    except Exception:  # noqa: BLE001
+        proven_levels = []
+    rows = [_criteria_row(run, criterion, verdict_entries, failed_checks,
+                          proven_levels, envelopes)
+            for criterion in criteria]
+    try:
+        outcome["criteria"] = rows
+    except (TypeError, AttributeError):
+        pass
+    return rows
+
+
+_CRITERIA_COLS = [S.col(90), S.col(fr=2, min=220), S.col(fr=3, min=260)]
+_CRITERIA_TONE = {"met": "green", "unmet": "red"}
+
+
+def _criteria_section(run: Run, outcome: dict[str, Any]) -> list[dict[str, Any]]:
+    """The checklist as one table section; empty when the run has no criteria."""
+    rows = _criteria_checklist(run, outcome)
+    if not rows:
+        return []
+    table_rows = []
+    for row in rows:
+        state = str(row["state"])
+        table_rows.append({
+            "cells": [S.cell(state.upper(), _CRITERIA_TONE.get(state, "sub"), b=True),
+                      S.cell(row["c"]),
+                      S.cell(row["why"], "sub")],
+            "do": row.get("do"),
+        })
+    met = sum(1 for row in rows if row["state"] == "met")
+    unmet = sum(1 for row in rows if row["state"] == "unmet")
+    return [S.table(
+        "Did it meet the criteria", _CRITERIA_COLS, ["", "Criterion", "Why"],
+        table_rows, full=True,
+        sub=f"{met} met · {unmet} unmet · {len(rows) - met - unmet} unknown",
+        note="A criterion is met only when the verdict or a PROVEN level "
+             "names it and its evidence.")]
+
+
 def _outcome_tab(run: Run, outcome: dict[str, Any],
-                 callout_actions: Iterable[dict[str, Any]] | None = None
+                 callout_actions: Iterable[dict[str, Any]] | None = None,
+                 absorbed: set[str] | tuple[str, ...] = ()
                  ) -> list[dict[str, Any]]:
     """The v2 outcome: what happened, what it was for, what it ran on.
 
@@ -3209,10 +4592,33 @@ def _outcome_tab(run: Run, outcome: dict[str, Any],
     ``callout_actions`` is the outcome's own buttons minus the ones the header
     draws, so the verdict carries the design's ``bodyActs`` without repeating
     a control the header already offers.
+
+    ``absorbed`` names the callouts the needs-you lane already carries (the
+    retry decision, when the lane owns it): they are dropped here so one
+    decision has one block on the tab.
     """
-    sections = [S.triage(outcome["text"], tone=outcome["tone"], icon=outcome["icon"],
-                         detail=outcome["detail"], counts=outcome["counts"],
-                         actions=list(callout_actions or ()), menu=[])]
+    triage = S.triage(outcome["text"], tone=outcome["tone"], icon=outcome["icon"],
+                      detail=outcome["detail"], counts=outcome["counts"],
+                      actions=list(callout_actions or ()), menu=[])
+    # The node and reason the triage names, when there is one. ``spec.triage``
+    # has no keyword for them, so they are attached additively here — an IDE
+    # that does not know the keys ignores them, and a run with no failed or
+    # blocked node omits both rather than guessing.
+    if str(outcome.get("node") or "").strip():
+        triage["node"] = str(outcome["node"]).strip()
+    if str(outcome.get("reason") or "").strip():
+        triage["reason"] = str(outcome["reason"]).strip()
+    sections = [triage]
+    # The Spend section sits directly under the outcome summary: the verdict
+    # says what happened, this says what it cost against its caps. One shared
+    # builder with the Checks tab so the two sections are always equal.
+    sections.append(_spend_section(run))
+    dropped = set(absorbed or ())
+    # The criteria checklist, directly under the verdict: the triage states what
+    # happened, this states which of the run's promises the evidence actually
+    # proves. Additive — every existing section keeps its place below it.
+    sections.extend(S.guarded({}, "Did it meet the criteria",
+                              lambda: _criteria_section(run, outcome)))
     # The reason, directly under the verdict it explains. The Overview tab has
     # always carried this list; the story tab had no path to it at all, so a
     # failure was stated and never explained.
@@ -3229,14 +4635,12 @@ def _outcome_tab(run: Run, outcome: dict[str, Any],
             and (goal.casefold() == title or len(title) >= 80):
         goal = ""
     files = _card_files(run)
-    added = sum(int(f.get("added") or 0) for f in files)
-    removed = sum(int(f.get("removed") or 0) for f in files)
-    done = sum(1 for n in run.nodes if n.state == "done")
-    cells = [(f"{done}/{len(run.nodes)}", "nodes done",
-              "green" if run.nodes and done == len(run.nodes) else "text"),
-             (S.money(_cost(run)), "cost"),
-             (_elapsed(run), "wall time")]
-    if files:
+    added, removed = _diff_totals(run)
+    # Progress, cost and elapsed are the header chips' job — they stay visible
+    # on every tab. The hero answers what this run is *for*, so its cells carry
+    # the one fact the chips do not: how much code moved.
+    cells = []
+    if files or added or removed:
         cells.append((f"+{added} −{removed}", "lines changed", "blue"))
     if goal or criteria or cells:
         sections.append(S.hero("What this run is for", goal=goal,
@@ -3254,6 +4658,7 @@ def _outcome_tab(run: Run, outcome: dict[str, Any],
         _, kickoff_file = _resolve_kickoff(run)
         kickoff = Path(kickoff_file).name if kickoff_file else ""
         risk = str(profile.get("risk_tolerance") or "")
+        commit = _landed_commit(run)
         environment = ("remote · " + str(profile.get("environment") or "")) \
             if str(profile.get("placement") or "").lower() == "remote" else "local"
         items = [
@@ -3261,6 +4666,7 @@ def _outcome_tab(run: Run, outcome: dict[str, Any],
             ("Task class", task_class or "—"),
             ("Worktree", worktree or "—"),
             ("Branch", branch or "—"),
+            ("Commit", commit or "—"),
             ("Started", _clock(started) if started else "—"),
             ("Kickoff", kickoff or "—"),
             ("Risk", risk or "—"),
@@ -3288,30 +4694,244 @@ def _outcome_tab(run: Run, outcome: dict[str, Any],
     # ``Seen before`` rides the failed card's callouts. It is prior art on the
     # same failure, so it belongs with the decision material below the narrative
     # — not wedged between the verdict and the reason that explains it.
-    sections.extend(outcome.get("callouts") or [])
+    sections.extend(c for c in outcome.get("callouts") or []
+                    if str(c.get("title") or "") not in dropped)
     sections.extend(S.guarded({}, "Diagnostics", lambda: diagnostics_sections(run)))
-    # Steering moved to the Orchestrator tab, beside the queue the message
-    # lands in and the watcher that may have nudged the same node. The pointer
-    # keeps the verb discoverable from the page a reader arrives on.
+    # A live run can still be steered: the box runs ``mini-ork board steer
+    # <run> --text <typed>``. Finished runs get no composer — there is nothing
+    # left to steer. ``_running`` is the page's own running test (the one the
+    # live chip and ``_actions`` use), so the composer cannot appear on a run
+    # the header already calls done.
     if _running(run):
-        sections.append(S.lst("Steering", [S.dot(
-            "Steer this run from the Orchestrator tab",
-            "The composer, the queue the next node reads, and the watcher's "
-            "own nudges are one page — this one is the run's story.",
-            mc="sub",
-            acts=[S.btn("Open Orchestrator",
-                        S.page_link("run", "orchestrator", run=run.id), "ghost")])],
-            full=True))
-    # The Overview tab's remaining sections — retry hints, run inputs, the
-    # orchestrator log, correlation, recent events, changed files. Evidence and
-    # the decision atoms are already above under their own headings, so they
-    # are skipped here by title rather than shown twice.
+        sections.append(S.composer(
+            "Tell the running agent what to change… (Enter to send)",
+            ["board", "steer", run.id, "--text"],
+            title="Steer this run"))
+    # The Overview tab's tail is not this page's tail. The orchestrator has its
+    # own tab, correlation and recent events are diagnostics, the file list
+    # lives on Artifacts, and the memory sections are already above. What is
+    # genuinely outcome-only is the retry decision and what the run knew going
+    # in; the attempt ledger explains a failure the retry hint is about.
     already = {str(section.get("title") or "") for section in sections}
-    already |= {"Why? — evidence", "Decisions and assumptions"}
+    keep = {"Retry", "Run inputs"}
     sections.extend(section for section in _overview_tab(run)
-                    if str(section.get("title") or "") not in already)
+                    if str(section.get("title") or "") in keep
+                    and str(section.get("title") or "") not in already)
+    sections.extend(_attempts_section(run))
     return sections
 
+
+def _verification_tab(run: Run) -> list[dict[str, Any]]:
+    """The run's verification in full — the five-level vector and every check.
+
+    The vector is shipped as data (:func:`spec.levels`): value, whether the
+    task class required it, and why it abstained. Which levels to foreground,
+    and how an abstention that could not fail the run should read, is the
+    renderer's call — the engine does not decide that here.
+    """
+    report = O.verification_report(run) or {}
+    level_values = report.get("levels") if isinstance(report.get("levels"), dict) else {}
+    reasons = report.get("levels_reasons") if isinstance(report.get("levels_reasons"), dict) else {}
+    stamped = report.get("levels_required")
+    stamped_required = ([str(name) for name in stamped]
+                        if isinstance(stamped, list) else None)
+    profile = _run_profile(run)
+    task_class = str(profile.get("task_class") or run.row.get("task_class") or "")
+    decision = str(report.get("levels_decision") or "")
+    sections: list[dict[str, Any]] = []
+
+    if not level_values:
+        sections.append(S.callout(
+            "No verification report for this run",
+            "The executor stamps the five-level vector when it writes the run's "
+            "verdict; this run has neither `run-verdict.json` levels nor a stamped "
+            "`verdict.json`. The verifier checks below are the run's own evidence.",
+            tone="muted"))
+    else:
+        rows = []
+        for name in O.LEVELS:
+            rows.append(S.level_row(
+                name, str(level_values.get(name) or "—"),
+                required=(name in stamped_required) if stamped_required is not None else None,
+                reason=str(reasons.get(name) or "")))
+        sections.append(S.levels("Levels", rows, decision=decision,
+                                 task_class=task_class, full=True))
+
+    # One section per verifier envelope: the same files the ``checks n/m``
+    # count reads, with each check's own verdict rather than only the roll-up.
+    for path in sorted(run.run_dir.glob("verifier_*.json")):
+        envelope = _json_obj(path)
+        if not isinstance(envelope, dict):
+            continue
+        name = str(envelope.get("verifier") or path.stem.removeprefix("verifier_"))
+        checks = envelope.get("checks")
+        rows = []
+        if isinstance(checks, list):
+            for check in checks:
+                if not isinstance(check, dict):
+                    continue
+                check_passed = bool(check.get("pass"))
+                detail = str(check.get("expected") or "").strip()
+                if not check_passed:
+                    detail = " · ".join(part for part in
+                                        (detail, str(check.get("actual") or "").strip()) if part)
+                rows.append(S.check_row(str(check.get("name") or "check"),
+                                        "pass" if check_passed else "fail",
+                                        detail=detail))
+        evidence = str(envelope.get("evidence_path") or "")
+        actions = ([S.btn("Open evidence", S.open_path(evidence), "ghost")]
+                   if evidence and Path(evidence).is_file() else [])
+        passed = bool(envelope.get("pass"))
+        title = f"{name} · {'pass' if passed else 'FAIL'}"
+        if rows:
+            sections.append(S.checks(
+                title, rows, full=True, actions=actions,
+                sub=f"{sum(1 for row in rows if row['state'] == 'pass')}/{len(rows)} checks"))
+        else:
+            item = S.ok(title) if passed else S.bad(title)
+            sections.append(S.lst(name, [item], full=True, actions=actions))
+    return sections
+
+
+def _checks_evidence_action(run: Run, level: str, reason: str,
+                            envelopes: list[tuple[Path, dict[str, Any]]]
+                            ) -> dict[str, Any] | None:
+    """The click-through that decided ``level``, when one exists.
+
+    Two sources, in order of directness: the file the level's own reason names
+    (``verifier_test.json: …``), then a verifier envelope whose name or checks
+    talk about this level. A level with no decidable evidence gets no action —
+    a dead "Open evidence" button would be worse than none.
+    """
+    for name in re.findall(r"[A-Za-z0-9_.-]+\.(?:json|log|md|txt|patch)", reason or ""):
+        path = run.run_dir / name
+        try:
+            if path.is_file():
+                return S.open_path(str(path))
+        except OSError:
+            continue
+    pattern = re.compile(rf"\b{re.escape(level)}\b", re.I)
+    for path, envelope in envelopes:
+        try:
+            checks = envelope.get("checks")
+            words = [str(envelope.get("verifier") or ""), str(envelope.get("error_summary") or "")]
+            if isinstance(checks, list):
+                for check in checks:
+                    if isinstance(check, dict):
+                        words.extend(str(check.get(key) or "")
+                                     for key in ("name", "detail", "expected", "actual"))
+            if not any(pattern.search(word) for word in words):
+                continue
+            evidence = str(envelope.get("evidence_path") or "")
+            target = evidence if evidence and Path(evidence).is_file() else str(path)
+            return S.open_path(target)
+        except (OSError, TypeError, ValueError):
+            continue
+    return None
+
+
+def _checks_envelope_sections(run: Run) -> list[dict[str, Any]]:
+    """The checks behind the vector, one section per ``verifier_*.json``.
+
+    Same envelopes :func:`verifier_check_counts` counts, with each check's own
+    verdict and the file that decided it. One broken envelope costs its own
+    section, never the tab.
+    """
+    sections: list[dict[str, Any]] = []
+    for path in sorted(run.run_dir.glob("verifier_*.json")):
+        try:
+            envelope = _json_obj(path)
+            if not isinstance(envelope, dict):
+                continue
+            name = str(envelope.get("verifier") or path.stem.removeprefix("verifier_"))
+            checks = envelope.get("checks")
+            rows = []
+            if isinstance(checks, list):
+                for check in checks:
+                    if not isinstance(check, dict):
+                        continue
+                    check_passed = bool(check.get("pass"))
+                    detail = str(check.get("expected") or "").strip()
+                    if not check_passed:
+                        detail = " · ".join(part for part in
+                                            (detail, str(check.get("actual") or "").strip())
+                                            if part)
+                    rows.append(S.check_row(str(check.get("name") or "check"),
+                                            "pass" if check_passed else "fail",
+                                            detail=detail))
+            evidence = str(envelope.get("evidence_path") or "")
+            if evidence and Path(evidence).is_file():
+                actions = [S.btn("Open evidence", S.open_path(evidence), "ghost")]
+            else:
+                actions = [S.btn("Open check row", S.open_path(str(path)), "ghost")]
+            passed = bool(envelope.get("pass"))
+            title = f"{name} · {'pass' if passed else 'FAIL'}"
+            if rows:
+                sections.append(S.checks(
+                    title, rows, full=True, actions=actions,
+                    sub=f"{sum(1 for row in rows if row['state'] == 'pass')}/{len(rows)} checks"))
+            else:
+                item = S.ok(title) if passed else S.bad(title)
+                sections.append(S.lst(name, [item], full=True, actions=actions))
+        except Exception:  # noqa: BLE001 — one broken envelope costs its section
+            continue
+    return sections
+
+
+def _checks_tab(run: Run) -> list[dict[str, Any]]:
+    """The verification levels, one self-explaining row each.
+
+    Every row carries its state in the kickoff's three-word vocabulary, a
+    plain-words sentence saying what the level means, and — when the run's
+    evidence names one — a click-through to the file that decided it. Sources
+    are read fail-soft: a missing or malformed verdict costs the data on that
+    row, never the tab.
+    """
+    try:
+        report = O.verification_report(run) or {}
+    except Exception:  # noqa: BLE001 — a broken verdict costs the rows' data
+        report = {}
+    levels = report.get("levels") if isinstance(report.get("levels"), dict) else {}
+    reasons = report.get("levels_reasons") if isinstance(report.get("levels_reasons"), dict) else {}
+    envelopes: list[tuple[Path, dict[str, Any]]] = []
+    try:
+        for path in sorted(run.run_dir.glob("verifier_*.json")):
+            envelope = _json_obj(path)
+            if isinstance(envelope, dict):
+                envelopes.append((path, envelope))
+    except OSError:
+        envelopes = []
+
+    rows = []
+    for level in O.LEVELS:
+        raw = str(levels.get(level) or "").upper()
+        state = _CHECK_STATE_WORD.get(raw, "UNVERIFIED")
+        reason = str(reasons.get(level) or "").strip()
+        meaning = _CHECK_LEVEL_MEANINGS.get(level, "a required check on this run")
+        detail = f"{state} — {meaning}."
+        if reason:
+            detail += f" Why: {reason}"
+        rows.append(S.check_row(
+            level, _CHECK_ROW_STATE[state], detail=detail,
+            do=_checks_evidence_action(run, level, reason, envelopes)))
+    sections = [S.checks(
+        "Verification levels", rows, full=True,
+        note="PROVEN = the evidence at the true base shows it; UNVERIFIED = not "
+             "proven yet; FAILED = the evidence refutes it. Click a row to open "
+             "the file that decided it.")]
+    # Spend follows the level rows: the checks say whether the run proved what
+    # it promised, the section under them says what proving it cost.
+    sections.append(_spend_section(run))
+    # The vector itself stays shipped as data for the renderer (``spec.levels``),
+    # and the per-check envelopes below mirror ``_checks_envelope_sections`` —
+    # so only the non-check sections of the old tab ride along here.
+    try:
+        sections.extend(s for s in _verification_tab(run)
+                        if s.get("type") != "checks")
+    except Exception:  # noqa: BLE001 — the data vector costs its section, not the tab
+        pass
+    sections.extend(_checks_envelope_sections(run))
+    return sections
 
 
 def _story_tab(run: Run, outcome: dict[str, Any]) -> list[dict[str, Any]]:
@@ -3322,17 +4942,49 @@ def _story_tab(run: Run, outcome: dict[str, Any]) -> list[dict[str, Any]]:
     """
     return _outcome_tab(run, outcome)
 
-def _checks_tab(run: Run) -> list[dict[str, Any]]:
-    """The run's verifier checks, levels and review findings.
 
-    The dock keeps only the failing rows (a glance); this tab is the full
-    record, so the dock can point at it instead of growing a second tab bar.
-    Imported inside the call — ``run_dock`` imports this module at top level.
+# Patch artefacts a run can leave behind, in the order the Changes tab's
+# "Open as patch" action prefers them.
+_PATCH_CANDIDATES = ("framework-edit.diff", "diff.patch", "changes.diff")
+
+
+def _patch_action(run: Run) -> dict[str, Any] | None:
+    """``Open as patch`` for the first patch artefact on disk, else ``None``.
+
+    A button is only emitted for a file that really exists — a dead link is
+    worse than no link.
     """
-    from mini_ork.ide_pages import run_dock
+    for name in _PATCH_CANDIDATES:
+        path = run.run_dir / name
+        if path.is_file():
+            return S.btn("Open as patch", S.open_path(str(path)))
+    return None
 
-    errors: dict[str, str] = {}
-    return run_dock.checks_sections(run, errors)
+
+def _changes_tab(run: Run, errors: dict[str, str]) -> list[dict[str, Any]]:
+    """The Changes tab: the dock's changes sections, reused fail-soft.
+
+    The dock already owns the diff loader, the changed-file list and the
+    commits (``run_dock._changes_sections``), so this tab composes that
+    builder rather than re-deriving it. Imported lazily because ``run_dock``
+    imports this module — the same dance as ``_attach_flow``. A builder that
+    raises costs the tab one quiet empty-state section, never the page.
+    """
+    try:
+        from mini_ork.ide_pages import run_dock
+
+        sections = run_dock._changes_sections(run, errors)
+    except Exception:  # noqa: BLE001 — a broken builder must not blank the tab
+        sections = []
+    if not isinstance(sections, list) or not sections:
+        sections = [S.lst("Changed files",
+                          [S.dot("No changes recorded for this run")], full=False)]
+    action = _patch_action(run)
+    if action is not None:
+        first = dict(sections[0])
+        first["actions"] = [action, *(first.get("actions") or [])]
+        sections[0] = first
+    return sections
 
 
 def _orch_args(args: dict[str, Any]) -> dict[str, Any]:
@@ -3345,20 +4997,34 @@ def _orch_args(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
-    """The ``MINI_ORK_IDE_SPEC=2`` page: the run id, its outcome, its graph.
+    """The ``MINI_ORK_IDE_SPEC=2`` page: the run's title, its outcome, its graph.
 
-    The design leads with the DAG, so the header names the run by id and gives
-    the human title the sub line — a reader scanning the tab bar already knows
-    which run, and the title is the sentence they came for.
+    The design leads with the DAG. The header leads with the human title when
+    there is one and puts the recipe / branch on the sub line; the run id is
+    the copyable handle the IDE draws beside the chips. A header that led with
+    ``run-1792233993-49139`` made the reader decode a machine handle before
+    they knew what the page was about.
     """
     outcome = O.resolve(run)
+    # The IDE badges the header from this block without parsing sections. A run
+    # with no recorded cost emits no key at all, so the badge stays absent for
+    # a run that never spent rather than reading as $0.00 spent.
+    spend = _spend_numbers(run)
+    if spend is not None:
+        outcome["spend"] = spend
     keys = {k for k, _ in V2_TABS}
     wanted = (tab or "").strip()
     resolved = V2_ALIASES.get(wanted, wanted)
     if resolved not in keys:
         resolved = "dag"
     node = args.get("node")
-
+    # One needs-you lane, at the top of every v2 tab. ``absorbed`` names the
+    # outcome callouts the lane already owns, so the tab does not draw the
+    # retry decision twice. A broken lane costs the lane, never the tab.
+    try:
+        lane, absorbed = _attention_lane(run, outcome)
+    except Exception:  # noqa: BLE001 — a broken lane must not blank the page
+        lane, absorbed = [], set()
     # The header fields are the same on every tab: the label names the run and
     # the controls (Stop/Kill while it runs, Merge/Discard when it is done) sit
     # beside them, so a user on the DAG tab can still stop a runaway run.
@@ -3371,29 +5037,51 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
     drawn = {str(a.get("label") or "") for a in header["actions"] + actions}
     callout_actions = [a for a in (outcome.get("actions") or [])
                        if isinstance(a, dict) and str(a.get("label") or "") not in drawn]
-    # The design's done state offers the diff beside the verdict; the changes
-    # moved to the Artifacts tab, so the button goes there.
-    if str(outcome.get("state") or "") == "done" and _card_files(run):
-        callout_actions.append(
-            S.btn("Open diff", S.page_link("run", "artifacts", run=run.id)))
+    # The design's done state offers the diff beside the verdict. Opening the
+    # recorded patch is the direct route; a run with only per-file rows (no
+    # patch on disk) sends the reader to the Changes table instead.
+    if str(outcome.get("state") or "") == "done":
+        diff_action = _diff_open_action(run)
+        if diff_action is None and _card_files(run):
+            diff_action = S.btn("Open diff", S.page_link("run", "artifacts", run=run.id))
+        if diff_action is not None:
+            callout_actions.append(diff_action)
+    # The verdict row is a summary; the level vector, each decision's reason and
+    # the checks behind ``checks n/m`` live in the Verification tab.
+    callout_actions.append(
+        S.btn("Checks", S.page_link("run", "checks", run=run.id)))
     callout_labels = {str(a.get("label") or "") for a in callout_actions}
     # A callout is drawn on the DAG and Outcome tabs only: on the others the
     # menu must keep the buttons no callout is showing.
     in_callout = callout_labels if resolved in ("dag", "outcome") else set()
     menu = [m for m in header["menu"]
             if str(m.get("label") or "") not in drawn | in_callout]
+    # A run parked for review has a change and its checks; the summary is safe
+    # to hand off now, so the page offers the entry the header withholds while
+    # a run is still in flight. One entry, on every tab.
+    if (str(outcome.get("state") or "") != "running"
+            and not any(str(m.get("label") or "") == "Copy summary" for m in menu)):
+        try:
+            menu.append(copy_summary_action(run, outcome))
+        except Exception:  # noqa: BLE001 — a broken summary costs its entry
+            pass
 
+    errors: dict[str, str] = {}
     sections = {
         "dag": lambda: _dag_tab(run, node, select=True, outcome=outcome,
                                 callout_actions=callout_actions),
-        "outcome": lambda: _outcome_tab(run, outcome, callout_actions),
+        "outcome": lambda: _outcome_tab(run, outcome, callout_actions, absorbed),
         "orchestrator": lambda: orch_tab.orchestrator_tab(run, args),
+        "verification": lambda: _verification_tab(run),
+        "checks": lambda: _checks_tab(run),
+        "changes": lambda: _changes_tab(run, errors),
         "kickoff": lambda: _kickoff_tab(run, code_presentation=True),
         "agents": lambda: _agents_tab(run),
-        "checks": lambda: _checks_tab(run),
         "learnings": lambda: _learnings_tab(run),
         "artifacts": lambda: _artifacts_tab(run, changes=True),
     }[resolved]()
+    if lane:
+        sections = lane + sections
 
     # The design's header strip: state, how far, what it cost, which recipe.
     # Placement and elapsed are this page's older chips; they trail the four
@@ -3402,7 +5090,7 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
     chips = []
     if waiting:
         chips.append(S.chip(f"✋ {waiting} question{'s' if waiting > 1 else ''}", "yellow"))
-    chips.append(S.chip(outcome["state"], outcome["tone"]))
+    chips.append(S.chip(O.chip_word(run, outcome["state"]), outcome["tone"]))
     done = sum(1 for n in run.nodes if n.state == "done")
     if run.nodes:
         chips.append(S.chip(f"{done}/{len(run.nodes)} nodes"))
@@ -3416,22 +5104,38 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
     chips.append(S.chip(_elapsed(run)))
 
     title = _title_v2(run)
-    # The design titles the run by its id and gives the human title the sub
-    # line — a reader scanning the tab bar already knows which run.
-    sub = title if title and title != run.id else _sub_v2(run)
-    page = S.page("run", run.id, sub, chips_=chips,
+    # The human title is the page's headline; the run id is a handle the IDE
+    # draws beside it with a copy button. A header that leads with
+    # ``run-1792233993-49139`` makes the reader decode a machine handle before
+    # they know what the page is about. Without a human title the id is the
+    # title, and the sub keeps the recipe / branch context.
+    human_title = bool(title) and title != run.id
+    if human_title:
+        sub = " · ".join(x for x in (
+            str(run.card.get("recipe") or run.row.get("recipe") or ""),
+            f"branch {_branch(run)}" if _branch(run) else "") if x)
+    else:
+        sub = _sub_v2(run)
+    sub = _sub_worktree(sub, run)
+    page = S.page("run", title if human_title else run.id, sub, chips_=chips,
                   actions=header["actions"] + actions,
-                  tabs=_v2_tabs(run, waiting), tab=resolved,
+                  tabs=_v2_tabs(run), tab=resolved,
                   args={"run": run.id, **({"node": node} if node else {}),
                         **_orch_args(args)},
-                  sections=sections, desc=_desc_fold(run, outcome, title),
+                  sections=sections, errors=errors,
+                  desc=_desc_fold(run, outcome, title),
                   label=header["label"], menu=menu,
+                  crumbs=header.get("crumbs") or (),
                   updated_at=header["updated_at"],
                   refresh=orch_tab.refresh_seconds(run))
     # The header draws no GOAL / SPEC labels on this page: the sub is the
     # kickoff's own heading, and a label above it would read as a field name.
     page["field_labels"] = False
     page["graph"] = _graph(run, node)
+    # The header badge reads this without walking sections; absent (never
+    # $0.00) when the run recorded no cost at all.
+    if spend is not None:
+        page["spend"] = spend
     return page
 
 
@@ -3466,34 +5170,32 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
     # (parked review, merge review) for every dock render — an effort the
     # dock doesn't use.
     if S.ide_level() >= 2 and (args.get("view") or "") == "dock":
-        # The right dock panel: one glance column, no tab bar — the run page's
-        # tab bar is the only tab surface (one home per fact). Imported here
+        # The right dock panel: one column, its own tab bar. Imported here
         # (not at module top) — ``run_dock`` imports this module, so a
         # top-level import would be circular (same dance as ``_story_tab``).
         from mini_ork.ide_pages import run_dock
 
+        t = tab if tab in {k for k, _ in run_dock.DOCK_TABS} else "changes"
         errors: dict[str, str] = {}
         sub = f"{O.state_word(run)} · {S.money(_cost(run))} · {_elapsed(run)}"
         page = S.page("run", _title_v2(run), sub, chips_=[], actions=[],
-                      tabs=(), tab="",
+                      tabs=run_dock.DOCK_TABS, tab=t,
                       args={"run": run.id, "view": "dock"},
-                      sections=run_dock.build(run, errors=errors), errors=errors)
+                      sections=run_dock.build(run, t, errors), errors=errors)
         page["graph"] = _graph(run, args.get("node"))
         _attach_flow(page, run)
         return page
-    # r-ide-review: top-of-page review sections. Built once, returned (often
-    # empty) here, then prepended to whichever ``sections`` the tab picks.
-    review_sections = _parked_review_section(run) + _merge_review_section(run)
     if S.ide_level() >= 2:
+        # Level 2 owns the top slot with the single needs-you lane built inside
+        # ``_build_v2`` (parked review, open gate, cost pause, merge approval,
+        # open asks) — one decision, one block on every tab.
         page = _build_v2(run, tab, args)
         _attach_flow(page, run)
-        # Additive on the story / graph / kickoff / agents / learnings /
-        # artifacts tabs at level 2: prepend the review sections so they
-        # own the top slot an empty ``Waiting for your review`` callout
-        # already reserved on every parked run.
-        if review_sections and isinstance(page.get("sections"), list):
-            page["sections"] = review_sections + page["sections"]
         return page
+    # r-ide-review (level 1 only): top-of-page review sections. Built once,
+    # returned (often empty) here, then prepended to whichever ``sections``
+    # the tab picks. Level 2 folds these sources into the attention lane.
+    review_sections = _parked_review_section(run) + _merge_review_section(run)
     tab = tab if tab in {k for k, _ in TABS} else "dag"
     done = sum(1 for n in run.nodes if n.state == "done")
     chips = [_state_chip(run), S.chip(f"{done}/{len(run.nodes)} nodes"),

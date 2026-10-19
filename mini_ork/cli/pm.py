@@ -7,9 +7,16 @@ subcommand ``mini_ork/pm/providers/__init__.py`` has promised since
 ``skipped_sources`` was written and nothing registered.
 
     mini-ork pm sources
-    mini-ork pm add <id> [--token-env NAME] [--set k=v ...] [--token-stdin]
+    mini-ork pm add <id> [--token-env NAME] [--set k=v ...] [--token-stdin] [--reuse-token]
     mini-ork pm test <id>
     mini-ork pm remove <id>
+
+**An existing credential is reused, never re-asked for.** When the vault
+already resolves ``token_env``, ``add`` declares the source and leaves the
+stored value alone. ``--reuse-token`` makes that reuse explicit and required:
+it refuses when the key is missing instead of falling back to a prompt, which
+is the shape an IDE button needs — the IDE runs commands with no terminal, so
+a prompt there would fail after the click rather than before it.
 
 **The credential travels once.** It is read from stdin (``--token-stdin``) or
 from a hidden prompt on a terminal — never from an argument, because an
@@ -41,7 +48,7 @@ from pathlib import Path
 from typing import Any
 
 from mini_ork.dispatch.secrets import SecretStoreError
-from mini_ork.dispatch.vault import VaultError
+from mini_ork.dispatch.vault import VaultError, vault_environment
 from mini_ork.dispatch.vault_write import assert_writable, set_secret
 from mini_ork.pm import config as pm_config
 from mini_ork.pm import providers as pm_providers
@@ -51,7 +58,7 @@ from mini_ork.pm.provider import ProviderError, Query
 
 USAGE = """Usage:
   mini-ork pm sources
-  mini-ork pm add <id> [--token-env NAME] [--set k=v ...] [--token-stdin] [--disable]
+  mini-ork pm add <id> [--token-env NAME] [--set k=v ...] [--token-stdin] [--reuse-token] [--disable]
   mini-ork pm test <id>
   mini-ork pm remove <id>
 
@@ -112,6 +119,10 @@ def _add_parser(prog: str = "mini-ork pm add") -> argparse.ArgumentParser:
     # after `--set`, which is exactly the prefix the IDE appends `--home` to.
     parser.add_argument("--set", dest="settings", action="append", nargs="*", default=None)
     parser.add_argument("--token-stdin", dest="token_stdin", action="store_true")
+    parser.add_argument(
+        "--reuse-token", dest="reuse_token", action="store_true",
+        help="require token_env to resolve already, and never prompt for a value",
+    )
     parser.add_argument(
         "--disable", dest="enable", action="store_false", default=True,
         help="declare the source switched off, and store no credential",
@@ -193,10 +204,21 @@ def _parse_settings(values: Iterable[str]) -> dict[str, str]:
     return settings
 
 
-def _default_token_env(source_id: str) -> str:
+def default_token_env(source_id: str) -> str:
+    """The vault key an adapter conventionally reads when none is named.
+
+    Public because the Board's Sources pane renders the same convention: a
+    page that guessed a different key would offer a "Connect" button for a
+    credential the adapter never reads.
+    """
     return _DEFAULT_TOKEN_ENV.get(
         source_id, f"{source_id.upper().replace('-', '_')}_TOKEN"
     )
+
+
+def _default_token_env(source_id: str) -> str:
+    """Back-compat alias for :func:`default_token_env`."""
+    return default_token_env(source_id)
 
 
 def _read_value(key: str, from_stdin: bool) -> str:
@@ -363,33 +385,60 @@ def _capability_bits(capabilities) -> list[str]:
 
 
 def _cmd_add(args: argparse.Namespace) -> int:
-    """Declare a source and store its credential — the store first, the config last."""
+    """Declare a source, storing a credential only when one is not already there.
+
+    The store comes before the config, except when there is nothing to store:
+    a key the vault already serves is left untouched, so re-running ``add``
+    (or a Board button that was clicked twice) cannot overwrite a working
+    token with a prompt that had no terminal to read from.
+    """
     _home(args.home)
     source_id = str(args.id).strip()
     if not source_id:
-        raise ValueError("pm add needs a source id (linear, jira)")
+        raise ValueError("pm add needs a source id (github, linear, jira)")
     settings = _parse_settings(args.settings or [])
-    token_env = (args.token_env if args.token_env is not None else _default_token_env(source_id)).strip()
+    token_env = (args.token_env if args.token_env is not None else default_token_env(source_id)).strip()
     enabled = bool(args.enable)
+    reuse = bool(getattr(args, "reuse_token", False))
+    if reuse and not enabled:
+        raise ValueError("--reuse-token needs an enabled source; drop it or drop --disable")
+    if reuse and args.token_stdin:
+        raise ValueError("--reuse-token and --token-stdin are mutually exclusive")
+    if reuse and not token_env:
+        raise ValueError(f"pm source {source_id!r} has no token_env to reuse")
 
     configuration = pm_config.load_config()
+    value = ""
+    reused = False
     if enabled:
-        # Refuse the store before asking anyone for a value: an operator whose
-        # vault is sops learns the command to run instead, and never types a
-        # secret into a flow that was going to refuse it. Nothing is written.
-        assert_writable(token_env)
-        value = _read_value(token_env, bool(args.token_stdin))
-    else:
-        value = ""
+        # An already-resolvable key is reused, never re-asked for. This is what
+        # makes `pm add` safe to run from the IDE: an IDE action has no
+        # terminal, so a prompt there fails after the click rather than before
+        # it — and `--reuse-token` is the explicit form of the same rule.
+        reused = _resolves(token_env)
+        if reuse and not reused:
+            raise PmConfigError(
+                f"pm source {source_id!r}: {token_env} is not in the vault; "
+                "store it first (from a terminal, `pm add` prompts for it, "
+                "`--token-stdin` reads it from a pipe) or export it"
+            )
+        if not reused:
+            # Refuse the store before asking anyone for a value: an operator
+            # whose vault is sops learns the command to run instead, and never
+            # types a secret into a flow that was going to refuse it.
+            assert_writable(token_env)
+            value = _read_value(token_env, bool(args.token_stdin))
 
     source = pm_config.SourceConfig(
         id=source_id, enabled=enabled, token_env=token_env or None, settings=settings
     )
     # The credential first: a source declared before its key exists is a source
     # that fails closed on the next read, which is the worse of the two orders.
-    if enabled and token_env:
+    if enabled and token_env and not reused:
         stored = set_secret(token_env, value)
         print(f"pm: {token_env} stored in {stored}")
+    elif enabled and reused:
+        print(f"pm: {token_env} already resolves; nothing stored")
     elif not enabled:
         print(f"pm: {source_id} declared disabled; no credential stored")
     target = pm_config.write_config(_merged(configuration, source))
@@ -397,6 +446,20 @@ def _cmd_add(args: argparse.Namespace) -> int:
     if enabled:
         print(f"pm: check it with `mini-ork pm test {source_id}` (a network read)")
     return 0
+
+
+def _resolves(key: str) -> bool:
+    """Whether the vault serves ``key``, without printing or returning a value.
+
+    Only presence is needed here. A backend that cannot answer is read as
+    "missing" so the ordinary prompting path still runs and reports its own,
+    more specific error.
+    """
+    try:
+        environment = vault_environment()
+        return environment.resolve(key) is not None
+    except VaultError:
+        return False
 
 
 def _cmd_test(args: argparse.Namespace) -> int:

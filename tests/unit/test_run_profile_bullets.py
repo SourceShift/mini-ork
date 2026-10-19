@@ -244,7 +244,8 @@ def test_hero_blanks_a_goal_that_repeats_the_title(home: Path, monkeypatch) -> N
         "user_goal": "  make THE demo pass  ",
         "success_criteria": ["it works", "it is fast"],
     }))
-    page = build_page(home, "run", None, {"run": RUN})
+    page = build_page(home, "run", "outcome", {"run": RUN})
+    # The kickoff's heading is the page's title; the sub is the recipe line.
     assert page["title"] == "Make the demo pass"
     hero = _section(page, "hero", "What this run is for")
     assert hero["goal"] == ""
@@ -258,28 +259,49 @@ def test_hero_keeps_a_goal_that_differs_from_the_title(home: Path, monkeypatch) 
         "user_goal": "Ship the thing",
         "success_criteria": ["it works"],
     }))
-    page = build_page(home, "run", None, {"run": RUN})
+    page = build_page(home, "run", "outcome", {"run": RUN})
     hero = _section(page, "hero", "What this run is for")
     assert hero["goal"] == "Ship the thing"
 
 
-def test_hero_is_omitted_when_the_goal_is_blanked_and_there_are_no_criteria(
+def test_a_blanked_goal_and_no_criteria_leaves_no_hero(
         home: Path, monkeypatch) -> None:
-    """Goal == title and no criteria → nothing left for the hero to say."""
+    """Goal == title, no criteria and no changed files → nothing is left to say.
+
+    Progress, cost and elapsed are the header chips' job, so the hero does not
+    fall back to repeating them: the section is dropped entirely.
+    """
     run_dir = _seed(home)
     monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
     (run_dir / "run_profile.json").write_text(json.dumps({
         "user_goal": "Make the demo pass",
         "success_criteria": [],
     }))
-    page = build_page(home, "run", None, {"run": RUN})
-    assert not [s for s in page["sections"] if s["type"] == "hero"]
+    page = build_page(home, "run", "outcome", {"run": RUN})
+    assert not [s for s in page["sections"] if s.get("title") == "What this run is for"]
+
+
+def test_the_hero_keeps_only_the_lines_changed_cell(home: Path, monkeypatch) -> None:
+    """Goal == title and no criteria, but the run moved code: the hero survives
+    to carry the one fact the chips do not."""
+    run_dir = _seed(home)
+    monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
+    (run_dir / "run_profile.json").write_text(json.dumps({
+        "user_goal": "Make the demo pass",
+        "success_criteria": [],
+    }))
+    (run_dir / "diffstat.json").write_text(json.dumps({"added": 12, "removed": 3, "v": 1}))
+    page = build_page(home, "run", "outcome", {"run": RUN})
+    hero = _section(page, "hero", "What this run is for")
+    assert hero["goal"] == ""
+    assert hero["criteria"] == []
+    assert [(c["v"], c["label"]) for c in hero["cells"]] == [("+12 −3", "lines changed")]
 
 
 def test_a_heading_over_80_chars_is_the_full_title_and_not_repeated(
         home: Path, monkeypatch) -> None:
-    """The card title is the heading cut to 80 chars; the v2 page shows the
-    whole heading as its title and the hero does not repeat it."""
+    """The card title is the heading cut to 80 chars; the v2 page titles itself
+    with the whole heading and the hero does not repeat it."""
     run_dir = _seed(home)
     long_heading = ("Make the demo pass on every platform we ship, including the slow "
                     "ARM runners and the nightly build")
@@ -287,7 +309,7 @@ def test_a_heading_over_80_chars_is_the_full_title_and_not_repeated(
     monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
     (run_dir / "run_profile.json").write_text(json.dumps({
         "user_goal": long_heading, "success_criteria": ["it works"]}))
-    page = build_page(home, "run", None, {"run": RUN})
+    page = build_page(home, "run", "outcome", {"run": RUN})
     assert page["title"] == long_heading
     hero = _section(page, "hero", "What this run is for")
     assert hero["goal"] == ""

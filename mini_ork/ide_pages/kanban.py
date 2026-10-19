@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import os
 import re as _re
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -477,9 +478,13 @@ def _freshness_items(home: Path, now: int) -> list[dict[str, Any]]:
     except Exception:  # noqa: BLE001 — a broken config must not blank the board
         return []
     if not enabled:
-        return [S.muted("No PM source is enabled — add a source to config/pm.yaml "
-                        "with `enabled: true` and its `token_env` key in the vault "
-                        "(`mini-ork vault status`).")]
+        # The empty state carries the next action, not just the diagnosis: a
+        # dead end that names a file is the state this pane exists to replace.
+        return [S.warn(
+            "No PM source is connected",
+            "Bring in GitHub issues, Linear or Jira tickets — no config file edit needed.",
+            acts=[S.btn("Connect a source", S.page_link("kanban", tab="sources"), "primary")],
+        )]
     items: list[dict[str, Any]] = []
     mirrored = [s for s in store.mirror_state(db=str(home / "state.db"))
                 if s.get("provider") != "local"]
@@ -694,18 +699,36 @@ def _tasks_board(home: Path, args: dict[str, str], now: int,
 # key, and the sentinel-grep test in ``test_ide_pages_kanban_tickets.py``
 # asserts that rather than trusting it.
 
-#: Sources the pane offers an Add box for: the adapters whose settings a person
-#: types. ``local`` needs no config, and the add flow's credential prompt is a
-#: terminal, so there is nothing here for a page payload to carry.
-_ADDABLE = ("linear", "jira")
+#: Sources the pane offers an Add flow for: the adapters whose settings a
+#: person types. ``local`` needs no config, so it is never "added".
+_ADDABLE = ("github", "linear", "jira")
 
 #: The settings each addable adapter needs, spelled for the Add box's
 #: placeholder. Not a validation — the adapter's own ``require`` decides, and a
 #: source missing one is skipped with its reason on the row above.
+_ADD_LABEL = {"github": "GitHub", "linear": "Linear", "jira": "Jira"}
+
 _ADD_HINT = {
+    "github": "owner=acme repo=widgets",
     "linear": "team=ENG",
     "jira": "site=acme project=ENG email_env=JIRA_EMAIL",
 }
+
+#: The command a person pastes into a terminal when the credential is not on
+#: this machine yet. Deliberately shown, never run by a page: ``pm add`` reads
+#: the value at a hidden prompt, and a page payload must never carry it.
+_ADD_COMMAND = {
+    "github": "mini-ork pm add github --set owner=<owner> repo=<repo>",
+    "linear": "mini-ork pm add linear --set team=<TEAM>",
+    "jira": "mini-ork pm add jira --set site=<site> project=<KEY> "
+            "email_env=JIRA_EMAIL",
+}
+
+#: ``https://github.com/owner/repo(.git)`` and ``git@github.com:owner/repo.git``
+#: — the two forms a clone's ``origin`` takes in practice.
+_REMOTE_SLUG = _re.compile(
+    r"^(?:(?:https?|ssh)://[^/]+/|git@[^:]+:)(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$"
+)
 
 
 def _mirror_rows(home: Path) -> dict[str, dict[str, Any]]:
@@ -783,6 +806,97 @@ def _adapter_exists(source_id: str, source: Any = None) -> bool:
     return adapter_for(source_id, settings.get("adapter")) is not None
 
 
+def _git_remote_slug(home: Path) -> tuple[str, str] | None:
+    """``(owner, repo)`` from this project's ``origin`` remote, or ``None``.
+
+    The prefill that turns "add a GitHub source" into one click. Read with a
+    short timeout and no shell, so a project without a remote — or without git
+    — costs the card its prefill, never the page.
+    """
+    project = home.parent
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(project), "remote", "get-url", "origin"],
+            capture_output=True, text=True, check=False, timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    match = _REMOTE_SLUG.match(completed.stdout.strip())
+    if not match:
+        return None
+    return match.group("owner"), match.group("repo")
+
+
+def _credential_locations(token_env: str) -> tuple[list[str], list[str]]:
+    """Where ``token_env`` *may* be found — never what it is.
+
+    Enumerates names only: the environment backend and the 0600 file backend
+    can say whether a key is present without a value leaving the store. A
+    backend that resolves by lookup (sops, command, OpenBao) is named as
+    "managed" and not read — reading it may unseal a store, which stays an
+    explicit Connect/Test act, never a page render.
+    """
+    from mini_ork.dispatch.vault import EnvBackend, FileBackend, vault_environment
+
+    found: list[str] = []
+    managed: list[str] = []
+    try:
+        environment = vault_environment()
+    except Exception:  # noqa: BLE001 — a broken vault must not blank the pane
+        return found, managed
+    for backend in environment.backends:
+        if isinstance(backend, EnvBackend):
+            if token_env in os.environ:
+                found.append("the environment")
+        elif isinstance(backend, FileBackend):
+            try:
+                if token_env in set(backend.known_keys()):
+                    found.append("secrets.local.sh (0600)")
+            except Exception:  # noqa: BLE001 — enumeration is best-effort
+                pass
+        else:
+            managed.append(backend.name)
+    return found, managed
+
+
+def _credential_state(source_id: str) -> tuple[str, bool]:
+    """``(line for the card, whether Connect can skip the prompt)``."""
+    from mini_ork.cli.pm import default_token_env
+
+    key = default_token_env(source_id)
+    found, managed = _credential_locations(key)
+    if found:
+        return f"{key} found in {' and '.join(found)}", True
+    if managed:
+        return f"{key} resolved by {' or '.join(managed)} when you connect", True
+    return f"no {key} in the environment or secrets.local.sh yet", False
+
+
+def _connect_row(home: Path, source_id: str) -> dict[str, Any]:
+    """One undeclared source as a card: what it is, and the shortest way in."""
+    line, has_credential = _credential_state(source_id)
+    title = _ADD_LABEL.get(source_id, source_id.capitalize())
+    acts: list[dict[str, Any]] = []
+    if source_id == "github":
+        slug = _git_remote_slug(home)
+        if slug:
+            owner, repo = slug
+            title = f"GitHub · {owner}/{repo}"
+            if has_credential:
+                acts.append(S.btn(
+                    "Connect",
+                    S.cli("pm", "add", "github", "--set", f"owner={owner}",
+                          f"repo={repo}", "--reuse-token"),
+                    "primary",
+                ))
+        else:
+            line = "no GitHub remote here — fill owner= and repo= in the box below"
+    acts.append(S.btn("Open terminal", S.terminal(cwd=str(home.parent)), "ghost"))
+    return S.item(title, line, acts=acts)
+
+
 def _sources_pane(home: Path, now: int) -> list[dict[str, Any]]:
     """The Sources tab: declared sources, then skipped ones, then what can be added."""
     from mini_ork.pm import registry
@@ -825,15 +939,29 @@ def _sources_pane(home: Path, now: int) -> list[dict[str, Any]]:
         ))
 
     addable = [source_id for source_id in _ADDABLE if source_id not in configuration.sources]
+    if addable:
+        sections.append(S.lst(
+            "Connect a source",
+            [_connect_row(home, source_id) for source_id in addable],
+            full=True,
+            note="Connect reuses a credential the vault already serves. The value is "
+                 "never typed into this page.",
+        ))
     for source_id in addable:
         sections.append(S.composer(
-            f"{_ADD_HINT.get(source_id, 'key=value')} — the value is then prompted "
-            "for in your terminal",
+            f"{_ADD_HINT.get(source_id, 'key=value')} — the settings, not the credential",
             ["pm", "add", source_id, "--set"],
             title=f"Add {source_id}", full=True,
-            note="The credential is typed at a hidden prompt and never enters this "
-                 "page: a value in a page payload is a value in a log, and in a "
-                 "shell history.",
+            note="A credential the vault already serves is reused silently. Otherwise "
+                 "run it in a terminal: the value is typed at a hidden prompt and never "
+                 "enters this page.",
+        ))
+    if addable:
+        sections.append(S.code(
+            "Credential not stored yet? Run this in a terminal",
+            [f"{_ADD_COMMAND[source_id]}" for source_id in addable
+             if source_id in _ADD_COMMAND],
+            full=True,
         ))
     return sections
 

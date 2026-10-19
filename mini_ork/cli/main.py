@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from mini_ork import trace_store
+from mini_ork.version import __version__
 from mini_ork.context import (
     apply_env_overrides,
     context_env,
@@ -57,6 +58,7 @@ _NATIVE_MODULE_SUBS = {
     "eval": "mini_ork.cli.eval",
     "promote": "mini_ork.cli.promote",
     "init": "mini_ork.cli.init",
+    "onboard": "mini_ork.cli.onboard",
     "update": "mini_ork.cli.update",
     "spawn": "mini_ork.cli.spawn",
     "scheduler": "mini_ork.scheduler",
@@ -117,7 +119,9 @@ _NATIVE_MODULE_SUBS = {
     "orchestrator": "mini_ork.cli.orchestrator_cmd",
 }
 
-_HELP = """mini-ork — task operating system for agents (v0.1)
+# The body stays a plain string: it documents `${NAME}` env vars, and an
+# f-string would read those braces as format fields.
+_HELP = f"mini-ork — task operating system for agents (v{__version__})\n" + """\
 
 Universal loop subcommands:
   classify <kickoff.md>          Route kickoff to a task_class
@@ -152,6 +156,8 @@ Self-improvement:
                                    --resume). Gated; never commits without verifiers.
 
 Lifecycle:
+  onboard                        First-run wizard: prerequisites, workspace, lanes,
+                                   and the optional ContextNest / Zed components
   init                           Bootstrap project (creates .mini-ork/)
   install                        Install or repair the per-user mini-ork command
   update                         Apply migrations + report config drift
@@ -1370,6 +1376,24 @@ def _handle_execute_park(run_rc: int, execute_out: str, execute_err: str,
     return REVIEW_PAUSE_RC, False
 
 
+def _apply_default_placement(
+    placement: str, node_env: str, env: Mapping[str, str]
+) -> tuple[str, str, bool]:
+    """Adopt ``MO_DEFAULT_NODE_ENV`` when the run specified no placement.
+
+    Returns ``(placement, node_env, defaulted)``. Explicit input wins;
+    ``MO_REMOTE_NODE=1`` (already inside a sandbox) skips the default.
+    """
+    if placement or node_env:
+        return placement, node_env, False
+    if (env.get("MO_REMOTE_NODE") or "").strip() == "1":
+        return placement, node_env, False
+    from mini_ork.remote.environments import default_node_env  # noqa: PLC0415
+
+    name = default_node_env(env)
+    return ("remote", name, True) if name else (placement, node_env, False)
+
+
 def _run_lifecycle_impl(argv, root, sink) -> int:
     t0 = int(time.time())
     # ── flag pre-parse: pull --deadline / --placement / --env / --set out ──
@@ -1440,6 +1464,8 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
     # gen_profile all read one answer. Unset → nothing published → today's run.
     placement = placement or context_env("MO_PLACEMENT", "").strip()
     node_env = node_env or context_env("MO_NODE_ENV", "").strip()
+    placement, node_env, placement_defaulted = _apply_default_placement(
+        placement, node_env, context_env_snapshot())
     if placement not in ("", "local", "remote"):
         sys.stderr.write(f"MO_PLACEMENT: expected local|remote (got '{placement}')\n"); return 2
     if placement == "remote":
@@ -1454,7 +1480,11 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
             except FileNotFoundError:
                 problem = f"--env: environment profile '{node_env}' not found"
             except ValueError as exc:   # schema violation or a secret-looking env key
-                problem = f"--env: environment profile '{node_env}' is invalid: {exc}"
+                if placement_defaulted:
+                    problem = (f"default environment '{node_env}' (MO_DEFAULT_NODE_ENV) "
+                               f"is invalid: {exc}")
+                else:
+                    problem = f"--env: environment profile '{node_env}' is invalid: {exc}"
         if problem:
             names = list_profiles(env=env_now)
             avail = ", ".join(names) if names else (
@@ -2100,6 +2130,27 @@ def _execute_inprocess(rest, root):
     return mini_ork_execute.main(rest, root=root)
 
 
+# Recovery scope is an in-process hand-off (`recovery.planner._emit_recovery_env`):
+# the closure, strategy and entry node name the DAG of the run that computed
+# them. A `run` started as a child process inherits them — the spec-driven
+# delivery dispatcher builds each child's env with `os.environ.copy()` — and
+# execute's `_apply_recovery_filter` then prunes the CHILD's DAG by the PARENT's
+# node names. run-1792151796-92942--pick-files-directories--D1, a 15-node
+# recursive-validate-impl child, ran only `publisher` because
+# `MINI_ORK_RECOVERY_FROM=test_validity` and its closure leaked from the
+# spec-driven-delivery parent; the panel never ran, so publish blocked on a
+# missing verdict. A fresh `run` starts with no inherited scope; `--resume`
+# and `recover` publish their own scope after this point.
+_INHERITED_RECOVERY_SCOPE_VARS = (
+    "MINI_ORK_RECOVERY_RUN_ID",
+    "MINI_ORK_RECOVERY_SKU",
+    "MINI_ORK_RECOVERY_CLOSURE",
+    "MINI_ORK_RECOVERY_STRATEGY",
+    "MINI_ORK_RECOVERY_FROM",
+    "MINI_ORK_RECOVERY_ACTIVE",
+)
+
+
 def _run_handler(rest, root):
     # ``--resume <run_id>`` / ``--checkpoint-id <id>`` (P1.3). The preflight
     # prints the one-line plan and HARD-ERRORS on an unknown run_id (C1 / F4 —
@@ -2107,6 +2158,8 @@ def _run_handler(rest, root):
     # that would classify and plan again and dispatch every node, so the
     # printed skip list would be a lie. It re-dispatches only the plan's
     # redispatch set against the run's existing plan.
+    for key in _INHERITED_RECOVERY_SCOPE_VARS:
+        os.environ.pop(key, None)
     from mini_ork.cli import run_resume
 
     rc, sink = run_resume.run_with_resume(rest)
@@ -2200,7 +2253,7 @@ def _doctor_handler(rest, root):
 
 def _version_handler(rest, root):
     del rest, root
-    print("mini-ork 0.9.0 (universal task loop runtime)")
+    print(f"mini-ork {__version__} (universal task loop runtime)")
     return 0
 
 

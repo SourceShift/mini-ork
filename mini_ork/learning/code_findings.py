@@ -6,9 +6,12 @@ behind the "Your code" tab. Reviews and verifiers already say, per file, what
 is wrong; this module pulls those findings out of the run directories and
 indexes them in two tables:
 
-  code_findings       -- one row per finding, deduped by
-                         ``sha256(run_id|source|file|line|issue)``.
-  code_findings_runs  -- one row per harvested run dir (the incremental guard).
+  code_findings          -- one row per finding, deduped by
+                            ``sha256(run_id|source|file|line|issue)``.
+  code_findings_runs     -- one row per harvested run dir (the incremental guard).
+  code_findings_landing  -- one row per run whose diff was checked against
+                            origin/main (LF-R11b; ``landed_commit`` NULL means
+                            "checked and not landed").
 
 Same DB resolution and ``ensure_schema`` discipline as
 ``mini_ork/learning/ledger.py``: cold-safe (a missing DB is a silent no-op,
@@ -28,6 +31,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+
 
 _DEFAULT_HOME = ".mini-ork"
 _DEFAULT_DEPTH = 3
@@ -883,6 +887,505 @@ def normalize_file(file, *, repo_root=None, known_paths=None, target_cwd=None):
     return f
 
 
+# ── staleness at HEAD (LF-R11a) ─────────────────────────────────────────────
+# A finding outlives the code it quoted. Two read-time decays: a max-age window
+# (``MO_CONTEXT_V2_MAX_AGE_DAYS``, default 30) and a HEAD check — a row whose
+# ``snippet`` no longer occurs in its file is either fixed or written against a
+# file that moved on. Nothing is deleted and no schema is added: ``snippet``
+# already holds the quoted line (R5), so staleness is computed on read.
+
+_MAX_AGE_DEFAULT = 30
+_MAX_AGE_WARNED = False
+
+
+def normalize_for_match(text) -> str:
+    """Whitespace-normalized text: ``" ".join(str(text).split())``.
+
+    A re-indented or re-wrapped line still matches the snippet the reviewer
+    quoted.
+    """
+    return " ".join(str(text).split())
+
+
+def _epoch_seconds(value):
+    """A ``ts`` value as epoch seconds, or None when it is not numeric.
+
+    Real rows store an INTEGER, but legacy fixtures (and pre-0064 databases)
+    can carry ISO date strings; those are not comparable to ``now`` and must
+    not be read as a tiny epoch ("2026-10-05" → 2026). None means "no age
+    verdict", never "very old".
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+def file_texts_at_head(repo_root, paths) -> dict:
+    """``{path: HEAD text | None}`` for ``paths`` under ``repo_root``.
+
+    One ``git -C repo_root cat-file --batch`` call fed ``HEAD:<path>`` for
+    every path, parsing the size-prefixed batch stream. A path that is not at
+    HEAD (untracked, or added after the last commit) falls back to the file on
+    disk; a path that exists in neither maps to ``None``. Any git/subprocess
+    failure — including a ``repo_root`` that is not a checkout — returns ``{}``:
+    callers then treat every row as fresh, because a broken probe must never
+    hide history.
+    """
+    unique: list[str] = []
+    seen: set[str] = set()
+    for p in paths or []:
+        if p is None:
+            continue
+        s = str(p)
+        if s not in seen:
+            seen.add(s)
+            unique.append(s)
+    if not unique:
+        return {}
+    root = str(repo_root or "")
+    if not root:
+        return {}
+    try:
+        proc = subprocess.run(
+            ["git", "-C", root, "cat-file", "--batch"],
+            input="".join(f"HEAD:{p}\n" for p in unique).encode("utf-8"),
+            capture_output=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    data = proc.stdout or b""
+    out: dict[str, str | None] = {}
+    pos = 0
+    for p in unique:
+        nl = data.find(b"\n", pos)
+        if nl < 0:
+            return {}
+        parts = data[pos:nl].split()
+        pos = nl + 1
+        if not parts:
+            return {}
+        if parts[-1] == b"missing":
+            # Not at HEAD: read the worktree file (untracked paths), or None.
+            try:
+                with open(os.path.join(root, p), "r", encoding="utf-8",
+                          errors="replace") as fh:
+                    out[p] = fh.read()
+            except OSError:
+                out[p] = None
+            continue
+        try:
+            size = int(parts[-1])
+        except ValueError:
+            return {}
+        body = data[pos:pos + size]
+        if len(body) < size:
+            return {}
+        pos += size
+        if data[pos:pos + 1] == b"\n":
+            pos += 1
+        out[p] = body.decode("utf-8", errors="replace")
+    return out
+
+
+def stale_reason(row, *, repo_root=None, file_texts=None, now=None,
+                 max_age_days=_MAX_AGE_DEFAULT):
+    """Why ``row`` is stale — ``"age"``, ``"file-missing"``, ``"snippet-absent"``
+    — or None when it is still live.
+
+    Order: age (``max_age_days > 0`` and ``now - ts`` exceeds it) → no ``file``
+    → no ``snippet`` (age-only: 1,282 of 1,669 live rows carry no snippet, and
+    inventing a verdict for them would be worse than the decay) → file missing
+    at HEAD → snippet not a whitespace-normalized substring of the HEAD text.
+
+    ``file_texts=None`` probes HEAD for this row alone; ``{}`` (or a path
+    absent from a non-empty map) means the probe could not decide, so the row
+    is fresh.
+    """
+    if now is None:
+        now = int(time.time())
+    if max_age_days and max_age_days > 0:
+        ts = _epoch_seconds(row.get("ts"))
+        if ts is not None and now - ts > int(max_age_days) * 86400:
+            return "age"
+    file = row.get("file")
+    if not file:
+        return None
+    snippet = row.get("snippet")
+    if not snippet:
+        return None
+    if file_texts is None:
+        file_texts = file_texts_at_head(repo_root, [file]) if repo_root else {}
+    if file not in file_texts:
+        return None
+    text = file_texts[file]
+    if text is None:
+        return "file-missing"
+    if normalize_for_match(snippet) not in normalize_for_match(text):
+        return "snippet-absent"
+    return None
+
+
+def annotate_staleness(rows, *, repo_root, now=None, max_age_days=_MAX_AGE_DEFAULT,
+                       environ=None) -> list[dict]:
+    """Copy ``rows`` and add ``stale`` / ``stale_reason`` to each.
+
+    One ``file_texts_at_head`` call covers the rows' distinct ``file`` values.
+    ``MO_FINDINGS_STALENESS=0`` disables only the HEAD half (age still applies)
+    and skips the probe entirely.
+    """
+    rows = list(rows or [])
+    if not rows:
+        return []
+    if now is None:
+        now = int(time.time())
+    env = os.environ if environ is None else environ
+    staleness_on = str(env.get("MO_FINDINGS_STALENESS", "")).strip().lower() \
+        not in {"0", "false", "no", "off"}
+    files: list[str] = []
+    seen: set[str] = set()
+    if staleness_on:
+        for r in rows:
+            f = r.get("file")
+            if f and str(f) not in seen:
+                seen.add(str(f))
+                files.append(str(f))
+    file_texts = file_texts_at_head(repo_root, files) if files else {}
+    out: list[dict] = []
+    for r in rows:
+        annotated = dict(r)
+        reason = stale_reason(annotated, repo_root=repo_root,
+                              file_texts=file_texts, now=now,
+                              max_age_days=max_age_days)
+        annotated["stale"] = reason is not None
+        annotated["stale_reason"] = reason
+        out.append(annotated)
+    return out
+
+
+def max_age_days_from_env(environ=None) -> int:
+    """``MO_CONTEXT_V2_MAX_AGE_DAYS`` → days; 30 when unset/empty.
+
+    ``0`` disables the window. A negative or non-integer value is a warning
+    (once per process, on stderr) and the 30-day default — never a silent 0.
+    """
+    global _MAX_AGE_WARNED
+    env = os.environ if environ is None else environ
+    raw = env.get("MO_CONTEXT_V2_MAX_AGE_DAYS")
+    if raw is None or str(raw).strip() == "":
+        return _MAX_AGE_DEFAULT
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        value = None
+    if value is None or value < 0:
+        if not _MAX_AGE_WARNED:
+            _MAX_AGE_WARNED = True
+            print(
+                f"  [code_findings] MO_CONTEXT_V2_MAX_AGE_DAYS={raw!r} is not a "
+                f"non-negative integer; using {_MAX_AGE_DEFAULT} days",
+                file=sys.stderr,
+            )
+        return _MAX_AGE_DEFAULT
+    return value
+
+
+# ── landing on origin/main (LF-R11b) ──────────────────────────────────────────
+# A finding outlives the run that produced it. R11a's decays (age, and "the
+# snippet is gone at HEAD") miss the common case where the run's own change
+# LANDED on origin/main while the finding points at a line the change did not
+# touch: the snippet is still there, yet the run is merged and its reviewers'
+# complaints are answered or superseded. The identity here is git's own —
+# ``git patch-id --stable`` is invariant to rebase, cherry-pick and line drift —
+# so a run's ``framework-edit.diff`` and the commit that merged it share an id.
+#
+# Known limitation: a run that shipped SEVERAL commits has a union diff whose
+# patch-id no single commit carries, so it never matches and stays not-landed.
+# That is the safe direction: a missed landing keeps a finding, never hides one
+# wrongly. Every probe is fail-open — a git/subprocess error, a missing repo or
+# an unknown ref is treated as "not landed".
+
+_DEFAULT_LANDING_REF = "origin/main"
+_LANDING_OFF = {"0", "false", "no", "off"}
+
+
+def landing_enabled(environ=None) -> bool:
+    """True unless ``MO_FINDINGS_LANDING`` says off (``0``/``false``/``no``)."""
+    env = os.environ if environ is None else environ
+    return str(env.get("MO_FINDINGS_LANDING", "")).strip().lower() not in _LANDING_OFF
+
+
+def _run_diff_text(run_dir):
+    """The text of ``<run_dir>/framework-edit.diff``, else the first ``*.diff``
+    (sorted) in the run dir; None when neither exists or is empty.
+
+    A run that shipped several commits writes a union diff; see the limitation
+    note above. Never raises.
+    """
+    if not run_dir:
+        return None
+    path = os.path.join(str(run_dir), "framework-edit.diff")
+    if not os.path.isfile(path):
+        try:
+            candidates = sorted(glob.glob(os.path.join(str(run_dir), "*.diff")))
+        except OSError:
+            candidates = []
+        path = candidates[0] if candidates else None
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    return text if text.strip() else None
+
+
+def _patch_id_of_text(text) -> str | None:
+    """``git patch-id --stable`` of a diff text — a pure filter, no repo needed.
+
+    Empty text, a non-diff, or a failed command yields None. Never raises.
+    """
+    if not text or not str(text).strip():
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "patch-id", "--stable"],
+            input=str(text),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    tokens = (proc.stdout or "").split()
+    return tokens[0] if tokens else None
+
+
+def run_patch_id(run_dir) -> str | None:
+    """The patch-id of the run's own diff, or None when there is none.
+
+    Reads ``<run_dir>/framework-edit.diff`` (falling back to the first
+    ``*.diff``), so a run whose implementer wrote no diff has no identity to
+    look up and is never called landed.
+    """
+    text = _run_diff_text(run_dir)
+    return _patch_id_of_text(text) if text else None
+
+
+def _since_arg(value) -> str | None:
+    """``since`` as a git-friendly ISO-8601 string (epoch ints are UTC)."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(value)))
+        except (OverflowError, OSError, ValueError):
+            return None
+    s = str(value).strip()
+    return s or None
+
+
+def landed_patch_ids(repo_root, ref: str = _DEFAULT_LANDING_REF,
+                     *, since=None) -> dict:
+    """``{patch_id: commit_sha}`` for every non-merge commit reachable from
+    ``ref`` in ``repo_root``, newest commit winning a duplicate id.
+
+    One ``git log -p`` piped through one ``git patch-id --stable`` covers the
+    whole repo — the cost is bounded by ``since`` (a run's minimum finding ts),
+    not by one call per commit. Any git/subprocess error, a path that is not a
+    checkout, or an unknown ref → ``{}``: callers then treat every run as not
+    landed, because a broken probe must never hide history.
+    """
+    root = str(repo_root or "")
+    if not root or not os.path.isdir(root):
+        return {}
+    cmd = ["git", "-C", root, "log", "--no-merges", "--no-renames",
+           "--format=commit %H", "-p"]
+    since_arg = _since_arg(since)
+    if since_arg:
+        cmd.append(f"--since={since_arg}")
+    cmd.append(str(ref or _DEFAULT_LANDING_REF))
+    try:
+        log = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if log.returncode != 0 or not (log.stdout or "").strip():
+        return {}
+    try:
+        ids = subprocess.run(
+            ["git", "patch-id", "--stable"],
+            input=log.stdout,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if ids.returncode != 0:
+        return {}
+    out: dict[str, str] = {}
+    for line in (ids.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            # ``git log`` is newest-first, so the first sighting of a patch-id
+            # is the newest commit that carries it.
+            out.setdefault(parts[0], parts[1])
+    return out
+
+
+def annotate_landing(rows, *, db=None) -> list[dict]:
+    """Copy ``rows`` and add ``landed`` / ``landed_commit`` to each.
+
+    One query over ``code_findings_landing`` for the rows' distinct ``run_id``
+    values. A missing table, a DB error or an unknown run marks the row
+    ``landed: False`` — fail-open keeps findings. Never raises.
+    """
+    rows = list(rows or [])
+    if not rows:
+        return []
+    run_ids = sorted({str(r.get("run_id")) for r in rows
+                      if isinstance(r, dict) and r.get("run_id") is not None})
+    landed: dict[str, str | None] = {}
+    if run_ids:
+        con = _open(db)
+        if con is not None:
+            try:
+                placeholders = ", ".join("?" for _ in run_ids)
+                landed = {
+                    str(r[0]): r[1]
+                    for r in con.execute(
+                        f"SELECT run_id, landed_commit FROM code_findings_landing "
+                        f"WHERE run_id IN ({placeholders})",
+                        tuple(run_ids),
+                    )
+                }
+            except sqlite3.Error:
+                landed = {}
+            finally:
+                try:
+                    con.close()
+                except sqlite3.Error:
+                    pass
+    out: list[dict] = []
+    for r in rows:
+        annotated = dict(r) if isinstance(r, dict) else {"row": r}
+        run_id = str(annotated.get("run_id") or "")
+        commit = landed.get(run_id) if run_id else None
+        annotated["landed"] = bool(commit)
+        annotated["landed_commit"] = commit
+        out.append(annotated)
+    return out
+
+
+def check_landing(home, *, db=None, ref: str = _DEFAULT_LANDING_REF,
+                  repo_root=None) -> dict:
+    """Record, per run, whether its diff landed on ``ref`` (LF-R11b).
+
+    Walks the runs that have a ``code_findings`` row and no landing row for
+    this ``checked_ref``. For each: the run's patch-id (skipped when it has no
+    diff), the repo it targeted (``repo_identity(_run_target_cwd(run_dir))``,
+    else ``repo_root``, else ``MINI_ORK_ROOT``/cwd), and a per-repo
+    ``landed_patch_ids`` lookup cached across runs. ``since`` is the run's
+    minimum finding ``ts``, which bounds the ``git log`` walk.
+
+    ``landed_commit`` records the commit that carries the diff, or NULL when it
+    was checked and not found. A run with no diff gets no row at all. Rows are
+    never deleted here: hiding is a read-path decision.
+
+    Returns ``{"runs_checked", "landed", "reason", "home", "db", "ref"}`` with
+    the ``harvest`` reason vocabulary. Idempotent: a second call with the same
+    ref returns ``runs_checked == 0``. Cold-safe and never raises.
+    """
+    stats = {"runs_checked": 0, "landed": 0, "reason": "ok",
+             "home": home or "", "db": _resolve_db(db) or "", "ref": str(ref)}
+    if not home:
+        stats["reason"] = "no_home"
+        return stats
+    runs_dir = os.path.join(home, "runs")
+    if not os.path.isdir(runs_dir):
+        stats["reason"] = "no_runs_dir"
+        return stats
+    ensure_schema(db)
+    con = _open(db)
+    if con is None:
+        stats["reason"] = "no_db"
+        return stats
+    fallback_root = repo_root or os.environ.get("MINI_ORK_ROOT") or os.getcwd()
+    cache: dict[str, dict] = {}
+    try:
+        try:
+            pending = con.execute(
+                """
+                SELECT f.run_id, MIN(f.ts)
+                  FROM code_findings f
+                  LEFT JOIN code_findings_landing l
+                         ON l.run_id = f.run_id AND l.checked_ref = ?
+                 WHERE f.run_id IS NOT NULL AND l.run_id IS NULL
+                 GROUP BY f.run_id
+                """,
+                (str(ref),),
+            ).fetchall()
+        except sqlite3.Error as e:
+            stats["reason"] = "db_error"
+            print(f"  [warn] code_findings: check_landing failed: {e}",
+                  file=sys.stderr)
+            return stats
+        now = int(time.time())
+        for run_id, min_ts in pending:
+            run_id = str(run_id)
+            run_dir = os.path.join(runs_dir, run_id)
+            patch_id = run_patch_id(run_dir) if os.path.isdir(run_dir) else None
+            if not patch_id:
+                # No diff to identify: nothing to record, and a later pass may
+                # still find one (the run may not be finished).
+                continue
+            repo = repo_identity(_run_target_cwd(run_dir))
+            if not repo:
+                repo = fallback_root
+            if repo not in cache:
+                cache[repo] = landed_patch_ids(repo, ref=ref,
+                                               since=_epoch_seconds(min_ts))
+            landed_commit = cache[repo].get(patch_id)
+            try:
+                con.execute(
+                    "INSERT OR REPLACE INTO code_findings_landing "
+                    "(run_id, patch_id, checked_ref, landed_commit, checked_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (run_id, patch_id, str(ref), landed_commit, now),
+                )
+                con.commit()
+            except sqlite3.Error as e:
+                print(f"  [warn] code_findings: landing {run_id} failed: {e}",
+                      file=sys.stderr)
+                stats["reason"] = "db_error"
+                continue
+            stats["runs_checked"] += 1
+            if landed_commit:
+                stats["landed"] += 1
+    except Exception as e:  # noqa: BLE001 — cold-safe by contract
+        stats["reason"] = "db_error"
+        print(f"  [warn] code_findings: check_landing failed: {e}",
+              file=sys.stderr)
+    finally:
+        try:
+            con.close()
+        except sqlite3.Error:
+            pass
+    return stats
+
+
 # ── DB plumbing (mirrors ledger.py) ───────────────────────────────────────────
 
 
@@ -920,7 +1423,7 @@ def _open(db=None) -> sqlite3.Connection | None:
     return con
 
 
-# Byte-consistent with db/migrations/0064_code_findings.sql + 0078 (see
+# Byte-consistent with db/migrations/0064_code_findings.sql + 0078 + 0079 (see
 # prior-art lens: ensure_schema DDL must not drift from the migrations).
 _DDL = """
 CREATE TABLE IF NOT EXISTS code_findings (
@@ -946,6 +1449,15 @@ CREATE TABLE IF NOT EXISTS code_findings_runs (
     harvested_at INTEGER NOT NULL,
     n            INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS code_findings_landing (
+    run_id        TEXT PRIMARY KEY,
+    patch_id      TEXT NOT NULL DEFAULT '',
+    checked_ref   TEXT NOT NULL DEFAULT 'origin/main',
+    landed_commit TEXT,
+    checked_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_code_findings_landing_patch
+    ON code_findings_landing(patch_id);
 """
 
 
@@ -958,8 +1470,9 @@ def _has_column(con, table: str, column: str) -> bool:
 
 def ensure_schema(db=None) -> None:
     """Idempotent CREATE TABLE + CREATE INDEX, plus the LF-R12 ``target_repo``
-    ALTER. Never raises — a CREATE failure is a warning, not a stop-the-line
-    event.
+    ALTER and the LF-R11b ``code_findings_landing`` twin (the same DDL
+    ``0079_code_findings_landing.sql`` applies). Never raises — a CREATE failure
+    is a warning, not a stop-the-line event.
 
     ``CREATE TABLE IF NOT EXISTS`` is a no-op on a DB migrated past 0064, so the
     new column is added explicitly when missing. This is the same column
@@ -1119,6 +1632,14 @@ def _harvest_run(con, run_id, run_dir, repo_root):
             skipped += 1
         is_review = source.startswith("review:")
         for finding in findings:
+            # LF-R11a: the review path already filters through classify_note;
+            # the verifier path did not, so a failed verifier whose only note is
+            # a delivery complaint ("pushed to origin/main before the reviewer
+            # node ran") was still stored. Gate every source centrally, BEFORE
+            # ``seen_review`` bookkeeping, so a skipped note can never shadow a
+            # later real finding with the same (file, line, issue) key.
+            if classify_note(finding["issue"]) != "code":
+                continue
             file = normalize_file(finding["file"], repo_root=repo_root,
                                   known_paths=paths, target_cwd=target_cwd)
             if is_review:
@@ -1817,6 +2338,9 @@ def _print_human(cmd, result) -> None:
         print(f"reharvested {result['runs']} run(s), {result['findings']} finding(s)")
     elif cmd == "backfill-target-repo":
         print(f"backfilled {result} finding row(s) with a target repo")
+    elif cmd == "check-landing":
+        print(f"checked {result['runs_checked']} run(s), "
+              f"{result['landed']} landed on {result['ref']}")
     else:  # show
         for r in result:
             loc = r["file"] or ""
@@ -1858,6 +2382,13 @@ def main(argv=None) -> int:
                    help="re-read every run dir that still exists under home/runs")
     sub.add_parser("backfill-target-repo", parents=[common],
                    help="stamp target_repo on NULL rows from their run profiles")
+    p_landing = sub.add_parser("check-landing", parents=[common],
+                               help="record whether each run's diff landed on "
+                                    "origin/main")
+    p_landing.add_argument("--ref", default=_DEFAULT_LANDING_REF,
+                           help="git ref to search (default: origin/main)")
+    p_landing.add_argument("--repo-root", default=None,
+                           help="fallback repo when a run has no target cwd")
 
     args = ap.parse_args(argv)
     home = args.home or os.environ.get("MINI_ORK_HOME") or _DEFAULT_HOME
@@ -1876,6 +2407,9 @@ def main(argv=None) -> int:
         result = reharvest(home, db=args.db)
     elif args.cmd == "backfill-target-repo":
         result = backfill_target_repo(home, db=args.db)
+    elif args.cmd == "check-landing":
+        result = check_landing(home, db=args.db, ref=args.ref,
+                               repo_root=args.repo_root)
     else:  # show
         result = findings_for(args.path, db=args.db)
 
@@ -1884,10 +2418,6 @@ def main(argv=None) -> int:
     else:
         _print_human(args.cmd, result)
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
 
 
 def parse_review(text) -> list[dict]:
@@ -1909,3 +2439,12 @@ def parse_verifier(name, payload) -> list[dict]:
     is the first path in that text, if any. Passed verifiers yield [].
     """
     return [f for f in _parse_verifier_raw(name, payload) if f]
+
+
+# The entrypoint goes LAST: ``python -m mini_ork.learning.code_findings``
+# executes the module top to bottom, so a guard above ``parse_review`` /
+# ``parse_verifier`` would run ``reharvest``/``harvest`` before the parsers
+# exist and fail with ``NameError: parse_review is not defined`` on every run
+# (live 2026-10-17, 619 runs). Imported use was never affected.
+if __name__ == "__main__":
+    raise SystemExit(main())

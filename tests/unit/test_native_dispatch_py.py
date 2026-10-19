@@ -26,7 +26,7 @@ def test_no_exec_subs_no_trampoline():
 
 def test_all_former_exec_subs_registered_natively():
     expected = {
-        "improve", "eval", "promote", "init", "update", "spawn", "scheduler",
+        "improve", "eval", "promote", "init", "onboard", "update", "spawn", "scheduler",
         "epics", "bugs", "inject", "review", "traceotter", "metrics",
         "rollback", "resume", "recover", "serve", "bug-collector", "conductor",
         "coord", "concord", "lifetime", "self-improve", "topology", "usage-report", "watchdog",

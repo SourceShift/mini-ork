@@ -1,0 +1,218 @@
+{
+  "schema_version": "1",
+  "panel_id": "run-1792352699-84084",
+  "lane": "activation",
+  "model": "GLM-5.3",
+  "candidates": [
+    {
+      "candidate_id": "A1",
+      "name": "mini-ork demo: one command to a completed, verified run, offline",
+      "evidence": [
+        "git -C $REF show HEAD:docs/start/getting-started.md:28-35 — 'Try it in one command: npx openclaw@latest … verifies it with a real completion, saves the config, and opens the web dashboard'",
+        "reference README.md:51 — 'On a fresh install, the installer scripts start onboarding automatically'",
+        "mini-ork examples/00-demo.sh:1-20 — an offline dry-run demo already exists as a bash script (temp dir, init, doctor, synthetic kickoff, dry run)",
+        "mini-ork README.md:256-268 — the documented first workflow is six manual copy-paste steps",
+        "mini-ork examples/01-hello-world/README.md:21 — example quick start uses the author's personal path 'cp ~/ps/mini-ork/...'"
+      ],
+      "star_impact": "high",
+      "effort": "S",
+      "fit": "high",
+      "why": "The developer moment won is 'I ran one command and the classify→plan→execute→verify loop completed in front of me.' mini-ork's demo content already exists (examples/00-demo.sh) but is not a command and is not in the Start-here path, so every visitor must invent six scaffolding steps whose example doc contains a broken personal path.",
+      "first_step": "Register a 'demo' handler in mini_ork/cli/main.py _build_default_registry() (alongside doctor) that wraps the examples/00-demo.sh flow in Python — temp dir, mini-ork init, synthetic kickoff, MINI_ORK_DRY_RUN=1 run code-fix — printing what the loop proved, where the artifacts live, and ending with 'next: mini-ork onboard'."
+    },
+    {
+      "candidate_id": "A2",
+      "name": "mini-ork onboard: credential detection + verified-probe wizard",
+      "evidence": [
+        "git -C $REF show HEAD:docs/start/wizard.md:115-126 — 'Detect configured models, API-key environment variables, supported local AI CLIs, and already installed tool-capable models from reachable Ollama or LM Studio servers … Only that connection is tested with a real completion'",
+        "git -C $REF show HEAD:docs/start/onboarding-overview.md:11-12,36 — 'Every path establishes inference first … verifies a real completion'",
+        "mini-ork README.md:275-277 — 'For a real run, review .mini-ork/config/agents.yaml, authenticate the CLI or configure the providers it names' (manual reading before first value)",
+        "mini-ork mini_ork/cli/validate.py:30-35 — a lane liveness probe already exists ('one cached 1-token probe per configured lane, ten-minute TTL')",
+        "mini-ork mini_ork/cli/main.py:2141-2189 — doctor's provider preflight is presence-only ('GLM_API_KEY unset; run: mini-ork providers configure glm')"
+      ],
+      "star_impact": "high",
+      "effort": "M",
+      "fit": "high",
+      "why": "The cliff between dry run and first real run is the credential wall. OpenClaw's detection reuses what the visitor already has (a Claude/Codex CLI login on PATH, an env key, a local model server) and verifies it with a real completion before saying 'Inference ready' — converting 'go get an API key' into 'press 1 to reuse the claude CLI you already have.'",
+      "first_step": "Add mini_ork/cli/onboard.py: detect claude/codex CLIs via shutil.which, env keys and vault entries via provider_environment(), and reachable OpenAI-compatible locals via the openai-chat kind; probe each candidate using validate.py's lane probe; write the winner via mini-ork providers configure / agents.yaml; register in _build_default_registry()."
+    },
+    {
+      "candidate_id": "A3",
+      "name": "mini-ork triage: sanitized diagnosis bundle handed to a coding agent",
+      "evidence": [
+        "reference docs/cli/triage.md:9-40 — detection order (codex, claude, pi, opencode, …); 'The prompt includes the OpenClaw version, platform … prioritized Doctor findings with repair hints'; archive 'excludes secrets, tokens, raw chat payloads, and raw logs'",
+        "git -C $REF show HEAD:docs/start/getting-started.md:158-172 — 'One command turns the current state of your install into a diagnosis you can act on' (openclaw triage)",
+        "mini-ork docs/operator/provider-triage.md — triage doc exists but is drift-panel-specific (Layer 2b README drift), not a first-run path",
+        "mini-ork mini_ork/cli/lane_preflight.py:532-556 — blocked runs emit good fix: lines, but nothing bundles run state for an agent or a human"
+      ],
+      "star_impact": "high",
+      "effort": "M",
+      "fit": "high",
+      "why": "mini-ork IS an agent dispatcher; 'mini-ork diagnosed its own broken setup by dispatching a repair prompt to my own claude CLI' is a shareable, on-brand moment. It also rescues the newcomer whose first real run died on a stale engine pointer or missing key — exactly the user who unstars and leaves.",
+      "first_step": "New mini_ork/cli/triage_cmd.py: collect version + engine commit (_engine_commit in main.py), doctor output, last run's lane_preflight/verdict.json/stderr tail from .mini-ork/runs/<id>/, emit a redacted bounded prompt (allowlist discipline of mini_ork/dispatch/secrets.py), then print the handoff command or dispatch one bounded repair turn through mini-ork's own lanes."
+    },
+    {
+      "candidate_id": "A4",
+      "name": "mini-ork doctor --fix: from presence report to guided repair",
+      "evidence": [
+        "reference docs/cli/doctor.md:9-19 — 'Health checks and quick fixes … --fix'; seven doc pages including 'Gateway and service recovery'",
+        "mini-ork mini_ork/cli/main.py:2141-2189 — _doctor_handler prints [OK]/[MISSING]/[WARN] and names fixes inline ('run: mini-ork providers configure glm', 'run mini-ork migrate') but executes none"
+      ],
+      "star_impact": "medium",
+      "effort": "S",
+      "fit": "high",
+      "why": "Doctor is the command every stuck visitor runs first; one that ends with 'run mini-ork doctor --fix to repair these 3 findings' converts a dead end into progress. mini-ork's doctor already knows every fix — it makes the human retype them.",
+      "first_step": "Extend _doctor_handler with --fix: for each WARN it already emits, run the remediation it already names (interactive providers configure <family> for unset keys; mini-ork migrate when _db_engine_version lags; mini-ork install --force for a stale managed command), printing one line per repair."
+    },
+    {
+      "candidate_id": "A5",
+      "name": "First-60-seconds ladder + first-run FAQ",
+      "evidence": [
+        "reference docs/help/troubleshooting.md:11-40 — '## First 60 seconds': ordered command ladder (triage → status → gateway probe → doctor → …) with 'Good output, one line each'",
+        "reference docs/help/faq-first-run.md — dedicated first-run FAQ with anchors like 'I am stuck' and 'Installer stuck?'",
+        "mini-ork README.md — no troubleshooting section; docs/operator/provider-triage.md targets drift-panel operators"
+      ],
+      "star_impact": "medium",
+      "effort": "S",
+      "fit": "high",
+      "why": "The questions mini-ork's first-run path generates are finite and predictable (venv/PATH confusion, dry run left no state.db row, claude CLI missing, key unset, empty ui/ submodule, engine-pointer drift). A pre-written symptom ladder with expected-good output turns the most common churn moment into a self-serve exit.",
+      "first_step": "Add docs/operator/first-run.md with the ordered ladder for the Start-here path (doctor → validate → dry run → providers status → real run), one line of expected-good output each; link it from README 'Start here' and from the lane_preflight fix: line (mini_ork/cli/lane_preflight.py:547-556)."
+    },
+    {
+      "candidate_id": "A6",
+      "name": "Interrupted-run resume as the default story",
+      "evidence": [
+        "git -C $REF show HEAD:docs/start/wizard.md:26-27 — 'Interrupted baseline setup resumes on the next run'",
+        "mini-ork mini_ork/cli/run_resume.py:131-181 — run --resume exists and is strict (hard-errors on unknown run_id, re-dispatches only the redispatch set)",
+        "mini-ork README.md:256-281 — the Start-here path never mentions what happens after Ctrl+C on a real run"
+      ],
+      "star_impact": "medium",
+      "effort": "S",
+      "fit": "medium",
+      "why": "A first real run that dies at minute 3 of a 2-5 minute hello-world is the classic rage-quit moment; one sentence naming the run id and the exact --resume command at the stall keeps the visitor in the funnel.",
+      "first_step": "After any interrupted run, print a banner naming the run id and the exact --resume command; add the same sentence to README's first-workflow section (touchpoint: the run lifecycle exit path in mini_ork/cli/main.py / run_resume.py where the run id is already known)."
+    },
+    {
+      "candidate_id": "A7",
+      "name": "Verified install tail: version stamp + post-install self-check",
+      "evidence": [
+        "reference docs/install/index.md:221-233 — 'Verify the install': openclaw --version → openclaw doctor → openclaw gateway status",
+        "reference docs/install/installer.md:157 — post-install 'starts onboarding before doctor or gateway checks. With --no-onboard or no TTY, it prints the command to finish setup later'",
+        "mini-ork scripts/full_install.py:148-149 — installer ends '✓ MiniOrk full runtime installed' + one providers hint; no verification, no first-run pointer",
+        "mini-ork mini_ork/cli/main.py:2194-2197 — _version_handler prints static 'mini-ork 0.9.0' while _HELP says '(v0.1)' and examples/01-hello-world/README.md:11 says '0.1.0'"
+      ],
+      "star_impact": "medium",
+      "effort": "S",
+      "fit": "high",
+      "why": "'Did it work?' is the visitor's first question after any installer. A version command that proves the install (engine commit, venv python, doctor summary) and an install tail that points at a 60-second first success convert doubt into momentum — and fix a visible version-honesty crack on the first command a newcomer runs.",
+      "first_step": "(1) Make _version_handler print version + engine commit + venv python path (local facts doctor already computes); (2) end scripts/full_install.py by running mini-ork doctor and printing 'first success in 60 seconds: mini-ork demo', with a non-TTY opt-out mirroring the reference's --no-onboard."
+    },
+    {
+      "candidate_id": "A8",
+      "name": "Key-free first real run: local OpenAI-compatible lane as onboard fallback",
+      "evidence": [
+        "git -C $REF show HEAD:docs/start/wizard.md:117-118 — detection includes 'tool-capable models from reachable Ollama or LM Studio servers … This read-only pass never downloads a model'",
+        "mini-ork mini_ork/dispatch/openai_chat_transport.py:1-10 — an openai-chat provider kind already exists for 'OpenRouter, Groq, Together, local vLLM, etc.' via /chat/completions",
+        "mini-ork examples/00-demo.sh:73 — the only key-free path (dry run) records no task_runs row, so no real verified run is possible without a credential"
+      ],
+      "star_impact": "high",
+      "effort": "M",
+      "fit": "medium",
+      "why": "A visitor without any API key can today only see a rehearsal, never a real verified run (plan → dispatch → verdict.json). A 'no key? use localhost:11434' onboarding fallback lets the first real loop complete with what the visitor already has — the demo path that does not require owning the hardest prerequisite.",
+      "first_step": "Add a 'local' lane kind in mini_ork/cli/providers.py building on the existing openai-chat provider kind with base_url=http://localhost:11434/v1, probed during onboarding (A2); document it as the zero-credential default in README 'Start here'."
+    },
+    {
+      "candidate_id": "A9",
+      "name": "Windows one-line installer (install.ps1)",
+      "evidence": [
+        "reference README.md:33-35 — 'iwr -useb https://openclaw.ai/install.ps1 | iex'; package.json ships scripts/install.ps1",
+        "mini-ork README.md:235-241 — native Windows requires manually winget-installing five packages (Python.Python.3.11, Git.Git, jqlang.jq, MikeFarah.yq, SQLite.SQLite) then 'py -3 .\\scripts\\full_install.py'"
+      ],
+      "star_impact": "medium",
+      "effort": "M",
+      "fit": "medium",
+      "why": "Every Windows-native visitor hits a six-step manual prerequisite wall at minute one — a population-sized activation leak. The fix is a script wrapping exactly the steps the README currently asks the human to do by hand.",
+      "first_step": "Add install.ps1 at repo root that runs the exact winget package list from README:236-238 (idempotent, skipping installed ones) then py -3 scripts\\full_install.py; replace the README winget block with the one-liner."
+    },
+    {
+      "candidate_id": "A10",
+      "name": "Browser success view (mini-ork dashboard-equivalent)",
+      "evidence": [
+        "reference README.md:62-66 — 'openclaw dashboard … opens the Control UI in your browser. If it loads, everything is working'",
+        "mini-ork docs/UI.md:1-20 — the IDE is a Rust/Zed fork in a submodule that 'cannot be built from this repo'; the web frontend was deliberately removed ('the old React SPA … has been removed')"
+      ],
+      "star_impact": "medium",
+      "effort": "L",
+      "fit": "low",
+      "why": "Visual proof of life is the strongest share trigger (screenshot-to-social) and OpenClaw's onboarding ends on exactly that. But mini-ork deliberately removed its web UI in favor of a native IDE, so this collides with an architecture decision — listed for completeness and expected to be rejected on fit."
+      ,
+      "first_step": "If pursued at all: a static 'mini-ork board --web' page over the existing serve.py read API (mini_ork/cli/serve.py) rendering the last run's verdict — not a general dashboard."
+    }
+  ],
+  "shortlist": ["A1", "A2", "A3", "A7", "A8", "A4", "A5", "A9", "A6", "A10"],
+  "gap_analysis": [
+    {
+      "candidate_id": "A1",
+      "miniork_today": "examples/00-demo.sh is a complete offline dry-run demo (temp project, init, doctor, synthetic kickoff, run, artifact inspection); README:256-268 documents a six-step manual first workflow instead; the demo script is never mentioned in Start-here.",
+      "gap": "No 'mini-ork demo' subcommand in _build_default_registry() (mini_ork/cli/main.py:2180-2200); the demo requires knowing the checkout path and running bash; the example README's copy line uses a personal absolute path (~\\/ps\\/mini-ork) that fails elsewhere."
+    },
+    {
+      "candidate_id": "A2",
+      "miniork_today": "doctor's provider preflight (main.py:2141-2189) is presence-only with configure hints; providers status/configure exists (providers.py:29-32); validate.py Check 5 probes configured lanes with a cached 1-token probe; secrets fail closed (dispatch/secrets.py).",
+      "gap": "No detection of credentials the visitor already has (CLIs on PATH, env keys, vault, local servers), no guided sequence, and no real-completion verification step that declares 'inference ready' — the README's real-run step is 'review agents.yaml, authenticate the CLI or configure the providers it names'."
+    },
+    {
+      "candidate_id": "A3",
+      "miniork_today": "doctor reports issues read-only; lane_preflight emits per-lane reasons and a fix: line (lane_preflight.py:532-556); run artifacts (verdict.json, execute_stderr, lane_preflight JSON) persist under .mini-ork/runs/<id>/; docs/operator/provider-triage.md covers drift-panel providers only.",
+      "gap": "No triage command that bundles sanitized state (version, engine commit, doctor findings, last-run stderr) into an agent-ready prompt and hands it to a detected coding agent or a mini-ork lane."
+    },
+    {
+      "candidate_id": "A4",
+      "miniork_today": "_doctor_handler (main.py:2141-2189) prints [OK]/[MISSING]/[WARN] across tools, engine-vs-DB drift, provider env vars, and vault backends, and names remediations inline.",
+      "gap": "No --fix posture: the named remediations (providers configure <family>, mini-ork migrate, install --force) are not executable from doctor; no repair success/failure reporting."
+    },
+    {
+      "candidate_id": "A5",
+      "miniork_today": "validate.py ships a Fix:-hint convention for pre-run findings; docs/operator/ covers operators (env-vars, provider-triage, scheduler-retry), not newcomers.",
+      "gap": "No symptom-first first-run ladder with expected-good output, no first-run FAQ; error messages (lane_preflight fix: lines) do not link to any self-serve recovery doc."
+    },
+    {
+      "candidate_id": "A6",
+      "miniork_today": "run --resume / resume / recover / rollback exist; run_resume.py:131-181 resolves home/state.db, hard-errors on unknown run ids, re-dispatches only the plan's redispatch set.",
+      "gap": "Interruption is invisible in the first-run path: no banner naming the interrupted run id and the exact --resume command, and README's first-workflow section never mentions resume for real runs."
+    },
+    {
+      "candidate_id": "A7",
+      "miniork_today": "install.sh execs full_install.py which ends with a success line plus one providers hint (full_install.py:148-149); _version_handler prints a static version string (main.py:2194-2197).",
+      "gap": "No post-install verification or first-success pointer; version output disagrees across surfaces (0.9.0 vs help 'v0.1' vs example doc '0.1.0'); no engine/venv facts in the version line."
+    },
+    {
+      "candidate_id": "A8",
+      "miniork_today": "The openai-chat provider kind (dispatch/openai_chat_transport.py) already supports local OpenAI-compatible endpoints like vLLM; dry run (MINI_ORK_DRY_RUN=1) is the only key-free path.",
+      "gap": "Dry run records no task_runs row (examples/00-demo.sh:73), so no real verified run completes without a credential; no local-lane default or localhost:11434 fallback offered anywhere in onboarding or README."
+    },
+    {
+      "candidate_id": "A9",
+      "miniork_today": "README:235-241 documents the Windows path as five manual winget installs plus py -3 scripts/full_install.py.",
+      "gap": "No install.ps1 one-liner; the Windows newcomer performs by hand what the Unix newcomer gets in one curl."
+    },
+    {
+      "candidate_id": "A10",
+      "miniork_today": "serve.py exposes a local observability API; board serves the IDE; the UI is a Rust/Zed fork in the ui/ submodule that cannot be built from this repo (docs/UI.md), and the web frontend was deliberately removed.",
+      "gap": "No human-visible success view a newcomer can open in one command — but filling it contradicts the project's own architecture decision, so the gap is arguably intentional."
+    }
+  ],
+  "open_questions": [
+    "Would the maintainers accept an interactive wizard in the CLI (A2), given mini-ork's operator-first, no-daemon minimalism — or should onboarding be a non-interactive 'mini-ork onboard --check' that prints a plan? A negative answer demotes A2 and promotes A4/A5.",
+    "Is a PyPI publish planned? 'pipx run mini-ork demo' would be the true npx equivalent and would change A1's shape (no clone at all before first value).",
+    "Will the dry-run no-task_runs-row behavior change (examples/00-demo.sh:73)? If dry runs record state, A1's verified-success story strengthens and A8's urgency drops.",
+    "What share of the target audience is on native Windows vs WSL — this drives A9's rank — and is there CI capacity to keep a PowerShell installer honest?",
+    "For A8, can mini-ork's verifier gates pass on typical local models, or does the key-free lane need a special lightweight recipe so the first real run does not fail its own gates?",
+    "Does the cost-governance pillar interact with A8 — is 'first run free because it is local' a message the project wants to send?"
+  ],
+  "read_only_attestation": {
+    "reference_modified": false,
+    "target_modified": false,
+    "files_written": ["lens-activation.md", "context-activation_lens.json"]
+  }
+}

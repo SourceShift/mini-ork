@@ -78,10 +78,6 @@ def _feed(sections: list[dict]) -> dict:
     return next(s for s in sections if s["type"] == "feed")
 
 
-def _lst(sections: list[dict], title: str) -> dict:
-    return next(s for s in sections if s["type"] == "list" and s["title"] == title)
-
-
 # ── activity feed ───────────────────────────────────────────────────────────
 
 def test_feed_leads_with_the_newest_event(home: Path, run: Run) -> None:
@@ -159,32 +155,42 @@ def test_ended_run_is_not_live_and_has_no_composer(home: Path) -> None:
                                                           "card": {"status": "executing"}})) == 5
 
 
-# ── steering queue ──────────────────────────────────────────────────────────
+# ── steering rows ───────────────────────────────────────────────────────────
 
-def test_steering_queue_distinguishes_queued_read_and_expired(home: Path, run: Run) -> None:
+def test_steering_rows_carry_their_state_into_the_stream(
+        home: Path, run: Run) -> None:
+    """Steering is the stream's other side: each row says whether it is still
+    queued, was read, or expired, and who sent it."""
     _steering(home, message="queued note", age_s=5)
     _steering(home, message="already read", age_s=10, consumed=True)
     _steering(home, message="stale note", age_s=100, expires_in_s=-10,
               source="orchestrator-watch", severity="warn")
 
-    queue = _lst(orch_tab.orchestrator_tab(run), "Steering queue")
-    subs = {item["t"].split(" · ", 1)[1]: item["sub"] for item in queue["items"]}
+    feed = _feed(orch_tab.orchestrator_tab(run, {"orch_view": "steer"}))
+    details = {item["t"]: item["d"] for item in feed["items"]}
 
-    assert subs["queued note"].endswith("queued")
-    assert subs["already read"].endswith("read")
-    assert subs["stale note"].endswith("expired")
-    assert "orchestrator-watch" in subs["stale note"]
-
-
-def test_steering_queue_empty_state_explains_the_composer(home: Path, run: Run) -> None:
-    queue = _lst(orch_tab.orchestrator_tab(run), "Steering queue")
-    assert "No steering rows" in queue["items"][0]["t"]
+    assert details["queued note"].endswith("queued")
+    assert details["already read"].endswith("read")
+    assert details["stale note"].endswith("expired")
+    assert "orchestrator-watch" in details["stale note"]
 
 
-# ── watcher card ────────────────────────────────────────────────────────────
+def test_steering_empty_state_explains_the_composer(home: Path, run: Run) -> None:
+    """With nothing queued the steers view says so, and the composer stays
+    docked so the input is not mistaken for a broken panel."""
+    feed = _feed(orch_tab.orchestrator_tab(run, {"orch_view": "steer"}))
 
-def test_watcher_card_reports_a_live_process(home: Path, run: Run,
-                                             monkeypatch: pytest.MonkeyPatch) -> None:
+    assert feed["items"] == []
+    assert feed["empty"].startswith("No steers")
+    assert feed["footer"]["cli"][:3] == ["board", "steer", RUN]
+
+
+# ── watcher state ───────────────────────────────────────────────────────────
+
+def test_watcher_state_rides_the_feed_status_line(home: Path, run: Run,
+                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    """The watcher has no card of its own: its state and numbers are the
+    stream's status line, so the tab reads as one live surface."""
     monkeypatch.setenv("MO_ORCH_WATCH", "1")
     monkeypatch.setenv("MO_ORCH_WATCH_INTERVAL_S", "20")
     monkeypatch.setenv("MO_ORCH_WATCH_MAX_STEERS", "3")
@@ -194,17 +200,13 @@ def test_watcher_card_reports_a_live_process(home: Path, run: Run,
         "tick_count": 7, "steers": 1,
     }), encoding="utf-8")
 
-    sections = orch_tab.orchestrator_tab(run)
-    feed = _feed(sections)
-    card = next(s for s in sections if s["type"] == "kv")
+    feed = _feed(orch_tab.orchestrator_tab(run))
 
     assert feed["status"] == "watching"
     assert feed["status_c"] == "green"
     assert "steers 1/3" in feed["meta"]
-    kv = {item["k"]: item["v"] for item in card["items"]}
-    assert kv["state"] == "watching"
-    assert kv["steers"] == "1/3"
-    assert kv["cadence"] == "every 20s"
+    assert "every 20s" in feed["meta"]
+    assert "tick 7" in feed["meta"]
 
 
 def test_watcher_off_is_named_not_hidden(home: Path, run: Run,
@@ -229,7 +231,20 @@ def test_armed_run_without_a_state_file_says_armed(home: Path, run: Run,
 
 
 def test_composer_rides_the_orchestrator_tab_while_the_run_lives(home: Path, run: Run) -> None:
-    composer = [s for s in orch_tab.orchestrator_tab(run) if s["type"] == "composer"]
+    """The composer is the feed's docked footer — one surface, not a card."""
+    feed = _feed(orch_tab.orchestrator_tab(run))
 
-    assert len(composer) == 1
-    assert composer[0]["cli"][:3] == ["board", "steer", RUN]
+    assert feed["footer"]["cli"][:3] == ["board", "steer", RUN]
+
+
+def test_finished_run_gets_the_note_instead_of_a_composer(home: Path) -> None:
+    run_dir = home / "runs" / RUN
+    run_dir.mkdir(parents=True)
+    finished = Run(id=RUN, home=home, run_dir=run_dir, row={},
+                   card={"status": "published"}, nodes=[], cols=[], calls=[],
+                   recipe_dir=None, workspace=None)
+
+    feed = _feed(orch_tab.orchestrator_tab(finished))
+
+    assert "cli" not in feed["footer"]
+    assert "finished" in feed["footer"]["note"]

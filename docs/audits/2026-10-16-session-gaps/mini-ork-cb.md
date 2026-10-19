@@ -154,8 +154,105 @@ e11b (`937506bc`, then the regression fix `d71a28d8`) → e6 (`51c37434`) → e1
   after `_wall()` (ours: a blank line, theirs: none). Resolved to main's two-blank-line spacing.
 - Green gate on the land worktree before merge: 255 passed, 1:27.
 
-**Still open:** the IDE renderer halves (C1, C2, C12, C13-render, C14-render, C24, C26) and
-the engine halves not covered by the four landed runs (C3, C4, C5, C8, C9, C12, C18, C21, C25).
-SDD option A-vs-B remains blocked on the user.
+**Engine halves landed after (d) opened.** Each is a `framework-edit` run whose
+diff was independently re-verified before merge:
+
+```
+git merge-base --is-ancestor 18ffcae7 origin/main   # C3  triage names the real failing node  → true
+git merge-base --is-ancestor fdf55574 origin/main   # C4+C5 one Needs-you lane, explained decisions → true
+git merge-base --is-ancestor 7d0ac72a origin/main   # C9+C12 Checks tab + tab badges          → true
+git merge-base --is-ancestor a70f9271 origin/main   # C8  Changes tab on the main page         → true
+git merge-base --is-ancestor 22c36d27 origin/main   # C25 failed run says whose fault it is    → true
+git merge-base --is-ancestor 899107f0 origin/main   # C18+C21 crumbs, worktree sub, Copy summary → true
+```
+
+- **C3** (`18ffcae7`) — the run rolled back (`impl_moved_base`, reviewer verdict on an
+  earlier out-of-scope round); its final diff was scoped to 3 files and landed after
+  an independent 267-test run. `run.py` gained `_awaiting_node_ids`.
+- **C4+C5** (`fdf55574`) — one `Needs you` lane (`_attention_lane`) at the top of every
+  v2 tab, absorbing the parked review / open gate / cost pause / merge approval / open
+  asks, each with its own buttons; a healthy run renders no lane. Gate callouts always
+  state strategy, from-node, command and unverified levels, falling back to
+  `retry-hint.json`. Landing required a rebase over a peer's `_story_tab` →
+  `_outcome_tab` rename and a stale assert in `test_ide_pages_run_header.py` that was
+  **already red on main** (fixed to assert header-owned controls are not duplicated).
+- **C9+C12** (`7d0ac72a`, run `run-1792233993-49139`, 40m13s, $2.24, reviewer pass) —
+  a Checks tab with one plain-words row per level (state, meaning, deciding file), the
+  level vector still shipped as data, and per-envelope check rows; tab badges
+  (`Checks · 1 ✗` red / proven count green, DAG question count). `verification` is now
+  an alias for `checks` — the vector was being drawn on two tabs with two badges.
+- **C8** (`a70f9271`) — a `Changes` tab between Checks and Kickoff, reusing
+  `run_dock._changes_sections` (never a copy of it) with per-file open actions, and
+  an `Open as patch` header action only when the diff file exists. A broken or empty
+  diff costs the tab's content, never the page.
+- **C25** (`22c36d27`, run `run-1792235591-…`, verdict pass) — a failed run's outcome
+  now asks `mini_ork.triage.blame.attribute` and says whose fault it is in one
+  sentence; `mini_ork` blame adds a confirm-gated `Open triage --promote` action,
+  `consumer` and `unknown` add none. Every read failure falls closed to `unknown`.
+- **C18+C21** (`899107f0`, run `run-1792239907-45563`, verdict pass, 321-test
+  independent re-run) — header `crumbs` (epic › run › retry #N) with a `do` only where
+  navigation exists and never a fabricated crumb; the v2 sub regains the worktree
+  path; a `Copy summary` menu entry pastes goal, outcome line, verification vector,
+  cost and the `mini-ork://run/<id>` link, each line best-effort.
+- **C10** (`5379395a`, run `run-1792243065-98237`, verdict pass, 329-test independent
+  re-run) — a `Did it meet the criteria` table under the outcome verdict, one row per
+  kickoff criterion marked met / unmet / unknown, decided by the verdict's own
+  criterion entries first, then a failed check, then a PROVEN level's evidence; an
+  undecided row says `No check names this criterion.` and only decided rows carry a
+  click-through. The rows are also stamped on `outcome["criteria"]`. Live check on the
+  run's own history: `run-1792243065-98237` renders `2 met · 0 unmet · 0 unknown`.
+- **C16** (`8e69e70a`, run `run-1792245136-98759`, verdict pass, 342-test independent
+  re-run) — a Spend section under the outcome and on Checks: spent vs the per-run cap
+  (the watcher's own resolver), today's spend vs the daily cap, remaining, and a
+  projection only for a running run past its first minute; the outcome carries a
+  `spend` block for the IDE. The run's first cut monkeypatched `json.dumps` globally
+  from a page module — removed before landing; the section is a plain dict.
+  Renders for `hr-smoke-b-152611`: `$0.84 of a $1.00 per-run cap · $0.16 left`,
+  `Daily $33.56 of a $225.00 cap`, `at this rate, ~$1.68 by the end`.
+- **Blame taxonomy** (`5c255d39`) — `impl_moved_base` and `dispatcher-dead` now
+  attribute to `mini_ork` (new `harness` evidence rule), so C25's callout offers the
+  triage action on a harness failure instead of saying it cannot tell. The harness
+  reason outranks a provider signature; artifact verdicts stay `consumer`, infra
+  reasons stay `unknown`. 41 + 13 tests, CLI proof pasted in the run log.
+- **C17** (`f0733db7`, run `run-1792249139-6289`, verdict pass) — the roster was drawn
+  twice (DAG and Agents); it now lives only on Agents. Call-to-node attribution is one
+  shared rule (`_match_calls`) so the cost column and the fallback note cannot
+  disagree. A node served by two models reads `first → last`, its row carries a
+  `fallback` list and a `⇄` marker, and the section note names each sequence plus the
+  failed-call count before the model that answered; one- and zero-model rows are
+  unchanged. The plan's Buddy clause was dropped as obsolete — that surface was removed
+  on 2026-10-16 and is not restored.
+- **C22** (`dd4f7a07`, run `run-1792251123-84567`, verdict pass) — one kind rule
+  (patch → json → log → jsonl → md → other) orders each node's artifact table, the
+  table's `sub` names the kinds present with counts, and every row — including the
+  pinned key artifacts — carries a machine-readable `kind` for the renderer's filter
+  (the box itself is the IDE's; the contract has no filter primitive). The row cap and
+  the single `… N more` accounting are unchanged. A side fix: `impl-<node>.patch` now
+  attributes to its node instead of falling into Run files, because the attribution
+  regex only knew extensions up to three letters.
+- **C23** (`cfba92f3`, run `run-1792253563-27493`, verdict **failed**, reworked by hand) —
+  `lessons promote <id>` approves a `proposed` row under `restore`'s authored-lesson
+  guard; `forget`/`restore` are untouched. The Learnings tab (spec 2) gains
+  `Proposed lessons · N` above the injected sections, linked to a run only by trace
+  membership in `member_item_ids_json`; rows carry Promote (confirm + done) and the
+  existing Forget, and a lessonless pattern offers no Promote so the page never names an
+  action the CLI would refuse. Unreadable member JSON or a missing table costs the
+  section, never the tab. **Incident:** the run failed only its own verification gate —
+  my kickoff passed `test_ide_pages_run_learnings*.py` and `test_ide_pages_run*.py` in
+  one pytest command, and the overlap trips pytest-asyncio's collection recursion. The
+  diff was reused, the glob dropped, an unrequested `resolved_at` write on the refusal
+  path removed, and the suite re-ran green (378). Lesson: the never-repeat-a-path rule
+  applies to globs too — a narrower glob that is a subset of a wider one is still a
+  duplicate.
+
+**Still open:** the IDE renderer halves (C1, C2, C12-render, C13-render, C14-render, C24,
+C26) plus any remaining C-series items. The engine half of the plan is complete through
+C23. SDD option A-vs-B remains blocked on the user.
+
+**Incident, same day:** the first C9+C12 dispatch was killed after its `code_impact_lens`
+found a deterministic scope conflict — the kickoff forbade editing the two tests that pin
+`V2_TABS` and the `"Verification · 1"` label. The kickoff was widened to those exact
+assertions and re-dispatched; the second run published green. Lesson: a page-shape change
+must name the shape pins it invalidates.
 
 ---

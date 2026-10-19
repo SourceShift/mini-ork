@@ -341,16 +341,20 @@ def _seed(home: Path) -> Path:
     return run_dir
 
 
-def test_v2_story_tab_sections(home: Path, monkeypatch) -> None:
+def test_v2_outcome_tab_sections(home: Path, monkeypatch) -> None:
     _seed(home)
     monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
-    page = run_page.build(home, None, {"run": RUN, "tab": "outcome"})
+    page = run_page.build(home, "outcome", {"run": RUN})
 
     kinds = [s["type"] for s in page["sections"]]
     titles = [s["title"] for s in page["sections"]]
     assert kinds[0] == "triage"
-    # The goal the run was asked for leads the content, before the story.
-    assert titles.index("What this run is for") < titles.index("What happened")
+    assert "What happened" in titles
+    assert "hero" in kinds
+    # The Overview tail survives below the story instead of replacing it. The
+    # changed files are the Changes tab's own content and are not repeated here.
+    assert titles.index("What happened") < titles.index("Run inputs")
+    assert "Files changed" not in titles
 
     story = page["sections"][titles.index("What happened")]
     assert story["type"] == "story"
@@ -360,8 +364,8 @@ def test_v2_story_tab_sections(home: Path, monkeypatch) -> None:
 
 def test_story_tab_is_guarded_when_the_section_raises(home: Path, monkeypatch) -> None:
     # A story that raises costs the story section only: triage / hero stay, and
-    # the story slot carries the guarded "Could not read this" section instead
-    # of blanking the whole page.
+    # the tab carries the guarded "Could not read this" section instead of
+    # blanking the whole page.
     _seed(home)
     monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
 
@@ -369,13 +373,12 @@ def test_story_tab_is_guarded_when_the_section_raises(home: Path, monkeypatch) -
         raise RuntimeError("kaboom")
 
     monkeypatch.setattr(run_story, "story_section", boom)
-    page = run_page.build(home, None, {"run": RUN, "tab": "outcome"})
+    page = run_page.build(home, "outcome", {"run": RUN})
 
-    kinds = [s["type"] for s in page["sections"]]
     titles = [s["title"] for s in page["sections"]]
-    assert kinds[0] == "triage"
-    story_at = titles.index("What happened")
-    assert kinds[story_at] == "list"  # S.guarded's failure section
+    assert page["sections"][0]["type"] == "triage"
+    failure = page["sections"][titles.index("What happened")]
+    assert failure["type"] == "list"  # S.guarded's failure section
 
 
 def test_layers_ignore_revise_loop_edges() -> None:

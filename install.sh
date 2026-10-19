@@ -12,6 +12,7 @@
 set -eu
 
 DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
+ORIG_DIR=$(pwd)
 
 # Checkout mode: script lives next to a real mini-ork checkout.
 if [ -e "$DIR/bin/mini-ork" ] && [ -e "$DIR/scripts/full_install.py" ]; then
@@ -90,4 +91,37 @@ fi
 
 cd "$TARGET"
 echo "mini-ork: installing into $TARGET (python: $FOUND_PY)" >&2
-exec "$FOUND_PY" scripts/full_install.py "$@"
+"$FOUND_PY" scripts/full_install.py "$@" || exit $?
+
+# Offer the first-run wizard on a real terminal, the way openclaw's installer
+# does. In a piped install (`curl … | sh`) stdin is the pipe, so prompt through
+# /dev/tty; with no controlling terminal (CI, Docker build) skip silently. Set
+# MINI_ORK_NO_ONBOARD=1 to skip it even interactively.
+TTY=""
+if [ -t 0 ] && [ -t 1 ]; then
+    TTY=stdio
+elif [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    TTY=/dev/tty
+fi
+if [ -n "$TTY" ] && [ "${MINI_ORK_NO_ONBOARD:-0}" != "1" ]; then
+    PY_BIN="$FOUND_PY"
+    if [ -x "$TARGET/.venv/bin/python" ]; then
+        PY_BIN="$TARGET/.venv/bin/python"
+    fi
+    PROMPT='mini-ork: run the first-run wizard now? It initializes a workspace and offers the optional ContextNest and Zed components. [Y/n] '
+    if [ "$TTY" = "stdio" ]; then
+        printf '\n%s' "$PROMPT" >&2
+        read -r ANSWER || ANSWER=n
+    else
+        printf '\n%s' "$PROMPT" >"$TTY"
+        read -r ANSWER <"$TTY" || ANSWER=n
+    fi
+    case "$ANSWER" in
+        ""|y|Y|yes|YES)
+            # The wizard initializes the directory the user ran the installer
+            # from, not the engine checkout this script cd'ed into.
+            cd "$ORIG_DIR"
+            "$PY_BIN" -m mini_ork.cli.onboard
+            ;;
+    esac
+fi

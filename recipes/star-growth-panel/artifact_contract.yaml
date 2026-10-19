@@ -1,0 +1,42 @@
+task_class: star_growth_panel
+expected_artifact: composite
+success_verifiers:
+  - verifiers/lens-completeness.py
+failure_policy: request_changes
+rollback_policy: >
+  Keep all four lens reports and sidecars under runs/<id>/ for human
+  inspection. Discard synthesis if verification fails.
+
+source_artifact: synthesis.md
+# BARE run-local names, deliberately (see audit-judge-panel-4l): the publisher
+# resolves a name with no directory component against MINI_ORK_RUN_DIR and
+# preserves it there instead of committing it into the target repo. This panel
+# is read-only with respect to both the target repo and the reference checkout.
+outputs:
+  - lens-growth.md
+  - lens-activation.md
+  - lens-ecosystem.md
+  - lens-capability.md
+  - synthesis.md
+
+acceptance_criteria:
+  - All four lens reports and the synthesis exist under ${MINI_ORK_RUN_DIR}.
+  - >
+    Each lens report carries the FIVE shared sections in this order:
+    Evidence Read, Candidate Features, Ranked Shortlist,
+    mini-ork Gap Analysis, Open Questions.
+  - >
+    Each lane proposes at least SIX candidate features, each with a lane-scoped
+    id (G<n>, A<n>, E<n>, K<n>), an evidence receipt from the reference
+    checkout, a star-impact rating, an effort rating and a mini-ork fit rating.
+  - >
+    Every star_impact, effort and fit value is one of the allowed enums, and a
+    field line carries the enum word ALONE.
+  - >
+    Each lane writes ONE JSON sidecar (context-<node>.json) carrying at least:
+    schema_version, panel_id, lane, model, candidates[], shortlist[],
+    gap_analysis[], open_questions[], read_only_attestation{}.
+  - >
+    The four lenses were served by four distinct model families (llm_calls), so
+    the panel is genuinely heterogeneous rather than one model under four names.
+  - Each report states that no file under the reference checkout or the target repo was modified.

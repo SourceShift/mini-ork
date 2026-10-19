@@ -1,6 +1,3 @@
-> [!IMPORTANT]
-> Remove this line to confirm you've reviewed this PR before submitting.
-
 <p align="center">
   <img src="assets/mini-ork-icon.svg" alt="mini-ork" width="112" height="112">
 </p>
@@ -20,493 +17,216 @@
 
 <p align="center">English | <a href="README.zh-CN.md">简体中文</a></p>
 
-mini-ork turns a goal into a planned, executed, and *verified* run across a fleet of
-different models: **classify → plan → execute → verify → reflect → improve**. The
-verdict on every change is what the code **actually did when it ran** — tests, type
-checks, schemas, real execution in an isolated sandbox — not a model's opinion of its
-own output.
+mini-ork turns a goal into a planned, executed, and **verified** run across a fleet of
+models: **classify → plan → execute → verify → reflect → improve**. Every verdict comes
+from what the code actually did when it ran — tests, type checks, schemas, execution in
+an isolated sandbox — not a model's opinion of its own output.
 
-It is for teams who want an agent to do real work without treating fluent output, a
-green-looking diff, or a panel of agreeing models as proof.
+This page is the install guide. For the argument behind the project, see
+[Why mini-ork exists](docs/WHY.md).
 
-## ✅ Prove a fix in one command
+## Quick start
 
-Point `mini-ork certify` at a change and the bug it claims to fix. It reproduces the bug
-against your repository's own code, generates extra inputs the change was not written
-for, runs everything in a Docker sandbox, and returns a verdict with the evidence
-attached:
-
-~~~text
-$ bash examples/certify-demo/demo.sh          # paths shortened
-$ mini-ork certify --base base --head fix-correct --issue "median([1, 2, 3, 4]) returns 3, …should return 2.5."
-PROVEN  the fix holds across 100% of 4 perturbed inputs (supermajority)
-  change  1 file · sha256 506d0947   claim  "median([1, 2, 3, 4]) returns 3, but the median of an even…"
-  proof   .mini-ork/certificates/88f4ff0d-….json   cost $0.03 · 129s
-exit code: 0
-
-$ mini-ork certify --base base --head fix-cheat --issue "median([1, 2, 3, 4]) returns 3, …should return 2.5."
-REFUTED  the fix does not generalise — only 0% of 4 invariants hold, which is the signature of a patch that special-cases the reported input
-  change  1 file · sha256 aeaffdf3   claim  "median([1, 2, 3, 4]) returns 3, but the median of an even…"
-  proof   .mini-ork/certificates/c575f369-….json   cost $0.03 · 89s
-exit code: 1
-~~~
-
-Both changes make the example in the bug report pass. The second one only special-cases
-`[1, 2, 3, 4]`: a plain reproduction test passes on it, and every generated invariant
-fails. Exit codes are `0` PROVEN, `1` REFUTED, `2` UNVERIFIED — it abstains rather than
-guess — so CI can gate on it. Every run writes a `mini-ork.certificate/v1` JSON with the
-probe, the invariants, hashes of the change and the claim, and a digest.
-
-Try it: `bash examples/certify-demo/demo.sh` (needs Docker and one model lane).
-
-## 📊 Measured, not claimed
-
-- **Real repositories.** Three external Python libraries (marshmallow, pyparsing, toolz),
-  each with its upstream fix and a plausible wrong fix: **5 of 6 verdicts correct, 1
-  abstention, 0 wrong.** The abstention is pyparsing's correct fix, where the generated
-  tests assumed a library behaviour that is not true; the oracle now says UNVERIFIED
-  there instead of guessing. An earlier version got that repository wrong both ways.
-- **Adversarial SWE-bench corpus.** 21 of 21 PROVEN verdicts were correct fixes, with 0
-  false completions. The first version let one special-cased patch through (28 of 29);
-  that miss is what the current invariant generator was built to stop.
-- **Held-out tasks from this repository's own history.** 22 of 40 solved (55%), graded
-  by hidden tests the solver never saw, at **$0.42 per task** in real API spend with
-  open-weight models (MiniMax-M3 implementer, GLM-5.3 reviewer).
-- **One certificate** costs about **$0.03** at list price and takes 1–3 minutes.
-
-Methods, sample sizes, and what each number does *not* show: [docs/RESULTS.md](docs/RESULTS.md).
-
-> [!IMPORTANT]
-> mini-ork also contains a loop that can rewrite its own prompts and workflows and
-> promote the change without a human review. It is **off by default**. Read the
-> [warning](#warning-this-system-modifies-itself-unattended) before you turn it on.
-
-<p align="center">
-  <img src="https://github.com/SourceShift/mini-ork/raw/main/assets/mini-ork-hero.jpg" alt="An ork operator on a starship bridge overseeing many isolated workstreams, each a self-contained environment running its own crew." width="860">
-</p>
-
-## 🎯 Why this exists
-
-AI agents now write code faster than any team can review it. The bottleneck moved from
-*generation* to *validation*. An agent that writes its own tests and then grades itself
-produces output that agrees with itself — fluent, green-looking, and wrong often enough
-to break production. And the naive fix (send everything to a frontier model, run it many
-times) makes the bill grow faster than the unit price falls.
-
-mini-ork is built for the world *after* "make it generate": ship agent work you can
-trust, at a cost you can defend, on a system that gets sharper on your codebase the more
-you run it.
-
-**Why now:**
-
-- 📈 **Reliability is the new bottleneck.** 81% of enterprise technology leaders report an
-  *increase* in production issues linked to AI-generated code (CloudBees,
-  [*2026 State of Code Abundance Report*](https://www.theregister.com/ai-ml/2026/05/20/ai-code-boom-drives-production-failures-higher-spending/)).
-- 💸 **Cost routing is a real lever.** Routing between a strong and a weak model can cut cost
-  **more than 2×** without compromising quality
-  ([RouteLLM, arXiv:2406.18665](https://arxiv.org/abs/2406.18665)) — the lever mini-ork's
-  router aims at, conditioned on a verification bar rather than a guess. Our first
-  measurement shows the bar is the hard part (see below).
-- 🚧 **Pilots stall on the same three things.** Most agent pilots don't reach production, and
-  the blockers are consistently evaluation, reliability, and governance — the three layers
-  mini-ork treats as runtime primitives instead of afterthoughts.
-
-## 🧱 Three things an orchestration framework won't do for you
-
-Wiring agents into a graph is now commodity (LangGraph, CrewAI, AutoGen). mini-ork adds
-the three layers that decide whether agent work is actually *shippable*.
-
-### 1. ✅ It verifies correctness — it doesn't just orchestrate
-
-The source of truth for a change is its **execution outcome**, captured in an isolated
-runtime (mini-ork's `Crucible`, over Prime Intellect's MIT-licensed `verifiers`):
-
-- **Execution-anchored reward.** A change is scored on what it *did* — did the test run,
-  did the assertion pass — not on a reviewer's approval. An LLM judge may only **veto** a
-  passing result, never fabricate a passing one (`reward_from_status`,
-  `mini_ork/learning/writeback.py`).
-- **A real failure ≠ a broken harness.** The runtime distinguishes a genuine assertion
-  failure (a real reproduction) from a broken test or a broken environment, so a correct
-  patch is never rejected because the *probe* had a typo.
-- **Non-regression is certified.** Candidates that would break a previously-solved,
-  held-out task are blocked before they ship (per-task no-regression gate,
-  `mini_ork/cli/apply.py`).
-- **A run with no meaningful check is reported as *vacuous*,** not silently successful.
-
-### 2. 💰 It governs cost across a pool of models
-
-You don't pay frontier prices for work a cheaper model can pass:
-
-- **Heterogeneous dispatch.** Bring your own providers (OpenAI/Codex, MiniMax, Kimi, GLM,
-  Anthropic, or any OpenAI-compatible endpoint) and route each node to a lane by role.
-- **Routing policies.** Selectable strategies from `frontier_only` to `cheap_only` to
-  `learning_governed` (`MO_ROUTING_POLICY`). Recipes can pin a lane per node; the shipped
-  `code-fix` recipe pins its implementer, so learned routing applies to the roles a
-  recipe leaves open.
-- **Real prices.** Spend is metered per model at the provider's list price
-  (`.mini-ork/config/pricing.yaml`), not at whatever rate a wrapper CLI assumes.
-- **Hard cost controls.** A daily-spend circuit breaker, a periodic cost-pause sentinel
-  an operator must approve, and a wall-clock deadline budget — so an autonomous run can't
-  quietly burn your account.
-
-### 3. 🔁 It learns from what actually verified
-
-Every run leaves a trail of *verified* outcomes, and the system feeds that signal back:
-
-- **Contextual-bandit routing** adjusts which lane gets each unpinned role next time,
-  from recorded advantage — no extra model calls (`mini_ork/lane_router.py`). First
-  measurement: on 15 held-out tasks it spent 44% less than a fixed strong lane but solved
-  5 instead of 8, because the run's own verdict it learns from disagreed with the hidden
-  tests on 40% of runs. Lower cost at equal correctness is **not** shown yet; see
-  [docs/RESULTS.md §5](docs/RESULTS.md).
-- **GRPO group-relative writeback** and **textual-gradient** prompt evolution improve the
-  planner / implementer / reviewer prompts across runs.
-- **Verified-outcome memory** persists *only what passed the gates*, so the learned
-  signal is clean rather than noise. A closed **learn → apply** loop materializes,
-  scores, and non-regression-gates each proposed improvement before it lands.
-
-## 🧭 Where it fits
-
-mini-ork isn't a prettier agent graph or a cheaper autonomous coder. Orchestration
-frameworks wire agents together; coding products write and ship; eval tools score after
-the fact. mini-ork is the open-source runtime where **correctness is the primitive**:
-every run yields a verified outcome, that outcome is recorded against the model and
-the prompt that produced it, and the next run can route and prompt from it.
-
-That combination — correctness-conditional, cost-optimizing, compounding, and
-open-source — is what the framework is built around.
-
-Honest about the edges: the execution oracle is only as strong as what you can *run*, so
-its guarantees are richest on code with real tests and thinnest on subjective or
-untestable work — where mini-ork is built to surface the uncertainty and refuse the
-promote rather than manufacture confidence. (Refusing does not mean asking you: the
-self-improvement loop has no approval prompt. See the [warning](#warning-this-system-modifies-itself-unattended) below.)
-
-## 📦 What is in the box
-
-**119 shipped capabilities across seven pillars** (full code-anchored list in the
-[feature inventory](docs/reference/FEATURE-INVENTORY.md)):
-
-| Pillar | What you get |
-|---|---|
-| 🧩 **Orchestration core** | Full `run` lifecycle, keyword task classifier, planner with repair-on-bad-JSON, recovery DAG, a multi-epic scheduler, and a meta-policy conductor. |
-| 🔀 **Heterogeneous model dispatch** | BYO provider registry (5 kinds), 6 routing policies, role-aware fallback chains, per-provider throttle guards, and an owner-only secrets store. |
-| 🛡️ **Runtime reliability** | Durable-DAG resume (resurrect a failed run at the step or turn), single-writer leases + fencing, idempotent tool receipts, and cost/deadline circuit breakers. |
-| ✅ **Verification & gates** | An extensible gate registry (deterministic verifiers, reviewer/human/budget/scope gates), evidence-cited grounded rejections, and promotion gated on measurable evidence. |
-| 🔁 **Self-improvement & learning** | Anti-Goodhart reward contract, cost-free bandit router, GRPO writeback, reflection pipeline, semantic long-term memory, and a closed apply loop. |
-| 📊 **Observability surface** | A FastAPI app (127.0.0.1:7090) with an SSE live event stream, run detail + DAG overlay, a "why did this fail" aggregator, learning dashboards, and OTel/Langfuse export. |
-| ⌨️ **Operator & dev ergonomics** | A stable CLI — `init`, `run`, `validate`, `doctor`, `providers`, `garden`, `serve`, `recover` — plus worktree-aware, file-surface-leased workflows for safe concurrent agents. |
-
-## 🚀 Start here
-
-`make install` installs the supported local runtime: required OS tools, a checkout-local
-`.venv`, the `.[full]` Python profile (CLI, local web sidecar, and Crucible), and the
-per-user `mini-ork` command. Dry runs do not call a model provider. Real runs
-additionally need the provider CLIs or provider configuration selected by your lanes.
-
-One line (macOS, Linux, or WSL):
+macOS, Linux, or WSL:
 
 ~~~bash
 curl -fsSL https://raw.githubusercontent.com/SourceShift/mini-ork/main/install.sh | sh
 ~~~
 
-It clones into `~/.local/share/mini-ork` (set `MINI_ORK_INSTALL_DIR` to change that) and
-runs the same full install as `make install`. Or from a checkout:
+The installer:
+
+- clones mini-ork into `~/.local/share/mini-ork` (`MINI_ORK_INSTALL_DIR` overrides it),
+- creates a checkout-local `.venv` and installs the full Python profile
+  (CLI, local web sidecar, Crucible),
+- puts `mini-ork` on your PATH in `~/.local/bin`,
+- offers the first-run wizard when it is running on a terminal.
+
+From an existing checkout, the same install:
 
 ~~~bash
-# Get mini-ork and install the full runtime (macOS, Linux, or WSL).
 git clone --recurse-submodules https://github.com/SourceShift/mini-ork.git
 cd mini-ork
 make install
-
-# Open a new terminal if the installer changed PATH, then confirm it uses .venv.
-mini-ork version
+mini-ork version        # open a new terminal if PATH changed
 ~~~
 
 `--recurse-submodules` fills in `ui/`, the IDE crate
-([`SourceShift/mini-ork-ui`](https://github.com/SourceShift/mini-ork-ui)). The
-Python runtime does not need it, so a clone without it still works — but `ui/`
-will be an empty directory, and `git submodule update --init` fills it in later.
-Mini-ork cannot compile the crate itself; see [docs/UI.md](docs/UI.md) for how to
-build the IDE.
+([`SourceShift/mini-ork-ui`](https://github.com/SourceShift/mini-ork-ui)). The Python
+runtime does not need it; see [docs/UI.md](docs/UI.md) to build the IDE.
 
-On native Windows PowerShell, install the OS prerequisites with `winget` first
-(`Python.Python.3.11`, `Git.Git`, `jqlang.jq`, `MikeFarah.yq`, and `SQLite.SQLite`), then
-run this from the checkout:
+## First run: `mini-ork onboard`
 
-~~~powershell
-py -3 .\scripts\full_install.py
-mini-ork version
-~~~
-
-`make install` is safe to re-run after an upgrade. It reuses `.venv`, updates the
-editable package, repairs the managed command, and verifies the OS tools. Use
-`INSTALL_SYSTEM_DEPS=0` only when those tools are already managed outside mini-ork. Use
-**mini-ork install --help** to see **--bin-dir**, **--no-path**, **--force**, and
-**--dry-run** for the command-only installer.
-
-### 🧪 Your first verifier-backed workflow
-
-Start in a real Git repository. Keeping the mini-ork checkout path lets you copy its
-example into the project you want to work on.
+One command takes a fresh machine to a workspace you can run a recipe in. It never
+calls a model and never spends money — every step is a local check or a local build.
 
 ~~~bash
-# In the mini-ork checkout, remember its location before leaving it.
-MINIORK_SOURCE="$PWD"
+cd ~/my-project
+mini-ork onboard
+~~~
 
-# Make a small project to try it on.
-mkdir -p ~/miniork-demo && cd ~/miniork-demo
-git init
-mini-ork init
+| Step | What happens |
+|---|---|
+| prerequisites | Checks Python ≥ 3.11 and git; notes `sqlite3` / `jq` if present |
+| workspace | Creates `.mini-ork/` in the current directory (runs `git init` if needed) |
+| provider lanes | Reports whether credentials are stored, or names the command that adds them |
+| contextnest | *Optional:* clones, builds, and seeds a config for the local memory service |
+| zed | *Optional:* wires mini-ork's agent + MCP servers into Zed's `settings.json` |
 
-# A kickoff states the goal, scope, artifact, and verification expectation.
-cp "$MINIORK_SOURCE/examples/01-hello-world/kickoff.md" ./kickoff.md
+Optional components are offered only when their toolchain is present (`cargo`, `zed`),
+and each can be chosen explicitly:
 
-# First run locally and without provider calls.
+~~~bash
+mini-ork onboard --with contextnest,zed      # force both
+mini-ork onboard --no-contextnest --no-zed   # core only
+mini-ork onboard --dry-run                   # print the plan, change nothing
+mini-ork onboard -y                          # accept defaults (scripts, CI)
+mini-ork onboard --json                      # machine-readable step results
+mini-ork onboard --help                      # every flag
+~~~
+
+Exit codes: `0` done (skipped components are fine), `1` a selected component failed
+under `--strict`, `2` usage error. A non-interactive run has no prompts: `-y` accepts
+every default.
+
+### ContextNest — local memory substrate
+
+A Rust HTTP service that remembers what past sessions decided, failed at, verified, and
+shipped. The wizard seeds `config/contextnest.yaml` in the **simple** tier; with
+`--secure` it writes nothing and requires `CN_TOKEN` before the service will start.
+
+~~~bash
+mini-ork onboard --with contextnest     # clone + cargo build --release + seed config
+mini-ork cn status                      # tier, endpoint, reachability, latency
+~~~
+
+By hand: `git clone https://github.com/SourceShift/ContextNest.git`, then
+`make cn-serve` (binds `127.0.0.1:28080`). Requires Rust 1.80+. Details:
+[docs/CONTEXTNEST-INTEGRATION.md](docs/CONTEXTNEST-INTEGRATION.md).
+
+### Zed — editor integration
+
+Wires `mini-ork acp` (external agent) and `mini-ork mcp-context` (read-only run,
+learning, and cost context) into Zed. Every write to `settings.json` is preceded by a
+timestamped backup.
+
+~~~bash
+mini-ork onboard --with zed     # or at any time:
+mini-ork zed setup
+mini-ork zed status
+mini-ork zed uninstall
+~~~
+
+See [docs/ZED.md](docs/ZED.md) and [docs/UI.md](docs/UI.md).
+
+## Your first verified workflow
+
+~~~bash
+cd ~/my-project
+mini-ork onboard                      # initialize the project
+mini-ork providers configure <lane>   # hidden prompt; keys never touch argv
+mini-ork doctor                       # dependencies, environment, provider preflight
+
+cp ~/.local/share/mini-ork/examples/01-hello-world/kickoff.md ./kickoff.md
+
+# Check the wiring first: no model calls, no spend.
 MINI_ORK_DRY_RUN=1 mini-ork run code-fix ./kickoff.md
-
-# Confirm the project and recipe are wired before spending tokens.
 mini-ork validate
-~~~
 
-After the dry run, inspect **.mini-ork/runs/** for run artifacts and **.mini-ork/state.db**
-for recorded state. For a real run, review **.mini-ork/config/agents.yaml**, authenticate
-the CLI or configure the providers it names, then run the same command without
-`MINI_ORK_DRY_RUN=1`:
-
-~~~bash
+# Then run it for real.
 mini-ork run code-fix ./kickoff.md
 ~~~
 
-## 🛠️ Use mini-ork well
+A kickoff states the target repository, allowed files, intended artifact, and the
+command or rule that proves success. Run artifacts land in `.mini-ork/runs/`, recorded
+state in `.mini-ork/state.db`. Review `.mini-ork/config/agents.yaml` to change which
+lane serves which role.
 
-1. ✍️ **Write a verifiable kickoff.** State the target repository, allowed files, intended
-   artifact, and the command or rule that proves success.
-2. 🧪 **Dry-run every new recipe or environment first.** It checks the lifecycle and
-   artifact paths without model calls; it does not prove the eventual change is correct.
-3. 🎯 **Give an agent an oracle when you can.** Prefer an existing test, typecheck, schema,
-   fixture, or observable acceptance criterion over an LLM-only score.
-4. 🔍 **Use multiple lenses deliberately.** Heterogeneous review is useful for discovery and
-   diagnosis; it does not replace deterministic verification.
-5. 👀 **Read the evidence before promotion.** mini-ork retains traces and can learn from
-   runs, but automatic promotion is intentionally restricted to classes with measurable
-   external evidence. Note that this is the *only* thing standing between a learned
-   directive and your recipe files — there is no human approval step to catch a bad
-   promote.
+### Prove a fix in one command
 
-### 🧰 Pick a starting recipe
+`mini-ork certify` takes a change and the bug it claims to fix, reproduces the bug
+against your code, generates inputs the change was not written for, runs everything in
+a Docker sandbox, and returns a verdict with the evidence attached:
 
-| Need | Start with |
+~~~text
+$ mini-ork certify --base base --head fix-cheat \
+    --issue "median([1, 2, 3, 4]) returns 3, should return 2.5"
+REFUTED  the fix does not generalise — only 0% of 4 invariants hold,
+         which is the signature of a patch that special-cases the reported input
+exit code: 1
+~~~
+
+Exit codes `0` PROVEN, `1` REFUTED, `2` UNVERIFIED — it abstains rather than guesses,
+so CI can gate on it. Needs Docker and one model lane.
+Try `bash examples/certify-demo/demo.sh`.
+
+## Everyday commands
+
+| Command | Does |
 |---|---|
-| 🩹 A focused patch with checks | **code-fix** |
-| 📝 A documentation change | **docs** |
-| 🔎 A multi-perspective codebase audit | **refactor-audit** or **bug-audit-cmgk** |
-| 🔬 A literature or research brief | **research-synthesis** |
-| 📐 A directory of feature specs → verified features | **spec-driven-delivery** |
-| ♻️ Self-improvement of this repository | **recursive-self-improve** (see below) |
-| 🧩 A new workflow shape | Copy a recipe and follow the extension guide |
+| `mini-ork run <recipe> <kickoff.md>` | Run one recipe end to end |
+| `mini-ork doctor` | Check dependencies, environment, provider preflight |
+| `mini-ork validate` | Static pre-run checks with `Fix:` hints |
+| `mini-ork providers status <lane>` | Show credential presence and source (never values) |
+| `mini-ork serve` | Local web UI and API on `127.0.0.1:7090` |
+| `mini-ork garden` | Drift detection: collisions, orphans, stale runs |
+| `mini-ork recover` / `resume` | Resurrect a failed or interrupted run |
+| `mini-ork mcp` / `vault` | MCP server registry; secret-vault backend chain |
+| `mini-ork zed setup` / `cn status` | Editor wiring; ContextNest tier and reachability |
 
-Recipes live in [recipes/](recipes/). To create one, define a task class, workflow,
-artifact contract, prompts, and verifiers; see the [extension guide](docs/EXTENSION.md).
+Starting recipes: `code-fix`, `docs`, `refactor-audit`, `bug-audit-cmgk`,
+`research-synthesis`, `spec-driven-delivery`. See [recipes/](recipes/) and the
+[extension guide](docs/EXTENSION.md).
 
-## Warning: this system modifies itself, unattended
+## Upgrade
+
+Re-run the installer, or from a checkout run `make install` — it is safe to re-run: it
+reuses `.venv`, updates the editable package, repairs the managed command, and verifies
+the OS tools. Then `mini-ork update` applies pending database migrations and reports
+config drift.
+
+## Uninstall
+
+~~~bash
+mini-ork zed uninstall                     # remove the Zed entries
+mini-ork automations scheduler uninstall   # only if you installed the OS tick
+rm -rf ~/.local/share/mini-ork ~/.local/bin/mini-ork
+~~~
+
+Project state lives in each project's `.mini-ork/`; delete it where you want it gone.
+Your source checkouts and git history are never touched.
+
+## Requirements
+
+| | |
+|---|---|
+| OS | macOS, Linux, WSL. Native Windows: install Python 3.11, Git, jq, yq, and SQLite with `winget`, then run `py -3 .\scripts\full_install.py` |
+| Python | 3.11 or 3.12 |
+| Git | required |
+| Docker | only for sandboxed verification (`certify`, Crucible) |
+| Rust 1.80+ | only for ContextNest and the IDE crate |
+| Model access | one configured provider lane for real runs; dry runs need none |
+
+## Learn more
+
+| | |
+|---|---|
+| [docs/WHY.md](docs/WHY.md) | Why the project exists; measurements; what it does not claim |
+| [docs/SAFETY.md](docs/SAFETY.md) | Self-modification posture and the gates that hold |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System design and component diagrams |
+| [docs/operator](docs/operator) | Running mini-ork: env vars, troubleshooting |
+| [docs/PYTHON-SDK.md](docs/PYTHON-SDK.md) | Embed mini-ork in your own app |
+| [docs/RESULTS.md](docs/RESULTS.md) | Methods and sample sizes behind the numbers |
+| [ROADMAP.md](ROADMAP.md) | Where the project is going |
 
 > [!WARNING]
-> mini-ork's apply loop can rewrite its own recipe prompts, agent prompts, and workflow
-> nodes and edges — and **promote those changes without a human approving each one**. It
-> runs the candidate change over a held-out probe set, compares the publish rate before
-> and after, and promotes only on a measured improvement that does not regress a
-> previously-passing task. There is no "review this first" gate in that loop, and no
-> environment variable that puts one back.
+> mini-ork contains an apply loop that can rewrite its own prompts and workflows and
+> promote the change without human review. It is **off by default** (both
+> `MO_APPLY_ENABLED` and `MO_AUTO_APPLY` must be `1`), and its blast radius, caps, and
+> rollbacks are documented in [docs/WHY.md](docs/WHY.md#warning-this-system-modifies-itself-unattended).
 
-Read that as what it is: the machine is allowed to rewrite itself while you are not
-looking. The measurement is real — no promote happens without one — but a measurement
-is evidence, not a guarantee. A probe set is only as strong as its probes, and the loop
-cannot know what it never tested.
+## Contributing and license
 
-This is **recursive self-improvement**, not a metaphor for it. The human approval gate
-that earlier versions had was deliberately removed, and it was removed *because* the
-measurement gate is what does the work: there is no code path that promotes without a
-real held-out measurement, and there is no flag that restores the human branch. What
-protects you from a bad promote is the probe set, the per-task no-regression rule, and
-your version control — not a person in the loop.
-
-**🛡️ If that is not what you want, the safe configuration is:**
-
-- 🔒 Leave `MO_APPLY_ENABLED` and `MO_AUTO_APPLY` unset. Both default to off, and the
-  unattended sweep requires *both* to be `1`.
-- 🧪 Run it on a throwaway worktree, never on a checkout you care about.
-- 🧮 Know your caps: `MO_APPLY_PROBE_BUDGET_USD` and `MO_APPLY_PROBE_MAX_TASKS` bound what
-  a single apply run can spend.
-- 🌿 Keep the target repository under version control. `mini-ork rollback agent <target>`
-  restores the pre-promotion file and `mini-ork rollback workflow <name>` the workflow,
-  but **your VCS is the ultimate backstop** — review the promoted diffs the way you
-  would review a junior engineer's commit.
-
-This is a research-grade, self-improving system under active development. A promotion
-is a change that has already landed, not a proposal waiting for you. See
-[docs/SAFETY.md](docs/SAFETY.md) for the full posture and the gates that do hold.
-
-## ♻️ Recursive self-improvement: two loops
-
-mini-ork improves itself through two loops that are easy to conflate, yet their blast
-radii are nothing alike. The [warning](#warning-this-system-modifies-itself-unattended)
-just above is about the second one. Know which one you are starting.
-
-### 🔬 The self-improvement loop — bounded, branch-isolated, dry-runnable
-
-`mini-ork self-improve` (`bin/mini-ork-self-improve`) is a wall-clock-budgeted outer
-loop that runs the [`recursive-self-improve`](recipes/recursive-self-improve/) recipe
-against the mini-ork checkout. One iteration scans the repo, the run database, and
-benchmark deltas for bottlenecks, runs three heterogeneous-family research lenses plus
-an arXiv research lane (MiniMax / Kimi / Codex — low-correlation voters, not three
-prompts on one model), asks Opus to synthesize a *ranked* patch plan, has a cheaper lane
-implement the top patch, and gates the result.
-
-The gate is four layers, not one: three deterministic verifiers — `bottlenecks-found`,
-`self-tests-pass` (runs mini-ork's own pytest suite in a hermetic sandbox, so the verdict
-reflects the patch and not the machine around it), and `no-regression` — plus an Opus
-patch critic, so a diff that passes pytest but is off-plan, gamed, or a no-op is still
-caught. The **runner**, not the implementer, is the only thing that calls `git commit`,
-and only once the gates pass. Every iteration lands on its own
-`self-improve/iter-<N>-<ts>` branch in a fresh worktree under `$MINI_ORK_HOME/worktrees/`.
-Nothing reaches the branch you are on unless you pass `--auto-merge`.
-
-```bash
-# Prove the wiring with no model calls. Start here.
-bin/mini-ork-self-improve --dry-run --max-iters 1
-
-# A real session: 3h soft cap, 5h hard cap; branches left for you to review.
-bin/mini-ork-self-improve --soft-cap-hours 3 --hard-cap-hours 5
-
-# Resume after Ctrl-C — picks the last iteration back out of MINI_ORK_DB.
-bin/mini-ork-self-improve --resume --soft-cap-hours 3 --hard-cap-hours 5
-```
-
-`--soft-cap-hours` finishes the iteration in flight then stops; `--hard-cap-hours` kills
-mid-iteration. Caps are also enforced in dollars (`MO_DAILY_BUDGET_USD`, plus per-iter
-and per-epic budgets in `config/agents.recursive-self-improve.yaml`), and a pre-iteration
-cost check (`MINI_ORK_PRE_ITER_COST_CHECK=1`, the default) refuses to start a new
-iteration once the daily cap is hit. Override lanes by copying
-`config/agents.recursive-self-improve.yaml` to `$MINI_ORK_HOME/config/agents.yaml`.
-
-### ⚙️ The apply loop — unattended, and the one to be careful with
-
-`mini-ork apply` closes learn → apply for *prompt and workflow* changes: it picks the
-highest-confidence proposed change, materializes it as a workflow candidate, scores it on
-a **frozen held-out probe set**, applies a per-task non-regression gate, and then either
-rewrites the target file or quarantines it with a reason. Quarantine is the gate doing its
-job, not an error — the command exits `0` either way.
-
-Only the `probe` scorer can promote. `mock` and `gepa` are deterministic placeholders
-that fabricate a utility and never promote; they exist for tests. With no measurement
-there is no promote.
-
-Probe sets live at `recipes/<recipe>/probes/*.md` — `code-fix` and `obs-smoke` ship them
-today, so those are the task classes you can build on. You also need an initialized
-project (`pattern_records` is created by `mini-ork init`), because a run against a bare
-home has nothing to pick from.
-
-```bash
-mini-ork init                      # once, in the project you are improving
-mini-ork apply --task-class code-fix \
-  --target recipes/code-fix/prompts/implementer.md --dry-run
-```
-
-Both flags that make this dangerous are off by default:
-
-- `MO_APPLY_ENABLED=1` — the master gate. Without it a candidate is prepared but the
-  file write and version registration are skipped. `apply --enable` sets it for one call.
-- `MO_AUTO_APPLY=1` — the unattended sweep *inside a run*. The sweep fires only when
-  **both** this and `MO_APPLY_ENABLED` are `1`; there is no code path that promotes on
-  one alone.
-- `MO_APPLY_DRY_RUN=1` — score and decide, write nothing.
-- `MO_APPLY_PROBE_MAX_TASKS` (default 2) and `MO_APPLY_PROBE_BUDGET_USD` (default 2.0) —
-  the spend ceiling for a single probe evaluation.
-
-Because that sweep has **no approval prompt**, the rollbacks are yours to know:
-`mini-ork rollback agent <name>` restores the pre-promotion prompt file and
-`mini-ork rollback workflow <name>` the workflow; your VCS is the backstop. Both read
-the version registry straight out of `MINI_ORK_DB`, which nothing sets for you — export it
-first, or the command exits on `MINI_ORK_DB unset`:
-
-```bash
-export MINI_ORK_DB="$MINI_ORK_HOME/state.db"
-mini-ork rollback agent <name>
-```
-
-See [docs/SAFETY.md](docs/SAFETY.md) for quarantine semantics.
-
-### ✍️ The manual loop that surrounds both
-
-Between the two, the same primitives are drivable by hand — propose, score, decide:
-
-```bash
-mini-ork improve --dry-run                     # show what it would propose, spend nothing
-mini-ork improve --task-class code-fix --limit 3
-mini-ork eval    --candidate <id>              # run the benchmark suite against a candidate
-mini-ork promote --candidate <id> --dry-run    # compute the gate decision, write nothing
-```
-
-### 🗄️ Where the state lives
-
-Everything above writes to `$MINI_ORK_DB` (default `$MINI_ORK_HOME/state.db`):
-
-```bash
-sqlite3 .mini-ork/state.db "SELECT iter, outcome, notes FROM self_improve_runs ORDER BY iter;"
-sqlite3 .mini-ork/state.db "SELECT iter, rank, category, title, outcome, severity, confidence FROM learning_record ORDER BY iter, rank;"
-sqlite3 .mini-ork/state.db "SELECT decision, COUNT(*) FROM apply_attempts GROUP BY decision;"
-```
-
-`learning_record` carries the per-bottleneck trail — a bottleneck is written `open` when
-the scanner finds it, `resolved` when an iteration commits a fix for it, and `superseded`
-once a later successful iteration lands over a `deferred` one. `apply_attempts` records
-every apply decision, including each quarantine and the reason, so a directive that failed
-a gate is never re-proposed.
-
-## ⚖️ Honesty by design
-
-mini-ork does **not** claim a universal oracle. Where there is no trustworthy external
-check — a subjective product decision, untestable code — it surfaces the uncertainty
-rather than manufacturing confidence. That discipline is wired in, not aspirational:
-
-- 🫥 A run whose verification is absent or meaningless is reported as **vacuous**.
-- 📉 The dispatch and learning surfaces refuse to invent a number below their evidence
-  threshold (Wilson-CI honesty: `<5` samples returns `evidence: "none"`).
-- 🧾 Every gate rejection cites the evidence trace it was based on, so a "no" is auditable.
-- 🚫 The promotion gate has no human branch. "Not promotable" is a recorded verdict with a
-  reason attached, never a request sent to a person — the loop has nobody to ask, and it
-  does not pretend otherwise.
-
-## 📚 Learn more
-
-Embedding mini-ork in your own app? The [Python SDK](docs/PYTHON-SDK.md) covers both
-the importable primitives (verification, dispatch, memory, routing) and the `MiniOrk`
-orchestrator client.
-
-Read the [architecture](docs/ARCHITECTURE.md), [operator guide](docs/operator),
-[safety model](docs/SAFETY.md), and [feature inventory](docs/reference/FEATURE-INVENTORY.md)
-when you need the detailed contracts.
-
-## 🗺️ Roadmap
-
-The near-term work is operational trust: truthful dispatch telemetry, error and
-finish-reason taxonomy, heartbeat/failure handling, capability-aware routing, cost
-accuracy, and operator intervention policies. See the full [roadmap](ROADMAP.md).
-
-The next research track is **verifier-led escalation**: use failure analysis to build a
-library of recovery behaviors, then learn a routing policy that chooses among a cheap
-tool call, more planning, a stronger model, or a user interruption — with the learning
-signal being *verified progress* at decision checkpoints, balanced against compute,
-latency, and the user's interruption budget. (A proposal, not yet a shipped capability.)
-
-## 🤝 Contributing and status
-
-mini-ork is **Apache-2.0** licensed, early, and research-grade. Use a dedicated worktree for framework
-changes, keep a verifier with every behavior claim, and run the focused checks for the
-surface you change. The contribution workflow and quality gates are in
-[AGENTS.md](AGENTS.md); project direction lives in [GOVERNANCE.md](GOVERNANCE.md).
-
-## Usage
-
-Run `mini-ork run code-fix ./kickoff.md` to execute a task from a verifiable kickoff.
+mini-ork is **Apache-2.0**, © Amir Khakshour. It is early and research-grade: use a
+dedicated worktree for framework changes, keep a verifier with every behaviour claim, and
+run the focused checks for the surface you change. See [AGENTS.md](AGENTS.md) for the
+contribution workflow and [GOVERNANCE.md](GOVERNANCE.md) for project direction.

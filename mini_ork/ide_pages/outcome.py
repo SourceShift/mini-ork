@@ -335,11 +335,19 @@ def _seen_before_section(run) -> dict[str, Any] | None:
     if envelope is not None:
         cards = _seen_before_cards(envelope, run_id=run_id)
         if not cards:
-            # Stored file but an empty hit list — the verb ran and found no
-            # similar past failure. A card saying so carries nothing to act on
-            # and nothing to learn, so it is not rendered: the run page shows
-            # the sections that have something in them.
-            return None
+            # Stored file but empty hit list — the verb succeeded with
+            # nothing to show. A single "no similar past failures" row
+            # plus the Helped/Wrong action row is the truthful state.
+            cards = [{
+                "m": "•",
+                "mc": "sub",
+                "t": "No similar past failures in ContextNest.",
+                "tc": "text",
+                "sub": "",
+                "mono": False,
+                "when": "",
+                "acts": [],
+            }]
         # Helped / Wrong live on each card's acts, bound to that card's
         # atom id — a verdict lands on the memory that was shown, not on
         # a run-scoped row the operator never saw.
@@ -485,6 +493,259 @@ def _gate_hint(gate: dict[str, Any]) -> dict[str, Any]:
     return hint if isinstance(hint, dict) else {}
 
 
+# ── display words ──────────────────────────────────────────────────────────
+#
+# One table, one helper. The page is read by a person deciding "retry or
+# abandon", so a database enum must never reach a chip or the triage line. Every
+# emit site calls ``display_word`` rather than spelling the substitution inline:
+# a new enum then gets human words in one place instead of leaking snake_case.
+
+_DISPLAY_WORDS = {
+    "needs_change": "Needs changes",
+    "needs_you": "Needs you",
+    "awaiting_review": "Awaiting review",
+    "passed": "Passed",
+    "failed": "Failed",
+    "done": "Done",
+    "running": "Running",
+    "published": "Published",
+    "rolled_back": "Rolled back",
+    "not_needed": "Not needed",
+    "reviewing": "Reviewing",
+    "pending": "Pending",
+    "skipped": "Skipped",
+}
+
+
+def chip_word(run, state: str) -> str:
+    """The header chip's word for the outcome ``state``.
+
+    A run the database marks failed always says so on the chip, even when the
+    card's own word is ``needs_you`` (a retry gate is open): the reader must
+    not see "Needs you" on a run the database calls failed. Every other state
+    maps straight through :func:`display_word`, so a parked run still reads
+    "Needs you" and a published one "Done".
+    """
+    if state == "needs_you" and _status(run) in _FAILED:
+        return display_word("failed")
+    return display_word(state)
+
+
+def display_word(value: Any) -> str:
+    """``value`` as display text a person reads — never a database enum.
+
+    The table names the enums the run page actually renders; anything else is
+    spaced and capitalised, so a newly added enum still cannot put snake_case
+    on a chip. Empty input stays empty (the caller omits the field).
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    known = _DISPLAY_WORDS.get(raw.casefold())
+    if known:
+        return known
+    words = raw.replace("_", " ").strip()
+    return words[:1].upper() + words[1:]
+
+
+# ── triage subject ─────────────────────────────────────────────────────────
+
+# A node in one of these states is finished and must never be named as the
+# thing that failed or blocked the run (kickoff c:0).
+_PASSED_STATES = ("done", "passed")
+
+
+def _first_failed_node(run):
+    """The first node whose state is ``failed`` in story order, or ``None``."""
+    for node in run.nodes:
+        if str(getattr(node, "state", "") or "") == "failed":
+            return node
+    return None
+
+
+# ── fault attribution ──────────────────────────────────────────────────────
+#
+# J24/C25: a failed run must answer "is this a mini-ork bug or a task fault?".
+# The verdict is NOT re-derived here — ``mini_ork.triage.blame.attribute`` owns
+# the rules (framework traceback frames → ``mini_ork``, a legitimate artifact
+# verdict or consumer-side traceback → ``consumer``, infra / unlocalisable →
+# ``unknown``). This page only feeds it the fields the run carries and renders
+# the answer. Every failure on the way — a missing module, an unreadable or
+# absent node log, a malformed node — fails closed to ``unknown``: a broken
+# diagnostic must never blank the outcome card or raise into the board.
+
+_BLAME_CALLOUT_TITLE = "Whose fault is this"
+_OPEN_TRIAGE_CONFIRM = "File a bug and queue a framework-edit fix epic?"
+
+
+def _failed_node_log(run, node_id: str) -> str:
+    """A bounded tail of the failed node's log, or ``""`` — never raises.
+
+    ``triage.failures._find_node_log`` already knows every stem a node's log is
+    written under (``verifier-<stem>.log``, ``<stem>.log``, ``impl-<stem>.log``,
+    ``logs/``, ``evidence/``) and reads only a bounded tail, so the page render
+    path reuses it rather than re-deriving the convention. Imported lazily: the
+    page never drags the triage I/O driver in at module load.
+    """
+    run_dir = getattr(run, "run_dir", None)
+    if run_dir is None or not node_id:
+        return ""
+    try:
+        from mini_ork.triage import failures as failures_mod
+
+        return failures_mod._find_node_log(Path(run_dir), node_id)
+    except Exception:  # noqa: BLE001 — a log read must never blank the card
+        return ""
+
+
+def _attribute_failure(run) -> tuple[str, list[Any]]:
+    """``(verdict, evidence)`` for the story's first failed node, fail-closed.
+
+    Uses exactly the fields the run page has (node id, type, ``finish`` and a
+    best-effort log excerpt); ``NodeFailure`` carries no exit code, and inventing
+    one would mean editing ``mini_ork/triage/`` (out of scope). Any failure —
+    missing ``triage`` module, unreadable log, bad node data — returns
+    ``("unknown", [])``: "we could not tell" is the honest verdict, never a
+    guess at the framework's fault.
+    """
+    try:
+        from mini_ork.triage import blame as blame_mod
+
+        first = _first_failed_node(run)
+        if first is None:
+            failure = blame_mod.NodeFailure(node_id="")
+        else:
+            node_id = str(getattr(first, "id", "") or "")
+            failure = blame_mod.NodeFailure(
+                node_id=node_id,
+                node_type=str(getattr(first, "type", "") or ""),
+                finish_reason=str(getattr(first, "finish", "") or "") or None,
+                log_excerpt=_failed_node_log(run, node_id),
+            )
+        verdict, evidence = blame_mod.attribute(failure)
+        return str(verdict), list(evidence)
+    except Exception:  # noqa: BLE001 — attribution optional: the card still renders
+        return "unknown", []
+
+
+def _first_evidence_line(evidence: list[Any]) -> str:
+    """The first non-empty ``Evidence.detail``, or ``""``."""
+    for item in evidence:
+        detail = str(getattr(item, "detail", "") or "").strip()
+        if detail:
+            return detail
+    return ""
+
+
+def _blame_sentence(verdict: str, evidence: list[Any]) -> str:
+    """The kickoff's one plain-words sentence for the blame verdict.
+
+    Each sentence names the first evidence line, so the operator can see *why*
+    the verdict was reached instead of trusting an unattributed label.
+    """
+    line = _first_evidence_line(evidence) or "no evidence line was recorded"
+    if verdict == "mini_ork":
+        return f"Looks like a mini-ork fault ({line}) — fix it at the source."
+    if verdict == "consumer":
+        return f"Looks like a task fault ({line}) — retry the failure, or adjust the kickoff."
+    return ("Can't tell yet whether this is a mini-ork fault or a task fault "
+            f"— the evidence is {line}.")
+
+
+def _blame_callout(run, verdict: str, evidence: list[Any]) -> dict[str, Any]:
+    """The failure-only blame callout, with ``Open triage`` on a mini-ork fault.
+
+    ``Open triage`` writes (it files a bug and queues a fix epic), so it is
+    confirm-gated; ``consumer`` / ``unknown`` add no button — the card's retry
+    actions already carry the task-fault path, and duplicating a retry here
+    would race the needs-you lane's single decision.
+    """
+    actions: list[dict[str, Any]] = []
+    if verdict == "mini_ork":
+        actions.append(S.btn(
+            "Open triage",
+            S.cli("triage", "--run", run.id, "--promote",
+                  confirm=_OPEN_TRIAGE_CONFIRM),
+            "primary",
+        ))
+    tone = "red" if verdict == "mini_ork" else "orange"
+    return S.callout(_BLAME_CALLOUT_TITLE, _blame_sentence(verdict, evidence),
+                     tone=tone, actions=actions)
+
+
+def _nameable(run, node_id: str) -> str:
+    """``node_id`` unless the story says that node is done/passed (then ``""``).
+
+    The lifecycle can disagree with the folded story after a recover re-run; the
+    page never names a node it also draws as finished.
+    """
+    for node in run.nodes:
+        if node.id == node_id:
+            return "" if str(node.state or "") in _PASSED_STATES else node_id
+    return node_id
+
+
+def _reason_for(run, node_id: str) -> str:
+    """``run._node_reason`` for ``node_id`` — its review → verifier → hint
+    fallbacks, imported rather than re-implemented (kickoff c:1)."""
+    for node in run.nodes:
+        if node.id == node_id:
+            try:
+                return str(_run_mod()._node_reason(run, node) or "").strip()
+            except Exception:  # noqa: BLE001 — a reason is never worth the page
+                return ""
+    return ""
+
+
+def _triage_subject(run) -> tuple[str, str]:
+    """The node the triage names and its one-line reason, or ``("", "")``.
+
+    The kickoff's rule order, first match wins:
+
+    1. the first node whose state is ``failed`` in story order;
+    2. else the node awaiting a human — a pending review, or the node an open
+       ask blocks on;
+    3. else the node of the open retry gate the callout is about.
+
+    A ``done``/``passed`` node is never named. When none of the rules finds a
+    node the caller omits the field rather than guessing.
+    """
+    failed = _first_failed_node(run)
+    if failed is not None:
+        return failed.id, _reason_for(run, failed.id)
+
+    rm = _run_mod()
+    try:
+        awaiting = rm._awaiting_node_ids(run)
+    except Exception:  # noqa: BLE001 — awaiting a human is optional
+        awaiting = []
+    for node_id in awaiting:
+        # The done/passed guard is absolute (c:0): a block is named only when
+        # the story does not already draw that node as finished. When the
+        # pending review's own node has finished, fall through to the next
+        # awaiting node and then to the gate rather than naming a passed node.
+        nameable = _nameable(run, node_id) if node_id else ""
+        if nameable:
+            return nameable, ""
+
+    gate = _pending_gate(run)
+    if isinstance(gate, dict):
+        hint = _gate_hint(gate)
+        for key in ("from_node", "failed_node", "node_id", "node"):
+            node_id = str(hint.get(key) or "").strip()
+            nameable = _nameable(run, node_id) if node_id else ""
+            if nameable:
+                return nameable, _reason_for(run, nameable)
+        ctxt = gate.get("context") if isinstance(gate.get("context"), dict) else {}
+        for key in ("node_id", "node"):
+            node_id = str(ctxt.get(key) or "").strip()
+            nameable = _nameable(run, node_id) if node_id else ""
+            if nameable:
+                return nameable, _reason_for(run, nameable)
+
+    return "", ""
+
+
 # ── counts / menu ──────────────────────────────────────────────────────────
 
 def _verifier_checks(run) -> tuple[int, int]:
@@ -504,9 +765,9 @@ def _findings_count(run) -> int | None:
 def verification_report(run) -> dict[str, Any] | None:
     """The run's five-level report — ``run-verdict.json`` or a stamped verdict.
 
-    Public because the run page's Verification tab shows the whole vector,
-    while the verdict row (:func:`_level_badges`) shows only what the run must
-    prove.
+    Public because the run page's Verification tab ships the whole vector as
+    data (``spec.levels``); the verdict row (:func:`_level_badges`) stays a
+    plain list of facts.
     """
     return _run_verdict(run)
 
@@ -516,17 +777,8 @@ def _level_badges(run) -> list[dict[str, Any]]:
     levels = rv.get("levels") if isinstance(rv, dict) else None
     if not isinstance(levels, dict):
         return []
-    # A run that stamped which levels its task class requires shows only those.
-    # The rest cannot fail it, so drawing them beside a publishable verdict
-    # reads as three failures that are not failures — a recipe without the
-    # instrument abstains on levels it never had to prove. The Verification tab
-    # keeps the whole vector and each abstention's reason.
-    stamped = rv.get("levels_required") if isinstance(rv, dict) else None
-    required = [str(name) for name in stamped] if isinstance(stamped, list) else None
     out: list[dict[str, Any]] = []
     for name in LEVELS:
-        if required is not None and name not in required:
-            continue
         value = str(levels.get(name) or "") if name in levels else ""
         if not value:
             continue
@@ -536,12 +788,14 @@ def _level_badges(run) -> list[dict[str, Any]]:
 
 
 def _counts(run) -> list[dict[str, Any]]:
-    rm = _run_mod()
+    """The evidence badges under the verdict: checks, findings, levels.
+
+    Progress (nodes), cost and elapsed are the header chips' job. Repeating
+    them here made the verdict restate the chrome directly above it, so this
+    list answers only what the chips cannot: did the evidence pass, and what
+    did the checks find.
+    """
     out: list[dict[str, Any]] = []
-    n = len(run.nodes)
-    if n:
-        done = sum(1 for node in run.nodes if node.state == "done")
-        out.append({"t": f"{done}/{n} nodes", "c": "sub"})
     passed, total = _verifier_checks(run)
     if total:
         out.append({"t": f"checks {passed}/{total}",
@@ -550,12 +804,6 @@ def _counts(run) -> list[dict[str, Any]]:
     if findings is not None:
         out.append({"t": f"{findings} finding{'s' if findings != 1 else ''}",
                     "c": "red" if findings else "sub"})
-    cost = rm._cost(run)
-    if cost > 0:
-        out.append({"t": S.money(cost), "c": "sub"})
-    elapsed = rm._elapsed(run)
-    if elapsed and elapsed != "—":
-        out.append({"t": elapsed, "c": "sub"})
     out.extend(_level_badges(run))
     return out
 
@@ -618,22 +866,180 @@ def _needs_you(run) -> dict[str, Any]:
     }
 
 
+# The callout title is a contract with ``run._attention_lane``: once the
+# needs-you lane carries this decision, the story tab drops the callout so the
+# retry decision renders exactly once.
+GATE_CALLOUT_TITLE = "This run needs your decision"
+
+# ``retry_hint`` strategies rendered as the operator-facing verb (the kickoff's
+# ``Re-verify`` / ``Retry`` / ``Merge``), never as the raw enum.
+_STRATEGY_WORDS = {
+    "verify": "Re-verify",
+    "re-verify": "Re-verify",
+    "resume": "Resume",
+    "resume-cost": "Resume from the cost pause",
+    "retry": "Retry",
+    "merge": "Merge",
+    "none": "Retry",
+}
+
+
+def _strategy_word(raw: Any) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return "Retry"
+    return _STRATEGY_WORDS.get(text.lower(), f"Retry ({text})")
+
+
+def _gate_merged_hint(run, gate: dict[str, Any]) -> dict[str, Any]:
+    """The gate's own hint with anything it omits filled from ``retry-hint.json``.
+
+    The gate row is authoritative for the fields it carries; the persisted hint
+    is the fallback for the common case where ``fix_steps`` renders empty (a
+    retry-hint-only gate). Both reads fail soft to ``{}``.
+    """
+    merged: dict[str, Any] = {}
+    persisted = _hint(run)
+    if isinstance(persisted, dict):
+        merged.update(persisted)
+    own = _gate_hint(gate)
+    merged.update(own)
+    return merged
+
+
+def _estimated_cost(hint: dict[str, Any]) -> float | None:
+    """The hint's cost estimate, when it carries one (``None`` otherwise)."""
+    for key in ("estimated_cost_usd", "estimated_cost", "cost_estimate_usd",
+                "estimated_usd"):
+        raw = hint.get(key)
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def _verification_wording(run) -> str:
+    """Which levels are unverified, and the rule publishing enforces."""
+    rv = _run_verdict(run)
+    levels = rv.get("levels") if isinstance(rv, dict) else None
+    unverified: list[str] = []
+    if isinstance(levels, dict):
+        for name in LEVELS:
+            value = str(levels.get(name) or "").strip()
+            if value != _PROVEN:
+                unverified.append(f"{name} ({value or 'not recorded'})")
+    if unverified:
+        return ("Unverified levels: " + ", ".join(unverified)
+                + ". Publishing requires every level PROVEN.")
+    return "Publishing requires every level PROVEN."
+
+
+def _recover_command(run, hint: dict[str, Any]) -> str:
+    command = str(hint.get("command") or "").strip()
+    if command:
+        return command
+    strategy = str(hint.get("strategy") or "").strip().lower() or "retry"
+    if strategy not in _STRATEGY_WORDS:
+        strategy = "retry"
+    return f"mini-ork recover {run.id} --strategy {strategy}"
+
+
+def _gate_explanation(run, gate: dict[str, Any]) -> str:
+    """What approving this retry will do — never an empty string.
+
+    C4: every gate/retry callout says the strategy, the from-node, the exact
+    command, and (when known) the estimated cost. Where the gate's hint has no
+    ``fix_steps``, the persisted ``retry-hint.json`` supplies ``failed_node`` /
+    ``notes[0]`` / the command. A verification gate also names the unverified
+    levels and the every-level-PROVEN rule. A broken hint still yields generic
+    text naming the decision — a broken part costs detail, never the sentence.
+    """
+    hint = _gate_merged_hint(run, gate)
+    nc = hint.get("needs_change")
+    nc = nc if isinstance(nc, dict) else {}
+    summary = str(nc.get("summary") or "").strip()
+    strategy_raw = str(hint.get("strategy") or "").strip().lower()
+    from_node = str(hint.get("from_node") or hint.get("failed_node") or "").strip()
+
+    steps: list[str] = []
+    try:
+        from mini_ork.recovery import retry_notify
+
+        steps = [str(s).strip() for s in retry_notify.fix_steps(hint, home=run.home)
+                 if str(s).strip()]
+    except Exception:  # noqa: BLE001 — a broken steps renderer must not blank the gate
+        steps = []
+    raw_notes = hint.get("notes")
+    notes = [str(n).strip() for n in raw_notes if str(n).strip()] \
+        if isinstance(raw_notes, list) else []
+
+    lines: list[str] = []
+    headline = (f"{_strategy_word(strategy_raw)} from {from_node}" if from_node
+                else f"{_strategy_word(strategy_raw)} from the failed node")
+    lines.append(headline + ".")
+    if summary and summary not in headline:
+        lines.append(summary)
+    if steps:
+        lines.extend(f"{i}. {step}" for i, step in enumerate(steps, 1))
+    elif notes:
+        lines.append(f"Next: {notes[0]}")
+    else:
+        lines.append("No fix steps are recorded; the retry re-runs the failed node.")
+    lines.append(f"Command: {_recover_command(run, hint)}")
+    cost = _estimated_cost(hint)
+    if cost is not None:
+        lines.append(f"Estimated cost: {S.money(cost)}")
+    if strategy_raw in ("verify", "re-verify") or hint.get("verification") is True:
+        lines.append(_verification_wording(run))
+    return "\n".join(lines)
+
+
+def gate_attention_item(run) -> dict[str, Any] | None:
+    """The pending retry gate as one needs-you lane item, or ``None``.
+
+    The item carries the primary decision (Approve retry) plus a non-empty
+    explanation; the lane is the single place the retry decision renders, so
+    the outcome's own callout is dropped from the story tab when this exists.
+    The reject command is named in the detail rather than drawn as a second
+    board-gate control (the lane promises one decision, one block).
+    """
+    gate = _pending_gate(run)
+    if gate is None:
+        return None
+    inbox_id = str(gate.get("inbox_id") or "")
+    actions: list[dict[str, Any]] = []
+    if inbox_id:
+        actions.append(S.btn(
+            "Approve retry",
+            S.cli("board", "gate", "approve", inbox_id,
+                  confirm="Approve the retry and dispatch the fix?"),
+            "primary"))
+    lines = [ln.strip() for ln in _gate_explanation(run, gate).splitlines() if ln.strip()]
+    detail = "\n".join(lines[1:])
+    if inbox_id:
+        detail = (detail + "\n" if detail else "") + \
+            f"To leave the run as it is: mini-ork board gate reject {inbox_id}."
+    return {
+        "id": f"gate:{inbox_id or getattr(run, 'id', 'run')}",
+        "t": lines[0] if lines else "This run needs your decision.",
+        "sub": detail,
+        "acts": actions,
+    }
+
+
 def _gate_needs_you(run, gate: dict[str, Any]) -> dict[str, Any]:
     hint = _gate_hint(gate)
     nc = hint.get("needs_change")
     summary = str((nc or {}).get("summary") or "") if isinstance(nc, dict) else ""
     inbox_id = str(gate.get("inbox_id") or "")
-    steps: list[str] = []
-    if hint:
-        try:
-            from mini_ork.recovery import retry_notify
-
-            steps = retry_notify.fix_steps(hint, home=run.home)
-        except Exception:  # noqa: BLE001 — a broken steps renderer must not blank the gate
-            steps = []
-    text_md = "\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1))
+    text_md = _gate_explanation(run, gate)
     callout = S.callout(
-        "This run needs your decision", text_md, tone="orange",
+        GATE_CALLOUT_TITLE, text_md, tone="orange",
         actions=[
             S.btn("Approve retry",
                   S.cli("board", "gate", "approve", inbox_id,
@@ -661,9 +1067,15 @@ def _failed(run, hint: dict[str, Any] | None) -> dict[str, Any]:
     card = _card_detail(run)
     if card == "Failed":  # task_state's FAILED_FALLBACK: no failing node recorded
         card = ""
-    node = ""
-    if isinstance(hint, dict):
-        node = str(hint.get("from_node") or hint.get("failed_node") or "")
+    # The story's own first failed node beats the hint's node: the hint may be
+    # a best-effort guess from an impl log, while a node the page draws as
+    # failed is the fact the reader can check. A done/passed node is never
+    # named (the hint can outlive a recover re-run that finished it).
+    first = _first_failed_node(run)
+    hint_node = str(hint.get("from_node") or hint.get("failed_node") or "") \
+        if isinstance(hint, dict) else ""
+    node = _nameable(run, first.id if first is not None else hint_node) \
+        if (first is not None or hint_node) else ""
     if card:
         text = card
     elif _failing_node_id(run) is None:
@@ -675,6 +1087,10 @@ def _failed(run, hint: dict[str, Any] | None) -> dict[str, Any]:
     else:
         text = f"Failed at {node}" if node else "Failed"
     detail = _failure_detail(run, hint)
+    if not detail and node:
+        # The retry-hint notes are ``_node_reason``'s last fallback, so a run
+        # whose only record of the failure is the hint still says why.
+        detail = _reason_for(run, node)
     actions, revised = _failed_actions(run, hint)
     if revised and revised not in detail:
         detail = f"{detail.rstrip('. ')}. {revised}" if detail else revised
@@ -684,7 +1100,13 @@ def _failed(run, hint: dict[str, Any] | None) -> dict[str, Any]:
     # nothing to compare against. The callout is added directly here
     # (rather than via ``_menu`` / ``_counts``) so the section is bound
     # to the failed card specifically.
-    callouts: list[dict[str, Any]] = []
+    # Fault attribution (J24/C25) rides only the failed card: whose bug is it,
+    # and — for a mini-ork fault — the confirm-gated triage action. It is added
+    # before the seen-before evidence so the answer to "what next?" precedes
+    # the supporting memories. ``consumer`` / ``unknown`` add no button; the
+    # retry actions above already carry the task-fault path.
+    blame_verdict, blame_evidence = _attribute_failure(run)
+    callouts: list[dict[str, Any]] = [_blame_callout(run, blame_verdict, blame_evidence)]
     seen = _seen_before_section(run)
     if seen is not None:
         callouts.append(seen)
@@ -696,6 +1118,7 @@ def _failed(run, hint: dict[str, Any] | None) -> dict[str, Any]:
         "detail": detail,
         "actions": actions,
         "callouts": callouts,
+        "blame": blame_verdict,
     }
 
 
@@ -998,6 +1421,21 @@ def resolve(run) -> dict[str, Any]:
         else:
             out = _published(run)
     out.setdefault("callouts", [])
+    # Three readers of "who failed or is blocked": the chip (state), the triage
+    # text (the sentence) and these two fields (the node and the one-line
+    # reason). A run that already ended (landed / published) names no node —
+    # its chip says done and the triage must not contradict it.
+    node, reason = ("", "") if out["state"] == "done" else _triage_subject(run)
+    if out["state"] == "needs_you" and node and _first_failed_node(run) is not None:
+        # A retry gate over a run whose story records a failed node: the gate's
+        # hint can be stale (its node has since finished), so the headline names
+        # the node the page actually draws as failed. The gate's own callout
+        # below still carries the decision and its fix steps.
+        out["text"] = f"Failed at {node} · needs your decision"
+        if reason:
+            out["detail"] = reason
+    out["node"] = node
+    out["reason"] = reason
     out["counts"] = _counts(run)
     out["menu"] = _menu(run, out["actions"])
     return out

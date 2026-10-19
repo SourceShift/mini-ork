@@ -5,6 +5,9 @@ on:
     branches: ["main"]
   pull_request:
     branches: ["main"]
+  # Reusable: release.yml calls this workflow so the release gate IS the CI
+  # matrix rather than a narrower inline copy of it.
+  workflow_call:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}

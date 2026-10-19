@@ -1,0 +1,36 @@
+name: star_growth_panel
+version: "0.1.0"
+description: >
+  Four-lens feature-adoption panel. Four researchers from four model families
+  each analyse a reference open-source project through a DIFFERENT commercial
+  lens (developer-growth, activation, ecosystem, capability), then propose the
+  features mini-ork should adopt to earn stars — each grounded in evidence
+  from the reference checkout and scored on star impact, effort and fit.
+  A synthesizer merges the four shortlists into one ranked adoption plan.
+  The kickoff names the reference checkout and the lens assignments; the ids
+  and the analysis live in the run, not in this recipe.
+
+matches:
+  keywords:
+    - star growth panel
+    - multi-lens feature adoption
+    - four-lens feature adoption
+    - open source growth analysis
+  regex: []
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+
+risk_class: low
+
+cost_model:
+  min_usd: 3
+  max_usd: 30
+  per_lens_usd: 5
+
+runtime_model:
+  min_minutes: 10
+  max_minutes: 60

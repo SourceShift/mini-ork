@@ -78,6 +78,21 @@ def enabled(environ=None):
     return context_env("MO_LEVEL_VECTOR", "1") == "1"
 
 
+def target_waiver_allowed(environ=None):
+    """True only when the operator explicitly accepted an unproven ``target``.
+
+    ``MO_ALLOW_UNPROVEN_TARGET=1`` is a deliberate, recorded waiver: the run
+    publishes even though the instrument that would prove ``target`` was
+    turned off. Default OFF, so a disabled instrument still abstains — a
+    silent downgrade to "publish without proof" stays impossible.
+
+    Reads ``environ`` when given, else ``context_env``, matching :func:`enabled`.
+    """
+    if environ is not None:
+        return environ.get("MO_ALLOW_UNPROVEN_TARGET", "0") == "1"
+    return context_env("MO_ALLOW_UNPROVEN_TARGET", "0") == "1"
+
+
 def _iter_json_objects(path):
     """Every dict parseable from ``path``, bottom-up.
 
@@ -434,6 +449,25 @@ def derive_levels(run_dir, task_class=None):
             "verifier_test.json: pass with replay overlap" if ov
             else "verifier_test.json: pass with opaque exit-code delta"
         )
+    elif rc == 0 and T.get("pass") is True and T.get("target_waiver"):
+        # The verifier turned the instrument off on purpose (e.g. the
+        # `MO_CODEFIX_REPLAY=0` opt-out). Distinguish that from "the suite ran
+        # and proved nothing": the reason names the switch, and only an
+        # explicit operator waiver turns it into publishable n/a. Without the
+        # waiver the level still abstains — never a silent downgrade.
+        waiver = str(T.get("target_waiver"))
+        if target_waiver_allowed():
+            vector["target"] = NA
+            reasons["target"] = (
+                "verifier_test.json: target instrument disabled "
+                f"({waiver}); waived by MO_ALLOW_UNPROVEN_TARGET=1"
+            )
+        else:
+            reasons["target"] = (
+                "verifier_test.json: target instrument disabled "
+                f"({waiver}) — re-run with the instrument enabled, or set "
+                "MO_ALLOW_UNPROVEN_TARGET=1 to publish with a recorded waiver"
+            )
     elif not (ru or au) and rc == 0 and T.get("pass") is False and ov == []:
         vector["target"] = REFUTED
         reasons["target"] = "verifier_test.json: pass=false, no overlap"

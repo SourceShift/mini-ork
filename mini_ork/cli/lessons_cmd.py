@@ -1,4 +1,4 @@
-"""``mini-ork lessons`` — list, forget and restore learned rules.
+"""``mini-ork lessons`` — list, forget, restore and promote learned rules.
 
 A "learned rule" is an ``emergent_patterns`` row that cleared the judge gate
 (``status='approved'``) and carries an authored ``lesson_text``; only those are
@@ -8,12 +8,15 @@ operator's control surface over them:
     lessons list [--json]
     lessons forget <pattern_id>
     lessons restore <pattern_id>
+    lessons promote <pattern_id>
 
 ``forget`` sets ``status='rejected'`` (``resolved_at`` = now) so the lesson
 stops being injected. ``restore`` returns a ``rejected`` row to ``approved``,
 and only when it still carries a non-blank lesson — restoring a lessonless row
 would inject a frequency count, exactly the confabulation the judge gate exists
-to stop (``reflection_verify_patterns``).
+to stop (``reflection_verify_patterns``). ``promote`` approves a ``proposed``
+row under the same authored-lesson guard, so the operator can accept a lesson
+where it was proposed instead of waiting for the judge gate.
 
 Exit codes: 0 on success, 2 on a usage error or an unknown id (message on
 stderr). The module mirrors ``prefs_cmd``: a bad id is a real mistake the
@@ -28,7 +31,7 @@ import sys
 import time
 from typing import Any
 
-_ACTIONS = ("list", "forget", "restore")
+_ACTIONS = ("list", "forget", "restore", "promote")
 _LIST_STATUSES = ("approved", "proposed")
 
 
@@ -49,12 +52,13 @@ def _usage() -> str:
     return (
         "Usage: mini-ork lessons <action> [args]\n"
         "\n"
-        "List, forget and restore learned rules (verified emergent patterns).\n"
+        "List, forget, restore and promote learned rules (verified emergent patterns).\n"
         "\n"
         "Actions:\n"
         "  lessons list               Approved + proposed learned rules\n"
         "  lessons forget <id>        Stop giving this lesson to agents\n"
         "  lessons restore <id>       Return a forgotten lesson to the agents\n"
+        "  lessons promote <id>       Approve a proposed lesson for future runs\n"
         "\n"
         "Options:\n"
         "  --json                     Emit JSON instead of text (list)\n"
@@ -248,6 +252,32 @@ def _do_restore(con: sqlite3.Connection, pid: str, err) -> int:
     return 0
 
 
+def _do_promote(con: sqlite3.Connection, pid: str, err) -> int:
+    """Approve a ``proposed`` row, under the same authored-lesson guard as
+    ``restore``: promoting a frequency count would inject noise."""
+    status = _row_status(con, pid)
+    if status is None:
+        err.write(f"no such lesson: {pid}\n")
+        return 2
+    _status, lesson = status
+    if not lesson.strip():
+        err.write(
+            f"cannot promote {pid}: it has no authored lesson — promoting it would "
+            "inject a frequency count, not guidance\n"
+        )
+        return 2
+    if _status != "proposed":
+        err.write(f"cannot promote {pid}: it is not proposed (status={_status!r})\n")
+        return 2
+    con.execute(
+        "UPDATE emergent_patterns SET status='approved', resolved_at=? "
+        "WHERE pattern_id=? AND status='proposed'",
+        (int(time.time()), pid),
+    )
+    con.commit()
+    return 0
+
+
 def main(argv=None, *, stdout=None, stderr=None) -> int:
     out = stdout if stdout is not None else sys.stdout
     err = stderr if stderr is not None else sys.stderr
@@ -298,6 +328,8 @@ def main(argv=None, *, stdout=None, stderr=None) -> int:
     try:
         if action == "forget":
             return _do_forget(con, pos[0], err)
+        if action == "promote":
+            return _do_promote(con, pos[0], err)
         return _do_restore(con, pos[0], err)
     finally:
         con.close()

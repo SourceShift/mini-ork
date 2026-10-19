@@ -9,8 +9,9 @@ Three verdicts, fail-closed to ``unknown`` (which, like ``consumer``, means
 "do not auto-fix"):
 
   * ``mini_ork``  — the failure raised inside mini-ork's own code (``mini_ork/``
-    or a *shipped* ``recipes/*`` verifier). A ``framework-edit`` fix run is
-    warranted.
+    or a *shipped* ``recipes/*`` verifier), or the harness's own
+    bookkeeping/supervisor failures (``impl_moved_base``, ``dispatcher-dead``).
+    A ``framework-edit`` fix run is warranted.
   * ``consumer``  — a legitimate artifact verdict (``verdict_fail`` /
     ``verdict_revise``) or an error in code outside the framework tree.
   * ``unknown``   — infra (timeout / budget / provider error) or simply not
@@ -31,6 +32,11 @@ Blame = Literal["mini_ork", "consumer", "unknown"]
 
 # finish_reason values from db/migrations/0021_error_taxonomy_finish_reasons.sql.
 _VERDICT_REASONS = frozenset({"verdict_fail", "verdict_revise"})
+# The harness's own bookkeeping/supervisor failures: the implementer's base
+# ref moved under it, or the dispatcher died. These are mini-ork bugs, not
+# consumer errors and not infra — and they outrank a provider signature in the
+# log, because the harness reason is the proximate cause.
+_HARNESS_REASONS = frozenset({"impl_moved_base", "dispatcher-dead"})
 _INFRA_REASONS = frozenset({"timeout", "cost_limit", "interrupted", "max_steps"})
 
 # A provider/auth/transport failure is infra, never a mini-ork code bug. Kept
@@ -137,6 +143,14 @@ def attribute(failed: NodeFailure, *, root: str | None = None) -> tuple[Blame, l
     if reason in _VERDICT_REASONS:
         return "consumer", [
             Evidence("verdict", f"finish_reason={reason}: a legitimate artifact verdict, not a harness bug")
+        ]
+
+    if reason in _HARNESS_REASONS:
+        return "mini_ork", [
+            Evidence(
+                "harness",
+                f"finish_reason={reason}: the run's own bookkeeping/supervisor failed, not the task",
+            )
         ]
 
     if reason in _INFRA_REASONS:

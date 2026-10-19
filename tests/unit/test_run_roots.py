@@ -382,6 +382,92 @@ def test_mini_ork_target_repo_pointing_at_engine_is_ignored(tmp_path, monkeypatc
 
     assert run_roots.resolve_run_roots(str(run_dir)).target == str(bare)
 
+# ─── A kickoff staged in the engine home declares no target ─────────────────
+
+
+def test_home_staged_kickoff_does_not_pin_the_engine_checkout(tmp_path, monkeypatch):
+    """run-1792224150-80303: the kickoff sits under ``<home>/kickoffs/``, i.e.
+    inside the engine checkout, and the run is launched from its target
+    worktree. Honouring the kickoff's toplevel pinned ``roots.target`` to the
+    engine; the ground-truth gate then compared the worktree's base with the
+    engine's HEAD and failed a good 3-file change. The launch cwd must win."""
+    engine = tmp_path / "engine"
+    _init_repo(engine)
+    home = engine / ".mini-ork"
+    (home / "kickoffs" / "run-page").mkdir(parents=True)
+    kickoff = home / "kickoffs" / "run-page" / "K.md"
+    kickoff.write_text("k")
+    worktree = tmp_path / "worktree"
+    _init_repo(worktree)
+    run_dir = home / "runs" / "run-1"
+    _write_profile(run_dir, kickoff_path=str(kickoff))
+
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+    monkeypatch.setenv("MINI_ORK_ROOT", str(worktree))
+    monkeypatch.setenv("MINI_ORK_TARGET_REPO", str(worktree))
+    monkeypatch.delenv("MO_TARGET_CWD", raising=False)
+    monkeypatch.delenv("MINI_ORK_ENGINE_ROOT", raising=False)
+    monkeypatch.delenv("MO_SHARED_DRIVE_BACKEND", raising=False)
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
+    monkeypatch.chdir(worktree)
+
+    target = run_roots.resolve_run_roots(str(run_dir)).target
+    assert os.path.realpath(target) == os.path.realpath(str(worktree))
+    assert ex._resolve_target_cwd(str(run_dir)) == target
+
+
+def test_home_staged_kickoff_honors_an_explicit_target_repo(tmp_path, monkeypatch):
+    """Only a declared target moves the edit surface; a home-staged kickoff does
+    not shadow the launcher's own MINI_ORK_TARGET_REPO."""
+    engine = tmp_path / "engine"
+    _init_repo(engine)
+    home = engine / ".mini-ork"
+    (home / "kickoffs").mkdir(parents=True)
+    kickoff = home / "kickoffs" / "K.md"
+    kickoff.write_text("k")
+    other = tmp_path / "other"
+    _init_repo(other)
+    run_dir = home / "runs" / "run-1"
+    _write_profile(run_dir, kickoff_path=str(kickoff))
+
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+    monkeypatch.setenv("MINI_ORK_ROOT", str(engine))
+    monkeypatch.setenv("MINI_ORK_TARGET_REPO", str(other))
+    monkeypatch.delenv("MO_TARGET_CWD", raising=False)
+    monkeypatch.delenv("MINI_ORK_ENGINE_ROOT", raising=False)
+    monkeypatch.delenv("MO_SHARED_DRIVE_BACKEND", raising=False)
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
+    monkeypatch.chdir(engine)
+
+    assert run_roots.resolve_run_roots(str(run_dir)).target == str(other)
+
+
+def test_kickoff_repo_outside_the_home_still_wins_over_cwd(tmp_path, monkeypatch):
+    """The home exclusion must not weaken the original guarantee: a kickoff
+    staged inside a *target* repo still names that repo, not the launch cwd."""
+    home = tmp_path / "home"
+    home.mkdir()
+    target = tmp_path / "target"
+    _init_repo(target)
+    kickoff = target / "K.md"
+    kickoff.write_text("k")
+    launch_cwd = tmp_path / "launch"
+    _init_repo(launch_cwd)
+    run_dir = home / "runs" / "run-1"
+    _write_profile(run_dir, kickoff_path=str(kickoff))
+
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+    monkeypatch.delenv("MINI_ORK_ROOT", raising=False)
+    monkeypatch.delenv("MINI_ORK_ENGINE_ROOT", raising=False)
+    monkeypatch.delenv("MINI_ORK_TARGET_REPO", raising=False)
+    monkeypatch.delenv("MO_TARGET_CWD", raising=False)
+    monkeypatch.delenv("MO_SHARED_DRIVE_BACKEND", raising=False)
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
+    monkeypatch.chdir(launch_cwd)
+
+    assert run_roots.resolve_run_roots(str(run_dir)).target == str(target)
+
+
 # ─── A recorded target that is gone: override or fail closed (audit 2026-10-12)
 
 

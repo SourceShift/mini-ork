@@ -49,10 +49,9 @@ purple cyan orange`` or a lane family ``fam:<lane>`` (``fam:sonnet``). The IDE
 maps them onto its theme. State words are ``done running failed skipped pending
 needs_you``.
 
-:func:`ide_level` reads the requested level on every call (default ``1``): the
-level rides on the request (:func:`ide_spec_level`) when a server is answering,
-and on ``MINI_ORK_IDE_SPEC`` in the environment otherwise. An IDE that asks for
-``2`` gets the section types above; an older IDE keeps getting today's pages.
+:func:`ide_level` reads ``MINI_ORK_IDE_SPEC`` on every call (default ``1``): an
+IDE that sets ``MINI_ORK_IDE_SPEC=2`` gets the section types above; an older IDE
+(env unset) keeps getting today's pages.
 
 Actions (``do``) — what a button, row or chip does in the IDE:
 
@@ -61,6 +60,9 @@ Actions (``do``) — what a button, row or chip does in the IDE:
 - ``{"set": {...}}``               re-fetch this page with these args merged
 - ``{"run": run_id, "title": t, "tab": t}``    open a run's tab
 - ``{"path": abs}`` / ``{"reveal": abs}`` / ``{"url": u}``
+- ``{"terminal": {"cli", "cwd", "home"}}``  open a real terminal (a TTY), run
+  ``mini-ork <cli> --home <home>`` in it; no ``cli`` opens a shell — the only
+  action that can host a credential prompt
 - ``{"thread": text}``             new mini-ork thread, ``text`` as its first prompt
 - ``{"project": abs}``             switch the IDE window to the project at ``abs``
 - ``{"project_pick": true}``       pick a project folder, then switch to it
@@ -73,9 +75,7 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Callable, Iterable, Iterator
-from contextlib import contextmanager
-from contextvars import ContextVar
+from collections.abc import Callable, Iterable
 from typing import Any
 
 COLOURS = ("text", "body", "muted", "sub", "dim", "blue", "green", "red", "yellow",
@@ -87,50 +87,20 @@ KINDS = ("primary", "default", "danger", "warn", "ghost")
 
 # ── spec level ─────────────────────────────────────────────────────────────
 
-def _level_of(raw: str | int | None) -> int:
-    """Parse a spec level. Anything missing, non-numeric or below ``1`` is
-    level ``1`` — the page that predates the v2 section types. Failing towards
-    level 1 is deliberate: an unreadable request must not take down a page."""
+def ide_level() -> int:
+    """The IDE spec level the caller asked for, from ``MINI_ORK_IDE_SPEC``.
+
+    The new IDE sets ``MINI_ORK_IDE_SPEC=2`` on every page build; builders use
+    this to decide whether to emit the v2 section types. Read on each call —
+    never cached — so a long-lived process sees a new value. Anything missing,
+    non-numeric or below ``1`` is level ``1`` (today's pages).
+    """
+    raw = os.environ.get("MINI_ORK_IDE_SPEC")
     try:
         level = int(raw) if raw is not None else 1
     except (TypeError, ValueError):
         return 1
     return level if level >= 1 else 1
-
-
-#: The level named by the request being served, when it named one. Set by
-#: :func:`ide_spec_level`. The environment stays the process-wide default (the
-#: subprocess path sets ``MINI_ORK_IDE_SPEC`` there), so a server that was
-#: started with no variable in its environment still answers at level 1.
-_SPEC_OVERRIDE: ContextVar[int | None] = ContextVar("mini_ork_ide_spec", default=None)
-
-
-def ide_level() -> int:
-    """The IDE spec level the caller asked for.
-
-    The per-request level wins — one ``mini-ork serve`` can be read by a level-2
-    IDE and a level-1 one at the same time — and ``MINI_ORK_IDE_SPEC`` in the
-    environment is the default underneath it, which is the only channel a
-    subprocess build has. Read on each call, never cached, so a long-lived
-    server sees a new value. Anything missing, non-numeric or below ``1`` is
-    level ``1``.
-    """
-    override = _SPEC_OVERRIDE.get()
-    if override is not None:
-        return _level_of(override)
-    return _level_of(os.environ.get("MINI_ORK_IDE_SPEC"))
-
-
-@contextmanager
-def ide_spec_level(level: int | None) -> Iterator[None]:
-    """Serve the enclosed build at ``level``, or at the environment's default
-    when it is ``None``. Reset on the way out: a request that named no level
-    must not leave the next one reading at level 2."""
-    token = _SPEC_OVERRIDE.set(level)
-    try:
-        yield
-    finally:
-        _SPEC_OVERRIDE.reset(token)
 
 
 # ── actions ────────────────────────────────────────────────────────────────
@@ -219,6 +189,24 @@ def project_forget(path: str, confirm: str | None = None) -> dict[str, Any]:
     return _with_confirm({"project_forget": path}, confirm)
 
 
+def terminal(cli_args: Iterable[str] | None = None, *, cwd: str | None = None,
+             home: bool = True) -> dict[str, Any]:
+    """Open a terminal in the IDE at ``cwd``, optionally running ``mini-ork``.
+
+    The one action that carries a TTY. ``cli`` actions run with stdin closed,
+    so a command that reads a credential (``pm add``'s hidden prompt) must run
+    here instead: the value is typed into a terminal, never into a page
+    payload, an argv, or a log. With no ``cli`` the action opens a plain shell
+    at ``cwd`` so a person can paste a displayed command.
+    """
+    spec: dict[str, Any] = {"home": home}
+    if cli_args:
+        spec["cli"] = list(cli_args)
+    if cwd:
+        spec["cwd"] = str(cwd)
+    return {"terminal": spec}
+
+
 def url(u: str) -> dict[str, Any]:
     return {"url": u}
 
@@ -248,6 +236,16 @@ def btn(label: str, do: dict[str, Any] | None = None, kind: str = "default", *,
         if done is not None:
             do["done"] = done
     return {"label": label, "kind": kind if kind in KINDS else "default", "do": do}
+
+
+def copy(text: str, done: str = "Copied") -> dict[str, Any]:
+    """An action that puts ``text`` on the clipboard, toasting ``done``.
+
+    A plain action dict rather than a button: the IDE draws it wherever an
+    action fits (a menu row, a list item) and the renderer reads ``copy`` the
+    way it reads ``cli`` / ``page``.
+    """
+    return {"copy": str(text), "done": done}
 
 
 # ── cells, chips, list items ───────────────────────────────────────────────
@@ -643,6 +641,29 @@ def checks(title: str, rows: Iterable[Any], *, summary: dict[str, Any] | None = 
         "rows": rows,
         "summary": summary if summary is not None else _checks_summary(rows),
     }, **opt)
+
+
+def level_row(name: str, value: str, *, required: bool | None = None,
+              reason: str = "") -> dict[str, Any]:
+    """One level for :func:`levels`.
+
+    ``required`` is ``None`` when the run never stamped its task class's
+    requirements — the renderer must not guess either way.
+    """
+    return {"name": str(name), "value": str(value),
+            "required": required, "reason": str(reason)}
+
+
+def levels(title: str, rows: Iterable[Any], *, decision: str = "",
+           task_class: str = "", **opt: Any) -> dict[str, Any]:
+    """The verification vector as data: value, requirement, reason per level.
+
+    The engine states the verdict and what the run had to prove; which levels
+    to foreground and how a value reads belong to the renderer.
+    """
+    return _section("levels", title, {"rows": list(rows),
+                                      "decision": str(decision),
+                                      "task_class": str(task_class)}, **opt)
 
 
 def agent_row(node_id: str, state: str, *, lane: str = "", model: str = "", step: str = "",

@@ -319,7 +319,8 @@ def _node_attempt_no(db, run_id: str, node_id: str) -> int:
 def _write_learned_record(run_dir: str, node_id: str, node_type: str,
                           lane: str, task_class: str, *,
                           attempt: int, block: str,
-                          sources: list[dict] | None) -> None:
+                          sources: list[dict] | None,
+                          run_id: str | None = None) -> None:
     """Persist the learned block an LLM node actually received.
 
     Writes two artifacts under ``<run_dir>/learned/``:
@@ -364,6 +365,16 @@ def _write_learned_record(run_dir: str, node_id: str, node_type: str,
             reason = "nothing matched"
         else:
             reason = ""
+        # LF-R13 §2: provenance only. Lazy import keeps context_v2 off this
+        # module's import path (which also loads in embedders without it). A
+        # missing run_id leaves both fields None — the pre-R13 record shape.
+        arm = None
+        if run_id:
+            try:
+                from mini_ork import context_v2
+                arm = context_v2.arm(run_id)
+            except Exception:  # noqa: BLE001 — provenance never blocks a dispatch
+                arm = None
         record = {
             "node_id": node_id,
             "node_type": node_type,
@@ -374,6 +385,8 @@ def _write_learned_record(run_dir: str, node_id: str, node_type: str,
             "injected": injected,
             "reason": reason,
             "sources": list(sources) if sources else [],
+            "arm": arm,
+            "held_out": (arm == "holdout") if arm is not None else None,
         }
         md_path = os.path.join(learned_dir, f"{node_id}.md")
         json_path = os.path.join(learned_dir, f"{node_id}.json")
@@ -804,7 +817,7 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         _write_learned_record(
             run_dir_eff, node_id, node_type, lane, task_class,
             attempt=_node_attempt_no(db, run_id, node_id),
-            block=learned, sources=learned_sources,
+            block=learned, sources=learned_sources, run_id=run_id,
         )
     # Publish the per-node identity + clear any stale resume session in one
     # canonical step (None removes the variable).

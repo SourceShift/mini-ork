@@ -201,21 +201,23 @@ def _seed(home: Path, *, status: str = "published", recipe: str = "demo-recipe")
     return run_dir
 
 
-def test_a_live_run_story_ends_with_the_steer_composer(home: Path, monkeypatch) -> None:
+def test_a_live_run_outcome_tab_carries_the_steer_composer(
+        home: Path, monkeypatch) -> None:
     _seed(home, status="executing")
     monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
-    page = build_page(home, "run", None, {"run": RUN})
-    assert page["tab"] == "story"
-    last = page["sections"][-1]
-    assert last["type"] == "composer"
-    assert last["title"] == "Steer this run"
-    assert last["placeholder"].startswith("Tell the running agent")
-    assert last["cli"] == ["board", "steer", RUN, "--text"]
+    page = build_page(home, "run", "outcome", {"run": RUN})
+    assert page["tab"] == "outcome"
+    composers = [s for s in page["sections"] if s["type"] == "composer"]
+    assert len(composers) == 1
+    steer = composers[0]
+    assert steer["title"] == "Steer this run"
+    assert steer["placeholder"].startswith("Tell the running agent")
+    assert steer["cli"] == ["board", "steer", RUN, "--text"]
 
 
-def test_a_finished_run_story_has_no_composer(home: Path, monkeypatch) -> None:
+def test_a_finished_run_outcome_tab_has_no_composer(home: Path, monkeypatch) -> None:
     _seed(home, status="published")
     monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
-    page = build_page(home, "run", None, {"run": RUN})
-    assert page["tab"] == "story"
+    page = build_page(home, "run", "outcome", {"run": RUN})
+    assert page["tab"] == "outcome"
     assert all(s["type"] != "composer" for s in page["sections"])

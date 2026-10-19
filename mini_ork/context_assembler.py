@@ -439,7 +439,8 @@ def failure_modes_md(task_class: str, limit: int = 5, db: str | None = None,
                      *, node_type: str = "", lane: str = "",
                      node_id: str = "",
                      sources: list[dict] | None = None,
-                     read_only: bool = False) -> str:
+                     read_only: bool = False,
+                     include_themes: bool = True) -> str:
     """The "Learned failure modes" block; '' when no learnings. Includes the
     project-scope filter: framework-internal targets are stripped when
     MO_TARGET_CWD is set and differs from MINI_ORK_ROOT.
@@ -456,6 +457,11 @@ def failure_modes_md(task_class: str, limit: int = 5, db: str | None = None,
     retrieval is logged and no mirror is written or swept (see
     ``semantic_lessons_md``). A preview render passes it; a node assembling its
     own prompt does not.
+
+    `include_themes=False` omits the induced-themes section and nothing else.
+    The v2 arm renders those same verified themes in its own block, so passing
+    False there is what keeps a lesson from reaching one prompt twice; every
+    other section is byte-identical either way.
     """
     limit = _limbo_limit(node_type, limit)
     dbp = _db_path(db)
@@ -513,9 +519,12 @@ def failure_modes_md(task_class: str, limit: int = 5, db: str | None = None,
 
     # Verified theme lessons — the loop-verified complement to the raw gradient
     # block above (user rule 2026-10-07). Uses the same post-LIMBO ``limit``.
-    verified = _verified_theme_lessons(dbp, task_class, limit, sources=sources)
-    if verified:
-        out.append(verified)
+    # ``include_themes=False`` skips this section only; a caller that renders
+    # the themes elsewhere (the v2 arm) must not also receive them here.
+    if include_themes:
+        verified = _verified_theme_lessons(dbp, task_class, limit, sources=sources)
+        if verified:
+            out.append(verified)
 
     # Verified emergent patterns (judge-gate approved) — read-back into the
     # prompt. ONLY status='approved' rows (cleared the evidence/strength floor

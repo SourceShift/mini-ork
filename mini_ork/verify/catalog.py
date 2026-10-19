@@ -114,14 +114,50 @@ def card_score(card: VerifierCard) -> float:
     return s.discrimination * s.consistency * (1.0 / (1.0 + card.cost)) - s.fuzz_penalty
 
 
-def rank_verifiers(cards: Iterable[VerifierCard]) -> list[VerifierCard]:
+_MUTATION_OFF_VALUES = frozenset({"0", "off", "false", "no"})
+
+
+def _mutation_gate_enabled() -> bool:
+    """Admission gating is on unless ``MO_VERIFIER_MUTATION`` says otherwise."""
+    return os.environ.get("MO_VERIFIER_MUTATION", "1").strip().lower() not in _MUTATION_OFF_VALUES
+
+
+def rank_verifiers(
+    cards: Iterable[VerifierCard],
+    mutation_scores: dict[str, float | None] | None = None,
+) -> list[VerifierCard]:
     """Sort cards by score desc, then cost asc.
 
     Python's sort is stable, so when score and cost both tie the input order
     is preserved. Callers should pass an already-sorted iterable (e.g. from
     :func:`load_cards`) to make file order the deterministic tie-breaker.
+
+    When the mutation gate is enabled (``MO_VERIFIER_MUTATION`` is anything
+    but ``"0"``/``"off"``/``"false"``/``"no"``), each card's sidecar kill
+    score is read and a card is dropped when
+    :func:`mini_ork.gates.verifier_mutation.admit` rejects it. Cards with no
+    score stay: unmeasured never blocks. Passing ``mutation_scores`` supplies
+    the scores directly and suppresses sidecar reads. With the gate off, this
+    is exactly the pre-existing ranking.
     """
-    return sorted(cards, key=lambda c: (-card_score(c), c.cost))
+    current = list(cards)
+    if _mutation_gate_enabled():
+        # Lazy: catalog's import-time contract stays stdlib-only, and the
+        # knob-off path never imports the gate module at all.
+        from mini_ork.gates import verifier_mutation
+
+        kept: list[VerifierCard] = []
+        for card in current:
+            if mutation_scores is not None:
+                score = mutation_scores.get(card.name)
+            elif card.source:
+                score = verifier_mutation.read_score(card.source)
+            else:
+                score = None
+            if verifier_mutation.admit(score):
+                kept.append(card)
+        current = kept
+    return sorted(current, key=lambda c: (-card_score(c), c.cost))
 
 
 def _parse_one(path: Path) -> VerifierCard:

@@ -253,7 +253,16 @@ def test_metrics_context_reports_delivery_ack_scope_and_recurrence(tmp_path, mon
     assert result["lift"]["status"] == "insufficient"
     monkeypatch.setattr(metrics_context, "MIN_N", 1)
     lift = metrics_context.summarize(records)["lift"]
-    assert lift == {"value": -1.0, "status": "measured", "n_v2": 1, "n_holdout": 1}
+    # LF-R13 added the v2_legacy count and the ITT lift to the payload, so an
+    # exact-dict assertion is no longer the contract; the delivered lift is
+    # unchanged.
+    assert {k: lift[k] for k in ("value", "status", "n_v2", "n_holdout")} == {
+        "value": -1.0, "status": "measured", "n_v2": 1, "n_holdout": 1}
+    assert lift["n_v2_legacy"] == 0
+    # ITT also counts run-c, which was never harvested (2 v2 runs, 1 event).
+    assert (lift["n_v2_itt"], lift["n_holdout_itt"]) == (2, 1)
+    assert lift["status_itt"] == "measured"
+    assert lift["value_itt"] == -0.5
 
 
 def test_metrics_context_cli_json_and_empty_state(tmp_path):

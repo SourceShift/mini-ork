@@ -107,6 +107,7 @@ from mini_ork.acp import task_state as _task_state
 from mini_ork.acp.task_state import TaskState as _TaskState
 from mini_ork.acp.live import LiveTail, normalize
 from mini_ork.acp.threads import ThreadStore, title_from_text
+from mini_ork.version import __version__
 from mini_ork.run_status import TERMINAL as TERMINAL_STATUSES
 from mini_ork.web.control import _is_safe_token
 
@@ -1055,7 +1056,7 @@ class MiniOrkAcpAgent:
         )
         return InitializeResponse(
             protocol_version=PROTOCOL_VERSION,
-            agent_info=Implementation(name="mini-ork-acp", version="0.9.0"),
+            agent_info=Implementation(name="mini-ork-acp", version=__version__),
             agent_capabilities=AgentCapabilities(
                 load_session=True,
                 prompt_capabilities=PromptCapabilities(
@@ -5881,12 +5882,6 @@ class MiniOrkAcpAgent:
                 continue
             emitted.add(key)
             new_events.append(ev)
-        # Live drain (Z3): any node whose node_start has already been emitted
-        # is followed here. Drain happens BEFORE the lifecycle events so a
-        # text chunk follows its tool call, and BEFORE the terminal message
-        # so nothing written at the very end is lost (kickoff §3).
-        if live:
-            await self._drain_live_for(session_id)
         # The run context lets every node update carry its projector-derived
         # card. Both the live projection and ``_replay_run_in_thread`` pass the
         # same values, so a reopened thread reconstructs identical cards.
@@ -5895,6 +5890,22 @@ class MiniOrkAcpAgent:
             run_id=session_id,
             recipe=self._recipes.get(session_id) or self._recipe,
         )
+        # Open every new node's tool call before its first live chunk. The
+        # drain below follows nodes whose ``node_start`` was recorded above,
+        # but a same-poll progress update sent before the ``ToolCallStart``
+        # that names its ``tool_call_id`` is an update for an unknown tool
+        # call: Zed renders it as a failed "Tool call not found" entry and
+        # returns before resolving its ``locations``, so the crosshair would
+        # skip that chunk — and, once the live dedup marks the path as sent,
+        # every later chunk for the same file too. The drain still runs
+        # before the remaining lifecycle events (``node_end``) and before
+        # the terminal message so final text is not lost (kickoff §3).
+        for update in updates:
+            if isinstance(update, ToolCallStart):
+                await self._emit(session_id, update)
+        updates = [update for update in updates if not isinstance(update, ToolCallStart)]
+        if live:
+            await self._drain_live_for(session_id)
         updates.append(self._build_usage_update(snapshot.get("llm_calls")))
         status = snapshot.get("status")
         if status is not None:

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -305,7 +306,7 @@ def test_sync_error_renders_a_warn_line_without_a_token(
     assert "lin_secret_value_xyz" not in json.dumps(page)
 
 
-def test_no_external_source_still_builds_and_names_pm_yaml(
+def test_no_external_source_still_builds_and_offers_the_next_step(
     home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _set_pm(monkeypatch, tmp_path, _PM_LOCAL_ONLY)
@@ -314,9 +315,11 @@ def test_no_external_source_still_builds_and_names_pm_yaml(
     items = _section(page, "list", "Sources")["items"]
     assert len(items) == 1
     text = items[0]["t"]
-    assert "config/pm.yaml" in text
-    assert "enabled: true" in text
-    assert "token_env" in text
+    assert "No PM source is connected" in text
+    # The empty state is a door, not a dead end: the row itself carries the
+    # action that opens the Sources tab.
+    acts = {a["label"]: a["do"] for a in items[0]["acts"]}
+    assert acts["Connect a source"] == {"page": "kanban", "tab": "sources"}
 
 
 # ── do: the ticket's own page ──────────────────────────────────────────────
@@ -455,7 +458,7 @@ def test_an_undeclared_addable_source_gets_an_add_box(
 ) -> None:
     _set_pm(monkeypatch, tmp_path, _PM_LOCAL_ONLY)
     boxes = _section(_sources_page(home), "composer", None)
-    assert boxes["cli"] == ["pm", "add", "linear", "--set"]  # first addable, in order
+    assert boxes["cli"] == ["pm", "add", "github", "--set"]  # first addable, in order
 
 
 def test_every_addable_source_gets_its_own_add_box(
@@ -464,6 +467,7 @@ def test_every_addable_source_gets_its_own_add_box(
     _set_pm(monkeypatch, tmp_path, _PM_LOCAL_ONLY)
     page = _sources_page(home)
     prefixes = [s["cli"] for s in page["sections"] if s["type"] == "composer"]
+    assert ["pm", "add", "github", "--set"] in prefixes
     assert ["pm", "add", "linear", "--set"] in prefixes
     assert ["pm", "add", "jira", "--set"] in prefixes
 
@@ -474,6 +478,91 @@ def test_a_declared_source_gets_no_add_box(
     page = _sources_page(home)
     prefixes = [s["cli"] for s in page["sections"] if s["type"] == "composer"]
     assert not any(prefix[:3] == ["pm", "add", "linear"] for prefix in prefixes)
+
+
+# ── connect: the empty-state door and the one-click path ────────────────────
+
+
+def _connect_row(page: dict[str, Any], source_id: str) -> dict[str, Any]:
+    row = next((i for i in _section(page, "list", "Connect a source")["items"]
+                if i["t"].lower().startswith(source_id)), None)
+    assert row is not None, [i["t"] for i in _section(page, "list", "Connect a source")["items"]]
+    return row
+
+
+def _init_project_remote(home: Path, url: str) -> None:
+    """Give ``home.parent`` an ``origin`` — the prefill GitHub's card reads."""
+    project = home.parent
+    subprocess.run(["git", "init", "-q", str(project)], check=True,
+                   capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(project), "remote", "add", "origin", url],
+                   check=True, capture_output=True, text=True)
+
+
+def test_undeclared_sources_are_offered_as_connect_cards(
+    home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_pm(monkeypatch, tmp_path, _PM_LOCAL_ONLY)
+    page = _sources_page(home)
+    titles = [i["t"] for i in _section(page, "list", "Connect a source")["items"]]
+    assert titles == ["GitHub", "Linear", "Jira"]
+
+
+def test_a_github_remote_and_a_credential_make_connect_one_click(
+    home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_pm(monkeypatch, tmp_path, _PM_LOCAL_ONLY)
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_sentinel_never_in_a_payload")
+    _init_project_remote(home, "https://github.com/acme/widgets.git")
+
+    row = _connect_row(_sources_page(home), "github")
+    assert row["t"] == "GitHub · acme/widgets"
+    assert "GITHUB_TOKEN found in the environment" in row["sub"]
+    acts = {a["label"]: a["do"] for a in row["acts"]}
+    assert acts["Connect"] == {
+        "cli": ["pm", "add", "github", "--set", "owner=acme", "repo=widgets",
+                "--reuse-token"],
+    }
+
+
+def test_without_a_credential_connect_is_not_offered(
+    home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_pm(monkeypatch, tmp_path, _PM_LOCAL_ONLY)
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    _init_project_remote(home, "git@github.com:acme/widgets.git")
+
+    row = _connect_row(_sources_page(home), "github")
+    assert row["t"] == "GitHub · acme/widgets"
+    assert "no GITHUB_TOKEN" in row["sub"]
+    assert "Connect" not in {a["label"] for a in row["acts"]}
+
+
+def test_the_connect_cards_never_carry_the_credential_value(
+    home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_pm(monkeypatch, tmp_path, _PM_LOCAL_ONLY)
+    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_sentinel_never_in_a_payload")
+    _init_project_remote(home, "https://github.com/acme/widgets.git")
+    payload = json.dumps(_sources_page(home))
+    assert "ghp_sentinel_never_in_a_payload" not in payload
+    assert "GITHUB_TOKEN" in payload              # the name is the contract
+
+
+def test_a_terminal_action_carries_a_tty_and_no_credential(
+    home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The terminal is the only action that may host a prompt; it carries none."""
+    _set_pm(monkeypatch, tmp_path, _PM_LOCAL_ONLY)
+    row = _connect_row(_sources_page(home), "linear")
+    do = {a["label"]: a["do"] for a in row["acts"]}["Open terminal"]
+    assert "terminal" in do
+    assert "cli" not in do["terminal"]            # a plain shell; nothing pre-typed
+    assert do["terminal"]["cwd"] == str(home.parent)
 
 
 def test_the_sources_tab_never_carries_a_credential_value(

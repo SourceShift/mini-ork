@@ -41,8 +41,10 @@ import yaml
 
 
 __all__ = [
+    "DEFAULT_NODE_ENV",
     "Environment",
     "LookalikeSecretError",
+    "default_node_env",
     "is_lookalike_secret",
     "load_profile",
     "resolve_schema_path",
@@ -329,6 +331,28 @@ def list_profiles(*, env: Mapping[str, str] | None = None) -> list[str]:
         if d.is_dir():
             names.update(p.stem for p in d.glob("*.yaml") if p.is_file())
     return sorted(names)
+
+
+DEFAULT_NODE_ENV = "daytona"
+_DEFAULT_ENV_OFF = frozenset({"", "0", "false", "no", "off", "none", "local"})
+
+
+def default_node_env(env: Mapping[str, str] | None = None) -> str:
+    """The environment profile a run adopts when it named none.
+
+    ``MO_DEFAULT_NODE_ENV`` names the profile (default ``daytona``); an empty
+    value or one of the off-words disables the default. The profile must exist
+    in the visible config dirs — ``*.yaml.example`` files do not count, so a
+    fresh checkout stays local. An EXISTING but invalid profile is returned
+    anyway: the caller's ``load_profile`` validation reports it (fail closed)
+    instead of this helper silently downgrading the run to the host.
+    """
+    src = os.environ if env is None else env
+    raw = src.get("MO_DEFAULT_NODE_ENV")
+    name = DEFAULT_NODE_ENV if raw is None else raw.strip()
+    if name.lower() in _DEFAULT_ENV_OFF:
+        return ""
+    return name if name in list_profiles(env=src) else ""
 
 
 def load_profile(
