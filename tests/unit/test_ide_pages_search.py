@@ -228,6 +228,70 @@ def test_search_special_chars_are_stripped(home: Path) -> None:
     assert total >= 1
 
 
+# ── run-id channel ───────────────────────────────────────────────────────────
+
+
+def _neutralise_kickoff(home: Path, rid: str) -> None:
+    """Rewrite a run's kickoff so it never names its own id.
+
+    The seeding helper writes the id into the kickoff text, which would let
+    the *body* channel satisfy the query. These tests are about the id
+    channel, so the body must not contain it.
+    """
+    kickoff = home / "kickoffs" / f"{rid}.md"
+    kickoff.write_text("# Neutral\n\nNo identifier in this body.\n")
+    con = sqlite3.connect(home / "state.db")
+    con.execute("UPDATE task_runs SET kickoff_path = ? WHERE id = ?",
+                (str(kickoff), rid))
+    con.commit()
+    con.close()
+    (home / "runs" / rid).touch()
+
+
+def test_search_matches_a_run_id_the_body_never_names(home: Path) -> None:
+    rids = _make_runs(home, 3)
+    for rid in rids:
+        _neutralise_kickoff(home, rid)
+    search_mod.reindex(home)
+    run_ids, total = search_mod.search(home, rids[1], limit=10, offset=0)
+    assert run_ids == [rids[1]]
+    assert total == 1
+
+
+def test_search_run_id_is_case_insensitive_and_matches_middle(home: Path) -> None:
+    rids = _make_runs(home, 2)
+    for rid in rids:
+        _neutralise_kickoff(home, rid)
+    search_mod.reindex(home)
+    assert search_mod.search(home, rids[0].upper(), 10, 0) == ([rids[0]], 1)
+    # the numeric middle is as good a handle as the whole id
+    assert search_mod.search(home, rids[0].split("-")[1], 10, 0) == ([rids[0]], 1)
+
+
+def test_search_id_hits_lead_and_the_union_counts_a_run_once(home: Path) -> None:
+    """``run`` matches every id *and* every kickoff; total must stay 12 and
+    the id channel's newest-first order must lead the page."""
+    rids = _make_runs(home, 12)
+    search_mod.reindex(home)
+    page, total = search_mod.search(home, "run", limit=5, offset=0)
+    assert total == 12
+    assert page == list(reversed(rids))[:5]
+
+
+def test_id_match_works_when_fts5_is_unavailable(home: Path, monkeypatch) -> None:
+    """The id channel reads ``task_runs`` directly, so it survives the
+    degraded LIKE fallback."""
+    monkeypatch.setattr(search_mod, "_fts5_available", lambda *_args, **_kwargs: False)  # pyright: ignore[reportUnusedParameter]
+    rids = _make_runs(home, 2)
+    for rid in rids:
+        _neutralise_kickoff(home, rid)
+    errors: dict[str, str] = {}
+    run_ids, total = search_mod.search(home, rids[0], 10, 0, errors=errors)
+    assert run_ids == [rids[0]]
+    assert total == 1
+    assert "FTS5 unavailable" in errors["search"]
+
+
 # ── like fallback ────────────────────────────────────────────────────────────
 
 

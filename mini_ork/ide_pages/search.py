@@ -35,6 +35,10 @@ Index schema::
 ``lens-*.md`` / ``synthesis.md`` / ``cycle-report.md``), each chunk and
 the joined result capped at :data:`_BODY_INDEX_CHUNK_CAP` (64 KB) so the
 index stays compact.
+
+A run's own id is matched directly against ``task_runs`` (:func:`_id_matches`),
+not through the body — a pasted ``run-…`` id finds its run even when the
+kickoff never spells the id out. Id hits sort before text hits.
 """
 from __future__ import annotations
 
@@ -481,23 +485,71 @@ def search(home: Path, query: str, limit: int, offset: int,
            *, errors: dict[str, str] | None = None) -> tuple[list[str], int]:
     """Return ``(run_ids, total)`` matching ``query``.
 
-    Whitespace-split AND; bm25 then mtime DESC; LIMIT/OFFSET applied. When
-    FTS5 is unavailable the LIKE fallback honours ``offset``/``limit`` and
-    records a note in ``errors``.
+    Two channels, unioned: the full-text index (whitespace-split AND, bm25
+    then mtime DESC) and a run's own id (:func:`_id_matches`). Id hits come
+    first, so a pasted ``run-…`` id is not buried under body matches.
+    LIMIT/OFFSET apply to the union. When FTS5 is unavailable the LIKE
+    fallback honours ``offset``/``limit`` and records a note in ``errors``.
     """
     errors = errors if errors is not None else {}
     terms = [t for t in _FS.split(query.strip()) if t]
     if not terms:
         return [], 0
 
+    id_hits = _id_matches(home, terms)
     use_fts = _fts5_available(errors)
+    if not id_hits:
+        if use_fts:
+            return _search_fts(home, terms, limit, offset)
+        errors.setdefault("search", "FTS5 unavailable, fell back to LIKE scan")
+        return _search_like(home, terms, limit, offset, errors)
+
+    # An id matched: materialise the union, because ``total`` must count a
+    # run once when it matches both channels (a query like ``run`` matches
+    # every id *and* every kickoff). Only entered when the id channel hits,
+    # so the unbounded read stays off the common search path.
     if use_fts:
-        return _search_fts(home, terms, limit, offset)
-    errors.setdefault("search", "FTS5 unavailable, fell back to LIKE scan")
-    return _search_like(home, terms, limit, offset, errors)
+        text_ids, _ = _search_fts(home, terms, None, 0)
+    else:
+        errors.setdefault("search", "FTS5 unavailable, fell back to LIKE scan")
+        text_ids, _ = _search_like(home, terms, None, 0, errors)
+    seen = set(id_hits)
+    merged = id_hits + [rid for rid in text_ids if rid not in seen]
+    return merged[int(offset): int(offset) + int(limit)], len(merged)
 
 
-def _search_fts(home: Path, terms: list[str], limit: int, offset: int) -> tuple[list[str], int]:
+def _id_matches(home: Path, terms: list[str]) -> list[str]:
+    """Run ids containing every query term, newest first.
+
+    Substring + case-insensitive, so a full ``run-…`` id, a numeric middle
+    or a suffix all resolve. A multi-term query needs every term in the id;
+    one pasted id is one term, which is the case this exists for.
+    """
+    from mini_ork.acp.history import _is_safe_token
+
+    state_db = Path(home) / "state.db"
+    if not state_db.is_file():
+        return []
+    clauses = " AND ".join("lower(id) LIKE ? ESCAPE '\\'" for _ in terms)
+    params = ["%" + t.lower().replace("\\", "\\\\").replace("%", "\\%")
+              .replace("_", "\\_") + "%" for t in terms]
+    try:
+        con = sqlite3.connect(str(state_db), timeout=5)
+        try:
+            rows = con.execute(
+                f"SELECT id FROM task_runs WHERE {clauses} "
+                "ORDER BY created_at DESC, rowid DESC",
+                params,
+            ).fetchall()
+        finally:
+            con.close()
+    except sqlite3.OperationalError:
+        return []
+    return [rid for (rid,) in rows if isinstance(rid, str) and _is_safe_token(rid)]
+
+
+def _search_fts(home: Path, terms: list[str], limit: int | None,
+                offset: int) -> tuple[list[str], int]:
     fts_expr = " AND ".join(matches for matches in (_escape_term(t) for t in terms) if matches)
     if not fts_expr:
         return [], 0
@@ -508,21 +560,24 @@ def _search_fts(home: Path, terms: list[str], limit: int, offset: int) -> tuple[
             "SELECT COUNT(*) FROM runs_fts WHERE runs_fts MATCH ?", (fts_expr,)
         ).fetchone()[0])
         # bm25(runs_fts) only — no LEFT JOIN on ``indexed`` (kickoff r3 fix).
-        rows = con.execute(
-            """
+        sql = """
             SELECT run_id FROM runs_fts
             WHERE runs_fts MATCH ?
             ORDER BY bm25(runs_fts)
-            LIMIT ? OFFSET ?
-            """,
-            (fts_expr, int(limit), int(offset)),
-        ).fetchall()
+        """
+        if limit is None:
+            rows = con.execute(sql, (fts_expr,)).fetchall()
+        else:
+            rows = con.execute(
+                sql + " LIMIT ? OFFSET ?",
+                (fts_expr, int(limit), int(offset)),
+            ).fetchall()
         return [r[0] for r in rows], total
     finally:
         con.close()
 
 
-def _search_like(home: Path, terms: list[str], limit: int, offset: int,
+def _search_like(home: Path, terms: list[str], limit: int | None, offset: int,
                  errors: dict[str, str]) -> tuple[list[str], int]:
     """LIKE fallback — scans every run's kickoff text + title + recipe.
 
@@ -566,7 +621,7 @@ def _search_like(home: Path, terms: list[str], limit: int, offset: int,
             matches.append((ts, rid))
     matches.sort(key=lambda x: x[0], reverse=True)
     total = len(matches)
-    page = matches[int(offset): int(offset) + int(limit)]
+    page = matches[int(offset):] if limit is None else matches[int(offset): int(offset) + int(limit)]
     return [rid for _, rid in page], total
 
 
