@@ -58,6 +58,7 @@ _NATIVE_MODULE_SUBS = {
     "eval": "mini_ork.cli.eval",
     "promote": "mini_ork.cli.promote",
     "init": "mini_ork.cli.init",
+    "onboard": "mini_ork.cli.onboard",
     "update": "mini_ork.cli.update",
     "spawn": "mini_ork.cli.spawn",
     "scheduler": "mini_ork.scheduler",
@@ -154,6 +155,8 @@ Self-improvement:
                                    --resume). Gated; never commits without verifiers.
 
 Lifecycle:
+  onboard                        First-run wizard: prerequisites, workspace, lanes,
+                                   and the optional ContextNest / Zed components
   init                           Bootstrap project (creates .mini-ork/)
   install                        Install or repair the per-user mini-ork command
   update                         Apply migrations + report config drift

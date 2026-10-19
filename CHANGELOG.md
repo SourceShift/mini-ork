@@ -11,6 +11,19 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- feat(onboard): `mini-ork onboard` — a first-run wizard that takes a fresh machine to a
+  runnable workspace: prerequisites (`python` ≥ 3.11, `git`), `mini-ork init`, and a
+  credential check that never calls a provider. It can also install the two optional
+  satellites: **ContextNest** (clone, `cargo build --release`, seed
+  `config/contextnest.yaml`) and **Zed** (wire `mini-ork acp` / `mini-ork mcp-context`
+  into `settings.json` via `mini-ork zed setup`). Components default to on only when
+  their toolchain is present. Flags: `-y`, `--workspace`, `--with`,
+  `--no-contextnest`, `--no-zed`, `--secure` (fails closed instead of writing a local
+  secret file), `--skip-build`, `--dry-run`, `--strict`, `--json`. `install.sh` offers
+  the wizard at the end of an interactive install (including piped `curl … | sh`, via
+  `/dev/tty`) and runs it in the directory the user started from; set
+  `MINI_ORK_NO_ONBOARD=1` to skip.
+
 - feat(verify): the verification stack — six techniques from the 2000-paper verification review, ON by
   default (see `docs/architecture/verification-stack.md`). Metamorphic relations in the certify oracle
   (`certify/relations.py`, veto + rescue); differential base-vs-patch check (`certify/differential.py`, collateral-
@@ -29,6 +42,13 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   LLM lane.
 
 ### Changed
+
+- docs(readme): `README.md` is now install-first — quick start, the `mini-ork onboard`
+  steps, the optional ContextNest and Zed components, a first verified run, everyday
+  commands, upgrade/uninstall, and a docs index. The positioning, measurements, feature
+  inventory, self-improvement loops, and safety discussion moved to `docs/WHY.md`,
+  which the README links to. The large in-README certify demo is condensed to one
+  example.
 
 - license: the copyright holder is now named. `LICENSE` was the untouched
   Apache-2.0 boilerplate, so its appendix still read
