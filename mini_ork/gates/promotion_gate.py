@@ -86,6 +86,16 @@ caching):
                                         ``MO_GATE_HACKABILITY_BUDGET_USD`` and
                                         ``MO_GATE_HACKABILITY_MAX`` configure
                                         the measurement, not this consumer.)
+    MO_ORACLE_INTEGRITY              → oracle-integrity consumer: default ON
+                                        ("1"); opt-out with "0". When ON, a
+                                        would-be promote is refused
+                                        ("quarantined", reason
+                                        ``oracle_integrity_failed``) when the
+                                        latest recorded audit of the verdict
+                                        judge failed. A missing record is
+                                        reported as ``unmeasured`` and never
+                                        blocks; the key is absent entirely
+                                        when the knob is off.
     MINI_ORK_ROOT                    → legacy: where to find ``lib/cw_por.sh``
                                         (WS4: CW-POR is computed natively via
                                         ``mini_ork.gates.cw_por``; the env var
@@ -454,6 +464,59 @@ def promotion_evaluate(
                         )
                         rationale += f" gate-hackability:{parts}>{gate_hk['max']:g}"
 
+        # ── Oracle-integrity consumer (vt8) ───────────────────────────────
+        # The verdict judge is itself an instrument; an audit that could be
+        # fooled by fabricated execution evidence means every PROVEN it emitted
+        # is suspect. The audit record is read from the DB's sidecar file. A
+        # missing record is "unmeasured" and never blocks (hackability's
+        # discipline); a failed record quarantines a would-be promote. The guard
+        # only acts on a promote that survived the gate-hackability check, so a
+        # hackable-gate reject still wins. Read on every branch so the result
+        # dict always reports the guard's state; the key itself is added only
+        # when the knob is on, preserving the legacy shape when it is off.
+        oracle_int: dict[str, Any] | None = None
+        try:
+            oi_enabled = os.environ.get("MO_ORACLE_INTEGRITY", "1") != "0"
+        except Exception:  # noqa: BLE001 - os.environ.get cannot raise; keep parity
+            oi_enabled = True
+        if oi_enabled:
+            try:
+                from mini_ork.gates import oracle_integrity
+
+                record = oracle_integrity.latest(db_path)
+                if record is None:
+                    oracle_int = {"status": "unmeasured"}
+                elif record.get("pass") is not True:
+                    # Fail closed: a record that exists but does not certify the
+                    # judge is not evidence the judge is sound.
+                    missed = list(record.get("missed") or [])
+                    controls_failed = list(record.get("controls_failed") or [])
+                    oracle_int = {
+                        "status": "fail",
+                        "reason": "oracle_integrity_failed",
+                        "missed": missed,
+                        "controls_failed": controls_failed,
+                        "audited_at": record.get("audited_at"),
+                    }
+                    if decision == "promoted":
+                        decision = "quarantined"
+                        rationale += (
+                            " oracle_integrity_failed: missed="
+                            f"{','.join(missed) or 'none'}; controls_failed="
+                            f"{','.join(controls_failed) or 'none'}"
+                        )
+                else:
+                    oracle_int = {
+                        "status": "pass",
+                        "audited_at": record.get("audited_at"),
+                    }
+            except Exception as exc:  # noqa: BLE001 - fail-open, like the siblings
+                print(
+                    f"promotion_evaluate: oracle-integrity check failed: {exc}",
+                    file=sys.stderr,
+                )
+                oracle_int = {"status": "error", "error": str(exc)}
+
         # The evidence pointer: which runs the decision actually rested on.
         # Before this the row stored a bare NULL, so the audit trail could not
         # answer the one question a promotion decision has to answer — how much
@@ -480,6 +543,10 @@ def promotion_evaluate(
         # the legacy 10-key shape is preserved when the consumer is disabled.
         if hk_enabled:
             result["gate_hackability"] = gate_hk
+        # Same discipline for the oracle-integrity guard: the key exists only
+        # when MO_ORACLE_INTEGRITY is on, so the knob-off result is unchanged.
+        if oi_enabled:
+            result["oracle_integrity"] = oracle_int
 
         # ── INSERT into promotion_records (mirrors bash lines 152-183) ──
         record_id = f"pr-{uuid.uuid4().hex[:16]}"
