@@ -225,6 +225,53 @@ def test_target_na(tmp_path):
     assert vector3["target"] == UNVERIFIED
 
 
+def test_target_waiver(tmp_path, monkeypatch):
+    """A verifier that turned its own instrument off names it; only an explicit
+    operator waiver (MO_ALLOW_UNPROVEN_TARGET=1) turns that into publishable n/a.
+    """
+    payload = {
+        "verifier": "test", "pass": True, "post_rc": 0, "base_rc": "",
+        "target_waiver": "replay disabled by MO_CODEFIX_REPLAY=0",
+    }
+
+    def run(name):
+        rd = _run_dir(
+            tmp_path,
+            summary={"status": "implemented", "files_changed": ["mod.py"]},
+            test_payload=_test_evidence(payload),
+            name=name,
+        )
+        return L.derive_levels(str(rd))
+
+    # Default: the disabled instrument still abstains, but the reason is
+    # actionable and names the switch — not the old opaque "not proven".
+    monkeypatch.delenv("MO_ALLOW_UNPROVEN_TARGET", raising=False)
+    vector, reasons = run("waiver-off")
+    assert vector["target"] == UNVERIFIED
+    assert "target instrument disabled" in reasons["target"]
+    assert "MO_CODEFIX_REPLAY=0" in reasons["target"]
+    assert "MO_ALLOW_UNPROVEN_TARGET=1" in reasons["target"]
+    assert L.publish_decision(vector, required=L.required_levels("code_fix")) == "abstain"
+
+    # Explicit waiver: publishable n/a, and the verdict records that it was waived.
+    monkeypatch.setenv("MO_ALLOW_UNPROVEN_TARGET", "1")
+    vector2, reasons2 = run("waiver-on")
+    assert vector2["target"] == NA
+    assert "waived by MO_ALLOW_UNPROVEN_TARGET=1" in reasons2["target"]
+    assert L.publish_decision(vector2, required=L.required_levels("code_fix")) == "publish"
+
+    # A waiver can never launder a failing suite into a publish.
+    failing = {**payload, "pass": False}
+    rd = _run_dir(
+        tmp_path,
+        summary={"status": "implemented", "files_changed": ["mod.py"]},
+        test_payload=_test_evidence(failing),
+        name="waiver-failing",
+    )
+    vector3, _ = L.derive_levels(str(rd))
+    assert vector3["target"] != NA
+
+
 def test_contract(tmp_path):
     # absent -> n/a
     rd = _run_dir(tmp_path, name="absent")

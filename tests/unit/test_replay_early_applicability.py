@@ -263,6 +263,9 @@ def test_pytest_opt_out_keeps_the_green_pass(tmp_path):
     assert "opt-out" in out["error_summary"], out
     assert "replay" not in out, out
     assert "replay_applicable" not in out, out
+    # The opt-out names itself, so the level deriver can distinguish "the
+    # instrument was switched off" from "the suite proved nothing".
+    assert out["target_waiver"] == "replay disabled by MO_CODEFIX_REPLAY=0", out
 
     vector = _write_evidence_and_levels(tmp_path, "pytest-optout", out)
     assert vector["target"] == UNVERIFIED

@@ -1228,6 +1228,11 @@ def detect_test_cmd():
 
 CMD = detect_test_cmd()
 BASE_RC = ""
+# Set when this run knowingly turned the target-level instrument off (the
+# `MO_CODEFIX_REPLAY=0` opt-out). Carries the reason into the payload so the
+# level deriver can say WHY `target` is unproven, and — only with an explicit
+# operator waiver — publish with that fact recorded instead of abstaining.
+TARGET_WAIVER = ""
 
 
 def run_suite(log, env=None):  # returns the exit code, never raises
@@ -1259,6 +1264,8 @@ def emit(passed, reason, post_rc, replay=None, adequacy=None):
         payload["replay"] = replay
     if adequacy is not None:
         payload["suite_adequacy"] = adequacy
+    if TARGET_WAIVER:
+        payload["target_waiver"] = TARGET_WAIVER
     print(json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
     return 0 if passed else 1
 
@@ -1581,7 +1588,7 @@ def _run_replay_check():
 
 
 def main():
-    global BASE_RC
+    global BASE_RC, TARGET_WAIVER
 
     if not CMD:
         sys.stderr.write("[test] no test command detected — skipping (pass)\n")
@@ -1597,6 +1604,23 @@ def main():
     # runner. stderr only — the emit()/emit_unverified() JSON payloads keep
     # their exact key set.
     sys.stderr.write(f"[test] cmd: {CMD}\n")
+
+    # Say up front what the opt-out will cost. This used to surface only at the
+    # publisher, after the implementer and every verifier had already been paid
+    # for: a green run that could never publish.
+    if os.environ.get("MO_CODEFIX_REPLAY", "1") == "0":
+        if os.environ.get("MO_ALLOW_UNPROVEN_TARGET", "0") == "1":
+            sys.stderr.write(
+                "[test] note: replay opt-out — level `target` stays unproven and "
+                "publishes under MO_ALLOW_UNPROVEN_TARGET=1 (recorded as a waiver)\n"
+            )
+        else:
+            sys.stderr.write(
+                "[test] WARNING: replay opt-out (MO_CODEFIX_REPLAY=0) leaves level "
+                "`target` unproven — the publisher will ABSTAIN. Re-run with replay "
+                "enabled, or set MO_ALLOW_UNPROVEN_TARGET=1 to publish with a "
+                "recorded waiver.\n"
+            )
 
     # ── Tamper guard (BEFORE the suite) ─────────────────────────────────
     # A patch that deletes/renames a test file or adds a skip marker to an
@@ -1641,7 +1665,14 @@ def main():
                 )
             # ── Delta-gate replay: a green suite that doesn't exercise the bug is theatre ──
             if os.environ.get("MO_CODEFIX_REPLAY", "1") == "0":
-                return _green_pass("post-patch suite green (replay opt-out: MO_CODEFIX_REPLAY=0)", post_rc)
+                # The opt-out is honest, not silent: it names the instrument it
+                # turned off so the level deriver can report "target disabled"
+                # rather than the indistinguishable "target not proven".
+                TARGET_WAIVER = "replay disabled by MO_CODEFIX_REPLAY=0"
+                return _green_pass(
+                    "post-patch suite green (replay opt-out: MO_CODEFIX_REPLAY=0)",
+                    post_rc,
+                )
             replay_result = _run_replay_check()
             if replay_result is None:
                 return _green_pass("post-patch suite green (replay skipped: certify unavailable or not a git repo)", post_rc)

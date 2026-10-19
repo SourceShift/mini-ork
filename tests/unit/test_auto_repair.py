@@ -502,6 +502,30 @@ def test_withheld_reverifies_then_proves(home, monkeypatch, spawned):
     assert "no test exercises the change" in second["feedback"]
 
 
+def test_instrument_disabled_withheld_routes_to_human(home, monkeypatch, spawned):
+    """A level the run itself switched off can never be proven by re-running:
+    the same env reproduces the same abstention, so both repair attempts would
+    be spent for nothing. decide() names the remedy instead."""
+    run_dir = _seed(home)
+    (run_dir / "verdict.json").write_text(json.dumps({
+        "levels_decision": "abstain",
+        "levels": {"target": "UNVERIFIED"},
+        "levels_reasons": {"target": (
+            "verifier_test.json: target instrument disabled "
+            "(replay disabled by MO_CODEFIX_REPLAY=0) — re-run with the "
+            "instrument enabled, or set MO_ALLOW_UNPROVEN_TARGET=1 to publish "
+            "with a recorded waiver"
+        )},
+    }))
+    _stub_hint(monkeypatch, _hint())
+    monkeypatch.delenv("MO_ALLOW_UNPROVEN_TARGET", raising=False)
+
+    decision = ar.decide(home, RUN)
+    assert decision["action"] == "human"
+    assert "target instrument disabled" in decision["reason"]
+    assert "MO_ALLOW_UNPROVEN_TARGET=1" in decision["reason"]
+
+
 def test_withheld_run_published_anyway_still_reverifies(home, monkeypatch):
     """A withheld run whose status reads ``published`` is still repairable.
 

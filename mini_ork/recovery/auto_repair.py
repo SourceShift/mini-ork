@@ -692,11 +692,27 @@ def _decide_policy(home: Path, run_id: str,
 
     # 5. Withheld publish with no failing node → re-verify; a repeat → prove.
     if withheld and not failed_node:
+        level = withheld[0]
+        lr = str(_levels_reasons(run_dir).get(level, ""))
+        # A run that switched its own truth instrument off (`MO_CODEFIX_REPLAY=0`,
+        # the Zed-fork default) can never prove the level by re-running: the same
+        # environment reproduces the same abstention. Both repair attempts are
+        # spent for nothing, so route straight to a person with the exact fix.
+        if "target instrument disabled" in lr:
+            waived = context_env("MO_ALLOW_UNPROVEN_TARGET", "0") == "1"
+            return _decision(
+                "human", from_node=failed_node or None, signature=signature,
+                reason=(
+                    f"{lr} — "
+                    + ("the waiver is set, so re-dispatching the publisher applies it"
+                       if waived else
+                       "re-run with the instrument enabled, or set "
+                       "MO_ALLOW_UNPROVEN_TARGET=1 to publish with a recorded waiver")
+                ),
+            )
         prior_reverify = any(str(a.get("action")) == "reverify" for a in attempts)
         if prior_reverify:
             impl = _first_node_of_type(home, recipe, "implementer")
-            level = withheld[0]
-            lr = str(_levels_reasons(run_dir).get(level, ""))
             feedback = (
                 f"Every check passed but level `{level}` is UNVERIFIED (`{lr}`). "
                 "Add the smallest test that exercises the change so the level can "
