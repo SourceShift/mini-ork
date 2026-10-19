@@ -43,6 +43,7 @@ from pathlib import Path
 
 from mini_ork.certify import differential
 from mini_ork.certify import discrimination
+from mini_ork.certify import hidden_checks
 from mini_ork.certify import invariants as mr
 from mini_ork.certify import probe as poc_plus
 from mini_ork.certify import relations
@@ -628,6 +629,7 @@ def judge(
     dispatch: DispatchFn | None = None,
     context: CodeContext | None = None,
     candidates: list | None = None,
+    run_id: str | None = None,
 ) -> Verdict:
     """Judge `patch`. Nothing here reads `gold` — it is used only to LABEL the invariants
     for measurement, never to decide. Pass gold=None in production.
@@ -655,6 +657,15 @@ def judge(
     EVIDENCE, so PROVEN is withheld (downgraded to UNVERIFIED). The term can
     never create PROVEN and never returns REFUTED. Omitted/disabled, the
     judgement is byte-identical to before.
+
+    `run_id` (optional) is the reproducible key material for the hidden-check
+    layer (`MO_ASSAY_HIDDEN`, default on). When a caller SUPPLIES the PoC, the
+    oracle regenerates behaviour-neutral, identity-renamed variants of it and
+    runs them against the same patch: a variant failure is REFUTED (the patch
+    depends on the visible test's identity), while a harness failure is
+    `unmeasured` and never refutes. A PoC built inside judge() is generated
+    after the patch was authored, so the implementer could not have
+    special-cased its identity -- the layer does not run there.
     """
     d_fn = dispatch or _default_dispatch()
 
@@ -690,6 +701,73 @@ def judge(
                        f"the reported bug still reproduces after the patch ({post.status}/{post.exc})",
                        poc_plus=poc_src)
 
+    # ── Term 2.5: hidden regenerable ground truth ───────────────────────────
+    # The visible reproduction test can be special-cased by identity (function
+    # or class name) across retries. When the caller supplied a pre-validated
+    # PoC, regenerate behaviour-neutral, identity-renamed variants of THAT PoC
+    # and run them against the same patch. The variants assert exactly what the
+    # visible PoC asserts, so a variant failure is evidence against the patch;
+    # a harness failure (error/test_defect/apply_fail/no_run) is unmeasured and
+    # NEVER refutes.
+    #
+    # The layer is gated on a caller-supplied PoC: a PoC built inside judge()
+    # is generated after the patch was authored, so the implementer could not
+    # have special-cased its identity -- the attack this term exists for does
+    # not exist there.
+    hidden_detail: dict | None = None
+    hidden_note = ""
+    if poc is not None and hidden_checks.enabled():
+        trials = hidden_checks.trials_from_env()
+        plan = hidden_checks.plan_for(run_id=run_id, patch=patch, trials=trials)
+        measured = 0
+        unmeasured = 0
+        for i in range(trials):
+            variant = hidden_checks.apply_variant(poc_src, seed=plan.seed, index=i)
+            if variant == poc_src:
+                # No top-level test identifier: nothing was renamed, so this
+                # "variant" is the visible PoC and measures nothing hidden.
+                unmeasured += 1
+                continue
+            trial = runner.run_test(variant, patch=patch)
+            status = getattr(trial, "status", None)
+            if status == "passed":
+                measured += 1
+            elif status == "failed":
+                # Same test, different identity: the patch depends on the
+                # identity it was visible under.
+                return Verdict(
+                    REFUTED,
+                    f"hidden trial {i} failed after the visible reproduction "
+                    "passed — the patch depends on the test's identity",
+                    poc_plus=poc_src,
+                    detail={"hidden_checks": {
+                        "commitment": plan.commitment,
+                        "trials": trials,
+                        "measured": measured,
+                        "unmeasured": unmeasured,
+                        "key_source": plan.key_source,
+                        "failed_trial": i,
+                    }},
+                )
+            else:
+                # error / test_defect / apply_fail / no_run / malformed: a
+                # fact about the harness, not the patch.
+                unmeasured += 1
+        hidden_detail = {
+            "commitment": plan.commitment,
+            "trials": trials,
+            "measured": measured,
+            "unmeasured": unmeasured,
+            "key_source": plan.key_source,
+        }
+        if trials and not measured:
+            # Every trial was unmeasured: carry the commitment so the audit
+            # trail shows the layer ran but could not measure.
+            hidden_note = (
+                f"hidden_commitment={plan.commitment} trials={trials} "
+                f"unmeasured={unmeasured}"
+            )
+
     # ── Term 3: metamorphic amplification ───────────────────────────────────
     # The probe is green. That is exactly the state a special-cased patch engineers,
     # so it proves nothing on its own. Now ask whether the fix GENERALISES.
@@ -705,13 +783,22 @@ def judge(
     if not cands:
         no_cands_reason = ("the probe passes, but no invariant that reproduces the bug could be built "
                            "-> cannot rule out a special-cased patch")
+        if hidden_note:
+            no_cands_reason = f"{no_cands_reason} ({hidden_note})"
         if relations.enabled() and relations.rescue_enabled():
             rec = relations.check(poc_src, issue, patch, runner=runner,
                                   dispatch=d_fn, context=context, rescue=True)
+            rel_detail: dict = {"relations": rec}
+            if hidden_detail is not None:
+                rel_detail["hidden_checks"] = hidden_detail
             return Verdict(rec["verdict"] or UNVERIFIED,
                            rec["reason"] or no_cands_reason,
-                           poc_plus=poc_src, detail={"relations": rec})
-        return Verdict(UNVERIFIED, no_cands_reason, poc_plus=poc_src)
+                           poc_plus=poc_src, detail=rel_detail)
+        no_cands_detail: dict = {}
+        if hidden_detail is not None:
+            no_cands_detail["hidden_checks"] = hidden_detail
+        return Verdict(UNVERIFIED, no_cands_reason, poc_plus=poc_src,
+                       detail=no_cands_detail)
 
     kept, dropped, holds, broken, inconclusive = [], [], 0, 0, 0
     for name, src in cands:                               # already validated informative
@@ -796,6 +883,8 @@ def judge(
     # never runs on a would-be REFUTED/UNVERIFIED). Knobs off => no dispatch, no key.
     detail = {"invariants": kept, "dropped": dropped,
               "n_effective": n_eff, "inconclusive": inconclusive}
+    if hidden_detail is not None:
+        detail["hidden_checks"] = hidden_detail
     proven_before_vetoes = verdict == PROVEN
     if verdict == PROVEN and relations.enabled():
         rec = relations.check(poc_src, issue, patch, runner=runner,
@@ -836,6 +925,9 @@ def judge(
         if dres.status == discrimination.REFUTED:
             verdict = UNVERIFIED
             reason = f"the reproduction test does not discriminate: {dres.evidence}"
+
+    if hidden_note:
+        reason = f"{reason} ({hidden_note})"
 
     return Verdict(verdict, reason, poc_plus=poc_src,
                    mr_pass_rate=(rate if n else None), mr_n=n,
