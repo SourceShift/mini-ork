@@ -28,6 +28,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 
 from ..deps import get_home
 from ...cli import board_cmd
+from ...ide_pages.spec import ide_spec_level
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,21 @@ def _refuse_stale_engine() -> None:
 router = APIRouter(prefix="/ide", tags=["ide"], dependencies=[Depends(_refuse_stale_engine)])
 
 
+def _spec_level(raw: str | None) -> int | None:
+    """The spec level the caller named, or ``None`` to serve the server's own
+    default. Lenient on purpose: the query parameter arrives from a client the
+    server does not control, and a garbled one must fall back to level 1 rather
+    than fail the read. FastAPI would do the opposite — a typed ``int`` query
+    turns ``spec=abc`` into a 422 and the page never renders."""
+    if raw is None:
+        return None
+    try:
+        level = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return level if level >= 1 else None
+
+
 def _json(payload: dict) -> Response:
     """Serialise like the CLI does (`default=str`, so a Path/datetime in the
     payload does not 500), as a raw Response since FastAPI's JSONResponse
@@ -108,17 +124,26 @@ def ide_page(
     key: str = Query(...),
     tab: str | None = Query(default=None),
     arg: list[str] | None = Query(default=None),
+    spec: str | None = Query(default=None),
     home: Path = Depends(get_home),
 ) -> Response:
     """`board page <key> [--tab T] [--arg k=v …]`: one IDE page. The key is a
     query parameter, not a path segment, because a run page's key carries a
-    `run:<id>` colon and a path would have to be encoded to survive it."""
+    `run:<id>` colon and a path would have to be encoded to survive it.
+
+    `spec` is the page spec level the client wants, and it is set for the
+    duration of this one build — the same server answers a level-1 and a
+    level-2 client at once, which the process-wide environment cannot. It is
+    set here in the handler body rather than in a dependency because FastAPI
+    runs each sync dependency in its own thread-pool call, whose context copy
+    the handler does not see."""
     argv = ["page", key]
     if tab:
         argv += ["--tab", tab]
     for pair in arg or []:
         argv += ["--arg", pair]
-    return _read(home, argv)
+    with ide_spec_level(_spec_level(spec)):
+        return _read(home, argv)
 
 
 @router.get("/node")

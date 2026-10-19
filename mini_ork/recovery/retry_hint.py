@@ -36,7 +36,7 @@ from mini_ork.learning.failure_classifier import (
     recovery_policy,
 )
 from mini_ork.recipes_catalog import find_recipe
-from mini_ork.verify.levels import read_verifier_payload
+from mini_ork.verify.levels import read_single_verifier_payload, read_verifier_payload
 from mini_ork.web.db import db_for
 
 # Bump whenever the classifier's *rule set* changes: a cached hint at an older
@@ -56,7 +56,12 @@ from mini_ork.web.db import db_for
 # plan with no execution), and a wider verifier-reason read that also consults
 # ``missing``/``failures`` (a structured verifier's failure was reaching case 5
 # as "cause not classified" while its own artefact held the exact list).
-HINT_VERSION = 4
+# v5 (2026-10-16): read ``verifier_<stem>.json`` by name when its payload carries
+# no ``verifier`` field — the same symptom as v4 one layer down, and the reason a
+# spec-driven-delivery run whose ``gates-materialize`` verifier wrote
+# ``pass: false`` still reached case 5 as "Failed at ?". Retires the case-5
+# caches those runs are holding.
+HINT_VERSION = 5
 CACHE_FILENAME = "retry-hint.json"
 
 # needs_change kinds whose retry needs no change: re-running the step IS the fix.
@@ -270,6 +275,13 @@ def _node_artifacts(run_dir: Path, node_name: str,
     vp = run_dir / f"verifier_{stem}.json"
     if vp.is_file():
         payload = read_verifier_payload(str(vp), stem)
+        if not isinstance(payload, dict):
+            # The name-matched read finds nothing for the 60 of 117 verifier
+            # scripts whose payload carries no ``verifier`` field — so on those
+            # recipes this node looked like it had no verdict, ``_first_failed_node``
+            # named nothing, and the run page told the operator "Failed at ?"
+            # about a verifier that plainly wrote ``pass: false``.
+            payload = read_single_verifier_payload(str(vp))
         if isinstance(payload, dict):
             out["verifier"] = payload
     rp = run_dir / f"review-{node_name}.json"
@@ -877,7 +889,11 @@ def _case_unknown(run_dir: Path, failed_name: str | None, run_id: str,
         "from_node": label,
         "needs_change": {
             "kind": "unknown",
-            "summary": f"Failed at {label or '?'}; the cause was not classified",
+            # Never "Failed at ?": a question mark in a sentence the operator
+            # reads as fact reads as a bug in the page, not as a missing name.
+            # When every lookup came back empty, say that instead.
+            "summary": (f"Failed at {label}; the cause was not classified" if label
+                        else "The run failed; the cause was not classified"),
             "detail": _tail_log(run_dir, label or ""),
             "evidence": "",
         },

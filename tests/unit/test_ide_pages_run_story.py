@@ -344,26 +344,24 @@ def _seed(home: Path) -> Path:
 def test_v2_story_tab_sections(home: Path, monkeypatch) -> None:
     _seed(home)
     monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
-    page = run_page.build(home, None, {"run": RUN})
+    page = run_page.build(home, None, {"run": RUN, "tab": "outcome"})
 
     kinds = [s["type"] for s in page["sections"]]
-    assert kinds[0] == "triage"
-    assert kinds[-1] == "story"
-    # The story replaces the Overview stopgap: no "Run inputs" / "Files changed".
     titles = [s["title"] for s in page["sections"]]
-    assert "Run inputs" not in titles
-    assert "Files changed" not in titles
-    assert not any(s["type"] == "files" for s in page["sections"])
+    assert kinds[0] == "triage"
+    # The goal the run was asked for leads the content, before the story.
+    assert titles.index("What this run is for") < titles.index("What happened")
 
-    story = page["sections"][-1]
+    story = page["sections"][titles.index("What happened")]
+    assert story["type"] == "story"
     ids = [s["id"] for s in story["steps"]]
     assert "implementer" in ids and "reviewer" in ids
 
 
 def test_story_tab_is_guarded_when_the_section_raises(home: Path, monkeypatch) -> None:
     # A story that raises costs the story section only: triage / hero stay, and
-    # the tab closes with the guarded "Could not read this" section instead of
-    # blanking the whole page.
+    # the story slot carries the guarded "Could not read this" section instead
+    # of blanking the whole page.
     _seed(home)
     monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
 
@@ -371,12 +369,13 @@ def test_story_tab_is_guarded_when_the_section_raises(home: Path, monkeypatch) -
         raise RuntimeError("kaboom")
 
     monkeypatch.setattr(run_story, "story_section", boom)
-    page = run_page.build(home, None, {"run": RUN})
+    page = run_page.build(home, None, {"run": RUN, "tab": "outcome"})
 
     kinds = [s["type"] for s in page["sections"]]
+    titles = [s["title"] for s in page["sections"]]
     assert kinds[0] == "triage"
-    assert kinds[-1] == "list"  # S.guarded's failure section
-    assert page["sections"][-1]["title"] == "What happened"
+    story_at = titles.index("What happened")
+    assert kinds[story_at] == "list"  # S.guarded's failure section
 
 
 def test_layers_ignore_revise_loop_edges() -> None:

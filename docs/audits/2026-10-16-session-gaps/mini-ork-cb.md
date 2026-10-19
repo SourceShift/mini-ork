@@ -13,10 +13,10 @@ Commands that were actually run are quoted verbatim.
 | id | description | recorded status | VERIFIED status | evidence |
 |---|---|---|---|---|
 | `fix-main-buddy` | Fix forward: origin/main red after the run-buddy removal | dispatched, in flight | **SUPERSEDED — not needed** | board: `fix-main-buddy-20261016-111824` `state=not_needed`, `step=rollback`. A peer landed the fix first: `d3b52b38 ide(node): restore the node page after the run-buddy removal`. `python3.11 -c "import mini_ork.ide_pages.node"` → `NODE IMPORT OK`. `_wall` return present at `mini_ork/ide_pages/run.py:834-835`. `grep -rn "_buddy_node_facts" mini_ork/ tests/` → only a prose comment at `mini_ork/acp_orchestrator/watch.py:21`. |
-| `rp-e3-header-v2` | Run page: state-aware header (label, actions, menu, updated_at) on every tab | **done** (board: `done`, step `publisher`, +614/−147) | **ARTIFACT NOT LANDED** | `mini_ork/ide_pages/run_header.py` does not exist in any commit (`git log --oneline -- mini_ork/ide_pages/run_header.py` → empty); the file exists only inside the run dir. Diff is `+614/−147` over 6 files at `.mini-ork/runs/rp-e3-header-v2-20261016-111144/framework-edit.diff`. `git apply --check` → **error: patch failed: mini_ork/ide_pages/node.py:55, patch does not apply** (superseded by `d3b52b38`). Its spec tests pass *inside* the run (`verifier-spec-tests.log` → `pass: True`, 23 selected) but are absent from the tree. |
-| `rp-e6-graph-focus` (C13 engine half) | Graph opens on the failing/blocking node; node carries a one-line `reason` | **needs_change** | **VERDICT PASS; NOT LANDED** | `.mini-ork/runs/rp-e6-graph-focus-20261015-222118/verdict.json` → `{"files_changed":2,"tests_pass":true,"static_pass":true,"pass":true}`. `git apply --stat` → `run.py +151`, `tests/unit/test_ide_pages_run_graph_focus.py +170`. `git apply --check` → **clean**. Live `run.py` has no `graph["focus"]` (`grep -n '"focus"' mini_ork/ide_pages/run.py` → no hits). |
-| `rp-e10-artifacts-learnings` (C22 + C23) | Artifacts grouped by node/kind with pinned keys; learnings promote/reject + used-by | **needs_change** | **VERDICT PASS; NOT LANDED** | `verdict.json` → `pass: true`. `git apply --stat` → `run.py +267`, new test `+356`. `git apply --check` → **clean**. |
-| `rp-e11b-steer-receipt` (C14 engine half) | `board steer` prints a receipt line; `--json` carries a `receipt` key | in flight | **VERDICT PASS; UNCOMMITTED** | `verdict.json` → `pass: true`. Worktree `/Volumes/docker-ssd/ps/mini-ork-worktrees/rp-e11b-land` at base `9bd29ede`: `M mini_ork/cli/board_cmd.py` (+75/−6) and untracked `tests/unit/test_board_steer_receipt.py`. No commit on `wt/rp-e11b-land`. |
+| `rp-e3-header-v2` | Run page: state-aware header (label, actions, menu, updated_at) on every tab | **done** (board: `done`, step `publisher`, +614/−147) | **LANDED 2026-10-17 — `b324fae5`** (surgical re-apply; see §d) | `mini_ork/ide_pages/run_header.py` does not exist in any commit (`git log --oneline -- mini_ork/ide_pages/run_header.py` → empty); the file exists only inside the run dir. Diff is `+614/−147` over 6 files at `.mini-ork/runs/rp-e3-header-v2-20261016-111144/framework-edit.diff`. `git apply --check` → **error: patch failed: mini_ork/ide_pages/node.py:55, patch does not apply** (superseded by `d3b52b38`). Its spec tests pass *inside* the run (`verifier-spec-tests.log` → `pass: True`, 23 selected) but are absent from the tree. |
+| `rp-e6-graph-focus` (C13 engine half) | Graph opens on the failing/blocking node; node carries a one-line `reason` | **needs_change** | **LANDED 2026-10-17 — `51c37434`** | `.mini-ork/runs/rp-e6-graph-focus-20261015-222118/verdict.json` → `{"files_changed":2,"tests_pass":true,"static_pass":true,"pass":true}`. `git apply --stat` → `run.py +151`, `tests/unit/test_ide_pages_run_graph_focus.py +170`. `git apply --check` → **clean**. Live `run.py` has no `graph["focus"]` (`grep -n '"focus"' mini_ork/ide_pages/run.py` → no hits). |
+| `rp-e10-artifacts-learnings` (C22 + C23) | Artifacts grouped by node/kind with pinned keys; learnings promote/reject + used-by | **needs_change** | **LANDED 2026-10-17 — `c7363e73`** | `verdict.json` → `pass: true`. `git apply --stat` → `run.py +267`, new test `+356`. `git apply --check` → **clean**. |
+| `rp-e11b-steer-receipt` (C14 engine half) | `board steer` prints a receipt line; `--json` carries a `receipt` key | in flight | **LANDED 2026-10-17 — `937506bc` + `d71a28d8`** | `verdict.json` → `pass: true`. Worktree `/Volumes/docker-ssd/ps/mini-ork-worktrees/rp-e11b-land` at base `9bd29ede`: `M mini_ork/cli/board_cmd.py` (+75/−6) and untracked `tests/unit/test_board_steer_receipt.py`. No commit on `wt/rp-e11b-land`. |
 | **C1–C27 programme** | "implement all" 27 proposed UX changes | in progress | **0 of 27 implemented** | see §b |
 | **SDD operator ratification** | Operator reviews a compiled SpecCard, accepts/adjusts, then accepts | design exists | **ABSENT** | `python3 bin/mini-ork specs --help` → only `ingest`, `list`, `lint`. `grep -rn "ratif" mini_ork/cli/ mini_ork/specdir/ --include=*.py` → no matches. `grep -rn "ratification\|SpecCard\|spec-card" mini_ork/ide_pages/` → no matches. |
 
@@ -40,15 +40,15 @@ separate, always-required step.
 | C3 | Triage names the actual failing/blocking node | not landed | `mini_ork/ide_pages/outcome.py` present but no golden-test change; `V2_TABS` unchanged |
 | C4 | Every decision callout explains itself | partial | `_gate_needs_you` exists at `outcome.py:610`; no test asserting non-empty text |
 | C5 | One attention block | not landed | no `Needs you` lane in `mini_ork/ide_pages/*.py` (`grep` hits only `cn_session.py:98`, a status string) |
-| C6 | Sticky run bar + header actions | **blocked on e3v2** | depends on `run_header.py`, unlanded |
+| C6 | Sticky run bar + header actions | **engine half landed `b324fae5`** (`run_header.py`); IDE render half not started | `mini_ork/ide_pages/run_header.py` now on main |
 | C8 | **Changes** tab | not landed | `mini_ork/ide_pages/run.py:52-54` — `V2_TABS` = story, graph, questions, kickoff, agents, learnings, artifacts. No `changes` |
 | C9 | **Checks** tab with explainable badges | not landed | same `V2_TABS`; no `tip` on triage counts |
 | C12 | Tab badges (`Questions · 2`) | not landed | `V2_TABS` entries are still `(key, label)` pairs |
-| C13 | Failure on the canvas (engine half) | **diff ready, unlanded** | e6 diff, §a |
-| C14 | Steering receipt (engine half) | **uncommitted in worktree** | e11b, §a |
+| C13 | Failure on the canvas (engine half) | **engine half landed `51c37434`** | e6 diff, §a |
+| C14 | Steering receipt (engine half) | **engine half landed `937506bc`+`d71a28d8`** | e11b, §a |
 | C18 | Breadcrumbs (`epic › run › retry #2`) | not landed | `grep -rn "crumbs" mini_ork/ide_pages/*.py` → no hits |
 | C21 | Copy summary as markdown | not landed | `grep -rn "copy_summary\|Copy summary" mini_ork/ide_pages/*.py` → no hits |
-| C22/C23 | Artifacts grouped; learnings actions | **diff ready, unlanded** | e10 diff, §a |
+| C22/C23 | Artifacts grouped; learnings actions | **landed `c7363e73`** | e10 diff, §a |
 | C25 | Fault attribution in the failure triage | not landed | `outcome.py` present; no fault-class split |
 
 ### IDE-side changes (`/Volumes/docker-ssd/ps/mini-ork-ui`, HEAD `9154ef4`)
@@ -127,3 +127,35 @@ The primary checkout is **not clean** right now — a peer session has
 ` M mini_ork/cli/specs.py`, ` M mini_ork/ide_pages/spec.py`, ` M mini_ork/web/routes/ide.py`
 staged in the working tree. Nothing in this session wrote to those files; the audit's
 `git status` shows them only because the audit ran in the same checkout.
+
+---
+
+## (d) Resolution — 2026-10-17
+
+**P0#4a closed.** All three green-but-unlanded runs are now ancestors of `origin/main`:
+
+```
+git merge-base --is-ancestor 51c37434 origin/main   # e6  graph focus        → true
+git merge-base --is-ancestor c7363e73 origin/main   # e10 artifacts/ditto   → true
+git merge-base --is-ancestor b324fae5 origin/main   # e3v2 header           → true
+```
+
+Landing order was serialized on `mini_ork/ide_pages/run.py` as predicted:
+e11b (`937506bc`, then the regression fix `d71a28d8`) → e6 (`51c37434`) → e10 (`c7363e73`) → e3v2 (`b324fae5`).
+
+**P0#4b closed.** e3v2 was re-applied surgically, not plainly:
+
+- Excluded `mini_ork/ide_pages/node.py` (−7) and `tests/unit/test_ide_pages_run.py` (−120).
+  Both are superseded by `d3b52b38`; the six deleted tests are the run-buddy tests that
+  `d3b52b38` had already removed, so applying the deletions again would have been a no-op
+  conflict, and omitting them leaves no duplicate coverage.
+- `spec.py`, `run_header.py` and the new test file applied clean.
+- `run.py` went through `git apply -3`, which produced exactly one conflict: whitespace
+  after `_wall()` (ours: a blank line, theirs: none). Resolved to main's two-blank-line spacing.
+- Green gate on the land worktree before merge: 255 passed, 1:27.
+
+**Still open:** the IDE renderer halves (C1, C2, C12, C13-render, C14-render, C24, C26) and
+the engine halves not covered by the four landed runs (C3, C4, C5, C8, C9, C12, C18, C21, C25).
+SDD option A-vs-B remains blocked on the user.
+
+---

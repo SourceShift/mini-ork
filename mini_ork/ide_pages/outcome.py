@@ -335,19 +335,11 @@ def _seen_before_section(run) -> dict[str, Any] | None:
     if envelope is not None:
         cards = _seen_before_cards(envelope, run_id=run_id)
         if not cards:
-            # Stored file but empty hit list — the verb succeeded with
-            # nothing to show. A single "no similar past failures" row
-            # plus the Helped/Wrong action row is the truthful state.
-            cards = [{
-                "m": "•",
-                "mc": "sub",
-                "t": "No similar past failures in ContextNest.",
-                "tc": "text",
-                "sub": "",
-                "mono": False,
-                "when": "",
-                "acts": [],
-            }]
+            # Stored file but an empty hit list — the verb ran and found no
+            # similar past failure. A card saying so carries nothing to act on
+            # and nothing to learn, so it is not rendered: the run page shows
+            # the sections that have something in them.
+            return None
         # Helped / Wrong live on each card's acts, bound to that card's
         # atom id — a verdict lands on the memory that was shown, not on
         # a run-scoped row the operator never saw.
@@ -509,13 +501,32 @@ def _findings_count(run) -> int | None:
     return len(findings) if isinstance(findings, list) else None
 
 
+def verification_report(run) -> dict[str, Any] | None:
+    """The run's five-level report — ``run-verdict.json`` or a stamped verdict.
+
+    Public because the run page's Verification tab shows the whole vector,
+    while the verdict row (:func:`_level_badges`) shows only what the run must
+    prove.
+    """
+    return _run_verdict(run)
+
+
 def _level_badges(run) -> list[dict[str, Any]]:
     rv = _run_verdict(run)
     levels = rv.get("levels") if isinstance(rv, dict) else None
     if not isinstance(levels, dict):
         return []
+    # A run that stamped which levels its task class requires shows only those.
+    # The rest cannot fail it, so drawing them beside a publishable verdict
+    # reads as three failures that are not failures — a recipe without the
+    # instrument abstains on levels it never had to prove. The Verification tab
+    # keeps the whole vector and each abstention's reason.
+    stamped = rv.get("levels_required") if isinstance(rv, dict) else None
+    required = [str(name) for name in stamped] if isinstance(stamped, list) else None
     out: list[dict[str, Any]] = []
     for name in LEVELS:
+        if required is not None and name not in required:
+            continue
         value = str(levels.get(name) or "") if name in levels else ""
         if not value:
             continue

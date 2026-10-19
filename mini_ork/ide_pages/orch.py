@@ -1739,7 +1739,7 @@ def attention(home: Path, tab: str, errors: dict[str, str]) -> dict[str, Any] | 
         parts.append((
             {"t": f"{n} watching", "c": "orange"},
             f"{n} run{'s' if n != 1 else ''} need attention: {where} — {first['reason']}",
-            S.btn("Open", S.page_link("run", run=first["run"]))))
+            S.btn("Open", S.page_link("run", "orchestrator", run=first["run"]))))
     if links:
         n = len(links)
         parts.append((

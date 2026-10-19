@@ -108,12 +108,38 @@ def _iter_json_objects(path):
 def read_verifier_payload(path, verifier):
     """The LAST JSON object in ``path`` whose ``verifier`` field equals ``verifier``.
 
-    Returns ``None`` when absent or unparsable.
+    Last, not first: :func:`_iter_json_objects` walks the file bottom-up and
+    yields the trailing blob before anything nested inside it, so returning on
+    the first match is returning the last writer's verdict — which is the one
+    a retry appended last. Returns ``None`` when absent or unparsable.
     """
     for obj in _iter_json_objects(path):
         if obj.get("verifier") == verifier:
             return obj
     return None
+
+
+def read_single_verifier_payload(path):
+    """The one JSON object ``path`` holds, or ``None`` when it holds none or several.
+
+    The counterpart to :func:`read_verifier_payload` for a file whose name
+    already says which verifier wrote it (``verifier_<stem>.json`` at the run
+    root): only 62 of the recipes' 123 verifier scripts put a ``verifier`` field
+    in their payload, so requiring one there reads the other half as "no verdict
+    at all". Several distinct objects mean a merged evidence log, whose objects
+    are told apart by that field — not one node's verdict, so that is ``None``.
+
+    ``_iter_json_objects`` yields a single-line file's object twice (the whole
+    remainder from that line, then the line alone), so the objects are compared
+    by value rather than counted, and the scan stops at the first disagreement.
+    """
+    found = None
+    for obj in _iter_json_objects(path):
+        if found is None:
+            found = obj
+        elif obj != found:
+            return None
+    return found
 
 
 def _read_json_dict(path):

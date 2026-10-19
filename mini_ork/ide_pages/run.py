@@ -17,11 +17,13 @@ import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from mini_ork.ide_pages import _cn as _CN
+from mini_ork.ide_pages import orch_tab
 from mini_ork.ide_pages import outcome as O
 from mini_ork.ide_pages import spec as S
+from mini_ork.ide_pages.run_header import build_header
 from mini_ork.ide_pages.cn_file import (
     _SECTION_BY_FILE as _CN_FILE_BY_FILE,
     _fetch_by_file as _cn_file_fetch_by_file,
@@ -43,16 +45,19 @@ def _node_session_id(run: "Run", node: Node) -> str | None:
     from mini_ork.ide_pages.node import _resolve_session_id
     return _resolve_session_id(run, node)
 
-TABS = [("dag", "DAG"), ("kickoff", "Kickoff"), ("overview", "Overview"), ("agents", "Agents"),
+TABS = [("dag", "DAG"), ("kickoff", "Kickoff"), ("overview", "Overview"),
+        ("orchestrator", "Orchestrator"), ("agents", "Agents"),
         ("learnings", "Learnings"), ("artifacts", "Artifacts")]
 
-# The v2 tab bar (``MINI_ORK_IDE_SPEC=2``): the story replaces the overview and
-# the graph replaces the DAG. The old keys still resolve (``dag`` → ``graph``,
-# ``overview`` → ``story``) so a stale IDE link lands somewhere sensible.
-V2_TABS = [("story", "Story"), ("graph", "Graph"), ("questions", "Questions"),
+# The v2 tab bar (``MINI_ORK_IDE_SPEC=2``) follows the Dispatch Console design:
+# the DAG leads, the outcome replaces the story, and the questions fold into the
+# DAG tab beside the nodes that stopped on them. Old keys still resolve so a
+# stale IDE link lands somewhere sensible.
+V2_TABS = [("dag", "DAG"), ("outcome", "Outcome"), ("orchestrator", "Orchestrator"),
            ("kickoff", "Kickoff"), ("agents", "Agents"), ("checks", "Checks"),
            ("learnings", "Learnings"), ("artifacts", "Artifacts")]
-V2_ALIASES = {"dag": "graph", "overview": "story"}
+V2_ALIASES = {"story": "outcome", "graph": "dag", "questions": "dag",
+              "overview": "outcome", "orch": "orchestrator"}
 
 # The kickoff text is capped well above the 20 KB the run card shows — the kickoff
 # tab is the place to read the whole task brief. Beyond the cap we append a
@@ -514,13 +519,19 @@ def _sub(run: Run) -> str:
 
 
 def _stop_kill_actions(run: Run) -> list[dict[str, Any]]:
-    """Stop / Kill — the two controls a running run offers."""
+    """Stop / Kill — the two controls a running run offers.
+
+    ``pending`` is what the button says while the command runs and ``done``
+    the toast it shows after; a Stop takes effect at the next node boundary,
+    so its toast says *when* rather than pretending the run is gone.
+    """
     return [
         S.btn("Stop", S.cli("board", "stop", run.id,
-                            confirm="Stop this run after its current node?"), "warn"),
+                            confirm="Stop this run after its current node?"), "warn",
+              pending="Stopping…", done="Run will stop after this node"),
         S.btn("Kill", S.cli("board", "kill", run.id,
                             confirm=f"Kill {run.id}? SIGTERM, then SIGKILL after 2 s."),
-              "danger"),
+              "danger", pending="Killing…", done="Run killed"),
     ]
 
 
@@ -534,7 +545,12 @@ def _discard_action(run: Run) -> dict[str, Any] | None:
 
 
 def _review_actions(run: Run) -> list[dict[str, Any]]:
-    """Merge / Discard — the decision a finished run with a worktree needs."""
+    """Merge / Discard — the decision a finished run with a worktree needs.
+
+    The toasts name the branch the merge landed in (or that the worktree is
+    gone), so the operator does not have to check the tree to know what
+    happened.
+    """
     if run.workspace is None:
         return []
     base = getattr(run.workspace, "base_branch", "") or "base"
@@ -542,10 +558,10 @@ def _review_actions(run: Run) -> list[dict[str, Any]]:
         S.btn(f"Merge into {base}",
               S.cli("board", "merge", run.id,
                     confirm=f"Merge this run's branch into {base}?"),
-              "primary"),
+              "primary", pending="Merging…", done=f"Merged into {base}"),
         S.btn("Discard", S.cli("board", "discard", run.id,
                                confirm="Discard this run's worktree and branch?"),
-              "danger"),
+              "danger", pending="Discarding…", done="Worktree discarded"),
     ]
 
 
@@ -897,6 +913,13 @@ def _wall(node: Node) -> str:
     return f"{max(0, end - node.start)}s"
 
 
+def _clock(epoch: int | None) -> str:
+    """Wall-clock time of day — a start/end reads "when", a duration reads "how long"."""
+    if not epoch:
+        return "—"
+    return time.strftime("%H:%M:%S", time.localtime(epoch))
+
+
 # ── tabs ────────────────────────────────────────────────────────────────────
 
 def _selected(run: Run, wanted: str | None) -> Node | None:
@@ -1100,9 +1123,43 @@ def _graph(run: Run, wanted: str | None = None) -> dict[str, Any]:
     return graph
 
 
-def _dag_tab(run: Run, wanted: str | None) -> list[dict[str, Any]]:
+def _dag_tab(run: Run, wanted: str | None, *, select: bool = False,
+             outcome: dict[str, Any] | None = None,
+             callout_actions: Iterable[dict[str, Any]] | None = None
+             ) -> list[dict[str, Any]]:
+    """The redesign's DAG tab: outcome, questions, graph, the selected node,
+    the coalition and the verifier rows — in the order the design reads.
+
+    ``select`` is the run page's own DAG: a node click picks it in place
+    (the IDE re-renders with ``args.node``) instead of opening the node tab.
+    Level 1 keeps the old behaviour and the old section order.
+
+    ``callout_actions`` is the outcome's own buttons already filtered by the
+    caller: the header sits above every tab and draws up to two controls, so
+    the page subtracts those before handing the rest to the callout body — the
+    design's ``bodyActs``.
+    """
     errors: dict[str, str] = {}
     sel = _selected(run, wanted)
+    resolved_outcome = outcome if outcome is not None else O.resolve(run)
+    drawn_actions = list(callout_actions or ())
+
+    def outcome_block() -> dict[str, Any]:
+        actions: list[dict[str, Any]] = list(drawn_actions)
+        return S.callout(resolved_outcome.get("text") or "",
+                         resolved_outcome.get("detail") or "",
+                         tone=resolved_outcome.get("tone") or "muted",
+                         icon=resolved_outcome.get("icon") or "",
+                         meta=resolved_outcome.get("counts") or (),
+                         actions=actions, full=True)
+
+    def questions() -> list[dict[str, Any]]:
+        # The Questions tab folded in here: a stopped run says what it waits
+        # for beside the graph it stopped on, and the composer answers it in
+        # place. A run that never asked gets no empty box.
+        if not open_asks(run.run_dir):
+            return []
+        return _questions_tab(run)
 
     def build_dag() -> dict[str, Any]:
         if not run.nodes:
@@ -1110,10 +1167,12 @@ def _dag_tab(run: Run, wanted: str | None) -> list[dict[str, Any]]:
                                        "The run has not started a node and its recipe has no workflow.yaml.")],
                          full=True)
         graph = _graph(run, wanted)
-        sec = S.dag("", graph["cols"],
+        recipe = str(run.card.get("recipe") or run.row.get("recipe") or "")
+        sec = S.dag("DAG", graph["cols"],
                     legend=("depends_on → · verifiers check the node before them · "
                             "rollback runs on escalates_to after a failure · "
-                            "click a node to inspect it"), full=True)
+                            "click a node to inspect it"), full=True,
+                    sub=" · ".join(x for x in (recipe, f"{len(run.nodes)} nodes") if x))
         # ``spec.dag`` forwards ``**opt`` into ``_section`` which has no
         # ``heads`` kwarg — mutate the returned dict in place so the kickoff's
         # "stage label per column" reaches the IDE without a spec.py edit.
@@ -1121,46 +1180,119 @@ def _dag_tab(run: Run, wanted: str | None) -> list[dict[str, Any]]:
         sec["edges"] = graph["edges"]
         sec["run_title"] = graph["run_title"]
         sec["recipe"] = graph["recipe"]
+        if select:
+            # The IDE's marker: a click here selects in-page. The node's own
+            # tab stays one button away, from the detail's "Open node".
+            sec["select"] = True
         return sec
 
-    def build_inspector() -> dict[str, Any]:
-        if sel is None:
-            return S.lst("", [S.dot("Nothing to inspect yet")], full=True)
-        lines = [(ln[:_LINE_CHARS], _colour(ln)) for ln in _node_output(run, sel)]
-        prov = _providers(run.home).get(sel.family, {})
-        provider = ("deterministic · no model" if sel.family == "shell"
-                    else " · ".join(p for p in (str(prov.get("model") or ""), str(prov.get("kind") or "")) if p)
-                    or sel.family)
-        items = [
-            # A shell node ran on no lane, so the lane its role declares would
-            # read here as the lane that served it — "shell · minimaxm3_lens".
-            ("Lane", f"{sel.family} · {sel.role_lane}"
-             if sel.role_lane and sel.role_lane != sel.family and sel.family != "shell"
-             else sel.family, f"fam:{sel.family}"),
-            ("Provider", provider),
-            ("Gates", ", ".join(sel.gates) or "—"),
-            ("Cost", S.money(sel.cost) + (f" · {sel.calls} call{'s' if sel.calls != 1 else ''}" if sel.calls else "")),
-            ("Wall time", _wall(sel)),
-        ]
-        if sel.finish and sel.finish != "done":
-            items.append(("Finish", sel.finish, "red" if sel.state == "failed" else "text"))
-        if sel.prompt:
-            items.append(("Prompt", sel.prompt, "muted"))
-        return S.inspector(sel.id, sel.type or "node", _STATE_TEXT.get(sel.state, sel.state),
-                           lines, items, full=True)
+    def run_overview() -> list[dict[str, Any]]:
+        """The run's own state — what the DAG tab opens on until a node is clicked.
 
-    def totals() -> dict[str, Any]:
-        counts: dict[str, int] = {}
-        for n in run.nodes:
-            counts[n.state] = counts.get(n.state, 0) + 1
-        states = ", ".join(f"{k} {counts[k]}" for k in
-                           ("done", "running", "failed", "skipped", "pending") if k in counts)
-        return S.kv("Run totals", [
+        ``_selected`` answers a different question: which node the *canvas*
+        should point at (first failed, else the last that finished). Using that
+        answer to fill this box described the publisher on every finished run —
+        a node whose own cost, start and end say nothing about the run. The box
+        is about the run until a click makes it about a node.
+        """
+        nodes = run.nodes
+        done = sum(1 for node in nodes if node.state == "done")
+        skipped = sum(1 for node in nodes if node.state == "skipped")
+        passed, total = verifier_check_counts(run.run_dir)
+        findings = O._findings_count(run)  # noqa: SLF001 — same package's count
+        live = _running(run)
+        state = str(resolved_outcome.get("state") or "")
+        facts: list[tuple[Any, ...]] = [
+            ("Status", {"done": "done", "running": "running", "failed": "failed",
+                        "needs_you": "needs you"}.get(state, state or "—"),
+             str(resolved_outcome.get("tone") or "text")),
             ("Cost", S.money(_cost(run))),
-            ("Wall time", _elapsed(run)),
-            ("Nodes", f"{len(run.nodes)} · {states}" if run.nodes else "no nodes"),
+            ("Started", _clock(_epoch(run.row.get("created_at")))),
+            ("Ended", "running" if live else _clock(
+                _epoch(run.row.get("ended_at")) or _epoch(run.row.get("updated_at")))),
+            ("Duration", _elapsed(run)),
+            ("Nodes", (f"{done}/{len(nodes)} done" +
+                       (f" · {skipped} not run" if skipped else ""))
+             if nodes else "no nodes"),
+            ("Checks", f"{passed}/{total}" if total else "—",
+             "green" if total and passed == total else "text"),
+            ("Findings", str(findings) if findings is not None else "—",
+             "red" if findings else "text"),
             ("Recipe", str(run.card.get("recipe") or run.row.get("recipe") or "—")),
-        ], full=True)
+        ]
+        sub = " · ".join(("run", "overall", "live" if live else "finished"))
+        return [S.kv("Run", facts, sub=sub, cols=3, big=True, full=True)]
+
+    def node_detail(node: Node) -> list[dict[str, Any]]:
+        # Lazy: ``node.py`` imports this module (same dance as ``run_story``).
+        from mini_ork.ide_pages.node import _kv_items, _resolve_prompt_file
+
+        items = _kv_items(node, _wall(node), run)
+        by_key = {item["k"]: item for item in items}
+        facts: list[tuple[Any, ...]] = [
+            ("Status", _STATE_TEXT.get(node.state, node.state),
+             _STATE_COLOUR.get(node.state, "sub")),
+            ("Lane", by_key["Lane"]["v"], by_key["Lane"]["c"]),
+            ("Provider", by_key["Provider"]["v"], by_key["Provider"]["c"]),
+            ("Cost", by_key["Cost"]["v"], by_key["Cost"]["c"]),
+            ("Started", _clock(node.start)),
+            ("Ended", _clock(node.end)),
+            ("Duration", _wall(node)),
+            ("Tokens", by_key["Tokens"]["v"], by_key["Tokens"]["c"]),
+            ("Skills", by_key["Skills"]["v"], by_key["Skills"]["c"]),
+            ("Gates", by_key["Gates"]["v"], by_key["Gates"]["c"]),
+        ]
+        if node.finish and node.finish != "done":
+            facts.append(("Finish", node.finish, "red" if node.state == "failed" else "text"))
+        if node.prompt:
+            facts.append(("Prompt", node.prompt, "muted"))
+        stage = next((i for i, column in enumerate(run.cols, 1) if node.id in column), None)
+        sub = " · ".join(x for x in (
+            "node",
+            f"stage {stage} of {len(run.cols)}" if stage else "",
+            node.family) if x)
+        actions = [S.btn("Open node", S.page_link("run", "dag", run=run.id, node=node.id),
+                         "primary"),
+                   # An empty ``set`` value removes the key (see the IDE's
+                   # ``set_args``), so the box can go back to describing the run.
+                   S.btn("Run overview", {"set": {"node": ""}}, "ghost")]
+        prompt_path = _resolve_prompt_file(node, run.recipe_dir)
+        if prompt_path:
+            actions.append(S.btn("Prompt", S.open_path(prompt_path), "ghost"))
+        sections = [S.kv(node.id, facts, sub=sub, cols=3, big=True, actions=actions, full=True)]
+        lines = [(ln[:_LINE_CHARS], _colour(ln)) for ln in _node_output(run, node)]
+        if lines:
+            sections.append(S.code(f"Transcript · {node.id}", lines, full=True))
+        return sections
+
+    def verifiers() -> dict[str, Any]:
+        rows = [n for n in run.nodes
+                if n.type == "verifier" or n.type in _REVIEW_TYPES
+                or "verifier" in n.id or "review" in n.id or "lens" in n.id]
+        if not rows:
+            return S.lst("Verifiers", [S.dot("No verifiers have run",
+                                             "Zero verifiers would read vacuous, never success.")],
+                         full=True)
+        items, failed, pending = [], 0, 0
+        for n in rows:
+            verdict, colour = _verdict(run, n)
+            if colour == "red":
+                failed += 1
+            if n.state in ("pending", "skipped"):
+                pending += 1
+            mark = {"done": "✓", "running": "●", "failed": "✗"}.get(n.state, "○")
+            sub = " · ".join(x for x in (verdict, _node_reason(run, n)) if x)
+            items.append(S.item(n.id, sub, m=mark, mc=colour, when=_wall(n)))
+        # "all pass" is a claim about every row: a half-run set still waiting
+        # on its last verifiers must not borrow the sentence a green run earned.
+        if failed:
+            title = f"Verifiers · {failed} failed"
+        elif pending:
+            title = f"Verifiers · {pending} not run"
+        else:
+            title = "Verifiers · all pass"
+        return S.lst(title, items, full=True,
+                     sub=f"{len(rows)} verifier/review node{'s' if len(rows) != 1 else ''}")
 
     def build_coalition() -> dict[str, Any]:
         fams: dict[str, int] = {}
@@ -1194,10 +1326,65 @@ def _dag_tab(run: Run, wanted: str | None) -> list[dict[str, Any]]:
                  sorted(fams.items(), key=lambda kv: (-kv[1], kv[0]))]
         return S.pills(title, pills, full=True, note=note)
 
-    # The DAG section stays first: the IDE draws it as the page's strip, and a
-    # test pins `sections[0]`. The roster and the totals follow it, so a run
-    # read without opening a node still answers "what ran, on what, for how
-    # much" — the same table the Agents tab shows, from one source.
+    if select:
+        # A click is the only thing that makes this tab about a node: ``wanted``
+        # names it, so the detail follows the click and never a guess.
+        explicit = next((n for n in run.nodes if n.id == wanted), None) if wanted else None
+
+        def detail() -> list[dict[str, Any]]:
+            return node_detail(explicit) if explicit is not None else run_overview()
+
+        # The redesign's order: what the run decided, what it waits for, the
+        # graph, the run's own state (or the clicked node), then who checked whom.
+        return (S.guarded(errors, "Outcome", outcome_block)
+                + S.guarded(errors, "Questions", questions)
+                + S.guarded(errors, "DAG", build_dag)
+                + S.guarded(errors, "Node", detail)
+                + S.guarded(errors, "Coalition", build_coalition)
+                + S.guarded(errors, "Verifiers", verifiers))
+
+    # Level 1: the DAG section stays first (the IDE draws it as the page's
+    # strip, and a test pins `sections[0]`); roster and totals follow so the
+    # page still answers "what ran, on what, for how much".
+    def totals() -> dict[str, Any]:
+        counts: dict[str, int] = {}
+        for n in run.nodes:
+            counts[n.state] = counts.get(n.state, 0) + 1
+        states = ", ".join(f"{k} {counts[k]}" for k in
+                           ("done", "running", "failed", "skipped", "pending") if k in counts)
+        return S.kv("Run totals", [
+            ("Cost", S.money(_cost(run))),
+            ("Wall time", _elapsed(run)),
+            ("Nodes", f"{len(run.nodes)} · {states}" if run.nodes else "no nodes"),
+            ("Recipe", str(run.card.get("recipe") or run.row.get("recipe") or "—")),
+        ], full=True)
+
+    def build_inspector() -> dict[str, Any]:
+        if sel is None:
+            return S.lst("", [S.dot("Nothing to inspect yet")], full=True)
+        lines = [(ln[:_LINE_CHARS], _colour(ln)) for ln in _node_output(run, sel)]
+        prov = _providers(run.home).get(sel.family, {})
+        provider = ("deterministic · no model" if sel.family == "shell"
+                    else " · ".join(p for p in (str(prov.get("model") or ""), str(prov.get("kind") or "")) if p)
+                    or sel.family)
+        items = [
+            # A shell node ran on no lane, so the lane its role declares would
+            # read here as the lane that served it — "shell · minimaxm3_lens".
+            ("Lane", f"{sel.family} · {sel.role_lane}"
+             if sel.role_lane and sel.role_lane != sel.family and sel.family != "shell"
+             else sel.family, f"fam:{sel.family}"),
+            ("Provider", provider),
+            ("Gates", ", ".join(sel.gates) or "—"),
+            ("Cost", S.money(sel.cost) + (f" · {sel.calls} call{'s' if sel.calls != 1 else ''}" if sel.calls else "")),
+            ("Wall time", _wall(sel)),
+        ]
+        if sel.finish and sel.finish != "done":
+            items.append(("Finish", sel.finish, "red" if sel.state == "failed" else "text"))
+        if sel.prompt:
+            items.append(("Prompt", sel.prompt, "muted"))
+        return S.inspector(sel.id, sel.type or "node", _STATE_TEXT.get(sel.state, sel.state),
+                           lines, items, full=True)
+
     return (S.guarded(errors, "DAG", build_dag)
             + S.guarded(errors, "Roster", lambda: _roster_section(run))
             + S.guarded(errors, "Totals", totals)
@@ -1332,26 +1519,6 @@ def _overview_tab(run: Run, *, include_retry: bool = True) -> list[dict[str, Any
                                  full=True)]
         return head
 
-    def evidence() -> dict[str, Any]:
-        items = []
-        for p in sorted(d.glob("verifier_*.json")):
-            data = _json_obj(p)
-            if data is None:
-                continue
-            name = str(data.get("verifier") or p.stem.removeprefix("verifier_"))
-            rc = data.get("post_rc")
-            rc_text = f" rc={rc}" if rc not in (None, "") else ""
-            ev = data.get("evidence_path") or ""
-            sub = " · ".join(x for x in (str(data.get("error_summary") or "")[:160],
-                                         _rel(ev, run.home) if ev else "") if x)
-            acts = [S.btn("Open", S.open_path(ev), "ghost")] if ev and Path(ev).is_file() else []
-            items.append(S.ok(f"{name} → PASS{rc_text}", sub, acts) if data.get("pass")
-                         else S.bad(f"{name} → FAIL{rc_text}", sub, acts))
-        if not items:
-            items = [S.dot("No verifiers have run",
-                           "Zero verifiers would read vacuous, never success.")]
-        return S.lst("Why? — evidence", items)
-
     def correlation() -> dict[str, Any]:
         from mini_ork.web.db import db_for
 
@@ -1367,80 +1534,10 @@ def _overview_tab(run: Run, *, include_retry: bool = True) -> list[dict[str, Any
         ])
 
     def recent() -> dict[str, Any]:
-        from mini_ork.web.db import db_for
-
-        db = db_for(run.home)
-        rows = db.rows("SELECT event_type, payload_json, created_at FROM run_events WHERE run_id = ? "
-                       "ORDER BY created_at DESC, rowid DESC LIMIT 8", (run.id,)) \
-            if db.has_table("run_events") else []
-        start = _epoch(run.row.get("created_at")) or 0
-        lines = []
-        for r in reversed(rows):
-            try:
-                payload = json.loads(r.get("payload_json") or "{}")
-            except ValueError:
-                payload = {}
-            node = payload.get("node_id") or ""
-            lane = payload.get("model_lane") or payload.get("lane") or ""
-            fin = payload.get("finish_reason") or ""
-            off = S.duration(max(0, int(r.get("created_at") or start) - start)) if start else ""
-            text = f"{off:<8}  {r.get('event_type', ''):<11} {node}"
-            if lane:
-                text += f"  lane={lane}"
-            if fin:
-                text += f"  {fin}"
-            lines.append((text, "red" if fin and fin != "done" else "muted"))
-        return S.code("Recent events", lines or [("No events recorded for this run.", "dim")])
-
-    def orchestrator() -> list[dict[str, Any]]:
-        """The per-run orchestrator, always shown — even when it never spoke.
-
-        It is armed on every dependency-graph run, but it emits a row only when
-        a node needs an intervention (help · repair · mutate · promote); a clean
-        run stays silent, which used to make the layer invisible. This section
-        is unconditional, so "on but quiet" reads as a fact, not an absence.
-        """
-        from mini_ork.web.db import db_for
-
-        db = db_for(run.home)
-        rows = db.rows("SELECT event_type, payload_json, created_at FROM run_events "
-                       "WHERE run_id = ? AND event_type LIKE 'orchestrator.%' "
-                       "ORDER BY created_at DESC, rowid DESC LIMIT 6", (run.id,)) \
-            if db.has_table("run_events") else []
-        try:
-            from mini_ork.orchestration import runner_orchestrator as _orch
-            armed = _orch.enabled()
-        except Exception:  # noqa: BLE001 — a missing import must not hide the layer
-            armed = True  # the layer is default-on
-        start = _epoch(run.row.get("created_at")) or 0
-        items = []
-        for r in reversed(rows):
-            try:
-                payload = json.loads(r.get("payload_json") or "{}")
-            except ValueError:
-                payload = {}
-            kind = str(r.get("event_type") or "").removeprefix("orchestrator.")
-            node = payload.get("node_id") or ""
-            reason = payload.get("reason") or ""
-            off = S.duration(max(0, int(r.get("created_at") or start) - start)) if start else ""
-            items.append(S.item(f"{off}  {kind}".strip(),
-                                " · ".join(x for x in (node, reason) if x),
-                                m="→", mc="yellow" if kind != "advance" else "blue"))
-        if not items:
-            items = [S.dot(
-                "Armed — no interventions this run" if armed else "Off (MO_RUN_ORCHESTRATOR)",
-                ("Speaks only when a DAG node needs help · repair · mutate · promote; "
-                 "green nodes are skipped, so a clean run stays quiet." if armed else
-                 "The per-run orchestrator is explicitly disabled for this engine."),
-                mc="green" if armed else "sub")]
-        return [S.lst(f"Orchestrator — {'armed' if armed else 'off'}", items, full=True,
-                      note="The per-run decision core at each dependency-graph wave. "
-                           "It never fails a run — it only picks an action.")]
+        return S.code("Recent events",
+                      recent_lines(run) or [("No events recorded for this run.", "dim")])
 
     def files() -> list[dict[str, Any]]:
-        from mini_ork.cli.board_cmd import _card_fields
-
-        fields = _card_fields(run.card, run.home.absolute().parent)
         # Resolve the per-file session-history once per render. The snapshot
         # path keeps the finished run from re-fetching CN for the line; live
         # runs go through the section cache so a slow CN still renders the
@@ -1456,7 +1553,7 @@ def _overview_tab(run: Run, *, include_retry: bool = True) -> list[dict[str, Any
                     snapshot_files[p] = entry
         items = []
         file_history_items: list[dict[str, Any]] = []
-        for f in fields.get("files") or []:
+        for f in _card_files(run):
             acts = [S.btn("Open", S.open_path(f["abs"]), "ghost")] if f.get("abs") else []
             items.append(S.item(f["path"], f"+{f['added']} −{f['removed']}", m="±", mc="blue",
                                 is_mono=True, acts=acts))
@@ -1497,8 +1594,16 @@ def _overview_tab(run: Run, *, include_retry: bool = True) -> list[dict[str, Any
 
     return ((S.guarded(errors, "Retry", retry_section) if include_retry else [])
             + S.guarded(errors, "Run inputs", inputs)
-            + S.guarded(errors, "Why? — evidence", evidence)
-            + S.guarded(errors, "Orchestrator", orchestrator)
+            + S.guarded(errors, "Why? — evidence",
+                        lambda: why_section(run, title="Why? — evidence"))
+            + S.guarded(errors, "Orchestrator", lambda: [S.lst(
+                "Orchestrator", [S.dot(
+                    "The orchestrator has its own tab",
+                    "Activity, the steering queue and the watcher's state live there.",
+                    mc="sub",
+                    acts=[S.btn("Open Orchestrator",
+                                S.page_link("run", "orchestrator", run=run.id), "ghost")])],
+                full=True)])
             + S.guarded(errors, "Correlation", correlation) + S.guarded(errors, "Recent events", recent)
             + S.guarded(errors, "Files changed", files)
             + _run_memory_sections(run))
@@ -1625,7 +1730,7 @@ def _questions_tab(run: Run) -> list[dict[str, Any]]:
     return S.guarded(errors, "Questions", build)
 
 
-def _kickoff_tab(run: Run) -> list[dict[str, Any]]:
+def _kickoff_tab(run: Run, *, code_presentation: bool = False) -> list[dict[str, Any]]:
     errors: dict[str, str] = {}
 
     def build() -> dict[str, Any]:
@@ -1638,36 +1743,55 @@ def _kickoff_tab(run: Run) -> list[dict[str, Any]]:
         if truncated:
             text = text[:_KICKOFF_TAB_CAP] + "\n\n(truncated)\n"
         title = Path(path).name if path else "Kickoff"
+        if code_presentation:
+            # The design reads the kickoff as the source it is: a code block,
+            # not a rendered page. Reading it is the tab's whole job — the file
+            # is not offered for editing, because it records what the run was
+            # asked, not what it is about to be asked.
+            return S.code(title, [(line, "body") for line in text.splitlines()], full=True)
         return S.markdown(title, text, path=path, full=True)
 
     return S.guarded(errors, "Kickoff", build)
 
 
-def _roster_section(run: Run) -> dict[str, Any]:
+def _roster_section(run: Run, *, tokens: bool = False) -> dict[str, Any]:
     """Every node of the run as one table: what it ran on, its state and cost.
 
     Shared by the Graph tab's run-level panel and the Agents tab, so the two
-    cannot report different numbers for the same node.
+    cannot report different numbers for the same node. ``tokens`` adds the
+    tokens column — the v2 Agents tab asks for it, the level-1 roster does not,
+    so its payload stays byte-identical.
     """
+    from mini_ork.ide_pages.node import _node_tokens  # lazy: node.py imports this module
+
     rows = []
     for n in run.nodes:
         verdict, vc = _verdict(run, n)
         ran = n.state not in ("pending", "skipped")
-        rows.append({"cells": [
+        cells = [
             S.cell(n.id, "text", b=True),
             S.cell(n.family, f"fam:{n.family}"),
             S.cell(_STATE_TEXT.get(n.state, n.state), _STATE_COLOUR.get(n.state, "sub")),
             S.cell(verdict, vc),
             S.mono(S.money(n.cost) if ran else "—"),
-            S.mono(_wall(n) if ran else "—"),
-            S.muted(", ".join(n.gates) or "—"),
-        ], "do": S.page_link("run", "dag", run=run.id, node=n.id)})
+        ]
+        if tokens:
+            counted = _node_tokens(n, run) if ran else None
+            cells.append(S.mono(f"{counted:,}" if counted is not None else "—"))
+        cells.extend([S.mono(_wall(n) if ran else "—"),
+                      S.muted(", ".join(n.gates) or "—")])
+        rows.append({"cells": cells,
+                     "do": S.page_link("run", "dag", run=run.id, node=n.id)})
+    head = ["node", "family", "status", "verdict", "cost"]
+    widths = [S.col(150), S.col(90), S.col(80), S.col(90), S.col(64)]
+    if tokens:
+        head.append("tokens")
+        widths.append(S.col(90))
+    head.extend(["time", "gates"])
+    widths.extend([S.col(64), S.col(fr=1, min=140)])
     if not rows:
-        rows = [[S.muted("No nodes recorded"), "", "", "", "", "", ""]]
-    return S.table("Agent roster",
-                   [S.col(150), S.col(90), S.col(80), S.col(90), S.col(64), S.col(64),
-                    S.col(fr=1, min=140)],
-                   ["node", "family", "status", "verdict", "cost", "time", "gates"], rows,
+        rows = [[S.muted("No nodes recorded")] + ["" for _ in head[1:]]]
+    return S.table("Agent roster", widths, head, rows,
                    full=True, note="Where the money went inside the run. Click a row to inspect the node.")
 
 
@@ -1684,7 +1808,7 @@ def _agents_tab(run: Run) -> list[dict[str, Any]]:
         return S.bars("Cost by stage", items, full=True,
                       note="Every metered call of the run, including planning and reflection.")
 
-    return (S.guarded(errors, "Agent roster", lambda: _roster_section(run))
+    return (S.guarded(errors, "Agent roster", lambda: _roster_section(run, tokens=True))
             + S.guarded(errors, "Cost by stage", run_level))
 
 
@@ -1872,13 +1996,13 @@ def _read_json_obj(path: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _injection_ledger(run: Run) -> list[dict[str, Any]]:
-    """Per-node rows from ``learned/<node>.json`` — what each node was given.
+def _injection_records(run: Run) -> list[dict[str, Any]]:
+    """The raw ``learned/<node>.json`` records — the run's injection ledger.
 
     ``learned/`` is the INJECTION ledger (what actually reached the model),
-    not produced learnings. Rendering it closes the "display != injection"
-    gap: the planner injects the v2 pack, so the tab must show the v2 blocks
-    (and each node's source ids / skipped blocks), not the v1 builder output.
+    not produced learnings. :func:`_injection_ledger` renders these for the
+    page; :func:`_injected_usage` reads the same records' ``sources[].id`` to
+    tell which pack items a node was actually given.
     """
     learned_dir = run.run_dir / "learned"
     if not learned_dir.is_dir():
@@ -1886,7 +2010,23 @@ def _injection_ledger(run: Run) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for p in sorted(learned_dir.glob("*.json")):
         d = _read_json_obj(p)
-        node = str(d.get("node_id") or p.stem)
+        # A missing/unparseable file still gets a row (its stem names the node),
+        # so a broken record is visible rather than silently dropped.
+        out.append({**d, "node_id": str(d.get("node_id") or p.stem)})
+    return out
+
+
+def _injection_ledger(run: Run) -> list[dict[str, Any]]:
+    """Per-node rows: what each node was given, and why the rest was skipped.
+
+    Rendering the INJECTION ledger (``learned/<node>.json``) closes the
+    "display != injection" gap: the planner injects the v2 pack, so the tab
+    must show the v2 blocks (and each node's source ids / skipped blocks), not
+    the v1 builder output.
+    """
+    out: list[dict[str, Any]] = []
+    for d in _injection_records(run):
+        node = str(d.get("node_id") or "")
         injected = bool(d.get("injected"))
         srcs = d.get("sources") if isinstance(d.get("sources"), list) else []
         kinds = sorted({str(s.get("kind") or "") for s in srcs if isinstance(s, dict)})
@@ -1905,8 +2045,74 @@ def _injection_ledger(run: Run) -> list[dict[str, Any]]:
     return out
 
 
+def _injected_usage(run: Run) -> set[str] | None:
+    """The pack item ids the ledger records as read or cited by a node.
+
+    ``None`` when the run has no injection ledger at all: the ledger cannot
+    tell, and the tab says so rather than guessing. A node "reads" an item by
+    being given it (the ledger's ``sources[].id``) and "cites" one by naming it
+    in the planner's ``context_used`` list
+    (:func:`mini_ork.context_v2.acknowledgements`).
+    """
+    records = _injection_records(run)
+    if not records:
+        return None
+    used: set[str] = set()
+    for d in records:
+        for s in d.get("sources") or []:
+            if isinstance(s, dict) and s.get("id") is not None:
+                used.add(str(s["id"]))
+    cited = _read_json_obj(run.run_dir / "plan.json").get("context_used")
+    if isinstance(cited, list):
+        used.update(str(c) for c in cited)
+    return used
+
+
+# What the Learnings tab says when the injection ledger has no field telling
+# whether an injected lesson was used — one note on the section, and the rows
+# stay unmarked (kickoff: "usage not recorded for this run").
+_USAGE_UNKNOWN = "usage not recorded for this run"
+
+
+def _forget_action(lesson_id: str) -> dict[str, Any]:
+    """The row's Forget button: ``lessons forget <id>``, confirmed.
+
+    ``S.btn`` carries no ``done`` toast, so the kickoff's success text rides
+    the action itself.
+    """
+    do = S.cli("lessons", "forget", lesson_id,
+               confirm=f"Forget lesson {lesson_id}? Future runs stop receiving it.")
+    do["done"] = "Lesson forgotten"
+    return S.btn("Forget", do, "ghost")
+
+
+def _lesson_acts(lesson_id: str) -> list[dict[str, Any]]:
+    """A lesson row's buttons: Forget (only when it has an id) + Open in Learn."""
+    acts = [_forget_action(lesson_id)] if lesson_id else []
+    acts.append(S.btn("Open in Learn", S.page_link("learn", "lessons"), "ghost"))
+    return acts
+
+
+def _lesson_item(title: str, lesson_id: str, usage: set[str] | None, level2: bool) -> dict[str, Any]:
+    """One injected lesson row: its id, its used/unused mark and its buttons.
+
+    ``usage`` is the id set the injection ledger records, or ``None`` when the
+    ledger cannot tell — and ``None`` marks nothing (the section carries
+    :data:`_USAGE_UNKNOWN` instead). Outside IDE spec 2 the row is exactly what
+    today's tab draws.
+    """
+    sub = lesson_id
+    if level2 and usage is not None and lesson_id:
+        sub = f"{lesson_id} · {'used' if lesson_id in usage else 'unused'}"
+    return S.item(title, sub, acts=_lesson_acts(lesson_id) if level2 else [])
+
+
 def _learnings_tab(run: Run) -> list[dict[str, Any]]:
     errors: dict[str, str] = {}
+    # The Forget / Open-in-Learn buttons and the used/unused marking are IDE
+    # spec 2 surfaces, like every other v2 field: an older IDE keeps getting
+    # exactly today's page.
+    level2 = S.ide_level() >= 2
 
     def produced() -> dict[str, Any]:
         from mini_ork.web.db import db_for
@@ -1944,21 +2150,40 @@ def _learnings_tab(run: Run) -> list[dict[str, Any]]:
                 except (TypeError, ValueError):
                     conf = 0.0
                 sub = f"{fix} · {node} · confidence {conf:.2f}"
-                items.append(S.item(title, sub, m="✦", mc="purple"))
+                items.append(S.item(title, sub, m="✦", mc="purple",
+                                    acts=_lesson_acts(str(g.get("gradient_id") or ""))
+                                    if level2 else []))
         if db.has_table("learning_record"):
             for r in db.rows("SELECT title, category, outcome, confidence FROM learning_record "
                              "WHERE run_id = ? ORDER BY rank LIMIT 20", (run.id,)):
                 items.append(S.item(str(r.get("title") or ""),
                                     f"{r.get('category')} · {r.get('outcome')} · confidence "
-                                    f"{float(r.get('confidence') or 0):.2f}", m="✦", mc="purple"))
+                                    f"{float(r.get('confidence') or 0):.2f}", m="✦", mc="purple",
+                                    acts=_lesson_acts("") if level2 else []))
         if not items:
             items = [S.dot("Nothing recorded", "Reflection writes gradients after the run's last node.")]
-        return S.lst("Produced by the run", items, full=True,
+        return S.lst("Written back" if level2 else "Produced by the run", items, full=True,
                      note="Gradients reflection wrote about this run's own nodes.")
 
     def available() -> list[dict[str, Any]]:
         sections: list[dict[str, Any]] = []
         items: list[dict[str, Any]] = []
+        # The injection ledger drives both the "Injected per node" list and the
+        # used/unused mark on each injected lesson. A ledger that cannot be read
+        # costs those two facts, never the tab (nor the rest of this section).
+        try:
+            ledger = _injection_ledger(run)
+        except Exception as exc:  # noqa: BLE001 — one broken source, one lost list
+            errors["Injected per node"] = f"{type(exc).__name__}: {exc}"
+            ledger = []
+        try:
+            usage = _injected_usage(run) if level2 else None
+        except Exception as exc:  # noqa: BLE001
+            errors["Injected lesson usage"] = f"{type(exc).__name__}: {exc}"
+            usage = None
+        # The ledger cannot tell → say so on the sections that list injected
+        # lessons, and leave every row unmarked.
+        usage_note = _USAGE_UNKNOWN if (level2 and usage is None) else ""
         # Prefer the INJECTED artifact. The planner writes context-pack.v2.json
         # and SUPPRESSES the v1 builder output, so rendering v1 showed a pack the
         # model never saw. v2 first; v1 only as a fallback for older runs.
@@ -1969,19 +2194,22 @@ def _learnings_tab(run: Run) -> list[dict[str, Any]]:
             items.append(S.ok("Injected context", "v2 pack — what the planner received"))
             cons = v2.get("constraints") if isinstance(v2.get("constraints"), list) else []
             if cons:
-                detail = [S.item(f"{c.get('kind', '?')}: {str(c.get('text', ''))[:180]}",
-                                 str(c.get("id", "")))
+                detail = [_lesson_item(f"{c.get('kind', '?')}: {str(c.get('text', ''))[:180]}",
+                                       str(c.get("id", "")), usage, level2)
                           for c in cons if isinstance(c, dict)]
                 items.append(S.ok("Constraints", f"{len(cons)} injected"))
-                sections.append(S.lst(f"Constraints (injected) · {len(cons)}", detail, full=True))
+                sections.append(S.lst(f"Constraints (injected) · {len(cons)}", detail,
+                                      full=True, note=usage_note))
             else:
                 items.append(S.dot("Constraints", "none injected"))
             themes = v2.get("themes") if isinstance(v2.get("themes"), list) else []
             if themes:
-                detail = [S.item(str(t.get("text") or "")[:180], str(t.get("id") or ""))
+                detail = [_lesson_item(str(t.get("text") or "")[:180], str(t.get("id") or ""),
+                                       usage, level2)
                           for t in themes if isinstance(t, dict)]
                 items.append(S.ok("Verified lessons", f"{len(themes)} injected"))
-                sections.append(S.lst(f"Verified lessons (injected) · {len(themes)}", detail, full=True))
+                sections.append(S.lst(f"Verified lessons (injected) · {len(themes)}", detail,
+                                      full=True, note=usage_note))
             contract = v2.get("contract") if isinstance(v2.get("contract"), dict) else {}
             ff = v2.get("file_findings") if isinstance(v2.get("file_findings"), list) else []
             if ff:
@@ -2027,7 +2255,6 @@ def _learnings_tab(run: Run) -> list[dict[str, Any]]:
         else:
             items.append(S.dot("No context pack", "This run was not given a context pack."))
 
-        ledger = _injection_ledger(run)
         if ledger:
             items.append(S.ok("Per-node injection", f"{len(ledger)} node(s) recorded"))
             sections.append(S.lst(f"Injected per node · {len(ledger)}", ledger, full=True))
@@ -2039,16 +2266,151 @@ def _learnings_tab(run: Run) -> list[dict[str, Any]]:
             n = (db.row("SELECT COUNT(*) AS n FROM operator_steering WHERE run_id = ?", (run.id,)) or {}).get("n", 0)
             items.append(S.ok("Operator steering", f"{n} message(s) this run") if n
                          else S.dot("Operator steering", "none this run"))
-        summary = S.lst("Available to the run", items, full=True,
+        summary = S.lst("Injected into prompts" if level2 else "Available to the run",
+                        items, full=True,
                         note="The context the planner actually received (v2 pack), "
                              "plus each node's own injection ledger.")
         return [summary, *sections]
 
+    # The design reads "what it was given" before "what it taught": the
+    # injected lessons lead, the written-back gradients follow. Level 1 keeps
+    # the old order and the old titles byte for byte.
+    if level2:
+        return (S.guarded(errors, "Injected into prompts", available)
+                + S.guarded(errors, "Written back", produced))
     return (S.guarded(errors, "Produced by the run", produced)
             + S.guarded(errors, "Available to the run", available))
 
 
-def _artifacts_tab(run: Run) -> list[dict[str, Any]]:
+# ── artifacts ───────────────────────────────────────────────────────────────
+#
+# Level 1 draws one flat "Artifacts" table; level 2 (the IDE's own spec) splits
+# the same rows into a "Key artifacts" header section plus one table per
+# producing node. Everything here is gated on ``S.ide_level()``, so an older IDE
+# keeps getting today's single table byte for byte.
+
+_ARTIFACT_COLS = [S.col(fr=1, min=200), S.col(110), S.col(70), S.col(110)]
+_ARTIFACT_HEAD = ["file", "kind", "size", "from"]
+
+# The tab draws at most this many FILE rows in total — the key artifacts count
+# toward it. Everything past the cap collapses into one final "+N more in the
+# run folder" row whose ``do`` reveals the run directory.
+_ARTIFACT_ROW_CAP = 200
+
+# The kickoff's "Key artifacts" slots, in the order the tab must show them. The
+# diff is ONE slot whose first alternative wins; ``evidence`` is a directory.
+_KEY_ARTIFACTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("file", ("review-diff.patch", "framework-edit.diff")),
+    ("file", ("verdict.json",)),
+    ("file", ("review-verdict.json",)),
+    ("file", ("rubric.json",)),
+    ("file", ("retry-hint.json",)),
+    ("dir", ("evidence",)),
+    ("file", ("execute.log",)),
+)
+
+
+def _artifact_size(path: Path) -> str:
+    """A key artifact's size: a directory sums the files under it."""
+    try:
+        if path.is_dir():
+            total = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+        else:
+            total = path.stat().st_size
+    except OSError:
+        return "—"
+    return _human(total)
+
+
+def _key_artifacts(run: Run) -> list[tuple[str, Path]]:
+    """``(label, path)`` for each key artifact that exists, in kickoff order."""
+    out: list[tuple[str, Path]] = []
+    for kind, names in _KEY_ARTIFACTS:
+        for name in names:
+            path = run.run_dir / name
+            if (path.is_dir() if kind == "dir" else path.is_file()):
+                out.append((name + ("/" if kind == "dir" else ""), path))
+                break
+    return out
+
+
+def _key_artifacts_section(run: Run) -> dict[str, Any]:
+    """The tab's first section: the handful of files a reviewer opens first."""
+    from mini_ork.cli.board_cmd import _artifact_group
+
+    rows: list[dict[str, Any]] = []
+    for label, path in _key_artifacts(run):
+        do = S.reveal(str(path)) if path.is_dir() else S.open_path(str(path))
+        rows.append({"cells": [S.mono(label), S.cell(_artifact_group(label).lower()),
+                               S.mono(_artifact_size(path)), S.muted("")],
+                     "do": do})
+    if not rows:
+        rows = [{"cells": [S.muted("No key artifacts yet"), "", "", ""]}]
+    return S.table("Key artifacts", _ARTIFACT_COLS, _ARTIFACT_HEAD, rows, full=True,
+                   note="The files a reviewer opens first — the diff, the verdicts, "
+                        "the rubric, the evidence and the run's log.")
+
+
+def _artifact_row(a: dict[str, Any], ids: set[str]) -> dict[str, Any]:
+    """One file row, in the flat table's own columns."""
+    return {"cells": [S.mono(a["path"]), S.cell(a["group"].lower()),
+                      S.mono(_human(a["size"])), S.muted(_from(a["path"], ids))],
+            "do": S.open_path(a["abs"])}
+
+
+def _artifact_file_sections(run: Run) -> list[dict[str, Any]]:
+    """One table per producing node, then the run-level files.
+
+    Attribution is the flat table's own :func:`_from` (``impl-<node>``,
+    ``review-<node>``, …); a file that belongs to no node lands in "Run files".
+    """
+    from mini_ork.cli.board_cmd import _artifacts
+
+    files = _artifacts(run.run_dir)
+    ids = {n.id for n in run.nodes}
+    buckets: dict[str, list[dict[str, Any]]] = {n.id: [] for n in run.nodes}
+    run_level: list[dict[str, Any]] = []
+    for a in files:
+        node = _from(a["path"], ids)
+        (buckets[node] if node in buckets else run_level).append(a)
+
+    # The key artifacts consume part of the row budget, so the tab as a whole
+    # stays under the cap.
+    cap = max(0, _ARTIFACT_ROW_CAP - len(_key_artifacts(run)))
+    ordered = [(f"From {n.id}", buckets[n.id]) for n in run.nodes if buckets[n.id]]
+    ordered.append(("Run files", run_level))
+
+    rendered: list[tuple[str, list[dict[str, Any]]]] = []
+    shown = 0
+    for title, entries in ordered:
+        rows: list[dict[str, Any]] = []
+        for a in entries:
+            if shown >= cap:
+                break
+            shown += 1
+            rows.append(_artifact_row(a, ids))
+        if rows:
+            rendered.append((title, rows))
+
+    if not rendered:
+        return [S.table("Run files", _ARTIFACT_COLS, _ARTIFACT_HEAD,
+                        [[S.muted("No artifacts yet"), "", "", ""]], full=True,
+                        note="Nothing in the run folder yet.")]
+
+    # Every file the cap left out is accounted for by this one row, which is
+    # the last thing the tab draws.
+    collapsed = len(files) - shown
+    if collapsed > 0:
+        rendered[-1][1].append({
+            "cells": [S.mono(f"+{collapsed} more in the run folder"), S.muted(""),
+                      S.muted(""), S.muted("")],
+            "do": S.reveal(str(run.run_dir))})
+
+    return [S.table(title, _ARTIFACT_COLS, _ARTIFACT_HEAD, rows, full=True)
+            for title, rows in rendered]
+
+
+def _artifacts_tab(run: Run, *, changes: bool = False) -> list[dict[str, Any]]:
     errors: dict[str, str] = {}
 
     def table() -> dict[str, Any]:
@@ -2062,11 +2424,39 @@ def _artifacts_tab(run: Run) -> list[dict[str, Any]]:
                          "do": S.open_path(a["abs"])})
         if not rows:
             rows = [[S.muted("No artifacts yet"), "", "", ""]]
-        return S.table("Artifacts", [S.col(fr=1, min=200), S.col(110), S.col(70), S.col(110)],
-                       ["file", "kind", "size", "from"], rows, full=True,
+        return S.table("Artifacts", _ARTIFACT_COLS, _ARTIFACT_HEAD, rows, full=True,
                        note="Only what the run produced, grouped. Click a file to open it.")
 
-    return S.guarded(errors, "Artifacts", table)
+    def changed_files() -> dict[str, Any] | list[dict[str, Any]]:
+        # The run's diff leads the tab: an artifact inventory answers "what did
+        # it write", the changed-file table answers "what did it touch in the
+        # repo" — the question the operator came with when the run finished.
+        files = _card_files(run)
+        if not files:
+            return []
+        rows = [{"cells": [S.mono(f.get("path") or ""),
+                           S.mono(f"+{f.get('added') or 0}"),
+                           S.mono(f"−{f.get('removed') or 0}")],
+                 "do": S.open_path(str(f.get("abs") or "")) if f.get("abs") else None}
+                for f in files]
+        # The design's sub-line totals the diff; level 1 keeps the page it had.
+        sub = ""
+        if S.ide_level() >= 2:
+            added = sum(int(f.get("added") or 0) for f in files)
+            removed = sum(int(f.get("removed") or 0) for f in files)
+            sub = (f"+{added} −{removed} · {len(files)} "
+                   f"file{'s' if len(files) != 1 else ''}")
+        return S.table("Changes", [S.col(fr=1, min=240), S.col(60), S.col(60)],
+                       ["file", "added", "removed"], rows, full=True, sub=sub,
+                       note="The run's working-tree diff. Click a file to open it.")
+
+    head = S.guarded(errors, "Changes", changed_files) if changes else []
+    if S.ide_level() < 2:
+        return head + S.guarded(errors, "Artifacts", table)
+    return head + (S.guarded(errors, "Key artifacts",
+                          lambda: _key_artifacts_section(run))
+                   + S.guarded(errors, "Artifacts",
+                              lambda: _artifact_file_sections(run)))
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────
@@ -2353,7 +2743,7 @@ def _collect_run_memory(run: Run) -> dict[str, Any]:
             "files": files_payload}
 
 
-def _decisions_assumptions_section(run: Run) -> dict[str, Any]:
+def _decisions_assumptions_section(run: Run) -> dict[str, Any] | None:
     """The "Decisions and assumptions" section.
 
     For each node with a session id and at least one trajectory atom of
@@ -2388,10 +2778,7 @@ def _decisions_assumptions_section(run: Run) -> dict[str, Any]:
         return S.lst("Decisions and assumptions",
                       [S.dot(error, mc="red")], full=True)
     if not nodes_data:
-        return S.lst("Decisions and assumptions",
-                      [S.dot("No decision atoms recorded",
-                             "Each node session is queried once; nothing came back.")],
-                      full=True)
+        return None
     items: list[dict[str, Any]] = []
     total_atoms = 0
     for entry in nodes_data:
@@ -2413,12 +2800,147 @@ def _decisions_assumptions_section(run: Run) -> dict[str, Any]:
                                 m="•", mc="sub", acts=acts))
             total_atoms += 1
     if not items:
-        return S.lst("Decisions and assumptions",
-                      [S.dot("No decision atoms recorded")], full=True)
+        return None
     note = (f"{len(nodes_data)} node session{'s' if len(nodes_data) != 1 else ''} · "
             f"{total_atoms} atom{'s' if total_atoms != 1 else ''} · "
             "open jumps to the source session.")
     return S.lst("Decisions and assumptions", items, full=True, note=note)
+
+
+# ── sections the two page families share ────────────────────────────────────
+
+
+def _card_files(run: Run) -> list[dict[str, Any]]:
+    """The run card's changed-file rows — ``path``/``abs``/``added``/``removed``."""
+    from mini_ork.cli.board_cmd import _card_fields
+
+    return list(_card_fields(run.card, run.home.absolute().parent).get("files") or [])
+
+
+def why_section(run: Run, *, title: str = "Why — evidence") -> dict[str, Any]:
+    """The verifier verdicts: the page's own answer to "why did this end here".
+
+    One row per ``verifier_*.json``, pass or fail, carrying the verifier's own
+    reason. It is the section an operator actually needs after a failure, so the
+    v2 story places it directly under the triage that states the outcome rather
+    than leaving the reason to be inferred from a log tail. ``title`` is a
+    parameter because the Overview tab has shown this list under a slightly
+    different title since before the story existed, and that page is not this
+    change's to rewrite.
+    """
+    items = []
+    for path in sorted(run.run_dir.glob("verifier_*.json")):
+        data = _json_obj(path)
+        if data is None:
+            continue
+        name = str(data.get("verifier") or path.stem.removeprefix("verifier_"))
+        rc = data.get("post_rc")
+        rc_text = f" rc={rc}" if rc not in (None, "") else ""
+        # The reason keys, in the order the engine's other failure readers try
+        # them (``outcome._first_failing_verifier``): a verifier states its case
+        # in whichever one its shape uses, and a row reading only "FAIL" is the
+        # thing this section exists to replace.
+        reason = next((str(data.get(key) or "").strip() for key in
+                       ("error_summary", "reason", "detail")
+                       if str(data.get(key) or "").strip()), "")
+        evidence_path = data.get("evidence_path") or ""
+        sub = " · ".join(x for x in
+                         (reason.splitlines()[0][:160] if reason else "",
+                          _rel(evidence_path, run.home) if evidence_path else "") if x)
+        acts = [S.btn("Open", S.open_path(evidence_path), "ghost")] \
+            if evidence_path and Path(evidence_path).is_file() else []
+        items.append(S.ok(f"{name} → PASS{rc_text}", sub, acts) if data.get("pass")
+                     else S.bad(f"{name} → FAIL{rc_text}", sub, acts))
+    if not items:
+        items = [S.dot("No verifiers have run",
+                       "Zero verifiers would read vacuous, never success.")]
+    return S.lst(title, items)
+
+
+def recent_lines(run: Run) -> list[tuple[str, str]]:
+    """The run's last events, oldest first, as ``(text, colour)`` lines."""
+    from mini_ork.web.db import db_for
+
+    db = db_for(run.home)
+    rows = db.rows("SELECT event_type, payload_json, created_at FROM run_events WHERE run_id = ? "
+                   "ORDER BY created_at DESC, rowid DESC LIMIT 8", (run.id,)) \
+        if db.has_table("run_events") else []
+    start = _epoch(run.row.get("created_at")) or 0
+    lines = []
+    for row in reversed(rows):
+        try:
+            payload = json.loads(row.get("payload_json") or "{}")
+        except ValueError:
+            payload = {}
+        node = payload.get("node_id") or ""
+        lane = payload.get("model_lane") or payload.get("lane") or ""
+        finish = payload.get("finish_reason") or ""
+        offset = S.duration(max(0, int(row.get("created_at") or start) - start)) if start else ""
+        text = f"{offset:<8}  {row.get('event_type', ''):<11} {node}"
+        if lane:
+            text += f"  lane={lane}"
+        if finish:
+            text += f"  {finish}"
+        lines.append((text, "red" if finish and finish != "done" else "muted"))
+    return lines
+
+
+def _log_step(step_id: str, title: str, tail: str) -> dict[str, Any]:
+    """One collapsed step holding a log tail."""
+    return S.story_step(step_id, title, kind="log",
+                        body=[S.block_lines([(line, "muted") for line in tail.splitlines()])])
+
+
+def diagnostics_sections(run: Run) -> list[dict[str, Any]]:
+    """Raw run material — log tails, recent events, changed files — folded away.
+
+    Each of these held prime space on the Overview tab: a log tail sat in a
+    top-level section literally titled ``Detail``, second of eight. None of it
+    explains anything by itself — a tail is evidence for one step, and a hundred
+    lines of it buries the answer the operator opened the page for. One
+    collapsed step each, so the section costs a row until someone opens the one
+    they need, and nothing is lost: ``_tail_log`` is the same reader, and so the
+    same text, the ``Detail`` block used.
+
+    A run with no logs, no events and no changed files contributes nothing.
+    """
+    from mini_ork.recovery.retry_hint import _tail_log
+
+    nodes: list[str] = []
+    for pattern, prefix, suffix in (("impl-*.log", "impl-", ".log"),
+                                    ("agent-*.live.jsonl", "agent-", ".live.jsonl")):
+        for path in sorted(run.run_dir.glob(pattern)):
+            node = path.name[len(prefix):-len(suffix)]
+            if node and node not in nodes:
+                nodes.append(node)
+    steps = []
+    for node in nodes:
+        tail = _tail_log(run.run_dir, node)
+        if tail:
+            steps.append(_log_step(f"diag-log-{node}", f"Log tail — {node}", tail))
+    if not steps:
+        # No per-node log, so the run-wide one is the only tail there is — and it
+        # is the one the old ``Detail`` block showed.
+        tail = _tail_log(run.run_dir, "")
+        if tail:
+            steps.append(_log_step("diag-log-run", "Log tail — the run", tail))
+    events = recent_lines(run)
+    if events:
+        steps.append(S.story_step("diag-events", "Recent events", kind="events",
+                                  body=[S.block_lines(events)]))
+    files = _card_files(run)
+    if files:
+        steps.append(S.story_step("diag-files", "Files changed", kind="files",
+                                  body=[S.block_files([
+                                      S.file_entry(str(f.get("path") or ""),
+                                                   abs=str(f.get("abs") or ""),
+                                                   added=int(f.get("added") or 0),
+                                                   removed=int(f.get("removed") or 0))
+                                      for f in files])]))
+    if not steps:
+        return []
+    return [S.story("Diagnostics", steps,
+                    note="Raw run material. Folded — open the one you need.")]
 
 
 def _run_memory_sections(run: Run) -> list[dict[str, Any]]:
@@ -2429,13 +2951,19 @@ def _run_memory_sections(run: Run) -> list[dict[str, Any]]:
     changed-files view itself gets the recency annotation. Both read
     from the same snapshot (or compute once and persist it) so the
     finished-run page renders without ever asking ContextNest.
+
+    A run with no atoms contributes nothing: "nothing was recorded" is not
+    worth a card, and a card whose only content is its own emptiness is what
+    made the page unreadable. A read that *failed* is a different fact and
+    still gets one (:func:`S.guarded` is the same distinction).
     """
     try:
-        return [_decisions_assumptions_section(run)]
+        section = _decisions_assumptions_section(run)
     except Exception as exc:  # noqa: BLE001 — additive sections must not blank the page
         return [S.lst("Decisions and assumptions",
                       [S.dot(f"Could not read this: {type(exc).__name__}: {exc}",
                              mc="red")], full=True)]
+    return [section] if section is not None else []
 
 
 def _title_v2(run: Run) -> str:
@@ -2463,6 +2991,28 @@ def _title_v2(run: Run) -> str:
         if first:
             return first[:120]
     return run.id
+
+
+def _v2_tabs(run: Run, waiting: int) -> list[tuple[str, str]]:
+    """``V2_TABS`` with a count appended where the tab has one to give.
+
+    Empty sections now vanish from the page rather than rendering a card whose
+    only content is its own emptiness, so the count is where "there is nothing
+    here" is said — in the tab bar, against the tab it is about. A tab with a
+    count of zero keeps its plain label: "Agents · 0" would be noise on every
+    run that has not started.
+    """
+    from mini_ork.cli.board_cmd import _artifacts
+
+    counts = {
+        # The questions tab folded into the DAG; its count rides here so a
+        # stopped run still advertises itself from the tab bar.
+        "dag": waiting,
+        "agents": len(run.nodes),
+        "artifacts": len(_artifacts(run.run_dir)),
+    }
+    return [(key, f"{label} · {counts[key]}" if counts.get(key) else label)
+            for key, label in V2_TABS]
 
 
 def _sub_v2(run: Run) -> str:
@@ -2644,13 +3194,29 @@ def _desc_fold(run: Run, outcome: dict[str, Any] | None = None, title: str = "")
     return _desc_wrap(" ".join(p for p in (intent, rest) if p))
 
 
-def _story_tab(run: Run, outcome: dict[str, Any]) -> list[dict[str, Any]]:
-    """The v2 story: triage, the outcome's callouts, the goal/criteria hero,
-    then the step-by-step story — one row per pipeline node with its evidence."""
+def _outcome_tab(run: Run, outcome: dict[str, Any],
+                 callout_actions: Iterable[dict[str, Any]] | None = None
+                 ) -> list[dict[str, Any]]:
+    """The v2 outcome: what happened, what it was for, what it ran on.
+
+    Order is the design's: the verdict, the evidence under it, the goal and
+    its numbers, then the run's own facts — how it was placed, when, on what
+    branch — before the operator can steer it, read the story, and see the
+    decision material. Everything the old Overview tab carried that has no
+    newer home (retry hints, inputs, orchestrator, correlation, events, files)
+    tails the page rather than being dropped.
+
+    ``callout_actions`` is the outcome's own buttons minus the ones the header
+    draws, so the verdict carries the design's ``bodyActs`` without repeating
+    a control the header already offers.
+    """
     sections = [S.triage(outcome["text"], tone=outcome["tone"], icon=outcome["icon"],
                          detail=outcome["detail"], counts=outcome["counts"],
-                         actions=outcome["actions"], menu=outcome["menu"])]
-    sections.extend(outcome.get("callouts") or [])
+                         actions=list(callout_actions or ()), menu=[])]
+    # The reason, directly under the verdict it explains. The Overview tab has
+    # always carried this list; the story tab had no path to it at all, so a
+    # failure was stated and never explained.
+    sections.extend(S.guarded({}, "Why — evidence", lambda: why_section(run)))
     profile = _run_profile(run)
     goal = str(profile.get("user_goal") or "").strip()
     raw_criteria = profile.get("success_criteria")
@@ -2662,17 +3228,52 @@ def _story_tab(run: Run, outcome: dict[str, Any]) -> list[dict[str, Any]]:
     if goal and title and goal.casefold().startswith(title) \
             and (goal.casefold() == title or len(title) >= 80):
         goal = ""
-    if goal or criteria:
-        recipe = str(run.card.get("recipe") or run.row.get("recipe") or "")
-        meta = []
-        if recipe:
-            meta.append(S.meta_item(recipe))
-        branch = _branch(run)
-        if branch:
-            meta.append(S.meta_item(f"branch {branch}", mono=True))
-        meta.append(S.meta_item(run.id, mono=True))
+    files = _card_files(run)
+    added = sum(int(f.get("added") or 0) for f in files)
+    removed = sum(int(f.get("removed") or 0) for f in files)
+    done = sum(1 for n in run.nodes if n.state == "done")
+    cells = [(f"{done}/{len(run.nodes)}", "nodes done",
+              "green" if run.nodes and done == len(run.nodes) else "text"),
+             (S.money(_cost(run)), "cost"),
+             (_elapsed(run), "wall time")]
+    if files:
+        cells.append((f"+{added} −{removed}", "lines changed", "blue"))
+    if goal or criteria or cells:
         sections.append(S.hero("What this run is for", goal=goal,
-                               criteria=criteria[:8], meta=meta))
+                               criteria=criteria[:8], cells=cells))
+
+    def run_facts() -> dict[str, Any]:
+        recipe = str(run.card.get("recipe") or run.row.get("recipe") or "")
+        task_class = str(profile.get("task_class") or run.row.get("task_class") or "")
+        workspace = run.workspace
+        worktree = branch = ""
+        if workspace is not None:
+            worktree = _rel(str(workspace.path), run.home.absolute().parent)
+            branch = str(workspace.branch or "")
+        started = _epoch(run.row.get("created_at"))
+        _, kickoff_file = _resolve_kickoff(run)
+        kickoff = Path(kickoff_file).name if kickoff_file else ""
+        risk = str(profile.get("risk_tolerance") or "")
+        environment = ("remote · " + str(profile.get("environment") or "")) \
+            if str(profile.get("placement") or "").lower() == "remote" else "local"
+        items = [
+            ("Recipe", recipe or "—"),
+            ("Task class", task_class or "—"),
+            ("Worktree", worktree or "—"),
+            ("Branch", branch or "—"),
+            ("Started", _clock(started) if started else "—"),
+            ("Kickoff", kickoff or "—"),
+            ("Risk", risk or "—"),
+            ("Environment", environment),
+        ]
+        actions = []
+        if kickoff_file:
+            actions.append(S.btn("Open kickoff", S.open_path(kickoff_file), "ghost"))
+        if workspace is not None:
+            actions.append(S.btn("Open worktree", S.open_path(str(workspace.path)), "ghost"))
+        return S.kv("This run", items, sub=run.id, cols=4, actions=actions, full=True)
+
+    sections.extend(S.guarded({}, "This run", run_facts))
     # Imported inside the function: ``node.py`` imports ``run.py``, so a
     # top-level ``run_story`` import (which pulls in ``node.py``) would be
     # circular. Guarded like the Overview sections it replaces: a broken story
@@ -2681,23 +3282,45 @@ def _story_tab(run: Run, outcome: dict[str, Any]) -> list[dict[str, Any]]:
 
     # The snapshot path keeps a finished run from re-fetching ContextNest;
     # live runs go through the section cache and never persist the snapshot.
-    # Placed before the story so the story stays the closing section the
-    # IDE scrolls to.
+    sections.extend(S.guarded({}, "What happened", lambda: run_story.story_section(run)))
     sections.extend(S.guarded({}, "Decisions and assumptions",
                               lambda: _run_memory_sections(run)))
-    sections.extend(S.guarded({}, "What happened", lambda: run_story.story_section(run)))
-    # A live run can still be steered: the box runs ``mini-ork board steer
-    # <run> --text <typed>``. Finished runs get no composer — there is nothing
-    # left to steer. ``_running`` is the page's own running test (the one the
-    # live chip and ``_actions`` use), so the composer cannot appear on a run
-    # the header already calls done.
+    # ``Seen before`` rides the failed card's callouts. It is prior art on the
+    # same failure, so it belongs with the decision material below the narrative
+    # — not wedged between the verdict and the reason that explains it.
+    sections.extend(outcome.get("callouts") or [])
+    sections.extend(S.guarded({}, "Diagnostics", lambda: diagnostics_sections(run)))
+    # Steering moved to the Orchestrator tab, beside the queue the message
+    # lands in and the watcher that may have nudged the same node. The pointer
+    # keeps the verb discoverable from the page a reader arrives on.
     if _running(run):
-        sections.append(S.composer(
-            "Tell the running agent what to change… (Enter to send)",
-            ["board", "steer", run.id, "--text"],
-            title="Steer this run"))
+        sections.append(S.lst("Steering", [S.dot(
+            "Steer this run from the Orchestrator tab",
+            "The composer, the queue the next node reads, and the watcher's "
+            "own nudges are one page — this one is the run's story.",
+            mc="sub",
+            acts=[S.btn("Open Orchestrator",
+                        S.page_link("run", "orchestrator", run=run.id), "ghost")])],
+            full=True))
+    # The Overview tab's remaining sections — retry hints, run inputs, the
+    # orchestrator log, correlation, recent events, changed files. Evidence and
+    # the decision atoms are already above under their own headings, so they
+    # are skipped here by title rather than shown twice.
+    already = {str(section.get("title") or "") for section in sections}
+    already |= {"Why? — evidence", "Decisions and assumptions"}
+    sections.extend(section for section in _overview_tab(run)
+                    if str(section.get("title") or "") not in already)
     return sections
 
+
+
+def _story_tab(run: Run, outcome: dict[str, Any]) -> list[dict[str, Any]]:
+    """The retired Story tab: the outcome tab under its old name.
+
+    The tab bar no longer offers it (``story`` resolves to ``outcome``); the
+    name survives because the header tests pin the triage it leads with.
+    """
+    return _outcome_tab(run, outcome)
 
 def _checks_tab(run: Run) -> list[dict[str, Any]]:
     """The run's verifier checks, levels and review findings.
@@ -2712,41 +3335,102 @@ def _checks_tab(run: Run) -> list[dict[str, Any]]:
     return run_dock.checks_sections(run, errors)
 
 
+def _orch_args(args: dict[str, Any]) -> dict[str, Any]:
+    """The Orchestrator tab's view state, carried through the page's own args.
+
+    Filters are server-side (``S.set_args`` round-trips them), so the page has
+    to echo the current ones or a refresh would drop the reader back to "all".
+    """
+    return {key: args[key] for key in ("orch_view", "orch_limit") if args.get(key)}
+
+
 def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
-    """The ``MINI_ORK_IDE_SPEC=2`` page: one true outcome, next action next to it."""
+    """The ``MINI_ORK_IDE_SPEC=2`` page: the run id, its outcome, its graph.
+
+    The design leads with the DAG, so the header names the run by id and gives
+    the human title the sub line — a reader scanning the tab bar already knows
+    which run, and the title is the sentence they came for.
+    """
     outcome = O.resolve(run)
     keys = {k for k, _ in V2_TABS}
     wanted = (tab or "").strip()
     resolved = V2_ALIASES.get(wanted, wanted)
     if resolved not in keys:
-        resolved = "story"
+        resolved = "dag"
     node = args.get("node")
+
+    # The header fields are the same on every tab: the label names the run and
+    # the controls (Stop/Kill while it runs, Merge/Discard when it is done) sit
+    # beside them, so a user on the DAG tab can still stop a runaway run.
+    header = build_header(run, outcome)
+    actions = [a for a in (S.btn("Open run folder", S.open_path(str(run.run_dir))),
+                           _orchestrator_action(run)) if a]
+    # One label, one control: subtract everything the header draws — its own
+    # buttons plus the page's — before the outcome's remaining buttons go to
+    # the callout body (the design's ``bodyActs``).
+    drawn = {str(a.get("label") or "") for a in header["actions"] + actions}
+    callout_actions = [a for a in (outcome.get("actions") or [])
+                       if isinstance(a, dict) and str(a.get("label") or "") not in drawn]
+    # The design's done state offers the diff beside the verdict; the changes
+    # moved to the Artifacts tab, so the button goes there.
+    if str(outcome.get("state") or "") == "done" and _card_files(run):
+        callout_actions.append(
+            S.btn("Open diff", S.page_link("run", "artifacts", run=run.id)))
+    callout_labels = {str(a.get("label") or "") for a in callout_actions}
+    # A callout is drawn on the DAG and Outcome tabs only: on the others the
+    # menu must keep the buttons no callout is showing.
+    in_callout = callout_labels if resolved in ("dag", "outcome") else set()
+    menu = [m for m in header["menu"]
+            if str(m.get("label") or "") not in drawn | in_callout]
+
     sections = {
-        "story": lambda: _story_tab(run, outcome),
-        "graph": lambda: _dag_tab(run, node),
-        "questions": lambda: _questions_tab(run),
-        "kickoff": lambda: _kickoff_tab(run),
+        "dag": lambda: _dag_tab(run, node, select=True, outcome=outcome,
+                                callout_actions=callout_actions),
+        "outcome": lambda: _outcome_tab(run, outcome, callout_actions),
+        "orchestrator": lambda: orch_tab.orchestrator_tab(run, args),
+        "kickoff": lambda: _kickoff_tab(run, code_presentation=True),
         "agents": lambda: _agents_tab(run),
         "checks": lambda: _checks_tab(run),
         "learnings": lambda: _learnings_tab(run),
-        "artifacts": lambda: _artifacts_tab(run),
+        "artifacts": lambda: _artifacts_tab(run, changes=True),
     }[resolved]()
-    chips = [S.chip(outcome["state"], outcome["tone"]),
-             S.chip(S.money(_cost(run))), S.chip(_elapsed(run))]
+
+    # The design's header strip: state, how far, what it cost, which recipe.
+    # Placement and elapsed are this page's older chips; they trail the four
+    # the design names rather than pushing them out of order.
+    waiting = len(open_asks(run.run_dir))
+    chips = []
+    if waiting:
+        chips.append(S.chip(f"✋ {waiting} question{'s' if waiting > 1 else ''}", "yellow"))
+    chips.append(S.chip(outcome["state"], outcome["tone"]))
+    done = sum(1 for n in run.nodes if n.state == "done")
+    if run.nodes:
+        chips.append(S.chip(f"{done}/{len(run.nodes)} nodes"))
+    chips.append(S.chip(S.money(_cost(run))))
+    recipe = str(run.card.get("recipe") or run.row.get("recipe") or "")
+    if recipe:
+        chips.append(S.chip(recipe))
     placement = _placement_chip(run)
     if placement:
-        chips.insert(1, placement)
-    # A run that stopped on a question says so in the header: the Questions tab
-    # is otherwise an empty tab on every run that never asked anything, and a
-    # blocked run would look like any other.
-    waiting = len(open_asks(run.run_dir))
-    if waiting:
-        chips.insert(0, S.chip(f"✋ {waiting} question{'s' if waiting > 1 else ''}", "yellow"))
+        chips.append(placement)
+    chips.append(S.chip(_elapsed(run)))
+
     title = _title_v2(run)
-    page = S.page("run", title, _sub_v2(run), chips_=chips, actions=[],
-                  tabs=V2_TABS, tab=resolved,
-                  args={"run": run.id, **({"node": node} if node else {})},
-                  sections=sections, desc=_desc_fold(run, outcome, title))
+    # The design titles the run by its id and gives the human title the sub
+    # line — a reader scanning the tab bar already knows which run.
+    sub = title if title and title != run.id else _sub_v2(run)
+    page = S.page("run", run.id, sub, chips_=chips,
+                  actions=header["actions"] + actions,
+                  tabs=_v2_tabs(run, waiting), tab=resolved,
+                  args={"run": run.id, **({"node": node} if node else {}),
+                        **_orch_args(args)},
+                  sections=sections, desc=_desc_fold(run, outcome, title),
+                  label=header["label"], menu=menu,
+                  updated_at=header["updated_at"],
+                  refresh=orch_tab.refresh_seconds(run))
+    # The header draws no GOAL / SPEC labels on this page: the sub is the
+    # kickoff's own heading, and a label above it would read as a field name.
+    page["field_labels"] = False
     page["graph"] = _graph(run, node)
     return page
 
@@ -2821,13 +3505,17 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
         "dag": lambda: _dag_tab(run, args.get("node")),
         "kickoff": lambda: _kickoff_tab(run),
         "overview": lambda: _overview_tab(run),
+        "orchestrator": lambda: orch_tab.orchestrator_tab(run, args),
         "agents": lambda: _agents_tab(run),
         "learnings": lambda: _learnings_tab(run),
         "artifacts": lambda: _artifacts_tab(run),
     }[tab]()
     page = S.page("run", run.id, _sub(run), chips_=chips, actions=_actions(run), tabs=TABS,
-                  tab=tab, args={"run": run.id, **({"node": args["node"]} if args.get("node") else {})},
-                  sections=review_sections + sections, desc=_desc_fold(run, None, run.id))
+                  tab=tab, args={"run": run.id,
+                                 **({"node": args["node"]} if args.get("node") else {}),
+                                 **_orch_args(args)},
+                  sections=review_sections + sections, desc=_desc_fold(run, None, run.id),
+                  refresh=orch_tab.refresh_seconds(run))
     # Additive at every level: the graph is available to an old IDE too.
     page["graph"] = _graph(run, args.get("node"))
     return page

@@ -344,7 +344,8 @@ def test_a_live_runs_fresh_signal_reaches_the_strip(home: Path, chain_intact, ca
     assert _pills(strip) == {"1 watching": "orange"}
     assert strip["detail"] == "1 run need attention: run-stuck · impl — impl has been idle 12m"
     assert strip["text"] == "1 thing needs you"
-    assert _button(strip, "Open")["do"] == {"page": "run", "args": {"run": "run-stuck"}}
+    assert _button(strip, "Open")["do"] == {
+        "page": "run", "tab": "orchestrator", "args": {"run": "run-stuck"}}
 
 
 def test_a_finished_runs_signal_is_history_not_attention(

@@ -124,7 +124,8 @@ def test_dag_layers_the_workflow_and_attributes_cost(home: Path) -> None:
     _seed(home)
     page = build_page(home, "run", None, {"run": RUN})
     assert page["ok"] is True and page["tab"] == "dag" and page["title"] == RUN
-    assert [t["key"] for t in page["tabs"]] == ["dag", "kickoff", "overview", "agents", "learnings", "artifacts"]
+    assert [t["key"] for t in page["tabs"]] == [
+        "dag", "kickoff", "overview", "orchestrator", "agents", "learnings", "artifacts"]
     assert [c["t"] for c in page["chips"]][:2] == ["published · verified", "5/6 nodes"]
     dag = _section(page, "dag")
     cols = [[n["id"] for n in c] for c in dag["cols"]]
@@ -194,35 +195,50 @@ def test_overview_reads_verifier_files_with_log_lines_before_the_json(home: Path
     assert events[-1]["t"].split()[2:4] == ["node_end", "publisher"]
 
 
-def test_overview_always_shows_the_orchestrator_even_when_it_never_spoke(
+def test_overview_points_at_the_orchestrator_tab_it_no_longer_carries(
         home: Path, monkeypatch) -> None:
-    """A clean dependency-graph run leaves the orchestrator silent — it emits a
-    row only when a node needs help/repair/mutate/promote, and green nodes are
-    skipped. The Overview tab must still show the layer, so "armed but quiet"
-    reads as a fact instead of as a missing feature."""
+    """The orchestrator log moved to its own tab; Overview keeps a pointer so
+    the layer stays discoverable from the page a reader arrives on."""
     monkeypatch.delenv("MO_RUN_ORCHESTRATOR", raising=False)  # default-on
     _seed(home)
     page = build_page(home, "run", "overview", {"run": RUN})
-    sec = next(s for s in page["sections"] if s["title"].startswith("Orchestrator"))
-    assert sec["title"] == "Orchestrator — armed"
-    assert sec["items"][0]["t"] == "Armed — no interventions this run"
+    sec = next(s for s in page["sections"] if s["title"] == "Orchestrator")
+    assert sec["type"] == "list"
+    assert sec["items"][0]["t"] == "The orchestrator has its own tab"
+    assert sec["items"][0]["acts"][0]["do"] == {
+        "page": "run", "tab": "orchestrator", "args": {"run": RUN}}
 
 
-def test_overview_lists_the_orchestrators_interventions(home: Path, monkeypatch) -> None:
+def test_orchestrator_tab_is_armed_and_quiet_on_a_clean_run(
+        home: Path, monkeypatch) -> None:
+    """A clean dependency-graph run leaves the orchestrator silent — it emits a
+    row only when a node needs help/repair/mutate/promote, and green nodes are
+    skipped. The tab must still show the layer, so "armed but quiet" reads as
+    a fact instead of as a missing feature."""
+    monkeypatch.delenv("MO_RUN_ORCHESTRATOR", raising=False)  # default-on
+    monkeypatch.setenv("MO_ORCH_WATCH", "1")  # conftest switches the watcher off
+    _seed(home)
+    page = build_page(home, "run", "orchestrator", {"run": RUN})
+    feed = _section(page, "feed", "Orchestrator activity")
+    assert feed["status"] in ("armed", "stopped")
+    assert "No interventions" in feed["empty"]
+
+
+def test_orchestrator_tab_lists_the_interventions(home: Path, monkeypatch) -> None:
     monkeypatch.delenv("MO_RUN_ORCHESTRATOR", raising=False)
     _seed(home)
     con = sqlite3.connect(home / "state.db")
     con.execute("INSERT INTO run_events (event_id, run_id, event_type, payload_json, created_at) "
                 "VALUES (?,?,?,?,?)",
-                ("ev-orch", RUN, "orchestrator.mutate.proposed",
+                ("ev-orch", RUN, "orchestrator.mutate",
                  json.dumps({"node_id": "implementer", "reason": "lane exhausted"}), T0 + 60))
     con.commit()
     con.close()
-    page = build_page(home, "run", "overview", {"run": RUN})
-    sec = next(s for s in page["sections"] if s["title"].startswith("Orchestrator"))
-    row = sec["items"][0]
-    assert "mutate.proposed" in row["t"]
-    assert row["sub"] == "implementer · lane exhausted"
+    page = build_page(home, "run", "orchestrator", {"run": RUN})
+    feed = _section(page, "feed", "Orchestrator activity")
+    row = feed["items"][0]
+    assert row["t"] == "mutate"
+    assert row["d"] == "implementer · lane exhausted"
 
 
 def test_agents_learnings_and_artifacts(home: Path) -> None:
@@ -311,7 +327,7 @@ def test_level_one_page_is_unchanged_plus_an_additive_graph(
     assert set(page) - {"graph", "desc"} == _LEVEL_ONE_KEYS
     assert page["title"] == RUN  # the run id is still the title
     assert [t["key"] for t in page["tabs"]] == [
-        "dag", "kickoff", "overview", "agents", "learnings", "artifacts"]
+        "dag", "kickoff", "overview", "orchestrator", "agents", "learnings", "artifacts"]
     assert page["tab"] == "dag"
     assert page["sections"][0]["type"] == "dag"
     assert page["chips"][0] == {"t": "published · verified", "c": "green"}
