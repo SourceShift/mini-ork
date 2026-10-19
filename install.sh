@@ -100,11 +100,18 @@ echo "mini-ork: installing into $TARGET (python: $FOUND_PY)" >&2
 TTY=""
 if [ -t 0 ] && [ -t 1 ]; then
     TTY=stdio
-elif { : </dev/tty; } 2>/dev/null && { : >/dev/tty; } 2>/dev/null; then
+elif ( : </dev/tty ) 2>/dev/null && ( : >/dev/tty ) 2>/dev/null; then
     # Permission bits are not enough: with no controlling terminal the node is
     # readable/writable but every open fails with ENXIO ("Device not
     # configured"), which killed the install under a test runner or a
     # container. Open it once both ways before committing to it.
+    #
+    # Each probe runs in a subshell on purpose. `:` is a POSIX special
+    # builtin, and a redirection error on one makes a non-interactive shell
+    # exit outright — dash does exactly this, so the brace-group form exited
+    # the whole installer with status 2 before it could reach the "no tty,
+    # skip" branch. In a subshell the exit is contained and the condition is
+    # merely false.
     TTY=/dev/tty
 fi
 if [ -n "$TTY" ] && [ "${MINI_ORK_NO_ONBOARD:-0}" != "1" ]; then
