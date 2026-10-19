@@ -100,7 +100,11 @@ echo "mini-ork: installing into $TARGET (python: $FOUND_PY)" >&2
 TTY=""
 if [ -t 0 ] && [ -t 1 ]; then
     TTY=stdio
-elif [ -r /dev/tty ] && [ -w /dev/tty ]; then
+elif { : </dev/tty; } 2>/dev/null && { : >/dev/tty; } 2>/dev/null; then
+    # Permission bits are not enough: with no controlling terminal the node is
+    # readable/writable but every open fails with ENXIO ("Device not
+    # configured"), which killed the install under a test runner or a
+    # container. Open it once both ways before committing to it.
     TTY=/dev/tty
 fi
 if [ -n "$TTY" ] && [ "${MINI_ORK_NO_ONBOARD:-0}" != "1" ]; then

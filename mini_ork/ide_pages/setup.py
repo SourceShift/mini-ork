@@ -69,11 +69,24 @@ def _entry(data: dict[str, Any] | None, group: str) -> dict[str, Any] | None:
 
 
 def _version() -> str:
-    try:
-        import tomllib
+    """The engine's version.
 
-        doc = tomllib.loads((_engine_root() / "pyproject.toml").read_text(encoding="utf-8"))
-        return str(doc.get("project", {}).get("version") or "—")
+    ``pyproject.toml`` carries no literal ``[project] version`` any more: it is
+    dynamic (``version = {attr = "mini_ork.version.__version__"}``), so reading
+    the TOML alone returned "—" on every checkout. ``mini_ork.version`` is the
+    single source of truth; the installed distribution metadata is the fallback
+    for an environment that has the package but no source tree.
+    """
+    try:
+        from mini_ork.version import __version__
+
+        return str(__version__)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from importlib.metadata import version as dist_version
+
+        return dist_version("mini-ork")
     except Exception:  # noqa: BLE001
         return "—"
 

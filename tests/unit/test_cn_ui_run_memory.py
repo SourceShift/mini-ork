@@ -639,10 +639,11 @@ def test_resolve_session_id_returns_sid_for_real_session(
 def test_disabled_cn_decisions_section_renders_one_line_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``MO_DISABLE_CN=1`` short-circuits before any ``_get`` fires;
-    the Decisions section renders an empty-state one-liner without
-    raising — the disabled flag pre-empts the trajectory fetch, so
-    a record with a ``won't render`` body never reaches the page."""
+    """``MO_DISABLE_CN=1`` short-circuits before any ``_get`` fires; the
+    disabled flag pre-empts the trajectory fetch, so a record with a
+    ``won't render`` body never reaches the page and the run contributes
+    no section. An empty card is not rendered: "nothing was recorded" is
+    not worth a card (see ``_run_memory_sections``)."""
     monkeypatch.setenv("MO_DISABLE_CN", "1")
     _stub_cn(monkeypatch, trajectories={
         "sid-impl": {"records": [{"kind": "decision_made",
@@ -656,15 +657,11 @@ def test_disabled_cn_decisions_section_renders_one_line_state(
                 card={"status": "published", "files": []})
 
     section = _decisions_assumptions_section(run)
-    # Disabled CN renders the established one-line state — the
-    # page must not raise and must not claim "won't render" (the
-    # ``_node_decision_atoms`` short-circuit drops the trajectory
-    # before any record could land in the list).
-    blob = json.dumps(section)
-    assert "won't render" not in blob, blob
-    # The empty-state label always shows when the section has no
-    # atom rows; the disabled flag is what kept the record out.
-    assert "No decision atoms recorded" in blob, blob
+    # The page must not raise and must not claim "won't render" (the
+    # ``_node_decision_atoms`` short-circuit drops the trajectory before
+    # any record could land in the list). With no atom rows there is no
+    # section at all — the disabled flag is what kept the record out.
+    assert section is None
 
 
 # ── 10. node without a session id — section stays empty ──────────────────
@@ -674,7 +671,7 @@ def test_decisions_section_empty_when_no_node_has_a_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A run where every node resolves to ``None`` (no session id) renders
-    the empty-state one-liner, not a fabricated section."""
+    no section, not a fabricated one."""
     monkeypatch.delenv("MO_DISABLE_CN", raising=False)
     _stub_cn(monkeypatch)
     _node_session_id_stub(monkeypatch, {})  # nothing resolves
@@ -688,12 +685,10 @@ def test_decisions_section_empty_when_no_node_has_a_session(
     run = _run(tmp_path, nodes, [["implementer"], ["test"]],
                 card={"status": "published", "files": []})
 
+    # No atom rows means no section: the page must not invent a card, and
+    # no node session label can leak into something that is not rendered.
     section = _decisions_assumptions_section(run)
-    blob = json.dumps(section)
-    assert "No decision atoms recorded" in blob, blob
-    # No node session label leaked into the section.
-    assert "node implementer" not in blob
-    assert "node test" not in blob
+    assert section is None
 
 
 # ── 11. action sweep — every action is a known spec action ────────────────
@@ -855,9 +850,9 @@ def test_run_page_build_with_run_memory_remains_ok_true(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The run page build with the new memory sections stays ``ok:
-    true`` and the Decisions section appears in the v2 story tab
-    between the story and the buddy narration. Additive: an existing
-    section count grows by one, never shrinks."""
+    true`` and the Decisions section appears on the v2 ``outcome`` tab,
+    where decision material lives. Additive: an existing section count
+    grows by one, never shrinks."""
     monkeypatch.delenv("MO_DISABLE_CN", raising=False)
     _stub_cn(monkeypatch, trajectories={
         "sid-impl": {"records": [
@@ -875,6 +870,15 @@ def test_run_page_build_with_run_memory_remains_ok_true(
     run_dir = home / "runs" / RUN
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    # The page loads nodes from the recipe workflow; without one the run has
+    # no node to resolve a session for, so the memory section could never
+    # render. Both files are what ``find_recipe`` requires.
+    recipe_dir = home / "recipes" / "demo-recipe"
+    recipe_dir.mkdir(parents=True, exist_ok=True)
+    (recipe_dir / "task_class.yaml").write_text("name: demo\n")
+    (recipe_dir / "workflow.yaml").write_text(
+        "nodes:\n  - name: implementer\n    type: implementer\n")
+
     con = sqlite3.connect(home / "state.db")
     con.execute(
         "INSERT INTO task_runs (id, recipe, status, cost_usd, created_at, updated_at, "
@@ -886,7 +890,7 @@ def test_run_page_build_with_run_memory_remains_ok_true(
     con.close()
 
     monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
-    page = run_page.build(home, None, {"run": RUN})
+    page = run_page.build(home, "outcome", {"run": RUN})
     assert page["ok"] is True
     titles = [s.get("title") for s in page["sections"]]
     assert "Decisions and assumptions" in titles, titles

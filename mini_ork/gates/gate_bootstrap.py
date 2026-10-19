@@ -38,12 +38,20 @@ import uuid
 # framework boot via the OCP seam (side effect of the module's
 # module-level ``register_gate_evaluator`` call). No DB write or recipe
 # change — opt-in per recipe (kickoff rule #5).
+#
+# ``conformal_gate`` registers itself the same way. Importing it here makes
+# the type available to ``gate_register`` in every process, not only in a
+# test run that happened to import its module first: a recipe listing
+# ``conformal_gate`` in ``gates:`` would otherwise be refused as an unknown
+# type in production. Registration is inert — the gate itself stays off
+# until ``MO_CONFORMAL_ORACLE=1``.
 from mini_ork.gates.native_gates import native_condition
 from mini_ork.gates import abstain_gate  # noqa: F401
-# Reference the module so static analysers that don't honour ``# noqa``
-# see the import as used. The side effect (``register_gate_evaluator``)
+from mini_ork.gates import conformal_gate  # noqa: F401
+# Reference the modules so static analysers that don't honour noqa
+# comments see the imports as used. The side effect (``register_gate_evaluator``)
 # is what we actually want; the explicit access is for the linter.
-_ = abstain_gate  # noqa: F841
+_ = (abstain_gate, conformal_gate)  # noqa: F841
 
 _DDL = """
     CREATE TABLE IF NOT EXISTS gate_registry (

@@ -147,7 +147,8 @@ def _insert_events_same_second(home: Path, run_id: str,
 
 
 def test_hint_version_is_current() -> None:
-    assert retry_hint.HINT_VERSION == 4
+    # v5: name-matched verifier payload read (see HINT_VERSION's comment).
+    assert retry_hint.HINT_VERSION == 5
 
 
 def test_dangling_start_is_interrupted(home: Path) -> None:
