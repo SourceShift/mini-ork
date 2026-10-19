@@ -74,6 +74,7 @@ def build_certificate(
     llm_calls: int,
     duration_s: float,
     context_files: list | None = None,
+    mutation_kill_score: float | None = None,
 ) -> dict:
     """Assemble the certificate dict. Caller writes it to ``--out``.
 
@@ -87,6 +88,11 @@ def build_certificate(
     confirm which files the oracle saw. Default ``None`` omits the key —
     callers that don't pass a CodeContext (legacy / SWE-bench-style) keep the
     prior certificate shape byte-for-byte (modulo the absent key).
+
+    ``mutation_kill_score`` (optional): the verifier's mutation kill rate.
+    When ``None`` the key is omitted and the certificate is byte-identical to
+    the pre-mutation-score shape; otherwise it lands in ``method`` and is
+    sealed by the digest.
     """
     files = _parse_patch_files(patch_text)
     method: dict = {
@@ -98,6 +104,8 @@ def build_certificate(
     }
     if context_files is not None:
         method["context_files"] = list(context_files)
+    if mutation_kill_score is not None:
+        method["mutation_kill_score"] = mutation_kill_score
     base: dict = {
         "schema": "mini-ork.certificate/v1",
         "id": str(uuid.uuid4()),
