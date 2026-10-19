@@ -224,12 +224,15 @@ def call_judge(runner, **extra):
     return judge(ISSUE, PATCH, runner=runner, poc=POC, dispatch=fake_dispatch, **extra)
 
 
-def test_judge_gains_exactly_one_optional_keyword_only_parameter():
+def test_judge_gains_exactly_two_optional_keyword_only_parameters():
+    # `candidates` (discrimination) and `run_id` (hidden checks) are the only
+    # optional additions to the judge's public signature.
     params = inspect.signature(judge).parameters
     assert list(params) == ["issue", "patch", "runner", "mr_n", "gold",
-                            "poc", "dispatch", "context", "candidates"]
-    assert params["candidates"].kind == inspect.Parameter.KEYWORD_ONLY
-    assert params["candidates"].default is None
+                            "poc", "dispatch", "context", "candidates", "run_id"]
+    for name in ("candidates", "run_id"):
+        assert params[name].kind == inspect.Parameter.KEYWORD_ONLY
+        assert params[name].default is None
     required = {n for n, p in params.items() if p.default is inspect.Parameter.empty}
     assert required == {"issue", "patch", "runner"}
 

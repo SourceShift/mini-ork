@@ -447,6 +447,10 @@ _LEGACY_RESULT_KEYS = {
 
 def test_knobs_off(db, monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("MO_PROMOTION_GATE_HACKABILITY", "0")
+    # Every newer promotion consumer must also be off for the legacy result
+    # shape to be byte-identical: oracle integrity defaults ON.
+    monkeypatch.setenv("MO_ORACLE_INTEGRITY", "0")
+    monkeypatch.setenv("MO_JUDGE_VALIDITY", "0")
     monkeypatch.setitem(gate_registry.GATE_EVALUATORS, "hk_open", lambda *a: "pass")
     gid = _register(db, "hk_open", "stub-condition")
     hackability.write_record(str(db), hackability.audit_gate(str(db), gid))
