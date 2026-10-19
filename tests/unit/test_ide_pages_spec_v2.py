@@ -46,6 +46,48 @@ def test_ide_level_is_read_on_each_call(monkeypatch: pytest.MonkeyPatch) -> None
     assert S.ide_level() == 2  # not cached from the first call
 
 
+def test_ide_spec_level_override_wins_over_a_silent_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A long-lived server started without MINI_ORK_IDE_SPEC must still serve
+    # the level the request named — that is the whole point of the contextvar.
+    monkeypatch.delenv("MINI_ORK_IDE_SPEC", raising=False)
+    with S.ide_spec_level(2):
+        assert S.ide_level() == 2
+
+
+def test_ide_spec_level_override_wins_over_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MINI_ORK_IDE_SPEC", "1")
+    with S.ide_spec_level(2):
+        assert S.ide_level() == 2
+
+
+def test_ide_spec_level_resets_on_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MINI_ORK_IDE_SPEC", "1")
+    with S.ide_spec_level(2):
+        assert S.ide_level() == 2
+    assert S.ide_level() == 1  # the next request is not left at level 2
+
+
+def test_ide_spec_level_none_falls_back_to_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MINI_ORK_IDE_SPEC", "2")
+    with S.ide_spec_level(None):
+        assert S.ide_level() == 2
+
+
+@pytest.mark.parametrize("level", [0, -3])
+def test_ide_spec_level_below_one_is_level_one(
+    monkeypatch: pytest.MonkeyPatch, level: int
+) -> None:
+    monkeypatch.delenv("MINI_ORK_IDE_SPEC", raising=False)
+    with S.ide_spec_level(level):
+        assert S.ide_level() == 1
+
+
 # ── hero / triage / callout ───────────────────────────────────────────────
 
 

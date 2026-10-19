@@ -49,9 +49,10 @@ purple cyan orange`` or a lane family ``fam:<lane>`` (``fam:sonnet``). The IDE
 maps them onto its theme. State words are ``done running failed skipped pending
 needs_you``.
 
-:func:`ide_level` reads ``MINI_ORK_IDE_SPEC`` on every call (default ``1``): an
-IDE that sets ``MINI_ORK_IDE_SPEC=2`` gets the section types above; an older IDE
-(env unset) keeps getting today's pages.
+:func:`ide_level` reads the requested level on every call (default ``1``): the
+level rides on the request (:func:`ide_spec_level`) when a server is answering,
+and on ``MINI_ORK_IDE_SPEC`` in the environment otherwise. An IDE that asks for
+``2`` gets the section types above; an older IDE keeps getting today's pages.
 
 Actions (``do``) — what a button, row or chip does in the IDE:
 
@@ -75,7 +76,9 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 COLOURS = ("text", "body", "muted", "sub", "dim", "blue", "green", "red", "yellow",
@@ -87,20 +90,50 @@ KINDS = ("primary", "default", "danger", "warn", "ghost")
 
 # ── spec level ─────────────────────────────────────────────────────────────
 
-def ide_level() -> int:
-    """The IDE spec level the caller asked for, from ``MINI_ORK_IDE_SPEC``.
-
-    The new IDE sets ``MINI_ORK_IDE_SPEC=2`` on every page build; builders use
-    this to decide whether to emit the v2 section types. Read on each call —
-    never cached — so a long-lived process sees a new value. Anything missing,
-    non-numeric or below ``1`` is level ``1`` (today's pages).
-    """
-    raw = os.environ.get("MINI_ORK_IDE_SPEC")
+def _level_of(raw: str | int | None) -> int:
+    """Parse a spec level. Anything missing, non-numeric or below ``1`` is
+    level ``1`` — the page that predates the v2 section types. Failing towards
+    level 1 is deliberate: an unreadable request must not take down a page."""
     try:
         level = int(raw) if raw is not None else 1
     except (TypeError, ValueError):
         return 1
     return level if level >= 1 else 1
+
+
+#: The level named by the request being served, when it named one. Set by
+#: :func:`ide_spec_level`. The environment stays the process-wide default (the
+#: subprocess path sets ``MINI_ORK_IDE_SPEC`` there), so a server that was
+#: started with no variable in its environment still answers at level 1.
+_SPEC_OVERRIDE: ContextVar[int | None] = ContextVar("mini_ork_ide_spec", default=None)
+
+
+def ide_level() -> int:
+    """The IDE spec level the caller asked for.
+
+    The per-request level wins — one ``mini-ork serve`` can be read by a level-2
+    IDE and a level-1 one at the same time — and ``MINI_ORK_IDE_SPEC`` in the
+    environment is the default underneath it, which is the only channel a
+    subprocess build has. Read on each call, never cached, so a long-lived
+    server sees a new value. Anything missing, non-numeric or below ``1`` is
+    level ``1``.
+    """
+    override = _SPEC_OVERRIDE.get()
+    if override is not None:
+        return _level_of(override)
+    return _level_of(os.environ.get("MINI_ORK_IDE_SPEC"))
+
+
+@contextmanager
+def ide_spec_level(level: int | None) -> Iterator[None]:
+    """Serve the enclosed build at ``level``, or at the environment's default
+    when it is ``None``. Reset on the way out: a request that named no level
+    must not leave the next one reading at level 2."""
+    token = _SPEC_OVERRIDE.set(level)
+    try:
+        yield
+    finally:
+        _SPEC_OVERRIDE.reset(token)
 
 
 # ── actions ────────────────────────────────────────────────────────────────
