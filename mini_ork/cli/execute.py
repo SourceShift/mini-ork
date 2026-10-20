@@ -1355,6 +1355,10 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     # Revise-loop cap read once per run: 0 (or negative) restores the legacy
     # block-descendants-and-rollback behaviour exactly.
     revise_rounds_cap = _revise_rounds_limit()
+    # RB-18: set by the dependency-graph pass when the test gate's evidence says
+    # the base already passes and the implementer changed nothing. ``main``
+    # closes the run terminal ``not_needed`` instead of counting a failure.
+    already_satisfied = False
 
     def _dispatch_dependency_graph():
         """Dispatch control/data dependencies in readiness waves.
@@ -1364,7 +1368,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         selected parent succeeded; failed parents block descendants without
         executing a publisher or consumer against partial state.
         """
-        nonlocal fail_count, abstain_count, pause_count
+        nonlocal fail_count, abstain_count, pause_count, already_satisfied
         pending = {field[0]: field for field in work_fields}
         statuses: dict[str, str] = {}
         order = {field[0]: index for index, field in enumerate(work_fields)}
@@ -1372,6 +1376,8 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         fields_by_id = {field[0]: field for field in work_fields}
         # revise round bookkeeping: target node_id -> rounds already consumed.
         round_used: dict[str, int] = {}
+        # RB-18: the defect report is noted once per run, not once per wave.
+        spec_defect_noted = False
 
         def _control_descendants(target: str) -> set[str]:
             """``target`` plus everything a re-run of it must redo.
@@ -1553,6 +1559,24 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 _orchestrator_act(live_run_dir, db, run_id, outcomes, repair_edges,
                                   revision_state=locals())
 
+            # ── RB-18: an already-fixed base is not a code problem ─────────
+            # The test gate can fail with "no candidate-pass/base-fail delta"
+            # (candidate rc=0, base rc=0) while the implementer's delta is empty
+            # or bytecode-only. No round can improve that, so end the run
+            # terminal ``not_needed`` instead of spending the revise budget
+            # (run-1792136781-59220, run-1792136293-92791). Checked BEFORE the
+            # revise grouping so the failing gate is never enqueued for a round;
+            # ``main`` writes the status after this function returns.
+            if fail_count > 0 and _already_satisfied_at_base(live_run_dir):
+                already_satisfied = True
+                print(
+                    "[revise] skipped: test verifier reports base rc=0 and "
+                    "candidate rc=0 with an empty/bytecode-only implementer diff "
+                    "— already satisfied at base",
+                    file=sys.stderr,
+                )
+                return
+
             # ── revise loop (retries edges) ────────────────────────────────
             # A failed node that carries a `retries` edge sends its findings
             # back to the edge's target (normally the implementer) instead of
@@ -1597,6 +1621,17 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                     # the implementer would spend a full round on a format failure.
                     print(f"[revise] skipped for {field[0]}: reviewer verdict unparseable "
                           "— no findings to send back", file=sys.stderr)
+                    continue
+                if _revise_skips_non_verdict(field, finish_reason):
+                    # RB-18: a dispatch error/timeout/config refusal produced no
+                    # verdict about the code. Re-running the implementer would
+                    # spend a full round on absent evidence
+                    # (run-1791910825-57872); the source's ordinary failure path
+                    # (escalates_to, fail_count, rollback) still fires.
+                    print(f"[revise] skipped for {field[0]}: "
+                          f"finish_reason={finish_reason} — no verdict produced, "
+                          "another implementer round is not warranted",
+                          file=sys.stderr)
                     continue
                 edge = repair_edges[field[0]]
                 target, max_rounds = edge.target, edge.max_rounds
@@ -1672,6 +1707,30 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 # marker changes.
                 revise_groups.setdefault(target, []).append(
                     (field, rc, CONDITION_FIRED_FINISH_REASON))
+            # ── RB-18: a filed spec defect ends the round budget ──────────
+            # An implementer that wrote spec-test-defect.md / questions.md has
+            # said the acceptance test cannot be satisfied by any
+            # implementation. Another round cannot change that, so drop the
+            # rounds this wave would have fired and let the ordinary failure
+            # path escalate (run-1792185781-68028). Checked after both firing
+            # channels so a condition-fired round is suppressed too.
+            _defect = _spec_defect_report(live_run_dir)
+            if _defect is not None and revise_groups:
+                revise_groups.clear()
+                if not spec_defect_noted:
+                    spec_defect_noted = True
+                    _defect_name, _defect_text = _defect
+                    from mini_ork.cli.execute_handlers import _append_run_note  # noqa: PLC0415
+
+                    print(
+                        f"[revise] skipped: implementer filed {_defect_name} — "
+                        f"implementer-initiated unsatisfiable-spec: {_defect_text}",
+                        file=sys.stderr,
+                    )
+                    _append_run_note(
+                        db, run_id,
+                        f"spec-test-defect ({_defect_name}): {_defect_text}",
+                    )
             if revise_groups:
                 for target, failed_sources in revise_groups.items():
                     _target_edge = repair_edges[failed_sources[0][0][0]]
@@ -1736,6 +1795,19 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
             fail_count += 1
         elif dependency_aware:
             _dispatch_dependency_graph()
+            if already_satisfied:
+                # RB-18: the run is over, but not failed — the base already
+                # satisfies the test gate and the implementer changed nothing
+                # (or bytecode only). Mirror the operator's ``not_needed``
+                # gesture with status + note only: no ``not-needed.json`` (that
+                # marker means a human closed the run), and no verdict, rollback
+                # or learning writeback on the way out.
+                from mini_ork.cli.execute_handlers import _append_run_note  # noqa: PLC0415
+
+                _append_run_note(db, run_id, "already satisfied at base")
+                set_status(db, run_id, "not_needed")
+                print("not_needed: already satisfied at base")
+                return 0
         elif dispatch_mode == "parallel":
             _oc = _parallel(work_fields)
             fail_count += _count_failures(_oc)
@@ -4324,6 +4396,190 @@ def _revise_rounds_limit() -> int:
         return int(context_env("MO_REVISE_ROUNDS", "2"))
     except ValueError:
         return 2
+
+
+# ── RB-18: only a real verdict may start a revise round ─────────────────────
+# The revise loop used to fire on three things that are not verdicts about the
+# code: a node that produced no verdict at all (dispatch error/timeout/config),
+# a base that already satisfies the test gate, and an implementer that filed a
+# spec-test defect. Each one burned a full implementer round on absent evidence
+# (run-1791910825-57872, run-1792136781-59220, run-1792185781-68028).
+
+#: Finish reasons that never carry a verdict about the code. ``timeout``,
+#: ``interrupted`` and ``config`` come from the dispatch/config boundary;
+#: ``cost_limit`` is a budget abort. None of them judged anything.
+_NON_VERDICT_FINISH_REASONS = frozenset(
+    {"timeout", "interrupted", "config", "cost_limit"}
+)
+
+#: Files an implementer writes when it believes the acceptance test cannot be
+#: satisfied by any implementation (RB-18 mechanism 3).
+_SPEC_DEFECT_FILENAMES = ("spec-test-defect.md", "questions.md")
+_SPEC_DEFECT_REASON_LIMIT = 300
+
+
+def _revise_skips_non_verdict(field, finish_reason) -> bool:
+    """True when ``field`` failed without producing a verdict about the code.
+
+    ``timeout`` / ``interrupted`` / ``config`` / ``cost_limit`` are never
+    verdicts for any node type. ``error`` is the reviewer handler's
+    dispatch-failure reason (``finish_reason_for_failure``), but a *verifier*
+    also reports ``error`` when its check simply failed — that failure IS a
+    verdict and must keep driving revise rounds (tests/unit/test_revise_loop.py
+    depends on it). Scope ``error`` to the reviewer.
+    """
+    reason = str(finish_reason or "").strip().lower()
+    if reason in _NON_VERDICT_FINISH_REASONS:
+        return True
+    node_type = field[1] if len(field) > 1 else ""
+    return reason == "error" and node_type == "reviewer"
+
+
+def _is_bytecode_only(paths) -> bool:
+    """True when every path is empty or only compiled Python bytecode.
+
+    The kickoff's literal set: ``__pycache__/`` and ``*.py[co]``. An implementer
+    whose only "change" is a compiled artifact changed no source, so a base
+    that already passes must not be revised (run-1792136293-92791).
+    """
+    for path in paths or []:
+        rel = str(path).replace("\\", "/").strip()
+        if not rel:
+            continue
+        if rel.endswith((".pyc", ".pyo")):
+            continue
+        if "__pycache__/" in rel or rel == "__pycache__":
+            continue
+        return False
+    return True
+
+
+def _read_json_object(path):
+    """The JSON object at ``path``, or None when absent/unreadable/not a dict."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _load_verifier_payload(path):
+    """Tolerant read of a verifier evidence file.
+
+    Evidence is stdout+stderr merged, so a warning line can precede the JSON
+    envelope (audit RB-02: 106/106 evidence files were not strict JSON). Try
+    strict first, then the levels parser that scans for the envelope.
+    """
+    payload = _read_json_object(path)
+    if payload is not None:
+        return payload
+    try:
+        return _levels.read_single_verifier_payload(path)
+    except Exception:  # noqa: BLE001 — evidence parsing is never fatal here
+        return None
+
+
+def _rc_is_zero(value) -> bool:
+    if isinstance(value, bool) or value is None:
+        return False
+    try:
+        return int(str(value).strip()) == 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _test_verifier_reports_no_delta(run_dir) -> bool:
+    """True when the test gate failed but both base and candidate exited 0.
+
+    Reads the evidence surfaces the verifier handler persists
+    (``verifier_<stem>.json``, e.g. ``verifier_test.json``) plus the
+    ``test-verdict.json`` mirror some recipes write. Only a *failing* verdict
+    (``pass`` explicitly False) qualifies: a green run is never rewritten as
+    ``not_needed``. RCs are read from the flat keys (framework-edit /
+    spec harness: ``candidate_rc``/``base_rc``), code-fix's ``post_rc``, the
+    nested ``replay`` dict, and finally the oracle's reason string.
+    """
+    if not run_dir or not os.path.isdir(run_dir):
+        return False
+    names = ["test-verdict.json"]
+    try:
+        names += sorted(
+            name for name in os.listdir(run_dir)
+            if name.startswith("verifier_") and name.endswith(".json")
+        )
+    except OSError:
+        pass
+    for name in names:
+        payload = _load_verifier_payload(os.path.join(run_dir, name))
+        if not isinstance(payload, dict) or payload.get("pass") is not False:
+            continue
+        replay = payload.get("replay")
+        if not isinstance(replay, dict):
+            replay = {}
+        candidate = payload.get("candidate_rc", payload.get("post_rc"))
+        if candidate is None:
+            candidate = replay.get("candidate_rc")
+        base = payload.get("base_rc")
+        if base is None:
+            base = replay.get("base_rc")
+        if candidate is None or base is None:
+            try:
+                blob = f"{payload.get('reason') or ''} {json.dumps(payload)}"
+            except (TypeError, ValueError):
+                blob = str(payload.get("reason") or "")
+            if "no candidate-pass/base-fail delta" in blob:
+                cand_match = re.search(r"candidate rc=(-?\d+)", blob)
+                base_match = re.search(r"base rc=(-?\d+)", blob)
+                if cand_match and base_match:
+                    candidate = cand_match.group(1)
+                    base = base_match.group(1)
+        if _rc_is_zero(candidate) and _rc_is_zero(base):
+            return True
+    return False
+
+
+def _implementer_diff_is_empty_or_bytecode(run_dir) -> bool:
+    """True when the implementer's recorded delta is empty or bytecode-only.
+
+    A missing or unreadable summary means *unknown*, never "no change": closing
+    a run as already-satisfied on evidence we could not read would hide real
+    work.
+    """
+    if not run_dir:
+        return False
+    payload = _read_json_object(os.path.join(run_dir, "implementer-summary.json"))
+    if payload is None or not isinstance(payload.get("files_changed"), list):
+        return False
+    return _is_bytecode_only(payload["files_changed"])
+
+
+def _already_satisfied_at_base(run_dir) -> bool:
+    """RB-18: the test gate's no-delta failure plus a no-op implementer.
+
+    No code round can improve a base that already passes when the implementer
+    changed nothing, so the run is terminal ``not_needed`` rather than revised.
+    """
+    return (
+        _test_verifier_reports_no_delta(run_dir)
+        and _implementer_diff_is_empty_or_bytecode(run_dir)
+    )
+
+
+def _spec_defect_report(run_dir):
+    """``(filename, first 300 chars)`` of an implementer-filed defect, or None."""
+    if not run_dir:
+        return None
+    for name in _SPEC_DEFECT_FILENAMES:
+        path = os.path.join(run_dir, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8", errors="replace") as handle:
+                return name, handle.read()[:_SPEC_DEFECT_REASON_LIMIT]
+        except OSError:
+            continue
+    return None
 
 
 def _verifier_stem(field) -> str:
