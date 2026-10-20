@@ -174,6 +174,85 @@ def _output_collision_count(root: str, out: str) -> int:
     return count
 
 
+_REPAIR_LOOP_NODE_TYPES = ("planner", "reflector")
+
+
+def _cycle_member_nodes(edges: list[tuple[str, str]]) -> set[str]:
+    """Every node that lies on a directed cycle of the full edge graph.
+
+    The compiler deliberately keeps non-control edges (``escalates_to``,
+    ``recursive`` back edges) out of the scheduling DAG, so a repair loop can
+    compile as acyclic while the *full* edge graph — which is what actually
+    re-runs nodes — is cyclic. Reachability back to the start is the definition
+    that matters here: a node is in a repair loop iff some edge path returns to
+    it. Small graphs, so plain DFS per node is plenty.
+    """
+    graph: dict[str, set[str]] = {}
+    for source, target in edges:
+        graph.setdefault(source, set()).add(target)
+        graph.setdefault(target, set())
+    on_cycle: set[str] = set()
+    for start in graph:
+        stack = list(graph.get(start, ()))
+        seen: set[str] = set()
+        while stack:
+            node = stack.pop()
+            if node == start:
+                on_cycle.add(start)
+                break
+            if node in seen:
+                continue
+            seen.add(node)
+            stack.extend(graph.get(node, ()))
+    return on_cycle
+
+
+def _check_repair_loop_nodes(wf: str, recipe: str, findings: Findings) -> None:
+    """Warn about prompt-less planner/reflector nodes inside a repair cycle.
+
+    Their early handlers ignore ``prompt_ref``, the node's lane and its declared
+    outputs — the planner prints ``[skip]`` and the reflector runs the global
+    reflect pipeline — so a cycle routed through one of them can never write the
+    artifact the loop needs (``reflector.json``/``replan.json``) or converge.
+    """
+    import yaml
+
+    try:
+        with open(wf) as f:
+            data = yaml.safe_load(f) or {}
+    except Exception:
+        return  # a malformed workflow is already an error
+    if not isinstance(data, dict):
+        return
+
+    nodes = [n for n in (data.get("nodes") or []) if isinstance(n, dict)]
+    edges = []
+    for edge in data.get("edges") or []:
+        if not isinstance(edge, dict):
+            continue
+        source = str(edge.get("from") or "").strip()
+        target = str(edge.get("to") or "").strip()
+        if source and target:
+            edges.append((source, target))
+    if not edges:
+        return
+
+    on_cycle = _cycle_member_nodes(edges)
+    for node in nodes:
+        name = str(node.get("name") or "").strip()
+        node_type = str(node.get("type") or "").strip()
+        if name not in on_cycle or node_type not in _REPAIR_LOOP_NODE_TYPES:
+            continue
+        if str(node.get("prompt_ref") or "").strip():
+            continue
+        findings.warn(
+            f"recipe {recipe} node '{name}' ({node_type}) is on a repair cycle "
+            f"but declares no prompt_ref — its early handler ignores the node's "
+            f"prompt, lane and outputs, so the loop cannot converge",
+            f"add 'prompt_ref: prompts/{name}.md' to node {name} in {wf}",
+        )
+
+
 def _check_recipe(root: str, recipe: str, findings: Findings) -> None:
     recipe_dir = os.path.join(root, "recipes", recipe)
     if not os.path.isdir(recipe_dir):
@@ -213,6 +292,10 @@ def _check_recipe(root: str, recipe: str, findings: Findings) -> None:
                 f"recipe {recipe} has an invalid recursion block",
                 str(exc),
             )
+        # A repair cycle routed through a prompt-less planner/reflector is a
+        # no-op: the early handler drops the node's prompt/lane/outputs, so the
+        # loop can never produce the artifact it re-reads. Warn pre-run.
+        _check_repair_loop_nodes(wf, recipe, findings)
 
     # artifact_contract.yaml: output-path collision guard
     ac = os.path.join(recipe_dir, "artifact_contract.yaml")

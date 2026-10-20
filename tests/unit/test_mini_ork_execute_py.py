@@ -25,8 +25,17 @@ from mini_ork.cli import execute_handlers as exh
 def _isolate_run_environment(monkeypatch):
     for name in (
         "MINI_ORK_RUN_DIR", "MINI_ORK_RECIPE", "MINI_ORK_PLAN_PATH",
-        "MINI_ORK_RUN_ID", "MINI_ORK_RECIPE_ROOT", "MINI_ORK_AGENTS",
-        "MO_TARGET_CWD", "MO_APPLY_IMPL_OUTPUT",
+        "MINI_ORK_RUN_ID", "MO_TARGET_CWD", "MO_APPLY_IMPL_OUTPUT",
+        # The executor honors this in _recipe_root(), overriding the explicit
+        # `root` these tests build under tmp_path. Under `mini-ork execute` it
+        # is always set, so leaving it ambient silently reads the checkout's
+        # recipes instead of the fixture's and makes the test order/environment
+        # dependent (contract lookups miss, statuses never reach "published").
+        "MINI_ORK_RECIPE_ROOT",
+        # A node lane inherits the campaign's agent map; leaving it ambient
+        # makes learning_static_lane resolve roles through that file instead of
+        # the per-test agents.yaml, so the routing parity cases flip.
+        "MINI_ORK_AGENTS",
     ):
         monkeypatch.delenv(name, raising=False)
 

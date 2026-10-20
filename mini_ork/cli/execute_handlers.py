@@ -767,8 +767,22 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     # planner/reflector don't dispatch an LLM — handled after the intervention gate
     # (bash routes them through the same gate then falls to their case). Early-phase
     # handlers are registered in EARLY_NODE_HANDLERS (see register_node_handler).
+    #
+    # …unless the node declares a prompt_ref. The early handlers ignore it
+    # entirely: the planner prints ``[skip]``, and the reflector runs the GLOBAL
+    # reflect pipeline synchronously BEFORE the node_start event below — so a
+    # recipe's prompt-bearing reflector/planner is a silent no-op that writes
+    # neither its declared artifact nor any node event (run-1792151796-92942 was
+    # silent for 8978 s, and spec-driven-delivery's repair loop never converged).
+    # Fall through to the main path for those so they get the researcher
+    # treatment: prompt assembly from prompt_ref, the node's lane and declared
+    # outputs, and a normal node_start/node_end pair. Prompt-less nodes keep the
+    # early behaviour unchanged.
+    prompt_bearing_early = (
+        node_type in PROMPT_BEARING_EARLY_NODE_TYPES and bool(prompt_ref.strip())
+    )
     early_handler = EARLY_NODE_HANDLERS.get(node_type)
-    if early_handler is not None:
+    if early_handler is not None and not prompt_bearing_early:
         return early_handler(root)
 
     # Capability assert (bash:2296-2306): a node's requires_capabilities must be
@@ -896,7 +910,14 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     # Node-type handler registry (OCP): a new node type is
     # register_node_handler("type", fn) — no edit to this function. Unknown
     # types fall through to (0, "done") exactly as the bash catch-all did.
+    #
+    # A prompt-bearing planner/reflector skipped its early handler above and has
+    # no registry entry of its own: run it through the researcher handler so it
+    # gets the same prompt/lane/outputs/events contract as any other LLM node.
+    # Prompt-less nodes never reach here — the early handler returned already.
     handler = NODE_HANDLER_REGISTRY.get(node_type)
+    if handler is None and prompt_bearing_early:
+        handler = _handle_researcher
     if handler is None:
         return 0, "done"
     # Emit node_start immediately before the handler runs, reusing the already
@@ -1191,6 +1212,13 @@ def scope_guard_block(run_dir: str) -> str:
         "--- /resource guard ---\n")
 
 
+# Early-phase node types whose handler ignores the node's declared prompt_ref,
+# lane and outputs. A node of one of these types that DOES declare a prompt_ref
+# is a real LLM node and is dispatched through the main (researcher) path
+# instead; see the early-handler dispatch site in ``dispatch_node``.
+PROMPT_BEARING_EARLY_NODE_TYPES = frozenset({"planner", "reflector"})
+
+
 def _handle_planner_early(root):
     print("  [skip] planner node handled by the Python plan runtime")
     return 0, "done"
@@ -1200,29 +1228,41 @@ def _handle_reflector_early(root):
     # Preserve bash's `… || true`: reflection is a side-channel and must
     # never fail the workflow node. Capturing output also prevents the
     # reflect report from leaking into execute's stdout contract.
+    #
+    # Timed and reported on every return path: this handler runs before the
+    # node_start event, so without a line of its own a long (or hung) pass is
+    # invisible in execute.log — run-1792151796-92942 was silent for 8978 s.
+    started_at = time.time()
+    started_clock = time.strftime("%H:%M:%S", time.localtime(started_at))
     try:
-        proc = subprocess.run(
-            [sys.executable, "-m", "mini_ork.cli.reflect"],
-            capture_output=True,
-            timeout=_reflect_timeout_seconds(),
-            env={**_module_env(root), "MINI_ORK_ROOT": root},
-        )
-    except subprocess.TimeoutExpired:
-        # Surface it: a silently-skipped reflection is how a gradient outage
-        # stayed invisible for hours (the learning loop read as "nothing to
-        # learn" while dispatch was actually refused).
-        print("  [reflect] timed out — reflection skipped this node "
-              "(learning loop lags; run `mini-ork reflect` to catch up)",
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "mini_ork.cli.reflect"],
+                capture_output=True,
+                timeout=_reflect_timeout_seconds(),
+                env={**_module_env(root), "MINI_ORK_ROOT": root},
+            )
+        except subprocess.TimeoutExpired:
+            # Surface it: a silently-skipped reflection is how a gradient outage
+            # stayed invisible for hours (the learning loop read as "nothing to
+            # learn" while dispatch was actually refused).
+            print("  [reflect] timed out — reflection skipped this node "
+                  "(learning loop lags; run `mini-ork reflect` to catch up)",
+                  file=sys.stderr)
+            return 0, "done"
+        except OSError as exc:
+            print(f"  [reflect] could not launch reflection ({exc})", file=sys.stderr)
+            return 0, "done"
+        if proc.returncode != 0:
+            tail = (proc.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+            note = tail[-1] if tail else f"rc={proc.returncode}"
+            print(f"  [reflect] reflection reported a problem: {note[:200]}",
+                  file=sys.stderr)
+        return 0, "done"
+    finally:
+        duration_s = max(0.0, time.time() - started_at)
+        print(f"  [reflect] started {started_clock} duration {duration_s:.1f}s",
               file=sys.stderr)
-        return 0, "done"
-    except OSError as exc:
-        print(f"  [reflect] could not launch reflection ({exc})", file=sys.stderr)
-        return 0, "done"
-    if proc.returncode != 0:
-        tail = (proc.stderr or b"").decode("utf-8", "replace").strip().splitlines()
-        note = tail[-1] if tail else f"rc={proc.returncode}"
-        print(f"  [reflect] reflection reported a problem: {note[:200]}", file=sys.stderr)
-    return 0, "done"
 
 
 EARLY_NODE_HANDLERS: dict[str, Callable] = {
@@ -1397,7 +1437,7 @@ def _handle_researcher(ctx: NodeDispatch):
         fr = finish_reason_for_failure(rc, result)
         declared = _declared_node_output_paths(ctx) or [out_file]
         if not _completed_via_artifacts(ctx, declared, _dispatch_started_at(marker), rc, fr):
-            ctx.trace(ctx.node_id, "failure", "researcher", out_file, "", fr)
+            ctx.trace(ctx.node_id, "failure", ctx.node_type, out_file, "", fr)
             return 1, fr
         # The agent's own files are the deliverable; partial stdout from an
         # aborted dispatch must not overwrite them.
@@ -1409,9 +1449,9 @@ def _handle_researcher(ctx: NodeDispatch):
     except OSError:
         pass
     if not ctx.publish_declared_outputs():
-        ctx.trace(ctx.node_id, "failure", "researcher", out_file, "", "artifact_contract")
+        ctx.trace(ctx.node_id, "failure", ctx.node_type, out_file, "", "artifact_contract")
         return 1, "artifact_contract"
-    ctx.trace(ctx.node_id, "success", "researcher", out_file, "", "done")
+    ctx.trace(ctx.node_id, "success", ctx.node_type, out_file, "", "done")
     ctx.charge()
     return 0, "done"
 
