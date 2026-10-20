@@ -32,11 +32,16 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
-__all__ = ["owner", "fix_steps", "lane_repair_message", "notify"]
+__all__ = [
+    "owner", "fix_steps", "lane_repair_message", "notify",
+    "settle_gates_for_run",
+]
 
 GATE_ID = "retry_precondition"  # written into mo_inbox_gates.gate_id
 PHASE = "retry"  # written into mo_inbox_gates.phase
@@ -1149,4 +1154,104 @@ def supersede_gates_for_target(
             closed.append(run_dir.name)
         except Exception:  # noqa: BLE001
             continue
+    return closed
+
+
+def settle_gates_for_run(
+    home: str | Path,
+    run_id: str,
+    reason: str,
+    *,
+    db_path: str | Path | None = None,
+) -> list[int]:
+    """Mark every still-pending gate of ``run_id`` as ``superseded``.
+
+    Called when a run publishes (the terminal transition) or when a recovery
+    execution leaves it published: the gate asked the operator to decide
+    something about work that is now settled, so leaving it ``pending`` keeps
+    ``blocks_dispatch_for`` blocking a relaunch forever (RB-17: gates 57/58/59
+    stayed pending for days on three published runs).
+
+    A gate belongs to the run when any of its run-identifying columns names it:
+    ``feature`` (the retry gate's producer), ``blocks_dispatch_for`` (node
+    review / merge approval) or ``context.run_id``. Only ``pending`` rows are
+    touched — an already-approved/rejected gate keeps its outcome — which also
+    makes a second call a no-op. ``superseded`` is not one of
+    ``oversight_inbox.RESOLVABLE`` and the canonical DDL's CHECK omits it, so
+    the write goes through this module's own connection with
+    ``PRAGMA ignore_check_constraints``; the resolution timestamp and the note
+    still land on the row, so a reader sees *why* it closed.
+
+    Fail-soft: a missing DB, a missing table or a bad row is skipped, never
+    raised — callers run this from publish/teardown paths that must not fail.
+    Returns the resolved ``inbox_id`` values.
+    """
+    home = Path(home)
+    run_id = str(run_id or "").strip()
+    closed: list[int] = []
+    if not run_id:
+        return closed
+    db = Path(db_path) if db_path is not None else home / "state.db"
+    if not db.is_file():
+        return closed
+    try:
+        from mini_ork.gates import oversight_inbox
+
+        rows = oversight_inbox.pending(db_path=str(db))
+    except Exception:  # noqa: BLE001 — a gating hiccup must not fail a publish
+        return closed
+    note = (reason or "run published").strip()
+    if not note.lower().startswith("superseded"):
+        note = f"superseded: {note}"
+    for row in rows:
+        try:
+            ctx = row.get("context")
+            ctx = ctx if isinstance(ctx, dict) else {}
+            if not (
+                str(row.get("feature") or "") == run_id
+                or str(row.get("blocks_dispatch_for") or "") == run_id
+                or str(ctx.get("run_id") or "") == run_id
+            ):
+                continue
+            iid = int(row.get("inbox_id"))
+            con = sqlite3.connect(str(db), timeout=5.0)
+            try:
+                con.execute("PRAGMA ignore_check_constraints = ON")
+                cur = con.execute(
+                    "UPDATE mo_inbox_gates "
+                    "   SET status = 'superseded', resolved_at = ?, "
+                    "       review_note = ? "
+                    " WHERE inbox_id = ? AND status = 'pending'",
+                    (time.time(), note, iid),
+                )
+                con.commit()
+                resolved = cur.rowcount == 1
+            finally:
+                con.close()
+            if not resolved:
+                continue
+            closed.append(iid)
+        except Exception:  # noqa: BLE001
+            continue
+    # Mirror ``supersede_gates_for_target``: a retry-gate pointer that names a
+    # gate we just closed carries the same marker, so ``repair_cmd``'s sweep
+    # skips the run even before it re-reads the gate row.
+    pointer = _run_dir(home, run_id) / GATE_POINTER_FILENAME
+    try:
+        if closed and pointer.is_file():
+            body = json.loads(pointer.read_text(encoding="utf-8"))
+            if isinstance(body, dict):
+                try:
+                    pid = int(body.get("inbox_id"))
+                except (TypeError, ValueError):
+                    pid = None
+                if pid in closed:
+                    body["abandoned"] = True
+                    body["superseded"] = note
+                    pointer.write_text(
+                        json.dumps(body, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
+    except (OSError, ValueError, TypeError):
+        pass
     return closed

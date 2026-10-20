@@ -537,6 +537,18 @@ def _decide_policy(home: Path, run_id: str,
                    else "waiting on a fix epic",
             fix_epic_id=fix_epic_id or None,
         )
+    # A run under human review is not a failure for this loop to repair. This
+    # rule sits BEFORE rule 1 because a stale ``verdict.json`` that still says
+    # "withheld" let a ``reviewing`` run through it (hr-smoke-b-152611: after a
+    # human approved gate 43, auto-repair ``prove`` re-ran the implementer and
+    # the run parked again on gate 45). ``.review-pause`` is the executor's
+    # parked-for-review sidecar; a run whose status moved past ``reviewing``
+    # but still carries it is still owned by the human. Placed after the
+    # opt-out and the parked-on-fix guard so those keep precedence.
+    if status == "reviewing":
+        return _decision("none", reason="review-gated (status=reviewing)")
+    if (run_dir / ".review-pause").exists():
+        return _decision("none", reason="review-gated (.review-pause present)")
     events = _events(home, run_id)
     # Rule 1 is "the run is not failed/rolled_back". A withheld publish counts
     # as failed even when the status flag disagrees (see ``_is_withheld``): the
@@ -801,27 +813,64 @@ def _is_infra(home: Path, run_id: str, hint: dict[str, Any] | None,
     return False
 
 
+def _current_run_cost(home: Path, run_id: str) -> float | None:
+    """The run's cumulative ``task_runs.cost_usd``; ``None`` when unreadable.
+
+    Reads over a fresh connection instead of the process-wide ``db_for`` cache:
+    a budget snapshot must reflect the row *right now*, and a cached handle can
+    be pointed at a path that was replaced since it was opened.
+    """
+    import sqlite3
+
+    db = Path(home) / "state.db"
+    if not db.is_file():
+        return None
+    try:
+        con = sqlite3.connect(str(db), timeout=5.0)
+    except sqlite3.Error:
+        return None
+    try:
+        row = con.execute(
+            "SELECT cost_usd FROM task_runs WHERE id = ? LIMIT 1", (run_id,)
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+    if not row:
+        return None
+    try:
+        return float(row[0] or 0.0)
+    except (TypeError, ValueError):
+        return None
+
+
 def _cost_since_first_repair(home: Path, run_id: str,
                              attempts: list[dict[str, Any]]) -> float | None:
-    """The run's ``cost_usd`` when at least one repair has been attempted.
+    """Spend since the FIRST repair attempt, not the run's lifetime cost.
 
-    The kickoff says "cost since the first repair"; ``task_runs.cost_usd`` is the
-    run's cumulative spend, the best available proxy (and the one the retry hint
-    already reads). ``None`` when there are no attempts or the DB is unreadable.
+    RB-19: learning-judge-4l was refused with "repair budget exceeded ($16.12 >
+    $10.00)" although the repair had spent ~$0 — the check compared the whole
+    run's cumulative ``task_runs.cost_usd`` against the cap. ``apply`` now
+    stamps ``cost_usd_at_start`` on the first attempt; the budget is the
+    difference between the current cumulative cost and that snapshot. A legacy
+    ``repair.json`` with no snapshot falls back to the cumulative value (the
+    pre-RB-19 behaviour) so an old record is never silently under-counted.
+    ``None`` when there are no attempts or the DB is unreadable.
     """
     if not attempts:
         return None
-    try:
-        from mini_ork.web.db import db_for
-        db = db_for(Path(home))
-        if not db.has_table("task_runs"):
-            return None
-        row = db.row("SELECT cost_usd FROM task_runs WHERE id = ? LIMIT 1", (run_id,))
-        if not row:
-            return None
-        return float(row.get("cost_usd") or 0.0)
-    except Exception:  # noqa: BLE001
+    current = _current_run_cost(home, run_id)
+    if current is None:
         return None
+    first = attempts[0] if isinstance(attempts[0], dict) else {}
+    snapshot = first.get("cost_usd_at_start")
+    if snapshot is None:
+        return current
+    try:
+        return max(0.0, current - float(snapshot))
+    except (TypeError, ValueError):
+        return current
 
 
 # ── feedback file (revise / prove) ───────────────────────────────────────────
@@ -1145,6 +1194,14 @@ def apply(home: Path, run_id: str, decision: dict[str, Any], *,
                                 ("rule_id", "layer", "stage", "node",
                                  "confidence", "routes_to", "summary")}
     prior_attempts = len(attempts)
+    if prior_attempts == 0:
+        # RB-19: snapshot the run's cumulative spend BEFORE this first repair
+        # so the budget rule counts only what the repair loop itself spends.
+        # First attempt only — every later attempt is measured from the same
+        # baseline.
+        cost_at_start = _current_run_cost(home, run_id)
+        if cost_at_start is not None:
+            attempt["cost_usd_at_start"] = cost_at_start
     attempts.append(attempt)
     repair["attempts"] = attempts
     # ``gave_up`` is the loop's own verdict: a stop rule fired, or at least one

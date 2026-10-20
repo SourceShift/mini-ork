@@ -1812,6 +1812,27 @@ def cli_main(argv: list[str] | None = None, *, execute_fn=None) -> int:
             retry_notify.notify(Path(home), handoff["run_id"])
         except Exception:  # noqa: BLE001
             pass
+    # ── settle gates (RB-17): a recovery execution that left the run PUBLISHED
+    # has answered whatever its pending gate was asking about, so the gate must
+    # stop blocking dispatch (gates 57/58/59 stayed pending for days on three
+    # published runs). One hook in this tail; keyed on the row's actual status
+    # so a failed revival (the common case) is untouched. Fail-soft: a gating
+    # hiccup must never change the recovery's exit code.
+    if exec_rc == 0 and handoff.get("db_path") and handoff.get("run_id"):
+        try:
+            from mini_ork.recovery import retry_notify  # noqa: PLC0415
+
+            if _task_run_status(
+                    str(handoff["db_path"]), str(handoff["run_id"])) == "published":
+                _settle_home = os.environ.get("MINI_ORK_HOME") or (
+                    os.path.dirname(str(handoff["db_path"])) or None)
+                if _settle_home:
+                    retry_notify.settle_gates_for_run(
+                        Path(_settle_home), str(handoff["run_id"]),
+                        "run published — pending gates settled",
+                        db_path=handoff["db_path"])
+        except Exception:  # noqa: BLE001
+            pass
     # ── auto-repair: a revived run that fails again re-enters the loop. Mirror
     # ``mini_ork.cli.main``'s hook (kickoff auto-repair-loop). UNCONDITIONAL —
     # a withdrawn publish sets status='failed' while exec_rc == 0 — and quiet:

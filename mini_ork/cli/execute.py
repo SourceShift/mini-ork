@@ -2098,6 +2098,19 @@ def set_status(db, run_id, new_status, *, dry_run=False):
             time.sleep(0.5 * (attempt + 1))
     if last_err is not None:
         raise RuntimeError(f"set_status({new_status!r}) for {run_id} could not be written: {last_err}") from last_err
+    if new_status == "published":
+        # RB-17: the run's own pending gates must stop blocking dispatch the
+        # moment it publishes. This is the single status funnel the publisher
+        # (and the no-publisher finalize path) writes through; gate settle is
+        # fail-soft on purpose — a gating hiccup must never fail a publish.
+        try:
+            from mini_ork.recovery import retry_notify  # noqa: PLC0415
+
+            retry_notify.settle_gates_for_run(
+                os.path.dirname(os.path.abspath(db)), run_id,
+                "run published — pending gates settled")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def charge_node_cost(db, run_id, cost_file="", *, dry_run=False, root=None):
