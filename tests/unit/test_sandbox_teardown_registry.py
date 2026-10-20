@@ -24,6 +24,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 import uuid
 from pathlib import Path
 from typing import Any
@@ -162,6 +163,49 @@ def test_registered_node_provider_is_swept_by_all_and_by_name(
 
     only_provider = sandbox_reaper.reap_sandboxes(backend="fakecloud", max_age_s=10)
     assert only_provider == {"fakecloud": ["sb-1", "sb-2"]}
+
+
+def test_daytona_sweep_with_credentials_reaches_the_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RBF-50: credentials must still enable the sweep — the gate is not a drop.
+
+    With a dummy ``DAYTONA_API_KEY`` the preflight passes, so ``reap`` reaches
+    ``list_sandboxes``; the stub ``daytona`` module records that the SDK seams
+    ran. Without the key the same call must import nothing (the fresh-process
+    case below pins that)."""
+    providers = _fake_providers(monkeypatch)
+    calls: list[str] = []
+
+    class _StubDaytonaClient:
+        def __init__(self, config: Any) -> None:  # noqa: ARG002 — config is opaque
+            calls.append("client")
+
+        def list(self, query: Any) -> list[Any]:  # noqa: ARG002 — empty sweep
+            calls.append("list")
+            return []
+
+    def _config(**kwargs: Any) -> Any:
+        return kwargs
+
+    def _list_query(**kwargs: Any) -> Any:
+        calls.append("query")
+        return kwargs
+
+    stub = types.SimpleNamespace(
+        DaytonaConfig=_config,
+        Daytona=_StubDaytonaClient,
+        ListSandboxesQuery=_list_query,
+    )
+    monkeypatch.setitem(sys.modules, "daytona", stub)
+
+    assert "daytona" in providers.known_node_providers()
+    result = sandbox_reaper.reap_sandboxes(
+        backend="daytona", dry_run=True, env={"DAYTONA_API_KEY": "dummy"}
+    )
+
+    assert result == {"daytona": []}
+    assert calls == ["query", "client", "list"]  # the provider was reached
 
 
 def test_raising_node_provider_reports_empty(monkeypatch: pytest.MonkeyPatch) -> None:

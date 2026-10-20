@@ -56,7 +56,11 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
-from mini_ork.remote.providers.base import NodeEndpoint, ProviderUnavailableError
+from mini_ork.remote.providers.base import (
+    NodeEndpoint,
+    ProviderUnavailableError,
+    resolve_provider_secret,
+)
 
 __all__ = [
     "BootOptions",
@@ -390,6 +394,17 @@ class SandboxNodeProvider:
             sandbox.delete(wait=False)
 
     def reap(self, *, max_age_s: int, dry_run: bool, env: Mapping[str, str]) -> list[str]:
+        # Credential preflight BEFORE ``list_sandboxes``: a sweep on a host where
+        # the cloud SDK is installed but the provider is unconfigured must not
+        # import that SDK (RBF-50). ``credential_keys`` declares what this
+        # provider reads; resolve each through the vault chain so a key held in
+        # the secure tier still enables the sweep. Fail-open, exactly as the
+        # SDK-missing/API-down path below.
+        try:
+            for key in self.credential_keys:
+                resolve_provider_secret(key, env, provider=self.name)
+        except Exception:  # noqa: BLE001 — no credential or unusable vault → reap 0
+            return []
         try:
             found = list(self.list_sandboxes(env))
         except Exception:  # noqa: BLE001 — fail-open: no SDK, no key, API down
