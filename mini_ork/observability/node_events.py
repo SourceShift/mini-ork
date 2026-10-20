@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import time
@@ -155,15 +156,6 @@ _CHECK_FINISH_FALLBACKS: dict[str, str] = {
     # RBF-22a: a remote exec/read timeout is a timeout at heart.
     "remote_unavailable": "timeout",
 }
-
-
-def _column_finish_reason(reason: Any) -> str | None:
-    """The ``finish_reason`` column value for a rejected precise ``reason``.
-
-    ``None`` means "write NULL", the pre-existing CHECK-recovery behaviour
-    for the reasons the enum lacks and this table does not map.
-    """
-    return _CHECK_FINISH_FALLBACKS.get(str(reason or ""))
 
 
 def _default_extra_json() -> str:
@@ -307,6 +299,90 @@ def mo_run_emit(
     )
 
 
+#: Finish reasons that end a node without making it a failure. Used only to
+#: pick the CLOSEST legal value for the indexed column when migration 0021's
+#: CHECK rejects the exact reason; the exact reason always stays in the
+#: payload, which is what readers parse.
+_ABSTAIN_LIKE_FINISH_REASONS = frozenset({
+    "publish_abstain",
+    "levels_unverified",
+    "impl_no_changes",
+    "abstain",
+    "skipped",
+})
+
+#: Migration 0021 adds the column with ``ALTER TABLE ... ADD COLUMN
+#: finish_reason TEXT NULL CHECK (... IN (...))``; SQLite folds that definition
+#: into the run_events DDL kept in ``sqlite_master``. Parse the vocabulary from
+#: there so the mapping can only ever choose a value the schema accepts.
+_FINISH_REASON_CHECK_RE = re.compile(
+    r"finish_reason[\s\S]{0,400}?CHECK\s*\(", re.IGNORECASE
+)
+
+
+def _finish_reason_vocabulary(con: sqlite3.Connection) -> set[str]:
+    """The legal ``run_events.finish_reason`` values, read from the schema.
+
+    Returns an empty set when the column has no CHECK (pre-0021 DB) or the
+    table is absent — callers then keep the exact reason untouched.
+    """
+    row = con.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='run_events'"
+    ).fetchone()
+    if not row or not row[0]:
+        return set()
+    ddl = row[0]
+    m = _FINISH_REASON_CHECK_RE.search(ddl)
+    if not m:
+        return set()
+    start = m.end() - 1  # position of the CHECK's opening '('
+    depth = 0
+    for i in range(start, len(ddl)):
+        if ddl[i] == "(":
+            depth += 1
+        elif ddl[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return set(re.findall(r"'([^']+)'", ddl[start + 1:i]))
+    return set()
+
+
+def _column_finish_reason(reason: str, legal: set[str]) -> str | None:
+    """Closest legal COLUMN value for a reason outside the CHECK list.
+
+    Migration 0021's enum predates the executor's payload vocabulary
+    (``publish_abstain``, ``levels_unverified``, ``impl_no_changes``,
+    ``impl_moved_base``, ``config``, …). The column is indexed and read by
+    triage/retry, so it must hold a legal non-NULL value: abstain-like
+    outcomes map to ``abstain`` when the schema admits it (0021 does not) and
+    ``done`` otherwise; everything else is failure-like and maps to ``error``.
+    The exact reason is preserved in ``payload_json`` by the caller.
+    """
+    if not reason:
+        return None
+    if reason in legal:
+        return reason
+    # A precise neighbour beats the generic buckets (RBF-22a:
+    # remote_unavailable is a timeout at heart).
+    fallback = _CHECK_FINISH_FALLBACKS.get(reason)
+    if fallback and fallback in legal:
+        return fallback
+    lowered = reason.lower()
+    abstain_like = (
+        reason in _ABSTAIN_LIKE_FINISH_REASONS
+        or "abstain" in lowered
+        or "no_changes" in lowered
+        or "unverified" in lowered
+    )
+    for value in (("abstain", "done") if abstain_like else ("error",)):
+        if value in legal:
+            return value
+    # Unknown schema vocabulary: never invent a value outside the CHECK list.
+    if "done" in legal:
+        return "done"
+    return sorted(legal)[0] if legal else None
+
+
 def _insert_event(
     resolved_db: str,
     *,
@@ -347,15 +423,17 @@ def _insert_event(
             # artifact_contract, impl_no_changes, levels_unverified and more.
             # The rejected insert used to drop the whole node_end, so the node
             # read as still running: the retry hint called a deliberate publish
-            # withhold an interruption and auto-repair re-ran it. Keep the row;
-            # the exact reason stays in payload_json, which is what readers parse.
-            if "finish_reason" not in insert_cols or payload.get("finish_reason") is None:
+            # withhold an interruption and auto-repair re-ran it. Keep the row:
+            # map the reason to the closest LEGAL column value (read from the
+            # schema's CHECK list, never a hardcoded guess) and leave the exact
+            # reason in payload_json, which is what readers parse.
+            reason = payload.get("finish_reason")
+            if "finish_reason" not in insert_cols or reason is None:
                 raise
-            # Keep the row: the exact reason stays in payload_json. Prefer the
-            # closest CHECK-allowed value (remote_unavailable -> timeout) and
-            # fall back to NULL for reasons with no mapped neighbour.
-            values[insert_cols.index("finish_reason")] = _column_finish_reason(
-                payload.get("finish_reason"))
+            mapped = _column_finish_reason(str(reason), _finish_reason_vocabulary(con))
+            if mapped is None:
+                raise
+            values[insert_cols.index("finish_reason")] = mapped
             con.execute(insert, values)
         con.commit()
     except sqlite3.Error:

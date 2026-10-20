@@ -615,7 +615,12 @@ def mark_not_needed(
 def _close_dangling_node_events(db: StateDB, task_run_id: str) -> None:
     """Insert synthetic node_end(CRASH) for every node_start lacking a
     node_end. Without this, the UI DAG derives 'running' from the dangling
-    node_start forever (observed run-1781081895-31571, 2026-06-10)."""
+    node_start forever (observed run-1781081895-31571, 2026-06-10).
+
+    Starts and ends are paired PER NODE ID IN TIME ORDER (not as sets): a node
+    that ran twice (start, end, start) still has one unmatched start and gets
+    exactly one synthetic end. Set-based matching saw an end for the id and
+    left that second run open forever (4 runs, RB-34)."""
     import sqlite3
 
     db_path = str(db.db_path)
@@ -627,11 +632,16 @@ def _close_dangling_node_events(db: StateDB, task_run_id: str) -> None:
             """
             SELECT event_type, payload_json FROM run_events
              WHERE run_id = ? AND event_type IN ('node_start', 'node_end')
+             ORDER BY created_at, rowid
             """,
             (task_run_id,),
         ).fetchall()
-        started: dict[str, str] = {}
-        ended: set[str] = set()
+        # One entry per still-open start: node id → stack of node types. An end
+        # consumes the most recent open start; every start left over is a run
+        # that never reported its end and needs a synthetic one. Keeping a
+        # stack (rather than a bool per id) is what lets a re-run be closed
+        # while a balanced node gets nothing.
+        open_starts: dict[str, list[str]] = {}
         for ev_type, pj in rows:
             try:
                 p = json.loads(pj) if pj else {}
@@ -641,35 +651,59 @@ def _close_dangling_node_events(db: StateDB, task_run_id: str) -> None:
             if not nid:
                 continue
             if ev_type == "node_start":
-                started[nid] = p.get("node_type", "")
+                open_starts.setdefault(nid, []).append(p.get("node_type", ""))
             else:
-                ended.add(nid)
-        for nid, ntype in started.items():
-            if nid in ended:
-                continue
-            payload = {
-                "node_id": nid,
-                "node_type": ntype,
-                "verdict": "CRASH",
-                "interrupted": True,
-                # ``interrupted`` is in run_events.finish_reason's own CHECK
-                # vocabulary, so the synthetic row is self-describing for every
-                # reader instead of relying on them to interpret ``verdict``.
-                # Without it a reader keyed on finish_reason alone saw "" and
-                # reported the node "done" (run-1791930074-82118).
-                "finish_reason": "interrupted",
-                "duration_ms": 0,
-            }
-            con.execute(
-                """
-                INSERT INTO run_events(event_id, run_id, event_type, payload_json, created_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                # The run id keeps the key unique when several runs that share
-                # a node id are closed in the same second (the run reaper).
-                (f"evt-node_end-{task_run_id}-{nid}-killclose-{now}", task_run_id, "node_end",
-                 json.dumps(payload), now),
-            )
+                pending = open_starts.get(nid)
+                if pending:
+                    pending.pop()
+                # An end with no matching start is ignored: there is no
+                # "negative start" to close, and inventing one would pair a
+                # later start against it.
+        cols = {row[1] for row in con.execute("PRAGMA table_info(run_events)")}
+        has_finish_reason = "finish_reason" in cols
+        for nid, pending in open_starts.items():
+            for i, ntype in enumerate(pending):
+                payload = {
+                    "node_id": nid,
+                    "node_type": ntype,
+                    "verdict": "CRASH",
+                    "interrupted": True,
+                    # ``interrupted`` is in run_events.finish_reason's own CHECK
+                    # vocabulary, so the synthetic row is self-describing for
+                    # every reader instead of relying on them to interpret
+                    # ``verdict``. Without it a reader keyed on finish_reason
+                    # alone saw "" and reported the node "done"
+                    # (run-1791930074-82118).
+                    "finish_reason": "interrupted",
+                    "duration_ms": 0,
+                }
+                event_id = (
+                    # The run id keeps the key unique when several runs that
+                    # share a node id are closed in the same second (the run
+                    # reaper); ``i`` keeps it unique within one close when the
+                    # node ran more than once.
+                    f"evt-node_end-{task_run_id}-{nid}-killclose-{now}-{i}"
+                )
+                if has_finish_reason:
+                    # RB-34: write the indexed column, not just the payload —
+                    # a NULL reason is invisible to triage/retry readers.
+                    con.execute(
+                        """
+                        INSERT INTO run_events(event_id, run_id, event_type, payload_json, created_at, finish_reason)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (event_id, task_run_id, "node_end",
+                         json.dumps(payload), now, "interrupted"),
+                    )
+                else:
+                    con.execute(
+                        """
+                        INSERT INTO run_events(event_id, run_id, event_type, payload_json, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (event_id, task_run_id, "node_end",
+                         json.dumps(payload), now),
+                    )
         con.commit()
     except sqlite3.OperationalError:
         # run_events may not exist on very old state.dbs — best-effort.

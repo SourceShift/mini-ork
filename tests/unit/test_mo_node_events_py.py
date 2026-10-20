@@ -393,7 +393,8 @@ def tmp_db(tmp_path, monkeypatch):
                                     "impl_no_changes", "levels_unverified"])
 def test_a_finish_reason_outside_the_column_enum_keeps_the_node_end(tmp_db, reason):
     """The CHECK used to reject the insert and the whole node_end was lost; the
-    row now lands with the column NULL and the exact reason in the payload."""
+    row now lands with the column holding the closest LEGAL value (RB-34) and
+    the exact reason in the payload."""
     dbp = _seed_db(tmp_db)
     py.mo_node_end("run-i", "publisher", "publisher", 12, "", "", reason)
 
@@ -404,7 +405,11 @@ def test_a_finish_reason_outside_the_column_enum_keeps_the_node_end(tmp_db, reas
         con.close()
     assert len(rows) == 1, rows
     assert rows[0]["event_type"] == "node_end"
-    assert rows[0]["finish_reason"] is None
+    # 0021's enum has no 'abstain', so abstain-like reasons fall back to 'done'
+    # and failure-like ones map to 'error' — never NULL, never an illegal value.
+    assert rows[0]["finish_reason"] == (
+        "error" if reason == "artifact_contract" else "done"
+    )
     assert json.loads(rows[0]["payload_json"])["finish_reason"] == reason
 
 
