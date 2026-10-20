@@ -5,11 +5,14 @@ zero artifacts (kickoff lane-health-gate). The cost circuit used to trip per
 LLM call *inside* the run, so the failure looked like any other model failure
 — indistinguishable from one that tried. Refuse before the run starts:
 
-1. Reuse the dispatcher's own expressions to resolve every node's lane to a
-   real model: alias → routed lane (routing policy) → family
-   (``resolve_lane_family``). Pinned nodes short-circuit; submodes are unioned
-   best-effort from the registry, but a dynamic child is still preflight-guarded
-   on dispatch.
+1. Reuse the dispatcher's own expressions to resolve every *LLM-dispatching*
+   node's lane to a real model: alias → routed lane (routing policy) → family
+   (``resolve_lane_family``). Pinned nodes short-circuit. Nodes that never
+   dispatch an LLM — ``publisher`` / ``rollback``, and script verifiers whose
+   workflow entry sets ``verifier_ref`` without a ``prompt_ref`` — are dropped
+   from the resolve set, so a dead lane they are merely *configured* on can no
+   longer block a run (RB-23). Dynamically spawned children are still guarded
+   per dispatch, not statically.
 2. Batch-key ``providers.preflight`` over the deduped model set with the same
    scoped env :func:`dispatch_model` builds (``provider_environment`` — the
    persisted secret store merged under a user-exported env), so key detection
@@ -150,6 +153,70 @@ def _node_role(node_type: str) -> str:
     return node_type or ""
 
 
+#: Workflow node types that never call an LLM: they publish or unwind a run.
+#: RB-23: a run was blocked ``lane_unhealthy`` on a publisher lane that makes
+#: no LLM call, and on ``code-fix``'s script ``typecheck`` routed to kimi (401).
+_NON_LLM_NODE_TYPES = frozenset({"publisher", "rollback"})
+
+
+def _node_name_variants(node_id: str) -> tuple[str, ...]:
+    """The name spellings a workflow entry may use for one dispatch node id.
+
+    Plan decomposition ids and workflow ``name:`` values can differ only by
+    separator (``code_impact_lens`` vs ``code-impact-lens``); mirror
+    ``execute.nodes_from_plan``'s ``_wf_lookup`` so a node is recognised
+    whichever spelling the caller carries.
+    """
+    return (node_id, node_id.replace("-", "_"), node_id.replace("_", "-"))
+
+
+def _non_llm_workflow_nodes(workflow_path: str) -> set[str]:
+    """Names of workflow nodes that cannot dispatch an LLM.
+
+    The workflow entry — not the dispatch field tuple — is the authority the
+    kickoff names. A node is non-LLM when its ``type`` is ``publisher`` or
+    ``rollback``, or when it declares a ``verifier_ref`` and no ``prompt_ref``
+    (the deterministic-script-verifier signature used by ``code-fix``'s
+    ``typecheck``/``test`` and ``framework-edit``'s verifiers).
+
+    Best-effort by contract: an empty path, an unreadable file, malformed
+    YAML or an unexpected shape all return the empty set, and the caller keeps
+    today's behaviour (probe every node). A preflight gate that cannot read its
+    workflow must not silently shrink the probed set.
+    """
+    if not workflow_path:
+        return set()
+    try:
+        import yaml
+    except ImportError:  # pragma: no cover — PyYAML is a hard dependency
+        return set()
+    try:
+        with open(workflow_path, encoding="utf-8") as fh:
+            document = yaml.safe_load(fh)
+    except (OSError, ValueError, yaml.YAMLError):
+        # ValueError covers a non-UTF-8 workflow; YAMLError is not one.
+        return set()
+    if not isinstance(document, Mapping):
+        return set()
+    nodes = document.get("nodes")
+    if not isinstance(nodes, list):
+        return set()
+    out: set[str] = set()
+    for node in nodes:
+        if not isinstance(node, Mapping):
+            continue
+        name = str(node.get("name") or "")
+        if not name:
+            continue
+        node_type = str(node.get("type") or "")
+        # ``prompt_ref: null`` parses to None; never ``str(None)`` (truthy).
+        prompt_ref = str(node.get("prompt_ref") or "")
+        verifier_ref = str(node.get("verifier_ref") or "")
+        if node_type in _NON_LLM_NODE_TYPES or (verifier_ref and not prompt_ref):
+            out.add(name)
+    return out
+
+
 def resolve_dispatch_lanes(
     fields: Sequence[Sequence[str]],
     *,
@@ -157,8 +224,9 @@ def resolve_dispatch_lanes(
     home: str | os.PathLike[str] | None,
     task_class: str = "",
     environ: Mapping[str, str] | None = None,
+    workflow_path: str | None = None,
 ) -> list[DispatchLane]:
-    """For every dispatched node, decide the lane+model the dispatcher will use.
+    """For every LLM-dispatching node, decide the lane+model the dispatcher uses.
 
     Field tuple layout matches ``WorkflowNode.dispatch_fields`` (the legacy
     8-tuple ``execute.py`` builds at the recovery-filter step), so field
@@ -169,7 +237,17 @@ def resolve_dispatch_lanes(
     ``*_lens`` aliases so the preflight keys on a real provider model. The
     model is the dedup key for the probe, but every waiting node survives on
     the returned list so the message names each one.
+
+    Nodes that cannot dispatch an LLM are dropped first (RB-23): see
+    :func:`_non_llm_workflow_nodes`. The workflow is read from
+    ``workflow_path`` when given, else from ``MINI_ORK_WORKFLOW`` (set by the
+    run lifecycle); when no workflow can be read every node is kept, matching
+    the pre-RB-23 behaviour. A node whose id is absent from the workflow is
+    likewise kept — "not in this workflow" is not proof it cannot dispatch.
     """
+    non_llm = _non_llm_workflow_nodes(
+        workflow_path or _read_env(environ, "MINI_ORK_WORKFLOW", "")
+    )
     from mini_ork.dispatch import llm_dispatch, routing
 
     out: list[DispatchLane] = []
@@ -180,6 +258,8 @@ def resolve_dispatch_lanes(
         # always safe (the executor's own code uses ``(e.split(_SEP) + [""]*8)[:8]``).
         t = tuple(f) + ("",) * (8 - len(f))
         node_id = str(t[0] or "")
+        if non_llm and any(v in non_llm for v in _node_name_variants(node_id)):
+            continue
         node_type = str(t[1] or "")
         workflow_lane = str(t[6] or node_type)
         routed = routing.policy_route_lane(
