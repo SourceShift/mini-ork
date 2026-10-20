@@ -690,7 +690,10 @@ def test_publisher_contract_honors_recipe_root_overlay(tmp_path, monkeypatch):
     rc, fr = ex.publisher_node(
         str(engine), str(rd), db, "r1", "chapter-review", "chapter_review",
         review_file="", verdict_env="")
-    assert (rc, fr) == (0, "done")
+    # The overlay's `outputs: []` takes the no-commit path; RB-14 makes a run
+    # that committed nothing abstain rather than claim "published". rc 0 (not
+    # the engine contract's rc 1 _envsubst crash) still proves the overlay won.
+    assert (rc, fr) == (0, "publish_abstain")
 
 
 def test_live_implementer_applies_diff(tmp_path, monkeypatch):
@@ -890,7 +893,10 @@ def test_publisher_preserves_heterogeneous_run_local_artifacts(tmp_path, monkeyp
     verdict = run_dir / "verdict.json"
     diff.write_text("diff --git a/a b/a\n")
     ledger.write_text('{"features": []}\n')
-    verdict.write_text('{"pass": false}\n')
+    # A passing recipe verdict: this test is about preserving composite
+    # run-local artifacts byte-for-byte, and RB-02 now (correctly) refuses to
+    # publish a run whose own verdict.json says pass: false.
+    verdict.write_text('{"pass": true}\n')
     (recipe_dir / "artifact_contract.yaml").write_text(
         "source_artifact: ${MINI_ORK_RUN_DIR}/self-migrate.diff\n"
         "outputs:\n"
@@ -909,7 +915,7 @@ def test_publisher_preserves_heterogeneous_run_local_artifacts(tmp_path, monkeyp
     assert (rc, reason) == (0, "done")
     assert diff.read_text() == "diff --git a/a b/a\n"
     assert json.loads(ledger.read_text()) == {"features": []}
-    assert json.loads(verdict.read_text()) == {"pass": False}
+    assert json.loads(verdict.read_text()) == {"pass": True}
     assert statuses == ["published"]
 
 

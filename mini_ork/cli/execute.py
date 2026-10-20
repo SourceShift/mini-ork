@@ -560,6 +560,7 @@ def _emit_run_verdict(run_dir, fail_count, dispatched, *, dry_run=False, task_cl
         verdict = "pass"
     verdict_path = os.path.join(
         run_dir, "verdict.dryrun.json" if dry_run else "verdict.json")
+    recipe_fail_reason = ""
     if os.path.isfile(verdict_path):
         try:
             existing = json.load(open(verdict_path, encoding="utf-8"))
@@ -567,6 +568,14 @@ def _emit_run_verdict(run_dir, fail_count, dispatched, *, dry_run=False, task_cl
             existing = {}
         if isinstance(existing, dict) and existing.get("source") == "execute@run-level":
             return
+        if isinstance(existing, dict) and existing.get("pass") is False and not dry_run:
+            # RB-02 layer 4: a recipe's own verdict.json says the run failed.
+            # `fail_count` only counts node failures, so it reads 0 when every
+            # node exited cleanly while the recipe's evidence says pass: false
+            # (7 published runs carried exactly that contradiction). The
+            # recipe's evidence outranks the executor's bookkeeping.
+            verdict = "fail"
+            recipe_fail_reason = "recipe verdict.json pass=false"
         if not dry_run:
             # A recipe may own verdict.json as a detailed deliverable. Keep that
             # evidence intact and put executor bookkeeping beside it.
@@ -587,6 +596,9 @@ def _emit_run_verdict(run_dir, fail_count, dispatched, *, dry_run=False, task_cl
         # abstained, so the no-abstention bytes are unchanged.
         if abstained:
             payload["failure_kinds"] = abstained
+        # Same byte-stability rule: only a recipe-forced fail carries a reason.
+        if recipe_fail_reason:
+            payload["reason"] = recipe_fail_reason
         try:
             open(verdict_path, "w").write(
                 json.dumps(payload, separators=(",", ":"), ensure_ascii=False) + "\n")
@@ -602,9 +614,17 @@ def _emit_run_verdict(run_dir, fail_count, dispatched, *, dry_run=False, task_cl
         _settle_cn_outcomes(run_dir, verdict)
         return
     try:
-        open(verdict_path, "w").write(
-            '{"verdict":"%s","failed_nodes":%d,"dispatched":%d,"source":"execute@run-level"}\n'
-            % (verdict, fail_count, dispatched))
+        if recipe_fail_reason:
+            line = ('{"verdict":"%s","failed_nodes":%d,"dispatched":%d,'
+                    '"source":"execute@run-level","reason":%s}\n'
+                    % (verdict, fail_count, dispatched,
+                       json.dumps(recipe_fail_reason)))
+        else:
+            # The four-key shape is byte-stable (tests 8 / 11 pin it).
+            line = ('{"verdict":"%s","failed_nodes":%d,"dispatched":%d,'
+                    '"source":"execute@run-level"}\n'
+                    % (verdict, fail_count, dispatched))
+        open(verdict_path, "w").write(line)
     except OSError:
         return
     print(f"  [verdict] run-level {os.path.basename(verdict_path)}: {verdict} "

@@ -115,6 +115,138 @@ def _record_publish_abstain(run_dir, reason, detail):
         pass
 
 
+def _note(db, run_id, note):
+    """Append ``note`` to ``task_runs.notes``; never masks the publish refusal."""
+    if not db or not run_id or not os.path.isfile(db):
+        return
+    from mini_ork.verify import probe_validity as _pv  # noqa: PLC0415
+    _pv.record_note(db, run_id, note)
+
+
+def _run_verifier_envelopes(run_dir):
+    """``(stem, envelope)`` for every readable ``verifier_<stem>.json`` at the run root.
+
+    Read with :func:`mini_ork.verify.levels.read_single_verifier_payload`: the
+    file may carry stderr prose before the envelope, and only the file's own
+    single object is that verifier's verdict (a merged multi-object log is
+    ``None``, i.e. unreadable evidence, never an implicit pass).
+    """
+    if not run_dir:
+        return []
+    try:
+        names = sorted(name for name in os.listdir(run_dir)
+                       if name.startswith("verifier_") and name.endswith(".json"))
+    except OSError:
+        return []
+    out = []
+    for name in names:
+        envelope = _levels.read_single_verifier_payload(os.path.join(run_dir, name))
+        if isinstance(envelope, dict):
+            out.append((name[len("verifier_"):-len(".json")], envelope))
+    return out
+
+
+def _publish_truth_refusal(run_dir):
+    """``(reason, detail)`` when the run's own evidence says it must not publish.
+
+    RB-02 layer 4 / RB-14: the publisher shipped on the reviewer verdict alone,
+    so a run whose recipe ``verdict.json`` said ``pass: false`` (7 published
+    runs) or whose gating verifier failed still committed. A non-gating
+    ``pass: false`` is advisory and exempt; an abstaining verifier
+    (``failure_kind``) is the abstention gate's business, not a failed verdict.
+    """
+    if not run_dir:
+        return None
+    try:
+        with open(os.path.join(run_dir, "verdict.json"), encoding="utf-8") as fh:
+            recipe_verdict = json.load(fh)
+    except (OSError, ValueError):
+        recipe_verdict = None
+    if isinstance(recipe_verdict, dict) and recipe_verdict.get("pass") is False:
+        return ("recipe verdict.json pass=false",
+                "the recipe's own verdict.json declares pass: false")
+    for stem, envelope in _run_verifier_envelopes(run_dir):
+        if envelope.get("pass") is not False:
+            continue
+        # Only an explicit gating:false exempts — a missing key is gating.
+        if envelope.get("gating") is False:
+            continue
+        if _levels.abstain_kind(envelope):
+            continue
+        return (f"verifier {stem} pass=false",
+                f"verifier_{stem}.json declares pass: false and is gating")
+    return None
+
+
+def _workflow_has_reviewer(root, recipe):
+    """True when the recipe's workflow declares a reviewer-type node.
+
+    A reviewer-less recipe has no approval to wait for: its verifier envelopes
+    are the approval (docs run-1792397274-39629). Unreadable workflow data
+    fails closed — without proof that no reviewer exists, one is required.
+    """
+    if not recipe:
+        return True
+    for base in (_recipe_root(root), root):
+        workflow = os.path.join(base or "", "recipes", recipe, "workflow.yaml")
+        if not os.path.isfile(workflow):
+            continue
+        try:
+            import yaml  # noqa: PLC0415
+            data = yaml.safe_load(open(workflow, encoding="utf-8")) or {}
+        except Exception:  # noqa: BLE001 — unreadable workflow fails closed
+            return True
+        nodes = data.get("nodes") if isinstance(data, dict) else None
+        if not isinstance(nodes, list):
+            return True
+        for node in nodes:
+            if isinstance(node, dict) and str(
+                    node.get("type") or node.get("node_type") or "").strip().lower() == "reviewer":
+                return True
+        return False
+    return True
+
+
+def _mark_published(db, run_id):
+    """Set ``status='published'`` AND ``verdict='APPROVE'`` in one UPDATE (RB-28).
+
+    The publisher used to write only the status, so ``task_runs.verdict`` was
+    NULL on all 799 published rows and
+    :func:`mini_ork.orchestration.active_state_index._established_facts`
+    (``WHERE verdict = 'APPROVE'``) never had a fact to show the planner. The
+    two columns move together so a published row can never be verdict-less.
+    Terminal stamps match ``execute.set_status``.
+    """
+    if not db or not run_id or not os.path.isfile(db):
+        # No DB to write: keep the status-only shim's behavior (and its
+        # late-bound override in tests).
+        set_status(db, run_id, "published")
+        return None
+    import sqlite3  # noqa: PLC0415
+    import time  # noqa: PLC0415
+    now = int(time.time())
+    con = sqlite3.connect(db, timeout=15.0)
+    try:
+        con.execute("PRAGMA busy_timeout = 15000")
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute(
+            "UPDATE task_runs SET status = 'published', verdict = 'APPROVE', "
+            "updated_at = ?, ended_at = COALESCE(ended_at, ?), "
+            "duration_ms = CASE WHEN COALESCE(duration_ms, 0) = 0 "
+            "THEN MAX(COALESCE(ended_at, ?) - created_at, 0) * 1000 "
+            "ELSE duration_ms END WHERE id = ?",
+            (now, now, now, run_id))
+        con.commit()
+        row = con.execute(
+            "SELECT status, verdict FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+    finally:
+        con.close()
+    if row is not None and tuple(row) != ("published", "APPROVE"):
+        raise RuntimeError(
+            f"_mark_published({run_id!r}) did not persist (row says {tuple(row)!r})")
+    return None
+
+
 def _publisher_try_commit_files(root, target_repo, run_dir, review_file, verdict_env,
                                 recipe, node_desc, run_id):
     """Commit the run's ACCEPTED, AUTHORED patch in place on reviewer APPROVE.
@@ -169,10 +301,16 @@ def _publisher_try_commit_files(root, target_repo, run_dir, review_file, verdict
         verdict = "approve"
     if verdict != "approve":
         disp = verdict or (verdict_env or "").strip() or "<none>"
-        log(f"  [skip-publish] reviewer verdict (resolved: '{disp}') is not APPROVE — no commit")
+        msg = f"reviewer verdict (resolved: '{disp}') is not APPROVE — no commit"
+        log(f"  [skip-publish] {msg}")
+        # A skip with no abstain record used to leave the caller to mark the run
+        # "published" with nothing committed (RB-14, docs run-1792397274-39629).
+        _record_publish_abstain(run_dir, "publish-no-approval", msg)
         return False
     if not target_repo:
-        log("  [skip-publish] no target_repo resolved (MO_TARGET_CWD empty and git toplevel failed)")
+        msg = "no target_repo resolved (MO_TARGET_CWD empty and git toplevel failed)"
+        log(f"  [skip-publish] {msg}")
+        _record_publish_abstain(run_dir, "publish-no-target", msg)
         return False
     from mini_ork.cli import publisher_authored_patch as _pap  # noqa: PLC0415
     authored = _pap.resolve_authored_patch(run_dir, repo=target_repo)
@@ -362,6 +500,20 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
         if not ok:
             print("  [BLOCK] publisher: panel verdict is not approved — publish refused", file=sys.stderr)
             return 1, "verdict_fail"
+    # ── publish-truth precondition (RB-02 layer 4 / RB-14) ──────────────────
+    # The publisher ships only what was verified, BEFORE any commit on either
+    # delivery path (authored patch and outputs[] copy). A recipe verdict of
+    # pass:false, or a gating verifier envelope of pass:false, is a refusal even
+    # when a reviewer APPROVED: 7 published runs carried exactly that
+    # contradiction. Exit 0 so no rollback discards the work left in the tree.
+    refusal = _publish_truth_refusal(run_dir)
+    if refusal is not None:
+        reason, detail = refusal
+        print(f"  [skip-publish] {reason}")
+        _record_publish_abstain(run_dir, reason, detail)
+        _note(db, run_id, f"publisher: {reason} — publish withheld")
+        set_status(db, run_id, "failed")
+        return 0, "publish_abstain"
     # ── verifier abstention gate (§failure_kind, audit 2026-10-11) ──────────
     # A verifier that could not run its tool abstained. The level-vector gate
     # below cannot catch this: `recursive_validate_impl` declares no required
@@ -484,7 +636,16 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
         abstain_path = os.path.join(run_dir, _PUBLISH_ABSTAIN_FILE) if run_dir else ""
         if abstain_path and os.path.isfile(abstain_path):
             os.remove(abstain_path)  # a stale record from an earlier attempt
-        _publisher_try_commit_files(root, target_repo, run_dir, review_file, verdict_env,
+        # A reviewer-less workflow has no approval to wait for: every verifier
+        # envelope passing IS the approval (docs run-1792397274-39629). Fail
+        # closed on no evidence at all — an unverified run approves nothing.
+        commit_verdict_env = verdict_env
+        envelopes = _run_verifier_envelopes(run_dir)
+        if (not _workflow_has_reviewer(root, recipe or "")
+                and envelopes
+                and all(envelope.get("pass") is True for _stem, envelope in envelopes)):
+            commit_verdict_env = "approve"
+        _publisher_try_commit_files(root, target_repo, run_dir, review_file, commit_verdict_env,
                                     recipe or "code-fix", os.environ.get("MINI_ORK_NODE_DESC", "implementer"),
                                     run_id or "local")
         if abstain_path and os.path.isfile(abstain_path):
@@ -509,9 +670,16 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
             # rollback discards the work left in the tree.
             print("  [ABSTAIN] publisher: the authored patch was not committed "
                   f"(see {_PUBLISH_ABSTAIN_FILE}) — publish withheld")
+            try:
+                with open(abstain_path, encoding="utf-8") as fh:
+                    abstain_reason = str(json.load(fh).get("reason") or "")
+            except (OSError, ValueError, AttributeError):
+                abstain_reason = ""
+            note_tail = f" ({abstain_reason})" if abstain_reason else ""
+            _note(db, run_id, f"publisher: nothing committed{note_tail} — publish withheld")
             set_status(db, run_id, "failed")
             return 0, "publish_abstain"
-        set_status(db, run_id, "published")
+        _mark_published(db, run_id)
         return 0, "done"
     # ── copy source_artifact → outputs[] + git-commit each.
     # B2-C: recipe-creator meta-recipe references ${MINI_ORK_DERIVED_RECIPE_NAME}; read
@@ -621,7 +789,7 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
               file=sys.stderr)
         return 1, "error"
     print(f"  [ok] publisher: {published_count} artifact(s) published")
-    set_status(db, run_id, "published")
+    _mark_published(db, run_id)
     return 0, "done"
 
 
