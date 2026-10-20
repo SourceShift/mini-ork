@@ -622,13 +622,39 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
         "}\n")
     sys.stdout.write(output)
     if dry_run == 0:
-        status = "failure" if verdict == "fail" else ("vacuous" if verdict == "vacuous" else "success")
-        _safe_trace_write(trace_store.enrich_stage_trace({
+        # A partial verdict means the gate FAILED: at least one verifier passed
+        # and at least one failed (a framework-edit whose test gate went red is
+        # the canonical case). It used to fall through to "success"/reward 1.0,
+        # so every learning ledger recorded a failed gate as a clean pass.
+        #
+        # The canonical execution_traces CHECK (db/migrations/0054) admits only
+        # ('success','failure','pending','running','vacuous','blocked') — there
+        # is no 'partial' member, and _safe_trace_write swallows the
+        # IntegrityError, which would leave the row stuck at 'running'. So a
+        # partial verdict is recorded as 'failure' and the reward carries the
+        # distinction instead: 0.5, strictly below pass's 1.0 and above fail's
+        # 0.0, so partial is visible as its own outcome rather than laundered
+        # into either neighbour.
+        if verdict == "partial":
+            status = "failure"
+        elif verdict == "fail":
+            status = "failure"
+        elif verdict == "vacuous":
+            status = "vacuous"
+        else:
+            status = "success"
+        payload = {
             "trace_id": trace_id,
             "task_class": task_class,
             "status": status,
             "verifier_output": {"verdict": verdict},
-        }, node_type="verifier", verdict=verdict), db)
+        }
+        if verdict == "partial":
+            payload["reward_value"] = 0.5
+            payload["reward_anchor"] = float(os.environ.get("MO_REWARD_ANCHOR", "0.5"))
+            payload["reward_direction"] = "higher_is_better"
+        _safe_trace_write(trace_store.enrich_stage_trace(
+            payload, node_type="verifier", verdict=verdict), db)
     return 1 if verdict == "fail" else 0
 
 
