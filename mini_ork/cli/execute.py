@@ -236,6 +236,20 @@ def infer_trace_code_region(payload: str) -> str:
     return ""
 
 
+def _is_bytecode_path(rel: str) -> bool:
+    """A compiled artifact is not a change (RB-43).
+
+    pytest's own run writes ``__pycache__/*.pyc`` into the target tree, so an
+    implementer that changed nothing otherwise looked ``implemented`` and its
+    diffstat counted bytecode. Exclude any path with a ``__pycache__`` segment
+    or a ``.pyc``/``.pyo`` suffix from every harvest surface. The check runs on
+    the repo-relative path (the segment test needs that form), not on the
+    absolute realpath callers record in ``files_changed``.
+    """
+    norm = rel.replace("\\", "/")
+    return "__pycache__" in norm.split("/") or norm.endswith((".pyc", ".pyo"))
+
+
 def _target_repo_changed_files() -> list[str]:
     """Repo-relative paths git sees as changed in the TARGET repo, so an
     implementer trace's code_region reflects the edited source — not the
@@ -845,6 +859,11 @@ def _parse_execute_argv(argv: list[str]) -> tuple[ExecuteArgs | None, int]:
     filter_node_type = ""
     dispatch_mode_override = ""
     plan_path = os.environ.get("MINI_ORK_PLAN_PATH", "")
+    # An explicit positional plan beats an inherited one (RB-03): a repair
+    # spawned from `mini-ork run` inherits MINI_ORK_PLAN_PATH yet also passes
+    # the plan positionally, and the env-seeded value used to make that argv a
+    # usage error. Track the positional separately so a second one still errors.
+    positional_plan: str | None = None
     from_node = ""
     recovery_active = False
     repair_budget = ""
@@ -877,10 +896,12 @@ def _parse_execute_argv(argv: list[str]) -> tuple[ExecuteArgs | None, int]:
         elif a.startswith("-"):
             sys.stderr.write(f"Unknown flag: {a}. Try --help\n"); return None, 2
         else:
-            if not plan_path:
-                plan_path = a; i += 1
+            if positional_plan is None:
+                positional_plan = a; i += 1
             else:
                 sys.stderr.write(f"Unexpected argument: {a}\n"); return None, 2
+    if positional_plan is not None:
+        plan_path = positional_plan
     return ExecuteArgs(dry_run, filter_node_type, dispatch_mode_override,
                        plan_path, from_node, recovery_active, repair_budget), 0
 
@@ -3465,7 +3486,7 @@ def _write_implementer_summary(run_dir, target, impl_log, *, since_mtime=None):
             if proc.returncode == 0:
                 for line in proc.stdout.splitlines():
                     rel = line.strip()
-                    if not rel:
+                    if not rel or _is_bytecode_path(rel):
                         continue
                     if argv is untracked_argv and rel in pre_untracked and snap_mtime is not None:
                         try:
@@ -3705,7 +3726,8 @@ def _append_untracked_hunks(diff_path, worktree, run_dir, specs):
     try:
         with open(diff_path, "a") as fh:
             for rel in (ls.stdout or "").split("\0"):
-                if not rel or rel in skip or rel.startswith(".mini-ork/"):
+                if (not rel or rel in skip or rel.startswith(".mini-ork/")
+                        or _is_bytecode_path(rel)):
                     continue
                 if specs and not _spec_matches(rel, specs):
                     continue
@@ -3746,7 +3768,8 @@ def _tree_has_no_change(worktree, baseline, specs):
             return False
         if proc.returncode != 0:
             return False
-        if any(line.strip() for line in proc.stdout.splitlines()):
+        if any(line.strip() and not _is_bytecode_path(line.strip())
+               for line in proc.stdout.splitlines()):
             return False
     return True
 

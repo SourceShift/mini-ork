@@ -159,17 +159,21 @@ def test_cli_main_still_pops_recovery_env_keys(
     assert set(seen["recovery_at_call"].values()) == {ABSENT}
 
 
-def test_parser_still_rejects_positional_with_env_plan(
+def test_parser_positional_plan_beats_inherited_env_plan(
         isolated_env, tmp_path):
-    """``cli/execute.py`` is out of scope: the env-vs-positional conflict must
-    stay a parser error, which is why the fix lives in the recover env."""
-    stale = str(tmp_path / "x" / "plan.json")
+    """Defence in depth with the recover env pop (RB-03): even when a stale
+    ``MINI_ORK_PLAN_PATH`` is inherited, an explicit positional plan wins
+    instead of being rejected as an "Unexpected argument" (RB-03 robustness
+    half, delivered with RB-43)."""
+    stale = str(tmp_path / "x" / "stale-plan.json")
+    explicit = str(tmp_path / "y" / "plan.json")
     os.environ["MINI_ORK_PLAN_PATH"] = stale
 
-    args, rc = _parse_execute_argv([stale, "--recovery"])
+    args, rc = _parse_execute_argv([explicit, "--recovery"])
 
-    assert args is None
-    assert rc == 2
+    assert args is not None
+    assert rc == 0
+    assert args.plan_path == explicit
 
 
 def test_spawn_recover_env_drops_only_plan_path(
