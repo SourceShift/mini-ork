@@ -253,14 +253,29 @@ def _notes(home: Path, run_id: str) -> str:
         return ""
 
 
+def _is_attempt_marker(segment: str) -> bool:
+    """``attempt <n> started <UTC iso>`` — the live-status attempt boundary."""
+    parts = str(segment or "").split(" ", 3)
+    return (len(parts) >= 3 and parts[0] == "attempt"
+            and parts[1].isdigit() and parts[2] == "started")
+
+
 def _note_segments(home: Path, run_id: str) -> list[str]:
     """The non-empty ``"; "``-separated segments of ``task_runs.notes``.
 
     The exact split ``auto_repair.decide`` uses, so the two never disagree about
-    whether a note is present.
+    whether a note is present. Only segments AFTER the last ``attempt <n>
+    started`` marker are returned: the notes column is append-only, so a
+    revived run still carries the dead attempt's ``reaped:`` line and would
+    otherwise be diagnosed as a dispatcher death ten hours old (RB-11/RB-16).
     """
     notes = _notes(home, run_id)
-    return [seg for seg in notes.split("; ") if seg.strip()]
+    segments = [seg for seg in notes.split("; ") if seg.strip()]
+    last_marker = -1
+    for index, segment in enumerate(segments):
+        if _is_attempt_marker(segment.strip()):
+            last_marker = index
+    return segments[last_marker + 1:]
 
 
 def _levels_ok(run_dir: Path) -> bool | None:

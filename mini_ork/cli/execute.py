@@ -570,7 +570,8 @@ def _settle_cn_outcomes(run_dir: str, verdict: str) -> dict:
     return report
 
 
-def _emit_run_verdict(run_dir, fail_count, dispatched, *, dry_run=False, task_class=""):
+def _emit_run_verdict(run_dir, fail_count, dispatched, *, dry_run=False, task_class="",
+                      recovery=False):
     # A rehearsal must not occupy the run's own record. A nested lifecycle that
     # inherits MINI_ORK_RUN_ID shares the run dir; when the rehearsal wrote
     # verdict.json first, this guard skipped the live run and the run dir kept a
@@ -600,7 +601,13 @@ def _emit_run_verdict(run_dir, fail_count, dispatched, *, dry_run=False, task_cl
             existing = json.load(open(verdict_path, encoding="utf-8"))
         except Exception:
             existing = {}
-        if isinstance(existing, dict) and existing.get("source") == "execute@run-level":
+        own_record = (isinstance(existing, dict)
+                      and existing.get("source") == "execute@run-level")
+        # The run-level record is write-once for a normal execution: a nested
+        # lifecycle that inherited this run dir must not replace the live run's
+        # outcome. A recovery execution IS that run continuing, so it refreshes
+        # the same record instead of keeping the dead attempt's `fail` (RB-16).
+        if own_record and not recovery:
             return
         if isinstance(existing, dict) and existing.get("pass") is False and not dry_run:
             # RB-02 layer 4: a recipe's own verdict.json says the run failed.
@@ -610,7 +617,7 @@ def _emit_run_verdict(run_dir, fail_count, dispatched, *, dry_run=False, task_cl
             # recipe's evidence outranks the executor's bookkeeping.
             verdict = "fail"
             recipe_fail_reason = "recipe verdict.json pass=false"
-        if not dry_run:
+        if not dry_run and not own_record:
             # A recipe may own verdict.json as a detailed deliverable. Keep that
             # evidence intact and put executor bookkeeping beside it.
             verdict_path = os.path.join(run_dir, "run-verdict.json")
@@ -1884,7 +1891,8 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 "mini-ork approvals list"
             )
             return REVIEW_PAUSE_RC
-        _emit_run_verdict(live_run_dir, fail_count, len(fields_list), task_class=task_class)
+        _emit_run_verdict(live_run_dir, fail_count, len(fields_list), task_class=task_class,
+                          recovery=args.recovery_active)
         _record_plan_artifact(db, run_id, live_run_dir)
         _post_run_learning(db, live_run_dir, run_id, task_class, fail_count=fail_count)
         if fail_count > 0:
@@ -2064,6 +2072,33 @@ def _post_run_learning(db, run_dir, run_id, task_class="", fail_count=None):
 #
 # ── per-node live-path support helpers (deterministic; increment 4) ──
 
+def _is_attempt_marker(segment: str) -> bool:
+    """``attempt <n> started <UTC iso>`` — the per-attempt boundary note."""
+    parts = str(segment or "").split(" ", 3)
+    return (len(parts) >= 3 and parts[0] == "attempt"
+            and parts[1].isdigit() and parts[2] == "started")
+
+
+def _attempt_marker_number(notes) -> int:
+    """The highest ``attempt <n> started`` number recorded in ``notes``, or 0."""
+    numbers = [int(seg.strip().split(" ")[1])
+               for seg in str(notes or "").split("; ")
+               if _is_attempt_marker(seg.strip())]
+    return max(numbers, default=0)
+
+
+def _attempt_boundary_note(notes, *, prior_attempt: bool) -> str:
+    """The ``attempt <n> started <UTC iso>`` segment a live-status write appends.
+
+    ``n`` continues the marker already in ``notes``. A row whose attempt 1
+    predates the marker — it carries a verdict or an end stamp — revives as
+    attempt 2; a fresh row starts at 1.
+    """
+    last = _attempt_marker_number(notes)
+    n = last + 1 if last else (2 if prior_attempt else 1)
+    return f"attempt {n} started {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}"
+
+
 def set_status(db, run_id, new_status, *, dry_run=False):
     """Retrying task_runs status write; terminal states stamp ended_at + duration_ms.
 
@@ -2113,10 +2148,38 @@ def set_status(db, run_id, new_status, *, dry_run=False):
                     # old value would pair a fresh ``ended_at`` with the previous
                     # attempt's length. Same rule as
                     # ``web.control._restore_status``.
+                    # Some callers run against a task_runs stub older than the
+                    # notes/verdict columns. Clear and stamp only what exists.
+                    columns = {info[1] for info in con.execute(
+                        "PRAGMA table_info(task_runs)").fetchall()}
+                    present = [c for c in ("notes", "verdict", "ended_at")
+                               if c in columns]
+                    row = con.execute(
+                        f"SELECT {', '.join(present)} FROM task_runs WHERE id = ?",
+                        (run_id,)).fetchone() if present else None
+                    data = dict(zip(present, row)) if row else {}
+                    prior_attempt = (data.get("verdict") is not None
+                                     or data.get("ended_at") is not None)
+                    assignments = ["status = ?", "updated_at = ?"]
+                    values = [new_status, int(time.time())]
+                    if "verdict" in columns:
+                        assignments.append("verdict = NULL")
+                    if "ended_at" in columns:
+                        assignments.append("ended_at = NULL")
+                    if "duration_ms" in columns:
+                        assignments.append("duration_ms = 0")
+                    # One marker per execute pass: only the transition into
+                    # ``executing`` starts an attempt. A review park
+                    # (``reviewing``) is the same attempt and must not count.
+                    if "notes" in columns and new_status == "executing":
+                        assignments.append(
+                            "notes = COALESCE(notes || '; ', '') || ?")
+                        values.append(_attempt_boundary_note(
+                            data.get("notes"), prior_attempt=prior_attempt))
+                    values.append(run_id)
                     con.execute(
-                        "UPDATE task_runs SET status = ?, updated_at = ?, "
-                        "ended_at = NULL, duration_ms = 0 WHERE id = ?",
-                        (new_status, int(time.time()), run_id))
+                        f"UPDATE task_runs SET {', '.join(assignments)} WHERE id = ?",
+                        values)
                 con.commit()
                 last_err = None
                 break

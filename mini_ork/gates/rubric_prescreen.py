@@ -787,8 +787,14 @@ def mo_rubric_run_score(
                 existing = loaded
         except (OSError, ValueError):
             existing = {}
-        for key, value in prescreen.items():
-            existing.setdefault(key, value)
+        if existing.get("source") == "rubric-prescreen":
+            # This file is the prescreen's OWN record from an earlier run, not
+            # a panel-authored verdict: refresh its top-level score/pass so a
+            # re-run does not leave 37.5/false beside a fresh 75/true (RB-16).
+            existing.update(prescreen)
+        else:
+            for key, value in prescreen.items():
+                existing.setdefault(key, value)
         existing["prescreen"] = prescreen
         with open(verdict_path, "w") as f:
             json.dump(existing, f)

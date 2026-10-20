@@ -123,6 +123,59 @@ def _note(db, run_id, note):
     _pv.record_note(db, run_id, note)
 
 
+# The markers an attempt writes for a revise/retry loop. They describe the
+# attempt that produced them, so a publish archives them instead of leaving a
+# dead attempt's narrative at the run-dir root (RB-16).
+_ATTEMPT_ARCHIVE_FILES = ("NEEDS-CHANGE.md", "retry-hint.json", "retry-gate.json")
+
+
+def _current_attempt_number(db, run_id) -> int:
+    """The attempt this run dir belongs to, from ``attempt <n> started`` notes.
+
+    The live-status write appends that marker once per attempt; a row with no
+    marker is still on attempt 1.
+    """
+    n = 0
+    try:
+        import sqlite3  # noqa: PLC0415
+        con = sqlite3.connect(str(db), timeout=5.0)
+        try:
+            row = con.execute(
+                "SELECT notes FROM task_runs WHERE id = ?", (str(run_id),)).fetchone()
+            notes = str((row or [""])[0] or "")
+        finally:
+            con.close()
+    except Exception:  # noqa: BLE001 — archiving is best effort
+        return 1
+    for segment in notes.split("; "):
+        parts = segment.strip().split(" ", 3)
+        if (len(parts) >= 3 and parts[0] == "attempt" and parts[1].isdigit()
+                and parts[2] == "started"):
+            n = max(n, int(parts[1]))
+    return n or 1
+
+
+def _archive_stale_attempt_markers(run_dir, db, run_id) -> None:
+    """Move a superseded attempt's markers under ``attempts/<n>/``.
+
+    A revived run dir still holds the dead attempt's ``NEEDS-CHANGE.md`` /
+    retry hints; the next grader reads them as the live attempt's evidence.
+    Best effort — archiving must never turn a publish into a failure.
+    """
+    if not run_dir or not os.path.isdir(run_dir):
+        return
+    target = os.path.join(run_dir, "attempts", str(_current_attempt_number(db, run_id)))
+    for name in _ATTEMPT_ARCHIVE_FILES:
+        src = os.path.join(run_dir, name)
+        if not os.path.isfile(src):
+            continue
+        try:
+            os.makedirs(target, exist_ok=True)
+            os.replace(src, os.path.join(target, name))
+        except OSError:
+            pass
+
+
 def _run_verifier_envelopes(run_dir):
     """``(stem, envelope)`` for every readable ``verifier_<stem>.json`` at the run root.
 
@@ -611,6 +664,7 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
         msg = f"publisher: no artifact_contract.yaml at {contract or '(no recipe)'} — nothing delivered"
         print(f"  [warn] {msg}", file=sys.stderr)
         print(f"  [ok] {msg}; gates passed, run finalized as published")
+        _archive_stale_attempt_markers(run_dir, db, run_id)
         if db and run_id and os.path.isfile(db):
             from mini_ork.orchestration.run_reaper import finalize_passed  # noqa: PLC0415
             finalize_passed(db, run_id, msg + "; artifact left in the run dir")
@@ -666,6 +720,7 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
                 msg = ("publisher: the run delegated its implementation to child runs and its "
                        "contract declares outputs: [] — nothing of its own to deliver")
                 print(f"  [ok] {msg}", file=sys.stderr)
+                _archive_stale_attempt_markers(run_dir, db, run_id)
                 if db and run_id and os.path.isfile(db):
                     from mini_ork.orchestration.run_reaper import finalize_passed  # noqa: PLC0415
                     finalize_passed(db, run_id, msg + "; artifact left in the run dir")
@@ -684,6 +739,7 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
             _note(db, run_id, f"publisher: nothing committed{note_tail} — publish withheld")
             set_status(db, run_id, "failed")
             return 0, "publish_abstain"
+        _archive_stale_attempt_markers(run_dir, db, run_id)
         _mark_published(db, run_id)
         return 0, "done"
     # ── copy source_artifact → outputs[] + git-commit each.
@@ -794,6 +850,7 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
               file=sys.stderr)
         return 1, "error"
     print(f"  [ok] publisher: {published_count} artifact(s) published")
+    _archive_stale_attempt_markers(run_dir, db, run_id)
     _mark_published(db, run_id)
     return 0, "done"
 

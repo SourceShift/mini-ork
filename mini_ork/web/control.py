@@ -490,6 +490,24 @@ def _strip_trailing_note(notes: str | None, tag: str) -> str | None:
     return text.strip() or None
 
 
+_ATTEMPT_MARKER_RE = re.compile(r"^attempt (\d+) started\b")
+
+
+def _attempt_boundary_note(notes: str | None, *, prior_attempt: bool) -> str:
+    """The ``attempt <n> started <UTC iso>`` segment a live-status write appends.
+
+    Mirrors ``cli.execute.set_status``: ``n`` continues the marker already in
+    the append-only notes; a row whose attempt 1 predates the marker (it still
+    carries a verdict or an end stamp) is revived as attempt 2.
+    """
+    numbers = [int(match.group(1)) for segment in (notes or "").split("; ")
+               if (match := _ATTEMPT_MARKER_RE.match(segment.strip()))]
+    last = max(numbers, default=0)
+    n = last + 1 if last else (2 if prior_attempt else 1)
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return f"attempt {n} started {stamp}"
+
+
 def _restore_status(
     db_path: str, task_run_id: str, status: str, *, drop_note: str | None = None
 ) -> None:
@@ -499,6 +517,9 @@ def _restore_status(
     reopened mid-flight must not keep the end stamp the closure gave it, while
     one restored to ``failed`` or ``published`` must keep the stamp it already
     had — clearing it there would make a settled run read as still running.
+    The live write is also the attempt boundary: it clears the dead attempt's
+    verdict and appends ``attempt <n> started`` so a revived run is not
+    diagnosed from the previous attempt's notes (RB-16).
 
     ``drop_note`` names a breadcrumb the reversed gesture appended; it is
     removed in the same write so a close→undo→close cycle leaves exactly one.
@@ -510,21 +531,37 @@ def _restore_status(
     con = sqlite3.connect(db_path, timeout=5.0)
     try:
         con.execute("PRAGMA busy_timeout = 5000")
-        column = "ended_at = NULL, " if live else ""
-        if drop_note is None:
+        if not live and drop_note is None:
             con.execute(
-                f"UPDATE task_runs SET status = ?, {column}updated_at = ? WHERE id = ?",
+                "UPDATE task_runs SET status = ?, updated_at = ? WHERE id = ?",
                 (status, now, task_run_id),
             )
         else:
             row = con.execute(
-                "SELECT notes FROM task_runs WHERE id = ?", (task_run_id,)
+                "SELECT notes, verdict, ended_at FROM task_runs WHERE id = ?",
+                (task_run_id,),
             ).fetchone()
-            cleaned = _strip_trailing_note(row[0] if row else None, drop_note)
+            notes = row[0] if row else None
+            if drop_note is not None:
+                notes = _strip_trailing_note(notes, drop_note)
+            assignments = ["status = ?", "updated_at = ?"]
+            values: list[Any] = [status, now]
+            if live:
+                prior_attempt = bool(
+                    row and (row[1] is not None or row[2] is not None))
+                marker = _attempt_boundary_note(
+                    notes, prior_attempt=prior_attempt)
+                merged = f"{notes}; {marker}" if notes else marker
+                assignments += ["verdict = NULL", "ended_at = NULL",
+                                "duration_ms = 0", "notes = ?"]
+                values.append(merged)
+            elif drop_note is not None:
+                assignments.append("notes = ?")
+                values.append(notes)
+            values.append(task_run_id)
             con.execute(
-                f"UPDATE task_runs SET status = ?, notes = ?, {column}updated_at = ?"
-                " WHERE id = ?",
-                (status, cleaned, now, task_run_id),
+                f"UPDATE task_runs SET {', '.join(assignments)} WHERE id = ?",
+                values,
             )
         con.commit()
     finally:
