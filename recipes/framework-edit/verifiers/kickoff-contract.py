@@ -320,6 +320,11 @@ def measure_env(run_dir: str) -> dict:
     home = os.environ.get("MINI_ORK_HOME")
     if home:
         env["MINI_ORK_HOME"] = home
+    # Pin the interpreter exactly as test.py does: a measure command that says
+    # bare `python3` must resolve the interpreter running this verifier, not the
+    # host's (3.9 raised a `|` TypeError in sde-3b1 and cost a 2580 s revise
+    # round). The inherited PATH is preserved after the pin.
+    env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
     return env
 
 

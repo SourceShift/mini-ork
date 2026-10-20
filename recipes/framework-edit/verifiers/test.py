@@ -89,6 +89,10 @@ EVIDENCE = os.path.join(RUN_DIR, f"verifier-{NAME}.log")
 CHECKS_TSV = os.path.join(RUN_DIR, f"verifier-{NAME}.checks.tsv")
 WORK_PARENT = os.path.join(RUN_DIR, f"verifier-{NAME}-work")
 WORKTREE = os.path.join(WORK_PARENT, "repo")
+# The base copy lives OUTSIDE WORK_PARENT: _make_throwaway_copy() rmtree's that
+# parent, and the base side of a failed command must survive that (RB-26).
+BASE_PARENT = os.path.join(RUN_DIR, f"verifier-{NAME}-base")
+BASE_WORKTREE = os.path.join(BASE_PARENT, "repo")
 
 open(CHECKS_TSV, "w").close()
 _ev = open(EVIDENCE, "w")
@@ -176,6 +180,40 @@ def _make_throwaway_copy():
     _materialise_submodules(REPO_ROOT, WORKTREE)
 
 
+def _recorded_base_ref():
+    """The ``pre-implementer-ref`` the diff was cut against, or "" when absent.
+
+    Deliberately does NOT fall back to HEAD: framework-edit may have committed
+    the implementer's patch already, so HEAD can contain the diff, and a
+    "base" copy built from it would compare the candidate with itself —
+    silently turning a real regression into a base-fails abstention."""
+    try:
+        with open(os.path.join(RUN_DIR, "pre-implementer-ref"), encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def _make_base_copy():
+    """Archive ``pre-implementer-ref`` WITHOUT applying the diff — the base tree.
+
+    Built lazily, only after a kickoff command failed on the patched copy, so a
+    green run pays nothing. Same construction as ``_make_throwaway_copy``
+    (archive, submodules, its own git root) minus the ``git apply``: tests that
+    read ``HEAD`` must see the same kind of checkout on both sides, or the
+    comparison would report failures the base never had. No recorded base means
+    no comparison at all — the caller keeps the failure gating (fail closed)."""
+    if not _recorded_base_ref():
+        return False
+    shutil.rmtree(BASE_PARENT, ignore_errors=True)
+    os.makedirs(BASE_WORKTREE)
+    archive = subprocess.run(["git", "-C", REPO_ROOT, "archive", _recorded_base_ref()],
+                             stdout=subprocess.PIPE, check=True).stdout
+    _extractall(tarfile.open(fileobj=io.BytesIO(archive)), BASE_WORKTREE)
+    _materialise_submodules(REPO_ROOT, BASE_WORKTREE)
+    return _assert_copy_is_own_git_root(BASE_WORKTREE)
+
+
 def _diff_sentinel_path():
     try:
         with open(DIFF, encoding="utf-8", errors="replace") as f:
@@ -198,25 +236,27 @@ _BASE_COMMIT_ENV = {
 }
 
 
-def _commit_base_snapshot():
+def _commit_base_snapshot(root=None):
     """Commit the copy's tree once, before the diff is applied (idempotent)."""
-    if subprocess.run(["git", "-C", WORKTREE, "rev-parse", "--verify", "-q", "HEAD"],
+    root = WORKTREE if root is None else root
+    if subprocess.run(["git", "-C", root, "rev-parse", "--verify", "-q", "HEAD"],
                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
         return
     env = {**os.environ, **_BASE_COMMIT_ENV}
-    subprocess.run(["git", "-C", WORKTREE, "add", "-A"], stdout=subprocess.DEVNULL,
+    subprocess.run(["git", "-C", root, "add", "-A"], stdout=subprocess.DEVNULL,
                    stderr=subprocess.DEVNULL, env=env)
-    subprocess.run(["git", "-C", WORKTREE, "-c", "commit.gpgsign=false", "commit", "-q",
+    subprocess.run(["git", "-C", root, "-c", "commit.gpgsign=false", "commit", "-q",
                     "--no-verify", "--allow-empty", "-m", "verifier base snapshot"],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
 
 
-def _assert_copy_is_own_git_root():
-    subprocess.run(["git", "-C", WORKTREE, "init"], stdout=subprocess.DEVNULL,
+def _assert_copy_is_own_git_root(root=None):
+    root = WORKTREE if root is None else root
+    subprocess.run(["git", "-C", root, "init"], stdout=subprocess.DEVNULL,
                    stderr=subprocess.DEVNULL)
-    _commit_base_snapshot()
-    top = os.path.realpath(WORKTREE)
-    r = subprocess.run(["git", "-C", WORKTREE, "rev-parse", "--show-toplevel"],
+    _commit_base_snapshot(root)
+    top = os.path.realpath(root)
+    r = subprocess.run(["git", "-C", root, "rev-parse", "--show-toplevel"],
                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     return r.returncode == 0 and r.stdout.decode().strip() == top
 
@@ -310,6 +350,33 @@ _check("apply-sentinel-has-content", "diff and patched-tree sentinels are non-em
                 and os.path.getsize(os.path.join(WORK_PARENT, "diff-applied.post.sha256")) > 0))
 
 
+def _command_env(root, *, restore_run_dir=False):
+    """The environment a kickoff command runs under, inside ``root``.
+
+    ``PYTHONPATH`` is the ABSOLUTE patched/base copy, prepended to whatever was
+    inherited — never ``.``. A relative ``.`` resolved to the verifier's cwd
+    while the command ran in the copy, leaking the engine root into the target
+    tree and failing ``test_default_root_is_the_engine_root`` on a clean base
+    (hr-cli-worktree, RB-26). A ``.`` component in an inherited value is dropped
+    for the same reason; everything else inherited is preserved.
+
+    ``PATH`` starts with the verifier's own interpreter directory, so a bare
+    ``python3``/``pytest`` in operator prose resolves the interpreter that can
+    import the tree under test (sde-3b1: host python3 was 3.9 and raised).
+    """
+    env = scrubbed_test_env()
+    if restore_run_dir:
+        # scrub drops it with the credentials; a run-local path, not a secret.
+        env["MINI_ORK_RUN_DIR"] = RUN_DIR
+    inherited = [
+        part for part in env.get("PYTHONPATH", "").split(os.pathsep)
+        if part and part != "."
+    ]
+    env["PYTHONPATH"] = os.pathsep.join([os.path.abspath(root), *inherited])
+    env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
+    return env
+
+
 # Only enforce web-smoke tests when the target repo actually ships them.
 # Framework-edit runs against many repos; failing a verifier because a
 # repo-specific smoke file is absent is an infrastructure false-negative.
@@ -317,8 +384,7 @@ def _web_smoke():
     if not (os.path.getsize(os.path.join(WORK_PARENT, "diff-applied.sha256")) > 0
             and os.path.getsize(os.path.join(WORK_PARENT, "diff-applied.post.sha256")) > 0):
         return False
-    env = scrubbed_test_env()
-    env["PYTHONPATH"] = "."
+    env = _command_env(WORKTREE)
     return _run([sys.executable, "-m", "pytest", "tests/test_web_smoke.py", "-q"],
                 cwd=WORKTREE, env=env)
 
@@ -442,21 +508,34 @@ def _is_test_path_token(token):
         "/" in token or token.endswith(".py") or _GLOB_CHARS & set(token))
 
 
-def _dedupe_redundant_test_paths(cmd):
-    """Drop test paths a sibling glob in the same command already collects.
+def _is_glob_path_token(token):
+    """A test path token that actually globs a path (not ``-k 'foo*'``)."""
+    return (_is_test_path_token(token) and _GLOB_CHARS & set(token)
+            and ("/" in token or token.endswith(".py")))
+
+
+def _dedupe_redundant_test_paths(cmd, root=None):
+    """Resolve test paths to concrete files and de-duplicate the union.
 
     pytest-asyncio (0.23.4) re-wraps ``Module.collect`` on every collection of the
     same path without an idempotence check, so a command naming a test file
     explicitly *and* a glob matching it recurses until the interpreter raises
     ``RecursionError`` during collection — before a single test runs. The change
     under test is then judged wrong (rp-e6-graph-focus, rp-e3-header,
-    hr-exec-park, all 2026-10-15). The glob collects the identical set, so the
-    explicit copy is redundant rather than merely unhelpful.
+    hr-exec-park, all 2026-10-15).
 
-    Only whole whitespace-separated tokens are removed, and only when the command
-    needs no shell quoting — a command this cannot rewrite exactly is left alone
-    to fail loudly instead of silently collecting a different set of tests.
+    Two overlapping GLOBS are the unfixed half of that bug (run-1792253563-27493:
+    ``test_ide_pages_run_learnings*.py`` + ``test_ide_pages_run*.py``): the old
+    code skipped every glob token, so the duplicate reached pytest. When two or
+    more glob tokens expand to an overlapping set, this expands them — relative
+    to ``root``, the tree the command will run in — unions them with any explicit
+    paths, and hands pytest each concrete file exactly once.
+
+    A lone glob is left verbatim (with an explicit path it covers still dropped),
+    and a command this cannot rewrite exactly is left alone to fail loudly
+    rather than silently collecting a different set of tests.
     """
+    root = WORKTREE if root is None else root
     tokens = cmd.split()
     try:
         parsed = shlex.split(cmd)
@@ -469,18 +548,56 @@ def _dedupe_redundant_test_paths(cmd):
     if sum(1 for token in tokens if _is_test_path_token(token)) < 2:
         return cmd
 
-    # ``glob.root_dir`` is 3.10+; this verifier runs on the target repo's
-    # interpreter, so match against fully-joined paths instead.
+    glob_tokens = [token for token in tokens if _is_glob_path_token(token)]
+    if len(glob_tokens) >= 2:
+        # ``glob.root_dir`` is 3.10+; join against the copy instead.
+        expanded = {}
+        for token in glob_tokens:
+            matches = sorted(
+                os.path.relpath(match, root)
+                for match in glob.glob(os.path.join(root, token), recursive=True)
+                if os.path.isfile(match))
+            if not matches:
+                # A glob matching nothing is a command we cannot rewrite
+                # faithfully; leave it for pytest to report.
+                return cmd
+            expanded[token] = matches
+        hits = {}
+        for matches in expanded.values():
+            for match in matches:
+                hits[match] = hits.get(match, 0) + 1
+        if any(count >= 2 for count in hits.values()):
+            union = []
+            for token in tokens:
+                if not _is_test_path_token(token):
+                    continue
+                for path in expanded.get(token, [token]):
+                    if path not in union:
+                        union.append(path)
+            kept, inserted = [], False
+            for token in tokens:
+                if _is_test_path_token(token):
+                    if not inserted:
+                        kept.extend(union)
+                        inserted = True
+                    continue
+                kept.append(token)
+            _ev.write(
+                f"  [dedupe] expanded {len(glob_tokens)} overlapping globs to "
+                f"{len(union)} concrete files (each collected once)\n")
+            _ev.flush()
+            return " ".join(kept)
+
     covered = set()
     for token in tokens:
         if _is_test_path_token(token) and _GLOB_CHARS & set(token):
-            covered.update(glob.glob(os.path.join(WORKTREE, token), recursive=True))
+            covered.update(glob.glob(os.path.join(root, token), recursive=True))
 
     seen, redundant = set(), set()
     for token in tokens:
         if not _is_test_path_token(token) or _GLOB_CHARS & set(token):
             continue
-        if token in seen or os.path.join(WORKTREE, token) in covered:
+        if token in seen or os.path.join(root, token) in covered:
             redundant.add(token)
         seen.add(token)
     if not redundant:
@@ -519,6 +636,37 @@ def _bind_run_dir(cmd):
     return f"MINI_ORK_RUN_DIR={shlex.quote(RUN_DIR)}; {cmd}"
 
 
+#: Check rows that carry evidence a command did not fail because of the diff.
+#: They are appended after the TSV rows and are non-gating by construction.
+_IMPLICIT_CHECKS = []
+
+
+def _run_acceptance_command(root, cmd):
+    """Run one kickoff command in ``root``. Returns ``(rc, timed_out)``.
+
+    ``_command_env`` restores ``MINI_ORK_RUN_DIR`` (run-local, not a secret) so
+    `--junitxml="${MINI_ORK_RUN_DIR}/x.xml"` resolves; ``_dedupe`` expands
+    globs against THIS tree, so a diff-added test is never collected on the
+    base side.
+    """
+    rewritten = _dedupe_redundant_test_paths(cmd, root)
+    _ev.write(f"  $ {_sh(rewritten)}\n")
+    _ev.flush()
+    try:
+        proc = subprocess.run(_bind_run_dir(_sh(rewritten)), shell=True, cwd=root,
+                              env=_command_env(root, restore_run_dir=True),
+                              stdout=_ev, stderr=subprocess.STDOUT,
+                              timeout=_VERIFY_CMD_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        _ev.write(f"  TIMEOUT after {_VERIFY_CMD_TIMEOUT_S}s\n")
+        _ev.flush()
+        return None, True
+    if proc.returncode != 0:
+        _ev.write(f"  rc={proc.returncode}\n")
+        _ev.flush()
+    return proc.returncode, False
+
+
 def _epic_verification_commands_pass():
     if os.environ.get("MO_EPIC_VERIFY_CMDS") == "0":
         return True
@@ -532,32 +680,55 @@ def _epic_verification_commands_pass():
             f"{_EPIC_VERIFICATION_COMMAND_LIMIT} — split the kickoff\n")
         _ev.flush()
         return False
-    env = scrubbed_test_env()
-    # The kickoff declares run-local artifacts as ${MINI_ORK_RUN_DIR}/…, so its
-    # own acceptance commands must be able to resolve the run dir. The scrub
-    # above drops MINI_ORK_RUN_DIR along with the credentials; restore that ONE
-    # path (run-local, not a secret) and nothing else, so GLM_API_KEY et al.
-    # stay scrubbed. Without it `--junitxml="${MINI_ORK_RUN_DIR}/x.xml"` expands
-    # to `/x.xml` and the command dies (Errno 30, read-only file system).
-    env["MINI_ORK_RUN_DIR"] = RUN_DIR
-    env["PYTHONPATH"] = "."
-    env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
+    base_ready = False
     for cmd in cmds:
-        cmd = _dedupe_redundant_test_paths(cmd)
-        _ev.write(f"  $ {_sh(cmd)}\n")
+        rc, timed_out = _run_acceptance_command(WORKTREE, cmd)
+        if timed_out:
+            return False
+        if rc == 0:
+            continue
+        # A command the pre-patch tree also fails is an environment/base
+        # failure, not a regression introduced by the diff. Replay it ONCE on
+        # the base copy (built lazily, so a green run pays nothing) before
+        # blaming the change. Base-passes => a real regression; base-fails =>
+        # a non-gating abstention in the envelope.
+        if not base_ready:
+            try:
+                base_ready = bool(_make_base_copy())
+            except Exception as exc:  # noqa: BLE001 — no base tree, no comparison
+                _ev.write(f"  base copy could not be built: {exc}\n")
+                _ev.flush()
+                return False
+            if not base_ready:
+                _ev.write(
+                    "  no usable pre-implementer-ref — cannot compare with the base; "
+                    "keeping the failure gating\n")
+                _ev.flush()
+                return False
+        _ev.write("  replaying the failed command on the base copy\n")
         _ev.flush()
-        try:
-            proc = subprocess.run(_bind_run_dir(_sh(cmd)), shell=True, cwd=WORKTREE, env=env,
-                                  stdout=_ev, stderr=subprocess.STDOUT,
-                                  timeout=_VERIFY_CMD_TIMEOUT_S)
-        except subprocess.TimeoutExpired:
-            _ev.write(f"  TIMEOUT after {_VERIFY_CMD_TIMEOUT_S}s\n")
-            _ev.flush()
+        base_rc, base_timed_out = _run_acceptance_command(BASE_WORKTREE, cmd)
+        if base_timed_out:
             return False
-        if proc.returncode != 0:
-            _ev.write(f"  rc={proc.returncode}\n")
+        if base_rc != 0:
+            _IMPLICIT_CHECKS.append({
+                "name": "epic-verification-commands-base-fails",
+                "expected": "command passes on the patched copy; a failure the base shares is not the diff's",
+                "actual": f"patched rc={rc}, base rc={base_rc}",
+                "pass": True,
+                "gating": False,
+                "failure_kind": "base-fails",
+                "command": cmd,
+                "reason": (f"`{cmd}` failed on the base copy too "
+                           f"(patched rc={rc}, base rc={base_rc}); no abstention "
+                           "is blamed on the diff"),
+            })
+            _ev.write(
+                f"  [base-fails] `{cmd}` also fails on the base copy "
+                f"(rc={base_rc}); recording a non-gating abstention\n")
             _ev.flush()
-            return False
+            continue
+        return False
     return True
 
 
@@ -575,8 +746,11 @@ with open(CHECKS_TSV) as f:
     for line in f:
         cid, desc, passed = line.rstrip("\n").split("\t", 2)
         checks.append({"name": cid, "expected": desc, "actual": "see evidence log",
-                       "pass": passed == "true"})
-failed = [c["name"] for c in checks if not c["pass"]]
+                       "pass": passed == "true", "gating": True})
+# A base-fails row is evidence of a shared environment failure, not of a
+# regression: it must be visible in `checks` yet never gate the run.
+checks.extend(_IMPLICIT_CHECKS)
+failed = [c["name"] for c in checks if not c["pass"] and c.get("gating", True)]
 VERIFIER_JSON = json.dumps({
     "verifier": NAME,
     "pass": not failed,
@@ -585,7 +759,8 @@ VERIFIER_JSON = json.dumps({
     "checks_run": [c["name"] for c in checks],
     "failed_checks": failed,
     "checks": checks,
-    "reasons": [f"{c['name']} failed; see {EVIDENCE}" for c in checks if not c["pass"]],
+    "reasons": [f"{c['name']} failed; see {EVIDENCE}" for c in checks
+                if not c["pass"] and c.get("gating", True)],
     "checked_criteria": [c["name"] for c in checks],
     "artifact_ref": "$MINI_ORK_RUN_DIR/framework-edit.diff tests/test_web_smoke.py",
 })
