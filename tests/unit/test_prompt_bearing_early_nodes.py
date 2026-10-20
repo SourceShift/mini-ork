@@ -132,7 +132,20 @@ def _node_event_types(db_path, run_id, node_id):
     return types
 
 
-def _dispatch(tmp_path, root, db_path, fields, stub):
+def _in_dag_workflow(tmp_path, node_id):
+    """A workflow in which ``node_id`` has a parent edge (an in-DAG node)."""
+    wf = tmp_path / "workflow.yaml"
+    wf.write_text(
+        "nodes:\n"
+        "  - { name: upstream, type: verifier }\n"
+        f"  - {{ name: {node_id}, type: planner }}\n"
+        "edges:\n"
+        f"  - {{ from: upstream, to: {node_id}, edge_type: escalates_to }}\n",
+        encoding="utf-8")
+    return str(wf)
+
+
+def _dispatch(tmp_path, root, db_path, fields, stub, workflow=""):
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     result = eh.dispatch_node(
@@ -145,6 +158,7 @@ def _dispatch(tmp_path, root, db_path, fields, stub):
         run_id=RUN_ID,
         dispatch_fn=stub,
         recipe=RECIPE,
+        workflow=workflow,
     )
     return run_dir, result
 
@@ -180,7 +194,9 @@ def test_prompt_bearing_early_node_dispatches_via_researcher(
         "", "", "spec_test_lane", "",
     ]
 
-    run_dir, (rc, finish_reason) = _dispatch(tmp_path, root, db_path, fields, stub)
+    run_dir, (rc, finish_reason) = _dispatch(
+        tmp_path, root, db_path, fields, stub,
+        workflow=_in_dag_workflow(tmp_path, node_id))
 
     assert early_sentinels[node_type] == 0, (
         f"the prompt-less {node_type} early handler was taken for a node with "
@@ -387,3 +403,25 @@ def test_validate_no_warning_for_promptless_node_off_any_cycle(
     warnings = _warnings(capsys.readouterr().err)
     assert not [ln for ln in warnings if "reflector" in ln], (
         f"a prompt-less reflector off any cycle was warned: {warnings}")
+
+
+def test_root_planner_node_keeps_the_early_noop(tmp_path):
+    """Fix-forward of 56ad7fb8: a recipe's ROOT planner (no incoming edge) is the
+    planning stage the lifecycle already ran; only an in-DAG planner/reflector
+    (with a parent edge) dispatches its prompt."""
+    from mini_ork.cli.execute_handlers import _workflow_node_has_parent
+    wf = tmp_path / "workflow.yaml"
+    wf.write_text(
+        "nodes:\n"
+        "  - { name: planner, type: planner, prompt_ref: prompts/planner.md }\n"
+        "  - { name: reflector, type: reflector, prompt_ref: prompts/reflector.md }\n"
+        "  - { name: replanner, type: planner, prompt_ref: prompts/replanner.md }\n"
+        "edges:\n"
+        "  - { from: planner, to: reflector, edge_type: escalates_to }\n"
+        "  - { from: reflector, to: replanner, edge_type: depends_on }\n",
+        encoding="utf-8")
+    assert _workflow_node_has_parent(str(wf), "planner") is False
+    assert _workflow_node_has_parent(str(wf), "reflector") is True
+    assert _workflow_node_has_parent(str(wf), "replanner") is True
+    assert _workflow_node_has_parent(str(tmp_path / "missing.yaml"), "replanner") is False
+    assert _workflow_node_has_parent("", "replanner") is False

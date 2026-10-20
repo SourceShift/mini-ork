@@ -888,8 +888,16 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     # treatment: prompt assembly from prompt_ref, the node's lane and declared
     # outputs, and a normal node_start/node_end pair. Prompt-less nodes keep the
     # early behaviour unchanged.
+    # Only an IN-DAG planner/reflector (a node with an incoming workflow edge,
+    # e.g. spec-driven-delivery's replanner) runs its prompt here. The root
+    # ``planner`` node most recipes open with IS the planning stage the run
+    # lifecycle already executed to produce plan.json — dispatching its prompt
+    # again re-planned every run (regression from 56ad7fb8, seen on
+    # rbf-diff-hash-pin-20261020-230109: +78 s per framework-edit run).
     prompt_bearing_early = (
-        node_type in PROMPT_BEARING_EARLY_NODE_TYPES and bool(prompt_ref.strip())
+        node_type in PROMPT_BEARING_EARLY_NODE_TYPES
+        and bool(prompt_ref.strip())
+        and _workflow_node_has_parent(workflow, node_id)
     )
     early_handler = EARLY_NODE_HANDLERS.get(node_type)
     if early_handler is not None and not prompt_bearing_early:
@@ -1343,6 +1351,28 @@ def scope_guard_block(run_dir: str) -> str:
 # lane and outputs. A node of one of these types that DOES declare a prompt_ref
 # is a real LLM node and is dispatched through the main (researcher) path
 # instead; see the early-handler dispatch site in ``dispatch_node``.
+def _workflow_node_has_parent(workflow, node_id) -> bool:
+    """True when ``workflow`` declares an edge INTO ``node_id`` (any edge type).
+
+    Fail-closed to the pre-RB-08 behaviour: an unreadable or missing workflow
+    returns False, so the node keeps its early (no-dispatch) handler.
+    """
+    path = str(workflow or "").strip()
+    if not path or not node_id or not os.path.isfile(path):
+        return False
+    try:
+        import yaml  # noqa: PLC0415
+        with open(path, encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+    except Exception:  # noqa: BLE001 — unreadable workflow → no dispatch
+        return False
+    edges = data.get("edges") if isinstance(data, dict) else None
+    if not isinstance(edges, list):
+        return False
+    variants = {node_id, node_id.replace("-", "_"), node_id.replace("_", "-")}
+    return any(isinstance(e, dict) and str(e.get("to") or "") in variants for e in edges)
+
+
 PROMPT_BEARING_EARLY_NODE_TYPES = frozenset({"planner", "reflector"})
 
 
