@@ -49,6 +49,7 @@ from typing import Callable  # noqa: F401 -- compatibility re-export for handler
 from mini_ork import run_status as _run_status
 from mini_ork.context import (  # noqa: F401 -- compatibility re-exports
     ENV_DISPATCH_CHAIN,
+    ENV_NODE_ID,
     ENV_RESUME_SESSION_ID,
     ENV_RUN_DIR,
     ENV_TARGET_CWD,
@@ -2024,6 +2025,14 @@ def _provision_remote_session(run_id: str, run_dir: str, db) -> bool:
 
 # ── post-run learning side-channels ──
 
+#: RB-41: post-run work is not a workflow node. Publishing its own identity
+#: keeps the last dispatched node's id (e.g. "rollback") from leaking into
+#: post-run diagnoser / gradient-extract sessions: `.last-llm-node`,
+#: `agent-<node>.live.jsonl`, and per-node isolation all key off MO_NODE_ID.
+#: The runtime layer carries a matching literal in
+#: ``mini_ork/runtime/backends/remote.py`` (it must not import the CLI).
+POST_RUN_NODE_ID = "post-run"
+
 
 def _post_run_learning(db, run_dir, run_id, task_class="", fail_count=None):
     """Post-run learning side-channels (each best-effort; never fail the run):
@@ -2050,6 +2059,13 @@ def _post_run_learning(db, run_dir, run_id, task_class="", fail_count=None):
        Opt-in twice (MO_AUTO_APPLY=1 AND MO_APPLY_ENABLED=1): a sweep without
        the master gate would audit but never write, which is pure noise.
     """
+    # RB-41: give post-run work its own identity before any side channel runs.
+    # ``publish_env`` dual-writes the contextvar (read by
+    # ``run_nodes.node_id_for``) and ``os.environ`` (read by llm_dispatch's
+    # ``.last-llm-node``, trace_store, and the live-sidecar naming). It is
+    # deliberately NOT scoped/restored: post-run child processes must inherit
+    # "post-run", not the last dispatched node's id.
+    publish_env({ENV_NODE_ID: POST_RUN_NODE_ID})
     if (os.environ.get("MO_IMPL_REWARD", "") == "run_verified"
             and fail_count is not None):
         try:

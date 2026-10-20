@@ -116,9 +116,49 @@ def _operation_in_progress(repo_root: str) -> bool:
     return any(_git_path(repo_root, m).exists() for m in _IN_PROGRESS_MARKERS)
 
 
+def _index_modes(repo_root: str, files: list) -> dict:
+    """Index modes for *files*, keyed by path (RB-40).
+
+    ``git diff-tree --name-only`` at commit time carries no mode, so the only
+    way to tell a gitlink (160000) from a regular file is the index. Read it
+    here, inside the watchdog, rather than threading a new ``_MO_RG_MODES``
+    channel from ``main()``: the direct-``_watchdog`` tests set only
+    ``_MO_RG_FILES``, and a missing mode must fall back to today's behavior.
+    """
+    paths = [f for f in files if f]
+    if not paths:
+        return {}
+    r = _git(repo_root, "ls-files", "-s", "--", *paths)
+    if r.returncode != 0:
+        return {}
+    modes = {}
+    for line in r.stdout.splitlines():
+        meta, tab, path = line.partition("\t")
+        fields = meta.split()
+        if tab and fields:
+            modes[path] = fields[0]
+    return modes
+
+
+def _restored_matches_head(repo_root: str, sha: str, f: str) -> bool:
+    """Whether *f* now matches HEAD's blob — i.e. the heal actually landed."""
+    head_blob = _git(repo_root, "rev-parse", f"{sha}:{f}").stdout.strip()
+    path = Path(repo_root) / f
+    if not head_blob or not path.is_file():
+        return False
+    file_blob = _git(repo_root, "hash-object", str(path)).stdout.strip()
+    return bool(file_blob) and file_blob == head_blob
+
+
 def _watchdog(repo_root: str, sha: str, branch: str, files: list,
               watch_s: int, poll_s: int, log_path: str) -> None:
     end = time.time() + watch_s
+    # A path healed but still not matching HEAD is not retried in this process.
+    # This must be local, not module-level: the hook re-execs itself as a fresh
+    # process for ``__watchdog__``, so a module-level set would be empty on
+    # every spawn — the very retry loop this fixes (RB-40).
+    noop_healed: set = set()
+    modes = _index_modes(repo_root, files)
     with open(log_path, "a", encoding="utf-8") as log:
         while time.time() < end:
             time.sleep(poll_s)
@@ -195,16 +235,26 @@ def _watchdog(repo_root: str, sha: str, branch: str, files: list,
                 continue
 
             for f in files:
-                if not f:
+                if not f or f in noop_healed:
+                    continue
+                # RB-40: a gitlink (index mode 160000) or a working-tree
+                # directory is not a deleted file. ``is_file()`` is false for
+                # both, so the old branch healed them on every poll forever
+                # (the `ui` submodule: 48 no-op rows, no effect). Skip before
+                # the deleted-file branch; a skip writes no ledger row.
+                if modes.get(f) == "160000" or (Path(repo_root) / f).is_dir():
                     continue
                 if not (Path(repo_root) / f).is_file():
                     # File deleted — restore from HEAD.
                     if _git(repo_root, "checkout", "HEAD", "--", f).returncode == 0:
-                        log.write(
-                            f"{_utc_now()}\t{sha}\t{f}\t"
-                            f"restored-deleted-from-{sha}\n"
-                        )
-                        log.flush()
+                        if _restored_matches_head(repo_root, sha, f):
+                            log.write(
+                                f"{_utc_now()}\t{sha}\t{f}\t"
+                                f"restored-deleted-from-{sha}\n"
+                            )
+                            log.flush()
+                        else:
+                            noop_healed.add(f)
                     continue
                 # File present — check if content matches HEAD's blob.
                 head_blob = _git(repo_root, "rev-parse", f"{sha}:{f}").stdout.strip()
@@ -228,14 +278,17 @@ def _watchdog(repo_root: str, sha: str, branch: str, files: list,
                                 _git(repo_root, "checkout", "HEAD", "--", f).returncode
                                 == 0
                             ):
-                                parent_sha = _git(
-                                    repo_root, "rev-parse", parent_ref
-                                ).stdout.strip()
-                                log.write(
-                                    f"{_utc_now()}\t{sha}\t{f}\t"
-                                    f"restored-reverted-to-{parent_sha}\n"
-                                )
-                                log.flush()
+                                if _restored_matches_head(repo_root, sha, f):
+                                    parent_sha = _git(
+                                        repo_root, "rev-parse", parent_ref
+                                    ).stdout.strip()
+                                    log.write(
+                                        f"{_utc_now()}\t{sha}\t{f}\t"
+                                        f"restored-reverted-to-{parent_sha}\n"
+                                    )
+                                    log.flush()
+                                else:
+                                    noop_healed.add(f)
                             break
 
 

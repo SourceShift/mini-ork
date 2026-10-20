@@ -113,9 +113,25 @@ def _isolate_process_state():
         cwd_snapshot = os.getcwd()
     except OSError:
         cwd_snapshot = None
+    # ``mini_ork.context.publish_env`` dual-writes ``os.environ`` (restored
+    # below) AND the per-thread run-context ContextVar, which is NOT restored by
+    # the env snapshot: a test that drives execute.main leaves MO_NODE_ID (e.g.
+    # "post-run", RB-41) bound for every later test in the thread. Start each
+    # test with an empty run context and drop whatever it bound afterwards.
+    ctx_mod = sys.modules.get("mini_ork.context")
+    ctx_token = (ctx_mod._RUN_CONTEXT_VARS.set({})
+                 if ctx_mod is not None and hasattr(ctx_mod, "_RUN_CONTEXT_VARS") else None)
     try:
         yield
     finally:
+        if ctx_token is not None:
+            try:
+                ctx_mod._RUN_CONTEXT_VARS.reset(ctx_token)
+            except (ValueError, RuntimeError):
+                ctx_mod._RUN_CONTEXT_VARS.set({})
+        elif (sys.modules.get("mini_ork.context") is not None
+              and hasattr(sys.modules["mini_ork.context"], "_RUN_CONTEXT_VARS")):
+            sys.modules["mini_ork.context"]._RUN_CONTEXT_VARS.set({})
         if applied_snapshot is not None and store_mod is not None:
             store_mod._applied.clear()
             store_mod._applied.update(applied_snapshot)

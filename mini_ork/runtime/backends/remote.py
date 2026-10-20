@@ -113,6 +113,12 @@ _CLAUDE_CONFIG_DIR_VALUE = "/workspace/home/.claude"
 # (kept as a literal so this module's import-time surface stays stdlib-only).
 _ENV_NODE_PROVIDER = "MO_NODE_PROVIDER"
 
+# RB-41: post-run learning is not a workflow node, so it must never get its own
+# per-node sandbox — one would be minted without the CLI and strand it (17 ×
+# rc 127). Mirrors ``mini_ork.cli.execute.POST_RUN_NODE_ID``; kept as a literal
+# here so the runtime layer does not import the CLI.
+_POST_RUN_NODE_ID = "post-run"
+
 
 def _env_int_mb(name: str, default_mb: int) -> int:
     """Read ``name`` (megabytes) from env; clamp invalid to ``default_mb``.
@@ -683,7 +689,13 @@ class RemoteWorkspace:
         """
         from mini_ork.remote.providers import run_nodes
 
-        return run_nodes.isolated_node(self._provider_env)
+        node = run_nodes.isolated_node(self._provider_env)
+        # RB-41: post-run work has no workflow node to isolate. It runs on the
+        # run-level placement instead of minting a per-node sandbox that would
+        # be provisioned without the CLI.
+        if node == _POST_RUN_NODE_ID:
+            return ""
+        return node
 
     def ensure_node(self, *, create: bool) -> Any:
         """Resolve this workspace's node through its node provider (lazy).
