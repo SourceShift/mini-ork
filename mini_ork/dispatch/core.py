@@ -28,11 +28,13 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 from typing import TextIO
 
 from ..context import context_env_snapshot
@@ -48,6 +50,117 @@ TextParser = Callable[[str], str]
 
 # Cap on the recorded error text (llm_calls.error_message / DispatchResult.error).
 _ERROR_CAP = 2000
+
+# Run-local bookkeeping of the live agent process groups (RBF-25). While a lane
+# runs, one ``"<pgid> <unix start ts>\n"`` line lives in this file. The run
+# reaper reads it to stop the agents of a dispatcher that died without running
+# its teardown — agents run detached in their own session, so they outlive the
+# dispatcher otherwise. A line is removed again when the group is reaped
+# normally; a stale line therefore means the dispatcher never got to clean up.
+AGENT_PGIDS_FILE = ".agent-pgids"
+
+
+def _agent_pgids_path(env: Mapping[str, str]) -> Path | None:
+    """``$MINI_ORK_RUN_DIR/.agent-pgids`` when the run dir is in the child env.
+
+    Only the environment handed to the child is consulted: this is the run
+    identity the caller chose for the spawn, and a direct ``spawn_local`` call
+    with an explicit env must not adopt an ambient run from the process env.
+    """
+    run_dir = env.get("MINI_ORK_RUN_DIR") or ""
+    return Path(run_dir) / AGENT_PGIDS_FILE if run_dir else None
+
+
+def _lock_pgids(fh: TextIO) -> None:
+    """Serialise the read-modify-write against concurrent lane spawns.
+
+    Best-effort: platforms without ``fcntl`` still append correctly (a single
+    O_APPEND write is atomic); only the removal pass loses its interlock.
+    """
+    try:
+        import fcntl
+
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+    except (ImportError, OSError):
+        pass
+
+
+def _record_agent_pgid(path: Path, pgid: int, started_at: int) -> bool:
+    """Append the live group's record. Returns False when it could not be written.
+
+    Bookkeeping must never break the spawn: an unwritable run dir degrades to
+    the pre-RBF-25 behavior (the reaper cannot stop this group).
+    """
+    try:
+        with path.open("a+", encoding="utf-8") as fh:
+            _lock_pgids(fh)
+            fh.write(f"{pgid} {started_at}\n")
+        return True
+    except OSError:
+        return False
+
+
+def _forget_agent_pgid(path: Path, pgid: int) -> None:
+    """Remove this group's line after a normal reap, keeping other lanes' lines.
+
+    Read-modify-write under the same lock as the append, so a concurrent lane
+    finishing (or starting) in this process cannot have its record dropped.
+    """
+    try:
+        with path.open("a+", encoding="utf-8") as fh:
+            _lock_pgids(fh)
+            fh.seek(0)
+            lines = fh.readlines()
+            kept = [line for line in lines if line.split()[:1] != [str(pgid)]]
+            if len(kept) != len(lines):
+                fh.seek(0)
+                fh.truncate()
+                fh.writelines(kept)
+    except OSError:
+        pass
+
+
+# A record in ``.agent-pgids`` must never outlive the group it names: the run
+# reaper decides from a *live* leader, so a pgid that is already gone can only
+# mislead it (or, once recycled, point it at an unrelated group). The record is
+# removed only after the spawn has been drained, which is strictly after the
+# leader exits — a window in which the group would otherwise vanish while the
+# line is still readable. A keeper in the leader's session closes that window:
+# it polls the leader cheaply and lingers a moment after it goes away. It is
+# backgrounded *before* ``exec``, so the agent stays the session/group leader
+# and keeps its pid, rc and streams; its stdio is /dev/null so it can never
+# hold the drain pipes open.
+_GROUP_KEEPER_POLL_S = 0.2
+_GROUP_KEEPER_LINGER_S = 0.5
+_GROUP_KEEPER_SHIM = (
+    f'( l=$$; while kill -0 "$l" 2>/dev/null; do sleep {_GROUP_KEEPER_POLL_S}; done; '
+    f'sleep {_GROUP_KEEPER_LINGER_S} ) </dev/null >/dev/null 2>&1 &\n'
+    'exec "$@"'
+)
+
+
+def _executable_exists(exe: str, env: Mapping[str, str], cwd: str | None) -> bool:
+    """Whether ``env``/``cwd`` would let ``execve`` find ``exe``.
+
+    Only used to decide whether wrapping in the keeper shim is safe: a target
+    that does not exist must still reach ``Popen`` unwrapped, so the documented
+    ``(127, "", "spawn failed: ...")`` contract is preserved rather than being
+    replaced by the shell's own "not found" message.
+    """
+    if "/" in exe:
+        target = exe if os.path.isabs(exe) or cwd is None else os.path.join(cwd, exe)
+        return os.access(target, os.X_OK)
+    return shutil.which(exe, path=env.get("PATH") or os.defpath) is not None
+
+
+def _spawn_argv(argv: Sequence[str], env: Mapping[str, str], cwd: str | None,
+                *, keep_group: bool) -> list[str]:
+    """``argv`` itself, or the keeper shim around it for a recorded group."""
+    if not keep_group or not argv or not _executable_exists(argv[0], env, cwd):
+        return list(argv)
+    # ``$0`` is a placeholder so ``"$@"`` is exactly the caller's argv.
+    return ["/bin/sh", "-c", _GROUP_KEEPER_SHIM, "mini-ork-agent", *argv]
+
 
 # Advisory chatter the Claude CLI prints to stderr at startup, before it does any
 # work: the connectors notice on any lane that sets an ANTHROPIC_* auth source
@@ -259,12 +372,16 @@ def spawn_local(
     # sees the variable. Fall back to the process env for direct callers.
     child_env = dict(env)
     live_path = child_env.pop("MO_LIVE_FILE", "") or None
+    # Only a spawn that writes a pgid record needs the keeper shim; without a
+    # run dir the command is exec'd exactly as the caller passed it.
+    pgids_path = _agent_pgids_path(child_env)
+    spawn_argv = _spawn_argv(argv, child_env, cwd, keep_group=pgids_path is not None)
     # Wall clock, not monotonic: the operator's 130-2664 s outliers are
     # wall-clock durations, and macOS's monotonic clock stops during sleep.
     spawned_at = time.time()
     try:
         proc = subprocess.Popen(
-            list(argv),
+            spawn_argv,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -280,6 +397,22 @@ def spawn_local(
         )
     except OSError as exc:
         return 127, "", f"spawn failed: {exc}"
+
+    # Record the group so the run reaper can stop it if this dispatcher dies
+    # before its teardown (RBF-25). ``start_new_session`` above makes the
+    # leader's pid its pgid. Best-effort: a failed write must not fail the lane.
+    pgid: int | None = None
+    recorded = False
+    if pgids_path is not None:
+        try:
+            pgid = os.getpgid(proc.pid)
+        except OSError:
+            pgid = None
+        if pgid is not None:
+            # Post-spawn wall clock: it is >= the child's real start, so the
+            # reaper's ``started <= ts + slack`` guard can never skip our own
+            # group because a slow ``Popen`` pushed the record earlier than it.
+            recorded = _record_agent_pgid(pgids_path, pgid, int(time.time()))
 
     with open_live_writer(live_path) as live:
         stdout_parts: list[str] = []
@@ -335,6 +468,10 @@ def spawn_local(
             reaped_at = time.time()
             for reader in readers:
                 reader.join(timeout=10)
+            # The group is dead (SIGKILL was delivered): drop its bookkeeping
+            # line so a later reap does not signal a recycled pid.
+            if recorded and pgids_path is not None and pgid is not None:
+                _forget_agent_pgid(pgids_path, pgid)
             return 124, "", (
                 f"timeout after {timeout}s "
                 f"(spawned→kill {killed_at - spawned_at:.0f}s, "
@@ -345,6 +482,10 @@ def spawn_local(
         # child is reaped, so this returns as soon as the pipes close.
         for reader in readers:
             reader.join()
+
+    # Normal reap: the group is gone, so its record must not outlive it.
+    if recorded and pgids_path is not None and pgid is not None:
+        _forget_agent_pgid(pgids_path, pgid)
 
     return proc.returncode, "".join(stdout_parts), "".join(stderr_parts)
 

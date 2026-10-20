@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -34,10 +35,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from mini_ork.dispatch.core import AGENT_PGIDS_FILE
 from mini_ork.remote.providers.base import clear_stale_run_lock
 from mini_ork.run_status import TERMINAL
 
 PID_FILE = ".pid"
+# How long a stopped agent group gets to honour SIGTERM before SIGKILL.
+_AGENT_TERM_GRACE_S = 5.0
 # A process that started after its .pid was written is a different process
 # wearing a recycled pid. The slack absorbs mtime / lstart second rounding.
 _START_SLACK_S = 2
@@ -352,6 +356,77 @@ def _pid_alive(pid: int, written_at: float) -> bool:
     return not stat.startswith("Z") and started <= written_at + _START_SLACK_S
 
 
+# ── agent process groups (written by dispatch/core.py) ─────────────────────
+
+def _group_alive(pgid: int) -> bool:
+    """True while any process (zombies included) still belongs to ``pgid``."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by another user
+    except OSError:
+        return False
+    return True
+
+
+def _recorded_agent_groups(run_dir: Path) -> list[tuple[int, float]]:
+    """``(pgid, recorded start ts)`` lines from ``.agent-pgids``, malformed skipped."""
+    try:
+        text = (run_dir / AGENT_PGIDS_FILE).read_text(encoding="utf-8")
+    except OSError:
+        return []
+    groups: list[tuple[int, float]] = []
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) != 2:
+            continue
+        try:
+            groups.append((int(fields[0]), float(fields[1])))
+        except ValueError:
+            continue
+    return groups
+
+
+def _stop_agent_groups(run_dir: Path, *, grace_s: float = _AGENT_TERM_GRACE_S) -> int:
+    """SIGTERM, then SIGKILL after ``grace_s``, every live agent group of a dead run.
+
+    Agents are spawned detached (``start_new_session`` in
+    ``dispatch/core.py``), so a dispatcher that dies without teardown leaves
+    them running; the reaper fails the row and must also end the work it was
+    driving (RBF-25). The recorded start ts reuses :func:`_pid_alive`'s
+    start-time guard: a group whose leader started AFTER the record is a
+    recycled pid and is never signalled — killing an unrelated process would be
+    worse than the orphan.
+
+    Best-effort: each group is independent, and an unreadable record or a
+    lookup/permission failure is skipped rather than raised out of reap.
+    Returns how many groups were signalled.
+    """
+    stopped = 0
+    own_pgid = os.getpgrp()
+    for pgid, recorded_at in _recorded_agent_groups(run_dir):
+        if pgid <= 1 or pgid == own_pgid:
+            continue  # never our own group, init, or an impossible pgid
+        if not _pid_alive(pgid, recorded_at):
+            continue
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            continue
+        deadline = time.monotonic() + grace_s
+        while _group_alive(pgid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if _group_alive(pgid):
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        stopped += 1
+    return stopped
+
+
 def probe(run_dir: Path) -> Probe:
     """Is the process that owns this run still alive?
 
@@ -497,11 +572,20 @@ def reap(home: Path, *, dry_run: bool = False, stale_after: int | None = None,
                 _close_dangling_node_events(db_for(home), run_id)
                 if found.verdict == "dead":
                     (run_dir / PID_FILE).unlink(missing_ok=True)
-                    # The owner died without teardown, so its Daytona node and
-                    # per-node sandboxes were never released. The row is
-                    # provably `failed` by now, so no provisioner can adopt them.
+                    # The owner died without teardown, so its agents still run
+                    # in their detached process groups. Stop them BEFORE the
+                    # remote release: they are work this run was driving and
+                    # nothing else will ever end it (RBF-25).
+                    stopped = _stop_agent_groups(run_dir)
+                    # Its Daytona node and per-node sandboxes were never
+                    # released either. The row is provably `failed` by now, so
+                    # no provisioner can adopt them.
                     released = _release_remote_nodes(run_dir, run_id)
-                    suffix = f"released {released} node(s)"
+                    parts = []
+                    if stopped:
+                        parts.append(f"stopped {stopped} agent group(s)")
+                    parts.append(f"released {released} node(s)")
+                    suffix = "; ".join(parts)
                     con.execute(
                         "UPDATE task_runs SET notes = COALESCE(notes || '; ', '') || ? "
                         "WHERE id = ?", (suffix, run_id))

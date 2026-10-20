@@ -430,6 +430,37 @@ def _extract_implementer_notes(run_dir: Path) -> list[str]:
     return notes
 
 
+def _strip_stream_json(text: str) -> str:
+    """Drop stream-JSON lines from a detail before it is truncated or stored.
+
+    A lane's raw thinking stream (``agent-*.live.jsonl``) is thousands of
+    one-line JSON records; carrying them into a 2 KB operator-facing ``detail``
+    buries the one line that says what failed. A *stream-JSON* line is a line
+    that parses as a JSON object carrying a ``type`` key (the kickoff's
+    definition). Plain lines and JSON records without ``type`` — structured
+    errors such as ``{"error": "..."}`` — are evidence and are kept. A line
+    that does not parse at all is kept too: it is text, not a stream record.
+    """
+    if not text:
+        return text
+    lines = text.splitlines()
+    kept = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("{"):
+            try:
+                value = json.loads(stripped)
+            except (ValueError, TypeError):
+                kept.append(line)
+                continue
+            if isinstance(value, dict) and "type" in value:
+                continue
+        kept.append(line)
+    # Leave untouched input byte-identical (a trailing newline, say) so the
+    # sanitiser is invisible to callers whose detail carries no stream records.
+    return "\n".join(kept) if len(kept) != len(lines) else text
+
+
 def _verifier_reason(payload: dict[str, Any]) -> str:
     """The verifier's reason field — first 800 chars across the candidate keys.
 
@@ -438,13 +469,17 @@ def _verifier_reason(payload: dict[str, Any]) -> str:
     than prose. Without them the run reached case 5 as "the cause was not
     classified" while the verifier's own artefact held the exact list — the
     most informative file in the run dir, unread.
+
+    Stream-JSON lines are stripped *before* truncation: a raw thinking stream
+    would otherwise fill the 800-char budget with records, pushing the actual
+    failure out (RBF-25).
     """
     for key in ("reason", "error_summary", "reasons", "detail", "missing",
                 "failures", "blocking"):
         v = payload.get(key)
         if v:
             text = "; ".join(str(x) for x in v) if isinstance(v, list) else str(v)
-            return text[:800]
+            return _strip_stream_json(text)[:800]
     return ""
 
 
@@ -477,7 +512,7 @@ def _extract_review_detail(text: str) -> str:
         if isinstance(items, list) and items:
             lines = [str(x) for x in items[:3] if x]
             joined = "\n".join(lines)
-            return joined[:800]
+            return _strip_stream_json(joined)[:800]
     return ""
 
 
@@ -638,7 +673,11 @@ def _tail_log(run_dir: Path, node_name: str, *, n: int = 20) -> str:
             continue
         lines = data.splitlines()[-n:]
         if lines:
-            return "\n".join(lines)[:2000]
+            # Strip BEFORE truncating: 20 stream-JSON records are far longer
+            # than the 2000-char cap, so truncating first would spend the whole
+            # detail on thinking tokens and drop the plain failure lines below
+            # them (RBF-25: a run's retry hint carried 2 KB of stream JSON).
+            return _strip_stream_json("\n".join(lines))[:2000]
     return ""
 
 
@@ -1105,7 +1144,7 @@ def _case_stopped(notes: str, run_id: str) -> dict[str, Any] | None:
         "needs_change": {
             "kind": "stopped",
             "summary": "Stopped by the operator — not a failure to repair",
-            "detail": notes[:800],
+            "detail": _strip_stream_json(notes)[:800],
             "evidence": "task_runs.notes: killed-by-user",
         },
         "notes": [],
@@ -1168,7 +1207,7 @@ def _case_not_started(home: Path, run_dir: Path, run_id: str, notes: str,
         "needs_change": {
             "kind": "not-started",
             "summary": summary,
-            "detail": notes[:800] or _tail_log(run_dir, ""),
+            "detail": _strip_stream_json(notes)[:800] or _tail_log(run_dir, ""),
             "evidence": evidence,
         },
         "notes": [],
@@ -1512,7 +1551,7 @@ def _case_lane_unavailable(home: Path, run_id: str, run_dir: Path,
         alias = _row_alias(row)
         error_kind = str(row.get("error_category") or "quota")
         failed_node = _failed_node_for_alias(starts, ends, alias)
-        detail = str(row.get("error_message") or "")[:400]
+        detail = _strip_stream_json(str(row.get("error_message") or ""))[:400]
     else:
         # Legacy: NULL error_category. The 429 lives in the provider stream, not
         # the row. Each candidate must be a node this run actually dispatched
@@ -1633,7 +1672,7 @@ def _case_planner_lane(home: Path, run_id: str,
     if not alias or not lane:
         return None
     error_kind = str(row.get("error_category") or "quota")
-    detail = str(row.get("error_message") or "")[:400]
+    detail = _strip_stream_json(str(row.get("error_message") or ""))[:400]
 
     suggestions: list[dict[str, str]] = []
     try:
@@ -1718,7 +1757,8 @@ def _case_planner_shape(home: Path, run_id: str,
     alias = _row_alias(shape_rows[0]) if shape_rows else "planner"
     provider = str(shape_rows[0].get("provider") or "") if shape_rows else ""
     detail = "; ".join(
-        str(r.get("error_message") or "")[:200] for r in shape_rows[:3]
+        _strip_stream_json(str(r.get("error_message") or ""))[:200]
+        for r in shape_rows[:3]
     )
     if not detail:
         detail = "the planner dispatcher returned rc 65 (shape rejection)"
