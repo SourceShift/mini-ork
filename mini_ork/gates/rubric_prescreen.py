@@ -524,6 +524,133 @@ def mo_run_rubric_prescreen(
             pass
 
 
+_VERIFIER_EVIDENCE_PREFIX = "verifier_"
+_VERIFIER_EVIDENCE_SUFFIX = ".json"
+_VERIFIER_NODE_SUFFIX = "verifier"
+
+
+def _norm_verifier_key(value: str) -> str:
+    """Lower-case, separator-free form used to relate a node id to a stem."""
+    return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
+
+
+def _verifier_node_end_keys(db_path: str, run_id: str) -> tuple[set[str], set[str]]:
+    """Evidence names/node ids claimed by this run's verifier ``node_end`` events.
+
+    Returns ``(artifact_basenames, normalised_node_ids)``. Node identity lives
+    inside ``payload_json``; verifier handlers bypass the trace seam, so
+    ``artifact_path`` is often absent and the node id is the only link back to
+    ``verifier_<stem>.json``. Any DB/table/payload problem yields empty sets,
+    which makes the caller treat every verifier file as unprovenanced — the
+    evidence has no provenance witness, so it must not be graded.
+    """
+    names: set[str] = set()
+    node_ids: set[str] = set()
+    if not db_path or not run_id or not os.path.isfile(db_path):
+        return names, node_ids
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+        try:
+            rows = con.execute(
+                "SELECT payload_json FROM run_events "
+                "WHERE run_id = ? AND event_type = 'node_end'",
+                (run_id,)).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return names, node_ids
+    for (payload,) in rows:
+        try:
+            data = json.loads(payload or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(data, dict) or data.get("node_type") != "verifier":
+            continue
+        artifact = os.path.basename(str(data.get("artifact_path") or ""))
+        if artifact:
+            names.add(artifact)
+        node_id = _norm_verifier_key(data.get("node_id"))
+        if node_id.endswith(_VERIFIER_NODE_SUFFIX):
+            node_id = node_id[: -len(_VERIFIER_NODE_SUFFIX)]
+        if node_id:
+            node_ids.add(node_id)
+    return names, node_ids
+
+
+def _unprovenanced_verifier_files(run_dir: str, db_path: str) -> list[str]:
+    """``verifier_<stem>.json`` files the run has no verifier ``node_end`` for.
+
+    A run dir is writable by the agents the run spawns, so a verifier payload
+    the implementer wrote itself is not evidence — it only counts when a
+    verifier node of this run actually ended with that evidence file. The
+    ignored files are returned so the caller can log them.
+    """
+    try:
+        names = sorted(
+            name for name in os.listdir(run_dir)
+            if name.startswith(_VERIFIER_EVIDENCE_PREFIX)
+            and name.endswith(_VERIFIER_EVIDENCE_SUFFIX)
+            and not name.startswith(".")
+        )
+    except OSError:
+        return []
+    if not names:
+        return []
+    run_id = os.environ.get("MINI_ORK_RUN_ID", "") \
+        or os.path.basename(str(run_dir).rstrip(os.sep))
+    artifact_names, node_ids = _verifier_node_end_keys(db_path, run_id)
+    ignored = []
+    for name in names:
+        if name in artifact_names:
+            continue
+        stem = name[len(_VERIFIER_EVIDENCE_PREFIX):
+                   -len(_VERIFIER_EVIDENCE_SUFFIX)]
+        stem_key = _norm_verifier_key(stem)
+        proven = bool(stem_key) and any(
+            node_id == stem_key
+            or (len(node_id) >= 3 and stem_key.startswith(node_id))
+            or (len(stem_key) >= 3 and node_id.startswith(stem_key))
+            for node_id in node_ids
+        )
+        if not proven:
+            ignored.append(name)
+    return ignored
+
+
+def _artifact_summary_without(run_dir: str, ignored: set[str]) -> str:
+    """``artifact_summary`` over the run dir minus the ignored evidence files.
+
+    The summary is built from a throwaway view of symlinks rather than by
+    parsing its text: samples may themselves contain ``###`` lines, so a
+    textual section strip could leak the tail of an ignored payload into the
+    grader prompt.
+    """
+    if not ignored:
+        return artifact_summary(run_dir)
+    import shutil
+    import tempfile
+
+    view = tempfile.mkdtemp(prefix="mo-rubric-view-")
+    try:
+        try:
+            entries = os.listdir(run_dir)
+        except OSError:
+            return ""
+        for name in entries:
+            if name in ignored:
+                continue
+            src = os.path.join(run_dir, name)
+            if not os.path.isfile(src):
+                continue
+            try:
+                os.symlink(os.path.abspath(src), os.path.join(view, name))
+            except OSError:
+                pass
+        return artifact_summary(view)
+    finally:
+        shutil.rmtree(view, ignore_errors=True)
+
+
 def mo_rubric_run_score(
     kickoff_path: str,
     run_dir: str,
@@ -567,7 +694,18 @@ def mo_rubric_run_score(
     rubric_path = f"{run_dir}/rubric.json"
     verdict_path = f"{run_dir}/panel-verdict.json"
 
-    artifacts = artifact_summary(run_dir)
+    # Evidence provenance: a verifier_<stem>.json counts only when a verifier
+    # node of THIS run ended with that evidence file. An agent-written pass
+    # payload with no verifier behind it must not reach the grader
+    # (run-1792224150-80303 / vg-1-kickoff-contract-20261015-123125).
+    ignored_evidence = _unprovenanced_verifier_files(run_dir, mini_ork_db)
+    if ignored_evidence:
+        print(
+            "  rubric: ignoring verifier evidence with no matching verifier "
+            f"node_end: {', '.join(ignored_evidence)}",
+            file=__import__("sys").stderr,
+        )
+    artifacts = _artifact_summary_without(run_dir, set(ignored_evidence))
     if not artifacts:
         artifacts = "(run dir contains no readable artifacts)"
 

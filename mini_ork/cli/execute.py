@@ -2625,6 +2625,145 @@ def _researcher_output_file(run_dir, recipe, node_id):
     return os.path.join(run_dir, f"context-{node_id}.json")
 
 
+def _run_id_from_run_dir(run_dir):
+    """The run id a run dir is named after (the engine's stable identity)."""
+    return os.path.basename(str(run_dir or "").rstrip(os.sep))
+
+
+def _read_profile_roots(run_dir):
+    """The run's persisted ``run_profile.json["roots"]`` dict, else ``None``."""
+    prof_path = os.path.join(run_dir or "", "run_profile.json")
+    if not prof_path or not os.path.isfile(prof_path):
+        return None
+    try:
+        with open(prof_path, encoding="utf-8") as fh:
+            prof = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    roots = prof.get("roots") if isinstance(prof, dict) else None
+    return roots if isinstance(roots, dict) else None
+
+
+def _canonical_roots_sha256(roots):
+    """sha256 of the canonical roots JSON (stable across key reordering)."""
+    try:
+        blob = json.dumps(roots, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return ""
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _pre_impl_seal_path(run_dir):
+    """Path of this run's baseline seal, OUTSIDE the run dir and target tree.
+
+    ``<MINI_ORK_HOME>/state/seals/<run_id>.json`` — the run dir is writable by
+    the agent the run spawns and the target tree is its edit surface, so a
+    baseline kept there is self-certified evidence. The engine's home is not
+    reachable from either. ``MINI_ORK_HOME`` is read from the run context
+    first: roots.home comes from the rewritable profile and must not be the
+    sole pointer to the seal (an implementer could re-point it).
+    """
+    home = context_env("MINI_ORK_HOME", "")
+    if not home:
+        roots = load_run_roots(run_dir)
+        home = roots.home if roots else ""
+    if not home:
+        return ""
+    return os.path.join(home, "state", "seals",
+                        f"{_run_id_from_run_dir(run_dir)}.json")
+
+
+def _write_pre_impl_seal(run_dir, ref, roots):
+    """Seal ``pre-implementer-ref`` + the roots hash outside the run dir.
+
+    Idempotent by construction: only called from the one-shot capture, which
+    returns early once the run-dir ref exists. Best-effort — a missing home or
+    unwritable store must not abort the capture — but the ground-truth check
+    fails closed only when a seal it can read disagrees.
+    """
+    seal_path = _pre_impl_seal_path(run_dir)
+    if not seal_path or not ref:
+        return
+    seal = {"pre_implementer_ref": ref}
+    if isinstance(roots, dict):
+        seal["roots_sha256"] = _canonical_roots_sha256(roots)
+        # The hash proves tampering; the copy lets the check RESTORE the roots
+        # the run started with (the kickoff requires restoring, not just
+        # reporting).
+        seal["roots"] = roots
+    try:
+        os.makedirs(os.path.dirname(seal_path), exist_ok=True)
+        with open(seal_path, "w", encoding="utf-8") as fh:
+            json.dump(seal, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+    except OSError:
+        return
+
+
+def _restore_rewritten_baseline(run_dir):
+    """Ground-truth check: are the run-dir baseline files the sealed ones?
+
+    Reads the engine-side seal (never the run-dir files alone) and compares
+    both witnesses the run pinned before the implementer: the
+    ``pre-implementer-ref`` content and the sha256 of ``roots``. On a mismatch
+    it restores what the seal carries and returns the failure reason; on an
+    intact baseline (or no seal, e.g. a legacy run) it returns ``None``.
+    """
+    seal_path = _pre_impl_seal_path(run_dir)
+    if not seal_path or not os.path.isfile(seal_path):
+        return None
+    try:
+        with open(seal_path, encoding="utf-8") as fh:
+            seal = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(seal, dict):
+        return None
+    sealed_ref = str(seal.get("pre_implementer_ref") or "").strip()
+    if not sealed_ref:
+        return None
+
+    rewritten = False
+    ref_path = os.path.join(run_dir, "pre-implementer-ref")
+    try:
+        with open(ref_path, encoding="utf-8") as fh:
+            current_ref = fh.read().strip()
+    except OSError:
+        current_ref = ""
+    if current_ref != sealed_ref:
+        rewritten = True
+        try:
+            with open(ref_path, "w", encoding="utf-8") as fh:
+                fh.write(sealed_ref + "\n")
+        except OSError:
+            pass
+
+    sealed_roots_hash = str(seal.get("roots_sha256") or "")
+    if sealed_roots_hash:
+        roots = _read_profile_roots(run_dir)
+        if not isinstance(roots, dict) \
+                or _canonical_roots_sha256(roots) != sealed_roots_hash:
+            rewritten = True
+            sealed_roots = seal.get("roots")
+            if isinstance(sealed_roots, dict):
+                prof_path = os.path.join(run_dir, "run_profile.json")
+                try:
+                    with open(prof_path, encoding="utf-8") as fh:
+                        prof = json.load(fh)
+                    if not isinstance(prof, dict):
+                        prof = {}
+                    prof["roots"] = sealed_roots
+                    with open(prof_path, "w", encoding="utf-8") as fh:
+                        json.dump(prof, fh, indent=2, sort_keys=True)
+                        fh.write("\n")
+                except (OSError, ValueError):
+                    pass
+
+    if rewritten:
+        return "baseline files rewritten during the run"
+    return None
+
+
 def _capture_pre_impl_baseline(run_dir):
     """Snapshot the working-tree state BEFORE the implementer edits, so the
     reviewer diff (below) captures ONLY the implementer's delta — never
@@ -2675,6 +2814,11 @@ def _capture_pre_impl_baseline(run_dir):
                 ["git", "-C", cwd, "update-ref", f"refs/mo/pre-impl/{run_id}", ref],
                 capture_output=True,
             )
+            # Seal the just-pinned baseline OUTSIDE the run dir and the target
+            # tree, so the ground-truth check has a witness the implementer
+            # cannot rewrite (run-1792224150-80303 re-pointed the run-dir ref
+            # and the rubric then scored the implementer's own evidence 8/8).
+            _write_pre_impl_seal(run_dir, ref, _read_profile_roots(run_dir))
         # `git stash create` snapshots TRACKED state only. Record the untracked
         # inventory too, so the ground-truth harvest can tell implementer-created
         # files apart from pre-existing untracked dirt (a node_modules symlink,
@@ -2879,6 +3023,15 @@ def _harvest_framework_edit_ground_truth(run_dir, target):
     """
     if not run_dir or not target:
         return True, ""
+    # Provenance, before the harvest trusts anything in the run dir: the ref
+    # and roots this run pinned BEFORE the implementer were sealed outside the
+    # run dir. A rewritten baseline is agent-authored evidence — restore the
+    # sealed values and fail the node as a config error instead of diffing
+    # from a base the implementer chose.
+    rewritten = _restore_rewritten_baseline(run_dir)
+    if rewritten:
+        print(f"  [ground-truth] FAIL: {rewritten}", file=sys.stderr)
+        return False, "config"
     try:
         if subprocess.run(["git", "-C", target, "rev-parse", "--git-dir"],
                           capture_output=True).returncode != 0:
