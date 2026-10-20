@@ -440,6 +440,41 @@ def _fuse_window_hours() -> int:
     return _int_or(os.environ.get("MO_FUSE_WINDOW_HOURS"), _FUSE_WINDOW_HOURS)
 
 
+def _current_placement() -> str:
+    """The placement label a dispatch runs under: ``host`` or the node env name.
+
+    RB-24: the lane fuse was keyed on ``model_id`` alone, so a credential
+    failure recorded on a remote node (``daytona``) opened the fuse for every
+    HOST dispatch of that lane too, and runs were refused at plan stage (rc 43)
+    under a placement where the lane had never failed.
+
+    Same source as the lifecycle's publisher (``runtime/placement_env.py``):
+    ``MO_PLACEMENT``/``MO_NODE_ENV`` through ``context_env``. A missing or
+    ``local`` placement is ``host`` (the historic default, so pre-change rows —
+    which carry no placement at all — keep counting for host dispatches). A
+    ``remote`` placement names its node env; with the env missing it stays the
+    literal ``remote`` rather than silently degrading to ``host``.
+    """
+    placement = (context_env("MO_PLACEMENT") or "").strip().lower()
+    if placement in ("", "local"):
+        return "host"
+    return (context_env("MO_NODE_ENV") or "").strip() or "remote"
+
+
+# A pre-spawn portability guard refuses a lane before anything is sent: the
+# anthropic-native lane's local login cannot travel to the node. Anchored to the
+# guard's own prefix + marker, NOT a general "config"/"api key" match — the
+# RB-10 lesson: a broad text rule misfires on unrelated provider errors.
+_PRESPAWN_GUARD_PREFIX = "remote placement: lane "
+_PRESPAWN_GUARD_MARKER = "api key is missing on the node"
+
+
+def _is_prespawn_guard_refusal(message: str) -> bool:
+    """True when ``message`` is the remote placement's pre-spawn secret guard."""
+    text = (message or "").strip()
+    return text.startswith(_PRESPAWN_GUARD_PREFIX) and _PRESPAWN_GUARD_MARKER in text
+
+
 def fuse_categories() -> tuple[tuple[str, int], ...]:
     """The ``(category, strikes)`` pairs the fuse watches.
 
@@ -457,7 +492,8 @@ def fuse_categories() -> tuple[tuple[str, int], ...]:
     return tuple(watch)
 
 
-def check_lane_fuse(db, lane: str, category: str, *, strikes: int = 3) -> bool:
+def check_lane_fuse(db, lane: str, category: str, *, strikes: int = 3,
+                    placement: str | None = None) -> bool:
     """True when the fuse is OPEN — this lane's last ``strikes`` calls all failed
     with ``category``, within the recency window.
 
@@ -484,15 +520,29 @@ def check_lane_fuse(db, lane: str, category: str, *, strikes: int = 3) -> bool:
 
     Guard-generated rows are excluded from the streak: ``feature_name`` ending
     ``:refused`` (a refusal names the fuse's own category and must not be
-    self-sustaining) and ``actor`` ending ``:crash`` (a dispatcher crash records
-    the engine's own death, not a provider verdict on this lane). The ``:crash``
-    predicate is only added when the schema has an ``actor`` column, and a NULL
-    actor still counts — older ledgers and test fixtures predate it.
+    self-sustaining), ``actor`` ending ``:refused`` (a pre-spawn portability
+    guard refused the lane before anything ran — RB-24: the remote secret guard
+    is worded as ``config`` and used to open the fuse under a placement where
+    no call was ever attempted) and ``actor`` ending ``:crash`` (a dispatcher
+    crash records the engine's own death, not a provider verdict on this lane).
+    The ``:crash``/``:refused`` predicates are only added when the schema has an
+    ``actor`` column, and a NULL actor still counts — older ledgers and test
+    fixtures predate it.
+
+    RB-24: strikes are also scoped to the dispatch's ``placement`` (default:
+    ``_current_placement()``). A credential failure recorded on ``daytona``
+    must not open the fuse for a host dispatch of the same lane. Rows written
+    before the placement key existed have no ``metadata_json.placement`` and
+    count as ``host`` — that is the "missing placement = host" contract, and it
+    keeps legacy ledgers (and fixtures that never set the env) behaving as
+    before. If the schema has no ``metadata_json`` column at all, only ``host``
+    can match.
     """
     if not (db and os.path.isfile(db) and lane and category):
         return False
     if _int_or(strikes, 0) < 1:
         return False
+    placement = placement if placement is not None else _current_placement()
     try:
         con = sqlite3.connect(db, timeout=5.0)
         con.execute("PRAGMA busy_timeout=5000")
@@ -502,16 +552,31 @@ def check_lane_fuse(db, lane: str, category: str, *, strikes: int = 3) -> bool:
         where = ["model_id = ?",
                  "feature_name NOT LIKE '%:refused'",
                  "feature_name NOT LIKE '%:crash'"]
+        params = [lane]
         if "actor" in cols:
             # A dispatcher-crash row marks itself with an ``actor`` suffix
             # (feature_name stays the node name), so the exclusion reads actor.
             where.append("(actor IS NULL OR actor NOT LIKE '%:crash')")
+            # The pre-spawn secret guard writes ``actor:refused`` (feature_name
+            # stays the node name) — same shape, and it must never be a strike.
+            where.append("(actor IS NULL OR actor NOT LIKE '%:refused')")
+        if "metadata_json" in cols:
+            # json_extract raises on malformed JSON, so guard with json_valid;
+            # NULL/invalid/absent placement all resolve to the historic host.
+            where.append(
+                "CASE WHEN json_valid(metadata_json) THEN"
+                " COALESCE(json_extract(metadata_json, '$.placement'), 'host')"
+                " ELSE 'host' END = ?")
+            params.append(placement)
+        elif placement != "host":
+            con.close(); return False
         where.append("datetime(ts) > datetime('now', ?)")
+        params.append(f"-{_fuse_window_hours()} hours")
+        params.append(_int_or(strikes, 1))
         rows = con.execute(
             "SELECT status, error_category FROM llm_calls WHERE "
             + " AND ".join(where)
-            + " ORDER BY id DESC LIMIT ?",
-            (lane, f"-{_fuse_window_hours()} hours", _int_or(strikes, 1))).fetchall()
+            + " ORDER BY id DESC LIMIT ?", params).fetchall()
         con.close()
     except Exception:
         return False
@@ -520,7 +585,7 @@ def check_lane_fuse(db, lane: str, category: str, *, strikes: int = 3) -> bool:
     return all(status == "failed" and err == category for status, err in rows)
 
 
-def _apply_lane_fuse(db, chain: str) -> tuple[str, str]:
+def _apply_lane_fuse(db, chain: str, *, placement: str | None = None) -> tuple[str, str]:
     """Narrow a comma-joined chain by dropping lanes whose fuse is open.
 
     Returns ``(chain, refused_category)``. ``refused_category`` is non-empty
@@ -529,14 +594,21 @@ def _apply_lane_fuse(db, chain: str) -> tuple[str, str]:
     A partially-fused chain is narrowed and logged — a quota-walled tail lane
     costs a full attempt-timeout before the walk abandons it, which is exactly
     the stall the fallback chain exists to prevent.
+
+    ``placement`` is resolved once and applied to every lane: one dispatch runs
+    under one placement, and the chain view must agree with the single-lane
+    view (RB-24).
     """
     lanes = [m.strip() for m in str(chain).split(",") if m.strip()]
     if not lanes or not (db and os.path.isfile(db)):
         return chain, ""
+    if placement is None:
+        placement = _current_placement()
     fused: dict[str, str] = {}
     for lane in lanes:
         for category, strikes in fuse_categories():
-            if check_lane_fuse(db, lane, category, strikes=strikes):
+            if check_lane_fuse(db, lane, category, strikes=strikes,
+                               placement=placement):
                 fused[lane] = category
                 break
     if not fused:
@@ -584,9 +656,18 @@ def write_llm_calls_row(db, provider, model_id, tier, feature_name, actor, statu
     import json as _json
     try:
         _md = _json.loads(metadata_json or "{}")
-        _sess = _md.get("session_id") if isinstance(_md, dict) else None
     except Exception:
-        _sess = None
+        _md = {}
+    if not isinstance(_md, dict):
+        _md = {}
+    # RB-24: every row records the placement it ran under, so the lane fuse can
+    # be keyed per (lane, placement) instead of lane alone. Merged into the
+    # caller's metadata rather than replacing it (refusals keep ``refused``,
+    # attempts keep ``dispatch_attempt``/``chain``) — and this is the one choke
+    # point every llm_calls writer here goes through.
+    _md["placement"] = _current_placement()
+    _sess = _md.get("session_id")
+    metadata_json = _json.dumps(_md)
     try:
         con = sqlite3.connect(db, timeout=_LEDGER_BUSY_TIMEOUT_S)
     except sqlite3.Error as exc:
@@ -956,13 +1037,24 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
             text = (getattr(result, "text", "") or "").strip()
             if ok and text:
                 return
-            err = redact_secrets((getattr(result, "error", "") or "empty output")[:200])
+            raw_err = getattr(result, "error", "") or "empty output"
+            err = redact_secrets(raw_err[:200])
             category = classify_error(err, getattr(result, "rc", 1))
+            row_actor = actor
+            if _is_prespawn_guard_refusal(raw_err):
+                # RB-24: a remote pre-spawn guard refused this lane before
+                # anything ran. Mark the row ``:refused`` so the fuse never
+                # counts it as this lane's verdict under this placement.
+                row_actor = actor + ":refused"
+                category = "config"
+                retryable = 0
+            else:
+                retryable = int(error_retryable(category))
             write_llm_calls_row(
-                db, provider_for_model(lane), lane, tier, feature, actor, "failed",
+                db, provider_for_model(lane), lane, tier, feature, row_actor, "failed",
                 int(getattr(result, "duration_ms", 0) or 0), "0", err,
                 metadata_json=json.dumps({"dispatch_attempt": attempt, "chain": str(model)}),
-                error_category=category, retryable=int(error_retryable(category)))
+                error_category=category, retryable=retryable)
         except Exception:  # noqa: BLE001 — telemetry must never break dispatch
             pass
 
@@ -1082,11 +1174,15 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
 
     duration_ms = int(time.time() * 1000) - start_ms
     _write_duration_ms(duration_ms)
-    err = ""
+    err_full = ""
     try:
-        err = (open(out_file + ".err.log", errors="ignore").read()[-200:])
+        # Read the WHOLE file for guard detection: the pre-spawn guard's
+        # identifying prefix is at the front, while the ledger column keeps the
+        # historic 200-char tail.
+        err_full = open(out_file + ".err.log", errors="ignore").read()
     except OSError:
         pass
+    err = err_full[-200:]
     # The claude-code wrapper hides the real provider rejection in a stdout
     # ``result`` object (``is_error: true``, ``api_error_status``, ``result``).
     # Surface it so ``error_message``/``error_category`` carry the provider's
@@ -1097,6 +1193,14 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
     err = redact_secrets(err)
     category = classify_error(err, rc)
     retryable = int(error_retryable(category))
+    row_actor = actor
+    if _is_prespawn_guard_refusal(err_full) or _is_prespawn_guard_refusal(provider_err):
+        # RB-24: nothing ran under this lane — the remote secret guard refused
+        # it before the spawn. Keep a visible row, but ``:refused`` keeps it
+        # out of the lane fuse's streak for this placement.
+        row_actor = actor + ":refused"
+        category = "config"
+        retryable = 0
     # A failed call still burned wall-clock, and partial provider usage often
     # survives in the sidecars — record both instead of hard zeros.
     cost_usd = "0"
@@ -1104,7 +1208,7 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
         cost_usd = open(out_file + ".cost").read().strip() or "0"
     in_tok, out_tok, cached_in, cache_create, thinking = _read_token_sidecar(
         out_file + ".tokens")
-    write_llm_calls_row(db, provider, selected_model, tier, feature, actor, "failed",
+    write_llm_calls_row(db, provider, selected_model, tier, feature, row_actor, "failed",
                         duration_ms, cost_usd, err, in_tok, out_tok, "{}", cached_in, cache_create,
                         error_category=category, retryable=retryable, thinking_tokens=thinking)
     sys.stderr.write(f"[llm_dispatch FAIL model={model} rc={rc}]\n")
