@@ -32,6 +32,18 @@ from mini_ork.cli import execute as ex  # noqa: E402
 from mini_ork.runtime import run_roots  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _launcher_not_child(monkeypatch):
+    """These tests exercise the launcher's ladder, not a spawned epic child.
+
+    Clear the spawned-child marker so an ambient ``MINI_ORK_TARGET_REPO`` (set
+    by the harness that runs this suite) stays a declaration: a child inherits
+    the parent's copy and ``resolve_run_roots`` correctly ignores it there
+    (``MINI_ORK_PARENT_RUN_ID`` is the discriminator).
+    """
+    monkeypatch.delenv("MINI_ORK_PARENT_RUN_ID", raising=False)
+
+
 def _git(repo: Path, *args: str) -> None:
     subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=True)
 
@@ -405,6 +417,11 @@ def test_home_staged_kickoff_does_not_pin_the_engine_checkout(tmp_path, monkeypa
     monkeypatch.setenv("MINI_ORK_HOME", str(home))
     monkeypatch.setenv("MINI_ORK_ROOT", str(worktree))
     monkeypatch.setenv("MINI_ORK_TARGET_REPO", str(worktree))
+    # Here the launch tree IS ``MINI_ORK_ROOT`` (the run edits its own engine
+    # worktree), so RBF-01's engine-coincidence guard applies: the self-edit
+    # flag is what distinguishes this from the silent fallback the guard
+    # exists to refuse. The assertion below is otherwise unchanged.
+    monkeypatch.setenv("MO_ALLOW_FRAMEWORK_CWD", "1")
     monkeypatch.delenv("MO_TARGET_CWD", raising=False)
     monkeypatch.delenv("MINI_ORK_ENGINE_ROOT", raising=False)
     monkeypatch.delenv("MO_SHARED_DRIVE_BACKEND", raising=False)
