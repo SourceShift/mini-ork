@@ -1017,6 +1017,10 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
     start_ms = int(time.time() * 1000)
     attempt = 1
     rc = 1
+    # Lanes whose attempt row already carries that attempt's real cost/tokens.
+    # The final failed row skips its usage when its lane is in here, so the
+    # last attempt of an all-lanes-failed chain is billed once, not twice.
+    attempt_rows_with_usage: set[str] = set()
 
     def _attempt_sink(lane: str, result) -> None:
         """Per-lane failed-attempt ledger row (the ``on_attempt`` observer).
@@ -1025,13 +1029,19 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
         the lanes that died mid-chain (minimax silent death, codex rc=1 in
         run-1791619207-22518) existed nowhere but the live-stream files. This
         sink writes one failed row per dead lane, attributed to THAT lane, with
-        the provider's own classified error. Cost and tokens are pinned to 0:
-        the wrapper's final success/failure row carries the sidecar numbers,
-        and ``cost_ledger.spent_last_24h`` sums every ``llm_calls.cost_usd`` —
-        duplicating partial usage here would double-count spend against the
-        daily budget. The ``metadata_json`` attempt marker lets a reader tell
-        attempt rows from final rows. The winning attempt is not recorded (the
-        success row below already names the serving lane)."""
+        the provider's own classified error.
+
+        RB-32b: a lane that returned output but failed the shape check was
+        *billed* by the provider, so its row carries that attempt's real
+        cost/tokens (``DispatchResult.cost_usd``/``.usage`` — both survive the
+        shape-reject downgrade in ``dispatch_with_fallback``). Pinning them to
+        0 undercounted 45 billed calls in one week. Recording them here does
+        not double-count: the final row carries only the FINAL attempt's usage,
+        and when every lane fails the final row drops its usage because this
+        sink already recorded that same attempt (``attempt_rows_with_usage``).
+        The ``metadata_json`` attempt marker lets a reader tell attempt rows
+        from final rows. The winning attempt is not recorded (the success row
+        below already names the serving lane)."""
         try:
             ok = bool(getattr(result, "ok", False))
             text = (getattr(result, "text", "") or "").strip()
@@ -1050,11 +1060,24 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
                 retryable = 0
             else:
                 retryable = int(error_retryable(category))
+            usage = getattr(result, "usage", None)
+            in_tok = int(getattr(usage, "input_tokens", 0) or 0)
+            out_tok = int(getattr(usage, "output_tokens", 0) or 0)
+            cached_in = int(getattr(usage, "cached_input_tokens", 0) or 0)
+            cache_create = int(getattr(usage, "cache_creation_tokens", 0) or 0)
+            thinking = getattr(usage, "thinking_tokens", None)
+            cost_usd = float(getattr(result, "cost_usd", 0.0) or 0.0)
             write_llm_calls_row(
                 db, provider_for_model(lane), lane, tier, feature, row_actor, "failed",
-                int(getattr(result, "duration_ms", 0) or 0), "0", err,
+                int(getattr(result, "duration_ms", 0) or 0), f"{cost_usd:.6f}", err,
+                in_tok, out_tok,
                 metadata_json=json.dumps({"dispatch_attempt": attempt, "chain": str(model)}),
-                error_category=category, retryable=retryable)
+                error_category=category, retryable=retryable,
+                cached_input_tokens=cached_in,
+                cache_creation_input_tokens=cache_create,
+                thinking_tokens=thinking)
+            if cost_usd or in_tok or out_tok or cached_in or cache_create:
+                attempt_rows_with_usage.add(lane)
         except Exception:  # noqa: BLE001 — telemetry must never break dispatch
             pass
 
@@ -1208,6 +1231,15 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
         cost_usd = open(out_file + ".cost").read().strip() or "0"
     in_tok, out_tok, cached_in, cache_create, thinking = _read_token_sidecar(
         out_file + ".tokens")
+    if selected_model in attempt_rows_with_usage:
+        # RB-32b: every lane failed and the LAST attempt (this result) already
+        # has its own attempt row carrying its real spend. The final row is the
+        # same attempt, not a chain total — leave its usage at zero so
+        # ``spent_last_24h`` counts the trial once. A single-lane failure has no
+        # attempt row, so its numbers stay here (the only row it gets).
+        cost_usd = "0"
+        in_tok = out_tok = cached_in = cache_create = 0
+        thinking = None
     write_llm_calls_row(db, provider, selected_model, tier, feature, row_actor, "failed",
                         duration_ms, cost_usd, err, in_tok, out_tok, "{}", cached_in, cache_create,
                         error_category=category, retryable=retryable, thinking_tokens=thinking)
