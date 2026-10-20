@@ -12,6 +12,7 @@
 #
 # Output: JSON to stdout. Exit code is always 0; caller reads .pass.
 
+import fnmatch
 import hashlib
 import importlib.util
 import io
@@ -525,6 +526,21 @@ def _read_kickoff():
     return "", ""
 
 
+def _read_kickoff_text():
+    """The full text of the first READABLE kickoff candidate (``""`` if none).
+
+    Same candidate order as ``_read_kickoff`` (run_profile.json's
+    ``kickoff_path``, then the run-local ``kickoff.md``), so the scope check
+    reads the kickoff the pipeline actually received."""
+    for path in _run_kickoff_candidates():
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                return fh.read()
+        except OSError:
+            continue
+    return ""
+
+
 def _load_pack():
     """The run's pre-run context-pack v2 (``{}`` when absent or unreadable).
 
@@ -673,6 +689,121 @@ _check("high-blast-radius-guard", "high-blast-radius paths require explicit ALLO
 _check("frozen-kernel-guard",
        "an auto-opened (origin=auto-triage) run may not change frozen kernel paths",
        _frozen_kernel_guard)
+
+
+# ── scope-respected (RB-12) ─────────────────────────────────────────────────
+# A kickoff's "Files in scope (touch ONLY these)" used to feed prompt
+# preferences only; nothing compared it with the diff, so a run could publish
+# edits to a file the kickoff ruled out (rp-e3-header-v2-20261016-111144). The
+# shared ``mini_ork.kickoff_scope`` reader is the one the profile/context
+# builders use, so the check sees the same allow/deny lists the run was scoped
+# with. A deny-listed file always gates; a file outside the allow list gates
+# only when the allow section's heading or body says ONLY / "do not modify any
+# other file"; otherwise it is a recorded, non-gating hint.
+
+_SCOPE_HEADING_RE = re.compile(r"^\s{0,3}(#{2,6})\s+(.+?)\s*$")
+_SCOPE_FENCE_RE = re.compile(r"^\s{0,3}(?:```|~~~)")
+_SCOPE_ONLY_HEADING_RE = re.compile(r"\bonly\b", re.IGNORECASE)
+_SCOPE_ONLY_BODY_RE = re.compile(
+    r"do\s+not\s+modify\s+any\s+other\s+file", re.IGNORECASE)
+
+
+def _normalise_scope_path(path):
+    """Repo-relative form: strip ``./`` (the scope parser already does this for
+    kickoff entries; diff paths arrive plain)."""
+    p = (path or "").strip()
+    while p.startswith("./"):
+        p = p[2:]
+    return p
+
+
+def _scope_match(path, patterns):
+    """True when ``path`` matches any allow/deny entry; globs use ``fnmatch``."""
+    return any(fnmatch.fnmatch(path, pattern) for pattern in patterns)
+
+
+def _only_scope_declared(text):
+    """True iff an ALLOW section's heading or body declares an ONLY scope.
+
+    Walk the kickoff exactly as ``kickoff_scope`` does (fences skipped, deny
+    sections ignored — an ONLY in "Out of scope" is not an allow-only rule):
+    the heading title and every body line under an allow section are tested for
+    the word ONLY or the phrase "do not modify any other file"."""
+    from mini_ork.kickoff_scope import heading_kind
+
+    current = None
+    in_fence = False
+    for line in (text or "").splitlines():
+        if _SCOPE_FENCE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        m = _SCOPE_HEADING_RE.match(line)
+        if m:
+            title = m.group(2)
+            current = heading_kind(title)
+            if current == "allow" and _SCOPE_ONLY_HEADING_RE.search(title):
+                return True
+            continue
+        if current == "allow" and _SCOPE_ONLY_BODY_RE.search(line):
+            return True
+    return False
+
+
+def _scope_respected():
+    try:
+        from mini_ork.kickoff_scope import kickoff_scope
+    except Exception:  # noqa: BLE001 — no parser: fail closed, never pass open
+        _ev.write("scope-respected: mini_ork.kickoff_scope unavailable\n")
+        _ev.flush()
+        return False
+
+    text = _read_kickoff_text()
+    scope = kickoff_scope(text)
+    allow = [_normalise_scope_path(p) for p in scope.get("allow", [])]
+    deny = [_normalise_scope_path(p) for p in scope.get("deny", [])]
+    _changed_files()
+    changed = [_normalise_scope_path(p) for p in _changed_file_lines()]
+
+    _ev.write(f"scope-respected: allow={allow} deny={deny} changed={changed}\n")
+    _ev.flush()
+
+    denied = sorted({p for p in changed if _scope_match(p, deny)})
+    if denied:
+        _ev.write("scope-respected: gating: deny-listed file(s) in diff: "
+                  + ", ".join(denied) + "\n")
+        _ev.flush()
+        return False
+
+    if not allow:
+        _ev.write("scope-respected: no scope declared\n")
+        _ev.flush()
+        return True
+
+    outside = sorted({p for p in changed if not _scope_match(p, allow)})
+    if not outside:
+        _ev.write("scope-respected: all changed files inside the declared scope\n")
+        _ev.flush()
+        return True
+
+    if _only_scope_declared(text):
+        _ev.write("scope-respected: gating: ONLY scope violated; file(s) "
+                  "outside allow: " + ", ".join(outside) + "\n")
+        _ev.flush()
+        return False
+
+    # A plain "Files in scope" section is a hint, not a boundary: record the
+    # overrun but let the run continue.
+    _ev.write("scope-respected: non-gating: file(s) outside allow: "
+              + ", ".join(outside) + " (gating: false)\n")
+    _ev.flush()
+    return True
+
+
+_check("scope-respected",
+       "diff files respect the kickoff's declared file scope",
+       _scope_respected)
 
 # Build the changed-files list (static-check owns files_changed) and capture count.
 _changed_files()
