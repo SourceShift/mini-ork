@@ -64,6 +64,99 @@ from mini_ork.workflow.retry import (  # P1.4 per-node retry block
 )
 
 
+# ── RB-42: per-dispatch wall-clock cap ──────────────────────────────────────
+# ``deadline_budget.check`` is evaluated only *between* stages, so one long
+# implementer stage can overrun a ``--deadline`` budget by hours (run
+# run-1792092531-89304: a 2700 s budget, a 2188 s stage, 5601 s total). The
+# effective node timeout is read in-process from ``MO_NODE_TIMEOUT_S``
+# (``dispatch/llm_dispatch.py``), so capping that value at the ``dispatch_node``
+# seam binds every node without touching the dispatcher.
+_DISPATCH_TIMEOUT_FLOOR_S = 60
+_DISPATCH_TIMEOUT_DEFAULT_S = 1500
+
+
+def _deadline_state(run_id: str = "") -> tuple[bool, int]:
+    """``(armed, remaining_seconds)`` for this run's wall-clock budget.
+
+    ``armed`` is False when no ``--deadline`` was set (no ``MO_DEADLINE_*``), in
+    which case the node timeout must pass through untouched. Best-effort: an
+    unreadable status reads as unarmed rather than wedging a dispatch.
+    """
+    try:
+        from mini_ork.dispatch import deadline_budget  # noqa: PLC0415
+
+        # ``status`` rejects an empty id but only uses it to name the sidecar;
+        # a placeholder lets the env-armed budget be read without one.
+        st = deadline_budget.status(
+            run_id or os.environ.get("MINI_ORK_RUN_ID", "") or "dispatch"
+        )
+    except Exception:  # noqa: BLE001 — a broken status must not fail a node
+        return False, 0
+    if not st:
+        return False, 0
+    try:
+        if int(st.get("deadline_seconds", 0) or 0) <= 0 and \
+                int(st.get("deadline_epoch", 0) or 0) <= 0:
+            return False, 0
+        return True, int(st.get("remaining_seconds", 0) or 0)
+    except (TypeError, ValueError):
+        return False, 0
+
+
+def remaining_seconds(run_id: str = "") -> int:
+    """Seconds left in this run's armed wall-clock budget (0 when unarmed).
+
+    Exposed next to the deadline computation so callers can bound work that
+    the between-stage check cannot interrupt.
+    """
+    _armed, remaining = _deadline_state(run_id)
+    return remaining
+
+
+def _cap_dispatch_timeout(node_timeout: int, remaining: int | None = None) -> int:
+    """``min(node_timeout, remaining run deadline)``, never below 60 s.
+
+    Pure when ``remaining`` is passed explicitly; with ``remaining is None``
+    the run's armed budget is read from ``MO_DEADLINE_*``. An unarmed budget
+    returns the node timeout untouched — the cap applies only to a ``--deadline``
+    run. The 60 s floor is intentional: a nearly spent budget still gives a
+    dispatch a real window to finish in, matching the kickoff's pinned
+    ``remaining 10 → 60``.
+    """
+    try:
+        bound = int(node_timeout)
+    except (TypeError, ValueError):
+        bound = _DISPATCH_TIMEOUT_DEFAULT_S
+    if remaining is None:
+        armed, remaining = _deadline_state()
+        if not armed:
+            return bound
+    try:
+        budget = int(remaining)
+    except (TypeError, ValueError):
+        return bound
+    return max(_DISPATCH_TIMEOUT_FLOOR_S, min(bound, budget))
+
+
+def _pinned_node_timeout() -> int:
+    """The operator's node-timeout base, pinned once per run.
+
+    ``publish_env`` has no restore (``mini_ork/context.py``), so after the
+    first cap ``MO_NODE_TIMEOUT_S`` holds the capped value. Re-reading it on
+    the next node would ratchet the bound down (300 → next node capped from a
+    300 base instead of 5400). ``MO_NODE_TIMEOUT_BASE`` remembers the pre-cap
+    value across those writes.
+    """
+    base = os.environ.get("MO_NODE_TIMEOUT_BASE", "")
+    if not base:
+        base = os.environ.get("MO_NODE_TIMEOUT_S", "") or str(_DISPATCH_TIMEOUT_DEFAULT_S)
+        publish_env({"MO_NODE_TIMEOUT_BASE": base})
+    try:
+        return int(base)
+    except (TypeError, ValueError):
+        return _DISPATCH_TIMEOUT_DEFAULT_S
+
+
 # ── P1.4 per-node retry helpers ──────────────────────────────────────────────
 # Kept module-local so the dispatch_node loop stays one tight block. Each
 # helper fails soft — a missing workflow file, no outputs declared, or a
@@ -624,6 +717,18 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     # plan without exporting it, so publish the resolved value at the node
     # boundary before any provider or verifier subprocess is invoked.
     publish_env({ENV_RUN_DIR: run_dir_eff})
+    # RB-42: tighten this node's dispatch timeout to the run's remaining
+    # deadline. The cap is per lane attempt (``providers.py`` applies the
+    # timeout per attempt), so it bounds one lane's wait, not the whole stage;
+    # the 60 s floor is the kickoff's pinned behaviour. No deadline armed →
+    # the operator's timeout passes through untouched.
+    _deadline_armed, _deadline_remaining = _deadline_state(run_id or "")
+    if _deadline_armed:
+        publish_env({
+            "MO_NODE_TIMEOUT_S": str(
+                _cap_dispatch_timeout(_pinned_node_timeout(), _deadline_remaining)
+            ),
+        })
 
     # The artifact ledger is a semantic boundary, not a replacement for an OS
     # sandbox: it records exactly what the recipe declares, validates integrity
@@ -2253,7 +2358,10 @@ def _record_verifier_result(ctx: NodeDispatch, verdict: str) -> None:
     carries the verdict and the scored axes for audit.
 
     Best-effort: a recording failure must never fail a verifier node, so every
-    exception is swallowed (mirrors ``_write_evidence_ledger_row``).
+    exception is swallowed (mirrors ``_write_evidence_ledger_row``). A
+    transient ``database is locked`` no longer reaches this except — the
+    writer retries and (on exhaustion) spools the row under the run dir — so
+    only a genuinely unrecorded row gets the warning below.
     """
     if not ctx.db or not ctx.run_id:
         return
@@ -2265,7 +2373,7 @@ def _record_verifier_result(ctx: NodeDispatch, verdict: str) -> None:
             scored_axes_json=_rubric_axes_json(ctx.run_dir_eff or ctx.run_dir),
         )
     except Exception as exc:  # noqa: BLE001 — enrichment must never fail the node
-        print(f"  [warn] verifier_results write skipped: {exc}", file=sys.stderr)
+        print(f"  [warn] verifier_results write lost: {exc}", file=sys.stderr)
 
 
 def _handle_verifier(ctx: NodeDispatch):

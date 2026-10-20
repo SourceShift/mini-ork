@@ -55,8 +55,10 @@ Notes on parity:
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import sqlite3
+import sys
 import time
 from typing import Optional
 
@@ -68,6 +70,161 @@ __all__ = [
     "verifier_chain_repair",
     "verifier_fp_rate",
 ]
+
+# RB-35: a ``verifier_results`` row is calibration data — the abstain gate
+# learns its LTT threshold from it — so losing one to a transient writer lock
+# is silent model damage. Retry with a bounded backoff; when the lock outlasts
+# the retries, spool the row as JSON under the run dir and flush it ahead of
+# the next successful write in the same run. The five waits are the kickoff's
+# declared schedule; each attempt also blocks on ``_open``'s busy_timeout.
+_LOCK_RETRY_BACKOFF_S = (0.5, 1.0, 2.0, 4.0, 8.0)
+_PENDING_RESULTS_NAME = "verifier_results.pending.jsonl"
+
+
+def _is_locked_error(exc: BaseException) -> bool:
+    """True only for SQLite's transient "database is locked" class.
+
+    A CHECK violation, a missing table or any other ``OperationalError`` is a
+    real defect and must propagate (fail closed) rather than be retried or
+    spooled — the row would poison the spool forever.
+    """
+    return isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower()
+
+
+def _run_dir_for_spool(db_path: Optional[str] = None) -> str:
+    """The run dir to spool under.
+
+    Prefer the run-scoped ``MINI_ORK_RUN_DIR`` (read through ``context_env`` so
+    a per-run binding wins over a leaked process env), then fall back to the
+    DB's own directory — every plausible resolution lands on the same file for
+    a run whose DB lives inside its run dir. Returns "" when nothing resolves,
+    which makes the writer fall back to today's raise-the-error behaviour.
+    """
+    try:
+        from mini_ork.context import context_env  # noqa: PLC0415
+
+        run_dir = context_env("MINI_ORK_RUN_DIR", "")
+    except Exception:  # noqa: BLE001 — resolution must never mask the write path
+        run_dir = os.environ.get("MINI_ORK_RUN_DIR", "")
+    if not run_dir and db_path and db_path != ":memory:":
+        candidate = os.path.dirname(os.path.abspath(db_path))
+        if candidate and os.path.isdir(candidate):
+            run_dir = candidate
+    return run_dir
+
+
+def _pending_results_path(db_path: Optional[str] = None) -> Optional[str]:
+    """``<run_dir>/verifier_results.pending.jsonl``, or None when unresolvable."""
+    run_dir = _run_dir_for_spool(db_path)
+    if not run_dir:
+        return None
+    return os.path.join(run_dir, _PENDING_RESULTS_NAME)
+
+
+def _insert_result_row(db_path: str, row: dict) -> None:
+    """One insert attempt on its own connection.
+
+    A fresh connection per attempt is deliberate: after ``database is locked``
+    the old connection holds an implicit transaction and is unusable, so
+    retrying on it is the classic silent-double-write bug.
+    """
+    con = _open(db_path)
+    try:
+        con.execute(
+            """
+            INSERT INTO verifier_results
+                (result_id, run_id, verifier_name, rubric_id, verdict,
+                 confidence, scored_axes_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row["result_id"],
+                row["run_id"],
+                row["verifier_name"],
+                row.get("rubric_id"),
+                row["verdict"],
+                row.get("confidence"),
+                row.get("scored_axes_json"),
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _flush_pending_results(db_path: str, run_id: str) -> None:
+    """Insert this run's spooled rows before the new one.
+
+    Best-effort and per-row: an unparseable or CHECK-violating line stays in
+    the spool (retried when its run writes next) but never aborts the drain,
+    and no exception propagates — enrichment must never fail a verifier node.
+    """
+    path = _pending_results_path(db_path)
+    if not path or not os.path.isfile(path):
+        return
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return
+    if not lines:
+        return
+    keep: list[str] = []
+    drained = False
+    for line in lines:
+        if not line.strip():
+            drained = True
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            keep.append(line)
+            continue
+        if not isinstance(row, dict) or row.get("run_id") != run_id:
+            keep.append(line)
+            continue
+        try:
+            _insert_result_row(db_path, row)
+        except Exception:  # noqa: BLE001 — one poisoned row must not stop the drain
+            keep.append(line)
+        else:
+            drained = True
+    if not drained:
+        return
+    try:
+        if keep:
+            with open(path, "w", encoding="utf-8") as fh:
+                for line in keep:
+                    fh.write(line + "\n")
+        else:
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def _spool_result_row(db_path: str, row: dict) -> bool:
+    """Append one JSON line; return False when no run dir is resolvable.
+
+    One complete ``open(..., "a")`` line is the concurrency unit: verifier
+    nodes can run in parallel, and an append of a single line stays parseable
+    under interleaving. The row carries its pre-minted ``result_id`` so a
+    flushed row lands under the id the caller was already given.
+    """
+    path = _pending_results_path(db_path)
+    if not path:
+        return False
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
+    except OSError:
+        return False
+    print(
+        f"  [warn] verifier_results row for {row.get('run_id')} spooled to "
+        f"{path} (database is locked); flushed on the next write",
+        file=sys.stderr,
+    )
+    return True
 
 
 def _open(db_path: str) -> sqlite3.Connection:
@@ -164,30 +321,41 @@ def verifier_result_record(
     ``verdict IN ('pass','fail','indeterminate','vacuous')`` raises
     ``sqlite3.IntegrityError`` on bad input. Matches bash's
     ``exit 1`` on the same DDL violation.
+
+    RB-35: only ``database is locked`` is retried (5 retries, backoff
+    ``0.5/1/2/4/8``). Exhaustion spools the row to
+    ``<run_dir>/verifier_results.pending.jsonl``; a later successful write in
+    the same run flushes it first. Any other error still propagates unchanged.
     """
     result_id = "vr-" + secrets.token_hex(6)
-    con = _open(db_path)
-    try:
-        con.execute(
-            """
-            INSERT INTO verifier_results
-                (result_id, run_id, verifier_name, rubric_id, verdict,
-                 confidence, scored_axes_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                result_id,
-                run_id,
-                verifier_name,
-                rubric_id or None,
-                verdict,
-                float(confidence) if confidence is not None else None,
-                scored_axes_json or None,
-            ),
-        )
-        con.commit()
-    finally:
-        con.close()
+    row = {
+        "result_id": result_id,
+        "run_id": run_id,
+        "verifier_name": verifier_name,
+        "rubric_id": rubric_id or None,
+        "verdict": verdict,
+        "confidence": float(confidence) if confidence is not None else None,
+        "scored_axes_json": scored_axes_json or None,
+    }
+    last_lock: Optional[sqlite3.OperationalError] = None
+    for attempt in range(len(_LOCK_RETRY_BACKOFF_S) + 1):
+        # Flush first: a spooled row must land before this one (rowid order is
+        # the calibration read order). If the DB is still locked the drain is a
+        # no-op and the insert below raises, which drives the retry.
+        _flush_pending_results(db_path, run_id)
+        try:
+            _insert_result_row(db_path, row)
+            return result_id
+        except sqlite3.OperationalError as exc:
+            if not _is_locked_error(exc):
+                raise
+            last_lock = exc
+        if attempt < len(_LOCK_RETRY_BACKOFF_S):
+            time.sleep(_LOCK_RETRY_BACKOFF_S[attempt])
+    # Retries exhausted: spool rather than lose the row. Without a resolvable
+    # run dir, fall back to today's behaviour (raise; the caller swallows).
+    if not _spool_result_row(db_path, row):
+        raise last_lock  # type: ignore[misc]
     return result_id
 
 
