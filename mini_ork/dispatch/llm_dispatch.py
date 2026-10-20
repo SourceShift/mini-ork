@@ -910,7 +910,16 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
             pass
 
     def _halt_on_fuse(chain: str, refused: str) -> int:
-        """Refuse a dispatch whose every lane is fused. Returns the refusal rc."""
+        """Refuse a dispatch whose every lane is fused. Returns the refusal rc.
+
+        RB-39: besides the ``llm_calls`` refusal row, stamp the run's
+        ``task_runs`` row so the fuse's history is queryable. ``chain`` is the
+        requested chain verbatim — ``_apply_lane_fuse`` collapses the per-lane
+        breakdown to the first blown category, so any narrower value would
+        pretend to a precision we do not have. Fail-soft: telemetry must never
+        change the rc (a pre-0023 schema raises OperationalError here and is
+        swallowed), and a missing/unknown run id is a no-op.
+        """
         sys.stderr.write(
             f"[lane_fuse_open] every lane in {chain} failed consecutively with "
             f"error_category={refused} — halting dispatch\n")
@@ -918,6 +927,23 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
             refused,
             f"lane fuse open: every lane in chain {chain} failed consecutively "
             f"with {refused}")
+        run_id = context_env("MINI_ORK_RUN_ID", "").strip()
+        if run_id and db and os.path.isfile(db):
+            try:
+                con = sqlite3.connect(db, timeout=5.0)
+                try:
+                    con.execute("PRAGMA busy_timeout=5000")
+                    con.execute(
+                        "UPDATE task_runs SET fuse_blown_lane = ?, "
+                        "fuse_consecutive_failures = "
+                        "COALESCE(fuse_consecutive_failures, 0) + 1 "
+                        "WHERE id = ?",
+                        (chain, run_id))
+                    con.commit()
+                finally:
+                    con.close()
+            except Exception:  # noqa: BLE001 — telemetry must never change the rc
+                pass
         return 43
 
     # RB-22b: a target cwd that no longer exists (a deleted worktree) made every

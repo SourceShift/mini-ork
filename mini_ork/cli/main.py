@@ -1176,8 +1176,129 @@ def _close_run_record(sink: dict, *, crashed: bool, rc: int | None = None) -> No
         db = resolve_db_path(context_env("MINI_ORK_DB") or None)
         if os.path.isfile(db):
             run_reaper.close_run_record(db, sink.get("run_id") or "", Path(run_dir), crashed=crashed, rc=rc)
+            # RB-39: revive the failure_memory writer. Its own try/except keeps
+            # teardown fail-soft — a broken memory write must not stop the
+            # close or the .pid release below.
+            try:
+                _record_failed_close(
+                    db,
+                    sink.get("run_id") or context_env("MINI_ORK_RUN_ID", ""),
+                    Path(run_dir),
+                )
+            except Exception as exc:  # noqa: BLE001 — telemetry is best-effort
+                sys.stderr.write(f"[warn] failure_memory write failed: {exc}\n")
     finally:
         run_reaper.release_pid_file(Path(run_dir))
+
+
+# ``node_end`` verdicts that mean "this node failed". Lowercased: run_events
+# payloads carry both the uppercase gate vocabulary (REQUEST_CHANGES) and the
+# lowercase lifecycle vocabulary (fail). Mirrors ``web/repositories``' failed
+# set plus the lowercase form this close path actually sees.
+_FAILED_NODE_VERDICTS = frozenset(
+    {"fail", "failure", "request_changes", "escalate", "crash"}
+)
+
+
+def _record_failed_close(db: str, run_id: str, run_dir: Path) -> None:
+    """Mirror a run that closed ``failed`` into ``failure_memory`` (RB-39).
+
+    ``memory.store.write_failure`` lost its callers in the bash→Python port, so
+    the readers (``context_assembler``, ``active_state_index``, the learn
+    pages) have been reading a table nobody writes. This is the writer's only
+    production call site: after ``run_reaper.close_run_record`` has made the
+    row terminal, read it back so we only record a real failure and reuse the
+    reaper's own note.
+
+    ``failure_memory`` has no task_class/recipe columns, so both ride in
+    ``error_message``; ``workflow_stage`` carries the first failed node (the
+    table's stage column is the closest fit) and falls back to ``"run"`` when
+    no ``node_end`` records a failure (an executor crash produces exactly
+    that). ``failure_category`` is the store's 4-value whitelist: a verifier
+    failure maps to ``verifier_fail``, everything else to ``dispatch_error``.
+
+    ``write_failure`` resolves ``failure_memory.run_id`` through the legacy
+    ``runs`` table (``run_dir LIKE %MINI_ORK_RUN_ID%``) while this runtime
+    writes ``task_runs``. We therefore bind ``MINI_ORK_RUN_ID`` to the run dir
+    for the call: in production the run dir is ``<home>/runs/<run_id>``, so it
+    matches that run's ``runs.run_dir`` more precisely than the bare id. A run
+    with no ``runs`` row still inserts (the FK is not enforced) with
+    ``run_id=0`` — out of scope to seed a second writer here.
+    """
+    if os.environ.get("MINI_ORK_DRY_RUN", "0") == "1":
+        return
+    if not run_id or not db or not os.path.isfile(db):
+        return
+
+    import sqlite3
+
+    con = sqlite3.connect(db, timeout=5.0)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("PRAGMA busy_timeout=5000")
+        row = con.execute(
+            "SELECT status, task_class, recipe, notes FROM task_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None or row["status"] != "failed":
+            return  # published / still running / no row: not a failure to record
+
+        tables = {
+            r["name"]
+            for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        stage, node_type = "run", ""
+        if "run_events" in tables:
+            for ev in con.execute(
+                "SELECT payload_json FROM run_events "
+                "WHERE run_id = ? AND event_type = 'node_end' "
+                "ORDER BY created_at ASC, rowid ASC",
+                (run_id,),
+            ).fetchall():
+                try:
+                    payload = json.loads(ev["payload_json"] or "{}")
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                verdict = str(payload.get("verdict") or "").strip().lower()
+                status = str(payload.get("status") or "").strip().lower()
+                if verdict in _FAILED_NODE_VERDICTS or status == "failed":
+                    stage = str(payload.get("node_id") or "run")
+                    node_type = str(payload.get("node_type") or "").lower()
+                    break
+
+        # Idempotence: a re-close of an already-failed run must not stack rows.
+        # Resolve the legacy runs.id the same way write_failure will.
+        run_row_id = 0
+        if "runs" in tables:
+            legacy = con.execute(
+                "SELECT id FROM runs WHERE run_dir LIKE ? ORDER BY id DESC LIMIT 1",
+                (f"%{run_dir}%",),
+            ).fetchone()
+            run_row_id = int(legacy["id"] or 0) if legacy is not None else 0
+        if "failure_memory" in tables and run_row_id:
+            already = con.execute(
+                "SELECT 1 FROM failure_memory WHERE run_id = ? AND workflow_stage = ? LIMIT 1",
+                (run_row_id, stage),
+            ).fetchone()
+            if already is not None:
+                return
+    finally:
+        con.close()
+
+    task_class = str(row["task_class"] or "")
+    recipe = str(row["recipe"] or "")
+    note = str(row["notes"] or "lifecycle closed failed")
+    message = f"task_class={task_class} recipe={recipe}; {note}"
+    category = "verifier_fail" if node_type == "verifier" else "dispatch_error"
+
+    from mini_ork.memory import store as memory_store
+
+    with run_context_scope({"MINI_ORK_RUN_ID": str(run_dir)}):
+        memory_store.write_failure(stage, category, message)
 
 
 def _reconcile_run_cost(sink: dict) -> None:

@@ -1,4 +1,9 @@
-"""SSE: tail mo_events + run_events so the UI updates live.
+"""SSE: tail run_events so the UI updates live.
+
+RB-39: this stream used to also poll ``mo_events`` on every tick, but nothing
+in the Python runtime writes that table (0 rows since the bash→Python port).
+The run_events tail below is the live source; the dead poll was removed rather
+than leaving a query that could never return a row.
 
 Concurrency notes (the part that previously stalled REST traffic):
   - SSE handlers are `async def` running on the main event loop. ANY
@@ -62,18 +67,13 @@ async def _event_loop(
     nodes: list[str] | None = None,
     home: Path | None = None,
 ) -> AsyncIterator[str]:
-    cursor_mo = 0
     cursor_run_evt = 0
     last_keepalive = time.monotonic()
 
     # Initial cursor: skip historical; stream only new from now.
-    has_mo = await asyncio.to_thread(db.has_table, "mo_events")
     has_re = await asyncio.to_thread(db.has_table, "run_events")
     has_tr = await asyncio.to_thread(db.has_table, "task_runs")
 
-    if has_mo:
-        row = await asyncio.to_thread(db.row, "SELECT COALESCE(MAX(id), 0) AS mx FROM mo_events")
-        cursor_mo = int(row["mx"] if row else 0)
     if has_re:
         row = await asyncio.to_thread(
             db.row, "SELECT COALESCE(MAX(created_at), 0) AS mx FROM run_events"
@@ -103,34 +103,8 @@ async def _event_loop(
 
         batch: list[dict[str, Any]] = []
 
-        if has_mo:
-            if trace_id:
-                rows = await asyncio.to_thread(
-                    db.rows,
-                    """
-                    SELECT id, ts, event_type, actor, status, duration_ms, cost_usd,
-                           artifact_path, payload_json
-                    FROM mo_events WHERE id > ? AND trace_id = ?
-                    ORDER BY id ASC LIMIT 200
-                    """,
-                    (cursor_mo, trace_id),
-                )
-            else:
-                rows = await asyncio.to_thread(
-                    db.rows,
-                    """
-                    SELECT id, ts, event_type, actor, status, duration_ms, cost_usd,
-                           artifact_path, payload_json
-                    FROM mo_events WHERE id > ?
-                    ORDER BY id ASC LIMIT 200
-                    """,
-                    (cursor_mo,),
-                )
-            if rows:
-                cursor_mo = max(int(r["id"]) for r in rows)
-                for r in rows:
-                    batch.append({"source": "mo_events", **r})
-
+        # RB-39: only run_events is tailed. mo_events has no writer in the
+        # Python runtime, so polling it every tick was pure dead traffic.
         if has_re and (task_run_id or trace_id is None):
             if task_run_id:
                 rows = await asyncio.to_thread(
