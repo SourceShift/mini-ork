@@ -105,10 +105,11 @@ def test_five_commands_no_cap(tmp_path):
         "make c1", "make c2", "make c3", "make c4", "make c5"]
 
 
-def test_prose_fallback_unchanged_when_no_section(tmp_path):
-    """A kickoff with no explicit section still uses ``command_hints()`` with
-    its cap of three — that path is untouched. The kickoff's prose mentions
-    ``pytest`` and ``ruff``, so the regex scan surfaces both, capped at 3."""
+def test_prose_is_a_hint_never_a_command_when_no_section(tmp_path):
+    """A kickoff with no explicit section executes NOTHING it merely mentions
+    (RB-09: vg-3 ran `python -m pytest files into`, harvested from prose). The
+    regex scan still surfaces the runners the prose names, but only as
+    ``verification_hints``, which no verifier executes."""
     data = _drive_gen_profile(
         tmp_path,
         """# No header at all
@@ -117,11 +118,9 @@ Run pytest tests/unit/test_widget.py and ruff check mini_ork/cli/main.py when do
 """,
     )
 
-    cmds = data["verification_command"]
-    assert len(cmds) <= 3, f"prose fallback must stay capped at three, got {cmds}"
-    assert cmds, "prose fallback must surface something when runners are named"
-    # Both runners appear at least once across the captured commands.
-    joined = " ".join(cmds)
+    assert data["verification_command"] == [], (
+        "prose must never become an executed verification command")
+    joined = " ".join(data["verification_hints"])
     assert "pytest" in joined
     assert "ruff" in joined
 

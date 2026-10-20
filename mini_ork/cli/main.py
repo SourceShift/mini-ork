@@ -782,7 +782,8 @@ def gen_profile(kickoff_path, root, recipe, task_class, profile_path, agents_pat
     # mentions ("…names the test runner…") into the verifier's slot 1 and
     # pushing real commands past the cap (run-1791853722-board-k3 ran a bare
     # runner over 8647 tests and timed out, never reaching the kickoff's
-    # `ruff check`). Keep it as the no-section fallback with its cap of three.
+    # `ruff check`). As of RB-09 the section is the ONLY source of executed
+    # commands: prose never reaches the verifier (see below).
     def _section_commands(lines):
         # Bullets outside fences, and every command inside a fenced block, in
         # document order. A kickoff writes a long command as one fenced shell
@@ -825,10 +826,23 @@ def gen_profile(kickoff_path, root, recipe, task_class, profile_path, agents_pat
             _c = _c[1:-1].strip()
         if _c and _c not in _explicit:
             _explicit.append(_c)
-    if _explicit:
-        commands = _explicit
-    else:
-        commands = command_hints()
+
+    # RB-09: ``verification_command`` is filled ONLY from the explicit section.
+    # Prose is never executed. The old no-section fallback fed command_hints()
+    # (a whole-kickoff regex scan) straight into the verifier, and a sentence
+    # like "write pytest files into …" became the command it ran (rc 4), losing
+    # an 8685 s run's verdict. Harvested prose now goes to verification_hints,
+    # a profile key no verifier reads.
+    #
+    # A command still carrying an unexpanded placeholder (``<run_dir>``,
+    # ``<profile_path>``) is not runnable as written: drop it from the command
+    # slot and keep it in the hints. ``${MINI_ORK_RUN_DIR}`` is a shell variable
+    # the verifier expands, so it is deliberately not matched.
+    _placeholder = re.compile(r"<[^>\n]+>")
+    commands = [_c for _c in _explicit if not _placeholder.search(_c)]
+    hints = command_hints()
+    hints.extend(_c for _c in _explicit if _placeholder.search(_c))
+    hints = list(dict.fromkeys(hints))
 
     task_yaml = load_yaml(rbase / "recipes" / recipe / "task_class.yaml")
     artifact_yaml = load_yaml(rbase / "recipes" / recipe / "artifact_contract.yaml")
@@ -906,7 +920,10 @@ def gen_profile(kickoff_path, root, recipe, task_class, profile_path, agents_pat
             "env": {"MINI_ORK_PROVIDER_POLICY": str(Path(agents_path).resolve()) if lanes else ""},
         },
         "artifact_destination": outputs,
-        "verification_command": commands if _explicit else commands[:3],
+        "verification_command": commands,
+        # Prose-harvested (or placeholder-dropped) commands, for a human to
+        # read. Nothing executes this key by construction (RB-09).
+        "verification_hints": hints,
         "human_questions": questions,
         "confidence": round(confidence, 2),
         "profile_status": status,
