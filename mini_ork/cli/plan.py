@@ -275,16 +275,29 @@ No prose, no markdown fences, return ONLY valid JSON.
 """
 
 
-def _charge_cost(db, run_id):
-    if not (db and os.path.isfile(db) and run_id):
+def _reconcile_planner_cost(db, run_id):
+    """Publish planning spend from the ``llm_calls`` ledger.
+
+    There is no flat per-dispatch charge: the old one added $0.05 *before* the
+    dispatch rc was checked, so 0-token refusals and spawn failures were
+    billed and the raise-only reconcile could never take it back (RB-32a).
+    The ledger is now the only source: raise ``task_runs.cost_usd`` to the
+    run's ledger sum and seed the cost-pause meter with the same total so the
+    pause math sees planner spend.
+    """
+    if not (db and run_id):
         return
-    import sqlite3
     try:
-        con = sqlite3.connect(db)
-        con.execute("PRAGMA journal_mode=WAL")
-        con.execute("UPDATE task_runs SET cost_usd=COALESCE(cost_usd,0)+0.05, updated_at=? WHERE id=?",
-                    (int(time.time()), run_id))
-        con.commit(); con.close()
+        from mini_ork import cost_ledger
+        ledger_spend = cost_ledger.run_cost(db, run_id)
+        cost_ledger.reconcile_run_cost(db, run_id)
+    except Exception:
+        return
+    if ledger_spend is None or ledger_spend <= 0:
+        return
+    try:
+        from mini_ork.dispatch import cost_pause
+        cost_pause.raise_spent(run_id, ledger_spend)
     except Exception:
         pass
 
@@ -1083,10 +1096,6 @@ def main(argv=None, *, root=None, dispatch=None) -> int:
                              f"{declared_plan} (planner LLM skipped)\n")
         else:
             rc, raw = dispatch_fn(task_class, "planner", prompt)
-            # Charge before judging: a rejected dispatch still spent tokens — the
-            # abandoned epic-runner planner call in run-1791788217-61320 produced
-            # 17,757 output tokens before the shape gate refused the lane.
-            _charge_cost(db, run_id)
             if rc != 0:
                 # rc=65 is a shape reject: the dispatch boundary judged the
                 # lane's *reply*. A planner whose contract is "write the plan
@@ -1139,7 +1148,6 @@ def main(argv=None, *, root=None, dispatch=None) -> int:
                                                      raw, verdict, truncated,
                                                      original_prompt=prompt)
                 rc, repaired = dispatch_fn(task_class, "planner", repair_prompt)
-                _charge_cost(db, run_id)
                 if rc != 0:
                     sys.stderr.write(f"LLM dispatch failed for planner repair (rc={rc}): {_dispatch_error_detail(raw)}\n")
                     _mark_failed(db, run_id, first_verdict)
@@ -1189,6 +1197,7 @@ def main(argv=None, *, root=None, dispatch=None) -> int:
 
     plan_hash = hashlib.sha256((plan_json + "\n").encode()).hexdigest()[:16]
     _db_write(db, run_id, task_class, out_file, plan_hash)
+    _reconcile_planner_cost(db, run_id)
     _trace_plan(trace_id, task_class, "success", db, final_artifact_ref=out_file)
     return 0
 

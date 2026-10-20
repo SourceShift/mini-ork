@@ -21,6 +21,41 @@ def _sentinel_path(run_id: str) -> str:
     return os.path.join(home, "runs", run_id, ".cost-pause")
 
 
+def _spend_path(run_id: str) -> str:
+    sentinel = _sentinel_path(run_id)
+    return sentinel[: -len(".cost-pause")] + ".cost-spent"
+
+
+def _read_spent(spend_file: str) -> float:
+    try:
+        return float(open(spend_file).read().strip() or 0)
+    except (ValueError, OSError):
+        return 0.0
+
+
+def raise_spent(run_id: str, spent_usd: float) -> float:
+    """Raise (never lower) the run's cumulative meter to ``spent_usd``.
+
+    Planning spend is recorded in ``llm_calls`` but the pause meter is a
+    sidecar written only by ``check()``. Seeding it with the audit total means
+    the next dispatch starts from real spend instead of zero (RB-32a). This
+    writes the meter's own file but deliberately does not create the pause
+    sentinel: planning is not a dispatch and must not halt itself.
+    """
+    if not run_id:
+        return 0.0
+    spend_file = _spend_path(run_id)
+    prev_spent = _read_spent(spend_file)
+    try:
+        new_spent = max(prev_spent, float(spent_usd))
+    except (TypeError, ValueError):
+        new_spent = prev_spent
+    os.makedirs(os.path.dirname(spend_file) or ".", exist_ok=True)
+    with open(spend_file, "w") as fh:
+        fh.write(f"{new_spent}\n")
+    return new_spent
+
+
 def check(run_id: str, delta_usd: float) -> int:
     """rc semantics of mo_cost_pause_check: 0 = proceed, 2 = paused (sentinel
     written when cumulative spend crosses into a new threshold window)."""
@@ -28,14 +63,9 @@ def check(run_id: str, delta_usd: float) -> int:
         return 2
     threshold = float(os.environ.get("MO_PAUSE_EVERY_USD", "25"))
     sentinel = _sentinel_path(run_id)
-    spend_file = sentinel[: -len(".cost-pause")] + ".cost-spent"
+    spend_file = _spend_path(run_id)
 
-    prev_spent = 0.0
-    if os.path.isfile(spend_file):
-        try:
-            prev_spent = float(open(spend_file).read().strip() or 0)
-        except (ValueError, OSError):
-            prev_spent = 0.0
+    prev_spent = _read_spent(spend_file)
     try:
         new_spent = prev_spent + float(delta_usd)
     except (TypeError, ValueError):
@@ -61,12 +91,7 @@ def status(run_id: str) -> dict:
     """mo_cost_pause_status: {paused, threshold_usd, spent_usd, sentinel_path}."""
     threshold = float(os.environ.get("MO_PAUSE_EVERY_USD", "25"))
     sentinel = _sentinel_path(run_id)
-    spend_file = sentinel[: -len(".cost-pause")] + ".cost-spent"
-    spent = 0.0
-    if os.path.isfile(spend_file):
-        try:
-            spent = float(open(spend_file).read().strip() or 0)
-        except (ValueError, OSError):
-            spent = 0.0
+    spend_file = _spend_path(run_id)
+    spent = _read_spent(spend_file)
     return {"paused": os.path.isfile(sentinel), "threshold_usd": threshold,
             "spent_usd": spent, "sentinel_path": sentinel}
