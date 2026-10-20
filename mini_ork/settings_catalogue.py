@@ -78,6 +78,15 @@ ENGINE_SETTINGS: tuple[Setting, ...] = (
         kind="seconds",
         read_at="mini_ork/dispatch/llm_dispatch.py",
     ),
+    Setting(
+        name="MO_KILL_REAP_TIMEOUT_S",
+        label="Kill reap timeout (s)",
+        group="Cost & limits",
+        effect="Stop waiting for a killed lane process group to be reaped after this many seconds.",
+        default="30",
+        kind="seconds",
+        read_at="mini_ork/dispatch/core.py",
+    ),
     # ── Verification ─────────────────────────────────────────────────────────
     Setting(
         name="MO_REVISE_ROUNDS",

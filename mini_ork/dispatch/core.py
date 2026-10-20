@@ -204,6 +204,28 @@ def _terminate_process_group(proc: "subprocess.Popen[str]") -> None:
             pass
 
 
+# Bound on how long the timeout path waits for a killed child's process group to
+# be reaped before giving up and returning rc=124 anyway. The unbounded
+# ``proc.wait()`` this replaces is what let a lane recorded as "timeout after
+# 120.0s" actually run for 2664 s with no record of where the time went.
+# Read at call time so an operator (or a test) can shorten it; a malformed value
+# falls back to the default rather than crashing the timeout handler.
+_DEFAULT_KILL_REAP_TIMEOUT_S = 30.0
+# Last-resort wait when even the bounded reap expires (an unkillable/D-state
+# child). SIGKILL was already delivered by this point, so this is only courtesy.
+_KILL_ESCALATION_WAIT_S = 10.0
+
+
+def _kill_reap_timeout_s() -> float:
+    """The bounded reap timeout (``MO_KILL_REAP_TIMEOUT_S``, default 30 s)."""
+    raw = os.environ.get("MO_KILL_REAP_TIMEOUT_S")
+    try:
+        value = float(raw) if raw is not None else _DEFAULT_KILL_REAP_TIMEOUT_S
+    except (TypeError, ValueError):
+        value = _DEFAULT_KILL_REAP_TIMEOUT_S
+    return max(0.0, value)
+
+
 def spawn_local(
     argv: Sequence[str],
     *,
@@ -237,6 +259,9 @@ def spawn_local(
     # sees the variable. Fall back to the process env for direct callers.
     child_env = dict(env)
     live_path = child_env.pop("MO_LIVE_FILE", "") or None
+    # Wall clock, not monotonic: the operator's 130-2664 s outliers are
+    # wall-clock durations, and macOS's monotonic clock stops during sleep.
+    spawned_at = time.time()
     try:
         proc = subprocess.Popen(
             list(argv),
@@ -285,11 +310,36 @@ def spawn_local(
             # the group closes the inherited pipes, which is what unblocks them
             # and reaps the zombie. Then surface the distinct rc=124 so
             # dispatch_with_fallback abandons this lane.
+            #
+            # Every wait below is bounded. The old bare proc.wait() blocked
+            # forever, so a stuck child made a "120 s" lane run for thousands of
+            # seconds with nothing recording where the time went. The error text
+            # now carries the split so the next outlier is attributable:
+            # timeout spent before the kill vs. time the kill took to take.
             _terminate_process_group(proc)
-            proc.wait()
+            killed_at = time.time()
+            try:
+                proc.wait(timeout=_kill_reap_timeout_s())
+            except subprocess.TimeoutExpired:
+                # _terminate_process_group sends SIGKILL only (there is no
+                # SIGTERM phase), so a second TimeoutExpired means the child is
+                # unkillable, not merely stubborn. Signal the group once more in
+                # case a descendant race admitted a new process, then give it
+                # one last bounded wait and return anyway — the OS reaps it
+                # after we are gone. Never block forever here.
+                _terminate_process_group(proc)
+                try:
+                    proc.wait(timeout=_KILL_ESCALATION_WAIT_S)
+                except subprocess.TimeoutExpired:
+                    pass
+            reaped_at = time.time()
             for reader in readers:
                 reader.join(timeout=10)
-            return 124, "", f"timeout after {timeout}s"
+            return 124, "", (
+                f"timeout after {timeout}s "
+                f"(spawned→kill {killed_at - spawned_at:.0f}s, "
+                f"kill→reaped {reaped_at - killed_at:.0f}s)"
+            )
 
         # Joining without a deadline matches communicate()'s drain semantics: the
         # child is reaped, so this returns as soon as the pipes close.

@@ -173,7 +173,10 @@ def test_timeout_still_returns_124_and_tees_what_was_emitted(tmp_path, monkeypat
     )
     assert rc == 124
     assert stdout == ""
-    assert stderr == "timeout after 1.0s"
+    # The prefix is the stable contract; the trailing wall-clock parenthetical
+    # (spawned→kill / kill→reaped) is appended by RBF-21.
+    assert stderr.startswith("timeout after 1.0s")
+    assert "spawned→kill" in stderr and "kill→reaped" in stderr
     assert len(_read_records(live)) >= 1, "lines emitted before the kill were lost"
 
 
