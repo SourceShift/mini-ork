@@ -93,6 +93,7 @@ def _build_parser() -> argparse.ArgumentParser:
         add_help=False,  # bash prints its own help text; mirror it
     )
     p.add_argument("--since", type=str, default="")
+    p.add_argument("--run-id", type=str, default="")
     p.add_argument("--task-class", type=str, default="")
     p.add_argument("--lane", type=str, default="")
     p.add_argument("--dry-run", action="store_true")
@@ -149,21 +150,67 @@ def _trace_finalizer(trace_id: str, trace_env: dict, state: dict) -> None:
         pass
 
 
+# ── Run-scoped trace selection ───────────────────────────────────────────────
+@contextlib.contextmanager
+def _run_scoped_trace_selection(rp, run_id: str):
+    """Restrict the pipeline's trace selection to ``run_id`` for one pass.
+
+    ``reflection_pipeline`` has a single selection point —
+    ``_extract_trace_ids_sql``, looked up on the module at call time — and no
+    run-id parameter. Rather than duplicate its extractor loop here (which
+    would drift from its watermark and dispatch-failure handling), swap that
+    one function for a run-scoped query for the duration of the pass and
+    restore it afterwards. The restore matters: ``reflect.main`` is callable
+    in-process, and a leaked scope would make the next un-scoped call silently
+    analyse only the previous run's traces.
+
+    The ``__reflect__`` exclusion mirrors the pipeline's own query, so this
+    pass never analyses another reflect pass either.
+    """
+    original = rp._extract_trace_ids_sql
+
+    def _scoped(db_path: str, since_ts: int, batch: int) -> list[str]:
+        con = sqlite3.connect(db_path)
+        con.execute("PRAGMA busy_timeout=5000")
+        try:
+            rows = con.execute(
+                "SELECT trace_id FROM execution_traces "
+                "WHERE CAST(strftime('%s', created_at) AS INTEGER) >= ? "
+                "AND run_id = ? "
+                "AND (task_class IS NULL OR substr(task_class, 1, 2) != '__') "
+                "ORDER BY created_at LIMIT ?",
+                (int(since_ts), run_id, int(batch)),
+            ).fetchall()
+        finally:
+            con.close()
+        return [r[0] for r in rows]
+
+    rp._extract_trace_ids_sql = _scoped
+    try:
+        yield
+    finally:
+        rp._extract_trace_ids_sql = original
+
+
 # ── Dry-run branch ───────────────────────────────────────────────────────────
 def _dry_run(since: int, task_class_filter: str, reflect_lane: str,
-             gradient_model: str, db_path: str) -> None:
+             gradient_model: str, db_path: str, run_id: str = "") -> None:
     """Mirror bash lines 122-134. sqlite3 from `MINI_ORK_DB`, optional
-    task_class filter. Echoes 2-3 lines to stdout depending on filter."""
+    task_class/run-id filters. Echoes 2-3 lines to stdout depending on filter."""
     count = 0
     if os.path.isfile(db_path):
-        filter_sql = ""
+        where = "created_at >= ?"
+        params: list = [int(since)]
         if task_class_filter:
-            filter_sql = f" AND task_class='{task_class_filter}'"
+            where += " AND task_class = ?"
+            params.append(task_class_filter)
+        if run_id:
+            where += " AND run_id = ?"
+            params.append(run_id)
         try:
             con = sqlite3.connect(db_path)
             count = con.execute(
-                f"SELECT COUNT(*) FROM execution_traces "
-                f"WHERE created_at >= {since}{filter_sql};"
+                f"SELECT COUNT(*) FROM execution_traces WHERE {where};", params
             ).fetchone()[0]
             con.close()
         except Exception:
@@ -172,6 +219,8 @@ def _dry_run(since: int, task_class_filter: str, reflect_lane: str,
     print(f"[dry-run] lane: {reflect_lane} -> {gradient_model}")
     if task_class_filter:
         print(f"[dry-run] filter: task_class={task_class_filter}")
+    if run_id:
+        print(f"[dry-run] filter: run_id={run_id}")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -195,6 +244,7 @@ def main(argv: list[str] | None = None) -> int:
     # ── env setup (mirror bash lines 38-72) ────────────────────────────────
     since = args.since or ""
     task_class_filter = args.task_class or ""
+    run_id = args.run_id or os.environ.get("MINI_ORK_REFLECT_RUN_ID", "")
     reflect_lane = args.lane or os.environ.get("MINI_ORK_REFLECT_LANE", "")
     dry_run_env = os.environ.get("MINI_ORK_DRY_RUN", "0")
     dry_run = args.dry_run or (dry_run_env == "1")
@@ -260,7 +310,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── dry-run branch ─────────────────────────────────────────────────────
     if dry_run:
-        _dry_run(since_int, task_class_filter, reflect_lane, gradient_model, db_path)
+        _dry_run(since_int, task_class_filter, reflect_lane, gradient_model,
+                 db_path, run_id)
         return 0
 
     # ── dispatch to reflection_pipeline (ported Python) ────────────────────
@@ -382,8 +433,13 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
     run_stdout = io.StringIO()
-    with contextlib.redirect_stdout(run_stdout):
-        suggestions_json = rp.reflection_run(since_int)
+    if run_id:
+        with _run_scoped_trace_selection(rp, run_id):
+            with contextlib.redirect_stdout(run_stdout):
+                suggestions_json = rp.reflection_run(since_int)
+    else:
+        with contextlib.redirect_stdout(run_stdout):
+            suggestions_json = rp.reflection_run(since_int)
     sys.stdout.write(f"{suggestions_json.rstrip(chr(10))}\n")
 
     # ── side-channel: pattern_store (MO_PATTERN_MINER) ──────────────────────
@@ -587,11 +643,14 @@ def main(argv: list[str] | None = None) -> int:
     gradients_written = 0
     try:
         con = sqlite3.connect(db_path)
+        where = ("CAST(strftime('%s', created_at) AS INTEGER) >= ? "
+                 "AND task_class != '__reflect__'")
+        params: list = [since_int]
+        if run_id:
+            where += " AND run_id = ?"
+            params.append(run_id)
         traces_analyzed = con.execute(
-            "SELECT COUNT(*) FROM execution_traces "
-            "WHERE CAST(strftime('%s', created_at) AS INTEGER) >= ? "
-            "AND task_class != '__reflect__';",
-            (since_int,),
+            f"SELECT COUNT(*) FROM execution_traces WHERE {where};", params
         ).fetchone()[0]
         gradients_written = con.execute(
             "SELECT COUNT(*) FROM gradient_records WHERE created_at >= ?;",
@@ -602,16 +661,22 @@ def main(argv: list[str] | None = None) -> int:
         pass
 
     from mini_ork import trace_store  # noqa: PLC0415
+    verifier_output = {
+        "traces_analyzed": int(traces_analyzed or 0),
+        "gradients_written": int(gradients_written or 0),
+        "since": int(since_int),
+    }
+    # `_reflect_timeout` sizes its bound from post-run passes only. Mark this
+    # row when the lifecycle spawned us as that tail; in-DAG reflector passes
+    # run the same command without the marker and must not ratchet the bound.
+    if os.environ.get("MO_REFLECT_POST_RUN") == "1":
+        verifier_output["caller"] = "post_run"
     payload = json.dumps(trace_store.enrich_stage_trace({
         "trace_id": trace_id,
         "task_class": "__reflect__",
         "status": "success",
         "duration_ms": (reflect_end_ts - reflect_start_ts) * 1000,
-        "verifier_output": {
-            "traces_analyzed": int(traces_analyzed or 0),
-            "gradients_written": int(gradients_written or 0),
-            "since": int(since_int),
-        },
+        "verifier_output": verifier_output,
     }, node_type="reflector"))
     _trace_write(payload, trace_env)
     _trace_state["terminal"] = True
@@ -620,6 +685,20 @@ def main(argv: list[str] | None = None) -> int:
         f"reflect: analyzed {traces_analyzed or 0} traces, "
         f"wrote {gradients_written or 0} gradients (trace {trace_id})\n"
     )
+
+    # ── cost reconcile (last step; post-run child) ──────────────────────────
+    # The lifecycle's own reconcile ran before reflect, so reflect's spend —
+    # gradient extraction is the expensive part — never reached
+    # ``task_runs.cost_usd`` (16 runs, $3.46 short; RB-32). A run-scoped pass
+    # reconciles that run now that every dispatch is recorded. Best-effort: a
+    # ledger/db hiccup must not fail a pass whose learning output is already
+    # persisted and traced.
+    if run_id:
+        try:
+            from mini_ork import cost_ledger  # noqa: PLC0415
+            cost_ledger.reconcile_run_cost(db_path, run_id)
+        except Exception as exc:  # a side-channel must never crash reflect
+            sys.stderr.write(f"  [cost] reconcile skipped: {exc}\n")
     return 0
 
 

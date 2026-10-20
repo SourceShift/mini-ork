@@ -782,12 +782,39 @@ def _assign_new(con: sqlite3.Connection, sim: float | None = None) -> dict:
         else:
             # Start a new theme. Its single member is already the centroid.
             tid = _theme_id(kind, gid)
-            centroid = _top_k(vec, _TOP_K)
+            existing_theme = theme_lookup.get(tid)
+            if existing_theme is not None:
+                # The same deterministic id is already in this pass's view.
+                # Blend the member vector into the existing centroid exactly
+                # as a similarity join does, so the upsert below stores (and
+                # the in-memory entry keeps) a sane centroid even when the
+                # post-pass growth threshold does not trigger a re-derive.
+                prev_n = int(existing_theme["n"] or 0)
+                centroid = _mean_add(existing_theme["centroid"], prev_n, vec)
+            else:
+                prev_n = 0
+                centroid = _top_k(vec, _TOP_K)
+            # A deterministic theme_id can already exist: two runs created in
+            # the same second derive the same id from the same first gradient
+            # (RB-20). A plain INSERT raised `UNIQUE constraint failed:
+            # lesson_themes.theme_id` and aborted the whole batch. Upsert
+            # instead: a second writer joins the theme rather than failing,
+            # and a concurrent process that committed between our read and
+            # this write is absorbed the same way.
             con.execute(
                 "INSERT INTO lesson_themes ("
                 "  theme_id, kind, representative, centroid, n_gradients,"
                 "  n_at_refresh, first_seen, last_seen, updated_at"
-                ") VALUES (?, ?, ?, ?, 1, 1, ?, ?, ?)",
+                ") VALUES (?, ?, ?, ?, 1, 1, ?, ?, ?)"
+                " ON CONFLICT(theme_id) DO UPDATE SET"
+                "  n_gradients = lesson_themes.n_gradients + 1,"
+                "  representative = excluded.representative,"
+                "  centroid = excluded.centroid,"
+                "  first_seen = MIN(COALESCE(lesson_themes.first_seen,"
+                "                    excluded.first_seen), excluded.first_seen),"
+                "  last_seen = MAX(COALESCE(lesson_themes.last_seen,"
+                "                   excluded.last_seen), excluded.last_seen),"
+                "  updated_at = excluded.updated_at",
                 (
                     tid,
                     kind,
@@ -800,26 +827,53 @@ def _assign_new(con: sqlite3.Connection, sim: float | None = None) -> dict:
             )
             con.execute(
                 "INSERT INTO gradient_theme (gradient_id, theme_id, similarity)"
-                "  VALUES (?, ?, ?)",
+                "  VALUES (?, ?, ?)"
+                "  ON CONFLICT(gradient_id) DO UPDATE SET"
+                "    theme_id = excluded.theme_id,"
+                "    similarity = excluded.similarity",
                 (gid, tid, 1.0),
             )
-            t = {
-                "theme_id": tid,
-                "kind": kind,
-                "centroid": centroid,
-                "n": 1,
-                "n_at_refresh": 1,
-                "representative": g["signal"] or "",
-                "first_seen": g["created_at"] or now,
-                "last_seen": g["created_at"] or now,
-                "role": None,
-                "task_class": None,
-            }
-            themes_by_kind[kind].append(t)
-            theme_lookup[tid] = t
-            _index_update(index_by_kind[kind], tid, centroid)
+            if existing_theme is not None:
+                # Same-process collision: the first member already opened this
+                # theme in this call. Keep one in-memory entry (a second would
+                # double-count `themes_total`) and let the post-pass re-derive.
+                existing_theme["n"] = prev_n + 1
+                existing_theme["last_seen"] = max(
+                    existing_theme["last_seen"] or 0, g["created_at"] or 0)
+                existing_theme["representative"] = g["signal"] or ""
+                existing_theme["centroid"] = centroid
+                _index_update(index_by_kind[kind], tid, centroid)
+            else:
+                # Cross-process collision: the row was committed after this
+                # pass loaded the theme tables. Build the entry from what the
+                # upsert left in the DB so the counts start from the truth.
+                row = con.execute(
+                    "SELECT n_gradients, n_at_refresh, first_seen, last_seen"
+                    "  FROM lesson_themes WHERE theme_id = ?",
+                    (tid,),
+                ).fetchone()
+                t = {
+                    "theme_id": tid,
+                    "kind": kind,
+                    "centroid": centroid,
+                    "n": int(row[0]) if row and row[0] is not None else 1,
+                    "n_at_refresh": (
+                        int(row[1]) if row and row[1] is not None else 0),
+                    "representative": g["signal"] or "",
+                    "first_seen": (
+                        int(row[2]) if row and row[2] is not None
+                        else (g["created_at"] or now)),
+                    "last_seen": (
+                        int(row[3]) if row and row[3] is not None
+                        else (g["created_at"] or now)),
+                    "role": None,
+                    "task_class": None,
+                }
+                themes_by_kind[kind].append(t)
+                theme_lookup[tid] = t
+                _index_update(index_by_kind[kind], tid, centroid)
+                new_themes += 1
             touched.add(tid)
-            new_themes += 1
         assigned += 1
         # Batch-commit (kickoff fix 5): release the write lock every 1,000
         # assignments so other mini-ork writers to state.db do not hit

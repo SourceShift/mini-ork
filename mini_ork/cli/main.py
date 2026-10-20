@@ -300,6 +300,12 @@ def _start_orchestrator_watch(root, home, run_id, run_dir) -> bool:
 _REFLECT_TIMEOUT_FALLBACK = 360
 _REFLECT_TIMEOUT_HEADROOM = 3
 _REFLECT_TIMEOUT_CEILING = 21600
+# Post-run reflect is a tail, not a stage: however slow a historical pass was,
+# it may hold the run for at most an hour unless the operator pins a bound
+# explicitly. A single 8978 s pass used to ratchet every later reflect to the
+# 21600 s ceiling (RB-20); the post-run tail is detached now, but the same
+# ratchet still bounded the in-DAG reflector and the MO_REFLECT_INLINE path.
+_REFLECT_TIMEOUT_POSTRUN_CAP = 3600
 _REFLECT_TIMEOUT_SAMPLE = 20
 # Slack added on top of the run's remaining --deadline when capping reflect:
 # enough for the child to notice the stop and flush its log, not enough to
@@ -309,13 +315,22 @@ _REFLECT_DEADLINE_GRACE = 120
 
 def _reflect_durations(db: str | None = None,
                        *, sample: int = _REFLECT_TIMEOUT_SAMPLE) -> list[int]:
-    """Durations, in seconds, of the most recent *successful* reflect passes.
+    """Durations, in seconds, of the most recent *post-run* successful passes.
+
+    Only batches this lifecycle spawned count. The in-DAG ``reflector`` node
+    runs the same command synchronously before ``node_start`` and once held a
+    run silent for 8978 s (RB-20); letting that pass size the post-run bound
+    ratcheted every later reflect to the 21600 s ceiling. Post-run children are
+    marked by ``MO_REFLECT_POST_RUN=1`` in their environment, which reflect
+    records as ``verifier_output.caller == "post_run"`` on its terminal trace;
+    unmarked rows (including every row written before this marker existed) are
+    not evidence of post-run work and are ignored.
 
     Read through the same ladder every other reader uses (explicit arg →
     ``MINI_ORK_DB`` → ``$MINI_ORK_HOME/state.db``). Returns ``[]`` when the DB
-    or the table is missing: a home that has never completed a reflect has no
-    recorded work to size a bound from, and an empty list is the honest answer
-    rather than a guess.
+    or the table is missing: a home that has never completed a post-run
+    reflect has no recorded work to size a bound from, and an empty list is
+    the honest answer rather than a guess.
     """
     path = db or os.environ.get("MINI_ORK_DB") or os.path.join(
         os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork"),
@@ -328,12 +343,15 @@ def _reflect_durations(db: str | None = None,
     except sqlite3.Error:
         return []
     try:
+        # Fetch more rows than the sample: in-DAG passes interleave with
+        # post-run ones, and filtering after the SQL keeps the query simple
+        # without letting a burst of in-DAG rows hide the tail's own history.
         rows = con.execute(
-            "SELECT duration_ms FROM execution_traces "
+            "SELECT duration_ms, verifier_output FROM execution_traces "
             "WHERE task_class='__reflect__' AND status='success' "
             "AND duration_ms IS NOT NULL AND duration_ms > 0 "
             "ORDER BY created_at DESC LIMIT ?",
-            (sample,),
+            (max(1, int(sample)) * 4,),
         ).fetchall()
     except sqlite3.Error:
         return []
@@ -342,7 +360,23 @@ def _reflect_durations(db: str | None = None,
             con.close()
         except sqlite3.Error:
             pass
-    return [int(r[0]) // 1000 for r in rows if r and r[0]]
+    durations: list[int] = []
+    for row in rows:
+        if not row or not row[0]:
+            continue
+        payload = row[1]
+        if isinstance(payload, (bytes, bytearray)):
+            payload = payload.decode("utf-8", "replace")
+        try:
+            marker = json.loads(payload) if payload else {}
+        except (TypeError, ValueError):
+            marker = {}
+        if not isinstance(marker, dict) or marker.get("caller") != "post_run":
+            continue
+        durations.append(int(row[0]) // 1000)
+        if len(durations) >= int(sample):
+            break
+    return durations
 
 
 def _reflect_timeout(db: str | None = None) -> tuple[int, str]:
@@ -359,41 +393,50 @@ def _reflect_timeout(db: str | None = None) -> tuple[int, str]:
     because ``code_findings`` is the last of eight sequential side channels,
     every kill took the "Your code" tab's only data source with it. The bound is
     therefore derived from the work this home has actually recorded: the
-    slowest of the last ``_REFLECT_TIMEOUT_SAMPLE`` successful passes, times
-    ``_REFLECT_TIMEOUT_HEADROOM``, floored at the legacy default and capped.
+    slowest of the last ``_REFLECT_TIMEOUT_SAMPLE`` successful *post-run*
+    passes, times ``_REFLECT_TIMEOUT_HEADROOM``, floored at the legacy default
+    and capped at ``_REFLECT_TIMEOUT_POSTRUN_CAP``. In-DAG reflector passes are
+    excluded — an 8978 s one used to ratchet every later pass to the ceiling.
 
-    ``MO_REFLECT_TIMEOUT_SECONDS`` still pins an explicit bound (an operator who
-    set it outranks the derivation) and ``MO_REFLECT_TIMEOUT_MAX_SECONDS`` moves
-    the ceiling. Fail-closed: an unreadable DB, no recorded pass, or a malformed
-    value all fall back to the floor, and the second element always names the
-    rule that produced the number so the log line can be read back.
+    ``MO_REFLECT_TIMEOUT_S`` (the kickoff's name) or the older
+    ``MO_REFLECT_TIMEOUT_SECONDS`` pins an explicit bound and is the only way
+    past the 3600 s post-run cap; ``MO_REFLECT_TIMEOUT_MAX_SECONDS`` may only
+    lower that cap. Fail-closed: an unreadable DB, no recorded pass, or a
+    malformed value all fall back to the floor, and the second element always
+    names the rule that produced the number so the log line can be read back.
     """
-    pinned = os.environ.get("MO_REFLECT_TIMEOUT_SECONDS")
-    if pinned:
+    invalid_pin = ""
+    for name in ("MO_REFLECT_TIMEOUT_S", "MO_REFLECT_TIMEOUT_SECONDS"):
+        pinned = os.environ.get(name)
+        if not pinned:
+            continue
         try:
-            return max(1, int(pinned)), "pinned by MO_REFLECT_TIMEOUT_SECONDS"
+            return max(1, int(pinned)), f"pinned by {name}"
         except ValueError:
-            return _REFLECT_TIMEOUT_FALLBACK, (
-                f"MO_REFLECT_TIMEOUT_SECONDS={pinned!r} is not an integer; "
-                f"floor {_REFLECT_TIMEOUT_FALLBACK}s")
+            invalid_pin = f"{name}={pinned!r} is not an integer"
+    if invalid_pin:
+        return _REFLECT_TIMEOUT_FALLBACK, (
+            f"{invalid_pin}; floor {_REFLECT_TIMEOUT_FALLBACK}s")
     try:
         ceiling = max(1, int(os.environ.get(
             "MO_REFLECT_TIMEOUT_MAX_SECONDS", str(_REFLECT_TIMEOUT_CEILING))))
     except ValueError:
         ceiling = _REFLECT_TIMEOUT_CEILING
+    capped_ceiling = min(ceiling, _REFLECT_TIMEOUT_POSTRUN_CAP)
     durations = _reflect_durations(db)
     if not durations:
         return _REFLECT_TIMEOUT_FALLBACK, (
-            f"no successful reflect recorded; floor {_REFLECT_TIMEOUT_FALLBACK}s")
+            f"no successful post-run reflect recorded; "
+            f"floor {_REFLECT_TIMEOUT_FALLBACK}s")
     slowest = max(durations)
-    derived = min(ceiling, slowest * _REFLECT_TIMEOUT_HEADROOM)
+    derived = min(capped_ceiling, slowest * _REFLECT_TIMEOUT_HEADROOM)
     if derived <= _REFLECT_TIMEOUT_FALLBACK:
         return _REFLECT_TIMEOUT_FALLBACK, (
-            f"slowest of {len(durations)} recent pass(es) {slowest}s; "
+            f"slowest of {len(durations)} recent post-run pass(es) {slowest}s; "
             f"floor {_REFLECT_TIMEOUT_FALLBACK}s")
     return derived, (
         f"{_REFLECT_TIMEOUT_HEADROOM}x the slowest of {len(durations)} recent "
-        f"pass(es) ({slowest}s), ceiling {ceiling}s")
+        f"post-run pass(es) ({slowest}s), ceiling {capped_ceiling}s")
 
 
 def _reflect_timeout_seconds() -> int:
@@ -2194,58 +2237,127 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
         # The child's output used to go into a pipe that was discarded on
         # return, so a reflect that died mid-pipeline left no evidence of where
         # it died — the researcher home's 1930 leaked 'running' rows are all
-        # there is to show for months of passes. The log is written for every
-        # outcome, the kill included, and it names the engine and the DB so a
-        # drifted vendored copy or a home/DB mismatch is visible in the artifact
-        # rather than only in a process list.
+        # there is to show for months of passes. The header is streamed to the
+        # log BEFORE the child exists now, so even a detached pass that dies
+        # leaves evidence, and it names the engine and the DB so a drifted
+        # vendored copy or a home/DB mismatch is visible in the artifact rather
+        # than only in a process list.
         reflect_head = (
             "=== mini-ork reflect (auto) ===\n"
+            f"run:    {run_id}\n"
             f"since:  {t0}\n"
             f"bound:  {reflect_bound}s ({reflect_bound_why})\n"
             f"engine: {root} (v{engine_version(root) or '?'})\n"
             f"home:   {home}\n"
             f"db:     {reflect_db}\n"
         )
-        reflect_out = ""
-        reflect_err = ""
-        reflect_status = ""
-        try:
-            completed = subprocess.run(
-                [sys.executable, "-m", "mini_ork.cli.reflect", "--since", str(t0)],
-                capture_output=True,
-                text=True,
-                timeout=reflect_bound,
-                env={
-                    **_module_env(root),
-                    "MO_REFLECTION_BATCH": os.environ.get("MO_REFLECTION_BATCH", "25"),
-                },
-            )
-            reflect_out = _child_text(completed.stdout)
-            reflect_err = _child_text(completed.stderr)
-            reflect_status = f"exit {completed.returncode}"
-        except subprocess.TimeoutExpired as exc:
-            reflect_out = _child_text(exc.stdout)
-            reflect_err = _child_text(exc.stderr)
-            reflect_status = f"timed out after {reflect_bound}s; skipped"
-            sys.stdout.write("── reflect (timed out; skipped) ──\n")
-        finally:
-            # A timed-out reflect is SIGKILLed by subprocess.run, so its own
-            # terminal trace write never runs and the row it opened as
-            # 'running' leaks forever — inflating the running count AND hiding
-            # the run from `resolve_finished_runs` (which reads "run over = no
-            # trace running"). The parent owns the kill, so the parent owns the
-            # terminal write. Keyed on run_id, so it only touches this run's
-            # reflect row.
-            with contextlib.suppress(Exception):
-                trace_store.finalize_reflect_traces(run_id)
-        reflect_log = ""
-        if _run_dir and _run_dir != "." and os.path.isdir(_run_dir):
-            reflect_log = _write_reflect_log(
-                _run_dir, reflect_head, reflect_status, reflect_out, reflect_err)
-        sys.stdout.write(
-            f"── reflect ({reflect_status}"
-            f"{f'; log: {reflect_log}' if reflect_log else ''}) ──\n"
+        # Scoped to this run: `--since` alone processed every concurrent run's
+        # traces (76 analysed, 8 its own, $0.41 of foreign spend on
+        # slack-transport), and the detached child reconciles this run's spend
+        # as its last step. `--since` is kept as the window; `--run-id` narrows
+        # it to the traces this run owns.
+        reflect_argv = [
+            sys.executable, "-m", "mini_ork.cli.reflect",
+            "--since", str(t0), "--run-id", run_id,
+        ]
+        reflect_env = {
+            **_module_env(root),
+            "MINI_ORK_RUN_ID": run_id,
+            "MO_REFLECTION_BATCH": os.environ.get("MO_REFLECTION_BATCH", "25"),
+            # Marks this pass as the post-run tail so `_reflect_durations`
+            # keeps in-DAG reflector passes out of the bound's history.
+            "MO_REFLECT_POST_RUN": "1",
+        }
+        reflect_run_dir = (
+            _run_dir if (_run_dir and _run_dir != "." and os.path.isdir(_run_dir))
+            else os.path.join(home, "runs", run_id)
         )
+        has_log_dir = bool(reflect_run_dir and os.path.isdir(reflect_run_dir))
+        ref_log_name = _reflect_log_name()
+        reflect_log = os.path.join(reflect_run_dir, ref_log_name) if has_log_dir else ""
+
+        if os.environ.get("MO_REFLECT_INLINE", "0") == "1":
+            # Synchronous mode, kept for tests and for an operator who wants
+            # the tail completed before the process exits. The header lands
+            # first so a timeout kill still leaves the bound and the paths.
+            reflect_out = ""
+            reflect_err = ""
+            reflect_status = ""
+            if has_log_dir:
+                with contextlib.suppress(OSError):
+                    with open(reflect_log, "w", encoding="utf-8") as fh:
+                        fh.write(reflect_head)
+            try:
+                completed = subprocess.run(
+                    reflect_argv,
+                    capture_output=True,
+                    text=True,
+                    timeout=reflect_bound,
+                    env=reflect_env,
+                )
+                reflect_out = _child_text(completed.stdout)
+                reflect_err = _child_text(completed.stderr)
+                reflect_status = f"exit {completed.returncode}"
+            except subprocess.TimeoutExpired as exc:
+                reflect_out = _child_text(exc.stdout)
+                reflect_err = _child_text(exc.stderr)
+                reflect_status = f"timed out after {reflect_bound}s; skipped"
+                sys.stdout.write("── reflect (timed out; skipped) ──\n")
+            finally:
+                # A timed-out reflect is SIGKILLed by subprocess.run, so its
+                # own terminal trace write never runs and the row it opened as
+                # 'running' leaks forever — inflating the running count AND
+                # hiding the run from `resolve_finished_runs` (which reads
+                # "run over = no trace running"). The parent owns the kill, so
+                # the parent owns the terminal write. Keyed on run_id, so it
+                # only touches this run's reflect row. The detached path needs
+                # no such sweep: nothing here kills that child.
+                with contextlib.suppress(Exception):
+                    trace_store.finalize_reflect_traces(run_id)
+            if has_log_dir:
+                reflect_log = _write_reflect_log(
+                    reflect_run_dir, reflect_head, reflect_status,
+                    reflect_out, reflect_err)
+            sys.stdout.write(
+                f"── reflect ({reflect_status}"
+                f"{f'; log: {reflect_log}' if reflect_log else ''}) ──\n"
+            )
+        else:
+            # Detached: publish must complete the run even when reflect has
+            # hours of foreign work to chew on (10 epic children measured
+            # 12–100 min of hold). `start_new_session=True` gives the child its
+            # own session so it outlives this process; its stdout/stderr go
+            # straight to the log file, never a pipe the parent would drain.
+            reflect_status = ""
+            try:
+                if has_log_dir:
+                    stream = open(reflect_log, "w", encoding="utf-8")
+                else:
+                    stream = open(os.devnull, "w", encoding="utf-8")
+                try:
+                    stream.write(reflect_head)
+                    stream.flush()
+                    proc = subprocess.Popen(
+                        reflect_argv,
+                        stdin=subprocess.DEVNULL,
+                        stdout=stream,
+                        stderr=subprocess.STDOUT,
+                        env=reflect_env,
+                        start_new_session=True,
+                    )
+                finally:
+                    stream.close()
+                reflect_status = f"spawned pid {proc.pid}; not awaited"
+            except OSError as exc:
+                reflect_status = f"spawn failed: {exc}"
+                if has_log_dir:
+                    with contextlib.suppress(OSError):
+                        with open(reflect_log, "a", encoding="utf-8") as fh:
+                            fh.write(f"spawn failed: {exc}\n")
+            sys.stdout.write(
+                f"── reflect ({reflect_status}"
+                f"{f'; log: {reflect_log}' if has_log_dir else ''}) ──\n"
+            )
 
     # ── trajectory retention (roadmap Step 2 / A2): best-effort TTL prune of
     # turn_jsonl artifacts. MO_TRAJECTORY_TTL_DAYS=0 disables; never gates.
