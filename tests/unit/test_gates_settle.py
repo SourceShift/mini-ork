@@ -106,7 +106,8 @@ def test_settle_marks_only_the_runs_pending_gates_superseded(tmp_path,
     assert set(closed) == {mine, retry}
     for inbox_id in (mine, retry):
         row = _row(home, inbox_id)
-        assert row["status"] == "superseded"
+        assert row["status"] == "rejected"
+        assert str(row["review_note"]).startswith("superseded")
         assert REASON in str(row.get("review_note") or "")
         assert row.get("resolved_at")
     other = _row(home, theirs)

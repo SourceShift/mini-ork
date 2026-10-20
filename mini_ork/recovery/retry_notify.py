@@ -1164,7 +1164,7 @@ def settle_gates_for_run(
     *,
     db_path: str | Path | None = None,
 ) -> list[int]:
-    """Mark every still-pending gate of ``run_id`` as ``superseded``.
+    """Resolve every still-pending gate of ``run_id`` (``rejected``, note ``superseded: …``).
 
     Called when a run publishes (the terminal transition) or when a recovery
     execution leaves it published: the gate asked the operator to decide
@@ -1176,11 +1176,11 @@ def settle_gates_for_run(
     ``feature`` (the retry gate's producer), ``blocks_dispatch_for`` (node
     review / merge approval) or ``context.run_id``. Only ``pending`` rows are
     touched — an already-approved/rejected gate keeps its outcome — which also
-    makes a second call a no-op. ``superseded`` is not one of
-    ``oversight_inbox.RESOLVABLE`` and the canonical DDL's CHECK omits it, so
-    the write goes through this module's own connection with
-    ``PRAGMA ignore_check_constraints``; the resolution timestamp and the note
-    still land on the row, so a reader sees *why* it closed.
+    makes a second call a no-op. The schema's CHECK admits only
+    pending/approved/rejected, so — exactly like
+    :func:`supersede_gates_for_target` — the gate is resolved ``rejected`` with a
+    ``superseded: …`` note; never bypass the CHECK (a forbidden status value is
+    invisible to every reader keyed on the vocabulary).
 
     Fail-soft: a missing DB, a missing table or a bad row is skipped, never
     raised — callers run this from publish/teardown paths that must not fail.
@@ -1216,13 +1216,12 @@ def settle_gates_for_run(
             iid = int(row.get("inbox_id"))
             con = sqlite3.connect(str(db), timeout=5.0)
             try:
-                con.execute("PRAGMA ignore_check_constraints = ON")
                 cur = con.execute(
                     "UPDATE mo_inbox_gates "
-                    "   SET status = 'superseded', resolved_at = ?, "
+                    "   SET status = 'rejected', resolved_at = ?, "
                     "       review_note = ? "
                     " WHERE inbox_id = ? AND status = 'pending'",
-                    (time.time(), note, iid),
+                    (int(time.time()), note, iid),
                 )
                 con.commit()
                 resolved = cur.rowcount == 1
