@@ -139,7 +139,12 @@ def test_executes_preserve_nonnested(tmp_path):
         ({"post_rc": 1, "base_rc": "0"}, PROVEN, REFUTED),   # the non-nested case
         ({"post_rc": 2, "base_rc": "0"}, REFUTED, REFUTED),
         ({"post_rc": 2, "base_rc": "2"}, UNVERIFIED, UNVERIFIED),
-        ({}, UNVERIFIED, UNVERIFIED),                        # no post_rc
+        # No post_rc: the envelope's boolean pass IS the test outcome
+        # (RBF-02b), so executes is proven while preserve — which needs an rc
+        # — cannot be judged. Still non-nested.
+        ({}, PROVEN, UNVERIFIED),
+        # No post_rc AND no boolean pass: no test outcome at all.
+        ({"pass": None}, UNVERIFIED, UNVERIFIED),
     ]
     for i, (extra, exp_exec, exp_pres) in enumerate(cases):
         payload = {"verifier": "test", "pass": True, **extra}

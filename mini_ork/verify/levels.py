@@ -51,6 +51,12 @@ VALUES = (PROVEN, REFUTED, UNVERIFIED, NA)
 REQUIRED_LEVELS = {
     "code_fix": ("applies", "executes", "target", "preserve"),
     "verified_artifact": ("contract",),
+    # framework-edit's test verifier publishes an envelope, not a posix rc
+    # (run-1792091737-99865: verifier_test.json said pass:false and the run
+    # still published because executes fell through to "no post_rc"). Its only
+    # required level is the test outcome; the tree-change quartet belongs to
+    # the code-fix instruments (see `_CODE_EDIT_CLASSES`).
+    "framework_edit": ("executes",),
 }
 
 # Classes whose recipes change a source tree and therefore OWN the
@@ -60,6 +66,14 @@ REQUIRED_LEVELS = {
 # UNVERIFIED — abstention is reserved for "the instrument ran and could not
 # prove", never for "this recipe never had the instrument".
 _CODE_EDIT_CLASSES = {"code_fix"}
+
+# Classes whose recipe may legitimately never write verifier_test.json. A
+# MISSING test instrument there is n/a (the level cannot apply), never
+# UNVERIFIED: framework-edit runs write implementer-summary.json, so the
+# generic `tree_levels_na` branch above does not fire for them, and treating
+# the absent instrument as abstention would withhold every publish the recipe
+# makes today. A PRESENT test file is scored normally for these classes too.
+_MISSING_TEST_NA_CLASSES = {"framework_edit"}
 
 
 def required_levels(task_class):
@@ -215,6 +229,13 @@ def abstain_kind(obj):
     return ""
 
 
+# A bare ``{"pass": true}`` carrying any of these keys is a declared skip, not
+# a judgement — code-fix's typecheck verifier emits exactly that shape when no
+# tool is installed. Reading it as PROVEN would mint a contract level out of an
+# examination that never ran (the defect the shape guard used to block).
+_BARE_PASS_SKIP_KEYS = ("error_summary", "status", "skipped")
+
+
 def _read_verifier_evidence(path):
     """The last JSON object in ``path`` shaped like a recipe verifier's envelope.
 
@@ -224,11 +245,38 @@ def _read_verifier_evidence(path):
     Scan bottom-up like :func:`read_verifier_payload`; the envelope's shape
     (bool ``pass`` + list ``checks``) distinguishes it from the inner check
     objects, which fail the guard.
+
+    A panel verifier that fails outright publishes only ``{"pass": false}`` —
+    an object with a boolean ``pass`` and no ``checks``. That is accepted as a
+    verdict when it is the LAST JSON object in the file and carries no
+    ``id``/``name`` key (inner check rows carry one), so a demonstrated failure
+    reads as REFUTED instead of "evidence unparsable" → UNVERIFIED. The full
+    ``pass`` + ``checks`` envelope keeps priority: it is returned as soon as it
+    is seen, even when a bare object trails it. A bare ``pass: true`` that also
+    declares a skip is not a judgement.
     """
+    bare = None
+    first = True
     for obj in _iter_json_objects(path):
         if isinstance(obj.get("pass"), bool) and isinstance(obj.get("checks"), list):
             return obj
-    return None
+        if not first:
+            continue
+        first = False
+        if (
+            isinstance(obj.get("pass"), bool)
+            and "checks" not in obj
+            and "id" not in obj
+            and "name" not in obj
+        ):
+            bare = obj
+    if bare is None:
+        return None
+    if bare["pass"] is False:
+        return bare
+    if any(bare.get(key) for key in _BARE_PASS_SKIP_KEYS):
+        return None
+    return bare
 
 
 def abstained_kinds(run_dir):
@@ -310,13 +358,18 @@ def _contract_from_recipe_verifiers(run_dir):
             # verifier's own payload says it examined nothing.
             verdicts[name] = "abstained"
             continue
+        # A bare `{"pass": bool}` verdict carries no `checks` list, so read it
+        # defensively; a full envelope's gating rows keep their priority.
+        checks = obj.get("checks")
         gating_failed = any(
             isinstance(check, dict)
             and check.get("gating") is True
             and check.get("pass") is not True
-            for check in obj["checks"]
+            for check in (checks if isinstance(checks, list) else ())
         )
-        verdicts[name] = "refuted" if (obj["pass"] is False or gating_failed) else "proven"
+        verdicts[name] = (
+            "refuted" if (obj.get("pass") is False or gating_failed) else "proven"
+        )
     if not verdicts:
         return None, ""
     if "refuted" in verdicts.values():
@@ -352,7 +405,14 @@ def derive_levels(run_dir, task_class=None):
     """
     run_dir = run_dir or ""
     S = _read_json_dict(os.path.join(run_dir, "implementer-summary.json"))
-    T = read_verifier_payload(os.path.join(run_dir, "verifier_test.json"), "test") or {}
+    test_path = os.path.join(run_dir, "verifier_test.json")
+    T = read_verifier_payload(test_path, "test")
+    if T is None:
+        # The file name already names the instrument, and half the recipes'
+        # verifiers omit the `verifier` field; fall back to the file's single
+        # object (a merged log of several distinct objects stays unreadable).
+        T = read_single_verifier_payload(test_path)
+    T = T or {}
     B = read_verifier_payload(os.path.join(run_dir, "verifier_behavioral.json"), "behavioral")
 
     vector = dict.fromkeys(LEVELS, UNVERIFIED)
@@ -422,12 +482,27 @@ def derive_levels(run_dir, task_class=None):
     if tree_levels_na:
         vector["executes"] = NA
         reasons["executes"] = f"verifier_test.json: instrument n/a for task_class={task_class}"
+    elif not has_test and task_class in _MISSING_TEST_NA_CLASSES:
+        # The recipe never wrote a test instrument: n/a, which does not block
+        # publish. A PRESENT file is scored normally, so an unreadable or
+        # non-boolean pass still abstains below.
+        vector["executes"] = NA
+        reasons["executes"] = f"verifier_test.json: instrument n/a for task_class={task_class}"
     elif rc in (0, 1):
         vector["executes"] = PROVEN
         reasons["executes"] = f"verifier_test.json: post_rc={rc}"
     elif isinstance(rc, int) and base_green:
         vector["executes"] = REFUTED
         reasons["executes"] = f"verifier_test.json: post_rc={rc} on green base"
+    elif rc is None and isinstance(T.get("pass"), bool):
+        # No posix rc, but the test evidence's envelope carries a verdict:
+        # framework-edit's test verifier publishes exactly this shape, so a
+        # boolean pass IS the test outcome. Code-fix evidence always carries
+        # post_rc, so it never reaches this branch (decided as today).
+        vector["executes"] = PROVEN if T["pass"] else REFUTED
+        reasons["executes"] = (
+            f"verifier_test.json: envelope pass={str(T['pass']).lower()}"
+        )
     else:
         reasons["executes"] = "verifier_test.json: no post_rc"
 
