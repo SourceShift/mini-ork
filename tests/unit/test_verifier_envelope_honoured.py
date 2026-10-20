@@ -73,6 +73,27 @@ def test_pass_true_envelope_after_warning_line_is_accepted(local_lane, tmp_path)
     assert rc == 0
 
 
+def test_declared_unverified_envelope_after_warning_keeps_exit_zero(local_lane, tmp_path):
+    """A declared abstention is not a judgement: keep the script's rc (RBF-02a-fixup)."""
+    rc, _ = _run(tmp_path, """
+        import sys
+        sys.stderr.write(%r)
+        print('{"verifier": "test", "pass": false, "status": "unverified"}')
+        sys.exit(0)
+    """ % WARNING_LINE)
+    assert rc == 0
+
+
+def test_declared_unverified_envelope_after_warning_keeps_exit_one(local_lane, tmp_path):
+    rc, _ = _run(tmp_path, """
+        import sys
+        sys.stderr.write(%r)
+        print('{"verifier": "test", "pass": false, "status": "unverified"}')
+        sys.exit(1)
+    """ % WARNING_LINE)
+    assert rc == 1
+
+
 def test_pure_json_pass_false_is_still_refuted(local_lane, tmp_path):
     rc, _ = _run(tmp_path, """
         import sys

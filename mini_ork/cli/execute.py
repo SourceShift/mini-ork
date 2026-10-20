@@ -2345,6 +2345,7 @@ def _run_verifier_ref(script, evidence_path, *, plan_path="", artifact_path="", 
     if not os.path.getsize(evidence_path):
         open(evidence_path, "w").write(f"vacuous pass: verifier exited {rc} but wrote no evidence")
         return 1
+    tolerant = False
     try:
         payload = json.load(open(evidence_path))
     except Exception:
@@ -2354,6 +2355,7 @@ def _run_verifier_ref(script, evidence_path, *, plan_path="", artifact_path="", 
         # then turned a failed gate into a pass (audit RB-02a). Read the
         # payload tolerantly instead: a sole JSON object, else the last
         # object carrying a boolean ``pass``.
+        tolerant = True
         payload = _levels.read_single_verifier_payload(evidence_path)
         if payload is None:
             for candidate in _levels._iter_json_objects(evidence_path):
@@ -2362,6 +2364,15 @@ def _run_verifier_ref(script, evidence_path, *, plan_path="", artifact_path="", 
                     break
     if not isinstance(payload, dict) or "pass" not in payload:
         return rc  # non-JSON evidence → propagate the script's rc
+    if tolerant and isinstance(payload.get("status"), str) and (
+            payload["status"].strip().lower() in ("unverified", "skipped", "abstain")):
+        # A declared non-judgement is not a verdict about the code: recipes
+        # such as code-fix's ``_unverified`` print ``pass: false`` with a
+        # ``status`` of ``unverified`` and exit 0 so the level gate withholds
+        # the publish. Recovering that envelope from merged evidence must not
+        # turn the abstention into a node failure (regression from RB-02a) —
+        # keep the script's own rc for this evidence only.
+        return rc
     if _levels.abstain_kind(payload):
         # The verifier declared it could not run its tool (audit 2026-10-11).
         # That is an abstention, not a verdict about the code: a distinct rc so

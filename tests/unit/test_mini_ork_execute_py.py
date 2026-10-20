@@ -25,7 +25,8 @@ from mini_ork.cli import execute_handlers as exh
 def _isolate_run_environment(monkeypatch):
     for name in (
         "MINI_ORK_RUN_DIR", "MINI_ORK_RECIPE", "MINI_ORK_PLAN_PATH",
-        "MINI_ORK_RUN_ID", "MO_TARGET_CWD", "MO_APPLY_IMPL_OUTPUT",
+        "MINI_ORK_RUN_ID", "MINI_ORK_RECIPE_ROOT", "MINI_ORK_AGENTS",
+        "MO_TARGET_CWD", "MO_APPLY_IMPL_OUTPUT",
     ):
         monkeypatch.delenv(name, raising=False)
 
