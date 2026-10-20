@@ -7,6 +7,7 @@ mini_ork.cli.execute for backward compatibility.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -228,6 +229,42 @@ def _publish_truth_refusal(run_dir):
             continue
         return (f"verifier {stem} pass=false",
                 f"verifier_{stem}.json declares pass: false and is gating")
+    return None
+
+
+def _verified_diff_refusal(run_dir, recipe):
+    """``(reason, detail)`` when framework-edit.diff changed after verification.
+
+    RB-13/RBF-13: the verifiers each record ``artifact_sha256`` — the sha256 of
+    the ``framework-edit.diff`` they judged. Before publishing, recompute the
+    file's sha and refuse when ANY recorded pin differs: that diff was rewritten
+    after its approval, so the verified artifact is not the published one
+    (run-1792351202: a 19-file delta was verified, then a 4-file diff was
+    shipped without re-verification). A missing ``artifact_sha256`` means an
+    envelope from an older run, which pinned nothing and is not refused; a
+    missing diff is the artifact gate's failure to report, not a pin mismatch.
+    """
+    if not run_dir or recipe != "framework-edit":
+        return None
+    diff = os.path.join(run_dir, "framework-edit.diff")
+    try:
+        with open(diff, "rb") as fh:
+            h = hashlib.sha256()
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+            current = h.hexdigest()
+    except OSError:
+        return None
+    for stem, envelope in _run_verifier_envelopes(run_dir):
+        pinned = envelope.get("artifact_sha256")
+        if not pinned:
+            continue
+        if str(pinned) != current:
+            return (
+                "framework-edit.diff changed after verification",
+                f"verifier_{stem}.json verified sha256 {pinned}, but "
+                f"framework-edit.diff is now {current}",
+            )
     return None
 
 
@@ -562,6 +599,18 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
     refusal = _publish_truth_refusal(run_dir)
     if refusal is not None:
         reason, detail = refusal
+        print(f"  [skip-publish] {reason}")
+        _record_publish_abstain(run_dir, reason, detail)
+        _note(db, run_id, f"publisher: {reason} — publish withheld")
+        set_status(db, run_id, "failed")
+        return 0, "publish_abstain"
+    # ── verified-artifact pin (RB-13/RBF-13) ────────────────────────────────
+    # The verifiers hashed the framework-edit.diff they judged. If that file has
+    # changed since, the approval belongs to an artifact that no longer exists;
+    # publishing the new one would ship unverified work (run-1792351202).
+    pin_refusal = _verified_diff_refusal(run_dir, recipe)
+    if pin_refusal is not None:
+        reason, detail = pin_refusal
         print(f"  [skip-publish] {reason}")
         _record_publish_abstain(run_dir, reason, detail)
         _note(db, run_id, f"publisher: {reason} — publish withheld")

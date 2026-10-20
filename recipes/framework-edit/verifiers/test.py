@@ -269,6 +269,16 @@ def _sha256_file(path):
     return h.hexdigest()
 
 
+# Pin the artifact this verifier judged (RB-13/RBF-13): the publisher recomputes
+# the sha before publishing and refuses when it no longer matches. Captured
+# BEFORE any check reads, applies, or could rewrite the diff, so the recorded
+# value is the diff that was actually verified — not whatever is on disk later.
+try:
+    ARTIFACT_SHA256 = _sha256_file(DIFF)
+except OSError:
+    ARTIFACT_SHA256 = ""
+
+
 def _apply_diff_to_copy():
     if not _assert_copy_is_own_git_root():
         _ev.write("copy-not-its-own-git-root\n")
@@ -763,6 +773,7 @@ VERIFIER_JSON = json.dumps({
                 if not c["pass"] and c.get("gating", True)],
     "checked_criteria": [c["name"] for c in checks],
     "artifact_ref": "$MINI_ORK_RUN_DIR/framework-edit.diff tests/test_web_smoke.py",
+    "artifact_sha256": ARTIFACT_SHA256,
 })
 
 tests_pass = "true" if not failed else "false"
