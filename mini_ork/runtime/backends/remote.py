@@ -437,6 +437,11 @@ class RemoteWorkspace:
         self._token_env = token_env or "MO_NODE_TOKEN"
         self._on_chunk = on_chunk or (lambda: None)
         self._sid: str | None = None  # populated from POST /v1/sessions response
+        # The engine sha this run pinned on its first up() (RBF-48): resolved
+        # and dirty-checked once, then reused by every later dispatch — even
+        # after a self-edit moved/dirtied the engine tree. The durable half
+        # lives in ``<run_dir>/.remote-engine-sha``.
+        self._engine_sha: str = ""
         self._uploaded_shas: set[str] = set()  # idempotent engine upload
         self._owns_session: bool = False  # False until up() succeeds
         # Epic 07: one ``last_synced`` per session, not per spawn
@@ -598,8 +603,10 @@ class RemoteWorkspace:
         uploaded is a no-op for the engine stage and returns the same sid.
         A dirty ``$MINI_ORK_ROOT`` is refused UNLESS
         ``MO_REMOTE_ALLOW_DIRTY_ENGINE=1`` — a sha must name an exact tree.
-        ``subprocess`` is imported here (NOT at module top level) because the
-        git bundle is the only subprocess call this module makes.
+        The sha is resolved and dirty-checked exactly ONCE per run, on the
+        first ``up()`` (before provisioning), then pinned for later dispatches
+        (RBF-48). ``subprocess`` is imported here (NOT at module top level)
+        because the git bundle is the only subprocess call this module makes.
         """
         # Lazy import: subprocess is the one stdlib module we do not want at
         # module-import time (gradient gr-1c9d2fad50a1: minimize top-level
@@ -608,15 +615,19 @@ class RemoteWorkspace:
         import subprocess
 
         t_up = time.monotonic()
-        # 0) Obtain this run's node through its provider (cloud-sandbox axis),
+        # 0) Resolve and pin the engine sha ONCE per run, BEFORE provisioning
+        # (RBF-48, RB-44): a dirty engine on the FIRST up() must refuse before
+        # a sandbox is minted, and every later dispatch in the run (a fresh
+        # process included) reuses the pin instead of re-checking a tree a
+        # self-edit has since dirtied or moved.
+        sha = self._pinned_engine_sha(subprocess)
+        # 1) Obtain this run's node through its provider (cloud-sandbox axis),
         # before any traffic. The run's FIRST up() creates the node exactly
         # once (under the run-dir lock); every later process attaches to the
         # recorded one. Construction never did this — see ``ensure_node``.
         if self._node_provider is not None:
             self._setup_step("provision", lambda: self.ensure_node(create=True))
-        # 1) Engine sha stage (idempotent).
-        sha = self._current_engine_sha(subprocess)
-        self._engine_sha = sha
+        # 2) Engine sha stage (idempotent; ``sha`` is the run's pinned sha).
         creating = self._sid is None
         health: dict = {}
         if sha not in self._uploaded_shas or creating:
@@ -633,7 +644,7 @@ class RemoteWorkspace:
             self._setup_step("engine", _stage_engine, detail=sha[:12])
             self._uploaded_shas.add(sha)
 
-        # 2) Session create (idempotent on run_id at the server), on the
+        # 3) Session create (idempotent on run_id at the server), on the
         # profile's prepared image when the profile declares a setup script.
         if creating:
             if self._profile is not None and (getattr(self._profile, "setup", "") or "").strip():
@@ -650,7 +661,7 @@ class RemoteWorkspace:
             self._sid = sess.get("sid", self._run_id)
             self._owns_session = True
             self._load_sync_state()
-        # 3) Initial tree sync-up (epic 07) and the one-shot mo-home upload
+        # 4) Initial tree sync-up (epic 07) and the one-shot mo-home upload
         # (epic 08). Both are idempotent on a repeated up().
         with self._sync_lock:
             self._setup_step("initial_sync", lambda: self._sync_up(force=True))
@@ -778,9 +789,55 @@ class RemoteWorkspace:
     # new process syncs incrementally (usually: nothing) instead of shipping
     # the whole tree again — valid only while the node holds the SAME session.
     _SYNC_STATE = ".remote-sync-state.json"
+    # RBF-48: the run's pinned engine sha. Written once, on the first up()
+    # that passes the dirty check; read by every later dispatch process so a
+    # self-edit that dirties (or moves) the engine tree cannot refuse the run
+    # mid-flight. Per-run dir, so a new run pins anew.
+    _ENGINE_SHA_PIN = ".remote-engine-sha"
 
     def _sync_state_path(self) -> Path | None:
         return Path(self._run_dir) / self._SYNC_STATE if self._run_dir else None
+
+    def _engine_pin_path(self) -> Path | None:
+        return Path(self._run_dir) / self._ENGINE_SHA_PIN if self._run_dir else None
+
+    def _load_engine_pin(self) -> str:
+        path = self._engine_pin_path()
+        if path is None or not path.is_file():
+            return ""
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+
+    def _save_engine_pin(self, sha: str) -> None:
+        """Persist the pinned sha atomically; a write failure is not fatal
+        (the in-memory pin still holds this process)."""
+        path = self._engine_pin_path()
+        if path is None or not sha:
+            return
+        try:
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(sha + "\n", encoding="utf-8")
+            tmp.replace(path)
+        except OSError:
+            pass
+
+    def _pinned_engine_sha(self, subprocess_mod: Any) -> str:
+        """Return the run's pinned engine sha, resolving it at most once.
+
+        The first call (normally the run's first ``up()``) resolves
+        ``git rev-parse HEAD`` and runs the dirty-tree check; the result is
+        then pinned in memory and in ``<run_dir>/.remote-engine-sha``. Later
+        calls — including from a new dispatch process sharing only the run
+        dir — reuse the pin and NEVER re-run the dirty check (RBF-48).
+        """
+        sha = self._engine_sha or self._load_engine_pin()
+        if not sha:
+            sha = self._current_engine_sha(subprocess_mod)
+            self._save_engine_pin(sha)
+        self._engine_sha = sha
+        return sha
 
     def _load_sync_state(self) -> None:
         path = self._sync_state_path()

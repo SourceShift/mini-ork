@@ -1425,6 +1425,41 @@ def _handle_execute_park(run_rc: int, execute_out: str, execute_err: str,
     return REVIEW_PAUSE_RC, False
 
 
+def _git_toplevel(path: str) -> str:
+    """The real path of ``path``'s git toplevel, or ``""`` when it is not in
+    a git work tree (missing dir, no git, not a repo)."""
+    if not path:
+        return ""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", path, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, check=False, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    top = proc.stdout.strip()
+    return os.path.realpath(top) if proc.returncode == 0 and top else ""
+
+
+def _is_self_edit_run(env: Mapping[str, str]) -> bool:
+    """True when this run targets the engine checkout itself (RBF-48).
+
+    Two signals, cheapest first: the operator's ``MO_ALLOW_FRAMEWORK_CWD=1``
+    opt-in, or the target directory living in the engine root's own git
+    work tree (a worktree target has the same toplevel as the engine
+    worktree, so this also covers self-edits on an isolated worktree).
+    """
+    if (env.get("MO_ALLOW_FRAMEWORK_CWD") or "").strip() == "1":
+        return True
+    target = (env.get("MO_TARGET_CWD") or "").strip()
+    engine = ((env.get("MINI_ORK_ROOT") or "").strip()
+              or (env.get("MINI_ORK_ENGINE_ROOT") or "").strip())
+    if not target or not engine:
+        return False
+    target_top = _git_toplevel(target)
+    return bool(target_top) and target_top == _git_toplevel(engine)
+
+
 def _apply_default_placement(
     placement: str, node_env: str, env: Mapping[str, str]
 ) -> tuple[str, str, bool]:
@@ -1432,6 +1467,10 @@ def _apply_default_placement(
 
     Returns ``(placement, node_env, defaulted)``. Explicit input wins;
     ``MO_REMOTE_NODE=1`` (already inside a sandbox) skips the default.
+    A self-edit run (target is the engine checkout, or
+    ``MO_ALLOW_FRAMEWORK_CWD=1``) stays local: defaulting it to a remote
+    node would refuse every dispatch once the implementer has edited the
+    engine tree (RBF-48). An explicit ``--placement remote`` still wins.
     """
     if placement or node_env:
         return placement, node_env, False
@@ -1440,7 +1479,14 @@ def _apply_default_placement(
     from mini_ork.remote.environments import default_node_env  # noqa: PLC0415
 
     name = default_node_env(env)
-    return ("remote", name, True) if name else (placement, node_env, False)
+    if not name:
+        return placement, node_env, False
+    if _is_self_edit_run(env):
+        sys.stderr.write(
+            f"[placement] self-edit run: staying local "
+            f"(default profile {name} not applied)\n")
+        return placement, node_env, False
+    return "remote", name, True
 
 
 def _run_lifecycle_impl(argv, root, sink) -> int:
