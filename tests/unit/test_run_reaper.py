@@ -3,8 +3,8 @@
 A dispatcher that dies without its ``finally`` leaves ``task_runs.status``
 non-terminal forever; the IDE's Active dispatches table then lists it as in
 flight. These tests pin who may be reaped (a ``.pid`` whose process is gone)
-and who must never be (a live owner, a paused or remote run, a row with no
-owner record unless the operator opts in).
+and who must never be (a live owner, a paused run, a remote run with no local
+owner record, a row with no owner record unless the operator opts in).
 """
 from __future__ import annotations
 
@@ -160,11 +160,13 @@ def test_no_pid_file_is_unknown_and_kept_unless_the_operator_opts_in(home: Path)
     assert _row(home, "run-busy")["status"] == "executing"
 
 
-@pytest.mark.parametrize("marker", [".cost-pause", ".remote-sync-state.json"])
-def test_paused_and_remote_runs_are_never_judged_by_a_local_pid(home: Path, marker: str) -> None:
+def test_a_cost_paused_run_is_never_judged_by_a_local_pid(home: Path) -> None:
+    # A remote-placement run (`.remote-sync-state.json`) is *not* exempt: its
+    # dispatcher is local, and its death is exactly what the reaper exists for
+    # (RB-07). Only `.cost-pause` parks a run above the pid check.
     run_dir = _seed(home, "run-held")
     _write_pid(run_dir, _dead_pid())
-    (run_dir / marker).write_text("{}", encoding="utf-8")
+    (run_dir / ".cost-pause").write_text("{}", encoding="utf-8")
 
     assert run_reaper.reap(home) == []
     assert _row(home, "run-held")["status"] == "executing"

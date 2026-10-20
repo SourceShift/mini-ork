@@ -53,7 +53,10 @@ class Probe:
 
 
 def _iso(ts: float) -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts))
+    # UTC, always: notes are read by operators in other zones, and a naive
+    # local timestamp (the old `time.localtime` shape) re-labels the same
+    # moment differently on every host.
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
 
 
 def _verdict_passed(run_dir: Path) -> bool:
@@ -350,9 +353,14 @@ def _pid_alive(pid: int, written_at: float) -> bool:
 
 
 def probe(run_dir: Path) -> Probe:
-    """Is the process that owns this run still alive?"""
-    if (run_dir / ".remote-sync-state.json").is_file():
-        return Probe("remote", detail="mirrored from a remote node; its pid is not local")
+    """Is the process that owns this run still alive?
+
+    A ``.pid`` naming processes decides alive/dead even when
+    ``.remote-sync-state.json`` is present: a ``--placement remote`` run is
+    still dispatched by a *local* process, and that process dying is exactly
+    the case the reaper exists for. The marker only means "not local" for a
+    run with no ``.pid`` at all (mirrored from a remote node).
+    """
     if (run_dir / ".cost-pause").exists():
         return Probe("paused", detail="cost-paused; waits on `mini-ork resume`")
     if _has_unanswered_ask(run_dir):
@@ -364,6 +372,8 @@ def probe(run_dir: Path) -> Probe:
         pids = _read_pids(pid_path)
         written_at = pid_path.stat().st_mtime
     except FileNotFoundError:
+        if (run_dir / ".remote-sync-state.json").is_file():
+            return Probe("remote", detail="mirrored from a remote node; its pid is not local")
         return Probe("unknown", detail="no .pid")
     if not pids:
         return Probe("unknown", detail=".pid names no process")
@@ -404,6 +414,41 @@ def _mark_failed(con: sqlite3.Connection, run_id: str, status: str, updated_at: 
         (verdict, note, note, now, ended_at, ended_at, run_id, status, *params))
     con.commit()
     return cur.rowcount == 1
+
+
+def _one_line(exc: BaseException) -> str:
+    """An exception message collapsed to one line for a stderr note."""
+    return " ".join(str(exc).split()) or exc.__class__.__name__
+
+
+def _release_remote_nodes(run_dir: Path, run_id: str) -> int:
+    """Free a provably-dead run's remote nodes; returns how many were freed.
+
+    Best-effort by contract: each release is isolated, so a Daytona outage
+    reports one stderr line and must never undo the reap that already marked
+    the row ``failed``. The provider's TTL reaper is the net for a release
+    that never lands. Called only after :func:`_mark_failed` wins its
+    compare-and-set — above that guard, the row could still be live.
+
+    The imports are deliberately local: monkeypatching the provider modules
+    (the documented seam) must intercept the call.
+    """
+    from mini_ork.remote.providers import base as provider_base
+    from mini_ork.remote.providers import run_nodes as provider_run_nodes
+
+    released = 0
+    if provider_base.node_record_path(run_dir).is_file():
+        try:
+            released += int(bool(provider_base.release_run_node(run_dir, os.environ)))
+        except Exception as exc:  # noqa: BLE001 — one failure must not strand the other
+            sys.stderr.write(
+                f"mini-ork reap: {run_id}: release_run_node failed: {_one_line(exc)}\n")
+    try:
+        released += int(provider_run_nodes.release_all_nodes(run_dir, os.environ) or 0)
+    except Exception as exc:  # noqa: BLE001 — never raise out of reap
+        sys.stderr.write(
+            f"mini-ork reap: {run_id}: release_all_nodes failed: {_one_line(exc)}\n")
+    return released
 
 
 def reap(home: Path, *, dry_run: bool = False, stale_after: int | None = None,
@@ -452,6 +497,16 @@ def reap(home: Path, *, dry_run: bool = False, stale_after: int | None = None,
                 _close_dangling_node_events(db_for(home), run_id)
                 if found.verdict == "dead":
                     (run_dir / PID_FILE).unlink(missing_ok=True)
+                    # The owner died without teardown, so its Daytona node and
+                    # per-node sandboxes were never released. The row is
+                    # provably `failed` by now, so no provisioner can adopt them.
+                    released = _release_remote_nodes(run_dir, run_id)
+                    suffix = f"released {released} node(s)"
+                    con.execute(
+                        "UPDATE task_runs SET notes = COALESCE(notes || '; ', '') || ? "
+                        "WHERE id = ?", (suffix, run_id))
+                    con.commit()
+                    entry["reason"] = f"{note}; {suffix}"
                 # The row is terminal now: no provision lock may outlive the run
                 # whose owner died (§8.3's 0-byte locks sat in exactly these dirs).
                 clear_stale_run_lock(run_dir)
