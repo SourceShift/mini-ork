@@ -205,7 +205,14 @@ def test_lane_fuse_narrows_a_chain_instead_of_refusing(tmp_path):
     assert rp != 43
 
 
-def test_lane_resolution(tmp_path):
+def test_lane_resolution(tmp_path, monkeypatch):
+    # Hermetic: a mini-ork lane exports its run identity, and the resolver
+    # deliberately gives the run's config/agents.yaml snapshot and the
+    # $MINI_ORK_AGENTS overlay precedence over the passed template. Left in
+    # place, the campaign overlay wins and `planner` resolves to its lane
+    # instead of the tmp policy this test builds.
+    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
+    monkeypatch.delenv("MINI_ORK_AGENTS", raising=False)
     home = tmp_path / "lr" / ".mini-ork" / "config"; home.mkdir(parents=True)
     (home / "agents.yaml").write_text("lanes:\n  planner: opus\n  worker: sonnet\n")
     root = str(tmp_path / "lr"); hm = str(tmp_path / "lr" / ".mini-ork")

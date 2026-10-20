@@ -16,6 +16,7 @@ bash gateway provider taxonomy (distinct from mini_ork.dispatch's finer one).
 """
 from __future__ import annotations
 
+import errno
 import inspect
 import json
 import os
@@ -98,6 +99,50 @@ def classify_error(message: str, rc: str | int = "") -> str:
 
 def error_retryable(category: str = "unknown") -> str:
     return "1" if category in ("capacity", "network", "stream", "provider") else "0"
+
+
+# Engine-side exception types whose TYPE alone identifies a config fault:
+# wrong arguments, a bad key/shape, a missing path — nothing the provider did.
+# Compared by class NAME (not isinstance) so a subclass defined outside the
+# engine does not silently widen the set.
+_CRASH_CONFIG_BUILTINS = frozenset({
+    "ValueError", "KeyError", "TypeError", "AssertionError", "FileNotFoundError",
+})
+
+# errno values that mean "the network path is down" rather than "this account
+# or this engine input is bad".
+_CRASH_NETWORK_ERRNOS = frozenset({
+    errno.ECONNREFUSED, errno.ECONNRESET, errno.ETIMEDOUT,
+})
+
+
+def classify_crash(exc: BaseException) -> str:
+    """Classify a DISPATCHER CRASH — an exception, not a provider error string.
+
+    ``classify_error(str(exc))`` over the WHOLE exception text is how RB-10
+    recorded a ``UnmappedHostPathError`` as ``auth``: its message embeds the
+    prompt, and the code-fix implementer prompt contains the word "forbidden",
+    so the auth regex matched a config fault. That is a one-strike, six-hour
+    lane fuse plus a hint telling the operator to switch lanes.
+
+    The exception TYPE is the reliable signal for an engine-side crash, so it
+    is checked first: the builtin config types and any ``*Error`` class defined
+    under ``mini_ork.``. ``ConnectionError``/``TimeoutError`` (and an ``OSError``
+    carrying one of the trio errnos) are ``network``. Only when the type says
+    nothing do we fall back to the text — and then only its FIRST 200 chars, so
+    auth wording buried in the prompt tail can never reclassify the crash.
+    """
+    name = type(exc).__name__
+    module = getattr(type(exc), "__module__", "") or ""
+    if name in _CRASH_CONFIG_BUILTINS or (
+            name.endswith("Error")
+            and (module == "mini_ork" or module.startswith("mini_ork."))):
+        return "config"
+    if isinstance(exc, (ConnectionError, TimeoutError)) or (
+            isinstance(exc, OSError)
+            and getattr(exc, "errno", None) in _CRASH_NETWORK_ERRNOS):
+        return "network"
+    return classify_error(str(exc)[:200])
 
 
 def provider_for_model(model: str) -> str:
@@ -436,6 +481,13 @@ def check_lane_fuse(db, lane: str, category: str, *, strikes: int = 3) -> bool:
     space-separated string, and ``'T'`` (0x54) sorts above ``' '`` (0x20) — so a
     raw string comparison drops the *time* half of the window and keeps every row
     from today.
+
+    Guard-generated rows are excluded from the streak: ``feature_name`` ending
+    ``:refused`` (a refusal names the fuse's own category and must not be
+    self-sustaining) and ``actor`` ending ``:crash`` (a dispatcher crash records
+    the engine's own death, not a provider verdict on this lane). The ``:crash``
+    predicate is only added when the schema has an ``actor`` column, and a NULL
+    actor still counts — older ledgers and test fixtures predate it.
     """
     if not (db and os.path.isfile(db) and lane and category):
         return False
@@ -447,11 +499,18 @@ def check_lane_fuse(db, lane: str, category: str, *, strikes: int = 3) -> bool:
         cols = {r[1] for r in con.execute("PRAGMA table_info(llm_calls)").fetchall()}
         if not {"status", "model_id", "feature_name", "error_category", "ts"} <= cols:
             con.close(); return False
+        where = ["model_id = ?",
+                 "feature_name NOT LIKE '%:refused'",
+                 "feature_name NOT LIKE '%:crash'"]
+        if "actor" in cols:
+            # A dispatcher-crash row marks itself with an ``actor`` suffix
+            # (feature_name stays the node name), so the exclusion reads actor.
+            where.append("(actor IS NULL OR actor NOT LIKE '%:crash')")
+        where.append("datetime(ts) > datetime('now', ?)")
         rows = con.execute(
-            "SELECT status, error_category FROM llm_calls "
-            "WHERE model_id = ? AND feature_name NOT LIKE '%:refused' "
-            "AND datetime(ts) > datetime('now', ?) "
-            "ORDER BY id DESC LIMIT ?",
+            "SELECT status, error_category FROM llm_calls WHERE "
+            + " AND ".join(where)
+            + " ORDER BY id DESC LIMIT ?",
             (lane, f"-{_fuse_window_hours()} hours", _int_or(strikes, 1))).fetchall()
         con.close()
     except Exception:
@@ -780,6 +839,20 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
             f"with {refused}")
         return 43
 
+    # RB-22b: a target cwd that no longer exists (a deleted worktree) made every
+    # lane in the chain fail `spawn failed: [Errno 2] No such file or directory`
+    # — each recorded as that lane's own failure, four attempts and 45s spent
+    # walking a chain that could never work, then rc=127. The cwd is a run-wide
+    # config fact, not a lane verdict: fail ONCE, before any lane is dispatched.
+    # This runs before the cost circuit so the config row is the only row a
+    # dead target produces.
+    target_cwd = (os.environ.get("MO_TARGET_CWD") or "").strip()
+    if target_cwd and not os.path.isdir(target_cwd):
+        message = f"target cwd does not exist: {target_cwd}"
+        _write_refusal_row("config", message)
+        sys.stderr.write(f"[target_cwd_missing] {message}\n")
+        return 127
+
     # cost circuit breaker
     if cost_circuit_open(db, os.environ.get("MO_DAILY_BUDGET_USD", "50")):
         from mini_ork import cost_ledger
@@ -919,13 +992,18 @@ def llm_dispatch(argv=None, *, root=None, dispatch_fn=None) -> int:
             # re-raise: the caller's contract (exception → rc=1 + text) is
             # unchanged, it just stops being invisible.
             try:
+                # Classify the crash by its TYPE, not the whole message: the
+                # message can embed the prompt (RB-10). The ``:crash`` actor
+                # suffix is what keeps this row out of the lane-fuse streak —
+                # it records the engine dying, not a verdict on the lane.
+                crash_category = classify_crash(exc)
                 write_llm_calls_row(
                     db, provider_for_model(str(model).split(",", 1)[0]), str(model),
-                    tier, feature, actor, "failed",
+                    tier, feature, actor + ":crash", "failed",
                     int(time.time() * 1000) - start_ms, "0",
                     redact_secrets(f"dispatcher crashed: {exc}"[:200]),
-                    error_category=classify_error(str(exc)),
-                    retryable=int(error_retryable(classify_error(str(exc)))))
+                    error_category=crash_category,
+                    retryable=int(error_retryable(crash_category)))
             except Exception:  # noqa: BLE001 — never mask the original crash
                 pass
             raise
