@@ -693,7 +693,12 @@ def _failure_class_for_node(home: Path, run_id: str,
     if not node_name:
         return None, ""
     try:
-        db = db_for(home)
+        # Callers pass either a Path or a plain home string; db_for joins with
+        # ``/`` and only accepts Path. Coercing here keeps a str home from
+        # silently degrading the lookup to "no row" (the TypeError was swallowed
+        # by the except below, so RB-33's reader stayed a dead end for str
+        # callers even after the writer became honest).
+        db = db_for(Path(home))
     except Exception:  # noqa: BLE001 — missing state.db: never raise
         return None, ""
     if not db.has_table("node_attempts"):
@@ -721,7 +726,7 @@ def _failure_class_for_any(home: Path, run_id: str
     the table is missing or no failed row exists.
     """
     try:
-        db = db_for(home)
+        db = db_for(Path(home))  # str or Path callers (see _failure_class_for_node)
     except Exception:  # noqa: BLE001 — missing state.db: never raise
         return None, None
     if not db.has_table("node_attempts"):

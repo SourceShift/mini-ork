@@ -4273,12 +4273,47 @@ def _make_checkpoint_fn(db, run_id, run_dir, recipe, task_class):
     # is exactly the per-node reuse key the validity check compares.
     config_hash = hashlib.sha256(
         f"{task_class}|{recipe_eff}|{run_id}".encode()).hexdigest()
+    # Ledger state for THIS closure. ``_cost_floor`` is the highest
+    # ``llm_calls.id`` already charged to an attempt; advancing it at each
+    # node end makes the per-attempt cost the delta since the last end
+    # (the ledger is append-only, so ids are the precise boundary). An
+    # attempt's start is the previous attempt's end, or closure creation
+    # for a node's first attempt.
+    _cost_floor = 0
+    _attempt_started: dict[str, int] = {}
 
-    def _cp(node_id: str, status: str, node_type: str = "", output_file: str = ""):
+    def _cp(node_id: str, status: str, node_type: str = "", output_file: str = "",
+            finish_reason: str = ""):
+        nonlocal _cost_floor
+        # RB-29: a node_attempts row is written at EVERY node end — success,
+        # failure, error, skipped. ``write_checkpoint`` keeps its success-only
+        # contract (design §3 rule 0); the non-success ends append a ledger
+        # row through ``append_node_attempt`` instead.
+        if status not in ("success", "failure", "skipped", "error"):
+            return
+        now = int(time.time())
+        attempt_started = _attempt_started.get(node_id, started_at)
+        cost_usd, max_call_id = mc.node_llm_cost_usd(
+            db, run_id, after_id=_cost_floor)
+        failure_class = None
         if status != "success":
-            return  # only success → reusable checkpoint (design §3 rule 0)
-        if not output_file:
-            return  # nothing on disk to checkpoint; no row = rerun is correct
+            # trace() passes the handler's finish_reason; direct callers (and
+            # the bash-era seam) publish it through MO_NODE_FINISH_REASON.
+            fr = finish_reason or os.environ.get("MO_NODE_FINISH_REASON", "")
+            failure_class = mc.failure_class_for_finish_reason(fr)
+        if status != "success" or not output_file:
+            # No checkpoint to produce (a failure, or a success with nothing
+            # on disk to checkpoint) — the ledger row is still mandatory.
+            append_rc = mc.append_node_attempt(
+                db, run_id, node_id, status=status,
+                node_type=node_type or "", started_at=attempt_started,
+                ended_at=now, failure_class=failure_class,
+                cost_usd=cost_usd, initiator="python",
+            )
+            if append_rc == 0:
+                _cost_floor = max(_cost_floor, max_call_id)
+                _attempt_started[node_id] = now
+            return
         # input_hash is per-(run, node) in E1; E2 will fold in upstream
         # input sha256s so a config change invalidates exactly the right
         # subtree.
@@ -4311,11 +4346,18 @@ def _make_checkpoint_fn(db, run_id, run_dir, recipe, task_class):
             status="success", input_hash=input_hash,
             recipe_version=recipe_eff, config_hash=config_hash,
             artifact_paths=[output_file], run_dir=run_dir,
-            node_type=node_type or "", started_at=started_at,
-            ended_at=int(time.time()), initiator="python",
+            node_type=node_type or "", started_at=attempt_started,
+            ended_at=now, initiator="python",
             owner_token=owner_token, provider_session_id=provider_session_id,
+            # RB-29: the ledger row is numbered from the ledger itself
+            # (1 + MAX), not from a per-process counter, so a revise-round
+            # dispatch continues where the previous round stopped.
+            attempt=mc.next_attempt_no(db, run_id, node_id),
+            cost_usd=cost_usd, failure_class=None,
         )
         if ckpt_rc == 0:
+            _cost_floor = max(_cost_floor, max_call_id)
+            _attempt_started[node_id] = now
             # F4b (per-node git checkpoints, kickoff hr-node-ckpt-refs):
             # capture the post-success worktree into a git ref so a run
             # can roll any node's effect back. The hook is fail-open —

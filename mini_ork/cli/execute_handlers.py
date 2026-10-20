@@ -595,7 +595,10 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         # F4: publish the durable checkpoint at the SAME single seam as the
         # trace write. The wrapper unifies node-completion side effects so
         # E2's recovery code can rely on every success also having a row.
-        _base_checkpoint(node_id, status, node_type, output_file)
+        # RB-29: the same seam now also appends the node_attempts row for
+        # non-success ends, so the finish_reason has to cross it.
+        _base_checkpoint(node_id, status, node_type, output_file,
+                         finish_reason=finish_reason)
         # Node-end at the same seam: duration from the recorded start, else 0
         # when no start was recorded (early-return path) — a node_end without a
         # node_start is the reader's "done/failed" signal and beats silence.
@@ -920,14 +923,10 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         handler = _handle_researcher
     if handler is None:
         return 0, "done"
-    # Emit node_start immediately before the handler runs, reusing the already
-    # resolved ``lane`` (never re-resolve), and record the start time so the
-    # matching node_end can carry a duration. remote-nodes-14 §4: under a
-    # placement the payload also says where the node runs.
+    # Placement is per dispatch (remote-nodes-14 §4: under a placement the
+    # node_start payload also says where the node runs). The event itself is
+    # emitted inside the attempt loop, once per attempt.
     placement, node_host, session_id = _node_placement(node_type, lane, run_dir_eff)
-    mo_node_start(run_id, node_id, node_type, model_lane=lane, db=db,
-                  placement=placement, node_host=node_host, session_id=session_id)
-    node_start_ms[node_id] = _now_ms()
     # A node is a *blocking in-process* call (verifiers park in run_check's
     # Popen, agent lanes park in dispatch.core), so for the whole window it runs
     # nothing else here is awake to say the run is still alive. This ticker
@@ -981,6 +980,16 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
     try:
         while True:
             _attempt += 1
+            # RB-33 (retried-node case): emit node_start PER ATTEMPT and re-arm
+            # the start clock before the handler runs. Previously the event and
+            # ``node_start_ms[node_id]`` were set once, before the loop; the
+            # first attempt's trace() popped the entry, so a retry's node_end
+            # found no start and reported duration_ms=0 with no matching
+            # node_start (run-1792091737-99865: ~38 min recorded as 0).
+            mo_node_start(run_id, node_id, node_type, model_lane=lane, db=db,
+                          placement=placement, node_host=node_host,
+                          session_id=session_id)
+            node_start_ms[node_id] = _now_ms()
             rc, finish_reason = handler(ctx)
             _finish_reason_history.append(str(finish_reason))
             record_attempt(run_dir_eff, node_id, _attempt, str(finish_reason), int(rc))
@@ -1052,6 +1061,17 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         # The real duration (it was a hard-coded 0, so every Python-era verifier
         # node_end read "0 ms" whether it ran or not — K0.5c AC0).
         started = node_start_ms.pop(node_id, None)
+        # RB-29: handlers that bypass trace() (verifier/publisher/rollback/
+        # eval) never reached the checkpoint seam, so without this their
+        # attempt would vanish from node_attempts. Same ledger vocabulary as
+        # trace(): rc==0 is a success end, anything else a failure end.
+        _base_checkpoint(
+            node_id,
+            "success" if int(rc) == 0 else "failure",
+            node_type,
+            "",
+            finish_reason=finish_reason,
+        )
         mo_node_end(run_id, node_id, node_type,
                     max(0, _now_ms() - started) if started is not None else 0,
                     verdict=ctx.node_verdict, finish_reason=finish_reason, db=db)

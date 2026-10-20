@@ -54,16 +54,69 @@ import json
 import os
 import sqlite3
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Iterable
 
 __all__ = [
     "CheckpointRecord",
     "write_checkpoint",
+    "append_node_attempt",
+    "next_attempt_no",
+    "node_llm_cost_usd",
+    "failure_class_for_finish_reason",
     "is_node_reusable",
     "hash_file",
     "compute_artifact_manifest",
 ]
+
+# finish_reason → ``node_attempts.failure_class`` (the 0050 vocabulary).
+# Kept here, next to the writer, so the ledger has ONE mapping: the recovery
+# readers (``mini_ork/recovery/retry_hint.py``, ``auto_repair.py``) compare
+# against exactly these strings. Anything not listed falls through to
+# ``failure_classifier.classify`` — the fail-closed source of truth that
+# maps an unknown stop to ``terminal``.
+_FINISH_REASON_FAILURE_CLASS = {
+    "provider_limit": "provider_limit",
+    "overloaded": "provider_limit",
+    "rate_limited": "provider_limit",
+    "quota": "provider_limit",
+    "429": "provider_limit",
+    "529": "provider_limit",
+    "timeout": "infra_interrupt",
+    "infra_interrupt": "infra_interrupt",
+    "network": "infra_interrupt",
+    "killed": "infra_interrupt",
+    "sigterm": "infra_interrupt",
+    "rc_137": "infra_interrupt",
+    "rc_143": "infra_interrupt",
+    "paused_for_approval": "input_required",
+    "needs_input": "input_required",
+    "input_required": "input_required",
+    "output_invalid": "output_invalid",
+}
+
+# A finish reason that means the node completed; never a failure class.
+_SUCCESS_FINISH_REASONS = frozenset({"", "done", "success", "ok", "pass"})
+
+
+def failure_class_for_finish_reason(finish_reason: str | None) -> str | None:
+    """Map a node ``finish_reason`` onto ``node_attempts.failure_class``.
+
+    Returns ``None`` for a successful/absent finish reason and a 0050
+    vocabulary class otherwise. Unknown stops go through
+    :func:`mini_ork.learning.failure_classifier.classify` (fail-closed:
+    unknown → ``terminal``), so a new producer cannot silently invent a
+    class the recovery readers do not understand.
+    """
+    reason = str(finish_reason or "").strip().lower()
+    if reason in _SUCCESS_FINISH_REASONS:
+        return None
+    mapped = _FINISH_REASON_FAILURE_CLASS.get(reason)
+    if mapped:
+        return mapped
+    from mini_ork.learning.failure_classifier import classify  # noqa: PLC0415
+    return classify(reason=reason)
 
 # Reuse the project-wide pragma default from db_open.mo_sqlite — keep
 # writer busy-timeout consistent with every other SQLite write in the
@@ -198,6 +251,191 @@ class CheckpointRecord:
 # signature keep the old required-kwarg TypeError behavior when no
 # record is supplied.
 _UNSET = object()
+
+# The single INSERT shape for ``node_attempts``. Both the success path
+# (``write_checkpoint``'s one transaction) and the every-end path
+# (``append_node_attempt``) go through it, so a schema/column change is
+# one edit and cannot diverge between the two writers.
+_ATTEMPT_COLUMNS = (
+    "run_id, node_id, attempt_no, node_type, started_at, ended_at, "
+    "result, failure_class, checkpoint_used, checkpoint_produced, "
+    "cost_usd, provider_session_id, initiator"
+)
+
+
+def _insert_node_attempt(
+    con: sqlite3.Connection,
+    *,
+    run_id: str,
+    node_id: str,
+    attempt_no: int,
+    node_type: str = "",
+    started_at: int,
+    ended_at: int,
+    result: str,
+    failure_class: str | None = None,
+    checkpoint_used: int = 0,
+    checkpoint_produced: int = 0,
+    cost_usd: float | None = None,
+    provider_session_id: str | None = None,
+    initiator: str = "python",
+) -> None:
+    con.execute(
+        f"INSERT INTO node_attempts ({_ATTEMPT_COLUMNS}) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (run_id, node_id, attempt_no, node_type or "", started_at,
+         ended_at, result, failure_class, checkpoint_used,
+         checkpoint_produced, cost_usd,
+         provider_session_id or None, initiator or "python"),
+    )
+
+
+def next_attempt_no(db: str, run_id: str, node_id: str) -> int:
+    """``1 + MAX(attempt_no)`` for ``(run_id, node_id)``.
+
+    MAX, not COUNT: the ledger is append-only per attempt and a gap (a
+    pruned/aborted row) must not reuse a number (kickoff rbf-attempt-ledger,
+    RB-29). Falls back to 1 when the DB or table is unavailable — the caller's
+    insert then fails closed against the same missing schema.
+    """
+    if not (db and run_id and node_id and os.path.isfile(db)):
+        return 1
+    try:
+        con = _open(db)
+        try:
+            row = con.execute(
+                "SELECT MAX(attempt_no) FROM node_attempts "
+                "WHERE run_id = ? AND node_id = ?",
+                (run_id, node_id),
+            ).fetchone()
+        finally:
+            con.close()
+        return int(row[0] or 0) + 1
+    except (sqlite3.Error, TypeError, ValueError):
+        return 1
+
+
+def node_llm_cost_usd(db: str, run_id: str, *, after_id: int = 0
+                      ) -> tuple[float, int]:
+    """``(cost_usd, max_call_id)`` for the run's ``llm_calls`` after ``after_id``.
+
+    ``llm_calls`` has no ``node_id`` column, so per-node attribution is the
+    run plus an attempt window: the caller passes the highest call id it has
+    already accounted for and advances that floor after the row is written.
+    That is exact for the serial path (every node end is a window boundary)
+    and for the per-node closure the parallel path constructs. Returns
+    ``(0.0, after_id)`` when the table is unavailable: no calls seen means
+    zero spend, never an invented figure.
+    """
+    if not (db and run_id and os.path.isfile(db)):
+        return 0.0, after_id
+    try:
+        con = _open(db)
+        try:
+            row = con.execute(
+                "SELECT COALESCE(SUM(cost_usd), 0), COALESCE(MAX(id), ?) "
+                "FROM llm_calls WHERE run_id = ? AND id > ?",
+                (int(after_id or 0), run_id, int(after_id or 0)),
+            ).fetchone()
+        finally:
+            con.close()
+        return float(row[0] or 0.0), int(row[1] or after_id or 0)
+    except (sqlite3.Error, TypeError, ValueError):
+        return 0.0, after_id
+
+
+def append_node_attempt(
+    db: str,
+    run_id: str,
+    node_id: str,
+    *,
+    status: str,
+    attempt: int | None = None,
+    node_type: str = "",
+    started_at: int | None = None,
+    ended_at: int | None = None,
+    failure_class: str | None = None,
+    checkpoint_used: int = 0,
+    checkpoint_produced: int = 0,
+    cost_usd: float | None = None,
+    provider_session_id: str | None = None,
+    initiator: str = "python",
+) -> int:
+    """Append one ledger row for a node END of ANY result.
+
+    This is the failure/error/skipped sibling of :func:`write_checkpoint`
+    (and the success-with-no-artifact path): it publishes no checkpoint and
+    no artifact, it only records that the attempt ended as ``status``.
+    ``attempt`` defaults to ``1 + MAX(attempt_no)`` so retries and revise
+    rounds keep counting. ``checkpoint_produced`` stays 0 unless the caller
+    actually wrote a checkpoint.
+
+    Best-effort like the rest of this module: returns 0 on success, non-zero
+    on any error, never raises. A DB without migration 0050 is a silent
+    no-op (legacy runs have no ledger to append to).
+    """
+    if not db or not run_id or not node_id:
+        _log_err("append_node_attempt: db, run_id, node_id are required")
+        return 1
+    if status not in ("success", "failure", "skipped", "error"):
+        _log_err(
+            "append_node_attempt: status must be success|failure|skipped|error, "
+            f"got {status!r}"
+        )
+        return 1
+    if not os.path.isfile(db):
+        _log_err(f"append_node_attempt: db not found: {db}")
+        return 1
+    now = int(ended_at) if ended_at else int(time.time())
+    started = int(started_at) if started_at else now
+    attempt_no = (int(attempt) if attempt is not None
+                  else next_attempt_no(db, run_id, node_id))
+    con = None
+    committed = False
+    try:
+        con = _open(db)
+        try:
+            con.execute("SELECT 1 FROM node_attempts LIMIT 0")
+        except sqlite3.Error:
+            return 0  # legacy DB: no 0050 ledger, nothing to append to
+        con.execute("BEGIN")
+        _insert_node_attempt(
+            con,
+            run_id=run_id,
+            node_id=node_id,
+            attempt_no=attempt_no,
+            node_type=node_type,
+            started_at=started,
+            ended_at=now,
+            result=status,
+            failure_class=failure_class,
+            checkpoint_used=checkpoint_used,
+            checkpoint_produced=checkpoint_produced,
+            cost_usd=cost_usd,
+            provider_session_id=provider_session_id,
+            initiator=initiator,
+        )
+        con.execute("COMMIT")
+        committed = True
+        return 0
+    except sqlite3.Error as e:
+        _log_err(f"append_node_attempt: sqlite error: {e}")
+        return 1
+    except Exception as e:  # noqa: BLE001 — best-effort seam
+        _log_err(f"append_node_attempt: unexpected error: {e}")
+        return 1
+    finally:
+        if con is not None:
+            if not committed:
+                try:
+                    con.execute("ROLLBACK")
+                except Exception:  # noqa: BLE001 — best-effort cleanup
+                    pass
+            try:
+                con.close()
+            except Exception:  # noqa: BLE001 — best-effort cleanup
+                pass
+
 
 
 def write_checkpoint(
@@ -384,18 +622,21 @@ def write_checkpoint(
                  rec.recipe_version, rec.config_hash, manifest_json,
                  session_ref, rec.failure_class, now),
             )
-            con.execute(
-                """
-                INSERT INTO node_attempts (
-                    run_id, node_id, attempt_no, node_type, started_at,
-                    ended_at, result, failure_class, checkpoint_used,
-                    checkpoint_produced, cost_usd, provider_session_id, initiator
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?, ?)
-                """,
-                (run_id, node_id, attempt_no, rec.node_type or "",
-                 int(rec.started_at) if rec.started_at else now, now,
-                 rec.status, rec.failure_class, rec.cost_usd,
-                 rec.provider_session_id or None, rec.initiator or "python"),
+            _insert_node_attempt(
+                con,
+                run_id=run_id,
+                node_id=node_id,
+                attempt_no=attempt_no,
+                node_type=rec.node_type or "",
+                started_at=int(rec.started_at) if rec.started_at else now,
+                ended_at=now,
+                result=rec.status,
+                failure_class=rec.failure_class,
+                checkpoint_used=0,
+                checkpoint_produced=1,
+                cost_usd=rec.cost_usd,
+                provider_session_id=rec.provider_session_id or None,
+                initiator=rec.initiator or "python",
             )
             con.execute("COMMIT")
         finally:
