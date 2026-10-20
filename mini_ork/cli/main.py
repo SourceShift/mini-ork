@@ -38,6 +38,10 @@ from mini_ork.dispatch.secrets import SecretStoreError
 from mini_ork.dispatch.vault import VaultError
 from mini_ork.features import gate_env
 from mini_ork.kickoff_scope import heading_kind
+from mini_ork.runtime.placement_env import (
+    publish_placement_env,
+    validate_placement_env,
+)
 from mini_ork.vcs import repo_integrity_guard
 from mini_ork.gates import rubric_prescreen
 from mini_ork.orchestration import concord_run
@@ -1511,37 +1515,13 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
     node_env = node_env or context_env("MO_NODE_ENV", "").strip()
     placement, node_env, placement_defaulted = _apply_default_placement(
         placement, node_env, context_env_snapshot())
-    if placement not in ("", "local", "remote"):
-        sys.stderr.write(f"MO_PLACEMENT: expected local|remote (got '{placement}')\n"); return 2
-    if placement == "remote":
-        from mini_ork.remote.environments import list_profiles, load_profile
-        env_now = context_env_snapshot()
-        problem = ""
-        if not node_env:
-            problem = "--placement remote requires --env <name> (or MO_NODE_ENV)"
-        else:
-            try:
-                load_profile(node_env, env=env_now)
-            except FileNotFoundError:
-                problem = f"--env: environment profile '{node_env}' not found"
-            except ValueError as exc:   # schema violation or a secret-looking env key
-                if placement_defaulted:
-                    problem = (f"default environment '{node_env}' (MO_DEFAULT_NODE_ENV) "
-                               f"is invalid: {exc}")
-                else:
-                    problem = f"--env: environment profile '{node_env}' is invalid: {exc}"
-        if problem:
-            names = list_profiles(env=env_now)
-            avail = ", ".join(names) if names else (
-                "none (add config/environments/<name>.yaml; see default.yaml.example)")
-            sys.stderr.write(f"{problem}. Available profiles: {avail}\n")
-            return 2
-    if placement or node_env:
-        publish_env({k: v for k, v in (("MO_PLACEMENT", placement), ("MO_NODE_ENV", node_env)) if v})
-    if placement == "remote":
-        # One node session for the whole run: execute keeps it for the later
-        # steps; _release_remote_session ends it when the lifecycle returns.
-        publish_env({"MO_REMOTE_SESSION_SCOPE": "lifecycle"})
+    problem = validate_placement_env(
+        placement, node_env, env=context_env_snapshot(),
+        defaulted=placement_defaulted)
+    if problem:
+        sys.stderr.write(f"{problem}\n")
+        return 2
+    publish_placement_env(placement, node_env)
 
     # ── workspace mode: --workspace flag beats MO_WORKSPACE_MODE beats the
     # review policy (MO_REVIEW_BEFORE_MERGE=required) beats in-place ──

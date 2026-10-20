@@ -88,7 +88,12 @@ from pathlib import Path
 # E1 seam — read by is_node_reusable for the per-node reuse decision.
 # Importing at module top means a runtime absence of E1 surfaces
 # immediately as ImportError on first call (fail loud).
-from mini_ork.context import apply_env_overrides, context_env, scoped_environ
+from mini_ork.context import (
+    apply_env_overrides,
+    context_env,
+    context_env_snapshot,
+    scoped_environ,
+)
 
 # DAG + plan-computation seams (SRP split; re-exported for parity).
 from mini_ork.recovery.dag import DAG, load_dag
@@ -101,6 +106,11 @@ from mini_ork.recovery.plan import (
     plan_recovery,
 )
 from mini_ork.recovery.restore import plan_restore, restore_carry_patch
+from mini_ork.runtime.placement_env import (
+    placement_env_map,
+    read_run_placement,
+    validate_placement_env,
+)
 
 # E3 seam — single-writer lease + idempotent recovery request. Guarded
 # (soft) so the planner still imports on a build where E3 is absent; the
@@ -129,7 +139,7 @@ __all__ = [
 _USAGE = """\
 Usage: mini-ork recover <run_id> [--from-node <id>] [--strategy NAME] [--status]
                                 [--carry-patch NAME] [--ack-change] [--force]
-                                [--lane <alias>=<lane>]…
+                                [--lane <alias>=<lane>]… [--allow-local]
 
 Recover a failed run by walking the workflow DAG, marking each node
 reusable via E1's `is_node_reusable`, and dispatching ONLY the
@@ -190,6 +200,10 @@ Options:
                                  is present with ``needs_change`` set.
   --force                      Override a ``retryable: false`` retry hint
                                  and dispatch anyway.
+  --allow-local                Revive a run recorded as ``--placement remote``
+                                 on the host when that placement can no longer
+                                 be restored (no node env resolvable). Without
+                                 it such a revival is refused.
   --workflow <path>            Override workflow.yaml location.
   --db <path>                  Override state.db location.
   --help, -h                   Show this help
@@ -862,6 +876,74 @@ def _abandon_lease(db_path: str, run_id: str, req: Any, token: str | None) -> No
         _lease.release_lease(db_path, run_id, token)
 
 
+def _plan_json_is_valid(run_dir: str) -> bool:
+    """True iff ``<run_dir>/plan.json`` exists and parses as a JSON object.
+
+    The literal file is the plan authority for a revival (the same file
+    ``cli_main`` hands execute positionally). A recipe-named plan
+    (``<recipe>-plan.json``) is not consulted here: recover already resolves
+    only ``plan.json`` for the executor, so treating another name as a plan
+    would dispatch a closure with nothing to execute.
+    """
+    if not run_dir:
+        return False
+    try:
+        with open(os.path.join(run_dir, "plan.json"), encoding="utf-8") as fh:
+            return isinstance(json.load(fh), dict)
+    except (OSError, ValueError):
+        return False
+
+
+def _run_has_ledger_row(db_path: str, run_id: str) -> bool:
+    """True iff the run has a ``task_runs`` row (i.e. the lifecycle started it).
+
+    Read-only and fail-soft: a missing DB, a pre-``task_runs`` schema, or any
+    sqlite error all read as "no row" — the caller pairs this with the DB's
+    existence to decide whether a missing plan is a pre-planning death.
+    """
+    if not db_path or not run_id or not os.path.isfile(db_path):
+        return False
+    import sqlite3  # noqa: PLC0415 — scoped to this read
+
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            return con.execute(
+                "SELECT 1 FROM task_runs WHERE id = ? LIMIT 1", (run_id,)
+            ).fetchone() is not None
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return False
+
+
+def _refuse_recovery(handoff: dict, message: str, repair_markers: dict) -> int:
+    """Refuse a revival before dispatch, leaving no state that claims it ran.
+
+    ``main`` has already acquired the lease on the dispatch path, so a refusal
+    here must abandon it — otherwise the run is lease-blocked for the TTL. A
+    recover spawned by auto-repair also hands the run to a human instead of
+    stranding ``repair.json`` at ``repairing`` (mirrors ``cli_main``'s
+    ``note_stuck`` on the ``main``-level early return).
+    """
+    sys.stderr.write(message)
+    try:
+        from mini_ork.recovery import auto_repair  # noqa: PLC0415
+
+        with scoped_environ(repair_markers):
+            auto_repair.note_stuck(reason=message.strip())
+    except Exception:  # noqa: BLE001 — the hand-off must never fail a recover
+        pass
+    request_id = handoff.get("request_id") or ""
+    _abandon_lease(
+        handoff.get("db_path") or "",
+        handoff.get("run_id") or "",
+        (request_id,) if request_id else None,
+        handoff.get("lease_token"),
+    )
+    return 2
+
+
 def _reconcile_recovered_cost(handoff: dict) -> None:
     """Raise the run's ``cost_usd`` to the ledger total for this revival.
 
@@ -970,6 +1052,7 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
     carry_patch = ""
     ack_change = False
     force = False
+    allow_local = False
     lane_overrides: list[str] = []
     positional: list[str] = []
     i = 0
@@ -1019,6 +1102,9 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
             i += 1
         elif a == "--force":
             force = True
+            i += 1
+        elif a == "--allow-local":
+            allow_local = True
             i += 1
         elif a == "--lane":
             if i + 1 >= len(argv):
@@ -1391,6 +1477,11 @@ def main(argv: list[str] | None = None, *, handoff: dict | None = None) -> int:
             "run_id": run_id, "run_dir": run_dir, "workflow": workflow,
             "db_path": db_path, "recipe": recipe,
             "request_id": _req[0] if _req else "", "lease_token": _token or "",
+            # Recover-only facts cli_main's pre-dispatch guards need; none of
+            # them changes what the executor reads.
+            "allow_local": allow_local,
+            "hint_kind": ((hint or {}).get("needs_change") or {}).get("kind") or "",
+            "has_reuse": bool(plan.reuse),
         })
     return 0
 
@@ -1519,6 +1610,47 @@ def cli_main(argv: list[str] | None = None, *, execute_fn=None) -> int:
                     break
         if _task_class:
             _overrides["MINI_ORK_TASK_CLASS"] = _task_class
+    # ── RB-08: a run that died before planning cannot be revived by
+    # re-entering execute. 92791 ran its implementer with no plan.json and
+    # MINI_ORK_PLAN_PATH="" — the closure was dispatched against nothing.
+    # Refuse before anything is published or dispatched; the plan-stage
+    # message wins over a placement refusal (that run had both problems).
+    # Scoped so a genuine mid-run revival is untouched: checkpointed revivals
+    # prove planning finished, an `interrupted` hint proves the run was past
+    # it, and a DB with no ledger row is a fixture-built mid-run revival (the
+    # lane-repair / interrupted-resume suites) rather than a started run.
+    _run_id = handoff["run_id"]
+    _run_dir = handoff["run_dir"]
+    if (not _plan_json_is_valid(_run_dir)
+            and not handoff.get("has_reuse")
+            and handoff.get("hint_kind") != "interrupted"
+            and (_run_has_ledger_row(handoff["db_path"], _run_id)
+                 or not os.path.isfile(handoff["db_path"]))):
+        return _refuse_recovery(
+            handoff,
+            f"recover: {_run_id} failed before planning; start a new run instead\n",
+            _repair_markers)
+    # ── RB-06: restore the run's recorded placement. The lifecycle publishes
+    # MO_PLACEMENT/MO_NODE_ENV for a fresh run; a revival re-enters execute
+    # directly, so without this every node of a remote run executed on the
+    # host. Restore only — never adopt MO_DEFAULT_NODE_ENV, a fresh-run
+    # policy that would turn a host revival into a remote one. An operator-set
+    # value wins, and a recorded host/absent placement publishes nothing
+    # (today's behaviour).
+    _recorded_placement, _recorded_env = read_run_placement(_run_dir)
+    _placement = context_env("MO_PLACEMENT").strip().lower() or _recorded_placement
+    _node_env = context_env("MO_NODE_ENV").strip() or _recorded_env
+    if _placement == "remote":
+        _problem = validate_placement_env(
+            _placement, _node_env, env=context_env_snapshot())
+        if _problem and not handoff.get("allow_local"):
+            return _refuse_recovery(
+                handoff,
+                f"recover: {_run_id} ran with placement {_placement}; "
+                "restore it or pass --allow-local\n",
+                _repair_markers)
+        if not _problem:
+            _overrides.update(placement_env_map(_placement, _node_env))
     apply_env_overrides(_overrides)
     # ── Recover revival fix 1 (kickoff recover-revival-fixes §1): close the
     # dead attempt before dispatching. The original process died mid-node and
