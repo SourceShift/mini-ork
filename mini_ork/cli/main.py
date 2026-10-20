@@ -2267,6 +2267,10 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
             # Marks this pass as the post-run tail so `_reflect_durations`
             # keeps in-DAG reflector passes out of the bound's history.
             "MO_REFLECT_POST_RUN": "1",
+            # Detached, nobody waits on this child, so the bound computed above
+            # is only real if the child enforces it itself. reflect.main arms
+            # SIGALRM from this value and exits 124 when it fires.
+            "MO_REFLECT_DEADLINE_S": str(reflect_bound),
         }
         reflect_run_dir = (
             _run_dir if (_run_dir and _run_dir != "." and os.path.isdir(_run_dir))

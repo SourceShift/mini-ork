@@ -25,6 +25,7 @@ import contextlib
 import io
 import json
 import os
+import signal
 import sqlite3
 import sys
 import time
@@ -223,6 +224,57 @@ def _dry_run(since: int, task_class_filter: str, reflect_lane: str,
         print(f"[dry-run] filter: run_id={run_id}")
 
 
+# ── Detached-pass deadline ───────────────────────────────────────────────────
+def _reflect_deadline_seconds() -> int | None:
+    """Read ``MO_REFLECT_DEADLINE_S``; only a positive integer arms an alarm."""
+    raw = os.environ.get("MO_REFLECT_DEADLINE_S", "")
+    try:
+        deadline = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return deadline if deadline > 0 else None
+
+
+def _arm_reflect_deadline() -> int | None:
+    """Bound the pass with ``SIGALRM`` when the lifecycle supplied a deadline.
+
+    The detached post-run child has no parent's blocking-call timeout
+    watching it, so a pass that blocks outside an LLM call (a DB lock wait,
+    say) would otherwise live forever. POSIX only: where ``SIGALRM`` or
+    ``alarm`` is unavailable this is skipped silently. Returns the armed bound
+    (or ``None`` when nothing was installed).
+    """
+    deadline = _reflect_deadline_seconds()
+    if deadline is None:
+        return None
+    sigalrm = getattr(signal, "SIGALRM", None)
+    alarm = getattr(signal, "alarm", None)
+    if sigalrm is None or alarm is None:
+        return None
+
+    def _on_deadline(_signum, _frame):
+        sys.stderr.write(f"reflect: deadline {deadline}s reached; stopping\n")
+        # SystemExit (not os._exit) so atexit handlers — in particular
+        # _trace_finalizer — still land a terminal trace row.
+        raise SystemExit(124)
+
+    try:
+        signal.signal(sigalrm, _on_deadline)
+        alarm(deadline)
+    except (OSError, ValueError):
+        # Not the main thread, or the platform refuses the signal: fail soft.
+        return None
+    return deadline
+
+
+def _disarm_reflect_deadline() -> None:
+    """Cancel a previously armed deadline alarm (no-op when unarmed)."""
+    alarm = getattr(signal, "alarm", None)
+    if alarm is not None:
+        with contextlib.suppress(Exception):
+            alarm(0)
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main(argv: list[str] | None = None) -> int:
     if argv is None:
@@ -240,6 +292,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.help:
         sys.stdout.write(_usage())
         return 0
+
+    # A detached post-run pass has no parent timeout; arm the child's own
+    # deadline before any work that could block. Disarmed at every normal
+    # return so a callable ``main`` cannot leave a stray alarm behind.
+    _arm_reflect_deadline()
 
     # ── env setup (mirror bash lines 38-72) ────────────────────────────────
     since = args.since or ""
@@ -312,6 +369,7 @@ def main(argv: list[str] | None = None) -> int:
     if dry_run:
         _dry_run(since_int, task_class_filter, reflect_lane, gradient_model,
                  db_path, run_id)
+        _disarm_reflect_deadline()
         return 0
 
     # ── dispatch to reflection_pipeline (ported Python) ────────────────────
@@ -699,6 +757,7 @@ def main(argv: list[str] | None = None) -> int:
             cost_ledger.reconcile_run_cost(db_path, run_id)
         except Exception as exc:  # a side-channel must never crash reflect
             sys.stderr.write(f"  [cost] reconcile skipped: {exc}\n")
+    _disarm_reflect_deadline()
     return 0
 
 
