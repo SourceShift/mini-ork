@@ -12,6 +12,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -19,6 +20,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Callable
 
 from mini_ork.context import (
@@ -1759,7 +1761,9 @@ def _handle_implementer(ctx: NodeDispatch):
         # artifact-completed path keeps only the edits the agent already made.
         apply_impl_output(impl_log, target)   # ported "capture coin-flip" applier
     if ctx.recipe_eff == "framework-edit":
-        moved = _implementer_moved_base(ctx.run_dir_eff, target)
+        moved = _implementer_moved_base(ctx.run_dir_eff, target,
+                                        window_start=dispatch_started,
+                                        window_end=time.time())
         if moved:
             print(f"  [ground-truth] FAIL: {moved}", file=sys.stderr)
             _append_run_note(ctx.db, ctx.run_id, f"impl_moved_base: {moved}")
@@ -1816,17 +1820,74 @@ REVIEWER_VERDICT_UNPARSEABLE = "reviewer_verdict_unparseable"
 REVIEWER_ESCALATED = "reviewer_escalated"
 
 
-def _implementer_moved_base(run_dir: str, target: str) -> str:
+_MOVED_BASE_REFLOG_MAX = 10
+_REFLOG_HEAD_RE = re.compile(r"HEAD@\{([^}]+)\}")
+
+
+def _moved_base_epoch(value) -> float | None:
+    """Coerce an epoch number, datetime, or ISO-8601 string to epoch seconds."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, datetime):
+        return value.timestamp()
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def _moved_base_reflog(target: str, since: float) -> list[tuple[float, str]]:
+    """The target's HEAD reflog entries at or after ``since`` (epoch), newest
+    first, as ``(epoch, raw line)``. Fail-soft: an unreadable or empty reflog
+    yields ``[]`` rather than a fabricated attribution."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", target, "reflog", "--date=iso"],
+            capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if proc.returncode != 0:
+        return []
+    entries: list[tuple[float, str]] = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        match = _REFLOG_HEAD_RE.search(line)
+        if not match:
+            continue
+        try:
+            when = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S %z")
+        except ValueError:
+            continue
+        epoch = when.timestamp()
+        if epoch >= since:
+            entries.append((epoch, line))
+    entries.sort(key=lambda entry: entry[0], reverse=True)
+    return entries
+
+
+def _implementer_moved_base(run_dir: str, target: str,
+                            window_start=None, window_end=None) -> str:
     """Why the implementer's tree delta cannot be trusted, or ``""``.
 
     The ground-truth harvest diffs the target against ``pre-implementer-ref``,
-    the commit HEAD was on before the implementer ran. If the implementer
-    commits, rebases, resets or checks out another ref, HEAD moves and the
-    delta carries every commit between the two: 2026-10-08,
-    sdd-i5-evidence-ledger-20261008122008 rebased onto origin/main mid-run and
-    shipped a 54-file diff for a 6-file change, then spent two revise rounds
-    chasing it. Fail the node here, with the cause, instead. ``""`` when the
-    check cannot run (no baseline, not a git repo).
+    the commit HEAD was on before the implementer ran. If HEAD moves — whether
+    the implementer commits, rebases, resets or checks out another ref, or a
+    concurrent session does — the delta carries every commit between the two:
+    2026-10-08, sdd-i5-evidence-ledger-20261008122008 rebased onto origin/main
+    mid-run and shipped a 54-file diff for a 6-file change, then spent two
+    revise rounds chasing it. Fail the node here, with the cause, instead.
+    ``""`` when the check cannot run (no baseline, not a git repo).
+
+    The blame is actor-neutral (RB-11d): the message names the two commits,
+    attaches the target's reflog entries since the run started (≤10 lines), and
+    adds ``not made by the implementer (concurrent actor)`` when no entry falls
+    inside ``window_start``..``window_end`` — the implementer's own subprocess
+    window, passed by the caller. Both default to the run's own boundaries
+    (``pre-implementer-ref`` mtime / now) so the recovery caller keeps working.
 
     A dirty tree at snapshot time makes ``_snapshot_pre_impl_ref`` record a
     ``git stash create`` WIP commit as the baseline (so the harvest diff
@@ -1838,8 +1899,9 @@ def _implementer_moved_base(run_dir: str, target: str) -> str:
     """
     if not run_dir or not target:
         return ""
+    ref_path = os.path.join(run_dir, "pre-implementer-ref")
     try:
-        baseline = open(os.path.join(run_dir, "pre-implementer-ref")).read().strip()
+        baseline = open(ref_path).read().strip()
     except OSError:
         return ""
     if not baseline:
@@ -1861,9 +1923,36 @@ def _implementer_moved_base(run_dir: str, target: str) -> str:
         parts = parents.stdout.split()
         if len(parts) >= 3 and parts[1] == head_sha:
             return ""
-    return (f"HEAD {head_sha[:12]} is not the run's starting commit {baseline[:12]}: the implementer "
-            "committed, rebased, reset or checked out in the target, so the tree delta would carry "
-            f"unrelated commits. Restore HEAD to {baseline[:12]} and leave the change uncommitted.")
+    try:
+        ref_mtime = os.path.getmtime(ref_path)
+    except OSError:
+        ref_mtime = None
+    start = _moved_base_epoch(window_start)
+    if start is None:
+        start = ref_mtime if ref_mtime is not None else 0.0
+    end = _moved_base_epoch(window_end)
+    if end is None:
+        end = time.time()
+    since = ref_mtime if ref_mtime is not None else start
+    entries = _moved_base_reflog(target, since)
+    shown = entries[:_MOVED_BASE_REFLOG_MAX]
+    message = (f"HEAD {head_sha[:12]} is not the run's starting commit "
+               f"{baseline[:12]}: HEAD moved from {baseline[:12]} to "
+               f"{head_sha[:12]} during the implementer window")
+    if shown:
+        message += ":\n" + "\n".join(f"  {line}" for _, line in shown) + "\n"
+    else:
+        message += ".\n"
+    # Attribution needs evidence: with no reflog the mover is simply unknown,
+    # and only entries outside the implementer's window implicate another actor.
+    if not entries:
+        message += ("Reflog unavailable or empty: the actor that moved HEAD "
+                    "is unknown.\n")
+    elif not any(start <= epoch <= end for epoch, _ in entries):
+        message += ("The move is not made by the implementer "
+                    "(concurrent actor).\n")
+    return message + (f"Restore HEAD to {baseline[:12]} and leave the change "
+                      "uncommitted.")
 
 
 def _append_run_note(db: str, run_id: str, note: str) -> None:
