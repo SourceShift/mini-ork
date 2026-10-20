@@ -311,6 +311,27 @@ def _reconcile_planner_cost(db, run_id):
 _VERDICT_ENUM = ("APPROVE", "REQUEST_CHANGES", "ESCALATE", "CRASH")
 
 
+def _first_plan_stage_error(con, run_id):
+    """The first plan-stage ``llm_calls.error_message`` for ``run_id``.
+
+    RB-30: ``planner_dispatch_rc_N`` alone says the planner died, not why. The
+    ledger already holds the reason (a missing target cwd, a refused lane), so
+    read the earliest failed planner row and bound it to ≤200 chars. Best-effort
+    by contract: a DB predating ``llm_calls`` contributes no message.
+    """
+    try:
+        row = con.execute(
+            "SELECT error_message FROM llm_calls "
+            "WHERE run_id = ? AND feature_name LIKE 'mini-ork:planner%' "
+            "AND status = 'failed' AND error_message IS NOT NULL "
+            "AND TRIM(error_message) <> '' ORDER BY id ASC LIMIT 1",
+            (run_id,)).fetchone()
+    except Exception:
+        return ""
+    message = (row[0] or "").strip() if row else ""
+    return message[:200]
+
+
 def _mark_failed(db, run_id, verdict):
     """Mark the run failed, recording ``verdict`` where the schema can hold it.
 
@@ -319,6 +340,9 @@ def _mark_failed(db, run_id, verdict):
     appended to ``notes`` instead (the ``'; '``-separated slot the retry
     machinery already reads for ``killed-by-user``), so the reason survives
     without fighting the schema.
+
+    RB-30: the reason is the plan-stage ledger's error when one exists —
+    ``planner_dispatch_rc_127: target cwd does not exist: …`` — not the bare rc.
     """
     if not (db and os.path.isfile(db) and run_id):
         return
@@ -333,9 +357,11 @@ def _mark_failed(db, run_id, verdict):
                     "updated_at=?, ended_at=COALESCE(ended_at, ?) WHERE id=?",
                     (legal, now, now, run_id))
         if reason:
+            message = _first_plan_stage_error(con, run_id)
+            note = f"{reason}: {message}" if message else reason
             con.execute("UPDATE task_runs SET notes = CASE WHEN COALESCE(notes, '') = '' "
                         "THEN ? ELSE notes || '; ' || ? END WHERE id=?",
-                        (reason, reason, run_id))
+                        (note, note, run_id))
         con.commit(); con.close()
     except Exception:
         pass

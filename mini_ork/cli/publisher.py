@@ -524,6 +524,9 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
     if abstained:
         print(f"  [ABSTAIN] publisher: a verifier could not run its tool "
               f"({', '.join(abstained)}) — publish withheld")
+        _note(db, run_id,
+              f"publisher: a verifier could not run its tool ({', '.join(abstained)}) "
+              "— publish withheld")
         set_status(db, run_id, "failed")
         return 0, "levels_unverified"
     # ── level-vector gate (MO_LEVEL_VECTOR): publish only when every required
@@ -540,6 +543,8 @@ def publisher_node(root, run_dir, db, run_id, recipe, task_class, review_file=""
             return 1, "levels_refuted"
         if decision == "abstain":
             print(f"  [ABSTAIN] publisher: level vector not proven ({detail}) — publish withheld")
+            _note(db, run_id,
+                  f"publisher: level vector not proven ({detail}) — publish withheld")
             set_status(db, run_id, "failed")
             return 0, "levels_unverified"
         print(f"  [ok] publisher: level gate pass (required={rep['levels_required'] or None})")

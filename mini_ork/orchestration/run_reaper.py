@@ -142,13 +142,32 @@ def _needs_change_note(run_dir: Path) -> str:
 
 
 def _retry_hint_note(run_dir: Path) -> str:
-    """``retry-hint.json``'s ``detail`` — why the lane could not be retried."""
+    """Why the lane could not be retried, from ``retry-hint.json``.
+
+    RB-30: every retry-hint shape the engine writes nests the reason under
+    ``needs_change.detail`` (0 of 83 files carried a top-level ``detail``), so
+    that is read first, then the hint's own ``notes[0]``, then the old
+    top-level ``detail`` for pre-nesting files. A blank value is not a reason:
+    it falls through to the next source.
+    """
     try:
         data = json.loads((run_dir / "retry-hint.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return ""
-    detail = data.get("detail") if isinstance(data, dict) else None
-    return _clip(detail) if isinstance(detail, str) and detail.strip() else ""
+    if not isinstance(data, dict):
+        return ""
+    candidates = []
+    needs_change = data.get("needs_change")
+    if isinstance(needs_change, dict):
+        candidates.append(needs_change.get("detail"))
+    notes = data.get("notes")
+    if isinstance(notes, list) and notes:
+        candidates.append(notes[0])
+    candidates.append(data.get("detail"))
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return _clip(candidate)
+    return ""
 
 
 def _repair_log_note(run_dir: Path) -> str:

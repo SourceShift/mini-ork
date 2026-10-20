@@ -1191,6 +1191,10 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     fail_count = 0
     abstain_count = 0
     pause_count = 0  # nodes that returned REVIEW_PAUSE_RC (awaiting human review)
+    # RB-30: node_id -> finish reason, so a failed run records *why* in
+    # task_runs.notes instead of leaving it NULL. A revise round that re-runs a
+    # failed node drops its entry; a later failure re-adds it.
+    failed_outcomes: dict[str, str] = {}
     out: list[str] = []
     if dry_run:
         # partitioned reorders by node_type group; others keep NODE_IDS order.
@@ -1344,6 +1348,13 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         return sum(1 for _field, rc, _finish_reason in outcomes
                    if rc != 0 and rc != _levels.ABSTAIN_RC and rc != REVIEW_PAUSE_RC)
 
+    def _record_failures(outcomes):
+        # RB-30: keep the node ids + finish reasons behind the fail-count so the
+        # failed-run note names them (the count alone says nothing).
+        for field, rc, finish_reason in outcomes:
+            if rc != 0 and rc != _levels.ABSTAIN_RC and rc != REVIEW_PAUSE_RC:
+                failed_outcomes[field[0]] = finish_reason or "failed"
+
     def _count_abstains(outcomes):
         return sum(1 for _field, rc, _finish_reason in outcomes
                    if rc == _levels.ABSTAIN_RC)
@@ -1465,6 +1476,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 # abstention (fail-closed): the node is blocked and counted.
                 statuses[node_id] = "blocked"
                 fail_count += 1
+                failed_outcomes[node_id] = "blocked by failed parent(s)"
                 print(
                     f"  [skip] node_id={node_id} blocked by failed parent(s): {', '.join(failed)}",
                     file=sys.stderr,
@@ -1506,6 +1518,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                     pending.pop(node_id)
                     statuses[node_id] = "blocked"
                     fail_count += 1
+                    failed_outcomes[node_id] = "unresolved workflow parents"
                     print(
                         f"  [skip] node_id={node_id} has unresolved workflow parents",
                         file=sys.stderr,
@@ -1542,6 +1555,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 else:
                     statuses[field[0]] = "failed"
                     fail_count += 1
+                    failed_outcomes[field[0]] = _finish_reason or "failed"
 
             # ── per-run orchestrator (default on; MO_RUN_ORCHESTRATOR=0 opts out) ──
             # Observe each node outcome at the wave boundary and pick one of
@@ -1761,6 +1775,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                         prior = statuses.pop(node_id, None)
                         if prior in {"failed", "blocked"}:
                             fail_count -= 1
+                            failed_outcomes.pop(node_id, None)
                         pending[node_id] = fields_by_id[node_id]
                     source_names = ", ".join(field[0] for field, _rc, _fr in failed_sources)
                     print(
@@ -1811,6 +1826,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         elif dispatch_mode == "parallel":
             _oc = _parallel(work_fields)
             fail_count += _count_failures(_oc)
+            _record_failures(_oc)
             abstain_count += _count_abstains(_oc)
             pause_count += _count_pauses(_oc)
         elif dispatch_mode == "partitioned":
@@ -1820,6 +1836,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 group = [field for field in work_fields if field[1] == node_type]
                 _oc = _parallel(group)
                 fail_count += _count_failures(_oc)
+                _record_failures(_oc)
                 abstain_count += _count_abstains(_oc)
                 pause_count += _count_pauses(_oc)
         else:
@@ -1830,6 +1847,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 if pending:
                     _oc = _parallel(pending)
                     fail_count += _count_failures(_oc)
+                    _record_failures(_oc)
                     abstain_count += _count_abstains(_oc)
                     pause_count += _count_pauses(_oc)
                     pending = []
@@ -1848,6 +1866,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                     pause_count += 1
                 elif rc != 0:
                     fail_count += 1
+                    failed_outcomes[field[0]] = _fr or "failed"
             _flush_pending()
 
         if rollback_fields and fail_count > 0:
@@ -1869,7 +1888,20 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         _record_plan_artifact(db, run_id, live_run_dir)
         _post_run_learning(db, live_run_dir, run_id, task_class, fail_count=fail_count)
         if fail_count > 0:
+            # RB-30: a failed run must record why. Node ids and their finish
+            # reasons, one bounded line (the notes column is read by humans and
+            # the IDE); the 300-char cap keeps the head — the count and the
+            # first ids/reasons — intact.
+            from mini_ork.cli.execute_handlers import _append_run_note  # noqa: PLC0415
+
+            ids = ", ".join(failed_outcomes) if failed_outcomes else "unknown"
+            reasons = ", ".join(dict.fromkeys(failed_outcomes.values())) \
+                if failed_outcomes else "unknown"
+            note = f"failed: {fail_count} node(s): {ids} ({reasons})"
+            if len(note) > 300:
+                note = note[:299] + "…"
             set_status(db, run_id, "failed")
+            _append_run_note(db, run_id, note)
             _maybe_triage_failed_run(db, run_id, home, root)
             sys.stderr.write(f"execute: {fail_count} node(s) failed\n")
             return 1
