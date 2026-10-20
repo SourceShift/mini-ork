@@ -79,6 +79,7 @@ Module layout (SOLID SRP split — behavior byte-identical parity port):
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -1696,9 +1697,25 @@ def cli_main(argv: list[str] | None = None, *, execute_fn=None) -> int:
             return _execute.main(a, root=root)
         execute_fn = _default_executor
     exec_rc = 1
+    # RB-31: recover's in-process execute tees to ``execute.recover-<n>.log``
+    # and points the live ``execute.log`` at it, so a revived run keeps the
+    # dead attempt's log while the new attempt is written as it goes.
+    from mini_ork.cli import log_tee  # noqa: PLC0415
+    _tee = log_tee.execute_tee(handoff["run_dir"], recover=True)
     try:
-        exec_rc = execute_fn(exec_argv)
+        with _tee:
+            with contextlib.redirect_stdout(_tee.stdout), contextlib.redirect_stderr(_tee.stderr):
+                exec_rc = execute_fn(exec_argv)
     finally:
+        # Mirror the attempt's output to the caller as before the tee; the
+        # mirror must never change the dispatch result.
+        try:
+            sys.stdout.write(_tee.stdout.getvalue())
+            sys.stderr.write(_tee.stderr.getvalue())
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:  # noqa: BLE001 — teardown is best-effort
+            pass
         if _lease is not None:
             # Lease bookkeeping must never stop the zombie guard below: a raise
             # here would leave the row ``executing`` with no live process.

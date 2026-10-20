@@ -1908,17 +1908,24 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
 
     # ── execute ── (failures do not exit; verify+reflect still fire)
     from mini_ork.cli import execute as mini_ork_execute
-    execute_stdout = io.StringIO()
-    execute_stderr = io.StringIO()
-    with contextlib.redirect_stdout(execute_stdout), contextlib.redirect_stderr(execute_stderr):
-        run_rc = mini_ork_execute.main([], root=root)
+    from mini_ork.cli import log_tee
+    # RB-31: tee execute's output into ``execute.log`` as it is written, not
+    # from a StringIO after it returns. A dispatcher that dies, a deadline
+    # early-return and a SIGTERM all used to leave the run dir with no log.
+    _exec_run_dir = context_env("MINI_ORK_RUN_DIR", "")
+    if not _exec_run_dir and plan_path:
+        _exec_run_dir = os.path.dirname(plan_path)
+    execute_tee = log_tee.execute_tee(_exec_run_dir)
+    with execute_tee:
+        with contextlib.redirect_stdout(execute_tee.stdout), contextlib.redirect_stderr(execute_tee.stderr):
+            run_rc = mini_ork_execute.main([], root=root)
     if sink.get("_pid_run_dir"):
         # execute drops .pid in its own finally; this process still owns the run.
         from mini_ork.orchestration import run_reaper
 
         run_reaper.claim_pid_file(Path(sink["_pid_run_dir"]))
-    execute_out = execute_stdout.getvalue()
-    execute_err = execute_stderr.getvalue()
+    execute_out = execute_tee.stdout.getvalue()
+    execute_err = execute_tee.stderr.getvalue()
     sys.stdout.write(execute_out)
     sys.stderr.write(execute_err)
     artifact = _grep_kv(execute_out, "artifact_path")
