@@ -247,6 +247,9 @@ def test_restore_replica_called_on_remote_branch(monkeypatch):
     # source module so the import resolves to our stub.
     monkeypatch.setattr("mini_ork.context.context_env",
                         lambda k, d="": "run-xyz" if k == "MINI_ORK_RUN_ID" else d)
+    # Keep the dispatch env hermetic: an ambient MINI_ORK_RUN_DIR would make
+    # ``run_check`` build a run PathMap and hand our stub a translated cwd/env.
+    monkeypatch.setattr("mini_ork.context.context_env_snapshot", lambda: {})
     rc, out = run_check(["echo", "hi"], cwd="/workspace/target", env=None,
                         evidence_path="")
     assert rc == 0
@@ -278,6 +281,8 @@ def test_restore_replica_failure_does_not_mask_check_rc(monkeypatch):
                         lambda _run_id, _env: FlakyRemote())
     monkeypatch.setattr("mini_ork.context.context_env",
                         lambda k, d="": "run-xyz" if k == "MINI_ORK_RUN_ID" else d)
+    # Hermetic dispatch env — see test_restore_replica_called_on_remote_branch.
+    monkeypatch.setattr("mini_ork.context.context_env_snapshot", lambda: {})
     rc, out = run_check(["false"], cwd="/w", env=None, evidence_path="")
     assert rc == 7
     assert out == "rc=7"

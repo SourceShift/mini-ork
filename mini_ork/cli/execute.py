@@ -2262,8 +2262,12 @@ def _run_verifier_ref(script, evidence_path, *, plan_path="", artifact_path="", 
     # through ``evidence_path``/``run_dir`` and not export MINI_ORK_RUN_DIR.
     # Recipe verifiers use that variable as their artifact namespace, so make
     # the executor-to-verifier boundary explicit instead of relying on an
-    # outer CLI process to have populated it.
-    verifier_env.setdefault("MINI_ORK_RUN_DIR", os.path.dirname(evidence_path))
+    # outer CLI process to have populated it. Override (not ``setdefault``): an
+    # ambient value from the shell that launched the run is not this verifier's
+    # namespace, and inheriting it pointed the verifier at the wrong run dir.
+    verifier_run_dir = run_dir or os.path.dirname(evidence_path)
+    if verifier_run_dir:
+        verifier_env["MINI_ORK_RUN_DIR"] = verifier_run_dir
     # A ``.py`` verifier runs in the TARGET repo, where ``mini_ork`` resolves to
     # whatever the interpreter finds (a venv editable install, or nothing in a
     # vendored install) — not necessarily the engine running this executor. Live
@@ -2344,9 +2348,20 @@ def _run_verifier_ref(script, evidence_path, *, plan_path="", artifact_path="", 
     try:
         payload = json.load(open(evidence_path))
     except Exception:
-        return rc  # non-JSON evidence → propagate the script's rc
+        # Evidence is stdout+stderr merged: a warning line (e.g. tarfile's
+        # DeprecationWarning on 3.13) in front of the JSON envelope used to
+        # make the strict parse fail, and the script's own ``sys.exit(0)``
+        # then turned a failed gate into a pass (audit RB-02a). Read the
+        # payload tolerantly instead: a sole JSON object, else the last
+        # object carrying a boolean ``pass``.
+        payload = _levels.read_single_verifier_payload(evidence_path)
+        if payload is None:
+            for candidate in _levels._iter_json_objects(evidence_path):
+                if isinstance(candidate.get("pass"), bool):
+                    payload = candidate
+                    break
     if not isinstance(payload, dict) or "pass" not in payload:
-        return rc
+        return rc  # non-JSON evidence → propagate the script's rc
     if _levels.abstain_kind(payload):
         # The verifier declared it could not run its tool (audit 2026-10-11).
         # That is an abstention, not a verdict about the code: a distinct rc so

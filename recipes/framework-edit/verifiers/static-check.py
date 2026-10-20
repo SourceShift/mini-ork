@@ -210,6 +210,19 @@ def _write_apply_sentinels():
             and os.path.getsize(os.path.join(WORK_PARENT, "diff-applied.post.sha256")) > 0)
 
 
+def _extractall(tar, dest):
+    """Extract ``tar`` into ``dest`` with PEP 706's ``data`` filter.
+
+    ``filter=`` exists from 3.12 (backported to 3.11.4); without it 3.13 emits a
+    DeprecationWarning into the merged evidence stream. Older interpreters have
+    no filter at all, so extract member-by-member there."""
+    if hasattr(tarfile, "data_filter"):
+        tar.extractall(dest, filter="data")
+        return
+    for member in tar.getmembers():
+        tar.extract(member, dest)
+
+
 def _materialise_submodules(root, dest):
     """Copy the target's submodule content into the extracted copy.
 
@@ -245,7 +258,7 @@ def _materialise_submodules(root, dest):
             continue
         target = os.path.join(dest, path)
         os.makedirs(target, exist_ok=True)
-        tarfile.open(fileobj=io.BytesIO(archived.stdout)).extractall(target)
+        _extractall(tarfile.open(fileobj=io.BytesIO(archived.stdout)), target)
 
 
 def _make_patched_copy():
@@ -253,7 +266,7 @@ def _make_patched_copy():
     os.makedirs(WORKTREE)
     archive = subprocess.run(["git", "-C", REPO_ROOT, "archive", _base_ref()],
                              stdout=subprocess.PIPE, check=True).stdout
-    tarfile.open(fileobj=io.BytesIO(archive)).extractall(WORKTREE)
+    _extractall(tarfile.open(fileobj=io.BytesIO(archive)), WORKTREE)
     _materialise_submodules(REPO_ROOT, WORKTREE)
     if not _assert_copy_is_own_git_root():
         return False
