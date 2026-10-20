@@ -94,10 +94,14 @@ LAYER_ENVIRONMENT = "environment"
 LAYER_ENGINE = "engine"
 LAYER_KICKOFF = "kickoff"
 LAYER_USER = "user"
+# RBF-22a: a remote node-agent outage is infrastructure the change never
+# touched. It keeps its own layer so an operator can separate "the sandbox was
+# unreachable" from a provider/model fault and from the change itself.
+LAYER_INFRA = "infra"
 LAYER_UNCLASSIFIED = "unclassified"
 LAYERS = frozenset({
     LAYER_CHANGE, LAYER_MODEL, LAYER_PROVIDER, LAYER_ENVIRONMENT,
-    LAYER_ENGINE, LAYER_KICKOFF, LAYER_USER, LAYER_UNCLASSIFIED,
+    LAYER_ENGINE, LAYER_KICKOFF, LAYER_USER, LAYER_INFRA, LAYER_UNCLASSIFIED,
 })
 
 # ``routes_to`` — what the next step should do about it.
@@ -139,6 +143,12 @@ SOURCE_FALLTHROUGH = ""
 SOURCE_MODEL = "model"
 
 RULE_UNCLASSIFIED = "unclassified"
+
+# RBF-22a: the finish reason the executor writes for a remote node-agent
+# outage, and the strategy that resolves it (re-dispatch the node — the
+# sandbox, not the change, was unavailable).
+RULE_REMOTE_UNAVAILABLE = "remote_unavailable"
+STRATEGY_RESUME = "resume"
 
 # The publisher's own withheld signals. ``publisher.py`` returns them as the
 # publisher node's ``finish_reason``; ``task_state._TERMINAL_OK_FINISH``
@@ -650,6 +660,40 @@ def _rule_framework_error(run_dir: Path, run_id: str, ends: dict[str, dict[str, 
     )
 
 
+def _rule_remote_unavailable(run_id: str, ends: dict[str, dict[str, Any]],
+                             failed_node: str | None, fail_reason: str
+                             ) -> dict[str, Any] | None:
+    """R3a — a remote node-agent outage (RBF-22a).
+
+    The executor names a remote read timeout / unreachable node-agent
+    ``remote_unavailable``; before this rule it fell through to
+    ``unclassified`` and the orchestrator blamed the verifier. The failure is
+    transport, not the change: layer ``infra``, strategy ``resume`` (re-dispatch
+    the same node), retryable. Only that exact finish reason matches — a
+    generic ``error`` must not inherit it.
+    """
+    if str(fail_reason or "").lower() != RULE_REMOTE_UNAVAILABLE:
+        return None
+    end = ends.get(failed_node or "") or {}
+    evidence = [_ev(
+        "event", f"run_events:{end.get('event_id') or '?'}",
+        f"finish_reason={RULE_REMOTE_UNAVAILABLE} — the remote node/agent was "
+        f"unreachable, not the change",
+    )]
+    result = _result(
+        run_id, rule_id=RULE_REMOTE_UNAVAILABLE, layer=LAYER_INFRA,
+        stage=_stage_for(failed_node, str(end.get("node_type") or "")),
+        node=failed_node, confidence=0.85, evidence=evidence,
+        routes_to=ROUTE_RETRY,
+        summary=(f"a remote node was unavailable at {failed_node or 'dispatch'} "
+                 f"— resume the node; it is transport, not the change"),
+        ends=ends,
+    )
+    result["strategy"] = STRATEGY_RESUME
+    result["retryable"] = True
+    return result
+
+
 def _rule_infra(home: Path, run_id: str, run_dir: Path, ends: dict[str, dict[str, Any]],
                 failed_node: str | None, fail_reason: str, log: str
                 ) -> dict[str, Any] | None:
@@ -923,6 +967,7 @@ def _diagnose(home: Path, run_id: str) -> dict[str, Any]:
         lambda: _rule_publish_abstain(run_dir, run_id, ends),
         lambda: _rule_withheld_unproven(run_dir, run_id, ends),
         lambda: _rule_framework_error(run_dir, run_id, ends, failed_node, fail_reason, log),
+        lambda: _rule_remote_unavailable(run_id, ends, failed_node, fail_reason),
         lambda: _rule_infra(home, run_id, run_dir, ends, failed_node, fail_reason, log),
         lambda: _rule_review(run_dir, run_id, ends, failed_node, fail_reason, artifacts),
         lambda: _rule_verifier(run_dir, run_id, ends, failed_node, fail_reason, artifacts),

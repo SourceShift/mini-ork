@@ -110,7 +110,41 @@ _NODE_TYPE_ORDER = ("planner", "researcher", "transform", "implementer", "review
                     "reflector", "publisher", "rollback")
 
 
+# RBF-22a: a remote node-agent outage is a named, retryable failure — not the
+# generic ``error`` that made the orchestrator blame the verifier. The dispatch
+# seam's contract with every handler is ``(rc, text)``, so
+# ``_default_llm_dispatch`` tags the captured text with this sentinel and
+# ``finish_reason_for_failure`` reads the precise class back out of it.
+REMOTE_UNAVAILABLE_FINISH_REASON = "remote_unavailable"
+_REMOTE_UNAVAILABLE_SENTINEL = "dispatch_failure_class=remote_unavailable"
+
+
+def _is_remote_unavailable(exc: BaseException) -> bool:
+    """True when ``exc`` is a remote-outage exception the dispatch wraps.
+
+    Both modules are imported on the exception path only: ``remote`` pulls the
+    sandbox registry, and a plain failed dispatch (the common case) must not
+    pay for it. A missing module degrades to "not a remote outage" rather than
+    masking the original failure.
+    """
+    classes: list[type[BaseException]] = []
+    try:
+        from mini_ork.remote.providers.base import ProviderUnavailableError
+        classes.append(ProviderUnavailableError)
+    except Exception:  # noqa: BLE001 — classification is best-effort
+        pass
+    try:
+        from mini_ork.runtime.backends.remote import RemoteUnavailableError
+        classes.append(RemoteUnavailableError)
+    except Exception:  # noqa: BLE001
+        pass
+    return isinstance(exc, tuple(classes))
+
+
 def finish_reason_for_failure(rc, text: str = "") -> str:
+    text = str(text or "")
+    if _REMOTE_UNAVAILABLE_SENTINEL in text:
+        return REMOTE_UNAVAILABLE_FINISH_REASON
     rc = int(rc) if str(rc).lstrip("-").isdigit() else 1
     if rc == 124:
         return "timeout"
@@ -2421,6 +2455,14 @@ def _default_llm_dispatch(root):
             # Every handler keeps only the rc of a failed dispatch, so without this
             # line the cause never reaches execute.log.
             sys.stderr.write(f"  [dispatch] {node_type}: llm_dispatch raised {exc!r}\n")
+            if _is_remote_unavailable(exc):
+                # RBF-22a: name the outage so the retry loop and the diagnosis
+                # can tell a remote read timeout apart from a code failure. The
+                # rc stays non-zero — the node still failed, and must retry.
+                return 1, (
+                    captured.getvalue()
+                    + f"{_REMOTE_UNAVAILABLE_SENTINEL}: {exc}"
+                )
             return 1, captured.getvalue() + str(exc)
     return d
 

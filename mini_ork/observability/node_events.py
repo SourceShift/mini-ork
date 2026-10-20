@@ -144,6 +144,28 @@ def _table_columns(con: sqlite3.Connection, table: str) -> set[str]:
     return {row[1] for row in con.execute(f"PRAGMA table_info({table})").fetchall()}
 
 
+# Migration 0021 CHECKs ``run_events.finish_reason`` against a fixed vocabulary
+# (done/error/interrupted/max_steps/cost_limit/timeout/verdict_revise/
+# verdict_fail). A newer, more precise reason outside that enum stays in
+# payload_json (every reader parses it); the column gets the closest allowed
+# value so the row survives. Only reasons with an unambiguous neighbour belong
+# here — an unmapped reason keeps the historical NULL column rather than
+# inventing a classification.
+_CHECK_FINISH_FALLBACKS: dict[str, str] = {
+    # RBF-22a: a remote exec/read timeout is a timeout at heart.
+    "remote_unavailable": "timeout",
+}
+
+
+def _column_finish_reason(reason: Any) -> str | None:
+    """The ``finish_reason`` column value for a rejected precise ``reason``.
+
+    ``None`` means "write NULL", the pre-existing CHECK-recovery behaviour
+    for the reasons the enum lacks and this table does not map.
+    """
+    return _CHECK_FINISH_FALLBACKS.get(str(reason or ""))
+
+
 def _default_extra_json() -> str:
     """Mirror bash default `$5` of `mo_node_emit` (the literal `{}`)."""
     return _DEFAULT_EXTRA_JSON
@@ -329,7 +351,11 @@ def _insert_event(
             # the exact reason stays in payload_json, which is what readers parse.
             if "finish_reason" not in insert_cols or payload.get("finish_reason") is None:
                 raise
-            values[insert_cols.index("finish_reason")] = None
+            # Keep the row: the exact reason stays in payload_json. Prefer the
+            # closest CHECK-allowed value (remote_unavailable -> timeout) and
+            # fall back to NULL for reasons with no mapped neighbour.
+            values[insert_cols.index("finish_reason")] = _column_finish_reason(
+                payload.get("finish_reason"))
             con.execute(insert, values)
         con.commit()
     except sqlite3.Error:

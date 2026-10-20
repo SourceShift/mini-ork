@@ -81,7 +81,25 @@ RETRYABLE_FINISH_REASONS: frozenset[str] = frozenset({
     "sigterm",          # SIGTERM caught
     "rc_137",           # killed by SIGKILL (128+9)
     "rc_143",           # killed by SIGTERM (128+15)
+    # RBF-22a: a remote node-agent outage (605 s exec read timeout, node
+    # unreachable after its own retries). Retryable, but under its own tight
+    # budget — see the override below.
+    "remote_unavailable",
 })
+
+# RBF-22a: the remote-outage budget. Two retries (three attempts total, the
+# LangGraph default ``max_attempts``) with a flat 30 s wait: the remote
+# transport already retried internally, so compounding exponential backoff on
+# top of a 605 s read timeout only lengthens the outage.
+REMOTE_UNAVAILABLE_FINISH_REASON = "remote_unavailable"
+REMOTE_UNAVAILABLE_MAX_RETRIES = 2
+REMOTE_UNAVAILABLE_BACKOFF_SECONDS = 30.0
+
+# Per-finish-reason backoff overrides. A reason absent here keeps the node's
+# parsed ``RetryPolicy`` envelope from :func:`compute_backoff`.
+RETRY_BACKOFF_OVERRIDES: dict[str, float] = {
+    REMOTE_UNAVAILABLE_FINISH_REASON: REMOTE_UNAVAILABLE_BACKOFF_SECONDS,
+}
 
 
 @dataclass(frozen=True)
@@ -284,6 +302,26 @@ def retryable_finish_reason(finish_reason: str) -> bool:
     and goes through the ``retries`` edge, not this loop.
     """
     return finish_reason in RETRYABLE_FINISH_REASONS
+
+
+def backoff_for_finish_reason(
+    policy: RetryPolicy,
+    finish_reason: str,
+    *,
+    attempt: int,
+    rng: random.Random | None = None,
+) -> float:
+    """The wait before the next attempt after ``finish_reason`` failed.
+
+    A per-reason override (``RETRY_BACKOFF_OVERRIDES``) wins over the policy
+    envelope: ``remote_unavailable`` waits a flat 30 s because the remote
+    transport already spent its own retry budget, while every other retryable
+    reason keeps the node's configured exponential backoff.
+    """
+    override = RETRY_BACKOFF_OVERRIDES.get(str(finish_reason))
+    if override is not None:
+        return float(override)
+    return compute_backoff(policy, attempt=attempt, rng=rng)
 
 
 # ── ERROR checkpoint row (F4) ────────────────────────────────────────────────
@@ -507,6 +545,11 @@ __all__ = [
     "compute_backoff",
     "retryable_finish_reason",
     "RETRYABLE_FINISH_REASONS",
+    "REMOTE_UNAVAILABLE_FINISH_REASON",
+    "REMOTE_UNAVAILABLE_MAX_RETRIES",
+    "REMOTE_UNAVAILABLE_BACKOFF_SECONDS",
+    "RETRY_BACKOFF_OVERRIDES",
+    "backoff_for_finish_reason",
     "ErrorRow",
     "mark_retry_error",
     "should_retry",
