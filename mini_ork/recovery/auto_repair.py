@@ -1279,6 +1279,13 @@ def _spawn_recover(home: Path, run_id: str, run_dir: Path,
     argv += ["--force"]
 
     env = dict(os.environ)
+    # The parent run exported ``MINI_ORK_PLAN_PATH`` for ITS execute; the child
+    # recover builds its own plan and passes it positionally. An inherited value
+    # makes ``execute._parse_execute_argv`` reject that positional as an
+    # "Unexpected argument" and the recover exits rc=2 before dispatching a node
+    # (RB-03: 13 repair logs this week). Drop exactly this key; every other
+    # inherited variable is still needed by the child.
+    env.pop("MINI_ORK_PLAN_PATH", None)
     env[_ATTEMPT_ENV] = str(n)
     env[_RUN_ID_ENV] = str(run_id)
     # The child must resolve the SAME home/db as this process: the CLI's own

@@ -1401,7 +1401,14 @@ def cli_main(argv: list[str] | None = None, *, execute_fn=None) -> int:
     the CLI used to print "dispatching closure" and exit without running a
     node. Dispatch the closure here, then close the request and release the
     lease so a later recover is not refused for the lease TTL."""
-    for key in ("MINI_ORK_RECOVERY_RUN_ID", "MINI_ORK_RECOVERY_SKU", "MINI_ORK_RECOVERY_CLOSURE",
+    # ``MINI_ORK_PLAN_PATH`` is the *caller's* plan (``cli/main.py`` exports it
+    # for the run's own execute). The recovery execute below is handed its plan
+    # positionally, and ``execute._parse_execute_argv`` seeds ``plan_path`` from
+    # this env — so an inherited value makes the positional an "Unexpected
+    # argument" and the recover dies rc=2 before dispatching a node (RB-03).
+    # Pop it in this same loop: the positional is the only plan authority here.
+    for key in ("MINI_ORK_PLAN_PATH",
+                "MINI_ORK_RECOVERY_RUN_ID", "MINI_ORK_RECOVERY_SKU", "MINI_ORK_RECOVERY_CLOSURE",
                 "MINI_ORK_RECOVERY_STRATEGY", "MINI_ORK_RECOVERY_FROM"):
         os.environ.pop(key, None)  # only this call's plan may drive the executor
     # ── auto-repair hand-off ──: when auto-repair spawned this recover, wait for
