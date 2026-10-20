@@ -481,6 +481,145 @@ def _extract_review_detail(text: str) -> str:
     return ""
 
 
+def _decode_review_payload(text: str) -> dict[str, Any] | None:
+    """The first JSON object in ``text`` (banner/log tolerant), or ``None``."""
+    if not text:
+        return None
+    try:
+        data: Any = json.loads(text)
+    except (ValueError, TypeError):
+        decoder = json.JSONDecoder()
+        data = None
+        for start in (i for i, ch in enumerate(text) if ch == "{"):
+            try:
+                data, _end = decoder.raw_decode(text, start)
+                break
+            except ValueError:
+                continue
+    return data if isinstance(data, dict) else None
+
+
+# Where a reviewer records the person-action it wants taken. The framework-edit
+# prompt uses ``reasons``; the generic inline reviewer contract uses ``notes``;
+# ``next_action_recommended`` is what ``auto_repair._escalation`` reads first.
+_ESCALATION_TEXT_KEYS = (
+    "next_action_recommended", "person_action", "reasons", "notes",
+)
+
+
+def _first_review_text(payload: dict[str, Any]) -> str:
+    """The reviewer's first actionable sentence, from the escalation fields."""
+    for key in _ESCALATION_TEXT_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, list):
+            for item in value:
+                text = str(item).strip() if item else ""
+                if text:
+                    return text
+    return ""
+
+
+def _escalate_verdict(payload: dict[str, Any]) -> bool:
+    """True when a reviewer/eval artefact's verdict is ``escalate``."""
+    return str(payload.get("verdict") or "").strip().lower() == "escalate"
+
+
+def _reviewer_evidence(run_dir: Path,
+                       review: dict[str, Any] | None) -> list[tuple[str, dict[str, Any], str]]:
+    """Reviewer artefacts as ``(node_name, payload, evidence_path)``.
+
+    A caller-supplied ``review`` (the ``_node_artifacts`` shape carries the
+    parsed verdict plus the raw ``text``) wins. Otherwise prefer the
+    engine-written ``review-verdict.json`` — it is rewritten every round — and
+    fall back to the reviewer nodes' own ``review-<node>.json`` artefacts.
+    """
+    if isinstance(review, dict):
+        payload = review
+        if not any(key in payload for key in _ESCALATION_TEXT_KEYS):
+            decoded = _decode_review_payload(str(payload.get("text") or ""))
+            if decoded is not None:
+                payload = {**decoded,
+                           "verdict": payload.get("verdict") or decoded.get("verdict")}
+        return [("reviewer", payload, "")]
+    if not run_dir.is_dir():
+        return []
+    verdict_path = run_dir / "review-verdict.json"
+    if verdict_path.is_file():
+        paths = [verdict_path]
+    else:
+        paths = sorted(run_dir.glob("review-*.json"))
+    out: list[tuple[str, dict[str, Any], str]] = []
+    for path in paths:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        payload = _decode_review_payload(text)
+        if payload is None:
+            m = _VERDICT_RE.search(text)
+            if not m:
+                continue
+            payload = {"verdict": m.group(1)}
+        name = ("reviewer" if path.name == "review-verdict.json"
+                else path.stem[len("review-"):])
+        out.append((name, payload, str(path)))
+    return out
+
+
+def _case_escalated(run_dir: Path,
+                    failed_name: str | None = None,
+                    review: dict[str, Any] | None = None,
+                    verifier: dict[str, Any] | None = None,
+                    run_id: str | None = None,
+                    home: Path | None = None) -> dict[str, Any] | None:
+    """Case 1.8: the reviewer escalated to a person — never a code change.
+
+    A reviewer ``escalate`` says the blocker is environmental or a harness bug,
+    so re-running the verifier or revising the code cannot help. Evaluated
+    BEFORE ``_failed_review``/``_case_code``: without this branch the verdict is
+    absent from ``_RETRY_VERDICTS``, the failing verifier is named as
+    ``failed_name``, and the hint blames the code with the verifier's reason
+    (RBF-11 case a).
+
+    The failing verifier (``failed_name``/``verifier``) is named only as
+    context — its result is a symptom, not the cause.
+    """
+    for node_name, payload, evidence in _reviewer_evidence(run_dir, review):
+        if not _escalate_verdict(payload):
+            continue
+        summary = _first_review_text(payload)[:300] or "the reviewer asked for a person"
+        detail = ""
+        if failed_name:
+            detail = (
+                f"Context only: {failed_name} reported a failure, but the "
+                "reviewer escalated to a person — the failing check is not the cause"
+            )
+        if isinstance(verifier, dict):
+            reason = _verifier_reason(verifier)
+            if reason:
+                detail = (detail + " " + reason).strip()
+        return {
+            "version": HINT_VERSION,
+            "run_id": run_id or "",
+            "failed_node": node_name or failed_name,
+            "retryable": False,
+            "strategy": "none",
+            "from_node": node_name or failed_name,
+            "needs_change": {
+                "kind": "person",
+                "summary": summary,
+                "detail": detail[:800],
+                "evidence": evidence,
+            },
+            "notes": [],
+            "command": "",
+            "computed_at": _now_iso(),
+        }
+    return None
+
+
 def _tail_log(run_dir: Path, node_name: str, *, n: int = 20) -> str:
     """Last ``n`` lines of the most informative log for ``node_name``."""
     candidates = [run_dir / f"impl-{name}.log" for name in (node_name,)]
@@ -630,7 +769,15 @@ def _build_command(strategy: str, run_id: str) -> str:
 def _case_environment(run_dir: Path, recipe: str, home: Path,
                       run_id: str, failed_name: str,
                       verifier: dict[str, Any]) -> dict[str, Any] | None:
-    """Case 2: verifier UNVERIFIED / unreachable-precondition while earlier verifiers passed."""
+    """Case 2: verifier UNVERIFIED / unreachable-precondition while earlier verifiers passed.
+
+    A verifier that *passed* (``pass: true``) or did not gate the run
+    (``gating: false``) cannot be an environment fault, even when its status
+    is ``UNVERIFIED``: a skipped, non-gating typecheck is a pass, not a
+    blocked precondition (RBF-11 case c).
+    """
+    if verifier.get("pass") is True or verifier.get("gating") is False:
+        return None
     status = str(verifier.get("status") or "").upper()
     reason_text = str(
         verifier.get("reason") or verifier.get("error_summary") or ""
@@ -1332,7 +1479,11 @@ def _case_lane_unavailable(home: Path, run_id: str, run_dir: Path,
     starts, ends = _node_start_lanes(home, run_id)
     by_alias, node_alias = _workflow_alias_map(starts)
     if not starts:
-        return _case_planner_lane(home, run_id, rows)
+        lane_hint = _case_planner_lane(home, run_id, rows)
+        if lane_hint is not None:
+            return lane_hint
+        return _case_planner_shape(home, run_id, rows,
+                                   _run_notes(home, run_id))
     if not by_alias:
         return None
 
@@ -1462,15 +1613,19 @@ def _case_planner_lane(home: Path, run_id: str,
     empty so a repair re-plans from the top rather than resuming a node that
     never existed.
 
-    Only a *categorised* row (``quota``/``auth``) qualifies: a plan-stage row
-    the executor could not classify is not evidence of a dead lane, and
-    guessing one here would switch a healthy lane. Those fall through to case 5
-    as before.
+    Only a *categorised* row (``quota``/``auth``) qualifies, and it must be
+    the *only* kind of failed plan-stage row: a single shape/unknown failure
+    means the chain did not die of credentials, so blaming the one auth row
+    would switch away from a lane that actually produced output (RBF-11 case
+    b — ``--lane planner=glm`` was suggested although glm had failed shape 3×).
+    Those mixed runs fall through to ``_case_planner_shape`` / case 5.
     """
-    dead = [r for r in rows
-            if str(r.get("error_category") or "") in ("quota", "auth")]
-    if not dead:
+    if not rows:
         return None
+    if any(str(r.get("error_category") or "") not in ("quota", "auth")
+           for r in rows):
+        return None
+    dead = list(rows)
     row = dead[0]
     alias = _row_alias(row)
     lane = str(row.get("model_id") or "")
@@ -1517,6 +1672,89 @@ def _case_planner_lane(home: Path, run_id: str,
         },
         "notes": [],
         "command": command,
+        "computed_at": _now_iso(),
+    }
+
+
+def _is_shape_row(row: dict[str, Any]) -> bool:
+    """True when a failed plan-stage row is a shape rejection.
+
+    ``classify_error`` has no ``shape`` category — a rejected planner payload
+    lands as ``unknown``/NULL with the dispatch error text
+    ``"dispatch result failed shape check (...)"``. Match the text, not the
+    category (RBF-11 case b).
+    """
+    if str(row.get("error_category") or "").strip().lower() == "shape":
+        return True
+    message = str(row.get("error_message") or "").lower()
+    return "failed shape check" in message or "shape check" in message
+
+
+def _case_planner_shape(home: Path, run_id: str,
+                        rows: list[dict[str, Any]],
+                        notes: str = "") -> dict[str, Any] | None:
+    """Plan-stage shape rejection → retry the plan; do not switch lanes.
+
+    Every lane in the chain rejected the planner's output shape, so the
+    failure is the planner's output, not a dead credential (RBF-11 case b).
+    The hint stays ``kind: "lane"`` (the existing vocabulary) but carries an
+    EMPTY ``suggestions`` list: ``auto_repair.decide`` switches lane whenever
+    a suggestion exists, which is exactly the wrong fix — the named lanes all
+    failed shape.
+
+    Fires on: a failed row whose text is a shape check, or the run note
+    ``planner_dispatch_rc_65`` (``plan.py`` records the dispatcher's rc).
+    """
+    shape_rows = [r for r in rows if _is_shape_row(r)]
+    rc65 = "planner_dispatch_rc_65" in str(notes or "")
+    if not shape_rows and not rc65:
+        return None
+    # ``rows`` is latest-first; reverse for dispatch order and de-dupe.
+    lanes: list[str] = []
+    for row in reversed(shape_rows):
+        lane = str(row.get("model_id") or "")
+        if lane and lane not in lanes:
+            lanes.append(lane)
+    alias = _row_alias(shape_rows[0]) if shape_rows else "planner"
+    provider = str(shape_rows[0].get("provider") or "") if shape_rows else ""
+    detail = "; ".join(
+        str(r.get("error_message") or "")[:200] for r in shape_rows[:3]
+    )
+    if not detail:
+        detail = "the planner dispatcher returned rc 65 (shape rejection)"
+    summary = (
+        "planner output failed the shape check on " + ", ".join(lanes)
+        if lanes
+        else "planner output failed the shape check on the planner chain"
+    )
+    return {
+        "version": HINT_VERSION,
+        "run_id": run_id,
+        "failed_node": alias,
+        "retryable": True,
+        "strategy": "resume",
+        "from_node": None,
+        "needs_change": {
+            "kind": "lane",
+            "summary": summary,
+            "detail": detail,
+            "lane": lanes[0] if lanes else "",
+            "alias": alias,
+            "provider": provider,
+            "error_kind": "shape",
+            "nodes": [],
+            # Deliberately empty: a lane suggestion here would auto-switch to
+            # another lane that already failed the same shape check.
+            "suggestions": [],
+            "code": False,
+        },
+        "notes": [],
+        # No command: with an empty ``suggestions`` list there is no
+        # ``--lane`` pin to satisfy the ack-change gate, so a
+        # ``recover ... --strategy resume`` here would be refused exactly like
+        # the hint that audit finding f:dd749eebaa records (RBF-11 case b is
+        # "retry the plan", which the board's retry action synthesises).
+        "command": "",
         "computed_at": _now_iso(),
     }
 
@@ -1837,6 +2075,14 @@ def compute(home: Path, run_id: str) -> dict[str, Any] | None:
     nodes, edges = _recipe_workflow(home, recipe)
     if not nodes:
         nodes = _nodes_from_events(home, run_id)
+
+    # Case 1.8 — a reviewer escalate is a person action, not a code revision.
+    # It must run BEFORE the reviewer/verifier cases: ``escalate`` is
+    # deliberately absent from ``_RETRY_VERDICTS``, so without this branch the
+    # failing verifier wins and the hint blames the code (RBF-11 case a).
+    escalated = _case_escalated(run_dir, run_id=run_id, home=home)
+    if escalated is not None:
+        return escalated
 
     # A reviewer that asked for a revision outranks any verifier outcome: the
     # change was judged wrong, so retrying it unchanged cannot help.
