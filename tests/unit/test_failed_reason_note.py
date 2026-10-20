@@ -145,9 +145,12 @@ def test_execute_fail_note_capped_and_keeps_head(tmp_path, monkeypatch):
 
     assert execute.main([], root=PKG_ROOT, dispatch_fn=stub_dispatch) == 1
     _, notes = _row(db_path, run_id)
-    assert notes and notes.startswith("failed:"), notes
-    assert "failed: 12 node(s):" in notes, notes
-    assert len(notes) <= 300, len(notes)
+    # RB-16 stamps "attempt <n> started <UTC>" on the transition into
+    # executing, so the failure note is the LAST segment, not the whole field.
+    segment = notes.split("; ")[-1] if notes else ""
+    assert segment.startswith("failed:"), notes
+    assert "failed: 12 node(s):" in segment, notes
+    assert len(segment) <= 300, len(segment)
 
 
 def test_reaper_reads_nested_needs_change_detail(tmp_path):
