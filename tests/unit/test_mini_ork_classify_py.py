@@ -146,6 +146,9 @@ def test_kickoff_size_limit_exits_two(tmp_path: Path, home: Path) -> None:
 def test_non_dry_run_writes_task_and_trace_contract(tmp_path: Path, home: Path) -> None:
     kickoff = tmp_path / "write.md"
     kickoff.write_text("fix a regression", encoding="utf-8")
+    # Inside a live run: the lifecycle creates <home>/runs/<id>/ before it
+    # classifies (RB-38 — a standalone classify writes no row).
+    (home / "runs" / "run-golden").mkdir(parents=True)
 
     out, err, rc = _run(
         home, [str(kickoff)], MINI_ORK_RUN_ID="run-golden",
@@ -186,6 +189,7 @@ def test_dry_run_writes_neither_task_nor_trace(tmp_path: Path, home: Path) -> No
 def test_reclassify_preserves_existing_task_trace_id(tmp_path: Path, home: Path) -> None:
     kickoff = tmp_path / "repeat.md"
     kickoff.write_text("fix a bug", encoding="utf-8")
+    (home / "runs" / "run-repeat").mkdir(parents=True)  # inside a live run (RB-38)
 
     assert _run(home, [str(kickoff)], MINI_ORK_RUN_ID="run-repeat")[2] == 0
     con = sqlite3.connect(home / "state.db")

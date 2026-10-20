@@ -354,6 +354,26 @@ def _preserve_raw(home, run_id, verdict, raw, sanitized):
     sys.stderr.write(f"[D-015 forensics preserved at {d}/plan-failure-{verdict}.*]\n")
 
 
+def _preserve_repair(home, run_id, attempt, raw, sanitized):
+    """Write one repair attempt's output to its own file (RB-37).
+
+    The first failing output is preserved once as ``plan-failure-<verdict>.*``
+    and must stay the *failing* output: writing every repair to that same path
+    replaced it with the repaired text, so all 7 ``plan-failure-*.raw.txt``
+    files in the audit window validated ``ok`` and the actual failure was lost.
+    """
+    if not (home and run_id):
+        return
+    d = os.path.join(home, "runs", run_id)
+    os.makedirs(d, exist_ok=True)
+    try:
+        open(os.path.join(d, f"plan-repair-{attempt}.raw.txt"), "w").write(raw or "")
+        open(os.path.join(d, f"plan-repair-{attempt}.sanitized.txt"), "w").write(sanitized or "")
+    except OSError:
+        pass
+    sys.stderr.write(f"[D-015 repair attempt {attempt} preserved at {d}/plan-repair-{attempt}.*]\n")
+
+
 def _db_write(db, run_id, task_class, out_file, plan_hash):
     if not (db and os.path.isfile(db)):
         return
@@ -1157,7 +1177,7 @@ def main(argv=None, *, root=None, dispatch=None) -> int:
                 raw = repaired
                 plan_json = extract_plan_json(raw)
                 verdict = validate_plan(plan_json)
-                _preserve_raw(home, run_id, first_verdict, raw, plan_json)
+                _preserve_repair(home, run_id, attempt, raw, plan_json)
                 if verdict == "ok":
                     break
                 if verdict == "placeholder_plan":

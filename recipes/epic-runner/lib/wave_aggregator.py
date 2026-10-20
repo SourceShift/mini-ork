@@ -84,9 +84,11 @@ def _raw_records(results: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 def _raw_status(record: dict[str, Any] | None) -> str:
     if record is None:
+        # A planned epic with no record is a failure, not "not started": the
+        # dispatcher writes a record for every planned epic up front.
         return STATUS_FAILED
     status = str(record.get("status") or "").strip().lower()
-    if status in TERMINAL:
+    if status in TERMINAL or status == STATUS_PENDING:
         return status
     return STATUS_FAILED
 
@@ -199,8 +201,24 @@ def aggregate() -> int:
                 }
             )
 
+    # RB-47: the verdict was hard-coded "in_progress", so epic-results.json /
+    # wave-aggregate.json still said in_progress after every wave passed. A run
+    # is done when every planned epic passed; it failed when at least one
+    # failed and none is still pending; otherwise it is still in progress.
+    pending_ids = {epic_id for epic_id, status in counted_status.items()
+                   if status == STATUS_PENDING}
+    all_planned_passed = bool(planned_ids) and all(
+        counted_status.get(epic_id) == STATUS_PASSED for epic_id in planned_ids)
+    if all_planned_passed:
+        verdict = "pass"
+    elif (any(status == STATUS_FAILED for status in counted_status.values())
+          and not pending_ids):
+        verdict = "fail"
+    else:
+        verdict = "in_progress"
+
     payload = {
-        "verdict": "in_progress",
+        "verdict": verdict,
         "aggregate": {
             "epics_total": len(planned_ids),
             "epics_passed": sum(1 for status in counted_status.values() if status == STATUS_PASSED),

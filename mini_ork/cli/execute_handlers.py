@@ -2316,6 +2316,39 @@ def _rollback_strategy(workflow_path: str) -> str:
         return ""
 
 
+def _rollback_artifact_contract(ctx: NodeDispatch) -> dict:
+    """The artifact contract a file-manipulating rollback strategy reads (RB-46).
+
+    The recipe's own ``artifact_contract.yaml`` is authoritative — the plan's
+    copy is the planner's rendering of it, and a planner may omit
+    ``source_artifact``. Fall back to the plan's ``artifact_contract`` when the
+    recipe file is unavailable (e.g. an ad-hoc run dir).
+    """
+    candidates = []
+    if ctx.recipe_dir:
+        candidates.append(os.path.join(ctx.recipe_dir, "artifact_contract.yaml"))
+    for path in candidates:
+        if path and os.path.isfile(path):
+            try:
+                import yaml  # noqa: PLC0415
+                data = yaml.safe_load(open(path)) or {}
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
+    try:
+        body = ctx.plan_content
+        if not body and ctx.plan_path and os.path.isfile(ctx.plan_path):
+            body = open(ctx.plan_path).read()
+        plan = json.loads(body or "{}")
+        contract = plan.get("artifact_contract") if isinstance(plan, dict) else None
+        if isinstance(contract, dict):
+            return contract
+    except Exception:
+        pass
+    return {}
+
+
 def _run_changed_files(run_dir: str) -> list[str]:
     """The implementer's recorded ``files_changed`` for this run ([] if none).
 
@@ -2881,6 +2914,38 @@ def _handle_rollback(ctx: NodeDispatch):
         print(f"  [ok] rollback: strategy {strategy} — "
               "partial work kept in the target tree (the run re-enters from the failing node)",
               file=sys.stderr, flush=True)
+    elif strategy == "keep_judge_reports_discard_synthesis":
+        # Declared by recipes/audit-judge-panel/workflow.yaml (and its -3l/-4l
+        # siblings): the judge reports are human evidence and stay, while the
+        # synthesis they feed is discarded when verification fails. Read the
+        # names from the recipe's artifact contract rather than guessing —
+        # ``outputs`` lists the run-local reports, ``source_artifact`` names the
+        # synthesis. Previously unimplemented and reported as
+        # "unhandled rollback_strategy" (RB-46).
+        contract = _rollback_artifact_contract(ctx)
+        outputs = [str(name).strip() for name in (contract.get("outputs") or [])
+                   if str(name).strip()]
+        synthesis = str(contract.get("source_artifact") or "").strip() or "synthesis.md"
+        judge_reports = [name for name in outputs if name != synthesis]
+        removed = False
+        if run_dir:
+            target = os.path.abspath(os.path.join(run_dir, synthesis))
+            base = os.path.abspath(run_dir)
+            if os.path.commonpath([base, target]) == base:
+                try:
+                    os.remove(target)
+                    removed = True
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    print(f"  [warn] rollback: could not discard synthesis {synthesis!r}: {exc}",
+                          file=sys.stderr, flush=True)
+            else:
+                print(f"  [warn] rollback: synthesis {synthesis!r} escapes the run dir — not removed",
+                      file=sys.stderr, flush=True)
+        print(f"  [ok] rollback: strategy {strategy} — kept {len(judge_reports)} judge report(s); "
+              f"discarded synthesis {synthesis!r}"
+              + ("" if removed else " (already absent)"), file=sys.stderr, flush=True)
     elif strategy:
         print(f"  [warn] rollback: unhandled rollback_strategy {strategy!r} — "
               "no working-tree compensation applied", file=sys.stderr, flush=True)

@@ -189,10 +189,18 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
         sys.stdout.write(f"[dry-run] would write task_class={task_class} to DB run row\n")
         return 0
 
-    run_id = None
-    if os.path.isfile(db):
+    # RB-38: a ``task_runs`` row is a run-lifecycle fact, not a standalone
+    # classification. Outside a run (no MINI_ORK_RUN_ID, or a run dir that does
+    # not exist) the row has no recipe and no run dir: the reaper reports it
+    # "unknown" and the board shows it as live forever. Those four audit rows
+    # came from exactly this path. Write nothing unless we are inside a run,
+    # and never let ON CONFLICT downgrade a live status to 'classified'.
+    run_id = context_env("MINI_ORK_RUN_ID").strip()
+    run_dir = (context_env("MINI_ORK_RUN_DIR").strip()
+               or (os.path.join(home, "runs", run_id) if run_id else ""))
+    in_lifecycle = bool(run_id and run_dir and os.path.isdir(run_dir))
+    if in_lifecycle and os.path.isfile(db):
         import sqlite3
-        run_id = context_env("MINI_ORK_RUN_ID") or f"run-{int(time.time())}-{os.getpid()}"
         recipe = os.environ.get("MINI_ORK_RECIPE") or None
         now = int(time.time())
         con = sqlite3.connect(db); con.execute("PRAGMA journal_mode=WAL")
@@ -203,7 +211,6 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
                 VALUES (?,?,?,?,?, 'classified', ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET task_class=excluded.task_class, recipe=excluded.recipe,
                     workflow_version=excluded.workflow_version, kickoff_path=excluded.kickoff_path,
-                    status='classified',
                     trace_id=COALESCE(task_runs.trace_id, excluded.trace_id),
                     updated_at=excluded.updated_at
             """, (run_id, task_class, recipe, resolved_wf, kickoff,
