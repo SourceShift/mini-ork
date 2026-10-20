@@ -293,8 +293,32 @@ def kill_run(home: Path, db: StateDB, task_run_id: str) -> dict[str, Any]:
             pass
 
     # Writeback to task_runs — mark failed regardless of whether pids were
-    # found. The user clicked Kill; the row should reflect that intent.
+    # found. The user clicked Kill; the row should reflect that intent. This
+    # comes BEFORE the provider release: a provider API that hangs must not
+    # delay the row reading as killed.
     _writeback_terminal(db, task_run_id, status="failed", notes="killed-by-user", verdict="CRASH")
+
+    # RB-49: a provider node recorded in ``<run_dir>/.node-provider.json``
+    # (Daytona and the other cloud providers) has no workspace-session marker,
+    # so the reap above cannot see it — ``board kill`` used to leave it alive
+    # until the provider TTL, and three campaign kills had to be released by
+    # hand. Release it through the provider seams, best-effort: a provider
+    # outage must not stop the kill from failing the row, and the TTL reaper is
+    # still the net. Imports stay local so the documented monkeypatch seam
+    # (the provider modules' own attributes) intercepts them.
+    nodes_released = 0
+    try:
+        from mini_ork.remote.providers import base as provider_base
+
+        nodes_released += int(bool(provider_base.release_run_node(run_dir, os.environ)))
+    except Exception:  # noqa: BLE001 — one failed release must not strand the other
+        pass
+    try:
+        from mini_ork.remote.providers import run_nodes as provider_run_nodes
+
+        nodes_released += int(provider_run_nodes.release_all_nodes(run_dir, os.environ) or 0)
+    except Exception:  # noqa: BLE001 — never raise out of kill
+        pass
 
     # SIGKILL bypasses the dispatcher's EXIT-trap finalizer, so dangling
     # node_start events (UI DAG "running" forever) must be closed here too.
@@ -328,6 +352,7 @@ def kill_run(home: Path, db: StateDB, task_run_id: str) -> dict[str, Any]:
         "pids_survived_permission_denied": survived,
         "session_halted": session_halted,
         "session_marker_reaped": _marker_reaped,
+        "nodes_released": nodes_released,
         "note": (
             "no pids found — marked status=failed anyway; dispatcher may have already exited"
             if not pids
@@ -454,6 +479,19 @@ def _writeback_terminal(
     con = sqlite3.connect(db_path, timeout=5.0)
     try:
         con.execute("PRAGMA busy_timeout = 5000")
+        # RB-33: a kill (or a not-needed close) is a terminal write and must
+        # stamp ACTIVE time. It used to set ``ended_at`` with no duration
+        # clause at all, so four killed runs recorded ``duration_ms = 0``.
+        row = con.execute(
+            "SELECT notes, duration_ms, ended_at, updated_at, created_at "
+            "FROM task_runs WHERE id = ?", (task_run_id,)).fetchone()
+        prior_end = row[2] if row else None
+        ended_at = now if prior_end is None else int(prior_end)
+        duration = _run_status.close_duration_ms(
+            row[1] if row else 0, row[0] if row else None, ended_at=ended_at,
+            updated_at=row[3] if row else None,
+            created_at=row[4] if row else None,
+            already_closed=prior_end is not None)
         con.execute(
             """
             UPDATE task_runs
@@ -461,10 +499,11 @@ def _writeback_terminal(
                    verdict = COALESCE(verdict, ?),
                    notes = COALESCE(notes || '; ', '') || ?,
                    updated_at = ?,
-                   ended_at = COALESCE(ended_at, ?)
+                   ended_at = COALESCE(ended_at, ?),
+                   duration_ms = ?
              WHERE id = ?
             """,
-            (status, verdict, notes, now, now, task_run_id),
+            (status, verdict, notes, now, now, duration, task_run_id),
         )
         con.commit()
     finally:
@@ -519,7 +558,9 @@ def _restore_status(
     had — clearing it there would make a settled run read as still running.
     The live write is also the attempt boundary: it clears the dead attempt's
     verdict and appends ``attempt <n> started`` so a revived run is not
-    diagnosed from the previous attempt's notes (RB-16).
+    diagnosed from the previous attempt's notes (RB-16). It KEEPS
+    ``duration_ms`` — that is the earlier attempts' accumulated active time,
+    and the terminal close adds only the current attempt's segment.
 
     ``drop_note`` names a breadcrumb the reversed gesture appended; it is
     removed in the same write so a close→undo→close cycle leaves exactly one.
@@ -552,8 +593,13 @@ def _restore_status(
                 marker = _attempt_boundary_note(
                     notes, prior_attempt=prior_attempt)
                 merged = f"{notes}; {marker}" if notes else marker
+                # ``duration_ms`` is KEPT: it is the earlier attempts'
+                # accumulated active time, and the close path adds only this
+                # attempt's segment. Zeroing it here lost it on a
+                # not-needed → undo cycle (reviewer finding on
+                # rbf-duration-20261020-224235).
                 assignments += ["verdict = NULL", "ended_at = NULL",
-                                "duration_ms = 0", "notes = ?"]
+                                "notes = ?"]
                 values.append(merged)
             elif drop_note is not None:
                 assignments.append("notes = ?")

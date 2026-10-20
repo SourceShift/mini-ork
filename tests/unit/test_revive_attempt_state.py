@@ -106,7 +106,9 @@ def test_live_status_write_clears_verdict_and_marks_attempt(tmp_path):
     set_status(db, RUN, "executing")
     assert _column(db, "verdict") is None
     assert _column(db, "ended_at") is None
-    assert _column(db, "duration_ms") == 0
+    # RB-33: a revive KEEPS the accumulated active time (attempt 1 ran 48 min);
+    # the terminal close adds only the new attempt's segment.
+    assert _column(db, "duration_ms") == 2880000
     segments = _segments(_column(db, "notes"))
     assert REAPED in segments  # history is appended to, never erased
     match = ATTEMPT_RE.match(segments[-1])

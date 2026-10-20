@@ -37,7 +37,7 @@ from typing import Any
 
 from mini_ork.dispatch.core import AGENT_PGIDS_FILE
 from mini_ork.remote.providers.base import clear_stale_run_lock
-from mini_ork.run_status import TERMINAL
+from mini_ork.run_status import TERMINAL, close_duration_ms
 
 PID_FILE = ".pid"
 # How long a stopped agent group gets to honour SIGTERM before SIGKILL.
@@ -245,13 +245,25 @@ def finalize_passed(db_path: str | Path, run_id: str, note: str, *, now: int | N
     con = sqlite3.connect(str(db_path), timeout=15.0)
     try:
         con.execute("PRAGMA busy_timeout = 15000")
+        # Same active-time arithmetic as every other close: accumulated time
+        # plus the segment since this attempt's marker (run_status helper), not
+        # ``ended_at - created_at``.
+        row = con.execute(
+            "SELECT notes, duration_ms, ended_at, updated_at, created_at "
+            "FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        prior_end = row[2] if row else None
+        ended_at = now if prior_end is None else int(prior_end)
+        duration = close_duration_ms(
+            row[1] if row else 0, row[0] if row else None, ended_at=ended_at,
+            updated_at=row[3] if row else None,
+            created_at=row[4] if row else None,
+            already_closed=prior_end is not None)
         cur = con.execute(
             "UPDATE task_runs SET status = 'published', notes = COALESCE(notes || '; ', '') || ?, "
             "updated_at = ?, ended_at = COALESCE(ended_at, ?), "
-            "duration_ms = CASE WHEN COALESCE(duration_ms, 0) = 0 "
-            "THEN MAX(COALESCE(ended_at, ?) - created_at, 0) * 1000 ELSE duration_ms END "
+            "duration_ms = ? "
             "WHERE id = ? AND status NOT IN ('published', 'failed', 'rolled_back')",
-            (note, now, now, now, run_id))
+            (note, now, now, duration, run_id))
         con.commit()
         return cur.rowcount == 1
     finally:
@@ -497,15 +509,27 @@ def _mark_failed(con: sqlite3.Connection, run_id: str, status: str, updated_at: 
     guard, params = "", ()
     if updated_at is not None:
         guard, params = " AND updated_at = ?", (updated_at,)
+    # The crash close must add the revived attempt's active segment it is
+    # reaping, not keep only the earlier attempts' accumulated time (the old
+    # CASE kept ``duration_ms`` untouched). ``ended_at`` is the moment the run
+    # provably stopped, so the segment ends there, not at ``now``.
+    row = con.execute(
+        "SELECT notes, duration_ms, ended_at, updated_at AS row_updated_at, "
+        "created_at FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+    prior_end = row[2] if row else None
+    duration = close_duration_ms(
+        row[1] if row else 0, row[0] if row else None, ended_at=ended_at,
+        updated_at=row[3] if row else None,
+        created_at=row[4] if row else None,
+        already_closed=prior_end is not None)
     cur = con.execute(
         "UPDATE task_runs SET status = 'failed', verdict = COALESCE(verdict, ?), "
         "notes = CASE WHEN ? = '' THEN notes ELSE COALESCE(notes || '; ', '') || ? END, "
         "updated_at = ?, "
         "ended_at = COALESCE(ended_at, ?), "
-        "duration_ms = CASE WHEN COALESCE(duration_ms, 0) = 0 "
-        "THEN MAX(COALESCE(ended_at, ?) - created_at, 0) * 1000 ELSE duration_ms END "
+        "duration_ms = ? "
         f"WHERE id = ? AND status = ?{guard}",
-        (verdict, note, note, now, ended_at, ended_at, run_id, status, *params))
+        (verdict, note, note, now, ended_at, duration, run_id, status, *params))
     con.commit()
     return cur.rowcount == 1
 

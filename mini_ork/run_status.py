@@ -27,6 +27,9 @@ fails that test rather than silently reading as in-flight on the board.
 """
 from __future__ import annotations
 
+import datetime as _dt
+import re as _re
+
 #: The statuses a run passes through while it is still moving.
 LIVE = frozenset({"classified", "planned", "executing", "verifying", "reviewing"})
 
@@ -98,3 +101,100 @@ def label(status: str | None) -> str:
     actually holds, which is the thing an operator can grep for.
     """
     return LABELS.get(status or "", status or "")
+
+
+#: ``attempt <n> started <UTC iso>`` — the marker a live-status write appends
+#: (``cli.execute.set_status`` / ``web.control._restore_status``) and the one
+#: place a close path can learn when the CURRENT attempt began.
+#:
+#: The stamp is matched as a timestamp, not ``\S+``: notes are ``"; "``-joined
+#: and an attempt is routinely followed by a mid-attempt breadcrumb
+#: (``impl_moved_base``, ``VERIFIER_NOT_EXECUTED``, …). ``\S+`` swallowed that
+#: separator's ``;``, the parse failed, and the close silently fell back to
+#: ``updated_at``/``created_at`` — the idle-gap bug again, through the back door.
+_ATTEMPT_MARKER = _re.compile(
+    r"attempt\s+(\d+)\s+started\s+"
+    r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))")
+
+
+def _marker_epoch(stamp: str) -> int | None:
+    """Parse a marker stamp (ISO 8601, ``Z`` or numeric offset) to epoch seconds."""
+    try:
+        parsed = _dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_dt.timezone.utc)
+    return int(parsed.timestamp())
+
+
+def attempt_start_epoch(notes, *, updated_at=None, created_at=None,
+                        ended_at=None):
+    """Epoch second at which the run's current attempt began.
+
+    The ``attempt <n> started <iso>`` marker in ``notes`` is authoritative when
+    present: the highest-numbered marker is the live attempt, and using it is
+    what keeps a revive's idle gap out of ``duration_ms``. Rows that predate
+    the marker fall back to ``updated_at`` (the last live write, which for a
+    pre-marker row is the closest thing to an attempt start) and then
+    ``created_at``.
+
+    A heartbeat stamped at or after ``ended_at`` is clamped to ``ended_at``, not
+    discarded: the row is read BEFORE the closing UPDATE, so equal timestamps
+    simply mean "this attempt began in the same second the run closed" — a
+    zero-length segment. Falling back to ``created_at`` there folds the run's
+    whole age (and every idle day) back in. Returns ``None`` when no timestamp
+    is available at all.
+    """
+    best_number, best_stamp = 0, None
+    for match in _ATTEMPT_MARKER.finditer(str(notes or "")):
+        stamp = _marker_epoch(match.group(2))
+        if stamp is None:
+            continue
+        number = int(match.group(1))
+        if number >= best_number:
+            best_number, best_stamp = number, stamp
+    if best_stamp is not None:
+        return best_stamp
+    if updated_at is not None:
+        updated_at = int(updated_at)
+        if ended_at is not None:
+            updated_at = min(updated_at, int(ended_at))
+        return updated_at
+    if created_at is not None:
+        return int(created_at)
+    return None
+
+
+def close_duration_ms(accumulated=0, notes=None, *, ended_at, updated_at=None,
+                      created_at=None, already_closed=False):
+    """The one terminal-close ``duration_ms``: accumulated + this attempt.
+
+    ``duration_ms`` is the run's ACTIVE time, not its age. A revive keeps the
+    time already accumulated (the live-status write no longer zeroes it), so a
+    terminal close adds ONLY the current attempt — ``ended_at`` minus the
+    attempt start from :func:`attempt_start_epoch` — instead of recomputing
+    ``ended_at - created_at`` and folding the idle gap in.
+
+    The result is capped at the row's wall age (``ended_at - created_at``): no
+    active-time sum can legitimately exceed it, so a legacy row whose
+    ``duration_ms`` was inflated by the old ``created_at`` formula must not be
+    handed a longer duration than it has existed.
+
+    ``already_closed`` guards a second close of the same attempt (the publisher,
+    the executor's finalizer and the reaper can all write one end): adding the
+    segment twice would inflate a run's active time.
+    """
+    accumulated = max(int(accumulated or 0), 0)
+    ended_at = int(ended_at)
+    if already_closed and accumulated:
+        return accumulated
+    start = attempt_start_epoch(
+        notes, updated_at=updated_at, created_at=created_at,
+        ended_at=ended_at)
+    if start is None:
+        return accumulated
+    duration = accumulated + max(ended_at - int(start), 0) * 1000
+    if created_at is not None:
+        duration = min(duration, max((ended_at - int(created_at)) * 1000, 0))
+    return max(duration, 0)

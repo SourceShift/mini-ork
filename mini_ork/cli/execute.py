@@ -2139,8 +2139,10 @@ def _attempt_boundary_note(notes, *, prior_attempt: bool) -> str:
 def set_status(db, run_id, new_status, *, dry_run=False):
     """Retrying task_runs status write; terminal states stamp ended_at + duration_ms.
 
-    A live status clears both instead: the row has not ended, and this call is
-    the per-attempt boundary (see the branch below).
+    A live status clears the end stamp and verdict instead: the row has not
+    ended, and this call is the per-attempt boundary. It KEEPS the accumulated
+    ``duration_ms`` so a revive does not lose the earlier attempts' active
+    time (see the branch below).
 
     Raises ``RuntimeError`` when the write cannot be made: after the retries for
     a locked/busy DB, at once for anything else (a missing table does not heal
@@ -2159,12 +2161,43 @@ def set_status(db, run_id, new_status, *, dry_run=False):
             try:
                 if new_status in terminal:
                     now = int(time.time())
+                    # ``duration_ms`` is the run's ACTIVE time. A revived row
+                    # arrives with its earlier attempts' time already
+                    # accumulated and no end stamp (the live branch below
+                    # preserves both), so the close must add only this
+                    # attempt — see run_status.close_duration_ms. The old
+                    # ``ended_at - created_at`` recompute folded in every idle
+                    # day between attempts (run-1792151796-92942: 66.7 h
+                    # reported for ~4.9 h of activity).
+                    columns = {info[1] for info in con.execute(
+                        "PRAGMA table_info(task_runs)").fetchall()}
+                    present = [c for c in ("notes", "duration_ms", "ended_at",
+                                           "updated_at", "created_at")
+                               if c in columns]
+                    row = con.execute(
+                        f"SELECT {', '.join(present)} FROM task_runs WHERE id = ?",
+                        (run_id,)).fetchone() if present else None
+                    data = dict(zip(present, row)) if row else {}
+                    prior_end = data.get("ended_at")
+                    ended_at = now if prior_end is None else int(prior_end)
+                    duration = _run_status.close_duration_ms(
+                        data.get("duration_ms") or 0, data.get("notes"),
+                        ended_at=ended_at,
+                        updated_at=data.get("updated_at"),
+                        created_at=data.get("created_at"),
+                        already_closed=prior_end is not None)
+                    assignments = ["status = ?", "updated_at = ?"]
+                    values = [new_status, now]
+                    if "ended_at" in columns:
+                        assignments.append("ended_at = COALESCE(ended_at, ?)")
+                        values.append(now)
+                    if "duration_ms" in columns:
+                        assignments.append("duration_ms = ?")
+                        values.append(duration)
+                    values.append(run_id)
                     con.execute(
-                        "UPDATE task_runs SET status = ?, updated_at = ?, ended_at = COALESCE(ended_at, ?), "
-                        "duration_ms = CASE WHEN COALESCE(duration_ms, 0) = 0 "
-                        "THEN MAX(COALESCE(ended_at, ?) - created_at, 0) * 1000 "
-                        "ELSE duration_ms END WHERE id = ?",
-                        (new_status, now, now, now, run_id))
+                        f"UPDATE task_runs SET {', '.join(assignments)} WHERE id = ?",
+                        values)
                 else:
                     # A live status means the run has not ended, so the row must
                     # carry no end stamp. This write is also the ATTEMPT boundary
@@ -2179,17 +2212,21 @@ def set_status(db, run_id, new_status, *, dry_run=False):
                     # run-1792059337-779 still read ``ended_at`` 2026-10-15
                     # 13:04:07 with the first attempt's 48m ``duration_ms`` after
                     # two revives, so an ``ended_at``-keyed monitor never saw the
-                    # recovery at all. ``duration_ms`` is reset with it (to 0,
-                    # the column is NOT NULL and that is the value the terminal
-                    # branch treats as "recompute from created_at") — leaving the
-                    # old value would pair a fresh ``ended_at`` with the previous
-                    # attempt's length. Same rule as
+                    # recovery at all.
+                    #
+                    # ``duration_ms`` is KEPT: it is accumulated active time,
+                    # and the terminal branch above adds only the segment since
+                    # this attempt's marker. Zeroing it here would lose the
+                    # earlier attempts (reviewer finding on
+                    # rbf-duration-20261020-224235: a revived run published at
+                    # 100000 instead of ~150000). Same rule as
                     # ``web.control._restore_status``.
                     # Some callers run against a task_runs stub older than the
                     # notes/verdict columns. Clear and stamp only what exists.
                     columns = {info[1] for info in con.execute(
                         "PRAGMA table_info(task_runs)").fetchall()}
-                    present = [c for c in ("notes", "verdict", "ended_at")
+                    present = [c for c in ("notes", "verdict", "ended_at",
+                                           "duration_ms", "updated_at")
                                if c in columns]
                     row = con.execute(
                         f"SELECT {', '.join(present)} FROM task_runs WHERE id = ?",
@@ -2197,6 +2234,22 @@ def set_status(db, run_id, new_status, *, dry_run=False):
                     data = dict(zip(present, row)) if row else {}
                     prior_attempt = (data.get("verdict") is not None
                                      or data.get("ended_at") is not None)
+                    # A REVIEW PARK is a live write that does not close the
+                    # attempt: ``reviewing`` updates ``updated_at`` and keeps
+                    # the row live, and the approve path re-enters here with
+                    # ``executing``. That row still carries the previous
+                    # attempt marker and the accumulated time stops at the
+                    # marker, so the park's active segment — marker start to
+                    # the park write — would otherwise be lost (a close right
+                    # after the resume measured 0 ms). Fold it in before the
+                    # new marker starts the next attempt.
+                    carry_ms = 0
+                    if (new_status == "executing"
+                            and data.get("ended_at") is None):
+                        start = _run_status.attempt_start_epoch(data.get("notes"))
+                        last_write = data.get("updated_at")
+                        if start is not None and last_write is not None:
+                            carry_ms = max(int(last_write) - int(start), 0) * 1000
                     assignments = ["status = ?", "updated_at = ?"]
                     values = [new_status, int(time.time())]
                     if "verdict" in columns:
@@ -2204,7 +2257,8 @@ def set_status(db, run_id, new_status, *, dry_run=False):
                     if "ended_at" in columns:
                         assignments.append("ended_at = NULL")
                     if "duration_ms" in columns:
-                        assignments.append("duration_ms = 0")
+                        assignments.append("duration_ms = COALESCE(duration_ms, 0) + ?")
+                        values.append(carry_ms)
                     # One marker per execute pass: only the transition into
                     # ``executing`` starts an attempt. A review park
                     # (``reviewing``) is the same attempt and must not count.

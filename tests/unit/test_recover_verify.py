@@ -1106,7 +1106,10 @@ def test_a_revive_restamps_the_end_and_reconciles_the_cost(
     assert status == "published", row
     # The revival's own end, not attempt 1's.
     assert ended_at > attempt_one + 2910, row
-    assert duration_ms == (ended_at - attempt_one) * 1000, row
+    # RB-33: active time, not the two-day idle gap — attempt 1's 2910 s plus
+    # the (short) revived attempt's own segment.
+    assert 2910000 <= duration_ms <= 2910000 + 120_000, row
+    assert duration_ms < (ended_at - attempt_one) * 1000, row
     assert abs(cost_usd - 7.002127) < 1e-6, row
 
 

@@ -31,6 +31,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from mini_ork import run_status as _run_status
 from mini_ork.context import apply_env_overrides, context_env
 from mini_ork.dispatch.predicates import looks_like_json_text
 
@@ -353,9 +354,24 @@ def _mark_failed(db, run_id, verdict):
     try:
         con = sqlite3.connect(db, timeout=5)
         con.execute("PRAGMA busy_timeout=5000")
+        # RB-33: a plan-stage failure must stamp ACTIVE time, not leave
+        # ``duration_ms = 0`` (run-1792076652-70170 and two siblings). Same
+        # shared close arithmetic every other terminal path uses.
+        row = con.execute(
+            "SELECT notes, duration_ms, ended_at, updated_at, created_at "
+            "FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        prior_end = row[2] if row else None
+        # A second close keeps the stamp the first one wrote; ``now`` here is
+        # only the moment this failure was observed, not the run's end.
+        ended_at = now if prior_end is None else int(prior_end)
+        duration = _run_status.close_duration_ms(
+            row[1] if row else 0, row[0] if row else None, ended_at=ended_at,
+            updated_at=row[3] if row else None,
+            created_at=row[4] if row else None,
+            already_closed=prior_end is not None)
         con.execute("UPDATE task_runs SET status='failed', verdict=COALESCE(verdict, ?), "
-                    "updated_at=?, ended_at=COALESCE(ended_at, ?) WHERE id=?",
-                    (legal, now, now, run_id))
+                    "updated_at=?, ended_at=COALESCE(ended_at, ?), duration_ms=? WHERE id=?",
+                    (legal, now, now, duration, run_id))
         if reason:
             message = _first_plan_stage_error(con, run_id)
             note = f"{reason}: {message}" if message else reason

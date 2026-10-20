@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 
+from mini_ork import run_status as _run_status
 from mini_ork.context import context_env, publish_env
 from mini_ork.runtime.run_roots import load_run_roots
 from mini_ork.verify import levels as _levels
@@ -319,13 +320,25 @@ def _mark_published(db, run_id):
     try:
         con.execute("PRAGMA busy_timeout = 15000")
         con.execute("PRAGMA journal_mode=WAL")
+        # RB-33/reviewer: the close adds only the CURRENT attempt's segment to
+        # the accumulated ``duration_ms``. The old ``ended_at - created_at``
+        # recompute dropped a revived run's final attempt (100000 instead of
+        # ~150000 on rbf-duration-20261020-224235).
+        row = con.execute(
+            "SELECT notes, duration_ms, ended_at, updated_at, created_at "
+            "FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        prior_end = row[2] if row else None
+        ended_at = now if prior_end is None else int(prior_end)
+        duration = _run_status.close_duration_ms(
+            row[1] if row else 0, row[0] if row else None, ended_at=ended_at,
+            updated_at=row[3] if row else None,
+            created_at=row[4] if row else None,
+            already_closed=prior_end is not None)
         con.execute(
             "UPDATE task_runs SET status = 'published', verdict = 'APPROVE', "
             "updated_at = ?, ended_at = COALESCE(ended_at, ?), "
-            "duration_ms = CASE WHEN COALESCE(duration_ms, 0) = 0 "
-            "THEN MAX(COALESCE(ended_at, ?) - created_at, 0) * 1000 "
-            "ELSE duration_ms END WHERE id = ?",
-            (now, now, now, run_id))
+            "duration_ms = ? WHERE id = ?",
+            (now, now, duration, run_id))
         con.commit()
         row = con.execute(
             "SELECT status, verdict FROM task_runs WHERE id = ?", (run_id,)).fetchone()

@@ -379,6 +379,9 @@ def _seed_task_run(db, rid="r1", status="planned", cost=0.0):
 def test_set_status_parity(tmp_path):
     db_p = _seed_db(tmp_path, "ssp")
     _seed_task_run(db_p)
+    # No attempt marker: the active segment starts at updated_at (RB-33), so
+    # seed it at creation to model a run that worked for the whole minute.
+    _sql(db_p, "UPDATE task_runs SET updated_at=created_at WHERE id='r1';")
     ex.set_status(db_p, "r1", "published")
     q = "SELECT status, ended_at IS NOT NULL AND ended_at>0, duration_ms>0 FROM task_runs WHERE id='r1';"
     assert _sql(db_p, q).stdout.strip() == "published|1|1"   # terminal stamps ended_at + duration
@@ -395,7 +398,9 @@ def test_set_status_parity(tmp_path):
     _sql(db_p, "UPDATE task_runs SET ended_at=111, duration_ms=222 WHERE id='r5';")
     ex.set_status(db_p, "r5", "executing")
     q5 = "SELECT status, ended_at IS NULL, duration_ms FROM task_runs WHERE id='r5';"
-    assert _sql(db_p, q5).stdout.strip() == "executing|1|0"
+    # ...while KEEPING the accumulated active time (RB-33): the next terminal
+    # close adds only the new attempt's segment to the 222 already recorded.
+    assert _sql(db_p, q5).stdout.strip() == "executing|1|222"
 
 
 def test_charge_node_cost_parity(tmp_path):
