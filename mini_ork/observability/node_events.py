@@ -64,12 +64,18 @@ __all__ = [
 _DEFAULT_EXTRA_JSON = "{}"
 
 
-# Mirrors lib/mo_node_events.sh:56
+# Mirrors lib/mo_node_events.sh:56 (the MINI_ORK_NO_CWD_DB guard is
+# Python-only; the bash half was retired in the 2026-07 bash removal.)
 def _resolve_db() -> str | None:
     """Return the state.db path the bash script would pick, or None if missing.
 
     Resolution order (mirrors bash line 56):
       $MINI_ORK_DB → $MINI_ORK_HOME/state.db → $(pwd)/.mini-ork/state.db
+    The cwd fallback is disabled when ``MINI_ORK_NO_CWD_DB == "1"``: it then
+    returns None, which callers already treat as the silent no-op. Tests set
+    that flag (RBF-27/RB-27) so a pytest run started from the operator's
+    checkout can never resolve — and write — the live `.mini-ork/state.db`.
+    The flag gates *only* the cwd arm; an explicit env DB always wins.
     Returns None when the resolved path does not exist (caller must mirror
     bash's silent no-op in `mo_node_emit`).
     """
@@ -79,6 +85,8 @@ def _resolve_db() -> str | None:
     home = os.environ.get("MINI_ORK_HOME")
     if home:
         return os.path.join(home, "state.db")
+    if os.environ.get("MINI_ORK_NO_CWD_DB") == "1":
+        return None
     return os.path.join(os.getcwd(), ".mini-ork", "state.db")
 
 

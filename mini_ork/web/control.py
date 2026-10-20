@@ -830,6 +830,11 @@ def launch_run(
     env = dict(os.environ)
     env["MINI_ORK_RUN_ID"] = rid
     env["MINI_ORK_HOME"] = str(home)
+    # Every DB resolver prefers MINI_ORK_DB over MINI_ORK_HOME, so setting only
+    # the home left the child free to fall back to $(pwd)/.mini-ork/state.db —
+    # the operator's live DB when the server runs from their checkout (RBF-27).
+    # Pin the child to the same file its home already implies.
+    env["MINI_ORK_DB"] = str(Path(home) / "state.db")
     # bin/mini-ork prefers MINI_ORK_PROJECT_HOME over MINI_ORK_HOME, and the
     # parent's value is whatever ITS cwd implied — e.g. <linked worktree>/.mini-ork,
     # which does not exist. Pin both to the home this run belongs to.

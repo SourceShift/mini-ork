@@ -100,6 +100,24 @@ def _catalog(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.fixture(autouse=True)
+def _stub_launch_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never start a real ``bin/mini-ork run`` from a ``/run`` prompt (RBF-27).
+
+    Every protocol test below drives ``/run`` only to reach the follower, and
+    the launcher seam was left at its default: each one spawned a REAL detached
+    ``code-fix`` against the tmp home (audit found 157 LLM calls / $1.51 for
+    ``run-lane-1``). The three ``MO_RUN_OWNER`` tests re-patch ``launch_run``
+    themselves — a later ``setattr`` wins over this default — so their env
+    assertions still exercise the real ``_launch`` wiring.
+    """
+
+    def fake_launch_run(home, recipe, kickoff_text, *, run_id=None, extra_env=None):
+        return {"ok": True, "run_id": run_id or "run-stub"}
+
+    monkeypatch.setattr("mini_ork.web.control.launch_run", fake_launch_run)
+
+
 def _text_block(text: str) -> TextContentBlock:
     return TextContentBlock(type="text", text=text)
 
@@ -208,6 +226,20 @@ class _Conn:
         ]
 
 
+async def _fake_orchestrator_turn(**_kwargs: Any) -> None:
+    """Narration/orchestrate turns are no-ops (RBF-27).
+
+    ``_narrate`` spends an orchestrator turn whenever a followed run reaches a
+    stage boundary, and its default seam is ``harness.run_turn`` — a REAL
+    ``claude --print`` subprocess. Left injected as nothing, a lane-repair test
+    that follows a failing run starts an agent turn ($ + minutes, and under a
+    full operator env it can outlive the suite's timeout). Nothing in this file
+    asserts narration output, so returning None (which ``_narrate`` treats as
+    "turn did nothing") is the hermetic seam.
+    """
+    return None
+
+
 def _new_thread_agent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **ctor_kwargs: Any
 ) -> tuple[MiniOrkAcpAgent, Path, str]:
@@ -221,6 +253,7 @@ def _new_thread_agent(
     # post-resume wait has its own (monkeypatched) clock — see
     # ``_fast_lane_repair``.
     ctor_kwargs.setdefault("start_timeout", 0.05)
+    ctor_kwargs.setdefault("orchestrator_turn", _fake_orchestrator_turn)
     agent = MiniOrkAcpAgent(**ctor_kwargs)
     resp = asyncio.run(agent.new_session(cwd=str(proj)))
     asyncio.run(agent.set_config_option("workspace", resp.session_id, "in-place"))

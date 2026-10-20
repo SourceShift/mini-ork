@@ -29,6 +29,14 @@ import pytest
 
 from scratch_prune import prune_stale_basetemps
 
+# RBF-27 / RB-27: the pops below close `MINI_ORK_DB`/`MINI_ORK_HOME`, but that
+# alone leaves node_events' `$(pwd)/.mini-ork/state.db` fallback live — running
+# pytest from the operator's checkout made that the LIVE DB and leaked ~1,900
+# `remote.*` events for 90 orphan run_ids into it. Set at import (before the
+# per-test env snapshot) so the flag holds for the whole session; the autouse
+# fixture restores it along with everything else it snapshots.
+os.environ["MINI_ORK_NO_CWD_DB"] = "1"
+
 # Basetemps untouched this long belong to no live session (see scratch_prune).
 _STALE_BASETEMP_AGE_S = 3 * 60 * 60
 
