@@ -931,6 +931,9 @@ def _gen_profile_or_reuse(kickoff, root, recipe, task_class, profile_path, agent
     re-block it, so the profile gate would never pass. A fresh run has no
     ``run_profile.json`` yet and always generates.
     """
+    # Under a rehearsal both the reuse read and the generate write target the
+    # dry-run sibling, so a dry run never touches the live profile.
+    profile_path = _profile_path(profile_path)
     try:
         existing = json.load(open(profile_path, encoding="utf-8"))
     except Exception:
@@ -1004,6 +1007,48 @@ def _execute_log_name() -> str:
     return ("execute.dryrun.log"
             if os.environ.get("MINI_ORK_DRY_RUN", "0") == "1"
             else "execute.log")
+
+
+def _profile_path(profile_path) -> str:
+    """The profile a run writes and reads: the dry-run sibling under a rehearsal.
+
+    A nested dry run that inherited the live run's id used to regenerate the
+    live ``run_profile.json`` from a different (pytest tmp) kickoff, so the
+    parent's declared verification commands vanished. A rehearsal gets
+    ``run_profile.dryrun.json`` and never opens the live profile; readers
+    inside the same dry run resolve the same sibling, symmetric with
+    ``_execute_log_name``.
+    """
+    path = Path(profile_path)
+    if (os.environ.get("MINI_ORK_DRY_RUN", "0") == "1"
+            and path.name == "run_profile.json"):
+        return str(path.with_name("run_profile.dryrun.json"))
+    return str(path)
+
+
+def _resolve_run_id(inherited_id: str, home, *, pid: int) -> tuple[str, int | None]:
+    """Resolve an inherited ``MINI_ORK_RUN_ID`` against its live-process claim.
+
+    Returns ``(resolved_id, live_pid)``. When ``<home>/runs/<inherited_id>/.pid``
+    names a live process other than ``pid``, that process owns the run and a
+    fresh ``run-<ts>-<pid>`` is minted (``live_pid`` is the owner). An inherited
+    id whose ``.pid`` is absent, unreadable, or dead is adopted unchanged —
+    operators set ``MINI_ORK_RUN_ID`` deliberately, so only a demonstrably live
+    foreign owner overrides it.
+    """
+    if not inherited_id:
+        return "", None
+    try:
+        from mini_ork.orchestration.run_reaper import _pid_alive, _read_pids
+
+        pid_path = Path(home) / "runs" / inherited_id / ".pid"
+        written_at = pid_path.stat().st_mtime
+        for owner in _read_pids(pid_path):
+            if owner != pid and _pid_alive(owner, written_at):
+                return f"run-{int(time.time())}-{pid}", owner
+    except Exception:  # noqa: BLE001 — an unreadable claim falls back to adoption
+        pass
+    return inherited_id, None
 
 
 def _run_lifecycle(argv, root) -> int:
@@ -1559,7 +1604,26 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
     os.environ["MINI_ORK_WORKFLOW"] = os.path.join(rbase, "recipes", recipe, "workflow.yaml")
     if not os.path.isfile(kickoff):
         sys.stderr.write(f"kickoff not found: {kickoff}\n"); return 2
-    run_id = os.environ.setdefault("MINI_ORK_RUN_ID", f"run-{int(time.time())}-{os.getpid()}")
+    # Adopt an inherited id only when its `.pid` claim is absent or dead. A live
+    # foreign owner means this is a nested run (a test, or an embedder spawning
+    # `mini-ork run` from inside a run); minting a fresh id keeps the live run's
+    # dir and profile from being overwritten by a rehearsal of a different
+    # kickoff (audit RB-04).
+    _id_home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
+    _inherited_id = os.environ.get("MINI_ORK_RUN_ID") or ""
+    run_id, _live_owner = (
+        _resolve_run_id(_inherited_id, _id_home, pid=os.getpid())
+        if _inherited_id
+        else (f"run-{int(time.time())}-{os.getpid()}", None)
+    )
+    if _live_owner is not None:
+        publish_env({"MINI_ORK_RUN_ID": run_id, "MINI_ORK_RUN_DIR": None})
+        sys.stderr.write(
+            f"[run] inherited run id {_inherited_id} belongs to live pid "
+            f"{_live_owner}; using {run_id}\n"
+        )
+    else:
+        os.environ["MINI_ORK_RUN_ID"] = run_id
     sink["run_id"] = run_id
     # Name the protection gap once, and only when the vault chain changes:
     # values resolving in the clear is the legitimate zero-setup tier, but the
@@ -1734,7 +1798,7 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
     # the child sees the run's own policy, and before any node runs so the
     # first stall is observed. Best-effort in both directions.
     _start_orchestrator_watch(root, home, run_id, run_dir)
-    profile_path = os.path.join(run_dir, "run_profile.json")
+    profile_path = _profile_path(os.path.join(run_dir, "run_profile.json"))
     os.environ["MINI_ORK_PROFILE_PATH"] = profile_path
 
     if deadline and int(deadline) > 0:

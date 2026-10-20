@@ -207,6 +207,13 @@ class MiniOrk:
 
     def _base_env(self, cwd: Path) -> dict[str, str]:
         env = os.environ.copy()
+        # The caller's run identity must not leak into a spawned run: a nested
+        # `mini-ork run` would adopt the parent's id and write into the LIVE run
+        # dir (audit RB-04). A caller that deliberately wants a nested run to
+        # inherit identity passes it through ``request.extra_env``, which
+        # ``_env``/``spawn`` apply after this base.
+        env.pop("MINI_ORK_RUN_ID", None)
+        env.pop("MINI_ORK_RUN_DIR", None)
         env["MINI_ORK_ROOT"] = str(self.root)
         env.setdefault("MINI_ORK_NO_COLOR", "1")
         env["MINI_ORK_HOME"] = str(self._home_for(cwd))
