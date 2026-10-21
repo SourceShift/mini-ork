@@ -1,5 +1,9 @@
 # mini-ork engine bugs found in the runs of 2026-10-13 .. 2026-10-20
 
+> **Update 2026-10-21:** every bug below (RB-01..RB-47) and the three found while fixing them
+> (RB-48..RB-50) is fixed on `main` — see [Fix status](#fix-status-campaign-2026-10-20).
+> The Status column in the summary table reflects the state at audit time.
+
 Audit of every `task_runs` row created in the 7 days to 2026-10-20 (171 runs, $338.63 recorded spend),
 read against its run dir (`execute.log`, verdict files, verifier logs, attempt ledgers, agent streams),
 `run_events`, `node_attempts`, `llm_calls`, `execution_traces`, `mo_inbox_gates` and the guard logs.
@@ -696,6 +700,80 @@ actually failed. Each case sends the operator, and auto-repair, to the wrong fix
   These are recipe-level problems, not engine ones.
 
 ---
+
+## Fix status (campaign 2026-10-20)
+
+Every bug above was fixed at the source by a mini-ork `framework-edit` run (one
+worktree per kickoff, implementer minimax, lenses glm/deepseek_flash, reviewer
+opus), reviewed by the coordinator, merged through `make worktree-merge` with a
+gate of every unit test that references the changed module. Kickoffs, launcher,
+merge queue and per-run logs: `/Volumes/docker-ssd/ps/mo-kickoffs/run-bugs-20261020/`
+(tracker `CAMPAIGN.md`). "Fix-forward" rows are coordinator corrections of a
+campaign merge found during later review.
+
+| Bug | Fix commit(s) on main | Notes |
+|---|---|---|
+| RB-01 | 83421eaa | named-but-missing target fails closed; engine target needs MO_ALLOW_FRAMEWORK_CWD=1 |
+| RB-02 | 673daa53, 445f5f91 (fix-forward), 64275077, b2814a35 | a: verifier `pass:false` fails its node (declared non-judgements keep rc); b: levels read the fe test envelope; c: run verdict + publisher refuse `pass:false` |
+| RB-03 | d4338e11, bba8ab01 | recover child drops MINI_ORK_PLAN_PATH; a positional plan beats an inherited one |
+| RB-04 | d4b26138 | nested run never adopts a live run id; dry-run writes run_profile.dryrun.json |
+| RB-05 | 50b4d7c2 | baseline sealed under `<home>/state/seals/`; rubric ignores verifier files with no node_end |
+| RB-06 | 469d017c | recover restores the recorded placement (`runtime/placement_env.py`) |
+| RB-07 | f3c9eb78 | `.pid` decides liveness even with the remote marker; reap releases nodes. Live: reaped run-1792400538-82050 and released its Daytona node |
+| RB-08 | 56ad7fb8, 469d017c, 4bec0cb3 (fix-forward) | in-DAG prompt-bearing planner/reflector nodes run their prompts (root `planner` stays the lifecycle no-op); recover refuses a run with no plan.json |
+| RB-09 | 87a52760 | only explicit-section commands execute; prose → `verification_hints` |
+| RB-10 | 8d28c247 | crashes classified by exception type; crash rows never feed the fuse |
+| RB-11 | a942cbf9, e731dc7c, 1fa562a8 | escalation / shape / non-gating cases; actor-neutral moved-HEAD message with reflog; diagnose ignores pre-revive notes |
+| RB-12 | 9ce327e0 | static-check `scope-respected` gates an ONLY scope |
+| RB-13 | 0e0c9bd4 | verifiers pin `artifact_sha256`; publisher refuses a changed diff |
+| RB-14 | b2814a35 | a publish that committed nothing ends failed with a note; reviewer-less recipes approve on passing verifiers |
+| RB-15 | ea0c69c2 | partial verify → failure trace, reward 0.5 |
+| RB-16 | 1fa562a8 | revive clears verdict, stamps `attempt <n> started` (only on → executing), overwrites run verdict, archives stale markers, refreshes panel score |
+| RB-17 | c7217113, 60de1f6f (fix-forward) | gates settle on publish (`rejected`, note `superseded: …` — never a CHECK bypass); auto-repair never re-parks a review-gated run. Backfill: 10 stale gates of published runs settled 2026-10-20 |
+| RB-18 | d5fb9bf3 | only a real verdict revises; satisfied base → not_needed; spec-test defect escalates |
+| RB-19 | c7217113 | repair budget compares spend since the first repair |
+| RB-20 | 26717cdf, c36418e9 | post-run reflect scoped to the run, detached, own deadline; bound from post-run passes, cap 3600 s; themes upsert |
+| RB-21 | be27fb4d | bounded post-kill reap; wall-clock spawned→kill / kill→reaped in the timeout text |
+| RB-22 | 2088182f, 8d28c247 | remote outage → retryable `remote_unavailable`; missing cwd fails once as config |
+| RB-23 | cbc6088b | lane preflight probes only LLM-dispatching nodes |
+| RB-24 | 3f5c3190 | fuse keyed by placement; pre-spawn guards never strike |
+| RB-25 | e0906db0 | reaper stops recorded agent process groups (keeper shim); hints drop stream JSON |
+| RB-26 | 71aa5c54 | absolute PYTHONPATH, pinned interpreter, base re-run → base-fails abstention, glob de-dupe |
+| RB-27 | fcf07c68 | MINI_ORK_NO_CWD_DB in tests; spawn_run exports MINI_ORK_DB; ACP tests stub launch_run + narration |
+| RB-28 | b2814a35 | a real publish writes verdict APPROVE |
+| RB-29 | 39016f35 | node_attempts row per attempt (attempt_no, result, failure_class, cost) |
+| RB-30 | 85672b8f | failed runs note their failed nodes / first planner error; reaper reads nested hint detail |
+| RB-31 | ca261195 | execute.log streamed; recover writes execute.recover-<n>.log |
+| RB-32 | 0438ab65, 58c13c66, 26717cdf | no phantom $0.05; rejected-attempt spend recorded; late reflect spend reconciled |
+| RB-33 | 39016f35 (retry node_start), 3da373d2 | kill / plan-stage / revive / all close paths compute active time from attempt markers |
+| RB-34 | ffd0bef5 | per-node ordered pairing; finish_reason mapped onto the CHECK vocabulary |
+| RB-35 | b7f38e62 | verifier_results retry + spool on a locked DB |
+| RB-36 | 64275077 | bare `{"pass": false}` envelope reads REFUTED |
+| RB-37 | edb72a48 | repairs → plan-repair-<n>.raw.txt |
+| RB-38 | edb72a48 | classify writes rows only inside a live run (incl. the lifecycle's dry-run probe) |
+| RB-39 | d0983312 | stream reads run_events; fuse columns and failure_memory written (run_detail keeps its legacy mo_events bridge) |
+| RB-40 | 5f53fb05 | reversion guard skips gitlinks; no repeat no-op heals |
+| RB-41 | 5f53fb05 | post-run work runs as node `post-run`; tests reset the run-context ContextVar |
+| RB-42 | b7f38e62 | dispatch timeout capped at the armed run deadline |
+| RB-43 | bba8ab01 | bytecode excluded from implementer changes / diffstat |
+| RB-44 | 9a64101d | dirty-engine check before provisioning |
+| RB-45 | f3c9eb78 | reaper timestamps UTC `Z` |
+| RB-46 | edb72a48 | `keep_judge_reports_discard_synthesis` implemented |
+| RB-47 | edb72a48 | wave aggregate verdict pass/fail/in_progress |
+
+### Found during the campaign
+
+| Bug | Sev | Fix | Summary |
+|---|---|---|---|
+| RB-48 | P1 | 9a64101d | 64a3426c (2026-10-19) defaults a bare run to the configured Daytona profile; remote placement dirty-checked the ENGINE tree on every dispatch, so every self-edit run's reviewer was refused (`engine tree … is dirty`) — all 7 first campaign runs. Engine sha now pinned once per run; self-edit runs stay local by default. |
+| RB-49 | P2 | 3da373d2 | `board kill` released only session-marker resources; a Daytona run node in `.node-provider.json` survived until TTL (3 campaign kills, released by hand). |
+| RB-50 | P3 | d7bd608b | `sandbox-gc --backend all` imported the Daytona SDK without credentials; `test_fresh_process_sandbox_gc_all_sweeps_lazy_providers` was red (pre-campaign) wherever the SDK is installed. |
+
+Environmental, not engine: `tests/unit/test_acp_commands.py::test_serve_down_returns_command`
+fails while an operator `mini-ork serve` listens on :7090 (the test probes the real port).
+CI follow-ups (2026-10-21): 8d6e7e86 (RB-30 note test vs RB-16 marker) and 2a9e7ac7 (retryable-set parity pin) fixed the two CI failures the campaign's tests/unit-only gates missed.
+Open operator item: `hr-smoke-b-152611` is still parked on human review gate 45 (a
+leftover of RB-17's re-park bug; resolving the gate is the operator's call).
 
 ## Fixed during the window
 Each of these was hit by a run this week and is now on `origin/main`. Every SHA was checked with
