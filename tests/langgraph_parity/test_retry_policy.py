@@ -323,6 +323,9 @@ def test_retryable_set_is_well_known():
     assert RETRYABLE_FINISH_REASONS == frozenset({
         "timeout", "infra_interrupt", "provider_limit", "network",
         "overloaded", "rate_limited", "killed", "sigterm", "rc_137", "rc_143",
+        # RB-22a (2088182f): a remote node-agent outage is transport, retried
+        # with a flat backoff — never a verdict about the change.
+        "remote_unavailable",
     })
 
 
