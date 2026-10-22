@@ -104,6 +104,7 @@ _NATIVE_MODULE_SUBS = {
     "cn": "mini_ork.cli.cn_cmd",
     "board": "mini_ork.cli.board_cmd",
     "gate-fuzz": "mini_ork.cli.gate_fuzz",
+    "graph-patch": "mini_ork.cli.graph_patch",
     "memory-lifecycle": "mini_ork.cli.memory_lifecycle",
     "prefs": "mini_ork.cli.prefs_cmd",
     "lessons": "mini_ork.cli.lessons_cmd",
@@ -174,6 +175,9 @@ Lifecycle:
   garden                         Drift detection (collisions, orphans, stale runs)
   supervise [--once]             Sweep parked self-driving runs: revive when the
                                    fix landed, label diagnoses, clear orphans
+  graph-patch list|propose|validate|apply|credit
+                                 Typed, immutable run-graph edits applied
+                                   through `recover --workflow`
   verifier list|annotate         Inspect verifier results and label false
                                    positives/negatives (abstain-gate calibration)
   recipe-eval                    Static evaluation of recipe definitions

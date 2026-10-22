@@ -5425,6 +5425,27 @@ def _orchestrator_act(run_dir, db, run_id, outcomes, retry_edges, *, revision_st
                     # fail-count bookkeeping a re-queue requires. Surface the
                     # exact node set rather than re-queueing from here.
                     proposal["reset_descendants"] = sorted(control_descendants(node_id))
+                # SDE-5a: persist the proposed mutation as a typed graph patch
+                # (applied later through `recover --workflow`). Best-effort and
+                # locally guarded: the outer handler is wave-scoped, so a raise
+                # here would silently cost every later node its action.
+                try:
+                    from mini_ork.recovery import graph_patch
+
+                    patch_kind = ("rerun"
+                                  if proposal.get("effective_locus") == "verifier"
+                                  else "replan")
+                    patch_number = graph_patch.propose(run_dir, {
+                        "kind": patch_kind,
+                        "from_node": node_id,
+                        "reason": action.reason,
+                        "source": "orchestrator",
+                    })
+                    if patch_number is not None:
+                        proposal["graph_patch"] = patch_number
+                except Exception as exc:  # noqa: BLE001 — proposal never blocks the run
+                    print(f"[orchestrator] graph patch propose skipped: {exc}",
+                          file=sys.stderr)
                 mo_node_emit(run_id, node_id, node_type,
                              "orchestrator.mutate.proposed",
                              json.dumps(proposal), db=db)
