@@ -67,6 +67,92 @@ def _recipe_dir(task_class: str) -> str | None:
     return None
 
 
+# ── per-recipe probe config ─────────────────────────────────────────────────
+#
+# The global MO_APPLY_PROBE_* defaults fit the small code-fix probes; a
+# framework-edit run costs $3-12 and takes 20-60 minutes, so its probe set
+# needs its own budget/timeout. A recipe may ship
+# ``probes/probe-config.yaml`` with any of the four knobs below; those values
+# become the DEFAULTS for that recipe, and an explicitly set env var still
+# wins. A config that exists but does not parse (or carries a non-numeric
+# value) FAILS CLOSED with ValueError naming the file — silently falling back
+# to the $2 global would score a real run against an impossible budget.
+
+_PROBE_CONFIG_KEYS = ("budget_usd", "timeout_s", "control_n", "max_tasks")
+
+
+def _probe_config(recipe: str | None) -> dict:
+    """The parsed ``probes/probe-config.yaml`` for a recipe dir, or ``{}``.
+
+    Raises ``ValueError`` naming the file when it exists but cannot be parsed
+    or holds a non-numeric value — never falls back to the global default.
+    """
+    if not recipe:
+        return {}
+    path = os.path.join(recipe, "probes", "probe-config.yaml")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        import yaml  # deferred: keeps module import cheap
+        with open(path, encoding="utf-8") as fh:
+            data = yaml.safe_load(fh)
+    except Exception as exc:  # malformed YAML, unreadable file, ...
+        raise ValueError(
+            f"probe config {path} does not parse: {exc}") from exc
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"probe config {path} must be a mapping, got {type(data).__name__}")
+    resolved: dict = {}
+    for key in _PROBE_CONFIG_KEYS:
+        if key not in data or data[key] is None:
+            continue
+        value = data[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                f"probe config {path} has non-numeric {key}: {value!r}")
+        resolved[key] = value
+    return resolved
+
+
+def _recipe_config(recipe_name: str) -> dict:
+    """Config for ``recipe_name``, following probe-arm temp-copy names back to
+    the recipe they were copied from.
+
+    ``_materialize_arm`` runs directive arms as
+    ``<recipe>__probe_<pid>_<idx>`` and strips the copy's ``probes/`` dir so a
+    nested scorer cannot re-discover the probe set. Its config lives in that
+    stripped directory, so resolve the original recipe's config instead.
+    """
+    recipe = _recipe_dir(recipe_name)
+    config = _probe_config(recipe)
+    if config or recipe is None:
+        return config
+    base = re.sub(r"__probe_\d+_\d+$", "", os.path.basename(recipe))
+    if base == os.path.basename(recipe):
+        return config
+    return _probe_config(_recipe_dir(base))
+
+
+def _probe_setting(recipe_name: str, env_name: str, config_key: str,
+                   default: float, *, as_int: bool = False) -> float | int:
+    """Resolve one probe knob: explicit env > recipe config > global default.
+
+    A malformed env value keeps the historical silent fallback to the global
+    default; only the config file fails closed (see ``_probe_config``).
+    """
+    raw = os.environ.get(env_name)
+    if raw is not None:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = float(default)
+    else:
+        value = float(_recipe_config(recipe_name).get(config_key, default))
+    return max(1, int(value)) if as_int else value
+
+
 def _parse_probe_frontmatter(path: str) -> dict:
     """YAML frontmatter at the top of a probe kickoff, or ``{}`` when absent.
 
@@ -127,10 +213,8 @@ def _load_probes(task_class: str) -> list[tuple[str, bool]]:
         path = os.path.join(probes_dir, name)
         is_anchor = bool(_parse_probe_frontmatter(path).get("anchor"))
         pairs.append((path, is_anchor))
-    try:
-        cap = max(1, int(os.environ.get("MO_APPLY_PROBE_MAX_TASKS", "2")))
-    except ValueError:
-        cap = 2
+    cap = int(_probe_setting(task_class, "MO_APPLY_PROBE_MAX_TASKS",
+                             "max_tasks", 2, as_int=True))
     gate = [pr for pr in pairs if not pr[1]][:cap]
     anchors = [pr for pr in pairs if pr[1]]
     return gate + anchors
@@ -280,10 +364,8 @@ def _launch_run(recipe_name: str, kickoff: str,
     caller must never score a run it cannot identify.
     """
     framework_root = _root()
-    try:
-        timeout_s = float(os.environ.get("MO_APPLY_PROBE_TIMEOUT_S", "600"))
-    except ValueError:
-        timeout_s = 600.0
+    timeout_s = float(_probe_setting(recipe_name, "MO_APPLY_PROBE_TIMEOUT_S",
+                                     "timeout_s", 600.0))
     # MO_STATIC_RECIPE_PLAN freezes planning: the probe measures the EXECUTION
     # effect of the directive, not the planner's mood. A stochastic planner
     # shape-fail (observed twice live on opus) would randomly kill an arm and
@@ -311,8 +393,12 @@ def _launch_run(recipe_name: str, kickoff: str,
         env["MINI_ORK_ROOT"] = root
         env["MINI_ORK_HOME"] = os.path.join(root, ".mini-ork")
         env["MINI_ORK_DB"] = os.path.join(root, ".mini-ork", "state.db")
+    # Probe arms run against a private fixture tmpdir on THIS host, so local
+    # placement is the only correct one. Without the explicit flag, a host
+    # whose env profile defaults to Daytona would ship every arm to the cloud.
     proc = subprocess.Popen(
-        [sys.executable, "-m", "mini_ork.cli.main", "run", recipe_name, kickoff],
+        [sys.executable, "-m", "mini_ork.cli.main", "run",
+         "--placement", "local", recipe_name, kickoff],
         cwd=root or framework_root, env=env, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, text=True, start_new_session=True,
     )
@@ -534,19 +620,15 @@ def probe_score(task_class: str, target_file: str | None,
         return None
     if not target_file or not directive:
         return None  # no candidate arm can be materialized → nothing to measure
-    try:
-        budget = float(os.environ.get("MO_APPLY_PROBE_BUDGET_USD", "2.0"))
-    except ValueError:
-        budget = 2.0
+    budget = float(_probe_setting(task_class, "MO_APPLY_PROBE_BUDGET_USD",
+                                  "budget_usd", 2.0))
     # MO_APPLY_PROBE_CONTROL_N: how many times to run the unmutated baseline arm
     # per probe task before scoring the candidate. The per-probe baseline outcome
     # becomes the BEST of N retries, so run-to-run noise in the unmutated recipe
     # can no longer be credited to the candidate (G06-T03). Default 3; minimum
     # 1 reproduces the pre-change behaviour byte-identically (max([x]) == x).
-    try:
-        control_n = max(1, int(os.environ.get("MO_APPLY_PROBE_CONTROL_N", "3")))
-    except ValueError:
-        control_n = 3
+    control_n = int(_probe_setting(task_class, "MO_APPLY_PROBE_CONTROL_N",
+                                   "control_n", 3, as_int=True))
 
     # Deferred import: apply imports this module at call time only, and the
     # directive-block builder lives in apply — importing here avoids the cycle.
@@ -837,14 +919,10 @@ def probe_score_code(task_class: str, patch_path: str | None, *,
     recipe = _recipe_dir(task_class)
     if not probes or recipe is None:
         return None
-    try:
-        budget = float(os.environ.get("MO_APPLY_PROBE_BUDGET_USD", "2.0"))
-    except ValueError:
-        budget = 2.0
-    try:
-        control_n = max(1, int(os.environ.get("MO_APPLY_PROBE_CONTROL_N", "3")))
-    except ValueError:
-        control_n = 3
+    budget = float(_probe_setting(task_class, "MO_APPLY_PROBE_BUDGET_USD",
+                                  "budget_usd", 2.0))
+    control_n = int(_probe_setting(task_class, "MO_APPLY_PROBE_CONTROL_N",
+                                   "control_n", 3, as_int=True))
     recipe_name = os.path.basename(recipe)
 
     arms: list[tuple[str, str, str]] = []  # (arm, tmpdir, tree)

@@ -1,0 +1,11 @@
+# Per-recipe probe knobs for the apply-gate probe scorer.
+#
+# A framework-edit run costs $3-12 and takes 20-60 minutes, so the global
+# defaults (budget_usd 2.0, timeout_s 600) cannot fit even one arm. These
+# values are the DEFAULTS for this recipe only: an explicitly set env var
+# (MO_APPLY_PROBE_BUDGET_USD, MO_APPLY_PROBE_TIMEOUT_S,
+# MO_APPLY_PROBE_CONTROL_N, MO_APPLY_PROBE_MAX_TASKS) still wins.
+budget_usd: 60
+timeout_s: 3600
+control_n: 2
+max_tasks: 2
