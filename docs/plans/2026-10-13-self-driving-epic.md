@@ -136,9 +136,23 @@ SDE-1 and SDE-2 touch disjoint files and run in parallel.
   **VG-1b** `23722ba8` (kickoff commands keep `MINI_ORK_RUN_DIR`). The prose-scan
   gap was fixed upstream by `ddc88c43`. Remaining VG-1c: measures on the engine
   venv interpreter (`python3` on PATH is 3.9).
-- **Next: SDE-4 supervisor** — revive parked runs when their fix lands and label
-  the ledger; mark superseded failures; clear orphaned `repairing` state; per-epic
-  budget (gaps G1–G3 in `docs/todos/2026-10-15-failed-runs-4d-revive-plan.md`).
+- **SDE-4 to SDE-6 merged 2026-10-22** (program `docs/plans/2026-10-22-rsi-gaps.md`):
+  - SDE-4a `f1f93760` — `mini-ork supervise`: R1 revives a `waiting_on_fix` run once
+    its fix epic is done and on `origin/main`; R2 labels the diagnosis ledger from the
+    revived run's outcome; R3 clears orphaned `repairing` (G2).
+  - SDE-4c `7aa2611f` — the scheduler enforces `budget.per_epic_usd`.
+  - SDE-4b `a9cbcfc0` — `superseded` run status (migration 0080); R4 supersedes
+    delivered-elsewhere failures (G1), R5 back-links done epics (G3).
+  - SDE-5a `7a85d5df` — typed, immutable graph patches applied through
+    `recover --workflow`; MUTATE proposes them; `mini-ork graph-patch`.
+  - SDE-6a `824d5700` — replan patches built from existing node templates.
+  - SDE-5b `d7694192` — R6 applies proposed patches and records outcomes; a kind
+    that is not better than a blind rerun after 5 samples each is skipped.
+  - SDE-6b `ad52777f` — split patches hand the remaining work to child epics; R7
+    closes the split.
+  Live on the primary home: migrations 0079–0083 applied; supervise sweeps
+  superseded 153 failed runs, cleared 3 orphaned `repairing` states and back-linked
+  `wit-2-documents`. **Not yet scheduled:** nothing runs `supervise` periodically.
 
 ## Two tiers
 
