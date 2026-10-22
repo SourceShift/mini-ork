@@ -34,7 +34,8 @@ import re as _re
 LIVE = frozenset({"classified", "planned", "executing", "verifying", "reviewing"})
 
 #: The statuses that mean the run is over and will never move again.
-TERMINAL = frozenset({"published", "failed", "rolled_back", "not_needed"})
+TERMINAL = frozenset({"published", "failed", "rolled_back", "not_needed",
+                      "superseded"})
 
 #: The terminal statuses that mean the run did not deliver its work.
 UNSUCCESSFUL = frozenset({"failed", "rolled_back"})
@@ -56,6 +57,8 @@ DEFAULT_BUCKET = {
     "failed": "failed",
     "rolled_back": "failed",
     "not_needed": "not_needed",
+    # Delivered some other way: not a defect, and not this run's win either.
+    "superseded": "not_needed",
 }
 
 #: Human wording for a status, for the pages that print one. Keyed by status,
@@ -70,6 +73,7 @@ LABELS = {
     "rolled_back": "Rolled back",
     "failed": "Failed",
     "not_needed": "Not needed",
+    "superseded": "Superseded",
 }
 
 

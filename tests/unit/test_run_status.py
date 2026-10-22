@@ -87,7 +87,7 @@ def test_sql_fragments_match_their_sets() -> None:
     Pinned as strings so a change to either set shows up as a readable diff in
     the SQL that reaches twenty call sites.
     """
-    assert run_status.SQL_TERMINAL == "('failed','not_needed','published','rolled_back')"
+    assert run_status.SQL_TERMINAL == "('failed','not_needed','published','rolled_back','superseded')"
     assert run_status.SQL_UNSUCCESSFUL == "('failed','rolled_back')"
 
 

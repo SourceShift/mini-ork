@@ -1,11 +1,14 @@
-"""The self-driving supervisor: one sweep closes the three parked-run gaps.
+"""The self-driving supervisor: one sweep closes the parked-run gaps.
 
 The self-driving loop parks an engine-fault run on a fix epic
 (``escalation._record_waiting_on_fix`` writes ``runs/<id>/repair.json`` with
 ``state="waiting_on_fix"`` and ``fix_epic_id``), but nothing came back for it:
 a human revived the run after the fix merged, the diagnosis ledger stayed
 unlabelled, and a ``repair.json`` left in ``repairing`` by a dead process was
-never cleared. :func:`sweep` closes all three under one pass:
+never cleared. Two more gaps sit beside those: a failed run whose work was
+delivered elsewhere stayed in the failed bucket, and a ``done`` epic whose
+closing run never published kept no record of what delivered it.
+:func:`sweep` closes all of them under one pass:
 
     R1 — revive:     parked run + fix epic ``done`` + a landing signal on
                      ``origin/main`` → re-dispatch the failed node.
@@ -13,6 +16,13 @@ never cleared. :func:`sweep` closes all three under one pass:
                      diagnosis ledger rows that carried its ``fix_epic_id``.
     R3 — orphan:     ``repairing`` with an old last attempt and a dead owner
                      process → ``gave_up``.
+    R4 — supersede:  a failed run whose work was delivered some other way (a
+                     later published run of the same kickoff, its diff landed
+                     on ``origin/main``, or a ``done`` epic it attempted) →
+                     terminal ``superseded`` (not unsuccessful).
+    R5 — back-link:  a ``done`` epic whose closing run did not publish (and has
+                     no ``delivered_by=`` note yet) → record the delivering run
+                     or ``origin/main`` commit on the epic's notes.
 
 No rule asks a human for approval: the operator is *notified* through the
 oversight inbox (``mo_inbox_gates``), never blocked on it. Every
@@ -30,6 +40,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from mini_ork.learning.code_findings import landed_patch_ids, run_patch_id
 from mini_ork.recovery.escalation import _TERMINAL_UNSUCCESSFUL
 from mini_ork.run_status import TERMINAL as _TERMINAL_RUN_STATUS
 
@@ -39,6 +50,11 @@ SUPERVISOR_GATE = "self-driving-supervisor"
 _FIX_EPIC_FEATURE = "fix epic failed: {run_id}"
 _LANDING_REF = "origin/main"
 _ATTEMPT_FILE = "repair.json"
+#: ``repair.json`` states that mean an active loop owns the run: R4 must never
+#: supersede one out from under it.
+_SUPERSEDE_OWNED_STATES = frozenset({"waiting_on_fix", "reviving", "repairing"})
+#: R4's budget: the most recent failed rows, newest first.
+_SUPERSEDE_SCAN_LIMIT = 500
 
 
 # ── small io / time helpers ─────────────────────────────────────────────────
@@ -129,6 +145,27 @@ def _query(db: str, sql: str, args: tuple = ()) -> list[tuple]:
         return []
 
 
+def _write(db: str, sql: str, args: tuple = ()) -> int:
+    """Run one targeted write; return the rowcount (0 on any DB error).
+
+    A missing DB file is never conjured (same cold-safe rule as :func:`_query`),
+    and a failed statement leaves the sweep going — one row the schema cannot
+    hold must not stop the other rules.
+    """
+    if not db or not os.path.isfile(str(db)):
+        return 0
+    try:
+        con = _connect(str(db))
+        try:
+            cur = con.execute(sql, args)
+            con.commit()
+            return int(cur.rowcount or 0)
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return 0
+
+
 def _epic(db: str, epic_id: str) -> tuple[str, str | None] | None:
     rows = _query(db, "SELECT status, last_run_id FROM epics WHERE id=?",
                   (epic_id,))
@@ -196,6 +233,18 @@ def _git(engine_root: str, *args: str) -> subprocess.CompletedProcess | None:
         return None
 
 
+def _landed_ids(engine_root: str, cache: dict[str, Any]) -> dict:
+    """The sweep's one ``{patch_id: sha}`` map for ``origin/main``.
+
+    ``code_findings.landed_patch_ids`` runs one whole-repo ``git log -p``, so
+    R1 and R4 share the ``"patch_ids"`` cache key: the map is computed at most
+    once per sweep no matter how many runs ask for it.
+    """
+    if "patch_ids" not in cache:
+        cache["patch_ids"] = landed_patch_ids(str(engine_root), _LANDING_REF)
+    return cache["patch_ids"]
+
+
 def _fix_landed(engine_root: str, epic_id: str, last_run_id: str | None,
                 home: Path, cache: dict[str, Any]) -> bool:
     """Did this epic's fix reach ``origin/main``?
@@ -203,20 +252,15 @@ def _fix_landed(engine_root: str, epic_id: str, last_run_id: str | None,
     Signal (a): the patch id of the epic's last run diff is in
     ``code_findings.landed_patch_ids(engine_root, "origin/main")``. That helper
     runs one whole-repo ``git log -p``, so the map is computed lazily and
-    cached for the sweep. Signal (b): a commit on ``origin/main`` whose message
-    contains the epic id. Neither → not landed, which parks the run (the safe
-    direction: a broken probe must never revive prematurely).
+    cached for the sweep (shared with R4). Signal (b): a commit on
+    ``origin/main`` whose message contains the epic id. Neither → not landed,
+    which parks the run (the safe direction: a broken probe must never revive
+    prematurely).
     """
     if last_run_id:
-        from mini_ork.learning import code_findings  # noqa: PLC0415
-
-        patch_id = code_findings.run_patch_id(str(home / "runs" / last_run_id))
-        if patch_id:
-            if "patch_ids" not in cache:
-                cache["patch_ids"] = code_findings.landed_patch_ids(
-                    str(engine_root), _LANDING_REF)
-            if patch_id in cache["patch_ids"]:
-                return True
+        patch_id = run_patch_id(str(home / "runs" / last_run_id))
+        if patch_id and patch_id in _landed_ids(engine_root, cache):
+            return True
     if not epic_id:
         return False
     proc = _git(engine_root, "log", _LANDING_REF, "--format=%H",
@@ -339,8 +383,10 @@ def sweep(home: str, db: str, *, engine_root: str, now: float | None = None,
             owner is orphaned.
 
     Returns:
-        One action dict per run acted on (``run_id`` / ``action`` / ``reason``
-        plus any detail the action carries). A run left alone yields no dict.
+        One action dict per run or epic acted on (``run_id`` or ``epic_id`` /
+        ``action`` / ``reason`` plus any detail the action carries). The
+        per-``repair.json`` rules come first; R4's and R5's dicts are appended
+        after them. Something left alone yields no dict.
     """
     home_p = Path(home)
     now_f = float(now) if now is not None else time.time()
@@ -389,6 +435,20 @@ def sweep(home: str, db: str, *, engine_root: str, now: float | None = None,
 
         if action is not None:
             actions.append(action)
+
+    # R4/R5 are DB-wide rules, not per-run-dir ones: their dicts are appended
+    # after every per-repair.json dict so the existing action order is stable.
+    try:
+        actions.extend(_rule_supersede(home_p, db, engine_root, land_cache,
+                                       dry_run))
+    except Exception as exc:  # one bad DB must never stop the sweep
+        actions.append({"run_id": "", "action": "error",
+                        "reason": f"supersede rule: {type(exc).__name__}: {exc}"})
+    try:
+        actions.extend(_rule_backlink(db, engine_root, dry_run))
+    except Exception as exc:  # one bad DB must never stop the sweep
+        actions.append({"epic_id": "", "action": "error",
+                        "reason": f"backlink rule: {type(exc).__name__}: {exc}"})
 
     return actions
 
@@ -519,3 +579,154 @@ def _rule_orphan(run_id: str, run_dir: Path, repair: dict[str, Any], now: float,
         updated["note"] = note
         _write_repair(run_dir, updated)
     return {"run_id": run_id, "action": "gave_up", "reason": note}
+
+
+# ── R4 / R5: delivered-elsewhere runs and epics ─────────────────────────────
+
+
+def _repair_state(run_dir: Path) -> str | None:
+    """The ``repair.json`` state, or ``"unreadable"`` when it cannot be read.
+
+    A run with no ``repair.json`` has no owning loop (``None``). An unreadable
+    one is treated as owned: R4 must never supersede a run whose repair state
+    it cannot see.
+    """
+    path = run_dir / _ATTEMPT_FILE
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "unreadable"
+    if not isinstance(data, dict):
+        return "unreadable"
+    return str(data.get("state") or "")
+
+
+def _rule_supersede(home: Path, db: str, engine_root: str, land_cache: dict,
+                    dry_run: bool) -> list[dict]:
+    """R4 — mark a failed run whose work was delivered some other way.
+
+    Signals, first match wins: (a) a later ``task_runs`` row with the same
+    ``kickoff_path`` published; (b) the patch id of the run's own
+    ``framework-edit.diff`` is in ``origin/main``; (c) the run is an attempt of
+    a ``done`` epic. Only the 500 most recent failed rows are scanned, and a
+    run whose ``repair.json`` says a loop owns it is skipped.
+
+    The write is a compare-and-set on ``status='failed'``: a row that moved on
+    (or was already superseded by a concurrent sweep) is left alone, which is
+    also what makes a second sweep append no second note.
+    """
+    rows = _query(
+        db,
+        "SELECT id, kickoff_path, created_at FROM task_runs"
+        " WHERE status='failed'"
+        " ORDER BY created_at DESC, id DESC LIMIT ?",
+        (_SUPERSEDE_SCAN_LIMIT,))
+    actions: list[dict] = []
+    for raw_id, kickoff_path, created_at in rows:
+        run_id = str(raw_id)
+        run_dir = home / "runs" / run_id
+        if _repair_state(run_dir) in _SUPERSEDE_OWNED_STATES | {"unreadable"}:
+            continue  # a repair loop owns it; or we cannot tell, so we wait
+
+        reason: str | None = None
+        signal_run: str | None = None
+        if kickoff_path:
+            later = _query(
+                db,
+                "SELECT id FROM task_runs WHERE kickoff_path=?"
+                " AND status='published' AND created_at > ?"
+                " ORDER BY created_at ASC, id ASC LIMIT 1",
+                (str(kickoff_path), created_at))
+            if later:
+                signal_run = str(later[0][0])
+                reason = f"later run {signal_run} published"
+        if reason is None:
+            patch_id = run_patch_id(str(run_dir))
+            if patch_id and patch_id in _landed_ids(engine_root, land_cache):
+                reason = "diff landed on origin/main"
+        if reason is None:
+            done_epic = _query(
+                db,
+                "SELECT a.epic_id FROM epic_attempts a"
+                " JOIN epics e ON e.id = a.epic_id"
+                " WHERE a.run_id=? AND e.status='done'"
+                " ORDER BY a.epic_id LIMIT 1",
+                (run_id,))
+            if done_epic:
+                reason = f"epic {done_epic[0][0]} done"
+        if reason is None:
+            continue
+
+        if not dry_run and _write(
+                db,
+                "UPDATE task_runs SET status='superseded',"
+                " notes=COALESCE(notes,'') || ?"
+                " WHERE id=? AND status='failed'",
+                (f" superseded: {reason}", run_id)) != 1:
+            continue  # the row moved on after it was read
+        action = {"run_id": run_id, "action": "supersede", "reason": reason}
+        if signal_run:
+            action["later_run_id"] = signal_run
+        actions.append(action)
+    return actions
+
+
+def _rule_backlink(db: str, engine_root: str, dry_run: bool) -> list[dict]:
+    """R5 — record what delivered a ``done`` epic whose closing run did not.
+
+    For every done epic whose ``last_run_id`` run is not ``published`` and whose
+    notes carry no ``delivered_by=`` marker, the evidence is the latest
+    published run among its ``epic_attempts``, else the first ``origin/main``
+    commit whose message names the epic. No evidence → no action. The write
+    re-checks the marker so two sweeps can never stamp twice.
+    """
+    rows = _query(db, "SELECT id, last_run_id, notes FROM epics"
+                      " WHERE status='done'")
+    actions: list[dict] = []
+    for raw_id, last_run_id, notes in rows:
+        epic_id = str(raw_id)
+        if "delivered_by=" in str(notes or ""):
+            continue
+        if not last_run_id:
+            continue  # no closing run to say what happened
+        last = _task_run(db, str(last_run_id))
+        if last is not None and last[0] == "published":
+            continue  # the epic's own last run delivered it
+
+        marker: str | None = None
+        reason = ""
+        published = _query(
+            db,
+            "SELECT a.run_id FROM epic_attempts a"
+            " JOIN task_runs t ON t.id = a.run_id"
+            " WHERE a.epic_id=? AND t.status='published'"
+            " ORDER BY a.attempt DESC LIMIT 1",
+            (epic_id,))
+        if published and published[0][0]:
+            delivering_run = str(published[0][0])
+            marker = f"delivered_by={delivering_run}"
+            reason = f"delivered by run {delivering_run}"
+        else:
+            proc = _git(engine_root, "log", _LANDING_REF, "--format=%H",
+                        "-F", f"--grep={epic_id}")
+            sha = ""
+            if proc is not None and proc.returncode == 0:
+                lines = (proc.stdout or "").splitlines()
+                sha = lines[0].strip() if lines else ""
+            if not sha:
+                continue
+            marker = f"delivered_by=commit:{sha}"
+            reason = f"delivered by commit {sha}"
+
+        if not dry_run and _write(
+                db,
+                "UPDATE epics SET notes=COALESCE(notes,'') || ?"
+                " WHERE id=? AND status='done'"
+                " AND COALESCE(notes,'') NOT LIKE '%delivered_by=%'",
+                (f" {marker}", epic_id)) != 1:
+            continue
+        actions.append({"epic_id": epic_id, "action": "backlink",
+                        "reason": reason})
+    return actions

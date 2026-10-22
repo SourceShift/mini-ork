@@ -12,7 +12,7 @@ tree, the DB and `origin/main`; when it needs a human it enqueues a *notice* in
 the oversight inbox (`mo_inbox_gates`, gate `self-driving-supervisor`) and keeps
 going. Nothing waits on that notice.
 
-## What one sweep does (R1–R3)
+## What one sweep does (R1–R5)
 
 **R1 — revive.** For every `runs/*/repair.json` with `state="waiting_on_fix"`
 and a `fix_epic_id`, read the epic's status:
@@ -44,6 +44,35 @@ or `revive_failed` (wrong). A run still executing is left alone.
 attempt is older than `orphan_after_s` and whose owning process is gone (the
 reaper's pid probe says `dead`) is moved to `state="gave_up"` with a note. With
 no `.pid`, or a live owner, or a young attempt, it is left alone.
+
+**R4 — supersede.** A failed run whose work was delivered some other way is
+moved to the terminal status `superseded` — terminal, but *not* unsuccessful,
+so it leaves the failed bucket and the repair sweeps (it buckets with
+`not_needed`). The sweep scans the 500 most recent `task_runs` rows with
+`status='failed'` and skips any run whose `repair.json` state is
+`waiting_on_fix`, `reviving` or `repairing` (a loop owns it). A run is
+superseded when any of these holds:
+
+- a **later** run (greater `created_at`) with the same `kickoff_path` is
+  `published` — an earlier published run does not count;
+- the patch id of the run's own `framework-edit.diff` is in the commits on
+  `origin/main` (the same `git log -p` map R1 uses, computed at most once per
+  sweep);
+- the run appears in `epic_attempts` for an epic whose status is `done`.
+
+The update is a compare-and-set on `status='failed'` and the note gains
+` superseded: <reason>`, naming the signal (`later run <id> published`,
+`diff landed on origin/main`, `epic <id> done`). A row that moved on is left
+alone, so a second sweep never appends the note twice.
+
+**R5 — back-link.** For every epic with `status='done'` whose `last_run_id` run
+is not `published` and whose notes do not already contain `delivered_by=`, the
+sweep records what delivered it. The evidence is the latest `published` run
+among the epic's `epic_attempts`, else the first commit on `origin/main` whose
+message contains the epic id (`git log origin/main --format=%H -F
+--grep=<id>`). The notes gain ` delivered_by=<run_id>` or
+` delivered_by=commit:<sha>`; with no evidence the epic is left alone, and the
+marker guard means a second sweep adds nothing.
 
 Every `repair.json` rewrite is atomic (temp file in the same directory, then
 `os.replace`) and preserves every key it does not change. One corrupt run dir
@@ -108,6 +137,8 @@ Each action is a small dict: `{"run_id", "action", "reason", ...}`.
 | `skip` | landed, but no failed node was recorded — nothing to resume from |
 | `gave_up` | a dead fix epic, or an orphaned `repairing` state, was closed |
 | `label` | a revived run's diagnosis was labelled (`correct`: true/false) |
+| `supersede` | a failed run's work was delivered elsewhere; it is now `superseded` |
+| `backlink` | a done epic's notes gained `delivered_by=<run|commit>` |
 | `error` | that run dir could not be processed; the sweep continued |
 
 Without `--json` the output is one line per action; with `--json` it is the full

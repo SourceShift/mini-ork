@@ -37,7 +37,7 @@ from typing import Any
 
 from mini_ork.dispatch.core import AGENT_PGIDS_FILE
 from mini_ork.remote.providers.base import clear_stale_run_lock
-from mini_ork.run_status import TERMINAL, close_duration_ms
+from mini_ork.run_status import SQL_TERMINAL, TERMINAL, close_duration_ms
 
 PID_FILE = ".pid"
 # How long a stopped agent group gets to honour SIGTERM before SIGKILL.
@@ -262,7 +262,7 @@ def finalize_passed(db_path: str | Path, run_id: str, note: str, *, now: int | N
             "UPDATE task_runs SET status = 'published', notes = COALESCE(notes || '; ', '') || ?, "
             "updated_at = ?, ended_at = COALESCE(ended_at, ?), "
             "duration_ms = ? "
-            "WHERE id = ? AND status NOT IN ('published', 'failed', 'rolled_back')",
+            "WHERE id = ? AND status NOT IN " + SQL_TERMINAL,
             (note, now, now, duration, run_id))
         con.commit()
         return cur.rowcount == 1
@@ -588,7 +588,7 @@ def reap(home: Path, *, dry_run: bool = False, stale_after: int | None = None,
         con.execute("PRAGMA busy_timeout = 5000")
         rows = con.execute(
             "SELECT id, status, updated_at FROM task_runs "
-            "WHERE status NOT IN ('published', 'failed', 'rolled_back')").fetchall()
+            "WHERE status NOT IN " + SQL_TERMINAL).fetchall()
         for run_id, status, updated_at in rows:
             run_dir = home / "runs" / run_id
             found = probe(run_dir)
