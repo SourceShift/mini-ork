@@ -165,6 +165,27 @@ class AdvantageStore:
                 continue
         return caps
 
+    def fetch_lane_run_stats(self, task_class: str) -> dict:
+        """``lane -> (success_count, runs_count)`` for ``task_class``.
+
+        RouteMoA's dominance screen reads this once per pick: it feeds the
+        Wilson intervals that decide which lanes the data already rules out.
+        Deliberately does NOT swallow a missing table — the caller treats any
+        failure here as "no stats" and falls back to the unscreened candidates,
+        so one try/except at the call site covers both fetch and screen.
+        """
+        rows = self.con.execute(
+            "SELECT agent_version_id, success_count, runs_count "
+            "FROM agent_performance_memory WHERE task_class=?",
+            (task_class,)).fetchall()
+        stats: dict = {}
+        for lane, successes, runs in rows:
+            try:
+                stats[lane] = (int(successes), int(runs))
+            except (TypeError, ValueError):
+                continue
+        return stats
+
     def fetch_prior_domain(self) -> dict:
         prior: dict = {}
         try:

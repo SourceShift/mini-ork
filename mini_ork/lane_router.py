@@ -51,6 +51,7 @@ import math
 import os
 from collections import defaultdict
 
+from mini_ork.dispatch import screening
 from mini_ork.learning.advantage_store import AdvantageStore, resolve_db_path
 
 
@@ -595,6 +596,18 @@ def _pick_lane(task_class: str, node_type: str, objective_domain: str,
         caps: dict = {}
         if _entrorouter_enabled():
             caps = store.fetch_lane_capabilities(task_class)
+        # RouteMoA dominance screen: per-lane (success_count, runs_count) from
+        # the global performance table, fetched once per pick. Any failure here
+        # (missing table, malformed row) degrades to "no stats" — screening is
+        # an optimisation and must never break a pick.
+        lane_stats: dict | None = None
+        screen_on = screening.enabled()
+        if screen_on:
+            try:
+                lane_stats = store.fetch_lane_run_stats(task_class)
+            except Exception:
+                lane_stats = None
+        screened_out: list[dict] = []
         for source, candidates in (
             ("region", store.fetch_region_candidates(
                 task_class, objective_domain, code_region, node_type, min_samples)
@@ -603,29 +616,42 @@ def _pick_lane(task_class: str, node_type: str, objective_domain: str,
                 task_class, objective_domain, node_type, min_samples)
                 if objective_domain else []),
         ):
+            kept = candidates
+            if lane_stats is not None:
+                try:
+                    kept, screened = screening.screen(
+                        candidates, lane_stats, min_runs=screening.min_runs())
+                except Exception:
+                    # Screening must never break a pick: fall back unscreened.
+                    kept, screened = candidates, []
+                screened_out.extend(screened)
             pick, margin = _select_best_lane_scored(
-                candidates, bandit_on, ucb_c, contextual,
+                kept, bandit_on, ucb_c, contextual,
                 task_class, node_type, objective_domain, code_region, caps)
             if not pick:
                 continue
-            overridden = _equirouter_pick(store, candidates, pick, task_class,
+            # The Borda override may only reorder lanes that survived the
+            # screen — otherwise it could hand back a dominated lane.
+            overridden = _equirouter_pick(store, kept, pick, task_class,
                                           node_type, objective_domain, code_region,
                                           min_samples)
             if overridden != pick:
                 # The Borda pick is an aggregate of other slices' orderings, not
                 # a margin comparison against this slice's runner-up, so the
                 # margin no longer describes the lane that was chosen.
-                return _detail(overridden, None, source)
-            return _detail(pick, margin, source)
+                return _detail(overridden, None, source, screened_out)
+            return _detail(pick, margin, source, screened_out)
         row = store.fetch_global_best(task_class, node_type, min_samples)
         # The global table carries no z-score, so bandit ordering degrades to
         # relative_advantage DESC and there is no runner-up to measure against.
-        return _detail(f"{row[0]}|{row[1]}|{row[2]}" if row else "", None, "global")
+        return _detail(f"{row[0]}|{row[1]}|{row[2]}" if row else "", None,
+                       "global", screened_out)
     finally:
         store.close()
 
 
-def _detail(pick: str, margin: float | None, source: str) -> dict:
+def _detail(pick: str, margin: float | None, source: str,
+            screened: list[dict] | None = None) -> dict:
     parts = (pick or "").split("|")
     return {
         "pick": pick or "",
@@ -634,6 +660,7 @@ def _detail(pick: str, margin: float | None, source: str) -> dict:
         "runs": parts[2] if len(parts) > 2 else "",
         "margin": margin,
         "source": source if pick else "",
+        "screened": list(screened or []),
     }
 
 
