@@ -144,10 +144,15 @@ Reading only `os.environ` reports every store-backed credential as missing;
 fixing that is what took one live home from 12 phantom "secret missing"
 warnings to the single real fault.
 
-The `budget:` block in `agents.yaml` (`daily_cap_usd`, `per_run_usd`,
-`per_epic_usd`) is **display only**: the IDE lanes page renders it and the
-Python SDK client prints it, but no gate reads it. `MO_DAILY_BUDGET_USD` is the
-sole enforcement knob.
+The `budget:` block in `agents.yaml` declares the epic's spend envelope.
+`per_epic_usd` is **enforced by the scheduler** per epic across all its
+attempts: once recorded spend reaches the cap, `dispatch_epic` sets the epic
+`blocked` with `held_reason=per_epic_budget` and dispatches nothing. To resume
+it, raise the cap and then release the hold with `mini-ork epics retry` (a
+release without a higher cap re-blocks on the next dispatch).
+Override the configured value with `MO_PER_EPIC_USD`; a non-numeric or negative
+override fails closed. `per_run_usd` and `daily_cap_usd` remain display only,
+and `MO_DAILY_BUDGET_USD` is still the dispatch circuit.
 
 ## Runtime behavior
 

@@ -269,6 +269,94 @@ def cost_pause_active(home: str | None = None) -> bool:
             or os.path.isfile(os.path.join(home, "control", "cost-pause")))
 
 
+def epic_spend_usd(epic_id: str, db: str | None = None) -> float:
+    """Recorded spend for one epic, across every attempt it has made.
+
+    Sums ``task_runs.cost_usd`` over the distinct run ids in ``epic_attempts``
+    for this epic, plus ``epics.last_run_id`` when it is not already among them
+    (a run recorded on the epic but not yet in the attempt history). Missing
+    tables or rows read as ``0.0`` — an unmigrated or empty DB has no spend, and
+    the budget guard must not crash a dispatch over it.
+
+    This reads ``task_runs``, not the ``llm_calls`` ledger: the ledger has no
+    epic key, so it cannot attribute a call to an epic. ``cost_ledger`` already
+    documents that ``task_runs`` undercounts relative to ``llm_calls``; the cap
+    is a floor on recorded run spend, which is the number the scheduler owns.
+    """
+    try:
+        con = _conn(db)
+        try:
+            rows = con.execute(
+                "SELECT DISTINCT run_id FROM epic_attempts "
+                "WHERE epic_id=? AND run_id IS NOT NULL", (epic_id,)).fetchall()
+            run_ids = {r[0] for r in rows if r[0]}
+            row = con.execute("SELECT last_run_id FROM epics WHERE id=?",
+                              (epic_id,)).fetchone()
+            if row and row[0]:
+                run_ids.add(row[0])
+            if not run_ids:
+                return 0.0
+            marks = ",".join("?" * len(run_ids))
+            total = con.execute(
+                f"SELECT COALESCE(SUM(cost_usd), 0.0) FROM task_runs "
+                f"WHERE id IN ({marks})", tuple(run_ids)).fetchone()[0]
+            return float(total or 0.0)
+        finally:
+            con.close()
+    except sqlite3.OperationalError:
+        return 0.0
+
+
+def _cap_value(raw, source: str) -> float:
+    """Parse a configured cap. Non-numeric, negative, or non-finite fails closed
+    with a ``ValueError`` naming its source — never a silent default."""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"{source} is not a number: {raw!r}") from None
+    if value != value or value in (float("inf"), float("-inf")) or value < 0:
+        raise ValueError(f"{source} must be a non-negative number: {raw!r}")
+    return value
+
+
+def _yaml_dict(path: str) -> dict:
+    import yaml
+
+    if not os.path.isfile(path):
+        return {}
+    with open(path, encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+    return data if isinstance(data, dict) else {}
+
+
+def per_epic_cap(home: str, root: str) -> float | None:
+    """The per-epic spend cap in force for this dispatch, or ``None``.
+
+    ``MO_PER_EPIC_USD`` wins when set; otherwise ``budget.per_epic_usd`` from
+    the agents config as dispatch sees it — HOME's ``config/agents.yaml`` else
+    ROOT's, merged with the personal overlay — the same resolution
+    ``mini_ork/ide_pages/lanes.py:_agents`` performs. No configured value means
+    no enforcement. A configured value that is not a number raises
+    ``ValueError`` (fail closed; see ``_cap_value``).
+    """
+    from mini_ork.dispatch import agents_config
+
+    env = os.environ.get("MO_PER_EPIC_USD")
+    if env is not None:
+        return _cap_value(env, "MO_PER_EPIC_USD")
+    base_path = os.path.join(home, "config", "agents.yaml")
+    if not os.path.isfile(base_path):
+        base_path = os.path.join(root, "config", "agents.yaml")
+    base = _yaml_dict(base_path)
+    overlay = agents_config.personal_path(home=home)
+    if overlay:
+        base = agents_config.merge(base, _yaml_dict(overlay))
+    budget = base.get("budget")
+    if not isinstance(budget, dict) or budget.get("per_epic_usd") is None:
+        return None
+    return _cap_value(budget["per_epic_usd"], "budget.per_epic_usd")
+
+
 def resolve_kickoff(epic_id: str, root: str, recipe: str,
                     db: str | None = None) -> str | None:
     """kickoff_path column -> kickoffs/<id>.md (bash order minus the example).
@@ -744,6 +832,30 @@ def dispatch_epic(epic_id: str, root: str, home: str, recipe: str,
     ensure_retry_schema(db)
     epic = _epic_row(db, epic_id)
     recipe = (epic.get("recipe") or "").strip() or recipe
+
+    # Per-epic budget: check before the epic is marked in progress and, because
+    # every retry re-enters dispatch_epic (a failed attempt settles to 'not
+    # started' and the pool re-dispatches), before every attempt by construction.
+    cap = per_epic_cap(home, root)
+    if cap is not None:
+        spent = epic_spend_usd(epic_id, db)
+        if spent >= cap:
+            note = f"per-epic budget: spent ${spent:.2f} >= cap ${cap:.2f}"
+            if dry_run:
+                sys.stdout.write(f"  [dry-run] would block: {epic_id} ({note})\n")
+                return "budget_blocked", 0
+            con = _conn(db)
+            try:
+                con.execute(
+                    "UPDATE epics SET status='blocked', held_reason='per_epic_budget', "
+                    "notes=COALESCE(notes,'') || ? WHERE id=?",
+                    (f" {note}", epic_id))
+                con.commit()
+            finally:
+                con.close()
+            sys.stdout.write(note + "\n")
+            return "budget_blocked", 0
+
     kickoff = resolve_kickoff(epic_id, root, recipe, db)
     if not kickoff:
         if dry_run:
