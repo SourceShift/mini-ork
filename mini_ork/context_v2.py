@@ -752,6 +752,29 @@ def _constraint_items(contract: dict) -> list[dict]:
     return items
 
 
+# The injection-outcome tally is bookkeeping, not part of the pack: resolving
+# it at most once per process per window keeps a plan/dispatch burst from
+# rescanning every finished run's ledger for each pack it builds.
+_ITEM_UCB_LAST_RESOLVE = 0.0
+_ITEM_UCB_RESOLVE_INTERVAL = 60.0
+
+
+def _resolve_item_utility_once(db_path: str | None, home: str) -> None:
+    """Fold finished runs' ledgers into the utility tally, lazily.
+
+    No-op without a database path or a MINI_ORK_HOME to read ledgers from, and
+    inside the 60 s window. Failure is the caller's fallback (old order)."""
+    if not db_path or not home:
+        return
+    global _ITEM_UCB_LAST_RESOLVE
+    now = time.time()
+    if now - _ITEM_UCB_LAST_RESOLVE < _ITEM_UCB_RESOLVE_INTERVAL:
+        return
+    _ITEM_UCB_LAST_RESOLVE = now
+    from mini_ork.learning import item_utility
+    item_utility.resolve_finished(home, db_path)
+
+
 def build(kickoff_path: str, *, task_class: str = "", db: str | None = None,
           run_id: str | None = None, max_clusters: int = 5,
           kickoff_text: str | None = None, run_dir: str | None = None,
@@ -802,10 +825,25 @@ def build(kickoff_path: str, *, task_class: str = "", db: str | None = None,
     floor = min_severity()
     clusters = [c for c in cluster(findings)
                 if _SEVERITY_RANK.get(str(c["worst_severity"]).lower(), 0) >= floor]
-    clusters = clusters[:max_clusters]
     prior = prior_attempts(kickoff_path, db=db, current_run=run_id,
                            target_repo=target_repo)
     themes = verified_themes(task_class, db=db)
+    # Severity-floor filtering already happened above, and the rerank precedes
+    # the cut so ``[:max_clusters]`` keeps the best-scored clusters rather than
+    # the best-ordered ones. Any failure leaves the pre-change order in place.
+    item_ranking = "prior-order"
+    try:
+        from mini_ork.learning import item_utility
+        if item_utility.enabled():
+            db_path = _db_path(db)
+            _resolve_item_utility_once(db_path, context_env("MINI_ORK_HOME"))
+            ranked_clusters = item_utility.rerank(clusters, db=db_path)
+            ranked_themes = item_utility.rerank(themes, db=db_path)
+            clusters, themes = ranked_clusters, ranked_themes
+            item_ranking = "simutil-ucb"
+    except Exception:  # noqa: BLE001 — injection path keeps the old order
+        item_ranking = "prior-order"
+    clusters = clusters[:max_clusters]
     constraints = _constraint_items(contract)
     return {
         "version": 2,
@@ -824,6 +862,9 @@ def build(kickoff_path: str, *, task_class: str = "", db: str | None = None,
         "file_findings": clusters,
         "prior_attempts": prior,
         "themes": themes,
+        # Which ranking produced the theme/cluster order: the pre-change
+        # prior, or the injection-outcome-adjusted SimUtil-UCB score.
+        "item_ranking": item_ranking,
         # R13 reads this marker to tell a run whose pack was built with the
         # once-only theme wiring from one that predates it (``v2_legacy``).
         "themes_once": True,
