@@ -69,6 +69,7 @@ from mini_ork.gates.node_review import REVIEW_PAUSE_RC  # noqa: F401
 
 
 # ── extracted modules (re-exported contracts; definitions live in the modules) ──
+from mini_ork.learning import revise_value
 from mini_ork.learning.writeback import (  # noqa: F401
     learning_update_conductor_outcomes,
     reward_from_status,
@@ -1416,6 +1417,9 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         fields_by_id = {field[0]: field for field in work_fields}
         # revise round bookkeeping: target node_id -> rounds already consumed.
         round_used: dict[str, int] = {}
+        # CoBa: a granted round is settled by the source that fired it, which
+        # re-runs in a later wave. source node_id -> (target, round number).
+        open_round_settles: dict[str, tuple[str, int]] = {}
         # RB-18: the defect report is noted once per run, not once per wave.
         spec_defect_noted = False
 
@@ -1586,6 +1590,21 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                     fail_count += 1
                     failed_outcomes[field[0]] = _finish_reason or "failed"
 
+            # ── CoBa: settle the revise round a source fired ───────────────
+            # A round's value is whether the source that fired it passes the
+            # next time it runs (the target reset pulls it into a later wave).
+            # Settle before grouping: a source failing again in this same wave
+            # settles the previous round as failed and may fire the next one.
+            # An empty history makes the whole rule inert; the module never
+            # raises, so a broken DB cannot stall the loop.
+            for field, rc, _finish_reason in outcomes:
+                pending_settle = open_round_settles.pop(field[0], None)
+                if pending_settle is None:
+                    continue
+                _settle_target, _settle_round = pending_settle
+                revise_value.settle_round(
+                    db, run_id, _settle_target, _settle_round, rc == 0)
+
             # ── per-run orchestrator (default on; MO_RUN_ORCHESTRATOR=0 opts out) ──
             # Observe each node outcome at the wave boundary and pick one of
             # advance/help/repair/mutate/promote (see
@@ -1691,6 +1710,15 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                     print(f"[revise] skipped for {field[0]}: revise target '{target}' "
                           "is outside this run's node closure", file=sys.stderr)
                     continue
+                # CoBa: stop spending rounds whose measured marginal value is
+                # too low. With no settled history (n < min samples) this is
+                # always False, so the default behaviour is unchanged.
+                _coba_stop, _coba_reason = revise_value.should_stop(
+                    db, task_class, target, round_used.get(target, 0) + 1)
+                if _coba_stop:
+                    print(f"[revise] coba stop for {target}: {_coba_reason}",
+                          file=sys.stderr)
+                    continue
                 revise_groups.setdefault(target, []).append((field, rc, finish_reason))
             # Second pass: condition-fired rounds (rc==0 + condition predicate
             # fired on the node's output artifact). The rc-fired loop above
@@ -1743,6 +1771,15 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                           f"'{target}' is outside this run's node closure",
                           file=sys.stderr)
                     continue
+                # CoBa applies symmetrically to the condition channel: same cap,
+                # same measured value. Inert until the history has enough
+                # settled samples.
+                _coba_stop, _coba_reason = revise_value.should_stop(
+                    db, task_class, target, round_used.get(target, 0) + 1)
+                if _coba_stop:
+                    print(f"[revise] coba stop for {target}: {_coba_reason}",
+                          file=sys.stderr)
+                    continue
                 # Mark the source with a sentinel finish_reason so the
                 # feedback section can pick the compact-JSON-dump fallback
                 # (C4 of p1-1-condition-edges) when none of the standard
@@ -1780,6 +1817,13 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                     _target_max = _target_edge.max_rounds
                     round_no = round_used.get(target, 0) + 1
                     round_used[target] = round_no
+                    # CoBa: this round is granted; remember it so the measured
+                    # value of the next one can be taken from real history,
+                    # and settle it when a firing source next reports.
+                    revise_value.record_round(
+                        db, run_id, task_class, target, round_no)
+                    for _src_field, _src_rc, _src_fr in failed_sources:
+                        open_round_settles[_src_field[0]] = (target, round_no)
                     reset_ids = _control_descendants(target)
                     feedback_path = _write_revise_feedback(
                         live_run_dir, round_no, _target_max, failed_sources)
