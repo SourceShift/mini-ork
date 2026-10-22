@@ -1,35 +1,45 @@
 # Recursive Self-Improvement Loop
 
-`bin/mini-ork-self-improve` is a wall-clock-budgeted outer loop that drives
+`mini-ork self-improve` (`mini_ork/cli/self_improve.py`; `bin/mini-ork-self-improve`
+is a thin launcher for it) is a wall-clock-budgeted outer loop that drives
 the `recursive-self-improve` recipe against the mini-ork checkout itself.
 Each iteration scans the repo + the run database + benchmark deltas for
 bottlenecks, dispatches three heterogeneous-family research lenses plus an
 arXiv research lane, asks Opus to synthesize a ranked patch plan, and has
-Codex apply the top patch inside a git worktree gated by three
-deterministic verifiers.
+the implementer lane apply the top patch inside a git worktree gated by three
+deterministic Python verifiers and an Opus patch critic.
+
+## Status (2026-10-22)
+
+The loop is built but has not run since 2026-08-06. The live `self_improve_runs`
+table holds 64 iterations: 1 `success`, 39 `failed`, 13 `rejected`, 9 `aborted`,
+1 `timed_out`, 1 `pending`. Before relaunching, probe the lanes the recipe names
+(`codex_lens`, `kimi_lens`): as of 2026-10 the codex account is out of quota and
+the kimi key is rejected, so both must be repointed in the lane overlay or every
+iteration dies at its first lens.
 
 ## Quickstart
 
 ```bash
 # One iteration, no LLM calls — proves wiring is OK.
-bin/mini-ork-self-improve --dry-run --max-iters 1
+bin/mini-ork self-improve --dry-run --max-iters 1
 
 # Real run: 3h soft cap, 5h hard cap, single commit per successful iter,
 # no auto-merge (user reviews branches).
-bin/mini-ork-self-improve --soft-cap-hours 3 --hard-cap-hours 5
+bin/mini-ork self-improve --soft-cap-hours 3 --hard-cap-hours 5
 
 # Real run with auto-merge into the current branch.
-bin/mini-ork-self-improve --soft-cap-hours 3 --hard-cap-hours 5 --auto-merge
+bin/mini-ork self-improve --soft-cap-hours 3 --hard-cap-hours 5 --auto-merge
 
 # Resume after Ctrl-C or crash.
-bin/mini-ork-self-improve --resume --soft-cap-hours 3 --hard-cap-hours 5
+bin/mini-ork self-improve --resume --soft-cap-hours 3 --hard-cap-hours 5
 ```
 
 ## Architecture
 
 ```
                       ┌──────────────────────────────────────────┐
-                      │  bin/mini-ork-self-improve (outer loop)  │
+                      │  mini_ork/cli/self_improve.py (outer)    │
                       │  - wall-clock budget                     │
                       │  - per-iter worktree                     │
                       │  - learning_record sqlite                │
@@ -43,10 +53,10 @@ bin/mini-ork-self-improve --resume --soft-cap-hours 3 --hard-cap-hours 5
                       └──────────────────────────────────────────┘
                                        │
                                        ▼
-      bottleneck_scanner ─┬─► perf_lens        (minimax) ─┐
-                          ├─► correctness_lens (kimi)     ─┤
+      bottleneck_lens ────┬─► perf_lens        (minimax) ─┐
+      (planner lane)      ├─► correctness_lens (kimi)     ─┤
                           ├─► arch_lens        (codex)    ─┤
-                          └─► arxiv_research   (codex)    ─┴─► opus_synthesizer (opus)
+                          └─► arxiv_lens       (codex)    ─┴─► opus_synthesizer (opus)
                                                                   │
                                                                   ▼
                                                           bottlenecks_found
@@ -61,13 +71,22 @@ bin/mini-ork-self-improve --resume --soft-cap-hours 3 --hard-cap-hours 5
                                                           no_regression
                                                                   │
                                                                   ▼
+                                                          opus_patch_critic
+                                                                  │
+                                                                  ▼
                                                               publisher
 ```
 
+Any failing gate (`bottlenecks_found`, `self_tests_pass`, `no_regression`,
+`opus_patch_critic`) escalates to `rollback`.
+
 ## Provider lanes
 
-The outer runner stages `config/agents.recursive-self-improve.yaml` into
-`$MINI_ORK_HOME/config/agents.yaml` before dispatching, so the recipe sees:
+The outer runner copies `config/agents.recursive-self-improve.yaml` over
+`$MINI_ORK_HOME/config/agents.yaml` before dispatching. That overwrites the
+home's `agents.yaml` in place, so run it against a dedicated `MINI_ORK_HOME` (a
+home's `agents.local.yaml` overlay still wins over the copied file). The recipe
+sees:
 
 | Lane | Model | Why this family |
 |---|---|---|
@@ -85,20 +104,25 @@ The outer runner stages `config/agents.recursive-self-improve.yaml` into
 1. **Worktree isolation.** Each iteration runs in
    `.mini-ork/worktrees/iter-<N>-<ts>` on a fresh branch named
    `self-improve/iter-<N>-<ts>`.
-2. **Implementer never commits.** Codex writes the patch + the regression
-   test in the worktree; the outer runner is the only thing that calls
-   `git commit`, and only after all three verifiers pass.
+2. **Implementer never commits.** The implementer writes the patch + the
+   regression test in the worktree; the outer runner is the only thing that
+   calls `git commit`, and only after every gate passes.
 3. **Branches stay quarantined** unless you pass `--auto-merge`. Failed
    iterations leave the branch alone so you can inspect the diff manually.
-4. **Verifier triple gate:**
-   - `bottlenecks-found` — synthesis has at least one ranked patch and is
+4. **Four-layer gate** (verifiers are Python scripts under
+   `recipes/recursive-self-improve/verifiers/`):
+   - `bottlenecks-found.py` — synthesis has at least one ranked patch and is
      not polluted with leaked `★ Insight` / `<z-insight>` envelopes.
-   - `self-tests-pass` — every existing `tests/{integration,unit}/test_*.sh`
-     still passes. Refuses to vacuous-pass when zero suites are present.
-   - `no-regression` — `bash -n` clean on every changed shell file;
+   - `self-tests-pass.py` — mini-ork's pytest suite (`python -m pytest -q`,
+     override with `MINI_ORK_SELF_IMPROVE_TEST_CMD`) passes on the patched
+     worktree, run from a hermetic temp sandbox outside the framework tree so
+     the operator's `.mini-ork` home and live DB cannot change the verdict.
+   - `no-regression.py` — `bash -n` clean on every changed shell file;
      benchmark utility scores show non-negative delta when historical
      data is available; implementer's own report does not say
      `refused-*` or `failed-*`.
+   - `opus_patch_critic` — an Opus review of the applied diff; a
+     non-approving verdict blocks promotion like a failed verifier.
 5. **Hard budget caps.** `--hard-cap-hours` kills mid-iteration via
    `timeout(1)` around the native execute runtime. Defaults: 3h soft / 5h hard.
 6. **Convergence shortcut.** When the bottleneck scanner emits
@@ -116,7 +140,8 @@ The outer runner stages `config/agents.recursive-self-improve.yaml` into
 | arxiv_research | Codex + jina MCP | ~$0.30 |
 | opus_synthesizer | **Opus** | **$3-6** (dominant) |
 | implementer | Codex | ~$0.50 |
-| verifiers | — | $0 (bash) |
+| verifiers | — | $0 (local Python) |
+| opus_patch_critic | **Opus** | one Opus call (not yet measured; not in the totals below) |
 | **Per iter** | | **~$5-8** |
 | **3h budget (3-4 iters)** | | **~$15-30** |
 | **5h budget (5-7 iters)** | | **~$25-50** |
@@ -172,7 +197,7 @@ sqlite3 .mini-ork/state.db \
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `[err] migration 0017 failed` | sqlite3 missing | install sqlite3 |
+| `[err] migration 0017 failed` | the `sqlite3` CLI rejected `0017_self_improve_learning.sql` (with no `sqlite3` on PATH the runner skips the migration) | run the SQL by hand and read the error |
 | Outer runner exits immediately | invalid cap hours (soft>hard) | fix flags |
 | Iter ends with `outcome=timed_out` | one Opus call hung | inspect `runs/<id>/execute.log`; consider lower per-iter budget |
 | Iter ends with `outcome=failed` | scanner found no actionable items | inspect `runs/<id>/bottleneck-scan.md`; manual seed |
@@ -186,7 +211,7 @@ sqlite3 .mini-ork/state.db \
   pairwise voter correlation low — avoid two researchers on the same
   provider family.
 - Want a stricter no-regression gate? Edit
-  `recipes/recursive-self-improve/verifiers/no-regression.sh` to require
+  `recipes/recursive-self-improve/verifiers/no-regression.py` to require
   a positive benchmark delta rather than just non-negative.
 - Want to suppress arXiv calls? Remove the `arxiv_research` node from
   `workflow.yaml` — the synthesizer will run without external evidence
@@ -195,11 +220,12 @@ sqlite3 .mini-ork/state.db \
 ## Testing
 
 ```bash
-bash tests/integration/test_recursive_self_improve_recipe.sh
+python3 -m pytest -q tests/unit/test_mini_ork_self_improve_py.py \
+  recipes/recursive-self-improve/verifiers/tests/
 ```
 
-Currently asserts: scaffolding presence (16 files), workflow lane
-routing for all 7 dispatched nodes, agents override lane bindings,
-migration idempotency + table presence, verifier behavior on empty /
-polluted / clean / converged inputs, and the outer runner's `--dry-run`
-+ invalid-cap rejection.
+`test_mini_ork_self_improve_py.py` covers the outer runner's pure core
+(`decide_outcome`, cap validation, the DB record blocks); the verifier tests
+cover `no-regression.py`'s benchmark delta. The bash-era
+`tests/integration/test_recursive_self_improve_recipe.sh` was removed with the
+2026-07 bash removal.
