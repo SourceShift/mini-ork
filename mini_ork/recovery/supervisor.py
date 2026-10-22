@@ -29,6 +29,10 @@ closing run never published kept no record of what delivered it.
                      control arm shows its kind is no better than a blind
                      rerun. R2 also writes the ``NNN.outcome.json`` file R6's
                      credit gate and ``mini-ork graph-patch credit`` read.
+    R7 — split:      a run ``waiting_on_children`` from a ``split`` graph
+                     patch → supersede the parent once every child epic is
+                     ``done``, or give up (and notify once) when one child
+                     ``escalated``/``abandoned``.
 
 No rule asks a human for approval: the operator is *notified* through the
 oversight inbox (``mo_inbox_gates``), never blocked on it. Every
@@ -54,11 +58,15 @@ __all__ = ["sweep"]
 
 SUPERVISOR_GATE = "self-driving-supervisor"
 _FIX_EPIC_FEATURE = "fix epic failed: {run_id}"
+_SPLIT_FAILED_FEATURE = "split child failed: {run_id}"
 _LANDING_REF = "origin/main"
 _ATTEMPT_FILE = "repair.json"
+#: The child epic statuses that mean a split cannot deliver (R7).
+_SPLIT_FAILED_CHILD_STATUSES = frozenset({"escalated", "abandoned"})
 #: ``repair.json`` states that mean an active loop owns the run: R4 must never
 #: supersede one out from under it.
-_SUPERSEDE_OWNED_STATES = frozenset({"waiting_on_fix", "reviving", "repairing"})
+_SUPERSEDE_OWNED_STATES = frozenset({"waiting_on_fix", "reviving", "repairing",
+                                     "waiting_on_children"})
 #: R4's budget: the most recent failed rows, newest first.
 _SUPERSEDE_SCAN_LIMIT = 500
 #: R6: ``repair.json`` states a run may be in when the supervisor may apply a
@@ -138,6 +146,20 @@ def _patch_key(repair: dict[str, Any]) -> str | None:
     file name and the action's ``patch`` value canonical.
     """
     raw = repair.get("revive_patch")
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        return f"{int(text):03d}"
+    except (TypeError, ValueError):
+        return None
+
+
+def _split_patch_key(repair: dict[str, Any]) -> str | None:
+    """The ``NNN`` split patch recorded by ``graph_patch.apply``, if any."""
+    raw = repair.get("split_patch")
     if raw is None:
         return None
     text = str(raw).strip()
@@ -277,6 +299,23 @@ def _notify_once(db: str, run_id: str) -> None:
         SUPERVISOR_GATE, feature,
         context={"run_id": run_id,
                  "reason": "the fix epic for this run ended unsuccessfully"},
+        db_path=db,
+    )
+
+
+def _notify_split_failed_once(db: str, run_id: str, child_id: str,
+                              status: str) -> None:
+    """Enqueue one split-failure notice, skipping when it already exists."""
+    feature = _SPLIT_FAILED_FEATURE.format(run_id=run_id)
+    if _inbox_row_exists(db, SUPERVISOR_GATE, feature):
+        return
+    from mini_ork.gates import oversight_inbox  # noqa: PLC0415
+
+    oversight_inbox.enqueue(
+        SUPERVISOR_GATE, feature,
+        context={"run_id": run_id, "child_epic_id": child_id,
+                 "child_status": status,
+                 "reason": "a split child epic ended unsuccessfully"},
         db_path=db,
     )
 
@@ -475,7 +514,10 @@ def sweep(home: str, db: str, *, engine_root: str, now: float | None = None,
         state = repair.get("state")
         try:
             action = None
-            if state == "waiting_on_fix":
+            if state == "waiting_on_children":
+                action = _rule_split(run_id, run_dir, repair, db, now_f,
+                                     dry_run)
+            elif state == "waiting_on_fix":
                 action = _rule_revive(run_id, run_dir, repair, db, engine_root,
                                       home_p, now_f, dry_run, spawn_fn, budget,
                                       land_cache)
@@ -587,6 +629,90 @@ def _rule_revive(run_id: str, run_dir: Path, repair: dict[str, Any], db: str,
     return {"run_id": run_id, "action": "revive",
             "reason": f"fix epic {epic_id} landed on origin/main",
             "from_node": from_node, "epic_id": epic_id}
+
+
+def _rule_split(run_id: str, run_dir: Path, repair: dict[str, Any], db: str,
+                now: float, dry_run: bool) -> dict | None:
+    """R7 — close a run whose remaining work was split into child epics.
+
+    Every child ``done`` → compare-and-set the parent ``failed → superseded``
+    and record the outcome as passed. Any child ``escalated``/``abandoned`` →
+    ``gave_up`` with one deduped oversight notice and a failed outcome. Anything
+    else (still running, blocked, missing) → no action: the split is not done.
+    """
+    raw_ids = repair.get("child_epic_ids")
+    if not isinstance(raw_ids, list) or not raw_ids:
+        return None
+    child_ids = [str(child_id) for child_id in raw_ids if str(child_id)]
+    if not child_ids:
+        return None
+    split_patch = _split_patch_key(repair)
+
+    statuses: dict[str, str] = {}
+    for child_id in child_ids:
+        epic = _epic(db, child_id)
+        statuses[child_id] = epic[0] if epic is not None else ""
+
+    failed = [child_id for child_id in child_ids
+              if statuses[child_id] in _SPLIT_FAILED_CHILD_STATUSES]
+    if failed:
+        child_id = failed[0]
+        status = statuses[child_id]
+        note = f"split child {child_id} ended {status}"
+        if not dry_run:
+            if split_patch:
+                _write_outcome_once(run_dir, split_patch, {
+                    "passed": False,
+                    "status": "gave_up",
+                    "child_epic_ids": child_ids,
+                    "failed_child": child_id,
+                    "failed_status": status,
+                    "closed_at": int(now),
+                })
+            updated = dict(repair)
+            updated["state"] = "gave_up"
+            updated["note"] = note
+            _write_repair(run_dir, updated)
+            _notify_split_failed_once(db, run_id, child_id, status)
+        action = {"run_id": run_id, "action": "split_failed", "reason": note,
+                  "child_epic_ids": child_ids}
+        if split_patch:
+            action["patch"] = split_patch
+        return action
+
+    if not all(statuses[child_id] == "done" for child_id in child_ids):
+        return None  # children still in flight (or not started): wait
+
+    task = _task_run(db, run_id)
+    if task is None or task[0] != "failed":
+        return None  # only a failed parent is the split's to close
+
+    note = (" superseded: delivered by split children "
+            + ", ".join(child_ids))
+    if not dry_run:
+        if _write(
+                db,
+                "UPDATE task_runs SET status='superseded',"
+                " notes=COALESCE(notes,'') || ?"
+                " WHERE id=? AND status='failed'",
+                (note, run_id)) != 1:
+            return None  # the row moved on after it was read
+        if split_patch:
+            _write_outcome_once(run_dir, split_patch, {
+                "passed": True,
+                "status": "superseded",
+                "child_epic_ids": child_ids,
+                "closed_at": int(now),
+            })
+        updated = dict(repair)
+        updated["state"] = "split_done"
+        _write_repair(run_dir, updated)
+    action = {"run_id": run_id, "action": "split_done",
+              "reason": f"all split children done: {', '.join(child_ids)}",
+              "child_epic_ids": child_ids}
+    if split_patch:
+        action["patch"] = split_patch
+    return action
 
 
 def _rule_label(run_id: str, run_dir: Path, repair: dict[str, Any], db: str,

@@ -5,6 +5,7 @@ Verbs::
     graph-patch list <run_id> [--json]
     graph-patch propose <run_id> --kind K --from-node N
                         [--node X] [--lane L] [--new-node-json J]
+                        [--children-json J]
                         [--source orchestrator|operator|supervisor] --reason R [--json]
     graph-patch validate <run_id> <n> [--json]      # materialize only
     graph-patch apply <run_id> <n> [--dry-run] [--json]
@@ -58,6 +59,17 @@ def _propose_patch(args: argparse.Namespace) -> dict:
         except json.JSONDecodeError as exc:
             raise graph_patch.GraphPatchError(
                 f"--new-node-json is not valid JSON: {exc}") from exc
+    children_json = getattr(args, "children_json", None)
+    if children_json:
+        try:
+            children = json.loads(children_json)
+        except json.JSONDecodeError as exc:
+            raise graph_patch.GraphPatchError(
+                f"--children-json is not valid JSON: {exc}") from exc
+        if not isinstance(children, list):
+            raise graph_patch.GraphPatchError(
+                "--children-json must be a JSON list of child scopes")
+        patch["children"] = children
     return patch
 
 
@@ -129,6 +141,7 @@ def main(argv: list[str] | None = None) -> int:
     p_propose.add_argument("--node")
     p_propose.add_argument("--lane")
     p_propose.add_argument("--new-node-json")
+    p_propose.add_argument("--children-json")
     p_propose.add_argument("--reason", required=True)
     p_propose.add_argument("--source", default="operator")
     p_propose.add_argument("--json", action="store_true")

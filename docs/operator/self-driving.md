@@ -12,7 +12,7 @@ tree, the DB and `origin/main`; when it needs a human it enqueues a *notice* in
 the oversight inbox (`mo_inbox_gates`, gate `self-driving-supervisor`) and keeps
 going. Nothing waits on that notice.
 
-## What one sweep does (R1–R6)
+## What one sweep does (R1–R7)
 
 **R1 — revive.** For every `runs/*/repair.json` with `state="waiting_on_fix"`
 and a `fix_epic_id`, read the epic's status:
@@ -97,6 +97,31 @@ whose `repair.json` state is absent, `gave_up` or `revive_failed`:
   run's `repair.json` becomes `reviving` with `revive_patch: "NNN"` and the
   revive starts from the patch's node. A patch that cannot materialize
   produces an `error` action for that run; the sweep continues.
+
+**R7 — close a split.** The last rung of the repair ladder hands a failed run's
+remaining work to child epics instead of reviving it. `graph_patch.apply` on a
+`split` patch creates one `epics` row per child (`not started`, the parent's
+recipe, a `<run_id>/graph-patches/NNN-split/<epic_id>.md` kickoff holding the
+parent kickoff plus that child's scope) and moves the parent's `repair.json` to
+`state="waiting_on_children"` with `child_epic_ids` and `split_patch: "NNN"`.
+R7 closes that loop for every `repair.json` in `waiting_on_children`:
+
+- every child epic `done` → compare-and-set the parent's `task_runs.status` from
+  `failed` to `superseded` with a ` superseded: delivered by split children
+  <ids>` note, set `repair.json` to `state="split_done"`, and write
+  `graph-patches/NNN.outcome.json` `{"passed": true, ...}` (write-once). Action
+  `split_done`.
+- any child `escalated` or `abandoned` → `repair.json` `state="gave_up"` with a
+  note naming the child, an outcome `{"passed": false, ...}`, and one oversight
+  notice (`split child failed: <run_id>`) that is skipped when the same gate and
+  feature already exist in any status. Action `split_failed`.
+- anything else (children still running, blocked, or missing) → no action; the
+  parent stays parked. A parent that is no longer `failed` is never touched.
+
+The outcome file belongs to the split patch (`NNN.outcome.json`), so
+`mini-ork graph-patch credit` scores the `split` kind alongside the others.
+`dry_run` reports the same `split_done`/`split_failed` actions and writes
+nothing.
 
 `dry_run` computes the same action list without materializing the workflow:
 it installs no `NNN.applied.json`, spawns nothing, and leaves `repair.json`
@@ -189,6 +214,8 @@ Each action is a small dict: `{"run_id", "action", "reason", ...}`.
 | `label` | a revived run's diagnosis was labelled (`correct`: true/false; `patch` when a graph patch revived it) |
 | `apply_patch` | a proposed graph patch was applied (`patch`, `kind`); R6 |
 | `supersede` | a failed run's work was delivered elsewhere; it is now `superseded` |
+| `split_done` | every split child is `done`; the parent was superseded (`patch`, `child_epic_ids`) |
+| `split_failed` | a split child `escalated`/`abandoned`; the parent gave up and the operator was notified (`patch`, `child_epic_ids`) |
 | `backlink` | a done epic's notes gained `delivered_by=<run|commit>` |
 | `error` | that run dir could not be processed; the sweep continued |
 

@@ -49,11 +49,17 @@ from mini_ork.dispatch.models import DispatchRequest
 from mini_ork.workflow.compiler import WorkflowCompileError, compile_workflow
 
 PATCH_DIRNAME = "graph-patches"
-KINDS = ("rerun", "swap_lane", "insert_before", "replace", "replan")
+KINDS = ("rerun", "swap_lane", "insert_before", "replace", "replan", "split")
 SOURCES = ("orchestrator", "operator", "supervisor")
 _ALLOWED_KEYS = frozenset(
-    {"kind", "from_node", "node", "lane", "new_node", "reason", "source", "created_at"}
+    {"kind", "from_node", "node", "lane", "new_node", "reason", "source",
+     "created_at", "children"}
 )
+# ── split (SDE-6b) ─────────────────────────────────────────────────────────
+
+_SPLIT_MAX_CHILDREN = 4
+_SPLIT_REFUSAL = "split patches do not change the workflow; apply them"
+_SPLIT_CHILD_KEYS = frozenset({"title", "goal"})
 # Edge types that route control (revise target, failure route) rather than
 # data; ``insert_before`` leaves them pointing at the original node.
 _CONTROL_EDGE_TYPES = frozenset({"retries", "escalates_to"})
@@ -157,6 +163,33 @@ def _require_non_empty_str(patch: Mapping[str, Any], key: str) -> str:
     return value
 
 
+def _validate_children(children: Any) -> list[dict[str, str]]:
+    """A split's 1–4 child scopes: ``{title, goal}`` strings and nothing else."""
+    if not isinstance(children, list) or not 1 <= len(children) <= _SPLIT_MAX_CHILDREN:
+        raise GraphPatchError(
+            "split requires children to be a list of 1 to "
+            f"{_SPLIT_MAX_CHILDREN} mappings")
+    validated: list[dict[str, str]] = []
+    for index, child in enumerate(children, start=1):
+        if not isinstance(child, Mapping):
+            raise GraphPatchError(f"split child {index} must be a mapping")
+        unknown = set(child) - _SPLIT_CHILD_KEYS
+        if unknown:
+            raise GraphPatchError(
+                f"split child {index} has unknown key(s): "
+                f"{', '.join(sorted(str(key) for key in unknown))}")
+        title = child.get("title")
+        goal = child.get("goal")
+        if not isinstance(title, str) or not title.strip():
+            raise GraphPatchError(
+                f"split child {index} requires a non-empty title")
+        if not isinstance(goal, str) or not goal.strip():
+            raise GraphPatchError(
+                f"split child {index} requires a non-empty goal")
+        validated.append({"title": title, "goal": goal})
+    return validated
+
+
 def _validate_new_node(new_node: Any) -> dict[str, Any]:
     if not isinstance(new_node, Mapping):
         raise GraphPatchError("graph patch requires new_node to be a node mapping")
@@ -206,6 +239,8 @@ def _validate_schema(patch: Mapping[str, Any]) -> dict[str, Any]:
                 "replace requires new_node.name to equal node")
         if from_node != node:
             raise GraphPatchError("replace requires from_node to equal node")
+    elif kind == "split":
+        _validate_children(patch.get("children"))
     # rerun: only the shared from_node/reason checks apply. replan: same.
     return dict(patch)
 
@@ -741,6 +776,10 @@ def materialize(home: str | Path, run_id: str, n: int) -> str:
     number = int(n)
     patch_dir = _patch_dir(_run_dir(home, run_id))
     patch = _load_patch(patch_dir, number)
+    if patch["kind"] == "split":
+        # A split creates child epics instead of reviving this run, so there
+        # is no workflow to compile; applying it is the only useful operation.
+        raise GraphPatchError(_SPLIT_REFUSAL)
 
     base = base_workflow(home, run_id)
     if not base or not Path(base).is_file():
@@ -873,6 +912,170 @@ def _default_spawn(home: Path, run_id: str, number: int,
     return _spawn
 
 
+def _unlink_quiet(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _split_db(home: Path) -> str:
+    """The DB a split writes its child epics to (same rule as ``_live_status``)."""
+    return os.environ.get("MINI_ORK_DB") or str(home / "state.db")
+
+
+def _parent_kickoff_text(run_dir: Path) -> str:
+    """The parent run's kickoff: the snapshot, else ``run_profile.json``'s file."""
+    snapshot_path = run_dir / "context-pack.v2.json"
+    if snapshot_path.is_file():
+        try:
+            document = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            document = None
+        if isinstance(document, Mapping):
+            snapshot = document.get("kickoff_snapshot")
+            if isinstance(snapshot, str) and snapshot.strip():
+                return snapshot
+
+    profile_path = run_dir / "run_profile.json"
+    if profile_path.is_file():
+        try:
+            profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            profile = None
+        if isinstance(profile, Mapping):
+            kickoff_path = profile.get("kickoff_path")
+            if isinstance(kickoff_path, str) and kickoff_path.strip():
+                try:
+                    text = Path(kickoff_path).read_text(encoding="utf-8")
+                except OSError:
+                    text = ""
+                if text.strip():
+                    return text
+
+    raise GraphPatchError(
+        f"run {run_dir.name} has no parent kickoff text: no "
+        "context-pack.v2.json kickoff_snapshot and no readable "
+        "run_profile.json kickoff_path")
+
+
+def _child_kickoff_text(parent_text: str, *, run_id: str, from_node: str,
+                        number: int, child: Mapping[str, str]) -> str:
+    """The parent kickoff, then this child's scope, then the parent's coords."""
+    text = parent_text
+    if not text.endswith("\n"):
+        text += "\n"
+    return (
+        f"{text}\n## This child's scope\n\n"
+        f"{child['title']}\n\n{child['goal']}\n\n"
+        f"Parent run: {run_id} (failing node {from_node}, "
+        f"graph patch {int(number):03d}).\n"
+    )
+
+
+def _update_repair_split(run_dir: Path, number: int,
+                         child_ids: list[str]) -> None:
+    """Mark the parent ``waiting_on_children``, keeping every other key."""
+    path = run_dir / "repair.json"
+    data: dict[str, Any] = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            loaded = None
+        if isinstance(loaded, dict):
+            data = loaded
+    data["state"] = "waiting_on_children"
+    data["child_epic_ids"] = list(child_ids)
+    data["split_patch"] = f"{int(number):03d}"
+    _write_json_atomic(path, data)
+
+
+def _apply_split(home: Path, run_id: str, number: int,
+                 patch: Mapping[str, Any], run_dir: Path, patch_dir: Path,
+                 dry_run: bool) -> dict[str, Any]:
+    """Create one child epic (and kickoff file) per split scope.
+
+    Never materializes a workflow and never spawns: the parent is not revived,
+    it waits for the scheduler to deliver its children (supervisor R7 closes
+    it). The epic inserts share one transaction; any failure rolls back and
+    removes the kickoff files already written, so a refused split leaves no
+    partial fan-out behind.
+    """
+    import sqlite3
+
+    children = _validate_children(patch.get("children"))
+    from_node = str(patch["from_node"])
+    child_ids = [f"split-{run_id}-{int(number):03d}-{index}"
+                 for index in range(1, len(children) + 1)]
+    result: dict[str, Any] = {
+        "number": number,
+        "workflow": None,
+        "from_node": from_node,
+        "dry_run": bool(dry_run),
+        "pid": None,
+        "child_epic_ids": child_ids,
+    }
+    if dry_run:
+        return result
+
+    parent_text = _parent_kickoff_text(run_dir)
+    db = _split_db(home)
+    if not os.path.isfile(db):
+        raise GraphPatchError(
+            f"cannot split run {run_id}: state database {db} not found")
+
+    split_dir = patch_dir / f"{int(number):03d}-split"
+    split_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    try:
+        for child_id, child in zip(child_ids, children):
+            path = split_dir / f"{child_id}.md"
+            path.write_text(
+                _child_kickoff_text(parent_text, run_id=str(run_id),
+                                    from_node=from_node, number=number,
+                                    child=child),
+                encoding="utf-8")
+            written.append(path)
+
+        from mini_ork.scheduler import ensure_retry_schema  # noqa: PLC0415
+
+        ensure_retry_schema(db)
+        con = sqlite3.connect(db, timeout=5.0)
+        try:
+            row = con.execute("SELECT recipe FROM task_runs WHERE id=?",
+                              (str(run_id),)).fetchone()
+            recipe = row[0] if row else None
+            with con:  # one transaction: any failed insert rolls back all
+                for child_id, child, path in zip(child_ids, children, written):
+                    con.execute(
+                        "INSERT INTO epics"
+                        " (id, title, status, kickoff_path, recipe, notes)"
+                        " VALUES (?, ?, 'not started', ?, ?, ?)",
+                        (child_id, child["title"], str(path), recipe,
+                         f"split from {run_id} graph patch {int(number):03d}"))
+        finally:
+            con.close()
+    except sqlite3.IntegrityError as exc:
+        for path in written:
+            _unlink_quiet(path)
+        raise GraphPatchError(
+            f"split child epic already exists for run {run_id} "
+            f"graph patch {int(number):03d}") from exc
+    except BaseException:
+        for path in written:
+            _unlink_quiet(path)
+        raise
+
+    _write_json_atomic(patch_dir / f"{int(number):03d}.applied.json", {
+        "applied_at": _now_iso(),
+        "child_epic_ids": child_ids,
+        "from_node": from_node,
+    })
+    _update_repair_split(run_dir, number, child_ids)
+    return result
+
+
 def apply(home: str | Path, run_id: str, n: int, *, engine_root: str | Path,
           spawn: Spawn | None = None, dry_run: bool = False) -> dict[str, Any]:
     """Materialize patch ``n`` and (unless ``dry_run``) revive the run from it."""
@@ -897,6 +1100,12 @@ def apply(home: str | Path, run_id: str, n: int, *, engine_root: str | Path,
         raise GraphPatchError(
             f"run {run_id} is still {live_status}; apply a graph patch only to "
             "a run that has stopped")
+
+    if patch["kind"] == "split":
+        # No workflow to compile and no revive to spawn: a split hands the
+        # remaining work to child epics.
+        return _apply_split(home_path, str(run_id), number, patch, run_dir,
+                            patch_dir, dry_run)
 
     workflow_path = materialize(home, run_id, number)
     # A replan chain replaced the failing node, so the run must revive from the
