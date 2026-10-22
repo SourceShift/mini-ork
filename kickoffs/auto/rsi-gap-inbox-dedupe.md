@@ -70,13 +70,9 @@ or `mini_ork/learning/writeback.py`.
   `subprocess` and `sys.executable -m mini_ork.learning.reward_audit`, cwd =
   repository root, against a temp DB).
 
-## Verification command
+## Verification commands
 
-The command that proves this run succeeded:
-
-```bash
-python3 -m pytest -q tests/unit/test_reward_audit_py.py tests/unit/test_writeback_validity_masking_py.py
-```
+- `pytest -q tests/unit/test_reward_audit_py.py tests/unit/test_writeback_validity_masking_py.py`
 
 ## Self-application measurement
 
