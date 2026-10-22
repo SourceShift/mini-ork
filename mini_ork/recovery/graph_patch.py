@@ -284,10 +284,14 @@ def base_workflow(home: str | Path, run_id: str) -> str:
     caller's shell cannot steer the resolution to another run.
     """
     patch_dir = _patch_dir(_run_dir(home, run_id))
-    applied = _applied_numbers(patch_dir)
-    if applied:
-        newest = applied[-1]
-        return str(patch_dir / f"{newest:03d}.workflow.yaml")
+    # Newest applied artifact that is actually on disk. A recorded applied
+    # patch whose ``NNN.workflow.yaml`` was deleted or never written must not
+    # strand the chain: fall back to the newest artifact before it, and
+    # ultimately to the run's own workflow.
+    for number in reversed(_applied_numbers(patch_dir)):
+        workflow = patch_dir / f"{number:03d}.workflow.yaml"
+        if workflow.is_file():
+            return str(workflow)
 
     from mini_ork.recovery import planner as recovery_planner
 
@@ -601,8 +605,10 @@ def _read_replan_cache(path: Path) -> list[dict[str, Any]]:
     except ValueError as exc:
         raise GraphPatchError(f"invalid replan cache {path}: {exc}") from exc
     nodes = document.get("nodes") if isinstance(document, Mapping) else document
-    if not isinstance(nodes, list) or not all(
-            isinstance(node, Mapping) for node in nodes):
+    # An empty list is invalid, not vacuous: a replan chain is 1-3 nodes, and
+    # accepting ``[]`` would surface as an IndexError at ``chain[0]`` in apply.
+    if (not isinstance(nodes, list) or not nodes
+            or not all(isinstance(node, Mapping) for node in nodes)):
         raise GraphPatchError(f"invalid replan cache {path}: no node list")
     return [dict(node) for node in nodes]
 

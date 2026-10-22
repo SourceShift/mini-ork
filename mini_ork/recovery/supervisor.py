@@ -23,6 +23,12 @@ closing run never published kept no record of what delivered it.
     R5 — back-link:  a ``done`` epic whose closing run did not publish (and has
                      no ``delivered_by=`` note yet) → record the delivering run
                      or ``origin/main`` commit on the epic's notes.
+    R6 — apply:      a failed run that no repair loop owns, with a still
+                     ``proposed`` graph patch → apply the lowest one through
+                     ``graph_patch.apply`` (budget-shared with R1), unless the
+                     control arm shows its kind is no better than a blind
+                     rerun. R2 also writes the ``NNN.outcome.json`` file R6's
+                     credit gate and ``mini-ork graph-patch credit`` read.
 
 No rule asks a human for approval: the operator is *notified* through the
 oversight inbox (``mo_inbox_gates``), never blocked on it. Every
@@ -55,6 +61,12 @@ _ATTEMPT_FILE = "repair.json"
 _SUPERSEDE_OWNED_STATES = frozenset({"waiting_on_fix", "reviving", "repairing"})
 #: R4's budget: the most recent failed rows, newest first.
 _SUPERSEDE_SCAN_LIMIT = 500
+#: R6: ``repair.json`` states a run may be in when the supervisor may apply a
+#: proposed patch. ``None`` (no ``repair.json`` at all) is eligible too.
+_R6_ELIGIBLE_STATES = frozenset({"", "gave_up", "revive_failed"})
+#: R6's hard ceiling on applied patches per run. The env var tightens it,
+#: never raises it.
+_DEFAULT_MAX_PATCHES_PER_RUN = 2
 
 
 # ── small io / time helpers ─────────────────────────────────────────────────
@@ -116,6 +128,53 @@ def _write_repair(run_dir: Path, data: dict[str, Any]) -> None:
         except OSError:
             pass
         raise
+
+
+def _patch_key(repair: dict[str, Any]) -> str | None:
+    """The ``NNN`` revive patch recorded by ``graph_patch.apply``, if any.
+
+    ``graph_patch`` writes it zero-padded, but an older ``repair.json`` could
+    carry a bare integer-looking string; normalising here keeps the outcome
+    file name and the action's ``patch`` value canonical.
+    """
+    raw = repair.get("revive_patch")
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        return f"{int(text):03d}"
+    except (TypeError, ValueError):
+        return None
+
+
+def _write_outcome_once(run_dir: Path, patch: str, payload: dict[str, Any]) -> bool:
+    """Write ``graph-patches/NNN.outcome.json`` exactly once.
+
+    ``O_CREAT|O_EXCL`` is the write-once guarantee: an existing file (written
+    by an earlier sweep or an operator) is left byte-for-byte alone. Returns
+    whether this call created the file.
+    """
+    directory = run_dir / "graph-patches"
+    destination = directory / f"{patch}.outcome.json"
+    if destination.is_file():
+        return False
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        return False  # another sweep won the race — its file is the outcome
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    except OSError:
+        try:
+            destination.unlink()
+        except OSError:
+            pass
+        raise
+    return True
 
 
 # ── sqlite reads (the sweep never writes the DB directly) ───────────────────
@@ -385,8 +444,9 @@ def sweep(home: str, db: str, *, engine_root: str, now: float | None = None,
     Returns:
         One action dict per run or epic acted on (``run_id`` or ``epic_id`` /
         ``action`` / ``reason`` plus any detail the action carries). The
-        per-``repair.json`` rules come first; R4's and R5's dicts are appended
-        after them. Something left alone yields no dict.
+        per-``repair.json`` rules come first, then R4's supersede pass, R6's
+        apply pass, and R5's back-link dicts. Something left alone yields no
+        dict.
     """
     home_p = Path(home)
     now_f = float(now) if now is not None else time.time()
@@ -397,6 +457,9 @@ def sweep(home: str, db: str, *, engine_root: str, now: float | None = None,
 
     budget = {"left": max(0, int(max_revives))}
     land_cache: dict[str, Any] = {}
+    # ``graph_patch.credit`` walks every run's patches; R6 shares one report
+    # across the whole sweep.
+    credit_cache: dict[str, Any] = {}
     actions: list[dict] = []
 
     for repair_path in sorted((home_p / "runs").glob(f"*/{_ATTEMPT_FILE}")):
@@ -444,6 +507,18 @@ def sweep(home: str, db: str, *, engine_root: str, now: float | None = None,
     except Exception as exc:  # one bad DB must never stop the sweep
         actions.append({"run_id": "", "action": "error",
                         "reason": f"supersede rule: {type(exc).__name__}: {exc}"})
+
+    # R6 scans run dirs that carry a ``graph-patches/`` directory, not every
+    # ``repair.json``: a failed run may have no repair state at all. It runs
+    # after R4 so a run whose work was delivered elsewhere is superseded, not
+    # revived from a patch.
+    try:
+        actions.extend(_rule_apply_patch(home_p, db, engine_root, dry_run,
+                                         spawn, budget, credit_cache))
+    except Exception as exc:  # one bad run dir never stops the sweep
+        actions.append({"run_id": "", "action": "error",
+                        "reason": f"apply-patch rule: {type(exc).__name__}: {exc}"})
+
     try:
         actions.extend(_rule_backlink(db, engine_root, dry_run))
     except Exception as exc:  # one bad DB must never stop the sweep
@@ -537,6 +612,7 @@ def _rule_label(run_id: str, run_dir: Path, repair: dict[str, Any], db: str,
     new_state = "revived" if correct else "revive_failed"
     reason = (f"revived run {status} — diagnosis was "
               f"{'right' if correct else 'wrong'}")
+    patch = _patch_key(repair)
     if not dry_run:
         fix_epic_id = repair.get("fix_epic_id")
         from mini_ork.stores import diagnosis_ledger  # noqa: PLC0415
@@ -544,6 +620,16 @@ def _rule_label(run_id: str, run_dir: Path, repair: dict[str, Any], db: str,
         for ledger_id in _ledger_ids(db, run_id,
                                      str(fix_epic_id) if fix_epic_id else None):
             diagnosis_ledger.set_label(db, ledger_id, correct, reason)
+        if patch:
+            # The outcome file is what ``graph_patch.credit`` joins back to the
+            # patch kind (R6's control arm). Write it before ``labelled_at`` is
+            # recorded so a failed write is retried by the next sweep instead
+            # of being silently skipped forever.
+            _write_outcome_once(run_dir, patch, {
+                "passed": bool(correct),
+                "status": status,
+                "labelled_at": int(now),
+            })
         updated = dict(repair)
         updated["labelled_at"] = int(now)
         updated["label_correct"] = bool(correct)
@@ -553,8 +639,184 @@ def _rule_label(run_id: str, run_dir: Path, repair: dict[str, Any], db: str,
         if repair.get("state") == "reviving":
             updated["state"] = new_state
         _write_repair(run_dir, updated)
-    return {"run_id": run_id, "action": "label", "reason": reason,
-            "correct": correct}
+    action = {"run_id": run_id, "action": "label", "reason": reason,
+              "correct": correct}
+    if patch:
+        action["patch"] = patch
+    return action
+
+
+# ── R6: apply a proposed graph patch ───────────────────────────────────────
+
+
+def _max_patches_per_run() -> int:
+    """``MO_SUPERVISE_MAX_PATCHES_PER_RUN``, clamped to the hard default.
+
+    Tighten-only (kickoff): a smaller value lowers the cap below 2, a larger
+    one never raises it above 2. An unparseable value keeps the default, so a
+    typo cannot switch the cap off.
+    """
+    raw = os.environ.get("MO_SUPERVISE_MAX_PATCHES_PER_RUN")
+    if raw is None:
+        return _DEFAULT_MAX_PATCHES_PER_RUN
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_PATCHES_PER_RUN
+    return max(0, min(value, _DEFAULT_MAX_PATCHES_PER_RUN))
+
+
+def _credit_report(cache: dict[str, Any], home: Path, graph_patch) -> dict:
+    """``graph_patch.credit(home)`` computed at most once per sweep."""
+    if "report" not in cache:
+        cache["report"] = graph_patch.credit(home)
+    return cache["report"]
+
+
+def _argv_from_node(argv) -> str | None:
+    """The ``--from-node`` value from the argv ``graph_patch.apply`` builds."""
+    args = list(argv)
+    try:
+        index = args.index("--from-node")
+    except ValueError:
+        return None
+    if index + 1 >= len(args):
+        return None
+    return str(args[index + 1])
+
+
+def _rule_apply_patch(home: Path, db: str, engine_root: str, dry_run: bool,
+                      spawn: Callable[[str, str | None], int | None] | None,
+                      budget: dict, credit_cache: dict[str, Any]) -> list[dict]:
+    """R6 — apply the lowest proposed graph patch on a failed, unparked run.
+
+    Per run with a ``graph-patches/`` directory: only ``task_runs.status ==
+    "failed"`` and a ``repair.json`` state that no loop owns (absent,
+    ``gave_up``, ``revive_failed``) qualify. One applied patch without an
+    outcome means a revive is in flight; ``MO_SUPERVISE_MAX_PATCHES_PER_RUN``
+    bounds the run's total. When the picked kind is not ``rerun`` and the
+    control arm has at least five samples on both sides, a kind that is not
+    ``credited`` (strictly better than a blind rerun) is skipped.
+    """
+    from mini_ork.recovery import graph_patch  # noqa: PLC0415 — import-time flag
+
+    cap = _max_patches_per_run()
+    actions: list[dict] = []
+    for patch_dir in sorted((home / "runs").glob(f"*/{graph_patch.PATCH_DIRNAME}")):
+        if not patch_dir.is_dir():
+            continue
+        run_dir = patch_dir.parent
+        run_id = run_dir.name
+        try:
+            action = _apply_one_patch(
+                run_id, run_dir, patch_dir, home, db, engine_root, dry_run,
+                spawn, budget, credit_cache, cap, graph_patch)
+        except graph_patch.GraphPatchError as exc:
+            actions.append({"run_id": run_id, "action": "error",
+                            "reason": str(exc)})
+            continue
+        except Exception as exc:  # one bad run dir never stops the sweep
+            actions.append({"run_id": run_id, "action": "error",
+                            "reason": f"{type(exc).__name__}: {exc}"})
+            continue
+        if action is not None:
+            actions.append(action)
+    return actions
+
+
+def _apply_one_patch(run_id: str, run_dir: Path, patch_dir: Path, home: Path,
+                     db: str, engine_root: str, dry_run: bool,
+                     spawn: Callable[[str, str | None], int | None] | None,
+                     budget: dict, credit_cache: dict[str, Any], cap: int,
+                     graph_patch) -> dict | None:
+    """One run's R6 decision: an action dict, or ``None`` when it is skipped."""
+    task = _task_run(db, run_id)
+    if task is None or task[0] != "failed":
+        return None  # only a failed run that no other rule owns
+    state = _repair_state(run_dir)
+    if state is not None and state not in _R6_ELIGIBLE_STATES:
+        return None  # a live repair loop owns the run (or it is unreadable)
+
+    entries = graph_patch.list_patches(home, run_id)
+    applied = [entry for entry in entries if entry.get("status") == "applied"]
+    if any(entry.get("outcome") is None for entry in applied):
+        return None  # one applied patch is still awaiting its R2 outcome
+    if len(applied) >= cap:
+        return None  # the per-run explore/exploit budget is spent
+
+    # Read the replan flag at sweep time, never at import: SDE-6a flips it.
+    replan_supported = bool(getattr(graph_patch, "REPLAN_SUPPORTED", False))
+    chosen = next(
+        (entry for entry in entries
+         if entry.get("status") == "proposed"
+         and (entry.get("kind") != "replan" or replan_supported)
+         # A patch that already failed to apply is never retried: a replan
+         # re-asks the model on every attempt, so a retry loop would spend on
+         # every sweep for a patch that cannot materialize.
+         and not (patch_dir / f"{int(entry['number']):03d}.apply-error.json").is_file()),
+        None)
+    if chosen is None:
+        return None
+
+    number = int(chosen["number"])
+    kind = str(chosen.get("kind") or "")
+    if kind != "rerun":
+        report = _credit_report(credit_cache, home, graph_patch)
+        mine = report.get(kind) or {"n": 0, "rate": 0.0, "credited": False}
+        control = report.get("rerun") or {"n": 0, "rate": 0.0}
+        if (int(mine.get("n") or 0) >= 5
+                and int(control.get("n") or 0) >= 5
+                and not mine.get("credited")):
+            return {"run_id": run_id, "action": "skip",
+                    "reason": (f"{kind} is not better than a blind rerun "
+                               f"({float(mine.get('rate') or 0):.2f} vs "
+                               f"{float(control.get('rate') or 0):.2f})")}
+
+    if budget["left"] <= 0:
+        return {"run_id": run_id, "action": "skip",
+                "reason": "revive budget exhausted for this sweep"}
+    budget["left"] -= 1
+
+    action = {"run_id": run_id, "action": "apply_patch",
+              "patch": f"{number:03d}", "kind": kind,
+              "reason": f"applied {kind} patch {number:03d} on failed run"}
+    if dry_run:
+        # ``graph_patch.apply(dry_run=True)`` still materializes the workflow;
+        # the sweep's dry run writes nothing at all, so preview the action
+        # without calling it.
+        return action
+
+    adapter = None
+    if spawn is not None:
+        def adapter(argv, _run_id=run_id, _spawn=spawn):
+            # The sweep's seam is ``spawn(run_id, from_node)``; the argv is how
+            # ``graph_patch.apply`` names the node it would resume from.
+            return _spawn(_run_id, _argv_from_node(argv))
+    try:
+        graph_patch.apply(home, run_id, number, engine_root=engine_root,
+                          spawn=adapter)
+    except graph_patch.GraphPatchError as exc:
+        # Nothing was revived: give the budget back, and record the failure
+        # once so later sweeps skip this patch instead of retrying it.
+        budget["left"] += 1
+        _write_apply_error_once(patch_dir, number, str(exc))
+        return {"run_id": run_id, "action": "error", "reason": str(exc),
+                "patch": f"{number:03d}"}
+    return action
+
+
+def _write_apply_error_once(patch_dir: Path, number: int, error: str) -> None:
+    """``NNN.apply-error.json`` (write-once): R6 never picks this patch again."""
+    destination = patch_dir / f"{int(number):03d}.apply-error.json"
+    try:
+        fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        return
+    except OSError:
+        return  # best-effort: an unwritable marker just means another retry
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps({"error": error, "at": int(time.time())},
+                                indent=2, sort_keys=True) + "\n")
 
 
 def _rule_orphan(run_id: str, run_dir: Path, repair: dict[str, Any], now: float,

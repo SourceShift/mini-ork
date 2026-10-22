@@ -12,7 +12,7 @@ tree, the DB and `origin/main`; when it needs a human it enqueues a *notice* in
 the oversight inbox (`mo_inbox_gates`, gate `self-driving-supervisor`) and keeps
 going. Nothing waits on that notice.
 
-## What one sweep does (R1–R5)
+## What one sweep does (R1–R6)
 
 **R1 — revive.** For every `runs/*/repair.json` with `state="waiting_on_fix"`
 and a `fix_epic_id`, read the epic's status:
@@ -73,6 +73,56 @@ message contains the epic id (`git log origin/main --format=%H -F
 --grep=<id>`). The notes gain ` delivered_by=<run_id>` or
 ` delivered_by=commit:<sha>`; with no evidence the epic is left alone, and the
 marker guard means a second sweep adds nothing.
+
+**R6 — apply a proposed patch.** The per-run orchestrator proposes typed graph
+patches on `MUTATE` (`runs/<id>/graph-patches/NNN.yaml`); R6 makes them act
+without an operator running `mini-ork graph-patch apply`. For every run dir
+with a `graph-patches/` directory whose `task_runs.status` is `failed` and
+whose `repair.json` state is absent, `gave_up` or `revive_failed`:
+
+- skip when one of the run's applied patches has no `NNN.outcome.json` yet —
+  the revive it started is still in flight;
+- skip once the run has `MO_SUPERVISE_MAX_PATCHES_PER_RUN` applied patches
+  (default 2; the env var may only tighten that, a larger value is clamped
+  back to 2);
+- take the lowest-numbered patch still in status `proposed`. A `replan` patch
+  is skipped unless `graph_patch.REPLAN_SUPPORTED` is true *at sweep time* —
+  SDE-6a flips that flag once a replanned chain is safe to apply;
+- control arm: `graph_patch.credit(home)` is computed once per sweep. When the
+  picked kind is not `rerun`, both it and `rerun` have at least five outcomes,
+  and the kind is not `credited` (strictly better than a blind rerun), the
+  patch is skipped with `<kind> is not better than a blind rerun (<rate> vs
+  <rerun rate>)`. Fewer than five samples on either side is exploration: apply;
+- apply it with `graph_patch.apply`, sharing R1's `max_revives` budget. The
+  run's `repair.json` becomes `reviving` with `revive_patch: "NNN"` and the
+  revive starts from the patch's node. A patch that cannot materialize
+  produces an `error` action for that run; the sweep continues.
+
+`dry_run` computes the same action list without materializing the workflow:
+it installs no `NNN.applied.json`, spawns nothing, and leaves `repair.json`
+untouched.
+
+**Outcome files.** When R2 labels a revived run whose `repair.json` carries
+`revive_patch: "NNN"`, it also writes
+`runs/<id>/graph-patches/NNN.outcome.json`:
+
+```json
+{"passed": true, "status": "published", "labelled_at": 1730000000}
+```
+
+`passed` is the same correct/incorrect judgement R2 computed (a failed run
+whose revived node checkpointed `success` still counts as passed), and
+`status` is the run's terminal `task_runs.status`. The file is **write-once**:
+an existing outcome is never overwritten, so an operator or an earlier sweep
+owns the first record. `dry_run` writes nothing (the label action still gains
+`"patch": "NNN"`).
+
+`mini-ork graph-patch credit` reads those outcome files — grouped by the patch
+kind in each `NNN.yaml` — and prints, per kind, `n`, `passed`, `rate` and
+`credited`. `rerun` is the control arm; another kind is credited only when
+both it and `rerun` have at least five outcomes and its pass rate is strictly
+higher. R6's control-arm gate is the same calculation, so the blind-retry
+control arm decides which patch kinds keep getting applied.
 
 Every `repair.json` rewrite is atomic (temp file in the same directory, then
 `os.replace`) and preserves every key it does not change. One corrupt run dir
@@ -136,7 +186,8 @@ Each action is a small dict: `{"run_id", "action", "reason", ...}`.
 | `wait` | the epic is not done, not landed, missing, or the revive budget ran out |
 | `skip` | landed, but no failed node was recorded — nothing to resume from |
 | `gave_up` | a dead fix epic, or an orphaned `repairing` state, was closed |
-| `label` | a revived run's diagnosis was labelled (`correct`: true/false) |
+| `label` | a revived run's diagnosis was labelled (`correct`: true/false; `patch` when a graph patch revived it) |
+| `apply_patch` | a proposed graph patch was applied (`patch`, `kind`); R6 |
 | `supersede` | a failed run's work was delivered elsewhere; it is now `superseded` |
 | `backlink` | a done epic's notes gained `delivered_by=<run|commit>` |
 | `error` | that run dir could not be processed; the sweep continued |
