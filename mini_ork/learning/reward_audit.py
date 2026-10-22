@@ -19,7 +19,12 @@ This module is the measurement half:
 * :func:`audit` reports the same classification over recent traces.
 * :func:`enqueue_divergences` surfaces drops to the operator through
   ``mo_inbox_gates`` under ``gate_id='reward_evidence_divergence'`` — a column
-  equality query, no prose parsing.
+  equality query, no prose parsing. Enqueueing is idempotent per
+  ``(feature, phase)``: a divergence the operator already saw — in any status —
+  is never written twice.
+* :func:`dedupe_divergence_rows` collapses duplicates that earlier writebacks
+  already wrote, keeping the smallest ``inbox_id`` per ``(feature, phase)`` and
+  never touching a resolved row or another gate's rows.
 
 All queries are read-only. Run ids are opaque TEXT keys — never int-cast.
 """
@@ -41,6 +46,7 @@ __all__ = [
     "pair",
     "audit",
     "enqueue_divergences",
+    "dedupe_divergence_rows",
 ]
 
 #: Rewards at or above this are positive and need evidence of success.
@@ -181,13 +187,43 @@ def _enqueue_limit() -> int:
         return DEFAULT_ENQUEUE_LIMIT
 
 
+def _divergence_row_exists(db_path: str, feature: str, phase: str) -> bool:
+    """Whether a divergence row already exists for ``(feature, phase)``.
+
+    Matches ``gate_id``, ``feature`` and ``phase`` in **any** status, so a
+    divergence the operator already approved or rejected never comes back. A
+    missing ``mo_inbox_gates`` table means the inbox has never been written
+    here: there is no row. Read failures propagate; the caller falls back to
+    the old enqueue-always behaviour for that entry.
+    """
+    con = sqlite3.connect(db_path, timeout=5.0)
+    try:
+        try:
+            row = con.execute(
+                "SELECT 1 FROM mo_inbox_gates WHERE gate_id = ? "
+                "AND feature = ? AND COALESCE(phase, '') = ? LIMIT 1",
+                (DIVERGENCE_GATE_ID, feature, phase),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return False
+        return row is not None
+    finally:
+        con.close()
+
+
 def enqueue_divergences(db_path: str, divergences) -> int:
     """Surface contradicted-run divergences to the operator inbox.
 
-    One ``mo_inbox_gates`` row per entry with
+    One ``mo_inbox_gates`` row per distinct ``(feature, phase)`` with
     ``gate_id='reward_evidence_divergence'``. The run id names the row
     (``feature``), the trace id rides in ``phase``, and the reason is kept in
     ``context_json``.
+
+    Enqueueing is idempotent: an entry whose row already exists in **any**
+    status — or whose ``(feature, phase)`` key already appeared earlier in this
+    call — is skipped and neither counted nor charged against the per-call cap.
+    If the existence check itself fails, the entry falls back to being
+    enqueued, exactly as before the check existed.
 
     Malformed entries are skipped, never raised on. A per-entry enqueue failure
     is swallowed for the same reason: oversight is a side channel and must
@@ -203,15 +239,29 @@ def enqueue_divergences(db_path: str, divergences) -> int:
 
     cap = _enqueue_limit()
     accepted = 0
+    seen: set[tuple[str, str]] = set()
     for entry in divergences:
-        if accepted >= cap:
-            break
         if not isinstance(entry, dict):
             continue
         run_id = entry.get("run_id")
         if not isinstance(run_id, str) or not run_id.strip():
             continue
         trace_id = entry.get("trace_id")
+        feature = f"reward/evidence divergence: {run_id}"
+        phase = str(trace_id) if trace_id else ""
+        key = (feature, phase)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if _divergence_row_exists(db_path, feature, phase):
+                continue
+        except Exception:
+            # Fail open: oversight must never be lost to a flaky read. The
+            # entry falls through to the pre-idempotent enqueue path.
+            pass
+        if accepted >= cap:
+            break
         reason = entry.get("reason")
         if not isinstance(reason, str) or not reason.strip():
             reason = CONTRADICTED_REASON
@@ -225,8 +275,8 @@ def enqueue_divergences(db_path: str, divergences) -> int:
         try:
             oversight_inbox.enqueue(
                 gate_id=DIVERGENCE_GATE_ID,
-                feature=f"reward/evidence divergence: {run_id}",
-                phase=str(trace_id) if trace_id else "",
+                feature=feature,
+                phase=phase,
                 context=context,
                 db_path=db_path,
             )
@@ -234,3 +284,101 @@ def enqueue_divergences(db_path: str, divergences) -> int:
             continue
         accepted += 1
     return accepted
+
+
+#: Smallest ``inbox_id`` per ``(feature, phase)`` group within one gate.
+_DEDUPE_KEEPER_SQL = (
+    "SELECT MIN(inbox_id) FROM mo_inbox_gates "
+    "WHERE gate_id = ? GROUP BY feature, phase"
+)
+
+_DEDUPE_COUNT_SQL = (
+    "SELECT COUNT(*) FROM mo_inbox_gates "
+    "WHERE gate_id = ? AND status = 'pending' "
+    f"AND inbox_id NOT IN ({_DEDUPE_KEEPER_SQL})"
+)
+
+_DEDUPE_DELETE_SQL = (
+    "DELETE FROM mo_inbox_gates "
+    "WHERE gate_id = ? AND status = 'pending' "
+    f"AND inbox_id NOT IN ({_DEDUPE_KEEPER_SQL})"
+)
+
+
+def _dedupe_divergence_rows(db_path: str, *, dry_run: bool) -> int:
+    try:
+        con = sqlite3.connect(db_path, timeout=5.0)
+    except sqlite3.OperationalError:
+        # An unopenable path holds no rows to dedupe.
+        return 0
+    try:
+        try:
+            if dry_run:
+                row = con.execute(
+                    _DEDUPE_COUNT_SQL,
+                    (DIVERGENCE_GATE_ID, DIVERGENCE_GATE_ID),
+                ).fetchone()
+                return int(row[0] or 0) if row else 0
+            cur = con.execute(
+                _DEDUPE_DELETE_SQL,
+                (DIVERGENCE_GATE_ID, DIVERGENCE_GATE_ID),
+            )
+        except sqlite3.OperationalError:
+            # No mo_inbox_gates table: nothing has ever been enqueued.
+            return 0
+        con.commit()
+        return int(cur.rowcount or 0)
+    finally:
+        con.close()
+
+
+def dedupe_divergence_rows(db_path: str) -> int:
+    """Collapse duplicate divergence rows already written to the inbox.
+
+    Within ``gate_id = DIVERGENCE_GATE_ID`` only, each ``(feature, phase)``
+    group keeps the row with the smallest ``inbox_id``; every other row in the
+    group whose ``status = 'pending'`` is deleted. Resolved rows
+    (``approved``/``rejected``) are never deleted, and no other gate's rows are
+    touched. Returns the number of rows deleted.
+    """
+    return _dedupe_divergence_rows(db_path, dry_run=False)
+
+
+def main(argv=None) -> int:
+    """Module CLI: ``dedupe [--db PATH] [--dry-run]``.
+
+    ``--db`` defaults to ``MINI_ORK_DB``, then ``.mini-ork/state.db``. Prints
+    the number of duplicate divergence rows deleted (or, with ``--dry-run``,
+    that would be deleted, without deleting).
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="python -m mini_ork.learning.reward_audit",
+        description="Reward/evidence audit utilities.",
+    )
+    sub = parser.add_subparsers(dest="command")
+    dedupe_parser = sub.add_parser(
+        "dedupe", help="delete duplicate reward/evidence divergence rows"
+    )
+    dedupe_parser.add_argument(
+        "--db", default=None, help="state DB path (default: MINI_ORK_DB or "
+        ".mini-ork/state.db)"
+    )
+    dedupe_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report how many rows would be deleted without deleting them",
+    )
+    args = parser.parse_args(argv)
+    if args.command != "dedupe":
+        parser.print_help()
+        return 2
+    db_path = args.db or os.environ.get("MINI_ORK_DB") or ".mini-ork/state.db"
+    deleted = _dedupe_divergence_rows(db_path, dry_run=bool(args.dry_run))
+    print(deleted)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

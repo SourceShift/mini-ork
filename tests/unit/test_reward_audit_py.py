@@ -576,3 +576,144 @@ def test_audit_limit_keeps_newest_rows(make_db):
     report = reward_audit.audit(db, limit=1)
     assert report["checked"] == 1
     assert report["divergences"] == []
+
+
+# ── idempotent enqueue + dedupe (inbox dedupe) ───────────────────────────────
+
+
+def _feature(run_id):
+    return f"reward/evidence divergence: {run_id}"
+
+
+def _divergence(run_id, trace_id):
+    return {
+        "run_id": run_id,
+        "trace_id": trace_id,
+        "status": "success",
+        "reviewer_verdict": "approved",
+        "reason": "run has verifier rows and none is a pass",
+    }
+
+
+def _inbox_rows(db, gate_id=reward_audit.DIVERGENCE_GATE_ID):
+    con = _connect(db)
+    try:
+        try:
+            return con.execute(
+                "SELECT * FROM mo_inbox_gates WHERE gate_id = ? "
+                "ORDER BY inbox_id",
+                (gate_id,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+    finally:
+        con.close()
+
+
+def _seed_inbox(db, feature, phase="", status="pending",
+                gate_id=reward_audit.DIVERGENCE_GATE_ID):
+    inbox_id = oversight_inbox.enqueue(
+        gate_id=gate_id, feature=feature, phase=phase, context={}, db_path=db
+    )
+    if status != "pending":
+        assert oversight_inbox.resolve(inbox_id, status, db_path=db)
+    return inbox_id
+
+
+def test_enqueue_divergences_is_idempotent_per_key(tmp_path):
+    db = str(tmp_path / "state.db")
+    entries = [_divergence("run-1", "t-1"), _divergence("run-2", "t-2")]
+    assert reward_audit.enqueue_divergences(db, entries) == 2
+    assert reward_audit.enqueue_divergences(db, entries) == 0
+    rows = _inbox_rows(db)
+    assert len(rows) == 2
+    assert {(r["feature"], r["phase"]) for r in rows} == {
+        (_feature("run-1"), "t-1"),
+        (_feature("run-2"), "t-2"),
+    }
+
+
+def test_resolved_divergence_is_not_re_enqueued(tmp_path):
+    db = str(tmp_path / "state.db")
+    assert reward_audit.enqueue_divergences(db, [_divergence("run-1", "t-1")]) == 1
+    only = _inbox_rows(db)[0]
+    assert oversight_inbox.resolve(only["inbox_id"], "rejected", db_path=db)
+    assert reward_audit.enqueue_divergences(
+        db, [_divergence("run-1", "t-1"), _divergence("run-9", "t-9")]
+    ) == 1
+    rows = _inbox_rows(db)
+    assert len(rows) == 2
+    by_feature = {r["feature"]: r for r in rows}
+    assert by_feature[_feature("run-1")]["status"] == "rejected"
+    assert by_feature[_feature("run-9")]["status"] == "pending"
+
+
+def test_same_entry_twice_in_one_list_is_one_row(tmp_path):
+    db = str(tmp_path / "state.db")
+    entry = _divergence("run-1", "t-1")
+    assert reward_audit.enqueue_divergences(db, [entry, dict(entry)]) == 1
+    rows = _inbox_rows(db)
+    assert len(rows) == 1
+    assert rows[0]["feature"] == _feature("run-1")
+    assert rows[0]["phase"] == "t-1"
+
+
+def test_skipped_duplicate_does_not_consume_cap(tmp_path, monkeypatch):
+    db = str(tmp_path / "state.db")
+    assert reward_audit.enqueue_divergences(db, [_divergence("run-1", "t-1")]) == 1
+    monkeypatch.setenv("MO_REWARD_DIVERGENCE_ENQUEUE_LIMIT", "1")
+    assert reward_audit.enqueue_divergences(
+        db, [_divergence("run-1", "t-1"), _divergence("run-2", "t-2")]
+    ) == 1
+    rows = _inbox_rows(db)
+    assert {(r["feature"], r["phase"]) for r in rows} == {
+        (_feature("run-1"), "t-1"),
+        (_feature("run-2"), "t-2"),
+    }
+
+
+def test_dedupe_divergence_rows_keeps_smallest_and_resolved(tmp_path):
+    db = str(tmp_path / "state.db")
+    a_ids = [_seed_inbox(db, _feature("runA"), "trA") for _ in range(3)]
+    b_pending = [_seed_inbox(db, _feature("runB"), "trB") for _ in range(2)]
+    b_approved = _seed_inbox(db, _feature("runB"), "trB", status="approved")
+    other_ids = [
+        _seed_inbox(db, "other feature", "other phase", gate_id="a_different_gate")
+        for _ in range(2)
+    ]
+
+    assert reward_audit.dedupe_divergence_rows(db) == 3
+    a_rows = [r for r in _inbox_rows(db) if r["feature"] == _feature("runA")]
+    assert [r["inbox_id"] for r in a_rows] == [a_ids[0]]
+    b_statuses = {
+        r["inbox_id"]: r["status"]
+        for r in _inbox_rows(db)
+        if r["feature"] == _feature("runB")
+    }
+    assert sorted(b_statuses) == sorted([b_pending[0], b_approved])
+    assert b_statuses[b_approved] == "approved"
+    assert [r["inbox_id"] for r in _inbox_rows(db, "a_different_gate")] == other_ids
+    # A second pass has nothing left to delete.
+    assert reward_audit.dedupe_divergence_rows(db) == 0
+
+
+def test_dedupe_cli_dry_run_reports_without_deleting(tmp_path):
+    import subprocess
+
+    db = str(tmp_path / "state.db")
+    a_ids = [_seed_inbox(db, _feature("runA"), "trA") for _ in range(3)]
+    before = [(r["inbox_id"], r["status"]) for r in _inbox_rows(db)]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        p for p in (str(REPO), env.get("PYTHONPATH", "")) if p
+    )
+    env["MINI_ORK_DB"] = str(tmp_path / "absent-default.db")
+    proc = subprocess.run(
+        [sys.executable, "-m", "mini_ork.learning.reward_audit",
+         "dedupe", "--db", db, "--dry-run"],
+        cwd=str(REPO), env=env, capture_output=True, text=True, timeout=180,
+    )
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert "2" in proc.stdout
+    assert [(r["inbox_id"], r["status"]) for r in _inbox_rows(db)] == before
+    assert [r["inbox_id"] for r in _inbox_rows(db)] == a_ids
