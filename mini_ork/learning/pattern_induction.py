@@ -62,6 +62,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from mini_ork.context import context_env
+from mini_ork.learning import lesson_conflict
 
 __all__ = [
     "Lesson",
@@ -716,6 +717,37 @@ def induce_cluster(
     }
 
 
+def _lesson_conflict_verdict(
+    con: sqlite3.Connection,
+    text: str,
+    description: str | None,
+    pattern_id: str,
+    dispatch_fn: Callable[..., int] | None,
+    model: str | None,
+) -> str:
+    """Run the conflict check for one pattern row; any failure is ``unchecked``.
+
+    ``pattern_records`` carries no ``task_class`` column; the class is the token
+    the cluster label has always carried ("cluster: task_class=code_fix …").
+    ``context_assembler.pattern_task_class`` is the shared public parse (the
+    same one migration 0077 backfills with), so the two never drift. A label
+    with no class is global — ``'*'`` — which narrows the neighbour set to the
+    genuinely cross-class lessons instead of widening it to all of them.
+    """
+    from mini_ork.context_assembler import pattern_task_class
+
+    task_class = pattern_task_class(description) or "*"
+    try:
+        result = lesson_conflict.check(
+            con, text, task_class=task_class, source_kind="pattern",
+            source_id=pattern_id, dispatch_fn=dispatch_fn, model=model,
+        )
+    except Exception:
+        return "unchecked"
+    verdict = result.get("verdict") if isinstance(result, dict) else None
+    return verdict if verdict in ("ok", "duplicate", "conflict") else "unchecked"
+
+
 def induce_pending(
     *,
     db_path: str | None = None,
@@ -786,6 +818,20 @@ def induce_pending(
             if not text:
                 report["skipped"].append(detail)
                 continue
+            # Trace2Skill conflict guardrail: judge the candidate against the
+            # lessons already live for this class before it becomes one of
+            # them. Fail closed — a duplicate, a contradiction, or an
+            # unavailable judge leaves the row unauthored for the next pass.
+            if lesson_conflict.enabled():
+                verdict = _lesson_conflict_verdict(
+                    con, text, row["description"], pid, dispatch_fn, model,
+                )
+                if verdict != "ok":
+                    report["skipped"].append({
+                        "pattern_id": pid,
+                        "reason": lesson_conflict.skip_reason(verdict),
+                    })
+                    continue
             con.execute(
                 "UPDATE pattern_records SET lesson_text=? WHERE pattern_id=?",
                 (text, pid),

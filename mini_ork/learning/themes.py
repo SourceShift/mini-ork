@@ -67,6 +67,8 @@ import sqlite3
 import sys
 import time
 
+from mini_ork.learning import lesson_conflict
+
 __all__ = [
     "FRAMEWORK_FIELDS",
     "MO_THEME_SIM_DEFAULT",
@@ -1242,6 +1244,30 @@ def promote(
                 report["skipped"].append(
                     {"theme_id": tid, "reason": reason or "no lesson"})
                 continue
+            # Trace2Skill conflict guardrail: judge the candidate against the
+            # lessons already live for this class before it becomes a verified
+            # lesson. Fail closed — a duplicate, a contradiction, or an
+            # unavailable judge leaves the candidate unauthored for the next
+            # pass (status and lesson_text untouched).
+            if lesson_conflict.enabled():
+                try:
+                    verdict = lesson_conflict.check(
+                        con, text, task_class=r["task_class"] or "",
+                        source_kind="theme", source_id=tid,
+                        dispatch_fn=dispatch_fn, model=model,
+                    )
+                except Exception:
+                    verdict = {"verdict": "unchecked"}
+                verdict = (
+                    verdict.get("verdict")
+                    if isinstance(verdict, dict) else "unchecked"
+                )
+                if verdict != "ok":
+                    report["skipped"].append({
+                        "theme_id": tid,
+                        "reason": lesson_conflict.skip_reason(verdict),
+                    })
+                    continue
             con.execute(
                 "UPDATE lesson_themes SET lesson_text = ?, status = 'verified',"
                 " updated_at = ? WHERE theme_id = ?",
