@@ -89,6 +89,37 @@ class FakeSpawn:
         return FAKE_PID
 
 
+class _FakeReply:
+    def __init__(self, text):
+        self.ok = True
+        self.text = text
+        self.error = ""
+        self.cost_usd = 0.0
+
+
+class _FakeDispatch:
+    def __init__(self, text):
+        self.text = text
+        self.requests = []
+
+    def __call__(self, request):
+        self.requests.append(request)
+        return _FakeReply(self.text)
+
+
+def prime_replan(home, run_id, patch, base_document, *names):
+    """Accept a replan chain through the injected planner lane.
+
+    The chain clones ``BASE_WORKFLOW``'s implementer template (which declares
+    no ``prompt_ref``), so the triple matches that base node exactly.
+    """
+    nodes = [{"name": name, "type": "implementer", "model_lane": "heavy"}
+             for name in names]
+    dispatch = _FakeDispatch(json.dumps({"nodes": nodes}))
+    return gp._replan_chain(str(home), run_id, patch, base_document,
+                            dispatch=dispatch)
+
+
 def propose_rerun(run_dir, from_node="implementer", reason="re-verify after flake"):
     return gp.propose(str(run_dir), {"kind": "rerun", "from_node": from_node,
                                      "reason": reason, "source": "operator"})
@@ -214,15 +245,26 @@ def test_materialize_rejects_compile_break_and_missing_node(tmp_path, monkeypatc
     assert not (run_dir / "graph-patches" / "001.workflow.yaml").exists()
 
 
-def test_materialize_refuses_replan(tmp_path, monkeypatch):
+def test_materialize_replan_grafts_chain_and_compiles(tmp_path, monkeypatch):
     home, run_dir, workflow = make_run(tmp_path)
     pin_env(monkeypatch, home, workflow)
-    assert gp.propose(str(run_dir), {"kind": "replan", "from_node": "implementer",
-                                     "reason": "wrong plan",
-                                     "source": "operator"}) == 1
-    with pytest.raises(gp.GraphPatchError,
-                       match="replan patches are not applicable yet"):
-        gp.materialize(str(home), "r1", 1)
+    patch = {"kind": "replan", "from_node": "implementer",
+             "reason": "wrong plan", "source": "operator"}
+    assert gp.propose(str(run_dir), patch) == 1
+    prime_replan(home, "r1", patch, load_yaml(workflow),
+                 "impl_probe", "impl_final")
+
+    out = gp.materialize(str(home), "r1", 1)
+    document = load_yaml(out)
+    assert [node["name"] for node in document["nodes"]] == [
+        "planner", "impl_probe", "impl_final", "reviewer"]
+    edges = {(edge["from"], edge["to"]) for edge in document["edges"]}
+    assert ("planner", "impl_probe") in edges
+    assert ("impl_final", "reviewer") in edges
+    assert ("impl_probe", "impl_final") in edges
+    assert "implementer" not in {endpoint for edge in edges for endpoint in edge}
+    assert "implementer" not in {node["name"] for node in document["nodes"]}
+    compile_workflow(out)
 
 
 # ── apply ──────────────────────────────────────────────────────────────────
@@ -288,17 +330,24 @@ def test_apply_dry_run_has_no_side_effects(tmp_path, monkeypatch):
     assert (run_dir / "graph-patches" / "001.workflow.yaml").is_file()
 
 
-def test_apply_refuses_replan_without_spawning(tmp_path, monkeypatch):
+def test_apply_replan_spawns_from_chain_head(tmp_path, monkeypatch):
     home, run_dir, workflow = make_run(tmp_path)
     pin_env(monkeypatch, home, workflow)
-    gp.propose(str(run_dir), {"kind": "replan", "from_node": "implementer",
-                              "reason": "wrong plan", "source": "operator"})
-    spawn = FakeSpawn()
-    with pytest.raises(gp.GraphPatchError,
-                       match="replan patches are not applicable yet"):
-        gp.apply(str(home), "r1", 1, engine_root=str(REPO_ROOT), spawn=spawn)
-    assert spawn.calls == []
-    assert not (run_dir / "graph-patches" / "001.applied.json").exists()
+    patch = {"kind": "replan", "from_node": "implementer",
+             "reason": "wrong plan", "source": "operator"}
+    gp.propose(str(run_dir), patch)
+    prime_replan(home, "r1", patch, load_yaml(workflow),
+                 "impl_probe", "impl_final")
+
+    spawn, result = apply_patch(home, "r1", 1)
+    argv = spawn.calls[0]
+    assert argv[argv.index("--from-node") + 1] == "impl_probe"
+    assert result["from_node"] == "impl_probe"
+
+    applied = load_json(run_dir / "graph-patches" / "001.applied.json")
+    assert applied["from_node"] == "impl_probe"
+    repair = load_json(run_dir / "repair.json")
+    assert repair["revive_from_node"] == "impl_probe"
 
 
 def test_base_workflow_tracks_newest_applied_patch(tmp_path, monkeypatch):

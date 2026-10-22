@@ -24,8 +24,10 @@ Public API::
     list_patches(home, run_id) -> list[dict]
     credit(home) -> dict
 
-``replan`` patches are accepted by :func:`propose` but refused by
-:func:`materialize` / :func:`apply` until SDE-6 implements them.
+A ``replan`` patch asks the run's planner lane for a short replacement chain
+built only from node templates the base workflow already declares; the chain is
+cached once under ``NNN.replan.json`` and grafted in place of the failing node
+(SDE-6a).
 """
 from __future__ import annotations
 
@@ -34,6 +36,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,7 +44,8 @@ from typing import Any, Callable, Mapping
 
 import yaml
 
-from mini_ork.context import run_context_scope, scoped_environ
+from mini_ork.context import context_env, run_context_scope, scoped_environ
+from mini_ork.dispatch.models import DispatchRequest
 from mini_ork.workflow.compiler import WorkflowCompileError, compile_workflow
 
 PATCH_DIRNAME = "graph-patches"
@@ -50,11 +54,32 @@ SOURCES = ("orchestrator", "operator", "supervisor")
 _ALLOWED_KEYS = frozenset(
     {"kind", "from_node", "node", "lane", "new_node", "reason", "source", "created_at"}
 )
-_REPLAN_REFUSAL = "replan patches are not applicable yet"
 # Edge types that route control (revise target, failure route) rather than
 # data; ``insert_before`` leaves them pointing at the original node.
 _CONTROL_EDGE_TYPES = frozenset({"retries", "escalates_to"})
 _NNN_RE = re.compile(r"^(\d{3})\.yaml$")
+
+# ── replan (SDE-6a) ────────────────────────────────────────────────────────
+
+# The supervisor's R6 starts applying ``replan`` patches only when this is true.
+REPLAN_SUPPORTED = True
+
+_REPLAN_MAX_NODES = 3
+# A replan is one JSON reply with no tool use, so it is bounded like the
+# model diagnoser rather than like a 25-minute node dispatch.
+_REPLAN_TIMEOUT_S = 180.0
+_REPLAN_MAX_TURNS = 3
+_REPLAN_DEFAULT_LANE = "glm"
+_REPLAN_LOG_LINES = 60
+_REPLAN_LOG_TAIL_BYTES = 64 * 1024
+_REPLAN_TEMPLATE_KEYS = ("type", "model_lane", "prompt_ref")
+# The evidence is in the prompt, so the call needs no tools, MCP servers or
+# session; pin them so a leaked node env cannot change the call's shape.
+_REPLAN_DISPATCH_ENV = {
+    "MO_RESOLVED_NODE_TOOLS": "Read|",
+    "MO_MCP_SERVERS": "",
+    "MO_RESUME_SESSION_ID": "",
+}
 
 Spawn = Callable[[list[str]], "int | None"]
 
@@ -356,6 +381,350 @@ def _apply_transform(document: dict[str, Any], patch: Mapping[str, Any]) -> None
     raise GraphPatchError(f"unknown graph patch kind: {kind!r}")
 
 
+# ── replan: ask the planner lane for a replacement chain ───────────────────
+
+
+def _node_triple(node: Mapping[str, Any]) -> tuple[Any, ...]:
+    return tuple(node.get(key) for key in _REPLAN_TEMPLATE_KEYS)
+
+
+def _replan_lane(run_dir: Path) -> str:
+    """``MO_REPLAN_LANE``, else the run's planner lane, else ``glm``.
+
+    The run's lane comes from its own ``config/agents.yaml`` snapshot (the
+    launch-time copy), not from the home's current policy.
+    """
+    lane = context_env("MO_REPLAN_LANE", "") or ""
+    if lane.strip():
+        return lane.strip()
+    agents = Path(run_dir) / "config" / "agents.yaml"
+    document: Any = {}
+    if agents.is_file():
+        try:
+            document = yaml.safe_load(agents.read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError):
+            document = {}
+    lanes = document.get("lanes") if isinstance(document, Mapping) else None
+    planner = lanes.get("planner") if isinstance(lanes, Mapping) else None
+    if isinstance(planner, str) and planner.strip():
+        return planner.strip()
+    return _REPLAN_DEFAULT_LANE
+
+
+def _tail_lines(path: Path, n: int, max_bytes: int = _REPLAN_LOG_TAIL_BYTES) -> str:
+    """The last ``n`` lines of ``path`` from a bounded tail read."""
+    try:
+        with Path(path).open("rb") as handle:
+            handle.seek(0, 2)
+            start = max(0, handle.tell() - max_bytes)
+            handle.seek(start)
+            data = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+    lines = data.splitlines()
+    if start and lines:
+        lines = lines[1:]
+    return "\n".join(lines[-n:])
+
+
+def _last_repair_attempt(run_dir: Path) -> Mapping[str, Any]:
+    path = Path(run_dir) / "repair.json"
+    if not path.is_file():
+        return {}
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(document, Mapping):
+        return {}
+    attempts = document.get("attempts")
+    if isinstance(attempts, list) and attempts:
+        last = attempts[-1]
+        if isinstance(last, Mapping):
+            return last
+    return {}
+
+
+def _newest_node_log(run_dir: Path, failing: str) -> tuple[str, str]:
+    """``(name, last 60 lines)`` of the newest ``*.log`` naming the failing node."""
+    candidates = [path for path in Path(run_dir).glob("*.log")
+                  if failing and failing in path.name]
+    if not candidates:
+        return "", ""
+
+    def _mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    newest = max(candidates, key=_mtime)
+    return newest.name, _tail_lines(newest, _REPLAN_LOG_LINES)
+
+
+def _replan_evidence(run_dir: Path, failing: str) -> str:
+    """Failure evidence: the last repair attempt, diagnosis.json, log tail."""
+    sections: list[str] = []
+    attempt = _last_repair_attempt(run_dir)
+    reason = attempt.get("reason")
+    if reason:
+        sections.append(f"last repair attempt reason: {reason}")
+    diagnosis = attempt.get("diagnosis")
+    if diagnosis is not None:
+        sections.append("last repair attempt diagnosis: "
+                        + json.dumps(diagnosis, sort_keys=True))
+    diagnosis_path = Path(run_dir) / "diagnosis.json"
+    if diagnosis_path.is_file():
+        try:
+            document = json.loads(diagnosis_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            document = None
+        if document is not None:
+            sections.append("diagnosis.json: "
+                            + json.dumps(document, sort_keys=True))
+    log_name, log_text = _newest_node_log(run_dir, failing)
+    if log_text.strip():
+        sections.append(f"=== NODE LOG ({log_name}, last {_REPLAN_LOG_LINES} lines) ===")
+        sections.append(log_text)
+    return "\n".join(sections)
+
+
+def _replan_prompt(run_id: str, patch: Mapping[str, Any],
+                   base_document: Mapping[str, Any], run_dir: Path) -> str:
+    failing = str(patch["from_node"])
+    workflow_yaml = yaml.safe_dump(
+        {"nodes": base_document.get("nodes"), "edges": base_document.get("edges")},
+        sort_keys=False)
+    evidence = _replan_evidence(run_dir, failing)
+    return (
+        "You repair failed mini-ork runs by re-planning one failing step.\n"
+        f"Run {run_id} ended at failing node {failing!r}.\n\n"
+        "Replace that node with a chain of 1 to 3 nodes that together do its job.\n"
+        "Answer with ONE JSON object and nothing else — no prose, no code fence:\n"
+        '{"nodes": [{"name": "...", "type": "...", "model_lane": "...", '
+        '"prompt_ref": "..."}]}\n\n'
+        "Rules:\n"
+        "- 1 to 3 nodes, in execution order.\n"
+        "- Use ONLY a (type, model_lane, prompt_ref) triple that already appears "
+        "on some node of the base workflow below; copy every other key of that "
+        "template node.\n"
+        "- Give every node a NEW unique name that is absent from the base "
+        "workflow.\n\n"
+        "=== PATCH REASON ===\n"
+        f"{patch.get('reason', '')}\n"
+        "=== BASE WORKFLOW ===\n"
+        f"{workflow_yaml}"
+        "=== FAILURE EVIDENCE ===\n"
+        f"{evidence}\n"
+    )
+
+
+def _parse_replan_reply(text: Any) -> dict[str, Any]:
+    """The reply must be strict JSON: one object with a ``nodes`` list."""
+    raw = str(text or "").strip()
+    if not raw:
+        raise GraphPatchError("replan reply was empty")
+    # Models wrap JSON in a ```json fence even when told not to; a whole-reply
+    # fence carries no extra content, so unwrap it rather than fail the patch.
+    fenced = re.fullmatch(r"```[a-zA-Z]*\s*\n?(.*?)\n?\s*```", raw, re.DOTALL)
+    if fenced:
+        raw = fenced.group(1).strip()
+    try:
+        document = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise GraphPatchError(f"replan reply is not valid JSON: {exc}") from exc
+    if not isinstance(document, Mapping):
+        raise GraphPatchError("replan reply is not a JSON object")
+    return dict(document)
+
+
+def _validate_replan_chain(document: Mapping[str, Any],
+                           base_document: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Validate one planner reply against the template-only contract.
+
+    Returns the chain as template nodes with the reply's names (so every other
+    key — artifact declarations included — is copied from the base node).
+    """
+    raw_nodes = document.get("nodes")
+    if not isinstance(raw_nodes, list) or not 1 <= len(raw_nodes) <= _REPLAN_MAX_NODES:
+        raise GraphPatchError(
+            f"replan reply must carry 1 to {_REPLAN_MAX_NODES} nodes")
+    base_nodes = _nodes_by_name(base_document)
+    templates: dict[tuple[Any, ...], dict[str, Any]] = {
+        _node_triple(node): node for node in base_nodes.values()}
+    chain: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, raw in enumerate(raw_nodes):
+        if not isinstance(raw, Mapping):
+            raise GraphPatchError(f"replan node {index} is not an object")
+        name = raw.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise GraphPatchError(f"replan node {index} requires a non-empty name")
+        name = name.strip()
+        if name in seen:
+            raise GraphPatchError(f"replan node name {name!r} is duplicated")
+        if name in base_nodes:
+            raise GraphPatchError(
+                f"replan node name {name!r} already exists in the base workflow")
+        template = templates.get(_node_triple(raw))
+        if template is None:
+            raise GraphPatchError(
+                f"replan node {name!r} uses a (type, model_lane, prompt_ref) "
+                "triple that no base workflow node declares")
+        node = dict(template)
+        node["name"] = name
+        chain.append(node)
+        seen.add(name)
+    return chain
+
+
+def _replan_number(patch_dir: Path, patch: Mapping[str, Any]) -> int:
+    """The file number of the on-disk replan patch this mapping came from."""
+    for number, path in _patch_files(patch_dir):
+        try:
+            document = _read_yaml(path)
+        except GraphPatchError:
+            continue
+        if (isinstance(document, Mapping)
+                and document.get("kind") == patch.get("kind")
+                and document.get("from_node") == patch.get("from_node")):
+            return number
+    existing = _patch_files(patch_dir)
+    return existing[-1][0] + 1 if existing else 1
+
+
+def _read_replan_cache(path: Path) -> list[dict[str, Any]]:
+    try:
+        document = json.loads(Path(path).read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise GraphPatchError(f"cannot read replan cache {path}: {exc}") from exc
+    except ValueError as exc:
+        raise GraphPatchError(f"invalid replan cache {path}: {exc}") from exc
+    nodes = document.get("nodes") if isinstance(document, Mapping) else document
+    if not isinstance(nodes, list) or not all(
+            isinstance(node, Mapping) for node in nodes):
+        raise GraphPatchError(f"invalid replan cache {path}: no node list")
+    return [dict(node) for node in nodes]
+
+
+def _store_replan_chain(path: Path, chain: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Write the accepted chain once with ``O_CREAT|O_EXCL``; return what won."""
+    payload = json.dumps({"nodes": chain}, indent=2, sort_keys=True) + "\n"
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        # Another materialize won the race: its chain is the deterministic one.
+        return _read_replan_cache(path)
+    except OSError as exc:
+        raise GraphPatchError(f"cannot write replan cache {path}: {exc}") from exc
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+    except OSError as exc:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise GraphPatchError(f"cannot write replan cache {path}: {exc}") from exc
+    return chain
+
+
+def _replan_chain(home: str | Path, run_id: str, patch: Mapping[str, Any],
+                  base_document: Mapping[str, Any], *,
+                  dispatch: Callable[[Any], Any] | None = None,
+                  number: int | None = None) -> list[dict[str, Any]]:
+    """The accepted replacement chain for ``patch``, cached under ``NNN.replan.json``.
+
+    The cache is the determinism guarantee: after the first accepted reply a
+    later materialize re-reads it rather than asking the model again, and the
+    patch YAML itself is never rewritten.
+    """
+    run_dir = _run_dir(home, run_id)
+    patch_dir = _patch_dir(run_dir)
+    if number is None:
+        number = _replan_number(patch_dir, patch)
+    cache_path = patch_dir / f"{int(number):03d}.replan.json"
+    if cache_path.is_file():
+        return _read_replan_cache(cache_path)
+
+    failing = patch.get("from_node")
+    if not isinstance(failing, str) or not failing.strip():
+        raise GraphPatchError("replan patch requires a non-empty from_node")
+
+    lane = _replan_lane(run_dir)
+    prompt = _replan_prompt(str(run_id), patch, base_document, run_dir)
+    if dispatch is None:
+        from mini_ork.dispatch.providers import dispatch_model
+        dispatch = dispatch_model
+    try:
+        # An empty scratch cwd: the call reads the prompt, not a tree.
+        with tempfile.TemporaryDirectory(prefix="mo-replan-") as scratch:
+            result = dispatch(DispatchRequest(
+                model=lane,
+                prompt=prompt,
+                timeout_s=_REPLAN_TIMEOUT_S,
+                max_turns=_REPLAN_MAX_TURNS,
+                cwd=scratch,
+                env=dict(_REPLAN_DISPATCH_ENV),
+            ))
+    except Exception as exc:  # noqa: BLE001 — a failed call is a patch failure
+        raise GraphPatchError(
+            f"replan dispatch failed ({type(exc).__name__}: {exc})") from exc
+
+    if not getattr(result, "ok", False):
+        raise GraphPatchError(
+            "replan dispatch was not ok: "
+            f"{getattr(result, 'error', '') or 'unknown'}")
+    document = _parse_replan_reply(getattr(result, "text", ""))
+    chain = _validate_replan_chain(document, base_document)
+    return _store_replan_chain(cache_path, chain)
+
+
+def _apply_replan_transform(document: dict[str, Any], failing: str,
+                            chain: list[dict[str, Any]]) -> None:
+    """Graft ``chain`` in place of ``failing`` and rewire the edges around it."""
+    if not chain:
+        raise GraphPatchError("replan chain is empty")
+    raw_nodes = document.get("nodes")
+    if not isinstance(raw_nodes, list):
+        raise GraphPatchError("base workflow nodes must be a list")
+    index = next(
+        (i for i, raw in enumerate(raw_nodes)
+         if isinstance(raw, Mapping) and raw.get("name") == failing), None)
+    if index is None:
+        raise GraphPatchError(f"replan names unknown node {failing!r}")
+    existing = {str(raw.get("name")) for raw in raw_nodes
+                if isinstance(raw, Mapping) and raw.get("name")}
+    for node in chain:
+        if node["name"] in existing:
+            raise GraphPatchError(
+                f"replan node {node['name']!r} already exists in the workflow")
+
+    raw_nodes[index:index + 1] = [dict(node) for node in chain]
+
+    raw_edges = document.get("edges") or []
+    if not isinstance(raw_edges, list):
+        raise GraphPatchError("base workflow edges must be a list")
+    head, tail = chain[0]["name"], chain[-1]["name"]
+    rewritten: list[Any] = []
+    for edge in raw_edges:
+        if isinstance(edge, Mapping):
+            edge = dict(edge)
+            if edge.get("to") == failing:
+                # Dataflow now enters the chain's head; a control edge
+                # (retries/escalates_to) means "the node doing the failing
+                # node's job", which is the chain's tail.
+                edge["to"] = (tail if edge.get("edge_type") in _CONTROL_EDGE_TYPES
+                              else head)
+            if edge.get("from") == failing:
+                edge["from"] = tail
+        rewritten.append(edge)
+    for left, right in zip(chain, chain[1:]):
+        rewritten.append({"from": left["name"], "to": right["name"],
+                          "edge_type": "depends_on"})
+    document["edges"] = rewritten
+
+
 def materialize(home: str | Path, run_id: str, n: int) -> str:
     """Apply patch ``n`` to its base workflow and compile the result.
 
@@ -366,8 +735,6 @@ def materialize(home: str | Path, run_id: str, n: int) -> str:
     number = int(n)
     patch_dir = _patch_dir(_run_dir(home, run_id))
     patch = _load_patch(patch_dir, number)
-    if patch["kind"] == "replan":
-        raise GraphPatchError(_REPLAN_REFUSAL)
 
     base = base_workflow(home, run_id)
     if not base or not Path(base).is_file():
@@ -377,7 +744,11 @@ def materialize(home: str | Path, run_id: str, n: int) -> str:
     if not isinstance(document, dict):
         raise GraphPatchError(f"base workflow {base} is not a mapping")
 
-    _apply_transform(document, patch)
+    if patch["kind"] == "replan":
+        chain = _replan_chain(home, run_id, patch, document, number=number)
+        _apply_replan_transform(document, str(patch["from_node"]), chain)
+    else:
+        _apply_transform(document, patch)
 
     destination = patch_dir / f"{number:03d}.workflow.yaml"
     tmp = patch_dir / f".{number:03d}.workflow.yaml.tmp.{os.getpid()}.{time.time_ns()}"
@@ -522,10 +893,18 @@ def apply(home: str | Path, run_id: str, n: int, *, engine_root: str | Path,
             "a run that has stopped")
 
     workflow_path = materialize(home, run_id, number)
+    # A replan chain replaced the failing node, so the run must revive from the
+    # chain's head, which is what the materialized workflow actually contains.
+    if patch["kind"] == "replan":
+        chain = _read_replan_cache(
+            patch_dir / f"{number:03d}.replan.json")
+        from_node = str(chain[0]["name"])
+    else:
+        from_node = str(patch["from_node"])
     result: dict[str, Any] = {
         "number": number,
         "workflow": workflow_path,
-        "from_node": patch["from_node"],
+        "from_node": from_node,
         "dry_run": bool(dry_run),
         "pid": None,
     }
@@ -534,7 +913,7 @@ def apply(home: str | Path, run_id: str, n: int, *, engine_root: str | Path,
 
     argv = [
         sys.executable, "-m", "mini_ork.recovery.planner", str(run_id),
-        "--from-node", str(patch["from_node"]),
+        "--from-node", from_node,
         "--workflow", workflow_path,
         "--force",
     ]
@@ -545,9 +924,9 @@ def apply(home: str | Path, run_id: str, n: int, *, engine_root: str | Path,
         "applied_at": _now_iso(),
         "pid": pid,
         "engine_sha": _engine_sha(engine_root),
-        "from_node": patch["from_node"],
+        "from_node": from_node,
     })
-    _update_repair(run_dir, str(patch["from_node"]), number)
+    _update_repair(run_dir, from_node, number)
     result["pid"] = pid
     return result
 
