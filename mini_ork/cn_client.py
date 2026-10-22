@@ -1031,12 +1031,15 @@ def _coord_timeout() -> float:
     return float(os.environ.get("CN_COORD_TIMEOUT_SEC", "3"))
 
 
-def _coord_request(method: str, path: str, body: dict | None = None) -> dict:
+def _coord_request(method: str, path: str, body: dict | None = None, *,
+                   timeout: float | None = None) -> dict:
     """One raise-based send path for the coord helpers.
 
     Unlike ``_get``/``_post_json`` this raises instead of returning a fallback,
     so the CLI can map failures to exit codes. Returns the parsed JSON body
-    (``{}`` on an empty or undecodable body).
+    (``{}`` on an empty or undecodable body). ``timeout`` overrides
+    ``CN_COORD_TIMEOUT_SEC`` for one call, so an IDE page can bound its read
+    without changing the environment a long-lived ``serve`` shares.
     """
     data = None
     headers: dict = {}
@@ -1045,7 +1048,7 @@ def _coord_request(method: str, path: str, body: dict | None = None) -> dict:
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(_base() + path, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=_coord_timeout()) as r:
+        with urllib.request.urlopen(req, timeout=timeout or _coord_timeout()) as r:
             raw = r.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
         try:
@@ -1089,11 +1092,16 @@ def coord_send(principal_id: str, sender: str, body: str) -> dict:
     )
 
 
-def coord_inbox(principal_id: str, unacked: bool = True) -> dict:
-    """GET /api/v1/coord/principals/{id}/messages?unacked=true — unacked messages."""
+def coord_inbox(principal_id: str, unacked: bool = True, *,
+                timeout: float | None = None) -> dict:
+    """GET /api/v1/coord/principals/{id}/messages?unacked=true|false.
+
+    ``unacked=False`` returns every message, acked ones included, oldest first.
+    """
     flag = "true" if unacked else "false"
     return _coord_request(
         "GET", f"/api/v1/coord/principals/{_enc(principal_id)}/messages?unacked={flag}",
+        timeout=timeout,
     )
 
 

@@ -22,6 +22,7 @@ from typing import Any, Iterable
 from mini_ork.ide_pages import _cn as _CN
 from mini_ork.ide_pages import orch_tab
 from mini_ork.ide_pages import outcome as O
+from mini_ork.ide_pages import run_messages
 from mini_ork.ide_pages import spec as S
 from mini_ork.ide_pages.run_header import build_header, copy_summary_action
 from mini_ork.ide_pages.cn_file import (
@@ -46,7 +47,7 @@ def _node_session_id(run: "Run", node: Node) -> str | None:
     return _resolve_session_id(run, node)
 
 TABS = [("dag", "DAG"), ("kickoff", "Kickoff"), ("overview", "Overview"),
-        ("orchestrator", "Orchestrator"), ("agents", "Agents"),
+        ("orchestrator", "Orchestrator"), ("messages", "Messages"), ("agents", "Agents"),
         ("learnings", "Learnings"), ("artifacts", "Artifacts")]
 
 # The v2 tab bar (``MINI_ORK_IDE_SPEC=2``) follows the Dispatch Console design:
@@ -55,11 +56,11 @@ TABS = [("dag", "DAG"), ("kickoff", "Kickoff"), ("overview", "Overview"),
 # stale IDE link lands somewhere sensible.
 V2_TABS = [("dag", "DAG"), ("outcome", "Outcome"), ("checks", "Checks"),
            ("changes", "Changes"), ("orchestrator", "Orchestrator"),
-           ("kickoff", "Kickoff"), ("agents", "Agents"),
+           ("messages", "Messages"), ("kickoff", "Kickoff"), ("agents", "Agents"),
            ("learnings", "Learnings"), ("artifacts", "Artifacts")]
 V2_ALIASES = {"story": "outcome", "graph": "dag", "questions": "dag",
               "overview": "outcome", "verification": "checks",
-              "orch": "orchestrator"}
+              "orch": "orchestrator", "concord": "messages"}
 
 # The kickoff text is capped well above the 20 KB the run card shows — the kickoff
 # tab is the place to read the whole task brief. Beyond the cap we append a
@@ -5072,6 +5073,8 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
                                 callout_actions=callout_actions),
         "outcome": lambda: _outcome_tab(run, outcome, callout_actions, absorbed),
         "orchestrator": lambda: orch_tab.orchestrator_tab(run, args),
+        "messages": lambda: S.guarded(errors, run_messages.TITLE,
+                                      lambda: run_messages.messages_tab(run.id)),
         "verification": lambda: _verification_tab(run),
         "checks": lambda: _checks_tab(run),
         "changes": lambda: _changes_tab(run, errors),
@@ -5208,6 +5211,8 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
         "kickoff": lambda: _kickoff_tab(run),
         "overview": lambda: _overview_tab(run),
         "orchestrator": lambda: orch_tab.orchestrator_tab(run, args),
+        "messages": lambda: S.guarded({}, run_messages.TITLE,
+                                      lambda: run_messages.messages_tab(run.id)),
         "agents": lambda: _agents_tab(run),
         "learnings": lambda: _learnings_tab(run),
         "artifacts": lambda: _artifacts_tab(run),

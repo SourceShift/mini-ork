@@ -123,6 +123,17 @@ fails open), `4` refused (for example, `stop` safety checks).
 Base URL: `CN_BASE_URL` (default `http://127.0.0.1:28080`), the same variable
 `mini_ork/cn_client.py` already uses.
 
+### A run's mailbox in the IDE
+
+Every run registers as `run:<run id>`, so the run page's **Messages** tab
+(`mini_ork/ide_pages/run_messages.py`) lists that principal's whole inbox,
+acked messages included, newest first. Each row shows its delivery state, with
+Ack and Reply buttons; a row whose sender is another `run:` principal also gets
+Open run. One run writing to another's principal is the only run-to-run
+channel. What a run *sent* is not shown, because there is no
+outbox endpoint. When ContextNest is off, unreachable, refuses the read, or
+the run never registered (`404`), the tab says which.
+
 ## P0b — the per-turn hook (shipped)
 
 ContextNest's ingest hooks run their curl in the background, so their responses

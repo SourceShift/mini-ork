@@ -126,7 +126,8 @@ def test_dag_layers_the_workflow_and_attributes_cost(home: Path) -> None:
     page = build_page(home, "run", None, {"run": RUN})
     assert page["ok"] is True and page["tab"] == "dag" and page["title"] == RUN
     assert [t["key"] for t in page["tabs"]] == [
-        "dag", "kickoff", "overview", "orchestrator", "agents", "learnings", "artifacts"]
+        "dag", "kickoff", "overview", "orchestrator", "messages", "agents", "learnings",
+        "artifacts"]
     assert [c["t"] for c in page["chips"]][:2] == ["published · verified", "5/6 nodes"]
     dag = _section(page, "dag")
     cols = [[n["id"] for n in c] for c in dag["cols"]]
@@ -328,7 +329,8 @@ def test_level_one_page_is_unchanged_plus_an_additive_graph(
     assert set(page) - {"graph", "desc"} == _LEVEL_ONE_KEYS
     assert page["title"] == RUN  # the run id is still the title
     assert [t["key"] for t in page["tabs"]] == [
-        "dag", "kickoff", "overview", "orchestrator", "agents", "learnings", "artifacts"]
+        "dag", "kickoff", "overview", "orchestrator", "messages", "agents", "learnings",
+        "artifacts"]
     assert page["tab"] == "dag"
     assert page["sections"][0]["type"] == "dag"
     assert page["chips"][0] == {"t": "published · verified", "c": "green"}
