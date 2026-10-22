@@ -71,10 +71,10 @@ All paths are relative to the repository root.
 
 - `mini_ork/learning/probe_scorer.py`
 - `recipes/framework-edit/probes/probe-config.yaml` (new)
-- `recipes/framework-edit/probes/probe-1.md`, `probe-2.md`, `probe-3.md` (new)
-- `recipes/framework-edit/probes/fixtures/probe-1/ledger.py`, `test_ledger.py` (new)
-- `recipes/framework-edit/probes/fixtures/probe-2/units.py`, `route.py`, `test_route.py` (new)
-- `recipes/framework-edit/probes/fixtures/probe-3/greet.py`, `test_greet.py` (new)
+- `recipes/framework-edit/probes/probe-1.md`, `recipes/framework-edit/probes/probe-2.md`, `recipes/framework-edit/probes/probe-3.md` (new)
+- `recipes/framework-edit/probes/fixtures/probe-1/ledger.py`, `recipes/framework-edit/probes/fixtures/probe-1/test_ledger.py` (new)
+- `recipes/framework-edit/probes/fixtures/probe-2/units.py`, `recipes/framework-edit/probes/fixtures/probe-2/route.py`, `recipes/framework-edit/probes/fixtures/probe-2/test_route.py` (new)
+- `recipes/framework-edit/probes/fixtures/probe-3/greet.py`, `recipes/framework-edit/probes/fixtures/probe-3/test_greet.py` (new)
 - `tests/unit/test_probe_config.py` (new)
 
 Do NOT modify any other file. Do not edit any file under `recipes/code-fix/` or
