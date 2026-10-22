@@ -91,6 +91,7 @@ _NATIVE_MODULE_SUBS = {
     "usage-report": "mini_ork.observability.usage_report",
     "watchdog": "mini_ork.orchestration.watchdog",
     "reap": "mini_ork.orchestration.run_reaper",
+    "supervise": "mini_ork.cli.supervise",
     "acp": "mini_ork.cli.acp_cmd",
     "mcp-context": "mini_ork.cli.mcp_context_cmd",
     "mcp": "mini_ork.cli.mcp_cmd",
@@ -171,6 +172,8 @@ Lifecycle:
   vault                          Report which secret sources are wired, and where a key lives
   validate                       Pre-run static checks with Fix: hints
   garden                         Drift detection (collisions, orphans, stale runs)
+  supervise [--once]             Sweep parked self-driving runs: revive when the
+                                   fix landed, label diagnoses, clear orphans
   verifier list|annotate         Inspect verifier results and label false
                                    positives/negatives (abstain-gate calibration)
   recipe-eval                    Static evaluation of recipe definitions

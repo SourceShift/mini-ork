@@ -35,6 +35,7 @@ def test_all_former_exec_subs_registered_natively():
         "prefs",
         "lessons",
         "reap",
+        "supervise",
         "harness-contrast", "harness-edit", "harness-audit", "hack-probe",
         "oversight", "metric-anchor", "active-eval", "certify", "node-agent",
         "nodes", "mcp", "vault", "mcp-context", "zed", "specs", "automations", "board",
@@ -105,12 +106,14 @@ def test_native_dispatch_uses_python_m(monkeypatch):
 def test_default_root_is_the_engine_root(monkeypatch, tmp_path):
     """The default ``root`` is the directory that contains ``mini_ork``.
 
-    ``_native_module_handler`` hands ``root`` to ``_module_env`` as the child's
-    PYTHONPATH, so a root one level too deep — ``mini_ork/`` itself — makes every
-    spawned subcommand die inside site init, where ``mini_ork/types.py`` shadows
-    the stdlib ``types`` module and the interpreter aborts before ``main`` runs.
-    ``bin/mini-ork`` reaches the same directory via ``parents[1]``; this is the
-    ``python -m mini_ork.cli.main`` path, where nothing sets MINI_ORK_ROOT.
+    ``_native_module_handler`` hands ``root`` to ``_module_env``, which PREPENDS
+    it to any inherited PYTHONPATH, so a root one level too deep — ``mini_ork/``
+    itself — makes every spawned subcommand die inside site init, where
+    ``mini_ork/types.py`` shadows the stdlib ``types`` module and the interpreter
+    aborts before ``main`` runs. ``bin/mini-ork`` reaches the same directory via
+    ``parents[1]``; this is the ``python -m mini_ork.cli.main`` path, where
+    nothing sets MINI_ORK_ROOT. PYTHONPATH is a ``os.pathsep``-separated search
+    path, so the default root is its FIRST entry, not the whole string.
     """
     monkeypatch.delenv("MINI_ORK_ROOT", raising=False)
     monkeypatch.setenv("MINI_ORK_HOME", str(tmp_path / ".mini-ork"))
@@ -125,7 +128,12 @@ def test_default_root_is_the_engine_root(monkeypatch, tmp_path):
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     assert main(["improve", "--help"]) == 0
-    engine_root = seen["env"]["PYTHONPATH"]
+    pythonpath = seen["env"]["PYTHONPATH"]
+    # ``_module_env`` prepends the engine root, so it must be the entry that
+    # wins resolution; inherited entries (another checkout's engine root, a
+    # plugin dir) legitimately follow it. Asserting on the whole string would
+    # also fail whenever the parent process exported any PYTHONPATH at all.
+    engine_root = pythonpath.split(os.pathsep)[0]
     assert os.path.isdir(os.path.join(engine_root, "mini_ork")), (
         f"default root {engine_root!r} does not contain the mini_ork package — "
         "a subcommand spawned with it as PYTHONPATH cannot import the engine"

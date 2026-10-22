@@ -1,0 +1,34 @@
+# Self-driving supervisor config (copy to a path you pass as
+# `--config PATH`, or name through MO_SUPERVISE_CONFIG).
+#
+# One config file serves both delivery tiers:
+#
+#   Simple tier — no server, no daemon, no cloud account. Run one sweep from
+#   cron/launchd against the local SQLite home:
+#
+#       mini-ork supervise --once
+#
+#   The `__supervisor__` lease row lives in the local state.db, so a cron
+#   overlap is a no-op, not a double sweep.
+#
+#   Service tier — a long-running process against the shared DB (a fleet of
+#   nodes, one owner):
+#
+#       mini-ork supervise --interval 300
+#
+#   The operator is notified through the oversight inbox (mo_inbox_gates) when
+#   a fix epic fails; the supervisor never blocks waiting for approval.
+#
+# A path named by --config / MO_SUPERVISE_CONFIG that is missing or unparseable
+# is a hard error (exit 2), never a silent fallback to these values.
+
+# Seconds between sweeps when the process loops (ignored by --once).
+interval_s: 300
+
+# At most this many revives per sweep. A sweep that finds more landed fix
+# epics leaves the rest parked and picks them up next time.
+max_revives: 2
+
+# A `repairing` repair.json whose last attempt is older than this many seconds
+# and whose owner process is gone is reported as an orphan and cleared.
+orphan_after_s: 3600
