@@ -1,262 +1,413 @@
-# Synthesis — Recursive Self-Improvement, iter 1 (20260806123316)
+# Synthesis — Recursive Self-Improvement, iter 1
 
-All five lenses (bottleneck / perf / correctness / arch / arxiv) converge on a
-single load-bearing defect: **telemetry/provenance collapse at the
-dispatch→trace boundary**. 112/126 `recursive_self_improve` traces carry empty
-`tool_calls`/`files_read`/`files_written`; **126/126 carry empty
-`prompt_version_hash`/`context_bundle_hash`**. The second half of that is not
-merely a logging gap — it makes the recipe's own learning loop *structurally
-inert*: `optimize/gepa.py` and `learning/rho_aggregator.py` filter their input
-with `WHERE prompt_version_hash <> '' AND prompt_version_hash IS NOT NULL`
-(per lens-correctness §A4), so every self-improve row is discarded before it
-can teach anything. A recursive-self-improvement recipe that cannot feed its
-own GRPO loop is the highest-leverage fix on the board.
-
-**Grounding note (synthesizer correction).** The three code lenses name the
-trace-writer `build_trace_payload()`; the live function is
-`trace_write_node` (`mini_ork/trace_store.py:140`). Line ranges the lenses
-cite are correct; the symbol name is not. Patch 1 below uses the verified
-name. The write-site gap is confirmed by direct read: `_tf`
-(`mini_ork/cli/execute.py:1662-1672`) builds `extra` with `trace_id`,
-`run_id`, `objective_domain`, `verifier_output`, `agent_version_id` — and
-never sets either provenance hash; `trace_write_node`'s payload dict
-(`:184-188`) has no slot for them either.
+Inputs: `lens-bottleneck.md` (rev 4), `lens-perf.md`, `lens-correctness.md`,
+`lens-arch.md`, `lens-arxiv.md` from this run dir. Every code anchor used for
+ranking was re-read in the worktree at HEAD `20b11c68`. The ledger was re-queried
+read-only at ~06:25Z (`$MINI_ORK_DB`). `learning_record` = 0 rows and
+`pattern_records` = 0 rows, so no prior iteration's findings exist to dedupe
+against. The context pack has no `[f:…]` findings (`file_findings: []`), so no
+patch below repeats a recorded `[f:…]` problem.
 
 ## Ranked patch plan
 
 | Rank | Bottleneck | Category | Patch summary | Evidence | Confidence |
 |---|---|---|---|---|---|
-| 1 | 126/126 self-improve traces have empty `prompt_version_hash`/`context_bundle_hash` → GEPA/rho_aggregator filter out 100% of rows → learning loop inert | correctness | In `_tf` (`execute.py:1662-1672`), stamp `prompt_version_hash` + `context_bundle_hash` into `extra`, computed **at the write site** from the node's recipe prompt file and the run's `context-pack.json` (materials provably present), so downstream `WHERE prompt_version_hash <> ''` filters return rows | `execute.py:1662-1672` (gap), `trace_store.py:184-191` (pass-through), lens-correctness §A4, lens-perf H2/F2, lens-arch RC1; arXiv 2605.17169, 2607.00941, 2606.07889 | 0.88 |
-| 2 | Verifier persists `{"verdict":"fail"}` only — 7 of 33 failures undiagnosable | correctness | At the verdict-write site (`verify.py:295-313`), carry the `results` array already built at `:295-303` plus a `failure_detail` list (`{rule_id, expected, observed, missing_inputs}`) into `verifier_output` | `verify.py:295-313`, `_safe_trace_write` `:307-313`, lens-correctness §A2, lens-bottleneck row 2; arXiv 2607.28871, 2412.13114, 2608.02011 | 0.82 |
-| 3 | `duration_ms`/`cost_usd` re-coerced to 0 when sidecar absent — 112/126 rows are 0, hung≡fast≡unmeasured | perf+correctness | In `trace_write_node` (`trace_store.py:169-182`), add `cost_observed`/`duration_observed` bools reflecting whether the sidecar was actually read; guard the 5 arithmetic consumers so unobserved-zero ≠ real-zero | `trace_store.py:169-188`, `context_assembler.py:332-333`, `otel_export.py:96,101,239,258,266`, lens-perf F1, lens-correctness §A1; arXiv 2605.08747, 2604.05119 | 0.80 |
-| 4 | Implementer no-op with `files_written=[101 paths]`, `tool_calls=[]`, accepted as success — audit cannot answer "what did it do?" | correctness | Implementer prompt mandates a per-file provenance block; `trace_write_node` downgrades `status` to `needs_provenance` when `cost_usd > floor AND tool_calls=[] AND files_read=[] AND files_written non-empty` | `trace_store.py:169-191`, `execute.py:1683`, `recipes/recursive-self-improve/prompts/implementer.md`, lens-correctness §A3, lens-bottleneck row 3; arXiv 2604.04035, 2603.14688, 2604.17557 | 0.74 |
-| 5 | Dual verifier filenames `verifier_*.json` (legacy) + `verifier-result-*.json` (current) both written every run | arch | Drop `"verifier_"` from the mirror tuple at `execute.py:1385`; canonicalize legacy source read-only | `execute.py:1385`, readers `self_improve.py:91`/`web/why.py:91`/`run_detail.py:169`, lens-arch RC2, lens-correctness §A5 | 0.70 |
+| 1 | Scan #1 / COR-1 / A4: researcher `bottleneck_lens` sits on lane `planner`. The lane name lands in llm_dispatch's `--node-type` slot and arms the planner's JSON **reply** gate, which shape-rejects the markdown scan and re-runs the fallback chain | correctness (critical) | Recipe tier: move `bottleneck_lens` from `model_lane: planner` to `model_lane: opus_lens` (same model, opus; no gate is keyed on that lane). Add a regression test proving that no prose node in this workflow sits on a lane that arms a shape gate | `llm_calls` ids 1–4 ($4.841139, 21.8 min wall); `workflow.yaml:24`; `execute_handlers.py:1277-1278`; `execute.py:2757-2766`; `llm_dispatch.py:791-793, 828-838, 1012, 1121-1125, 1167-1180`; arXiv 2501.10868, 2609.23742, 2603.27905 | 0.90 |
+| 2 | Same defect at engine level: the reply-shape gate is keyed on the **lane label**, not on what the node emits. 3 more researcher nodes sit on lane `planner` (`prompt-graph-loop` ×2, `spec-driven-delivery` ×1) | correctness (critical) | Executor seam forwards the node's role and its declared output kind (`--node-role`, `--expect-shape`). `_shape_predicate_for` gates on the declared contract and keeps the `--node-type` lookup only for direct CLI/plan.py calls | `context.py:161-164` (MO_NODE_TYPE published per node), `execute_handlers.py:956-960`; `prompt-graph-loop/workflow.yaml:13,17,42,50` (JSON outputs); `artifacts.py` never validates `kind: json`; arXiv 2501.10868, 2609.23742 | 0.70 |
+| 3 | Scan #2 / H1–H2: `self-tests-pass` runs the whole suite in one serial pytest with no `timeout=` inside a 3600 s iteration that wraps the entire DAG | perf (critical) | Give the verifier a hard timeout derived from the iteration deadline and K stdlib-parallel shards (CI's odd/even split). Count per shard with anchored regexes and sum. On timeout, emit a recorded `budget-timeout` verdict instead of dying to the outer rc 124 | `self-tests-pass.py:235, 251-257, 264-269`; `self_improve.py:493, 515-519, 72-73`; `ci.yml:61-70`; collect-only 11 479 tests in 18.09 s (perf lens); arXiv 2105.07311, 2610.04184, 2311.12484 | 0.60 |
+| 4 | Scan #3 / COR-2: `self-tests-pass` is an absolute `rc == 0` gate. A base that is already red rejects every patch, and the kickoff's "non-negative quality delta" is computed nowhere | correctness (critical) | Record a per-test baseline at `pre-implementer-ref` and gate on `failures(patch) ⊆ failures(base)`, keeping `rc == 0` as a fast pass. Depends on rank 3's budget | `self-tests-pass.py:272-278`; `self_improve.py:74-81`; audit doc `:25` (11 failed + 8 errors); arXiv 2506.09289, 2410.06992 | 0.55 |
+| 5 | Scan #4 / COR-4: `no-regression` checks only `*.sh`/`bin/*` (an empty surface since the bash removal). With 0 benchmark rows it passes with zero evidence | correctness (high) | Add changed and untracked `*.py` to the surface and run `py_compile` on each. When no surface was checked and the benchmark is inconclusive, fail closed (`reason: "vacuous"`) | `no-regression.py:35-36, 103-109, 125-131`; R-5 executed (`pass: true, changed_sh_files=0`); `benchmark_results` = 0 rows; arXiv 2607.24300 | 0.75 |
 
-Only **Patch 1** is attempted this iteration (kickoff: "exactly one patch,
-minimal and reviewable"). Ranks 2–5 are queued to `learning_record` for
-subsequent iters.
+Ordering notes:
+
+- Rank 3 (perf) sits above rank 4 (correctness) even though both are critical, which departs from the "correctness > perf" tie rule. The reason is a dependency, not a preference. Rank 4 needs a second (baseline) suite run, and the correctness lens itself flags that this "doubles an already ~59-min serial suite inside a 60-min budget". Rank 4 cannot land safely before rank 3.
+- Scope polarity + `lstrip("./")` (COR-5/COR-6) is the sixth candidate. The 5-patch cap drops it to the unranked backlog, but it is the smallest backlog diff and the best candidate to bundle next.
 
 ## Top patch — detailed plan
 
-### Patch 1: Stamp `prompt_version_hash` + `context_bundle_hash` at the trace-write boundary
+### Patch 1: Take the bottleneck scanner off the `planner` lane (same model, no reply gate)
 
-**Problem statement.** Every `recursive_self_improve` execution trace persists
-an empty `prompt_version_hash` and `context_bundle_hash` (126/126, queried this
-run). Both downstream learners — `optimize/gepa.py` and
-`learning/rho_aggregator.py` — filter their input on
-`prompt_version_hash <> '' AND prompt_version_hash IS NOT NULL`
-(lens-correctness §A4), so the recipe's entire output is discarded and the
-GRPO learning loop the recipe exists to feed never receives a row.
+**Problem statement.** `bottleneck_lens` is a `type: researcher` node whose
+deliverable is the markdown file `lens-bottleneck.md`, but its `model_lane` is
+`planner`. The executor forwards the **lane** in llm_dispatch's `--node-type`
+slot, so the planner's JSON reply gate arms on a prose node. Every lane's reply
+is shape-rejected, and the whole fallback chain is re-run by the shape-reject
+retry. That multiplies cost and wall time for a file that lane 1 had already
+written.
 
 **Evidence.**
-- `mini_ork/cli/execute.py:1662-1672` — verified by direct read: the `_tf`
-  closure's `extra` dict is assembled with `trace_id`, `run_id`,
-  `objective_domain`, `verifier_output` (and `agent_version_id` at `:1677`);
-  **no path sets `prompt_version_hash` or `context_bundle_hash`.** The
-  adjacent `.tool-summary` merge (`:1693-1708`) demonstrates the exact,
-  in-place, best-effort pattern this patch reuses.
-- `mini_ork/trace_store.py:184-191` — the payload dict (`:184-188`) omits both
-  hash keys; the `extra`-merge loop (`:189-191`) copies any `extra` key into
-  the payload when absent/falsy, so once `_tf` sets the two keys they flow to
-  the row without touching `trace_write_node` at all.
-- Concrete offenders (from lens-bottleneck, this run's DB): researcher lens
-  trace `tr-researcher-arch_lens-4418b76a` (`duration_ms=367788`,
-  `cost_usd=1.785704`, final artifact written) with empty hashes;
-  `tr-researcher-arxiv_lens-9fee8d64` (`cost_usd=1.3366`) with empty hashes.
-- Matches the top 4 known_failure_modes in `context-pack.json` at conf.
-  0.96–0.98 (`cross_class:agent.researcher.prompt` — artifact with empty
-  prompt/context hashes) and the run's own learned-failure ledger
-  (`tr-researcher-arxiv_lens-9fee8d64`: "both prompt_version_hash and
-  context_bundle_hash are empty strings").
-- arXiv (from `lens-arxiv.md`): **2605.17169** (Hu et al., *Responsible
-  Agentic AI Requires Explicit Provenance* — the causal-attribution function
-  is precisely a per-trace provenance key; provenance is a structural
-  prerequisite, not optional); **2607.00941** (*Evidentiary-Adequacy
-  Criterion* — an empty-hash trace fails the completeness property);
-  **2606.07889** (*Strained Coherence* — a success trace whose provenance
-  fields are empty is the pre-failure signal these hashes make detectable).
 
-**Proposed change.** Compute both hashes from inputs that are **provably
-present at write time**, so the patch is not blocked on any upstream producer
-(the open question raised by lens-perf Q2 and lens-arch Q3 — "are the hashes
-computed upstream or dropped?" — is dissolved by computing them here):
+- Ledger (this run, `llm_calls`, read-only query):
+  - id 1 opus: 392 849 ms, $3.184097, failed `dispatch result failed shape check (looks_like_json)`
+  - id 2 deepseek_flash: 367 400 ms, $0.126698, same error
+  - id 3 minimax: 251 283 ms, $0.084590, same error
+  - id 4 opus: success, $1.445754
+  - All four rows have `feature_name='mini-ork:planner'`.
+  - Node total: **$4.841139 and 21.8 min wall** (05:48:22Z → 06:10:10Z), out of a 60-min iteration.
+  - For comparison, all four downstream lenses together (ids 5–8) cost **$0.798776**. The scanner alone cost **6.06×** the rest of the research phase.
+- Dispatch transcript `lens-bottleneck.md.stdout.md`:
+  - lines 2/4/6: `lane <x> produced wrong shape (rc=65 …); trying next`
+  - line 7: `[llm_dispatch RETRY model=opus,deepseek_flash,minimax reason=shape_reject attempt=1/3 sleep=5s]`
+  - The scanner then replied in JSON **on purpose** to get past the gate (its own `reply_format_note`). A lane gaming a gate is the signature of a gate on the wrong surface.
+- Code path, re-read this pass:
+  1. `recipes/recursive-self-improve/workflow.yaml:24` sets `type: researcher, model_lane: planner`.
+  2. `mini_ork/cli/execute_handlers.py:1277-1278` calls `self.dispatch_fn(self.task_class, self.lane, prompt)`, putting the lane in the seam's `node_type` slot.
+  3. `mini_ork/cli/execute.py:2757-2766` forwards it as `--node-type <lane>`.
+  4. `mini_ork/dispatch/llm_dispatch.py:791-793` keys `_NODE_SHAPE_PREDICATES = {"planner": looks_like_json}` on that slot. `:1012` arms `accept_fn`. `:1121-1125` hands it to the chain dispatcher (per-lane shape fallback). `:1167-1180` retries a shape reject up to `MO_DISPATCH_MAX_ATTEMPTS` (default 3, `:1005`), so the bound is 3 lanes × 3 attempts.
+  5. The code's own invariant at `llm_dispatch.py:784-786` is broken: "only nodes whose artifact is *known* to be JSON are gated, so prose-emitting nodes (researcher, …) are never false-rejected".
+  6. `self_improve.py:505-512` documents that the same failure already killed iterations one layer up; the outer planner was skipped for exactly this reason.
+- Correction to the scan's mechanism (it does not change the fix): `execute.py:2759-2764` always passes `--model`, so the `:1029-1035` expansion (`not model_override`) is skipped. The 3-lane chain came from the executor-published `MO_DISPATCH_CHAIN`, and the shape fallback happened inside it via `accept=` (`:1121-1125`).
+- Lane facts:
+  - `opus_lens` resolves to `opus` in both `config/agents.yaml:44` and the home's `.mini-ork/config/agents.yaml:60`, and in this run's `run_profile.json` (`opus_lens → opus / claude-opus`).
+  - `_shape_predicate_for("opus_lens")` is `None` (correctness lens R-1a; the table has only `planner`).
+  - `planner`, by contrast, maps to opus, sonnet or glm depending on which config wins (`run_profile.json`, `config/agents.yaml:16`, `.mini-ork/config/agents.yaml:24`).
+  - So `opus_lens` also pins the scanner to the model that actually produced this run's scan.
+- No test pins the lane: `tests/test_web_smoke.py:1148` asserts only the node **name**.
+- arXiv (all from `lens-arxiv.md`):
+  - **2501.10868** (JSONSchemaBench): schema enforcement belongs to the declared output contract, not to a routing label.
+  - **2609.23742**: a structural (shape) check is necessary-not-sufficient and must not stand in for the artifact verifier. Here it ran on the reply instead of the artifact.
+  - **2603.27905** (ATLAS-RTC): prevent the violation instead of paying for retries. Removing a deterministic mis-gate is the degenerate case of that, since retrying a deterministic reject is the same experiment run again.
+- Not new infra: one YAML value changes and one test file is added.
 
-1. Add a small helper in `mini_ork/cli/execute.py`, e.g.
-   `_provenance_hashes(node_id, node_type, task_class, run_dir) -> tuple[str, str]`:
-   - `context_bundle_hash = "sha256:" + sha256(context_pack_bytes)` where
-     `context_pack_bytes` is the byte content of `<run_dir>/context-pack.json`
-     (confirmed present in this run dir, 12.4 KB). This is the bundle
-     *version* identity: stable across identical bundles, changes when the
-     bundle changes.
-   - `prompt_version_hash = "sha256:" + sha256(prompt_file_bytes)` where
-     `prompt_file_bytes` is the node's recipe prompt under
-     `recipes/<recipe>/prompts/<node>.md`, resolved via the existing
-     recipe/node→file logic already present in `execute.py` (the same
-     resolution `_researcher_output_file` at `:1287-1319` relies on). This is
-     the *prompt version*, not the per-run rendered string — matching the
-     semantics the perf lens already assumed (`lens-perf-prompt-…-v1` =
-     "deterministic copy of the recipe prompt").
-   - Best-effort, mirroring `:1707-1708`: any resolution/IO failure returns
-     `("", "")` for the affected field and never raises. When a hash can't be
-     computed, also set `extra["prompt_hash_source"] = "unavailable"` so an
-     empty hash is *explained* rather than silently indistinguishable from a
-     bug (satisfies 2607.00941's atomicity/immutability intent without a
-     schema change).
-2. In `_tf` (`execute.py:1662-1672`), after building `extra`, call the helper
-   and set `extra["prompt_version_hash"]` / `extra["context_bundle_hash"]`.
-3. **Verify the persistence column-mapping** before claiming success: confirm
-   the `INSERT` in `trace_store.py` maps payload keys `prompt_version_hash` /
-   `context_bundle_hash` to their columns (the schema columns exist per all
-   three lenses). If the INSERT drops unknown keys, add the two columns to the
-   mapping — still within the LOC budget. Do **not** ship the `_tf` change
-   without confirming the row actually persists the value (otherwise it is the
-   no-op the perf lens warned about).
+**Proposed change.** Two files.
 
-Estimated size: helper + two assignments + INSERT-mapping check + tests ≈
-40–70 LOC. Comfortably under the 200-LOC ceiling; additive (new metadata
-fields, empty-string default preserved, no existing arithmetic touched).
+1. `recipes/recursive-self-improve/workflow.yaml`, line 24: change
+   `model_lane: planner,` → `model_lane: opus_lens,` on the `bottleneck_lens`
+   entry. Change nothing else on that line. Extend the comment block above it
+   (`:20-23`) with:
+   ```yaml
+   # Its lane is opus_lens, NOT planner: the executor passes the lane in
+   # llm_dispatch's --node-type slot, and lane `planner` arms the planner's
+   # JSON reply gate (_NODE_SHAPE_PREDICATES), which shape-rejected every
+   # markdown scan and re-ran the fallback chain (iter-1-20261023054815:
+   # 4 lanes, $4.84, 21.8 min). Same model (opus), no reply gate.
+   ```
+2. New file `tests/unit/test_rsi_workflow_shape_gate.py`. The kickoff permits
+   adding a regression test, and the test is the whole guard.
 
-**Regression test.** New file `tests/test_trace_provenance_hashes.py`:
+Do **not** touch `mini_ork/`, `.mini-ork/`, any verifier, or any other recipe.
+`.mini-ork/` is listed as allowed in constraint `c:0` only because of the
+negation-parsing defect (COR-5). The kickoff says "Leave `.mini-ork/` (run
+state) untouched", and that wins.
 
-- `test_tf_stamps_nonempty_provenance_hashes` — dispatch a node through the
-  `_tf` path (or the smallest integration that writes a row) with a known
-  recipe prompt file and a known `context-pack.json`; assert the persisted
-  `execution_traces` row has
-  `prompt_version_hash != "" and prompt_version_hash is not None and
-  context_bundle_hash != ""`.
-- `test_provenance_hashes_are_stable` — two writes with the *same* prompt file
-  and *same* context-pack produce **identical** `prompt_version_hash` and
-  `context_bundle_hash` (attribution must not drift across identical runs).
-- `test_prompt_hash_changes_on_prompt_edit` — mutate one byte of the node's
-  prompt file; assert `prompt_version_hash` changes while `context_bundle_hash`
-  stays constant (sensitivity + independence of the two axes).
-- `test_learning_loop_filter_now_selects_rows` — after a self-improve node
-  writes, assert
-  `SELECT count(*) FROM execution_traces WHERE task_class='recursive_self_improve'
-   AND prompt_version_hash <> '' AND prompt_version_hash IS NOT NULL >= 1`
-  (the exact predicate GEPA/rho_aggregator use — proves the loop is no longer
-  starved).
-- `test_hash_failure_is_best_effort` — point prompt resolution at a missing
-  file; assert `_tf` does **not** raise and the row is still written with
-  `prompt_hash_source == "unavailable"`.
+**Regression test.** `tests/unit/test_rsi_workflow_shape_gate.py`. It must fail
+on the base (lane `planner`) and pass after the change:
 
-**Verification.** `python3 -m pytest -q` must stay green (the kickoff's only
-verification command). Existing trace/dispatch/learning tests must pass
-unchanged — the change is additive metadata; no aggregator reads these fields
-for arithmetic, so cost/duration/percentile numbers are byte-identical.
-Expected benchmark delta: the count of self-improve rows satisfying the GEPA
-filter moves **0 → N**, where N ≈ the number of LLM-backed nodes dispatched
-per run (this recipe's plan dispatches 13 nodes; expect a step increase of
-that order per iter, sign strictly non-negative). No expected change to
-`self-tests-pass` or `no-regression` beyond the new tests passing.
+```python
+"""recursive-self-improve: no prose node may sit on a lane that arms a reply-shape gate.
 
-**Rollback criteria.** Discard the patch if any of:
-- (a) any existing test regresses, or the new `INSERT` mapping rejects a
-  payload (column-type mismatch);
-- (b) `test_provenance_hashes_are_stable` fails — non-deterministic hashes
-  would *poison* attribution, which is worse than empty hashes;
-- (c) hash computation raises on any node despite the best-effort guard
-  (must behave like the `:1707-1708` `except: pass`);
-- (d) the persisted value is still empty after the change (the no-op failure
-  mode — means the source material or column mapping was mis-identified;
-  fix-forward rather than ship a cosmetic diff).
+2026-10-23 (self-improve-iter-1-20261023054815): bottleneck_lens is a researcher
+that writes lens-bottleneck.md, but its model_lane was `planner`. The executor
+passes the lane in llm_dispatch's --node-type slot, so the planner JSON gate
+rejected every markdown reply and re-ran the chain: 4 lanes, $4.84, 21.8 min.
+"""
+from pathlib import Path
+
+import pytest
+import yaml
+
+from mini_ork.dispatch import llm_dispatch as L
+from mini_ork.dispatch.predicates import SHAPE_REJECT_RC
+
+WORKFLOW = (Path(__file__).resolve().parents[2]
+            / "recipes" / "recursive-self-improve" / "workflow.yaml")
+
+
+def _nodes():
+    return yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["nodes"]
+
+
+def _prose_nodes():
+    return [n for n in _nodes()
+            if n.get("model_lane") and n["type"] not in L._NODE_SHAPE_PREDICATES]
+
+
+def test_workflow_has_laned_prose_nodes():
+    assert {"bottleneck_lens", "perf_lens", "opus_synthesizer"} <= {
+        n["name"] for n in _prose_nodes()}
+
+
+@pytest.mark.parametrize("node", _prose_nodes(), ids=lambda n: n["name"])
+def test_prose_node_lane_does_not_arm_shape_gate(node, monkeypatch):
+    monkeypatch.delenv("MO_SHAPE_CHECK", raising=False)
+    monkeypatch.delenv("MO_PLAN_ARTIFACT", raising=False)
+    assert L._shape_predicate_for(node["model_lane"]) is None, (
+        f"{node['name']} ({node['type']}) is on lane {node['model_lane']!r}, "
+        "which arms the planner's JSON reply gate")
+
+
+def test_bottleneck_scan_is_dispatched_once_on_a_markdown_reply(monkeypatch, tmp_path):
+    # Same isolation as tests/unit/test_llm_dispatch_shape_fallback.py::_isolate.
+    monkeypatch.setattr(L, "cost_circuit_open", lambda *a, **k: False)
+    monkeypatch.setattr(L, "write_llm_calls_row", lambda *a, **k: None)
+    monkeypatch.setattr(L, "backoff_seconds", lambda n: 0)
+    monkeypatch.setenv("MINI_ORK_HOME", str(tmp_path))
+    monkeypatch.setenv("MINI_ORK_DB", str(tmp_path / "state.db"))
+    monkeypatch.setenv("MO_DISPATCH_MAX_ATTEMPTS", "3")
+    for key in ("MO_SHAPE_CHECK", "MO_FUSE_ENABLED", "MO_PLAN_ARTIFACT"):
+        monkeypatch.delenv(key, raising=False)
+    lane = next(n["model_lane"] for n in _nodes() if n["name"] == "bottleneck_lens")
+    calls = []
+
+    def lane_writes_markdown(model, prompt, out_file, timeout_s, max_turns):
+        calls.append(model)
+        Path(out_file).write_text("# Bottleneck Scan\n\nmarkdown, not json\n")
+        return SHAPE_REJECT_RC
+
+    out = str(tmp_path / "out.txt")
+    L.llm_dispatch(["--node-type", lane, "--model", lane, "--prompt-text", "x",
+                    "--out", out], dispatch_fn=lane_writes_markdown)
+    # One lane run. On lane `planner` the shape-reject retry re-runs it 3x.
+    assert calls == [lane]
+```
+
+The assertions that must hold, in plain text:
+
+- (a) `_shape_predicate_for(model_lane) is None` for every node of
+  `recursive-self-improve` whose `type` is not a key of `_NODE_SHAPE_PREDICATES`.
+- (b) Dispatching `bottleneck_lens`'s lane with a markdown reply invokes the
+  lane exactly once: `calls == [lane]`. On the base this is
+  `["planner", "planner", "planner"]`.
+
+**Verification.**
+
+- New test file: passes after the change. It fails on the base: (a) fails for
+  `bottleneck_lens`, and (b) yields 3 calls.
+- Existing tests that must stay green, measured green on the base this pass
+  (**154 passed in 83.87 s**):
+  - `tests/unit/test_llm_dispatch_shape_fallback.py`
+  - `tests/unit/test_dispatch_shape_check_py.py`
+  - `tests/unit/test_mini_ork_execute_py.py`
+  - `tests/unit/test_mini_ork_plan_py.py`
+  - `tests/unit/test_remote_unavailable_retry.py`
+- Also `tests/test_web_smoke.py` (node-name assertion at `:1148`), and any test
+  that loads `recipes/*/workflow.yaml`.
+- Run these as explicit file paths (resource guard). Kickoff gate:
+  `python3 -m pytest -q`.
+- Expected deltas on the **next** iteration's `bottleneck_lens`:
+  - `llm_calls` rows for the node: 4 (bound 9) → **1**.
+  - Wall time: 1308 s → **~290–395 s**. The range is this run's two single opus lanes (attempt-2 lane ≈ 1308 − 1011.5 − 5 s backoff; attempt-1 lane 392.8 s). That is **−913 to −1018 s (−70 % to −78 %)**, i.e. 15–17 min of the 60-min iteration returned to the verifier stage that rank 3 shows is starved.
+  - Cost: $4.84 → **~$1.45–$3.18 (−34 % to −70 %)**.
+  - Rows carrying `dispatch result failed shape check`: 3 → **0**.
+  - No change to pass/fail counts of the existing suite.
+- Side effect to expect, and not to treat as a regression: the node's ledger
+  rows change from `feature_name='mini-ork:planner'` to `'mini-ork:opus_lens'`,
+  the same label as `opus_synthesizer` and `opus_patch_critic`. Per-node
+  attribution still comes from `metadata_json.node_id` (`web/agents.py:514`).
+  Fixing lane-keyed attribution is backlog.
+
+**Rollback criteria.** Discard the patch if any of these hold:
+
+1. The new test file fails after the change, or any of the five files above
+   (154 tests) or `tests/test_web_smoke.py` regresses.
+2. `python3 -m pytest -q` shows **any failure not present on the base**. The
+   absolute `rc == 0` gate (rank 4) may reject for pre-existing reds; compare
+   failure sets before blaming this patch.
+3. The diff touches anything besides `recipes/recursive-self-improve/workflow.yaml`
+   (one `model_lane` value plus the comment) and the new test file, or exceeds
+   ~80 changed lines.
+4. In the next iteration, `opus_lens` fails lane preflight for a researcher
+   node, `lens-bottleneck.md` is not written, or any `llm_calls` row for
+   `bottleneck_lens` carries a shape-check error.
+
+Restore `model_lane: planner` in each case. The emergency lever, unchanged, is
+`MO_SHAPE_CHECK=0` (`llm_dispatch.py:829`).
+
+**Implementer notes.**
+
+- Keep the diff to the two files.
+- Run the targeted test files only. The full suite is the verifier's job, and
+  this iteration's budget is nearly spent (see Convergence).
+- Do not "fix" the bottleneck-scan prompt's JSON-reply workaround. It becomes
+  unnecessary but harmless.
 
 ## Lower-ranked patches
 
-### Patch 2: Structured `failure_detail` on verifier output (correctness, ~15–25 LOC)
-`mini_ork/cli/verify.py:295-303` already builds a `results` array with
-`pass_count`/`fail_count`; `_safe_trace_write` (`:307-313`) throws it away and
-persists `{"verdict": verdict}` only. Extend the write to carry `results` plus
-a `failure_detail` list — one entry per failed check
-`{rule_id, expected, observed, missing_inputs, evidence_path}`. Directly fixes
-the learned-failure-mode `tr-verify-1785858934-69675`
-("verifier_output is only {\"verdict\": \"fail\"}") and its siblings.
-**Regression test:** `verify.py --artifact` with one failing check →
-`execution_traces.verifier_output` contains `failed_rule_ids: list[str]` and
-`results: list[dict]`, not bare verdict. arXiv: 2607.28871 (evidentiary-role
-classification is the verbatim `failure_detail` shape), 2412.13114
-(assume-guarantee: empty detail is a broken guarantee), 2608.02011 (Read-Gate:
-`verdict="fail"` requires non-empty detail). Back-compat: existing consumers
-that key on `verifier_output.verdict` are unaffected.
+### Patch 2 — Key the reply-shape gate on the node's declared contract (engine tier)
 
-### Patch 3: `cost_observed` / `duration_observed` flags (perf+correctness, ~30 LOC + 5 guards)
-`trace_write_node` (`trace_store.py:169-182`) pre-inits `cost=0.0`/
-`duration_ms=0` and the sidecar-absent branch silently leaves them at 0 — 3
-semantic states (ran in 0ms, sidecar never written, sidecar wrote 0) collapse
-to one value. Set `cost_observed = bool(c)` / `duration_observed = bool(d)` and
-emit them in the payload; guard the 5 arithmetic consumers
-(`context_assembler.py:332-333`, `otel_export.py:96,101,239,258,266`) with
-`WHERE cost_observed` (or `cost_observed OR cost_usd=0`) so unobserved-zero is
-excluded from sums/percentiles. Prefer the JSON-envelope form if Patch 3 ships
-alone; a `0043_*` nullable migration only if it lands with a consumer that
-needs `WHERE`. arXiv: 2605.08747 (VIGIL W/B decomposition — "measured" vs
-"reported" is exactly `*_observed`), 2604.05119 (typed telemetry beats coerced
-zeros). **Regression test:** an aggregator skips `duration_ms=0` rows when
-`duration_observed=False`. This is prior-iter (`20260804165336`) rank 2, never
-landed — re-ranked here, not a third variant.
+- **Problem.** Patch 1 removes one instance. The engine trap stays armed for any
+  node whose lane happens to be named after a JSON-contract role:
+  - `prompt-graph-loop` `prompt_intake` and `recursive_plan_composer`
+    (`workflow.yaml:13,42`) are researchers on lane `planner`.
+  - `spec-driven-delivery` `contract_compiler` (`workflow.yaml:14`) is a
+    researcher on lane `planner`.
+  - The two `prompt-graph-loop` nodes declare `kind: json` outputs (`:17,50`),
+    and `ArtifactLedger.publish_node_outputs` never validates `kind`. Their only
+    JSON check today is this accidental reply gate, which false-rejects an
+    agentic lane that writes the file and replies with a summary (the same
+    failure as `_plan_artifact_predicate`'s docstring incident, `llm_dispatch.py:799-820`).
+  - That is why this patch is not rank 1: a role-only disarm would silently
+    remove those nodes' only JSON check.
+- **Change.**
+  - In `NodeDispatch.dispatch` / `_default_llm_dispatch.d`, forward two values as argv:
+    - `--node-role <MO_NODE_TYPE>`, already published per node at `execute_handlers.py:956-960` via `context.py:161-164`;
+    - `--expect-shape json|text`: `json` iff the node declares a `kind: json` output, else `text`.
+  - In `llm_dispatch.llm_dispatch`, parse both. `_shape_predicate_for(node_type, node_role="", expect_shape="")`:
+    - `expect_shape == "text"` → `None`;
+    - `expect_shape == "json"` → `looks_like_json`, or the artifact-file predicate when the declared path exists;
+    - neither flag → today's `--node-type` lookup, so the `cli/plan.py` path is unchanged.
+  - Read the role and shape only from argv. Do not read them from `context_env`
+    inside llm_dispatch: `publish_env` leaks `MO_NODE_TYPE` into `os.environ`
+    forever (`context.py:268-283`), and a nested `mini-ork run` planner would
+    inherit a parent node's role and lose its gate.
+- **Regression test.**
+  - `_shape_predicate_for("planner", "researcher", "text") is None`
+  - `_shape_predicate_for("planner", "researcher", "json") is not None`
+  - `_shape_predicate_for("planner") is L._NODE_SHAPE_PREDICATES["planner"]` (back-compat)
+  - Seam: with `run_context_scope({"MO_NODE_TYPE": "researcher"})`, argv contains `["--node-role", "researcher"]`.
+  - Hazard: `tests/conftest.py` does not pop `MO_NODE_TYPE`, and
+    `test_mini_ork_execute_py.py:160-185` asserts an exact argv. Append the new
+    flags at the end, only when non-empty, and run tests with `env -u MO_NODE_TYPE`
+    when inside a node.
+- **Rollback.** Revert if any planner JSON-contract path (epic-runner via
+  `MO_PLAN_ARTIFACT`) starts failing shape checks it used to pass, or if
+  `prompt-graph-loop` JSON nodes start publishing non-JSON outputs.
+- **arXiv:** 2501.10868, 2609.23742. Not new infra.
 
-### Patch 4: Implementer provenance gate (correctness, dual-surface)
-(a) `recipes/recursive-self-improve/prompts/implementer.md` mandates a
-`## Provenance` block: one `{path, op: read|set|write, source, justification}`
-per `files_written` entry. (b) `trace_write_node` downgrades `status` from
-`success` to a new terminal `needs_provenance` when
-`cost_usd > MO_PROVENANCE_COST_FLOOR (default 0.05) AND tool_calls=[] AND
-files_read=[] AND files_written non-empty`. Fixes
-`tr-implementer-implementer-f6b6c79a` (`cost_usd=1.308`, 101 writes, empty
-ledger). arXiv: 2604.04035 (causality laundering — the 101-path list *is* the
-laundered audit trail), 2603.14688 / 2604.17557 (causal-graph data shape).
-Wider blast radius (new status + patch-critic must accept
-`status IN ('success','needs_provenance')`) → deferred behind the two narrower
-correctness patches.
+### Patch 3 — Bound and parallelize `self-tests-pass` (perf)
 
-### Patch 5: Drop the legacy `verifier_` mirror prefix (arch, ~1 LOC + cleanup)
-`execute.py:1385` mirrors both `("verifier_", "verifier-")`; both byte-
-identical files are written every run (confirmed on disk in
-`20260804165336`), while every canonical reader
-(`self_improve.py:91`, `web/why.py:91`, `run_detail.py:169`) reads the hyphen
-form only. Drop `"verifier_"`; canonicalize any legacy source read-only. No
-arXiv required (this is *removal*, not new infra — ranking rule 4 N/A).
-**Scope caveat:** `framework_edit` (out of scope per kickoff) shares this
-mirror path; the fix is recipe-agnostic at `:1385`, so grep
-`recipes/framework-edit/` for a live `verifier_` writer before merging.
+- **Change** (`recipes/recursive-self-improve/verifiers/self-tests-pass.py`):
+  - Export the iteration deadline from `self_improve.py:493` (e.g.
+    `MINI_ORK_SELF_IMPROVE_DEADLINE` = epoch of `start + per_iter`). Pass
+    `timeout = deadline − now − 120 s` to every `subprocess.run`.
+  - On `TimeoutExpired`, write `exc.output` to the evidence log and emit
+    `pass: false, reason: "budget-timeout"`.
+  - Run K = `min(6, max(2, cpu_count − 2))` shards via `ThreadPoolExecutor`,
+    using CI's interleave (`ci.yml:66-70, 96-101`): `tests/unit/*.py` split
+    `NR % 2`, plus a `--ignore=tests/unit` rest shard.
+  - Add the override `MINI_ORK_SELF_IMPROVE_TEST_JOBS`; `1` gives serial.
+  - Count each shard with `re.search(rf"(\d+) {word}\b", …)` and `errors?` as one
+    alternation, then **sum**. This also fixes the double count (R-2: reports 27
+    vs a true 19).
+- **Probe first:** time `python3 -m pytest tests/unit -q` once on this box. The
+  3533.93 s audit figure and CI's ~14–17 min comment disagree by ~3.5×. Then time
+  the two CI shards concurrently to rule out shared-state collisions (perf lens
+  open question 3).
+- **Expected:** verifier wall 3534 s → ~700 s at K = 6 (perf lens PC-1
+  arithmetic), and a recorded verdict instead of outer rc 124.
+- **Rollback:** summed shard counts ≠ serial counts on the same tree, or any
+  shard goes red on a lock/fixture error that is absent serially.
+- **arXiv:** 2105.07311 (RTS for APR patch validation), 2610.04184 (compact
+  evaluator under budget, with truncation reported), 2311.12484 (time-budgeted
+  prioritization; needs an explicit inconclusive outcome).
+
+### Patch 4 — Make `self-tests-pass` a delta gate (correctness, after Patch 3)
+
+- **Change.**
+  - Run the same sandboxed command once against the worktree at the
+    `pre-implementer-ref` sha (already in the run dir), using `--junitxml` for
+    per-test ids. Persist `verifier-self-tests-baseline.json`.
+  - Pass iff `rc == 0` **or** `failed_ids(patch) ⊆ failed_ids(base)`. Report the
+    `new_failures` and `fixed` sets.
+  - Cheaper first cut: baseline only the test files that would be selected for
+    the diff.
+- **Regression test:** for a unit helper `failures_subset(child, base)`, the
+  result is `False` iff `child − base` is non-empty. Also, a fixture tail
+  `11 failed, 9895 passed, 15 skipped, 8 errors` parses to `failed == 19`.
+- **Rollback:** two baseline runs on the same sha disagree on the failure set
+  (flakiness). Then fall back to `rc == 0` plus a recorded `baseline_red` marker.
+- **arXiv:** 2506.09289 (UTBoost: 345 false "passed" patches), 2410.06992
+  (SWE-Bench+: a verified pass must distinguish the patch from the base).
+
+### Patch 5 — Give `no-regression` a Python surface and make it fail closed (correctness)
+
+- **Change** (`recipes/recursive-self-improve/verifiers/no-regression.py:35-36, 125-131`):
+  - Build the surface from `git diff --name-only HEAD -- '*.py' '*.sh' 'bin/*'`
+    plus `git ls-files --others --exclude-standard -- '*.py'`.
+  - Run `python3 -m py_compile` on each `.py` and `bash -n` on each `.sh`.
+  - If zero files were checked **and** the benchmark is inconclusive, set
+    `pass: false, reason: "vacuous"`.
+- **Regression test:** in a scratch git repo, a changed `.py` with a
+  `SyntaxError` → `pass: false` naming the file. An untracked `.py` with a
+  `SyntaxError` → `pass: false`. An empty diff with no DB →
+  `pass: false, reason == "vacuous"`.
+- **Rollback:** a legitimate docs-only iteration is blocked. Add that surface
+  rather than reverting the fail-closed default.
+- **arXiv:** 2607.24300 (SEAL: the audit must be exogenous, diff-based and fail
+  closed).
+
+### Unranked backlog (queued for `learning_record`, not this iteration)
+
+- **COR-6 + COR-5, scope prefix and polarity.**
+  - `entry.strip().lstrip("./")` → `.removeprefix("./")` at
+    `publisher_authored_patch.py:219` and `scheduler.py:950` (R-4:
+    `_in_scope('.mini-ork/state.db', ['.mini-ork/'])` is `False`). This is a
+    2-line fix.
+  - Route paths on negated lines ("leave … untouched", "do not touch",
+    "read-only") to `deny` in `kickoff_scope.py:170-208` and
+    `preferences.py:237-249`.
+  - arXiv 2601.17789, 2603.16417. This was the sixth candidate; bundle the
+    `removeprefix` half with the next small patch.
+- **COR-7.** One `## Status`-style convergence heading anywhere in the scan
+  makes `bottlenecks-found.py:57-61` pass with no synthesis (R-6). Require
+  `not missing`, or move the convergence verdict to a runner-owned sidecar.
+- **COR-8.** `recipe_plan.py:52` asserts "Planner LLM output was invalid JSON"
+  even under `MO_STATIC_RECIPE_PLAN=1`. That fabricated provenance is fed to
+  every node.
+- **COR-10.** `self_improve.py:558-563` ignores the `git commit` rc before
+  `rev-parse HEAD`.
+- **PC-4.** A shape reject (deterministic for a given node) is retried like a
+  throttle; make shape retries chain-scoped, and keep throttle and fair-usage
+  retries intact.
+- **COR-1 secondary.** The final `llm_calls.duration_ms` spans the whole retry
+  loop (`llm_dispatch.py:1043, 1192-1194`); the column is not summable per
+  dispatch.
+- **A1.** Node `gates:` are display-only (326 refs, 40 workflows). The two gate
+  tables never meet, and `verify.py:567-574` passes `cost_usd: 0.0`.
+- **A2.** Outputs are routed by node-id suffix (`execute.py:2906-2940`) although
+  the schema has `outputs`.
+- **A3 / scan #8.** One static Anthropic rate tuple (`telemetry.py:42-48`): opus
+  breakdown 3.91× its envelope (id 1), 2.65× (id 4). Reporting only.
+- **Ledger attribution.** `feature_name` is `mini-ork:<lane>`, so `arch_lens`
+  and `arxiv_lens` are indistinguishable (ids 5 and 7, both
+  `mini-ork:codex_lens`).
+- **Test hygiene.** `tests/conftest.py` pops `MINI_ORK_DB`/`MINI_ORK_HOME` but
+  not `MO_NODE_TYPE`/`MO_NODE_ID`. This is a prerequisite for Patch 2.
 
 ## Convergence assessment
 
-**Not converged — continue the loop.** Two signals point in opposite
-directions and the net is "more headroom, different surface":
+mini-ork is **not** converging. The scan has eight evidence-backed bottlenecks,
+four of them critical, and the cross-iteration tables are empty, so there is no
+history of resolved items. The loop's liveness is also gated by three of the
+ranked patches:
 
-- *Converging on the old surface:* the previously dominant failure pattern
-  `pat-c694ab5f46f0` (recursive_self_improve failure) collapsed **freq 28 → 3**
-  over the 8 days / 10 follow-up merges between `421a6862` and HEAD
-  `83553a58` (verifier-triple reconnection, real pytest, kickoff scope).
-- *New load-bearing surface:* telemetry/provenance collapse — dormant while
-  the old failures dominated — is now the top defect, and it is *self-
-  defeating* (the learning loop that would drive convergence is filtered to
-  empty by the very gap Patch 1 fixes). Until Patch 1 lands, the loop cannot
-  demonstrate diminishing returns because it receives no rows to learn from.
+- **Rank 1:** node 1 consumed 36 % of the iteration.
+- **Rank 3:** the full suite may not fit the remaining budget.
+- **Rank 4:** a red base blocks every promotion.
 
-Recommendation: run at least one more iteration **after** Patch 1 to confirm
-the learning loop begins ingesting rows (the `test_learning_loop_filter_now_
-selects_rows` predicate turning non-zero in production is the convergence
-gate), then re-assess with Patches 2–4 queued. The outer loop should **not**
-terminate after this iteration.
+Until these land, an iteration cannot reliably reach a verdict, let alone show
+diminishing returns.
+
+Feasibility warning for **this** iteration:
+
+- The outer `timeout` is `min(3600, time_left)` from ~05:48:16Z, so it expires
+  around **06:48Z**.
+- At synthesis time (~06:30Z) about 18 minutes remain for the implementer, a
+  serial full suite, `no-regression`, and the patch critic.
+- If the runner records `timed_out` (rc 124, `self_improve.py:72-73`), that is
+  **not** a verdict on Patch 1. Re-queue it as rank 1 rather than recording it
+  as failed. Its small diff and targeted tests make it the right first patch for
+  the next iteration too.
+
+Following DGM (arXiv 2505.22954), acceptance should rest on a measured delta.
+Rank 1's expected delta (−70 to −78 % node-1 wall time) is directly measurable
+from `llm_calls` on the next iteration.
 
 ## Provenance footer
 
-- Lenses consumed: minimax (perf, arch) / kimi (correctness) / codex
-  (bottleneck, arxiv) — all present; none degraded.
-- Synthesizer family: opus.
-- arXiv papers cited: 11 (2605.17169, 2607.00941, 2606.07889, 2607.28871,
-  2412.13114, 2608.02011, 2605.08747, 2604.05119, 2604.04035, 2603.14688,
-  2604.17557) — all appear in `lens-arxiv.md`; none invented.
-- Cross-iteration learnings applied: 4 — prior synthesis
-  `20260804165336` (its unfielded rank-2 duration-coercion re-ranked to Patch
-  3, not re-litigated as new); `learning_record` open rows 2/10/11/12
-  (consulted, none patchable on the `mini_ork/`+`recipes/`+`schemas/` surface
-  per kickoff scope); pattern-store collapse `pat-c694ab5f46f0` 28→3; the
-  run's 5 learned failure modes (top 4 map 1:1 to Patch 1's symptom cluster).
-- Synthesizer-verified against live source (files read this node):
-  `mini_ork/trace_store.py:140-209`, `mini_ork/cli/execute.py:1650-1719` —
-  corrected the lens symbol name `build_trace_payload` → `trace_write_node`.
-- Scope honored: no patch touches `.mini-ork/` run state or the
-  `framework_edit` recipe surface.
+- **Lenses consumed** (family as actually routed, from `run_profile.json` and `llm_calls`):
+  - bottleneck scan: opus via lane `planner`
+  - perf: MiniMax-M3 via `minimax_lens` (`llm_calls` id 6)
+  - correctness: **GLM-5.3 via `kimi_lens`** (id 8). The lens self-labels "Moonshot Kimi", but the home's policy remaps `kimi_lens → glm`.
+  - arch and arXiv: **deepseek-v4-flash via `codex_lens`** (ids 5, 7), not OpenAI Codex
+  - The research phase therefore covered four distinct families (anthropic, minimax, zai, deepseek). The kickoff's "kimi"/"codex" families were not the ones that ran.
+  - Note: per `run_profile.json`, the implementer lane `codex_lens` is also deepseek_flash on this home.
+- **Synthesizer family:** opus (Anthropic).
+- **arXiv papers cited:** 12. All appear in `lens-arxiv.md`: 2501.10868, 2609.23742, 2603.27905, 2105.07311, 2610.04184, 2311.12484, 2506.09289, 2410.06992, 2607.24300, 2601.17789, 2603.16417, 2505.22954.
+- **Cross-iteration learnings applied:** 0 rows from `learning_record` (table empty, verified by query); `pattern_records` 0 rows.
+- **Verification performed by the synthesizer this pass:**
+  - re-read every rank-1 code anchor;
+  - ledger query (ids 1–8);
+  - grep showing no test pins `bottleneck_lens`'s lane;
+  - the five existing gate/seam test files run on the base as file paths: 154 passed, 83.87 s;
+  - the Patch 1 regression test above, dry-run from a scratch copy (worktree untouched): against the base `workflow.yaml` **2 failed, 8 passed** (`bottleneck_lens` parametrization, and `calls == ['planner', 'planner', 'planner']`); against a copy with `model_lane: opus_lens` **10 passed**.
