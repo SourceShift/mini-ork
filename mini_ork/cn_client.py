@@ -1018,6 +1018,15 @@ class CoordUnavailable(RuntimeError):
     """ContextNest is unreachable (connection refused, DNS, or a timeout)."""
 
 
+class CoordConfigError(CoordUnavailable):
+    """The secure tier's bearer token could not be resolved.
+
+    A ``CoordUnavailable`` so every caller that already degrades on an
+    unreachable ContextNest (the CLI's exit 3, ``concord run`` failing open)
+    degrades here too. The message names the missing key, never its value.
+    """
+
+
 class CoordHTTPError(RuntimeError):
     """ContextNest answered with a 4xx/5xx status."""
 
@@ -1041,8 +1050,16 @@ def _coord_request(method: str, path: str, body: dict | None = None, *,
     ``CN_COORD_TIMEOUT_SEC`` for one call, so an IDE page can bound its read
     without changing the environment a long-lived ``serve`` shares.
     """
+    try:
+        # The coord routes sit behind the same bearer as every other read: a
+        # secure-tier deployment that gates /api/v1 would refuse them otherwise.
+        headers: dict = _auth_headers()
+    except Exception as exc:  # noqa: BLE001 — only SecretStoreError is converted
+        from mini_ork.dispatch.secrets import SecretStoreError
+        if isinstance(exc, SecretStoreError):
+            raise CoordConfigError(str(exc)) from exc
+        raise
     data = None
-    headers: dict = {}
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -1101,6 +1118,18 @@ def coord_inbox(principal_id: str, unacked: bool = True, *,
     flag = "true" if unacked else "false"
     return _coord_request(
         "GET", f"/api/v1/coord/principals/{_enc(principal_id)}/messages?unacked={flag}",
+        timeout=timeout,
+    )
+
+
+def coord_outbox(sender: str, limit: int = 200, *, timeout: float | None = None) -> dict:
+    """GET /api/v1/coord/messages?from=<sender> — what ``sender`` sent, oldest first.
+
+    Each message's ``principal_id`` is its recipient. A ContextNest that
+    predates the route answers 404, raised as ``CoordHTTPError``.
+    """
+    return _coord_request(
+        "GET", f"/api/v1/coord/messages?from={_enc(sender)}&limit={int(limit)}",
         timeout=timeout,
     )
 

@@ -54,6 +54,7 @@ The name matches `[A-Za-z0-9._@/-]{1,128}`. Full regex:
 | `GET /bindings/{worker_id}` | — | `200 Binding` | `404` |
 | `POST /principals/{principal_id}/messages` | `{"from": str, "body": str}` (body 1–8192 bytes) | `201 Message` | `404` unknown principal, `400` empty or oversized body |
 | `GET /principals/{principal_id}/messages?unacked=true` | — | `200 {"messages": [Message]}`, oldest first | `404` |
+| `GET /messages?from=<sender>&limit=200` — what a sender sent, to anyone (limit 1–1000, newest kept) | — | `200 {"messages": [Message]}`, oldest first; each `principal_id` is the recipient; an unknown sender is an empty list | `400` missing `from` |
 | `POST /principals/{principal_id}/messages/{msg_id}/ack` — idempotent | `{"by": str}` | `200 Message` | `404` |
 
 Ids in paths are URL-encoded (`loop%3Asurface-craft-rsi`).
@@ -125,14 +126,28 @@ Base URL: `CN_BASE_URL` (default `http://127.0.0.1:28080`), the same variable
 
 ### A run's mailbox in the IDE
 
-Every run registers as `run:<run id>`, so the run page's **Messages** tab
-(`mini_ork/ide_pages/run_messages.py`) lists that principal's whole inbox,
-acked messages included, newest first. Each row shows its delivery state, with
-Ack and Reply buttons; a row whose sender is another `run:` principal also gets
-Open run. One run writing to another's principal is the only run-to-run
-channel. What a run *sent* is not shown, because there is no
-outbox endpoint. When ContextNest is off, unreachable, refuses the read, or
-the run never registered (`404`), the tab says which.
+Every run registers as `run:<run id>` and its workers send as that principal, so
+the run page's **Messages** tab (`mini_ork/ide_pages/run_messages.py`) shows
+both directions:
+
+- **Messages to this run**: the principal's inbox, acked messages included,
+  newest first. Each row shows its delivery state. Ack and Reply buttons, plus
+  Open run when the sender is another `run:` principal.
+- **Messages this run sent**: `GET /messages?from=run:<id>`, with Open run when
+  the recipient is a run.
+
+One run writing to another's principal is the only run-to-run channel.
+
+The tab badge counts received messages and turns yellow while any is unacked.
+There is no badge when the mailbox could not be read. When ContextNest is off,
+unreachable, misconfigured (secure tier without its token), refuses the read,
+predates the sender route, or the run never registered (`404`), the tab says
+which.
+
+Every coord request carries the same `Authorization: Bearer …` header as the
+other ContextNest reads when `CN_TIER=secure`. A missing token raises
+`CoordConfigError`, a `CoordUnavailable` that names the key. So the CLI exits
+`3` and `concord run` still fails open.
 
 ## P0b — the per-turn hook (shipped)
 

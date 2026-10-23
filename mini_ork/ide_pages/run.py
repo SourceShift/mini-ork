@@ -4008,7 +4008,7 @@ def _learnings_count(run: Run) -> int:
         return 0
 
 
-def _v2_tabs(run: Run) -> list[dict[str, Any]]:
+def _v2_tabs(run: Run, mailbox: run_messages.Mailbox | None = None) -> list[dict[str, Any]]:
     """``V2_TABS`` with a ``count``/``tone`` badge where the tab has one.
 
     Labels stay the plain tab name (``Checks``, not ``Checks · 1``): the badge
@@ -4043,6 +4043,9 @@ def _v2_tabs(run: Run) -> list[dict[str, Any]]:
         "learnings": (_learnings_count(run), "sub"),
         "artifacts": (artifacts, "sub"),
     }
+    messages_badge = run_messages.badge(mailbox) if mailbox is not None else None
+    if messages_badge is not None:
+        badges["messages"] = messages_badge
     out: list[dict[str, Any]] = []
     for key, label in V2_TABS:
         entry: dict[str, Any] = {"key": key, "label": label}
@@ -5067,14 +5070,20 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
         except Exception:  # noqa: BLE001 — a broken summary costs its entry
             pass
 
+    # One inbox read per build feeds both the tab badge and the Messages tab.
+    try:
+        mailbox = run_messages.read_mailbox(run.id)
+    except Exception as exc:  # noqa: BLE001 — a broken mailbox costs its tab, never the page
+        mailbox = run_messages.Mailbox(run_messages.principal_for(run.id), "error",
+                                       error=f"{type(exc).__name__}: {exc}")
     errors: dict[str, str] = {}
     sections = {
         "dag": lambda: _dag_tab(run, node, select=True, outcome=outcome,
                                 callout_actions=callout_actions),
         "outcome": lambda: _outcome_tab(run, outcome, callout_actions, absorbed),
         "orchestrator": lambda: orch_tab.orchestrator_tab(run, args),
-        "messages": lambda: S.guarded(errors, run_messages.TITLE,
-                                      lambda: run_messages.messages_tab(run.id)),
+        "messages": lambda: S.guarded(errors, run_messages.RECEIVED_TITLE,
+                                      lambda: run_messages.messages_tab(run.id, mailbox)),
         "verification": lambda: _verification_tab(run),
         "checks": lambda: _checks_tab(run),
         "changes": lambda: _changes_tab(run, errors),
@@ -5122,7 +5131,7 @@ def _build_v2(run: Run, tab: str | None, args: dict[str, str]) -> dict[str, Any]
     sub = _sub_worktree(sub, run)
     page = S.page("run", title if human_title else run.id, sub, chips_=chips,
                   actions=header["actions"] + actions,
-                  tabs=_v2_tabs(run), tab=resolved,
+                  tabs=_v2_tabs(run, mailbox), tab=resolved,
                   args={"run": run.id, **({"node": node} if node else {}),
                         **_orch_args(args)},
                   sections=sections, errors=errors,
@@ -5211,7 +5220,7 @@ def build(home: Path, tab: str | None, args: dict[str, str]) -> dict[str, Any]:
         "kickoff": lambda: _kickoff_tab(run),
         "overview": lambda: _overview_tab(run),
         "orchestrator": lambda: orch_tab.orchestrator_tab(run, args),
-        "messages": lambda: S.guarded({}, run_messages.TITLE,
+        "messages": lambda: S.guarded({}, run_messages.RECEIVED_TITLE,
                                       lambda: run_messages.messages_tab(run.id)),
         "agents": lambda: _agents_tab(run),
         "learnings": lambda: _learnings_tab(run),

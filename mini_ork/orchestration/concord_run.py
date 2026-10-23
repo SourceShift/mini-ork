@@ -102,6 +102,9 @@ def start(run_id: str, recipe: str, kickoff: str) -> RunPrincipal | None:
                 if exc.status == 404 else f"ContextNest returned {exc.status}")
         sys.stderr.write(f"[concord] {hint} — run not registered\n")
         return handle  # env stays set; no heartbeat
+    except cn_client.CoordConfigError as exc:
+        sys.stderr.write(f"[concord] {exc} — run not registered\n")
+        return handle  # env stays set; no heartbeat
     except cn_client.CoordUnavailable:
         sys.stderr.write("[concord] ContextNest unavailable — run not registered\n")
         return handle  # env stays set; no heartbeat
