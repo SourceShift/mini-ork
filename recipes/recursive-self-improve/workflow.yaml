@@ -21,7 +21,12 @@ nodes:
   # dispatcher writes its output to lens-bottleneck.md per the
   # `_lens` naming heuristic. Planner-type nodes write plan.json which
   # the downstream verifier cannot grep for ranked bottleneck rows.
-  - { name: bottleneck_lens,     type: researcher,  model_lane: planner,         prompt_ref: prompts/bottleneck-scan.md,      dispatch_mode: serial,   gates: [budget_gate] }
+  # Its lane is opus_lens, NOT planner: the executor passes the lane in
+  # llm_dispatch's --node-type slot, and lane `planner` arms the planner's
+  # JSON reply gate (_NODE_SHAPE_PREDICATES), which shape-rejected every
+  # markdown scan and re-ran the fallback chain (iter-1-20261023054815:
+  # 4 lanes, $4.84, 21.8 min). Same model (opus), no reply gate.
+  - { name: bottleneck_lens,     type: researcher,  model_lane: opus_lens,       prompt_ref: prompts/bottleneck-scan.md,      dispatch_mode: serial,   gates: [budget_gate] }
   - { name: perf_lens,           type: researcher,  model_lane: minimax_lens,    prompt_ref: prompts/lens-minimax-perf.md,    dispatch_mode: parallel, gates: [budget_gate] }
   - { name: correctness_lens,    type: researcher,  model_lane: kimi_lens,       prompt_ref: prompts/lens-kimi-correctness.md,dispatch_mode: parallel, gates: [budget_gate] }
   - { name: arch_lens,           type: researcher,  model_lane: codex_lens,      prompt_ref: prompts/lens-codex-arch.md,      dispatch_mode: parallel, gates: [budget_gate] }
