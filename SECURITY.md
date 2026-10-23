@@ -4,14 +4,17 @@
 
 | Version | Supported |
 |---|---|
-| 0.1.x (latest) | Yes |
-| < 0.1.0 | No |
+| 0.9.x (latest) | Yes |
+| < 0.9.0 | No |
 
 ## Reporting a Vulnerability
 
 Do not open a public GitHub issue for security vulnerabilities.
 
-Email the maintainers at: **security@sourceshift.io**.
+Report privately through either channel:
+
+- **GitHub:** [open a private security advisory](https://github.com/SourceShift/mini-ork/security/advisories/new) (preferred — keeps the report, fix, and CVE in one place).
+- **Email:** **security@sourceshift.ai**.
 
 Include:
 - Description of the vulnerability and potential impact

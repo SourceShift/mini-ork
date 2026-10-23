@@ -27,7 +27,7 @@ If you read one, read Nasser. The harshness table is the receipts.
 
 > "List the model families behind every hunter and every validator. If the
 > list reads 'Sonnet, Sonnet, Sonnet, Sonnet, Opus' you have an evaluative
-> coalition, not an audit." — [sourceshift.io](https://blog.sourceshift.io/p/we-ran-a-3-source-bug-hunt-then-we-realised-our-validators-were-all-claude)
+> coalition, not an audit." — [sourceshift.ai](https://blog.sourceshift.ai/p/we-ran-a-3-source-bug-hunt-then-we-realised-our-validators-were-all-claude)
 
 This is the test we built mini-ork to pass.
 

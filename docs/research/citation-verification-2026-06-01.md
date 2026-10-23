@@ -39,7 +39,7 @@ URL: https://arxiv.org/abs/2511.16708
 | Krippendorff α = 0.042 | ✓ "inter-judge agreement is near-zero (Krippendorff's α = 0.042)" |
 | Judges as fingerprints concept | ✓ "their disagreement patterns are so stable they function as fingerprints" |
 | Harshness/leniency axis | ✓ "judges are characterized along multiple axes: harshness/leniency, dimension emphasis" |
-| Specific coefficients (−0.429 / +0.262 / etc) | partial: abstract confirms harshness IS measured; the specific numerical table lives in §3-4 of the full paper (blog post sourceshift.io read the full PDF) |
+| Specific coefficients (−0.429 / +0.262 / etc) | partial: abstract confirms harshness IS measured; the specific numerical table lives in §3-4 of the full paper (blog post sourceshift.ai read the full PDF) |
 
 URL: https://arxiv.org/abs/2601.05114
 
@@ -116,4 +116,4 @@ in the positioning doc's "Where mini-ork is honest about what it isn't
   flagged the gap
 - `docs/refactor/SCALABILITY-AUDIT.md` — the full dogfood arc that produced
   the recipe + lens prompts
-- Blog post: https://blog.sourceshift.io/p/we-ran-a-3-source-bug-hunt-then-we-realised-our-validators-were-all-claude — original framing of the heterogeneity-precondition argument
+- Blog post: https://blog.sourceshift.ai/p/we-ran-a-3-source-bug-hunt-then-we-realised-our-validators-were-all-claude — original framing of the heterogeneity-precondition argument

@@ -20,7 +20,7 @@ else (no prose preamble, no markdown fence):
 {
   "title_working": "string — working title (may be revised by editor lens)",
   "audience": "string — primary reader profile",
-  "distribution_channel": "string — where this lands (Substack | sourceshift.io | LinkedIn | …)",
+  "distribution_channel": "string — where this lands (Substack | blog.sourceshift.ai | LinkedIn | …)",
   "target_word_count": "integer — words; lenses will respect ±20%",
   "key_takeaways": ["string", "..."],
   "scope_boundaries": "string — what the post will NOT cover",
@@ -37,7 +37,7 @@ else (no prose preamble, no markdown fence):
 
 ## Rules
 
-- Pick `distribution_channel` from kickoff; if unclear default to `sourceshift.io`.
+- Pick `distribution_channel` from kickoff; if unclear default to `blog.sourceshift.ai`.
 - `target_word_count`: default 1200 unless kickoff specifies.
 - `scope_boundaries` MUST list at least 2 things the post will NOT cover —
   this prevents scope drift in lens contributions.

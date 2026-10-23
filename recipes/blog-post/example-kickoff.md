@@ -15,7 +15,7 @@ information-theory framing of agent panels.
 
 ## Distribution channel
 
-sourceshift.io
+blog.sourceshift.ai
 
 ## Length target
 
