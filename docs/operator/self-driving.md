@@ -12,7 +12,7 @@ tree, the DB and `origin/main`; when it needs a human it enqueues a *notice* in
 the oversight inbox (`mo_inbox_gates`, gate `self-driving-supervisor`) and keeps
 going. Nothing waits on that notice.
 
-## What one sweep does (R1–R7)
+## What one sweep does (R1–R8)
 
 **R1 — revive.** For every `runs/*/repair.json` with `state="waiting_on_fix"`
 and a `fix_epic_id`, read the epic's status:
@@ -123,6 +123,18 @@ The outcome file belongs to the split patch (`NNN.outcome.json`), so
 `dry_run` reports the same `split_done`/`split_failed` actions and writes
 nothing.
 
+**R8 — dispatch ready epics (opt-in).** Off by default, because a dispatch
+starts a paid run. When `dispatch_epics.enabled` is true, each sweep picks the
+highest-priority ready epic from `scheduler.pick_ready` and spawns a detached
+`mini-ork scheduler --once --epic <id>`; stdout and stderr go to
+`<home>/state/supervisor-dispatch-<epic_id>.log`. It starts at most one epic
+per sweep and pauses entirely once `max_in_progress` epics (default 1) are
+already `in progress`. `dispatch_epics.only` is an optional allow-list of epic
+ids; an empty list allows any ready epic. The scheduler still enforces the
+per-epic budget and `MO_DAILY_BUDGET_USD` — R8 adds no budget logic of its own.
+Turn it on by setting `dispatch_epics.enabled: true` in the config file below;
+the simple (`--once`) and service (`--interval`) tiers read the same key.
+
 `dry_run` computes the same action list without materializing the workflow:
 it installs no `NNN.applied.json`, spawns nothing, and leaves `repair.json`
 untouched.
@@ -195,6 +207,10 @@ Pass `--config PATH`, or set `MO_SUPERVISE_CONFIG`, to a YAML file like
 interval_s: 300      # seconds between sweeps when looping
 max_revives: 2       # revives per sweep
 orphan_after_s: 3600 # repairing this old + dead owner = orphaned
+dispatch_epics:      # R8 — opt-in; off because it starts paid runs
+  enabled: false
+  max_in_progress: 1
+  only: []
 ```
 
 With no config named, the same values are the built-in defaults. A path that is

@@ -32,7 +32,13 @@ from mini_ork.stores import lease
 
 LEASE_KEY = "__supervisor__"
 LEASE_MESSAGE = "another supervisor holds the lease"
-DEFAULTS = {"interval_s": 300, "max_revives": 2, "orphan_after_s": 3600}
+DEFAULTS = {
+    "interval_s": 300,
+    "max_revives": 2,
+    "orphan_after_s": 3600,
+    "dispatch_epics": {"enabled": False, "max_in_progress": 1, "only": []},
+}
+_SCALAR_KEYS = ("interval_s", "max_revives", "orphan_after_s")
 _MIN_TTL_S = 900
 
 
@@ -58,7 +64,7 @@ def _load_config(path: str) -> dict:
         raise ConfigError(
             f"cannot parse supervise config {path}: expected a mapping")
     out = dict(DEFAULTS)
-    for key in DEFAULTS:
+    for key in _SCALAR_KEYS:
         if key not in data or data[key] is None:
             continue
         try:
@@ -66,7 +72,51 @@ def _load_config(path: str) -> dict:
         except (TypeError, ValueError) as exc:
             raise ConfigError(
                 f"supervise config {path}: {key} must be an integer") from exc
+    out["dispatch_epics"] = _parse_dispatch_block(
+        path, data.get("dispatch_epics"))
     return out
+
+
+def _parse_dispatch_block(path: str, raw) -> dict:
+    """Parse and validate R8's ``dispatch_epics`` block, failing closed.
+
+    Absent → ``enabled: false``. A wrong type on any sub-key raises
+    :class:`ConfigError` naming the key, so the caller exits 2 rather than
+    silently running a paid dispatch with a value the operator did not mean.
+    """
+    block = {"enabled": False, "max_in_progress": 1, "only": []}
+    if raw is None:
+        return block
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"supervise config {path}: dispatch_epics must be a mapping")
+
+    if raw.get("enabled") is not None:
+        enabled = raw["enabled"]
+        if not isinstance(enabled, bool):
+            raise ConfigError(
+                f"supervise config {path}:"
+                " dispatch_epics.enabled must be a bool")
+        block["enabled"] = enabled
+
+    if raw.get("max_in_progress") is not None:
+        cap = raw["max_in_progress"]
+        if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
+            raise ConfigError(
+                f"supervise config {path}:"
+                " dispatch_epics.max_in_progress must be an integer >= 1")
+        block["max_in_progress"] = cap
+
+    if raw.get("only") is not None:
+        only = raw["only"]
+        if (not isinstance(only, list)
+                or not all(isinstance(item, str) for item in only)):
+            raise ConfigError(
+                f"supervise config {path}:"
+                " dispatch_epics.only must be a list of strings")
+        block["only"] = list(only)
+
+    return block
 
 
 def _resolve_paths() -> tuple[str, str, str]:
@@ -122,12 +172,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     def run_sweep() -> list[dict]:
+        dispatch = config["dispatch_epics"]
         return supervisor.sweep(
             home, db,
             engine_root=engine_root,
             dry_run=args.dry_run,
             max_revives=int(config["max_revives"]),
             orphan_after_s=int(config["orphan_after_s"]),
+            dispatch_epics=bool(dispatch["enabled"]),
+            dispatch_max_in_progress=int(dispatch["max_in_progress"]),
+            dispatch_only=list(dispatch["only"]),
         )
 
     try:

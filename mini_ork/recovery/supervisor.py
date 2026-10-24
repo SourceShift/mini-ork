@@ -484,7 +484,9 @@ def _owner_alive(run_dir: Path) -> bool:
 
 def sweep(home: str, db: str, *, engine_root: str, now: float | None = None,
           dry_run: bool = False, spawn=None, max_revives: int = 2,
-          orphan_after_s: int = 3600) -> list[dict]:
+          orphan_after_s: int = 3600, dispatch_epics: bool = False,
+          dispatch_max_in_progress: int = 1,
+          dispatch_only: list[str] | None = None, dispatch_fn=None) -> list[dict]:
     """One supervisor pass over ``home/runs/*/repair.json``.
 
     Args:
@@ -501,6 +503,13 @@ def sweep(home: str, db: str, *, engine_root: str, now: float | None = None,
         max_revives: at most this many revives per sweep.
         orphan_after_s: a ``repairing`` attempt older than this with a dead
             owner is orphaned.
+        dispatch_epics: enable R8 — start one ready epic through the scheduler.
+            Off by default because a dispatch spends money.
+        dispatch_max_in_progress: R8's cap on epics already ``in progress``.
+        dispatch_only: optional allow-list of epic ids R8 may pick.
+        dispatch_fn: injectable
+            ``callable(engine_root, home, db, epic_id) -> dict``; the default
+            spawns a detached ``mini-ork scheduler --once --epic <id>``.
 
     Returns:
         One action dict per run or epic acted on (``run_id`` or ``epic_id`` /
@@ -590,6 +599,16 @@ def sweep(home: str, db: str, *, engine_root: str, now: float | None = None,
     except Exception as exc:  # one bad DB must never stop the sweep
         actions.append({"epic_id": "", "action": "error",
                         "reason": f"backlink rule: {type(exc).__name__}: {exc}"})
+
+    if dispatch_epics:
+        try:
+            actions.extend(_rule_dispatch_epic(
+                home, db, engine_root, dry_run,
+                max_in_progress=dispatch_max_in_progress,
+                only=dispatch_only, dispatch_fn=dispatch_fn))
+        except Exception as exc:  # a failed spawn must never stop the sweep
+            actions.append({"epic_id": "", "action": "error",
+                            "reason": f"dispatch rule: {type(exc).__name__}: {exc}"})
 
     return actions
 
@@ -1187,3 +1206,85 @@ def _rule_backlink(db: str, engine_root: str, dry_run: bool) -> list[dict]:
         actions.append({"epic_id": epic_id, "action": "backlink",
                         "reason": reason})
     return actions
+
+
+# ── R8: dispatch one ready epic ─────────────────────────────────────────────
+
+
+def _default_dispatch_epic(engine_root: str, home: str, db: str,
+                           epic_id: str) -> dict:
+    """Spawn a detached ``mini-ork scheduler --once --epic <id>`` (R8).
+
+    The child gets the supervisor's home/root/DB pinned and every run-scoped key
+    popped (the same list :func:`_default_spawn` drops) so an inherited run from
+    the supervisor's own shell can never steer the dispatch. stdout and stderr
+    go to ``<home>/state/supervisor-dispatch-<epic_id>.log``. On ``OSError`` it
+    returns ``{"error": ...}`` and never raises — one failed spawn must not stop
+    the sweep.
+    """
+    home_p = Path(home)
+    state_dir = home_p / "state"
+    log_path = state_dir / f"supervisor-dispatch-{epic_id}.log"
+
+    env = dict(os.environ)
+    env["MINI_ORK_ROOT"] = str(engine_root)
+    env["MINI_ORK_HOME"] = str(home)
+    env["MINI_ORK_DB"] = str(db)
+    for key in ("MINI_ORK_RUN_ID", "MINI_ORK_RUN_DIR", "MINI_ORK_PLAN_PATH"):
+        env.pop(key, None)
+
+    argv = [sys.executable,
+            os.path.join(str(engine_root), "bin", "mini-ork"),
+            "scheduler", "--once", "--epic", str(epic_id)]
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        log_fh = open(log_path, "ab")
+        try:
+            proc = subprocess.Popen(
+                argv,
+                cwd=str(engine_root),
+                env=env,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        finally:
+            log_fh.close()
+    except OSError as exc:
+        return {"error": str(exc)}
+    return {"pid": getattr(proc, "pid", None), "log": str(log_path)}
+
+
+def _rule_dispatch_epic(home: str, db: str, engine_root: str, dry_run: bool,
+                        *, max_in_progress: int, only: list[str] | None,
+                        dispatch_fn) -> list[dict]:
+    """R8 — start at most one ready epic through the scheduler.
+
+    Bounded by the number of epics already ``in progress`` (the scheduler enforces
+    the per-epic budget and ``MO_DAILY_BUDGET_USD``; R8 adds no budget logic of
+    its own). ``only`` intersects the ready-set with an allow-list. Nothing ready
+    or the cap reached → no action. ``dry_run`` reports the pick and spawns
+    nothing.
+    """
+    from mini_ork import scheduler  # noqa: PLC0415 — avoids an import cycle
+
+    rows = _query(db, "SELECT COUNT(*) FROM epics"
+                      " WHERE status='in progress' AND archived_at IS NULL")
+    in_progress = int(rows[0][0]) if rows else 0
+    if in_progress >= int(max_in_progress):
+        return []
+
+    ready = scheduler.pick_ready(db, only=set(only) if only else None)
+    if not ready:
+        return []
+    epic_id = str(ready[0])
+
+    if dry_run:
+        return [{"epic_id": epic_id, "action": "dispatch_epic",
+                 "reason": "ready; dry-run", "dry_run": True}]
+
+    result = (dispatch_fn or _default_dispatch_epic)(
+        engine_root, home, db, epic_id)
+    return [{"epic_id": epic_id, "action": "dispatch_epic",
+             "reason": "ready", **result}]
