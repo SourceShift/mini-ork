@@ -193,9 +193,11 @@ def test_resolve_marks_held_out_runs_so_a_full_window_does_not_wedge(tmp_path):
     Path(home).mkdir()
 
     for n in range(3):
-        _add_run(db, f"hold{n}", "published", n + 1)
+        # Holdouts are the newest runs: resolve_finished walks newest first, so
+        # they are what a narrow window reaches before the evidence-bearing run.
+        _add_run(db, f"hold{n}", "published", 100 + n)
         _write_learned(home, f"hold{n}", "planner", ["t:h"], held_out=True)
-    _add_run(db, "real", "published", 9)
+    _add_run(db, "real", "published", 1)
     _write_learned(home, "real", "planner", ["t:r"])
 
     # A window narrower than the holdout backlog: the first pass spends it

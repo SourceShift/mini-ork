@@ -129,6 +129,10 @@ def _delivered_ids(records: list[dict]) -> set[str]:
 def resolve_finished(home: str, db: str, *, limit: int = 200) -> int:
     """Tally finished runs' ledgers into ``context_item_utility``.
 
+    Runs are counted newest first: the ``limit`` window must reach the recent
+    runs that carry ``learned/`` ledgers before spending itself on older
+    history that has none.
+
     Counts at most ``limit`` terminal runs not already recorded in
     ``context_item_runs``. A run whose every ledger record is held out
     contributes no evidence, so it is not counted — but it *is* marked, or it
@@ -147,7 +151,7 @@ def resolve_finished(home: str, db: str, *, limit: int = 200) -> int:
             "SELECT id, status FROM task_runs"
             f" WHERE status IN ({placeholders})"
             " AND id NOT IN (SELECT run_id FROM context_item_runs)"
-            " ORDER BY created_at, id LIMIT ?",
+            " ORDER BY created_at DESC, id DESC LIMIT ?",
             (*_TERMINAL_STATUSES, int(limit)),
         ).fetchall()
         now = int(time.time())
