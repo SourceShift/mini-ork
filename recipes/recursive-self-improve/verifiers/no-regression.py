@@ -30,19 +30,84 @@ try:
 except OSError:
     pass
 
-# 1) bash -n on every changed shell file
+# 1) syntax-check every changed file — routed by type/shebang because the
+# bash runtime is gone: bin/mini-ork is Python, so feeding it to `bash -n`
+# false-fails, and a Python syntax error in a changed .py file used to pass
+# unseen. `*.sh` keeps the original bash -n arm; `bin/*` is routed by its
+# shebang (python -> compile, shell -> bash -n).
+
+_PY_SHEBANG = re.compile(r"^#!\s*(?:/\S*/)?(?:env\s+)?python[0-9.]*\b")
+_SHELL_SHEBANG = re.compile(r"^#!\s*(?:/\S*/)?(?:env\s+)?(?:sh|bash|zsh|dash)\b")
+
+
+def _first_line(path):
+    try:
+        with open(path, "rb") as fh:
+            return fh.readline().decode("utf-8", "replace").strip()
+    except OSError:
+        return ""
+
+
+def _is_python_shebang(path):
+    return bool(_PY_SHEBANG.match(_first_line(path)))
+
+
+def _is_shell_shebang(path):
+    return bool(_SHELL_SHEBANG.match(_first_line(path)))
+
+
 syntax_failures = []
 r = subprocess.run(["git", "-C", WT, "diff", "--name-only", "HEAD", "--", "*.sh", "bin/*"],
                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 CHANGED = [l for l in r.stdout.decode("utf-8", "replace").splitlines() if l]
 for f in CHANGED:
-    if not os.path.isfile(os.path.join(WT, f)):
+    path = os.path.join(WT, f)
+    if not os.path.isfile(path):
         continue
-    if f.endswith(".sh") or f.startswith("bin/"):
-        if subprocess.run(["bash", "-n", os.path.join(WT, f)],
+    if f.endswith(".sh") or (f.startswith("bin/") and _is_shell_shebang(path)):
+        if subprocess.run(["bash", "-n", path],
                           stdout=ev, stderr=subprocess.STDOUT).returncode != 0:
             syntax_failures.append(f)
 ev.write(f"changed_sh_files={len(CHANGED)} syntax_failures={len(syntax_failures)}\n")
+
+# Python arm: union (de-duplicated, diff-then-untracked order) of tracked
+# modifications and new untracked files, plus python-shebang bin/ files from
+# the shell-arm list. compile() catches SyntaxError and ValueError without
+# writing a .pyc.
+py_files = []
+_seen_py = set()
+
+
+def _add_py(rel):
+    if rel and rel not in _seen_py:
+        _seen_py.add(rel)
+        py_files.append(rel)
+
+
+r = subprocess.run(["git", "-C", WT, "diff", "--name-only", "HEAD", "--", "*.py"],
+                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+for f in r.stdout.decode("utf-8", "replace").splitlines():
+    _add_py(f)
+r = subprocess.run(["git", "-C", WT, "ls-files", "--others", "--exclude-standard", "--", "*.py"],
+                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+for f in r.stdout.decode("utf-8", "replace").splitlines():
+    _add_py(f)
+for f in CHANGED:
+    if f.startswith("bin/") and _is_python_shebang(os.path.join(WT, f)):
+        _add_py(f)
+
+py_syntax_failures = []
+for f in py_files:
+    path = os.path.join(WT, f)
+    if not os.path.isfile(path):
+        continue
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            source = fh.read()
+        compile(source, f, "exec")
+    except (SyntaxError, ValueError):
+        py_syntax_failures.append(f)
+ev.write(f"changed_py_files={len(py_files)} py_syntax_failures={len(py_syntax_failures)}\n")
 ev.flush()
 
 # 2) benchmark delta — fail only when enough benchmark evidence regresses.
@@ -125,6 +190,8 @@ ev.flush()
 passed = 1
 if syntax_failures:
     passed = 0
+if py_syntax_failures:
+    passed = 0
 if bench_delta_ok == 0:
     passed = 0
 if report_outcome.startswith(("refused-", "failed-")):
@@ -143,6 +210,7 @@ result = {
     "pass": passed == 1,
     "evidence_path": EVIDENCE,
     "syntax_failures": syntax_failures,
+    "py_syntax_failures": py_syntax_failures,
     "implementer_outcome": report_outcome,
     "benchmark_summary": bench_obj,
     "benchmark_regression": benchmark_regression,

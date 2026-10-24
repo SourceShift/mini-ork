@@ -99,6 +99,29 @@ if not WT_RAW or not os.path.isdir(WT_RAW):
 # and Path.cwd() all see the same string (root cause #4 above).
 WT = os.path.realpath(WT_RAW)
 
+# ── parse the test timeout, fail closed on a bad value ───────────────────────
+# A hung suite used to hang the whole self-improve iteration: the child had no
+# timeout. Fail closed rather than silently falling back to unbounded.
+
+_RAW_TIMEOUT = os.environ.get("MINI_ORK_SELF_IMPROVE_TEST_TIMEOUT_S", "2400")
+try:
+    TIMEOUT_S = int(_RAW_TIMEOUT)
+except (TypeError, ValueError):
+    TIMEOUT_S = 0
+if TIMEOUT_S <= 0:
+    _reason = "bad MINI_ORK_SELF_IMPROVE_TEST_TIMEOUT_S"
+    print(f"error: {_reason}: {_RAW_TIMEOUT!r}", file=sys.stderr)
+    ev.write(f"{_reason}: {_RAW_TIMEOUT!r}\n")
+    ev.flush()
+    _emit({
+        "verifier": "self-tests-pass",
+        "pass": False,
+        "evidence_path": EVIDENCE,
+        "reason": _reason,
+        "timed_out": False,
+    })
+    sys.exit(0)
+
 # ── build pristine sandbox: staging dir under real TMPDIR ─────────────────────
 
 # Exclude anything that would drag the machine's live state into the run.
@@ -248,13 +271,32 @@ try:
     )
     ev.flush()
 
-    proc = subprocess.run(
-        cmd,
-        cwd=staging,
-        env=child_env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=staging,
+            env=child_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        ev.write(f"tests timed out after {TIMEOUT_S}s\n")
+        ev.flush()
+        _emit({
+            "verifier": "self-tests-pass",
+            "pass": False,
+            "evidence_path": EVIDENCE,
+            "test_cmd": " ".join(cmd),
+            "sandbox": staging,
+            "pytest_rc": None,
+            "tests_collected": 0,
+            "tests_passed": 0,
+            "tests_failed": 0,
+            "timed_out": True,
+        })
+        sys.exit(0)
+
     out = proc.stdout.decode("utf-8", "replace")
     ev.write(out)
     rc = proc.returncode
@@ -266,7 +308,10 @@ try:
         return int(m.group(1)) if m else 0
 
     n_passed = _count("passed")
-    n_failed = _count("failed") + _count("error") + _count("errors")
+    # Count "N errors?" once: the old `_count("error") + _count("errors")`
+    # double-counted "2 errors" in the evidence. The verdict still follows rc.
+    _errors = re.search(r"(\d+) errors?\b", out)
+    n_failed = _count("failed") + (int(_errors.group(1)) if _errors else 0)
     collected = n_passed + n_failed
 
     if rc == 5 or (rc == 0 and collected == 0):
@@ -287,6 +332,7 @@ try:
         "tests_collected": collected,
         "tests_passed": n_passed,
         "tests_failed": n_failed,
+        "timed_out": False,
     })
 finally:
     # Best-effort cleanup — symlinks only, no real payload to lose.
