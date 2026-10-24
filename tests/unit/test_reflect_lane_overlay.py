@@ -82,7 +82,7 @@ def test_broken_overlay_announces_on_stderr(tmp_path, capsys):
     home = _home(tmp_path, overlay="lanes: [unclosed\n")
     assert _resolve_reflect_model("reflector", home) == "reflector"
     err = capsys.readouterr().err
-    assert "reflect: lane policy unreadable(" in err
+    assert "reflect: lane policy unreadable (" in err
     assert "using lane 'reflector'" in err
 
 
