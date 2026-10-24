@@ -2286,6 +2286,13 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
         has_log_dir = bool(reflect_run_dir and os.path.isdir(reflect_run_dir))
         ref_log_name = _reflect_log_name()
         reflect_log = os.path.join(reflect_run_dir, ref_log_name) if has_log_dir else ""
+        # Never inherit the caller's cwd: the RSI runner launches `mini-ork run`
+        # from the iteration worktree and removes it ~2 s after the run returns,
+        # so every later os.getcwd() in the reflect child raised ENOENT. The run
+        # dir (else home) outlives the run.
+        reflect_cwd = os.path.abspath(reflect_run_dir if has_log_dir else home)
+        if not os.path.isdir(reflect_cwd):
+            reflect_cwd = None
 
         if os.environ.get("MO_REFLECT_INLINE", "0") == "1":
             # Synchronous mode, kept for tests and for an operator who wants
@@ -2305,6 +2312,7 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
                     text=True,
                     timeout=reflect_bound,
                     env=reflect_env,
+                    cwd=reflect_cwd,
                 )
                 reflect_out = _child_text(completed.stdout)
                 reflect_err = _child_text(completed.stderr)
@@ -2354,6 +2362,7 @@ def _run_lifecycle_impl(argv, root, sink) -> int:
                         stdout=stream,
                         stderr=subprocess.STDOUT,
                         env=reflect_env,
+                        cwd=reflect_cwd,
                         start_new_session=True,
                     )
                 finally:

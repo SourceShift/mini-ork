@@ -55,35 +55,28 @@ def _usage() -> str:
 
 
 def _resolve_reflect_model(lane: str, mini_ork_home: str) -> str:
-    """Resolve a reflect model from agents.yaml. Mirrors bash `_resolve_reflect_model`.
+    """Resolve a reflect model from the effective lane policy.
 
-    Search order:
-      1. ${MINI_ORK_HOME}/config/agents.yaml
-      2. ${MINI_ORK_ROOT}/config/agents.yaml
-      3. fallback: return lane name verbatim.
+    Reads the same policy dispatch honours: the run-dir snapshot
+    (``$MINI_ORK_RUN_DIR/config/agents.yaml``) > ``<home>/config/agents.yaml``
+    > ``<root>/config/agents.yaml``, with the per-user overlay
+    (``$MINI_ORK_AGENTS`` or ``<home>/config/agents.local.yaml``) merged on
+    top. The raw template alone ignored the overlay and the run snapshot, so
+    a reflect pass could land on a lane no other node was using.
 
-    Behaviour mirrors bash byte-for-byte: if the YAML is malformed or the
-    lanes key is missing, the lane name is returned. The bash implementation
-    uses an inline python3 heredoc; we reimplement the same lookup so the
-    port doesn't have to shell out for a YAML read on every invocation.
+    Falls back to the lane name verbatim when no policy is readable. A broken
+    overlay is announced on stderr and also falls back to the lane name rather
+    than taking the reflect pass down.
     """
-    candidates = [
-        os.path.join(mini_ork_home, "config", "agents.yaml"),
-        os.path.join(str(MINI_ORK_ROOT), "config", "agents.yaml"),
-    ]
-    for path in candidates:
-        if not os.path.isfile(path):
-            continue
-        try:
-            import yaml  # type: ignore[import-untyped]
+    from mini_ork.dispatch.llm_dispatch import _effective_lanes  # noqa: PLC0415
 
-            with open(path) as f:
-                data = yaml.safe_load(f) or {}
-            lanes = data.get("lanes") or {}
-            return str(lanes.get(lane) or lanes.get("reflector") or lane)
-        except Exception:
-            return lane
-    return lane
+    try:
+        lanes = _effective_lanes(str(MINI_ORK_ROOT), mini_ork_home) or {}
+    except Exception as exc:  # noqa: BLE001 — an overlay typo must not kill reflect
+        sys.stderr.write(
+            f"reflect: lane policy unreadable ({exc}); using lane {lane!r}\n")
+        return lane
+    return str(lanes.get(lane) or lanes.get("reflector") or lane)
 
 
 # ── Argument parsing ─────────────────────────────────────────────────────────
