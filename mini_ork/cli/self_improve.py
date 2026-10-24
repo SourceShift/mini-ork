@@ -248,6 +248,31 @@ def promote_synthesis_findings(db, run_id, iter_, synth_path) -> int:
     return inserted
 
 
+def close_iteration_findings(db, run_id, iter_) -> tuple[int, int]:
+    """Close an iteration's findings: the implemented rank-1 finding becomes
+    ``resolved``; every lower-ranked open finding becomes ``deferred`` (carried
+    to a later iteration). Returns ``(resolved_count, deferred_count)``.
+
+    Fail-open: a missing/corrupt DB yields ``(0, 0)`` — the runner must never
+    die because cross-iteration memory could not be updated.
+    """
+    ts = int(time.time())
+    try:
+        con = sqlite3.connect(db); con.execute("PRAGMA busy_timeout=5000")
+        resolved = con.execute(
+            "UPDATE learning_record SET outcome='resolved', updated_at=?"
+            " WHERE run_id=? AND iter=? AND rank=1 AND outcome='open'",
+            (ts, run_id, int(iter_))).rowcount
+        deferred = con.execute(
+            "UPDATE learning_record SET outcome='deferred', updated_at=?"
+            " WHERE run_id=? AND iter=? AND rank>1 AND outcome='open'",
+            (ts, run_id, int(iter_))).rowcount
+        con.commit(); con.close()
+        return resolved, deferred
+    except sqlite3.Error:
+        return (0, 0)
+
+
 def record_success(db, run_id, iter_, branch, sha):
     ts = int(time.time())
     con = sqlite3.connect(db); con.execute("PRAGMA busy_timeout=5000")
@@ -258,7 +283,13 @@ def record_success(db, run_id, iter_, branch, sha):
         (run_id, int(iter_), f"iter {iter_} success — commit {sha[:8] if sha else 'unknown'}",
          branch, f"All 3 verifiers (bottlenecks-found, self-tests-pass, no-regression) passed; "
                  f"runner committed {sha} to {branch}.", ts, ts))
-    con.execute("UPDATE learning_record SET outcome='superseded', updated_at=? WHERE outcome='deferred'", (ts,))
+    # Skip the current iteration's rows: close_iteration_findings just deferred
+    # them, and superseding them here would erase that deferral. A deferred row
+    # from an earlier iteration is still superseded.
+    con.execute(
+        "UPDATE learning_record SET outcome='superseded', updated_at=?"
+        " WHERE outcome='deferred' AND NOT (run_id=? AND iter=?)",
+        (ts, run_id, int(iter_)))
     con.commit(); con.close()
 
 
@@ -310,6 +341,61 @@ def _parse_args(argv):
             sys.stderr.write(f"Unknown flag: {a}\n" + _USAGE)
             return None, 2
     return o, None
+
+
+def _kickoff_template(it, wt_path, branch) -> str:
+    """The iteration kickoff. A bare "Target: <path>" kickoff scores
+    needs_answers at the run_profile gate (no scope / success-criteria / proof
+    command → confidence ~0.55) and the planner refuses to dispatch, so emit the
+    full scope block the classifier needs. Mirrors
+    recipes/recursive-self-improve/example-kickoff.md but with the current
+    Python verification command (bash tests/run-all.sh was retired 2026-07).
+
+    The branch is deliberately left un-backticked in the Scope bullet: the
+    scope parser treats any backticked token containing "/" as a path, so a
+    backticked ``self-improve/iter-N-…`` would be read as a file path (D3).
+    """
+    return f"""# Recursive Self-Improvement — iter {it}
+
+## Goal
+Run mini-ork against itself: find and fix the single highest-impact bottleneck
+in performance, correctness, or architecture, grounded in cited evidence (run
+logs, code paths, benchmark deltas, and arXiv references).
+
+## Scope
+- Target repo: this mini-ork checkout at `{wt_path}` — an isolated git worktree
+  on branch {branch}.
+- Improvable surface: the `mini_ork/` Python package, `recipes/`, and
+  `schemas/`. Leave `.mini-ork/` (run state) untouched; tests are read-only
+  context unless the patch adds a regression test.
+- Exactly one patch this iteration; keep the diff minimal and reviewable.
+
+## Success Criteria
+- The bottleneck scanner yields a ranked list with at least one
+  evidence-grounded candidate.
+- The Opus synthesizer emits a patch plan citing both internal evidence (run
+  logs / code paths) and external evidence (arXiv refs).
+- All three verifiers pass: bottlenecks-found, self-tests-pass, no-regression.
+- Existing tests pass with a non-negative quality delta on the patch.
+
+## Provider Policy
+- Research lenses: `minimax_lens`, `kimi_lens`, `codex_lens` (no Anthropic).
+- Synthesis reviewer: `opus_lens`. Implementer: `codex_lens`.
+
+## Verification Command
+- `python3 -m pytest -q` (the Python runtime is the only runtime).
+"""
+
+
+def build_dispatch_argv(root: str, kickoff: str, timeout_s: int) -> list[str]:
+    """the coreutils ``timeout`` backstop plus the run's own ``--deadline``,
+    which fires 120 s earlier so the run can finish publish + learning before
+    the backstop kills it with rc 124 (which writes no learning rows). The
+    deadline floor is 60 s. ``timeout_s`` is stringified raw for ``timeout``
+    and truncated to int for the deadline."""
+    return ["timeout", str(timeout_s), os.path.join(root, "bin", "mini-ork"),
+            "run", "--deadline", str(max(60, int(timeout_s) - 120)),
+            "recursive-self-improve", kickoff]
 
 
 def main(argv=None, *, root=None, dispatch=None) -> int:
@@ -442,43 +528,8 @@ def _iter_run(root, home, db, it, opts, parent, resolved_sha, soft_deadline, har
 
     run_dir = os.path.join(home, "runs", run_id)
     os.makedirs(os.path.join(run_dir, "patches"), exist_ok=True)
-    # A bare "Target: <path>" kickoff scores needs_answers at the run_profile
-    # gate (no scope / success-criteria / proof command → confidence ~0.55) and
-    # the planner refuses to dispatch. Emit the full scope block the classifier
-    # needs so the iteration actually plans. Mirrors
-    # recipes/recursive-self-improve/example-kickoff.md but with the current
-    # Python verification command (bash tests/run-all.sh was retired 2026-07).
     open(os.path.join(run_dir, "kickoff.md"), "w").write(
-        f"""# Recursive Self-Improvement — iter {it}
-
-## Goal
-Run mini-ork against itself: find and fix the single highest-impact bottleneck
-in performance, correctness, or architecture, grounded in cited evidence (run
-logs, code paths, benchmark deltas, and arXiv references).
-
-## Scope
-- Target repo: this mini-ork checkout at `{wt_path}` — an isolated git worktree
-  on branch `{branch}`.
-- Improvable surface: the `mini_ork/` Python package, `recipes/`, and
-  `schemas/`. Leave `.mini-ork/` (run state) untouched; tests are read-only
-  context unless the patch adds a regression test.
-- Exactly one patch this iteration; keep the diff minimal and reviewable.
-
-## Success Criteria
-- The bottleneck scanner yields a ranked list with at least one
-  evidence-grounded candidate.
-- The Opus synthesizer emits a patch plan citing both internal evidence (run
-  logs / code paths) and external evidence (arXiv refs).
-- All three verifiers pass: bottlenecks-found, self-tests-pass, no-regression.
-- Existing tests pass with a non-negative quality delta on the patch.
-
-## Provider Policy
-- Research lenses: `minimax_lens`, `kimi_lens`, `codex_lens` (no Anthropic).
-- Synthesis reviewer: `opus_lens`. Implementer: `codex_lens`.
-
-## Verification Command
-- `python3 -m pytest -q` (the Python runtime is the only runtime).
-""")
+        _kickoff_template(it, wt_path, branch))
 
     if opts["dry_run"]:
         print(f"  [dry-run] would dispatch recipe recursive-self-improve inside {wt_path}")
@@ -515,8 +566,7 @@ logs, code paths, benchmark deltas, and arXiv references).
     def _default_dispatch(wt, kickoff, log, timeout_s, e):
         with open(log, "wb") as fh:
             return subprocess.run(
-                ["timeout", str(timeout_s), os.path.join(root, "bin", "mini-ork"),
-                 "run", "recursive-self-improve", kickoff],
+                build_dispatch_argv(root, kickoff, timeout_s),
                 cwd=wt, stdout=fh, stderr=subprocess.STDOUT, env=e).returncode
     # Snapshot the operator's pre-run dirty surface so a leak the dispatch
     # writes back into the main checkout can be told apart from work the
@@ -560,8 +610,9 @@ logs, code paths, benchmark deltas, and arXiv references).
                             "--author=mini-ork-self-improve <self-improve@mini-ork.local>"], capture_output=True)
             sha = subprocess.run(["git", "-C", wt_path, "rev-parse", "HEAD"],
                                  capture_output=True, text=True).stdout.strip()
-            record_success(db, run_id, it, branch, sha)
             promote_synthesis_findings(db, run_id, it, os.path.join(run_dir, "synthesis.md"))
+            close_iteration_findings(db, run_id, it)
+            record_success(db, run_id, it, branch, sha)
         if opts["auto_merge"]:
             # Human-review gate: policy-aware hold BEFORE the merge. ``require``
             # is a no-op when ``before_merge=off`` (no DB write, byte-for-byte
