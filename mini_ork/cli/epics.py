@@ -58,6 +58,9 @@ _USAGE = """Usage: mini-ork epics <subcommand> [args]
                                --reset-attempts it gets one attempt past its
                                cap; with it, a fresh cycle of max_attempts.
                                Attempt history is kept either way.
+  status <epic_id> <new_status> --note TEXT
+                               Set an allowed status and record why in --note;
+                               'done' runs the scheduler's dependency cascade.
 
 Roadmap per-epic settings (under an epic's heading, applied by ingest):
   - recipe: <name>
@@ -356,6 +359,100 @@ def _retry(epic_id: str, rest: list[str], db: str) -> int:
     return 0
 
 
+_STATUSES = (
+    "not started", "in progress", "in review", "done", "blocked", "escalated",
+)
+_STATUS_ALIASES = {
+    "not-started": "not started",
+    "in-progress": "in progress",
+    "in-review": "in review",
+}
+
+
+def _status(rest: list[str], db: str) -> int:
+    """`epics status <epic_id> <new_status> --note TEXT`.
+
+    Operator override for the epic table: set one of the CHECK-allowed
+    statuses, append a `` [operator: <old> -> <new>: <note>]`` audit note, and
+    — for ``done`` — run the same dependency cascade the scheduler runs on a
+    done verdict (``epic_graph.on_done``). ``--note`` is required; a missing
+    or whitespace-only note is refused before the DB is touched. Setting the
+    current status is a no-op. A ``blocked`` target keeps any held_reason;
+    every other target clears it.
+    """
+    epic_id = rest[0]
+    raw_status = None
+    note = None
+    unknown = []
+    i = 1
+    while i < len(rest):
+        arg = rest[i]
+        if arg == "--note":
+            note = rest[i + 1] if i + 1 < len(rest) else None
+            i += 2 if i + 1 < len(rest) else 1
+        elif arg.startswith("-"):
+            unknown.append(arg); i += 1
+        elif raw_status is None:
+            raw_status = arg; i += 1
+        else:
+            unknown.append(arg); i += 1
+    if unknown:
+        sys.stderr.write(f"status: unknown argument(s): {' '.join(unknown)}\n")
+        return 2
+    if raw_status is None:
+        sys.stderr.write("status: <new_status> is required\n"); return 2
+    raw = raw_status.strip()
+    new_status = _STATUS_ALIASES.get(raw, raw)
+    if new_status not in _STATUSES:
+        sys.stderr.write(
+            f"status: '{raw_status}' is not one of: {', '.join(_STATUSES)}\n")
+        return 2
+    if note is None or not note.strip():
+        sys.stderr.write("status: --note is required\n"); return 2
+    note = note.strip()
+
+    # The retry schema (held_reason, ...) is a runtime migration; ensure it
+    # BEFORE opening the write connection (see _apply_settings on deadlocks).
+    _ensure_retry_schema(db)
+    con = sqlite3.connect(db)
+    try:
+        con.execute("PRAGMA busy_timeout=5000")
+        row = con.execute("SELECT status, notes FROM epics WHERE id=?",
+                          (epic_id,)).fetchone()
+        if not row:
+            sys.stderr.write(f"unknown epic: {epic_id}\n"); return 1
+        old_status, old_notes = row
+        if old_status == new_status:
+            sys.stdout.write(f"{epic_id}: already {new_status}\n")
+            return 0
+        notes = (old_notes or "") + f" [operator: {old_status} -> {new_status}: {note}]"
+        try:
+            if new_status == "blocked":
+                # A blocked target keeps whatever hold the epic already carries.
+                con.execute("UPDATE epics SET status=?, notes=? WHERE id=?",
+                            (new_status, notes, epic_id))
+            else:
+                con.execute(
+                    "UPDATE epics SET status=?, notes=?, held_reason=NULL WHERE id=?",
+                    (new_status, notes, epic_id))
+            con.commit()
+        except sqlite3.IntegrityError as err:
+            con.rollback()
+            sys.stderr.write(
+                f"status: cannot move '{epic_id}' from '{old_status}' to "
+                f"'{new_status}': {err}\n")
+            return 1
+    finally:
+        con.close()
+
+    # Commit AND close first: on_done opens its own connection (mirrors
+    # scheduler._settle), so calling it inside an open write txn deadlocks.
+    if new_status == "done":
+        epic_graph.on_done(epic_id, db=db)
+    sys.stdout.write(f"{epic_id}: {old_status} -> {new_status}\n")
+    return 0
+
+
 def _path_hints(body):
     p = re.findall(r"`([a-z_][\w./-]*\.(?:sh|py|sql|md|yaml|yml|json|ts|tsx|js|jsx))`", body, re.I)
     p += re.findall(r"`(bin/[\w-]+)`", body)
@@ -505,6 +602,10 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
         return _set(rest[0], rest[1:], db, root) if rest else (sys.stderr.write("epic_id required\n") or 2)
     if sub == "retry":
         return _retry(rest[0], rest[1:], db) if rest else (sys.stderr.write("epic_id required\n") or 2)
+    if sub == "status":
+        if not rest:
+            sys.stderr.write("status: epic_id required\n"); return 2
+        return _status(rest, db)
     if sub in ("help", "--help", "-h"):
         sys.stdout.write(_USAGE); return 0
     sys.stderr.write(f"Unknown subcommand: {sub}\n"); sys.stdout.write(_USAGE); return 2
