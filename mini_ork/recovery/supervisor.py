@@ -281,6 +281,28 @@ def _ledger_ids(db: str, run_id: str, fix_epic_id: str | None) -> list[int]:
     return [int(r[0]) for r in rows]
 
 
+# Terminal statuses whose outcome cannot judge a repair's diagnosis (R2's
+# repair-ledger path): the run's work was delivered by another run, or the run
+# turned out to be unnecessary.
+_UNJUDGEABLE_STATUS = frozenset({"superseded", "not_needed"})
+
+
+def _unlabelled_ledger_ids(db: str, run_id: str) -> list[int]:
+    """Unlabelled ledger row ids for ``run_id``; ``[]`` on any read error.
+
+    The repair-ledger path writes rows from the repair loop itself, so it
+    labels exactly the rows still waiting for a verdict — a row already
+    labelled by another pass is left alone. ``_query`` already returns ``[]``
+    for a missing DB or a schema that lacks the table.
+    """
+    try:
+        rows = _query(db, "SELECT id FROM diagnosis_ledger"
+                          " WHERE run_id=? AND label IS NULL", (run_id,))
+        return [int(r[0]) for r in rows]
+    except Exception:  # noqa: BLE001 — a label read never stops the sweep
+        return []
+
+
 def _inbox_row_exists(db: str, gate_id: str, feature: str) -> bool:
     rows = _query(db, "SELECT 1 FROM mo_inbox_gates"
                       " WHERE gate_id=? AND feature=? LIMIT 1",
@@ -527,7 +549,9 @@ def sweep(home: str, db: str, *, engine_root: str, now: float | None = None,
                 # (``repaired`` on publish, ``repairing``/``gave_up`` on a
                 # failure) while preserving the supervisor's keys, so a
                 # state-keyed rule would never see most revived runs.
-                if repair.get("revived_at") and not repair.get("labelled_at"):
+                if ((repair.get("revived_at")
+                     or repair.get("ledger_recorded_at"))
+                        and not repair.get("labelled_at")):
                     action = _rule_label(run_id, run_dir, repair, db, now_f,
                                          dry_run)
                 if action is None and state == "repairing":
@@ -717,13 +741,58 @@ def _rule_split(run_id: str, run_dir: Path, repair: dict[str, Any], db: str,
 
 def _rule_label(run_id: str, run_dir: Path, repair: dict[str, Any], db: str,
                 now: float, dry_run: bool) -> dict | None:
-    """R2 — label the diagnosis once a revived run reaches a terminal status."""
+    """R2 — label the diagnosis once a revived or repaired run finishes.
+
+    Two entry paths share this rule. A run the supervisor revived is judged by
+    the ``revived_at`` marker exactly as before. A run whose repair loop
+    recorded its diagnosis in the ledger (``ledger_recorded_at``, written by
+    ``auto_repair.apply``) is judged by the run's terminal status: the repair
+    was right iff the repaired run published.
+    """
     task = _task_run(db, run_id)
     if task is None:
         return None
     status, updated_at = task
     if status not in _TERMINAL_RUN_STATUS:
         return None  # still running: no action
+
+    if not repair.get("revived_at"):
+        recorded_at = _as_epoch(repair.get("ledger_recorded_at"))
+        updated_epoch = _as_epoch(updated_at)
+        if (recorded_at is None or updated_epoch is None
+                or updated_epoch <= recorded_at):
+            return None  # not updated since the repair was recorded
+
+        if status in _UNJUDGEABLE_STATUS:
+            # The work landed elsewhere (superseded) or was never needed: the
+            # outcome says nothing about the diagnosis, so it is not labelled —
+            # a "wrong" label here would bias the calibrated bar. Stamp the
+            # marker so the rule stops re-checking the run.
+            reason = f"repaired run {status} — diagnosis not judged"
+            if not dry_run:
+                updated = dict(repair)
+                updated["labelled_at"] = int(now)
+                updated["label_skipped"] = status
+                _write_repair(run_dir, updated)
+            return {"run_id": run_id, "action": "label_skipped",
+                    "reason": reason}
+
+        correct = status == "published"
+        reason = (f"repaired run {status} — diagnosis was "
+                  f"{'right' if correct else 'wrong'}")
+        if not dry_run:
+            from mini_ork.stores import diagnosis_ledger  # noqa: PLC0415
+
+            for ledger_id in _unlabelled_ledger_ids(db, run_id):
+                diagnosis_ledger.set_label(db, ledger_id, correct, reason)
+            updated = dict(repair)
+            updated["labelled_at"] = int(now)
+            updated["label_correct"] = bool(correct)
+            # ``state`` is the repair loop's to own: labelling an outcome must
+            # not rewrite it (unlike the revive path's reviving → revived).
+            _write_repair(run_dir, updated)
+        return {"run_id": run_id, "action": "label", "reason": reason,
+                "correct": correct}
 
     revived_at = _as_epoch(repair.get("revived_at"))
     updated_epoch = _as_epoch(updated_at)

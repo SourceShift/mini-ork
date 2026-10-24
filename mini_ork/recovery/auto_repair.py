@@ -1086,6 +1086,29 @@ def _write_current(run_dir: Path, round_no: int, feedback_path: Path) -> None:
     (revise_dir / "current.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
+def _record_repair_ledger(home: Path, run_id: str, diagnosis: dict,
+                          action: str) -> bool:
+    """Record a repaired diagnosis in ``diagnosis_ledger``; never raises.
+
+    The ledger is the calibration corpus for the escalation bar (SDE-3b2): the
+    repair loop acts on far more diagnoses than the ``escalate`` path, and each
+    one it acts on is evidence about whether the diagnoser was right. The
+    supervisor labels the row once the repaired run reaches a terminal status
+    (``ledger_recorded_at`` in ``repair.json``).
+
+    A side channel, not part of the repair: any failure returns ``False`` so a
+    ledger problem can never change what the repair loop does.
+    """
+    try:
+        from mini_ork.stores import diagnosis_ledger  # noqa: PLC0415
+
+        row_id = diagnosis_ledger.record(
+            Path(home) / "state.db", run_id, diagnosis, action=action)
+        return bool(row_id)
+    except Exception:  # noqa: BLE001 — the ledger must never fail a repair
+        return False
+
+
 # ── apply ────────────────────────────────────────────────────────────────────
 
 
@@ -1222,6 +1245,16 @@ def apply(home: Path, run_id: str, decision: dict[str, Any], *,
     repair["triaged"] = bool(repair.get("triaged", False))
     if action == "human":
         repair["triaged"] = _triage_on_give_up(home, run_id, repair)
+    # Every diagnosis the loop acts on with a spawnable action gets a ledger
+    # row — not just the ``escalate`` ones — so the calibrated bar has a
+    # labelled corpus to learn from. ``ledger_recorded_at`` arms the
+    # supervisor's R2 labelling; a stale ``labelled_at`` is dropped so R2
+    # labels this newest attempt rather than trusting the previous verdict.
+    if (action in _SPAWNABLE and isinstance(dx, dict)
+            and str(dx.get("source") or "")):
+        if _record_repair_ledger(home, run_id, dx, action):
+            repair["ledger_recorded_at"] = int(time.time())
+            repair.pop("labelled_at", None)
     _write_repair(run_dir, repair)
     _emit_run_event(home, run_id, attempt)
 
