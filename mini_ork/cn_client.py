@@ -887,7 +887,9 @@ def render_atoms_md(payload: str, limit: int = 5) -> str:
         content = (h.get("content") or "").strip().replace("\n", " ")
         if len(content) > 280:
             content = content[:277] + "..."
-        out.append(f"- [{kind} sim={sim:.2f} {ts} sess={sid[:8]}] {content}")
+        aid = h.get("id")
+        id_tok = f" id={aid}" if isinstance(aid, str) and aid.startswith("cn-") else ""
+        out.append(f"- [{kind} sim={sim:.2f} {ts} sess={sid[:8]}{id_tok}] {content}")
     out.append("--- /ContextNest atoms ---")
     return "\n".join(out) + "\n"
 
