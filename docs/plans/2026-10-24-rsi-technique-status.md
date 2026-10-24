@@ -159,6 +159,57 @@ flowchart LR
 4. **Run real traffic on the post-10-22 engine** (an ops step, no code), so
    SDE-5/6 graph patches, RouteMoA, CoBa and Trace2Skill get their first data.
 
+#### Tier 0 progress (landed 2026-10-24)
+
+Nine framework-edit runs, one per kickoff (`kickoffs/auto/rsi-t0-*.md`, 75c9974e).
+Each was reviewed, checked by its kickoff suite and an importer gate (the tests
+importing each changed module, capped at 60 files), and merged:
+
+| Item | Commit | Notes |
+|---|---|---|
+| Item-utility tally reads the newest runs first | a8ea463b | `resolve_finished` `ORDER BY created_at DESC, id DESC` |
+| Diagnosis ledger gets rows from normal repairs, and R2 labels them | ff28c65d | See the correction below. Review fix: `superseded` / `not_needed` outcomes are not labelled |
+| ContextNest atom ids rendered in the prefetch file | 1aeeec09 | `render_atoms_md` writes `id=cn-…` |
+| `mini-ork epics status <id> <status> --note` | 35bc52d1 | `done` runs `epic_graph.on_done`. Used on `rsi-e1-code-arm`, which unblocked E2, E4, E5, E7 and E8 |
+| D1: reflect gets a durable cwd and the effective lane | c3ed7c08, b7d93921 | Primary home reflector stays `glm`; the RSI home moves `codex` → `glm` |
+| D2: RSI gates check Python, and the test step has a timeout | b0b37c92 | Salvaged: its only red check was a vanished-`tmp_path` race (below) |
+| D3: a negative clause in an allow section denies its paths | 0663ea35 | 54 of 470 kickoffs now parse differently; the sampled ones are all "Do NOT touch X" lines that the old parser had *allowed* |
+| D4 + D5: runner `--deadline`, and the `learning_record` lifecycle | 28e9c0b2 | Also un-backticks the branch name in the kickoff template |
+| R8: supervisor dispatches one ready epic per sweep | e15d8f42 | Off by default (`dispatch_epics.enabled: false`) because it starts paid runs |
+
+**Full suite on b7d93921** (all of Tier 0 except R8, which has its own
+1,180-test gate): 12,314 passed and 2 failed. Neither failure comes from Tier 0:
+
+- `test_migrate_py.py::test_dot_command_once_read_shell` also fails on the
+  pre-Tier-0 base 7eb3d216. It depends on sqlite3 `.shell` behaviour in this
+  environment.
+- `test_evidence_ledger.py::test_gate_claimed_implementation_with_real_change_is_ok`
+  passes on its own on both commits and fails only in the full run, so it
+  depends on test order. It imports none of the changed modules.
+
+Corrections to the Tier 0 list above:
+
+- **Collapse history is not a starvation bug.** Its rows are score-vs-anchor
+  per *promotion* iteration, and the metric anchor is fail-open by design. Both
+  fill once apply (①) or the RSI cycle (Tier 1 #11) runs.
+- **The diagnosis ledger already recorded escalation refusals.** The real gaps
+  were elsewhere: only `escalate`-routed diagnoses reached the ledger at all,
+  and only supervisor-revived runs were labelled.
+- **`arx-0-scout` stays `done`.** The trigger `trg_epics_no_revert_done` blocks
+  any done → non-done change by design. Its dependency edges were resolved in
+  June, so the wrong status blocks nothing.
+
+Follow-ups found while landing Tier 0:
+
+- **Concurrent framework-edit runs delete each other's pytest `tmp_path`.**
+  pytest keeps only the 3 newest `pytest-of-<user>/pytest-N` dirs and prunes the
+  rest. The framework-edit test and spec-test verifiers should pass a run-local
+  `--basetemp`.
+- **`mini-ork epics show` lists no outgoing dependencies** even when
+  `epic_dependencies` has them.
+- **R8's cap counts `in progress` epics.** An epic left `in progress` by a
+  crashed scheduler holds the cap until someone resets it.
+
 ### Tier 1: build the missing load-bearing techniques
 
 | # | Gap | Why it matters (the source's own words) | Source |
