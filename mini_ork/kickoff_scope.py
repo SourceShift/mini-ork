@@ -13,6 +13,13 @@ Three readers used to disagree about the same kickoff text (LF-R8):
   became a hard constraint while a real rule mid-line (``Edit files directly;
   do not emit unified diffs. Do not touch …``) was missed.
 
+Polarity is clause-aware inside an allow section: a negative clause (one that
+starts with a ``do not`` trigger or ``except``, or that reads
+``leave|keep … untouched|unchanged|alone|as-is``) denies the paths it names, so
+``Leave `.mini-ork/` (run state) untouched`` no longer lands in ``allow`` —
+with the known limit that a negative clause wrapped across two physical lines
+only denies the paths on its first line.
+
 This module is pure — no I/O, no environment, no imports from the rest of
 ``mini_ork`` — so every caller can share the parse without a cycle. Callers:
 ``cli.main.gen_profile`` (``heading_kind``), ``memory.preferences``
@@ -174,6 +181,12 @@ def kickoff_scope(text: str) -> dict:
     fenced code, normalized, de-duplicated and in document order. A path that
     appears in both lists stays only in ``deny``: a scope the kickoff rules out
     is never also allowed.
+
+    In a ``deny`` section every path on the line is denied, as before. In an
+    ``allow`` section the physical line is split into clauses
+    (``_SENTENCE_SPLIT_RE``) — the first clause keeps the line's list marker, so
+    a bare bullet head still parses — and each clause's paths go to ``deny``
+    when ``_negative_clause`` reads the clause as negative, else to ``allow``.
     """
     allow: list[str] = []
     deny: list[str] = []
@@ -193,11 +206,19 @@ def kickoff_scope(text: str) -> dict:
             continue
         if current is None:
             continue
-        bucket, seen = (deny, seen_deny) if current == "deny" else (allow, seen_allow)
-        for p in paths_in_line(line):
-            if p not in seen:
-                seen.add(p)
-                bucket.append(p)
+        if current == "deny":
+            for p in paths_in_line(line):
+                if p not in seen_deny:
+                    seen_deny.add(p)
+                    deny.append(p)
+            continue
+        for clause in _SENTENCE_SPLIT_RE.split(line):
+            bucket, seen = ((deny, seen_deny) if _negative_clause(clause)
+                            else (allow, seen_allow))
+            for p in paths_in_line(clause):
+                if p not in seen:
+                    seen.add(p)
+                    bucket.append(p)
     deny_set = set(deny)
     return {"allow": [p for p in allow if p not in deny_set], "deny": deny}
 
@@ -216,10 +237,44 @@ _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|;\s*")
 _START_MARKUP_RE = re.compile(r"^[\s`*_]+")
 _LIST_MARKER_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
 _HEADING_LINE_RE = re.compile(r"^\s{0,3}#{1,6}\s+")
+# The ``leave|keep … untouched/unchanged/alone/as-is`` polarity pattern. Kept
+# separate from ``_TRIGGERS`` so a do-not scan does not also promote every
+# ``except …`` clause to a rule: only this pattern is shared with
+# ``do_not_sentences``.
+_LEAVE_KEEP_RE = re.compile(
+    r"^(leave|keep)\b.*\b(untouched|unchanged|alone|as[- ]is)\b")
 
 
 def _strip_markup(s: str) -> str:
     return s.replace("**", "").replace("__", "").replace("`", "").strip()
+
+
+def _normalized_clause(clause: str) -> str:
+    """A clause with its list marker and markup stripped, then lowercased."""
+    t = _LIST_MARKER_RE.sub("", clause or "")
+    t = _START_MARKUP_RE.sub("", t)
+    return _strip_markup(t).lower()
+
+
+def _negative_clause(clause: str) -> bool:
+    """True when ``clause`` negates the paths it names (scope polarity).
+
+    The clause is stripped of a leading list marker, leading markup and
+    ``**``/``__``/backticks. It is negative when it then starts with a
+    ``_TRIGGERS`` phrase or ``except``, or opens with the
+    ``leave|keep … untouched/unchanged/alone/as-is`` pattern.
+    """
+    t = _normalized_clause(clause)
+    return (
+        any(t.startswith(w) for w in _TRIGGERS)
+        or t.startswith("except")
+        or bool(_LEAVE_KEEP_RE.match(t))
+    )
+
+
+def _is_leave_keep(clause: str) -> bool:
+    """True when ``clause`` alone matches the leave/keep polarity pattern."""
+    return bool(_LEAVE_KEEP_RE.match(_normalized_clause(clause)))
 
 
 def _starts_with_trigger(sentence: str) -> bool:
@@ -277,14 +332,16 @@ def do_not_sentences(text: str) -> list[str]:
     each paragraph into one logical line; sentences are split on
     ``(?<=[.!?])\\s+`` (and on ``;``, see ``_SENTENCE_SPLIT_RE``); a sentence is
     kept when it STARTS — after ``**``/``__``/backticks — with ``do not``,
-    ``don't``, ``never`` or ``must not`` (case-insensitive). Markup is stripped,
-    a sentence is capped at 200 chars, and the result is de-duplicated in order.
+    ``don't``, ``never`` or ``must not`` (case-insensitive), or matches the
+    ``leave|keep … untouched/unchanged/alone/as-is`` polarity pattern. Markup is
+    stripped, a sentence is capped at 200 chars, and the result is
+    de-duplicated in order.
     """
     out: list[str] = []
     seen: set[str] = set()
     for logical in _logical_lines(text):
         for sentence in _SENTENCE_SPLIT_RE.split(logical):
-            if not _starts_with_trigger(sentence):
+            if not (_starts_with_trigger(sentence) or _is_leave_keep(sentence)):
                 continue
             clean = _strip_markup(sentence)[:_MAX_SENTENCE_CHARS]
             if clean and clean not in seen:
