@@ -490,6 +490,17 @@ def from_mapping(raw: Any, *, env: Mapping[str, str] | None = None,
             raise ConfigError(
                 "probes.allow_live: true is not enough on its own; live probes need "
                 "`--probe-run` on the command line")
+        # G10 quarantines any cycle whose critics share a family with the
+        # implementer. Catching it here turns a guaranteed quarantine — after a
+        # paid child run — into a startup error that costs nothing.
+        from mini_ork.verify.panel_heterogeneity import lane_family
+
+        implementer = lane_family(cfg.implement.lane)
+        critic_families = {lane_family(lane) for lane in cfg.critic.lanes}
+        if implementer and implementer in critic_families:
+            raise ConfigError(
+                f"critic.lanes {list(cfg.critic.lanes)} share the implementer's family "
+                f"({implementer}); every cycle would be quarantined as critic_not_exogenous")
     return cfg
 
 

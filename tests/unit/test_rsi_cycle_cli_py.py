@@ -237,14 +237,16 @@ def test_doctor_reports_every_check_and_its_remedy(root, db, monkeypatch, capsys
         "mini_ork.stores.migrate.migrate_status",
         lambda *a, **kw: (84, 0, 0, 84),
     )
+    _write_config(root)
     rc = rsi_cycle.main(["doctor", "--json"], root=root)
     payload = json.loads(capsys.readouterr().out)
     assert rc == 0, payload
     assert payload["ok"] is True
     names = [c["name"] for c in payload["checks"]]
     assert names == [
-        "database", "migrations", "rsi_tables", "lease_tables",
-        "binaries", "origin_remote", "harvest_rules",
+        "config", "database", "migrations", "rsi_tables", "lease_tables",
+        "binaries", "origin_remote", "harvest_rules", "critic_families",
+        "worktrees", "budget", "stop_switch",
     ]
 
 
@@ -262,6 +264,70 @@ def test_doctor_flags_pending_migrations(root, db, monkeypatch, capsys):
     )
     assert rsi_cycle.main(["doctor"], root=root) == 1
     assert "4 of 84 migration(s) pending" in capsys.readouterr().out
+
+
+def _readied(root: Path, monkeypatch) -> None:
+    """The temp DB only has 0052 + 0084; the real repo has ~84 migrations."""
+    monkeypatch.setattr(
+        "mini_ork.stores.migrate.migrate_status", lambda *a, **kw: (84, 0, 0, 84))
+
+
+def _checks(capsys) -> dict:
+    return {c["name"]: c for c in json.loads(capsys.readouterr().out)["checks"]}
+
+
+def test_doctor_flags_a_missing_config_first(root, monkeypatch, capsys):
+    # The config check is the first one for a reason: everything after it that
+    # needs a budget or a lane family cannot be judged without it.
+    _readied(root, monkeypatch)
+    assert rsi_cycle.main(["doctor", "--json"], root=root) == 1
+    check = _checks(capsys)["config"]
+    assert check["ok"] is False
+    assert "rsi-cycle" in check["detail"]
+
+
+def test_doctor_flags_the_stop_switch(root, db, monkeypatch, capsys):
+    _readied(root, monkeypatch)
+    _write_config(root)
+    stop = db.parent / "rsi" / "DISABLED"
+    stop.parent.mkdir(parents=True)
+    stop.write_text("collapse: score_rise=0.2 anchor_drop=0.3\n", encoding="utf-8")
+    rsi_cycle.main(["doctor", "--json"], root=root)
+    check = _checks(capsys)["stop_switch"]
+    assert check["ok"] is False
+    assert "collapse: score_rise=0.2" in check["detail"]
+
+
+def test_doctor_without_an_origin_fails_when_require_remote_is_true(root, db, monkeypatch,
+                                                                   capsys):
+    _readied(root, monkeypatch)
+    _write_config(root)
+    subprocess.run(["git", "-C", str(root), "remote", "remove", "origin"], check=True)
+    rsi_cycle.main(["doctor", "--json"], root=root)
+    check = _checks(capsys)["origin_remote"]
+    assert check["ok"] is False
+    assert "quarantine" in check["detail"]
+
+
+def test_doctor_tolerates_a_missing_origin_when_remote_is_not_required(root, db, monkeypatch,
+                                                                      capsys):
+    _readied(root, monkeypatch)
+    _write_config(root, CONFIG + "merge: {require_remote: false}\n")
+    subprocess.run(["git", "-C", str(root), "remote", "remove", "origin"], check=True)
+    rsi_cycle.main(["doctor", "--json"], root=root)
+    check = _checks(capsys)["origin_remote"]
+    assert check["ok"] is True
+    assert "require_remote is false" in check["detail"]
+
+
+def test_require_origin_is_a_setup_error_not_a_late_quarantine(root, tmp_path):
+    from mini_ork.cli.rsi_cycle import _SetupError, _require_origin
+
+    _require_origin(root)  # the fixture repo has an origin
+    bare = _fake_root(tmp_path / "bare")
+    subprocess.run(["git", "-C", str(bare), "remote", "remove", "origin"], check=True)
+    with pytest.raises(_SetupError, match="no 'origin' remote"):
+        _require_origin(bare)
 
 
 def test_doctor_flags_schema_drift_as_not_ready(root, db, monkeypatch, capsys):

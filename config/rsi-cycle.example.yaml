@@ -1,0 +1,101 @@
+# RSI cycle — one config file for both tiers.
+#
+#   cp config/rsi-cycle.example.yaml config/rsi-cycle.yaml
+#   mini-ork rsi-cycle --dry-run        # prints the plan, spends nothing
+#   mini-ork rsi-cycle                  # one cycle
+#
+# Simple tier (everything here as written): local SQLite, local worktrees,
+# `runtime_backend: local`, no server, no daemon, no cloud account.
+# Secure tier: shared DB via `secure.db_path`, a sandbox `runtime_backend`,
+# secrets from `secure.secret_store`, `mode: loop` under the install's lease
+# (the lease makes two overlapping cycles a no-op instead of a race). No key
+# changes shape between the tiers — only its value.
+#
+# Everything below FAILS CLOSED. A value that cannot be honoured is exit 2 at
+# startup, never a silent fallback: see docs/operator/rsi-cycle.md.
+
+version: 1
+enabled: true          # false is the config-level kill switch (same as `rsi-cycle halt`)
+mode: once             # once | loop
+interval_s: 3600       # loop only; must be > 0
+max_cycles: 1          # 0 = unlimited (loop only); a loop still stops on a collapse
+
+lease:
+  key: __rsi_cycle__
+  ttl_s: 3600          # raise for a slow child: the lease must outlive one cycle
+
+queue:
+  max_candidates: 3     # how many gaps one cycle may consider
+  per_domain_max: 5     # per-domain pool before the ranked queue is assembled
+  min_severity: 40      # below this a gap is recorded but not queued
+  failed_signature_ttl_days: 30
+  severity_rise: 15     # a failed signature is retried only if it got this much worse
+  credit_min_n: 3       # credit reorders the queue only after 3 observations
+
+budget:
+  daily_cap_usd: 50     # MO_DAILY_BUDGET_USD overrides it when set
+  # A framework-edit child runs ~7 model nodes; the measured phase-0 cycles cost
+  # $9.69 and $7.35. 20 leaves headroom so a cycle is not blocked on G11 for one
+  # call too many — at most 2 cycles/day against the cap above.
+  per_cycle_cap_usd: 20
+
+probes:
+  # Deterministic, in-process/SQL probes. `db:<RULE>` ids re-run a detection;
+  # the rest shell out to the existing commands. All are registered — an
+  # unknown id is exit 2, not a silently skipped probe.
+  run: [garden, validate, verifier-audit, calibrate, metrics, oversight, tests, lane-preflight]
+  timeout_s: 900
+  per_source_max: 3     # findings kept per source; a red probe is not 400 gaps
+  error_policy: halt_before_spend   # | quarantine_only
+  # Live probes (a real run, $3-12, 20-60 min) are per-invocation only:
+  # `mini-ork rsi-cycle --probe-run`. Setting this true is refused at startup;
+  # a checked-in file must never be able to start spending on its own.
+  allow_live: false
+  # Fallback scoped test set when `gates.pytest_paths` is empty.
+  pytest_paths: [tests/unit/test_rsi_cycle_py.py, tests/unit/test_rsi_learn_py.py]
+
+gates:
+  cmd_timeout_s: 1800
+  max_files: 5          # G4: a wider diff is a scope violation, not a review request
+  static_mode: differential   # | strict — `strict` is unusable on today's red baseline
+  suite_adequacy: false  # launches a full live run; opt in deliberately
+  probe_run: false
+  allow_prefixes: [mini_ork/, recipes/, tests/, config/, db/migrations/, scripts/, docs/]
+  # G6's scoped set AND the merge script's green gate. Never leave both this and
+  # probes.pytest_paths empty: the merge default is the whole suite (~60 min).
+  pytest_paths:
+    - tests/unit/test_rsi_cycle_py.py
+    - tests/unit/test_rsi_learn_py.py
+
+critic:
+  # Two critics, distinct model families, both exogenous to implement.lane
+  # (checked at startup). A shared family, or fewer than two, is exit 2.
+  lanes: [glm_lens, opus_lens]
+  require_unanimous: true   # false is refused: a split quarantines, never majority-merges
+  model_timeout_s: 900
+
+implement:
+  runtime_backend: local    # | bubblewrap | daytona | microsandbox
+  child_timeout_s: 3600
+  static_recipe_plan: true
+  lane: codex_lens          # the implementer; critics must not share its family
+
+merge:
+  # No origin -> quarantine, never a local commit on main. Checked at startup
+  # and again at merge time.
+  require_remote: true
+  test_cmd: ""              # overrides MINI_ORK_TEST_CMD and the derived scoped set
+  on_merge: clean           # | keep
+
+decide:
+  # NO default in code: absent means false, and false means every cycle
+  # quarantines. Set it true only with a critic panel you trust.
+  auto_merge: true
+  quarantine_keep_worktree: true   # a quarantined cycle is evidence, not garbage
+
+# The secure tier's pointers. Empty = simple tier. A named secret_store that
+# cannot be opened is exit 2 — there is no silent fall back to the environment.
+secure:
+  secret_store: ""          # e.g. vault://mini-ork/rsi
+  db_path: ""               # shared DB; empty -> <MINI_ORK_HOME>/state.db
+  node_pool: ""

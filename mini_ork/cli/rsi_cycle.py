@@ -443,13 +443,17 @@ def _cmd_doctor(args, root: Path, db: Path) -> int:
         return "bin/mini-ork + scripts/mini_ork_worktree.py present"
 
     def origin() -> str:
+        cfg = loaded.get("cfg")
         proc = subprocess.run(
             ["git", "-C", str(root), "remote", "get-url", "origin"],
             capture_output=True, text=True, timeout=30, check=False,
         )
-        if proc.returncode != 0:
-            raise RuntimeError("no `origin` remote — merges must quarantine, not commit locally")
-        return proc.stdout.strip()
+        found = proc.returncode == 0 and bool(proc.stdout.strip())
+        if found:
+            return proc.stdout.strip()
+        if cfg is not None and not cfg.merge.require_remote:
+            return "absent, and merge.require_remote is false"
+        raise RuntimeError("no `origin` remote — merges must quarantine, not commit locally")
 
     def rules() -> str:
         con = ledger.connect(str(db))
@@ -465,6 +469,61 @@ def _cmd_doctor(args, root: Path, db: Path) -> int:
             raise RuntimeError(f"schema drift: {names}")
         return f"{len(report.candidates)} candidate(s), {len(report.skipped)} rule(s) skipped"
 
+    loaded: dict[str, Any] = {}
+
+    def config() -> str:
+        cfg = _load_config(args, root)
+        loaded["cfg"] = cfg
+        return (f"mode={cfg.mode} max_cycles={cfg.max_cycles} "
+                f"auto_merge={cfg.decide.auto_merge} "
+                f"per_cycle=${cfg.budget.per_cycle_cap_usd:.0f}")
+
+    def critic_heterogeneity() -> str:
+        from mini_ork.verify.panel_heterogeneity import lane_family
+
+        cfg = loaded.get("cfg")
+        if cfg is None:
+            raise RuntimeError("config did not load; cannot check lane families")
+        implementer = lane_family(cfg.implement.lane)
+        families = [lane_family(lane) for lane in cfg.critic.lanes]
+        if implementer in families:
+            raise RuntimeError(
+                f"implement.lane {cfg.implement.lane} ({implementer}) shares a family "
+                f"with a critic {families} — every cycle would quarantine")
+        return f"{cfg.implement.lane}={implementer} vs {dict(zip(cfg.critic.lanes, families))}"
+
+    def worktrees() -> str:
+        base = os.environ.get("MINI_ORK_WORKTREES_DIR")
+        path = Path(base) if base else root.parent / f"{root.name}-worktrees"
+        path.mkdir(parents=True, exist_ok=True)
+        if not os.access(path, os.W_OK):
+            raise PermissionError(f"{path} is not writable")
+        return str(path)
+
+    def budget() -> str:
+        from mini_ork.cost_ledger import spent_last_24h
+
+        cfg = loaded.get("cfg")
+        if cfg is None:
+            raise RuntimeError("config did not load; cannot compute budget headroom")
+        spent = float(spent_last_24h(str(db)))
+        cap = cfg.budget.daily_cap_usd
+        if spent >= cap:
+            raise RuntimeError(
+                f"spent ${spent:.2f} of the ${cap:.2f} daily cap — every cycle halts")
+        return f"${spent:.2f} of ${cap:.2f} used in the last 24h"
+
+    def stop_switch() -> str:
+        stop = Path(db).parent / "rsi" / "DISABLED"
+        if not stop.exists():
+            return "not set"
+        try:
+            first = stop.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            first = ""
+        raise RuntimeError(f"{stop} present — {first.splitlines()[0] if first else 'operator stop'}")
+
+    check("config", config)
     check("database", db_exists)
     check("migrations", migrations)
     check("rsi_tables", tables)
@@ -472,6 +531,10 @@ def _cmd_doctor(args, root: Path, db: Path) -> int:
     check("binaries", probe_bin)
     check("origin_remote", origin)
     check("harvest_rules", rules)
+    check("critic_families", critic_heterogeneity)
+    check("worktrees", worktrees)
+    check("budget", budget)
+    check("stop_switch", stop_switch)
 
     ok = all(c["ok"] for c in checks)
     if args.json:
@@ -534,12 +597,30 @@ def _load_config(args, root: Path):
     return cfg
 
 
+def _require_origin(root: Path) -> None:
+    """``merge.require_remote: true`` with no remote is exit 2, not a late quarantine."""
+    proc = subprocess.run(
+        ["git", "-C", str(root), "remote", "get-url", "origin"],
+        capture_output=True, text=True, timeout=30, check=False,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        raise _SetupError(
+            "merge.require_remote is true but this repository has no 'origin' "
+            "remote — every merge would quarantine after the child had already "
+            "spent. Add an origin, or set merge.require_remote: false to allow "
+            "local-only merging")
+
+
 def _cmd_run(args, root: Path, db: Path) -> int:
     from dataclasses import replace
 
     from mini_ork.rsi import cycle as cycle_mod
 
     cfg = _load_config(args, root)
+    if cfg.merge.require_remote:
+        # Checked here as well as at merge time: discovering it *after* a paid
+        # child run turns a $10 cycle into a guaranteed quarantine.
+        _require_origin(root)
     if args.probe_run and not cfg.probes.allow_live and not args.dry_run:
         # ``allow_live`` in the file is a permission, not a trigger: a config
         # alone must never start a paid run.

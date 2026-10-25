@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  RSI cycle on a cadence (simple tier).
+
+  Install:
+    mkdir -p ~/Library/Logs/mini-ork ~/Library/LaunchAgents
+    sed -e "s|__PYTHON__|$(command -v python3.11)|g" \
+        -e "s|__MINI_ORK_ROOT__|$PWD|g" \
+        -e "s|__HOME__|$HOME|g" \
+        deploy/launchd/com.miniork.rsi-cycle.plist.example \
+        > ~/Library/LaunchAgents/com.miniork.rsi-cycle.plist
+    launchctl load ~/Library/LaunchAgents/com.miniork.rsi-cycle.plist
+    launchctl kickstart -k gui/$(id -u)/com.miniork.rsi-cycle   # one cycle now
+
+  Three things this file gets right on purpose:
+
+  1. It runs the interpreter, not a shell script. Under launchd there is no
+     interactive shell, and a sh-spawned `git` cannot getcwd in a checkout on
+     an external volume (`/Volumes/...`). Python can; it spawns git itself.
+  2. `StartInterval` + `--once` makes launchd the scheduler, so a cycle never
+     outlives its tick. For mini-ork's own loop instead, use `mode: loop` in the
+     config, drop `--once`, and set `RunAtLoad` true with `StartInterval`
+     absent — one process, sleeping `interval_s` between cycles.
+  3. Logs go under ~/Library/Logs, on the boot volume. launchd cannot create
+     the directory, and a log path inside /Volumes can fail at boot before the
+     external disk mounts.
+
+  The cycle's own lease means a manual run and a scheduled tick cannot overlap:
+  the second one halts with `lease_held` and costs nothing. `rsi-cycle halt`
+  writes <home>/rsi/DISABLED, which every future tick honours until `resume`.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.miniork.rsi-cycle</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>-m</string>
+    <string>mini_ork.cli.main</string>
+    <string>rsi-cycle</string>
+    <string>--once</string>
+    <string>--config</string>
+    <string>__MINI_ORK_ROOT__/config/rsi-cycle.yaml</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__MINI_ORK_ROOT__</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>MINI_ORK_ROOT</key>
+    <string>__MINI_ORK_ROOT__</string>
+    <key>MINI_ORK_HOME</key>
+    <string>__MINI_ORK_ROOT__/.mini-ork</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StartInterval</key>
+  <integer>3600</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/mini-ork/rsi-cycle.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/mini-ork/rsi-cycle.err.log</string>
+</dict>
+</plist>

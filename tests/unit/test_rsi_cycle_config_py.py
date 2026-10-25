@@ -7,6 +7,8 @@ test that disagreeing is refused at parse time instead of at gate time.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from mini_ork.rsi.config import (
@@ -15,6 +17,9 @@ from mini_ork.rsi.config import (
     from_mapping,
     load_config,
 )
+
+REPO = Path(__file__).resolve().parents[2]
+EXAMPLE = REPO / "config" / "rsi-cycle.example.yaml"
 
 #: A minimal file that parses. Every other test varies exactly one thing, so a
 #: failure points at the knob rather than at the fixture drifting.
@@ -311,3 +316,57 @@ def test_a_round_trip_to_dict_keeps_the_safety_knobs():
     assert data["decide"]["auto_merge"] is False
     assert data["budget"]["per_cycle_cap_usd"] == 20.0
     assert data["critic"]["lanes"] == ["glm_lens", "opus_lens"]
+
+
+# --------------------------------------------------------------------------
+# The shipped example: the file in the repo cannot rot
+# --------------------------------------------------------------------------
+
+
+def test_the_shipped_example_parses_strict_and_passes_every_precondition():
+    out = load_config(EXAMPLE, env={}, strict=True)
+    assert out.version == 1 and out.enabled is True
+    assert out.mode == "once" and out.max_cycles == 1
+    assert out.budget.per_cycle_cap_usd <= out.budget.daily_cap_usd
+    assert out.decide.auto_merge is True, "the example is the chosen gated-auto-merge policy"
+    assert out.probes.allow_live is False
+    assert out.gates.static_mode == "differential", "strict is unusable on today's red baseline"
+    assert out.merge.require_remote is True
+    assert out.critic.lanes == ("glm_lens", "opus_lens")
+    assert out.implement.lane == "codex_lens"
+
+
+def test_the_example_merge_command_is_scoped_and_disables_the_asyncio_plugin():
+    out = load_config(EXAMPLE, env={}, strict=True)
+    cmd = out.merge_test_cmd
+    assert cmd.startswith("python3 -m pytest -q -p no:asyncio ")
+    for path in out.scoped_tests:
+        assert path in cmd
+    assert set(out.scoped_tests) == {"tests/unit/test_rsi_cycle_py.py",
+                                     "tests/unit/test_rsi_learn_py.py"}
+
+
+# --------------------------------------------------------------------------
+# Strict mode: the implementer/critic family check
+# --------------------------------------------------------------------------
+
+
+def test_strict_refuses_critics_sharing_the_implementers_family():
+    """Without this the cycle pays for a child, then quarantines on G10."""
+    raw = {**BASE, "implement": {"lane": "glm_lens"}}
+    from_mapping(raw, env={})  # a plan does not spend, so non-strict parses
+    with pytest.raises(ConfigError, match="share the implementer's family"):
+        from_mapping(raw, env={}, strict=True)
+
+
+def test_strict_accepts_an_exogenous_panel():
+    raw = {**BASE, "implement": {"lane": "codex_lens"}}
+    assert from_mapping(raw, env={}, strict=True).implement.lane == "codex_lens"
+
+
+def test_a_blank_lane_in_the_panel_is_refused():
+    """``lane_family`` falls back to the lowercased name; a blank one is not a family."""
+    with pytest.raises(ConfigError, match="contains an empty entry"):
+        cfg(critic={"lanes": ["glm_lens", "  "]})
+    with pytest.raises(ConfigError, match="contains an empty entry"):
+        cfg(critic={"lanes": ["glm_lens", ""]})
