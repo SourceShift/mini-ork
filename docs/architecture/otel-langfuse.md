@@ -2,16 +2,13 @@
 
 > Status: **implemented**. `mini_ork/otel_export.py` builds the
 > task_run → agent → llm_call span tree from state.db and exports it as
-> OTLP/JSON (env-gated on `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY`,
-> `--dry-run` prints the payload; tests in `tests/test_otel_export.py`).
-> Live in-process span emission is wired: `MO_OTEL=1` makes
-> `mini_ork/cli/execute.py` buffer lifecycle events to
-> `$MINI_ORK_RUN_DIR/.otel-spans.jsonl` via `lib/mo_otel.sh` (root span at
-> startup/EXIT trap, agent spans piggybacked on the node-end trap in
-> `lib/mo_node_events.sh`) and flush at run end through
-> `python3 -m mini_ork.otel_export --from-jsonl` — which joins the
-> llm_call layer from state.db, POSTs, and renames the buffer to `*.sent`
-> on success (it survives otherwise, for resync).
+> OTLP/JSON. After every run, `_post_run_learning` exports the run's span
+> tree when both Langfuse keys resolve through the vault (simple tier:
+> environment / `config/secrets.local.sh`; secure tier: a vault backend,
+> see `config/vault.example.yaml`). `MO_OTEL_EXPORT=0` opts out.
+> Manual: `python -m mini_ork.otel_export <run_id> [--dry-run]`.
+> Tests in `tests/test_otel_export.py` and
+> `tests/unit/test_eco6_k10_otel_live.py`.
 
 ## Why
 
@@ -59,19 +56,22 @@ Generate a 32-hex trace_id at `mini-ork run` startup; store both the
 existing string trace_id (for internal correlation) AND a new
 `task_runs.otel_trace_id` (32-hex) for external export.
 
-### 2. Span emitter (`lib/mo_otel.sh`)
+### 2. Post-run export
 
-Pure-python helper invoked from bash. Buffers spans as JSONL at
-`$MINI_ORK_RUN_DIR/.otel-spans.jsonl`, then flushes to OTLP at run end.
+`_post_run_learning` (the final step) calls
+`otel_export.export_after_run(run_id, db)`. It resolves the key pair through
+the same `vault_environment()` chain every other credential uses, builds the
+span tree from state.db, and POSTs it. Best-effort: any failure is reported
+on stderr with the exception class only and never fails the run.
+`MO_OTEL_EXPORT=0` opts out entirely.
 
 ### 3. Wiring points
 
-| Where | Span emitted |
+| Where | Effect |
 |---|---|
-| `mini_ork/cli/execute.py` startup | root span "task_run" |
-| `_dispatch_node` entry | child span "agent" |
-| `_mo_llm_write_llm_calls_row` | grandchild span "llm_call" |
-| dispatcher exit trap | flush + end root span |
+| `mini_ork/cli/execute.py::_post_run_learning` | export the finished run |
+| `mini_ork/otel_export.py::export_after_run` | resolve keys, build, POST |
+| `mini_ork/otel_export.py::export` | manual CLI path |
 
 ### 4. Configuration
 
@@ -80,6 +80,12 @@ export LANGFUSE_OTLP_ENDPOINT="https://cloud.langfuse.com/api/public/otel/v1/tra
 export LANGFUSE_PUBLIC_KEY="pk-lf-..."
 export LANGFUSE_SECRET_KEY="sk-lf-..."
 ```
+
+The simple tier reads those from the environment or an owner-only
+`config/secrets.local.sh`; the secure tier reads them from a sops / command /
+openbao vault backend (`config/vault.example.yaml`). A half-configured pair
+(one key set) fails closed with a visible stderr warning; neither key means
+export is off.
 
 ## What's already in place
 
@@ -90,17 +96,16 @@ export LANGFUSE_SECRET_KEY="sk-lf-..."
 
 ## What's built
 
-1. **`mini_ork/otel_export.py`** — stdlib-only OTLP/JSON exporter; offline
-   mode (`<task_run_id>`, reads state.db) and live mode (`--from-jsonl`,
-   reads the run buffer + joins llm_calls). 32-hex trace_ids derived
+1. **`mini_ork/otel_export.py`** — stdlib-only OTLP/JSON exporter. It reads
+   one run from state.db (`<task_run_id>`), builds the span tree, and POSTs
+   it; `--dry-run` prints the payload instead. 32-hex trace_ids are derived
    deterministically from task_run_id (`sha256` prefix) — no migration
-   needed; live and offline exports of the same run collide on
-   traceId/spanId so the backend dedupes.
-2. **`lib/mo_otel.sh`** — bash span buffer (root_begin/root_end/agent
-   events as JSONL; `MO_OTEL=1` gated; every entry point returns 0).
-3. **Wired** into `mini_ork/cli/execute.py` (source + root_begin after
-   `MINI_ORK_RUN_DIR` export; root_end + flush in the EXIT trap) and
-   `lib/mo_node_events.sh` (`mo_node_emit_end_trap` emits the agent span).
+   needed; re-exporting the same run collides on traceId/spanId so the
+   backend dedupes. Keys resolve through the vault chain.
+2. **Post-run hook** — `mini_ork/cli/execute.py::_post_run_learning` exports
+   every finished run (best-effort, `MO_OTEL_EXPORT=0` opts out).
+3. **IDE setup page** — the OTel / Langfuse status row reports whether each
+   finished run is exported, resolved through the same credentials path.
 
 ## What's left
 
@@ -108,6 +113,7 @@ export LANGFUSE_SECRET_KEY="sk-lf-..."
 
 ## Failure modes & guards
 
-- OTLP endpoint unreachable → JSONL on disk survives; `mini-ork otel-resync` re-POSTs
-- Credentials missing → emitter is a no-op (telemetry never leaves the host without opt-in)
+- OTLP endpoint unreachable → the export is reported and skipped; the run is unaffected
+- Credentials missing → export is a no-op (telemetry never leaves the host without opt-in)
+- Only one key set → export fails closed with a visible stderr warning
 - Schema drift → namespace attributes (`mini-ork.*`, `langfuse.*`, `llm.*`)

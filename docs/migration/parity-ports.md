@@ -37,7 +37,7 @@ the capability either has a live replacement or is gone.
 | `mini_ork/observability/blame_attributor.py` | `lib/blame_attributor.sh` | retired |
 | `mini_ork/observability/check_claude_invocations.py` | `bin/mo-check-claude-invocations` | retired |
 | `mini_ork/observability/emit_hook.py` | `lib/emit_hook.sh` | retired |
-| `mini_ork/observability/langfuse_score_mapper.py` | `lib/langfuse_score_mapper.sh` | retired |
+| `mini_ork/observability/langfuse_score_mapper.py` | `lib/langfuse_score_mapper.sh` | removed 2026-10 (no production caller)
 | `mini_ork/observability/otel.py` | `lib/otel.sh` | retired |
 | `mini_ork/orchestration/harness_wrapper.py` | `lib/harness_wrapper.sh` | retired |
 | `mini_ork/orchestration/spec_split.py` | `lib/spec_split.sh` | retired |

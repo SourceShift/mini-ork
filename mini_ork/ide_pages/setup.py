@@ -290,6 +290,38 @@ def _garden(home: Path) -> tuple[dict[str, Any], dict[str, int]]:
     return S.lst("garden · drift", items, note=f"{f.errors} error(s), {f.warnings} warning(s), {f.infos} info"), counts
 
 
+def _otel_status() -> dict[str, Any]:
+    """The OTel / Langfuse health row, resolved through the vault chain.
+
+    ``_credentials()`` returns ``None`` for both "off" and "half-configured",
+    so a second lookup distinguishes the two. Any failure reads as not
+    configured. Values are never rendered — only presence and the endpoint.
+    """
+    try:
+        from mini_ork import otel_export
+
+        creds = otel_export._credentials()
+        if creds is not None:
+            _pk, _sk, endpoint = creds
+            return S.ok("OTel / Langfuse", f"each finished run is exported to {endpoint}")
+        env = otel_export.vault_environment()
+        half = bool(env.resolve("LANGFUSE_PUBLIC_KEY")) ^ bool(
+            env.resolve("LANGFUSE_SECRET_KEY")
+        )
+    except Exception:  # noqa: BLE001 — a broken vault means "not configured" here
+        half = False
+    if half:
+        return S.warn(
+            "OTel / Langfuse",
+            "only one of LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY is set"
+            " — nothing is exported",
+        )
+    return S.dot(
+        "OTel / Langfuse",
+        "not configured · set LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY",
+    )
+
+
 def _health(home: Path) -> list[dict[str, Any]]:
     errors: dict[str, str] = {}
     counts: dict[str, int] = {}
@@ -309,11 +341,7 @@ def _health(home: Path) -> list[dict[str, Any]]:
                                  ("Config drift", drift[0], drift[1])],
                     actions=[S.btn("Update", None)]))
     exports = [S.dot("Web UI", f"mini-ork serve · {_SERVE_URL}", [S.btn("Open", S.url(_SERVE_URL))])]
-    if os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY"):
-        endpoint = os.environ.get("LANGFUSE_OTLP_ENDPOINT") or "Langfuse default endpoint"
-        exports.append(S.ok("OTel / Langfuse", f"exporting to {endpoint}"))
-    else:
-        exports.append(S.dot("OTel / Langfuse", "not configured · set LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY"))
+    exports.append(_otel_status())
     if os.environ.get("MINI_ORK_ON_EVENT"):
         exports.append(S.ok("Event hook", "MINI_ORK_ON_EVENT is set — node lifecycle events go to its command"))
     else:

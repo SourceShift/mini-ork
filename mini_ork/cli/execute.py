@@ -2082,6 +2082,8 @@ def _post_run_learning(db, run_dir, run_id, task_class="", fail_count=None):
        gradient per agent-prompt target, gated through the same apply_run.
        Opt-in twice (MO_AUTO_APPLY=1 AND MO_APPLY_ENABLED=1): a sweep without
        the master gate would audit but never write, which is pure noise.
+    5. OTel / Langfuse export of this run (off unless both Langfuse keys
+       resolve through the vault chain; MO_OTEL_EXPORT=0 opts out).
     """
     # RB-41: give post-run work its own identity before any side channel runs.
     # ``publish_env`` dual-writes the contextvar (read by
@@ -2124,6 +2126,14 @@ def _post_run_learning(db, run_dir, run_id, task_class="", fail_count=None):
             _apply.auto_sweep(task_class, db=db)
         except Exception:
             pass
+
+    # 5. OTel / Langfuse export of this run (off unless both Langfuse keys
+    #    resolve through the vault chain; MO_OTEL_EXPORT=0 opts out).
+    try:
+        from mini_ork import otel_export  # noqa: PLC0415
+        otel_export.export_after_run(run_id, db)
+    except Exception:  # noqa: BLE001 — telemetry must never fail a run
+        pass
 
 
 # These are the deterministic operations _dispatch_node's live (non-dry-run)

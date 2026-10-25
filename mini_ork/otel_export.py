@@ -8,6 +8,11 @@ Span tree:  task_run (root) -> agent (one per execution_trace) -> llm_call.
 Env gating (telemetry never leaves the host without opt-in):
   LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY   required for live export
   LANGFUSE_OTLP_ENDPOINT                      default: Langfuse Cloud
+  MO_OTEL_EXPORT=0                            opt out of the post-run export
+
+Keys resolve through the vault chain (environment / owner-only
+secrets.local.sh for the simple tier; a sops / command / openbao backend for
+the secure tier). See docs/architecture/otel-langfuse.md.
 
 CLI:
   python3 -m mini_ork.otel_export <task_run_id> [--db PATH] [--dry-run]
@@ -28,11 +33,13 @@ import sys
 import urllib.request
 from datetime import datetime, timezone
 
+from mini_ork.dispatch.vault import vault_environment
 from mini_ork.sqlite_read import connect_readonly
 
 DEFAULT_ENDPOINT = "https://cloud.langfuse.com/api/public/otel/v1/traces"
 
 OK, ERROR = 1, 2  # OTLP status codes
+
 
 
 def _hex_id(seed: str, nbytes: int) -> str:
@@ -117,100 +124,6 @@ def _llm_call_spans(db_path, task_run_id, trace_id, agent_by_node, root_id):
     return spans
 
 
-def build_payload_from_jsonl(jsonl_path: str, db_path: str | None = None) -> dict:
-    """Assemble the span tree from a live run's .otel-spans.jsonl buffer.
-
-    Events: root_begin {task_run_id, start_ms}, root_end {end_ms, status},
-    agent {node_id, node_type, start_ms, end_ms, verdict}. The llm_call
-    layer is joined in from state.db when db_path is given. Span IDs use
-    the same derivation as the offline exporter, so re-exporting the same
-    run is idempotent on the backend.
-    """
-    events = []
-    with open(jsonl_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                events.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-
-    begin = next((e for e in events if e.get("type") == "root_begin"), None)
-    if begin is None or not begin.get("task_run_id"):
-        raise SystemExit(f"otel_export: no root_begin event in {jsonl_path}")
-    end = next((e for e in events if e.get("type") == "root_end"), None)
-    agents = [e for e in events if e.get("type") == "agent"]
-
-    task_run_id = begin["task_run_id"]
-    trace_id = _hex_id(task_run_id, 16)
-    root_id = _hex_id(f"{task_run_id}/root", 8)
-
-    start_ns = int(begin.get("start_ms", 0)) * 1_000_000
-    if end:
-        end_ns = int(end.get("end_ms", 0)) * 1_000_000
-        root_status = ERROR if end.get("status") == "failure" else OK
-    else:
-        end_ns = max([int(a.get("end_ms", 0)) for a in agents] + [0]) * 1_000_000
-        root_status = OK
-
-    spans = [
-        _span(
-            trace_id, root_id, f"task_run {task_run_id}", start_ns, end_ns,
-            [_attr("mini-ork.task_run_id", task_run_id)],
-            root_status,
-        )
-    ]
-
-    # The node-end RETURN trap can fire more than once per node (nested
-    # returns), yielding several events with the same (node_id, start_ms)
-    # seed → identical span_id. Keep only the final one (max end_ms).
-    by_span: dict[str, dict] = {}
-    for a in agents:
-        sid = _hex_id(f"{task_run_id}/{a.get('node_id', '')}/{a.get('start_ms', 0)}", 8)
-        cur = by_span.get(sid)
-        if cur is None or int(a.get("end_ms", 0)) >= int(cur.get("end_ms", 0)):
-            by_span[sid] = a
-
-    agent_by_node: dict[str, str] = {}
-    for span_id, a in by_span.items():
-        node = a.get("node_id", "")
-        agent_by_node.setdefault(node, span_id)
-        attrs = [
-            _attr("mini-ork.node_id", node),
-            _attr("mini-ork.node_type", a.get("node_type", "")),
-            _attr("mini-ork.task_run_id", task_run_id),
-        ]
-        verdict = a.get("verdict", "")
-        if verdict:
-            attrs.append(_attr("mini-ork.verdict", verdict))
-        spans.append(
-            _span(
-                trace_id, span_id, f"agent {node}",
-                int(a.get("start_ms", 0)) * 1_000_000,
-                int(a.get("end_ms", 0)) * 1_000_000,
-                attrs,
-                ERROR if verdict in ("fail", "failure", "REQUEST_CHANGES") else OK,
-                parent=root_id,
-            )
-        )
-
-    if db_path and os.path.exists(db_path):
-        spans.extend(
-            _llm_call_spans(db_path, task_run_id, trace_id, agent_by_node, root_id)
-        )
-
-    return {
-        "resourceSpans": [
-            {
-                "resource": {"attributes": [_attr("service.name", "mini-ork")]},
-                "scopeSpans": [{"scope": {"name": "mini-ork"}, "spans": spans}],
-            }
-        ]
-    }
-
-
 def build_payload(db_path: str, task_run_id: str) -> dict:
     """Build an OTLP/JSON ExportTraceServiceRequest for one task_run."""
     con = connect_readonly(db_path)
@@ -288,20 +201,50 @@ def build_payload(db_path: str, task_run_id: str) -> dict:
     }
 
 
-def _deliver(payload: dict, dry_run: bool) -> bool:
+def _credentials(environment=None) -> tuple[str, str, str] | None:
+    """Resolve the Langfuse key pair through the vault chain.
+
+    Returns ``(public_key, secret_key, endpoint)`` only when both keys are
+    present. One key is a misconfiguration: fail closed and say so, without
+    ever echoing the value. No keys means export is simply off, silently.
+    """
+    try:
+        env = environment if environment is not None else vault_environment()
+        pk = env.resolve("LANGFUSE_PUBLIC_KEY")
+        sk = env.resolve("LANGFUSE_SECRET_KEY")
+        endpoint = env.resolve("LANGFUSE_OTLP_ENDPOINT") or DEFAULT_ENDPOINT
+    except Exception as exc:  # noqa: BLE001 — the class name is the whole report
+        print(
+            f"otel_export: vault unavailable — no export ({type(exc).__name__})",
+            file=sys.stderr,
+        )
+        return None
+    if not pk and not sk:
+        return None
+    if not pk or not sk:
+        print(
+            "otel_export: only one of LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY"
+            " is set — no export (set both, or neither)",
+            file=sys.stderr,
+        )
+        return None
+    return (pk, sk, endpoint)
+
+
+def _deliver(payload: dict, dry_run: bool, *, environment=None) -> bool:
     """Print (dry-run) or POST the payload. Returns True iff it was POSTed."""
     if dry_run:
         json.dump(payload, sys.stdout, indent=2)
         sys.stdout.write("\n")
         return False
 
-    pk = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
-    sk = os.environ.get("LANGFUSE_SECRET_KEY", "")
-    if not pk or not sk:
+    creds = _credentials(environment)
+    if creds is None:
+        # Legacy manual-CLI behaviour: nothing to send, say so and exit 0.
         print("otel_export: LANGFUSE_PUBLIC_KEY/SECRET_KEY unset — no-op", file=sys.stderr)
         return False
+    pk, sk, endpoint = creds
 
-    endpoint = os.environ.get("LANGFUSE_OTLP_ENDPOINT", DEFAULT_ENDPOINT)
     auth = base64.b64encode(f"{pk}:{sk}".encode()).decode()
     req = urllib.request.Request(
         endpoint,
@@ -327,29 +270,35 @@ def export(task_run_id: str, db_path: str, dry_run: bool = False) -> int:
     return 0
 
 
-def export_jsonl(jsonl_path: str, db_path: str | None, dry_run: bool = False) -> int:
-    """Flush a live run's span buffer. On a successful POST the buffer is
-    renamed to *.sent; on failure or no-op it stays for a later resync."""
-    payload = build_payload_from_jsonl(jsonl_path, db_path)
-    if _deliver(payload, dry_run):
-        try:
-            os.replace(jsonl_path, jsonl_path + ".sent")
-        except OSError:
-            pass
-    return 0
+def export_after_run(
+    task_run_id: str, db_path: str, *, environment=None
+) -> bool:
+    """Best-effort export of one finished run. Never raises.
+
+    Off unless both Langfuse keys resolve through the vault chain;
+    ``MO_OTEL_EXPORT=0`` opts out.
+    """
+    if os.environ.get("MO_OTEL_EXPORT") == "0":
+        return False
+    try:
+        if _credentials(environment) is None:
+            return False
+        payload = build_payload(db_path, task_run_id)
+        return _deliver(payload, False, environment=environment)
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 — telemetry is best-effort
+        print(
+            f"otel_export: export of {task_run_id} failed: {type(exc).__name__}",
+            file=sys.stderr,
+        )
+        return False
 
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="mini_ork.otel_export")
-    p.add_argument("task_run_id", nargs="?")
+    p.add_argument("task_run_id")
     p.add_argument("--db", default=os.environ.get("MINI_ORK_DB", ".mini-ork/state.db"))
-    p.add_argument("--from-jsonl", metavar="PATH", help="flush a live run's .otel-spans.jsonl buffer")
     p.add_argument("--dry-run", action="store_true")
     a = p.parse_args(argv)
-    if a.from_jsonl:
-        return export_jsonl(a.from_jsonl, a.db, dry_run=a.dry_run)
-    if not a.task_run_id:
-        p.error("task_run_id required unless --from-jsonl is given")
     return export(a.task_run_id, a.db, dry_run=a.dry_run)
 
 
