@@ -72,7 +72,14 @@ gates:
 critic:
   # Two critics, distinct model families, both exogenous to implement.lane
   # (checked at startup). A shared family, or fewer than two, is exit 2.
-  lanes: [glm_lens, opus_lens]
+  #
+  # These must match the lanes `recipes/rsi-critic/workflow.yaml` dispatches,
+  # and the *served* families must differ — an alias is not a family. A host's
+  # `agents.local.yaml` overlay can point two aliases at one model lane (this
+  # repo's own overlay maps `opus_lens` to glm), which passes this check and
+  # then fails G10 after the run. `rsi-cycle doctor` and the recipe's
+  # `panel-composition.json` both report which lane actually served.
+  lanes: [glm_lens, deepseek_lens]
   require_unanimous: true   # false is refused: a split quarantines, never majority-merges
   model_timeout_s: 900
 
@@ -80,7 +87,10 @@ implement:
   runtime_backend: local    # | bubblewrap | daytona | microsandbox
   child_timeout_s: 3600
   static_recipe_plan: true
-  lane: codex_lens          # the implementer; critics must not share its family
+  # The model lane the child implementer actually runs on — G10 refuses a critic
+  # in this family. `minimax` is the `implementer` alias in a stock home; if your
+  # overlay points that alias elsewhere, name the family it really reaches.
+  lane: minimax
 
 merge:
   # No origin -> quarantine, never a local commit on main. Checked at startup

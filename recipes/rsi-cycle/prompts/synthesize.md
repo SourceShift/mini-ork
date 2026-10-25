@@ -1,13 +1,13 @@
-Read the declared `brief` and `lens_panel` artifacts. The panel holds four
-independent answers to the same gap — impact, root cause, fix shape, oracle —
-reduced to anonymous ids L1..L4 so position carries no authority. The brief
+Read the declared `brief` and `lens_panel` artifacts. The panel holds three
+independent answers to the same gap — root cause, fix shape, oracle —
+reduced to anonymous ids L1..L3 so position carries no authority. The brief
 carries the hard constraints: repo root, the success command, the file limit.
 
 Produce ONE proposal. Your job is not to average the panel. It is to resolve it:
 
 - Where the panel agrees, take the agreement — but only if it is argued, not
-  restated. Four providers agreeing on "add the missing writer" is evidence;
-  four providers agreeing on "improve robustness" is not.
+  restated. Three providers agreeing on "add the missing writer" is evidence;
+  three providers agreeing on "improve robustness" is not.
 - Where the panel disagrees, decide and say why. A fix-shape that contradicts a
   root cause is the most important disagreement to resolve, because it means one
   of them is wrong about the mechanism.

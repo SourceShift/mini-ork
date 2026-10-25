@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Grade the panel that actually served, from `llm_calls`.
 
-The node declarations *ask* for four families. This node reports what answered:
+The node declarations *ask* for three families. This node reports what answered:
 a lane can fall back to another provider mid-run, and a panel that quietly
-became one family is exactly the failure the four-lane layout exists to avoid.
+became one family is exactly the failure the multi-family layout exists to avoid.
 
 Aliases are read back out of `llm_calls` for this run rather than passed in,
 because the alias the engine records is the one the check has to grade — passing

@@ -228,8 +228,17 @@ of one cycle sorts together and no run can write into the operator's own home.
 
 | Recipe | Stage | Artifact the cycle reads | Shape |
 |---|---|---|---|
-| `rsi-cycle` | SUGGEST | `proposal.json` (→ `mini_ork.rsi.select.Proposal`) | 4 lenses on 4 families, anonymised, one synthesis |
+| `rsi-cycle` | SUGGEST | `proposal.json` (→ `mini_ork.rsi.select.Proposal`) | 3 lenses on 3 families, anonymised, one synthesis |
 | `rsi-critic` | DECIDE | `critics.json` + `panel-composition.json` (→ G10) | 2 critics on 2 families, no synthesiser, no vote |
+
+Both lanes sets are chosen for what a stock home can actually reach:
+`glm_lens` (zai), `deepseek_lens` (deepseek), `minimax_lens` (minimax), with the
+implementer on `minimax`. **An alias is not a family.** A host's
+`agents.local.yaml` overlay can point `opus_lens` at the glm lane — the config's
+startup check still passes, because it resolves the *provider* lane, and then
+every cycle quarantines on G10 because both critics were served by one family.
+`panel-composition.json` records the lanes that actually answered; read it
+before blaming the critics.
 
 The machine brief travels by environment variable (`MO_RSI_SUGGEST_BRIEF`,
 `MO_RSI_CRITIC_BRIEF`), not as an artifact: the run directory does not exist yet

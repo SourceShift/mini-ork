@@ -57,7 +57,7 @@ FILE = "mini_ork/rsi/cycle.py"
 def _cfg(**overrides):
     raw = {
         "budget": {"daily_cap_usd": 50, "per_cycle_cap_usd": 20},
-        "critic": {"lanes": ["glm_lens", "opus_lens"]},
+        "critic": {"lanes": ["glm_lens", "deepseek_lens"]},
         "gates": {"pytest_paths": ["tests/unit/test_x.py"]},
         "decide": {"auto_merge": True},
     }
@@ -177,24 +177,39 @@ def test_the_task_class_names_are_globally_unique():
     assert {"rsi_cycle", "rsi_critic"} <= set(seen)
 
 
-def test_the_critics_are_two_families_neither_the_implementers():
+def _example_config():
+    from mini_ork.rsi.config import load_config
+
+    return load_config(REPO / "config" / "rsi-cycle.example.yaml", env={}, strict=True)
+
+
+def test_the_critics_are_the_config_lanes_two_families_neither_the_implementers():
+    """The recipe, the config and G10 must agree on who the critics are.
+
+    A recipe that dispatches lanes the config does not name makes `doctor`'s
+    family check grade a panel that never ran — and G10 then rejects the run
+    after it has been paid for.
+    """
+    cfg = _example_config()
     wf = yaml.safe_load(
         (REPO / "recipes" / "rsi-critic" / "workflow.yaml").read_text(encoding="utf-8"))
     lanes = [n["model_lane"] for n in wf["nodes"] if n["type"] == "researcher"]
-    assert len(lanes) == 2, lanes
+    assert sorted(lanes) == sorted(cfg.critic.lanes), (
+        f"recipe dispatches {lanes}, config names {list(cfg.critic.lanes)}")
     families = [lane_family(lane) for lane in lanes]
     assert "" not in families, lanes
     assert len(set(families)) == 2, families
-    assert lane_family("codex_lens") not in families, "a critic in the implementer's family is not exogenous"
+    assert lane_family(cfg.implement.lane) not in families, (
+        f"a critic in the implementer's family ({cfg.implement.lane}) is not exogenous")
 
 
-def test_the_suggest_workflow_runs_four_lenses_on_four_families():
+def test_the_suggest_workflow_runs_three_lenses_on_three_families():
     wf = yaml.safe_load(
         (REPO / "recipes" / "rsi-cycle" / "workflow.yaml").read_text(encoding="utf-8"))
     lenses = [n for n in wf["nodes"] if n["name"].startswith("lens_")]
-    assert len(lenses) == 4
+    assert len(lenses) == 3, [n["name"] for n in lenses]
     families = [lane_family(n["model_lane"]) for n in lenses]
-    assert len(set(families)) == 4, families
+    assert len(set(families)) == 3, families
 
 
 # --------------------------------------------------------------------------
@@ -334,15 +349,16 @@ def test_critic_merge_carries_every_verdict_and_refuses_an_abstention(tmp_path):
     (inputs / "verdicts" / "glm_lens.json").write_text(json.dumps({
         "approve": True, "blocking_findings": [], "confidence": 0.8, "why": "traced"}),
         encoding="utf-8")
-    (inputs / "verdicts" / "opus_lens.json").write_text(json.dumps({
+    (inputs / "verdicts" / "deepseek_lens.json").write_text(json.dumps({
         "approve": False, "blocking_findings": ["the test was deleted"]}),
         encoding="utf-8")
 
     out = _run("rsi-critic", "merge.py", run_dir=run_dir, input_dir=inputs, extra_env={})
     assert out.returncode == 0, out.stderr
     merged = json.loads((run_dir / "critics.json").read_text())
-    assert [c["alias"] for c in merged["critics"]] == ["glm_lens", "opus_lens"]
-    assert merged["critics"][1]["blocking_findings"] == ["the test was deleted"]
+    by_alias = {c["alias"]: c for c in merged["critics"]}
+    assert sorted(by_alias) == ["deepseek_lens", "glm_lens"]
+    assert by_alias["deepseek_lens"]["blocking_findings"] == ["the test was deleted"]
 
     (inputs / "verdicts" / "glm_lens.json").write_text(json.dumps({"approve": "no"}), encoding="utf-8")
     out = _run("rsi-critic", "merge.py", run_dir=run_dir, input_dir=inputs, extra_env={})
@@ -416,11 +432,11 @@ def test_default_critics_returns_nothing_without_the_recipe(tmp_path):
 def test_recipe_critics_returns_the_verdicts_and_the_served_panel(tmp_path, monkeypatch):
     cand = _cand()
     panel = {"ok": True, "problems": [], "served": {"glm_lens": "glm-4.6"},
-             "families": {"glm_lens": ["zai"], "opus_lens": ["anthropic"]}}
+             "families": {"glm_lens": ["zai"], "deepseek_lens": ["anthropic"]}}
     seen = _fake_run(monkeypatch, {
         "critics.json": {"critics": [
             {"alias": "glm_lens", "lane": "glm_lens", "approve": True, "blocking_findings": []},
-            {"alias": "opus_lens", "lane": "opus_lens", "approve": True, "blocking_findings": []},
+            {"alias": "deepseek_lens", "lane": "deepseek_lens", "approve": True, "blocking_findings": []},
         ], "count": 2},
         "panel-composition.json": panel,
     })
@@ -429,7 +445,7 @@ def test_recipe_critics_returns_the_verdicts_and_the_served_panel(tmp_path, monk
                              evaluate(GateEvidence()))
 
     assert isinstance(result, CriticsResult)
-    assert [v.alias for v in result] == ["glm_lens", "opus_lens"]
+    assert [v.alias for v in result] == ["glm_lens", "deepseek_lens"]
     assert all(v.approve for v in result)
     assert result.panel == panel
     assert seen["recipe"] == "rsi-critic"
@@ -477,7 +493,7 @@ def _gate(report, gate_id: str):
 
 def _approving() -> tuple[CriticVerdict, ...]:
     return (CriticVerdict("glm_lens", lane="glm_lens", approve=True),
-            CriticVerdict("opus_lens", lane="opus_lens", approve=True))
+            CriticVerdict("deepseek_lens", lane="deepseek_lens", approve=True))
 
 
 def test_a_panel_without_verdicts_is_not_attached():
@@ -499,7 +515,7 @@ def test_the_served_panel_travels_with_the_verdicts():
 
 
 def test_g10_fails_when_the_served_panel_has_problems():
-    panel = {"ok": False, "problems": ["same_family:glm_lens,opus_lens"]}
+    panel = {"ok": False, "problems": ["same_family:glm_lens,deepseek_lens"]}
     evidence = GateEvidence(critics=_approving(), implementer_family="codex_lens",
                             critic_panel=panel)
     result = _gate(evaluate(evidence), "G10")
@@ -516,7 +532,7 @@ def test_g10_passes_on_two_exogenous_approvals_and_an_ok_panel():
 
 def test_g10_rejects_a_split_panel():
     verdicts = (CriticVerdict("glm_lens", lane="glm_lens", approve=True),
-                CriticVerdict("opus_lens", lane="opus_lens", approve=False))
+                CriticVerdict("deepseek_lens", lane="deepseek_lens", approve=False))
     result = _gate(evaluate(GateEvidence(critics=verdicts,
                                          implementer_family="codex_lens")), "G10")
     assert not result.ok

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reduce four lens answers to an anonymous panel.
+"""Reduce three lens answers to an anonymous panel.
 
 Ordering is by content hash, not by filename, so the synthesiser cannot infer
 which lane said what from position. Filenames track lanes; hashes do not.

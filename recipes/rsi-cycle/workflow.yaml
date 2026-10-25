@@ -1,15 +1,19 @@
-# Four lenses, one synthesis. Why the shapes are what they are:
+# Three lenses, one synthesis. Why the shapes are what they are:
 #
-# * The four lens nodes sit on four *different* model families (minimax, moonshot,
-#   zai, anthropic). That is the same heterogeneity the judge panels use, applied
-#   to diagnosis rather than grading: a plan four providers agree on is much less
-#   likely to be one provider's idiom. The families are checked after the run by
-#   `panel_composition`, not assumed.
-# * The synthesiser is `codex_lens` — a fifth family, and the family that will
-#   implement the change (framework-edit's implementer). Exogeneity is *not*
-#   required here the way G10 requires it of critics: this stage is producing the
-#   plan, and a plan written in the implementer's idiom is more likely to land.
-#   The critics in `recipes/rsi-critic` are the ones kept exogenous.
+# * The three lens nodes sit on three *different* model families, and every lane
+#   is one a stock mini-ork home can actually reach: `minimax_lens` (minimax),
+#   `deepseek_lens` (deepseek), `glm_lens` (zai). That is the same heterogeneity
+#   the judge panels use, applied to diagnosis rather than grading: a plan three
+#   providers agree on is much less likely to be one provider's idiom.
+#   Three, not four: the alternatives on a stock home are either dead lanes or
+#   aliases whose `agents.yaml` overlay points them at one of these same three
+#   families, and `panel_composition` refuses a panel that only looks diverse.
+#   The families are checked after the run from `llm_calls`, not assumed.
+# * The synthesiser is `codex_lens`, the coding lane the implementer is configured
+#   as. Exogeneity is *not* required here the way G10 requires it of critics: this
+#   stage is producing the plan, and a plan written in the implementer's idiom is
+#   more likely to land. The critics in `recipes/rsi-critic` are the ones kept
+#   exogenous.
 # * Every lens and the synthesiser only see `brief.md` / `lens-panel.json`. The
 #   candidate's `source` (db:L10 vs probe:garden) and every lane name are stripped
 #   by `brief.py` and `anonymize.py`, so a lens cannot favour a gap because it came
@@ -31,17 +35,9 @@ nodes:
       - { name: brief, kind: markdown, path: brief.md }
       - { name: candidates, kind: json, path: candidates.json }
 
-  - name: lens_impact
-    type: researcher
-    model_lane: minimax_lens
-    prompt_ref: prompts/lens-impact.md
-    dispatch_mode: parallel
-    inputs: { brief: { required: true } }
-    outputs: [{ name: lens_impact, kind: json, path: lenses/impact.json }]
-
   - name: lens_root_cause
     type: researcher
-    model_lane: kimi_lens
+    model_lane: deepseek_lens
     prompt_ref: prompts/lens-root-cause.md
     dispatch_mode: parallel
     inputs: { brief: { required: true } }
@@ -57,7 +53,7 @@ nodes:
 
   - name: lens_oracle
     type: researcher
-    model_lane: opus_lens
+    model_lane: minimax_lens
     prompt_ref: prompts/lens-oracle.md
     dispatch_mode: parallel
     inputs: { brief: { required: true } }
@@ -99,11 +95,9 @@ nodes:
   - { name: rollback, type: rollback, prompt_ref: null, dispatch_mode: serial }
 
 edges:
-  - { from: brief_loader, to: lens_impact, edge_type: depends_on, from_output: brief, to_input: brief }
   - { from: brief_loader, to: lens_root_cause, edge_type: depends_on, from_output: brief, to_input: brief }
   - { from: brief_loader, to: lens_fix_shape, edge_type: depends_on, from_output: brief, to_input: brief }
   - { from: brief_loader, to: lens_oracle, edge_type: depends_on, from_output: brief, to_input: brief }
-  - { from: lens_impact, to: panel_anonymize, edge_type: depends_on, from_output: lens_impact, to_input: lenses }
   - { from: lens_root_cause, to: panel_anonymize, edge_type: depends_on, from_output: lens_root_cause, to_input: lenses }
   - { from: lens_fix_shape, to: panel_anonymize, edge_type: depends_on, from_output: lens_fix_shape, to_input: lenses }
   - { from: lens_oracle, to: panel_anonymize, edge_type: depends_on, from_output: lens_oracle, to_input: lenses }

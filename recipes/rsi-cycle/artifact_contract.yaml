@@ -15,9 +15,6 @@ outputs:
   - path: "${MINI_ORK_RUN_DIR}/candidates.json"
     mime: application/json
     description: The queued candidates around this one, for context only; the proposal must answer exactly one.
-  - path: "${MINI_ORK_RUN_DIR}/lenses/impact.json"
-    mime: application/json
-    description: What breaks if this gap stays open.
   - path: "${MINI_ORK_RUN_DIR}/lenses/root-cause.json"
     mime: application/json
     description: Why the code produces this evidence, anchored to real symbols.
@@ -29,7 +26,7 @@ outputs:
     description: How the fix will be proven — the command whose output must change.
   - path: "${MINI_ORK_RUN_DIR}/lens-panel.json"
     mime: application/json
-    description: The four lens answers, anonymised and reduced to L1..L4 before synthesis.
+    description: The three lens answers, anonymised and reduced to L1..L3 before synthesis.
   - path: "${MINI_ORK_RUN_DIR}/suggestion.json"
     mime: application/json
     description: One synthesised proposal resolving the lenses' disagreements.

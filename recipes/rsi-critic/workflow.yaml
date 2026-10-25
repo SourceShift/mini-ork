@@ -1,11 +1,13 @@
 # Two critics, two families, neither the implementer's.
 #
 # The cycle's G10 refuses a verdict set whose families collapse or that shares
-# the implementer's family (codex_lens). This workflow is where that is honoured
-# in practice: `glm_lens` (zai) and `opus_lens` (anthropic). The post-run
+# the implementer's family. This workflow is where that is honoured in practice:
+# `glm_lens` (zai) and `deepseek_lens` (deepseek), while the implementer runs
+# minimax (`implement.lane` in the example config). The post-run
 # `panel_composition` node checks the lanes that actually served, because a lane
-# can fall back mid-run and a panel that quietly became one family is exactly
-# the failure this recipe exists to prevent.
+# can fall back mid-run — and this host's own `agents.local.yaml` is proof that
+# an alias is not a family: it maps `opus_lens` to the glm lane, so a panel
+# declared as glm+opus would run as glm+glm and G10 would quarantine every cycle.
 #
 # There is no synthesiser. A majority vote on a self-improvement diff is a way to
 # merge something neither critic approved; the answer is unanimity or quarantine.
@@ -31,13 +33,13 @@ nodes:
     inputs: { critic_brief: { required: true } }
     outputs: [{ name: verdict_glm, kind: json, path: critics/glm_lens.json }]
 
-  - name: critic_opus
+  - name: critic_deepseek
     type: researcher
-    model_lane: opus_lens
+    model_lane: deepseek_lens
     prompt_ref: prompts/critique.md
     dispatch_mode: parallel
     inputs: { critic_brief: { required: true } }
-    outputs: [{ name: verdict_opus, kind: json, path: critics/opus_lens.json }]
+    outputs: [{ name: verdict_deepseek, kind: json, path: critics/deepseek_lens.json }]
 
   - name: verdict_merge
     type: verifier
@@ -57,9 +59,9 @@ nodes:
 
 edges:
   - { from: brief_loader, to: critic_glm, edge_type: depends_on, from_output: critic_brief, to_input: critic_brief }
-  - { from: brief_loader, to: critic_opus, edge_type: depends_on, from_output: critic_brief, to_input: critic_brief }
+  - { from: brief_loader, to: critic_deepseek, edge_type: depends_on, from_output: critic_brief, to_input: critic_brief }
   - { from: critic_glm, to: verdict_merge, edge_type: depends_on, from_output: verdict_glm, to_input: verdicts }
-  - { from: critic_opus, to: verdict_merge, edge_type: depends_on, from_output: verdict_opus, to_input: verdicts }
+  - { from: critic_deepseek, to: verdict_merge, edge_type: depends_on, from_output: verdict_deepseek, to_input: verdicts }
   - { from: verdict_merge, to: panel_composition, edge_type: depends_on, from_output: critics, to_input: critics }
   - { from: brief_loader, to: rollback, edge_type: escalates_to, condition: fail }
   - { from: verdict_merge, to: rollback, edge_type: escalates_to, condition: fail }
