@@ -80,8 +80,8 @@ All paths are relative to the repository root.
 - `schemas/workflow.schema.json`
 - `mini_ork/cli/validate.py`
 - `recipes/session-task-judge/workflow.yaml`
-- `recipes/bug-audit-cmgk/task_class.yaml`, `workflow.yaml`, `artifact_contract.yaml`
-- `recipes/feature-inventory-cmgk/task_class.yaml`, `workflow.yaml`, `artifact_contract.yaml`
+- `recipes/bug-audit-cmgk/task_class.yaml`, `recipes/bug-audit-cmgk/workflow.yaml`, `recipes/bug-audit-cmgk/artifact_contract.yaml`
+- `recipes/feature-inventory-cmgk/task_class.yaml`, `recipes/feature-inventory-cmgk/workflow.yaml`, `recipes/feature-inventory-cmgk/artifact_contract.yaml`
 - `recipes/bug-audit-fe-be/artifact_contract.yaml`
 - `tests/unit/test_eco6_k3_recipe_schema.py` (new)
 
