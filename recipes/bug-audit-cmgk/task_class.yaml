@@ -1,28 +1,15 @@
-name: refactor_audit
+name: bug_audit_cmgk
 version: "0.1.0"
 description: >
-  Multi-lens audit of a codebase for scalability, security, performance,
-  or architectural-shape concerns. Produces a ranked findings synthesis
-  with one report per lens.
+  Four-family (codex/minimax/glm/kimi) bug audit of a codebase; ranked bug
+  findings, report only.
 
 # Canonical matcher shape (matches schemas/task_class.schema.json).
 matches:
   keywords:
-    - audit
-    - refactor audit
-    - refactor-audit
-    - provider roster
-    - refactor
-    - scalability
-    - bottleneck
-    - tech debt
-    - architecture review
-    - code review
-    - scaling
-    - performance audit
-    - security audit
-    - review codebase
-    - review repo
+    - bug audit cmgk
+    - cmgk bug audit
+    - four-family bug audit
   regex: []
 
 artifact_contract_ref: artifact_contract.yaml

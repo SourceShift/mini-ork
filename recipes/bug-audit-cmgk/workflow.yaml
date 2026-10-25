@@ -1,5 +1,5 @@
 version: "0.1.0"
-task_class: refactor_audit
+task_class: bug_audit_cmgk
 description: >
   Multi-model audit recipe — 4 lens stances run in parallel
   (glm/kimi/codex/opus) with opus AS ARCHITECTURAL LENS,

@@ -1,28 +1,15 @@
-name: refactor_audit
+name: feature_inventory_cmgk
 version: "0.1.0"
 description: >
-  Multi-lens audit of a codebase for scalability, security, performance,
-  or architectural-shape concerns. Produces a ranked findings synthesis
-  with one report per lens.
+  Four-family inventory of the features a codebase ships, with code
+  anchors; report only.
 
 # Canonical matcher shape (matches schemas/task_class.schema.json).
 matches:
   keywords:
-    - audit
-    - refactor audit
-    - refactor-audit
-    - provider roster
-    - refactor
-    - scalability
-    - bottleneck
-    - tech debt
-    - architecture review
-    - code review
-    - scaling
-    - performance audit
-    - security audit
-    - review codebase
-    - review repo
+    - feature inventory
+    - feature inventory cmgk
+    - inventory features
   regex: []
 
 artifact_contract_ref: artifact_contract.yaml

@@ -327,6 +327,11 @@
           "type": "boolean",
           "default": false,
           "description": "Marks a bounded recursive control edge excluded from DAG readiness ordering."
+        },
+        "max_rounds": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "retries edges only: maximum revise rounds this edge may fire (compiler default 2)"
         }
       }
     }

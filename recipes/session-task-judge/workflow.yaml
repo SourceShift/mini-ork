@@ -9,8 +9,8 @@
 # synthesis is mechanical reconciliation, not a fourth vote, and keeping it
 # off the three judge families preserves "three families judged, one
 # composed" as a readable property of the panel.
-version: 1
-name: session-task-judge
+version: "1"
+task_class: session_task_judge
 
 nodes:
   - { name: minimax_judge, type: researcher, model_lane: minimax_lens, prompt_ref: prompts/minimax-judge.md, dispatch_mode: parallel, gates: [budget_gate] }

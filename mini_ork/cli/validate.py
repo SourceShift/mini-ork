@@ -127,6 +127,75 @@ def _check_kickoff(kickoff: str, findings: Findings) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Check 1b — task-class uniqueness + recipe-declaration consistency.
+# ─────────────────────────────────────────────────────────────────────────────
+def _check_task_class_names(root: str, findings: Findings,
+                            *, check_duplicates: bool = True) -> None:
+    """Error on task classes declared by more than one recipe; warn on drift.
+
+    ``check_duplicates`` is False when ``main`` was given an explicit
+    ``--recipe``: the duplicate scan is a whole-tree property, while a
+    single-recipe validate must not fail on unrelated sibling recipes (the
+    hermetic fixtures reuse one class name). Mismatch warnings are always
+    scoped to each recipe and therefore always run.
+    """
+    import yaml
+
+    recipes_dir = os.path.join(root, "recipes")
+    if not os.path.isdir(recipes_dir):
+        return
+
+    declared: dict[str, list[str]] = {}
+    per_recipe: dict[str, tuple[str, str]] = {}
+    for entry in sorted(os.listdir(recipes_dir)):
+        recipe_dir = os.path.join(recipes_dir, entry)
+        if not os.path.isdir(recipe_dir):
+            continue
+        tc = os.path.join(recipe_dir, "task_class.yaml")
+        if not os.path.isfile(tc):
+            continue  # recipes without a task class are out of scope
+        try:
+            with open(tc) as f:
+                data = yaml.safe_load(f) or {}
+        except Exception:
+            continue  # invalid YAML is reported by the recipe's own checks
+        name = data.get("name") if isinstance(data, dict) else None
+        if not isinstance(name, str) or not name.strip():
+            continue
+        declared.setdefault(name, []).append(entry)
+        per_recipe[entry] = (name, tc)
+
+    if check_duplicates:
+        for name, recipes in sorted(declared.items()):
+            if len(recipes) > 1:
+                findings.error(
+                    f"task class '{name}' is declared by {len(recipes)} "
+                    f"recipes: {', '.join(sorted(recipes))}",
+                    "give each recipe a distinct name in its task_class.yaml",
+                )
+
+    for recipe, (name, _tc) in sorted(per_recipe.items()):
+        for manifest in ("workflow.yaml", "artifact_contract.yaml"):
+            path = os.path.join(recipes_dir, recipe, manifest)
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path) as f:
+                    doc = yaml.safe_load(f) or {}
+            except Exception:
+                continue
+            declared_class = (doc.get("task_class")
+                              if isinstance(doc, dict) else None)
+            if declared_class is None or declared_class == name:
+                continue
+            findings.warn(
+                f"recipe {recipe} {manifest} declares task_class "
+                f"'{declared_class}' but task_class.yaml name is '{name}'",
+                f"set task_class: {name} in {path}",
+            )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Check 2 — recipe manifest schema checks + output-path collision guard.
 # ─────────────────────────────────────────────────────────────────────────────
 def _valid_yaml(path: str) -> bool:
@@ -137,6 +206,64 @@ def _valid_yaml(path: str) -> bool:
         return True
     except Exception:
         return False
+
+
+_WORKFLOW_SCHEMA_REL = os.path.join("schemas", "workflow.schema.json")
+_SCHEMA_ERROR_CAP = 5
+
+
+def _check_workflow_schema(root: str, recipe: str, wf: str,
+                           findings: Findings) -> None:
+    """Validate ``workflow.yaml`` against the engine's workflow schema.
+
+    The schema is resolved from ``MINI_ORK_ROOT`` rather than the installed
+    package: a hermetic tmp root that ships no ``schemas/`` cannot be schema
+    checked, and skipping there keeps fixture-only roots (whose minimal
+    workflows predate this check) valid instead of reporting them as broken.
+    """
+    schema_path = os.path.join(root, _WORKFLOW_SCHEMA_REL)
+    if not os.path.isfile(schema_path):
+        return
+    try:
+        import jsonschema  # noqa: F401 - presence is the point
+        from jsonschema.validators import validator_for
+    except ImportError:
+        findings.warn(
+            f"recipe {recipe} workflow schema check skipped: jsonschema is not importable",
+            "install jsonschema (a declared dependency) to enable workflow "
+            "schema validation",
+        )
+        return
+    try:
+        import json
+
+        import yaml
+        with open(schema_path) as f:
+            schema = json.load(f)
+        with open(wf) as f:
+            document = yaml.safe_load(f)
+        # Match the schema's declared draft (2020-12) rather than assuming it.
+        validator = validator_for(schema)(schema)
+        errors = list(validator.iter_errors(document))
+    except Exception as exc:  # malformed schema or unreadable file
+        findings.warn(
+            f"recipe {recipe} workflow schema check skipped: {exc}",
+            f"fix {schema_path}",
+        )
+        return
+    for error in errors[:_SCHEMA_ERROR_CAP]:
+        path = "/".join(str(part) for part in error.absolute_path) or "<root>"
+        findings.error(
+            f"recipe {recipe} workflow.yaml violates the schema at {path}: "
+            f"{error.message}",
+            f"fix {wf} or schemas/workflow.schema.json",
+        )
+    if len(errors) > _SCHEMA_ERROR_CAP:
+        findings.error(
+            f"recipe {recipe} workflow.yaml has "
+            f"{len(errors) - _SCHEMA_ERROR_CAP} more schema error(s)",
+            f"fix {wf} or schemas/workflow.schema.json",
+        )
 
 
 def _contract_outputs(ac: str) -> list[str]:
@@ -296,6 +423,9 @@ def _check_recipe(root: str, recipe: str, findings: Findings) -> None:
         # no-op: the early handler drops the node's prompt/lane/outputs, so the
         # loop can never produce the artifact it re-reads. Warn pre-run.
         _check_repair_loop_nodes(wf, recipe, findings)
+        # The workflow schema is the contract the compiler reads; checking it
+        # pre-run is what makes later schema removals enforceable.
+        _check_workflow_schema(root, recipe, wf, findings)
 
     # artifact_contract.yaml: output-path collision guard
     ac = os.path.join(recipe_dir, "artifact_contract.yaml")
@@ -492,6 +622,7 @@ def main(argv: list[str] | None = None) -> int:
 
     kickoff = ""
     recipe = ""
+    recipe_explicit = False
     strict = False
     i = 0
     while i < len(argv):
@@ -508,6 +639,7 @@ def main(argv: list[str] | None = None) -> int:
                 sys.stderr.write(HELP_TEXT)
                 return 2
             recipe = argv[i + 1]
+            recipe_explicit = True
             i += 2
         elif arg.startswith("-"):
             sys.stderr.write(f"Unknown flag: {arg}\n")
@@ -533,6 +665,10 @@ def main(argv: list[str] | None = None) -> int:
 
     findings = Findings()
     _check_kickoff(kickoff, findings)
+    # Runs on every invocation, after the kickoff checks. The duplicate-class
+    # scan is repo-wide; an explicit --recipe scopes validate to one recipe and
+    # must not fail on unrelated siblings (see _check_task_class_names).
+    _check_task_class_names(root, findings, check_duplicates=not recipe_explicit)
     if recipe:
         _check_recipe(root, recipe, findings)
     _check_agents_yaml(root, home, findings)

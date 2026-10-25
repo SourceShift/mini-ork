@@ -1,4 +1,4 @@
-task_class: refactor_audit
+task_class: bug_audit_cmgk
 expected_artifact: composite     # 4 lens reports + 1 synthesis markdown
 success_verifiers:
   - verifiers/lens-completeness.py
