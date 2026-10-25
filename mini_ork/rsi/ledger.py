@@ -326,30 +326,38 @@ def set_candidate_status(
     con.commit()
 
 
-def reconcile(con: sqlite3.Connection, observed: Iterable[str], *, now: int) -> int:
+def reconcile(con: sqlite3.Connection, observed: Iterable[str], *,
+              now: int, blind_sources: Iterable[str] = ()) -> int:
     """Mark open candidates the harvest did not reproduce as ``fixed_externally``.
 
     Returns the number of rows closed. A candidate can disappear because the gap
     was fixed by a cycle elsewhere, by a human, or because the probe that
     produced it changed shape — all three mean "stop queueing it and say so",
     which is why the reason names the harvest rather than a cause it cannot see.
+
+    ``blind_sources`` names the producers that could **not** look this time
+    (``db:V8`` for a rule whose table is absent, ``probe:tests`` for one that
+    errored). Absence from a blind producer is not evidence of absence, so its
+    candidates stay open. Only they are protected — a board-wide veto would let
+    one permanently-unreadable rule freeze reconciliation forever, which is what
+    a home missing a single old table would otherwise get.
     """
     ids = sorted({str(i) for i in observed})
+    blind = sorted({str(s) for s in blind_sources})
+    where = ["status = 'open'"]
+    params: list[Any] = [int(now)]
     if ids:
-        placeholders = ",".join("?" for _ in ids)
-        cursor = con.execute(
-            "UPDATE rsi_candidates SET status = 'fixed_externally',"
-            " outcome_reason = 'not reproduced by harvest', updated_at = ?"
-            f" WHERE status = 'open' AND candidate_id NOT IN ({placeholders})",
-            [int(now), *ids],
-        )
-    else:
-        cursor = con.execute(
-            "UPDATE rsi_candidates SET status = 'fixed_externally',"
-            " outcome_reason = 'not reproduced by harvest', updated_at = ?"
-            " WHERE status = 'open'",
-            (int(now),),
-        )
+        where.append(f"candidate_id NOT IN ({','.join('?' for _ in ids)})")
+        params.extend(ids)
+    if blind:
+        where.append(f"source NOT IN ({','.join('?' for _ in blind)})")
+        params.extend(blind)
+    cursor = con.execute(
+        "UPDATE rsi_candidates SET status = 'fixed_externally',"
+        " outcome_reason = 'not reproduced by harvest', updated_at = ?"
+        f" WHERE {' AND '.join(where)}",
+        params,
+    )
     con.commit()
     return cursor.rowcount or 0
 

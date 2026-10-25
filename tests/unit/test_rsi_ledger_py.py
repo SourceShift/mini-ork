@@ -198,6 +198,23 @@ def test_reconcile_closes_unreproduced_open_candidates_only(db):
     assert L.get_candidate(db, merged.candidate_id)["status"] == "merged"
 
 
+def test_reconcile_leaves_blind_sources_open(db):
+    """A producer that could not look cannot testify that its gap is gone."""
+    seen = _cand(evidence_key="table:a:empty", source="db:V1")
+    blind = _cand(evidence_key="table:b:empty", source="db:L7")
+    other = _cand(evidence_key="table:c:empty", source="db:L1")
+    for cand in (seen, blind, other):
+        L.upsert_candidate(db, cand, now=NOW)
+
+    closed = L.reconcile(db, [seen.candidate_id], now=NOW + 60,
+                         blind_sources=["db:L7"])
+
+    assert closed == 1
+    assert L.get_candidate(db, seen.candidate_id)["status"] == "open"
+    assert L.get_candidate(db, blind.candidate_id)["status"] == "open"
+    assert L.get_candidate(db, other.candidate_id)["status"] == "fixed_externally"
+
+
 def test_reconcile_with_empty_harvest_closes_every_open_candidate(db):
     for key in ("a", "b"):
         L.upsert_candidate(db, _cand(evidence_key=f"table:{key}:empty"), now=NOW)

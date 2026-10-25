@@ -110,10 +110,11 @@ def _cand(**overrides) -> Candidate:
 
 def _report(cand: Candidate | None = None, *, ok: bool = True,
             skipped: tuple[str, ...] = (),
-            closed: tuple[str, ...] = ()) -> HarvestReport:
+            closed: tuple[str, ...] = (),
+            probes: tuple[ProbeResult, ...] = ()) -> HarvestReport:
     return HarvestReport(
         candidates=() if cand is None else (cand,),
-        probes=(),
+        probes=probes,
         harvest_ok=ok,
         skipped=skipped,
         closed=closed,
@@ -625,15 +626,48 @@ def test_a_repeated_candidate_increments_times_seen(world):
     assert row["times_seen"] >= 2
 
 
-def test_a_skipped_rule_does_not_reconcile_other_candidates(world):
-    """A gap a DB cannot measure is not a gap that was fixed."""
-    h = Harness(world)
+def test_a_skipped_rule_protects_its_own_candidates(world):
+    """A gap a DB rule cannot measure is not a gap that was fixed."""
+    h = Harness(world, _cand(source="db:L7"))
+    h.runtime.propose = lambda req, cand: None  # leaves the row open
     h.run(cycle_id="rsi-ctest-1")
-    # The second harvest cannot run one rule (missing table) and reports nothing.
+    assert _candidate_row(world.db)["status"] == "open"
+
+    # The second harvest cannot run L7 (its table is absent) and reports nothing.
     h.runtime.harvest = lambda req, con, now, probes: _report(None, skipped=("L7",))
     h.run(cycle_id="rsi-ctest-2")
-    assert _candidate_row(world.db)["status"] == "merged", (
-        "reconcile must not mark a candidate fixed_externally when a rule was skipped")
+    assert _candidate_row(world.db)["status"] == "open", (
+        "reconcile must not mark an L7 candidate fixed_externally while L7 is blind")
+
+
+def test_a_skipped_rule_does_not_veto_another_rules_candidates(world):
+    """One unreadable rule must not freeze reconciliation for the whole board.
+
+    A home missing a single legacy table would otherwise be stuck forever: every
+    harvest skips that rule, and no candidate from any other source could ever
+    reach ``fixed_externally``.
+    """
+    h = Harness(world)  # candidate source is db:V1
+    h.runtime.propose = lambda req, cand: None
+    h.run(cycle_id="rsi-ctest-1")
+    assert _candidate_row(world.db)["status"] == "open"
+
+    h.runtime.harvest = lambda req, con, now, probes: _report(None, skipped=("L7",))
+    h.run(cycle_id="rsi-ctest-2")
+    assert _candidate_row(world.db)["status"] == "fixed_externally"
+
+
+def test_an_errored_probe_protects_its_own_candidates(world):
+    """A probe that did not reach a verdict carries no evidence either way."""
+    h = Harness(world, _cand(source="probe:tests", success_command="probe:tests"))
+    h.runtime.propose = lambda req, cand: None
+    h.run(cycle_id="rsi-ctest-1")
+    assert _candidate_row(world.db)["status"] == "open"
+
+    h.runtime.harvest = lambda req, con, now, probes: _report(
+        None, probes=(ProbeResult("tests", "pytest", "error", 1, 1),))
+    h.run(cycle_id="rsi-ctest-2")
+    assert _candidate_row(world.db)["status"] == "open"
 
 
 def test_a_full_harvest_marks_a_vanished_candidate_fixed_externally(world):

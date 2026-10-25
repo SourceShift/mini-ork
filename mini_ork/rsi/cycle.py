@@ -39,6 +39,7 @@ from . import learn, ledger
 from .candidates import Candidate
 from .config import CycleConfig
 from .gates import CriticVerdict, GateEvidence, ValidationReport, evaluate
+from .harvest import HarvestReport
 from .probes import ProbeResult
 from .queue import QueueConfig, QueuePlan, build_queue
 from .select import (
@@ -331,21 +332,22 @@ def _body(req: CycleRequest, rt: Runtime, con, *, token: str, spend: float) -> C
                        halt_reason="harvest_incomplete",
                        detail="harvest did not complete: " + ", ".join(report.errors))
 
-    # Reconciling "what we did not see" only means something when every rule
-    # *could* answer. ``skipped`` is now exactly that set: a rule whose table is
-    # absent. A rule that ran and found its defect gone lands in ``closed``, not
-    # here — before 2026-10-25 the two shared one list (``_GapClosed`` subclasses
-    # ``_SkipRule``), so the first closed gap froze reconciliation for every
-    # candidate on the board and nothing was ever marked ``fixed_externally``.
+    # Reconciling "what we did not see" only means something for the producers
+    # that could actually look. ``skipped`` is exactly the blind rules (a table
+    # is absent) and an errored probe is a blind probe; their candidates stay
+    # open whatever this harvest found. Before 2026-10-25 the veto was board-wide
+    # — one unreadable rule froze reconciliation for everything, so nothing was
+    # ever marked ``fixed_externally``.
     if not req.dry_run:
         _upsert(con, req, report, rt.clock())
-        if report.harvest_ok and not report.skipped:
+        if report.harvest_ok:
             # ``reconcile`` keeps the *ids* it was told about; any other open row
             # is closed. Passing signatures here would match nothing (ids carry
             # the ``rsi-`` prefix), so every gap would be marked
             # ``fixed_externally`` on the cycle that first saw it.
             ledger.reconcile(con, [c.candidate_id for c in report.candidates],
-                             now=rt.clock())
+                             now=rt.clock(),
+                             blind_sources=_blind_sources(report))
 
     # --- QUEUE -------------------------------------------------------------
     plan = _build_queue(req, con, report, rt.clock())
@@ -1339,6 +1341,19 @@ def _freeze_db(req: CycleRequest) -> Path | None:
     except (OSError, sqlite3.Error):
         return None
     return target
+
+
+def _blind_sources(report: HarvestReport) -> list[str]:
+    """The ``source`` values whose absence this harvest cannot be read as a fix.
+
+    A skipped DB rule names itself as ``db:<RULE>``; a probe that did not run to
+    a verdict names ``probe:<id>``. Everything else (a probed rule, an AST rule,
+    a rule that answered "closed") observed its subject and may be trusted.
+    """
+    blind = [f"db:{rule}" for rule in report.skipped]
+    blind += [f"probe:{probe.probe_id}" for probe in report.probes
+              if probe.status not in ("ok", "findings")]
+    return blind
 
 
 def _measured_db(req: CycleRequest) -> Path:
