@@ -15,12 +15,12 @@ nodes:
   # detectors (Rajan 2025), so the union of their gap lists covers each
   # single model's consistent blind spot. Opus doubles as the synthesizer
   # (strongest reasoner for the merge), but decorrelation lives at the lens tier.
-  - { name: glm_lens,          type: researcher, model_lane: glm_lens,     prompt_ref: prompts/lens-glm.md,     dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: minimax_lens,      type: researcher, model_lane: minimax_lens, prompt_ref: prompts/lens-minimax.md, dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: opus_lens,         type: researcher, model_lane: opus_lens,    prompt_ref: prompts/lens-opus.md,    dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: synthesizer,       type: reviewer,   model_lane: reviewer,     prompt_ref: prompts/synthesis.md,    dispatch_mode: serial,   gates: [budget_gate] }
+  - { name: glm_lens,          type: researcher, model_lane: glm_lens,     prompt_ref: prompts/lens-glm.md,     dispatch_mode: parallel }
+  - { name: minimax_lens,      type: researcher, model_lane: minimax_lens, prompt_ref: prompts/lens-minimax.md, dispatch_mode: parallel }
+  - { name: opus_lens,         type: researcher, model_lane: opus_lens,    prompt_ref: prompts/lens-opus.md,    dispatch_mode: parallel }
+  - { name: synthesizer,       type: reviewer,   model_lane: reviewer,     prompt_ref: prompts/synthesis.md,    dispatch_mode: serial }
   - { name: lens_completeness, type: verifier,   verifier_ref: verifiers/lens-completeness.py, dispatch_mode: serial }
-  - { name: publisher,         type: publisher,  prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
+  - { name: publisher,         type: publisher,  prompt_ref: null, dispatch_mode: serial }
   - { name: rollback,          type: rollback,   prompt_ref: null, dispatch_mode: serial }
 
 edges:

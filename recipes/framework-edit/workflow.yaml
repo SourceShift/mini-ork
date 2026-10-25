@@ -19,14 +19,12 @@ nodes:
     model_lane: minimax_lens
     prompt_ref: prompts/code-impact-lens.md
     dispatch_mode: parallel
-    gates: [budget_gate]
 
   - name: prior_art_lens
     type: researcher
     model_lane: codex_lens
     prompt_ref: prompts/prior-art-lens.md
     dispatch_mode: parallel
-    gates: [budget_gate]
 
   # Blind spec tests: a second model (GLM, not the implementer's DeepSeek)
   # writes pytest files from the KICKOFF alone, before any implementation
@@ -43,7 +41,6 @@ nodes:
     model_lane: codex_lens
     prompt_ref: prompts/implementer.md
     dispatch_mode: serial
-    gates: [scope_gate, budget_gate]
 
   - name: static_check_verifier
     type: verifier
@@ -82,7 +79,6 @@ nodes:
     model_lane: opus_lens
     prompt_ref: prompts/reviewer.md
     dispatch_mode: serial
-    gates: [budget_gate]
 
   - name: publisher
     type: publisher

@@ -99,7 +99,6 @@ class Node:
     finish: str = ""
     cost: float = 0.0
     calls: int = 0
-    gates: list[str] = field(default_factory=list)
     prompt: str = ""
     in_workflow: bool = True
 
@@ -387,11 +386,9 @@ def _load(home: Path, run_id: str, *, with_files: bool = True) -> Run | None:
     nodes: dict[str, Node] = {}
     for n in wf_nodes:
         name = str(n["name"])
-        gates = n.get("gates") if isinstance(n.get("gates"), list) else []
         prompt = n.get("prompt_ref") or n.get("verifier_ref") or ""
         nodes[name] = Node(id=name, type=str(n.get("type") or ""),
                            role_lane=str(n.get("model_lane") or ""),
-                           gates=[str(g) for g in gates],
                            prompt=f"{recipe_dir.name}/{prompt}" if prompt and recipe_dir else "")
     steps = card.get("steps") or []
     for s in steps:
@@ -1463,11 +1460,11 @@ def _graph(run: Run, wanted: str | None = None) -> dict[str, Any]:
             node_dict = S.dag_node(n.id, n.id, n.family, n.state, cost=cost,
                                    selected=sel is not None and n.id == sel.id,
                                    do=S.set_args(node=n.id))
-            # ``node.py``'s stream view reads ``role``/``dur``/``gates`` off
-            # the same dict the IDE draws from — augment in place rather
-            # than editing ``spec.dag_node``'s positional signature (the
-            # additive spec.py change was rejected to keep the diff inside
-            # the kickoff's 4-file scope).
+            # ``node.py``'s stream view reads ``role``/``dur`` off the same
+            # dict the IDE draws from — augment in place rather than editing
+            # ``spec.dag_node``'s positional signature (the additive spec.py
+            # change was rejected to keep the diff inside the kickoff's
+            # 4-file scope).
             #
             # A deterministic node ran on no model, so ``role_lane`` — the lane
             # agents.yaml *declares* for its role — names nothing that served
@@ -1479,7 +1476,6 @@ def _graph(run: Run, wanted: str | None = None) -> dict[str, Any]:
             node_dict["role"] = "" if n.family == "shell" else n.role_lane
             node_dict["stage_lane"] = n.role_lane
             node_dict["dur"] = _wall(n)
-            node_dict["gates"] = ", ".join(n.gates) or "—"
             # The kickoff: only a node that failed or is blocked gets a
             # reason, and only when a source actually has text.
             if state_of(n) == "failed" or n.id in holding:
@@ -1641,7 +1637,6 @@ def _dag_tab(run: Run, wanted: str | None, *, select: bool = False,
             ("Duration", _wall(node)),
             ("Tokens", by_key["Tokens"]["v"], by_key["Tokens"]["c"]),
             ("Skills", by_key["Skills"]["v"], by_key["Skills"]["c"]),
-            ("Gates", by_key["Gates"]["v"], by_key["Gates"]["c"]),
         ]
         if node.finish and node.finish != "done":
             facts.append(("Finish", node.finish, "red" if node.state == "failed" else "text"))
@@ -1776,7 +1771,6 @@ def _dag_tab(run: Run, wanted: str | None, *, select: bool = False,
              if sel.role_lane and sel.role_lane != sel.family and sel.family != "shell"
              else sel.family, f"fam:{sel.family}"),
             ("Provider", provider),
-            ("Gates", ", ".join(sel.gates) or "—"),
             ("Cost", S.money(sel.cost) + (f" · {sel.calls} call{'s' if sel.calls != 1 else ''}" if sel.calls else "")),
             ("Wall time", _wall(sel)),
         ]
@@ -2284,8 +2278,7 @@ def _roster_section(run: Run, *, tokens: bool = False) -> dict[str, Any]:
         if tokens:
             counted = _node_tokens(n, run) if ran else None
             cells.append(S.mono(f"{counted:,}" if counted is not None else "—"))
-        cells.extend([S.mono(_wall(n) if ran else "—"),
-                      S.muted(", ".join(n.gates) or "—")])
+        cells.append(S.mono(_wall(n) if ran else "—"))
         if fallback:
             cells.append(S.muted("⇄"))
             fell_back.append((n.id, f"{models[0]} → {models[-1]}", failed, failed_then))
@@ -2297,8 +2290,8 @@ def _roster_section(run: Run, *, tokens: bool = False) -> dict[str, Any]:
     if tokens:
         head.append("tokens")
         widths.append(S.col(90))
-    head.extend(["time", "gates"])
-    widths.extend([S.col(64), S.col(fr=1, min=140)])
+    head.append("time")
+    widths.append(S.col(64))
     if not rows:
         rows = [[S.muted("No nodes recorded")] + ["" for _ in head[1:]]]
     note = _ROSTER_NOTE

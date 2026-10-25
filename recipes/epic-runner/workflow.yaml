@@ -19,14 +19,12 @@ nodes:
     model_lane: codex_lens
     prompt_ref: prompts/epic-dispatcher.md
     dispatch_mode: serial
-    gates: [budget_gate, scope_gate]
 
   - name: wave_aggregator
     type: implementer
     model_lane: minimax_lens
     prompt_ref: prompts/wave-aggregator.md
     dispatch_mode: serial
-    gates: [budget_gate]
 
   - name: epic_verifier
     type: verifier
@@ -40,7 +38,6 @@ nodes:
     model_lane: opus_lens
     prompt_ref: prompts/final-reviewer.md
     dispatch_mode: serial
-    gates: [budget_gate]
 
   - name: publisher
     type: publisher

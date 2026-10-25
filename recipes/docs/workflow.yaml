@@ -14,8 +14,6 @@ nodes:
     model_lane: worker
     prompt_ref: prompts/doc-editor.md
     dispatch_mode: serial
-    gates:
-      - scope_gate
 
   - name: grep_assert
     type: verifier

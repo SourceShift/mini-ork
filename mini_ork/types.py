@@ -30,7 +30,6 @@ class NodeSpec:
     prompt_ref: str | None = None
     verifier_ref: str | None = None
     dispatch_mode: DispatchMode = "serial"
-    gates: tuple[str, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -43,8 +42,6 @@ class NodeSpec:
             value = getattr(self, key)
             if value:
                 data[key] = value
-        if self.gates:
-            data["gates"] = list(self.gates)
         data.update(self.metadata)
         return data
 

@@ -23,9 +23,6 @@ nodes:
     model_lane: worker
     prompt_ref: prompts/implementer.md
     dispatch_mode: serial
-    gates:
-      - scope_gate
-      - budget_gate
     tools:
       native: [Read, Write, Edit, Bash]
       mcp: [codegraph]
@@ -70,8 +67,6 @@ nodes:
     type: publisher
     prompt_ref: null
     dispatch_mode: serial
-    gates:
-      - deployment_gate
 
   - name: rollback
     type: rollback

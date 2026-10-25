@@ -35,8 +35,7 @@ version: 1
 task_class: demo
 nodes:
   - {name: planner, type: planner, model_lane: planner, prompt_ref: prompts/planner.md}
-  - {name: implementer, type: implementer, model_lane: worker, prompt_ref: prompts/implementer.md,
-     gates: [scope_gate, budget_gate]}
+  - {name: implementer, type: implementer, model_lane: worker, prompt_ref: prompts/implementer.md}
   - {name: verifier_node, type: verifier, verifier_ref: verifiers/test.py}
 """
 
@@ -420,7 +419,7 @@ def test_run_dag_carries_role_dur_gates_and_heads(home: Path) -> None:
     dag = next(s for s in page["sections"] if s["type"] == "dag")
     nodes = {n["id"]: n for c in dag["cols"] for n in c}
     assert nodes["implementer"]["role"] == "worker"
-    assert nodes["implementer"]["gates"] == "scope_gate, budget_gate"
+    assert "gates" not in nodes["implementer"]  # per-node gates removed (eco6 K13)
     assert nodes["implementer"]["dur"].endswith("s")
     # stage heads: one per column, in order.
     assert len(dag["heads"]) == len(dag["cols"])

@@ -208,7 +208,6 @@ def list_agents(
                 "prompt_ref": node.get("prompt_ref"),
                 "verifier_ref": node.get("verifier_ref"),
                 "dispatch_mode": node.get("dispatch_mode"),
-                "gates": node.get("gates") or [],
                 "status": ev.get("status", "never_seen"),
                 "interrupted": ev.get("interrupted", False),
                 "duration_ms": ev.get("duration_ms"),

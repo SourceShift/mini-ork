@@ -11,19 +11,19 @@ description: >
 
 nodes:
   - { name: specdir_ingest, type: verifier, verifier_ref: verifiers/specdir-ingest.py, dispatch_mode: serial }
-  - { name: contract_compiler, type: researcher, model_lane: planner, prompt_ref: prompts/contract-compiler.md, dispatch_mode: serial, gates: [budget_gate] }
+  - { name: contract_compiler, type: researcher, model_lane: planner, prompt_ref: prompts/contract-compiler.md, dispatch_mode: serial }
   - { name: ratification_check, type: verifier, verifier_ref: verifiers/ratification-check.py, dispatch_mode: serial }
   - { name: spec_lint, type: verifier, verifier_ref: verifiers/spec-lint.py, dispatch_mode: serial }
   - { name: gates_materialize, type: verifier, verifier_ref: verifiers/gates-materialize.py, dispatch_mode: serial }
   - { name: test_validity, type: verifier, verifier_ref: verifiers/test-validity.py, dispatch_mode: serial }
-  - { name: per_spec_dispatcher, type: implementer, model_lane: implementer, prompt_ref: prompts/per-spec-dispatcher.md, dispatch_mode: serial, gates: [budget_gate, scope_gate] }
+  - { name: per_spec_dispatcher, type: implementer, model_lane: implementer, prompt_ref: prompts/per-spec-dispatcher.md, dispatch_mode: serial }
   - { name: dispatch_aggregator, type: verifier, verifier_ref: verifiers/dispatch-aggregator.py, dispatch_mode: serial }
   - { name: smoke_live, type: verifier, verifier_ref: verifiers/smoke-live.py, dispatch_mode: serial }
   - { name: ui_craft_gate, type: verifier, verifier_ref: verifiers/ui-craft-gate.py, dispatch_mode: serial }
   - { name: ledger_writer, type: verifier, verifier_ref: verifiers/ledger-writer.py, dispatch_mode: serial }
-  - { name: reflector, type: reflector, model_lane: reflector, prompt_ref: prompts/reflector.md, dispatch_mode: serial, gates: [budget_gate] }
-  - { name: replanner, type: planner, model_lane: planner, prompt_ref: prompts/replanner.md, dispatch_mode: serial, gates: [budget_gate] }
-  - { name: publisher, type: publisher, prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
+  - { name: reflector, type: reflector, model_lane: reflector, prompt_ref: prompts/reflector.md, dispatch_mode: serial }
+  - { name: replanner, type: planner, model_lane: planner, prompt_ref: prompts/replanner.md, dispatch_mode: serial }
+  - { name: publisher, type: publisher, prompt_ref: null, dispatch_mode: serial }
   - { name: rollback, type: rollback, prompt_ref: null, dispatch_mode: serial }
 
 edges:

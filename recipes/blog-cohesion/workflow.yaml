@@ -12,18 +12,18 @@ description: >
 # than coalitional.
 nodes:
   - { name: planner,      type: planner,    model_lane: planner,      prompt_ref: prompts/planner.md,    dispatch_mode: serial }
-  - { name: thesis,       type: researcher, model_lane: glm_lens,     prompt_ref: prompts/thesis.md,     dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: bridge,       type: researcher, model_lane: codex_lens,   prompt_ref: prompts/bridge.md,     dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: topic,        type: researcher, model_lane: opus_lens,    prompt_ref: prompts/topic.md,      dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: entity,       type: researcher, model_lane: minimax_lens, prompt_ref: prompts/entity.md,     dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: rhythm,       type: researcher, model_lane: kimi_lens,    prompt_ref: prompts/rhythm.md,     dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: thesis,       type: researcher, model_lane: glm_lens,     prompt_ref: prompts/thesis.md,     dispatch_mode: parallel }
+  - { name: bridge,       type: researcher, model_lane: codex_lens,   prompt_ref: prompts/bridge.md,     dispatch_mode: parallel }
+  - { name: topic,        type: researcher, model_lane: opus_lens,    prompt_ref: prompts/topic.md,      dispatch_mode: parallel }
+  - { name: entity,       type: researcher, model_lane: minimax_lens, prompt_ref: prompts/entity.md,     dispatch_mode: parallel }
+  - { name: rhythm,       type: researcher, model_lane: kimi_lens,    prompt_ref: prompts/rhythm.md,     dispatch_mode: parallel }
   # Node name MUST contain "synth" — mini-ork's reviewer dispatch treats
   # *synth* node ids as synthesizers (write source_artifact directly) vs
   # classic reviewers (write review-<id>.json verdict envelope only). The
   # arbiter role conceptually IS a synthesizer of 5 lens findings.
-  - { name: synth_arbiter, type: reviewer, model_lane: reviewer, prompt_ref: prompts/arbiter.md, dispatch_mode: serial, gates: [budget_gate] }
+  - { name: synth_arbiter, type: reviewer, model_lane: reviewer, prompt_ref: prompts/arbiter.md, dispatch_mode: serial }
   - { name: cohesion_completeness, type: verifier, verifier_ref: verifiers/cohesion-completeness.py, dispatch_mode: serial }
-  - { name: publisher,    type: publisher,  prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
+  - { name: publisher,    type: publisher,  prompt_ref: null, dispatch_mode: serial }
   - { name: rollback,     type: rollback,   prompt_ref: null, dispatch_mode: serial }
 
 edges:

@@ -212,6 +212,36 @@ _WORKFLOW_SCHEMA_REL = os.path.join("schemas", "workflow.schema.json")
 _SCHEMA_ERROR_CAP = 5
 
 
+def _check_node_gates(wf: str, recipe: str, findings: Findings) -> None:
+    """Error once per recipe that still declares per-node ``gates``.
+
+    ECO6 K13 removed the key: the compiler never read it, the executor never
+    read it, and ``gate_registry.gate_evaluate`` resolves a gate by registered
+    *id*, not by the declared name, so the names could never have fired. One
+    error per recipe (naming the first offending node) keeps a stale recipe
+    legible while ``additionalProperties: false`` in the schema would otherwise
+    report the same problem less helpfully.
+    """
+    import yaml
+
+    try:
+        with open(wf) as f:
+            document = yaml.safe_load(f) or {}
+    except Exception:
+        return  # an unparseable file is already reported by _valid_yaml
+    for node in document.get("nodes") or []:
+        if not isinstance(node, dict) or "gates" not in node:
+            continue
+        name = node.get("name") or node.get("id") or "<unnamed>"
+        findings.error(
+            f"recipe {recipe} node '{name}' declares gates: — "
+            "per-node gates were never enforced",
+            "remove it; add a verifier node, or register a task-class gate "
+            "with mini_ork.gates.gate_registry.gate_register()",
+        )
+        return
+
+
 def _check_workflow_schema(root: str, recipe: str, wf: str,
                            findings: Findings) -> None:
     """Validate ``workflow.yaml`` against the engine's workflow schema.
@@ -423,6 +453,9 @@ def _check_recipe(root: str, recipe: str, findings: Findings) -> None:
         # no-op: the early handler drops the node's prompt/lane/outputs, so the
         # loop can never produce the artifact it re-reads. Warn pre-run.
         _check_repair_loop_nodes(wf, recipe, findings)
+        # Per-node gates were never enforced; name that plainly before the
+        # schema check reports the same stale key as a generic property error.
+        _check_node_gates(wf, recipe, findings)
         # The workflow schema is the contract the compiler reads; checking it
         # pre-run is what makes later schema removals enforceable.
         _check_workflow_schema(root, recipe, wf, findings)

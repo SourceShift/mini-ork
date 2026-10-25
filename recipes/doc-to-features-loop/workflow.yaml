@@ -7,20 +7,20 @@ description: >
   Hard-caps at convergence, max iterations, or total budget.
 
 nodes:
-  - { name: planner, type: planner, model_lane: planner, prompt_ref: null, dispatch_mode: serial, gates: [budget_gate] }
-  - { name: feature_extractor_codex, type: researcher, model_lane: codex_lens, prompt_ref: prompts/feature-extractor-surface.md, dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: feature_extractor_kimi, type: researcher, model_lane: kimi_lens, prompt_ref: prompts/feature-extractor-deep.md, dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: feature_extractor_glm, type: researcher, model_lane: glm_lens, prompt_ref: prompts/feature-extractor-deep.md, dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: feature_extractor_minimax, type: researcher, model_lane: minimax_lens, prompt_ref: prompts/feature-extractor-surface.md, dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: feature_synthesizer, type: reviewer, model_lane: codex_lens, prompt_ref: prompts/feature-synthesizer.md, dispatch_mode: serial, gates: [budget_gate] }
-  - { name: feature_prioritizer, type: planner, model_lane: planner, prompt_ref: prompts/feature-prioritizer.md, dispatch_mode: serial, gates: [budget_gate] }
+  - { name: planner, type: planner, model_lane: planner, prompt_ref: null, dispatch_mode: serial }
+  - { name: feature_extractor_codex, type: researcher, model_lane: codex_lens, prompt_ref: prompts/feature-extractor-surface.md, dispatch_mode: parallel }
+  - { name: feature_extractor_kimi, type: researcher, model_lane: kimi_lens, prompt_ref: prompts/feature-extractor-deep.md, dispatch_mode: parallel }
+  - { name: feature_extractor_glm, type: researcher, model_lane: glm_lens, prompt_ref: prompts/feature-extractor-deep.md, dispatch_mode: parallel }
+  - { name: feature_extractor_minimax, type: researcher, model_lane: minimax_lens, prompt_ref: prompts/feature-extractor-surface.md, dispatch_mode: parallel }
+  - { name: feature_synthesizer, type: reviewer, model_lane: codex_lens, prompt_ref: prompts/feature-synthesizer.md, dispatch_mode: serial }
+  - { name: feature_prioritizer, type: planner, model_lane: planner, prompt_ref: prompts/feature-prioritizer.md, dispatch_mode: serial }
   - { name: extraction_completeness, type: verifier, verifier_ref: verifiers/extraction-completeness.py, dispatch_mode: serial }
   - { name: arxiv_compliance, type: verifier, verifier_ref: verifiers/arxiv-compliance-check.py, dispatch_mode: serial }
-  - { name: per_feature_dispatcher, type: implementer, model_lane: codex_lens, prompt_ref: prompts/per-feature-dispatcher.md, dispatch_mode: serial, gates: [budget_gate, scope_gate] }
+  - { name: per_feature_dispatcher, type: implementer, model_lane: codex_lens, prompt_ref: prompts/per-feature-dispatcher.md, dispatch_mode: serial }
   - { name: dispatch_aggregator, type: verifier, verifier_ref: verifiers/per-feature-dispatch-results.py, dispatch_mode: serial }
-  - { name: reflector, type: reflector, model_lane: reflector, prompt_ref: prompts/reflector.md, dispatch_mode: serial, gates: [budget_gate] }
-  - { name: replanner, type: planner, model_lane: planner, prompt_ref: prompts/replanner.md, dispatch_mode: serial, gates: [budget_gate] }
-  - { name: publisher, type: publisher, prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
+  - { name: reflector, type: reflector, model_lane: reflector, prompt_ref: prompts/reflector.md, dispatch_mode: serial }
+  - { name: replanner, type: planner, model_lane: planner, prompt_ref: prompts/replanner.md, dispatch_mode: serial }
+  - { name: publisher, type: publisher, prompt_ref: null, dispatch_mode: serial }
   - { name: rollback, type: rollback, prompt_ref: null, dispatch_mode: serial }
 
 edges:

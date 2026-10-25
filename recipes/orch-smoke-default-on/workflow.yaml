@@ -16,11 +16,11 @@ nodes:
   # Each lens is small/cheap; budget_gate caps the LLM spend. Parallel
   # dispatch so the wave finishes in one researcher pass.
   - { name: smoke_context_lens,     type: researcher, model_lane: codex_lens,
-      prompt_ref: prompts/smoke-context-lens.md,     dispatch_mode: parallel, gates: [budget_gate] }
+      prompt_ref: prompts/smoke-context-lens.md,     dispatch_mode: parallel }
   - { name: engagement_design_lens, type: researcher, model_lane: glm_lens,
-      prompt_ref: prompts/engagement-design-lens.md, dispatch_mode: parallel, gates: [budget_gate] }
+      prompt_ref: prompts/engagement-design-lens.md, dispatch_mode: parallel }
   - { name: determinism_lens,       type: researcher, model_lane: kimi_lens,
-      prompt_ref: prompts/determinism-lens.md,       dispatch_mode: parallel, gates: [budget_gate] }
+      prompt_ref: prompts/determinism-lens.md,       dispatch_mode: parallel }
 
   # ── smoke leg: EXACT orch-smoke declaration, never edited ──
   # rc=1 every invocation, writes verifier-result-fail-probe.json with pass=false.

@@ -9,11 +9,11 @@ description: >
   the recipe. All nodes are read-only with respect to repo source.
 
 nodes:
-  - { name: opus_judge, type: researcher, model_lane: opus_lens, prompt_ref: prompts/opus-judge.md, dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: glm_judge, type: researcher, model_lane: glm_lens, prompt_ref: prompts/glm-judge.md, dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: deepseek_judge, type: researcher, model_lane: deepseek_lens, prompt_ref: prompts/deepseek-judge.md, dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: minimax_judge, type: researcher, model_lane: minimax_lens, prompt_ref: prompts/minimax-judge.md, dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: synthesizer, type: reviewer, model_lane: reviewer, prompt_ref: prompts/synthesis.md, dispatch_mode: serial, gates: [budget_gate] }
+  - { name: opus_judge, type: researcher, model_lane: opus_lens, prompt_ref: prompts/opus-judge.md, dispatch_mode: parallel }
+  - { name: glm_judge, type: researcher, model_lane: glm_lens, prompt_ref: prompts/glm-judge.md, dispatch_mode: parallel }
+  - { name: deepseek_judge, type: researcher, model_lane: deepseek_lens, prompt_ref: prompts/deepseek-judge.md, dispatch_mode: parallel }
+  - { name: minimax_judge, type: researcher, model_lane: minimax_lens, prompt_ref: prompts/minimax-judge.md, dispatch_mode: parallel }
+  - { name: synthesizer, type: reviewer, model_lane: reviewer, prompt_ref: prompts/synthesis.md, dispatch_mode: serial }
   - { name: panel_completeness, type: verifier, verifier_ref: verifiers/panel-completeness.py, dispatch_mode: serial }
   - { name: publisher, type: publisher, prompt_ref: null, dispatch_mode: serial }
   - { name: rollback, type: rollback, prompt_ref: null, dispatch_mode: serial }

@@ -486,7 +486,6 @@ def recipe_card(home: Path | None, recipe_id: str) -> dict[str, Any] | None:
                 "type": str(n.get("type") or ""),
                 "model_lane": n.get("model_lane") or n.get("lane"),
                 "verifier_ref": n.get("verifier_ref"),
-                "gates": _as_str_list(n.get("gates")),
                 "prompt_ref": n.get("prompt_ref"),
             }
         )
@@ -597,8 +596,6 @@ def render_recipe_card(card: dict[str, Any]) -> tuple[str, list[Path]]:
             vr = n.get("verifier_ref")
             if vr:
                 checks.append(Path(vr).name if isinstance(vr, str) else str(vr))
-            for g in n.get("gates") or []:
-                checks.append(f"gate:{g}")
             lines.append(
                 f"| `{n.get('id', '?')}` | {n.get('type', '?')} | {lane_cell} | {', '.join(checks) or '—'} |"
             )

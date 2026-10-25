@@ -21,35 +21,30 @@ nodes:
     model_lane: opus_lens
     prompt_ref: prompts/contract-architect.md
     dispatch_mode: parallel
-    gates: [budget_gate]
 
   - name: creation_flow_auditor
     type: researcher
     model_lane: kimi_lens
     prompt_ref: prompts/creation-flow-auditor.md
     dispatch_mode: parallel
-    gates: [budget_gate]
 
   - name: retrieval_hydration_lens
     type: researcher
     model_lane: codex_lens
     prompt_ref: prompts/retrieval-hydration-lens.md
     dispatch_mode: parallel
-    gates: [budget_gate]
 
   - name: migration_backfill_lens
     type: researcher
     model_lane: minimax_lens
     prompt_ref: prompts/migration-backfill-lens.md
     dispatch_mode: parallel
-    gates: [budget_gate]
 
   - name: implementer
     type: implementer
     model_lane: implementer
     prompt_ref: prompts/implementer.md
     dispatch_mode: serial
-    gates: [scope_gate, budget_gate]
 
   - name: deterministic_verifier
     type: verifier
@@ -63,14 +58,12 @@ nodes:
     model_lane: reviewer
     prompt_ref: prompts/reviewer.md
     dispatch_mode: serial
-    gates: [budget_gate]
 
   - name: publisher
     type: publisher
     model_lane: publisher
     prompt_ref: null
     dispatch_mode: serial
-    gates: [scope_gate]
 
   - name: rollback
     type: rollback

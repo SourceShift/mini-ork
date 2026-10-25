@@ -12,13 +12,13 @@ description: >
 # evaluative disposition. Family diversity is the enforceable proxy here.
 nodes:
   - { name: planner,        type: planner,     model_lane: planner,       prompt_ref: prompts/planner.md,         dispatch_mode: serial }
-  - { name: glm_lens,       type: researcher,  model_lane: glm_lens,      prompt_ref: prompts/lens-glm-web.md,    dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: kimi_lens,      type: researcher,  model_lane: kimi_lens,     prompt_ref: prompts/lens-kimi-lit.md,   dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: codex_lens,     type: researcher,  model_lane: codex_lens,    prompt_ref: prompts/lens-codex-code.md, dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: opus_lens,      type: researcher,  model_lane: opus_lens,     prompt_ref: prompts/lens-opus-narrative.md, dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: synthesizer,    type: reviewer,    model_lane: reviewer,      prompt_ref: prompts/synthesis.md,       dispatch_mode: serial,   gates: [budget_gate] }
+  - { name: glm_lens,       type: researcher,  model_lane: glm_lens,      prompt_ref: prompts/lens-glm-web.md,    dispatch_mode: parallel }
+  - { name: kimi_lens,      type: researcher,  model_lane: kimi_lens,     prompt_ref: prompts/lens-kimi-lit.md,   dispatch_mode: parallel }
+  - { name: codex_lens,     type: researcher,  model_lane: codex_lens,    prompt_ref: prompts/lens-codex-code.md, dispatch_mode: parallel }
+  - { name: opus_lens,      type: researcher,  model_lane: opus_lens,     prompt_ref: prompts/lens-opus-narrative.md, dispatch_mode: parallel }
+  - { name: synthesizer,    type: reviewer,    model_lane: reviewer,      prompt_ref: prompts/synthesis.md,       dispatch_mode: serial }
   - { name: source_completeness, type: verifier, verifier_ref: verifiers/source-completeness.py, dispatch_mode: serial }
-  - { name: publisher,      type: publisher,   prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
+  - { name: publisher,      type: publisher,   prompt_ref: null, dispatch_mode: serial }
   - { name: rollback,       type: rollback,    prompt_ref: null, dispatch_mode: serial }
 
 edges:

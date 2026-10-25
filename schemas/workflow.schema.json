@@ -117,12 +117,6 @@
           "description": "How this node's work units are dispatched: serial (one by one), parallel (all at once), partitioned (sharded by input key), speculative (race N copies; first wins).",
           "enum": ["serial", "parallel", "partitioned", "speculative"]
         },
-        "gates": {
-          "type": "array",
-          "description": "Gate IDs that must pass before this node is considered done. References registered_gates(gate_id).",
-          "items": { "type": "string" },
-          "default": []
-        },
         "prompt_ref": {
           "type": ["string", "null"],
           "description": "Path (relative to repo root) or key of the prompt template for this node.",
@@ -136,12 +130,6 @@
         "timeout_minutes": {
           "type": "integer",
           "description": "Hard timeout for this node in minutes. 0 = inherit workflow default.",
-          "minimum": 0,
-          "default": 0
-        },
-        "max_cost_usd": {
-          "type": "number",
-          "description": "Per-invocation cost ceiling in USD. 0 = no per-node cap.",
           "minimum": 0,
           "default": 0
         },

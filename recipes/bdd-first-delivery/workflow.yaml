@@ -22,9 +22,6 @@ nodes:
     prompt_ref: prompts/implementer.md
     dispatch_mode: partitioned
     partition_key: sub_epic_id
-    gates:
-      - scope_gate
-      - budget_gate
 
   - name: bdd_runner
     type: verifier
@@ -54,8 +51,6 @@ nodes:
   - name: publisher
     type: publisher
     dispatch_mode: serial
-    gates:
-      - deployment_gate
 
   - name: rollback
     type: rollback

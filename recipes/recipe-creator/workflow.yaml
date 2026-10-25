@@ -12,30 +12,30 @@ nodes:
   - { name: planner,          type: planner,    model_lane: planner,         prompt_ref: prompts/planner.md,           dispatch_mode: serial }
 
   # Grounding lenses — independent evidence channels for the drafters
-  - { name: arxiv_lens,       type: researcher, model_lane: codex_lens,      prompt_ref: prompts/arxiv-lens.md,        dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: prior_art_lens,   type: researcher, model_lane: opus_lens,       prompt_ref: prompts/prior-art-lens.md,    dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: arxiv_lens,       type: researcher, model_lane: codex_lens,      prompt_ref: prompts/arxiv-lens.md,        dispatch_mode: parallel }
+  - { name: prior_art_lens,   type: researcher, model_lane: opus_lens,       prompt_ref: prompts/prior-art-lens.md,    dispatch_mode: parallel }
 
   # Family-diverse drafters — each emits a candidate recipe directory under
   # ${MINI_ORK_RUN_DIR}/drafts/<family>/. 3 distinct families satisfy the
   # heterogeneity floor BEFORE the arbiter even picks.
-  - { name: minimax_drafter,      type: implementer, model_lane: minimax_lens,   prompt_ref: prompts/drafter-glm.md,       dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: kimi_drafter,     type: implementer, model_lane: kimi_lens,      prompt_ref: prompts/drafter-kimi.md,      dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: codex_drafter,    type: implementer, model_lane: codex_lens,     prompt_ref: prompts/drafter-codex.md,     dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: minimax_drafter,      type: implementer, model_lane: minimax_lens,   prompt_ref: prompts/drafter-glm.md,       dispatch_mode: parallel }
+  - { name: kimi_drafter,     type: implementer, model_lane: kimi_lens,      prompt_ref: prompts/drafter-kimi.md,      dispatch_mode: parallel }
+  - { name: codex_drafter,    type: implementer, model_lane: codex_lens,     prompt_ref: prompts/drafter-codex.md,     dispatch_mode: parallel }
 
   # Cross-family arbiter — different family from all 3 drafters
-  - { name: opus_arbiter,     type: reviewer,    model_lane: opus_lens,      prompt_ref: prompts/arbiter.md,           dispatch_mode: serial,   gates: [budget_gate] }
+  - { name: opus_arbiter,     type: reviewer,    model_lane: opus_lens,      prompt_ref: prompts/arbiter.md,           dispatch_mode: serial }
 
   # Verifier_smith generates the task-specific bash verifiers for the
   # chosen draft. Hybrid strategy: a template covers file-exists +
   # workflow-parses; the smith adds task-specific assertions (e.g.
   # success_criteria → file_exists mapping).
-  - { name: verifier_smith,   type: implementer, model_lane: codex,          prompt_ref: prompts/verifier-smith.md,    dispatch_mode: serial,   gates: [budget_gate] }
+  - { name: verifier_smith,   type: implementer, model_lane: codex,          prompt_ref: prompts/verifier-smith.md,    dispatch_mode: serial }
 
   # Single combined validator: structure + heterogeneity (≥3 distinct
   # families, HARD per user direction) + dry-run parse.
   - { name: recipe_validator, type: verifier,    verifier_ref: verifiers/recipe-validator.py, dispatch_mode: serial }
 
-  - { name: publisher,        type: publisher,   prompt_ref: null,                          dispatch_mode: serial, gates: [scope_gate] }
+  - { name: publisher,        type: publisher,   prompt_ref: null,                          dispatch_mode: serial }
   - { name: rollback,         type: rollback,    prompt_ref: null,                          dispatch_mode: serial }
 
 edges:

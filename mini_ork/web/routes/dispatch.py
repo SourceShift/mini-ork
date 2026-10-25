@@ -95,7 +95,6 @@ def options(task_class: str | None = None, db: StateDB = Depends(get_db)) -> dic
                             "type": n.get("type"),
                             "lane": n.get("model_lane"),
                             "dispatch_mode": n.get("dispatch_mode", "serial"),
-                            "gates": n.get("gates") or [],
                             "verifier_ref": n.get("verifier_ref"),
                         }
                         for n in (spec.get("nodes") or [])

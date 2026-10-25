@@ -18,28 +18,24 @@ nodes:
     model_lane: codex_lens
     prompt_ref: prompts/structural-lens.md
     dispatch_mode: parallel
-    gates: [budget_gate]
 
   - name: semantic_lens
     type: researcher
     model_lane: glm_lens
     prompt_ref: prompts/semantic-lens.md
     dispatch_mode: parallel
-    gates: [budget_gate]
 
   - name: adversarial_lens
     type: researcher
     model_lane: kimi_lens
     prompt_ref: prompts/adversarial-lens.md
     dispatch_mode: parallel
-    gates: [budget_gate]
 
   - name: findings_reviewer
     type: reviewer
     model_lane: reviewer
     prompt_ref: prompts/findings-reviewer.md
     dispatch_mode: serial
-    gates: [budget_gate]
 
   - name: audit_shape
     type: verifier
@@ -51,7 +47,6 @@ nodes:
     type: publisher
     prompt_ref: null
     dispatch_mode: serial
-    gates: [scope_gate]
 
   - name: rollback
     type: rollback

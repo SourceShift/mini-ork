@@ -13,7 +13,6 @@ nodes:
     model_lane: planner
     prompt_ref: prompts/prompt-intake.md
     dispatch_mode: serial
-    gates: [budget_gate]
     outputs: [{ name: prompt_brief, kind: json, path: prompt-brief.json }]
 
   - name: semantic_flow_extractor
@@ -21,7 +20,6 @@ nodes:
     model_lane: researcher
     prompt_ref: prompts/semantic-flow-extractor.md
     dispatch_mode: serial
-    gates: [budget_gate]
     inputs:
       prompt_brief: { required: true }
       human_feedback: { required: false }
@@ -32,7 +30,6 @@ nodes:
     model_lane: researcher
     prompt_ref: prompts/source-researcher.md
     dispatch_mode: serial
-    gates: [budget_gate]
     inputs:
       semantic_signals: { required: true }
     outputs: [{ name: source_corpus, kind: json, path: source-corpus.json }]
@@ -42,7 +39,6 @@ nodes:
     model_lane: planner
     prompt_ref: prompts/recursive-plan-composer.md
     dispatch_mode: serial
-    gates: [budget_gate]
     inputs:
       semantic_signals: { required: true }
       source_corpus: { required: true }
@@ -54,7 +50,6 @@ nodes:
     model_lane: worker
     prompt_ref: prompts/draft-executor.md
     dispatch_mode: serial
-    gates: [budget_gate]
     inputs:
       agent_plan: { required: true }
     outputs: [{ name: draft_artifact, kind: markdown, path: draft-artifact.md }]
@@ -64,7 +59,6 @@ nodes:
     model_lane: reviewer
     prompt_ref: prompts/verifier-gate.md
     dispatch_mode: serial
-    gates: [budget_gate]
     inputs:
       agent_plan: { required: true }
       draft_artifact: { required: true }
@@ -83,7 +77,6 @@ nodes:
     model_lane: reflector
     prompt_ref: prompts/reflection-loop.md
     dispatch_mode: serial
-    gates: [budget_gate]
     inputs:
       verification_report: { required: true }
     outputs: [{ name: refinement_prompt, kind: markdown, path: refinement-prompt.md }]
@@ -93,7 +86,6 @@ nodes:
     model_lane: reviewer
     prompt_ref: prompts/human-review-packet.md
     dispatch_mode: serial
-    gates: [budget_gate]
     inputs:
       agent_plan: { required: true }
       draft_artifact: { required: true }
@@ -113,7 +105,6 @@ nodes:
     model_lane: worker
     prompt_ref: prompts/summary-finalizer.md
     dispatch_mode: serial
-    gates: [budget_gate, scope_gate]
     inputs:
       agent_plan: { required: true }
       source_corpus: { required: true }
@@ -127,7 +118,6 @@ nodes:
     model_lane: worker
     prompt_ref: prompts/aggregation-document.md
     dispatch_mode: serial
-    gates: [budget_gate, scope_gate]
     inputs:
       final_summaries: { required: true }
     outputs: [{ name: aggregation, kind: markdown, path: aggregation.md }]

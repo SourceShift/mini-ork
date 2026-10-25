@@ -6,12 +6,12 @@ description: >
 
 nodes:
   - { name: planner, type: planner, model_lane: planner, prompt_ref: prompts/planner.md, dispatch_mode: serial }
-  - { name: opus_scalability_lens, type: researcher, model_lane: opus_lens, prompt_ref: prompts/opus-scalability.md, dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: opus_llm_safety_lens, type: researcher, model_lane: opus_lens, prompt_ref: prompts/opus-llm-safety.md, dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: kimi_correctness_lens, type: researcher, model_lane: kimi_lens, prompt_ref: prompts/kimi-correctness.md, dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: codex_codebase_lens, type: researcher, model_lane: codex_lens, prompt_ref: prompts/codex-codebase.md, dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: minimax_perf_lens, type: researcher, model_lane: minimax_lens, prompt_ref: prompts/minimax-performance.md, dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: synthesizer, type: reviewer, model_lane: reviewer, prompt_ref: prompts/synthesis.md, dispatch_mode: serial, gates: [budget_gate] }
+  - { name: opus_scalability_lens, type: researcher, model_lane: opus_lens, prompt_ref: prompts/opus-scalability.md, dispatch_mode: parallel }
+  - { name: opus_llm_safety_lens, type: researcher, model_lane: opus_lens, prompt_ref: prompts/opus-llm-safety.md, dispatch_mode: parallel }
+  - { name: kimi_correctness_lens, type: researcher, model_lane: kimi_lens, prompt_ref: prompts/kimi-correctness.md, dispatch_mode: parallel }
+  - { name: codex_codebase_lens, type: researcher, model_lane: codex_lens, prompt_ref: prompts/codex-codebase.md, dispatch_mode: parallel }
+  - { name: minimax_perf_lens, type: researcher, model_lane: minimax_lens, prompt_ref: prompts/minimax-performance.md, dispatch_mode: parallel }
+  - { name: synthesizer, type: reviewer, model_lane: reviewer, prompt_ref: prompts/synthesis.md, dispatch_mode: serial }
   - { name: panel_completeness, type: verifier, verifier_ref: verifiers/panel-completeness.py, dispatch_mode: serial }
   - { name: publisher, type: publisher, prompt_ref: null, dispatch_mode: serial }
   - { name: rollback, type: rollback, prompt_ref: null, dispatch_mode: serial }

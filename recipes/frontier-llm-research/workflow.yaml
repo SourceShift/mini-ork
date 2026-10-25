@@ -11,7 +11,6 @@ nodes:
     type: verifier
     verifier_ref: verifiers/collect-latest-libwit.py
     dispatch_mode: serial
-    gates: [budget_gate]
     outputs: [{ name: source_corpus, kind: json, path: source-corpus.json }]
 
   - name: corpus_sharder
@@ -37,7 +36,6 @@ nodes:
     model_lane: researcher
     prompt_ref: prompts/summarize-shard.md
     dispatch_mode: parallel
-    gates: [budget_gate]
     inputs: { source_shard: { required: true } }
     outputs: [{ name: summary_shard_01, kind: json, path: summaries/shard-01.json }]
   - name: summarize_shard_02
@@ -45,7 +43,6 @@ nodes:
     model_lane: researcher
     prompt_ref: prompts/summarize-shard.md
     dispatch_mode: parallel
-    gates: [budget_gate]
     inputs: { source_shard: { required: true } }
     outputs: [{ name: summary_shard_02, kind: json, path: summaries/shard-02.json }]
   - name: summarize_shard_03
@@ -53,7 +50,6 @@ nodes:
     model_lane: researcher
     prompt_ref: prompts/summarize-shard.md
     dispatch_mode: parallel
-    gates: [budget_gate]
     inputs: { source_shard: { required: true } }
     outputs: [{ name: summary_shard_03, kind: json, path: summaries/shard-03.json }]
   - name: summarize_shard_04
@@ -61,7 +57,6 @@ nodes:
     model_lane: researcher
     prompt_ref: prompts/summarize-shard.md
     dispatch_mode: parallel
-    gates: [budget_gate]
     inputs: { source_shard: { required: true } }
     outputs: [{ name: summary_shard_04, kind: json, path: summaries/shard-04.json }]
   - name: summarize_shard_05
@@ -69,7 +64,6 @@ nodes:
     model_lane: researcher
     prompt_ref: prompts/summarize-shard.md
     dispatch_mode: parallel
-    gates: [budget_gate]
     inputs: { source_shard: { required: true } }
     outputs: [{ name: summary_shard_05, kind: json, path: summaries/shard-05.json }]
   - name: summarize_shard_06
@@ -77,7 +71,6 @@ nodes:
     model_lane: researcher
     prompt_ref: prompts/summarize-shard.md
     dispatch_mode: parallel
-    gates: [budget_gate]
     inputs: { source_shard: { required: true } }
     outputs: [{ name: summary_shard_06, kind: json, path: summaries/shard-06.json }]
   - name: summarize_shard_07
@@ -85,7 +78,6 @@ nodes:
     model_lane: researcher
     prompt_ref: prompts/summarize-shard.md
     dispatch_mode: parallel
-    gates: [budget_gate]
     inputs: { source_shard: { required: true } }
     outputs: [{ name: summary_shard_07, kind: json, path: summaries/shard-07.json }]
   - name: summarize_shard_08
@@ -93,7 +85,6 @@ nodes:
     model_lane: researcher
     prompt_ref: prompts/summarize-shard.md
     dispatch_mode: parallel
-    gates: [budget_gate]
     inputs: { source_shard: { required: true } }
     outputs: [{ name: summary_shard_08, kind: json, path: summaries/shard-08.json }]
   - name: summarize_shard_09
@@ -101,7 +92,6 @@ nodes:
     model_lane: researcher
     prompt_ref: prompts/summarize-shard.md
     dispatch_mode: parallel
-    gates: [budget_gate]
     inputs: { source_shard: { required: true } }
     outputs: [{ name: summary_shard_09, kind: json, path: summaries/shard-09.json }]
   - name: summarize_shard_10
@@ -109,7 +99,6 @@ nodes:
     model_lane: researcher
     prompt_ref: prompts/summarize-shard.md
     dispatch_mode: parallel
-    gates: [budget_gate]
     inputs: { source_shard: { required: true } }
     outputs: [{ name: summary_shard_10, kind: json, path: summaries/shard-10.json }]
 
@@ -125,7 +114,6 @@ nodes:
     model_lane: kimi_lens
     prompt_ref: prompts/synthesize-techniques.md
     dispatch_mode: serial
-    gates: [budget_gate]
     inputs: { technique_rollup: { required: true } }
     outputs: [{ name: unified_techniques, kind: markdown, path: unified-techniques.md }]
 

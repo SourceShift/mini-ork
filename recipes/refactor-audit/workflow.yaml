@@ -14,35 +14,30 @@ nodes:
     model_lane: glm_lens
     prompt_ref: prompts/lens-glm.md
     dispatch_mode: parallel
-    gates: [budget_gate]
     outputs: [{ name: report, kind: markdown, path: lens-glm.md }]
   - name: kimi_lens
     type: researcher
     model_lane: kimi_lens
     prompt_ref: prompts/lens-kimi.md
     dispatch_mode: parallel
-    gates: [budget_gate]
     outputs: [{ name: report, kind: markdown, path: lens-kimi.md }]
   - name: codex_lens
     type: researcher
     model_lane: codex_lens
     prompt_ref: prompts/lens-codex.md
     dispatch_mode: parallel
-    gates: [budget_gate]
     outputs: [{ name: report, kind: markdown, path: lens-codex.md }]
   - name: opus_lens
     type: researcher
     model_lane: opus_lens
     prompt_ref: prompts/lens-opus.md
     dispatch_mode: parallel
-    gates: [budget_gate]
     outputs: [{ name: report, kind: markdown, path: lens-opus.md }]
   - name: minimax_lens
     type: researcher
     model_lane: minimax_lens
     prompt_ref: prompts/lens-minimax.md
     dispatch_mode: parallel
-    gates: [budget_gate]
     outputs: [{ name: report, kind: markdown, path: lens-minimax.md }]
   - name: anonymize_panel
     type: transform
@@ -58,12 +53,11 @@ nodes:
     model_lane: reviewer
     prompt_ref: prompts/synthesis.md
     dispatch_mode: serial
-    gates: [budget_gate]
     inputs:
       panel_reports: { required: true }
     outputs: [{ name: synthesis, kind: markdown, path: synthesis.md }]
   - { name: lens_completeness, type: verifier, verifier_ref: verifiers/lens-completeness.py, dispatch_mode: serial }
-  - { name: publisher, type: publisher, prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
+  - { name: publisher, type: publisher, prompt_ref: null, dispatch_mode: serial }
   - { name: rollback, type: rollback, prompt_ref: null, dispatch_mode: serial }
 
 edges:

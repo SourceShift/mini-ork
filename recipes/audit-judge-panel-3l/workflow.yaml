@@ -7,10 +7,10 @@ description: >
   respect to repo source.
 
 nodes:
-  - { name: opus_judge, type: researcher, model_lane: opus_lens, prompt_ref: prompts/opus-judge.md, dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: minimax_judge, type: researcher, model_lane: minimax_lens, prompt_ref: prompts/minimax-judge.md, dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: laguna_lens, type: researcher, model_lane: laguna_lens, prompt_ref: prompts/laguna-judge.md, dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: synthesizer, type: reviewer, model_lane: reviewer, prompt_ref: prompts/synthesis.md, dispatch_mode: serial, gates: [budget_gate] }
+  - { name: opus_judge, type: researcher, model_lane: opus_lens, prompt_ref: prompts/opus-judge.md, dispatch_mode: parallel }
+  - { name: minimax_judge, type: researcher, model_lane: minimax_lens, prompt_ref: prompts/minimax-judge.md, dispatch_mode: parallel }
+  - { name: laguna_lens, type: researcher, model_lane: laguna_lens, prompt_ref: prompts/laguna-judge.md, dispatch_mode: parallel }
+  - { name: synthesizer, type: reviewer, model_lane: reviewer, prompt_ref: prompts/synthesis.md, dispatch_mode: serial }
   - { name: panel_completeness, type: verifier, verifier_ref: verifiers/panel-completeness.py, dispatch_mode: serial }
   - { name: publisher, type: publisher, prompt_ref: null, dispatch_mode: serial }
   - { name: rollback, type: rollback, prompt_ref: null, dispatch_mode: serial }

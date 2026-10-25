@@ -23,11 +23,10 @@ version: 1
 task_class: demo
 nodes:
   - {name: planner, type: planner, model_lane: planner, prompt_ref: prompts/planner.md}
-  - {name: implementer, type: implementer, model_lane: worker, prompt_ref: prompts/implementer.md,
-     gates: [scope_gate, budget_gate]}
+  - {name: implementer, type: implementer, model_lane: worker, prompt_ref: prompts/implementer.md}
   - {name: test, type: verifier, verifier_ref: verifiers/test.py}
   - {name: reviewer, type: reviewer, model_lane: reviewer, prompt_ref: prompts/reviewer.md}
-  - {name: publisher, type: publisher, gates: [deployment_gate]}
+  - {name: publisher, type: publisher}
   - {name: rollback, type: rollback}
 edges:
   - {from: planner, to: implementer, edge_type: depends_on}
@@ -175,7 +174,6 @@ def test_inspector_shows_the_selected_nodes_real_output(home: Path) -> None:
     assert [ln["t"] for ln in insp["lines"]] == ["Edit calc.py", "tests PASS"]
     assert insp["lines"][1]["c"] == "green"
     items = {i["k"]: i["v"] for i in insp["items"]}
-    assert items["Gates"] == "scope_gate, budget_gate"
     assert items["Cost"].startswith("$0.07")
     assert items["Wall time"] == "30s"
     assert items["Prompt"] == "demo-recipe/prompts/implementer.md"
@@ -494,8 +492,8 @@ def test_level_two_agents_roster_counts_tokens(home: Path, monkeypatch) -> None:
     page = build_page(home, "run", "agents", {"run": RUN})
     roster = _section(page, "table", "Agent roster")
     assert roster["head"] == ["node", "family", "status", "verdict", "cost", "tokens",
-                              "time", "gates"]
-    assert len(roster["rows"][0]["cells"]) == 8
+                              "time"]
+    assert len(roster["rows"][0]["cells"]) == 7
 
 
 def test_kickoff_tab_renders_the_full_kickoff(home: Path) -> None:

@@ -24,7 +24,6 @@ nodes:
     model_lane: glm_lens
     prompt_ref: prompts/cost-verifiability-lens.md
     dispatch_mode: parallel
-    gates: [budget_gate]
 
   # ── 2b. the authoritative static-feature ledger (opus judgment) ──
   - name: static_feature_ledger
@@ -32,7 +31,6 @@ nodes:
     model_lane: opus_lens
     prompt_ref: prompts/static-feature-ledger.md
     dispatch_mode: parallel
-    gates: [budget_gate]
 
   # ── 2c. capture the Bash oracle while the legacy entrypoint still exists ──
   - name: pre_retirement_parity
@@ -48,7 +46,6 @@ nodes:
     model_lane: codex_lens
     prompt_ref: prompts/migrator.md
     dispatch_mode: serial
-    gates: [scope_gate, budget_gate]
 
   # ── 4. the verify stack = the moat, made concrete ──
   - name: parity_verifier
@@ -85,7 +82,6 @@ nodes:
     model_lane: opus_lens
     prompt_ref: prompts/reviewer.md
     dispatch_mode: serial
-    gates: [budget_gate]
 
   - name: publisher
     type: publisher

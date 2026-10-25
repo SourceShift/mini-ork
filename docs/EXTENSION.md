@@ -57,9 +57,6 @@ nodes:
     model_lane: worker
     prompt_ref: prompts/implementer.md
     dispatch_mode: serial
-    gates:
-      - scope_gate
-      - budget_gate
 
   - name: verify
     type: verifier
@@ -233,15 +230,17 @@ nodes:
     dispatch_mode: serial
 ```
 
-**Shell registration at runtime:**
+**Registration at runtime (Python):**
 
-```bash
-source lib/gate_registry.sh
-gate_register \
-  --name schema_diff \
-  --type deterministic_verifier \
-  --script "recipes/my-recipe/verifiers/schema_diff.sh" \
-  --task-classes "db_migration"
+```python
+from mini_ork.gates import gate_registry
+
+gate_registry.gate_register(
+    db_path,
+    "deterministic_verifier",
+    "recipes/my-recipe/verifiers/schema_diff.sh",
+    task_class_filter="db_migration",
+)
 ```
 
 ---
@@ -319,27 +318,49 @@ The `promotion_gate` calls `utility_score_override()` if the file exists for the
 
 ## 6. Custom Gates
 
-Register a gate beyond the 6 built-in types:
+Gates are **per task class**, not per node. Each gate is a row in the
+`registered_gates` table; `mini-ork verify` evaluates every gate that applies
+to the task class through `gate_registry.gate_run_all`. To check one node's
+output, add a verifier node to the workflow — that is the per-node mechanism.
+The Python module is `mini_ork.gates.gate_registry`.
 
-```bash
-source lib/gate_registry.sh
+Register a gate beyond the built-in types:
 
-gate_register \
-  --name my_custom_gate \
-  --type deterministic_verifier \
-  --script "recipes/my-recipe/verifiers/my_custom_gate.sh" \
-  --task-classes "my_task_class" \
-  --continue-on-fail false
+```python
+from mini_ork.gates import gate_registry
+
+# 1. Optionally add a new gate *type*. An evaluator is
+#    Callable[[str, str, str, Optional[str]], str] and returns
+#    "pass", "fail" or "defer".
+def my_evaluator(condition: str, context_json: str, db_path: str,
+                 mini_ork_root: str | None) -> str:
+    return "pass" if condition in context_json else "fail"
+
+gate_registry.register_gate_evaluator("my_custom_type", my_evaluator)
+
+# 2. Register the gate row for a task class. ``condition`` is a bash function
+#    name or a script path; the evaluator decides how to read it.
+gate_id = gate_registry.gate_register(
+    db_path,
+    "my_custom_type",
+    "recipes/my-recipe/verifiers/my_custom_gate.sh",
+    task_class_filter="my_task_class",
+    safety=False,
+)
 ```
 
-Reference in `workflow.yaml`:
+Exact signatures:
 
-```yaml
-nodes:
-  - id: verify
-    type: verifier
-    gates: [deterministic_verifier, my_custom_gate]
-    verifies: impl
-```
+- `register_gate_evaluator(gate_type: str, evaluator: GateEvaluator) -> None`
+  adds or replaces the evaluator for a type; unregistered types `defer`.
+- `gate_register(db_path: str, gate_type: str, condition: str, task_class_filter: str = "", safety: bool = False) -> str`
+  returns the new `gate_id` (empty string on a uuid collision) and raises
+  `ValueError` for an unknown `gate_type`.
+- `gate_run_all(db_path: str, task_class: str, context_json: str, mini_ork_root: Optional[str] = None) -> dict[str, Any]`
+  evaluates every applicable gate and returns the summary `mini-ork verify`
+  gates on (`all_pass`, `any_fail`, `any_defer`, `safety_violation`, `gates`).
 
-Gates fire in declaration order. First non-zero exit stops the chain unless `continue_on_fail: true`.
+Registered gates run per task class when `mini-ork verify` calls
+`gate_run_all`. A `workflow.yaml` node no longer takes a gate list; to check
+one node's output, add a verifier node (a `type: verifier` node with a
+`verifier_ref`) — the recipe's own verifier script is the check.

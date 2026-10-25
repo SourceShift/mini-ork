@@ -7,14 +7,14 @@ description: >
 
 nodes:
   - { name: planner,           type: planner,    model_lane: planner,       prompt_ref: prompts/planner.md,              dispatch_mode: serial }
-  - { name: detection_lens,    type: researcher, model_lane: glm_lens,      prompt_ref: prompts/lens-detection.md,       dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: containment_lens,  type: researcher, model_lane: kimi_lens,     prompt_ref: prompts/lens-containment.md,     dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: diagnosis_lens,    type: researcher, model_lane: codex_lens,    prompt_ref: prompts/lens-diagnosis.md,       dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: recovery_lens,     type: researcher, model_lane: opus_lens,     prompt_ref: prompts/lens-recovery.md,        dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: prevention_lens,   type: researcher, model_lane: minimax_lens,  prompt_ref: prompts/lens-prevention.md,      dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: synthesizer,       type: reviewer,   model_lane: reviewer,      prompt_ref: prompts/synthesis.md,            dispatch_mode: serial,   gates: [budget_gate] }
+  - { name: detection_lens,    type: researcher, model_lane: glm_lens,      prompt_ref: prompts/lens-detection.md,       dispatch_mode: parallel }
+  - { name: containment_lens,  type: researcher, model_lane: kimi_lens,     prompt_ref: prompts/lens-containment.md,     dispatch_mode: parallel }
+  - { name: diagnosis_lens,    type: researcher, model_lane: codex_lens,    prompt_ref: prompts/lens-diagnosis.md,       dispatch_mode: parallel }
+  - { name: recovery_lens,     type: researcher, model_lane: opus_lens,     prompt_ref: prompts/lens-recovery.md,        dispatch_mode: parallel }
+  - { name: prevention_lens,   type: researcher, model_lane: minimax_lens,  prompt_ref: prompts/lens-prevention.md,      dispatch_mode: parallel }
+  - { name: synthesizer,       type: reviewer,   model_lane: reviewer,      prompt_ref: prompts/synthesis.md,            dispatch_mode: serial }
   - { name: runbook_completeness, type: verifier, verifier_ref: verifiers/runbook-completeness.py, dispatch_mode: serial }
-  - { name: publisher,         type: publisher,  prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
+  - { name: publisher,         type: publisher,  prompt_ref: null, dispatch_mode: serial }
   - { name: rollback,          type: rollback,   prompt_ref: null, dispatch_mode: serial }
 
 edges:

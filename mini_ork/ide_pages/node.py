@@ -578,7 +578,6 @@ def _kv_items(node: Node, duration: str, run: "Run") -> list[dict[str, str]]:
         {"k": "Tokens", "v": tokens_v, "c": "text" if tokens is not None else "muted"},
         {"k": "Skills", "v": ", ".join(skills) or "—",
          "c": "text" if skills else "muted"},
-        {"k": "Gates", "v": ", ".join(node.gates) or "—", "c": "text"},
     ]
 
 

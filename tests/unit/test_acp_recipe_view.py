@@ -400,7 +400,6 @@ def test_recipe_card_includes_steps_flow_checks(monkeypatch, tmp_path, home):
                 "type": "implementer",
                 "model_lane": "implementer",
                 "verifier_ref": "verifiers/test.py",
-                "gates": ("cost", "grade"),
             },
         ],
         edges=[
@@ -452,9 +451,8 @@ def test_recipe_card_includes_steps_flow_checks(monkeypatch, tmp_path, home):
     assert "Flow:" in md
     assert "planner → doc_editor" in md
     assert "grep_assert" in md
-    # Checks column lists verifier filenames + gates.
+    # Checks column lists verifier filenames.
     assert "test.py" in md
-    assert "gate:cost" in md
     # Artifact contract rows.
     assert "framework-edit.diff" in md
     assert "rollback" in md

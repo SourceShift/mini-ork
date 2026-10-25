@@ -26,16 +26,16 @@ nodes:
   # JSON reply gate (_NODE_SHAPE_PREDICATES), which shape-rejected every
   # markdown scan and re-ran the fallback chain (iter-1-20261023054815:
   # 4 lanes, $4.84, 21.8 min). Same model (opus), no reply gate.
-  - { name: bottleneck_lens,     type: researcher,  model_lane: opus_lens,       prompt_ref: prompts/bottleneck-scan.md,      dispatch_mode: serial,   gates: [budget_gate] }
-  - { name: perf_lens,           type: researcher,  model_lane: minimax_lens,    prompt_ref: prompts/lens-minimax-perf.md,    dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: correctness_lens,    type: researcher,  model_lane: kimi_lens,       prompt_ref: prompts/lens-kimi-correctness.md,dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: arch_lens,           type: researcher,  model_lane: codex_lens,      prompt_ref: prompts/lens-codex-arch.md,      dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: bottleneck_lens,     type: researcher,  model_lane: opus_lens,       prompt_ref: prompts/bottleneck-scan.md,      dispatch_mode: serial }
+  - { name: perf_lens,           type: researcher,  model_lane: minimax_lens,    prompt_ref: prompts/lens-minimax-perf.md,    dispatch_mode: parallel }
+  - { name: correctness_lens,    type: researcher,  model_lane: kimi_lens,       prompt_ref: prompts/lens-kimi-correctness.md,dispatch_mode: parallel }
+  - { name: arch_lens,           type: researcher,  model_lane: codex_lens,      prompt_ref: prompts/lens-codex-arch.md,      dispatch_mode: parallel }
   # arxiv_lens (not arxiv_lens) so dispatcher writes lens-arxiv.md
   # via the _lens heuristic; the verifier reads markdown not JSON context.
-  - { name: arxiv_lens,          type: researcher,  model_lane: codex_lens,      prompt_ref: prompts/arxiv-researcher.md,     dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: opus_synthesizer,    type: reviewer,    model_lane: opus_lens,       prompt_ref: prompts/opus-synthesis.md,       dispatch_mode: serial,   gates: [budget_gate] }
+  - { name: arxiv_lens,          type: researcher,  model_lane: codex_lens,      prompt_ref: prompts/arxiv-researcher.md,     dispatch_mode: parallel }
+  - { name: opus_synthesizer,    type: reviewer,    model_lane: opus_lens,       prompt_ref: prompts/opus-synthesis.md,       dispatch_mode: serial }
   - { name: bottlenecks_found,   type: verifier,    verifier_ref: verifiers/bottlenecks-found.py, dispatch_mode: serial }
-  - { name: implementer,         type: implementer, model_lane: codex_lens,      prompt_ref: prompts/implementer.md,          dispatch_mode: serial,   gates: [scope_gate, budget_gate] }
+  - { name: implementer,         type: implementer, model_lane: codex_lens,      prompt_ref: prompts/implementer.md,          dispatch_mode: serial }
   - { name: self_tests_pass,     type: verifier,    verifier_ref: verifiers/self-tests-pass.py,   dispatch_mode: serial }
   - { name: no_regression,       type: verifier,    verifier_ref: verifiers/no-regression.py,     dispatch_mode: serial }
   # opus_patch_critic (NOT *synth* so the executor takes the classic-reviewer
@@ -46,8 +46,8 @@ nodes:
   # a diff can pass pytest yet be off-plan, gamed, or a no-op. Runs only after
   # the cheap deterministic triple passes (depends_on no_regression), so opus is
   # never paid to review a patch already caught by tests.
-  - { name: opus_patch_critic,   type: reviewer,    model_lane: opus_lens,       prompt_ref: prompts/patch-critic.md,          dispatch_mode: serial,   gates: [budget_gate] }
-  - { name: publisher,           type: publisher,   prompt_ref: null,                            dispatch_mode: serial,   gates: [scope_gate] }
+  - { name: opus_patch_critic,   type: reviewer,    model_lane: opus_lens,       prompt_ref: prompts/patch-critic.md,          dispatch_mode: serial }
+  - { name: publisher,           type: publisher,   prompt_ref: null,                            dispatch_mode: serial }
   - { name: rollback,            type: rollback,    prompt_ref: null,                            dispatch_mode: serial }
 
 edges:

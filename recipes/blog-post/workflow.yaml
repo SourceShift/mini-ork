@@ -11,14 +11,14 @@ description: >
 # model lanes via config/agents.yaml.
 nodes:
   - { name: planner,         type: planner,    model_lane: planner,        prompt_ref: prompts/planner.md,           dispatch_mode: serial }
-  - { name: editor_lens,     type: researcher, model_lane: glm_lens,       prompt_ref: prompts/lens-editor.md,       dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: researcher_lens, type: researcher, model_lane: kimi_lens,      prompt_ref: prompts/lens-researcher.md,   dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: narrative_lens,  type: researcher, model_lane: codex_lens,     prompt_ref: prompts/lens-narrative.md,    dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: audience_lens,   type: researcher, model_lane: opus_lens,      prompt_ref: prompts/lens-audience.md,     dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: counter_lens,    type: researcher, model_lane: minimax_lens,   prompt_ref: prompts/lens-counter.md,      dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: synthesizer,     type: reviewer,   model_lane: reviewer,       prompt_ref: prompts/synthesis.md,         dispatch_mode: serial,   gates: [budget_gate] }
+  - { name: editor_lens,     type: researcher, model_lane: glm_lens,       prompt_ref: prompts/lens-editor.md,       dispatch_mode: parallel }
+  - { name: researcher_lens, type: researcher, model_lane: kimi_lens,      prompt_ref: prompts/lens-researcher.md,   dispatch_mode: parallel }
+  - { name: narrative_lens,  type: researcher, model_lane: codex_lens,     prompt_ref: prompts/lens-narrative.md,    dispatch_mode: parallel }
+  - { name: audience_lens,   type: researcher, model_lane: opus_lens,      prompt_ref: prompts/lens-audience.md,     dispatch_mode: parallel }
+  - { name: counter_lens,    type: researcher, model_lane: minimax_lens,   prompt_ref: prompts/lens-counter.md,      dispatch_mode: parallel }
+  - { name: synthesizer,     type: reviewer,   model_lane: reviewer,       prompt_ref: prompts/synthesis.md,         dispatch_mode: serial }
   - { name: draft_completeness, type: verifier, verifier_ref: verifiers/draft-completeness.py, dispatch_mode: serial }
-  - { name: publisher,       type: publisher,  prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
+  - { name: publisher,       type: publisher,  prompt_ref: null, dispatch_mode: serial }
   - { name: rollback,        type: rollback,   prompt_ref: null, dispatch_mode: serial }
 
 edges:

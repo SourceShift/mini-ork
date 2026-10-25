@@ -101,7 +101,6 @@ def fingerprint(recipe_name: str, home: Path | None = None) -> dict[str, Any]:
                 "prompt_ref": n.get("prompt_ref"),
                 "verifier_ref": n.get("verifier_ref"),
                 "dispatch_mode": n.get("dispatch_mode"),
-                "gates": n.get("gates") or [],
             }
         )
     family_counts: dict[str, int] = {}

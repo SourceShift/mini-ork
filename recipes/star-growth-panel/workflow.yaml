@@ -9,11 +9,11 @@ description: >
   respect to both repositories.
 
 nodes:
-  - { name: growth_lens, type: researcher, model_lane: codex_lens, prompt_ref: prompts/growth-lens.md, dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: activation_lens, type: researcher, model_lane: glm_lens, prompt_ref: prompts/activation-lens.md, dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: ecosystem_lens, type: researcher, model_lane: deepseek_lens, prompt_ref: prompts/ecosystem-lens.md, dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: capability_lens, type: researcher, model_lane: minimax_lens, prompt_ref: prompts/capability-lens.md, dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: synthesizer, type: reviewer, model_lane: reviewer, prompt_ref: prompts/synthesis.md, dispatch_mode: serial, gates: [budget_gate] }
+  - { name: growth_lens, type: researcher, model_lane: codex_lens, prompt_ref: prompts/growth-lens.md, dispatch_mode: parallel }
+  - { name: activation_lens, type: researcher, model_lane: glm_lens, prompt_ref: prompts/activation-lens.md, dispatch_mode: parallel }
+  - { name: ecosystem_lens, type: researcher, model_lane: deepseek_lens, prompt_ref: prompts/ecosystem-lens.md, dispatch_mode: parallel }
+  - { name: capability_lens, type: researcher, model_lane: minimax_lens, prompt_ref: prompts/capability-lens.md, dispatch_mode: parallel }
+  - { name: synthesizer, type: reviewer, model_lane: reviewer, prompt_ref: prompts/synthesis.md, dispatch_mode: serial }
   - { name: lens_completeness, type: verifier, verifier_ref: verifiers/lens-completeness.py, dispatch_mode: serial }
   - { name: publisher, type: publisher, prompt_ref: null, dispatch_mode: serial }
   - { name: rollback, type: rollback, prompt_ref: null, dispatch_mode: serial }

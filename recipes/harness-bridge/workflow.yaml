@@ -27,9 +27,6 @@ nodes:
     model_lane: worker
     prompt_ref: null
     dispatch_mode: serial
-    gates:
-      - scope_gate
-      - budget_gate
 
   - name: harness_verifier
     type: verifier
@@ -41,8 +38,6 @@ nodes:
     type: publisher
     prompt_ref: null
     dispatch_mode: serial
-    gates:
-      - scope_gate
 
   - name: rollback
     type: rollback

@@ -13,13 +13,13 @@ nodes:
   # 4 parallel lenses — each routes to its named family lane for
   # heterogeneous review. Rajan 2025 / Nasser 2026 motivate
   # low-correlation detectors and judge-disposition realism.
-  - { name: glm_lens,       type: researcher,  model_lane: glm_lens,     prompt_ref: prompts/lens-glm.md,    dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: kimi_lens,      type: researcher,  model_lane: kimi_lens,    prompt_ref: prompts/lens-kimi.md,   dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: codex_lens,     type: researcher,  model_lane: codex_lens,   prompt_ref: prompts/lens-codex.md,  dispatch_mode: parallel, gates: [budget_gate] }
-  - { name: opus_lens,      type: researcher,  model_lane: opus_lens,    prompt_ref: prompts/lens-opus.md,   dispatch_mode: parallel, gates: [budget_gate] }
+  - { name: glm_lens,       type: researcher,  model_lane: glm_lens,     prompt_ref: prompts/lens-glm.md,    dispatch_mode: parallel }
+  - { name: kimi_lens,      type: researcher,  model_lane: kimi_lens,    prompt_ref: prompts/lens-kimi.md,   dispatch_mode: parallel }
+  - { name: codex_lens,     type: researcher,  model_lane: codex_lens,   prompt_ref: prompts/lens-codex.md,  dispatch_mode: parallel }
+  - { name: opus_lens,      type: researcher,  model_lane: opus_lens,    prompt_ref: prompts/lens-opus.md,   dispatch_mode: parallel }
 
   # Synthesizer: authoritative composer. Runs serial after all lenses.
-  - { name: synthesizer,    type: reviewer,    model_lane: reviewer,     prompt_ref: prompts/synthesis.md,   dispatch_mode: serial,   gates: [budget_gate] }
+  - { name: synthesizer,    type: reviewer,    model_lane: reviewer,     prompt_ref: prompts/synthesis.md,   dispatch_mode: serial }
 
   # Verifier 1: JSON schema — asserts every required top-level key
   # and every C1..C9 sub-key by name, plus valid JSON syntax.
@@ -31,7 +31,7 @@ nodes:
   - { name: panel_completeness,    type: verifier, verifier_ref: verifiers/panel-completeness.py,  dispatch_mode: serial }
 
   # Publisher commits chapter-review.json; rollback recovers on failure.
-  - { name: publisher,      type: publisher,   prompt_ref: null, dispatch_mode: serial, gates: [scope_gate] }
+  - { name: publisher,      type: publisher,   prompt_ref: null, dispatch_mode: serial }
   - { name: rollback,       type: rollback,    prompt_ref: null, dispatch_mode: serial }
 
 edges:
