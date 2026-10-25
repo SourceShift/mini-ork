@@ -249,9 +249,6 @@ flowchart TB
   subgraph catalog["verifier catalog / certificate (verify/catalog.py + certify/certificate.py)"]
     VM["⑩ VERIFIER MUTATION<br/>gates/verifier_mutation.py"]
   end
-  subgraph registry["gate registry — opt-in (mini_ork/gates/gate_registry.py)"]
-    CO["⑪ CONFORMAL ABSTENTION<br/>gates/conformal_gate.py"]
-  end
   subgraph certify2["certify oracle (mini_ork/certify/oracle.py)"]
     DI["⑫ DISCRIMINATION-ANCHORED TEST EVIDENCE<br/>certify/discrimination.py + oracle.py"]
     HC["⑭ HIDDEN REGENERABLE GROUND TRUTH<br/>certify/hidden_checks.py + oracle.py + certificate.py"]
@@ -319,21 +316,9 @@ flowchart TB
 
 **Evidence.** Writes a `<card>.mutation.json` sidecar; the certificate may carry `mutation_kill_score`.
 
-## ⑪ Conformal abstention (G07-T01): `mini_ork/gates/conformal_gate.py`
+## ⑪ Conformal abstention — removed (2026-10)
 
-**What it checks.** Whether the oracle's nonconformity score is safe to publish. A split-conformal threshold computed from labelled pass history decides.
-
-**How it decides.**
-- **Above threshold.** The gate defers and enqueues an oversight item with reason `conformal-threshold-exceeded`; the gate never converts abstention into a pass.
-- **Below threshold.** Admits.
-- **Off by default** (`MO_CONFORMAL_ORACLE=0`).
-
-**Knobs.**
-- `MO_CONFORMAL_ORACLE` (`0`): master switch.
-- `MO_CONFORMAL_ALPHA` (0.10): conformal risk level; tighten-only.
-- `MO_CONFORMAL_MIN_CALIB` (30): minimum calibration rows; raise-only.
-
-**Evidence.** The gate delegates to the existing `abstain_gate` calibration rather than re-implementing it.
+The split-conformal gate (`gates/conformal_gate.py`) and the calibrated `abstain_gate` evaluator were removed: no verifier writes a confidence or a false-positive label, so neither ever had calibration data, and the only switch (a recipe's per-node `gates:` list) is never read by the executor. The Learn-Then-Test bar in `gates/abstain_gate.py` stays; the self-driving escalation policy uses it. See `docs/plans/2026-10-25-ecosystem-section6.md`.
 
 ## ⑫ Discrimination-anchored test evidence (G06-T01): `mini_ork/certify/discrimination.py`, `mini_ork/certify/oracle.py`
 
@@ -392,7 +377,7 @@ Set its master knob to `0`, for one run or in `config/secrets.local.sh`:
 MO_ASSAY_RELATIONS=0 MO_ASSAY_DIFFERENTIAL=0 mini-ork certify ...      # oracle terms
 MO_SUITE_ADEQUACY=0 MO_LEVEL_VECTOR=0 mini-ork run code-fix kickoff.md # code-fix gates
 MO_PROMOTION_GATE_HACKABILITY=0 mini-ork promote --candidate <id>     # promotion consumer
-MO_ORACLE_INTEGRITY=0 MO_JUDGE_VALIDITY=0 MO_REWARD_EVIDENCE_PAIRING=0 MO_VERIFIER_MUTATION=0 MO_ASSAY_DISCRIMINATION=0 MO_ASSAY_HIDDEN=0 MO_CONFORMAL_ORACLE=0 mini-ork certify ...  # 2026-10 review opt-outs
+MO_ORACLE_INTEGRITY=0 MO_JUDGE_VALIDITY=0 MO_REWARD_EVIDENCE_PAIRING=0 MO_VERIFIER_MUTATION=0 MO_ASSAY_DISCRIMINATION=0 MO_ASSAY_HIDDEN=0 mini-ork certify ...  # 2026-10 review opt-outs
 ```
 
 With a knob at `0`, verdicts are byte-identical to the pre-feature behaviour.
@@ -412,10 +397,10 @@ With a knob at `0`, verdicts are byte-identical to the pre-feature behaviour.
   - Code-fix adds up to 2 + `MAX_MUTANTS` suite runs per green verifier.
 - **Reviewer interaction.** The glm reviewer already rejects runs whose verifier reported `pass:false`. The level gate
   matters most where the verifier is *green but unproven*, which the reviewer approves.
-- **Honest limits (2026-10 review).** Two of the eight instruments are **OFF by default** because each changes
-  promotion outcomes: `MO_JUDGE_VALIDITY` (reviewer-vs-execution agreement) and `MO_CONFORMAL_ORACLE` (split-conformal
-  abstention). Both abstain rather than block when unmeasured — neither converts abstention into a pass — so flipping
-  either to `1` is a deliberate promotion-policy change, not a quality-of-life toggle.
+- **Honest limits (2026-10 review).** One instrument is **OFF by default** because it changes promotion outcomes:
+  `MO_JUDGE_VALIDITY` (reviewer-vs-execution agreement). It abstains rather than blocks when unmeasured — it never
+  converts abstention into a pass — so flipping it to `1` is a deliberate promotion-policy change, not a
+  quality-of-life toggle. (The split-conformal abstention gate, `MO_CONFORMAL_ORACLE`, was removed in 2026-10.)
 - **Hidden-check hiding is strongest with a secret.** With `MO_HIDDEN_CHECK_SECRET` set, the variant names are
   unpredictable to the implementer. With only `run_id` or the patch digest they are reproducible by anyone who knows
   those inputs — so the certificate records `key_source` rather than implying secret-backed hiding.

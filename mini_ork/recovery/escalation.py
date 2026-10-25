@@ -232,9 +232,8 @@ def _calibrated_bar(rows: list[tuple[float, bool]]) -> float | None:
     through on the bootstrap" — the fail-closed direction.
 
     ``MIN_LABELS`` is imported from the policy rather than re-hard-coded, and
-    ``abstain_gate`` is imported lazily because importing it registers the gate
-    via the OCP seam — a side effect not worth paying on the overwhelmingly
-    common path where nothing is labelled yet.
+    ``abstain_gate`` (which now holds only the LTT bar) is imported lazily so
+    the common path, where nothing is labelled yet, pays nothing.
     """
     if len(rows) < escalation_policy.MIN_LABELS:
         return None
