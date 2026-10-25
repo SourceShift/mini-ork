@@ -53,14 +53,13 @@ edges:
   - { from: reflector, to: replanner, edge_type: depends_on }
   - { from: replanner, to: implementer, edge_type: depends_on, recursive: true }
 
+# convergence (informational): all_dod_probes_pass
+# divergence (informational): Iteration N+1 produces same verifier-fail signature as iteration N.
+#   Detected by hashing the failure-log sorted by stage. Two identical
+#   hashes in a row -> escalate to operator instead of looping forever.
+# per-iteration cap (removed in 2026-10, nothing read it): 20.00
 recursion:
   max_iterations: 5
-  convergence_check: all_dod_probes_pass
-  budget_cap_per_iter_usd: 20.00
   budget_cap_total_usd: 60.00
-  divergence_kill: |
-    Iteration N+1 produces same verifier-fail signature as iteration N.
-    Detected by hashing the failure-log sorted by stage. Two identical
-    hashes in a row -> escalate to operator instead of looping forever.
 
 rollback_strategy: keep_partial_drain_discard_failed_iter

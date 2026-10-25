@@ -140,10 +140,7 @@ def test_workflow_yaml_parses_and_validates_recursion():
 
     expected = {
         "max_iterations",
-        "convergence_check",
-        "budget_cap_per_iter_usd",
         "budget_cap_total_usd",
-        "divergence_kill",
     }
     assert set(wf["recursion"].keys()) == expected
 

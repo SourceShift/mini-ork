@@ -31,29 +31,21 @@ REPO = Path(__file__).resolve().parents[2]
 DECLARED = {
     "doc-to-features-loop": {
         "max_iterations": 8,
-        "convergence_check": "all_p0_features_passed",
-        "budget_cap_per_iter_usd": 15.0,
         "budget_cap_total_usd": 100.0,
     },
     "goal-loop": {
         "max_iterations": 30,
-        "convergence_check": "all_goal_units_pass",
-        "budget_cap_per_iter_usd": 10.0,
         "budget_cap_total_usd": 150.0,
     },
     "prompt-graph-loop": {
         "max_iterations": 5,
-        "convergence_check": "human_decision_approved_and_aggregation_complete",
-        "budget_cap_per_iter_usd": 4.0,
         "budget_cap_total_usd": 20.0,
     },
-    # Caps raised 5/25 -> 20/60 (2026-10-14): per-iteration repair budgets of $5
+    # Total cap raised 25 -> 60 (2026-10-14): per-iteration repair budgets of $5
     # were killing healthy multi-lane children before their panels converged, and
     # the exhaustion was reported as a failure the verdicts had already passed.
     "recursive-validate-impl": {
         "max_iterations": 5,
-        "convergence_check": "all_dod_probes_pass",
-        "budget_cap_per_iter_usd": 20.0,
         "budget_cap_total_usd": 60.0,
     },
 }
@@ -68,10 +60,7 @@ def _write(tmp_path: Path, document: dict) -> Path:
 def _block(**overrides) -> dict:
     base = {
         "max_iterations": 5,
-        "convergence_check": "check",
-        "budget_cap_per_iter_usd": 1.0,
         "budget_cap_total_usd": 5.0,
-        "divergence_kill": "kill",
     }
     base.update(overrides)
     return base
@@ -87,15 +76,7 @@ def test_declared_recipe_round_trips(recipe: str) -> None:
     assert config is not None
     expected = DECLARED[recipe]
     assert config.max_iterations == expected["max_iterations"]
-    assert config.convergence_check == expected["convergence_check"]
-    assert config.budget_cap_per_iter_usd == expected["budget_cap_per_iter_usd"]
     assert config.budget_cap_total_usd == expected["budget_cap_total_usd"]
-    # divergence_kill is free prose (multi-line, trailing newline in every
-    # declaring recipe); assert it survives verbatim rather than normalized.
-    assert config.divergence_kill.strip()
-    assert config.divergence_kill == yaml.safe_load(
-        (REPO / "recipes" / recipe / "workflow.yaml").read_text()
-    )["recursion"]["divergence_kill"]
 
 
 def test_config_is_frozen() -> None:
@@ -137,7 +118,7 @@ def test_unknown_key_raises(tmp_path: Path) -> None:
 
 
 def test_partial_block_raises(tmp_path: Path) -> None:
-    """The schema allows this (no `required` array); the loader must not.
+    """The schema requires both keys; the loader rejects a partial block too.
 
     A partial block that quietly picks up a hardcoded default is the exact
     "edit the YAML and nothing happens" bug this reader exists to fix.
@@ -163,12 +144,6 @@ def test_zero_iterations_raises(tmp_path: Path) -> None:
 def test_negative_budget_raises(tmp_path: Path) -> None:
     path = _write(tmp_path, {"recursion": _block(budget_cap_total_usd=-1)})
     with pytest.raises(RecursionConfigError, match=">= 0"):
-        load_recursion_config(path)
-
-
-def test_empty_convergence_check_raises(tmp_path: Path) -> None:
-    path = _write(tmp_path, {"recursion": _block(convergence_check="   ")})
-    with pytest.raises(RecursionConfigError, match="non-empty string"):
         load_recursion_config(path)
 
 
@@ -198,13 +173,10 @@ def test_integer_budget_coerces_to_float(tmp_path: Path) -> None:
 
 
 def test_field_order_matches_schema() -> None:
-    """FIELDS mirrors the five schema properties, in schema order."""
+    """FIELDS mirrors the two schema properties, in schema order."""
     assert FIELDS == (
         "max_iterations",
-        "convergence_check",
-        "budget_cap_per_iter_usd",
         "budget_cap_total_usd",
-        "divergence_kill",
     )
 
 
@@ -225,7 +197,6 @@ def test_declared_block_reaches_the_driver() -> None:
     cannot be the fallback masquerading as the declaration.
     """
     import importlib.util
-    import os
     import sys as _sys
 
     from mini_ork.context import publish_env
@@ -245,19 +216,10 @@ def test_declared_block_reaches_the_driver() -> None:
     # Mirror execute.py's publish exactly (keys and formatting).
     publish_env({
         "MO_RECURSION_MAX_ITERATIONS": str(config.max_iterations),
-        "MO_RECURSION_CONVERGENCE_CHECK": config.convergence_check,
-        "MO_RECURSION_BUDGET_CAP_PER_ITER_USD": f"{config.budget_cap_per_iter_usd:.2f}",
         "MO_RECURSION_BUDGET_CAP_TOTAL_USD": f"{config.budget_cap_total_usd:.2f}",
-        "MO_RECURSION_DIVERGENCE_KILL": config.divergence_kill,
     })
 
     # Resolved through the driver's own helpers, with the literals as defaults
     # so a broken chain would show as 30 / 150.0 rather than as an exception.
     assert drive_mod._env_int("MO_RECURSION_MAX_ITERATIONS", 30) == 5  # noqa: SLF001
     assert drive_mod._env_float("MO_RECURSION_BUDGET_CAP_TOTAL_USD", 150.0) == 20.0  # noqa: SLF001
-    assert drive_mod._env_float("MO_RECURSION_BUDGET_CAP_PER_ITER_USD", 0.0) == 4.0  # noqa: SLF001
-    # Check strings travel verbatim.
-    assert (
-        os.environ["MO_RECURSION_CONVERGENCE_CHECK"]
-        == "human_decision_approved_and_aggregation_complete"
-    )

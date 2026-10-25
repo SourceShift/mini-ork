@@ -50,15 +50,14 @@ edges:
   - { from: reflector, to: replanner, edge_type: depends_on }
   - { from: replanner, to: contract_compiler, edge_type: depends_on, recursive: true }
 
+# convergence (informational): all_deliverables_delivered
+# divergence (informational): If iteration N's failed-deliverables set is a superset of iteration N-1's
+#   set, escalate to an operator. Detect by hashing sorted failed
+#   "<spec_id>/<deliverable_id>" IDs and stopping when the hash repeats for
+#   two consecutive iterations.
+# per-iteration cap (removed in 2026-10, nothing read it): 15.00
 recursion:
   max_iterations: 6
-  convergence_check: all_deliverables_delivered
-  budget_cap_per_iter_usd: 15.00
   budget_cap_total_usd: 100.00
-  divergence_kill: |
-    If iteration N's failed-deliverables set is a superset of iteration N-1's
-    set, escalate to an operator. Detect by hashing sorted failed
-    "<spec_id>/<deliverable_id>" IDs and stopping when the hash repeats for
-    two consecutive iterations.
 
 rollback_strategy: keep_partial_pass_discard_failed_iter

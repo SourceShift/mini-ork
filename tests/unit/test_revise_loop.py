@@ -459,10 +459,7 @@ def test_recursion_block_publishes_the_escalation_loop(tmp_path):
     back-edge is published so the reset can reach the loop body."""
     cw = _compile_yaml(tmp_path, _escalation_workflow(recursion={
         "max_iterations": 5,
-        "convergence_check": "all_dod_probes_pass",
-        "budget_cap_per_iter_usd": 20.0,
         "budget_cap_total_usd": 60.0,
-        "divergence_kill": "same signature twice -> escalate",
     }))
     assert cw.escalation_edges["synth"].target == "reflector"
     assert cw.escalation_edges["synth"].max_rounds == 5   # the declared cap
@@ -477,10 +474,7 @@ def test_retries_edge_outranks_an_escalation_on_the_same_source(tmp_path):
     escalation must not silently replace it."""
     workflow = _escalation_workflow(recursion={
         "max_iterations": 5,
-        "convergence_check": "all_dod_probes_pass",
-        "budget_cap_per_iter_usd": 20.0,
         "budget_cap_total_usd": 60.0,
-        "divergence_kill": "n/a",
     })
     workflow["edges"].append(
         {"from": "synth", "to": "implementer", "edge_type": "retries",

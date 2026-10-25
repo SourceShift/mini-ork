@@ -55,12 +55,10 @@
       "type": "object",
       "description": "Optional bounded recursion configuration for recursive recipes.",
       "additionalProperties": false,
+      "required": ["max_iterations", "budget_cap_total_usd"],
       "properties": {
         "max_iterations": { "type": "integer", "minimum": 1 },
-        "convergence_check": { "type": "string" },
-        "budget_cap_per_iter_usd": { "type": "number", "minimum": 0 },
-        "budget_cap_total_usd": { "type": "number", "minimum": 0 },
-        "divergence_kill": { "type": "string" }
+        "budget_cap_total_usd": { "type": "number", "minimum": 0 }
       }
     },
     "source_artifact": {

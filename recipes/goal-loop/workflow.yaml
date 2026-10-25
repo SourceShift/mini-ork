@@ -63,14 +63,13 @@ edges:
   - { from: goal_apply,       to: goal_check,        edge_type: depends_on }
   - { from: goal_check,       to: publisher,         edge_type: depends_on }
 
+# convergence (informational): all_goal_units_pass
+# divergence (informational): Wave N+1 produces the same failing-unit set as wave N.
+#   Detected by hashing the sorted list of failing unit ids from panel-verdict.json.
+#   Two identical hashes in a row -> escalate to operator instead of looping forever.
+# per-iteration cap (removed in 2026-10, nothing read it): 10.00
 recursion:
   max_iterations: 30
-  convergence_check: all_goal_units_pass
-  budget_cap_per_iter_usd: 10.00
   budget_cap_total_usd: 150.00
-  divergence_kill: |
-    Wave N+1 produces the same failing-unit set as wave N. Detected by hashing
-    the sorted list of failing unit ids from panel-verdict.json. Two identical
-    hashes in a row -> escalate to operator instead of looping forever.
 
 source_artifact: panel-verdict.json

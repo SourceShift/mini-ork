@@ -1,6 +1,6 @@
 """Read the ``recursion:`` block a recipe workflow declares.
 
-``schemas/workflow.schema.json`` has enforced this block since the five-key
+``schemas/workflow.schema.json`` has enforced this block since the recursion
 lock, but nothing consumed it: a recipe could declare ``max_iterations: 5``
 and the driver that actually ran the loop would still use its own hardcoded
 default. The declaration was decoration — editing it changed nothing.
@@ -10,12 +10,15 @@ file in, one immutable config out, no env reads and no defaults. Resolution
 order (caller → declared → literal) belongs at the consumption site, not here,
 so that "what did the recipe declare?" stays answerable on its own.
 
-**Stricter than the schema.** The schema lists the five properties under
-``additionalProperties: false`` but declares no ``required`` array, so a
-partial block validates. This loader rejects one: a missing key would otherwise
-silently fall back to a hardcoded default at the consumption site, which is the
-same "edit the YAML and nothing happens" failure in a smaller costume. Unknown
-keys raise too, so a typo is caught at load rather than at 3am.
+**Only what runs.** The block declares the two declared caps a reader actually
+honors: ``max_iterations`` and ``budget_cap_total_usd``. Three keys —
+``budget_cap_per_iter_usd``, ``convergence_check`` and ``divergence_kill`` —
+were dropped in 2026-10 because nothing read them; a block that still carries
+one raises with a message saying so rather than passing silently. The schema
+declares the same two properties and requires both, and this loader agrees: a
+partial block is rejected so it cannot silently fall back to a hardcoded
+default at the consumption site. Unknown keys raise too, so a typo is caught at
+load rather than at 3am.
 """
 from __future__ import annotations
 
@@ -29,9 +32,15 @@ import yaml
 # several keys reports the first one deterministically.
 FIELDS: tuple[str, ...] = (
     "max_iterations",
-    "convergence_check",
-    "budget_cap_per_iter_usd",
     "budget_cap_total_usd",
+)
+
+# Keys that used to be declared and were read by nothing. Kept out of FIELDS so
+# a block still carrying one gets a removal notice instead of a generic
+# unknown-key error that names the key without saying why it is gone.
+REMOVED_FIELDS: tuple[str, ...] = (
+    "budget_cap_per_iter_usd",
+    "convergence_check",
     "divergence_kill",
 )
 
@@ -42,13 +51,10 @@ class RecursionConfigError(ValueError):
 
 @dataclass(frozen=True)
 class RecursionConfig:
-    """The five declared caps/conditions, verbatim from the recipe."""
+    """The two declared caps, verbatim from the recipe."""
 
     max_iterations: int
-    convergence_check: str
-    budget_cap_per_iter_usd: float
     budget_cap_total_usd: float
-    divergence_kill: str
 
 
 def _as_int(value: Any, key: str, path: Path) -> int:
@@ -76,14 +82,6 @@ def _as_float(value: Any, key: str, path: Path) -> float:
     return float(value)
 
 
-def _as_str(value: Any, key: str, path: Path) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise RecursionConfigError(
-            f"recursion.{key} must be a non-empty string in {path}"
-        )
-    return value
-
-
 def load_recursion_config(workflow_path: str | Path) -> RecursionConfig | None:
     """Return the workflow's declared recursion config, or ``None`` if it has none.
 
@@ -107,6 +105,15 @@ def load_recursion_config(workflow_path: str | Path) -> RecursionConfig | None:
     if not isinstance(raw, Mapping):
         raise RecursionConfigError(f"recursion must be an object in {path}")
 
+    # A key that was removed must say so before the generic unknown-key check:
+    # "unknown recursion key" names the key but not why it is invalid. Sorted so
+    # a block carrying several removed keys reports the same one every time.
+    removed = sorted(set(raw) & set(REMOVED_FIELDS))
+    if removed:
+        raise RecursionConfigError(
+            f"recursion.{removed[0]} was removed in 2026-10 (nothing read it); "
+            f"delete it from {path}"
+        )
     unknown = sorted(set(raw) - set(FIELDS))
     if unknown:
         raise RecursionConfigError(
@@ -117,18 +124,13 @@ def load_recursion_config(workflow_path: str | Path) -> RecursionConfig | None:
     if missing:
         raise RecursionConfigError(
             f"recursion block in {path} is missing {missing}; "
-            "declare all five keys or none (a partial block would silently "
+            "declare both keys or none (a partial block would silently "
             "fall back to a hardcoded default)"
         )
 
     return RecursionConfig(
         max_iterations=_as_int(raw["max_iterations"], "max_iterations", path),
-        convergence_check=_as_str(raw["convergence_check"], "convergence_check", path),
-        budget_cap_per_iter_usd=_as_float(
-            raw["budget_cap_per_iter_usd"], "budget_cap_per_iter_usd", path
-        ),
         budget_cap_total_usd=_as_float(
             raw["budget_cap_total_usd"], "budget_cap_total_usd", path
         ),
-        divergence_kill=_as_str(raw["divergence_kill"], "divergence_kill", path),
     )

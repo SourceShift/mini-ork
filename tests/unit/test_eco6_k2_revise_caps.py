@@ -31,10 +31,7 @@ _REPO_ROOT = Path(mini_ork.cli.execute.__file__).resolve().parents[2]
 
 _RECURSION_BLOCK = {
     "max_iterations": 4,
-    "convergence_check": "objective_delta",
-    "budget_cap_per_iter_usd": 0.50,
     "budget_cap_total_usd": 1.00,
-    "divergence_kill": "none",
 }
 
 
