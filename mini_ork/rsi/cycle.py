@@ -913,6 +913,31 @@ def _run_artifact(home: Path, run_id: str, filename: str) -> Path | None:
     return hits[-1] if hits else None
 
 
+def _verify_failure(home: Path, run_id: str) -> str:
+    """Why a recipe run's contract verify failed, in one line.
+
+    The run writes its own receipt (``verify-result.json``); the failing entries'
+    ``detail`` already name the problem — ``the panel recorded problems: [...]``
+    in the case this exists for. A missing receipt is itself the answer: the run
+    died before verifying, which is no more admissible than a failed check.
+    """
+    path = _run_artifact(home, run_id, "verify-result.json")
+    if path is None:
+        return "no verify-result.json was written"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return f"{path} is unreadable"
+    results = payload.get("results") if isinstance(payload, Mapping) else None
+    details = [
+        str(entry.get("detail") or entry.get("verifier") or "").strip()
+        for entry in (results or [])
+        if isinstance(entry, Mapping) and entry.get("pass") is False
+    ]
+    return "; ".join(detail for detail in details if detail) or (
+        f"verdict={payload.get('verdict')!r}")
+
+
 def _default_propose(req: CycleRequest, cand: Candidate) -> Proposal | None:
     """SUGGEST is the first model edge and lives in a recipe, not here.
 
@@ -964,6 +989,15 @@ def _recipe_propose(req: CycleRequest, cand: Candidate) -> Proposal:
     if path is None:
         raise CycleFailure(
             f"the SUGGEST run exited {rc} without a proposal.json (see {run_dir})")
+    if rc != 0:
+        # A non-zero exit with an artifact in hand is the panel failing *after*
+        # the synthesiser wrote: the third live cycle (2026-10-25) took a
+        # proposal from a panel that had collapsed to two families and carried
+        # its "three families" claim into IMPLEMENT. The artifact exists; the
+        # contract that makes it admissible does not.
+        raise CycleFailure(
+            f"the SUGGEST run exited {rc} with a failed contract verify: "
+            f"{_verify_failure(home, run_dir.name)} (see {run_dir})")
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except ValueError as exc:

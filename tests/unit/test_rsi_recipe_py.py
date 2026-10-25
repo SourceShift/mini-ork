@@ -495,6 +495,53 @@ def test_recipe_propose_fails_cleanly_without_an_artifact(tmp_path, monkeypatch)
         _recipe_propose(_req(tmp_path), _cand())
 
 
+def test_recipe_propose_refuses_a_proposal_from_a_failed_contract(tmp_path, monkeypatch):
+    """The artifact existing does not make it admissible.
+
+    Cycle 3's synthesizer wrote ``proposal.json`` and the panel verifier then
+    failed; the cycle carried the panel's false "three families" claim into
+    IMPLEMENT. The run's own receipt names the reason and must reach the error.
+    """
+    cand = _cand()
+    _fake_run(monkeypatch, {
+        "proposal.json": {
+            "candidate_id": cand.candidate_id,
+            "files": [FILE],
+            "summary": "persist the column",
+            "root_cause": "the producer is unwired",
+            "ac_ids": ["V1"],
+            "verification_command": cand.success_command,
+        },
+        "verify-result.json": {
+            "verdict": "fail",
+            "results": [{"verifier": "verifiers/verify.py", "pass": False, "rc": 1,
+                         "detail": "the panel recorded problems: "
+                                   "['same_family:deepseek_lens,minimax_lens:minimax']"}],
+        },
+    }, rc=1)
+
+    with pytest.raises(CycleFailure, match="failed contract verify.*same_family"):
+        _recipe_propose(_req(tmp_path), cand)
+
+
+def test_recipe_propose_still_accepts_a_proposal_from_a_clean_contract(tmp_path, monkeypatch):
+    cand = _cand()
+    _fake_run(monkeypatch, {
+        "proposal.json": {
+            "candidate_id": cand.candidate_id,
+            "files": [FILE],
+            "summary": "persist the column",
+            "root_cause": "the producer is unwired",
+            "ac_ids": ["V1"],
+            "verification_command": cand.success_command,
+        },
+        "verify-result.json": {"verdict": "pass", "results": [
+            {"verifier": "verifiers/verify.py", "pass": True, "rc": 0}]},
+    }, rc=0)
+
+    assert _recipe_propose(_req(tmp_path), cand).candidate_id == cand.candidate_id
+
+
 def test_recipe_propose_rejects_an_artifact_that_is_not_json(tmp_path, monkeypatch):
     def _run(req, recipe, brief, kickoff, *, timeout_s, brief_env):
         home = req.home / "rsi" / req.cycle_id / recipe / "home"
