@@ -90,6 +90,35 @@ def _make_db(tmp_path, *, with_apm=True, apm_rows=(), domain_rows=(),
     return path
 
 
+def _seed_traces(path, rows):
+    """Seed ``execution_traces`` with ``(lane, successes, runs)`` per lane.
+
+    The RouteMoA screen reads its per-lane outcomes from this table, so the
+    pick tests must put the same numbers there that they used to put in
+    ``agent_performance_memory``.
+    """
+    con = sqlite3.connect(path)
+    con.execute("""CREATE TABLE IF NOT EXISTS execution_traces (
+          trace_id TEXT, agent_version_id TEXT, task_class TEXT,
+          objective_domain TEXT, code_region TEXT, verifier_output TEXT,
+          reward_g REAL, cost_usd REAL, status TEXT, created_at TEXT)""")
+    trace_id = 0
+    for lane, successes, runs in rows:
+        for i in range(runs):
+            con.execute(
+                "INSERT INTO execution_traces (trace_id, agent_version_id,"
+                " task_class, objective_domain, code_region, verifier_output,"
+                " reward_g, cost_usd, status, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                [f"seed-{trace_id}", lane, TC, OD, "", "{}",
+                 1.0 if i < successes else -1.0,
+                 0.0, "success" if i < successes else "failure",
+                 "2026-10-01T00:00:00.000Z"])
+            trace_id += 1
+    con.commit()
+    con.close()
+
+
 # ── wilson_bounds ────────────────────────────────────────────────────────────
 
 
@@ -225,6 +254,7 @@ def test_pick_lane_screens_the_dominated_exploration_pick(tmp_path):
             ("lane-good", 0.05, 40, 36, 0.0),
         ],
     )
+    _seed_traces(path, [("lane-good", 18, 20), ("lane-bad", 2, 20)])
     detail = lane_router._pick_lane(TC, "", OD, "", path)
     assert detail["lane"] == "lane-good", detail
     assert detail["source"] == "domain"
@@ -306,6 +336,7 @@ def test_pick_lane_equirouter_override_only_considers_kept_lanes(tmp_path):
             ("lane-borda-keep", "r2", 0.40, 50, 45, 0.0),
         ],
     )
+    _seed_traces(path, [("lane-borda-keep", 18, 20), ("lane-borda-bad", 1, 20)])
     detail = lane_router._pick_lane(TC, "", OD, "r1", path)
     assert detail["source"] == "region"
     assert detail["lane"] == "lane-borda-keep", detail

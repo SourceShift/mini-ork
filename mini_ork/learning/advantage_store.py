@@ -23,6 +23,7 @@ gates (tests/unit/test_lane_router_py.py) keep passing byte-for-byte.
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 
@@ -36,6 +37,13 @@ def resolve_db_path(db: str | None) -> str:
         return env
     home = os.environ.get("MINI_ORK_HOME", ".mini-ork")
     return os.path.join(home, "state.db")
+
+
+def _trace_node_type(raw) -> str:
+    try:
+        return json.loads(raw or "{}").get("node_type") or "unknown"
+    except Exception:
+        return "unknown"
 
 
 class AdvantageStore:
@@ -165,25 +173,60 @@ class AdvantageStore:
                 continue
         return caps
 
-    def fetch_lane_run_stats(self, task_class: str) -> dict:
-        """``lane -> (success_count, runs_count)`` for ``task_class``.
+    def fetch_lane_run_stats(self, task_class: str, node_type: str = "",
+                             objective_domain: str = "") -> dict:
+        """``lane -> (successes, runs)`` for the routed slice's own outcomes.
 
         RouteMoA's dominance screen reads this once per pick: it feeds the
         Wilson intervals that decide which lanes the data already rules out.
+
+        The source is ``execution_traces`` rather than
+        ``agent_performance_memory`` because that table does not hold a real
+        success count: ``recompute_advantages`` overwrites ``success_count``
+        with the number of GRPO groups the lane won while ``runs_count`` counts
+        rows, so "wins / rows" falls as a lane gets busier. The table also has
+        no ``node_type``, so reviewer verdicts were mixed into implementer
+        screens. Counting ``status == 'success'`` over the slice's own
+        reward-bearing ``execution_traces`` rows — the same ``(task_class,
+        node_type, objective_domain)`` slice the router learns from — measures
+        what the screen actually needs.
+
         Deliberately does NOT swallow a missing table — the caller treats any
         failure here as "no stats" and falls back to the unscreened candidates,
         so one try/except at the call site covers both fetch and screen.
         """
+        cols = self.execution_trace_columns()
+        if not cols:
+            raise sqlite3.OperationalError("no such table: execution_traces")
+        where = [
+            "task_class = ?",
+            "agent_version_id IS NOT NULL",
+            "agent_version_id <> ''",
+            "objective_domain IS NOT NULL",
+            "objective_domain <> ''",
+            "reward_g IS NOT NULL",
+        ]
+        params: list = [task_class]
+        if objective_domain:
+            where.append("objective_domain = ?")
+            params.append(objective_domain)
+        if "validity" in cols:
+            where.append(
+                "(validity IS NULL OR trim(validity) = '' "
+                "OR lower(trim(validity)) = 'valid')")
         rows = self.con.execute(
-            "SELECT agent_version_id, success_count, runs_count "
-            "FROM agent_performance_memory WHERE task_class=?",
-            (task_class,)).fetchall()
+            "SELECT agent_version_id, status, verifier_output "
+            "FROM execution_traces WHERE " + " AND ".join(where),
+            params).fetchall()
         stats: dict = {}
-        for lane, successes, runs in rows:
-            try:
-                stats[lane] = (int(successes), int(runs))
-            except (TypeError, ValueError):
+        for lane, status, verifier_output in rows:
+            if node_type and _trace_node_type(verifier_output) != node_type:
                 continue
+            successes, runs = stats.get(lane, (0, 0))
+            runs += 1
+            if status == "success":
+                successes += 1
+            stats[lane] = (successes, runs)
         return stats
 
     def fetch_prior_domain(self) -> dict:

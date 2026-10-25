@@ -596,15 +596,15 @@ def _pick_lane(task_class: str, node_type: str, objective_domain: str,
         caps: dict = {}
         if _entrorouter_enabled():
             caps = store.fetch_lane_capabilities(task_class)
-        # RouteMoA dominance screen: per-lane (success_count, runs_count) from
-        # the global performance table, fetched once per pick. Any failure here
-        # (missing table, malformed row) degrades to "no stats" — screening is
-        # an optimisation and must never break a pick.
+        # RouteMoA dominance screen: per-lane (successes, runs) from the routed
+        # slice's own execution_traces outcomes, fetched once per pick. Any
+        # failure here (missing table, malformed row) degrades to "no stats" —
+        # screening is an optimisation and must never break a pick.
         lane_stats: dict | None = None
         screen_on = screening.enabled()
         if screen_on:
             try:
-                lane_stats = store.fetch_lane_run_stats(task_class)
+                lane_stats = store.fetch_lane_run_stats(task_class, node_type, objective_domain)
             except Exception:
                 lane_stats = None
         screened_out: list[dict] = []

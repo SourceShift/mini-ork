@@ -5,13 +5,13 @@ predictor BEFORE inference and drops the ones that cannot win. mini-ork's
 router ranks lanes from learned per-lane stats, but exploration keeps spending
 real dispatches on lanes the data already rules out.
 
-This module adds the missing screen. Given per-lane ``(success_count,
-runs_count)`` from ``agent_performance_memory``, it puts a Wilson score
-interval around each lane's observed success rate and drops a lane whose
-interval sits strictly below another candidate's. The comparison is
-conservative on purpose — intervals must separate, not just order — so a
-screened lane is one the evidence already rules out, not one that merely lost
-a point estimate.
+This module adds the missing screen. Given per-lane ``(successes, runs)``
+over the routed slice's reward-bearing ``execution_traces``
+(``AdvantageStore.fetch_lane_run_stats``), it puts a Wilson score interval
+around each lane's observed success rate and drops a lane whose interval sits
+strictly below another candidate's. The comparison is conservative on purpose
+— intervals must separate, not just order — so a screened lane is one the
+evidence already rules out, not one that merely lost a point estimate.
 
 Exploration is preserved: a lane with fewer than ``min_runs`` runs is never
 screened because its interval is still too wide to rule it out. The screen can
