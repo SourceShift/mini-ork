@@ -17,6 +17,13 @@
 
 <p align="center">English | <a href="README.zh-CN.md">简体中文</a></p>
 
+<p align="center">
+  <a href="https://miniork.dev/media/mini-ork-demo.mp4">
+    <img src="assets/mini-ork-demo.gif" alt="A code-fix run in the mini-ork IDE: classify, plan, implement, verify, three review lenses, publish, then Keep or Reject for each changed file" width="900">
+  </a>
+</p>
+<p align="center"><sub>A <code>code-fix</code> run in the mini-ork IDE: classify → plan → implement → verify → three review lenses on three model families → publish, then each changed file waits for Keep or Reject. Sample run from the <a href="https://miniork.dev/">walkthrough</a> · <a href="https://miniork.dev/media/mini-ork-demo.mp4">full-quality video</a>.</sub></p>
+
 mini-ork turns a goal into a planned, executed, and **verified** run across a fleet of
 models: **classify → plan → execute → verify → reflect → improve**. Every verdict comes
 from what the code actually did when it ran — tests, type checks, schemas, execution in

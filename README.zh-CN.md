@@ -23,6 +23,13 @@
 > 本页尚未同步到以安装为主的新版结构。安装步骤、`mini-ork onboard` 首次运行向导，以及
 > ContextNest / Zed 组件说明，请以 [英文 README](README.md) 为准。
 
+<p align="center">
+  <a href="https://miniork.dev/media/mini-ork-demo.mp4">
+    <img src="assets/mini-ork-demo.gif" alt="mini-ork IDE 中的一次 code-fix 运行：分类、规划、实现、验证、三个评审视角、发布，然后逐个文件 Keep 或 Reject" width="900">
+  </a>
+</p>
+<p align="center"><sub>mini-ork IDE 中的一次 <code>code-fix</code> 运行：分类 → 规划 → 实现 → 验证 → 来自三个模型家族的三个评审视角 → 发布，随后每个改动文件等待 Keep 或 Reject。示例运行，来自 <a href="https://miniork.dev/">miniork.dev</a> 的演示 · <a href="https://miniork.dev/media/mini-ork-demo.mp4">完整视频</a>。</sub></p>
+
 mini-ork 把一个目标变成一次经过规划、执行、并被**验证**的运行，背后由一组不同的模型协同完成：**分类 → 规划 → 执行 → 验证 → 反思 → 改进**。对每一次改动的裁决，依据的是代码**在真实运行时实际做了什么**——测试、类型检查、schema 校验、在隔离沙箱中的真实执行——而不是某个模型对自己输出的看法。
 
 它是为这样的团队准备的:希望 agent 真正完成工作,而不是把流畅的输出、一个看起来是绿色的 diff,或者一组相互附和的模型,当作证据。
