@@ -24,6 +24,17 @@ Storage: ``<state_dir>/services.json``. Env **values** are never written to
 disk — only the key names. A create request carries the values in memory and
 hands them to ``docker run``; a later restart uses ``docker restart``, which
 does not need them. This mirrors the D6 rule in ``procs.py``.
+
+**Volumes** are the one durable thing a service owns, so they are deliberately
+half-specified. A deployment document names a volume and the path it wants
+inside the container; the node alone decides where on its disk that volume
+lives — ``<volume_root>/<service_id>/<name>``. A control plane that sent a host
+path could mount ``/etc`` or another tenant's directory into a container, and
+no amount of path cleaning makes that a safe interface. ``volume_root`` is
+``MO_NODE_VOLUME_ROOT`` when set (the secure tier: a backed-up, encrypted disk)
+and ``<state_dir>/volumes`` otherwise (the simple tier: a laptop). A relative
+env value raises rather than falling back — a volume that silently lands on the
+container's ephemeral layer is data loss the tenant only discovers on redeploy.
 """
 from __future__ import annotations
 
@@ -52,6 +63,20 @@ _LABEL_DEPLOYMENT = "mo.deployment"
 
 _RESTART_POLICIES = frozenset({"no", "on-failure", "always", "unless-stopped"})
 
+#: A volume name is an *identity*, not a path: it becomes one directory below
+#: the node's volume root, so it is held to a stricter shape than the service id
+#: (no dots, hence no ``..``) and never interpreted as anything but a leaf name.
+_VOLUME_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+
+#: Container-side mount paths. Absolute, no ``:`` (Docker's field separator for
+#: the ``-v host:container:opts`` triage), and no ``..`` segment — the same rule
+#: the published schema states, enforced here as well because the node must not
+#: depend on the caller having validated.
+_MOUNT_PATH_RE = re.compile(r"^(/(?!\.\.?(/|$))[^:\x00/]+)+$")
+
+#: Where a node keeps service volumes when the operator has not named a root.
+_VOLUME_ROOT_ENV = "MO_NODE_VOLUME_ROOT"
+
 
 class ServiceError(ValueError):
     """A request the node refuses before it touches Docker."""
@@ -66,6 +91,9 @@ class ServiceSpec:
     command: list[str] = field(default_factory=list)
     env_keys: list[str] = field(default_factory=list)
     ports: list[dict[str, Any]] = field(default_factory=list)
+    #: ``[{"name": ..., "mount_path": ...}]`` — the host side is derived, never
+    #: stored, so a state file copied to another node re-derives its own paths.
+    volumes: list[dict[str, str]] = field(default_factory=list)
     replicas: int = 1
     cpus: float | None = None
     memory: str | None = None
@@ -88,6 +116,10 @@ class ServiceSpec:
             command=[str(a) for a in data.get("command") or []],
             env_keys=[str(k) for k in data.get("env_keys") or []],
             ports=[dict(p) for p in data.get("ports") or []],
+            volumes=[
+                {"name": str(v["name"]), "mount_path": str(v["mount_path"])}
+                for v in data.get("volumes") or []
+            ],
             replicas=int(data.get("replicas") or 1),
             cpus=float(data["cpus"]) if data.get("cpus") is not None else None,
             memory=str(data["memory"]) if data.get("memory") else None,
@@ -139,6 +171,35 @@ def _validate(payload: Mapping[str, Any]) -> tuple[ServiceSpec, dict[str, str]]:
             raise ServiceError("port.host must be 1..65535")
         ports.append({"container": container, "host": host})
 
+    # Two collisions Docker would accept without a word, and both lose data: the
+    # same name twice mounts one directory at two paths, and the same mount path
+    # twice mounts the second volume *over* the first. Refused here so the
+    # caller sees a 400 instead of a service that silently lost its state.
+    volumes: list[dict[str, str]] = []
+    seen_names: set[str] = set()
+    seen_paths: set[str] = set()
+    for raw in payload.get("volumes") or []:
+        if not isinstance(raw, Mapping):
+            raise ServiceError("volumes must be a list of objects")
+        name = str(raw.get("name") or "")
+        if not _VOLUME_NAME_RE.match(name):
+            raise ServiceError(
+                f"volume name must match ^[a-z0-9][a-z0-9_-]{{0,62}}$: {name!r}"
+            )
+        mount_path = str(raw.get("mount_path") or "")
+        if not _MOUNT_PATH_RE.match(mount_path):
+            raise ServiceError(
+                "volume mount_path must be an absolute path without ':' or '..': "
+                f"{mount_path!r}"
+            )
+        if name in seen_names:
+            raise ServiceError(f"duplicate volume name: {name!r}")
+        if mount_path in seen_paths:
+            raise ServiceError(f"two volumes mount the same path: {mount_path!r}")
+        seen_names.add(name)
+        seen_paths.add(mount_path)
+        volumes.append({"name": name, "mount_path": mount_path})
+
     resources = payload.get("resources") or {}
     cpus_raw = resources.get("cpus", payload.get("cpus"))
     memory_raw = resources.get("memory", payload.get("memory"))
@@ -174,6 +235,7 @@ def _validate(payload: Mapping[str, Any]) -> tuple[ServiceSpec, dict[str, str]]:
         command=[str(a) for a in payload.get("command") or []],
         env_keys=env_keys,
         ports=ports,
+        volumes=volumes,
         replicas=replicas,
         cpus=float(cpus_raw) if cpus_raw is not None else None,
         memory=str(memory_raw) if memory_raw else None,
@@ -195,10 +257,12 @@ class ServiceManager:
         self,
         state_dir: Path,
         *,
+        volume_root: Path | None = None,
         _run_fn: Callable[..., Any] | None = None,
     ) -> None:
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.volume_root = self._resolve_volume_root(volume_root)
         self._path = self.state_dir / "services.json"
         self._run = _run_fn or default_run
         self._specs: dict[str, ServiceSpec] = {}
@@ -207,6 +271,28 @@ class ServiceManager:
         self._load()
 
     # ---- persistence -------------------------------------------------
+
+    def _resolve_volume_root(self, explicit: Path | None) -> Path:
+        """The directory service volumes live under. Fails rather than guesses.
+
+        Precedence: an explicit argument, then ``MO_NODE_VOLUME_ROOT``, then a
+        ``volumes/`` directory beside the service state. The environment is the
+        secure tier — an operator pointing tenant data at a backed-up disk — and
+        a *relative* value there is a misconfiguration, not a request to use the
+        cwd: falling back would put the volumes somewhere the operator did not
+        choose, and the tenant would not find out until a redeploy emptied them.
+        """
+        if explicit is not None:
+            return Path(explicit)
+        raw = os.environ.get(_VOLUME_ROOT_ENV)
+        if raw:
+            root = Path(raw)
+            if not root.is_absolute():
+                raise ServiceError(
+                    f"{_VOLUME_ROOT_ENV} must be an absolute path, got {raw!r}"
+                )
+            return root
+        return self.state_dir / "volumes"
 
     def _load(self) -> None:
         if not self._path.is_file():
@@ -241,6 +327,34 @@ class ServiceManager:
 
     def _name(self, spec: ServiceSpec, replica: int) -> str:
         return f"mo-svc-{spec.service_id}-{replica}"
+
+    def host_volume_path(self, spec: ServiceSpec, volume_name: str) -> str:
+        """Where a volume lives on this node's disk — derived, never received.
+
+        ``service_id`` and ``volume_name`` are both regex-restricted leaf names
+        (no ``.``, no ``/``), so this join cannot escape ``volume_root``; that
+        is the reason the wire carries a name rather than a path.
+        """
+        return str(self.volume_root / spec.service_id / volume_name)
+
+    def _prepare_volumes(self, spec: ServiceSpec) -> None:
+        """Create each volume's host directory before Docker sees it.
+
+        Docker creates a missing bind source as root and, on some setups, as a
+        *file*; a service that then fails to write looks like an application bug
+        rather than a node one. Creating them here (0700) makes the failure
+        either absent or immediate and attributable. Existing directories are
+        left as they are — an operator may have mounted a disk or set a policy
+        there, and this is not the place to overrule it.
+        """
+        for volume in spec.volumes:
+            path = Path(self.host_volume_path(spec, volume["name"]))
+            try:
+                path.mkdir(parents=True, exist_ok=True, mode=0o700)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"could not create volume directory {path}: {exc}"
+                ) from exc
 
     def _env_for(self, spec: ServiceSpec, env: Mapping[str, str]) -> dict[str, str]:
         """Values from the request win; otherwise resolve from the node env.
@@ -279,6 +393,12 @@ class ServiceManager:
             host = port.get("host")
             mapping = f"{host}:{port['container']}" if host else f"{port['container']}"
             argv += ["-p", mapping]
+
+        for volume in spec.volumes:
+            host = self.host_volume_path(spec, volume["name"])
+            # ``:rw`` is Docker's default; stated so a read-only or labelled
+            # mount cannot be inferred from a missing field later.
+            argv += ["-v", f"{host}:{volume['mount_path']}:rw"]
 
         if spec.cpus is not None:
             argv += ["--cpus", str(spec.cpus)]
@@ -320,6 +440,8 @@ class ServiceManager:
         if spec.service_id in self._specs:
             raise ServiceError(f"service {spec.service_id!r} already exists")
 
+        self._prepare_volumes(spec)
+
         cids: dict[int, str] = {}
         for replica in range(spec.replicas):
             argv = self._docker_run_argv(spec, replica, env)
@@ -342,6 +464,12 @@ class ServiceManager:
         return self.status(spec.service_id) or {}
 
     def delete(self, service_id: str) -> bool:
+        """Remove every replica. The service's volume directories stay.
+
+        Deleting a service is a deployment action, not a data-retention
+        decision; the platform decides retention (and bills for it). Data
+        removal is an explicit, separate act.
+        """
         if service_id not in self._specs and service_id not in self._cids:
             return False
         for cid in self._cids.get(service_id, {}).values():
@@ -421,6 +549,7 @@ def make_router(
     state_dir: Path,
     *,
     bearer: Callable,
+    volume_root: Path | None = None,
     _run_fn: Callable | None = None,
 ) -> APIRouter:
     """Build the FastAPI router exposing the ``/v1/services`` surface.
@@ -429,8 +558,12 @@ def make_router(
     is additive, every route inherits the bearer dependency, and bodies are
     ``dict`` with manual validation so a missing field is a 400 (not the 422
     FastAPI would infer from a Pydantic model).
+
+    ``volume_root`` is resolved when the manager is built — that is, at startup
+    — so a misconfigured ``MO_NODE_VOLUME_ROOT`` stops the node-agent from
+    serving rather than surfacing on the first deploy that needed a volume.
     """
-    services = ServiceManager(state_dir, _run_fn=_run_fn)
+    services = ServiceManager(state_dir, volume_root=volume_root, _run_fn=_run_fn)
     router = APIRouter()
 
     @router.post("/v1/services")

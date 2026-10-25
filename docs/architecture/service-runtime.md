@@ -51,9 +51,9 @@ the node never learns what a tenant is.
 
 `schemas/deployment.schema.json` is the public half. A deployment document
 carries `service_id`, `deployment_id`, `image`, `command`, `replicas`,
-`ports`, `resources`, `restart_policy`, `healthcheck`, `env`, `env_keys`,
-`network`, `user`, and `labels`. `status` is read-only and only appears in
-responses.
+`ports`, `volumes`, `resources`, `restart_policy`, `healthcheck`, `env`,
+`env_keys`, `network`, `user`, and `labels`. `status` is read-only and only
+appears in responses.
 
 Validation happens in the node, not in the control plane's type system, so a
 self-hosted client written in any language gets the same guarantees. The
@@ -65,6 +65,9 @@ checks that matter:
 | `replicas` ≤ 100 | one request cannot exhaust a shared node |
 | `restart_policy` in a fixed set | no free-text policy reaches the daemon |
 | ports 1..65535 | Docker rejects the rest with a worse error |
+| volume `name` matches `^[a-z0-9][a-z0-9_-]{0,62}$` | it becomes one directory below the node's volume root; no dots means no `..` |
+| volume `mount_path` is absolute, no `:` or `..` | relative paths resolve against a per-image WORKDIR; `:` is Docker's `-v` separator |
+| one volume per name and per mount path | the same path twice lets one mount shadow the other, silently |
 | env names are shell identifiers | a hostile key cannot smuggle flags into `-e` |
 | unknown `schema_version` → 400 | a contract change fails loudly, never silently |
 
@@ -129,6 +132,55 @@ names, not credentials. The trade-off is that an env change requires a
 redeploy rather than a restart — which is the desirable behaviour anyway,
 because secrets should roll with a deployment, not drift underneath one.
 
+## Volumes — the node owns the host side
+
+A service that keeps state needs a directory that survives a redeploy. The
+contract carries only half of that: a `name` (an identity) and a `mount_path`
+(where it appears *inside* the container). The node derives the host side
+itself:
+
+```
+<volume_root>/<service_id>/<name>   →   <mount_path>   (:rw)
+```
+
+```mermaid
+flowchart LR
+  CP["Control plane<br/>name=data, mount_path=/var/lib/app"] -->|"POST /v1/services"| NA["Node agent"]
+  NA -->|"derives"| H["<volume_root>/web/data"]
+  H -->|"bind mount"| C["container: /var/lib/app"]
+  CP -.->|"never sends"| X["host path"]
+```
+
+A host path in the request would be one field away from mounting `/etc`, a
+node's Docker socket, or another tenant's directory into a container — and no
+amount of path cleaning makes a *shared* node safe against a control plane that
+can name any directory. So the field does not exist. `name` cannot contain `/`
+or `.`, which is what makes the join above unable to escape `volume_root`.
+
+Two tiers, one env var:
+
+| Tier | Root | Use |
+|---|---|---|
+| Simple | `<state_dir>/volumes` | a laptop, a single test VM — works after copying an example config |
+| Secure | `MO_NODE_VOLUME_ROOT` (absolute path) | a node whose volumes live on a backed-up, encrypted disk |
+
+A *relative* `MO_NODE_VOLUME_ROOT` refuses to start the node-agent. Falling
+back would put tenant data where the operator did not choose, and the tenant
+would only discover it on a redeploy that came up empty — the exact silent
+failure the volume exists to prevent.
+
+Lifecycle rules:
+
+- Directories are created `0700` before `docker run`, so a permission failure
+  is attributable to the node instead of looking like an application bug.
+  Existing directories are left untouched — an operator may have mounted a disk
+  or set a policy there.
+- `DELETE /v1/services/{sid}` removes containers and **keeps the volume data**.
+  Retention is a platform policy (and a line item); deleting a service is not a
+  data-deletion request.
+- Renaming a volume starts a new empty one. The name *is* the identity.
+- A redeploy reuses the same directories, which is the entire point.
+
 ## What is deliberately absent
 
 These are the proprietary layer's job, and every one of them is policy:
@@ -138,7 +190,11 @@ These are the proprietary layer's job, and every one of them is policy:
 - Health-gated rollout, blue/green, and automatic rollback on `unhealthy`.
 - Metrics scraping (`docker stats`) → usage events → invoices.
 - Private networking between a tenant's services across nodes.
-- Persisted volumes and managed databases (a separate primitive).
+- Volume **quotas, backups, snapshots, and restore**. `platform_volumes.size_mb`
+  is recorded but not enforced by the node; backup jobs and quota enforcement
+  are the control plane's, and a node that guessed at them would be wrong for
+  every tenant at once.
+- Managed databases (a separate primitive built on volumes).
 - Idle detection, scale-to-zero, and cron-scheduled services.
 
 The node exposes what those need — replica state, logs, the port mapping, the
@@ -169,6 +225,7 @@ curl -sS "http://127.0.0.1:7091/v1/services" \
     "image": "nginx:1.27-alpine",
     "replicas": 1,
     "ports": [{"container": 80, "host": 8080}],
+    "volumes": [{"name": "site", "mount_path": "/usr/share/nginx/html"}],
     "resources": {"cpus": 0.5, "memory": "256m"},
     "healthcheck": {"cmd": "wget -qO- localhost:80", "interval": "10s"}
   }' | jq '.replicas_state'
@@ -180,4 +237,8 @@ curl -sS "http://127.0.0.1:7091/v1/services" \
 `TestClient` with one fake Docker runner. It asserts the composed argv (not
 just the response), the rollback path, the replace path, auth, and the
 security property: `services.json` contains `DATABASE_URL` and does not
-contain the value that was passed with it.
+contain the value that was passed with it. For volumes it asserts the mount
+target the node actually composed, that the directory exists `0700`, that
+`delete` leaves the data, that the status response never leaks a host path,
+that a relative `MO_NODE_VOLUME_ROOT` stops the app from starting, and that
+the published schema rejects the same shapes the node does.

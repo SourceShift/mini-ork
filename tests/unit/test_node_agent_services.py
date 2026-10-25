@@ -275,3 +275,146 @@ def test_delete_unknown_is_404(client):
 def test_services_require_bearer(client):
     assert client.get("/v1/services").status_code == 401
     assert client.post("/v1/services", json=_spec()).status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# volumes — the node owns the host side, the caller only names one
+# ---------------------------------------------------------------------------
+
+
+def test_create_mounts_each_volume_under_the_node_root(client, docker, tmp_path):
+    r = client.post(
+        "/v1/services",
+        json=_spec(volumes=[{"name": "data", "mount_path": "/var/lib/app"}]),
+        headers=AUTH,
+    )
+    assert r.status_code == 200, r.text
+    argv = docker.run_argv()[0]
+    host = tmp_path / "volumes" / "web" / "data"
+    assert argv[argv.index("-v") + 1] == f"{host}:/var/lib/app:rw"
+    assert host.is_dir()
+    # The container user must not need a second permission to write its own
+    # volume just because another tenant shares the node.
+    assert host.stat().st_mode & 0o077 == 0
+
+
+def test_volume_root_env_is_the_secure_tier(tmp_path, monkeypatch, docker):
+    elsewhere = tmp_path / "backed-up-disk"
+    monkeypatch.setenv(TOKEN_ENV, TOKEN_VALUE)
+    monkeypatch.setenv("MO_NODE_VOLUME_ROOT", str(elsewhere))
+    app = create_app(state_dir=tmp_path / "state", token_env=TOKEN_ENV, _run_fn=docker)
+    r = TestClient(app).post(
+        "/v1/services",
+        json=_spec(volumes=[{"name": "data", "mount_path": "/data"}]),
+        headers=AUTH,
+    )
+    assert r.status_code == 200, r.text
+    assert (elsewhere / "web" / "data").is_dir()
+    assert not (tmp_path / "state" / "volumes").exists()
+
+
+def test_a_relative_volume_root_refuses_to_start(tmp_path, monkeypatch, docker):
+    from mini_ork.remote.node_agent.services import ServiceError
+
+    monkeypatch.setenv(TOKEN_ENV, TOKEN_VALUE)
+    monkeypatch.setenv("MO_NODE_VOLUME_ROOT", "volumes")
+    with pytest.raises(ServiceError, match="MO_NODE_VOLUME_ROOT.*absolute"):
+        create_app(state_dir=tmp_path, token_env=TOKEN_ENV, _run_fn=docker)
+
+
+@pytest.mark.parametrize(
+    "volume, reason",
+    [
+        ({"name": "../etc", "mount_path": "/etc"}, "volume name"),
+        ({"name": "Data", "mount_path": "/data"}, "volume name"),
+        ({"name": "data", "mount_path": "data"}, "absolute"),
+        ({"name": "data", "mount_path": "/data:rw"}, "absolute"),
+        ({"name": "data", "mount_path": "/a/../b"}, "absolute"),
+        ({"name": "data"}, "absolute"),
+    ],
+)
+def test_bad_volume_shapes_are_400s_before_docker(client, docker, volume, reason):
+    r = client.post("/v1/services", json=_spec(volumes=[volume]), headers=AUTH)
+    assert r.status_code == 400, r.text
+    assert reason in r.json()["detail"]
+    assert docker.run_argv() == []
+
+
+def test_two_volumes_cannot_share_a_name_or_a_mount_path(client, docker):
+    same_name = client.post(
+        "/v1/services",
+        json=_spec(
+            volumes=[
+                {"name": "data", "mount_path": "/data"},
+                {"name": "data", "mount_path": "/other"},
+            ]
+        ),
+        headers=AUTH,
+    )
+    assert same_name.status_code == 400
+    assert "duplicate volume name" in same_name.json()["detail"]
+
+    same_path = client.post(
+        "/v1/services",
+        json=_spec(
+            volumes=[
+                {"name": "one", "mount_path": "/data"},
+                {"name": "two", "mount_path": "/data"},
+            ]
+        ),
+        headers=AUTH,
+    )
+    assert same_path.status_code == 400
+    assert "same path" in same_path.json()["detail"]
+    assert docker.run_argv() == []
+
+
+def test_delete_keeps_the_volume_data(client, tmp_path):
+    client.post(
+        "/v1/services",
+        json=_spec(volumes=[{"name": "data", "mount_path": "/data"}]),
+        headers=AUTH,
+    )
+    marker = tmp_path / "volumes" / "web" / "data" / "leave-me.txt"
+    marker.write_text("tenant data", encoding="utf-8")
+
+    assert client.delete("/v1/services/web", headers=AUTH).status_code == 200
+    assert marker.read_text(encoding="utf-8") == "tenant data"
+
+
+def test_status_reports_volumes_but_never_the_host_path(client):
+    client.post(
+        "/v1/services",
+        json=_spec(volumes=[{"name": "data", "mount_path": "/var/lib/app"}]),
+        headers=AUTH,
+    )
+    body = client.get("/v1/services/web", headers=AUTH).json()
+    assert body["volumes"] == [{"name": "data", "mount_path": "/var/lib/app"}]
+    assert "volumes/" not in json.dumps(body)
+
+
+def test_the_published_schema_rejects_the_same_shapes():
+    """The contract and the node agree — a control plane fails at build time.
+
+    The node validates too (it cannot trust its caller), but a tenant should
+    learn that `/data:rw` is not a mount path from ``mini-ork validate``, not
+    from a 400 halfway through a deploy.
+    """
+    jsonschema = pytest.importorskip("jsonschema")
+    import json as _json
+
+    schema_path = Path(__file__).resolve().parents[2] / "schemas" / "deployment.schema.json"
+    schema = _json.loads(schema_path.read_text(encoding="utf-8"))
+    validator = jsonschema.Draft202012Validator(schema)
+
+    ok = _spec(volumes=[{"name": "data", "mount_path": "/var/lib/app"}])
+    assert list(validator.iter_errors(ok)) == []
+
+    for bad in (
+        [{"name": "data", "mount_path": "data"}],
+        [{"name": "data", "mount_path": "/data:rw"}],
+        [{"name": "data", "mount_path": "/a/../b"}],
+        [{"name": "../etc", "mount_path": "/etc"}],
+        [{"name": "data", "mount_path": "/data", "host": "/etc"}],
+    ):
+        assert list(validator.iter_errors(_spec(volumes=bad))), bad

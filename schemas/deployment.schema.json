@@ -54,6 +54,28 @@
       },
       "default": []
     },
+    "volumes": {
+      "type": "array",
+      "description": "Durable directories the service keeps across deploys. Only the CONTAINER-side path crosses this contract: the node derives the host path from its own volume root as <root>/<service_id>/<name>, so a control plane can never name a host directory to mount. Names are stable identities, not paths — renaming one starts a new empty volume.",
+      "items": {
+        "type": "object",
+        "required": ["name", "mount_path"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The volume's identity on this node. Dots are excluded along with slashes, so no name can address a parent directory.",
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,62}$"
+          },
+          "mount_path": {
+            "type": "string",
+            "description": "Absolute path inside the container. Relative paths are refused: Docker would resolve one against the image's WORKDIR, which differs per image and is not the tenant's to guess.",
+            "pattern": "^(/(?!\\.\\.?(/|$))[^:\\u0000/]+)+$"
+          }
+        }
+      },
+      "default": []
+    },
     "resources": {
       "type": "object",
       "description": "Hard limits. Absent = node default; never unbounded on a shared node.",
