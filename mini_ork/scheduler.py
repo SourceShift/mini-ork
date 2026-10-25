@@ -121,6 +121,11 @@ _RETRY_COLUMNS = (
     ("last_run_id", "TEXT"),
     # "<host>:<pid>" of the scheduler that claimed the epic; see reclaim_stale.
     ("claimed_by", "TEXT"),
+    # pick_ready orders by priority. Without it here, a DB that never ran the
+    # epics CLI's ensure_priority_column made the ready-set query raise, which
+    # pick_ready swallows into an EMPTY ready set — a full queue reported as
+    # "nothing to dispatch".
+    ("priority", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 

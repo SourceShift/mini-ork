@@ -2,7 +2,8 @@
 
 Strangler-fig parity port of the subcommand CLI: ingest (roadmap md → epics +
 epic_dependencies + auto-block), split (per-epic kickoff files + kickoff_path),
-list, ready (via ported epic_graph), show, priority. Every `## <title>`
+list, ready (via ported epic_graph), show, priority, archive (hide an epic
+that will never run by setting ``epics.archived_at``). Every `## <title>`
 heading becomes an epic unless it ends with `(no-epic)`, `(context)`, or
 `(ignore)`. Dependency lists split on commas only; each token resolves by exact
 id, slugified exact id, unique slug prefix, then unique slug substring against
@@ -61,6 +62,7 @@ _USAGE = """Usage: mini-ork epics <subcommand> [args]
   status <epic_id> <new_status> --note TEXT
                                Set an allowed status and record why in --note;
                                'done' runs the scheduler's dependency cascade.
+  archive <epic_id> --note TEXT   Hide an epic that will never run (sets archived_at)
 
 Roadmap per-epic settings (under an epic's heading, applied by ingest):
   - recipe: <name>
@@ -453,6 +455,82 @@ def _status(rest: list[str], db: str) -> int:
     return 0
 
 
+def _archive(rest: list[str], db: str) -> int:
+    """`epics archive <epic_id> --note TEXT`.
+
+    Hide an epic that will never run. Sets ``epics.archived_at`` — the column
+    the scheduler's ready set (``scheduler.pick_ready``), the epic graph, the
+    supervisor and ``epics list`` already filter on — and records the
+    operator's reason in ``notes``.
+
+    ``status`` is NOT touched: the epic keeps the status it had, so the audit
+    trail still says what it was, and ``trg_epics_no_revert_done`` stays
+    satisfied (the trigger only fires for an UPDATE that lists ``status``).
+
+    Checks, in order:
+      * ``--note`` missing or whitespace-only → rc 2, the DB is untouched.
+      * unknown extra arguments → rc 2, the DB is untouched.
+      * unknown epic id → rc 1.
+      * an epic that is ``in progress`` → rc 1 (its run has to stop first).
+      * an already-archived epic → rc 0, a no-op: the stored timestamp is
+        reported and no second note is appended.
+    """
+    epic_id = rest[0]
+    note = None
+    unknown: list[str] = []
+    i = 1
+    while i < len(rest):
+        arg = rest[i]
+        if arg == "--note":
+            note = rest[i + 1] if i + 1 < len(rest) else None
+            i += 2 if i + 1 < len(rest) else 1
+        else:
+            unknown.append(arg)
+            i += 1
+    if note is None or not note.strip():
+        sys.stderr.write("archive: --note is required\n")
+        return 2
+    if unknown:
+        sys.stderr.write(f"archive: unknown argument(s): {' '.join(unknown)}\n")
+        return 2
+    note = note.strip()
+
+    con = sqlite3.connect(db)
+    try:
+        con.execute("PRAGMA busy_timeout=5000")
+        row = con.execute(
+            "SELECT status, notes, archived_at FROM epics WHERE id=?", (epic_id,)).fetchone()
+        if not row:
+            sys.stderr.write(f"archive: no such epic: {epic_id}\n")
+            return 1
+        status, old_notes, archived_at = row
+        if status == "in progress":
+            sys.stderr.write(
+                f"archive: {epic_id} is in progress — stop its run first\n")
+            return 1
+        if archived_at is not None:
+            sys.stdout.write(f"{epic_id} already archived at {archived_at}\n")
+            return 0
+        # ONE statement, so the timestamp and the note land together (or not
+        # at all): ``status`` is absent from the SET list on purpose.
+        notes = (old_notes or "") + f" [operator: archived: {note}]"
+        cur = con.execute(
+            "UPDATE epics SET archived_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), "
+            "notes=? WHERE id=? AND archived_at IS NULL", (notes, epic_id))
+        if cur.rowcount == 0:
+            # Another operator archived it between the read and the write.
+            ts = con.execute(
+                "SELECT archived_at FROM epics WHERE id=?", (epic_id,)).fetchone()[0]
+            sys.stdout.write(f"{epic_id} already archived at {ts}\n")
+            return 0
+        con.commit()
+    finally:
+        con.close()
+
+    sys.stdout.write(f"archived {epic_id} (status {status})\n")
+    return 0
+
+
 def _path_hints(body):
     p = re.findall(r"`([a-z_][\w./-]*\.(?:sh|py|sql|md|yaml|yml|json|ts|tsx|js|jsx))`", body, re.I)
     p += re.findall(r"`(bin/[\w-]+)`", body)
@@ -606,6 +684,10 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
         if not rest:
             sys.stderr.write("status: epic_id required\n"); return 2
         return _status(rest, db)
+    if sub == "archive":
+        if not rest:
+            sys.stderr.write("archive: epic_id required\n"); return 2
+        return _archive(rest, db)
     if sub in ("help", "--help", "-h"):
         sys.stdout.write(_USAGE); return 0
     sys.stderr.write(f"Unknown subcommand: {sub}\n"); sys.stdout.write(_USAGE); return 2
