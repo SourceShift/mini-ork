@@ -1,7 +1,0 @@
-#!/usr/bin/env python3
-"""Compatibility launcher for mini-ork promote."""
-
-from _mini_ork_subcommand import main
-
-if __name__ == "__main__":
-    raise SystemExit(main("promote"))

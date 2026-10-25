@@ -26,7 +26,7 @@ def test_no_exec_subs_no_trampoline():
 
 def test_all_former_exec_subs_registered_natively():
     expected = {
-        "improve", "eval", "promote", "init", "onboard", "update", "spawn", "scheduler",
+        "init", "onboard", "update", "spawn", "scheduler",
         "epics", "bugs", "inject", "review", "traceotter", "metrics",
         "rollback", "resume", "recover", "serve", "bug-collector", "conductor",
         "coord", "concord", "lifetime", "self-improve", "topology", "usage-report", "watchdog",
@@ -98,9 +98,9 @@ def test_native_dispatch_uses_python_m(monkeypatch):
         return _P()
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    rc = main(["improve", "--help"], root="/tmp/root")
+    rc = main(["specs", "--help"], root="/tmp/root")
     assert rc == 0
-    assert seen["cmd"][:3] == [sys.executable, "-m", "mini_ork.cli.improve"]
+    assert seen["cmd"][:3] == [sys.executable, "-m", "mini_ork.cli.specs"]
     assert all("bin/mini-ork-" not in str(part) for part in seen["cmd"])
 
 
@@ -128,7 +128,7 @@ def test_default_root_is_the_engine_root(monkeypatch, tmp_path):
         return _P()
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    assert main(["improve", "--help"]) == 0
+    assert main(["specs", "--help"]) == 0
     pythonpath = seen["env"]["PYTHONPATH"]
     # ``_module_env`` prepends the engine root, so it must be the entry that
     # wins resolution; inherited entries (another checkout's engine root, a

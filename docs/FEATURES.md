@@ -126,7 +126,7 @@ experience and feeds it forward:
 
 ## Inventory (mechanically checked)
 
-### 16 user-facing entrypoints (`bin/`)
+### 13 user-facing entrypoints (`bin/`)
 
 | Entrypoint | Role |
 |---|---|
@@ -137,9 +137,6 @@ experience and feeds it forward:
 | `mini-ork execute` | Workflow DAG dispatch across lanes |
 | `mini-ork-verify` | Deterministic verifier + gate execution |
 | `mini-ork-reflect` | Trace → gradient extraction |
-| `mini-ork-improve` | Workflow candidate generation |
-| `mini-ork-eval` | Benchmark suite execution |
-| `mini-ork-promote` | Gated promotion into version registry |
 | `mini-ork-metrics` | Cross-cycle trajectory reporting |
 | `mini-ork-spawn` | Bounded child-orchestrator delegation |
 | `mini-ork-topology` | Panel topology measurement |

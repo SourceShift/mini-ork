@@ -58,9 +58,6 @@ _NATIVE_SUBS = {
 # Native module subcommands. Compatibility launchers under bin/ re-exec this
 # dispatcher, so there is one public command implementation.
 _NATIVE_MODULE_SUBS = {
-    "improve": "mini_ork.cli.improve",
-    "eval": "mini_ork.cli.eval",
-    "promote": "mini_ork.cli.promote",
     "init": "mini_ork.cli.init",
     "onboard": "mini_ork.cli.onboard",
     "update": "mini_ork.cli.update",
@@ -137,9 +134,6 @@ Universal loop subcommands:
                                    publisher/rollback)
   verify <artifact-path>         Run verifiers + gates for the artifact contract
   reflect [--since <timestamp>]  Extract gradients + patterns from recent runs
-  improve                        Propose workflow candidates via group_evolver
-  eval --candidate <id>          Run benchmark suite against a workflow candidate
-  promote --candidate <id>       Promotion gate decision (promote|quarantine)
   apply --task-class <name>      Close the apply loop: pick→materialize→score→gate→
   --target <file>                write|quarantine (IMPL-3, opt-in via MO_APPLY_ENABLED=1)
 
