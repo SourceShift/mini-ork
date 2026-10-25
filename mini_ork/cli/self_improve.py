@@ -621,7 +621,7 @@ def _iter_run(root, home, db, it, opts, parent, resolved_sha, soft_deadline, har
             # ``(False, …)``. We print and skip the merge — the branch stays
             # so a human can approve exactly this content later.
             from mini_ork.gates import merge_approval  # noqa: PLC0415
-            from mini_ork.vcs.auto_merge import content_ids
+            from mini_ork.vcs.content_ids import content_ids
             cur_branch = subprocess.run(
                 ["git", "-C", root, "rev-parse", "--abbrev-ref", "HEAD"],
                 capture_output=True, text=True).stdout.strip()

@@ -31,18 +31,14 @@ bin/mini-ork epics ready
 
 # 5. Fire the scheduler. --once exits after the queue drains; without
 #    --once it idles 60s between empty-queue polls.
-MO_OPEN_PR=1 \
-GH_TOKEN=$(gh auth token) \
-MO_AUTO_MERGE=1 \
-MO_PR_SOAK_HOURS=24 \
 MO_BUG_COLLECTOR=1 \
 MO_BUG_REPORT_AUTO_PROMOTE=3 \
 bin/mini-ork scheduler --once
 ```
 
-Step 5 enables **everything**: real PR creation, soak + CI gated auto-merge,
-per-node bug collection, and auto-promotion of the top-3 noticed bugs into
-new epics on every reflect cycle. Drop the env vars one at a time to scope
+Step 5 enables per-node bug collection and auto-promotion of the top-3
+noticed bugs into new epics on every reflect cycle. Merging an epic's branch
+is a manual `mini-ork board merge` step. Drop the env vars one at a time to scope
 the autonomy you want.
 
 ## Architecture
@@ -97,8 +93,6 @@ the autonomy you want.
 | `bin/mini-ork-epics`    | E6 | Ingest roadmap → epics + dep edges. Split roadmap → per-epic kickoffs. |
 | `bin/mini-ork-scheduler` → `mini_ork/scheduler.py` | E4 | Public Python launcher and canonical concurrent owner: pick ready epics, dispatch, mark done or escalated, cascade. |
 | `lib/epic_graph.sh`     | E5 | `epic_graph_ready_now`, `epic_graph_on_done`, dep cascade. |
-| `lib/pr-create.sh`      | E3 | `mo_open_pr` opens a real GitHub PR per epic when `MO_OPEN_PR=1`. |
-| `lib/auto-merge-pr.sh`  | E8 | Polls CI + approval + soak; `gh pr merge --squash --auto`. |
 | `lib/cross_epic_gradient.sh` | E7 | Promotes recurring TARGETS (across task_classes) into `__cross_class__` gradients. |
 | `lib/bug_report.sh`     | bug-channel | `bug_report_emit / sweep / prioritize / promote`. |
 | `bin/mini-ork-bug-collector` | auto-collector | Fires after every node trace; heuristic regex scan of agent output. |
@@ -260,7 +254,6 @@ bin/mini-ork epics split  kickoffs/roadmap-arxiv-self-learn.md
 
 # Long-running daemon. 60s idle between picks; honors cost-pause sentinels
 # and the daily $50 budget cap (MO_DAILY_BUDGET_USD).
-MO_OPEN_PR=1 MO_AUTO_MERGE=1 \
 MO_BUG_COLLECTOR=1 MO_BUG_REPORT_AUTO_PROMOTE=3 \
 nohup bin/mini-ork scheduler > .mini-ork/scheduler.log 2>&1 &
 
@@ -277,10 +270,6 @@ touch .mini-ork/cost-pause.sentinel    # scheduler exits at next iter
 
 | Knob | Default | Effect |
 |---|---|---|
-| `MO_OPEN_PR` | 0 | Open a GitHub PR per epic that produces a branch. |
-| `MO_AUTO_MERGE` | 0 | Squash-merge PRs that pass CI + approval + soak. |
-| `MO_PR_SOAK_HOURS` | 24 | Required PR age before auto-merge eligibility. |
-| `MO_REQUIRE_REVIEWER` | 1 | Require approving GH review before auto-merge. |
 | `MO_PATTERN_MINER` | 0 | Mine `execution_traces` clusters → `pattern_records`. |
 | `MO_CROSS_EPIC_GRADIENTS` | 1 | Promote recurring targets → `__cross_class__`. |
 | `MO_CROSS_EPIC_MIN_CLASSES` | 2 | Min distinct task_classes to promote. |
@@ -329,7 +318,6 @@ SELECT id, severity, frequency, ROUND(confidence,2),
 | Bug-collector floods queue with TODOs | Heuristic is conservative but can over-fire on agent commentary. | Raise `MO_BUG_REPORT_AUTO_PROMOTE` minimum severity, or `UPDATE bug_reports SET status='wontfix' WHERE severity='low'`. |
 | Cross-class gradient list dominated by one target | Single recipe is generating noisy gradients. | Inspect `gradient_records WHERE target=?`. Reduce gradient extraction noise upstream or raise `MO_CROSS_EPIC_MIN_CONF` to 0.8+. |
 | Scheduler picks an old leftover smoke epic | `epic_graph_ready_now` is oldest-first fair. | `UPDATE epics SET archived_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id LIKE 'old-prefix-%';` |
-| PR open succeeds but never auto-merges | Soak hours not satisfied, or required reviewer missing. | `gh pr view <url> --json reviewDecision,createdAt` then either approve or wait. |
 | Auto-promoted bug-epic has no kickoff body | Heuristic produced a one-line title only. | Manually edit `kickoffs/auto/bug-<id>.md` before scheduler picks it up. |
 
 ## Roadmap shape

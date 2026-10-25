@@ -1,8 +1,8 @@
 """Lane-helpers — Python port of ``lib/lane-helpers.sh``.
 
-Faithful Python port of the six bash functions in
+Faithful Python port of the five bash functions in
 ``lib/lane-helpers.sh`` (lane predicate, budget flag, cache flag,
-capability assertion, cache-stats aggregation, claude --print wrapper).
+capability assertion, claude --print wrapper).
 The bash source is the authoritative spec and stays byte-identical
 (strangler-fig invariant); this module gives Python callers an
 in-process target and gives ``tests/unit/test_lane_helpers_py.py`` a
@@ -30,9 +30,6 @@ Pipeline map (bash function → Python):
                                        mini_ork.dispatch.config_resolve
                                        for yaml path resolution; same
                                        external observable)
-  mo_aggregate_cache_stats <dir>     → aggregate_cache_stats(iter_dir) -> dict
-  (grep -oE + jq -n to write JSON)   (Python regex + json.dumps to
-                                       cache-stats.json; same shape)
   mo_claude_print <prompt> [extra]   → claude_print(prompt, *extra) -> CP
   (claude --print --permission-mode  (subprocess.run of the same argv;
    bypassPermissions --output-format  returns CompletedProcess so caller
@@ -43,14 +40,11 @@ Public surface:
     emit_budget_flag(lane, val) -> list[str]
     emit_cache_flags() -> list[str]
     assert_lane_capability(lane) -> None
-    aggregate_cache_stats(iter_dir: str) -> dict
     claude_print(prompt, *extra, max_turns=40, output_format="text") -> CompletedProcess
 """
 from __future__ import annotations
 
-import json
 import os
-import re
 import subprocess
 
 import yaml
@@ -62,7 +56,6 @@ __all__ = [
     "emit_budget_flag",
     "emit_cache_flags",
     "assert_lane_capability",
-    "aggregate_cache_stats",
     "claude_print",
 ]
 
@@ -75,14 +68,6 @@ _CACHE_FLAG = "--exclude-dynamic-system-prompt-sections"
 # test harness can ``monkeypatch.setattr`` this to force a re-probe.
 _CACHED_SUPPORTED: bool | None = None
 _PROBE_DONE: bool = False
-
-# JSON output shape for ``mo_aggregate_cache_stats``. ``hit_rate`` and
-# ``estimated_usd_saved`` are floats (4dp); everything else is integer.
-_SAVED_USD_PER_TOKEN = 0.9 * 3 / 1_000_000  # 0.1× of $3/M input
-# bash's `grep -oE '"<key>":[0-9]+' | awk -F: '{s+=$2} END{print s+0}'`
-_CACHE_CREATION_RE = re.compile(r'"cache_creation_input_tokens":(\d+)')
-_CACHE_READ_RE = re.compile(r'"cache_read_input_tokens":(\d+)')
-_INPUT_TOKENS_RE = re.compile(r'"input_tokens":(\d+)')
 
 def lane_is_free(lane: str) -> bool:
     """Mirror ``mo_lane_is_free`` — True for glm/kimi/minimax, False otherwise.
@@ -218,71 +203,6 @@ def assert_lane_capability(lane: str, required: str | None = None) -> None:
             missing.append(name)
     if missing:
         raise RuntimeError(missing[0])
-
-
-def aggregate_cache_stats(iter_dir: str) -> dict:
-    """Mirror ``mo_aggregate_cache_stats`` — scan ``*.log`` files, write JSON.
-
-    Bash iterates ``<iter_dir>/*.log`` and sums three token counts via
-    ``grep -oE '"<key>":[0-9]+' | awk -F: '{s+=$2} END{print s+0}'``,
-    then writes ``<iter_dir>/cache-stats.json`` with a ``jq -n`` template.
-
-    Returns 1 / no write when ``iter_dir`` is not a directory. The
-    written JSON has the exact same keys + value shapes (compact form,
-    no indent) as bash's ``jq -n`` output — the parity test diffs the
-    two JSON files byte-for-byte modulo path fields and float rounding.
-    """
-    if not os.path.isdir(iter_dir):
-        raise FileNotFoundError(f"not a directory: {iter_dir}")
-    stats_file = os.path.join(iter_dir, "cache-stats.json")
-
-    creation = 0
-    read = 0
-    uncached = 0
-    file_count = 0
-    per_file: list[dict] = []
-
-    for name in sorted(os.listdir(iter_dir)):
-        if not name.endswith(".log"):
-            continue
-        log = os.path.join(iter_dir, name)
-        if not os.path.isfile(log):
-            continue
-        with open(log, "r", encoding="utf-8", errors="replace") as fh:
-            text = fh.read()
-        c = sum(int(m) for m in _CACHE_CREATION_RE.findall(text))
-        r = sum(int(m) for m in _CACHE_READ_RE.findall(text))
-        u = sum(int(m) for m in _INPUT_TOKENS_RE.findall(text))
-        creation += c
-        read += r
-        uncached += u
-        file_count += 1
-        per_file.append({
-            "file": name,
-            "cache_creation": c,
-            "cache_read": r,
-            "uncached": u,
-        })
-
-    saved = round(read * _SAVED_USD_PER_TOKEN, 4)
-    total = creation + read + uncached
-    hit_rate = round(read / total, 4) if total > 0 else 0
-    payload = {
-        "cache_creation_tokens": creation,
-        "cache_read_tokens": read,
-        "uncached_input_tokens": uncached,
-        "hit_rate": hit_rate,
-        "estimated_usd_saved": saved,
-        "log_files_scanned": file_count,
-        "per_file": per_file,
-    }
-    # bash's `jq -n ... > file` writes compact JSON (no indent). The
-    # parity test byte-diffs against bash's output, so we use
-    # ``json.dumps`` default (no indent) + ``sort_keys=False`` to
-    # preserve insertion order.
-    with open(stats_file, "w", encoding="utf-8") as fh:
-        fh.write(json.dumps(payload))
-    return payload
 
 
 def claude_print(

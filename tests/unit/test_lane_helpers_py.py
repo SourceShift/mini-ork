@@ -1,10 +1,10 @@
 """Unit tests: ``mini_ork.dispatch.lane_helpers`` (bash parity halves removed; formerly vs ``lib/lane-helpers.sh``).
 
 Each test drives the Python port on controlled inputs and asserts flag
-arrays, error text, exit behavior, and ``cache-stats.json`` content. No
+arrays, error text, and exit behavior. No
 mocks beyond PATH shims for the ``claude`` feature-detect.
 
-Eight cases:
+Six cases:
   (a) lane_is_free                 — 5 lanes (free vs paid) parametrised
   (b) emit_budget_flag             — free lane returns [], paid returns [--max-budget-usd, <val>]
   (c) emit_cache_flags feature-detect — PATH-shim fake `claude --help` echoes
@@ -13,9 +13,6 @@ Eight cases:
   (e) assert_lane_capability OK    — capabilities satisfied → no raise
   (f) assert_lane_capability fail  — missing capability → RuntimeError with
                                        the first missing cap token
-  (g) aggregate_cache_stats happy  — 3 fixture logs → totals + per_file shape
-  (h) aggregate_cache_stats empty  — zero-log dir → valid JSON with zeros +
-                                       hit_rate:0 + per_file:[]
 
 ``mo_claude_print`` is exercised via in-process argv-shape verification
 (a real network call is non-deterministic).
@@ -32,7 +29,6 @@ from __future__ import annotations
 
 import contextlib
 import io
-import json
 import os
 import sys
 from pathlib import Path
@@ -219,72 +215,6 @@ def test_assert_lane_capability_missing(
 
 
 # ─────────────────────────────────────────────────────────────────────
-# (g) aggregate_cache_stats happy — totals + per_file shape
-# ─────────────────────────────────────────────────────────────────────
-def test_aggregate_cache_stats(
-    tmp_path: Path,
-) -> None:
-    """Seed 3 fixture logs; cache-stats.json carries the summed totals +
-    per_file rows (one per log)."""
-    py_dir = tmp_path / "py" / "iter-1"
-    py_dir.mkdir(parents=True)
-
-    fixture_body = (
-        '{"event":"usage","cache_creation_input_tokens":100,"cache_read_input_tokens":50,"input_tokens":25}\n'
-        '{"event":"usage","cache_creation_input_tokens":200,"cache_read_input_tokens":75,"input_tokens":50}\n'
-    )
-    for name in ("a.log", "b.log", "c.log"):
-        (py_dir / name).write_text(fixture_body)
-
-    lh.aggregate_cache_stats(str(py_dir))
-    py_stats_path = py_dir / "cache-stats.json"
-    assert py_stats_path.exists(), f"python didn't write {py_stats_path}"
-
-    stats = json.loads(py_stats_path.read_text())
-
-    # Integer totals: 3 files × (100+200) creation, (50+75) read, (25+50) uncached.
-    assert stats["cache_creation_tokens"] == 900
-    assert stats["cache_read_tokens"] == 375
-    assert stats["uncached_input_tokens"] == 225
-    assert stats["log_files_scanned"] == 3
-
-    # hit_rate is a ratio in (0, 1).
-    assert 0 < stats["hit_rate"] < 1
-
-    # per_file: one row per log with per-file sums.
-    assert len(stats["per_file"]) == 3
-    by_name = {e["file"]: e for e in stats["per_file"]}
-    assert set(by_name) == {"a.log", "b.log", "c.log"}
-    for e in by_name.values():
-        assert e["cache_creation"] == 300
-        assert e["cache_read"] == 125
-        assert e["uncached"] == 75
-
-
-# ─────────────────────────────────────────────────────────────────────
-# (h) aggregate_cache_stats empty — zero-log dir → valid JSON zeros
-# ─────────────────────────────────────────────────────────────────────
-def test_aggregate_cache_stats_empty_dir(
-    tmp_path: Path,
-) -> None:
-    """No .log files in iter_dir → a valid JSON with all-zero totals and
-    an empty per_file array."""
-    py_dir = tmp_path / "py" / "iter-1"
-    py_dir.mkdir(parents=True)
-
-    lh.aggregate_cache_stats(str(py_dir))
-
-    stats = json.loads((py_dir / "cache-stats.json").read_text())
-
-    for k in ("cache_creation_tokens", "cache_read_tokens",
-              "uncached_input_tokens", "log_files_scanned"):
-        assert stats[k] == 0
-    assert stats["hit_rate"] == 0
-    assert stats["per_file"] == []
-    # saved_usd exactly 0.0 (read=0 → 0.0*0.9*3/1e6=0).
-    assert stats["estimated_usd_saved"] == 0
-
-
 # ─────────────────────────────────────────────────────────────────────
 # claude_print — argv-shape smoke (no network call).
 # ─────────────────────────────────────────────────────────────────────

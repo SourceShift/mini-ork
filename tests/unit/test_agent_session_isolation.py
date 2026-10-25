@@ -197,31 +197,7 @@ def test_non_claude_argv_is_untouched():
     assert _claude_command_builder(argv, request=_req("codex"), env={}) == argv
 
 
-# ── the two other call sites: rubric pre-screen + cleaner worker ─────────────
-
-
-def test_cleaner_worker_argv_carries_isolation(monkeypatch, tmp_path):
-    from mini_ork.recovery import cleaner
-
-    captured: dict[str, list[str]] = {}
-
-    def fake_run(cmd, **_kwargs):
-        captured["cmd"] = list(cmd)
-        return subprocess.CompletedProcess(cmd, 0)
-
-    monkeypatch.setattr(cleaner.subprocess, "run", fake_run)
-    prompt = tmp_path / "prompt.md"
-    prompt.write_text("do the thing")
-    rc = cleaner._default_spawn(str(tmp_path), str(prompt), str(tmp_path), "glm", 1.0, None)
-
-    assert rc == 0
-    cmd = captured["cmd"]
-    assert cmd[0] == "claude"
-    assert cmd[cmd.index("--setting-sources") + 1] == "project,local"
-    assert cmd[cmd.index("--settings") + 1] == str(SETTINGS)
-    # The existing --model stays; the subscription alias must not duplicate it.
-    assert cmd.count("--model") == 1
-    assert cmd[cmd.index("--model") + 1] == "glm"
+# ── the other call site: rubric pre-screen ───────────────────────────────────
 
 
 def test_rubric_argv_carries_isolation(monkeypatch, tmp_path):

@@ -6,9 +6,8 @@ continues. Every DAG node also leaves a git checkpoint of the run's worktree
 that you can restore. In Zed, the agent panel's follow-the-agent crosshair
 jumps to the files a run reads and edits.
 
-Everything below is **off by default**. Turning the gates on holds the epic
-scheduler's and the goal loop's auto-merges until a human approves, so switch
-them on deliberately.
+Everything below is **off by default**. Turning the gates on holds automated
+merges until a human approves, so switch them on deliberately.
 
 ---
 
@@ -60,10 +59,8 @@ Approvals live in the existing oversight channel (`mo_inbox_gates`), so
   approval, the approval no longer counts.
 - **Every merge path checks for an approval:**
   - `workspaces.merge` (IDE **Merge**, Zed review card, race keep, `/merge`);
-  - the epic `auto_merge`;
-  - `auto_merge_pr`;
-  - the cleaner's squash merges (exit 8, `HELD_FOR_REVIEW`);
-  - `self-improve --auto-merge`.
+  - `mini-ork board merge` and `mini-ork approvals`;
+  - the self-improve runner's automatic merge path.
   Automated paths **hold**; the human surfaces treat the click itself as the
   approval (`ide:<user>`, `zed:<user>`).
 

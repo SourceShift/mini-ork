@@ -9,10 +9,12 @@ tests. The old path is retained here only to aid migration archaeology and
 consumer migration; it is not a runnable fallback.
 
 Status legend: **retired** = native owner verified; Bash counterpart deleted.
+**removed 2026-10 (no production caller)** = the Python module was deleted;
+the capability either has a live replacement or is gone.
 
 | Module | Retired Bash counterpart | Status |
 |---|---|---|
-| `mini_ork/cache.py` | `lib/cache.sh` | retired |
+| `mini_ork/cache.py` | `lib/cache.sh` | removed 2026-10 (no production caller) |
 | `mini_ork/trace_store.py` | `lib/trace_store.sh` | retired |
 | `mini_ork/memory/store.py` | `lib/memory.sh` | retired |
 | `mini_ork/dispatch/pricing_strategy.py` | `lib/llm-dispatch.sh` (pricing) | retired |
@@ -40,10 +42,10 @@ Status legend: **retired** = native owner verified; Bash counterpart deleted.
 | `mini_ork/orchestration/harness_wrapper.py` | `lib/harness_wrapper.sh` | retired |
 | `mini_ork/orchestration/spec_split.py` | `lib/spec_split.sh` | retired |
 | `mini_ork/policies/engine.py` (+ `policies/`) | (policy engine; no bash twin — staged feature) | retired |
-| `mini_ork/recovery/cleaner.py` | `lib/cleaner.sh` | retired |
-| `mini_ork/recovery/finalize.py` | `lib/finalize.sh` | retired |
-| `mini_ork/recovery/healer.py` | `lib/healer.sh` | retired |
-| `mini_ork/recovery/healer_bridge.py` | `lib/healer_bridge.sh` | retired |
+| `mini_ork/recovery/cleaner.py` | `lib/cleaner.sh` | removed 2026-10 (no production caller) |
+| `mini_ork/recovery/finalize.py` | `lib/finalize.sh` | removed 2026-10 (no production caller) |
+| `mini_ork/recovery/healer.py` | `lib/healer.sh` | removed 2026-10 (no production caller) |
+| `mini_ork/recovery/healer_bridge.py` | `lib/healer_bridge.sh` | removed 2026-10 (no production caller) |
 | `mini_ork/recovery/trace.py` | `lib/recovery_trace.sh` | retired |
 | `mini_ork/registries/agent_registry.py` | `lib/agent_registry.sh` | retired |
 | `mini_ork/steering/mid_node_injector.py` | `lib/mid_node_injector.sh` | retired |
@@ -56,10 +58,10 @@ Status legend: **retired** = native owner verified; Bash counterpart deleted.
 | `mini_ork/stores/runs_tracker.py` | `lib/runs_tracker.sh` | retired |
 | `mini_ork/stores/safety_events.py` | `lib/safety_events.sh` | retired |
 | `mini_ork/stores/tool_receipts.py` | `lib/tool_receipts.sh` | retired |
-| `mini_ork/vcs/auto_merge.py` | `lib/auto_merge.sh` | retired |
-| `mini_ork/vcs/auto_merge_pr.py` | `lib/auto_merge_pr.sh` | retired |
+| `mini_ork/vcs/auto_merge.py` | `lib/auto_merge.sh` | removed 2026-10 (no production caller) |
+| `mini_ork/vcs/auto_merge_pr.py` | `lib/auto_merge_pr.sh` | removed 2026-10 (no production caller) |
 | `mini_ork/vcs/branch_quarantine.py` | `lib/branch_quarantine.sh` | retired |
-| `mini_ork/vcs/pr_create.py` | `lib/pr_create.sh` | retired |
+| `mini_ork/vcs/pr_create.py` | `lib/pr_create.sh` | removed 2026-10 (no production caller) |
 | `mini_ork/vcs/rebase_guard.py` | `lib/rebase_guard.sh` | retired |
 | `mini_ork/vcs/worktree_guard.py` | `lib/worktree_guard.sh` | retired |
 

@@ -160,16 +160,6 @@ ENGINE_SETTINGS: tuple[Setting, ...] = (
     ),
     # ── Git & PR ─────────────────────────────────────────────────────────────
     Setting(
-        name="MO_AUTO_MERGE",
-        label="Auto-merge PR",
-        group="Git & PR",
-        effect="Merge a run's pull request once its gates pass.",
-        default="0",
-        kind="onoff",
-        read_at="mini_ork/vcs/auto_merge_pr.py",
-        note="Read with a different default (1) by the recovery path — set it explicitly if you rely on it.",
-    ),
-    Setting(
         name="MO_WORKSPACE_MODE",
         label="Workspace mode",
         group="Git & PR",
