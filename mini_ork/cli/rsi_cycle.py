@@ -1,20 +1,25 @@
 """``mini-ork rsi-cycle`` — the operator surface of the self-improvement loop.
 
-At this step the command is **read-only**: ``plan`` harvests the three domains
-and prints the ranked queue, and nothing is written to the ledger, no worktree
-is created and no model is called. That is deliberate — the queue is useful on
-day one, at zero spend, and it gives every later stage a reference output to be
-tested against.
+Two halves. The read-only half (``plan``/``list``/``show``/``doctor``) harvests
+the three domains and prints the ranked queue: useful on day one, at zero spend,
+and the reference output every later stage is tested against. The spending half
+(the default verb, plus ``quarantine``/``revert``/``halt``/``resume``) runs one
+cycle end to end and gives an operator the levers to inspect, keep, release or
+undo what it produced.
 
-The verbs here are the ones an operator reaches for when a cycle misbehaves:
+The verbs an operator reaches for when a cycle misbehaves:
 
-* ``plan``   — what would be fixed next, and why everything else was dropped.
-* ``list``   — what the ledger already knows (candidates, or ``--cycles``).
-* ``show``   — one candidate or cycle in full, including the gate results.
-* ``doctor`` — is this checkout able to run a cycle at all, right now.
+* ``plan``       — what would be fixed next, and why everything else was dropped.
+* ``list``       — what the ledger already knows (candidates, or ``--cycles``).
+* ``show``       — one candidate or cycle in full, including the gate results.
+* ``quarantine`` — list/show/release/clean what a red gate kept.
+* ``revert``     — undo a merge with a gated revert commit, never a reset.
+* ``halt``       — write the durable stop file; ``resume`` removes it.
+* ``doctor``     — is this checkout able to run a cycle at all, right now.
 
-Exit codes: ``0`` ok, ``1`` a check failed / internal error, ``2`` usage,
-config or an unusable database.
+Exit codes: ``0`` ok / nothing to do / halted by budget or a kill switch,
+``1`` a check failed, a cycle failed or an internal error, ``2`` usage, config
+or an unusable database.
 """
 from __future__ import annotations
 
@@ -28,21 +33,35 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 _USAGE = """\
-mini-ork rsi-cycle — harvest gaps in learning, routing and verification.
+mini-ork rsi-cycle — harvest gaps in learning, routing and verification, and fix one.
 
 Usage:
+  mini-ork rsi-cycle [run] [--once | --interval N] [--config PATH] [--dry-run]
+                     [--suggest] [--probe-run] [--max-cycles N] [--budget USD]
+                     [--candidate ID] [--domain D] [--json]
   mini-ork rsi-cycle plan [--json] [--no-probes] [--domain D] [--max N]
   mini-ork rsi-cycle list [--status S] [--limit N] [--cycles] [--json]
   mini-ork rsi-cycle show <cycle_id|candidate_id> [--json]
+  mini-ork rsi-cycle quarantine [list | show <id> | release <id> | clean <id>]
+  mini-ork rsi-cycle revert <cycle_id>
+  mini-ork rsi-cycle halt | resume
   mini-ork rsi-cycle doctor [--json]
 
 Global: --db PATH  --home DIR  --root DIR
+
+The default verb runs one cycle. ``--dry-run`` prints the would-be kickoff and
+writes nothing; ``--suggest`` runs the paid SUGGEST stage but dispatches nothing.
+A cycle merges only when all eleven gates pass and an exogenous critic panel is
+unanimous — otherwise it quarantines the branch and names the failing gate.
 
 ``plan`` is read-only and spends nothing: it runs the deterministic harvest
 (SQLite predicates, AST rules, and — unless --no-probes — the cheap probes)
 and prints the queue a cycle would work from. ``doctor`` is the first thing to
 run when a cycle misbehaves: it checks the DB, the migration state, the probe
 binaries, the worktree driver and the origin remote.
+
+With ``--json`` a single cycle prints one object; a multi-cycle run prints
+``{"cycles": [...]}`` so the output stays one JSON document either way.
 """
 
 _DEFAULTS = {"limit": 20, "max": 3, "status": None}
@@ -71,17 +90,9 @@ def _engine_root(root: str | Path | None) -> Path:
 
 
 def _db_path(root: Path, *, db: str | None, home: str | None) -> Path:
-    if db:
-        return Path(db).expanduser()
-    if home:
-        return Path(home).expanduser() / "state.db"
-    env_db = os.environ.get("MINI_ORK_DB")
-    if env_db:
-        return Path(env_db).expanduser()
-    env_home = os.environ.get("MINI_ORK_HOME")
-    if env_home:
-        return Path(env_home).expanduser() / "state.db"
-    return root / ".mini-ork" / "state.db"
+    from mini_ork.rsi.view import resolve_db
+
+    return resolve_db(root, db=db, home=home)
 
 
 class _SetupError(RuntimeError):
@@ -117,74 +128,6 @@ def _run_probes(root: Path, *, enabled: bool):
     return probe_mod.run_probes(probe_mod.default_specs(root=root), root=root)
 
 
-def _merged_ancestor_signatures(root: Path, rows: Sequence[Mapping[str, Any]]) -> frozenset[str]:
-    """Signatures whose ``merged_sha`` is already an ancestor of ``origin/main``.
-
-    Requires git, which is why the queue never does it. If ``origin/main``
-    cannot be resolved the set is empty: a merged gap then returns to the queue
-    and costs one re-check, rather than a real regression staying hidden
-    forever because the remote moved.
-    """
-    shas = {str(r["merged_sha"]) for r in rows if r.get("merged_sha")}
-    if not shas:
-        return frozenset()
-    try:
-        base = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "--verify", "origin/main"],
-            capture_output=True, text=True, timeout=30, check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return frozenset()
-    if base.returncode != 0:
-        return frozenset()
-
-    reachable: set[str] = set()
-    for sha in shas:
-        try:
-            proc = subprocess.run(
-                ["git", "-C", str(root), "merge-base", "--is-ancestor", sha, "origin/main"],
-                capture_output=True, text=True, timeout=30, check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if proc.returncode == 0:
-            reachable.add(sha)
-    return frozenset(
-        str(r["signature"]) for r in rows if r.get("merged_sha") in reachable
-    )
-
-
-def _ledger_view(con, candidates, *, root: Path):
-    """Read what the queue needs. One query per distinct signature is fine here:
-    a harvest produces dozens, not thousands, and the alternative is a bulk read
-    whose SQL would have to mirror the ledger's own signature index."""
-    from mini_ork.rsi import ledger
-    from mini_ork.rsi.queue import LedgerView
-
-    by_signature: dict[str, Mapping[str, Any]] = {}
-    merged_rows: list[Mapping[str, Any]] = []
-    for sig in sorted({c.signature for c in candidates}):
-        row = ledger.candidate_by_signature(con, sig)
-        if row is None:
-            continue
-        by_signature[sig] = row
-        if row.get("status") == "merged":
-            merged_rows.append(row)
-
-    claimed = {
-        str(r["candidate_id"])
-        for r in con.execute(
-            "SELECT candidate_id FROM rsi_cycles"
-            " WHERE status = 'running' AND candidate_id IS NOT NULL"
-        )
-    }
-    return LedgerView(
-        by_signature=by_signature,
-        claimed_ids=frozenset(claimed),
-        merged_ancestor_signatures=_merged_ancestor_signatures(root, merged_rows),
-    )
-
-
 def _harvest_and_queue(
     root: Path,
     db: Path,
@@ -197,6 +140,7 @@ def _harvest_and_queue(
     from mini_ork.context import scoped_environ
     from mini_ork.rsi import harvest as harvest_mod
     from mini_ork.rsi import ledger, queue as queue_mod
+    from mini_ork.rsi.view import ledger_view
 
     now = int(time.time()) if now is None else int(now)
     con = _open_ledger(db)
@@ -207,7 +151,7 @@ def _harvest_and_queue(
         with scoped_environ({"MINI_ORK_DB": str(db), "MINI_ORK_ROOT": str(root)}):
             probe_results = _run_probes(root, enabled=probes_enabled)
             report = harvest_mod.harvest(root, con, now=now, probes=probe_results)
-        view = _ledger_view(con, report.candidates, root=root)
+        view = ledger_view(con, report.candidates, root=root)
         plan = queue_mod.build_queue(
             report.candidates,
             now=now,
@@ -335,7 +279,7 @@ def _cmd_plan(args, root: Path, db: Path) -> int:
         root,
         db,
         probes_enabled=not args.no_probes,
-        max_candidates=args.max,
+        max_candidates=args.max if args.max is not None else _DEFAULTS["max"],
         domains=[args.domain] if args.domain else None,
     )
     if args.json:
@@ -541,25 +485,375 @@ def _cmd_doctor(args, root: Path, db: Path) -> int:
 
 
 # --------------------------------------------------------------------------
+# The spending half: run one cycle, and the operator levers around it
+# --------------------------------------------------------------------------
+
+
+def _load_config(args, root: Path):
+    """Parse the config, then apply the command-line overrides that are allowed.
+
+    ``--budget`` can only *lower* the per-cycle cap: a flag that raised it would
+    let one invocation outspend the file an operator wrote down.
+    """
+    from dataclasses import replace
+
+    from mini_ork.rsi import config as cfg_mod
+
+    env = dict(os.environ)
+    # So the default config path (``<MINI_ORK_ROOT>/config/rsi-cycle.yaml``)
+    # resolves to the checkout being operated on, not the shell's cwd.
+    env["MINI_ORK_ROOT"] = str(root)
+    try:
+        cfg = cfg_mod.load_config(args.config, env=env, strict=True)
+    except cfg_mod.ConfigError as exc:
+        raise _SetupError(str(exc)) from exc
+
+    if args.budget is not None:
+        cap = float(args.budget)
+        if cap <= 0:
+            raise _SetupError("--budget must be positive")
+        if cap > cfg.budget.daily_cap_usd:
+            raise _SetupError(
+                f"--budget {cap:.2f} exceeds the daily cap "
+                f"{cfg.budget.daily_cap_usd:.2f}; lower the daily cap in the config instead")
+        cfg = replace(cfg, budget=replace(cfg.budget, per_cycle_cap_usd=cap))
+
+    max_cycles = cfg.max_cycles if args.max_cycles is None else int(args.max_cycles)
+    mode, interval = cfg.mode, cfg.interval_s
+    if args.once:
+        # ``--once`` beats a config that says loop: an operator's flag is the
+        # more recent statement of intent, and "run once" must never run twice.
+        mode, max_cycles = "once", 1
+    elif args.interval is not None:
+        mode, interval = "loop", int(args.interval)
+    # ``--max-cycles`` above one is a loop by definition; the config's own
+    # ``mode: once`` is not contradicted, it is overridden for this invocation.
+    if mode == "once" and max_cycles != 1:
+        mode = "loop"
+    cfg = replace(cfg, mode=mode, interval_s=interval, max_cycles=max_cycles)
+    return cfg
+
+
+def _cmd_run(args, root: Path, db: Path) -> int:
+    from dataclasses import replace
+
+    from mini_ork.rsi import cycle as cycle_mod
+
+    cfg = _load_config(args, root)
+    if args.probe_run and not cfg.probes.allow_live and not args.dry_run:
+        # ``allow_live`` in the file is a permission, not a trigger: a config
+        # alone must never start a paid run.
+        cfg = replace(cfg, probes=replace(cfg.probes, allow_live=True))
+
+    outcomes: list[Any] = []
+    rc = 0
+    while True:
+        req = cycle_mod.CycleRequest(
+            root=root, db=db, config=cfg,
+            dry_run=args.dry_run, propose_only=args.suggest,
+            candidate_id=args.candidate, max_candidates=args.max,
+            domains=[args.domain] if args.domain else None,
+            probe_run=bool(args.probe_run),
+        )
+        try:
+            outcome = cycle_mod.run_cycle(req)
+        except cycle_mod.CycleSetupError as exc:
+            raise _SetupError(str(exc)) from exc
+        except cycle_mod.CycleFailure as exc:
+            sys.stderr.write(f"rsi-cycle: {exc}\n")
+            return 1
+        outcomes.append(outcome)
+        rc = outcome.rc
+
+        looping = cfg.mode == "loop" and not args.dry_run
+        if not looping or outcome.status == "halted":
+            break
+        if cfg.max_cycles and len(outcomes) >= cfg.max_cycles:
+            break
+        time.sleep(cfg.interval_s)
+
+    if args.json:
+        payload: Any = (_outcome_dict(outcomes[0]) if len(outcomes) == 1
+                        else {"cycles": [_outcome_dict(o) for o in outcomes]})
+        sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    else:
+        for outcome in outcomes:
+            sys.stdout.write(_render_outcome(outcome))
+    return rc
+
+
+def _outcome_dict(outcome) -> dict[str, Any]:
+    return {
+        "cycle_id": outcome.cycle_id,
+        "status": outcome.status,
+        "rc": outcome.rc,
+        "halt_reason": outcome.halt_reason,
+        "candidate_id": outcome.candidate_id,
+        "detail": outcome.detail,
+        "merged_sha": outcome.merged_sha,
+        "kickoff": outcome.kickoff,
+        "gates": outcome.gates.to_dict() if outcome.gates is not None else None,
+    }
+
+
+def _render_outcome(outcome) -> str:
+    lines = [f"cycle {outcome.cycle_id} — {outcome.status}"]
+    if outcome.candidate_id:
+        lines.append(f"  candidate  {outcome.candidate_id}")
+    if outcome.merged_sha:
+        lines.append(f"  merged     {outcome.merged_sha}")
+    if outcome.halt_reason:
+        lines.append(f"  reason     {outcome.halt_reason}")
+    if outcome.detail:
+        lines.append(f"  detail     {outcome.detail}")
+    if outcome.gates is not None:
+        results = outcome.gates.results
+        passed = sum(1 for r in results if r.ok)
+        lines.append(f"  gates      {passed}/{len(results)} passed")
+        for result in outcome.gates.failing:
+            lines.append(f"    FAIL {result.gate} {result.code}: {result.detail}")
+    if outcome.kickoff:
+        lines.append("")
+        lines.append(outcome.kickoff.rstrip())
+    return "\n".join(lines) + "\n"
+
+
+def _operator_request(root: Path, db: Path, cfg):
+    """A request used only to rebuild worktree policy for an operator verb."""
+    from mini_ork.rsi.cycle import CycleRequest
+
+    return CycleRequest(root=root, db=db, config=cfg, dry_run=True,
+                        cycle_id="rsi-operator")
+
+
+def _quarantine_record(row: Mapping[str, Any], db: Path) -> Path:
+    explicit = str(row.get("quarantine_path") or "")
+    if explicit:
+        return Path(explicit)
+    return Path(db).parent / "rsi" / "quarantine" / f"{row['cycle_id']}.json"
+
+
+def _cmd_quarantine(args, root: Path, db: Path) -> int:
+    from mini_ork.rsi import ledger
+
+    action = (args.ident or "list").lower()
+    if action not in ("list", "show", "release", "clean"):
+        raise _SetupError("quarantine takes one of: list, show <id>, release <id>, clean <id>")
+    con = _open_ledger(db)
+    try:
+        if action == "list":
+            rows = [
+                dict(r) for r in con.execute(
+                    "SELECT cycle_id, candidate_id, status, quarantine_reason,"
+                    " quarantine_path, cost_usd, started_at FROM rsi_cycles"
+                    " WHERE quarantine_path IS NOT NULL AND quarantine_path <> ''"
+                    " ORDER BY started_at DESC LIMIT ?", (int(args.limit),))
+            ]
+        else:
+            ident = args.sub
+            if not ident:
+                raise _SetupError(f"quarantine {action} needs a cycle id")
+            row = ledger.get_cycle(con, ident)
+            if row is None:
+                raise _SetupError(f"no such cycle: {ident}")
+    finally:
+        con.close()
+
+    if action == "list":
+        if args.json:
+            sys.stdout.write(json.dumps(rows, indent=2, sort_keys=True) + "\n")
+        elif not rows:
+            sys.stdout.write("no quarantined cycles\n")
+        else:
+            sys.stdout.write(_table(
+                [(r["cycle_id"], str(r["status"]), r["candidate_id"] or "-",
+                  f"{float(r['cost_usd'] or 0):.2f}", r["quarantine_reason"] or "-")
+                 for r in rows],
+                ("cycle_id", "status", "candidate", "usd", "reason")) + "\n")
+        return 0
+
+    if action == "show":
+        path = _quarantine_record(row, db)
+        if not path.is_file():
+            raise _SetupError(f"quarantine record missing: {path}")
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise _SetupError(f"cannot read {path}: {exc}") from exc
+        if args.json:
+            sys.stdout.write(json.dumps(record, indent=2, sort_keys=True) + "\n")
+        else:
+            gates = (record.get("gates") or {}).get("results") or []
+            lines = [f"cycle {row['cycle_id']} — {row['status']}",
+                     f"  candidate  {row['candidate_id'] or '-'}",
+                     f"  reason     {row['quarantine_reason'] or '-'}",
+                     f"  record     {path}"]
+            for gate in gates:
+                if not gate.get("ok"):
+                    lines.append(f"    FAIL {gate['gate']} {gate['code']}: {gate['detail']}")
+            if record.get("changed_files"):
+                lines.append(f"  files      {', '.join(record['changed_files'])}")
+            lines.append("  worktree   "
+                         f"{_worktree_path(root, row['cycle_id'])} (branch wt/{row['cycle_id']})")
+            sys.stdout.write("\n".join(lines) + "\n")
+        return 0
+
+    # release / clean both need the config: they rebuild worktree policy, and
+    # ``clean`` must not invent a scope the run never had.
+    cfg = _load_config(args, root)
+    from mini_ork.rsi import cycle as cycle_mod
+
+    con = _open_ledger(db)
+    try:
+        candidate = ledger.get_candidate(con, row["candidate_id"] or "")
+        if candidate is None:
+            raise _SetupError(f"no candidate row for cycle {row['cycle_id']}")
+        files = json.loads(candidate.get("files_json") or "[]")
+        if action == "release":
+            # Re-open it: the operator is taking the branch, and the next cycle
+            # may still re-attempt the gap once the failed-signature TTL lapses.
+            ledger.set_candidate_status(
+                con, candidate["candidate_id"], "open", now=int(time.time()),
+                reason=f"released by operator (cycle {row['cycle_id']})")
+        else:
+            from mini_ork.rsi.worktree import clean
+
+            clean(cycle_mod.worktree_config(
+                _operator_request(root, db, cfg), slug=row["cycle_id"], files=files))
+    finally:
+        con.close()
+
+    if action == "release":
+        path = _worktree_path(root, row["cycle_id"])
+        sys.stdout.write(
+            f"released {candidate['candidate_id']}; branch wt/{row['cycle_id']} kept at {path}\n"
+            f"  merge by hand with: git -C {path} checkout wt/{row['cycle_id']}\n")
+    else:
+        sys.stdout.write(f"cleaned worktree and branch for {row['cycle_id']}\n")
+    return 0
+
+
+def _worktree_path(root: Path, slug: str) -> Path:
+    from mini_ork.rsi.cycle import _worktrees_dir
+
+    return _worktrees_dir(root) / slug
+
+
+def _cmd_revert(args, root: Path, db: Path) -> int:
+    from mini_ork.rsi import ledger
+    from mini_ork.rsi import cycle as cycle_mod
+    from mini_ork.rsi.worktree import revert
+
+    ident = args.ident
+    if not ident:
+        raise _SetupError("revert needs a merged cycle id")
+    con = _open_ledger(db)
+    try:
+        row = ledger.get_cycle(con, ident)
+        if row is None:
+            raise _SetupError(f"no such cycle: {ident}")
+        if not row.get("merged_sha"):
+            raise _SetupError(f"cycle {ident} has no merged_sha — nothing to revert")
+        candidate = ledger.get_candidate(con, row["candidate_id"] or "")
+    finally:
+        con.close()
+
+    cfg = _load_config(args, root)
+    files = json.loads((candidate or {}).get("files_json") or "[]")
+    result = revert(
+        cycle_mod.worktree_config(_operator_request(root, db, cfg), slug=ident, files=files),
+        str(row["merged_sha"]))
+    if args.json:
+        sys.stdout.write(json.dumps(
+            {"cycle_id": ident, "reverted_sha": row["merged_sha"],
+             "status": result.status, "sha": result.sha, "detail": result.detail},
+            indent=2, sort_keys=True) + "\n")
+    else:
+        sys.stdout.write(f"revert {ident}: {result.status}"
+                         + (f" {result.sha}" if result.sha else "")
+                         + (f"\n  {result.detail}" if result.detail else "") + "\n")
+    return 0 if result.landed else 1
+
+
+def _cmd_halt(args, root: Path, db: Path) -> int:
+    """Write the durable stop and report who still holds the lease.
+
+    Deliberately does not read the config: a loop whose config is broken is
+    exactly when an operator needs to stop it, and ``halt`` must not be the
+    verb that fails to parse.
+    """
+    from mini_ork.rsi.config import LeaseConfig
+    from mini_ork.stores import lease
+
+    stop = Path(db).parent / "rsi" / "DISABLED"
+    stop.parent.mkdir(parents=True, exist_ok=True)
+    stop.write_text(f"halted by operator at {int(time.time())}\n", encoding="utf-8")
+    sys.stdout.write(f"halted: wrote {stop}\n")
+    try:
+        held = lease.current_lease(str(db), LeaseConfig().key)
+    except Exception:  # noqa: BLE001 - reporting must not fail the stop
+        held = None
+    if held:
+        sys.stdout.write(
+            f"  a cycle is still running under lease {held.get('owner_token', '?')}; "
+            f"it stops at its next stage check or when the lease expires\n")
+    return 0
+
+
+def _cmd_resume(args, root: Path, db: Path) -> int:
+    stop = Path(db).parent / "rsi" / "DISABLED"
+    if stop.exists():
+        stop.unlink()
+        sys.stdout.write(f"resumed: removed {stop}\n")
+    else:
+        sys.stdout.write(f"resumed: {stop} was not present\n")
+    return 0
+
+
+# --------------------------------------------------------------------------
 # Parser / entry point
 # --------------------------------------------------------------------------
 
 
+_VERBS = ("run", "plan", "list", "show", "doctor", "quarantine", "revert",
+          "halt", "resume", "help")
+
+
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="mini-ork rsi-cycle", add_help=False)
-    p.add_argument("verb", nargs="?", default="plan",
-                   choices=["plan", "list", "show", "doctor", "help"])
-    p.add_argument("ident", nargs="?", default=None)
+    p.add_argument("verb", nargs="?", default="run", choices=_VERBS)
+    p.add_argument("ident", nargs="?", default=None,
+                   help="show <id> | quarantine <action> | revert <id>")
+    p.add_argument("sub", nargs="?", default=None,
+                   help="quarantine show|release|clean <cycle_id>")
     p.add_argument("--json", action="store_true")
     p.add_argument("--no-probes", action="store_true",
                    help="plan: skip the deterministic probes (DB + AST only)")
     p.add_argument("--domain", default=None,
                    choices=["learning", "routing", "verification"])
-    p.add_argument("--max", type=int, default=_DEFAULTS["max"],
+    p.add_argument("--max", type=int, default=None,
                    help="plan: how many candidates to select")
     p.add_argument("--status", default=None, help="list: filter by status")
     p.add_argument("--limit", type=int, default=_DEFAULTS["limit"])
     p.add_argument("--cycles", action="store_true", help="list: cycles instead of candidates")
+    # --- the run verb
+    p.add_argument("--config", default=None,
+                   help="run: config file (else MO_RSI_CONFIG, else config/rsi-cycle.yaml)")
+    p.add_argument("--once", action="store_true", help="run: exactly one cycle (default)")
+    p.add_argument("--interval", type=int, default=None,
+                   help="run: seconds between cycles; implies a loop")
+    p.add_argument("--dry-run", action="store_true",
+                   help="run: print the would-be kickoff; write and dispatch nothing")
+    p.add_argument("--suggest", action="store_true",
+                   help="run: run SUGGEST but do not dispatch an implementer")
+    p.add_argument("--probe-run", action="store_true",
+                   help="run: include the paid live probes (opt-in, charged to the budget)")
+    p.add_argument("--max-cycles", type=int, default=None,
+                   help="run: stop after N cycles (0 = unlimited, loop only)")
+    p.add_argument("--budget", type=float, default=None,
+                   help="run: per-cycle USD cap; may only lower the config's value")
+    p.add_argument("--candidate", default=None,
+                   help="run: work on this candidate id instead of the queue's top")
     p.add_argument("--db", default=None)
     p.add_argument("--home", default=None)
     p.add_argument("--root", default=None)
@@ -584,17 +878,29 @@ def main(argv: Sequence[str] | None = None, *, root: str | Path | None = None) -
     if args.verb == "show" and not args.ident:
         sys.stderr.write("usage: mini-ork rsi-cycle show <cycle_id|candidate_id>\n")
         return 2
+    if args.verb == "revert" and not args.ident:
+        sys.stderr.write("usage: mini-ork rsi-cycle revert <cycle_id>\n")
+        return 2
+    if args.verb == "quarantine" and args.ident and args.ident.lower() not in (
+            "list", "show", "release", "clean"):
+        sys.stderr.write("usage: mini-ork rsi-cycle quarantine [list|show|release|clean] <id>\n")
+        return 2
 
     base = _engine_root(args.root or root)
     db = _db_path(base, db=args.db, home=args.home)
+    verbs = {
+        "plan": _cmd_plan,
+        "list": _cmd_list,
+        "show": _cmd_show,
+        "quarantine": _cmd_quarantine,
+        "revert": _cmd_revert,
+        "halt": _cmd_halt,
+        "resume": _cmd_resume,
+        "doctor": _cmd_doctor,
+    }
     try:
-        if args.verb == "plan":
-            return _cmd_plan(args, base, db)
-        if args.verb == "list":
-            return _cmd_list(args, base, db)
-        if args.verb == "show":
-            return _cmd_show(args, base, db)
-        return _cmd_doctor(args, base, db)
+        handler = verbs.get(args.verb, _cmd_run)
+        return handler(args, base, db)
     except _SetupError as exc:
         sys.stderr.write(f"rsi-cycle: {exc}\n")
         return 2

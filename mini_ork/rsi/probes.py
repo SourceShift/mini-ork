@@ -254,11 +254,19 @@ PARSERS: Mapping[str, Callable[[str], tuple[Finding, ...]]] = {
 # Running
 # --------------------------------------------------------------------------
 
-def subprocess_runner(argv: Sequence[str], *, timeout_s: int, cwd: str) -> tuple[int, str, str]:
-    """Default runner: no shell, no retry, output captured as text."""
+def subprocess_runner(argv: Sequence[str], *, timeout_s: int, cwd: str,
+                      env: Mapping[str, str] | None = None) -> tuple[int, str, str]:
+    """Default runner: no shell, no retry, output captured as text.
+
+    ``env`` exists so a cycle can pin ``MINI_ORK_DB``/``MINI_ORK_ROOT`` for a
+    probe. Without it every probe resolves its own DB, and a cycle given an
+    explicit ``--db`` would harvest one database while its probes report on
+    another.
+    """
     proc = subprocess.run(
         list(argv),
         cwd=cwd,
+        env=None if env is None else dict(env),
         capture_output=True,
         text=True,
         timeout=timeout_s,

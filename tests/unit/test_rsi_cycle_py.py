@@ -1,0 +1,650 @@
+"""Unit tests: one cycle end to end, with every side effect faked.
+
+The point of injecting a ``Runtime`` is that these tests can prove the *policy*
+of an unattended loop without a model, a worktree or a merge:
+
+* it merges only when every gate passes and the panel is unanimous;
+* it quarantines rather than discards when a gate is red;
+* it halts before spending, not after;
+* it never leaves a ``running`` row behind;
+* ``--dry-run`` writes nothing and spawns nothing.
+
+Each test names the failure it prevents. A cycle is a spending machine; the
+tests are its brakes.
+"""
+from __future__ import annotations
+
+import shutil
+import sqlite3
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO))
+
+from mini_ork.rsi.candidates import Candidate  # noqa: E402
+from mini_ork.rsi.config import from_mapping  # noqa: E402
+from mini_ork.rsi.cycle import (  # noqa: E402
+    CycleFailure,
+    CycleRequest,
+    CycleSetupError,
+    Implementation,
+    Runtime,
+    run_cycle,
+)
+from mini_ork.rsi.gates import CriticVerdict, GateEvidence  # noqa: E402
+from mini_ork.rsi.harvest import HarvestReport  # noqa: E402
+from mini_ork.rsi.probes import ProbeResult  # noqa: E402
+from mini_ork.rsi.select import Proposal  # noqa: E402
+from mini_ork.rsi.worktree import MergeResult  # noqa: E402
+from mini_ork.stores import lease, migrate  # noqa: E402
+
+NOW = 1_760_000_000
+FILE = "mini_ork/verify/persist.py"
+
+
+# --------------------------------------------------------------------------
+# Fixtures
+# --------------------------------------------------------------------------
+
+
+def _migrate(db_path: Path, tmp_path: Path, names: tuple[str, ...]) -> None:
+    migdir = tmp_path / "migrations"
+    migdir.mkdir(exist_ok=True)
+    for name in names:
+        shutil.copy(REPO / "db" / "migrations" / name, migdir / name)
+    rc, out = migrate.migrate_apply(str(migdir), dry_run=False, db=str(db_path),
+                                    root=str(REPO))
+    assert rc == 0, out
+
+
+def _cfg(**overrides):
+    raw = {
+        "budget": {"daily_cap_usd": 50, "per_cycle_cap_usd": 20},
+        "critic": {"lanes": ["glm_lens", "opus_lens"]},
+        "gates": {"pytest_paths": ["tests/unit/test_x.py"]},
+        "decide": {"auto_merge": True},
+    }
+    raw.update(overrides)
+    return from_mapping(raw, env={}, strict=True)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_env(tmp_path, monkeypatch):
+    """Every kill switch and meter resolves under tmp_path, never the real home."""
+    monkeypatch.delenv("MO_RSI_CYCLE_DISABLED", raising=False)
+    monkeypatch.setenv("MINI_ORK_HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("MINI_ORK_DB", raising=False)
+
+
+@pytest.fixture
+def world(tmp_path):
+    db = tmp_path / "state.db"
+    _migrate(db, tmp_path, ("0052_run_leases_recovery_requests.sql",
+                            "0084_rsi_cycles.sql"))
+    root = tmp_path / "repo"
+    (root / "mini_ork" / "verify").mkdir(parents=True)
+    (root / FILE).write_text("# target\n", encoding="utf-8")
+    return SimpleNamespace(db=db, root=root, tmp=tmp_path, cfg=_cfg())
+
+
+def _cand(**overrides) -> Candidate:
+    kwargs = dict(
+        domain="verification",
+        source="db:V1",
+        kind="data_path_dead",
+        title="confidence is never persisted",
+        evidence_key="table:verifier_results:confidence-null",
+        files=(FILE,),
+        success_command="db:V1",
+        now=NOW,
+    )
+    kwargs.update(overrides)
+    return Candidate.build(**kwargs)
+
+
+def _report(cand: Candidate | None = None, *, ok: bool = True,
+            skipped: tuple[str, ...] = ()) -> HarvestReport:
+    return HarvestReport(
+        candidates=() if cand is None else (cand,),
+        probes=(),
+        harvest_ok=ok,
+        skipped=skipped,
+        errors=() if ok else ("garden",),
+    )
+
+
+def _impl(root: Path, cand: Candidate, *, cost: float = 2.0) -> Implementation:
+    return Implementation(
+        worktree=SimpleNamespace(path=root),
+        worktree_config=object(),
+        changed_files=cand.files,
+        diff="diff --git a/x b/x\n",
+        verdict={"pass": True, "files_changed": 1},
+        child_run_id="child-run",
+        cost_usd=cost,
+    )
+
+
+def _evidence(**overrides) -> GateEvidence:
+    base = dict(lint_ok=True, pytest_ok=True, static_ran=True, probes_ran=True,
+                static_before=(), static_after=(),
+                gap_before=True, gap_after=False,
+                probe_failures_before=(), probe_failures_after=())
+    base.update(overrides)
+    return GateEvidence(**base)
+
+
+class Harness:
+    """A runtime where every call is recorded, so 'did not run' is assertable."""
+
+    def __init__(self, world, cand: Candidate | None = None):
+        self.world = world
+        self.cand = cand if cand is not None else _cand()
+        self.calls: list[str] = []
+        self.quarantined: list[str] = []
+        self.cleaned: list[str] = []
+        self.lease_key = world.cfg.lease.key
+        self.runtime = Runtime(
+            now=lambda: NOW,
+            probes=self._probes,
+            harvest=self._harvest,
+            propose=self._propose,
+            implement=self._implement,
+            measure=self._measure,
+            critics=self._critics,
+            spend_24h=self._spend,
+            merge=self._merge,
+            clean=self._clean,
+            quarantine=self._quarantine,
+        )
+
+    # --- overridable behaviour
+    spend: float = 0.0
+    merge_status: str = "merged"
+    critic_verdicts: tuple[CriticVerdict, ...] = (
+        CriticVerdict("glm", lane="glm_lens", approve=True),
+        CriticVerdict("opus", lane="opus_lens", approve=True),
+    )
+    measurement_overrides: dict = {}
+
+    def _probes(self, req):
+        self.calls.append("probes")
+        return (ProbeResult("garden", "garden", "ok", 0, 1),)
+
+    def _harvest(self, req, con, now, probes):
+        self.calls.append("harvest")
+        return _report(self.cand)
+
+    def _propose(self, req, cand):
+        self.calls.append("propose")
+        return Proposal(candidate_id=cand.candidate_id, files=cand.files,
+                        summary="persist the column", root_cause="the producer is unwired",
+                        verification_command=cand.success_command)
+
+    def _implement(self, req, cand, selection):
+        self.calls.append("implement")
+        return _impl(self.world.root, cand)
+
+    def _measure(self, req, cand, impl, selection):
+        self.calls.append("measure")
+        return _evidence(**self.measurement_overrides)
+
+    def _critics(self, req, cand, impl, selection, report):
+        self.calls.append("critics")
+        return self.critic_verdicts
+
+    def _spend(self, db):
+        self.calls.append("spend")
+        return self.spend
+
+    def _merge(self, req, impl):
+        self.calls.append("merge")
+        return MergeResult(self.merge_status, sha="deadbeef" if self.merge_status == "merged" else "",
+                           detail="")
+
+    def _clean(self, req, impl):
+        self.calls.append("clean")
+        self.cleaned.append(req.cycle_id)
+
+    def _quarantine(self, req, cand, impl, report, reason):
+        self.calls.append("quarantine")
+        self.quarantined.append(reason)
+        return self.world.tmp / f"{req.cycle_id}.json"
+
+    # --- helpers
+    def request(self, **overrides) -> CycleRequest:
+        kwargs = dict(root=self.world.root, db=self.world.db, config=self.world.cfg,
+                      cycle_id="rsi-ctest", propose_only=False, proposal=None)
+        kwargs.update(overrides)
+        return CycleRequest(**kwargs)
+
+    def run(self, **overrides):
+        return run_cycle(self.request(**overrides), runtime=self.runtime)
+
+
+def _rows(db: Path, sql: str, *args):
+    con = sqlite3.connect(str(db))
+    con.row_factory = sqlite3.Row
+    try:
+        return [dict(r) for r in con.execute(sql, args)]
+    finally:
+        con.close()
+
+
+def _cycle(db: Path, cycle_id: str = "rsi-ctest") -> dict:
+    rows = _rows(db, "SELECT * FROM rsi_cycles WHERE cycle_id = ?", cycle_id)
+    assert rows, "the cycle wrote no ledger row"
+    return rows[0]
+
+
+def _candidate_row(db: Path) -> dict:
+    rows = _rows(db, "SELECT * FROM rsi_candidates")
+    assert len(rows) == 1, rows
+    return rows[0]
+
+
+# --------------------------------------------------------------------------
+# The happy path
+# --------------------------------------------------------------------------
+
+
+def test_a_clean_cycle_merges_and_records_the_sha(world):
+    h = Harness(world)
+    out = h.run()
+
+    assert out.rc == 0
+    assert out.status == "merged"
+    assert out.merged_sha == "deadbeef"
+    row = _cycle(world.db)
+    assert row["status"] == "merged"
+    assert row["merged_sha"] == "deadbeef"
+    assert row["finished_at"] == NOW
+    cand = _candidate_row(world.db)
+    assert cand["status"] == "merged"
+    assert cand["merged_sha"] == "deadbeef"
+    assert h.cleaned == [], "a merged worktree is cleaned by the merge script, not the cycle"
+
+
+def test_the_merge_is_the_last_thing_that_happens(world):
+    h = Harness(world)
+    h.run()
+    assert h.calls == ["spend", "probes", "harvest", "propose", "implement",
+                       "measure", "critics", "merge"]
+    assert h.calls.index("implement") < h.calls.index("measure") < h.calls.index("merge")
+
+
+def test_probe_results_are_recorded_per_cycle(world):
+    Harness(world).run()
+    rows = _rows(world.db, "SELECT probe_id, status FROM rsi_probe_runs")
+    assert rows == [{"probe_id": "garden", "status": "ok"}]
+
+
+# --------------------------------------------------------------------------
+# Red gates
+# --------------------------------------------------------------------------
+
+
+def test_a_red_gate_quarantines_instead_of_merging(world):
+    h = Harness(world)
+    h.measurement_overrides = {"lint_ok": False, "lint_detail": "E999 syntax error"}
+    out = h.run()
+
+    assert out.status == "quarantined"
+    assert out.rc == 0
+    assert "lint_failed" in out.detail
+    assert h.quarantined == ["gate_failed"]
+    assert "merge" not in h.calls
+    assert _candidate_row(world.db)["status"] == "quarantined"
+    row = _cycle(world.db)
+    assert row["status"] == "quarantined"
+    assert "lint_failed" in row["quarantine_reason"]
+    assert row["quarantine_path"].endswith("rsi-ctest.json")
+
+
+def test_quarantine_keeps_the_worktree_by_default(world):
+    h = Harness(world)
+    h.measurement_overrides = {"pytest_ok": False}
+    h.run()
+    assert h.cleaned == []
+    assert world.cfg.decide.quarantine_keep_worktree is True
+
+
+def test_quarantine_can_clean_a_throwaway_worktree(world):
+    h = Harness(world)
+    h.world = SimpleNamespace(**{**world.__dict__,
+                                 "cfg": _cfg(decide={"auto_merge": True,
+                                                     "quarantine_keep_worktree": False})})
+    h.measurement_overrides = {"pytest_ok": False}
+    h.run()
+    assert h.cleaned == ["rsi-ctest"]
+
+
+def test_a_split_panel_quarantines_even_when_every_other_gate_passes(world):
+    h = Harness(world)
+    h.critic_verdicts = (
+        CriticVerdict("glm", lane="glm_lens", approve=True),
+        CriticVerdict("opus", lane="opus_lens", approve=False, blocking=("no root cause",)),
+    )
+    out = h.run()
+    assert out.status == "quarantined"
+    assert "critic_split" in out.detail
+    assert "merge" not in h.calls
+
+
+def test_no_critics_at_all_fails_g10_closed(world):
+    """With no panel configured a cycle must not merge on 'nobody objected'."""
+    h = Harness(world)
+    h.critic_verdicts = ()
+    out = h.run()
+    assert out.status == "quarantined"
+    assert "critic_not_exogenous" in out.detail
+
+
+def test_auto_merge_absent_quarantines_a_passing_change(world):
+    h = Harness(world)
+    h.world = SimpleNamespace(**{**world.__dict__,
+                                 "cfg": from_mapping({
+                                     "budget": {"daily_cap_usd": 50, "per_cycle_cap_usd": 20},
+                                     "critic": {"lanes": ["glm_lens", "opus_lens"]},
+                                     "gates": {"pytest_paths": ["tests/unit/test_x.py"]},
+                                 }, env={}, strict=True)})
+    out = h.run()
+    assert out.status == "quarantined"
+    assert out.halt_reason == "auto_merge_disabled"
+    assert "merge" not in h.calls
+
+
+def test_a_rejected_merge_is_a_quarantine_not_a_crash(world):
+    h = Harness(world)
+    h.merge_status = "rejected"
+    out = h.run()
+    assert out.status == "quarantined"
+    assert out.halt_reason == "merge_rejected"
+    assert _candidate_row(world.db)["status"] == "quarantined"
+
+
+def test_a_diverged_merge_counts_as_landed(world):
+    """``--ff-only`` refusing locally means the push already landed."""
+    h = Harness(world)
+    h.merge_status = "diverged"
+    out = h.run()
+    assert out.status == "merged"
+
+
+# --------------------------------------------------------------------------
+# Budget
+# --------------------------------------------------------------------------
+
+
+def test_the_daily_cap_halts_before_probes_or_models(world):
+    h = Harness(world)
+    h.spend = 50.0
+    out = h.run()
+
+    assert out.status == "halted"
+    assert out.rc == 0
+    assert out.halt_reason == "daily_cap"
+    assert h.calls == ["spend"], "nothing may run once the daily cap is reached"
+    assert _rows(world.db, "SELECT * FROM rsi_cycles") == []
+
+
+def test_the_per_cycle_cap_blocks_the_merge(world):
+    h = Harness(world)
+
+    def expensive(req, cand, selection):
+        return _impl(world.root, cand, cost=25.0)
+
+    h.runtime.implement = expensive
+    out = h.run()
+    assert out.status == "quarantined"
+    assert "budget_exceeded" in out.detail
+    assert "merge" not in h.calls
+
+
+def test_the_per_cycle_cap_is_judged_against_the_child_cost(world):
+    """A tight cap still merges a child that fits under it — G11 grades the
+    measured cost, not the cap itself."""
+    h = Harness(world)
+    h.world = SimpleNamespace(**{**world.__dict__, "cfg": _cfg(
+        budget={"daily_cap_usd": 50, "per_cycle_cap_usd": 5})})
+    out = h.run()
+    assert out.status == "merged"
+
+
+# --------------------------------------------------------------------------
+# Lease and kill switches
+# --------------------------------------------------------------------------
+
+
+def test_a_held_lease_is_rc_zero_and_spends_nothing(world):
+    lease.acquire_lease(str(world.db), world.cfg.lease.key, owner_token="someone-else")
+    h = Harness(world)
+    out = h.run()
+
+    assert out.status == "halted"
+    assert out.rc == 0
+    assert out.halt_reason == "lease_held"
+    # The budget check runs before the lease, by design: it costs one query and
+    # a halted cycle must never even read a model bill.
+    assert h.calls == ["spend"]
+    assert _rows(world.db, "SELECT * FROM rsi_cycles") == []
+
+
+def test_the_lease_is_released_after_the_cycle(world):
+    Harness(world).run()
+    assert lease.current_lease(str(world.db), world.cfg.lease.key) is None
+
+
+def test_missing_lease_tables_is_a_setup_error(tmp_path):
+    db = tmp_path / "old.db"
+    _migrate(db, tmp_path, ("0084_rsi_cycles.sql",))
+    root = tmp_path / "repo"
+    root.mkdir()
+    with pytest.raises(CycleSetupError, match="lease tables"):
+        run_cycle(CycleRequest(root=root, db=db, config=_cfg()))
+
+
+def test_no_database_is_a_setup_error(tmp_path):
+    with pytest.raises(CycleSetupError, match="state DB not found"):
+        run_cycle(CycleRequest(root=tmp_path, db=tmp_path / "nope.db", config=_cfg()))
+
+
+def test_the_env_kill_switch_stops_everything(world, monkeypatch):
+    monkeypatch.setenv("MO_RSI_CYCLE_DISABLED", "1")
+    h = Harness(world)
+    out = h.run()
+    assert out.halt_reason == "MO_RSI_CYCLE_DISABLED=1"
+    assert h.calls == []
+
+
+def test_the_disabled_file_stops_everything(world):
+    (world.tmp / "rsi").mkdir()
+    (world.tmp / "rsi" / "DISABLED").write_text("operator stop\n", encoding="utf-8")
+    h = Harness(world)
+    out = h.run()
+    assert out.halt_reason == "rsi/DISABLED file present"
+    assert h.calls == []
+
+
+def test_the_config_switch_stops_everything(world):
+    (world.tmp / "rsi").mkdir()
+    h = Harness(world)
+    h.world = SimpleNamespace(**{**world.__dict__, "cfg": from_mapping({
+        "enabled": False,
+        "budget": {"daily_cap_usd": 50, "per_cycle_cap_usd": 20},
+        "critic": {"lanes": ["glm_lens", "opus_lens"]},
+        "gates": {"pytest_paths": ["tests/unit/test_x.py"]},
+    }, env={}, strict=True)})
+    out = h.run()
+    assert out.halt_reason == "enabled: false"
+    assert h.calls == []
+
+
+# --------------------------------------------------------------------------
+# Dry run
+# --------------------------------------------------------------------------
+
+
+def test_a_dry_run_writes_zero_rows_and_spawns_nothing(world):
+    """The default dry run must not spend: with no SUGGEST recipe wired it
+    previews from the candidate's own evidence and stops there."""
+    h = Harness(world)
+    h.runtime.propose = None
+    h.runtime.implement = None
+    out = h.run(dry_run=True)
+
+    assert out.rc == 0
+    assert out.status == "halted"
+    assert out.kickoff
+    assert h.cand.candidate_id in out.kickoff or "confidence is never persisted" in out.kickoff
+    assert h.calls == ["spend", "probes", "harvest"]
+    assert _rows(world.db, "SELECT * FROM rsi_cycles") == []
+    assert _rows(world.db, "SELECT * FROM rsi_candidates") == []
+    assert _rows(world.db, "SELECT * FROM rsi_probe_runs") == []
+
+
+def test_a_dry_run_with_suggest_runs_the_panel_but_still_writes_nothing(world):
+    """``--dry-run --suggest`` may pay for SUGGEST; it may never implement."""
+    h = Harness(world)
+    out = h.run(dry_run=True)
+
+    assert out.rc == 0
+    assert "propose" in h.calls
+    for forbidden in ("implement", "measure", "critics", "merge"):
+        assert forbidden not in h.calls
+    assert _rows(world.db, "SELECT * FROM rsi_cycles") == []
+    assert _rows(world.db, "SELECT * FROM rsi_candidates") == []
+
+
+# --------------------------------------------------------------------------
+# Halts before spend
+# --------------------------------------------------------------------------
+
+
+def test_a_probe_error_halts_before_suggest(world):
+    h = Harness(world)
+
+    def broken(req, con, now, probes):
+        return _report(None, ok=False)
+
+    h.runtime.harvest = broken
+    out = h.run()
+
+    assert out.status == "halted"
+    assert out.rc == 1
+    assert out.halt_reason == "harvest_incomplete"
+    assert "propose" not in h.calls
+    assert "implement" not in h.calls
+    assert _cycle(world.db)["status"] == "halted"
+
+
+def test_quarantine_only_policy_continues_and_lets_g1_decide(world):
+    h = Harness(world)
+    h.world = SimpleNamespace(**{**world.__dict__, "cfg": _cfg(
+        probes={"error_policy": "quarantine_only"})})
+    h.runtime.harvest = lambda req, con, now, probes: _report(h.cand, ok=False)
+    out = h.run()
+    assert out.status == "quarantined"
+    assert "harvest_incomplete" in out.detail
+
+
+def test_no_proposal_halts_without_touching_git(world):
+    h = Harness(world)
+    h.runtime.propose = lambda req, cand: None
+    out = h.run()
+    assert out.status == "halted"
+    assert out.halt_reason == "no_proposal"
+    assert out.rc == 0
+    assert "implement" not in h.calls
+
+
+def test_an_empty_diff_is_a_rejection_that_cleans_its_worktree(world):
+    h = Harness(world)
+    h.runtime.implement = lambda req, cand, sel: Implementation(
+        worktree=SimpleNamespace(path=world.root), detail="the child produced no diff")
+    out = h.run()
+    assert out.status == "rejected"
+    assert "no diff" in out.detail
+    assert h.cleaned == ["rsi-ctest"]
+
+
+def test_a_rejected_selection_never_reaches_implement(world):
+    h = Harness(world)
+    h.runtime.propose = lambda req, cand: Proposal(
+        candidate_id=cand.candidate_id, files=("mini_ork/nope.py",),
+        summary="invented", root_cause="invented", verification_command=cand.success_command)
+    out = h.run()
+    assert out.status == "rejected"
+    assert "panel_invented_file" in out.detail
+    assert "implement" not in h.calls
+    assert _candidate_row(world.db)["status"] == "open"
+
+
+def test_a_crash_finishes_the_row_as_error_and_re_raises(world):
+    h = Harness(world)
+
+    def explode(req, cand, selection):
+        raise CycleFailure("the child could not be started")
+
+    h.runtime.implement = explode
+    with pytest.raises(CycleFailure):
+        h.run()
+    assert _cycle(world.db)["status"] == "error"
+    assert "CycleFailure" in _cycle(world.db)["halt_reason"]
+
+
+# --------------------------------------------------------------------------
+# Harvest bookkeeping
+# --------------------------------------------------------------------------
+
+
+def test_an_empty_harvest_is_rc_zero(world):
+    h = Harness(world)
+    h.runtime.harvest = lambda req, con, now, probes: _report(None)
+    out = h.run()
+    assert out.rc == 0
+    assert out.status == "no_candidate"
+    assert _cycle(world.db)["status"] == "no_candidate"
+
+
+def test_a_repeated_candidate_increments_times_seen(world):
+    h = Harness(world)
+    h.run()
+    # Second cycle sees the same signature but the row is merged now; the
+    # harvest still records the observation.
+    h.run(cycle_id="rsi-ctest-2")
+    row = _candidate_row(world.db)
+    assert row["times_seen"] >= 2
+
+
+def test_a_skipped_rule_does_not_reconcile_other_candidates(world):
+    """A gap a DB cannot measure is not a gap that was fixed."""
+    h = Harness(world)
+    h.run(cycle_id="rsi-ctest-1")
+    # The second harvest cannot run one rule (missing table) and reports nothing.
+    h.runtime.harvest = lambda req, con, now, probes: _report(None, skipped=("L7",))
+    h.run(cycle_id="rsi-ctest-2")
+    assert _candidate_row(world.db)["status"] == "merged", (
+        "reconcile must not mark a candidate fixed_externally when a rule was skipped")
+
+
+def test_a_full_harvest_marks_a_vanished_candidate_fixed_externally(world):
+    h = Harness(world)
+    h.runtime.propose = lambda req, cand: None  # leaves the row open
+    h.run(cycle_id="rsi-ctest-1")
+    assert _candidate_row(world.db)["status"] == "open"
+
+    h.runtime.harvest = lambda req, con, now, probes: _report(None)
+    h.run(cycle_id="rsi-ctest-2")
+    assert _candidate_row(world.db)["status"] == "fixed_externally"
+
+
+def test_a_pinned_candidate_that_is_not_eligible_is_not_a_crash(world):
+    h = Harness(world)
+    out = h.run(candidate_id="rsi-does-not-exist")
+    assert out.rc == 0
+    assert out.status == "no_candidate"

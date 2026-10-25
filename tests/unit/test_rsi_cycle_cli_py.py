@@ -1,4 +1,4 @@
-"""Unit tests: the ``rsi-cycle`` operator surface at the read-only step.
+"""Unit tests: the ``rsi-cycle`` operator surface.
 
 What is pinned here is the *contract* the later stages build on:
 
@@ -8,6 +8,9 @@ What is pinned here is the *contract* the later stages build on:
   with a remedy on stderr (missing DB, missing ``rsi_*`` tables, unknown flag),
   while a *finding* — a harvest that could not look — exits 1.
 * ``--json`` prints exactly one object on stdout, so `jq` never sees prose.
+* the run verb owns no policy of its own: it parses flags, loads the config,
+  hands a request to ``cycle.run_cycle`` and renders the outcome. Those tests
+  replace ``run_cycle`` for exactly that reason.
 """
 from __future__ import annotations
 
@@ -77,14 +80,31 @@ def db(root):
 def test_every_documented_verb_parses():
     parser = rsi_cycle.build_parser()
     for argv in (
+        ["run"],
+        ["run", "--once", "--config", "x.yaml", "--dry-run", "--suggest",
+         "--probe-run", "--max-cycles", "2", "--budget", "5",
+         "--candidate", "rsi-abc", "--domain", "learning", "--json"],
         ["plan"],
         ["plan", "--json", "--no-probes", "--domain", "routing", "--max", "2"],
         ["list"],
         ["list", "--status", "open", "--limit", "5", "--cycles"],
         ["show", "rsi-abc"],
+        ["quarantine"],
+        ["quarantine", "show", "rsi-c1"],
+        ["quarantine", "release", "rsi-c1"],
+        ["revert", "rsi-c1"],
+        ["halt"],
+        ["resume"],
         ["doctor", "--json"],
     ):
         assert parser.parse_args(argv).verb == argv[0]
+
+
+def test_the_default_verb_is_run_and_the_defaults_are_conservative():
+    args = rsi_cycle.build_parser().parse_args([])
+    assert args.verb == "run"
+    assert args.dry_run is False and args.suggest is False
+    assert args.probe_run is False and args.max_cycles is None
 
 
 def test_unknown_flag_exits_2(capsys):
@@ -266,3 +286,260 @@ def test_doctor_flags_schema_drift_as_not_ready(root, db, monkeypatch, capsys):
     )
     assert rsi_cycle.main(["doctor"], root=root) == 1
     assert "schema drift" in capsys.readouterr().out
+
+
+# ── the run verb ────────────────────────────────────────────────────────────
+
+CONFIG = """\
+version: 1
+mode: once
+interval_s: 3600
+max_cycles: 1
+budget: {daily_cap_usd: 50, per_cycle_cap_usd: 20}
+queue: {max_candidates: 3, min_severity: 40}
+probes: {error_policy: halt_before_spend, allow_live: false}
+gates: {pytest_paths: [tests/unit/test_x.py]}
+critic: {lanes: [glm_lens, opus_lens]}
+decide: {auto_merge: true}
+"""
+
+
+def _write_config(root: Path, text: str = CONFIG) -> Path:
+    path = root / "config" / "rsi-cycle.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _outcome(**kw):
+    from mini_ork.rsi.cycle import CycleOutcome
+
+    base = {"cycle_id": "rsi-ctest", "status": "merged", "rc": 0,
+            "candidate_id": "rsi-abc", "merged_sha": "deadbeef", "detail": "ok"}
+    base.update(kw)
+    return CycleOutcome(**base)
+
+
+def _fake_cycle(monkeypatch, outcomes):
+    """Replace the state machine; record every request it was handed."""
+    seen: list = []
+    queue = list(outcomes)
+
+    def fake_run_cycle(req, *, runtime=None):
+        seen.append(req)
+        return queue.pop(0) if len(queue) > 1 else queue[0]
+
+    monkeypatch.setattr("mini_ork.rsi.cycle.run_cycle", fake_run_cycle)
+    return seen
+
+
+def test_run_dispatches_one_cycle_and_renders_it(root, db, monkeypatch, capsys):
+    seen = _fake_cycle(monkeypatch, [_outcome()])
+    assert rsi_cycle.main(["--config", str(_write_config(root))], root=root) == 0
+    out = capsys.readouterr().out
+    assert len(seen) == 1
+    assert "— merged" in out and "deadbeef" in out
+
+
+def test_run_json_is_exactly_one_object(root, db, monkeypatch, capsys):
+    _fake_cycle(monkeypatch, [_outcome()])
+    assert rsi_cycle.main(["--config", str(_write_config(root)), "--json"], root=root) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["cycle_id"] == "rsi-ctest"
+    assert payload["status"] == "merged"
+    assert payload["merged_sha"] == "deadbeef"
+
+
+def test_run_carries_the_flags_into_the_request(root, db, monkeypatch, capsys):
+    seen = _fake_cycle(monkeypatch, [_outcome(status="halted", detail="dry run")])
+    rc = rsi_cycle.main(
+        ["--config", str(_write_config(root)), "--dry-run", "--suggest",
+         "--candidate", "rsi-abc", "--max", "1", "--domain", "verification"],
+        root=root)
+    capsys.readouterr()
+    assert rc == 0
+    req = seen[0]
+    assert req.dry_run is True and req.propose_only is True
+    assert req.candidate_id == "rsi-abc" and req.max_candidates == 1
+    assert list(req.domains) == ["verification"]
+    assert req.config.mode == "once", "a dry run never loops"
+
+
+def test_a_loop_runs_until_max_cycles(root, db, monkeypatch, capsys):
+    monkeypatch.setattr(rsi_cycle.time, "sleep", lambda _s: None)
+    seen = _fake_cycle(monkeypatch, [_outcome(status="merged"),
+                                     _outcome(status="no_candidate", merged_sha="")])
+    rc = rsi_cycle.main(
+        ["--config", str(_write_config(root)), "--interval", "1", "--max-cycles", "2",
+         "--json"], root=root)
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert len(seen) == 2
+    assert [c["status"] for c in payload["cycles"]] == ["merged", "no_candidate"]
+
+
+def test_a_halt_stops_the_loop_immediately(root, db, monkeypatch, capsys):
+    monkeypatch.setattr(rsi_cycle.time, "sleep", lambda _s: None)
+    seen = _fake_cycle(monkeypatch, [_outcome(status="halted", halt_reason="daily_cap")])
+    assert rsi_cycle.main(
+        ["--config", str(_write_config(root)), "--interval", "1"], root=root) == 0
+    capsys.readouterr()
+    assert len(seen) == 1
+
+
+def test_once_beats_a_config_that_says_loop(root, db, monkeypatch, capsys):
+    monkeypatch.setattr(rsi_cycle.time, "sleep", lambda _s: None)
+    _write_config(root, CONFIG.replace("mode: once", "mode: loop").replace(
+        "max_cycles: 1", "max_cycles: 0"))
+    seen = _fake_cycle(monkeypatch, [_outcome()])
+    assert rsi_cycle.main(["--once"], root=root) == 0
+    capsys.readouterr()
+    assert len(seen) == 1
+    assert seen[0].config.mode == "once" and seen[0].config.max_cycles == 1
+
+
+def test_budget_lowers_the_per_cycle_cap(root, db, monkeypatch, capsys):
+    seen = _fake_cycle(monkeypatch, [_outcome()])
+    assert rsi_cycle.main(
+        ["--config", str(_write_config(root)), "--budget", "5"], root=root) == 0
+    capsys.readouterr()
+    assert seen[0].config.budget.per_cycle_cap_usd == 5.0
+    assert seen[0].config.budget.daily_cap_usd == 50
+
+
+def test_budget_may_not_raise_the_daily_cap(root, db, capsys):
+    assert rsi_cycle.main(
+        ["--config", str(_write_config(root)), "--budget", "500"], root=root) == 2
+    assert "exceeds the daily cap" in capsys.readouterr().err
+
+
+def test_a_missing_config_is_rc2_with_a_remedy(root, db, capsys):
+    assert rsi_cycle.main(["--once"], root=root) == 2
+    err = capsys.readouterr().err
+    assert "no rsi-cycle config" in err and "rsi-cycle.example.yaml" in err
+
+
+def test_a_cycle_failure_is_rc1(root, db, monkeypatch, capsys):
+    def boom(req, *, runtime=None):
+        from mini_ork.rsi.cycle import CycleFailure
+
+        raise CycleFailure("the child could not be started")
+
+    monkeypatch.setattr("mini_ork.rsi.cycle.run_cycle", boom)
+    assert rsi_cycle.main(["--config", str(_write_config(root))], root=root) == 1
+    assert "could not be started" in capsys.readouterr().err
+
+
+def test_a_setup_failure_from_the_cycle_is_rc2(root, db, monkeypatch, capsys):
+    def boom(req, *, runtime=None):
+        from mini_ork.rsi.cycle import CycleSetupError
+
+        raise CycleSetupError("lease tables are missing")
+
+    monkeypatch.setattr("mini_ork.rsi.cycle.run_cycle", boom)
+    assert rsi_cycle.main(["--config", str(_write_config(root))], root=root) == 2
+    assert "lease tables" in capsys.readouterr().err
+
+
+# ── halt / resume ───────────────────────────────────────────────────────────
+
+
+def test_halt_writes_the_stop_file_and_resume_removes_it(root, db, capsys):
+    assert rsi_cycle.main(["halt"], root=root) == 0
+    stop = db.parent / "rsi" / "DISABLED"
+    assert stop.is_file()
+    capsys.readouterr()
+
+    assert rsi_cycle.main(["resume"], root=root) == 0
+    assert not stop.exists()
+    assert "removed" in capsys.readouterr().out
+
+    assert rsi_cycle.main(["resume"], root=root) == 0
+    assert "not present" in capsys.readouterr().out
+
+
+def test_halt_does_not_need_a_parsable_config(root, db, capsys):
+    """Stopping a loop whose config is broken is the whole point of `halt`."""
+    _write_config(root, "budget: {daily_cap_usd: 'not a number'}\n")
+    assert rsi_cycle.main(["halt"], root=root) == 0
+    assert (db.parent / "rsi" / "DISABLED").is_file()
+
+
+# ── quarantine ──────────────────────────────────────────────────────────────
+
+
+def test_quarantine_list_is_empty_on_a_fresh_db(root, db, capsys):
+    assert rsi_cycle.main(["quarantine"], root=root) == 0
+    assert "no quarantined cycles" in capsys.readouterr().out
+
+
+def test_quarantine_rejects_an_unknown_action(root, db, capsys):
+    assert rsi_cycle.main(["quarantine", "delete", "rsi-c1"], root=root) == 2
+    assert "quarantine" in capsys.readouterr().err
+
+
+def test_quarantine_show_unknown_id_is_rc2(root, db, capsys):
+    assert rsi_cycle.main(["quarantine", "show", "rsi-nope"], root=root) == 2
+    assert "no such cycle" in capsys.readouterr().err
+
+
+def test_quarantine_show_without_a_record_is_rc2(root, db, capsys):
+    con = ledger.connect(str(db))
+    try:
+        ledger.start_cycle(con, cycle_id="rsi-c1", now=1, mode="once", dry_run=False)
+        ledger.finish_cycle(con, "rsi-c1", now=2, status="quarantined",
+                            halt_reason="gate_failed",
+                            quarantine_path=str(root / "missing.json"))
+    finally:
+        con.close()
+    assert rsi_cycle.main(["quarantine", "show", "rsi-c1"], root=root) == 2
+    assert "quarantine record missing" in capsys.readouterr().err
+
+
+def test_quarantine_release_reopens_the_candidate(root, db, capsys):
+    from mini_ork.rsi.candidates import Candidate
+
+    _write_config(root)
+    cand = Candidate.build(domain="verification", source="db:V1",
+                           kind="data_path_dead", title="t",
+                           evidence_key="table:x:y", now=1)
+    con = ledger.connect(str(db))
+    try:
+        ledger.upsert_candidate(con, cand, now=1)
+        ledger.set_candidate_status(con, cand.candidate_id, "quarantined", now=2,
+                                    reason="gate_failed: lint_failed")
+        ledger.start_cycle(con, cycle_id="rsi-c1", now=1, mode="once", dry_run=False)
+        ledger.finish_cycle(con, "rsi-c1", now=2, status="quarantined",
+                            halt_reason="gate_failed",
+                            candidate_id=cand.candidate_id,
+                            quarantine_path=str(root / "q.json"))
+    finally:
+        con.close()
+
+    assert rsi_cycle.main(["quarantine", "release", "rsi-c1"], root=root) == 0
+    out = capsys.readouterr().out
+    assert "released" in out and "wt/rsi-c1" in out
+    con = ledger.connect(str(db))
+    try:
+        assert ledger.get_candidate(con, cand.candidate_id)["status"] == "open"
+    finally:
+        con.close()
+
+
+# ── revert ──────────────────────────────────────────────────────────────────
+
+
+def test_revert_without_a_merged_sha_is_rc2(root, db, capsys):
+    con = ledger.connect(str(db))
+    try:
+        ledger.start_cycle(con, cycle_id="rsi-c1", now=1, mode="once", dry_run=False)
+        ledger.finish_cycle(con, "rsi-c1", now=2, status="no_candidate")
+    finally:
+        con.close()
+    assert rsi_cycle.main(["revert", "rsi-c1"], root=root) == 2
+    assert "nothing to revert" in capsys.readouterr().err
+
+
+def test_revert_without_an_id_is_rc2(tmp_path, capsys):
+    assert rsi_cycle.main(["revert"], root=tmp_path) == 2
+    assert "revert <cycle_id>" in capsys.readouterr().err
