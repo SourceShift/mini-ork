@@ -220,7 +220,7 @@ Legend: **●** present · **◐** partial/seam exists · **○** missing.
 |---|---|---|
 | Managed PG/MySQL/Mongo/Redis | ○ | Provision via operators (CloudNativePG, Redis Operator) or partner (Neon/Upstash) |
 | HA + pooling + backups + PITR | ○ | Operator defaults + backup controller |
-| Volumes | ◐ `SharedDrive` protocol, local-bind only | Add network drive backend (EBS/CSI, S3, JuiceFS) |
+| Volumes | ◐ node-local bind mounts in `mini-ork.deployment/v1` (shipped 2026-10-25: `volumes: [{name, mount_path}]`, host side derived on the node) | Network drive backend (EBS/CSI, S3, JuiceFS), quotas, snapshots, backup/restore |
 | Object storage buckets | ○ | S3-compatible service (MinIO/Ceph or cloud S3) + signed URLs |
 | Team state store | ◐ SQLite only | **Postgres backend** — required for hosting, already a roadmap item |
 
@@ -385,7 +385,7 @@ focused pair of engineers.
 | **R-08** | Ingress + TLS + custom domains + L4 proxy | Public reachability | L | commercial (rent/embed Envoy/Caddy) |
 | **R-09** | Private network + service discovery per environment | Railway's "zero setup networking" | L | commercial |
 | **R-10** | Managed data services + HA + backups + PITR | Every real app needs a DB | L | commercial (operators/partners) |
-| **R-11** | Volumes + object storage | Persistence beyond git | M | commercial (CSI/S3) |
+| **R-11** | Volumes + object storage | Persistence beyond git | M | OSS mechanics shipped (bind volumes) + commercial (CSI/S3, snapshots, quotas) |
 | **R-12** | Infra usage metering (vCPU-s, GB-s, egress, storage) + pricing + hard caps | Revenue and trust | M | commercial |
 | **R-13** | Per-tenant log/metric/trace pipeline + retention + alerts | Debuggability is a purchase criterion | L | commercial |
 | **R-14** | Audit log (append-only, retention tiers) | Enterprise gate | M | commercial |
