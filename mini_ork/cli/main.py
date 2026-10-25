@@ -84,6 +84,7 @@ _NATIVE_MODULE_SUBS = {
     "concord": "mini_ork.orchestration.concord",
     "lifetime": "mini_ork.orchestration.lifetime",
     "self-improve": "mini_ork.cli.self_improve",
+    "rsi-cycle": "mini_ork.cli.rsi_cycle",
     "topology": "mini_ork.cli.topology",
     "usage-report": "mini_ork.observability.usage_report",
     "watchdog": "mini_ork.orchestration.watchdog",
@@ -154,6 +155,10 @@ Self-improvement:
                                    worktree + branch per iteration (--dry-run,
                                    --soft-cap-hours, --hard-cap-hours, --auto-merge,
                                    --resume). Gated; never commits without verifiers.
+  rsi-cycle [plan|list|show|doctor]
+                                 Harvest gaps in learning, routing and verification,
+                                   rank them into one queue, and (later) fix one per
+                                   cycle. `plan` is read-only and spends nothing.
 
 Lifecycle:
   onboard                        First-run wizard: prerequisites, workspace, lanes,

@@ -50,6 +50,7 @@ def test_all_former_exec_subs_registered_natively():
         "orchestrator",
         "cn",
         "approvals",
+        "rsi-cycle",
     }
     assert expected == set(_NATIVE_MODULE_SUBS)
     for sub in expected:

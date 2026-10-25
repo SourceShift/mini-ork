@@ -10,8 +10,9 @@ Layout (built incrementally; only the modules listed here exist today):
 ``ledger``      all reads/writes of the ``rsi_*`` tables. No policy.
 ``probes``      deterministic commands and their parseable findings.
 ``harvest``     the live predicates: three domains, DB + AST + probe evidence.
+``queue``       dedupe, avoid re-spending, seed every domain, rank into one queue.
 
-Later steps add ``queue``, ``gates``, ``worktree`` and ``cycle``. Everything
+Later steps add ``gates``, ``worktree`` and ``cycle``. Everything
 except the two model edges (SUGGEST, IMPLEMENT) is pure Python so the loop can
 be dry-run against a temp DB with no network.
 """
