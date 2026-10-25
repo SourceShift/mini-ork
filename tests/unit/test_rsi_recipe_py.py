@@ -18,6 +18,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -33,10 +34,12 @@ from mini_ork.rsi.cycle import (  # noqa: E402
     CycleFailure,
     CycleRequest,
     Implementation,
+    _child_env,
     _default_critics,
     _default_propose,
     _recipe_critics,
     _recipe_propose,
+    _run_recipe,
     _with_critics,
 )
 from mini_ork.rsi.gates import CriticVerdict, GateEvidence, evaluate  # noqa: E402
@@ -480,6 +483,73 @@ def test_recipe_critics_treats_an_unreadable_panel_as_unmeasured(tmp_path, monke
                              evaluate(GateEvidence()))
     assert len(result) == 1
     assert result.panel is None, "an unparseable panel must not become a passing one"
+
+
+# --------------------------------------------------------------------------
+# A dispatched run can still reach the operator's credentials
+# --------------------------------------------------------------------------
+
+
+def test_child_env_points_a_foreign_home_at_the_operators_secret_store(tmp_path, monkeypatch):
+    monkeypatch.delenv("MINI_ORK_SECRETS", raising=False)
+    req = _req(tmp_path)
+    store = tmp_path / "config" / "secrets.local.sh"
+    store.parent.mkdir()
+    store.write_text("export OPENROUTER_API_KEY=x\n", encoding="utf-8")
+    home = tmp_path / "rsi" / "rsi-ctest" / "child-home"
+
+    env = _child_env(req, home)
+
+    assert env["MINI_ORK_SECRETS"] == str(store)
+    assert env["MINI_ORK_HOME"] == str(home)
+    assert env["MINI_ORK_ROOT"] == str(tmp_path)
+    assert env["MINI_ORK_DB"] == str(tmp_path / "state.db")
+
+
+def test_child_env_never_names_a_store_that_does_not_exist(tmp_path, monkeypatch):
+    """An explicit-but-wrong path fails where the default would have resolved."""
+    monkeypatch.delenv("MINI_ORK_SECRETS", raising=False)
+
+    env = _child_env(_req(tmp_path), tmp_path / "child-home")
+
+    assert "MINI_ORK_SECRETS" not in env
+
+
+def test_child_env_keeps_a_store_the_operator_chose(tmp_path, monkeypatch):
+    chosen = tmp_path / "elsewhere.sh"
+    chosen.write_text("export OPENROUTER_API_KEY=y\n", encoding="utf-8")
+    monkeypatch.setenv("MINI_ORK_SECRETS", str(chosen))
+    local = tmp_path / "config" / "secrets.local.sh"
+    local.parent.mkdir()
+    local.write_text("export OPENROUTER_API_KEY=x\n", encoding="utf-8")
+
+    env = _child_env(_req(tmp_path), tmp_path / "child-home")
+
+    assert env["MINI_ORK_SECRETS"] == str(chosen)
+
+
+def test_run_recipe_hands_the_store_to_the_child(tmp_path, monkeypatch):
+    monkeypatch.delenv("MINI_ORK_SECRETS", raising=False)
+    store = tmp_path / "config" / "secrets.local.sh"
+    store.parent.mkdir()
+    store.write_text("export OPENROUTER_API_KEY=x\n", encoding="utf-8")
+    seen: dict = {}
+
+    def _run(argv, **kwargs):
+        seen.update(argv=argv, env=kwargs["env"])
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cycle_mod.subprocess, "run", _run)
+
+    rc, home, run_dir = _run_recipe(_req(tmp_path), "rsi-cycle", {"candidate": {}},
+                                    "# kickoff\n", timeout_s=600,
+                                    brief_env="MO_RSI_SUGGEST_BRIEF")
+
+    assert rc == 0
+    assert seen["env"]["MINI_ORK_SECRETS"] == str(store)
+    assert seen["env"]["MINI_ORK_HOME"] == str(home)
+    assert seen["env"]["MO_RSI_SUGGEST_BRIEF"].endswith("brief.json")
+    assert run_dir == home / "runs" / "rsi-ctest-rsi-cycle"
 
 
 # --------------------------------------------------------------------------

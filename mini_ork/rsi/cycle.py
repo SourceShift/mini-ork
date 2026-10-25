@@ -798,6 +798,30 @@ def _candidate_brief(cand: Candidate) -> dict[str, Any]:
     }
 
 
+def _child_env(req: CycleRequest, home: Path) -> dict[str, str]:
+    """The environment a dispatched run inherits, with its credentials reachable.
+
+    A run gets its own home — the runner rewrites ``agents.yaml`` there — but a
+    fresh home resolves the secret store to ``<home>/config/secrets.local.sh``,
+    which does not exist. Without a pointer back to the operator's store every
+    gateway lane (glm, minimax, deepseek) runs keyless and the run dies after the
+    classifier with no useful message. Pointing ``MINI_ORK_SECRETS`` at the
+    cycle's own store keeps the keys where the operator put them instead of
+    copying them into a throwaway directory, and only when that file exists: an
+    explicit path that is wrong is worse than letting the default resolve.
+    """
+    env = {
+        **os.environ,
+        "MINI_ORK_ROOT": str(req.root),
+        "MINI_ORK_DB": str(req.db),
+        "MINI_ORK_HOME": str(home),
+    }
+    store = Path(req.home) / "config" / "secrets.local.sh"
+    if not os.environ.get("MINI_ORK_SECRETS") and store.is_file():
+        env["MINI_ORK_SECRETS"] = str(store)
+    return env
+
+
 def _run_recipe(req: CycleRequest, recipe: str, brief: Mapping[str, Any],
                 kickoff: str, *, timeout_s: int, brief_env: str) -> tuple[int, Path, Path]:
     """Dispatch one recipe run for this cycle; return ``(rc, home, run_dir)``.
@@ -822,10 +846,7 @@ def _run_recipe(req: CycleRequest, recipe: str, brief: Mapping[str, Any],
         "--deadline", str(max(60, timeout_s - 120)), recipe, str(kickoff_path),
     ]
     env = {
-        **os.environ,
-        "MINI_ORK_ROOT": str(req.root),
-        "MINI_ORK_DB": str(req.db),
-        "MINI_ORK_HOME": str(home),
+        **_child_env(req, home),
         "MINI_ORK_RUN_ID": run_id,
         "MO_RUNTIME_BACKEND": req.config.implement.runtime_backend,
         brief_env: str(brief_path),
@@ -991,10 +1012,7 @@ def _dispatch_child(req: CycleRequest, wt, kickoff: str, child_home: Path) -> tu
         "framework-edit", str(kickoff_path),
     ]
     env = {
-        **os.environ,
-        "MINI_ORK_ROOT": str(wt.path),
-        "MINI_ORK_DB": str(req.db),
-        "MINI_ORK_HOME": str(child_home),
+        **_child_env(req, child_home),
         "MINI_ORK_RUN_ID": run_id,
         "MO_ALLOW_FRAMEWORK_CWD": "1",
         "MO_RUNTIME_BACKEND": req.config.implement.runtime_backend,
