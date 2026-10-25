@@ -33,6 +33,7 @@ ENDPOINTS = [
     "/api/v1/learning/topology",
     "/api/v1/learning/circuit-breakers",
     "/api/v1/learning/applies",
+    "/api/v1/learning/injections",
 ]
 
 
@@ -168,6 +169,51 @@ def test_cors_allows_electron_and_localhost_but_not_the_web(client: TestClient) 
         "/api/v1/learning/summary", headers={"Origin": "https://evil.com"}
     ).headers.get("access-control-allow-origin")
     assert leaked is None, "a remote origin was granted CORS access to the control plane"
+
+
+def test_injections_are_newest_first_with_a_held_out_count(tmp_path: Path) -> None:
+    """The injection ledger is the one place "a lesson reached a prompt" is a fact.
+
+    A count of stored lessons cannot tell a loop that teaches from one that only
+    writes files; this endpoint is how a reader checks the first. Newest first,
+    because the question is usually "what is reaching the run I am watching now".
+    """
+    home = tmp_path / ".mini-ork"
+    home.mkdir()
+    con = sqlite3.connect(home / "state.db")
+    con.executescript(
+        """
+        CREATE TABLE lesson_injections (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id      TEXT    NOT NULL,
+            node_id     TEXT    NOT NULL,
+            node_type   TEXT,
+            lane        TEXT,
+            task_class  TEXT,
+            attempt     INTEGER,
+            source_kind TEXT    NOT NULL,
+            source_id   TEXT    NOT NULL,
+            held_out    INTEGER NOT NULL DEFAULT 0,
+            ts          INTEGER NOT NULL
+        );
+        """
+    )
+    con.executemany(
+        "INSERT INTO lesson_injections "
+        "(run_id, node_id, source_kind, source_id, held_out, ts) VALUES (?,?,?,?,?,?)",
+        [
+            ("run-1", "n1", "lesson", "L-1", 0, 100),
+            ("run-2", "n2", "pattern", "P-9", 1, 200),
+        ],
+    )
+    con.commit()
+    con.close()
+
+    body = TestClient(create_app(home=home)).get("/api/v1/learning/injections").json()
+
+    assert body["count"] == 2
+    assert body["held_out"] == 1
+    assert [row["source_id"] for row in body["injections"]] == ["P-9", "L-1"]
 
 
 def test_no_populated_table_is_dark(tmp_path: Path) -> None:

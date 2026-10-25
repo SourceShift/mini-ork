@@ -116,6 +116,41 @@ def applies(db: StateDB = Depends(get_db), limit: int = 100) -> list[dict[str, A
     )
 
 
+# ── lesson injections — which lesson reached which run ───────────────────────
+
+
+@router.get("/injections")
+def lesson_injections(db: StateDB = Depends(get_db), limit: int = 100) -> dict[str, Any]:
+    """The injection ledger: one row per lesson that reached a prompt.
+
+    ``learning/ledger.py`` records ``(run, node, attempt, source_kind,
+    source_id)`` every time a lesson, pattern or rule is placed into a prompt —
+    the table that separates *stored* from *taught*. ``held_out`` marks the rows
+    reserved for measurement, so a population with no grader is a loop claiming
+    learning it cannot prove. Guarded: a fresh state.db returns an empty list
+    rather than a 500.
+    """
+    empty = {"injections": [], "count": 0, "held_out": 0}
+    if not db.has_table("lesson_injections"):
+        return empty
+    rows = db.rows(
+        """
+        SELECT run_id, node_id, node_type, lane, task_class, attempt,
+               source_kind, source_id, held_out, ts
+        FROM lesson_injections
+        ORDER BY ts DESC, id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    totals = db.rows(
+        "SELECT COUNT(*) AS count, COALESCE(SUM(held_out), 0) AS held_out "
+        "FROM lesson_injections"
+    )
+    stat = totals[0] if totals else {"count": 0, "held_out": 0}
+    return {"injections": rows, "count": stat["count"], "held_out": stat["held_out"]}
+
+
 # ── GEPA — not just the gradients, but whether they won ──────────────────────
 
 
