@@ -125,27 +125,27 @@ nodes:
   - { name: rollback, type: rollback, prompt_ref: null, dispatch_mode: serial }
 
 edges:
-  - { from: prompt_intake, to: semantic_flow_extractor, edge_type: supplies_context_to, from_output: prompt_brief, to_input: prompt_brief }
-  - { from: semantic_flow_extractor, to: source_researcher, edge_type: supplies_context_to, from_output: semantic_signals, to_input: semantic_signals }
-  - { from: semantic_flow_extractor, to: recursive_plan_composer, edge_type: supplies_context_to, from_output: semantic_signals, to_input: semantic_signals }
-  - { from: source_researcher, to: recursive_plan_composer, edge_type: supplies_context_to, from_output: source_corpus, to_input: source_corpus }
-  - { from: recursive_plan_composer, to: draft_executor, edge_type: supplies_context_to, from_output: agent_plan, to_input: agent_plan }
-  - { from: recursive_plan_composer, to: verifier_gate, edge_type: supplies_context_to, from_output: agent_plan, to_input: agent_plan }
-  - { from: draft_executor, to: verifier_gate, edge_type: supplies_context_to, from_output: draft_artifact, to_input: draft_artifact }
-  - { from: verifier_gate, to: graph_contract_gate, edge_type: verifies, from_output: verification_report, to_input: verification_report }
-  - { from: verifier_gate, to: reflection_loop, edge_type: supplies_context_to, from_output: verification_report, to_input: verification_report }
-  - { from: verifier_gate, to: human_review_packet, edge_type: supplies_context_to, from_output: verification_report, to_input: verification_report }
-  - { from: recursive_plan_composer, to: human_review_packet, edge_type: supplies_context_to, from_output: agent_plan, to_input: agent_plan }
-  - { from: draft_executor, to: human_review_packet, edge_type: supplies_context_to, from_output: draft_artifact, to_input: draft_artifact }
+  - { from: prompt_intake, to: semantic_flow_extractor, edge_type: depends_on, from_output: prompt_brief, to_input: prompt_brief }
+  - { from: semantic_flow_extractor, to: source_researcher, edge_type: depends_on, from_output: semantic_signals, to_input: semantic_signals }
+  - { from: semantic_flow_extractor, to: recursive_plan_composer, edge_type: depends_on, from_output: semantic_signals, to_input: semantic_signals }
+  - { from: source_researcher, to: recursive_plan_composer, edge_type: depends_on, from_output: source_corpus, to_input: source_corpus }
+  - { from: recursive_plan_composer, to: draft_executor, edge_type: depends_on, from_output: agent_plan, to_input: agent_plan }
+  - { from: recursive_plan_composer, to: verifier_gate, edge_type: depends_on, from_output: agent_plan, to_input: agent_plan }
+  - { from: draft_executor, to: verifier_gate, edge_type: depends_on, from_output: draft_artifact, to_input: draft_artifact }
+  - { from: verifier_gate, to: graph_contract_gate, edge_type: depends_on, from_output: verification_report, to_input: verification_report }
+  - { from: verifier_gate, to: reflection_loop, edge_type: depends_on, from_output: verification_report, to_input: verification_report }
+  - { from: verifier_gate, to: human_review_packet, edge_type: depends_on, from_output: verification_report, to_input: verification_report }
+  - { from: recursive_plan_composer, to: human_review_packet, edge_type: depends_on, from_output: agent_plan, to_input: agent_plan }
+  - { from: draft_executor, to: human_review_packet, edge_type: depends_on, from_output: draft_artifact, to_input: draft_artifact }
   - { from: reflection_loop, to: recursive_plan_composer, edge_type: retries, recursive: true, from_output: refinement_prompt, to_input: refinement_prompt }
-  - { from: human_review_packet, to: human_feedback_gate, edge_type: verifies_user_choice, from_output: review_packet, to_input: review_packet }
+  - { from: human_review_packet, to: human_feedback_gate, edge_type: depends_on, from_output: review_packet, to_input: review_packet }
   - { from: human_feedback_gate, to: semantic_flow_extractor, edge_type: retries, condition: {pointer: "/status", match: {const: revision_requested}}, recursive: true, from_output: human_decision, to_input: human_feedback }
-  - { from: human_feedback_gate, to: summary_finalizer, edge_type: human_decision_gate, condition: approved, from_output: human_decision, to_input: human_decision }
-  - { from: recursive_plan_composer, to: summary_finalizer, edge_type: supplies_context_to, from_output: agent_plan, to_input: agent_plan }
-  - { from: source_researcher, to: summary_finalizer, edge_type: supplies_context_to, from_output: source_corpus, to_input: source_corpus }
-  - { from: draft_executor, to: summary_finalizer, edge_type: supplies_context_to, from_output: draft_artifact, to_input: draft_artifact }
-  - { from: verifier_gate, to: summary_finalizer, edge_type: supplies_context_to, from_output: verification_report, to_input: verification_report }
-  - { from: summary_finalizer, to: aggregation_document, edge_type: supplies_context_to, from_output: final_summaries, to_input: final_summaries }
+  - { from: human_feedback_gate, to: summary_finalizer, edge_type: depends_on, condition: approved, from_output: human_decision, to_input: human_decision }
+  - { from: recursive_plan_composer, to: summary_finalizer, edge_type: depends_on, from_output: agent_plan, to_input: agent_plan }
+  - { from: source_researcher, to: summary_finalizer, edge_type: depends_on, from_output: source_corpus, to_input: source_corpus }
+  - { from: draft_executor, to: summary_finalizer, edge_type: depends_on, from_output: draft_artifact, to_input: draft_artifact }
+  - { from: verifier_gate, to: summary_finalizer, edge_type: depends_on, from_output: verification_report, to_input: verification_report }
+  - { from: summary_finalizer, to: aggregation_document, edge_type: depends_on, from_output: final_summaries, to_input: final_summaries }
   - { from: graph_contract_gate, to: rollback, edge_type: escalates_to, condition: fail }
   - { from: human_feedback_gate, to: rollback, edge_type: escalates_to, condition: fail }
 

@@ -32,7 +32,7 @@ nodes:
 
 edges:
   - { from: planner, to: implementer, edge_type: depends_on }
-  - { from: implementer, to: tier1_compile, edge_type: verifies }
+  - { from: implementer, to: tier1_compile, edge_type: depends_on }
   - { from: tier1_compile, to: tier2_unit, edge_type: depends_on, condition: pass }
   - { from: tier1_compile, to: reflector, edge_type: escalates_to, condition: fail }
   - { from: tier2_unit, to: tier3_property, edge_type: depends_on, condition: pass }
@@ -42,10 +42,10 @@ edges:
   - { from: tier3_property, to: tier4_codex,   edge_type: depends_on, condition: pass }
   - { from: tier3_property, to: tier4_minimax, edge_type: depends_on, condition: pass }
   - { from: tier3_property, to: reflector, edge_type: escalates_to, condition: fail }
-  - { from: tier4_glm,     to: tier4_quorum, edge_type: supplies_context_to }
-  - { from: tier4_kimi,    to: tier4_quorum, edge_type: supplies_context_to }
-  - { from: tier4_codex,   to: tier4_quorum, edge_type: supplies_context_to }
-  - { from: tier4_minimax, to: tier4_quorum, edge_type: supplies_context_to }
+  - { from: tier4_glm,     to: tier4_quorum, edge_type: depends_on }
+  - { from: tier4_kimi,    to: tier4_quorum, edge_type: depends_on }
+  - { from: tier4_codex,   to: tier4_quorum, edge_type: depends_on }
+  - { from: tier4_minimax, to: tier4_quorum, edge_type: depends_on }
   - { from: tier4_quorum,  to: tier4_synth, edge_type: depends_on, condition: pass }
   - { from: tier4_quorum,  to: reflector,   edge_type: escalates_to, condition: fail }
   - { from: tier4_synth, to: publisher, edge_type: depends_on, condition: pass }

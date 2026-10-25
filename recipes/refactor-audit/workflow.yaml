@@ -66,13 +66,13 @@ edges:
   - { from: planner, to: codex_lens, edge_type: depends_on }
   - { from: planner, to: opus_lens, edge_type: depends_on }
   - { from: planner, to: minimax_lens, edge_type: depends_on }
-  - { from: glm_lens, to: anonymize_panel, edge_type: supplies_context_to, from_output: report, to_input: reports }
-  - { from: kimi_lens, to: anonymize_panel, edge_type: supplies_context_to, from_output: report, to_input: reports }
-  - { from: codex_lens, to: anonymize_panel, edge_type: supplies_context_to, from_output: report, to_input: reports }
-  - { from: opus_lens, to: anonymize_panel, edge_type: supplies_context_to, from_output: report, to_input: reports }
-  - { from: minimax_lens, to: anonymize_panel, edge_type: supplies_context_to, from_output: report, to_input: reports }
-  - { from: anonymize_panel, to: synthesizer, edge_type: supplies_context_to, from_output: panel_responses, to_input: panel_reports }
-  - { from: synthesizer, to: lens_completeness, edge_type: verifies }
+  - { from: glm_lens, to: anonymize_panel, edge_type: depends_on, from_output: report, to_input: reports }
+  - { from: kimi_lens, to: anonymize_panel, edge_type: depends_on, from_output: report, to_input: reports }
+  - { from: codex_lens, to: anonymize_panel, edge_type: depends_on, from_output: report, to_input: reports }
+  - { from: opus_lens, to: anonymize_panel, edge_type: depends_on, from_output: report, to_input: reports }
+  - { from: minimax_lens, to: anonymize_panel, edge_type: depends_on, from_output: report, to_input: reports }
+  - { from: anonymize_panel, to: synthesizer, edge_type: depends_on, from_output: panel_responses, to_input: panel_reports }
+  - { from: synthesizer, to: lens_completeness, edge_type: depends_on }
   - { from: lens_completeness, to: publisher, edge_type: depends_on }
   - { from: synthesizer, to: rollback, edge_type: escalates_to }
   - { from: lens_completeness, to: rollback, edge_type: escalates_to }

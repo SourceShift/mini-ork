@@ -62,7 +62,7 @@ def test_recipe_preserves_feedback_and_approved_summary_routes():
         "match": {"const": "revision_requested"},
     }
     assert feedback["from_output"] == "human_decision"
-    assert finalization["edge_type"] == "human_decision_gate"
+    assert finalization["edge_type"] == "depends_on"  # deprecated alias collapsed (eco6 K14)
     assert finalization["condition"] == "approved"
     assert aggregation["from_output"] == "final_summaries"
     assert aggregation["to_input"] == "final_summaries"

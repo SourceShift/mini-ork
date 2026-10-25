@@ -34,7 +34,7 @@ nodes:
 
 edges:
   - { from: planner,       to: doc_editor,     edge_type: depends_on }
-  - { from: doc_editor,    to: grep_assert,    edge_type: verifies   }
-  - { from: doc_editor,    to: link_verifier,  edge_type: verifies   }
+  - { from: doc_editor,    to: grep_assert,    edge_type: depends_on   }
+  - { from: doc_editor,    to: link_verifier,  edge_type: depends_on   }
   - { from: grep_assert,   to: publisher,      edge_type: depends_on }
   - { from: link_verifier, to: publisher,      edge_type: depends_on }

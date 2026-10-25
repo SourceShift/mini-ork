@@ -95,16 +95,16 @@ nodes:
 edges:
   - { from: planner,               to: code_impact_lens,      edge_type: depends_on }
   - { from: planner,               to: prior_art_lens,        edge_type: depends_on }
-  - { from: code_impact_lens,      to: implementer,           edge_type: supplies_context_to }
-  - { from: prior_art_lens,        to: implementer,           edge_type: supplies_context_to }
+  - { from: code_impact_lens,      to: implementer,           edge_type: depends_on }
+  - { from: prior_art_lens,        to: implementer,           edge_type: depends_on }
   # The author finishes before the implementer starts (depends_on, not a context
   # handoff): the spec tests are the implementer's acceptance bar, not its input.
   - { from: planner,               to: spec_test_author,      edge_type: depends_on }
   - { from: spec_test_author,      to: implementer,           edge_type: depends_on }
-  - { from: implementer,           to: static_check_verifier, edge_type: verifies }
-  - { from: implementer,           to: test_verifier,         edge_type: verifies }
-  - { from: implementer,           to: kickoff_contract_verifier, edge_type: verifies }
-  - { from: implementer,           to: spec_test_verifier,    edge_type: verifies }
+  - { from: implementer,           to: static_check_verifier, edge_type: depends_on }
+  - { from: implementer,           to: test_verifier,         edge_type: depends_on }
+  - { from: implementer,           to: kickoff_contract_verifier, edge_type: depends_on }
+  - { from: implementer,           to: spec_test_verifier,    edge_type: depends_on }
   - { from: static_check_verifier, to: reviewer,              edge_type: depends_on }
   - { from: test_verifier,         to: reviewer,              edge_type: depends_on }
   - { from: kickoff_contract_verifier, to: reviewer,          edge_type: depends_on }

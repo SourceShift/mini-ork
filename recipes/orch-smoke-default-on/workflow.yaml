@@ -42,9 +42,9 @@ nodes:
 
 edges:
   # Researchers supply context to the engagement proof (verifies = gate).
-  - { from: smoke_context_lens,     to: engagement_check, edge_type: verifies }
-  - { from: engagement_design_lens, to: engagement_check, edge_type: verifies }
-  - { from: determinism_lens,       to: engagement_check, edge_type: verifies }
+  - { from: smoke_context_lens,     to: engagement_check, edge_type: depends_on }
+  - { from: engagement_design_lens, to: engagement_check, edge_type: depends_on }
+  - { from: determinism_lens,       to: engagement_check, edge_type: depends_on }
 
   # EXACT orch-smoke edges — do not change. fail_probe's failure must
   # block publisher and escalate to rollback; the recipe-creator's

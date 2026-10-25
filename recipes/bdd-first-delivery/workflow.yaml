@@ -67,11 +67,11 @@ edges:
 
   - from: spec_author
     to: spec_reviewer
-    edge_type: verifies
+    edge_type: depends_on
 
   - from: implementer
     to: bdd_runner
-    edge_type: verifies
+    edge_type: depends_on
 
   - from: bdd_runner
     to: reviewer

@@ -259,7 +259,7 @@
         },
         "edge_type": {
           "type": "string",
-          "description": "Semantic relationship between from and to nodes.",
+          "description": "`depends_on`, `retries` and `escalates_to` have runtime meaning; `supplies_context_to`, `verifies`, `blocks`, `human_decision_gate` and `verifies_user_choice` are deprecated aliases of `depends_on` (2026-10) and will be removed.",
           "enum": [
             "depends_on",
             "supplies_context_to",

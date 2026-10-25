@@ -32,12 +32,12 @@ edges:
   - { from: planner, to: topic,  edge_type: depends_on }
   - { from: planner, to: entity, edge_type: depends_on }
   - { from: planner, to: rhythm, edge_type: depends_on }
-  - { from: thesis, to: synth_arbiter, edge_type: supplies_context_to }
-  - { from: bridge, to: synth_arbiter, edge_type: supplies_context_to }
-  - { from: topic,  to: synth_arbiter, edge_type: supplies_context_to }
-  - { from: entity, to: synth_arbiter, edge_type: supplies_context_to }
-  - { from: rhythm, to: synth_arbiter, edge_type: supplies_context_to }
-  - { from: synth_arbiter, to: cohesion_completeness, edge_type: verifies }
+  - { from: thesis, to: synth_arbiter, edge_type: depends_on }
+  - { from: bridge, to: synth_arbiter, edge_type: depends_on }
+  - { from: topic,  to: synth_arbiter, edge_type: depends_on }
+  - { from: entity, to: synth_arbiter, edge_type: depends_on }
+  - { from: rhythm, to: synth_arbiter, edge_type: depends_on }
+  - { from: synth_arbiter, to: cohesion_completeness, edge_type: depends_on }
   - { from: cohesion_completeness, to: publisher, edge_type: depends_on }
   - { from: synth_arbiter, to: rollback, edge_type: escalates_to }
   - { from: cohesion_completeness, to: rollback, edge_type: escalates_to }

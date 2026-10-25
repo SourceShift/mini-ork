@@ -46,16 +46,34 @@ Nodes are the roles that agents play inside the `Execute` stage. Each role maps 
 
 ## 6 Edge-Type Semantics
 
-Edges in `workflow.yaml` carry typed semantics. The executor enforces them.
+Edges in `workflow.yaml` carry an `edge_type`, but only three names have runtime
+meaning. Everything else is an alias of `depends_on`.
 
 | Edge type | Meaning | Example |
 |---|---|---|
-| `depends_on` | Target node cannot start until source completes and its output is available | `implementer depends_on researcher` |
-| `supplies_context_to` | Source output is injected into target's context pack, even if not a hard dependency | `planner supplies_context_to verifier` |
-| `verifies` | Source verifier node gates target node's continuation | `verifier verifies implementer` |
-| `blocks` | Source failure prevents target from running entirely | `scope_gate blocks implementer` |
-| `retries` | On failure, target re-runs source with correction context appended | `verifier retries implementer` |
-| `escalates_to` | On failure beyond max retries, route to human gate or escalation inbox | `verifier escalates_to human_gate` |
+| `depends_on` | Ordering parent: the target cannot start until the source completes. An edge of any type may also carry `from_output`/`to_input` to bind the source's output artifact to one of the target's inputs. | `implementer depends_on researcher` |
+| `retries` | Revise loop: on failure the target re-runs the source with correction context, up to `max_rounds`; an object `condition:` predicate decides whether the edge fires. | `verifier retries implementer` |
+| `escalates_to` | Repair edge, honoured **only** when the recipe declares a `recursion:` block: on failure beyond the retry budget, route to the escalation target. | `verifier escalates_to rollback` |
+
+The following five names are **deprecated** aliases of `depends_on` (2026-10)
+and will be removed. The compiler already treats each of them exactly like
+`depends_on` — an ordering parent and nothing else — so a recipe that uses one
+promises semantics the executor never implemented:
+
+- `supplies_context_to` — no context is injected; artifact handoff comes from
+  `from_output`/`to_input`.
+- `verifies` — a verifier gates the run through its own verifier node, not
+  through the edge name.
+- `blocks` — a source failure orders the target behind it; it does not delete
+  the target from the graph.
+- `human_decision_gate` — human pauses are the intervention gate / node review,
+  not an edge property.
+- `verifies_user_choice` — same as `depends_on`.
+
+The schema keeps all eight names for one release so out-of-tree recipes still
+compile; `mini-ork validate` warns on every deprecated use and on string
+`condition:` values (which the runtime ignores). New recipes should emit
+`depends_on`.
 
 ---
 

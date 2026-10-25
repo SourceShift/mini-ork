@@ -242,6 +242,80 @@ def _check_node_gates(wf: str, recipe: str, findings: Findings) -> None:
         return
 
 
+# Edge names the schema still accepts but whose only runtime behaviour is
+# `depends_on` ordering. See ECO6 K14 and compiler.py's control-parent rule.
+_DEPRECATED_EDGE_TYPES = (
+    "supplies_context_to",
+    "verifies",
+    "blocks",
+    "human_decision_gate",
+    "verifies_user_choice",
+)
+
+
+def _check_deprecated_edge_types(wf: str, recipe: str, findings: Findings) -> None:
+    """Warn once per recipe that still declares a decorative ``edge_type``.
+
+    The compiler already treats every one of these names exactly like
+    ``depends_on`` — an ordering parent and nothing else — so the name promises
+    semantics the runtime does not implement. The names stay accepted for one
+    release, then they are removed.
+    """
+    import yaml
+
+    try:
+        with open(wf) as f:
+            document = yaml.safe_load(f) or {}
+    except Exception:
+        return  # an unparseable file is already reported by _valid_yaml
+    if not isinstance(document, dict):
+        return
+    used: set[str] = set()
+    for edge in document.get("edges") or []:
+        if not isinstance(edge, dict):
+            continue
+        edge_type = str(edge.get("edge_type") or "").strip()
+        if edge_type in _DEPRECATED_EDGE_TYPES:
+            used.add(edge_type)
+    if not used:
+        return
+    findings.warn(
+        f"recipe {recipe} uses deprecated edge_type(s) {', '.join(sorted(used))} "
+        "— they behave exactly like depends_on",
+        "rename them to depends_on "
+        "(scripts/codemods/eco6_collapse_edge_types.py does it)",
+    )
+
+
+def _check_edge_conditions(wf: str, recipe: str, findings: Findings) -> None:
+    """Warn about plain-string ``condition:`` values the runtime ignores.
+
+    ``condition:`` is read only on a ``retries`` edge, and only in its object
+    form (``mini_ork/recovery/condition.py``). A bare string such as
+    ``condition: pass`` is a legacy marker: the compiler keeps it, but no
+    handler ever evaluates it, so it reads as a control that is not there.
+    """
+    import yaml
+
+    try:
+        with open(wf) as f:
+            document = yaml.safe_load(f) or {}
+    except Exception:
+        return  # an unparseable file is already reported by _valid_yaml
+    if not isinstance(document, dict):
+        return
+    ignored = 0
+    for edge in document.get("edges") or []:
+        if isinstance(edge, dict) and isinstance(edge.get("condition"), str):
+            ignored += 1
+    if not ignored:
+        return
+    findings.warn(
+        f"recipe {recipe} has {ignored} string condition(s) the runtime ignores",
+        "remove them, or use an object predicate on a retries edge",
+    )
+
+
 def _check_workflow_schema(root: str, recipe: str, wf: str,
                            findings: Findings) -> None:
     """Validate ``workflow.yaml`` against the engine's workflow schema.
@@ -456,6 +530,10 @@ def _check_recipe(root: str, recipe: str, findings: Findings) -> None:
         # Per-node gates were never enforced; name that plainly before the
         # schema check reports the same stale key as a generic property error.
         _check_node_gates(wf, recipe, findings)
+        # Five edge names are compiled as `depends_on`; warn recipes that still
+        # use them, and warn when a string `condition:` reads as a dead control.
+        _check_deprecated_edge_types(wf, recipe, findings)
+        _check_edge_conditions(wf, recipe, findings)
         # The workflow schema is the contract the compiler reads; checking it
         # pre-run is what makes later schema removals enforceable.
         _check_workflow_schema(root, recipe, wf, findings)

@@ -27,12 +27,12 @@ edges:
   - { from: planner, to: narrative_lens,  edge_type: depends_on }
   - { from: planner, to: audience_lens,   edge_type: depends_on }
   - { from: planner, to: counter_lens,    edge_type: depends_on }
-  - { from: editor_lens,     to: synthesizer, edge_type: supplies_context_to }
-  - { from: researcher_lens, to: synthesizer, edge_type: supplies_context_to }
-  - { from: narrative_lens,  to: synthesizer, edge_type: supplies_context_to }
-  - { from: audience_lens,   to: synthesizer, edge_type: supplies_context_to }
-  - { from: counter_lens,    to: synthesizer, edge_type: supplies_context_to }
-  - { from: synthesizer, to: draft_completeness, edge_type: verifies }
+  - { from: editor_lens,     to: synthesizer, edge_type: depends_on }
+  - { from: researcher_lens, to: synthesizer, edge_type: depends_on }
+  - { from: narrative_lens,  to: synthesizer, edge_type: depends_on }
+  - { from: audience_lens,   to: synthesizer, edge_type: depends_on }
+  - { from: counter_lens,    to: synthesizer, edge_type: depends_on }
+  - { from: synthesizer, to: draft_completeness, edge_type: depends_on }
   - { from: draft_completeness, to: publisher, edge_type: depends_on }
   - { from: synthesizer, to: rollback, edge_type: escalates_to }
   - { from: draft_completeness, to: rollback, edge_type: escalates_to }

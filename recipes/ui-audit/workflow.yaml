@@ -23,12 +23,12 @@ edges:
   - { from: planner, to: visual_lens,      edge_type: depends_on }
   - { from: planner, to: interaction_lens, edge_type: depends_on }
   - { from: planner, to: edge_lens,        edge_type: depends_on }
-  - { from: a11y_lens,        to: synthesizer, edge_type: supplies_context_to }
-  - { from: perf_lens,        to: synthesizer, edge_type: supplies_context_to }
-  - { from: visual_lens,      to: synthesizer, edge_type: supplies_context_to }
-  - { from: interaction_lens, to: synthesizer, edge_type: supplies_context_to }
-  - { from: edge_lens,        to: synthesizer, edge_type: supplies_context_to }
-  - { from: synthesizer, to: findings_completeness, edge_type: verifies }
+  - { from: a11y_lens,        to: synthesizer, edge_type: depends_on }
+  - { from: perf_lens,        to: synthesizer, edge_type: depends_on }
+  - { from: visual_lens,      to: synthesizer, edge_type: depends_on }
+  - { from: interaction_lens, to: synthesizer, edge_type: depends_on }
+  - { from: edge_lens,        to: synthesizer, edge_type: depends_on }
+  - { from: synthesizer, to: findings_completeness, edge_type: depends_on }
   - { from: findings_completeness, to: publisher, edge_type: depends_on }
   - { from: synthesizer, to: rollback, edge_type: escalates_to }
   - { from: findings_completeness, to: rollback, edge_type: escalates_to }

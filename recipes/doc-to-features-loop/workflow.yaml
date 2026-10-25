@@ -28,17 +28,17 @@ edges:
   - { from: planner, to: feature_extractor_kimi, edge_type: depends_on }
   - { from: planner, to: feature_extractor_glm, edge_type: depends_on }
   - { from: planner, to: feature_extractor_minimax, edge_type: depends_on }
-  - { from: feature_extractor_codex, to: feature_synthesizer, edge_type: supplies_context_to }
-  - { from: feature_extractor_kimi, to: feature_synthesizer, edge_type: supplies_context_to }
-  - { from: feature_extractor_glm, to: feature_synthesizer, edge_type: supplies_context_to }
-  - { from: feature_extractor_minimax, to: feature_synthesizer, edge_type: supplies_context_to }
+  - { from: feature_extractor_codex, to: feature_synthesizer, edge_type: depends_on }
+  - { from: feature_extractor_kimi, to: feature_synthesizer, edge_type: depends_on }
+  - { from: feature_extractor_glm, to: feature_synthesizer, edge_type: depends_on }
+  - { from: feature_extractor_minimax, to: feature_synthesizer, edge_type: depends_on }
   - { from: feature_synthesizer, to: feature_prioritizer, edge_type: depends_on }
-  - { from: feature_prioritizer, to: extraction_completeness, edge_type: verifies }
+  - { from: feature_prioritizer, to: extraction_completeness, edge_type: depends_on }
   - { from: extraction_completeness, to: arxiv_compliance, edge_type: depends_on, condition: pass }
   - { from: extraction_completeness, to: reflector, edge_type: escalates_to, condition: fail }
   - { from: arxiv_compliance, to: per_feature_dispatcher, edge_type: depends_on, condition: pass }
   - { from: arxiv_compliance, to: reflector, edge_type: escalates_to, condition: fail }
-  - { from: per_feature_dispatcher, to: dispatch_aggregator, edge_type: verifies }
+  - { from: per_feature_dispatcher, to: dispatch_aggregator, edge_type: depends_on }
   - { from: dispatch_aggregator, to: publisher, edge_type: depends_on, condition: pass }
   - { from: dispatch_aggregator, to: reflector, edge_type: escalates_to, condition: fail }
   - { from: reflector, to: replanner, edge_type: depends_on }

@@ -75,8 +75,8 @@ nodes:
 
 edges:
   - { from: planner,     to: implementer, edge_type: depends_on   }
-  - { from: implementer, to: typecheck,   edge_type: verifies      }
-  - { from: implementer, to: test,        edge_type: verifies      }
+  - { from: implementer, to: typecheck,   edge_type: depends_on      }
+  - { from: implementer, to: test,        edge_type: depends_on      }
   - { from: typecheck,   to: reviewer,    edge_type: depends_on    }
   - { from: test,        to: reviewer,    edge_type: depends_on    }
   - { from: reviewer,    to: eval,        edge_type: depends_on    }

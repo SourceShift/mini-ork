@@ -18,7 +18,19 @@ NodeType = Literal[
 ]
 
 DispatchMode = Literal["serial", "parallel", "partitioned", "speculative"]
-EdgeType = Literal["depends_on", "supplies_context_to", "verifies", "blocks", "retries", "escalates_to"]
+# All eight names stay accepted for one release. `supplies_context_to`,
+# `verifies`, `blocks`, `human_decision_gate` and `verifies_user_choice` are
+# deprecated aliases of `depends_on` (2026-10) and will be removed.
+EdgeType = Literal[
+    "depends_on",
+    "supplies_context_to",
+    "verifies",
+    "blocks",
+    "retries",
+    "escalates_to",
+    "human_decision_gate",
+    "verifies_user_choice",
+]
 RunMode = Literal["dry-run", "live"]
 
 

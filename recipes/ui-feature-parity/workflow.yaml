@@ -27,10 +27,10 @@ edges:
   - { from: planner,      to: glm_lens,          edge_type: depends_on }
   - { from: planner,      to: minimax_lens,      edge_type: depends_on }
   - { from: planner,      to: opus_lens,         edge_type: depends_on }
-  - { from: glm_lens,     to: synthesizer,       edge_type: supplies_context_to }
-  - { from: minimax_lens, to: synthesizer,       edge_type: supplies_context_to }
-  - { from: opus_lens,    to: synthesizer,       edge_type: supplies_context_to }
-  - { from: synthesizer,  to: lens_completeness, edge_type: verifies }
+  - { from: glm_lens,     to: synthesizer,       edge_type: depends_on }
+  - { from: minimax_lens, to: synthesizer,       edge_type: depends_on }
+  - { from: opus_lens,    to: synthesizer,       edge_type: depends_on }
+  - { from: synthesizer,  to: lens_completeness, edge_type: depends_on }
   - { from: lens_completeness, to: publisher,    edge_type: depends_on }
   - { from: synthesizer,  to: rollback,          edge_type: escalates_to }
   - { from: lens_completeness, to: rollback,     edge_type: escalates_to }

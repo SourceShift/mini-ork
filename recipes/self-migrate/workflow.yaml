@@ -100,11 +100,11 @@ edges:
   - { from: seam_mapper,            to: static_feature_ledger,   edge_type: depends_on }
   - { from: cost_verifiability_lens, to: pre_retirement_parity,  edge_type: depends_on }
   - { from: static_feature_ledger,  to: pre_retirement_parity,   edge_type: depends_on }
-  - { from: pre_retirement_parity,  to: migrator,                edge_type: supplies_context_to }
-  - { from: migrator,               to: parity_verifier,         edge_type: verifies }
-  - { from: migrator,               to: acceptance_verifier,     edge_type: verifies }
-  - { from: migrator,               to: ledger_verifier,         edge_type: verifies }
-  - { from: migrator,               to: closure_verifier,        edge_type: verifies }
+  - { from: pre_retirement_parity,  to: migrator,                edge_type: depends_on }
+  - { from: migrator,               to: parity_verifier,         edge_type: depends_on }
+  - { from: migrator,               to: acceptance_verifier,     edge_type: depends_on }
+  - { from: migrator,               to: ledger_verifier,         edge_type: depends_on }
+  - { from: migrator,               to: closure_verifier,        edge_type: depends_on }
   - { from: parity_verifier,        to: reviewer,                edge_type: depends_on }
   - { from: acceptance_verifier,    to: reviewer,                edge_type: depends_on }
   - { from: ledger_verifier,        to: reviewer,                edge_type: depends_on }

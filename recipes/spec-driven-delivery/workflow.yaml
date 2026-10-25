@@ -29,7 +29,7 @@ nodes:
 edges:
   - { from: specdir_ingest, to: contract_compiler, edge_type: depends_on, condition: pass }
   - { from: specdir_ingest, to: reflector, edge_type: escalates_to, condition: fail }
-  - { from: contract_compiler, to: ratification_check, edge_type: verifies }
+  - { from: contract_compiler, to: ratification_check, edge_type: depends_on }
   - { from: ratification_check, to: spec_lint, edge_type: depends_on, condition: pass }
   - { from: ratification_check, to: reflector, edge_type: escalates_to, condition: fail }
   - { from: spec_lint, to: gates_materialize, edge_type: depends_on, condition: pass }
@@ -38,7 +38,7 @@ edges:
   - { from: gates_materialize, to: reflector, edge_type: escalates_to, condition: fail }
   - { from: test_validity, to: per_spec_dispatcher, edge_type: depends_on, condition: pass }
   - { from: test_validity, to: reflector, edge_type: escalates_to, condition: fail }
-  - { from: per_spec_dispatcher, to: dispatch_aggregator, edge_type: verifies }
+  - { from: per_spec_dispatcher, to: dispatch_aggregator, edge_type: depends_on }
   - { from: dispatch_aggregator, to: smoke_live, edge_type: depends_on, condition: pass }
   - { from: dispatch_aggregator, to: reflector, edge_type: escalates_to, condition: fail }
   - { from: smoke_live, to: ui_craft_gate, edge_type: depends_on, condition: pass }
