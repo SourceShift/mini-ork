@@ -82,10 +82,20 @@ def test_missing_column_on_a_present_table_is_a_probe_broken_candidate(tmp_path,
     assert rep.harvest_ok is True
 
 
-def test_llm_calls_without_a_lane_column_is_r8(tmp_path, con):
+def test_llm_calls_without_a_lane_column_is_a_routing_gap(tmp_path, con):
+    # The absent column *is* R8's subject. If it were raised through
+    # ``_require_column`` it would arrive as ``probe_broken`` — "the harvester
+    # cannot look" — and ``doctor`` would report the checkout unready because the
+    # gap exists, instead of queueing the gap for a cycle to fix.
     ddl(con, "CREATE TABLE llm_calls (id INTEGER, cost_usd REAL)")
+    con.executemany("INSERT INTO llm_calls VALUES (?, ?)", [(1, 0.1), (2, 0.2)])
+    con.commit()
     rep = report(tmp_path, con)
-    assert one(rep, "db:R8").kind == "probe_broken"
+    cand = one(rep, "db:R8")
+    assert cand.kind == "signal_not_propagated"
+    assert cand.evidence_key == "table:llm_calls:lane:absent"
+    assert cand.evidence["rows"] == 2
+    assert "R8" not in rep.skipped and rep.harvest_ok is True
 
 
 def test_llm_calls_with_a_lane_column_is_healthy(tmp_path, con):

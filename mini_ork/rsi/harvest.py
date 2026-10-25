@@ -889,9 +889,33 @@ def _r7_workflow_candidates_flat(ctx: _Ctx, domain: str, rule_id: str) -> list[C
 
 
 def _r8_llm_calls_no_lane(ctx: _Ctx, domain: str, rule_id: str) -> list[Candidate]:
-    """Cost rows cannot be attributed to a lane."""
-    _require_column(ctx, "llm_calls", "lane")
-    raise _GapClosed("llm_calls has a lane column")
+    """Cost rows cannot be attributed to a lane.
+
+    The column's *absence* is this rule's finding, so it must not go through
+    ``_require_column``: that raises ``_SchemaDrift``, which the dispatcher turns
+    into a ``probe_broken`` candidate about the rule itself. The two readings
+    differ operationally — ``doctor`` treats schema drift as "the harvester
+    cannot look" and reports the checkout unready, while a real gap is an
+    ordinary queue item that the loop can fix. ``_columns`` still raises
+    ``_SkipRule`` when the table itself is absent, so an old home stays a skip.
+    """
+    if "lane" in _columns(ctx, "llm_calls"):
+        raise _GapClosed("llm_calls has a lane column")
+    rows = _scalar(ctx, "SELECT count(*) FROM llm_calls")
+    return [_cand(
+        ctx, domain, rule_id,
+        kind="signal_not_propagated",
+        title="llm_calls records no lane, so cost cannot be attributed to a route",
+        evidence_key="table:llm_calls:lane:absent",
+        files=("mini_ork/dispatch/telemetry.py", "mini_ork/dispatch/llm_dispatch.py"),
+        detail="The dispatch knows which lane served a call, but the cost row drops it. "
+               "Per-lane cost, win-rate and routing credit are then unattributable.",
+        evidence={"table": "llm_calls", "column": "lane", "rows": rows},
+        reach=rows,
+        fix_hint="Add a lane column and write it from the dispatch path that already "
+                 "resolves the lane.",
+        success_metric="llm_calls has a lane column and new rows populate it",
+    )]
 
 
 # --------------------------------------------------------------------------
