@@ -59,29 +59,24 @@ exit code: 1
 
 ## 🔍 验证、学习与自我改进
 
-顶部的动图是运行循环。围绕它还有三层。下面的片段来自 [miniork.dev](https://miniork.dev/) 上的演示（示例数据）。
+<p align="center">
+  <a href="https://miniork.dev/media/mini-ork-loops.mp4">
+    <img src="assets/mini-ork-loops.gif" alt="miniork.dev 上的区域图：运行循环、学习循环、修复循环与 RSI 循环依次点亮，分别展示引擎、验证、学习与恢复之间流动的内容" width="900">
+  </a>
+</p>
+<p align="center"><sub>围绕同一个引擎的四个循环，来自 <a href="https://miniork.dev/">miniork.dev</a> 的演示（示例数据） · <a href="https://miniork.dev/media/mini-ork-loops.mp4">完整视频</a>。</sub></p>
+
+本页顶部的动图是运行循环。围绕它还有三层。
 
 ### 验证：agent 无法靠措辞蒙混过关
-
-<p align="center">
-  <img src="assets/mini-ork-verification.gif" alt="IDE 中一次已发布的运行及其级别向量（applies PROVEN、executes PROVEN、target UNVERIFIED、preserve UNVERIFIED、contract PROVEN），随后是验证区域：配方验证器、审阅裁决、发布闸门链、作者补丁落地、晋升闸门、监督收件箱" width="900">
-</p>
 
 每一个裁决都来自执行证据：篡改守卫、测试套件、基线回放（测试必须在旧代码上失败）、变异充分性检查；另一个模型通道在实现者开工之前仅凭 kickoff 写出盲测，实现者不能改动它们。审阅模型可以否决一个结果，但永远不能凭空制造通过。`certify` 对单个改动给出 PROVEN、REFUTED，或在无法证明时给出 UNVERIFIED。方法与局限见 [docs/RESULTS.md](docs/RESULTS.md)，机制见 [docs/architecture/verification-stack.md](docs/architecture/verification-stack.md)。
 
 ### 学习：只保留经过验证的东西
 
-<p align="center">
-  <img src="assets/mini-ork-learning.gif" alt="区域图上的学习循环：执行轨迹与验证器证据变成奖励、路由器的通道优势、梯度与经过验证的经验，以及每个提示词里的学习块" width="900">
-</p>
-
 每次运行之后，轨迹变成每个节点的过程奖励，正向奖励必须有验证器证据配对；路由器从各通道的优势中学习（GRPO），反思步骤从文本梯度中提炼经验，写入前先做冲突检查。只有经过验证的经验才会进入提示词，注入账本记录每个节点收到了什么，功劳才能回流。生命周期与现状见 [docs/LEARNING-LOOP-LIFECYCLE.md](docs/LEARNING-LOOP-LIFECYCLE.md)。
 
 ### 自我改进：带闸门
-
-<p align="center">
-  <img src="assets/mini-ork-rsi.gif" alt="区域图上的 RSI 循环，随后是处于 Improve 模式的配方：图补丁插入一个 lens，提示词指令与对照组比较，晋升闸门与回滚指针守护新版本" width="900">
-</p>
 
 mini-ork 通过同一套配方图修改自己：`framework-edit`、`self-improve`、`rsi-technique-review`、`goal-loop`。每一项学到的改动都要通过可攻击性审计与验证器审计，再通过基于冻结探针、带盲重跑对照组的非回归闸门，每个被晋升的版本都保留回滚指针。无人值守改写提示词的 apply 循环**默认关闭**。详见 [docs/RECURSIVE-SELF-IMPROVE.md](docs/RECURSIVE-SELF-IMPROVE.md)、[docs/SAFETY.md](docs/SAFETY.md)。
 

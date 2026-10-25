@@ -165,14 +165,16 @@ Try `bash examples/certify-demo/demo.sh`.
 
 ## Verification, learning, and self-improvement
 
-The GIF at the top is the run loop. Three more layers sit around it. The clips below
-come from the walkthrough on [miniork.dev](https://miniork.dev/) and show sample data.
+<p align="center">
+  <a href="https://miniork.dev/media/mini-ork-loops.mp4">
+    <img src="assets/mini-ork-loops.gif" alt="The zone map on miniork.dev: the run loop, the learning loop, the repair loop and the RSI loop light up in turn, each showing what flows between the engine, verification, learning and recovery" width="900">
+  </a>
+</p>
+<p align="center"><sub>Four loops around one engine, from the <a href="https://miniork.dev/">walkthrough</a> (sample data) · <a href="https://miniork.dev/media/mini-ork-loops.mp4">full-quality video</a>.</sub></p>
+
+The GIF at the top of this page is the run loop. Three more layers sit around it.
 
 ### Verification the agents cannot talk their way past
-
-<p align="center">
-  <img src="assets/mini-ork-verification.gif" alt="A published run in the IDE with its level vector (applies PROVEN, executes PROVEN, target UNVERIFIED, preserve UNVERIFIED, contract PROVEN), then the verification zone: recipe verifiers, reviewer verdict, publisher gate chain, authored-patch landing, promotion gates, oversight inbox" width="900">
-</p>
 
 Every verdict is execution evidence. A recipe's verifiers run a tamper guard, the test
 suite, a base replay (the test must fail on the old code) and a mutation-adequacy check.
@@ -187,10 +189,6 @@ PROVEN verdicts were correct with 0 false completions; the method and its limits
 
 ### Learning that keeps only what verified
 
-<p align="center">
-  <img src="assets/mini-ork-learning.gif" alt="The learning loop on the zone map: execution traces and verifier evidence become rewards, lane advantages for the router, gradients and verified lessons, and a learned block in every prompt" width="900">
-</p>
-
 After every run the traces become a process reward per node, and a positive reward has to
 be paired with verifier evidence. From there the loop fans out: per-lane advantages the
 router learns from (GRPO), textual gradients the reflection step mines into lessons, and
@@ -202,10 +200,6 @@ of routes. Lifecycle and status:
 [docs/LEARNING-LOOP-LIFECYCLE.md](docs/LEARNING-LOOP-LIFECYCLE.md).
 
 ### Self-improvement, gated
-
-<p align="center">
-  <img src="assets/mini-ork-rsi.gif" alt="The RSI loop on the zone map, then a recipe in Improve mode: a graph patch inserts a lens, a prompt directive is measured against a control arm, promotion gates and a rollback pointer guard the new version" width="900">
-</p>
 
 mini-ork edits mini-ork through the same recipe graph: `framework-edit` (verified
 self-edits with blind spec tests), `self-improve` (scan, lenses, synthesis, implement,
