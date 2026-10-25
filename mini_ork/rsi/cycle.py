@@ -814,12 +814,19 @@ def _child_env(req: CycleRequest, home: Path, *, root: Path | None = None) -> di
     cycle's own store keeps the keys where the operator put them instead of
     copying them into a throwaway directory, and only when that file exists: an
     explicit path that is wrong is worse than letting the default resolve.
+
+    ``MINI_ORK_PROJECT_HOME`` is set as well as ``MINI_ORK_HOME``, and to the
+    same value. The launcher prefers it, and the cycle process inherits it from
+    its own launcher — so leaving it alone sent the first child's whole run to
+    the primary ``.mini-ork/runs`` while the cycle waited for artifacts under
+    the child home (2026-10-25). The two names must never disagree.
     """
     env = {
         **os.environ,
         "MINI_ORK_ROOT": str(root if root is not None else req.root),
         "MINI_ORK_DB": str(req.db),
         "MINI_ORK_HOME": str(home),
+        "MINI_ORK_PROJECT_HOME": str(home),
     }
     store = Path(req.home) / "config" / "secrets.local.sh"
     if not os.environ.get("MINI_ORK_SECRETS") and store.is_file():

@@ -229,6 +229,7 @@ def _run(recipe: str, name: str, *, run_dir: Path, input_dir: Path,
          extra_env: dict[str, str]) -> subprocess.CompletedProcess:
     env = {
         **os.environ,
+        "PYTHONPATH": os.pathsep.join(filter(None, (str(REPO), os.environ.get("PYTHONPATH")))),
         "MINI_ORK_RUN_DIR": str(run_dir),
         "MINI_ORK_NODE_INPUT_DIR": str(input_dir),
         "MINI_ORK_RUN_ID": "rsi-ctest",
@@ -371,6 +372,92 @@ def test_critic_merge_carries_every_verdict_and_refuses_an_abstention(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# The panel grades its own lanes, not every actor that logged a call
+# --------------------------------------------------------------------------
+
+
+def _llm_db(tmp_path: Path, rows: list[tuple[str, str, str, str]]) -> Path:
+    """A minimal ``llm_calls`` the panel verifier can grade."""
+    import sqlite3
+
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    try:
+        con.execute("CREATE TABLE llm_calls (run_id TEXT, actor TEXT, model_id TEXT, status TEXT)")
+        con.executemany("INSERT INTO llm_calls VALUES (?,?,?,?)", rows)
+        con.commit()
+    finally:
+        con.close()
+    return db
+
+
+def test_the_suggest_panel_grades_only_the_three_declared_lenses(tmp_path):
+    """The synthesiser and the engine's own lanes are not panel members.
+
+    The first live cycle graded them too and reported
+    ``same_family:codex_lens,deepseek_lens`` on a recipe that was correct, which
+    would quarantine every cycle.
+    """
+    db = _llm_db(tmp_path, [
+        ("rsi-ctest", "deepseek_lens", "deepseek-v3", "success"),
+        ("rsi-ctest", "glm_lens", "glm-4.6", "success"),
+        ("rsi-ctest", "minimax_lens", "minimax-m2", "success"),
+        ("rsi-ctest", "codex_lens", "deepseek-v3", "success"),
+        ("rsi-ctest", "planner", "glm-4.6", "success"),
+        ("rsi-ctest", "profile_answerer", "minimax-m2", "success"),
+    ])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    out = _run("rsi-cycle", "panel.py", run_dir=run_dir, input_dir=tmp_path,
+               extra_env={"MINI_ORK_DB": str(db)})
+
+    assert out.returncode == 0, out.stderr
+    panel = json.loads((run_dir / "panel-composition.json").read_text())
+    assert panel["ok"] is True, panel["problems"]
+    assert panel["lanes"] == ["deepseek_lens", "glm_lens", "minimax_lens"]
+    assert sorted(panel["families"]) == ["deepseek_lens", "glm_lens", "minimax_lens"]
+
+
+def test_the_suggest_panel_still_fails_when_two_lenses_share_a_family(tmp_path):
+    db = _llm_db(tmp_path, [
+        ("rsi-ctest", "deepseek_lens", "deepseek-v3", "success"),
+        ("rsi-ctest", "glm_lens", "deepseek-v3", "success"),
+        ("rsi-ctest", "minimax_lens", "minimax-m2", "success"),
+    ])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    out = _run("rsi-cycle", "panel.py", run_dir=run_dir, input_dir=tmp_path,
+               extra_env={"MINI_ORK_DB": str(db)})
+
+    assert out.returncode != 0
+    assert "same_family" in out.stderr
+
+
+def test_the_critic_panel_grades_only_the_two_declared_critics(tmp_path):
+    brief, _ = _brief_file(tmp_path)
+    brief.write_text(json.dumps({**json.loads(brief.read_text()),
+                                 "implementer_lane": "minimax"}), encoding="utf-8")
+    db = _llm_db(tmp_path, [
+        ("rsi-ctest", "glm_lens", "glm-4.6", "success"),
+        ("rsi-ctest", "deepseek_lens", "deepseek-v3", "success"),
+        ("rsi-ctest", "planner", "glm-4.6", "success"),
+        ("rsi-ctest", "profile_answerer", "minimax-m2", "success"),
+    ])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    out = _run("rsi-critic", "panel.py", run_dir=run_dir, input_dir=tmp_path,
+               extra_env={"MINI_ORK_DB": str(db), "MO_RSI_CRITIC_BRIEF": str(brief)})
+
+    assert out.returncode == 0, out.stderr
+    panel = json.loads((run_dir / "panel-composition.json").read_text())
+    assert panel["lanes"] == ["glm_lens", "deepseek_lens"]
+    assert sorted(panel["families"]) == ["deepseek_lens", "glm_lens"]
+
+
+# --------------------------------------------------------------------------
 # SUGGEST: the seam
 # --------------------------------------------------------------------------
 
@@ -503,6 +590,9 @@ def test_child_env_points_a_foreign_home_at_the_operators_secret_store(tmp_path,
 
     assert env["MINI_ORK_SECRETS"] == str(store)
     assert env["MINI_ORK_HOME"] == str(home)
+    # The launcher prefers PROJECT_HOME and the cycle inherits its own; leaving
+    # it stale sent the first child's run to the primary .mini-ork/runs.
+    assert env["MINI_ORK_PROJECT_HOME"] == str(home)
     assert env["MINI_ORK_ROOT"] == str(tmp_path)
     assert env["MINI_ORK_DB"] == str(tmp_path / "state.db")
 

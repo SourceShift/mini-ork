@@ -1,59 +1,71 @@
 #!/usr/bin/env python3
-"""Grade the panel that actually served, from `llm_calls`.
+"""Grade the lenses that actually served, from `llm_calls`.
 
-The node declarations *ask* for three families. This node reports what answered:
-a lane can fall back to another provider mid-run, and a panel that quietly
-became one family is exactly the failure the multi-family layout exists to avoid.
+The workflow declares three lenses on three families. This node reports what
+answered: a lane can fall back to another provider mid-run, and a panel that
+quietly became one family is exactly the failure the multi-family layout exists
+to avoid.
 
-Aliases are read back out of `llm_calls` for this run rather than passed in,
-because the alias the engine records is the one the check has to grade — passing
-a list we guessed would manufacture `no_calls` problems on a healthy run.
+**Only the declared panel members are graded.** The first live cycle
+(2026-10-25) graded every actor that logged a call and reported
+``same_family:codex_lens,deepseek_lens`` — the synthesiser is deliberately in
+the implementer's family — plus collisions with the engine's own ``planner``
+and ``profile_answerer`` lanes. That demanded a fourth distinct family no stock
+home can provide, so a correct recipe could never pass. The panel is exactly the
+``lens_*`` nodes in ``workflow.yaml``; reading the declaration keeps the two in
+one place.
 
 Fail-open when there is nothing to grade (no DB, no table, no rows), matching
 `check_panel`'s own contract: an unmeasured panel is reported as skipped, never
-as healthy.
+as healthy. Fail closed when the workflow declares no lens at all — that is a
+recipe bug, and skipping it would let the bug through.
 """
 import os
-import sqlite3
 import sys
+
+import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import write_json
 
 STAGE = "panel"
+PANEL_PREFIX = "lens_"
+WORKFLOW = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "workflow.yaml")
 
 
-def _served_actors(db: str, run_id: str) -> list[str] | None:
-    try:
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
-    except sqlite3.Error:
-        return None
-    try:
-        rows = con.execute(
-            "SELECT DISTINCT actor FROM llm_calls WHERE CAST(run_id AS TEXT) = ? "
-            "AND actor IS NOT NULL AND actor <> ''",
-            (str(run_id),),
-        ).fetchall()
-    except sqlite3.Error:
-        return None
-    finally:
-        con.close()
-    return sorted({str(row[0]) for row in rows})
+def _declared_lanes() -> list[str]:
+    """The ``model_lane`` of every node the workflow names as a panel member."""
+    with open(WORKFLOW, encoding="utf-8") as handle:
+        workflow = yaml.safe_load(handle) or {}
+    lanes: list[str] = []
+    for node in workflow.get("nodes") or []:
+        if isinstance(node, dict) and str(node.get("name", "")).startswith(PANEL_PREFIX):
+            lane = str(node.get("model_lane") or "").strip()
+            if lane:
+                lanes.append(lane)
+    return lanes
 
 
 def main() -> None:
     run_id = os.environ.get("MINI_ORK_RUN_ID", "").strip()
     db = os.environ.get("MINI_ORK_DB", "").strip()
-    result = {"ok": True, "problems": [], "skipped": None, "served": {}, "families": {}}
-    actors = _served_actors(db, run_id) if (db and run_id and os.path.isfile(db)) else None
-    if actors is None:
-        result["skipped"] = "no usable llm_calls table"
-    elif not actors:
-        result["skipped"] = f"no llm_calls rows for run {run_id!r}"
+    try:
+        lanes = _declared_lanes()
+    except OSError as exc:
+        sys.stderr.write(f"{STAGE}: cannot read {WORKFLOW}: {exc}\n")
+        raise SystemExit(1) from exc
+    if not lanes:
+        sys.stderr.write(f"{STAGE}: workflow.yaml declares no {PANEL_PREFIX}* node\n")
+        raise SystemExit(1)
+    result = {"ok": True, "problems": [], "skipped": None, "served": {}, "families": {},
+              "lanes": lanes}
+    if not run_id:
+        result["skipped"] = "MINI_ORK_RUN_ID is not set"
     else:
         from mini_ork.verify.panel_heterogeneity import check_panel
 
-        result = check_panel(run_id, actors, db=db)
+        result.update(check_panel(run_id, lanes, db=db or None))
 
     write_json("panel-composition.json", result, "rsi-cycle-panel")
     if not result.get("ok", True):
