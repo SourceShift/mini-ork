@@ -57,16 +57,23 @@ All paths are relative to the repository root.
 
 ## Files in scope (touch ONLY these)
 
-- the 11 deleted files listed in step 1
+- `mini_ork/cli/improve.py` (delete)
+- `mini_ork/cli/eval.py` (delete)
+- `mini_ork/cli/promote.py` (delete)
+- `mini_ork/learning/group_evolver.py` (delete)
+- `bin/mini-ork-improve` (delete)
+- `bin/mini-ork-eval` (delete)
+- `bin/mini-ork-promote` (delete)
+- `tests/unit/test_mini_ork_improve_py.py` (delete)
+- `tests/unit/test_mini_ork_eval_py.py` (delete)
+- `tests/unit/test_mini_ork_promote_py.py` (delete)
+- `tests/unit/test_group_evolver_py.py` (delete)
 - `mini_ork/cli/main.py`
 - `tests/unit/test_native_dispatch_py.py`
 - `docs/FEATURES.md`
 - `tests/unit/test_eco6_k1_promotion_path_removed.py` (new)
 
-Do NOT modify `mini_ork/learning/benchmark_suite.py`,
-`mini_ork/gates/promotion_gate.py`, `mini_ork/cli/apply.py`, any migration, or
-any other file. The `workflow_candidates`, `benchmark_results` and
-`benchmark_memory` tables stay.
+Do NOT modify `mini_ork/learning/benchmark_suite.py`, `mini_ork/gates/promotion_gate.py`, `mini_ork/cli/apply.py`, any migration, or any other file. The `workflow_candidates`, `benchmark_results` and `benchmark_memory` tables stay.
 
 ## Tests (`tests/unit/test_eco6_k1_promotion_path_removed.py`, hermetic)
 

@@ -74,7 +74,14 @@ lane role in configs.
 
 ## Files in scope (touch ONLY these)
 
-- the files deleted in step 3
+- the files deleted in step 3:
+  - `mini_ork/recovery/healer.py`, `mini_ork/recovery/healer_bridge.py`
+  - `mini_ork/recovery/cleaner.py`, `mini_ork/recovery/finalize.py`
+  - `mini_ork/cache.py`
+  - `mini_ork/vcs/auto_merge.py`, `mini_ork/vcs/auto_merge_pr.py`, `mini_ork/vcs/pr_create.py`
+  - `tests/unit/test_healer_py.py`, `tests/unit/test_mo_healer_bridge_py.py`
+  - `tests/unit/test_cleaner_py.py`, `tests/unit/test_finalize_py.py`, `tests/unit/test_cache_py.py`
+  - `tests/unit/test_auto_merge_py.py`, `tests/unit/test_auto_merge_pr_py.py`, `tests/unit/test_pr_create_py.py`
 - `mini_ork/vcs/content_ids.py` (new)
 - `mini_ork/cli/self_improve.py`
 - `mini_ork/dispatch/lane_helpers.py`, `tests/unit/test_lane_helpers_py.py`
