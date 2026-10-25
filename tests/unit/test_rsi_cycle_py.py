@@ -25,6 +25,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
+from mini_ork.rsi import cycle as cycle_mod  # noqa: E402
 from mini_ork.rsi.candidates import Candidate  # noqa: E402
 from mini_ork.rsi.config import from_mapping  # noqa: E402
 from mini_ork.rsi.cycle import (  # noqa: E402
@@ -782,3 +783,83 @@ def test_the_collapse_reason_does_not_disguise_an_operator_stop(world):
 
     assert out.status == "halted"
     assert out.halt_reason == "rsi/DISABLED file present"
+
+
+# --------------------------------------------------------------------------
+# G8/G9 measure a frozen input, not a DB the implementer can write
+# --------------------------------------------------------------------------
+
+
+def _seed_l10_gap(db: Path) -> None:
+    """The state L10 fires on: themes exist, conflicts never recorded."""
+    con = sqlite3.connect(str(db))
+    try:
+        con.executescript(
+            "CREATE TABLE lesson_themes (id TEXT);"
+            "INSERT INTO lesson_themes VALUES ('th-1'), ('th-2');"
+            "CREATE TABLE lesson_conflicts (id INTEGER);")
+        con.commit()
+    finally:
+        con.close()
+
+
+def _l10_candidate() -> Candidate:
+    return Candidate(
+        candidate_id="rsi-l10test", domain="learning", source="db:L10",
+        kind="producer_missing", title="lesson_conflicts is empty while themes exist",
+        detail="", severity=89, files=("mini_ork/learning/lesson_conflict.py",),
+        evidence={"table": "lesson_conflicts", "rows": 0, "themes": 2},
+        fix_hint="", success_metric="", success_command="db:L10",
+        evidence_key="table:lesson_conflicts:empty",
+        signature="sig-l10", first_seen_at=NOW)
+
+
+def test_g8_reads_the_frozen_db_not_the_live_one(tmp_path):
+    """The third live cycle's own fix wrote the rows G8 was measuring.
+
+    The child runs with MINI_ORK_DB pointing at the state DB, so an implementer
+    that makes the check *execute* changes the very table the gap is defined on.
+    Measured live, both trees then read "already absent" and G8 could not credit
+    a correct change. The freeze is taken before IMPLEMENT for exactly this.
+    """
+    db = tmp_path / "state.db"
+    _seed_l10_gap(db)
+    req = CycleRequest(root=tmp_path, db=db, config=_cfg(), cycle_id="rsi-ctest")
+    frozen = cycle_mod._freeze_db(req)
+    assert frozen is not None and frozen.is_file()
+
+    # The child's run: the detector is now on the write path.
+    con = sqlite3.connect(str(db))
+    try:
+        con.execute("INSERT INTO lesson_conflicts (id) VALUES (1)")
+        con.commit()
+    finally:
+        con.close()
+
+    cand = _l10_candidate()
+    assert cycle_mod._measured_db(req) == frozen
+    assert cycle_mod._gap_at(req, cand, tmp_path) is True, (
+        "the gap must still be measurable after the implementer rewrote the "
+        "table it is defined on — otherwise G8 credits nothing")
+    # Without the freeze the same measurement sees the mutation.
+    frozen.unlink()
+    assert cycle_mod._gap_at(req, cand, tmp_path) is False
+
+
+def test_no_freeze_falls_back_to_the_live_db(tmp_path):
+    """A DB that cannot be copied must not be reported as a measured one."""
+    db = tmp_path / "state.db"
+    _seed_l10_gap(db)
+    req = CycleRequest(root=tmp_path, db=db, config=_cfg(), cycle_id="rsi-nofreeze")
+
+    assert cycle_mod._freeze_db(req) is not None
+    assert cycle_mod._measured_db(req) != Path(db)
+    (cycle_mod._baseline_path(req)).unlink()
+    assert cycle_mod._measured_db(req) == Path(db)
+
+
+def test_a_missing_db_freezes_to_none(tmp_path):
+    req = CycleRequest(root=tmp_path, db=tmp_path / "absent.db", config=_cfg(),
+                       cycle_id="rsi-absent")
+
+    assert cycle_mod._freeze_db(req) is None

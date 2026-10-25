@@ -313,6 +313,12 @@ def run_cycle(req: CycleRequest, *, runtime: Runtime | None = None) -> CycleOutc
 def _body(req: CycleRequest, rt: Runtime, con, *, token: str, spend: float) -> CycleOutcome:
     cfg = req.config
     _refresh(req, token)
+    # Before HARVEST and long before IMPLEMENT: the child runs with
+    # MINI_ORK_DB pointing at this same file, and a fix that *runs* writes to
+    # it. Measured live, G8 compared two trees against a DB the implementer had
+    # already changed.
+    if not req.dry_run:
+        _freeze_db(req)
 
     # --- HARVEST -----------------------------------------------------------
     probes = tuple((rt.probes or _default_probes)(req))
@@ -552,6 +558,10 @@ def _finish(req: CycleRequest, rt: Runtime, con, status: str, *, rc: int,
         fields["merged_sha"] = merged_sha
     if gates is not None:
         fields["gates_json"] = gates.to_dict()
+    measured = _measured_db(req)
+    if measured != Path(req.db):
+        # Provenance for G8/G9: which DB the before/after actually read.
+        fields.setdefault("baseline_json", {"db": str(measured)})
     fields.update(extra or {})
     if not req.dry_run:
         ledger.finish_cycle(con, req.cycle_id, now=rt.clock(), status=status, **fields)
@@ -1280,6 +1290,61 @@ def _remove_detached(req: CycleRequest, base: Path) -> None:
          cwd=req.root, timeout_s=120)
 
 
+def _baseline_path(req: CycleRequest) -> Path:
+    """Where this cycle's frozen DB lives — a convention, not a field.
+
+    ``CycleRequest`` is frozen with slots and is built before the freeze runs, so
+    the pointer is derived from the cycle id instead of carried on it. One name,
+    three readers (``_freeze_db``, ``_measured_db``, ``_finish``), so they cannot
+    drift apart.
+    """
+    return req.home / "rsi" / req.cycle_id / "gap-baseline.db"
+
+
+def _freeze_db(req: CycleRequest) -> Path | None:
+    """Take a read-consistent copy of the state DB before any child can write.
+
+    G8 and G9 measure the state DB at two *trees*. The child runs with
+    ``MINI_ORK_DB`` pointing at that same file, so an implementer whose fix
+    executes writes rows during IMPLEMENT: the third live cycle (2026-10-25)
+    added 31 ``lesson_conflicts`` rows at 22:14, both trees then reported the L10
+    gap "already absent", and G8 could not credit a change that had in fact
+    closed it. Freezing the input makes the two trees the only variable.
+
+    ``backup()``, not a file copy: the source is live and in WAL mode, so copying
+    the file can miss committed writes still in the ``-wal``. Returns ``None``
+    when the copy cannot be made — the gates then measure the live DB, which is
+    what they did before this existed, rather than a half-written file.
+    """
+    src = Path(req.db)
+    if not src.is_file():
+        return None
+    target = _baseline_path(req)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.unlink(missing_ok=True)
+        # ``as_uri()`` percent-encodes the path; an f-string into a URI breaks
+        # on any directory whose name contains '?' or '#'.
+        source = sqlite3.connect(f"{src.resolve().as_uri()}?mode=ro", uri=True, timeout=10)
+        try:
+            dest = sqlite3.connect(str(target))
+            try:
+                source.backup(dest)
+            finally:
+                dest.close()
+        finally:
+            source.close()
+    except (OSError, sqlite3.Error):
+        return None
+    return target
+
+
+def _measured_db(req: CycleRequest) -> Path:
+    """The DB the differential gates read: the freeze if it exists, else live."""
+    frozen = _baseline_path(req)
+    return frozen if frozen.is_file() else Path(req.db)
+
+
 def _gap(req: CycleRequest, cand: Candidate, wt: Path) -> tuple[bool | None, bool | None]:
     """G8's before/after: is this candidate's gap still measurable?
 
@@ -1304,7 +1369,8 @@ def _gap_at(req: CycleRequest, cand: Candidate, root: Path) -> bool | None:
     if command.startswith(SYNTHETIC_PREFIX):
         rule = command[len(SYNTHETIC_PREFIX):]
         try:
-            result = run_synthetic(rule, root=root, db=req.db, now=int(time.time()))
+            result = run_synthetic(rule, root=root, db=_measured_db(req),
+                                   now=int(time.time()))
         except Exception:  # noqa: BLE001 - "cannot measure" is None, not True
             return None
         return result.status == "findings"
@@ -1312,12 +1378,13 @@ def _gap_at(req: CycleRequest, cand: Candidate, root: Path) -> bool | None:
     # candidate. It is present when the probe still reports that signature.
     from . import probes as probe_mod
 
+    db = _measured_db(req)
     spec = {s.probe_id: s for s in probe_mod.default_specs(
         root=root, pytest_paths=req.config.probes.pytest_paths,
-        timeout_s=req.config.probes.timeout_s, db=req.db)}.get(command)
+        timeout_s=req.config.probes.timeout_s, db=db)}.get(command)
     if spec is None:
         return None
-    env = {**os.environ, "MINI_ORK_ROOT": str(root), "MINI_ORK_DB": str(req.db)}
+    env = {**os.environ, "MINI_ORK_ROOT": str(root), "MINI_ORK_DB": str(db)}
     try:
         result = probe_mod.run_probe(spec, root=root,
                                      runner=lambda a, timeout_s, cwd: probe_mod.subprocess_runner(
@@ -1348,13 +1415,14 @@ def _probe_failures(req: CycleRequest, root: Path) -> tuple[str, ...]:
     # trees, and G6 has already run the scoped tests once. ``verifier-audit``
     # reads the DB, not the tree, so it is identical at both ends and drops out
     # of the set difference — it costs one query, not a false failure.
+    db = _measured_db(req)
     specs = probe_mod.default_specs(
-        root=root, pytest_paths=(), timeout_s=req.config.probes.timeout_s, db=req.db)
+        root=root, pytest_paths=(), timeout_s=req.config.probes.timeout_s, db=db)
     results = probe_mod.run_probes(
         specs, root=root,
         runner=lambda a, timeout_s, cwd: probe_mod.subprocess_runner(
             a, timeout_s=timeout_s, cwd=cwd,
-            env={**os.environ, "MINI_ORK_ROOT": str(root), "MINI_ORK_DB": str(req.db)}))
+            env={**os.environ, "MINI_ORK_ROOT": str(root), "MINI_ORK_DB": str(db)}))
     return tuple(r.probe_id for r in results if r.failed)
 
 
