@@ -39,6 +39,8 @@ class _Docker:
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
         self.states: dict[str, str] = {}
+        self.exit_codes: dict[str, int] = {}
+        self.finished: dict[str, str] = {}
         self.networks: set[str] = set()
         self.network_creates: list[list[str]] = []
         self.fail_network: str | None = None
@@ -57,6 +59,8 @@ class _Docker:
                 r.stderr = "docker: image not found"
                 return r
             self.states[name] = "running"
+            self.exit_codes.pop(name, None)
+            self.finished.pop(name, None)
             r.stdout = f"cid-{name}"
             return r
 
@@ -78,11 +82,19 @@ class _Docker:
 
         if argv[:2] == ["docker", "inspect"]:
             name = argv[-1]
-            if name in self.states:
-                r.stdout = self.states[name]
-            else:
+            if name not in self.states:
                 r.returncode = 1
                 r.stderr = "Error: No such object"
+                return r
+            state = self.states[name]
+            if any("{{.State.ExitCode}}" in a for a in argv):
+                # Docker's own zero value for "never finished" — the manager
+                # must translate it to null rather than pass it through.
+                finished = self.finished.get(name, "0001-01-01T00:00:00Z")
+                exit_code = self.exit_codes.get(name, 0)
+                r.stdout = f"{state}|{exit_code}|{finished}"
+            else:
+                r.stdout = state
             return r
 
         if argv[:2] == ["docker", "logs"]:
@@ -92,10 +104,13 @@ class _Docker:
         if argv[:2] == ["docker", "rm"]:
             self.removed.append(argv[-1])
             self.states.pop(argv[-1], None)
+            self.exit_codes.pop(argv[-1], None)
+            self.finished.pop(argv[-1], None)
             return r
 
         if argv[:2] == ["docker", "restart"]:
             self.states[argv[-1]] = "running"
+            self.finished.pop(argv[-1], None)
             return r
 
         return r
@@ -410,6 +425,34 @@ def test_status_reports_volumes_but_never_the_host_path(client):
     body = client.get("/v1/services/web", headers=AUTH).json()
     assert body["volumes"] == [{"name": "data", "mount_path": "/var/lib/app"}]
     assert "volumes/" not in json.dumps(body)
+
+
+def test_a_running_replica_reports_no_completion(client):
+    client.post("/v1/services", json=_spec(replicas=1), headers=AUTH)
+    replica = client.get("/v1/services/web", headers=AUTH).json()["replicas_state"][0]
+    assert replica["state"] == "running"
+    assert replica["exit_code"] is None
+    # Docker's "never finished" zero value must not leak as a 0001 date.
+    assert replica["finished_at"] is None
+
+
+def test_a_one_shot_replica_reports_its_exit_code_and_finish_time(client, docker):
+    """A cron run's exit code is its verdict; a state-only view cannot tell
+    a successful job from a crashed one."""
+    client.post(
+        "/v1/services",
+        json=_spec(replicas=1, restart_policy="no", ports=[]),
+        headers=AUTH,
+    )
+    docker.states["mo-svc-web-0"] = "exited"
+    docker.exit_codes["mo-svc-web-0"] = 3
+    docker.finished["mo-svc-web-0"] = "2026-10-25T09:00:00.123456789Z"
+
+    replica = client.get("/v1/services/web", headers=AUTH).json()["replicas_state"][0]
+    assert replica["state"] == "exited"
+    assert replica["exit_code"] == 3
+    assert replica["finished_at"] == "2026-10-25T09:00:00.123456789Z"
+
 
 
 def test_the_published_schema_rejects_the_same_shapes():

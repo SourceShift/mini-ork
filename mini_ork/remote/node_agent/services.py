@@ -900,13 +900,55 @@ class ServiceManager:
             chunks.append(f"--- replica {replica} ---\n{text}")
         return "\n".join(chunks)
 
-    def _replica_state(self, name: str) -> str:
+    #: Docker's zero value for ``State.FinishedAt``: a container that has
+    #: never finished. Reporting it as a timestamp would be a lie the caller
+    #: has to special-case; ``null`` says "still running" and nothing else.
+    _NEVER = "0001-01-01T00:00:00Z"
+
+    #: States in which Docker's ``ExitCode`` means something. A *running*
+    #: container also reports ``ExitCode: 0`` — passing that through would let
+    #: a supervisor read "success" from a job that has not finished, so it is
+    #: normalized to ``null`` here and the state stays the authority.
+    _TERMINAL_STATES = frozenset({"exited", "dead"})
+
+    def _replica_detail(self, name: str) -> dict[str, Any]:
+        """One ``docker inspect`` per replica, returning state and completion.
+
+        ``exit_code`` and ``finished_at`` exist for one-shot workloads: a
+        scheduled job's exit code *is* its verdict, and a supervisor that only
+        saw ``exited`` could not tell success from a crash. A long-running
+        service reports ``exit_code: null`` until it stops.
+        """
         result = self._run(
-            ["docker", "inspect", "-f", "{{.State.Status}}", name]
+            [
+                "docker", "inspect", "-f",
+                "{{.State.Status}}|{{.State.ExitCode}}|{{.State.FinishedAt}}",
+                name,
+            ]
         )
         if int(getattr(result, "returncode", 1)) != 0:
-            return "missing"
-        return (getattr(result, "stdout", "") or "").strip() or "unknown"
+            return {"state": "missing", "exit_code": None, "finished_at": None}
+        raw = (getattr(result, "stdout", "") or "").strip()
+        parts = raw.split("|", 2)
+        state = (parts[0] if parts else "").strip() or "unknown"
+        terminal = state in self._TERMINAL_STATES
+
+        exit_code: int | None = None
+        if terminal and len(parts) > 1:
+            code = parts[1].strip()
+            if code.lstrip("-").isdigit():
+                exit_code = int(code)
+
+        finished_at: str | None = None
+        if terminal and len(parts) > 2:
+            stamp = parts[2].strip()
+            if stamp and stamp != self._NEVER:
+                finished_at = stamp
+
+        return {"state": state, "exit_code": exit_code, "finished_at": finished_at}
+
+    def _replica_state(self, name: str) -> str:
+        return str(self._replica_detail(name)["state"])
 
     def status(self, service_id: str) -> dict[str, Any] | None:
         spec = self._specs.get(service_id)
@@ -920,7 +962,7 @@ class ServiceManager:
                     "replica": index,
                     "name": name,
                     "cid": self._cids.get(service_id, {}).get(index),
-                    "state": self._replica_state(name),
+                    **self._replica_detail(name),
                 }
             )
         return {**spec.to_dict(), "replicas_state": replicas}
