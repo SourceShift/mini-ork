@@ -13,6 +13,7 @@ from .deps import get_db, get_home, set_home_override
 from .routes import (
     agent_server,
     artifacts as artifacts_routes,
+    chat as chat_routes,
     control as control_routes,
     dispatch as dispatch_routes,
     features,
@@ -137,6 +138,10 @@ def create_app(home: Path | None = None, dev_cors: bool = True) -> FastAPI:
     # is meant to answer, so the route carries its own HMAC rather than the
     # local-caller guard. "/api/" is already in _NON_SPA_PREFIXES.
     app.include_router(intake_routes.router)
+    # Chat webhooks (secure tier): enabled per transport by config/chat.yaml
+    # `tier: secure`, guarded by the platform's own signature. "/api/" is
+    # already in _NON_SPA_PREFIXES, so the SPA fallback never shadows them.
+    app.include_router(chat_routes.router)
 
     @app.get("/api")
     def api_index() -> JSONResponse:
