@@ -829,6 +829,18 @@ def _child_env(req: CycleRequest, home: Path, *, root: Path | None = None) -> di
     hazard — an inherited one names the primary checkout as the run's target
     from inside a worktree — so it is dropped and the ladder falls back to the
     child's cwd, which each caller already sets to ``root``.
+
+    The lane overlay has the same problem as the secret store, in the same fresh
+    home. ``agents_config`` resolves aliases from
+    ``<home>/config/agents.local.yaml`` and falls back to the tracked
+    ``config/agents.yaml`` when there is none — so a child home silently ran the
+    *stock* alias map. On 2026-10-25 that made the SUGGEST panel fail against
+    itself: the operator's ``deepseek_lens`` alias did not exist in the child,
+    the lens fell back to ``minimax``, and the panel reported a family collapse
+    that no code had caused. ``MINI_ORK_AGENTS`` is the existing lever for
+    exactly this ("the operator's own lane choice"), so it is pointed at the
+    cycle's overlay under the same rule as ``MINI_ORK_SECRETS``: only when the
+    file exists, and never over a choice the caller already made.
     """
     engine = str(root if root is not None else req.root)
     env = {
@@ -843,6 +855,9 @@ def _child_env(req: CycleRequest, home: Path, *, root: Path | None = None) -> di
     store = Path(req.home) / "config" / "secrets.local.sh"
     if not os.environ.get("MINI_ORK_SECRETS") and store.is_file():
         env["MINI_ORK_SECRETS"] = str(store)
+    overlay = Path(req.home) / "config" / "agents.local.yaml"
+    if not os.environ.get("MINI_ORK_AGENTS") and overlay.is_file():
+        env["MINI_ORK_AGENTS"] = str(overlay)
     return env
 
 

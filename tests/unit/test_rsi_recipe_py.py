@@ -619,6 +619,64 @@ def test_child_env_keeps_a_store_the_operator_chose(tmp_path, monkeypatch):
     assert env["MINI_ORK_SECRETS"] == str(chosen)
 
 
+def test_child_env_hands_the_child_the_operators_lane_overlay(tmp_path, monkeypatch):
+    """A fresh child home has no ``agents.local.yaml``: without the pointer the
+    child silently runs the *stock* alias map (2026-10-25)."""
+    monkeypatch.delenv("MINI_ORK_AGENTS", raising=False)
+    req = _req(tmp_path)
+    overlay = tmp_path / "config" / "agents.local.yaml"
+    overlay.parent.mkdir()
+    overlay.write_text("lanes:\n  deepseek_lens: deepseek_flash\n", encoding="utf-8")
+
+    env = _child_env(req, tmp_path / "rsi" / "rsi-ctest" / "child-home")
+
+    assert env["MINI_ORK_AGENTS"] == str(overlay)
+
+
+def test_child_env_never_names_an_overlay_that_does_not_exist(tmp_path, monkeypatch):
+    """``agents_config`` raises on a missing MINI_ORK_AGENTS — worse than none."""
+    monkeypatch.delenv("MINI_ORK_AGENTS", raising=False)
+
+    env = _child_env(_req(tmp_path), tmp_path / "child-home")
+
+    assert "MINI_ORK_AGENTS" not in env
+
+
+def test_child_env_keeps_an_overlay_the_operator_chose(tmp_path, monkeypatch):
+    chosen = tmp_path / "elsewhere.yaml"
+    chosen.write_text("lanes:\n  deepseek_lens: deepseek_flash\n", encoding="utf-8")
+    monkeypatch.setenv("MINI_ORK_AGENTS", str(chosen))
+    local = tmp_path / "config" / "agents.local.yaml"
+    local.parent.mkdir()
+    local.write_text("lanes:\n  deepseek_lens: glm\n", encoding="utf-8")
+
+    env = _child_env(_req(tmp_path), tmp_path / "child-home")
+
+    assert env["MINI_ORK_AGENTS"] == str(chosen)
+
+
+def test_every_lane_the_rsi_recipes_declare_resolves_from_the_tracked_map():
+    """The portable tier's guard: a fresh home reads only ``config/agents.yaml``.
+
+    An alias a recipe names but the tracked map omits is not a *missing* lane —
+    dispatch treats it as a literal provider name, raises "unknown lane", and the
+    node falls back to whatever the health filter picks. The panel then reports
+    a family collapse the recipe never caused.
+    """
+    tracked = yaml.safe_load((REPO / "config" / "agents.yaml").read_text(encoding="utf-8"))
+    lanes = tracked["lanes"]
+    missing: list[str] = []
+    for recipe in ("rsi-cycle", "rsi-critic"):
+        workflow = yaml.safe_load(
+            (REPO / "recipes" / recipe / "workflow.yaml").read_text(encoding="utf-8"))
+        for node in workflow.get("nodes") or []:
+            lane = str((node or {}).get("model_lane") or "").strip()
+            if lane and lane not in lanes:
+                missing.append(f"{recipe}:{node.get('name')} -> {lane}")
+
+    assert not missing, f"lanes a fresh home cannot resolve: {missing}"
+
+
 def test_run_recipe_hands_the_store_to_the_child(tmp_path, monkeypatch):
     monkeypatch.delenv("MINI_ORK_SECRETS", raising=False)
     store = tmp_path / "config" / "secrets.local.sh"

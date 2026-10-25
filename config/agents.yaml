@@ -52,6 +52,13 @@ lanes:
   # workflows — that's a per-recipe cost-budget decision).
   minimax_lens: minimax  # MiniMax (Anthropic-compatible gateway, M3)
   laguna_lens: laguna_free  # poolside/laguna-s-2.1 — 3rd judge of audit-judge-panel-3l
+  # Declared by recipes/rsi-cycle and recipes/rsi-critic. An alias a recipe
+  # names must resolve from THIS tracked map: a fresh home (every dispatched
+  # child run gets one) has no agents.local.yaml, so an alias that lived only
+  # in the operator's overlay raised "unknown lane" and the lens silently fell
+  # back to another provider — a detected family collapse that was really a
+  # missing alias (2026-10-25). Operators retarget it in agents.local.yaml.
+  deepseek_lens: deepseek_flash  # DeepSeek (fast tier; same key as `deepseek`)
   # Dedicated judge lane for advisory eval nodes (recipes/code-fix workflow.yaml
   # node `eval`). Split out of `reviewer` because the eval node's lane string is
   # ALSO what reaches the judge: the node's resolved lane is published into
