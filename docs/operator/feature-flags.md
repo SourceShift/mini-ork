@@ -154,8 +154,6 @@ touched set is the child's working tree ∪ untracked ∪ `pre-implementer-ref�
 | `MO_REVIEW_PANEL` | `"codex kimi glm"` | Pre-push review LLM panel lanes |
 | `MO_REVIEW_LENS_TIMEOUT_S` | `"180"` | Per-lens review timeout |
 | `MO_ORACLE_GATES_AUTO` | `"1"` | Auto oracle-gate run pre-publish |
-| `MO_OPTIMIZER_MODEL` | `"minimax"` | GEPA optimizer lane |
-| `MO_OPTIMIZER_BUDGET` | `"4"` | GEPA optimizer budget |
 | `MO_NODE_HEARTBEAT_SECONDS` | `"60"` | How often a running node writes a `node_heartbeat` row |
 | `MO_ORCH_WATCH` | `"1"` | `0` stops `mini-ork run` from spawning the run's interval watcher |
 | `MO_ORCH_WATCH_INTERVAL_S` | `"20"` | Seconds between watcher ticks |

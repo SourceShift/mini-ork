@@ -81,7 +81,7 @@ experience and feeds it forward:
 | Auditable context packs | `bin/mini-ork-plan` (`context-pack.json`) | The full cite-tagged memory bundle available at plan time is persisted next to the plan — you can audit what the planner knew. |
 | Pattern store | `lib/pattern_store.sh` | Recurring gradients consolidate into durable pattern records. |
 | Agent performance history | `agent_performance_memory` + `lib/agent_registry.sh` | Success rate, cost, and latency accumulate per agent version — dispatch decisions get data. |
-| Self-healing loop | `lib/healer.sh` | Reads a failed run's logs, classifies the failure, dispatches the matching recovery action. |
+| Repair ladder | `mini_ork/recovery/auto_repair.py` | Diagnoses a failed run (rules, then a model for the unclassified) and runs the matching recovery: lane swap, infra retry, re-verify, revise, escalate. |
 | Improvement chain | `bin/mini-ork-{reflect,improve,eval,promote}` + `lib/{group_evolver,benchmark_suite,promotion_gate,version_registry}.sh` | Gradients → workflow candidates → benchmark → gated promotion with rollback pointers. The pipeline itself evolves, with receipts. |
 | Proof it works | README §"Recursive self-improvement evidence" | The loop ran against mini-ork itself: 10 autonomous commits to main in ~5h, each citing arXiv evidence, audit trail in `self_improve_runs`. |
 

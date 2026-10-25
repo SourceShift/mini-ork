@@ -62,7 +62,7 @@ flowchart LR
     CLASSIFY["Classify + profile"]
     PLAN["Plan"]
     EXEC["Execute: compile workflow → DAG waves"]
-    REVISE["Revise loop + CoBa stop"]
+    REVISE["Revise loop (recursion caps + budget)"]
     ORCH["Run orchestrator (ADVANCE / REPAIR / MUTATE)"]
     SCHED["Epics queue + scheduler + conductor"]
     GOAL["Goal-loop / spawn / threads"]
@@ -189,7 +189,7 @@ Status legend: **on** = runs by default · **opt-in** = needs a flag or command 
 | Planner | LLM plan with repair loop and a profile gate that refuses under-specified kickoffs | `cli/plan.py`, `planning/` | on |
 | Workflow compiler | Typed node/edge graph, artifact ports, `retries` repair edges, `recursion:` block | `workflow/compiler.py`, `workflow/recursion.py` | on |
 | DAG wave dispatcher | Runs nodes in readiness waves; serial / parallel / partitioned; node handler registry | `cli/execute.py`, `cli/execute_handlers.py` | on |
-| Revise loop | A failing check sends findings back to its target node (≤2 rounds); CoBa stops low-value rounds | `cli/execute.py:1642`, `learning/revise_value.py` | on |
+| Revise loop | A failing check sends findings back to its target node (≤2 rounds; a `recursion:` block's `max_iterations` and `budget_cap_total_usd` apply to its repair edges) | `cli/execute.py` (`_round_cap`) | on |
 | Run orchestrator | At each wave boundary: ADVANCE / REPAIR / MUTATE (proposes a graph patch); a watcher sends steering hints | `orchestration/runner_orchestrator.py` | on |
 | Durable resume | Node checkpoints → `recover --from-node`; completion ledger → `run --resume`; git ref per node | `stores/checkpoints.py`, `checkpoints/`, `vcs/node_checkpoint.py` | on |
 | Epics + scheduler + conductor | Roadmap → epics with dependencies; pool dispatch with budgets, retries, hooks; conductor picks topology | `cli/epics.py`, `scheduler.py`, `orchestration/conductor.py` | opt-in |
@@ -203,7 +203,7 @@ Status legend: **on** = runs by default · **opt-in** = needs a flag or command 
 | Router | Learned bandit over lane advantages (region → domain → global), EquiRouter, EntroRouter, RouteMoA dominance screen, UCCI calibrated escalation, ε-exploration | `dispatch/routing.py`, `steering/decision_service.py`, `lane_router.py`, `dispatch/screening.py`, `dispatch/calibration.py` | on (recipe-pinned lanes bypass it) |
 | Fallback chain + fuse | Lead lane plus a role tail; shape check for planner JSON; a lane that fails the same way is fused off | `dispatch/llm_dispatch.py` | on |
 | Lane health | Key check + cached 1-token probe; run-level preflight refuses a dead lead lane | `dispatch/providers.py`, `cli/lane_preflight.py` | on |
-| Cost governance | Rolling 24 h daily circuit, per-epic budget, deadline-capped node timeouts, per-run pause sentinel, cost ledger | `cost_ledger.py`, `scheduler.py`, `dispatch/deadline_budget.py`, `dispatch/cost_pause.py` | on (pause does not halt) |
+| Cost governance | Rolling 24 h daily circuit, per-epic budget, deadline-capped node timeouts, per-run pause sentinel, cost ledger | `cost_ledger.py`, `scheduler.py`, `dispatch/deadline_budget.py`, `dispatch/cost_pause.py` | on (pause stops new dispatches; `resume` restarts) |
 | Secrets / vault | Simple tier: env + 0600 file; secure tier: sops / command / OpenBao | `dispatch/secrets.py`, `dispatch/vault.py` | on |
 | Operator steering | Queued guidance per role, injected once into the next prompt | `steering/operator_steering.py` | on |
 
@@ -214,7 +214,7 @@ Status legend: **on** = runs by default · **opt-in** = needs a flag or command 
 | Reviewer verdict | Last `{"verdict": …}` in the reply; unknown fails the node | `lib/extract_verdict.py` | on |
 | Publisher gate chain | Oracle gates → publish-truth → verified-diff pin → abstention → **level vector** (applies / executes / target / preserve / contract) → artifact contract | `cli/publisher.py:560`, `verify/levels.py` | on |
 | Authored-patch landing | Rebuilds the run's own patch, refuses frozen-kernel paths, commits through a private index | `cli/publisher_authored_patch.py`, `config/kernel-frozen.yaml` | on |
-| Promotion gates | Hackability audit, verifier audit (hack probe + metric anchor + gate fuzzer) before a learned change is promoted | `gates/promotion_gate.py`, `gates/hackability.py`, `learning/verifier_audit.py` | on (promote path) |
+| Promotion gates | Hackability audit, verifier audit (hack probe + collapse detector + gate fuzzer) before a learned change is promoted | `gates/promotion_gate.py`, `gates/hackability.py`, `learning/verifier_audit.py` | on (promote path) |
 | Oversight inbox | Notifications and review items; human review gates (park after a node, approve before merge) | `gates/oversight_inbox.py`, `gates/node_review.py`, `gates/merge_approval.py` | inbox on; review gates opt-in |
 | Certify oracle | PoC, delta, invariants, relations, differential, hidden checks | `certify/oracle.py` | opt-in (`mini-ork certify`) |
 
@@ -226,7 +226,7 @@ Status legend: **on** = runs by default · **opt-in** = needs a flag or command 
 | Reflection | Detached after each run: harvest code findings, extract textual gradients (LLM), mine patterns, induce lessons, verify them, group themes | `cli/reflect.py`, `learning/reflection_pipeline.py`, `learning/gradient_extractor.py`, `learning/pattern_induction.py`, `learning/themes.py`, `learning/code_findings.py` | on |
 | Lesson safety | Trace2Skill conflict check before a lesson is written; only verified lessons in prompt files | `learning/lesson_conflict.py`, `learning/prompt_directives.py` | on |
 | Apply loop | Candidate directive → frozen probes with a blind-rerun control arm → non-regression gate → versioned prompt edit with rollback | `cli/apply.py`, `learning/probe_scorer.py`, `registries/version_registry.py` | opt-in |
-| Measurement suite | Collapse detector (feeds the circuit breaker), calibration backtest, harness contrast, hack probe, metric anchor, active eval | `learning/collapse_detector.py`, `learning/calibration_backtest.py`, `learning/harness_contrast.py`, … | on / opt-in CLIs |
+| Measurement suite | Collapse detector (feeds the circuit breaker), calibration backtest, harness contrast, hack probe, `metric-anchor` CLI, active eval | `learning/collapse_detector.py`, `learning/calibration_backtest.py`, `learning/harness_contrast.py`, … | on / opt-in CLIs |
 | Self-improvement | `self-improve` outer loop; `rsi-technique-review`; `goal-loop`; GEPA adapters; TraceOtter export | `cli/self_improve.py`, recipes, `gepa/`, `cli/traceotter.py` | opt-in |
 
 ### E · Memory, context & the state spine
@@ -245,9 +245,9 @@ Status legend: **on** = runs by default · **opt-in** = needs a flag or command 
 |---|---|---|---|
 | Diagnosis | Typed layer (change / model / provider / environment / engine / kickoff / user) with cited evidence; model diagnoser for the unclassified | `recovery/diagnose.py`, `recovery/diagnoser_llm.py` | on |
 | Repair ladder | lane swap → infra → re-verify → prove → revise → escalate → human; ≤2 attempts, $10 | `recovery/auto_repair.py`, `recovery/retry_hint.py` | on |
-| Escalation | Engine fault → bug → framework-edit fix epic; frozen policy, daily cap, calibrated confidence bar | `recovery/escalation.py`, `recovery/escalation_policy.py`, `stores/diagnosis_ledger.py` | wired, never fired live |
+| Escalation | Engine fault → bug → framework-edit fix epic; frozen policy, daily cap, calibrated confidence bar | `recovery/escalation.py`, `recovery/escalation_policy.py`, `stores/diagnosis_ledger.py` | on; refusing correctly (no rule-detected engine fault yet) |
 | Supervisor | R1 revive · R2 label · R3 orphans · R4 supersede · R5 back-link · R6 apply graph patch · R7 close split | `recovery/supervisor.py`, `cli/supervise.py` | on (launchd, 5 min) |
-| Graph patches | Typed immutable edits (rerun, swap lane, insert, replace, replan, split) applied through `recover --workflow`, credited against a blind rerun | `recovery/graph_patch.py` | wired, no live patches |
+| Graph patches | Typed immutable edits (rerun, swap lane, insert, replace, replan, split) applied through `recover --workflow`, credited against a blind rerun | `recovery/graph_patch.py` | on (first live patches 2026-10-25) |
 | Recover / resume | Reuse finished nodes, rerun the failed one and its descendants, resume the agent session | `recovery/planner.py`, `recovery/resume_prep.py` | on |
 | Guards | Liveness circuit breaker (with collapse halt), frozen kernel, run reaper, watchdog | `recovery/circuit_breaker.py`, `vcs/repo_integrity_guard.py`, `orchestration/run_reaper.py` | on / reaper lazy / watchdog manual |
 | Observability | Node/run events, heartbeat, bug reports, usage report, automations (cron/launchd) | `observability/`, `automations.py` | on / opt-in |
@@ -274,8 +274,9 @@ Status legend: **on** = runs by default · **opt-in** = needs a flag or command 
 
 A recipe is three files — `task_class.yaml` (how it is recognized), `workflow.yaml`
 (nodes of 10 types: planner, researcher, transform, implementer, reviewer, verifier,
-eval, reflector, publisher, rollback; edges of 8 types incl. `retries` and
-`escalates_to`; optional `recursion:`), `artifact_contract.yaml` (what counts as
+eval, reflector, publisher, rollback; edges `depends_on`, `retries` and
+`escalates_to` — five older names are deprecated aliases of `depends_on`; optional
+`recursion:` with `max_iterations` and `budget_cap_total_usd`), `artifact_contract.yaml` (what counts as
 done, where it is published) — plus prompts, verifier scripts and probes.
 
 ---
@@ -326,28 +327,42 @@ done, where it is published) — plus prompts, verifier scripts and probes.
 
 ## 6. Greyed-out on the picture (wired but not live)
 
-Draw these with a dashed outline; they exist in code but do not affect runs today.
+On 2026-10-25 every item that used to be listed here was either removed or made
+live; the evidence and per-item decision are in
+[docs/plans/2026-10-25-ecosystem-section6.md](plans/2026-10-25-ecosystem-section6.md).
+In short:
 
-- **Learning that never closes:** `mini-ork eval` always reports a zero utility delta
-  (`cli/eval.py:296`), so improve → eval → promote can never promote; the apply loop
-  has no live promoted directive; learned routing decides 97 of ~11k routes.
-- **Measurements starved of data:** collapse history (2 rows), item-utility ranking
-  (0 rows), CoBa (2 of 20 needed samples), lesson conflicts (0), abstain/conformal
-  gates (no labelled verifier results), diagnosis ledger (0).
-- **Self-driving escalation:** fully wired, never fired on the live home; 24 fix epics
-  wait because no scheduler daemon runs.
-- **Decorative config:** per-node `gates:` in `workflow.yaml` are never read by the
-  executor; most `recursion:` keys are exported but unread; several edge types
-  collapse to `depends_on`.
-- **Dead code:** OTel/Langfuse export, the healer/cleaner/finalize chain, chat
-  integrations (Slack/Discord/Telegram), epic auto-merge/PR, `cache.py`, GEPA
-  (package not installed).
-- **Known sharp edges:** the cost pause records but does not halt; the ContextNest
-  outcome loop never matches an atom id (`cli/execute.py:392` vs `cn_client.py:890`);
-  three recipes declare the same task class `refactor_audit`; web stop/kill routes
-  take no token; publish happens before the post-run verify.
+- **Removed** (no reader, or could never act): `improve` / `eval` / `promote`,
+  `group_evolver`, the CoBa revise stop, the abstain and conformal gate
+  evaluators, the verifier audit's metric-anchor arm, per-node `gates:` and node
+  `max_cost_usd`, three unread `recursion:` keys, the healer / cleaner / finalize
+  chain, `cache.py`, epic auto-merge / PR, the in-process OTel buffer and the
+  Langfuse score mapper. Five edge types became deprecated aliases of
+  `depends_on`.
+- **Made live:** OTel / Langfuse export after every run (keys through the vault),
+  the chat transports (`mini-ork threads serve` and `POST /api/v1/chat/<transport>`
+  with a mandatory channel allowlist), declared recursion caps and budgets, and a
+  RouteMoA screen that reads each slice's own outcomes.
+- **Fixed:** the cost pause stops new dispatches and `resume` restarts the run;
+  ContextNest context the engine injects is persisted so outcomes are credited;
+  a verify that fails after publish marks the run `ESCALATE` with an inbox item;
+  web stop / kill / answers refuse a foreign `Origin`; `validate` checks the
+  workflow schema and task-class uniqueness; `epics archive` closes epics that
+  will never run.
 
----
+Still dashed, by design:
+
+- **Apply loop** (opt-in): its probe sets hold 2–3 probes, so a live sweep can
+  only quarantine; it goes live after the probe harvest (epic rsi-e2).
+- **Escalation** (on, refusing): no rule-detected engine fault yet; the model
+  diagnoser's engine calls sit below the 0.85 bar. Before it may act alone, the
+  files that feed its frozen policy should join the frozen kernel (epic rsi-e8).
+- **Supervisor epic dispatch (R8)** (opt-in): it starts paid runs; enable it with
+  an allow-list once rsi-e8 is scoped.
+- **Waiting for traffic:** collapse history (fed per promotion), lesson conflicts
+  (a guard on new lessons), the diagnosis ledger (writer fixed).
+- **Known gap found later:** `MINI_ORK_ON_EVENT` (`observability/emit_hook.py`) is
+  documented but nothing calls `mo_emit_hook`.
 
 ## 7. Drawing guide
 
