@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mini-ork/schemas/deployment.schema.json",
+  "title": "Deployment",
+  "description": "A long-lived service the node-agent must keep running: image, command, published ports, replicas, resources, restart policy, healthcheck, and the environment it needs. This is the public contract between the OSS node-agent (which executes it, POST /v1/services) and any control plane (which decides tenancy, routing, and billing). Env VALUES are carried in the request but never written to node state — only env_keys are persisted.",
+  "type": "object",
+  "required": ["schema_version", "service_id", "image"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "mini-ork.deployment/v1",
+      "description": "Contract version. Bump the major part on a breaking change."
+    },
+    "service_id": {
+      "type": "string",
+      "description": "Stable, DNS- and Docker-safe service identifier. The node derives container names as mo-svc-<service_id>-<replica>.",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"
+    },
+    "deployment_id": {
+      "type": "string",
+      "description": "Opaque id of the deployment attempt (commit sha or ULID). Stamped on every container label for rollback and log correlation.",
+      "maxLength": 128
+    },
+    "image": {
+      "type": "string",
+      "description": "Container image reference. Prefer an immutable digest (repo@sha256:...) in production; a tag is allowed for local use.",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "command": {
+      "type": "array",
+      "description": "Overrides the image ENTRYPOINT/CMD when present. Empty = use the image default.",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "replicas": {
+      "type": "integer",
+      "description": "Number of identical containers to run behind the service.",
+      "minimum": 1,
+      "maximum": 100,
+      "default": 1
+    },
+    "ports": {
+      "type": "array",
+      "description": "Ports exposed by the container. host is optional; when omitted the node publishes an ephemeral port.",
+      "items": {
+        "type": "object",
+        "required": ["container"],
+        "additionalProperties": false,
+        "properties": {
+          "container": { "type": "integer", "minimum": 1, "maximum": 65535 },
+          "host": { "type": "integer", "minimum": 1, "maximum": 65535 }
+        }
+      },
+      "default": []
+    },
+    "resources": {
+      "type": "object",
+      "description": "Hard limits. Absent = node default; never unbounded on a shared node.",
+      "additionalProperties": false,
+      "properties": {
+        "cpus": { "type": "number", "exclusiveMinimum": 0, "maximum": 128 },
+        "memory": {
+          "type": "string",
+          "description": "Docker memory syntax: 512m, 2g, 1073741824.",
+          "pattern": "^[0-9]+(b|k|m|g)?$"
+        }
+      }
+    },
+    "restart_policy": {
+      "enum": ["no", "on-failure", "always", "unless-stopped"],
+      "default": "unless-stopped",
+      "description": "unless-stopped is the platform default: a crashed service restarts, but an operator stop survives a daemon restart."
+    },
+    "healthcheck": {
+      "type": "object",
+      "description": "Container-level liveness probe. The node reports healthy/unhealthy; the control plane decides whether to route traffic or roll back.",
+      "required": ["cmd"],
+      "additionalProperties": false,
+      "properties": {
+        "cmd": { "type": "string", "minLength": 1 },
+        "interval": { "type": "string", "default": "10s" },
+        "timeout": { "type": "string", "default": "5s" },
+        "retries": { "type": "integer", "minimum": 1, "default": 3 },
+        "start_period": { "type": "string", "default": "0s" }
+      }
+    },
+    "env": {
+      "type": "object",
+      "description": "Non-secret configuration resolved by the caller. Values are passed to docker run and are NOT persisted to node state.",
+      "additionalProperties": { "type": "string" },
+      "default": {}
+    },
+    "env_keys": {
+      "type": "array",
+      "description": "Names the container needs. A value is taken from env, else from the node's own environment; the names (never the values) are persisted so a restart does not need the caller.",
+      "items": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+      "default": []
+    },
+    "network": {
+      "type": "string",
+      "description": "Container network to join. Services on the same network reach each other by container name; omit for the daemon default."
+    },
+    "user": {
+      "type": "string",
+      "description": "user[:group] or uid[:gid] the container runs as. The control plane is expected to require a non-root value."
+    },
+    "labels": {
+      "type": "object",
+      "description": "Extra labels stamped on the containers. mo.* keys are reserved by mini-ork and are ignored from this map.",
+      "additionalProperties": { "type": "string" },
+      "default": {}
+    },
+    "status": {
+      "type": "object",
+      "description": "Read-only, echoed by the node after create/restart/status. Never sent by the caller.",
+      "readOnly": true,
+      "additionalProperties": false,
+      "properties": {
+        "replicas_state": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["replica", "name", "state"],
+            "additionalProperties": false,
+            "properties": {
+              "replica": { "type": "integer", "minimum": 0 },
+              "name": { "type": "string" },
+              "cid": { "type": ["string", "null"] },
+              "state": {
+                "type": "string",
+                "enum": ["created", "running", "paused", "restarting", "exited", "dead", "missing", "unknown"]
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

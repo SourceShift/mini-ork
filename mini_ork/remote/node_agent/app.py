@@ -35,6 +35,7 @@ from .procs import (
     ProcSpec,
     _RC_TIMEOUT,
 )
+from .services import make_router as make_services_router
 from .sessions import SessionManager
 
 
@@ -503,6 +504,15 @@ def create_app(
         make_images_router(
             state_dir, bearer=bearer, _run_fn=_run_fn,
         )
+    )
+
+    # ---- services (app-runtime primitive; see docs/architecture/service-runtime.md)
+    #
+    # Long-lived, port-publishing, restarting containers — the mechanism a
+    # hosted deployment platform builds on. Mechanism only: tenancy, routing,
+    # and billing policy live in the closed control plane.
+    app.include_router(
+        make_services_router(state_dir, bearer=bearer, _run_fn=_run_fn)
     )
 
     return app

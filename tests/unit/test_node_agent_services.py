@@ -1,0 +1,277 @@
+"""Unit tests for the node-agent service runtime (``/v1/services``).
+
+Every Docker invocation flows through one fake runner, so the suite needs no
+daemon. The tests assert on the argv the fabric composes (labels, ports,
+restart policy, healthcheck, env) as well as the HTTP contract, because the
+argv *is* the product here: the control plane can only trust what the node
+actually ran.
+
+The last test is the security property the module exists to keep: env values
+cross into the container but never land in ``services.json``.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("fastapi.testclient")
+from fastapi.testclient import TestClient  # noqa: E402
+
+from mini_ork.remote.node_agent.app import create_app  # noqa: E402
+
+
+TOKEN_ENV = "MO_TEST_SERVICE_TOKEN"
+TOKEN_VALUE = "svc-token-abc"
+AUTH = {"Authorization": f"Bearer {TOKEN_VALUE}"}
+
+
+class _FakeCompleted:
+    returncode = 0
+    stdout = ""
+    stderr = ""
+
+
+class _Docker:
+    """Minimal docker CLI double with a state table keyed by container name."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+        self.states: dict[str, str] = {}
+        self.fail_on: str | None = None
+        self.removed: list[str] = []
+
+    def __call__(self, argv, **_kwargs):
+        argv = [str(a) for a in argv]
+        self.calls.append(argv)
+        r = _FakeCompleted()
+
+        if argv[:2] == ["docker", "run"]:
+            name = argv[argv.index("--name") + 1]
+            if self.fail_on and self.fail_on in name:
+                r.returncode = 125
+                r.stderr = "docker: image not found"
+                return r
+            self.states[name] = "running"
+            r.stdout = f"cid-{name}"
+            return r
+
+        if argv[:2] == ["docker", "inspect"]:
+            name = argv[-1]
+            if name in self.states:
+                r.stdout = self.states[name]
+            else:
+                r.returncode = 1
+                r.stderr = "Error: No such object"
+            return r
+
+        if argv[:2] == ["docker", "logs"]:
+            r.stdout = "listening on :8080\n"
+            return r
+
+        if argv[:2] == ["docker", "rm"]:
+            self.removed.append(argv[-1])
+            self.states.pop(argv[-1], None)
+            return r
+
+        if argv[:2] == ["docker", "restart"]:
+            self.states[argv[-1]] = "running"
+            return r
+
+        return r
+
+    def run_argv(self) -> list[list[str]]:
+        return [c for c in self.calls if c[:2] == ["docker", "run"]]
+
+
+@pytest.fixture()
+def docker(monkeypatch) -> _Docker:
+    monkeypatch.setenv(TOKEN_ENV, TOKEN_VALUE)
+    return _Docker()
+
+
+@pytest.fixture()
+def app(tmp_path: Path, docker: _Docker):
+    return create_app(state_dir=tmp_path, token_env=TOKEN_ENV, _run_fn=docker)
+
+
+@pytest.fixture()
+def client(app) -> TestClient:
+    return TestClient(app)
+
+
+def _spec(**overrides) -> dict:
+    payload = {
+        "schema_version": "mini-ork.deployment/v1",
+        "service_id": "web",
+        "deployment_id": "deploy-42",
+        "image": "ghcr.io/acme/web:1",
+        "command": ["uvicorn", "app:app", "--port", "8080"],
+        "replicas": 2,
+        "ports": [{"container": 8080}],
+        "resources": {"cpus": 0.5, "memory": "512m"},
+        "restart_policy": "unless-stopped",
+        "healthcheck": {"cmd": "curl -fsS localhost:8080/health", "interval": "10s"},
+        "env": {"DATABASE_URL": "postgres://secret@db/app"},
+        "env_keys": ["DATABASE_URL", "LOG_LEVEL"],
+        "labels": {"team": "core"},
+    }
+    payload.update(overrides)
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# create
+# ---------------------------------------------------------------------------
+
+
+def test_create_returns_one_container_per_replica(client, docker):
+    r = client.post("/v1/services", json=_spec(), headers=AUTH)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["service_id"] == "web"
+    assert body["replicas"] == 2
+    assert [rep["state"] for rep in body["replicas_state"]] == ["running", "running"]
+    assert len(docker.run_argv()) == 2
+
+
+def test_create_argv_carries_the_contract(client, docker):
+    r = client.post("/v1/services", json=_spec(), headers=AUTH)
+    assert r.status_code == 200, r.text
+    argv = docker.run_argv()[0]
+
+    assert "--label" in argv and "mo.service=web" in argv
+    assert "mo.deployment=deploy-42" in argv
+    assert "mo.sandbox=1" in argv
+    assert "team=core" in argv
+    assert argv[argv.index("--restart") + 1] == "unless-stopped"
+    assert "8080" in argv
+    assert argv[argv.index("--cpus") + 1] == "0.5"
+    assert argv[argv.index("--memory") + 1] == "512m"
+    assert argv[argv.index("--health-cmd") + 1] == "curl -fsS localhost:8080/health"
+    assert "--health-interval" in argv
+    # env value crosses into the container
+    assert "DATABASE_URL=postgres://secret@db/app" in argv
+    # command follows the image
+    image_at = argv.index("ghcr.io/acme/web:1")
+    assert argv[image_at + 1:] == ["uvicorn", "app:app", "--port", "8080"]
+
+
+def test_create_persists_keys_but_never_values(client, tmp_path):
+    r = client.post("/v1/services", json=_spec(), headers=AUTH)
+    assert r.status_code == 200, r.text
+    raw = (tmp_path / "services.json").read_text(encoding="utf-8")
+    data = json.loads(raw)
+    assert data["services"][0]["env_keys"] == ["DATABASE_URL", "LOG_LEVEL"]
+    assert "postgres://secret" not in raw
+    assert "secret@db" not in raw
+
+
+def test_create_rejects_bad_service_id(client):
+    r = client.post("/v1/services", json=_spec(service_id="Bad ID!"), headers=AUTH)
+    assert r.status_code == 400
+    assert "service_id" in r.json()["detail"]
+
+
+def test_create_rejects_unknown_restart_policy(client):
+    r = client.post("/v1/services", json=_spec(restart_policy="sometimes"), headers=AUTH)
+    assert r.status_code == 400
+
+
+def test_create_rejects_unknown_schema_version(client):
+    r = client.post("/v1/services", json=_spec(schema_version="v2"), headers=AUTH)
+    assert r.status_code == 400
+
+
+def test_create_rolls_back_partial_replica_set(client, docker, tmp_path):
+    docker.fail_on = "mo-svc-web-1"
+    r = client.post("/v1/services", json=_spec(), headers=AUTH)
+    assert r.status_code == 500
+    # replica 0 was removed on the failure path …
+    assert "cid-mo-svc-web-0" in docker.removed
+    # … and nothing was persisted, so a retry starts clean.
+    assert not (tmp_path / "services.json").exists()
+
+    r = client.get("/v1/services", headers=AUTH)
+    assert r.json() == {"services": []}
+
+
+def test_create_replaces_by_default(client, docker):
+    assert client.post("/v1/services", json=_spec(), headers=AUTH).status_code == 200
+    assert (
+        client.post("/v1/services", json=_spec(image="ghcr.io/acme/web:2"), headers=AUTH)
+        .status_code
+        == 200
+    )
+    assert len(docker.run_argv()) == 4  # 2 + 2
+    assert client.get("/v1/services", headers=AUTH).json()["services"][0]["image"].endswith(":2")
+
+
+# ---------------------------------------------------------------------------
+# read / restart / logs / delete
+# ---------------------------------------------------------------------------
+
+
+def test_list_and_get(client):
+    client.post("/v1/services", json=_spec(replicas=1), headers=AUTH)
+    listed = client.get("/v1/services", headers=AUTH).json()["services"]
+    assert [s["service_id"] for s in listed] == ["web"]
+
+    got = client.get("/v1/services/web", headers=AUTH)
+    assert got.status_code == 200
+    assert got.json()["image"] == "ghcr.io/acme/web:1"
+
+
+def test_get_unknown_is_404(client):
+    assert client.get("/v1/services/nope", headers=AUTH).status_code == 404
+
+
+def test_restart_hits_every_replica(client, docker):
+    client.post("/v1/services", json=_spec(), headers=AUTH)
+    r = client.post("/v1/services/web/restart", headers=AUTH)
+    assert r.status_code == 200
+    restarted = [c[-1] for c in docker.calls if c[:2] == ["docker", "restart"]]
+    assert sorted(restarted) == ["mo-svc-web-0", "mo-svc-web-1"]
+
+
+def test_restart_unknown_is_404(client):
+    assert client.post("/v1/services/web/restart", headers=AUTH).status_code == 404
+
+
+def test_logs_merge_replicas(client):
+    client.post("/v1/services", json=_spec(), headers=AUTH)
+    r = client.get("/v1/services/web/logs", params={"tail": 10}, headers=AUTH)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["service_id"] == "web"
+    assert "--- replica 0 ---" in body["logs"]
+    assert "--- replica 1 ---" in body["logs"]
+    assert "listening on :8080" in body["logs"]
+
+
+def test_logs_unknown_is_404(client):
+    assert client.get("/v1/services/web/logs", headers=AUTH).status_code == 404
+
+
+def test_delete_removes_containers_and_state(client, docker, tmp_path):
+    client.post("/v1/services", json=_spec(), headers=AUTH)
+    r = client.delete("/v1/services/web", headers=AUTH)
+    assert r.status_code == 200
+    assert {"cid-mo-svc-web-0", "cid-mo-svc-web-1"} <= set(docker.removed)
+    assert client.get("/v1/services/web", headers=AUTH).status_code == 404
+    assert json.loads((tmp_path / "services.json").read_text())["services"] == []
+
+
+def test_delete_unknown_is_404(client):
+    assert client.delete("/v1/services/web", headers=AUTH).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# auth
+# ---------------------------------------------------------------------------
+
+
+def test_services_require_bearer(client):
+    assert client.get("/v1/services").status_code == 401
+    assert client.post("/v1/services", json=_spec()).status_code == 401
