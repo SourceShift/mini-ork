@@ -27,6 +27,12 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 STATUSES: tuple[str, ...] = ("ok", "findings", "error", "timeout", "skipped")
 
+#: Prefix of a synthetic probe id: ``db:<RULE>`` re-runs one harvest rule against
+#: the cycle's DB and is ``ok`` only when the rule now reports nothing. Defined
+#: here, not in ``harvest``, so the probe factory below does not import the
+#: module that imports it.
+SYNTHETIC_PREFIX = "db:"
+
 #: How a probe's exit code is interpreted. ``rc != 0`` alone is ambiguous:
 #: pytest returns 5 for "no tests collected" (a broken selection, not a
 #: failure) while garden/validate return 1 *with* parseable findings.
@@ -424,6 +430,104 @@ def default_specs(
     return tuple(specs)
 
 
+def synthetic_spec(rule_id: str) -> ProbeSpec:
+    """The ``db:<RULE>`` success check for one harvest rule.
+
+    A candidate's ``success_command`` is either a real probe id or one of these.
+    The check re-runs the rule and passes only when it produces no candidate:
+    that is the *same* predicate the harvest used to find the gap, so a fix
+    "stays fixed" exactly when the gap stops firing.
+
+    An unknown rule id raises here rather than at run time — a candidate naming
+    a rule that does not exist has no success state at all, and the two places
+    that construct these (``select`` by validating the candidate, ``cycle`` by
+    running it) should both see the same failure.
+    """
+    from mini_ork.rsi.harvest import rule_ids  # local: harvest imports this module
+
+    if rule_id not in rule_ids():
+        raise LookupError(f"unknown harvest rule {rule_id!r}")
+
+    def _check() -> Mapping[str, Any]:
+        import os
+        import sqlite3
+
+        from mini_ork.rsi.harvest import run_rule
+
+        db = os.environ.get("MINI_ORK_DB")
+        if not db:
+            raise RuntimeError("MINI_ORK_DB is not set; a db: probe needs the cycle's DB")
+        root = os.environ.get("MINI_ORK_ROOT") or os.getcwd()
+        con = sqlite3.connect(db, timeout=5)
+        con.row_factory = sqlite3.Row
+        try:
+            remaining = run_rule(rule_id, root, con, now=int(time.time()))
+        finally:
+            con.close()
+        return {
+            "rule": rule_id,
+            "remaining": len(remaining),
+            # ``flags`` is the payload shape run_probe turns into findings; one
+            # flag per still-firing candidate keeps the probe's finding count
+            # equal to the gap count, which is what G8 compares.
+            "flags": [
+                {"level": "error", "message": f"{rule_id}: {cand.title}"}
+                for cand in remaining
+            ],
+        }
+
+    return ProbeSpec(
+        probe_id=f"{SYNTHETIC_PREFIX}{rule_id}",
+        description=f"harvest rule {rule_id} reports nothing",
+        fn=_check,
+        policy="ok_only",
+    )
+
+
+def run_synthetic(
+    rule_id: str,
+    *,
+    root: str | Path,
+    db: str | Path,
+    now: int,
+) -> ProbeResult:
+    """Run one ``db:<RULE>`` check against an explicit DB, without touching env.
+
+    ``synthetic_spec`` reads ``MINI_ORK_DB``/``MINI_ORK_ROOT`` because the probe
+    runner gives it no other channel. Tests and the cycle already hold both
+    values, so they use this instead of mutating process env.
+    """
+    import sqlite3
+
+    from mini_ork.rsi.harvest import run_rule
+
+    spec = synthetic_spec(rule_id)
+    started = time.monotonic()
+    try:
+        con = sqlite3.connect(str(db), timeout=5)
+        con.row_factory = sqlite3.Row
+        try:
+            remaining = run_rule(rule_id, root, con, now=int(now))
+        finally:
+            con.close()
+    except Exception as exc:  # noqa: BLE001 - a probe failure is a status
+        return ProbeResult(
+            probe_id=spec.probe_id, cmd=spec.cmd, status="error", rc=1,
+            duration_ms=int((time.monotonic() - started) * 1000),
+            payload={"error": f"{type(exc).__name__}: {exc}"},
+            stderr_digest=_digest(f"{type(exc).__name__}: {exc}"),
+        )
+    findings = tuple(
+        Finding(level="error", message=f"{rule_id}: {cand.title}") for cand in remaining
+    )
+    return ProbeResult(
+        probe_id=spec.probe_id, cmd=spec.cmd,
+        status="findings" if findings else "ok", rc=0,
+        duration_ms=int((time.monotonic() - started) * 1000),
+        findings=findings, payload={"rule": rule_id, "remaining": len(remaining)},
+    )
+
+
 __all__ = [
     "Finding",
     "PARSERS",
@@ -432,6 +536,7 @@ __all__ = [
     "ProbeSpec",
     "Runner",
     "STATUSES",
+    "SYNTHETIC_PREFIX",
     "default_specs",
     "normalize_message",
     "normalize_path",
@@ -440,5 +545,7 @@ __all__ = [
     "parse_validate",
     "run_probe",
     "run_probes",
+    "run_synthetic",
+    "synthetic_spec",
     "subprocess_runner",
 ]

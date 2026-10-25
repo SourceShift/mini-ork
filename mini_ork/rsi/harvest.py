@@ -33,11 +33,10 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from mini_ork.learning.collapse_detector import MIN_STEPS
 from mini_ork.rsi.candidates import Candidate, dedupe
-from mini_ork.rsi.probes import Finding, ProbeResult, normalize_path
+from mini_ork.rsi.probes import SYNTHETIC_PREFIX, Finding, ProbeResult, normalize_path
 
 #: Rule ids are the ``source`` suffix recorded in the ledger (``db:L4``).
 #: ``db:`` probes are synthetic: re-running the rule *is* the success check.
-SYNTHETIC_PREFIX = "db:"
 
 DEFAULT_CFG: Mapping[str, Any] = {
     "per_source_max": 3,     # garden/validate findings admitted per cycle
@@ -52,7 +51,24 @@ DEFAULT_CFG: Mapping[str, Any] = {
 
 
 class _SkipRule(Exception):
-    """The rule cannot answer on this database. Not a finding."""
+    """The rule cannot answer on this database. Not a finding.
+
+    Harvest and a *success check* mean opposite things by this, so the two are
+    separate classes: for harvest a skip is "nothing to report", but a check that
+    cannot read its evidence must fail closed rather than pass. ``run_rule``
+    turns this into a probe ``error`` and :class:`_GapClosed` into "no
+    candidates".
+    """
+
+
+class _GapClosed(_SkipRule):
+    """The rule answered, and the defect it looks for is not present.
+
+    Raised only after the rule has read its own tables/columns — the healthy
+    branch of the same predicate that would have produced a candidate. A success
+    check reads it as "fixed"; harvest, which subclasses this, still records a
+    plain skip.
+    """
 
 
 class _SchemaDrift(Exception):
@@ -349,11 +365,11 @@ def _l1_pass_stats_never_written(ctx: _Ctx, domain: str, rule_id: str) -> list[C
     """The table exists, is empty, and nothing calls its writer."""
     _require_table(ctx, "learning_pass_stats")
     if _scalar(ctx, "SELECT count(*) FROM learning_pass_stats"):
-        raise _SkipRule("learning_pass_stats has rows")
+        raise _GapClosed("learning_pass_stats has rows")
     callers = [(f, ln) for f, ln in _call_sites(ctx.root, "record_pass_stat")
                if f != "mini_ork/learning/ledger.py"]
     if callers:
-        raise _SkipRule(f"record_pass_stat is called at {callers[:3]}")
+        raise _GapClosed(f"record_pass_stat is called at {callers[:3]}")
     return [_cand(
         ctx, domain, rule_id,
         kind="producer_missing",
@@ -374,9 +390,9 @@ def _l2_reflection_log_never_written(ctx: _Ctx, domain: str, rule_id: str) -> li
     """Reflection queue table exists, is empty, and no code inserts into it."""
     _require_table(ctx, "reflection_log")
     if _scalar(ctx, "SELECT count(*) FROM reflection_log"):
-        raise _SkipRule("reflection_log has rows")
+        raise _GapClosed("reflection_log has rows")
     if _inserts_table(ctx.root, "reflection_log"):
-        raise _SkipRule("a writer for reflection_log exists")
+        raise _GapClosed("a writer for reflection_log exists")
     return [_cand(
         ctx, domain, rule_id,
         kind="producer_missing",
@@ -400,7 +416,7 @@ def _l3_held_out_never_populated(ctx: _Ctx, domain: str, rule_id: str) -> list[C
     _require_column(ctx, "lesson_injections", "held_out")
     held = _scalar(ctx, "SELECT count(*) FROM lesson_injections WHERE held_out=1")
     if held:
-        raise _SkipRule(f"{held} held-out injections exist")
+        raise _GapClosed(f"{held} held-out injections exist")
     return [_cand(
         ctx, domain, rule_id,
         kind="data_path_dead",
@@ -434,7 +450,7 @@ def _l4_malformed_timestamps(ctx: _Ctx, domain: str, rule_id: str) -> list[Candi
         raise _SkipRule("none of the timestamp tables exist")
     bad = sum(counts.values())
     if not bad:
-        raise _SkipRule("timestamps parse")
+        raise _GapClosed("timestamps parse")
     return [_cand(
         ctx, domain, rule_id,
         kind="temporal_corruption",
@@ -459,7 +475,7 @@ def _l5_promoted_to_never_set(ctx: _Ctx, domain: str, rule_id: str) -> list[Cand
         "SELECT count(*) FROM pattern_records",
     )
     if total == 0 or ratio <= ctx.num("null_ratio_high"):
-        raise _SkipRule(f"promoted_to null ratio {ratio:.2f}")
+        raise _GapClosed(f"promoted_to null ratio {ratio:.2f}")
     return [_cand(
         ctx, domain, rule_id,
         kind="data_path_dead",
@@ -484,7 +500,7 @@ def _l6_lesson_text_missing(ctx: _Ctx, domain: str, rule_id: str) -> list[Candid
         "SELECT count(*) FROM lesson_themes",
     )
     if total == 0 or ratio <= 0.8:
-        raise _SkipRule(f"lesson_text missing ratio {ratio:.2f}")
+        raise _GapClosed(f"lesson_text missing ratio {ratio:.2f}")
     return [_cand(
         ctx, domain, rule_id,
         kind="data_path_dead",
@@ -505,7 +521,7 @@ def _l7_collapse_history_under_min(ctx: _Ctx, domain: str, rule_id: str) -> list
     _require_table(ctx, "collapse_history")
     rows = _scalar(ctx, "SELECT count(*) FROM collapse_history")
     if rows >= MIN_STEPS:
-        raise _SkipRule(f"collapse_history has {rows} >= {MIN_STEPS} rows")
+        raise _GapClosed(f"collapse_history has {rows} >= {MIN_STEPS} rows")
     return [_cand(
         ctx, domain, rule_id,
         kind="coverage_gap",
@@ -531,14 +547,14 @@ def _l9_benchmark_delta_never_computed(ctx: _Ctx, domain: str, rule_id: str) -> 
         raise _SkipRule("learning_record is empty")
     with_delta = _scalar(ctx, "SELECT count(*) FROM learning_record WHERE benchmark_delta IS NOT NULL")
     if with_delta:
-        raise _SkipRule(f"{with_delta} records carry a benchmark delta")
+        raise _GapClosed(f"{with_delta} records carry a benchmark delta")
     # Parse every timestamp rather than MAX(): the ':fZ' corruption (L4) means
     # the text column cannot be trusted to sort.
     stamps = [ts for ts in (parse_ts(r[0]) for r in _rows(
         ctx, "SELECT created_at FROM learning_record")) if ts is not None]
     stale = _age_days(ctx.now, max(stamps) if stamps else None)
     if stale <= ctx.int("stale_days"):
-        raise _SkipRule(f"newest record is {stale}d old")
+        raise _GapClosed(f"newest record is {stale}d old")
     return [_cand(
         ctx, domain, rule_id,
         kind="data_path_dead",
@@ -561,7 +577,7 @@ def _l10_lesson_conflicts_never_found(ctx: _Ctx, domain: str, rule_id: str) -> l
     _require_table(ctx, "lesson_themes")
     conflicts = _scalar(ctx, "SELECT count(*) FROM lesson_conflicts")
     if conflicts:
-        raise _SkipRule(f"{conflicts} lesson conflicts recorded")
+        raise _GapClosed(f"{conflicts} lesson conflicts recorded")
     themes = _scalar(ctx, "SELECT count(*) FROM lesson_themes")
     if themes == 0:
         raise _SkipRule("no themes to conflict")
@@ -591,7 +607,7 @@ def _l11_diagnosis_unlabelled(ctx: _Ctx, domain: str, rule_id: str) -> list[Cand
     window = ctx.int("unlabelled_days")
     stale = [(rid, _age_days(ctx.now, ts)) for rid, ts in old if _age_days(ctx.now, ts) > window]
     if not stale:
-        raise _SkipRule(f"{len(rows)} unlabelled diagnoses, none older than {window}d")
+        raise _GapClosed(f"{len(rows)} unlabelled diagnoses, none older than {window}d")
     return [_cand(
         ctx, domain, rule_id,
         kind="stale_signal",
@@ -644,7 +660,7 @@ def _l12_verifier_pass_rate_regression(ctx: _Ctx, domain: str, rule_id: str) -> 
             success_metric="pass rate recovers to the older half's level",
         ))
     if not fired:
-        raise _SkipRule("no verifier shows a pass-rate drop")
+        raise _GapClosed("no verifier shows a pass-rate drop")
     return fired
 
 
@@ -659,7 +675,7 @@ def _r1_decide_without_segment(ctx: _Ctx, domain: str, rule_id: str) -> list[Can
         raise _SkipRule("no decide() call sites found")
     missing = [(f, ln) for f, ln, has in calls if not has]
     if not missing:
-        raise _SkipRule("every decide() call passes segment")
+        raise _GapClosed("every decide() call passes segment")
     return [_cand(
         ctx, domain, rule_id,
         kind="signal_not_propagated",
@@ -689,7 +705,7 @@ def _r2_learned_route_underused(ctx: _Ctx, domain: str, rule_id: str) -> list[Ca
     learned = _scalar(ctx, "SELECT count(*) FROM execution_traces WHERE route_source='learned'")
     share = learned / total
     if share >= 0.05:
-        raise _SkipRule(f"learned share {share:.1%}")
+        raise _GapClosed(f"learned share {share:.1%}")
     return [_cand(
         ctx, domain, rule_id,
         kind="unused_capability",
@@ -723,7 +739,7 @@ def _r3_code_region_null(ctx: _Ctx, domain: str, rule_id: str) -> list[Candidate
         "SELECT count(*) FROM execution_traces",
     )
     if total == 0 or ratio <= 0.5:
-        raise _SkipRule(f"code_region null ratio {ratio:.2f}")
+        raise _GapClosed(f"code_region null ratio {ratio:.2f}")
     ast_clean = all(entry[2] for entry in _decision_decide_calls(ctx.root))
     nulls = int(ratio * total)
     if not ast_clean:
@@ -764,7 +780,7 @@ def _r4_screened_out_dropped(ctx: _Ctx, domain: str, rule_id: str) -> list[Candi
     if not keys:
         raise _SkipRule("could not read decide()'s return shape")
     if "screened_out" in keys:
-        raise _SkipRule("decide() already returns screened_out")
+        raise _GapClosed("decide() already returns screened_out")
     return [_cand(
         ctx, domain, rule_id,
         kind="silent_swallow",
@@ -786,7 +802,7 @@ def _r5_brain_and_policy_decisions_empty(ctx: _Ctx, domain: str, rule_id: str) -
         raise _SkipRule(f"only {present} present")
     counts = {t: _scalar(ctx, f'SELECT count(*) FROM "{t}"') for t in present}
     if any(counts.values()):
-        raise _SkipRule(f"decision journals have rows: {counts}")
+        raise _GapClosed(f"decision journals have rows: {counts}")
     return [_cand(
         ctx, domain, rule_id,
         kind="producer_missing",
@@ -842,7 +858,7 @@ def _r6_stale_routing_signals(ctx: _Ctx, domain: str, rule_id: str) -> list[Cand
     if not seen_any:
         raise _SkipRule("no routing signal tables present")
     if not stale:
-        raise _SkipRule("routing signals are fresh")
+        raise _GapClosed("routing signals are fresh")
     return stale
 
 
@@ -856,7 +872,7 @@ def _r7_workflow_candidates_flat(ctx: _Ctx, domain: str, rule_id: str) -> list[C
         "SELECT count(*) FROM workflow_candidates",
     )
     if total == 0 or ratio <= 0.9:
-        raise _SkipRule(f"zero-delta ratio {ratio:.2f}")
+        raise _GapClosed(f"zero-delta ratio {ratio:.2f}")
     return [_cand(
         ctx, domain, rule_id,
         kind="unused_capability",
@@ -875,7 +891,7 @@ def _r7_workflow_candidates_flat(ctx: _Ctx, domain: str, rule_id: str) -> list[C
 def _r8_llm_calls_no_lane(ctx: _Ctx, domain: str, rule_id: str) -> list[Candidate]:
     """Cost rows cannot be attributed to a lane."""
     _require_column(ctx, "llm_calls", "lane")
-    raise _SkipRule("llm_calls has a lane column")
+    raise _GapClosed("llm_calls has a lane column")
 
 
 # --------------------------------------------------------------------------
@@ -891,7 +907,7 @@ def _v1_confidence_never_recorded(ctx: _Ctx, domain: str, rule_id: str) -> list[
         "SELECT count(*) FROM verifier_results",
     )
     if total <= 100 or ratio <= ctx.num("null_ratio_near_total"):
-        raise _SkipRule(f"confidence null ratio {ratio:.3f} over {total} rows")
+        raise _GapClosed(f"confidence null ratio {ratio:.3f} over {total} rows")
     return [_cand(
         ctx, domain, rule_id,
         kind="data_path_dead",
@@ -913,7 +929,7 @@ def _v2_rubrics_absent(ctx: _Ctx, domain: str, rule_id: str) -> list[Candidate]:
         raise _SkipRule("neither rubric table exists")
     counts = {t: _scalar(ctx, f'SELECT count(*) FROM "{t}"') for t in present}
     if any(counts.values()):
-        raise _SkipRule(f"rubrics exist: {counts}")
+        raise _GapClosed(f"rubrics exist: {counts}")
     return [_cand(
         ctx, domain, rule_id,
         kind="producer_missing",
@@ -939,7 +955,7 @@ def _v3_calibration_never_recorded(ctx: _Ctx, domain: str, rule_id: str) -> list
     fn = _scalar(ctx, "SELECT count(*) FROM verifier_results WHERE is_false_negative=1")
     repairs = _scalar(ctx, "SELECT count(*) FROM verifier_results WHERE repair_run_id IS NOT NULL")
     if fp or fn or repairs:
-        raise _SkipRule(f"calibration present: fp={fp} fn={fn} repairs={repairs}")
+        raise _GapClosed(f"calibration present: fp={fp} fn={fn} repairs={repairs}")
     return [_cand(
         ctx, domain, rule_id,
         kind="data_path_dead",
@@ -959,7 +975,7 @@ def _v4_defect_attribution_absent(ctx: _Ctx, domain: str, rule_id: str) -> list[
     _require_table(ctx, "defect_attributions")
     rows = _scalar(ctx, "SELECT count(*) FROM defect_attributions")
     if rows:
-        raise _SkipRule(f"{rows} attributions recorded")
+        raise _GapClosed(f"{rows} attributions recorded")
     return [_cand(
         ctx, domain, rule_id,
         kind="producer_missing",
@@ -981,7 +997,7 @@ def _v5_gauntlet_and_safety_absent(ctx: _Ctx, domain: str, rule_id: str) -> list
         raise _SkipRule("no gauntlet/safety tables exist")
     counts = {t: _scalar(ctx, f'SELECT count(*) FROM "{t}"') for t in present}
     if any(counts.values()):
-        raise _SkipRule(f"gauntlet evidence exists: {counts}")
+        raise _GapClosed(f"gauntlet evidence exists: {counts}")
     return [_cand(
         ctx, domain, rule_id,
         kind="coverage_gap",
@@ -1004,7 +1020,7 @@ def _v6_oversight_backlog(ctx: _Ctx, domain: str, rule_id: str) -> list[Candidat
         ctx, "SELECT enqueued_at FROM mo_inbox_gates WHERE status='pending'")) if ts is not None]
     oldest = max((_age_days(ctx.now, ts) for ts in stamps), default=0)
     if pending < ctx.int("inbox_pending_max") and oldest <= ctx.int("inbox_oldest_days"):
-        raise _SkipRule(f"{pending} pending, oldest {oldest}d")
+        raise _GapClosed(f"{pending} pending, oldest {oldest}d")
     return [_cand(
         ctx, domain, rule_id,
         kind="stale_signal",
@@ -1029,7 +1045,7 @@ def _v7_promotions_unbenchmarked(ctx: _Ctx, domain: str, rule_id: str) -> list[C
         "SELECT count(*) FROM promotion_records",
     )
     if total == 0 or ratio <= ctx.num("null_ratio_high"):
-        raise _SkipRule(f"benchmark_run_id null ratio {ratio:.2f}")
+        raise _GapClosed(f"benchmark_run_id null ratio {ratio:.2f}")
     return [_cand(
         ctx, domain, rule_id,
         kind="data_path_dead",
@@ -1056,7 +1072,7 @@ def _v8_level_vector_unstored(ctx: _Ctx, domain: str, rule_id: str) -> list[Cand
             stored = True
             break
     if stored:
-        raise _SkipRule("a table stores level vectors")
+        raise _GapClosed("a table stores level vectors")
     return [_cand(
         ctx, domain, rule_id,
         kind="coverage_gap",
@@ -1082,7 +1098,7 @@ def _v9_apply_stale(ctx: _Ctx, domain: str, rule_id: str) -> list[Candidate]:
         raise _SkipRule("no parseable apply timestamps")
     age = _age_days(ctx.now, max(stamps))
     if age <= ctx.int("stale_days"):
-        raise _SkipRule(f"newest apply is {age}d old")
+        raise _GapClosed(f"newest apply is {age}d old")
     return [_cand(
         ctx, domain, rule_id,
         kind="stale_signal",
@@ -1103,7 +1119,7 @@ def _v12_vacuous_verdicts(ctx: _Ctx, domain: str, rule_id: str) -> list[Candidat
     _require_column(ctx, "verifier_results", "verdict")
     rows = _scalar(ctx, "SELECT count(*) FROM verifier_results WHERE verdict='vacuous'")
     if rows == 0:
-        raise _SkipRule("no vacuous verdicts")
+        raise _GapClosed("no vacuous verdicts")
     total = _scalar(ctx, "SELECT count(*) FROM verifier_results")
     return [_cand(
         ctx, domain, rule_id,
@@ -1248,6 +1264,56 @@ def _headline(message: str, limit: int = 110) -> str:
 # Entrypoint
 # --------------------------------------------------------------------------
 
+_RULE_INDEX: dict[str, tuple[str, Rule]] = {
+    rule_id: (domain, rule)
+    for domain, rules in ALL_RULES
+    for rule_id, rule in rules
+}
+
+
+def rule_ids() -> tuple[str, ...]:
+    """Every registered rule id, in harvest order."""
+    return tuple(_RULE_INDEX)
+
+
+def run_rule(
+    rule_id: str,
+    root: str | Path,
+    con: sqlite3.Connection,
+    *,
+    now: int,
+    cfg: Mapping[str, Any] | None = None,
+) -> tuple[Candidate, ...]:
+    """Run ONE rule, for the synthetic ``db:<RULE>`` success check.
+
+    The mapping differs from :func:`harvest` on exactly one axis — what an
+    absence means:
+
+    * ``_GapClosed`` — the rule read its evidence and the defect is gone. That
+      is a fix: return no candidates.
+    * ``_SkipRule`` — the rule could not read its evidence (absent table, empty
+      input, no call sites). This must **not** be read as "fixed": G8 would then
+      merge a fix against a data path nobody checked. Raises, so the probe is an
+      ``error`` and the gate fails closed.
+    * ``_SchemaDrift`` — a present table lost a column. Also an error, and per
+      the plan drift is itself a bug.
+    """
+    entry = _RULE_INDEX.get(rule_id)
+    if entry is None:
+        raise LookupError(f"unknown harvest rule {rule_id!r}")
+    domain, rule = entry
+    ctx = _Ctx(root=Path(root), con=con, now=int(now),
+               cfg={**DEFAULT_CFG, **dict(cfg or {})})
+    try:
+        return tuple(rule(ctx, domain, rule_id))
+    except _GapClosed:
+        return ()
+    except _SkipRule as exc:
+        raise RuntimeError(f"rule {rule_id} cannot answer: {exc}") from exc
+    except _SchemaDrift as exc:
+        raise RuntimeError(f"rule {rule_id} schema drift: {exc}") from exc
+
+
 def harvest(
     root: str | Path,
     con: sqlite3.Connection,
@@ -1303,4 +1369,6 @@ __all__ = [
     "VERIFICATION_RULES",
     "harvest",
     "parse_ts",
+    "rule_ids",
+    "run_rule",
 ]

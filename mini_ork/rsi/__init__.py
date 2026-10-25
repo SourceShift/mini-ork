@@ -12,8 +12,11 @@ Layout (built incrementally; only the modules listed here exist today):
 ``harvest``     the live predicates: three domains, DB + AST + probe evidence.
 ``queue``       dedupe, avoid re-spending, seed every domain, rank into one queue.
 ``select``      the pre-dispatch filter and the kickoff writer (``rsi.select@v1``).
+``gates``       the eleven merge gates — judgement over evidence, running nothing.
+``worktree``    the git surface: claim, create, apply via ``land_patch``, merge,
+                quarantine, revert.
 
-Later steps add ``gates``, ``worktree`` and ``cycle``. Everything
-except the two model edges (SUGGEST, IMPLEMENT) is pure Python so the loop can
-be dry-run against a temp DB with no network.
+A later step adds ``cycle``, which joins them. Everything except the two model
+edges (SUGGEST, IMPLEMENT) is pure Python so the loop can be dry-run against a
+temp DB with no network.
 """
