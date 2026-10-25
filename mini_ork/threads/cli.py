@@ -37,6 +37,7 @@ Usage:
   mini-ork threads send <id> --text <t> [--title T] [--recipe R] ...
   mini-ork threads continue <id> --text <t> [--title T] [--recipe R] ...
   mini-ork threads attach <id> <path>... [--json]
+  mini-ork threads serve [--transport T] [--once]
 
 Verbs:
   list       threads, most recently touched first
@@ -46,6 +47,7 @@ Verbs:
   continue   start the next attempt, refusing while a run is live
   attach     copy local files onto the thread (one turn); the next send's run
              is told where they are. Starts nothing on its own
+  serve      run the chat simple tier from config/chat.yaml (telegram long-poll, slack socket mode); see docs/operator/chat.md
 
 Common options:
   --text -   read the message from stdin
@@ -109,6 +111,8 @@ def main(argv=None, *, root=None) -> int:  # noqa: ARG001 - root is the dispatch
         return _cmd_deliver(verb, rest)
     if verb == "attach":
         return _cmd_attach(rest)
+    if verb == "serve":
+        return _cmd_serve(rest)
     sys.stderr.write(f"threads: unknown verb {verb!r}\n\n{_USAGE}")
     return 2
 
@@ -282,6 +286,60 @@ def _cmd_attach(argv: list[str]) -> int:
         for item in stored:
             sys.stdout.write(f"attached: {item}\n")
     return 0
+
+
+def _cmd_serve(argv: list[str]) -> int:
+    """Run the chat simple tier from ``config/chat.yaml``.
+
+    Everything that can be refused is refused here, before the transport is
+    built — and the transport itself resolves every secret at construction — so
+    a misconfiguration never reaches the network and never becomes a retry loop
+    against a platform API.
+    """
+    parser = argparse.ArgumentParser(prog="mini-ork threads serve", add_help=False,
+                                     usage=argparse.SUPPRESS)
+    parser.add_argument("--transport", default=None,
+                        choices=("telegram", "slack", "discord"))
+    parser.add_argument("--once", action="store_true")
+    _common(parser)
+    args = parser.parse_args(argv)
+
+    home, db = _targets(args)
+
+    from mini_ork.integrations import serve as chat
+
+    try:
+        config = chat.load_chat_config(home)
+    except chat.ChatConfigError as exc:
+        sys.stderr.write(f"threads serve: {exc}\n")
+        return 2
+    if config is None:
+        sys.stderr.write(
+            f"threads serve: no chat config at {chat.config_path(home)} — copy "
+            "config/chat.example.yaml there and set transport, tier and "
+            "allow_channels\n"
+        )
+        return 2
+    if args.transport is not None and args.transport != config.transport:
+        sys.stderr.write(
+            f"threads serve: --transport {args.transport} does not match "
+            f"{config.path}, which selects transport: {config.transport}\n"
+        )
+        return 2
+    if config.tier == "secure":
+        sys.stderr.write(
+            f"threads serve: {config.path} selects tier: secure — that tier is "
+            f"the web route POST /api/v1/chat/{config.transport} under "
+            "`mini-ork serve`, not this loop\n"
+        )
+        return 2
+
+    try:
+        transport = chat.build_transport(config, home=home, db=db)
+    except chat.ChatConfigError as exc:
+        sys.stderr.write(f"threads serve: {exc}\n")
+        return 2
+    return chat.serve(transport, home=home, db=db, once=args.once)
 
 
 def _targets(args: argparse.Namespace) -> tuple[Path, str]:

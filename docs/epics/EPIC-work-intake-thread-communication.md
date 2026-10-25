@@ -171,7 +171,7 @@ Preview in-app, agent writes.
 
 ### 2.2 Stage 3 — communication
 
-Transports over the same Thread. Package **`mini_ork/integrations/`** — the Telegram transport landed in `bb258b91`; Slack and Discord are not built.
+Transports over the same Thread. Package **`mini_ork/integrations/`** — Telegram, Slack and Discord transports are built (both tiers each) and reachable via `mini-ork threads serve` (simple) and `POST /api/v1/chat/<transport>` (secure), selected by `config/chat.yaml` — see `docs/operator/chat.md`. Posting results back to the chat is not wired yet.
 
 - **Simple tier (no public URL):** Telegram long-poll (`getUpdates`), Slack Socket Mode
   (outbound websocket), Discord Gateway. Keeps the runtime dep list at two.

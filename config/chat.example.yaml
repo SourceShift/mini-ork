@@ -1,0 +1,30 @@
+# mini-ork chat intake — one config file selects the transport and the tier.
+#
+# Copy to $MINI_ORK_HOME/config/chat.yaml (or point $MINI_ORK_CHAT at it).
+# This file holds names only: a secret written here is refused (unknown key) —
+# secrets live in the vault, by key name, and are resolved by the transport.
+#
+# Entry points:
+#   simple tier:  mini-ork threads serve [--transport T] [--once]
+#   secure tier:  POST /api/v1/chat/<transport> under `mini-ork serve`
+#
+# Vault key names per transport and tier:
+#   telegram / simple:  TELEGRAM_BOT_TOKEN
+#   telegram / secure:  TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET
+#   slack    / simple:  SLACK_BOT_TOKEN, SLACK_APP_TOKEN
+#   slack    / secure:  SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET
+#   discord  / simple:  DISCORD_BOT_TOKEN
+#   discord  / secure:  DISCORD_BOT_TOKEN, DISCORD_PUBLIC_KEY
+#
+# allow_channels is mandatory: chat never accepts messages from everywhere.
+# A channel not listed here is reported `ignored` before any thread or run is
+# created. Telegram DM chat id is the user id (groups are negative); Slack ids
+# look like C…/D…; Discord is a channel snowflake.
+
+transport: telegram
+tier: simple
+allow_channels: ["123456789"]
+
+# Optional recipe override for every run this chat starts. Defaults to the
+# thread service's own DEFAULT_RECIPE when unset.
+# recipe: code-fix
