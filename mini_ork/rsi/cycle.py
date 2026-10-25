@@ -1373,21 +1373,62 @@ def _gap(req: CycleRequest, cand: Candidate, wt: Path) -> tuple[bool | None, boo
         return None, None
     try:
         before = _gap_at(req, cand, base)
-        after = _gap_at(req, cand, wt)
+        after = _gap_at(req, cand, wt, post=True)
     finally:
         _remove_detached(req, base)
     return before, after
 
 
-def _gap_at(req: CycleRequest, cand: Candidate, root: Path) -> bool | None:
+def _post_db(req: CycleRequest, root: Path) -> Path:
+    """The measured DB as the patch would leave it: its pending migrations applied.
+
+    G8 compares two *trees* against one *database*, so before this a ``db:<RULE>``
+    success command could never move: a schema fix (add a missing column, a new
+    attribution table) is exactly the kind of gap the DB rules report, and it
+    lands in ``db/migrations``. The baseline must stay writable by nobody — the
+    implementer's own run wrote the rows the previous G8 was measuring — so this
+    migrates a **copy** instead.
+
+    History still does not change: a data-ratio gap (``confidence IS NULL`` over
+    existing rows) cannot be flipped here, and ``metric_unchanged`` is then the
+    honest answer — that candidate needs a producer-side success metric, not a
+    looser gate.
+    """
+    src = _measured_db(req)
+    target = req.home / "rsi" / req.cycle_id / "gap-post.db"
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.unlink(missing_ok=True)
+        source = sqlite3.connect(f"{src.resolve().as_uri()}?mode=ro", uri=True, timeout=10)
+        try:
+            dest = sqlite3.connect(str(target))
+            try:
+                source.backup(dest)
+            finally:
+                dest.close()
+        finally:
+            source.close()
+        from mini_ork.stores import migrate
+
+        rc, _out = migrate.migrate_apply(str(Path(root) / "db" / "migrations"),
+                                         dry_run=False, db=str(target), root=str(root))
+        if rc != 0:
+            return src
+    except (OSError, sqlite3.Error):
+        return src
+    return target
+
+
+def _gap_at(req: CycleRequest, cand: Candidate, root: Path, *,
+            post: bool = False) -> bool | None:
     from .probes import SYNTHETIC_PREFIX, run_synthetic
 
     command = cand.success_command or ""
+    db = _post_db(req, root) if post else _measured_db(req)
     if command.startswith(SYNTHETIC_PREFIX):
         rule = command[len(SYNTHETIC_PREFIX):]
         try:
-            result = run_synthetic(rule, root=root, db=_measured_db(req),
-                                   now=int(time.time()))
+            result = run_synthetic(rule, root=root, db=db, now=int(time.time()))
         except Exception:  # noqa: BLE001 - "cannot measure" is None, not True
             return None
         return result.status == "findings"
@@ -1395,7 +1436,6 @@ def _gap_at(req: CycleRequest, cand: Candidate, root: Path) -> bool | None:
     # candidate. It is present when the probe still reports that signature.
     from . import probes as probe_mod
 
-    db = _measured_db(req)
     spec = {s.probe_id: s for s in probe_mod.default_specs(
         root=root, pytest_paths=req.config.probes.pytest_paths,
         timeout_s=req.config.probes.timeout_s, db=db)}.get(command)
@@ -1419,20 +1459,21 @@ def _probe_differential(req: CycleRequest, wt: Path) -> tuple[tuple, tuple, bool
         return (), (), False
     try:
         before = _probe_failures(req, base)
-        after = _probe_failures(req, wt)
+        after = _probe_failures(req, wt, post=True)
     finally:
         _remove_detached(req, base)
     return before, after, True
 
 
-def _probe_failures(req: CycleRequest, root: Path) -> tuple[str, ...]:
+def _probe_failures(req: CycleRequest, root: Path, *,
+                    post: bool = False) -> tuple[str, ...]:
     from . import probes as probe_mod
 
     # No ``pytest_paths`` on purpose: G9 compares cheap probe health at the two
     # trees, and G6 has already run the scoped tests once. ``verifier-audit``
-    # reads the DB, not the tree, so it is identical at both ends and drops out
-    # of the set difference — it costs one query, not a false failure.
-    db = _measured_db(req)
+    # reads the DB, not the tree; it is identical at both ends unless the patch
+    # ships a migration, which is exactly why the post side reads ``_post_db``.
+    db = _post_db(req, root) if post else _measured_db(req)
     specs = probe_mod.default_specs(
         root=root, pytest_paths=(), timeout_s=req.config.probes.timeout_s, db=db)
     results = probe_mod.run_probes(

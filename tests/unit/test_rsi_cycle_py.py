@@ -918,3 +918,93 @@ def test_a_missing_db_freezes_to_none(tmp_path):
                        cycle_id="rsi-absent")
 
     assert cycle_mod._freeze_db(req) is None
+
+
+def _seed_llm_calls_without_lane(db: Path) -> None:
+    """R8's shape: the table exists, the column that makes cost attributable does not."""
+    con = sqlite3.connect(str(db))
+    try:
+        con.executescript("CREATE TABLE llm_calls (id INTEGER);"
+                          "INSERT INTO llm_calls VALUES (1), (2);")
+        con.commit()
+    finally:
+        con.close()
+
+
+def _r8_candidate() -> Candidate:
+    return Candidate(
+        candidate_id="rsi-r8test", domain="routing", source="db:R8",
+        kind="signal_not_propagated", title="llm_calls records no lane",
+        detail="", severity=74,
+        files=("mini_ork/dispatch/telemetry.py", "mini_ork/dispatch/llm_dispatch.py"),
+        evidence={"table": "llm_calls", "column": "lane", "rows": 2},
+        fix_hint="", success_metric="llm_calls has a lane column",
+        success_command="db:R8",
+        evidence_key="table:llm_calls:lane:absent",
+        signature="sig-r8", first_seen_at=NOW)
+
+
+def _post_tree(root: Path, sql: str) -> Path:
+    """A tree whose only migration is the patch's."""
+    mig = root / "db" / "migrations"
+    mig.mkdir(parents=True, exist_ok=True)
+    (mig / "0099_add_lane.sql").write_text(sql, encoding="utf-8")
+    return root
+
+
+def test_g8_sees_the_schema_its_patch_adds(tmp_path):
+    """A missing column is fixed by a migration; measured on one DB it could not move.
+
+    Before the post-DB, ``db:R8`` was evaluated against the same frozen baseline on
+    both sides, so *every* DB-sourced candidate reported ``metric_unchanged`` and no
+    cycle could ever merge. The baseline stays the thing nobody writes; the post
+    side migrates a copy.
+    """
+    db = tmp_path / "state.db"
+    _seed_llm_calls_without_lane(db)
+    req = CycleRequest(root=tmp_path, db=db, config=_cfg(), cycle_id="rsi-ctest")
+    assert cycle_mod._freeze_db(req) is not None
+
+    post = _post_tree(tmp_path / "post", "ALTER TABLE llm_calls ADD COLUMN lane TEXT;")
+    cand = _r8_candidate()
+
+    assert cycle_mod._gap_at(req, cand, post) is True, "the baseline still has the gap"
+    assert cycle_mod._gap_at(req, cand, post, post=True) is False, (
+        "after the patch's migration the rule must stop firing")
+
+    # …and the copy is the only thing that moved.
+    con = sqlite3.connect(str(cycle_mod._measured_db(req)))
+    try:
+        columns = {row[1] for row in con.execute("PRAGMA table_info(llm_calls)")}
+    finally:
+        con.close()
+    assert "lane" not in columns
+
+
+def test_a_data_ratio_gap_stays_unchanged_after_the_post_migration(tmp_path):
+    """History is not a schema: a copy with new migrations still has the old rows.
+
+    The honest outcome for such a candidate is ``metric_unchanged`` — it needs a
+    producer-side success metric, not a looser gate.
+    """
+    db = tmp_path / "state.db"
+    _seed_l10_gap(db)
+    req = CycleRequest(root=tmp_path, db=db, config=_cfg(), cycle_id="rsi-ctest")
+    assert cycle_mod._freeze_db(req) is not None
+
+    post = _post_tree(tmp_path / "post", "CREATE TABLE unrelated (id INTEGER);")
+    cand = _l10_candidate()
+
+    assert cycle_mod._gap_at(req, cand, post, post=True) is True
+
+
+def test_the_post_db_falls_back_when_a_migration_fails(tmp_path):
+    """A patch whose migration does not apply must not be credited with a fix."""
+    db = tmp_path / "state.db"
+    _seed_llm_calls_without_lane(db)
+    req = CycleRequest(root=tmp_path, db=db, config=_cfg(), cycle_id="rsi-ctest")
+    assert cycle_mod._freeze_db(req) is not None
+
+    post = _post_tree(tmp_path / "post", "THIS IS NOT SQL;")
+    assert cycle_mod._post_db(req, post) == cycle_mod._measured_db(req)
+    assert cycle_mod._gap_at(req, _r8_candidate(), post, post=True) is True
