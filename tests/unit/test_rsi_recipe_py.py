@@ -651,6 +651,20 @@ def test_child_env_runs_the_engine_the_caller_names(tmp_path, monkeypatch):
     env = _child_env(_req(tmp_path), tmp_path / "child-home", root=worktree)
 
     assert env["MINI_ORK_ROOT"] == str(worktree)
+    # First in the launcher's lookup: left inherited, the child imports the
+    # primary package while its argv and cwd are the worktree.
+    assert env["MINI_ORK_ENGINE_ROOT"] == str(worktree)
+
+
+def test_child_env_drops_a_stale_target_repo(tmp_path, monkeypatch):
+    """An inherited target names the primary checkout from inside a worktree."""
+    monkeypatch.setenv("MINI_ORK_TARGET_REPO", str(tmp_path / "primary"))
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    env = _child_env(_req(tmp_path), tmp_path / "child-home", root=worktree)
+
+    assert "MINI_ORK_TARGET_REPO" not in env
 
 
 def test_the_implementer_child_runs_the_worktrees_engine(tmp_path, monkeypatch):

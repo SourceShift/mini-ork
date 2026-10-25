@@ -820,14 +820,26 @@ def _child_env(req: CycleRequest, home: Path, *, root: Path | None = None) -> di
     its own launcher — so leaving it alone sent the first child's whole run to
     the primary ``.mini-ork/runs`` while the cycle waited for artifacts under
     the child home (2026-10-25). The two names must never disagree.
+
+    ``MINI_ORK_ENGINE_ROOT`` is the third name for the same thing, and it is
+    first in the launcher's lookup: left inherited it makes the child import the
+    *primary* ``mini_ork`` while its argv and cwd are the worktree, so the
+    implementer would be running (and, via the inherited target, editing) code
+    that is not the tree under test. ``MINI_ORK_TARGET_REPO`` is the mirror
+    hazard — an inherited one names the primary checkout as the run's target
+    from inside a worktree — so it is dropped and the ladder falls back to the
+    child's cwd, which each caller already sets to ``root``.
     """
+    engine = str(root if root is not None else req.root)
     env = {
         **os.environ,
-        "MINI_ORK_ROOT": str(root if root is not None else req.root),
+        "MINI_ORK_ROOT": engine,
+        "MINI_ORK_ENGINE_ROOT": engine,
         "MINI_ORK_DB": str(req.db),
         "MINI_ORK_HOME": str(home),
         "MINI_ORK_PROJECT_HOME": str(home),
     }
+    env.pop("MINI_ORK_TARGET_REPO", None)
     store = Path(req.home) / "config" / "secrets.local.sh"
     if not os.environ.get("MINI_ORK_SECRETS") and store.is_file():
         env["MINI_ORK_SECRETS"] = str(store)
