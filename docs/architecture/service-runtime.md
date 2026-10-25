@@ -181,6 +181,71 @@ Lifecycle rules:
 - Renaming a volume starts a new empty one. The name *is* the identity.
 - A redeploy reuses the same directories, which is the entire point.
 
+## Snapshots — copying a volume
+
+The node can copy a volume and put it back:
+
+```
+POST   /v1/services/{sid}/volumes/{name}/snapshots
+GET    /v1/services/{sid}/volumes/{name}/snapshots
+DELETE /v1/services/{sid}/volumes/{name}/snapshots/{snap}
+POST   /v1/services/{sid}/volumes/{name}/restore   {"snapshot_id": "<32 hex>"}
+```
+
+A snapshot is a `tar.gz` of the volume's contents plus a JSON sidecar carrying
+the byte count and sha256. The node mints the id (`uuid4().hex`) and derives the
+path from identity, never from the request:
+
+```
+<snapshot_root>/<service_id>/<name>/<snapshot_id>.tar.gz
+<snapshot_root>/<service_id>/<name>/<snapshot_id>.json
+```
+
+```mermaid
+flowchart LR
+  V["volume dir<br/><volume_root>/web/data"] -->|"tar.gz"| S["snapshot<br/><snapshot_root>/web/data/<id>.tar.gz"]
+  S -->|"sidecar"| M["<id>.json<br/>bytes · sha256 · created_at"]
+  M -->|"control plane stores"| DB[("platform_volume_snapshots")]
+  S -->|"restore (atomic swap)"| V
+```
+
+The snapshot root follows the same two-tier rule as the volume root:
+
+| Tier | Root | Use |
+|---|---|---|
+| Simple | `<state_dir>/volume-snapshots` | a laptop — a copy beside the volume |
+| Secure | `MO_NODE_SNAPSHOT_ROOT` (absolute path) | a disk backed up independently of the volume disk |
+
+A relative `MO_NODE_SNAPSHOT_ROOT` refuses to start the node-agent, for the same
+reason a relative volume root does.
+
+Rules the node enforces, each because the alternative loses data quietly:
+
+- **An empty volume is a real snapshot.** "The volume was empty when I copied
+  it" is a fact worth keeping. Only a volume that was never materialized on this
+  node (no directory) is refused — that returns 404, because an empty archive
+  would restore to nothing and look like a successful backup.
+- **A snapshot of a running volume is crash-consistent.** The caller decides
+  whether that is good enough (a database wants a quiesced copy; a static site
+  does not).
+- **Restore is refused while any container holds the volume** (409). Only
+  `missing`, `exited`, and `dead` are safe; an unreadable Docker state counts as
+  holding. Replacing the directory under a live process is corruption, not
+  recovery.
+- **Restore swaps atomically.** Contents are extracted into a sibling staging
+  directory, the old directory is moved aside, the staged one is renamed into
+  place, and the old copy is only deleted after the swap succeeds. A failed
+  extraction leaves the volume exactly as it was.
+- **Restore accepts only the minted id shape.** The id is a path component, so
+  anything that is not 32 lowercase hex characters is refused before it can name
+  a file; archive members are extracted with the interpreter's `data` filter
+  (or an explicit regular-file/regular-directory allow-list on older runtimes).
+- **The sidecar is written after the archive is durable.** A crash between the
+  two leaves an archive that listing ignores and restore refuses — an invisible
+  snapshot, never a listed one that cannot be restored.
+- **Deleting a service keeps its snapshots.** Like the volume data, retention is
+  the platform's decision; the node only deletes when asked.
+
 ## What is deliberately absent
 
 These are the proprietary layer's job, and every one of them is policy:
@@ -190,9 +255,10 @@ These are the proprietary layer's job, and every one of them is policy:
 - Health-gated rollout, blue/green, and automatic rollback on `unhealthy`.
 - Metrics scraping (`docker stats`) → usage events → invoices.
 - Private networking between a tenant's services across nodes.
-- Volume **quotas, backups, snapshots, and restore**. `platform_volumes.size_mb`
-  is recorded but not enforced by the node; backup jobs and quota enforcement
-  are the control plane's, and a node that guessed at them would be wrong for
+- Volume **quotas, retention, and off-node backup**. Snapshots and restore are
+  mechanism and live here; *when* to take one, how long to keep it, and where it
+  is shipped afterwards are policy. `platform_volumes.size_mb` is recorded but
+  not enforced by the node; a node that guessed at retention would be wrong for
   every tenant at once.
 - Managed databases (a separate primitive built on volumes).
 - Idle detection, scale-to-zero, and cron-scheduled services.

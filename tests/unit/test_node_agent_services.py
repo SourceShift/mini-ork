@@ -418,3 +418,211 @@ def test_the_published_schema_rejects_the_same_shapes():
         [{"name": "data", "mount_path": "/data", "host": "/etc"}],
     ):
         assert list(validator.iter_errors(_spec(volumes=bad))), bad
+
+
+# ---------------------------------------------------------------------------
+# volume snapshots — the node copies, the control plane decides when
+# ---------------------------------------------------------------------------
+
+SNAPSHOT = "/v1/services/web/volumes/data/snapshots"
+
+
+def _create_with_volume(client) -> Path:
+    r = client.post(
+        "/v1/services",
+        json=_spec(volumes=[{"name": "data", "mount_path": "/data"}]),
+        headers=AUTH,
+    )
+    assert r.status_code == 200, r.text
+    return Path(client.app.state.state_dir) / "volumes" / "web" / "data"
+
+
+def _volume_dir(tmp_path: Path) -> Path:
+    return tmp_path / "volumes" / "web" / "data"
+
+
+def test_snapshot_writes_an_archive_and_its_metadata(client, tmp_path):
+    client.post(
+        "/v1/services",
+        json=_spec(volumes=[{"name": "data", "mount_path": "/data"}]),
+        headers=AUTH,
+    )
+    volume = _volume_dir(tmp_path)
+    (volume / "state.json").write_text('{"counter": 1}', encoding="utf-8")
+    (volume / "nested").mkdir()
+    (volume / "nested" / "blob.bin").write_bytes(b"\x00\x01" * 1024)
+
+    r = client.post(SNAPSHOT, headers=AUTH)
+    assert r.status_code == 200, r.text
+    meta = r.json()
+    assert len(meta["snapshot_id"]) == 32
+    assert meta["volume"] == "data"
+    assert meta["sha256"] and len(meta["sha256"]) == 64
+
+    archive = tmp_path / "volume-snapshots" / "web" / "data" / f"{meta['snapshot_id']}.tar.gz"
+    assert archive.is_file()
+    assert archive.stat().st_size == meta["bytes"]
+
+    # Metadata and archive agree: the size the control plane is about to store
+    # is the size of the file that exists, not of a directory estimate.
+    import hashlib
+
+    assert hashlib.sha256(archive.read_bytes()).hexdigest() == meta["sha256"]
+
+
+def test_snapshot_refuses_a_volume_that_never_existed(client):
+    r = client.post(SNAPSHOT, headers=AUTH)
+    assert r.status_code == 404
+    assert "no data on this node" in r.json()["detail"]
+
+
+def test_an_empty_volume_is_a_real_snapshot(client, tmp_path):
+    client.post(
+        "/v1/services",
+        json=_spec(volumes=[{"name": "data", "mount_path": "/data"}]),
+        headers=AUTH,
+    )
+    r = client.post(SNAPSHOT, headers=AUTH)
+    assert r.status_code == 200, r.text
+    assert r.json()["bytes"] > 0  # a valid empty tar.gz
+
+
+def test_list_is_newest_first_and_skips_unanchored_archives(client, tmp_path):
+    client.post(
+        "/v1/services",
+        json=_spec(volumes=[{"name": "data", "mount_path": "/data"}]),
+        headers=AUTH,
+    )
+    first = client.post(SNAPSHOT, headers=AUTH).json()["snapshot_id"]
+    second = client.post(SNAPSHOT, headers=AUTH).json()["snapshot_id"]
+    # A crash between archive and sidecar must not produce a listed snapshot
+    # that cannot be trusted; the orphan is invisible.
+    (tmp_path / "volume-snapshots" / "web" / "data" / f"{'f' * 32}.tar.gz").write_bytes(b"x")
+
+    r = client.get(SNAPSHOT, headers=AUTH)
+    assert r.status_code == 200
+    ids = [s["snapshot_id"] for s in r.json()["snapshots"]]
+    assert ids[:2] == [second, first]
+    assert "f" * 32 not in ids
+
+
+def test_restore_round_trips_the_volume(client, tmp_path):
+    client.post(
+        "/v1/services",
+        json=_spec(volumes=[{"name": "data", "mount_path": "/data"}]),
+        headers=AUTH,
+    )
+    volume = _volume_dir(tmp_path)
+    (volume / "keep.txt").write_text("before", encoding="utf-8")
+    snap = client.post(SNAPSHOT, headers=AUTH).json()["snapshot_id"]
+
+    (volume / "keep.txt").write_text("after", encoding="utf-8")
+    (volume / "dropped.txt").write_text("new", encoding="utf-8")
+
+    # A deleted service still owns its data; stopping is a deployment action,
+    # not a data-retention decision, so restore must work on its volumes.
+    assert client.delete("/v1/services/web", headers=AUTH).status_code == 200
+
+    r = client.post(
+        "/v1/services/web/volumes/data/restore",
+        json={"snapshot_id": snap},
+        headers=AUTH,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["restored"] is True
+    assert (volume / "keep.txt").read_text(encoding="utf-8") == "before"
+    assert not (volume / "dropped.txt").exists()
+
+
+def test_restore_is_refused_while_a_container_holds_the_volume(client, tmp_path):
+    client.post(
+        "/v1/services",
+        json=_spec(volumes=[{"name": "data", "mount_path": "/data"}]),
+        headers=AUTH,
+    )
+    volume = _volume_dir(tmp_path)
+    (volume / "keep.txt").write_text("before", encoding="utf-8")
+    snap = client.post(SNAPSHOT, headers=AUTH).json()["snapshot_id"]
+    (volume / "keep.txt").write_text("live", encoding="utf-8")
+
+    r = client.post(
+        "/v1/services/web/volumes/data/restore",
+        json={"snapshot_id": snap},
+        headers=AUTH,
+    )
+    assert r.status_code == 409
+    assert "hold the volume" in r.json()["detail"]
+    assert (volume / "keep.txt").read_text(encoding="utf-8") == "live"
+
+
+def test_restore_refuses_an_unknown_or_malformed_snapshot(client):
+    client.post(
+        "/v1/services",
+        json=_spec(volumes=[{"name": "data", "mount_path": "/data"}]),
+        headers=AUTH,
+    )
+    unknown = client.post(
+        "/v1/services/web/volumes/data/restore",
+        json={"snapshot_id": "0" * 32},
+        headers=AUTH,
+    )
+    assert unknown.status_code == 404
+
+    # The id is a path component; anything that is not the minted shape is
+    # refused before it can name a file.
+    traversal = client.post(
+        "/v1/services/web/volumes/data/restore",
+        json={"snapshot_id": "../../services"},
+        headers=AUTH,
+    )
+    assert traversal.status_code == 400
+    assert "32 lowercase hex" in traversal.json()["detail"]
+
+
+def test_delete_removes_the_snapshot_and_reports_a_second_delete(client, tmp_path):
+    client.post(
+        "/v1/services",
+        json=_spec(volumes=[{"name": "data", "mount_path": "/data"}]),
+        headers=AUTH,
+    )
+    snap = client.post(SNAPSHOT, headers=AUTH).json()["snapshot_id"]
+    assert client.delete(f"{SNAPSHOT}/{snap}", headers=AUTH).status_code == 200
+    assert client.get(SNAPSHOT, headers=AUTH).json()["count"] == 0
+    assert client.delete(f"{SNAPSHOT}/{snap}", headers=AUTH).status_code == 404
+
+
+def test_snapshot_root_env_is_the_secure_tier(tmp_path, monkeypatch, docker):
+    elsewhere = tmp_path / "backup-disk"
+    monkeypatch.setenv(TOKEN_ENV, TOKEN_VALUE)
+    monkeypatch.setenv("MO_NODE_SNAPSHOT_ROOT", str(elsewhere))
+    app = create_app(state_dir=tmp_path / "state", token_env=TOKEN_ENV, _run_fn=docker)
+    c = TestClient(app)
+    c.post(
+        "/v1/services",
+        json=_spec(volumes=[{"name": "data", "mount_path": "/data"}]),
+        headers=AUTH,
+    )
+    r = c.post(SNAPSHOT, headers=AUTH)
+    assert r.status_code == 200, r.text
+    assert (elsewhere / "web" / "data" / f"{r.json()['snapshot_id']}.tar.gz").is_file()
+    assert not (tmp_path / "state" / "volume-snapshots").exists()
+
+
+def test_a_relative_snapshot_root_refuses_to_start(tmp_path, monkeypatch, docker):
+    from mini_ork.remote.node_agent.services import ServiceError
+
+    monkeypatch.setenv(TOKEN_ENV, TOKEN_VALUE)
+    monkeypatch.setenv("MO_NODE_SNAPSHOT_ROOT", "backups")
+    with pytest.raises(ServiceError, match="MO_NODE_SNAPSHOT_ROOT.*absolute"):
+        create_app(state_dir=tmp_path, token_env=TOKEN_ENV, _run_fn=docker)
+
+
+def test_snapshot_routes_require_bearer(client):
+    for method, path in (
+        ("post", SNAPSHOT),
+        ("get", SNAPSHOT),
+        ("delete", f"{SNAPSHOT}/{'0' * 32}"),
+        ("post", "/v1/services/web/volumes/data/restore"),
+    ):
+        r = getattr(client, method)(path, **({"json": {"snapshot_id": "0" * 32}} if method == "post" else {}))
+        assert r.status_code in (401, 403), (method, path, r.status_code)

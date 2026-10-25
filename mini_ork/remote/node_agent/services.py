@@ -19,6 +19,10 @@ Contract (all routes are bearer-authed by the node-agent):
     DELETE /v1/services/{sid}        stop and remove every replica
     POST   /v1/services/{sid}/restart
     GET    /v1/services/{sid}/logs?tail=N
+    POST   /v1/services/{sid}/volumes/{name}/snapshots
+    GET    /v1/services/{sid}/volumes/{name}/snapshots
+    DELETE /v1/services/{sid}/volumes/{name}/snapshots/{snap}
+    POST   /v1/services/{sid}/volumes/{name}/restore
 
 Storage: ``<state_dir>/services.json``. Env **values** are never written to
 disk — only the key names. A create request carries the values in memory and
@@ -35,14 +39,32 @@ no amount of path cleaning makes that a safe interface. ``volume_root`` is
 and ``<state_dir>/volumes`` otherwise (the simple tier: a laptop). A relative
 env value raises rather than falling back — a volume that silently lands on the
 container's ephemeral layer is data loss the tenant only discovers on redeploy.
+
+**Snapshots** are the durable copy of a volume. The node writes a ``tar.gz``
+of the volume's contents under
+``<snapshot_root>/<service_id>/<name>/<snapshot_id>.tar.gz`` plus a JSON
+sidecar carrying the byte count and sha256; the control plane stores those
+facts and later asks the node to restore by id. The snapshot root follows the
+same two-tier rule as the volume root: ``MO_NODE_SNAPSHOT_ROOT`` when set (a
+backed-up disk, a mounted object-store gateway), otherwise
+``<state_dir>/volume-snapshots``. A snapshot of a running volume is
+crash-consistent — the caller decides whether that is good enough — but a
+restore is refused while any container still holds the volume, because
+replacing the directory under a live process corrupts state instead of
+recovering it.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import shutil
+import tarfile
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -77,9 +99,60 @@ _MOUNT_PATH_RE = re.compile(r"^(/(?!\.\.?(/|$))[^:\x00/]+)+$")
 #: Where a node keeps service volumes when the operator has not named a root.
 _VOLUME_ROOT_ENV = "MO_NODE_VOLUME_ROOT"
 
+#: Where a node keeps volume snapshots when the operator has not named a root.
+_SNAPSHOT_ROOT_ENV = "MO_NODE_SNAPSHOT_ROOT"
+
+#: Snapshot ids are minted by the node (``uuid4().hex``) and later received
+#: back on restore/delete. Held to the minted shape so a request cannot name a
+#: path component — the id is a leaf under a node-chosen directory.
+_SNAPSHOT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
 
 class ServiceError(ValueError):
     """A request the node refuses before it touches Docker."""
+
+
+def _utc_now() -> str:
+    """ISO-8601 UTC with a ``Z`` suffix (the wire style used elsewhere)."""
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _extract_safely(archive: Path, dest: Path) -> None:
+    """Extract a snapshot without letting a member escape ``dest``.
+
+    ``filter='data'`` (3.11.4+/3.12) is the interpreter's own allow-list: it
+    rejects absolute paths, ``..`` hops, device nodes, and setuid bits. Runtimes
+    without the filter fall back to an explicit allow-list of regular files and
+    directories, so an old node is stricter, never looser.
+    """
+    try:
+        with tarfile.open(archive, "r:gz") as tar:
+            tar.extractall(dest, filter="data")
+        return
+    except TypeError:
+        pass  # interpreter predates the `filter` argument
+    except tarfile.TarError as exc:
+        raise ServiceError(f"snapshot archive is unreadable: {exc}") from exc
+    with tarfile.open(archive, "r:gz") as tar:
+        for member in tar.getmembers():
+            parts = Path(member.name).parts
+            if member.name.startswith("/") or ".." in parts:
+                raise ServiceError(f"snapshot contains an unsafe path: {member.name!r}")
+            if not (member.isfile() or member.isdir()):
+                raise ServiceError(f"snapshot contains a non-regular entry: {member.name!r}")
+        tar.extractall(dest)
+
+
+class VolumeNotMaterializedError(ServiceError):
+    """The volume has no directory on this node, so there is nothing to copy."""
+
+
+class VolumeInUseError(ServiceError):
+    """A container still holds the volume; restoring under it would corrupt it."""
+
+
+class SnapshotNotFoundError(ServiceError):
+    """No snapshot with that id exists for this service and volume."""
 
 
 @dataclass
@@ -258,11 +331,13 @@ class ServiceManager:
         state_dir: Path,
         *,
         volume_root: Path | None = None,
+        snapshot_root: Path | None = None,
         _run_fn: Callable[..., Any] | None = None,
     ) -> None:
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.volume_root = self._resolve_volume_root(volume_root)
+        self.snapshot_root = self._resolve_snapshot_root(snapshot_root)
         self._path = self.state_dir / "services.json"
         self._run = _run_fn or default_run
         self._specs: dict[str, ServiceSpec] = {}
@@ -293,6 +368,28 @@ class ServiceManager:
                 )
             return root
         return self.state_dir / "volumes"
+
+    def _resolve_snapshot_root(self, explicit: Path | None) -> Path:
+        """Where snapshots live; same precedence and fail-closed rule as volumes.
+
+        The snapshot root is the second half of the durability story: on the
+        simple tier it sits beside the volume state on one laptop disk, and on
+        the secure tier ``MO_NODE_SNAPSHOT_ROOT`` points at a disk that is
+        backed up independently of the volume root. If the two roots are the
+        same disk, a backup is not a backup — the operator decides, and the
+        node records where each snapshot went rather than guessing.
+        """
+        if explicit is not None:
+            return Path(explicit)
+        raw = os.environ.get(_SNAPSHOT_ROOT_ENV)
+        if raw:
+            root = Path(raw)
+            if not root.is_absolute():
+                raise ServiceError(
+                    f"{_SNAPSHOT_ROOT_ENV} must be an absolute path, got {raw!r}"
+                )
+            return root
+        return self.state_dir / "volume-snapshots"
 
     def _load(self) -> None:
         if not self._path.is_file():
@@ -336,6 +433,205 @@ class ServiceManager:
         is the reason the wire carries a name rather than a path.
         """
         return str(self.volume_root / spec.service_id / volume_name)
+
+    # ---- volume snapshots ---------------------------------------------
+
+    def _volume_dir(self, service_id: str, volume_name: str) -> Path:
+        """Derive a volume's directory from names alone.
+
+        Deliberately does not require a live ``ServiceSpec``: a stopped service
+        still owns its data, and the data outlives a ``DELETE /v1/services`` by
+        design (retention is a platform decision). Both components are leaf
+        names under the node's roots, so the join cannot escape either root.
+        """
+        if not _SID_RE.match(service_id):
+            raise ServiceError(
+                f"service_id must match ^[a-z0-9][a-z0-9-]{{0,62}}$: {service_id!r}"
+            )
+        if not _VOLUME_NAME_RE.match(volume_name):
+            raise ServiceError(
+                f"volume name must match ^[a-z0-9][a-z0-9_-]{{0,62}}$: {volume_name!r}"
+            )
+        return self.volume_root / service_id / volume_name
+
+    def _snapshot_dir(self, service_id: str, volume_name: str) -> Path:
+        return self.snapshot_root / service_id / volume_name
+
+    @staticmethod
+    def _snapshot_id(raw: object) -> str:
+        value = str(raw or "")
+        if not _SNAPSHOT_ID_RE.match(value):
+            raise ServiceError(f"snapshot id must be 32 lowercase hex chars: {value!r}")
+        return value
+
+    def snapshot(self, service_id: str, volume_name: str) -> dict[str, Any]:
+        """Write a ``tar.gz`` of the volume and its metadata sidecar.
+
+        Refuses when the volume has never been materialized on this node (no
+        directory): an empty archive would look like a successful backup and
+        restore to nothing. An existing but empty directory *is* a real
+        snapshot — "the volume was empty when I copied it" is a fact worth
+        keeping.
+        """
+        source = self._volume_dir(service_id, volume_name)
+        if not source.is_dir():
+            raise VolumeNotMaterializedError(
+                f"volume {volume_name!r} of service {service_id!r} has no data on this node"
+            )
+
+        out_dir = self._snapshot_dir(service_id, volume_name)
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        except OSError as exc:
+            raise RuntimeError(f"could not create snapshot directory {out_dir}: {exc}") from exc
+
+        snapshot_id = uuid.uuid4().hex
+        archive = out_dir / f"{snapshot_id}.tar.gz"
+        tmp = out_dir / f".{snapshot_id}.tar.gz.tmp"
+        try:
+            with tarfile.open(tmp, "w:gz") as tar:
+                for child in sorted(source.iterdir()):
+                    tar.add(child, arcname=child.name, recursive=True)
+            digest = hashlib.sha256()
+            size = 0
+            with tmp.open("rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    digest.update(chunk)
+                    size += len(chunk)
+            os.replace(tmp, archive)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+        meta = {
+            "snapshot_id": snapshot_id,
+            "service_id": service_id,
+            "volume": volume_name,
+            "bytes": size,
+            "sha256": digest.hexdigest(),
+            "created_at": _utc_now(),
+        }
+        # The sidecar is written after the archive is durable. A crash between
+        # the two leaves an archive that listing ignores and restore refuses —
+        # an invisible snapshot, never a listed one that cannot be restored.
+        meta_tmp = out_dir / f".{snapshot_id}.json.tmp"
+        meta_tmp.write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(meta_tmp, out_dir / f"{snapshot_id}.json")
+        return meta
+
+    def list_snapshots(self, service_id: str, volume_name: str) -> list[dict[str, Any]]:
+        """Snapshots for one volume, newest first. Read exclusively from sidecars."""
+        self._volume_dir(service_id, volume_name)
+        out_dir = self._snapshot_dir(service_id, volume_name)
+        if not out_dir.is_dir():
+            return []
+        found: list[dict[str, Any]] = []
+        for meta_path in out_dir.glob("*.json"):
+            archive = meta_path.with_suffix(".tar.gz")
+            if not archive.is_file():
+                continue
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(meta, dict) and meta.get("snapshot_id"):
+                found.append(meta)
+        found.sort(key=lambda m: (str(m.get("created_at") or ""), str(m["snapshot_id"])), reverse=True)
+        return found
+
+    def restore(self, service_id: str, volume_name: str, snapshot_id: object) -> dict[str, Any]:
+        """Replace the volume's contents with a snapshot, atomically.
+
+        Refused while a container still holds the mount. The check fails
+        closed: a state this module cannot read is treated as holding the
+        volume, because the cost of a wrong restore is the tenant's data.
+        """
+        self._volume_dir(service_id, volume_name)
+        snap = self._snapshot_id(snapshot_id)
+        out_dir = self._snapshot_dir(service_id, volume_name)
+        archive = out_dir / f"{snap}.tar.gz"
+        meta_path = out_dir / f"{snap}.json"
+        if not archive.is_file() or not meta_path.is_file():
+            raise SnapshotNotFoundError(
+                f"no snapshot {snap!r} for volume {volume_name!r} of service {service_id!r}"
+            )
+        holders = self._volume_holders(service_id)
+        if holders:
+            raise VolumeInUseError(
+                "refusing to restore while containers hold the volume: "
+                + ", ".join(f"{name} ({state})" for name, state in holders)
+            )
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ServiceError(f"snapshot {snap!r} has unreadable metadata: {exc}") from exc
+
+        target = self.volume_root / service_id / volume_name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        stage = target.parent / f".{volume_name}.restore-{uuid.uuid4().hex}"
+        swapped = target.parent / f".{volume_name}.pre-restore-{uuid.uuid4().hex}"
+        stage.mkdir(parents=True, mode=0o700)
+        try:
+            _extract_safely(archive, stage)
+            if target.exists():
+                os.replace(target, swapped)
+            os.replace(stage, target)
+        except Exception:
+            # Put the old contents back if the swap did not complete, so a
+            # failed restore leaves the volume exactly as it was.
+            if swapped.exists() and not target.exists():
+                os.replace(swapped, target)
+            raise
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+            shutil.rmtree(swapped, ignore_errors=True)
+
+        restored = {
+            "restored": True,
+            "snapshot_id": snap,
+            "service_id": service_id,
+            "volume": volume_name,
+            "bytes": meta.get("bytes"),
+            "sha256": meta.get("sha256"),
+        }
+        return restored
+
+    def delete_snapshot(self, service_id: str, volume_name: str, snapshot_id: object) -> bool:
+        """Remove one snapshot. Reports whether it existed rather than guessing."""
+        self._volume_dir(service_id, volume_name)
+        snap = self._snapshot_id(snapshot_id)
+        out_dir = self._snapshot_dir(service_id, volume_name)
+        archive = out_dir / f"{snap}.tar.gz"
+        meta_path = out_dir / f"{snap}.json"
+        existed = archive.is_file() or meta_path.is_file()
+        archive.unlink(missing_ok=True)
+        meta_path.unlink(missing_ok=True)
+        try:
+            out_dir.rmdir()
+        except OSError:
+            pass
+        if not existed:
+            raise SnapshotNotFoundError(
+                f"no snapshot {snap!r} for volume {volume_name!r} of service {service_id!r}"
+            )
+        return True
+
+    def _volume_holders(self, service_id: str) -> list[tuple[str, str]]:
+        """Containers whose mounts still point at the volume.
+
+        Only *missing*, *exited* and *dead* are safe: every other Docker state
+        (created, restarting, running, paused, removing) either has the mount
+        live now or will shortly. An unreadable state counts as holding.
+        """
+        spec = self._specs.get(service_id)
+        if spec is None:
+            return []
+        holders: list[tuple[str, str]] = []
+        for replica in range(max(spec.replicas, 1)):
+            name = self._name(spec, replica)
+            state = self._replica_state(name)
+            if state not in ("missing", "exited", "dead"):
+                holders.append((name, state))
+        return holders
 
     def _prepare_volumes(self, spec: ServiceSpec) -> None:
         """Create each volume's host directory before Docker sees it.
@@ -550,6 +846,7 @@ def make_router(
     *,
     bearer: Callable,
     volume_root: Path | None = None,
+    snapshot_root: Path | None = None,
     _run_fn: Callable | None = None,
 ) -> APIRouter:
     """Build the FastAPI router exposing the ``/v1/services`` surface.
@@ -559,11 +856,17 @@ def make_router(
     ``dict`` with manual validation so a missing field is a 400 (not the 422
     FastAPI would infer from a Pydantic model).
 
-    ``volume_root`` is resolved when the manager is built — that is, at startup
-    — so a misconfigured ``MO_NODE_VOLUME_ROOT`` stops the node-agent from
-    serving rather than surfacing on the first deploy that needed a volume.
+    ``volume_root`` and ``snapshot_root`` are resolved when the manager is
+    built — that is, at startup — so a misconfigured ``MO_NODE_VOLUME_ROOT`` or
+    ``MO_NODE_SNAPSHOT_ROOT`` stops the node-agent from serving rather than
+    surfacing on the first deploy or backup that needed it.
     """
-    services = ServiceManager(state_dir, volume_root=volume_root, _run_fn=_run_fn)
+    services = ServiceManager(
+        state_dir,
+        volume_root=volume_root,
+        snapshot_root=snapshot_root,
+        _run_fn=_run_fn,
+    )
     router = APIRouter()
 
     @router.post("/v1/services")
@@ -607,7 +910,61 @@ def make_router(
         except KeyError as exc:
             raise HTTPException(404, f"unknown service {sid!r}") from exc
 
+    # ---- volume snapshots ---------------------------------------------
+
+    @router.post("/v1/services/{sid}/volumes/{name}/snapshots")
+    def post_volume_snapshot(sid: str, name: str, _: None = Depends(bearer)) -> dict:
+        try:
+            return services.snapshot(sid, name)
+        except VolumeNotMaterializedError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ServiceError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(500, str(exc)) from exc
+
+    @router.get("/v1/services/{sid}/volumes/{name}/snapshots")
+    def list_volume_snapshots(sid: str, name: str, _: None = Depends(bearer)) -> dict:
+        try:
+            snapshots = services.list_snapshots(sid, name)
+        except ServiceError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {"snapshots": snapshots, "count": len(snapshots)}
+
+    @router.delete("/v1/services/{sid}/volumes/{name}/snapshots/{snap}")
+    def delete_volume_snapshot(sid: str, name: str, snap: str,
+                               _: None = Depends(bearer)) -> dict:
+        try:
+            services.delete_snapshot(sid, name, snap)
+        except SnapshotNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ServiceError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {"deleted": snap}
+
+    @router.post("/v1/services/{sid}/volumes/{name}/restore")
+    def post_volume_restore(sid: str, name: str, payload: dict,
+                            _: None = Depends(bearer)) -> dict:
+        try:
+            return services.restore(sid, name, payload.get("snapshot_id"))
+        except SnapshotNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except VolumeInUseError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except ServiceError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(500, f"restore failed: {exc}") from exc
+
     return router
 
 
-__all__ = ["ServiceError", "ServiceManager", "ServiceSpec", "make_router"]
+__all__ = [
+    "ServiceError",
+    "ServiceManager",
+    "ServiceSpec",
+    "SnapshotNotFoundError",
+    "VolumeInUseError",
+    "VolumeNotMaterializedError",
+    "make_router",
+]
