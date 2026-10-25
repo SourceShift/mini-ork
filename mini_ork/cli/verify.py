@@ -246,6 +246,67 @@ def _safe_trace_write(payload: dict, db: str) -> None:
         pass
 
 
+def _parse_rows(results) -> list[dict]:
+    """Verifier result rows as dicts; a row that does not parse keeps its text."""
+    rows: list[dict] = []
+    for raw in results or []:
+        try:
+            row = json.loads(raw)
+        except (TypeError, ValueError):
+            row = None
+        rows.append(row if isinstance(row, dict) else {"raw": raw})
+    return rows
+
+
+def _record_post_run(*, trace_id: str, verdict: str, artifact_path: str,
+                     task_class: str, pass_count: int, fail_count: int,
+                     results, run_dir: str, db: str) -> None:
+    """Persist the post-run verify result and flag a failure after publish.
+
+    Observability only: a failure here must never change verify's verdict, its
+    stdout or its exit code, so every step is contained. The result file is the
+    run-local record of what the post-run verify measured; the flag escalates a
+    run that was already marked ``published`` rather than staying silent about a
+    failure discovered afterwards.
+    """
+    try:
+        rows = _parse_rows(results)
+        if run_dir and os.path.isdir(run_dir):
+            record = {
+                "trace_id": trace_id,
+                "verdict": verdict,
+                "artifact_path": artifact_path,
+                "task_class": task_class,
+                "pass_count": pass_count,
+                "fail_count": fail_count,
+                "results": rows,
+                "written_at": int(time.time()),
+            }
+            try:
+                with open(os.path.join(run_dir, "verify-result.json"), "w",
+                          encoding="utf-8") as fh:
+                    json.dump(record, fh, indent=2)
+            except OSError:
+                pass
+        if verdict in ("fail", "partial"):
+            try:
+                from mini_ork.verify import post_publish_flag
+
+                post_publish_flag.mark(
+                    db,
+                    os.environ.get("MINI_ORK_TASK_RUN_ID")
+                    or context_env("MINI_ORK_RUN_ID", ""),
+                    run_dir or "",
+                    verdict,
+                    trace_id=trace_id,
+                    failing=[r for r in rows if r.get("pass") is False],
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def _first_verifier_command(plan_path):
     """First command named in the plan's ``verifier_contract``, or ``""``."""
     if not plan_path or not os.path.isfile(plan_path):
@@ -569,20 +630,34 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
                           "mutation_report": mutation_report,
                           "workspace": (os.environ.get("MO_TARGET_CWD")
                                         or os.environ.get("MINI_ORK_TARGET_REPO") or ""),
+                          "run_dir": run_dir or "",
                           "cost_usd": 0.0})
         try:
             summary = gate_registry.gate_run_all(db, task_class, ctx, mini_ork_root=root)
             gate_failed = bool(summary.get("any_fail", True))
             unmeasured = [g.get("gate_id", "") for g in summary.get("gates", [])
                           if g.get("verdict") == "defer"]
+            failed_gates = sorted(g.get("gate_id", "") for g in summary.get("gates", [])
+                                  if g.get("verdict") == "fail")
         except Exception:
             # A broken registry must not red every run; the gates defer rather
             # than inventing a verdict either way.
             gate_failed = False
             unmeasured = []
+            failed_gates = []
         if gate_failed:
             gate_verdict = "fail"; fail_count += 1
-            results.append('{"verifier":"__gates__","pass":false,"evidence_path":"gate_registry"}')
+            if failed_gates:
+                # Name the gates that failed, so the post-run reader can tell a
+                # real gate failure from a verifier that broke on its own.
+                results.append(json.dumps({
+                    "verifier": "__gates__",
+                    "pass": False,
+                    "evidence_path": "gate_registry",
+                    "detail": "gate(s) failed: " + ", ".join(failed_gates),
+                }, separators=(",", ":")))
+            else:
+                results.append('{"verifier":"__gates__","pass":false,"evidence_path":"gate_registry"}')
         else:
             results.append('{"verifier":"__gates__","pass":true,"evidence_path":"gate_registry"}')
         if unmeasured:
@@ -655,6 +730,17 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
             payload["reward_direction"] = "higher_is_better"
         _safe_trace_write(trace_store.enrich_stage_trace(
             payload, node_type="verifier", verdict=verdict), db)
+        _record_post_run(
+            trace_id=trace_id,
+            verdict=verdict,
+            artifact_path=artifact_path,
+            task_class=task_class,
+            pass_count=pass_count,
+            fail_count=fail_count,
+            results=results,
+            run_dir=run_dir or "",
+            db=db,
+        )
     return 1 if verdict == "fail" else 0
 
 

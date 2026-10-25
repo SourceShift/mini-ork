@@ -61,8 +61,16 @@ _PATH_TOKEN = re.compile(
 
 #: `--junitxml=reports/out.xml` names where a result will be *written*, not a
 #: file that must already exist. Same for a `>` redirect target.
-_ASSIGN_FLAG = re.compile(r"-{1,2}[\w-]+=[\w./-]+")
-_REDIRECT = re.compile(r"\d?>\s*[\w./-]+")
+_ASSIGN_FLAG = re.compile(r"-{1,2}[\w-]+=[\"']?[\w./-]+")
+_REDIRECT = re.compile(r"\d?>>?\s*[\"']?[\w./-]+")
+
+#: `${NAME}` / `$NAME` in a verifier command. ``_expand_refs`` substitutes the
+#: ones it can resolve; the rest survive to be recognised as unreadable.
+_VAR_REF = re.compile(r"\$\{(\w+)\}|\$(\w+)")
+
+#: A word carrying a variable, placeholder, glob or brace is not a literal
+#: path: the rule cannot know which file it names, so it must not veto it.
+_UNRESOLVED_WORD = re.compile(r"\S*[$<>*?{}]\S*")
 
 
 def _git(workspace: str, args: list[str], *, timeout: int = 30):
@@ -169,7 +177,21 @@ def rule_patch_applies_cleanly(artifact_path: str, workspace: str) -> tuple[str,
 # ── rule 2: the paths the plan names exist ───────────────────────────────────
 
 
-def _command_paths(plan: dict) -> list[str]:
+def _expand_refs(text: str, env: dict) -> str:
+    """Substitute ``${NAME}`` / ``$NAME`` that resolve to a non-empty value.
+
+    A reference the environment cannot resolve is left byte-for-byte intact so
+    the unresolved-word scrub can recognise it as unreadable rather than the
+    rule treating the literal ``$NAME`` as a file that does not exist.
+    """
+    def repl(match: re.Match) -> str:
+        value = env.get(match.group(1) or match.group(2))
+        return value if value else match.group(0)
+
+    return _VAR_REF.sub(repl, text)
+
+
+def _command_paths(plan: dict, env: dict | None = None) -> list[str]:
     """Path-shaped tokens from the plan's verifier commands and verifier names."""
     commands: list[str] = []
     contract = plan.get("verifier_contract")
@@ -188,8 +210,11 @@ def _command_paths(plan: dict) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
     for command in commands:
-        # Drop where-outputs before looking for where-inputs.
-        scrubbed = _REDIRECT.sub(" ", _ASSIGN_FLAG.sub(" ", command))
+        # Resolve the variables we can, then drop where-outputs before looking
+        # for where-inputs, then drop the words we cannot read at all.
+        expanded = _expand_refs(command, env or {})
+        scrubbed = _REDIRECT.sub(" ", _ASSIGN_FLAG.sub(" ", expanded))
+        scrubbed = _UNRESOLVED_WORD.sub(" ", scrubbed)
         for token in _PATH_TOKEN.findall(scrubbed):
             if token not in seen:
                 seen.add(token)
@@ -197,10 +222,10 @@ def _command_paths(plan: dict) -> list[str]:
     return out
 
 
-def _resolve(token: str, workspace: str, root: str) -> bool:
+def _resolve(token: str, workspace: str, root: str, run_dir: str = "") -> bool:
     if os.path.isabs(token):
         return os.path.exists(token)
-    for base in (workspace, root):
+    for base in (workspace, root, run_dir):
         if base and os.path.exists(os.path.join(base, token)):
             return True
     return _resolves_via_the_verifier_dispatcher(token, root)
@@ -239,7 +264,7 @@ def _last_line(blob) -> str:
 
 
 def rule_named_test_path_exists(plan_path: str, workspace: str,
-                                root: str) -> tuple[str, str]:
+                                root: str, run_dir: str = "") -> tuple[str, str]:
     """Every path the plan's verifier names must exist where the verifier will run.
 
     A command naming a test file that is not in the target is a plan that cannot
@@ -261,12 +286,19 @@ def rule_named_test_path_exists(plan_path: str, workspace: str,
         return "defer", "plan is unreadable"
     if not isinstance(plan, dict):
         return "defer", "plan is not an object"
-    tokens = _command_paths(plan)
+    env = {k: v for k, v in os.environ.items() if v}
+    if root:
+        env["MINI_ORK_ROOT"] = root
+    if run_dir:
+        env["MINI_ORK_RUN_DIR"] = run_dir
+    if workspace:
+        env.setdefault("MO_TARGET_CWD", workspace)
+    tokens = _command_paths(plan, env)
     if not tokens:
         return "defer", "the plan's verifier names no path"
-    if not workspace and not root:
+    if not workspace and not root and not run_dir:
         return "defer", "no root to resolve the named paths against"
-    missing = [t for t in tokens if not _resolve(t, workspace, root)]
+    missing = [t for t in tokens if not _resolve(t, workspace, root, run_dir)]
     if missing:
         return "fail", "named path(s) absent: " + ", ".join(sorted(missing)[:5])
     return "pass", f"{len(tokens)} named path(s) resolved"
@@ -275,21 +307,21 @@ def rule_named_test_path_exists(plan_path: str, workspace: str,
 # ── aggregate ────────────────────────────────────────────────────────────────
 
 _RULES = (
-    # (name, callable(artifact_path, plan_path, workspace, root))
+    # (name, callable(artifact_path, plan_path, workspace, root, run_dir))
     ("patch_applies_cleanly",
-     lambda a, _p, w, _r: rule_patch_applies_cleanly(a, w)),
+     lambda a, _p, w, _r, _d: rule_patch_applies_cleanly(a, w)),
     ("named_test_path_exists",
-     lambda _a, p, w, r: rule_named_test_path_exists(p, w, r)),
+     lambda _a, p, w, r, d: rule_named_test_path_exists(p, w, r, run_dir=d)),
 )
 
 
 def run_rules(artifact_path: str, plan_path: str = "", workspace: str = "",
-              root: str = "") -> dict:
+              root: str = "", run_dir: str = "") -> dict:
     """Evaluate every rule, recording each verdict and why."""
     rules = []
     for name, fn in _RULES:
         try:
-            verdict, detail = fn(artifact_path, plan_path, workspace, root)
+            verdict, detail = fn(artifact_path, plan_path, workspace, root, run_dir)
         except Exception as exc:  # a rule that breaks is an unrun rule
             verdict, detail = "defer", f"rule error: {exc}"
         rules.append({"rule": name, "verdict": verdict, "detail": detail})
@@ -340,4 +372,5 @@ def evaluate(condition: str, context_json: str, db_path: str,
         str(ctx.get("plan_path") or ""),
         workspace,
         root,
+        run_dir=str(ctx.get("run_dir") or ""),
     ))
