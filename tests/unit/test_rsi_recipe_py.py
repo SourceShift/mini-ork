@@ -37,6 +37,7 @@ from mini_ork.rsi.cycle import (  # noqa: E402
     _child_env,
     _default_critics,
     _default_propose,
+    _dispatch_child,
     _recipe_critics,
     _recipe_propose,
     _run_recipe,
@@ -550,6 +551,38 @@ def test_run_recipe_hands_the_store_to_the_child(tmp_path, monkeypatch):
     assert seen["env"]["MINI_ORK_HOME"] == str(home)
     assert seen["env"]["MO_RSI_SUGGEST_BRIEF"].endswith("brief.json")
     assert run_dir == home / "runs" / "rsi-ctest-rsi-cycle"
+
+
+def test_child_env_runs_the_engine_the_caller_names(tmp_path, monkeypatch):
+    """A child that edits must run the tree it edits, not the primary checkout."""
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    env = _child_env(_req(tmp_path), tmp_path / "child-home", root=worktree)
+
+    assert env["MINI_ORK_ROOT"] == str(worktree)
+
+
+def test_the_implementer_child_runs_the_worktrees_engine(tmp_path, monkeypatch):
+    monkeypatch.delenv("MINI_ORK_SECRETS", raising=False)
+    req = _req(tmp_path)
+    wt = SimpleNamespace(path=tmp_path / "wt")
+    child_home = tmp_path / "rsi" / "rsi-ctest" / "child-home"
+    child_home.mkdir(parents=True)
+    seen: dict = {}
+
+    def _run(argv, **kwargs):
+        seen.update(argv=argv, cwd=kwargs["cwd"], env=kwargs["env"])
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cycle_mod.subprocess, "run", _run)
+
+    run_id, rc, _out = _dispatch_child(req, wt, "# kickoff\n", child_home)
+
+    assert (run_id, rc) == ("rsi-ctest-fe", 0)
+    assert seen["env"]["MINI_ORK_ROOT"] == str(wt.path)
+    assert seen["cwd"] == str(wt.path)
+    assert seen["argv"][2] == str(wt.path / "bin" / "mini-ork")
 
 
 # --------------------------------------------------------------------------

@@ -798,8 +798,13 @@ def _candidate_brief(cand: Candidate) -> dict[str, Any]:
     }
 
 
-def _child_env(req: CycleRequest, home: Path) -> dict[str, str]:
+def _child_env(req: CycleRequest, home: Path, *, root: Path | None = None) -> dict[str, str]:
     """The environment a dispatched run inherits, with its credentials reachable.
+
+    ``root`` is the engine the child runs — the worktree for the implementer, the
+    cycle's repo for a recipe panel. It defaults to the repo so a caller that is
+    not editing anything cannot accidentally point a child at the primary engine;
+    the one caller that *does* edit must pass its worktree explicitly.
 
     A run gets its own home — the runner rewrites ``agents.yaml`` there — but a
     fresh home resolves the secret store to ``<home>/config/secrets.local.sh``,
@@ -812,7 +817,7 @@ def _child_env(req: CycleRequest, home: Path) -> dict[str, str]:
     """
     env = {
         **os.environ,
-        "MINI_ORK_ROOT": str(req.root),
+        "MINI_ORK_ROOT": str(root if root is not None else req.root),
         "MINI_ORK_DB": str(req.db),
         "MINI_ORK_HOME": str(home),
     }
@@ -1012,7 +1017,7 @@ def _dispatch_child(req: CycleRequest, wt, kickoff: str, child_home: Path) -> tu
         "framework-edit", str(kickoff_path),
     ]
     env = {
-        **_child_env(req, child_home),
+        **_child_env(req, child_home, root=Path(wt.path)),
         "MINI_ORK_RUN_ID": run_id,
         "MO_ALLOW_FRAMEWORK_CWD": "1",
         "MO_RUNTIME_BACKEND": req.config.implement.runtime_backend,
