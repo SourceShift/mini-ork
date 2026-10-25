@@ -690,6 +690,30 @@ def main(argv: list[str] | None = None) -> int:
             # Author + verify lessons for supported themes, so the v1/v2 lesson
             # blocks get a producer (a candidate-only table renders nothing).
             promoted = themes.promote(db_path).get("promoted", 0)
+            # The conflict detector is wired onto the authoring path only, so
+            # the lessons that predate it were never examined against each
+            # other — two of them can contradict and nothing notices. One
+            # capped audit pass judges the live corpus through that same
+            # detector, so every relation it records is the detector's own
+            # evidence rather than a hand-written row. The import sits
+            # INSIDE this try: an ImportError must degrade to a stderr line,
+            # never crash reflect.
+            try:
+                from mini_ork.learning import lesson_conflict
+
+                if lesson_conflict.enabled():
+                    audit_report = lesson_conflict.audit_live_corpus(
+                        db_path,
+                        limit=lesson_conflict.audit_limit(),
+                        model=os.environ.get("MINI_ORK_INDUCE_MODEL") or gradient_model,
+                    )
+                    sys.stdout.write(
+                        f"  [lesson_conflict] audited {audit_report.get('audited', 0)}"
+                        f" lesson(s), {audit_report.get('recorded', 0)} relation(s)"
+                        " recorded\n"
+                    )
+            except Exception as exc:  # a side-channel must never crash reflect
+                sys.stderr.write(f"  [lesson_conflict] skipped: {exc}\n")
         except Exception as exc:  # a side-channel must never crash reflect
             sys.stderr.write(f"  [themes] skipped: {exc}\n")
             themes_report = None
