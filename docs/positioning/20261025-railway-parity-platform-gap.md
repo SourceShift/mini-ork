@@ -400,14 +400,20 @@ focused pair of engineers.
 | **R-23** | BYOC + dedicated nodes + region catalog | Enterprise deals | L | commercial |
 | **R-24** | Signed evidence bundle ("proof-carrying deploy") | The moat, made legible | M | OSS + commercial |
 
-**Shipped (2026-10-25): R-24, first half.** Attestia issues an Ed25519-signed
+**Shipped (2026-10-25): R-24.** Attestia issues an Ed25519-signed
 `attestia.evidence/v1` payload per `(service, commit)` — verifications, builds,
 deployments, `truncated` — deterministic so re-issuing is idempotent and the
 history is append-only; `attestia platform evidence-verify` checks it offline,
-optionally against a pinned key fingerprint. Still open: verification *levels*
-(which evidence a gate requires), and an attestation from the run itself so a
-verdict is tied to output the platform did not merely record. Design and known
-limits: `hosted-platform-mvp.md` §5 "Signed evidence bundles" (Attestia repo).
+optionally against a pinned key fingerprint. **Verification levels** shipped
+the same day (Attestia `0123`): every verdict records what the run actually did
+(1 tests, 2 + differential, 3 + independent panel) and every gated service a
+minimum, so the gate answers "how much was verified", not only "did it pass" —
+a pass one level short is `409 verification_level_insufficient`, and the level
+travels inside the signed bundle. Both columns default to 1, which is the
+pre-levels behaviour exactly. Still open: an attestation from the run itself so
+a verdict is tied to output the platform did not merely record. Design and
+known limits: `hosted-platform-mvp.md` §5 "Verification levels" and "Signed
+evidence bundles" (Attestia repo).
 
 ---
 
