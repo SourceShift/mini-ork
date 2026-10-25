@@ -1275,12 +1275,22 @@ def contextnest_atoms_md(
     if len(capsule) > min_chars and any(
         line.startswith("## ") for line in capsule.splitlines()
     ):
-        return (
+        text = (
             "--- ContextNest capsule (kind-ordered substrate digest) ---\n"
             f"{capsule}\n"
             "--- /ContextNest capsule ---\n"
         )
-    return client.render_atoms_md(client.retrieve(query, int(limit)), int(limit))
+    else:
+        text = client.render_atoms_md(client.retrieve(query, int(limit)), int(limit))
+    # Persist exactly what the engine injected so the run's settle can credit
+    # the atoms this prompt actually carried. Prefer the client's own hook
+    # (embedders can override it); fall back to the module helper.
+    persist = getattr(client, "persist_prefetch", None) or cn_client.persist_prefetch
+    try:
+        persist(text, "context")
+    except Exception:  # noqa: BLE001 — persistence must never break context assembly
+        pass
+    return text
 
 
 def contextnest_recent_sessions_md(

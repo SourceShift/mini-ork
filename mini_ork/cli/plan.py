@@ -721,10 +721,16 @@ def _contextnest_atoms_md(brief_path, limit=6) -> str:
         except ValueError:
             min_chars = 100
         if len(capsule) > min_chars and any(line.startswith("## ") for line in capsule.splitlines()):
-            return ("--- ContextNest capsule (kind-ordered substrate digest) ---\n"
+            text = ("--- ContextNest capsule (kind-ordered substrate digest) ---\n"
                     + capsule + "\n--- /ContextNest capsule ---\n")
-        query = _brief_query(brief_path)
-        return cn_client.render_atoms_md(cn_client.retrieve(query, limit), limit) if query else ""
+        else:
+            query = _brief_query(brief_path)
+            text = (cn_client.render_atoms_md(cn_client.retrieve(query, limit), limit)
+                    if query else "")
+        # Persist the exact planner block so the settle credits the atoms the
+        # planner was shown. Inside the try: a persist failure must not raise.
+        cn_client.persist_prefetch(text, "planner")
+        return text
     except Exception:
         return ""
 

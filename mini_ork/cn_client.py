@@ -358,6 +358,38 @@ def retrieve(query: str, limit: int = 8) -> str:
                       json.dumps({"query": query, "top_k": int(limit)}))
 
 
+def persist_prefetch(block: str, label: str) -> str | None:
+    """Append the injected CN block to ``$MINI_ORK_RUN_DIR/cn_prefetch/engine-<label>.md``.
+
+    The run's settle (``mini_ork.cli.execute._collect_cn_atom_ids``) scans
+    ``cn_prefetch/*.md`` for ``cn-<hex>`` ids, so persisting exactly the text
+    the engine put in the prompt is what lets a verdict credit the atoms the
+    run was actually shown — no extra retrieval, no invented ids.
+
+    Returns the file path on success, ``None`` when there is nothing to
+    persist (empty block), no run dir, or the run dir does not exist. Never
+    raises: any ``OSError`` returns ``None``.
+    """
+    if not block or not block.strip():
+        return None
+    run_dir = os.environ.get("MINI_ORK_RUN_DIR", "")
+    if not run_dir or not os.path.isdir(run_dir):
+        return None
+    safe_label = "".join(
+        char if (char.isascii() and (char.isalnum() or char in "_-")) else "_"
+        for char in label
+    )
+    prefetch_dir = os.path.join(run_dir, "cn_prefetch")
+    path = os.path.join(prefetch_dir, f"engine-{safe_label}.md")
+    try:
+        os.makedirs(prefetch_dir, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(block + "\n")
+    except OSError:
+        return None
+    return path
+
+
 def sessions_by_file(path: str) -> str:
     if _disabled() or not available():
         return "{}"
