@@ -82,6 +82,11 @@ class HarvestReport:
     harvest_ok: bool
     skipped: tuple[str, ...]
     errors: tuple[str, ...]
+    #: Rules that answered "the defect is not here" (``_GapClosed``). Distinct
+    #: from ``skipped`` — a closed rule *measured* the table and found it healthy,
+    #: so it is evidence for reconciliation, while a skipped rule could not read
+    #: its evidence at all.
+    closed: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -90,6 +95,7 @@ class HarvestReport:
             "harvest_ok": self.harvest_ok,
             "skipped": list(self.skipped),
             "errors": list(self.errors),
+            "closed": list(self.closed),
         }
 
     @classmethod
@@ -100,6 +106,7 @@ class HarvestReport:
             harvest_ok=bool(raw.get("harvest_ok", False)),
             skipped=tuple(raw.get("skipped") or ()),
             errors=tuple(raw.get("errors") or ()),
+            closed=tuple(raw.get("closed") or ()),
         )
 
 
@@ -1351,12 +1358,18 @@ def harvest(
     ctx = _Ctx(root=Path(root), con=con, now=int(now), cfg=merged)
     candidates: list[Candidate] = []
     skipped: list[str] = []
+    closed: list[str] = []
     errors: list[str] = []
 
     for domain, rules in ALL_RULES:
         for rule_id, rule in rules:
             try:
                 candidates.extend(rule(ctx, domain, rule_id))
+            except _GapClosed:
+                # Checked BEFORE _SkipRule: it subclasses it. A closed rule read
+                # its own tables and found them healthy, so reconciliation may
+                # trust its absence; a skipped rule could not read them at all.
+                closed.append(rule_id)
             except _SkipRule:
                 skipped.append(rule_id)
             except _SchemaDrift as exc:
@@ -1379,6 +1392,7 @@ def harvest(
         harvest_ok=probe_ok and not errors,
         skipped=tuple(skipped),
         errors=tuple(errors),
+        closed=tuple(closed),
     )
 
 

@@ -109,12 +109,14 @@ def _cand(**overrides) -> Candidate:
 
 
 def _report(cand: Candidate | None = None, *, ok: bool = True,
-            skipped: tuple[str, ...] = ()) -> HarvestReport:
+            skipped: tuple[str, ...] = (),
+            closed: tuple[str, ...] = ()) -> HarvestReport:
     return HarvestReport(
         candidates=() if cand is None else (cand,),
         probes=(),
         harvest_ok=ok,
         skipped=skipped,
+        closed=closed,
         errors=() if ok else ("garden",),
     )
 
@@ -641,6 +643,25 @@ def test_a_full_harvest_marks_a_vanished_candidate_fixed_externally(world):
     assert _candidate_row(world.db)["status"] == "open"
 
     h.runtime.harvest = lambda req, con, now, probes: _report(None)
+    h.run(cycle_id="rsi-ctest-2")
+    assert _candidate_row(world.db)["status"] == "fixed_externally"
+
+
+def test_a_closed_rule_still_reconciles(world):
+    """A rule that answered "not here" measured its tables; it is not a blind spot.
+
+    ``_GapClosed`` subclasses ``_SkipRule``, so before the split both landed in
+    ``skipped``. Every healthy harvest therefore skipped something, reconciliation
+    never ran, and no candidate could ever be marked ``fixed_externally`` — which
+    is exactly the state the plan's definition of done needs.
+    """
+    h = Harness(world)
+    h.runtime.propose = lambda req, cand: None  # leaves the row open
+    h.run(cycle_id="rsi-ctest-1")
+    assert _candidate_row(world.db)["status"] == "open"
+
+    h.runtime.harvest = lambda req, con, now, probes: _report(
+        None, closed=("L1", "L2", "L7"))
     h.run(cycle_id="rsi-ctest-2")
     assert _candidate_row(world.db)["status"] == "fixed_externally"
 

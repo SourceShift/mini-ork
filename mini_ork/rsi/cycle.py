@@ -332,9 +332,11 @@ def _body(req: CycleRequest, rt: Runtime, con, *, token: str, spend: float) -> C
                        detail="harvest did not complete: " + ", ".join(report.errors))
 
     # Reconciling "what we did not see" only means something when every rule
-    # ran. A skipped rule (an old home without that table) would otherwise mark
-    # its candidates fixed_externally — the loop would forget a real gap
-    # because this particular DB could not measure it.
+    # *could* answer. ``skipped`` is now exactly that set: a rule whose table is
+    # absent. A rule that ran and found its defect gone lands in ``closed``, not
+    # here — before 2026-10-25 the two shared one list (``_GapClosed`` subclasses
+    # ``_SkipRule``), so the first closed gap froze reconciliation for every
+    # candidate on the board and nothing was ever marked ``fixed_externally``.
     if not req.dry_run:
         _upsert(con, req, report, rt.clock())
         if report.harvest_ok and not report.skipped:

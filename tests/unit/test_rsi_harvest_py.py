@@ -100,7 +100,7 @@ def test_llm_calls_without_a_lane_column_is_a_routing_gap(tmp_path, con):
 
 def test_llm_calls_with_a_lane_column_is_healthy(tmp_path, con):
     ddl(con, "CREATE TABLE llm_calls (id INTEGER, lane TEXT)")
-    assert "R8" in report(tmp_path, con).skipped
+    assert "R8" in report(tmp_path, con).closed
 
 
 def test_a_crashing_rule_is_evidence_not_a_stop(tmp_path, con, monkeypatch):
@@ -139,23 +139,23 @@ def test_l1_fires_when_the_writer_has_no_external_caller(tmp_path, con):
     assert cand.evidence["external_call_sites"] == 0
 
 
-def test_l1_skips_when_a_caller_exists(tmp_path, con):
+def test_l1_closes_when_a_caller_exists(tmp_path, con):
     ddl(con, "CREATE TABLE learning_pass_stats (id INTEGER)")
     write(tmp_path, {"mini_ork/runner.py": "record_pass_stat(stage='reflect')\n"})
-    assert "L1" in report(tmp_path, con).skipped
+    assert "L1" in report(tmp_path, con).closed
 
 
-def test_l1_skips_when_rows_exist(tmp_path, con):
+def test_l1_closes_when_rows_exist(tmp_path, con):
     ddl(con, "CREATE TABLE learning_pass_stats (id INTEGER);"
               "INSERT INTO learning_pass_stats VALUES (1);")
-    assert "L1" in report(tmp_path, con).skipped
+    assert "L1" in report(tmp_path, con).closed
 
 
-def test_l2_fires_without_an_insert_and_skips_with_one(tmp_path, con):
+def test_l2_fires_without_an_insert_and_closes_with_one(tmp_path, con):
     ddl(con, "CREATE TABLE reflection_log (log_id TEXT)")
     assert one(report(tmp_path, con), "db:L2").kind == "producer_missing"
     write(tmp_path, {"mini_ork/reflect.py": "cur.execute('INSERT INTO reflection_log VALUES (1)')\n"})
-    assert "L2" in report(tmp_path, con).skipped
+    assert "L2" in report(tmp_path, con).closed
 
 
 def test_l3_fires_when_nothing_is_held_out(tmp_path, con):
@@ -197,7 +197,7 @@ def test_l5_does_not_fire_at_exactly_the_threshold(tmp_path, con):
     con.executemany("INSERT INTO pattern_records VALUES ('v2')", [()] * 1)
     con.commit()
     # 9/10 = 0.9 is not > 0.9.
-    assert "L5" in report(tmp_path, con).skipped
+    assert "L5" in report(tmp_path, con).closed
 
 
 def test_l6_fires_when_most_themes_carry_no_lesson_text(tmp_path, con):
@@ -208,14 +208,14 @@ def test_l6_fires_when_most_themes_carry_no_lesson_text(tmp_path, con):
     assert one(report(tmp_path, con), "db:L6").kind == "data_path_dead"
 
 
-def test_l7_fires_below_min_steps_and_skips_at_it(tmp_path, con):
+def test_l7_fires_below_min_steps_and_closes_at_it(tmp_path, con):
     ddl(con, "CREATE TABLE collapse_history (id INTEGER);"
               "INSERT INTO collapse_history VALUES (1),(2);")
     rep = report(tmp_path, con)
     assert one(rep, "db:L7").kind == "coverage_gap"
     con.executemany("INSERT INTO collapse_history VALUES (?)", [(3,), (4,)])
     con.commit()
-    assert "L7" in report(tmp_path, con).skipped
+    assert "L7" in report(tmp_path, con).closed
 
 
 def test_l9_fires_only_when_deltas_are_absent_and_the_table_is_stale(tmp_path, con):
@@ -226,7 +226,7 @@ def test_l9_fires_only_when_deltas_are_absent_and_the_table_is_stale(tmp_path, c
 
     con.execute("INSERT INTO learning_record VALUES (0.1, ?)", (NOW - 40 * DAY,))
     con.commit()
-    assert "L9" in report(tmp_path, con).skipped
+    assert "L9" in report(tmp_path, con).closed
 
 
 def test_l10_fires_when_conflicts_are_empty_but_themes_exist(tmp_path, con):
@@ -237,14 +237,14 @@ def test_l10_fires_when_conflicts_are_empty_but_themes_exist(tmp_path, con):
     """)
     assert one(report(tmp_path, con), "db:L10").evidence["themes"] == 3
     ddl(con, "INSERT INTO lesson_conflicts VALUES (1);")
-    assert "L10" in report(tmp_path, con).skipped
+    assert "L10" in report(tmp_path, con).closed
 
 
 def test_l11_fires_only_after_the_labelling_window(tmp_path, con):
     ddl(con, "CREATE TABLE diagnosis_ledger (id INTEGER, label TEXT, created_at INTEGER);")
     con.execute("INSERT INTO diagnosis_ledger VALUES (1, NULL, ?)", (NOW - 2 * DAY,))
     con.commit()
-    assert "L11" in report(tmp_path, con).skipped
+    assert "L11" in report(tmp_path, con).closed
 
     con.execute("INSERT INTO diagnosis_ledger VALUES (2, NULL, ?)", (NOW - 10 * DAY,))
     con.commit()
@@ -284,7 +284,7 @@ def test_l12_fires_on_a_pass_rate_drop(tmp_path, con):
 def test_l12_ignores_small_samples(tmp_path, con):
     ddl(con, VERIFIER_RESULTS_DDL)
     _seed_verifier_results(con, ["pass"] * 4 + ["fail"] * 4)
-    assert "L12" in report(tmp_path, con).skipped
+    assert "L12" in report(tmp_path, con).closed
 
 
 # --------------------------------------------------------------------------
@@ -323,9 +323,9 @@ def test_r1_fires_when_decide_is_called_without_segment(tmp_path, con):
     assert cand.evidence["call_sites"] == [{"file": "mini_ork/dispatch/routing.py", "line": 4}]
 
 
-def test_r1_skips_when_segment_is_passed(tmp_path, con):
+def test_r1_closes_when_segment_is_passed(tmp_path, con):
     write(tmp_path, {"mini_ork/dispatch/routing.py": ROUTING_WITH_SEGMENT})
-    assert "R1" in report(tmp_path, con).skipped
+    assert "R1" in report(tmp_path, con).closed
 
 
 def test_r3_merges_with_r1_when_both_describe_the_same_defect(tmp_path, con):
@@ -369,12 +369,12 @@ def test_r4_fires_when_screened_out_is_produced_but_not_returned(tmp_path, con):
     assert one(report(tmp_path, con), "db:R4").kind == "silent_swallow"
 
 
-def test_r4_skips_once_decide_returns_it(tmp_path, con):
+def test_r4_closes_once_decide_returns_it(tmp_path, con):
     write(tmp_path, {
         "mini_ork/lane_router.py": LANE_ROUTER_PRODUCES,
         "mini_ork/steering/decision_service.py": DECIDE_WITH_SCREENED,
     })
-    assert "R4" in report(tmp_path, con).skipped
+    assert "R4" in report(tmp_path, con).closed
 
 
 def test_r5_fires_only_when_both_journals_are_empty(tmp_path, con):
@@ -382,7 +382,7 @@ def test_r5_fires_only_when_both_journals_are_empty(tmp_path, con):
               "CREATE TABLE policy_decisions (decision_id TEXT);")
     assert one(report(tmp_path, con), "db:R5").kind == "producer_missing"
     ddl(con, "INSERT INTO policy_decisions VALUES ('d1');")
-    assert "R5" in report(tmp_path, con).skipped
+    assert "R5" in report(tmp_path, con).closed
 
 
 def test_r6_fires_on_a_stale_win_rate_table(tmp_path, con):
@@ -393,7 +393,7 @@ def test_r6_fires_on_a_stale_win_rate_table(tmp_path, con):
 
     con.execute("UPDATE prompt_win_rates SET last_updated = ?", (NOW - 2 * DAY,))
     con.commit()
-    assert "R6" in report(tmp_path, con).skipped
+    assert "R6" in report(tmp_path, con).closed
 
 
 def test_r7_threshold(tmp_path, con):
@@ -411,7 +411,7 @@ def test_v1_needs_a_large_enough_sample(tmp_path, con):
     ddl(con, "CREATE TABLE verifier_results (confidence REAL);")
     con.executemany("INSERT INTO verifier_results VALUES (NULL)", [()] * 50)
     con.commit()
-    assert "V1" in report(tmp_path, con).skipped
+    assert "V1" in report(tmp_path, con).closed
 
     con.executemany("INSERT INTO verifier_results VALUES (NULL)", [()] * 60)
     con.commit()
@@ -438,7 +438,7 @@ def test_v9_parses_temporally_and_does_not_fire_on_a_recent_apply(tmp_path, con)
     con.commit()
     # Lexicographic sorting would see a ':fZ' string as very "new"; parsing
     # says 12 days, which is inside the window. Either way: no candidate.
-    assert "V9" in report(tmp_path, con).skipped
+    assert "V9" in report(tmp_path, con).closed
 
 
 def test_v9_fires_when_apply_has_really_stopped(tmp_path, con):
@@ -558,3 +558,17 @@ def test_harvest_report_round_trips(tmp_path, con):
     again = HarvestReport.from_dict(original.to_dict())
     assert [c.candidate_id for c in again.candidates] == [c.candidate_id for c in original.candidates]
     assert again.skipped == original.skipped
+    assert again.closed == original.closed
+
+
+def test_a_closed_rule_and_a_skipped_rule_are_reported_apart(tmp_path, con):
+    """``closed`` answers "measured, healthy"; ``skipped`` answers "could not read".
+
+    Reconciliation may trust the first (the defect is gone) and must not trust the
+    second (the defect may be there, unreadable). One harvest exercises both.
+    """
+    ddl(con, "CREATE TABLE learning_pass_stats (id INTEGER);"
+              "INSERT INTO learning_pass_stats VALUES (1);")
+    rep = report(tmp_path, con)
+    assert "L1" in rep.closed and "L1" not in rep.skipped
+    assert "L3" in rep.skipped and "L3" not in rep.closed
