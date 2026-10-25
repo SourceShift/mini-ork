@@ -139,20 +139,6 @@ def _clean_hack_history() -> list[dict]:
     ]
 
 
-def _clean_metric_history() -> list[dict]:
-    """An anchor-disciplined metric: clean anchor, discriminating, full size."""
-    held_out = list("abcdefghij")  # exactly REFERENCE_SIZE = 10
-    rows: list[dict] = []
-    for i in range(6):
-        rows.append({
-            "gen": i,
-            "scored": [f"q{i}-a", f"q{i}-b"],
-            "held_out": held_out,
-            "agreements": [True, False, True, True, False, True],
-        })
-    return rows
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # (1) Hack-probe flag in seeded data → promotion quarantined with reason.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -216,14 +202,12 @@ def test_audit_clean_data_ok(db):
     no flag. ``audit()`` returns ``ok=True`` and ``flags==[]``."""
     _seed_workflow(db)
     result = va.audit(None, str(db),
-                      hack_history=_clean_hack_history(),
-                      metric_history=_clean_metric_history())
+                      hack_history=_clean_hack_history())
 
     assert result["ok"] is True
     assert result["flags"] == []
-    # Both detectors' reports are present in evidence.
+    # The detector's report is present in evidence.
     assert result["evidence"]["hack_probe"]["hacking"] is False
-    assert result["evidence"]["metric_anchor"]["intact"] is True
 
 
 def test_promotion_promoted_when_audit_clean(db):
@@ -257,13 +241,6 @@ def test_audit_no_history_no_flags(db):
     hp = result["evidence"]["hack_probe"]
     assert hp["n_generations"] == 0
     assert hp["hacking"] is False
-    # metric_anchor reports ``intact=None`` on empty history — an unaudited
-    # metric must never read as an intact one, but the audit treats ``None``
-    # as "no flag" (the undecided verdict is a fact about the metric, not a
-    # defect of the candidate's grader as a whole).
-    ma = result["evidence"]["metric_anchor"]
-    assert ma["n_generations"] == 0
-    assert ma["intact"] is None
     # The gate-fuzzer arm is skipped when no corpus/workdir is supplied —
     # Path B from the code-impact lens. A skipped arm is not a defect.
     assert "skipped" in result["evidence"]["gate_fuzzer"]
@@ -344,10 +321,9 @@ def test_audit_cannot_upgrade_rejected_to_promoted(db, monkeypatch):
     def _fake_flagged(*_args, **_kwargs):
         return {
             "ok": False,
-            "flags": ["hack_probe", "metric_anchor"],
+            "flags": ["hack_probe"],
             "evidence": {
                 "hack_probe": {"hacking": True},
-                "metric_anchor": {"intact": False},
             },
             "audit_version": va_mod.AUDIT_VERSION,
         }
@@ -367,7 +343,7 @@ def test_audit_cannot_upgrade_rejected_to_promoted(db, monkeypatch):
 # ─────────────────────────────────────────────────────────────────────────────
 # (5) Production DB-probe path: collapse_history seeds drive the audit.
 #     kickoff ``auto/rsi-i2-verifier-audit-repair.md`` §"Tests (add)" — these
-#     tests deliberately avoid the hack_history / metric_history kwargs so the
+#     tests deliberately avoid the hack_history kwargs so the
 #     DB-probe path is exercised end-to-end.
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -472,15 +448,7 @@ def test_audit_clean_collapse_history_no_flags(db):
     assert result["ok"] is True
     assert result["flags"] == []
     assert result["evidence"]["hack_probe"]["hacking"] is False
-    # metric_anchor: ``collapse_history`` rows carry no per-probe
-    # ``scored`` / ``held_out`` / ``agreements`` lists (the table stores
-    # per-decision fractions only), so the projection leaves those fields
-    # absent and the detector's anti-fabrication contract reports
-    # ``intact is None`` — an unaudited metric must never read as an
-    # intact one. ``n_with_anchor == 0`` is the honest measurement.
-    assert result["evidence"]["metric_anchor"]["n_with_anchor"] == 0
-    assert result["evidence"]["metric_anchor"]["intact"] is None
-    # The new ``collapse`` arm reads the same rows; healthy rows produce
+    # The ``collapse`` arm reads the same rows; healthy rows produce
     # ``recommendation="none"`` and contribute no flag.
     assert result["evidence"]["collapse"]["recommendation"] == "none"
 
@@ -536,20 +504,13 @@ def test_audit_flags_textbook_collapse_via_collapse_history(db):
 
     The kickoff's prior state returned ``ok=True, flags=[]`` because the
     audit never wired ``collapse_detector.detect``, so the breaker's
-    ``recommendation="halt"`` had no echo in the audit. ``metric_anchor``
-    also reported zero anchor measurements, but that is the detector's
-    anti-fabrication contract — ``collapse_history`` carries no per-probe
-    anchor lists, so it is preserved, not "fixed".
+    ``recommendation="halt"`` had no echo in the audit.
 
-    After the I2b fix the audit:
-      * keeps ``metric_anchor`` fail-open (``collapse_history`` carries no
-        per-probe anchor lists, so the anti-fabrication contract reports
-        ``intact is None`` / ``n_with_anchor == 0`` — no flag);
-      * runs ``collapse_detector.detect`` on the same rows and trips
-        ``recommendation == "halt"`` (half-split means: first-half
-        score mean = 0.52, second-half = 0.82 → score_rise = +0.30;
-        first-half anchor mean = 0.79, second-half = 0.39 → anchor_drop
-        = +0.40; divergence = ``score_rise > 0 and anchor_drop > 0``).
+    The I2b fix runs ``collapse_detector.detect`` on the same rows and trips
+    ``recommendation == "halt"`` (half-split means: first-half score mean =
+    0.52, second-half = 0.82 → score_rise = +0.30; first-half anchor mean =
+    0.79, second-half = 0.39 → anchor_drop = +0.40; divergence =
+    ``score_rise > 0 and anchor_drop > 0``).
     """
     _seed_workflow(db)
     _seed_collapse_history(
@@ -564,19 +525,9 @@ def test_audit_flags_textbook_collapse_via_collapse_history(db):
 
     assert result["ok"] is False
     # Membership-only assertion per the recipe contract — the kickoff's
-    # exact spec is ``"collapse" in flags``. ``metric_anchor`` may also
-    # flag (its ``intact`` verdict is whatever the detector's own math
-    # produces on the projected rows); the test deliberately does not
-    # require either way.
+    # exact spec is ``"collapse" in flags``.
     assert "collapse" in result["flags"]
-    # The metric_anchor row projection stays fail-open: ``collapse_history``
-    # stores per-decision fractions, not per-probe anchor lists, so the
-    # anti-fabrication contract reports ``intact is None`` and counts zero
-    # anchored rows. The collapse signal lives entirely in the ``collapse``
-    # arm below — never in a fabricated anchor.
-    assert result["evidence"]["metric_anchor"]["n_with_anchor"] == 0
-    assert result["evidence"]["metric_anchor"]["intact"] is None
-    # The new collapse detector arm ran and reported the textbook halt.
+    # The collapse detector arm ran and reported the textbook halt.
     assert result["evidence"]["collapse"]["recommendation"] == "halt"
     assert result["evidence"]["collapse"]["divergence"] is True
     # The score rises and the anchor falls — the half-split means carry
@@ -593,12 +544,9 @@ def test_audit_clean_10row_collapse_history_no_flags(db):
     second_mean(anchor)`` is negative). ``divergence`` requires BOTH,
     so ``recommendation="none"`` and no flag.
 
-    ``metric_anchor`` stays fail-open: ``collapse_history`` rows carry no
-    per-probe anchor lists, so the anti-fabrication contract reports
-    ``intact is None`` → no flag. ``hack_probe`` sees the visible score
-    and the visible rise (anchor → core_pass) both increasing, so
-    ``level_gap`` and ``stagnation`` see no divergence → ``hacking is
-    False`` → no flag.
+    ``hack_probe`` sees the visible score and the visible rise (anchor →
+    core_pass) both increasing, so ``level_gap`` and ``stagnation`` see no
+    divergence → ``hacking is False`` → no flag.
     """
     _seed_workflow(db)
     _seed_collapse_history(
@@ -612,11 +560,6 @@ def test_audit_clean_10row_collapse_history_no_flags(db):
     assert result["ok"] is True
     assert result["flags"] == []
     assert result["evidence"]["hack_probe"]["hacking"] is False
-    # metric_anchor: ``collapse_history`` carries no per-probe anchor
-    # lists, so the anti-fabrication contract keeps the arm fail-open —
-    # ``intact is None``, ``n_with_anchor == 0``, no flag.
-    assert result["evidence"]["metric_anchor"]["n_with_anchor"] == 0
-    assert result["evidence"]["metric_anchor"]["intact"] is None
     # collapse: anchor rising → anchor_drop < 0 → divergence False
     # → recommendation="none" (kickoff test #2).
     assert result["evidence"]["collapse"]["recommendation"] == "none"
@@ -629,11 +572,6 @@ def test_audit_fewer_than_min_steps_no_flags(db):
     ``collapse_detector.detect`` returns ``recommendation="none"`` on
     ``n < 4`` (``collapse_detector.py:71-84``) without computing any
     statistics — the arm is fail-open per detector by construction.
-
-    ``metric_anchor`` returns ``intact is None`` on
-    ``anchor["n"] < MIN_GENERATIONS = 4`` (``metric_anchor.py:207``) —
-    an unaudited metric must never read as intact, but the audit treats
-    ``None`` as no flag.
 
     ``hack_probe`` returns ``hacking is False`` on
     ``n < MIN_GENERATIONS = 4`` — no family-wise p, no decision.
@@ -652,7 +590,6 @@ def test_audit_fewer_than_min_steps_no_flags(db):
     assert result["ok"] is True
     assert result["flags"] == []
     assert result["evidence"]["hack_probe"]["hacking"] is False
-    assert result["evidence"]["metric_anchor"]["intact"] is None
     # Collapse detector: insufficient history, no statistics computed.
     assert result["evidence"]["collapse"]["recommendation"] == "none"
     assert result["evidence"]["collapse"]["reason"].startswith("insufficient")

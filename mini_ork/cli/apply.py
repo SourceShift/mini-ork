@@ -236,22 +236,40 @@ def _opt_float(value):
 # ─────────────────────────────────────────────────────────────────────────────
 # apply_pick_candidate
 # ─────────────────────────────────────────────────────────────────────────────
+_FAILED_SOURCE_EXCLUSION = """
+              AND {column} NOT IN (
+                  SELECT source_id FROM apply_attempts
+                  WHERE task_class = ? AND target_name = ?
+                    AND decision IN ('quarantined','rejected')
+                    AND source_id IS NOT NULL)"""
+
+
 def pick_candidate(task_class: str, target_kind: str, target_name: str,
-                   db: str | None = None) -> str:
+                   db: str | None = None, *, include_failed: bool = False) -> str:
     """Pick the highest-confidence source pattern for the tuple.
 
     Sources, in priority order: pattern_records (output_type='prompt_change',
     status='observed') → emergent_patterns (status='proposed') →
-    gradient_records (fallback). Returns a single JSON line, or "" when
-    nothing qualifies (bash echoes an empty line).
+    gradient_records (fallback). A source already decided
+    ``quarantined``/``rejected`` for the same ``(task_class, target_name)`` is
+    skipped, so the loop advances to the next source instead of re-picking a
+    dead one. ``include_failed`` disables that exclusion; ``apply_run`` uses it
+    only as a fallback so its unchanged ``_previously_failed`` defence can
+    record a rejection when every qualifying source is already dead.
+    Returns a single JSON line, or "" when nothing qualifies (bash echoes an
+    empty line).
     """
     ensure_tables(db)
     con = sqlite3.connect(_db_path(db))
     con.row_factory = sqlite3.Row
+    pattern_exclusion = ("" if include_failed
+                         else _FAILED_SOURCE_EXCLUSION.format(column="pattern_id"))
+    gradient_exclusion = ("" if include_failed
+                          else _FAILED_SOURCE_EXCLUSION.format(column="gradient_id"))
     try:
         # Priority 1: pattern_records. The real schema has no suggested_change
         # column — the proposed change text IS the `description` field.
-        row = con.execute("""
+        row = con.execute(f"""
             SELECT pattern_id AS id, description, frequency,
                    CAST(frequency AS REAL) /
                      NULLIF((SELECT MAX(frequency) FROM pattern_records
@@ -259,10 +277,13 @@ def pick_candidate(task_class: str, target_kind: str, target_name: str,
             FROM pattern_records
             WHERE output_type='prompt_change'
               AND status='observed'
-              AND (description LIKE ? OR description LIKE ?)
+              AND (description LIKE ? OR description LIKE ?){pattern_exclusion}
             ORDER BY frequency DESC, last_seen DESC
             LIMIT 1
-        """, (f"%{target_name}%", f"%{task_class}%")).fetchone()
+        """, ((f"%{target_name}%", f"%{task_class}%")
+              if include_failed else
+              (f"%{target_name}%", f"%{task_class}%",
+               task_class, target_name))).fetchone()
         if row is not None:
             return json.dumps({
                 "source_kind": "pattern_records",
@@ -273,16 +294,20 @@ def pick_candidate(task_class: str, target_kind: str, target_name: str,
             })
 
         # Priority 2: emergent_patterns. Column-of-record is cluster_label.
-        row = con.execute("""
+        row = con.execute(f"""
             SELECT pattern_id AS id, cluster_label, suggested_meta_adr, strength_score
             FROM emergent_patterns
             WHERE status='proposed'
               AND (cluster_label LIKE ? OR suggested_meta_adr LIKE ?
-                   OR cluster_label LIKE ? OR suggested_meta_adr LIKE ?)
+                   OR cluster_label LIKE ? OR suggested_meta_adr LIKE ?){pattern_exclusion}
             ORDER BY strength_score DESC, detected_at DESC
             LIMIT 1
-        """, (f"%{target_name}%", f"%{target_name}%",
-              f"%{task_class}%", f"%{task_class}%")).fetchone()
+        """, ((f"%{target_name}%", f"%{target_name}%",
+               f"%{task_class}%", f"%{task_class}%")
+              if include_failed else
+              (f"%{target_name}%", f"%{target_name}%",
+               f"%{task_class}%", f"%{task_class}%",
+               task_class, target_name))).fetchone()
         if row is not None:
             return json.dumps({
                 "source_kind": "emergent_patterns",
@@ -297,14 +322,16 @@ def pick_candidate(task_class: str, target_kind: str, target_name: str,
         # requested target_name exactly: without the filter, any gradient of
         # the task_class wins and a workflow.node.* directive could be
         # appended to an agent prompt file.
-        row = con.execute("""
+        row = con.execute(f"""
             SELECT gradient_id AS id, suggested_change, signal, confidence,
                    row_number() OVER (ORDER BY confidence DESC) AS rank
             FROM gradient_records
-            WHERE task_class=? AND target=?
+            WHERE task_class=? AND target=?{gradient_exclusion}
             ORDER BY confidence DESC
             LIMIT 1
-        """, (task_class, target_name)).fetchone()
+        """, ((task_class, target_name)
+              if include_failed else
+              (task_class, target_name, task_class, target_name))).fetchone()
         if row is not None:
             return json.dumps({
                 "source_kind": "gradient_records",
@@ -968,6 +995,46 @@ def record_promotion(candidate_id: str, utility_before, utility_after,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# apply_set_candidate_status
+# ─────────────────────────────────────────────────────────────────────────────
+_CANDIDATE_STATUS_BY_DECISION = {
+    "promoted": "promoted",
+    "quarantined": "quarantined",
+    # workflow_candidates' CHECK constraint has no 'rejected' value; the
+    # table's terminal equivalent is 'deprecated'.
+    "rejected": "deprecated",
+}
+
+
+def _set_candidate_status(candidate_id: str, decision: str,
+                          db: str | None = None) -> None:
+    """Set ``workflow_candidates.status`` from the gate's decision.
+
+    ``promotion_records`` holds the decision; this keeps the candidate row
+    from sitting at ``candidate`` forever. A decision outside the mapping
+    (``no_candidate``, ``pending_human_approval``, ``dry_run``) leaves the
+    status unchanged. A failed write is swallowed: the status is audit
+    bookkeeping and must never change the gate's decision.
+    """
+    status = _CANDIDATE_STATUS_BY_DECISION.get(decision)
+    if status is None:
+        return
+    try:
+        con = sqlite3.connect(_db_path(db))
+    except sqlite3.Error:
+        return
+    try:
+        con.execute(
+            "UPDATE workflow_candidates SET status=? WHERE candidate_id=?",
+            (status, candidate_id))
+        con.commit()
+    except sqlite3.Error:
+        pass
+    finally:
+        con.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # apply_run — top-level orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
 def _previously_failed(task_class: str, target_name: str, source_id: str,
@@ -1006,8 +1073,13 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
     dry_run = os.environ.get("MO_APPLY_DRY_RUN", "0")
     dry_flag = "1" if dry_run == "1" else "0"
 
-    # 1. Pick the source pattern.
+    # 1. Pick the source pattern. If nothing *fresh* qualifies, re-pick
+    #    including edit-memory-blocked sources so the unchanged
+    #    `_previously_failed` defence below records the rejection.
     picked = pick_candidate(task_class, target_kind, target_name, db=db)
+    if not picked or picked == "null":
+        picked = pick_candidate(task_class, target_kind, target_name, db=db,
+                                include_failed=True)
     if not picked or picked == "null":
         # bash lets this attempt_record's stdout (the attempt id) through —
         # only the normal path below is redirected to /dev/null.
@@ -1272,6 +1344,10 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
     promotion_id = record_promotion(
         candidate_id, utility_before, utility_after,
         gate_decision, gate_rationale, db=db)
+
+    # 5a. Candidate status follows the final gate decision, so the row does
+    #     not stay at 'candidate' after it has been decided.
+    _set_candidate_status(candidate_id, gate_decision, db=db)
 
     # 5b. collapse_history write (kickoff rule #2). The breaker's collapse
     #     signal reads collapse_history directly; without this write the halt

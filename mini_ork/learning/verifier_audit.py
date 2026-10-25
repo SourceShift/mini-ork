@@ -2,11 +2,10 @@
 
 Three shipped measurement modules each detect a way the grading signal lies:
 
-  * ``mini_ork.learning.hack_probe``    — H2 reward-hacking monitor
-                                          (arXiv 2609.04665)
-  * ``mini_ork.learning.metric_anchor`` — H5 anchor-discipline audit
-                                          (arXiv 2607.12790)
-  * ``mini_ork.gates.gate_fuzzer``      — G3 blind-spot / over-block fuzzing
+  * ``mini_ork.learning.hack_probe``        — H2 reward-hacking monitor
+                                              (arXiv 2609.04665)
+  * ``mini_ork.learning.collapse_detector`` — score/anchor divergence detector
+  * ``mini_ork.gates.gate_fuzzer``          — G3 blind-spot / over-block fuzzing
 
 This module is the *promotion precondition* that acts on them. It runs each
 detector in-process (reusing their public functions; never reimplementing
@@ -24,11 +23,11 @@ that contract on its caller side.
 History assembly is the open design question this module answers. None of
 the three detectors touches storage; each accepts a caller-assembled
 ``Sequence[Mapping]``. The audit honours the same discipline: when a caller
-passes a ``hack_history=`` / ``metric_history=`` argument, that history is
+passes a ``hack_history=`` / ``collapse_history=`` argument, that history is
 used verbatim; otherwise the audit probes the DB best-effort for a table
 whose columns project onto the detector shape, and logs every absence. No
 synthetic histories are ever fabricated — a missing row is missing, and a
-detector that reads ``[]`` returns ``hacking=False`` / ``intact=None``
+detector that reads ``[]`` returns ``hacking=False`` / ``recommendation="none"``
 which contributes zero flags.
 
 No DB writes, no lane, no network, no model. The module is hermetic by
@@ -153,34 +152,6 @@ def _project_hack_row(row: sqlite3.Row) -> dict:
     }
 
 
-def _project_metric_row(row: sqlite3.Row) -> dict:
-    """Project a ``collapse_history`` row onto the metric_anchor row shape.
-
-    Structural fail-open contract (metric_anchor.py:19-25): "an unaudited
-    metric must never read as an intact one". The detector needs per-probe
-    ``scored`` / ``held_out`` / ``agreements`` lists; ``collapse_history``
-    stores per-decision fractions and does NOT carry those lists. We pass
-    the row through anyway so the detector's own fall-through path runs
-    cleanly, but the absent lists mean:
-
-      * ``n_with_anchor = 0`` (no row has both ``scored`` and ``held_out``)
-      * ``intact = None`` (the ``anchor["n"] < MIN_GENERATIONS`` branch)
-      * ``undecided = ["no_anchor_measured"]``
-
-    → the metric_anchor arm contributes NO flag. This is the same
-    fail-open the audit honours for empty history; the detector's
-    anti-fabrication contract demands it. Synthesizing ``held_out`` from
-    ``anchor`` would be a fabrication (per metric_anchor.py:19-25) and
-    is explicitly forbidden here.
-    """
-    return {
-        "gen": row["step"],
-        "scored": None,
-        "held_out": None,
-        "agreements": [],
-    }
-
-
 def _read_hack_history(
     db_path: str, task_class: str | None = None,
 ) -> list[dict]:
@@ -199,25 +170,6 @@ def _read_hack_history(
     ]
 
 
-def _read_metric_history(
-    db_path: str, task_class: str | None = None,
-) -> list[dict]:
-    """Read metric-anchor-shaped rows from ``collapse_history`` (migration 0060).
-
-    Per the structural fail-open contract documented on ``_project_metric_row``,
-    every row from ``collapse_history`` is projected to a row whose
-    ``scored`` / ``held_out`` / ``agreements`` are absent, so the metric_anchor
-    detector reports ``intact=None`` and contributes no flag. The arm is
-    wired end-to-end so future schema additions to ``collapse_history``
-    (e.g. per-probe ``held_out`` columns) can land without changing the
-    audit's public surface.
-    """
-    return [
-        _project_metric_row(r)
-        for r in _read_collapse_history(db_path, task_class)
-    ]
-
-
 def _run_hack_probe(history: list[dict]) -> dict[str, Any]:
     """Run hack_probe.monitor, returning its report unchanged.
 
@@ -226,12 +178,6 @@ def _run_hack_probe(history: list[dict]) -> dict[str, Any]:
     """
     from mini_ork.learning import hack_probe
     return hack_probe.monitor(history)
-
-
-def _run_metric_anchor(history: list[dict]) -> dict[str, Any]:
-    """Run metric_anchor.audit, returning its report unchanged."""
-    from mini_ork.learning import metric_anchor
-    return metric_anchor.audit(history)
 
 
 def _project_collapse_row(row: sqlite3.Row) -> dict:
@@ -259,9 +205,9 @@ def _read_collapse_detector_history(
 ) -> list[dict]:
     """Read collapse-detector-shaped rows from ``collapse_history``.
 
-    Same reader as ``_read_hack_history`` / ``_read_metric_history`` —
-    pulls from the same migration-0060 table with the same task_class
-    filter, projects each row through ``_project_collapse_row``.
+    Same reader as ``_read_hack_history`` — pulls from the same
+    migration-0060 table with the same task_class filter, projects each row
+    through ``_project_collapse_row``.
     """
     return [
         _project_collapse_row(r)
@@ -272,9 +218,9 @@ def _read_collapse_detector_history(
 def _run_collapse_detector(history: list[dict]) -> dict[str, Any]:
     """Run ``collapse_detector.detect``, returning its report unchanged.
 
-    Mirrors ``_run_hack_probe`` / ``_run_metric_anchor``: the detector
-    is the only authority on its verdict, so the audit reuses its
-    public function rather than reimplementing the math.
+    Mirrors ``_run_hack_probe``: the detector is the only authority on its
+    verdict, so the audit reuses its public function rather than
+    reimplementing the math.
     """
     from mini_ork.learning import collapse_detector
     return collapse_detector.detect(history)
@@ -299,12 +245,11 @@ def audit(
     db_path: str,
     *,
     hack_history: list[dict] | None = None,
-    metric_history: list[dict] | None = None,
     collapse_history: list[dict] | None = None,
     gate_corpus_path: str | None = None,
     workdir: str | None = None,
 ) -> dict[str, Any]:
-    """Run the four detectors and fold them into a verdict.
+    """Run the three detectors and fold them into a verdict.
 
     Parameters
     ----------
@@ -320,7 +265,7 @@ def audit(
         SQLite path whose tables are probed best-effort for detector-shaped
         history rows. When no such rows are found, the corresponding
         detector runs on an empty history and contributes no flag.
-    hack_history, metric_history, collapse_history, gate_corpus_path, workdir:
+    hack_history, collapse_history, gate_corpus_path, workdir:
         Explicit overrides. When supplied, the audit skips the DB probe
         and uses the value verbatim. ``gate_corpus_path`` requires
         ``workdir`` (the artifact_contract evaluator writes files there);
@@ -354,19 +299,6 @@ def audit(
     except Exception as exc:  # noqa: BLE001 — fail-open per detector
         _log.warning("verifier_audit: hack_probe arm failed: %s", exc)
         evidence["hack_probe"] = {"error": str(exc)}
-
-    # ── H5: metric_anchor ─────────────────────────────────────────────
-    try:
-        history = (metric_history
-                   if metric_history is not None
-                   else _read_metric_history(db_path, task_class))
-        report = _run_metric_anchor(history)
-        evidence["metric_anchor"] = report
-        if report.get("intact") is False:
-            flags.append("metric_anchor")
-    except Exception as exc:  # noqa: BLE001 — fail-open per detector
-        _log.warning("verifier_audit: metric_anchor arm failed: %s", exc)
-        evidence["metric_anchor"] = {"error": str(exc)}
 
     # ── C1: collapse_detector ────────────────────────────────────────
     # The breaker already trusts this detector (``circuit_breaker.py:245-352``)
