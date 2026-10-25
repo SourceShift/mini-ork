@@ -249,7 +249,7 @@ def _age_days(now: int, stamp: Any) -> float:
         return 0.0
 
 
-def _avoidance(
+def avoidance(
     cand: Candidate,
     view: LedgerView,
     cfg: QueueConfig,
@@ -363,7 +363,7 @@ def build_queue(
             rejected.append(Rejection(cand.candidate_id, cand.signature,
                                       "domain_filtered", f"domain {cand.domain} not selected"))
             continue
-        avoid = _avoidance(cand, view, cfg, now=now)
+        avoid = avoidance(cand, view, cfg, now=now)
         if avoid is not None:
             rejected.append(avoid)
             continue
@@ -417,6 +417,7 @@ __all__ = [
     "QueueItem",
     "QueuePlan",
     "Rejection",
+    "avoidance",
     "build_queue",
     "credit_adjustment",
     "credit_for_source",

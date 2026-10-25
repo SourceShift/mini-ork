@@ -11,6 +11,7 @@ Layout (built incrementally; only the modules listed here exist today):
 ``probes``      deterministic commands and their parseable findings.
 ``harvest``     the live predicates: three domains, DB + AST + probe evidence.
 ``queue``       dedupe, avoid re-spending, seed every domain, rank into one queue.
+``select``      the pre-dispatch filter and the kickoff writer (``rsi.select@v1``).
 
 Later steps add ``gates``, ``worktree`` and ``cycle``. Everything
 except the two model edges (SUGGEST, IMPLEMENT) is pure Python so the loop can
