@@ -6,9 +6,15 @@ mini_ork/web/control.py for the security note.
 The /pause-cost + /resume-cost endpoints require Bearer-token auth
 via mini_ork.web.auth.require_token (Epic E6 substrate). When
 ${MINI_ORK_HOME}/auth-tokens.txt is missing, all auth-gated POSTs
-return 401. The legacy /stop and /kill endpoints stay
-loopback-trust-based for backwards compatibility; tighten by
-adding the same dependency when ready.
+return 401.
+
+The mutating /stop, /kill and /answers endpoints refuse a foreign
+``Origin`` through :func:`require_local_caller` (the CSRF /
+DNS-rebinding guard shared with the agent-server and workspace
+routes): a browser page served from anywhere else cannot fire them
+with a cross-origin POST, while non-browser callers (the IDE, ACP,
+the SDK, curl) send no ``Origin`` and are unaffected. The cost
+routes still need a bearer token.
 """
 
 from __future__ import annotations
@@ -20,11 +26,15 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Path as PathParam
 from .. import auth, control
 from ..db import StateDB
 from ..deps import get_db, get_home
+from .agent_server import require_local_caller
 
 router = APIRouter(prefix="/api/v1/task-runs", tags=["control"])
 
 
-@router.post("/{task_run_id}/stop")
+@router.post(
+    "/{task_run_id}/stop",
+    dependencies=[Depends(require_local_caller)],
+)
 def stop(
     task_run_id: str = PathParam(...),
     db: StateDB = Depends(get_db),
@@ -36,7 +46,10 @@ def stop(
     return result
 
 
-@router.post("/{task_run_id}/kill")
+@router.post(
+    "/{task_run_id}/kill",
+    dependencies=[Depends(require_local_caller)],
+)
 def kill(
     task_run_id: str = PathParam(...),
     db: StateDB = Depends(get_db),
@@ -62,7 +75,10 @@ def get_profile_route(
     return control.get_profile(home, task_run_id)
 
 
-@router.post("/{task_run_id}/answers")
+@router.post(
+    "/{task_run_id}/answers",
+    dependencies=[Depends(require_local_caller)],
+)
 def save_answers_route(
     task_run_id: str = PathParam(...),
     answers: dict[str, str] = Body(..., description="Map of question → answer"),
