@@ -8,8 +8,10 @@ Layout (built incrementally; only the modules listed here exist today):
 
 ``candidates``  the unit of work — identity, signature, integer severity.
 ``ledger``      all reads/writes of the ``rsi_*`` tables. No policy.
+``probes``      deterministic commands and their parseable findings.
+``harvest``     the live predicates: three domains, DB + AST + probe evidence.
 
-Later steps add ``probes``, ``harvest``, ``queue``, ``gates``, ``worktree`` and
-``cycle``. Everything except the two model edges (SUGGEST, IMPLEMENT) is pure
-Python so the loop can be dry-run against a temp DB with no network.
+Later steps add ``queue``, ``gates``, ``worktree`` and ``cycle``. Everything
+except the two model edges (SUGGEST, IMPLEMENT) is pure Python so the loop can
+be dry-run against a temp DB with no network.
 """
