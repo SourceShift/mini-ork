@@ -896,24 +896,16 @@ def _write_collapse_history_row(task_class: str, score: float, anchor,
     """Append one row to ``collapse_history`` after a scored apply decision.
 
     The circuit breaker's collapse signal reads ``collapse_history`` directly
-    (mini_ork/recovery/circuit_breaker.py:_eval_collapse_signal); the apply
-    loop is the only writer (kickoff rule #2). Failures MUST NOT propagate:
-    the gate decision was already made, and a write error here would corrupt
-    the audit trail by retrying an unrelated decision path. We swallow every
-    exception and let the caller carry on.
+    (mini_ork/recovery/circuit_breaker.py:_eval_collapse_signal). This was the
+    table's only writer until the RSI cycle also needed to record its own
+    score/anchor pairs; the insert and the 0-based step arithmetic now live in
+    :mod:`mini_ork.learning.collapse_history` so both producers share one
+    implementation instead of two drifting copies of the same SQL.
 
-    Schema source of truth: db/migrations/0060_collapse_history.sql.
-
-    Step arithmetic (kickoff rule #2): the FIRST row for a task_class is
-    ``step = 0`` (0-based start), and each subsequent row is
-    ``(max existing step) + 1``. Detectors read by ascending ``step`` so the
-    history stays in measurement order across promoted and quarantined
-    decisions alike.
-
-    When the table is missing (older DBs that ran mini-ork before migration
-    0060), the write is a silent no-op — the breaker's production read path
-    is fail-open on the same condition, so an absent table is a coherent
-    state, not an error.
+    Failures MUST NOT propagate: the gate decision was already made, and a
+    write error here must not corrupt the audit trail by retrying an unrelated
+    decision path. ``append`` is fail-open on the same conditions the breaker's
+    read path is (missing table, unreadable DB, write error).
     """
     if anchor is None:
         return  # no anchor probes → no row (kickoff rule #3)
@@ -922,39 +914,11 @@ def _write_collapse_history_row(task_class: str, score: float, anchor,
     except sqlite3.Error:
         return  # DB unreadable → skip, never crash the gate
     try:
-        try:
-            row = con.execute(
-                "SELECT COALESCE(MAX(step), -1) FROM collapse_history "
-                "WHERE task_class=?",
-                (task_class,),
-            ).fetchone()
-            next_step = (int(row[0]) + 1) if row and row[0] is not None else 0
-        except sqlite3.OperationalError:
-            # No collapse_history table yet — older DBs, exactly the fail-open
-            # case the breaker also honours.
-            return
-        con.execute(
-            """
-            INSERT INTO collapse_history
-                (task_class, step, score, anchor, directives, run_id, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                task_class,
-                next_step,
-                float(score),
-                float(anchor),
-                int(directives),
-                run_id or None,
-                int(time.time()),
-            ),
-        )
-        con.commit()
-    except (sqlite3.Error, ValueError, TypeError):
-        # Write failure: swallow. The gate's decision is already finalized
-        # above this call; the audit row in ``apply_attempts`` will reflect
-        # the real outcome regardless.
-        pass
+        from mini_ork.learning.collapse_history import append
+
+        append(con, task_class=task_class, score=score, anchor=anchor,
+               directives=directives, run_id=run_id or None,
+               now=int(time.time()))
     finally:
         con.close()
 

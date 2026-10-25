@@ -84,7 +84,8 @@ def _isolated_env(tmp_path, monkeypatch):
 def world(tmp_path):
     db = tmp_path / "state.db"
     _migrate(db, tmp_path, ("0052_run_leases_recovery_requests.sql",
-                            "0084_rsi_cycles.sql"))
+                            "0084_rsi_cycles.sql",
+                            "0060_collapse_history.sql"))
     root = tmp_path / "repo"
     (root / "mini_ork" / "verify").mkdir(parents=True)
     (root / FILE).write_text("# target\n", encoding="utf-8")
@@ -648,3 +649,136 @@ def test_a_pinned_candidate_that_is_not_eligible_is_not_a_crash(world):
     out = h.run(candidate_id="rsi-does-not-exist")
     assert out.rc == 0
     assert out.status == "no_candidate"
+
+
+# --------------------------------------------------------------------------
+# LEARN — what the cycle leaves for the next one
+# --------------------------------------------------------------------------
+
+
+def _seed_history(db: Path, rows: tuple[tuple[float, float], ...]) -> None:
+    con = sqlite3.connect(str(db))
+    try:
+        for step, (score, anchor) in enumerate(rows):
+            con.execute(
+                "INSERT INTO collapse_history"
+                " (task_class, step, score, anchor, directives, run_id, created_at)"
+                " VALUES ('rsi_cycle', ?, ?, ?, 0, ?, ?)",
+                (step, score, anchor, f"seed-{step}", NOW - 10 + step),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_a_merged_cycle_records_credit_and_a_collapse_measurement(world):
+    out = Harness(world).run()
+    assert out.status == "merged"
+
+    credit = _rows(world.db, "SELECT * FROM rsi_credit")
+    assert len(credit) == 1
+    assert credit[0]["cycle_id"] == "rsi-ctest"
+    assert credit[0]["source"] == "db:V1"
+    assert credit[0]["domain"] == "verification"
+    assert credit[0]["outcome"] == "merged"
+    assert credit[0]["utility"] == 1.0
+
+    history = _rows(world.db, "SELECT * FROM collapse_history")
+    assert len(history) == 1
+    assert history[0]["task_class"] == "rsi_cycle"
+    assert history[0]["run_id"] == "rsi-ctest"
+    assert history[0]["step"] == 0
+    assert history[0]["score"] == pytest.approx(1.0)
+    assert history[0]["anchor"] == pytest.approx(1.0)
+
+
+def test_a_quarantined_cycle_earns_no_utility(world):
+    h = Harness(world)
+    h.measurement_overrides = {"lint_ok": False}
+    assert h.run().status == "quarantined"
+
+    credit = _rows(world.db, "SELECT * FROM rsi_credit")
+    assert [c["utility"] for c in credit] == [0.0]
+    assert [c["outcome"] for c in credit] == ["quarantined"]
+
+
+def test_learning_accumulates_across_cycles(world):
+    h = Harness(world)
+    h.run(cycle_id="rsi-one")
+    h.run(cycle_id="rsi-two")
+
+    steps = [r["step"] for r in _rows(
+        world.db, "SELECT step FROM collapse_history ORDER BY step")]
+    assert steps == [0, 1]
+    assert len(_rows(world.db, "SELECT * FROM rsi_credit")) == 2
+
+    scores = [r["score"] for r in _rows(
+        world.db, "SELECT score FROM collapse_history ORDER BY step")]
+    assert scores == [pytest.approx(1.0), pytest.approx(1.0)]
+
+
+def test_a_dry_run_teaches_nothing(world):
+    h = Harness(world)
+    out = h.run(dry_run=True)
+
+    assert out.rc == 0
+    assert _rows(world.db, "SELECT * FROM rsi_credit") == []
+    assert _rows(world.db, "SELECT * FROM collapse_history") == []
+    assert _rows(world.db, "SELECT * FROM rsi_cycles") == []
+
+
+def test_a_cycle_with_no_candidate_measures_the_anchor_but_earns_no_credit(world):
+    h = Harness(world)
+    h.runtime.harvest = lambda req, con, now, probes: _report(None)
+    assert h.run().status == "no_candidate"
+
+    assert _rows(world.db, "SELECT * FROM rsi_credit") == []
+    assert len(_rows(world.db, "SELECT * FROM collapse_history")) == 1
+
+
+def test_a_raising_learner_never_turns_a_merge_into_an_error(world, monkeypatch):
+    """Bookkeeping is not allowed to change a decision already made."""
+    import mini_ork.rsi.cycle as cycle_mod
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("disk on fire")
+
+    monkeypatch.setattr(cycle_mod.learn, "record", boom)
+    out = Harness(world).run()
+
+    assert out.status == "merged"
+    assert out.rc == 0
+    assert _cycle(world.db)["status"] == "merged"
+
+
+def test_a_collapse_trend_arms_the_stop_and_the_next_cycle_says_why(world):
+    _seed_history(world.db, ((0.0, 1.0), (0.0, 1.0), (0.0, 1.0), (0.0, 1.0)))
+    h = Harness(world)
+
+    def red_probes(req):
+        h.calls.append("probes")
+        return (ProbeResult("garden", "garden", "error", 1, 1),)
+
+    h.runtime.probes = red_probes
+    assert h.run().status == "merged"
+
+    stop = world.tmp / "rsi" / "DISABLED"
+    assert stop.exists(), "a rising score with a dying anchor must arm the stop"
+
+    second = h.run(cycle_id="rsi-after-collapse")
+    assert second.rc == 0
+    assert second.status == "halted"
+    assert second.halt_reason.startswith("collapse:"), second.halt_reason
+    assert second.halt_reason == stop.read_text(encoding="utf-8").splitlines()[0]
+    assert h.calls.count("probes") == 1, "the halted cycle did not even probe"
+
+
+def test_the_collapse_reason_does_not_disguise_an_operator_stop(world):
+    stop = world.tmp / "rsi"
+    stop.mkdir()
+    (stop / "DISABLED").write_text("halted by operator\n", encoding="utf-8")
+
+    out = Harness(world).run()
+
+    assert out.status == "halted"
+    assert out.halt_reason == "rsi/DISABLED file present"

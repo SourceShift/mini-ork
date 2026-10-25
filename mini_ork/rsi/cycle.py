@@ -35,7 +35,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from . import ledger
+from . import learn, ledger
 from .candidates import Candidate
 from .config import CycleConfig
 from .gates import CriticVerdict, GateEvidence, ValidationReport, evaluate
@@ -218,7 +218,17 @@ def disabled_reason(req: CycleRequest, runtime: Runtime | None = None) -> str:
     env = os.environ.get(DISABLED_ENV, "")
     if env.strip() not in ("", "0"):
         return f"{DISABLED_ENV}={env.strip()}"
-    if (req.home / "rsi" / "DISABLED").exists():
+    stop = req.home / "rsi" / "DISABLED"
+    if stop.exists():
+        # A collapse trip writes its own reason as line 1 (see ``rsi.learn``).
+        # Surfacing it here is the whole operator story: the run that stopped
+        # says *why* it stopped, not just that a file exists.
+        try:
+            first = stop.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            first = ""
+        if first.startswith("collapse"):
+            return first.splitlines()[0]
         return "rsi/DISABLED file present"
     if not req.config.enabled:
         return "enabled: false"
@@ -281,8 +291,16 @@ def run_cycle(req: CycleRequest, *, runtime: Runtime | None = None) -> CycleOutc
     except BaseException as exc:  # noqa: BLE001 - a broken cycle must not stay 'running'
         if con is not None and not req.dry_run:
             try:
-                ledger.finish_cycle(con, req.cycle_id, now=rt.clock(), status="error",
-                                    halt_reason=f"{type(exc).__name__}: {exc}")
+                row = ledger.get_cycle(con, req.cycle_id)
+                # Only a still-running row is an error. A cycle that already
+                # terminal-finished (a merge, a quarantine) must not have its
+                # status rewritten because something raised *after* the ledger
+                # write — a closed stderr pipe is enough to do it.
+                if row is not None and row["status"] == "running":
+                    ledger.finish_cycle(con, req.cycle_id, now=rt.clock(),
+                                        status="error",
+                                        halt_reason=f"{type(exc).__name__}: {exc}")
+                    _learn(req, rt, con, "error", "")
             except Exception:  # noqa: BLE001 - the original error is the one to raise
                 pass
         raise
@@ -538,9 +556,41 @@ def _finish(req: CycleRequest, rt: Runtime, con, status: str, *, rc: int,
     fields.update(extra or {})
     if not req.dry_run:
         ledger.finish_cycle(con, req.cycle_id, now=rt.clock(), status=status, **fields)
+        _learn(req, rt, con, status, candidate_id)
     return CycleOutcome(req.cycle_id, status, rc, halt_reason=halt_reason,
                         candidate_id=candidate_id, detail=detail, merged_sha=merged_sha,
                         gates=gates)
+
+
+def _learn(req: CycleRequest, rt: Runtime, con, status: str,
+           candidate_id: str) -> None:
+    """Record credit + the collapse measurement for a finished cycle.
+
+    Runs *after* ``finish_cycle`` so the merge rate it computes includes this
+    cycle. Bookkeeping must never change a decision that was already made: a
+    merged cycle whose credit row failed is still merged, so errors here are
+    swallowed and reported on stderr. That includes a collapse trip that could
+    not be written — the cycle is already finished by then, and rewriting a
+    ``merged`` row to ``error`` would misreport work that landed. The message
+    says the stop is NOT armed, because that is the part a human must act on.
+    """
+    try:
+        report = learn.record(con, cycle_id=req.cycle_id, status=status,
+                              candidate_id=candidate_id or None,
+                              home=req.home, now=rt.clock())
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        print(f"[rsi] learn failed for {req.cycle_id}: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        return
+    if report.get("collapse"):
+        if report.get("collapse_error"):
+            print("[rsi] collapse detected but the DISABLED file could not be"
+                  f" written ({report['collapse_error']}); the next cycle will"
+                  " NOT halt — fix the home directory before resuming",
+                  file=sys.stderr)
+        else:
+            print(f"[rsi] collapse detected: {report['disabled_path']} written;"
+                  " the next cycle will halt", file=sys.stderr)
 
 
 def _quarantine(req: CycleRequest, rt: Runtime, con, cand: Candidate,
