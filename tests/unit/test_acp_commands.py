@@ -610,9 +610,13 @@ def test_certify_timeout(home: Path, monkeypatch: pytest.MonkeyPatch):
 # ── /serve ───────────────────────────────────────────────────────────────────
 
 
-def test_serve_down_returns_command():
+def test_serve_down_returns_command(monkeypatch: pytest.MonkeyPatch):
+    # "Nothing is listening" is stated, not assumed: a real serve on the port —
+    # the developer's own, or the page server in another session — would
+    # otherwise turn this into a host-state test that fails only on some
+    # machines. The sibling below states the up direction the same way.
+    monkeypatch.setattr(cmds, "_probe", lambda url, *, timeout=1.0: False)
     agent = _agent(Path.cwd())
-    # Default: probe fails (no serve actually running).
     out = asyncio.run(cmds.handle_serve(agent, "run-1", ""))
     assert "Run `mini-ork serve`" in out
 

@@ -24,6 +24,7 @@ What is pinned:
 from __future__ import annotations
 
 import contextlib
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -457,6 +458,35 @@ def test_the_cli_once_runs_a_pass_over_every_configured_source(
     assert rc == 0
     assert len(launches) == 1
     assert launches[0]["run_id"] == "acme-eng-1"
+
+
+def test_the_local_source_reads_the_database_the_pass_was_handed(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """``db=`` names the database; the local source must not read the cwd's.
+
+    The registry builds the local adapter once, with no database bound. A pass
+    that rows from the process's cwd passes on a machine whose own
+    ``.mini-ork/state.db`` happens to hold an epics table, and fails in every
+    clean checkout (found: a worktree whose cwd-relative db had no epics) — the
+    failure is a *wrong* database, not a missing one, which is why it needs its
+    own pin.
+    """
+    con = sqlite3.connect(home / "state.db")
+    con.execute("INSERT INTO epics (id, title, status) VALUES ('EP-1', 'one', 'not started')")
+    con.commit()
+    con.close()
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    report = intake_poll.poll_once(
+        home, "local", db=str(home / "state.db"), dry_run=True, trigger=Trigger()
+    )
+
+    assert report.error is None
+    assert report.mirrored == 1
 
 
 def test_the_cli_reports_a_sync_failure_and_exits_nonzero(

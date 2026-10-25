@@ -210,7 +210,7 @@ def poll_once(
     dispatched ticket, which a preview exists to avoid, and it can only ever
     make the preview say "would start" where the real pass says "already done".
     """
-    adapter = provider if provider is not None else _adapter(source)
+    adapter = provider if provider is not None else _adapter(source, db)
     source_id = adapter.id
     rules = trigger if trigger is not None else trigger_for(source_id)
 
@@ -410,10 +410,20 @@ def source_statuses(
     return statuses
 
 
-def _adapter(source: str) -> Provider:
-    """The registered adapter for a source id, with the registry's own error."""
-    from mini_ork.pm import registry
+def _adapter(source: str, db: str | None = None) -> Provider:
+    """The registered adapter for a source id, with the registry's own error.
 
+    The local source is mini-ork's own ``state.db``, and the registry builds it
+    once with no database bound. A pass that was handed a specific database —
+    ``intake once --home <dir>``, where ``<dir>`` need not be the process's cwd —
+    must read *that* one, or it answers from an unrelated file. Every other
+    source binds its database at registration; this one rebinds per pass.
+    """
+    from mini_ork.pm import registry
+    from mini_ork.pm.providers import LOCAL_ID, local
+
+    if db is not None and source == LOCAL_ID:
+        return local.provider(db)
     return registry.get_provider(source)
 
 
