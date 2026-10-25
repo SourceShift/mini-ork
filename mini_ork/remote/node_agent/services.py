@@ -52,6 +52,17 @@ crash-consistent — the caller decides whether that is good enough — but a
 restore is refused while any container still holds the volume, because
 replacing the directory under a live process corrupts state instead of
 recovering it.
+
+**Networks** are how services reach each other without a public hostname. A
+deployment document names a network and the DNS aliases the container answers
+to inside it (``db``, ``db-1f2a3b4c.internal``); the node creates the network
+if it is missing and joins every replica to it. The platform scopes the name
+per environment, so two tenants (or two environments of one tenant) never share
+a namespace. Driver choice is the node's: the default bridge is the
+single-laptop tier, and ``MO_NODE_NETWORK_DRIVER=overlay`` on a Docker swarm
+makes the same name span hosts — without the overlay, Docker networks stop at
+the node boundary, so cross-node reachability is a fleet property, never
+something this module can invent.
 """
 from __future__ import annotations
 
@@ -106,6 +117,26 @@ _SNAPSHOT_ROOT_ENV = "MO_NODE_SNAPSHOT_ROOT"
 #: back on restore/delete. Held to the minted shape so a request cannot name a
 #: path component — the id is a leaf under a node-chosen directory.
 _SNAPSHOT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+#: A Docker network name. The platform sends an environment-scoped network so
+#: services of one environment reach each other by name; the node may have to
+#: create it. Held to a leaf shape (no dots, no slashes) even though it is
+#: passed to ``docker network`` as argv, so a name that looks like a flag or a
+#: path never reaches the daemon.
+_NETWORK_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+
+#: A network alias is a DNS name inside that network: ``db`` or
+#: ``db-1f2a3b4c.internal``. Dots are part of the name and never a path hop;
+#: empty labels (``a..b``, a trailing dot) are refused.
+_NETWORK_ALIAS_RE = re.compile(
+    r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$"
+)
+
+#: Driver used when the node has to create a network. ``bridge`` is the
+#: single-laptop default; a fleet sets ``overlay`` (requires Docker swarm) so
+#: one environment network spans hosts instead of being created per node.
+_NETWORK_DRIVER_ENV = "MO_NODE_NETWORK_DRIVER"
+_NETWORK_DRIVERS = frozenset({"bridge", "overlay"})
 
 
 class ServiceError(ValueError):
@@ -174,6 +205,10 @@ class ServiceSpec:
     labels: dict[str, str] = field(default_factory=dict)
     healthcheck: dict[str, Any] | None = None
     network: str | None = None
+    #: DNS names the container answers to inside ``network``. The platform's
+    #: stable name for a service lives here; they are meaningless without a
+    #: network, so validation refuses the combination.
+    network_aliases: list[str] = field(default_factory=list)
     user: str | None = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
@@ -200,6 +235,7 @@ class ServiceSpec:
             labels={str(k): str(v) for k, v in (data.get("labels") or {}).items()},
             healthcheck=dict(data["healthcheck"]) if data.get("healthcheck") else None,
             network=str(data["network"]) if data.get("network") else None,
+            network_aliases=[str(a) for a in data.get("network_aliases") or []],
             user=str(data["user"]) if data.get("user") else None,
             created_at=float(data.get("created_at") or time.time()),
             updated_at=float(data.get("updated_at") or time.time()),
@@ -273,6 +309,27 @@ def _validate(payload: Mapping[str, Any]) -> tuple[ServiceSpec, dict[str, str]]:
         seen_paths.add(mount_path)
         volumes.append({"name": name, "mount_path": mount_path})
 
+    # Private networking: a network name is an identity the node may have to
+    # create, and an alias only means something inside that network. Refusing
+    # the pair-less case here keeps a caller from believing it published a DNS
+    # name when Docker would have ignored it on the default bridge.
+    network = str(payload["network"]).strip() if payload.get("network") else None
+    if network is not None and not _NETWORK_NAME_RE.match(network):
+        raise ServiceError(
+            f"network must match ^[a-z0-9][a-z0-9_-]{{0,62}}$: {network!r}"
+        )
+    network_aliases: list[str] = []
+    for raw in payload.get("network_aliases") or []:
+        alias = str(raw).strip()
+        if len(alias) > 253 or not _NETWORK_ALIAS_RE.match(alias):
+            raise ServiceError(f"network alias is not a DNS name: {alias!r}")
+        if alias not in network_aliases:
+            network_aliases.append(alias)
+    if len(network_aliases) > 32:
+        raise ServiceError("at most 32 network aliases are supported")
+    if network_aliases and network is None:
+        raise ServiceError("network_aliases requires network")
+
     resources = payload.get("resources") or {}
     cpus_raw = resources.get("cpus", payload.get("cpus"))
     memory_raw = resources.get("memory", payload.get("memory"))
@@ -315,7 +372,8 @@ def _validate(payload: Mapping[str, Any]) -> tuple[ServiceSpec, dict[str, str]]:
         restart_policy=policy,
         labels={str(k): str(v) for k, v in labels.items()},
         healthcheck=dict(healthcheck) if healthcheck else None,
-        network=str(payload["network"]) if payload.get("network") else None,
+        network=network,
+        network_aliases=network_aliases,
         user=str(payload["user"]) if payload.get("user") else None,
         created_at=now,
         updated_at=now,
@@ -633,6 +691,37 @@ class ServiceManager:
                 holders.append((name, state))
         return holders
 
+    def _ensure_network(self, name: str) -> None:
+        """Create the service network if this node does not have it yet.
+
+        Idempotent by inspection, not by swallowing an error: a second deploy
+        joins the existing network and never re-creates it. The driver is the
+        node's choice — the default bridge is enough on one host, and a fleet
+        sets ``MO_NODE_NETWORK_DRIVER=overlay`` so the same environment network
+        spans nodes (overlay needs Docker swarm; a node that is not in a swarm
+        fails here, loudly, instead of containers landing on separate bridges
+        and silently not reaching each other).
+        """
+        result = self._run(["docker", "network", "inspect", name])
+        if int(getattr(result, "returncode", 1)) == 0:
+            return
+        driver = (os.environ.get(_NETWORK_DRIVER_ENV) or "bridge").strip() or "bridge"
+        # A bad driver is an operator mistake and a daemon refusal is an
+        # infrastructure one; neither is the caller's fault, so both surface as
+        # 500 rather than a 400 that would send the tenant looking at its spec.
+        if driver not in _NETWORK_DRIVERS:
+            raise RuntimeError(
+                f"{_NETWORK_DRIVER_ENV} must be one of {sorted(_NETWORK_DRIVERS)}: "
+                f"{driver!r}"
+            )
+        result = self._run(["docker", "network", "create", "--driver", driver, name])
+        if int(getattr(result, "returncode", 1)) != 0:
+            stderr = (getattr(result, "stderr", "") or "").strip()
+            stdout = (getattr(result, "stdout", "") or "").strip()
+            raise RuntimeError(
+                f"docker network create failed ({result.returncode}): {stderr or stdout}"
+            )
+
     def _prepare_volumes(self, spec: ServiceSpec) -> None:
         """Create each volume's host directory before Docker sees it.
 
@@ -702,6 +791,8 @@ class ServiceManager:
             argv += ["--memory", spec.memory]
         if spec.network:
             argv += ["--network", spec.network]
+            for alias in spec.network_aliases:
+                argv += ["--network-alias", alias]
         if spec.user:
             argv += ["--user", spec.user]
 
@@ -736,6 +827,8 @@ class ServiceManager:
         if spec.service_id in self._specs:
             raise ServiceError(f"service {spec.service_id!r} already exists")
 
+        if spec.network:
+            self._ensure_network(spec.network)
         self._prepare_volumes(spec)
 
         cids: dict[int, str] = {}

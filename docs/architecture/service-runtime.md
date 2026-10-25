@@ -254,7 +254,9 @@ These are the proprietary layer's job, and every one of them is policy:
 - Public hostnames, TLS certificates, and HTTP routing to a replica port.
 - Health-gated rollout, blue/green, and automatic rollback on `unhealthy`.
 - Metrics scraping (`docker stats`) → usage events → invoices.
-- Private networking between a tenant's services across nodes.
+- The **overlay itself** — swarm membership, WireGuard, or a CNI. This module
+  joins a network and creates it on demand; making that one network span hosts
+  is infrastructure, and the driver choice below decides whether it does.
 - Volume **quotas, retention, and off-node backup**. Snapshots and restore are
   mechanism and live here; *when* to take one, how long to keep it, and where it
   is shipped afterwards are policy. `platform_volumes.size_mb` is recorded but
@@ -267,14 +269,43 @@ The node exposes what those need — replica state, logs, the port mapping, the
 `mo.deployment` label — and nothing else. That keeps the trust surface small
 and lets a self-hoster run the same primitive with a shell script.
 
-## The private-network caveat
+## Private networks
 
-`--network` joins an existing Docker network by name. On one node that gives
-services name-based reachability. **Across nodes it gives nothing** — Docker
-networks do not span hosts. Cross-node private networking needs an overlay
-(WireGuard, Tailscale, or a CNI), which is infrastructure policy and belongs
-with ingress, not with this module. Do not imply multi-node private
-networking from this flag.
+Services reach each other by DNS name when they sit on the same Docker
+network. A deployment document names that network and the aliases the
+container answers to inside it:
+
+```json
+"network": "attestia-env-1f2a3b4c",
+"network_aliases": ["db", "db-1f2a3b4c.internal"]
+```
+
+Rules:
+
+- **The node creates the network if it is missing.** `docker network inspect`
+  decides; a second deploy joins what the first created and never re-creates
+  it. The caller never runs Docker commands.
+- **The driver is the node's choice, and a bad one fails closed.**
+  `MO_NODE_NETWORK_DRIVER` is `bridge` by default (one host) or `overlay` on a
+  Docker swarm (one name across the fleet). An unknown value, or a daemon that
+  refuses to create the network, fails the deploy with a 500 — there is no
+  fallback to the default bridge, because that would leave peers silently
+  unable to resolve each other.
+- **An alias without a network is refused.** Docker accepts
+  `--network-alias` on the default bridge and ignores it; a caller that sent
+  only aliases would believe it had published a name.
+- **Aliases are DNS names, not paths.** `[a-z0-9.-]`, no empty label (`a..b`),
+  no trailing dot, at most 253 characters, 32 per service. The short label is
+  the name peers use (`db`); the FQDN is what the platform shows tenants.
+- **Scoping is the platform's job.** The node enforces shape, not tenancy: two
+  tenants that send the same network name land on the same network. The
+  control plane derives the name from the environment, so a tenant cannot
+  choose it.
+- **Cross-node reachability is a fleet property.** Bridge networks stop at the
+  host boundary; `overlay` crosses swarm nodes. The node reports the truth by
+  failing the create when the driver cannot be honoured. A fleet that has not
+  joined a swarm must keep one environment on one node — placement is the
+  control plane's concern, not this module's.
 
 ## Self-host example
 
@@ -291,6 +322,8 @@ curl -sS "http://127.0.0.1:7091/v1/services" \
     "image": "nginx:1.27-alpine",
     "replicas": 1,
     "ports": [{"container": 80, "host": 8080}],
+    "network": "attestia-env-1f2a3b4c",
+    "network_aliases": ["web", "web-3f2a1b9c.internal"],
     "volumes": [{"name": "site", "mount_path": "/usr/share/nginx/html"}],
     "resources": {"cpus": 0.5, "memory": "256m"},
     "healthcheck": {"cmd": "wget -qO- localhost:80", "interval": "10s"}

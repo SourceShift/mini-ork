@@ -39,6 +39,9 @@ class _Docker:
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
         self.states: dict[str, str] = {}
+        self.networks: set[str] = set()
+        self.network_creates: list[list[str]] = []
+        self.fail_network: str | None = None
         self.fail_on: str | None = None
         self.removed: list[str] = []
 
@@ -55,6 +58,22 @@ class _Docker:
                 return r
             self.states[name] = "running"
             r.stdout = f"cid-{name}"
+            return r
+
+        if argv[:3] == ["docker", "network", "inspect"]:
+            if argv[-1] not in self.networks:
+                r.returncode = 1
+                r.stderr = "Error: No such network"
+            return r
+
+        if argv[:3] == ["docker", "network", "create"]:
+            if self.fail_network:
+                r.returncode = 1
+                r.stderr = f"Error response from daemon: {self.fail_network}"
+                return r
+            self.networks.add(argv[-1])
+            self.network_creates.append(argv)
+            r.stdout = argv[-1]
             return r
 
         if argv[:2] == ["docker", "inspect"]:
@@ -626,3 +645,142 @@ def test_snapshot_routes_require_bearer(client):
     ):
         r = getattr(client, method)(path, **({"json": {"snapshot_id": "0" * 32}} if method == "post" else {}))
         assert r.status_code in (401, 403), (method, path, r.status_code)
+
+
+# ---------------------------------------------------------------------------
+# private networking
+# ---------------------------------------------------------------------------
+
+NETWORK = "attestia-env-1f2a3b4c"
+ALIASES = ["db", "db-1f2a3b4c.internal"]
+
+
+def test_create_joins_the_environment_network_under_its_aliases(client, docker):
+    r = client.post(
+        "/v1/services",
+        json=_spec(network=NETWORK, network_aliases=ALIASES),
+        headers=AUTH,
+    )
+    assert r.status_code == 200, r.text
+
+    assert docker.network_creates == [
+        ["docker", "network", "create", "--driver", "bridge", NETWORK]
+    ]
+    argv = docker.run_argv()[0]
+    assert argv[argv.index("--network") + 1] == NETWORK
+    aliases = [argv[i + 1] for i, a in enumerate(argv) if a == "--network-alias"]
+    assert aliases == ALIASES
+
+
+def test_a_second_service_reuses_the_network_instead_of_recreating_it(client, docker):
+    first = client.post(
+        "/v1/services",
+        json=_spec(service_id="web", network=NETWORK, network_aliases=["web"]),
+        headers=AUTH,
+    )
+    second = client.post(
+        "/v1/services",
+        json=_spec(service_id="api", network=NETWORK, network_aliases=["api"]),
+        headers=AUTH,
+    )
+
+    assert first.status_code == 200 and second.status_code == 200
+    assert len(docker.network_creates) == 1
+    assert docker.network_creates[0][-1] == NETWORK
+
+
+def test_network_driver_is_the_nodes_choice(client, docker, monkeypatch):
+    monkeypatch.setenv("MO_NODE_NETWORK_DRIVER", "overlay")
+
+    r = client.post(
+        "/v1/services",
+        json=_spec(network=NETWORK, network_aliases=["db"]),
+        headers=AUTH,
+    )
+
+    assert r.status_code == 200, r.text
+    assert docker.network_creates[0][
+        docker.network_creates[0].index("--driver") + 1
+    ] == "overlay"
+
+
+def test_an_unknown_network_driver_refuses_before_creating_anything(
+    client, docker, monkeypatch
+):
+    monkeypatch.setenv("MO_NODE_NETWORK_DRIVER", "macvlan")
+
+    r = client.post(
+        "/v1/services",
+        json=_spec(network=NETWORK, network_aliases=["db"]),
+        headers=AUTH,
+    )
+
+    assert r.status_code == 500
+    assert "MO_NODE_NETWORK_DRIVER" in r.json()["detail"]
+    assert docker.network_creates == []
+    assert docker.run_argv() == []
+
+
+def test_a_network_the_daemon_refuses_is_a_loud_failure(client, docker):
+    # The overlay driver on a node that never joined a swarm lands here: the
+    # deploy must fail, not fall back to an isolated bridge.
+    docker.fail_network = "operation is not permitted"
+
+    r = client.post(
+        "/v1/services",
+        json=_spec(network=NETWORK, network_aliases=["db"]),
+        headers=AUTH,
+    )
+
+    assert r.status_code == 500
+    assert "network create failed" in r.json()["detail"]
+    assert docker.run_argv() == []
+    assert not (docker.networks)
+
+
+def test_an_alias_without_a_network_is_refused(client):
+    r = client.post(
+        "/v1/services",
+        json=_spec(network_aliases=["db"]),
+        headers=AUTH,
+    )
+    assert r.status_code == 400
+    assert "requires network" in r.json()["detail"]
+
+
+@pytest.mark.parametrize("alias", ["Bad_Name", "-db", "db..internal", "db.", "a/b"])
+def test_a_malformed_alias_is_refused(client, alias):
+    r = client.post(
+        "/v1/services",
+        json=_spec(network=NETWORK, network_aliases=[alias]),
+        headers=AUTH,
+    )
+    assert r.status_code == 400
+    assert "network alias" in r.json()["detail"]
+
+
+def test_duplicate_aliases_are_collapsed(client, docker):
+    r = client.post(
+        "/v1/services",
+        json=_spec(network=NETWORK, network_aliases=["db", "db", "db.internal"]),
+        headers=AUTH,
+    )
+    assert r.status_code == 200, r.text
+    argv = docker.run_argv()[0]
+    assert [argv[i + 1] for i, a in enumerate(argv) if a == "--network-alias"] == [
+        "db",
+        "db.internal",
+    ]
+
+
+def test_aliases_survive_the_state_file(client, tmp_path):
+    r = client.post(
+        "/v1/services",
+        json=_spec(network=NETWORK, network_aliases=ALIASES),
+        headers=AUTH,
+    )
+    assert r.status_code == 200, r.text
+
+    data = json.loads((tmp_path / "services.json").read_text(encoding="utf-8"))
+    assert data["services"][0]["network"] == NETWORK
+    assert data["services"][0]["network_aliases"] == ALIASES

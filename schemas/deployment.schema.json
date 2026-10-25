@@ -121,7 +121,20 @@
     },
     "network": {
       "type": "string",
-      "description": "Container network to join. Services on the same network reach each other by container name; omit for the daemon default."
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,62}$",
+      "description": "Container network to join. The node creates it when missing (driver from MO_NODE_NETWORK_DRIVER, default bridge; overlay on a swarm spans hosts). Services on the same network reach each other by name; omit for the daemon default."
+    },
+    "network_aliases": {
+      "type": "array",
+      "description": "DNS names the container answers to inside `network`, so peers can address it as `db` or `db-1f2a3b4c.internal`. Refused without `network`.",
+      "items": {
+        "type": "string",
+        "maxLength": 253,
+        "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$"
+      },
+      "maxItems": 32,
+      "uniqueItems": true,
+      "default": []
     },
     "user": {
       "type": "string",
