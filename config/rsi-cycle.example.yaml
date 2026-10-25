@@ -42,8 +42,10 @@ budget:
 probes:
   # Deterministic, in-process/SQL probes. `db:<RULE>` ids re-run a detection;
   # the rest shell out to the existing commands. All are registered — an
-  # unknown id is exit 2, not a silently skipped probe.
-  run: [garden, validate, verifier-audit, calibrate, metrics, oversight, tests, lane-preflight]
+  # unknown id is exit 2, not a silently skipped probe. `lane-preflight` is
+  # intentionally absent: its health check is a provider network call, and this
+  # set must stay network-free (lane health is a dispatch-time gate).
+  run: [garden, validate, verifier-audit, calibrate, metrics, oversight, tests]
   timeout_s: 900
   per_source_max: 3     # findings kept per source; a red probe is not 400 gaps
   error_policy: halt_before_spend   # | quarantine_only

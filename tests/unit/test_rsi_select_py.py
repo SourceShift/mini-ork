@@ -232,8 +232,11 @@ def test_every_harvest_rule_has_a_registered_synthetic_probe():
     for _, rules in ALL_RULES:
         for rule_id, _ in rules:
             assert f"{SYNTHETIC_PREFIX}{rule_id}" in commands, rule_id
-    for probe_id in ("garden", "validate", "tests", "verifier-audit", "lane-preflight"):
+    for probe_id in ("garden", "validate", "tests", "verifier-audit"):
         assert probe_id in commands
+    # Never registered: no runner builds it, and accepting it only postponed the
+    # failure to the start of a cycle.
+    assert "lane-preflight" not in commands
     assert f"{SYNTHETIC_PREFIX}L8" not in commands  # a probe, not a rule
     assert "please make it better" not in commands
 

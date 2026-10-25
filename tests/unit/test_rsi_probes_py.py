@@ -9,6 +9,7 @@ The two bugs this file exists to prevent:
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -251,6 +252,84 @@ def test_result_json_round_trip_preserves_required(tmp_path):
     original = run_probe(spec, root=tmp_path, runner=run)
     again = ProbeResult.from_dict(original.to_dict())
     assert again == original
+
+
+# --------------------------------------------------------------------------
+# verifier-audit — the one probe with no CLI verb
+# --------------------------------------------------------------------------
+
+def test_verifier_audit_is_built_in_process_and_optional(tmp_path):
+    spec = {s.probe_id: s for s in default_specs(root=tmp_path)}["verifier-audit"]
+    assert spec.fn is not None and not spec.argv
+    assert not spec.required
+
+
+def test_verifier_audit_turns_audit_flags_into_findings(tmp_path, monkeypatch):
+    from mini_ork.learning import verifier_audit
+
+    seen: dict[str, str] = {}
+
+    def fake_audit(task_class, db_path, **kw):
+        seen["db"] = str(db_path)
+        return {"ok": False, "flags": ["gate_hackable:suite_shrunk"],
+                "evidence": {"detectors": 3}}
+
+    monkeypatch.setattr(verifier_audit, "audit", fake_audit)
+    db = tmp_path / "state.db"
+    spec = {s.probe_id: s for s in default_specs(root=tmp_path, db=db)}["verifier-audit"]
+    result = run_probe(spec, root=tmp_path)
+    assert result.status == "findings"
+    assert [f.message for f in result.findings] == ["verifier-audit: gate_hackable:suite_shrunk"]
+    assert result.payload["ok"] is False
+    # The cycle's DB wins over whatever the probe process would resolve.
+    assert seen["db"] == str(db)
+
+
+def test_verifier_audit_is_ok_when_the_audit_finds_nothing(tmp_path, monkeypatch):
+    from mini_ork.learning import verifier_audit
+
+    monkeypatch.setattr(verifier_audit, "audit",
+                        lambda *a, **k: {"ok": True, "flags": [], "evidence": {}})
+    spec = {s.probe_id: s for s in default_specs(root=tmp_path)}["verifier-audit"]
+    assert run_probe(spec, root=tmp_path).status == "ok"
+
+
+def test_verifier_audit_resolves_the_db_from_the_environment(tmp_path, monkeypatch):
+    from mini_ork.learning import verifier_audit
+
+    seen: dict[str, str] = {}
+
+    def fake_audit(task_class, db_path, **kw):
+        seen["db"] = str(db_path)
+        return {"ok": True, "flags": [], "evidence": {}}
+
+    monkeypatch.setattr(verifier_audit, "audit", fake_audit)
+    monkeypatch.setenv("MINI_ORK_DB", str(tmp_path / "env.db"))
+    spec = {s.probe_id: s for s in default_specs(root=tmp_path)}["verifier-audit"]
+    run_probe(spec, root=tmp_path)
+    assert seen["db"] == str(tmp_path / "env.db")
+
+
+REPO = Path(__file__).resolve().parents[2]
+EXAMPLE = REPO / "config" / "rsi-cycle.example.yaml"
+
+
+def test_every_probe_the_shipped_config_names_has_a_runnable_spec():
+    """The example config must be runnable *as shipped*.
+
+    Regression guard for a real defect: ``probes.run`` named two ids no runner
+    built, and the shipped config failed at startup — after HARVEST, before any
+    SUGGEST — with "has no runnable spec". Config parsing accepted both, so
+    nothing caught it until a live invocation.
+    """
+    from mini_ork.rsi.config import load_config
+
+    cfg = load_config(EXAMPLE, env={}, strict=True)
+    built = {s.probe_id for s in default_specs(
+        root=REPO, pytest_paths=cfg.probes.pytest_paths, db=REPO / ".mini-ork" / "state.db")}
+    unbuilt = [p for p in cfg.probes.run
+               if not p.startswith(probes.SYNTHETIC_PREFIX) and p not in built]
+    assert unbuilt == []
 
 
 def test_module_exports_the_registry_it_documents():

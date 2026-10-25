@@ -82,9 +82,12 @@ DEFAULT_ALLOW_PREFIXES: tuple[str, ...] = (
 #: hand, with the gates off.
 DENY_PREFIXES: tuple[str, ...] = ("mini_ork/rsi/",)
 
-#: Probe ids that exist but are not in :func:`probes.default_specs` (they are
-#: in-process or added by the cycle driver). Accepted as success commands.
-_EXTRA_PROBES: frozenset[str] = frozenset({"tests", "verifier-audit", "lane-preflight"})
+#: Probe ids accepted as success commands although :func:`probes.default_specs`
+#: only builds them conditionally (``tests`` needs a configured pytest path).
+#: ``lane-preflight`` is deliberately absent: it was never built by any runner,
+#: and its health check is a provider network probe — a config naming it used to
+#: be accepted here and then fail the run at startup.
+_EXTRA_PROBES: frozenset[str] = frozenset({"tests"})
 
 #: The queue names a merged candidate ``already_merged``; the plan's select
 #: table calls the same state ``already_fixed``. Map once, at the boundary, so

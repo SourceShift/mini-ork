@@ -96,6 +96,29 @@ The two that matter most:
   script's default green gate is the **whole suite** (~60 min), which is not a
   gate a cycle can wait for.
 
+### The deterministic probe set
+
+`probes.run` may name any registered id; the shipped default is:
+
+| id | what it reads | cost |
+|---|---|---|
+| `garden` | recipe/naming/output drift | ~1 s |
+| `validate` | static workflow validation (`--strict`) | ~1 s |
+| `verifier-audit` | verifier detectors (gate hacking, collapse, gate fuzz) — in-process, no CLI verb | one query |
+| `calibrate` | router calibration (`ece`, blind-spot rate) | ~1 s |
+| `metrics` | trajectory metrics | ~1 s |
+| `oversight` | oversight backlog | ~1 s |
+| `tests` | the scoped `pytest_paths` set | minutes |
+| `db:<RULE>` | re-runs one harvest rule; `ok` only when the rule now reports nothing | one query |
+
+None of them touch the network or a model. That is deliberate: the set is the
+half of HARVEST that two cycles can be compared on, and G9 diffs it. A probe
+that needed a provider call would turn a flaky network into a fake regression.
+
+`lane-preflight` is **not** in the set, and naming it is exit 2. Its health
+check is a provider network call; dead lanes are caught by the dispatch-time
+gate, where they belong.
+
 ### Fails closed — exit 2 before anything is spent
 
 - config path unreadable, empty, not a mapping, unknown key anywhere

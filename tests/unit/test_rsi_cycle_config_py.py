@@ -180,6 +180,22 @@ def test_a_db_probe_naming_no_rule_is_refused_by_the_shared_registry():
         cfg(probes={"run": ["db:L99"]})
 
 
+def test_lane_preflight_is_refused_instead_of_accepted_then_unrunnable():
+    """It used to be accepted here and then crash at startup.
+
+    ``default_specs`` never built it — its health check is a provider network
+    call, so it does not belong in a deterministic set. Accepting the id and
+    failing later (after HARVEST, before SUGGEST) was the worse of the two
+    errors; exit 2 at config time is free.
+    """
+    with pytest.raises(ConfigError, match="unregistered probe id"):
+        cfg(probes={"run": ["garden", "lane-preflight"]})
+
+
+def test_verifier_audit_is_registered_because_it_runs_in_process():
+    assert cfg(probes={"run": ["verifier-audit"]}).probes.run == ("verifier-audit",)
+
+
 def test_an_unknown_error_policy_is_refused():
     with pytest.raises(ConfigError, match="error_policy"):
         cfg(probes={"error_policy": "ignore"})

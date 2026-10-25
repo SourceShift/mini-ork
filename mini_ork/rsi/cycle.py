@@ -686,8 +686,12 @@ def _default_probes(req: CycleRequest) -> tuple[ProbeResult, ...]:
     from . import probes as probe_mod
 
     cfg = req.config.probes
+    # ``db`` pins the in-process ``verifier-audit`` probe: a cycle given
+    # ``--db`` must audit that database, not whichever one the child env
+    # happens to resolve.
     by_id = {s.probe_id: s for s in probe_mod.default_specs(
-        root=req.root, pytest_paths=cfg.pytest_paths, timeout_s=cfg.timeout_s)}
+        root=req.root, pytest_paths=cfg.pytest_paths, timeout_s=cfg.timeout_s,
+        db=req.db)}
     if not cfg.run:
         specs = list(by_id.values())
     else:
@@ -699,9 +703,9 @@ def _default_probes(req: CycleRequest) -> tuple[ProbeResult, ...]:
                 continue
             spec = by_id.get(probe_id)
             if spec is None:
-                # ``config`` accepts ids the select filter knows about but the
-                # runner does not build (``verifier-audit``, ``lane-preflight``).
-                # A config that names one is a setup error, not a silent skip.
+                # Every id ``config`` accepts is built by ``default_specs`` (the
+                # shipped example is pinned by a test against exactly this), so
+                # this is a config bug, not a missing implementation.
                 raise CycleSetupError(
                     f"probe {probe_id!r} is configured but has no runnable spec")
             specs.append(spec)
@@ -1058,7 +1062,7 @@ def _gap_at(req: CycleRequest, cand: Candidate, root: Path) -> bool | None:
 
     spec = {s.probe_id: s for s in probe_mod.default_specs(
         root=root, pytest_paths=req.config.probes.pytest_paths,
-        timeout_s=req.config.probes.timeout_s)}.get(command)
+        timeout_s=req.config.probes.timeout_s, db=req.db)}.get(command)
     if spec is None:
         return None
     env = {**os.environ, "MINI_ORK_ROOT": str(root), "MINI_ORK_DB": str(req.db)}
@@ -1089,9 +1093,11 @@ def _probe_failures(req: CycleRequest, root: Path) -> tuple[str, ...]:
     from . import probes as probe_mod
 
     # No ``pytest_paths`` on purpose: G9 compares cheap probe health at the two
-    # trees, and G6 has already run the scoped tests once.
+    # trees, and G6 has already run the scoped tests once. ``verifier-audit``
+    # reads the DB, not the tree, so it is identical at both ends and drops out
+    # of the set difference — it costs one query, not a false failure.
     specs = probe_mod.default_specs(
-        root=root, pytest_paths=(), timeout_s=req.config.probes.timeout_s)
+        root=root, pytest_paths=(), timeout_s=req.config.probes.timeout_s, db=req.db)
     results = probe_mod.run_probes(
         specs, root=root,
         runner=lambda a, timeout_s, cwd: probe_mod.subprocess_runner(

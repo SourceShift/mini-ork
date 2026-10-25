@@ -403,16 +403,58 @@ def run_probes(
     return tuple(run_probe(spec, root=root, runner=runner) for spec in specs)
 
 
+def _verifier_audit_spec(*, root: str | Path, db: str | Path | None,
+                         timeout_s: int) -> ProbeSpec:
+    """``verifier_audit.audit`` has no CLI verb, so it runs in-process.
+
+    The DB is passed explicitly when the caller knows it (the cycle does) and
+    otherwise resolved the way every other consumer resolves it. Best-effort
+    per detector is the audit's own contract: a detector that cannot read
+    contributes evidence, never an exception.
+    """
+    root_s = str(root)
+
+    def _check() -> Mapping[str, Any]:
+        import os
+
+        from mini_ork.context import RunContext
+        from mini_ork.learning import verifier_audit
+
+        resolved = str(db) if db else (
+            os.environ.get("MINI_ORK_DB")
+            or RunContext.from_env().db_or_default()
+            or os.path.join(root_s, ".mini-ork", "state.db")
+        )
+        report = verifier_audit.audit(None, resolved)
+        return {
+            "ok": bool(report.get("ok")),
+            "db": resolved,
+            "evidence": report.get("evidence") or {},
+            "flags": [{"level": "error", "message": f"verifier-audit: {flag}"}
+                      for flag in report.get("flags") or ()],
+        }
+
+    return ProbeSpec("verifier-audit", "verifier detectors (hack / collapse / gate fuzz)",
+                     fn=_check, policy="ok_only", required=False, timeout_s=timeout_s)
+
+
 def default_specs(
     *,
     root: str | Path,
     pytest_paths: Sequence[str] = (),
     timeout_s: int = 900,
+    db: str | Path | None = None,
 ) -> tuple[ProbeSpec, ...]:
     """The default probe set, all deterministic. No network, no model.
 
     ``pytest_paths`` comes from config; an empty list omits the tests probe
-    rather than silently running the whole suite (~60 min here).
+    rather than silently running the whole suite (~60 min here). ``db`` pins
+    the in-process probe (``verifier-audit``) to the database the caller
+    decided on, so a cycle given ``--db`` does not audit a different one.
+
+    ``lane-preflight`` is deliberately *not* here: its health check is a
+    provider network probe, and the deterministic set must stay network-free.
+    Dead lanes are caught by the dispatch-time gate instead.
     """
     bin_path = str(Path(root) / "bin" / "mini-ork")
     specs: list[ProbeSpec] = [
@@ -426,6 +468,7 @@ def default_specs(
                   policy="ok_only", required=False, timeout_s=timeout_s),
         ProbeSpec("oversight", "oversight backlog", argv=(bin_path, "oversight", "--calibrate", "--json"),
                   policy="ok_only", required=False, timeout_s=timeout_s),
+        _verifier_audit_spec(root=root, db=db, timeout_s=timeout_s),
     ]
     if pytest_paths:
         import sys
