@@ -1,0 +1,69 @@
+# Two critics, two families, neither the implementer's.
+#
+# The cycle's G10 refuses a verdict set whose families collapse or that shares
+# the implementer's family (codex_lens). This workflow is where that is honoured
+# in practice: `glm_lens` (zai) and `opus_lens` (anthropic). The post-run
+# `panel_composition` node checks the lanes that actually served, because a lane
+# can fall back mid-run and a panel that quietly became one family is exactly
+# the failure this recipe exists to prevent.
+#
+# There is no synthesiser. A majority vote on a self-improvement diff is a way to
+# merge something neither critic approved; the answer is unanimity or quarantine.
+version: "0.1.0"
+task_class: rsi_critic
+description: >
+  Read one candidate's diff together with the evidence it claims to answer and
+  its before/after measurement, and decide — twice, independently — whether the
+  change closes the gap or merely makes the repo look different.
+
+nodes:
+  - name: brief_loader
+    type: verifier
+    verifier_ref: verifiers/brief.py
+    dispatch_mode: serial
+    outputs: [{ name: critic_brief, kind: markdown, path: critic-brief.md }]
+
+  - name: critic_glm
+    type: researcher
+    model_lane: glm_lens
+    prompt_ref: prompts/critique.md
+    dispatch_mode: parallel
+    inputs: { critic_brief: { required: true } }
+    outputs: [{ name: verdict_glm, kind: json, path: critics/glm_lens.json }]
+
+  - name: critic_opus
+    type: researcher
+    model_lane: opus_lens
+    prompt_ref: prompts/critique.md
+    dispatch_mode: parallel
+    inputs: { critic_brief: { required: true } }
+    outputs: [{ name: verdict_opus, kind: json, path: critics/opus_lens.json }]
+
+  - name: verdict_merge
+    type: verifier
+    verifier_ref: verifiers/merge.py
+    dispatch_mode: serial
+    inputs: { verdicts: { required: true, many: true } }
+    outputs: [{ name: critics, kind: json, path: critics.json }]
+
+  - name: panel_composition
+    type: verifier
+    verifier_ref: verifiers/panel.py
+    dispatch_mode: serial
+    inputs: { critics: { required: true } }
+    outputs: [{ name: panel_composition, kind: json, path: panel-composition.json }]
+
+  - { name: rollback, type: rollback, prompt_ref: null, dispatch_mode: serial }
+
+edges:
+  - { from: brief_loader, to: critic_glm, edge_type: depends_on, from_output: critic_brief, to_input: critic_brief }
+  - { from: brief_loader, to: critic_opus, edge_type: depends_on, from_output: critic_brief, to_input: critic_brief }
+  - { from: critic_glm, to: verdict_merge, edge_type: depends_on, from_output: verdict_glm, to_input: verdicts }
+  - { from: critic_opus, to: verdict_merge, edge_type: depends_on, from_output: verdict_opus, to_input: verdicts }
+  - { from: verdict_merge, to: panel_composition, edge_type: depends_on, from_output: critics, to_input: critics }
+  - { from: brief_loader, to: rollback, edge_type: escalates_to, condition: fail }
+  - { from: verdict_merge, to: rollback, edge_type: escalates_to, condition: fail }
+  - { from: panel_composition, to: rollback, edge_type: escalates_to, condition: fail }
+
+rollback_strategy: retain_brief_and_verdicts
+source_artifact: critics.json

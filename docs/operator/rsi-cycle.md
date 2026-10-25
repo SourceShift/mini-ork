@@ -219,16 +219,35 @@ migrations, the four `rsi_*` tables, lease tables, `bin/mini-ork` +
 drift shows up as `probe_broken`), lane-family distinctness, worktree directory
 writability, 24h budget headroom, and the stop switch.
 
+## The two recipe runs
+
+A cycle dispatches two recipes and reads exactly two artifacts from them. Both
+run with their own home under `<home>/rsi/<cycle_id>/<recipe>/home`, on the
+cycle's database, under a run id derived from the cycle id — so every artifact
+of one cycle sorts together and no run can write into the operator's own home.
+
+| Recipe | Stage | Artifact the cycle reads | Shape |
+|---|---|---|---|
+| `rsi-cycle` | SUGGEST | `proposal.json` (→ `mini_ork.rsi.select.Proposal`) | 4 lenses on 4 families, anonymised, one synthesis |
+| `rsi-critic` | DECIDE | `critics.json` + `panel-composition.json` (→ G10) | 2 critics on 2 families, no synthesiser, no vote |
+
+The machine brief travels by environment variable (`MO_RSI_SUGGEST_BRIEF`,
+`MO_RSI_CRITIC_BRIEF`), not as an artifact: the run directory does not exist yet
+when the cycle builds the brief. The recipes render it themselves
+(`verifiers/brief.py`), strip provenance before any lens or critic sees it, and
+refuse to run without it — that is why they are never dispatched by hand.
+
+A failed run never crashes the cycle. SUGGEST without a proposal halts with
+`no_proposal`; a critic run that crashes returns no verdicts, G10 fails closed
+with `critic_not_exogenous`, and the cycle **quarantines** — keeping the
+worktree and the diff so the work is still there to review.
+
 ## What it does not do yet
 
 - **Lesson authoring.** A cycle records credit and the collapse measurement; it
   does not write lessons. A lesson drawn from one cycle teaches the loop its own
   noise — authoring waits for a repeated failure signature and the
   `lesson_conflict` judge.
-- **The SUGGEST and critic recipes** (`recipes/rsi-cycle/`, `recipes/rsi-critic/`)
-  live in the repo, but a cycle refuses to merge until they are present: G10
-  fails closed with `critic_not_exogenous` rather than merging on an
-  implementer's own word.
 - **Un-gameable gates.** G7/G9 are differential and G10 is out-of-family, which
   raises the cost of gaming them; it does not make them impossible. The
   implementer never sees the gate implementation it is measured against, and

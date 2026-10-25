@@ -1,0 +1,41 @@
+source_artifact: proposal.json
+task_class: rsi_cycle
+expected_artifact: single
+
+success_verifiers:
+  - verifiers/verify.py
+
+failure_policy: escalate
+rollback_policy: keep_all_panel_artifacts
+
+outputs:
+  - path: "${MINI_ORK_RUN_DIR}/brief.md"
+    mime: text/markdown
+    description: The candidate's evidence, rendered for the lens prompts. Anonymised — no source or lane provenance.
+  - path: "${MINI_ORK_RUN_DIR}/candidates.json"
+    mime: application/json
+    description: The queued candidates around this one, for context only; the proposal must answer exactly one.
+  - path: "${MINI_ORK_RUN_DIR}/lenses/impact.json"
+    mime: application/json
+    description: What breaks if this gap stays open.
+  - path: "${MINI_ORK_RUN_DIR}/lenses/root-cause.json"
+    mime: application/json
+    description: Why the code produces this evidence, anchored to real symbols.
+  - path: "${MINI_ORK_RUN_DIR}/lenses/fix-shape.json"
+    mime: application/json
+    description: The smallest edit that closes the gap, and what it must not touch.
+  - path: "${MINI_ORK_RUN_DIR}/lenses/oracle.json"
+    mime: application/json
+    description: How the fix will be proven — the command whose output must change.
+  - path: "${MINI_ORK_RUN_DIR}/lens-panel.json"
+    mime: application/json
+    description: The four lens answers, anonymised and reduced to L1..L4 before synthesis.
+  - path: "${MINI_ORK_RUN_DIR}/suggestion.json"
+    mime: application/json
+    description: One synthesised proposal resolving the lenses' disagreements.
+  - path: "${MINI_ORK_RUN_DIR}/proposal.json"
+    mime: application/json
+    description: The validated proposal in `mini_ork.rsi.select.Proposal` shape. The only artifact the cycle reads.
+  - path: "${MINI_ORK_RUN_DIR}/panel-composition.json"
+    mime: application/json
+    description: Which lane actually served each lens, and whether the families stayed distinct.

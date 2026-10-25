@@ -1,0 +1,26 @@
+source_artifact: critics.json
+task_class: rsi_critic
+expected_artifact: composite
+
+success_verifiers:
+  - verifiers/verify.py
+
+failure_policy: escalate
+rollback_policy: keep_all_critic_verdicts
+
+outputs:
+  - path: "${MINI_ORK_RUN_DIR}/critic-brief.md"
+    mime: text/markdown
+    description: The diff, the evidence it answers, the deterministic gate results and the before/after metric.
+  - path: "${MINI_ORK_RUN_DIR}/critics/glm_lens.json"
+    mime: application/json
+    description: One exogenous critic's verdict.
+  - path: "${MINI_ORK_RUN_DIR}/critics/opus_lens.json"
+    mime: application/json
+    description: The second exogenous critic's verdict.
+  - path: "${MINI_ORK_RUN_DIR}/panel-composition.json"
+    mime: application/json
+    description: Which lane actually served each critic, and whether the families stayed distinct.
+  - path: "${MINI_ORK_RUN_DIR}/critics.json"
+    mime: application/json
+    description: Both verdicts in the shape `mini_ork.rsi.gates.CriticVerdict` reads. The cycle reads this and `panel-composition.json`.

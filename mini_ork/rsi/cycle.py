@@ -401,9 +401,8 @@ def _body(req: CycleRequest, rt: Runtime, con, *, token: str, spend: float) -> C
     evidence = _evidence(req, report, cand, impl, selection, measurement, spend)
     first = evaluate(evidence)
 
-    critics = tuple((rt.critics or _default_critics)(req, cand, impl, selection, first))
-    if critics:
-        evidence = replace(evidence, critics=critics)
+    raw = (rt.critics or _default_critics)(req, cand, impl, selection, first)
+    evidence = _with_critics(evidence, raw)
     report_final = evaluate(evidence)
 
     # --- DECIDE ------------------------------------------------------------
@@ -739,17 +738,179 @@ def _default_harvest(req: CycleRequest, con, now: int, probes):
                    probes=tuple(probes))
 
 
+#: How long one SUGGEST run may take. Five model nodes, four of them in
+#: parallel; the critics get ``critic.model_timeout_s`` from config instead.
+_SUGGEST_TIMEOUT_S = 1800
+
+
+class CriticsResult(tuple):
+    """Verdicts plus the record of which lane actually served each critic.
+
+    ``Runtime.critics`` returns a plain tuple when nothing measured the panel
+    (an injected fake in a test). The recipe path returns this subclass so G10
+    also sees the served-lane report. Subclassing ``tuple`` keeps every existing
+    caller — ``tuple(...)``, ``len()``, iteration — working unchanged.
+    """
+
+    panel: Mapping[str, Any] | None
+
+    def __new__(cls, verdicts: Sequence[CriticVerdict] = (), panel=None):
+        self = super().__new__(cls, tuple(verdicts))
+        self.panel = panel
+        return self
+
+
+def _with_critics(evidence: GateEvidence, raw: Sequence[CriticVerdict]) -> GateEvidence:
+    """Attach the panel's verdicts and, when the run measured it, the served lanes.
+
+    G10 grades two things: the verdicts and — when the critic run reported it —
+    which lane actually served each critic. A plain tuple (an injected fake)
+    carries no measurement, so ``critic_panel`` stays ``None`` and the gate
+    judges the families recorded on the verdicts alone. A panel without verdicts
+    is dropped: it would describe a review that produced no answer.
+    """
+    critics = tuple(raw)
+    if not critics:
+        return evidence
+    return replace(evidence, critics=critics, critic_panel=getattr(raw, "panel", None))
+
+
+def _recipe_dir(req: CycleRequest, name: str) -> Path:
+    return Path(req.root) / "recipes" / name
+
+
+def _candidate_brief(cand: Candidate) -> dict[str, Any]:
+    """The candidate as the panel sees it — model input, not the ledger row."""
+    return {
+        "candidate_id": cand.candidate_id,
+        "domain": cand.domain,
+        "kind": cand.kind,
+        "severity": cand.severity,
+        "title": cand.title,
+        "detail": cand.detail,
+        "files": list(cand.files),
+        "evidence": dict(cand.evidence),
+        "evidence_key": cand.evidence_key,
+        "fix_hint": cand.fix_hint,
+        "success_metric": cand.success_metric,
+        "success_command": cand.success_command,
+        "source": cand.source,
+    }
+
+
+def _run_recipe(req: CycleRequest, recipe: str, brief: Mapping[str, Any],
+                kickoff: str, *, timeout_s: int, brief_env: str) -> tuple[int, Path, Path]:
+    """Dispatch one recipe run for this cycle; return ``(rc, home, run_dir)``.
+
+    Same shape as the implementer child: its own home (the runner rewrites
+    ``agents.yaml`` there), the cycle's DB, and a run id derived from the cycle
+    so every artifact of one cycle sorts together. The brief is handed over by
+    environment variable because the run directory does not exist yet.
+    """
+    stage = req.home / "rsi" / req.cycle_id / recipe
+    home = stage / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    brief_path = stage / "brief.json"
+    brief_path.write_text(json.dumps(brief, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    kickoff_path = stage / "kickoff.md"
+    kickoff_path.write_text(kickoff, encoding="utf-8")
+    run_id = f"{req.cycle_id}-{recipe}"
+
+    argv = [
+        "timeout", str(timeout_s),
+        str(Path(req.root) / "bin" / "mini-ork"), "run",
+        "--deadline", str(max(60, timeout_s - 120)), recipe, str(kickoff_path),
+    ]
+    env = {
+        **os.environ,
+        "MINI_ORK_ROOT": str(req.root),
+        "MINI_ORK_DB": str(req.db),
+        "MINI_ORK_HOME": str(home),
+        "MINI_ORK_RUN_ID": run_id,
+        "MO_RUNTIME_BACKEND": req.config.implement.runtime_backend,
+        brief_env: str(brief_path),
+    }
+    try:
+        proc = subprocess.run(argv, cwd=str(req.root), env=env, capture_output=True,
+                              text=True, timeout=timeout_s + 60)
+    except subprocess.TimeoutExpired:
+        return _TIMEOUT_RC, home, home / "runs" / run_id
+    except OSError as exc:
+        raise CycleFailure(f"the {recipe} run could not be started: {exc}") from exc
+    return proc.returncode, home, home / "runs" / run_id
+
+
+def _run_artifact(home: Path, run_id: str, filename: str) -> Path | None:
+    """The declared artifact of this run, or the newest one under its home.
+
+    The sink's run id is authoritative when the engine honoured it; a run that
+    renamed itself still leaves exactly one artifact in a fresh home.
+    """
+    direct = home / "runs" / run_id / filename
+    if direct.is_file():
+        return direct
+    hits = sorted(home.glob(f"runs/*/{filename}"), key=lambda p: p.stat().st_mtime)
+    return hits[-1] if hits else None
+
+
 def _default_propose(req: CycleRequest, cand: Candidate) -> Proposal | None:
     """SUGGEST is the first model edge and lives in a recipe, not here.
 
-    Until ``recipes/rsi-cycle`` ships, a cycle gets its proposal from
-    ``--proposal PATH`` (or a runtime override). Failing loudly is the point:
-    inventing a proposal from the candidate alone would dispatch an implementer
-    with no diagnosis behind it.
+    Failing loudly is the point: inventing a proposal from the candidate alone
+    would dispatch an implementer with no diagnosis behind it.
     """
-    raise CycleFailure(
-        "SUGGEST has no recipe yet: pass --proposal PATH with the panel's "
-        "proposal JSON, or install recipes/rsi-cycle")
+    if not _recipe_dir(req, "rsi-cycle").is_dir():
+        raise CycleFailure(
+            "SUGGEST has no recipe: recipes/rsi-cycle is not installed under "
+            f"{req.root}, and this cycle has no injected proposal. Install the "
+            "recipe (it ships with the repo) or inject one through the runtime.")
+    return _recipe_propose(req, cand)
+
+
+def _recipe_propose(req: CycleRequest, cand: Candidate) -> Proposal:
+    cfg = req.config
+    brief = {
+        "version": 1,
+        "cycle_id": req.cycle_id,
+        "candidate": _candidate_brief(cand),
+        "constraints": {
+            "repo_root": str(req.root),
+            "verification_command": cand.success_command,
+            "max_files": cfg.gates.max_files,
+            "allow_prefixes": list(cfg.gates.allow_prefixes),
+        },
+        # Context only: the panel answers exactly one candidate. Carrying the
+        # neighbours lets a lens notice a duplicate without letting it re-rank.
+        "candidates": [{"candidate_id": cand.candidate_id, "domain": cand.domain,
+                        "kind": cand.kind, "severity": cand.severity,
+                        "title": cand.title}],
+    }
+    kickoff = "\n".join([
+        f"# RSI suggest: {cand.title}",
+        "",
+        "Produce one fix proposal for the gap described in the machine brief.",
+        "",
+        f"- The brief (authoritative): `{req.home / 'rsi' / req.cycle_id / 'rsi-cycle' / 'brief.json'}`",
+        "- Recipe: rsi-cycle. Run every node; do not skip a lens because another one looks right.",
+        "- Required output: `$MINI_ORK_RUN_DIR/proposal.json`, shaped as described in the "
+        "synthesize prompt.",
+        "- Do not edit the repository. This run proposes; the cycle decides.",
+        "",
+    ])
+    rc, home, run_dir = _run_recipe(req, "rsi-cycle", brief, kickoff,
+                                    timeout_s=_SUGGEST_TIMEOUT_S,
+                                    brief_env="MO_RSI_SUGGEST_BRIEF")
+    path = _run_artifact(home, run_dir.name, "proposal.json")
+    if path is None:
+        raise CycleFailure(
+            f"the SUGGEST run exited {rc} without a proposal.json (see {run_dir})")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise CycleFailure(f"{path} is not JSON: {exc}") from exc
+    if not isinstance(payload, Mapping):
+        raise CycleFailure(f"{path} must be a JSON object")
+    return Proposal.from_mapping(payload)
 
 
 def worktree_config(req: CycleRequest, *, slug: str, files: Sequence[str],
@@ -1106,15 +1267,94 @@ def _probe_failures(req: CycleRequest, root: Path) -> tuple[str, ...]:
     return tuple(r.probe_id for r in results if r.failed)
 
 
+def _critic_brief(req: CycleRequest, cand: Candidate, impl: Implementation,
+                  report: ValidationReport) -> dict[str, Any]:
+    """What a critic is asked to judge: the gap, the diff, the gates, the metric."""
+    gates = [{"id": r.gate, "name": r.name, "passed": r.ok,
+              "code": r.code, "detail": r.detail} for r in report.results]
+    g8 = next((g for g in gates if g["id"] == "G8"), None)
+    return {
+        "version": 1,
+        "cycle_id": req.cycle_id,
+        "candidate": _candidate_brief(cand),
+        "implementer_lane": req.config.implement.lane,
+        "diff": impl.diff,
+        "changed_files": list(impl.changed_files),
+        "gates": gates,
+        "metric": {"command": cand.success_command,
+                   "detail": (g8 or {}).get("detail", ""),
+                   "passed": (g8 or {}).get("passed")},
+        "child_verdict": dict(impl.verdict or {}),
+    }
+
+
+def _recipe_critics(req: CycleRequest, cand: Candidate, impl: Implementation,
+                    selection: Selection, report: ValidationReport) -> tuple[CriticVerdict, ...]:
+    """Ask the critic recipe for an independent, two-family review of this diff.
+
+    A critic run that fails returns an *empty* verdict set rather than raising:
+    G10 then fails closed and the cycle quarantines, keeping the worktree. An
+    exception here would take down a cycle whose diff already landed, which
+    loses the work in exchange for a cleaner stack trace.
+    """
+    cfg = req.config
+    brief = _critic_brief(req, cand, impl, report)
+    lanes = ", ".join(cfg.critic.lanes)
+    kickoff = "\n".join([
+        f"# RSI review: {cand.title}",
+        "",
+        "Review the diff in the machine brief for one question: does it fix the "
+        "gap it claims to fix, without making any check easier to pass?",
+        "",
+        f"- The brief (authoritative): "
+        f"`{req.home / 'rsi' / req.cycle_id / 'rsi-critic' / 'brief.json'}`",
+        f"- Recipe: rsi-critic. Every critic answers independently; families: {lanes}.",
+        "- Required output: `$MINI_ORK_RUN_DIR/critics.json` and "
+        "`$MINI_ORK_RUN_DIR/panel-composition.json`.",
+        "- Do not edit the repository. You judge; the cycle decides.",
+        "",
+    ])
+    try:
+        rc, home, run_dir = _run_recipe(req, "rsi-critic", brief, kickoff,
+                                        timeout_s=cfg.critic.model_timeout_s,
+                                        brief_env="MO_RSI_CRITIC_BRIEF")
+    except CycleFailure as exc:
+        sys.stderr.write(f"rsi-cycle: critic run failed: {exc}\n")
+        return CriticsResult(())
+
+    verdicts_path = _run_artifact(home, run_dir.name, "critics.json")
+    if verdicts_path is None:
+        sys.stderr.write(f"rsi-cycle: critic run exited {rc} without critics.json "
+                         f"(see {run_dir}); G10 will quarantine\n")
+        return CriticsResult(())
+    try:
+        payload = json.loads(verdicts_path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        sys.stderr.write(f"rsi-cycle: {verdicts_path} is not JSON: {exc}\n")
+        return CriticsResult(())
+
+    rows = payload.get("critics") if isinstance(payload, Mapping) else None
+    verdicts = [CriticVerdict.from_mapping(row) for row in (rows or ())
+                if isinstance(row, Mapping)]
+    # The panel file is written by the recipe from `llm_calls`; its absence is
+    # an unmeasured panel, which is `None`, not a fabricated {"ok": true}.
+    panel_path = _run_artifact(home, run_dir.name, "panel-composition.json")
+    panel = None
+    if panel_path is not None:
+        try:
+            loaded = json.loads(panel_path.read_text(encoding="utf-8"))
+            panel = loaded if isinstance(loaded, Mapping) else None
+        except ValueError:
+            panel = None
+    return CriticsResult(verdicts, panel=panel)
+
+
 def _default_critics(req: CycleRequest, cand: Candidate, impl: Implementation,
                      selection: Selection, report: ValidationReport) -> tuple[CriticVerdict, ...]:
-    """No critics configured in code: the panel is a recipe (step 5).
-
-    Returning ``()`` is deliberate. G10 then fails closed with
-    ``critic_not_exogenous``, so a cycle in this state quarantines instead of
-    merging on a panel it never had.
-    """
-    return ()
+    """The panel is a recipe. Without it, G10 fails closed and the cycle quarantines."""
+    if not _recipe_dir(req, "rsi-critic").is_dir():
+        return CriticsResult(())
+    return _recipe_critics(req, cand, impl, selection, report)
 
 
 def _default_merge(req: CycleRequest, impl: Implementation):

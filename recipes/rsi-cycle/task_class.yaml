@@ -1,0 +1,33 @@
+name: rsi_cycle
+version: "0.1.0"
+description: >
+  The suggestion half of a mini-ork RSI cycle: take one evidence-backed gap
+  chosen by the deterministic queue, run four independent lenses over its
+  evidence, synthesise a single bounded fix proposal, and return it in the
+  shape `mini_ork.rsi.select` filters. It proposes; it never edits, merges or
+  dispatches.
+
+matches:
+  keywords:
+    - rsi cycle suggest
+    - rsi proposal
+    - gap fix proposal
+    - self-improvement cycle
+  regex: []
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+
+risk_class: low
+
+cost_model:
+  min_usd: 0.3
+  max_usd: 4.0
+  per_lens_usd: 0.4
+
+runtime_model:
+  min_minutes: 2
+  max_minutes: 40

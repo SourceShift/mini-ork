@@ -1,0 +1,121 @@
+# Four lenses, one synthesis. Why the shapes are what they are:
+#
+# * The four lens nodes sit on four *different* model families (minimax, moonshot,
+#   zai, anthropic). That is the same heterogeneity the judge panels use, applied
+#   to diagnosis rather than grading: a plan four providers agree on is much less
+#   likely to be one provider's idiom. The families are checked after the run by
+#   `panel_composition`, not assumed.
+# * The synthesiser is `codex_lens` — a fifth family, and the family that will
+#   implement the change (framework-edit's implementer). Exogeneity is *not*
+#   required here the way G10 requires it of critics: this stage is producing the
+#   plan, and a plan written in the implementer's idiom is more likely to land.
+#   The critics in `recipes/rsi-critic` are the ones kept exogenous.
+# * Every lens and the synthesiser only see `brief.md` / `lens-panel.json`. The
+#   candidate's `source` (db:L10 vs probe:garden) and every lane name are stripped
+#   by `brief.py` and `anonymize.py`, so a lens cannot favour a gap because it came
+#   from a source it likes — the same reason `panel.anonymize` exists elsewhere.
+version: "0.1.0"
+task_class: rsi_cycle
+description: >
+  Turn one queued RSI candidate into a validated fix proposal: render the
+  evidence, run four independent lenses, anonymise their answers, synthesise
+  one bounded proposal, and validate it against the candidate's own scope and
+  success command.
+
+nodes:
+  - name: brief_loader
+    type: verifier
+    verifier_ref: verifiers/brief.py
+    dispatch_mode: serial
+    outputs:
+      - { name: brief, kind: markdown, path: brief.md }
+      - { name: candidates, kind: json, path: candidates.json }
+
+  - name: lens_impact
+    type: researcher
+    model_lane: minimax_lens
+    prompt_ref: prompts/lens-impact.md
+    dispatch_mode: parallel
+    inputs: { brief: { required: true } }
+    outputs: [{ name: lens_impact, kind: json, path: lenses/impact.json }]
+
+  - name: lens_root_cause
+    type: researcher
+    model_lane: kimi_lens
+    prompt_ref: prompts/lens-root-cause.md
+    dispatch_mode: parallel
+    inputs: { brief: { required: true } }
+    outputs: [{ name: lens_root_cause, kind: json, path: lenses/root-cause.json }]
+
+  - name: lens_fix_shape
+    type: researcher
+    model_lane: glm_lens
+    prompt_ref: prompts/lens-fix-shape.md
+    dispatch_mode: parallel
+    inputs: { brief: { required: true } }
+    outputs: [{ name: lens_fix_shape, kind: json, path: lenses/fix-shape.json }]
+
+  - name: lens_oracle
+    type: researcher
+    model_lane: opus_lens
+    prompt_ref: prompts/lens-oracle.md
+    dispatch_mode: parallel
+    inputs: { brief: { required: true } }
+    outputs: [{ name: lens_oracle, kind: json, path: lenses/oracle.json }]
+
+  - name: panel_anonymize
+    type: verifier
+    verifier_ref: verifiers/anonymize.py
+    dispatch_mode: serial
+    inputs: { lenses: { required: true, many: true } }
+    outputs: [{ name: lens_panel, kind: json, path: lens-panel.json }]
+
+  - name: synthesizer
+    type: researcher
+    model_lane: codex_lens
+    prompt_ref: prompts/synthesize.md
+    dispatch_mode: serial
+    inputs:
+      lens_panel: { required: true }
+      brief: { required: true }
+    outputs: [{ name: suggestion, kind: json, path: suggestion.json }]
+
+  - name: proposal_builder
+    type: verifier
+    verifier_ref: verifiers/proposal.py
+    dispatch_mode: serial
+    inputs:
+      suggestion: { required: true }
+      brief: { required: true }
+    outputs: [{ name: proposal, kind: json, path: proposal.json }]
+
+  - name: panel_composition
+    type: verifier
+    verifier_ref: verifiers/panel.py
+    dispatch_mode: serial
+    inputs: { proposal: { required: true } }
+    outputs: [{ name: panel_composition, kind: json, path: panel-composition.json }]
+
+  - { name: rollback, type: rollback, prompt_ref: null, dispatch_mode: serial }
+
+edges:
+  - { from: brief_loader, to: lens_impact, edge_type: depends_on, from_output: brief, to_input: brief }
+  - { from: brief_loader, to: lens_root_cause, edge_type: depends_on, from_output: brief, to_input: brief }
+  - { from: brief_loader, to: lens_fix_shape, edge_type: depends_on, from_output: brief, to_input: brief }
+  - { from: brief_loader, to: lens_oracle, edge_type: depends_on, from_output: brief, to_input: brief }
+  - { from: lens_impact, to: panel_anonymize, edge_type: depends_on, from_output: lens_impact, to_input: lenses }
+  - { from: lens_root_cause, to: panel_anonymize, edge_type: depends_on, from_output: lens_root_cause, to_input: lenses }
+  - { from: lens_fix_shape, to: panel_anonymize, edge_type: depends_on, from_output: lens_fix_shape, to_input: lenses }
+  - { from: lens_oracle, to: panel_anonymize, edge_type: depends_on, from_output: lens_oracle, to_input: lenses }
+  - { from: panel_anonymize, to: synthesizer, edge_type: depends_on, from_output: lens_panel, to_input: lens_panel }
+  - { from: brief_loader, to: synthesizer, edge_type: depends_on, from_output: brief, to_input: brief }
+  - { from: synthesizer, to: proposal_builder, edge_type: depends_on, from_output: suggestion, to_input: suggestion }
+  - { from: brief_loader, to: proposal_builder, edge_type: depends_on, from_output: brief, to_input: brief }
+  - { from: proposal_builder, to: panel_composition, edge_type: depends_on, from_output: proposal, to_input: proposal }
+  - { from: brief_loader, to: rollback, edge_type: escalates_to, condition: fail }
+  - { from: panel_anonymize, to: rollback, edge_type: escalates_to, condition: fail }
+  - { from: proposal_builder, to: rollback, edge_type: escalates_to, condition: fail }
+  - { from: panel_composition, to: rollback, edge_type: escalates_to, condition: fail }
+
+rollback_strategy: retain_brief_and_lens_answers
+source_artifact: proposal.json

@@ -1,0 +1,31 @@
+name: rsi_critic
+version: "0.1.0"
+description: >
+  The decision half of a mini-ork RSI cycle: two critics on families distinct
+  from the implementer and from each other read one candidate's diff, its
+  evidence and its before/after measurement, and answer whether the change
+  actually closes the gap. Unanimity is required; a split quarantines.
+
+matches:
+  keywords:
+    - rsi critic
+    - rsi verdict
+    - review a self-improvement diff
+  regex: []
+
+artifact_contract_ref: artifact_contract.yaml
+default_workflow: workflow.yaml
+
+default_gates:
+  - budget_gate
+
+risk_class: low
+
+cost_model:
+  min_usd: 0.2
+  max_usd: 2.0
+  per_lens_usd: 0.6
+
+runtime_model:
+  min_minutes: 1
+  max_minutes: 20
