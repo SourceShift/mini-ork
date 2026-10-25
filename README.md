@@ -166,6 +166,61 @@ Exit codes `0` PROVEN, `1` REFUTED, `2` UNVERIFIED — it abstains rather than g
 so CI can gate on it. Needs Docker and one model lane.
 Try `bash examples/certify-demo/demo.sh`.
 
+## Verification, learning, and self-improvement
+
+The GIF at the top is the run loop. Three more layers sit around it. The clips below
+come from the walkthrough on [miniork.dev](https://miniork.dev/) and show sample data.
+
+### Verification the agents cannot talk their way past
+
+<p align="center">
+  <img src="assets/mini-ork-verification.gif" alt="A published run in the IDE with its level vector (applies PROVEN, executes PROVEN, target UNVERIFIED, preserve UNVERIFIED, contract PROVEN), then the verification zone: recipe verifiers, reviewer verdict, publisher gate chain, authored-patch landing, promotion gates, oversight inbox" width="900">
+</p>
+
+Every verdict is execution evidence. A recipe's verifiers run a tamper guard, the test
+suite, a base replay (the test must fail on the old code) and a mutation-adequacy check.
+A second model lane writes blind spec tests from the kickoff before the implementer
+starts, and the implementer cannot edit them. The publisher's gate chain refuses anything
+that did not pass, and a reviewer model may veto a result but can never create a pass.
+`certify` applies the same stance to one change and answers PROVEN, REFUTED, or
+UNVERIFIED when it cannot prove either way. On an adversarial SWE-bench corpus, 21 of 21
+PROVEN verdicts were correct with 0 false completions; the method and its limits are in
+[docs/RESULTS.md](docs/RESULTS.md), the mechanisms in
+[docs/architecture/verification-stack.md](docs/architecture/verification-stack.md).
+
+### Learning that keeps only what verified
+
+<p align="center">
+  <img src="assets/mini-ork-learning.gif" alt="The learning loop on the zone map: execution traces and verifier evidence become rewards, lane advantages for the router, gradients and verified lessons, and a learned block in every prompt" width="900">
+</p>
+
+After every run the traces become a process reward per node, and a positive reward has to
+be paired with verifier evidence. From there the loop fans out: per-lane advantages the
+router learns from (GRPO), textual gradients the reflection step mines into lessons, and
+a conflict check before any lesson is written. Only verified lessons reach a prompt, every
+prompt carries the learned block, and an injection ledger records exactly what each node
+received, so credit flows back to the lesson that earned it. Today the gradients and
+verified themes do flow into prompts, while learned routing still decides a small minority
+of routes. Lifecycle and status:
+[docs/LEARNING-LOOP-LIFECYCLE.md](docs/LEARNING-LOOP-LIFECYCLE.md).
+
+### Self-improvement, gated
+
+<p align="center">
+  <img src="assets/mini-ork-rsi.gif" alt="The RSI loop on the zone map, then a recipe in Improve mode: a graph patch inserts a lens, a prompt directive is measured against a control arm, promotion gates and a rollback pointer guard the new version" width="900">
+</p>
+
+mini-ork edits mini-ork through the same recipe graph: `framework-edit` (verified
+self-edits with blind spec tests), `self-improve` (scan, lenses, synthesis, implement,
+gates), `rsi-technique-review` (reads the literature and proposes techniques to build) and
+`goal-loop`. A learned change must pass a hackability audit and a verifier audit, then a
+non-regression gate on frozen probes against a blind-rerun control arm, and every promoted
+version keeps a rollback pointer. The apply loop that rewrites prompts unattended ships
+**off by default** (see the warning below). `framework-edit` is the most-run recipe, and
+`self-improve` found and merged its own fix on 2026-10-23. Details:
+[docs/RECURSIVE-SELF-IMPROVE.md](docs/RECURSIVE-SELF-IMPROVE.md),
+[docs/SAFETY.md](docs/SAFETY.md), [docs/ECOSYSTEM.md](docs/ECOSYSTEM.md).
+
 ## Everyday commands
 
 | Command | Does |

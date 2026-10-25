@@ -57,6 +57,34 @@ exit code: 1
 
 试一下: `bash examples/certify-demo/demo.sh` (需要 Docker 和至少一个可用的模型 lane)。
 
+## 🔍 验证、学习与自我改进
+
+顶部的动图是运行循环。围绕它还有三层。下面的片段来自 [miniork.dev](https://miniork.dev/) 上的演示（示例数据）。
+
+### 验证：agent 无法靠措辞蒙混过关
+
+<p align="center">
+  <img src="assets/mini-ork-verification.gif" alt="IDE 中一次已发布的运行及其级别向量（applies PROVEN、executes PROVEN、target UNVERIFIED、preserve UNVERIFIED、contract PROVEN），随后是验证区域：配方验证器、审阅裁决、发布闸门链、作者补丁落地、晋升闸门、监督收件箱" width="900">
+</p>
+
+每一个裁决都来自执行证据：篡改守卫、测试套件、基线回放（测试必须在旧代码上失败）、变异充分性检查；另一个模型通道在实现者开工之前仅凭 kickoff 写出盲测，实现者不能改动它们。审阅模型可以否决一个结果，但永远不能凭空制造通过。`certify` 对单个改动给出 PROVEN、REFUTED，或在无法证明时给出 UNVERIFIED。方法与局限见 [docs/RESULTS.md](docs/RESULTS.md)，机制见 [docs/architecture/verification-stack.md](docs/architecture/verification-stack.md)。
+
+### 学习：只保留经过验证的东西
+
+<p align="center">
+  <img src="assets/mini-ork-learning.gif" alt="区域图上的学习循环：执行轨迹与验证器证据变成奖励、路由器的通道优势、梯度与经过验证的经验，以及每个提示词里的学习块" width="900">
+</p>
+
+每次运行之后，轨迹变成每个节点的过程奖励，正向奖励必须有验证器证据配对；路由器从各通道的优势中学习（GRPO），反思步骤从文本梯度中提炼经验，写入前先做冲突检查。只有经过验证的经验才会进入提示词，注入账本记录每个节点收到了什么，功劳才能回流。生命周期与现状见 [docs/LEARNING-LOOP-LIFECYCLE.md](docs/LEARNING-LOOP-LIFECYCLE.md)。
+
+### 自我改进：带闸门
+
+<p align="center">
+  <img src="assets/mini-ork-rsi.gif" alt="区域图上的 RSI 循环，随后是处于 Improve 模式的配方：图补丁插入一个 lens，提示词指令与对照组比较，晋升闸门与回滚指针守护新版本" width="900">
+</p>
+
+mini-ork 通过同一套配方图修改自己：`framework-edit`、`self-improve`、`rsi-technique-review`、`goal-loop`。每一项学到的改动都要通过可攻击性审计与验证器审计，再通过基于冻结探针、带盲重跑对照组的非回归闸门，每个被晋升的版本都保留回滚指针。无人值守改写提示词的 apply 循环**默认关闭**。详见 [docs/RECURSIVE-SELF-IMPROVE.md](docs/RECURSIVE-SELF-IMPROVE.md)、[docs/SAFETY.md](docs/SAFETY.md)。
+
 ## 📊 数字是测出来的,不是喊出来的
 
 - **真实仓库。** 三个外部 Python 库(marshmallow、pyparsing、toolz),每个都有上游的正确修复和一个看起来合理但实际错误的修复:**6 个裁决中 5 个正确,1 个放弃判断,0 个错误。** 放弃判断的是 pyparsing 的正确修复:生成的测试假设了这个库并不具备的行为,现在 oracle 在这种情况下返回 UNVERIFIED,而不是瞎猜。更早的版本在这个仓库上两个方向都判错了。
