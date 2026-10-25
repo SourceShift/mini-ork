@@ -819,6 +819,26 @@ def dispatch_node(fields, *, root, run_dir, plan_path, task_class, db, run_id,
         print(f"  [stop] .stop-requested present — skipping node_id={node_id}", file=sys.stderr)
         return 1, "interrupted"
 
+    # Cost-pause gate: ``cost_pause.check()`` writes ``<run_dir>/.cost-pause``
+    # when cumulative run spend crosses the cap, but nothing else in the
+    # dispatch path reads it (``charge_node_cost``'s finish reason is only
+    # consulted for nodes that did not succeed). Read it here, directly after
+    # the soft-stop check, and park the run exactly like the intervention gate
+    # below: the executor's pause drain stops issuing new nodes, lets in-flight
+    # nodes finish, and ends the run with REVIEW_PAUSE_RC (rc 9) — repair,
+    # verify and reflect are already skipped for that rc. ``mini-ork resume``
+    # clears the sentinel and restarts the run.
+    if os.path.isfile(os.path.join(run_dir_eff, ".cost-pause")):
+        publish_env({"MO_NODE_FINISH_REASON": "paused_for_approval"})
+        print(
+            f"  [cost-pause] .cost-pause present — not dispatching "
+            f"node_id={node_id}; resume with: mini-ork resume {run_id}",
+            file=sys.stderr,
+        )
+        from mini_ork.gates import node_review  # noqa: PLC0415
+
+        return node_review.REVIEW_PAUSE_RC, "paused_for_approval"
+
     # Intervention gate (bash:2258-2262): runs FIRST, for every node type (including
     # planner/reflector), before the type-specific handling.
     #

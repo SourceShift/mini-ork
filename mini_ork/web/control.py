@@ -92,13 +92,18 @@ def pause_cost_run(
 def resume_cost_run(
     home: Path, task_run_id: str, approver: str
 ) -> dict[str, Any]:
-    """Clear the cost-pause sentinel + record the approval.
+    """Clear the cost-pause sentinel, record the approval, restart the run.
 
     Mirrors bin/mini-ork-resume's audit shape: appends
     {resumed_at, approver, source, run_id} to
     .cost-pause-approvals.jsonl so the resume is traceable. Returns
     ok=False when no sentinel was present (treat as a successful
     no-op on the client side).
+
+    After the clear + audit, the run is restarted with
+    ``mini-ork recover <id> --strategy resume`` — the same helper and log
+    name the CLI resume uses. A spawn failure never raises: the result
+    carries ``restarted=False`` and a ``hint`` with the manual command.
     """
     run_dir = _resolve_run_dir(home, task_run_id)
     if not run_dir.is_dir():
@@ -126,13 +131,37 @@ def resume_cost_run(
 
     sentinel.unlink()
 
-    return {
+    # The sentinel alone never stopped the run, so clearing it is not a
+    # resume: restart the run through the same seam the approvals path uses.
+    # Lazy import keeps the control plane from importing the CLI surface at
+    # module import time (and mirrors how routes import their dependencies).
+    from mini_ork.cli import approvals_cmd  # noqa: PLC0415
+
+    log_path = run_dir / "cost-resume.log"
+    restarted = False
+    spawned_log: str | None = None
+    try:
+        _pid, spawned_log = approvals_cmd._spawn_recover(
+            home, task_run_id, ["--strategy", "resume"], log_path=log_path
+        )
+        restarted = True
+    except (approvals_cmd._LauncherMissingError, OSError):
+        pass
+
+    result: dict[str, Any] = {
         "ok": True,
         "task_run_id": task_run_id,
         "action": "resume-cost",
         "approver": approver,
         "audit_path": str(approvals),
+        "restarted": restarted,
+        "log": spawned_log,
     }
+    if not restarted:
+        result["hint"] = (
+            f"mini-ork recover {task_run_id} --strategy resume"
+        )
+    return result
 
 
 def stop_run(home: Path, db: StateDB, task_run_id: str) -> dict[str, Any]:

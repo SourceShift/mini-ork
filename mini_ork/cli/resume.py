@@ -20,9 +20,10 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 _USAGE = """\
-Usage: mini-ork resume <run_id> [--answer ask-N=<text>]...
+Usage: mini-ork resume <run_id> [--no-restart] [--answer ask-N=<text>]...
 
 Clear the cost-pause sentinel for <run_id> + record an audit row, or
 record answers to the run's open profile questions and continue the run.
@@ -32,11 +33,14 @@ Arguments:
 
 Options:
   --help, -h       Show this help
+  --no-restart     Clear the sentinel + audit only; do not restart the run
   --answer ask-N=text   Answer the run's open question ask-N (repeatable)
 
-After resume, the next dispatch step against this run will be
-allowed to proceed. The cumulative spend counter is preserved -
-the NEXT pause fires when cost crosses the NEXT multiple of
+After resume, the run is restarted with
+``mini-ork recover <run_id> --strategy resume`` (the way approvals
+resume a review-parked run); pass --no-restart to only clear the
+sentinel and audit the approval. The cumulative spend counter is
+preserved - the NEXT pause fires when cost crosses the NEXT multiple of
 $MO_PAUSE_EVERY_USD (default $25), not immediately.
 
 When --answer is given, the run's asks/ask-N.json files are updated; once
@@ -81,6 +85,7 @@ def resume(
     home: str | None = None,
     approver: str | None = None,
     now: datetime.datetime | None = None,
+    restart: bool = True,
 ) -> tuple[int, str, str | None, bool]:
     """Mirror ``bin/mini-ork-resume`` for a single run_id.
 
@@ -93,6 +98,15 @@ def resume(
       * 0 — success (no stderr; ``audit_path`` is the jsonl path;
              ``sentinel_removed`` is ``True``; ``stdout_msg`` is the
              "[mini-ork-resume] resumed ..." line).
+
+    After the sentinel is cleared and the audit row written, the run itself
+    is restarted with ``mini-ork recover <run_id> --strategy resume`` via
+    ``approvals_cmd._spawn_recover`` — the same hand-off ``mini-ork approvals``
+    uses for a review-parked run. ``restart=False`` (CLI ``--no-restart``)
+    keeps the old clear-and-audit-only behaviour. A launcher that cannot be
+    spawned degrades to a manual-resume hint in ``stdout_msg`` rather than
+    raising: the sentinel is already gone, so the operator must be told how
+    to drive the run forward.
 
     Stderr is written in-process to mirror bash's behavior so the parity
     test can compare it against bash's captured stderr.
@@ -123,13 +137,39 @@ def resume(
         fh.write(row)
     os.remove(sentinel)
 
-    return (
-        0,
+    stdout_msg = (
         f"[mini-ork-resume] resumed {run_id} (approver={approver}, "
-        f"audit={approvals})\n",
-        approvals,
-        True,
+        f"audit={approvals})"
     )
+    if restart:
+        # The run never stopped (the old sentinel was written but not read by
+        # the dispatch path), so a resume that only deletes the file would
+        # leave it dead. Restart it exactly the way an approvals resume does:
+        # a detached ``recover --strategy resume`` with its own log in the
+        # run dir. ``_spawn_recover`` raises only when the launcher is
+        # unusable; the sentinel is already gone, so degrade to the manual
+        # command instead of tracing back. Imported here, not at module scope:
+        # the clear-and-audit path (and the parity tests that drive it) must not
+        # pay for the approvals/ledger import.
+        from mini_ork.cli import approvals_cmd  # noqa: PLC0415
+
+        log_path = Path(run_dir) / "cost-resume.log"
+        try:
+            _pid, spawned_log = approvals_cmd._spawn_recover(
+                Path(run_dir).parent.parent,
+                run_id,
+                ["--strategy", "resume"],
+                log_path=log_path,
+            )
+        except (approvals_cmd._LauncherMissingError, OSError):
+            stdout_msg += (
+                f"\nresume with: mini-ork recover {run_id} --strategy resume"
+            )
+        else:
+            stdout_msg += f"; restarting (log: {spawned_log})"
+    stdout_msg += "\n"
+
+    return 0, stdout_msg, approvals, True
 
 
 def _list_ask_files(run_dir: str) -> list[str]:
@@ -267,13 +307,17 @@ def main(argv: list[str] | None = None) -> int:
 
     run_id = ""
     answers: dict[str, str] = {}
+    restart = True
     i = 0
     while i < len(argv):
         a = argv[i]
         if a in ("--help", "-h"):
             sys.stdout.write(_usage())
             return 0
-        if a == "--answer":
+        if a == "--no-restart":
+            restart = False
+            i += 1
+        elif a == "--answer":
             if i + 1 >= len(argv):
                 sys.stderr.write("--answer requires ask-N=text\n")
                 return 2
@@ -310,7 +354,7 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdout.write(stdout_msg)
         return rc
 
-    rc, stdout_msg, _audit, _removed = resume(run_id)
+    rc, stdout_msg, _audit, _removed = resume(run_id, restart=restart)
     if stdout_msg:
         sys.stdout.write(stdout_msg)
     return rc
