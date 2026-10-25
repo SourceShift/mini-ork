@@ -69,7 +69,6 @@ from mini_ork.gates.node_review import REVIEW_PAUSE_RC  # noqa: F401
 
 
 # ── extracted modules (re-exported contracts; definitions live in the modules) ──
-from mini_ork.learning import revise_value
 from mini_ork.learning.writeback import (  # noqa: F401
     learning_update_conductor_outcomes,
     reward_from_status,
@@ -1185,6 +1184,10 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
     retry_edges: dict[str, CompiledRetryEdge] = {}
     escalation_edges: dict[str, CompiledRetryEdge] = {}
     recursive_children: dict[str, tuple[str, ...]] = {}
+    # Declared `recursion:` config, loaded once below when the workflow exists.
+    # ``None`` means the recipe declared no block (or there is no workflow file):
+    # its `escalates_to` edges stay inert and the declared budget does not apply.
+    recursion = None
     if workflow and os.path.isfile(workflow):
         from mini_ork.workflow import compile_workflow
 
@@ -1417,9 +1420,6 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         fields_by_id = {field[0]: field for field in work_fields}
         # revise round bookkeeping: target node_id -> rounds already consumed.
         round_used: dict[str, int] = {}
-        # CoBa: a granted round is settled by the source that fired it, which
-        # re-runs in a later wave. source node_id -> (target, round number).
-        open_round_settles: dict[str, tuple[str, int]] = {}
         # RB-18: the defect report is noted once per run, not once per wave.
         spec_defect_noted = False
 
@@ -1590,21 +1590,6 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                     fail_count += 1
                     failed_outcomes[field[0]] = _finish_reason or "failed"
 
-            # ── CoBa: settle the revise round a source fired ───────────────
-            # A round's value is whether the source that fired it passes the
-            # next time it runs (the target reset pulls it into a later wave).
-            # Settle before grouping: a source failing again in this same wave
-            # settles the previous round as failed and may fire the next one.
-            # An empty history makes the whole rule inert; the module never
-            # raises, so a broken DB cannot stall the loop.
-            for field, rc, _finish_reason in outcomes:
-                pending_settle = open_round_settles.pop(field[0], None)
-                if pending_settle is None:
-                    continue
-                _settle_target, _settle_round = pending_settle
-                revise_value.settle_round(
-                    db, run_id, _settle_target, _settle_round, rc == 0)
-
             # ── per-run orchestrator (default on; MO_RUN_ORCHESTRATOR=0 opts out) ──
             # Observe each node outcome at the wave boundary and pick one of
             # advance/help/repair/mutate/promote (see
@@ -1696,8 +1681,8 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                           file=sys.stderr)
                     continue
                 edge = repair_edges[field[0]]
-                target, max_rounds = edge.target, edge.max_rounds
-                cap = min(max_rounds, revise_rounds_cap)
+                target = edge.target
+                cap = _round_cap(field[0], edge, escalation_edges, revise_rounds_cap)
                 if round_used.get(target, 0) >= cap:
                     continue
                 if target not in fields_by_id:
@@ -1709,15 +1694,6 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                     # field (KeyError at the reset below) (run-1791469896-2926).
                     print(f"[revise] skipped for {field[0]}: revise target '{target}' "
                           "is outside this run's node closure", file=sys.stderr)
-                    continue
-                # CoBa: stop spending rounds whose measured marginal value is
-                # too low. With no settled history (n < min samples) this is
-                # always False, so the default behaviour is unchanged.
-                _coba_stop, _coba_reason = revise_value.should_stop(
-                    db, task_class, target, round_used.get(target, 0) + 1)
-                if _coba_stop:
-                    print(f"[revise] coba stop for {target}: {_coba_reason}",
-                          file=sys.stderr)
                     continue
                 revise_groups.setdefault(target, []).append((field, rc, finish_reason))
             # Second pass: condition-fired rounds (rc==0 + condition predicate
@@ -1750,7 +1726,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 if not outcome.fired:
                     continue
                 target = edge.target
-                cap = min(edge.max_rounds, revise_rounds_cap)
+                cap = _round_cap(field[0], edge, escalation_edges, revise_rounds_cap)
                 if round_used.get(target, 0) >= cap:
                     # Round cap applies symmetrically to condition-fired and
                     # rc-fired rounds (F6). The cap was already checked for
@@ -1769,15 +1745,6 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                     # stand as a pass.
                     print(f"[revise] skipped for {field[0]}: revise target "
                           f"'{target}' is outside this run's node closure",
-                          file=sys.stderr)
-                    continue
-                # CoBa applies symmetrically to the condition channel: same cap,
-                # same measured value. Inert until the history has enough
-                # settled samples.
-                _coba_stop, _coba_reason = revise_value.should_stop(
-                    db, task_class, target, round_used.get(target, 0) + 1)
-                if _coba_stop:
-                    print(f"[revise] coba stop for {target}: {_coba_reason}",
                           file=sys.stderr)
                     continue
                 # Mark the source with a sentinel finish_reason so the
@@ -1815,15 +1782,28 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                 for target, failed_sources in revise_groups.items():
                     _target_edge = repair_edges[failed_sources[0][0][0]]
                     _target_max = _target_edge.max_rounds
+                    # A recursion edge spends the recipe's declared total budget,
+                    # not an implicit one. Check once per target per wave, before
+                    # the round is charged; a None spend (unreadable ledger) fails
+                    # open, matching the orchestrator's budget gate.
+                    _escalation_fired = any(
+                        _src_field[0] in escalation_edges
+                        for _src_field, _src_rc, _src_fr in failed_sources)
+                    if _escalation_fired and recursion is not None:
+                        from mini_ork import cost_ledger as _cost_ledger  # noqa: PLC0415
+
+                        _spent = _cost_ledger.run_cost(db, run_id)
+                        if (_spent is not None
+                                and _spent >= recursion.budget_cap_total_usd):
+                            print(
+                                f"[revise] recursion budget cap reached for "
+                                f"{target}: spent ${_spent:.2f} of "
+                                f"${recursion.budget_cap_total_usd:.2f}",
+                                file=sys.stderr,
+                            )
+                            continue
                     round_no = round_used.get(target, 0) + 1
                     round_used[target] = round_no
-                    # CoBa: this round is granted; remember it so the measured
-                    # value of the next one can be taken from real history,
-                    # and settle it when a firing source next reports.
-                    revise_value.record_round(
-                        db, run_id, task_class, target, round_no)
-                    for _src_field, _src_rc, _src_fr in failed_sources:
-                        open_round_settles[_src_field[0]] = (target, round_no)
                     reset_ids = _control_descendants(target)
                     feedback_path = _write_revise_feedback(
                         live_run_dir, round_no, _target_max, failed_sources)
@@ -4683,6 +4663,24 @@ def _revise_rounds_limit() -> int:
         return int(context_env("MO_REVISE_ROUNDS", "2"))
     except ValueError:
         return 2
+
+
+def _round_cap(source: str, edge, escalation_edges, revise_rounds_cap: int) -> int:
+    """Round cap for one revise edge.
+
+    A recipe that declares a ``recursion:`` block owns its loop: the compiler
+    stamps ``recursion.max_iterations`` onto each ``escalates_to`` edge, and
+    that declared cap applies unless the operator explicitly sets
+    ``MO_REVISE_ROUNDS`` (an empty string counts as unset). Every other edge --
+    ``retries`` edges, and all edges of recipes without a recursion block --
+    keeps today's ``min(edge.max_rounds, MO_REVISE_ROUNDS)`` rule byte for byte.
+    ``revise_rounds_cap <= 0`` still disables the loop for every edge.
+    """
+    if revise_rounds_cap <= 0:
+        return 0
+    if source in escalation_edges and not context_env("MO_REVISE_ROUNDS", ""):
+        return edge.max_rounds
+    return min(edge.max_rounds, revise_rounds_cap)
 
 
 # ── RB-18: only a real verdict may start a revise round ─────────────────────
