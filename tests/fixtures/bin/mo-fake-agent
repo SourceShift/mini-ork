@@ -4,7 +4,8 @@ tier (no LLM spend). Every lane of the test run points here; the node's role
 (MO_NODE_TYPE, published per node by the executor) picks the answer:
 
 * implementer — applies the fixture's one-line fix in the cwd (the target
-  checkout) and reports it;
+  checkout) and reports it as a unified diff, the way a text lane does: the
+  publisher commits only a patch it can attribute to the implementer;
 * reviewer — passes;
 * anything else — a short acknowledgement.
 
@@ -34,8 +35,27 @@ def main() -> int:
         if not target.is_file():
             print(f"mo-fake-agent: no calc_pkg/calc.py under {Path.cwd()}", file=sys.stderr)
             return 1
-        target.write_text(target.read_text().replace(BUG, FIX))
+        original = target.read_text()
+        target.write_text(original.replace(BUG, FIX))
         print("Fixed the off-by-one in calc_pkg/calc.py: range(1, n) -> range(1, n + 1).")
+        # The publisher commits only a patch it can attribute to the implementer:
+        # a transcript Write/Edit, or the unified diff the implementer emitted.
+        # This stand-in edits the tree directly and leaves no transcript, so it
+        # says what it changed the way a text lane does. `apply_impl_output`
+        # will not re-apply it — it only runs when the tree is clean.
+        if BUG in original and FIX not in original:
+            sys.stdout.write(
+                "--- a/calc_pkg/calc.py\n"
+                "+++ b/calc_pkg/calc.py\n"
+                "@@ -1,6 +1,6 @@\n"
+                ' """Remote-nodes E2E fixture: one off-by-one, one failing test."""\n'
+                " \n"
+                " \n"
+                " def total_upto(n):\n"
+                '     """Sum of the integers 1..n inclusive."""\n'
+                f"-    {BUG}\n"
+                f"+    {FIX}\n"
+            )
     elif role == "reviewer":
         print(json.dumps({"verdict": "pass", "summary": "one-line fix; test covers it"}))
     else:
