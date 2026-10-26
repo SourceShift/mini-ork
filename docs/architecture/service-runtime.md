@@ -98,6 +98,7 @@ Every route except `/v1/health` requires the node bearer token.
 | `DELETE` | `/v1/services/{sid}` | `{"deleted": sid}` |
 | `POST` | `/v1/services/{sid}/restart` | status after `docker restart` |
 | `GET` | `/v1/services/{sid}/logs?tail=N` | merged logs, `N` clamped to 1..5000 |
+| `POST` | `/v1/services/{sid}/exec` | run one command in replica 0; `{argv, stdin, timeout}` in, rc + bounded output out |
 
 `POST /v1/services` is an upsert by default (`replace: true`). A redeploy of
 the same `service_id` tears the old replicas down first, which is what a
@@ -327,6 +328,70 @@ The node still does not decide *where* off-node bytes live, *how many* copies to
 keep, or *when* they expire. It moves bytes and proves their integrity; those
 three questions are retention policy and stay in the control plane.
 
+## Exec — one command inside a live replica
+
+Some maintenance cannot be expressed as a new deployment: rotating a managed
+database's password must run *inside* the running engine, against its own
+`psql`/`redis-cli`, without restarting it or baking a secret into an image. The
+node exposes exactly that, and nothing broader:
+
+```http
+POST /v1/services/{sid}/exec
+{"argv": ["sh", "-c", "IFS= read -r new; …"], "stdin": "<new secret>\n", "timeout": 30}
+→ {"service_id": "db", "replica": 0, "exit_code": 0, "stdout": "ALTER ROLE", "stderr": ""}
+```
+
+```mermaid
+sequenceDiagram
+  participant CP as control plane
+  participant NA as node agent
+  participant C as replica 0
+
+  CP->>NA: POST /exec {argv, stdin: secret, timeout}
+  NA->>NA: validate argv shape + bounds
+  NA->>NA: inspect state — must be running
+  NA->>C: docker exec -i <name> <argv…>   (secret on stdin)
+  C-->>NA: rc + stdout + stderr
+  NA-->>CP: {exit_code, stdout, stderr}   (tail-bounded)
+```
+
+Why the shape is what it is:
+
+- **The secret travels on stdin.** `ps` on the node shows every `docker exec`
+  argument, and anything in argv is readable by anyone with a shell on the host
+  for as long as the command runs. A password belongs on stdin, which the node
+  passes through and never records.
+- **The node logs neither argv nor stdin.** It has no logger in this path; the
+  control plane's audit records the service, the exit code, and the fact that a
+  command ran. That is enough to answer "did something run" and not enough to
+  leak what it carried. The same rule as env values: mechanism sees the value,
+  state never does.
+- **Replica 0 only.** A managed engine runs one replica; fanning out would
+  produce answers the caller has no per-replica use for, and make a partial
+  failure the normal case.
+- **A stopped replica is refused, not started.** Exec is maintenance on a live
+  service, not a way to wake one. `400` names the container and its state.
+- **Bounds are enforced before Docker runs.** `argv` is a non-empty list of at
+  most 64 non-empty strings of at most 4096 bytes each; `stdin` at most 1 MiB;
+  `timeout` an integer 1..300. Every refusal happens with zero processes
+  spawned, so a malformed request cannot reach a container.
+- **A non-zero exit is data, not a transport failure.** The command ran and
+  failed; the caller gets `200` with `exit_code` and the tail of stderr, which
+  is what it needs to decide whether to retry, roll back, or stop.
+- **Timeout is `504`.** A command that outlives its budget is killed by
+  `subprocess.run(timeout=…)`; the node says so rather than hanging the request.
+- **Output is tail-bounded** (1 MiB per stream, prefixed with `…` when cut). The
+  end of an error is what explains the exit; a silent truncation would be worse
+  than a stated one.
+- **Unknown service is `404`.** An exec names a service the node created; it
+  does not reach for a container by name.
+
+The node does not decide *which* commands are allowed. The proprietary layer
+picks the argv per engine template, generates the secret, and confirms the new
+credential works before recording the rotation. The node runs what it is told
+inside a replica the caller already owns — no shell on the host, no image pull,
+no new container.
+
 ## What is deliberately absent
 
 These are the proprietary layer's job, and every one of them is policy:
@@ -422,3 +487,9 @@ target the node actually composed, that the directory exists `0700`, that
 `delete` leaves the data, that the status response never leaks a host path,
 that a relative `MO_NODE_VOLUME_ROOT` stops the app from starting, and that
 the published schema rejects the same shapes the node does.
+
+For `exec` it asserts the composed argv (`docker exec -i <replica> …`), that the
+secret reached the runner on stdin and never appeared in argv, that neither
+argv nor stdin landed in `services.json`, that every malformed shape is a `400`
+with zero processes spawned, that a stopped replica is refused, that a
+non-zero exit is `200` with the code, and that a timeout is `504`.

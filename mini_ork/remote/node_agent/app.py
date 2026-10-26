@@ -65,6 +65,7 @@ def create_app(
     version: str = "0.1.0",
     _run_fn: Callable | None = None,
     _spawn_fn: Callable | None = None,
+    _run_input_fn: Callable | None = None,
 ) -> FastAPI:
     """Build the node-agent FastAPI app.
 
@@ -512,7 +513,10 @@ def create_app(
     # hosted deployment platform builds on. Mechanism only: tenancy, routing,
     # and billing policy live in the closed control plane.
     app.include_router(
-        make_services_router(state_dir, bearer=bearer, _run_fn=_run_fn)
+        make_services_router(
+            state_dir, bearer=bearer, _run_fn=_run_fn,
+            _run_input_fn=_run_input_fn,
+        )
     )
 
     return app

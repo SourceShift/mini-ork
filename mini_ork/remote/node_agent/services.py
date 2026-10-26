@@ -88,6 +88,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import tarfile
 import time
 import uuid
@@ -208,6 +209,27 @@ def _port_mapping(port: Mapping[str, Any]) -> str:
     return target
 
 
+def _run_input(
+    argv: list[str], *, stdin: str = "", timeout: float = 30
+) -> subprocess.CompletedProcess:
+    """Run argv with stdin attached — the seam for control-plane exec.
+
+    Separate from :func:`procs._run` because that helper has no way to hand a
+    child bytes, and a credential must travel on stdin rather than in argv
+    where ``ps`` on the node would show it. Mirrors the same
+    ``capture_output``/``text``/``check=False`` contract so callers treat the
+    result identically.
+    """
+    return subprocess.run(
+        argv,
+        input=stdin,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout,
+    )
+
+
 def _extract_safely(archive: Path, dest: Path) -> None:
     """Extract a snapshot without letting a member escape ``dest``.
 
@@ -264,6 +286,14 @@ class ServiceRestartFailedError(RuntimeError):
     The archive is durable and listed — the copy is real — but leaving the
     service down silently would be worse than an error. The message names the
     snapshot so the operator can act on both facts.
+    """
+
+
+class ServiceExecTimeoutError(RuntimeError):
+    """A control-plane exec outlived its bound and was killed.
+
+    Distinct from a non-zero exit: the command did not answer, so the caller
+    cannot conclude that it failed at its own work.
     """
 
 
@@ -505,9 +535,11 @@ class ServiceManager:
         snapshot_root: Path | None = None,
         snapshot_max_bytes: int | None = None,
         _run_fn: Callable[..., Any] | None = None,
+        _run_input_fn: Callable[..., Any] | None = None,
     ) -> None:
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        self._run_input = _run_input_fn or _run_input
         self.volume_root = self._resolve_volume_root(volume_root)
         self.snapshot_root = self._resolve_snapshot_root(snapshot_root)
         self.snapshot_max_bytes = self._resolve_snapshot_max_bytes(snapshot_max_bytes)
@@ -1233,6 +1265,98 @@ class ServiceManager:
             chunks.append(f"--- replica {replica} ---\n{text}")
         return "\n".join(chunks)
 
+    #: Bounds on a control-plane exec. The node runs an argv it did not write,
+    #: so the shape is capped before anything reaches Docker: a caller cannot
+    #: stream an unbounded body through the agent or keep a child alive for
+    #: hours. Every limit is a refusal, never a truncation of the request.
+    _EXEC_MAX_ARGV = 64
+    _EXEC_MAX_ARG = 4096
+    _EXEC_MAX_STDIN = 1 << 20
+    _EXEC_MAX_OUTPUT = 1 << 20
+    _EXEC_MAX_TIMEOUT = 300
+
+    def exec_in_service(
+        self,
+        service_id: str,
+        argv: object,
+        *,
+        stdin: object = "",
+        timeout: object = 30,
+    ) -> dict[str, Any]:
+        """Run one argv inside replica 0 of a service.
+
+        The primitive exists for engine maintenance the platform owns — rotating
+        a managed database's password, for instance — not as a tenant shell.
+        ``stdin`` is how a value that must not be in argv reaches the command,
+        because ``ps`` on the node shows every ``docker exec`` argument. The
+        node deliberately logs neither argv nor stdin; the control plane records
+        argc and the exit code, which is enough to audit that something ran and
+        not enough to leak what it carried.
+
+        Replica 0 is the only target: a managed engine runs one replica, and a
+        fan-out would produce an answer the caller has no per-replica use for.
+        A container that is not running is refused rather than started: exec is
+        maintenance on a live service, not a way to wake one.
+        """
+        spec = self._specs.get(service_id)
+        if spec is None:
+            raise KeyError(service_id)
+        if not isinstance(argv, (list, tuple)) or not argv:
+            raise ServiceError("argv must be a non-empty list of strings")
+        if len(argv) > self._EXEC_MAX_ARGV:
+            raise ServiceError(f"argv may carry at most {self._EXEC_MAX_ARGV} entries")
+        cleaned: list[str] = []
+        for arg in argv:
+            if not isinstance(arg, str) or arg == "":
+                raise ServiceError("argv entries must be non-empty strings")
+            if len(arg.encode("utf-8")) > self._EXEC_MAX_ARG:
+                raise ServiceError(
+                    f"an argv entry exceeds {self._EXEC_MAX_ARG} bytes"
+                )
+            cleaned.append(arg)
+        if not isinstance(stdin, str):
+            raise ServiceError("stdin must be a string")
+        if len(stdin.encode("utf-8")) > self._EXEC_MAX_STDIN:
+            raise ServiceError(f"stdin exceeds {self._EXEC_MAX_STDIN} bytes")
+        if isinstance(timeout, bool) or not isinstance(timeout, int):
+            raise ServiceError("timeout must be an integer number of seconds")
+        if not 1 <= timeout <= self._EXEC_MAX_TIMEOUT:
+            raise ServiceError(f"timeout must be between 1 and {self._EXEC_MAX_TIMEOUT}")
+
+        name = self._name(spec, 0)
+        state = self._replica_state(name)
+        if state != "running":
+            raise ServiceError(f"replica {name} is {state}; exec needs a running container")
+
+        try:
+            result = self._run_input(
+                ["docker", "exec", "-i", name, *cleaned],
+                stdin=stdin,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ServiceExecTimeoutError(
+                f"exec in {name} did not finish within {timeout}s"
+            ) from exc
+        except OSError as exc:
+            raise RuntimeError(f"could not exec in {name}: {exc}") from exc
+
+        def bounded(text: object) -> str:
+            value = str(text or "")
+            # Keep the tail: an error a command prints last is what explains
+            # the exit, and a silent cut is worse than a stated one.
+            if len(value) <= self._EXEC_MAX_OUTPUT:
+                return value
+            return "…" + value[-self._EXEC_MAX_OUTPUT :]
+
+        return {
+            "service_id": service_id,
+            "replica": 0,
+            "exit_code": int(getattr(result, "returncode", 1)),
+            "stdout": bounded(getattr(result, "stdout", "")),
+            "stderr": bounded(getattr(result, "stderr", "")),
+        }
+
     #: Docker's zero value for ``State.FinishedAt``: a container that has
     #: never finished. Reporting it as a timestamp would be a lie the caller
     #: has to special-case; ``null`` says "still running" and nothing else.
@@ -1317,6 +1441,7 @@ def make_router(
     snapshot_root: Path | None = None,
     snapshot_max_bytes: int | None = None,
     _run_fn: Callable | None = None,
+    _run_input_fn: Callable | None = None,
 ) -> APIRouter:
     """Build the FastAPI router exposing the ``/v1/services`` surface.
 
@@ -1336,6 +1461,7 @@ def make_router(
         snapshot_root=snapshot_root,
         snapshot_max_bytes=snapshot_max_bytes,
         _run_fn=_run_fn,
+        _run_input_fn=_run_input_fn,
     )
     router = APIRouter()
 
@@ -1379,6 +1505,26 @@ def make_router(
             return {"service_id": sid, "logs": services.logs(sid, tail=tail)}
         except KeyError as exc:
             raise HTTPException(404, f"unknown service {sid!r}") from exc
+
+    @router.post("/v1/services/{sid}/exec")
+    def post_service_exec(sid: str, payload: dict | None = None,
+                          _: None = Depends(bearer)) -> dict:
+        body = payload or {}
+        try:
+            return services.exec_in_service(
+                sid,
+                body.get("argv"),
+                stdin=body.get("stdin", ""),
+                timeout=body.get("timeout", 30),
+            )
+        except KeyError as exc:
+            raise HTTPException(404, f"unknown service {sid!r}") from exc
+        except ServiceError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except ServiceExecTimeoutError as exc:
+            raise HTTPException(504, str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(500, str(exc)) from exc
 
     # ---- volume snapshots ---------------------------------------------
 

@@ -48,6 +48,26 @@ class _Docker:
         self.fail_stop: str | None = None
         self.fail_start: str | None = None
         self.removed: list[str] = []
+        #: (argv, stdin) pairs the exec route handed to the runner. Kept apart
+        #: from ``calls`` so a test can assert a credential travelled on stdin.
+        self.inputs: list[tuple[list[str], str | None]] = []
+        self.exec_exit = 0
+        self.exec_stdout = ""
+        self.exec_stderr = ""
+        self.exec_timeout = False
+
+    def run_input(self, argv, **kwargs):
+        argv = [str(a) for a in argv]
+        self.inputs.append((argv, kwargs.get("stdin")))
+        if self.exec_timeout:
+            import subprocess
+
+            raise subprocess.TimeoutExpired(argv, kwargs.get("timeout", 0))
+        r = _FakeCompleted()
+        r.returncode = self.exec_exit
+        r.stdout = self.exec_stdout
+        r.stderr = self.exec_stderr
+        return r
 
     def __call__(self, argv, **_kwargs):
         argv = [str(a) for a in argv]
@@ -147,7 +167,9 @@ def docker(monkeypatch) -> _Docker:
 
 @pytest.fixture()
 def app(tmp_path: Path, docker: _Docker):
-    return create_app(state_dir=tmp_path, token_env=TOKEN_ENV, _run_fn=docker)
+    return create_app(
+        state_dir=tmp_path, token_env=TOKEN_ENV, _run_fn=docker, _run_input_fn=docker.run_input
+    )
 
 
 @pytest.fixture()
@@ -393,6 +415,148 @@ def test_delete_removes_containers_and_state(client, docker, tmp_path):
 
 def test_delete_unknown_is_404(client):
     assert client.delete("/v1/services/web", headers=AUTH).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# exec — maintenance the control plane owns, with the secret on stdin
+#
+# ``ps`` on the node shows every ``docker exec`` argument, so a value that must
+# not be readable by anyone with a shell belongs on stdin. These tests pin the
+# two halves of that contract: the value reaches the command, and neither argv
+# nor the persisted state ever carries it.
+# ---------------------------------------------------------------------------
+
+
+_EXEC_BODY = {"argv": ["sh", "-c", 'IFS= read -r new; echo "$new"'], "stdin": "s3cr3t\n"}
+
+
+def test_exec_runs_in_replica_zero_and_returns_its_result(client, docker):
+    assert client.post("/v1/services", json=_spec(), headers=AUTH).status_code == 200
+    docker.exec_stdout = "ALTER ROLE"
+
+    r = client.post("/v1/services/web/exec", json=_EXEC_BODY, headers=AUTH)
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "service_id": "web",
+        "replica": 0,
+        "exit_code": 0,
+        "stdout": "ALTER ROLE",
+        "stderr": "",
+    }
+
+    argv, stdin = docker.inputs[0]
+    assert argv[:4] == ["docker", "exec", "-i", "mo-svc-web-0"]
+    assert argv[4:] == _EXEC_BODY["argv"]
+    assert stdin == "s3cr3t\n"
+    # The whole point of stdin: the value is not an argument anyone can read.
+    assert "s3cr3t" not in " ".join(argv)
+
+
+def test_exec_leaves_no_trace_of_argv_or_stdin_in_state(client, tmp_path):
+    assert client.post("/v1/services", json=_spec(), headers=AUTH).status_code == 200
+    assert client.post("/v1/services/web/exec", json=_EXEC_BODY, headers=AUTH).status_code == 200
+
+    persisted = (tmp_path / "services.json").read_text()
+    assert "s3cr3t" not in persisted
+    assert "IFS= read" not in persisted
+
+
+def test_exec_refuses_a_replica_that_is_not_running(client, docker):
+    assert client.post("/v1/services", json=_spec(), headers=AUTH).status_code == 200
+    docker.states["mo-svc-web-0"] = "exited"
+
+    r = client.post("/v1/services/web/exec", json={"argv": ["true"]}, headers=AUTH)
+    assert r.status_code == 400
+    assert "exec needs a running container" in r.text
+    # Refused before docker: an exec is maintenance, not a way to wake a service.
+    assert docker.inputs == []
+
+
+def test_exec_of_an_unknown_service_is_404(client, docker):
+    r = client.post("/v1/services/web/exec", json={"argv": ["true"]}, headers=AUTH)
+    assert r.status_code == 404
+    assert docker.inputs == []
+
+
+@pytest.mark.parametrize(
+    "body, reason",
+    [
+        ({}, "argv must be"),
+        ({"argv": []}, "argv must be"),
+        ({"argv": "psql"}, "argv must be"),
+        ({"argv": [""]}, "non-empty strings"),
+        ({"argv": ["ok", 3]}, "non-empty strings"),
+        ({"argv": ["x" * 4097]}, "exceeds 4096 bytes"),
+        ({"argv": ["x"] * 65}, "at most 64 entries"),
+        ({"argv": ["x"], "stdin": "y" * ((1 << 20) + 1)}, "stdin exceeds"),
+        ({"argv": ["x"], "stdin": 5}, "stdin must be a string"),
+        ({"argv": ["x"], "timeout": 0}, "between 1 and 300"),
+        ({"argv": ["x"], "timeout": 301}, "between 1 and 300"),
+        ({"argv": ["x"], "timeout": True}, "integer number of seconds"),
+        ({"argv": ["x"], "timeout": "30"}, "integer number of seconds"),
+    ],
+    ids=[
+        "no-argv",
+        "empty-argv",
+        "argv-not-a-list",
+        "empty-entry",
+        "non-string-entry",
+        "entry-too-long",
+        "too-many-entries",
+        "stdin-too-large",
+        "stdin-not-a-string",
+        "timeout-zero",
+        "timeout-too-large",
+        "timeout-bool",
+        "timeout-string",
+    ],
+)
+def test_a_bad_exec_shape_is_a_400_before_docker(client, docker, body, reason):
+    assert client.post("/v1/services", json=_spec(), headers=AUTH).status_code == 200
+
+    r = client.post("/v1/services/web/exec", json=body, headers=AUTH)
+    assert r.status_code == 400, r.text
+    assert reason in r.text
+    assert docker.inputs == []
+
+
+def test_exec_reports_a_nonzero_exit_as_data(client, docker):
+    assert client.post("/v1/services", json=_spec(), headers=AUTH).status_code == 200
+    docker.exec_exit = 2
+    docker.exec_stderr = "psql: error: role does not exist"
+
+    r = client.post("/v1/services/web/exec", json={"argv": ["psql"]}, headers=AUTH)
+    # The command ran and failed. That is a result, not a transport error: the
+    # caller needs the exit code and the tail of stderr to decide what next.
+    assert r.status_code == 200
+    assert r.json()["exit_code"] == 2
+    assert r.json()["stderr"] == "psql: error: role does not exist"
+
+
+def test_exec_output_is_tail_bounded(client, docker):
+    assert client.post("/v1/services", json=_spec(), headers=AUTH).status_code == 200
+    docker.exec_stdout = "x" * ((1 << 20) + 5)
+
+    r = client.post("/v1/services/web/exec", json={"argv": ["cat"]}, headers=AUTH)
+    assert r.status_code == 200
+    stdout = r.json()["stdout"]
+    assert len(stdout) == (1 << 20) + 1
+    assert stdout.startswith("…")
+
+
+def test_a_command_that_outlives_its_budget_is_504(client, docker):
+    assert client.post("/v1/services", json=_spec(), headers=AUTH).status_code == 200
+    docker.exec_timeout = True
+
+    r = client.post(
+        "/v1/services/web/exec", json={"argv": ["sleep", "999"], "timeout": 5}, headers=AUTH
+    )
+    assert r.status_code == 504
+    assert "did not finish within 5s" in r.text
+
+
+def test_exec_requires_bearer(client):
+    assert client.post("/v1/services/web/exec", json={"argv": ["true"]}).status_code == 401
 
 
 # ---------------------------------------------------------------------------
