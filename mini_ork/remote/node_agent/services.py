@@ -85,6 +85,8 @@ something this module can invent.
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
 import ipaddress
 import json
@@ -100,7 +102,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Iterator, Mapping
+from typing import Any, AsyncIterator, Callable, Mapping
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
@@ -187,6 +189,10 @@ _NETWORK_DRIVERS = frozenset({"bridge", "overlay"})
 #: closed, so an abandoned tail stops reading instead of growing forever.
 _LOG_TAIL_MAX = 5000
 _LOG_QUEUE_FRAMES = 2000
+#: How often an idle tail re-checks whether its reader is still connected. A
+#: quiet container produces no write that would fail, so without this poll the
+#: children would outlive the request that asked for them.
+_LOG_POLL_SECONDS = 0.2
 
 #: Docker's ``--timestamps`` prefix: RFC3339 in UTC with a ``Z`` and optional
 #: fractional seconds. Matching it means a line's timestamp is *Docker's clock*
@@ -238,8 +244,59 @@ def _popen_logs(argv: list[str]) -> subprocess.Popen:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        # A container is not obliged to emit valid UTF-8, and one bad byte
+        # must not end the tail. Replacement characters are visible and
+        # honest; a truncated stream is neither.
+        errors="replace",
         bufsize=1,
     )
+
+
+class _LogTail:
+    """Running follow children plus the queue they feed.
+
+    The reader *polls* instead of iterating: the HTTP layer has to notice a
+    disconnected reader while the container is quiet, and a blocking
+    ``queue.get`` would pin the request and the Docker children until the next
+    line arrived. ``poll()`` never blocks; ``close()`` is what ends the tail.
+    """
+
+    def __init__(
+        self,
+        *,
+        frames: queue.Queue[dict[str, Any]],
+        procs: list[subprocess.Popen],
+        stopped: threading.Event,
+        open_tails: int,
+    ) -> None:
+        self._frames = frames
+        self._procs = procs
+        self._stopped = stopped
+        self._open = open_tails
+
+    @property
+    def done(self) -> bool:
+        """Every replica reported its ``eof``."""
+        return self._open == 0
+
+    def poll(self) -> dict[str, Any] | None:
+        """The next frame, or ``None`` when nothing is buffered right now."""
+        try:
+            frame = self._frames.get_nowait()
+        except queue.Empty:
+            return None
+        if frame.get("eof"):
+            self._open -= 1
+        return frame
+
+    def close(self) -> None:
+        """Stop the tail and kill every child that is still following."""
+        self._stopped.set()
+        for proc in self._procs:
+            with contextlib.suppress(OSError):
+                if proc.poll() is None:
+                    proc.kill()
 
 
 def _port_mapping(port: Mapping[str, Any]) -> str:
@@ -1414,21 +1471,23 @@ class ServiceManager:
 
     def follow_logs(
         self, service_id: str, *, tail: int = 50, replica: int | None = None
-    ) -> Iterator[dict[str, Any]]:
-        """Live log frames for one service, one ``docker logs --follow`` per replica.
+    ) -> _LogTail:
+        """Start a live tail for one service, one ``docker logs --follow`` per replica.
 
-        Frames are ``{"replica", "ts", "line"}``; each replica ends with
+        Returns a handle the reader polls. Frames are
+        ``{"replica", "ts", "line"}``; each replica ends with
         ``{"replica", "eof": true, "exit_code"}``. Frames arrive in *arrival*
         order across replicas, not sorted: sorting would mean holding output
         until every replica had spoken, which is the opposite of a live tail.
         ``ts`` is Docker's timestamp, so a client that wants a merged timeline
         can order by it.
 
-        Validation happens here, before the caller starts a response, so an
-        unknown service (``KeyError``) or replica (``ServiceError``) is still an
-        ordinary HTTP error rather than a half-written stream. The generator
-        owns the children: when the reader stops, ``finally`` kills them, so a
-        closed browser tab does not leave a Docker process per replica.
+        Everything that can fail fails *here* — unknown service
+        (``KeyError``), replica outside the range (``ServiceError``), a Docker
+        that cannot spawn (``OSError``) — before the caller starts a response.
+        A stream that starts and *then* reports an error has already told the
+        client it succeeded. The returned handle owns the children: a reader
+        that stops must call :meth:`_LogTail.close`, which kills them.
         """
         spec = self._specs.get(service_id)
         if spec is None:
@@ -1448,11 +1507,11 @@ class ServiceManager:
                 )
             replicas = [index]
         names = [(index, self._name(spec, index)) for index in replicas]
-        return self._follow(names, tail=tail)
+        return self._start_tail(names, tail=tail)
 
-    def _follow(
+    def _start_tail(
         self, names: list[tuple[int, str]], *, tail: int
-    ) -> Iterator[dict[str, Any]]:
+    ) -> _LogTail:
         frames: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=_LOG_QUEUE_FRAMES)
         stopped = threading.Event()
         procs: list[subprocess.Popen] = []
@@ -1468,6 +1527,7 @@ class ServiceManager:
             return False
 
         def pump(index: int, proc: subprocess.Popen) -> None:
+            failed = False
             try:
                 stream = proc.stdout
                 if stream is not None:
@@ -1479,8 +1539,18 @@ class ServiceManager:
                         if frame is not None and not offer(frame):
                             return
             except (OSError, ValueError):
-                pass
+                # A closed pipe ends this replica's tail; the ``finally``
+                # still reports it rather than leaving the reader waiting
+                # for an eof that never comes.
+                failed = True
             finally:
+                if failed or stopped.is_set():
+                    # The read loop ended without the child exiting. Waiting
+                    # on a child that is still following would block this
+                    # thread forever, so kill it first.
+                    with contextlib.suppress(OSError):
+                        if proc.poll() is None:
+                            proc.kill()
                 try:
                     code = proc.wait()
                 except OSError:
@@ -1489,10 +1559,8 @@ class ServiceManager:
                     offer({"replica": index, "eof": True, "exit_code": code})
                 stream = proc.stdout
                 if stream is not None:
-                    try:
+                    with contextlib.suppress(OSError):
                         stream.close()
-                    except OSError:
-                        pass
 
         try:
             for index, name in names:
@@ -1515,22 +1583,14 @@ class ServiceManager:
                     daemon=True,
                     name=f"service-logs-{index}",
                 ).start()
-            remaining = len(names)
-            while remaining > 0:
-                frame = frames.get()
-                if frame.get("eof"):
-                    remaining -= 1
-                yield frame
-        finally:
-            # Set first: a pump blocked on a full queue must see the close
-            # before it tries to push an eof nobody will read.
-            stopped.set()
+        except OSError:
+            # Replica 0 started and replica 1 could not: the caller gets an
+            # error, so nothing may keep tailing behind it.
             for proc in procs:
-                try:
-                    if proc.poll() is None:
-                        proc.kill()
-                except OSError:
-                    pass
+                with contextlib.suppress(OSError):
+                    proc.kill()
+            raise
+        return _LogTail(frames=frames, procs=procs, stopped=stopped, open_tails=len(names))
 
     def stats(self, service_id: str) -> dict[str, Any] | None:
         """One ``docker stats --no-stream`` sample for every running replica.
@@ -1822,25 +1882,41 @@ def make_router(
             raise HTTPException(404, f"unknown service {sid!r}") from exc
 
     @router.get("/v1/services/{sid}/logs/stream")
-    def stream_service_logs(sid: str, tail: int = 50, replica: int | None = None,
-                            _: None = Depends(bearer)) -> Response:
+    async def stream_service_logs(sid: str, request: Request, tail: int = 50,
+                                  replica: int | None = None,
+                                  _: None = Depends(bearer)) -> Response:
         """Live tail as NDJSON: ``{"replica","ts","line"}`` then ``{"eof":true}``.
 
-        ``follow_logs`` validates before this returns a generator, so an
-        unknown service or a replica outside the range is still a normal JSON
-        error — a stream that starts and then reports 404 has already told the
-        client it succeeded.
+        ``follow_logs`` starts the children before this returns, so an unknown
+        service, a replica outside the range, or a Docker that cannot spawn is
+        still a normal JSON error — a stream that starts and then reports 404
+        has already told the client it succeeded.
+
+        The loop polls instead of blocking on the queue so it can check
+        ``request.is_disconnected()`` while the container is quiet: a closed
+        tab must kill the children even if no line ever arrives.
         """
         try:
-            frames = services.follow_logs(sid, tail=tail, replica=replica)
+            log_tail = services.follow_logs(sid, tail=tail, replica=replica)
         except KeyError as exc:
             raise HTTPException(404, f"unknown service {sid!r}") from exc
         except ServiceError as exc:
             raise HTTPException(400, str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(502, f"could not start docker logs: {exc}") from exc
 
-        def gen() -> Iterator[str]:
-            for frame in frames:
-                yield json.dumps(frame) + "\n"
+        async def gen() -> AsyncIterator[str]:
+            try:
+                while not log_tail.done:
+                    frame = log_tail.poll()
+                    if frame is None:
+                        if await request.is_disconnected():
+                            return
+                        await asyncio.sleep(_LOG_POLL_SECONDS)
+                        continue
+                    yield json.dumps(frame) + "\n"
+            finally:
+                log_tail.close()
 
         return StreamingResponse(
             gen(),

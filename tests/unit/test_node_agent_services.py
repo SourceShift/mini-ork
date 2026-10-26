@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -612,11 +613,50 @@ def test_follow_logs_close_kills_the_children(monkeypatch, tmp_path, docker):
     )
     manager.create(_spec())
 
-    frames = manager.follow_logs("web")
-    assert next(frames)["line"] in {"a", "b"}
-    frames.close()  # the reader went away, as when a browser tab closes
+    tail = manager.follow_logs("web")
+    frame = None
+    deadline = time.time() + 2
+    while frame is None and time.time() < deadline:
+        frame = tail.poll()
+        time.sleep(0.01)
+    assert frame is not None and frame["line"] in {"a", "b"}
 
+    tail.close()  # the reader went away, as when a browser tab closes
     assert all(proc.killed for proc in popen.procs)
+
+
+def test_log_stream_tail_is_clamped(monkeypatch, tmp_path, docker):
+    monkeypatch.setenv(TOKEN_ENV, TOKEN_VALUE)
+    popen = _FakePopen()
+    client = _popen_client(tmp_path, docker, popen)
+    client.post("/v1/services", json=_spec(), headers=AUTH)
+
+    r = client.get(
+        "/v1/services/web/logs/stream", params={"tail": 999999}, headers=AUTH
+    )
+    assert r.status_code == 200
+    assert all(c[c.index("--tail") + 1] == "5000" for c in popen.calls)
+
+
+def test_log_stream_spawn_failure_is_502(monkeypatch, tmp_path, docker):
+    monkeypatch.setenv(TOKEN_ENV, TOKEN_VALUE)
+
+    class _BrokenPopen:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self, argv):
+            self.calls += 1
+            raise OSError("docker: command not found")
+
+    popen = _BrokenPopen()
+    client = _popen_client(tmp_path, docker, popen)
+    client.post("/v1/services", json=_spec(), headers=AUTH)
+
+    r = client.get("/v1/services/web/logs/stream", headers=AUTH)
+    assert r.status_code == 502
+    # The first replica could not start, so no second child was attempted.
+    assert popen.calls == 1
 
 
 def test_delete_removes_containers_and_state(client, docker, tmp_path):

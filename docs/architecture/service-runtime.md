@@ -491,16 +491,29 @@ Wire shape — one JSON object per line, `application/x-ndjson`:
   opposite of a live view. A line Docker did not prefix keeps its text with
   `ts: null` — losing a log line is worse than not dating it.
 - **One child per replica.** `docker logs -f` has no exit condition the node
-  can bound, so it runs as a child the node owns. The generator's `finally`
-  kills every child when the reader goes away: a closed browser tab must not
-  leave a Docker process per replica behind.
-- **Validation is eager.** The service and replica are checked before the
-  response starts, so an unknown service is still a plain `404` and a replica
-  outside `0..replicas-1` a plain `400`. A stream that starts and *then*
-  reports the error has already told the client it succeeded.
+  can bound, so it runs as a child the node owns. When the reader goes away
+  the children are killed: a closed browser tab must not leave a Docker
+  process per replica behind.
+- **Disconnect is polled, not inferred from a write.** A quiet container
+  produces no write that could fail, so the stream loop wakes every 200 ms and
+  asks `request.is_disconnected()`. A blocking read would have pinned the
+  request and its children until the next line arrived.
+- **Validation and spawn happen before the response.** The service and replica
+  are checked, and every Docker child is started, before the first byte is
+  written. An unknown service is a plain `404`, a replica outside
+  `0..replicas-1` and a `docker` that cannot spawn are normal JSON errors — a
+  stream that starts and *then* reports the error has already told the client
+  it succeeded. If replica 1 fails to spawn, replica 0 is killed before the
+  error is returned.
 - **A line is emitted when Docker writes its newline.** A partial line (a
   progress bar) waits for one or for exit, which is what `docker logs` shows
-  too.
+  too. A truly empty line is skipped; invalid UTF-8 becomes replacement
+  characters rather than ending the tail.
+- **Container stderr is part of the stream.** Docker merges it into the same
+  output as stdout, so a line cannot be labelled "error" without guessing.
+  What the reader *can* trust is the `eof` frame: a non-zero `exit_code` means
+  the child did not end cleanly, whether the container crashed or Docker
+  itself refused the request.
 - **Backpressure is bounded.** The node queues at most a couple of thousand
   frames between the child and the reader and then stops reading, checking a
   close flag while it waits — a reader that stalls cannot make the node grow
@@ -625,6 +638,6 @@ For the live tail it asserts the composed argv (`--follow`, `--timestamps`,
 the clamped `--tail`, one child per requested replica), the NDJSON frames
 (replica, Docker timestamp, text) and their `eof` frames, the replica filter,
 that an out-of-range replica is `400` with **no** child started, that an
-unknown service is `404` before anything spawns, that a line without the
-timestamp prefix keeps its text with `ts: null`, and that closing the
-generator kills every child.
+unknown service is `404` before anything spawns, that a spawn failure is `502`
+and stops after the first child, that a line without the timestamp prefix
+keeps its text with `ts: null`, and that closing the tail kills every child.
