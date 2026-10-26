@@ -237,6 +237,16 @@ instead of racing. Point `secure.db_path` at the shared DB and
 | `2` and a config message | the message names the key | see the fail-closed list above |
 | `error` with a traceback summary | `rsi-cycle show <id>` | a bug in the cycle itself — the row carries the exception type |
 
+Every `rejected` row carries its reason in `halt_reason`, not only on the
+terminal it was printed to: a pre-dispatch filter writes its code
+(`panel_invented_file`, `worktree_claim_conflict`, `frozen_path`, …) and a child
+that landed nothing writes `implement_empty: <detail>`. That matters for a
+scheduled run, whose stdout nobody keeps — `rsi-cycle list` is then the only
+record of *why* the cycle stopped, and `rsi-cycle show` renders it beside the
+candidate. It does not change avoidance: the queue skips a failed signature by
+signature and TTL, not by reason, so a rejection that keeps recurring under a
+different code is the same candidate coming back.
+
 `rsi-cycle doctor` checks all of it in one pass: config parse, database,
 migrations, the four `rsi_*` tables, lease tables, `bin/mini-ork` +
 `scripts/mini_ork_worktree.py`, the `origin` remote, harvest rules (schema

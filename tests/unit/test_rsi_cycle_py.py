@@ -671,6 +671,9 @@ def test_an_empty_diff_is_a_rejection_that_cleans_its_worktree(world):
     assert out.status == "rejected"
     assert "no diff" in out.detail
     assert h.cleaned == ["rsi-ctest"]
+    # A rejection is only diagnosable after the fact if the ledger carries the
+    # code: stdout from a scheduled run is gone by the time anyone lists rows.
+    assert _cycle(world.db)["halt_reason"].startswith("implement_empty: ")
 
 
 def test_a_rejected_selection_never_reaches_implement(world):
@@ -683,6 +686,7 @@ def test_a_rejected_selection_never_reaches_implement(world):
     assert "panel_invented_file" in out.detail
     assert "implement" not in h.calls
     assert _candidate_row(world.db)["status"] == "open"
+    assert _cycle(world.db)["halt_reason"].startswith("panel_invented_file")
 
 
 def _claim(root: Path, slug: str, path: str) -> None:
@@ -738,6 +742,7 @@ def test_an_operator_pin_does_not_silently_become_a_different_candidate(world):
     assert "worktree_claim_conflict" in out.detail
     assert h.proposed == [top.candidate_id], "a pin is not re-rolled into another candidate"
     assert "implement" not in h.calls
+    assert "worktree_claim_conflict" in _cycle(world.db)["halt_reason"]
 
 
 def test_only_a_claim_conflict_falls_through(world):

@@ -405,8 +405,14 @@ def _body(req: CycleRequest, rt: Runtime, con, *, token: str, spend: float) -> C
         if req.dry_run:
             return CycleOutcome(req.cycle_id, "rejected", 0,
                                 candidate_id=attempt.candidate_id, detail=detail)
+        # The code goes in the ledger, not only on stdout: `rejected` was the
+        # one outcome whose reason existed solely in the terminal, so an
+        # operator reading `rsi-cycle list` after a scheduled run could not
+        # tell a claim conflict from a bad proposal, and the queue — which
+        # avoids by signature, not by reason — kept re-targeting the candidate.
         return _finish(req, rt, con, "rejected", rc=0, candidate_id=attempt.candidate_id,
-                       detail=detail, extra=_candidate_fields(attempt))
+                       halt_reason=detail, detail=detail,
+                       extra=_candidate_fields(attempt))
     else:
         # ``attempts`` always starts with ``cand``, so the loop cannot fall out
         # without a break: every other path returns. Stated for the type checker
@@ -432,9 +438,13 @@ def _body(req: CycleRequest, rt: Runtime, con, *, token: str, spend: float) -> C
         detail = (impl.detail if impl is not None else "the implementer produced nothing")
         if impl is not None:
             (rt.clean or _default_clean)(req, impl)
+        # Same reason-code discipline as the SUGGEST rejection: a child that
+        # lands nothing is a *kind* of failure (`implement_empty`), and the
+        # operator needs it in the row to tell it from a pre-dispatch filter.
         return _finish(req, rt, con, "rejected", rc=0, candidate_id=cand.candidate_id,
-                       detail=detail, extra={**_candidate_fields(cand),
-                                             "child_run_id": getattr(impl, "child_run_id", "")})
+                       halt_reason=f"implement_empty: {detail}", detail=detail,
+                       extra={**_candidate_fields(cand),
+                              "child_run_id": getattr(impl, "child_run_id", "")})
 
     # --- VALIDATE ----------------------------------------------------------
     measurement = (rt.measure or _default_measure)(req, cand, impl, selection)
