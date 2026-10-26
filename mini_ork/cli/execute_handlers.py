@@ -51,6 +51,7 @@ from mini_ork.execute_compat import (
     declared_artifacts_report,
     node_strict_handshake,
 )
+from mini_ork.workflow import review_ledger
 from mini_ork.workflow.store import make_artifact_store
 from mini_ork.workflow.retry import (  # P1.4 per-node retry block
     ErrorRow,
@@ -266,6 +267,9 @@ _intervention_gate_check = _execute_delegate("_intervention_gate_check")
 _intervention_decision = _execute_delegate("_intervention_decision")
 _learned_block = _execute_delegate("_learned_block")
 _refresh_stale_pre_impl_baseline = _execute_delegate("_refresh_stale_pre_impl_baseline")
+_load_review_json = _execute_delegate("_load_review_json")
+_review_delta = _execute_delegate("_review_delta")
+_review_worktree_and_specs = _execute_delegate("_review_worktree_and_specs")
 _required_artifacts_ok = _execute_delegate("_required_artifacts_ok")
 _researcher_output_file = _execute_delegate("_researcher_output_file")
 _resolve_target_cwd = _execute_delegate("_resolve_target_cwd")
@@ -2160,6 +2164,83 @@ def _review_verdict_envelope(review_file: str, verdict: str) -> dict:
     return envelope
 
 
+def reviewer_envelope(review_file: str) -> str:
+    """The one JSON contract a classic reviewer is asked to emit.
+
+    Kickoff rev6-r5a: the classified reviewer's runtime vocabulary
+    (pass|fail|needs_revision|escalate) plus structured ``findings`` with
+    stable ids and ``resolved``, so the verdict, the ledger and the implementer
+    feedback all agree. The final sentence names the artifact the runtime reads;
+    an answer that is prose only is discarded.
+    """
+    return (
+        'Respond with JSON: {"verdict": "pass|fail|needs_revision|escalate", '
+        '"notes": [], "findings": [], "resolved": []}\n'
+        'Each finding: {"id": "<an id from \'Your earlier findings\' when you '
+        'report one of those again, else empty>", "file": "<repo-relative path>", '
+        '"line": <int>, "severity": "high|medium|low", "issue": "<one sentence: '
+        'the defect and why it matters>", "instances": [{"file": "<path>", '
+        '"line": <int>}]}\n'
+        "needs_revision and fail MUST carry at least one finding. When one defect "
+        "pattern appears in several places, report it ONCE and list every other "
+        "location in instances.\n"
+        'Use "escalate" only when the change itself is right and what blocks it is '
+        "something only a person can do (apply a migration, settle a spec or scope "
+        "question); name that action in notes. It hands the run to a person "
+        "instead of another implementer round.\n"
+        f"AND write that exact JSON object to {review_file} — a Bash heredoc is fine. "
+        "That file is the artifact the runtime reads; an answer that is prose only is discarded."
+    )
+
+
+def _review_converge_enabled() -> bool:
+    """``MO_REVIEW_CONVERGE`` is on by default; ``off`` drops the carry-over."""
+    return context_env("MO_REVIEW_CONVERGE", "on").strip().lower() not in (
+        "off", "0", "false", "no")
+
+
+def _record_review_ledger(run_dir: str, review_file: str, verdict: str) -> None:
+    """Record this review's findings under stable ids and persist them.
+
+    The verdict flow must never depend on the ledger, so the caller wraps this
+    in a bare ``try/except``. Parsing mirrors ``_extract_verdict``'s read of the
+    same file; a prose/unparseable file degrades to the verdict-only shape.
+    """
+    # Same tolerant read as the revise-feedback section (fences, surrounding
+    # prose): a strict json.load would drop the findings of every review whose
+    # file carries the JSON object inside prose, while _extract_verdict still
+    # read its verdict.
+    data, body = _load_review_json(review_file)
+    strict = False
+    try:
+        strict = isinstance(json.loads(body), dict)
+    except ValueError:
+        strict = False
+    if not isinstance(data, dict):
+        data = {"verdict": verdict}
+    delta_files = None
+    try:
+        worktree, specs = _review_worktree_and_specs(run_dir)
+        delta = _review_delta(run_dir, worktree, specs)
+        if delta is not None:
+            delta_files = delta[1]
+    except Exception:
+        delta_files = None
+    review_ledger.record_review(
+        run_dir, review_ledger.attempt_no(run_dir), data, delta_files)
+    findings = data.get("findings")
+    # Rewrite only a file that was pure JSON: replacing prose + JSON with the
+    # bare object would discard the reviewer's text. The ids are in the ledger
+    # either way.
+    if strict and isinstance(findings, list) and findings:
+        try:
+            with open(review_file, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2)
+                handle.write("\n")
+        except OSError:
+            pass
+
+
 def _handle_reviewer(ctx: NodeDispatch):
     review_file, is_panel_gate, is_synth = _classify_review_node(
         ctx.recipe_eff, ctx.node_id, ctx.root, ctx.run_dir)
@@ -2200,16 +2281,42 @@ def _handle_reviewer(ctx: NodeDispatch):
         # correctly. Naming the file restores the branch to the same contract as
         # panel/synth: the agent writes it, and `write_preserving_agent` keeps an
         # agent-written output (routing the captured text to `.stdout.md`).
+        # Round 2+: show the reviewer its earlier findings (with stable ids) and
+        # the delta since its last review, so it re-reviews the change rather
+        # than re-reading everything. Default on; MO_REVIEW_CONVERGE=off drops
+        # both blocks. The envelope always applies, ending with "AND write that exact JSON object to {review_file}".
+        run_dir = ctx.run_dir_eff or ctx.run_dir
+        converge_block = ""
+        if _review_converge_enabled():
+            try:
+                prior = review_ledger.prior_block(run_dir)
+            except Exception:
+                prior = ""
+            if prior:
+                converge_block = prior + "\n"
+                try:
+                    worktree, specs = _review_worktree_and_specs(run_dir)
+                    delta = _review_delta(run_dir, worktree, specs)
+                except Exception:
+                    delta = None
+                if delta is not None:
+                    from mini_ork.context_assembler import cap_block
+                    converge_block += (
+                        "\n## Changes since your last review\n"
+                        f"{cap_block(delta[0], label='review-delta.patch')}\n")
+                converge_block += (
+                    "\nRules for this round:\n"
+                    "- Re-review ONLY the changes since your last review; the full diff above is reference.\n"
+                    '- For each open earlier finding: if the changes fix it, put its id in "resolved"; '
+                    'if not, report it again with the same "id".\n'
+                    "- Do not report an already-fixed finding unless the new changes broke it again.\n"
+                    "- Report a NEW finding only for code inside the changes since your last review, "
+                    "or at severity high when shipping without the fix would be wrong.\n")
         prompt = (f"{ctx.prepend()}Review the implementation for: {ctx.node_desc}{ctx.learned}\n\n"
                   f"Plan:\n{ctx.plan_content}{ctx.artifact_context}{ctx.scope_guard()}\n\n{reviewer_inputs}\n"
-                  f"{_reviewer_round_block(ctx.run_dir_eff or ctx.run_dir, ctx.run_id)}"
-                  'Respond with JSON: {"verdict": "pass|fail|needs_revision|escalate", "notes": []}\n'
-                  'Use "escalate" only when the change itself is right and what blocks it is '
-                  'something only a person can do (apply a migration, settle a spec or scope '
-                  'question); name that action in notes. It hands the run to a person '
-                  'instead of another implementer round.\n'
-                  f'AND write that exact JSON object to {review_file} — a Bash heredoc is fine. '
-                  'That file is the artifact the runtime reads; an answer that is prose only is discarded.')
+                  f"{_reviewer_round_block(run_dir, ctx.run_id)}"
+                  f"{converge_block}"
+                  f"{reviewer_envelope(review_file)}")
     marker = os.path.join(ctx.run_dir, f".dispatch-marker-{ctx.node_id}")
     open(marker, "w").write("")
     rc, result = ctx.dispatch(prompt)
@@ -2227,6 +2334,15 @@ def _handle_reviewer(ctx: NodeDispatch):
         return 1, "artifact_contract"
     verdict = _extract_verdict(ctx.root, review_file)
     print(f"  [info] reviewer verdict={verdict} → {review_file}")
+    # Classic reviewers only (panel/synth branches keep their own contracts):
+    # assign this review's findings stable ids and append it to the ledger so
+    # the next reviewer and implementer round can see them. Never let the
+    # ledger change the verdict flow.
+    if not is_panel_gate and not is_synth:
+        try:
+            _record_review_ledger(ctx.run_dir_eff or ctx.run_dir, review_file, verdict)
+        except Exception:
+            pass
     # Hand the verdict to the publisher through run_dir, NOT the environment: nodes
     # execute in a ProcessPoolExecutor (cli/execute.py), so a publish_env write in
     # this worker dies with the worker and the publisher's own process observes

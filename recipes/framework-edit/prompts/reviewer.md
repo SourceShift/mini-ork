@@ -15,8 +15,10 @@ Inputs:
 > shown as `(not available)`.
 
 Return one JSON object with:
-- `verdict`: `approve`, `revise`, or `reject`
-- `reasons`: array of concrete reasons
+- `verdict`: `pass`, `needs_revision`, `fail`, or `escalate`
+- `notes`: array of concrete notes
+- `findings`: array of structured findings (see below)
+- `resolved`: array of finding ids fixed by this change
 - `checked_criteria`: array covering artifact names, verifier results, scope,
   and high-blast-radius policy
 - `artifact_ref`: `${MINI_ORK_RUN_DIR}/framework-edit.diff`
@@ -34,26 +36,30 @@ structured findings is not a review. Each entry:
 
 ```json
 {
+  "id": "<leave empty for a new finding; reuse an earlier id when re-reporting>",
   "file": "<repo-relative path of the changed file>",
   "line": 42,
   "severity": "high",
   "snippet": "<the offending line or fragment, quoted verbatim>",
-  "issue": "<one sentence: the defect and why it matters>"
+  "issue": "<one sentence: the defect and why it matters>",
+  "instances": [{"file": "<path>", "line": 42}]
 }
 ```
 
 | Field | Rules |
 |---|---|
+| `id` | leave empty for a new finding; reuse the id from 'Your earlier findings' when reporting one again. |
 | `file` | Repo-relative path. Never absolute, never a bare basename. |
 | `line` | 1-based line number in the changed file. |
 | `severity` | Exactly one of: `high`, `medium`, `low`. |
 | `snippet` | The offending text, copied verbatim from the diff or file. |
 | `issue` | One sentence. Name the defect, not the category. |
+| `instances` | every other location of the same defect. |
 
-A `needs_revision` verdict (the runtime's name for the `revise` verdict above)
-MUST carry at least one finding — a revision request with an empty `findings`
-array is a contract violation. A `reject` verdict MUST also carry at least one
-finding. An `approve` verdict MAY carry an empty array.
+A `needs_revision` verdict MUST carry at least one finding — a revision
+request with an empty `findings` array is a contract violation. A `fail`
+verdict MUST also carry at least one finding. A `pass` verdict MAY carry an
+empty array.
 
 Findings are the machine-readable form of the review and are read by the IDE's
 "Your code" view, so they are part of the contract, not decoration: cite the
@@ -70,4 +76,5 @@ answer, work through the whole diff in the reviewer-inputs block:
 every changed file is already there — do not issue Read calls to re-open them.
 List each changed file you judged in `checked_criteria`. If a round fixes your
 earlier findings, judge those fixes first; a new blocker in a later round must
-be one the earlier diff did not already show.
+be one the earlier diff did not already show. From round 2, judge the earlier
+findings by id first and put fixed ones in `resolved`.

@@ -98,6 +98,7 @@ from mini_ork.execute_compat import normalize_implementer_summary, write_json_at
 from mini_ork.recovery.condition import evaluate_condition
 from mini_ork.recovery.dag import CompiledRetryEdge
 from mini_ork.verify import levels as _levels
+from mini_ork.workflow import review_ledger
 
 # Sentinel finish_reason set when a `retries` edge fires from its `condition:`
 # predicate (rather than from a non-zero exit). The value is opaque to the
@@ -3875,6 +3876,145 @@ def _tree_has_no_change(worktree, baseline, specs):
     return True
 
 
+def _review_worktree_and_specs(run_dir) -> tuple[str, list[str]]:
+    """Resolve the worktree the reviewer diffs and the pathspecs to scope it by.
+
+    Shared by ``_assemble_reviewer_inputs`` and the reviewer handler's delta
+    block so both review exactly the same surface.
+    """
+    worktree, files = "", []
+    summary = os.path.join(run_dir, "implementer-summary.json") if run_dir else ""
+    if summary and os.path.isfile(summary):
+        try:
+            with open(summary, encoding="utf-8") as handle:
+                d = json.load(handle)
+            worktree = d.get("worktree_path") or ""
+            fc = d.get("files_changed") or []
+            files = [str(x) for x in fc] if isinstance(fc, list) else []
+        except Exception:
+            pass
+    if not worktree or not os.path.isdir(worktree):
+        # Prefer the pinned target from run_profile.json["roots"]; fall back
+        # to MO_TARGET_CWD for legacy run dirs without the record.
+        roots = load_run_roots(run_dir) if run_dir else None
+        worktree = (roots.target if roots else (context_env("MO_TARGET_CWD") or os.getcwd()))
+    return worktree, _review_pathspecs(worktree, files)
+
+
+def _snapshot_review_tree(worktree: str, run_dir: str, specs: list[str]) -> str:
+    """Snapshot the worktree's tracked+untracked state into a tree sha.
+
+    Uses a scratch index (``GIT_INDEX_FILE=<run_dir>/.review-index``) so the
+    real index, HEAD, refs and the stash are never touched — the snapshot is a
+    read of the tree plus a write of loose objects, nothing else. The sha lands
+    in ``<run_dir>/review-tree.txt`` for the next round's ``_review_delta``.
+    """
+    if not worktree or not run_dir or not os.path.isdir(worktree):
+        return ""
+    try:
+        os.makedirs(run_dir, exist_ok=True)
+    except OSError:
+        return ""
+    index_file = os.path.abspath(os.path.join(run_dir, ".review-index"))
+    env = dict(os.environ)
+    env["GIT_INDEX_FILE"] = index_file
+    paths = list(specs) if specs else ["."]
+    sha = ""
+    try:
+        for args in (["read-tree", "HEAD"],
+                     ["add", "-A", "--", *paths],
+                     ["write-tree"]):
+            proc = subprocess.run(["git", "-C", worktree, *args],
+                                  capture_output=True, text=True, env=env)
+            if proc.returncode != 0:
+                return ""
+            if args[0] == "write-tree":
+                sha = proc.stdout.strip()
+        if not sha:
+            return ""
+        with open(os.path.join(run_dir, "review-tree.txt"), "w",
+                  encoding="utf-8") as handle:
+            handle.write(sha + "\n")
+        return sha
+    except Exception:
+        return ""
+    finally:
+        try:
+            os.remove(index_file)
+        except OSError:
+            pass
+
+
+def _archived_review_tree(run_dir: str) -> str:
+    """The review-tree.txt in the highest-numbered ``revise/round-<n>/``."""
+    revise_dir = os.path.join(run_dir, "revise")
+    try:
+        rounds = sorted(
+            (int(match.group(1)), name)
+            for name in os.listdir(revise_dir)
+            for match in [re.fullmatch(r"round-(\d+)", name)]
+            if match
+        )
+    except OSError:
+        return ""
+    for _number, name in reversed(rounds):
+        try:
+            with open(os.path.join(revise_dir, name, "review-tree.txt"),
+                      encoding="utf-8") as handle:
+                tree = handle.read().strip()
+        except OSError:
+            continue
+        if tree:
+            return tree
+    return ""
+
+
+def _review_delta(run_dir: str, worktree: str, specs: list[str]):
+    """The diff between the last archived review snapshot and the current one.
+
+    Returns ``(patch_text, sorted_changed_paths)`` and writes the patch to
+    ``<run_dir>/review-delta.patch``, or ``None`` when either snapshot is
+    missing/empty or git fails. The reviewer uses this to re-review only what
+    changed since its last review.
+    """
+    if not run_dir or not worktree:
+        return None
+    try:
+        with open(os.path.join(run_dir, "review-tree.txt"),
+                  encoding="utf-8") as handle:
+            curr = handle.read().strip()
+    except OSError:
+        return None
+    if not curr:
+        return None
+    prev = _archived_review_tree(run_dir)
+    if not prev:
+        return None
+    base = ["git", "-C", worktree, "diff"]
+    try:
+        patch = subprocess.run(
+            [*base, "--no-color", prev, curr, "--", *specs],
+            capture_output=True, text=True)
+        if patch.returncode != 0:
+            return None
+        names = subprocess.run(
+            [*base, "--name-only", prev, curr, "--", *specs],
+            capture_output=True, text=True)
+        if names.returncode != 0:
+            return None
+    except Exception:
+        return None
+    try:
+        with open(os.path.join(run_dir, "review-delta.patch"), "w",
+                  encoding="utf-8") as handle:
+            handle.write(patch.stdout)
+    except OSError:
+        return None
+    changed = sorted(line.strip() for line in names.stdout.splitlines()
+                     if line.strip())
+    return patch.stdout, changed
+
+
 def _assemble_reviewer_inputs(run_dir):
     """F2-B (bash _mo_assemble_reviewer_inputs:182-275). Build the reviewer input block:
     implementer-summary.json + verifier_{typecheck,test}.json + a generated
@@ -3887,21 +4027,17 @@ def _assemble_reviewer_inputs(run_dir):
     except OSError:
         pass
     summary = os.path.join(run_dir, "implementer-summary.json")
-    worktree, files = "", []
+    worktree, specs = _review_worktree_and_specs(run_dir)
+    # The declared files drive the no-op guard below; the pathspecs above are
+    # their repo-relative projection.
+    files = []
     if os.path.isfile(summary):
         try:
-            d = json.load(open(summary))
-            worktree = d.get("worktree_path") or ""
-            fc = d.get("files_changed") or []
-            files = [str(x) for x in fc] if isinstance(fc, list) else []
+            with open(summary, encoding="utf-8") as handle:
+                declared = json.load(handle).get("files_changed") or []
+            files = [str(x) for x in declared] if isinstance(declared, list) else []
         except Exception:
             pass
-    if not worktree or not os.path.isdir(worktree):
-        # Prefer the pinned target from run_profile.json["roots"]; fall back
-        # to MO_TARGET_CWD for legacy run dirs without the record.
-        roots = load_run_roots(run_dir) if run_dir else None
-        worktree = (roots.target if roots else (context_env("MO_TARGET_CWD") or os.getcwd()))
-    specs = _review_pathspecs(worktree, files)
     diff_path = os.path.join(run_dir, "review-diff.patch")
     # Diff against the pre-implementer baseline (captured at run start by
     # _capture_pre_impl_baseline) so the reviewer sees ONLY the implementer's
@@ -3933,6 +4069,9 @@ def _assemble_reviewer_inputs(run_dir):
             # CREATES a module/test/migration yields an empty patch and the
             # reviewer passes work it never saw. Append the untracked hunks.
             _append_untracked_hunks(diff_path, worktree, run_dir, specs)
+            # Snapshot the reviewed tree so the NEXT round can diff against it
+            # instead of re-reading the whole change (kickoff rev6-r5a).
+            _snapshot_review_tree(worktree, run_dir, specs)
         if not (os.path.isfile(diff_path) and os.path.getsize(diff_path) > 0):
             open(diff_path, "w").close()
     except Exception:
@@ -5188,6 +5327,42 @@ def _revise_failure_section(run_dir: str, field, finish_reason: str) -> str:
                     lines.append(f"notes: {notes}")
             elif data.get("reasons"):
                 lines.append(f"reasons: {json.dumps(data['reasons'])[:4000]}")
+            # Structured findings are the actionable unit the implementer
+            # needs: a bare verdict with prose notes makes the next attempt
+            # fix blind. Ids let the reviewer's ledger state "was F1 fixed?".
+            listed_ids: set[str] = set()
+            findings = data.get("findings")
+            if isinstance(findings, list) and findings:
+                lines.append("findings:")
+                for finding in findings:
+                    if not isinstance(finding, dict):
+                        continue
+                    finding_id = finding.get("id")
+                    text = (f"- [{finding_id or '?'}] "
+                            f"{finding.get('severity') or 'medium'} "
+                            f"{finding.get('file', '')}:{finding.get('line', 0)} — "
+                            f"{finding.get('issue', '')}")
+                    instances = finding.get("instances")
+                    if isinstance(instances, list) and instances:
+                        spots = [f"{item.get('file', '')}:{item.get('line', 0)}"
+                                 for item in instances if isinstance(item, dict)]
+                        if spots:
+                            text += f" (also at {', '.join(spots)})"
+                    lines.append(text)
+                    if finding_id:
+                        listed_ids.add(str(finding_id))
+            # Findings that stayed open from earlier reviews but this review
+            # did not repeat still bind the next attempt (kickoff rev6-r5a).
+            extra = []
+            for ledger_line in review_ledger.feedback_lines(
+                    run_dir, review_ledger.attempt_no(run_dir)):
+                match = re.match(r"- \[([^\]]+)\]", ledger_line)
+                if match and match.group(1) in listed_ids:
+                    continue
+                extra.append(ledger_line)
+            if extra:
+                lines.append("still open from earlier reviews:")
+                lines.extend(extra)
             # Panel-gate probes: the actionable unit is the FAILED probe, and
             # a passing majority hides it in a long list — surface only the
             # probes whose panel_consensus is not a pass, bounded.
@@ -5216,6 +5391,12 @@ def _write_revise_feedback(run_dir: str, round_no: int, max_rounds: int,
         "problems were found. Fix ONLY these problems, on top of the changes already "
         "in the working tree. Do not start over, and do not revert your earlier work.\n"
     )
+    if round_no == max_rounds:
+        header += (
+            "This is the last revision round. If a finding survived an earlier "
+            "fix, do not patch the same lines again: choose a different approach "
+            "for it.\n"
+        )
     sections = [_revise_failure_section(run_dir, field, finish_reason)
                 for field, _rc, finish_reason in sources]
     path = os.path.join(revise_dir, f"round-{round_no}.md")
@@ -5268,12 +5449,15 @@ def _archive_revise_round(run_dir: str, round_no: int, reset_fields) -> None:
                     shutil.move(source, os.path.join(dest, os.path.basename(source)))
                 except OSError:
                     pass
-    review_diff = os.path.join(run_dir, "review-diff.patch")
-    if os.path.isfile(review_diff):
-        try:
-            shutil.move(review_diff, os.path.join(dest, "review-diff.patch"))
-        except OSError:
-            pass
+    # The round's diff, snapshot and computed delta travel together so the
+    # next review can diff its tree against the one archived here.
+    for name in ("review-diff.patch", "review-tree.txt", "review-delta.patch"):
+        source = os.path.join(run_dir, name)
+        if os.path.isfile(source):
+            try:
+                shutil.move(source, os.path.join(dest, name))
+            except OSError:
+                pass
 
 
 # Roles ``steer_run`` accepts (web/control._STEER_ROLES). A node type outside
