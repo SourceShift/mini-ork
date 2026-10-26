@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -306,11 +307,46 @@ If you find no issues, return {"issues":[]}.
 --- DIFF FOLLOWS ---
 """
 
+_PROMPT_MARKER = "--- DIFF FOLLOWS ---"
+_PROMPT_TAIL = """Set "pre_existing": true on an issue whose problem is in code this diff did not change.
+Output shape: {"issues":[{"severity":"…","file":"…","line":null,"title":"…","description":"…","suggested_fix":"…","same_as":null,"pre_existing":false}],"resolved":[]}
+"""
+_PRIOR_INSTRUCTIONS = """For each OPEN earlier finding: if this diff fixes it, put its id in "resolved"; if it is still present, report it again with "same_as": "<id>".
+Never report a DISMISSED or PRE_EXISTING finding again.
+"""
+
+
+def build_review_prompt(diff_text: str, prior: list[dict]) -> str:
+    """``_REVIEW_PROMPT`` with the finding-lifecycle block before the diff.
+
+    With a non-empty ``prior`` the block lists each earlier finding and how to
+    reference it (``resolved`` / ``same_as``); with an empty list it carries
+    only the output-shape instructions.  ``diff_text`` is accepted for the
+    caller's convenience — it is appended after this prompt, never embedded.
+    """
+    index = _REVIEW_PROMPT.index(_PROMPT_MARKER)
+    head = _REVIEW_PROMPT[:index]
+    lines: list[str] = []
+    if prior:
+        for row in prior:
+            status = str(row.get("status") or "").upper()
+            lines.append(
+                f"- [{row.get('fingerprint', '')}] {status} "
+                f"{row.get('severity', '')} {row.get('file_path') or '?'} "
+                f"— {row.get('title', '')}"
+            )
+        lines.append(_PRIOR_INSTRUCTIONS.rstrip("\n"))
+    lines.append(_PROMPT_TAIL.rstrip("\n"))
+    return head + "\n".join(lines) + "\n" + _PROMPT_MARKER + "\n"
+
 
 def _default_llm_panel(
     diff_text: str,
     *,
     dispatch_fn: Callable[..., int] | None = None,
+    prior: list[dict] | None = None,
+    resolved_sink: list[str] | None = None,
+    lens_sink: list[dict] | None = None,
 ) -> list[dict]:
     """Run the configured review panel through the native dispatcher.
 
@@ -334,17 +370,30 @@ def _default_llm_panel(
     if not models:
         return []
 
+    prior_fps = {
+        row.get("fingerprint")
+        for row in (prior or [])
+        if isinstance(row, dict) and row.get("fingerprint")
+    }
+    prompt = (
+        _REVIEW_PROMPT + diff_text
+        if prior is None
+        else build_review_prompt(diff_text, prior) + diff_text
+    )
+
     out_files: list[str] = []
     for _ in models:
         with tempfile.NamedTemporaryFile("w", suffix=".out", delete=False) as handle:
             out_files.append(handle.name)
 
-    def run_one(model: str, out_file: str) -> int:
+    def run_one(model: str, out_file: str) -> tuple[int, int]:
+        start = time.monotonic()
         try:
-            return dispatch_fn(model, _REVIEW_PROMPT + diff_text, out_file, timeout, 4)
+            rc = dispatch_fn(model, prompt, out_file, timeout, 4)
         except Exception:
             # Fail-open per lens: one dead provider must not sink the panel.
-            return 1
+            rc = 1
+        return rc, int((time.monotonic() - start) * 1000)
 
     try:
         with contextlib.redirect_stdout(io.StringIO()), \
@@ -356,59 +405,95 @@ def _default_llm_panel(
                     pool.submit(run_one, model, out_file)
                     for model, out_file in zip(models, out_files)
                 ]
-                returncodes = [future.result() for future in futures]
+                results = [future.result() for future in futures]
 
         output: list[dict] = []
-        for model, out_file, rc in zip(models, out_files, returncodes):
+        for model, out_file, (rc, elapsed_ms) in zip(models, out_files, results):
+            status = "ok"
+            emitted = 0
             try:
                 if rc != 0:
-                    continue
-                try:
-                    raw = Path(out_file).read_text()
-                except OSError:
-                    continue
-                payload = None
-                try:
-                    payload = json.loads(raw)
-                except Exception:
-                    match = re.search(r"\{[\s\S]*\}", raw)
-                    if match:
+                    status = "dispatch_failed"
+                else:
+                    try:
+                        raw = Path(out_file).read_text()
+                    except OSError:
+                        status = "unparseable"
+                        raw = ""
+                    payload = None
+                    if raw:
                         try:
-                            payload = json.loads(match.group(0))
+                            payload = json.loads(raw)
                         except Exception:
-                            payload = None
-                if not isinstance(payload, dict) or not isinstance(
-                    payload.get("issues", []), list
-                ):
-                    continue
-                emitted = 0
-                for issue in payload.get("issues", []):
-                    if not isinstance(issue, dict):
-                        continue
-                    severity = str(issue.get("severity") or "medium").lower()
-                    if severity not in {"info", "low", "medium", "high", "critical"}:
-                        severity = "medium"
-                    title = str(issue.get("title") or "").strip()[:300]
-                    if not title:
-                        continue
-                    output.append({
+                            match = re.search(r"\{[\s\S]*\}", raw)
+                            if match:
+                                try:
+                                    payload = json.loads(match.group(0))
+                                except Exception:
+                                    payload = None
+                    if not isinstance(payload, dict) or not isinstance(
+                        payload.get("issues", []), list
+                    ):
+                        status = "unparseable"
+                    else:
+                        for issue in payload.get("issues", []):
+                            if not isinstance(issue, dict):
+                                continue
+                            severity = str(issue.get("severity") or "medium").lower()
+                            if severity not in {"info", "low", "medium", "high", "critical"}:
+                                severity = "medium"
+                            title = str(issue.get("title") or "").strip()[:300]
+                            if not title:
+                                continue
+                            item = {
+                                "lens": f"llm.{model}",
+                                "severity": severity,
+                                "file": str(issue.get("file") or "?")[:200],
+                                "line": issue.get("line"),
+                                "title": title,
+                                "description": str(issue.get("description") or "")[:1000],
+                                "suggested_fix": str(issue.get("suggested_fix") or "")[:500],
+                            }
+                            if prior is not None:
+                                same_as = issue.get("same_as")
+                                item["same_as"] = (
+                                    same_as
+                                    if isinstance(same_as, str) and same_as in prior_fps
+                                    else None
+                                )
+                                item["pre_existing"] = bool(issue.get("pre_existing"))
+                            output.append(item)
+                            emitted += 1
+                            if emitted >= 8:
+                                break
+                        if resolved_sink is not None:
+                            resolved = payload.get("resolved")
+                            if isinstance(resolved, list):
+                                for ref in resolved:
+                                    if isinstance(ref, str) and ref in prior_fps:
+                                        resolved_sink.append(ref)
+            except Exception:
+                if lens_sink is not None:
+                    lens_sink.append({
                         "lens": f"llm.{model}",
-                        "severity": severity,
-                        "file": str(issue.get("file") or "?")[:200],
-                        "line": issue.get("line"),
-                        "title": title,
-                        "description": str(issue.get("description") or "")[:1000],
-                        "suggested_fix": str(issue.get("suggested_fix") or "")[:500],
+                        "status": "error",
+                        "issues": 0,
+                        "elapsed_ms": elapsed_ms,
                     })
-                    emitted += 1
-                    if emitted >= 8:
-                        break
+                raise
             finally:
                 for path in (out_file, out_file + ".err.log"):
                     try:
                         os.remove(path)
                     except OSError:
                         pass
+            if lens_sink is not None:
+                lens_sink.append({
+                    "lens": f"llm.{model}",
+                    "status": status,
+                    "issues": emitted,
+                    "elapsed_ms": elapsed_ms,
+                })
         return output
     finally:
         # The per-lens cleanup above normally removes these; this covers an

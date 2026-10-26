@@ -70,6 +70,7 @@ Schema citations:
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -137,6 +138,12 @@ __all__ = [
 # ─────────────────────────────────────────────────────────────────────────
 # review_run orchestrator
 # ─────────────────────────────────────────────────────────────────────────
+
+
+def _diff_files(diff_text: str) -> list[str]:
+    """The paths a diff touches, from its ``+++ b/`` headers."""
+    return sorted(set(re.findall(r"^\+\+\+ b/(.+)$", diff_text, re.M)))
+
 
 # Mirrors lib/pre_push_review.sh:350-526 (review_run).
 def review_run(
@@ -211,6 +218,32 @@ def review_run(
 
     # Insert the review row (mirrors bash INSERT at lines 401-407).
     now = int(time.time())
+
+    # ── Finding lifecycle (rev6 R2b). Every step is caught and skipped so the
+    # review completes exactly as it did before this layer existed.
+    life = None
+    prior: list[dict] | None = None
+    resolved: list[str] = []
+    lens_rows: list[dict] = []
+    observed: set[str] = set()
+    panel_failed = False
+    try:
+        from mini_ork.review import findings as life  # lazy: keeps imports acyclic
+    except Exception:
+        life = None
+    if life is not None:
+        try:
+            lcon = sqlite3.connect(db)
+            try:
+                lcon.execute("PRAGMA busy_timeout=5000")
+                life.ensure_schema(lcon)
+                prior = life.prior_for(lcon, _diff_files(diff_text))
+                lcon.commit()
+            finally:
+                lcon.close()
+        except Exception:
+            prior = None
+
     con = sqlite3.connect(db)
     try:
         con.execute("PRAGMA busy_timeout=5000")
@@ -233,17 +266,28 @@ def review_run(
     # Run heuristic lenses (mirrors bash heredoc at lines 414-430).
     issues = _run_heuristic_lenses(diff_text, cwd)
     if parsed_mode in ("llm_panel", "hybrid"):
-        try:
-            issues.extend((llm_panel or _default_llm_panel)(diff_text))
-        except Exception:
-            pass
+        if llm_panel is None:
+            try:
+                issues.extend(_default_llm_panel(
+                    diff_text,
+                    prior=prior,
+                    resolved_sink=resolved,
+                    lens_sink=lens_rows,
+                ))
+            except Exception:
+                panel_failed = True
+        else:
+            try:
+                issues.extend(llm_panel(diff_text))
+            except Exception:
+                pass
 
     # Persist issues (mirrors bash INSERT at lines 445-454).
     con = sqlite3.connect(db)
     try:
         con.execute("PRAGMA busy_timeout=5000")
         for d in issues:
-            con.execute(
+            cur = con.execute(
                 """INSERT INTO pre_push_review_issues
                    (review_id, lens, severity, file_path, line_no,
                     title, description, suggested_fix, status)
@@ -257,6 +301,37 @@ def review_run(
                  (d.get("description") or "")[:_DESCRIPTION_MAX],
                  (d.get("suggested_fix") or "")[:_SUGGESTED_FIX_MAX]),
             )
+            # Link the observation to its finding on the same connection. A
+            # savepoint keeps a lifecycle failure from discarding issue rows.
+            if life is not None and cur.lastrowid is not None:
+                try:
+                    con.execute("SAVEPOINT rf")
+                    fp = life.link_issue(con, int(cur.lastrowid), rid, d, now)
+                    con.execute("RELEASE rf")
+                    observed.add(fp)
+                except Exception:
+                    try:
+                        con.execute("ROLLBACK TO rf")
+                        con.execute("RELEASE rf")
+                    except Exception:
+                        pass
+        if life is not None and prior is not None:
+            try:
+                life.settle(con, rid, prior, observed, set(resolved), now)
+            except Exception:
+                pass
+        if life is not None and lens_rows and not panel_failed:
+            try:
+                for row in lens_rows:
+                    con.execute(
+                        "INSERT INTO review_lens_runs"
+                        " (review_id, lens, status, issues, elapsed_ms, created_at)"
+                        " VALUES (?, ?, ?, ?, ?, ?)",
+                        (rid, row.get("lens"), row.get("status"),
+                         int(row.get("issues") or 0), row.get("elapsed_ms"), now),
+                    )
+            except Exception:
+                pass
         con.commit()
     finally:
         con.close()
@@ -523,6 +598,9 @@ _USAGE = """Usage: mini-ork review <subcommand> [args]
   verdict <review_id>
   forward <review_id>
   list [N]
+  findings [--status open|fixed|dismissed|pre_existing|all] [--file PATH]
+           [--limit N] [--json]
+  resolve <fingerprint> --as fixed|dismissed|pre_existing [--reason TEXT]
   gate [--target main|feature] [--head SHA] [--base SHA] [--cwd DIR]
 """
 
@@ -538,6 +616,12 @@ def main(argv: list[str] | None = None) -> int:
     if not args or args[0] in ("help", "--help", "-h"):
         sys.stdout.write(_USAGE)
         return 0
+    if args[0] in ("findings", "resolve"):
+        # Lazy import: findings.main resolves the DB through gate, which
+        # imports this module at load time.
+        from mini_ork.review.findings import main as findings_main
+
+        return findings_main(args)
     if args[0] == "gate":
         # Lazy import: mini_ork.review.gate imports this module, so a
         # module-level import here would be circular.

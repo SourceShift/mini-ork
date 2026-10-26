@@ -52,6 +52,7 @@ from mini_ork.pre_push_review import (
     review_show,
     review_verdict_for,
 )
+from mini_ork.review import verdict as _verdict
 
 __all__ = [
     "CACHE_REL",
@@ -323,6 +324,77 @@ def _print_review(review_text: str) -> None:
         print(f"pre-push review: {line}" if line.strip() else "pre-push review:")
 
 
+def _lens_runs(review_id: int, db: Path) -> list[tuple]:
+    """The recorded lens outcomes for a review, in panel order."""
+    con = sqlite3.connect(str(db))
+    try:
+        con.execute("PRAGMA busy_timeout=5000")
+        if con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table'"
+            " AND name='review_lens_runs'"
+        ).fetchone() is None:
+            return []
+        return con.execute(
+            "SELECT lens, status, issues, elapsed_ms FROM review_lens_runs"
+            " WHERE review_id=? ORDER BY id",
+            (int(review_id),),
+        ).fetchall()
+    finally:
+        con.close()
+
+
+def _print_lens_runs(review_id: int, db: Path) -> None:
+    """One evidence line per lens run; display only, never changes ``rc``."""
+    try:
+        for lens, status, issues, elapsed_ms in _lens_runs(review_id, db):
+            seconds = int(elapsed_ms or 0) // 1000
+            print(
+                f"pre-push review: lens {lens} {status} "
+                f"({int(issues or 0)} issues, {seconds}s)"
+            )
+    except Exception:  # noqa: BLE001 — evidence must not flip the decision
+        return
+
+
+_BLOCK_HINT = (
+    "pre-push review: blocking findings — dismiss one with: "
+    "mini-ork review resolve <fingerprint> --as dismissed --reason \"<why>\""
+)
+
+
+def _print_block_findings(review_id: int, db: Path) -> None:
+    """The dismiss hint plus each open high/critical linked finding."""
+    print(_BLOCK_HINT)
+    try:
+        con = sqlite3.connect(str(db))
+        try:
+            con.execute("PRAGMA busy_timeout=5000")
+            names = {
+                row[0] for row in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                    " AND name IN ('review_findings','review_finding_links')"
+                ).fetchall()
+            }
+            if not {"review_findings", "review_finding_links"} <= names:
+                return
+            rows = con.execute(
+                "SELECT DISTINCT f.fingerprint, f.severity, f.file_path, f.title "
+                "  FROM review_finding_links l "
+                "  JOIN review_findings f ON f.fingerprint = l.fingerprint "
+                " WHERE l.review_id=? AND l.pre_existing=0"
+                "   AND f.status='open' AND f.severity IN ('high','critical') "
+                " ORDER BY CASE f.severity WHEN 'critical' THEN 4"
+                "                          WHEN 'high' THEN 3 ELSE 0 END DESC",
+                (int(review_id),),
+            ).fetchall()
+        finally:
+            con.close()
+    except Exception:  # noqa: BLE001 — display only, never changes ``rc``
+        return
+    for fp, severity, file_path, title in rows:
+        print(f"  {fp}  {severity}  {file_path or '?'}  {title}")
+
+
 def _unavailable(reason: str, *, cwd: str | Path, env: Mapping[str, str],
                  target: str) -> GateResult:
     """The tier-aware "the review could not run" path."""
@@ -421,6 +493,13 @@ def run_gate(
         )
         cached = False
         if review_id is not None:
+            # Recompute so a dismissal (or a reopen) since the cached review
+            # takes effect. A read-only/locked DB falls through to the stored
+            # verdict instead of turning a cached approve into "unavailable".
+            try:
+                _verdict._apply_verdict(review_id, target, str(db))
+            except Exception:  # noqa: BLE001
+                pass
             verdict = _db_verdict(review_id, db)
             if verdict in _TERMINAL_VERDICTS:
                 cached = True
@@ -454,6 +533,7 @@ def run_gate(
                     target=target,
                     now=clock,
                 )
+            _print_lens_runs(review_id, db)
     except Exception as exc:  # noqa: BLE001
         return _unavailable(
             f"{type(exc).__name__}: {exc}", cwd=cwd, env=merged, target=target
@@ -471,6 +551,7 @@ def run_gate(
         _print_review(review_show(review_id, db=str(db)))
     elif verdict == "block":
         _print_review(review_show(review_id, db=str(db)))
+        _print_block_findings(review_id, db)
         if merged.get("MO_REVIEW_AUTO_FIX") == "1":
             forwarded = review_forward_to_bug_reports(review_id, db=str(db))
             print(f"pre-push review: forwarded {forwarded} issue(s) to bug_reports")

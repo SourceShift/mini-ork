@@ -13,6 +13,37 @@ from mini_ork.review.common import _resolve_db
 # Verdict policy
 # ─────────────────────────────────────────────────────────────────────────
 
+_LIFECYCLE_TABLES = ("review_findings", "review_finding_links")
+
+# Excludes issues whose finding was dismissed or is pre-existing, and issues
+# whose link itself carries the pre_existing flag.  The ``id`` column is
+# pre_push_review_issues.id in every query it is appended to.
+_EXCLUSION = (
+    " AND id NOT IN ("
+    "SELECT l.issue_id FROM review_finding_links l "
+    "LEFT JOIN review_findings f ON f.fingerprint = l.fingerprint "
+    "WHERE l.pre_existing = 1 "
+    "   OR f.status IN ('dismissed','pre_existing'))"
+)
+
+
+def _exclusion(con: sqlite3.Connection) -> str:
+    """The lifecycle exclusion clause, or ``""`` when the tables are missing.
+
+    A DB that predates rev6 R2b (or a test that drops the tables) keeps
+    today's counts exactly.
+    """
+    names = {
+        row[0] for row in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN (?,?)",
+            _LIFECYCLE_TABLES,
+        ).fetchall()
+    }
+    if not set(_LIFECYCLE_TABLES) <= names:
+        return ""
+    return _EXCLUSION
+
+
 # Mirrors lib/pre_push_review.sh:459-522 (compute_verdict / verdict UPDATE).
 def compute_verdict(rid: int, target_branch: str, *, db: str | None = None) -> tuple[str, str]:
     """Mirror the bash verdict-policy heredoc at lines 459-522.
@@ -32,28 +63,33 @@ def compute_verdict(rid: int, target_branch: str, *, db: str | None = None) -> t
     con = sqlite3.connect(db)
     try:
         con.execute("PRAGMA busy_timeout=5000")
+        excl = _exclusion(con)
         cur = con.execute(
             "SELECT COUNT(*) FROM pre_push_review_issues "
-            "WHERE review_id=? AND severity='critical' AND status='open'",
+            "WHERE review_id=? AND severity='critical' AND status='open'"
+            + excl,
             (rid,),
         ).fetchone()[0]
         critical = int(cur)
         cur = con.execute(
             "SELECT COUNT(*) FROM pre_push_review_issues "
-            "WHERE review_id=? AND severity='high' AND status='open'",
+            "WHERE review_id=? AND severity='high' AND status='open'"
+            + excl,
             (rid,),
         ).fetchone()[0]
         high = int(cur)
         cur = con.execute(
             "SELECT COUNT(*) FROM pre_push_review_issues "
-            "WHERE review_id=? AND status='open'",
+            "WHERE review_id=? AND status='open'"
+            + excl,
             (rid,),
         ).fetchone()[0]
         total = int(cur)
         cur = con.execute(
             "SELECT COUNT(*) FROM pre_push_review_issues "
             "WHERE review_id=? AND severity='high' AND status='open' "
-            "AND lens LIKE 'heuristic.%'",
+            "AND lens LIKE 'heuristic.%'"
+            + excl,
             (rid,),
         ).fetchone()[0]
         heuristic_high = int(cur)
@@ -61,7 +97,8 @@ def compute_verdict(rid: int, target_branch: str, *, db: str | None = None) -> t
             "SELECT COUNT(*) FROM ("
             "  SELECT file_path FROM pre_push_review_issues "
             "  WHERE review_id=? AND severity='high' AND status='open' "
-            "    AND lens LIKE 'llm.%' AND file_path IS NOT NULL "
+            "    AND lens LIKE 'llm.%' AND file_path IS NOT NULL"
+            + excl + " "
             "  GROUP BY file_path HAVING COUNT(DISTINCT lens) >= 2"
             ")",
             (rid,),
@@ -95,15 +132,18 @@ def _apply_verdict(rid: int, target_branch: str, db: str) -> None:
     con = sqlite3.connect(db)
     try:
         con.execute("PRAGMA busy_timeout=5000")
+        excl = _exclusion(con)
         cur = con.execute(
             "SELECT COUNT(*) FROM pre_push_review_issues "
-            "WHERE review_id=? AND status='open'",
+            "WHERE review_id=? AND status='open'"
+            + excl,
             (rid,),
         ).fetchone()[0]
         issues_open = int(cur)
         cur = con.execute(
             "SELECT COUNT(*) FROM pre_push_review_issues "
-            "WHERE review_id=? AND severity='critical' AND status='open'",
+            "WHERE review_id=? AND severity='critical' AND status='open'"
+            + excl,
             (rid,),
         ).fetchone()[0]
         issues_critical = int(cur)
