@@ -531,6 +531,48 @@ def test_halt_does_not_need_a_parsable_config(root, db, capsys):
     assert (db.parent / "rsi" / "DISABLED").is_file()
 
 
+def test_halt_releases_a_dead_cycles_lease(root, db, capsys):
+    """A SIGKILLed cycle leaves its lease live for a full TTL.
+
+    Releasing it here is what makes halt→resume a recovery path instead of an
+    operator waiting an hour for an expired row. It is safe to release another
+    process's lease *because the stop file is already on disk*: a new cycle
+    refuses to start, and a cycle that is still alive halts at its next check.
+    """
+    from mini_ork.stores import lease as lease_mod
+
+    token = lease_mod.acquire_lease(str(db), "__rsi_cycle__", ttl_s=3600)
+    assert token
+    assert lease_mod.current_lease(str(db), "__rsi_cycle__") is not None
+
+    assert rsi_cycle.main(["halt"], root=root) == 0
+    out = capsys.readouterr().out
+    assert "released lease __rsi_cycle__" in out
+    assert token in out
+    assert lease_mod.current_lease(str(db), "__rsi_cycle__") is None
+
+
+def test_halt_leaves_no_lease_of_its_own_behind(root, db, capsys):
+    """Halt on an idle checkout must not print a release it did not do."""
+    assert rsi_cycle.main(["halt"], root=root) == 0
+    out = capsys.readouterr().out
+    assert "halted: wrote" in out
+    assert "released lease" not in out
+
+
+def test_halt_says_so_when_the_release_does_not_take(root, db, capsys, monkeypatch):
+    """A release that fails is reported, never silently swallowed."""
+    from mini_ork.stores import lease as lease_mod
+
+    lease_mod.acquire_lease(str(db), "__rsi_cycle__", ttl_s=3600)
+    monkeypatch.setattr(lease_mod, "release_lease", lambda *a, **k: False)
+
+    assert rsi_cycle.main(["halt"], root=root) == 0
+    out = capsys.readouterr().out
+    assert "was not released here" in out
+    assert "expires on its own TTL" in out
+
+
 # ── quarantine ──────────────────────────────────────────────────────────────
 
 

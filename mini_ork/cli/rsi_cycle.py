@@ -857,27 +857,48 @@ def _cmd_revert(args, root: Path, db: Path) -> int:
 
 
 def _cmd_halt(args, root: Path, db: Path) -> int:
-    """Write the durable stop and report who still holds the lease.
+    """Write the durable stop, then release the lease.
 
     Deliberately does not read the config: a loop whose config is broken is
     exactly when an operator needs to stop it, and ``halt`` must not be the
-    verb that fails to parse.
+    verb that fails to parse. The price of that choice is that a cycle
+    configured with a non-default ``lease.key`` cannot be found here, so the
+    release is best effort and says which key it looked for.
+
+    Order matters. The stop file is written **first**: it is what refuses the
+    next cycle, so releasing afterwards leaves no window in which a fresh cycle
+    could claim the freed key. A cycle that is still alive re-checks the file
+    before every stage and halts on its own; its own ``release_lease`` then
+    finds no row, which the cycle already tolerates.
     """
     from mini_ork.rsi.config import LeaseConfig
     from mini_ork.stores import lease
 
+    key = LeaseConfig().key
     stop = Path(db).parent / "rsi" / "DISABLED"
     stop.parent.mkdir(parents=True, exist_ok=True)
     stop.write_text(f"halted by operator at {int(time.time())}\n", encoding="utf-8")
     sys.stdout.write(f"halted: wrote {stop}\n")
     try:
-        held = lease.current_lease(str(db), LeaseConfig().key)
+        held = lease.current_lease(str(db), key)
     except Exception:  # noqa: BLE001 - reporting must not fail the stop
         held = None
-    if held:
+    if not held:
+        return 0
+    token = str(held.get("owner_token") or "")
+    released = False
+    try:
+        released = bool(token) and lease.release_lease(str(db), key, token)
+    except Exception:  # noqa: BLE001 - the TTL is the backstop
+        released = False
+    if released:
         sys.stdout.write(
-            f"  a cycle is still running under lease {held.get('owner_token', '?')}; "
-            f"it stops at its next stage check or when the lease expires\n")
+            f"  released lease {key} (held by {token}); a cycle that is still "
+            f"running stops at its next stage check\n")
+    else:
+        sys.stdout.write(
+            f"  lease {key} held by {token or '?'} was not released here; it "
+            f"expires on its own TTL\n")
     return 0
 
 
