@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import sys
+
 import pytest
 
 from mini_ork.rsi.config import (
@@ -238,8 +240,22 @@ def test_an_unknown_mode_is_refused():
 
 def test_the_merge_command_is_built_from_the_scoped_test_set():
     out = cfg()
-    assert out.merge_test_cmd.startswith("python3 -m pytest -q")
+    assert out.merge_test_cmd.startswith(f"{sys.executable} -m pytest -q")
     assert out.merge_test_cmd.endswith("tests/unit/test_x.py")
+
+
+def test_the_merge_command_runs_the_cycles_own_interpreter():
+    """``python3`` on PATH here is 3.9; the package needs 3.11+.
+
+    The gate once ran under ``python3``, died in collection on
+    ``dataclass(slots=True)``, and rejected every merge before judging it — the
+    work was fine and the gate could not say so.
+    """
+    out = cfg()
+    first = out.merge_test_cmd.split()[0]
+    assert first == sys.executable, (
+        "the green gate must run under the interpreter that owns this process, "
+        "not whatever `python3` resolves to on PATH")
 
 
 def test_the_merge_command_refuses_to_fall_back_to_the_full_suite():
@@ -355,7 +371,7 @@ def test_the_shipped_example_parses_strict_and_passes_every_precondition():
 def test_the_example_merge_command_is_scoped_and_disables_the_asyncio_plugin():
     out = load_config(EXAMPLE, env={}, strict=True)
     cmd = out.merge_test_cmd
-    assert cmd.startswith("python3 -m pytest -q -p no:asyncio ")
+    assert cmd.startswith(f"{sys.executable} -m pytest -q -p no:asyncio ")
     for path in out.scoped_tests:
         assert path in cmd
     assert set(out.scoped_tests) == {"tests/unit/test_rsi_cycle_py.py",

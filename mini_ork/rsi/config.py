@@ -23,6 +23,8 @@ Three rules follow, and each one closes a way a config lies:
 from __future__ import annotations
 
 import os
+import shlex
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -400,6 +402,12 @@ class CycleConfig:
         ``merge.test_cmd`` wins; otherwise the scoped set is turned into a
         pytest invocation. There is deliberately no fall back to a bare
         ``pytest`` — that is the full suite the merge script would otherwise run.
+
+        The interpreter is the one running this process, not ``python3`` from
+        ``PATH``: on this host that is a 3.9 build, and the package needs 3.11+
+        (``dataclass(slots=True)``), so the gate died in *collection* and every
+        merge was rejected before it could be judged. A gate must run what the
+        cycle runs.
         """
         if self.merge.test_cmd:
             return self.merge.test_cmd
@@ -409,7 +417,8 @@ class CycleConfig:
                 "no scoped test set: set gates.pytest_paths (or merge.test_cmd). "
                 "The merge script's default gate is the full suite, which is not a "
                 "gate a cycle can wait for")
-        return "python3 -m pytest -q -p no:asyncio " + " ".join(tests)
+        return (f"{shlex.quote(sys.executable)} -m pytest -q -p no:asyncio "
+                + " ".join(shlex.quote(t) for t in tests))
 
     def to_dict(self) -> dict[str, Any]:
         return {
