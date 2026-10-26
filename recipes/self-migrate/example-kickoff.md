@@ -9,6 +9,13 @@ The `verify` fork was the cleanest proof case (0 outbound seams — the Python
 side was already runtime-native). This file remains the root-relative template
 for evaluating another fork; all six original top-level forks are now closed.
 
+**This task is finished — do not dispatch it.** `bin/mini-ork-verify` and the
+first Python port `mini_ork_verify.py` are both retired; the live module is
+`mini_ork/cli/verify.py`. Paths below that name either of the retired files are
+the historical scope of this migration, kept so the template stays legible. For
+where the "vacuous" logic lives now, see
+`docs/architecture/verification-stack.md`, "Which vacuous guard you mean".
+
 ## Fork
 - **fork:** `verify`
 - **python entrypoint:** `mini_ork/cli/verify.py`
@@ -31,7 +38,8 @@ for evaluating another fork; all six original top-level forks are now closed.
 - `verifiers/feature-acceptance.sh` — `gates/feature_acceptance.sh verify` passes,
   `tests/unit/test_mini_ork_verify_py.py` green, pyright 0 on the port.
 - `verifiers/ledger-shape.sh` — `static-feature-ledger.json` classifies every
-  behavior in `mini_ork_verify.py` (static vs agentic), agentic rows carry a
+  behavior in the Python port (then `mini_ork_verify.py`, now
+  `mini_ork/cli/verify.py`) as static vs agentic, agentic rows carry a
   cost-down `opportunity`.
 - `verifiers/fork-closure.sh` — the Bash entrypoint is absent and executable/runtime paths contain no surviving `bin/mini-ork-verify` reference.
 - No surviving reference to `bin/mini-ork-verify` anywhere in the diff'd tree.

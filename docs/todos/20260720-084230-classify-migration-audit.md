@@ -62,8 +62,9 @@ touching the user-owned `.mini-ork/config/agents.yaml`.
 - Re-ran classify feature acceptance, focused Pyright, post-retirement parity,
   feature acceptance, ledger shape, fork closure, and diff hygiene; all pass.
 - Diagnosed the outer `__gates__` failure as an orchestration-context defect:
-  `mini_ork_verify.py` omits keys required by globally registered oracle gates,
-  and its aggregate treats `defer` as failure. The self-migrate reports and
+  the Python verify port (then `mini_ork_verify.py`; today `mini_ork/cli/verify.py`
+  — the old module was retired) omits keys required by globally registered oracle
+  gates, and its aggregate treats `defer` as failure. The self-migrate reports and
   implementation are green, so no paid retry was performed.
 
 ## Second completion audit

@@ -28,6 +28,25 @@ The features below close three holes that were measured in mini-ork itself:
 2. **The oracle had a recall hole.** It could not judge about 16% of correct fixes (recall 21/25).
 3. **Single tests can be gamed through coverage gaps.** A patch that special-cases the tested input passes the test.
 
+## Which "vacuous" guard you mean: three, not one
+
+"There is a vacuous-pass guard, but it is off behind a flag" and "a vacuous pass
+cannot be laundered into a success" are both true, and they describe different
+code. Naming one path for all three is how the retired `mini_ork_verify.py`
+kept being cited for a guard that lives somewhere else.
+
+| Mechanism | Path | What it stops | State today |
+|---|---|---|---|
+| Verdict | `mini_ork/cli/verify.py` | A run with zero executed verifiers, zero-byte evidence, or a verifier that declares itself vacuous ends `vacuous`/`fail`, never `pass` | **Live, unconditional** |
+| Dispatch | `mini_ork/cli/execute_handlers.py` (`_is_vacuous_command`, `_vacuous_verdict`, `_record_verifier_result(…, "vacuous")`) | A literal `true` / `:` / `exit 0` probe — statically no-op — has its `pass`, `suite_green` and `post_rc` stripped, so it earns no execution reward | **Live, unconditional** |
+| Pre-publish gate | `mini_ork/verify/probe_validity.py` | A run whose probes are vacuous, aliased across acceptance criteria, or already green on the untouched base tree is not publishable (`verify_vacuous`) | **Default OFF** — `MO_PROBE_VALIDITY` unset/`0`; `1` = enforce, `shadow` = record `would_block` only. Turning it on is a separate change after an n ≥ 30 A/B against the K1 frozen baseline |
+
+The first two are the reason a vacuous run cannot pass today; the third is a
+publish-time hold-out whose evidence (`probe-validity.json`) is collected in
+`shadow` mode first. `bin/mini-ork-verify` and `mini_ork_verify.py` — the
+pre-2026-07 shell oracle and its first Python port — are both retired; any
+document still citing them is describing that history, not this code.
+
 ## Where each piece lands
 
 ```mermaid

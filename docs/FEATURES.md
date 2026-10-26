@@ -89,11 +89,12 @@ experience and feeds it forward:
 
 | Feature | Where | What it gives you |
 |---|---|---|
-| Deterministic verifier registry | `${MINI_ORK_HOME}/verifiers/` + `recipes/*/verifiers/` + `lib/gate_registry.sh` | Executable specs: exit 0 = pass. Recipe-scoped verifiers override globals. |
-| 7 gate types + custom | `lib/gate_registry.sh` | deterministic_verifier / reviewer_gate / human_gate / budget_gate / scope_gate / deployment_gate / liveness_gate. |
-| Minimum-evidence policy | `bin/mini-ork-verify` | Zero verifiers executed ⇒ verdict `vacuous`, *not* success. "Nothing was checked" is never laundered into a pass. |
-| Run-scoped evidence | `bin/mini-ork-verify` | Verifier evidence files live with the run that produced them — every verdict is replayable. |
-| Mutation adversary | `lib/mutation-adversary.sh` | Generates 5 plausible buggy diffs; the spec must catch ≥80% before implementation proceeds. Tests the tests. |
+| Deterministic verifier registry | `${MINI_ORK_HOME}/verifiers/` + `recipes/*/verifiers/`, resolved by `mini_ork/cli/verify.py` | Executable specs: exit 0 = pass. Recipe-scoped verifiers override globals. |
+| 7 gate types + custom | `mini_ork/gates/gate_registry.py` | deterministic_verifier / reviewer_gate / human_gate / budget_gate / scope_gate / deployment_gate / liveness_gate. |
+| Minimum-evidence policy | `mini_ork/cli/verify.py` (verdict) + `mini_ork/cli/execute_handlers.py` (reward) | Zero verifiers executed, zero-byte evidence, or a self-declared vacuous verifier ⇒ verdict `vacuous`, *not* success; a statically no-op probe (`true`/`:`) also has its `pass` stripped before it reaches the reward. "Nothing was checked" is never laundered into a pass. |
+| Run-scoped evidence | `mini_ork/cli/verify.py` | Verifier evidence files live with the run that produced them — every verdict is replayable. |
+| Probe-validity publish gate | `mini_ork/verify/probe_validity.py` | Refuses to publish a run whose probes proved nothing, are aliased across acceptance criteria, or already pass on the untouched base tree. **Default OFF** (`MO_PROBE_VALIDITY`; `1` = enforce, `shadow` = record only) pending an n ≥ 30 A/B against the K1 frozen baseline — see `docs/operator/feature-flags.md` |
+| Mutation adversary | `mini_ork/gates/mutation_adversary.py` | Generates 5 plausible buggy diffs; the spec must catch ≥80% before implementation proceeds. Tests the tests. |
 | Scope guards | `config/scope-patterns.yaml.example` + `lib/scope-overlap.sh` | Per-lane file-glob allow/deny — a backend worker can't quietly edit your frontend. |
 | Bounded autonomy ladder | README §"Bounded Autonomy" + `docs/SAFETY.md` | 7 risk rungs from "tune prompt wording" (free) to "promote runtime changes" (benchmark + human gate + quarantine clear). |
 | Class-restricted self-evolution | `docs/positioning/why-mini-ork.md` | Auto-promotion only for task classes with an external oracle (tests, schemas). LLM-judged classes stay operator-gated — the framework refuses to fabricate an oracle. |
