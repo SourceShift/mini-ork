@@ -232,8 +232,12 @@ of one cycle sorts together and no run can write into the operator's own home.
 | `rsi-critic` | DECIDE | `critics.json` + `panel-composition.json` (→ G10) | 2 critics on 2 families, no synthesiser, no vote |
 
 Both lanes sets are chosen for what a stock home can actually reach:
-`glm_lens` (zai), `deepseek_lens` (deepseek), `minimax_lens` (minimax), with the
-implementer on `minimax`. **An alias is not a family.** A host's
+`glm_lens` (zai) and `minimax_lens` (minimax) for the critics, `deepseek_lens`
+(deepseek), `codex_lens` and the other lens aliases for the suggest panel, with
+the implementer on `codex_lens`. Deepseek is deliberately *not* a critic: a host
+may map `codex_lens` and `deepseek_lens` onto one provider — this repo's own
+overlay does — and the panel would then answer with one model wearing two
+names. **An alias is not a family.** A host's
 `agents.local.yaml` overlay can point `opus_lens` at the glm lane — the config's
 startup check still passes, because it resolves the *provider* lane, and then
 every cycle quarantines on G10 because both critics were served by one family.

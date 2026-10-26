@@ -523,10 +523,11 @@ def test_the_suggest_panel_still_fails_when_two_lenses_share_a_family(tmp_path):
 def test_the_critic_panel_grades_only_the_two_declared_critics(tmp_path):
     brief, _ = _brief_file(tmp_path)
     brief.write_text(json.dumps({**json.loads(brief.read_text()),
-                                 "implementer_lane": "minimax"}), encoding="utf-8")
+                                 "implementer_lane": "codex_lens"}), encoding="utf-8")
     db = _llm_db(tmp_path, [
         ("rsi-ctest", "glm_lens", "glm-4.6", "success"),
-        ("rsi-ctest", "deepseek_lens", "deepseek-v3", "success"),
+        ("rsi-ctest", "minimax_lens", "minimax-m2", "success"),
+        ("rsi-ctest", "codex_lens", "deepseek-v3", "success"),
         ("rsi-ctest", "planner", "glm-4.6", "success"),
         ("rsi-ctest", "profile_answerer", "minimax-m2", "success"),
     ])
@@ -538,8 +539,8 @@ def test_the_critic_panel_grades_only_the_two_declared_critics(tmp_path):
 
     assert out.returncode == 0, out.stderr
     panel = json.loads((run_dir / "panel-composition.json").read_text())
-    assert panel["lanes"] == ["glm_lens", "deepseek_lens"]
-    assert sorted(panel["families"]) == ["deepseek_lens", "glm_lens"]
+    assert panel["lanes"] == ["glm_lens", "minimax_lens"]
+    assert sorted(panel["families"]) == ["glm_lens", "minimax_lens"]
 
 
 # --------------------------------------------------------------------------

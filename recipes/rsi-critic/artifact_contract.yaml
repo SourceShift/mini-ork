@@ -15,7 +15,7 @@ outputs:
   - path: "${MINI_ORK_RUN_DIR}/critics/glm_lens.json"
     mime: application/json
     description: One exogenous critic's verdict.
-  - path: "${MINI_ORK_RUN_DIR}/critics/deepseek_lens.json"
+  - path: "${MINI_ORK_RUN_DIR}/critics/minimax_lens.json"
     mime: application/json
     description: The second exogenous critic's verdict.
   - path: "${MINI_ORK_RUN_DIR}/panel-composition.json"

@@ -79,18 +79,25 @@ critic:
   # repo's own overlay maps `opus_lens` to glm), which passes this check and
   # then fails G10 after the run. `rsi-cycle doctor` and the recipe's
   # `panel-composition.json` both report which lane actually served.
-  lanes: [glm_lens, deepseek_lens]
+  lanes: [glm_lens, minimax_lens]
   require_unanimous: true   # false is refused: a split quarantines, never majority-merges
-  model_timeout_s: 900
+  # The whole critic run, not one call: lane probes, two critics, merge, panel.
+  # 900 s was measured too small on this host — single model calls reach ~580 s,
+  # and a run that hits it yields zero verdicts and quarantines a green diff.
+  model_timeout_s: 2400
 
 implement:
   runtime_backend: local    # | bubblewrap | daytona | microsandbox
   child_timeout_s: 3600
   static_recipe_plan: true
-  # The model lane the child implementer actually runs on — G10 refuses a critic
-  # in this family. `minimax` is the `implementer` alias in a stock home; if your
-  # overlay points that alias elsewhere, name the family it really reaches.
-  lane: minimax
+  # The lane the child implementer runs on — G10 refuses a critic in this
+  # family. The framework-edit recipe pins the implementer to `codex_lens`, so
+  # that is the alias to name; `model_family()` maps it by name. If a host's
+  # overlay serves `codex_lens` from a provider one of your critics also uses,
+  # set this to the served model family (`deepseek`, `anthropic`, …) instead —
+  # the alias map cannot see the overlay, and G10 would otherwise pass a panel
+  # that is not actually independent of the implementer.
+  lane: codex_lens
 
 merge:
   # No origin -> quarantine, never a local commit on main. Checked at startup

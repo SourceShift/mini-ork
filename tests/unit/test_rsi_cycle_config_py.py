@@ -364,8 +364,9 @@ def test_the_shipped_example_parses_strict_and_passes_every_precondition():
     assert out.probes.allow_live is False
     assert out.gates.static_mode == "differential", "strict is unusable on today's red baseline"
     assert out.merge.require_remote is True
-    assert out.critic.lanes == ("glm_lens", "deepseek_lens")
-    assert out.implement.lane == "minimax"
+    assert out.critic.lanes == ("glm_lens", "minimax_lens")
+    assert out.implement.lane == "codex_lens"
+    assert out.critic.model_timeout_s == 2400, "900 s was measured too small for a real panel"
 
 
 def test_the_example_merge_command_is_scoped_and_disables_the_asyncio_plugin():
