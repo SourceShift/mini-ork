@@ -82,38 +82,57 @@ def test_missing_column_on_a_present_table_is_a_probe_broken_candidate(tmp_path,
     assert rep.harvest_ok is True
 
 
-def test_llm_calls_without_a_lane_column_is_a_routing_gap(tmp_path, con):
-    # The absent column *is* R8's subject. If it were raised through
-    # ``_require_column`` it would arrive as ``probe_broken`` — "the harvester
-    # cannot look" — and ``doctor`` would report the checkout unready because the
-    # gap exists, instead of queueing the gap for a cycle to fix.
-    ddl(con, "CREATE TABLE llm_calls (id INTEGER, cost_usd REAL)")
-    con.executemany("INSERT INTO llm_calls VALUES (?, ?)", [(1, 0.1), (2, 0.2)])
+def test_llm_calls_with_a_chain_in_model_id_is_a_routing_gap(tmp_path, con):
+    # R8's subject is a *chain where a lane belongs*, not the absence of a lane
+    # column: ``model_id`` already doubles as the serving lane, so asserting
+    # "cost cannot be attributed" was a claim nobody measured. Cycles 12-13
+    # (2026-10-26) spent $3.00 and three critic rejections on a column that was
+    # a byte-copy of model_id. What is left is the real defect.
+    ddl(con, "CREATE TABLE llm_calls (id INTEGER, model_id TEXT NOT NULL)")
+    con.executemany("INSERT INTO llm_calls VALUES (?, ?)",
+                    [(1, "glm"), (2, "deepseek_flash,minimax,glm")])
     con.commit()
     rep = report(tmp_path, con)
     cand = one(rep, "db:R8")
-    assert cand.kind == "signal_not_propagated"
-    assert cand.evidence_key == "table:llm_calls:lane:absent"
+    assert cand.kind == "quality_red"
+    assert cand.evidence_key == "table:llm_calls:model_id:chain"
     assert cand.evidence["rows"] == 2
+    assert cand.evidence["chain_rows"] == 1
+    # Severity follows the measured reach (one malformed row), not the table.
+    assert cand.severity < 50
     assert "R8" not in rep.skipped and rep.harvest_ok is True
 
 
 def test_r8_fix_hint_forbids_inventing_a_lane(tmp_path, con):
-    # Cycle 12 (2026-10-26) quarantined on a critic split caused by this hint:
-    # the old wording said where to *get* a lane but not what to write when none
-    # was resolved, so the child stamped the first entry of the fused ``model``
-    # chain onto refusal and crash rows. The hint travels into the cycle brief,
-    # which every lens and the synthesizer read, so it is part of the contract.
-    ddl(con, "CREATE TABLE llm_calls (id INTEGER, cost_usd REAL)")
+    # Cycles 12-13 quarantined because the hint said where to *get* a lane but
+    # not what to write when none was resolved, so the child stamped the first
+    # entry of the fused ``model`` chain onto refusal and crash rows. The hint
+    # travels into the cycle brief, which every lens and the synthesizer read,
+    # so it is part of the contract.
+    ddl(con, "CREATE TABLE llm_calls (id INTEGER, model_id TEXT NOT NULL)")
+    con.execute("INSERT INTO llm_calls VALUES (1, 'glm,minimax')")
     cand = one(report(tmp_path, con), "db:R8")
     hint = cand.fix_hint.lower()
     assert "null" in hint
     assert "infer" in hint
 
 
-def test_llm_calls_with_a_lane_column_is_healthy(tmp_path, con):
-    ddl(con, "CREATE TABLE llm_calls (id INTEGER, lane TEXT)")
+def test_one_lane_per_row_is_healthy(tmp_path, con):
+    # 16,533 of 16,543 rows on the live home are exactly this shape, which is
+    # why the old structural rule mis-ranked the gap at 74.
+    ddl(con, "CREATE TABLE llm_calls (id INTEGER, model_id TEXT NOT NULL)")
+    con.executemany("INSERT INTO llm_calls VALUES (?, ?)",
+                    [(1, "glm"), (2, "minimax")])
     assert "R8" in report(tmp_path, con).closed
+
+
+def test_a_lane_column_alone_does_not_close_the_gap(tmp_path, con):
+    # The rejected cycle-12/13 fix in one assertion: a new column whose writers
+    # still stamp a chain into model_id leaves the malformed rows in place, and
+    # the new column NULL. On a copy of the database that is not a fix.
+    ddl(con, "CREATE TABLE llm_calls (id INTEGER, model_id TEXT, lane TEXT)")
+    con.execute("INSERT INTO llm_calls VALUES (1, 'glm,minimax', NULL)")
+    assert "R8" not in report(tmp_path, con).closed
 
 
 def test_a_crashing_rule_is_evidence_not_a_stop(tmp_path, con, monkeypatch):

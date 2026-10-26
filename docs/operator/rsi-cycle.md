@@ -207,7 +207,8 @@ instead of racing. Point `secure.db_path` at the shared DB and
 |---|---|---|
 | `halted` + `lease_held` | `rsi-cycle list --status running` | a cycle is genuinely running; if it is stale, the TTL expires |
 | `halted` + `daily_cap` | `rsi-cycle doctor` | 24h spend at the cap; raise `daily_cap_usd` or wait |
-| every cycle `quarantined` `critic_split` | `rsi-cycle show <id> --json` | the critics disagree; read their `blocking_findings` |
+| every cycle `quarantined` `critic_rejected` | `rsi-cycle show <id> --json` | every critic rejected the same change; the *fix shape* is wrong, not the panel — re-read the candidate's `fix_hint` before retrying, since the next child derives its approach from it |
+| every cycle `quarantined` `critic_split` | `rsi-cycle show <id> --json` | the critics disagree with each other; the *question* is underspecified — read their `blocking_findings` against each other |
 | every cycle `quarantined` `critic_not_exogenous` | `rsi-cycle doctor` | a critic lane share a family with `implement.lane` |
 | `no_candidate` forever | `rsi-cycle plan --json` | nothing above `queue.min_severity`, or everything is closed in `rsi_candidates` |
 | `2` and a config message | the message names the key | see the fail-closed list above |

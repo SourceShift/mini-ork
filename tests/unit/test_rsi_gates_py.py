@@ -255,6 +255,37 @@ def test_g10_names_blocking_findings_as_dissent():
     assert "critic_split" in _codes(ev)
 
 
+def test_g10_tells_unanimous_rejection_from_a_split():
+    """A panel that agrees the fix is wrong is not a panel that disagrees.
+
+    Both fail the gate, but they mean opposite things to the loop: unanimous
+    rejection is evidence about the *change* (the fix shape is wrong — a second
+    child should be aimed elsewhere), a split is evidence about the *question*
+    (the gap is underspecified). Cycle 13 merged the two under
+    ``critic_split`` and the quarantine read as "the critics could not agree"
+    when in fact both had said no for the same reason.
+    """
+    both_no = _evidence(critics=(
+        _critic("c1", "glm-5.3", approve=False),
+        _critic("c2", "claude-opus-5-5", approve=False),
+    ))
+    assert "critic_rejected" in _codes(both_no)
+    assert "critic_split" not in _codes(both_no)
+
+    one_no = _evidence(critics=(
+        _critic("c1", "glm-5.3", approve=False), _critic("c2", "claude-opus-5-5")))
+    assert "critic_split" in _codes(one_no)
+    assert "critic_rejected" not in _codes(one_no)
+
+    # An approve-with-blocking-finding counts as dissent, so a panel where both
+    # approve but both block is also a rejection.
+    both_blocking = _evidence(critics=(
+        CriticVerdict(alias="c1", lane="glm-5.3", approve=True, blocking=("x",)),
+        CriticVerdict(alias="c2", lane="claude-opus-5-5", approve=True, blocking=("y",)),
+    ))
+    assert "critic_rejected" in _codes(both_blocking)
+
+
 def test_g10_requires_distinct_families_and_no_implementer_family():
     same = _evidence(critics=(_critic("c1", "glm-5.3"), _critic("c2", "glm-4.6")))
     assert "critic_not_exogenous" in _codes(same)
@@ -302,10 +333,14 @@ def test_gate_result_rejects_inconsistent_records():
         GateResult("G1", "harvest_complete", False, "not_a_code")
 
 
-def test_fail_codes_cover_every_gate_and_g10_s_second_code():
+def test_fail_codes_cover_every_gate_and_g10_s_extra_codes():
     for code in (row[2] for row in GATE_ORDER):
         assert code in FAIL_CODES
+    # G10's ledger spellings are deliberately three-way: the table's declared
+    # code is the disagreement case, and the two extra codes name the ways a
+    # panel can fail without disagreeing with itself.
     assert "critic_not_exogenous" in FAIL_CODES
+    assert "critic_rejected" in FAIL_CODES
 
 
 def test_replace_keeps_the_fixture_honest():

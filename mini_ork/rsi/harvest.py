@@ -896,41 +896,61 @@ def _r7_workflow_candidates_flat(ctx: _Ctx, domain: str, rule_id: str) -> list[C
 
 
 def _r8_llm_calls_no_lane(ctx: _Ctx, domain: str, rule_id: str) -> list[Candidate]:
-    """Cost rows cannot be attributed to a lane.
+    """Some cost rows record a requested chain where a serving lane belongs.
 
-    The column's *absence* is this rule's finding, so it must not go through
-    ``_require_column``: that raises ``_SchemaDrift``, which the dispatcher turns
-    into a ``probe_broken`` candidate about the rule itself. The two readings
-    differ operationally — ``doctor`` treats schema drift as "the harvester
-    cannot look" and reports the checkout unready, while a real gap is an
-    ordinary queue item that the loop can fix. ``_columns`` still raises
-    ``_SkipRule`` when the table itself is absent, so an old home stays a skip.
+    This rule used to fire on the *absence* of a ``lane`` column and assert that
+    "cost cannot be attributed to a route". That consequence was never measured,
+    and it is false: ``model_id`` doubles as the serving lane — the lane fuse
+    keys on it (``llm_dispatch._apply_lane_fuse``) — so a ``GROUP BY model_id``
+    attributes 16,533 of 16,543 rows on this home correctly. Two cycles on
+    2026-10-26 ($3.00, and three critic rejections) were spent proving it: the
+    panel refused a column that is a byte-copy of ``model_id``, and it was right.
+
+    The defect underneath is narrower and real. The refusal and dispatcher-crash
+    writers stamp ``str(model).split(",",1)[0]`` — the head of a comma-joined
+    *requested* chain — into ``model_id``, and ``persist_call`` defaults the same
+    field from ``result.model``, which is a ``DispatchResult``'s requested model.
+    A value that looks like a lane to every consumer is then not one, on rows
+    where nothing served at all.
+
+    So the rule measures that: rows whose ``model_id`` is a chain. It closes when
+    none are left — and *only* then. Adding a ``lane`` column on its own does not
+    close it, because the writers would keep stamping chains into ``model_id``
+    and the new column would sit NULL; measured on a copy of the database, a
+    schema-only change is not a fix. ``_columns`` raises ``_SkipRule`` when the
+    table itself is absent, so an old home stays a skip.
     """
-    if "lane" in _columns(ctx, "llm_calls"):
-        raise _GapClosed("llm_calls has a lane column")
+    _require_column(ctx, "llm_calls", "model_id")
     rows = _scalar(ctx, "SELECT count(*) FROM llm_calls")
+    chained = _scalar(ctx, "SELECT count(*) FROM llm_calls WHERE model_id LIKE '%,%'")
+    if not chained:
+        raise _GapClosed("model_id names one serving lane on every row")
     return [_cand(
         ctx, domain, rule_id,
-        kind="signal_not_propagated",
-        title="llm_calls records no lane, so cost cannot be attributed to a route",
-        evidence_key="table:llm_calls:lane:absent",
+        kind="quality_red",
+        title="llm_calls stores a requested chain where a serving lane belongs",
+        evidence_key="table:llm_calls:model_id:chain",
         files=("mini_ork/dispatch/telemetry.py", "mini_ork/dispatch/llm_dispatch.py"),
-        detail="The dispatch knows which lane served a call, but the cost row drops it. "
-               "Per-lane cost, win-rate and routing credit are then unattributable.",
-        evidence={"table": "llm_calls", "column": "lane", "rows": rows},
-        reach=rows,
-        # The hint says which lane to write *when there is one* on purpose. Cycle
-        # 12's proposal read the old wording ("write it from the dispatch path")
-        # as licence to stamp the first entry of the fused ``model`` chain onto
-        # refusal and crash rows, and the critic panel split on it — correctly: a
-        # fused chain names the lanes that were tried, and a refusal or a
-        # dispatcher crash means nothing served at all.
-        fix_hint="Add a nullable lane column and write the lane the dispatch actually "
-                 "resolved. Where no lane resolved — a fused chain, a pre-spawn refusal, "
-                 "a dispatcher crash — the lane is genuinely unknown: write NULL. Never "
-                 "infer one from the model string; an invented attribution cannot be "
-                 "told apart from a measured one downstream.",
-        success_metric="llm_calls has a lane column and new rows populate it",
+        detail=f"{chained} of {rows} rows hold a comma-joined chain in model_id instead of "
+               "the single lane that served. Every consumer that groups by model_id reads "
+               "a whole chain as one route, and on the refusal and dispatcher-crash rows "
+               "nothing served at all.",
+        evidence={"table": "llm_calls", "column": "model_id", "rows": rows,
+                  "chain_rows": chained},
+        reach=chained,
+        # The invariant, not the mechanism: say what a consumer must be able to
+        # rely on and leave the shape to the panel. The previous hint prescribed
+        # "add a lane column and write it from the dispatch path", which a child
+        # read as licence to stamp the first entry of the fused chain onto
+        # refusal and crash rows — the exact inference two critics rejected.
+        fix_hint="A consumer grouping cost by the lane field must see exactly one lane "
+                 "that served, or an explicit nothing-served marker. Keep model_id as the "
+                 "serving lane; on the refusal and dispatcher-crash rows, record the "
+                 "requested chain outside the lane field and write the absence explicitly "
+                 "(NULL in a lane column, or a marker that no lane served). Never infer a "
+                 "lane from the chain: an invented attribution cannot be told apart from a "
+                 "measured one downstream.",
+        success_metric="no llm_calls row stores a comma-joined chain in model_id",
     )]
 
 

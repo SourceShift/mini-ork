@@ -29,9 +29,13 @@ Two gates carry their own vocabulary:
 * **G4** accepts ``changed ⊆ kickoff files ∪ allow_prefixes`` and a file-count
   bound. The allowlist is deliberately the same one ``select`` used
   pre-dispatch, so the two checks cannot disagree about the fix surface.
-* **G10** fails twice over — ``critic_split`` for a non-unanimous panel,
-  ``critic_not_exogenous`` when the critics share a family with each other or
-  with the implementer. A majority vote is not merge authority here.
+* **G10** fails three ways — ``critic_rejected`` when every critic said no,
+  ``critic_split`` when they could not agree, ``critic_not_exogenous`` when the
+  critics share a family with each other or with the implementer. The first two
+  are different signals and the ledger must not read them alike: a panel that
+  unanimously rejects the *change* is evidence about the fix, while a panel that
+  disagrees with itself is evidence about the question. A majority vote is merge
+  authority under neither.
 """
 from __future__ import annotations
 
@@ -70,9 +74,10 @@ GATE_ORDER: tuple[tuple[str, str, str], ...] = (
     ("G11", "budget", "budget_exceeded"),
 )
 
-#: Every fail code a gate can emit, including G10's second.
+#: Every fail code a gate can emit, including G10's two extra.
 FAIL_CODES: tuple[str, ...] = tuple(code for _, _, code in GATE_ORDER) + (
     "critic_not_exogenous",
+    "critic_rejected",
 )
 
 
@@ -363,7 +368,13 @@ def _g10(ev: GateEvidence) -> GateResult:
                               "panel check: " + (", ".join(map(str, problems)) or "not ok"))
     dissent = [c.alias for c in critics if not c.approve or c.blocking]
     if dissent:
-        return GateResult("G10", "critic_unanimous", False, "critic_split",
+        # A panel that rejected in unison is not a split. Cycle 13 (2026-10-26)
+        # merged the two under ``critic_split`` and a reader could not tell
+        # "the fix is wrong" from "the panel could not agree" — which is the
+        # difference between a lesson about the fix and a lesson about the
+        # question.
+        code = "critic_rejected" if len(dissent) == len(critics) else "critic_split"
+        return GateResult("G10", "critic_unanimous", False, code,
                           f"critic(s) did not approve: {', '.join(dissent)}")
     return GateResult("G10", "critic_unanimous", True)
 

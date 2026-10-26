@@ -978,12 +978,12 @@ def test_a_missing_db_freezes_to_none(tmp_path):
     assert cycle_mod._freeze_db(req) is None
 
 
-def _seed_llm_calls_without_lane(db: Path) -> None:
-    """R8's shape: the table exists, the column that makes cost attributable does not."""
+def _seed_llm_calls_with_a_chain(db: Path) -> None:
+    """R8's shape: one row stores a requested chain where a serving lane belongs."""
     con = sqlite3.connect(str(db))
     try:
-        con.executescript("CREATE TABLE llm_calls (id INTEGER);"
-                          "INSERT INTO llm_calls VALUES (1), (2);")
+        con.executescript("CREATE TABLE llm_calls (id INTEGER, model_id TEXT NOT NULL);"
+                          "INSERT INTO llm_calls VALUES (1, 'glm'), (2, 'glm,minimax');")
         con.commit()
     finally:
         con.close()
@@ -992,13 +992,13 @@ def _seed_llm_calls_without_lane(db: Path) -> None:
 def _r8_candidate() -> Candidate:
     return Candidate(
         candidate_id="rsi-r8test", domain="routing", source="db:R8",
-        kind="signal_not_propagated", title="llm_calls records no lane",
-        detail="", severity=74,
+        kind="quality_red", title="llm_calls stores a requested chain where a lane belongs",
+        detail="", severity=40,
         files=("mini_ork/dispatch/telemetry.py", "mini_ork/dispatch/llm_dispatch.py"),
-        evidence={"table": "llm_calls", "column": "lane", "rows": 2},
-        fix_hint="", success_metric="llm_calls has a lane column",
+        evidence={"table": "llm_calls", "column": "model_id", "rows": 2, "chain_rows": 1},
+        fix_hint="", success_metric="no llm_calls row stores a comma-joined chain",
         success_command="db:R8",
-        evidence_key="table:llm_calls:lane:absent",
+        evidence_key="table:llm_calls:model_id:chain",
         signature="sig-r8", first_seen_at=NOW)
 
 
@@ -1010,20 +1010,26 @@ def _post_tree(root: Path, sql: str) -> Path:
     return root
 
 
-def test_g8_sees_the_schema_its_patch_adds(tmp_path):
-    """A missing column is fixed by a migration; measured on one DB it could not move.
+def test_g8_sees_the_data_its_patch_normalises(tmp_path):
+    """A malformed row is fixed by a migration; measured on one DB it could not move.
 
     Before the post-DB, ``db:R8`` was evaluated against the same frozen baseline on
     both sides, so *every* DB-sourced candidate reported ``metric_unchanged`` and no
     cycle could ever merge. The baseline stays the thing nobody writes; the post
     side migrates a copy.
+
+    The fix normalises the rows rather than adding a column: a schema-only change
+    leaves the chain in ``model_id`` and the new column NULL, which is why the
+    cycle-12/13 diff was rejected — and why this gate must not credit it.
     """
     db = tmp_path / "state.db"
-    _seed_llm_calls_without_lane(db)
+    _seed_llm_calls_with_a_chain(db)
     req = CycleRequest(root=tmp_path, db=db, config=_cfg(), cycle_id="rsi-ctest")
     assert cycle_mod._freeze_db(req) is not None
 
-    post = _post_tree(tmp_path / "post", "ALTER TABLE llm_calls ADD COLUMN lane TEXT;")
+    post = _post_tree(tmp_path / "post",
+                      "UPDATE llm_calls SET model_id = 'unresolved' "
+                      "WHERE model_id LIKE '%,%';")
     cand = _r8_candidate()
 
     assert cycle_mod._gap_at(req, cand, post) is True, "the baseline still has the gap"
@@ -1059,7 +1065,7 @@ def test_a_data_ratio_gap_stays_unchanged_after_the_post_migration(tmp_path):
 def test_the_post_db_falls_back_when_a_migration_fails(tmp_path):
     """A patch whose migration does not apply must not be credited with a fix."""
     db = tmp_path / "state.db"
-    _seed_llm_calls_without_lane(db)
+    _seed_llm_calls_with_a_chain(db)
     req = CycleRequest(root=tmp_path, db=db, config=_cfg(), cycle_id="rsi-ctest")
     assert cycle_mod._freeze_db(req) is not None
 
