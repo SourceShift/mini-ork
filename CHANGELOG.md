@@ -93,6 +93,14 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- fix(certify): every oracle lane call is bounded and retried once. `certify` used to call the lane with
+  the dispatcher's defaults (25 min, 60 turns), so one stalled gateway call pinned a verdict for up to
+  25 minutes with nothing printed; the demo's PROVEN path made six such calls (one measured at 6m43s on
+  a lane that answers in 4 s). Calls now run under `MO_CERTIFY_LANE_TIMEOUT_S` (180 s) and
+  `MO_CERTIFY_LANE_MAX_TURNS` (8), are retried `MO_CERTIFY_LANE_RETRIES` (1) times, and print one
+  progress line per call on a terminal (`MO_CERTIFY_PROGRESS=1` elsewhere); a call that still fails makes
+  the oracle abstain (UNVERIFIED) instead of hanging. `mo_llm_dispatch` now threads its `max_turns`
+  argument into the request; it was accepted and dropped on both the single-lane and fallback paths.
 - fix(gates): certifying oracle gates (coalition, liveness, stability) defer on absent evidence instead of passing
   (hackability 0.8 → 0.0, b53b6c0d).
 - fix(execute): framework-edit verifier nodes no longer require the verdict.json they are about to write (6/6 builds

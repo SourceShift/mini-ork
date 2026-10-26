@@ -742,7 +742,8 @@ def mo_llm_dispatch(model, prompt, out_file, timeout_s=1500, max_turns=60, accep
     from mini_ork.dispatch.predicates import SHAPE_REJECT_RC
     from mini_ork.dispatch.providers import dispatch_model, dispatch_with_fallback
     lanes = [m.strip() for m in str(model).split(",") if m.strip()] or [str(model)]
-    req = DispatchRequest(model=lanes[0], prompt=prompt, timeout_s=float(timeout_s))
+    req = DispatchRequest(model=lanes[0], prompt=prompt, timeout_s=float(timeout_s),
+                          max_turns=int(max_turns))
     if len(lanes) > 1:
         res = dispatch_with_fallback(req, lanes, accept=accept, on_attempt=on_attempt)
     else:

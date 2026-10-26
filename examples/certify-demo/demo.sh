@@ -12,6 +12,10 @@
 # Needs: Docker (certify builds a runtime image of the repo) and one working model
 # lane (default MO_CERTIFY_MODEL=minimax; see `mini-ork providers`). Real model calls:
 # roughly $0.10–0.60 and 1–3 minutes per certificate, depending on the lane.
+# Each lane call is capped at MO_CERTIFY_LANE_TIMEOUT_S seconds (180) and retried once,
+# so a stalled gateway costs minutes, not the 25-minute dispatcher default; a call that
+# still fails makes that certificate UNVERIFIED. On a terminal, certify prints one line
+# per lane call so a slow lane is not mistaken for a hang.
 #
 # Usage:
 #   bash examples/certify-demo/demo.sh             # builds the repo under a temp dir

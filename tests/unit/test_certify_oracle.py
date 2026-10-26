@@ -419,7 +419,7 @@ def test_default_dispatch_runs_the_lane_in_a_throwaway_dir(tmp_path, monkeypatch
     monkeypatch.delenv("MO_TARGET_CWD", raising=False)
     seen = {}
 
-    def fake(model, prompt, out_file):
+    def fake(model, prompt, out_file, **kw):  # kw: the per-call bounds certify passes
         cwd = os.environ["MO_TARGET_CWD"]
         seen["cwd"] = cwd
         open(os.path.join(cwd, "stray.py"), "w").write("x = 1\n")  # a lane scribbling

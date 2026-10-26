@@ -172,6 +172,24 @@ Two common extension selectors are:
 `escalates_to` rollback edges fire. Set it to `0` to restore the pre-revise
 behaviour (a failed node blocks its descendants and rollback runs).
 
+### Certify lane calls
+
+`mini-ork certify` calls its model lane several times per verdict (reproduction,
+invariants, relations, differential). Each call is bounded on its own, so a stalled
+gateway costs minutes rather than the dispatcher's 25-minute default, and a call
+that still fails makes the oracle abstain (UNVERIFIED) instead of hanging.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MO_CERTIFY_MODEL` | `minimax` | The lane that writes probes and invariants (a code lane). |
+| `MO_CERTIFY_LANE_TIMEOUT_S` | `180` | Wall-clock cap per lane call. |
+| `MO_CERTIFY_LANE_MAX_TURNS` | `8` | Agentic turn cap per lane call. |
+| `MO_CERTIFY_LANE_RETRIES` | `1` | Retries after a failed or timed-out call (`0` disables). |
+| `MO_CERTIFY_PROGRESS` | unset | `1` prints one line per lane call to stderr even when it is not a terminal. |
+
+A present-but-malformed value fails closed: no call is made and the verdict is
+UNVERIFIED, with the reason on stderr when a terminal is attached.
+
 The verification stack — six instruments from the 2026-10-05/06 review
 (metamorphic relations, the differential check, mutation suite adequacy, the
 level vector, the gate-hackability audit, and the declared equivalence operator)
