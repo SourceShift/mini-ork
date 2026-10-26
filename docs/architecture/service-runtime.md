@@ -98,6 +98,7 @@ Every route except `/v1/health` requires the node bearer token.
 | `DELETE` | `/v1/services/{sid}` | `{"deleted": sid}` |
 | `POST` | `/v1/services/{sid}/restart` | status after `docker restart` |
 | `GET` | `/v1/services/{sid}/logs?tail=N` | merged logs, `N` clamped to 1..5000 |
+| `GET` | `/v1/services/{sid}/stats` | one resource sample per **running** replica (CPU, memory, cumulative I/O, pids) |
 | `POST` | `/v1/services/{sid}/exec` | run one command in replica 0; `{argv, stdin, timeout}` in, rc + bounded output out |
 
 `POST /v1/services` is an upsert by default (`replace: true`). A redeploy of
@@ -392,6 +393,68 @@ credential works before recording the rotation. The node runs what it is told
 inside a replica the caller already owns — no shell on the host, no image pull,
 no new container.
 
+## Stats — one sample, as Docker measures it
+
+A dashboard needs numbers. The node exposes one `docker stats --no-stream`
+reading per **running** replica and interprets nothing beyond that:
+
+```http
+GET /v1/services/{sid}/stats
+→ {
+    "service_id": "web",
+    "replicas_total": 2,
+    "sampled_at": "2026-10-26T18:00:00.000000Z",
+    "replicas": [
+      {"replica": 0, "name": "mo-svc-web-0", "cpu_pct": 0.15, "mem_pct": 0.004,
+       "mem_used_bytes": 67633152, "mem_limit_bytes": 8217346…,
+       "net_rx_bytes": 1200, "net_tx_bytes": 3400000,
+       "block_read_bytes": 1200000, "block_write_bytes": 3400000, "pids": 3}
+    ]
+  }
+```
+
+```mermaid
+sequenceDiagram
+  participant CP as control plane
+  participant NA as node agent
+  participant D as Docker
+
+  CP->>NA: GET /v1/services/web/stats
+  NA->>D: docker stats --no-stream --format '{{json .}}' <name 0> <name 1>
+  D-->>NA: one JSON line per running container
+  NA->>NA: parse units, split pairs, keep cumulative counters
+  NA-->>CP: {replicas, replicas_total, sampled_at}
+```
+
+Why the shape is what it is:
+
+- **I/O counters stay cumulative.** Docker reports them since container start.
+  A rate needs two samples and an interval; the node cannot know the caller's
+  polling period, so inventing a rate here would make the answer depend on when
+  it happened to be asked. The control plane stores the counters and derives
+  deltas from consecutive samples.
+- **Units are parsed with their base.** Docker prints I/O in decimal
+  (`kB` = 1000 B) and memory in binary (`MiB` = 1024 B). A parser that assumes
+  one for both is off by 2.4% at KiB and 7.4% at GiB — plausible-looking and
+  wrong. The unit is part of the wire format and is mapped explicitly.
+- **An unread field is `null`, never `0`.** "Docker did not print this" and
+  "this is zero" are different facts; once both are `0` no graph can tell them
+  apart. Percentages and sizes that do not match the expected shape degrade to
+  `null` rather than a fabricated number.
+- **A stopped replica is absent, not zero.** `docker stats` only measures
+  running containers. Reporting zeros would draw a flat line that reads as
+  "idle" instead of "not running". `replicas_total` says how many were asked
+  for, so the gap is visible.
+- **A partial sample is a sample.** Docker exits non-zero when *any* named
+  container is not running, but still prints the lines it could measure. The
+  node returns those; it raises `500` only when the command failed **and**
+  nothing was parseable (daemon down, for example).
+- **Unknown service is `404`.** Same rule as every other route here.
+
+The node keeps no history, sets no retention, and decides no sampling interval:
+it answers "what is true right now" for one service. Storing, scoping,
+aggregating and expiring those answers is the proprietary layer.
+
 ## What is deliberately absent
 
 These are the proprietary layer's job, and every one of them is policy:
@@ -493,3 +556,11 @@ secret reached the runner on stdin and never appeared in argv, that neither
 argv nor stdin landed in `services.json`, that every malformed shape is a `400`
 with zero processes spawned, that a stopped replica is refused, that a
 non-zero exit is `200` with the code, and that a timeout is `504`.
+
+For `stats` it asserts the composed argv (`--no-stream` plus every replica
+name), the field mapping from Docker's humanized strings (decimal I/O,
+binary memory), that counters are passed through cumulative across two
+samples, that a stopped replica is omitted while `replicas_total` still
+reports it, that an unreadable field becomes `null` rather than `0`, that a
+non-zero exit keeps the lines it got, that a failure with no parseable line is
+a `500`, and that an unknown service is `404`.

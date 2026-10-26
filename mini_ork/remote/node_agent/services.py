@@ -19,6 +19,8 @@ Contract (all routes are bearer-authed by the node-agent):
     DELETE /v1/services/{sid}        stop and remove every replica
     POST   /v1/services/{sid}/restart
     GET    /v1/services/{sid}/logs?tail=N
+    GET    /v1/services/{sid}/stats    one resource sample per running replica
+    POST   /v1/services/{sid}/exec     run one argv inside replica 0
     POST   /v1/services/{sid}/volumes/{name}/snapshots
     GET    /v1/services/{sid}/volumes/{name}/snapshots
     DELETE /v1/services/{sid}/volumes/{name}/snapshots/{snap}
@@ -207,6 +209,92 @@ def _port_mapping(port: Mapping[str, Any]) -> str:
     if protocol != "tcp":
         target = f"{target}/{protocol}"
     return target
+
+
+#: Docker humanizes the numbers ``docker stats`` reports in two different base
+#: systems: the I/O counters use decimal units (``kB`` = 1000 B) while memory
+#: uses binary ones (``MiB`` = 1024 B). A parser that assumes one for both is
+#: off by 2.4% at KiB and 7.4% at GiB — a graph that looks plausible and is
+#: wrong. The units are part of the wire format, so they are mapped explicitly
+#: rather than inferred from context.
+_SIZE_UNITS = {
+    "b": 1,
+    "k": 1000, "m": 1000**2, "g": 1000**3, "t": 1000**4, "p": 1000**5,
+    "kb": 1000, "mb": 1000**2, "gb": 1000**3, "tb": 1000**4, "pb": 1000**5,
+    "kib": 1024, "mib": 1024**2, "gib": 1024**3, "tib": 1024**4, "pib": 1024**5,
+}
+_SIZE_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([a-zA-Z]*)\s*$")
+
+
+def _parse_size(raw: object) -> int | None:
+    """``"12.3MiB"`` -> bytes. A shape Docker does not print yields ``None``.
+
+    ``None`` rather than ``0``: "unread" and "genuinely zero" are different
+    facts, and once both are zero nothing downstream can tell them apart.
+    """
+    if not isinstance(raw, str):
+        return None
+    match = _SIZE_RE.match(raw)
+    if match is None:
+        return None
+    factor = _SIZE_UNITS.get((match.group(2) or "b").lower())
+    if factor is None:
+        return None
+    return int(round(float(match.group(1)) * factor))
+
+
+def _parse_pct(raw: object) -> float | None:
+    """``"0.15%"`` -> ``0.15``. Anything else is unread, not zero."""
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if not text.endswith("%"):
+        return None
+    try:
+        return round(float(text[:-1]), 4)
+    except ValueError:
+        return None
+
+
+def _split_size_pair(raw: object) -> tuple[int | None, int | None]:
+    """``"1.2kB / 3.4MB"`` -> ``(1200, 3400000)``; a missing half is ``None``."""
+    if not isinstance(raw, str) or "/" not in raw:
+        return (None, None)
+    left, _, right = raw.partition("/")
+    return (_parse_size(left), _parse_size(right))
+
+
+def _parse_stats_line(line: str) -> dict[str, Any] | None:
+    """One ``docker stats --format '{{json .}}'`` line -> a flat sample.
+
+    The wire fields keep Docker's names and pairs; this is the one place the
+    two-half strings are split, so the caller never parses presentation text.
+    """
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(row, dict):
+        return None
+    name = row.get("Name")
+    if not isinstance(name, str) or not name:
+        return None
+    mem_used, mem_limit = _split_size_pair(row.get("MemUsage"))
+    net_rx, net_tx = _split_size_pair(row.get("NetIO"))
+    block_read, block_write = _split_size_pair(row.get("BlockIO"))
+    pids = row.get("PIDs")
+    return {
+        "name": name,
+        "cpu_pct": _parse_pct(row.get("CPUPerc")),
+        "mem_pct": _parse_pct(row.get("MemPerc")),
+        "mem_used_bytes": mem_used,
+        "mem_limit_bytes": mem_limit,
+        "net_rx_bytes": net_rx,
+        "net_tx_bytes": net_tx,
+        "block_read_bytes": block_read,
+        "block_write_bytes": block_write,
+        "pids": int(pids) if isinstance(pids, str) and pids.isdigit() else None,
+    }
 
 
 def _run_input(
@@ -1265,6 +1353,52 @@ class ServiceManager:
             chunks.append(f"--- replica {replica} ---\n{text}")
         return "\n".join(chunks)
 
+    def stats(self, service_id: str) -> dict[str, Any] | None:
+        """One ``docker stats --no-stream`` sample for every running replica.
+
+        The I/O counters are reported as Docker keeps them — cumulative since
+        the container started — because a rate needs two samples and the node
+        cannot know the caller's interval. The control plane stores the
+        counters and derives a rate; inventing one here would make the answer
+        depend on when the node happened to be asked.
+
+        A stopped replica contributes no entry: ``docker stats`` only measures
+        running containers, and reporting zeros would draw a flat line that
+        reads as "idle" instead of "not running". ``replicas_total`` says how
+        many were asked for, so a missing replica is visible rather than
+        inferred.
+
+        A command that fails *and* produced no parseable line raises; one that
+        produced some (docker exits non-zero when any named container is not
+        running) returns the sample it did get.
+        """
+        spec = self._specs.get(service_id)
+        if spec is None:
+            return None
+        names = [self._name(spec, index) for index in range(spec.replicas)]
+        result = self._run(
+            ["docker", "stats", "--no-stream", "--format", "{{json .}}", *names]
+        )
+        by_name: dict[str, dict[str, Any]] = {}
+        for line in (getattr(result, "stdout", "") or "").splitlines():
+            parsed = _parse_stats_line(line.strip())
+            if parsed is not None:
+                by_name[parsed["name"]] = parsed
+        if not by_name and int(getattr(result, "returncode", 0)) != 0:
+            detail = (getattr(result, "stderr", "") or "").strip()[-500:] or "no output"
+            raise RuntimeError(f"docker stats failed: {detail}")
+        replicas = [
+            {"replica": index, **by_name[name]}
+            for index, name in enumerate(names)
+            if name in by_name
+        ]
+        return {
+            "service_id": service_id,
+            "replicas": replicas,
+            "replicas_total": spec.replicas,
+            "sampled_at": _utc_now(),
+        }
+
     #: Bounds on a control-plane exec. The node runs an argv it did not write,
     #: so the shape is capped before anything reaches Docker: a caller cannot
     #: stream an unbounded body through the agent or keep a child alive for
@@ -1505,6 +1639,16 @@ def make_router(
             return {"service_id": sid, "logs": services.logs(sid, tail=tail)}
         except KeyError as exc:
             raise HTTPException(404, f"unknown service {sid!r}") from exc
+
+    @router.get("/v1/services/{sid}/stats")
+    def get_service_stats(sid: str, _: None = Depends(bearer)) -> dict:
+        try:
+            sample = services.stats(sid)
+        except RuntimeError as exc:
+            raise HTTPException(500, str(exc)) from exc
+        if sample is None:
+            raise HTTPException(404, f"unknown service {sid!r}")
+        return sample
 
     @router.post("/v1/services/{sid}/exec")
     def post_service_exec(sid: str, payload: dict | None = None,

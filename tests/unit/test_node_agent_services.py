@@ -55,6 +55,12 @@ class _Docker:
         self.exec_stdout = ""
         self.exec_stderr = ""
         self.exec_timeout = False
+        #: ``docker stats --format '{{json .}}'`` rows keyed by container name.
+        #: A name that is absent prints nothing, which is how Docker reports a
+        #: container that is not running.
+        self.stats: dict[str, dict] = {}
+        self.stats_returncode = 0
+        self.stats_stderr = ""
 
     def run_input(self, argv, **kwargs):
         argv = [str(a) for a in argv]
@@ -121,6 +127,14 @@ class _Docker:
 
         if argv[:2] == ["docker", "logs"]:
             r.stdout = "listening on :8080\n"
+            return r
+
+        if argv[:2] == ["docker", "stats"]:
+            names = argv[argv.index("{{json .}}") + 1:]
+            lines = [json.dumps(self.stats[n]) for n in names if n in self.stats]
+            r.stdout = "".join(f"{line}\n" for line in lines)
+            r.returncode = self.stats_returncode
+            r.stderr = self.stats_stderr
             return r
 
         if argv[:2] == ["docker", "rm"]:
@@ -415,6 +429,152 @@ def test_delete_removes_containers_and_state(client, docker, tmp_path):
 
 def test_delete_unknown_is_404(client):
     assert client.delete("/v1/services/web", headers=AUTH).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# stats — one resource sample per running replica
+#
+# Docker prints humanized strings in two bases (``kB`` decimal for I/O,
+# ``MiB`` binary for memory) and keeps I/O cumulative. The node's job is to
+# report exactly that, unmodified, so the control plane can derive rates from
+# consecutive samples; the tests pin the parse and the omitted-replica rule.
+# ---------------------------------------------------------------------------
+
+
+def _docker_stats_row(name: str, **overrides) -> dict:
+    row = {
+        "BlockIO": "1.2MB / 3.4MB",
+        "CPUPerc": "0.15%",
+        "Container": "abc123",
+        "ID": "abc123",
+        "MemPerc": "0.004%",
+        "MemUsage": "64.5MiB / 7.653GiB",
+        "Name": name,
+        "NetIO": "1.2kB / 3.4MB",
+        "PIDs": "3",
+    }
+    row.update(overrides)
+    return row
+
+
+def test_stats_reports_one_sample_per_running_replica(client, docker):
+    client.post("/v1/services", json=_spec(), headers=AUTH)
+    docker.stats = {
+        "mo-svc-web-0": _docker_stats_row("mo-svc-web-0"),
+        "mo-svc-web-1": _docker_stats_row("mo-svc-web-1", CPUPerc="2.5%"),
+    }
+
+    r = client.get("/v1/services/web/stats", headers=AUTH)
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    assert body["service_id"] == "web"
+    assert body["replicas_total"] == 2
+    assert body["sampled_at"].endswith("Z")
+    assert [rep["replica"] for rep in body["replicas"]] == [0, 1]
+    first = body["replicas"][0]
+    assert first["name"] == "mo-svc-web-0"
+    assert first["cpu_pct"] == 0.15
+    assert first["mem_pct"] == 0.004
+    assert first["mem_used_bytes"] == round(64.5 * 1024**2)
+    assert first["mem_limit_bytes"] == round(7.653 * 1024**3)
+    # Decimal for the I/O pairs — 1.2kB is 1200 bytes, not 1229.
+    assert first["net_rx_bytes"] == 1200
+    assert first["net_tx_bytes"] == 3_400_000
+    assert first["block_read_bytes"] == 1_200_000
+    assert first["block_write_bytes"] == 3_400_000
+    assert first["pids"] == 3
+    assert body["replicas"][1]["cpu_pct"] == 2.5
+
+    argv = next(c for c in docker.calls if c[:2] == ["docker", "stats"])
+    assert argv[2] == "--no-stream"
+    assert argv[-2:] == ["mo-svc-web-0", "mo-svc-web-1"]
+
+
+def test_stats_omits_a_stopped_replica_but_says_how_many_were_asked_for(client, docker):
+    client.post("/v1/services", json=_spec(), headers=AUTH)
+    docker.stats = {"mo-svc-web-1": _docker_stats_row("mo-svc-web-1")}
+
+    r = client.get("/v1/services/web/stats", headers=AUTH)
+    body = r.json()
+
+    assert [rep["replica"] for rep in body["replicas"]] == [1]
+    assert body["replicas_total"] == 2
+
+
+def test_stats_are_cumulative_as_docker_reports_them(client, docker):
+    """Two samples of the same container keep counting up; the node adds nothing."""
+    client.post("/v1/services", json=_spec(), headers=AUTH)
+    docker.stats = {"mo-svc-web-0": _docker_stats_row("mo-svc-web-0", NetIO="5MB / 1MB")}
+    first = client.get("/v1/services/web/stats", headers=AUTH).json()["replicas"][0]
+    docker.stats = {"mo-svc-web-0": _docker_stats_row("mo-svc-web-0", NetIO="9MB / 1MB")}
+    second = client.get("/v1/services/web/stats", headers=AUTH).json()["replicas"][0]
+
+    assert (first["net_rx_bytes"], second["net_rx_bytes"]) == (5_000_000, 9_000_000)
+
+
+def test_stats_parse_docker_units():
+    from mini_ork.remote.node_agent.services import _parse_size, _split_size_pair
+
+    assert _parse_size("0B") == 0
+    assert _parse_size("512") == 512  # unitless is bytes
+    assert _parse_size("1.5kB") == 1500
+    assert _parse_size("2MiB") == 2 * 1024**2
+    assert _parse_size("1GiB") == 1024**3
+    assert _parse_size("3 TB") == 3 * 1000**4  # Docker never prints this, but a space is not a lie
+    assert _parse_size("lots") is None
+    assert _parse_size("12QB") is None
+    assert _parse_size(None) is None
+    assert _parse_size(12) is None
+    assert _split_size_pair("1.2kB / 3.4MB") == (1200, 3_400_000)
+    assert _split_size_pair("1kB") == (None, None)
+    assert _split_size_pair(None) == (None, None)
+
+
+def test_stats_degrade_unreadable_fields_to_none_not_zero(client, docker):
+    client.post("/v1/services", json=_spec(), headers=AUTH)
+    docker.stats = {
+        "mo-svc-web-0": _docker_stats_row(
+            "mo-svc-web-0", CPUPerc="--", MemPerc="", MemUsage="?", PIDs="3 (approx)"
+        )
+    }
+    sample = client.get("/v1/services/web/stats", headers=AUTH).json()["replicas"][0]
+
+    assert sample["cpu_pct"] is None
+    assert sample["mem_pct"] is None
+    assert sample["mem_used_bytes"] is None
+    assert sample["mem_limit_bytes"] is None
+    assert sample["pids"] is None
+
+
+def test_stats_keeps_the_lines_it_got_when_docker_exits_nonzero(client, docker):
+    """Docker exits non-zero when *any* named container is not running."""
+    client.post("/v1/services", json=_spec(), headers=AUTH)
+    docker.stats = {"mo-svc-web-0": _docker_stats_row("mo-svc-web-0")}
+    docker.stats_returncode = 1
+    docker.stats_stderr = "Error: No such container: mo-svc-web-1"
+
+    r = client.get("/v1/services/web/stats", headers=AUTH)
+    assert r.status_code == 200
+    assert [rep["replica"] for rep in r.json()["replicas"]] == [0]
+
+
+def test_stats_failure_with_no_sample_is_500(client, docker):
+    client.post("/v1/services", json=_spec(), headers=AUTH)
+    docker.stats_returncode = 1
+    docker.stats_stderr = "Cannot connect to the Docker daemon"
+
+    r = client.get("/v1/services/web/stats", headers=AUTH)
+    assert r.status_code == 500
+    assert "Cannot connect to the Docker daemon" in r.json()["detail"]
+
+
+def test_stats_unknown_is_404(client):
+    assert client.get("/v1/services/web/stats", headers=AUTH).status_code == 404
+
+
+def test_stats_requires_bearer(client):
+    assert client.get("/v1/services/web/stats").status_code == 401
 
 
 # ---------------------------------------------------------------------------
