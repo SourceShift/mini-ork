@@ -1074,6 +1074,141 @@ def test_the_post_db_falls_back_when_a_migration_fails(tmp_path):
     assert cycle_mod._gap_at(req, _r8_candidate(), post, post=True) is True
 
 
+def test_an_errored_rule_is_not_read_as_a_fix(tmp_path):
+    """A rule that cannot answer is unmeasurable, not closed.
+
+    ``run_rule`` deliberately raises for a rule that cannot read its evidence,
+    because silence must never be read as "fixed". ``_gap_at`` then flattened
+    ``error`` to ``status == "findings" == False`` — the same value as a closed
+    rule — so a patch that dropped the column the rule measures, or dropped the
+    table it reads, walked through G8 green. The verdict is now three-valued and
+    an error is ``None``.
+    """
+    db = tmp_path / "state.db"
+    _seed_llm_calls_with_a_chain(db)
+    req = CycleRequest(root=tmp_path, db=db, config=_cfg(), cycle_id="rsi-ctest")
+    assert cycle_mod._freeze_db(req) is not None
+
+    post = _post_tree(tmp_path / "post", "DROP TABLE llm_calls;")
+    assert cycle_mod._gap_at(req, _r8_candidate(), post, post=True) is None, (
+        "the rule cannot answer on this tree, so the gate has no measurement")
+
+    # …and the gate reads None as a failure, never as "the gap is gone".
+    from mini_ork.rsi.gates import evaluate
+
+    report = evaluate(GateEvidence(gap_before=True, gap_after=None,
+                                   metric_command="db:R8"))
+    g8 = next(r for r in report.results if r.gate == "G8")
+    assert not g8.ok and g8.code == "metric_unchanged"
+    assert "not measured" in g8.detail
+
+
+def _seed_l3_gap(db: Path) -> None:
+    """L3's shape: injections exist, none held out."""
+    con = sqlite3.connect(str(db))
+    try:
+        con.executescript(
+            "CREATE TABLE lesson_injections (id INTEGER PRIMARY KEY, lesson_id INTEGER,"
+            " held_out INTEGER DEFAULT 0);"
+            "INSERT INTO lesson_injections VALUES (1, 10, 0), (2, 11, 0);")
+        con.commit()
+    finally:
+        con.close()
+
+
+def _l3_candidate() -> Candidate:
+    return Candidate(
+        candidate_id="rsi-l3test", domain="learning", source="db:L3",
+        kind="data_path_dead", title="every lesson injection is in-sample",
+        detail="", severity=87,
+        files=("mini_ork/learning/ledger.py",),
+        evidence={"table": "lesson_injections", "rows": 2, "held_out": 0},
+        fix_hint="", success_metric="lesson injections include a held-out slice",
+        success_command="db:L3",
+        evidence_key="table:lesson_injections:held_out:never-1",
+        signature="sig-l3", first_seen_at=NOW)
+
+
+def _producer_tree(root: Path, *, writes_held_out: bool) -> Path:
+    """A tree whose scoped test either does or does not hold a lesson out."""
+    (root / "db" / "migrations").mkdir(parents=True, exist_ok=True)
+    (root / "db" / "migrations" / "0099_noop.sql").write_text(
+        "CREATE TABLE IF NOT EXISTS noop_1499 (id INTEGER);", encoding="utf-8")
+    (root / "tests" / "unit").mkdir(parents=True, exist_ok=True)
+    if writes_held_out:
+        (root / "tests" / "unit" / "test_x.py").write_text(
+            "import os, sqlite3\n\n\n"
+            "def test_the_injector_holds_one_out():\n"
+            "    con = sqlite3.connect(os.environ['MINI_ORK_DB'])\n"
+            "    try:\n"
+            "        con.execute('INSERT INTO lesson_injections VALUES (3, 12, 1)')\n"
+            "        con.commit()\n"
+            "    finally:\n"
+            "        con.close()\n",
+            encoding="utf-8")
+    return root
+
+
+def test_g8_credits_a_row_only_the_producer_can_write(tmp_path):
+    """A held-out injection cannot be backfilled from history — the run writes it.
+
+    Copying the baseline and applying the patch's migrations leaves the row
+    absent for ever, so a correct wiring of the injector read ``metric_unchanged``.
+    G8 now exercises the candidate's own scoped tests against the copy and asks
+    the rule again: the base tree's tests write nothing (the gap holds), the
+    patched tree's tests drive the producer (the gap closes).
+    """
+    db = tmp_path / "state.db"
+    _seed_l3_gap(db)
+    req = CycleRequest(root=tmp_path, db=db, config=_cfg(), cycle_id="rsi-ctest")
+    assert cycle_mod._freeze_db(req) is not None
+    cand = _l3_candidate()
+
+    base = _producer_tree(tmp_path / "base", writes_held_out=False)
+    head = _producer_tree(tmp_path / "head", writes_held_out=True)
+
+    # Without the exercise both sides are red — history never moves.
+    assert cycle_mod._gap_at(req, cand, base) is True
+    assert cycle_mod._gap_at(req, cand, head, post=True) is True
+
+    assert cycle_mod._exercise_gap(req, cand, base=base, head=head,
+                                   before=True, after=True) == (True, False)
+
+
+def test_the_producer_arm_needs_the_base_side_to_stay_red(tmp_path):
+    """If the base tree's own tests already write the row, there was no gap.
+
+    Crediting only the patched side would let a candidate that never reproduced
+    merge on a measurement the base could have produced itself.
+    """
+    db = tmp_path / "state.db"
+    _seed_l3_gap(db)
+    req = CycleRequest(root=tmp_path, db=db, config=_cfg(), cycle_id="rsi-ctest")
+    assert cycle_mod._freeze_db(req) is not None
+    cand = _l3_candidate()
+
+    base = _producer_tree(tmp_path / "base", writes_held_out=True)
+    head = _producer_tree(tmp_path / "head", writes_held_out=True)
+
+    assert cycle_mod._exercise_gap(req, cand, base=base, head=head,
+                                   before=True, after=True) == (True, True)
+
+
+def test_the_producer_arm_is_inert_without_scoped_tests(tmp_path):
+    """No test to run means no runtime verdict — never an invented one."""
+    db = tmp_path / "state.db"
+    _seed_l3_gap(db)
+    req = CycleRequest(root=tmp_path, db=db, config=_cfg(), cycle_id="rsi-ctest")
+    assert cycle_mod._freeze_db(req) is not None
+
+    base = _producer_tree(tmp_path / "base", writes_held_out=False)
+    head = _producer_tree(tmp_path / "head", writes_held_out=True)
+    (head / "tests" / "unit" / "test_x.py").rename(head / "tests" / "unit" / "other.py")
+
+    assert cycle_mod._exercise_gap(req, _l3_candidate(), base=base, head=head,
+                                   before=True, after=True) == (True, True)
+
+
 # --------------------------------------------------------------------------
 # VALIDATE measures the tree the patch landed, not the child's revert
 # --------------------------------------------------------------------------

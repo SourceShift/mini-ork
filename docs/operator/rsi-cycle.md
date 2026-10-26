@@ -68,7 +68,7 @@ what `rsi-cycle show` prints and what the quarantine record keeps.
 | G5 | `lint` | ruff `F,E9` fails on a changed `.py` |
 | G6 | `pytest_scoped` | the scoped set, or any test importing a changed module, fails |
 | G7 | `static_differential` | `validate --strict`/`garden` findings grew (`post ⊄ pre`) |
-| G8 | `success_metric` | the candidate's own success predicate did not flip |
+| G8 | `success_metric` | the candidate's own success predicate did not flip, or the rule could not answer at all |
 | G9 | `no_new_probe_failures` | probe failures grew versus before the change |
 | G10 | `critic_unanimous` | fewer than 2 exogenous critics, or they split |
 | G11 | `budget` | 24h spend or this cycle's cost exceeds its cap |
@@ -78,6 +78,18 @@ already red on a healthy checkout; a strict "rc == 0" gate would mean this
 feature merges nothing, ever. They compare *finding signatures* before and
 after, so a real fix is proven by a **removed** finding and an unrelated red
 does not block anything.
+
+**G8 measures two ways, and neither credits silence.** It re-runs the
+candidate's own success predicate on both trees. A schema or data repair shows
+up directly (the post copy has the patch's migrations applied). A gap that
+only a *producer* closes — a held-out injection, a promotion outcome, a
+benchmark delta — cannot be repaired in history, so when both sides are still
+red the gate runs the candidate's scoped tests against the copy and asks the
+predicate again; it credits the change only if the base tree stays red while
+the patched tree closes, i.e. only the new code wrote the row. And a predicate
+that cannot answer at all (an absent table, an empty input, a dropped column)
+is recorded as *unmeasured*, not as fixed — reading an error as "no finding"
+was a way to walk a broken schema through this gate.
 
 ## Config
 

@@ -1448,11 +1448,36 @@ def _measured_db(req: CycleRequest) -> Path:
     return frozen if frozen.is_file() else Path(req.db)
 
 
+def _copy_db(src: Path, target: Path) -> None:
+    """Copy a SQLite DB without reading the original writable (WAL-safe)."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.unlink(missing_ok=True)
+    source = sqlite3.connect(f"{src.resolve().as_uri()}?mode=ro", uri=True, timeout=10)
+    try:
+        dest = sqlite3.connect(str(target))
+        try:
+            source.backup(dest)
+        finally:
+            dest.close()
+    finally:
+        source.close()
+
+
 def _gap(req: CycleRequest, cand: Candidate, wt: Path) -> tuple[bool | None, bool | None]:
     """G8's before/after: is this candidate's gap still measurable?
 
     A ``db:<RULE>`` success command re-runs the rule; anything else compares the
     candidate's own finding signature against the probe findings at each tree.
+
+    A rule that is still red on both sides is not necessarily a broken fix: some
+    gaps close only on rows a *producer* writes when it runs (a held-out
+    injection, a promotion outcome, a benchmark delta). Copying history plus the
+    patch's migrations can never produce those rows, so those candidates read
+    ``metric_unchanged`` for ever — cycle 13 spent $1.55 proving exactly that —
+    and the honest way to measure them is to run the code that is supposed to
+    write the row. ``_exercise_gap`` does that, and may only turn a red-red pair
+    into a green one: a measurement that moves for any other reason is not this
+    gate's to credit.
     """
     base = _detached_base(req, wt)
     if base is None:
@@ -1460,9 +1485,77 @@ def _gap(req: CycleRequest, cand: Candidate, wt: Path) -> tuple[bool | None, boo
     try:
         before = _gap_at(req, cand, base)
         after = _gap_at(req, cand, wt, post=True)
+        if before is True and after is True:
+            before, after = _exercise_gap(req, cand, base=base, head=wt,
+                                          before=before, after=after)
     finally:
         _remove_detached(req, base)
     return before, after
+
+
+def _exercise_gap(req: CycleRequest, cand: Candidate, *, base: Path, head: Path,
+                  before: bool | None, after: bool | None
+                  ) -> tuple[bool | None, bool | None]:
+    """Re-ask a stuck ``db:<RULE>`` after running the code that should write the row.
+
+    The exercise is the candidate's own scoped tests, run against a *copy* of the
+    measured DB with the tree's migrations applied — the same set G6 already
+    requires to pass, so a cycle buys no extra model spend to measure itself.
+    Then the rule is asked again on that DB:
+
+    * base code exercised → the rule must still fire, or the metric never
+      distinguished the two trees and the run is discarded;
+    * patched code exercised → the rule must close, because the producer wrote
+      the row the gap is about.
+
+    Both sides are required. A patched side alone would credit a base tree that
+    was already writing the row — i.e. a candidate that was never a gap.
+
+    Fail-closed: no scoped tests, an unreadable copy, a tree that cannot be the
+    rule's root, or an error at either side leaves the copy's verdict untouched.
+    """
+    from .probes import SYNTHETIC_PREFIX
+
+    command = cand.success_command or ""
+    if not command.startswith(SYNTHETIC_PREFIX):
+        return before, after
+    try:
+        ran_base = _exercise_once(req, cand, base, side="base")
+        ran_head = _exercise_once(req, cand, head, side="post")
+    except (OSError, sqlite3.Error):
+        return before, after
+    if ran_base is True and ran_head is False:
+        return True, False
+    return before, after
+
+
+def _exercise_once(req: CycleRequest, cand: Candidate, root: Path, *,
+                   side: str) -> bool | None:
+    """Exercise one tree's scoped tests against a DB copy, then re-ask the rule."""
+    from .probes import SYNTHETIC_PREFIX, run_synthetic
+
+    rule = (cand.success_command or "")[len(SYNTHETIC_PREFIX):]
+    tests = list(req.config.scoped_tests)
+    tests.extend(_importing_tests(root, cand.files, existing=tests))
+    if not tests:
+        return None
+    src = _post_db(req, root) if side == "post" else _measured_db(req)
+    workdir = req.home / "rsi" / req.cycle_id
+    db = workdir / f"exercise-{side}.db"
+    _copy_db(src, db)
+    home = workdir / f"exercise-{side}-home"
+    home.mkdir(parents=True, exist_ok=True)
+    env = {**os.environ, "MINI_ORK_DB": str(db), "MINI_ORK_ROOT": str(root),
+           "MINI_ORK_HOME": str(home)}
+    # A red test run is not a verdict here: the rule is asked afterwards, and a
+    # patch that writes the row but breaks an unrelated assertion fails G6.
+    _run([sys.executable, "-m", "pytest", "-q", "-p", "no:asyncio", *tests],
+         cwd=root, timeout_s=req.config.gates.cmd_timeout_s, env=env)
+    try:
+        result = run_synthetic(rule, root=root, db=db, now=int(time.time()))
+    except Exception:  # noqa: BLE001 - "cannot measure" is None
+        return None
+    return _synthetic_verdict(result)
 
 
 def _post_db(req: CycleRequest, root: Path) -> Path:
@@ -1476,24 +1569,15 @@ def _post_db(req: CycleRequest, root: Path) -> Path:
     migrates a **copy** instead.
 
     History still does not change: a data-ratio gap (``confidence IS NULL`` over
-    existing rows) cannot be flipped here, and ``metric_unchanged`` is then the
-    honest answer — that candidate needs a producer-side success metric, not a
-    looser gate.
+    existing rows) cannot be flipped here. Such a candidate is not written off,
+    though — ``_exercise_gap`` re-asks its rule after running the code that is
+    supposed to write the row, so a producer becomes measurable without
+    loosening the gate.
     """
     src = _measured_db(req)
     target = req.home / "rsi" / req.cycle_id / "gap-post.db"
     try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.unlink(missing_ok=True)
-        source = sqlite3.connect(f"{src.resolve().as_uri()}?mode=ro", uri=True, timeout=10)
-        try:
-            dest = sqlite3.connect(str(target))
-            try:
-                source.backup(dest)
-            finally:
-                dest.close()
-        finally:
-            source.close()
+        _copy_db(src, target)
         from mini_ork.stores import migrate
 
         rc, _out = migrate.migrate_apply(str(Path(root) / "db" / "migrations"),
@@ -1503,6 +1587,24 @@ def _post_db(req: CycleRequest, root: Path) -> Path:
     except (OSError, sqlite3.Error):
         return src
     return target
+
+
+def _synthetic_verdict(result) -> bool | None:
+    """``True`` = the gap still fires, ``False`` = the rule closed, ``None`` = no answer.
+
+    Reading ``error`` as "not findings" used to make G8 green: ``run_rule``
+    raises for a rule that cannot read its evidence (an absent table, an empty
+    input the rule needs, no call sites), the probe reports that as ``error``,
+    and ``status == "findings"`` was ``False`` — so a patch that dropped the
+    column a rule measures, or emptied the table it reads, turned the gate green
+    by making the rule unable to answer. An error is unmeasurable; the gate
+    fails closed on ``None``.
+    """
+    if result.status == "findings":
+        return True
+    if result.status == "ok":
+        return False
+    return None
 
 
 def _gap_at(req: CycleRequest, cand: Candidate, root: Path, *,
@@ -1517,7 +1619,7 @@ def _gap_at(req: CycleRequest, cand: Candidate, root: Path, *,
             result = run_synthetic(rule, root=root, db=db, now=int(time.time()))
         except Exception:  # noqa: BLE001 - "cannot measure" is None, not True
             return None
-        return result.status == "findings"
+        return _synthetic_verdict(result)
     # A real probe id: the gap is the finding whose signature produced this
     # candidate. It is present when the probe still reports that signature.
     from . import probes as probe_mod
