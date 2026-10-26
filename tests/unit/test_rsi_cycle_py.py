@@ -110,12 +110,18 @@ def _cand(**overrides) -> Candidate:
     return Candidate.build(**kwargs)
 
 
-def _report(cand: Candidate | None = None, *, ok: bool = True,
+def _report(cand: Candidate | tuple[Candidate, ...] | None = None, *, ok: bool = True,
             skipped: tuple[str, ...] = (),
             closed: tuple[str, ...] = (),
             probes: tuple[ProbeResult, ...] = ()) -> HarvestReport:
+    if cand is None:
+        found: tuple[Candidate, ...] = ()
+    elif isinstance(cand, Candidate):
+        found = (cand,)
+    else:
+        found = tuple(cand)
     return HarvestReport(
-        candidates=() if cand is None else (cand,),
+        candidates=found,
         probes=probes,
         harvest_ok=ok,
         skipped=skipped,
@@ -148,10 +154,19 @@ def _evidence(**overrides) -> GateEvidence:
 class Harness:
     """A runtime where every call is recorded, so 'did not run' is assertable."""
 
-    def __init__(self, world, cand: Candidate | None = None):
+    def __init__(self, world, cand: Candidate | tuple[Candidate, ...] | None = None):
         self.world = world
-        self.cand = cand if cand is not None else _cand()
+        if cand is None:
+            cands: tuple[Candidate, ...] = (_cand(),)
+        elif isinstance(cand, Candidate):
+            cands = (cand,)
+        else:
+            cands = tuple(cand)
+        self.cands = cands
+        self.cand = cands[0]
         self.calls: list[str] = []
+        #: Which candidates SUGGEST was actually asked about, in order.
+        self.proposed: list[str] = []
         self.quarantined: list[str] = []
         self.cleaned: list[str] = []
         self.lease_key = world.cfg.lease.key
@@ -184,10 +199,11 @@ class Harness:
 
     def _harvest(self, req, con, now, probes):
         self.calls.append("harvest")
-        return _report(self.cand)
+        return _report(self.cands)
 
     def _propose(self, req, cand):
         self.calls.append("propose")
+        self.proposed.append(cand.candidate_id)
         return Proposal(candidate_id=cand.candidate_id, files=cand.files,
                         summary="persist the column", root_cause="the producer is unwired",
                         verification_command=cand.success_command)
@@ -612,6 +628,96 @@ def test_a_rejected_selection_never_reaches_implement(world):
     assert "panel_invented_file" in out.detail
     assert "implement" not in h.calls
     assert _candidate_row(world.db)["status"] == "open"
+
+
+def _claim(root: Path, slug: str, path: str) -> None:
+    """Hold ``path`` in the CAID registry the cycle reads before dispatch."""
+    registry = root.parent / f"{root.name}-worktrees"
+    registry.mkdir(parents=True, exist_ok=True)
+    (registry / ".ownership").write_text(f"{slug}\t{path}\n", encoding="utf-8")
+
+
+def _two_ranked(world) -> tuple[Candidate, Candidate]:
+    """A top candidate on a claimed file and a second one on a free file."""
+    second_file = "mini_ork/verify/persist_two.py"
+    (world.root / second_file).write_text("# target\n", encoding="utf-8")
+    top = _cand(kind="producer_missing",
+                evidence_key="table:verifier_results:confidence-null",
+                title="confidence is never persisted")
+    nxt = _cand(source="db:V2", kind="regression",
+                evidence_key="table:verifier_results:judgement-unscored",
+                title="the judgement column is dropped",
+                files=(second_file,), success_command="db:V2")
+    return top, nxt
+
+
+def test_a_claimed_top_candidate_is_displaced_instead_of_stalling_the_cycle(world, capsys):
+    """Cycle 14 (2026-10-26) ended at $0.00 because a stale worktree held one
+    file. A claim is the one rejection that says nothing about the candidate:
+    another worktree can let go, and the fix would still be right. So the
+    cycle walks the ranked shortlist rather than stopping the loop."""
+    top, nxt = _two_ranked(world)
+    _claim(world.root, "rsi-someone-else", FILE)
+
+    h = Harness(world, (top, nxt))
+    out = h.run()
+
+    assert out.status == "merged"
+    assert out.candidate_id == nxt.candidate_id, "the cycle worked the next ranked gap"
+    assert h.proposed == [top.candidate_id, nxt.candidate_id], "asked in rank order"
+    assert h.calls.count("implement") == 1, "one candidate is implemented, never two"
+    assert "displaced by a live claim" in capsys.readouterr().err
+
+
+def test_an_operator_pin_does_not_silently_become_a_different_candidate(world):
+    """A pin names the target. Shipping a fix for a different gap than the one
+    asked about is worse than a rejection that says why."""
+    top, nxt = _two_ranked(world)
+    _claim(world.root, "rsi-someone-else", FILE)
+
+    h = Harness(world, (top, nxt))
+    out = h.run(candidate_id=top.candidate_id)
+
+    assert out.status == "rejected"
+    assert out.candidate_id == top.candidate_id
+    assert "worktree_claim_conflict" in out.detail
+    assert h.proposed == [top.candidate_id], "a pin is not re-rolled into another candidate"
+    assert "implement" not in h.calls
+
+
+def test_only_a_claim_conflict_falls_through(world):
+    """Every other code is a verdict on the candidate; re-asking would buy a
+    second panel for the same answer."""
+    top, nxt = _two_ranked(world)
+
+    h = Harness(world, (top, nxt))
+
+    def invented(req, cand):
+        h.proposed.append(cand.candidate_id)
+        return Proposal(candidate_id=cand.candidate_id, files=("mini_ork/nope.py",),
+                        summary="invented", root_cause="invented",
+                        verification_command=cand.success_command)
+
+    h.runtime.propose = invented
+    out = h.run()
+
+    assert out.status == "rejected"
+    assert "panel_invented_file" in out.detail
+    assert h.proposed == [top.candidate_id]
+
+
+def test_a_dry_run_reports_a_claim_conflict_instead_of_spending_on_the_next(world):
+    """The preview is of the queue's top; walking past it would answer an
+    unasked question at panel cost."""
+    top, nxt = _two_ranked(world)
+    _claim(world.root, "rsi-someone-else", FILE)
+
+    h = Harness(world, (top, nxt))
+    out = h.run(dry_run=True)
+
+    assert out.status == "rejected"
+    assert "worktree_claim_conflict" in out.detail
+    assert h.proposed == [top.candidate_id]
 
 
 def test_a_crash_finishes_the_row_as_error_and_re_raises(world):

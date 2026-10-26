@@ -363,26 +363,55 @@ def _body(req: CycleRequest, rt: Runtime, con, *, token: str, spend: float) -> C
     # A dry run must be able to show the would-be kickoff without a paid panel,
     # so it falls back to the candidate's own evidence. A live cycle never does:
     # there, a missing proposal is the recipe's job and it must say so.
-    if req.proposal is not None:
-        proposal = req.proposal
-    elif req.dry_run and rt.propose is None:
-        proposal = _preview_proposal(cand)
-    else:
-        proposal = (rt.propose or _default_propose)(req, cand)
-    if proposal is None:
-        return _finish(req, rt, con, "halted", rc=0, halt_reason="no_proposal",
-                       candidate_id=cand.candidate_id,
-                       detail="SUGGEST produced no proposal")
+    #
+    # A claim conflict is the one rejection that is not a verdict on the
+    # candidate: another worktree holds a file, and the fix would be fine once
+    # it lets go. Ending the cycle there lets one long-lived worktree stall the
+    # whole loop (cycle 14, 2026-10-26: rejected at $0.00, nothing attempted).
+    # So the cycle walks the ranked shortlist instead — bounded by the queue's
+    # ``max_candidates``, i.e. at most that many SUGGEST panels. Every other
+    # code still ends the cycle: those say something about the candidate, and
+    # re-asking costs a second panel for the same answer.
+    by_id = {c.candidate_id: c for c in report.candidates}
+    attempts = (cand, *_fallback_candidates(req, plan, cand))
+    displaced: list[str] = []
+    for index, attempt in enumerate(attempts):
+        if req.proposal is not None:
+            proposal = req.proposal
+        elif req.dry_run and rt.propose is None:
+            proposal = _preview_proposal(attempt)
+        else:
+            proposal = (rt.propose or _default_propose)(req, attempt)
+        if proposal is None:
+            return _finish(req, rt, con, "halted", rc=0, halt_reason="no_proposal",
+                           candidate_id=attempt.candidate_id,
+                           detail="SUGGEST produced no proposal")
 
-    selection = select({c.candidate_id: c for c in report.candidates}, proposal,
-                       _select_context(req, con, report, cand))
-    if not selection.accepted:
+        selection = select(by_id, proposal,
+                           _select_context(req, con, report, attempt))
+        if selection.accepted:
+            cand = attempt
+            break
+        if selection.code == "worktree_claim_conflict" and index + 1 < len(attempts):
+            displaced.append(f"{attempt.candidate_id} ({selection.detail})")
+            # A merged cycle carries no detail string, so the displacement is
+            # announced where it happens: the operator should be able to see
+            # that the landed fix is not the top-ranked gap, and why.
+            print(f"[rsi] {attempt.candidate_id} displaced by a live claim"
+                  f" ({selection.detail}); trying {attempts[index + 1].candidate_id}",
+                  file=sys.stderr)
+            continue
+        detail = _rejection_detail(selection, displaced)
         if req.dry_run:
-            return CycleOutcome(req.cycle_id, "rejected", 0, candidate_id=cand.candidate_id,
-                                detail=f"{selection.code}: {selection.detail}")
-        return _finish(req, rt, con, "rejected", rc=0, candidate_id=cand.candidate_id,
-                       detail=f"{selection.code}: {selection.detail}",
-                       extra=_candidate_fields(cand))
+            return CycleOutcome(req.cycle_id, "rejected", 0,
+                                candidate_id=attempt.candidate_id, detail=detail)
+        return _finish(req, rt, con, "rejected", rc=0, candidate_id=attempt.candidate_id,
+                       detail=detail, extra=_candidate_fields(attempt))
+    else:
+        # ``attempts`` always starts with ``cand``, so the loop cannot fall out
+        # without a break: every other path returns. Stated for the type checker
+        # and so a future edit that adds a way out fails loudly here.
+        raise AssertionError("SUGGEST loop ended without a selection")
 
     if req.dry_run:
         return CycleOutcome(req.cycle_id, "halted", 0, candidate_id=cand.candidate_id,
@@ -458,6 +487,30 @@ def _pick(req: CycleRequest, plan: QueuePlan) -> Candidate | None:
         item = plan.find(req.candidate_id)
         return item.candidate if item is not None else None
     return plan.top
+
+
+def _fallback_candidates(req: CycleRequest, plan: QueuePlan,
+                         first: Candidate) -> list[Candidate]:
+    """Ranked candidates to try if ``first`` is displaced by a live claim.
+
+    Empty when the cycle must not drift. An operator pin (``--candidate``, an
+    injected proposal) names the target: silently shipping a fix for a
+    different gap than the one asked about is worse than a rejection that says
+    why. A dry run and ``--suggest`` dispatch nothing, so a claim conflict there
+    is information the operator asked for — not an obstacle to route around.
+    """
+    if req.candidate_id or req.proposal is not None or req.dry_run or req.propose_only:
+        return []
+    return [item.candidate for item in plan.selected
+            if item.candidate.candidate_id != first.candidate_id]
+
+
+def _rejection_detail(selection, displaced: list[str]) -> str:
+    """The one reason this cycle stopped, plus what it walked past to get here."""
+    detail = f"{selection.code}: {selection.detail}"
+    if displaced:
+        detail += "; displaced by a live claim first: " + "; ".join(displaced)
+    return detail
 
 
 def _queue_cfg(req: CycleRequest) -> QueueConfig:

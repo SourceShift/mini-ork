@@ -223,6 +223,7 @@ instead of racing. Point `secure.db_path` at the shared DB and
 | every cycle `quarantined` `critic_split` | `rsi-cycle show <id> --json` | the critics disagree with each other; the *question* is underspecified — read their `blocking_findings` against each other |
 | every cycle `quarantined` `critic_not_exogenous` | `rsi-cycle doctor` | a critic lane share a family with `implement.lane` |
 | `no_candidate` forever | `rsi-cycle plan --json` | nothing above `queue.min_severity`, or everything is closed in `rsi_candidates` |
+| `rejected` naming `worktree_claim_conflict` | `rsi-cycle quarantine list` | another worktree holds one of the files the fix needs. A live cycle walks the ranked shortlist past a claim (bounded by `queue.max_candidates`) and only ends here when *every* eligible candidate is claimed; a cron job that keeps landing here means a stale claim — `quarantine release <id>` drops it without deleting the work |
 | `2` and a config message | the message names the key | see the fail-closed list above |
 | `error` with a traceback summary | `rsi-cycle show <id>` | a bug in the cycle itself — the row carries the exception type |
 
