@@ -2369,21 +2369,75 @@ def _verifier_result_name(ctx: NodeDispatch) -> str:
     return "verifier@v1"
 
 
+def _rubric_items(run_dir: str) -> list | None:
+    """The parsed ``rubric.json`` items for this run, else None.
+
+    The items carry the per-criterion label/verdict/note the verifier actually
+    reasoned over. ``None`` when there is no rubric, the doc is unreadable or
+    not a dict, the item list is absent/empty, or the doc is a parse-error
+    payload (``score == -1``) whose items describe no verdict at all. Pure:
+    reads the file, mutates nothing.
+    """
+    path = os.path.join(run_dir, "rubric.json") if run_dir else ""
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    try:
+        if float(doc.get("score")) == -1:
+            return None
+    except (TypeError, ValueError):
+        pass
+    items = doc.get("items")
+    if not isinstance(items, list) or not items:
+        return None
+    return items
+
+
+def _confidence_from_axes(items: list | None, verdict: str) -> float | None:
+    """The rubric's agreement with ``verdict``, measured as a fraction in [0, 1].
+
+    Of the *decisive* items — those whose verdict is PASS or FAIL, matched
+    case-insensitively — the fraction whose verdict equals this row's
+    ``verdict``. A rubric that agrees with the row scores near 1.0; one that
+    splits scores lower. Pure, and deliberately fail-closed: ``None`` when the
+    row is not pass/fail (indeterminate/vacuous carry no agreement claim), when
+    there are no items, or when no item is decisive. Never a constant, a
+    default, or a back-filled number — the value must be evidence the verifier
+    actually produced.
+    """
+    row = (verdict or "").strip().lower()
+    if row not in ("pass", "fail") or not items:
+        return None
+    decisive = 0
+    matching = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_verdict = str(item.get("verdict") or "").strip().lower()
+        if item_verdict not in ("pass", "fail"):
+            continue
+        decisive += 1
+        if item_verdict == row:
+            matching += 1
+    if decisive == 0:
+        return None
+    return matching / decisive
+
+
 def _rubric_axes_json(run_dir: str) -> str | None:
     """The scored rubric axes for this run (``rubric.json`` items), else None.
 
     The items carry the per-criterion label/verdict/note the verifier actually
     reasoned over; persisting them is what turns a bare pass/fail into an
     auditable verdict. ``None`` (no rubric, or no items) stores NULL."""
-    path = os.path.join(run_dir, "rubric.json") if run_dir else ""
-    if not path or not os.path.isfile(path):
-        return None
-    try:
-        doc = json.load(open(path, encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    items = doc.get("items") if isinstance(doc, dict) else None
-    if not items:
+    items = _rubric_items(run_dir)
+    if items is None:
         return None
     try:
         return json.dumps(items)
@@ -2402,10 +2456,14 @@ def _record_verifier_result(ctx: NodeDispatch, verdict: str) -> None:
     ``pass|fail|indeterminate|vacuous``; anything else would trip the CHECK and
     be swallowed below.
 
-    ``confidence`` is left NULL by design: the verifier emits a pass/fail
-    rubric, not a calibrated posterior, and inventing one would poison the
-    conformal calibration the gate computes over this column. The row still
-    carries the verdict and the scored axes for audit.
+    ``confidence`` is measured from the rubric, not invented: when
+    ``rubric.json`` holds the scored items the verifier reasoned over, it is
+    the fraction of decisive (PASS/FAIL) items whose verdict agrees with this
+    row's ``verdict`` — a float in [0, 1] that falls as the rubric splits.
+    Rows with no rubric (first attempts, before the advisory pre-screen writes
+    one), no decisive items, a parse-error rubric, and indeterminate/vacuous
+    rows store NULL rather than a back-filled number, so the column stays a
+    trustworthy uncertainty signal.
 
     Best-effort: a recording failure must never fail a verifier node, so every
     exception is swallowed (mirrors ``_write_evidence_ledger_row``). A
@@ -2418,9 +2476,11 @@ def _record_verifier_result(ctx: NodeDispatch, verdict: str) -> None:
     try:
         from mini_ork.gates.verifier_rubric import verifier_result_record  # noqa: PLC0415
 
+        run_dir = ctx.run_dir_eff or ctx.run_dir
         verifier_result_record(
             ctx.db, ctx.run_id, _verifier_result_name(ctx), verdict,
-            scored_axes_json=_rubric_axes_json(ctx.run_dir_eff or ctx.run_dir),
+            confidence=_confidence_from_axes(_rubric_items(run_dir), verdict),
+            scored_axes_json=_rubric_axes_json(run_dir),
         )
     except Exception as exc:  # noqa: BLE001 — enrichment must never fail the node
         print(f"  [warn] verifier_results write lost: {exc}", file=sys.stderr)
