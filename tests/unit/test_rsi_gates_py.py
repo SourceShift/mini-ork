@@ -310,6 +310,27 @@ def test_critic_family_is_resolved_from_the_served_lane():
     ).blocking == ("x",)
 
 
+def test_a_verdict_round_trips_through_its_ledger_shape():
+    """``why`` is carried for the ledger and ignored by the gate.
+
+    G10 grades ``approve`` + ``family`` + ``blocking``; the reasoning is kept
+    beside them so a quarantined split explains itself without a run directory.
+    """
+    raw = {"alias": "minimax", "lane": "minimax_lens", "approve": False,
+           "blocking_findings": ["nothing emits the field"], "confidence": 0.76,
+           "why": "every verifier envelope lacks one"}
+    verdict = CriticVerdict.from_mapping(raw)
+    assert verdict.why == "every verifier envelope lacks one"
+    assert verdict.to_dict() == {
+        "alias": "minimax", "lane": "minimax_lens", "family": "minimax",
+        "approve": False, "confidence": 0.76,
+        "blocking_findings": ["nothing emits the field"],
+        "why": "every verifier envelope lacks one",
+    }
+    # A verdict built by a test fake carries no prose and must not invent any.
+    assert CriticVerdict("glm", lane="glm_lens", approve=True).to_dict()["why"] == ""
+
+
 # ── G11 budget ──────────────────────────────────────────────────────────────
 
 

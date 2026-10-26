@@ -109,6 +109,13 @@ class CriticVerdict:
     approve: bool = False
     blocking: tuple[str, ...] = ()
     confidence: float = 0.0
+    #: The critic's own account of *why* it answered this way. G10 does not read
+    #: it — the verdict is ``approve`` + ``blocking`` — but the ledger keeps it,
+    #: because ``"minimax_lens did not approve"`` and ``"minimax_lens did not
+    #: approve because no producer emits the field the patch reads"`` send an
+    #: operator to two different places. Carried here so a cycle that records
+    #: its verdicts records the reasoning too, not just the vote.
+    why: str = ""
 
     @property
     def family(self) -> str:
@@ -125,7 +132,19 @@ class CriticVerdict:
             approve=raw.get("approve") is True,
             blocking=tuple(str(b) for b in blocking),
             confidence=float(raw.get("confidence") or 0.0),
+            why=str(raw.get("why") or ""),
         )
+
+    def to_dict(self) -> dict[str, Any]:
+        """The ledger/JSON shape: every field, with ``family`` resolved.
+
+        ``family`` is included because that is what G10 actually grades — a
+        reader must be able to see, from the row alone, whether two critics
+        were two *families* or one model wearing two names.
+        """
+        return {"alias": self.alias, "lane": self.lane, "family": self.family,
+                "approve": self.approve, "confidence": self.confidence,
+                "blocking_findings": list(self.blocking), "why": self.why}
 
 
 @dataclass(frozen=True, slots=True)

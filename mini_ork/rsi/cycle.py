@@ -453,18 +453,25 @@ def _body(req: CycleRequest, rt: Runtime, con, *, token: str, spend: float) -> C
     raw = (rt.critics or _default_critics)(req, cand, impl, selection, first)
     evidence = _with_critics(evidence, raw)
     report_final = evaluate(evidence)
+    # Read once and record on every path from here on: a split quarantines, and
+    # the *reason* for the split is the only thing that tells the next operator
+    # whether the fix shape was wrong or the question was. Losing it turned
+    # cycle 15 into a run-dir archaeology exercise.
+    critics_json = _critic_json(raw)
 
     # --- DECIDE ------------------------------------------------------------
     if not report_final.passed:
-        return _quarantine(req, rt, con, cand, impl, report_final, "gate_failed")
+        return _quarantine(req, rt, con, cand, impl, report_final, "gate_failed",
+                           critics=critics_json)
     if not cfg.decide.auto_merge:
-        return _quarantine(req, rt, con, cand, impl, report_final, "auto_merge_disabled")
+        return _quarantine(req, rt, con, cand, impl, report_final, "auto_merge_disabled",
+                           critics=critics_json)
 
     merged = (rt.merge or _default_merge)(req, impl)
     if not getattr(merged, "landed", False):
         return _quarantine(req, rt, con, cand, impl, report_final,
                            f"merge_{getattr(merged, 'status', 'failed')}",
-                           detail=getattr(merged, "detail", ""))
+                           detail=getattr(merged, "detail", ""), critics=critics_json)
 
     sha = str(getattr(merged, "sha", "") or "")
     ledger.set_candidate_status(con, cand.candidate_id, "merged", now=rt.clock(),
@@ -473,7 +480,8 @@ def _body(req: CycleRequest, rt: Runtime, con, *, token: str, spend: float) -> C
                    merged_sha=sha, gates=report_final,
                    extra={**_candidate_fields(cand),
                           "child_run_id": impl.child_run_id,
-                          "cost_usd": impl.cost_usd})
+                          "cost_usd": impl.cost_usd,
+                          "critic_json": critics_json})
 
 
 # --------------------------------------------------------------------------
@@ -671,8 +679,15 @@ def _learn(req: CycleRequest, rt: Runtime, con, status: str,
 
 def _quarantine(req: CycleRequest, rt: Runtime, con, cand: Candidate,
                 impl: Implementation, report: ValidationReport,
-                reason: str, *, detail: str = "") -> CycleOutcome:
-    """Keep the work; record why. A quarantined cycle is evidence, not garbage."""
+                reason: str, *, detail: str = "",
+                critics: Mapping[str, Any] | None = None) -> CycleOutcome:
+    """Keep the work; record why. A quarantined cycle is evidence, not garbage.
+
+    ``critics`` is the panel's verdicts in ledger shape, or ``None`` when the
+    cycle stopped before DECIDE asked anyone. It is passed through rather than
+    re-derived so the row keeps exactly what the gate judged — a re-read of the
+    run directory could see a later, edited file.
+    """
     failing = ", ".join(report.codes) or reason
     path = (rt.quarantine or _default_quarantine)(req, cand, impl, report, reason)
     ledger.set_candidate_status(con, cand.candidate_id, "quarantined", now=rt.clock(),
@@ -688,6 +703,7 @@ def _quarantine(req: CycleRequest, rt: Runtime, con, cand: Candidate,
                "child_run_id": impl.child_run_id,
                "cost_usd": impl.cost_usd,
                "gates_json": report.to_dict(),
+               "critic_json": critics,
                "quarantine_reason": f"{reason}: {failing}",
                "quarantine_path": str(path) if path else ""},
     )
@@ -850,6 +866,24 @@ def _with_critics(evidence: GateEvidence, raw: Sequence[CriticVerdict]) -> GateE
     if not critics:
         return evidence
     return replace(evidence, critics=critics, critic_panel=getattr(raw, "panel", None))
+
+
+def _critic_json(raw: Sequence[CriticVerdict]) -> dict[str, Any] | None:
+    """The panel in ledger shape: verdicts, their reasons, and who served them.
+
+    ``None`` — not ``{}`` — when nobody was asked. ``rsi_cycles.critic_json`` is
+    the column an operator reads to decide whether a cycle failed on a bad fix
+    or a bad question, so a cycle that never reached DECIDE must not leave a
+    row that parses as "a panel reviewed this and said nothing".
+    """
+    verdicts = tuple(raw)
+    if not verdicts:
+        return None
+    payload: dict[str, Any] = {"critics": [v.to_dict() for v in verdicts]}
+    panel = getattr(raw, "panel", None)
+    if panel is not None:
+        payload["panel"] = dict(panel)
+    return payload
 
 
 def _recipe_dir(req: CycleRequest, name: str) -> Path:

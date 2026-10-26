@@ -268,6 +268,13 @@ every cycle quarantines on G10 because both critics were served by one family.
 `panel-composition.json` records the lanes that actually answered; read it
 before blaming the critics.
 
+Whatever the critics answered is copied into `rsi_cycles.critic_json` on every
+path from DECIDE onwards — the verdict, the resolved family, the blocking
+findings and each critic's own `why` — so `rsi-cycle show <id> --json` is
+enough to tell a wrong *fix* from a wrong *question* without opening the run
+directory. A cycle that never reached the panel stores `NULL`, never `{}`:
+"nobody was asked" and "asked and silent" are different answers.
+
 The machine brief travels by environment variable (`MO_RSI_SUGGEST_BRIEF`,
 `MO_RSI_CRITIC_BRIEF`), not as an artifact: the run directory does not exist yet
 when the cycle builds the brief. The recipes render it themselves

@@ -669,3 +669,31 @@ def test_revert_without_a_merged_sha_is_rc2(root, db, capsys):
 def test_revert_without_an_id_is_rc2(tmp_path, capsys):
     assert rsi_cycle.main(["revert"], root=tmp_path) == 2
     assert "revert <cycle_id>" in capsys.readouterr().err
+
+
+# ── show: the critic verdicts ───────────────────────────────────────────────
+
+
+def test_show_renders_each_critic_and_its_first_finding():
+    """A split must be legible in the default (non-JSON) output.
+
+    The stored column is a JSON string; a cycle whose panel split is the only
+    thing standing between it and a merge should say so on one line per critic,
+    not require ``--json`` and a jq pipe.
+    """
+    raw = json.dumps({"critics": [
+        {"alias": "glm", "family": "zai", "approve": True, "blocking_findings": []},
+        {"alias": "minimax", "family": "minimax", "approve": False,
+         "blocking_findings": ["no producer emits the field", "second finding"]},
+    ]})
+    lines = rsi_cycle._render_critics(raw)
+    assert len(lines) == 2
+    assert "approve" in lines[0] and "(zai)" in lines[0]
+    assert "REJECT" in lines[1] and "no producer emits the field" in lines[1]
+    assert "second finding" not in lines[1], "one line per critic, not a dump"
+
+
+@pytest.mark.parametrize("raw", [None, "", "{}", "not json", {"critics": None}])
+def test_show_survives_a_missing_or_shapeless_panel(raw):
+    """``show`` is an operator tool: a bad column must not raise."""
+    assert rsi_cycle._render_critics(raw) == []

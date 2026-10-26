@@ -387,7 +387,28 @@ def _render_show(kind: str, payload: Mapping[str, Any]) -> str:
                 f"  probe {probe['probe_id']:<16} {probe['status']:<9} "
                 f"rc={probe['rc']} {probe['duration_ms']}ms"
             )
+        lines.extend(_render_critics(row.get("critic_json")))
     return "\n".join(lines)
+
+
+def _render_critics(raw: Any) -> list[str]:
+    """One line per critic, with the first blocking finding and its `why` cut.
+
+    The full text is in ``--json``; a split has to be legible without it, since
+    the question "did the panel split on the fix or on the question?" is what
+    decides whether the next cycle retries this candidate at all.
+    """
+    try:
+        doc = json.loads(raw) if isinstance(raw, str) else (raw or {})
+    except (TypeError, ValueError):
+        return []
+    lines: list[str] = []
+    for critic in (doc.get("critics") or ()) if isinstance(doc, dict) else ():
+        verdict = "approve" if critic.get("approve") else "REJECT "
+        blocking = critic.get("blocking_findings") or [""]
+        lines.append(f"  critic {str(critic.get('alias', '')):<14} {verdict} "
+                     f"({critic.get('family', '')}) {str(blocking[0])[:110]}")
+    return lines
 
 
 def _cmd_doctor(args, root: Path, db: Path) -> int:

@@ -390,6 +390,61 @@ def test_no_critics_at_all_fails_g10_closed(world):
     assert "critic_not_exogenous" in out.detail
 
 
+def test_a_split_panel_is_recorded_with_its_reasoning(world):
+    """The verdicts and their reasons must survive into ``critic_json``.
+
+    ``rsi-cycle show --json`` is documented as the way to tell a bad *fix* from
+    a bad *question* — "read their blocking_findings against each other". That
+    instruction was dead: the column stayed ``{}`` for every quarantined cycle,
+    so cycle 15's split was only readable by digging through the run directory.
+    """
+    h = Harness(world)
+    h.critic_verdicts = cycle_mod.CriticsResult(
+        (CriticVerdict("glm", lane="glm_lens", approve=True, confidence=0.74,
+                       why="the mechanism traces cleanly"),
+         CriticVerdict("minimax", lane="minimax_lens", approve=False,
+                       blocking=("no producer emits the field",), confidence=0.76,
+                       why="every verifier prints an envelope without one")),
+        panel={"ok": True, "critics": {"glm_lens": "zai", "minimax_lens": "minimax"}},
+    )
+    out = h.run()
+    assert out.status == "quarantined"
+
+    recorded = json.loads(_cycle(world.db)["critic_json"])
+    assert [c["alias"] for c in recorded["critics"]] == ["glm", "minimax"]
+    assert [c["family"] for c in recorded["critics"]] == ["zai", "minimax"]
+    assert recorded["critics"][0]["approve"] is True
+    # The prose is the load-bearing part: "did not approve" and "did not approve
+    # because nothing emits the field" send an operator to different places.
+    assert recorded["critics"][1]["blocking_findings"] == ["no producer emits the field"]
+    assert recorded["critics"][1]["why"] == "every verifier prints an envelope without one"
+    assert recorded["panel"]["ok"] is True
+
+
+def test_a_merged_cycle_records_the_panel_that_approved_it(world):
+    h = Harness(world)
+    out = h.run()
+    assert out.status == "merged"
+
+    recorded = json.loads(_cycle(world.db)["critic_json"])
+    assert [c["approve"] for c in recorded["critics"]] == [True, True]
+
+
+def test_a_cycle_that_never_reached_the_panel_stores_null_not_empty(world):
+    """``{}`` would parse as 'a panel reviewed this and said nothing'.
+
+    A cycle that failed a deterministic gate never buys a panel, so it has no
+    verdict to record. NULL says "not asked"; an empty object says "asked and
+    silent", and the two are different questions for an operator.
+    """
+    h = Harness(world)
+    h.measurement_overrides = {"pytest_ok": False}
+    out = h.run()
+    assert out.status == "quarantined"
+    assert "critics" not in h.calls
+    assert _cycle(world.db)["critic_json"] is None
+
+
 def test_auto_merge_absent_quarantines_a_passing_change(world):
     h = Harness(world)
     h.world = SimpleNamespace(**{**world.__dict__,
