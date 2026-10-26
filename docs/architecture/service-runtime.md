@@ -98,6 +98,7 @@ Every route except `/v1/health` requires the node bearer token.
 | `DELETE` | `/v1/services/{sid}` | `{"deleted": sid}` |
 | `POST` | `/v1/services/{sid}/restart` | status after `docker restart` |
 | `GET` | `/v1/services/{sid}/logs?tail=N` | merged logs, `N` clamped to 1..5000 |
+| `GET` | `/v1/services/{sid}/logs/stream?tail=N&replica=R` | live NDJSON tail, one frame per line, then an `eof` frame per replica |
 | `GET` | `/v1/services/{sid}/stats` | one resource sample per **running** replica (CPU, memory, cumulative I/O, pids) |
 | `POST` | `/v1/services/{sid}/exec` | run one command in replica 0; `{argv, stdin, timeout}` in, rc + bounded output out |
 
@@ -455,6 +456,61 @@ The node keeps no history, sets no retention, and decides no sampling interval:
 it answers "what is true right now" for one service. Storing, scoping,
 aggregating and expiring those answers is the proprietary layer.
 
+## Live tail — follow, one child per replica
+
+`GET /v1/services/{sid}/logs` answers with the last `N` lines and closes. A
+deployment platform also needs to *watch*: the moment a deploy starts failing,
+an operator wants the next line, not a refresh button.
+
+```mermaid
+sequenceDiagram
+  participant CP as control plane
+  participant NA as node-agent
+  participant D as docker
+  CP->>NA: GET /v1/services/web/logs/stream?tail=50&replica=1
+  NA->>D: docker logs --follow --tail 50 --timestamps mo-svc-web-1
+  loop each line
+    D-->>NA: 2026-10-26T10:00:01.2Z GET /health 200
+    NA-->>CP: {"replica":1,"ts":"2026-10-26T10:00:01.2Z","line":"GET /health 200"}
+  end
+  D-->>NA: container exits
+  NA-->>CP: {"replica":1,"eof":true,"exit_code":0}
+```
+
+Wire shape — one JSON object per line, `application/x-ndjson`:
+
+```
+{"replica": 0, "ts": "2026-10-26T10:00:01.234567890Z", "line": "GET /health 200"}
+{"replica": 0, "eof": true, "exit_code": 0}
+```
+
+- **`ts` is Docker's clock, not the node's.** `--timestamps` makes the line
+  carry the instant the container wrote it, so a reader merging replicas can
+  order by time instead of by arrival. Arrival order is *not* sorted: sorting
+  would mean holding output until every replica had spoken, which is the
+  opposite of a live view. A line Docker did not prefix keeps its text with
+  `ts: null` — losing a log line is worse than not dating it.
+- **One child per replica.** `docker logs -f` has no exit condition the node
+  can bound, so it runs as a child the node owns. The generator's `finally`
+  kills every child when the reader goes away: a closed browser tab must not
+  leave a Docker process per replica behind.
+- **Validation is eager.** The service and replica are checked before the
+  response starts, so an unknown service is still a plain `404` and a replica
+  outside `0..replicas-1` a plain `400`. A stream that starts and *then*
+  reports the error has already told the client it succeeded.
+- **A line is emitted when Docker writes its newline.** A partial line (a
+  progress bar) waits for one or for exit, which is what `docker logs` shows
+  too.
+- **Backpressure is bounded.** The node queues at most a couple of thousand
+  frames between the child and the reader and then stops reading, checking a
+  close flag while it waits — a reader that stalls cannot make the node grow
+  without bound. When the reader closes, the child is killed and the thread
+  exits.
+
+The node still decides no retention and no fan-out: it tails the replicas of
+one service for one connected reader. Recording, searching, and sharing those
+lines remain the control plane's job.
+
 ## What is deliberately absent
 
 These are the proprietary layer's job, and every one of them is policy:
@@ -564,3 +620,11 @@ samples, that a stopped replica is omitted while `replicas_total` still
 reports it, that an unreadable field becomes `null` rather than `0`, that a
 non-zero exit keeps the lines it got, that a failure with no parseable line is
 a `500`, and that an unknown service is `404`.
+
+For the live tail it asserts the composed argv (`--follow`, `--timestamps`,
+the clamped `--tail`, one child per requested replica), the NDJSON frames
+(replica, Docker timestamp, text) and their `eof` frames, the replica filter,
+that an out-of-range replica is `400` with **no** child started, that an
+unknown service is `404` before anything spawns, that a line without the
+timestamp prefix keeps its text with `ts: null`, and that closing the
+generator kills every child.

@@ -12,6 +12,7 @@ cross into the container but never land in ``services.json``.
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -416,6 +417,206 @@ def test_logs_merge_replicas(client):
 
 def test_logs_unknown_is_404(client):
     assert client.get("/v1/services/web/logs", headers=AUTH).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# live log tail (`/logs/stream`)
+# ---------------------------------------------------------------------------
+
+
+class _FakeLogProc:
+    """One ``docker logs --follow`` child: buffered lines, then EOF.
+
+    ``live=True`` models a running container: the child prints its lines and
+    then blocks, the way ``docker logs -f`` waits for more output, until
+    :meth:`kill` unblocks it.
+    """
+
+    def __init__(self, lines: list[str], *, exit_code: int = 0, live: bool = False) -> None:
+        self.stdout = self
+        self._lines = lines
+        self._live = live
+        self._unblock = threading.Event()
+        self.exit_code = exit_code
+        self.killed = False
+        self.closed = False
+        self.returncode: int | None = None
+
+    def __iter__(self):
+        for line in self._lines:
+            yield line
+        if self._live:
+            self._unblock.wait(timeout=5)
+
+    def close(self) -> None:
+        self.closed = True
+
+    def wait(self) -> int:
+        if self.returncode is None:
+            self.returncode = -9 if self.killed else self.exit_code
+        return self.returncode
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+        self._unblock.set()
+
+
+class _FakePopen:
+    """Records the argv of every tail child and hands back canned lines."""
+
+    def __init__(
+        self, scripts: dict[str, list[str]] | None = None, *, live: bool = False
+    ) -> None:
+        self.calls: list[list[str]] = []
+        self.procs: list[_FakeLogProc] = []
+        self.scripts = scripts or {}
+        self.live = live
+
+    def __call__(self, argv):
+        argv = [str(a) for a in argv]
+        self.calls.append(argv)
+        proc = _FakeLogProc(
+            self.scripts.get(argv[-1], ["2026-10-26T10:00:00.000000001Z listening\n"]),
+            live=self.live,
+        )
+        self.procs.append(proc)
+        return proc
+
+
+def _popen_client(tmp_path: Path, docker: _Docker, popen: _FakePopen) -> TestClient:
+    return TestClient(
+        create_app(
+            state_dir=tmp_path,
+            token_env=TOKEN_ENV,
+            _run_fn=docker,
+            _run_input_fn=docker.run_input,
+            _popen_fn=popen,
+        )
+    )
+
+
+def _ndjson(response) -> list[dict]:
+    return [json.loads(line) for line in response.text.splitlines() if line.strip()]
+
+
+def test_log_stream_frames_both_replicas(monkeypatch, tmp_path, docker):
+    monkeypatch.setenv(TOKEN_ENV, TOKEN_VALUE)
+    popen = _FakePopen(
+        {
+            "mo-svc-web-0": [
+                "2026-10-26T10:00:00.100000000Z ready\n",
+                "2026-10-26T10:00:01.000000000Z GET /health 200\n",
+            ],
+            "mo-svc-web-1": ["2026-10-26T10:00:00.200000000Z ready\n"],
+        }
+    )
+    client = _popen_client(tmp_path, docker, popen)
+    client.post("/v1/services", json=_spec(), headers=AUTH)
+
+    r = client.get("/v1/services/web/logs/stream", params={"tail": 5}, headers=AUTH)
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("application/x-ndjson")
+    assert r.headers["cache-control"] == "no-store"
+
+    frames = _ndjson(r)
+    bodies = [f for f in frames if not f.get("eof")]
+    eofs = [f for f in frames if f.get("eof")]
+    assert {(f["replica"], f["line"]) for f in bodies} == {
+        (0, "ready"),
+        (0, "GET /health 200"),
+        (1, "ready"),
+    }
+    assert all(f["ts"].startswith("2026-10-26T10:00:0") for f in bodies)
+    assert sorted((f["replica"], f["exit_code"]) for f in eofs) == [(0, 0), (1, 0)]
+
+    # The tail is history then follow, timestamped by Docker's clock.
+    assert [c[-1] for c in popen.calls] == ["mo-svc-web-0", "mo-svc-web-1"]
+    assert all("--follow" in c and "--timestamps" in c for c in popen.calls)
+    assert all(c[c.index("--tail") + 1] == "5" for c in popen.calls)
+
+
+def test_log_stream_one_replica(monkeypatch, tmp_path, docker):
+    monkeypatch.setenv(TOKEN_ENV, TOKEN_VALUE)
+    popen = _FakePopen({"mo-svc-web-1": ["2026-10-26T10:00:00.000000000Z only-one\n"]})
+    client = _popen_client(tmp_path, docker, popen)
+    client.post("/v1/services", json=_spec(), headers=AUTH)
+
+    r = client.get(
+        "/v1/services/web/logs/stream", params={"replica": 1}, headers=AUTH
+    )
+    assert r.status_code == 200
+    assert [c[-1] for c in popen.calls] == ["mo-svc-web-1"]
+    bodies = [f for f in _ndjson(r) if not f.get("eof")]
+    assert [(f["replica"], f["line"]) for f in bodies] == [(1, "only-one")]
+
+
+def test_log_stream_replica_out_of_range_is_400(monkeypatch, tmp_path, docker):
+    monkeypatch.setenv(TOKEN_ENV, TOKEN_VALUE)
+    popen = _FakePopen()
+    client = _popen_client(tmp_path, docker, popen)
+    client.post("/v1/services", json=_spec(), headers=AUTH)
+
+    r = client.get("/v1/services/web/logs/stream", params={"replica": 9}, headers=AUTH)
+    assert r.status_code == 400
+    assert popen.calls == []
+
+
+def test_log_stream_unknown_service_is_404(monkeypatch, tmp_path, docker):
+    monkeypatch.setenv(TOKEN_ENV, TOKEN_VALUE)
+    popen = _FakePopen()
+    client = _popen_client(tmp_path, docker, popen)
+    r = client.get("/v1/services/web/logs/stream", headers=AUTH)
+    assert r.status_code == 404
+    assert popen.calls == []
+
+
+def test_log_stream_requires_bearer(monkeypatch, tmp_path, docker):
+    monkeypatch.setenv(TOKEN_ENV, TOKEN_VALUE)
+    client = _popen_client(tmp_path, docker, _FakePopen())
+    assert client.get("/v1/services/web/logs/stream").status_code == 401
+
+
+def test_log_line_without_docker_timestamp_is_kept():
+    from mini_ork.remote.node_agent.services import _parse_log_line
+
+    assert _parse_log_line(3, "plain text from a container\n") == {
+        "replica": 3,
+        "ts": None,
+        "line": "plain text from a container",
+    }
+    assert _parse_log_line(0, "2026-10-26T10:00:00Z x\n") == {
+        "replica": 0,
+        "ts": "2026-10-26T10:00:00Z",
+        "line": "x",
+    }
+    assert _parse_log_line(0, "   \n") is None
+
+
+def test_follow_logs_close_kills_the_children(monkeypatch, tmp_path, docker):
+    from mini_ork.remote.node_agent.services import ServiceManager
+
+    monkeypatch.setenv(TOKEN_ENV, TOKEN_VALUE)
+    popen = _FakePopen(
+        {
+            "mo-svc-web-0": ["2026-10-26T10:00:00.000000000Z a\n"],
+            "mo-svc-web-1": ["2026-10-26T10:00:00.000000000Z b\n"],
+        },
+        live=True,
+    )
+    manager = ServiceManager(
+        tmp_path, _run_fn=docker, _run_input_fn=docker.run_input, _popen_fn=popen
+    )
+    manager.create(_spec())
+
+    frames = manager.follow_logs("web")
+    assert next(frames)["line"] in {"a", "b"}
+    frames.close()  # the reader went away, as when a browser tab closes
+
+    assert all(proc.killed for proc in popen.procs)
 
 
 def test_delete_removes_containers_and_state(client, docker, tmp_path):

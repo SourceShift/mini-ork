@@ -66,6 +66,7 @@ def create_app(
     _run_fn: Callable | None = None,
     _spawn_fn: Callable | None = None,
     _run_input_fn: Callable | None = None,
+    _popen_fn: Callable | None = None,
 ) -> FastAPI:
     """Build the node-agent FastAPI app.
 
@@ -515,7 +516,7 @@ def create_app(
     app.include_router(
         make_services_router(
             state_dir, bearer=bearer, _run_fn=_run_fn,
-            _run_input_fn=_run_input_fn,
+            _run_input_fn=_run_input_fn, _popen_fn=_popen_fn,
         )
     )
 

@@ -19,6 +19,7 @@ Contract (all routes are bearer-authed by the node-agent):
     DELETE /v1/services/{sid}        stop and remove every replica
     POST   /v1/services/{sid}/restart
     GET    /v1/services/{sid}/logs?tail=N
+    GET    /v1/services/{sid}/logs/stream?tail=N&replica=R   live NDJSON tail
     GET    /v1/services/{sid}/stats    one resource sample per running replica
     POST   /v1/services/{sid}/exec     run one argv inside replica 0
     POST   /v1/services/{sid}/volumes/{name}/snapshots
@@ -88,19 +89,21 @@ import hashlib
 import ipaddress
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
 import tarfile
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Mapping
+from typing import Any, AsyncIterator, Callable, Iterator, Mapping
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.responses import FileResponse, StreamingResponse
 
 from .procs import _run as default_run
 
@@ -177,6 +180,20 @@ _NETWORK_ALIAS_RE = re.compile(
 _NETWORK_DRIVER_ENV = "MO_NODE_NETWORK_DRIVER"
 _NETWORK_DRIVERS = frozenset({"bridge", "overlay"})
 
+#: Bounds on a live log tail. ``tail`` is the history replayed before the
+#: follow starts (Docker's own flag), and the queue is what sits between the
+#: Docker child and a reader that may be slower than the container writes.
+#: A full queue blocks the pump briefly and then checks whether the stream was
+#: closed, so an abandoned tail stops reading instead of growing forever.
+_LOG_TAIL_MAX = 5000
+_LOG_QUEUE_FRAMES = 2000
+
+#: Docker's ``--timestamps`` prefix: RFC3339 in UTC with a ``Z`` and optional
+#: fractional seconds. Matching it means a line's timestamp is *Docker's clock*
+#: rather than the node's read time, so two replicas can be merged in one
+#: timeline without inventing an order.
+_DOCKER_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z) (.*)$")
+
 
 class ServiceError(ValueError):
     """A request the node refuses before it touches Docker."""
@@ -185,6 +202,44 @@ class ServiceError(ValueError):
 def _utc_now() -> str:
     """ISO-8601 UTC with a ``Z`` suffix (the wire style used elsewhere)."""
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _parse_log_line(replica: int, raw: str) -> dict[str, Any] | None:
+    """One ``docker logs --timestamps`` line → a frame, or ``None`` to skip it.
+
+    The prefix is Docker's, not the node's: a line that arrived from a restart
+    before this tail started still carries the time the container wrote it, so
+    a reader can order two replicas without trusting arrival order. A line
+    without the prefix (a container that echoed something odd, or a Docker that
+    formatted it differently) is passed through with ``ts: null`` rather than
+    dropped — losing a log line is worse than not dating it.
+    """
+    line = raw.rstrip("\r\n")
+    if not line.strip():
+        # Docker emits an empty line for a blank container line; a frame that
+        # says nothing is noise in a live stream.
+        return None
+    match = _DOCKER_TS_RE.match(line)
+    if match is None:
+        return {"replica": replica, "ts": None, "line": line}
+    return {"replica": replica, "ts": match.group(1), "line": match.group(2)}
+
+
+def _popen_logs(argv: list[str]) -> subprocess.Popen:
+    """Start one ``docker logs --follow`` child, merged stdout/stderr.
+
+    A child, not ``subprocess.run``: follow has no exit condition the node can
+    put a deadline on, so the node owns the process and kills it when the
+    reader goes away. Docker writes container stderr to the CLI's stderr, and a
+    single merged stream is what a log viewer shows.
+    """
+    return subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
 
 
 def _port_mapping(port: Mapping[str, Any]) -> str:
@@ -624,10 +679,14 @@ class ServiceManager:
         snapshot_max_bytes: int | None = None,
         _run_fn: Callable[..., Any] | None = None,
         _run_input_fn: Callable[..., Any] | None = None,
+        _popen_fn: Callable[[list[str]], subprocess.Popen] | None = None,
     ) -> None:
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._run_input = _run_input_fn or _run_input
+        # Separate from ``_run_fn``: a follow stream is a live child the node
+        # kills, not a command it waits on, so tests seam it separately.
+        self._popen = _popen_fn or _popen_logs
         self.volume_root = self._resolve_volume_root(volume_root)
         self.snapshot_root = self._resolve_snapshot_root(snapshot_root)
         self.snapshot_max_bytes = self._resolve_snapshot_max_bytes(snapshot_max_bytes)
@@ -1353,6 +1412,126 @@ class ServiceManager:
             chunks.append(f"--- replica {replica} ---\n{text}")
         return "\n".join(chunks)
 
+    def follow_logs(
+        self, service_id: str, *, tail: int = 50, replica: int | None = None
+    ) -> Iterator[dict[str, Any]]:
+        """Live log frames for one service, one ``docker logs --follow`` per replica.
+
+        Frames are ``{"replica", "ts", "line"}``; each replica ends with
+        ``{"replica", "eof": true, "exit_code"}``. Frames arrive in *arrival*
+        order across replicas, not sorted: sorting would mean holding output
+        until every replica had spoken, which is the opposite of a live tail.
+        ``ts`` is Docker's timestamp, so a client that wants a merged timeline
+        can order by it.
+
+        Validation happens here, before the caller starts a response, so an
+        unknown service (``KeyError``) or replica (``ServiceError``) is still an
+        ordinary HTTP error rather than a half-written stream. The generator
+        owns the children: when the reader stops, ``finally`` kills them, so a
+        closed browser tab does not leave a Docker process per replica.
+        """
+        spec = self._specs.get(service_id)
+        if spec is None:
+            raise KeyError(service_id)
+        tail = max(1, min(int(tail), _LOG_TAIL_MAX))
+        count = max(spec.replicas, 1)
+        if replica is None:
+            replicas = list(range(count))
+        else:
+            try:
+                index = int(replica)
+            except (TypeError, ValueError) as exc:
+                raise ServiceError("replica must be an integer") from exc
+            if not 0 <= index < count:
+                raise ServiceError(
+                    f"replica must be between 0 and {count - 1}, got {index}"
+                )
+            replicas = [index]
+        names = [(index, self._name(spec, index)) for index in replicas]
+        return self._follow(names, tail=tail)
+
+    def _follow(
+        self, names: list[tuple[int, str]], *, tail: int
+    ) -> Iterator[dict[str, Any]]:
+        frames: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=_LOG_QUEUE_FRAMES)
+        stopped = threading.Event()
+        procs: list[subprocess.Popen] = []
+
+        def offer(frame: dict[str, Any]) -> bool:
+            """Put a frame, giving up if the stream was closed while waiting."""
+            while not stopped.is_set():
+                try:
+                    frames.put(frame, timeout=0.25)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def pump(index: int, proc: subprocess.Popen) -> None:
+            try:
+                stream = proc.stdout
+                if stream is not None:
+                    # A line is emitted when Docker writes its newline. A
+                    # partial line (a progress bar) waits for one, which is
+                    # what ``docker logs`` itself shows.
+                    for raw in stream:
+                        frame = _parse_log_line(index, raw)
+                        if frame is not None and not offer(frame):
+                            return
+            except (OSError, ValueError):
+                pass
+            finally:
+                try:
+                    code = proc.wait()
+                except OSError:
+                    code = None
+                if not stopped.is_set():
+                    offer({"replica": index, "eof": True, "exit_code": code})
+                stream = proc.stdout
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+
+        try:
+            for index, name in names:
+                procs.append(
+                    self._popen(
+                        [
+                            "docker",
+                            "logs",
+                            "--follow",
+                            "--tail",
+                            str(tail),
+                            "--timestamps",
+                            name,
+                        ]
+                    )
+                )
+                threading.Thread(
+                    target=pump,
+                    args=(index, procs[-1]),
+                    daemon=True,
+                    name=f"service-logs-{index}",
+                ).start()
+            remaining = len(names)
+            while remaining > 0:
+                frame = frames.get()
+                if frame.get("eof"):
+                    remaining -= 1
+                yield frame
+        finally:
+            # Set first: a pump blocked on a full queue must see the close
+            # before it tries to push an eof nobody will read.
+            stopped.set()
+            for proc in procs:
+                try:
+                    if proc.poll() is None:
+                        proc.kill()
+                except OSError:
+                    pass
+
     def stats(self, service_id: str) -> dict[str, Any] | None:
         """One ``docker stats --no-stream`` sample for every running replica.
 
@@ -1576,6 +1755,7 @@ def make_router(
     snapshot_max_bytes: int | None = None,
     _run_fn: Callable | None = None,
     _run_input_fn: Callable | None = None,
+    _popen_fn: Callable[[list[str]], subprocess.Popen] | None = None,
 ) -> APIRouter:
     """Build the FastAPI router exposing the ``/v1/services`` surface.
 
@@ -1596,6 +1776,7 @@ def make_router(
         snapshot_max_bytes=snapshot_max_bytes,
         _run_fn=_run_fn,
         _run_input_fn=_run_input_fn,
+        _popen_fn=_popen_fn,
     )
     router = APIRouter()
 
@@ -1639,6 +1820,38 @@ def make_router(
             return {"service_id": sid, "logs": services.logs(sid, tail=tail)}
         except KeyError as exc:
             raise HTTPException(404, f"unknown service {sid!r}") from exc
+
+    @router.get("/v1/services/{sid}/logs/stream")
+    def stream_service_logs(sid: str, tail: int = 50, replica: int | None = None,
+                            _: None = Depends(bearer)) -> Response:
+        """Live tail as NDJSON: ``{"replica","ts","line"}`` then ``{"eof":true}``.
+
+        ``follow_logs`` validates before this returns a generator, so an
+        unknown service or a replica outside the range is still a normal JSON
+        error — a stream that starts and then reports 404 has already told the
+        client it succeeded.
+        """
+        try:
+            frames = services.follow_logs(sid, tail=tail, replica=replica)
+        except KeyError as exc:
+            raise HTTPException(404, f"unknown service {sid!r}") from exc
+        except ServiceError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+        def gen() -> Iterator[str]:
+            for frame in frames:
+                yield json.dumps(frame) + "\n"
+
+        return StreamingResponse(
+            gen(),
+            media_type="application/x-ndjson",
+            headers={
+                # A tail is never cacheable, and a buffering edge would turn
+                # live output into one delayed blob at EOF.
+                "cache-control": "no-store",
+                "x-accel-buffering": "no",
+            },
+        )
 
     @router.get("/v1/services/{sid}/stats")
     def get_service_stats(sid: str, _: None = Depends(bearer)) -> dict:
