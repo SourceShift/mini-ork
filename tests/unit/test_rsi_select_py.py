@@ -163,6 +163,60 @@ def test_a_file_the_panel_invented_is_rejected():
     assert "does_not_exist" in sel.detail
 
 
+def test_a_directory_is_not_a_file_to_change():
+    """A directory claim is a prefix claim: it collides with every sibling editor.
+
+    Cycle 6 proposed ``db/migrations`` because a new migration file did not exist
+    yet, and the directory then overlapped ``db/migrations/0071_*.sql`` held by
+    another worktree. The proposal must name files, not containers.
+    """
+    cand = _cand()
+    for directory in ("db/migrations", "tests/unit", "db/migrations/"):
+        sel = _run(cand, Proposal(candidate_id=cand.candidate_id, files=(directory,)))
+        assert sel.code == "directory_scope", directory
+        assert "database" not in sel.detail
+    assert "directory_scope" in SELECT_CODES
+
+
+def test_a_declared_new_file_is_accepted_and_marked_in_the_kickoff():
+    cand = _cand()
+    sel = _run(cand, Proposal(candidate_id=cand.candidate_id,
+                              files=("mini_ork/learning/ledger.py",),
+                              new_files=("db/migrations/0085_llm_calls_lane.sql",)))
+    assert sel.accepted, (sel.code, sel.detail)
+    assert sel.files == ("mini_ork/learning/ledger.py",
+                         "db/migrations/0085_llm_calls_lane.sql")
+    assert "`db/migrations/0085_llm_calls_lane.sql` (new)" in sel.kickoff
+    findings = lint(sel.kickoff, project=ROOT, recipe="framework-edit", home=None)
+    assert findings == [], findings
+
+
+def test_a_new_file_under_a_missing_directory_is_invented():
+    cand = _cand()
+    sel = _run(cand, Proposal(candidate_id=cand.candidate_id,
+                              files=("mini_ork/learning/ledger.py",),
+                              new_files=("db/no_such_dir/0085_x.sql",)))
+    assert sel.code == "panel_invented_file"
+    assert "no_such_dir" in sel.detail
+
+
+def test_a_declared_new_file_counts_toward_the_blast_radius():
+    cand = _cand()
+    five = ("mini_ork/learning/__init__.py", "mini_ork/learning/ledger.py",
+            "mini_ork/learning/lesson_conflict.py", "mini_ork/dispatch/routing.py",
+            "mini_ork/gates/gate_registry.py")
+    sel = _run(cand, Proposal(candidate_id=cand.candidate_id, files=five,
+                              new_files=("tests/unit/test_new_thing_py.py",)))
+    assert sel.code == "blast_radius"
+
+
+def test_proposal_parses_the_new_file_aliases():
+    raw = {"candidate_id": "rsi-x", "files": ["a.py"], "files_to_create": ["b.py"]}
+    assert Proposal.from_mapping(raw).new_files == ("b.py",)
+    raw = {"candidate_id": "rsi-x", "files": ["a.py"], "new_files": "b.py"}
+    assert Proposal.from_mapping(raw).new_files == ("b.py",)
+
+
 def test_frozen_path_is_rejected_before_blast_and_allowlist():
     cand = _cand(file="config/kernel-frozen.yaml")
     sel = _run(cand, frozen_paths=("config/kernel-frozen.yaml",))

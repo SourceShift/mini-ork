@@ -16,8 +16,12 @@ Produce ONE proposal. Your job is not to average the panel. It is to resolve it:
 
 Hard requirements, checked mechanically after you:
 
-- `files` must be repo-relative paths that exist today, at most 5, all needed
-  for the one change. No new files unless the root cause requires one.
+- `files` must be repo-relative paths that exist today, all needed for the one
+  change. A file the fix must CREATE — a migration, a new test module — goes in
+  `new_files`, never in `files`. `files` plus `new_files` together are at most 5.
+- Never name a directory (`db/migrations`, `tests/unit`). A directory is not a
+  file to change, and claiming one collides with every other worktree editing a
+  file under it. Name the concrete path, including the exact new filename.
 - `verification_command` must be the brief's success command unless an oracle
   lens made a specific case for a stricter registered one.
 - `do_not_touch` must include anything that measures the gap — the gate code,
@@ -27,7 +31,8 @@ Write one JSON object to the requested output path, no fences:
 
 {
   "candidate_id": "<copy the brief's candidate_id exactly>",
-  "files": ["repo-relative paths — 5 at most"],
+  "files": ["repo-relative paths that exist today"],
+  "new_files": ["repo-relative paths the fix creates — may be empty"],
   "change_summary": "3-5 sentences a competent implementer can act on: what changes, where, and why it closes the gap.",
   "root_cause": "1-3 sentences: the mechanism, as the panel best established it.",
   "ac_ids": ["AC1", "AC2", "AC3"],

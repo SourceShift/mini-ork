@@ -98,6 +98,7 @@ SELECT_CODES: tuple[str, ...] = (
     "candidate_not_in_harvest",
     "panel_invented_file",
     "bad_path",
+    "directory_scope",
     "empty_scope",
     "frozen_path",
     "self_edit_of_gate",
@@ -183,10 +184,16 @@ class Proposal:
     ``from_mapping`` tolerates the field names the lens/suggest prompts actually
     emit (``change_summary`` vs ``summary``, ``files_to_touch`` vs ``files``),
     because a shape mismatch should surface as a filter code, not a crash.
+
+    ``new_files`` is the one place a path that does not exist yet is legitimate:
+    a fix whose correct shape *is* a new file — a migration, a new test module.
+    Keeping it separate from ``files`` is what keeps ``panel_invented_file``
+    honest, because every path in ``files`` must exist today.
     """
 
     candidate_id: str
     files: tuple[str, ...] = ()
+    new_files: tuple[str, ...] = ()
     summary: str = ""
     root_cause: str = ""
     ac_ids: tuple[str, ...] = ()
@@ -205,6 +212,9 @@ class Proposal:
         files_raw = _first("files", "files_to_touch", "scope_files") or ()
         if isinstance(files_raw, str):
             files_raw = [files_raw]
+        new_raw = _first("new_files", "files_to_create", "create_files") or ()
+        if isinstance(new_raw, str):
+            new_raw = [new_raw]
         dont_raw = _first("do_not_touch", "constraints") or ()
         if isinstance(dont_raw, str):
             dont_raw = [dont_raw]
@@ -214,6 +224,7 @@ class Proposal:
         return cls(
             candidate_id=str(raw.get("candidate_id") or ""),
             files=tuple(str(f) for f in files_raw),
+            new_files=tuple(str(f) for f in new_raw),
             summary=str(_first("summary", "change_summary", "title") or ""),
             root_cause=str(_first("root_cause", "why", "diagnosis") or ""),
             ac_ids=tuple(str(a) for a in ac_raw),
@@ -379,11 +390,15 @@ def select(
                        f"severity {cand.severity} < {cfg.queue.min_severity}")
 
     files: list[str] = []
-    for raw in proposal.files:
+    declared_new: set[str] = set()
+    for raw, is_new in [(f, False) for f in proposal.files] + [
+            (f, True) for f in proposal.new_files]:
         clean = normalize_repo_path(raw)
         if clean is None:
             return _reject(cand.candidate_id, "bad_path",
                            f"{raw!r} is not a repo-relative file path")
+        if is_new:
+            declared_new.add(clean)
         if clean not in files:
             files.append(clean)
     if not files:
@@ -392,7 +407,21 @@ def select(
 
     root = Path(ctx.root)
     for path in files:
-        if not (root / path).exists():
+        target = root / path
+        if target.is_dir():
+            # A directory is not a file to change, and claiming one is a
+            # prefix claim that collides with every sibling worktree editing
+            # any file under it. Name the concrete paths instead.
+            return _reject(cand.candidate_id, "directory_scope",
+                           f"{path} is a directory; name the files the change touches")
+        if path in declared_new:
+            if target.exists():
+                declared_new.discard(path)  # already there — an ordinary file
+            elif not target.parent.is_dir():
+                return _reject(cand.candidate_id, "panel_invented_file",
+                               f"{path} would be created under a directory that "
+                               "does not exist")
+        elif not target.exists():
             return _reject(cand.candidate_id, "panel_invented_file",
                            f"{path} does not exist in the target repo")
 
@@ -441,7 +470,8 @@ def select(
                 return _reject(cand.candidate_id, "worktree_claim_conflict",
                                f"{path} overlaps '{claimed}' held by '{slug}'")
 
-    kickoff = build_kickoff(cand, proposal, verification_command=success, files=tuple(files))
+    kickoff = build_kickoff(cand, proposal, verification_command=success,
+                            files=tuple(files), new_files=tuple(sorted(declared_new)))
     return Selection(
         candidate_id=cand.candidate_id,
         accepted=True,
@@ -470,6 +500,7 @@ def build_kickoff(
     *,
     verification_command: str,
     files: Sequence[str],
+    new_files: Sequence[str] = (),
 ) -> str:
     """Render the implementer kickoff. Deterministic: same input, same bytes.
 
@@ -525,7 +556,10 @@ def build_kickoff(
         "",
         "## Files in scope",
         "",
-        _bullets(f"`{path}`" for path in files),
+        # "(new)" is the literal marker ``kickoff_lint`` recognises to skip its
+        # existence check — spell it exactly, or the emitted kickoff warns.
+        _bullets(f"`{path}`" + (" (new)" if path in new_files else "")
+                 for path in files),
         "",
         "## Out of scope",
         "",
