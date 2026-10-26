@@ -815,6 +815,50 @@ _check("scope-respected",
        "diff files respect the kickoff's declared file scope",
        _scope_respected)
 
+
+def _no_test_gaming():
+    """Fail a diff whose production code detects or patches the test harness.
+
+    eco6 K10 (spec-suite detection + a pytest MonkeyPatch shim) and K12 (an
+    import-time write into scheduler._RETRY_COLUMNS) passed every other check
+    here. mini_ork.verify.gaming_scan reads ADDED lines of non-test .py files and
+    the patched copy (for the cross-module-write AST rule). A kickoff line
+    ``Allow-test-probe: <path>`` exempts one path; the implementer cannot write
+    it, because the kickoff is frozen at launch. An engine without the scanner
+    fails closed.
+    """
+    try:
+        from mini_ork.verify import gaming_scan  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        _ev.write(f"  gaming_scan unavailable in this engine: {exc}\n")
+        return False
+    try:
+        with open(DIFF, encoding="utf-8", errors="replace") as fh:
+            diff_text = fh.read()
+    except OSError as exc:
+        _ev.write(f"  cannot read {DIFF}: {exc}\n")
+        return False
+
+    def _read(rel):
+        try:
+            with open(os.path.join(WORKTREE, rel), encoding="utf-8") as fh:
+                return fh.read()
+        except (OSError, UnicodeDecodeError):
+            return None
+
+    allowed = gaming_scan.kickoff_allowances(_read_kickoff_text())
+    findings = gaming_scan.scan_diff(diff_text, read_file=_read, allowed_paths=allowed)
+    for f in findings:
+        _ev.write(f"  {f.path}:{f.line}: {f.rule}: {f.text}\n")
+    if allowed:
+        _ev.write("  kickoff allows: " + ", ".join(sorted(allowed)) + "\n")
+    return not findings
+
+
+_check("no-test-gaming",
+       "diff adds no test-harness detection or cross-module patching to production code",
+       _no_test_gaming)
+
 # Build the changed-files list (static-check owns files_changed) and capture count.
 _changed_files()
 files_changed_count = len(_changed_file_lines())
