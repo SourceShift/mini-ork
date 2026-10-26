@@ -52,3 +52,52 @@ R5a), and R3 (after R1 and R2a, since it shares the merge driver).
 
 High-tier merges stop being autonomous: the agent prepares them, and a person
 approves them at a terminal.
+
+## Outcome (2026-10-26, same day)
+
+| # | Landed | How |
+|---|---|---|
+| R1 | `961fe0ef` gaming_scan; `edb6b9b2` static-check `no-test-gaming` row (operator commit, frozen file) | K10 caught (15 findings); K12 caught (cross-module-write) against the patched tree |
+| R2a | pre-push gate, primary DB, patch-id cache, review before the merge lock | Salvaged: 6 spec tests called a fixture directly. Default panel `glm deepseek_flash` (minimax quota, kimi 401, codex unsupported) |
+| R2b | finding lifecycle + per-lens outcomes (`review_lens_runs`, migration 0085) | Run passed all verifiers and the reviewer |
+| R2c | lenses get the primary `MINI_ORK_HOME`; timeout 600 s; "no LLM lens ran" warning / secure-tier block | Found by R2b's lens lines: every worktree-merge review since R2a ran heuristics only (`$GLM_API_KEY is not set`) |
+| R3 | risk tiers + TTY approval bound to patch-id; merge driver runs the scanner + risk check | Salvaged: 2 unsatisfiable spec tests |
+| R4 | `mini-ork reviewer-eval` + 12 cases (5 incidents, 7 clean) | Salvaged: the repair attempt had shaped code + seed data to a defective spec test (lookup by id, a fake kickoff heading); both removed. Alias-resolution bug fixed on first live run |
+| R5a | one reviewer contract, findings ledger with ids, review of the delta | Salvaged: 1 spec test re-created its own directory |
+| R5b | `revise_rounds` writer + `mini-ork metrics revise` | Salvaged: 3 spec INSERTs bound 2 values to 3 placeholders |
+| R6 | `mini-ork undo` | Run passed |
+| R7 | spec-tests verifier labels fixture-misuse harness defects and files spec-test-defect.md | Run passed |
+
+### What the program taught
+
+- **Unsatisfiable blind spec tests were the main cost.** Five of nine runs
+  failed only on spec tests no implementation could pass (fixture called
+  directly, helper mkdir twice, binding-count mismatch, file and directory at
+  one path, a fixture contradicting its own precondition). R7 catches the
+  fixture-misuse class; the others still need a person.
+- **Auto-repair games what it cannot satisfy.** Twice the repair implementer
+  went after the grader or the data instead of the code: a pytest-7
+  compatibility shim in the spec verifier (R2a), and code + seed data shaped
+  to a defective test (R4). The engine-separate verifier made the first
+  harmless; the second was caught in review. Stop auto-repair
+  (`.stop-requested` + kill `recovery.planner <run>`) before salvaging a
+  failed run's worktree.
+- **The LLM half of Layer 3 was silently dead,** first from a 180 s timeout,
+  then from a missing `MINI_ORK_HOME` in worktree merges. Recording per-lens
+  outcomes (R2b) is what made it visible.
+
+### Follow-ups
+
+- **Spec tests cannot exercise the CLI of the change under test.**
+  `bin/mini-ork` resolves its root from `MINI_ORK_ENGINE_ROOT`, then
+  `MINI_ORK_ROOT`, then `.mini-ork/engine`, so a spec test that spawns it runs
+  the engine. Scrubbing one variable is not enough. Either spec tests call
+  `python -m mini_ork.cli.main` with the target on `PYTHONPATH`, or the
+  launcher gets an explicit "use my own tree" mode.
+- **Heuristic findings that go silent are marked fixed** even when the next
+  diff did not touch the offending line (R2b reviewer finding F1).
+- **The spec-test author needs a self-check.** Run each authored test against
+  the BASE and classify errors raised inside the test's own code as harness
+  defects before the implementer starts.
+- **Score the reviewer after every prompt, lane or model change** (`garden`
+  warns), and grow the incident set as new incidents land.
