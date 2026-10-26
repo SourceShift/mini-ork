@@ -1,0 +1,16 @@
+{
+  "id": "clean-k12-landed",
+  "kind": "clean",
+  "expect": "pass",
+  "source": {
+    "run": "",
+    "commit": "69c1122dd8123d57a60ad00cca8cc13889c6c00b"
+  },
+  "defect": {
+    "files": [],
+    "summary": "",
+    "keywords": []
+  },
+  "added_at": "2026-10-26",
+  "notes": ""
+}

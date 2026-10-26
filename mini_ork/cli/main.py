@@ -183,6 +183,8 @@ Lifecycle:
   verifier list|annotate         Inspect verifier results and label false
                                    positives/negatives (abstain-gate calibration)
   recipe-eval                    Static evaluation of recipe definitions
+  reviewer-eval [list|add-case|run|status|score]
+                                   Score the framework-edit reviewer on incidents + clean changes.
   version
 
 Coordination:
@@ -2662,6 +2664,9 @@ def _build_default_registry() -> dict:
     # "recipe-eval" is native too, but the dash is not importable in a module
     # name — register it explicitly against mini_ork.cli.recipe_eval.
     registry["recipe-eval"] = _native_module_handler("mini_ork.cli.recipe_eval")
+    # "reviewer-eval" — same dash-not-importable case; scores the framework-edit
+    # reviewer against incidents + clean changes.
+    registry["reviewer-eval"] = _native_module_handler("mini_ork.cli.reviewer_eval_cmd")
     # "sandbox-gc" — same dash-not-importable case; sweeps leaked sandboxes.
     registry["sandbox-gc"] = _native_module_handler("mini_ork.cli.sandbox_gc")
     registry["execute"] = _execute_inprocess

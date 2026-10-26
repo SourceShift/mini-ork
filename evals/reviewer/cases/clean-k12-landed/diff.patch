@@ -1,0 +1,339 @@
+diff --git a/mini_ork/cli/epics.py b/mini_ork/cli/epics.py
+index da585745..1615b3ab 100644
+--- a/mini_ork/cli/epics.py
++++ b/mini_ork/cli/epics.py
+@@ -2,7 +2,8 @@
+ 
+ Strangler-fig parity port of the subcommand CLI: ingest (roadmap md → epics +
+ epic_dependencies + auto-block), split (per-epic kickoff files + kickoff_path),
+-list, ready (via ported epic_graph), show, priority. Every `## <title>`
++list, ready (via ported epic_graph), show, priority, archive (hide an epic
++that will never run by setting ``epics.archived_at``). Every `## <title>`
+ heading becomes an epic unless it ends with `(no-epic)`, `(context)`, or
+ `(ignore)`. Dependency lists split on commas only; each token resolves by exact
+ id, slugified exact id, unique slug prefix, then unique slug substring against
+@@ -61,6 +62,7 @@ _USAGE = """Usage: mini-ork epics <subcommand> [args]
+   status <epic_id> <new_status> --note TEXT
+                                Set an allowed status and record why in --note;
+                                'done' runs the scheduler's dependency cascade.
++  archive <epic_id> --note TEXT   Hide an epic that will never run (sets archived_at)
+ 
+ Roadmap per-epic settings (under an epic's heading, applied by ingest):
+   - recipe: <name>
+@@ -453,6 +455,82 @@ def _status(rest: list[str], db: str) -> int:
+     return 0
+ 
+ 
++def _archive(rest: list[str], db: str) -> int:
++    """`epics archive <epic_id> --note TEXT`.
++
++    Hide an epic that will never run. Sets ``epics.archived_at`` — the column
++    the scheduler's ready set (``scheduler.pick_ready``), the epic graph, the
++    supervisor and ``epics list`` already filter on — and records the
++    operator's reason in ``notes``.
++
++    ``status`` is NOT touched: the epic keeps the status it had, so the audit
++    trail still says what it was, and ``trg_epics_no_revert_done`` stays
++    satisfied (the trigger only fires for an UPDATE that lists ``status``).
++
++    Checks, in order:
++      * ``--note`` missing or whitespace-only → rc 2, the DB is untouched.
++      * unknown extra arguments → rc 2, the DB is untouched.
++      * unknown epic id → rc 1.
++      * an epic that is ``in progress`` → rc 1 (its run has to stop first).
++      * an already-archived epic → rc 0, a no-op: the stored timestamp is
++        reported and no second note is appended.
++    """
++    epic_id = rest[0]
++    note = None
++    unknown: list[str] = []
++    i = 1
++    while i < len(rest):
++        arg = rest[i]
++        if arg == "--note":
++            note = rest[i + 1] if i + 1 < len(rest) else None
++            i += 2 if i + 1 < len(rest) else 1
++        else:
++            unknown.append(arg)
++            i += 1
++    if note is None or not note.strip():
++        sys.stderr.write("archive: --note is required\n")
++        return 2
++    if unknown:
++        sys.stderr.write(f"archive: unknown argument(s): {' '.join(unknown)}\n")
++        return 2
++    note = note.strip()
++
++    con = sqlite3.connect(db)
++    try:
++        con.execute("PRAGMA busy_timeout=5000")
++        row = con.execute(
++            "SELECT status, notes, archived_at FROM epics WHERE id=?", (epic_id,)).fetchone()
++        if not row:
++            sys.stderr.write(f"archive: no such epic: {epic_id}\n")
++            return 1
++        status, old_notes, archived_at = row
++        if status == "in progress":
++            sys.stderr.write(
++                f"archive: {epic_id} is in progress — stop its run first\n")
++            return 1
++        if archived_at is not None:
++            sys.stdout.write(f"{epic_id} already archived at {archived_at}\n")
++            return 0
++        # ONE statement, so the timestamp and the note land together (or not
++        # at all): ``status`` is absent from the SET list on purpose.
++        notes = (old_notes or "") + f" [operator: archived: {note}]"
++        cur = con.execute(
++            "UPDATE epics SET archived_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), "
++            "notes=? WHERE id=? AND archived_at IS NULL", (notes, epic_id))
++        if cur.rowcount == 0:
++            # Another operator archived it between the read and the write.
++            ts = con.execute(
++                "SELECT archived_at FROM epics WHERE id=?", (epic_id,)).fetchone()[0]
++            sys.stdout.write(f"{epic_id} already archived at {ts}\n")
++            return 0
++        con.commit()
++    finally:
++        con.close()
++
++    sys.stdout.write(f"archived {epic_id} (status {status})\n")
++    return 0
++
++
+ def _path_hints(body):
+     p = re.findall(r"`([a-z_][\w./-]*\.(?:sh|py|sql|md|yaml|yml|json|ts|tsx|js|jsx))`", body, re.I)
+     p += re.findall(r"`(bin/[\w-]+)`", body)
+@@ -606,6 +684,10 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
+         if not rest:
+             sys.stderr.write("status: epic_id required\n"); return 2
+         return _status(rest, db)
++    if sub == "archive":
++        if not rest:
++            sys.stderr.write("archive: epic_id required\n"); return 2
++        return _archive(rest, db)
+     if sub in ("help", "--help", "-h"):
+         sys.stdout.write(_USAGE); return 0
+     sys.stderr.write(f"Unknown subcommand: {sub}\n"); sys.stdout.write(_USAGE); return 2
+diff --git a/mini_ork/scheduler.py b/mini_ork/scheduler.py
+index 7199d166..2fa1443f 100644
+--- a/mini_ork/scheduler.py
++++ b/mini_ork/scheduler.py
+@@ -121,6 +121,11 @@ _RETRY_COLUMNS = (
+     ("last_run_id", "TEXT"),
+     # "<host>:<pid>" of the scheduler that claimed the epic; see reclaim_stale.
+     ("claimed_by", "TEXT"),
++    # pick_ready orders by priority. Without it here, a DB that never ran the
++    # epics CLI's ensure_priority_column made the ready-set query raise, which
++    # pick_ready swallows into an EMPTY ready set — a full queue reported as
++    # "nothing to dispatch".
++    ("priority", "INTEGER NOT NULL DEFAULT 0"),
+ )
+ 
+ 
+diff --git a/tests/unit/test_eco6_k12_epics_archive.py b/tests/unit/test_eco6_k12_epics_archive.py
+new file mode 100644
+index 00000000..01190b08
+--- /dev/null
++++ b/tests/unit/test_eco6_k12_epics_archive.py
+@@ -0,0 +1,201 @@
++"""Unit tests: `mini-ork epics archive` (ECOSYSTEM §6 K12).
++
++The operator verb that closes an epic that will never run: it sets
++``epics.archived_at`` — the column the scheduler's ready set, the epic graph,
++the supervisor and `epics list` already filter on — and records why in
++``notes``, WITHOUT touching ``status`` (so `trg_epics_no_revert_done` stays
++satisfied).
++
++Hermetic temp sqlite built straight from the repo migrations (0001_core for
++`epics` + its status CHECK/triggers, 0027 for `epic_dependencies`) plus
++`scheduler.ensure_retry_schema` for the runtime retry columns. Epics `a`
++('not started'), `b` ('in progress') and `c` ('done') are seeded; the command
++runs in process via `epics.main(..., db=..., root=...)`.
++"""
++from __future__ import annotations
++
++import re
++import sqlite3
++from contextlib import redirect_stderr, redirect_stdout
++from io import StringIO
++from pathlib import Path
++
++import pytest
++
++from mini_ork import scheduler
++from mini_ork.cli import epics as ep
++
++REPO = Path(__file__).resolve().parents[2]
++
++# strftime('%Y-%m-%dT%H:%M:%fZ','now') -> 2026-10-25T11:34:56.789Z
++_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
++
++
++def _init_db(tmp_path: Path) -> str:
++    db = str(tmp_path / "state.db")
++    con = sqlite3.connect(db)
++    try:
++        for name in ("0001_core.sql", "0027_epic_dependencies.sql"):
++            con.executescript((REPO / "db" / "migrations" / name).read_text(encoding="utf-8"))
++        con.commit()
++    finally:
++        con.close()
++    scheduler.ensure_retry_schema(db)
++    scheduler.ensure_priority_column(db)
++    con = sqlite3.connect(db)
++    try:
++        con.execute("INSERT INTO epics(id, title, status) VALUES('a', 'Epic A', 'not started')")
++        con.execute("INSERT INTO epics(id, title, status, notes) "
++                    "VALUES('b', 'Epic B', 'in progress', 'keep')")
++        con.execute("INSERT INTO epics(id, title, status, notes) "
++                    "VALUES('c', 'Epic C', 'done', 'pre-existing')")
++        con.commit()
++    finally:
++        con.close()
++    return db
++
++
++@pytest.fixture()
++def db(tmp_path):
++    return _init_db(tmp_path)
++
++
++def _run(db: str, tmp_path, *args):
++    """Invoke the CLI in process, capturing stdout/stderr."""
++    out, err = StringIO(), StringIO()
++    with redirect_stdout(out), redirect_stderr(err):
++        rc = ep.main(["archive", *args], db=db, root=str(tmp_path))
++    return rc, out.getvalue(), err.getvalue()
++
++
++def _row(db: str, epic_id: str):
++    con = sqlite3.connect(db)
++    try:
++        return con.execute(
++            "SELECT status, notes, archived_at FROM epics WHERE id=?",
++            (epic_id,)).fetchone()
++    finally:
++        con.close()
++
++
++def _list_ids(db: str, tmp_path) -> set[str]:
++    out = StringIO()
++    with redirect_stdout(out):
++        assert ep.main(["list"], db=db, root=str(tmp_path)) == 0
++    return {line.split("|")[0].strip() for line in out.getvalue().splitlines() if "|" in line}
++
++
++def test_archive_happy_path(db, tmp_path):
++    """Sets archived_at, keeps `status`, appends the operator note."""
++    rc, out, err = _run(db, tmp_path, "a", "--note", "obsolete")
++    assert rc == 0, err
++    assert "archived a (status not started)" in out
++    status, notes, archived_at = _row(db, "a")
++    assert status == "not started"
++    assert archived_at is not None and _TS_RE.match(archived_at), archived_at
++    assert notes is not None and notes.endswith("[operator: archived: obsolete]"), notes
++    assert "None" not in notes  # NULL notes handled, not stringified
++
++
++def test_archive_hides_epic_from_list(db, tmp_path):
++    """`epics list` no longer shows an archived epic."""
++    assert "a" in _list_ids(db, tmp_path)
++    rc, _out, err = _run(db, tmp_path, "a", "--note", "obsolete")
++    assert rc == 0, err
++    ids = _list_ids(db, tmp_path)
++    assert "a" not in ids
++    assert "b" in ids  # only the archived row disappears
++
++
++def test_archive_removes_epic_from_ready_set(db, tmp_path):
++    """The scheduler's ready set stops offering an archived epic.
++
++    The control assertion matters: both ready-set readers swallow DB errors
++    and return [], so "a is gone" would also hold for a database whose schema
++    the query cannot read at all.
++    """
++    assert "a" in scheduler.pick_ready(db=db)
++    rc, _out, err = _run(db, tmp_path, "a", "--note", "obsolete")
++    assert rc == 0, err
++    assert "a" not in scheduler.pick_ready(db=db)
++
++
++def test_archive_done_epic_stays_done(db, tmp_path):
++    """A `done` epic keeps its status — the trigger only guards a revert."""
++    rc, out, err = _run(db, tmp_path, "c", "--note", "delivered elsewhere")
++    assert rc == 0, err
++    assert "archived c (status done)" in out
++    status, notes, archived_at = _row(db, "c")
++    assert status == "done"
++    assert archived_at is not None
++    assert notes.startswith("pre-existing")  # appended to, not replacing
++    assert notes.endswith("[operator: archived: delivered elsewhere]")
++
++
++def test_archive_refuses_in_progress_epic(db, tmp_path):
++    """An epic with a run going is refused; the row is untouched."""
++    rc, _out, err = _run(db, tmp_path, "b", "--note", "wont run")
++    assert rc == 1
++    assert "archive: b is in progress — stop its run first" in err
++    assert _row(db, "b") == ("in progress", "keep", None)
++
++
++def test_archive_requires_a_note(db, tmp_path):
++    """A missing or whitespace-only note is refused before the DB is touched."""
++    for args in (("a",), ("a", "--note", "   "), ("a", "--note")):
++        rc, _out, err = _run(db, tmp_path, *args)
++        assert rc == 2, args
++        assert "archive: --note is required" in err
++        assert _row(db, "a") == ("not started", None, None)
++
++
++def test_archive_unknown_epic(db, tmp_path):
++    """An unknown id is refused with rc 1."""
++    rc, _out, err = _run(db, tmp_path, "nope", "--note", "x")
++    assert rc == 1
++    assert "archive: no such epic: nope" in err
++
++
++def test_archive_twice_is_a_noop(db, tmp_path):
++    """Archiving an archived epic reports the stored timestamp and adds no note."""
++    rc, _out, err = _run(db, tmp_path, "a", "--note", "obsolete")
++    assert rc == 0, err
++    _status, first_notes, first_ts = _row(db, "a")
++
++    rc, out, err = _run(db, tmp_path, "a", "--note", "obsolete")
++    assert rc == 0, err
++    assert "already archived at" in out
++    assert first_ts in out
++
++    status, notes, archived_at = _row(db, "a")
++    assert archived_at == first_ts
++    assert notes == first_notes
++    assert notes.count("[operator: archived:") == 1
++
++
++def test_archive_rejects_unknown_arguments(db, tmp_path):
++    """Unknown extra arguments are refused with rc 2; the row is untouched."""
++    for args in (("a", "--note", "x", "--flag"), ("a", "bogus", "--note", "x")):
++        rc, _out, err = _run(db, tmp_path, *args)
++        assert rc == 2, args
++        assert "archive: unknown argument(s):" in err
++        assert _row(db, "a") == ("not started", None, None)
++
++
++def test_archive_requires_an_epic_id(db, tmp_path):
++    """`epics archive` with no id is refused with rc 2."""
++    err = StringIO()
++    with redirect_stderr(err):
++        rc = ep.main(["archive"], db=db, root=str(tmp_path))
++    assert rc == 2
++    assert "epic_id required" in err.getvalue()
++
++
++def test_usage_documents_archive(db, tmp_path):
++    """The usage block lists the new verb."""
++    out = StringIO()
++    with redirect_stdout(out):
++        assert ep.main(["help"], db=db, root=str(tmp_path)) == 0
++    text = out.getvalue()
++    assert "archive <epic_id> --note TEXT" in text
++    assert "Hide an epic that will never run (sets archived_at)" in text

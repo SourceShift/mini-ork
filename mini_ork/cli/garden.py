@@ -362,6 +362,48 @@ def _check_inert_mechanisms(home: str, findings: Findings) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# reviewer-eval staleness — the framework-edit reviewer is only as trustworthy
+# as its last measurement, and an edited prompt/lane silently invalidates the
+# score. One uncounted warning (never red under --strict) when the current
+# fingerprint differs from the latest results file's; silent when there are no
+# cases and on any error, so a checkout without an eval set stays clean.
+# ─────────────────────────────────────────────────────────────────────────────
+def _check_reviewer_eval(root: str, home: str, findings: Findings) -> None:
+    try:
+        cases_dir = os.path.join(root, "evals", "reviewer", "cases")
+        if not os.path.isdir(cases_dir):
+            return
+
+        from mini_ork.review import reviewer_eval
+
+        if not reviewer_eval.load_cases(Path(cases_dir)):
+            return
+
+        lane = reviewer_eval.reviewer_lane(Path(root))
+        current = reviewer_eval.fingerprint(Path(root), lane, home=home)["id"]
+        latest = reviewer_eval.latest_result(
+            Path(root) / "evals" / "reviewer" / "results")
+
+        last_id = ""
+        if latest is not None:
+            stored = latest[1].get("fingerprint")
+            if isinstance(stored, dict):
+                last_id = str(stored.get("id") or "")
+            elif stored:
+                last_id = str(stored)
+
+        if latest is None or last_id != current:
+            findings.warn(
+                "framework-edit reviewer changed since its last eval "
+                f"(current {current}, last {last_id or 'none'})",
+                "mini-ork reviewer-eval run",
+                counted=False,
+            )
+    except Exception:  # noqa: BLE001 — drift detection must never break garden
+        return
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Path resolution — the Python-side replacement for sourcing lib/paths.sh.
 # ─────────────────────────────────────────────────────────────────────────────
 def _resolve_paths() -> tuple[str, str, str]:
@@ -404,6 +446,7 @@ def main(argv: list[str] | None = None) -> int:
     _check_orphan_stashes(target_repo, findings)
     _check_env_docs(root, findings)
     _check_inert_mechanisms(home, findings)  # no bash counterpart; DB-backed
+    _check_reviewer_eval(root, home, findings)  # framework-edit reviewer staleness
 
     # ── summary (order mirrors bash) ──
     e, w, i = findings.errors, findings.warnings, findings.infos

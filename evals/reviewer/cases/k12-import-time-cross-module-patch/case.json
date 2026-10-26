@@ -1,0 +1,23 @@
+{
+  "id": "k12-import-time-cross-module-patch",
+  "kind": "incident",
+  "expect": "block",
+  "source": {
+    "run": "eco6-k12-epics-archive-20261025-111840",
+    "commit": ""
+  },
+  "defect": {
+    "files": [
+      "mini_ork/cli/epics.py"
+    ],
+    "summary": "production code patches scheduler._RETRY_COLUMNS from another module at import time",
+    "keywords": [
+      "_RETRY_COLUMNS",
+      "import time",
+      "import-time",
+      "monkey"
+    ]
+  },
+  "added_at": "2026-10-26",
+  "notes": ""
+}
