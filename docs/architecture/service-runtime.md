@@ -96,6 +96,7 @@ Every route except `/v1/health` requires the node bearer token.
 | `GET` | `/v1/services` | `{"services": [...]}` |
 | `GET` | `/v1/services/{sid}` | one service + per-replica `state` |
 | `DELETE` | `/v1/services/{sid}` | `{"deleted": sid}` |
+| `DELETE` | `/v1/networks/{name}` | `{"name", "removed"}`; `removed: false` when already gone, `409` while containers hold it |
 | `POST` | `/v1/services/{sid}/restart` | status after `docker restart` |
 | `GET` | `/v1/services/{sid}/logs?tail=N` | merged logs, `N` clamped to 1..5000 |
 | `GET` | `/v1/services/{sid}/logs/stream?tail=N&replica=R` | live NDJSON tail, one frame per line, then an `eof` frame per replica |
@@ -563,6 +564,14 @@ Rules:
 - **The node creates the network if it is missing.** `docker network inspect`
   decides; a second deploy joins what the first created and never re-creates
   it. The caller never runs Docker commands.
+- **Removal is explicit and idempotent.** `DELETE /v1/networks/{name}` inspects
+  first and answers `removed: false` when the network is already gone, so the
+  control plane can retry a teardown after a partial success. Docker refuses to
+  remove a network with attached containers; that is `409`, not an outage — the
+  caller removes services first and retries. Any other daemon refusal is `502`.
+  The node never sweeps: it removes the name it was given and nothing else,
+  because which networks belong to which environment is the control plane's
+  ledger, and a node that guessed could take a peer's network down.
 - **The driver is the node's choice, and a bad one fails closed.**
   `MO_NODE_NETWORK_DRIVER` is `bridge` by default (one host) or `overlay` on a
   Docker swarm (one name across the fleet). An unknown value, or a daemon that
@@ -633,6 +642,13 @@ samples, that a stopped replica is omitted while `replicas_total` still
 reports it, that an unreadable field becomes `null` rather than `0`, that a
 non-zero exit keeps the lines it got, that a failure with no parseable line is
 a `500`, and that an unknown service is `404`.
+
+For private networks it asserts the created network name and driver, that a
+second service joins instead of re-creating, that an unknown driver fails
+before any container starts, and — for removal — that an empty network is
+removed once, that a second delete answers `removed: false` without calling
+`docker network rm`, that attached containers are a `409` and the network
+survives, and that a daemon refusal is a `502`.
 
 For the live tail it asserts the composed argv (`--follow`, `--timestamps`,
 the clamped `--tail`, one child per requested replica), the NDJSON frames

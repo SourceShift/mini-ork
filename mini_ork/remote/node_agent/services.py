@@ -480,6 +480,15 @@ class SnapshotTooLargeError(ServiceError):
     """An imported body exceeds ``MO_NODE_SNAPSHOT_MAX_BYTES``."""
 
 
+class NetworkInUseError(ServiceError):
+    """Docker refused to remove a network because containers still hold it.
+
+    An ordering mistake by the caller — services must be removed first — not
+    an infrastructure failure, so the control plane can retry the teardown
+    once its own containers are gone instead of believing the node is down.
+    """
+
+
 class ServiceRestartFailedError(RuntimeError):
     """A quiesced snapshot exists, but a replica did not come back up.
 
@@ -1443,6 +1452,39 @@ class ServiceManager:
         self._save()
         return True
 
+    def remove_network(self, name: str) -> bool:
+        """Remove an environment network this node no longer needs.
+
+        Idempotent by inspection, like ``_ensure_network``: a network that is
+        already gone returns ``False`` instead of failing, because a control
+        plane retrying a teardown after a partial success is being correct, not
+        making a mistake. A network still holding containers is a different
+        thing — Docker refuses the removal, and the caller must delete those
+        containers first. That surfaces as a conflict rather than an outage.
+
+        The node removes only networks it was asked to remove. It does not
+        sweep: which networks belong to which environment is the control
+        plane's ledger, and a node that guessed could take a peer's network
+        down. The name is held to the same leaf shape as on create, so it can
+        never reach ``docker network rm`` as a flag or a path.
+        """
+        if not isinstance(name, str) or not _NETWORK_NAME_RE.match(name):
+            raise ServiceError(f"invalid network name {name!r}")
+        result = self._run(["docker", "network", "inspect", name])
+        if int(getattr(result, "returncode", 1)) != 0:
+            return False
+        result = self._run(["docker", "network", "rm", name])
+        if int(getattr(result, "returncode", 1)) != 0:
+            stderr = (getattr(result, "stderr", "") or "").strip()
+            stdout = (getattr(result, "stdout", "") or "").strip()
+            detail = stderr or stdout or f"exit {result.returncode}"
+            if "active endpoints" in detail:
+                raise NetworkInUseError(
+                    f"network {name!r} still has attached containers: {detail}"
+                )
+            raise RuntimeError(f"docker network rm failed ({result.returncode}): {detail}")
+        return True
+
     def restart(self, service_id: str) -> dict[str, Any]:
         spec = self._specs.get(service_id)
         if spec is None:
@@ -1866,6 +1908,24 @@ def make_router(
             raise HTTPException(404, f"unknown service {sid!r}")
         return {"deleted": sid}
 
+    @router.delete("/v1/networks/{name}")
+    def delete_network(name: str, _: None = Depends(bearer)) -> dict:
+        """Remove an environment network. ``removed`` is false when it was already gone.
+
+        The 409 is the honest one: Docker will not detach containers for you,
+        so a teardown that races its own container removal gets a retryable
+        conflict rather than a 200 that hides a network still in use.
+        """
+        try:
+            removed = services.remove_network(name)
+        except NetworkInUseError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except ServiceError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(502, str(exc)) from exc
+        return {"name": name, "removed": removed}
+
     @router.post("/v1/services/{sid}/restart")
     def restart_service(sid: str, _: None = Depends(bearer)) -> dict:
         try:
@@ -2076,6 +2136,7 @@ def make_router(
 
 
 __all__ = [
+    "NetworkInUseError",
     "ServiceError",
     "ServiceManager",
     "ServiceSpec",

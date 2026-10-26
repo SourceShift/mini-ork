@@ -45,7 +45,12 @@ class _Docker:
         self.finished: dict[str, str] = {}
         self.networks: set[str] = set()
         self.network_creates: list[list[str]] = []
+        self.network_removes: list[list[str]] = []
         self.fail_network: str | None = None
+        #: ``"in_use"`` reproduces Docker refusing a network with containers
+        #: attached; ``"daemon"`` a daemon-level refusal. Both are exit 1, so
+        #: the manager has to read the reason rather than the code.
+        self.fail_network_rm: str | None = None
         self.fail_on: str | None = None
         self.fail_stop: str | None = None
         self.fail_start: str | None = None
@@ -108,6 +113,26 @@ class _Docker:
             self.networks.add(argv[-1])
             self.network_creates.append(argv)
             r.stdout = argv[-1]
+            return r
+
+        if argv[:3] == ["docker", "network", "rm"]:
+            name = argv[-1]
+            if self.fail_network_rm == "in_use":
+                r.returncode = 1
+                r.stderr = (
+                    f"Error response from daemon: network {name} has active endpoints"
+                )
+                return r
+            if self.fail_network_rm == "daemon":
+                r.returncode = 1
+                r.stderr = "Error response from daemon: operation is not permitted"
+                return r
+            if name not in self.networks:
+                r.returncode = 1
+                r.stderr = f"Error response from daemon: network {name} not found"
+                return r
+            self.networks.discard(name)
+            self.network_removes.append(argv)
             return r
 
         if argv[:2] == ["docker", "inspect"]:
@@ -1786,3 +1811,78 @@ def test_aliases_survive_the_state_file(client, tmp_path):
     data = json.loads((tmp_path / "services.json").read_text(encoding="utf-8"))
     assert data["services"][0]["network"] == NETWORK
     assert data["services"][0]["network_aliases"] == ALIASES
+
+
+def test_delete_network_removes_an_empty_network(client, docker):
+    client.post(
+        "/v1/services",
+        json=_spec(network=NETWORK, network_aliases=["db"]),
+        headers=AUTH,
+    )
+    assert NETWORK in docker.networks
+
+    r = client.delete(f"/v1/networks/{NETWORK}", headers=AUTH)
+
+    assert r.status_code == 200, r.text
+    assert r.json() == {"name": NETWORK, "removed": True}
+    assert docker.network_removes == [["docker", "network", "rm", NETWORK]]
+    assert NETWORK not in docker.networks
+
+
+def test_delete_network_is_idempotent_when_it_is_already_gone(client, docker):
+    # No network on this node — a teardown retried after a partial success
+    # must not fail, and must not run rm on something it did not inspect.
+    r = client.delete(f"/v1/networks/{NETWORK}", headers=AUTH)
+
+    assert r.status_code == 200, r.text
+    assert r.json() == {"name": NETWORK, "removed": False}
+    assert docker.network_removes == []
+    assert ["docker", "network", "inspect", NETWORK] in docker.calls
+    assert ["docker", "network", "rm", NETWORK] not in docker.calls
+
+
+def test_delete_network_with_containers_attached_is_409(client, docker):
+    client.post(
+        "/v1/services",
+        json=_spec(network=NETWORK, network_aliases=["db"]),
+        headers=AUTH,
+    )
+    docker.fail_network_rm = "in_use"
+
+    r = client.delete(f"/v1/networks/{NETWORK}", headers=AUTH)
+
+    assert r.status_code == 409
+    assert "active endpoints" in r.json()["detail"]
+    # The network stays: a 409 that removed it anyway would lie.
+    assert NETWORK in docker.networks
+
+
+def test_a_daemon_refusal_to_delete_a_network_is_502(client, docker):
+    client.post(
+        "/v1/services",
+        json=_spec(network=NETWORK, network_aliases=["db"]),
+        headers=AUTH,
+    )
+    docker.fail_network_rm = "daemon"
+
+    r = client.delete(f"/v1/networks/{NETWORK}", headers=AUTH)
+
+    assert r.status_code == 502
+    assert "network rm failed" in r.json()["detail"]
+    assert NETWORK in docker.networks
+
+
+@pytest.mark.parametrize("name", ["Bad_Name", "-net", "a/b", "net.name", ""])
+def test_delete_network_rejects_a_name_that_is_not_a_leaf(client, docker, name):
+    r = client.delete(f"/v1/networks/{name}", headers=AUTH)
+
+    # A name with a slash fails routing because {name} stops at the segment;
+    # the rest must be refused before Docker sees them.
+    assert r.status_code in (400, 404)
+    assert docker.network_removes == []
+    assert not any(c[:3] == ["docker", "network", "rm"] for c in docker.calls)
+
+
+def test_delete_network_requires_a_bearer(client):
+    r = client.delete(f"/v1/networks/{NETWORK}")
+    assert r.status_code in (401, 403)
