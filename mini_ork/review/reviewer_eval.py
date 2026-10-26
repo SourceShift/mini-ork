@@ -490,10 +490,16 @@ def run_case(case: Case, *, root: Path, lane: str, work_dir: Path,
 
     prompt = build_prompt(case, root=Path(root), review_file=str(review_file))
 
+    dispatch_lane = lane
     if dispatch_fn is None:
         from mini_ork.dispatch import llm_dispatch
 
         dispatch = llm_dispatch.mo_llm_dispatch
+        # mo_llm_dispatch's preflight knows providers.yaml lanes, not
+        # agents.yaml aliases: `opus_lens` is refused as an unknown lane. The
+        # executor resolves the alias before dispatch; so must the eval, or
+        # every case errors before the reviewer sees it (first run, 2026-10-26).
+        dispatch_lane = _resolved_lane(lane, Path(root), os.environ.get("MINI_ORK_HOME", ""))
     else:
         dispatch = dispatch_fn
 
@@ -507,7 +513,7 @@ def run_case(case: Case, *, root: Path, lane: str, work_dir: Path,
             # so a dispatch fake that only declares the required ones still
             # matches instead of raising a TypeError the harness would record as
             # a case error.
-            rc = dispatch(lane, prompt, str(out_txt),
+            rc = dispatch(dispatch_lane, prompt, str(out_txt),
                           timeout_s=timeout_s, max_turns=30)
         except Exception as exc:  # noqa: BLE001 — a crashed dispatch is a case error
             rc = None

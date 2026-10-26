@@ -659,3 +659,29 @@ def test_no_test_calls_a_real_lane():
     """Guard: the dispatch seam is always faked in this module."""
     source = Path(__file__).read_text()
     assert "mo_llm_dispatch" in source  # only ever monkeypatched
+
+
+def test_run_case_resolves_the_lane_alias_for_the_real_dispatcher(tmp_path, monkeypatch):
+    """mo_llm_dispatch refuses an agents.yaml alias (`opus_lens`) as an unknown
+    lane; the first live eval errored on every case. The eval must dispatch
+    the alias's family lane, as the executor does."""
+    from mini_ork.dispatch import llm_dispatch
+
+    root = make_framework_tree(tmp_path)
+    cases_dir = tmp_path / "cases"
+    write_case(cases_dir, "alias-case", kind="incident", defect=EPICS_DEFECT)
+    case = reviewer_eval.load_cases(cases_dir)[0]
+    seen = []
+
+    def fake_dispatch(lane, prompt, out_file, *args, **kwargs):
+        seen.append(lane)
+        Path(out_file).write_text('{"verdict": "pass", "findings": []}')
+        return 0
+
+    monkeypatch.setattr(llm_dispatch, "mo_llm_dispatch", fake_dispatch)
+    monkeypatch.setattr(llm_dispatch, "resolve_lane_family",
+                        lambda lane, root="", home="": {"opus_lens": "glm"}.get(lane, lane))
+    result = reviewer_eval.run_case(case, root=root, lane="opus_lens",
+                                    work_dir=tmp_path / "work")
+    assert seen == ["glm"]
+    assert result.error == ""
