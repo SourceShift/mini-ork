@@ -159,10 +159,7 @@ _FULL_RECURSION = (
     "nodes: []\n"
     "recursion:\n"
     "  max_iterations: 5\n"
-    "  convergence_check: all_done\n"
-    "  budget_cap_per_iter_usd: 1.0\n"
     "  budget_cap_total_usd: 5.0\n"
-    "  divergence_kill: stop on repeat\n"
 )
 
 
@@ -178,9 +175,9 @@ def test_partial_recursion_block_is_an_error(env, capsys):
     assert validate.main(["--recipe", "demo"]) == 1
     captured = capsys.readouterr()
     assert "[error]   recipe demo has an invalid recursion block" in captured.err
-    # The detail names the missing keys, so the fix is obvious without reading source.
+    # The detail names the missing key, so the fix is obvious without reading source.
     assert "missing" in captured.err
-    assert "convergence_check" in captured.err
+    assert "budget_cap_total_usd" in captured.err
 
 
 def test_typo_recursion_key_is_an_error(env, capsys):
@@ -189,14 +186,34 @@ def test_typo_recursion_key_is_an_error(env, capsys):
         "nodes: []\n"
         "recursion:\n"
         "  max_iterations: 5\n"
-        "  convergence_check: x\n"
-        "  budget_cap_per_iter_usd: 1.0\n"
         "  budget_cap_total: 5.0\n"  # typo: _total, not _total_usd
-        "  divergence_kill: y\n"
+        "  budget_cap_total_usd: 5.0\n"
     ))
 
     assert validate.main(["--recipe", "demo"]) == 1
     assert "unknown recursion key" in capsys.readouterr().err
+
+
+def test_a_removed_recursion_key_names_the_removal(env, capsys):
+    """A recipe still carrying a dropped key must be told *why* it is wrong.
+
+    ``convergence_check`` was removed (nothing read it) and the loader reports
+    the removal before the generic unknown-key error, which would name the key
+    without saying it is gone rather than mistyped.
+    """
+    root, _home = env
+    _recipe(root, "demo", workflow=(
+        "nodes: []\n"
+        "recursion:\n"
+        "  max_iterations: 5\n"
+        "  budget_cap_total_usd: 5.0\n"
+        "  convergence_check: all_done\n"
+    ))
+
+    assert validate.main(["--recipe", "demo"]) == 1
+    err = capsys.readouterr().err
+    assert "convergence_check was removed" in err
+    assert "unknown recursion key" not in err
 
 
 def test_complete_recursion_block_is_clean(env, capsys):
