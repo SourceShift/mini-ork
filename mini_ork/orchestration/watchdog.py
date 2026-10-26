@@ -48,7 +48,7 @@ DEFAULT_POLL_SECS = 30
 
 
 def _tok(s):
-    """Tokenise a string. Mirrors the bash heredoc verbatim: lowercase, swap
+    r"""Tokenise a string. Mirrors the bash heredoc verbatim: lowercase, swap
     any run of ``[^\w./_-]+`` for a single space, drop tokens shorter than 3
     characters.
     """
