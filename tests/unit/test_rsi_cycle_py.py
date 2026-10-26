@@ -1630,3 +1630,106 @@ def test_a_failed_restore_is_an_implementation_detail_not_a_silent_pass(world, m
 
     assert impl is not None and not impl.landed_something, impl
     assert "could not be restored" in impl.detail
+
+
+# --------------------------------------------------------------------------
+# Budget discipline inside one stage
+# --------------------------------------------------------------------------
+
+
+def test_a_node_may_take_at_most_half_the_run_wall():
+    """The share is a ratio, not a constant: it must scale with the wall.
+
+    Cycle 17 (2026-10-26) let one lens node hold a call for 1111 s of the SUGGEST
+    run's 1800 s wall. The runtime default (1500 s) was the only bound, so the
+    synthesizer that runs *after* the lenses had 570 s and the run was killed at
+    its wall with no proposal. Half the wall is the most a node may take.
+    """
+    assert cycle_mod._node_timeout_s(1800, None) == 900
+    # The runtime default is inherited; it must not survive the cap.
+    assert cycle_mod._node_timeout_s(1800, "1500") == 900
+    # An operator who tightened it keeps their value.
+    assert cycle_mod._node_timeout_s(1800, "300") == 300
+    # Garbage and non-positive values fall back to the share, never to "unbounded".
+    assert cycle_mod._node_timeout_s(1800, "nonsense") == 900
+    assert cycle_mod._node_timeout_s(1800, "0") == 900
+    # A short wall still has a floor, so a node is never given a zero timeout.
+    assert cycle_mod._node_timeout_s(60, None) == 60
+
+
+def test_the_recipe_run_passes_the_capped_node_timeout_to_the_child(world, monkeypatch):
+    """The cap must reach the node dispatcher, not just exist as a helper."""
+    monkeypatch.setenv("MO_NODE_TIMEOUT_S", "1500")
+    seen = {}
+
+    def _run(argv, **kwargs):
+        seen["argv"] = argv
+        seen["env"] = kwargs.get("env") or {}
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cycle_mod.subprocess, "run", _run)
+    req = CycleRequest(root=world.root, db=world.db, config=world.cfg,
+                       cycle_id="rsi-ctest")
+
+    rc, _home, _run_dir = cycle_mod._run_recipe(
+        req, "rsi-cycle", {"version": 1}, "# k\n", timeout_s=1800,
+        brief_env="MO_RSI_SUGGEST_BRIEF",
+        node_wall_s=cycle_mod._node_timeout_s(1800, "1500"))
+
+    assert rc == 0
+    assert seen["argv"][:2] == ["timeout", "1800"]
+    assert seen["env"]["MO_NODE_TIMEOUT_S"] == "900"
+    assert seen["env"]["MO_RSI_SUGGEST_BRIEF"].endswith("brief.json")
+
+
+def test_a_run_with_no_serial_successor_keeps_the_runtime_node_timeout(world, monkeypatch):
+    """The critic run must not inherit SUGGEST's cap.
+
+    Its two critics dispatch in parallel and *are* the whole run: one taking most
+    of the wall costs nothing, and capping it would only turn a slow-but-correct
+    panel into an incomplete one — a G10 quarantine the cycle did not earn.
+    """
+    monkeypatch.setenv("MO_NODE_TIMEOUT_S", "1500")
+    seen = {}
+
+    def _run(argv, **kwargs):
+        seen["env"] = kwargs.get("env") or {}
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cycle_mod.subprocess, "run", _run)
+    req = CycleRequest(root=world.root, db=world.db, config=world.cfg,
+                       cycle_id="rsi-ctest")
+
+    cycle_mod._run_recipe(req, "rsi-critic", {"version": 1}, "# k\n", timeout_s=900,
+                          brief_env="MO_RSI_CRITIC_BRIEF")
+
+    assert seen["env"]["MO_NODE_TIMEOUT_S"] == "1500"
+
+
+def test_an_errored_cycle_records_what_it_spent(world, monkeypatch):
+    """A cycle that dies mid-stage must not read as free.
+
+    Cycle 17 (2026-10-26) spent $0.42 in SUGGEST, hit its wall, and wrote
+    `cost_usd 0.00` — so every crash-looping cycle looked costless in the ledger
+    the definition of done reads ("the second cycle costs less").
+    """
+    con = sqlite3.connect(str(world.db))
+    con.execute("CREATE TABLE llm_calls (run_id TEXT, cost_usd REAL)")
+    con.executemany("INSERT INTO llm_calls VALUES (?, ?)",
+                    [("rsi-ctest-rsi-cycle", 0.30), ("rsi-ctest-rsi-critic", 0.12),
+                     ("rsi-ctest", 0.01), ("rsi-other-cycle-rsi-cycle", 9.0)])
+    con.commit()
+    con.close()
+
+    def _boom(req, rt, con, *, token, spend):
+        raise CycleFailure("the SUGGEST run hit its wall before writing proposal.json")
+
+    monkeypatch.setattr(cycle_mod, "_body", _boom)
+    with pytest.raises(CycleFailure):
+        Harness(world).run()
+
+    row = _cycle(world.db)
+    assert row["status"] == "error"
+    assert "hit its wall" in row["halt_reason"]
+    # Every run this cycle dispatched, and nothing another cycle spent.
+    assert row["cost_usd"] == pytest.approx(0.43)

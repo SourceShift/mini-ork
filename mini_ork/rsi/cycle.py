@@ -299,9 +299,12 @@ def run_cycle(req: CycleRequest, *, runtime: Runtime | None = None) -> CycleOutc
                 # status rewritten because something raised *after* the ledger
                 # write — a closed stderr pipe is enough to do it.
                 if row is not None and row["status"] == "running":
+                    # The spend goes in the row even though the cycle failed: a
+                    # crash loop that costs money must not read as free.
                     ledger.finish_cycle(con, req.cycle_id, now=rt.clock(),
                                         status="error",
-                                        halt_reason=f"{type(exc).__name__}: {exc}")
+                                        halt_reason=f"{type(exc).__name__}: {exc}",
+                                        cost_usd=_cycle_spend(req))
                     _learn(req, rt, con, "error", "")
             except Exception:  # noqa: BLE001 - the original error is the one to raise
                 pass
@@ -982,8 +985,40 @@ def _child_env(req: CycleRequest, home: Path, *, root: Path | None = None) -> di
     return env
 
 
+# A recipe run's wall is shared between nodes that dispatch in parallel and one
+# that runs after them. A node allowed most of the wall leaves the rest none.
+_NODE_WALL_SHARE = 2
+
+
+def _node_timeout_s(run_wall_s: int, inherited: str | None) -> int:
+    """The per-node bound for a recipe run whose nodes share a wall *and* leave a
+    later stage behind them.
+
+    Only SUGGEST has that shape: three lenses dispatch in parallel, then the
+    synthesizer runs serially after them. The runtime default (1500 s) is the only
+    bound otherwise, and it is 83% of the SUGGEST wall — measured, cycle 17
+    (2026-10-26): one lens node held a single call for 1111 s of the 1800 s wall,
+    so the synthesizer had no time left, the run was killed at its wall (rc 124),
+    and the cycle ended as an error with no proposal. Half is the most a node may
+    take there. A lower inherited value still wins, so an operator can tighten it.
+
+    The critic run does *not* use this: its two nodes are parallel and are the
+    whole run, so one of them taking the wall costs nothing and capping it would
+    only produce incomplete panels.
+    """
+    half = max(60, run_wall_s // _NODE_WALL_SHARE)
+    try:
+        current = int(inherited) if inherited not in (None, "") else None
+    except (TypeError, ValueError):
+        current = None
+    if current is None or current <= 0:
+        return half
+    return min(current, half)
+
+
 def _run_recipe(req: CycleRequest, recipe: str, brief: Mapping[str, Any],
-                kickoff: str, *, timeout_s: int, brief_env: str) -> tuple[int, Path, Path]:
+                kickoff: str, *, timeout_s: int, brief_env: str,
+                node_wall_s: int | None = None) -> tuple[int, Path, Path]:
     """Dispatch one recipe run for this cycle; return ``(rc, home, run_dir)``.
 
     Same shape as the implementer child: its own home (the runner rewrites
@@ -1011,6 +1046,10 @@ def _run_recipe(req: CycleRequest, recipe: str, brief: Mapping[str, Any],
         "MO_RUNTIME_BACKEND": req.config.implement.runtime_backend,
         brief_env: str(brief_path),
     }
+    if node_wall_s is not None:
+        # Only a run that must leave room for a stage *after* its parallel nodes
+        # passes this; see ``_node_timeout_s``.
+        env["MO_NODE_TIMEOUT_S"] = str(node_wall_s)
     try:
         proc = subprocess.run(argv, cwd=str(req.root), env=env, capture_output=True,
                               text=True, timeout=timeout_s + 60)
@@ -1105,9 +1144,20 @@ def _recipe_propose(req: CycleRequest, cand: Candidate) -> Proposal:
     ])
     rc, home, run_dir = _run_recipe(req, "rsi-cycle", brief, kickoff,
                                     timeout_s=_SUGGEST_TIMEOUT_S,
-                                    brief_env="MO_RSI_SUGGEST_BRIEF")
+                                    brief_env="MO_RSI_SUGGEST_BRIEF",
+                                    node_wall_s=_node_timeout_s(
+                                        _SUGGEST_TIMEOUT_S, os.environ.get("MO_NODE_TIMEOUT_S")))
     path = _run_artifact(home, run_dir.name, "proposal.json")
     if path is None:
+        if rc == _TIMEOUT_RC:
+            # Name the wall, not just the exit code: a cycle that dies here spent
+            # the whole stage and produced nothing, and the operator's next
+            # question is which budget ran out.
+            raise CycleFailure(
+                f"the SUGGEST run hit its {_SUGGEST_TIMEOUT_S} s wall before writing "
+                f"proposal.json; each node was bounded to "
+                f"{_node_timeout_s(_SUGGEST_TIMEOUT_S, os.environ.get('MO_NODE_TIMEOUT_S'))} s "
+                f"(see {run_dir})")
         raise CycleFailure(
             f"the SUGGEST run exited {rc} without a proposal.json (see {run_dir})")
     if rc != 0:
@@ -1310,6 +1360,32 @@ def _restore_landed(wt: Path, paths: Sequence[str], *,
     if dirty:
         return "the working tree still differs from HEAD at " + ", ".join(dirty) + " after the restore"
     return None
+
+
+def _cycle_spend(req: CycleRequest) -> float:
+    """Everything this cycle spent, summed by run-id prefix; ``0.0`` if unreadable.
+
+    Every run a cycle dispatches carries its id as a prefix (``<cycle_id>-rsi-cycle``,
+    ``-rsi-critic``, ``-fe``) and writes to the cycle's DB, so one query covers a
+    stage that died before it could report its own cost. Cycle 17 (2026-10-26) spent
+    $0.42 in SUGGEST, hit its wall, and the error row recorded $0.00 — the per-cycle
+    measurement the definition of done reads ("the second cycle costs less") was
+    blind to exactly the cycles that cost money and delivered nothing.
+    """
+    if not Path(req.db).exists():
+        return 0.0
+    try:
+        con = sqlite3.connect(str(req.db), timeout=5)
+        try:
+            row = con.execute(
+                "SELECT COALESCE(SUM(cost_usd), 0) FROM llm_calls "
+                "WHERE run_id = ? OR run_id LIKE ?",
+                (req.cycle_id, f"{req.cycle_id}-%")).fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return 0.0
+    return float(row[0] or 0.0)
 
 
 def _child_cost(req: CycleRequest, run_id: str, rc: int) -> float:

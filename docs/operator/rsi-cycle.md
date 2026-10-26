@@ -236,6 +236,7 @@ instead of racing. Point `secure.db_path` at the shared DB and
 | `rejected` naming `worktree_claim_conflict` | `rsi-cycle quarantine list` | another worktree holds one of the files the fix needs. A live cycle walks the ranked shortlist past a claim (bounded by `queue.max_candidates`) and only ends here when *every* eligible candidate is claimed; a cron job that keeps landing here means a stale claim — `quarantine release <id>` drops it without deleting the work |
 | `2` and a config message | the message names the key | see the fail-closed list above |
 | `error` with a traceback summary | `rsi-cycle show <id>` | a bug in the cycle itself — the row carries the exception type |
+| `error` naming the SUGGEST wall (`hit its … wall before writing proposal.json`) | the run dir it names, then `llm_calls` for that run id | one node consumed its whole share and the stage after it had no time. The row records what the stage spent; check `.last-llm-node` in the run dir to see which node held the call |
 
 Every `rejected` row carries its reason in `halt_reason`, not only on the
 terminal it was printed to: a pre-dispatch filter writes its code
@@ -277,6 +278,28 @@ startup check still passes, because it resolves the *provider* lane, and then
 every cycle quarantines on G10 because both critics were served by one family.
 `panel-composition.json` records the lanes that actually answered; read it
 before blaming the critics.
+
+Each recipe run gets its own wall (`SUGGEST` 1800 s, the critic run
+`critic.model_timeout_s`). The SUGGEST run additionally bounds every node to
+**half of that wall** by setting `MO_NODE_TIMEOUT_S` to `wall / 2` in the run's
+environment, lowering (never raising) an operator's own value. Without that
+bound a node inherited the runtime default of 1500 s, which is 83% of the wall:
+on 2026-10-26 one lens call held a single dispatch for 1111 s and the
+synthesizer, which by design runs *after* the lenses, had none left. The run was
+killed at its wall and the cycle ended as an `error` with no proposal. The share
+is a ratio rather than a constant so a longer wall buys proportionally more per
+node instead of re-opening the same hole.
+
+The critic run is deliberately **not** capped: its two critics dispatch in
+parallel and are the whole run, so one of them using most of the wall costs
+nothing, and a cap there would only turn a slow but correct panel into an
+incomplete one — a G10 quarantine the cycle did not earn.
+
+A cycle that ends in `error` still records what it spent: `cost_usd` is summed
+from every `llm_calls` row whose `run_id` carries the cycle id as a prefix, so a
+stage that died before reporting its own cost is not invisible. Cycle 17 spent
+$0.42 and wrote $0.00 before this — which made a crash loop look free in the
+one column the definition of done reads.
 
 Whatever the critics answered is copied into `rsi_cycles.critic_json` on every
 path from DECIDE onwards — the verdict, the resolved family, the blocking
