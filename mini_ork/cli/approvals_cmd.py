@@ -469,6 +469,98 @@ def _cmd_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def _approve_worktree_merge(args: argparse.Namespace, db: str) -> int:
+    """Approve a ``wt:<slug>`` merge-risk gate — by hand, at a terminal.
+
+    The approval is bound to the branch's ``git patch-id`` (not a commit sha),
+    so it survives a clean rebase and stops counting the moment the branch's
+    own patch changes. The operator sees the changed paths and the risk
+    reasons, then types the first eight characters of the patch id. A missing
+    TTY refuses before touching the ledger: an agent must never mint one.
+    """
+    if not sys.stdin.isatty():
+        sys.stderr.write(
+            "approvals approve: a merge-risk approval (wt:…) must be typed "
+            "by a person at a terminal\n"
+        )
+        return 1
+
+    from mini_ork.gates import merge_risk
+    from mini_ork.review.gate import primary_root
+    from mini_ork.rsi.cycle import _worktrees_dir
+
+    slug = args.run_id[len("wt:"):]
+    engine_root = Path(__file__).resolve().parents[2]
+    wt_dir = Path(_worktrees_dir(primary_root(engine_root))) / slug
+    if not wt_dir.is_dir():
+        sys.stderr.write(
+            f"approvals approve: no worktree for {args.run_id!r} at {wt_dir}\n"
+        )
+        return 1
+
+    # ``None`` means the flag was absent; an explicit ``--head ""`` is an empty
+    # head and is refused below rather than silently defaulted.
+    head = args.head
+    if head is None:
+        try:
+            head = merge_risk.branch_patch_id(str(wt_dir))
+        except Exception as exc:  # noqa: BLE001 — surface, never approve blindly
+            sys.stderr.write(f"approvals approve: cannot read {wt_dir}: {exc}\n")
+            return 1
+    if not head:
+        sys.stderr.write(
+            f"approvals approve: {args.run_id} has an empty head (empty patch "
+            "id); nothing to approve\n"
+        )
+        return 1
+
+    try:
+        verdict = merge_risk.classify(
+            str(wt_dir), engine_root=str(engine_root), db=db, env=os.environ,
+        )
+    except Exception as exc:  # noqa: BLE001 — surface, never approve blindly
+        sys.stderr.write(
+            f"approvals approve: cannot classify {args.run_id}: {exc}\n"
+        )
+        return 1
+
+    if verdict.files:
+        sys.stdout.write("changed files:\n")
+        for path in verdict.files[:40]:
+            sys.stdout.write(f"  {path}\n")
+        if len(verdict.files) > 40:
+            sys.stdout.write(f"  … and {len(verdict.files) - 40} more\n")
+    if verdict.reasons:
+        sys.stdout.write("risk:\n")
+        for reason in verdict.reasons:
+            sys.stdout.write(f"  {reason}\n")
+
+    try:
+        answer = input(f"type {head[:8]} to approve: ")
+    except (EOFError, KeyboardInterrupt):
+        sys.stderr.write("approvals approve: not approved\n")
+        return 1
+    if answer.strip() != head[:8]:
+        sys.stderr.write("approvals approve: not approved\n")
+        return 1
+
+    try:
+        inbox_id = approve(
+            args.run_id,
+            head,
+            approver=_approver(),
+            base_sha=args.base or "",
+            note=args.note or "",
+            db_path=db,
+            env=os.environ,
+        )
+    except ApprovalError as exc:
+        sys.stderr.write(f"approvals approve: {exc}\n")
+        return 1
+    sys.stdout.write(f"approved {args.run_id} (inbox_id={inbox_id})\n")
+    return 0
+
+
 def _cmd_approve(args: argparse.Namespace) -> int:
     db, home = _resolve_db_path(args.db)
     # Node review branch: --node resolves a pending node row, no head/workspace
@@ -509,6 +601,11 @@ def _cmd_approve(args: argparse.Namespace) -> int:
                 f"resume with: mini-ork recover {args.run_id} --strategy resume\n"
             )
         return 0
+
+    # A merge-risk approval (wt:<slug>) is bound to the branch's patch id,
+    # needs a terminal, and shows the operator what they are approving.
+    if args.run_id.startswith("wt:"):
+        return _approve_worktree_merge(args, db)
 
     head = args.head or ""
     base = args.base or ""
@@ -671,7 +768,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_approve = subs.add_parser("approve", add_help=False, usage=argparse.SUPPRESS)
     p_approve.add_argument("run_id")
-    p_approve.add_argument("--head", default="")
+    # ``None`` lets ``wt:`` approvals tell "flag absent" (compute the patch id)
+    # apart from ``--head ""`` (an empty head, which must be refused).
+    p_approve.add_argument("--head", default=None)
     p_approve.add_argument("--base", default="")
     p_approve.add_argument("--node", default="")
     p_approve.add_argument("--note", default="")

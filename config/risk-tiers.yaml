@@ -1,0 +1,30 @@
+# Changes that need a person's approval before they merge to main.
+# Read from origin/main at merge time (a branch cannot loosen its own check).
+# Docs: docs/operator/review-gates.md#risk-tiers
+risk_tiers:
+  enabled: true
+  include_frozen_kernel: true        # every path repo_integrity_guard.enforced_frozen_paths returns
+  high_risk_classes: [high, critical]
+  high:
+    - config/risk-tiers.yaml
+    - config/kernel-frozen.yaml
+    - .github/workflows/**
+    - .githooks/**
+    - db/migrations/**
+    - install.sh
+    - scripts/install-system-deps.sh
+    - scripts/full_install.py
+    - scripts/mini_ork_worktree.py
+    - mini_ork/cli/install_command.py
+    - mini_ork/dispatch/vault.py
+    - mini_ork/dispatch/vault_write.py
+    - mini_ork/dispatch/secrets.py
+    - mini_ork/cli/vault_cmd.py
+    - mini_ork/remote/secrets_scope.py
+    - config/vault.example.yaml
+    - config/secrets.example.sh
+    - .mini-ork/config/**
+    - mini_ork/gates/merge_risk.py
+    - mini_ork/gates/merge_approval.py
+    - mini_ork/cli/approvals_cmd.py
+    - mini_ork/verify/gaming_scan.py

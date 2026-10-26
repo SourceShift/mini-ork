@@ -40,6 +40,21 @@ from collections.abc import Iterable, Iterator
 DEFAULT_WORKTREES_DIR = "/Volumes/docker-ssd/ps/mini-ork-worktrees"
 DEFAULT_TEST_CMD = "python3 -m pytest -q"
 
+# The engine checkout that RUNS this merge — deliberately not ``ROOT``, which
+# may be a throwaway clone (tests) or a stale local main. The guards below run
+# the engine's own scanner and risk check, so a branch cannot weaken them.
+ENGINE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _engine_python() -> str:
+    """The engine's own interpreter when it has a venv, else this one.
+
+    ``merge_risk`` needs PyYAML; a bare system python may not have it. Prefer
+    the engine venv so the check runs where the engine's dependencies live.
+    """
+    venv_python = os.path.join(ENGINE, ".venv", "bin", "python")
+    return venv_python if os.access(venv_python, os.X_OK) else sys.executable
+
 
 def die(msg: str) -> "SystemExit":
     print(f"[mo-worktree] {msg}", file=sys.stderr)
@@ -474,6 +489,83 @@ def _oss_guard(wt: str, slug: str) -> None:
     _check_oss_content(wt)
 
 
+# ── merge-time gates: test-gaming scan + risk tiers ────────────────────────
+# Both run the ENGINE's copy of the check (never the branch's), as a
+# subprocess so this driver keeps its "no top-level mini_ork import" promise.
+# A branch therefore cannot weaken the check it is being checked by.
+
+def _guard_env() -> dict:
+    env = os.environ.copy()
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (ENGINE, existing) if p)
+    return env
+
+
+def _forward(proc: subprocess.CompletedProcess) -> str:
+    """Echo a guard's output unchanged; return its stdout for inspection."""
+    out = proc.stdout or ""
+    if out:
+        sys.stdout.write(out)
+        if not out.endswith("\n"):
+            sys.stdout.write("\n")
+    if proc.stderr:
+        sys.stderr.write(proc.stderr)
+    return out
+
+
+def _gaming_guard(wt: str) -> None:
+    """Refuse production test-gaming patterns (``gaming_scan``). Fails closed.
+
+    ``MO_MERGE_ALLOW_TEST_PROBE=1`` is the reviewed override for a person who
+    has read the findings; it is announced so the bypass is visible in logs.
+    """
+    scan = os.path.join(ENGINE, "mini_ork", "verify", "gaming_scan.py")
+    if not os.path.isfile(scan):
+        return
+    if os.environ.get("MO_MERGE_ALLOW_TEST_PROBE") == "1":
+        print("[mo-worktree] warn: MO_MERGE_ALLOW_TEST_PROBE=1 — allowing "
+              "test-gaming patterns into main (a person must have read them)",
+              file=sys.stderr)
+        return
+    proc = subprocess.run(
+        [_engine_python(), "-m", "mini_ork.verify.gaming_scan",
+         "--git-range", "origin/main...HEAD", "--repo", wt],
+        cwd=ENGINE, env=_guard_env(), check=False, capture_output=True, text=True,
+    )
+    _forward(proc)
+    if proc.returncode == 1:
+        die("test-gaming patterns in production code (above); fix them. A "
+            "person who has read them may set MO_MERGE_ALLOW_TEST_PROBE=1")
+    if proc.returncode != 0:
+        die(f"test-gaming scan failed to run (rc={proc.returncode}); refusing "
+            f"to merge unscanned")
+
+
+def _risk_guard(wt: str, slug: str) -> bool:
+    """Gate a high-tier change on a person's patch-bound approval.
+
+    Returns ``True`` when the branch is high tier and approved (so the caller
+    re-checks after the in-lock rebase), ``False`` when it is low tier. Any
+    refusal or failure raises ``SystemExit`` via ``die`` — fails closed.
+    """
+    module = os.path.join(ENGINE, "mini_ork", "gates", "merge_risk.py")
+    if not os.path.isfile(module):
+        return False
+    proc = subprocess.run(
+        [_engine_python(), "-m", "mini_ork.gates.merge_risk", "check",
+         "--worktree", wt, "--slug", slug],
+        cwd=ENGINE, env=_guard_env(), check=False, capture_output=True, text=True,
+    )
+    out = _forward(proc)
+    if proc.returncode == 0:
+        return "risk tier: high" in out
+    if proc.returncode == 1:
+        die("merge refused: high-risk change without a person's approval "
+            "(see above)")
+    die(f"risk check failed to run (rc={proc.returncode}); refusing to merge "
+        f"unchecked")
+
+
 # ── Concord registration (best-effort, fail-open) ─────────────────────────
 # A worktree is registered with ContextNest as principal agent:wt-<slug>, with
 # its --owns claims as labels, so the per-turn precheck can flag edits inside
@@ -608,8 +700,12 @@ def merge_worktree(args: list[str]) -> None:
     base_before = git("-C", wt, "merge-base", "HEAD", "origin/main", capture=True).stdout.strip()
     git("-C", wt, "rebase", "origin/main")
     # Fail fast before the (slower) green gate and before anything is pushed:
-    # the branch must stay inside its claims and carry nothing confidential.
+    # the branch must stay inside its claims, carry nothing confidential, add
+    # no production test-gaming, and — if it is high tier — hold a person's
+    # patch-bound approval.
     _oss_guard(wt, slug)
+    _gaming_guard(wt)
+    high_risk = _risk_guard(wt, slug)
     # Green gate: never push a red branch to main. Override the command per-task
     # with MINI_ORK_TEST_CMD (e.g. a scoped pytest path for a fast, focused gate).
     test_cmd = os.environ.get("MINI_ORK_TEST_CMD", DEFAULT_TEST_CMD)
@@ -640,6 +736,11 @@ def merge_worktree(args: list[str]) -> None:
         for attempt in range(1, attempts + 1):
             git("-C", wt, "fetch", "origin", "main")
             git("-C", wt, "rebase", "origin/main")
+            # An approval is bound to the patch. A rebase that changed the
+            # branch's own patch (a conflict resolution, a replayed commit)
+            # must be approved again; a clean rebase leaves the patch-id alone.
+            if high_risk:
+                _risk_guard(wt, slug)
             push = git("-C", wt, "push", "origin", "HEAD:main",
                        check=False, capture=True)
             if push.returncode == 0:

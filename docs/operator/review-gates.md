@@ -73,6 +73,67 @@ mini-ork board merge <run>               # human merge = approve + merge
 
 ---
 
+## Risk tiers
+
+`make worktree-merge` (`scripts/mini_ork_worktree.py merge`) decides whether a
+change needs a person's approval from **what it touches**, not who wrote it.
+The rules live in `config/risk-tiers.yaml`.
+
+**A branch is high tier when it either**
+
+- changes a high-tier path — `config/risk-tiers.yaml`,
+  `config/kernel-frozen.yaml`, `.github/workflows/**`, `.githooks/**`,
+  `db/migrations/**`, the installer and install scripts, the vault and secrets
+  modules, `.mini-ork/config/**`, or the risk/approval/gaming-scan code itself;
+  or every path `repo_integrity_guard.enforced_frozen_paths` returns
+  (`include_frozen_kernel`); or
+- carries a `[run <id>]` commit whose recipe declares `risk_class: high` or
+  `critical` (`high_risk_classes`).
+
+Everything else is low tier and merges exactly as before.
+
+**The rules are read from `origin/main`**, and the check itself runs from the
+engine checkout that performs the merge — a branch cannot weaken the check it
+is being checked by, and editing the rules file is itself high tier. Run the
+merge from the main checkout (`make -C <main> worktree-merge SLUG=…`) for that
+guarantee to hold; running it from inside a task worktree uses that branch's
+code.
+
+**Approving.** A high-tier branch stops with the changed paths, the reasons,
+and a command:
+
+```bash
+mini-ork approvals approve wt:<slug>
+```
+
+It must be **typed by a person at a terminal**: with no TTY the CLI refuses,
+and it prints the changed files and risk reasons, then asks you to type the
+first eight characters of the patch id. The approval is bound to the branch's
+`git patch-id --stable` of `origin/main...HEAD`, so it survives a clean rebase
+onto a moved `main` and stops counting the moment the branch's own patch
+changes. Pass `--head <patch-id>` to name one explicitly.
+
+**Overrides** (tests/CI, never a routine merge):
+
+- `MO_RISK_TIERS_FILE=<path>` — use this rules file instead of
+  `origin/main`'s. A file that does not parse refuses the merge.
+- `MO_MERGE_ALLOW_TEST_PROBE=1` — let test-gaming patterns through after a
+  person has read them. The driver announces the override on stderr.
+
+**The two tiers** match the rest of this page:
+
+| | simple (a laptop) | secure (shared or cloud) |
+|---|---|---|
+| Where the approval lives | the local state DB, after your typed confirmation | the same ledger, and the row must carry an HMAC |
+| Key | none | `MO_REVIEW_SIGNING_KEY` through the vault chain (`config/review.yaml`: `tier: secure`), so an agent's environment alone cannot mint one |
+| Missing key | — | the approval fails closed and the merge is refused |
+
+Set `MINI_ORK_HOME` consistently: the CLI records the approval in
+`$MINI_ORK_HOME/state.db` (or `$MINI_ORK_DB`), which is the same DB the merge
+check reads when it runs with that environment.
+
+---
+
 ## 3. After a node (`after_nodes: [...]`)
 
 Before each dispatch, the executor asks the gate whether a finished node still
