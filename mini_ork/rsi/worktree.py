@@ -393,6 +393,7 @@ def write_quarantine(record: Mapping[str, Any], *,
 
 
 def revert(cfg: WorktreeConfig, merged_sha: str, *,
+           mainline: int | None = None,
            runner: Runner = subprocess_runner) -> MergeResult:
     """Undo a merged cycle with a *new revert commit*, gated like any other merge.
 
@@ -414,8 +415,11 @@ def revert(cfg: WorktreeConfig, merged_sha: str, *,
         timeout_s=cfg.timeout_s,
     )
     wt = claim_and_create(rev, runner=runner)
-    rc, out, err = _git(cfg, ["revert", "--no-edit", merged_sha],
-                        runner=runner, cwd=wt.path)
+    argv = ["revert", "--no-edit"]
+    if mainline is not None:
+        argv.extend(["-m", str(mainline)])
+    argv.append(merged_sha)
+    rc, out, err = _git(cfg, argv, runner=runner, cwd=wt.path)
     if rc != 0:
         return MergeResult("rejected", detail=(
             f"revert of {merged_sha} conflicted in {wt.path}; the worktree is kept "

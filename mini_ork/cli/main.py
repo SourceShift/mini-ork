@@ -85,6 +85,7 @@ _NATIVE_MODULE_SUBS = {
     "lifetime": "mini_ork.orchestration.lifetime",
     "self-improve": "mini_ork.cli.self_improve",
     "rsi-cycle": "mini_ork.cli.rsi_cycle",
+    "undo": "mini_ork.cli.undo",
     "topology": "mini_ork.cli.topology",
     "usage-report": "mini_ork.observability.usage_report",
     "watchdog": "mini_ork.orchestration.watchdog",
@@ -159,6 +160,8 @@ Self-improvement:
                                  Harvest gaps in learning, routing and verification,
                                    rank them into one queue, and (later) fix one per
                                    cycle. `plan` is read-only and spends nothing.
+  undo <commit|run-id>           Revert a landed commit as a new, gated commit
+                                   (--mainline N, --test-cmd, --dry-run). Never rewrites main.
 
 Lifecycle:
   onboard                        First-run wizard: prerequisites, workspace, lanes,
