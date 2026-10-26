@@ -258,6 +258,22 @@ class SnapshotTooLargeError(ServiceError):
     """An imported body exceeds ``MO_NODE_SNAPSHOT_MAX_BYTES``."""
 
 
+class ServiceRestartFailedError(RuntimeError):
+    """A quiesced snapshot exists, but a replica did not come back up.
+
+    The archive is durable and listed — the copy is real — but leaving the
+    service down silently would be worse than an error. The message names the
+    snapshot so the operator can act on both facts.
+    """
+
+
+#: Grace period Docker gives a container to exit on ``docker stop``. A database
+#: that needs longer than this to flush is doing something the node cannot
+#: speed up; ten seconds matches Docker's own default and is long enough for
+#: Postgres' fast shutdown.
+_QUIESCE_STOP_SECONDS = "10"
+
+
 @dataclass
 class ServiceSpec:
     """The durable half of a service. Env values are intentionally absent."""
@@ -648,7 +664,45 @@ class ServiceManager:
             raise ServiceError(f"snapshot id must be 32 lowercase hex chars: {value!r}")
         return value
 
-    def snapshot(self, service_id: str, volume_name: str) -> dict[str, Any]:
+    def _stop_for_copy(self, service_id: str) -> list[str]:
+        """Stop every replica that could write to the volume; return their names.
+
+        Fail closed. The caller asked for a copy no writer can be half-way
+        through; if a container will not stop, resuming the ones already
+        stopped and refusing is the only answer that does not quietly produce a
+        crash-consistent archive labelled consistent. A replica Docker reports
+        as *missing* or *exited* holds no open files, so nothing is stopped for
+        it — and a service this node does not define cannot be quiesced at all,
+        because there is nothing here to stop.
+        """
+        if service_id not in self._specs:
+            raise ServiceError(
+                f"service {service_id!r} is not defined on this node; cannot quiesce it"
+            )
+        stopped: list[str] = []
+        for name, state in self._volume_holders(service_id):
+            result = self._run(["docker", "stop", "--time", _QUIESCE_STOP_SECONDS, name])
+            if getattr(result, "returncode", 0) != 0:
+                self._resume(stopped)
+                detail = (getattr(result, "stderr", "") or "").strip()
+                raise ServiceError(
+                    f"could not stop {name} ({state}) to quiesce the volume: {detail}"
+                )
+            stopped.append(name)
+        return stopped
+
+    def _resume(self, names: list[str]) -> list[str]:
+        """Start the replicas a quiesced copy stopped; return the failures."""
+        failed: list[str] = []
+        for name in names:
+            result = self._run(["docker", "start", name])
+            if getattr(result, "returncode", 0) != 0:
+                failed.append(name)
+        return failed
+
+    def snapshot(
+        self, service_id: str, volume_name: str, *, quiesce: bool = False
+    ) -> dict[str, Any]:
         """Write a ``tar.gz`` of the volume and its metadata sidecar.
 
         Refuses when the volume has never been materialized on this node (no
@@ -656,6 +710,14 @@ class ServiceManager:
         restore to nothing. An existing but empty directory *is* a real
         snapshot — "the volume was empty when I copied it" is a fact worth
         keeping.
+
+        ``quiesce`` stops the replicas that hold the mount before the copy and
+        starts them again afterwards, so the archive is engine-consistent
+        rather than crash-consistent: no writer was mid-transaction when the
+        bytes were read. It is opt-in because it costs downtime for the length
+        of the copy, and the policy — when consistency is worth that — belongs
+        to the control plane. The sidecar records whether the copy was quiesced
+        so a backup list never implies more than happened.
         """
         source = self._volume_dir(service_id, volume_name)
         if not source.is_dir():
@@ -672,7 +734,11 @@ class ServiceManager:
         snapshot_id = uuid.uuid4().hex
         archive = out_dir / f"{snapshot_id}.tar.gz"
         tmp = out_dir / f".{snapshot_id}.tar.gz.tmp"
+        stopped: list[str] = []
+        restart_failed: list[str] = []
         try:
+            if quiesce:
+                stopped = self._stop_for_copy(service_id)
             with tarfile.open(tmp, "w:gz") as tar:
                 for child in sorted(source.iterdir()):
                     tar.add(child, arcname=child.name, recursive=True)
@@ -684,6 +750,10 @@ class ServiceManager:
                     size += len(chunk)
             os.replace(tmp, archive)
         finally:
+            # Restarting is unconditional: an exception during the copy must
+            # not leave the service down. The failure list is carried out of
+            # the ``finally`` so a successful copy can still report it.
+            restart_failed = self._resume(stopped)
             tmp.unlink(missing_ok=True)
 
         meta = {
@@ -693,13 +763,26 @@ class ServiceManager:
             "bytes": size,
             "sha256": digest.hexdigest(),
             "created_at": _utc_now(),
+            "quiesced": bool(quiesce),
         }
+        if stopped:
+            meta["quiesce_stopped"] = len(stopped)
+        if restart_failed:
+            meta["quiesce_restart_failed"] = restart_failed
         # The sidecar is written after the archive is durable. A crash between
         # the two leaves an archive that listing ignores and restore refuses —
         # an invisible snapshot, never a listed one that cannot be restored.
         meta_tmp = out_dir / f".{snapshot_id}.json.tmp"
         meta_tmp.write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
         os.replace(meta_tmp, out_dir / f"{snapshot_id}.json")
+        if restart_failed:
+            # The bytes are a real, listed backup; the service is not running.
+            # Both facts are true and the caller must see both.
+            raise ServiceRestartFailedError(
+                f"snapshot {snapshot_id} is complete, but "
+                f"{', '.join(restart_failed)} did not restart; "
+                "start the replica before the next deploy"
+            )
         return meta
 
     def list_snapshots(self, service_id: str, volume_name: str) -> list[dict[str, Any]]:
@@ -1300,9 +1383,16 @@ def make_router(
     # ---- volume snapshots ---------------------------------------------
 
     @router.post("/v1/services/{sid}/volumes/{name}/snapshots")
-    def post_volume_snapshot(sid: str, name: str, _: None = Depends(bearer)) -> dict:
+    def post_volume_snapshot(sid: str, name: str, payload: dict | None = None,
+                             _: None = Depends(bearer)) -> dict:
+        body = payload or {}
+        quiesce = body.get("quiesce", False)
+        if not isinstance(quiesce, bool):
+            # A string "false" is truthy; refusing the shape is how a caller
+            # that meant a crash-consistent copy does not get a stopping one.
+            raise HTTPException(400, "quiesce must be a boolean")
         try:
-            return services.snapshot(sid, name)
+            return services.snapshot(sid, name, quiesce=quiesce)
         except VolumeNotMaterializedError as exc:
             raise HTTPException(404, str(exc)) from exc
         except ServiceError as exc:

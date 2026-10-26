@@ -201,7 +201,7 @@ Lifecycle rules:
 The node can copy a volume and put it back:
 
 ```
-POST   /v1/services/{sid}/volumes/{name}/snapshots
+POST   /v1/services/{sid}/volumes/{name}/snapshots   {"quiesce": true}
 GET    /v1/services/{sid}/volumes/{name}/snapshots
 DELETE /v1/services/{sid}/volumes/{name}/snapshots/{snap}
 GET    /v1/services/{sid}/volumes/{name}/snapshots/{snap}/blob
@@ -242,9 +242,23 @@ Rules the node enforces, each because the alternative loses data quietly:
   it" is a fact worth keeping. Only a volume that was never materialized on this
   node (no directory) is refused — that returns 404, because an empty archive
   would restore to nothing and look like a successful backup.
-- **A snapshot of a running volume is crash-consistent.** The caller decides
-  whether that is good enough (a database wants a quiesced copy; a static site
-  does not).
+- **A snapshot of a running volume is crash-consistent by default.** The bytes
+  are read while writers may be mid-transaction. That is right for a file or
+  asset volume and wrong for an engine's data directory, so the request can ask
+  for more: `{"quiesce": true}` stops every replica Docker reports as holding
+  the mount (grace period 10 s), takes the copy, and starts them again. The
+  sidecar records `quiesced`, plus `quiesce_stopped` and, if a replica would
+  not come back, `quiesce_restart_failed`. The *policy* — when consistency is
+  worth the downtime — is the control plane's; the node offers the mechanism.
+- **Quiesce fails closed.** If a container will not stop, the replicas already
+  stopped are restarted and the request is refused (400) with no archive: a
+  crash-consistent copy labelled consistent is worse than no copy. If the copy
+  succeeds but a replica will not start, the request errors (500) with the
+  snapshot id in the message and the sidecar stays — the backup is real, and
+  the service being down must not be reported as success.
+- **Quiesce refuses a service this node does not define** (400). A volume whose
+  owner was deleted, or that this node never created, has nothing here to stop;
+  recording it as quiesced would be a claim the node cannot support.
 - **Restore is refused while any container holds the volume** (409). Only
   `missing`, `exited`, and `dead` are safe; an unreadable Docker state counts as
   holding. Replacing the directory under a live process is corruption, not

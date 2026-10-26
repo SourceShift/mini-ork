@@ -45,6 +45,8 @@ class _Docker:
         self.network_creates: list[list[str]] = []
         self.fail_network: str | None = None
         self.fail_on: str | None = None
+        self.fail_stop: str | None = None
+        self.fail_start: str | None = None
         self.removed: list[str] = []
 
     def __call__(self, argv, **_kwargs):
@@ -111,6 +113,24 @@ class _Docker:
         if argv[:2] == ["docker", "restart"]:
             self.states[argv[-1]] = "running"
             self.finished.pop(argv[-1], None)
+            return r
+
+        if argv[:2] == ["docker", "stop"]:
+            name = argv[-1]
+            if self.fail_stop and self.fail_stop in name:
+                r.returncode = 1
+                r.stderr = "Error response from daemon: cannot stop container"
+                return r
+            self.states[name] = "exited"
+            return r
+
+        if argv[:2] == ["docker", "start"]:
+            name = argv[-1]
+            if self.fail_start and self.fail_start in name:
+                r.returncode = 1
+                r.stderr = "Error response from daemon: cannot start container"
+                return r
+            self.states[name] = "running"
             return r
 
         return r
@@ -629,6 +649,98 @@ def test_an_empty_volume_is_a_real_snapshot(client, tmp_path):
     r = client.post(SNAPSHOT, headers=AUTH)
     assert r.status_code == 200, r.text
     assert r.json()["bytes"] > 0  # a valid empty tar.gz
+
+
+def test_a_quiesced_snapshot_stops_the_owner_and_starts_it_again(client, docker):
+    client.post(
+        "/v1/services",
+        json=_spec(volumes=[{"name": "data", "mount_path": "/data"}], replicas=1),
+        headers=AUTH,
+    )
+    r = client.post(SNAPSHOT, headers=AUTH, json={"quiesce": True})
+    assert r.status_code == 200, r.text
+    meta = r.json()
+    assert meta["quiesced"] is True
+    assert meta["quiesce_stopped"] == 1
+    assert "quiesce_restart_failed" not in meta
+
+    verbs = [c[1] for c in docker.calls if c[:2] in (["docker", "stop"], ["docker", "start"])]
+    assert verbs == ["stop", "start"]
+    name = "mo-svc-web-0"
+    assert docker.states[name] == "running"
+    # The stop carries a grace period: a database needs long enough to flush.
+    stop = next(c for c in docker.calls if c[:2] == ["docker", "stop"])
+    assert stop[2] == "--time" and stop[3] == "10"
+
+
+def test_a_crash_consistent_snapshot_does_not_stop_the_service(client, docker):
+    client.post(
+        "/v1/services",
+        json=_spec(volumes=[{"name": "data", "mount_path": "/data"}], replicas=1),
+        headers=AUTH,
+    )
+    r = client.post(SNAPSHOT, headers=AUTH, json={"quiesce": False})
+    assert r.status_code == 200, r.text
+    assert r.json()["quiesced"] is False
+    assert not [c for c in docker.calls if c[:2] == ["docker", "stop"]]
+
+
+def test_quiesce_refuses_when_a_replica_will_not_stop(client, docker, tmp_path):
+    client.post(
+        "/v1/services",
+        json=_spec(volumes=[{"name": "data", "mount_path": "/data"}], replicas=1),
+        headers=AUTH,
+    )
+    docker.fail_stop = "mo-svc-web"
+    r = client.post(SNAPSHOT, headers=AUTH, json={"quiesce": True})
+    assert r.status_code == 400
+    assert "could not stop" in r.json()["detail"]
+    # Fail closed: no partial archive was written for a copy that is not the
+    # consistent one the caller asked for.
+    assert not list((tmp_path / "volume-snapshots" / "web" / "data").glob("*.tar.gz"))
+
+
+def test_a_snapshot_whose_service_did_not_restart_says_so(client, docker):
+    client.post(
+        "/v1/services",
+        json=_spec(volumes=[{"name": "data", "mount_path": "/data"}], replicas=1),
+        headers=AUTH,
+    )
+    docker.fail_start = "mo-svc-web"
+    r = client.post(SNAPSHOT, headers=AUTH, json={"quiesce": True})
+    assert r.status_code == 500
+    detail = r.json()["detail"]
+    assert "did not restart" in detail
+    assert "mo-svc-web-0" in detail
+    # The bytes are real: the sidecar exists, so the backup is listed even
+    # though the request errored — the operator can act on both facts.
+    listed = client.get(SNAPSHOT, headers=AUTH).json()["snapshots"]
+    assert listed and listed[0]["quiesce_restart_failed"] == ["mo-svc-web-0"]
+
+
+def test_quiesce_of_a_deleted_service_is_refused(client, docker):
+    client.post(
+        "/v1/services",
+        json=_spec(volumes=[{"name": "data", "mount_path": "/data"}], replicas=1),
+        headers=AUTH,
+    )
+    assert client.delete("/v1/services/web", headers=AUTH).status_code == 200
+    r = client.post(SNAPSHOT, headers=AUTH, json={"quiesce": True})
+    assert r.status_code == 400
+    assert "not defined on this node" in r.json()["detail"]
+    assert not [c for c in docker.calls if c[:2] == ["docker", "stop"]]
+
+
+def test_the_quiesce_flag_must_be_a_boolean(client, docker):
+    client.post(
+        "/v1/services",
+        json=_spec(volumes=[{"name": "data", "mount_path": "/data"}], replicas=1),
+        headers=AUTH,
+    )
+    r = client.post(SNAPSHOT, headers=AUTH, json={"quiesce": "false"})
+    assert r.status_code == 400
+    assert "quiesce must be a boolean" in r.json()["detail"]
+    assert not [c for c in docker.calls if c[:2] == ["docker", "stop"]]
 
 
 def test_list_is_newest_first_and_skips_unanchored_archives(client, tmp_path):
