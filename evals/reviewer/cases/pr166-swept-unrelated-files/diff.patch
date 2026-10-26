@@ -1,0 +1,1594 @@
+diff --git a/bin/mini-ork-execute b/bin/mini-ork-execute
+index e3195997..d12bddc4 100755
+--- a/bin/mini-ork-execute
++++ b/bin/mini-ork-execute
+@@ -1841,6 +1841,27 @@ if tool_summary_path and os.path.isfile(tool_summary_path):
+         sys.stderr.write(f'tool-summary parse error: {e}\n')
+ 
+ files_written = []
++# Implementer code_region must reflect the TARGET repo's edited source, not the
++# .mini-ork run-log path passed as output_file (which relativizes to '.mini-ork'
++# when MINI_ORK_RUN_DIR is unset). Seed files_written from git-visible target-repo
++# changes FIRST — unstaged tracked edits + new untracked files (ls-files honours
++# .gitignore so .mini-ork/runs artifacts never leak in). Best-effort; falls back
++# to output_file when there are none. Parity with mini_ork_execute._tf.
++if node_type == 'implementer':
++    import subprocess
++    _tgt = os.environ.get('MO_TARGET_CWD') or ''
++    if _tgt and os.path.isdir(_tgt):
++        for _gitargs in (['diff', '--name-only'], ['ls-files', '--others', '--exclude-standard']):
++            try:
++                _r = subprocess.run(['git', '-C', _tgt, *_gitargs], capture_output=True, text=True, timeout=10)
++            except Exception:
++                continue
++            if _r.returncode != 0:
++                continue
++            for _ln in _r.stdout.splitlines():
++                _p = _ln.strip()
++                if _p and _p not in files_written:
++                    files_written.append(_p)
+ if output_file:
+     files_written.append(output_file)
+ for fw in files_written_extra:
+diff --git a/bin/mini-ork-reflect b/bin/mini-ork-reflect
+index 6fc169c1..2cf522eb 100755
+--- a/bin/mini-ork-reflect
++++ b/bin/mini-ork-reflect
+@@ -227,29 +227,12 @@ fi
+ # Track B item 4: GRPO-style lane routing — recompute relative_advantage
+ # per (lane, task_class) from group-relative trace comparisons. Default on,
+ # opt out via MO_LANE_ROUTER=0. arXiv:2601.22607 + 2603.02701.
+-#
+-# D5 wiring: when MO_ROUTER_PER_NODE_CREDIT=1, weight reward_g by per-node
+-# process_reward BEFORE the lane router reads it, then restore from the
+-# backup table so downstream consumers (next reflect cycle, replay eval,
+-# obs UI) see the unweighted rubric value. The apply step is gated on the
+-# flag; the restore step runs UNCONDITIONALLY so a stale backup from a
+-# prior crashed run can never leak — the restore path drops the table
+-# even when it is empty.
+-_D5_APPLIED=0
+ if [ "${MO_LANE_ROUTER:-1}" != "0" ] \
+    && [ -f "$MINI_ORK_ROOT/lib/lane_router.sh" ]; then
+-  if [ "${MO_ROUTER_PER_NODE_CREDIT:-0}" = "1" ]; then
+-    reflection_apply_per_node_credit 2>/dev/null || true
+-    _D5_APPLIED=1
+-  fi
+   _require_lib lane_router
+   _LANES_UPDATED=$(lane_router_recompute_advantages --since "$SINCE" 2>/dev/null || echo 0)
+   echo "  [lane_router] recomputed advantage for ${_LANES_UPDATED:-0} (lane, task_class) pair(s)"
+ fi
+-# Always run the restore so a stale backup from a prior crashed run can't
+-# leak weighted reward_g values into subsequent reflect cycles or into the
+-# obs UI. No-op when the table is absent (MO_ROUTER_PER_NODE_CREDIT=0).
+-reflection_restore_per_node_credit 2>/dev/null || true
+ 
+ # R4b: GEPA-style reflective prompt optimizer — opt-in via MO_OPTIMIZER=gepa.
+ # Wires mini_ork.optimize.gepa (Protocol + optimize()) plus
+diff --git a/docs/architecture/coevolve-ecosystem.md b/docs/architecture/coevolve-ecosystem.md
+deleted file mode 100644
+index b43a8dd7..00000000
+--- a/docs/architecture/coevolve-ecosystem.md
++++ /dev/null
+@@ -1,258 +0,0 @@
+-# The Co-Evolve Ecosystem — Architecture
+-
+-*How five systems compose into one co-evolving AI-development layer: **Co-Evolve** (the shell), **mini-ork** (the brain), **ContextNest** (the memory), **TraceOtter** (the weights), and **researcher** (the R&D loop that mines new techniques). Compiled 2026-07-11. Grounds on the per-system detail in [`techniques-compendium.md`](techniques-compendium.md); this doc is the layer *above* — how the pieces fit and how the whole thing gets better over time.*
+-
+----
+-
+-## 1. The thesis
+-
+-Most AI-dev tooling is static after deployment: a harness calls a frontier model, and every run starts from zero. Co-Evolve is the opposite bet — **one system a team owns that gets structurally better the more it's used**, along two independent axes:
+-
+-- **Usage flywheel** — every task run produces traces; those traces improve routing (which model), weights (a local model), and memory (grounded context). The next run is cheaper and better.
+-- **Research flywheel** — the system reads the AI-research frontier (arXiv), proposes improvements to *its own method*, proves each on held-out data, and adopts only what wins.
+-
+-The first flywheel compounds on *your* work. The second compounds on *the entire literature*. Neither requires a human in the loop, and every change is gated + auditable.
+-
+----
+-
+-## 2. The five components
+-
+-| Component | Role | Repo | One-line |
+-|---|---|---|---|
+-| **Co-Evolve** | The shell / product | `ps/coevolve` (Go) | The CLI + control plane a team runs; opencode-style front-end that spawns mini-ork over MCP and renders the whole loop. |
+-| **mini-ork** | The brain / orchestrator | `ps/mini-ork` (bash+Python) | Task OS: classify→plan→execute→verify→reflect→improve→eval→promote, heterogeneous model lanes, GRPO routing, GEPA, the gradient + **apply loop**. |
+-| **ContextNest** | The memory substrate | `ps/ContextNest` (Rust) | Turns session transcripts into an attractor-basin memory field; grades every claim against real tool events; serves grounded context back. |
+-| **TraceOtter** | The weight arm | `ps/TraceOtter` (Python) | Distils execution traces into an SFT dataset and LoRA-trains a small local model; held-out-gated; JitRL continual design. |
+-| **researcher** | The R&D loop | `ps/researcher` + arxiv-libwit corpus | Reads the arXiv frontier, proposes new techniques / self-improvements, and pushes them through the same held-out gate before adoption. |
+-
+-The rule of composition: **mechanics are per-system; decisions are shared.** mini-ork is the single place that decides (route, apply, promote); the others are specialized organs (memory, weights, research) it reads from and writes to.
+-
+----
+-
+-## 3. Master architecture
+-
+-```mermaid
+-flowchart TB
+-    subgraph SHELL["Co-Evolve — the shell a team owns (opencode CLI + control plane, in the customer's VPC)"]
+-        UI["dev invokes a task<br/>(CLI / Slack / IDE)"]
+-        CP["control plane: run / cost / router / context panels"]
+-    end
+-
+-    UI -->|MCP| BRAIN
+-
+-    subgraph BRAIN["mini-ork — the brain (orchestrator + policy)"]
+-        direction TB
+-        LOOP["universal loop<br/>classify → plan → execute → verify → reflect"]
+-        DECIDE{{"decide() — per-node lane<br/>GRPO relative-advantage + ε-greedy"}}
+-        TRACES[("execution_traces<br/>reward_g · cost · verdict")]
+-        SELF["self-improvement:<br/>gradients · GEPA · apply loop"]
+-        LOOP --> TRACES
+-        DECIDE -.routes.-> LOOP
+-        TRACES --> SELF
+-    end
+-
+-    subgraph MEM["ContextNest — memory"]
+-        BASINS["attractor basins + fragments"]
+-        PROV["provenance grading<br/>(observed / contradicted / absent)"]
+-        CAPSULE[["/prompt-context/capsule"]]
+-    end
+-
+-    subgraph WEIGHTS["TraceOtter — weights"]
+-        DISTIL["distil traces → episodes"]
+-        LORA["LoRA train (held-out gated)"]
+-        LOCAL[["local model<br/>72.4% route acc"]]
+-    end
+-
+-    subgraph RND["researcher — R&D loop"]
+-        ARXIV["read arXiv frontier<br/>(libwit corpus)"]
+-        PROPOSE["propose method change"]
+-        GATE{{"held-out eval gate"}}
+-        ARXIV --> PROPOSE --> GATE
+-    end
+-
+-    %% usage flywheel
+-    TRACES --> DISTIL
+-    LORA --> LOCAL
+-    LOCAL -->|"local absorbs the majority"| DECIDE
+-    TRACES --> BASINS --> PROV --> CAPSULE
+-    CAPSULE -->|"grounded prefetch"| LOOP
+-    LOOP -.->|"agent/outcome (EvoMem)"| PROV
+-    SELF -->|"promote prompt/recipe/lane change"| LOOP
+-
+-    %% research flywheel
+-    GATE -->|"adopt only what wins"| SELF
+-    TRACES -.->|"what to research next"| ARXIV
+-
+-    %% surfacing
+-    BRAIN --> CP
+-    MEM --> CP
+-    WEIGHTS --> CP
+-```
+-
+----
+-
+-## 4. How one request flows end-to-end
+-
+-1. **Invoke.** A developer fires a task through **Co-Evolve** (CLI/Slack/IDE). Co-Evolve spawns **mini-ork** over MCP inside the team's own environment — no code leaves the VPC.
+-2. **Prefetch memory.** Before planning, mini-ork pulls a kind-ordered **capsule** from **ContextNest** (risks → decisions → failures → … → artifacts), so the run starts grounded instead of rediscovering context.
+-3. **Route.** For each node, `decide()` picks a model lane by learned **GRPO relative advantage** — sending the majority to the cheap **TraceOtter local model** and reserving frontier compute for the hard minority.
+-4. **Execute + verify.** Workers run; verifier gates enforce real evidence (no "vacuous" passes). Every step lands in `execution_traces` with cost, verdict, and a scale-free `reward_g`.
+-5. **Reflect + learn.** A rubric grades the run; the reflection pipeline mines **gradients** (idempotent, deduped by semantic signature); GEPA proposes prompt rewrites scored by a real **online evaluator**.
+-6. **Apply (the loop that just closed).** `bin/mini-ork-apply` turns the highest-confidence gradient/GEPA suggestion into a `workflow_candidate`, scores it on held-out data, passes it through a **non-regression gate**, and either promotes it (rewrites the prompt + records a version) or quarantines it. Suggest-safe by default (`MO_APPLY_ENABLED`).
+-7. **Feed back.** mini-ork tells ContextNest which memories it consumed and how the run turned out (`/agent/outcome`, EvoMem) — reweighting the memory field. TraceOtter distils the new traces into the next LoRA cycle.
+-
+-Net: the run got cheaper (local routing), the memory got grounded (provenance-graded), and the system got a little better (an applied improvement) — all from one task.
+-
+----
+-
+-## 5. Flywheel 1 — Usage (compounds on *your* work)
+-
+-Three sub-loops turning on the same `execution_traces` stream:
+-
+-- **Routing (mini-ork):** GRPO relative-advantage per `(objective_domain, task_class, node_type, code_region)` group, recency-weighted, shrinkage-damped. `preferred_lane` shifts toward whichever lane beats its peers → cheaper routing over time.
+-- **Weights (TraceOtter):** traces → action-grounded route labels + MemP skills → redact/quality-gate → single-epoch LoRA on Qwen3-4B → **gate on held-out route accuracy, not train loss** (72.4% vs 0% base). JitRL will make this continual (frozen model + additive logit memory, ~30× cheaper, no forgetting).
+-- **Memory (ContextNest):** transcripts → attractor basins + fragments; every self-reported claim **graded against real tool receipts** (a "tests passed" claim that a Bash receipt contradicts is down-weighted). Retrieval score = `cosine · decay · kind · density · trust`; EvoMem outcome feedback nudges what surfaced.
+-
+-The **apply loop** is what makes these *act*: without it, all three merely *diagnose*. With it, a learned improvement becomes an applied prompt/recipe/lane change through a non-regression gate.
+-
+-## 6. Flywheel 2 — Research (compounds on *the literature*)
+-
+-This is the **researcher** organ — the second, rarer flywheel:
+-
+-1. **Read the frontier.** The researcher queries the arxiv-libwit corpus (~147K papers) for techniques relevant to the system's own weak spots (surfaced by the trace scorecard: which recipe/node underperforms).
+-2. **Propose a method change.** A concrete, scoped self-improvement — a new routing rule, a workflow mutation, a dedup strategy, a reward shape — grounded in a specific paper.
+-3. **Gate it.** The *same* held-out eval gate the apply loop uses. A proposed change is adopted only if it beats the current method on held-out data — **every change traceable to the paper it came from.**
+-4. **Adopt.** Winners flow into mini-ork's self-improvement machinery (as a candidate → promote), exactly like a usage-derived gradient.
+-
+-The two flywheels share one gate and one apply path — the research loop is "just another source of candidates," which is why the whole thing stays auditable and non-regressive. *(Build order: the eval gate is the prerequisite for both — see the arxiv-driven-R&D-loop and eval-in-run-flow research docs.)*
+-
+----
+-
+-## 7. The contracts between organs
+-
+-- **mini-ork ⇄ ContextNest:** prefetch (`cn_retrieve`, `/prompt-context/capsule`) in; `/agent/outcome` (consumed-atoms + result) out. Side-effect-light — outcome feedback only reweights metadata retrieval already reads.
+-- **mini-ork ⇄ TraceOtter:** `execution_traces` are the shared substrate; TraceOtter reads them, trains, and publishes a local model the router dispatches to.
+-- **mini-ork ⇄ researcher:** the trace scorecard says *what to research*; the researcher returns *candidate method changes* that re-enter the promote pipeline.
+-- **Co-Evolve ⇄ everything:** MCP to mini-ork; read-only panels over all three organs' state (run/cost/router/context/memory). The one process a customer runs.
+-
+-All decisions route through mini-ork's `decide()`/apply/promote — so the policy is **shared once** across consumers (eng-team, book-gen, …) via `objective_domain` partitioning, while each organ's mechanics stay native.
+-
+----
+-
+-## 8. Deployment & sovereignty
+-
+-The whole ecosystem runs **inside the customer's environment/VPC**: traces, memory, and the tuned local model never leave. Frontier calls (the hard minority) route through the customer's *own* provider account — no third-party proxy. This is the [redacted] that is also a compliance unlock: the per-customer trace corpus + tuned weights make leaving costly (revert to day-1 frontier pricing on months of retraining), and air-gapped operation satisfies the regulated-DACH mandate. (Positioning detail: `internal-docs/strategy/`.)
+-
+----
+-
+-## 9. Honest state (what's real vs in-flight)
+-
+-- **Real + shipped:** mini-ork loop + GRPO routing; ContextNest basins + provenance grading + EvoMem feedback; TraceOtter distil→LoRA at 72.4% held-out; the **learn→apply loop (merged 2026-07-11)** so GEPA/gradients now actually change prompts; Co-Evolve control-plane wiring.
+-- **Designed, not yet wired:** TraceOtter JitRL continual learning; the researcher R&D flywheel is ~70% existing mini-ork parts but its held-out eval gate for method-changes must be built first; ContextNest's elegant "neural-field/resonance" canon layer is largely dormant (basins are live, the deeper field theory is scaffolding).
+-- **Modeled, not proven on a customer:** the 84% token-cost reduction and quality-parity numbers are internal modeling / held-out, not yet validated on an external workload.
+-
+-The line to hold: this is an *outer system* — general, memory-backed, multi-lane, self-improving, deployable — whose *inner* self-improvement loop just became real. The compounding curve is the gating artifact; everything above exists to make that curve go up on both usage and research.
+-
+----
+-
+-# Appendix A — Technique deep dives (worked examples)
+-
+-*Each deep dive has three parts: **the product story** (what it buys the customer — say this to a VC), **the mechanism** (the real code, `file:line`), and **a worked example** (real numbers walked through). These are the load-bearing techniques; if a technical partner asks "but how does it actually work," this is the answer.*
+-
+----
+-
+-## A1 — How routing picks a model lane (cost-aware contextual bandit)
+-
+-> **Naming note (accuracy):** the code and older docs call this "GRPO," but it is a **cost-aware contextual bandit**, not the GRPO algorithm. GRPO samples G responses from *one trainable policy* and does a gradient weight update; routing here picks *one lane* per task among *heterogeneous closed-API models* (no shared weights, no gradients) and updates a table. It borrows exactly one idea from GRPO — the group-relative baseline — and, since PR #163, supplements it with a persistent single-sample baseline so it no longer even needs a group. See `internal-docs/research/2026-07-11-cost-efficient-grpo-learning.md`.
+-
+-
+-### The product story
+-Every coding task runs through several steps (plan, implement, review, verify). For each step, the system decides **which model to use** — a cheap local model, a mid-tier one (Kimi/MiniMax), or a frontier one (Opus/Codex). Instead of a human hard-coding "use GPT for review," the system **learns, from your own runs, which model is actually best at each kind of step on your codebase** — and it keeps adapting as models and prices change. The result: work steadily shifts to whichever model wins on *your* work, cutting cost while holding quality, with nobody tuning anything.
+-
+-The subtle-but-crucial part (and the part a technical VC will appreciate): it **compares models head-to-head on the same task**, not on their raw scores. A model that only ever gets handed easy tasks would look great on absolute score; grading it *relative to the other models on the identical task* cancels out task difficulty, so a model is only credited when it genuinely beats its peers. That's the "GRPO" (Group-Relative) idea, borrowed from RL post-training and applied to model routing.
+-
+-### The mechanism
+-Entry path: `bin/mini-ork-execute:1974` (`_mo_policy_route_lane`, policy `MO_ROUTING_POLICY=learning_governed`) → `_mo_learning_governed_lane` (`:347`) → `decide()` (`lib/decision_service.sh:80`) → `lane_router_preferred_lane` → `mini_ork/lane_router.py::preferred_lane` (`:286`). The learning itself is `recompute_advantages` (`lane_router.py:31`), run during reflect.
+-
+-The computation (`lane_router.py:117-283`), per the reward signal `reward_g` (a scale-free, direction-normalized run quality in `[−1,+1]`):
+-1. **Group** every past trace by `(objective_domain, task_class, node_type, code_region)` — traces that competed on the *same kind of work* (`:132`). Groups of 2+ get a within-group relative advantage; **single-lane runs are no longer skipped** — since PR #163 they update a persistent per-slice baseline (`lane_slice_baseline`, SPO-style) and score `advantage = reward − running_slice_mean`, so the router learns from ordinary 1× runs, not only from panel/bake-off slices (gated by `MO_ROUTER_SINGLE_SAMPLE`, default on).
+-2. **Weighted group mean** `wmean` with a **14-day recency half-life** so stale evidence fades (`:127-129, 147`).
+-3. **Per-lane advantage** = `lane_mean − wmean` (`:164`) — the lane's average minus the group's average. Positive = beats its peers on this slice.
+-4. **Cost tie-break**: when quality is flat (all scores equal), add a small bonus to the *cheaper* lane (`0.1 − 0.2·normalized_cost`, `:150-155`).
+-5. **Shrinkage** `n/(n+5)` damps low-sample lanes so a lane doesn't win on one lucky run (`:166`).
+-6. **EMA blend** with the prior value (`α=0.30`, `:217-226`) so the policy moves smoothly, not jerkily.
+-7. **Decayed defect penalty**: a lane that caused a bug in a code region gets a time-decaying penalty *for that region* (`:185-215`).
+-8. Results are written to three tables at increasing specificity: `lane_region_advantage`, `lane_domain_advantage`, `agent_performance_memory`.
+-
+-At routing time, `preferred_lane` (`:286`) selects a lane that has enough samples (`MO_LEARNING_MIN_SAMPLES=3`), cascading **region → domain → global** (`:295-330`) — most specific track record first, then falls back. Since PR #163, selection is **UCB** (`z_score_advantage + C·√(2·lnN/n)`, `MO_ROUTER_UCB_C` default 0.5) rather than raw argmax, so an under-sampled promising lane can be tried over a marginally-better well-sampled one (`MO_ROUTER_UCB_C=0` restores the legacy argmax). Cold-start safe: if nothing clears the floor, it returns empty and `decide()` uses the configured default lane (never invents one). Exploration also lives in `decide()`: an **ε-draw** (10%) that, when the bandit is on, reroutes to the **least-sampled** eligible lane (highest uncertainty) instead of uniform-random. Every routing decision can log its propensity (`route_source/route_explore/route_score`), and `scripts/router_replay_eval.py` replays the logs to check the new selector beats the legacy rule (measured +0.09 win-rate on the current corpus).
+-
+-This is a **contextual bandit**, not GRPO or off-policy RL: there is no importance-sampling correction, because off-policy estimators (IPS/DR) are unreliable under near-deterministic logging (2509.00648). The UCB exploration is what gradually buys the counterfactual coverage instead.
+-
+-### Worked example
+-Task: `code_fix`, step: `implementer`, domain: `code-delivery`. Over the last 14 days three lanes ran this step across many task instances. On each instance the lanes are graded *relative to each other*; here is one representative instance's rubric-normalized `reward_g` plus the 14-day aggregate:
+-
+-| Lane | avg reward_g (its runs) | group mean (all lanes) | advantage = lane − group | samples | after shrinkage ×n/(n+5) |
+-|---|---:|---:|---:|---:|---:|
+-| **minimax** | 0.667 | 0.50 | **+0.167** | 12 | +0.167 × 12/17 = **+0.118** |
+-| **codex** | 0.625 | 0.50 | +0.125 | 7 | +0.125 × 7/12 = +0.073 |
+-| **kimi** | 0.125 | 0.50 | −0.375 | 6 | −0.375 × 6/11 = −0.205 |
+-
+-After the EMA blend with last cycle's values, `agent_performance_memory` holds roughly: minimax **+0.11**, codex +0.07, kimi −0.20. Next time an `implementer` node fires on a `code_fix` task, `preferred_lane` runs `SELECT … ORDER BY relative_advantage DESC` with `runs_count ≥ 3` → **minimax wins**, and the node dispatches to minimax. If minimax and codex had *tied* on quality, the cost tie-break would send it to whichever is cheaper. If minimax had recently caused a bug in `src/auth/`, the region penalty would down-weight it *for that module only*, and codex might win there while minimax still wins elsewhere.
+-
+-**Why the VC cares:** this is the mechanism behind "cost falls while quality holds, and it compounds." Nobody wrote a routing table; the system derived it from the customer's own traces, and it self-corrects weekly. That per-customer routing policy *is* the [redacted] — a competitor can copy the idea but not the months of your traces it was trained on.
+-
+----
+-
+-## A2 — How gradients turn failures into fixes
+-
+-### The product story
+-The system watches its own agents work and, when something goes wrong, **writes down the fix in plain English** — e.g. "the reviewer is approving code without reading the files; make it cite evidence before giving a verdict." It generates thousands of these observations, **dedupes them into a handful of real lessons**, and (via the apply loop, A4) tests and applies the good ones — so the system's own prompts get better over time **without a human editing them**. To a customer: "it debugs and improves itself, and every improvement is traceable to the runs that motivated it."
+-
+-### The mechanism
+-A "gradient" is a **textual improvement signal** (TextGrad-style), stored in `gradient_records`: `{target, signal, suggested_change, confidence, evidence(trace_id)}` (`lib/gradient_extractor.sh`). The reflection pipeline (`lib/reflection_pipeline.sh`, run from `bin/mini-ork-reflect`) does: **extract** (an LLM reads low-reward traces and proposes 0–5 gradients each) → **dedup** → **cluster** → hand off to the apply loop.
+-
+-Three properties that make it production-safe (shipped 2026-07-11):
+-- **Idempotent extraction:** a per-trace watermark skips any trace already mined (`gradient_extractor.sh`) and excludes framework-internal `__reflect__` traces — so re-running reflect over an overlapping window doesn't re-generate the same gradient. (Before this fix: 9,777 gradients from only 1,603 traces — a 6× duplicate pile.)
+-- **Semantic-signature dedup** (`reflection_pipeline.sh`): near-identical gradients that differ only in trace-specific noise (durations like "2.7min", costs like "$1.62", trace-ids) are normalized to a **semantic signature** and collapsed. This is why 172 differently-worded "reviewer must cite evidence" observations become **one** lesson.
+-- **Confidence + evidence:** each gradient carries a 0–1 confidence and the trace-ids that produced it, so the apply loop can rank and audit.
+-
+-### Worked example
+-Real gradients pulled from a live DB, all targeting `agent.reviewer.prompt`:
+-
+-| signal (what the system observed) | suggested_change (the fix, in plain English) | confidence |
+-|---|---|---:|
+-| "Reviewer issued ESCALATE after 2.7min/$1.62 with files_read=[]" | "Require the reviewer prompt to emit a structured evidence block (files_inspected[], diff_hunks) before any verdict." | 0.95 |
+-| "Reviewer returned needs_revision with zero files_read and zero tool_calls" | "Reviewer prompt must mandate explicit file inspection before a verdict." | 0.92 |
+-| "Reviewer returned a pass verdict despite reading no files" | "Require the reviewer to cite concrete evidence from the changed files/diff/tests." | 0.92 |
+-
+-There were ~57 more phrased differently. The dominant, high-confidence theme is a single real bug — **agents giving verdicts without reading the code** ("theater"). Semantic dedup collapses all ~60 into one lesson: *"reviewer must cite evidence before verdict."* That one deduped, high-confidence gradient is what flows into the apply loop (A4), gets tested on held-out reviews, and — if it doesn't regress — rewrites the reviewer prompt to require an evidence block.
+-
+-**Why the VC cares:** this is a self-debugging system with an audit trail. It found, in its own logs, the exact failure mode ("reviewers not reading the code") that a human would take weeks to notice, and it fixes it under a gate. The diagnosis quality is high; the apply loop (A4) is what turns diagnosis into a shipped improvement.
+-
+----
+-
+-## A3 — How GEPA improves a prompt (reflective evolution)
+-
+-### The product story
+-Beyond one-line fixes, the system can **rewrite an entire prompt** for a role (say, the planner) by looking at where it failed and proposing a better version — then keeping the new prompt **only if it measurably beats the old one** on held-out tasks. It's cheaper than RL fine-tuning (a handful of evaluations, not thousands of rollouts) and every accepted change is proven, not hoped.
+-
+-### The mechanism
+-`mini_ork/optimize/gepa.py` (Genetic-Pareto reflective optimizer). Loop: keep the best prompt on a Pareto front → draw a minibatch → build a "reflective dataset" from the failures → an LLM (real lane via `MO_OPTIMIZER_MODEL`, default minimax) proposes a rewrite of one component → **strict-improvement gate on the minibatch**: keep only if `sum(new) > sum(parent)` (`:204`) → then a full eval. The fatal historical bug (fixed 2026-07-11): the evaluator could only score prompts by hash-lookup of past runs, so a *new* prompt always tied its parent and was always rejected. The fix is a real **online evaluator** `held_out_score()` that actually runs and scores the candidate — so the gate is winnable.
+-
+-### Worked example
+-Seed reviewer prompt scores **0.61** on held-out reviews. GEPA reads the failures (the "no evidence" theme), proposes: *"…before any verdict, list the files you inspected and quote the diff hunk that supports your finding; if you inspected nothing, return REQUEST_CHANGES."* On the minibatch the new prompt scores **5.9 vs 4.5** for the parent → accepted → full eval **0.74 > 0.61** → it goes on the Pareto front. A later over-strict mutation scores **5.8 vs 6.0** → rejected, no full eval spent (that's the ~35× rollout saving vs evaluating every idea fully).
+-
+----
+-
+-## A4 — How the apply loop ships a change (the loop that closes the system)
+-
+-### The product story
+-This is what makes all of the above *real* instead of a pile of suggestions: the system takes its best learned improvement, **tests it on held-out work, checks it doesn't make anything worse, and only then applies it** — rewriting the actual prompt and recording a reversible version. It's off by default (suggest-only) so nothing changes a customer's system without the gate passing. To a VC: "it doesn't just learn — it safely ships its own improvements, with a non-regression guarantee and a rollback."
+-
+-### The mechanism
+-`bin/mini-ork-apply` + `lib/apply.sh` (migration `0048_apply_attempts`): **pick** the highest-confidence candidate (from `pattern_records` / `emergent_patterns` / `gradient_records`, matched by task_class/role) → **materialize** a `workflow_candidates` row → **score** it (online eval `held_out_score`, or a mock in tests) → **non-regression gate** (`apply_evaluate_gate`: promote only if `utility_after ≥ utility_before`; else quarantine) → **promote** = rewrite the prompt file + write a `version_registry` row (reversible), or **quarantine** with an audited reason. Guards: `MO_APPLY_ENABLED` (master switch, default OFF), `MO_APPLY_DRY_RUN` (write nothing), `MO_APPLY_NONREGRESSION_DELTA` (how much regression, if any, is tolerable).
+-
+-### Worked example
+-The deduped gradient from A2 ("reviewer must cite evidence") is picked. A candidate reviewer prompt is materialized. The online evaluator scores it **0.74** vs the current prompt's **0.50** baseline → `utility_delta = +0.24 ≥ 0` → **promoted**: the reviewer prompt file is rewritten to require an evidence block and a `version_registry` row is recorded. If the same evaluator had instead scored the candidate **0.35** (a regression), the gate returns **quarantined** with the rationale "non-regression failed (0.35 < 0.50)", the prompt is left untouched, and the attempt is logged for audit. Net: a failure the system observed in its own logs became a proven, reversible prompt improvement — automatically, under a gate.
+-
+-**The whole chain, in one line for the pitch:** *a run fails → the system writes down why (gradient) → dedupes thousands of these into one real lesson → GEPA/apply proposes a fix → it's proven on held-out work under a non-regression gate → the prompt is rewritten and versioned → the next run is better.* That is the compounding curve, mechanized.
+diff --git a/kickoffs/grpo-cost-free-followup.md b/kickoffs/grpo-cost-free-followup.md
+deleted file mode 100644
+index 8fdd05b5..00000000
+--- a/kickoffs/grpo-cost-free-followup.md
++++ /dev/null
+@@ -1,65 +0,0 @@
+-# Router cost-free learning — follow-up (wire the core into the loop)
+-
+-The estimator core landed in PR #163: persistent single-sample baseline
+-(`lane_slice_baseline`), z-score normalization, UCB ordering in
+-`preferred_lane`, NeuralUCB tie-break, and the migration that adds the bandit
+-columns + the reserved D4 propensity columns
+-(`route_source/route_explore/route_score` on `execution_traces`, currently
+-NULL). This run wires the remaining deliverables so the core is actually fed and
+-provable. Still **zero** extra model calls on the default path.
+-
+-## Scope (files explicitly in scope)
+-- `lib/decision_service.sh` — D1 ε-reroute + D4 propensity writer
+-- `lib/reflection_pipeline.sh`, `bin/mini-ork-reflect` — D5 per-node credit
+-- `scripts/router_replay_eval.py` — new (D6)
+-- `tests/unit/test_lane_router_py.py`, `tests/unit/test_lane_router.sh` — new bandit assertions
+-- `docs/architecture/coevolve-ecosystem.md` — Appendix A1 rewrite
+-
+-Out of scope: `mini_ork/lane_router.py` estimator internals (already shipped),
+-provider config, weights/training.
+-
+-## Success command
+-```
+-python3 -m pytest tests/unit/test_lane_router_py.py -q && bash tests/unit/test_lane_router.sh && python3 scripts/router_replay_eval.py --db .mini-ork/state.db
+-```
+-
+-## D1b — decision_service ε-reroute
+-In `lib/decision_service.sh`, when an ε-explore draw fires, pick the
+-**highest-UCB-uncertainty** lane for the slice (lowest `runs_count` among lanes
+-clearing the floor) instead of uniform-random across `agents.yaml` candidates.
+-Gate on `MO_ROUTER_UCB_C > 0`; when 0, keep the current uniform-random ε path.
+-Accept: a unit test shows the ε path selects the least-sampled eligible lane
+-when the bandit is on, and uniform-random when off.
+-
+-## D4 — propensity writer
+-On every routing decision, write `route_source` ('exploit'|'explore'),
+-`route_explore` (0|1), and `route_score` (the UCB score used) onto the node's
+-`execution_traces` row. Nullable; only routed (executor-dispatched) nodes
+-populate them. Accept: a dispatched run leaves non-null `route_source` on routed
+-nodes; framework-internal traces stay NULL.
+-
+-## D5 — per-node credit from the single outcome
+-In the reflect gradient-stamp path, stop stamping run-level `reward_g`
+-uniformly on every node's trace; weight per-node credit toward decisive nodes
+-using the existing per-node `process_reward`/verifier signal, falling back to
+-uniform when that signal is absent. Pure reweighting of existing signal — no new
+-model calls. Accept: two nodes in one run with different `process_reward` get
+-different effective credit feeding `recompute_advantages`.
+-
+-## D6 — offline replay eval
+-New `scripts/router_replay_eval.py`: replay logged `execution_traces` and score
+-whether the new estimator (baseline + z-score + UCB) would pick a
+-higher-reward lane than the legacy greedy rule, on a held-out slice split. No new
+-inference. Accept: runs against `.mini-ork/state.db`, prints `old_winrate`,
+-`new_winrate`, `delta`; a fixture-db smoke passes in CI.
+-
+-## D7-docs — Appendix A1 rewrite
+-Update `docs/architecture/coevolve-ecosystem.md` Appendix A1 to describe the
+-actual mechanism: cost-aware contextual bandit with a persistent single-sample
+-baseline + UCB selection — NOT canonical GRPO, no off-policy correction.
+-
+-## Global acceptance
+-- Flag-gated: `MO_ROUTER_*=0` reproduces current routing exactly.
+-- No extra per-task model calls on the default path.
+-- New unit tests for D1b, D4, D5; smoke for D6.
+-- The success command passes.
+diff --git a/lib/decision_service.sh b/lib/decision_service.sh
+index 8ee704b9..34e8b953 100644
+--- a/lib/decision_service.sh
++++ b/lib/decision_service.sh
+@@ -7,13 +7,10 @@
+ # of their logic.
+ #
+ # Public API:
+-#   decide <node_type> <task_class> <objective_domain> [segment] [trace_pk]
++#   decide <node_type> <task_class> <objective_domain> [segment]
+ #       Emits a JSON object on stdout:
+ #         {
+ #           "route":           "<lane name>",
+-#           "route_source":    "exploit"|"explore",
+-#           "route_explore":   <bool>,
+-#           "route_score":     <float>,
+ #           "coalition_ok":    <bool>,
+ #           "reward_estimate": <float 0.0-1.0>,
+ #           "recursion_hint":  { ... },
+@@ -21,12 +18,6 @@
+ #           "segment":         "<segment name>",
+ #           "code_region":     "<region name or null>"
+ #         }
+-#   decision_service_log_propensity <trace_pk> <source> <explore> <score>
+-#       D4 — write route_source / route_explore / route_score onto a routed
+-#       execution_traces row. No-op when MO_ROUTER_LOG_PROPENSITY != 1
+-#       (default 0 → preserves legacy behavior; production wiring is a
+-#       follow-on that plumbs trace_pk into decide at the dispatch site).
+-#       Idempotent: re-running overwrites the same columns on the same row.
+ #
+ # Composition (pure read + compute, no per-request state):
+ #   - routing        : lane_router_preferred_lane <task_class> <node_type>
+@@ -58,23 +49,6 @@
+ #     lib/coalition_gate.sh / lib/policy_store.sh).
+ #   - decide is pure: no per-request state, no side effects, no LLM dispatch.
+ #     It composes existing read APIs and emits JSON.
+-#
+-# D1b — ε-reroute (MO_ROUTER_UCB_C > 0): when an ε-explore draw fires,
+-#     pick the lane with the lowest `runs_count` in the active slice (highest
+-#     UCB uncertainty → highest exploration bonus) instead of uniform-random
+-#     over agents.yaml candidates. Restricted to lanes that already cleared
+-#     the GRPO sample-size floor (MO_LEARNING_MIN_SAMPLES, default 3); when
+-#     no eligible lane exists we fall back to the legacy uniform path so the
+-#     bandit never starves a cold-start lane. When MO_ROUTER_UCB_C=0 the
+-#     ε-explore Python block is byte-equivalent to the pre-D1b path.
+-#
+-# D4 — propensity writer: when decide is called with an integer trace_pk
+-#     (5th positional arg) AND MO_ROUTER_LOG_PROPENSITY=1, route_source /
+-#     route_explore / route_score are written to execution_traces.id=trace_pk
+-#     via decision_service_log_propensity. Framework-internal traces
+-#     (task_class='__reflect__' etc.) are NOT routed through decide, so
+-#     their route_* columns stay NULL — matching the kickoff's acceptance
+-#     ("framework-internal traces stay NULL").
+ 
+ # Strict mode only when executed directly — never leak set -u/pipefail onto a
+ # parent that sources this lib (matches the brain libs this file composes).
+@@ -97,23 +71,17 @@ MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ # shellcheck disable=SC1091
+ . "${MINI_ORK_ROOT}/lib/config_resolve.sh"  # run-dir-first agents.yaml (T1.0)
+ 
+-# decide <node_type> <task_class> <objective_domain> [segment] [trace_pk]
++# decide <node_type> <task_class> <objective_domain> [segment]
+ #   node_type        — e.g. "implementer", "reviewer", "planner"
+ #   task_class       — e.g. "code-fix", "spec-author"
+ #   objective_domain — e.g. "eng-team", "book-gen"
+ #   segment          — optional free-form label echoed back in the JSON
+ #                      and treated as code_region when non-empty/non-default
+-#   trace_pk         — optional integer execution_traces.id. When set AND
+-#                      MO_ROUTER_LOG_PROPENSITY=1, decide writes
+-#                      route_source / route_explore / route_score onto the
+-#                      row via decision_service_log_propensity. Default
+-#                      empty (no DB write) preserves legacy behavior.
+ decide() {
+   local node_type="${1:?node_type required}"
+   local task_class="${2:?task_class required}"
+   local objective_domain="${3:-}"
+   local segment="${4:-default}"
+-  local trace_pk="${5:-}"
+   local code_region=""
+   if [ -n "$segment" ] && [ "$segment" != "default" ]; then
+     code_region="$segment"
+@@ -149,40 +117,14 @@ decide() {
+   #     decide returns the configured default lane unchanged — exploration
+   #     must NOT pull a cold-start run off its default lane (this is the
+   #     rlm-4b regression's invariant).
+-  #
+-  #     D1b — bandit reroute (MO_ROUTER_UCB_C > 0): when the ε-draw fires,
+-  #     pick the lane with the LOWEST runs_count in the active slice
+-  #     (clearing the GRPO sample floor) instead of uniform-random across
+-  #     agents.yaml. This is the exploit-time analog of preferred_lane's
+-  #     UCB bonus: under-sampled lanes get explored first. When no
+-  #     lane in the slice clears the floor, OR when MO_ROUTER_UCB_C=0,
+-  #     the path falls through to the legacy uniform-random block so
+-  #     the all-zero flag setting is byte-equivalent to pre-D1b.
+-  local _epsilon _seed _route_source _route_explore _route_score
++  local _epsilon _seed
+   _epsilon="${EPSILON:-${MO_LEARNING_EPSILON:-0.10}}"
+   _seed="${SEED:-${MO_LEARNING_SEED:-}}"
+-  _route_source="exploit"
+-  _route_explore="false"
+-  _route_score="0.0"
+   if [ -n "$learned_route" ]; then
+     local _agents_yaml; _agents_yaml="$(mo_resolve_agents_yaml)"  # run-dir-first (T1.0)
+-    # Carry the slice tuple + ucb_c + min_samples into the Python heredoc
+-    # so the bandit reroute can short-circuit when MO_ROUTER_UCB_C=0
+-    # without re-implementing the SQL read in bash. Default ucb_c=0
+-    # preserves the legacy uniform path byte-for-byte.
+-    local _ucb_c="${MO_ROUTER_UCB_C:-0}"
+-    local _min_samples="${MO_LEARNING_MIN_SAMPLES:-3}"
+-    local _route_out
+-    _route_out=$(MO_DECISION_EPSILON_AGENTS_YAML="$_agents_yaml" \
+-      MO_DECISION_EPSILON_UCB_C="$_ucb_c" \
+-      MO_DECISION_EPSILON_MIN_SAMPLES="$_min_samples" \
+-      MO_DECISION_EPSILON_DB="$STATE_DB" \
+-      MO_DECISION_EPSILON_TC="$task_class" \
+-      MO_DECISION_EPSILON_NT="$node_type" \
+-      MO_DECISION_EPSILON_OD="$objective_domain" \
+-      MO_DECISION_EPSILON_CR="$code_region" \
++    route=$(MO_DECISION_EPSILON_AGENTS_YAML="$_agents_yaml" \
+       python3 - "$route" "$_epsilon" "$_seed" <<'PY'
+-import os, random, sqlite3, sys, yaml
++import os, random, sys, yaml
+ 
+ exploit_route, epsilon_s, seed = sys.argv[1:4]
+ try:
+@@ -205,94 +147,14 @@ if seed:
+ else:
+     rng = random.SystemRandom()
+ 
+-# Emit fields on stdout in the SAME order callers parse today:
+-#   <route>\t<source>\t<explore>\t<score>
+-# Source/explore/score are routed back through command substitution; the
+-# legacy single-token contract is preserved at column 1.
+-print("\t".join([exploit_route, "exploit", "0", "0.0"]))
+-sys.exit(0) if rng.random() >= epsilon else None
+-
+-# Explore — D1b: when MO_ROUTER_UCB_C > 0, prefer the lane with the
+-# LOWEST runs_count in the active slice (clearing the sample floor).
+-# This is the exploit-time counterpart to preferred_lane's UCB bonus:
+-# under-sampled eligible lanes get explored first. Falls through to the
+-# legacy uniform-random path when:
+-#   - the bandit flag is off (MO_ROUTER_UCB_C=0),
+-#   - the DB read fails / no eligible lane exists,
+-#   - the active slice is empty (cold-start).
+-# Reads lane_region_advantage first (most-specific slice), then
+-# lane_domain_advantage, then agent_performance_memory — same precedence
+-# as preferred_lane() in mini_ork/lane_router.py.
+-ucb_c_s = os.environ.get("MO_DECISION_EPSILON_UCB_C", "0")
+-try:
+-    ucb_c = float(ucb_c_s)
+-except (TypeError, ValueError):
+-    ucb_c = 0.0
+-
+-if ucb_c > 0.0:
+-    db = os.environ.get("MO_DECISION_EPSILON_DB", "")
+-    tc  = os.environ.get("MO_DECISION_EPSILON_TC", "")
+-    nt  = os.environ.get("MO_DECISION_EPSILON_NT", "")
+-    od  = os.environ.get("MO_DECISION_EPSILON_OD", "")
+-    cr  = os.environ.get("MO_DECISION_EPSILON_CR", "")
+-    try:
+-        min_samples = int(os.environ.get("MO_DECISION_EPSILON_MIN_SAMPLES", "3"))
+-    except ValueError:
+-        min_samples = 3
+-    bandit_lane = ""
+-    bandit_score = 0.0
+-    if db and tc:
+-        try:
+-            con = sqlite3.connect(db)
+-            con.execute("PRAGMA busy_timeout=5000")
+-            con.row_factory = sqlite3.Row
+-            # Region slice first (most specific); only when both od AND cr set.
+-            tbl = None
+-            where = "task_class = ? AND runs_count >= ?"
+-            params = [tc, min_samples]
+-            if nt:
+-                where += " AND node_type = ?"
+-                params.append(nt)
+-            if od and cr:
+-                where += " AND objective_domain = ? AND code_region = ?"
+-                params += [od, cr]
+-                tbl = "lane_region_advantage"
+-            elif od:
+-                where += " AND objective_domain = ?"
+-                params.append(od)
+-                tbl = "lane_domain_advantage"
+-            else:
+-                tbl = "agent_performance_memory"
+-            row = con.execute(
+-                f"SELECT agent_version_id, runs_count, z_score_advantage "
+-                f"FROM {tbl} WHERE {where} "
+-                f"ORDER BY runs_count ASC, last_updated ASC LIMIT 1",
+-                params).fetchone()
+-            if row and row["agent_version_id"] and row["agent_version_id"] != exploit_route:
+-                n = max(int(row["runs_count"]), 1)
+-                # Heuristic score: higher when under-sampled. Matches the
+-                # preferred_lane UCB bonus shape (z + C*sqrt(2*ln(N)/n))
+-                # but we only need a comparable number for stdout logging.
+-                z = float(row["z_score_advantage"] or 0.0)
+-                # Slice-wide N total — estimate from the eligible pool.
+-                total = con.execute(
+-                    f"SELECT COALESCE(SUM(runs_count),1) FROM {tbl} WHERE {where}",
+-                    params).fetchone()[0] or 1
+-                bonus = ucb_c * (2.0 * (total + 1) / n) ** 0.5
+-                bandit_lane = str(row["agent_version_id"])
+-                bandit_score = round(z + bonus, 6)
+-            con.close()
+-        except Exception:
+-            bandit_lane = ""
+-    if bandit_lane:
+-        print("\t".join([bandit_lane, "explore", "1", str(bandit_score)]))
+-        sys.exit(0)
+-
+-# Legacy uniform-random ε path (pre-D1b byte-equivalent when
+-# MO_ROUTER_UCB_C=0). Pick a lane from agents.yaml that's not the
+-# current exploit route. Sorted + set so the seeded RNG produces stable
+-# selections across runs with the same seed (avoids hash-ordering drift
+-# on Py3 dicts).
++if rng.random() >= epsilon:
++    # No exploration this round — exploit unchanged.
++    print(exploit_route)
++    sys.exit(0)
++
++# Explore — pick a lane from agents.yaml that's not the current exploit
++# route. Sorted + set so the seeded RNG produces stable selections across
++# runs with the same seed (avoids hash-ordering drift on Py3 dicts).
+ agents_yaml = os.environ.get("MO_DECISION_EPSILON_AGENTS_YAML", "")
+ candidates = []
+ if agents_yaml and os.path.isfile(agents_yaml):
+@@ -310,23 +172,9 @@ if agents_yaml and os.path.isfile(agents_yaml):
+         # fall back to exploit rather than crashing the caller.
+         pass
+ 
+-chosen = rng.choice(sorted(candidates)) if candidates else exploit_route
+-print("\t".join([chosen, "explore", "1", "0.0"]))
++print(rng.choice(sorted(candidates)) if candidates else exploit_route)
+ PY
+     )
+-    # Parse the 4-tuple the Python block emits. Fall back to legacy
+-    # single-token contract (route only) if a caller is running an older
+-    # Python heredoc that emits a single line.
+-    if printf '%s' "$_route_out" | grep -q $'\t'; then
+-      route="${_route_out%%$'\t'*}"
+-      _rest="${_route_out#*$'\t'}"
+-      _route_source="${_rest%%$'\t'*}"
+-      _rest="${_rest#*$'\t'}"
+-      _route_explore="${_rest%%$'\t'*}"
+-      _route_score="${_rest#*$'\t'}"
+-    else
+-      route="$_route_out"
+-    fi
+   fi
+ 
+   # 2) Coalition — slice-aware family-diversity check.
+@@ -349,28 +197,14 @@ PY
+   local recursion_hint
+   recursion_hint=$(decision_service_recursion_hint)
+ 
+-  # D4 — propensity writer: stamp route_source / route_explore / route_score
+-  # onto the routed execution_traces row. Off by default so the legacy
+-  # call sites (which never pass trace_pk) keep working unchanged.
+-  # When the caller passes trace_pk AND MO_ROUTER_LOG_PROPENSITY=1, the
+-  # 4-tuple from the ε-explore block is persisted to the row.
+-  if [ -n "$trace_pk" ] && [ "${MO_ROUTER_LOG_PROPENSITY:-0}" = "1" ]; then
+-    decision_service_log_propensity \
+-      "$trace_pk" "$_route_source" "$_route_explore" "$_route_score" \
+-      || true
+-  fi
+-
+   python3 - "$route" "$coalition_ok" "$reward_mean" "$reward_sample" \
+-                "$recursion_hint" "$segment" "$code_region" \
+-                "$_route_source" "$_route_explore" "$_route_score" <<'PY'
++                "$recursion_hint" "$segment" "$code_region" <<'PY'
+ import json, sys
+-(route, coalition_ok, reward_mean, reward_sample, recursion_hint,
+- segment, code_region, route_source, route_explore, route_score) = sys.argv[1:11]
++route, coalition_ok, reward_mean, reward_sample, recursion_hint, segment, code_region = (
++    sys.argv[1:8]
++)
+ out = {
+     "route":           route,
+-    "route_source":    route_source or "exploit",
+-    "route_explore":   route_explore == "1",
+-    "route_score":     float(route_score or 0.0),
+     "coalition_ok":    coalition_ok == "1",
+     "reward_estimate": float(reward_mean),
+     "recursion_hint":  json.loads(recursion_hint),
+@@ -382,54 +216,6 @@ print(json.dumps(out, sort_keys=True))
+ PY
+ }
+ 
+-# decision_service_log_propensity <trace_pk> <source> <explore> <score>
+-#   D4 — write route_source / route_explore / route_score onto an
+-#   execution_traces row by primary key. Mirrors
+-#   mini_ork.lane_router.log_propensity; the bash copy exists so decide()
+-#   can stamp without an extra Python module import (decision_service
+-#   callers typically already source this lib, not lane_router's).
+-#   Tolerates: empty trace_pk, missing DB, missing columns — never crashes
+-#   the caller. Idempotent: re-running overwrites the same columns.
+-decision_service_log_propensity() {
+-  local trace_pk="${1:-}"
+-  local source="${2:-exploit}"
+-  local explore="${3:-0}"
+-  local score="${4:-0.0}"
+-  [ -n "$trace_pk" ] || return 0
+-  local _db="${MINI_ORK_DB:-${MO_STORE_DB:-${MINI_ORK_HOME:-.mini-ork}/state.db}}"
+-  [ -f "$_db" ] || return 0
+-  python3 - "$_db" "$trace_pk" "$source" "$explore" "$score" <<'PY' 2>/dev/null || true
+-import sqlite3, sys
+-db, trace_pk, source, explore_s, score_s = sys.argv[1:6]
+-# execution_traces' primary key is trace_id (TEXT hash), not an integer id —
+-# keep trace_pk as-is; do not int-cast.
+-if not str(trace_pk).strip():
+-    sys.exit(0)
+-try:
+-    explore = 1 if str(explore_s).strip() in ("1", "true", "True", "yes") else 0
+-except Exception:
+-    explore = 0
+-try:
+-    score = float(score_s)
+-except (TypeError, ValueError):
+-    score = 0.0
+-con = sqlite3.connect(db)
+-con.execute("PRAGMA busy_timeout=5000")
+-try:
+-    # Migration 0049 (PR #163) added the route_* columns. When the
+-    # column is absent (older DB), the UPDATE raises OperationalError
+-    # which we swallow — never break the dispatch path on a stale DB.
+-    con.execute(
+-        "UPDATE execution_traces SET route_source = ?, route_explore = ?, "
+-        "route_score = ? WHERE trace_id = ?",
+-        (source[:16], explore, score, trace_pk))
+-    con.commit()
+-except Exception:
+-    pass
+-con.close()
+-PY
+-}
+-
+ # decision_service_default_lane <node_type>
+ #   Read agents.yaml lane for a given node_type. Uses the same precedence
+ #   as lib/lane-helpers.sh's mo_assert_lane_capability:
+diff --git a/lib/reflection_pipeline.sh b/lib/reflection_pipeline.sh
+index 518f2150..f67829e3 100755
+--- a/lib/reflection_pipeline.sh
++++ b/lib/reflection_pipeline.sh
+@@ -507,158 +507,6 @@ print(approved)
+ PY
+ }
+ 
+-# desc: D5 — per-node credit from the single outcome.
+-#   reflection_apply_per_node_credit
+-#       Reweight each trace's reward_g by its per-node process_reward so
+-#       decisive nodes (high process_reward vs run mean) carry more credit
+-#       into recompute_advantages, while consensus nodes (process_reward
+-#       near 0.5) carry less. Falls back to uniform (no reweight) when a
+-#       trace's process_reward is NULL or when MO_ROUTER_PER_NODE_CREDIT=0.
+-#       Idempotent: re-running with no state carries zero net effect
+-#       because the original reward_g is restored from per_node_credit_backup
+-#       in reflection_restore_per_node_credit. Best-effort: any failure
+-#       in the apply path triggers an automatic restore so the caller
+-#       never sees a partially-weighted DB.
+-#
+-#   Math: per_node_weight = 1 + gamma * (process_reward - 0.5)
+-#         effective_reward_g = reward_g * per_node_weight
+-#         (clamped to [-1.0, +1.0] to match reward_g's documented range).
+-#         gamma defaults to 1.0 (full amplification). Set
+-#         MO_ROUTER_PER_NODE_CREDIT_GAMMA=0 for the uniform limit (no
+-#         reweight, only the backup/restore overhead remains).
+-#
+-#   State: a side-table `per_node_credit_backup` (id PRIMARY KEY,
+-#         original_reward_g REAL) is created in the same DB. It is
+-#         dropped by reflection_restore_per_node_credit at the end of
+-#         the reflect cycle. No ALTER TABLE on execution_traces — the
+-#         plan's out_of_scope rule is respected.
+-#
+-#   Cold-start: a fresh DB (no reward_g rows) is a no-op — empty backup
+-#               table is still created and immediately dropped so the
+-#               restore path stays symmetric.
+-reflection_apply_per_node_credit() {
+-  [ "${MO_ROUTER_PER_NODE_CREDIT:-0}" = "1" ] || return 0
+-  [ -n "${MINI_ORK_DB:-}" ] || return 0
+-  [ -f "${MINI_ORK_DB}" ] || return 0
+-
+-  local _gamma="${MO_ROUTER_PER_NODE_CREDIT_GAMMA:-1.0}"
+-  python3 - "${MINI_ORK_DB}" "$_gamma" <<'PY' 2>/dev/null || true
+-import os, sqlite3, sys
+-
+-db, gamma_s = sys.argv[1], sys.argv[2]
+-try:
+-    gamma = float(gamma_s)
+-except (TypeError, ValueError):
+-    gamma = 1.0
+-# Hard cap so a runaway env knob can't drive weight to 0 / negative;
+-# the kickoff's contract is a multiplier around 1.0 (range [0.5, 1.5]).
+-if gamma < 0.0:
+-    gamma = 0.0
+-if gamma > 2.0:
+-    gamma = 2.0
+-
+-con = sqlite3.connect(db)
+-con.execute("PRAGMA busy_timeout=5000")
+-con.row_factory = sqlite3.Row
+-try:
+-    cols = {r[1] for r in con.execute(
+-        "PRAGMA table_info(execution_traces)").fetchall()}
+-except sqlite3.OperationalError:
+-    con.close(); sys.exit(0)
+-if "reward_g" not in cols or "process_reward" not in cols:
+-    con.close(); sys.exit(0)
+-
+-# CREATE TABLE — keep idempotent + in the same DB so the restore path
+-# (reflection_restore_per_node_credit) sees the originals. NOT a
+-# migration — this is a transient staging table scoped to one reflect
+-# cycle.
+-con.execute(
+-    "CREATE TABLE IF NOT EXISTS per_node_credit_backup ("
+-    "  id INTEGER PRIMARY KEY,"
+-    "  original_reward_g REAL NOT NULL"
+-    ")")
+-
+-# Snapshot original reward_g BEFORE we mutate. Only rows with both a
+-# non-NULL reward_g AND a non-NULL process_reward get a backup; rows
+-# with NULL process_reward keep their uniform fallback (no reweight,
+-# no backup row either).
+-# execution_traces has no integer 'id' column (PK is trace_id, a TEXT hash);
+-# use sqlite's implicit rowid as the stable integer key for the backup.
+-con.execute(
+-    "INSERT OR REPLACE INTO per_node_credit_backup (id, original_reward_g) "
+-    "SELECT rowid, reward_g FROM execution_traces "
+-    "  WHERE reward_g IS NOT NULL "
+-    "    AND process_reward IS NOT NULL")
+-
+-cur = con.execute(
+-    "SELECT rowid AS id, reward_g, process_reward FROM execution_traces "
+-    "  WHERE reward_g IS NOT NULL "
+-    "    AND process_reward IS NOT NULL")
+-updated = 0
+-for row in cur:
+-    try:
+-        rg = float(row["reward_g"])
+-        pr = float(row["process_reward"])
+-    except (TypeError, ValueError):
+-        continue
+-    weight = 1.0 + gamma * (pr - 0.5)
+-    # Clamp to keep effective reward_g inside the documented [-1, +1] range.
+-    eff = max(-1.0, min(1.0, rg * weight))
+-    con.execute(
+-        "UPDATE execution_traces SET reward_g = ? WHERE rowid = ?",
+-        (round(eff, 6), row["id"]))
+-    updated += 1
+-con.commit()
+-con.close()
+-sys.stderr.write(
+-    f"  [d5] per-node credit: gamma={gamma:g} updated={updated} traces\n")
+-PY
+-}
+-
+-# desc: D5 — restore reward_g from per_node_credit_backup after
+-#       lane_router_recompute_advantages has consumed the reweighted
+-#       values. No-op when per_node_credit_backup is absent or empty
+-#       (e.g. MO_ROUTER_PER_NODE_CREDIT=0, fresh DB, or restore already
+-#       ran in this reflect cycle). Tolerates failures silently —
+-#       a stale backup row only risks a future reflect cycle seeing
+-#       slightly-different reward_g values on the same trace ids, never
+-#       a crash.
+-reflection_restore_per_node_credit() {
+-  [ -n "${MINI_ORK_DB:-}" ] || return 0
+-  [ -f "${MINI_ORK_DB}" ] || return 0
+-  python3 - "${MINI_ORK_DB}" <<'PY' 2>/dev/null || true
+-import sqlite3, sys
+-
+-db = sys.argv[1]
+-con = sqlite3.connect(db)
+-con.execute("PRAGMA busy_timeout=5000")
+-try:
+-    cur = con.execute(
+-        "SELECT id, original_reward_g FROM per_node_credit_backup")
+-    rows = cur.fetchall()
+-except sqlite3.OperationalError:
+-    con.close(); sys.exit(0)
+-if not rows:
+-    # Empty table — drop it and exit. Keeps the DB clean even when
+-    # MO_ROUTER_PER_NODE_CREDIT=0 (the apply path is a no-op).
+-    con.execute("DROP TABLE IF EXISTS per_node_credit_backup")
+-    con.commit()
+-    con.close(); sys.exit(0)
+-
+-restored = 0
+-for backup_rowid, original in rows:
+-    con.execute(
+-        "UPDATE execution_traces SET reward_g = ? WHERE rowid = ?",
+-        (original, backup_rowid))
+-    restored += 1
+-con.execute("DROP TABLE IF EXISTS per_node_credit_backup")
+-con.commit()
+-con.close()
+-sys.stderr.write(
+-    f"  [d5] per-node credit restored: {restored} traces reverted\n")
+-PY
+-}
+-
+ # desc: Orchestrate all reflection steps sequentially. since_ts is unix epoch;
+ #       defaults to 24 hours ago.
+ reflection_run() {
+diff --git a/mini_ork/ported/mini_ork_execute.py b/mini_ork/ported/mini_ork_execute.py
+index 4678526a..2c1ca4ec 100644
+--- a/mini_ork/ported/mini_ork_execute.py
++++ b/mini_ork/ported/mini_ork_execute.py
+@@ -236,6 +236,34 @@ def infer_trace_code_region(payload: str) -> str:
+     return ""
+ 
+ 
++def _target_repo_changed_files() -> list[str]:
++    """Repo-relative paths git sees as changed in the TARGET repo, so an
++    implementer trace's code_region reflects the edited source — not the
++    .mini-ork run-log path passed as output_file (which relativizes to
++    '.mini-ork' when MINI_ORK_RUN_DIR is unset). Covers unstaged tracked
++    edits (`git diff --name-only`) plus new untracked files (`ls-files
++    --others --exclude-standard`, which honours .gitignore so .mini-ork/runs
++    artifacts never leak in). Best-effort: any git failure yields [] and the
++    caller falls back to the impl.log path (prior behaviour)."""
++    target = os.environ.get("MO_TARGET_CWD") or ""
++    if not target or not os.path.isdir(target):
++        return []
++    files: list[str] = []
++    for args in (["diff", "--name-only"], ["ls-files", "--others", "--exclude-standard"]):
++        try:
++            r = subprocess.run(["git", "-C", target, *args],
++                               capture_output=True, text=True, timeout=10)
++        except Exception:
++            continue
++        if r.returncode != 0:
++            continue
++        for line in r.stdout.splitlines():
++            p = line.strip()
++            if p and p not in files:
++                files.append(p)
++    return files
++
++
+ # ── GRPO learning writeback (verbatim transcription of the embedded python) ──
+ 
+ def learning_update_conductor_outcomes(db) -> int:
+@@ -1337,7 +1365,12 @@ def _make_trace_fn(task_class, db, run_id):
+         # so lane_router_recompute_advantages can't group rows by lane.
+         if lane:
+             extra["agent_version_id"] = lane
+-        files_written = []
++        # Implementer code_region must reflect the TARGET repo's edited source,
++        # not the .mini-ork run-log path. Seed files_written from git-visible
++        # target-repo changes FIRST so infer_trace_code_region resolves the
++        # region from the edited repo; output_file (impl.log) stays as the
++        # fallback consumed only when there are no target-repo changes.
++        files_written = _target_repo_changed_files() if node_type == "implementer" else []
+         if output_file:
+             extra["final_artifact_ref"] = output_file
+             files_written.append(output_file)
+diff --git a/scripts/router_replay_eval.py b/scripts/router_replay_eval.py
+deleted file mode 100644
+index 2039b575..00000000
+--- a/scripts/router_replay_eval.py
++++ /dev/null
+@@ -1,393 +0,0 @@
+-#!/usr/bin/env python3
+-"""scripts/router_replay_eval.py — D6 offline replay evaluation.
+-
+-Replay logged execution_traces from a state.db and score whether the
+-bandit estimator (single-sample baseline + z-score + UCB) picks a
+-higher-reward lane than the legacy greedy (relative_advantage DESC)
+-selector, on a held-out slice split.
+-
+-No new inference — pure read against the existing execution_traces +
+-agent_performance_memory + lane_domain_advantage tables.
+-
+-The replay is intentionally deterministic: a seeded RNG plus a pinned
+-train/eval split coefficient (default 70/30) so two replays against the
+-same state.db produce identical win-rate numbers. CI smokes against
+-tests/fixtures/router_replay_fixture.db; live runs against
+-.mini-ork/state.db.
+-
+-Output (stdout, one JSON object):
+-    {
+-      "db": "<path>",
+-      "n_traces_total": <int>,
+-      "n_eval": <int>,
+-      "n_train": <int>,
+-      "old_winrate": <float>,
+-      "new_winrate": <float>,
+-      "delta": <float>,
+-      "seed": <int>,
+-      "split": <float>,
+-      "ucb_c": <float>,
+-      "notes": "<short string>"
+-    }
+-
+-Exit codes:
+-    0 — success (always, even when delta is negative; the script reports
+-        the answer, it does not gate it).
+-    1 — invocation error (missing DB, malformed args).
+-
+-Implementation notes:
+-    - Train/eval split is grouped by (objective_domain, task_class,
+-      node_type) slice so the held-out set never overlaps with a lane's
+-      training history. Without the grouping, a lane with no train rows
+-      could appear "lucky" on every eval row it owns.
+-    - The legacy selector reads agent_performance_memory (the global
+-      pool) ordered by relative_advantage DESC, runs_count DESC. The
+-      bandit selector uses the lane_domain_advantage z_score_advantage
+-      with a UCB bonus; when no z-scored row exists the lane drops
+-      back to the legacy order so cold-start paths match.
+-    - Both selectors project onto (task_class, node_type) the trace
+-      belonged to, so we measure within-slice routing quality — not
+-      cross-slice leakage.
+-"""
+-from __future__ import annotations
+-
+-import argparse
+-import json
+-import math
+-import os
+-import random
+-import sqlite3
+-import sys
+-from collections import defaultdict
+-
+-
+-DEFAULT_DB = os.environ.get("MINI_ORK_DB") or os.path.join(
+-    os.environ.get("MINI_ORK_HOME", ".mini-ork"), "state.db")
+-
+-
+-def _parse_args(argv):
+-    p = argparse.ArgumentParser(
+-        description=(__doc__ or "router replay eval").splitlines()[0])
+-    p.add_argument("--db", default=DEFAULT_DB,
+-                   help=f"path to state.db (default: {DEFAULT_DB})")
+-    p.add_argument("--seed", type=int, default=20260711,
+-                   help="RNG seed (default: 20260711, the recipe's launch date)")
+-    p.add_argument("--split", type=float, default=0.30,
+-                   help="held-out eval fraction (default: 0.30)")
+-    p.add_argument("--ucb-c", type=float, default=0.5,
+-                   help="UCB C parameter (default: 0.5, matches estimator core)")
+-    p.add_argument("--min-samples", type=int, default=3,
+-                   help="lane floor; matches MO_LEARNING_MIN_SAMPLES (default: 3)")
+-    p.add_argument("--limit", type=int, default=0,
+-                   help="max traces to evaluate (0 = all; default: 0)")
+-    return p.parse_args(argv)
+-
+-
+-def _detect_cols(con, table):
+-    return {r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()}
+-
+-
+-def _fetch_traces(con):
+-    """Read every routed execution_traces row with a non-NULL reward_g.
+-
+-    Framework-internal traces (task_class starting with `__`) are
+-    skipped — they carry only meta payload, no real signal to learn
+-    from, matching reflection_extract_gradients' policy.
+-    """
+-    cols = set(_detect_cols(con, "execution_traces"))
+-    # execution_traces' PK is trace_id (TEXT); use sqlite's implicit integer
+-    # rowid as the ordering/reference key (aliased to 'id' downstream).
+-    need = {"task_class", "agent_version_id", "reward_g",
+-            "objective_domain", "verifier_output", "code_region",
+-            "created_at"}
+-    if not need.issubset(cols):
+-        missing = sorted(need - cols)
+-        raise RuntimeError(f"execution_traces missing columns: {missing}")
+-
+-    rows = con.execute(
+-        "SELECT rowid AS id, task_class, agent_version_id, reward_g, objective_domain, "
+-        "       verifier_output, code_region, created_at "
+-        "  FROM execution_traces "
+-        " WHERE task_class IS NOT NULL AND task_class <> '' "
+-        "   AND task_class NOT LIKE '\\_%' ESCAPE '\\' "
+-        "   AND agent_version_id IS NOT NULL AND agent_version_id <> '' "
+-        "   AND reward_g IS NOT NULL "
+-        " ORDER BY rowid ASC").fetchall()
+-    out = []
+-    for r in rows:
+-        node_type = "unknown"
+-        try:
+-            vo = json.loads(r["verifier_output"] or "{}")
+-            v = vo.get("node_type")
+-            if v:
+-                node_type = str(v)
+-        except Exception:
+-            pass
+-        out.append({
+-            "id": int(r["id"]),
+-            "task_class": r["task_class"],
+-            "agent_version_id": r["agent_version_id"],
+-            "reward_g": float(r["reward_g"]),
+-            "objective_domain": r["objective_domain"] or "",
+-            "code_region": r["code_region"] or "",
+-            "node_type": node_type,
+-        })
+-    return out
+-
+-
+-def _split_train_eval(traces, eval_frac, seed):
+-    """Deterministic group-aware train/eval split.
+-
+-    Groups by (objective_domain, task_class, node_type) so the held-out
+-    set never shares a slice with the training set. The seed makes the
+-    per-group draw reproducible across runs against the same DB.
+-    """
+-    rng = random.Random(seed)
+-    by_group = defaultdict(list)
+-    for t in traces:
+-        by_group[(t["objective_domain"], t["task_class"], t["node_type"])].append(t)
+-    train, eval_ = [], []
+-    for group in by_group.values():
+-        rng.shuffle(group)
+-        n_eval = max(1, int(round(len(group) * eval_frac)))
+-        eval_.extend(group[:n_eval])
+-        train.extend(group[n_eval:])
+-    rng.shuffle(eval_)
+-    return train, eval_
+-
+-
+-def _legacy_pool(con, train, min_samples):
+-    """Legacy selector pool: per (task_class, node_type, od) the best
+-    lane by relative_advantage DESC, runs_count DESC, restricted to
+-    lanes seen in the training set."""
+-    seen = defaultdict(set)
+-    for t in train:
+-        seen[(t["task_class"], t["node_type"], t["objective_domain"])].add(
+-            t["agent_version_id"])
+-    pool = defaultdict(list)
+-    cols = _detect_cols(con, "agent_performance_memory")
+-    if "relative_advantage" not in cols:
+-        return pool
+-    for (tc, nt, od), lanes in seen.items():
+-        if not lanes:
+-            continue
+-        placeholders = ",".join("?" * len(lanes))
+-        where = ("task_class = ? AND agent_version_id IN ("
+-                 + placeholders + ") AND runs_count >= ?")
+-        params = [tc, *lanes, min_samples]
+-        if "node_type" in cols and nt:
+-            where += " AND (node_type = ? OR node_type = '')"
+-            params.append(nt)
+-        if "objective_domain" in cols and od:
+-            where += " AND objective_domain = ?"
+-            params.append(od)
+-        try:
+-            rows = con.execute(
+-                f"SELECT agent_version_id, relative_advantage, runs_count "
+-                f"  FROM agent_performance_memory WHERE {where} "
+-                f" ORDER BY relative_advantage DESC, runs_count DESC",
+-                params).fetchall()
+-        except sqlite3.OperationalError:
+-            continue
+-        pool[(tc, nt, od)] = [(r["agent_version_id"],
+-                               float(r["relative_advantage"] or 0.0))
+-                              for r in rows]
+-    return pool
+-
+-
+-def _bandit_pool(con, train, min_samples, ucb_c):
+-    """Bandit selector pool: per (task_class, node_type, od, code_region)
+-    the lane with the highest UCB score (z + C*sqrt(2*ln(N+1)/n)). When
+-    no z-scored row exists, the lane drops back to the legacy ordering
+-    so cold-start paths match.
+-    """
+-    seen = defaultdict(set)
+-    for t in train:
+-        seen[(t["task_class"], t["node_type"], t["objective_domain"],
+-              t["code_region"])].add(t["agent_version_id"])
+-    pool = defaultdict(list)
+-    cols_d = _detect_cols(con, "lane_domain_advantage")
+-    cols_r = _detect_cols(con, "lane_region_advantage")
+-    if "z_score_advantage" not in cols_d:
+-        return pool
+-
+-    def _read(table, where_extra, params_extra, lanes):
+-        if not lanes:
+-            return []
+-        placeholders = ",".join("?" * len(lanes))
+-        where = ("task_class = ? AND agent_version_id IN ("
+-                 + placeholders + ") AND runs_count >= ?")
+-        params = [params_extra["tc"], *lanes, min_samples]
+-        if "node_type" in _detect_cols(con, table) and params_extra.get("nt"):
+-            where += " AND node_type = ?"
+-            params.append(params_extra["nt"])
+-        if "objective_domain" in _detect_cols(con, table) \
+-                and params_extra.get("od"):
+-            where += " AND objective_domain = ?"
+-            params.append(params_extra["od"])
+-        if "code_region" in _detect_cols(con, table) \
+-                and params_extra.get("cr"):
+-            where += " AND code_region = ?"
+-            params.append(params_extra["cr"])
+-        where += where_extra
+-        try:
+-            return con.execute(
+-                f"SELECT agent_version_id, z_score_advantage, "
+-                f"       relative_advantage, runs_count "
+-                f"  FROM {table} WHERE {where}",
+-                params).fetchall()
+-        except sqlite3.OperationalError:
+-            return []
+-
+-    for (tc, nt, od, cr), lanes in seen.items():
+-        rows = []
+-        if cr:
+-            rows = _read("lane_region_advantage", "",
+-                         {"tc": tc, "nt": nt, "od": od, "cr": cr}, lanes)
+-        if not rows and od:
+-            rows = _read("lane_domain_advantage", "",
+-                         {"tc": tc, "nt": nt, "od": od, "cr": None}, lanes)
+-        if not rows:
+-            continue
+-        total_n = sum(int(r["runs_count"]) for r in rows) or 1
+-        scored = []
+-        for r in rows:
+-            z = float(r["z_score_advantage"] or 0.0)
+-            n = max(int(r["runs_count"]), 1)
+-            bonus = ucb_c * math.sqrt(2.0 * math.log(total_n + 1) / n)
+-            scored.append((r["agent_version_id"], z + bonus))
+-        scored.sort(key=lambda t: t[1], reverse=True)
+-        pool[(tc, nt, od, cr)] = scored
+-    return pool
+-
+-
+-def _pick(pool, key, fallback):
+-    """Pick the highest-ranked lane in `pool[key]`; on miss return
+-    `fallback` (the trace's own lane — a fair baseline)."""
+-    candidates = pool.get(key)
+-    if not candidates:
+-        return fallback
+-    return candidates[0][0]
+-
+-
+-def _winner_picked(chosen, trace, pool):
+-    """Was the trace's lane the chosen lane? Returns bool. When the
+-    chosen lane differs, we report a 'wrong' pick — i.e. the selector
+-    would have routed elsewhere."""
+-    return chosen == trace["agent_version_id"]
+-
+-
+-def _reward_for(trace, train):
+-    """Reward estimate for a single trace under a hypothetical reroute.
+-
+-    We don't have a counterfactual for the reroute (we only have what
+-    actually happened), so the win/loss verdict is: did the selector
+-    pick the trace's actual lane, AND would that lane have produced
+-    higher reward_g than the average lane in the slice on the training
+-    set? Returns a tuple (selector_match, beat_baseline).
+-    """
+-    # Group-relative baseline: mean reward_g over training rows in the
+-    # same (objective_domain, task_class, node_type) slice.
+-    pool = [t["reward_g"] for t in train
+-            if t["objective_domain"] == trace["objective_domain"]
+-            and t["task_class"] == trace["task_class"]
+-            and t["node_type"] == trace["node_type"]]
+-    if pool:
+-        baseline = sum(pool) / len(pool)
+-    else:
+-        baseline = 0.0
+-    return baseline
+-
+-
+-def main(argv):
+-    args = _parse_args(argv)
+-
+-    if not os.path.isfile(args.db):
+-        print(json.dumps({
+-            "error": f"db not found: {args.db}",
+-            "old_winrate": 0.0,
+-            "new_winrate": 0.0,
+-            "delta": 0.0,
+-        }))
+-        return 1
+-
+-    con = sqlite3.connect(args.db)
+-    con.execute("PRAGMA busy_timeout=5000")
+-    con.row_factory = sqlite3.Row
+-    try:
+-        traces = _fetch_traces(con)
+-        if not traces:
+-            print(json.dumps({
+-                "db": args.db,
+-                "n_traces_total": 0,
+-                "n_eval": 0,
+-                "n_train": 0,
+-                "old_winrate": 0.0,
+-                "new_winrate": 0.0,
+-                "delta": 0.0,
+-                "seed": args.seed,
+-                "split": args.split,
+-                "ucb_c": args.ucb_c,
+-                "notes": "no routed traces in DB; replay is a no-op",
+-            }))
+-            return 0
+-        if args.limit and len(traces) > args.limit:
+-            # Deterministic truncation by seed — keeps the smoke run
+-            # small without losing determinism for repeated CI runs.
+-            rng = random.Random(args.seed)
+-            traces = rng.sample(traces, args.limit)
+-
+-        train, eval_ = _split_train_eval(traces, args.split, args.seed)
+-        legacy = _legacy_pool(con, train, args.min_samples)
+-        bandit = _bandit_pool(con, train, args.min_samples, args.ucb_c)
+-
+-        old_wins, new_wins, total = 0, 0, 0
+-        for t in eval_:
+-            legacy_key = (t["task_class"], t["node_type"], t["objective_domain"])
+-            bandit_key = (t["task_class"], t["node_type"],
+-                          t["objective_domain"], t["code_region"])
+-            old_pick = _pick(legacy, legacy_key, t["agent_version_id"])
+-            new_pick = _pick(bandit, bandit_key, t["agent_version_id"])
+-            old_match = _winner_picked(old_pick, t, legacy)
+-            new_match = _winner_picked(new_pick, t, bandit)
+-            # Reward scoring: legacy/bandid picks are scored against the
+-            # mean reward_g of training-set lanes in the same slice. The
+-            # winner is the selector that picks a lane ABOVE the slice
+-            # baseline. When both pick the same lane we credit both.
+-            baseline = _reward_for(t, train)
+-            # Score the actual chosen lane's expected reward (we use the
+-            # trace's own reward_g as a noisy proxy for "how good was
+-            # the chosen lane on this eval slice").
+-            actual = t["reward_g"]
+-            if old_match and actual > baseline:
+-                old_wins += 1
+-            if new_match and actual > baseline:
+-                new_wins += 1
+-            total += 1
+-
+-        old_rate = (old_wins / total) if total else 0.0
+-        new_rate = (new_wins / total) if total else 0.0
+-        result = {
+-            "db": args.db,
+-            "n_traces_total": len(traces),
+-            "n_eval": len(eval_),
+-            "n_train": len(train),
+-            "old_winrate": round(old_rate, 4),
+-            "new_winrate": round(new_rate, 4),
+-            "delta": round(new_rate - old_rate, 4),
+-            "seed": args.seed,
+-            "split": args.split,
+-            "ucb_c": args.ucb_c,
+-            "notes": (
+-                "win = selector picked the trace's actual lane AND "
+-                "actual reward_g beat the slice mean on the training set"
+-            ),
+-        }
+-        print(json.dumps(result, sort_keys=True))
+-        return 0
+-    finally:
+-        con.close()
+-
+-
+-if __name__ == "__main__":
+-    sys.exit(main(sys.argv[1:]))
+\ No newline at end of file
+diff --git a/tests/unit/test_mini_ork_execute_py.py b/tests/unit/test_mini_ork_execute_py.py
+index 6df9aec0..e3245325 100644
+--- a/tests/unit/test_mini_ork_execute_py.py
++++ b/tests/unit/test_mini_ork_execute_py.py
+@@ -623,6 +623,7 @@ def test_trace_fn_merges_tool_summary_sidecar_and_lane(tmp_path, monkeypatch):
+     # bash _trace_write_node_rich. And the resolved lane must land as agent_version_id.
+     db = _seed_db(tmp_path, "sidecar"); _seed_task_run(db, rid="run-x", status="executing")
+     monkeypatch.setenv("MINI_ORK_DB", db)
++    monkeypatch.delenv("MO_TARGET_CWD", raising=False)  # keep files_written deterministic (no target-repo seed)
+     out = tmp_path / "impl.log"; out.write_text("implementer output\n")
+     # Seed the tool-summary sidecar next to the output file, bash-shaped.
+     (tmp_path / "impl.log.tool-summary").write_text(json.dumps({
+@@ -650,6 +651,7 @@ def test_trace_fn_no_sidecar_leaves_tool_calls_empty(tmp_path, monkeypatch):
+     # merge is strictly best-effort and gated on sidecar existence, like bash).
+     db = _seed_db(tmp_path, "nosidecar"); _seed_task_run(db, rid="run-n", status="executing")
+     monkeypatch.setenv("MINI_ORK_DB", db)
++    monkeypatch.delenv("MO_TARGET_CWD", raising=False)  # keep files_written deterministic (no target-repo seed)
+     out = tmp_path / "impl.log"; out.write_text("out\n")
+     tf = ex._make_trace_fn("code_fix", db, "run-n")
+     tf("impl1", "success", "implementer", output_file=str(out), lane="codex_lens")
+@@ -662,6 +664,33 @@ def test_trace_fn_no_sidecar_leaves_tool_calls_empty(tmp_path, monkeypatch):
+     assert agent == "codex_lens"
+ 
+ 
++def test_implementer_trace_code_region_from_target_repo(tmp_path, monkeypatch):
++    # Regression: an implementer node's code_region must reflect the TARGET repo's
++    # edited source dir, NOT '.mini-ork'. The impl.log passed as output_file lives
++    # under $MO_TARGET_CWD/.mini-ork/runs/<id>/ — with MINI_ORK_RUN_DIR unset it
++    # relativizes to '.mini-ork', poisoning the GRPO code_region slice. files_written
++    # must be seeded from git-visible target-repo changes first (untracked + unstaged),
++    # and .mini-ork/runs artifacts must be excluded via .gitignore.
++    db = _seed_db(tmp_path, "implregion"); _seed_task_run(db, rid="run-i", status="executing")
++    repo = _git_repo(tmp_path / "repo")
++    (repo / ".gitignore").write_text(".mini-ork/runs/\n")   # mirror production: run artifacts ignored
++    subprocess.run(["git", "-C", str(repo), "add", ".gitignore"], check=True, capture_output=True)
++    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "gitignore"], check=True, capture_output=True)
++    (repo / "app").mkdir()
++    (repo / "app" / "service.py").write_text("x = 1\n")     # new untracked source edit (implementer output)
++    run_dir = repo / ".mini-ork" / "runs" / "run-i"; run_dir.mkdir(parents=True)
++    impl_log = run_dir / "impl-impl1.log"; impl_log.write_text("done\n")  # the poisoning output_file
++    monkeypatch.setenv("MINI_ORK_DB", db)
++    monkeypatch.setenv("MO_TARGET_CWD", str(repo))
++    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)   # the env that triggered the bug
++    monkeypatch.delenv("RUN_DIR", raising=False)
++    tf = ex._make_trace_fn("code_fix", db, "run-i")
++    tf("impl1", "success", "implementer", output_file=str(impl_log), finish_reason="done")
++    region = _sql(db, "SELECT code_region FROM execution_traces "
++                      "WHERE run_id='run-i';").stdout.strip()
++    assert region == "app", f"expected 'app' from target-repo edit, got {region!r}"
++
++
+ # ── orchestration backbone parity (NODE_IDS + --dry-run) ──
+ 
+ def _py_blocks():
+diff --git a/tests/unit/test_pattern_store_py.py b/tests/unit/test_pattern_store_py.py
+index d9066891..b48b0da8 100644
+--- a/tests/unit/test_pattern_store_py.py
++++ b/tests/unit/test_pattern_store_py.py
+@@ -361,14 +361,8 @@ def test_mine_from_traces_deterministic_ids(tmp_path):
+     _init_temp_db(py_db)
+ 
+     # Seed execution_traces on both sides: 3 failures, 1 success.
+-    # Timestamp must be seeded RELATIVE to the current time — a hardcoded
+-    # absolute date silently ages out of the `--window 7d` filter and turns
+-    # this test red days later (relative-window time-bomb). 1 day ago is
+-    # always well inside the window; the deterministic pattern id hashes
+-    # task_class|status, not the timestamp, so this stays reproducible.
+-    import datetime as _dt
+-    now = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=1)).strftime(
+-        "%Y-%m-%dT%H:%M:%S.000Z")
++    # Use ISO timestamps well within a 7d window.
++    now = "2026-07-04T12:00:00.000Z"
+     trace_rows = [
+         ("tr-f1", "code_fix", "failure", now),
+         ("tr-f2", "code_fix", "failure", now),
+diff --git a/tests/unit/test_reflection_pipeline_py.py b/tests/unit/test_reflection_pipeline_py.py
+index be2feac2..fd8426bd 100644
+--- a/tests/unit/test_reflection_pipeline_py.py
++++ b/tests/unit/test_reflection_pipeline_py.py
+@@ -362,13 +362,10 @@ def test_reflection_detect_stale(temp_db):
+     assert sorted(bash_json["stale_ids"]) == sorted(py_json["stale_ids"]) == [
+         "g-stale-1", "g-stale-2",
+     ]
+-    # Bash and Python compute `now` in two separate subprocesses; when the
+-    # window base is truncated to integer seconds, the two calls can land on
+-    # opposite sides of a second boundary and differ by exactly 1 (observed:
+-    # bash=…654 vs py=…655). Tolerate a full-second straddle — a 1e-6 gate was
+-    # a CI time-bomb that flaked whenever the calls crossed a second.
++    # Bash uses time.time() inside python3 — float; Python uses time.time() —
++    # also float. They may differ by milliseconds. Use the float-tolerance gate.
+     assert math.isclose(bash_json["stale_before_epoch"], py_json["stale_before_epoch"],
+-                        rel_tol=0, abs_tol=2), (
++                        rel_tol=0, abs_tol=1e-6), (
+         f"stale_before_epoch mismatch: bash={bash_json['stale_before_epoch']} py={py_json['stale_before_epoch']}"
+     )
+     # Stderr summary must match byte-for-byte.
+diff --git a/tests/unit/test_router_followup.sh b/tests/unit/test_router_followup.sh
+deleted file mode 100644
+index feadad35..00000000
+--- a/tests/unit/test_router_followup.sh
++++ /dev/null
+@@ -1,134 +0,0 @@
+-#!/usr/bin/env bash
+-# tests/unit/test_router_followup.sh — unit tests for the router cost-free
+-# follow-up: D1b (ε-reroute to the least-sampled lane), D4 (propensity writer),
+-# and D5 (per-node credit reweight + restore).
+-#
+-# Verifies, against an isolated temp SQLite DB:
+-#   D4.write   — decision_service_log_propensity writes route_source /
+-#                route_explore / route_score onto the row whose trace_id
+-#                matches, and ONLY that row.
+-#   D4.default — MO_ROUTER_* off / no trace_pk → no rows stamped.
+-#   D5.apply   — reflection_apply_per_node_credit reweights reward_g by
+-#                process_reward (decisive node up, low-signal node down),
+-#                gated behind MO_ROUTER_PER_NODE_CREDIT=1.
+-#   D5.restore — reflection_restore_per_node_credit reverts reward_g exactly
+-#                and drops the backup table.
+-#   D5.off     — MO_ROUTER_PER_NODE_CREDIT=0 → reward_g untouched.
+-#   D1b.reroute— with MO_ROUTER_UCB_C>0, the ε-explore draw picks the lane
+-#                with the lowest runs_count (highest UCB uncertainty).
+-#
+-# Run: bash tests/unit/test_router_followup.sh
+-# Exit 0 on all green, non-zero otherwise.
+-
+-set -uo pipefail
+-
+-MINI_ORK_ROOT="${MINI_ORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+-export MINI_ORK_ROOT
+-
+-PASS=0; FAIL=0; SKIP=0
+-_ok()   { echo "  [OK]   $*"; PASS=$((PASS+1)); }
+-_fail() { echo "  [FAIL] $*"; FAIL=$((FAIL+1)); }
+-_skip() { echo "  [SKIP] $*"; SKIP=$((SKIP+1)); }
+-
+-echo "── unit: router follow-up (D1b/D4/D5) ──"
+-
+-DS="$MINI_ORK_ROOT/lib/decision_service.sh"
+-RP="$MINI_ORK_ROOT/lib/reflection_pipeline.sh"
+-INIT="$MINI_ORK_ROOT/db/init.sh"
+-if [ ! -f "$DS" ] || [ ! -f "$RP" ] || [ ! -f "$INIT" ]; then
+-  _skip "decision_service.sh / reflection_pipeline.sh / db/init.sh missing"
+-  echo ""; echo "── Results: ${PASS} OK  ${SKIP} SKIP  ${FAIL} FAIL ──"
+-  [ "$FAIL" -eq 0 ] && exit 0 || exit 1
+-fi
+-
+-TMPD="$(mktemp -d)"
+-trap 'rm -rf "$TMPD"' EXIT
+-export MINI_ORK_DB="$TMPD/state.db"
+-if ! MINI_ORK_DB="$MINI_ORK_DB" bash "$INIT" >/dev/null 2>&1; then
+-  _skip "db/init.sh failed to build a test DB"
+-  echo ""; echo "── Results: ${PASS} OK  ${SKIP} SKIP  ${FAIL} FAIL ──"
+-  [ "$FAIL" -eq 0 ] && exit 0 || exit 1
+-fi
+-
+-_seed_traces() {
+-  sqlite3 "$MINI_ORK_DB" "DELETE FROM execution_traces;
+-    INSERT INTO execution_traces
+-      (trace_id,run_id,agent_version_id,task_class,status,created_at,reward_g,process_reward,objective_domain)
+-    VALUES
+-      ('tid-A','r1','codex_lens','code_fix','success','2026-07-11T10:00:00.000Z',0.8,0.9,'eng'),
+-      ('tid-B','r1','kimi_lens','code_fix','success','2026-07-11T10:00:00.000Z',0.8,0.3,'eng');"
+-}
+-
+-# shellcheck disable=SC1090
+-source "$DS" 2>/dev/null
+-# shellcheck disable=SC1090
+-source "$RP" 2>/dev/null
+-
+-# ── D4.write ────────────────────────────────────────────────────────────────
+-_seed_traces
+-decision_service_log_propensity "tid-A" "explore" "1" "0.42" >/dev/null 2>&1
+-got="$(sqlite3 "$MINI_ORK_DB" "SELECT trace_id||'|'||route_source||'|'||route_explore||'|'||route_score FROM execution_traces WHERE route_source IS NOT NULL;")"
+-[ "$got" = "tid-A|explore|1|0.42" ] \
+-  && _ok "D4.write — propensity stamped on tid-A only ($got)" \
+-  || _fail "D4.write — expected 'tid-A|explore|1|0.42', got '$got'"
+-
+-# ── D4.default ───────────────────────────────────────────────────────────────
+-_seed_traces
+-decision_service_log_propensity "" "exploit" "0" "0.0" >/dev/null 2>&1
+-n="$(sqlite3 "$MINI_ORK_DB" "SELECT COUNT(*) FROM execution_traces WHERE route_source IS NOT NULL;")"
+-[ "$n" = "0" ] \
+-  && _ok "D4.default — empty trace_pk stamps nothing" \
+-  || _fail "D4.default — expected 0 stamped, got $n"
+-
+-# ── D5.apply ────────────────────────────────────────────────────────────────
+-_seed_traces
+-MO_ROUTER_PER_NODE_CREDIT=1 MO_ROUTER_PER_NODE_CREDIT_GAMMA=1.0 reflection_apply_per_node_credit >/dev/null 2>&1
+-ra="$(sqlite3 "$MINI_ORK_DB" "SELECT printf('%.2f',reward_g) FROM execution_traces WHERE trace_id='tid-A';")"
+-rb="$(sqlite3 "$MINI_ORK_DB" "SELECT printf('%.2f',reward_g) FROM execution_traces WHERE trace_id='tid-B';")"
+-# A: 0.8*(1+1*(0.9-0.5))=1.12 → clamp 1.00 ; B: 0.8*(1+1*(0.3-0.5))=0.64
+-{ [ "$ra" = "1.00" ] && [ "$rb" = "0.64" ]; } \
+-  && _ok "D5.apply — decisive node up (A=$ra), low-signal down (B=$rb)" \
+-  || _fail "D5.apply — expected A=1.00 B=0.64, got A=$ra B=$rb"
+-
+-# ── D5.restore ──────────────────────────────────────────────────────────────
+-reflection_restore_per_node_credit >/dev/null 2>&1
+-ra="$(sqlite3 "$MINI_ORK_DB" "SELECT printf('%.2f',reward_g) FROM execution_traces WHERE trace_id='tid-A';")"
+-rb="$(sqlite3 "$MINI_ORK_DB" "SELECT printf('%.2f',reward_g) FROM execution_traces WHERE trace_id='tid-B';")"
+-tbl="$(sqlite3 "$MINI_ORK_DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='per_node_credit_backup';")"
+-{ [ "$ra" = "0.80" ] && [ "$rb" = "0.80" ] && [ "$tbl" = "0" ]; } \
+-  && _ok "D5.restore — reward_g reverted (A=$ra B=$rb) + backup dropped" \
+-  || _fail "D5.restore — expected A=0.80 B=0.80 tbl=0, got A=$ra B=$rb tbl=$tbl"
+-
+-# ── D5.off ──────────────────────────────────────────────────────────────────
+-_seed_traces
+-MO_ROUTER_PER_NODE_CREDIT=0 reflection_apply_per_node_credit >/dev/null 2>&1
+-ra="$(sqlite3 "$MINI_ORK_DB" "SELECT printf('%.2f',reward_g) FROM execution_traces WHERE trace_id='tid-A';")"
+-[ "$ra" = "0.80" ] \
+-  && _ok "D5.off — MO_ROUTER_PER_NODE_CREDIT=0 leaves reward_g untouched" \
+-  || _fail "D5.off — expected 0.80, got $ra"
+-
+-# ── D1b.reroute ─────────────────────────────────────────────────────────────
+-# Seed two lanes in the same slice with different runs_count; the bandit
+-# ε-reroute must prefer the least-sampled (highest-uncertainty) lane.
+-if declare -f decide >/dev/null 2>&1; then
+-  sqlite3 "$MINI_ORK_DB" "INSERT INTO lane_domain_advantage
+-      (agent_version_id,task_class,node_type,objective_domain,relative_advantage,runs_count,success_count)
+-    VALUES
+-      ('codex_lens','code_fix','impl','eng', 0.30, 40, 30),
+-      ('kimi_lens','code_fix','impl','eng', 0.10,  4,  3);" 2>/dev/null
+-  # EPSILON=1 forces the explore branch on every draw; MO_ROUTER_UCB_C>0 turns
+-  # on the uncertainty reroute. Expect the least-sampled lane (kimi_lens, n=4).
+-  route="$(EPSILON=1 MO_ROUTER_UCB_C=0.5 MO_LEARNING_MIN_SAMPLES=1 \
+-    decide "impl" "code_fix" "eng" 2>/dev/null | head -1)"
+-  if printf '%s' "$route" | grep -q "kimi_lens"; then
+-    _ok "D1b.reroute — ε-explore picked least-sampled lane (kimi_lens): $route"
+-  else
+-    _skip "D1b.reroute — decide returned '$route' (needs agents.yaml lane wiring; core reroute SELECT covered by replay eval)"
+-  fi
+-else
+-  _skip "D1b.reroute — decide() not sourced"
+-fi
+-
+-echo ""
+-echo "── Results: ${PASS} OK  ${SKIP} SKIP  ${FAIL} FAIL ──"
+-[ "$FAIL" -eq 0 ] && exit 0 || exit 1

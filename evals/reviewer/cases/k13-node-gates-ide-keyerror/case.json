@@ -1,0 +1,23 @@
+{
+  "id": "k13-node-gates-ide-keyerror",
+  "kind": "incident",
+  "expect": "block",
+  "source": {
+    "run": "eco6-k13-remove-node-gates-20261025-130443",
+    "commit": ""
+  },
+  "defect": {
+    "files": [
+      "mini_ork/ide_pages/run.py",
+      "mini_ork/ide_pages/node.py"
+    ],
+    "summary": "removes the node gates field while the IDE node/run pages still render a Gates row, so the run page loses its node section",
+    "keywords": [
+      "Gates",
+      "KeyError",
+      "ide_pages"
+    ]
+  },
+  "added_at": "2026-10-26",
+  "notes": ""
+}

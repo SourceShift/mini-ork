@@ -1,0 +1,16 @@
+{
+  "id": "clean-k9-cn-outcome-ids",
+  "kind": "clean",
+  "expect": "pass",
+  "source": {
+    "run": "eco6-k9-cn-outcome-ids-20261025-111837",
+    "commit": ""
+  },
+  "defect": {
+    "files": [],
+    "summary": "",
+    "keywords": []
+  },
+  "added_at": "2026-10-26",
+  "notes": "eco6 change merged without hand fixes on 2026-10-25"
+}

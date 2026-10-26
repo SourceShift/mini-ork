@@ -1,0 +1,248 @@
+diff --git a/mini_ork/web/routes/control.py b/mini_ork/web/routes/control.py
+index 3d117176ef10a9aaf1ae93c227cca08b195f39c0..edf0d850af58b0428916fcdf70d2e51f0747bcfa 100644
+--- a/mini_ork/web/routes/control.py
++++ b/mini_ork/web/routes/control.py
+@@ -6,9 +6,15 @@ mini_ork/web/control.py for the security note.
+ The /pause-cost + /resume-cost endpoints require Bearer-token auth
+ via mini_ork.web.auth.require_token (Epic E6 substrate). When
+ ${MINI_ORK_HOME}/auth-tokens.txt is missing, all auth-gated POSTs
+-return 401. The legacy /stop and /kill endpoints stay
+-loopback-trust-based for backwards compatibility; tighten by
+-adding the same dependency when ready.
++return 401.
++
++The mutating /stop, /kill and /answers endpoints refuse a foreign
++``Origin`` through :func:`require_local_caller` (the CSRF /
++DNS-rebinding guard shared with the agent-server and workspace
++routes): a browser page served from anywhere else cannot fire them
++with a cross-origin POST, while non-browser callers (the IDE, ACP,
++the SDK, curl) send no ``Origin`` and are unaffected. The cost
++routes still need a bearer token.
+ """
+ 
+ from __future__ import annotations
+@@ -20,11 +26,15 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Path as PathParam
+ from .. import auth, control
+ from ..db import StateDB
+ from ..deps import get_db, get_home
++from .agent_server import require_local_caller
+ 
+ router = APIRouter(prefix="/api/v1/task-runs", tags=["control"])
+ 
+ 
+-@router.post("/{task_run_id}/stop")
++@router.post(
++    "/{task_run_id}/stop",
++    dependencies=[Depends(require_local_caller)],
++)
+ def stop(
+     task_run_id: str = PathParam(...),
+     db: StateDB = Depends(get_db),
+@@ -36,7 +46,10 @@ def stop(
+     return result
+ 
+ 
+-@router.post("/{task_run_id}/kill")
++@router.post(
++    "/{task_run_id}/kill",
++    dependencies=[Depends(require_local_caller)],
++)
+ def kill(
+     task_run_id: str = PathParam(...),
+     db: StateDB = Depends(get_db),
+@@ -62,7 +75,10 @@ def get_profile_route(
+     return control.get_profile(home, task_run_id)
+ 
+ 
+-@router.post("/{task_run_id}/answers")
++@router.post(
++    "/{task_run_id}/answers",
++    dependencies=[Depends(require_local_caller)],
++)
+ def save_answers_route(
+     task_run_id: str = PathParam(...),
+     answers: dict[str, str] = Body(..., description="Map of question → answer"),
+diff --git a/tests/unit/test_eco6_k6_control_local_caller.py b/tests/unit/test_eco6_k6_control_local_caller.py
+new file mode 100644
+index 00000000..c34ad3ad
+--- /dev/null
++++ b/tests/unit/test_eco6_k6_control_local_caller.py
+@@ -0,0 +1,178 @@
++"""ECOSYSTEM §6 K6: stop / kill / answers refuse foreign-origin callers.
++
++``mini_ork/web/routes/control.py`` used to trust the loopback bind alone for
++its three mutating routes. A browser page from any origin can fire a
++cross-origin ``no-cors`` POST (the CORS middleware limits reads, not the side
++effect), and DNS rebinding reaches the loopback listener too. The routes now
++carry :func:`mini_ork.web.routes.agent_server.require_local_caller`, which
++refuses a foreign ``Origin`` with 403 while admitting callers that send no
++``Origin`` at all (the IDE, ACP, the SDK, curl).
++
++Hermetic: a tmp ``MINI_ORK_HOME`` with one live ``task_runs`` row, and
++``mini_ork.web.control.kill_run`` monkeypatched so no signal is ever sent.
++"""
++
++from __future__ import annotations
++
++import json
++import sqlite3
++from pathlib import Path
++
++import pytest
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++from mini_ork.web import control as web_control
++from mini_ork.web.db import db_for
++from mini_ork.web.deps import get_db, get_home
++from mini_ork.web.routes import agent_server
++from mini_ork.web.routes import control as control_routes
++
++RUN_ID = "run-1770000000-4242"
++MISSING_ID = "run-1999999999-1"
++FOREIGN_ORIGIN = "https://evil.example"
++LOOPBACK_ORIGIN = "http://127.0.0.1:7090"
++ALLOW_REMOTE_ENV = "MO_AGENT_SERVER_ALLOW_REMOTE"
++
++SENTINEL = ".stop-requested"
++ANSWERS_FILE = "profile-answers.json"
++PROFILE_FILE = "run_profile.json"
++
++
++@pytest.fixture()
++def home(tmp_path: Path, monkeypatch) -> Path:
++    """A hermetic MINI_ORK_HOME: state.db with one live task_runs row."""
++    monkeypatch.delenv(ALLOW_REMOTE_ENV, raising=False)
++    home = tmp_path / "mini-ork-home"
++    (home / "runs" / RUN_ID).mkdir(parents=True)
++    con = sqlite3.connect(home / "state.db")
++    con.execute("CREATE TABLE task_runs (id TEXT PRIMARY KEY, status TEXT NOT NULL)")
++    con.execute(
++        "INSERT INTO task_runs (id, status) VALUES (?, ?)", (RUN_ID, "executing")
++    )
++    con.commit()
++    con.close()
++    return home
++
++
++@pytest.fixture()
++def client(home: Path) -> TestClient:
++    """A bare app mounting exactly the router under test."""
++    app = FastAPI()
++    app.include_router(control_routes.router)
++    app.dependency_overrides[get_home] = lambda: home
++    app.dependency_overrides[get_db] = lambda: db_for(home)
++    return TestClient(app)
++
++
++@pytest.fixture()
++def kill_calls(monkeypatch) -> list[str]:
++    """Replace ``mini_ork.web.control.kill_run`` so no signal is ever sent."""
++    calls: list[str] = []
++
++    def fake_kill_run(home, db, task_run_id):
++        calls.append(task_run_id)
++        return {"ok": True, "task_run_id": task_run_id, "killed": [], "survived": []}
++
++    monkeypatch.setattr(web_control, "kill_run", fake_kill_run)
++    return calls
++
++
++def _run_dir(home: Path, run_id: str) -> Path:
++    return home / "runs" / run_id
++
++
++# ── stop ─────────────────────────────────────────────────────────────────
++
++
++def test_stop_foreign_origin_is_403_and_writes_no_sentinel(client, home):
++    resp = client.post(
++        f"/api/v1/task-runs/{RUN_ID}/stop", headers={"Origin": FOREIGN_ORIGIN}
++    )
++    assert resp.status_code == 403, resp.text
++    assert not (_run_dir(home, RUN_ID) / SENTINEL).exists()
++
++
++def test_stop_no_origin_succeeds_and_writes_sentinel(client, home):
++    resp = client.post(f"/api/v1/task-runs/{RUN_ID}/stop")
++    assert resp.status_code == 200, resp.text
++    assert (_run_dir(home, RUN_ID) / SENTINEL).exists()
++
++
++def test_stop_no_origin_missing_run_keeps_409(client, home):
++    resp = client.post(f"/api/v1/task-runs/{MISSING_ID}/stop")
++    assert resp.status_code == 409, resp.text
++    assert not (_run_dir(home, MISSING_ID) / SENTINEL).exists()
++
++
++def test_stop_loopback_origin_is_admitted(client, home):
++    resp = client.post(
++        f"/api/v1/task-runs/{RUN_ID}/stop", headers={"Origin": LOOPBACK_ORIGIN}
++    )
++    assert resp.status_code == 200, resp.text
++    assert (_run_dir(home, RUN_ID) / SENTINEL).exists()
++
++
++# ── kill ─────────────────────────────────────────────────────────────────
++
++
++def test_kill_foreign_origin_is_403_and_never_calls_kill_run(client, kill_calls):
++    resp = client.post(
++        f"/api/v1/task-runs/{RUN_ID}/kill", headers={"Origin": FOREIGN_ORIGIN}
++    )
++    assert resp.status_code == 403, resp.text
++    assert kill_calls == []
++
++
++def test_kill_no_origin_still_reaches_kill_run(client, kill_calls):
++    resp = client.post(f"/api/v1/task-runs/{RUN_ID}/kill")
++    assert resp.status_code == 200, resp.text
++    assert kill_calls == [RUN_ID]
++
++
++# ── answers ──────────────────────────────────────────────────────────────
++
++
++def test_answers_foreign_origin_is_403_and_writes_nothing(client, home):
++    run_dir = _run_dir(home, RUN_ID)
++    resp = client.post(
++        f"/api/v1/task-runs/{RUN_ID}/answers",
++        json={"q": "a"},
++        headers={"Origin": FOREIGN_ORIGIN},
++    )
++    assert resp.status_code == 403, resp.text
++    assert not (run_dir / ANSWERS_FILE).exists()
++    assert not (run_dir / PROFILE_FILE).exists()
++
++
++def test_answers_no_origin_still_persists(client, home):
++    resp = client.post(f"/api/v1/task-runs/{RUN_ID}/answers", json={"q": "a"})
++    assert resp.status_code == 200, resp.text
++    answers = json.loads(
++        (_run_dir(home, RUN_ID) / ANSWERS_FILE).read_text(encoding="utf-8")
++    )
++    assert answers == {"q": "a"}
++
++
++# ── wiring and the untouched neighbours ──────────────────────────────────
++
++
++def test_control_imports_the_shared_guard():
++    assert control_routes.require_local_caller is agent_server.require_local_caller
++
++
++def test_docstring_documents_the_guard():
++    doc = control_routes.__doc__ or ""
++    assert "require_local_caller" in doc
++    assert "loopback-trust-based" not in doc
++
++
++def test_cost_routes_keep_require_token(client):
++    """A foreign Origin on a cost route must yield 401 (no bearer), not 403."""
++    for path in ("pause-cost", "resume-cost"):
++        resp = client.post(
++            f"/api/v1/task-runs/{MISSING_ID}/{path}",
++            json={} if path == "pause-cost" else None,
++            headers={"Origin": FOREIGN_ORIGIN},
++        )
++        assert resp.status_code == 401, f"{path}: {resp.status_code} {resp.text}"

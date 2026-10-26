@@ -1,0 +1,16 @@
+{
+  "id": "clean-k6-web-control-local-caller",
+  "kind": "clean",
+  "expect": "pass",
+  "source": {
+    "run": "eco6-k6-web-control-local-caller-20261025-105933",
+    "commit": ""
+  },
+  "defect": {
+    "files": [],
+    "summary": "",
+    "keywords": []
+  },
+  "added_at": "2026-10-26",
+  "notes": "eco6 change merged without hand fixes on 2026-10-25"
+}

@@ -1,0 +1,25 @@
+{
+  "id": "a047f878-reverts-upstream",
+  "kind": "incident",
+  "expect": "block",
+  "source": {
+    "run": "",
+    "commit": "a047f878"
+  },
+  "defect": {
+    "files": [
+      "mini_ork/cli/execute_handlers.py",
+      "mini_ork/cli/verify.py",
+      "mini_ork/dispatch/core.py",
+      "mini_ork/dispatch/routing.py"
+    ],
+    "summary": "a squashed control-arm commit silently reverts upstream changes in 10 files it never meant to touch",
+    "keywords": [
+      "revert",
+      "unrelated",
+      "removes"
+    ]
+  },
+  "added_at": "2026-10-26",
+  "notes": ""
+}

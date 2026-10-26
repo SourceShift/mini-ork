@@ -1,0 +1,16 @@
+{
+  "id": "clean-k11-post-publish-verify",
+  "kind": "clean",
+  "expect": "pass",
+  "source": {
+    "run": "eco6-k11-post-publish-verify-20261025-114133",
+    "commit": ""
+  },
+  "defect": {
+    "files": [],
+    "summary": "",
+    "keywords": []
+  },
+  "added_at": "2026-10-26",
+  "notes": "eco6 change merged without hand fixes on 2026-10-25"
+}

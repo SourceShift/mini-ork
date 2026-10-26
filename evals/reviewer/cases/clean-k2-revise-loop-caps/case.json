@@ -1,0 +1,16 @@
+{
+  "id": "clean-k2-revise-loop-caps",
+  "kind": "clean",
+  "expect": "pass",
+  "source": {
+    "run": "eco6-k2-revise-loop-caps-20261025-105921",
+    "commit": ""
+  },
+  "defect": {
+    "files": [],
+    "summary": "",
+    "keywords": []
+  },
+  "added_at": "2026-10-26",
+  "notes": "eco6 change merged without hand fixes on 2026-10-25"
+}

@@ -1,0 +1,428 @@
+diff --git a/mini_ork/dispatch/screening.py b/mini_ork/dispatch/screening.py
+index d653f1f2155e0570e406d1de8a8f7b1707019aa4..24615342263c6a2bab7b9335c50f9a2c75cf15c9 100644
+--- a/mini_ork/dispatch/screening.py
++++ b/mini_ork/dispatch/screening.py
+@@ -5,13 +5,13 @@ predictor BEFORE inference and drops the ones that cannot win. mini-ork's
+ router ranks lanes from learned per-lane stats, but exploration keeps spending
+ real dispatches on lanes the data already rules out.
+ 
+-This module adds the missing screen. Given per-lane ``(success_count,
+-runs_count)`` from ``agent_performance_memory``, it puts a Wilson score
+-interval around each lane's observed success rate and drops a lane whose
+-interval sits strictly below another candidate's. The comparison is
+-conservative on purpose — intervals must separate, not just order — so a
+-screened lane is one the evidence already rules out, not one that merely lost
+-a point estimate.
++This module adds the missing screen. Given per-lane ``(successes, runs)``
++over the routed slice's reward-bearing ``execution_traces``
++(``AdvantageStore.fetch_lane_run_stats``), it puts a Wilson score interval
++around each lane's observed success rate and drops a lane whose interval sits
++strictly below another candidate's. The comparison is conservative on purpose
++— intervals must separate, not just order — so a screened lane is one the
++evidence already rules out, not one that merely lost a point estimate.
+ 
+ Exploration is preserved: a lane with fewer than ``min_runs`` runs is never
+ screened because its interval is still too wide to rule it out. The screen can
+diff --git a/mini_ork/lane_router.py b/mini_ork/lane_router.py
+index 9c45e0dfec0befe651da0fb05b0cc7bbad0bc6a2..fc6d74a90c891b4c221a4b1e8e9efb58b56b309e 100644
+--- a/mini_ork/lane_router.py
++++ b/mini_ork/lane_router.py
+@@ -596,15 +596,15 @@ def _pick_lane(task_class: str, node_type: str, objective_domain: str,
+         caps: dict = {}
+         if _entrorouter_enabled():
+             caps = store.fetch_lane_capabilities(task_class)
+-        # RouteMoA dominance screen: per-lane (success_count, runs_count) from
+-        # the global performance table, fetched once per pick. Any failure here
+-        # (missing table, malformed row) degrades to "no stats" — screening is
+-        # an optimisation and must never break a pick.
++        # RouteMoA dominance screen: per-lane (successes, runs) from the routed
++        # slice's own execution_traces outcomes, fetched once per pick. Any
++        # failure here (missing table, malformed row) degrades to "no stats" —
++        # screening is an optimisation and must never break a pick.
+         lane_stats: dict | None = None
+         screen_on = screening.enabled()
+         if screen_on:
+             try:
+-                lane_stats = store.fetch_lane_run_stats(task_class)
++                lane_stats = store.fetch_lane_run_stats(task_class, node_type, objective_domain)
+             except Exception:
+                 lane_stats = None
+         screened_out: list[dict] = []
+diff --git a/mini_ork/learning/advantage_store.py b/mini_ork/learning/advantage_store.py
+index 13ddd754fa4bb42fb5db0d52f326e6de05f196c3..091929ba829e06bdb5155d36eff8e4bad94f64e4 100644
+--- a/mini_ork/learning/advantage_store.py
++++ b/mini_ork/learning/advantage_store.py
+@@ -23,6 +23,7 @@ gates (tests/unit/test_lane_router_py.py) keep passing byte-for-byte.
+ """
+ from __future__ import annotations
+ 
++import json
+ import os
+ import sqlite3
+ 
+@@ -38,6 +39,13 @@ def resolve_db_path(db: str | None) -> str:
+     return os.path.join(home, "state.db")
+ 
+ 
++def _trace_node_type(raw) -> str:
++    try:
++        return json.loads(raw or "{}").get("node_type") or "unknown"
++    except Exception:
++        return "unknown"
++
++
+ class AdvantageStore:
+     """Connection-owning repository for the lane-router advantage tables.
+ 
+@@ -165,25 +173,60 @@ class AdvantageStore:
+                 continue
+         return caps
+ 
+-    def fetch_lane_run_stats(self, task_class: str) -> dict:
+-        """``lane -> (success_count, runs_count)`` for ``task_class``.
++    def fetch_lane_run_stats(self, task_class: str, node_type: str = "",
++                             objective_domain: str = "") -> dict:
++        """``lane -> (successes, runs)`` for the routed slice's own outcomes.
+ 
+         RouteMoA's dominance screen reads this once per pick: it feeds the
+         Wilson intervals that decide which lanes the data already rules out.
++
++        The source is ``execution_traces`` rather than
++        ``agent_performance_memory`` because that table does not hold a real
++        success count: ``recompute_advantages`` overwrites ``success_count``
++        with the number of GRPO groups the lane won while ``runs_count`` counts
++        rows, so "wins / rows" falls as a lane gets busier. The table also has
++        no ``node_type``, so reviewer verdicts were mixed into implementer
++        screens. Counting ``status == 'success'`` over the slice's own
++        reward-bearing ``execution_traces`` rows — the same ``(task_class,
++        node_type, objective_domain)`` slice the router learns from — measures
++        what the screen actually needs.
++
+         Deliberately does NOT swallow a missing table — the caller treats any
+         failure here as "no stats" and falls back to the unscreened candidates,
+         so one try/except at the call site covers both fetch and screen.
+         """
++        cols = self.execution_trace_columns()
++        if not cols:
++            raise sqlite3.OperationalError("no such table: execution_traces")
++        where = [
++            "task_class = ?",
++            "agent_version_id IS NOT NULL",
++            "agent_version_id <> ''",
++            "objective_domain IS NOT NULL",
++            "objective_domain <> ''",
++            "reward_g IS NOT NULL",
++        ]
++        params: list = [task_class]
++        if objective_domain:
++            where.append("objective_domain = ?")
++            params.append(objective_domain)
++        if "validity" in cols:
++            where.append(
++                "(validity IS NULL OR trim(validity) = '' "
++                "OR lower(trim(validity)) = 'valid')")
+         rows = self.con.execute(
+-            "SELECT agent_version_id, success_count, runs_count "
+-            "FROM agent_performance_memory WHERE task_class=?",
+-            (task_class,)).fetchall()
++            "SELECT agent_version_id, status, verifier_output "
++            "FROM execution_traces WHERE " + " AND ".join(where),
++            params).fetchall()
+         stats: dict = {}
+-        for lane, successes, runs in rows:
+-            try:
+-                stats[lane] = (int(successes), int(runs))
+-            except (TypeError, ValueError):
++        for lane, status, verifier_output in rows:
++            if node_type and _trace_node_type(verifier_output) != node_type:
+                 continue
++            successes, runs = stats.get(lane, (0, 0))
++            runs += 1
++            if status == "success":
++                successes += 1
++            stats[lane] = (successes, runs)
+         return stats
+ 
+     def fetch_prior_domain(self) -> dict:
+diff --git a/tests/unit/test_route_screening.py b/tests/unit/test_route_screening.py
+index 7deb5ba05ff0e1facb8600d4bc685f173957426c..a3f6ff523395b08b3c17e6078227b7950b5a511b 100644
+--- a/tests/unit/test_route_screening.py
++++ b/tests/unit/test_route_screening.py
+@@ -90,6 +90,35 @@ def _make_db(tmp_path, *, with_apm=True, apm_rows=(), domain_rows=(),
+     return path
+ 
+ 
++def _seed_traces(path, rows):
++    """Seed ``execution_traces`` with ``(lane, successes, runs)`` per lane.
++
++    The RouteMoA screen reads its per-lane outcomes from this table, so the
++    pick tests must put the same numbers there that they used to put in
++    ``agent_performance_memory``.
++    """
++    con = sqlite3.connect(path)
++    con.execute("""CREATE TABLE IF NOT EXISTS execution_traces (
++          trace_id TEXT, agent_version_id TEXT, task_class TEXT,
++          objective_domain TEXT, code_region TEXT, verifier_output TEXT,
++          reward_g REAL, cost_usd REAL, status TEXT, created_at TEXT)""")
++    trace_id = 0
++    for lane, successes, runs in rows:
++        for i in range(runs):
++            con.execute(
++                "INSERT INTO execution_traces (trace_id, agent_version_id,"
++                " task_class, objective_domain, code_region, verifier_output,"
++                " reward_g, cost_usd, status, created_at)"
++                " VALUES (?,?,?,?,?,?,?,?,?,?)",
++                [f"seed-{trace_id}", lane, TC, OD, "", "{}",
++                 1.0 if i < successes else -1.0,
++                 0.0, "success" if i < successes else "failure",
++                 "2026-10-01T00:00:00.000Z"])
++            trace_id += 1
++    con.commit()
++    con.close()
++
++
+ # ── wilson_bounds ────────────────────────────────────────────────────────────
+ 
+ 
+@@ -225,6 +254,7 @@ def test_pick_lane_screens_the_dominated_exploration_pick(tmp_path):
+             ("lane-good", 0.05, 40, 36, 0.0),
+         ],
+     )
++    _seed_traces(path, [("lane-good", 18, 20), ("lane-bad", 2, 20)])
+     detail = lane_router._pick_lane(TC, "", OD, "", path)
+     assert detail["lane"] == "lane-good", detail
+     assert detail["source"] == "domain"
+@@ -306,6 +336,7 @@ def test_pick_lane_equirouter_override_only_considers_kept_lanes(tmp_path):
+             ("lane-borda-keep", "r2", 0.40, 50, 45, 0.0),
+         ],
+     )
++    _seed_traces(path, [("lane-borda-keep", 18, 20), ("lane-borda-bad", 1, 20)])
+     detail = lane_router._pick_lane(TC, "", OD, "r1", path)
+     assert detail["source"] == "region"
+     assert detail["lane"] == "lane-borda-keep", detail
+diff --git a/tests/unit/test_route_screening_slice_stats.py b/tests/unit/test_route_screening_slice_stats.py
+new file mode 100644
+index 00000000..d72682da
+--- /dev/null
++++ b/tests/unit/test_route_screening_slice_stats.py
+@@ -0,0 +1,220 @@
++"""Unit tests: the RouteMoA screen reads the routed slice's own outcomes.
++
++Hermetic: every test builds its own sqlite DB under ``tmp_path``. The screen
++must count real ``status='success'`` rows over the ``(task_class, node_type,
++objective_domain)`` slice of ``execution_traces`` instead of
++``agent_performance_memory``'s groups-won ``success_count``.
++"""
++from __future__ import annotations
++
++import itertools
++import json
++import sqlite3
++
++import pytest
++
++import mini_ork.lane_router as lane_router
++from mini_ork.learning.advantage_store import AdvantageStore
++
++TC = "slice-stats-tc"
++OD = "od1"
++CREATED_AT = "2026-10-01T00:00:00.000Z"
++
++TRACE_DDL = """CREATE TABLE IF NOT EXISTS execution_traces (
++    trace_id TEXT, agent_version_id TEXT, task_class TEXT, objective_domain TEXT,
++    code_region TEXT, verifier_output TEXT, reward_g REAL, cost_usd REAL,
++    status TEXT, created_at TEXT, validity TEXT)"""
++
++TRACE_DDL_NO_VALIDITY = """CREATE TABLE IF NOT EXISTS execution_traces (
++    trace_id TEXT, agent_version_id TEXT, task_class TEXT, objective_domain TEXT,
++    code_region TEXT, verifier_output TEXT, reward_g REAL, cost_usd REAL,
++    status TEXT, created_at TEXT)"""
++
++APM_DDL = """CREATE TABLE IF NOT EXISTS agent_performance_memory (
++    agent_version_id TEXT, role TEXT, model TEXT, task_class TEXT,
++    runs_count INTEGER, success_count INTEGER, relative_advantage REAL,
++    last_updated TEXT, PRIMARY KEY (agent_version_id, task_class))"""
++
++_TRACE_SEQ = itertools.count()
++
++
++@pytest.fixture(autouse=True)
++def _router_env(monkeypatch):
++    """Pin every knob the screen and ``_pick_lane`` read."""
++    for var in ("MO_ROUTEMOA", "MO_ROUTEMOA_MIN_RUNS"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setenv("MO_LEARNING_MIN_SAMPLES", "3")
++    monkeypatch.setenv("MO_ROUTER_UCB_C", "0.5")
++    monkeypatch.setenv("MO_ROUTER_CONTEXTUAL", "0")
++    monkeypatch.setenv("MO_EQUIROUTER", "1")
++    monkeypatch.setenv("MO_ENTROROUTER", "1")
++    monkeypatch.setenv("MO_ROUTER_ANCHOR", "0.5")
++    monkeypatch.setenv("MO_ROUTER_ENTROPY_TAU", "3")
++
++
++def _nt(node_type):
++    return json.dumps({"node_type": node_type})
++
++
++def _insert(con, lane, *, status="success", reward_g=1.0, n=1,
++            node_type="implementer", task_class=TC, objective_domain=OD,
++            validity=None, verifier_output=None, with_validity=True):
++    """Insert ``n`` identical trace rows for ``lane`` (unique ``trace_id``)."""
++    vo = _nt(node_type) if verifier_output is None else verifier_output
++    cols = ("trace_id, agent_version_id, task_class, objective_domain, "
++            "code_region, verifier_output, reward_g, cost_usd, status, created_at")
++    if with_validity:
++        cols += ", validity"
++    placeholders = ",".join("?" * (11 if with_validity else 10))
++    for _ in range(n):
++        vals = [f"t{next(_TRACE_SEQ)}", lane, task_class, objective_domain, "",
++                vo, reward_g, 0.0, status, CREATED_AT]
++        if with_validity:
++            vals.append(validity)
++        con.execute(
++            f"INSERT INTO execution_traces ({cols}) VALUES ({placeholders})", vals)
++
++
++def _big_slice_db(path):
++    """The kickoff's seeded slice: every exclusion the SQL must apply."""
++    con = sqlite3.connect(str(path))
++    con.execute(TRACE_DDL)
++    # lane-a / implementer / od1: 9 success (validity NULL) + 1 failure (valid).
++    _insert(con, "lane-a", status="success", reward_g=1.0, n=9, validity=None)
++    _insert(con, "lane-a", status="failure", reward_g=-1.0, n=1, validity="valid")
++    # lane-b / implementer / od1: 2 success + 8 failure.
++    _insert(con, "lane-b", status="success", reward_g=1.0, n=2, validity=None)
++    _insert(con, "lane-b", status="failure", reward_g=-1.0, n=8, validity=None)
++    # Wrong node_type.
++    _insert(con, "lane-a", node_type="reviewer", status="failure", reward_g=-1.0, n=5)
++    # Wrong objective_domain.
++    _insert(con, "lane-a", objective_domain="od2", status="failure",
++            reward_g=-1.0, n=5)
++    # No reward: not a reward-bearing row.
++    _insert(con, "lane-a", status="failure", reward_g=None, n=3)
++    # No lane id.
++    _insert(con, "", status="success", reward_g=1.0, n=2)
++    # Invalid verdict row.
++    _insert(con, "lane-a", status="failure", reward_g=-1.0, n=4,
++            validity="infra_failed")
++    # Wrong task_class.
++    _insert(con, "lane-b", task_class="other-tc", status="success",
++            reward_g=1.0, n=10)
++    con.commit()
++    con.close()
++
++
++def _fetch(path, *args):
++    store = AdvantageStore(str(path)).open()
++    try:
++        return store.fetch_lane_run_stats(*args)
++    finally:
++        store.close()
++
++
++def test_real_successes_for_the_slice(tmp_path):
++    path = tmp_path / "slice.db"
++    _big_slice_db(path)
++    assert _fetch(path, TC, "implementer", OD) == {
++        "lane-a": (9, 10), "lane-b": (2, 10)}
++
++
++def test_empty_filters_widen_the_slice(tmp_path):
++    path = tmp_path / "slice.db"
++    _big_slice_db(path)
++    assert _fetch(path, TC) == {"lane-a": (9, 20), "lane-b": (2, 10)}
++    assert _fetch(path, TC, "", OD) == {"lane-a": (9, 15), "lane-b": (2, 10)}
++    assert _fetch(path, TC, "reviewer", OD) == {"lane-a": (0, 5)}
++
++
++def test_node_type_parsing_matches_recompute(tmp_path):
++    path = tmp_path / "parse.db"
++    con = sqlite3.connect(str(path))
++    con.execute(TRACE_DDL)
++    outputs = [
++        "not json",
++        '{"node_type": ""}',
++        json.dumps('{"node_type": "implementer"}'),
++        None,
++    ]
++    for i, vo in enumerate(outputs):
++        con.execute(
++            "INSERT INTO execution_traces (trace_id, agent_version_id, task_class,"
++            " objective_domain, code_region, verifier_output, reward_g, cost_usd,"
++            " status, created_at, validity) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
++            [f"t{i}", "lane-c", TC, OD, "", vo, 1.0, 0.0, "success", CREATED_AT, None])
++    con.commit()
++    con.close()
++    assert _fetch(path, TC, "unknown", OD) == {"lane-c": (4, 4)}
++    assert _fetch(path, TC, "implementer", OD) == {}
++
++
++def test_no_validity_column_is_fine(tmp_path):
++    path = tmp_path / "noval.db"
++    con = sqlite3.connect(str(path))
++    con.execute(TRACE_DDL_NO_VALIDITY)
++    _insert(con, "lane-d", status="success", reward_g=1.0, n=3, with_validity=False)
++    con.commit()
++    con.close()
++    assert _fetch(path, TC, "implementer", OD) == {"lane-d": (3, 3)}
++
++
++def test_missing_trace_table_raises(tmp_path):
++    path = tmp_path / "apm-only.db"
++    con = sqlite3.connect(str(path))
++    con.execute(APM_DDL)
++    con.execute("INSERT INTO agent_performance_memory VALUES"
++                " ('lane-x', 'implementer', 'm', ?, 50, 50, 0.5, ?)",
++                [TC, CREATED_AT])
++    con.commit()
++    con.close()
++    with pytest.raises(sqlite3.OperationalError, match="execution_traces"):
++        _fetch(path, TC)
++
++
++def _make_pick_db(path):
++    """APM groups-won rows that would screen lane-hi out under the old read;
++    traces that rule lane-lo out instead."""
++    con = sqlite3.connect(str(path))
++    con.execute(TRACE_DDL)
++    _insert(con, "lane-hi", status="success", reward_g=1.0, n=380)
++    _insert(con, "lane-hi", status="failure", reward_g=-1.0, n=20)
++    _insert(con, "lane-lo", status="success", reward_g=1.0, n=80)
++    _insert(con, "lane-lo", status="failure", reward_g=-1.0, n=15)
++    _insert(con, "lane-hi", node_type="reviewer", status="failure",
++            reward_g=-1.0, n=50)
++    con.commit()
++    con.close()
++
++    store = AdvantageStore(str(path)).open()
++    try:
++        store.ensure_advantage_tables()
++        store.con.execute(APM_DDL)
++        store.upsert_agent_performance("lane-hi", "implementer", "m1", TC, 400, 3, 0.0)
++        store.upsert_agent_performance("lane-lo", "implementer", "m2", TC, 95, 8, 0.0)
++        store.upsert_domain_advantage(
++            "lane-hi", TC, "implementer", OD, 0.05, 400, 3, 0.0, 0.0, 0.5)
++        store.upsert_domain_advantage(
++            "lane-lo", TC, "implementer", OD, 0.02, 95, 8, 0.0, 0.0, 0.1)
++        store.commit()
++    finally:
++        store.close()
++
++
++def test_pick_screens_on_slice_outcomes_not_apm_groups_won(tmp_path):
++    path = tmp_path / "pick.db"
++    _make_pick_db(str(path))
++    detail = lane_router._pick_lane(TC, "implementer", OD, "", str(path))
++    assert detail["lane"] == "lane-hi", detail
++    assert detail["source"] == "domain", detail
++    assert [e["lane"] for e in detail["screened"]] == ["lane-lo"], detail
++    assert detail["screened"][0]["dominated_by"] == "lane-hi", detail
++
++
++def test_opting_out_still_works(tmp_path, monkeypatch):
++    path = tmp_path / "pick.db"
++    _make_pick_db(str(path))
++    monkeypatch.setenv("MO_ROUTEMOA", "0")
++    detail = lane_router._pick_lane(TC, "implementer", OD, "", str(path))
++    assert detail["lane"] == "lane-hi", detail
++    assert detail["screened"] == [], detail

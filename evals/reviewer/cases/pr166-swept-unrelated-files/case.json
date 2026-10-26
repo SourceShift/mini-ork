@@ -1,0 +1,24 @@
+{
+  "id": "pr166-swept-unrelated-files",
+  "kind": "incident",
+  "expect": "block",
+  "source": {
+    "run": "",
+    "commit": "a0280656"
+  },
+  "defect": {
+    "files": [
+      "tests/unit/test_pattern_store_py.py",
+      "scripts/router_replay_eval.py",
+      "docs/architecture/coevolve-ecosystem.md"
+    ],
+    "summary": "a 3-file implementer fix also commits 9 unrelated staged files, including a TDD-red test that turns main red",
+    "keywords": [
+      "unrelated",
+      "out of scope",
+      "scope"
+    ]
+  },
+  "added_at": "2026-10-26",
+  "notes": ""
+}

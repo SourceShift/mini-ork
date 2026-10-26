@@ -1,0 +1,908 @@
+diff --git a/mini_ork/cli/verify.py b/mini_ork/cli/verify.py
+index 922f8423b29df35769b9c0212172a7a80e726281..b753c68da60cb32012c0a0f565ce2b3c6d10f3c5 100644
+--- a/mini_ork/cli/verify.py
++++ b/mini_ork/cli/verify.py
+@@ -246,6 +246,67 @@ def _safe_trace_write(payload: dict, db: str) -> None:
+         pass
+ 
+ 
++def _parse_rows(results) -> list[dict]:
++    """Verifier result rows as dicts; a row that does not parse keeps its text."""
++    rows: list[dict] = []
++    for raw in results or []:
++        try:
++            row = json.loads(raw)
++        except (TypeError, ValueError):
++            row = None
++        rows.append(row if isinstance(row, dict) else {"raw": raw})
++    return rows
++
++
++def _record_post_run(*, trace_id: str, verdict: str, artifact_path: str,
++                     task_class: str, pass_count: int, fail_count: int,
++                     results, run_dir: str, db: str) -> None:
++    """Persist the post-run verify result and flag a failure after publish.
++
++    Observability only: a failure here must never change verify's verdict, its
++    stdout or its exit code, so every step is contained. The result file is the
++    run-local record of what the post-run verify measured; the flag escalates a
++    run that was already marked ``published`` rather than staying silent about a
++    failure discovered afterwards.
++    """
++    try:
++        rows = _parse_rows(results)
++        if run_dir and os.path.isdir(run_dir):
++            record = {
++                "trace_id": trace_id,
++                "verdict": verdict,
++                "artifact_path": artifact_path,
++                "task_class": task_class,
++                "pass_count": pass_count,
++                "fail_count": fail_count,
++                "results": rows,
++                "written_at": int(time.time()),
++            }
++            try:
++                with open(os.path.join(run_dir, "verify-result.json"), "w",
++                          encoding="utf-8") as fh:
++                    json.dump(record, fh, indent=2)
++            except OSError:
++                pass
++        if verdict in ("fail", "partial"):
++            try:
++                from mini_ork.verify import post_publish_flag
++
++                post_publish_flag.mark(
++                    db,
++                    os.environ.get("MINI_ORK_TASK_RUN_ID")
++                    or context_env("MINI_ORK_RUN_ID", ""),
++                    run_dir or "",
++                    verdict,
++                    trace_id=trace_id,
++                    failing=[r for r in rows if r.get("pass") is False],
++                )
++            except Exception:
++                pass
++    except Exception:
++        pass
++
++
+ def _first_verifier_command(plan_path):
+     """First command named in the plan's ``verifier_contract``, or ``""``."""
+     if not plan_path or not os.path.isfile(plan_path):
+@@ -569,20 +630,34 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
+                           "mutation_report": mutation_report,
+                           "workspace": (os.environ.get("MO_TARGET_CWD")
+                                         or os.environ.get("MINI_ORK_TARGET_REPO") or ""),
++                          "run_dir": run_dir or "",
+                           "cost_usd": 0.0})
+         try:
+             summary = gate_registry.gate_run_all(db, task_class, ctx, mini_ork_root=root)
+             gate_failed = bool(summary.get("any_fail", True))
+             unmeasured = [g.get("gate_id", "") for g in summary.get("gates", [])
+                           if g.get("verdict") == "defer"]
++            failed_gates = sorted(g.get("gate_id", "") for g in summary.get("gates", [])
++                                  if g.get("verdict") == "fail")
+         except Exception:
+             # A broken registry must not red every run; the gates defer rather
+             # than inventing a verdict either way.
+             gate_failed = False
+             unmeasured = []
++            failed_gates = []
+         if gate_failed:
+             gate_verdict = "fail"; fail_count += 1
+-            results.append('{"verifier":"__gates__","pass":false,"evidence_path":"gate_registry"}')
++            if failed_gates:
++                # Name the gates that failed, so the post-run reader can tell a
++                # real gate failure from a verifier that broke on its own.
++                results.append(json.dumps({
++                    "verifier": "__gates__",
++                    "pass": False,
++                    "evidence_path": "gate_registry",
++                    "detail": "gate(s) failed: " + ", ".join(failed_gates),
++                }, separators=(",", ":")))
++            else:
++                results.append('{"verifier":"__gates__","pass":false,"evidence_path":"gate_registry"}')
+         else:
+             results.append('{"verifier":"__gates__","pass":true,"evidence_path":"gate_registry"}')
+         if unmeasured:
+@@ -655,6 +730,17 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
+             payload["reward_direction"] = "higher_is_better"
+         _safe_trace_write(trace_store.enrich_stage_trace(
+             payload, node_type="verifier", verdict=verdict), db)
++        _record_post_run(
++            trace_id=trace_id,
++            verdict=verdict,
++            artifact_path=artifact_path,
++            task_class=task_class,
++            pass_count=pass_count,
++            fail_count=fail_count,
++            results=results,
++            run_dir=run_dir or "",
++            db=db,
++        )
+     return 1 if verdict == "fail" else 0
+ 
+ 
+diff --git a/mini_ork/gates/step_rules.py b/mini_ork/gates/step_rules.py
+index 173d19601665c70d195d339e44d4f4e7af232253..e9855d5accbaf95452a6c65f83574a5c64e2c04e 100644
+--- a/mini_ork/gates/step_rules.py
++++ b/mini_ork/gates/step_rules.py
+@@ -61,8 +61,16 @@ _PATH_TOKEN = re.compile(
+ 
+ #: `--junitxml=reports/out.xml` names where a result will be *written*, not a
+ #: file that must already exist. Same for a `>` redirect target.
+-_ASSIGN_FLAG = re.compile(r"-{1,2}[\w-]+=[\w./-]+")
+-_REDIRECT = re.compile(r"\d?>\s*[\w./-]+")
++_ASSIGN_FLAG = re.compile(r"-{1,2}[\w-]+=[\"']?[\w./-]+")
++_REDIRECT = re.compile(r"\d?>>?\s*[\"']?[\w./-]+")
++
++#: `${NAME}` / `$NAME` in a verifier command. ``_expand_refs`` substitutes the
++#: ones it can resolve; the rest survive to be recognised as unreadable.
++_VAR_REF = re.compile(r"\$\{(\w+)\}|\$(\w+)")
++
++#: A word carrying a variable, placeholder, glob or brace is not a literal
++#: path: the rule cannot know which file it names, so it must not veto it.
++_UNRESOLVED_WORD = re.compile(r"\S*[$<>*?{}]\S*")
+ 
+ 
+ def _git(workspace: str, args: list[str], *, timeout: int = 30):
+@@ -169,7 +177,21 @@ def rule_patch_applies_cleanly(artifact_path: str, workspace: str) -> tuple[str,
+ # ── rule 2: the paths the plan names exist ───────────────────────────────────
+ 
+ 
+-def _command_paths(plan: dict) -> list[str]:
++def _expand_refs(text: str, env: dict) -> str:
++    """Substitute ``${NAME}`` / ``$NAME`` that resolve to a non-empty value.
++
++    A reference the environment cannot resolve is left byte-for-byte intact so
++    the unresolved-word scrub can recognise it as unreadable rather than the
++    rule treating the literal ``$NAME`` as a file that does not exist.
++    """
++    def repl(match: re.Match) -> str:
++        value = env.get(match.group(1) or match.group(2))
++        return value if value else match.group(0)
++
++    return _VAR_REF.sub(repl, text)
++
++
++def _command_paths(plan: dict, env: dict | None = None) -> list[str]:
+     """Path-shaped tokens from the plan's verifier commands and verifier names."""
+     commands: list[str] = []
+     contract = plan.get("verifier_contract")
+@@ -188,8 +210,11 @@ def _command_paths(plan: dict) -> list[str]:
+     seen: set[str] = set()
+     out: list[str] = []
+     for command in commands:
+-        # Drop where-outputs before looking for where-inputs.
+-        scrubbed = _REDIRECT.sub(" ", _ASSIGN_FLAG.sub(" ", command))
++        # Resolve the variables we can, then drop where-outputs before looking
++        # for where-inputs, then drop the words we cannot read at all.
++        expanded = _expand_refs(command, env or {})
++        scrubbed = _REDIRECT.sub(" ", _ASSIGN_FLAG.sub(" ", expanded))
++        scrubbed = _UNRESOLVED_WORD.sub(" ", scrubbed)
+         for token in _PATH_TOKEN.findall(scrubbed):
+             if token not in seen:
+                 seen.add(token)
+@@ -197,10 +222,10 @@ def _command_paths(plan: dict) -> list[str]:
+     return out
+ 
+ 
+-def _resolve(token: str, workspace: str, root: str) -> bool:
++def _resolve(token: str, workspace: str, root: str, run_dir: str = "") -> bool:
+     if os.path.isabs(token):
+         return os.path.exists(token)
+-    for base in (workspace, root):
++    for base in (workspace, root, run_dir):
+         if base and os.path.exists(os.path.join(base, token)):
+             return True
+     return _resolves_via_the_verifier_dispatcher(token, root)
+@@ -239,7 +264,7 @@ def _last_line(blob) -> str:
+ 
+ 
+ def rule_named_test_path_exists(plan_path: str, workspace: str,
+-                                root: str) -> tuple[str, str]:
++                                root: str, run_dir: str = "") -> tuple[str, str]:
+     """Every path the plan's verifier names must exist where the verifier will run.
+ 
+     A command naming a test file that is not in the target is a plan that cannot
+@@ -261,12 +286,19 @@ def rule_named_test_path_exists(plan_path: str, workspace: str,
+         return "defer", "plan is unreadable"
+     if not isinstance(plan, dict):
+         return "defer", "plan is not an object"
+-    tokens = _command_paths(plan)
++    env = {k: v for k, v in os.environ.items() if v}
++    if root:
++        env["MINI_ORK_ROOT"] = root
++    if run_dir:
++        env["MINI_ORK_RUN_DIR"] = run_dir
++    if workspace:
++        env.setdefault("MO_TARGET_CWD", workspace)
++    tokens = _command_paths(plan, env)
+     if not tokens:
+         return "defer", "the plan's verifier names no path"
+-    if not workspace and not root:
++    if not workspace and not root and not run_dir:
+         return "defer", "no root to resolve the named paths against"
+-    missing = [t for t in tokens if not _resolve(t, workspace, root)]
++    missing = [t for t in tokens if not _resolve(t, workspace, root, run_dir)]
+     if missing:
+         return "fail", "named path(s) absent: " + ", ".join(sorted(missing)[:5])
+     return "pass", f"{len(tokens)} named path(s) resolved"
+@@ -275,21 +307,21 @@ def rule_named_test_path_exists(plan_path: str, workspace: str,
+ # ── aggregate ────────────────────────────────────────────────────────────────
+ 
+ _RULES = (
+-    # (name, callable(artifact_path, plan_path, workspace, root))
++    # (name, callable(artifact_path, plan_path, workspace, root, run_dir))
+     ("patch_applies_cleanly",
+-     lambda a, _p, w, _r: rule_patch_applies_cleanly(a, w)),
++     lambda a, _p, w, _r, _d: rule_patch_applies_cleanly(a, w)),
+     ("named_test_path_exists",
+-     lambda _a, p, w, r: rule_named_test_path_exists(p, w, r)),
++     lambda _a, p, w, r, d: rule_named_test_path_exists(p, w, r, run_dir=d)),
+ )
+ 
+ 
+ def run_rules(artifact_path: str, plan_path: str = "", workspace: str = "",
+-              root: str = "") -> dict:
++              root: str = "", run_dir: str = "") -> dict:
+     """Evaluate every rule, recording each verdict and why."""
+     rules = []
+     for name, fn in _RULES:
+         try:
+-            verdict, detail = fn(artifact_path, plan_path, workspace, root)
++            verdict, detail = fn(artifact_path, plan_path, workspace, root, run_dir)
+         except Exception as exc:  # a rule that breaks is an unrun rule
+             verdict, detail = "defer", f"rule error: {exc}"
+         rules.append({"rule": name, "verdict": verdict, "detail": detail})
+@@ -340,4 +372,5 @@ def evaluate(condition: str, context_json: str, db_path: str,
+         str(ctx.get("plan_path") or ""),
+         workspace,
+         root,
++        run_dir=str(ctx.get("run_dir") or ""),
+     ))
+diff --git a/mini_ork/verify/post_publish_flag.py b/mini_ork/verify/post_publish_flag.py
+new file mode 100644
+index 00000000..561f1082
+--- /dev/null
++++ b/mini_ork/verify/post_publish_flag.py
+@@ -0,0 +1,166 @@
++"""Make a post-run verify failure after publish visible instead of silent.
++
++A run is marked ``published`` before the post-run verify runs. If that verify
++then ends ``fail`` or ``partial``, the run was already delivered: nothing
++reopens it, ``retry_hint`` returns ``None`` for a ``published`` row (no
++NEEDS-CHANGE.md, no inbox item), and a ``partial`` even exits 0. The failure
++existed only in the verify's own stdout.
++
++This module closes that hole without adding a pre-publish gate. The publish is
++left alone; afterwards, the run's verdict is escalated to ``ESCALATE`` (the
++status stays ``published``), a note records why, a run-local record is written,
++and one non-blocking oversight item is enqueued. ``active_state_index`` reads
++only ``verdict='APPROVE'``, so an escalated run drops out of the planner's
++facts while remaining delivered.
++
++Everything is best-effort: a missing table, a locked database or a broken inbox
++must not turn a post-run verify into a crash. ``mark`` returns ``None`` in every
++one of those cases.
++"""
++from __future__ import annotations
++
++import json
++import os
++import sqlite3
++import time
++
++__all__ = ["GATE_ID", "FLAG_FILE", "FLAGGED_VERDICTS", "mark"]
++
++GATE_ID = "post_verify_after_publish"
++FLAG_FILE = "post-verify-after-publish.json"
++FLAGGED_VERDICTS = frozenset({"fail", "partial"})
++
++#: Row fields carried into the run-local record for each failing verifier.
++_FAILING_FIELDS = ("verifier", "detail", "evidence_path", "rc")
++
++
++def _connect(db: str) -> sqlite3.Connection:
++    conn = sqlite3.connect(db, timeout=15)
++    conn.row_factory = sqlite3.Row
++    conn.execute("PRAGMA busy_timeout = 15000")
++    return conn
++
++
++def _failing_records(failing) -> list[dict]:
++    out: list[dict] = []
++    for row in failing or []:
++        if not isinstance(row, dict):
++            continue
++        out.append({key: row[key] for key in _FAILING_FIELDS if key in row})
++    return out
++
++
++def _failing_names(failing) -> list[str]:
++    names = {
++        str(row["verifier"])
++        for row in failing or []
++        if isinstance(row, dict) and row.get("verifier") is not None
++    }
++    return sorted(names)
++
++
++def mark(db, run_id, run_dir, verdict, *, trace_id: str = "",
++         failing=None, now=None) -> dict | None:
++    """Escalate a published run whose post-run verify failed. Never raises.
++
++    Returns the record written to ``<run_dir>/FLAG_FILE`` (also the function's
++    value when no run dir exists), or ``None`` when nothing was flagged.
++    """
++    try:
++        if verdict not in FLAGGED_VERDICTS:
++            return None
++        if not db or not run_id:
++            return None
++        if not os.path.isfile(db):
++            return None
++
++        try:
++            conn = _connect(db)
++        except sqlite3.Error:
++            return None
++
++        try:
++            try:
++                row = conn.execute(
++                    "SELECT status, verdict FROM task_runs WHERE id = ?", (run_id,)
++                ).fetchone()
++            except sqlite3.Error:
++                return None
++            if row is None or row["status"] != "published":
++                return None
++
++            names = _failing_names(failing)
++            note = (f"post-run verify {verdict} after publish ({trace_id}): "
++                    f"{', '.join(names) or 'no failing row recorded'}")
++            flagged_at = now if now is not None else int(time.time())
++
++            try:
++                cur = conn.execute(
++                    "UPDATE task_runs SET verdict = 'ESCALATE', "
++                    "notes = COALESCE(notes || '; ', '') || ?, updated_at = ? "
++                    "WHERE id = ? AND status = 'published' "
++                    "AND (verdict IS NULL OR verdict = 'APPROVE')",
++                    (note, flagged_at, run_id),
++                )
++                conn.commit()
++                escalated = cur.rowcount == 1
++            except sqlite3.Error:
++                return None
++
++            feature = f"post-run verify failed after publish: {run_id}"
++            inbox_id = None
++            try:
++                try:
++                    existing = conn.execute(
++                        "SELECT inbox_id FROM mo_inbox_gates"
++                        " WHERE gate_id = ? AND feature = ?",
++                        (GATE_ID, feature),
++                    ).fetchone()
++                except sqlite3.Error:
++                    existing = None
++                if existing is not None:
++                    inbox_id = int(existing["inbox_id"])
++                else:
++                    from mini_ork.gates.oversight_inbox import enqueue
++
++                    # No ``blocks_dispatch_for``: an oversight item, never a
++                    # dispatch blocker — the run was already delivered.
++                    inbox_id = enqueue(
++                        GATE_ID,
++                        feature,
++                        phase="verify",
++                        context={
++                            "run_id": run_id,
++                            "verdict": verdict,
++                            "trace_id": trace_id,
++                            "failing": names,
++                            "run_dir": run_dir,
++                        },
++                        db_path=db,
++                    )
++            except Exception:
++                inbox_id = None
++
++            record = {
++                "run_id": run_id,
++                "verdict": verdict,
++                "trace_id": trace_id,
++                "status": "published",
++                "task_runs_verdict": "ESCALATE" if escalated else row["verdict"],
++                "failing": _failing_records(failing),
++                "inbox_id": inbox_id,
++                "flagged_at": flagged_at,
++            }
++
++            if run_dir and os.path.isdir(run_dir):
++                try:
++                    with open(os.path.join(run_dir, FLAG_FILE), "w",
++                              encoding="utf-8") as fh:
++                        json.dump(record, fh, indent=2)
++                except OSError:
++                    pass
++            return record
++        finally:
++            conn.close()
++    except Exception:
++        return None
+diff --git a/tests/unit/test_eco6_k11_post_publish_verify.py b/tests/unit/test_eco6_k11_post_publish_verify.py
+new file mode 100644
+index 00000000..dc60de7a
+--- /dev/null
++++ b/tests/unit/test_eco6_k11_post_publish_verify.py
+@@ -0,0 +1,466 @@
++"""ECOSYSTEM §6 · K11: a post-run verify failure after publish is marked.
++
++Two mechanisms are covered here:
++
++* ``mini_ork.cli.verify`` now persists its result to ``<run_dir>/verify-result.json``
++  and, when the verdict is ``fail``/``partial`` against a run that is already
++  ``published``, escalates that run (``verdict='ESCALATE'``, status untouched),
++  records a note, writes ``post-verify-after-publish.json`` and enqueues one
++  non-blocking oversight item.
++* ``mini_ork.gates.step_rules.rule_named_test_path_exists`` expands the
++  variables it can resolve, ignores words it cannot read (unset variables,
++  ``<placeholders>``, globs) and resolves relative paths under the run dir.
++
++Hermetic: tmp dirs, a template DB from ``init_db``, a faked ``gate_run_all``.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++from pathlib import Path
++
++import pytest
++
++import mini_ork.gates.step_rules as sr
++from mini_ork.cli import verify as verify_cli
++from mini_ork.stores.migrate import init_db
++
++REPO = str(Path(__file__).resolve().parents[2])
++
++#: The kickoff's autouse env scrub, so an outer mini-ork run's identity can
++#: never leak into these tests.
++_CLEAN_ENV = [
++    "MINI_ORK_RUN_DIR", "MINI_ORK_RUN_ID", "MINI_ORK_TASK_RUN_ID",
++    "MINI_ORK_DB", "MINI_ORK_HOME", "MINI_ORK_ROOT", "MINI_ORK_PLAN_PATH",
++    "MINI_ORK_TASK_CLASS", "MINI_ORK_DRY_RUN", "MINI_ORK_RECIPE",
++    "MINI_ORK_TARGET_REPO", "MO_TARGET_CWD", "MO_MUTATION_REPORT",
++    "MO_MUTATION_TEST_CMD", "MO_VERIFY_RERUN", "MO_STEP_RULES", "RUN_ID",
++]
++
++# Copied from ``tests/unit/test_verify_partial_trace.py`` (the V6 bullet).
++_TRACE_DDL = """
++CREATE TABLE IF NOT EXISTS execution_traces (
++  trace_id              TEXT PRIMARY KEY,
++  run_id                INTEGER,
++  workflow_version_id   TEXT,
++  agent_version_id      TEXT NOT NULL DEFAULT '',
++  task_class            TEXT NOT NULL,
++  prompt_version_hash   TEXT NOT NULL DEFAULT '',
++  context_bundle_hash   TEXT NOT NULL DEFAULT '',
++  tool_calls            TEXT NOT NULL DEFAULT '[]',
++  files_read            TEXT NOT NULL DEFAULT '[]',
++  files_written         TEXT NOT NULL DEFAULT '[]',
++  verifier_output       TEXT NOT NULL DEFAULT '{}',
++  reviewer_verdict      TEXT,
++  cost_usd              REAL NOT NULL DEFAULT 0.0,
++  duration_ms           INTEGER NOT NULL DEFAULT 0,
++  final_artifact_ref    TEXT,
++  status                TEXT NOT NULL
++                        CHECK (status IN ('success','failure','pending','running','vacuous','blocked')),
++  created_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
++  process_reward        REAL DEFAULT NULL,
++  objective_domain      TEXT NOT NULL DEFAULT 'code-delivery',
++  segment               TEXT DEFAULT NULL,
++  reward_primary_metric TEXT DEFAULT NULL,
++  reward_direction      TEXT NOT NULL DEFAULT 'higher_is_better',
++  reward_value          REAL DEFAULT NULL,
++  reward_anchor         REAL DEFAULT NULL,
++  reward_g              REAL DEFAULT NULL,
++  reward_vector_json    TEXT DEFAULT NULL,
++  reward_source         TEXT NOT NULL DEFAULT 'verifier@v1',
++  validity              TEXT NOT NULL DEFAULT 'valid',
++  code_region           TEXT DEFAULT NULL,
++  route_source          TEXT DEFAULT NULL,
++  route_explore         INTEGER DEFAULT NULL,
++  route_score           REAL DEFAULT NULL,
++  route_margin          REAL DEFAULT NULL,
++  predicted_error       REAL DEFAULT NULL
++)
++"""
++
++
++@pytest.fixture(autouse=True)
++def _kickoff_env(monkeypatch, tmp_path):
++    for key in _CLEAN_ENV:
++        monkeypatch.delenv(key, raising=False)
++    monkeypatch.setenv("MO_MUTATION_ADVERSARY", "0")
++    return tmp_path
++
++
++@pytest.fixture(scope="module")
++def template_db(tmp_path_factory):
++    db = str(tmp_path_factory.mktemp("tpl") / "state.db")
++    rc, _out, err = init_db(db=db, root=REPO)
++    assert rc == 0, err
++    return db
++
++
++def _fresh_db(template_db, tmp_path):
++    db = str(tmp_path / "state.db")
++    src = sqlite3.connect(template_db)
++    dst = sqlite3.connect(db)
++    src.backup(dst)
++    dst.close()
++    src.close()
++    return db
++
++
++def _insert_run(db, status, verdict):
++    con = sqlite3.connect(db)
++    con.execute(
++        "INSERT INTO task_runs (id, task_class, kickoff_path, status, verdict,"
++        " created_at, updated_at) VALUES ('run-k11', 'k11', 'k.md', ?, ?, 1, 1)",
++        (status, verdict),
++    )
++    con.commit()
++    con.close()
++
++
++class _Setup:
++    """Verifiers under ``root/verifiers``, an existing ``rd``, a plan naming
++    them, and a fresh DB with one ``task_runs`` row."""
++
++    def __init__(self, tmp_path, template_db, verifiers, run_row):
++        self.root = tmp_path / "root"
++        (self.root / "verifiers").mkdir(parents=True)
++        for name, lines in verifiers.items():
++            (self.root / "verifiers" / name).write_text(
++                "\n".join(lines) + "\n", encoding="utf-8")
++        self.home = tmp_path / "home"
++        self.home.mkdir()
++        self.rd = tmp_path / "rd"
++        self.rd.mkdir()
++        self.plan = tmp_path / "plan.json"
++        self.plan.write_text(json.dumps({
++            "task_class": "k11",
++            "artifact_contract": {"success_verifiers": list(verifiers)},
++        }), encoding="utf-8")
++        self.db = _fresh_db(template_db, tmp_path)
++        if run_row is not None:
++            _insert_run(self.db, *run_row)
++
++
++def _verifier_scripts(which):
++    scripts = {
++        "vpass.py": ["print('pass evidence')"],
++        "vfail.py": ["import sys", "print('fail evidence')", "sys.exit(1)"],
++    }
++    return {name: scripts[name] for name in which}
++
++
++def _invoke(monkeypatch, capsys, setup, gates=None):
++    """One ``verify_cli.main`` call, as the lifecycle makes it (no artifact)."""
++    recorded = {}
++
++    def fake_gate_run_all(db_path, task_class, ctx_json, mini_ork_root=None):
++        recorded["ctx"] = json.loads(ctx_json)
++        if gates is not None:
++            return gates
++        return {"any_fail": False, "gates": []}
++
++    monkeypatch.setattr(verify_cli.gate_registry, "gate_run_all", fake_gate_run_all)
++    monkeypatch.setenv("MINI_ORK_HOME", str(setup.home))
++    monkeypatch.setenv("MINI_ORK_RUN_DIR", str(setup.rd))
++    monkeypatch.setenv("MINI_ORK_RUN_ID", "run-k11")
++    rc = verify_cli.main(["--plan", str(setup.plan), "--task-class", "k11"],
++                         db=setup.db, root=str(setup.root))
++    out = json.loads(capsys.readouterr().out)
++    return out, rc, recorded
++
++
++def _run(tmp_path, template_db, monkeypatch, capsys, which,
++         gates=None, run_row=("published", "APPROVE")):
++    setup = _Setup(tmp_path, template_db, _verifier_scripts(which), run_row)
++    out, rc, recorded = _invoke(monkeypatch, capsys, setup, gates=gates)
++    return out, rc, recorded, setup
++
++
++def _row(db, sql, args=()):
++    con = sqlite3.connect(db)
++    try:
++        return con.execute(sql, args).fetchall()
++    finally:
++        con.close()
++
++
++def _result_rows(out):
++    return [r if isinstance(r, dict) else json.loads(r) for r in out["results"]]
++
++
++# ── V1–V10 ────────────────────────────────────────────────────────────────────
++
++
++def test_v1_partial_after_publish_escalates(tmp_path, template_db, monkeypatch, capsys):
++    out, rc, _recorded, setup = _run(tmp_path, template_db, monkeypatch, capsys,
++                                     ["vpass.py", "vfail.py"])
++    assert rc == 0
++    assert out["verdict"] == "partial"
++
++    rows = _row(setup.db, "SELECT status, verdict, notes FROM task_runs WHERE id='run-k11'")
++    assert len(rows) == 1
++    status, verdict, notes = rows[0]
++    assert status == "published"
++    assert verdict == "ESCALATE"
++    assert "post-run verify partial after publish" in notes
++    assert "vfail.py" in notes
++
++    flag = json.loads((setup.rd / "post-verify-after-publish.json").read_text())
++    assert flag["verdict"] == "partial"
++    assert flag["trace_id"].startswith("tr-verify-")
++    assert [r["verifier"] for r in flag["failing"]] == ["vfail.py"]
++    assert flag["task_runs_verdict"] == "ESCALATE"
++    assert isinstance(flag["inbox_id"], int)
++
++    inbox = _row(setup.db, "SELECT gate_id, feature, phase, status, blocks_dispatch_for"
++                           " FROM mo_inbox_gates")
++    assert len(inbox) == 1
++    gate_id, feature, phase, st, blocks = inbox[0]
++    assert gate_id == "post_verify_after_publish"
++    assert feature == "post-run verify failed after publish: run-k11"
++    assert phase == "verify"
++    assert st == "pending"
++    assert blocks in ("", None)
++
++    result = json.loads((setup.rd / "verify-result.json").read_text())
++    assert result["verdict"] == "partial"
++    assert result["trace_id"] == flag["trace_id"]
++
++
++def test_v2_fail_after_publish_escalates(tmp_path, template_db, monkeypatch, capsys):
++    out, rc, _recorded, setup = _run(tmp_path, template_db, monkeypatch, capsys,
++                                     ["vfail.py"])
++    assert rc == 1
++    rows = _row(setup.db, "SELECT status, verdict FROM task_runs WHERE id='run-k11'")
++    assert rows == [("published", "ESCALATE")]
++    flag = json.loads((setup.rd / "post-verify-after-publish.json").read_text())
++    assert flag["verdict"] == "fail"
++
++
++def test_v3_twice_one_inbox_row_one_note(tmp_path, template_db, monkeypatch, capsys):
++    setup = _Setup(tmp_path, template_db, _verifier_scripts(["vpass.py", "vfail.py"]),
++                   ("published", "APPROVE"))
++    out1, rc1, _ = _invoke(monkeypatch, capsys, setup)
++    out2, rc2, _ = _invoke(monkeypatch, capsys, setup)
++    assert rc1 == 0 and out1["verdict"] == "partial"
++    assert rc2 == 0 and out2["verdict"] == "partial"
++    assert len(_row(setup.db, "SELECT inbox_id FROM mo_inbox_gates")) == 1
++    notes = _row(setup.db, "SELECT notes FROM task_runs WHERE id='run-k11'")[0][0]
++    assert notes.count("post-run verify") == 1
++
++
++def test_v4_not_published_no_flag(tmp_path, template_db, monkeypatch, capsys):
++    out, rc, _recorded, setup = _run(tmp_path, template_db, monkeypatch, capsys,
++                                     ["vpass.py", "vfail.py"],
++                                     run_row=("executing", None))
++    assert rc == 0
++    assert out["verdict"] == "partial"
++    assert _row(setup.db, "SELECT status, verdict, notes FROM task_runs WHERE id='run-k11'") \
++        == [("executing", None, None)]
++    assert not (setup.rd / "post-verify-after-publish.json").exists()
++    assert len(_row(setup.db, "SELECT inbox_id FROM mo_inbox_gates")) == 0
++    result = json.loads((setup.rd / "verify-result.json").read_text())
++    assert result["verdict"] == "partial"
++
++
++def test_v5_pass_writes_nothing(tmp_path, template_db, monkeypatch, capsys):
++    out, rc, _recorded, setup = _run(tmp_path, template_db, monkeypatch, capsys,
++                                     ["vpass.py"])
++    assert rc == 0
++    assert out["verdict"] == "pass"
++    assert _row(setup.db, "SELECT status, verdict, notes FROM task_runs WHERE id='run-k11'") \
++        == [("published", "APPROVE", None)]
++    assert not (setup.rd / "post-verify-after-publish.json").exists()
++    assert len(_row(setup.db, "SELECT inbox_id FROM mo_inbox_gates")) == 0
++
++
++def test_v6_db_without_task_runs_does_not_raise(tmp_path, template_db, monkeypatch, capsys):
++    setup = _Setup(tmp_path, template_db, _verifier_scripts(["vpass.py", "vfail.py"]),
++                   run_row=None)
++    con = sqlite3.connect(setup.db)
++    for (name,) in con.execute(
++            "SELECT name FROM sqlite_master WHERE type='table'"
++            " AND name NOT LIKE 'sqlite_%' AND name != 'execution_traces'").fetchall():
++        con.execute(f'DROP TABLE IF EXISTS "{name}"')
++    con.commit()
++    con.close()
++    out, rc, _recorded = _invoke(monkeypatch, capsys, setup)
++    assert rc == 0
++    assert out["verdict"] == "partial"
++    assert not (setup.rd / "post-verify-after-publish.json").exists()
++
++
++def test_v7_crash_verdict_never_overwritten(tmp_path, template_db, monkeypatch, capsys):
++    out, rc, _recorded, setup = _run(tmp_path, template_db, monkeypatch, capsys,
++                                     ["vpass.py", "vfail.py"],
++                                     run_row=("published", "CRASH"))
++    assert rc == 0
++    assert out["verdict"] == "partial"
++    assert _row(setup.db, "SELECT status, verdict FROM task_runs WHERE id='run-k11'") \
++        == [("published", "CRASH")]
++    flag = json.loads((setup.rd / "post-verify-after-publish.json").read_text())
++    assert flag["task_runs_verdict"] == "CRASH"
++    assert len(_row(setup.db, "SELECT inbox_id FROM mo_inbox_gates")) == 1
++
++
++def test_v8_gate_context_carries_run_dir(tmp_path, template_db, monkeypatch, capsys):
++    _out, _rc, recorded, setup = _run(tmp_path, template_db, monkeypatch, capsys,
++                                      ["vpass.py"])
++    assert recorded["ctx"]["run_dir"] == str(setup.rd)
++
++
++def test_v9_failing_gates_row_names_them(tmp_path, template_db, monkeypatch, capsys):
++    out, rc, _recorded, _setup = _run(
++        tmp_path, template_db, monkeypatch, capsys, ["vpass.py"],
++        gates={"any_fail": True, "gates": [
++            {"gate_id": "step-rules-gate", "verdict": "fail"},
++            {"gate_id": "oracle-liveness", "verdict": "pass"},
++        ]})
++    assert rc == 0
++    assert out["verdict"] == "partial"
++    gates_rows = [r for r in _result_rows(out) if r.get("verifier") == "__gates__"]
++    assert gates_rows == [{
++        "verifier": "__gates__", "pass": False, "evidence_path": "gate_registry",
++        "detail": "gate(s) failed: step-rules-gate",
++    }]
++
++
++def test_v10_default_gates_row_shape_unchanged(tmp_path, template_db, monkeypatch, capsys):
++    out, _rc, _recorded, _setup = _run(tmp_path, template_db, monkeypatch, capsys,
++                                       ["vpass.py"])
++    gates_rows = [r for r in _result_rows(out) if r.get("verifier") == "__gates__"]
++    assert len(gates_rows) == 1
++    row = gates_rows[0]
++    assert set(row) == {"verifier", "pass", "evidence_path"}
++    assert row["pass"] is True
++
++
++# ── M1 ────────────────────────────────────────────────────────────────────────
++
++
++def test_m1_unflagged_verdicts_return_none(tmp_path, template_db):
++    from mini_ork.verify import post_publish_flag
++
++    rd = tmp_path / "rd"
++    rd.mkdir()
++    db = _fresh_db(template_db, tmp_path)
++    _insert_run(db, "published", "APPROVE")
++    assert post_publish_flag.mark(db, "run-k11", str(rd), "vacuous") is None
++    assert post_publish_flag.mark(db, "run-k11", str(rd), "pass") is None
++    assert _row(db, "SELECT status, verdict, notes FROM task_runs WHERE id='run-k11'") \
++        == [("published", "APPROVE", None)]
++    assert not (rd / "post-verify-after-publish.json").exists()
++    assert len(_row(db, "SELECT inbox_id FROM mo_inbox_gates")) == 0
++
++
++# ── Step rules ────────────────────────────────────────────────────────────────
++
++
++def _dirs(tmp_path):
++    ws = tmp_path / "ws"
++    root = tmp_path / "root"
++    rd = tmp_path / "rd"
++    for d in (ws, root, rd):
++        d.mkdir()
++    return ws, root, rd
++
++
++def _plan(tmp_path, *commands):
++    path = tmp_path / "plan.json"
++    path.write_text(json.dumps({
++        "task_class": "code_fix",
++        "verifier_contract": {
++            "checks": [{"id": f"c{i + 1}", "command": cmd}
++                       for i, cmd in enumerate(commands)]
++        },
++    }), encoding="utf-8")
++    return str(path)
++
++
++def test_step_rules_run_dir_var_expands(tmp_path):
++    ws, root, rd = _dirs(tmp_path)
++    (ws / "tool.py").write_text("", encoding="utf-8")
++    (rd / "source-corpus.json").write_text("{}", encoding="utf-8")
++    plan = _plan(tmp_path,
++                 'python3 tool.py verify --corpus "$MINI_ORK_RUN_DIR/source-corpus.json"')
++    assert sr.rule_named_test_path_exists(
++        plan, str(ws), str(root), run_dir=str(rd)) == ("pass", "2 named path(s) resolved")
++
++
++def test_step_rules_missing_expanded_path_names_the_file(tmp_path):
++    ws, root, rd = _dirs(tmp_path)
++    plan = _plan(tmp_path, 'jq -e . "${MINI_ORK_RUN_DIR}/source-corpus.json"')
++    verdict, detail = sr.rule_named_test_path_exists(
++        plan, str(ws), str(root), run_dir=str(rd))
++    assert verdict == "fail"
++    assert f"{rd}/source-corpus.json" in detail
++    assert "MINI_ORK_RUN_DIR/" not in detail
++
++
++def test_step_rules_root_var_expands(tmp_path):
++    ws, root, rd = _dirs(tmp_path)
++    vdir = root / "recipes" / "r1" / "verifiers"
++    vdir.mkdir(parents=True)
++    (vdir / "v.py").write_text("", encoding="utf-8")
++    plan = _plan(tmp_path, "python3 ${MINI_ORK_ROOT}/recipes/r1/verifiers/v.py")
++    assert sr.rule_named_test_path_exists(plan, str(ws), str(root))[0] == "pass"
++
++
++def test_step_rules_placeholder_and_glob_defer(tmp_path):
++    ws, root, rd = _dirs(tmp_path)
++    plan = _plan(tmp_path, 'python3 -c "import sys" <run_dir>/*.sidecar.json')
++    assert sr.rule_named_test_path_exists(
++        plan, str(ws), str(root), run_dir=str(rd))[0] == "defer"
++
++
++def test_step_rules_unset_var_defers(tmp_path):
++    ws, root, rd = _dirs(tmp_path)
++    plan = _plan(tmp_path, 'test -s ".mini-ork/runs/$RUN_ID/review.json"')
++    assert sr.rule_named_test_path_exists(
++        plan, str(ws), str(root), run_dir=str(rd))[0] == "defer"
++
++
++def test_step_rules_recipe_glob_defers(tmp_path):
++    ws, root, rd = _dirs(tmp_path)
++    plan = _plan(tmp_path, "grep -rln path_globs recipes/*/task_class.yaml")
++    assert sr.rule_named_test_path_exists(
++        plan, str(ws), str(root), run_dir=str(rd))[0] == "defer"
++
++
++def test_step_rules_redirect_and_flag_targets_are_outputs(tmp_path):
++    ws, root, rd = _dirs(tmp_path)
++    plan = _plan(tmp_path,
++                 'python3 -m pytest -q > "$MINI_ORK_RUN_DIR/run.json"',
++                 'python3 -m pytest -q --report="$MINI_ORK_RUN_DIR/r.json"')
++    assert sr.rule_named_test_path_exists(
++        plan, str(ws), str(root), run_dir=str(rd))[0] == "defer"
++
++
++def test_step_rules_relative_token_resolves_under_run_dir(tmp_path):
++    ws, root, rd = _dirs(tmp_path)
++    (rd / "verifier-result-x.json").write_text("{}", encoding="utf-8")
++    plan = _plan(tmp_path, "test -s verifier-result-x.json")
++    assert sr.rule_named_test_path_exists(
++        plan, str(ws), str(root), run_dir=str(rd))[0] == "pass"
++    assert sr.rule_named_test_path_exists(plan, str(ws), str(root))[0] == "fail"
++
++
++def test_step_rules_absent_named_test_fails_and_is_named(tmp_path):
++    ws, root, rd = _dirs(tmp_path)
++    plan = _plan(tmp_path, "python3 -m pytest tests/unit/test_ghost.py")
++    verdict, detail = sr.rule_named_test_path_exists(plan, str(ws), str(root))
++    assert verdict == "fail"
++    assert "tests/unit/test_ghost.py" in detail
++
++
++def test_step_rules_evaluate_passes_run_dir_from_context(tmp_path):
++    ws, root, rd = _dirs(tmp_path)
++    (ws / "tool.py").write_text("", encoding="utf-8")
++    (rd / "source-corpus.json").write_text("{}", encoding="utf-8")
++    plan = _plan(tmp_path,
++                 'python3 tool.py verify --corpus "$MINI_ORK_RUN_DIR/source-corpus.json"')
++    assert sr.evaluate(
++        "",
++        json.dumps({"plan_path": plan, "workspace": str(ws), "run_dir": str(rd)}),
++        "",
++        str(root),
++    ) == "pass"

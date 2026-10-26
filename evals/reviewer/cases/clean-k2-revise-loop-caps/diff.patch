@@ -1,0 +1,897 @@
+diff --git a/mini_ork/cli/execute.py b/mini_ork/cli/execute.py
+index 97df0b7f88fa8f2bd502a18c5e33b18f41c11b5c..e815bda33dcae4b3601faa7673c55eefd9e66069 100644
+--- a/mini_ork/cli/execute.py
++++ b/mini_ork/cli/execute.py
+@@ -69,7 +69,6 @@ from mini_ork.gates.node_review import REVIEW_PAUSE_RC  # noqa: F401
+ 
+ 
+ # ── extracted modules (re-exported contracts; definitions live in the modules) ──
+-from mini_ork.learning import revise_value
+ from mini_ork.learning.writeback import (  # noqa: F401
+     learning_update_conductor_outcomes,
+     reward_from_status,
+@@ -1185,6 +1184,10 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
+     retry_edges: dict[str, CompiledRetryEdge] = {}
+     escalation_edges: dict[str, CompiledRetryEdge] = {}
+     recursive_children: dict[str, tuple[str, ...]] = {}
++    # Declared `recursion:` config, loaded once below when the workflow exists.
++    # ``None`` means the recipe declared no block (or there is no workflow file):
++    # its `escalates_to` edges stay inert and the declared budget does not apply.
++    recursion = None
+     if workflow and os.path.isfile(workflow):
+         from mini_ork.workflow import compile_workflow
+ 
+@@ -1417,9 +1420,6 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
+         fields_by_id = {field[0]: field for field in work_fields}
+         # revise round bookkeeping: target node_id -> rounds already consumed.
+         round_used: dict[str, int] = {}
+-        # CoBa: a granted round is settled by the source that fired it, which
+-        # re-runs in a later wave. source node_id -> (target, round number).
+-        open_round_settles: dict[str, tuple[str, int]] = {}
+         # RB-18: the defect report is noted once per run, not once per wave.
+         spec_defect_noted = False
+ 
+@@ -1590,21 +1590,6 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
+                     fail_count += 1
+                     failed_outcomes[field[0]] = _finish_reason or "failed"
+ 
+-            # ── CoBa: settle the revise round a source fired ───────────────
+-            # A round's value is whether the source that fired it passes the
+-            # next time it runs (the target reset pulls it into a later wave).
+-            # Settle before grouping: a source failing again in this same wave
+-            # settles the previous round as failed and may fire the next one.
+-            # An empty history makes the whole rule inert; the module never
+-            # raises, so a broken DB cannot stall the loop.
+-            for field, rc, _finish_reason in outcomes:
+-                pending_settle = open_round_settles.pop(field[0], None)
+-                if pending_settle is None:
+-                    continue
+-                _settle_target, _settle_round = pending_settle
+-                revise_value.settle_round(
+-                    db, run_id, _settle_target, _settle_round, rc == 0)
+-
+             # ── per-run orchestrator (default on; MO_RUN_ORCHESTRATOR=0 opts out) ──
+             # Observe each node outcome at the wave boundary and pick one of
+             # advance/help/repair/mutate/promote (see
+@@ -1696,8 +1681,8 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
+                           file=sys.stderr)
+                     continue
+                 edge = repair_edges[field[0]]
+-                target, max_rounds = edge.target, edge.max_rounds
+-                cap = min(max_rounds, revise_rounds_cap)
++                target = edge.target
++                cap = _round_cap(field[0], edge, escalation_edges, revise_rounds_cap)
+                 if round_used.get(target, 0) >= cap:
+                     continue
+                 if target not in fields_by_id:
+@@ -1710,15 +1695,6 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
+                     print(f"[revise] skipped for {field[0]}: revise target '{target}' "
+                           "is outside this run's node closure", file=sys.stderr)
+                     continue
+-                # CoBa: stop spending rounds whose measured marginal value is
+-                # too low. With no settled history (n < min samples) this is
+-                # always False, so the default behaviour is unchanged.
+-                _coba_stop, _coba_reason = revise_value.should_stop(
+-                    db, task_class, target, round_used.get(target, 0) + 1)
+-                if _coba_stop:
+-                    print(f"[revise] coba stop for {target}: {_coba_reason}",
+-                          file=sys.stderr)
+-                    continue
+                 revise_groups.setdefault(target, []).append((field, rc, finish_reason))
+             # Second pass: condition-fired rounds (rc==0 + condition predicate
+             # fired on the node's output artifact). The rc-fired loop above
+@@ -1750,7 +1726,7 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
+                 if not outcome.fired:
+                     continue
+                 target = edge.target
+-                cap = min(edge.max_rounds, revise_rounds_cap)
++                cap = _round_cap(field[0], edge, escalation_edges, revise_rounds_cap)
+                 if round_used.get(target, 0) >= cap:
+                     # Round cap applies symmetrically to condition-fired and
+                     # rc-fired rounds (F6). The cap was already checked for
+@@ -1771,15 +1747,6 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
+                           f"'{target}' is outside this run's node closure",
+                           file=sys.stderr)
+                     continue
+-                # CoBa applies symmetrically to the condition channel: same cap,
+-                # same measured value. Inert until the history has enough
+-                # settled samples.
+-                _coba_stop, _coba_reason = revise_value.should_stop(
+-                    db, task_class, target, round_used.get(target, 0) + 1)
+-                if _coba_stop:
+-                    print(f"[revise] coba stop for {target}: {_coba_reason}",
+-                          file=sys.stderr)
+-                    continue
+                 # Mark the source with a sentinel finish_reason so the
+                 # feedback section can pick the compact-JSON-dump fallback
+                 # (C4 of p1-1-condition-edges) when none of the standard
+@@ -1815,15 +1782,28 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
+                 for target, failed_sources in revise_groups.items():
+                     _target_edge = repair_edges[failed_sources[0][0][0]]
+                     _target_max = _target_edge.max_rounds
++                    # A recursion edge spends the recipe's declared total budget,
++                    # not an implicit one. Check once per target per wave, before
++                    # the round is charged; a None spend (unreadable ledger) fails
++                    # open, matching the orchestrator's budget gate.
++                    _escalation_fired = any(
++                        _src_field[0] in escalation_edges
++                        for _src_field, _src_rc, _src_fr in failed_sources)
++                    if _escalation_fired and recursion is not None:
++                        from mini_ork import cost_ledger as _cost_ledger  # noqa: PLC0415
++
++                        _spent = _cost_ledger.run_cost(db, run_id)
++                        if (_spent is not None
++                                and _spent >= recursion.budget_cap_total_usd):
++                            print(
++                                f"[revise] recursion budget cap reached for "
++                                f"{target}: spent ${_spent:.2f} of "
++                                f"${recursion.budget_cap_total_usd:.2f}",
++                                file=sys.stderr,
++                            )
++                            continue
+                     round_no = round_used.get(target, 0) + 1
+                     round_used[target] = round_no
+-                    # CoBa: this round is granted; remember it so the measured
+-                    # value of the next one can be taken from real history,
+-                    # and settle it when a firing source next reports.
+-                    revise_value.record_round(
+-                        db, run_id, task_class, target, round_no)
+-                    for _src_field, _src_rc, _src_fr in failed_sources:
+-                        open_round_settles[_src_field[0]] = (target, round_no)
+                     reset_ids = _control_descendants(target)
+                     feedback_path = _write_revise_feedback(
+                         live_run_dir, round_no, _target_max, failed_sources)
+@@ -4685,6 +4665,24 @@ def _revise_rounds_limit() -> int:
+         return 2
+ 
+ 
++def _round_cap(source: str, edge, escalation_edges, revise_rounds_cap: int) -> int:
++    """Round cap for one revise edge.
++
++    A recipe that declares a ``recursion:`` block owns its loop: the compiler
++    stamps ``recursion.max_iterations`` onto each ``escalates_to`` edge, and
++    that declared cap applies unless the operator explicitly sets
++    ``MO_REVISE_ROUNDS`` (an empty string counts as unset). Every other edge --
++    ``retries`` edges, and all edges of recipes without a recursion block --
++    keeps today's ``min(edge.max_rounds, MO_REVISE_ROUNDS)`` rule byte for byte.
++    ``revise_rounds_cap <= 0`` still disables the loop for every edge.
++    """
++    if revise_rounds_cap <= 0:
++        return 0
++    if source in escalation_edges and not context_env("MO_REVISE_ROUNDS", ""):
++        return edge.max_rounds
++    return min(edge.max_rounds, revise_rounds_cap)
++
++
+ # ── RB-18: only a real verdict may start a revise round ─────────────────────
+ # The revise loop used to fire on three things that are not verdicts about the
+ # code: a node that produced no verdict at all (dispatch error/timeout/config),
+diff --git a/mini_ork/learning/revise_value.py b/mini_ork/learning/revise_value.py
+deleted file mode 100644
+index 000f393283c830bd20c28cce7507608790a14442..0000000000000000000000000000000000000000
+--- a/mini_ork/learning/revise_value.py
++++ /dev/null
+@@ -1,229 +0,0 @@
+-"""CoBa: measure the marginal value of another revise round.
+-
+-The revise loop (``mini_ork/cli/execute.py``) grants an implementer round when
+-a verifier fails, up to ``MO_REVISE_ROUNDS``. That cap is blind to history: it
+-spends the last round exactly like the first. CoBa (arXiv 2608.07424) allocates
+-a fixed budget between generating another attempt and stopping by the measured
+-marginal value of each. This module is the measurement half:
+-
+-  record_round      -- a round was granted (idempotent on run/target/round)
+-  settle_round      -- the source that fired it reported pass (1) or fail (0)
+-  next_round_value  -- P(pass at ``round_no`` | settled history), plus n
+-  should_stop       -- cheap guard: enough samples AND too little value
+-
+-The rule only fires with real history: a fresh home has no rows, so every run
+-keeps the old behaviour exactly. The environment can only make stopping
+-*rarer* -- ``MO_COBA_MIN_SAMPLES`` clamps up to 20 and ``MO_COBA_MIN_GAIN``
+-clamps down to 0.05 -- and ``MO_COBA=0`` disables the rule outright.
+-
+-Every function swallows DB errors and returns a neutral value: the revise loop
+-is on the critical path of a run, and a history write that crashes it is worse
+-than no history at all. ``record_round`` also creates the table when absent so
+-a state.db that never ran migration 0081 still works (the migration and
+-``_SCHEMA`` must not drift apart).
+-"""
+-from __future__ import annotations
+-
+-import os
+-import sqlite3
+-import time
+-from typing import Any
+-
+-#: Default and floor for the settled-sample count. ``MO_COBA_MIN_SAMPLES`` may
+-#: only raise it: fewer samples than this is not evidence.
+-DEFAULT_MIN_SAMPLES = 20
+-#: Default and ceiling for the next-round pass-rate threshold. ``MO_COBA_MIN_GAIN``
+-#: may only lower it, so the environment can only make stopping rarer.
+-DEFAULT_MIN_GAIN = 0.05
+-
+-_NEUTRAL_VALUE: dict[str, Any] = {"p": None, "n": 0}
+-
+-#: Runtime copy of db/migrations/0081_revise_rounds.sql's CREATE TABLE. Kept in
+-#: sync with the migration by hand; the migration is authoritative.
+-_SCHEMA = """
+-CREATE TABLE IF NOT EXISTS revise_rounds (
+-    id          INTEGER PRIMARY KEY,
+-    run_id      TEXT    NOT NULL,
+-    task_class  TEXT,
+-    target_node TEXT    NOT NULL,
+-    round       INTEGER NOT NULL,
+-    passed      INTEGER,
+-    cost_usd    REAL,
+-    created_at  INTEGER NOT NULL,
+-    UNIQUE (run_id, target_node, round)
+-)
+-"""
+-
+-
+-def _connect(db_path: str) -> sqlite3.Connection | None:
+-    """Open ``db_path`` and ensure the table exists.
+-
+-    ``None`` when there is no path. Raises ``sqlite3.Error`` / ``OSError`` on an
+-    unusable path (missing directory, corrupt file) for the caller to swallow.
+-    """
+-    if db_path is None or str(db_path).strip() == "":
+-        return None
+-    conn = sqlite3.connect(str(db_path), timeout=5.0)
+-    try:
+-        conn.execute(_SCHEMA)
+-        conn.commit()
+-    except BaseException:
+-        conn.close()
+-        raise
+-    return conn
+-
+-
+-def _env_float(name: str, default: float) -> float:
+-    raw = os.environ.get(name)
+-    if raw is None or str(raw).strip() == "":
+-        return default
+-    try:
+-        return float(raw)
+-    except (TypeError, ValueError):
+-        return default
+-
+-
+-def _env_int(name: str, default: int) -> int:
+-    raw = os.environ.get(name)
+-    if raw is None or str(raw).strip() == "":
+-        return default
+-    try:
+-        return int(str(raw).strip())
+-    except (TypeError, ValueError):
+-        return default
+-
+-
+-def _coba_disabled() -> bool:
+-    raw = os.environ.get("MO_COBA")
+-    if raw is None:
+-        return False
+-    return str(raw).strip().lower() in {"0", "false", "off", "no"}
+-
+-
+-def record_round(
+-    db: str,
+-    run_id: str,
+-    task_class: str | None,
+-    target_node: str,
+-    round_no: int,
+-    cost_usd: float | None = None,
+-) -> None:
+-    """Record that ``target_node`` was granted ``round_no`` in this run.
+-
+-    Idempotent on the unique ``(run_id, target_node, round)``: a re-record keeps
+-    whatever ``passed`` the row already carries and never raises.
+-    """
+-    try:
+-        conn = _connect(db)
+-        if conn is None:
+-            return
+-        try:
+-            conn.execute(
+-                "INSERT OR IGNORE INTO revise_rounds "
+-                "(run_id, task_class, target_node, round, cost_usd, created_at) "
+-                "VALUES (?, ?, ?, ?, ?, ?)",
+-                (
+-                    run_id,
+-                    task_class,
+-                    target_node,
+-                    int(round_no),
+-                    cost_usd,
+-                    int(time.time()),
+-                ),
+-            )
+-            conn.commit()
+-        finally:
+-            conn.close()
+-    except Exception:  # noqa: BLE001 -- history must never crash the revise loop
+-        return
+-
+-
+-def settle_round(
+-    db: str,
+-    run_id: str,
+-    target_node: str,
+-    round_no: int,
+-    passed: bool,
+-) -> None:
+-    """Mark ``round_no`` of this run/target as passed (1) or failed (0)."""
+-    try:
+-        conn = _connect(db)
+-        if conn is None:
+-            return
+-        try:
+-            conn.execute(
+-                "UPDATE revise_rounds SET passed = ? "
+-                "WHERE run_id = ? AND target_node = ? AND round = ?",
+-                (1 if passed else 0, run_id, target_node, int(round_no)),
+-            )
+-            conn.commit()
+-        finally:
+-            conn.close()
+-    except Exception:  # noqa: BLE001 -- history must never crash the revise loop
+-        return
+-
+-
+-def next_round_value(
+-    db: str,
+-    task_class: str | None,
+-    target_node: str,
+-    round_no: int,
+-) -> dict[str, Any]:
+-    """Pass rate of settled history at ``round_no`` for this class+target.
+-
+-    ``{"p": None, "n": 0}`` when there is no settled history; otherwise ``p`` is
+-    the fraction of rows that passed and ``n`` the number of rows counted.
+-    """
+-    try:
+-        conn = _connect(db)
+-        if conn is None:
+-            return dict(_NEUTRAL_VALUE)
+-        try:
+-            row = conn.execute(
+-                "SELECT COUNT(*), COALESCE(SUM(passed), 0) FROM revise_rounds "
+-                "WHERE task_class IS ? AND target_node = ? AND round = ? "
+-                "AND passed IS NOT NULL",
+-                (task_class, target_node, int(round_no)),
+-            ).fetchone()
+-        finally:
+-            conn.close()
+-        n = int(row[0] or 0) if row is not None else 0
+-        if n == 0:
+-            return dict(_NEUTRAL_VALUE)
+-        return {"p": float(row[1]) / n, "n": n}
+-    except Exception:  # noqa: BLE001 -- history must never crash the revise loop
+-        return dict(_NEUTRAL_VALUE)
+-
+-
+-def should_stop(
+-    db: str,
+-    task_class: str | None,
+-    target_node: str,
+-    round_no: int,
+-) -> tuple[bool, str]:
+-    """Should ``round_no`` be withheld instead of granted?
+-
+-    True only when the settled history has at least ``MO_COBA_MIN_SAMPLES`` rows
+-    (default 20, clamped up) and its pass rate is below ``MO_COBA_MIN_GAIN``
+-    (default 0.05, clamped down). ``MO_COBA=0`` disables the rule.
+-    """
+-    if _coba_disabled():
+-        return False, "coba disabled"
+-    min_samples = max(_env_int("MO_COBA_MIN_SAMPLES", DEFAULT_MIN_SAMPLES),
+-                      DEFAULT_MIN_SAMPLES)
+-    min_gain = min(_env_float("MO_COBA_MIN_GAIN", DEFAULT_MIN_GAIN),
+-                   DEFAULT_MIN_GAIN)
+-    value = next_round_value(db, task_class, target_node, round_no)
+-    n = int(value.get("n") or 0)
+-    p = value.get("p")
+-    if n < min_samples:
+-        return False, (
+-            f"only {n} settled round-{round_no} samples (need {min_samples})"
+-        )
+-    if p is None:
+-        return False, f"no settled round-{round_no} pass rate"
+-    if p >= min_gain:
+-        return False, (
+-            f"next-round pass rate {p:.3f} >= {min_gain:.2f} (n={n})"
+-        )
+-    return True, f"next-round pass rate {p:.3f} < {min_gain:.2f} (n={n})"
+diff --git a/tests/unit/test_eco6_k2_revise_caps.py b/tests/unit/test_eco6_k2_revise_caps.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bc039c816f13c70c8c985ef5b965ca2ddfa2ff9b
+--- /dev/null
++++ b/tests/unit/test_eco6_k2_revise_caps.py
+@@ -0,0 +1,258 @@
++"""ECOSYSTEM §6 K2: the revise loop drops CoBa and honors declared recursion caps.
++
++Hermetic: every case runs against ``tmp_path`` with an injected deterministic
++dispatch seam. No network, no provider, no credentials, no shared DB.
++
++Part A pins the removal: ``mini_ork.learning.revise_value`` is gone and the
++executor no longer mentions it. Part B pins the ``_round_cap`` contract and
++drives the real executor over a two-node loop to prove the declared
++``recursion.max_iterations`` and ``budget_cap_total_usd`` are live while a
++``retries`` edge (and any recipe without a ``recursion:`` block) keeps the old
++``min(edge.max_rounds, MO_REVISE_ROUNDS)`` rule.
++"""
++from __future__ import annotations
++
++import contextlib
++import importlib.util
++import io
++import json
++import os
++import re
++import shutil
++from pathlib import Path
++
++import yaml
++
++import mini_ork.cli.execute
++from mini_ork.context import run_context_scope
++from mini_ork.recovery.dag import CompiledRetryEdge
++
++_REPO_ROOT = Path(mini_ork.cli.execute.__file__).resolve().parents[2]
++
++_RECURSION_BLOCK = {
++    "max_iterations": 4,
++    "convergence_check": "objective_delta",
++    "budget_cap_per_iter_usd": 0.50,
++    "budget_cap_total_usd": 1.00,
++    "divergence_kill": "none",
++}
++
++
++# ── Part A: the CoBa rule is gone ─────────────────────────────────────────────
++
++def test_revise_value_module_and_its_test_are_deleted():
++    assert importlib.util.find_spec("mini_ork.learning.revise_value") is None
++    legacy_test = _REPO_ROOT / "tests" / "unit" / "test_revise_value.py"
++    assert not legacy_test.exists(), f"{legacy_test} must be deleted with the module"
++
++
++def test_execute_py_contains_neither_revise_value_nor_coba_stop():
++    text = Path(mini_ork.cli.execute.__file__).read_text(encoding="utf-8")
++    assert "revise_value" not in text
++    assert "coba stop" not in text
++
++
++def test_migration_0081_and_revise_rounds_table_stay():
++    sql = _REPO_ROOT / "db" / "migrations" / "0081_revise_rounds.sql"
++    assert sql.is_file()
++    assert "revise_rounds" in sql.read_text(encoding="utf-8")
++
++
++# ── Part B1: the `_round_cap` helper contract ────────────────────────────────
++
++def _edge(max_rounds):
++    return CompiledRetryEdge(target="implementer", max_rounds=max_rounds)
++
++
++def _round_cap(source, edge, escalation_edges, revise_rounds_cap):
++    from mini_ork.cli import execute
++
++    return execute._round_cap(source, edge, escalation_edges, revise_rounds_cap)
++
++
++def test_retries_edge_keeps_the_env_cap():
++    assert _round_cap("reviewer", _edge(2), {}, 2) == 2
++    assert _round_cap("reviewer", _edge(5), {}, 2) == 2
++
++
++def test_recursion_edge_uses_declared_max_when_env_unset(monkeypatch):
++    monkeypatch.delenv("MO_REVISE_ROUNDS", raising=False)
++    edge = _edge(6)
++    assert _round_cap("reviewer", edge, {"reviewer": edge}, 2) == 6
++
++
++def test_recursion_edge_respects_explicit_env(monkeypatch):
++    monkeypatch.setenv("MO_REVISE_ROUNDS", "3")
++    edge = _edge(6)
++    assert _round_cap("reviewer", edge, {"reviewer": edge}, 3) == 3
++
++
++def test_empty_env_counts_as_unset(monkeypatch):
++    monkeypatch.setenv("MO_REVISE_ROUNDS", "")
++    edge = _edge(6)
++    assert _round_cap("reviewer", edge, {"reviewer": edge}, 2) == 6
++
++
++def test_non_positive_cap_disables_every_edge():
++    edge = _edge(6)
++    assert _round_cap("reviewer", edge, {"reviewer": edge}, 0) == 0
++    assert _round_cap("reviewer", _edge(5), {}, 0) == 0
++    assert _round_cap("reviewer", edge, {"reviewer": edge}, -1) == 0
++
++
++# ── Part B2: the real executor honors the declared caps and budget ───────────
++
++_WORKFLOW = {
++    "nodes": [
++        {"name": "implementer", "type": "implementer", "description": "do the thing"},
++        {"name": "reviewer", "type": "reviewer", "description": "review the thing"},
++    ],
++    "edges": [
++        {"from": "implementer", "to": "reviewer", "edge_type": "depends_on"},
++    ],
++}
++
++
++def _rounds_on_disk(run_dir: Path) -> list[int]:
++    revise = run_dir / "revise"
++    if not revise.is_dir():
++        return []
++    return sorted(
++        int(m.group(1))
++        for entry in revise.iterdir()
++        if (m := re.fullmatch(r"round-(\d+)\.md", entry.name))
++    )
++
++
++def _drive(tmp_path, monkeypatch, *, edge_type="escalates_to", max_rounds=4,
++           with_recursion=True, env_overrides=None, run_cost_value=None):
++    """Run the real executor once over a two-node loop; return its observable state."""
++    root = tmp_path / "root"
++    home = tmp_path / "home"
++    run_dir = tmp_path / "run"
++    target = tmp_path / "target"
++    for directory in (root / "lib", home, run_dir, target):
++        directory.mkdir(parents=True, exist_ok=True)
++    # The reviewer verdict is parsed by the repo's tolerant extractor, which the
++    # executor shells out to as <root>/lib/extract_verdict.py.
++    shutil.copy(_REPO_ROOT / "lib" / "extract_verdict.py",
++                root / "lib" / "extract_verdict.py")
++
++    workflow = dict(_WORKFLOW)
++    workflow["edges"] = list(_WORKFLOW["edges"]) + [{
++        "from": "reviewer",
++        "to": "implementer",
++        "edge_type": edge_type,
++        "max_rounds": max_rounds,
++    }]
++    if with_recursion:
++        workflow["recursion"] = dict(_RECURSION_BLOCK)
++    workflow_path = run_dir / "workflow.yaml"
++    workflow_path.write_text(yaml.safe_dump(workflow), encoding="utf-8")
++    plan = run_dir / "plan.json"
++    plan.write_text(json.dumps({"objective": "k2", "decomposition": []}),
++                    encoding="utf-8")
++
++    calls: list[str] = []
++
++    def fake_dispatch(task_class, lane, prompt):
++        node_id = os.environ.get("MO_NODE_ID", "?")
++        calls.append(node_id)
++        if node_id == "reviewer":
++            return 0, json.dumps({"verdict": "fail", "notes": ["keeps failing"]})
++        return 0, "implemented; nothing to apply"
++
++    env = {
++        "MINI_ORK_ROOT": str(root),
++        "MINI_ORK_HOME": str(home),
++        "MINI_ORK_RUN_DIR": str(run_dir),
++        "MINI_ORK_WORKFLOW": str(workflow_path),
++        "MINI_ORK_PLAN_PATH": str(plan),
++        # Nonexistent DB + no run id: every DB writer no-ops. The ledger read is
++        # patched below when the case wants a spend.
++        "MINI_ORK_DB": str(tmp_path / "nonexistent-state.db"),
++        "MO_TARGET_CWD": str(target),
++        "MO_RUN_ORCHESTRATOR": "0",
++        "MINI_ORK_RECIPE": "",
++    }
++    for stale in ("MINI_ORK_RUN_ID", "MO_REVISE_ROUNDS", "MINI_ORK_DRY_RUN",
++                  "MINI_ORK_RECOVERY_CLOSURE", "MINI_ORK_RECOVERY_FROM"):
++        env.pop(stale, None)
++    env.update(env_overrides or {})
++
++    if run_cost_value is not None:
++        import mini_ork.cost_ledger as cost_ledger
++
++        monkeypatch.setattr(cost_ledger, "run_cost",
++                            lambda db, run_id: run_cost_value)
++
++    saved_environ = dict(os.environ)
++    err, out = io.StringIO(), io.StringIO()
++    try:
++        os.environ.clear()
++        os.environ.update(env)
++        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
++            with run_context_scope({}):
++                rc = mini_ork.cli.execute.main(
++                    argv=[], root=str(root), dispatch_fn=fake_dispatch)
++    finally:
++        os.environ.clear()
++        os.environ.update(saved_environ)
++
++    return {
++        "rc": rc,
++        "calls": calls,
++        "rounds": _rounds_on_disk(run_dir),
++        "stderr": err.getvalue(),
++    }
++
++
++def test_budget_cap_total_usd_blocks_the_round(tmp_path, monkeypatch):
++    r = _drive(tmp_path, monkeypatch, run_cost_value=1.50)
++    assert r["rounds"] == []
++    assert "[revise] round" not in r["stderr"]
++    assert r["calls"] == ["implementer", "reviewer"]
++    assert re.search(
++        r"\[revise\] recursion budget cap reached for implementer: "
++        r"spent \$1\.50 of \$1\.00",
++        r["stderr"],
++    )
++
++
++def test_under_cap_spend_grants_round_one(tmp_path, monkeypatch):
++    r = _drive(tmp_path, monkeypatch, run_cost_value=0.10)
++    assert 1 in r["rounds"]
++    assert re.search(r"\[revise\] round 1/4:", r["stderr"])
++
++
++def test_unset_env_allows_the_declared_four_rounds(tmp_path, monkeypatch):
++    r = _drive(tmp_path, monkeypatch, run_cost_value=0.10)
++    assert r["rounds"] == [1, 2, 3, 4]
++    assert re.search(r"\[revise\] round 3/4:", r["stderr"])
++    assert not re.search(r"\[revise\] round 5/", r["stderr"])
++
++
++def test_none_spend_fails_open(tmp_path, monkeypatch):
++    r = _drive(tmp_path, monkeypatch, run_cost_value=None)
++    assert 1 in r["rounds"]
++
++
++def test_explicit_env_still_caps_a_recursion_edge(tmp_path, monkeypatch):
++    r = _drive(tmp_path, monkeypatch,
++               env_overrides={"MO_REVISE_ROUNDS": "3"}, run_cost_value=0.10)
++    assert r["rounds"] == [1, 2, 3]
++    assert not re.search(r"\[revise\] round 4/", r["stderr"])
++
++
++def test_retries_edge_without_recursion_block_keeps_min_cap(tmp_path, monkeypatch):
++    r = _drive(tmp_path, monkeypatch, edge_type="retries", max_rounds=5,
++               with_recursion=False)
++    assert r["rounds"] == [1, 2]
++    assert re.search(r"\[revise\] round 2/5:", r["stderr"])
++
++
++def test_zero_revise_rounds_disables_the_loop(tmp_path, monkeypatch):
++    r = _drive(tmp_path, monkeypatch,
++               env_overrides={"MO_REVISE_ROUNDS": "0"}, run_cost_value=0.10)
++    assert r["rounds"] == []
++    assert "[revise] round" not in r["stderr"]
+diff --git a/tests/unit/test_revise_value.py b/tests/unit/test_revise_value.py
+deleted file mode 100644
+index 423336ff932211b262bb24fd09130a54a652ad7e..0000000000000000000000000000000000000000
+--- a/tests/unit/test_revise_value.py
++++ /dev/null
+@@ -1,224 +0,0 @@
+-"""Unit tests for the CoBa revise-round value rule (rsi-gap-coba).
+-
+-Hermetic: every test uses a temp sqlite file; no shared state, no network.
+-The env may only tighten the rule, so each test starts from the defaults.
+-"""
+-
+-import sqlite3
+-
+-import pytest
+-
+-from mini_ork.learning import revise_value
+-
+-TASK_CLASS = "framework_edit"
+-TARGET = "implementer"
+-
+-
+-@pytest.fixture(autouse=True)
+-def _clean_coba_env(monkeypatch):
+-    for var in ("MO_COBA", "MO_COBA_MIN_SAMPLES", "MO_COBA_MIN_GAIN"):
+-        monkeypatch.delenv(var, raising=False)
+-
+-
+-@pytest.fixture
+-def db(tmp_path):
+-    return str(tmp_path / "state.db")
+-
+-
+-def _fetch_all(db_path, sql, params=()):
+-    conn = sqlite3.connect(db_path)
+-    try:
+-        return conn.execute(sql, params).fetchall()
+-    finally:
+-        conn.close()
+-
+-
+-def _seed(db_path, *, round_no=2, passed=0, failed=0,
+-          task_class=TASK_CLASS, target=TARGET, prefix="run"):
+-    """Record + settle ``passed``/``failed`` history rows at ``round_no``."""
+-    for i in range(passed):
+-        run_id = f"{prefix}-pass-{i}"
+-        revise_value.record_round(db_path, run_id, task_class, target, round_no)
+-        revise_value.settle_round(db_path, run_id, target, round_no, True)
+-    for i in range(failed):
+-        run_id = f"{prefix}-fail-{i}"
+-        revise_value.record_round(db_path, run_id, task_class, target, round_no)
+-        revise_value.settle_round(db_path, run_id, target, round_no, False)
+-
+-
+-# ── record_round ─────────────────────────────────────────────────────────────
+-
+-def test_record_round_creates_table_on_unmigrated_db(db):
+-    revise_value.record_round(db, "run-1", TASK_CLASS, TARGET, 1)
+-    rows = _fetch_all(
+-        db, "SELECT run_id, task_class, target_node, round FROM revise_rounds")
+-    assert rows == [("run-1", TASK_CLASS, TARGET, 1)]
+-
+-
+-def test_record_round_twice_same_key_one_row(db):
+-    revise_value.record_round(db, "run-1", TASK_CLASS, TARGET, 1)
+-    revise_value.record_round(db, "run-1", TASK_CLASS, TARGET, 1, cost_usd=0.5)
+-    assert _fetch_all(db, "SELECT COUNT(*) FROM revise_rounds")[0][0] == 1
+-
+-
+-def test_record_round_idempotent_keeps_settled_state(db):
+-    revise_value.record_round(db, "run-1", TASK_CLASS, TARGET, 2)
+-    revise_value.settle_round(db, "run-1", TARGET, 2, True)
+-    revise_value.record_round(db, "run-1", TASK_CLASS, TARGET, 2)
+-    assert revise_value.next_round_value(db, TASK_CLASS, TARGET, 2) == {
+-        "p": 1.0,
+-        "n": 1,
+-    }
+-
+-
+-def test_record_round_stores_cost_and_created_at(db):
+-    revise_value.record_round(db, "run-1", TASK_CLASS, TARGET, 1, cost_usd=0.42)
+-    cost_usd, created_at = _fetch_all(
+-        db, "SELECT cost_usd, created_at FROM revise_rounds")[0]
+-    assert cost_usd == pytest.approx(0.42)
+-    assert created_at is not None
+-
+-
+-# ── settle_round ─────────────────────────────────────────────────────────────
+-
+-def test_settle_round_encodes_passed_as_one_zero(db):
+-    revise_value.record_round(db, "run-open", TASK_CLASS, TARGET, 1)
+-    revise_value.record_round(db, "run-pass", TASK_CLASS, TARGET, 1)
+-    revise_value.record_round(db, "run-fail", TASK_CLASS, TARGET, 1)
+-    revise_value.settle_round(db, "run-pass", TARGET, 1, True)
+-    revise_value.settle_round(db, "run-fail", TARGET, 1, False)
+-    values = dict(_fetch_all(db, "SELECT run_id, passed FROM revise_rounds"))
+-    assert values["run-open"] is None
+-    assert values["run-pass"] == 1
+-    assert values["run-fail"] == 0
+-
+-
+-# ── next_round_value ─────────────────────────────────────────────────────────
+-
+-def test_next_round_value_no_history(db):
+-    assert revise_value.next_round_value(db, TASK_CLASS, TARGET, 2) == {
+-        "p": None,
+-        "n": 0,
+-    }
+-
+-
+-def test_next_round_value_fraction_passed_at_round(db):
+-    _seed(db, round_no=2, passed=3, failed=1)
+-    value = revise_value.next_round_value(db, TASK_CLASS, TARGET, 2)
+-    assert set(value) == {"p", "n"}
+-    assert value["n"] == 4
+-    assert value["p"] == pytest.approx(0.75)
+-
+-
+-def test_next_round_value_ignores_unsettled_rows(db):
+-    for i in range(5):
+-        revise_value.record_round(db, f"run-{i}", TASK_CLASS, TARGET, 2)
+-    assert revise_value.next_round_value(db, TASK_CLASS, TARGET, 2) == {
+-        "p": None,
+-        "n": 0,
+-    }
+-
+-
+-def test_next_round_value_scopes_to_class_target_round(db):
+-    _seed(db, round_no=2, passed=2, failed=1, prefix="in-scope")
+-    _seed(db, round_no=2, passed=9, task_class="code_fix", prefix="other-class")
+-    _seed(db, round_no=2, passed=9, target="reviewer", prefix="other-target")
+-    _seed(db, round_no=1, passed=9, prefix="other-round")
+-    value = revise_value.next_round_value(db, TASK_CLASS, TARGET, 2)
+-    assert value["n"] == 3
+-    assert value["p"] == pytest.approx(2 / 3)
+-
+-
+-# ── should_stop ──────────────────────────────────────────────────────────────
+-
+-def test_should_stop_true_25_round2_rows_1_passed(db):
+-    _seed(db, round_no=2, passed=1, failed=24)
+-    stop, reason = revise_value.should_stop(db, TASK_CLASS, TARGET, 2)
+-    assert stop is True
+-    assert isinstance(reason, str) and reason
+-
+-
+-def test_should_stop_false_10_rows_below_min_samples(db):
+-    _seed(db, round_no=2, passed=0, failed=10)
+-    stop, _ = revise_value.should_stop(db, TASK_CLASS, TARGET, 2)
+-    assert stop is False
+-
+-
+-def test_should_stop_false_25_rows_5_passed(db):
+-    _seed(db, round_no=2, passed=5, failed=20)
+-    stop, _ = revise_value.should_stop(db, TASK_CLASS, TARGET, 2)
+-    assert stop is False
+-
+-
+-def test_min_samples_env_clamps_up_to_20(db, monkeypatch):
+-    _seed(db, round_no=2, passed=0, failed=10)
+-    monkeypatch.setenv("MO_COBA_MIN_SAMPLES", "3")
+-    stop, _ = revise_value.should_stop(db, TASK_CLASS, TARGET, 2)
+-    assert stop is False
+-
+-
+-def test_min_samples_env_can_tighten_above_default(db, monkeypatch):
+-    _seed(db, round_no=2, passed=1, failed=24)
+-    monkeypatch.setenv("MO_COBA_MIN_SAMPLES", "30")
+-    stop, _ = revise_value.should_stop(db, TASK_CLASS, TARGET, 2)
+-    assert stop is False
+-
+-
+-def test_min_gain_env_clamps_down_to_005(db, monkeypatch):
+-    _seed(db, round_no=2, passed=5, failed=20)
+-    monkeypatch.setenv("MO_COBA_MIN_GAIN", "0.5")
+-    stop, _ = revise_value.should_stop(db, TASK_CLASS, TARGET, 2)
+-    assert stop is False
+-
+-
+-def test_min_gain_env_can_tighten_below_default(db, monkeypatch):
+-    _seed(db, round_no=2, passed=1, failed=24)
+-    monkeypatch.setenv("MO_COBA_MIN_GAIN", "0.01")
+-    stop, _ = revise_value.should_stop(db, TASK_CLASS, TARGET, 2)
+-    assert stop is False
+-
+-
+-def test_coba_zero_returns_disabled_tuple(db, monkeypatch):
+-    _seed(db, round_no=2, passed=0, failed=25)
+-    monkeypatch.setenv("MO_COBA", "0")
+-    assert revise_value.should_stop(db, TASK_CLASS, TARGET, 2) == (
+-        False,
+-        "coba disabled",
+-    )
+-
+-
+-def test_coba_one_keeps_rule_armed(db, monkeypatch):
+-    _seed(db, round_no=2, passed=1, failed=24)
+-    monkeypatch.setenv("MO_COBA", "1")
+-    stop, _ = revise_value.should_stop(db, TASK_CLASS, TARGET, 2)
+-    assert stop is True
+-
+-
+-# ── failure neutrality ───────────────────────────────────────────────────────
+-
+-def test_neutral_values_on_db_in_nonexistent_directory(tmp_path):
+-    db = str(tmp_path / "no-such-dir" / "state.db")
+-    revise_value.record_round(db, "run-1", TASK_CLASS, TARGET, 1, cost_usd=0.1)
+-    revise_value.settle_round(db, "run-1", TARGET, 1, True)
+-    assert revise_value.next_round_value(db, TASK_CLASS, TARGET, 1) == {
+-        "p": None,
+-        "n": 0,
+-    }
+-    stop, reason = revise_value.should_stop(db, TASK_CLASS, TARGET, 1)
+-    assert stop is False
+-    assert isinstance(reason, str)
+-
+-
+-def test_neutral_values_on_corrupt_db_file(tmp_path):
+-    db_file = tmp_path / "state.db"
+-    db_file.write_bytes(b"this is not a sqlite database at all")
+-    db = str(db_file)
+-    revise_value.record_round(db, "run-1", TASK_CLASS, TARGET, 1)
+-    revise_value.settle_round(db, "run-1", TARGET, 1, True)
+-    assert revise_value.next_round_value(db, TASK_CLASS, TARGET, 1) == {
+-        "p": None,
+-        "n": 0,
+-    }
+-    stop, reason = revise_value.should_stop(db, TASK_CLASS, TARGET, 1)
+-    assert stop is False
+-    assert isinstance(reason, str)

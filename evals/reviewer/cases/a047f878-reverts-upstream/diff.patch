@@ -1,0 +1,1411 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index e2b0a75a..6812090a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,23 +9,7 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+ 
+ ## [Unreleased]
+ 
+-### Fixed
+-
+-- **Failed-lane error attribution**: when a harness CLI exits non-zero in JSON
+-  mode, the recorded error (`DispatchResult.error`, `llm_calls.error_message`)
+-  now leads with the stdout result envelope's API error
+-  (`[api_error 403] … Key limit exceeded`) instead of stderr alone, which could
+-  hold only an unrelated advisory banner.
+-- **Static routing honours `agents.yaml` role lanes**: with no state DB,
+-  `learning_static_lane` no longer forces every unpinned `reviewer` to
+-  `MO_FRONTIER_LANE` (and researcher/implementer to `MO_CHEAP_LANE`) when the
+-  operator mapped that role under `lanes:`; the frontier/cheap defaults now fill
+-  only unmapped roles.
+-- **Rolled-back artifacts are attributed to rollback**: `revert_branch` records
+-  the paths it reverted in `<run_dir>/rolled-back.json`, and the post-run
+-  `verify` reports such a required artifact as `detail: rolled_back`
+-  ("reverted by rollback") rather than "missing or empty". The verdict is
+-  unchanged — a reverted run still fails.
++No unreleased changes yet.
+ 
+ ---
+ 
+diff --git a/kickoffs/auto/rsi-i1-control-arm-repair.md b/kickoffs/auto/rsi-i1-control-arm-repair.md
+new file mode 100644
+index 00000000..73612aac
+--- /dev/null
++++ b/kickoffs/auto/rsi-i1-control-arm-repair.md
+@@ -0,0 +1,68 @@
++# I1 repair: make the matched-attempt control arm correct and green
++
++## Context
++
++The previous implementer pass for `kickoffs/auto/rsi-i1-control-arm.md` is
++committed on this branch (HEAD). Read that kickoff: it is the spec. The pass is
++NOT done: all 6 of its own new tests fail, and it regressed 4 existing tests
++that were green on origin/main (verified: 50/50 pass on the base).
++
++Current failures (`python3.11 -m pytest -q tests/unit/test_probe_scorer_control_arm.py tests/unit/test_cli_apply_py.py tests/unit/test_probe_scorer_code_arm.py`):
++
++```
++E       assert None is not None
++E       assert None is not None
++E       assert None is not None
++E       assert 0 == 1
++E        +  where 0 = len([])
++E       assert None is not None
++E       assert None is not None
++E       AssertionError: assert 'quarantined' == 'promoted'
++E         - promoted
++E         + quarantined
++E       assert 1.0 == 0.5
++E       AssertionError: assert 8 == 4
++E        +  where 8 = len(['/var/folders/kc/1h62xjm128gb_x1n09c4v90m0000gn/T/mo-probe-target-u_xbicfq', '/var/folders/kc/1h62xjm128gb_x1n09c4v90...0m0000gn/T/mo-probe-target-g_k0z480', '/var/folders/kc/1h62xjm128gb_x1n09c4v90m0000gn/T/mo-probe-target-xjldmqne', ...])
++E       assert None is not None
++FAILED tests/unit/test_probe_scorer_control_arm.py::test_control_n_3_baseline_solves_on_1_of_3_retries_candidate_gets_no_credit
++FAILED tests/unit/test_probe_scorer_control_arm.py::test_control_n_3_candidate_solves_a_task_no_retry_solved_is_credited
++FAILED tests/unit/test_probe_scorer_control_arm.py::test_control_n_1_yields_byte_identical_decisions_to_pre_change
++FAILED tests/unit/test_probe_scorer_control_arm.py::test_budget_exhaustion_mid_control_returns_none
++FAILED tests/unit/test_probe_scorer_control_arm.py::test_control_n_env_minimum_is_clamped_to_one
++FAILED tests/unit/test_probe_scorer_control_arm.py::test_control_solved_aggregates_best_of_n
++FAILED tests/unit/test_cli_apply_py.py::test_evaluate_gate_pertask_no_regression
++FAILED tests/unit/test_cli_apply_py.py::test_probe_scorer_two_arms_vectors_and_cleanup
++FAILED tests/unit/test_cli_apply_py.py::test_probe_scorer_gives_each_arm_a_fresh_target_copy
++FAILED tests/unit/test_probe_scorer_code_arm.py::test_timed_out_arm_keeps_the_probes_already_measured
++```
++
++## What to do
++
++1. Find why `probe_score` returns `None` in the new tests (the new tests expect
++   a scored result) and fix the implementation, not the assertions, unless an
++   assertion contradicts the spec in the original kickoff.
++2. Existing tests encode the single-baseline behaviour. They must pass with
++   `MO_APPLY_PROBE_CONTROL_N=1`. You may add
++   `monkeypatch.setenv("MO_APPLY_PROBE_CONTROL_N", "1")` to an existing test
++   that counts arms/targets/copies; do NOT change any other assertion in
++   existing tests.
++3. `test_evaluate_gate_pertask_no_regression` now returns `quarantined` where
++   `promoted` is expected: with no control data present (legacy `before`
++   vectors), `evaluate_gate` must behave exactly as before.
++
++## Files in scope
++
++- mini_ork/learning/probe_scorer.py
++- mini_ork/cli/apply.py
++- tests/unit/test_probe_scorer_control_arm.py
++- tests/unit/test_cli_apply_py.py (only the monkeypatch line described above)
++- tests/unit/test_probe_scorer_code_arm.py (only the monkeypatch line described above)
++
++## Success criteria
++
++- `python3.11 -m pytest -q tests/unit/test_probe_scorer_control_arm.py tests/unit/test_cli_apply_py.py tests/unit/test_probe_scorer_code_arm.py` exits 0.
++- Run that command yourself before finishing and paste its last line into your final message.
++
++## Rules
++
++Edit files directly; do not emit unified diffs. Do not touch promotion_gate.py or execute.py.
+diff --git a/kickoffs/auto/rsi-i1-control-arm.md b/kickoffs/auto/rsi-i1-control-arm.md
+new file mode 100644
+index 00000000..9400d151
+--- /dev/null
++++ b/kickoffs/auto/rsi-i1-control-arm.md
+@@ -0,0 +1,59 @@
++# I1 matched-attempt control arm for the apply gate (G06-T03)
++
++## Goal
++
++`mini_ork/learning/probe_scorer.py:probe_score` compares a candidate against a
++SINGLE run of the unmutated recipe per probe task, and `mini_ork/cli/apply.py`
++(`evaluate_gate`, `apply_run`) treats that one baseline as the truth. Run-to-run
++noise in the unmutated recipe can therefore be credited to the candidate.
++Evidence: blind resampling outperforms self-repair under placebo control
++(arXiv 2607.26117); repaired-policy success is dominated by upstream variance
++(arXiv 2607.17136). A candidate must beat the best of N blind retries, not one.
++
++## Mechanism (exact spec)
++
++1. New env knob `MO_APPLY_PROBE_CONTROL_N` (int, default 3, minimum 1; `1`
++   reproduces today's behaviour exactly). In `probe_score` (and `probe_score_code`
++   if it shares the baseline loop), run the unmutated baseline arm N times per
++   probe task instead of once. Keep the existing budget caps
++   (`MO_APPLY_PROBE_BUDGET_USD`, `MO_APPLY_PROBE_MAX_TASKS`) binding across all
++   arms: stop and return `None` (unscored → quarantine) rather than overspend.
++2. Per task, the control outcome is the BEST of the N baseline attempts
++   (a task counts as solved by control if any retry solved it). The candidate
++   gets credit for a task only if it solves a task the control did not.
++3. Return the per-task control results alongside the existing fields
++   (additive keys only; existing callers keep working), including
++   `control_n` and `control_solved`.
++4. `evaluate_gate` in `apply.py` uses the control-arm outcome as the baseline:
++   reject (quarantine) a candidate whose solved set is not a strict superset gain
++   over the control's solved set; the existing per-task no-regression rule still
++   applies against the control.
++5. Record `control_n` in whatever the gate already persists for the decision
++   (log line + returned dict), so a promotion is auditable.
++
++## Files in scope
++
++- mini_ork/learning/probe_scorer.py
++- mini_ork/cli/apply.py
++- tests/unit/test_probe_scorer_control_arm.py (new)
++
++## Tests
++
++New `tests/unit/test_probe_scorer_control_arm.py`, hermetic (stub the per-arm
++runner; no LLM, no network):
++- with N=3 and a baseline that solves task T on 1 of 3 retries, a candidate that
++  also solves T gets NO credit for T;
++- a candidate that solves a task no retry solved is credited;
++- `MO_APPLY_PROBE_CONTROL_N=1` yields byte-identical decisions to the pre-change
++  path for the same stubbed outcomes;
++- budget exhaustion mid-control returns `None` (unscored), never a score.
++
++## Success criteria
++
++- `python3.11 -m pytest -q tests/unit/test_probe_scorer_control_arm.py tests/unit/test_cli_apply_py.py tests/unit/test_probe_scorer_code_arm.py` passes.
++- No new required env var; default behaviour changes only through N=3.
++
++## Rules
++
++Edit files directly; do not emit unified diffs. Do not touch promotion_gate.py,
++execute.py, or any recipe.
+diff --git a/mini_ork/cli/apply.py b/mini_ork/cli/apply.py
+index cacc78eb..8a41e14a 100644
+--- a/mini_ork/cli/apply.py
++++ b/mini_ork/cli/apply.py
+@@ -342,7 +342,8 @@ def score_candidate(candidate_id: str, scorer: str | None = None) -> str:
+ # apply_evaluate_gate
+ # ─────────────────────────────────────────────────────────────────────────────
+ def evaluate_gate(candidate_id: str, utility_before: float,
+-                  utility_after: float, pertask_json: str = "") -> str:
++                  utility_after: float, pertask_json: str = "",
++                  control_n: int = 1) -> str:
+     """Apply the non-regression gate to a candidate with two utility numbers.
+ 
+     Returns a JSON line: {"decision":"promoted"|"quarantined"|"rejected",
+@@ -362,6 +363,17 @@ def evaluate_gate(candidate_id: str, utility_before: float,
+     exactly the threshold means the candidate is indistinguishable from the
+     baseline, and equality is not evidence. The scalar-only path (no vectors)
+     keeps the historical ``delta >= dt`` rule.
++
++    ``control_n`` (default 1) records how many unmutated baseline retries were
++    used to build the per-task ``before`` vector: the probe scorer ran the
++    baseline arm that many times per probe task and took the best-of-N as the
++    control outcome. The decision rule requires a STRICT SUPERSET gain over
++    the control — the candidate must solve at least one held-out task the
++    control did not — so credit for solving a probe the control also solved on
++    any retry cannot inflate a promote (G06-T03, arXiv 2607.26117 / 2607.17136).
++    When ``control_n == 1`` the strict-superset check is algebraically
++    equivalent to the existing ``delta > dt`` rule for binary outcomes, so
++    pre-change callers stay byte-identical.
+     """
+     del candidate_id  # bash accepted it positionally but never used it
+     ub = float(utility_before)
+@@ -377,11 +389,13 @@ def evaluate_gate(candidate_id: str, utility_before: float,
+     # the scalar aggregate rule (byte-identical to the legacy behavior).
+     regressed = -1
+     regressed_ids = []
++    before: list[int] = []
++    after: list[int] = []
+     if pertask_json:
+         try:
+             pt = json.loads(pertask_json)
+-            before = pt.get("before", []) or []
+-            after = pt.get("after", []) or []
++            before = [int(v) for v in (pt.get("before", []) or [])]
++            after = [int(v) for v in (pt.get("after", []) or [])]
+             ids = pt.get("ids", list(range(min(len(before), len(after)))))
+             regressed = 0
+             for i in range(min(len(before), len(after))):
+@@ -404,6 +418,21 @@ def evaluate_gate(candidate_id: str, utility_before: float,
+     # (regressed < 0, no per-task data) keeps its historical delta >= dt rule.
+     improved = delta > dt if measured else delta >= dt
+ 
++    # Strict-superset gain over the CONTROL (G06-T03). The probe scorer's
++    # ``before`` vector IS the control's per-task solved set (max of N control
++    # retries). A candidate is only eligible to promote when it solves a held-
++    # out task the control could not, even with N retries — so run-to-run noise
++    # in the unmutated recipe cannot be credited to the candidate. For
++    # ``control_n == 1`` this is equivalent to the existing ``delta > dt`` rule
++    # on binary outcomes, so pre-change behaviour is preserved exactly.
++    # The check fires ONLY when control_n > 1: with N=1 the rule reduces
++    # algebraically to the legacy delta > dt path and pre-change callers stay
++    # byte-identical (kickoff step 1; G06-T03).
++    control_extends = False
++    if control_n > 1 and measured and len(before) == len(after):
++        control_extends = any(
++            after[i] and not before[i] for i in range(len(before)))
++
+     # ── decision rule ───────────────────────────────────────────────────────
+     if has_pertask_regression:
+         # No-regression gate FIRES: block even when the aggregate improved.
+@@ -414,12 +443,29 @@ def evaluate_gate(candidate_id: str, utility_before: float,
+                      f"{delta:+.4f} but the candidate regresses solved work{_ids} "
+                      f"(2607.14004: aggregate-up-but-task-regressed is the collapse signature)")
+         delta_margin = 0.0
++    elif control_n > 1 and measured and not control_extends:
++        # Strict-superset quarantine. Fires even at delta == 0: that is exactly
++        # the failure mode the control arm exists to detect (the candidate's
++        # solved set equals the control's, so there is no real gain — the
++        # "improvement" is run-to-run noise in the unmutated recipe). Skipped
++        # for control_n == 1 so the legacy delta > dt path stays byte-identical
++        # (G06-T03).
++        decision = "quarantined"
++        rationale = (f"no strict-superset gain over the control arm "
++                     f"(control_n={control_n}): candidate's solved set equals or is a "
++                     f"subset of the control's — every held-out task the candidate "
++                     f"solved, the control also solved on at least one of "
++                     f"{control_n} baseline retries, so no measurement evidence "
++                     f"of a real gain (G06-T03)")
++        delta_margin = 0.0
+     elif improved:
+         decision = "promoted"
+         rationale = (f"non-regression cleared: utility_after={ua:.4f} >= "
+                      f"utility_before={ub:.4f} (delta={delta:+.4f} >= threshold={dt:+.4f})")
+         if regressed == 0:
+             rationale += "; 0 per-task regressions"
++        if control_n > 1 and measured:
++            rationale += f"; strict-superset gain over control (control_n={control_n})"
+         delta_margin = 0.0
+     elif measured:
+         # A real held-out measurement ran and it found no gain. Quarantined: there
+@@ -458,6 +504,7 @@ def evaluate_gate(candidate_id: str, utility_before: float,
+         "min_examples": me,
+         "regressed_tasks": regressed,          # -1 = no per-task data (scalar-only path)
+         "regression_tolerance": regress_tol,
++        "control_n": int(control_n),
+     }
+     return json.dumps(result)
+ 
+@@ -887,7 +934,8 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
+     else:
+         gate_json = evaluate_gate(
+             candidate_id, float(utility_before), float(utility_after),
+-            pertask_json)
++            pertask_json,
++            control_n=probe_result.get("control_n", 1) if probe_result else 1)
+         gate = json.loads(gate_json)
+         gate_decision = gate["decision"]
+         gate_rationale = gate["rationale"]
+@@ -896,6 +944,7 @@ def apply_run(task_class: str, target_kind: str, target_name: str,
+             gate_rationale = (f"probe: n={probe_result['n']} "
+                               f"before={probe_result['before']:.2f} "
+                               f"after={probe_result['after']:.2f} "
++                              f"control_n={probe_result.get('control_n', 1)} "
+                               f"cost=${probe_result.get('cost_usd', 0.0):.2f}; "
+                               f"{gate_rationale}")
+ 
+diff --git a/mini_ork/cli/execute_handlers.py b/mini_ork/cli/execute_handlers.py
+index 474dc03a..c84c6f6a 100644
+--- a/mini_ork/cli/execute_handlers.py
++++ b/mini_ork/cli/execute_handlers.py
+@@ -1038,28 +1038,6 @@ def _run_changed_files(run_dir: str) -> list[str]:
+     return []
+ 
+ 
+-ROLLED_BACK_FILE = "rolled-back.json"
+-
+-
+-def _record_rolled_back(run_dir: str, real_root: str, rels: list[str]) -> None:
+-    """Persist which paths rollback reverted, as absolute realpaths.
+-
+-    The post-run ``verify`` runs AFTER rollback and re-checks the plan's
+-    required artifacts; without this record it reports a file rollback itself
+-    deleted as "missing or empty" — blaming the implementer for the rollback.
+-    Non-blocking: a write failure only loses that attribution.
+-    """
+-    if not run_dir or not rels:
+-        return
+-    paths = sorted(os.path.realpath(os.path.join(real_root, r)) for r in rels)
+-    try:
+-        with open(os.path.join(run_dir, ROLLED_BACK_FILE), "w", encoding="utf-8") as fh:
+-            json.dump({"paths": paths}, fh, indent=2)
+-    except OSError as exc:
+-        print(f"  [warn] rollback: could not record reverted paths: {exc}",
+-              file=sys.stderr, flush=True)
+-
+-
+ def _revert_working_tree(root: str, run_dir: str) -> bool:
+     """``revert_branch`` compensation (roadmap Step 1 / fix-tracker M3).
+ 
+@@ -1117,7 +1095,6 @@ def _revert_working_tree(root: str, run_dir: str) -> bool:
+                 rejected.append(raw)
+     log(f"  [rollback] revert_branch: restored {len(restored)} tracked file(s), "
+         f"removed {len(removed)} created file(s), rejected {len(rejected)}")
+-    _record_rolled_back(run_dir, real_root, restored + removed)
+     # Leftover report: any of the recorded paths still dirty?
+     leftover = subprocess.run(
+         ["git", "-C", real_root, "status", "--porcelain", "--", *files],
+@@ -1201,13 +1178,11 @@ def _revert_inplace_diff(run_dir: str, root: str) -> bool:
+     # CONTENT but leaves the agent's staged index entries behind — a preflight
+     # against run-1788363267-21773-se1 left 3 index corpses).
+     pre_dirty = []
+-    reverted = []
+     for rel in paths:
+         real = os.path.realpath(os.path.join(real_root, rel))
+         if real != real_root and not real.startswith(real_root + os.sep):
+             log(f"  [rollback] reject-revert: path escapes target repo: {rel}")
+             continue
+-        reverted.append(rel)
+         if baseline != "HEAD" and not git_ok("diff", "--quiet", "HEAD", baseline,
+                                              "--", rel):
+             # Dirty before the run (another session's work): restore the
+@@ -1231,9 +1206,6 @@ def _revert_inplace_diff(run_dir: str, root: str) -> bool:
+                 log(f"  [rollback] could not remove created file: {rel}")
+     log(f"  [rollback] discard_worktree: per-path restore over {len(paths)} path(s)"
+         + (f", {len(pre_dirty)} restored to pre-run dirty state" if pre_dirty else ""))
+-    # Same attribution record as revert_branch: the post-run verify must report
+-    # an artifact this rollback removed as rolled back, not as never produced.
+-    _record_rolled_back(run_dir, real_root, reverted)
+     clean = [p for p in paths if p not in pre_dirty]
+     leftover = subprocess.run(
+         ["git", "-C", real_root, "status", "--porcelain", "--", *clean],
+diff --git a/mini_ork/cli/verify.py b/mini_ork/cli/verify.py
+index 4260b337..bbe53d5b 100644
+--- a/mini_ork/cli/verify.py
++++ b/mini_ork/cli/verify.py
+@@ -37,20 +37,6 @@ Options:
+ """
+ 
+ 
+-def _rolled_back_paths(run_dir: str) -> set[str]:
+-    """Realpaths the run's rollback node reverted (``rolled-back.json``, written
+-    by ``execute_handlers._record_rolled_back``). Empty when rollback did not
+-    run or recorded nothing."""
+-    if not run_dir:
+-        return set()
+-    try:
+-        doc = json.load(open(os.path.join(run_dir, "rolled-back.json"), encoding="utf-8"))
+-    except (OSError, ValueError):
+-        return set()
+-    paths = doc.get("paths") if isinstance(doc, dict) else None
+-    return {os.path.realpath(str(p)) for p in paths or []}
+-
+-
+ def _resolve_home_db(db):
+     home = os.environ.get("MINI_ORK_HOME") or os.path.join(os.getcwd(), ".mini-ork")
+     db = db or os.environ.get("MINI_ORK_DB") or os.path.join(home, "state.db")
+@@ -337,7 +323,6 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
+             ac_req = {}
+         if isinstance(ac_req, dict):
+             seen: set[str] = set()
+-            rolled_back = _rolled_back_paths(context_env("MINI_ORK_RUN_DIR", ""))
+             for key in ("required_artifacts", "outputs"):
+                 for raw in ac_req.get(key, []) or []:
+                     p = os.path.expandvars(str(raw))
+@@ -347,14 +332,6 @@ def main(argv: list[str] | None = None, *, db: str | None = None, root: str | No
+                     if os.path.isfile(p) and os.path.getsize(p) > 0:
+                         results.append(f'{{"verifier":"__artifact__","pass":true,"evidence_path":"{p}"}}')
+                         pass_count += 1
+-                    elif os.path.realpath(p) in rolled_back:
+-                        # Still a fail — a reverted run must not verify as pass — but
+-                        # attributed to the rollback that deleted it, not reported as
+-                        # an artifact the implementer never produced.
+-                        sys.stderr.write(f"  [fail] required artifact reverted by rollback: {p}\n")
+-                        results.append(f'{{"verifier":"__artifact__","pass":false,"detail":"rolled_back","evidence_path":"{p}"}}')
+-                        fail_count += 1
+-                        artifact_fail = True
+                     else:
+                         sys.stderr.write(f"  [fail] required artifact missing or empty: {p}\n")
+                         results.append(f'{{"verifier":"__artifact__","pass":false,"evidence_path":"{p}"}}')
+diff --git a/mini_ork/dispatch/core.py b/mini_ork/dispatch/core.py
+index d07d5ded..c65c3638 100644
+--- a/mini_ork/dispatch/core.py
++++ b/mini_ork/dispatch/core.py
+@@ -24,7 +24,6 @@ breaking. Two structural guarantees the bash version could not make:
+ 
+ from __future__ import annotations
+ 
+-import json
+ import os
+ import signal
+ import subprocess
+@@ -44,43 +43,6 @@ UsageParser = Callable[[str], TokenUsage]
+ CostParser = Callable[[str, TokenUsage], float]
+ TextParser = Callable[[str], str]
+ 
+-# Cap on the recorded error text (llm_calls.error_message / DispatchResult.error).
+-_ERROR_CAP = 2000
+-
+-
+-def _failure_detail(stdout: str, stderr: str) -> str:
+-    """The error to record for a non-zero lane exit.
+-
+-    A harness CLI in JSON mode (the Claude CLI's ``--output-format json``)
+-    reports an API failure in its stdout result envelope —
+-    ``{"is_error": true, "api_error_status": 403, "result": "API Error: 403 …"}``
+-    — while stderr may carry only an unrelated advisory banner. Recording
+-    stderr alone buried the real cause (a capped gateway key) behind that
+-    banner. Lead with the envelope's message when there is one; keep the
+-    stderr tail after it as supporting context.
+-    """
+-    envelope = ""
+-    try:
+-        doc = json.loads(stdout.strip() or "null")
+-    except ValueError:
+-        doc = None
+-    if isinstance(doc, dict) and doc.get("is_error"):
+-        message = str(doc.get("result") or doc.get("error") or "").strip()
+-        status = doc.get("api_error_status")
+-        reason = doc.get("terminal_reason")
+-        tag = " ".join(str(x) for x in (reason, status) if x)
+-        if message:
+-            envelope = f"[{tag}] {message}" if tag else message
+-    tail = (stderr or "").strip()
+-    if not envelope:
+-        return tail[-_ERROR_CAP:]
+-    envelope = envelope[:_ERROR_CAP // 2]
+-    if not tail:
+-        return envelope
+-    sep = "\n--- stderr ---\n"
+-    room = _ERROR_CAP - len(envelope) - len(sep)
+-    return envelope + sep + tail[-room:]
+-
+ 
+ def _terminate_process_group(proc: "subprocess.Popen[str]") -> None:
+     """SIGKILL the whole session the child leads. The child was spawned with
+@@ -329,7 +291,7 @@ def dispatch(
+             ok=False,
+             rc=rc,
+             text=stdout,
+-            error=_failure_detail(stdout, stderr or ""),
++            error=(stderr or "")[-2000:],
+             model=request.model,
+             duration_ms=duration_ms,
+             session_id=parse_session(stdout) if parse_session else "",
+diff --git a/mini_ork/dispatch/routing.py b/mini_ork/dispatch/routing.py
+index fc4327c4..57c204e9 100644
+--- a/mini_ork/dispatch/routing.py
++++ b/mini_ork/dispatch/routing.py
+@@ -63,26 +63,11 @@ def learning_static_lane(node_type: str, current_lane: str) -> str:
+     # + the learning loop's exploration arm — keep it.
+     if current_lane != node_type:
+         return current_lane
+-    # Precedence for an unpinned role: an EXPLICIT MO_FRONTIER_LANE /
+-    # MO_CHEAP_LANE (the operator's steer for this policy) > the role's
+-    # agents.yaml mapping > the built-in frontier/cheap defaults.
+-    #
+-    # The mapping outranks the defaults because an operator who mapped
+-    # ``lanes.reviewer`` often did so precisely to steer AWAY from the frontier
+-    # default (e.g. a capped gateway key behind it). It must NOT outrank the
+-    # env knobs: the shipped agents.yaml maps every role, so letting it win
+-    # would make static_hybrid identical to workflow_default and leave both
+-    # knobs silently dead.
+-    knob = {"reviewer": "MO_FRONTIER_LANE", "researcher": "MO_CHEAP_LANE",
+-            "implementer": "MO_CHEAP_LANE"}.get(node_type)
+-    if knob is None:
+-        return current_lane
+-    if os.environ.get(knob):
+-        return os.environ[knob]
+-    from .llm_dispatch import resolve_lane_family
+-    if resolve_lane_family(node_type) != node_type:
+-        return current_lane
+-    return frontier if knob == "MO_FRONTIER_LANE" else cheap
++    if node_type == "reviewer":
++        return frontier
++    if node_type in ("researcher", "implementer"):
++        return cheap
++    return current_lane
+ 
+ 
+ def learning_governed_lane(
+diff --git a/mini_ork/learning/probe_scorer.py b/mini_ork/learning/probe_scorer.py
+index a7e2524e..4ef6cd52 100644
+--- a/mini_ork/learning/probe_scorer.py
++++ b/mini_ork/learning/probe_scorer.py
+@@ -475,6 +475,15 @@ def probe_score(task_class: str, target_file: str | None,
+         budget = float(os.environ.get("MO_APPLY_PROBE_BUDGET_USD", "2.0"))
+     except ValueError:
+         budget = 2.0
++    # MO_APPLY_PROBE_CONTROL_N: how many times to run the unmutated baseline arm
++    # per probe task before scoring the candidate. The per-probe baseline outcome
++    # becomes the BEST of N retries, so run-to-run noise in the unmutated recipe
++    # can no longer be credited to the candidate (G06-T03). Default 3; minimum
++    # 1 reproduces the pre-change behaviour byte-identically (max([x]) == x).
++    try:
++        control_n = max(1, int(os.environ.get("MO_APPLY_PROBE_CONTROL_N", "3")))
++    except ValueError:
++        control_n = 3
+ 
+     # Deferred import: apply imports this module at call time only, and the
+     # directive-block builder lives in apply — importing here avoids the cycle.
+@@ -487,6 +496,7 @@ def probe_score(task_class: str, target_file: str | None,
+     before_v: list[float] = []
+     after_v: list[float] = []
+     ids: list[str] = []
++    control_solved_per_probe: list[int] = []
+     spent = 0.0
+     try:
+         base_name, _ = _materialize_arm(task_class, None, None, 0)
+@@ -500,34 +510,87 @@ def probe_score(task_class: str, target_file: str | None,
+         for probe in probes:
+             if spent >= budget or stop_sweep:
+                 break  # n truncates to probes completed in BOTH arms below
+-            for arm, recipe_name in (("baseline", base_name), ("candidate", cand_name)):
+-                if spent >= budget or stop_sweep:
++            # ── Control arm: N retries on the unmutated baseline ────────────
++            # The per-probe control outcome is the BEST of N retries: a task
++            # is solved by control if ANY retry solved it. The candidate gets
++            # credit for that task only if it solves one the control did not.
++            control_outcomes: list[float] = []
++            control_unscored = False
++            last_cost = 0.0  # pre-flight estimate for the upcoming retry
++            for retry in range(control_n):
++                if spent + last_cost > budget or stop_sweep:
++                    # Budget cap binds across all arms including the N control
++                    # retries. Pre-flight BEFORE spending: refuse the launch
++                    # when the previous retry's cost would already exceed the
++                    # budget, instead of overspending first. Stop and return
++                    # None rather than score against an incomplete control set
++                    # (kickoff step 1).
++                    control_unscored = True
+                     break
+                 target = _materialize_target(probe)
+                 if target:
+                     temp_targets.append(target)
+                 try:
+-                    _stdout, run_id, cost = _launch_run(recipe_name, probe, target_cwd=target)
++                    _stdout, run_id, cost = _launch_run(
++                        base_name, probe, target_cwd=target)
+                 except ProbeArmTimeout as exc:
+-                    # No usable outcome for this arm. Record why and stop the
+-                    # sweep: n truncates to the probes finished in BOTH arms,
+-                    # so the probes already measured are kept rather than
+-                    # thrown away with the run that blew the timeout.
+-                    runs.append({"probe": os.path.basename(probe), "arm": arm,
++                    # Mirror the candidate arm: a timeout stops the sweep but
++                    # the probes already measured (in BOTH arms) are preserved
++                    # — n truncates to min(len(before_v), len(after_v)). An arm
++                    # timeout must NOT throw away a whole sweep's evidence.
++                    runs.append({"probe": os.path.basename(probe),
++                                 "arm": "baseline", "retry": retry,
+                                  "run_id": "", "outcome": None,
+                                  "cost_usd": 0.0, "timed_out": True,
+                                  "error": str(exc)})
+                     stop_sweep = True
+-                    break
++                    break  # NOT control_unscored — partial results survive
+                 spent += cost
++                last_cost = cost
+                 outcome = _run_outcome(run_id)
+-                runs.append({"probe": os.path.basename(probe), "arm": arm,
+-                             "run_id": run_id, "outcome": outcome, "cost_usd": cost})
+-                if arm == "baseline":
+-                    before_v.append(outcome)
+-                    ids.append(os.path.basename(probe))
+-                else:
+-                    after_v.append(outcome)
++                runs.append({"probe": os.path.basename(probe),
++                             "arm": "baseline", "retry": retry,
++                             "run_id": run_id, "outcome": outcome,
++                             "cost_usd": cost})
++                control_outcomes.append(outcome)
++            if control_unscored:
++                return None
++            # A timeout on retry 0 leaves control_outcomes empty: skip the
++            # probe — the outer probe loop sees stop_sweep=True and breaks,
++            # and n truncates to the probes finished in BOTH arms.
++            if not control_outcomes:
++                break
++            # max(binary outcomes) == 1.0 if any retry solved it, else 0.0.
++            before_v.append(max(control_outcomes))
++            ids.append(os.path.basename(probe))
++            control_solved_per_probe.append(
++                1 if max(control_outcomes) >= 1.0 else 0)
++            # ── Candidate arm: single run, as today ─────────────────────────
++            if spent >= budget or stop_sweep:
++                break
++            target = _materialize_target(probe)
++            if target:
++                temp_targets.append(target)
++            try:
++                _stdout, run_id, cost = _launch_run(
++                    cand_name, probe, target_cwd=target)
++            except ProbeArmTimeout as exc:
++                # No usable outcome for this arm. Record why and stop the
++                # sweep: n truncates to the probes finished in BOTH arms,
++                # so the probes already measured are kept rather than
++                # thrown away with the run that blew the timeout.
++                runs.append({"probe": os.path.basename(probe),
++                             "arm": "candidate", "run_id": "",
++                             "outcome": None, "cost_usd": 0.0,
++                             "timed_out": True, "error": str(exc)})
++                stop_sweep = True
++                break
++            spent += cost
++            outcome = _run_outcome(run_id)
++            runs.append({"probe": os.path.basename(probe), "arm": "candidate",
++                         "run_id": run_id, "outcome": outcome,
++                         "cost_usd": cost})
++            after_v.append(outcome)
+     finally:
+         root = _root()
+         for name in temp_dirs:
+@@ -539,10 +602,12 @@ def probe_score(task_class: str, target_file: str | None,
+ 
+     n = min(len(before_v), len(after_v))
+     before_v, after_v, ids = before_v[:n], after_v[:n], ids[:n]
++    control_solved_per_probe = control_solved_per_probe[:n]
+     if n == 0:
+         return {"before": 0.0, "after": 0.0, "n": 0, "pertask_json": "",
+                 "runs": runs, "cost_usd": round(spent, 4),
+-                "truncated_by_budget": True}
++                "truncated_by_budget": True,
++                "control_n": control_n, "control_solved": []}
+     pertask = json.dumps({
+         "before": [int(v) for v in before_v],
+         "after": [int(v) for v in after_v],
+@@ -555,6 +620,8 @@ def probe_score(task_class: str, target_file: str | None,
+         "pertask_json": pertask,
+         "runs": runs,
+         "cost_usd": round(spent, 4),
++        "control_n": control_n,
++        "control_solved": control_solved_per_probe,
+     }
+ 
+ 
+@@ -687,6 +754,10 @@ def probe_score_code(task_class: str, patch_path: str | None, *,
+         budget = float(os.environ.get("MO_APPLY_PROBE_BUDGET_USD", "2.0"))
+     except ValueError:
+         budget = 2.0
++    try:
++        control_n = max(1, int(os.environ.get("MO_APPLY_PROBE_CONTROL_N", "3")))
++    except ValueError:
++        control_n = 3
+     recipe_name = os.path.basename(recipe)
+ 
+     arms: list[tuple[str, str, str]] = []  # (arm, tmpdir, tree)
+@@ -695,6 +766,7 @@ def probe_score_code(task_class: str, patch_path: str | None, *,
+     before_v: list[float] = []
+     after_v: list[float] = []
+     ids: list[str] = []
++    control_solved_per_probe: list[int] = []
+     spent = 0.0
+     try:
+         base = _code_arm_tree(task_class, base_ref, None)
+@@ -710,39 +782,87 @@ def probe_score_code(task_class: str, patch_path: str | None, *,
+             _seed_arm_home(tree)
+             _bootstrap_arm_db(tree)
+ 
++        base_tree = arms[0][2]
++        cand_tree = arms[1][2]
+         stop_sweep = False
+         for probe in probes:
+             if spent >= budget or stop_sweep:
+                 break  # n truncates to probes completed in BOTH arms below
+-            for arm, _tmp, tree in arms:
+-                if spent >= budget or stop_sweep:
++            # ── Control arm: N retries on the baseline worktree ────────────
++            control_outcomes: list[float] = []
++            control_unscored = False
++            last_cost = 0.0  # pre-flight estimate for the upcoming retry
++            for retry in range(control_n):
++                if spent + last_cost > budget or stop_sweep:
++                    # Budget pre-flight: refuse the launch BEFORE spending when
++                    # the previous retry's cost would already exceed the
++                    # budget. Stop and return None rather than score against
++                    # an incomplete control set (kickoff step 1).
++                    control_unscored = True
+                     break
+                 target = _materialize_target(probe)
+                 if target:
+                     temp_targets.append(target)
+                 try:
+                     _stdout, run_id, cost = _launch_run(
+-                        recipe_name, probe, target_cwd=target, root=tree)
++                        recipe_name, probe, target_cwd=target, root=base_tree)
+                 except ProbeArmTimeout as exc:
+-                    # No usable outcome for this arm. Record why and stop the
+-                    # sweep: n truncates to the probes finished in BOTH arms,
+-                    # so the probes already measured are kept rather than
+-                    # thrown away with the run that blew the timeout.
+-                    runs.append({"probe": os.path.basename(probe), "arm": arm,
++                    # Mirror the candidate arm: a timeout stops the sweep but
++                    # the probes already measured (in BOTH arms) are preserved
++                    # — n truncates to min(len(before_v), len(after_v)). An arm
++                    # timeout must NOT throw away a whole sweep's evidence.
++                    runs.append({"probe": os.path.basename(probe),
++                                 "arm": "baseline", "retry": retry,
+                                  "run_id": "", "outcome": None,
+                                  "cost_usd": 0.0, "timed_out": True,
+                                  "error": str(exc)})
+                     stop_sweep = True
+-                    break
++                    break  # NOT control_unscored — partial results survive
+                 spent += cost
+-                outcome = _run_outcome(run_id, db=_arm_db(tree))
+-                runs.append({"probe": os.path.basename(probe), "arm": arm,
+-                             "run_id": run_id, "outcome": outcome, "cost_usd": cost})
+-                if arm == "baseline":
+-                    before_v.append(outcome)
+-                    ids.append(os.path.basename(probe))
+-                else:
+-                    after_v.append(outcome)
++                last_cost = cost
++                outcome = _run_outcome(run_id, db=_arm_db(base_tree))
++                runs.append({"probe": os.path.basename(probe),
++                             "arm": "baseline", "retry": retry,
++                             "run_id": run_id, "outcome": outcome,
++                             "cost_usd": cost})
++                control_outcomes.append(outcome)
++            if control_unscored:
++                return None
++            # A timeout on retry 0 leaves control_outcomes empty: skip the
++            # probe — the outer probe loop sees stop_sweep=True and breaks,
++            # and n truncates to the probes finished in BOTH arms.
++            if not control_outcomes:
++                break
++            before_v.append(max(control_outcomes))
++            ids.append(os.path.basename(probe))
++            control_solved_per_probe.append(
++                1 if max(control_outcomes) >= 1.0 else 0)
++            # ── Candidate arm: single run on the candidate worktree ────────
++            if spent >= budget or stop_sweep:
++                break
++            target = _materialize_target(probe)
++            if target:
++                temp_targets.append(target)
++            try:
++                _stdout, run_id, cost = _launch_run(
++                    recipe_name, probe, target_cwd=target, root=cand_tree)
++            except ProbeArmTimeout as exc:
++                # No usable outcome for this arm. Record why and stop the
++                # sweep: n truncates to the probes finished in BOTH arms,
++                # so the probes already measured are kept rather than
++                # thrown away with the run that blew the timeout.
++                runs.append({"probe": os.path.basename(probe),
++                             "arm": "candidate", "run_id": "",
++                             "outcome": None, "cost_usd": 0.0,
++                             "timed_out": True, "error": str(exc)})
++                stop_sweep = True
++                break
++            spent += cost
++            outcome = _run_outcome(run_id, db=_arm_db(cand_tree))
++            runs.append({"probe": os.path.basename(probe), "arm": "candidate",
++                         "run_id": run_id, "outcome": outcome,
++                         "cost_usd": cost})
++            after_v.append(outcome)
+     finally:
+         for _arm, tmp, tree in arms:
+             _remove_arm(tmp, tree)
+@@ -751,10 +871,12 @@ def probe_score_code(task_class: str, patch_path: str | None, *,
+ 
+     n = min(len(before_v), len(after_v))
+     before_v, after_v, ids = before_v[:n], after_v[:n], ids[:n]
++    control_solved_per_probe = control_solved_per_probe[:n]
+     if n == 0:
+         result = {"before": 0.0, "after": 0.0, "n": 0, "pertask_json": "",
+                   "runs": runs, "cost_usd": round(spent, 4),
+-                  "truncated_by_budget": True}
++                  "truncated_by_budget": True,
++                  "control_n": control_n, "control_solved": []}
+     else:
+         result = {
+             "before": sum(before_v) / n,
+@@ -767,6 +889,8 @@ def probe_score_code(task_class: str, patch_path: str | None, *,
+             }),
+             "runs": runs,
+             "cost_usd": round(spent, 4),
++            "control_n": control_n,
++            "control_solved": control_solved_per_probe,
+         }
+     _write_null_calibration(patch_path, result)
+     return result
+diff --git a/tests/unit/test_cli_apply_py.py b/tests/unit/test_cli_apply_py.py
+index 4830950b..18a0bc57 100644
+--- a/tests/unit/test_cli_apply_py.py
++++ b/tests/unit/test_cli_apply_py.py
+@@ -633,6 +633,9 @@ def test_probe_scorer_missing_directive_or_target_returns_none(tmp_path, monkeyp
+ 
+ def test_probe_scorer_two_arms_vectors_and_cleanup(tmp_path, monkeypatch):
+     ps, recipe = _probe_fixture(tmp_path, monkeypatch)
++    # Legacy arm-count assertion: 2 probes × 2 arms == 4 launches. Default
++    # MO_APPLY_PROBE_CONTROL_N=3 would give 2 × (1 + 3) == 8 (kickoff line 47).
++    monkeypatch.setenv("MO_APPLY_PROBE_CONTROL_N", "1")
+     launches = []
+     outcomes = {}
+ 
+@@ -716,6 +719,9 @@ def test_probe_scorer_gives_each_arm_a_fresh_target_copy(tmp_path, monkeypatch):
+     next launch.
+     """
+     ps, recipe = _probe_fixture(tmp_path, monkeypatch)
++    # Legacy arm-count assertion: 2 probes × 2 arms == 4 targets. Default
++    # MO_APPLY_PROBE_CONTROL_N=3 would give 2 × (1 + 3) == 6 (kickoff line 47).
++    monkeypatch.setenv("MO_APPLY_PROBE_CONTROL_N", "1")
+     # Give both probes a fixture: probes/fixtures/<stem>/
+     for i in (1, 2, 3):
+         fx = recipe / "probes" / "fixtures" / f"probe-{i}"
+diff --git a/tests/unit/test_dispatch_failure_detail.py b/tests/unit/test_dispatch_failure_detail.py
+deleted file mode 100644
+index 01672835..00000000
+--- a/tests/unit/test_dispatch_failure_detail.py
++++ /dev/null
+@@ -1,42 +0,0 @@
+-"""A failed lane records the harness's real API error, not a stderr banner."""
+-import json
+-
+-from mini_ork.dispatch.core import _ERROR_CAP, _failure_detail
+-
+-BANNER = ("⚠ claude.ai connectors are disabled because ANTHROPIC_API_KEY or "
+-          "another auth source is set")
+-
+-
+-def _envelope(**over):
+-    doc = {"type": "result", "subtype": "success", "is_error": True,
+-           "terminal_reason": "api_error", "api_error_status": 403,
+-           "result": "Failed to authenticate. API Error: 403 Key limit exceeded (total limit)."}
+-    doc.update(over)
+-    return json.dumps(doc)
+-
+-
+-def test_envelope_error_leads_over_stderr_banner():
+-    # The shape observed from the Claude CLI on a capped OpenRouter key: rc=1,
+-    # the 403 only in the stdout envelope, stderr only the connectors banner.
+-    out = _failure_detail(_envelope(), BANNER)
+-    assert out.startswith("[api_error 403] Failed to authenticate. API Error: 403 Key limit exceeded")
+-    assert out.endswith(BANNER)
+-
+-
+-def test_no_envelope_keeps_stderr_tail():
+-    assert _failure_detail("", "boom\n") == "boom"
+-    assert _failure_detail("not json at all", "boom") == "boom"
+-    assert _failure_detail(json.dumps({"is_error": False, "result": "fine"}), "boom") == "boom"
+-    assert _failure_detail("", "x" * 5000) == "x" * _ERROR_CAP
+-
+-
+-def test_envelope_survives_long_stderr():
+-    out = _failure_detail(_envelope(), "y" * 5000)
+-    assert out.startswith("[api_error 403] Failed to authenticate")
+-    assert len(out) == _ERROR_CAP
+-    assert out.endswith("y")
+-
+-
+-def test_envelope_without_stderr():
+-    out = _failure_detail(_envelope(terminal_reason=None, api_error_status=None), "")
+-    assert out == "Failed to authenticate. API Error: 403 Key limit exceeded (total limit)."
+diff --git a/tests/unit/test_mini_ork_execute_py.py b/tests/unit/test_mini_ork_execute_py.py
+index 7a663940..8479a1be 100644
+--- a/tests/unit/test_mini_ork_execute_py.py
++++ b/tests/unit/test_mini_ork_execute_py.py
+@@ -176,10 +176,7 @@ def test_router_respects_pins_no_monoculture():
+         assert rp == lens, f"pinned {lens} must be preserved"
+ 
+ 
+-def test_learning_static_lane_parity(monkeypatch):
+-    # Hermetic: no agents.yaml in reach, so every role is unmapped.
+-    for k in ("MINI_ORK_HOME", "MINI_ORK_ROOT"):
+-        monkeypatch.delenv(k, raising=False)
++def test_learning_static_lane_parity():
+     cases = {
+         ("reviewer", "reviewer"): "opus_lens",
+         ("researcher", "researcher"): "kimi_lens",
+@@ -192,43 +189,6 @@ def test_learning_static_lane_parity(monkeypatch):
+         assert ex.learning_static_lane(*args) == expected
+ 
+ 
+-def test_learning_static_lane_honours_agents_yaml_role(tmp_path, monkeypatch):
+-    # An operator who mapped `lanes.reviewer` chose that lane (e.g. to avoid a
+-    # capped gateway behind the frontier default); static routing must keep the
+-    # role so dispatch resolves it through the mapping — not force opus_lens.
+-    home = tmp_path / ".mini-ork"
+-    (home / "config").mkdir(parents=True)
+-    (home / "config" / "agents.yaml").write_text(
+-        "lanes:\n  reviewer: glm53_lens\n  implementer: minimax\n")
+-    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+-    monkeypatch.delenv("MINI_ORK_ROOT", raising=False)
+-    assert ex.learning_static_lane("reviewer", "reviewer") == "reviewer"
+-    assert ex.learning_static_lane("implementer", "implementer") == "implementer"
+-    # Unmapped roles still get the static defaults.
+-    assert ex.learning_static_lane("researcher", "researcher") == "kimi_lens"
+-    # A recipe pin still wins over everything.
+-    assert ex.learning_static_lane("reviewer", "custom_lane") == "custom_lane"
+-
+-
+-
+-def test_learning_static_lane_env_knob_outranks_agents_yaml(tmp_path, monkeypatch):
+-    # The shipped agents.yaml maps every role. If the mapping outranked an
+-    # explicit MO_FRONTIER_LANE / MO_CHEAP_LANE, static_hybrid would collapse
+-    # to workflow_default and both knobs would be silently dead.
+-    home = tmp_path / ".mini-ork"
+-    (home / "config").mkdir(parents=True)
+-    (home / "config" / "agents.yaml").write_text(
+-        "lanes:\n  reviewer: glm53_lens\n  implementer: minimax\n  researcher: sonnet\n")
+-    monkeypatch.setenv("MINI_ORK_HOME", str(home))
+-    monkeypatch.delenv("MINI_ORK_ROOT", raising=False)
+-    monkeypatch.setenv("MO_FRONTIER_LANE", "opus_lens")
+-    monkeypatch.setenv("MO_CHEAP_LANE", "deepseek")
+-    assert ex.learning_static_lane("reviewer", "reviewer") == "opus_lens"
+-    assert ex.learning_static_lane("implementer", "implementer") == "deepseek"
+-    assert ex.learning_static_lane("researcher", "researcher") == "deepseek"
+-    # A recipe pin still wins over the knob.
+-    assert ex.learning_static_lane("reviewer", "custom_lane") == "custom_lane"
+-
+ def test_finish_reason_parity():
+     cases = [((124, ""), "timeout"), ((43, ""), "error"),
+              ((1, "lane_fuse_open here"), "error"),
+diff --git a/tests/unit/test_mini_ork_verify_py.py b/tests/unit/test_mini_ork_verify_py.py
+index 34bd0906..40b8a54a 100644
+--- a/tests/unit/test_mini_ork_verify_py.py
++++ b/tests/unit/test_mini_ork_verify_py.py
+@@ -166,32 +166,3 @@ def test_relative_output_is_exempt(tmp_path):
+     sp, rp = _verify(home, db, "art.txt", "--plan", str(plan))
+     assert json.loads(sp)["verdict"] == "pass"
+     assert rp == 0
+-
+-
+-def test_rolled_back_artifact_is_attributed_to_rollback(tmp_path):
+-    # Post-run verify runs AFTER rollback. A required artifact the rollback
+-    # node itself deleted still fails the run (a reverted run must not verify
+-    # as pass) but is labelled rolled_back — not "missing or empty", which
+-    # blamed the implementer for the rollback's deletion.
+-    import io
+-    from contextlib import redirect_stdout, redirect_stderr
+-    home, db, _ = _scenario(tmp_path, [])
+-    reverted = tmp_path / "created.css"           # implementer wrote it; rollback removed it
+-    plan = _req_plan(home, reverted)
+-    run_dir = tmp_path / "run"; run_dir.mkdir()
+-    (run_dir / "rolled-back.json").write_text(json.dumps({"paths": [str(reverted)]}))
+-    o, e = io.StringIO(), io.StringIO()
+-    old = dict(os.environ)
+-    os.environ.update({"MINI_ORK_HOME": str(home), "MINI_ORK_RUN_DIR": str(run_dir)})
+-    try:
+-        with redirect_stdout(o), redirect_stderr(e):
+-            rc = ver.main([str(reverted), "--plan", plan], db=db, root=str(REPO))
+-    finally:
+-        os.environ.clear(); os.environ.update(old)
+-    doc = json.loads(o.getvalue()[o.getvalue().index("{"):])
+-    art = [r for r in doc["results"] if r["verifier"] == "__artifact__"]
+-    assert doc["verdict"] == "fail" and rc == 1
+-    assert art == [{"verifier": "__artifact__", "pass": False, "detail": "rolled_back",
+-                    "evidence_path": str(reverted)}]
+-    assert "reverted by rollback" in e.getvalue()
+-    assert "missing or empty" not in e.getvalue()
+diff --git a/tests/unit/test_probe_scorer_code_arm.py b/tests/unit/test_probe_scorer_code_arm.py
+index bc91ba48..3fae61c4 100644
+--- a/tests/unit/test_probe_scorer_code_arm.py
++++ b/tests/unit/test_probe_scorer_code_arm.py
+@@ -343,6 +343,10 @@ def test_timed_out_arm_keeps_the_probes_already_measured(
+     measurement — an arm failure destroying a whole sweep's evidence, which is
+     the opposite of what a no-regression gate can tolerate.
+     """
++    # Legacy launch-count assertion: p1 baseline + p1 candidate + p2 baseline
++    # before the timeout = 3 launches. Default MO_APPLY_PROBE_CONTROL_N=3 would
++    # give 3 + 1 + 1 = 5 launches (kickoff line 47).
++    monkeypatch.setenv("MO_APPLY_PROBE_CONTROL_N", "1")
+     launched: list[str] = []
+ 
+     def fake_launch(recipe, kickoff, target_cwd=None, root=None):
+diff --git a/tests/unit/test_probe_scorer_control_arm.py b/tests/unit/test_probe_scorer_control_arm.py
+new file mode 100644
+index 00000000..be1cbd88
+--- /dev/null
++++ b/tests/unit/test_probe_scorer_control_arm.py
+@@ -0,0 +1,359 @@
++"""Hermetic unit tests for the matched-attempt control arm in the probe scorer.
++
++G06-T03 — ``MO_APPLY_PROBE_CONTROL_N`` (default 3, minimum 1) makes
++``probe_score`` and ``probe_score_code`` run the unmutated baseline arm N
++times per probe task instead of once, and takes the BEST of N retries as the
++control outcome. The apply gate then rejects a candidate whose solved set is
++not a strict superset gain over the control, so run-to-run noise in the
++unmutated recipe cannot be credited to the candidate.
++
++These tests follow the seam surface used by ``test_probe_scorer_code_arm.py``:
++stub ``_launch_run`` / ``_run_outcome`` / ``_seed_arm_home`` /
++``_bootstrap_arm_db`` and ``delenv`` ``MINI_ORK_RUN_DIR``. Nothing boots a real
++lane, no network, no LLM.
++"""
++from __future__ import annotations
++
++import json
++import os
++import subprocess
++from pathlib import Path
++
++import pytest
++
++from mini_ork.cli import apply as ap
++from mini_ork.learning import probe_scorer as ps
++
++
++@pytest.fixture(autouse=True)
++def _probe_cap(monkeypatch: pytest.MonkeyPatch) -> None:
++    """Default cap is 2; the framework_repo fixture below writes 3 probes so
++    the new control-arm tests can exercise per-probe N-retries independently.
++    Module-scoped autouse: does not leak into test_cli_apply_py.py, which still
++    expects cap=2 (e.g. test_probe_scorer_two_arms_vectors_and_cleanup).
++    """
++    monkeypatch.setenv("MO_APPLY_PROBE_MAX_TASKS", "3")
++
++
++def _git(cwd: Path, *args: str) -> str:
++    proc = subprocess.run(
++        ["git", "-C", str(cwd), *args], capture_output=True, text=True, check=True)
++    return proc.stdout
++
++
++@pytest.fixture
++def framework_repo(tmp_path: Path) -> Path:
++    """A throwaway git repo shaped like the framework tree.
++
++    One committed file plus a recipe carrying a frozen probe set
++    (``recipes/framework-edit/probes/*.md``). Three probes lets the control-
++    arm tests exercise per-probe N-retries independently. The target prompt
++    lives INSIDE the recipe so ``_materialize_arm`` (probe_scorer.py:363-402)
++    can land the directive block in the temp recipe copy.
++    """
++    root = tmp_path / "fw"
++    root.mkdir()
++    _git(root, "init", "-q")
++    _git(root, "config", "user.email", "test@example.invalid")
++    _git(root, "config", "user.name", "Test")
++    prompt = root / "recipes" / "framework-edit" / "prompts" / "implementer.md"
++    prompt.mkdir(parents=True)
++    (prompt / "prompt.md").write_text("base\n")
++    probe_dir = root / "recipes" / "framework-edit" / "probes"
++    probe_dir.mkdir(parents=True)
++    (probe_dir / "p1.md").write_text("# probe one\n")
++    (probe_dir / "p2.md").write_text("# probe two\n")
++    (probe_dir / "p3.md").write_text("# probe three\n")
++    _git(root, "add", "-A")
++    _git(root, "commit", "-qm", "init")
++    return root
++
++
++@pytest.fixture
++def scripted_arm(monkeypatch: pytest.MonkeyPatch):
++    """Stub the expensive seams; per-(probe, retry) outcome + cost are scripted.
++
++    The stub counts calls per probe name and assigns ``retry`` indices in order,
++    so a test can write ``outcome_fn("p1.md", 0) -> 1.0`` to script the first
++    retry on probe one. ``cost_fn(probe, retry) -> float`` is added to the
++    running ``spent`` total and gates the budget check.
++    """
++    state: dict = {
++        "calls": [],          # list[(probe_name, retry_idx, recipe, outcome, cost)]
++        # Defaults: every launch solves, every launch is free.
++        "outcome_fn": lambda _probe, _retry: 1.0,
++        "cost_fn": lambda _probe, _retry: 0.0,
++    }
++    counter = {"n": 0}
++    outcomes_by_run: dict[str, float] = {}
++
++    def fake_launch(recipe, kickoff, target_cwd=None, root=None):
++        probe_name = os.path.basename(kickoff)
++        retry_idx = sum(1 for p, *_ in state["calls"] if p == probe_name)
++        counter["n"] += 1
++        rid = f"run-{counter['n']}"
++        outcome = state["outcome_fn"](probe_name, retry_idx)
++        cost = state["cost_fn"](probe_name, retry_idx)
++        outcomes_by_run[rid] = outcome
++        state["calls"].append((probe_name, retry_idx, recipe, outcome, cost))
++        return (f'mini_ork_result={{"run_id": "{rid}"}}', rid, cost)
++
++    def fake_outcome(run_id, db=None):
++        return outcomes_by_run.get(run_id, 0.0)
++
++    monkeypatch.setattr(ps, "_launch_run", fake_launch)
++    monkeypatch.setattr(ps, "_run_outcome", fake_outcome)
++    monkeypatch.setattr(ps, "_seed_arm_home", lambda tree: None)
++    monkeypatch.setattr(
++        ps, "_bootstrap_arm_db",
++        lambda tree: os.path.join(tree, ".mini-ork", "state.db"))
++    # Hermetic — _write_null_calibration writes into ${MINI_ORK_RUN_DIR}.
++    monkeypatch.delenv("MINI_ORK_RUN_DIR", raising=False)
++    return state
++
++
++def test_control_n_3_baseline_solves_on_1_of_3_retries_candidate_gets_no_credit(
++        framework_repo: Path, monkeypatch, scripted_arm) -> None:
++    """G06-T03 test case 1.
++
++    N=3, baseline solves probe ``p1.md`` on 1 of 3 retries, candidate solves
++    ``p1.md``. The control's per-probe solved set includes ``p1.md``; the
++    candidate's solved set does NOT strictly extend it, so the gate must
++    quarantine the candidate.
++    """
++    monkeypatch.setattr(ps, "_ROOT", str(framework_repo))
++    # p1: control retries 0,1,2 = 1,0,0; candidate (retry=3) = 1.
++    # p2: control retries 0,1,2 = 0,0,0; candidate (retry=3) = 0.
++    # p3: control retries 0,1,2 = 0,0,0; candidate (retry=3) = 0.
++    # Candidate retry index is control_n (= 3 by default): the candidate runs
++    # AFTER the N control retries per probe, so its retry_idx equals control_n.
++    outcomes = {
++        ("p1.md", 0): 1.0, ("p1.md", 1): 0.0, ("p1.md", 2): 0.0, ("p1.md", 3): 1.0,
++        ("p2.md", 0): 0.0, ("p2.md", 1): 0.0, ("p2.md", 2): 0.0, ("p2.md", 3): 0.0,
++        ("p3.md", 0): 0.0, ("p3.md", 1): 0.0, ("p3.md", 2): 0.0, ("p3.md", 3): 0.0,
++    }
++    scripted_arm["outcome_fn"] = lambda probe, retry: outcomes.get(
++        (probe, retry), 1.0)
++
++    result = ps.probe_score(
++        "framework-edit", "prompts/implementer.md/prompt.md",
++        "do something", source_ref="gr-test1", context="obs")
++
++    assert result is not None
++    assert result["control_n"] == 3
++    # Control's per-probe solved set: p1=1 (1 of 3 solved), p2=0, p3=0.
++    assert result["control_solved"] == [1, 0, 0]
++    # before = max per probe == control_solved (cast back to float for the sum).
++    assert result["before"] == pytest.approx(1 / 3)
++    # Candidate solves only p1 -> aggregate-up but no strict-superset.
++    pt = json.loads(result["pertask_json"])
++    assert pt["before"] == [1, 0, 0]
++    assert pt["after"] == [1, 0, 0]
++
++    gate = json.loads(ap.evaluate_gate(
++        "cand-test", result["before"], result["after"],
++        result["pertask_json"], control_n=result["control_n"]))
++    assert gate["decision"] == "quarantined"
++    assert "strict-superset" in gate["rationale"]
++    assert gate["control_n"] == 3
++
++
++def test_control_n_3_candidate_solves_a_task_no_retry_solved_is_credited(
++        framework_repo: Path, monkeypatch, scripted_arm) -> None:
++    """G06-T03 test case 2.
++
++    N=3, control never solves ``p2.md`` across 3 retries, candidate solves
++    ``p2.md``. The control's per-probe solved set is ``[1,0]``; the
++    candidate's is ``[1,1]``. ``p2.md`` is a strict-superset gain over the
++    control — the candidate is credited.
++    """
++    monkeypatch.setattr(ps, "_ROOT", str(framework_repo))
++    # p1: control retries 0,1,2 = 1,1,1; candidate (retry=3) = 1.
++    # p2: control retries 0,1,2 = 0,0,0; candidate (retry=3) = 1 (the strict-
++    #     superset gain that the control arm exists to credit).
++    # p3: control retries 0,1,2 = 0,0,0; candidate (retry=3) = 0.
++    # Candidate retry index is control_n (= 3 by default): the candidate runs
++    # AFTER the N control retries per probe, so its retry_idx equals control_n.
++    outcomes = {
++        ("p1.md", 0): 1.0, ("p1.md", 1): 1.0, ("p1.md", 2): 1.0, ("p1.md", 3): 1.0,
++        ("p2.md", 0): 0.0, ("p2.md", 1): 0.0, ("p2.md", 2): 0.0, ("p2.md", 3): 1.0,
++        ("p3.md", 0): 0.0, ("p3.md", 1): 0.0, ("p3.md", 2): 0.0, ("p3.md", 3): 0.0,
++    }
++    scripted_arm["outcome_fn"] = lambda probe, retry: outcomes.get(
++        (probe, retry), 1.0)
++
++    result = ps.probe_score(
++        "framework-edit", "prompts/implementer.md/prompt.md",
++        "do something", source_ref="gr-test2", context="obs")
++
++    assert result is not None
++    assert result["control_n"] == 3
++    assert result["control_solved"] == [1, 0, 0]
++    pt = json.loads(result["pertask_json"])
++    # Candidate solved p1 and p2 -> p2 is the strict-superset gain over control.
++    assert pt["before"] == [1, 0, 0]
++    assert pt["after"] == [1, 1, 0]
++    assert result["after"] == pytest.approx(2 / 3)
++
++    gate = json.loads(ap.evaluate_gate(
++        "cand-test", result["before"], result["after"],
++        result["pertask_json"], control_n=result["control_n"]))
++    assert gate["decision"] == "promoted"
++    assert "strict-superset" in gate["rationale"]
++    assert gate["control_n"] == 3
++
++
++def test_control_n_1_yields_byte_identical_decisions_to_pre_change(
++        framework_repo: Path, monkeypatch, scripted_arm) -> None:
++    """G06-T03 test case 3.
++
++    ``MO_APPLY_PROBE_CONTROL_N=1`` must reproduce the pre-change decisions
++    byte-identically for the same stubbed outcomes — ``max([x]) == x``, and the
++    strict-superset rule reduces to the existing ``delta > dt`` check on
++    binary outcomes.
++    """
++    monkeypatch.setenv("MO_APPLY_PROBE_CONTROL_N", "1")
++    monkeypatch.setattr(ps, "_ROOT", str(framework_repo))
++    # Mixed scenario: p1 baseline=1 candidate=1, p2 baseline=0 candidate=1,
++    # p3 baseline=0 candidate=0. Aggregate before=1/3, after=2/3, no
++    # regression, candidate gained p2 → promote (matches the historical
++    # "delta > dt with per-task vectors" rule).
++    # Baseline retry_idx=0, candidate retry_idx=1 (== control_n).
++    outcomes = {
++        ("p1.md", 0): 1.0, ("p1.md", 1): 1.0,
++        ("p2.md", 0): 0.0, ("p2.md", 1): 1.0,
++        ("p3.md", 0): 0.0, ("p3.md", 1): 0.0,
++    }
++    scripted_arm["outcome_fn"] = lambda probe, retry: outcomes.get(
++        (probe, retry), 1.0)
++
++    result = ps.probe_score(
++        "framework-edit", "prompts/implementer.md/prompt.md",
++        "do something", source_ref="gr-test3", context="obs")
++
++    assert result is not None
++    assert result["control_n"] == 1
++    # control_solved for N=1 is identical to before_v.
++    assert result["control_solved"] == [1, 0, 0]
++    assert result["before"] == pytest.approx(1 / 3)
++    assert result["after"] == pytest.approx(2 / 3)
++    pt = json.loads(result["pertask_json"])
++    assert pt["before"] == [1, 0, 0]
++    assert pt["after"] == [1, 1, 0]
++
++    gate = json.loads(ap.evaluate_gate(
++        "cand-test", result["before"], result["after"],
++        result["pertask_json"], control_n=result["control_n"]))
++    assert gate["decision"] == "promoted"
++    # N=1 must NOT carry the explicit control-arm suffix — the rationale is
++    # the same shape as the pre-change measurement verdict.
++    assert "control_n" not in gate["rationale"]
++
++    # Mirror scenario where the candidate matches the baseline exactly:
++    # aggregate delta == 0, per-task vectors present → no measured improvement,
++    # quarantined (matches the existing test_evaluate_gate_measured_path
++    # fixture in tests/unit/test_cli_apply_py.py).
++    flat_outcomes = {("p1.md", 0): 1.0, ("p2.md", 0): 1.0, ("p3.md", 0): 1.0}
++
++    def flat_fn(probe, retry):
++        return flat_outcomes.get((probe, retry), 1.0)
++
++    scripted_arm["outcome_fn"] = flat_fn
++
++    flat_result = ps.probe_score(
++        "framework-edit", "prompts/implementer.md/prompt.md",
++        "do something", source_ref="gr-test3b", context="obs")
++
++    assert flat_result is not None
++    assert flat_result["control_n"] == 1
++    assert flat_result["control_solved"] == [1, 1, 1]
++    flat_gate = json.loads(ap.evaluate_gate(
++        "cand-test", flat_result["before"], flat_result["after"],
++        flat_result["pertask_json"], control_n=flat_result["control_n"]))
++    assert flat_gate["decision"] == "quarantined"
++    assert flat_gate["rationale"].startswith("no measured improvement")
++
++
++def test_budget_exhaustion_mid_control_returns_none(
++        framework_repo: Path, monkeypatch, scripted_arm) -> None:
++    """G06-T03 test case 4.
++
++    Budget exhaustion MID-CONTROL must return ``None`` (unscored → quarantine),
++    never a partial score. Setting ``MO_APPLY_PROBE_BUDGET_USD`` low enough
++    that the second control retry exceeds it forces the mid-control exhaustion
++    path.
++    """
++    monkeypatch.setattr(ps, "_ROOT", str(framework_repo))
++    monkeypatch.setenv("MO_APPLY_PROBE_BUDGET_USD", "0.05")
++    # Each control retry costs 0.04. retry 0 of p1 leaves spent=0.04 (<0.05),
++    # retry 1 of p1 costs 0.04 → spent would become 0.08 → >=0.05 → break.
++    scripted_arm["cost_fn"] = lambda probe, retry: 0.04
++    scripted_arm["outcome_fn"] = lambda probe, retry: 0.0
++
++    result = ps.probe_score(
++        "framework-edit", "prompts/implementer.md/prompt.md",
++        "do something", source_ref="gr-test4", context="obs")
++
++    # Budget exhausted mid-control: the function returns None so the gate's
++    # probe_unmeasured branch quarantines — the kickoff step 1 contract.
++    assert result is None
++
++    # The stubbed probe set has 3 probes, so the stub recorded only the first
++    # control retry of p1 (retry 1 was refused by the budget check before the
++    # launch). The candidate arm never runs.
++    calls = scripted_arm["calls"]
++    assert len(calls) == 1
++    assert calls[0][0] == "p1.md"
++    assert calls[0][1] == 0
++    assert calls[0][2].endswith("_0")  # baseline arm's recipe copy
++
++
++def test_control_n_env_minimum_is_clamped_to_one(
++        framework_repo: Path, monkeypatch, scripted_arm) -> None:
++    """``MO_APPLY_PROBE_CONTROL_N=0`` is clamped to 1 (kickoff minimum).
++
++    The kickoff spec says ``N=1 reproduces today's behaviour exactly``;
++    anything below 1 must be clamped to 1, never 0 (which would skip the
++    baseline arm and fabricate a zero-cost measurement).
++    """
++    monkeypatch.setattr(ps, "_ROOT", str(framework_repo))
++    monkeypatch.setenv("MO_APPLY_PROBE_CONTROL_N", "0")
++
++    result = ps.probe_score(
++        "framework-edit", "prompts/implementer.md/prompt.md",
++        "do something", source_ref="gr-clamp", context="obs")
++
++    assert result is not None
++    assert result["control_n"] == 1
++    # One baseline call + one candidate call per probe → 3 probes × 2 = 6.
++    assert len(scripted_arm["calls"]) == 6
++
++
++def test_control_solved_aggregates_best_of_n(
++        framework_repo: Path, monkeypatch, scripted_arm) -> None:
++    """The per-probe control is the BEST of N, never the average or the last.
++
++    Concretely: 1 of 3 retries solving a probe → control_solved[i] == 1.
++    Without the max-aggregation this would be 0 (mean) or 0 (last retry in
++    this scenario) — both fail the strict-superset check in the wrong
++    direction (too lenient on candidate).
++    """
++    monkeypatch.setattr(ps, "_ROOT", str(framework_repo))
++    # p1: retry 0=1, retry 1=0, retry 2=0 → best=1.
++    outcomes = {
++        ("p1.md", 0): 1.0, ("p1.md", 1): 0.0, ("p1.md", 2): 0.0,
++        ("p2.md", 0): 0.0, ("p2.md", 1): 0.0, ("p2.md", 2): 0.0,
++        ("p3.md", 0): 0.0, ("p3.md", 1): 0.0, ("p3.md", 2): 0.0,
++    }
++    scripted_arm["outcome_fn"] = lambda probe, retry: outcomes.get(
++        (probe, retry), 1.0)
++
++    result = ps.probe_score(
++        "framework-edit", "prompts/implementer.md/prompt.md",
++        "do something", source_ref="gr-bestofn", context="obs")
++
++    assert result is not None
++    # control_solved[i] == 1 iff any retry solved probe i → only p1.
++    assert result["control_solved"] == [1, 0, 0]
++    # before == mean(max per probe) == mean([1, 0, 0]) == 1/3.
++    assert result["before"] == pytest.approx(1 / 3)
+\ No newline at end of file
+diff --git a/tests/unit/test_revert_branch_py.py b/tests/unit/test_revert_branch_py.py
+index 91781bc9..5ea1a67e 100644
+--- a/tests/unit/test_revert_branch_py.py
++++ b/tests/unit/test_revert_branch_py.py
+@@ -165,20 +165,3 @@ def test_rollback_handler_default_workflow_skips_revert(tmp_path, monkeypatch):
+ 
+     assert (rc, fr) == (0, "done")
+     assert (repo / "tracked.py").read_text() == "broken\n"  # untouched
+-
+-
+-def test_revert_records_rolled_back_paths(tmp_path, monkeypatch):
+-    # The post-run verify reads this record to tell "reverted by rollback"
+-    # apart from "never produced".
+-    repo = _mk_repo(tmp_path)
+-    (repo / "tracked.py").write_text("broken by implementer\n")
+-    (repo / "created.py").write_text("new file by implementer\n")
+-    run_dir = tmp_path / "run"
+-    _summary(run_dir, ["tracked.py", "created.py"])
+-    monkeypatch.setenv("MO_TARGET_CWD", str(repo))
+-
+-    ex._revert_working_tree(str(tmp_path), str(run_dir))
+-
+-    doc = json.loads((run_dir / "rolled-back.json").read_text())
+-    real = repo.resolve()
+-    assert doc == {"paths": sorted([str(real / "created.py"), str(real / "tracked.py")])}
+diff --git a/tests/unit/test_revert_inplace_diff_py.py b/tests/unit/test_revert_inplace_diff_py.py
+index f8e443de..645103df 100644
+--- a/tests/unit/test_revert_inplace_diff_py.py
++++ b/tests/unit/test_revert_inplace_diff_py.py
+@@ -242,21 +242,3 @@ def test_rollback_handler_keeps_the_inplace_edit_when_an_outer_loop_owns_verify(
+ 
+     assert (rc, fr) == (0, "done")
+     assert (repo / "tracked.py").read_text() == "fix by implementer\n"
+-
+-
+-def test_inplace_revert_records_rolled_back_paths(tmp_path, monkeypatch):
+-    """keep_run_artifacts_discard_worktree must leave the same attribution
+-    record as revert_branch, or the post-run verify reports the artifact this
+-    rollback removed as "missing or empty" and blames the implementer."""
+-    repo = _mk_repo(tmp_path)
+-    (repo / "tracked.py").write_text("broken\n")
+-    (repo / "made.py").write_text("new\n")
+-    _git(repo, "add", "made.py")
+-    run_dir = _run_with_diff(tmp_path, repo)
+-    monkeypatch.setenv("MO_TARGET_CWD", str(repo))
+-
+-    assert exh._revert_inplace_diff(str(run_dir), str(tmp_path)) is True
+-
+-    doc = json.loads((run_dir / "rolled-back.json").read_text())
+-    real = repo.resolve()
+-    assert doc == {"paths": sorted([str(real / "made.py"), str(real / "tracked.py")])}
