@@ -1733,3 +1733,61 @@ def test_an_errored_cycle_records_what_it_spent(world, monkeypatch):
     assert "hit its wall" in row["halt_reason"]
     # Every run this cycle dispatched, and nothing another cycle spent.
     assert row["cost_usd"] == pytest.approx(0.43)
+
+
+def test_the_suggest_kickoff_declares_its_verification_commands(tmp_path, monkeypatch):
+    """SUGGEST must not need a model to answer its own profile questions.
+
+    Cycle 19 (2026-10-26) died in 30 s: the run_profile asked the three standard
+    questions, the answerer's lane fuse was open on quota, so the plan gate
+    blocked before any node ran and the cycle could only report "exited 6". The
+    kickoff already names the deterministic verifiers, so it declares them and
+    `cli.plan` readies the profile without interrogating it. Asserted through the
+    consumer's own predicate: any wording that stops matching it is the bug.
+    """
+    from mini_ork.gates.profile_gate import declares_verification_command
+
+    seen = {}
+
+    def _fake_recipe(req, recipe, brief, kickoff, **kwargs):
+        seen["kickoff"] = kickoff
+        raise cycle_mod.CycleFailure("stop after capturing the kickoff")
+
+    monkeypatch.setattr(cycle_mod, "_run_recipe", _fake_recipe)
+    req = CycleRequest(root=tmp_path, db=tmp_path / "state.db", config=_cfg(),
+                       cycle_id="rsi-ctest")
+
+    with pytest.raises(cycle_mod.CycleFailure):
+        cycle_mod._recipe_propose(req, _l10_candidate())
+
+    assert declares_verification_command(seen["kickoff"]) is True
+
+
+def test_a_blocked_profile_names_the_reason_instead_of_the_exit_code(world, monkeypatch):
+    """`exit 6` is not a diagnosis; the run's own plan.json is.
+
+    A run whose profile never got answered writes `plan_status=needs_answers` and
+    stops before the planner. Nothing in the cycle log said so, so the operator
+    had to open the run dir to learn the stage was blocked rather than broken.
+    """
+    def _fake_recipe(req, recipe, brief, kickoff, **kwargs):
+        home = req.home / "rsi" / req.cycle_id / recipe / "home"
+        run_dir = home / "runs" / f"{req.cycle_id}-{recipe}"
+        run_dir.mkdir(parents=True)
+        (run_dir / "plan.json").write_text(json.dumps({
+            "plan_status": "needs_answers", "blocked_by": "run_profile",
+            "human_questions": ["a?", "b?", "c?"],
+        }), encoding="utf-8")
+        return 6, home, run_dir
+
+    monkeypatch.setattr(cycle_mod, "_run_recipe", _fake_recipe)
+    req = CycleRequest(root=world.root, db=world.db, config=world.cfg,
+                       cycle_id="rsi-ctest")
+
+    with pytest.raises(cycle_mod.CycleFailure) as excinfo:
+        cycle_mod._recipe_propose(req, _l10_candidate())
+
+    message = str(excinfo.value)
+    assert "never dispatched the planner" in message
+    assert "plan_status=needs_answers" in message and "run_profile" in message
+    assert "exited 6" not in message

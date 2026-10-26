@@ -1098,6 +1098,29 @@ def _verify_failure(home: Path, run_id: str) -> str:
         f"verdict={payload.get('verdict')!r}")
 
 
+def _blocked_reason(home: Path, run_id: str) -> str:
+    """Why a recipe run never dispatched its planner, or ``""`` if it did.
+
+    A run whose ``run_profile`` is still asking questions writes a ``plan.json``
+    carrying ``plan_status=needs_answers`` and stops before any node — no
+    proposal, exit 6, and nothing in the log that says "blocked". The profile is
+    interrogated by a model lane, so a dead lane looks like an empty stage; the
+    run's own plan is the only place that distinction is written down.
+    """
+    path = _run_artifact(home, run_id, "plan.json")
+    if path is None:
+        return ""
+    try:
+        plan = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(plan, Mapping) or plan.get("plan_status") != "needs_answers":
+        return ""
+    return (f"plan_status=needs_answers, blocked_by "
+            f"{plan.get('blocked_by') or 'unknown'} "
+            f"(questions: {len(plan.get('human_questions') or [])})")
+
+
 def _default_propose(req: CycleRequest, cand: Candidate) -> Proposal | None:
     """SUGGEST is the first model edge and lives in a recipe, not here.
 
@@ -1141,6 +1164,18 @@ def _recipe_propose(req: CycleRequest, cand: Candidate) -> Proposal:
         "synthesize prompt.",
         "- Do not edit the repository. This run proposes; the cycle decides.",
         "",
+        # Self-sufficiency marker, read by ``profile_gate.declares_verification_command``
+        # through ``cli.plan``: a kickoff that states how it is verified is not
+        # interrogated. Without it the run_profile asks three questions and answers
+        # them with a *model* call, so a dead lane blocks a stage whose verification
+        # was never in question — cycle 19 (2026-10-26) died this way in 30 s when
+        # the profile-answerer lane's fuse opened on quota, and the cycle could only
+        # report "exited 6 without a proposal.json".
+        "## Verification commands",
+        "",
+        "- `python3 recipes/rsi-cycle/verifiers/verify.py`",
+        "- `python3 recipes/rsi-cycle/verifiers/proposal.py`",
+        "",
     ])
     rc, home, run_dir = _run_recipe(req, "rsi-cycle", brief, kickoff,
                                     timeout_s=_SUGGEST_TIMEOUT_S,
@@ -1157,6 +1192,12 @@ def _recipe_propose(req: CycleRequest, cand: Candidate) -> Proposal:
                 f"the SUGGEST run hit its {_SUGGEST_TIMEOUT_S} s wall before writing "
                 f"proposal.json; each node was bounded to "
                 f"{_node_timeout_s(_SUGGEST_TIMEOUT_S, os.environ.get('MO_NODE_TIMEOUT_S'))} s "
+                f"(see {run_dir})")
+        blocked = _blocked_reason(home, run_dir.name)
+        if blocked:
+            # "exited 6" says nothing an operator can act on; the run's plan does.
+            raise CycleFailure(
+                f"the SUGGEST run never dispatched the planner: {blocked} "
                 f"(see {run_dir})")
         raise CycleFailure(
             f"the SUGGEST run exited {rc} without a proposal.json (see {run_dir})")
@@ -1969,6 +2010,13 @@ def _recipe_critics(req: CycleRequest, cand: Candidate, impl: Implementation,
         "- Required output: `$MINI_ORK_RUN_DIR/critics.json` and "
         "`$MINI_ORK_RUN_DIR/panel-composition.json`.",
         "- Do not edit the repository. You judge; the cycle decides.",
+        "",
+        # Same self-sufficiency marker as the SUGGEST kickoff: the panel's own
+        # deterministic verifier is the proof, so the profile gate must not
+        # spend a model call answering a question the run already answers.
+        "## Verification commands",
+        "",
+        "- `python3 recipes/rsi-critic/verifiers/verify.py`",
         "",
     ])
     try:
