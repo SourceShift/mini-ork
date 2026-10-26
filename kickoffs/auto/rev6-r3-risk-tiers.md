@@ -243,7 +243,7 @@ Run the driver with `[sys.executable, REPO/scripts/mini_ork_worktree.py, ...]`
 
 ## Verification commands
 
-- `python3.11 -m pytest -q -p no:asyncio tests/unit/test_merge_risk.py tests/unit/test_merge_oss_guard.py tests/unit/test_worktree_script_py.py tests/unit/test_merge_approval.py tests/unit/test_approvals_cmd.py tests/unit/test_gaming_scan.py`
+- `python3.11 -m pytest -q -p no:asyncio tests/unit/test_merge_risk.py tests/unit/test_merge_oss_guard.py tests/unit/test_worktree_script_py.py tests/unit/test_merge_approval.py tests/unit/test_node_review.py tests/unit/test_gaming_scan.py`
 
 (Drop any listed test file that does not exist; do not create it.)
 
