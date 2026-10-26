@@ -312,6 +312,91 @@ def test_brief_strips_provenance_before_a_lens_sees_it(tmp_path):
     assert "db:V1" not in (run_dir / "brief.md").read_text(encoding="utf-8").split("## Evidence")[1].split("## What")[0]
 
 
+def test_proposal_carries_a_new_file_instead_of_dropping_it(tmp_path):
+    """The builder must not silently turn a two-part fix into half a fix.
+
+    Cycle 7's synthesis declared the migration under ``new_files`` and this node
+    dropped the key, so the kickoff named no schema change and G8 could not pass.
+    """
+    brief, _ = _brief_file(tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    inputs = tmp_path / "inputs"
+    (inputs / "suggestion").mkdir(parents=True)
+    created = str(Path(FILE).parent / "0085_new_thing.sql")
+    (inputs / "suggestion" / "suggestion.json").write_text(json.dumps({
+        "candidate_id": "rsi-abc",
+        "files": [FILE],
+        "new_files": [created],
+        "change_summary": "add the column",
+        "verification_command": "db:V1",
+    }), encoding="utf-8")
+
+    out = _run("rsi-cycle", "proposal.py", run_dir=run_dir, input_dir=inputs,
+               extra_env={"MO_RSI_SUGGEST_BRIEF": str(brief)})
+    assert out.returncode == 0, out.stderr
+    proposal = json.loads((run_dir / "proposal.json").read_text())
+    assert proposal["files"] == [FILE]
+    assert proposal["new_files"] == [created]
+
+
+def test_proposal_counts_new_files_against_the_limit(tmp_path):
+    brief, _ = _brief_file(tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    inputs = tmp_path / "inputs"
+    (inputs / "suggestion").mkdir(parents=True)
+    parent = Path(FILE).parent
+    (inputs / "suggestion" / "suggestion.json").write_text(json.dumps({
+        "candidate_id": "rsi-abc",
+        "files": [FILE],
+        "new_files": [str(parent / f"new_{i}.py") for i in range(5)],
+        "verification_command": "db:V1",
+    }), encoding="utf-8")
+
+    out = _run("rsi-cycle", "proposal.py", run_dir=run_dir, input_dir=inputs,
+               extra_env={"MO_RSI_SUGGEST_BRIEF": str(brief)})
+    assert out.returncode != 0
+    assert "the limit is" in out.stderr
+
+
+def test_proposal_fails_on_a_new_file_under_a_missing_directory(tmp_path):
+    brief, _ = _brief_file(tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    inputs = tmp_path / "inputs"
+    (inputs / "suggestion").mkdir(parents=True)
+    (inputs / "suggestion" / "suggestion.json").write_text(json.dumps({
+        "candidate_id": "rsi-abc",
+        "files": [FILE],
+        "new_files": ["db/no_such_dir/0085_x.sql"],
+        "verification_command": "db:V1",
+    }), encoding="utf-8")
+
+    out = _run("rsi-cycle", "proposal.py", run_dir=run_dir, input_dir=inputs,
+               extra_env={"MO_RSI_SUGGEST_BRIEF": str(brief)})
+    assert out.returncode != 0
+    assert "does not exist" in out.stderr
+
+
+def test_proposal_rejects_a_directory_in_files(tmp_path):
+    brief, _ = _brief_file(tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    inputs = tmp_path / "inputs"
+    (inputs / "suggestion").mkdir(parents=True)
+    (inputs / "suggestion" / "suggestion.json").write_text(json.dumps({
+        "candidate_id": "rsi-abc",
+        "files": [str(Path(FILE).parent)],
+        "verification_command": "db:V1",
+    }), encoding="utf-8")
+
+    out = _run("rsi-cycle", "proposal.py", run_dir=run_dir, input_dir=inputs,
+               extra_env={"MO_RSI_SUGGEST_BRIEF": str(brief)})
+    assert out.returncode != 0
+    assert "is a directory" in out.stderr
+
+
 def test_proposal_fails_on_a_path_that_does_not_exist(tmp_path):
     brief, _ = _brief_file(tmp_path)
     run_dir = tmp_path / "run"

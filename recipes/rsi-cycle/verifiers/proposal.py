@@ -43,19 +43,34 @@ def main() -> None:
                     f"dispatched for {wanted!r}")
 
     files = _clean_paths(first(suggestion, "files", "files_to_touch", "proposed_files"))
-    if not files:
+    # A fix whose correct shape *is* a new file — a migration, a new test module —
+    # declares it here. The field must survive this node: dropping it silently
+    # turns a two-part fix into half a fix, and the cycle then fails G8.
+    new_files = [p for p in _clean_paths(first(suggestion, "new_files", "files_to_create"))
+                 if p not in files]
+    if not files and not new_files:
         fail(STAGE, "the synthesis named no files; there is nothing to scope")
     limit = int(constraints.get("max_files") or MAX_FILES)
-    if len(files) > limit:
-        fail(STAGE, f"{len(files)} files proposed; the limit is {limit} (a wider diff is a "
-                     f"review request, not a fix)")
+    if len(files) + len(new_files) > limit:
+        fail(STAGE, f"{len(files) + len(new_files)} files proposed; the limit is {limit} "
+                     f"(a wider diff is a review request, not a fix)")
     repo_root = str(constraints.get("repo_root") or "")
     for path in files:
         if os.path.isabs(path) or ".." in path.split("/"):
             fail(STAGE, f"{path!r} is not a repo-relative path")
+        if os.path.isdir(os.path.join(repo_root, path)):
+            fail(STAGE, f"{path!r} is a directory; name the files the change touches "
+                        f"(a directory claim collides with unrelated worktrees)")
         if not os.path.exists(os.path.join(repo_root, path)):
             fail(STAGE, f"{path!r} does not exist under {repo_root}; an invented path would "
                         f"be rejected before dispatch anyway, so it fails here instead")
+    for path in new_files:
+        if os.path.isabs(path) or ".." in path.split("/"):
+            fail(STAGE, f"{path!r} is not a repo-relative path")
+        parent = os.path.dirname(os.path.join(repo_root, path))
+        if not os.path.isdir(parent):
+            fail(STAGE, f"{path!r} would be created under a directory that does not exist "
+                        f"({parent}); check the path before claiming to add it")
 
     verification = str(first(suggestion, "verification_command", "success_command", default="")
                        or candidate.get("success_command") or "").strip()
@@ -65,6 +80,7 @@ def main() -> None:
     proposal = {
         "candidate_id": wanted,
         "files": files,
+        "new_files": new_files,
         "summary": str(first(suggestion, "summary", "change_summary", default="")).strip()
                    or str(candidate.get("title") or ""),
         "root_cause": str(first(suggestion, "root_cause", "cause", default="")).strip(),
@@ -78,7 +94,7 @@ def main() -> None:
         json.dump(proposal, handle, indent=2, sort_keys=True)
         handle.write("\n")
     print(json.dumps({"verifier": "rsi-cycle-proposal", "pass": True,
-                      "candidate_id": wanted, "files": len(files)}))
+                      "candidate_id": wanted, "files": len(files) + len(new_files)}))
 
 
 if __name__ == "__main__":
