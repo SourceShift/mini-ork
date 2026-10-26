@@ -97,6 +97,7 @@ from mini_ork.runtime.contract import run_check  # noqa: F401 -- routing helper
 from mini_ork.execute_compat import normalize_implementer_summary, write_json_atomic
 from mini_ork.recovery.condition import evaluate_condition
 from mini_ork.recovery.dag import CompiledRetryEdge
+from mini_ork.stores import revise_rounds
 from mini_ork.verify import levels as _levels
 from mini_ork.workflow import review_ledger
 
@@ -1418,6 +1419,26 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
         fields_by_id = {field[0]: field for field in work_fields}
         # revise round bookkeeping: target node_id -> rounds already consumed.
         round_used: dict[str, int] = {}
+        # Rounds-to-pass ledger (rev6 R5b): a recover process starts its
+        # in-memory counter at 1, so number rows from the table's offset and a
+        # recovered run continues its numbering instead of overwriting it.
+        # Only `retries` edges are revise rounds; `escalates_to` targets are not.
+        retry_targets = sorted({edge.target for edge in retry_edges.values()})
+        if not dry_run and run_id:
+            rr_base = {t: revise_rounds.next_round(db, run_id, t)
+                       for t in retry_targets}
+        else:
+            rr_base: dict[str, int] = {}
+
+        def _revise_run_cost():
+            """Cumulative run spend, or None — a cost read never changes a run."""
+            try:
+                from mini_ork import cost_ledger as _cost_ledger  # noqa: PLC0415
+
+                return _cost_ledger.run_cost(db, run_id)
+            except Exception:  # noqa: BLE001 — bookkeeping must not raise
+                return None
+
         # RB-18: the defect report is noted once per run, not once per wave.
         spec_defect_noted = False
 
@@ -1802,6 +1823,12 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                             continue
                     round_no = round_used.get(target, 0) + 1
                     round_used[target] = round_no
+                    if target in rr_base:
+                        # Attempt rr_base+round_no-1 failed; the new one starts.
+                        revise_rounds.record_grant(
+                            db, run_id, task_class, target,
+                            rr_base[target] + round_no,
+                            cost_usd=_revise_run_cost())
                     reset_ids = _control_descendants(target)
                     feedback_path = _write_revise_feedback(
                         live_run_dir, round_no, _target_max, failed_sources)
@@ -1834,6 +1861,18 @@ def main(argv=None, *, root=None, dispatch_fn=None) -> int:
                         f"problems → re-running {target} with feedback ({feedback_path})",
                         file=sys.stderr,
                     )
+
+        # Rounds-to-pass ledger: settle every revise target's final attempt now,
+        # before rollback decides the run's fate. `passed` is the run's own
+        # failure count (already final here), so it means "the run was green".
+        if rr_base:
+            _rr_cost = _revise_run_cost()
+            for _rr_target in rr_base:
+                revise_rounds.record_outcome(
+                    db, run_id, task_class, _rr_target,
+                    rr_base[_rr_target] + round_used.get(_rr_target, 0),
+                    passed=(fail_count == 0),
+                    cost_usd=_rr_cost)
 
     dependency_aware = any(
         control_parents.get(field[0]) for field in work_fields
