@@ -35,7 +35,6 @@
 import json
 import os
 import re
-import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -47,7 +46,6 @@ _STRUCTURAL_RE = re.compile(
     r"^(README\.md|ROADMAP\.md|lib/|bin/|recipes/|db/migrations/|schemas/)",
     re.MULTILINE,
 )
-_NUMERIC_RE = re.compile(r"^[0-9]+$")
 
 
 def _git(*args: str) -> subprocess.CompletedProcess:
@@ -112,134 +110,63 @@ def run_layer1(repo_root: Path) -> int:
 
 
 def _layer3_run(repo_root: Path, target_main: int) -> int:
-    if os.environ.get("MO_REVIEW_SKIP", "0") == "1":
-        print("pre-push: Layer 3 skipped (MO_REVIEW_SKIP=1).")
-        return 0
-    review_lib = repo_root / "lib" / "pre_push_review.sh"
-    if not review_lib.is_file():
-        print(
-            "pre-push: Layer 3 not installed (lib/pre_push_review.sh missing)"
-            " — skipping."
-        )
-        return 0
+    """Layer 3 — the Python pre-push review gate.
 
-    push_sha = _git("rev-parse", "HEAD").stdout.strip()
-    r = _git("merge-base", push_sha, "origin/main")
-    push_base = r.stdout.strip() if r.returncode == 0 else ""
-    if not push_base:
-        r = _git("rev-parse", push_sha + "^")
-        push_base = r.stdout.strip() if r.returncode == 0 else ""
+    The gate owns the verdict, the patch-id cache and the tier rule; this hook
+    only chooses the interpreter and maps its exit code. It must not import
+    ``mini_ork`` itself, so ``primary_root`` is inlined from
+    ``git rev-parse --path-format=absolute --git-common-dir``.
+    """
     target = "main" if target_main == 1 else "feature"
-    mode = "hybrid" if os.environ.get("MO_REVIEW_LLM_LENSES", "0") == "1" else "heuristic"
 
-    print(
-        f"pre-push: running Layer 3 (code reviewer) — target={target} "
-        f"base={push_base[:12]} sha={push_sha[:12]}"
-    )
+    primary = None
+    common = _git("rev-parse", "--path-format=absolute", "--git-common-dir")
+    if common.returncode == 0 and common.stdout.strip():
+        common_path = Path(common.stdout.strip())
+        if common_path.name == ".git":
+            primary = common_path.parent
+    if primary is None:
+        top = _git("rev-parse", "--show-toplevel")
+        primary = (
+            Path(top.stdout.strip())
+            if top.returncode == 0 and top.stdout.strip()
+            else repo_root
+        )
+
+    python = None
+    for candidate in (
+        primary / ".venv" / "bin" / "python",
+        repo_root / ".venv" / "bin" / "python",
+    ):
+        if os.access(candidate, os.X_OK):
+            python = str(candidate)
+            break
+    if python is None:
+        python = sys.executable
 
     l3_env = os.environ.copy()
-    l3_env["MINI_ORK_ROOT"] = str(repo_root)
-    l3_env["MINI_ORK_DB"] = os.environ.get(
-        "MINI_ORK_DB", str(repo_root / ".mini-ork" / "state.db")
+    existing = l3_env.get("PYTHONPATH", "")
+    l3_env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (str(repo_root), existing) if part
     )
 
-    # TODO-port: lib/pre_push_review.sh is still bash (operator review tool);
-    # invoke it through a bash subprocess with identical args until it lands
-    # in Python.
-    base_arg = f"--base {shlex.quote(push_base)}" if push_base else ""
-    run_cmd = (
-        f"source {shlex.quote(str(review_lib))}; "
-        f"review_run {shlex.quote(push_sha)} {shlex.quote(target)} "
-        f"--mode {shlex.quote(mode)} {base_arg}"
-    )
-    r = subprocess.run(
-        ["bash", "-c", run_cmd],
+    rc = subprocess.run(
+        [python, "-m", "mini_ork.pre_push_review", "gate",
+         "--target", target, "--cwd", str(repo_root)],
+        cwd=str(repo_root),
         env=l3_env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,  # mirror `2>&1 | tail -1`
-        text=True,
         check=False,
-    )
-    combined = r.stdout or ""
-    if combined.endswith("\n"):
-        combined = combined[:-1]
-    review_id = combined.split("\n")[-1] if combined else ""
+    ).returncode
 
-    if not _NUMERIC_RE.search(review_id):
-        print(
-            f"⚠ pre-push: Layer 3 reviewer error (review_id={review_id})"
-            " — fail-open."
-        )
+    if rc == 0:
         return 0
-
-    verdict_cmd = (
-        f"source {shlex.quote(str(review_lib))}; review_verdict_for {review_id}"
-    )
-    r = subprocess.run(
-        ["bash", "-c", verdict_cmd],
-        env=l3_env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    verdict = r.stdout.strip()
-
-    print(f"  review_id={review_id} verdict={verdict}")
-
-    if verdict == "approve":
-        print("✓ pre-push: Layer 3 clean.")
-        return 0
-    if verdict == "warn":
-        subprocess.run(
-            [str(repo_root / "bin" / "mini-ork-review"), "show", review_id],
-            check=False,
-        )
-        print()
-        print(
-            f"⚠ pre-push: Layer 3 raised warnings but target is '{target}'"
-            " — push proceeds."
-        )
-        return 0
-    if verdict == "block":
-        subprocess.run(
-            [str(repo_root / "bin" / "mini-ork-review"), "show", review_id],
-            check=False,
-        )
-        if os.environ.get("MO_REVIEW_AUTO_FIX", "0") == "1":
-            print()
-            print(
-                "pre-push: MO_REVIEW_AUTO_FIX=1 — forwarding issues to"
-                " bug_reports."
-            )
-            fwd_cmd = (
-                f"source {shlex.quote(str(review_lib))}; "
-                f"review_forward_to_bug_reports {review_id}"
-            )
-            r = subprocess.run(
-                ["bash", "-c", fwd_cmd],
-                env=l3_env,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            n = r.stdout.strip()
-            print(f"pre-push: forwarded {n} issue(s).")
-            print("         operator next:")
-            print(f"           bin/mini-ork bugs promote --top {n}")
-            print("           bin/mini-ork scheduler --once")
-        print()
-        print(
-            f"✗ pre-push: Layer 3 blocked push (verdict=block,"
-            f" review_id={review_id})."
-        )
+    if rc == 1:
+        print("✗ pre-push: Layer 3 blocked the push.")
         print("  Fix the issues above, OR:")
         print("    MO_REVIEW_SKIP=1 git push       # bypass Layer 3 only")
-        print(
-            "    MO_REVIEW_AUTO_FIX=1 git push   # dispatch a fix epic instead"
-            " of blocking"
-        )
         print("    git push --no-verify            # bypass all hooks")
         return 1
+    print(f"⚠ pre-push: Layer 3 reviewer error (rc={rc}) — fail-open.")
     return 0
 
 

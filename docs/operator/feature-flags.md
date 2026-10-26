@@ -151,8 +151,10 @@ touched set is the child's working tree ∪ untracked ∪ `pre-implementer-ref�
 | `MO_CONDUCTOR_ADAPTIVE_GAIN` | `"1"` | Adaptive conductor gain from outcomes |
 | `MO_CONDUCTOR_GAIN_MIN_SAMPLES` | `"3"` | Min samples before adaptive gain engages |
 | `MO_SCHED_MAX_PARALLEL` | `"3"` | Scheduler epic parallelism |
-| `MO_REVIEW_PANEL` | `"codex kimi glm"` | Pre-push review LLM panel lanes |
+| `MO_REVIEW_PANEL` | `"glm deepseek_flash"` | Pre-push review LLM panel lanes (the two families live on 2026-10-26; minimax, kimi and codex failed their probes). A high LLM finding blocks only when two lenses flag the same file |
 | `MO_REVIEW_LENS_TIMEOUT_S` | `"180"` | Per-lens review timeout |
+| `MO_REVIEW_LLM_LENSES` | `"0"` | `1` runs the LLM panel with the heuristics (hybrid mode) |
+| `MO_REVIEW_SKIP` | `"0"` | `1` skips the pre-push code review; a human decision |
 | `MO_ORACLE_GATES_AUTO` | `"1"` | Auto oracle-gate run pre-publish |
 | `MO_NODE_HEARTBEAT_SECONDS` | `"60"` | How often a running node writes a `node_heartbeat` row |
 | `MO_ORCH_WATCH` | `"1"` | `0` stops `mini-ork run` from spawning the run's interval watcher |
@@ -160,6 +162,11 @@ touched set is the child's working tree ∪ untracked ∪ `pre-implementer-ref�
 | `MO_ORCH_WATCH_AUTONOMY` | `"steer"` | `steer` \| `notify` \| `off` — whether a stall is nudged or only signalled |
 | `MO_ORCH_WATCH_MAX_STEERS` | `"2"` | Nudges per run |
 | `MO_ORCH_WATCH_MAX_HOURS` | `"12"` | Wall-clock cap on the watcher's own lifetime |
+
+The pre-push review is cached by `git patch-id` in
+`$MINI_ORK_HOME/state/pre-push-review-cache.json`, and in the secure review
+tier (`config/review.yaml` with `review: {tier: secure}`) a review that cannot
+run blocks the push.
 
 ### Node heartbeats (`MO_NODE_HEARTBEAT_SECONDS`)
 

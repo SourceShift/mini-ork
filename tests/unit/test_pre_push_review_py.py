@@ -158,7 +158,7 @@ def test_native_llm_panel_contract_and_normalization(tmp_path, monkeypatch):
     issues = ppr._default_llm_panel("diff body", dispatch_fn=dispatch)
 
     assert not (empty_root / "lib" / "llm-dispatch.sh").exists()
-    assert [call[0] for call in calls] == ["codex", "glm"]
+    assert sorted(call[0] for call in calls) == ["codex", "glm"]  # lenses run concurrently
     assert all(call[1] == ppr._REVIEW_PROMPT + "diff body" for call in calls)
     assert all(call[2:] == ("17", 4) for call in calls)
     assert issues == [
@@ -187,10 +187,10 @@ def test_native_llm_panel_fails_open_per_lens(monkeypatch):
 
     monkeypatch.setenv("MO_REVIEW_PANEL", "kimi glm")
     assert ppr._default_llm_panel("diff", dispatch_fn=dispatch) == []
-    assert calls == ["kimi", "glm"]
+    assert sorted(calls) == ["glm", "kimi"]  # lenses run concurrently
 
 
-def test_native_llm_panel_default_models_exclude_minimax(tmp_path, monkeypatch):
+def test_native_llm_panel_default_models_are_the_live_lanes(tmp_path, monkeypatch):
     calls = []
 
     def dispatch(model, prompt, out_file, timeout, max_turns):
@@ -200,4 +200,4 @@ def test_native_llm_panel_default_models_exclude_minimax(tmp_path, monkeypatch):
 
     monkeypatch.delenv("MO_REVIEW_PANEL", raising=False)
     assert ppr._default_llm_panel("diff", dispatch_fn=dispatch) == []
-    assert calls == ["codex", "kimi", "glm"]
+    assert sorted(calls) == ["deepseek_flash", "glm"]

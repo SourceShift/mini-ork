@@ -523,6 +523,7 @@ _USAGE = """Usage: mini-ork review <subcommand> [args]
   verdict <review_id>
   forward <review_id>
   list [N]
+  gate [--target main|feature] [--head SHA] [--base SHA] [--cwd DIR]
 """
 
 
@@ -537,6 +538,12 @@ def main(argv: list[str] | None = None) -> int:
     if not args or args[0] in ("help", "--help", "-h"):
         sys.stdout.write(_USAGE)
         return 0
+    if args[0] == "gate":
+        # Lazy import: mini_ork.review.gate imports this module, so a
+        # module-level import here would be circular.
+        from mini_ork.review.gate import main as gate_main
+
+        return gate_main(args[1:])
     try:
         sys.stdout.write(run_cli(args))
     except ValueError as e:

@@ -554,6 +554,39 @@ def create_worktree(slug: str, opts: list[str]) -> None:
     print(f"[mo-worktree] ready: {wt}  (branch {branch})")
 
 
+def _prereview(wt: str) -> None:
+    """Run the pre-push code-review gate *before* the merge lock is taken.
+
+    A review can take minutes (an LLM panel), and ``_merge_lock`` serialises
+    every merge on the machine — reviewing inside it would block peers. The
+    in-lock push fires the same gate through the hook; the patch-id cache makes
+    that second call a no-op. ``rc 1`` means the review blocked; any other
+    non-zero code is a reviewer error the push hook will surface and retry.
+    """
+    if os.environ.get("MO_REVIEW_SKIP") == "1":
+        return
+    if not os.path.isfile(os.path.join(wt, ".githooks", "pre-push")):
+        return
+    venv_python = os.path.join(ROOT, ".venv", "bin", "python")
+    python = venv_python if os.access(venv_python, os.X_OK) else sys.executable
+    env = os.environ.copy()
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join(part for part in (wt, existing) if part)
+    rc = subprocess.run(
+        [python, "-m", "mini_ork.pre_push_review", "gate",
+         "--target", "main", "--cwd", wt],
+        cwd=wt,
+        env=env,
+        check=False,
+    ).returncode
+    if rc == 1:
+        die("pre-push code review blocked the merge (findings above); "
+            "fix them, or re-run with MO_REVIEW_SKIP=1 if a human accepts them")
+    if rc != 0:
+        print(f"[mo-worktree] pre-push review errored (rc={rc}); "
+              "the push hook will retry it")
+
+
 def merge_worktree(args: list[str]) -> None:
     if args:
         slug = sanitize_slug(args[0])
@@ -584,6 +617,9 @@ def merge_worktree(args: list[str]) -> None:
     if rc != 0:
         die(f"green gate failed ({test_cmd}) in {wt}; "
             f"{_differential_verdict(wt, test_cmd, pre_rebase, base_before)}")
+    # Review here, *before* the lock: a multi-minute review must never hold
+    # the merge lock. The in-lock push hits the patch-id cache instead.
+    _prereview(wt)
     # The gate above runs for minutes, so origin/main has moved since the fetch
     # at the top: pushing now is rejected as non-fast-forward whenever any peer
     # landed during the gate. The tree is green; only the base is stale. Rebase

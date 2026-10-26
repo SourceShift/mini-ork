@@ -7,6 +7,7 @@ the bash JSONL shape.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import io
 import json
@@ -311,68 +312,110 @@ def _default_llm_panel(
     *,
     dispatch_fn: Callable[..., int] | None = None,
 ) -> list[dict]:
-    """Run the configured review panel through the native dispatcher."""
+    """Run the configured review panel through the native dispatcher.
+
+    Lenses run concurrently — one worker per lane — because each may take up to
+    ``MO_REVIEW_LENS_TIMEOUT_S``. Results are collected in panel order, so the
+    issue list is exactly what the previous sequential loop produced.
+    ``redirect_stdout`` / ``redirect_stderr`` are process-global, so they wrap
+    the whole pool, never an individual lens.
+    """
     from mini_ork.dispatch import llm_dispatch
 
     dispatch_fn = dispatch_fn or llm_dispatch.mo_llm_dispatch
-    panel = os.environ.get("MO_REVIEW_PANEL", "codex kimi glm").split()
+    panel = os.environ.get("MO_REVIEW_PANEL", "glm deepseek_flash").split()
     timeout = os.environ.get("MO_REVIEW_LENS_TIMEOUT_S", "180")
-    output: list[dict] = []
-    for model in panel:
-        if model == "gemini" or model.startswith("gemini-") or "-gemini-" in model:
-            continue
+    models = [
+        model for model in panel
+        if not (model == "gemini"
+                or model.startswith("gemini-")
+                or "-gemini-" in model)
+    ]
+    if not models:
+        return []
+
+    out_files: list[str] = []
+    for _ in models:
         with tempfile.NamedTemporaryFile("w", suffix=".out", delete=False) as handle:
-            out_file = handle.name
+            out_files.append(handle.name)
+
+    def run_one(model: str, out_file: str) -> int:
         try:
+            return dispatch_fn(model, _REVIEW_PROMPT + diff_text, out_file, timeout, 4)
+        except Exception:
+            # Fail-open per lens: one dead provider must not sink the panel.
+            return 1
+
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=len(models)
+            ) as pool:
+                futures = [
+                    pool.submit(run_one, model, out_file)
+                    for model, out_file in zip(models, out_files)
+                ]
+                returncodes = [future.result() for future in futures]
+
+        output: list[dict] = []
+        for model, out_file, rc in zip(models, out_files, returncodes):
             try:
-                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                    rc = dispatch_fn(model, _REVIEW_PROMPT + diff_text, out_file, timeout, 4)
-            except Exception:
-                rc = 1
-            if rc != 0:
-                continue
-            try:
-                raw = Path(out_file).read_text()
-            except OSError:
-                continue
-            payload = None
-            try:
-                payload = json.loads(raw)
-            except Exception:
-                match = re.search(r"\{[\s\S]*\}", raw)
-                if match:
+                if rc != 0:
+                    continue
+                try:
+                    raw = Path(out_file).read_text()
+                except OSError:
+                    continue
+                payload = None
+                try:
+                    payload = json.loads(raw)
+                except Exception:
+                    match = re.search(r"\{[\s\S]*\}", raw)
+                    if match:
+                        try:
+                            payload = json.loads(match.group(0))
+                        except Exception:
+                            payload = None
+                if not isinstance(payload, dict) or not isinstance(
+                    payload.get("issues", []), list
+                ):
+                    continue
+                emitted = 0
+                for issue in payload.get("issues", []):
+                    if not isinstance(issue, dict):
+                        continue
+                    severity = str(issue.get("severity") or "medium").lower()
+                    if severity not in {"info", "low", "medium", "high", "critical"}:
+                        severity = "medium"
+                    title = str(issue.get("title") or "").strip()[:300]
+                    if not title:
+                        continue
+                    output.append({
+                        "lens": f"llm.{model}",
+                        "severity": severity,
+                        "file": str(issue.get("file") or "?")[:200],
+                        "line": issue.get("line"),
+                        "title": title,
+                        "description": str(issue.get("description") or "")[:1000],
+                        "suggested_fix": str(issue.get("suggested_fix") or "")[:500],
+                    })
+                    emitted += 1
+                    if emitted >= 8:
+                        break
+            finally:
+                for path in (out_file, out_file + ".err.log"):
                     try:
-                        payload = json.loads(match.group(0))
-                    except Exception:
-                        payload = None
-            if not isinstance(payload, dict) or not isinstance(payload.get("issues", []), list):
-                continue
-            emitted = 0
-            for issue in payload.get("issues", []):
-                if not isinstance(issue, dict):
-                    continue
-                severity = str(issue.get("severity") or "medium").lower()
-                if severity not in {"info", "low", "medium", "high", "critical"}:
-                    severity = "medium"
-                title = str(issue.get("title") or "").strip()[:300]
-                if not title:
-                    continue
-                output.append({
-                    "lens": f"llm.{model}",
-                    "severity": severity,
-                    "file": str(issue.get("file") or "?")[:200],
-                    "line": issue.get("line"),
-                    "title": title,
-                    "description": str(issue.get("description") or "")[:1000],
-                    "suggested_fix": str(issue.get("suggested_fix") or "")[:500],
-                })
-                emitted += 1
-                if emitted >= 8:
-                    break
-        finally:
+                        os.remove(path)
+                    except OSError:
+                        pass
+        return output
+    finally:
+        # The per-lens cleanup above normally removes these; this covers an
+        # escape before the parse loop ran (temp files must never leak).
+        for out_file in out_files:
             for path in (out_file, out_file + ".err.log"):
                 try:
                     os.remove(path)
                 except OSError:
                     pass
-    return output
