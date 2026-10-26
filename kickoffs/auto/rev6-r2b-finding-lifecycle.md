@@ -200,6 +200,39 @@ string format is unchanged. Apply the same exclusion to `_apply_verdict`'s
 In `main(argv)`, when the first argument is `findings` or `resolve`, return
 `mini_ork.review.findings.main(argv)`. Add both to the usage text.
 
+### 8. Lens outcomes are recorded
+
+The first revived review (#52, 2026-10-26) recorded only a heuristic finding.
+Nothing says whether the two LLM lenses ran and found nothing, or failed
+(they fail open per lens).
+
+- The migration also creates:
+  ```sql
+  CREATE TABLE IF NOT EXISTS review_lens_runs (
+    id INTEGER PRIMARY KEY, review_id INTEGER NOT NULL, lens TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('ok','dispatch_failed','unparseable','error')),
+    issues INTEGER NOT NULL DEFAULT 0, elapsed_ms INTEGER, created_at INTEGER NOT NULL);
+  CREATE INDEX IF NOT EXISTS idx_rlr_review ON review_lens_runs(review_id);
+  ```
+  `findings.ensure_schema` creates it too.
+- **`_default_llm_panel(..., lens_sink=None)`**: when `lens_sink` is a list,
+  append one dict per lens, in panel order:
+  `{"lens": f"llm.{model}", "status": ..., "issues": <emitted count>, "elapsed_ms": <int>}`.
+  The status is:
+  - `ok` — parsed;
+  - `dispatch_failed` — non-zero rc, or the dispatch raised;
+  - `unparseable` — out-file missing or no JSON payload;
+  - `error` — any other exception.
+- **`review_run`** passes `lens_sink` to the default panel and inserts the rows
+  for this review id. On any error it skips the rows; the review result is
+  unchanged.
+- **`gate.run_gate`**, after a fresh (non-cached) review, prints one line per
+  row: `pre-push review: lens llm.glm ok (2 issues, 41s)`. A test asserts a
+  lens that raised is recorded as `dispatch_failed` and printed.
+
+Add `review_lens_runs` to the files-in-scope DDL; the extra tests go in
+`tests/unit/test_review_findings.py`.
+
 ## Files in scope (touch ONLY these)
 
 - `db/migrations/0085_review_findings.sql` (new)
