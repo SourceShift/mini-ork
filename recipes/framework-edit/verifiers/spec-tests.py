@@ -103,6 +103,30 @@ _DESELECTED_RE = re.compile(r"(\d+)\s+deselected")
 # traceback, whose exception line carries the `E` marker at column 0.
 _TRACEBACK_HEADER_RE = re.compile(r"^_+\s*(.+?)\s*_+$")
 _EXCEPTION_LINE_RE = re.compile(r"^E\s{2,}(\S.*)$")
+# pytest closes each traceback with `<path>:<line>: <ExcType>`. Assertion
+# rewriting prints a bare `E   assert False` line with no type, so the footer is
+# the only place the exception class appears; the declaration of a custom error
+# may be dotted (`sqlite3.OperationalError`).
+_EXCEPTION_FOOTER_RE = re.compile(r"^\S.*:\d+: ([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)$")
+
+# pytest usage errors that are defects in the SPEC TEST itself: calling a
+# fixture as a plain function, asking for a fixture that does not exist, or
+# requesting one from the wrong scope. No implementation can make such a test
+# pass, so they are labelled instead of being read as a refuted clause. The
+# order is the order the kickoff declares them in.
+_HARNESS_DEFECT_RES = (
+    re.compile(r'Fixture "([^"]+)" called directly'),
+    re.compile(r"fixture '([^']+)' not found"),
+    re.compile(r"ScopeMismatch: .+"),
+)
+# pytest reports a fixture error against the setup/teardown of the unit, not as
+# a FAILED item; the header names the unit with this prefix, which must come off
+# before `_unit_key` or the marking can never match the failure record.
+_SETUP_ERROR_PREFIXES = ("ERROR at setup of ", "ERROR at teardown of ")
+
+# The run-root file RB-18 (`mini_ork/cli/execute.py`) reads to stop the revise
+# rounds: a person must fix the spec tests before the change can be measured.
+SPEC_DEFECT_REPORT_NAME = "spec-test-defect.md"
 
 # Written by pytest itself, not by the author: running the suite (as the
 # implementer is told to) creates these, so they are not part of the fence.
@@ -587,8 +611,13 @@ def failure_exceptions(output: str) -> dict[str, str]:
     The short summary reports ``FAILED <nodeid>`` with no reason, so the only
     place the cause appears is the first ``E`` line under the item's
     ``___ test_name ___`` header. That line is what tells the operator whether
-    the clause was refuted or the test died before reaching it."""
-    found: dict[str, str] = {}
+    the clause was refuted or the test died before reaching it. When the ``E``
+    line carries no exception type (assertion rewriting prints a bare
+    ``E   assert False``), the traceback footer supplies it, so a plain
+    assertion failure still reads as ``AssertionError: assert False`` rather
+    than a bare expression."""
+    details: dict[str, str] = {}
+    footers: dict[str, str] = {}
     current = ""
     for line in output.splitlines():
         header = _TRACEBACK_HEADER_RE.match(line.strip())
@@ -600,8 +629,54 @@ def failure_exceptions(output: str) -> dict[str, str]:
                 current = _unit_key(name)
             continue
         exception = _EXCEPTION_LINE_RE.match(line)
-        if exception and current:
-            found.setdefault(current, " ".join(exception.group(1).split())[:200])
+        if exception and current and current not in details:
+            details[current] = " ".join(exception.group(1).split())
+            continue
+        footer = _EXCEPTION_FOOTER_RE.match(line.strip())
+        if footer and current:
+            footers.setdefault(current, footer.group(1))
+    found: dict[str, str] = {}
+    for unit, detail in details.items():
+        exc_type = footers.get(unit)
+        text = f"{exc_type}: {detail}" if exc_type and exc_type not in detail else detail
+        found[unit] = text[:200]
+    return found
+
+
+def harness_defects(output: str) -> dict[str, str]:
+    """``{unit name: pytest usage error}`` for failures caused by the spec test.
+
+    Reads ANY line in a block, not only ``E``-prefixed ones: a fixture called
+    directly prints a bare line under the test's header, which is why
+    ``failure_exceptions`` recorded no reason for the six fixture-misuse
+    failures that spent both revise rounds of the R2a run. Only the first
+    matching line of a block is kept, and a ``=====`` section banner ends the
+    block so the ``-rA`` summary line (which repeats the message) is never
+    attributed to the last test in the suite."""
+    found: dict[str, str] = {}
+    current = ""
+    for line in output.splitlines():
+        header = _TRACEBACK_HEADER_RE.match(line.strip())
+        if header:
+            name = header.group(1)
+            # pytest also separates traceback frames with `_ _ _ _`; that line
+            # matches the header shape but names nothing.
+            if any(ch.isalnum() for ch in name):
+                for prefix in _SETUP_ERROR_PREFIXES:
+                    if name.startswith(prefix):
+                        name = name[len(prefix):]
+                        break
+                current = _unit_key(name)
+            continue
+        if line.strip().startswith("==="):
+            current = ""
+            continue
+        if not current:
+            continue
+        for pattern in _HARNESS_DEFECT_RES:
+            if pattern.search(line):
+                found.setdefault(current, line.strip()[:200])
+                break
     return found
 
 
@@ -636,6 +711,9 @@ def evaluate(run_dir: str, log) -> dict:
         "deselected": [],
         "tampered": [],
         "failures": [],
+        # Always present, on every early-return path too: an operator reading
+        # the payload must never have to guess whether the scan ran.
+        "harness_defects": [],
         "author_node_end": None,
         "deselected_reported": 0,
         "rc": None,
@@ -792,6 +870,30 @@ def evaluate(run_dir: str, log) -> dict:
             failure["error"] = error
         result["failures"].append(failure)
 
+    harness = harness_defects(output)
+    for failure in result["failures"]:
+        defect = harness.get(_unit_key(failure["test"]))
+        if defect:
+            failure["harness_defect"] = defect
+    result["harness_defects"] = sorted(
+        failure["test"] for failure in result["failures"] if failure.get("harness_defect"))
+
+    # When EVERY failure is a spec-test usage error the suite is unsatisfiable:
+    # no implementation can pass it, so the run must reach a person instead of
+    # spending its revise rounds. RB-18 (`mini_ork/cli/execute.py`) stops the
+    # rounds as soon as this file exists. A mixed suite is labelled only — the
+    # implementer is told which failures not to chase, but a real refutation
+    # still gates the run.
+    if result["failures"] and all(f.get("harness_defect") for f in result["failures"]):
+        report = os.path.join(run_dir, SPEC_DEFECT_REPORT_NAME)
+        if not os.path.exists(report):
+            try:
+                with open(report, "x", encoding="utf-8") as fh:
+                    fh.write(_harness_defect_report(result["failures"]))
+            except OSError:
+                pass  # a failed write must never change the gate verdict
+        result["harness_defect_report"] = report
+
     checks = [
         {"name": "tamper-detection",
          "expected": "no spec test file was modified after the author node ended",
@@ -830,11 +932,31 @@ def _failure_clause(failure: dict) -> str:
     truncated downstream, and a test that died before asserting says nothing
     about the change the operator is being asked to revise."""
     parts = [failure["test"]]
-    if failure.get("error"):
+    if failure.get("harness_defect"):
+        parts.append(f"[harness defect: {failure['harness_defect']}]")
+    elif failure.get("error"):
         parts.append(f"[{failure['error']}]")
     if failure["kickoff"]:
         parts.append(f"← {failure['kickoff']}")
     return " ".join(parts)
+
+
+def _harness_defect_report(failures: list[dict]) -> str:
+    """The report RB-18 reads; every failure named in it is a spec-test defect."""
+    lines = [
+        "# Spec-test defect (detected by the spec-tests verifier)",
+        "",
+        ("These spec tests fail with a pytest usage error inside the test code itself; "
+         "no implementation can make them pass. A person should fix the spec tests and "
+         "re-measure. They say nothing about the implementation."),
+        "",
+    ]
+    for failure in failures:
+        bullet = f"- `{failure['test']}` — {failure['harness_defect']}"
+        if failure.get("kickoff"):
+            bullet += f" — {failure['kickoff']}"
+        lines.append(bullet)
+    return "\n".join(lines) + "\n"
 
 
 def _pass_actual(rc, failures: list[dict]) -> str:
@@ -904,6 +1026,7 @@ def _normal(run_dir: str) -> int:
         "manifest": result["manifest"],
         "missing": result["missing"],
         "failures": result["failures"],
+        "harness_defects": result["harness_defects"],
         "author_node_end": result["author_node_end"],
         "rc": result["rc"],
         "timed_out": result["timed_out"],
@@ -919,6 +1042,8 @@ def _normal(run_dir: str) -> int:
         payload["note"] = result["note"]
     if result["error"]:
         payload["error"] = result["error"]
+    if result.get("harness_defect_report"):
+        payload["harness_defect_report"] = result["harness_defect_report"]
     # The executor copies its captured stdout over verifier_spec-tests.json
     # (`execute_handlers._handle_verifier`), so stdout — not this file — is what
     # the engine reads back. Serialize ONCE and use that same text for both, so
