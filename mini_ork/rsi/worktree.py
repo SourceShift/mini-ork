@@ -208,15 +208,22 @@ def _tail(text: str, lines: int = 12) -> str:
     return "\n".join(rows[-lines:])
 
 
+def _run_script_at(script: Path, primary: Path, args: Sequence[str], *,
+                   runner: Runner, env: Mapping[str, str] | None = None,
+                   timeout_s: int | None = None) -> tuple[int, str, str]:
+    if not script.is_file():
+        raise WorktreeError(f"worktree script not found: {script}")
+    return runner([sys.executable, str(script), *args],
+                  cwd=str(primary),
+                  env={**os.environ, **(env or {})},
+                  timeout_s=timeout_s)
+
+
 def _run_script(cfg: WorktreeConfig, args: Sequence[str], *,
                 runner: Runner, env: Mapping[str, str] | None = None,
                 ) -> tuple[int, str, str]:
-    if not cfg.script.is_file():
-        raise WorktreeError(f"worktree script not found: {cfg.script}")
-    return runner([sys.executable, str(cfg.script), *args],
-                  cwd=str(cfg.primary),
-                  env={**os.environ, **(env or {})},
-                  timeout_s=cfg.timeout_s)
+    return _run_script_at(cfg.script, cfg.primary, args, runner=runner,
+                          env=env, timeout_s=cfg.timeout_s)
 
 
 def _git(cfg: WorktreeConfig, args: Sequence[str], *,
@@ -342,6 +349,29 @@ def clean(cfg: WorktreeConfig, *, runner: Runner = subprocess_runner) -> None:
     if rc != 0:
         raise WorktreeError(
             f"worktree clean failed for {cfg.slug!r}: {_tail(err) or _tail(out)}")
+
+
+def release(primary: Path, slug: str, *, runner: Runner = subprocess_runner,
+            timeout_s: int | None = None) -> None:
+    """Drop a cycle's file claims, keeping its worktree and branch.
+
+    The claims — not the branch — are what a later cycle collides with: while
+    they are live, the next attempt at the same gap rejects with
+    ``worktree_claim_conflict`` after paying for SUGGEST. So this is the verb an
+    operator means by "release": keep the diff for review, hand the files back
+    to the loop.
+
+    It takes the primary and a slug rather than a ``WorktreeConfig`` on purpose.
+    That config *requires* a merge scope, and a release has no scope: a cycle
+    quarantined before its candidate recorded any files still has claims to
+    drop, and demanding a scope here would turn a cleanup into a ValueError.
+    """
+    script = Path(primary) / "scripts" / "mini_ork_worktree.py"
+    rc, out, err = _run_script_at(script, Path(primary), ["release", slug],
+                                  runner=runner, timeout_s=timeout_s)
+    if rc != 0:
+        raise WorktreeError(
+            f"worktree release failed for {slug!r}: {_tail(err) or _tail(out)}")
 
 
 def write_quarantine(record: Mapping[str, Any], *,

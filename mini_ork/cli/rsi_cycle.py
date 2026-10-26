@@ -779,9 +779,6 @@ def _cmd_quarantine(args, root: Path, db: Path) -> int:
             sys.stdout.write("\n".join(lines) + "\n")
         return 0
 
-    # release / clean both need the config: they rebuild worktree policy, and
-    # ``clean`` must not invent a scope the run never had.
-    cfg = _load_config(args, root)
     from mini_ork.rsi import cycle as cycle_mod
 
     con = _open_ledger(db)
@@ -791,6 +788,15 @@ def _cmd_quarantine(args, root: Path, db: Path) -> int:
             raise _SetupError(f"no candidate row for cycle {row['cycle_id']}")
         files = json.loads(candidate.get("files_json") or "[]")
         if action == "release":
+            from mini_ork.rsi.worktree import release
+
+            # Drop the file claims first. They, not the branch, are what the
+            # next cycle collides with — a claim left behind turns a re-attempt
+            # into a `worktree_claim_conflict` rejection after the paid SUGGEST
+            # step, which is precisely the thing "release" exists to prevent.
+            # Deliberately config-free, like `halt`: cleanup must survive the
+            # broken config that made the cycle quarantine in the first place.
+            release(root, row["cycle_id"])
             # Re-open it: the operator is taking the branch, and the next cycle
             # may still re-attempt the gap once the failed-signature TTL lapses.
             ledger.set_candidate_status(
@@ -799,6 +805,9 @@ def _cmd_quarantine(args, root: Path, db: Path) -> int:
         else:
             from mini_ork.rsi.worktree import clean
 
+            # ``clean`` rebuilds the whole worktree policy, so it does parse the
+            # config — and must not invent a scope the run never had.
+            cfg = _load_config(args, root)
             clean(cycle_mod.worktree_config(
                 _operator_request(root, db, cfg), slug=row["cycle_id"], files=files))
     finally:
@@ -807,8 +816,10 @@ def _cmd_quarantine(args, root: Path, db: Path) -> int:
     if action == "release":
         path = _worktree_path(root, row["cycle_id"])
         sys.stdout.write(
-            f"released {candidate['candidate_id']}; branch wt/{row['cycle_id']} kept at {path}\n"
-            f"  merge by hand with: git -C {path} checkout wt/{row['cycle_id']}\n")
+            f"released claims for {row['cycle_id']} and reopened "
+            f"{candidate['candidate_id']}; branch wt/{row['cycle_id']} kept at {path}\n"
+            f"  the next cycle may claim these files again; merge by hand with: "
+            f"git -C {path} checkout wt/{row['cycle_id']}\n")
     else:
         sys.stdout.write(f"cleaned worktree and branch for {row['cycle_id']}\n")
     return 0

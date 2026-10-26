@@ -604,10 +604,27 @@ def test_quarantine_show_without_a_record_is_rc2(root, db, capsys):
     assert "quarantine record missing" in capsys.readouterr().err
 
 
-def test_quarantine_release_reopens_the_candidate(root, db, capsys):
+def test_quarantine_release_drops_the_claims_and_reopens_the_candidate(
+        root, db, capsys, monkeypatch):
+    """Release means "keep the tree, hand the files back" — not just a status flip.
+
+    Two halves, both load-bearing:
+
+    * the file claims go, or the next cycle rejects the same paths with
+      `worktree_claim_conflict` *after* paying for SUGGEST;
+    * the candidate reopens, or the queue keeps filtering it as a failure.
+
+    It must also survive a broken config: cleaning up after a quarantine is
+    exactly when the config that caused it may be unparsable.
+    """
+    from mini_ork.rsi import worktree as wt_mod
     from mini_ork.rsi.candidates import Candidate
 
-    _write_config(root)
+    released: list[str] = []
+    monkeypatch.setattr(wt_mod, "release",
+                        lambda primary, slug, **kw: released.append(slug))
+
+    _write_config(root, "budget: {daily_cap_usd: 'not a number'}\n")
     cand = Candidate.build(domain="verification", source="db:V1",
                            kind="data_path_dead", title="t",
                            evidence_key="table:x:y", now=1)
@@ -626,7 +643,8 @@ def test_quarantine_release_reopens_the_candidate(root, db, capsys):
 
     assert rsi_cycle.main(["quarantine", "release", "rsi-c1"], root=root) == 0
     out = capsys.readouterr().out
-    assert "released" in out and "wt/rsi-c1" in out
+    assert "released claims for rsi-c1" in out and "wt/rsi-c1" in out
+    assert released == ["rsi-c1"]
     con = ledger.connect(str(db))
     try:
         assert ledger.get_candidate(con, cand.candidate_id)["status"] == "open"

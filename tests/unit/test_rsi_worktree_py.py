@@ -33,6 +33,7 @@ from mini_ork.rsi.worktree import (
     claim_and_create,
     clean,
     merge,
+    release,
     revert,
     safe_slug,
     write_quarantine,
@@ -286,6 +287,35 @@ def test_clean_failure_raises(tmp_path):
     cfg = _cfg(tmp_path)
     with pytest.raises(WorktreeError, match="dirty"):
         clean(cfg, runner=FakeRunner().on("clean", cfg.slug, rc=1, err="dirty"))
+
+
+def test_release_asks_the_script_for_claims_only(tmp_path):
+    """`release` must not become a second spelling of `clean`.
+
+    An operator releasing a quarantine wants the claims gone and the tree kept:
+    the branch is evidence, while the claims are what make the next cycle
+    reject the same files with `worktree_claim_conflict`.
+    """
+    cfg = _cfg(tmp_path)
+    fake = FakeRunner()
+    release(cfg.primary, cfg.slug, runner=fake)
+    assert _contains(fake.calls[-1]["argv"], ("release", cfg.slug))
+    assert fake.matching("clean") == []
+
+
+def test_release_does_not_need_a_merge_scope(tmp_path):
+    """A release is about claims; a quarantined cycle may record no files."""
+    _cfg(tmp_path)                       # only for its script stub
+    fake = FakeRunner()
+    release(tmp_path, "rsi-c1", runner=fake)
+    assert _contains(fake.calls[-1]["argv"], ("release", "rsi-c1"))
+
+
+def test_a_failed_release_is_an_error(tmp_path):
+    _cfg(tmp_path)                       # only for its script stub
+    with pytest.raises(WorktreeError, match="release failed"):
+        release(tmp_path, "rsi-c1", runner=FakeRunner().on(
+            "release", "rsi-c1", rc=1, err="no such slug"))
 
 
 # ── revert ─────────────────────────────────────────────────────────────────
