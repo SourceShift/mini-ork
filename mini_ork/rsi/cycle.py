@@ -1298,7 +1298,7 @@ def _default_measure(req: CycleRequest, cand: Candidate, impl: Implementation,
     lint_ok, lint_detail = _lint(wt, changed, req.config.gates.cmd_timeout_s)
     pytest_ok, pytest_detail = _pytest(wt, req, cand, changed)
     static_before, static_after, static_ran = _static_differential(req, wt)
-    gap_before, gap_after = _gap(req, cand, wt)
+    gap_before, gap_after = _gap(req, cand, wt, changed=changed)
     failures_before, failures_after, probes_ran = _probe_differential(req, wt)
     return GateEvidence(
         lint_ok=lint_ok, lint_detail=lint_detail,
@@ -1333,9 +1333,8 @@ def _lint(wt: Path, changed: Sequence[str], timeout_s: int) -> tuple[bool, str]:
 
 def _pytest(wt: Path, req: CycleRequest, cand: Candidate,
             changed: Sequence[str]) -> tuple[bool, str]:
-    """The kickoff's tests plus every ``tests/`` file importing a changed module."""
-    tests = list(req.config.scoped_tests)
-    tests.extend(_importing_tests(req.root, changed, existing=tests))
+    """Every test that can pin this change (see ``_scoped_tests``)."""
+    tests = _scoped_tests(req.root, changed, existing=req.config.scoped_tests)
     if not tests:
         return False, ("no scoped tests: set gates.pytest_paths — an unscoped "
                        "pytest run is the whole suite")
@@ -1344,15 +1343,71 @@ def _pytest(wt: Path, req: CycleRequest, cand: Candidate,
     return rc == 0, "" if rc == 0 else out[-4000:]
 
 
+def _scoped_tests(root: Path, changed: Sequence[str], *,
+                  existing: Sequence[str]) -> list[str]:
+    """The tests that can possibly pin this change.
+
+    Three sources, because each one alone leaves a real hole:
+
+    * the configured ``gates.pytest_paths``;
+    * a changed ``tests/**/test_*.py`` — the test a patch writes is its own pin,
+      and nothing imports a test, so a reverse-import search can never find it;
+    * the one-level reverse-import search below.
+
+    A changed test path that does not exist in this tree is skipped: the base
+    tree does not have a test the patch is about to add, and naming a missing
+    file only turns the run into a no-op error.
+    """
+    tests = list(existing)
+    for path in changed:
+        if _is_test_path(path) and path not in tests and (Path(root) / path).is_file():
+            tests.append(path)
+    tests.extend(_importing_tests(root, changed, existing=tests))
+    return tests
+
+
+def _is_test_path(rel: str) -> bool:
+    name = rel.rsplit("/", 1)[-1]
+    return (rel.startswith("tests/") and name.startswith("test_")
+            and name.endswith(".py"))
+
+
+def _dotted(rel: str) -> str:
+    """``mini_ork/cli/x.py`` -> ``mini_ork.cli.x``; a package's ``__init__`` -> the package."""
+    parts = rel[:-3].split("/") if rel.endswith(".py") else rel.split("/")
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(parts)
+
+
+def _imports_module(text: str, dotted: str) -> bool:
+    """Is ``dotted`` imported by ``text``, in any spelling Python accepts?
+
+    ``import pkg.mod``, ``from pkg.mod import x`` and ``from pkg import mod`` all
+    count. The stem-only substring match this replaced caught none of the dotted
+    forms — for ``mini_ork/cli/execute_handlers.py`` it looked for the literal
+    ``import execute_handlers``, which no real import line contains, so the
+    pinning test was invisible and G6/G8 ran the configured paths alone.
+    """
+    pkg, _, stem = dotted.rpartition(".")
+    forms = [rf"^[ \t]*import[ \t]+{re.escape(dotted)}\b",
+             rf"^[ \t]*from[ \t]+{re.escape(dotted)}[ \t]+import\b"]
+    if pkg:
+        forms.append(rf"^[ \t]*from[ \t]+{re.escape(pkg)}[ \t]+import[^\n]*\b"
+                     rf"{re.escape(stem)}\b")
+    return any(re.search(form, text, flags=re.M) for form in forms)
+
+
 def _importing_tests(root: Path, changed: Sequence[str], *,
                      existing: Sequence[str]) -> list[str]:
-    """One-level reverse import search, by module stem.
+    """One-level reverse import search, by module path.
 
     Structural, not line-based: a test file that imports the changed module by
     name is the pinning test for that module, whatever line it is on.
     """
-    stems = {Path(p).stem for p in changed if p.endswith(".py")}
-    if not stems:
+    modules = {_dotted(p) for p in changed if p.endswith(".py")}
+    modules.discard("")
+    if not modules:
         return []
     tests_dir = Path(root) / "tests"
     if not tests_dir.is_dir():
@@ -1366,7 +1421,7 @@ def _importing_tests(root: Path, changed: Sequence[str], *,
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        if any(f"import {stem}" in text or f"from {stem}" in text for stem in stems):
+        if any(_imports_module(text, module) for module in modules):
             out.append(rel)
     return out
 
@@ -1516,7 +1571,8 @@ def _copy_db(src: Path, target: Path) -> None:
         source.close()
 
 
-def _gap(req: CycleRequest, cand: Candidate, wt: Path) -> tuple[bool | None, bool | None]:
+def _gap(req: CycleRequest, cand: Candidate, wt: Path,
+         changed: Sequence[str] = ()) -> tuple[bool | None, bool | None]:
     """G8's before/after: is this candidate's gap still measurable?
 
     A ``db:<RULE>`` success command re-runs the rule; anything else compares the
@@ -1540,6 +1596,7 @@ def _gap(req: CycleRequest, cand: Candidate, wt: Path) -> tuple[bool | None, boo
         after = _gap_at(req, cand, wt, post=True)
         if before is True and after is True:
             before, after = _exercise_gap(req, cand, base=base, head=wt,
+                                          changed=changed,
                                           before=before, after=after)
     finally:
         _remove_detached(req, base)
@@ -1547,6 +1604,7 @@ def _gap(req: CycleRequest, cand: Candidate, wt: Path) -> tuple[bool | None, boo
 
 
 def _exercise_gap(req: CycleRequest, cand: Candidate, *, base: Path, head: Path,
+                  changed: Sequence[str] = (),
                   before: bool | None, after: bool | None
                   ) -> tuple[bool | None, bool | None]:
     """Re-ask a stuck ``db:<RULE>`` after running the code that should write the row.
@@ -1561,11 +1619,22 @@ def _exercise_gap(req: CycleRequest, cand: Candidate, *, base: Path, head: Path,
     * patched code exercised → the rule must close, because the producer wrote
       the row the gap is about.
 
-    Both sides are required. A patched side alone would credit a base tree that
-    was already writing the row — i.e. a candidate that was never a gap.
+    Three-valued on each side: the rule fired (True), it closed (False), or the
+    side had nothing to run (None). Credit needs ``ran_head is False`` and
+    ``ran_base is not False``:
 
-    Fail-closed: no scoped tests, an unreadable copy, a tree that cannot be the
-    rule's root, or an error at either side leaves the copy's verdict untouched.
+    * ``ran_base is False`` — the base tree's own code closes the gap when
+      exercised, so there was never a gap. Never credit.
+    * ``ran_base is None`` — the base tree has no test to run, which is the
+      ordinary shape when the patch *adds* its pinning test. Base history is
+      fixed before the child starts, so its having no writer test is a fact
+      about the code, not a choice the implementer made; and ``before`` is
+      already True from the rule reading real rows. Refusing to credit here
+      would make every producer fix whose test the patch writes unmeasurable —
+      which is cycle 15's shape.
+
+    Fail-closed: an unreadable copy, a tree that cannot be the rule's root, or
+    an error at either side leaves the copy's verdict untouched.
     """
     from .probes import SYNTHETIC_PREFIX
 
@@ -1573,23 +1642,33 @@ def _exercise_gap(req: CycleRequest, cand: Candidate, *, base: Path, head: Path,
     if not command.startswith(SYNTHETIC_PREFIX):
         return before, after
     try:
-        ran_base = _exercise_once(req, cand, base, side="base")
-        ran_head = _exercise_once(req, cand, head, side="post")
+        ran_base = _exercise_once(req, cand, base, changed=changed, side="base")
+        ran_head = _exercise_once(req, cand, head, changed=changed, side="post")
     except (OSError, sqlite3.Error):
         return before, after
-    if ran_base is True and ran_head is False:
+    if ran_head is False and ran_base is not False:
         return True, False
     return before, after
 
 
 def _exercise_once(req: CycleRequest, cand: Candidate, root: Path, *,
-                   side: str) -> bool | None:
-    """Exercise one tree's scoped tests against a DB copy, then re-ask the rule."""
+                   changed: Sequence[str] = (), side: str) -> bool | None:
+    """Exercise one tree's scoped tests against a DB copy, then re-ask the rule.
+
+    The test set is ``_scoped_tests``, the same one G6 requires to pass: the
+    candidate's declared files are the hint, and the patch's own changed files
+    (when the caller has them) add the test it wrote.
+    """
     from .probes import SYNTHETIC_PREFIX, run_synthetic
 
     rule = (cand.success_command or "")[len(SYNTHETIC_PREFIX):]
-    tests = list(req.config.scoped_tests)
-    tests.extend(_importing_tests(root, cand.files, existing=tests))
+    roots = tuple(dict.fromkeys((*changed, *cand.files)))
+    tests = _scoped_tests(root, roots, existing=req.config.scoped_tests)
+    # pytest aborts the *whole* run with rc 4 when one named path is missing,
+    # and this arm ignores rc — so one absent path would silently leave the
+    # rule red and the arm inert. A test the patch adds cannot exist on the
+    # base tree; that is a fact about the tree, not a reason to run nothing.
+    tests = [t for t in tests if (Path(root) / t).is_file()]
     if not tests:
         return None
     src = _post_db(req, root) if side == "post" else _measured_db(req)

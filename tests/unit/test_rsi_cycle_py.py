@@ -1235,14 +1235,15 @@ def _l3_candidate() -> Candidate:
         signature="sig-l3", first_seen_at=NOW)
 
 
-def _producer_tree(root: Path, *, writes_held_out: bool) -> Path:
+def _producer_tree(root: Path, *, writes_held_out: bool,
+                   test_name: str = "test_x.py") -> Path:
     """A tree whose scoped test either does or does not hold a lesson out."""
     (root / "db" / "migrations").mkdir(parents=True, exist_ok=True)
     (root / "db" / "migrations" / "0099_noop.sql").write_text(
         "CREATE TABLE IF NOT EXISTS noop_1499 (id INTEGER);", encoding="utf-8")
     (root / "tests" / "unit").mkdir(parents=True, exist_ok=True)
     if writes_held_out:
-        (root / "tests" / "unit" / "test_x.py").write_text(
+        (root / "tests" / "unit" / test_name).write_text(
             "import os, sqlite3\n\n\n"
             "def test_the_injector_holds_one_out():\n"
             "    con = sqlite3.connect(os.environ['MINI_ORK_DB'])\n"
@@ -1313,6 +1314,78 @@ def test_the_producer_arm_is_inert_without_scoped_tests(tmp_path):
 
     assert cycle_mod._exercise_gap(req, _l3_candidate(), base=base, head=head,
                                    before=True, after=True) == (True, True)
+
+
+def test_a_dotted_import_makes_a_test_the_pinning_test(tmp_path):
+    """The reverse-import search looked for the literal ``import <stem>``.
+
+    For ``mini_ork/cli/execute_handlers.py`` that is ``import execute_handlers``,
+    which neither ``import mini_ork.cli.execute_handlers`` nor
+    ``from mini_ork.cli.execute_handlers import x`` — the two spellings a real
+    test uses — contains. So the pinning test was invisible and G6/G8 silently
+    ran the configured paths alone, passing on a set that omitted the change.
+    """
+    tests = tmp_path / "tests" / "unit"
+    tests.mkdir(parents=True)
+    (tests / "test_dotted.py").write_text("import mini_ork.cli.execute_handlers\n")
+    (tests / "test_from_module.py").write_text(
+        "from mini_ork.cli.execute_handlers import record\n")
+    (tests / "test_from_package.py").write_text(
+        "from mini_ork.cli import execute_handlers\n")
+    (tests / "test_unrelated.py").write_text("import os\n")
+
+    found = cycle_mod._importing_tests(
+        tmp_path, ("mini_ork/cli/execute_handlers.py",), existing=())
+
+    assert sorted(found) == ["tests/unit/test_dotted.py",
+                             "tests/unit/test_from_module.py",
+                             "tests/unit/test_from_package.py"]
+
+
+def test_a_changed_test_is_its_own_pinning_test(tmp_path):
+    """Nothing imports a test, so the reverse-import search can never find the
+    test a patch writes — and that test is precisely the pin for the change."""
+    unit = tmp_path / "tests" / "unit"
+    unit.mkdir(parents=True)
+    (unit / "test_new.py").write_text("def test_x():\n    assert True\n")
+
+    found = cycle_mod._scoped_tests(
+        tmp_path, ("mini_ork/thing.py", "tests/unit/test_new.py"),
+        existing=("tests/unit/test_given.py",))
+
+    assert found == ["tests/unit/test_given.py", "tests/unit/test_new.py"]
+
+
+def test_the_producer_arm_runs_the_test_the_patch_added(tmp_path):
+    """Cycle 15's shape: the fix is a producer plus the test it writes.
+
+    That test exists only in the patched tree, so the candidate's declared scope
+    cannot name it and the base side must stay red. The patch's own changed
+    files have to carry it into the exercise, or a correct fix reads
+    ``metric_unchanged``.
+    """
+    db = tmp_path / "state.db"
+    _seed_l3_gap(db)
+    # A scoped path that exists in neither tree, so only the patch's own files
+    # can name the writer test.
+    req = CycleRequest(root=tmp_path, db=db, cycle_id="rsi-ctest",
+                       config=_cfg(gates={"pytest_paths": ["tests/unit/test_absent.py"]}))
+    assert cycle_mod._freeze_db(req) is not None
+    cand = _l3_candidate()
+    added = "tests/unit/test_held_out_writer.py"
+
+    base = _producer_tree(tmp_path / "base", writes_held_out=False,
+                          test_name="test_held_out_writer.py")
+    head = _producer_tree(tmp_path / "head", writes_held_out=True,
+                          test_name="test_held_out_writer.py")
+
+    assert cycle_mod._exercise_gap(req, cand, base=base, head=head,
+                                   before=True, after=True) == (True, True), (
+        "nothing names the new test, so the arm has nothing to run")
+
+    assert cycle_mod._exercise_gap(req, cand, base=base, head=head,
+                                   changed=("mini_ork/learning/ledger.py", added),
+                                   before=True, after=True) == (True, False)
 
 
 # --------------------------------------------------------------------------

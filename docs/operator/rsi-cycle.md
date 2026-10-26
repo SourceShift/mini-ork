@@ -66,7 +66,7 @@ what `rsi-cycle show` prints and what the quarantine record keeps.
 | G3 | `frozen_paths` | the diff touches a frozen path |
 | G4 | `scope` | the diff escapes the kickoff scope or exceeds `gates.max_files` |
 | G5 | `lint` | ruff `F,E9` fails on a changed `.py` |
-| G6 | `pytest_scoped` | the scoped set, or any test importing a changed module, fails |
+| G6 | `pytest_scoped` | the scoped set — configured paths, a test the patch itself changes, or any test importing a changed module — fails |
 | G7 | `static_differential` | `validate --strict`/`garden` findings grew (`post ⊄ pre`) |
 | G8 | `success_metric` | the candidate's own success predicate did not flip, or the rule could not answer at all |
 | G9 | `no_new_probe_failures` | probe failures grew versus before the change |
@@ -90,6 +90,16 @@ the patched tree closes, i.e. only the new code wrote the row. And a predicate
 that cannot answer at all (an absent table, an empty input, a dropped column)
 is recorded as *unmeasured*, not as fixed — reading an error as "no finding"
 was a way to walk a broken schema through this gate.
+
+**The scoped set is what the change can actually be pinned by.** Configured
+`gates.pytest_paths` are always in; so is every `tests/**/test_*.py` the patch
+touches (nothing imports a test, so only its own path can name it); so is every
+test that imports a changed module, matched on the module *path*
+(`from mini_ork.cli import execute_handlers`, `import mini_ork.cli.execute_handlers`,
+`from mini_ork.cli.execute_handlers import x`). A stem-only match once missed the
+dotted forms, so the pinning test silently never ran. On the base tree, paths
+that do not exist are skipped rather than named: pytest aborts the entire run
+when one named path is missing, and a test the patch adds cannot exist there.
 
 ## Config
 
