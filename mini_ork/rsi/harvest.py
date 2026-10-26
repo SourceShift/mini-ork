@@ -973,12 +973,28 @@ def _v1_confidence_never_recorded(ctx: _Ctx, domain: str, rule_id: str) -> list[
         kind="data_path_dead",
         title="verifier_results.confidence is never recorded",
         evidence_key="table:verifier_results:confidence:null",
-        files=("mini_ork/gates/verifier_rubric.py",),
+        files=("mini_ork/gates/verifier_rubric.py", "mini_ork/cli/execute_handlers.py"),
         detail=f"{ratio:.1%} of {total} results have NULL confidence; escalation has no "
                "uncertainty signal to threshold on.",
         evidence={"table": "verifier_results", "rows": total, "null_ratio": round(ratio, 4)},
         reach=total,
-        fix_hint="Record the verifier's confidence wherever verdicts are written.",
+        # The value cannot be *plumbed* into existence: no verifier prints a
+        # numeric confidence in its verdict envelope today, so a patch that only
+        # forwards a field writes NULL forever and a test that writes rows
+        # directly passes the success metric without the live table moving.
+        # Cycle 15 (2026-10-26) was exactly that patch, and the panel split on
+        # it: "after this merge every production verifier_results row is still
+        # NULL, because nothing in the corpus emits the top-level 'confidence'
+        # the new reader looks for". The hint therefore names both ends and the
+        # one shortcut that looks like a fix.
+        fix_hint=(
+            "Make a production verifier path emit a numeric confidence in its verdict "
+            "envelope and forward it into verifier_result_record. Today none does, so "
+            "wiring the reader alone changes nothing: the value must be produced by the "
+            "code path a real run takes - measured from the verifier's own evidence "
+            "(e.g. agreement across the scored axes it already stores), never a "
+            "constant, a default, or a value invented to fill the column. A test that "
+            "writes rows directly does not close this gap."),
         success_metric="confidence null ratio falls below 0.99",
     )]
 

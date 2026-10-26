@@ -450,6 +450,29 @@ def test_v1_needs_a_large_enough_sample(tmp_path, con):
     assert one(report(tmp_path, con), "db:V1").evidence["rows"] == 110
 
 
+def test_v1_fix_hint_names_the_producer_not_just_the_reader(tmp_path, con):
+    """A NULL column cannot be plumbed into existence.
+
+    Cycle 15 (2026-10-26) read this hint as "forward whatever confidence the
+    envelope carries" and the panel split on the result: no verifier in the
+    corpus emits one, so the live table stayed 100% NULL and the cycle had
+    bought a reader for a field nothing writes. The reach covers the write path
+    so the child is pointed at both ends, and the hint names the two shortcuts
+    that pass a synthetic metric without moving the live table.
+    """
+    ddl(con, "CREATE TABLE verifier_results (confidence REAL);")
+    con.executemany("INSERT INTO verifier_results VALUES (NULL)", [()] * 110)
+    con.commit()
+    cand = one(report(tmp_path, con), "db:V1")
+
+    assert "mini_ork/cli/execute_handlers.py" in cand.files, (
+        "the write path must be in scope or the patch can only add a reader")
+    hint = cand.fix_hint.lower()
+    assert "emit" in hint and "envelope" in hint
+    assert "never a constant" in hint
+    assert "test" in hint, "the hint must rule out the test-only writer"
+
+
 def test_v6_fires_on_pending_count_and_on_age(tmp_path, con):
     ddl(con, "CREATE TABLE mo_inbox_gates (status TEXT, enqueued_at INTEGER);")
     con.executemany("INSERT INTO mo_inbox_gates VALUES ('pending', ?)", [(NOW - DAY,)] * 12)
