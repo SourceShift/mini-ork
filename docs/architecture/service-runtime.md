@@ -565,8 +565,10 @@ Rules:
   decides; a second deploy joins what the first created and never re-creates
   it. The caller never runs Docker commands.
 - **Removal is explicit and idempotent.** `DELETE /v1/networks/{name}` inspects
-  first and answers `removed: false` when the network is already gone, so the
-  control plane can retry a teardown after a partial success. Docker refuses to
+  first and answers `removed: false` when the network is already gone — before
+  the inspect *or* between the inspect and the `rm`, so two callers tearing
+  down one environment cannot turn the loser into a `502`. The control plane
+  can retry a teardown after a partial success. Docker refuses to
   remove a network with attached containers; that is `409`, not an outage — the
   caller removes services first and retries. Any other daemon refusal is `502`.
   The node never sweeps: it removes the name it was given and nothing else,

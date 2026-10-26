@@ -28,6 +28,7 @@ Contract (all routes are bearer-authed by the node-agent):
     GET    /v1/services/{sid}/volumes/{name}/snapshots/{snap}/blob
     PUT    /v1/services/{sid}/volumes/{name}/snapshots/{snap}/blob
     POST   /v1/services/{sid}/volumes/{name}/restore
+    DELETE /v1/networks/{name}        remove an environment network
 
 Storage: ``<state_dir>/services.json``. Env **values** are never written to
 disk — only the key names. A create request carries the values in memory and
@@ -1468,7 +1469,7 @@ class ServiceManager:
         down. The name is held to the same leaf shape as on create, so it can
         never reach ``docker network rm`` as a flag or a path.
         """
-        if not isinstance(name, str) or not _NETWORK_NAME_RE.match(name):
+        if not isinstance(name, str) or not _NETWORK_NAME_RE.fullmatch(name):
             raise ServiceError(f"invalid network name {name!r}")
         result = self._run(["docker", "network", "inspect", name])
         if int(getattr(result, "returncode", 1)) != 0:
@@ -1478,6 +1479,12 @@ class ServiceManager:
             stderr = (getattr(result, "stderr", "") or "").strip()
             stdout = (getattr(result, "stdout", "") or "").strip()
             detail = stderr or stdout or f"exit {result.returncode}"
+            # The inspect and the rm are two calls: a control plane deleting a
+            # whole environment can remove the same network twice, and a peer
+            # can win the race between them. "Gone" is the answer the caller
+            # asked for, so treat the second one as already removed.
+            if "no such network" in detail.lower() or "not found" in detail.lower():
+                return False
             if "active endpoints" in detail:
                 raise NetworkInUseError(
                     f"network {name!r} still has attached containers: {detail}"

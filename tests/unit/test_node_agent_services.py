@@ -117,6 +117,12 @@ class _Docker:
 
         if argv[:3] == ["docker", "network", "rm"]:
             name = argv[-1]
+            if self.fail_network_rm == "vanished":
+                # Inspect saw it; a concurrent delete removed it first.
+                self.networks.discard(name)
+                r.returncode = 1
+                r.stderr = f"Error response from daemon: network {name} not found"
+                return r
             if self.fail_network_rm == "in_use":
                 r.returncode = 1
                 r.stderr = (
@@ -1819,6 +1825,9 @@ def test_delete_network_removes_an_empty_network(client, docker):
         json=_spec(network=NETWORK, network_aliases=["db"]),
         headers=AUTH,
     )
+    # Docker only removes a network once nothing is attached, so the teardown
+    # order is services first, network second.
+    assert client.delete("/v1/services/web", headers=AUTH).status_code == 200
     assert NETWORK in docker.networks
 
     r = client.delete(f"/v1/networks/{NETWORK}", headers=AUTH)
@@ -1839,6 +1848,35 @@ def test_delete_network_is_idempotent_when_it_is_already_gone(client, docker):
     assert docker.network_removes == []
     assert ["docker", "network", "inspect", NETWORK] in docker.calls
     assert ["docker", "network", "rm", NETWORK] not in docker.calls
+
+
+def test_a_network_that_vanishes_between_inspect_and_rm_is_already_removed(
+    client, docker
+):
+    client.post(
+        "/v1/services",
+        json=_spec(network=NETWORK, network_aliases=["db"]),
+        headers=AUTH,
+    )
+    docker.fail_network_rm = "vanished"
+
+    r = client.delete(f"/v1/networks/{NETWORK}", headers=AUTH)
+
+    # Two callers tearing down one environment race here. The loser asked for
+    # the network to be gone and it is gone, so this is not a 502.
+    assert r.status_code == 200, r.text
+    assert r.json() == {"name": NETWORK, "removed": False}
+
+
+def test_remove_network_refuses_a_name_with_a_trailing_newline(tmp_path, docker):
+    # ``$`` matches before a final newline; a fullmatch is what keeps the
+    # argv to the leaf shape the create path assumes.
+    from mini_ork.remote.node_agent.services import ServiceError, ServiceManager
+
+    manager = ServiceManager(state_dir=tmp_path, _run_fn=docker)
+    with pytest.raises(ServiceError):
+        manager.remove_network(f"{NETWORK}\n")
+    assert docker.calls == []
 
 
 def test_delete_network_with_containers_attached_is_409(client, docker):
