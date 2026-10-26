@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 from typing import Optional
 
 __all__ = [
@@ -71,6 +72,16 @@ _VAR_REF = re.compile(r"\$\{(\w+)\}|\$(\w+)")
 #: A word carrying a variable, placeholder, glob or brace is not a literal
 #: path: the rule cannot know which file it names, so it must not veto it.
 _UNRESOLVED_WORD = re.compile(r"\S*[$<>*?{}]\S*")
+
+#: A flag whose *operand is a program body*, not a shell word. The inline
+#: program is source code for another interpreter: a path fragment inside it
+#: (``R + '/proposal.json'``) or a substring test (``'routing.py' in summary``)
+#: is not a file this command names. Reading one as shell arguments invented
+#: five absent paths on a single rsi-cycle run and vetoed a healthy plan.
+#: Only an interpreter's own code flag is skipped — `tar -c` names a file.
+_INLINE_CODE = re.compile(r"^(?:-[ce]|--eval|--exec)$")
+_INTERPRETER = re.compile(
+    r"^(?:python[\d.]*|node|nodejs|perl|ruby|deno|bun|Rscript|pwsh)$")
 
 
 def _git(workspace: str, args: list[str], *, timeout: int = 30):
@@ -191,6 +202,42 @@ def _expand_refs(text: str, env: dict) -> str:
     return _VAR_REF.sub(repl, text)
 
 
+def _without_inline_programs(words: list[str]) -> list[str]:
+    """Drop the operand of an interpreter's ``-c`` / ``-e``: it is code, not shell.
+
+    Only the single word after the flag goes. Arguments that follow it are still
+    shell words the command really passes, so a plan that hands a path to an
+    inline program is still checked on that path.
+    """
+    out: list[str] = []
+    skip = False
+    for word in words:
+        if skip:
+            skip = False
+            continue
+        out.append(word)
+        if (len(out) >= 2 and _INLINE_CODE.match(word)
+                and _INTERPRETER.match(os.path.basename(out[-2]))):
+            skip = True
+    return out
+
+
+def _shell_visible(command: str) -> str:
+    """``command`` with inline program bodies removed; unchanged when unparseable.
+
+    ``shlex`` is what makes the operand boundaries real: it knows that the body
+    of ``python3 -c "import json; …"`` is one word even when it holds quotes and
+    semicolons. A command the shell itself could not split is left whole — the
+    rule has no better reading of it than it had before, so it keeps the old one
+    rather than inventing a new opinion on malformed input.
+    """
+    try:
+        words = shlex.split(command, comments=False, posix=True)
+    except ValueError:
+        return command
+    return " ".join(_without_inline_programs(words))
+
+
 def _command_paths(plan: dict, env: dict | None = None) -> list[str]:
     """Path-shaped tokens from the plan's verifier commands and verifier names."""
     commands: list[str] = []
@@ -210,10 +257,13 @@ def _command_paths(plan: dict, env: dict | None = None) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
     for command in commands:
-        # Resolve the variables we can, then drop where-outputs before looking
-        # for where-inputs, then drop the words we cannot read at all.
+        # Resolve the variables we can, drop inline program bodies (their
+        # contents are another interpreter's source, not shell words), then
+        # drop where-outputs before looking for where-inputs, then drop the
+        # words we cannot read at all.
         expanded = _expand_refs(command, env or {})
-        scrubbed = _REDIRECT.sub(" ", _ASSIGN_FLAG.sub(" ", expanded))
+        scrubbed = _REDIRECT.sub(" ", _ASSIGN_FLAG.sub(
+            " ", _shell_visible(expanded)))
         scrubbed = _UNRESOLVED_WORD.sub(" ", scrubbed)
         for token in _PATH_TOKEN.findall(scrubbed):
             if token not in seen:

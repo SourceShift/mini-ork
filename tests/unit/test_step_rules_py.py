@@ -207,6 +207,41 @@ def test_success_verifiers_are_checked_too(ws, tmp_path):
     assert "verifiers/absent-check.py" in detail
 
 
+def test_an_inline_program_is_not_read_as_a_list_of_paths(ws, tmp_path):
+    """The shape that failed a live run: three `python3 -c` checks, no real paths.
+
+    Reading the program body as shell words turned `R + '/proposal.json'` into
+    the absolute path `/proposal.json` and the assertion `'routing.py' in …`
+    into a missing file, so the rule reported five absent paths for a plan whose
+    only real named paths all existed. A rule that vetoes good work while
+    looking healthy is the decay the module's docstring warns about.
+    """
+    (ws / "tests").mkdir()
+    (ws / "tests" / "test_m.py").write_text("def test_x():\n    assert True\n")
+    plan = _plan(tmp_path, command=(
+        "python3 -c \"import json,os;R=os.environ['MINI_ORK_RUN_DIR'];"
+        "p=json.load(open(R+'/proposal.json'))\""))
+    verdict, detail = sr.rule_named_test_path_exists(plan, str(ws), str(REPO))
+    assert verdict != "fail", detail
+    assert "/proposal.json" not in detail and "routing.py" not in detail
+
+
+def test_an_inline_program_does_not_hide_the_paths_around_it(ws, tmp_path):
+    """Only the program operand is skipped; a path passed to it is still checked."""
+    plan = _plan(tmp_path, command=(
+        "python3 -c \"print(1)\" tests/unit/test_ghost.py"))
+    verdict, detail = sr.rule_named_test_path_exists(plan, str(ws), str(REPO))
+    assert verdict == "fail"
+    assert "tests/unit/test_ghost.py" in detail
+
+
+def test_a_code_flag_on_a_non_interpreter_keeps_its_file(ws, tmp_path):
+    """`-c` is only a program body when an *interpreter* owns it, not for `tar -c`."""
+    (ws / "input.json").write_text("{}")
+    plan = _plan(tmp_path, command="tar -c input.json")
+    assert sr.rule_named_test_path_exists(plan, str(ws), str(REPO))[0] == "pass"
+
+
 def test_a_recipe_verifier_resolves_the_way_the_dispatcher_resolves_it(ws, tmp_path,
                                                                        monkeypatch):
     """`verifiers/typecheck.py` lives under `recipes/<recipe>/verifiers`, not the root.
