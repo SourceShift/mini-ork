@@ -45,6 +45,9 @@ In `mini_ork/cli/epics.py`:
 ## Files in scope (touch ONLY these)
 
 - `mini_ork/cli/epics.py`
+- `mini_ork/scheduler.py` (add the `priority` column to `_RETRY_COLUMNS` so
+  the scheduler's own schema bootstrap creates it; never patch it from
+  `epics.py`)
 - `tests/unit/test_eco6_k12_epics_archive.py` (new)
 
 ## Tests (`tests/unit/test_eco6_k12_epics_archive.py`, hermetic tmp DB)

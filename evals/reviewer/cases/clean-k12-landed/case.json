@@ -12,5 +12,5 @@
     "keywords": []
   },
   "added_at": "2026-10-26",
-  "notes": ""
+  "notes": "kickoff.md is the eco6 K12 kickoff with mini_ork/scheduler.py added to its scope: the landed operator fix (69c1122d) moved the priority column into the scheduler, so the original scope made a correct change look out of scope (first eval, 2026-10-26)"
 }
