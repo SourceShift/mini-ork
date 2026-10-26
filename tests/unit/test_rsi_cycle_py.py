@@ -681,6 +681,39 @@ def test_a_full_harvest_marks_a_vanished_candidate_fixed_externally(world):
     assert _candidate_row(world.db)["status"] == "fixed_externally"
 
 
+def test_a_dead_cycles_row_stops_claiming_its_candidate(world):
+    """Holding the lease proves no peer is alive; a 'running' row then is a corpse.
+
+    ``view.claimed_ids`` reads ``status = 'running'``, so a killed process vetoes
+    its own gap from every later queue. Cycle 5 died on a transient ledger error
+    after ten green gates and would otherwise have blocked its candidate forever.
+    """
+    dead = _cand()
+    L = cycle_mod.ledger
+    con = sqlite3.connect(str(world.db))
+    try:
+        L.upsert_candidate(con, dead, now=NOW - 60)
+        con.execute(
+            "INSERT INTO rsi_cycles (cycle_id, started_at, mode, status, candidate_id,"
+            " lease_token) VALUES ('rsi-dead', ?, 'once', 'running', ?, 'tok')",
+            (NOW - 60, dead.candidate_id))
+        con.commit()
+    finally:
+        con.close()
+
+    h = Harness(world, dead)
+    h.run(cycle_id="rsi-ctest-1")
+
+    con = sqlite3.connect(str(world.db))
+    try:
+        row = con.execute("SELECT status, halt_reason FROM rsi_cycles"
+                          " WHERE cycle_id = 'rsi-dead'").fetchone()
+    finally:
+        con.close()
+    assert row == ("error", "stale_process")
+    assert "propose" in h.calls, "the retired row must not keep the candidate out of the queue"
+
+
 def test_a_closed_rule_still_reconciles(world):
     """A rule that answered "not here" measured its tables; it is not a blind spot.
 

@@ -284,6 +284,7 @@ def run_cycle(req: CycleRequest, *, runtime: Runtime | None = None) -> CycleOutc
     try:
         con = ledger.connect(str(req.db))
         if not req.dry_run:
+            _retire_stale_runs(con, req, rt.clock())
             ledger.start_cycle(con, cycle_id=req.cycle_id, now=rt.clock(),
                                mode=req.config.mode, dry_run=False)
         return _body(req, rt, con, token=token, spend=spend)
@@ -1341,6 +1342,28 @@ def _freeze_db(req: CycleRequest) -> Path | None:
     except (OSError, sqlite3.Error):
         return None
     return target
+
+
+def _retire_stale_runs(con: sqlite3.Connection, req: CycleRequest, now: int) -> int:
+    """Retire ``running`` rows left by cycles that died without finishing.
+
+    Holding the lease is the proof nobody else is alive, so any other ``running``
+    row is a corpse. It matters beyond tidiness: ``view.claimed_ids`` reads
+    exactly ``status = 'running'``, so a killed process keeps its candidate out of
+    every future queue — cycle 5 died on a transient ledger error and would have
+    vetoed its own gap forever.
+
+    The row is retired, not deleted: the ledger must still say a cycle started and
+    died.
+    """
+    cursor = con.execute(
+        "UPDATE rsi_cycles SET status = 'error', halt_reason = 'stale_process',"
+        " finished_at = COALESCE(finished_at, ?)"
+        " WHERE status = 'running' AND cycle_id != ?",
+        (int(now), req.cycle_id),
+    )
+    con.commit()
+    return cursor.rowcount or 0
 
 
 def _blind_sources(report: HarvestReport) -> list[str]:
