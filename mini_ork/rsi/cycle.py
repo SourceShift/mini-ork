@@ -412,6 +412,15 @@ def _body(req: CycleRequest, rt: Runtime, con, *, token: str, spend: float) -> C
     evidence = _evidence(req, report, cand, impl, selection, measurement, spend)
     first = evaluate(evidence)
 
+    # G10 is the last of eleven ANDed gates, so a panel verdict cannot rescue a
+    # cycle some other gate already failed — the merge decision is identical
+    # either way. Cycle 12 (2026-10-26) bought a critic panel after G8 had
+    # already failed and quarantined for the same reason; the panel is the most
+    # expensive part of VALIDATE, so the dead cycle must not pay for it.
+    deterministic = ValidationReport(tuple(r for r in first.results if r.gate != "G10"))
+    if not deterministic.passed:
+        return _quarantine(req, rt, con, cand, impl, deterministic, "gate_failed")
+
     raw = (rt.critics or _default_critics)(req, cand, impl, selection, first)
     evidence = _with_critics(evidence, raw)
     report_final = evaluate(evidence)

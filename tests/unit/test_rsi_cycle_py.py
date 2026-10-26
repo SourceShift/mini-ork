@@ -14,6 +14,7 @@ tests are its brakes.
 """
 from __future__ import annotations
 
+import json
 import shutil
 import sqlite3
 import subprocess
@@ -309,6 +310,29 @@ def test_a_red_gate_quarantines_instead_of_merging(world):
     assert row["status"] == "quarantined"
     assert "lint_failed" in row["quarantine_reason"]
     assert row["quarantine_path"].endswith("rsi-ctest.json")
+
+
+def test_a_red_deterministic_gate_does_not_buy_a_critic_panel(world):
+    """G10 is ANDed last: a panel on an already-failed cycle cannot change the verdict.
+
+    Cycle 12 (2026-10-26) paid for one after G8 had already reported
+    ``metric_unchanged`` — the most expensive stage of VALIDATE, spent on a
+    decision that was already made. The ledger must also not claim G10 ran.
+    """
+    h = Harness(world)
+    h.measurement_overrides = {"gap_before": True, "gap_after": True}
+    out = h.run()
+
+    assert out.status == "quarantined"
+    assert "metric_unchanged" in out.detail
+    assert "critics" not in h.calls, "a failed cycle must not buy a panel"
+    assert h.calls[-1] == "quarantine"
+
+    row = _cycle(world.db)
+    assert "metric_unchanged" in row["quarantine_reason"]
+    gates = json.loads(row["gates_json"])
+    assert "G10" not in {g["gate"] for g in gates["gates"]}, (
+        "G10 was never run, so it must not appear as a failed gate")
 
 
 def test_quarantine_keeps_the_worktree_by_default(world):
