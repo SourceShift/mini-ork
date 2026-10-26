@@ -26,6 +26,14 @@ Hard requirements, checked mechanically after you:
   lens made a specific case for a stricter registered one.
 - `do_not_touch` must include anything that measures the gap — the gate code,
   frozen config, or the tests that define success.
+- Never invent a value the gap says is absent. When the gap is "this signal is
+  missing", the fix must record the real value where one exists and the absence
+  where none does — NULL, or the column's own "unresolved" marker. Do not derive
+  a plausible substitute from a neighbouring field: on a fused dispatch `model`
+  is the comma-joined chain of lanes, so its first element is the lane tried
+  first, not the lane that served — and on a pre-spawn refusal or a dispatcher
+  crash nothing served at all. An inferred attribution is indistinguishable
+  downstream from a measured one, which makes it worse than the missing column.
 
 Write one JSON object to the requested output path, no fences:
 

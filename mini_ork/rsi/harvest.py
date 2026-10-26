@@ -919,8 +919,17 @@ def _r8_llm_calls_no_lane(ctx: _Ctx, domain: str, rule_id: str) -> list[Candidat
                "Per-lane cost, win-rate and routing credit are then unattributable.",
         evidence={"table": "llm_calls", "column": "lane", "rows": rows},
         reach=rows,
-        fix_hint="Add a lane column and write it from the dispatch path that already "
-                 "resolves the lane.",
+        # The hint says which lane to write *when there is one* on purpose. Cycle
+        # 12's proposal read the old wording ("write it from the dispatch path")
+        # as licence to stamp the first entry of the fused ``model`` chain onto
+        # refusal and crash rows, and the critic panel split on it — correctly: a
+        # fused chain names the lanes that were tried, and a refusal or a
+        # dispatcher crash means nothing served at all.
+        fix_hint="Add a nullable lane column and write the lane the dispatch actually "
+                 "resolved. Where no lane resolved — a fused chain, a pre-spawn refusal, "
+                 "a dispatcher crash — the lane is genuinely unknown: write NULL. Never "
+                 "infer one from the model string; an invented attribution cannot be "
+                 "told apart from a measured one downstream.",
         success_metric="llm_calls has a lane column and new rows populate it",
     )]
 

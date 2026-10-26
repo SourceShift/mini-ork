@@ -98,6 +98,19 @@ def test_llm_calls_without_a_lane_column_is_a_routing_gap(tmp_path, con):
     assert "R8" not in rep.skipped and rep.harvest_ok is True
 
 
+def test_r8_fix_hint_forbids_inventing_a_lane(tmp_path, con):
+    # Cycle 12 (2026-10-26) quarantined on a critic split caused by this hint:
+    # the old wording said where to *get* a lane but not what to write when none
+    # was resolved, so the child stamped the first entry of the fused ``model``
+    # chain onto refusal and crash rows. The hint travels into the cycle brief,
+    # which every lens and the synthesizer read, so it is part of the contract.
+    ddl(con, "CREATE TABLE llm_calls (id INTEGER, cost_usd REAL)")
+    cand = one(report(tmp_path, con), "db:R8")
+    hint = cand.fix_hint.lower()
+    assert "null" in hint
+    assert "infer" in hint
+
+
 def test_llm_calls_with_a_lane_column_is_healthy(tmp_path, con):
     ddl(con, "CREATE TABLE llm_calls (id INTEGER, lane TEXT)")
     assert "R8" in report(tmp_path, con).closed
