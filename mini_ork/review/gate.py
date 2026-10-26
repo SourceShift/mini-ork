@@ -356,6 +356,29 @@ def _print_lens_runs(review_id: int, db: Path) -> None:
         return
 
 
+def _llm_lenses_all_failed(review_id: int, db: Path) -> tuple[bool, int]:
+    """``(True, n)`` when the review recorded lens runs and none succeeded.
+
+    ``n`` is the number of lens rows. A review with no lens rows — or a DB
+    without the ``review_lens_runs`` table — reports ``(False, 0)``: absence of
+    evidence is not the same as evidence that every lens failed.
+    """
+    try:
+        rows = _lens_runs(review_id, db)
+    except Exception:  # noqa: BLE001 — evidence must not flip the decision
+        return False, 0
+    if not rows:
+        return False, 0
+    return (not any(status == "ok" for _, status, _, _ in rows)), len(rows)
+
+
+def _no_llm_lens_warning(n: int) -> None:
+    print(
+        f"pre-push review: ⚠ no LLM lens ran (all {n} failed); "
+        "this verdict rests on heuristics only"
+    )
+
+
 _BLOCK_HINT = (
     "pre-push review: blocking findings — dismiss one with: "
     "mini-ork review resolve <fingerprint> --as dismissed --reason \"<why>\""
@@ -511,6 +534,12 @@ def run_gate(
                 for key, value in merged.items()
                 if key.startswith("MO_REVIEW_")
             }
+            # The dispatch the review triggers resolves its own home; from a
+            # linked worktree that is the primary checkout, not the worktree.
+            # Pass it explicitly so a lane preflight (GLM_API_KEY from
+            # ``<home>/config/local.sh``) cannot fail in 0 ms.
+            if not merged.get("MINI_ORK_HOME"):
+                overrides["MINI_ORK_HOME"] = str(resolve_home(cwd, merged))
             with scoped_environ(overrides):
                 review_id = int(
                     (review_fn or review_run)(
@@ -538,6 +567,33 @@ def run_gate(
         return _unavailable(
             f"{type(exc).__name__}: {exc}", cwd=cwd, env=merged, target=target
         )
+
+    # A hybrid review whose every LLM lens failed is indistinguishable from a
+    # clean one on the verdict alone. Say so, and in the secure tier refuse to
+    # let heuristics alone approve the push. Applies to a cache hit too: the
+    # cached review's lens rows are what the warning is about.
+    if mode == "hybrid":
+        all_failed, lens_count = _llm_lenses_all_failed(review_id, db)
+        if all_failed:
+            _no_llm_lens_warning(lens_count)
+            try:
+                tier = load_policy(
+                    home=resolve_home(cwd, merged), env=merged
+                ).tier
+            except Exception as exc:  # noqa: BLE001 — a policy error fails closed
+                text = str(exc) or f"{type(exc).__name__}: {exc}"
+                print(f"pre-push review: ✗ review policy error: {text}")
+                return _emit(
+                    GateResult(1, "unavailable", review_id, cached, text), target
+                )
+            if tier == "secure":
+                return _emit(
+                    GateResult(
+                        1, "unavailable", review_id, cached,
+                        "secure tier: no LLM lens ran",
+                    ),
+                    target,
+                )
 
     if verdict not in _TERMINAL_VERDICTS:
         return _unavailable(

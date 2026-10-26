@@ -360,7 +360,7 @@ def _default_llm_panel(
 
     dispatch_fn = dispatch_fn or llm_dispatch.mo_llm_dispatch
     panel = os.environ.get("MO_REVIEW_PANEL", "glm deepseek_flash").split()
-    timeout = os.environ.get("MO_REVIEW_LENS_TIMEOUT_S", "180")
+    timeout = os.environ.get("MO_REVIEW_LENS_TIMEOUT_S", "600")
     models = [
         model for model in panel
         if not (model == "gemini"

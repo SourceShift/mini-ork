@@ -320,7 +320,13 @@ def review_run(
                 life.settle(con, rid, prior, observed, set(resolved), now)
             except Exception:
                 pass
-        if life is not None and lens_rows and not panel_failed:
+        # A panel that raised wrote no (or partial) per-lens rows; record the
+        # failure itself, so the gate's "no LLM lens ran" check sees evidence
+        # instead of an absence it must treat as unknown.
+        if panel_failed:
+            lens_rows = list(lens_rows) + [
+                {"lens": "llm.panel", "status": "error", "issues": 0, "elapsed_ms": None}]
+        if life is not None and lens_rows:
             try:
                 for row in lens_rows:
                     con.execute(

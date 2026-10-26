@@ -772,6 +772,21 @@ def test_lens_runs_recorded(db, git_repo, monkeypatch):
         ("llm.glm", "ok", 1), ("llm.deepseek_flash", "dispatch_failed", 0)]
 
 
+def test_a_panel_that_raises_is_recorded_as_a_failed_lens(db, git_repo, monkeypatch):
+    """Reviewer finding on R2c: a panel that raised left no lens rows, so the
+    gate's "no LLM lens ran" check had no evidence and stayed silent."""
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("panel exploded")
+
+    monkeypatch.setattr(ppr, "_default_llm_panel", boom)
+    c1 = git_commit(git_repo, "a.py", "x = 1\ny = 2\nz = 3\n", "one")
+    rid = run_review(git_repo, db, c1, parent_sha(git_repo))
+    got = rows(db, "SELECT lens, status FROM review_lens_runs WHERE review_id=?", (rid,))
+    assert [(g["lens"], g["status"]) for g in got] == [("llm.panel", "error")]
+    from mini_ork.review import gate as gate_mod
+    assert gate_mod._llm_lenses_all_failed(rid, Path(db)) == (True, 1)
+
+
 # ── verdict exclusion ──────────────────────────────────────────────────────
 
 

@@ -153,7 +153,7 @@ touched set is the child's working tree ∪ untracked ∪ `pre-implementer-ref�
 | `MO_CONDUCTOR_GAIN_MIN_SAMPLES` | `"3"` | Min samples before adaptive gain engages |
 | `MO_SCHED_MAX_PARALLEL` | `"3"` | Scheduler epic parallelism |
 | `MO_REVIEW_PANEL` | `"glm deepseek_flash"` | Pre-push review LLM panel lanes (the two families live on 2026-10-26; minimax, kimi and codex failed their probes). A high LLM finding blocks only when two lenses flag the same file |
-| `MO_REVIEW_LENS_TIMEOUT_S` | `"180"` | Per-lens review timeout |
+| `MO_REVIEW_LENS_TIMEOUT_S` | `"600"` | Per-lens review timeout (glm needed 179 s on a 15 kB diff, so 180 s timed out under load) |
 | `MO_REVIEW_LLM_LENSES` | `"0"` | `1` runs the LLM panel with the heuristics (hybrid mode) |
 | `MO_REVIEW_SKIP` | `"0"` | `1` skips the pre-push code review; a human decision |
 | `MO_ORACLE_GATES_AUTO` | `"1"` | Auto oracle-gate run pre-publish |
@@ -167,7 +167,8 @@ touched set is the child's working tree ∪ untracked ∪ `pre-implementer-ref�
 The pre-push review is cached by `git patch-id` in
 `$MINI_ORK_HOME/state/pre-push-review-cache.json`, and in the secure review
 tier (`config/review.yaml` with `review: {tier: secure}`) a review that cannot
-run blocks the push.
+run blocks the push. A hybrid review in which no LLM lens ran prints a warning
+and, in the secure tier, blocks the push.
 
 ### Node heartbeats (`MO_NODE_HEARTBEAT_SECONDS`)
 
