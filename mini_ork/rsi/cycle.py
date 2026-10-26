@@ -1121,6 +1121,47 @@ def _blocked_reason(home: Path, run_id: str) -> str:
             f"(questions: {len(plan.get('human_questions') or [])})")
 
 
+#: How much of a provider's own words to keep in the cycle's error line. The
+#: upstream body is a JSON error envelope that runs to hundreds of characters;
+#: the operator needs "out of quota" and the lane, not the envelope.
+_PREFLIGHT_REASON_MAX = 200
+
+
+def _preflight_block(home: Path, run_id: str) -> str:
+    """Why lane preflight refused the run, or ``""`` if it let it start.
+
+    ``lane_preflight`` is the one gate that can stop a recipe run *before any
+    node dispatches* — it writes ``<run_dir>/lane-preflight.json`` and exits 75.
+    Cycle 20 (2026-10-26) died that way and the cycle reported only
+    "exited 75 without a proposal.json", while the file said exactly what an
+    operator could act on: ``minimax on node lens_oracle: out of quota (HTTP
+    429 … Token Plan usage limit reached)``. The lane and the provider's own
+    words live in that file and nowhere else — the run log records the refusal
+    as a line, not a diagnosis.
+    """
+    path = _run_artifact(home, run_id, "lane-preflight.json")
+    if path is None:
+        return ""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(payload, Mapping) or payload.get("verdict") != "blocked":
+        return ""
+    parts: list[str] = []
+    for entry in (payload.get("failures") or [])[:3]:
+        if not isinstance(entry, Mapping):
+            continue
+        reason = " ".join(str(entry.get("reason") or "").split())
+        if len(reason) > _PREFLIGHT_REASON_MAX:
+            reason = reason[:_PREFLIGHT_REASON_MAX].rstrip() + "…"
+        parts.append(
+            f"{entry.get('lane') or '?'} on node {entry.get('node_id') or '?'}: "
+            f"{reason or 'unhealthy'}")
+    detail = "; ".join(parts) or str(payload.get("blocked_reason") or "unhealthy lane")
+    return f"{payload.get('blocked_reason') or 'lane_unhealthy'} — {detail}"
+
+
 def _default_propose(req: CycleRequest, cand: Candidate) -> Proposal | None:
     """SUGGEST is the first model edge and lives in a recipe, not here.
 
@@ -1192,6 +1233,13 @@ def _recipe_propose(req: CycleRequest, cand: Candidate) -> Proposal:
                 f"the SUGGEST run hit its {_SUGGEST_TIMEOUT_S} s wall before writing "
                 f"proposal.json; each node was bounded to "
                 f"{_node_timeout_s(_SUGGEST_TIMEOUT_S, os.environ.get('MO_NODE_TIMEOUT_S'))} s "
+                f"(see {run_dir})")
+        blocked = _preflight_block(home, run_dir.name)
+        if blocked:
+            # rc 75 is the preflight's own code and says nothing an operator can
+            # act on; the lane it refused is named only in its verdict file.
+            raise CycleFailure(
+                f"the SUGGEST run was blocked before dispatch: {blocked} "
                 f"(see {run_dir})")
         blocked = _blocked_reason(home, run_dir.name)
         if blocked:

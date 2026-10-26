@@ -1791,3 +1791,76 @@ def test_a_blocked_profile_names_the_reason_instead_of_the_exit_code(world, monk
     assert "never dispatched the planner" in message
     assert "plan_status=needs_answers" in message and "run_profile" in message
     assert "exited 6" not in message
+
+
+def test_a_preflight_block_names_the_lane_instead_of_the_exit_code(world, monkeypatch):
+    """`exit 75` is not a diagnosis; the run's own lane-preflight.json is.
+
+    Cycle 20 (2026-10-26) was stopped by lane preflight — the SUGGEST lens panel
+    needs `minimax_lens` and minimax was out of quota — and the cycle reported
+    only "exited 75 without a proposal.json". The lane, the node and the
+    provider's own words were in `lane-preflight.json` the whole time.
+    """
+    def _fake_recipe(req, recipe, brief, kickoff, **kwargs):
+        home = req.home / "rsi" / req.cycle_id / recipe / "home"
+        run_dir = home / "runs" / f"{req.cycle_id}-{recipe}"
+        run_dir.mkdir(parents=True)
+        (run_dir / "lane-preflight.json").write_text(json.dumps({
+            "verdict": "blocked",
+            "blocked_reason": "lane_unhealthy",
+            "failures": [{
+                "lane": "minimax",
+                "role": "researcher",
+                "node_id": "lens_oracle",
+                "reason": ("minimax: out of quota (HTTP 429: Token Plan usage "
+                           "limit reached) — every dispatch on this lane would "
+                           "fail"),
+            }],
+            "unverified": [],
+        }), encoding="utf-8")
+        return 75, home, run_dir
+
+    monkeypatch.setattr(cycle_mod, "_run_recipe", _fake_recipe)
+    req = CycleRequest(root=world.root, db=world.db, config=world.cfg,
+                       cycle_id="rsi-ctest")
+
+    with pytest.raises(cycle_mod.CycleFailure) as excinfo:
+        cycle_mod._recipe_propose(req, _l10_candidate())
+
+    message = str(excinfo.value)
+    assert "blocked before dispatch" in message
+    assert "lane_unhealthy" in message
+    assert "minimax on node lens_oracle" in message and "out of quota" in message
+    assert "exited 75" not in message
+
+
+def test_a_preflight_reason_is_truncated_not_pasted(world, monkeypatch):
+    """The upstream body is a JSON envelope; the operator needs the verdict.
+
+    A raw 1000-character provider error in a cycle's `error` column crowds out
+    the one part a human acts on, so the cycle keeps a bounded prefix.
+    """
+    def _fake_recipe(req, recipe, brief, kickoff, **kwargs):
+        home = req.home / "rsi" / req.cycle_id / recipe / "home"
+        run_dir = home / "runs" / f"{req.cycle_id}-{recipe}"
+        run_dir.mkdir(parents=True)
+        (run_dir / "lane-preflight.json").write_text(json.dumps({
+            "verdict": "blocked",
+            "blocked_reason": "lane_unhealthy",
+            "failures": [{"lane": "minimax", "node_id": "lens_oracle",
+                          "reason": "out of quota " + "x" * 1000}],
+        }), encoding="utf-8")
+        return 75, home, run_dir
+
+    monkeypatch.setattr(cycle_mod, "_run_recipe", _fake_recipe)
+    req = CycleRequest(root=world.root, db=world.db, config=world.cfg,
+                       cycle_id="rsi-ctest")
+
+    with pytest.raises(cycle_mod.CycleFailure) as excinfo:
+        cycle_mod._recipe_propose(req, _l10_candidate())
+
+    message = str(excinfo.value)
+    assert "out of quota" in message and "…" in message
+    assert "x" * (cycle_mod._PREFLIGHT_REASON_MAX + 50) not in message
+    # The prefix plus the run-dir pointer, not the whole provider envelope.
+    assert len(message) < cycle_mod._PREFLIGHT_REASON_MAX + 400
