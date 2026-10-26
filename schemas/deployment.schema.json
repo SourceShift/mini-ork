@@ -42,14 +42,16 @@
     },
     "ports": {
       "type": "array",
-      "description": "Ports exposed by the container. host is optional; when omitted the node publishes an ephemeral port.",
+      "description": "Ports exposed by the container. host is optional; when omitted the node publishes an ephemeral port. bind restricts the published port to one host IP (omitted = all interfaces); protocol selects the transport (tcp default, udp).",
       "items": {
         "type": "object",
         "required": ["container"],
         "additionalProperties": false,
         "properties": {
           "container": { "type": "integer", "minimum": 1, "maximum": 65535 },
-          "host": { "type": "integer", "minimum": 1, "maximum": 65535 }
+          "host": { "type": "integer", "minimum": 1, "maximum": 65535 },
+          "protocol": { "type": "string", "enum": ["tcp", "udp"], "default": "tcp" },
+          "bind": { "type": "string", "minLength": 2, "maxLength": 45, "description": "Host IP literal to bind the published port to." }
         }
       },
       "default": []

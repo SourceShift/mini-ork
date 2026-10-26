@@ -192,6 +192,80 @@ def test_create_argv_carries_the_contract(client, docker):
     assert argv[image_at + 1:] == ["uvicorn", "app:app", "--port", "8080"]
 
 
+def test_port_mappings_cover_bind_and_protocol():
+    """The Docker ``-p`` grammar, pinned without a daemon."""
+    from mini_ork.remote.node_agent.services import _port_mapping
+
+    assert _port_mapping({"container": 8080}) == "8080"
+    assert _port_mapping({"container": 5432, "host": 20001}) == "20001:5432"
+    assert _port_mapping({"container": 53, "host": 20002, "protocol": "udp"}) == "20002:53/udp"
+    assert (
+        _port_mapping({"container": 5432, "host": 20003, "bind": "10.0.0.5"}) == "10.0.0.5:20003:5432"
+    )
+    assert (
+        _port_mapping(
+            {"container": 53, "host": 20004, "bind": "::1", "protocol": "udp"}
+        )
+        == "[::1]:20004:53/udp"
+    )
+
+
+def test_create_publishes_a_bound_udp_port(client, docker):
+    r = client.post(
+        "/v1/services",
+        json=_spec(replicas=1, ports=[{"container": 5432, "host": 20001, "bind": "10.0.0.5"}]),
+        headers=AUTH,
+    )
+    assert r.status_code == 200, r.text
+    argv = docker.run_argv()[0]
+    assert argv[argv.index("-p") + 1] == "10.0.0.5:20001:5432"
+
+    client.post(
+        "/v1/services",
+        json=_spec(
+            service_id="dns", replicas=1, ports=[{"container": 53, "host": 20002, "protocol": "udp"}]
+        ),
+        headers=AUTH,
+    )
+    argv = docker.run_argv()[1]
+    assert argv[argv.index("-p") + 1] == "20002:53/udp"
+
+
+def test_the_spec_keeps_defaults_out_of_state(client, tmp_path):
+    r = client.post(
+        "/v1/services",
+        json=_spec(
+            ports=[
+                {"container": 8080, "host": 20001, "protocol": "tcp"},
+                {"container": 9000, "host": 20002, "protocol": "udp", "bind": "127.0.0.1"},
+            ]
+        ),
+        headers=AUTH,
+    )
+    assert r.status_code == 200, r.text
+    data = json.loads((tmp_path / "services.json").read_text(encoding="utf-8"))
+    assert data["services"][0]["ports"] == [
+        {"container": 8080, "host": 20001},
+        {"container": 9000, "host": 20002, "protocol": "udp", "bind": "127.0.0.1"},
+    ]
+
+
+@pytest.mark.parametrize(
+    ("port", "reason"),
+    [
+        ({"container": 8080, "protocol": "sctp"}, "protocol"),
+        ({"container": 8080, "bind": "node.example.com"}, "IP literal"),
+        ({"container": 8080, "bind": "300.1.1.1"}, "IP literal"),
+        ("8080", "objects"),
+    ],
+)
+def test_bad_port_shapes_are_400s_before_docker(client, docker, port, reason):
+    r = client.post("/v1/services", json=_spec(ports=[port]), headers=AUTH)
+    assert r.status_code == 400, r.text
+    assert reason in r.text
+    assert docker.run_argv() == []
+
+
 def test_create_persists_keys_but_never_values(client, tmp_path):
     r = client.post("/v1/services", json=_spec(), headers=AUTH)
     assert r.status_code == 200, r.text
@@ -471,6 +545,14 @@ def test_the_published_schema_rejects_the_same_shapes():
 
     ok = _spec(volumes=[{"name": "data", "mount_path": "/var/lib/app"}])
     assert list(validator.iter_errors(ok)) == []
+    ok_port = _spec(ports=[{"container": 5432, "host": 20001, "protocol": "udp", "bind": "10.0.0.5"}])
+    assert list(validator.iter_errors(ok_port)) == []
+
+    for bad_port in (
+        [{"container": 5432, "protocol": "sctp"}],
+        [{"container": 5432, "protocol": "tcp", "bind": ""}],
+    ):
+        assert list(validator.iter_errors(_spec(ports=bad_port))), bad_port
 
     for bad in (
         [{"name": "data", "mount_path": "data"}],

@@ -83,6 +83,7 @@ something this module can invent.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -112,6 +113,9 @@ _LABEL_SERVICE = "mo.service"
 _LABEL_DEPLOYMENT = "mo.deployment"
 
 _RESTART_POLICIES = frozenset({"no", "on-failure", "always", "unless-stopped"})
+
+#: Docker publishes ``/tcp`` by default, so ``tcp`` is never rendered.
+_PORT_PROTOCOLS = ("tcp", "udp")
 
 #: A volume name is an *identity*, not a path: it becomes one directory below
 #: the node's volume root, so it is held to a stricter shape than the service id
@@ -178,6 +182,30 @@ class ServiceError(ValueError):
 def _utc_now() -> str:
     """ISO-8601 UTC with a ``Z`` suffix (the wire style used elsewhere)."""
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _port_mapping(port: Mapping[str, Any]) -> str:
+    """Render one validated port entry as Docker's ``-p`` argument.
+
+    Grammar: ``[bind:]host:container[/proto]`` — ``bind`` is an optional host
+    IP, ``host`` may be empty for an ephemeral port, and ``/tcp`` is Docker's
+    default so it is omitted. Keeping this pure is what lets the tests pin the
+    full matrix (all-interfaces, bound, UDP, both) without a Docker daemon.
+    """
+    container = port["container"]
+    host = port.get("host")
+    bind = port.get("bind")
+    target = f"{host}:{container}" if host is not None else f"{container}"
+    if bind:
+        # IPv6 literals need brackets, or the colons in the address read as
+        # further ``-p`` separators.
+        rendered = f"[{bind}]" if ":" in bind else bind
+        # No host means an ephemeral host port: Docker spells it ``bind::c``.
+        target = f"{rendered}:{host if host is not None else ''}:{container}"
+    protocol = port.get("protocol") or "tcp"
+    if protocol != "tcp":
+        target = f"{target}/{protocol}"
+    return target
 
 
 def _extract_safely(archive: Path, dest: Path) -> None:
@@ -315,6 +343,8 @@ def _validate(payload: Mapping[str, Any]) -> tuple[ServiceSpec, dict[str, str]]:
 
     ports: list[dict[str, Any]] = []
     for raw in payload.get("ports") or []:
+        if not isinstance(raw, Mapping):
+            raise ServiceError("ports must be a list of objects")
         container = int(raw.get("container") or 0)
         if container < 1 or container > 65535:
             raise ServiceError("port.container must be 1..65535")
@@ -322,7 +352,30 @@ def _validate(payload: Mapping[str, Any]) -> tuple[ServiceSpec, dict[str, str]]:
         host = int(host_raw) if host_raw is not None else None
         if host is not None and (host < 1 or host > 65535):
             raise ServiceError("port.host must be 1..65535")
-        ports.append({"container": container, "host": host})
+        protocol = str(raw.get("protocol") or "tcp").lower()
+        if protocol not in _PORT_PROTOCOLS:
+            raise ServiceError(
+                f"port.protocol must be one of {list(_PORT_PROTOCOLS)}: {protocol!r}"
+            )
+        bind = raw.get("bind")
+        if bind is not None:
+            # A literal address only: a hostname here would make the container
+            # bind to whatever DNS says at spawn time, which is neither what the
+            # caller asked for nor reproducible across nodes.
+            try:
+                bind = str(ipaddress.ip_address(str(bind)))
+            except ValueError:
+                raise ServiceError(
+                    f"port.bind must be an IP literal: {bind!r}"
+                ) from None
+        # Only non-default fields are stored, so an existing service.json
+        # written before this contract decodes to exactly the same spec.
+        entry: dict[str, Any] = {"container": container, "host": host}
+        if protocol != "tcp":
+            entry["protocol"] = protocol
+        if bind is not None:
+            entry["bind"] = bind
+        ports.append(entry)
 
     # Two collisions Docker would accept without a word, and both lose data: the
     # same name twice mounts one directory at two paths, and the same mount path
@@ -974,9 +1027,7 @@ class ServiceManager:
             argv += ["--label", f"{key}={value}"]
 
         for port in spec.ports:
-            host = port.get("host")
-            mapping = f"{host}:{port['container']}" if host else f"{port['container']}"
-            argv += ["-p", mapping]
+            argv += ["-p", _port_mapping(port)]
 
         for volume in spec.volumes:
             host = self.host_volume_path(spec, volume["name"])

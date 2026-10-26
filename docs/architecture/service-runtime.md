@@ -65,11 +65,26 @@ checks that matter:
 | `replicas` ≤ 100 | one request cannot exhaust a shared node |
 | `restart_policy` in a fixed set | no free-text policy reaches the daemon |
 | ports 1..65535 | Docker rejects the rest with a worse error |
+| port `protocol` ∈ {`tcp`, `udp`}; `bind` is an IP literal | rendered as `-p [bind:]host:container[/proto]`; a hostname would bind to whatever DNS resolves at spawn time |
 | volume `name` matches `^[a-z0-9][a-z0-9_-]{0,62}$` | it becomes one directory below the node's volume root; no dots means no `..` |
 | volume `mount_path` is absolute, no `:` or `..` | relative paths resolve against a per-image WORKDIR; `:` is Docker's `-v` separator |
 | one volume per name and per mount path | the same path twice lets one mount shadow the other, silently |
 | env names are shell identifiers | a hostile key cannot smuggle flags into `-e` |
 | unknown `schema_version` → 400 | a contract change fails loudly, never silently |
+
+A port entry is `{"container": 5432, "host": 20001}` and may add two optional
+fields. `protocol: "udp"` publishes `20001:5432/udp` (`tcp` is Docker's
+default and never rendered). `bind: "10.0.0.5"` publishes on that one host
+interface — `10.0.0.5:20001:5432` — so the control plane can keep an edge-only
+port off a node's public interface while another service on the same node is
+deliberately public. IPv6 binds are bracketed (`[::1]:20001:5432`). Omitted
+fields mean the historic behaviour: all interfaces, TCP. The node persists
+only non-default fields, so a state file written before this contract decodes
+unchanged.
+
+The *policy* — which ports a tenant may make public, and whether a port is
+reachable only through the edge proxy or also directly — belongs to the
+control plane. The node executes the bind it is given and nothing more.
 
 ## The HTTP surface
 
