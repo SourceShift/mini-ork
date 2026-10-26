@@ -68,6 +68,27 @@ approves them at a terminal.
 | R6 | `mini-ork undo` | Run passed |
 | R7 | spec-tests verifier labels fixture-misuse harness defects and files spec-test-defect.md | Run passed |
 
+| R2d | a degraded review (no LLM lens ran) is never cached; an empty panel counts as "no lens ran" | Found by the first working LLM review (#65), reviewing R2c itself; both lenses agreed. Its merge review (#69) marked 3 of #65's findings `fixed` |
+
+### First reviewer score (reviewer-eval, fingerprint 382cb8d46be94da2)
+
+Lane `opus_lens` → glm (GLM-5.3), R5a envelope, 12 cases:
+
+- **Incidents:** 5/5 blocked AND naming the defect (recall 1.0; Wilson 95%
+  lower bound 0.57 at n=5).
+- **Clean changes:** 0/6 false blocks (1 timed out).
+- **Cost:** $5.01.
+
+Caveat: in their real runs this reviewer passed K10, K12 and K13. The eval
+prompt has the kickoff and the diff but not the run's (all green) verifier
+reports, so it probably overstates in-run recall. Next eval change: feed
+cases the in-run reviewer inputs.
+
+One clean case (`clean-k12-landed`) was first blocked as an out-of-scope
+`scheduler.py` edit. The data was wrong, not the reviewer (the landed fix
+legitimately touched a file the K12 kickoff did not list), and the case's
+kickoff now lists it.
+
 ### What the program taught
 
 - **Unsatisfiable blind spec tests were the main cost.** Five of nine runs
@@ -87,6 +108,23 @@ approves them at a terminal.
   outcomes (R2b) is what made it visible.
 
 ### Follow-ups
+
+- **High tier, needs a person: never run the LLM panel inside the merge
+  lock** (review #69 finding d6c35ecb). Since R2d no longer caches degraded
+  reviews, a pre-review whose lenses failed makes the in-lock push hook
+  re-run the panel (up to 600 s) while holding the lock. Fix: the merge
+  driver tells the hook the patch was already reviewed (e.g.
+  `MO_REVIEW_DONE_PATCH_ID`), and the in-lock hook reuses that verdict. This
+  touches `scripts/mini_ork_worktree.py`, which is high tier.
+- **Open pre-push findings on `mini_ork/review/gate.py`:** see
+  `mini-ork review findings --file mini_ork/review/gate.py` (e.g. a partial
+  `ok` lens row defeats the all-failed check; the secure-tier early return
+  hides blocking findings).
+- **The rev6-r2d run has no `task_runs` row** although it published: a
+  silent bookkeeping write failure, still to be investigated.
+- **Stale run rows:** rev6 R2a/R4/R5b stay `executing` and R5a `failed`,
+  although all landed on main by operator salvage (their auto-repair was
+  stopped). The supervisor's superseded check closed R3 the same way.
 
 - **Spec tests cannot exercise the CLI of the change under test.**
   `bin/mini-ork` resolves its root from `MINI_ORK_ENGINE_ROOT`, then
