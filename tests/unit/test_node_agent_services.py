@@ -684,10 +684,210 @@ def test_snapshot_routes_require_bearer(client):
         ("post", SNAPSHOT),
         ("get", SNAPSHOT),
         ("delete", f"{SNAPSHOT}/{'0' * 32}"),
+        ("get", f"{SNAPSHOT}/{'0' * 32}/blob"),
+        ("put", f"{SNAPSHOT}/{'0' * 32}/blob"),
         ("post", "/v1/services/web/volumes/data/restore"),
     ):
         r = getattr(client, method)(path, **({"json": {"snapshot_id": "0" * 32}} if method == "post" else {}))
         assert r.status_code in (401, 403), (method, path, r.status_code)
+
+
+# ---------------------------------------------------------------------------
+# shipping a snapshot off-node — download, import, cross-node restore
+# ---------------------------------------------------------------------------
+
+
+def _archive_bytes(files: dict[str, bytes]) -> bytes:
+    """A real tar.gz, so an imported snapshot can be restored, not just listed."""
+    import io
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, data in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            info.mtime = 0
+            tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def _sha(body: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(body).hexdigest()
+
+
+def test_export_blob_returns_the_archive_and_its_digest(client, tmp_path):
+    client.post(
+        "/v1/services",
+        json=_spec(volumes=[{"name": "data", "mount_path": "/data"}]),
+        headers=AUTH,
+    )
+    (tmp_path / "volumes" / "web" / "data" / "state.json").write_bytes(b'{"n":1}')
+    meta = client.post(SNAPSHOT, headers=AUTH).json()
+
+    r = client.get(f"{SNAPSHOT}/{meta['snapshot_id']}/blob", headers=AUTH)
+
+    assert r.status_code == 200, r.text
+    on_disk = (tmp_path / "volume-snapshots" / "web" / "data" / f"{meta['snapshot_id']}.tar.gz").read_bytes()
+    assert r.content == on_disk
+    # The headers repeat what the sidecar says, so a shipper can verify the
+    # body it just received without a second call that a delete could race.
+    assert r.headers["x-content-sha256"] == meta["sha256"]
+    assert r.headers["x-content-bytes"] == str(meta["bytes"])
+    assert r.headers["content-type"].startswith("application/gzip")
+    assert f"{meta['snapshot_id']}.tar.gz" in r.headers["content-disposition"]
+
+
+def test_export_blob_refuses_unknown_and_malformed_ids(client):
+    assert client.get(f"{SNAPSHOT}/{'0' * 32}/blob", headers=AUTH).status_code == 404
+    # An id that is not the minted shape is a bad request, not a lookup miss:
+    # the id is a path component and never a caller-chosen path.
+    r = client.get(f"{SNAPSHOT}/{'A' * 32}/blob", headers=AUTH)
+    assert r.status_code == 400
+    assert "32 lowercase hex" in r.json()["detail"]
+
+
+def test_import_then_restore_round_trips_bytes(client, tmp_path):
+    body = _archive_bytes({"imported.txt": b"from another node"})
+    snap = "a" * 32
+
+    r = client.put(
+        f"{SNAPSHOT}/{snap}/blob",
+        content=body,
+        headers={**AUTH, "X-Content-Sha256": _sha(body)},
+    )
+
+    assert r.status_code == 200, r.text
+    assert r.json()["imported"] is True
+    assert r.json()["bytes"] == len(body)
+    assert r.json()["sha256"] == _sha(body)
+    assert client.get(SNAPSHOT, headers=AUTH).json()["count"] == 1
+
+    restored = client.post(
+        "/v1/services/web/volumes/data/restore",
+        json={"snapshot_id": snap},
+        headers=AUTH,
+    )
+    assert restored.status_code == 200, restored.text
+    assert (tmp_path / "volumes" / "web" / "data" / "imported.txt").read_bytes() == b"from another node"
+
+
+def test_a_repeat_import_of_the_same_bytes_is_a_no_op(client, tmp_path):
+    body = _archive_bytes({"one.txt": b"1"})
+    snap = "b" * 32
+    headers = {**AUTH, "X-Content-Sha256": _sha(body)}
+
+    first = client.put(f"{SNAPSHOT}/{snap}/blob", content=body, headers=headers)
+    created_at = first.json()["created_at"]
+    second = client.put(f"{SNAPSHOT}/{snap}/blob", content=body, headers=headers)
+
+    assert second.status_code == 200, second.text
+    assert second.json()["imported"] is False
+    assert second.json()["created_at"] == created_at
+    assert client.get(SNAPSHOT, headers=AUTH).json()["count"] == 1
+    # No temporary files leaked from either attempt.
+    assert not list((tmp_path / "volume-snapshots" / "web" / "data").glob(".*.import-*"))
+
+
+def test_import_refuses_different_bytes_for_a_taken_id(client):
+    snap = "c" * 32
+    first = _archive_bytes({"one.txt": b"1"})
+    client.put(
+        f"{SNAPSHOT}/{snap}/blob", content=first, headers={**AUTH, "X-Content-Sha256": _sha(first)}
+    )
+    other = _archive_bytes({"two.txt": b"2"})
+
+    r = client.put(
+        f"{SNAPSHOT}/{snap}/blob", content=other, headers={**AUTH, "X-Content-Sha256": _sha(other)}
+    )
+
+    assert r.status_code == 409
+    assert "different content" in r.json()["detail"]
+
+
+def test_a_sha_mismatch_admits_nothing(client, tmp_path):
+    body = _archive_bytes({"x.txt": b"x"})
+    snap = "d" * 32
+
+    r = client.put(
+        f"{SNAPSHOT}/{snap}/blob",
+        content=body,
+        headers={**AUTH, "X-Content-Sha256": "e" * 64},
+    )
+
+    assert r.status_code == 400
+    assert "does not match" in r.json()["detail"]
+    assert client.get(SNAPSHOT, headers=AUTH).json()["count"] == 0
+    out_dir = tmp_path / "volume-snapshots" / "web" / "data"
+    assert not list(out_dir.glob(f"{snap}.*"))
+    assert not list(out_dir.glob(".*.import-*"))
+
+
+def test_import_requires_a_digest_header(client):
+    body = _archive_bytes({"x.txt": b"x"})
+    r = client.put(f"{SNAPSHOT}/{'f' * 32}/blob", content=body, headers=AUTH)
+    assert r.status_code == 400
+    assert "X-Content-Sha256" in r.json()["detail"]
+
+
+def test_import_refuses_a_body_over_the_configured_cap(tmp_path, monkeypatch, docker):
+    monkeypatch.setenv(TOKEN_ENV, TOKEN_VALUE)
+    monkeypatch.setenv("MO_NODE_SNAPSHOT_MAX_BYTES", "64")
+    c = TestClient(create_app(state_dir=tmp_path, token_env=TOKEN_ENV, _run_fn=docker))
+    body = _archive_bytes({"big.bin": b"x" * 4096})
+
+    r = c.put(
+        f"{SNAPSHOT}/{'a' * 32}/blob",
+        content=body,
+        headers={**AUTH, "X-Content-Sha256": _sha(body)},
+    )
+
+    assert r.status_code == 413
+    assert c.get(SNAPSHOT, headers=AUTH).json()["count"] == 0
+
+
+def test_a_malformed_snapshot_cap_refuses_to_start(tmp_path, monkeypatch, docker):
+    from mini_ork.remote.node_agent.services import ServiceError
+
+    monkeypatch.setenv(TOKEN_ENV, TOKEN_VALUE)
+    monkeypatch.setenv("MO_NODE_SNAPSHOT_MAX_BYTES", "16GiB")
+    with pytest.raises(ServiceError, match="MO_NODE_SNAPSHOT_MAX_BYTES.*positive integer"):
+        create_app(state_dir=tmp_path, token_env=TOKEN_ENV, _run_fn=docker)
+
+
+def test_a_snapshot_shipped_from_one_node_restores_on_another(tmp_path, monkeypatch, docker):
+    """The disaster-recovery story: bytes leave a node and land on a new one."""
+    monkeypatch.setenv(TOKEN_ENV, TOKEN_VALUE)
+    source_app = create_app(state_dir=tmp_path / "a", token_env=TOKEN_ENV, _run_fn=docker)
+    a = TestClient(source_app)
+    a.post(
+        "/v1/services",
+        json=_spec(volumes=[{"name": "data", "mount_path": "/data"}]),
+        headers=AUTH,
+    )
+    (tmp_path / "a" / "volumes" / "web" / "data" / "app.db").write_bytes(b"tenant rows")
+    meta = a.post(SNAPSHOT, headers=AUTH).json()
+    shipped = a.get(f"{SNAPSHOT}/{meta['snapshot_id']}/blob", headers=AUTH)
+    assert shipped.status_code == 200
+
+    target_app = create_app(state_dir=tmp_path / "b", token_env=TOKEN_ENV, _run_fn=docker)
+    b = TestClient(target_app)
+    imported = b.put(
+        f"{SNAPSHOT}/{meta['snapshot_id']}/blob",
+        content=shipped.content,
+        headers={**AUTH, "X-Content-Sha256": shipped.headers["x-content-sha256"]},
+    )
+    assert imported.status_code == 200, imported.text
+
+    restored = b.post(
+        "/v1/services/web/volumes/data/restore",
+        json={"snapshot_id": meta["snapshot_id"]},
+        headers=AUTH,
+    )
+    assert restored.status_code == 200, restored.text
+    assert (tmp_path / "b" / "volumes" / "web" / "data" / "app.db").read_bytes() == b"tenant rows"
 
 
 # ---------------------------------------------------------------------------

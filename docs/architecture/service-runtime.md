@@ -189,6 +189,8 @@ The node can copy a volume and put it back:
 POST   /v1/services/{sid}/volumes/{name}/snapshots
 GET    /v1/services/{sid}/volumes/{name}/snapshots
 DELETE /v1/services/{sid}/volumes/{name}/snapshots/{snap}
+GET    /v1/services/{sid}/volumes/{name}/snapshots/{snap}/blob
+PUT    /v1/services/{sid}/volumes/{name}/snapshots/{snap}/blob
 POST   /v1/services/{sid}/volumes/{name}/restore   {"snapshot_id": "<32 hex>"}
 ```
 
@@ -246,6 +248,56 @@ Rules the node enforces, each because the alternative loses data quietly:
 - **Deleting a service keeps its snapshots.** Like the volume data, retention is
   the platform's decision; the node only deletes when asked.
 
+### Shipping a snapshot off-node
+
+The node can hand the bytes of a snapshot it took to the control plane, and
+accept bytes the control plane shipped back under an id it names. That is what
+turns a node-local rollback copy into a disaster-recovery copy: the archive can
+leave the machine before the machine does, and a restored node — or a different
+one — can take it back.
+
+```mermaid
+sequenceDiagram
+  participant A as node A
+  participant CP as control plane
+  participant B as node B
+  A->>CP: GET …/snapshots/{id}/blob (tar.gz + sha256 header)
+  CP->>CP: store bytes + verify sha256
+  CP->>B: PUT …/snapshots/{id}/blob (X-Content-Sha256, body)
+  B->>B: stream → hash → fsync → rename → sidecar
+  CP->>B: POST …/restore {snapshot_id}
+  B->>B: atomic swap of the volume dir
+```
+
+`GET …/blob` repeats the sidecar's `sha256` and byte count in
+`X-Content-Sha256` / `X-Content-Bytes` headers, so the shipper verifies the body
+it received without a second metadata call that a delete could race. It 404s on
+an unknown id and on an archive whose sidecar is missing — that pair is what a
+crash between the two writes leaves, and those bytes are not restorable.
+
+`PUT …/blob` is an import, and it is strict on purpose:
+
+- **The digest header is required**, 64 lowercase hex characters. A body
+  admitted without one is an archive nothing verified, which would later restore
+  as tenant data.
+- **Bytes are hashed while streaming** to a temporary file, fsynced, and renamed
+  into place only when the digest matches. A mismatch or a dropped connection
+  leaves no archive, no sidecar, and no temporary file; the snapshot id stays
+  free.
+- **Imports are idempotent by content.** Re-delivering the same sha256 returns
+  the existing record with `imported: false` — the retry after a dropped
+  response is safe. Different bytes for a taken id are `409`: a retry must never
+  be able to replace a backup quietly.
+- **The body is bounded** by `MO_NODE_SNAPSHOT_MAX_BYTES` (default 16 GiB),
+  resolved at startup. A declared `Content-Length` over the cap is refused with
+  `413` before a byte is read, and the stream is counted anyway because a
+  chunked body can lie about its length. A malformed value refuses to start the
+  node, matching the roots.
+
+The node still does not decide *where* off-node bytes live, *how many* copies to
+keep, or *when* they expire. It moves bytes and proves their integrity; those
+three questions are retention policy and stay in the control plane.
+
 ## What is deliberately absent
 
 These are the proprietary layer's job, and every one of them is policy:
@@ -257,11 +309,11 @@ These are the proprietary layer's job, and every one of them is policy:
 - The **overlay itself** — swarm membership, WireGuard, or a CNI. This module
   joins a network and creates it on demand; making that one network span hosts
   is infrastructure, and the driver choice below decides whether it does.
-- Volume **quotas, retention, and off-node backup**. Snapshots and restore are
-  mechanism and live here; *when* to take one, how long to keep it, and where it
-  is shipped afterwards are policy. `platform_volumes.size_mb` is recorded but
-  not enforced by the node; a node that guessed at retention would be wrong for
-  every tenant at once.
+- Volume **quotas and retention**. Snapshots, restore, and moving the bytes
+  (`…/blob`) are mechanism and live here; *when* to take a snapshot, *how many*
+  copies to keep, *where* shipped bytes are stored, and *when* they expire are
+  policy. `platform_volumes.size_mb` is recorded but not enforced by the node; a
+  node that guessed at retention would be wrong for every tenant at once.
 - Managed databases (a separate primitive built on volumes).
 - Idle detection, scale-to-zero, and cron-scheduled services.
 

@@ -22,6 +22,8 @@ Contract (all routes are bearer-authed by the node-agent):
     POST   /v1/services/{sid}/volumes/{name}/snapshots
     GET    /v1/services/{sid}/volumes/{name}/snapshots
     DELETE /v1/services/{sid}/volumes/{name}/snapshots/{snap}
+    GET    /v1/services/{sid}/volumes/{name}/snapshots/{snap}/blob
+    PUT    /v1/services/{sid}/volumes/{name}/snapshots/{snap}/blob
     POST   /v1/services/{sid}/volumes/{name}/restore
 
 Storage: ``<state_dir>/services.json``. Env **values** are never written to
@@ -39,6 +41,20 @@ no amount of path cleaning makes that a safe interface. ``volume_root`` is
 and ``<state_dir>/volumes`` otherwise (the simple tier: a laptop). A relative
 env value raises rather than falling back — a volume that silently lands on the
 container's ephemeral layer is data loss the tenant only discovers on redeploy.
+
+**Shipping** is the control plane's job, not the node's. The node exposes the
+bytes of a snapshot it already wrote (``GET …/blob``) and accepts bytes for a
+snapshot id the control plane names (``PUT …/blob``), so an archive can leave
+the machine that took it and come back on a different one. The node does not
+decide where off-node bytes live, how many copies are kept, or when they
+expire — those are retention policy. What the node does enforce is integrity:
+an import must carry the sha256 of its body, is hashed while streaming to a
+temporary file, and is renamed into place only when the bytes match. A repeat
+import of the same content is a no-op that returns the existing metadata; a
+different body for a taken id is refused, so a retried ship can never silently
+replace a backup. Imports are bounded by ``MO_NODE_SNAPSHOT_MAX_BYTES``
+(default 16 GiB), resolved at startup so a malformed value stops the node
+rather than surfacing on the first restore of a real backup.
 
 **Snapshots** are the durable copy of a volume. The node writes a ``tar.gz``
 of the volume's contents under
@@ -77,9 +93,10 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, AsyncIterator, Callable, Mapping
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import FileResponse
 
 from .procs import _run as default_run
 
@@ -117,6 +134,21 @@ _SNAPSHOT_ROOT_ENV = "MO_NODE_SNAPSHOT_ROOT"
 #: back on restore/delete. Held to the minted shape so a request cannot name a
 #: path component — the id is a leaf under a node-chosen directory.
 _SNAPSHOT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+#: Cap on an imported snapshot body. An upload is written through to the
+#: snapshot root, so without a bound a single request could fill the disk an
+#: operator set aside for backups. 16 GiB clears a normal database volume and
+#: is an operator lever (``MO_NODE_SNAPSHOT_MAX_BYTES``) for the rest.
+_SNAPSHOT_MAX_BYTES_ENV = "MO_NODE_SNAPSHOT_MAX_BYTES"
+_DEFAULT_SNAPSHOT_MAX_BYTES = 16 * 1024**3
+
+#: The header an import must carry. Required, not optional: a body admitted
+#: without its digest would be an archive whose bytes nothing verified, and it
+#: would later restore as tenant data.
+_SNAPSHOT_SHA256_HEADER = "x-content-sha256"
+#: Canonical spelling for error messages; HTTP header lookup is case-insensitive.
+_SNAPSHOT_SHA256_NAME = "X-Content-Sha256"
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 #: A Docker network name. The platform sends an environment-scoped network so
 #: services of one environment reach each other by name; the node may have to
@@ -184,6 +216,18 @@ class VolumeInUseError(ServiceError):
 
 class SnapshotNotFoundError(ServiceError):
     """No snapshot with that id exists for this service and volume."""
+
+
+class SnapshotExistsError(ServiceError):
+    """That snapshot id is taken by content the import did not match.
+
+    A repeat import of the *same* bytes is not an error — it returns the
+    existing metadata — but a different body must never overwrite a backup.
+    """
+
+
+class SnapshotTooLargeError(ServiceError):
+    """An imported body exceeds ``MO_NODE_SNAPSHOT_MAX_BYTES``."""
 
 
 @dataclass
@@ -390,12 +434,14 @@ class ServiceManager:
         *,
         volume_root: Path | None = None,
         snapshot_root: Path | None = None,
+        snapshot_max_bytes: int | None = None,
         _run_fn: Callable[..., Any] | None = None,
     ) -> None:
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.volume_root = self._resolve_volume_root(volume_root)
         self.snapshot_root = self._resolve_snapshot_root(snapshot_root)
+        self.snapshot_max_bytes = self._resolve_snapshot_max_bytes(snapshot_max_bytes)
         self._path = self.state_dir / "services.json"
         self._run = _run_fn or default_run
         self._specs: dict[str, ServiceSpec] = {}
@@ -448,6 +494,33 @@ class ServiceManager:
                 )
             return root
         return self.state_dir / "volume-snapshots"
+
+    def _resolve_snapshot_max_bytes(self, explicit: int | None) -> int:
+        """Bound on an imported snapshot. A malformed value refuses startup.
+
+        Imported bytes are written to the snapshot root before anything checks
+        them, so the bound is a disk-safety limit, not an aesthetic one. The
+        same fail-closed rule as the roots: an unreadable setting is an operator
+        error, and silently substituting the default would leave a node the
+        operator believed was bounded.
+        """
+        if explicit is not None:
+            value = explicit
+        else:
+            raw = os.environ.get(_SNAPSHOT_MAX_BYTES_ENV)
+            if raw is None or raw.strip() == "":
+                return _DEFAULT_SNAPSHOT_MAX_BYTES
+            try:
+                value = int(raw)
+            except ValueError as exc:
+                raise ServiceError(
+                    f"{_SNAPSHOT_MAX_BYTES_ENV} must be a positive integer, got {raw!r}"
+                ) from exc
+        if value <= 0:
+            raise ServiceError(
+                f"{_SNAPSHOT_MAX_BYTES_ENV} must be a positive integer, got {value!r}"
+            )
+        return value
 
     def _load(self) -> None:
         if not self._path.is_file():
@@ -672,6 +745,132 @@ class ServiceManager:
                 f"no snapshot {snap!r} for volume {volume_name!r} of service {service_id!r}"
             )
         return True
+
+    def snapshot_archive(
+        self, service_id: str, volume_name: str, snapshot_id: object
+    ) -> tuple[Path, dict[str, Any]]:
+        """The archive and metadata of one snapshot, for shipping off-node.
+
+        Both files must exist. An archive without a sidecar is what a crash
+        between the two writes leaves behind: listing ignores it and restore
+        refuses it, and handing those bytes to a control plane would let it
+        record a backup it can never restore. Reading the sidecar here means
+        the caller ships a snapshot the node itself considers restorable.
+        """
+        self._volume_dir(service_id, volume_name)
+        snap = self._snapshot_id(snapshot_id)
+        out_dir = self._snapshot_dir(service_id, volume_name)
+        archive = out_dir / f"{snap}.tar.gz"
+        meta_path = out_dir / f"{snap}.json"
+        if not archive.is_file() or not meta_path.is_file():
+            raise SnapshotNotFoundError(
+                f"no snapshot {snap!r} for volume {volume_name!r} of service {service_id!r}"
+            )
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ServiceError(f"snapshot {snap!r} has unreadable metadata: {exc}") from exc
+        if not isinstance(meta, dict):
+            raise ServiceError(f"snapshot {snap!r} has unreadable metadata")
+        return archive, meta
+
+    async def import_snapshot(
+        self,
+        service_id: str,
+        volume_name: str,
+        snapshot_id: object,
+        chunks: AsyncIterator[bytes],
+        *,
+        sha256: str,
+    ) -> dict[str, Any]:
+        """Accept an archive the control plane shipped, under an id it names.
+
+        The write order mirrors :meth:`snapshot`: bytes stream to a temporary
+        file, are hashed on the way, are fsynced, renamed into place, and only
+        then does the sidecar exist. A failure at any point leaves no listed
+        snapshot — never one whose bytes differ from its metadata.
+
+        Idempotent by content: a retry that delivers the same sha256 returns
+        the existing record instead of failing, which is what makes a ship
+        retried after a dropped response safe. Different bytes for the same id
+        are refused: overwriting a backup under a name the control plane already
+        recorded would be the quiet kind of data loss.
+        """
+        self._volume_dir(service_id, volume_name)
+        snap = self._snapshot_id(snapshot_id)
+        digest_hex = str(sha256 or "")
+        if not _SHA256_RE.match(digest_hex):
+            raise ServiceError(
+                f"{_SNAPSHOT_SHA256_NAME} must be 64 lowercase hex characters"
+            )
+
+        out_dir = self._snapshot_dir(service_id, volume_name)
+        archive = out_dir / f"{snap}.tar.gz"
+        meta_path = out_dir / f"{snap}.json"
+        if archive.is_file() or meta_path.is_file():
+            if not (archive.is_file() and meta_path.is_file()):
+                raise SnapshotExistsError(
+                    f"snapshot {snap!r} is incomplete on this node; delete it before importing"
+                )
+            try:
+                existing = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise SnapshotExistsError(
+                    f"snapshot {snap!r} has unreadable metadata; delete it before importing"
+                ) from exc
+            if isinstance(existing, dict) and existing.get("sha256") == digest_hex:
+                return {**existing, "imported": False}
+            raise SnapshotExistsError(
+                f"snapshot {snap!r} already exists with different content on this node"
+            )
+
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        except OSError as exc:
+            raise RuntimeError(f"could not create snapshot directory {out_dir}: {exc}") from exc
+
+        tmp = out_dir / f".{snap}.tar.gz.import-{uuid.uuid4().hex}"
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with tmp.open("wb") as fh:
+                async for chunk in chunks:
+                    if not isinstance(chunk, (bytes, bytearray)):
+                        raise ServiceError("snapshot body must be binary")
+                    size += len(chunk)
+                    if size > self.snapshot_max_bytes:
+                        raise SnapshotTooLargeError(
+                            f"snapshot body exceeds {self.snapshot_max_bytes} bytes "
+                            f"({_SNAPSHOT_MAX_BYTES_ENV})"
+                        )
+                    digest.update(chunk)
+                    fh.write(chunk)
+                fh.flush()
+                os.fsync(fh.fileno())
+            if digest.hexdigest() != digest_hex:
+                raise ServiceError(
+                    f"snapshot body sha256 {digest.hexdigest()} does not match "
+                    f"{_SNAPSHOT_SHA256_NAME} {digest_hex}"
+                )
+            os.replace(tmp, archive)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+        meta = {
+            "snapshot_id": snap,
+            "service_id": service_id,
+            "volume": volume_name,
+            "bytes": size,
+            "sha256": digest_hex,
+            "created_at": _utc_now(),
+        }
+        meta_tmp = out_dir / f".{snap}.json.import-{uuid.uuid4().hex}"
+        try:
+            meta_tmp.write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
+            os.replace(meta_tmp, meta_path)
+        finally:
+            meta_tmp.unlink(missing_ok=True)
+        return {**meta, "imported": True}
 
     def _volume_holders(self, service_id: str) -> list[tuple[str, str]]:
         """Containers whose mounts still point at the volume.
@@ -982,6 +1181,7 @@ def make_router(
     bearer: Callable,
     volume_root: Path | None = None,
     snapshot_root: Path | None = None,
+    snapshot_max_bytes: int | None = None,
     _run_fn: Callable | None = None,
 ) -> APIRouter:
     """Build the FastAPI router exposing the ``/v1/services`` surface.
@@ -1000,6 +1200,7 @@ def make_router(
         state_dir,
         volume_root=volume_root,
         snapshot_root=snapshot_root,
+        snapshot_max_bytes=snapshot_max_bytes,
         _run_fn=_run_fn,
     )
     router = APIRouter()
@@ -1077,6 +1278,66 @@ def make_router(
             raise HTTPException(400, str(exc)) from exc
         return {"deleted": snap}
 
+    @router.get("/v1/services/{sid}/volumes/{name}/snapshots/{snap}/blob")
+    def get_snapshot_blob(sid: str, name: str, snap: str,
+                          _: None = Depends(bearer)) -> FileResponse:
+        try:
+            archive, meta = services.snapshot_archive(sid, name, snap)
+        except SnapshotNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ServiceError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return FileResponse(
+            archive,
+            media_type="application/gzip",
+            filename=f"{snap}.tar.gz",
+            headers={
+                # The control plane records what it shipped; these headers make
+                # the bytes self-describing so it can verify the download without
+                # a second metadata call that could race a delete.
+                _SNAPSHOT_SHA256_HEADER: str(meta.get("sha256") or ""),
+                "x-content-bytes": str(meta.get("bytes") or ""),
+            },
+        )
+
+    @router.put("/v1/services/{sid}/volumes/{name}/snapshots/{snap}/blob")
+    async def put_snapshot_blob(sid: str, name: str, snap: str, request: Request,
+                                _: None = Depends(bearer)) -> dict:
+        declared = request.headers.get(_SNAPSHOT_SHA256_HEADER, "")
+        if not _SHA256_RE.match(declared):
+            raise HTTPException(
+                400,
+                f"{_SNAPSHOT_SHA256_NAME} header is required: 64 lowercase hex characters",
+            )
+        # Refuse an oversized upload from its declared length before reading a
+        # byte; the stream is still counted below, because a chunked body or a
+        # lying Content-Length must not become an unbounded write.
+        declared_length = request.headers.get("content-length")
+        if declared_length is not None:
+            try:
+                if int(declared_length) > services.snapshot_max_bytes:
+                    raise HTTPException(
+                        413,
+                        f"snapshot body exceeds {services.snapshot_max_bytes} bytes "
+                        f"({_SNAPSHOT_MAX_BYTES_ENV})",
+                    )
+            except ValueError:
+                raise HTTPException(400, "Content-Length must be an integer") from None
+        try:
+            return await services.import_snapshot(
+                sid, name, snap, request.stream(), sha256=declared
+            )
+        except SnapshotTooLargeError as exc:
+            raise HTTPException(413, str(exc)) from exc
+        except SnapshotExistsError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except SnapshotNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ServiceError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(500, str(exc)) from exc
+
     @router.post("/v1/services/{sid}/volumes/{name}/restore")
     def post_volume_restore(sid: str, name: str, payload: dict,
                             _: None = Depends(bearer)) -> dict:
@@ -1098,7 +1359,9 @@ __all__ = [
     "ServiceError",
     "ServiceManager",
     "ServiceSpec",
+    "SnapshotExistsError",
     "SnapshotNotFoundError",
+    "SnapshotTooLargeError",
     "VolumeInUseError",
     "VolumeNotMaterializedError",
     "make_router",
