@@ -237,6 +237,7 @@ instead of racing. Point `secure.db_path` at the shared DB and
 | `2` and a config message | the message names the key | see the fail-closed list above |
 | `error` with a traceback summary | `rsi-cycle show <id>` | a bug in the cycle itself — the row carries the exception type |
 | `error` naming the SUGGEST wall (`hit its … wall before writing proposal.json`) | the run dir it names, then `llm_calls` for that run id | one node consumed its whole share and the stage after it had no time. The row records what the stage spent; check `.last-llm-node` in the run dir to see which node held the call |
+| `error` naming a failed contract verify (`gate(s) failed: <gate>`) | the run dir's `verify-result.json`, then the gate module | the plan was written but a *globally registered* gate disagreed with it. The recipe's own verifier passing alongside a failed `__gates__` row is the signal that the gate is wrong about the run, not that the run is wrong: a proposal-only stage has no patch to apply and no test path to find. `step-rules-gate` in particular used to read the inside of `python3 -c "…"` checks as shell paths — fixed in `c79d189a`; if a different gate vetoes again, reproduce it against that run's `plan.json` before touching the proposal |
 
 Every `rejected` row carries its reason in `halt_reason`, not only on the
 terminal it was printed to: a pre-dispatch filter writes its code
