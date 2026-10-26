@@ -1082,8 +1082,20 @@ def _default_implement(req: CycleRequest, cand: Candidate,
     if isinstance(landed, Abstain):
         return Implementation(wt, cfg, detail=f"land_patch abstained: {landed.reason}",
                               child_run_id=run_id, cost_usd=cost, verdict=verdict)
+    changed = tuple(_changed_files(wt))
+    # ``land_patch`` commits through a private index and checks nothing out, and
+    # a framework-edit child restores its own in-place diff before it exits
+    # (``[rollback] discard_worktree``). The branch therefore carries the fix
+    # while the working tree is back at ``HEAD~1`` — and every gate below
+    # measures the working tree. Cycle 12 (2026-10-26) showed the cost: lint and
+    # pytest passed against unfixed code and G8 re-measured the gap as still
+    # present. Materialise the commit before anything measures it.
+    problem = _restore_landed(Path(wt.path), changed)
+    if problem:
+        return Implementation(wt, cfg, detail=problem, child_run_id=run_id,
+                              cost_usd=cost, verdict=verdict)
     return Implementation(
-        wt, cfg, changed_files=tuple(_changed_files(wt)), diff=diff,
+        wt, cfg, changed_files=changed, diff=diff,
         verdict=verdict, child_run_id=run_id, cost_usd=cost,
     )
 
@@ -1150,6 +1162,48 @@ def _changed_files(wt) -> list[str]:
     except (OSError, subprocess.SubprocessError):
         return []
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+def _restore_landed(wt: Path, paths: Sequence[str], *,
+                    runner: Callable[..., Any] | None = None) -> str | None:
+    """Write the landed commit's bytes for ``paths`` into the working tree.
+
+    Returns ``None`` when the tree now matches ``HEAD`` for those paths, or a
+    one-sentence reason it does not — the caller refuses to measure a tree
+    nobody landed.
+
+    Deliberately *not* ``git reset``: the branch and the index are already
+    correct, only the checked-out bytes are stale, and a reset would also throw
+    away work the cycle did not create. ``checkout HEAD -- <paths>`` writes the
+    landed paths and nothing else, so a dirty path outside ``paths`` survives.
+
+    Restoring beats re-reading git in the gates: the gates are pure functions of
+    measured evidence, and the probes already take a tree path. Teaching each of
+    them to check out its own tree would spread git plumbing across the whole
+    measurement layer to save one checkout here.
+    """
+    if not paths:
+        return "the landed commit names no changed files, so there is nothing to measure"
+    run = runner or subprocess.run
+    try:
+        proc = run(["git", "-C", str(wt), "checkout", "HEAD", "--", *paths],
+                   capture_output=True, text=True, timeout=120, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"the landed tree could not be restored: {exc}"
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        return "the landed tree could not be restored: " + (detail[-1] if detail else f"rc={proc.returncode}")
+    try:
+        proc = run(["git", "-C", str(wt), "diff", "--name-only", "HEAD", "--", *paths],
+                   capture_output=True, text=True, timeout=120, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"the landed tree could not be verified: {exc}"
+    if proc.returncode != 0:
+        return "the landed tree could not be verified: " + (proc.stderr or "").strip()[:200]
+    dirty = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+    if dirty:
+        return "the working tree still differs from HEAD at " + ", ".join(dirty) + " after the restore"
+    return None
 
 
 def _child_cost(req: CycleRequest, run_id: str, rc: int) -> float:

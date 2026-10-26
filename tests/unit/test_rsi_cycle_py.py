@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import shutil
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,7 +40,7 @@ from mini_ork.rsi.cycle import (  # noqa: E402
 from mini_ork.rsi.gates import CriticVerdict, GateEvidence  # noqa: E402
 from mini_ork.rsi.harvest import HarvestReport  # noqa: E402
 from mini_ork.rsi.probes import ProbeResult  # noqa: E402
-from mini_ork.rsi.select import Proposal  # noqa: E402
+from mini_ork.rsi.select import Proposal, Selection  # noqa: E402
 from mini_ork.rsi.worktree import MergeResult  # noqa: E402
 from mini_ork.stores import lease, migrate  # noqa: E402
 
@@ -1041,3 +1042,187 @@ def test_the_post_db_falls_back_when_a_migration_fails(tmp_path):
     post = _post_tree(tmp_path / "post", "THIS IS NOT SQL;")
     assert cycle_mod._post_db(req, post) == cycle_mod._measured_db(req)
     assert cycle_mod._gap_at(req, _r8_candidate(), post, post=True) is True
+
+
+# --------------------------------------------------------------------------
+# VALIDATE measures the tree the patch landed, not the child's revert
+# --------------------------------------------------------------------------
+
+
+def _git(repo: Path, *args: str) -> str:
+    proc = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
+                          text=True, timeout=60, check=True)
+    return proc.stdout
+
+
+def _init_repo(repo: Path) -> None:
+    repo.mkdir(parents=True)
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+
+
+def _landed_but_reverted_repo(repo: Path) -> None:
+    """HEAD carries the fix; the working tree is back at ``HEAD~1``.
+
+    This is the live shape between IMPLEMENT and VALIDATE: ``land_patch``
+    commits through a private index without checking anything out, and a
+    framework-edit child restores its own in-place diff on the way out
+    (``[rollback] discard_worktree``). Cycle 12 (2026-10-26) measured exactly
+    this tree.
+    """
+    _init_repo(repo)
+    (repo / "a.py").write_text("pre\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+
+    (repo / "a.py").write_text("post\n", encoding="utf-8")
+    (repo / "db" / "migrations").mkdir(parents=True)
+    (repo / "db" / "migrations" / "0085_lane.sql").write_text(
+        "ALTER TABLE t ADD COLUMN lane TEXT;\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "fix")
+
+    # the child's per-path revert: the bytes go back, the commit stays
+    (repo / "a.py").write_text("pre\n", encoding="utf-8")
+    (repo / "db" / "migrations" / "0085_lane.sql").unlink()
+
+
+def test_the_landed_commit_is_written_back_into_the_worktree(tmp_path):
+    """Lint and pytest read files. A commit nobody checked out is invisible to them."""
+    repo = tmp_path / "wt"
+    _landed_but_reverted_repo(repo)
+    assert _git(repo, "status", "--porcelain").strip(), "the fixture must start dirty"
+
+    assert cycle_mod._restore_landed(repo, ("a.py", "db/migrations/0085_lane.sql")) is None
+
+    assert (repo / "a.py").read_text(encoding="utf-8") == "post\n"
+    assert (repo / "db" / "migrations" / "0085_lane.sql").is_file(), (
+        "a patch that adds a file is the case a revert deletes outright")
+    assert _git(repo, "status", "--porcelain") == "", "the tree now matches HEAD"
+
+
+def test_a_commit_that_names_no_files_is_not_measurable(tmp_path):
+    """Measuring the unchanged tree would credit a patch that touched nothing."""
+    problem = cycle_mod._restore_landed(tmp_path, ())
+    assert problem and "nothing to measure" in problem
+
+
+def test_a_restore_that_fails_is_reported_not_swallowed(tmp_path):
+    """A git refusal must reach the ledger as a reason, not as a passing gate."""
+
+    def _runner(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            argv, 1, "", "error: path 'a.py' does not exist in HEAD\n")
+
+    problem = cycle_mod._restore_landed(tmp_path, ("a.py",), runner=_runner)
+    assert problem and "does not exist in HEAD" in problem
+
+
+def test_a_restore_that_did_not_take_is_caught_by_the_verification(tmp_path):
+    """``checkout`` exiting 0 is not proof; the dirty check is."""
+    calls: list[list[str]] = []
+
+    def _runner(argv, **kwargs):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "" if len(calls) == 1 else "a.py\n", "")
+
+    problem = cycle_mod._restore_landed(tmp_path, ("a.py",), runner=_runner)
+    assert problem and "still differs from HEAD" in problem
+    assert "diff" in calls[1], "the second git call must be the verification"
+
+
+def test_implement_leaves_the_worktree_on_the_landed_commit(world, monkeypatch):
+    """The defect a live cycle paid for: gates measured the child's revert.
+
+    ``apply_patch`` here is a real commit followed by a real revert, which is
+    what ``land_patch`` + ``[rollback]`` produce together. Without the restore,
+    ``impl.changed_files`` is non-empty while the files the gates read are the
+    pre-fix ones.
+    """
+    repo = world.tmp / "wt"
+    _init_repo(repo)
+    (repo / "a.py").write_text("pre\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+
+    from mini_ork.rsi import worktree as wt_mod
+
+    monkeypatch.setattr(wt_mod, "claim_and_create", lambda cfg: SimpleNamespace(path=repo))
+    monkeypatch.setattr(wt_mod, "assert_worktree_root", lambda wt, runner=None: None)
+
+    def _apply(wt, diff, message=""):
+        (repo / "a.py").write_text("post\n", encoding="utf-8")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "fix")
+        (repo / "a.py").write_text("pre\n", encoding="utf-8")  # the child's revert
+        return "abc123"
+
+    monkeypatch.setattr(wt_mod, "apply_patch", _apply)
+
+    def _dispatch(req, wt, kickoff, child_home):
+        run_dir = child_home / "runs" / "rid"
+        run_dir.mkdir(parents=True)
+        (run_dir / "framework-edit.diff").write_text(
+            "diff --git a/a.py b/a.py\n", encoding="utf-8")
+        (run_dir / "verdict.json").write_text(
+            '{"pass": true, "files_changed": 1}', encoding="utf-8")
+        return "rid", 0, ""
+
+    monkeypatch.setattr(cycle_mod, "_dispatch_child", _dispatch)
+
+    req = CycleRequest(root=world.root, db=world.db, config=world.cfg, cycle_id="rsi-ctest")
+    cand = _cand(files=("a.py",))
+    selection = Selection(candidate_id=cand.candidate_id, accepted=True, files=("a.py",),
+                          verification_command=cand.success_command, kickoff="# k\n")
+
+    impl = cycle_mod._default_implement(req, cand, selection)
+
+    assert impl is not None and impl.landed_something, impl
+    assert impl.changed_files == ("a.py",)
+    assert (repo / "a.py").read_text(encoding="utf-8") == "post\n", (
+        "the gates measure the working tree; it must hold the landed fix")
+
+
+def test_a_failed_restore_is_an_implementation_detail_not_a_silent_pass(world, monkeypatch):
+    """If the tree cannot be restored, the cycle must reject — never measure it."""
+    repo = world.tmp / "wt"
+    _init_repo(repo)
+    (repo / "a.py").write_text("pre\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+
+    from mini_ork.rsi import worktree as wt_mod
+
+    monkeypatch.setattr(wt_mod, "claim_and_create", lambda cfg: SimpleNamespace(path=repo))
+    monkeypatch.setattr(wt_mod, "assert_worktree_root", lambda wt, runner=None: None)
+
+    def _apply(wt, diff, message=""):
+        (repo / "a.py").write_text("post\n", encoding="utf-8")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "fix")
+        return "abc123"
+
+    monkeypatch.setattr(wt_mod, "apply_patch", _apply)
+    monkeypatch.setattr(cycle_mod, "_restore_landed",
+                        lambda wt, paths: "the landed tree could not be restored: boom")
+
+    def _dispatch(req, wt, kickoff, child_home):
+        run_dir = child_home / "runs" / "rid"
+        run_dir.mkdir(parents=True)
+        (run_dir / "framework-edit.diff").write_text(
+            "diff --git a/a.py b/a.py\n", encoding="utf-8")
+        (run_dir / "verdict.json").write_text('{"pass": true}', encoding="utf-8")
+        return "rid", 0, ""
+
+    monkeypatch.setattr(cycle_mod, "_dispatch_child", _dispatch)
+
+    req = CycleRequest(root=world.root, db=world.db, config=world.cfg, cycle_id="rsi-ctest")
+    cand = _cand(files=("a.py",))
+    selection = Selection(candidate_id=cand.candidate_id, accepted=True, files=("a.py",),
+                          verification_command=cand.success_command, kickoff="# k\n")
+
+    impl = cycle_mod._default_implement(req, cand, selection)
+
+    assert impl is not None and not impl.landed_something, impl
+    assert "could not be restored" in impl.detail
