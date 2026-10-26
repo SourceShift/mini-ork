@@ -26,9 +26,11 @@ unexpected error (the hook maps that to fail-open; see ``.githooks/pre-push``).
 
 The verdict vocabulary at the gate level is ``approve`` / ``warn`` / ``block``
 / ``skipped`` / ``unavailable`` / ``empty``. Only ``approve`` / ``warn`` /
-``block`` are ever written to the cache — the database verdicts remain the
-review runtime's own ``pending`` / ``approve`` / ``warn`` / ``block`` /
-``aborted`` set, untouched by this module.
+``block`` are ever written to the cache, and never a degraded hybrid review
+(one whose LLM lenses all failed, or which recorded no lens run at all) — a
+transient lane outage must not pin a patch for the cache TTL. The database
+verdicts remain the review runtime's own ``pending`` / ``approve`` / ``warn``
+/ ``block`` / ``aborted`` set, untouched by this module.
 """
 from __future__ import annotations
 
@@ -343,6 +345,24 @@ def _lens_runs(review_id: int, db: Path) -> list[tuple]:
         con.close()
 
 
+def _lens_table_exists(db: Path) -> bool:
+    """Whether ``db`` has the ``review_lens_runs`` table.
+
+    ``_lens_runs`` returns ``[]`` both for "no rows" and for "no table"; the
+    fresh-review check needs to tell those apart. A read failure is reported as
+    "no table", so the caller falls back to the pre-R2d behaviour.
+    """
+    con = sqlite3.connect(str(db))
+    try:
+        con.execute("PRAGMA busy_timeout=5000")
+        return con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table'"
+            " AND name='review_lens_runs'"
+        ).fetchone() is not None
+    finally:
+        con.close()
+
+
 def _print_lens_runs(review_id: int, db: Path) -> None:
     """One evidence line per lens run; display only, never changes ``rc``."""
     try:
@@ -356,25 +376,35 @@ def _print_lens_runs(review_id: int, db: Path) -> None:
         return
 
 
-def _llm_lenses_all_failed(review_id: int, db: Path) -> tuple[bool, int]:
+def _llm_lenses_all_failed(
+    review_id: int, db: Path, *, fresh: bool = False
+) -> tuple[bool, int]:
     """``(True, n)`` when the review recorded lens runs and none succeeded.
 
-    ``n`` is the number of lens rows. A review with no lens rows — or a DB
-    without the ``review_lens_runs`` table — reports ``(False, 0)``: absence of
-    evidence is not the same as evidence that every lens failed.
+    ``n`` is the number of lens rows. With the default ``fresh=False``, a
+    review with no lens rows — or a DB without the ``review_lens_runs``
+    table — reports ``(False, 0)``: absence of evidence is not the same as
+    evidence that every lens failed.
+
+    ``fresh=True`` means the review *just ran* in hybrid mode. When the table
+    exists but holds no row for ``review_id``, a panel that ran recorded
+    nothing, so report ``(True, 0)``. A missing table is still ``(False, 0)``.
     """
     try:
         rows = _lens_runs(review_id, db)
+        if not rows:
+            if fresh and _lens_table_exists(db):
+                return True, 0
+            return False, 0
     except Exception:  # noqa: BLE001 — evidence must not flip the decision
-        return False, 0
-    if not rows:
         return False, 0
     return (not any(status == "ok" for _, status, _, _ in rows)), len(rows)
 
 
 def _no_llm_lens_warning(n: int) -> None:
+    detail = f"all {n} failed" if n >= 1 else "the panel is empty"
     print(
-        f"pre-push review: ⚠ no LLM lens ran (all {n} failed); "
+        f"pre-push review: ⚠ no LLM lens ran ({detail}); "
         "this verdict rests on heuristics only"
     )
 
@@ -509,12 +539,17 @@ def run_gate(
     # crash: the hook's rc mapping treats a crash as a block, the opposite of
     # the tier intent.
     cache_path = resolve_home(cwd, merged) / CACHE_REL
+    lens_state: tuple[bool, int] | None = None
     try:
         cache = _read_cache(cache_path)
         review_id = _cache_review_id(
             cache.get(pid), mode=mode, target=target, now=clock
         )
         cached = False
+        # A degraded cache entry — written before this guard existed, or by an
+        # older gate — must not pin the patch. Keep it in hand so a re-run that
+        # cannot happen leaves the earlier review standing.
+        degraded_stale: tuple[int, str] | None = None
         if review_id is not None:
             # Recompute so a dismissal (or a reopen) since the cached review
             # takes effect. A read-only/locked DB falls through to the stored
@@ -526,6 +561,12 @@ def run_gate(
             verdict = _db_verdict(review_id, db)
             if verdict in _TERMINAL_VERDICTS:
                 cached = True
+                if mode == "hybrid":
+                    all_failed, lens_count = _llm_lenses_all_failed(review_id, db)
+                    if all_failed and lens_count >= 1:
+                        degraded_stale = (review_id, verdict)
+                        review_id = None
+                        cached = False
             else:
                 review_id = None
         if review_id is None:
@@ -540,29 +581,49 @@ def run_gate(
             # ``<home>/config/local.sh``) cannot fail in 0 ms.
             if not merged.get("MINI_ORK_HOME"):
                 overrides["MINI_ORK_HOME"] = str(resolve_home(cwd, merged))
-            with scoped_environ(overrides):
-                review_id = int(
-                    (review_fn or review_run)(
-                        head_sha,
-                        target,
-                        mode=mode,
-                        base=resolved_base,
-                        cwd=str(cwd),
-                        db=str(db),
+            try:
+                with scoped_environ(overrides):
+                    review_id = int(
+                        (review_fn or review_run)(
+                            head_sha,
+                            target,
+                            mode=mode,
+                            base=resolved_base,
+                            cwd=str(cwd),
+                            db=str(db),
+                        )
                     )
-                )
-                verdict = _db_verdict(review_id, db)
-            if verdict in _TERMINAL_VERDICTS:
-                _write_cache(
-                    cache_path,
-                    cache,
-                    pid,
-                    review_id=review_id,
-                    mode=mode,
-                    target=target,
-                    now=clock,
-                )
-            _print_lens_runs(review_id, db)
+                    verdict = _db_verdict(review_id, db)
+            except Exception:  # noqa: BLE001 — see below
+                if degraded_stale is None:
+                    raise
+                # The degraded re-run could not happen: the earlier review is
+                # the best evidence there is, and the hybrid check below
+                # handles it (warn in the simple tier, block in the secure
+                # one). Never surface the exception, and never call this a
+                # cache miss in the output.
+                review_id, verdict = degraded_stale
+                cached = True
+            else:
+                if mode == "hybrid":
+                    # A hybrid review that just ran and recorded no successful
+                    # lens is degraded: warn, and do not cache it — a lane
+                    # outage must never outlive the retry.
+                    lens_state = _llm_lenses_all_failed(
+                        review_id, db, fresh=True
+                    )
+                degraded = bool(lens_state and lens_state[0])
+                if verdict in _TERMINAL_VERDICTS and not degraded:
+                    _write_cache(
+                        cache_path,
+                        cache,
+                        pid,
+                        review_id=review_id,
+                        mode=mode,
+                        target=target,
+                        now=clock,
+                    )
+                _print_lens_runs(review_id, db)
     except Exception as exc:  # noqa: BLE001
         return _unavailable(
             f"{type(exc).__name__}: {exc}", cwd=cwd, env=merged, target=target
@@ -573,7 +634,11 @@ def run_gate(
     # let heuristics alone approve the push. Applies to a cache hit too: the
     # cached review's lens rows are what the warning is about.
     if mode == "hybrid":
-        all_failed, lens_count = _llm_lenses_all_failed(review_id, db)
+        if lens_state is None:
+            # A cache hit (or a degraded re-run that fell back to its earlier
+            # review): the recorded rows are the evidence, so no ``fresh``.
+            lens_state = _llm_lenses_all_failed(review_id, db)
+        all_failed, lens_count = lens_state
         if all_failed:
             _no_llm_lens_warning(lens_count)
             try:
