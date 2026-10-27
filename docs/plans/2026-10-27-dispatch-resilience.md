@@ -95,6 +95,12 @@ explanations were tested:
    misses were single bad samples. R5c makes test gaming always high and
    lets the eval measure the configuration this home runs.
 
+**After R5c** (eval inputs v3, fingerprint b4d0ee6c, 577eaca6): with the
+round block its run received plus the new "test gaming is HIGH" line, K10
+blocks 3/3 and names the defect (0/2 with the same block before R5c).
+Overall: incidents 5/5, clean 0/7 false blocks, 1 error (clean-k4 timed out,
+now scored as an error), $2.47.
+
 ### Where failed-call time goes (14 days to 2026-10-27)
 
 48.8 hours over 1,073 failed `llm_calls` rows. Timeouts are 41 h (84%).
