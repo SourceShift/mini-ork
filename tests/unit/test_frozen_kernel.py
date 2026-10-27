@@ -369,7 +369,7 @@ def test_load_frozen_paths_missing_file_returns_nonempty_default(tmp_path: Path)
     from mini_ork.vcs.repo_integrity_guard import FROZEN_PATHS_DEFAULT, load_frozen_paths
     got = load_frozen_paths(str(tmp_path / "does-not-exist"))
     assert got == FROZEN_PATHS_DEFAULT
-    assert len(got) == 14
+    assert len(got) == 22
 
 
 def test_load_frozen_paths_garbage_file_returns_default(tmp_path: Path) -> None:

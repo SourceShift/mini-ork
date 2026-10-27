@@ -1,9 +1,11 @@
 version: 1
-# Paths no run's authored patch may change. Enforced by the in-place publisher
-# (mini_ork/cli/publisher_authored_patch.py land_patch) on EVERY run — a plain
-# run and an auto-opened (origin=auto-triage) framework-edit alike — which
-# refuses the patch (abstain reason publish-frozen-path) before it is applied or
-# published. The list is unioned with the engine's built-in floor
+# Paths no self-driving change may alter. Enforced at publish by
+# mini_ork/cli/publisher_authored_patch.py land_patch for every in-place run
+# (and every RSI-cycle land), by the framework-edit verifier for auto-opened
+# (origin=auto-triage) runs, by the RSI cycle's selector, by the apply loop, and
+# at merge as a high risk tier (mini_ork/gates/merge_risk.py) that needs a
+# person's approval.
+# The list is unioned with the engine's built-in floor
 # (mini_ork/vcs/repo_integrity_guard.FROZEN_PATHS_DEFAULT), so a diff cannot
 # unfreeze a path by rewriting this file; the operator's single override token
 # is MO_ALLOW_FROZEN_EDIT=1.
@@ -31,6 +33,21 @@ paths:
   - mini_ork/dispatch/cost_pause.py
   - mini_ork/stores/safety_events.py
   - mini_ork/observability/bug_report.py
+  # The self-driving policy's INPUTS (RSI Tier-1 #4). The frozen escalation
+  # policy decides only from what these hand it: layer/route (diagnose,
+  # diagnoser_llm), the calibrated bar's labelled rows (diagnosis_ledger,
+  # labelled by supervisor R2), the cap/breaker/bar inputs (escalation
+  # gather_inputs), the DAG edits the supervisor applies (graph_patch), the
+  # publish-time refusal (publisher_authored_patch.land_patch) and the
+  # merge-time reader of this list (gates/merge_risk).
+  - mini_ork/recovery/escalation.py
+  - mini_ork/recovery/diagnose.py
+  - mini_ork/recovery/diagnoser_llm.py
+  - mini_ork/recovery/supervisor.py
+  - mini_ork/recovery/graph_patch.py
+  - mini_ork/stores/diagnosis_ledger.py
+  - mini_ork/cli/publisher_authored_patch.py
+  - mini_ork/gates/merge_risk.py
   # The code-fix probe fixtures are the measurement floor the code-fix probes
   # score against: a run that edits them moves its own goalposts. The glob
   # covers all three fixture subtrees (and any future one) — never a file list,

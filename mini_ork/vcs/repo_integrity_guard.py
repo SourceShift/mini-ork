@@ -39,13 +39,15 @@ import os
 import subprocess
 
 # ── frozen kernel ───────────────────────────────────────────────────────────
-# The paths an auto-opened (origin=auto-triage) framework-edit epic may never
-# change: the escalation policy, the circuit breaker, the budget pause, the
-# abstention gate, the sandbox, the integrity guard, the verifier that enforces
-# all of this, and the list itself. This built-in list is the FLOOR: it is the
-# fail-closed fallback for a missing/unparsable ``config/kernel-frozen.yaml`` and
-# the guaranteed minimum every consumer unions with the file, so a diff can never
-# unfreeze a path by editing (or deleting) the list.
+# The frozen kernel is the fail-closed floor every enforcement point unions with.
+# The same paths are refused at publish by
+# ``mini_ork/cli/publisher_authored_patch.py`` ``land_patch`` (every in-place run
+# and every RSI-cycle land), by the framework-edit verifier for auto-opened
+# (origin=auto-triage) runs, by the RSI cycle's selector, by the apply loop, and
+# at merge as a high risk tier in ``mini_ork/gates/merge_risk.py``. This built-in
+# list is the floor: a consumer that cannot read ``config/kernel-frozen.yaml``
+# still enforces these, and every consumer unions the file's entries with them,
+# so a diff can never unfreeze a path by editing (or deleting) the list.
 FROZEN_CONFIG_RELPATH = os.path.join("config", "kernel-frozen.yaml")
 
 FROZEN_PATHS_DEFAULT: list[str] = [
@@ -67,6 +69,15 @@ FROZEN_PATHS_DEFAULT: list[str] = [
     "mini_ork/dispatch/cost_pause.py",
     "mini_ork/stores/safety_events.py",
     "mini_ork/observability/bug_report.py",
+    # The self-driving policy's inputs (RSI Tier-1 #4).
+    "mini_ork/recovery/escalation.py",
+    "mini_ork/recovery/diagnose.py",
+    "mini_ork/recovery/diagnoser_llm.py",
+    "mini_ork/recovery/supervisor.py",
+    "mini_ork/recovery/graph_patch.py",
+    "mini_ork/stores/diagnosis_ledger.py",
+    "mini_ork/cli/publisher_authored_patch.py",
+    "mini_ork/gates/merge_risk.py",
 ]
 
 
