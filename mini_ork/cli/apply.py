@@ -753,14 +753,45 @@ def _frozen_target(target_file: str) -> list[str]:
         os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
     real_root = os.path.realpath(root)
     real = os.path.realpath(target_file)
-    rel = os.path.relpath(real, real_root).replace(os.sep, "/")
-    if rel == ".." or rel.startswith("../"):
-        return []
     from mini_ork.vcs.repo_integrity_guard import (
         enforced_frozen_paths,
         frozen_hits,
     )
-    return frozen_hits([rel], enforced_frozen_paths(real_root))
+    patterns = enforced_frozen_paths(real_root)
+    rel = os.path.relpath(real, real_root).replace(os.sep, "/")
+    if not (rel == ".." or rel.startswith("../")):
+        hits = frozen_hits([rel], patterns)
+        if hits:
+            return hits
+    # A string match misses a case variant on a case-insensitive filesystem
+    # (macOS APFS: ``MINI_ORK/recovery/x.py`` IS ``mini_ork/recovery/x.py``)
+    # and a hardlink, which may even live outside the tree. Both are the same
+    # file, so compare (device, inode) against every enforced frozen file.
+    return _frozen_by_inode(real, real_root, patterns)
+
+
+def _frozen_by_inode(real: str, real_root: str, patterns: list[str]) -> list[str]:
+    """Frozen paths (repo-relative) that are the same file as ``real``.
+
+    ``[]`` when ``real`` does not exist (a new file cannot be a frozen one) or
+    matches none. Globs in ``patterns`` are expanded under ``real_root``.
+    """
+    import glob as _glob
+
+    try:
+        st = os.stat(real)
+    except OSError:
+        return []
+    key = (st.st_dev, st.st_ino)
+    for pattern in patterns:
+        for path in _glob.glob(os.path.join(real_root, pattern), recursive=True):
+            try:
+                other = os.stat(path)
+            except OSError:
+                continue
+            if (other.st_dev, other.st_ino) == key:
+                return [os.path.relpath(path, real_root).replace(os.sep, "/")]
+    return []
 
 
 def _record_frozen_refusal(paths: list[str], *, candidate_id: str = "",

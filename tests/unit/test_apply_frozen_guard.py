@@ -114,6 +114,33 @@ def test_frozen_target_symlink_to_frozen(engine):
     assert ap._frozen_target(str(evil)) == ["mini_ork/recovery/auto_repair.py"]
 
 
+def test_frozen_target_hardlink_outside_tree(engine, tmp_path):
+    # Review fix: a hardlink is the frozen file under another name, even
+    # outside the engine tree; writing through it edits the frozen file.
+    link = tmp_path / "hardlinked.py"
+    os.link(engine.frozen, link)
+    assert ap._frozen_target(str(link)) == ["mini_ork/recovery/auto_repair.py"]
+
+
+def test_frozen_target_hardlink_inside_prompts(engine):
+    link = engine.recipe_dir / "prompts" / "hl.md"
+    os.link(engine.frozen, link)
+    assert ap._frozen_target(str(link)) == ["mini_ork/recovery/auto_repair.py"]
+
+
+def test_frozen_target_case_variant(engine):
+    # Review fix: on a case-insensitive filesystem (macOS APFS) a case variant
+    # names the frozen file itself; a string match alone would miss it.
+    variant = engine.root / "MINI_ORK" / "Recovery" / "AUTO_REPAIR.py"
+    if not variant.exists():
+        pytest.skip("case-sensitive filesystem: the variant is a different path")
+    assert ap._frozen_target(str(variant)) == ["mini_ork/recovery/auto_repair.py"]
+
+
+def test_frozen_target_new_file_is_not_frozen(engine):
+    assert ap._frozen_target(str(engine.recipe_dir / "prompts" / "new.md")) == []
+
+
 # ── _record_frozen_refusal ──────────────────────────────────────────────────
 
 def test_record_frozen_refusal_never_raises(engine, monkeypatch, tmp_path):
