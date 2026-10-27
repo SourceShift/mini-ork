@@ -12,7 +12,8 @@ Covered (see the kickoff's mechanism list):
 2. ``kickoff-contract.py`` pins ``PATH`` to ``dirname(sys.executable)`` so a
    bare ``python3`` in a measure resolves the verifier's interpreter.
 3. A command failing on both the patched and the base copy is recorded as a
-   non-gating ``base-fails`` abstention; a patched-only failure stays a
+   non-gating ``base-fails`` abstention when both fail with the SAME exit
+   code; a different base exit code, or a patched-only failure, stays a
    gating regression.
 4. Two overlapping glob tokens reach pytest as concrete files, each once.
 """
@@ -271,3 +272,27 @@ def test_overlapping_globs_reach_pytest_as_each_file_once(tmp_path: Path) -> Non
     for name in ("test_ide_pages_run_learnings_a.py", "test_ide_pages_run_b.py"):
         assert basenames.count(name) == 1, (name, args)
     assert not [token for token in args if set("*?[") & set(token)], args
+
+
+def test_failure_with_a_different_exit_code_on_the_base_stays_gating(tmp_path: Path) -> None:
+    """A base failure excuses the patched one only when it is the SAME failure.
+
+    Patched rc=1 (marker is PATCHED) vs base rc=4 (marker is BASE) is the
+    measured incident shape: the base copy cannot run the same check at all,
+    so the failure must stay gating and no ``base-fails`` row may appear.
+    """
+    dump = tmp_path / "runs.txt"
+    cmd = ("{ pwd; cat marker.txt; } >> " + shlex.quote(str(dump))
+           + "; if grep -q BASE marker.txt; then exit 4; else exit 1; fi")
+    repo, ref = _target_repo(tmp_path, {"marker.txt": "BASE\n"})
+    run = _run_dir(tmp_path, repo, ref, [cmd])
+
+    data = _envelope(_run_verifier(VERIFIER_TEST, repo, run))
+
+    _, markers = _base_markers(dump)
+    assert markers.count("PATCHED") == 1, markers
+    assert markers.count("BASE") >= 1, markers
+    assert not [c for c in data["checks"] if c.get("failure_kind") == "base-fails"], data["checks"]
+    assert data["pass"] is False, data
+    assert data["failed_checks"], data
+    assert "[base-differs]" in (run / "verifier-test.log").read_text()

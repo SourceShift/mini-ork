@@ -700,8 +700,10 @@ def _epic_verification_commands_pass():
         # A command the pre-patch tree also fails is an environment/base
         # failure, not a regression introduced by the diff. Replay it ONCE on
         # the base copy (built lazily, so a green run pays nothing) before
-        # blaming the change. Base-passes => a real regression; base-fails =>
-        # a non-gating abstention in the envelope.
+        # blaming the change. Base-passes => a real regression; base fails with
+        # the SAME exit code => a non-gating abstention in the envelope; base
+        # fails differently => the base cannot run the same check, so it stays
+        # gating.
         if not base_ready:
             try:
                 base_ready = bool(_make_base_copy())
@@ -720,7 +722,7 @@ def _epic_verification_commands_pass():
         base_rc, base_timed_out = _run_acceptance_command(BASE_WORKTREE, cmd)
         if base_timed_out:
             return False
-        if base_rc != 0:
+        if base_rc != 0 and base_rc == rc:
             _IMPLICIT_CHECKS.append({
                 "name": "epic-verification-commands-base-fails",
                 "expected": "command passes on the patched copy; a failure the base shares is not the diff's",
@@ -738,6 +740,12 @@ def _epic_verification_commands_pass():
                 f"(rc={base_rc}); recording a non-gating abstention\n")
             _ev.flush()
             continue
+        if base_rc != 0:
+            _ev.write(
+                f"  [base-differs] `{cmd}` fails on the patched copy (rc={rc}) "
+                f"and differently on the base copy (rc={base_rc}): the base "
+                "cannot run the same check, so the failure stays gating\n")
+            _ev.flush()
         return False
     return True
 
