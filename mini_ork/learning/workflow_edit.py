@@ -249,23 +249,10 @@ def apply_edit(document: Mapping[str, Any], edit: str | Mapping[str, Any]) -> di
             current.append(tool)
         elif tool in current:
             current = [item for item in current if item != tool]
-        elif not current:
-            # Nothing named and nothing to prune: an un-tooled node must not
-            # gain an empty ``tools[group]`` from a revoke.
-            raise WorkflowEditError(f"no-op: {tool!r} is not granted")
-        elif _tool_granted_elsewhere(nodes, target_index, group, tool):
-            # The named tool is a workflow capability, but this node does not
-            # hold it.  A revoke prunes the group down to grants that remain
-            # capabilities of another node: those are the only entries the
-            # no-new-capability rule can ever re-grant.  The prune is
-            # order-independent — it never depends on where a grant sits in
-            # the YAML list.
-            current = [
-                item
-                for item in current
-                if _tool_granted_elsewhere(nodes, target_index, group, item)
-            ]
         else:
+            # Revoking a tool this node does not hold is a no-op, whether or
+            # not another node holds it. It must never touch the node's other
+            # grants.
             raise WorkflowEditError(f"no-op: {tool!r} is not granted")
 
         tools[group] = current
@@ -306,6 +293,15 @@ def schema_errors(document: Any, *, schema_path: str | Path | None = None) -> li
         location = "/".join(str(part) for part in error.absolute_path) or "<root>"
         errors.append(f"{location}: {error.message}")
     return sorted(errors)
+
+
+_COMMENT_RE = re.compile(r"(^|\s)#")
+
+
+def comment_lines(text: str) -> int:
+    """Lines of ``text`` that carry a YAML comment (conservative: a ``#`` that
+    starts a line or follows whitespace). ``render`` drops every comment."""
+    return sum(1 for line in text.splitlines() if _COMMENT_RE.search(line))
 
 
 def render(document: Mapping[str, Any]) -> str:
@@ -399,11 +395,29 @@ def materialize(
         "after_sha256": sha256_text(after_text),
         "before_order": before_order,
         "after_order": after_order,
+        # ``render`` re-emits the whole document, so every comment and the
+        # original layout are lost on write; apply_to_file refuses that unless
+        # the caller passes allow_reformat=True.
+        "comments_dropped": comment_lines(before_text),
     }
 
 
-def apply_to_file(workflow_path: str | Path, result: Mapping[str, Any]) -> bool:
-    """Write ``result['after_text']`` iff the file still matches its before hash."""
+def apply_to_file(workflow_path: str | Path, result: Mapping[str, Any], *,
+                  allow_reformat: bool = False) -> bool:
+    """Write ``result['after_text']`` iff the file still matches its before hash.
+
+    The write re-renders the whole document, which drops every YAML comment and
+    the original layout (``rollback`` restores both byte-for-byte). It is refused
+    with ``WorkflowEditError`` when the live file carries comments, unless the
+    caller passes ``allow_reformat=True`` deliberately.
+    """
+    dropped = int(result.get("comments_dropped", 0) or 0)
+    if dropped and not allow_reformat:
+        raise WorkflowEditError(
+            f"refusing to write {workflow_path}: the re-render would drop "
+            f"{dropped} comment line(s) and the original layout; pass "
+            "allow_reformat=True to accept (rollback restores the original bytes)"
+        )
     if file_sha256(workflow_path) != result["before_sha256"]:
         return False
     Path(workflow_path).write_text(result["after_text"], encoding="utf-8")

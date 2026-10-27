@@ -203,16 +203,17 @@ def test_tool_revoke_missing_tool_is_noop(base_doc):
         )
 
 
-def test_tool_revoke_missing_but_known_capability_prunes_non_capabilities(base_doc):
-    # `Bash` exists in the workflow (on `lint`) but not on `implementer`.  The
-    # revoke prunes grants that are not capabilities of another node, so
-    # `Write` (held only by `implementer`) goes and `Read` (shared with
-    # `docs`/`lint`) stays.  The prune is order-independent.
-    out = we.apply_edit(
-        base_doc,
-        {"op": "tool_grant", "node": "implementer", "group": "native", "tool": "Bash", "grant": False},
-    )
-    assert _node(out, "implementer")["tools"]["native"] == ["Read"]
+def test_tool_revoke_tool_held_only_elsewhere_is_noop(base_doc):
+    # Review fix: `Bash` is on `lint`, not on `implementer`. Revoking it from
+    # `implementer` is a no-op error and must never touch implementer's other
+    # grants (an earlier version pruned `Write` here).
+    snapshot = copy.deepcopy(base_doc)
+    with pytest.raises(we.WorkflowEditError, match="no-op"):
+        we.apply_edit(
+            base_doc,
+            {"op": "tool_grant", "node": "implementer", "group": "native", "tool": "Bash", "grant": False},
+        )
+    assert base_doc == snapshot
 
 
 def test_tool_revoke_missing_capability_from_untooled_node_is_noop(base_doc):
@@ -274,6 +275,7 @@ def test_materialize_result_shape(wf_path):
         "after_sha256",
         "before_order",
         "after_order",
+        "comments_dropped",
     }
     assert result["edit"] == we.parse_edit(
         {"op": "lane_pin", "node": "implementer", "lane": "glm"}
@@ -387,3 +389,23 @@ def test_render_and_sha_helpers(tmp_path):
     assert isinstance(we.LANE_NODE_TYPES, frozenset)
     assert (we.RETRY_MIN, we.RETRY_MAX, we.DEFAULT_MAX_ATTEMPTS) == (1, 5, 3)
     assert len(we.__all__) == 12
+
+
+def test_apply_to_file_refuses_to_drop_comments(tmp_path):
+    # Review fix: the re-render drops YAML comments, so a commented live file
+    # is refused unless the caller accepts the reformat explicitly.
+    path = tmp_path / "workflow.yaml"
+    path.write_text("# operator note: keep the lint gate first\n" + FIXTURE_YAML, encoding="utf-8")
+    result = we.materialize(path, {"op": "lane_pin", "node": "implementer", "lane": "glm"})
+    assert result["comments_dropped"] == 1
+    original = path.read_bytes()
+    with pytest.raises(we.WorkflowEditError, match="comment line"):
+        we.apply_to_file(path, result)
+    assert path.read_bytes() == original
+    assert we.apply_to_file(path, result, allow_reformat=True) is True
+    assert we.rollback(path, result) is True
+    assert path.read_bytes() == original
+
+
+def test_comment_lines_counts_hash_comments():
+    assert we.comment_lines("a: 1\n# x\nb: 2  # y\nc: 'a#b'\n") == 2
