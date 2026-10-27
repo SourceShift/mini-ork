@@ -650,6 +650,15 @@ def _finish(req: CycleRequest, rt: Runtime, con, status: str, *, rc: int,
     if measured != Path(req.db):
         # Provenance for G8/G9: which DB the before/after actually read.
         fields.setdefault("baseline_json", {"db": str(measured)})
+    # Every terminal path records what the cycle spent, including the ones that
+    # die before they can measure it themselves: `_cycle_spend` sums the ledger
+    # by run-id prefix, so a rejected or halted cycle still shows its bill. A
+    # call site may override with a narrower measurement (merge and quarantine
+    # pass the child's own cost); it cannot leave the column at its default.
+    # Cycle 21 (2026-10-27) spent $1.68 across SUGGEST and a child that hit its
+    # wall, and the `implement_empty` row — the one path that passes no cost in
+    # `extra` — recorded `cost_usd = 0.0`.
+    fields.setdefault("cost_usd", _cycle_spend(req))
     fields.update(extra or {})
     if not req.dry_run:
         ledger.finish_cycle(con, req.cycle_id, now=rt.clock(), status=status, **fields)

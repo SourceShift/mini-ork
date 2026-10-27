@@ -676,6 +676,33 @@ def test_an_empty_diff_is_a_rejection_that_cleans_its_worktree(world):
     assert _cycle(world.db)["halt_reason"].startswith("implement_empty: ")
 
 
+def _seed_spend(db: Path, run_id: str, cost: float) -> None:
+    """Give ``_cycle_spend`` something to sum — the production DB's ``llm_calls``
+    is not part of the rsi migration set this fixture applies."""
+    con = sqlite3.connect(str(db))
+    try:
+        con.execute("CREATE TABLE IF NOT EXISTS llm_calls (run_id TEXT, cost_usd REAL)")
+        con.execute("INSERT INTO llm_calls (run_id, cost_usd) VALUES (?, ?)", (run_id, cost))
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_a_rejected_cycle_still_records_what_it_spent(world):
+    h = Harness(world)
+    h.runtime.implement = lambda req, cand, sel: Implementation(
+        worktree=SimpleNamespace(path=world.root), detail="the child produced no diff",
+        child_run_id="rsi-ctest-fe")
+    _seed_spend(world.db, "rsi-ctest-rsi-cycle", 0.53)
+    _seed_spend(world.db, "rsi-ctest-fe", 0.86)
+    out = h.run()
+    assert out.status == "rejected"
+    # A rejected cycle is not a free cycle: SUGGEST and the child both billed.
+    # Cycle 21 (2026-10-27) spent $1.68 this way and the row said $0.00, which
+    # is the one measurement the per-cycle budget and the credit table read.
+    assert _cycle(world.db)["cost_usd"] == pytest.approx(1.39)
+
+
 def test_a_rejected_selection_never_reaches_implement(world):
     h = Harness(world)
     h.runtime.propose = lambda req, cand: Proposal(
