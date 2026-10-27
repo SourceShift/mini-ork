@@ -16,9 +16,10 @@ Three readers used to disagree about the same kickoff text (LF-R8):
 Polarity is clause-aware inside an allow section: a negative clause (one that
 starts with a ``do not`` trigger or ``except``, or that reads
 ``leave|keep … untouched|unchanged|alone|as-is``) denies the paths it names, so
-``Leave `.mini-ork/` (run state) untouched`` no longer lands in ``allow`` —
-with the known limit that a negative clause wrapped across two physical lines
-only denies the paths on its first line.
+``Leave `.mini-ork/` (run state) untouched`` no longer lands in ``allow``. The
+clauses are read from logical lines (``_logical_lines``), so a sentence wrapped
+across physical lines keeps its polarity on every line: a hard-wrapped
+``Do NOT modify `a`, `b`,`` / ``` `c`. ``` denies all three.
 
 This module is pure — no I/O, no environment, no imports from the rest of
 ``mini_ork`` — so every caller can share the parse without a cycle. Callers:
@@ -182,24 +183,19 @@ def kickoff_scope(text: str) -> dict:
     appears in both lists stays only in ``deny``: a scope the kickoff rules out
     is never also allowed.
 
-    In a ``deny`` section every path on the line is denied, as before. In an
-    ``allow`` section the physical line is split into clauses
-    (``_SENTENCE_SPLIT_RE``) — the first clause keeps the line's list marker, so
-    a bare bullet head still parses — and each clause's paths go to ``deny``
-    when ``_negative_clause`` reads the clause as negative, else to ``allow``.
+    In a ``deny`` section every path on the logical line is denied, as before.
+    In an ``allow`` section the logical line (a paragraph or list item with its
+    hard-wrapped continuations joined — ``_logical_lines(keep_marker=True)``,
+    so a bare bullet head still parses) is split into clauses
+    (``_SENTENCE_SPLIT_RE``) and each clause's paths go to ``deny`` when
+    ``_negative_clause`` reads the clause as negative, else to ``allow``.
     """
     allow: list[str] = []
     deny: list[str] = []
     seen_allow: set[str] = set()
     seen_deny: set[str] = set()
     current: str | None = None
-    in_fence = False
-    for line in (text or "").splitlines():
-        if _FENCE_RE.match(line):
-            in_fence = not in_fence
-            continue
-        if in_fence:
-            continue
+    for line in _logical_lines(text, keep_marker=True):
         m = _HEADING_RE.match(line)
         if m:
             current = heading_kind(m.group(2))
@@ -282,7 +278,7 @@ def _starts_with_trigger(sentence: str) -> bool:
     return any(t.startswith(w) for w in _TRIGGERS)
 
 
-def _logical_lines(text: str) -> list[str]:
+def _logical_lines(text: str, *, keep_marker: bool = False) -> list[str]:
     """Paragraphs and list items, each one line, heading and fences aside.
 
     A list item swallows its continuation lines — indented, or flush-left
@@ -290,6 +286,11 @@ def _logical_lines(text: str) -> list[str]:
     columns) — so a rule split across a wrap is one sentence. A heading line is
     its own logical line and never joins the text under it. Fenced blocks
     contribute nothing.
+
+    With ``keep_marker=True`` a list item's logical line starts with the item's
+    raw line stripped (marker included) instead of the text after the marker,
+    so ``paths_in_line`` can still read a bare bullet head. Continuation
+    joining, headings, blank lines and fences are unchanged.
     """
     out: list[str] = []
     buf = ""
@@ -318,7 +319,7 @@ def _logical_lines(text: str) -> list[str]:
         m = _LIST_MARKER_RE.match(raw)
         if m:
             flush()
-            buf = raw[m.end():].strip()
+            buf = raw.strip() if keep_marker else raw[m.end():].strip()
             continue
         buf = f"{buf} {raw.strip()}" if buf else raw.strip()
     flush()

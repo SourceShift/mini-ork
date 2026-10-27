@@ -9,7 +9,11 @@ Hermetic: inline text only, no I/O, no environment.
 """
 from __future__ import annotations
 
-from mini_ork.kickoff_scope import do_not_sentences, kickoff_scope
+from mini_ork.kickoff_scope import (
+    _logical_lines,
+    do_not_sentences,
+    kickoff_scope,
+)
 
 # The kickoff's template, exactly as written — including the wrap on the third
 # bullet line.
@@ -84,3 +88,86 @@ def test_deny_sections_are_unchanged():
     scope = kickoff_scope(_scoped("## Out of scope", "- `z/` (keep it)"))
     assert "z/" in scope["deny"]
     assert "z/" not in scope["allow"]
+
+
+# ─── wrapped "do not" sentences keep their polarity on every line ───────────
+
+# Every fixture below sits under the allow-kind heading the kickoff names.
+_SCOPE_HEADING = "## Files in scope (touch ONLY these)"
+# `paths_in_line` admits only path-like tokens (a `/` or a trailing `.ext`),
+# so the kickoff's shorthand `a`/`b` are spelled `a.py`/`b.py` here.
+_WRAPPED_DENY = (
+    _SCOPE_HEADING + "\n"
+    "\n"
+    "- `a/x.py`\n"
+    "\n"
+    "Do NOT modify `a/y.py`, `a/z.py`,\n"
+    "`recipes/`, `docs/` (note), or any path in\n"
+    "`config/kernel-frozen.yaml`. Every existing test must pass.\n"
+)
+
+
+def test_a_wrapped_deny_sentence_denies_every_wrapped_path():
+    """Kickoff test 1: the Goal's wrapped sentence, with a bullet before it."""
+    scope = kickoff_scope(_WRAPPED_DENY)
+    assert scope["allow"] == ["a/x.py"]
+    for denied in ("a/y.py", "a/z.py", "recipes/", "docs/",
+                   "config/kernel-frozen.yaml"):
+        assert denied in scope["deny"]
+    assert "a/x.py" not in scope["deny"]
+
+
+def test_a_new_sentence_after_a_terminated_deny_is_allowed():
+    """Kickoff test 2: `Do not modify `a`.` then `Also edit `b`.`."""
+    scope = kickoff_scope(
+        _scoped(_SCOPE_HEADING,
+                "Do not modify `a.py`.",
+                "Also edit `b.py`."))
+    assert scope["allow"] == ["b.py"]
+    assert scope["deny"] == ["a.py"]
+
+
+def test_a_bullet_with_a_wrapped_description_stays_allowed():
+    """Kickoff test 3: a wrapped description is part of the same bullet."""
+    scope = kickoff_scope(
+        _scoped(_SCOPE_HEADING,
+                "- `a.py` (new;",
+                "  do not add tests here)"))
+    assert scope["allow"] == ["a.py"]
+    assert "a.py" not in scope["deny"]
+
+
+def test_a_bare_bullet_head_still_parses():
+    """Kickoff test 4: `- mini_ork/foo.py` (no backticks) is in scope."""
+    scope = kickoff_scope(_scoped(_SCOPE_HEADING, "- mini_ork/foo.py"))
+    assert scope["allow"] == ["mini_ork/foo.py"]
+    assert "mini_ork/foo.py" not in scope["deny"]
+
+
+def test_a_blank_line_ends_the_sentence():
+    """Kickoff test 5: the paragraph after a blank line is a new sentence."""
+    scope = kickoff_scope(
+        _scoped(_SCOPE_HEADING,
+                "Do not modify `a.py`,",
+                "",
+                "`b.py` is in scope."))
+    assert scope["allow"] == ["b.py"]
+    assert scope["deny"] == ["a.py"]
+
+
+def test_a_semicolon_ends_the_clause():
+    """Kickoff test 6: `Do not modify `a`; edit` / ``b` instead.`"""
+    scope = kickoff_scope(
+        _scoped(_SCOPE_HEADING,
+                "Do not modify `a.py`; edit",
+                "`b.py` instead."))
+    assert scope["allow"] == ["b.py"]
+    assert scope["deny"] == ["a.py"]
+
+
+def test_logical_lines_default_strips_the_list_marker():
+    """Kickoff test 7: `keep_marker=False` keeps the strip-marker behaviour."""
+    text = "- a\n  b\n1. c\n"
+    assert _logical_lines(text) == ["a b", "c"]
+    assert _logical_lines(text, keep_marker=False) == ["a b", "c"]
+    assert _logical_lines(text, keep_marker=True) == ["- a b", "1. c"]
