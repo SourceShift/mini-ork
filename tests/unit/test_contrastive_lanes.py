@@ -84,8 +84,8 @@ def _row(db_path, pid):
 def test_constants():
     assert contrastive_lanes.EXCLUDED_REASONS == frozenset(
         {"verdict_revise", "verdict_fail", "impl_moved_base"})
-    assert contrastive_lanes.INFRA_REASONS == frozenset(
-        {"error", "timeout", "cost_limit"})
+    # The engine's non-learnable exits (execute._NON_LEARNABLE_FINISH_REASONS).
+    assert contrastive_lanes.INFRA_REASONS == frozenset({"timeout", "cost_limit"})
     assert contrastive_lanes.MIN_RUNS_FLOOR == 3
 
 
@@ -170,6 +170,30 @@ def test_find_pairs_infra_kind(db):
     con.close()
     assert pairs[0]["kind"] == "infra"
     assert pairs[0]["loser_reasons"] == ["timeout"]
+
+
+@pytest.mark.parametrize("reason", ["error", ""])
+def test_find_pairs_error_and_empty_reason_are_quality(db, reason):
+    # Review fix: `error` and an empty finish_reason are valid, learnable
+    # failures (1,236 of 1,732 live failures), not plumbing.
+    con = sqlite3.connect(db)
+    _pair(con, "r1", reason=reason)
+    pairs = contrastive_lanes.find_pairs(con)
+    con.close()
+    assert pairs[0]["kind"] == "quality"
+
+
+def test_find_pairs_infra_failed_validity_is_infra(db):
+    # A trace the engine labelled validity='infra_failed' is infra even when its
+    # finish_reason is empty.
+    con = sqlite3.connect(db)
+    _w, loser = _pair(con, "r1", reason="")
+    con.execute("UPDATE execution_traces SET validity='infra_failed' WHERE trace_id=?",
+                (loser,))
+    con.commit()
+    pairs = contrastive_lanes.find_pairs(con)
+    con.close()
+    assert pairs[0]["kind"] == "infra"
 
 
 @pytest.mark.parametrize("bad", [

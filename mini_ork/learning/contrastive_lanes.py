@@ -32,7 +32,13 @@ from mini_ork.context import context_env
 EXCLUDED_REASONS = frozenset({"verdict_revise", "verdict_fail", "impl_moved_base"})
 
 # Failures that describe the plumbing, not the lane. Report-only evidence.
-INFRA_REASONS = frozenset({"error", "timeout", "cost_limit"})
+# Exactly the engine's non-learnable exits (mini_ork/cli/execute.py
+# _NON_LEARNABLE_FINISH_REASONS), the ones it labels validity='infra_failed'.
+# `error` and an empty finish_reason are valid, learnable failures: on live data
+# they are 1,236 of 1,732 failed traces, so classing them as infra would leave
+# almost nothing to mine and mine the noise instead.
+INFRA_REASONS = frozenset({"timeout", "cost_limit"})
+INFRA_VALIDITY = "infra_failed"
 
 # A key must recur across at least this many independent runs before it can be
 # written. The floor may be raised by configuration, never lowered.
@@ -58,9 +64,15 @@ def find_pairs(
     Malformed rows (bad JSON, non-dict verifier output, trace-id/node-type
     mismatch, empty lane, empty run) are skipped. A missing table returns ``[]``.
     """
+    try:
+        cols = {r[1] for r in con.execute("PRAGMA table_info(execution_traces)")}
+    except sqlite3.OperationalError:
+        return []
+    validity_expr = ("COALESCE(validity, 'valid')" if "validity" in cols
+                     else "'valid'")
     sql = (
         "SELECT trace_id, run_id, task_class, agent_version_id, status, "
-        "verifier_output FROM execution_traces "
+        f"verifier_output, {validity_expr} FROM execution_traces "
         "WHERE status IN ('success','failure')"
     )
     params: list[Any] = []
@@ -77,7 +89,7 @@ def find_pairs(
     #               "failure": {lane: [(trace_id, reason)]}}
     groups: dict[tuple, dict[str, dict[str, list[tuple[str, str]]]]] = {}
     for row in rows:
-        trace_id, run_id, task_class, agent_version_id, status, vo_raw = row
+        trace_id, run_id, task_class, agent_version_id, status, vo_raw, validity = row
         try:
             vo = json.loads(vo_raw)
         except (json.JSONDecodeError, TypeError, ValueError):
@@ -108,7 +120,9 @@ def find_pairs(
             {"success": {}, "failure": {}},
         )
         side = "success" if status == "success" else "failure"
-        group[side].setdefault(lane, []).append((trace_id, finish_reason))
+        infra = (finish_reason in INFRA_REASONS
+                 or str(validity or "").strip().lower() == INFRA_VALIDITY)
+        group[side].setdefault(lane, []).append((trace_id, finish_reason, infra))
 
     pairs: list[dict] = []
     for (run, task_class, node_type, node_id), group in groups.items():
@@ -116,10 +130,10 @@ def find_pairs(
             for loser, failure_recs in group["failure"].items():
                 if loser == winner:
                     continue
-                loser_reasons = sorted({reason for _, reason in failure_recs})
+                loser_reasons = sorted({reason for _, reason, _ in failure_recs})
                 kind = (
                     "quality"
-                    if any(r and r not in INFRA_REASONS for r in loser_reasons)
+                    if any(not infra for _, _, infra in failure_recs)
                     else "infra"
                 )
                 pairs.append(
@@ -130,8 +144,8 @@ def find_pairs(
                         "node_id": node_id,
                         "winner": winner,
                         "loser": loser,
-                        "winner_trace_ids": sorted(t for t, _ in success_recs),
-                        "loser_trace_ids": sorted(t for t, _ in failure_recs),
+                        "winner_trace_ids": sorted(t for t, _, _ in success_recs),
+                        "loser_trace_ids": sorted(t for t, _, _ in failure_recs),
                         "loser_reasons": loser_reasons,
                         "kind": kind,
                     }
