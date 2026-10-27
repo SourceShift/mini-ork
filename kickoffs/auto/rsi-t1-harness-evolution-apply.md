@@ -143,6 +143,14 @@ All paths are relative to the repository root.
     condition, it calls
     `apply_workflow_mutation(candidate_id, target_file, wf_result, db=db)`
     instead of `apply_mutation`.
+    - **A refused live write is not a promotion.** When that call returns
+      `""` while `MO_APPLY_ENABLED == "1"` and `MO_APPLY_DRY_RUN != "1"` (a
+      real write was attempted and refused: comments would be dropped, or the
+      file changed since scoring), set `gate_decision = "quarantined"` and
+      append `" | workflow write refused (see stderr)"` to `gate_rationale`
+      BEFORE step 7 records the attempt. The dry-run and master-gate-off cases
+      keep today's behaviour, where the decision is the gate's and the
+      `version_id` is empty.
 - **`auto_sweep`.** Let `wf_on = os.environ.get("MO_APPLY_HARNESS_WORKFLOW", "0") == "1"`.
   - **The selection SQL.**
     - When `harness_on` is true, the existing query is unchanged.
@@ -322,6 +330,13 @@ Tests:
     file bytes are unchanged, and stderr contains `would drop`.
   - With `MO_APPLY_WORKFLOW_REFORMAT=1` the same call returns a non-empty
     version id, and the file now equals `result["after_text"]`.
+- **A refused write records quarantined, not promoted.** Drive `apply_run`
+  on a workflow target whose live file carries a comment, with
+  `MO_APPLY_ENABLED=1`, `MO_APPLY_WORKFLOW_REFORMAT` unset, and the gate forced
+  to `promoted` (reuse the existing gate-forcing seam this file's other
+  `apply_run` tests use). The `apply_attempts` row's decision is
+  `quarantined`, its rationale contains `workflow write refused`, and the file
+  bytes are unchanged.
 - **The helpers.**
   - `_is_workflow_target` is `True` for `T`. It is `False` for
     `"harness.fw-edit.implementer"`, `"harness..workflow.yaml"` and
