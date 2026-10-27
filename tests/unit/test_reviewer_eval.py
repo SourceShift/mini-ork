@@ -687,3 +687,35 @@ def test_run_case_resolves_the_lane_alias_for_the_real_dispatcher(tmp_path, monk
                                     work_dir=tmp_path / "work")
     assert seen == ["glm"]
     assert result.error == ""
+
+
+# ── an errored case is an error, not a catch (R5c) ──────────────────────────
+
+def test_run_case_nonzero_rc_is_an_error_even_with_a_parsed_review(tmp_path):
+    root = make_framework_tree(tmp_path)
+
+    def fake(model=None, prompt=None, out_file=None, timeout_s=None,
+             max_turns=None, **kw):
+        Path("review.json").write_text(json.dumps(
+            {"verdict": "needs_revision",
+             "findings": [{"file": "mini_ork/cli/epics.py", "severity": "high",
+                           "issue": "x"}]}))
+        return 124
+
+    result = reviewer_eval.run_case(incident_case(), root=root, lane="l",
+                                    work_dir=tmp_path / "work", dispatch_fn=fake)
+    assert (result.verdict, result.flagged, result.hit_defect) == (
+        "error", False, False)
+    assert result.error == "124"
+    assert result.findings_n == 1
+    summary = reviewer_eval.score([result])
+    assert summary["errors"] == 1
+    assert summary["incidents"]["caught"] == 0
+
+
+def test_fingerprint_id_changes_with_eval_inputs_version(tmp_path, monkeypatch):
+    root = make_framework_tree(tmp_path)
+    before = reviewer_eval.fingerprint(root, "lane-x")
+    monkeypatch.setattr(reviewer_eval, "_EVAL_INPUTS_VERSION", 424242)
+    after = reviewer_eval.fingerprint(root, "lane-x")
+    assert before["id"] != after["id"]

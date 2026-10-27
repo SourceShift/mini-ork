@@ -1707,6 +1707,49 @@ def _review_round_arm(run_id: str) -> str:
     return "on"
 
 
+# Test gaming is never a medium/low finding: a change that detects the test run
+# or patches the harness is wrong on every attempt, including the last one, so
+# the final-attempt escape hatch must not swallow it (kickoff R5c, incident K10).
+_TEST_GAMING_LINE = (
+    # Worded without the literal probe tokens: the no-test-gaming scan reads
+    # production text, and quoting a probe here would flag this prompt itself.
+    '- Test gaming is HIGH on every attempt, the last one included: production code '
+    "that checks whether it runs under a test (the test runner's environment "
+    'variables or loaded modules, stack-frame inspection), patches the test '
+    'framework or a test fixture, or rewrites another module\'s state at import '
+    'time so a check passes.'
+)
+
+
+def reviewer_round_text(attempt: int, total: int, feedback_text: str = "") -> str:
+    """The reviewer's round block for ``attempt`` of ``total``.
+
+    Pure: the runtime (``_reviewer_round_block``) and the reviewer eval both
+    render this exact text, so the eval measures the reviewer this home runs
+    rather than the plain branch. ``attempt >= total`` is the final attempt.
+    """
+    final = attempt >= total
+    consequence = ("on this FINAL attempt it discards the whole delivery and the run rolls back."
+                   if final else "the implementer gets one more attempt to fix them.")
+    lines = [
+        f"## Review attempt {attempt} of {total}",
+        f"A fail or needs_revision verdict sends your findings back to the implementer; {consequence}",
+        "- Return fail or needs_revision only for HIGH-severity findings: the change is wrong, "
+        "unsafe, breaks a test, or misses a requirement of the kickoff. For medium and low "
+        "findings, pass and list them in your notes/findings.",
+        _TEST_GAMING_LINE,
+    ]
+    if attempt > 1:
+        from mini_ork.context_assembler import cap_block
+        lines.append("- First check that every finding from the previous attempt (below) is "
+                     "fixed. Raise a NEW blocking finding only if it is high severity.")
+        lines.append(cap_block(feedback_text, label=f"revise/round-{attempt - 1}.md"))
+    if final:
+        lines.append("- This is the last attempt: block only if shipping this change would be "
+                     "worse than discarding all of it. Shipping test gaming always is.")
+    return "\n".join(lines) + "\n\n"
+
+
 def _reviewer_round_block(run_dir: str, run_id: str) -> str:
     """Round awareness + a severity bar for the plain reviewer, or ``""``.
 
@@ -1748,25 +1791,8 @@ def _reviewer_round_block(run_dir: str, run_id: str) -> str:
         pass
     if arm != "on":
         return ""
-    consequence = ("on this FINAL attempt it discards the whole delivery and the run rolls back."
-                   if final else "the implementer gets one more attempt to fix them.")
-    lines = [
-        f"## Review attempt {attempt} of {total}",
-        f"A fail or needs_revision verdict sends your findings back to the implementer; {consequence}",
-        "- Return fail or needs_revision only for HIGH-severity findings: the change is wrong, "
-        "unsafe, breaks a test, or misses a requirement of the kickoff. For medium and low "
-        "findings, pass and list them in your notes/findings.",
-    ]
-    if attempt > 1 and revise:
-        from mini_ork.context_assembler import cap_block
-        lines.append("- First check that every finding from the previous attempt (below) is "
-                     "fixed. Raise a NEW blocking finding only if it is high severity.")
-        lines.append(cap_block(revise.get("feedback_text") or "",
-                               label=f"revise/round-{attempt - 1}.md"))
-    if final:
-        lines.append("- This is the last attempt: block only if shipping this change would be "
-                     "worse than discarding all of it.")
-    return "\n".join(lines) + "\n\n"
+    feedback_text = (revise.get("feedback_text") or "") if attempt > 1 else ""
+    return reviewer_round_text(attempt, total, feedback_text)
 
 
 def _handle_implementer(ctx: NodeDispatch):

@@ -181,3 +181,23 @@ def test_executor_reviewer_prompt_is_unchanged_with_the_flag_off(tmp_path, monke
     prompts = _drive(tmp_path, monkeypatch)
     assert len(prompts) == 3
     assert not any("## Review attempt" in p for p in prompts)
+
+
+# ── the shared round text (R5c) ─────────────────────────────────────────────
+
+def test_round_block_is_the_shared_round_text(tmp_path, monkeypatch):
+    """The runtime block and the eval render the same pure function."""
+    monkeypatch.setenv("MO_REVIEW_ROUND_AWARE", "on")
+    monkeypatch.setenv("MO_REVIEW_ROUND_AWARE_HOLDOUT", "0")
+    monkeypatch.delenv("MO_REVISE_ROUNDS", raising=False)
+    _revise(tmp_path, 2, 2, "the cache key ignores the file mtime")
+    assert eh._reviewer_round_block(str(tmp_path), "run-1") == eh.reviewer_round_text(
+        3, 3, "the cache key ignores the file mtime")
+
+
+def test_round_text_names_test_gaming_high_on_every_attempt():
+    assert "Test gaming is HIGH" in eh.reviewer_round_text(1, 3)
+    assert "last attempt" not in eh.reviewer_round_text(1, 3)
+    final = eh.reviewer_round_text(3, 3)
+    assert "Test gaming is HIGH" in final
+    assert "Shipping test gaming always is." in final

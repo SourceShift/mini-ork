@@ -220,7 +220,7 @@ def test_fingerprint_hashes_eval_inputs_version(tmp_path, monkeypatch):
                 if isinstance(c[0], dict) and "prompt_sha" in c[0]]
     assert matching, "fingerprint hashed object was not observed"
     obj, args, kwargs = matching[-1]
-    assert obj.get("eval_inputs") == 2
+    assert obj.get("eval_inputs") == rev._EVAL_INPUTS_VERSION
 
     with_version = real_dumps(obj, *args, **kwargs)
     without = {key: val for key, val in obj.items() if key != "eval_inputs"}
@@ -368,3 +368,73 @@ def test_copy_evidence_drops_files_the_run_no_longer_has(tmp_path):
     (dest / "verifier_static-check.json").write_text('{"pass": false}')
     assert rev.copy_evidence(run_dir, dest) == 1
     assert sorted(p.name for p in dest.iterdir()) == ["verifier_test.json"]
+
+
+# ── 5. the round block a case's run received is replayed ────────────────────
+
+_FEEDBACK = "the cache key ignores the file mtime"
+
+
+def _round_run(tmp_path: Path, records: list[dict]) -> Path:
+    run_dir = tmp_path / "run"
+    (run_dir / "revise").mkdir(parents=True)
+    feedback = run_dir / "revise" / "round-2.md"
+    feedback.write_text(_FEEDBACK, encoding="utf-8")
+    (run_dir / "revise" / "current.json").write_text(json.dumps(
+        {"round": 2, "max_rounds": 2, "feedback": str(feedback)}), encoding="utf-8")
+    (run_dir / "review-round-aware.json").write_text(
+        json.dumps(records), encoding="utf-8")
+    return run_dir
+
+
+def test_copy_evidence_records_the_last_round(tmp_path):
+    run_dir = _round_run(tmp_path, [
+        {"arm": "on", "attempt": 1, "total": 3, "final": False},
+        {"arm": "on", "attempt": 3, "total": 3, "final": True},
+    ])
+    dest = tmp_path / "evidence"
+    rev.copy_evidence(run_dir, dest)
+    assert json.loads((dest / "review-round.json").read_text(encoding="utf-8")) == {
+        "arm": "on", "attempt": 3, "total": 3, "feedback": _FEEDBACK}
+    # a second copy keeps it rather than sweeping it as a stale file
+    rev.copy_evidence(run_dir, dest)
+    assert (dest / "review-round.json").is_file()
+
+
+def test_copy_evidence_keeps_the_feedback_the_last_review_saw(tmp_path):
+    """An auto-repair round after the last review moves ``current.json`` on to
+    new feedback; the eval must replay the round-<attempt-1> file instead."""
+    run_dir = _round_run(tmp_path, [{"arm": "on", "attempt": 3, "total": 3}])
+    later = run_dir / "revise" / "round-3.md"
+    later.write_text("repair round 3: feedback no reviewer saw", encoding="utf-8")
+    (run_dir / "revise" / "current.json").write_text(json.dumps(
+        {"round": 3, "max_rounds": 3, "feedback": str(later)}), encoding="utf-8")
+    dest = tmp_path / "evidence"
+    rev.copy_evidence(run_dir, dest)
+    record = json.loads((dest / "review-round.json").read_text(encoding="utf-8"))
+    assert record["feedback"] == _FEEDBACK
+
+
+def test_copy_evidence_removes_a_stale_round_record(tmp_path):
+    run_dir = _round_run(tmp_path, [{"arm": "on", "attempt": 3, "total": 3}])
+    dest = tmp_path / "evidence"
+    rev.copy_evidence(run_dir, dest)
+    assert (dest / "review-round.json").is_file()
+    (run_dir / "review-round-aware.json").unlink()
+    rev.copy_evidence(run_dir, dest)
+    assert not (dest / "review-round.json").exists()
+
+
+def test_build_prompt_replays_the_round_block_before_the_envelope(tmp_path):
+    case = _case(tmp_path / "on", {"review-round.json": json.dumps(
+        {"arm": "on", "attempt": 3, "total": 3, "feedback": _FEEDBACK})})
+    prompt = rev.build_prompt(case, root=REPO_ROOT, review_file="review.json")
+    block_at = prompt.index("## Review attempt 3 of 3")
+    env_at = prompt.index("Respond with JSON:")
+    assert block_at < env_at
+    assert prompt[block_at:env_at].rstrip().endswith("Shipping test gaming always is.")
+
+    holdout = _case(tmp_path / "holdout", {"review-round.json": json.dumps(
+        {"arm": "holdout", "attempt": 3, "total": 3, "feedback": _FEEDBACK})})
+    assert "## Review attempt" not in rev.build_prompt(
+        holdout, root=REPO_ROOT, review_file="review.json")

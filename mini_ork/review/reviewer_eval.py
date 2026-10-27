@@ -45,7 +45,7 @@ EVIDENCE_DIR = "evidence"
 # new ones. It is hashed into the fingerprint id but NOT exposed as a returned
 # field: ``status``/``garden`` only read ``id`` and the existing tests pin the
 # returned key shape.
-_EVAL_INPUTS_VERSION = 2
+_EVAL_INPUTS_VERSION = 3
 
 # Every run-dir name the eval copies into ``<case>/evidence/`` (§kickoff 1.1).
 # ``verifier_*.json`` is matched by prefix; the rest are exact names.
@@ -57,6 +57,11 @@ _EVIDENCE_FIXED_NAMES = (
     "static-feature-ledger.json",
     "self-migrate.diff",
 )
+
+# Derived by ``copy_evidence`` from the run's ``review-round-aware.json``: it is
+# an eval input block, not a reviewer-input report, so ``is_evidence_name``
+# rejects it even though the stale-file sweep must keep it.
+_ROUND_EVIDENCE_NAME = "review-round.json"
 
 _PASS_VERDICTS = frozenset({"pass", "approve", "approved"})
 _BLOCK_VERDICTS = frozenset(
@@ -358,23 +363,76 @@ def evidence_files(run_dir: Path) -> list[str]:
         if is_evidence_name(name) and os.path.isfile(os.path.join(run_dir, name)))
 
 
+def _round_record(run_dir: Path) -> dict | None:
+    """The round block a case's run received, or ``None`` when it recorded none.
+
+    Reads the LAST ``review-round-aware.json`` record (the reviewer's final
+    attempt) and resolves the previous-round feedback text from
+    ``revise/current.json``. Fewer than one record, or a malformed file, means
+    the reviewer saw no round block.
+    """
+    try:
+        records = json.loads(
+            (run_dir / "review-round-aware.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(records, list) or not records:
+        return None
+    last = records[-1]
+    if not isinstance(last, dict):
+        return None
+    attempt = last.get("attempt", 1)
+    total = last.get("total", attempt)
+    feedback = ""
+    if isinstance(attempt, int) and attempt > 1:
+        # At review time the runtime feeds ``revise/round-<attempt-1>.md`` (the
+        # file ``current.json`` names then). Read that file first: auto-repair
+        # rounds after the last review move ``current.json`` on to feedback
+        # this reviewer never saw.
+        feedback_path = str(run_dir / "revise" / f"round-{attempt - 1}.md")
+        if not os.path.isfile(feedback_path):
+            try:
+                current = json.loads(
+                    (run_dir / "revise" / "current.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                current = None
+            feedback_path = current.get("feedback") if isinstance(current, dict) else ""
+        if feedback_path and os.path.isfile(feedback_path):
+            try:
+                feedback = Path(feedback_path).read_text(
+                    encoding="utf-8", errors="replace")
+            except OSError:
+                feedback = ""
+    return {"arm": str(last.get("arm") or ""), "attempt": attempt,
+            "total": total, "feedback": feedback}
+
+
 def copy_evidence(run_dir: Path, dest_dir: Path) -> int:
     """Copy every evidence file from ``run_dir`` into ``dest_dir``; return count.
 
     Bytes are copied verbatim (never re-serialised): the drift test pins the
-    rendered block to the real assembler byte-for-byte.
+    rendered block to the real assembler byte-for-byte. The derived
+    ``review-round.json`` rides along when the run recorded a round block and is
+    removed otherwise, so the eval never replays a block the run did not have.
     """
     run_dir = Path(run_dir)
     dest_dir = Path(dest_dir)
     names = evidence_files(run_dir)
+    round_record = _round_record(run_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
     # The evidence set mirrors the run exactly: a file the run no longer has
     # must not keep being rendered to the reviewer (reviewer finding on R4b).
+    keep = set(names)
+    if round_record is not None:
+        keep.add(_ROUND_EVIDENCE_NAME)
     for stale in sorted(dest_dir.iterdir()):
-        if stale.is_file() and stale.name not in names:
+        if stale.is_file() and stale.name not in keep:
             stale.unlink()
     for name in names:
         shutil.copyfile(run_dir / name, dest_dir / name)
+    if round_record is not None:
+        (dest_dir / _ROUND_EVIDENCE_NAME).write_text(
+            json.dumps(round_record), encoding="utf-8")
     return len(names)
 
 
@@ -466,12 +524,36 @@ def render_reviewer_inputs(evidence_dir: Path, diff_text: str) -> str:
     return block
 
 
+def _case_round_block(case_dir: Path) -> str:
+    """The round block this case's run showed its reviewer, or ``""``.
+
+    Only the ``on`` arm saw one: ``holdout``/``off`` runs (and cases with no
+    record) replay no block, matching the runtime prompt they were graded on.
+    """
+    try:
+        payload = json.loads(
+            (case_dir / EVIDENCE_DIR / _ROUND_EVIDENCE_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(payload, dict) or payload.get("arm") != "on":
+        return ""
+    attempt = payload.get("attempt")
+    total = payload.get("total")
+    if not isinstance(attempt, int) or not isinstance(total, int):
+        return ""
+    from mini_ork.cli.execute_handlers import reviewer_round_text
+
+    feedback = payload.get("feedback")
+    return reviewer_round_text(attempt, total, feedback if isinstance(feedback, str) else "")
+
+
 def build_prompt(case: Case, *, root: Path, review_file: str) -> str:
     """Mirror the classic reviewer branch of ``_handle_reviewer`` for one case.
 
     Order matches the runtime prompt: recipe prompt (system context), the
     task line, the plan (the case's kickoff), the reviewer inputs (the diff),
-    then the envelope naming the artifact to write.
+    the round block the case's run received, then the envelope naming the
+    artifact to write.
     """
     from mini_ork.cli.execute_handlers import reviewer_envelope
 
@@ -494,6 +576,7 @@ def build_prompt(case: Case, *, root: Path, review_file: str) -> str:
         # (``test_build_prompt_truncates_huge_diff_and_kickoff``) asserts, and it
         # only diverges from the runtime block for diffs over ``_DIFF_CAP``.
         "\n\n", render_reviewer_inputs(case_dir / EVIDENCE_DIR, _cap(diff, _DIFF_CAP)),
+        _case_round_block(case_dir),
         "\n", reviewer_envelope(review_file),
     ])
 
@@ -693,6 +776,11 @@ def run_case(case: Case, *, root: Path, lane: str, work_dir: Path,
 
     review = parse_review(text)
     verdict, flagged, hit_defect, findings_n = judge(case, review)
+    if error:
+        # A dispatch that raised or returned a non-zero rc did not produce a
+        # trustworthy verdict: score it as an error, never a catch. Keep the
+        # parsed finding count so the record still shows what the reviewer said.
+        verdict, flagged, hit_defect = "error", False, False
 
     return CaseResult(
         case_id=case.id,
